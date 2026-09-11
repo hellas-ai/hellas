@@ -54,6 +54,11 @@ fn regular_open_is_safe_readable_seekable_and_close_on_exec() {
     // public name with a device, then finish the reopen. The bytes must
     // still come from the held inode.
     let path_handle = open_path_handle(&link).expect("path handle");
+    // O_PATH must survive libc-specific access-mode flags (notably musl).
+    // SAFETY: F_GETFL only observes the live descriptor owned by path_handle.
+    let path_flags = unsafe { libc::fcntl(path_handle.as_raw_fd(), libc::F_GETFL) };
+    assert!(path_flags >= 0, "F_GETFL: {}", io::Error::last_os_error());
+    assert_ne!(path_flags & libc::O_PATH, 0);
     let replacement = dir.join("replacement");
     std::os::unix::fs::symlink("/dev/null", &replacement).expect("device symlink");
     std::fs::rename(&replacement, &link).expect("replace link");
@@ -83,6 +88,17 @@ fn regular_open_is_safe_readable_seekable_and_close_on_exec() {
             .expect_err("a character device is not regular content");
         assert_eq!(device_error.kind(), io::ErrorKind::InvalidInput);
     }
+
+    use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+    let mut nul_path = target.as_os_str().as_bytes().to_vec();
+    nul_path.extend_from_slice(b"\0ignored-suffix");
+    let nul_path = PathBuf::from(std::ffi::OsString::from_vec(nul_path));
+    assert_eq!(
+        open_regular_file(&nul_path)
+            .expect_err("NUL must not truncate the path")
+            .kind(),
+        io::ErrorKind::InvalidInput,
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
