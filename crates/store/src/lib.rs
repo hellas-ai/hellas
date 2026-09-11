@@ -93,13 +93,27 @@ fn open_regular_file_impl(path: &Path) -> io::Result<std::fs::File> {
 /// Acquires an inode reference without invoking the target's file operations.
 #[cfg(target_os = "linux")]
 fn open_path_handle(path: &Path) -> io::Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt as _;
+    use std::ffi::CString;
+    use std::os::fd::FromRawFd as _;
+    use std::os::unix::ffi::OsStrExt as _;
 
-    let mut options = OpenOptions::new();
-    options
-        .read(true)
-        .custom_flags(libc::O_PATH | libc::O_CLOEXEC);
-    options.open(path)
+    let path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    // OpenOptions masks custom flags with !O_ACCMODE. On musl that mask
+    // includes O_PATH, turning a descriptor-only open into a blocking read.
+    loop {
+        // SAFETY: path is NUL-terminated and live for the call. These flags
+        // do not create a file, so open needs no variadic mode argument.
+        let fd = unsafe { libc::open(path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+        if fd >= 0 {
+            // SAFETY: open returned a new descriptor, owned only here.
+            return Ok(unsafe { std::fs::File::from_raw_fd(fd) });
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
 }
 
 /// Converts an `O_PATH` reference to a readable descriptor for the same inode.
