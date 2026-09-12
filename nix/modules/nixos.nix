@@ -12,7 +12,10 @@ let
   inherit (lib) mkIf mkOption types;
   cfg = config.services.hellas;
   inherit (cfg) gateway;
-  hellasLib = import ../lib { inherit pkgs; };
+  hellasLib = import ../lib {
+    inherit pkgs;
+    inherit (self.inputs) nix-strix-halo;
+  };
   normalizeRuntimePath = hellas.lexicallyNormalizeAbsolutePath lib;
   pathWithin =
     root: path:
@@ -69,13 +72,38 @@ let
   defaultGpuSessionAssetBytes = 128 * 1024 * 1024 * 1024;
   effectiveGpuSessionAssetBytes =
     if cfg.gpuSessionAssetBytes == null then defaultGpuSessionAssetBytes else cfg.gpuSessionAssetBytes;
-  inherit (hellasLib) rocmToolkit;
+  inherit (hellasLib) rocmToolkit cudaToolkit;
+  nvidiaDriverEnabled = builtins.elem "nvidia" config.services.xserver.videoDrivers;
+  useCuda = cfg.gpuBackend == "cuda" || (cfg.gpuBackend == null && nvidiaDriverEnabled);
+  useHip = cfg.gpuBackend == "hip" || (cfg.gpuBackend == null && !nvidiaDriverEnabled);
+  gpuPackages =
+    lib.optionals useHip [ rocmToolkit ]
+    ++ lib.optionals useCuda [
+      cudaToolkit
+      pkgs.cudaPackages.backendStdenv.cc
+    ];
+  gpuEnvironment =
+    lib.optionalAttrs useHip (builtins.removeAttrs rocmEnvironment [ "LD_LIBRARY_PATH" ])
+    // lib.optionalAttrs useCuda {
+      CUDA_PATH = cudaToolkit;
+      NVCC_CCBIN = "${pkgs.cudaPackages.backendStdenv.cc}/bin/c++";
+    }
+    // {
+      LD_LIBRARY_PATH = lib.concatStringsSep ":" (
+        lib.optional useHip "${rocmToolkit}/lib"
+        ++ lib.optionals useCuda [
+          "${cudaToolkit}/lib"
+          "/run/opengl-driver/lib"
+        ]
+        ++ lib.optional (cfg.environment ? LD_LIBRARY_PATH) (toString cfg.environment.LD_LIBRARY_PATH)
+      );
+    };
   rocmEnvironment = {
     ROCM_PATH = rocmToolkit;
     HIP_PATH = rocmToolkit;
-    HIP_CLANG_PATH = "${pkgs.rocmPackages.clang}/bin";
-    DEVICE_LIB_PATH = "${pkgs.rocmPackages.rocm-device-libs}/amdgcn/bitcode";
-    HIP_FLAGS = "--rocm-path=${rocmToolkit} --rocm-device-lib-path=${pkgs.rocmPackages.rocm-device-libs}/amdgcn/bitcode";
+    HIP_CLANG_PATH = "${rocmToolkit}/bin";
+    DEVICE_LIB_PATH = "${rocmToolkit}/amdgcn/bitcode";
+    HIP_FLAGS = "--rocm-path=${rocmToolkit} --rocm-device-lib-path=${rocmToolkit}/amdgcn/bitcode";
     LD_LIBRARY_PATH =
       "${rocmToolkit}/lib"
       + lib.optionalString (
@@ -115,10 +143,17 @@ let
       "render"
       "video"
     ];
-    DeviceAllow = [
-      "/dev/kfd rw"
-      "char-drm rw"
-    ];
+    DeviceAllow =
+      lib.optionals useHip [
+        "/dev/kfd rw"
+        "char-drm rw"
+      ]
+      ++ lib.optionals useCuda [
+        "char-nvidia-frontend rw"
+        "char-nvidiactl rw"
+        "char-nvidia-uvm rw"
+        "char-nvidia-caps rw"
+      ];
   };
   providerReadinessCommands = map (
     environment:
@@ -360,10 +395,7 @@ in
         # filesystem and make an otherwise satisfiable environment disappear.
         RequiresMountsFor = providerRuntimePaths;
       };
-      path = lib.optionals providerGpuConfigured [
-        pkgs.rocmPackages.clang
-        pkgs.rocmPackages.hipcc
-      ];
+      path = lib.optionals providerGpuConfigured gpuPackages;
       environment = hellas.renderEnvironment (
         hellas.mkOtelEnv {
           inherit lib;
@@ -379,7 +411,7 @@ in
           TMPDIR = "/run/hellas";
           XDG_CACHE_HOME = "/var/cache/hellas";
         }
-        // lib.optionalAttrs providerGpuConfigured rocmEnvironment
+        // lib.optionalAttrs providerGpuConfigured gpuEnvironment
       );
       serviceConfig = {
         ExecStart = lib.escapeShellArgs (
@@ -432,9 +464,10 @@ in
       // lib.optionalAttrs providerGpuConfigured (
         gpuDeviceAccess
         // {
-          # Catena keeps exact weights resident by mmap-registering them as
-          # mapped host memory. RLIMIT_MEMLOCK is a driver/runtime permission,
-          # not the logical asset-admission or whole-unit memory boundary.
+          # The shared VRAM owner uploads weights once; execution workers keep
+          # mutable generation state private. GPU runtimes may still lock host
+          # pages for upload staging and driver queues. RLIMIT_MEMLOCK permits
+          # those operations; asset admission and MemoryMax remain separate.
           LimitMEMLOCK = "infinity";
         }
       );
@@ -448,10 +481,7 @@ in
       unitConfig = lib.optionalAttrs (gatewayRuntimePaths != [ ]) {
         RequiresMountsFor = gatewayRuntimePaths;
       };
-      path = lib.optionals (gateway.local || gateway.verifyLocal) [
-        pkgs.rocmPackages.clang
-        pkgs.rocmPackages.hipcc
-      ];
+      path = lib.optionals (gateway.local || gateway.verifyLocal) gpuPackages;
       environment = hellas.renderEnvironment (
         hellas.mkOtelEnv {
           inherit lib;
@@ -468,7 +498,7 @@ in
             TMPDIR = "/run/hellas-gateway";
             XDG_CACHE_HOME = "/var/cache/hellas-gateway";
           }
-          // rocmEnvironment
+          // gpuEnvironment
         )
         // lib.optionalAttrs (cfg.otel.endpoint != null) {
           # Distinguish gateway spans from the node's in shared trace storage.

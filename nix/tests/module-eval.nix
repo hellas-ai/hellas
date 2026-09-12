@@ -10,6 +10,10 @@ let
   plainPkgs = import pkgs.path {
     system = pkgs.stdenv.hostPlatform.system;
   };
+  cudaPkgs = import pkgs.path {
+    system = pkgs.stdenv.hostPlatform.system;
+    config.allowUnfree = true;
+  };
   darwinPkgs = import pkgs.path {
     system = "aarch64-darwin";
   };
@@ -115,7 +119,7 @@ let
       modules = [
         self.nixosModules.default
         {
-          nixpkgs.pkgs = plainPkgs;
+          nixpkgs.pkgs = if (provider.gpuBackend or null) == "cuda" then cudaPkgs else plainPkgs;
           system.stateVersion = "26.05";
           services.hellas = {
             enable = true;
@@ -454,6 +458,14 @@ let
       (evalProvider {
         gpuMaxGenerationCapacity = 524289;
       }).config.systemd.services.hellas.serviceConfig.ExecStart;
+  cudaProvider = evalProvider {
+    gpuBackend = "cuda";
+    executePolicy = "any";
+  };
+  hipProvider = evalProvider {
+    gpuBackend = "hip";
+    executePolicy = "any";
+  };
   maxGpuSessionAssetBytes = evalProvider {
     gpuSessionAssetBytes = 4398046511104;
   };
@@ -850,6 +862,16 @@ in
     assert !(runtimeStoreAssertion storePathReadinessProvider).assertion;
     assert lib.hasInfix "--gpu-session-asset-bytes 4398046511104"
       maxGpuSessionAssetBytes.config.systemd.services.hellas.serviceConfig.ExecStart;
+    assert lib.hasInfix "--gpu-backend cuda"
+      cudaProvider.config.systemd.services.hellas.serviceConfig.ExecStart;
+    assert cudaProvider.config.systemd.services.hellas.environment ? CUDA_PATH;
+    assert !(cudaProvider.config.systemd.services.hellas.environment ? ROCM_PATH);
+    assert builtins.elem "char-nvidia-uvm rw"
+      cudaProvider.config.systemd.services.hellas.serviceConfig.DeviceAllow;
+    assert lib.hasInfix "--gpu-backend hip"
+      hipProvider.config.systemd.services.hellas.serviceConfig.ExecStart;
+    assert hipProvider.config.systemd.services.hellas.environment ? ROCM_PATH;
+    assert !(hipProvider.config.systemd.services.hellas.environment ? CUDA_PATH);
     assert !oversizedGpuSessionAssetBytes.success;
     assert !oversizedDefaultMaxTokens.success;
     assert !oversizedStopToken.success;

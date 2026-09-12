@@ -29,6 +29,8 @@ mod worker;
 
 #[cfg(feature = "evaluate")]
 pub use artifact_store::{ArtifactStoreConfig, DEFAULT_EVALUATE_RETAINED_EXECUTION_CAPACITY};
+#[cfg(feature = "evaluate")]
+pub use catena_lang::safe_gpu::Backend as GpuBackend;
 pub use chain::{ChainView, kernel_signer};
 #[cfg(feature = "evaluate")]
 pub use environment::{CausalLmEnvironmentSource, CausalLmEnvironmentSourceError};

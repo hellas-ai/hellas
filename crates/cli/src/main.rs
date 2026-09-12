@@ -328,6 +328,10 @@ enum Commands {
         #[cfg(feature = "evaluate")]
         #[arg(long = "content-index", value_name = "FILE")]
         content_index: Option<PathBuf>,
+        /// GPU runtime to use: auto, hip, or cuda.
+        #[cfg(feature = "evaluate")]
+        #[arg(long = "gpu-backend", default_value_t = hellas_executor::GpuBackend::Auto)]
+        gpu_backend: hellas_executor::GpuBackend,
         /// Maximum distinct Catena programs retained in one GPU session.
         #[cfg(feature = "evaluate")]
         #[arg(long = "gpu-session-programs", default_value_t = hellas_executor::DEFAULT_GPU_SESSION_PROGRAMS, value_parser = parse_positive_usize)]
@@ -969,6 +973,8 @@ async fn async_main() {
             #[cfg(feature = "evaluate")]
             gpu_session_programs,
             #[cfg(feature = "evaluate")]
+            gpu_backend,
+            #[cfg(feature = "evaluate")]
             gpu_session_asset_bytes,
             #[cfg(feature = "evaluate")]
             gpu_max_generation_capacity,
@@ -1015,7 +1021,8 @@ async fn async_main() {
                             Duration::from_secs(gpu_compile_timeout_secs),
                             Duration::from_secs(gpu_execution_timeout_secs),
                         )
-                        .map_err(anyhow::Error::msg)?;
+                        .map_err(anyhow::Error::msg)?
+                        .with_backend(gpu_backend);
                         commands::serve::run(commands::serve::ServeOptions {
                             port,
                             execute_policy,
