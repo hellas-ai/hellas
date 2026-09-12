@@ -11,7 +11,10 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     rust-overlay.url = "github:oxalica/rust-overlay";
-
+    nix-strix-halo = {
+      url = "github:hellas-ai/nix-strix-halo/e24b2efcfaee1cefd326ff65ff7a955a908fd5ee";
+      flake = false;
+    };
   };
 
   outputs =
@@ -19,6 +22,7 @@
       self,
       nixpkgs,
       rust-overlay,
+      nix-strix-halo,
     }:
     let
       systems = [
@@ -56,7 +60,10 @@
 
       overlays.default = final: _prev: {
         hellas = self.packages.${final.system};
-        hellasLib = import ./nix/lib { pkgs = final; };
+        hellasLib = import ./nix/lib {
+          pkgs = final;
+          inherit nix-strix-halo;
+        };
       };
 
       nixosModules = {

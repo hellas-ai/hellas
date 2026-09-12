@@ -160,6 +160,45 @@ fn session_program_and_asset_limits_recycle_before_runtime_rejection() {
 }
 
 #[test]
+fn program_pressure_preserves_assets_but_asset_pressure_resets_owner() {
+    let one = Duration::from_secs(1);
+    let config = GpuConfig::new(1, 10, 1, 1, one, one).unwrap();
+    let resident = SessionUsage {
+        programs: 1,
+        assets: 1,
+        asset_bytes: 8,
+    };
+    let no_missing = MissingAssets { count: 0, bytes: 0 };
+    assert!(session_requires_recycle(
+        false, resident, no_missing, config
+    ));
+    assert!(!asset_owner_requires_recycle(
+        resident.assets,
+        resident.asset_bytes,
+        no_missing,
+        config,
+    ));
+    assert!(asset_owner_requires_recycle(
+        resident.assets,
+        resident.asset_bytes,
+        MissingAssets { count: 1, bytes: 3 },
+        config,
+    ));
+    assert!(asset_owner_requires_recycle(
+        MAX_RESIDENT_ASSETS,
+        0,
+        MissingAssets { count: 1, bytes: 0 },
+        config,
+    ));
+    assert!(asset_owner_requires_recycle(
+        0,
+        u64::MAX,
+        MissingAssets { count: 0, bytes: 1 },
+        config,
+    ));
+}
+
+#[test]
 fn a_stalled_consumer_fails_instead_of_blocking_the_worker() {
     let producer_key = ProducerSigningKey::from_secret_bytes([7; 32]).unwrap();
     let request = EvaluateRequest {

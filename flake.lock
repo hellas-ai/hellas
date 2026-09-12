@@ -1,5 +1,22 @@
 {
   "nodes": {
+    "nix-strix-halo": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1787924729,
+        "narHash": "sha256-fYT3b70X9proZqMkQ2YenMfbL6ngia7YhRCF8LuB2QQ=",
+        "owner": "hellas-ai",
+        "repo": "nix-strix-halo",
+        "rev": "e24b2efcfaee1cefd326ff65ff7a955a908fd5ee",
+        "type": "github"
+      },
+      "original": {
+        "owner": "hellas-ai",
+        "repo": "nix-strix-halo",
+        "rev": "e24b2efcfaee1cefd326ff65ff7a955a908fd5ee",
+        "type": "github"
+      }
+    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1782959384,
@@ -34,6 +51,7 @@
     },
     "root": {
       "inputs": {
+        "nix-strix-halo": "nix-strix-halo",
         "nixpkgs": "nixpkgs",
         "rust-overlay": "rust-overlay"
       }

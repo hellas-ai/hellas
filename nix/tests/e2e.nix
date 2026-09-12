@@ -307,7 +307,7 @@ in
     testScript = ''
       start_all()
       machine.wait_for_unit("hellas.service")
-      machine.succeed("test -e /var/lib/hellas/content-index.bin")
+      machine.wait_until_succeeds("test -e /var/lib/hellas/content-index.bin", timeout=30)
 
       # Materialize three previously unknown environments entirely at VM
       # runtime. All canonical roots are adopted from the configured content
@@ -395,7 +395,7 @@ in
       print(admitted)
       assert (
           "did not compile" in admitted
-          or "HIP GPU runtime is unavailable" in admitted
+          or "GPU runtime is unavailable" in admitted
       ), admitted
       assert "policy denied" not in admitted
       assert "is not locally available" not in admitted
@@ -406,7 +406,7 @@ in
       assert "accepted evaluate execution" in provider_log
       assert (
           "Catena program compilation failed" in provider_log
-          or "failed to start Catena HIP session" in provider_log
+          or "failed to start Catena GPU session" in provider_log
       ), provider_log
 
       unit = machine.succeed(
