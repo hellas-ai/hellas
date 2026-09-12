@@ -993,6 +993,8 @@ fn serve_accepts_gpu_resource_envelope() {
     let cli = Cli::try_parse_from([
         "hellas",
         "serve",
+        "--gpu-backend",
+        "cuda",
         "--gpu-session-programs",
         "3",
         "--gpu-session-asset-bytes",
@@ -1009,6 +1011,7 @@ fn serve_accepts_gpu_resource_envelope() {
     .unwrap();
     match cli.command {
         Commands::Serve {
+            gpu_backend,
             gpu_session_programs,
             gpu_session_asset_bytes,
             gpu_max_generation_capacity,
@@ -1017,6 +1020,7 @@ fn serve_accepts_gpu_resource_envelope() {
             gpu_execution_timeout_secs,
             ..
         } => {
+            assert_eq!(gpu_backend, hellas_executor::GpuBackend::Cuda);
             assert_eq!(gpu_session_programs, 3);
             assert_eq!(gpu_session_asset_bytes, 5);
             assert_eq!(gpu_max_generation_capacity, 7);

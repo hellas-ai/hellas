@@ -281,7 +281,23 @@ let
       );
     in
     {
-      packages.docker = docker.image;
+      packages = {
+        docker = docker.image;
+      }
+      // lib.optionalAttrs isX86_64Linux {
+        docker-cuda =
+          (import ./docker.nix {
+            inherit pkgs rustToolchain;
+            cli = nativePackages.cli-catena;
+            backend = "cuda";
+          }).image;
+        docker-hip =
+          (import ./docker.nix {
+            inherit pkgs rustToolchain;
+            cli = nativePackages.cli-catena;
+            backend = "hip";
+          }).image;
+      };
 
       apps."docker-push-all" = {
         type = "app";
@@ -290,14 +306,22 @@ let
       };
 
       devShells = lib.optionalAttrs isX86_64Linux {
-        rocm = pkgs.mkShellNoCC {
+        cuda = pkgs.mkShellNoCC {
           packages = devShellPackages ++ [
-            pkgs.rocmPackages.clang
-            pkgs.rocmPackages.hipcc
+            pkgs.hellasLib.cudaToolkit
+            pkgs.cudaPackages.backendStdenv.cc
           ];
           shellHook = envShellHook + ''
+            export CUDA_PATH=${pkgs.hellasLib.cudaToolkit}
+            export NVCC_CCBIN=${pkgs.cudaPackages.backendStdenv.cc}/bin/c++
+            export LD_LIBRARY_PATH=${pkgs.hellasLib.cudaToolkit}/lib:/run/opengl-driver/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+          '';
+        };
+        rocm = pkgs.mkShellNoCC {
+          packages = devShellPackages ++ [ pkgs.hellasLib.rocmToolkit ];
+          shellHook = envShellHook + ''
             # hipcc's setup selects its clang as the host C compiler. That
-            # compiler emits LLVM 22 LTO objects which this Rust toolchain's
+            # compiler emits newer LLVM LTO objects which this Rust toolchain's
             # lld cannot consume (notably while building alloca's C shim).
             # Keep ordinary build scripts on nixpkgs' wrapped host compiler;
             # Catena still reaches ROCm through hipcc and HIP_CLANG_PATH.
@@ -305,9 +329,9 @@ let
             export CXX=${pkgs.stdenv.cc}/bin/c++
             export ROCM_PATH=${pkgs.hellasLib.rocmToolkit}
             export HIP_PATH=${pkgs.hellasLib.rocmToolkit}
-            export HIP_CLANG_PATH=${pkgs.rocmPackages.clang}/bin
-            export DEVICE_LIB_PATH=${pkgs.rocmPackages.rocm-device-libs}/amdgcn/bitcode
-            export HIP_FLAGS="--rocm-path=${pkgs.hellasLib.rocmToolkit} --rocm-device-lib-path=${pkgs.rocmPackages.rocm-device-libs}/amdgcn/bitcode"
+            export HIP_CLANG_PATH=${pkgs.hellasLib.rocmToolkit}/bin
+            export DEVICE_LIB_PATH=${pkgs.hellasLib.rocmToolkit}/amdgcn/bitcode
+            export HIP_FLAGS="--rocm-path=${pkgs.hellasLib.rocmToolkit} --rocm-device-lib-path=${pkgs.hellasLib.rocmToolkit}/amdgcn/bitcode"
             export LD_LIBRARY_PATH=${pkgs.hellasLib.rocmToolkit}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
           '';
         };

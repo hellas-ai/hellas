@@ -8,7 +8,7 @@ use catena_lang::safe_gpu::causal_lm::{
     ModelConfig, minimum_generation_device_bytes,
 };
 use catena_lang::safe_gpu::{
-    Asset, GpuDialect, MAX_RESIDENT_ASSET_BYTES, MAX_RESIDENT_ASSETS, Program, Session,
+    Asset, AssetOwner, MAX_RESIDENT_ASSET_BYTES, MAX_RESIDENT_ASSETS, Program, Session,
     SessionTimeouts,
 };
 use hellas_rpc::evaluate::{EvaluateOutputTranscriptBuilder, input_commitment};
@@ -33,12 +33,11 @@ use crate::state::{Invocation, StopReason};
 
 /// Default number of distinct programs admitted into one GPU worker session.
 ///
-/// Catena retains compiled artifacts and attached assets for a session. Hellas
-/// therefore recycles the whole isolated worker at this boundary instead of
-/// allowing paid requests for unique programs to grow it without bound.
+/// Hellas recycles the execution worker at this boundary to bound compiled
+/// artifacts. Immutable assets remain resident in a separate bounded owner.
 pub const DEFAULT_GPU_SESSION_PROGRAMS: usize = 8;
 
-/// Default aggregate size of unique static objects attached to one session.
+/// Default aggregate size of unique static objects retained by one asset owner.
 pub const DEFAULT_GPU_SESSION_ASSET_BYTES: u64 = 128 * 1024 * 1024 * 1024;
 
 /// Default provider limit for prompt plus generated tokens in one invocation.
@@ -72,6 +71,7 @@ const _: () = assert!(MAX_CAUSAL_LM_STATIC_BYTES == MAX_MODEL_STATIC_BYTES);
 /// Bounded provider-local lifetime policy for the isolated GPU worker.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GpuConfig {
+    backend: catena_lang::safe_gpu::Backend,
     session_programs: usize,
     session_asset_bytes: u64,
     max_generation_capacity: u64,
@@ -120,6 +120,7 @@ impl GpuConfig {
             return Err("GPU execution timeout must be greater than zero".to_string());
         }
         Ok(Self {
+            backend: catena_lang::safe_gpu::Backend::Auto,
             session_programs,
             session_asset_bytes,
             max_generation_capacity,
@@ -127,6 +128,17 @@ impl GpuConfig {
             compile_timeout,
             execution_timeout,
         })
+    }
+
+    #[must_use]
+    pub const fn with_backend(mut self, backend: catena_lang::safe_gpu::Backend) -> Self {
+        self.backend = backend;
+        self
+    }
+
+    #[must_use]
+    pub const fn backend(self) -> catena_lang::safe_gpu::Backend {
+        self.backend
     }
 
     #[must_use]
@@ -179,6 +191,7 @@ impl GpuConfig {
 impl Default for GpuConfig {
     fn default() -> Self {
         Self {
+            backend: catena_lang::safe_gpu::Backend::Auto,
             session_programs: DEFAULT_GPU_SESSION_PROGRAMS,
             session_asset_bytes: DEFAULT_GPU_SESSION_ASSET_BYTES,
             max_generation_capacity: DEFAULT_GPU_MAX_GENERATION_CAPACITY,
@@ -528,6 +541,7 @@ impl<T> ExactContentCache<T> {
 struct ModelRuntime {
     config: GpuConfig,
     session: Option<Session>,
+    asset_owner: Option<AssetOwner>,
     models: HashMap<ContentId, Model>,
     model_order: VecDeque<ContentId>,
     programs: ExactContentCache<Program>,
@@ -540,6 +554,7 @@ impl ModelRuntime {
         Self {
             config,
             session: None,
+            asset_owner: None,
             models: HashMap::new(),
             model_order: VecDeque::new(),
             programs: ExactContentCache::default(),
@@ -617,6 +632,15 @@ impl ModelRuntime {
         &mut self,
         source: &CausalLmEnvironmentSource,
     ) -> Result<(), crate::ExecutorError> {
+        // Existing models can continue using imported allocations after owner
+        // loss. Loading a model requires a live owner for any new imports.
+        if self
+            .asset_owner
+            .as_ref()
+            .is_some_and(|owner| !owner.is_available())
+        {
+            self.discard_asset_owner();
+        }
         let environment = source.environment();
         let program_ref = environment.program();
         let program_is_resident = self.programs.get(program_ref)?.is_some();
@@ -671,7 +695,19 @@ impl ModelRuntime {
                 attached_asset_bytes = self.asset_bytes,
                 "recycling bounded Catena GPU session"
             );
-            self.discard_session();
+            if asset_owner_requires_recycle(
+                self.assets.len(),
+                self.asset_bytes,
+                MissingAssets {
+                    count: missing_asset_count,
+                    bytes: missing_asset_bytes,
+                },
+                self.config,
+            ) {
+                self.discard_asset_owner();
+            } else {
+                self.discard_session();
+            }
         }
 
         // Recompute cache misses after a possible recycle, then reopen every
@@ -731,10 +767,21 @@ impl ModelRuntime {
             let timeouts = SessionTimeouts::default()
                 .with_compile_timeout(self.config.compile_timeout)
                 .with_execution_timeout(self.config.execution_timeout);
-            self.session = Some(Session::with_timeouts(GpuDialect::Hip, timeouts).map_err(
+            if self.asset_owner.is_none() {
+                self.asset_owner = Some(AssetOwner::with_backend(self.config.backend, timeouts).map_err(
+                    |error| {
+                        warn!(backend = %self.config.backend, runtime_error = %error, "failed to start Catena GPU asset owner");
+                        crate::ExecutorError::Execution("GPU runtime is unavailable".to_string())
+                    },
+                )?);
+            }
+            self.session = Some(Session::with_assets(
+                self.asset_owner.as_ref().expect("asset owner was initialized above"),
+                timeouts,
+            ).map_err(
                 |error| {
-                    warn!(runtime_error = %error, "failed to start Catena HIP session");
-                    crate::ExecutorError::Execution("HIP GPU runtime is unavailable".to_string())
+                    warn!(backend = %self.config.backend, runtime_error = %error, "failed to start Catena GPU session");
+                    crate::ExecutorError::Execution("GPU runtime is unavailable".to_string())
                 },
             )?);
         }
@@ -783,9 +830,9 @@ impl ModelRuntime {
                     .take()
                     .expect("preflight opened every nonresident static object");
                 let attached = self
-                    .session
+                    .asset_owner
                     .as_ref()
-                    .expect("session was initialized above")
+                    .expect("asset owner was initialized above")
                     .attach(*content.id().as_bytes(), file.into_file());
                 let asset = match attached {
                     Ok(asset) => asset,
@@ -797,7 +844,7 @@ impl ModelRuntime {
                             "Catena asset attachment failed"
                         );
                         if error.invalidates_session() {
-                            self.discard_session();
+                            self.discard_asset_owner();
                         }
                         return Err(crate::ExecutorError::Execution(format!(
                             "static content {} could not be attached to the GPU runtime",
@@ -867,7 +914,13 @@ impl ModelRuntime {
                     bind_error = %error,
                     "Catena causal-LM binding failed"
                 );
-                if error.invalidates_session() {
+                if self
+                    .asset_owner
+                    .as_ref()
+                    .is_some_and(|owner| !owner.is_available())
+                {
+                    self.discard_asset_owner();
+                } else if error.invalidates_session() {
                     self.discard_session();
                 }
                 return Err(crate::ExecutorError::Execution(format!(
@@ -894,8 +947,15 @@ impl ModelRuntime {
         self.models.clear();
         self.model_order.clear();
         self.programs.clear();
-        self.assets.clear();
         self.session = None;
+    }
+
+    fn discard_asset_owner(&mut self) {
+        // Drop model handles and their execution worker before the owner whose
+        // allocations those workers import.
+        self.discard_session();
+        self.assets.clear();
+        self.asset_owner = None;
         self.asset_bytes = 0;
     }
 }
@@ -920,12 +980,19 @@ fn session_requires_recycle(
     config: GpuConfig,
 ) -> bool {
     (!program_is_resident && resident.programs >= config.session_programs)
-        || resident
-            .assets
-            .checked_add(missing.count)
-            .is_none_or(|total| total > MAX_RESIDENT_ASSETS)
-        || resident
-            .asset_bytes
+        || asset_owner_requires_recycle(resident.assets, resident.asset_bytes, missing, config)
+}
+
+fn asset_owner_requires_recycle(
+    assets: usize,
+    asset_bytes: u64,
+    missing: MissingAssets,
+    config: GpuConfig,
+) -> bool {
+    assets
+        .checked_add(missing.count)
+        .is_none_or(|total| total > MAX_RESIDENT_ASSETS)
+        || asset_bytes
             .checked_add(missing.bytes)
             .is_none_or(|total| total > config.session_asset_bytes)
 }
