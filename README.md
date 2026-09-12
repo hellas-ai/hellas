@@ -92,7 +92,7 @@ compiles. The authorized worker is the final availability and integrity
 boundary: before nonresident content enters the safe runtime, it reopens the
 descriptor and enforces the exact ID and length; an already-resident exact
 mapping is reused. The provider then compiles the Catena source for its visible
-ROCm device. Verified static files are lent by descriptor to a bounded
+GPU device. Verified static files are lent by descriptor to a bounded
 persistent safe-runtime session, so an already prepared program and weights are
 reused across requests until the session is recycled or the service restarts.
 There is no client-supplied `gfx` target or provider architecture allow-list.
@@ -305,14 +305,20 @@ Hellas imports only `catena-lang` from the Catena workspace, pinned to a
 published Git revision in `Cargo.toml` and `Cargo.lock`. Nix vendors the same
 locked dependency; a sibling Catena checkout is not required.
 
-Enter the x86_64 Linux ROCm development shell with:
+Enter an x86_64 Linux GPU development shell with:
 
 ```sh
-nix develop .#rocm --no-write-lock-file
+nix develop .#rocm --no-write-lock-file  # AMD
+nix develop .#cuda --no-write-lock-file  # NVIDIA
 ```
 
-The NixOS provider module configures the ROCm toolchain, cache directory, and
-GPU device access when runtime content is enabled:
+Catena selects a usable CUDA or HIP runtime inside its isolated worker. Use
+`serve --gpu-backend auto|hip|cuda` to override selection. GPU visibility follows
+`CUDA_VISIBLE_DEVICES` or `HIP_VISIBLE_DEVICES`.
+
+The NixOS provider module configures toolchains, scratch directories, and device
+access for local execution. Set `gpuBackend = "cuda"` for NVIDIA or `"hip"` for
+AMD; automatic configuration includes CUDA when the NixOS NVIDIA driver is enabled:
 
 ```nix
 services.hellas = {
@@ -327,7 +333,7 @@ services.hellas = {
 Model weights, Catena programs, environment files, tokenizers, and generated
 compiler artifacts are runtime data. Keep them outside `/nix/store`; the
 module rejects store paths for these options. A provider chooses its actual
-ROCm device at execution time rather than baking a client-selected target into
+GPU device at execution time rather than baking a client-selected target into
 the environment.
 
 Fetch providers likewise use runtime files: set `fetchConfigFile` to the JSON
@@ -394,7 +400,7 @@ nix run .#check-kernel-model-verify
 
 ## Docker
 
-The Docker output is a network-only node image. It contains no local Catena or
+The default `docker` output is a network-only node image. It contains no local Catena or
 GPU runtime and is tagged `ghcr.io/hellas-ai/hellas:network`. The derivation
 streams a Docker archive to stdout:
 
@@ -402,6 +408,36 @@ streams a Docker archive to stdout:
 $(nix build .#docker --print-out-paths) | docker load
 nix run .#docker-push-all
 ```
+
+GPU images include Catena and the corresponding runtime compiler:
+
+```bash
+$(nix build .#docker-cuda --print-out-paths) | docker load
+$(nix build .#docker-hip --print-out-paths) | docker load
+
+# NVIDIA with a configured CDI device specification:
+docker run --rm --device nvidia.com/gpu=all \
+  -v hellas-state:/var/lib/hellas -v /srv/hellas/content:/content:ro \
+  ghcr.io/hellas-ai/hellas:cuda --software-root --content-root /content
+
+# AMD:
+docker run --rm --device /dev/kfd --device /dev/dri \
+  -v hellas-state:/var/lib/hellas -v /srv/hellas/content:/content:ro \
+  ghcr.io/hellas-ai/hellas:hip --software-root --content-root /content
+```
+
+Both GPU images default to `serve` with their matching backend. The host supplies
+the GPU driver; model content stays on runtime volumes. Publish `31145/udp` when
+accepting external connections. NVIDIA hosts using the conventional container
+runtime can use `--gpus all` instead of the CDI device argument.
+
+Catena uploads verified weights once into a dedicated GPU asset-owner process.
+Execution workers share read-only VRAM mappings and retain private KV caches and
+scratch memory. Worker replacement preserves cached weights; asset-capacity
+pressure recycles the owner as well. The session asset limit bounds cached weight
+payloads; leave additional VRAM for allocation granularity, contexts, and state.
+The HIP image uses the newer ROCm stack pinned from `nix-strix-halo`; resident
+sharing requires HIP 7.15 or newer. Source weight files remain read-only.
 
 ## Dependency maintenance
 

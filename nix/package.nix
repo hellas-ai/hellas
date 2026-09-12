@@ -11,7 +11,10 @@ let
   overlays = [
     (import rust-overlay)
     (final: _prev: {
-      hellasLib = import ./lib { pkgs = final; };
+      hellasLib = import ./lib {
+        pkgs = final;
+        inherit (self.inputs) nix-strix-halo;
+      };
     })
   ];
   pkgs = import nixpkgs (
@@ -67,7 +70,7 @@ let
     cargoLock = {
       lockFile = ../Cargo.lock;
       outputHashes = {
-        "catena-lang-0.1.0" = "sha256-kB9Xj8JItEd3mGuVK7MNIfzxoApKb/6FV4TUeSNdpaI=";
+        "catena-lang-0.1.0" = "sha256-Sd/zEpZadqk0XOLDU37EEQjwSkOeYUzaAeDN8l3hQdI=";
         "commonware-actor-2026.7.0" = "sha256-LEVuwzWlttz1znLpe0bmEV/Gk+7v9BI9/Un25tR7naM=";
       };
     };

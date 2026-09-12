@@ -187,6 +187,7 @@ rec {
     "--content"
     "--content-root"
     "--content-index"
+    "--gpu-backend"
     "--gpu-session-programs"
     "--gpu-session-asset-bytes"
     "--gpu-max-generation-capacity"
@@ -249,6 +250,7 @@ rec {
     || serve.content != [ ]
     || serve.contentRoots != [ ]
     || serve.contentIndex != null
+    || serve.gpuBackend != null
     || serve.gpuSessionPrograms != null
     || serve.gpuSessionAssetBytes != null
     || serve.gpuMaxGenerationCapacity != null
@@ -337,7 +339,10 @@ rec {
     { lib, pkgs }:
     let
       inherit (lib) mkOption types;
-      hellasLib = import ../lib { inherit pkgs; };
+      hellasLib = import ../lib {
+        inherit pkgs;
+        inherit (self.inputs) nix-strix-halo;
+      };
       runtimePath = types.strMatching "/.*";
       catenaMaxResidentAssetBytes = 4 * 1024 * 1024 * 1024 * 1024;
       positiveLimitOption =
@@ -442,17 +447,29 @@ rec {
           $HOME/.hellas/artifacts.
         '';
       };
+      gpuBackend = mkOption {
+        type = types.nullOr (
+          types.enum [
+            "auto"
+            "hip"
+            "cuda"
+          ]
+        );
+        default = null;
+        description = "GPU backend selected inside Catena's isolated worker. Null uses automatic detection.";
+      };
       gpuSessionPrograms = positiveLimitOption "Maximum distinct Catena programs retained in one resident GPU session. Null uses the CLI default.";
       gpuSessionAssetBytes = mkOption {
         type = types.nullOr (types.ints.between 1 catenaMaxResidentAssetBytes);
         default = null;
         description = ''
-          Logical admission limit for aggregate static bytes retained in one
-          resident GPU session (at most 4398046511104 bytes, Catena's 4 TiB
-          hard ceiling). Catena may mmap-register these assets as pinned host
-          memory. This is not an RLIMIT_MEMLOCK or whole-service RAM limit;
-          NixOS operators should set memoryMaxBytes separately. Null uses the
-          CLI default.
+          Logical admission limit for aggregate static bytes retained by the
+          shared VRAM owner across execution-worker restarts (at most
+          4398046511104 bytes, Catena's 4 TiB hard ceiling). Execution workers
+          map these assets read-only and keep generation state private.
+          Physical VRAM also includes allocation-granularity padding, private
+          generation allocations, and driver overhead. Set memoryMaxBytes
+          separately to bound host RAM. Null uses the CLI default.
         '';
       };
       gpuMaxGenerationCapacity = mkOption {
@@ -826,6 +843,7 @@ rec {
       path
     ]) serve.contentRoots
     ++ optArg "--content-index" serve.contentIndex
+    ++ optArg "--gpu-backend" serve.gpuBackend
     ++ optArg "--gpu-session-programs" serve.gpuSessionPrograms
     ++ optArg "--gpu-session-asset-bytes" serve.gpuSessionAssetBytes
     ++ optArg "--gpu-max-generation-capacity" serve.gpuMaxGenerationCapacity

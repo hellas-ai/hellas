@@ -1,4 +1,7 @@
-{ pkgs }:
+{ pkgs, nix-strix-halo }:
+let
+  rocm = import ../rocm.nix { inherit pkgs nix-strix-halo; };
+in
 {
   apiFlavor = {
     anthropic = "anthropic-messages";
@@ -18,14 +21,36 @@
   # this derivation contains only the provider toolchain.
   rocmToolkit = pkgs.symlinkJoin {
     name = "hellas-rocm-toolkit";
+    nativeBuildInputs = [ pkgs.makeWrapper ];
+    postBuild = ''
+      wrapProgram "$out/bin/hipcc" \
+        --add-flags "--rocm-path=$out --rocm-device-lib-path=${rocm.rocm-device-libs}/amdgcn/bitcode -I$out/include -L$out/lib" \
+        --set-default HIP_PATH "$out" \
+        --set-default ROCM_PATH "$out" \
+        --set-default HIP_CLANG_PATH "${rocm.clang}/bin"
+    '';
     paths = [
-      pkgs.rocmPackages.clang
-      pkgs.rocmPackages.clr
-      pkgs.rocmPackages.hip-common
-      pkgs.rocmPackages.hipcc
-      pkgs.rocmPackages.rocm-core
-      pkgs.rocmPackages.rocm-device-libs
-      pkgs.rocmPackages.rocm-runtime
+      rocm.clang
+      rocm.clr
+      rocm.hip-common
+      rocm.hipcc
+      rocm.rocm-core
+      rocm.rocm-device-libs
+      rocm.rocm-runtime
+    ];
+  };
+  cudaToolkit = pkgs.symlinkJoin {
+    name = "hellas-cuda-toolkit";
+    nativeBuildInputs = [ pkgs.makeWrapper ];
+    postBuild = ''
+      wrapProgram "$out/bin/nvcc" \
+        --add-flags "-I$out/include -L$out/lib" \
+        --set-default NVCC_CCBIN "${pkgs.cudaPackages.backendStdenv.cc}/bin/c++"
+    '';
+    paths = with pkgs.cudaPackages; [
+      cuda_nvcc
+      cuda_cudart
+      cccl
     ];
   };
 }
