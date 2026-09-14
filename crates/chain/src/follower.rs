@@ -172,7 +172,7 @@ async fn follow(context: tokio::Context, options: FollowerOptions) -> Result<(),
     follow_remote(indexer, options.rpc, consensus_info, options.status).await
 }
 
-async fn follow_remote(
+pub(crate) async fn follow_remote(
     indexer: ChainIndexer,
     rpc: String,
     consensus_info: ConsensusInfo,

@@ -377,6 +377,31 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "writes deterministic local integration fixtures only when explicitly requested"]
+    fn export_integration_fixture() {
+        let directory =
+            std::env::var("HELLAS_EXPLORER_FIXTURE_DIR").expect("set fixture output directory");
+        let directory = std::path::Path::new(&directory);
+        std::fs::create_dir_all(directory).unwrap();
+        let (verifier, bundle) = fixture();
+        std::fs::write(
+            directory.join("trust.json"),
+            serde_json::to_vec_pretty(&verifier.trust).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            directory.join("proof.json"),
+            serde_json::to_vec(&bundle).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            directory.join("proof.pb"),
+            prost::Message::encode_to_vec(&bundle),
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn verifies_block_transaction_and_both_wire_encodings() {
         let (verifier, bundle) = fixture();
         let json: ProofBundle =
