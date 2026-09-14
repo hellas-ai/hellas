@@ -25,54 +25,16 @@ jobs:
       - name: Build dev shell
         run: nix develop --accept-flake-config --command true
 
-  lints-matrix:
-    runs-on: ubuntu-latest
-    outputs:
-      matrix: ${{ steps.set-matrix.outputs.matrix }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: NixOS/nix-installer-action@62c1943b776c509394b550f3f983adc14e9212d6
-      - id: set-matrix
-        name: Enumerate CI checks
-        run: |
-          set -Eeu
-          matrix="$(
-            nix eval --accept-flake-config --json '.#ci.x86_64-linux.checks' --apply '
-              cs: { include = map (name: { inherit name; }) (builtins.attrNames cs); }
-            '
-          )"
-          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
-
   lints:
     runs-on: ubuntu-latest
-    name: lint:${{ matrix.name }}
+    name: Lints
     needs:
       - devshell
-      - lints-matrix
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.lints-matrix.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v4
       - uses: NixOS/nix-installer-action@62c1943b776c509394b550f3f983adc14e9212d6
-      - name: nix run .#check-${{ matrix.name }}
-        run: nix run --accept-flake-config '.#check-${{ matrix.name }}'
-
-  lints-passed:
-    runs-on: ubuntu-latest
-    if: always()
-    name: Lints passed
-    needs:
-      - devshell
-      - lints-matrix
-      - lints
-    steps:
-      - name: Require devshell + lints-matrix + all lints succeeded
-        run: |
-          set -Eeu
-          test '${{ needs.devshell.result }}' = 'success'
-          test '${{ needs.lints-matrix.result }}' = 'success'
-          test '${{ needs.lints.result }}' = 'success'
+      - name: nix run .#check
+        run: nix run --accept-flake-config .#check
 
   # ─── release builds ─────────────────────────────────────────────────────
   # Native, cross, and container builds run on PRs and again once merged.
@@ -80,7 +42,7 @@ jobs:
   # by default), so this stage also covers test execution.
 
   build-smoke-matrix:
-    needs: lints-passed
+    needs: lints
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
