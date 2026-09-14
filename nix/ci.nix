@@ -214,6 +214,8 @@ let
   }
   // lib.optionalAttrs (pkgs.stdenv.hostPlatform.system == "x86_64-linux") {
     cli-catena = "cli-catena";
+    docker-cuda = "docker-cuda";
+    docker-hip = "docker-hip";
   };
 in
 {

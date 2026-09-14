@@ -1,9 +1,8 @@
 name: CI
 
 # Trigger model:
-#   push to default branch      → lints only
-#   pull_request                → lints + build-smoke + e2e
-#   push to default branch      → lints + build-full (TODO)
+#   pull_request                → lints + release builds + e2e
+#   push to master              → lints + release builds
 #   workflow_dispatch (release) → push artifacts (TODO)
 on:
   pull_request:
@@ -75,13 +74,12 @@ jobs:
           test '${{ needs.lints-matrix.result }}' = 'success'
           test '${{ needs.lints.result }}' = 'success'
 
-  # ─── build-smoke (PR only) ──────────────────────────────────────────────
-  # Slow native + cross builds gated to PRs. The native builds run cargo test
-  # as part of buildRustPackage (`doCheck = true` by default), so this stage
-  # also covers test execution.
+  # ─── release builds ─────────────────────────────────────────────────────
+  # Native, cross, and container builds run on PRs and again once merged.
+  # Native builds run cargo test as part of buildRustPackage (`doCheck = true`
+  # by default), so this stage also covers test execution.
 
   build-smoke-matrix:
-    if: github.event_name == 'pull_request'
     needs: lints-passed
     runs-on: ubuntu-latest
     outputs:
@@ -105,7 +103,6 @@ jobs:
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
   build-smoke:
-    if: github.event_name == 'pull_request'
     needs: build-smoke-matrix
     runs-on: ubuntu-latest
     name: build:${{ matrix.name }}
@@ -119,7 +116,7 @@ jobs:
         run: nix build --accept-flake-config --print-build-logs --no-link '.#packages.x86_64-linux.${{ matrix.attr }}'
 
   build-smoke-passed:
-    if: always() && github.event_name == 'pull_request'
+    if: always()
     runs-on: ubuntu-latest
     name: Build smoke passed
     needs:
