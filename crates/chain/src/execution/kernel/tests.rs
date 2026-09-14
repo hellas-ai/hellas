@@ -71,6 +71,7 @@ async fn read_objects(
             Some(Object::RegistryChunk(chunk)) => {
                 panic!("kernel open/close scenarios store no registry chunk, found {chunk:?}");
             }
+            Some(Object::OwnerData(_)) => panic!("object id collided with owner metadata"),
             None => {}
         }
     }
@@ -2139,5 +2140,97 @@ fn proposal_byte_budget_stops_admission_and_retains_the_tail() {
                 .expect("edge read"),
             Some(Object::Edge(_))
         ));
+    });
+}
+
+#[test]
+fn owner_commitments_are_speculative_replayable_and_match_native_reconstruction() {
+    run_qmdb(|runtime| async move {
+        let first = database(runtime.child("owner_first"), "owner-first").await;
+        let replay = database(runtime.child("owner_replay"), "owner-replay").await;
+        let fixture = kernel_fixture(10).unwrap();
+        let genesis = index_genesis();
+        let owners = OwnerIndex::new(
+            crate::domain::TEST_NETWORK,
+            &genesis,
+            fixture.allocations.clone(),
+        );
+        let mut parent = genesis;
+        for (height, tx) in [(1, fixture.open.clone()), (2, fixture.mutual_close.clone())] {
+            let before = super::super::owner_tree::root(&first.new_batches().await)
+                .await
+                .unwrap();
+            let batches = execute_all(
+                context(height),
+                &ChainVerifier::new(),
+                &[Transaction::Kernel(tx.clone())],
+                &fixture.allocations,
+                first.new_batches().await,
+            )
+            .await
+            .unwrap();
+            let expected = super::super::owner_tree::root(&batches).await.unwrap();
+            // A competing/discarded speculative branch must not mutate the committed root.
+            assert_eq!(
+                super::super::owner_tree::root(&first.new_batches().await)
+                    .await
+                    .unwrap(),
+                before
+            );
+            let merkleized = batches.merkleize().await.unwrap();
+            let state_root = merkleized.root();
+            first.finalize(merkleized).await;
+            let replay_batches = execute_all(
+                context(height),
+                &ChainVerifier::new(),
+                &[Transaction::Kernel(tx.clone())],
+                &fixture.allocations,
+                replay.new_batches().await,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                super::super::owner_tree::root(&replay_batches)
+                    .await
+                    .unwrap(),
+                expected
+            );
+            let replay_merkleized = replay_batches.merkleize().await.unwrap();
+            assert_eq!(replay_merkleized.root(), state_root);
+            replay.finalize(replay_merkleized).await;
+            let block = index_block(&parent, state_root, vec![Transaction::Kernel(tx)])
+                .with_owner_root(expected);
+            owners.apply_finalized(&block).unwrap();
+            let mut rebuilt = crate::owner_proof::MemoryOwnerTree::default();
+            for (id, coin) in owners.all_coins_for_test() {
+                crate::owner_proof::update_holding(
+                    &mut rebuilt,
+                    coin.owner,
+                    id,
+                    Some((0, coin.value)),
+                )
+                .await
+                .unwrap();
+            }
+            for (id, edge) in owners.all_edges_for_test() {
+                crate::owner_proof::update_holding(&mut rebuilt, edge.maker, id, Some((1, 0)))
+                    .await
+                    .unwrap();
+                if edge.taker != edge.maker {
+                    crate::owner_proof::update_holding(&mut rebuilt, edge.taker, id, Some((1, 0)))
+                        .await
+                        .unwrap();
+                }
+            }
+            assert_eq!(
+                crate::owner_proof::owner_root(&rebuilt).await.unwrap(),
+                expected
+            );
+            let page = crate::owner_proof::prove_owner_page(&rebuilt, fixture.maker, 0, 64)
+                .await
+                .unwrap();
+            crate::owner_proof::verify_owner_page(expected, fixture.maker, 0, 64, &page).unwrap();
+            parent = block;
+        }
     });
 }

@@ -265,6 +265,14 @@ pub fn advance_cursor(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AddressStoreQuery {
+    pub owner: crate::domain::SettlementKey,
+    pub offset: u64,
+    pub limit: u32,
+    pub payload: Option<Digest>,
+}
+
 /// Backends retain canonical evidence. Re-verify returned bundles against the current pinned
 /// trust document before rendering. Futures intentionally need not be Send on a WASM isolate.
 /// `commit` atomically stores evidence and advances the cursor, rejects immutable-key conflicts,
@@ -275,6 +283,12 @@ pub trait VerifiedStore {
     async fn cursor(&self) -> Result<Option<VerifiedCursor>, Self::Error>;
     async fn get(&self, query: FinalizedBlockQuery) -> Result<Option<ProofBundle>, Self::Error>;
     async fn commit(&self, block: &VerifiedBlock) -> Result<(), Self::Error>;
+    async fn get_address(
+        &self,
+        query: AddressStoreQuery,
+    ) -> Result<Option<AddressProofBundle>, Self::Error>;
+    /// Store snapshot-bound address evidence atomically with its certified block/cursor.
+    async fn commit_address(&self, address: &VerifiedAddress) -> Result<(), Self::Error>;
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -294,6 +308,32 @@ mod tests {
     use commonware_utils::{N3f1, non_empty_range, ordered::Set};
     use hellas_genesis::{HELLAS_DEVNET_1_ID, TrustEpoch};
     use rand::{SeedableRng, rngs::StdRng};
+
+    fn immediate<F: std::future::Future>(future: F) -> F::Output {
+        let mut future = std::pin::pin!(future);
+        match future
+            .as_mut()
+            .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+        {
+            std::task::Poll::Ready(value) => value,
+            std::task::Poll::Pending => panic!("memory fixture must not wait for IO"),
+        }
+    }
+    fn owner_fixture() -> (
+        crate::domain::SettlementKey,
+        crate::owner_proof::MemoryOwnerTree,
+    ) {
+        let owner = crate::domain::SettlementKey::from_bytes([1; 33]);
+        let mut tree = crate::owner_proof::MemoryOwnerTree::default();
+        immediate(crate::owner_proof::update_holding(
+            &mut tree,
+            owner,
+            Digest::from([1; 32]),
+            Some((0, 123)),
+        ))
+        .unwrap();
+        (owner, tree)
+    }
 
     fn fixture() -> (ExplorerVerifier, ProofBundle) {
         let keys = (0..4)
@@ -354,6 +394,9 @@ mod tests {
                 hellas_kernel::test_support::valid_open_tx().unwrap(),
             )],
         );
+        let (_, tree) = owner_fixture();
+        let block =
+            block.with_owner_root(immediate(crate::owner_proof::owner_root(&tree)).unwrap());
         let proposal = Proposal::new(block.context().round, View::zero(), block.digest());
         let votes = schemes
             .iter()
@@ -384,6 +427,25 @@ mod tests {
         let directory = std::path::Path::new(&directory);
         std::fs::create_dir_all(directory).unwrap();
         let (verifier, bundle) = fixture();
+        let (owner, tree) = owner_fixture();
+        let page = immediate(crate::owner_proof::prove_owner_page(&tree, owner, 0, 64)).unwrap();
+        let address = AddressProofBundle {
+            schema_version: 1,
+            block: Some(bundle.clone()),
+            page: serde_json::to_vec(&page).unwrap(),
+        };
+        std::fs::write(
+            directory.join("address.json"),
+            serde_json::to_vec(&address).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            directory.join("address.pb"),
+            prost::Message::encode_to_vec(&address),
+        )
+        .unwrap();
+        std::fs::write(directory.join("owner.txt"), owner.to_string()).unwrap();
+
         std::fs::write(
             directory.join("trust.json"),
             serde_json::to_vec_pretty(&verifier.trust).unwrap(),
@@ -399,6 +461,32 @@ mod tests {
             prost::Message::encode_to_vec(&bundle),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn address_bundle_binds_owner_summary_and_page_to_certified_block() {
+        let (verifier, bundle) = fixture();
+        let (owner, tree) = owner_fixture();
+        let page = immediate(crate::owner_proof::prove_owner_page(&tree, owner, 0, 64)).unwrap();
+        let bundle = AddressProofBundle {
+            schema_version: 1,
+            block: Some(bundle),
+            page: serde_json::to_vec(&page).unwrap(),
+        };
+        let verified = verifier
+            .verify_address(bundle.clone(), owner, 0, 64)
+            .unwrap();
+        assert_eq!(verified.summary().balance, 123);
+        assert_eq!(verified.summary().count, 1);
+        let mut bad = bundle.clone();
+        let mut page = page;
+        page.holdings[0].path.leaf = Some(crate::owner_proof::OwnerLeaf::Holding {
+            kind: 0,
+            balance: 999,
+        });
+        bad.page = serde_json::to_vec(&page).unwrap();
+        assert!(verifier.verify_address(bad, owner, 0, 64).is_err());
+        assert!(verifier.verify_address(bundle, owner, 1, 64).is_err());
     }
 
     #[test]
@@ -502,5 +590,73 @@ mod tests {
             advance_cursor(Some(new), VerifiedCursor { height: 2, ..old }),
             Err(CursorError::Conflict)
         );
+    }
+}
+
+/// Address evidence uses the identical canonical block bundle plus a bounded typed owner proof.
+/// The `page` bytes are serde JSON for `OwnerPageProof`; all claims are reconstructed and checked
+/// against the owner root in the certified block, independent of the serialization's spelling.
+#[derive(Clone, PartialEq, Serialize, Deserialize, prost::Message)]
+#[serde(deny_unknown_fields)]
+pub struct AddressProofBundle {
+    #[prost(uint32, tag = "1")]
+    pub schema_version: u32,
+    #[prost(message, optional, tag = "2")]
+    pub block: Option<ProofBundle>,
+    #[prost(bytes = "vec", tag = "3")]
+    pub page: Vec<u8>,
+}
+
+pub struct VerifiedAddress {
+    block: VerifiedBlock,
+    page: crate::owner_proof::OwnerPageProof,
+    summary: crate::owner_proof::OwnerCommitment,
+    bundle: AddressProofBundle,
+}
+impl VerifiedAddress {
+    pub fn block(&self) -> &VerifiedBlock {
+        &self.block
+    }
+    pub fn page(&self) -> &crate::owner_proof::OwnerPageProof {
+        &self.page
+    }
+    pub fn summary(&self) -> crate::owner_proof::OwnerCommitment {
+        self.summary
+    }
+    pub fn bundle(&self) -> &AddressProofBundle {
+        &self.bundle
+    }
+}
+impl ExplorerVerifier {
+    pub fn verify_address(
+        &self,
+        bundle: AddressProofBundle,
+        owner: crate::domain::SettlementKey,
+        offset: u64,
+        limit: u32,
+    ) -> Result<VerifiedAddress, VerificationError> {
+        if bundle.schema_version != PROOF_SCHEMA_VERSION || bundle.page.len() > MAX_PROOF_BYTES {
+            return Err(VerificationError::Identity);
+        }
+        let block = self.verify(
+            bundle.block.clone().ok_or(VerificationError::Query)?,
+            ExplorerQuery::Block(FinalizedBlockQuery::Latest),
+        )?;
+        let page: crate::owner_proof::OwnerPageProof =
+            serde_json::from_slice(&bundle.page).map_err(|_| VerificationError::Query)?;
+        let summary = crate::owner_proof::verify_owner_page(
+            block.view().owner_root(),
+            owner,
+            offset,
+            limit,
+            &page,
+        )
+        .map_err(|_| VerificationError::Query)?;
+        Ok(VerifiedAddress {
+            block,
+            page,
+            summary,
+            bundle,
+        })
     }
 }

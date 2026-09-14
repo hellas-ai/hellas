@@ -17,6 +17,7 @@ domain = [
     "dep:hellas-genesis",
     "dep:hellas-kernel",
     "dep:p256",
+    "dep:serde",
     "dep:serde_json",
     "dep:sha2",
     "dep:thiserror",

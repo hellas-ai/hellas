@@ -44,15 +44,15 @@ pub fn utxo_db_config(
 
     FixedConfig {
         merkle_config: MmrConfig {
-            journal_partition: format!("{partition_prefix}_utxo_mmr_journal_v2"),
-            metadata_partition: format!("{partition_prefix}_utxo_mmr_metadata_v2"),
+            journal_partition: format!("{partition_prefix}_utxo_mmr_journal_v3"),
+            metadata_partition: format!("{partition_prefix}_utxo_mmr_metadata_v3"),
             items_per_blob: ITEMS_PER_BLOB,
             write_buffer: WRITE_BUFFER,
             strategy: Sequential,
             page_cache: page_cache.clone(),
         },
         journal_config: FixedLogConfig {
-            partition: format!("{partition_prefix}_utxo_log_journal_v2"),
+            partition: format!("{partition_prefix}_utxo_log_journal_v3"),
             items_per_blob: ITEMS_PER_BLOB,
             page_cache,
             write_buffer: WRITE_BUFFER,
