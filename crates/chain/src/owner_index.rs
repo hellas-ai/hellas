@@ -38,6 +38,7 @@ pub struct OwnerCursor {
 pub enum ApplyOutcome {
     Applied,
     Duplicate,
+    Stale,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -261,6 +262,16 @@ impl State {
                 return Ok(ApplyOutcome::Duplicate);
             }
             return Err(OwnerIndexError::ConflictingHeight { height });
+        }
+        // Finalized delivery is at-least-once: marshal resumes from its own
+        // durable acknowledgement, which may sit below the height this index
+        // reached by replaying the finalized-block archive. Below the
+        // finalized tip there are no forks, so a redelivery under the cursor
+        // is the block already folded in and nothing else. It cannot be
+        // payload-checked — only the cursor payload is retained — and it must
+        // not be reapplied, so it is acknowledged and dropped.
+        if height < self.cursor.height {
+            return Ok(ApplyOutcome::Stale);
         }
         let next_height = self.cursor.height.saturating_add(1);
         if height != next_height {

@@ -68,9 +68,89 @@ fn duplicate_finalized_block_is_idempotent() {
 
     assert_eq!(indexer.apply_finalized(&block), Ok(ApplyOutcome::Applied));
     let before = indexer.get_coins_by_owner(&settlement(1));
+    let cursor = indexer.cursor();
 
     assert_eq!(indexer.apply_finalized(&block), Ok(ApplyOutcome::Duplicate));
     assert_eq!(indexer.get_coins_by_owner(&settlement(1)), before);
+    assert_eq!(indexer.cursor(), cursor);
+}
+
+#[test]
+fn stale_finalized_block_is_acknowledged_without_reapplying() {
+    let genesis = genesis();
+    let indexer = OwnerIndex::new(
+        crate::domain::TEST_NETWORK,
+        &genesis,
+        vec![(settlement(1), 100)],
+    );
+    let tx = Transaction::transfer(
+        crate::domain::TEST_NETWORK,
+        &key(1),
+        genesis_object_id(0),
+        address(2),
+        40,
+    )
+    .unwrap();
+    let first = block(&genesis, vec![tx]);
+    let second = block(&first, Vec::new());
+
+    assert_eq!(indexer.apply_finalized(&first), Ok(ApplyOutcome::Applied));
+    assert_eq!(indexer.apply_finalized(&second), Ok(ApplyOutcome::Applied));
+    let cursor = indexer.cursor();
+    assert_eq!(cursor.height, 2);
+    assert_eq!(cursor.payload, second.digest());
+    let before = indexer.get_coins_by_owner(&settlement(2));
+
+    assert_eq!(indexer.apply_finalized(&first), Ok(ApplyOutcome::Stale));
+    assert_eq!(indexer.cursor(), cursor);
+    assert_eq!(indexer.cursor().height, 2);
+    assert_eq!(indexer.cursor().payload, second.digest());
+    assert_eq!(indexer.get_coins_by_owner(&settlement(2)), before);
+}
+
+#[test]
+fn forward_height_gap_is_rejected() {
+    let genesis = genesis();
+    let indexer = OwnerIndex::new(
+        crate::domain::TEST_NETWORK,
+        &genesis,
+        vec![(settlement(1), 100)],
+    );
+    let first = block(&genesis, Vec::new());
+    let second = block(&first, Vec::new());
+    let third = block(&second, Vec::new());
+
+    assert_eq!(indexer.apply_finalized(&first), Ok(ApplyOutcome::Applied));
+    assert_eq!(
+        indexer.apply_finalized(&third),
+        Err(OwnerIndexError::HeightGap {
+            current: 1,
+            next: 3
+        })
+    );
+    assert_eq!(indexer.cursor().height, 1);
+    assert_eq!(indexer.cursor().payload, first.digest());
+}
+
+#[test]
+fn conflicting_payload_at_cursor_height_is_rejected() {
+    let genesis = genesis();
+    let indexer = OwnerIndex::new(
+        crate::domain::TEST_NETWORK,
+        &genesis,
+        vec![(settlement(1), 100)],
+    );
+    let first = block(&genesis, Vec::new());
+    let fork = index_block(&genesis, Sha256::hash(b"fork-1"), Vec::new());
+    assert_ne!(first.digest(), fork.digest());
+
+    assert_eq!(indexer.apply_finalized(&first), Ok(ApplyOutcome::Applied));
+    assert_eq!(
+        indexer.apply_finalized(&fork),
+        Err(OwnerIndexError::ConflictingHeight { height: 1 })
+    );
+    assert_eq!(indexer.cursor().height, 1);
+    assert_eq!(indexer.cursor().payload, first.digest());
 }
 
 #[test]
