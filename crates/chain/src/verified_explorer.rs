@@ -58,7 +58,7 @@ pub enum VerificationError {
     Consensus(#[from] crate::ConsensusVerificationError),
     #[error(transparent)]
     Block(#[from] crate::BlockViewError),
-    #[error("trust document does not name the shipped devnet genesis")]
+    #[error("trust document does not match the independently provisioned devnet genesis")]
     Genesis,
     #[error("proof schema, network, or trust document does not match")]
     Identity,
@@ -83,8 +83,23 @@ pub struct ExplorerVerifier {
 impl ExplorerVerifier {
     /// `trust` is an authenticated deployment input, never a document accepted from a query peer.
     pub fn new(trust: TrustDocument) -> Result<Self, VerificationError> {
+        Self::with_genesis(trust, HELLAS_DEVNET_1_JSON.as_bytes())
+    }
+
+    /// Both inputs must be authenticated deployment inputs, never accepted from a query peer.
+    /// The digest covers the exact JSON bytes, including whitespace and trailing newlines.
+    pub fn with_genesis(
+        trust: TrustDocument,
+        genesis_json: &[u8],
+    ) -> Result<Self, VerificationError> {
         trust.validate()?;
-        if trust.genesis_sha256 != hex::encode(Sha256::hash(HELLAS_DEVNET_1_JSON.as_bytes())) {
+        let genesis: hellas_genesis::Genesis =
+            serde_json::from_slice(genesis_json).map_err(|_| VerificationError::Genesis)?;
+        if genesis.validate().is_err()
+            || genesis.network_id != hellas_genesis::HELLAS_DEVNET_1_ID
+            || genesis.network_id != trust.network_id
+            || trust.genesis_sha256 != hex::encode(Sha256::hash(genesis_json))
+        {
             return Err(VerificationError::Genesis);
         }
         let trust_sha256 = hex::encode(Sha256::hash(
@@ -335,6 +350,35 @@ mod tests {
         (owner, tree)
     }
 
+    #[test]
+    fn provisioned_genesis_is_pinned_by_exact_bytes_and_network() {
+        let (verifier, _) = fixture();
+        let mut trust = verifier.trust.clone();
+        let mut genesis: hellas_genesis::Genesis =
+            serde_json::from_str(HELLAS_DEVNET_1_JSON).unwrap();
+        genesis.validators[0].label = "disposable-demo".into();
+        let document = serde_json::to_vec(&genesis).unwrap();
+        trust.genesis_sha256 = hex::encode(Sha256::hash(&document));
+        assert!(ExplorerVerifier::with_genesis(trust.clone(), &document).is_ok());
+        assert!(matches!(
+            ExplorerVerifier::new(trust.clone()),
+            Err(VerificationError::Genesis)
+        ));
+        let mut changed = document.clone();
+        changed.push(b'\n');
+        assert!(matches!(
+            ExplorerVerifier::with_genesis(trust.clone(), &changed),
+            Err(VerificationError::Genesis)
+        ));
+        genesis.network_id = "untrusted-network".into();
+        let document = serde_json::to_vec(&genesis).unwrap();
+        trust.genesis_sha256 = hex::encode(Sha256::hash(&document));
+        assert!(matches!(
+            ExplorerVerifier::with_genesis(trust, &document),
+            Err(VerificationError::Genesis)
+        ));
+    }
+
     fn fixture() -> (ExplorerVerifier, ProofBundle) {
         let keys = (0..4)
             .map(ed25519::PrivateKey::from_seed)
@@ -426,6 +470,7 @@ mod tests {
             std::env::var("HELLAS_EXPLORER_FIXTURE_DIR").expect("set fixture output directory");
         let directory = std::path::Path::new(&directory);
         std::fs::create_dir_all(directory).unwrap();
+        std::fs::write(directory.join("genesis.json"), HELLAS_DEVNET_1_JSON).unwrap();
         let (verifier, bundle) = fixture();
         let (owner, tree) = owner_fixture();
         let page = immediate(crate::owner_proof::prove_owner_page(&tree, owner, 0, 64)).unwrap();

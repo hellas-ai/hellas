@@ -378,7 +378,31 @@ pub async fn spawn_trusted_follower_indexer<E>(
 where
     E: BufferPooler + Clock + Metrics + Spawner + Storage + CryptoRng,
 {
-    let schedule = TrustedEpochs::new(trust)?;
+    spawn_trusted_follower_indexer_with_genesis(
+        context,
+        partition_prefix,
+        config,
+        trust,
+        hellas_genesis::HELLAS_DEVNET_1_JSON.as_bytes(),
+        genesis_block,
+    )
+    .await
+}
+
+/// Initialize a follower using an independently provisioned genesis document and trust schedule.
+#[cfg(feature = "explorer-origin")]
+pub async fn spawn_trusted_follower_indexer_with_genesis<E>(
+    context: E,
+    partition_prefix: &str,
+    config: Config,
+    trust: hellas_genesis::TrustDocument,
+    genesis_json: &[u8],
+    genesis_block: HellasBlock,
+) -> Result<(ChainIndexer, Handle<()>), IngestError>
+where
+    E: BufferPooler + Clock + Metrics + Spawner + Storage + CryptoRng,
+{
+    let schedule = TrustedEpochs::with_genesis(trust, genesis_json)?;
     let verifier = schedule
         .verifier(Height::zero(), commonware_consensus::types::Epoch::zero())?
         .clone();

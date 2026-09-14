@@ -9,8 +9,12 @@ pub(super) struct TrustedEpochs {
     verifiers: Arc<Vec<ConsensusVerifier>>,
 }
 impl TrustedEpochs {
+    #[cfg(test)]
     pub fn new(trust: TrustDocument) -> Result<Self, IngestError> {
-        crate::verified_explorer::ExplorerVerifier::new(trust.clone())
+        Self::with_genesis(trust, hellas_genesis::HELLAS_DEVNET_1_JSON.as_bytes())
+    }
+    pub fn with_genesis(trust: TrustDocument, genesis_json: &[u8]) -> Result<Self, IngestError> {
+        crate::verified_explorer::ExplorerVerifier::with_genesis(trust.clone(), genesis_json)
             .map_err(|error| IngestError::TrustSchedule(error.to_string()))?;
         // Marshal's transition logic asks for epoch.next(), so native ingestion requires
         // consecutive round epochs even though an offline verifier can inspect sparse IDs.

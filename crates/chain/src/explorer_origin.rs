@@ -32,6 +32,8 @@ type OriginResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 pub struct OriginOptions {
     pub rpc: String,
     pub trust: TrustDocument,
+    /// Exact independently provisioned genesis JSON bytes; None uses the embedded devnet.
+    pub genesis_json: Option<Vec<u8>>,
     pub storage_dir: PathBuf,
     pub partition_prefix: String,
     pub listen: SocketAddr,
@@ -42,12 +44,18 @@ pub fn run(options: OriginOptions) -> OriginResult<()> {
     if !options.listen.ip().is_loopback() {
         return Err("private explorer origin must bind to loopback".into());
     }
-    let verifier = Arc::new(ExplorerVerifier::new(options.trust.clone())?);
+    let genesis_json = options
+        .genesis_json
+        .unwrap_or_else(|| HELLAS_DEVNET_1_JSON.as_bytes().to_vec());
+    let verifier = Arc::new(ExplorerVerifier::with_genesis(
+        options.trust.clone(),
+        &genesis_json,
+    )?);
+    let genesis: Genesis = serde_json::from_slice(&genesis_json)?;
     let runtime = tokio::Config::new()
         .with_storage_directory(&options.storage_dir)
         .with_tcp_nodelay(Some(true));
     tokio::Runner::new(runtime).start(move |context| async move {
-        let genesis: Genesis = serde_json::from_str(HELLAS_DEVNET_1_JSON)?;
         let info = ConsensusInfo {
             network_id: genesis.network_id.clone(),
             validators: genesis
@@ -77,11 +85,12 @@ pub fn run(options: OriginOptions) -> OriginResult<()> {
             ApplicationConfig::default(),
         )
         .await;
-        let (indexer, _marshal) = crate::indexer::spawn_trusted_follower_indexer(
+        let (indexer, _marshal) = crate::indexer::spawn_trusted_follower_indexer_with_genesis(
             context.child("indexer"),
             &options.partition_prefix,
             Config::default(),
             options.trust,
+            &genesis_json,
             application.genesis_block(),
         )
         .await?;
