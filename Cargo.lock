@@ -2559,6 +2559,7 @@ dependencies = [
  "opentelemetry_sdk 0.31.0",
  "p256",
  "prometheus-client",
+ "prost",
  "rand 0.10.2",
  "rand_core 0.10.1",
  "serde",

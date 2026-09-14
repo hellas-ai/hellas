@@ -48,7 +48,7 @@ pub struct OpenArgs {
     /// Chain light-client RPC endpoint
     #[arg(long)]
     rpc: String,
-    /// Network to sign for: a shipped name (`devnet`, `testnet`) or a
+    /// Network to sign for: a shipped name (`devnet`) or a
     /// full network id
     #[arg(long, default_value = "devnet", conflicts_with = "genesis")]
     network: String,
@@ -92,7 +92,7 @@ pub struct CloseArgs {
     /// Chain light-client RPC endpoint
     #[arg(long)]
     rpc: String,
-    /// Network to sign for: a shipped name (`devnet`, `testnet`) or a
+    /// Network to sign for: a shipped name (`devnet`) or a
     /// full network id
     #[arg(long, default_value = "devnet", conflicts_with = "genesis")]
     network: String,
@@ -557,7 +557,7 @@ async fn connect_verified(rpc: String) -> CliResult<RemoteLightClient> {
 /// before anyone can tell you whether it was wanted — but the node
 /// reports its own network, so the mismatch is worth catching here
 /// rather than as an unexplained rejected transaction. Pointing devnet
-/// keys at a testnet node is exactly the mistake this slice makes
+/// keys at a different network node is exactly the mistake this slice makes
 /// impossible to get away with silently.
 /// Resolves the network to sign for, without touching the network.
 ///
@@ -592,7 +592,7 @@ fn selected_network(network: &str, genesis: Option<PathBuf>) -> CliResult<Networ
 /// before anyone can tell you whether it was wanted — but the node
 /// reports its own network, so the mismatch is caught here rather than
 /// as an unexplained rejected transaction. Pointing devnet keys at a
-/// testnet node is exactly the mistake this makes impossible to get
+/// different network node is exactly the mistake this makes impossible to get
 /// away with silently.
 async fn confirm_network(network: NetworkId, client: &RemoteLightClient) -> CliResult<NetworkId> {
     let reported = client.get_consensus_info().await?.network_id;

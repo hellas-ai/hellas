@@ -175,7 +175,7 @@ fn peer_topology_must_cover_exact_genesis_committee() {
 fn any_valid_genesis_network_id_is_accepted_and_carried() {
     let address =
         SettlementKey::from(addr_from_signing_key(&secp256r1_key_from_seed(7))).to_string();
-    for id in ["hellas-devnet-1", "hellas-testnet-1", "someone-elses-net"] {
+    for id in ["hellas-devnet-1", "another-network", "someone-elses-net"] {
         let mut config = config_with_genesis(address.clone());
         config.genesis.network_id = id.to_string();
 

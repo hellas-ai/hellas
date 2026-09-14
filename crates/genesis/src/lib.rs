@@ -23,12 +23,6 @@ pub const HELLAS_DEVNET_1_JSON: &str = include_str!("../networks/hellas-devnet-1
 /// The id that document names.
 pub const HELLAS_DEVNET_1_ID: &str = "hellas-devnet-1";
 
-/// The in-tree test network's document.
-pub const HELLAS_TESTNET_1_JSON: &str = include_str!("../networks/hellas-testnet-1/genesis.json");
-
-/// The id that document names.
-pub const HELLAS_TESTNET_1_ID: &str = "hellas-testnet-1";
-
 /// A network whose genesis document ships inside the binary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct KnownNetwork {
@@ -53,18 +47,11 @@ pub struct KnownNetwork {
 /// once. Adding a network here adds an entry; it never moves an
 /// existing one. Nothing reads this list to decide what network it is
 /// on: a caller names one, or hands over a document.
-pub const KNOWN_NETWORKS: &[KnownNetwork] = &[
-    KnownNetwork {
-        name: "devnet",
-        id: HELLAS_DEVNET_1_ID,
-        json: HELLAS_DEVNET_1_JSON,
-    },
-    KnownNetwork {
-        name: "testnet",
-        id: HELLAS_TESTNET_1_ID,
-        json: HELLAS_TESTNET_1_JSON,
-    },
-];
+pub const KNOWN_NETWORKS: &[KnownNetwork] = &[KnownNetwork {
+    name: "devnet",
+    id: HELLAS_DEVNET_1_ID,
+    json: HELLAS_DEVNET_1_JSON,
+}];
 
 /// Looks up a shipped network by its short name (`devnet`) or its full
 /// id (`hellas-devnet-1`).
@@ -208,3 +195,6 @@ fn is_token(value: &str, max_len: usize) -> bool {
 
 #[cfg(test)]
 mod tests;
+
+mod trust;
+pub use trust::{TRUST_SCHEMA_VERSION, TrustDocument, TrustEpoch, TrustError};
