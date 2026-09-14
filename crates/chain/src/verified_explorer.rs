@@ -380,6 +380,10 @@ mod tests {
     }
 
     fn fixture() -> (ExplorerVerifier, ProofBundle) {
+        fixture_at_height(1)
+    }
+
+    fn fixture_at_height(height: u64) -> (ExplorerVerifier, ProofBundle) {
         let keys = (0..4)
             .map(ed25519::PrivateKey::from_seed)
             .collect::<Vec<_>>();
@@ -419,12 +423,12 @@ mod tests {
         let verifier = ExplorerVerifier::new(trust).unwrap();
         let block = crate::HellasBlock::new(
             Context {
-                round: Round::new(Epoch::zero(), View::new(1)),
+                round: Round::new(Epoch::zero(), View::new(height)),
                 leader: keys[0].public_key(),
                 parent: (View::zero(), Digest::EMPTY),
             },
             Digest::EMPTY,
-            Height::new(1),
+            Height::new(height),
             1000,
             Digest::from([5; 32]),
             crate::UtxoSyncTarget::new(
@@ -504,6 +508,41 @@ mod tests {
         std::fs::write(
             directory.join("proof.pb"),
             prost::Message::encode_to_vec(&bundle),
+        )
+        .unwrap();
+
+        // A separately certified higher block with the same owner tree lets
+        // workerd exercise asynchronously rebuilt snapshot freshness.
+        let (next_verifier, next_bundle) = fixture_at_height(2);
+        assert_eq!(next_verifier.trust_sha256(), verifier.trust_sha256());
+        let next_address = AddressProofBundle {
+            block: Some(next_bundle.clone()),
+            ..address
+        };
+        next_verifier
+            .verify_address(next_address.clone(), owner, 0, 64)
+            .unwrap();
+        std::fs::write(
+            directory.join("proof-next.pb"),
+            prost::Message::encode_to_vec(&next_bundle),
+        )
+        .unwrap();
+        std::fs::write(
+            directory.join("address-next.pb"),
+            prost::Message::encode_to_vec(&next_address),
+        )
+        .unwrap();
+        let page = immediate(crate::owner_proof::prove_owner_page(&tree, owner, 0, 1)).unwrap();
+        let next_small_page = AddressProofBundle {
+            page: serde_json::to_vec(&page).unwrap(),
+            ..next_address
+        };
+        next_verifier
+            .verify_address(next_small_page.clone(), owner, 0, 1)
+            .unwrap();
+        std::fs::write(
+            directory.join("address-next-limit1.pb"),
+            prost::Message::encode_to_vec(&next_small_page),
         )
         .unwrap();
     }
