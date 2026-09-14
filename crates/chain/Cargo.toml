@@ -205,5 +205,9 @@ hellas-kernel = { workspace = true, features = ["test-support"] }
 # consensus is asked to accept. As a runtime dependency `hellas-rpc`
 # arrives without the work protocol; the settlement suite needs it.
 hellas-rpc = { workspace = true, features = ["work"] }
+# The consensus tests submit close actions built by the endpoint's own
+# paid-work helpers. Keep that dependency test-only: production chain code
+# only needs it behind the `work-watcher` feature.
+hellas-work.workspace = true
 serde = { workspace = true, features = ["derive"] }
 tempfile = "3"
