@@ -196,6 +196,9 @@ pub enum IndexerCommand {
         /// Authenticated trust document, provisioned independently of the RPC origin
         #[arg(long)]
         trust: PathBuf,
+        /// Exact authenticated genesis JSON; defaults to the embedded devnet document
+        #[arg(long)]
+        genesis: Option<PathBuf>,
         #[arg(long)]
         storage_dir: PathBuf,
         #[arg(long, default_value = "hellas-explorer")]
@@ -221,6 +224,13 @@ pub enum IndexerCommand {
 #[cfg(feature = "validator")]
 #[derive(Subcommand)]
 pub enum ValidatorCommand {
+    /// Export public epoch-zero explorer trust from a validator config and exact genesis file
+    ExportTrust {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        genesis: PathBuf,
+    },
     /// Generate one cryptographically random validator configuration per committee member
     GenerateNetwork {
         /// Stable lowercase network identifier
@@ -738,15 +748,18 @@ async fn run_indexer(command: IndexerCommand) -> CliResult {
         IndexerCommand::Serve {
             rpc,
             trust,
+            genesis,
             storage_dir,
             partition_prefix,
             listen,
         } => {
             let trust = serde_json::from_slice(&fs::read(&trust)?)?;
+            let genesis_json = genesis.map(fs::read).transpose()?;
             tokio::task::spawn_blocking(move || {
                 hellas_chain::explorer_origin::run(hellas_chain::explorer_origin::OriginOptions {
                     rpc,
                     trust,
+                    genesis_json,
                     storage_dir,
                     partition_prefix,
                     listen,
@@ -794,6 +807,9 @@ fn follower_status_sink() -> hellas_chain::follower::FollowerStatusSink {
 #[cfg(feature = "validator")]
 async fn run_validator(command: ValidatorCommand) -> CliResult {
     let command = match command {
+        ValidatorCommand::ExportTrust { config, genesis } => {
+            hellas_chain::validator::Command::ExportTrust { config, genesis }
+        }
         ValidatorCommand::GenerateNetwork {
             network_id,
             validators,

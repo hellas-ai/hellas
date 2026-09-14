@@ -135,6 +135,10 @@ pub enum ValidatorError {
 
 #[derive(Debug)]
 pub enum Command {
+    ExportTrust {
+        config: PathBuf,
+        genesis: PathBuf,
+    },
     GenerateNetwork {
         network_id: String,
         validators: u32,
@@ -169,6 +173,12 @@ pub enum Command {
 
 pub fn run_command(command: Command) -> Result<(), ValidatorError> {
     match command {
+        Command::ExportTrust { config, genesis } => {
+            let config: ValidatorConfig = toml::from_str(&std::fs::read_to_string(config)?)?;
+            let trust = export_trust(&config, &std::fs::read(genesis)?)?;
+            println!("{}", serde_json::to_string_pretty(&trust)?);
+            Ok(())
+        }
         Command::GenerateNetwork {
             network_id,
             validators,
@@ -546,6 +556,50 @@ fn parse_genesis_allocation(raw: &str) -> Result<GenesisEntry, ValidatorError> {
 mod genesis_allocation_tests {
     use super::*;
     use crate::domain::{SettlementKey, addr_from_signing_key, secp256r1_key_from_seed};
+
+    #[test]
+    fn generated_network_exports_public_trust_bound_to_exact_genesis() {
+        use commonware_cryptography::{Hasher as _, Sha256};
+        let directory = tempfile::tempdir().unwrap();
+        let output_dir = directory.path().join("network");
+        generate_network(GenerateNetworkArgs {
+            network_id: hellas_genesis::HELLAS_DEVNET_1_ID.into(),
+            validators: 1,
+            labels: vec!["demo".into()],
+            addresses: vec!["127.0.0.1".into()],
+            start_port: 3000,
+            metrics_base_port: 9090,
+            relay_urls: vec![],
+            genesis_allocations: vec![],
+            treasury_balance: Some(100),
+            output_dir: output_dir.clone(),
+        })
+        .unwrap();
+        let config: ValidatorConfig =
+            toml::from_str(&std::fs::read_to_string(output_dir.join("validator-0.toml")).unwrap())
+                .unwrap();
+        let document = std::fs::read(output_dir.join("genesis.json")).unwrap();
+        let trust = export_trust(&config, &document).unwrap();
+        assert_eq!(trust.genesis_sha256, hex::encode(Sha256::hash(&document)));
+        assert_eq!(trust.epochs[0].threshold_identity.len(), 96);
+        #[cfg(feature = "verified-explorer")]
+        assert!(
+            crate::verified_explorer::ExplorerVerifier::with_genesis(trust.clone(), &document)
+                .is_ok()
+        );
+        let public = serde_json::to_string(&trust).unwrap();
+        assert!(!public.contains(&config.private_key));
+        assert!(!public.contains(&config.threshold_share));
+        let mut changed = document.clone();
+        changed.push(b'\n');
+        assert_ne!(
+            trust.genesis_sha256,
+            export_trust(&config, &changed).unwrap().genesis_sha256
+        );
+        let mut wrong = config.genesis.clone();
+        wrong.validators[0].label = "other".into();
+        assert!(export_trust(&config, &serde_json::to_vec(&wrong).unwrap()).is_err());
+    }
 
     #[test]
     fn rejects_settlement_key_valid_on_neither_curve() {
@@ -1000,6 +1054,44 @@ fn validate_relay_urls(
         }
     }
     Ok(())
+}
+
+/// Export epoch-zero trust from a provisioned validator config, bound to exact genesis bytes.
+/// Only public data is returned. Authenticate this output independently before deployment.
+pub fn export_trust(
+    config: &ValidatorConfig,
+    genesis_json: &[u8],
+) -> Result<hellas_genesis::TrustDocument, ValidatorError> {
+    use commonware_cryptography::{Hasher as _, Sha256};
+    let genesis: Genesis = serde_json::from_slice(genesis_json)?;
+    config.validate_genesis()?;
+    if genesis != config.genesis || genesis.network_id != hellas_genesis::HELLAS_DEVNET_1_ID {
+        return Err(ValidatorError::InvalidSetup(
+            "genesis file must match the validator's devnet genesis".into(),
+        ));
+    }
+    let scheme = Scheme::signer(
+        NAMESPACE,
+        config.participants()?,
+        config.decode_threshold_polynomial()?,
+        config.decode_threshold_share()?,
+    )
+    .ok_or_else(|| ValidatorError::Scheme("threshold share does not match polynomial".into()))?;
+    let trust = hellas_genesis::TrustDocument {
+        schema_version: hellas_genesis::TRUST_SCHEMA_VERSION,
+        network_id: genesis.network_id,
+        genesis_sha256: hex::encode(Sha256::hash(genesis_json)),
+        epochs: vec![hellas_genesis::TrustEpoch {
+            epoch: 0,
+            start_height: 0,
+            end_height: None,
+            threshold_identity: hex::encode(scheme.identity().encode()),
+        }],
+    };
+    trust
+        .validate()
+        .map_err(|error| ValidatorError::InvalidSetup(error.to_string()))?;
+    Ok(trust)
 }
 
 fn check_config(config_path: PathBuf) -> Result<(), ValidatorError> {
