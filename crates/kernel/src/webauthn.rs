@@ -315,7 +315,7 @@ enum FieldName {
 
 /// Escaped member names never match a required field: `type`/`challenge`
 /// must appear literally, and an escaped alias is skipped as unknown.
-fn field_name(value: JsonString<'_>) -> FieldName {
+const fn field_name(value: JsonString<'_>) -> FieldName {
     if value.escaped {
         return FieldName::Other;
     }

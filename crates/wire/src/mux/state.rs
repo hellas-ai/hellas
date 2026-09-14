@@ -424,7 +424,7 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
         if self.pending_terminal_free.is_empty() {
             return;
         }
-        let drained: Vec<SlotIndex> = self.pending_terminal_free.drain(..).collect();
+        let drained = core::mem::take(&mut self.pending_terminal_free);
         for idx in drained {
             if !self.maybe_free_slot(idx) {
                 self.pending_terminal_free.push(idx);
