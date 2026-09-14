@@ -110,27 +110,26 @@ mod genesis_reexport {
 
     #[test]
     fn the_documents_reached_through_chain_are_the_reviewed_bytes() {
-        for (selector, id, json, expected) in [(
+        let (selector, id, json, expected) = (
             "devnet",
             crate::genesis::HELLAS_DEVNET_1_ID,
             crate::genesis::HELLAS_DEVNET_1_JSON,
             "caab04a9350edbe0d50aa9375dcee2742145cf5c24c57f42c844ebf4f27aa4b6",
-        )] {
-            let hex: String = Sha256::digest(json.as_bytes())
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect();
-            assert_eq!(hex, expected, "{selector}");
+        );
+        let hex: String = Sha256::digest(json.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert_eq!(hex, expected, "{selector}");
 
-            let network = crate::genesis::known_network(selector).expect("shipped network");
-            assert_eq!(network.id, id);
-            assert_eq!(network.json, json);
+        let network = crate::genesis::known_network(selector).expect("shipped network");
+        assert_eq!(network.id, id);
+        assert_eq!(network.json, json);
 
-            let genesis: crate::genesis::Genesis =
-                serde_json::from_str(json).expect("shipped document parses");
-            genesis.validate().expect("shipped document validates");
-            assert_eq!(genesis.network_id, id);
-        }
+        let genesis: crate::genesis::Genesis =
+            serde_json::from_str(json).expect("shipped document parses");
+        genesis.validate().expect("shipped document validates");
+        assert_eq!(genesis.network_id, id);
 
         assert_eq!(crate::genesis::known_network_names(), vec!["devnet"]);
         assert_eq!(crate::genesis::GENESIS_SCHEMA_VERSION, 1);
