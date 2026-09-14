@@ -181,16 +181,13 @@ fn missing_ancestry(path: &Path) -> io::Result<Vec<PathBuf>> {
     }
 }
 
-/// Runs one complete synchronous filesystem transaction without executing its
-/// filesystem work on a Tokio worker thread.
+/// Runs a complete filesystem transaction while preserving synchronous ordering.
 ///
-/// Executor state remains serialized because the caller waits for the whole
-/// operation. The actual I/O runs on Tokio's blocking pool. On a multi-thread
-/// runtime, `block_in_place` first yields this worker's task lane while the
-/// synchronous store API waits for the result. A current-thread runtime cannot
-/// yield its sole worker through a synchronous API, but the filesystem syscall
-/// still runs on the blocking pool rather than on that worker. Plain
-/// synchronous callers with no Tokio runtime execute directly.
+/// On a multithread Tokio runtime, `block_in_place` hands off the worker before
+/// running the transaction. Other tasks can progress, but branches of the same
+/// `join!` or `select!` still wait. A current-thread runtime uses the blocking
+/// pool and waits synchronously; its sole worker cannot progress during this
+/// call. Callers outside Tokio run the transaction directly.
 pub(crate) fn run_blocking_io<T, F>(operation: F) -> io::Result<T>
 where
     T: Send + 'static,
@@ -199,26 +196,28 @@ where
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
         return Ok(operation());
     };
-    let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
-    let _blocking_task = tokio::task::spawn_blocking(move || {
-        let _ = result_tx.send(operation());
-    });
-    let receive = || result_rx.recv().map_err(io::Error::other);
     if matches!(
         handle.runtime_flavor(),
         tokio::runtime::RuntimeFlavor::MultiThread
     ) {
-        tokio::task::block_in_place(receive)
-    } else {
-        receive()
+        // Do the I/O here instead of queueing another blocking job and waiting
+        // for it. Nested jobs can deadlock when the blocking pool is full.
+        return tokio::task::block_in_place(|| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation))
+                .map_err(|_| io::Error::other("blocking filesystem operation panicked"))
+        });
     }
+
+    let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+    let _blocking_task = tokio::task::spawn_blocking(move || {
+        let _ = result_tx.send(operation());
+    });
+    result_rx.recv().map_err(io::Error::other)
 }
 
 #[cfg(all(test, unix))]
 mod tests {
     use std::os::unix::fs::PermissionsExt as _;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
 
@@ -321,26 +320,26 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn blocking_io_releases_the_shared_runtime_worker() {
-        let progressed = Arc::new(AtomicBool::new(false));
-        let task_progress = Arc::clone(&progressed);
-        let progress = tokio::spawn(async move {
-            tokio::task::yield_now().await;
-            task_progress.store(true, Ordering::SeqCst);
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let operation = tokio::spawn(async move {
+            run_blocking_io(move || {
+                entered_tx.send(()).expect("signal transaction started");
+                resume_rx.recv_timeout(std::time::Duration::from_secs(2))
+            })
         });
-        let observed_progress = Arc::clone(&progressed);
 
-        let shared_runtime_progressed = run_blocking_io(move || {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-            while !observed_progress.load(Ordering::SeqCst) && std::time::Instant::now() < deadline
-            {
-                std::thread::yield_now();
-            }
-            observed_progress.load(Ordering::SeqCst)
+        entered_rx.await.expect("transaction started");
+        tokio::spawn(async move {
+            resume_tx.send(()).expect("resume transaction");
         })
-        .expect("blocking operation joins");
-
-        progress.await.expect("runtime task");
-        assert!(shared_runtime_progressed);
+        .await
+        .expect("other task runs on the single worker");
+        operation
+            .await
+            .expect("transaction task joins")
+            .expect("blocking operation returns")
+            .expect("another task progresses before the transaction finishes");
     }
 
     #[tokio::test]
@@ -351,12 +350,34 @@ mod tests {
         assert_ne!(operation_thread, runtime_thread);
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn a_blocking_pool_caller_can_run_a_store_operation() {
-        let value = tokio::task::spawn_blocking(|| run_blocking_io(|| 42_u8))
+    #[test]
+    fn a_blocking_pool_caller_does_not_need_another_pool_slot() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_time()
+            .build()
+            .expect("runtime");
+        let result = runtime.block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                tokio::task::spawn_blocking(|| run_blocking_io(|| 42_u8)),
+            )
             .await
+        });
+        // A regression must fail the test instead of hanging runtime shutdown.
+        runtime.shutdown_timeout(std::time::Duration::from_millis(100));
+        let value = result
+            .expect("store operation waited for an unavailable blocking slot")
             .expect("outer blocking task joins")
-            .expect("nested store operation returns");
+            .expect("store operation returns");
         assert_eq!(value, 42);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_panicking_transaction_returns_an_io_error() {
+        let error = run_blocking_io(|| panic!("failed transaction"))
+            .expect_err("transaction panics must not unwind the executor task");
+        assert_eq!(error.kind(), io::ErrorKind::Other);
     }
 }
