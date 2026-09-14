@@ -91,9 +91,17 @@ before archive ingestion. Native epoch IDs must be consecutive beginning at zero
 finite schedules fail closed past their final height. Changing a schedule requires
 restarting the follower with newly authenticated configuration. Core validators still
 need their own coordinated signing-key/epoch activation before a rotated schedule
-produces blocks. Address proofs are served from the latest rebuilt verified snapshot.
+produces blocks. Address proofs default to the latest rebuilt verified snapshot; the origin retains
+the most recent 32 snapshots by finalized height for payload-pinned pagination.
 
 `/api/v1/addresses/{base58-owner}/proof?offset=0&limit=64` returns an address bundle;
-`payload=...` pins a requested snapshot and returns 503 if it is no longer retained
-at that native origin. During replay/catch-up no unverified address snapshot is served.
+`payload=...` pins a requested snapshot across subsequent blocks and returns 503
+when that snapshot falls outside the native origin's 32-snapshot retention window. During replay/catch-up no unverified address snapshot is served.
 The edge may retain older independently verifiable bundles in its bounded cache.
+
+Native snapshot retention is indexed by both payload and height, rejects conflicting
+bindings, and evicts the lowest finalized height first. An in-flight request holds
+its snapshot independently, so eviction cannot change the page being generated.
+Snapshots are reconstructed and checked against their certified owner roots before
+entering retention; restarting the process rebuilds the same bounded window from
+its durable finalized archive.
