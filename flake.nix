@@ -11,9 +11,11 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     rust-overlay.url = "github:oxalica/rust-overlay";
+    # The HIP provider uses the public TheRock ROCm package set exported by
+    # this flake. Keep the full flake input so its package interface and every
+    # transitive source pin are locked with the Hellas release.
     nix-strix-halo = {
       url = "github:hellas-ai/nix-strix-halo/e24b2efcfaee1cefd326ff65ff7a955a908fd5ee";
-      flake = false;
     };
   };
 
