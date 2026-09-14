@@ -57,13 +57,18 @@ policy. The process never downloads its trust configuration from the RPC peer.
 
 `/api/v1/blocks/{latest|height|payload}/proof` and
 `/api/v1/transactions/{digest}/proof` return the shared ProofBundle, defaulting to
-JSON and selecting protobuf for `Accept: application/x-protobuf`. Native canonical
+protobuf on `/proof` routes and selecting JSON for `Accept: application/json` (both
+`application/x-protobuf` and `application/protobuf` are accepted). Other API aliases
+default to JSON. Unsupported representation requests receive 406. Native canonical
 block history remains durable in Commonware. Transaction locators rebuild from
 verified archive records on restart; unavailable or not-yet-indexed locators return
 503. A known block height can be supplied as `?height=N` to resolve a transaction
 without waiting for the locator. Every response is reverified before serving.
 
-The initial origin runner requires one open epoch zero because the native marshal
-currently uses a constant provider. The portable verifier understands height-key
-rotation; the native marshal provider and validator rotation require coordinated
-upgrades before activating a rotated schedule. Address routes remain unavailable.
+The native origin uses a scheduled Commonware certificate provider and height epocher
+from the authenticated trust document. It rejects wrong-height keys and unknown epochs
+before archive ingestion. Native epoch IDs must be consecutive beginning at zero;
+finite schedules fail closed past their final height. Changing a schedule requires
+restarting the follower with newly authenticated configuration. Core validators still
+need their own coordinated signing-key/epoch activation before a rotated schedule
+produces blocks. Address routes remain unavailable.

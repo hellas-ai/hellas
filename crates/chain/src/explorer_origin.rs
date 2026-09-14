@@ -2,16 +2,15 @@
 //! Bind only to loopback; Cloudflare Tunnel + Access supplies external authentication.
 use crate::{
     Application, ApplicationConfig, ChainIndexer, ConsensusInfo, ConsensusVerifier,
-    FinalizedBlockQuery,
+    FinalizedBlockQuery, LightClient as _,
     config::Config,
     domain::{Digest, PublicKey},
-    follower::{FollowerStatusSink, follow_remote},
-    spawn_follower_indexer,
+    follower::{FollowerStatusSink, ingest_finalized_block},
     verified_explorer::{ExplorerQuery, ExplorerVerifier, PROOF_SCHEMA_VERSION, ProofBundle},
 };
 use axum::{
     Router,
-    extract::{Path, Query, State},
+    extract::{OriginalUri, Path, Query, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
     routing::get,
@@ -43,32 +42,61 @@ pub fn run(options: OriginOptions) -> OriginResult<()> {
     if !options.listen.ip().is_loopback() {
         return Err("private explorer origin must bind to loopback".into());
     }
-    // Marshal currently has a constant threshold provider and epoch zero. Reject a schedule
-    // it cannot ingest rather than silently use a different key from the portable verifier.
-    if options.trust.epochs.len() != 1
-        || options.trust.epochs[0].epoch != 0
-        || options.trust.epochs[0].end_height.is_some()
-    {
-        return Err("native follower currently requires one open epoch zero; key rotation requires a marshal provider upgrade".into());
-    }
     let verifier = Arc::new(ExplorerVerifier::new(options.trust.clone())?);
     let runtime = tokio::Config::new()
         .with_storage_directory(&options.storage_dir)
         .with_tcp_nodelay(Some(true));
     tokio::Runner::new(runtime).start(move |context| async move {
         let genesis: Genesis = serde_json::from_str(HELLAS_DEVNET_1_JSON)?;
-        let info = ConsensusInfo { network_id: genesis.network_id.clone(), validators: genesis.validators.iter().map(|validator| validator.public_key.clone()).collect(), threshold_identity: hex::decode(&options.trust.epochs[0].threshold_identity)? };
+        let info = ConsensusInfo {
+            network_id: genesis.network_id.clone(),
+            validators: genesis
+                .validators
+                .iter()
+                .map(|validator| validator.public_key.clone())
+                .collect(),
+            threshold_identity: hex::decode(&options.trust.epochs[0].threshold_identity)?,
+        };
         let leader = PublicKey::decode(hex::decode(&info.validators[0])?.as_slice())?;
-        let allocations = genesis.allocations.iter().map(|entry| Ok((crate::config::parse_genesis_settlement_key(&entry.address)?,entry.balance))).collect::<Result<Vec<_>,crate::config::ConfigError>>()?;
-        let application = Application::new(context.child("app"), crate::domain::network_id(&genesis)?, leader, allocations, &format!("{}-genesis",options.partition_prefix), ApplicationConfig::default()).await;
-        let (indexer,_marshal) = spawn_follower_indexer(context.child("indexer"),&options.partition_prefix,Config::default(),ConsensusVerifier::new(&info)?,application.genesis_block()).await?;
-        let state = OriginState { indexer:indexer.clone(), verifier, network_id:info.network_id.clone(), transactions:Arc::new(RwLock::new(BTreeMap::new())) };
+        let allocations = genesis
+            .allocations
+            .iter()
+            .map(|entry| {
+                Ok((
+                    crate::config::parse_genesis_settlement_key(&entry.address)?,
+                    entry.balance,
+                ))
+            })
+            .collect::<Result<Vec<_>, crate::config::ConfigError>>()?;
+        let application = Application::new(
+            context.child("app"),
+            crate::domain::network_id(&genesis)?,
+            leader,
+            allocations,
+            &format!("{}-genesis", options.partition_prefix),
+            ApplicationConfig::default(),
+        )
+        .await;
+        let (indexer, _marshal) = crate::indexer::spawn_trusted_follower_indexer(
+            context.child("indexer"),
+            &options.partition_prefix,
+            Config::default(),
+            options.trust,
+            application.genesis_block(),
+        )
+        .await?;
+        let state = OriginState {
+            indexer: indexer.clone(),
+            verifier,
+            network_id: info.network_id.clone(),
+            transactions: Arc::new(RwLock::new(BTreeMap::new())),
+        };
         let app = router(state.clone());
         let listener = ::tokio::net::TcpListener::bind(options.listen).await?;
         ::tokio::select! {
-            result = index_transactions(state) => result,
+            result = index_transactions(state.clone()) => result,
             result = axum::serve(listener,app) => result.map_err(Into::into),
-            result = follow_remote(indexer,options.rpc,info,options.status) => result.map_err(Into::into),
+            result = follow_trusted(state,options.rpc,options.status) => result,
         }
     })
 }
@@ -93,6 +121,7 @@ fn router(state: OriginState) -> Router {
 async fn block(
     State(state): State<OriginState>,
     Path(selector): Path<String>,
+    OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
 ) -> Response {
     let query = if selector == "latest" {
@@ -105,7 +134,13 @@ async fn block(
             Err(_) => return failure(StatusCode::BAD_REQUEST, "invalid block height"),
         }
     };
-    answer(state, query, ExplorerQuery::Block(query), headers).await
+    answer(
+        state,
+        query,
+        ExplorerQuery::Block(query),
+        default_proof_accept(headers, &uri),
+    )
+    .await
 }
 async fn payload(
     State(state): State<OriginState>,
@@ -126,6 +161,7 @@ async fn transaction(
     State(state): State<OriginState>,
     Path(tx): Path<String>,
     Query(query): Query<TransactionQuery>,
+    OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
 ) -> Response {
     let Some(tx) = digest(&tx) else {
@@ -149,7 +185,7 @@ async fn transaction(
         state,
         FinalizedBlockQuery::Height(height),
         ExplorerQuery::Transaction(tx),
-        headers,
+        default_proof_accept(headers, &uri),
     )
     .await
 }
@@ -170,6 +206,12 @@ async fn answer(
     query: ExplorerQuery,
     headers: HeaderMap,
 ) -> Response {
+    let Some(protobuf) = representation(&headers) else {
+        return failure(
+            StatusCode::NOT_ACCEPTABLE,
+            "supported types are application/json and application/x-protobuf",
+        );
+    };
     let finalized = match state.indexer.get_finalized_block(lookup).await {
         Ok(Some(block)) => block,
         Ok(None) => return failure(StatusCode::NOT_FOUND, "finalized block is unavailable"),
@@ -191,14 +233,6 @@ async fn answer(
             );
         }
     };
-    let protobuf = headers
-        .get(header::ACCEPT)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| {
-            value
-                .split(',')
-                .any(|item| item.trim() == "application/x-protobuf")
-        });
     let (content_type, body) = if protobuf {
         (
             "application/x-protobuf",
@@ -220,6 +254,61 @@ async fn answer(
     )
         .into_response()
 }
+fn default_proof_accept(mut headers: HeaderMap, uri: &axum::http::Uri) -> HeaderMap {
+    if !headers.contains_key(header::ACCEPT) && uri.path().ends_with("/proof") {
+        headers.insert(
+            header::ACCEPT,
+            axum::http::HeaderValue::from_static("application/x-protobuf"),
+        );
+    }
+    headers
+}
+
+fn representation(headers: &HeaderMap) -> Option<bool> {
+    let Some(accept) = headers.get(header::ACCEPT) else {
+        return Some(false);
+    };
+    let accept = accept.to_str().ok()?;
+    let mut json = None;
+    let mut protobuf = None;
+    for range in accept.split(',') {
+        let mut parts = range.trim().split(';');
+        let media = parts.next()?.trim();
+        let mut quality = 1.0_f32;
+        for part in parts {
+            if let Some(value) = part.trim().strip_prefix("q=") {
+                quality = value.parse().ok()?;
+            }
+        }
+        if !quality.is_finite() || !(0.0..=1.0).contains(&quality) {
+            return None;
+        }
+        let specificity = match media {
+            "application/json" | "application/protobuf" | "application/x-protobuf" => 2,
+            "application/*" => 1,
+            "*/*" => 0,
+            _ => continue,
+        };
+        let applies_json = matches!(media, "application/json" | "application/*" | "*/*");
+        let applies_proto = matches!(
+            media,
+            "application/protobuf" | "application/x-protobuf" | "application/*" | "*/*"
+        );
+        for (applies, slot) in [(applies_json, &mut json), (applies_proto, &mut protobuf)] {
+            if applies && slot.is_none_or(|(previous, _)| specificity > previous) {
+                *slot = Some((specificity, quality));
+            }
+        }
+    }
+    let json = json.map_or(0.0, |(_, q)| q);
+    let protobuf = protobuf.map_or(0.0, |(_, q)| q);
+    if json == 0.0 && protobuf == 0.0 {
+        None
+    } else {
+        Some(protobuf > json)
+    }
+}
+
 fn failure(status: StatusCode, message: &str) -> Response {
     (
         status,
@@ -230,6 +319,10 @@ fn failure(status: StatusCode, message: &str) -> Response {
 }
 
 fn proof_bundle(state: &OriginState, finalized: crate::FinalizedBlock) -> ProofBundle {
+    let epoch = ConsensusVerifier::decode_finalization(&finalized.snapshot.finalization)
+        .map_or(u64::MAX, |finalization| {
+            finalization.proposal.round.epoch().get()
+        });
     ProofBundle {
         schema_version: PROOF_SCHEMA_VERSION,
         network_id: state.network_id.clone(),
@@ -242,7 +335,7 @@ fn proof_bundle(state: &OriginState, finalized: crate::FinalizedBlock) -> ProofB
         observed_at_ms: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
-        epoch: 0,
+        epoch,
     }
 }
 async fn index_transactions(state: OriginState) -> OriginResult<()> {
@@ -277,6 +370,53 @@ async fn index_transactions(state: OriginState) -> OriginResult<()> {
     }
 }
 
+async fn follow_trusted(
+    state: OriginState,
+    rpc: String,
+    status: FollowerStatusSink,
+) -> OriginResult<()> {
+    loop {
+        // The remote client is only a transport/codec here. The authenticated height-key
+        // schedule below verifies every block before the native archive sees it.
+        let client = match crate::client::RemoteLightClient::connect(rpc.clone()).await {
+            Ok(client) => client,
+            Err(error) => {
+                tracing::warn!(%error,"explorer upstream connection failed");
+                ::tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                continue;
+            }
+        };
+        loop {
+            let next = state
+                .indexer
+                .get_latest_block()
+                .await?
+                .map_or(1, |latest| latest.height.saturating_add(1));
+            let remote = match client
+                .get_finalized_block(FinalizedBlockQuery::Height(next))
+                .await
+            {
+                Ok(Some(finalized)) => finalized,
+                Ok(None) => {
+                    ::tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(%error,"explorer upstream disconnected");
+                    ::tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    break;
+                }
+            };
+            state.verifier.verify(
+                proof_bundle(&state, remote.clone()),
+                ExplorerQuery::Block(FinalizedBlockQuery::Height(next)),
+            )?;
+            ingest_finalized_block(&state.indexer, remote, next, &status).await?;
+            ::tokio::task::yield_now().await;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,6 +428,28 @@ mod tests {
     use commonware_runtime::deterministic;
     use hellas_genesis::{HELLAS_DEVNET_1_ID, TrustEpoch};
     use tower::ServiceExt as _;
+
+    #[test]
+    fn representation_respects_qualities_aliases_and_exclusions() {
+        for (accept, expected) in [
+            ("application/protobuf", Some(true)),
+            (
+                "application/x-protobuf;q=0.5, application/json;q=0.9",
+                Some(false),
+            ),
+            ("application/json;q=0, */*;q=1", Some(true)),
+            ("application/json;q=0, application/x-protobuf;q=0", None),
+            ("text/html", None),
+            ("application/json;q=nan", None),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::ACCEPT, accept.parse().unwrap());
+            assert_eq!(representation(&headers), expected, "{accept}");
+        }
+        let headers =
+            default_proof_accept(HeaderMap::new(), &"/api/v1/blocks/1/proof".parse().unwrap());
+        assert_eq!(representation(&headers), Some(true));
+    }
 
     #[test]
     fn http_origin_returns_reverifiable_evidence_and_resolves_transaction_routes() {
@@ -313,7 +475,7 @@ mod tests {
                 }],
             };
             let verifier = Arc::new(ExplorerVerifier::new(trust).unwrap());
-            let (indexer, _handle) = spawn_follower_indexer(
+            let (indexer, _handle) = crate::spawn_follower_indexer(
                 context,
                 "origin-test",
                 Config::default(),

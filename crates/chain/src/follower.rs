@@ -279,7 +279,7 @@ async fn catch_up_batch(
     Ok(batch_end < target_height)
 }
 
-async fn ingest_finalized_block(
+pub(crate) async fn ingest_finalized_block(
     indexer: &ChainIndexer,
     finalized: FinalizedBlock,
     requested: u64,
