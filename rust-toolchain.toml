@@ -1,5 +1,7 @@
 [toolchain]
-channel = "stable"
+# Keep local and hosted CI diagnostics reproducible. Upgrade this deliberately
+# with the compatibility fixes that a newer compiler requires.
+channel = "1.96.1"
 components = [
     "rustfmt",
     "clippy",
