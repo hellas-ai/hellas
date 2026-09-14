@@ -1,0 +1,185 @@
+name: CI
+
+# Trigger model:
+#   push (any branch)           → lints only
+#   pull_request                → lints + build-smoke + e2e
+#   push to default branch      → lints + build-full (TODO)
+#   workflow_dispatch (release) → push artifacts (TODO)
+on:
+  pull_request:
+  push:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  devshell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: NixOS/nix-installer-action@62c1943b776c509394b550f3f983adc14e9212d6
+      - name: Build dev shell
+        run: nix develop --accept-flake-config --command true
+
+  lints-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: NixOS/nix-installer-action@62c1943b776c509394b550f3f983adc14e9212d6
+      - id: set-matrix
+        name: Enumerate CI checks
+        run: |
+          set -Eeu
+          matrix="$(
+            nix eval --accept-flake-config --json '.#ci.x86_64-linux.checks' --apply '
+              cs: { include = map (name: { inherit name; }) (builtins.attrNames cs); }
+            '
+          )"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  lints:
+    runs-on: ubuntu-latest
+    name: lint:${{ matrix.name }}
+    needs:
+      - devshell
+      - lints-matrix
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.lints-matrix.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: NixOS/nix-installer-action@62c1943b776c509394b550f3f983adc14e9212d6
+      - name: nix run .#check-${{ matrix.name }}
+        run: nix run --accept-flake-config '.#check-${{ matrix.name }}'
+
+  lints-passed:
+    runs-on: ubuntu-latest
+    if: always()
+    name: Lints passed
+    needs:
+      - devshell
+      - lints-matrix
+      - lints
+    steps:
+      - name: Require devshell + lints-matrix + all lints succeeded
+        run: |
+          set -Eeu
+          test '${{ needs.devshell.result }}' = 'success'
+          test '${{ needs.lints-matrix.result }}' = 'success'
+          test '${{ needs.lints.result }}' = 'success'
+
+  # ─── build-smoke (PR only) ──────────────────────────────────────────────
+  # Slow native + cross builds gated to PRs. The native builds run cargo test
+  # as part of buildRustPackage (`doCheck = true` by default), so this stage
+  # also covers test execution.
+
+  build-smoke-matrix:
+    if: github.event_name == 'pull_request'
+    needs: lints-passed
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: NixOS/nix-installer-action@62c1943b776c509394b550f3f983adc14e9212d6
+      - id: set-matrix
+        name: Enumerate smoke builds
+        run: |
+          set -Eeu
+          matrix="$(
+            nix eval --accept-flake-config --json '.#ci.x86_64-linux.builds' --apply '
+              builds: {
+                include = builtins.attrValues (
+                  builtins.mapAttrs (name: attr: { inherit name attr; }) builds
+                );
+              }
+            '
+          )"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  build-smoke:
+    if: github.event_name == 'pull_request'
+    needs: build-smoke-matrix
+    runs-on: ubuntu-latest
+    name: build:${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.build-smoke-matrix.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: NixOS/nix-installer-action@62c1943b776c509394b550f3f983adc14e9212d6
+      - name: nix build .#${{ matrix.attr }}
+        run: nix build --accept-flake-config --print-build-logs --no-link '.#packages.x86_64-linux.${{ matrix.attr }}'
+
+  build-smoke-passed:
+    if: always() && github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    name: Build smoke passed
+    needs:
+      - build-smoke-matrix
+      - build-smoke
+    steps:
+      - name: Require build-smoke-matrix + all smoke builds succeeded
+        run: |
+          set -Eeu
+          test '${{ needs.build-smoke-matrix.result }}' = 'success'
+          test '${{ needs.build-smoke.result }}' = 'success'
+
+  # ─── e2e (PR only) ──────────────────────────────────────────────────────
+  # nixosTests run in QEMU VMs. They depend on the same package derivations
+  # the build-smoke stage built, so this stage reuses them via the nix store
+  # — no rebuilds.
+
+  e2e-matrix:
+    if: github.event_name == 'pull_request'
+    needs: build-smoke-passed
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: NixOS/nix-installer-action@62c1943b776c509394b550f3f983adc14e9212d6
+      - id: set-matrix
+        name: Enumerate nixosTests
+        run: |
+          set -Eeu
+          matrix="$(
+            nix eval --accept-flake-config --json '.#nixosTests.x86_64-linux' --apply '
+              tests: { include = map (name: { inherit name; }) (builtins.attrNames tests); }
+            '
+          )"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  e2e:
+    if: github.event_name == 'pull_request'
+    needs: e2e-matrix
+    runs-on: ubuntu-latest
+    name: e2e:${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.e2e-matrix.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: NixOS/nix-installer-action@62c1943b776c509394b550f3f983adc14e9212d6
+      - name: nix build .#nixosTests.x86_64-linux.${{ matrix.name }}
+        run: nix build --accept-flake-config --print-build-logs --no-link '.#nixosTests.x86_64-linux.${{ matrix.name }}'
+
+  e2e-passed:
+    if: always() && github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    name: E2E passed
+    needs:
+      - e2e-matrix
+      - e2e
+    steps:
+      - name: Require e2e-matrix + all e2e succeeded
+        run: |
+          set -Eeu
+          test '${{ needs.e2e-matrix.result }}' = 'success'
+          test '${{ needs.e2e.result }}' = 'success'
