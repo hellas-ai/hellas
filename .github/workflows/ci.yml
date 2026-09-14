@@ -1,13 +1,14 @@
 name: CI
 
 # Trigger model:
-#   push (any branch)           → lints only
+#   push to default branch      → lints only
 #   pull_request                → lints + build-smoke + e2e
 #   push to default branch      → lints + build-full (TODO)
 #   workflow_dispatch (release) → push artifacts (TODO)
 on:
   pull_request:
   push:
+    branches: [master]
 
 permissions:
   contents: read
