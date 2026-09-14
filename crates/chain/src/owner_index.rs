@@ -159,6 +159,24 @@ impl OwnerIndex {
         (state.cursor, coins)
     }
 
+    /// Deterministic owner holdings for rebuilding the authenticated native proof snapshot.
+    #[cfg(feature = "explorer-origin")]
+    pub(crate) fn holdings_snapshot(&self) -> Vec<(SettlementKey, ObjectId, u8, u64)> {
+        let state = self.inner.read().expect("owner index lock poisoned");
+        let mut holdings = Vec::new();
+        for (id, coin) in &state.coins {
+            holdings.push((coin.owner, *id, 0, coin.value));
+        }
+        for (id, edge) in &state.edges {
+            holdings.push((edge.maker, *id, 1, 0));
+            if edge.taker != edge.maker {
+                holdings.push((edge.taker, *id, 1, 0));
+            }
+        }
+        holdings.sort();
+        holdings
+    }
+
     #[cfg(test)]
     pub(crate) fn all_coins_for_test(&self) -> BTreeMap<ObjectId, Coin> {
         self.inner
@@ -243,13 +261,13 @@ impl State {
             return Ok(Some(*coin));
         }
         match self.kind_of(id) {
-            Some(actual @ (ObjectKind::Edge | ObjectKind::RegistryChunk)) => {
-                Err(OwnerIndexError::WrongObjectKind {
-                    id: *id,
-                    expected: ObjectKind::Coin,
-                    actual,
-                })
-            }
+            Some(
+                actual @ (ObjectKind::Edge | ObjectKind::RegistryChunk | ObjectKind::OwnerData),
+            ) => Err(OwnerIndexError::WrongObjectKind {
+                id: *id,
+                expected: ObjectKind::Coin,
+                actual,
+            }),
             Some(ObjectKind::Coin) | None => Ok(None),
         }
     }
@@ -533,13 +551,15 @@ impl State {
             Some(edge) => edge,
             None => {
                 return match self.kind_of(id) {
-                    Some(actual @ (ObjectKind::Coin | ObjectKind::RegistryChunk)) => {
-                        Err(OwnerIndexError::WrongObjectKind {
-                            id: *id,
-                            expected: ObjectKind::Edge,
-                            actual,
-                        })
-                    }
+                    Some(
+                        actual @ (ObjectKind::Coin
+                        | ObjectKind::RegistryChunk
+                        | ObjectKind::OwnerData),
+                    ) => Err(OwnerIndexError::WrongObjectKind {
+                        id: *id,
+                        expected: ObjectKind::Edge,
+                        actual,
+                    }),
                     Some(ObjectKind::Edge) | None => {
                         Err(OwnerIndexError::ObjectNotFound { id: *id })
                     }

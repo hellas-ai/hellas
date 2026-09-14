@@ -86,6 +86,8 @@ pub fn run(options: OriginOptions) -> OriginResult<()> {
         )
         .await?;
         let state = OriginState {
+            owner_index: application.owner_index(),
+            owners: Arc::new(RwLock::new(None)),
             indexer: indexer.clone(),
             verifier,
             network_id: info.network_id.clone(),
@@ -107,6 +109,14 @@ struct OriginState {
     verifier: Arc<ExplorerVerifier>,
     network_id: String,
     transactions: Arc<RwLock<BTreeMap<Digest, u64>>>,
+    owner_index: crate::OwnerIndex,
+    owners: Arc<RwLock<Option<OwnerSnapshot>>>,
+}
+
+#[derive(Clone)]
+struct OwnerSnapshot {
+    tree: crate::owner_proof::MemoryOwnerTree,
+    block: ProofBundle,
 }
 fn router(state: OriginState) -> Router {
     Router::new()
@@ -115,6 +125,8 @@ fn router(state: OriginState) -> Router {
         .route("/api/v1/blocks/by-payload/{payload}", get(payload))
         .route("/api/v1/transactions/{digest}", get(transaction))
         .route("/api/v1/transactions/{digest}/proof", get(transaction))
+        .route("/api/v1/addresses/{owner}/proof", get(address))
+        .route("/api/v1/addresses/{owner}", get(address))
         .with_state(state)
 }
 
@@ -189,6 +201,91 @@ async fn transaction(
     )
     .await
 }
+#[derive(Deserialize)]
+struct AddressQuery {
+    #[serde(default)]
+    offset: u64,
+    #[serde(default = "address_limit")]
+    limit: u32,
+    payload: Option<String>,
+}
+fn address_limit() -> u32 {
+    crate::owner_proof::OWNER_PAGE_LIMIT
+}
+async fn address(
+    State(state): State<OriginState>,
+    Path(owner): Path<String>,
+    Query(query): Query<AddressQuery>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+) -> Response {
+    let Ok(owner) = owner.parse::<crate::domain::SettlementKey>() else {
+        return failure(StatusCode::BAD_REQUEST, "invalid owner");
+    };
+    let Some(protobuf) = representation(&default_proof_accept(headers, &uri)) else {
+        return failure(StatusCode::NOT_ACCEPTABLE, "unsupported representation");
+    };
+    let Some(snapshot) = state.owners.read().expect("owner snapshot lock").clone() else {
+        return failure(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "verified owner snapshot is still catching up",
+        );
+    };
+    if query
+        .payload
+        .as_ref()
+        .is_some_and(|payload| payload != &snapshot.block.payload)
+    {
+        return failure(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "requested owner snapshot is unavailable",
+        );
+    }
+    let page = match crate::owner_proof::prove_owner_page(
+        &snapshot.tree,
+        owner,
+        query.offset,
+        query.limit,
+    )
+    .await
+    {
+        Ok(page) => page,
+        Err(_) => return failure(StatusCode::BAD_REQUEST, "invalid owner page"),
+    };
+    let bundle = crate::verified_explorer::AddressProofBundle {
+        schema_version: PROOF_SCHEMA_VERSION,
+        block: Some(snapshot.block),
+        page: serde_json::to_vec(&page).expect("owner page serializes"),
+    };
+    let verified = match state
+        .verifier
+        .verify_address(bundle, owner, query.offset, query.limit)
+    {
+        Ok(verified) => verified,
+        Err(_) => return failure(StatusCode::BAD_GATEWAY, "owner proof failed verification"),
+    };
+    let (content_type, bytes) = if protobuf {
+        (
+            "application/x-protobuf",
+            prost::Message::encode_to_vec(verified.bundle()),
+        )
+    } else {
+        (
+            "application/json",
+            serde_json::to_vec(verified.bundle()).expect("address bundle serializes"),
+        )
+    };
+    (
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::CACHE_CONTROL, "no-store"),
+            (header::VARY, "Accept"),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
 fn digest(value: &str) -> Option<Digest> {
     if value.len() != 64
         || !value
@@ -291,19 +388,22 @@ fn representation(headers: &HeaderMap) -> Option<bool> {
             _ => continue,
         };
         let applies_json = matches!(media, "application/json" | "application/*" | "*/*");
-        let applies_proto = matches!(
-            media,
-            "application/x-protobuf" | "application/*" | "*/*"
-        );
-        let applies_alias = matches!(media,"application/protobuf"|"application/*"|"*/*");
-        for (applies, slot) in [(applies_json, &mut json), (applies_proto, &mut protobuf), (applies_alias, &mut protobuf_alias)] {
+        let applies_proto = matches!(media, "application/x-protobuf" | "application/*" | "*/*");
+        let applies_alias = matches!(media, "application/protobuf" | "application/*" | "*/*");
+        for (applies, slot) in [
+            (applies_json, &mut json),
+            (applies_proto, &mut protobuf),
+            (applies_alias, &mut protobuf_alias),
+        ] {
             if applies && slot.is_none_or(|(previous, _)| specificity > previous) {
                 *slot = Some((specificity, quality));
             }
         }
     }
     let json = json.map_or(0.0, |(_, q)| q);
-    let protobuf = protobuf.map_or(0.0_f32, |(_, q)| q).max(protobuf_alias.map_or(0.0,|(_,q)|q));
+    let protobuf = protobuf
+        .map_or(0.0_f32, |(_, q)| q)
+        .max(protobuf_alias.map_or(0.0, |(_, q)| q));
     if json == 0.0 && protobuf == 0.0 {
         None
     } else {
@@ -342,6 +442,8 @@ fn proof_bundle(state: &OriginState, finalized: crate::FinalizedBlock) -> ProofB
 }
 async fn index_transactions(state: OriginState) -> OriginResult<()> {
     let mut height = 1_u64;
+    let mut owner_tree = crate::owner_proof::MemoryOwnerTree::default();
+    let mut previous = BTreeMap::new();
     loop {
         match state
             .indexer
@@ -362,6 +464,44 @@ async fn index_transactions(state: OriginState) -> OriginResult<()> {
                             .or_insert(height);
                     }
                 }
+                let block =
+                    crate::HellasBlock::decode(verified.bundle().canonical_block.as_slice())?;
+                state.owner_index.apply_finalized(&block)?;
+                let current = state
+                    .owner_index
+                    .holdings_snapshot()
+                    .into_iter()
+                    .map(|(owner, id, kind, balance)| ((owner, id), (kind, balance)))
+                    .collect::<BTreeMap<_, _>>();
+                for ((owner, id), value) in &previous {
+                    if current.get(&(*owner, *id)) != Some(value) {
+                        crate::owner_proof::update_holding(&mut owner_tree, *owner, *id, None)
+                            .await?;
+                    }
+                }
+                for ((owner, id), value) in &current {
+                    if previous.get(&(*owner, *id)) != Some(value) {
+                        crate::owner_proof::update_holding(
+                            &mut owner_tree,
+                            *owner,
+                            *id,
+                            Some(*value),
+                        )
+                        .await?;
+                    }
+                }
+                if crate::owner_proof::owner_root(&owner_tree).await?
+                    != verified.view().owner_root()
+                {
+                    return Err(
+                        "replayed owner state does not match the certified owner root".into(),
+                    );
+                }
+                *state.owners.write().expect("owner snapshot lock") = Some(OwnerSnapshot {
+                    tree: owner_tree.clone(),
+                    block: verified.bundle().clone(),
+                });
+                previous = current;
                 height = height
                     .checked_add(1)
                     .ok_or("transaction index height exhausted")?;
@@ -435,8 +575,14 @@ mod tests {
     fn representation_respects_qualities_aliases_and_exclusions() {
         for (accept, expected) in [
             ("application/protobuf", Some(true)),
-            ("application/x-protobuf;q=0,application/protobuf;q=1",Some(true)),
-            ("application/protobuf;q=1,application/x-protobuf;q=0",Some(true)),
+            (
+                "application/x-protobuf;q=0,application/protobuf;q=1",
+                Some(true),
+            ),
+            (
+                "application/protobuf;q=1,application/x-protobuf;q=0",
+                Some(true),
+            ),
             (
                 "application/x-protobuf;q=0.5, application/json;q=0.9",
                 Some(false),
@@ -467,6 +613,17 @@ mod tests {
                     hellas_kernel::test_support::valid_open_tx().unwrap(),
                 )],
             );
+            let owner = crate::domain::SettlementKey::from_bytes([1; 33]);
+            let mut tree = crate::owner_proof::MemoryOwnerTree::default();
+            crate::owner_proof::update_holding(
+                &mut tree,
+                owner,
+                Digest::from([7; 32]),
+                Some((0, 321)),
+            )
+            .await
+            .unwrap();
+            let block = block.with_owner_root(crate::owner_proof::owner_root(&tree).await.unwrap());
             let trust = TrustDocument {
                 schema_version: 1,
                 network_id: HELLAS_DEVNET_1_ID.into(),
@@ -479,6 +636,8 @@ mod tests {
                 }],
             };
             let verifier = Arc::new(ExplorerVerifier::new(trust).unwrap());
+            let owner_index =
+                crate::OwnerIndex::new(crate::domain::TEST_NETWORK, &genesis, Vec::new());
             let (indexer, _handle) = crate::spawn_follower_indexer(
                 context,
                 "origin-test",
@@ -494,12 +653,53 @@ mod tests {
                 .unwrap();
             let tx = crate::verified_explorer::transaction_digest(&block.txs()[0]);
             let transactions = Arc::new(RwLock::new(BTreeMap::from([(tx, 1)])));
-            let app = router(OriginState {
+            let state = OriginState {
+                owner_index,
+                owners: Arc::new(RwLock::new(None)),
                 indexer,
                 verifier: verifier.clone(),
                 network_id: HELLAS_DEVNET_1_ID.into(),
                 transactions,
+            };
+            let finalized = state
+                .indexer
+                .get_finalized_block(FinalizedBlockQuery::Height(1))
+                .await
+                .unwrap()
+                .unwrap();
+            *state.owners.write().unwrap() = Some(OwnerSnapshot {
+                tree,
+                block: proof_bundle(&state, finalized),
             });
+            let app = router(state);
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(format!("/api/v1/addresses/{owner}/proof?offset=0&limit=64"))
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(
+                response.into_body(),
+                crate::verified_explorer::MAX_PROOF_BYTES,
+            )
+            .await
+            .unwrap();
+            let bundle =
+                <crate::verified_explorer::AddressProofBundle as prost::Message>::decode(bytes)
+                    .unwrap();
+            assert_eq!(
+                verifier
+                    .verify_address(bundle, owner, 0, 64)
+                    .unwrap()
+                    .summary()
+                    .balance,
+                321
+            );
             for uri in [
                 "/api/v1/blocks/1/proof".to_owned(),
                 format!("/api/v1/blocks/{}/proof", hex::encode(block.digest())),

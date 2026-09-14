@@ -20,6 +20,8 @@ pub mod explorer_origin;
 pub mod faucet;
 #[cfg(feature = "indexer")]
 pub mod follower;
+#[cfg(feature = "domain")]
+pub mod owner_proof;
 #[cfg(feature = "verified-explorer")]
 pub mod verified_explorer;
 /// The shipped genesis documents and the type that reads them. It is its
