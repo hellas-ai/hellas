@@ -189,6 +189,21 @@ pub enum QueryCommand {
 #[cfg(feature = "indexer")]
 #[derive(Subcommand)]
 pub enum IndexerCommand {
+    /// Serve verified proofs from a local full follower for a private Cloudflare Tunnel
+    Serve {
+        #[arg(long)]
+        rpc: String,
+        /// Authenticated trust document, provisioned independently of the RPC origin
+        #[arg(long)]
+        trust: PathBuf,
+        #[arg(long)]
+        storage_dir: PathBuf,
+        #[arg(long, default_value = "hellas-explorer")]
+        partition_prefix: String,
+        /// Loopback listener for the local tunnel daemon
+        #[arg(long, default_value = "127.0.0.1:8788")]
+        listen: std::net::SocketAddr,
+    },
     /// Follow a validator and maintain a verified finalized-block archive
     Follow {
         /// Chain light-client RPC endpoint
@@ -720,6 +735,28 @@ fn read_terms(path: &std::path::Path) -> CliResult<Terms> {
 #[cfg(feature = "indexer")]
 async fn run_indexer(command: IndexerCommand) -> CliResult {
     match command {
+        IndexerCommand::Serve {
+            rpc,
+            trust,
+            storage_dir,
+            partition_prefix,
+            listen,
+        } => {
+            let trust = serde_json::from_slice(&fs::read(&trust)?)?;
+            tokio::task::spawn_blocking(move || {
+                hellas_chain::explorer_origin::run(hellas_chain::explorer_origin::OriginOptions {
+                    rpc,
+                    trust,
+                    storage_dir,
+                    partition_prefix,
+                    listen,
+                    status: follower_status_sink(),
+                })
+            })
+            .await?
+            .map_err(anyhow::Error::from_boxed)?;
+        }
+
         IndexerCommand::Follow {
             rpc,
             storage_dir,

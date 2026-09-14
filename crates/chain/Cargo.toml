@@ -59,6 +59,7 @@ block-view = [
     "dep:commonware-storage",
     "dep:commonware-utils",
 ]
+explorer-origin = ["verified-explorer", "indexer", "dep:axum"]
 verified-explorer = ["block-view", "dep:serde", "dep:hex", "dep:prost"]
 indexer = [
     "block-view",
@@ -191,6 +192,7 @@ tracing-subscriber = { workspace = true, optional = true, features = [
 url = { version = "2", optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
 commonware-consensus = { workspace = true, features = ["mocks"] }
 commonware-cryptography = { workspace = true, features = ["mocks"] }
 ed25519-dalek.workspace = true

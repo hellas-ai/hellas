@@ -14,6 +14,8 @@ mod consensus;
 pub mod domain;
 #[cfg(any(feature = "indexer", feature = "validator"))]
 mod execution;
+#[cfg(feature = "explorer-origin")]
+pub mod explorer_origin;
 #[cfg(feature = "validator")]
 pub mod faucet;
 #[cfg(feature = "indexer")]
