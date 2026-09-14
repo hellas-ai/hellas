@@ -271,6 +271,7 @@ fn representation(headers: &HeaderMap) -> Option<bool> {
     let accept = accept.to_str().ok()?;
     let mut json = None;
     let mut protobuf = None;
+    let mut protobuf_alias = None;
     for range in accept.split(',') {
         let mut parts = range.trim().split(';');
         let media = parts.next()?.trim();
@@ -292,16 +293,17 @@ fn representation(headers: &HeaderMap) -> Option<bool> {
         let applies_json = matches!(media, "application/json" | "application/*" | "*/*");
         let applies_proto = matches!(
             media,
-            "application/protobuf" | "application/x-protobuf" | "application/*" | "*/*"
+            "application/x-protobuf" | "application/*" | "*/*"
         );
-        for (applies, slot) in [(applies_json, &mut json), (applies_proto, &mut protobuf)] {
+        let applies_alias = matches!(media,"application/protobuf"|"application/*"|"*/*");
+        for (applies, slot) in [(applies_json, &mut json), (applies_proto, &mut protobuf), (applies_alias, &mut protobuf_alias)] {
             if applies && slot.is_none_or(|(previous, _)| specificity > previous) {
                 *slot = Some((specificity, quality));
             }
         }
     }
     let json = json.map_or(0.0, |(_, q)| q);
-    let protobuf = protobuf.map_or(0.0, |(_, q)| q);
+    let protobuf = protobuf.map_or(0.0_f32, |(_, q)| q).max(protobuf_alias.map_or(0.0,|(_,q)|q));
     if json == 0.0 && protobuf == 0.0 {
         None
     } else {
@@ -433,6 +435,8 @@ mod tests {
     fn representation_respects_qualities_aliases_and_exclusions() {
         for (accept, expected) in [
             ("application/protobuf", Some(true)),
+            ("application/x-protobuf;q=0,application/protobuf;q=1",Some(true)),
+            ("application/protobuf;q=1,application/x-protobuf;q=0",Some(true)),
             (
                 "application/x-protobuf;q=0.5, application/json;q=0.9",
                 Some(false),
