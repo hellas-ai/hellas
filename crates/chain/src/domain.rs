@@ -1780,17 +1780,16 @@ mod tests {
             SettlementKey::from(addr_from_signing_key(&key)).to_string()
         }
 
-        for (json, scalars) in [(crate::genesis::HELLAS_DEVNET_1_JSON, [1_u8, 2])] {
-            let genesis: crate::genesis::Genesis =
-                serde_json::from_str(json).expect("shipped document parses");
-            let funded: Vec<&str> = genesis
-                .allocations
-                .iter()
-                .map(|allocation| allocation.address.as_str())
-                .collect();
-            let expected: Vec<String> = scalars.iter().copied().map(address_for).collect();
-            assert_eq!(funded, expected, "{}", genesis.network_id);
-        }
+        let (json, scalars) = (crate::genesis::HELLAS_DEVNET_1_JSON, [1_u8, 2]);
+        let genesis: crate::genesis::Genesis =
+            serde_json::from_str(json).expect("shipped document parses");
+        let funded: Vec<&str> = genesis
+            .allocations
+            .iter()
+            .map(|allocation| allocation.address.as_str())
+            .collect();
+        let expected: Vec<String> = scalars.iter().copied().map(address_for).collect();
+        assert_eq!(funded, expected, "{}", genesis.network_id);
     }
 
     #[test]

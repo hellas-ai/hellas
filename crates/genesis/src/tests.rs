@@ -93,14 +93,13 @@ fn shipped_networks_share_no_name_id_committee_or_account() {
 fn shipped_documents_hash_to_the_bytes_that_were_reviewed() {
     use sha2::{Digest as _, Sha256};
 
-    for (json, expected) in [(
+    let (json, expected) = (
         HELLAS_DEVNET_1_JSON,
         "caab04a9350edbe0d50aa9375dcee2742145cf5c24c57f42c844ebf4f27aa4b6",
-    )] {
-        let digest = Sha256::digest(json.as_bytes());
-        let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
-        assert_eq!(hex, expected);
-    }
+    );
+    let digest = Sha256::digest(json.as_bytes());
+    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    assert_eq!(hex, expected);
 }
 
 #[test]

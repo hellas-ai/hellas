@@ -133,7 +133,6 @@ wasm-client = ["client-core", "hellas-wire/ws-wasm"]
 work-watcher = ["block-view", "dep:hellas-work"]
 
 [dependencies]
-prost = { version = "0.14", default-features = false, features = ["derive"], optional = true }
 axum = { workspace = true, optional = true }
 base64ct = { version = "1", optional = true, features = ["alloc"] }
 bs58 = { version = "0.5", optional = true }
@@ -168,6 +167,9 @@ opentelemetry-otlp = { workspace = true, optional = true }
 opentelemetry_sdk = { workspace = true, optional = true }
 p256 = { workspace = true, optional = true }
 prometheus-client = { workspace = true, optional = true }
+prost = { version = "0.14", default-features = false, features = [
+    "derive",
+], optional = true }
 rand = { workspace = true, optional = true }
 rand_core = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
@@ -193,7 +195,6 @@ tracing-subscriber = { workspace = true, optional = true, features = [
 url = { version = "2", optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
-tower = { version = "0.5", features = ["util"] }
 commonware-consensus = { workspace = true, features = ["mocks"] }
 commonware-cryptography = { workspace = true, features = ["mocks"] }
 ed25519-dalek.workspace = true
@@ -216,3 +217,4 @@ hellas-rpc = { workspace = true, features = ["work"] }
 hellas-work.workspace = true
 serde = { workspace = true, features = ["derive"] }
 tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
