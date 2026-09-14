@@ -142,7 +142,7 @@ impl From<XetHash> for [u8; 32] {
 
 impl fmt::LowerHex for XetHash {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for limb in self.0.chunks_exact(8) {
+        for limb in self.0.as_chunks::<8>().0 {
             for byte in limb.iter().rev() {
                 write!(formatter, "{byte:02x}")?;
             }
@@ -195,7 +195,7 @@ impl FromStr for XetHash {
         }
 
         let mut raw = [0; 32];
-        for (limb_index, limb) in hex.as_bytes().chunks_exact(16).enumerate() {
+        for (limb_index, limb) in hex.as_bytes().as_chunks::<16>().0.iter().enumerate() {
             for byte_index in 0..8 {
                 let high = decode_hex(limb[byte_index * 2]).ok_or(XetHashError::InvalidHex)?;
                 let low = decode_hex(limb[byte_index * 2 + 1]).ok_or(XetHashError::InvalidHex)?;
@@ -590,7 +590,7 @@ fn merge(nodes: &[Chunk]) -> Chunk {
 fn write_hash(buffer: &mut [u8], position: &mut usize, hash: XetHash) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
 
-    for limb in hash.0.chunks_exact(8) {
+    for limb in hash.0.as_chunks::<8>().0 {
         for byte in limb.iter().rev() {
             buffer[*position] = HEX[(byte >> 4) as usize];
             buffer[*position + 1] = HEX[(byte & 0x0f) as usize];
