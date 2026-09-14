@@ -87,7 +87,7 @@ pub fn run(options: OriginOptions) -> OriginResult<()> {
         .await?;
         let state = OriginState {
             owner_index: application.owner_index(),
-            owners: Arc::new(RwLock::new(None)),
+            owners: Arc::new(RwLock::new(OwnerSnapshots::default())),
             indexer: indexer.clone(),
             verifier,
             network_id: info.network_id.clone(),
@@ -110,7 +110,7 @@ struct OriginState {
     network_id: String,
     transactions: Arc<RwLock<BTreeMap<Digest, u64>>>,
     owner_index: crate::OwnerIndex,
-    owners: Arc<RwLock<Option<OwnerSnapshot>>>,
+    owners: Arc<RwLock<OwnerSnapshots>>,
 }
 
 #[derive(Clone)]
@@ -118,6 +118,49 @@ struct OwnerSnapshot {
     tree: crate::owner_proof::MemoryOwnerTree,
     block: ProofBundle,
 }
+/// Keeps pagination pinned to a recently finalized payload while new blocks arrive.
+/// Readers hold an Arc, so eviction cannot invalidate an in-flight proof generation.
+const OWNER_SNAPSHOT_RETENTION: usize = 32;
+
+#[derive(Default)]
+struct OwnerSnapshots {
+    by_height: BTreeMap<u64, Arc<OwnerSnapshot>>,
+    by_payload: BTreeMap<String, u64>,
+}
+impl OwnerSnapshots {
+    fn insert(&mut self, snapshot: OwnerSnapshot) -> Result<(), &'static str> {
+        let height = snapshot.block.height;
+        let payload = &snapshot.block.payload;
+        if self
+            .by_height
+            .get(&height)
+            .is_some_and(|previous| previous.block.payload != *payload)
+            || self
+                .by_payload
+                .get(payload)
+                .is_some_and(|previous| *previous != height)
+        {
+            return Err("conflicting finalized owner snapshot");
+        }
+        self.by_payload.insert(payload.clone(), height);
+        self.by_height.insert(height, Arc::new(snapshot));
+        while self.by_height.len() > OWNER_SNAPSHOT_RETENTION {
+            let (_, expired) = self.by_height.pop_first().expect("nonempty snapshot cache");
+            self.by_payload.remove(&expired.block.payload);
+        }
+        Ok(())
+    }
+    fn get(&self, payload: Option<&str>) -> Option<Arc<OwnerSnapshot>> {
+        match payload {
+            Some(payload) => self.by_height.get(self.by_payload.get(payload)?).cloned(),
+            None => self
+                .by_height
+                .last_key_value()
+                .map(|(_, snapshot)| snapshot.clone()),
+        }
+    }
+}
+
 fn router(state: OriginState) -> Router {
     Router::new()
         .route("/api/v1/blocks/{selector}", get(block))
@@ -225,22 +268,17 @@ async fn address(
     let Some(protobuf) = representation(&default_proof_accept(headers, &uri)) else {
         return failure(StatusCode::NOT_ACCEPTABLE, "unsupported representation");
     };
-    let Some(snapshot) = state.owners.read().expect("owner snapshot lock").clone() else {
+    let Some(snapshot) = state
+        .owners
+        .read()
+        .expect("owner snapshot lock")
+        .get(query.payload.as_deref())
+    else {
         return failure(
             StatusCode::SERVICE_UNAVAILABLE,
-            "verified owner snapshot is still catching up",
+            "requested verified owner snapshot is unavailable or still catching up",
         );
     };
-    if query
-        .payload
-        .as_ref()
-        .is_some_and(|payload| payload != &snapshot.block.payload)
-    {
-        return failure(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "requested owner snapshot is unavailable",
-        );
-    }
     let page = match crate::owner_proof::prove_owner_page(
         &snapshot.tree,
         owner,
@@ -254,7 +292,7 @@ async fn address(
     };
     let bundle = crate::verified_explorer::AddressProofBundle {
         schema_version: PROOF_SCHEMA_VERSION,
-        block: Some(snapshot.block),
+        block: Some(snapshot.block.clone()),
         page: serde_json::to_vec(&page).expect("owner page serializes"),
     };
     let verified = match state
@@ -497,10 +535,14 @@ async fn index_transactions(state: OriginState) -> OriginResult<()> {
                         "replayed owner state does not match the certified owner root".into(),
                     );
                 }
-                *state.owners.write().expect("owner snapshot lock") = Some(OwnerSnapshot {
-                    tree: owner_tree.clone(),
-                    block: verified.bundle().clone(),
-                });
+                state
+                    .owners
+                    .write()
+                    .expect("owner snapshot lock")
+                    .insert(OwnerSnapshot {
+                        tree: owner_tree.clone(),
+                        block: verified.bundle().clone(),
+                    })?;
                 previous = current;
                 height = height
                     .checked_add(1)
@@ -572,6 +614,49 @@ mod tests {
     use tower::ServiceExt as _;
 
     #[test]
+    fn owner_snapshot_retention_evicts_oldest_without_regressing_latest() {
+        fn snapshot(height: u64) -> OwnerSnapshot {
+            OwnerSnapshot {
+                tree: crate::owner_proof::MemoryOwnerTree::default(),
+                block: ProofBundle {
+                    height,
+                    payload: format!("{height:064x}"),
+                    ..ProofBundle::default()
+                },
+            }
+        }
+        let mut snapshots = OwnerSnapshots::default();
+        snapshots.insert(snapshot(1)).unwrap();
+        let in_flight = snapshots.get(Some(&format!("{:064x}", 1))).unwrap();
+        for height in 2..=OWNER_SNAPSHOT_RETENTION as u64 + 1 {
+            snapshots.insert(snapshot(height)).unwrap();
+        }
+        assert_eq!(snapshots.by_height.len(), OWNER_SNAPSHOT_RETENTION);
+        assert_eq!(snapshots.by_payload.len(), OWNER_SNAPSHOT_RETENTION);
+        assert!(snapshots.get(Some(&format!("{:064x}", 1))).is_none());
+        assert_eq!(in_flight.block.height, 1);
+        assert_eq!(
+            snapshots
+                .get(Some(&format!("{:064x}", 2)))
+                .unwrap()
+                .block
+                .height,
+            2
+        );
+        let latest = OWNER_SNAPSHOT_RETENTION as u64 + 1;
+        snapshots.insert(snapshot(0)).unwrap();
+        assert_eq!(snapshots.get(None).unwrap().block.height, latest);
+        assert!(snapshots.get(Some(&format!("{:064x}", 0))).is_none());
+        let mut conflict = snapshot(latest);
+        conflict.block.payload = "f".repeat(64);
+        assert!(snapshots.insert(conflict).is_err());
+        let mut conflict = snapshot(latest + 1);
+        conflict.block.payload = format!("{latest:064x}");
+        assert!(snapshots.insert(conflict).is_err());
+        assert_eq!(snapshots.by_payload.len(), OWNER_SNAPSHOT_RETENTION);
+    }
+
+    #[test]
     fn representation_respects_qualities_aliases_and_exclusions() {
         for (accept, expected) in [
             ("application/protobuf", Some(true)),
@@ -623,6 +708,14 @@ mod tests {
             )
             .await
             .unwrap();
+            crate::owner_proof::update_holding(
+                &mut tree,
+                owner,
+                Digest::from([8; 32]),
+                Some((1, 0)),
+            )
+            .await
+            .unwrap();
             let block = block.with_owner_root(crate::owner_proof::owner_root(&tree).await.unwrap());
             let trust = TrustDocument {
                 schema_version: 1,
@@ -655,7 +748,7 @@ mod tests {
             let transactions = Arc::new(RwLock::new(BTreeMap::from([(tx, 1)])));
             let state = OriginState {
                 owner_index,
-                owners: Arc::new(RwLock::new(None)),
+                owners: Arc::new(RwLock::new(OwnerSnapshots::default())),
                 indexer,
                 verifier: verifier.clone(),
                 network_id: HELLAS_DEVNET_1_ID.into(),
@@ -667,11 +760,16 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            *state.owners.write().unwrap() = Some(OwnerSnapshot {
-                tree,
-                block: proof_bundle(&state, finalized),
-            });
-            let app = router(state);
+            state
+                .owners
+                .write()
+                .unwrap()
+                .insert(OwnerSnapshot {
+                    tree: tree.clone(),
+                    block: proof_bundle(&state, finalized),
+                })
+                .unwrap();
+            let app = router(state.clone());
             let response = app
                 .clone()
                 .oneshot(
@@ -700,6 +798,72 @@ mod tests {
                     .balance,
                 321
             );
+            // New finality changes the owner state before the uncached second page is read.
+            crate::owner_proof::update_holding(&mut tree, owner, Digest::from([8; 32]), None)
+                .await
+                .unwrap();
+            crate::owner_proof::update_holding(
+                &mut tree,
+                owner,
+                Digest::from([7; 32]),
+                Some((0, 999)),
+            )
+            .await
+            .unwrap();
+            let next = index_block(&block, Digest::from([3; 32]), Vec::new())
+                .with_owner_root(crate::owner_proof::owner_root(&tree).await.unwrap());
+            state
+                .indexer
+                .ingest_finalized(next.clone(), finalization(&fixture, &next))
+                .await
+                .unwrap();
+            let finalized = state
+                .indexer
+                .get_finalized_block(FinalizedBlockQuery::Height(2))
+                .await
+                .unwrap()
+                .unwrap();
+            state
+                .owners
+                .write()
+                .unwrap()
+                .insert(OwnerSnapshot {
+                    tree: tree.clone(),
+                    block: proof_bundle(&state, finalized),
+                })
+                .unwrap();
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(format!(
+                            "/api/v1/addresses/{owner}/proof?offset=1&limit=1&payload={}",
+                            hex::encode(block.digest())
+                        ))
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(
+                response.into_body(),
+                crate::verified_explorer::MAX_PROOF_BYTES,
+            )
+            .await
+            .unwrap();
+            let pinned =
+                <crate::verified_explorer::AddressProofBundle as prost::Message>::decode(bytes)
+                    .unwrap();
+            let verified = verifier.verify_address(pinned, owner, 1, 1).unwrap();
+            assert_eq!(verified.block().view().height(), 1);
+            assert_eq!(verified.summary().balance, 321);
+            assert_eq!(verified.page().holdings[0].object_id, [8; 32]);
+            assert_eq!(
+                state.owners.read().unwrap().get(None).unwrap().block.height,
+                2
+            );
+
             for uri in [
                 "/api/v1/blocks/1/proof".to_owned(),
                 format!("/api/v1/blocks/{}/proof", hex::encode(block.digest())),
