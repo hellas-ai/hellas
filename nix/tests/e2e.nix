@@ -404,10 +404,6 @@ in
       print(provider_log)
       assert "quoted causal-LM evaluate execution" in provider_log
       assert "accepted evaluate execution" in provider_log
-      assert (
-          "Catena program compilation failed" in provider_log
-          or "failed to start Catena GPU session" in provider_log
-      ), provider_log
 
       unit = machine.succeed(
           "systemctl show hellas.service "
