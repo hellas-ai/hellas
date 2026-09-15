@@ -328,7 +328,15 @@ mod tests {
         drop(first);
 
         let error = ArtifactStoreConfig::lock_root(&root, 2).unwrap_err();
-        assert!(error.to_string().contains("capacity 1, not configured 2"));
+        assert!(
+            matches!(
+                &error,
+                crate::ExecutorError::ArtifactStore(message)
+                    if message.contains("retained execution capacity 1")
+                        && message.contains("not configured 2")
+            ),
+            "unexpected root capacity reconfiguration error: {error}"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
