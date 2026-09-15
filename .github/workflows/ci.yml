@@ -21,6 +21,7 @@ jobs:
     runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'shared' }}
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/prepare-ci-runner
       - if: runner.environment == 'github-hosted'
         uses: NixOS/nix-installer-action@62c1943b776c509394b550f3f983adc14e9212d6
       - name: Build dev shell
@@ -33,6 +34,7 @@ jobs:
       - devshell
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/prepare-ci-runner
       - if: runner.environment == 'github-hosted'
         uses: NixOS/nix-installer-action@62c1943b776c509394b550f3f983adc14e9212d6
       # This gate crosses feature and target sets in one Cargo target directory.
@@ -57,6 +59,7 @@ jobs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/prepare-ci-runner
       - if: runner.environment == 'github-hosted'
         uses: NixOS/nix-installer-action@62c1943b776c509394b550f3f983adc14e9212d6
       - id: set-matrix
@@ -83,6 +86,7 @@ jobs:
       matrix: ${{ fromJSON(needs.build-smoke-matrix.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/prepare-ci-runner
       - if: runner.environment == 'github-hosted'
         uses: NixOS/nix-installer-action@62c1943b776c509394b550f3f983adc14e9212d6
       - name: nix build .#${{ matrix.attr }}
@@ -115,6 +119,7 @@ jobs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/prepare-ci-runner
       - if: runner.environment == 'github-hosted'
         uses: NixOS/nix-installer-action@62c1943b776c509394b550f3f983adc14e9212d6
       - id: set-matrix
@@ -138,6 +143,7 @@ jobs:
       matrix: ${{ fromJSON(needs.e2e-matrix.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/prepare-ci-runner
       - if: runner.environment == 'github-hosted'
         uses: NixOS/nix-installer-action@62c1943b776c509394b550f3f983adc14e9212d6
       - name: nix build .#nixosTests.x86_64-linux.${{ matrix.name }}
