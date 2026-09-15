@@ -1,0 +1,17 @@
+name: Prepare CI runner
+description: Reclaim per-runner build caches before a trusted CI job.
+runs:
+  using: composite
+  steps:
+    - if: runner.environment == 'self-hosted'
+      name: Reclaim per-runner caches
+      shell: bash
+      run: |
+        for path in "$HOME/.cache/nix" "$GITHUB_WORKSPACE/target"; do
+          if [ -d "$path" ]; then
+            find "$path" -mindepth 1 -delete
+          fi
+        done
+        echo "XDG_CACHE_HOME=$RUNNER_TEMP/xdg-cache" >> "$GITHUB_ENV"
+        echo "CARGO_TARGET_DIR=$RUNNER_TEMP/cargo-target" >> "$GITHUB_ENV"
+        df -h "$RUNNER_TEMP"
