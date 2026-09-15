@@ -18,7 +18,7 @@ concurrency:
 
 jobs:
   devshell:
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'shared' }}
     steps:
       - uses: actions/checkout@v4
       - uses: NixOS/nix-installer-action@62c1943b776c509394b550f3f983adc14e9212d6
@@ -26,7 +26,7 @@ jobs:
         run: nix develop --accept-flake-config --command true
 
   lints:
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'shared' }}
     name: Lints
     needs:
       - devshell
@@ -43,7 +43,7 @@ jobs:
 
   build-smoke-matrix:
     needs: lints
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'shared' }}
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
     steps:
@@ -66,7 +66,7 @@ jobs:
 
   build-smoke:
     needs: build-smoke-matrix
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'shared' }}
     name: build:${{ matrix.name }}
     strategy:
       fail-fast: false
@@ -79,7 +79,7 @@ jobs:
 
   build-smoke-passed:
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'shared' }}
     name: Build smoke passed
     needs:
       - build-smoke-matrix
@@ -99,7 +99,7 @@ jobs:
   e2e-matrix:
     if: github.event_name == 'pull_request'
     needs: build-smoke-passed
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'shared' }}
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
     steps:
@@ -119,7 +119,7 @@ jobs:
   e2e:
     if: github.event_name == 'pull_request'
     needs: e2e-matrix
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'shared' }}
     name: e2e:${{ matrix.name }}
     strategy:
       fail-fast: false
@@ -132,7 +132,7 @@ jobs:
 
   e2e-passed:
     if: always() && github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'shared' }}
     name: E2E passed
     needs:
       - e2e-matrix
