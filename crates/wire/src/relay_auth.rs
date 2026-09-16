@@ -177,7 +177,7 @@ mod tests {
                 ..original
             },
             RelayAdmission {
-                network_id: "hellas-testnet-1",
+                network_id: "another-network",
                 ..original
             },
             RelayAdmission {

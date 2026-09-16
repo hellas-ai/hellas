@@ -17,6 +17,7 @@ domain = [
     "dep:hellas-genesis",
     "dep:hellas-kernel",
     "dep:p256",
+    "dep:serde",
     "dep:serde_json",
     "dep:sha2",
     "dep:thiserror",
@@ -59,6 +60,8 @@ block-view = [
     "dep:commonware-storage",
     "dep:commonware-utils",
 ]
+explorer-origin = ["verified-explorer", "indexer", "dep:axum"]
+verified-explorer = ["block-view", "dep:serde", "dep:hex", "dep:prost"]
 indexer = [
     "block-view",
     "client",
@@ -164,6 +167,9 @@ opentelemetry-otlp = { workspace = true, optional = true }
 opentelemetry_sdk = { workspace = true, optional = true }
 p256 = { workspace = true, optional = true }
 prometheus-client = { workspace = true, optional = true }
+prost = { version = "0.14", default-features = false, features = [
+    "derive",
+], optional = true }
 rand = { workspace = true, optional = true }
 rand_core = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
@@ -211,3 +217,4 @@ hellas-rpc = { workspace = true, features = ["work"] }
 hellas-work.workspace = true
 serde = { workspace = true, features = ["derive"] }
 tempfile = "3"
+tower = { version = "0.5", features = ["util"] }

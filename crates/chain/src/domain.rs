@@ -639,6 +639,8 @@ pub enum ObjectKind {
     /// authenticated by the same state root as coins and edges, but no
     /// party spends it and no owner index tracks it.
     RegistryChunk,
+    /// Consensus owner-tree metadata.
+    OwnerData,
 }
 
 impl core::fmt::Display for ObjectKind {
@@ -647,6 +649,7 @@ impl core::fmt::Display for ObjectKind {
             Self::Coin => f.write_str("coin"),
             Self::Edge => f.write_str("edge"),
             Self::RegistryChunk => f.write_str("registry-chunk"),
+            Self::OwnerData => f.write_str("owner-data"),
         }
     }
 }
@@ -665,6 +668,8 @@ pub enum Object {
     Edge(KernelEdge),
     /// Registry chunk payload.
     RegistryChunk(KernelRegistryChunk),
+    /// Canonical owner-tree node bytes. Only consensus host code writes these records.
+    OwnerData([u8; crate::owner_proof::OWNER_NODE_BYTES]),
 }
 
 /// The larger of two sizes, in a const context.
@@ -676,6 +681,7 @@ impl Object {
     const COIN_TAG: u8 = 0;
     const EDGE_TAG: u8 = 1;
     const REGISTRY_CHUNK_TAG: u8 = 2;
+    const OWNER_DATA_TAG: u8 = 3;
 
     /// Fixed payload area following the one-byte object-kind tag.
     ///
@@ -697,6 +703,7 @@ impl Object {
             Self::Coin(_) => ObjectKind::Coin,
             Self::Edge(_) => ObjectKind::Edge,
             Self::RegistryChunk(_) => ObjectKind::RegistryChunk,
+            Self::OwnerData(_) => ObjectKind::OwnerData,
         }
     }
 
@@ -740,6 +747,10 @@ impl Write for Object {
                 Self::EDGE_TAG.write(buf);
                 Self::write_payload(edge, buf);
             }
+            Self::OwnerData(data) => {
+                Self::OWNER_DATA_TAG.write(buf);
+                buf.put_slice(data);
+            }
             Self::RegistryChunk(chunk) => {
                 Self::REGISTRY_CHUNK_TAG.write(buf);
                 Self::write_payload(chunk, buf);
@@ -755,6 +766,7 @@ impl Read for Object {
         let tag = u8::read(buf)?;
         let payload = <[u8; Self::PAYLOAD_SIZE]>::read(buf)?;
         match tag {
+            Self::OWNER_DATA_TAG => Ok(Self::OwnerData(payload)),
             Self::COIN_TAG => {
                 let coin = Self::read_payload::<KernelCoin>(&payload)?;
                 Ok(Self::Coin(Coin::from(coin)))
@@ -1758,13 +1770,7 @@ mod tests {
     /// The funded accounts in the shipped genesis documents are
     /// derivations, not opaque strings.
     ///
-    /// Both networks' READMEs promise that their funded accounts come
-    /// from specific low secret scalars, which is what makes them
-    /// usable — a wrong address there is an unspendable balance and a
-    /// document nobody can tell is wrong by looking at it. This derives
-    /// them and checks. It also pins that the two networks fund
-    /// different scalars, so a devnet key is not silently funded on
-    /// testnet.
+    /// The devnet README documents the low secret scalars used below.
     #[test]
     fn shipped_genesis_allocations_match_their_documented_scalars() {
         fn address_for(scalar: u8) -> String {
@@ -1774,20 +1780,16 @@ mod tests {
             SettlementKey::from(addr_from_signing_key(&key)).to_string()
         }
 
-        for (json, scalars) in [
-            (crate::genesis::HELLAS_DEVNET_1_JSON, [1_u8, 2]),
-            (crate::genesis::HELLAS_TESTNET_1_JSON, [3, 4]),
-        ] {
-            let genesis: crate::genesis::Genesis =
-                serde_json::from_str(json).expect("shipped document parses");
-            let funded: Vec<&str> = genesis
-                .allocations
-                .iter()
-                .map(|allocation| allocation.address.as_str())
-                .collect();
-            let expected: Vec<String> = scalars.iter().copied().map(address_for).collect();
-            assert_eq!(funded, expected, "{}", genesis.network_id);
-        }
+        let genesis: crate::genesis::Genesis =
+            serde_json::from_str(crate::genesis::HELLAS_DEVNET_1_JSON)
+                .expect("shipped document parses");
+        let funded: Vec<&str> = genesis
+            .allocations
+            .iter()
+            .map(|allocation| allocation.address.as_str())
+            .collect();
+        let expected: Vec<String> = [1_u8, 2].into_iter().map(address_for).collect();
+        assert_eq!(funded, expected, "{}", genesis.network_id);
     }
 
     #[test]

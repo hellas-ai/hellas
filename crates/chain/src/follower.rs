@@ -172,7 +172,7 @@ async fn follow(context: tokio::Context, options: FollowerOptions) -> Result<(),
     follow_remote(indexer, options.rpc, consensus_info, options.status).await
 }
 
-async fn follow_remote(
+pub(crate) async fn follow_remote(
     indexer: ChainIndexer,
     rpc: String,
     consensus_info: ConsensusInfo,
@@ -279,7 +279,7 @@ async fn catch_up_batch(
     Ok(batch_end < target_height)
 }
 
-async fn ingest_finalized_block(
+pub(crate) async fn ingest_finalized_block(
     indexer: &ChainIndexer,
     finalized: FinalizedBlock,
     requested: u64,

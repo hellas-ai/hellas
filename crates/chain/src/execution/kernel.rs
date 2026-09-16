@@ -118,7 +118,7 @@ pub async fn execute_all<E>(
 where
     E: StorageContext + Spawner + Send + Sync + 'static,
 {
-    let mut batches = maybe_seed_genesis(context, genesis_allocations, batches);
+    let mut batches = maybe_seed_genesis(context, genesis_allocations, batches).await?;
     for tx in txs {
         let next = apply_transaction(batches, context, verifier, tx)
             .await
@@ -140,7 +140,7 @@ pub async fn execute_proposal<E>(
 where
     E: StorageContext + Spawner + Send + Sync + 'static,
 {
-    let mut batches = maybe_seed_genesis(context, genesis_allocations, batches);
+    let mut batches = maybe_seed_genesis(context, genesis_allocations, batches).await?;
     let mut included = Vec::new();
     let mut retained = Vec::new();
     let mut included_bytes = 0_usize;
@@ -193,16 +193,16 @@ fn response_contest_was_removed(transaction: &Transaction, error: &ExecutionErro
     )
 }
 
-fn maybe_seed_genesis<E>(
+async fn maybe_seed_genesis<E>(
     context: KernelContext,
     genesis_allocations: &[(SettlementKey, u64)],
     mut batches: Batch<E>,
-) -> Batch<E>
+) -> Result<Batch<E>, ExecutionError>
 where
     E: StorageContext + Spawner + Send + Sync + 'static,
 {
     if context.block_height().get() != 1 {
-        return batches;
+        return Ok(batches);
     }
 
     for (idx, (owner, balance)) in genesis_allocations.iter().enumerate() {
@@ -218,9 +218,11 @@ where
             owner: *owner,
             value: *balance,
         };
-        batches = batches.write(id, Some(Object::Coin(coin)));
+        batches = super::owner_tree::write_owned(batches, id, Some(Object::Coin(coin)))
+            .await
+            .map_err(|(_, error)| error)?;
     }
-    batches
+    Ok(batches)
 }
 
 async fn apply_transaction<E>(
@@ -299,23 +301,27 @@ where
                 None
             };
 
-            batches = batches.write(*input, None);
-            batches = batches.write(
+            batches = super::owner_tree::write_owned(batches, *input, None).await?;
+            batches = super::owner_tree::write_owned(
+                batches,
                 recipient_id,
                 Some(Object::Coin(Coin {
                     owner: SettlementKey::from(recipient),
                     value: *amount,
                 })),
-            );
+            )
+            .await?;
 
             if let Some(change_id) = change_id {
-                batches = batches.write(
+                batches = super::owner_tree::write_owned(
+                    batches,
                     change_id,
                     Some(Object::Coin(Coin {
                         owner: coin.owner,
                         value: change_value,
                     })),
-                );
+                )
+                .await?;
             }
             Ok(batches)
         }
@@ -376,15 +382,17 @@ where
             }
 
             for input in inputs {
-                batches = batches.write(*input, None);
+                batches = super::owner_tree::write_owned(batches, *input, None).await?;
             }
-            batches = batches.write(
+            batches = super::owner_tree::write_owned(
+                batches,
                 output_id,
                 Some(Object::Coin(Coin {
                     owner,
                     value: total,
                 })),
-            );
+            )
+            .await?;
             Ok(batches)
         }
         Transaction::Kernel(tx) => apply_kernel_transaction(batches, context, verifier, tx).await,
@@ -600,7 +608,7 @@ fn classify_kernel_error(working: &BlockWorkingSet, source: ApplyError) -> Execu
     }
 }
 
-fn replay_kernel_event<E>(
+async fn replay_kernel_event<E>(
     mut batches: Batch<E>,
     working: &BlockWorkingSet,
     event: &Event,
@@ -621,7 +629,12 @@ where
                         }),
                     );
                 }
-                batches = batches.write(coin_object_id(*id), None);
+                batches = match super::owner_tree::write_owned(batches, coin_object_id(*id), None)
+                    .await
+                {
+                    Ok(next) => next,
+                    Err((next, error)) => return (next, Some(error)),
+                };
             }
             let Some(edge) = working.edge(*output) else {
                 return (
@@ -631,7 +644,16 @@ where
                     }),
                 );
             };
-            batches = batches.write(edge_object_id(*output), Some(Object::Edge(edge)));
+            batches = match super::owner_tree::write_owned(
+                batches,
+                edge_object_id(*output),
+                Some(Object::Edge(edge)),
+            )
+            .await
+            {
+                Ok(next) => next,
+                Err((next, error)) => return (next, Some(error)),
+            };
         }
         EventKind::EdgeClosed { input, outputs } => {
             if working.edge(*input).is_some() {
@@ -642,7 +664,11 @@ where
                     }),
                 );
             }
-            batches = batches.write(edge_object_id(*input), None);
+            batches =
+                match super::owner_tree::write_owned(batches, edge_object_id(*input), None).await {
+                    Ok(next) => next,
+                    Err((next, error)) => return (next, Some(error)),
+                };
             for id in outputs {
                 let Some(coin) = working.coin(*id) else {
                     return (
@@ -652,7 +678,16 @@ where
                         }),
                     );
                 };
-                batches = batches.write(coin_object_id(*id), Some(Object::Coin(Coin::from(coin))));
+                batches = match super::owner_tree::write_owned(
+                    batches,
+                    coin_object_id(*id),
+                    Some(Object::Coin(Coin::from(coin))),
+                )
+                .await
+                {
+                    Ok(next) => next,
+                    Err((next, error)) => return (next, Some(error)),
+                };
             }
         }
     }
@@ -763,7 +798,7 @@ where
     // as a unit: an event persisted without its registry writes would
     // be a partially applied operation.
     let (batches, replay_error) = match outcome.public_event() {
-        Some(event) => replay_kernel_event(batches, &working, event),
+        Some(event) => replay_kernel_event(batches, &working, event).await,
         None => (batches, None),
     };
     if let Some(error) = replay_error {

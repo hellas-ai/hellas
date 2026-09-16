@@ -126,6 +126,11 @@ impl FinalizedBlockView {
         })
     }
 
+    /// Owner commitment from the exact canonical block authenticated by its certificate.
+    pub fn owner_root(&self) -> [u8; 32] {
+        self.block.owner_root()
+    }
+
     /// Returns the finalized height of this block.
     #[must_use]
     pub fn height(&self) -> u64 {
@@ -177,6 +182,16 @@ mod tests {
     use super::*;
     use crate::execution::test_support::{index_block, index_genesis};
     use crate::light_client::LatestBlock;
+
+    #[test]
+    fn owner_layout_requires_the_new_canonical_block_format() {
+        let block = index_genesis().with_owner_root([7; 32]);
+        let bytes = block.encode();
+        assert!(bytes.starts_with(b"HLS2"));
+        let decoded = HellasBlock::decode(bytes.as_ref()).unwrap();
+        assert_eq!(decoded.owner_root(), [7; 32]);
+        assert!(HellasBlock::decode(&bytes[4..]).is_err());
+    }
 
     fn finalized(block: &HellasBlock, state_root: Digest) -> FinalizedBlock {
         FinalizedBlock {
