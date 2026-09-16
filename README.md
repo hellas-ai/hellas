@@ -92,7 +92,7 @@ compiles. The authorized worker is the final availability and integrity
 boundary: before nonresident content enters the safe runtime, it reopens the
 descriptor and enforces the exact ID and length; an already-resident exact
 mapping is reused. The provider then compiles the Catena source for its visible
-ROCm device. Verified static files are lent by descriptor to a bounded
+GPU device. Verified static files are lent by descriptor to a bounded
 persistent safe-runtime session, so an already prepared program and weights are
 reused across requests until the session is recycled or the service restarts.
 There is no client-supplied `gfx` target or provider architecture allow-list.
@@ -305,30 +305,29 @@ Hellas imports only `catena-lang` from the Catena workspace, pinned to a
 published Git revision in `Cargo.toml` and `Cargo.lock`. Nix vendors the same
 locked dependency; a sibling Catena checkout is not required.
 
-Enter the x86_64 Linux ROCm development shell with:
+Enter an x86_64 Linux GPU development shell with:
 
 ```sh
-nix develop .#rocm --no-write-lock-file
+nix develop .#rocm --no-write-lock-file  # AMD
+nix develop .#cuda --no-write-lock-file  # NVIDIA
 ```
 
-The NixOS provider module configures the ROCm toolchain, cache directory, and
-GPU device access when runtime content is enabled:
+Catena selects a runtime inside an isolated worker. Use `serve
+--gpu-backend auto|hip|cuda` to choose one; `auto` chooses CUDA on a NixOS NVIDIA
+host and HIP otherwise.
+
+The NixOS module provisions the matching toolchain and device access:
 
 ```nix
 services.hellas = {
   enable = true;
-  openFirewall = true;
   executePolicy = "any";
+  gpuBackend = "cuda"; # or "hip" / "auto"
   contentRoots = [ "/srv/hellas/content" ];
-  extraArgs = [ "--software-root" ];
 };
 ```
 
-Model weights, Catena programs, environment files, tokenizers, and generated
-compiler artifacts are runtime data. Keep them outside `/nix/store`; the
-module rejects store paths for these options. A provider chooses its actual
-ROCm device at execution time rather than baking a client-selected target into
-the environment.
+Keep models and compiler artifacts outside `/nix/store`; they are runtime data.
 
 Fetch providers likewise use runtime files: set `fetchConfigFile` to the JSON
 configuration path and `environmentFile` to a systemd environment file holding
@@ -394,14 +393,39 @@ nix run .#check-kernel-model-verify
 
 ## Docker
 
-The Docker output is a network-only node image. It contains no local Catena or
+The default `docker` output is a network-only node image. It contains no local Catena or
 GPU runtime and is tagged `ghcr.io/hellas-ai/hellas:network`. The derivation
 streams a Docker archive to stdout:
 
 ```bash
 $(nix build .#docker --print-out-paths) | docker load
-nix run .#docker-push-all
+nix run .#docker-push  # network image only
 ```
+
+GPU images include Catena and the corresponding runtime compiler:
+
+```bash
+$(nix build .#docker-cuda --print-out-paths) | docker load
+$(nix build .#docker-hip --print-out-paths) | docker load
+
+# NVIDIA with a configured CDI device specification:
+docker run --rm --device nvidia.com/gpu=all \
+  -v hellas-state:/var/lib/hellas -v /srv/hellas/content:/content:ro \
+  ghcr.io/hellas-ai/hellas:cuda --software-root --content-root /content
+
+# AMD:
+docker run --rm --device /dev/kfd --device /dev/dri \
+  -v hellas-state:/var/lib/hellas -v /srv/hellas/content:/content:ro \
+  ghcr.io/hellas-ai/hellas:hip --software-root --content-root /content
+```
+
+Both GPU images default to `serve` with their matching backend. The host supplies
+the GPU driver and model content stays on runtime volumes. On x86_64 Linux,
+`nix run .#docker-push-all` publishes the network, CUDA, and HIP images.
+
+A GPU asset owner uploads verified weights once and execution workers map them
+read-only. Worker replacement retains weights; asset pressure recreates the
+owner. HIP resident sharing requires version 7.15 or newer.
 
 ## Dependency maintenance
 

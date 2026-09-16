@@ -160,16 +160,31 @@ pub struct IrohSendHalf {
 }
 
 impl IrohSendHalf {
-    async fn write_framed(&mut self, frame_bytes: &[u8]) -> std::io::Result<()> {
+    async fn write_framed(&mut self, frame: Frame) -> std::io::Result<()> {
+        let frame_bytes = encode_outbound_frame(&frame)?;
         let write_timeout = self.write_timeout;
         let mut len_buf = BytesMut::with_capacity(10);
         write_varint(frame_bytes.len() as u64, &mut len_buf);
         let result = match self.send.as_mut() {
             Some(send) => {
-                write_frame_with_timeout(send, &len_buf, frame_bytes, write_timeout).await
+                write_frame_with_timeout(send, &len_buf, &frame_bytes, write_timeout).await
             }
             None => Err(std::io::Error::other("send half closed")),
         };
+        // A handler can finish after reading the request body, before the
+        // caller writes End. Dropping its QUIC receive stream sends
+        // STOP_SENDING(0): the send direction is already closed normally.
+        // Only End may accept this; body writes and nonzero stops still fail.
+        if matches!(frame, Frame::End(_))
+            && matches!(
+                result.as_ref().err().and_then(|error| error.get_ref())
+                    .and_then(|error| error.downcast_ref::<iroh::endpoint::WriteError>()),
+                Some(iroh::endpoint::WriteError::Stopped(code)) if *code == 0_u32.into()
+            )
+        {
+            self.send.take();
+            return Ok(());
+        }
         if result.is_err() {
             self.reset_flag.store(true, Ordering::Release);
             if let Some(mut send) = self.send.take() {
@@ -194,17 +209,16 @@ impl crate::transport::SendHalf for IrohSendHalf {
     type Error = std::io::Error;
 
     async fn send_body(&mut self, payload: Bytes) -> Result<(), Self::Error> {
-        let buf = encode_outbound_frame(&Frame::Body(payload))?;
-        self.write_framed(&buf).await
+        self.write_framed(Frame::Body(payload)).await
     }
 
     async fn close_send(&mut self, trailer: Option<Trailer>) -> Result<(), Self::Error> {
         let trailer = trailer.unwrap_or_default();
-        let buf = encode_outbound_frame(&Frame::End(EndFrame {
+        self.write_framed(Frame::End(EndFrame {
             status: trailer.status,
             trailer,
-        }))?;
-        self.write_framed(&buf).await?;
+        }))
+        .await?;
         if let Some(mut s) = self.send.take() {
             let _ = s.finish();
         }
