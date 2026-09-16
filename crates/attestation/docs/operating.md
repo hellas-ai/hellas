@@ -10,9 +10,11 @@ There are two roles: the **provider** (serves inference on a Mac) and the
 
 Attestation only works on a genuine, locked-down Apple machine.
 
-1. **Build hardened.** Package, provision, and sign Hellas Gate. The native App
-   Attest producer lives in Gate because DeviceCheck is an app capability, not
-   a portable protocol primitive. Run with SIP enabled and Full Security boot.
+1. **Build hardened.** Package, provision, and sign Hellas Gate using its
+   [macOS signing guide](https://github.com/hellas-ai/gate/blob/52ade7b8be85835d8b43962463ff32913a638090/docs/SIGNING.md).
+   Gate owns the app bundle, signing, and native App Attest producer because
+   DeviceCheck is an app capability, not a portable protocol primitive.
+   Run with SIP enabled and Full Security boot.
 2. **Enroll (automatic).** The first time Gate starts its provider, it runs App
    Attest (`attestKey`) in the Secure Enclave and builds a
    `ProviderEnrollmentBundle` = signed genesis + the original Apple
