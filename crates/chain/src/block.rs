@@ -60,11 +60,22 @@ pub struct HellasBlock {
     height: Height,
     timestamp: u64,
     state_root: Digest,
+    owner_root: [u8; 32],
     sync_target: UtxoSyncTarget,
     txs: Vec<Transaction>,
 }
 
 impl HellasBlock {
+    /// Root of the authenticated owner summary/holdings tree, covered by canonical block bytes.
+    pub const fn owner_root(&self) -> [u8; 32] {
+        self.owner_root
+    }
+
+    pub fn with_owner_root(mut self, owner_root: [u8; 32]) -> Self {
+        self.owner_root = owner_root;
+        self
+    }
+
     pub fn genesis(leader: PublicKey, state_root: Digest, sync_target: UtxoSyncTarget) -> Self {
         Self {
             context: Context {
@@ -76,6 +87,7 @@ impl HellasBlock {
             height: Height::zero(),
             timestamp: 0,
             state_root,
+            owner_root: [0; 32],
             sync_target,
             txs: Vec::new(),
         }
@@ -96,6 +108,7 @@ impl HellasBlock {
             height,
             timestamp,
             state_root,
+            owner_root: [0; 32],
             sync_target,
             txs,
         }
@@ -192,7 +205,8 @@ impl CertifiableBlock for HellasBlock {
 
 impl EncodeSize for HellasBlock {
     fn encode_size(&self) -> usize {
-        self.context.encode_size()
+        4 + 32
+            + self.context.encode_size()
             + self.parent.encode_size()
             + self.height.encode_size()
             + self.timestamp.encode_size()
@@ -204,11 +218,13 @@ impl EncodeSize for HellasBlock {
 
 impl Write for HellasBlock {
     fn write(&self, buf: &mut impl BufMut) {
+        buf.put_slice(b"HLS2");
         self.context.write(buf);
         self.parent.write(buf);
         self.height.write(buf);
         self.timestamp.write(buf);
         self.state_root.write(buf);
+        buf.put_slice(&self.owner_root);
         self.sync_target.write(buf);
         self.txs.write(buf);
     }
@@ -218,11 +234,18 @@ impl Read for HellasBlock {
     type Cfg = ();
 
     fn read_cfg(buf: &mut impl Buf, _cfg: &Self::Cfg) -> Result<Self, CodecError> {
+        if <[u8; 4]>::read(buf)? != *b"HLS2" {
+            return Err(CodecError::Invalid(
+                "HellasBlock",
+                "unsupported block format; devnet reset required",
+            ));
+        }
         let context = Context::read(buf)?;
         let parent = Digest::read(buf)?;
         let height = Height::read(buf)?;
         let timestamp = u64::read(buf)?;
         let state_root = Digest::read(buf)?;
+        let owner_root = <[u8; 32]>::read(buf)?;
         let sync_target = UtxoSyncTarget::read(buf)?;
         let txs = Vec::<Transaction>::read_range(buf, 0..=MAX_TXS_PER_BLOCK)?;
         Ok(Self {
@@ -231,6 +254,7 @@ impl Read for HellasBlock {
             height,
             timestamp,
             state_root,
+            owner_root,
             sync_target,
             txs,
         })

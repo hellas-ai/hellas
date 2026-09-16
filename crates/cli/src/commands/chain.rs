@@ -48,7 +48,7 @@ pub struct OpenArgs {
     /// Chain light-client RPC endpoint
     #[arg(long)]
     rpc: String,
-    /// Network to sign for: a shipped name (`devnet`, `testnet`) or a
+    /// Network to sign for: a shipped name (`devnet`) or a
     /// full network id
     #[arg(long, default_value = "devnet", conflicts_with = "genesis")]
     network: String,
@@ -92,7 +92,7 @@ pub struct CloseArgs {
     /// Chain light-client RPC endpoint
     #[arg(long)]
     rpc: String,
-    /// Network to sign for: a shipped name (`devnet`, `testnet`) or a
+    /// Network to sign for: a shipped name (`devnet`) or a
     /// full network id
     #[arg(long, default_value = "devnet", conflicts_with = "genesis")]
     network: String,
@@ -189,6 +189,24 @@ pub enum QueryCommand {
 #[cfg(feature = "indexer")]
 #[derive(Subcommand)]
 pub enum IndexerCommand {
+    /// Serve verified proofs from a local full follower on a loopback listener
+    Serve {
+        #[arg(long)]
+        rpc: String,
+        /// Authenticated trust document, provisioned independently of the RPC origin
+        #[arg(long)]
+        trust: PathBuf,
+        /// Exact authenticated genesis JSON; defaults to the embedded devnet document
+        #[arg(long)]
+        genesis: Option<PathBuf>,
+        #[arg(long)]
+        storage_dir: PathBuf,
+        #[arg(long, default_value = "hellas-explorer")]
+        partition_prefix: String,
+        /// Loopback listener for the local tunnel daemon
+        #[arg(long, default_value = "127.0.0.1:8788")]
+        listen: std::net::SocketAddr,
+    },
     /// Follow a validator and maintain a verified finalized-block archive
     Follow {
         /// Chain light-client RPC endpoint
@@ -206,6 +224,13 @@ pub enum IndexerCommand {
 #[cfg(feature = "validator")]
 #[derive(Subcommand)]
 pub enum ValidatorCommand {
+    /// Export public epoch-zero explorer trust from a validator config and exact genesis file
+    ExportTrust {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        genesis: PathBuf,
+    },
     /// Generate one cryptographically random validator configuration per committee member
     GenerateNetwork {
         /// Stable lowercase network identifier
@@ -557,7 +582,7 @@ async fn connect_verified(rpc: String) -> CliResult<RemoteLightClient> {
 /// before anyone can tell you whether it was wanted — but the node
 /// reports its own network, so the mismatch is worth catching here
 /// rather than as an unexplained rejected transaction. Pointing devnet
-/// keys at a testnet node is exactly the mistake this slice makes
+/// keys at a different network node is exactly the mistake this slice makes
 /// impossible to get away with silently.
 /// Resolves the network to sign for, without touching the network.
 ///
@@ -592,7 +617,7 @@ fn selected_network(network: &str, genesis: Option<PathBuf>) -> CliResult<Networ
 /// before anyone can tell you whether it was wanted — but the node
 /// reports its own network, so the mismatch is caught here rather than
 /// as an unexplained rejected transaction. Pointing devnet keys at a
-/// testnet node is exactly the mistake this makes impossible to get
+/// different network node is exactly the mistake this makes impossible to get
 /// away with silently.
 async fn confirm_network(network: NetworkId, client: &RemoteLightClient) -> CliResult<NetworkId> {
     let reported = client.get_consensus_info().await?.network_id;
@@ -720,6 +745,31 @@ fn read_terms(path: &std::path::Path) -> CliResult<Terms> {
 #[cfg(feature = "indexer")]
 async fn run_indexer(command: IndexerCommand) -> CliResult {
     match command {
+        IndexerCommand::Serve {
+            rpc,
+            trust,
+            genesis,
+            storage_dir,
+            partition_prefix,
+            listen,
+        } => {
+            let trust = serde_json::from_slice(&fs::read(&trust)?)?;
+            let genesis_json = genesis.map(fs::read).transpose()?;
+            tokio::task::spawn_blocking(move || {
+                hellas_chain::explorer_origin::run(hellas_chain::explorer_origin::OriginOptions {
+                    rpc,
+                    trust,
+                    genesis_json,
+                    storage_dir,
+                    partition_prefix,
+                    listen,
+                    status: follower_status_sink(),
+                })
+            })
+            .await?
+            .map_err(anyhow::Error::from_boxed)?;
+        }
+
         IndexerCommand::Follow {
             rpc,
             storage_dir,
@@ -757,6 +807,9 @@ fn follower_status_sink() -> hellas_chain::follower::FollowerStatusSink {
 #[cfg(feature = "validator")]
 async fn run_validator(command: ValidatorCommand) -> CliResult {
     let command = match command {
+        ValidatorCommand::ExportTrust { config, genesis } => {
+            hellas_chain::validator::Command::ExportTrust { config, genesis }
+        }
         ValidatorCommand::GenerateNetwork {
             network_id,
             validators,

@@ -414,6 +414,7 @@ where
             }
         };
         retained.extend(deferred_general);
+        let owner_root = crate::execution::owner_tree::root(&batches).await.ok()?;
         let merkleized = batches.merkleize().await.expect("UTXO merkleize failed");
         input.commit_snapshot(snapshot, retained).await;
 
@@ -426,7 +427,8 @@ where
             merkleized.root(),
             sync_target_from_merkleized(&merkleized),
             txs,
-        );
+        )
+        .with_owner_root(owner_root);
         Some(Proposed { block, merkleized })
     }
 
@@ -467,6 +469,10 @@ where
             err
         })
         .ok()?;
+        let owner_root = crate::execution::owner_tree::root(&batches).await.ok()?;
+        if owner_root != block.owner_root() {
+            return None;
+        }
         let merkleized = batches.merkleize().await.expect("UTXO merkleize failed");
         let computed_sync_target = sync_target_from_merkleized(&merkleized);
         if merkleized.root() != block.state_root() || computed_sync_target != block.sync_target() {
@@ -498,6 +504,14 @@ where
         )
         .await
         .expect("replay of certified block failed");
+        let owner_root = crate::execution::owner_tree::root(&batches)
+            .await
+            .expect("owner commitment must replay");
+        assert_eq!(
+            owner_root,
+            block.owner_root(),
+            "certified owner commitment must replay"
+        );
         let merkleized = batches.merkleize().await.expect("UTXO merkleize failed");
         assert_eq!(merkleized.root(), block.state_root());
         assert_eq!(

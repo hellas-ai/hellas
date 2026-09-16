@@ -29,6 +29,7 @@ fn parse_object_kind(value: &str) -> Option<ObjectKind> {
         "coin" => Some(ObjectKind::Coin),
         "edge" => Some(ObjectKind::Edge),
         "registry-chunk" => Some(ObjectKind::RegistryChunk),
+        "owner-data" => Some(ObjectKind::OwnerData),
         _ => None,
     }
 }

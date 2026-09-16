@@ -14,10 +14,16 @@ mod consensus;
 pub mod domain;
 #[cfg(any(feature = "indexer", feature = "validator"))]
 mod execution;
+#[cfg(feature = "explorer-origin")]
+pub mod explorer_origin;
 #[cfg(feature = "validator")]
 pub mod faucet;
 #[cfg(feature = "indexer")]
 pub mod follower;
+#[cfg(feature = "domain")]
+pub mod owner_proof;
+#[cfg(feature = "verified-explorer")]
+pub mod verified_explorer;
 /// The shipped genesis documents and the type that reads them. It is its
 /// own `std` crate because a browser build and the relay in another
 /// repository read the same bytes a validator does; re-exported whole so
@@ -104,40 +110,26 @@ mod genesis_reexport {
 
     #[test]
     fn the_documents_reached_through_chain_are_the_reviewed_bytes() {
-        for (selector, id, json, expected) in [
-            (
-                "devnet",
-                crate::genesis::HELLAS_DEVNET_1_ID,
-                crate::genesis::HELLAS_DEVNET_1_JSON,
-                "caab04a9350edbe0d50aa9375dcee2742145cf5c24c57f42c844ebf4f27aa4b6",
-            ),
-            (
-                "testnet",
-                crate::genesis::HELLAS_TESTNET_1_ID,
-                crate::genesis::HELLAS_TESTNET_1_JSON,
-                "2c845c34455dc96e818ce40f4200edac79e6fb43f3e68a24e522d2030c3d8680",
-            ),
-        ] {
-            let hex: String = Sha256::digest(json.as_bytes())
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect();
-            assert_eq!(hex, expected, "{selector}");
+        let selector = "devnet";
+        let id = crate::genesis::HELLAS_DEVNET_1_ID;
+        let json = crate::genesis::HELLAS_DEVNET_1_JSON;
+        let expected = "caab04a9350edbe0d50aa9375dcee2742145cf5c24c57f42c844ebf4f27aa4b6";
+        let hex: String = Sha256::digest(json.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert_eq!(hex, expected, "{selector}");
 
-            let network = crate::genesis::known_network(selector).expect("shipped network");
-            assert_eq!(network.id, id);
-            assert_eq!(network.json, json);
+        let network = crate::genesis::known_network(selector).expect("shipped network");
+        assert_eq!(network.id, id);
+        assert_eq!(network.json, json);
 
-            let genesis: crate::genesis::Genesis =
-                serde_json::from_str(json).expect("shipped document parses");
-            genesis.validate().expect("shipped document validates");
-            assert_eq!(genesis.network_id, id);
-        }
+        let genesis: crate::genesis::Genesis =
+            serde_json::from_str(json).expect("shipped document parses");
+        genesis.validate().expect("shipped document validates");
+        assert_eq!(genesis.network_id, id);
 
-        assert_eq!(
-            crate::genesis::known_network_names(),
-            vec!["devnet", "testnet"]
-        );
+        assert_eq!(crate::genesis::known_network_names(), vec!["devnet"]);
         assert_eq!(crate::genesis::GENESIS_SCHEMA_VERSION, 1);
     }
 }

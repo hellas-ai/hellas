@@ -1,3 +1,5 @@
+#[cfg(feature = "explorer-origin")]
+mod trusted_epochs;
 use crate::domain::{PublicKey, Scheme};
 use crate::{
     app::{HellasBlock, MarshalMailbox},
@@ -28,6 +30,8 @@ use commonware_utils::{Acknowledgement, NZU64, sync::AsyncMutex, vec::NonEmptyVe
 use rand_core::CryptoRng;
 use std::{marker::PhantomData, num::NonZeroU64, num::NonZeroUsize, sync::Arc};
 use thiserror::Error;
+#[cfg(feature = "explorer-origin")]
+use trusted_epochs::TrustedEpochs;
 
 pub type FinalizationStore<E = tokio::Context> = immutable::Archive<E, Digest, Finalization>;
 pub type BlockStore<E = tokio::Context> = immutable::Archive<E, Digest, HellasBlock>;
@@ -118,6 +122,8 @@ where
 pub struct ChainIndexer {
     marshal: MarshalMailbox,
     verifier: Option<ConsensusVerifier>,
+    #[cfg(feature = "explorer-origin")]
+    schedule: Option<TrustedEpochs>,
     ingest_lock: Arc<AsyncMutex<()>>,
 }
 
@@ -131,6 +137,8 @@ pub enum IngestOutcome {
 pub enum IngestError {
     #[error("consensus verifier is not configured")]
     MissingVerifier,
+    #[error("invalid trust schedule or finalized epoch: {0}")]
+    TrustSchedule(String),
     #[error("{0}")]
     Consensus(#[from] ConsensusVerificationError),
     #[error("invalid block")]
@@ -160,6 +168,8 @@ impl ChainIndexer {
         Self {
             marshal,
             verifier: None,
+            #[cfg(feature = "explorer-origin")]
+            schedule: None,
             ingest_lock: Arc::new(AsyncMutex::new(())),
         }
     }
@@ -191,8 +201,19 @@ impl ChainIndexer {
         finalization: Finalization,
     ) -> Result<IngestOutcome, IngestError> {
         let _guard = self.ingest_lock.lock().await;
-        let verifier = self.verifier.as_ref().ok_or(IngestError::MissingVerifier)?;
         let height = block.height();
+        #[cfg(feature = "explorer-origin")]
+        let scheduled = self
+            .schedule
+            .as_ref()
+            .map(|schedule| schedule.verifier(height, finalization.proposal.round.epoch()))
+            .transpose()?;
+        #[cfg(feature = "explorer-origin")]
+        let verifier = scheduled
+            .or(self.verifier.as_ref())
+            .ok_or(IngestError::MissingVerifier)?;
+        #[cfg(not(feature = "explorer-origin"))]
+        let verifier = self.verifier.as_ref().ok_or(IngestError::MissingVerifier)?;
         let payload = block.digest();
 
         verifier.verify_finalization(&finalization, payload)?;
@@ -332,6 +353,90 @@ pub async fn spawn_follower_indexer<E>(
 where
     E: BufferPooler + Clock + Metrics + Spawner + Storage + CryptoRng,
 {
+    let provider = ConstantProvider::new(verifier.scheme().clone());
+    let epocher = FixedEpocher::new(NonZeroU64::new(u64::MAX).unwrap());
+    spawn_follower_with_provider(
+        context,
+        partition_prefix,
+        config,
+        verifier,
+        genesis_block,
+        provider,
+        epocher,
+    )
+    .await
+}
+
+#[cfg(feature = "explorer-origin")]
+pub async fn spawn_trusted_follower_indexer<E>(
+    context: E,
+    partition_prefix: &str,
+    config: Config,
+    trust: hellas_genesis::TrustDocument,
+    genesis_block: HellasBlock,
+) -> Result<(ChainIndexer, Handle<()>), IngestError>
+where
+    E: BufferPooler + Clock + Metrics + Spawner + Storage + CryptoRng,
+{
+    spawn_trusted_follower_indexer_with_genesis(
+        context,
+        partition_prefix,
+        config,
+        trust,
+        hellas_genesis::HELLAS_DEVNET_1_JSON.as_bytes(),
+        genesis_block,
+    )
+    .await
+}
+
+/// Initialize a follower using an independently provisioned genesis document and trust schedule.
+#[cfg(feature = "explorer-origin")]
+pub async fn spawn_trusted_follower_indexer_with_genesis<E>(
+    context: E,
+    partition_prefix: &str,
+    config: Config,
+    trust: hellas_genesis::TrustDocument,
+    genesis_json: &[u8],
+    genesis_block: HellasBlock,
+) -> Result<(ChainIndexer, Handle<()>), IngestError>
+where
+    E: BufferPooler + Clock + Metrics + Spawner + Storage + CryptoRng,
+{
+    let schedule = TrustedEpochs::with_genesis(trust, genesis_json)?;
+    let verifier = schedule
+        .verifier(Height::zero(), commonware_consensus::types::Epoch::zero())?
+        .clone();
+    let (mut indexer, handle) = spawn_follower_with_provider(
+        context,
+        partition_prefix,
+        config,
+        verifier,
+        genesis_block,
+        schedule.clone(),
+        schedule.clone(),
+    )
+    .await?;
+    indexer.schedule = Some(schedule);
+    Ok((indexer, handle))
+}
+
+async fn spawn_follower_with_provider<E, P, H>(
+    context: E,
+    partition_prefix: &str,
+    config: Config,
+    verifier: ConsensusVerifier,
+    genesis_block: HellasBlock,
+    provider: P,
+    epocher: H,
+) -> Result<(ChainIndexer, Handle<()>), IngestError>
+where
+    E: BufferPooler + Clock + Metrics + Spawner + Storage + CryptoRng,
+    P: commonware_cryptography::certificate::Provider<
+            Scope = commonware_consensus::types::Epoch,
+            Scheme = Scheme,
+        >,
+    H: commonware_consensus::types::Epocher,
+{
     let finalizations_by_height = init_finalization_store(
         context.child("finalizations_by_height"),
         partition_prefix,
@@ -342,8 +447,8 @@ where
         init_block_store(context.child("finalized_blocks"), partition_prefix, &config).await;
     let mailbox_size = NonZeroUsize::new(config.mailbox_size).unwrap_or(NonZeroUsize::MIN);
     let marshal_config = marshal::Config {
-        provider: ConstantProvider::new(verifier.scheme().clone()),
-        epocher: FixedEpocher::new(NonZeroU64::new(u64::MAX).unwrap()),
+        provider,
+        epocher,
         start: Start::Genesis(genesis_block),
         partition_prefix: partition_prefix.to_string(),
         mailbox_size,
