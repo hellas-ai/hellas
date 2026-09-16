@@ -262,6 +262,10 @@ impl State {
             }
             return Err(OwnerIndexError::ConflictingHeight { height });
         }
+        // Marshal can redeliver finalized blocks below an archive-replayed cursor.
+        if height < self.cursor.height {
+            return Ok(ApplyOutcome::Duplicate);
+        }
         let next_height = self.cursor.height.saturating_add(1);
         if height != next_height {
             return Err(OwnerIndexError::HeightGap {
