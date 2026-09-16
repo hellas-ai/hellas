@@ -454,6 +454,65 @@ mod timeout_tests {
     }
 
     #[tokio::test]
+    async fn only_end_accepts_a_graceful_peer_stop() {
+        use crate::metadata::Trailer;
+        use crate::transport::RecvHalf as _;
+
+        for (stop_code, closing) in [(0_u32, true), (1, true), (0, false)] {
+            let (client, server, client_connection, server_connection) = connected_pair().await;
+            let transport = IrohTransport::new(server_connection);
+            let mut bytes = framed(open_frame(10));
+            bytes.extend_from_slice(&framed(Frame::Body(Bytes::from_static(b"request"))));
+            let (client_send, client_recv) = raw_stream(&client_connection, &bytes).await;
+            let inbound = transport
+                .accept()
+                .await
+                .expect("transport accepts Open")
+                .expect("stream is present");
+            let (mut send, mut recv) = inbound.stream.split();
+            assert_eq!(recv.next().await.unwrap().unwrap(), b"request"[..]);
+            send.send_body(Bytes::from_static(b"response"))
+                .await
+                .unwrap();
+            send.close_send(Some(Trailer::ok())).await.unwrap();
+            if stop_code != 0 {
+                recv.reset(crate::status::WireCode::Cancelled);
+            }
+            // Normal handlers drop their receive half after the single body.
+            // Wait for the resulting stop so End always encounters the race.
+            drop(recv);
+            assert_eq!(
+                tokio::time::timeout(OUTER_TIMEOUT, client_send.stopped())
+                    .await
+                    .expect("the peer observes STOP_SENDING")
+                    .expect("the connection remains live"),
+                Some(stop_code.into()),
+            );
+            let (mut send, mut recv) =
+                IrohStream::new(client_send, client_recv, OUTER_TIMEOUT, OUTER_TIMEOUT).split();
+            let written = if closing {
+                send.close_send(None).await
+            } else {
+                send.send_body(Bytes::from_static(b"another body")).await
+            };
+            if stop_code == 0 && closing {
+                written.expect("a normal peer stop already closed the send direction");
+                assert_eq!(recv.next().await.unwrap().unwrap(), b"response"[..]);
+                assert!(recv.next().await.is_none());
+                assert_eq!(
+                    recv.trailer().expect("response trailer").status,
+                    crate::status::WireCode::Ok
+                );
+            } else {
+                written.expect_err("body writes and peer resets remain errors");
+            }
+            drop((send, recv));
+            client.close().await;
+            server.close().await;
+        }
+    }
+
+    #[tokio::test]
     async fn incomplete_open_is_reset_and_accept_capacity_is_released() {
         let (client, server, client_connection, server_connection) = connected_pair().await;
         let transport = IrohTransport::with_timeouts(
