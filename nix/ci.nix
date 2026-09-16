@@ -212,6 +212,8 @@ let
   // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
     docker = "docker";
   }
+  # CUDA and HIP images are intentionally omitted from the hosted matrix.
+  # Build them on the self-hosted release runner once it is registered again.
   // lib.optionalAttrs (pkgs.stdenv.hostPlatform.system == "x86_64-linux") {
     cli-catena = "cli-catena";
   };

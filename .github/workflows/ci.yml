@@ -1,0 +1,158 @@
+name: CI
+
+# Trigger model:
+#   pull_request                → lints + release builds + e2e
+#   push to master              → lints + release builds
+#   workflow_dispatch (release) → push artifacts (TODO)
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  devshell:
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'shared' }}
+    steps:
+      - uses: actions/checkout@v4
+      - if: runner.environment == 'github-hosted'
+        uses: NixOS/nix-installer-action@62c1943b776c509394b550f3f983adc14e9212d6
+      - name: Build dev shell
+        run: nix develop --accept-flake-config --command true
+
+  lints:
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'shared' }}
+    name: Lints
+    needs:
+      - devshell
+    steps:
+      - uses: actions/checkout@v4
+      - if: runner.environment == 'github-hosted'
+        uses: NixOS/nix-installer-action@62c1943b776c509394b550f3f983adc14e9212d6
+      # This gate crosses feature and target sets in one Cargo target directory.
+      # Incremental state alone reaches tens of GiB, which exhausts shared runners
+      # without making CI more trustworthy.
+      - name: nix run .#check
+        env:
+          CARGO_INCREMENTAL: "0"
+          CARGO_PROFILE_DEV_DEBUG: "0"
+          CARGO_PROFILE_TEST_DEBUG: "0"
+        run: nix run --accept-flake-config .#check
+
+  # ─── release builds ─────────────────────────────────────────────────────
+  # Native, cross, and container builds run on PRs and again once merged.
+  # Native builds run cargo test as part of buildRustPackage (`doCheck = true`
+  # by default), so this stage also covers test execution.
+
+  build-smoke-matrix:
+    needs: lints
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'shared' }}
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - if: runner.environment == 'github-hosted'
+        uses: NixOS/nix-installer-action@62c1943b776c509394b550f3f983adc14e9212d6
+      - id: set-matrix
+        name: Enumerate smoke builds
+        run: |
+          set -Eeu
+          matrix="$(
+            nix eval --accept-flake-config --json '.#ci.x86_64-linux.builds' --apply '
+              builds: {
+                include = builtins.attrValues (
+                  builtins.mapAttrs (name: attr: { inherit name attr; }) builds
+                );
+              }
+            '
+          )"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  build-smoke:
+    needs: build-smoke-matrix
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'shared' }}
+    name: build:${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.build-smoke-matrix.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - if: runner.environment == 'github-hosted'
+        uses: NixOS/nix-installer-action@62c1943b776c509394b550f3f983adc14e9212d6
+      - name: nix build .#${{ matrix.attr }}
+        run: nix build --accept-flake-config --print-build-logs --no-link '.#packages.x86_64-linux.${{ matrix.attr }}'
+
+  build-smoke-passed:
+    if: always()
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'shared' }}
+    name: Build smoke passed
+    needs:
+      - build-smoke-matrix
+      - build-smoke
+    steps:
+      - name: Require build-smoke-matrix + all smoke builds succeeded
+        run: |
+          set -Eeu
+          test '${{ needs.build-smoke-matrix.result }}' = 'success'
+          test '${{ needs.build-smoke.result }}' = 'success'
+
+  # ─── e2e (PR only) ──────────────────────────────────────────────────────
+  # nixosTests run in QEMU VMs. They depend on the same package derivations
+  # the build-smoke stage built, so this stage reuses them via the nix store
+  # — no rebuilds.
+
+  e2e-matrix:
+    if: github.event_name == 'pull_request'
+    needs: build-smoke-passed
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'shared' }}
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - if: runner.environment == 'github-hosted'
+        uses: NixOS/nix-installer-action@62c1943b776c509394b550f3f983adc14e9212d6
+      - id: set-matrix
+        name: Enumerate nixosTests
+        run: |
+          set -Eeu
+          matrix="$(
+            nix eval --accept-flake-config --json '.#nixosTests.x86_64-linux' --apply '
+              tests: { include = map (name: { inherit name; }) (builtins.attrNames tests); }
+            '
+          )"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  e2e:
+    if: github.event_name == 'pull_request'
+    needs: e2e-matrix
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'shared' }}
+    name: e2e:${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.e2e-matrix.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - if: runner.environment == 'github-hosted'
+        uses: NixOS/nix-installer-action@62c1943b776c509394b550f3f983adc14e9212d6
+      - name: nix build .#nixosTests.x86_64-linux.${{ matrix.name }}
+        run: nix build --accept-flake-config --print-build-logs --no-link '.#nixosTests.x86_64-linux.${{ matrix.name }}'
+
+  e2e-passed:
+    if: always() && github.event_name == 'pull_request'
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'shared' }}
+    name: E2E passed
+    needs:
+      - e2e-matrix
+      - e2e
+    steps:
+      - name: Require e2e-matrix + all e2e succeeded
+        run: |
+          set -Eeu
+          test '${{ needs.e2e-matrix.result }}' = 'success'
+          test '${{ needs.e2e.result }}' = 'success'
