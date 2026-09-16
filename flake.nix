@@ -11,9 +11,9 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     rust-overlay.url = "github:oxalica/rust-overlay";
+    # Public, pinned HIP 7.15+ ROCm package set.
     nix-strix-halo = {
       url = "github:hellas-ai/nix-strix-halo/e24b2efcfaee1cefd326ff65ff7a955a908fd5ee";
-      flake = false;
     };
   };
 

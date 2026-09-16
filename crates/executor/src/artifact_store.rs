@@ -158,6 +158,12 @@ impl ArtifactStoreRoot {
     }
 }
 
+impl Drop for ArtifactStoreRoot {
+    fn drop(&mut self) {
+        let _ = self._root_directory.unlock();
+    }
+}
+
 /// Publishes the first capacity record whole or not at all. Creating the final
 /// name in place can leave an empty-but-existing record after power loss,
 /// permanently failing subsequent startup. A synced sibling followed by rename
