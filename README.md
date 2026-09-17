@@ -427,6 +427,127 @@ A GPU asset owner uploads verified weights once and execution workers map them
 read-only. Worker replacement retains weights; asset pressure recreates the
 owner. HIP resident sharing requires version 7.15 or newer.
 
+## Inference cache and reproducible agent runs
+
+Inference reuse is opt-in: `--output-cache off` (the default), `record`
+(reuse the first successful result, record misses), or `replay-only` (fail
+on a miss without inference). These are local trust-on-first-use recordings,
+independent of the protocol's public `--retain` setting. Enabling recording
+persists inference outputs even for otherwise ephemeral requests.
+
+Caching applies to native CLI/library execution, gateway requests, and executor
+requests from uncached clients. Executor replay verifies its original signed
+evidence before signing for the new ticket; client replay preserves provenance.
+Only complete successful streams are recorded, and recording failures are
+reported rather than silently losing the material required for later replay.
+
+| Kind | Input identity |
+| --- | --- |
+| Evaluate | Catena execution identity: environment, input state, prompt token IDs and decode policy |
+| Responses proxy | Endpoint and effective forwarded body after model/stream normalization |
+| Inference Fetch | Sealed Responses environment, service, method and body, excluding caller signatures |
+
+General Fetch operations bypass recording and are refused in replay-only mode.
+Agent tool execution is not cached. Shadow verification requires live execution.
+
+The cache uses the existing Hellas store (`--store-dir`, `HELLAS_STORE_DIR`,
+or `~/.hellas/store`): Xet-addressed objects and a DAG-CBOR inference index.
+One process owns the writable index; administer its live store through RPC.
+Offline read-only opens are snapshots. Clear/remove/prune remove mappings, not
+shared objects or executor ticket history, and prevent older in-flight work
+from republishing. Replay-only administration is read-only.
+
+Client-side Fetch recordings (CLI/gateway) share keys with executor recordings,
+but omit the signed evidence required for executor replay. Reusing that store
+with `serve` can therefore fail with a missing `signed` field, in both `record`
+and `replay-only` modes; invalid entries never trigger live fallback. Remove
+the affected entry with
+`hellas-cli output-cache --kind fetch --key "$IDENTITY" remove`, then let the
+executor record it afresh. For a running writer, add `--socket` or `--node-id`
+as described below. Executor recordings remain readable by clients.
+
+```sh
+hellas-cli --output-cache record gateway --responses-backend proxy --wrap opencode
+hellas-cli --output-cache replay-only gateway --responses-backend proxy --wrap opencode
+hellas-cli output-cache --kind proxy list
+hellas-cli output-cache --kind proxy --key "$IDENTITY" show
+hellas-cli output-cache --json stats
+hellas-cli output-cache --kind proxy prune --max-entries 1000 --dry-run
+hellas-cli output-cache export --to ./agent-recordings
+```
+
+Control is ordinary transport-independent RPC with separate admin grants.
+For an owner-only Unix socket (also supported by `serve`):
+
+```sh
+mkdir -m 700 ./hellas-control
+hellas-cli --output-cache record --control-socket ./hellas-control/control.sock \
+  gateway --responses-backend proxy
+hellas-cli output-cache --socket ./hellas-control/control.sock --kind proxy clear
+```
+
+For remote node administration, explicitly allow the administrator's Iroh node
+ID, then use that administrator's existing identity to connect:
+
+```sh
+hellas-cli --output-cache record serve --admin-peer "$ADMIN_NODE_ID"
+hellas-cli --identity ./admin.identity output-cache --node-id "$NODE_ID" clear
+```
+
+All management commands accept either `--socket` or `--node-id` (with optional
+`--node-addr`); `reset` aliases `clear`. Without either they operate offline.
+Remote admin is disabled by default and is not publicly advertised. An
+authenticated peer is not an administrator unless explicitly granted access.
+An admin grant permits reading/exporting every cached transcript as well as
+clearing it; those transcripts may contain private prompts, source, or outputs.
+
+Embedders compose `CacheControlServer(CacheController)` with `Authorized` and
+`AdminPolicy`, reusing the existing dispatcher and carriers. WebSocket and
+serial hosts must authenticate their connection before supplying its identity;
+raw connectivity grants nothing. The shared framed byte-stream adapter also
+accepts serial I/O. Unix checks OS ownership; its socket is mode `0600` under
+an owner-only directory, and existing paths are not overwritten.
+
+For a Linux Nix agent build, use the overlay's `pkgs.hellasLib.agent` helpers:
+
+```nix
+let
+  agent = pkgs.hellasLib.agent;
+  inputs = {
+    name = "agent-change";
+    workspace = ./source;
+    prompt = builtins.readFile ./prompt.txt;
+    model = "your-provider-model";
+    hellas = pkgs.hellas.cli;
+    opencode = pkgs.opencode;
+    packages = [ pkgs.rustc pkgs.cargo ]; # tools available to the agent
+    gatewayArgs = [ "--responses-backend" "proxy" ];
+  };
+in {
+  record = agent.mkAgentRecord inputs;
+  result = agent.mkAgentRun (inputs // { cache = ./agent-recordings; });
+}
+```
+
+Run the recorder executable with a writable store directory outside the Nix
+build, with provider credentials in its runtime environment. Export a snapshot
+and use it as `cache`. `mkAgentRun` starts a replay-only gateway inside the
+sandbox, runs OpenCode, and returns its resulting workspace. Both phases use
+`/build/workspace`, the same pinned tools/configuration, and an explicit system
+prompt `date` (default `1970-01-01`). Changing inputs can produce a cache miss;
+re-record them instead of giving the build network access. A replay reruns
+tools and is only reproducible when those tools are deterministic too.
+
+The helper uses OpenCode's generic OpenAI Responses client. Its endpoint must
+accept that request shape; the stricter sealed `codex-responses` Fetch contract
+is not a drop-in target. A zero OpenCode exit status alone is not success: the
+runner also requires a completed session and rejects error events.
+
+Recordings and generated files can contain private source or model output.
+Do not put credentials in Nix expressions, and do not publish recordings
+without reviewing them: Nix store contents are normally readable by all local
+users.
+
 ## Dependency maintenance
 
 Available in the development shell:

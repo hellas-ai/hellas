@@ -110,6 +110,16 @@ fn forwarded_body(request: &BackendRequest) -> Result<Bytes, BackendError> {
         })
 }
 
+impl super::cache::CacheIdentity for ResponsesProxy {
+    fn cache_key(&self, request: &BackendRequest) -> Result<super::cache::CacheKey, BackendError> {
+        let body = forwarded_body(request)?;
+        Ok(super::cache::CacheKey::hash(
+            super::cache::CacheKind::Proxy,
+            &[self.endpoint.as_str().as_bytes(), &body],
+        ))
+    }
+}
+
 fn responses_event_stream(
     upstream: reqwest::Response,
     parsed: ParsedResponseRequest,

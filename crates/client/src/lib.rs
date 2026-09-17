@@ -1,8 +1,13 @@
-//! Reusable Hellas client orchestration.
+//! Reusable Hellas client orchestration. The optional `local` backend embeds
+//! an executor; transport-neutral verification does not depend on that backend.
 
+#[cfg(feature = "iroh")]
+pub mod cache;
 mod error;
 #[cfg(feature = "evaluate")]
 mod evaluate;
+#[cfg(all(feature = "iroh", feature = "evaluate"))]
+pub mod execution;
 mod fetch;
 #[cfg(feature = "iroh")]
 pub mod iroh;

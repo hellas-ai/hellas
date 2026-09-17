@@ -1,4 +1,4 @@
-mod execution;
+pub(super) mod execution;
 mod quote;
 
 use crate::ExecutorError;
@@ -120,6 +120,7 @@ pub struct Executor {
     pub(super) fetch_state: FetchStateMachine<FetchTranscriptStoreBackend>,
     pub(super) fetch_access_policy: FetchAccessPolicy,
     pub(super) fetch_routes: FetchRouteRegistry,
+    pub(super) fetch_cache: Option<Arc<execution::cache::FetchCache>>,
     pub(super) pending_fetches: VecDeque<PendingFetch>,
     pending_fetch_quota_cancellations: VecDeque<DeferredFetchQuotaCancellation>,
     pending_fetch_quota_settlements: VecDeque<DeferredFetchQuotaSettlement>,
@@ -130,6 +131,7 @@ pub struct Executor {
 }
 
 pub struct ExecutorSpawnConfig {
+    pub output_cache: hellas_rpc::cache::CacheOptions,
     pub execute_policy: ExecutePolicy,
     pub queue_capacity: usize,
     pub metrics: Arc<ExecutorMetrics>,
@@ -151,6 +153,7 @@ pub struct ExecutorSpawnConfig {
 }
 
 struct ExecutorRuntimeConfig {
+    output_cache: hellas_rpc::cache::CacheOptions,
     #[cfg_attr(not(feature = "evaluate"), allow(dead_code))]
     execute_policy: ExecutePolicy,
     #[cfg_attr(not(feature = "evaluate"), allow(dead_code))]
@@ -181,6 +184,7 @@ impl Executor {
     ) -> Result<ExecutorHandle, ExecutorError> {
         let producer_key = Arc::new(producer_key);
         Self::spawn_runtime(ExecutorRuntimeConfig {
+            output_cache: Default::default(),
             execute_policy,
             queue_capacity,
             metrics: Arc::new(ExecutorMetrics::default()),
@@ -214,6 +218,7 @@ impl Executor {
     ) -> Result<ExecutorHandle, ExecutorError> {
         let producer_key = Arc::new(producer_key);
         Self::spawn_runtime(ExecutorRuntimeConfig {
+            output_cache: Default::default(),
             execute_policy,
             queue_capacity,
             metrics: Arc::new(ExecutorMetrics::default()),
@@ -243,6 +248,7 @@ impl Executor {
         #[cfg(feature = "evaluate")]
         let artifacts = EvaluateArtifactStore::open(config.artifact_store).await?;
         Self::spawn_runtime(ExecutorRuntimeConfig {
+            output_cache: config.output_cache,
             execute_policy: config.execute_policy,
             queue_capacity: config.queue_capacity,
             metrics: config.metrics,
@@ -338,6 +344,7 @@ impl Executor {
         let fetch_caller_policy = FetchCallerPolicy::new(config.fetch_access_policy.caller_keys());
         #[cfg(feature = "evaluate")]
         let evaluate = EvaluateEngine::new(EvaluateEngineConfig {
+            output_cache: config.output_cache.clone(),
             artifacts: config.artifacts,
             content_store: config.content_store,
             gpu_config: config.gpu_config,
@@ -361,6 +368,7 @@ impl Executor {
             fetch_access_policy: config.fetch_access_policy,
             fetch_routes: config.fetch_routes,
             pending_fetches: VecDeque::new(),
+            fetch_cache: execution::cache::FetchCache::open(config.output_cache)?,
             pending_fetch_quota_cancellations: VecDeque::new(),
             pending_fetch_quota_settlements: VecDeque::new(),
             fetch_max_in_flight: config.fetch_max_in_flight,
@@ -687,6 +695,7 @@ mod mailbox_tests {
         let metrics = Arc::new(ExecutorMetrics::default());
         let evaluate = EvaluateEngine::new_with_worker(
             EvaluateEngineConfig {
+                output_cache: Default::default(),
                 artifacts: EvaluateArtifactStore::memory(),
                 content_store: fixture.store.clone(),
                 gpu_config: GpuConfig::default(),
@@ -700,6 +709,7 @@ mod mailbox_tests {
         );
         let caller = producer_key.public_key();
         let executor = Executor {
+            fetch_cache: None,
             request_rx,
             owed_rx,
             completion_rx,
@@ -840,6 +850,7 @@ mod mailbox_tests {
             ..
         } = job;
         ExecutorCompletion::EvaluateFinished(Box::new(WorkerCompletion {
+            cache_recording: None,
             execution_id,
             request_commitment,
             evaluate_request,

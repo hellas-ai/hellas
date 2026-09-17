@@ -12,8 +12,8 @@ default = []
 evaluate = [
     "dep:hellas-executor",
     "hellas-executor/evaluate",
+    "hellas-client/local",
     "dep:hellas-store",
-    "dep:tokio-stream",
 ]
 
 [dependencies]
@@ -36,6 +36,10 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
-tokio-stream = { workspace = true, optional = true }
 tower = { version = "0.5", default-features = false, features = ["util"] }
 tracing.workspace = true
+
+[dev-dependencies]
+hellas-rpc = { workspace = true, features = ["host-control"] }
+hellas-wire = { workspace = true, features = ["unix"] }
+tempfile = "3"

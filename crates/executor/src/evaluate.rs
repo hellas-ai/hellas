@@ -111,6 +111,7 @@ enum ExecutionClass {
 }
 
 pub struct EvaluateEngine {
+    output_cache: hellas_rpc::cache::CacheOptions,
     artifacts: EvaluateArtifactStore,
     content_store: ContentStore,
     environments: HashMap<ContentId, CausalLmEnvironmentSource>,
@@ -135,6 +136,7 @@ pub struct EvaluateEngine {
 }
 
 pub(crate) struct EvaluateEngineConfig {
+    pub output_cache: hellas_rpc::cache::CacheOptions,
     pub artifacts: EvaluateArtifactStore,
     pub content_store: ContentStore,
     pub gpu_config: GpuConfig,
@@ -182,6 +184,7 @@ impl EvaluateEngine {
 
     fn with_worker(config: EvaluateEngineConfig, worker: ExecuteWorker) -> Self {
         Self {
+            output_cache: config.output_cache,
             artifacts: config.artifacts,
             content_store: config.content_store,
             environments: HashMap::new(),
@@ -352,11 +355,12 @@ impl EvaluateEngine {
         &mut self,
         evaluate_request: &EvaluateRequest,
         invocation: &Invocation,
-        stop_reason: StopReason,
-        output_tokens: Vec<u32>,
+        output: (StopReason, Vec<u32>),
         output_events: Vec<OutputEventEnvelope>,
         prepared_artifacts: Option<&PreparedTextArtifacts>,
+        cache_recording: Option<&hellas_rpc::cache::CacheRecording>,
     ) -> Result<(Termination, u64), ExecutorError> {
+        let (stop_reason, output_tokens) = output;
         let text_artifact = if evaluate_request.retention().should_retain() {
             self.artifacts
                 .record_completed_text_with_prepared(
@@ -385,6 +389,7 @@ impl EvaluateEngine {
         let billable_units = usage
             .billable_units()
             .map_err(|err| ExecutorError::Execution(format!("evaluate billing failed: {err}")))?;
+        let cached_stop_reason = stop_reason;
         let (stop_reason, matched_stop_token_id) = evaluate_stop_reason(stop_reason);
         let terminal = EvaluateTerminal {
             final_position: output_units,
@@ -403,6 +408,16 @@ impl EvaluateEngine {
         .map_err(|err| ExecutorError::Execution(format!("evaluate transcript failed: {err}")))?
         .finish(terminal)
         .map_err(|err| ExecutorError::Execution(format!("evaluate transcript failed: {err}")))?;
+        crate::inference_cache::record(
+            cache_recording,
+            evaluate_request,
+            invocation,
+            &output_tokens,
+            cached_stop_reason,
+            text_artifact,
+            &output_events,
+        )
+        .await?;
         let terminal_output_event = output_events.pop().ok_or_else(|| {
             ExecutorError::Execution("evaluate transcript finished without a terminal event".into())
         })?;
@@ -679,6 +694,11 @@ impl EvaluateEngine {
         let stat_prompt = invocation.input_ids.len() as u64;
         let (sender, receiver) = mpsc::channel(PER_EXECUTION_CHANNEL_CAPACITY);
         let execute_job = ExecuteJob {
+            cache_recording: self
+                .output_cache
+                .recording()
+                .map_err(|error| ExecutorError::ArtifactStore(error.to_string()))?,
+            output_cache: self.output_cache.clone(),
             execution_id: execution_id.clone(),
             request_commitment,
             evaluate_request,
@@ -852,6 +872,7 @@ impl EvaluateEngine {
 
     pub(crate) async fn on_completion(&mut self, completion: WorkerCompletion) {
         let WorkerCompletion {
+            cache_recording,
             execution_id,
             request_commitment,
             evaluate_request,
@@ -895,10 +916,10 @@ impl EvaluateEngine {
                 .completed_evaluate_termination(
                     &evaluate_request,
                     &invocation,
-                    stop_reason,
-                    output_tokens,
+                    (stop_reason, output_tokens),
                     output_events,
                     prepared_artifacts.as_ref(),
+                    cache_recording.as_ref(),
                 )
                 .await
             {
@@ -1233,6 +1254,7 @@ pub(crate) mod environment_admission_tests {
     fn engine(store: ContentStore, gpu_config: GpuConfig) -> EvaluateEngine {
         let (completion_tx, _completion_rx) = mpsc::channel(1);
         EvaluateEngine::new(EvaluateEngineConfig {
+            output_cache: Default::default(),
             artifacts: EvaluateArtifactStore::memory(),
             content_store: store,
             gpu_config,
@@ -1301,6 +1323,8 @@ pub(crate) mod environment_admission_tests {
         } = evaluate_job(engine, fixture, index);
         let (sender, _receiver) = mpsc::channel(1);
         ExecuteJob {
+            cache_recording: None,
+            output_cache: Default::default(),
             execution_id: execution_id.to_string(),
             request_commitment: request_commitment(index.into()),
             evaluate_request,

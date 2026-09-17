@@ -1,7 +1,7 @@
 use crate::commands::CliResult;
 use futures::StreamExt;
-use hellas_client::iroh::fetch_execution_stream;
-use hellas_client::{ExecutionRoute, ExecutionRuntime, FetchExecutionEvent, FetchOutcome};
+use hellas_client::cache::{CacheOptions, CachePolicy, OutputCache, fetch_output_stream};
+use hellas_client::{ExecutionRoute, ExecutionRuntime};
 use hellas_rpc::fetch::{MAX_FETCH_REQUEST_BODY_BYTES, build_input_events_with_retention};
 use hellas_rpc::pb::fetch::FetchRequest;
 use hellas_rpc::stream::input_event_to_pb;
@@ -19,6 +19,7 @@ pub(crate) fn load_payload_file(path: &Path) -> CliResult<Vec<u8>> {
 }
 
 pub struct ExecuteOptions {
+    pub output_cache: CacheOptions,
     pub node_id: Option<EndpointId>,
     pub node_addrs: Vec<SocketAddr>,
     pub service: String,
@@ -42,19 +43,26 @@ pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()
 
     let caller_key = std::sync::Arc::new(caller_key);
 
-    let provider_trust = crate::identity::provider_trust(
-        options.expected_provider_genesis,
-        options.assurance,
-        options.apple_app_attest_app_id,
-        options.apple_app_attest_cdhashes,
-    )?;
-    let route = ExecutionRoute::remote(
-        options.node_id,
-        options.node_addrs.clone(),
-        options.retries,
-        provider_trust,
-    );
-    let runtime = ExecutionRuntime::<()>::remote(secret_key).await?;
+    let replay_only = options.output_cache.policy == CachePolicy::ReplayOnly;
+    let cache = OutputCache::open(&options.output_cache)?;
+    let (runtime, route) = if replay_only {
+        (ExecutionRuntime::<()>::default(), None)
+    } else {
+        let provider_trust = crate::identity::provider_trust(
+            options.expected_provider_genesis,
+            options.assurance,
+            options.apple_app_attest_app_id,
+            options.apple_app_attest_cdhashes,
+        )?;
+        let route = ExecutionRoute::remote(
+            options.node_id,
+            options.node_addrs.clone(),
+            options.retries,
+            provider_trust,
+        );
+        let runtime = ExecutionRuntime::<()>::remote(secret_key).await?;
+        (runtime, Some(route))
+    };
 
     let request = FetchRequest {
         input: signed_input_events(
@@ -67,30 +75,23 @@ pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()
             Retention::from_retain(options.retain),
         )?,
     };
-    let stream = fetch_execution_stream(runtime, request, route, caller_key);
-    tokio::pin!(stream);
+    let mut stream = fetch_output_stream(runtime, request, route, caller_key, cache)
+        .await?
+        .events;
 
     let mut completed = false;
     while let Some(event) = stream.next().await {
-        match event? {
-            FetchExecutionEvent::Chunk {
-                position, event, ..
-            } => {
-                trace!(position, "fetch output event");
-                serde_json::to_writer(&mut io::stdout(), &event)?;
-                io::stdout().write_all(b"\n")?;
-                io::stdout().flush()?;
-            }
-            FetchExecutionEvent::Done(FetchOutcome::Completed { terminal, .. }) => {
-                serde_json::to_writer(&mut io::stdout(), &terminal.to_output_event())?;
-                io::stdout().write_all(b"\n")?;
-                io::stdout().flush()?;
-                completed = true;
-                break;
-            }
-            FetchExecutionEvent::Done(FetchOutcome::Failed { position, error }) => {
-                anyhow::bail!("fetch execution failed at position {position}: {error}");
-            }
+        let event = event?;
+        trace!("fetch output event");
+        if let hellas_rpc::output::OutputEvent::Error { message, .. } = &event {
+            anyhow::bail!("fetch execution failed: {message}");
+        }
+        completed |= matches!(event, hellas_rpc::output::OutputEvent::Finished { .. });
+        serde_json::to_writer(&mut io::stdout(), &event)?;
+        io::stdout().write_all(b"\n")?;
+        io::stdout().flush()?;
+        if completed {
+            break;
         }
     }
     if !completed {

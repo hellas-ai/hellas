@@ -11,7 +11,7 @@
 //! not live under `$HOME` and for tests, which must never read or write
 //! the developer's own.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Where this node keeps store state, if it can be determined.
 ///
@@ -29,7 +29,12 @@ pub fn dir() -> Option<PathBuf> {
 /// Where the fastresume record lives by default.
 #[must_use]
 pub fn records_path() -> Option<PathBuf> {
-    dir().map(|dir| dir.join(RECORDS_FILE))
+    dir().map(|dir| records_path_at(&dir))
+}
+
+#[must_use]
+pub fn records_path_at(root: &Path) -> PathBuf {
+    root.join(RECORDS_FILE)
 }
 
 const RECORDS_FILE: &str = "fastresume.bin";

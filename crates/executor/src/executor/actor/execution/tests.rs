@@ -324,6 +324,7 @@ async fn spawn_fetch_executor(
         fetch_queue_capacity,
         hellas_rpc::DEFAULT_FETCH_REPLAY_MAX_IN_FLIGHT,
         FetchTranscriptStoreBackend::memory(),
+        Default::default(),
     )
     .await
 }
@@ -334,10 +335,12 @@ async fn spawn_fetch_executor_with_bounds(
     fetch_queue_capacity: usize,
     fetch_replay_max_in_flight: usize,
     fetch_store: FetchTranscriptStoreBackend,
+    output_cache: hellas_rpc::cache::CacheOptions,
 ) -> crate::ExecutorHandle {
     let producer_key = key();
     let caller_key = producer_key.public_key();
     Executor::spawn_configured(ExecutorSpawnConfig {
+        output_cache,
         execute_policy: ExecutePolicy::Any,
         queue_capacity: 1,
         metrics: Arc::new(ExecutorMetrics::default()),
@@ -397,6 +400,7 @@ async fn spawn_quota_fetch_executor_with_store(
         window: Duration::from_secs(60),
     });
     Executor::spawn_configured(ExecutorSpawnConfig {
+        output_cache: Default::default(),
         execute_policy: ExecutePolicy::Any,
         queue_capacity: 1,
         metrics: Arc::new(ExecutorMetrics::default()),
@@ -505,6 +509,171 @@ async fn fetch_execution_streams_mock_provider_and_replays_completed_transcript(
     );
     assert_eq!(replayed.terminal_output_event, first.terminal_output_event);
     assert_eq!(provider.calls("echo", "run", input), 1);
+}
+
+#[tokio::test]
+async fn inference_cache_bypasses_unrelated_fetch_only_in_record_mode() {
+    use hellas_rpc::cache::{CacheOptions, CachePolicy, CacheStore, MemoryCacheStore};
+    for policy in [CachePolicy::Record, CachePolicy::ReplayOnly] {
+        let signing_key = key();
+        let body = br#"{"hello":"uncacheable"}"#;
+        let provider = MockFetchProvider::new(test_environment());
+        provider.insert("echo", "run", body, [b"terminal:done".to_vec()]);
+        let store = Arc::new(MemoryCacheStore::default());
+        let handle = spawn_fetch_executor_with_bounds(
+            Arc::new(provider.clone()),
+            1,
+            1,
+            1,
+            FetchTranscriptStoreBackend::memory(),
+            CacheOptions {
+                policy,
+                store: Some(store.clone()),
+            },
+        )
+        .await;
+        let ticket = handle
+            .create_fetch_ticket(fetch_request(&signing_key, "echo", "run", body))
+            .await
+            .unwrap()
+            .response;
+        if policy == CachePolicy::Record {
+            run_one(&handle, ticket, &signing_key).await;
+            assert_eq!(provider.calls("echo", "run", body), 1);
+        } else {
+            let error = handle
+                .run_ticket_handle(run_ticket_request(ticket, &signing_key))
+                .await
+                .unwrap_err();
+            assert!(matches!(error, ExecutorError::PolicyDenied(_)));
+            assert_eq!(provider.calls("echo", "run", body), 0);
+        }
+        assert!(store.list().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn inference_cache_reuses_fetch_across_callers_with_fresh_signatures() {
+    use hellas_rpc::cache::{CacheOptions, CachePolicy, CacheStore, MemoryCacheStore};
+    use hellas_rpc::output::{OutputEvent, TextChannel};
+
+    struct InferenceAdaptor;
+    impl FetchAdaptorFactory for InferenceAdaptor {
+        fn execution_environment(&self) -> hellas_rpc::ContentId {
+            hellas_rpc::FetchEnvironment::OpenAiResponses.manifest_id()
+        }
+
+        fn create(
+            &self,
+            request: &crate::FetchCall,
+        ) -> Result<FetchAdaptorSession, FetchAdaptorError> {
+            TestFetchAdaptorFactory.create(request)
+        }
+    }
+
+    let environment = hellas_rpc::FetchEnvironment::OpenAiResponses.manifest_id();
+    let body = br#"{"model":"fixture","input":"hello"}"#;
+    let provider = MockFetchProvider::new(environment);
+    provider.insert(
+        "openai",
+        "responses",
+        body,
+        [
+            hellas_rpc::fetch::encode_fetch_event_payload(&OutputEvent::TextDelta {
+                index: 0,
+                delta: "cached".into(),
+                channel: TextChannel::Output,
+            })
+            .unwrap(),
+            b"terminal:done".to_vec(),
+        ],
+    );
+    let callers = [
+        key(),
+        ProducerSigningKey::from_secret_bytes([3; 32]).unwrap(),
+    ];
+    let store = Arc::new(MemoryCacheStore::default());
+    let handle = Executor::spawn_configured(ExecutorSpawnConfig {
+        output_cache: CacheOptions {
+            policy: CachePolicy::Record,
+            store: Some(store.clone()),
+        },
+        execute_policy: ExecutePolicy::Any,
+        queue_capacity: 1,
+        metrics: Arc::new(ExecutorMetrics::default()),
+        producer_key: Arc::new(key()),
+        provider_genesis: Arc::new(test_genesis()),
+        assurance: test_assurance(),
+        fetch_access_policy: FetchAccessPolicy::trusted_callers(
+            callers.iter().map(ProducerSigningKey::public_key),
+        ),
+        fetch_routes: test_routes(
+            "openai",
+            "responses",
+            Arc::new(provider.clone()),
+            Arc::new(InferenceAdaptor),
+        ),
+        fetch_max_in_flight: 2,
+        fetch_queue_capacity: 2,
+        fetch_replay_max_in_flight: 2,
+        fetch_store: FetchTranscriptStoreBackend::memory(),
+        #[cfg(feature = "evaluate")]
+        artifact_store: ArtifactStoreConfig::memory(),
+        #[cfg(feature = "evaluate")]
+        content_store: ContentStore::new(),
+        #[cfg(feature = "evaluate")]
+        gpu_config: GpuConfig::default(),
+    })
+    .await
+    .unwrap();
+
+    let mut runs = Vec::new();
+    for caller in &callers {
+        let input = build_input_events(
+            "openai",
+            "responses",
+            body,
+            environment,
+            test_assurance(),
+            caller,
+        )
+        .unwrap();
+        let commitment = hellas_rpc::fetch::verify_input_events(&input)
+            .unwrap()
+            .input_commitment;
+        let ticket = handle
+            .create_fetch_ticket(FetchRequest {
+                input: input.iter().map(input_event_to_pb).collect(),
+            })
+            .await
+            .unwrap()
+            .response;
+        let handle = handle.clone();
+        runs.push(async move {
+            let (chunks, finished) = run_one(&handle, ticket, caller).await;
+            let mut output = chunks
+                .into_iter()
+                .map(|chunk| {
+                    hellas_rpc::stream::output_event_from_pb(chunk.output_event.unwrap()).unwrap()
+                })
+                .collect::<Vec<_>>();
+            output.push(
+                hellas_rpc::stream::output_event_from_pb(finished.terminal_output_event.unwrap())
+                    .unwrap(),
+            );
+            hellas_rpc::fetch::verify_output_events(commitment, test_assurance(), &output).unwrap();
+            (commitment, output)
+        });
+    }
+    let results = futures_util::future::join_all(runs).await;
+    assert_ne!(results[0].0, results[1].0);
+    assert_ne!(results[0].1, results[1].1);
+    assert!(
+        hellas_rpc::fetch::verify_output_events(results[1].0, test_assurance(), &results[0].1)
+            .is_err()
+    );
+    assert_eq!(provider.calls("openai", "responses", body), 1);
+    assert_eq!(store.list().unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -1314,6 +1483,7 @@ async fn run_ticket_with_recovered_running_marker_reports_indeterminate() {
         .unwrap();
 
     let handle = Executor::spawn_configured(ExecutorSpawnConfig {
+        output_cache: Default::default(),
         execute_policy: ExecutePolicy::Any,
         queue_capacity: 1,
         metrics: Arc::new(ExecutorMetrics::default()),
@@ -1384,6 +1554,7 @@ async fn fetch_policy_denial_does_not_start_provider() {
         },
     };
     let handle = Executor::spawn_configured(ExecutorSpawnConfig {
+        output_cache: Default::default(),
         execute_policy: ExecutePolicy::Any,
         queue_capacity: 1,
         metrics: Arc::new(ExecutorMetrics::default()),
@@ -1432,6 +1603,7 @@ async fn retained_capacity_refusal_never_starts_provider() {
         1,
         1,
         FetchTranscriptStoreBackend::memory_with_capacity(0),
+        Default::default(),
     )
     .await;
     let request = fetch_request(&signing_key, "echo", "run", br#"{"n":1}"#);
@@ -1461,6 +1633,7 @@ async fn queued_retained_capacity_refusal_fails_and_discards_ticket() {
         1,
         1,
         FetchTranscriptStoreBackend::memory_with_capacity(1),
+        Default::default(),
     )
     .await;
     let first = fetch_request(&signing_key, "echo", "run", br#"{"n":1}"#);
@@ -1527,6 +1700,7 @@ async fn replay_slot_lives_until_terminal_is_drained_or_receiver_is_dropped() {
         1,
         1,
         FetchTranscriptStoreBackend::Memory(transcript_store.clone()),
+        Default::default(),
     )
     .await;
     let ticket = handle

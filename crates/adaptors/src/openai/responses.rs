@@ -286,6 +286,7 @@ impl WireAdaptor for OpenAiResponsesAdaptor {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ResponsesIngressState {
     item_to_tool_index: HashMap<String, usize>,
+    output_to_tool_index: HashMap<usize, usize>,
     next_tool_index: usize,
     saw_text_delta: bool,
     saw_reasoning_delta: bool,
@@ -965,6 +966,16 @@ fn decode_output_item_added(
     if let Some(id) = id.as_ref() {
         state.item_to_tool_index.insert(id.clone(), index);
     }
+    // Argument deltas name the output item, not its distinct call_id. Output
+    // indexes also include non-tool items, so neither is our tool ordinal.
+    if let Some(id) = item.get("id").and_then(JsonValue::as_str) {
+        state.item_to_tool_index.insert(id.to_string(), index);
+    }
+    if let Some(output_index) = data.get("output_index").and_then(JsonValue::as_u64)
+        && let Ok(output_index) = usize::try_from(output_index)
+    {
+        state.output_to_tool_index.insert(output_index, index);
+    }
 
     let mut events = vec![OutputEvent::ToolCallStart(ToolCallStart {
         index,
@@ -1013,6 +1024,7 @@ fn tool_index_for_event(state: &ResponsesIngressState, data: &JsonValue) -> Opti
             data.get("output_index")
                 .and_then(JsonValue::as_u64)
                 .and_then(|index| usize::try_from(index).ok())
+                .and_then(|index| state.output_to_tool_index.get(&index).copied())
         })
 }
 
@@ -1988,6 +2000,59 @@ mod tests {
                     }),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn decode_stream_tool_indexes_exclude_other_output_items() {
+        let parsed = sample_request();
+        for reference in [json!({"item_id": "fc_1"}), json!({"output_index": 3})] {
+            let mut state = adaptor().initial_ingress_state(&parsed);
+            let item = json!({
+                "type": "function_call", "id": "fc_1", "call_id": "call_1",
+                "name": "write", "arguments": ""
+            });
+            let start =
+                decode_output_item_added(&mut state, &json!({"output_index": 3, "item": item}))
+                    .unwrap();
+            assert!(matches!(&start[0], OutputEvent::ToolCallStart(call)
+                if call.index == 0 && call.id.as_deref() == Some("call_1")));
+            let mut delta = reference;
+            delta["type"] = json!("response.function_call_arguments.delta");
+            delta["delta"] = json!("{}");
+            assert_eq!(
+                adaptor()
+                    .decode_stream_event(&parsed, &mut state, WireStreamEvent::json(None, delta))
+                    .unwrap(),
+                vec![OutputEvent::ToolCallArgumentsDelta(
+                    ToolCallArgumentsDelta {
+                        index: 0,
+                        delta: "{}".into(),
+                    }
+                )]
+            );
+            assert_eq!(tool_index_for_item(&state, &item), Some(0));
+        }
+    }
+
+    #[test]
+    fn decode_stream_rejects_unknown_tool_output_index() {
+        let parsed = sample_request();
+        let mut state = adaptor().initial_ingress_state(&parsed);
+        assert!(
+            adaptor()
+                .decode_stream_event(
+                    &parsed,
+                    &mut state,
+                    WireStreamEvent::json(
+                        None,
+                        json!({
+                            "type": "response.function_call_arguments.delta",
+                            "output_index": 0, "delta": "{}"
+                        })
+                    ),
+                )
+                .is_err()
         );
     }
 

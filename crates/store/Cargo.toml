@@ -7,10 +7,17 @@ license.workspace = true
 repository.workspace = true
 documentation.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dependencies]
+hellas-rpc.workspace = true
 hellas-xet = { workspace = true, features = ["chunking"] }
 lz4_flex = { version = "0.14", default-features = false, features = ["frame"] }
+serde.workspace = true
+serde_ipld_dagcbor.workspace = true
 serde_json = { workspace = true }
+tempfile.workspace = true
 thiserror = { workspace = true }
 # Bundled Mozilla roots, matching the workspace `reqwest`. Deliberately
 # NOT `platform-verifier`: two HTTP clients in one binary trusting two
@@ -22,6 +29,3 @@ ureq = { version = "3", default-features = false, features = [
     "rustls",
     "rustls-webpki-roots",
 ] }
-
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
