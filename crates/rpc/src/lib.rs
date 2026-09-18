@@ -39,6 +39,7 @@ impl core::fmt::Display for SubmitTxOutcome {
     }
 }
 
+pub mod cache;
 pub mod call;
 #[cfg(feature = "evaluate")]
 pub mod evaluate;
@@ -111,7 +112,7 @@ pub use crate::pb::services;
 pub fn peer_service_aliases() -> Vec<peers::ServiceAlias> {
     crate::services::KNOWN_SERVICES
         .iter()
-        .filter(|entry| entry.name != "hellas.host.v1.HostControl")
+        .filter(|entry| !entry.name.starts_with("hellas.host."))
         .flat_map(|entry| {
             [
                 peers::ServiceAlias::new(entry.alpn, entry.name),
@@ -121,15 +122,14 @@ pub fn peer_service_aliases() -> Vec<peers::ServiceAlias> {
         .collect()
 }
 
-/// Local-control services must never become reachable through peer discovery,
-/// even in a binary that compiles both network and desktop-host features.
+/// Administrative services are not automatically advertised as peer services.
+/// Remote access requires an explicit mount and administrative grant.
 #[cfg(all(test, feature = "host-control"))]
 mod local_service_tests {
     #[test]
     fn host_control_is_not_a_peer_alias() {
         assert!(super::peer_service_aliases().iter().all(|alias| {
-            alias.query != "hellas.host.v1.HostControl"
-                && alias.service != "hellas.host.v1.HostControl"
+            !alias.query.starts_with("hellas.host.") && !alias.service.starts_with("hellas.host.")
         }));
     }
 }

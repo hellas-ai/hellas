@@ -218,6 +218,8 @@ pub(crate) enum EnqueueError {
 }
 
 pub(crate) struct ExecuteJob {
+    pub output_cache: hellas_rpc::cache::CacheOptions,
+    pub cache_recording: Option<hellas_rpc::cache::CacheRecording>,
     pub execution_id: String,
     pub request_commitment: [u8; 32],
     pub evaluate_request: EvaluateRequest,
@@ -230,6 +232,7 @@ pub(crate) struct ExecuteJob {
 }
 
 pub(crate) struct WorkerCompletion {
+    pub cache_recording: Option<hellas_rpc::cache::CacheRecording>,
     pub execution_id: String,
     pub request_commitment: [u8; 32],
     pub evaluate_request: EvaluateRequest,
@@ -321,6 +324,7 @@ fn worker_loop(
         let invocation = job.invocation.clone();
         let prepared_artifacts = job.prepared_artifacts.clone();
         let producer_key = job.producer_key.clone();
+        let cache_recording = job.cache_recording.clone();
 
         let mut position = 0;
         let mut output_builder = EvaluateOutputTranscriptBuilder::new(
@@ -364,6 +368,7 @@ fn worker_loop(
 
         let _ = completion_tx.blocking_send(ExecutorCompletion::EvaluateFinished(Box::new(
             WorkerCompletion {
+                cache_recording,
                 execution_id,
                 request_commitment,
                 evaluate_request,
@@ -381,6 +386,9 @@ fn run_job(
     mut on_progress: impl FnMut(u32) -> Result<(), crate::ExecutorError>,
     runtime: &mut ModelRuntime,
 ) -> Result<(StopReason, Vec<u32>), crate::ExecutorError> {
+    if let Some(output) = crate::inference_cache::replay(&job, &mut on_progress)? {
+        return Ok(output);
+    }
     let ExecuteJob {
         execution_id,
         source,

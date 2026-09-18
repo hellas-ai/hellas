@@ -53,14 +53,15 @@ pub enum StoreCommand {
     },
 }
 
-pub async fn run(command: StoreCommand) -> CliResult {
+pub async fn run(command: StoreCommand, root: Option<PathBuf>) -> CliResult {
+    let default_records = root.as_deref().map(hellas_store::state::records_path_at);
     match command {
         StoreCommand::Adopt {
             cache,
             records,
             recheck,
-        } => adopt(cache, records, recheck),
-        StoreCommand::Status { records } => status(records),
+        } => adopt(cache, records.or(default_records), recheck),
+        StoreCommand::Status { records } => status(records.or(default_records)),
         StoreCommand::Fetch {
             id,
             repo,

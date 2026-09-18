@@ -19,28 +19,28 @@
 //!                                └─ shadow (verify):  same shape, run after primary
 //! ```
 //!
-//! Remote bootstrap, discovery, quote retries, ticket signing, and signed
-//! chunk verification live in `hellas-client`; this module retains local
-//! executor dispatch plus manifest-bound execution and gateway response shaping.
+//! Remote transport lives in `crate::iroh`. This module binds token-native
+//! execution to local or remote runtimes, with optional replay and independent
+//! verification. Tokenizers and HTTP response shaping belong to callers.
 
+use crate::ClientError as ExecutionError;
+use crate::ExecutionRuntime as ClientExecutionRuntime;
+use crate::signed_run_ticket_request;
+use crate::{ClientResult as ExecutionResult, ExecutionRoute};
+use crate::{
+    EvaluateChunkVerifier, EvaluateExecutionEvent as ClientEvaluateEvent,
+    EvaluateOutcome as ClientEvaluateOutcome, verify_evaluate_work_event,
+};
 use async_stream::try_stream;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use futures::stream::Stream;
-use hellas_client::ClientError as ExecutionError;
-use hellas_client::ExecutionRuntime as ClientExecutionRuntime;
-use hellas_client::signed_run_ticket_request;
-use hellas_client::{ClientResult as ExecutionResult, ExecutionRoute};
-use hellas_client::{
-    EvaluateChunkVerifier, EvaluateExecutionEvent as ClientEvaluateEvent,
-    EvaluateOutcome as ClientEvaluateOutcome, verify_evaluate_work_event,
-};
-#[cfg(feature = "evaluate")]
+#[cfg(feature = "local")]
 use hellas_executor::ExecutorHandle;
 use hellas_rpc::ContentId;
+#[cfg(test)]
 use hellas_rpc::Digest;
 use hellas_rpc::InputCommitment;
-use hellas_rpc::OutputEventEnvelope;
 use hellas_rpc::ProducerSigningKey;
 use hellas_rpc::PublicKey;
 use hellas_rpc::Retention;
@@ -55,11 +55,11 @@ use hellas_rpc::provenance::ExecutionProvenance;
 use hellas_rpc::services::execute::ExecuteClientImpl;
 use hellas_wire::WireStatus;
 use hellas_wire::iroh::IrohTransport;
-#[cfg(feature = "evaluate")]
+#[cfg(feature = "local")]
 use std::error::Error as StdError;
 use std::sync::Arc;
 use std::time::Duration;
-#[cfg(feature = "evaluate")]
+#[cfg(feature = "local")]
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::instrument;
 
@@ -89,12 +89,12 @@ where
         })
 }
 
-#[cfg(feature = "evaluate")]
+#[cfg(feature = "local")]
 trait ExecutionContext<T> {
     fn exec_context(self, context: impl Into<String>) -> ExecutionResult<T>;
 }
 
-#[cfg(feature = "evaluate")]
+#[cfg(feature = "local")]
 impl<T, E> ExecutionContext<T> for Result<T, E>
 where
     E: StdError + Send + Sync + 'static,
@@ -106,6 +106,8 @@ where
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExecutionStrategy {
+    /// Consult the inference cache without constructing an execution route.
+    Replay,
     Run(ExecutionRoute),
     Verify {
         primary: ExecutionRoute,
@@ -113,51 +115,20 @@ pub enum ExecutionStrategy {
     },
 }
 
-#[cfg(feature = "evaluate")]
+#[cfg(feature = "local")]
 pub type CliRuntime = ClientExecutionRuntime<ExecutorHandle>;
-#[cfg(not(feature = "evaluate"))]
+#[cfg(not(feature = "local"))]
 pub type CliRuntime = ClientExecutionRuntime<()>;
 
 // ---------------------------------------------------------------------------
 // Stream item types
 // ---------------------------------------------------------------------------
 
-/// One observation from a streaming execution. Stream protocol: zero or
-/// more `Chunk` events, terminated by exactly one `Done`.
-#[derive(Debug, Clone)]
-pub enum ExecutionEvent {
-    Chunk {
-        /// Cumulative tokens emitted *after* this chunk.
-        position: u64,
-        /// Little-endian u32 token IDs.
-        tokens: Vec<u8>,
-    },
-    Done(Outcome),
-}
+pub use hellas_rpc::cache::{
+    EvaluateEvent as ExecutionEvent, EvaluateOutcome as Outcome, EvaluateStop as StopReason,
+};
 
-/// Terminal verdict of an execution.
-#[derive(Debug, Clone)]
-pub enum Outcome {
-    Completed {
-        total_tokens: u64,
-        stop_reason: StopReason,
-        text_artifact: Digest,
-        output_events: Vec<OutputEventEnvelope>,
-    },
-    Failed {
-        /// Tokens emitted before the failure (for honest usage reporting).
-        position: u64,
-        error: String,
-    },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StopReason {
-    StopToken(u32),
-    MaxNewTokens,
-}
-
-#[cfg(feature = "evaluate")]
+#[cfg(feature = "local")]
 fn require_local_executor(runtime: &CliRuntime) -> ExecutionResult<ExecutorHandle> {
     runtime.local_state().cloned().ok_or_else(|| {
         ExecutionError::protocol("local execution requested but no local executor is configured")
@@ -193,6 +164,7 @@ pub struct ExecutionRequest {
     expected_environment: hellas_rpc::CausalLmEnvironment,
     strategy: ExecutionStrategy,
     runner_key: Arc<ProducerSigningKey>,
+    cache: Option<Arc<crate::cache::OutputCache>>,
 }
 
 /// Canonical Catena causal-LM bodies checked against an out-of-band manifest
@@ -227,7 +199,7 @@ impl CausalLmExecutionEnvironment {
         program_manifest: Vec<u8>,
         environment: Vec<u8>,
     ) -> ExecutionResult<Self> {
-        let environment = hellas_client::iroh::validate_causal_lm_environment(
+        let environment = crate::iroh::validate_causal_lm_environment(
             expected_manifest_id,
             &program_manifest,
             &environment,
@@ -244,6 +216,28 @@ impl CausalLmExecutionEnvironment {
     pub const fn manifest_id(&self) -> ContentId {
         self.manifest_id
     }
+}
+
+pub(super) fn genesis_text_execution_id(
+    manifest: ContentId,
+    prompt: &[u32],
+    max_tokens: u32,
+    stop_tokens: &[u32],
+) -> hellas_rpc::Digest {
+    use hellas_rpc::protocol::artifacts::{
+        BoundTermId, InputAddressed, OutputAddressed, SourceRef, TextArtifact, TextExecution,
+        TextPolicy, TokenIds,
+    };
+    let identity = TextArtifact::identity(BoundTermId::from_digest(manifest.digest()));
+    let prompt = TokenIds::from_u32s(prompt.iter().copied());
+    let policy = TextPolicy::from_u32_stop_tokens(max_tokens, stop_tokens.iter().copied());
+    TextExecution::new(
+        SourceRef::output(identity.output_id()),
+        prompt.output_id(),
+        policy.output_id(),
+    )
+    .input_id()
+    .digest()
 }
 
 #[cfg(test)]
@@ -334,11 +328,11 @@ impl ExecutionRequest {
             start: Some(EvaluateStart {
                 kind: Some(evaluate_start::Kind::Genesis(EvaluateGenesisStart {})),
             }),
-            runner_public_key: Some(hellas_client::runner_public_key(&runner_key)),
+            runner_public_key: Some(crate::runner_public_key(&runner_key)),
             assurance: options.assurance.to_byte().into(),
             retain: Some(options.retention.should_retain()),
         };
-        hellas_client::iroh::validate_causal_lm_quote_request(
+        crate::iroh::validate_causal_lm_quote_request(
             &quote_req,
             environment.manifest_id,
             &environment.environment,
@@ -350,16 +344,18 @@ impl ExecutionRequest {
             expected_environment: environment.environment,
             strategy,
             runner_key: Arc::new(runner_key),
+            cache: None,
         })
     }
 
     /// True if any leg of this strategy talks to a remote executor.
     pub fn uses_remote_transport(&self) -> bool {
-        #[cfg(feature = "evaluate")]
+        #[cfg(feature = "local")]
         let is_remote = |r: &ExecutionRoute| !matches!(r, ExecutionRoute::Local);
-        #[cfg(not(feature = "evaluate"))]
+        #[cfg(not(feature = "local"))]
         let is_remote = |_r: &ExecutionRoute| true;
         match &self.strategy {
+            ExecutionStrategy::Replay => false,
             ExecutionStrategy::Run(route) => is_remote(route),
             ExecutionStrategy::Verify { primary, shadow } => {
                 is_remote(primary) || is_remote(shadow)
@@ -367,15 +363,69 @@ impl ExecutionRequest {
         }
     }
 
-    /// Run the quote step (talking to the chosen executor) and return the
-    /// `PreparedExecution`. Splitting prepare from `stream` lets callers
-    /// (notably the gateway) read pre-flight provenance off
-    /// `PreparedExecution::provenance()` *before* the response stream
-    /// flushes its headers.
+    /// Attach a shared inference cache. Input identity is independent of the
+    /// runtime, tokenizer, caller key, and provider ticket nonce.
+    pub fn with_cache(mut self, cache: Option<Arc<crate::cache::OutputCache>>) -> Self {
+        self.cache = cache;
+        self
+    }
+
+    /// Check the cache, then quote only on a permitted miss. Preparation
+    /// exposes provenance before the caller starts sending response headers.
     pub async fn prepare(self) -> ExecutionResult<PreparedExecution> {
-        match self.strategy {
-            ExecutionStrategy::Run(route) => Ok(PreparedExecution {
-                primary: PreparedRoute::prepare(
+        use crate::cache::CacheKey;
+        let key = CacheKey::evaluate(genesis_text_execution_id(
+            self.expected_manifest_id,
+            &self.quote_req.prompt_token_ids,
+            self.quote_req
+                .max_new_tokens
+                .expect("explicit decode limit"),
+            &self.quote_req.stop_token_ids,
+        ));
+        if self.cache.is_some() && matches!(self.strategy, ExecutionStrategy::Verify { .. }) {
+            return Err(ExecutionError::protocol(
+                "verification requires live execution; disable inference caching",
+            ));
+        }
+        let guard = if let Some(cache) = &self.cache {
+            if let Some(entry) = cache
+                .read::<ExecutionEvent, ExecutionProvenance>(key.clone())
+                .await?
+            {
+                return Ok(PreparedExecution::replay(entry));
+            }
+            let guard = cache.acquire(&key).await?;
+            if let Some(entry) = cache
+                .read::<ExecutionEvent, ExecutionProvenance>(key.clone())
+                .await?
+            {
+                return Ok(PreparedExecution::replay(entry));
+            }
+            Some(guard)
+        } else {
+            None
+        };
+        let (primary_route, shadow_route) = match self.strategy {
+            ExecutionStrategy::Run(route) => (route, None),
+            ExecutionStrategy::Verify { primary, shadow } => (primary, Some(shadow)),
+            ExecutionStrategy::Replay => {
+                return Err(ExecutionError::protocol(
+                    "replay requires a cached inference result",
+                ));
+            }
+        };
+        let primary = PreparedRoute::prepare(
+            &self.runtime,
+            &self.quote_req,
+            self.expected_manifest_id,
+            &self.expected_environment,
+            &primary_route,
+            self.runner_key.clone(),
+        )
+        .await?;
+        let shadow = if let Some(route) = shadow_route {
+            Some(
+                PreparedRoute::prepare(
                     &self.runtime,
                     &self.quote_req,
                     self.expected_manifest_id,
@@ -384,33 +434,26 @@ impl ExecutionRequest {
                     self.runner_key.clone(),
                 )
                 .await?,
-                shadow: None,
-                runtime: self.runtime,
-            }),
-            ExecutionStrategy::Verify { primary, shadow } => Ok(PreparedExecution {
-                primary: PreparedRoute::prepare(
-                    &self.runtime,
-                    &self.quote_req,
-                    self.expected_manifest_id,
-                    &self.expected_environment,
-                    &primary,
-                    self.runner_key.clone(),
-                )
-                .await?,
-                shadow: Some(
-                    PreparedRoute::prepare(
-                        &self.runtime,
-                        &self.quote_req,
-                        self.expected_manifest_id,
-                        &self.expected_environment,
-                        &shadow,
-                        self.runner_key.clone(),
-                    )
-                    .await?,
-                ),
-                runtime: self.runtime,
-            }),
-        }
+            )
+        } else {
+            None
+        };
+        let provenance = primary.provenance().cloned();
+        let runtime = self.runtime;
+        let inner =
+            reconcile_execution_streams(primary.stream(), shadow.map(PreparedRoute::stream));
+        let events = Box::pin(try_stream! {
+            let _runtime = runtime;
+            let mut inner = inner;
+            while let Some(event) = inner.next().await {
+                yield event?;
+            }
+        });
+        let events = match (self.cache, guard) {
+            (Some(cache), Some(guard)) => cache.record(key, provenance.clone(), events, guard),
+            _ => events,
+        };
+        Ok(PreparedExecution { provenance, events })
     }
 
     /// Drive this request to completion as a stream of events.
@@ -435,39 +478,34 @@ impl ExecutionRequest {
 // ---------------------------------------------------------------------------
 
 pub struct PreparedExecution {
-    primary: PreparedRoute,
-    shadow: Option<PreparedRoute>,
-    // Owns the remote endpoint from quote through the terminal Execute
-    // trailer. A transport alone does not keep its endpoint alive.
-    runtime: CliRuntime,
+    provenance: Option<ExecutionProvenance>,
+    events: BoxStream<'static, ExecutionResult<ExecutionEvent>>,
 }
 
 impl PreparedExecution {
-    /// See [`PreparedRoute::provenance`] — this delegates to the primary
-    /// route. Shadow's provenance is intentionally not exposed (verify is
-    /// internal; the primary is what the user sees).
-    pub fn provenance(&self) -> Option<&ExecutionProvenance> {
-        self.primary.provenance()
+    fn replay(entry: crate::cache::Transcript<ExecutionEvent, ExecutionProvenance>) -> Self {
+        Self {
+            provenance: entry.initial_provenance,
+            events: Box::pin(futures::stream::iter(entry.events.into_iter().map(Ok))),
+        }
     }
 
-    /// Stream a primary live only when no shadow is configured. With a shadow,
-    /// withhold every primary chunk until its terminal artifact matches; a
-    /// mismatch exposes only `Done(Failed)`, never unverified text.
+    pub fn provenance(&self) -> Option<&ExecutionProvenance> {
+        self.provenance.as_ref()
+    }
+
     pub fn stream(self) -> BoxStream<'static, ExecutionResult<ExecutionEvent>> {
-        let Self {
-            primary,
-            shadow,
-            runtime,
-        } = self;
-        let inner =
-            reconcile_execution_streams(primary.stream(), shadow.map(PreparedRoute::stream));
-        Box::pin(try_stream! {
-            let _runtime = runtime;
-            let mut inner = inner;
-            while let Some(event) = inner.next().await {
-                yield event?;
-            }
-        })
+        self.events
+    }
+}
+
+impl crate::cache::CacheEvent for ExecutionEvent {
+    fn terminal(&self) -> Option<bool> {
+        match self {
+            Self::Chunk { .. } => None,
+            Self::Done(Outcome::Completed { .. }) => Some(true),
+            Self::Done(Outcome::Failed { .. }) => Some(false),
+        }
     }
 }
 
@@ -611,7 +649,7 @@ async fn drain_to_outcome(
 
 #[allow(clippy::large_enum_variant)]
 enum PreparedRoute {
-    #[cfg(feature = "evaluate")]
+    #[cfg(feature = "local")]
     Local {
         handle: ExecutorHandle,
         ticket: Ticket,
@@ -635,7 +673,7 @@ enum PreparedRoute {
 impl PreparedRoute {
     fn provenance(&self) -> Option<&ExecutionProvenance> {
         match self {
-            #[cfg(feature = "evaluate")]
+            #[cfg(feature = "local")]
             PreparedRoute::Local { provenance, .. } => Some(provenance),
             PreparedRoute::RemoteDirect { provenance, .. } => Some(provenance),
         }
@@ -652,11 +690,11 @@ impl PreparedRoute {
     ) -> ExecutionResult<Self> {
         match route {
             ExecutionRoute::Local => {
-                #[cfg(not(feature = "evaluate"))]
+                #[cfg(not(feature = "local"))]
                 return Err(ExecutionError::protocol(
                     "local execution requested but no local executor is configured",
                 ));
-                #[cfg(feature = "evaluate")]
+                #[cfg(feature = "local")]
                 {
                     let handle = require_local_executor(runtime)?;
                     let outcome = handle
@@ -664,14 +702,14 @@ impl PreparedRoute {
                         .await
                         .exec_context("local quote_tokens failed")?;
                     let provenance = outcome.provenance.clone();
-                    let validated = hellas_client::iroh::validate_evaluate_quote_response(
+                    let validated = crate::iroh::validate_evaluate_quote_response(
                         quote_req,
                         expected_manifest_id,
                         expected_environment,
                         outcome.response,
                         None,
                     )?;
-                    let provenance = hellas_client::iroh::validate_evaluate_quote_provenance(
+                    let provenance = crate::iroh::validate_evaluate_quote_provenance(
                         &validated.ticket,
                         provenance,
                     )?;
@@ -695,7 +733,7 @@ impl PreparedRoute {
             }
             ExecutionRoute::RemoteDirect(target) => {
                 let (transport, ticket, provenance, producer_key, text_execution) =
-                    hellas_client::iroh::quote_tokens(
+                    crate::iroh::quote_tokens(
                         runtime,
                         target,
                         quote_req,
@@ -725,7 +763,7 @@ impl PreparedRoute {
                 provider_trust,
             } => {
                 let (transport, ticket, provenance, producer_key, text_execution) =
-                    hellas_client::iroh::discover_and_quote(
+                    crate::iroh::discover_and_quote(
                         runtime.remote_registry()?,
                         quote_req,
                         expected_manifest_id,
@@ -756,7 +794,7 @@ impl PreparedRoute {
 
     fn stream(self) -> BoxStream<'static, ExecutionResult<ExecutionEvent>> {
         match self {
-            #[cfg(feature = "evaluate")]
+            #[cfg(feature = "local")]
             PreparedRoute::Local {
                 handle,
                 ticket,
@@ -799,7 +837,7 @@ impl PreparedRoute {
 // Local execute streams — talk directly to `ExecutorHandle`
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "evaluate")]
+#[cfg(feature = "local")]
 fn local_execute_stream(
     handle: ExecutorHandle,
     ticket: Ticket,
@@ -818,7 +856,7 @@ fn local_execute_stream(
             .exec_context("failed to start local execution stream")?;
         let _provenance = outcome.provenance; // already surfaced from PreparedRoute::Local
         let input_commitment =
-            hellas_client::evaluate_input_from_request_commitment(&request_commitment)?;
+            crate::evaluate_input_from_request_commitment(&request_commitment)?;
         let verifier = EvaluateChunkVerifier::new(
             input_commitment,
             assurance,
@@ -847,7 +885,7 @@ fn local_execute_stream(
     }
 }
 
-#[cfg(feature = "evaluate")]
+#[cfg(feature = "local")]
 fn verified_local_execute_stream(
     mut events: ReceiverStream<Result<WorkEvent, WireStatus>>,
     input_commitment: InputCommitment,
@@ -901,7 +939,7 @@ fn remote_execute_stream(
             .map_err(|status| ExecutionError::wire("failed to start remote execute stream", status))?;
         let mut terminal = None;
         let input_commitment =
-            hellas_client::evaluate_input_from_request_commitment(&request_commitment)?;
+            crate::evaluate_input_from_request_commitment(&request_commitment)?;
         let mut verifier = EvaluateChunkVerifier::new(
             input_commitment,
             assurance,
@@ -1010,6 +1048,93 @@ fn stop_reason_from_evaluate(
 mod request_tests {
     use super::*;
     use futures::stream;
+
+    #[test]
+    fn cache_identity_covers_execution_inputs_and_normalizes_stops() {
+        let manifest = test_causal_lm_environment(1).manifest_id();
+        let identity = genesis_text_execution_id(manifest, &[1], 2, &[3, 4]);
+        assert_eq!(
+            identity,
+            genesis_text_execution_id(manifest, &[1], 2, &[4, 3, 3])
+        );
+        assert_ne!(
+            identity,
+            genesis_text_execution_id(
+                test_causal_lm_environment(2).manifest_id(),
+                &[1],
+                2,
+                &[3, 4]
+            )
+        );
+        assert_ne!(
+            identity,
+            genesis_text_execution_id(manifest, &[2], 2, &[3, 4])
+        );
+        assert_ne!(
+            identity,
+            genesis_text_execution_id(manifest, &[1], 3, &[3, 4])
+        );
+        assert_ne!(identity, genesis_text_execution_id(manifest, &[1], 2, &[3]));
+    }
+
+    #[tokio::test]
+    async fn replay_prepares_without_a_provider_or_local_executor() {
+        use crate::cache::{
+            CacheKey, CachePolicy, CacheStore, MemoryCacheStore, OutputCache, Transcript,
+        };
+        let environment = test_causal_lm_environment(1);
+        let key = CacheKey::evaluate(genesis_text_execution_id(
+            environment.manifest_id(),
+            &[1],
+            1,
+            &[],
+        ));
+        let store = Arc::new(MemoryCacheStore::default());
+        let transcript = Transcript {
+            version: 1,
+            key: key.clone(),
+            initial_provenance: Some(ExecutionProvenance {
+                commitment_id: [8; 32],
+            }),
+            events: vec![
+                ExecutionEvent::Chunk {
+                    position: 1,
+                    tokens: hellas_rpc::encode_token_ids(&[2]),
+                },
+                ExecutionEvent::Done(completed(1)),
+            ],
+        };
+        store
+            .insert(&key, &serde_ipld_dagcbor::to_vec(&transcript).unwrap(), 0)
+            .unwrap();
+        let cache = Arc::new(OutputCache::new(CachePolicy::ReplayOnly, store));
+        let request = |prompt| {
+            ExecutionRequest::new(
+                CliRuntime::default(),
+                environment.clone(),
+                vec![prompt],
+                Vec::new(),
+                ExecutionRequestOptions {
+                    max_new_tokens: 1,
+                    assurance: hellas_rpc::Assurance::ProducerSigned,
+                    retention: Retention::Ephemeral,
+                },
+                ExecutionStrategy::Replay,
+                ProducerSigningKey::from_secret_bytes([2; 32]).unwrap(),
+            )
+            .unwrap()
+            .with_cache(Some(cache.clone()))
+        };
+        let prepared = request(1).prepare().await.unwrap();
+        assert_eq!(prepared.provenance().unwrap().commitment_id, [8; 32]);
+        assert_eq!(prepared.stream().collect::<Vec<_>>().await.len(), 2);
+        let error = request(2)
+            .prepare()
+            .await
+            .err()
+            .expect("changed prompt misses");
+        assert!(error.to_string().contains("replay miss"));
+    }
 
     fn completed(artifact: u8) -> Outcome {
         Outcome::Completed {
@@ -1200,8 +1325,8 @@ mod request_tests {
 #[cfg(test)]
 mod remote_lifetime_tests {
     use super::*;
+    use crate::{ProviderTrustAnchor, RemoteNodeTarget};
     use futures::stream;
-    use hellas_client::{ProviderTrustAnchor, RemoteNodeTarget};
     use hellas_rpc::call::WithTrailer;
     use hellas_rpc::open::{OpenDispatcher, OpenHandler};
     use hellas_rpc::pb::courtesy::{
@@ -1558,7 +1683,7 @@ mod remote_lifetime_tests {
     }
 }
 
-#[cfg(all(test, feature = "evaluate"))]
+#[cfg(all(test, feature = "local"))]
 mod tests {
     use super::*;
     use futures::FutureExt;

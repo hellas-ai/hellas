@@ -35,9 +35,9 @@ node = [
 ]
 # Token-native remote execution and its local text-presentation boundary.
 # This deliberately does not pull Catena into a client that only dials a node.
-llm = ["dep:hellas-gateway", "dep:hellas-presentation"]
+llm = ["hellas-client/evaluate", "dep:hellas-presentation"]
 # HTTP gateway front-end (OpenAI/Anthropic/plain APIs).
-gateway = ["llm"]
+gateway = ["llm", "dep:hellas-gateway"]
 evaluate = [
     "node",
     "gateway",
@@ -93,9 +93,11 @@ hellas-providers.workspace = true
 hellas-rpc = { workspace = true, default-features = false, features = [
     "all-protocols",
     "work",
+    "host-control",
 ] }
 hellas-store = { workspace = true }
 hellas-wire = { workspace = true, features = [
+    "unix",
     "iroh",
     "discovery-dht",
     "discovery-mdns",
@@ -116,6 +118,7 @@ qrcode = { version = "0.14", default-features = false, optional = true }
 rand.workspace = true
 reqwest.workspace = true
 serde.workspace = true
+serde_ipld_dagcbor.workspace = true
 serde_json.workspace = true
 tempfile = { workspace = true }
 thiserror.workspace = true

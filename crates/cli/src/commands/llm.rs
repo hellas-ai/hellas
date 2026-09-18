@@ -3,14 +3,14 @@ use crate::commands::CliResult;
 use anyhow::Context;
 use futures::StreamExt;
 use hellas_client::ExecutionRoute;
+use hellas_client::execution::{
+    CausalLmExecutionEnvironment, CliRuntime, ExecutionEvent, ExecutionRequest,
+    ExecutionRequestOptions, ExecutionStrategy, Outcome,
+};
 #[cfg(feature = "evaluate")]
 use hellas_executor::{
     ArtifactStoreConfig, CausalLmEnvironmentSource, Executor, ExecutorMetrics, ExecutorSpawnConfig,
     FetchAccessPolicy, FetchRouteRegistry, FetchTranscriptStoreBackend, GpuConfig,
-};
-use hellas_gateway::{
-    CausalLmExecutionEnvironment, CliRuntime, ExecutionEvent, ExecutionRequest,
-    ExecutionRequestOptions, ExecutionStrategy, Outcome,
 };
 use hellas_presentation::{TextOutputDecoder, TextPresentation};
 use hellas_rpc::{Assurance, ContentId, ProducerSigningKey, Retention};
@@ -127,6 +127,7 @@ pub(crate) fn local_content_store(
 }
 
 pub struct ExecuteOptions {
+    pub output_cache: hellas_rpc::cache::CacheOptions,
     pub node_id: Option<EndpointId>,
     pub node_addrs: Vec<SocketAddr>,
     /// Presentation label. It never enters a quote or manifest.
@@ -154,10 +155,17 @@ pub struct ExecuteOptions {
 }
 
 pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()> {
+    let cache = hellas_client::cache::OutputCache::open(&options.output_cache)?;
     #[cfg(feature = "evaluate")]
-    let uses_remote = !options.local || options.verify_local;
+    anyhow::ensure!(
+        cache.is_none() || !options.verify_local,
+        "verification requires live execution; disable inference caching"
+    );
+    let replay_only = options.output_cache.policy == hellas_rpc::cache::CachePolicy::ReplayOnly;
+    #[cfg(feature = "evaluate")]
+    let uses_remote = !replay_only && (!options.local || options.verify_local);
     #[cfg(not(feature = "evaluate"))]
-    let uses_remote = true;
+    let uses_remote = !replay_only;
     let provider_trust = if uses_remote {
         Some(crate::identity::provider_trust(
             options.expected_provider_genesis,
@@ -179,11 +187,14 @@ pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()
     let runner_key = options.producer_key.clone();
 
     #[cfg(feature = "evaluate")]
-    let runtime = if options.local || options.verify_local {
+    let runtime = if replay_only {
+        CliRuntime::default()
+    } else if options.local || options.verify_local {
         let content_store = options
             .local_content_store
             .context("local Catena execution requires a verified local content store")?;
         let executor = Executor::spawn_configured(ExecutorSpawnConfig {
+            output_cache: options.output_cache.clone(),
             execute_policy: hellas_rpc::policy::ExecutePolicy::Any,
             queue_capacity: hellas_rpc::DEFAULT_EXECUTION_QUEUE_CAPACITY,
             metrics: Arc::new(ExecutorMetrics::default()),
@@ -212,10 +223,16 @@ pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()
         CliRuntime::remote(secret_key.clone()).await?
     };
     #[cfg(not(feature = "evaluate"))]
-    let runtime = CliRuntime::remote(secret_key.clone()).await?;
+    let runtime = if replay_only {
+        CliRuntime::default()
+    } else {
+        CliRuntime::remote(secret_key.clone()).await?
+    };
 
     #[cfg(feature = "evaluate")]
-    let strategy = if options.verify_local {
+    let strategy = if replay_only {
+        ExecutionStrategy::Replay
+    } else if options.verify_local {
         info!(program_manifest = %manifest_id, "executing remotely and verifying against local Catena");
         ExecutionStrategy::Verify {
             primary: ExecutionRoute::remote(
@@ -239,12 +256,16 @@ pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()
         ))
     };
     #[cfg(not(feature = "evaluate"))]
-    let strategy = ExecutionStrategy::Run(ExecutionRoute::remote(
-        options.node_id,
-        options.node_addrs,
-        options.retries,
-        provider_trust.expect("remote route requires provider trust"),
-    ));
+    let strategy = if replay_only {
+        ExecutionStrategy::Replay
+    } else {
+        ExecutionStrategy::Run(ExecutionRoute::remote(
+            options.node_id,
+            options.node_addrs,
+            options.retries,
+            provider_trust.expect("remote route requires provider trust"),
+        ))
+    };
 
     info!(model = %options.model_name, "using presentation label");
     let remote_runtime = uses_remote.then(|| runtime.clone());
@@ -261,6 +282,14 @@ pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()
         strategy,
         runner_key,
     )?;
+    // The local executor already owns this cache; avoid a second pipeline.
+    #[cfg(feature = "evaluate")]
+    let cache = if options.local && !replay_only {
+        None
+    } else {
+        cache
+    };
+    let request = request.with_cache(cache);
     let uses_remote = request.uses_remote_transport();
     let result: anyhow::Result<()> = async {
         let stream = request.stream();

@@ -79,6 +79,31 @@ fn test_proxy(addr: std::net::SocketAddr, bearer_token: Option<String>) -> Respo
     )
 }
 
+#[test]
+fn cache_identity_hashes_the_effective_request_and_endpoint_not_credentials() {
+    use crate::cache::CacheIdentity;
+    let proxy = test_proxy("127.0.0.1:1234".parse().unwrap(), Some("secret-one".into()));
+    let request = backend_request(Bytes::from_static(
+        br#"{"model":"fixture","input":"hello","stream":false}"#,
+    ));
+    let key = proxy.cache_key(&request).unwrap();
+    let streaming = backend_request(Bytes::from_static(
+        br#"{"model":"fixture","input":"hello","stream":true}"#,
+    ));
+    assert_eq!(key, proxy.cache_key(&streaming).unwrap());
+    let other_token = test_proxy("127.0.0.1:1234".parse().unwrap(), Some("secret-two".into()));
+    assert_eq!(key, other_token.cache_key(&request).unwrap());
+    let other_endpoint = test_proxy("127.0.0.1:1235".parse().unwrap(), None);
+    assert_ne!(key, other_endpoint.cache_key(&request).unwrap());
+    let mut other_model = request.clone();
+    other_model.execution.canonical.model.name = "other".into();
+    assert_ne!(key, proxy.cache_key(&other_model).unwrap());
+    let other_input = backend_request(Bytes::from_static(
+        br#"{"model":"fixture","input":"changed"}"#,
+    ));
+    assert_ne!(key, proxy.cache_key(&other_input).unwrap());
+}
+
 #[tokio::test]
 async fn streaming_backend_forwards_request_body_and_bearer_token() {
     let (tx, rx) = oneshot::channel();

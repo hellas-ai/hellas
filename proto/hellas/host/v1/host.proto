@@ -2,14 +2,79 @@ syntax = "proto3";
 
 package hellas.host.v1;
 
-// Local lifecycle control for an application hosting Hellas services. This
-// service is not a network protocol and must never be advertised over Iroh or
-// a relay.
+// Administrative lifecycle control. Hosts must authorize each connection before
+// dispatch, regardless of whether the carrier is local or remote.
 service HostControl {
   rpc GetHostStatus(GetHostStatusRequest) returns (HostStatus);
   rpc SetProviderState(SetProviderStateRequest) returns (HostStatus);
   rpc SetGatewayState(SetGatewayStateRequest) returns (HostStatus);
   rpc GetGatewayAccess(GetGatewayAccessRequest) returns (GatewayAccess);
+}
+
+// Shares the host's admin authorization boundary, not inference permissions.
+service CacheControl {
+  rpc ManageCache(ManageCacheRequest) returns (stream ManageCacheResponse);
+}
+
+message CacheKey {
+  string kind = 1;
+  string identity = 2;
+}
+
+message CacheFilter {
+  optional string kind = 1;
+  optional string identity = 2;
+}
+
+message CacheEntry {
+  CacheKey key = 1;
+  string output = 2;
+  uint64 recorded_at = 3;
+  uint64 bytes = 4;
+}
+
+message CachePrune {
+  optional uint64 recorded_before = 1;
+  optional uint64 max_entries = 2;
+  optional uint64 max_bytes = 3;
+}
+
+message EvictCacheEntries {
+  CacheFilter filter = 1;
+  CachePrune prune = 2;
+  bool dry_run = 3;
+  // Required for clearing a non-exact selection without prune limits.
+  bool all = 4;
+}
+
+message ManageCacheRequest {
+  oneof operation {
+    CacheFilter list = 1;
+    CacheKey read = 2;
+    CacheFilter stats = 3;
+    EvictCacheEntries evict = 4;
+  }
+}
+
+message CacheStats {
+  uint64 entries = 1;
+  uint64 bytes = 2;
+}
+
+message CacheEviction {
+  uint64 entries = 1;
+  bool dry_run = 2;
+}
+
+// Lists emit entries; reads emit bounded data frames from a single object.
+// Stats/eviction emit one result. The ordinary RPC trailer terminates the call.
+message ManageCacheResponse {
+  oneof result {
+    CacheEntry entry = 1;
+    bytes data = 2;
+    CacheStats stats = 3;
+    CacheEviction evict = 4;
+  }
 }
 
 message GetHostStatusRequest {}

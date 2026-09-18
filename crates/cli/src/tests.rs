@@ -117,9 +117,110 @@ fn causal_lm_args(command: Commands) -> CausalLmArgs {
     match command {
         Commands::Llm { causal_lm, .. } => causal_lm,
         #[cfg(feature = "gateway")]
-        Commands::Gateway { causal_lm, .. } => causal_lm,
+        Commands::Gateway { causal_lm, .. } => causal_lm.expect("causal-LM arguments"),
         _ => panic!("expected causal-LM command"),
     }
+}
+
+#[test]
+fn cache_reset_can_target_a_live_control_socket_without_an_identity() {
+    let cli = Cli::try_parse_from([
+        "hellas",
+        "output-cache",
+        "--socket",
+        "/run/user/1000/hellas/control.sock",
+        "reset",
+    ])
+    .unwrap();
+    assert!(matches!(&cli.command, Commands::OutputCache(_)));
+    assert!(validate_identity_options(&cli.command, None, false).is_ok());
+}
+
+#[test]
+fn remote_cache_management_uses_an_existing_identity_and_exclusive_transport() {
+    let peer = "bb18ebc065d836ecc7e1f33972d2c17eac9894cd33ce4916f66cb1165ccc7550";
+    let cli = Cli::try_parse_from([
+        "hellas",
+        "--identity",
+        "owner.identity",
+        "output-cache",
+        "--node-id",
+        peer,
+        "--kind",
+        "proxy",
+        "--key",
+        peer,
+        "show",
+    ])
+    .unwrap();
+    assert!(validate_identity_options(&cli.command, cli.identity.as_deref(), false).is_ok());
+    assert!(validate_identity_options(&cli.command, cli.identity.as_deref(), true).is_err());
+    assert_eq!(
+        cli.identity.as_deref(),
+        Some(std::path::Path::new("owner.identity"))
+    );
+    let Commands::OutputCache(args) = cli.command else {
+        panic!()
+    };
+    assert_eq!(args.key.as_deref(), Some(peer));
+    let offline = Cli::try_parse_from([
+        "hellas",
+        "output-cache",
+        "--kind",
+        "proxy",
+        "--key",
+        peer,
+        "show",
+    ])
+    .unwrap();
+    assert!(offline.identity.is_none());
+    assert!(
+        Cli::try_parse_from([
+            "hellas",
+            "output-cache",
+            "--node-id",
+            peer,
+            "--socket",
+            "control.sock",
+            "clear"
+        ])
+        .is_err()
+    );
+}
+
+#[cfg(feature = "node")]
+#[test]
+fn remote_admin_is_explicitly_granted() {
+    let cli = Cli::try_parse_from(["hellas", "serve"]).unwrap();
+    let Commands::Serve { admin_peers, .. } = cli.command else {
+        panic!()
+    };
+    assert!(admin_peers.is_empty());
+    let peer = "bb18ebc065d836ecc7e1f33972d2c17eac9894cd33ce4916f66cb1165ccc7550";
+    let cli = Cli::try_parse_from(["hellas", "serve", "--admin-peer", peer]).unwrap();
+    let Commands::Serve { admin_peers, .. } = cli.command else {
+        panic!()
+    };
+    assert_eq!(admin_peers, [peer.parse::<iroh::EndpointId>().unwrap()]);
+}
+
+#[cfg(feature = "gateway")]
+#[test]
+fn control_socket_is_not_cache_specific_and_does_not_require_record_mode() {
+    let cli = Cli::try_parse_from([
+        "hellas",
+        "--control-socket",
+        "/run/user/1000/hellas/control.sock",
+        "gateway",
+        "--responses-backend",
+        "proxy",
+    ])
+    .unwrap();
+    assert_eq!(
+        cli.control_socket.as_deref(),
+        Some(std::path::Path::new("/run/user/1000/hellas/control.sock"))
+    );
+    assert_eq!(cli.output_cache, hellas_rpc::cache::CachePolicy::Off);
 }
 
 #[test]
@@ -478,7 +579,10 @@ fn gateway_local_modes_require_and_accept_explicit_content() {
             assert!(node_id.is_none());
             assert!(node_addrs.is_empty());
             assert!(local);
-            assert_eq!(causal_lm.content_paths, vec![PathBuf::from(TEST_CONTENT)]);
+            assert_eq!(
+                causal_lm.unwrap().content_paths,
+                vec![PathBuf::from(TEST_CONTENT)]
+            );
         }
         _ => panic!("expected gateway command"),
     }
@@ -1435,4 +1539,24 @@ fn content_id_parser_round_trips_xet_text_encoding() {
         parse_content_id_hex(displayed).unwrap().to_string(),
         displayed
     );
+}
+#[cfg(feature = "gateway")]
+#[test]
+fn proxy_cache_needs_no_causal_lm_files() {
+    let cli = Cli::try_parse_from([
+        "hellas",
+        "gateway",
+        "--responses-backend",
+        "proxy",
+        "--output-cache",
+        "replay-only",
+    ])
+    .unwrap();
+    assert!(matches!(
+        cli.command,
+        Commands::Gateway {
+            causal_lm: None,
+            ..
+        }
+    ));
 }

@@ -20,6 +20,58 @@ use hellas_wire::{Dispatcher, MethodMarker};
 
 use crate::peers::{PeerId, PeerManager};
 
+/// Administrative grants are distinct from transport authentication and
+/// execution permissions. Empty/default policy denies every caller.
+#[derive(Clone, Default)]
+pub struct AdminPolicy {
+    pub local_owner: bool,
+    pub peers: Vec<hellas_wire::PeerIdentity>,
+}
+
+impl AdminPolicy {
+    pub fn allows(&self, context: &hellas_wire::TransportContext) -> bool {
+        (self.local_owner && context.auth_level == hellas_wire::AuthLevel::LocalOwner)
+            || context
+                .vouched_peer()
+                .is_some_and(|peer| self.peers.contains(&peer))
+    }
+}
+
+/// Apply the same authorization before dispatch on every carrier. The policy
+/// consumes live transport evidence, never caller-supplied headers or peer
+/// registry observations from a different connection.
+pub struct Authorized<S> {
+    pub service: S,
+    pub policy: AdminPolicy,
+}
+
+impl<T, S> Dispatcher<T> for Authorized<S>
+where
+    T: StreamTransport + Send + Sync,
+    T::Stream: Send,
+    S: Dispatcher<T, Error = hellas_wire::TransportError> + Send + Sync,
+{
+    type Error = hellas_wire::TransportError;
+
+    async fn dispatch(&self, inbound: Inbound<T::Stream>) -> Result<(), Self::Error> {
+        if !self.policy.allows(&inbound.context) {
+            use hellas_wire::{SendHalf, Stream, WireCode, WireStatus};
+            let (mut send, _recv) = inbound.stream.split();
+            return send
+                .close_send(Some(
+                    WireStatus::new(
+                        WireCode::PermissionDenied,
+                        "administrative access is not granted",
+                    )
+                    .into(),
+                ))
+                .await
+                .map_err(|e| hellas_wire::TransportError::Io(e.to_string()));
+        }
+        self.service.dispatch(inbound).await
+    }
+}
+
 /// Routes one method to `selected` and every other method to `fallback`.
 ///
 /// This lets one connection-bound service carry a method whose protobuf

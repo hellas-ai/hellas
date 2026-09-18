@@ -28,31 +28,8 @@ pub use provider::{OpenAiProviderOptions, ProviderHandle, start_openai_provider}
 #[cfg(feature = "client")]
 pub use remote::{ClientIdentity, HellasClient, RemoteFetchRequest};
 
-#[cfg(all(feature = "local-control", unix))]
+#[cfg(all(feature = "local-control", unix, not(target_os = "espidf")))]
 pub mod local {
-    use std::io;
-
-    use hellas_wire::mux::{MuxConfig, MuxTransport, Role};
-    use hellas_wire::unix::{DEFAULT_MAX_MESSAGE_BYTES, UnixMessagePipe};
-    use hellas_wire::{DefaultClock, TransportContext};
-    use tokio::net::UnixStream;
-
-    /// Local control is deliberately small; capacity here bounds concurrent
-    /// RPCs on one user-owned socket rather than exposing an unbounded queue.
-    pub const LOCAL_MUX_SLOTS: usize = 32;
-
-    pub fn transport(
-        stream: UnixStream,
-        role: Role,
-        context: TransportContext,
-    ) -> io::Result<MuxTransport> {
-        let pipe = UnixMessagePipe::new(stream, DEFAULT_MAX_MESSAGE_BYTES)?;
-        Ok(MuxTransport::spawn::<LOCAL_MUX_SLOTS, _, _>(
-            role,
-            DefaultClock,
-            MuxConfig::default(),
-            pipe,
-            context,
-        ))
-    }
+    pub use hellas_rpc::cache::control::CacheController;
+    pub use hellas_wire::unix::{LOCAL_MUX_SLOTS, LocalControlServer, connect, transport};
 }
