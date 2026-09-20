@@ -3568,9 +3568,12 @@ fn observed<'a>(
     }
 }
 
-/// What this service answers a fresh proposal with.
-fn proposal_refusal(service: &WorkService) -> i32 {
-    match service.accept(&signed_request(NONCE, 1)).outcome {
+/// What this service answers the named proposal with.
+fn proposal_refusal(service: &WorkService, proposal_nonce: u64) -> i32 {
+    match service
+        .accept(&signed_request(NONCE, proposal_nonce))
+        .outcome
+    {
         Some(AcceptOutcome::Refused(refused)) => refused.code,
         other => panic!("a channel that admits no new work refuses: {other:?}"),
     }
@@ -3663,9 +3666,20 @@ async fn a_contested_channel_mounts_a_close_capable_service() {
         "the journaled digest is the one the submitted answer was signed over",
     );
     assert_eq!(
-        proposal_refusal(&service),
+        proposal_refusal(&service, 1),
+        WorkRefusalCode::Conflict as i32,
+        "the paid job remains terminal even without a readiness decision",
+    );
+    assert_eq!(
+        proposal_refusal(&service, 2),
         WorkRefusalCode::NotReady as i32,
-        "and it admits no new work while it has no readiness decision",
+        "a fresh proposal needs a readiness decision",
+    );
+    assert!(
+        service
+            .with_state(|state| state.jobs().next().is_none())
+            .expect("the endpoint is reachable"),
+        "neither refused proposal reserved new work",
     );
 }
 
@@ -3786,7 +3800,7 @@ async fn a_close_only_service_admits_work_only_once_a_readiness_arrives() {
     let service = WorkService::close_only(endpoint);
 
     assert_eq!(
-        proposal_refusal(&service),
+        proposal_refusal(&service, 1),
         WorkRefusalCode::NotReady as i32,
         "a channel with no readiness decision admits no work",
     );
