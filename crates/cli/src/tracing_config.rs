@@ -56,7 +56,7 @@ impl TracerGuard {
 ///
 /// Supported environment variables (all standard OTEL, only consulted when
 /// `otel` is enabled):
-///   OTEL_EXPORTER_OTLP_TRACES_ENDPOINT  — collector URL (e.g. https://jaeger.lsd-ag.ch/v1/traces)
+///   OTEL_EXPORTER_OTLP_TRACES_ENDPOINT  — collector URL (e.g. https://collector.example.com/v1/traces)
 ///   OTEL_SERVICE_NAME                    — service name  (default: hellas-node)
 ///   OTEL_TRACES_SAMPLER_ARG             — sample rate 0.0–1.0 (default: 1.0)
 ///   OTEL_EXPORTER_OTLP_HEADERS          — extra headers as k=v,k=v
