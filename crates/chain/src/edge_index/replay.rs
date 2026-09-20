@@ -5,13 +5,16 @@ use crate::{
     domain::{Digest, SettlementKey},
     execution::{
         ChainVerifier, execute_all_observed,
-        store::{UtxoDatabase, utxo_db_config},
+        store::{UtxoDatabase, UtxoDb, utxo_db_config},
     },
-    verified_explorer::{ExplorerQuery, ExplorerVerifier, ProofBundle},
+    verified_explorer::{
+        AddressProofBundle, ExplorerQuery, ExplorerVerifier, PROOF_SCHEMA_VERSION, ProofBundle,
+    },
 };
+use commonware_codec::DecodeExt as _;
 use commonware_consensus::{Block as _, Heightable as _};
 use commonware_cryptography::Digestible as _;
-use commonware_glue::stateful::db::{DatabaseSet, Merkleized as _, Unmerkleized as _};
+use commonware_glue::stateful::db::{DatabaseSet, ManagedDb, Merkleized as _, Unmerkleized as _};
 use commonware_runtime::Spawner;
 use commonware_storage::Context as StorageContext;
 
@@ -22,6 +25,7 @@ pub(crate) struct Replay<E: StorageContext + Spawner> {
     allocations: Vec<(SettlementKey, u64)>,
     genesis: HellasBlock,
     cursor: u64,
+    checkpoint: Option<ProofBundle>,
 }
 impl<E: StorageContext + Spawner + Send + Sync + 'static> Replay<E> {
     pub async fn new(
@@ -78,7 +82,12 @@ impl<E: StorageContext + Spawner + Send + Sync + 'static> Replay<E> {
         {
             return Err("QMDB and index publication roots disagree".into());
         }
-        let cursor = latest.map_or(0, |proof| proof.height);
+        // Recovery must complete before the HTTP origin exposes any state.
+        // Check the durable owner tree and sync range as well as the QMDB root.
+        if let Some(proof) = &latest {
+            Self::check_checkpoint(&database, proof, verifier).await?;
+        }
+        let cursor = latest.as_ref().map_or(0, |proof| proof.height);
         Ok(Self {
             database,
             index,
@@ -86,8 +95,80 @@ impl<E: StorageContext + Spawner + Send + Sync + 'static> Replay<E> {
             allocations,
             genesis,
             cursor,
+            checkpoint: latest,
         })
     }
+    pub fn next_height(&self) -> Result<u64> {
+        self.cursor
+            .checked_add(1)
+            .ok_or_else(|| "replay height overflow".into())
+    }
+
+    async fn check_checkpoint(
+        database: &UtxoDatabase<E>,
+        proof: &ProofBundle,
+        verifier: &ExplorerVerifier,
+    ) -> Result<()> {
+        let verified = verifier.verify(
+            proof.clone(),
+            ExplorerQuery::Block(FinalizedBlockQuery::Height(proof.height)),
+        )?;
+        let database = database.read().await;
+        let target = <UtxoDb<E> as ManagedDb<E>>::sync_target(&database);
+        let expected = HellasBlock::decode(proof.canonical_block.as_slice())?.sync_target();
+        if database.root() != verified.view().state_root()
+            || target.root != expected.root
+            || target.range != expected.range
+            || crate::execution::owner_tree::stored_root(&database).await?
+                != verified.view().owner_root()
+        {
+            return Err("durable owner checkpoint does not match certified state".into());
+        }
+        Ok(())
+    }
+
+    /// Read current holdings from the very QMDB state committed by replay.
+    /// The origin serializes this whole call with apply (including publication).
+    /// No retained historical tree or follower archive is needed after reopening.
+    pub async fn owner_proof(
+        &self,
+        verifier: &ExplorerVerifier,
+        owner: SettlementKey,
+        offset: u64,
+        limit: u32,
+        payload: Option<&str>,
+    ) -> Result<Option<AddressProofBundle>> {
+        let Some(proof) = &self.checkpoint else {
+            return Ok(None);
+        };
+        if payload.is_some_and(|payload| payload != proof.payload) {
+            return Ok(None);
+        }
+        let verified = verifier.verify(
+            proof.clone(),
+            ExplorerQuery::Block(FinalizedBlockQuery::Height(proof.height)),
+        )?;
+        // One read guard covers every node and the root check. The outer Replay
+        // lock also excludes the finalize -> index-publication interval.
+        let database = self.database.read().await;
+        if database.root() != verified.view().state_root()
+            || crate::execution::owner_tree::stored_root(&database).await?
+                != verified.view().owner_root()
+        {
+            return Err("durable owner checkpoint does not match certified state".into());
+        }
+        let page =
+            crate::execution::owner_tree::prove_stored_owner_page(&database, owner, offset, limit)
+                .await?;
+        let bundle = AddressProofBundle {
+            schema_version: PROOF_SCHEMA_VERSION,
+            block: Some(proof.clone()),
+            page: serde_json::to_vec(&page)?,
+        };
+        verifier.verify_address(bundle.clone(), owner, offset, limit)?;
+        Ok(Some(bundle))
+    }
+
     pub async fn apply(&mut self, block: &HellasBlock, proof: ProofBundle) -> Result<()> {
         let height = block.height().get();
         if height <= self.cursor {
@@ -151,13 +232,14 @@ impl<E: StorageContext + Spawner + Send + Sync + 'static> Replay<E> {
         {
             return Err("replayed sync target differs from certified block".into());
         }
-        self.index.store.prepare(proof, changes)?;
+        self.index.store.prepare(proof.clone(), changes)?;
         self.database.finalize(merkleized).await;
         self.index.store.publish_intent()?;
         self.cursor = height;
+        self.checkpoint = Some(proof);
         Ok(())
     }
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
