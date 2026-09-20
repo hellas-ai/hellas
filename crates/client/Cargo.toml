@@ -10,6 +10,9 @@ documentation.workspace = true
 [features]
 default = []
 iroh = [
+    "dep:hellas-adaptors",
+    "dep:serde_ipld_dagcbor",
+    "dep:tracing",
     "dep:async-stream",
     "dep:futures",
     "dep:iroh",
@@ -22,6 +25,13 @@ iroh = [
     "hellas-wire/discovery-mdns",
 ]
 evaluate = ["hellas-rpc/evaluate"]
+local = [
+    "iroh",
+    "evaluate",
+    "dep:hellas-executor",
+    "hellas-executor/evaluate",
+    "dep:tokio-stream",
+]
 # The paid-work half: the acceptance and delivery wire, and the
 # independent reexecution check the client makes before a result is
 # payable. Off by default because it pulls the consensus kernel into a
@@ -31,9 +41,11 @@ work = ["dep:hellas-kernel", "dep:hellas-work"]
 [dependencies]
 async-stream = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
+hellas-adaptors = { workspace = true, optional = true }
 hellas-attestation = { workspace = true, features = [
     "apple-app-attest",
 ], optional = true }
+hellas-executor = { workspace = true, optional = true }
 # The re-execution names the network its outcome is bound to, and that
 # type is the consensus kernel's. `work` is the only feature that reaches
 # it.
@@ -44,8 +56,12 @@ hellas-work = { workspace = true, optional = true }
 iroh = { workspace = true, features = ["tls-ring"], optional = true }
 iroh-mdns-address-lookup = { workspace = true, optional = true }
 rand.workspace = true
+serde.workspace = true
+serde_ipld_dagcbor = { workspace = true, optional = true }
 thiserror.workspace = true
 tokio = { workspace = true, optional = true }
+tokio-stream = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
 
 [dev-dependencies]
 base64.workspace = true
@@ -58,7 +74,6 @@ hellas-kernel = { workspace = true, features = ["secp256k1"] }
 hellas-wire = { workspace = true, features = ["mux"] }
 hex.workspace = true
 p256.workspace = true
-serde.workspace = true
 serde_bytes.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

@@ -38,6 +38,17 @@ pub enum OutputEvent {
     Provenance(Provenance),
 }
 
+impl OutputEvent {
+    /// None for nonterminal events; Some indicates success or failure/cancellation.
+    pub fn terminal(&self) -> Option<bool> {
+        match self {
+            Self::Finished { stop_reason, .. } => Some(*stop_reason != StopReason::Cancelled),
+            Self::Error { .. } => Some(false),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum AdaptorEvent {
     CodexResponses(CodexResponsesEvent),

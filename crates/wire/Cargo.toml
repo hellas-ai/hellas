@@ -79,6 +79,9 @@ wasm-bindgen-futures = { version = "0.4", optional = true }
 web-time = { workspace = true }
 ws_stream_wasm = { version = "0.7", optional = true }
 
+[target.'cfg(all(unix, not(target_os = "espidf")))'.dependencies]
+libc = "0.2"
+
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 tokio = { workspace = true, features = [
     "io-util",

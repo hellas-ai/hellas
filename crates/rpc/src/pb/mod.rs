@@ -167,6 +167,14 @@ mod id_pins {
         assert_eq!(<CreateTicket as MethodMarker>::METHOD_ID, 0x39183beb);
     }
 
+    #[cfg(feature = "host-control")]
+    #[test]
+    fn cache_control_ids_are_stable() {
+        use super::services::cache_control::{CacheControl, ManageCache};
+        assert_eq!(<CacheControl as ServiceMarker>::SERVICE_ID, 0x506b_ebfb);
+        assert_eq!(<ManageCache as MethodMarker>::METHOD_ID, 0x8bb7_91fb);
+    }
+
     #[cfg(feature = "courtesy")]
     #[test]
     fn courtesy_ids_are_stable() {

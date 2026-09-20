@@ -16,7 +16,10 @@ pub mod fetch;
 pub mod identity;
 #[cfg(feature = "llm")]
 pub mod llm;
+#[cfg(any(feature = "gateway", feature = "node", test))]
+pub mod local_control;
 pub mod monitor;
+pub mod output_cache;
 #[cfg(feature = "node")]
 pub mod paid_work;
 pub mod rpc;

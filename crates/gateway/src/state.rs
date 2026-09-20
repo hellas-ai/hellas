@@ -30,6 +30,7 @@ pub(super) const DEFAULT_INFERENCE_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Clone)]
 pub(super) struct GatewayState {
+    pub(super) output_cache: Option<Arc<super::cache::OutputCache>>,
     #[cfg(feature = "evaluate")]
     pub(super) local: bool,
     #[cfg(feature = "evaluate")]
@@ -132,17 +133,37 @@ pub(super) struct HttpError {
 
 impl GatewayState {
     pub(super) async fn from_options(options: &GatewayOptions) -> anyhow::Result<Self> {
+        let output_cache = super::cache::OutputCache::open(&options.output_cache)?;
+        let verification = options.verify.is_some();
+        #[cfg(feature = "evaluate")]
+        let verification = verification || options.verify_local;
+        anyhow::ensure!(
+            output_cache.is_none() || !verification,
+            "verification requires live execution; disable inference caching"
+        );
+        let replay_only = options.output_cache.policy == super::cache::CachePolicy::ReplayOnly;
         anyhow::ensure!(
             options.default_max_tokens > 0,
             "default maximum tokens must be greater than zero"
         );
         let runner_key = Arc::new(options.producer_key.clone());
-        let tokenizer = options.tokenizer.clone();
-        let presentation = Arc::new(
-            tokio::task::spawn_blocking(move || TextPresentation::load(&tokenizer))
-                .await
-                .context("tokenizer loader panicked")??,
+        anyhow::ensure!(
+            options.causal_lm.is_some() == options.tokenizer.is_some(),
+            "causal-LM environment and tokenizer must be supplied together"
         );
+        anyhow::ensure!(
+            options.responses_backend != ResponsesBackend::Hellas || options.causal_lm.is_some(),
+            "Hellas backend requires an environment and tokenizer"
+        );
+        let presentation = if let Some(tokenizer) = options.tokenizer.clone() {
+            Some(Arc::new(
+                tokio::task::spawn_blocking(move || TextPresentation::load(&tokenizer))
+                    .await
+                    .context("tokenizer loader panicked")??,
+            ))
+        } else {
+            None
+        };
         let responses_proxy = match options.responses_backend {
             ResponsesBackend::Hellas => None,
             ResponsesBackend::Proxy => Some(Arc::new(ResponsesProxy::new(
@@ -153,12 +174,20 @@ impl GatewayState {
         };
 
         #[cfg(feature = "evaluate")]
-        let runtime = if options.local || options.verify_local {
+        let runtime = if replay_only
+            || (options.responses_backend == ResponsesBackend::Proxy
+                && options.causal_lm.is_none()
+                && !options.local
+                && !options.verify_local)
+        {
+            CliRuntime::default()
+        } else if options.local || options.verify_local {
             let content_store = options
                 .local_content_store
                 .clone()
                 .context("local gateway execution requires a local content store")?;
             let handle = Executor::spawn_configured(ExecutorSpawnConfig {
+                output_cache: options.output_cache.clone(),
                 execute_policy: ExecutePolicy::Any,
                 queue_capacity: options.queue_size,
                 metrics: Arc::new(ExecutorMetrics::default()),
@@ -187,24 +216,33 @@ impl GatewayState {
             CliRuntime::remote(options.secret_key.clone()).await?
         };
         #[cfg(not(feature = "evaluate"))]
-        let runtime = CliRuntime::remote(options.secret_key.clone()).await?;
+        let runtime = if replay_only
+            || (options.responses_backend == ResponsesBackend::Proxy && options.causal_lm.is_none())
+        {
+            CliRuntime::default()
+        } else {
+            CliRuntime::remote(options.secret_key.clone()).await?
+        };
 
         let responses_fetch = match options.responses_backend {
             ResponsesBackend::Fetch => {
                 Some(Arc::new(super::fetch_backend::ResponsesFetchBackend::new(
                     runtime.clone(),
-                    ExecutionRoute::remote(
-                        options.node_id,
-                        options.node_addrs.clone(),
-                        options.retries,
-                        // This backend dials a provider for every request
-                        // it serves, so it is built only where the anchor
-                        // that provider will be checked against exists.
-                        options
-                            .provider_trust
-                            .clone()
-                            .context("fetch responses backend requires a provider trust anchor")?,
-                    ),
+                    if replay_only {
+                        None
+                    } else {
+                        Some(ExecutionRoute::remote(
+                            options.node_id,
+                            options.node_addrs.clone(),
+                            options.retries,
+                            // This backend dials a provider for every request
+                            // it serves, so it is built only where the anchor
+                            // that provider will be checked against exists.
+                            options.provider_trust.clone().context(
+                                "fetch responses backend requires a provider trust anchor",
+                            )?,
+                        ))
+                    },
                     (
                         &options.responses_fetch_route_service,
                         &options.responses_fetch_route_method,
@@ -225,6 +263,7 @@ impl GatewayState {
         };
 
         Ok(Self {
+            output_cache,
             #[cfg(feature = "evaluate")]
             local: options.local,
             #[cfg(feature = "evaluate")]
@@ -232,16 +271,20 @@ impl GatewayState {
             verify_node_id: options.verify,
             default_max_tokens: options.default_max_tokens,
             model_name: options.model_name.clone(),
-            causal_lm: Some(options.causal_lm.clone()),
+            causal_lm: options.causal_lm.clone(),
             inference_timeout: DEFAULT_INFERENCE_TIMEOUT,
             runtime,
-            presentation: Some(presentation),
+            presentation,
             stop_token_ids: options.stop_token_ids.clone(),
             responses_proxy,
             responses_fetch,
             runner_key,
             assurance: options.assurance,
-            strategy: configured_strategy(options),
+            strategy: if replay_only {
+                Some(ExecutionStrategy::Replay)
+            } else {
+                configured_strategy(options)
+            },
         })
     }
 
@@ -256,7 +299,7 @@ impl GatewayState {
         );
         let responses_fetch = Arc::new(super::fetch_backend::ResponsesFetchBackend::new(
             runtime.clone(),
-            route,
+            Some(route),
             (
                 &options.service,
                 &options.method,
@@ -267,6 +310,7 @@ impl GatewayState {
             options.request_overrides.clone(),
         ));
         Ok(Self {
+            output_cache: None,
             #[cfg(feature = "evaluate")]
             local: false,
             #[cfg(feature = "evaluate")]
@@ -329,10 +373,21 @@ impl GatewayState {
             status: StatusCode::BAD_REQUEST,
             message: format!("Failed to build execution request: {err}"),
         })?;
-        let prepared = request.prepare().await.map_err(|err| HttpError {
-            status: StatusCode::BAD_GATEWAY,
-            message: format!("{prepare_error}: {}", format_error_causes(&err)),
-        })?;
+        let cache = self.output_cache.clone();
+        #[cfg(feature = "evaluate")]
+        let cache = if self.local && !matches!(self.strategy, Some(ExecutionStrategy::Replay)) {
+            None
+        } else {
+            cache
+        };
+        let prepared = request
+            .with_cache(cache)
+            .prepare()
+            .await
+            .map_err(|err| HttpError {
+                status: StatusCode::BAD_GATEWAY,
+                message: format!("{prepare_error}: {}", format_error_causes(&err)),
+            })?;
         let provenance = prepared.provenance().cloned();
 
         Ok(PreparedGeneration {
@@ -391,6 +446,13 @@ impl GatewayState {
             retention,
         )
         .await
+    }
+
+    pub(super) fn cached<B>(&self, backend: B) -> super::cache::CachedBackend<B> {
+        super::cache::CachedBackend {
+            backend,
+            cache: self.output_cache.clone(),
+        }
     }
 }
 

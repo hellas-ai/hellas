@@ -11,6 +11,8 @@ pub mod schema;
 pub mod status;
 pub mod transport;
 
+#[cfg(all(feature = "mux", not(target_family = "wasm")))]
+pub mod framed;
 #[cfg(feature = "mux")]
 pub mod mux;
 
@@ -20,7 +22,7 @@ pub mod iroh;
 #[cfg(any(feature = "ws", feature = "ws-wasm"))]
 pub mod ws;
 
-#[cfg(all(feature = "unix", unix))]
+#[cfg(all(feature = "unix", unix, not(target_os = "espidf")))]
 pub mod unix;
 
 pub use crate::canonical::{Encode, Writer};

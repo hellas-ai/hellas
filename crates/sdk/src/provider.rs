@@ -97,6 +97,7 @@ where
         FetchQuotaStoreBackend::fs(options.state_directory.join("quota")),
     );
     let executor = Executor::spawn_configured(ExecutorSpawnConfig {
+        output_cache: Default::default(),
         execute_policy: ExecutePolicy::Deny,
         queue_capacity: 1,
         metrics: Arc::new(ExecutorMetrics::default()),

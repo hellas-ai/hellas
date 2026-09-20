@@ -18,7 +18,7 @@ pub const COMMITMENT_KEY: &str = "x-hellas-commitment-bin";
 
 /// Pre-flight provenance for a single execution. Scheme result commitments
 /// live in signed terminal output events, not in this struct.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ExecutionProvenance {
     pub commitment_id: [u8; 32],
 }

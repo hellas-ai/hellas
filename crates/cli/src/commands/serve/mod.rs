@@ -33,6 +33,8 @@ pub use provision::{ProvisionOptions, run_provision};
 pub use work_config::{WorkConfig, load_work_config};
 
 pub struct ServeOptions {
+    pub admin_peers: Vec<iroh::EndpointId>,
+    pub output_cache: hellas_rpc::cache::CacheOptions,
     pub port: Option<u16>,
     pub execute_policy: ExecutePolicy,
     pub queue_size: usize,
@@ -194,6 +196,8 @@ async fn run_with_store(
     // underlying state.
     let metrics = Arc::new(ExecutorMetrics::default());
     let node = node::spawn_node(node::NodeConfig {
+        admin_peers: options.admin_peers,
+        output_cache: options.output_cache,
         port: options.port,
         execute_policy: options.execute_policy.clone(),
         queue_size: options.queue_size,

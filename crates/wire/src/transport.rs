@@ -53,6 +53,9 @@ pub enum AuthLevel {
     None,
     /// Transport-vouched identity (iroh NodeId, mTLS subject).
     Vouched,
+    /// The carrier checked that the caller is this process's OS owner.
+    /// Never set from RPC metadata, discovery, or a claimed remote identity.
+    LocalOwner,
 }
 
 /// Transport-provided context for an inbound stream.

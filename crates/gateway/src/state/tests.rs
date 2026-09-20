@@ -24,9 +24,30 @@ fn anchor() -> ProviderTrustAnchor {
     }
 }
 
+fn test_environment() -> CausalLmExecutionEnvironment {
+    let environment = hellas_rpc::CausalLmEnvironment::new(
+        hellas_rpc::ContentRef::new(hellas_rpc::ContentId::from_bytes([8; 32]), 1024),
+        "model",
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        256,
+        1024,
+    )
+    .unwrap();
+    let manifest = environment.manifest();
+    CausalLmExecutionEnvironment::from_canonical_bytes(
+        manifest.content_id(),
+        manifest.canonical_bytes(),
+        environment.canonical_bytes(),
+    )
+    .unwrap()
+}
+
 /// A gateway pointed at one node, which callers then vary.
 fn options(provider_trust: Option<ProviderTrustAnchor>) -> GatewayOptions {
     GatewayOptions {
+        output_cache: Default::default(),
         host: "127.0.0.1".to_string(),
         port: None,
         node_id: Some(endpoint(1)),
@@ -41,10 +62,10 @@ fn options(provider_trust: Option<ProviderTrustAnchor>) -> GatewayOptions {
         retries: 2,
         default_max_tokens: 128,
         model_name: "smollm2-135m".to_string(),
-        causal_lm: crate::execution::test_causal_lm_environment(8),
+        causal_lm: Some(test_environment()),
         #[cfg(feature = "evaluate")]
         local_content_store: None,
-        tokenizer: "tokenizer.json".into(),
+        tokenizer: Some("tokenizer.json".into()),
         stop_token_ids: Vec::new(),
         metrics_port: None,
         responses_backend: ResponsesBackend::Hellas,
@@ -64,6 +85,106 @@ fn options(provider_trust: Option<ProviderTrustAnchor>) -> GatewayOptions {
         wrap: None,
         wrap_args: Vec::new(),
     }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn local_control_clear_resets_a_running_gateway_cache() {
+    use hellas_rpc::cache::control::CacheController;
+    use hellas_rpc::cache::{CacheOptions, CachePolicy, MemoryCacheStore};
+    use hellas_rpc::pb::host as pb;
+    use hellas_rpc::services::cache_control::{CacheControlClientImpl, CacheControlServer};
+    use hellas_wire::unix::{LocalControlServer, connect};
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let upstream = axum::Router::new().route("/v1/responses", axum::routing::post({
+        let calls = calls.clone();
+        move || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async {
+                ([("content-type", "text/event-stream")], r#"event: response.output_item.added
+data: {"type":"response.output_item.added","item":{"content":[],"id":"msg_1","role":"assistant","status":"in_progress","type":"message"}}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","item_id":"msg_1","delta":"hello"}
+
+event: response.output_text.done
+data: {"type":"response.output_text.done","item_id":"msg_1","text":"hello"}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_1","object":"response","status":"completed","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}
+
+"#)
+            }
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_address = listener.local_addr().unwrap();
+    let upstream = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+    let mut options = options(None);
+    options.causal_lm = None;
+    options.tokenizer = None;
+    options.node_id = None;
+    options.port = Some(0);
+    options.responses_backend = ResponsesBackend::Proxy;
+    options.responses_proxy_url = format!("http://{upstream_address}/v1/responses");
+    options.output_cache = CacheOptions {
+        policy: CachePolicy::Record,
+        store: Some(Arc::new(MemoryCacheStore::default())),
+    };
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let socket = directory.path().join("control.sock");
+    let _control = LocalControlServer::bind(
+        &socket,
+        CacheControlServer(CacheController::new(&options.output_cache)),
+    )
+    .unwrap();
+    let control = CacheControlClientImpl::new(connect(&socket).await.unwrap());
+    let gateway = crate::start(options).await.unwrap();
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap();
+    for (index, expected_calls) in [1, 1, 2].into_iter().enumerate() {
+        let response = http
+            .post(format!("http://{}/v1/responses", gateway.address()))
+            .bearer_auth(gateway.bearer())
+            .header("content-type", "application/json")
+            .body(r#"{"model":"m","input":"hello","stream":false}"#)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let response: serde_json::Value = serde_json::from_slice(&response).unwrap();
+        assert_eq!(response["output"][0]["content"][0]["text"], "hello");
+        assert_eq!(calls.load(Ordering::SeqCst), expected_calls);
+        if index == 1 {
+            let mut call = control
+                .manage_cache(pb::ManageCacheRequest {
+                    operation: Some(pb::manage_cache_request::Operation::Evict(
+                        pb::EvictCacheEntries {
+                            all: true,
+                            ..Default::default()
+                        },
+                    )),
+                })
+                .await
+                .unwrap();
+            while let Some(reply) = futures::StreamExt::next(&mut call).await {
+                reply.unwrap();
+            }
+            call.finish().unwrap();
+        }
+    }
+    gateway.shutdown().await.unwrap();
+    upstream.abort();
 }
 
 /// Fails the day a remote route becomes constructible without the
@@ -145,4 +266,59 @@ fn pure_local_runtime_does_not_bind_remote_transport() {
     options.verify_local = false;
     options.responses_backend = ResponsesBackend::Fetch;
     assert!(local_runtime_needs_remote(&options));
+}
+
+#[tokio::test]
+async fn proxy_with_causal_lm_keeps_remote_runtime_except_in_replay_only() {
+    use hellas_rpc::cache::{CacheOptions, CachePolicy, MemoryCacheStore};
+
+    let tokenizer = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(
+        tokenizer.path(),
+        br#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":{"type":"Whitespace"},"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"hello":0,"<unk>":1},"unk_token":"<unk>"}}"#,
+    )
+    .unwrap();
+
+    for policy in [
+        CachePolicy::Off,
+        CachePolicy::Record,
+        CachePolicy::ReplayOnly,
+    ] {
+        let mut options = options(Some(anchor()));
+        options.responses_backend = ResponsesBackend::Proxy;
+        options.responses_proxy_url = "http://127.0.0.1:1/v1/responses".into();
+        options.tokenizer = Some(tokenizer.path().into());
+        options.output_cache = CacheOptions {
+            policy,
+            store: Some(Arc::new(MemoryCacheStore::default())),
+        };
+        let state = GatewayState::from_options(&options).await.unwrap();
+        assert!(state.responses_proxy.is_some());
+        assert_eq!(
+            state.runtime.remote_registry().is_ok(),
+            policy != CachePolicy::ReplayOnly,
+            "{policy:?}"
+        );
+        assert_eq!(
+            state.execution_strategy().unwrap(),
+            if policy == CachePolicy::ReplayOnly {
+                ExecutionStrategy::Replay
+            } else {
+                configured_strategy(&options).unwrap()
+            }
+        );
+        state.runtime.close_remote().await;
+    }
+}
+
+#[tokio::test]
+async fn proxy_without_causal_lm_does_not_bind_remote_transport() {
+    let mut options = options(None);
+    options.causal_lm = None;
+    options.tokenizer = None;
+    options.responses_backend = ResponsesBackend::Proxy;
+    options.responses_proxy_url = "http://127.0.0.1:1/v1/responses".into();
+    let state = GatewayState::from_options(&options).await.unwrap();
+    assert!(state.responses_proxy.is_some());
+    assert!(state.runtime.remote_registry().is_err());
 }

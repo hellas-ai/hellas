@@ -154,6 +154,7 @@ pub(crate) struct FetchProviderFailure {
 }
 
 pub(crate) struct PendingFetch {
+    pub(in crate::executor) cache: Option<actor::execution::cache::FetchCacheRequest>,
     pub request: PreparedFetchRequest,
     pub provider: Arc<dyn FetchProvider>,
     pub projector: Box<dyn FetchProjector>,

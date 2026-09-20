@@ -1,9 +1,6 @@
-use async_stream::try_stream;
 use axum::body::Bytes;
-use futures::StreamExt;
 use hellas_adaptors::{
-    BackendError, BackendFuture, BackendRequest, BackendStream, ExecutionBackend, OutputEvent,
-    Provenance,
+    BackendError, BackendFuture, BackendRequest, BackendStream, ExecutionBackend,
 };
 use hellas_rpc::fetch::{build_input_events_with_retention, verify_input_events};
 use hellas_rpc::pb::fetch::FetchRequest;
@@ -13,13 +10,13 @@ use serde_json::{Map as JsonMap, Value as JsonValue};
 use std::sync::Arc;
 
 use crate::execution::CliRuntime;
-use hellas_client::iroh::fetch_execution_stream;
-use hellas_client::{ExecutionRoute, FetchExecutionEvent, FetchOutcome};
+use hellas_client::ExecutionRoute;
+use hellas_client::cache::fetch_output_stream;
 
 #[derive(Clone)]
 pub(super) struct ResponsesFetchBackend {
     runtime: CliRuntime,
-    route: ExecutionRoute,
+    route: Option<ExecutionRoute>,
     service: String,
     method: String,
     execution_environment: ContentId,
@@ -31,7 +28,7 @@ pub(super) struct ResponsesFetchBackend {
 impl ResponsesFetchBackend {
     pub(super) fn new(
         runtime: CliRuntime,
-        route: ExecutionRoute,
+        route: Option<ExecutionRoute>,
         target: (&str, &str, ContentId),
         caller_key: ProducerSigningKey,
         assurance: Assurance,
@@ -60,7 +57,7 @@ impl ExecutionBackend for ResponsesFetchBackend {
         Box::pin(async move {
             let ProviderRequestBody { payload, retention } =
                 provider_request_body(&request, &self.request_overrides)?;
-            let (input, input_commitment) = signed_input_events_with_commitment(
+            let (input, _) = signed_input_events_with_commitment(
                 &self.service,
                 &self.method,
                 &payload,
@@ -73,18 +70,29 @@ impl ExecutionBackend for ResponsesFetchBackend {
                 BackendError::failed(format!("failed to sign fetch request: {source}"))
             })?;
             let fetch_request = FetchRequest { input };
-            Ok(BackendStream::new(
-                fetch_events(
-                    self.runtime.clone(),
-                    self.route.clone(),
-                    fetch_request,
-                    self.caller_key.clone(),
-                ),
-                Some(Provenance {
-                    call_commitment: Some(input_commitment),
-                }),
-            ))
+            fetch_output_stream(
+                self.runtime.clone(),
+                fetch_request,
+                self.route.clone(),
+                self.caller_key.clone(),
+                None,
+            )
+            .await
+            .map_err(|error| BackendError::failed(error.to_string()))
         })
+    }
+}
+
+impl super::cache::CacheIdentity for ResponsesFetchBackend {
+    fn cache_key(&self, request: &BackendRequest) -> Result<super::cache::CacheKey, BackendError> {
+        let body = provider_request_body(request, &self.request_overrides)?;
+        super::cache::CacheKey::fetch(
+            self.execution_environment,
+            &self.service,
+            &self.method,
+            &body.payload,
+        )
+        .map_err(|error| BackendError::rejected(error.to_string()))
     }
 }
 
@@ -111,37 +119,6 @@ fn signed_input_events_with_commitment(
         events.iter().map(input_event_to_pb).collect(),
         input_commitment.digest().to_string(),
     ))
-}
-
-fn fetch_events(
-    runtime: CliRuntime,
-    route: ExecutionRoute,
-    request: FetchRequest,
-    runner_key: Arc<ProducerSigningKey>,
-) -> impl futures::Stream<Item = Result<OutputEvent, BackendError>> + Send {
-    try_stream! {
-        let stream = fetch_execution_stream(runtime, request, route, runner_key);
-        tokio::pin!(stream);
-
-        while let Some(event) = stream.next().await {
-            match event.map_err(|err| BackendError::failed(err.to_string()))? {
-                FetchExecutionEvent::Chunk { event, .. } => {
-                    yield event;
-                }
-                FetchExecutionEvent::Done(FetchOutcome::Completed { terminal, .. }) => {
-                    yield terminal.to_output_event();
-                    return;
-                }
-                FetchExecutionEvent::Done(FetchOutcome::Failed { position, error }) => {
-                    Err(BackendError::failed(format!(
-                        "fetch execution failed at position {position}: {error}"
-                    )))?;
-                }
-            }
-        }
-
-        Err(BackendError::failed("fetch execution stream ended without terminal outcome"))?;
-    }
 }
 
 #[derive(Debug)]

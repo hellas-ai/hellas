@@ -317,6 +317,102 @@ async fn one_slow_rpc_does_not_serialize_its_connection() {
 }
 
 #[tokio::test]
+async fn remote_cache_cli_uses_the_nodes_existing_dispatch_and_admin_grant() {
+    use clap::Parser;
+    use hellas_rpc::cache::{
+        CacheKey, CacheKind, CacheOptions, CachePolicy, CacheStore, MemoryCacheStore,
+    };
+
+    let temporary = temp();
+    let identity_path = temporary.path().join("admin.identity");
+    let admin = crate::identity::load_or_create(Some(&identity_path)).unwrap();
+    let server = Endpoint::builder(presets::Minimal)
+        .alpns(vec![CacheControl::ALPN.as_bytes().to_vec()])
+        .bind_addr("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap())
+        .unwrap()
+        .bind()
+        .await
+        .unwrap();
+    let directory = Arc::new(PeerDirectory::with_config(
+        PeerId::from_bytes(*server.id().as_bytes()),
+        hellas_rpc::peer_directory_config(),
+    ));
+    let store = Arc::new(MemoryCacheStore::default());
+    store
+        .insert(&CacheKey::hash(CacheKind::Proxy, &[b"cli"]), b"output", 0)
+        .unwrap();
+    for granted in [false, true] {
+        let mut execution = test_remote_execution();
+        execution.control = CacheController::new(&CacheOptions {
+            policy: CachePolicy::Record,
+            store: Some(store.clone()),
+        });
+        if granted {
+            execution
+                .admin_policy
+                .peers
+                .push(PeerIdentity(*admin.transport_key.public().as_bytes()));
+        }
+        let handler = NodeHandlerImpl::new(
+            server.id(),
+            "admin-test".into(),
+            Vec::new(),
+            directory.clone(),
+        );
+        let manager = directory.manager();
+        let accepting = server.clone();
+        let task = tokio::spawn(async move {
+            let connection = accepting.accept().await.unwrap().await.unwrap();
+            serve_connection::<NodeChain>(
+                connection.alpn().to_vec(),
+                connection,
+                execution,
+                handler,
+                manager,
+                None,
+                None,
+            )
+            .await
+        });
+        let cli = crate::Cli::try_parse_from([
+            "hellas",
+            "--identity",
+            identity_path.to_str().unwrap(),
+            "output-cache",
+            "--node-id",
+            &server.id().to_string(),
+            "--node-addr",
+            &server.bound_sockets()[0].to_string(),
+            "clear",
+        ])
+        .unwrap();
+        let crate::Commands::OutputCache(args) = cli.command else {
+            panic!()
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            crate::commands::output_cache::run(args, None, cli.identity.as_deref()),
+        )
+        .await
+        .unwrap();
+        if granted {
+            result.unwrap();
+            assert!(store.list().unwrap().is_empty());
+        } else {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("administrative access")
+            );
+            assert_eq!(store.list().unwrap().len(), 1);
+        }
+        task.abort();
+    }
+    server.close().await;
+}
+
+#[tokio::test]
 async fn production_fetch_alpn_dispatches_run_ticket_on_its_connection() {
     let alpn = <Fetch as ServiceMarker>::ALPN.as_bytes();
     assert!(served_alpns(false).contains(&alpn.to_vec()));
@@ -1026,6 +1122,8 @@ fn test_remote_execution() -> RemoteExecutionServices {
     )
     .expect("the test remote-execution actor starts");
     RemoteExecutionServices {
+        control: CacheController::new(&Default::default()),
+        admin_policy: AdminPolicy::default(),
         executor,
         open_identity: identity.open_identity(),
     }

@@ -34,9 +34,8 @@ chain = []
 # (EvaluateRequest), so the feature must pull both forward.
 courtesy = ["execute", "evaluate"]
 swarm = []
-# Desktop-host lifecycle control. This package is intentionally omitted from
-# `all-protocols` and from the peer-service alias table: it is carried only by
-# an authenticated local transport.
+# Host administration. Explicitly mounted behind admin authorization, not
+# included in the ordinary peer-service discovery catalogue.
 host-control = []
 all-protocols = ["swarm", "courtesy", "execute", "evaluate", "fetch", "chain"]
 # Paid private work: the canonical authorization, result, invoice, and
@@ -81,6 +80,10 @@ prost-types = "0.14"
 protox = "0.9"
 quote = "1"
 syn = { version = "2", features = ["full"] }
+
+[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
+hellas-wire = { workspace = true, features = ["unix", "ws"] }
+tokio-tungstenite.workspace = true
 
 [dev-dependencies]
 # Real settlement signatures in the paid-work vectors: the kernel's own

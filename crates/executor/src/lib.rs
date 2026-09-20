@@ -64,3 +64,5 @@ pub use worker::{
     DEFAULT_GPU_SESSION_ASSET_BYTES, DEFAULT_GPU_SESSION_PROGRAMS, GpuConfig,
     MAX_GPU_GENERATION_CAPACITY,
 };
+#[cfg(feature = "evaluate")]
+mod inference_cache;

@@ -24,6 +24,8 @@
 //! The Receipt type that owned its only caller is gone for good and did
 //! not come back with it.
 
+pub(in crate::executor) mod cache;
+
 use crate::ExecutorError;
 use crate::StateError;
 use crate::executor::{
@@ -245,6 +247,31 @@ impl Executor {
                         .fetch_state
                         .quoted(input_commitment)
                         .map_err(fetch_execute_error)?;
+                    let cache = self
+                        .fetch_cache
+                        .as_ref()
+                        .map(|cache| {
+                            hellas_rpc::cache::CacheKey::fetch_for_policy(
+                                cache.policy(),
+                                entry.execution_environment(),
+                                &call.service,
+                                &call.method,
+                                call.body.as_bytes(),
+                            )
+                            .and_then(|key| {
+                                key.map(|key| {
+                                    cache::FetchCacheRequest::new(
+                                        cache.clone(),
+                                        key,
+                                        fetch_quote.clone(),
+                                    )
+                                })
+                                .transpose()
+                            })
+                        })
+                        .transpose()
+                        .map_err(|error| ExecutorError::PolicyDenied(error.to_string()))?
+                        .flatten();
                     let execution_id = new_execution_id();
                     let admission = match self.fetch_access_policy.authorize_admission(
                         &fetch_quote.caller_key,
@@ -277,6 +304,7 @@ impl Executor {
                         format!("{}/{}", provider_request.service, provider_request.method);
                     let (sender, receiver) = mpsc::channel(PER_EXECUTION_CHANNEL_CAPACITY);
                     let pending = PendingFetch {
+                        cache,
                         request: provider_request,
                         provider: entry.provider,
                         input_commitment,
@@ -886,6 +914,7 @@ fn spawn_fetch_provider(
 ) {
     tokio::spawn(async move {
         let PendingFetch {
+            cache,
             request,
             provider,
             projector,
@@ -897,15 +926,41 @@ fn spawn_fetch_provider(
             metric_name,
             sender,
         } = pending;
-        let result = run_fetch_provider(
-            provider,
-            request,
-            projector,
-            input_commitment,
-            assurance,
-            &producer_key,
-            sender.clone(),
-        )
+        let result = async {
+            let _guard = if let Some(cache) = &cache {
+                let (recording, guard) = cache.read().await?;
+                if let Some(recording) = recording {
+                    return cache::replay(
+                        recording,
+                        input_commitment,
+                        assurance,
+                        &producer_key,
+                        &sender,
+                    )
+                    .await;
+                }
+                Some(guard)
+            } else {
+                None
+            };
+            let run = run_fetch_provider(
+                provider,
+                request,
+                projector,
+                input_commitment,
+                assurance,
+                &producer_key,
+                sender.clone(),
+            )
+            .await?;
+            if let Some(cache) = &cache {
+                cache.record(&run).await.map_err(|mut error| {
+                    error.position = run.position;
+                    error
+                })?;
+            }
+            Ok(run)
+        }
         .await;
         let _ = completion_tx
             .send(ExecutorCompletion::FetchFinished(Box::new(

@@ -30,6 +30,7 @@ use hellas_executor::{
     FetchTranscriptStoreBackend,
 };
 use hellas_kernel::{EdgeId, NetworkId, Secp256k1Signer, Secp256k1Verifier};
+use hellas_rpc::cache::control::CacheController;
 use hellas_rpc::open::OpenDispatcher;
 use hellas_rpc::pb::work::{
     AcceptWorkRequest, AcceptWorkResponse, AdmitCertificateRequest, AdmitCertificateResponse,
@@ -46,7 +47,8 @@ use hellas_rpc::protocol::work::{
 use hellas_rpc::protocol::work_setup::{
     ProviderChannelPolicy, ReadyChannel, WorkChannelDescriptor,
 };
-use hellas_rpc::serve::{AccountingDispatcher, MethodDispatcher};
+use hellas_rpc::serve::{AccountingDispatcher, AdminPolicy, Authorized, MethodDispatcher};
+use hellas_rpc::services::cache_control::{CacheControl, CacheControlServer};
 use hellas_rpc::services::courtesy::{Courtesy, Open as CourtesyOpen};
 use hellas_rpc::services::execute::RunTicket;
 use hellas_rpc::services::fetch::{Fetch, Open as FetchOpen};
@@ -138,6 +140,8 @@ impl NodeHandle {
 }
 
 pub(super) struct NodeConfig {
+    pub(super) admin_peers: Vec<EndpointId>,
+    pub(super) output_cache: hellas_rpc::cache::CacheOptions,
     pub(super) port: Option<u16>,
     pub(super) execute_policy: ExecutePolicy,
     pub(super) queue_size: usize,
@@ -170,11 +174,22 @@ pub(super) struct NodeConfig {
 
 #[derive(Clone)]
 struct RemoteExecutionServices {
+    control: CacheController,
+    admin_policy: AdminPolicy,
     executor: hellas_executor::ExecutorHandle,
     open_identity: Arc<OpenIdentity>,
 }
 
 pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle> {
+    let control = CacheController::new(&config.output_cache);
+    let admin_policy = AdminPolicy {
+        local_owner: false,
+        peers: config
+            .admin_peers
+            .iter()
+            .map(|peer| hellas_wire::PeerIdentity(*peer.as_bytes()))
+            .collect(),
+    };
     let fetch_store = FetchTranscriptStoreBackend::fs_with_capacity(
         config.artifact_store_path.join("fetch-transcripts"),
         config.fetch_retained_transcript_capacity,
@@ -185,6 +200,7 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
             config.artifact_store_path.join("fetch-quota"),
         ));
     let handle = Executor::spawn_configured(ExecutorSpawnConfig {
+        output_cache: config.output_cache,
         execute_policy: config.execute_policy,
         queue_capacity: config.queue_size,
         metrics: config.metrics.clone(),
@@ -206,7 +222,11 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
     })
     .await
     .context("failed to spawn executor")?;
-    let alpns = served_alpns(config.work.is_some());
+    let advertised_alpns = served_alpns(config.work.is_some());
+    let mut alpns = advertised_alpns.clone();
+    if !admin_policy.peers.is_empty() {
+        alpns.push(CacheControl::ALPN.as_bytes().to_vec());
+    }
     let mut builder = Endpoint::builder(presets::N0)
         .secret_key(config.secret_key)
         .alpns(alpns.clone());
@@ -220,7 +240,7 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
         .await
         .context("failed to bind iroh endpoint")?;
     let node_id = endpoint.id();
-    let discovery = start_server_advertising(&endpoint, &alpns)
+    let discovery = start_server_advertising(&endpoint, &advertised_alpns)
         .context("failed to start service discovery advertising")?;
 
     // -- Construct a shared peer directory.
@@ -255,6 +275,8 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
     // handle live in every remote-execution handler and, when paid work is
     // configured, in its mount as well.
     let remote_execution = RemoteExecutionServices {
+        control,
+        admin_policy,
         executor: handle.clone(),
         open_identity: config.open_identity,
     };
@@ -376,7 +398,16 @@ where
     // of the data that `PeerDirectory::ranked_known_peers` consumes
     // when surfacing `Node/get_known_peers`; without this wrapper
     // the directory the node hands out is always empty.
-    if alpn == <Courtesy as ServiceMarker>::ALPN.as_bytes() {
+    if alpn == CacheControl::ALPN.as_bytes() {
+        serve_loop(
+            transport,
+            Authorized {
+                service: CacheControlServer(remote_execution.control),
+                policy: remote_execution.admin_policy,
+            },
+        )
+        .await
+    } else if alpn == <Courtesy as ServiceMarker>::ALPN.as_bytes() {
         let server = AccountingDispatcher::new(
             OpenDispatcher::<_, _, CourtesyOpen>::new(
                 MethodDispatcher::<_, _, RunTicket>::new(

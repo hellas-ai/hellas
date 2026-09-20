@@ -5,7 +5,6 @@ mod access;
 mod anthropic;
 mod backend;
 mod dispatch;
-mod execution;
 mod fetch_backend;
 mod metrics;
 mod openai;
@@ -23,6 +22,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
 use futures::Stream;
+use hellas_client::{cache, execution};
 use hellas_rpc::ProducerSigningKey;
 use iroh::{EndpointId, SecretKey};
 use serde::Serialize;
@@ -46,6 +46,7 @@ const DEFAULT_HTTP_PORT: u16 = 8080;
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 pub struct GatewayOptions {
+    pub output_cache: cache::CacheOptions,
     pub host: String,
     pub port: Option<u16>,
     pub node_id: Option<EndpointId>,
@@ -64,7 +65,7 @@ pub struct GatewayOptions {
     pub model_name: String,
     /// Strict canonical Catena causal-LM manifest and locally checked root
     /// metadata, bound to an independent caller pin.
-    pub causal_lm: CausalLmExecutionEnvironment,
+    pub causal_lm: Option<CausalLmExecutionEnvironment>,
     /// Locally available Xet content used by a local execution leg. The
     /// executor may only reopen the objects named below the manifest root; it
     /// does not fetch or compile while admitting the environment.
@@ -72,7 +73,7 @@ pub struct GatewayOptions {
     pub local_content_store: Option<hellas_store::ContentStore>,
     /// Application-selected tokenizer used only before and after execution.
     /// It is not part of the Catena environment or Hellas execution claim.
-    pub tokenizer: PathBuf,
+    pub tokenizer: Option<PathBuf>,
     /// Application-selected stop IDs sent explicitly with every request.
     pub stop_token_ids: Vec<u32>,
     pub metrics_port: Option<u16>,
