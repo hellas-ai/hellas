@@ -475,7 +475,7 @@ pub(crate) fn edge_object_id(id: hellas_kernel::EdgeId) -> ObjectId {
 /// consensus state that no owner owns, so nothing outside execution
 /// addresses one.
 #[must_use]
-#[cfg(feature = "validator")]
+#[cfg(any(feature = "validator", feature = "explorer-origin"))]
 pub(crate) fn registry_chunk_object_id(id: hellas_kernel::RegistryChunkId) -> ObjectId {
     ObjectId::from(id.to_bytes())
 }

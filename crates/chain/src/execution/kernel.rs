@@ -4,16 +4,19 @@ use crate::domain::{
     SettlementKey, Transaction, coin_object_id, edge_object_id, genesis_object_id,
     merge_input_fault, output_object_id, registry_chunk_object_id,
 };
-use commonware_codec::{Encode, EncodeSize};
+use commonware_codec::Encode;
+#[cfg(any(feature = "validator", test))]
+use commonware_codec::EncodeSize;
 use commonware_cryptography::{Hasher, Sha256};
 use commonware_glue::stateful::db::DatabaseSet;
 use commonware_runtime::Spawner;
 use commonware_storage::Context as StorageContext;
+#[cfg(any(feature = "validator", test))]
+use hellas_kernel::InvalidProofReason;
 use hellas_kernel::{
     ApplyError, CloseKind, Coin as KernelCoin, CoinId, Context as KernelContext, EdgeId, Event,
-    EventKind, InvalidProofReason, Move as KernelMove, Proof as KernelProof, RegistryChunkId,
-    RegistryDiff, State, TermsProfile, Tx as KernelTx, bond_lease_slots,
-    pending_payment_close_slot,
+    EventKind, Move as KernelMove, Proof as KernelProof, RegistryChunkId, RegistryDiff, State,
+    TermsProfile, Tx as KernelTx, bond_lease_slots, pending_payment_close_slot,
 };
 use thiserror::Error;
 use tracing::warn;
@@ -58,6 +61,7 @@ pub enum ExecutionError {
     EdgeLifetimeExceeded { blocks: u64, max: u64 },
 }
 
+#[cfg(any(feature = "validator", test))]
 impl ExecutionError {
     pub fn is_transient_for_mempool(&self) -> bool {
         matches!(
@@ -108,6 +112,7 @@ where
         .map_err(storage_err)
 }
 
+#[cfg(any(feature = "validator", test))]
 pub async fn execute_all<E>(
     context: KernelContext,
     verifier: &ChainVerifier,
@@ -128,6 +133,7 @@ where
     Ok(batches)
 }
 
+#[cfg(any(feature = "validator", test))]
 pub async fn execute_proposal<E>(
     context: KernelContext,
     verifier: &ChainVerifier,
@@ -179,6 +185,7 @@ where
     Ok((batches, included, retained))
 }
 
+#[cfg(any(feature = "validator", test))]
 fn response_contest_was_removed(transaction: &Transaction, error: &ExecutionError) -> bool {
     let Transaction::Kernel(KernelTx::Move {
         action: KernelMove::RespondPaymentClose(response),
@@ -778,6 +785,19 @@ async fn apply_kernel_transaction<E>(
 where
     E: StorageContext + Spawner + Send + Sync + 'static,
 {
+    apply_kernel_transaction_observed(batches, context, verifier, tx, None).await
+}
+
+async fn apply_kernel_transaction_observed<E>(
+    batches: Batch<E>,
+    context: KernelContext,
+    verifier: &ChainVerifier,
+    tx: &KernelTx,
+    changes: Option<&mut Vec<(ObjectId, Option<Object>)>>,
+) -> Result<Batch<E>, (Batch<E>, ExecutionError)>
+where
+    E: StorageContext + Spawner + Send + Sync + 'static,
+{
     if let Err(err) = check_open(context, tx) {
         return Err((batches, err));
     }
@@ -807,8 +827,100 @@ where
     let (batches, replay_error) = replay_kernel_registry(batches, &working, outcome.registry());
     match replay_error {
         Some(error) => Err((batches, error)),
-        None => Ok(batches),
+        None => {
+            if let Some(changes) = changes {
+                if let Some(event) = outcome.public_event() {
+                    match event.kind() {
+                        EventKind::EdgeOpened { inputs, output } => {
+                            changes.extend(inputs.iter().map(|id| (coin_object_id(*id), None)));
+                            changes.push((
+                                edge_object_id(*output),
+                                working.edge(*output).map(Object::Edge),
+                            ));
+                        }
+                        EventKind::EdgeClosed { input, outputs } => {
+                            changes.push((edge_object_id(*input), None));
+                            changes.extend(outputs.iter().map(|id| {
+                                (
+                                    coin_object_id(*id),
+                                    working.coin(*id).map(|coin| Object::Coin(Coin::from(coin))),
+                                )
+                            }));
+                        }
+                    }
+                }
+                changes.extend(outcome.registry().into_iter().map(|mutation| {
+                    (
+                        registry_chunk_object_id(mutation.id()),
+                        mutation.chunk().map(Object::RegistryChunk),
+                    )
+                }));
+            }
+            Ok(batches)
+        }
     }
+}
+
+/// Finalized replay with the authoritative kernel object and registry diffs.
+/// Owner metadata remains in the QMDB batch and therefore participates in its root;
+/// the public object projection stores only spendable/edge/registry objects.
+#[cfg(feature = "explorer-origin")]
+pub(crate) async fn execute_all_observed<E>(
+    context: KernelContext,
+    verifier: &ChainVerifier,
+    txs: &[Transaction],
+    genesis_allocations: &[(SettlementKey, u64)],
+    batches: Batch<E>,
+) -> Result<(Batch<E>, Vec<(ObjectId, Option<Object>)>), ExecutionError>
+where
+    E: StorageContext + Spawner + Send + Sync + 'static,
+{
+    let mut batches = maybe_seed_genesis(context, genesis_allocations, batches).await?;
+    let mut changes = Vec::new();
+    if context.block_height().get() == 1 {
+        for (index, (owner, value)) in genesis_allocations.iter().enumerate() {
+            let index = u16::try_from(index)
+                .map_err(|_| ExecutionError::Storage("too many genesis allocations".into()))?;
+            changes.push((
+                genesis_object_id(index),
+                Some(Object::Coin(Coin {
+                    owner: *owner,
+                    value: *value,
+                })),
+            ));
+        }
+    }
+    for tx in txs {
+        if let Transaction::Kernel(kernel) = tx {
+            batches = apply_kernel_transaction_observed(
+                batches,
+                context,
+                verifier,
+                kernel,
+                Some(&mut changes),
+            )
+            .await
+            .map_err(|(_, error)| error)?;
+        } else {
+            batches = apply_transaction(batches, context, verifier, tx)
+                .await
+                .map_err(|(_, error)| error)?;
+            let digest = Sha256::hash(&tx.encode());
+            let mut ids = vec![output_object_id(&digest, 0)];
+            match tx {
+                Transaction::Transfer { input, .. } => {
+                    ids.push(*input);
+                    ids.push(output_object_id(&digest, 1));
+                }
+                Transaction::MergeCoin { inputs, .. } => ids.extend(inputs.iter().copied()),
+                Transaction::Kernel(_) => unreachable!(),
+            }
+            for id in ids {
+                changes.push((id, batches.get(&id).await.map_err(storage_err)?));
+            }
+        }
+    }
+    Ok((batches, changes))
 }
 
 #[cfg(test)]
