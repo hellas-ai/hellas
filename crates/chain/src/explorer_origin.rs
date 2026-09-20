@@ -361,6 +361,57 @@ struct AddressQuery {
 fn address_limit() -> u32 {
     crate::owner_proof::OWNER_PAGE_LIMIT
 }
+
+#[derive(Clone, PartialEq, prost::Message, serde::Serialize)]
+struct OwnerSnapshotError {
+    #[prost(uint32, tag = "1")]
+    schema_version: u32,
+    #[prost(string, tag = "2")]
+    network_id: String,
+    #[prost(string, tag = "3")]
+    code: String,
+    #[prost(string, tag = "4")]
+    message: String,
+    #[prost(string, optional, tag = "5")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    latest_url: Option<String>,
+}
+
+fn owner_snapshot_unavailable(
+    network_id: &str,
+    owner: crate::domain::SettlementKey,
+    protobuf: bool,
+) -> Response {
+    let error = OwnerSnapshotError {
+        schema_version: PROOF_SCHEMA_VERSION,
+        network_id: network_id.into(),
+        code: "snapshot_unavailable".into(),
+        message: "The requested verified owner snapshot is unavailable. Request latest holdings explicitly.".into(),
+        latest_url: Some(format!("/addresses/{owner}")),
+    };
+    let (content_type, bytes) = if protobuf {
+        (
+            "application/x-protobuf",
+            prost::Message::encode_to_vec(&error),
+        )
+    } else {
+        (
+            "application/json",
+            serde_json::to_vec(&error).expect("owner error serializes"),
+        )
+    };
+    (
+        StatusCode::CONFLICT,
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::CACHE_CONTROL, "no-store"),
+            (header::VARY, "Accept"),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
 async fn address(
     State(state): State<OriginState>,
     Path(owner): Path<String>,
@@ -374,12 +425,22 @@ async fn address(
     let Some(protobuf) = representation(&default_proof_accept(headers, &uri)) else {
         return failure(StatusCode::NOT_ACCEPTABLE, "unsupported representation");
     };
+    if query
+        .payload
+        .as_ref()
+        .is_some_and(|payload| digest(payload).is_none())
+    {
+        return failure(StatusCode::BAD_REQUEST, "invalid payload");
+    }
     let Some(snapshot) = state
         .owners
         .read()
         .expect("owner snapshot lock")
         .get(query.payload.as_deref())
     else {
+        if query.payload.is_some() {
+            return owner_snapshot_unavailable(&state.network_id, owner, protobuf);
+        }
         return failure(
             StatusCode::SERVICE_UNAVAILABLE,
             "requested verified owner snapshot is unavailable or still catching up",
@@ -1040,6 +1101,99 @@ mod tests {
                 state.owners.read().unwrap().get(None).unwrap().block.height,
                 2
             );
+
+            // Evict the historical snapshot while retaining a valid latest one.
+            // The retention policy itself is exercised by the snapshot-cache test.
+            {
+                let mut snapshots = state.owners.write().unwrap();
+                let (_, expired) = snapshots.by_height.pop_first().unwrap();
+                snapshots.by_payload.remove(&expired.block.payload);
+            }
+            for missing in [hex::encode(block.digest()), "00".repeat(32)] {
+                for accept in ["application/json", "application/x-protobuf"] {
+                    let response = app
+                        .clone()
+                        .oneshot(
+                            axum::http::Request::builder()
+                                .uri(format!("/api/v1/addresses/{owner}/proof?payload={missing}"))
+                                .header(header::ACCEPT, accept)
+                                .body(axum::body::Body::empty())
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status(), StatusCode::CONFLICT);
+                    assert_eq!(response.headers()[header::CONTENT_TYPE], accept);
+                    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+                    let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                        .await
+                        .unwrap();
+                    let json = if accept == "application/json" {
+                        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+                    } else {
+                        let error = <OwnerSnapshotError as prost::Message>::decode(bytes).unwrap();
+                        serde_json::to_value(error).unwrap()
+                    };
+                    assert_eq!(json["schema_version"], PROOF_SCHEMA_VERSION);
+                    assert_eq!(json["network_id"], HELLAS_DEVNET_1_ID);
+                    assert_eq!(json["code"], "snapshot_unavailable");
+                    assert_eq!(json["latest_url"], format!("/addresses/{owner}"));
+                    assert!(json["message"].as_str().unwrap().contains("unavailable"));
+                    assert!(json.get("block").is_none());
+                }
+            }
+            for malformed in ["", "bad", &"A".repeat(64), &"g".repeat(64)] {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        axum::http::Request::builder()
+                            .uri(format!(
+                                "/api/v1/addresses/{owner}/proof?payload={malformed}"
+                            ))
+                            .body(axum::body::Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            }
+            // A caller can explicitly follow latest; a missing pin never does so.
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(format!("/api/v1/addresses/{owner}/proof"))
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(
+                response.into_body(),
+                crate::verified_explorer::MAX_PROOF_BYTES,
+            )
+            .await
+            .unwrap();
+            let latest =
+                <crate::verified_explorer::AddressProofBundle as prost::Message>::decode(bytes)
+                    .unwrap();
+            let latest = verifier.verify_address(latest, owner, 0, 64).unwrap();
+            assert_eq!(latest.block().view().height(), 2);
+            assert_eq!(latest.summary().balance, 999);
+
+            *state.owners.write().unwrap() = OwnerSnapshots::default();
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(format!("/api/v1/addresses/{owner}/proof"))
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 
             for uri in [
                 "/api/v1/blocks/1/proof".to_owned(),
