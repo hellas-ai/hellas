@@ -8,6 +8,8 @@
   extraChecks ? { },
 }:
 let
+  isValidatorHost = pkgs.stdenv.hostPlatform.system == "x86_64-linux";
+
   mk =
     name: cmd: inputs:
     pkgs.writeShellApplication {
@@ -48,16 +50,18 @@ let
     clippy-features = mk "check-clippy-features" (builtins.concatStringsSep " && " (
       map
         (f: "cargo clippy -p hellas-cli --no-default-features --features ${f} --all-targets -- -D warnings")
-        [
-          "chain"
-          "indexer"
-          "validator"
-          "evaluate"
-          "node"
-          "llm"
-          "gateway"
-          "otel"
-        ]
+        (
+          [
+            "chain"
+            "indexer"
+            "evaluate"
+            "node"
+            "llm"
+            "gateway"
+            "otel"
+          ]
+          ++ lib.optionals isValidatorHost [ "validator" ]
+        )
     )) (cargoEnv rustToolchain);
     # The kernel's whole suite, including `tests/itf.rs` — the Quint↔Rust
     # replay that the entire abstract-correspondence story rests on — and
@@ -179,7 +183,17 @@ let
     );
   };
 
-  checks = baseChecks // extraChecks;
+  checks =
+    (
+      if isValidatorHost then
+        baseChecks
+      else
+        builtins.removeAttrs baseChecks [
+          "validator"
+          "chain-setup"
+        ]
+    )
+    // extraChecks;
 
   # Auto-fix variants. Not all checks have one (e.g. test, wasm-rpc).
   fixes = {
@@ -204,7 +218,6 @@ let
   # `nix build .#packages.<system>.<attr>`.
   ciBuilds = {
     cli = "cli";
-    cli-validator = "cli-validator";
     static-x86_64 = "cross-x86_64-linux-musl-cli";
     static-aarch64 = "cross-aarch64-linux-musl-cli";
     hellas-rpc-wasm = "hellas-rpc-wasm";
@@ -214,7 +227,8 @@ let
   }
   # CUDA and HIP images are intentionally omitted from the hosted matrix.
   # Build them on the self-hosted release runner once it is registered again.
-  // lib.optionalAttrs (pkgs.stdenv.hostPlatform.system == "x86_64-linux") {
+  // lib.optionalAttrs isValidatorHost {
+    cli-validator = "cli-validator";
     cli-catena = "cli-catena";
   };
 in

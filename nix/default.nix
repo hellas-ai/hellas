@@ -440,10 +440,11 @@ let
   };
 
   hydraPackages = {
-    inherit (nativePackages) cli cli-validator;
+    inherit (nativePackages) cli;
   }
   // lib.optionalAttrs isX86_64Linux {
-    inherit (nativePackages) cli-catena;
+    # Validators are deployed only on x86; ARM workers build the client/node CLI.
+    inherit (nativePackages) cli-catena cli-validator;
     static-x86_64 = crossPackages.cross-x86_64-linux-musl-cli;
     static-aarch64 = crossPackages.cross-aarch64-linux-musl-cli;
     inherit (linuxOutputs.packages) docker;
