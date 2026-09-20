@@ -383,36 +383,83 @@ async fn run_one(
 ) -> CliResult<()> {
     let prepared = read_prepared_input(&args.prepared_input)?;
     let endpoint = bind_paid_endpoint(transport_key).await?;
-    run_channel(args, Some(prepared), endpoint, settlement_key, false, None).await?;
+    let mut channel = OpenPaidChannel::open(args, endpoint, settlement_key).await?;
+    println!(
+        "bond_edge: {}",
+        hex::encode(channel.descriptor.bond_edge().to_bytes())
+    );
+    println!(
+        "payment_edge: {}",
+        hex::encode(channel.descriptor.channel().payment_edge().to_bytes())
+    );
+    println!(
+        "channel_id: {}",
+        hex::encode(channel.descriptor.channel().id().as_bytes())
+    );
+    let result = channel
+        .run(Some(prepared), false, None)
+        .await?
+        .context("paid execution returned no result")?;
+    println!("work_id: {}", hex::encode(result.work_id.as_bytes()));
+    println!("job_price: {}", result.job_price);
+    println!("credited_cumulative: {}", result.credited_cumulative);
+    println!("authenticated_result: true");
+    if let Some(output) = channel.args.output.as_ref() {
+        std::fs::write(output, &result.transcript).with_context(|| {
+            format!("failed to write result transcript to {}", output.display())
+        })?;
+        println!(
+            "result: {} ({} bytes)",
+            output.display(),
+            result.transcript.len()
+        );
+    } else {
+        println!("result_bytes: {}", result.transcript.len());
+    }
+    if channel.args.settle {
+        channel
+            .client
+            .prepare_close()
+            .context("failed to prepare the client payment close")?;
+        loop {
+            match channel
+                .client
+                .advance_close(&channel.chain, &channel.chain)
+                .await
+                .context("failed to advance the client payment close")?
+            {
+                CloseProgress::Settled { provider_payout } => {
+                    println!("settled: true");
+                    println!("settled_provider_payout: {provider_payout}");
+                    println!(
+                        "settled_finalized_height: {}",
+                        channel.client.state().cursor().0
+                    );
+                    break;
+                }
+                CloseProgress::Submitted { outcome, .. } => {
+                    tracing::info!(?outcome, "client payment close submitted");
+                }
+                CloseProgress::Opened { .. } | CloseProgress::Nothing => {}
+            }
+            tokio::time::sleep(channel.config.poll).await;
+        }
+    } else {
+        println!("settled: false");
+    }
+    println!("client_journals: {}", channel.args.journal_root.display());
     Ok(())
 }
 
 struct PaidOutput {
+    work_id: hellas_rpc::Digest,
+    job_price: u64,
+    credited_cumulative: u64,
     transcript: Vec<u8>,
     #[cfg(feature = "gateway")]
     provider_key: hellas_rpc::PublicKey,
     #[cfg(feature = "gateway")]
     input: hellas_rpc::InputCommitment,
-}
-
-async fn run_channel(
-    args: RunArgs,
-    prepared: Option<PreparedPaidInputV1>,
-    endpoint: Endpoint,
-    settlement_key: Secp256k1Signer,
-    recover: bool,
-    progress: Option<hellas_work::work::PaidProgress>,
-) -> CliResult<Option<PaidOutput>> {
-    if prepared.is_none()
-        && (!args.journal_root.try_exists()?
-            || std::fs::read_dir(&args.journal_root)?.next().is_none())
-    {
-        return Ok(None);
-    }
-    OpenPaidChannel::open(args, endpoint, settlement_key)
-        .await?
-        .run(prepared, recover, progress)
-        .await
 }
 
 struct OpenPaidChannel {
@@ -513,18 +560,6 @@ impl OpenPaidChannel {
             drive_setup(&setup_service, &policy, &chain, config.poll).await?;
         let ready = ready_channel(&descriptor, &chain).await?;
         let client = ClientEndpoint::new(ready.clone(), mounted, settlement_key)?;
-        println!(
-            "bond_edge: {}",
-            hex::encode(descriptor.bond_edge().to_bytes())
-        );
-        println!(
-            "payment_edge: {}",
-            hex::encode(descriptor.channel().payment_edge().to_bytes()),
-        );
-        println!(
-            "channel_id: {}",
-            hex::encode(descriptor.channel().id().as_bytes()),
-        );
 
         Ok(Self {
             args,
@@ -665,47 +700,6 @@ impl OpenPaidChannel {
             None => None,
         };
         *needs_recovery = false;
-        if let Some(result) = result.as_ref() {
-            if let Some(output) = args.output.as_ref() {
-                std::fs::write(output, &result.transcript).with_context(|| {
-                    format!("failed to write result transcript to {}", output.display())
-                })?;
-                println!(
-                    "result: {} ({} bytes)",
-                    output.display(),
-                    result.transcript.len()
-                );
-            } else {
-                println!("result_bytes: {}", result.transcript.len());
-            }
-        }
-        if args.settle {
-            client
-                .prepare_close()
-                .context("failed to prepare the client payment close")?;
-            loop {
-                match client
-                    .advance_close(&*chain, &*chain)
-                    .await
-                    .context("failed to advance the client payment close")?
-                {
-                    CloseProgress::Settled { provider_payout } => {
-                        println!("settled: true");
-                        println!("settled_provider_payout: {provider_payout}");
-                        println!("settled_finalized_height: {}", client.state().cursor().0);
-                        break;
-                    }
-                    CloseProgress::Submitted { outcome, .. } => {
-                        tracing::info!(?outcome, "client payment close submitted");
-                    }
-                    CloseProgress::Opened { .. } | CloseProgress::Nothing => {}
-                }
-                tokio::time::sleep(config.poll).await;
-            }
-        } else {
-            println!("settled: false");
-        }
-        println!("client_journals: {}", args.journal_root.display());
         Ok(result)
     }
 }
@@ -812,8 +806,6 @@ async fn execute_paid_job(
             false,
         ),
     };
-    println!("work_id: {}", hex::encode(work_id.as_bytes()));
-
     let transcript = if already_collected {
         client
             .state()
@@ -843,17 +835,10 @@ async fn execute_paid_job(
         collect_until_ready(dialer, client, ready, chain, work_id, poll).await?
     };
     let credited = pay_for_result(dialer.work().await?, client, work_id).await?;
-    tracing::info!(
-        provider = %args.provider,
-        work_id = %hex::encode(work_id.as_bytes()),
-        job_price = ready.execution_policy().fixed_price,
-        credited_cumulative = credited,
-        "paid inference result acknowledged",
-    );
-    println!("job_price: {}", ready.execution_policy().fixed_price);
-    println!("credited_cumulative: {credited}");
-    println!("authenticated_result: true");
     Ok(PaidOutput {
+        work_id,
+        job_price: ready.execution_policy().fixed_price,
+        credited_cumulative: credited,
         transcript,
         #[cfg(feature = "gateway")]
         provider_key: hellas_rpc::PublicKey::Secp256k1(ready.channel().provider_key().to_bytes()),

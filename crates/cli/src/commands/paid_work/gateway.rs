@@ -386,5 +386,12 @@ fn output_events(output: PaidOutput) -> CliResult<Vec<ExecutionEvent>> {
         text_artifact: terminal.text_artifact,
         output_events: events,
     }));
+    tracing::info!(
+        work_id = %hex::encode(output.work_id.as_bytes()),
+        job_price = output.job_price,
+        credited_cumulative = output.credited_cumulative,
+        result_bytes = output.transcript.len(),
+        "paid inference result acknowledged",
+    );
     Ok(result)
 }

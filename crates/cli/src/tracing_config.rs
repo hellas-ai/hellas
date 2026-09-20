@@ -1,8 +1,13 @@
+use std::io::IsTerminal as _;
 use std::path::Path;
 use std::sync::OnceLock;
 
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::fmt::format::{FormatEvent, FormatFields, Writer};
+use tracing_subscriber::fmt::time::FormatTime as _;
+use tracing_subscriber::fmt::{FmtContext, time};
 use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::reload;
 
 #[cfg(feature = "otel")]
@@ -20,11 +25,41 @@ type FilterHandle = reload::Handle<EnvFilter, tracing_subscriber::Registry>;
 static LOG_FILTER: OnceLock<FilterHandle> = OnceLock::new();
 
 fn base_env_filter() -> EnvFilter {
-    EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("warn"))
+    with_default_directives(
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
+    )
+}
+
+fn with_default_directives(filter: EnvFilter) -> EnvFilter {
+    filter
         .add_directive("hellas_request=info".parse().unwrap())
         .add_directive("noq::connection=error".parse().unwrap())
         .add_directive("netlink_packet_route=error".parse().unwrap())
+        .add_directive("iroh::net_report=error".parse().unwrap())
+        .add_directive("iroh::address_lookup=error".parse().unwrap())
+}
+
+/// Local logs contain event fields; request span attributes belong to traces.
+/// The built-in compact formatter also appends ancestor span fields.
+struct EventOnly;
+
+impl<S, N> FormatEvent<S, N> for EventOnly
+where
+    S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+    N: for<'a> FormatFields<'a> + 'static,
+{
+    fn format_event(
+        &self,
+        ctx: &FmtContext<'_, S, N>,
+        mut writer: Writer<'_>,
+        event: &tracing::Event<'_>,
+    ) -> std::fmt::Result {
+        time::SystemTime.format_time(&mut writer)?;
+        let metadata = event.metadata();
+        write!(writer, " {} {}: ", metadata.level(), metadata.target())?;
+        ctx.field_format().format_fields(writer.by_ref(), event)?;
+        writeln!(writer)
+    }
 }
 
 /// Initialise the tracing subscriber.
@@ -45,7 +80,10 @@ pub fn init_tracing(log_file: Option<&Path>) -> TracerGuard {
     let (filter_layer, filter_handle) = reload::Layer::new(base_env_filter());
     let _ = LOG_FILTER.set(filter_handle);
 
-    let fmt_layer = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .event_format(EventOnly)
+        .with_ansi(std::io::stderr().is_terminal())
+        .with_writer(std::io::stderr);
     let file_layer = log_file.and_then(|path| {
         // Open append-mode so successive runs accumulate; line-buffered
         // happens naturally per-event because the fmt layer flushes
@@ -57,6 +95,7 @@ pub fn init_tracing(log_file: Option<&Path>) -> TracerGuard {
         {
             Ok(f) => Some(
                 tracing_subscriber::fmt::layer()
+                    .event_format(EventOnly)
                     .with_writer(std::sync::Mutex::new(f))
                     .with_ansi(false),
             ),
@@ -91,4 +130,53 @@ pub fn suppress_execute_tail_logs() {
         .add_directive("acto::tokio=off".parse().unwrap());
 
     let _ = handle.reload(filter);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn journal_keeps_event_fields_and_transport_errors_without_span_or_warning_noise() {
+        let output = tempfile::NamedTempFile::new().unwrap();
+        let subscriber = tracing_subscriber::registry()
+            .with(with_default_directives(EnvFilter::new("warn")))
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .event_format(EventOnly)
+                    .with_ansi(false)
+                    .with_writer(output.reopen().unwrap()),
+            );
+        tracing::subscriber::with_default(subscriber, || {
+            let _request = tracing::info_span!(
+                target: "hellas_request", "http.server",
+                otel.kind = "server", http.route = "/v1/chat/completions",
+            )
+            .entered();
+            let _payment = tracing::info_span!(
+                target: "hellas_request", "paid.gateway",
+                hellas.provider.id = "provider-span-only",
+            )
+            .entered();
+            tracing::info!(target: "hellas_request", credited_cumulative = 17, "paid completion");
+            tracing::warn!(target: "iroh::net_report::report", "routine address warning");
+            tracing::warn!(target: "iroh::address_lookup::pkarr", "routine discovery warning");
+            tracing::error!(target: "iroh::net_report::report", "report failed");
+            tracing::error!(target: "iroh::address_lookup::pkarr", "lookup failed");
+        });
+        let output = std::fs::read_to_string(output.path()).unwrap();
+        assert_eq!(output.lines().count(), 3, "{output}");
+        assert!(output.contains("paid completion credited_cumulative=17"));
+        assert!(output.contains("ERROR iroh::net_report::report: report failed"));
+        assert!(output.contains("ERROR iroh::address_lookup::pkarr: lookup failed"));
+        for absent in [
+            "otel.kind",
+            "http.route",
+            "paid.gateway",
+            "provider-span-only",
+            "routine",
+        ] {
+            assert!(!output.contains(absent), "{output}");
+        }
+    }
 }
