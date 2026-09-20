@@ -8,7 +8,7 @@ use crate::{
         store::{UtxoDatabase, UtxoDb, utxo_db_config},
     },
     verified_explorer::{
-        AddressProofBundle, ExplorerQuery, ExplorerVerifier, PROOF_SCHEMA_VERSION, ProofBundle,
+        ExplorerQuery, ExplorerVerifier, ProofBundle, VerifiedAddress, VerifiedBlock,
     },
 };
 use commonware_codec::DecodeExt as _;
@@ -25,7 +25,7 @@ pub(crate) struct Replay<E: StorageContext + Spawner> {
     allocations: Vec<(SettlementKey, u64)>,
     genesis: HellasBlock,
     cursor: u64,
-    checkpoint: Option<ProofBundle>,
+    checkpoint: Option<VerifiedBlock>,
 }
 impl<E: StorageContext + Spawner + Send + Sync + 'static> Replay<E> {
     pub async fn new(
@@ -84,9 +84,10 @@ impl<E: StorageContext + Spawner + Send + Sync + 'static> Replay<E> {
         }
         // Recovery must complete before the HTTP origin exposes any state.
         // Check the durable owner tree and sync range as well as the QMDB root.
-        if let Some(proof) = &latest {
-            Self::check_checkpoint(&database, proof, verifier).await?;
-        }
+        let checkpoint = match &latest {
+            Some(proof) => Some(Self::check_checkpoint(&database, proof, verifier).await?),
+            None => None,
+        };
         let cursor = latest.as_ref().map_or(0, |proof| proof.height);
         Ok(Self {
             database,
@@ -95,7 +96,7 @@ impl<E: StorageContext + Spawner + Send + Sync + 'static> Replay<E> {
             allocations,
             genesis,
             cursor,
-            checkpoint: latest,
+            checkpoint,
         })
     }
     pub fn next_height(&self) -> Result<u64> {
@@ -108,7 +109,7 @@ impl<E: StorageContext + Spawner + Send + Sync + 'static> Replay<E> {
         database: &UtxoDatabase<E>,
         proof: &ProofBundle,
         verifier: &ExplorerVerifier,
-    ) -> Result<()> {
+    ) -> Result<VerifiedBlock> {
         let verified = verifier.verify(
             proof.clone(),
             ExplorerQuery::Block(FinalizedBlockQuery::Height(proof.height)),
@@ -124,7 +125,7 @@ impl<E: StorageContext + Spawner + Send + Sync + 'static> Replay<E> {
         {
             return Err("durable owner checkpoint does not match certified state".into());
         }
-        Ok(())
+        Ok(verified)
     }
 
     /// Read current holdings from the very QMDB state committed by replay.
@@ -132,22 +133,17 @@ impl<E: StorageContext + Spawner + Send + Sync + 'static> Replay<E> {
     /// No retained historical tree or follower archive is needed after reopening.
     pub async fn owner_proof(
         &self,
-        verifier: &ExplorerVerifier,
         owner: SettlementKey,
         offset: u64,
         limit: u32,
         payload: Option<&str>,
-    ) -> Result<Option<AddressProofBundle>> {
-        let Some(proof) = &self.checkpoint else {
+    ) -> Result<Option<VerifiedAddress>> {
+        let Some(verified) = &self.checkpoint else {
             return Ok(None);
         };
-        if payload.is_some_and(|payload| payload != proof.payload) {
+        if payload.is_some_and(|payload| payload != verified.bundle().payload) {
             return Ok(None);
         }
-        let verified = verifier.verify(
-            proof.clone(),
-            ExplorerQuery::Block(FinalizedBlockQuery::Height(proof.height)),
-        )?;
         // One read guard covers every node and the root check. The outer Replay
         // lock also excludes the finalize -> index-publication interval.
         let database = self.database.read().await;
@@ -160,16 +156,26 @@ impl<E: StorageContext + Spawner + Send + Sync + 'static> Replay<E> {
         let page =
             crate::execution::owner_tree::prove_stored_owner_page(&database, owner, offset, limit)
                 .await?;
-        let bundle = AddressProofBundle {
-            schema_version: PROOF_SCHEMA_VERSION,
-            block: Some(proof.clone()),
-            page: serde_json::to_vec(&page)?,
-        };
-        verifier.verify_address(bundle.clone(), owner, offset, limit)?;
-        Ok(Some(bundle))
+        // The immutable checkpoint was certified on admission or disk recovery.
+        // Only owner-page hashes are checked here; no signature work holds Replay.
+        Ok(Some(verified.clone().verify_owner_page(
+            serde_json::to_vec(&page)?,
+            owner,
+            offset,
+            limit,
+        )?))
     }
 
-    pub async fn apply(&mut self, block: &HellasBlock, proof: ProofBundle) -> Result<()> {
+    pub async fn apply(&mut self, block: &HellasBlock, verified: VerifiedBlock) -> Result<()> {
+        if block.digest() != verified.view().payload() {
+            return Err("replay block differs from certified checkpoint".into());
+        }
+        let proof = verified.bundle();
+        if proof.network_id != self.index.store.identity.network_id
+            || proof.trust_sha256 != self.index.store.identity.trust_sha256
+        {
+            return Err("replay checkpoint uses a different trust configuration".into());
+        }
         let height = block.height().get();
         if height <= self.cursor {
             // Archive redelivery is harmless only when it is the exact same finalized payload.
@@ -236,7 +242,7 @@ impl<E: StorageContext + Spawner + Send + Sync + 'static> Replay<E> {
         self.database.finalize(merkleized).await;
         self.index.store.publish_intent()?;
         self.cursor = height;
-        self.checkpoint = Some(proof);
+        self.checkpoint = Some(verified);
         Ok(())
     }
 }
