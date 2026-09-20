@@ -10,7 +10,7 @@ use crate::{
 use commonware_actor::Feedback;
 use commonware_codec::{DecodeExt, Encode};
 use commonware_consensus::{
-    CertifiableBlock, Heightable, Reporter,
+    Block as _, CertifiableBlock, Heightable, Reporter,
     marshal::{
         self, Identifier as MarshalIdentifier, Start, Update,
         core::Actor as MarshalActor,
@@ -200,13 +200,47 @@ impl ChainIndexer {
         block: HellasBlock,
         finalization: Finalization,
     ) -> Result<IngestOutcome, IngestError> {
+        self.ingest_proven_blocks(
+            block,
+            crate::finality_proof::FinalityProof {
+                certificate: finalization,
+                descendants: Vec::new(),
+            },
+        )
+        .await
+    }
+
+    pub async fn ingest_finalized_proof(
+        &self,
+        block: HellasBlock,
+        encoded_proof: &[u8],
+    ) -> Result<IngestOutcome, IngestError> {
+        self.ingest_proven_blocks(
+            block,
+            crate::finality_proof::FinalityProof::decode(encoded_proof)?,
+        )
+        .await
+    }
+
+    async fn ingest_proven_blocks(
+        &self,
+        block: HellasBlock,
+        proof: crate::finality_proof::FinalityProof,
+    ) -> Result<IngestOutcome, IngestError> {
         let _guard = self.ingest_lock.lock().await;
-        let height = block.height();
+        let terminal = proof.descendants.last().unwrap_or(&block);
+        let finalization = &proof.certificate;
         #[cfg(feature = "explorer-origin")]
         let scheduled = self
             .schedule
             .as_ref()
-            .map(|schedule| schedule.verifier(height, finalization.proposal.round.epoch()))
+            .map(|schedule| {
+                // Every block's epoch must agree with the authenticated height schedule.
+                for candidate in std::iter::once(&block).chain(proof.descendants.iter()) {
+                    schedule.verifier(candidate.height(), candidate.context().round.epoch())?;
+                }
+                schedule.verifier(terminal.height(), finalization.proposal.round.epoch())
+            })
             .transpose()?;
         #[cfg(feature = "explorer-origin")]
         let verifier = scheduled
@@ -214,55 +248,96 @@ impl ChainIndexer {
             .ok_or(IngestError::MissingVerifier)?;
         #[cfg(not(feature = "explorer-origin"))]
         let verifier = self.verifier.as_ref().ok_or(IngestError::MissingVerifier)?;
-        let payload = block.digest();
-
-        verifier.verify_finalization(&finalization, payload)?;
-        if block.context().round != finalization.round() {
-            return Err(IngestError::RoundMismatch);
-        }
-
-        if let Some((_, existing_payload)) = self.marshal.get_info(height).await {
-            if existing_payload == payload {
-                return Ok(IngestOutcome::Duplicate);
+        proof.verify(
+            verifier,
+            &LatestBlock {
+                height: block.height().get(),
+                payload: block.digest(),
+                state_root: block.state_root(),
+                finalization: Vec::new(),
+            },
+        )?;
+        proof
+            .verify_terminal_context(terminal)
+            .map_err(|_| IngestError::RoundMismatch)?;
+        let terminal_height = terminal.height();
+        let terminal_payload = terminal.digest();
+        let mut pending = Vec::new();
+        let mut expected_parent = None;
+        for candidate in std::iter::once(block).chain(proof.descendants) {
+            let height = candidate.height();
+            let payload = candidate.digest();
+            if let Some((_, existing_payload)) = self.marshal.get_info(height).await {
+                if existing_payload != payload {
+                    return Err(IngestError::ConflictingHeight {
+                        height: height.get(),
+                        existing: existing_payload,
+                        incoming: payload,
+                    });
+                }
+                expected_parent = Some(payload);
+                continue;
             }
-            return Err(IngestError::ConflictingHeight {
-                height: height.get(),
-                existing: existing_payload,
-                incoming: payload,
-            });
-        }
-        if let Some((existing_height, _)) = self.marshal.get_info(&payload).await {
-            if existing_height == height {
-                return Ok(IngestOutcome::Duplicate);
+            if let Some((existing_height, _)) = self.marshal.get_info(&payload).await {
+                return Err(IngestError::ConflictingPayload {
+                    payload,
+                    existing_height: existing_height.get(),
+                    incoming_height: height.get(),
+                });
             }
-            return Err(IngestError::ConflictingPayload {
-                payload,
-                existing_height: existing_height.get(),
-                incoming_height: height.get(),
-            });
+            let parent = match expected_parent {
+                Some(parent) => parent,
+                None => {
+                    self.marshal
+                        .get_info(Height::new(
+                            height
+                                .get()
+                                .checked_sub(1)
+                                .ok_or(IngestError::InvalidBlock)?,
+                        ))
+                        .await
+                        .ok_or(IngestError::InvalidBlock)?
+                        .1
+                }
+            };
+            if candidate.parent() != parent {
+                return Err(IngestError::InvalidBlock);
+            }
+            expected_parent = Some(payload);
+            pending.push(candidate);
         }
-
-        if !self.marshal.verified(finalization.round(), block).await {
-            return Err(IngestError::MarshalClosed);
+        if pending.is_empty() {
+            return Ok(IngestOutcome::Duplicate);
         }
-
+        // Marshal must know the entire authenticated ancestry before the terminal
+        // certificate triggers its normal ancestor finalization and persistence.
+        for candidate in pending {
+            if !self
+                .marshal
+                .verified(candidate.context().round, candidate)
+                .await
+            {
+                return Err(IngestError::MarshalClosed);
+            }
+        }
         let mut marshal = self.marshal.clone();
         if !marshal
-            .report(Activity::Finalization(finalization))
+            .report(Activity::Finalization(proof.certificate))
             .accepted()
         {
             return Err(IngestError::MarshalClosed);
         }
-
-        match self.marshal.get_info(height).await {
-            Some((_, stored_payload)) if stored_payload == payload => Ok(IngestOutcome::Applied),
+        match self.marshal.get_info(terminal_height).await {
+            Some((_, stored_payload)) if stored_payload == terminal_payload => {
+                Ok(IngestOutcome::Applied)
+            }
             Some((_, existing)) => Err(IngestError::ConflictingHeight {
-                height: height.get(),
+                height: terminal_height.get(),
                 existing,
-                incoming: payload,
+                incoming: terminal_payload,
             }),
             None => Err(IngestError::NotStored {
-                height: height.get(),
+                height: terminal_height.get(),
             }),
         }
     }
@@ -277,10 +352,9 @@ impl ChainIndexer {
             ));
         }
         Ok(self
-            .marshal
-            .get_finalization(height)
-            .await
-            .map(|finalization| finalization.encode().to_vec()))
+            .get_finalized_block_at(height, payload)
+            .await?
+            .map(|block| block.snapshot.finalization))
     }
 
     pub async fn get_latest_block(&self) -> Result<Option<LatestBlock>, QueryError> {
@@ -328,18 +402,49 @@ impl ChainIndexer {
                 "finalized block digest did not match index".to_string(),
             ));
         }
-        let Some(finalization) = self.marshal.get_finalization(height).await else {
-            return Err(QueryError::StateUnavailable(format!(
-                "finalization is missing at height {}",
-                height.get()
-            )));
-        };
-        if finalization.proposal.payload != payload {
-            return Err(QueryError::StateUnavailable(
-                "finalization payload did not match block".to_string(),
-            ));
+        let mut descendants = Vec::new();
+        let mut candidate = block.clone();
+        let mut proof_bytes = 0usize;
+        loop {
+            if let Some(finalization) = self.marshal.get_finalization(candidate.height()).await {
+                if finalization.proposal.payload != candidate.digest()
+                    || finalization.proposal.round != candidate.context().round
+                {
+                    return Err(QueryError::StateUnavailable(
+                        "finalization did not match its certified block".into(),
+                    ));
+                }
+                let encoded = crate::finality_proof::encode(&finalization.encode(), &descendants)?;
+                return Ok(Some(finalized_block(block, encoded)));
+            }
+            if descendants.len() >= crate::finality_proof::MAX_FINALITY_DESCENDANTS {
+                return Err(QueryError::StateUnavailable(
+                    "finality ancestry exceeds proof block limit".into(),
+                ));
+            }
+            let next_height = candidate.height().get().checked_add(1).ok_or_else(|| {
+                QueryError::StateUnavailable("finality ancestry height overflow".into())
+            })?;
+            let Some(child) = self.marshal.get_block(Height::new(next_height)).await else {
+                return Err(QueryError::StateUnavailable(format!(
+                    "no certified descendant available for finalized height {}",
+                    height.get()
+                )));
+            };
+            if child.height().get() != next_height || child.parent() != candidate.digest() {
+                return Err(QueryError::StateUnavailable(
+                    "finalized ancestry is not contiguous".into(),
+                ));
+            }
+            proof_bytes = proof_bytes.saturating_add(child.encode().len());
+            if proof_bytes > crate::finality_proof::MAX_FINALITY_PROOF_BYTES {
+                return Err(QueryError::StateUnavailable(
+                    "finality ancestry exceeds proof byte limit".into(),
+                ));
+            }
+            descendants.push(child.clone());
+            candidate = child;
         }
-        Ok(Some(finalized_block(block, finalization.encode().to_vec())))
     }
 }
 

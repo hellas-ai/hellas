@@ -40,8 +40,8 @@ use hellas_rpc::{
 use hellas_wire::mux::MuxTransport;
 use hellas_wire::{Dispatcher, ServiceMarker, StreamTransport};
 use hellas_work::work::{
-    ClientEndpoint, EndpointError, JobProposal, ProposeError, ProviderEndpoint, WorkRefusal,
-    WorkService, propose_work,
+    ClientEndpoint, CloseEndpoint, EndpointError, JobProposal, ProposeError, ProviderEndpoint,
+    WorkRefusal, WorkService, propose_work,
 };
 use hellas_work::work_close::{BlockSourceError, CatchUpError, FinalizedBlocks, FinalizedWork};
 use hellas_work::work_store::{
@@ -134,13 +134,17 @@ fn payment_values() -> EdgeValues {
 }
 
 fn descriptor() -> WorkChannelDescriptor {
+    descriptor_with_policy(execution_policy())
+}
+
+fn descriptor_with_policy(policy: PaidExecutionPolicyV1) -> WorkChannelDescriptor {
     let config = WorkChannelConfig {
         network: network(),
         payment_edge: payment_edge(),
         payment_terms: payment_terms(),
         policy_salt: SALT,
         channel_policy: channel_policy(),
-        execution_policy: execution_policy(),
+        execution_policy: policy,
         expected_payment_values: payment_values(),
     };
     match WorkChannelDescriptor::open(config) {
@@ -150,6 +154,10 @@ fn descriptor() -> WorkChannelDescriptor {
 }
 
 fn ready() -> ReadyChannel {
+    ready_with_descriptor(descriptor())
+}
+
+fn ready_with_descriptor(descriptor: WorkChannelDescriptor) -> ReadyChannel {
     let bond = bond_object();
     let payment = payment_object();
     let observed = ObservedChannel {
@@ -159,7 +167,7 @@ fn ready() -> ReadyChannel {
         lease: lease_over(bond_edge(), payment_edge()),
         pending: PendingSlot::Absent,
     };
-    match descriptor().check_ready(&observed) {
+    match descriptor.check_ready(&observed) {
         Ok(ready) => ready,
         Err(error) => panic!("the fixture channel is ready: {error}"),
     }
@@ -1116,6 +1124,32 @@ fn a_repeat_proposal_returns_the_retained_request() {
 }
 
 #[test]
+fn a_retained_proposal_survives_restart_expiry_and_policy_change() {
+    let root = temp();
+    let provider_root = temp();
+    let mut endpoint = client_endpoint(root.path());
+    let first = endpoint.propose(&proposal(1)).unwrap();
+    let work_id = endpoint.state().jobs().next().unwrap().work_id();
+    let mut provider_endpoint = provider_endpoint(provider_root.path());
+    let response = provider_endpoint.accept(&first);
+    drop(endpoint); // The provider response was lost before journaling.
+
+    let mut policy = execution_policy();
+    policy.allowed_environment = ContentId::from_bytes([0x99; 32]);
+    let changed = ready_with_descriptor(descriptor_with_policy(policy));
+    let reopened = at_height(
+        store(root.path(), Role::Client),
+        proposal(1).deadlines.acceptance + 1,
+    );
+    let mut endpoint = ClientEndpoint::new(changed, reopened, client()).unwrap();
+    let resumed = endpoint.resume_proposal(work_id).unwrap();
+    assert_eq!(resumed, first);
+    assert_eq!(endpoint.state().proposal_nonce_high_water(), 1);
+    assert_eq!(provider_endpoint.accept(&resumed), response);
+    assert_eq!(endpoint.accepted(&response).unwrap(), work_id);
+}
+
+#[test]
 fn a_different_proposal_while_one_is_outstanding_opens_concurrently() {
     let root = temp();
     let mut endpoint = client_endpoint(root.path());
@@ -1342,23 +1376,74 @@ fn a_retry_returns_the_retained_co_signature() {
 #[test]
 fn a_retry_after_the_deadline_still_returns_the_retained_signature() {
     let root = temp();
+    let client_root = temp();
+    let mut caller = client_endpoint(client_root.path());
+    let request = caller
+        .propose(&proposal(1))
+        .expect("the client journals its proposal");
     let mut endpoint = provider_endpoint(root.path());
-    let first = accepted_signature(&endpoint.accept(&signed_request(1, 1)));
+    let first = accepted_signature(&endpoint.accept(&request));
     drop(endpoint);
+    drop(caller); // The acceptance acknowledgement never reached the client.
 
-    // The same provider, now well past the acceptance deadline.
+    // Both sides restart. The provider is past acceptance and close-only,
+    // while the client still has only its own signature.
     let late = at_height(
         store(root.path(), Role::Provider),
         deadlines().acceptance + 1,
     );
-    let Ok(mut endpoint) = ProviderEndpoint::new(ready(), late, provider()) else {
-        panic!("the endpoint binds");
-    };
-    let again = endpoint.accept(&signed_request(1, 1));
+    let service = WorkService::close_only(CloseEndpoint::new(late, provider()).unwrap());
+    let checkpoint = service.with_state(ChannelState::checkpoint).unwrap();
+    let mut caller = client_endpoint(client_root.path());
+    assert_eq!(phase_of(caller.state()), Some(JobPhase::HalfSigned));
+    let id = work_id(ready().channel(), &authorization(1, 1));
+    let resumed = caller.resume_proposal(id).unwrap();
+    let mut forged = resumed.clone();
+    forged.client_signature = stranger().sign(signing_hash(id)).as_bytes().to_vec();
+    assert_eq!(
+        refusal_code(&service.precheck_acceptance(&forged).unwrap()),
+        WorkRefusalCode::Invalid,
+        "a retained signature is returned only to an authenticated proposal",
+    );
+    let again = service.precheck_acceptance(&resumed).unwrap();
     assert_eq!(
         accepted_signature(&again),
         first,
         "an answer already given is not unsaid by a passing height",
+    );
+    assert_eq!(service.accept(&resumed), again);
+    assert_eq!(
+        service.with_state(ChannelState::checkpoint).unwrap(),
+        checkpoint
+    );
+    assert_eq!(caller.accepted(&again).unwrap(), id);
+    assert_eq!(phase_of(caller.state()), Some(JobPhase::Accepted));
+
+    // A terminal is also an authenticated, permanent answer without readiness.
+    drop(service);
+    let mut ended = store(root.path(), Role::Provider);
+    ended
+        .commit(
+            ChannelRecord::JobTerminated {
+                work_id: id,
+                outcome: TerminalOutcome::Failed { code: 1 },
+            },
+            &Secp256k1Verifier::new(),
+        )
+        .unwrap();
+    let service = WorkService::close_only(CloseEndpoint::new(ended, provider()).unwrap());
+    let checkpoint = service.with_state(ChannelState::checkpoint).unwrap();
+    assert_eq!(
+        refusal_code(&service.precheck_acceptance(&forged).unwrap()),
+        WorkRefusalCode::Invalid
+    );
+    assert_eq!(
+        refusal_code(&service.precheck_acceptance(&resumed).unwrap()),
+        WorkRefusalCode::Conflict
+    );
+    assert_eq!(
+        service.with_state(ChannelState::checkpoint).unwrap(),
+        checkpoint
     );
 }
 
@@ -1420,6 +1505,54 @@ fn an_authorization_past_its_acceptance_deadline_expires() {
     let response = endpoint.accept(&signed_request(1, 1));
     assert_eq!(refusal_code(&response), WorkRefusalCode::Expired);
     assert!(!WorkRefusal::Expired.is_retryable());
+    drop(endpoint);
+
+    let service = WorkService::close_only(
+        CloseEndpoint::new(store(root.path(), Role::Provider), provider()).unwrap(),
+    );
+    let checkpoint = service.with_state(ChannelState::checkpoint).unwrap();
+    let expired = signed_request(1, 1);
+    assert_eq!(
+        refusal_code(&service.precheck_acceptance(&expired).unwrap()),
+        WorkRefusalCode::Expired,
+        "the persisted cursor proves expiry without any new readiness",
+    );
+    assert_eq!(
+        refusal_code(&service.accept(&expired)),
+        WorkRefusalCode::Expired
+    );
+    let mut forged = expired;
+    forged.client_signature = stranger()
+        .sign(signing_hash(work_id(
+            ready().channel(),
+            &authorization(1, 1),
+        )))
+        .as_bytes()
+        .to_vec();
+    assert_eq!(
+        refusal_code(&service.precheck_acceptance(&forged).unwrap()),
+        WorkRefusalCode::Invalid
+    );
+    let fresh = signed_request_with(
+        1,
+        1,
+        JobDeadlines {
+            acceptance: deadlines().acceptance + 1,
+            ..deadlines()
+        },
+    );
+    assert!(
+        service.precheck_acceptance(&fresh).is_none(),
+        "the acceptance boundary remains inclusive"
+    );
+    assert_eq!(
+        refusal_code(&service.accept(&fresh)),
+        WorkRefusalCode::NotReady
+    );
+    assert_eq!(
+        service.with_state(ChannelState::checkpoint).unwrap(),
+        checkpoint
+    );
 }
 
 #[tokio::test]

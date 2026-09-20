@@ -91,6 +91,7 @@ pub struct LatestBlock {
     pub height: u64,
     pub payload: Digest,
     pub state_root: Digest,
+    /// Raw Simplex certificate or a bounded `finality_proof` ancestry envelope.
     pub finalization: Vec<u8>,
 }
 

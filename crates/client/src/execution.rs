@@ -216,9 +216,17 @@ impl CausalLmExecutionEnvironment {
     pub const fn manifest_id(&self) -> ContentId {
         self.manifest_id
     }
+
+    /// The canonical environment used to construct token-native execution.
+    pub fn environment(&self) -> &hellas_rpc::CausalLmEnvironment {
+        &self.environment
+    }
 }
 
-pub(super) fn genesis_text_execution_id(
+/// Canonical input identity shared by native and externally authenticated
+/// causal-LM streams. Presentation, payment routing and ticket nonces do not
+/// affect this identity.
+pub fn genesis_text_execution_id(
     manifest: ContentId,
     prompt: &[u32],
     max_tokens: u32,
@@ -373,38 +381,24 @@ impl ExecutionRequest {
     /// Check the cache, then quote only on a permitted miss. Preparation
     /// exposes provenance before the caller starts sending response headers.
     pub async fn prepare(self) -> ExecutionResult<PreparedExecution> {
-        use crate::cache::CacheKey;
-        let key = CacheKey::evaluate(genesis_text_execution_id(
+        let identity = genesis_text_execution_id(
             self.expected_manifest_id,
             &self.quote_req.prompt_token_ids,
             self.quote_req
                 .max_new_tokens
                 .expect("explicit decode limit"),
             &self.quote_req.stop_token_ids,
-        ));
+        );
         if self.cache.is_some() && matches!(self.strategy, ExecutionStrategy::Verify { .. }) {
             return Err(ExecutionError::protocol(
                 "verification requires live execution; disable inference caching",
             ));
         }
-        let guard = if let Some(cache) = &self.cache {
-            if let Some(entry) = cache
-                .read::<ExecutionEvent, ExecutionProvenance>(key.clone())
-                .await?
-            {
-                return Ok(PreparedExecution::replay(entry));
-            }
-            let guard = cache.acquire(&key).await?;
-            if let Some(entry) = cache
-                .read::<ExecutionEvent, ExecutionProvenance>(key.clone())
-                .await?
-            {
-                return Ok(PreparedExecution::replay(entry));
-            }
-            Some(guard)
-        } else {
-            None
-        };
+        let cache = self.cache.clone();
+        prepare_evaluate_stream(identity, cache, self.prepare_uncached()).await
+    }
+
+    async fn prepare_uncached(self) -> ExecutionResult<EvaluateStreamSource> {
         let (primary_route, shadow_route) = match self.strategy {
             ExecutionStrategy::Run(route) => (route, None),
             ExecutionStrategy::Verify { primary, shadow } => (primary, Some(shadow)),
@@ -449,11 +443,7 @@ impl ExecutionRequest {
                 yield event?;
             }
         });
-        let events = match (self.cache, guard) {
-            (Some(cache), Some(guard)) => cache.record(key, provenance.clone(), events, guard),
-            _ => events,
-        };
-        Ok(PreparedExecution { provenance, events })
+        Ok((provenance, events))
     }
 
     /// Drive this request to completion as a stream of events.
@@ -471,6 +461,44 @@ impl ExecutionRequest {
             }
         }
     }
+}
+
+/// A live evaluate stream whose producer verification belongs to its route.
+/// Paid routes additionally delay their successful terminal until payment ACK.
+type EvaluateStreamSource = (
+    Option<ExecutionProvenance>,
+    BoxStream<'static, ExecutionResult<ExecutionEvent>>,
+);
+
+/// Reuse or record a token-native evaluate stream under its canonical identity.
+/// The live source is polled only after a permitted cache miss. Recording uses
+/// the same event schema as native execution and publishes only after its
+/// successful terminal and EOF; dropping a stream retains the source's own
+/// cancellation semantics.
+pub async fn prepare_evaluate_stream(
+    identity: hellas_rpc::Digest,
+    cache: Option<Arc<crate::cache::OutputCache>>,
+    live: impl std::future::Future<Output = ExecutionResult<EvaluateStreamSource>>,
+) -> ExecutionResult<PreparedExecution> {
+    let key = crate::cache::CacheKey::evaluate(identity);
+    let guard = if let Some(cache) = &cache {
+        if let Some(entry) = cache.read(key.clone()).await? {
+            return Ok(PreparedExecution::replay(entry));
+        }
+        let guard = cache.acquire(&key).await?;
+        if let Some(entry) = cache.read(key.clone()).await? {
+            return Ok(PreparedExecution::replay(entry));
+        }
+        Some(guard)
+    } else {
+        None
+    };
+    let (provenance, events) = live.await?;
+    let events = match (cache, guard) {
+        (Some(cache), Some(guard)) => cache.record(key, provenance.clone(), events, guard),
+        _ => events,
+    };
+    Ok(PreparedExecution { provenance, events })
 }
 
 // ---------------------------------------------------------------------------

@@ -7,7 +7,7 @@ use crate::{
 use commonware_codec::DecodeExt;
 use commonware_consensus::Heightable;
 use commonware_cryptography::Digestible;
-use commonware_runtime::{Runner as _, Supervisor as _, tokio};
+use commonware_runtime::{Runner as _, Spawner as _, Supervisor as _, tokio};
 use futures_util::StreamExt as _;
 use hellas_kernel::NetworkId;
 use hellas_rpc::pb::chain::{ActivityEvent, ActivityEventKind, activity_event};
@@ -18,6 +18,7 @@ use tracing::{info, warn};
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const CATCH_UP_BATCH: u64 = 8;
 const IDLE_SYNC_INTERVAL: Duration = Duration::from_secs(1);
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Error)]
 pub enum FollowerError {
@@ -63,6 +64,10 @@ pub enum FollowerError {
     Consensus(#[from] crate::ConsensusVerificationError),
     #[error("{0}")]
     Ingest(#[from] IngestError),
+    #[error("failed to listen for follower shutdown: {0}")]
+    ShutdownSignal(std::io::Error),
+    #[error("failed to shut down follower runtime: {0}")]
+    Shutdown(commonware_runtime::Error),
 }
 
 impl FollowerError {
@@ -140,11 +145,36 @@ pub fn run(options: FollowerOptions) -> Result<(), FollowerError> {
     let runtime_cfg = tokio::Config::new()
         .with_storage_directory(storage_dir_utf8)
         .with_tcp_nodelay(Some(true));
-    tokio::Runner::new(runtime_cfg)
-        .start(move |context| async move { follow(context, options).await })
+    tokio::Runner::new(runtime_cfg).start(move |context| async move {
+        let result = ::tokio::select! {
+            result = follow(&context, options) => result,
+            result = wait_for_shutdown_signal() => result.map_err(FollowerError::ShutdownSignal),
+        };
+        // Stop marshal through its runtime signal and wait for actor cleanup
+        // before returning to the CLI, which flushes the telemetry providers.
+        let shutdown = context
+            .stop(0, Some(SHUTDOWN_TIMEOUT))
+            .await
+            .map_err(FollowerError::Shutdown);
+        result.and(shutdown)
+    })
 }
 
-async fn follow(context: tokio::Context, options: FollowerOptions) -> Result<(), FollowerError> {
+async fn wait_for_shutdown_signal() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            ::tokio::signal::unix::signal(::tokio::signal::unix::SignalKind::terminate())?;
+        ::tokio::select! {
+            result = ::tokio::signal::ctrl_c() => result,
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    ::tokio::signal::ctrl_c().await
+}
+
+async fn follow(context: &tokio::Context, options: FollowerOptions) -> Result<(), FollowerError> {
     let client = RemoteLightClient::connect(options.rpc.clone()).await?;
     let consensus_info = client.get_consensus_info().await?;
     let verifier = ConsensusVerifier::new(&consensus_info)?;
@@ -308,8 +338,9 @@ pub(crate) async fn ingest_finalized_block(
         });
     }
 
-    let finalization = ChainIndexer::decode_finalization(&finalized.snapshot.finalization)?;
-    let outcome = indexer.ingest_finalized(block, finalization).await?;
+    let outcome = indexer
+        .ingest_finalized_proof(block, &finalized.snapshot.finalization)
+        .await?;
     status.emit(FollowerStatus::BlockIngested {
         height: block_height,
         outcome,

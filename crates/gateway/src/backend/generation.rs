@@ -40,8 +40,8 @@ pub(super) fn generation_stream(
         ..
     } = generation;
     try_stream! {
-        let mut decoder = TextOutputDecoder::new(presentation);
-        let inner = prepared.stream();
+        let mut decoder = TextOutputDecoder::new(&presentation);
+        let inner = prepared;
         tokio::pin!(inner);
         while let Some(event) = inner.next().await {
             match event? {
@@ -52,6 +52,12 @@ pub(super) fn generation_stream(
                     }
                 }
                 crate::execution::ExecutionEvent::Done(outcome) => {
+                    if matches!(outcome, Outcome::Completed { .. }) {
+                        let delta = decoder.finish()?;
+                        if !delta.is_empty() {
+                            yield GenerationEvent::Delta(delta);
+                        }
+                    }
                     yield GenerationEvent::Done(outcome);
                     return;
                 }

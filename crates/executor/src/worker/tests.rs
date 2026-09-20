@@ -97,6 +97,56 @@ fn generation_resource_limits_use_checked_arithmetic() {
 }
 
 #[test]
+fn fixed_schedule_is_charged_before_generation_and_rejects_excess_tokens() {
+    let environment = CausalLmEnvironment::new(
+        ContentRef::new(ContentId::from_bytes([1; 32]), 1),
+        "model",
+        vec![],
+        vec![],
+        vec![4],
+        16,
+        16,
+    )
+    .unwrap()
+    .with_generation_schedule(hellas_rpc::CausalLmGenerationSchedule {
+        fixed_capacity: 16,
+        prefill_chunk_tokens: 2,
+    })
+    .unwrap();
+    let invocation = Invocation {
+        input_ids: vec![1, 2],
+        max_new_tokens: 2,
+        stop_token_ids: vec![],
+    };
+    let one = Duration::from_secs(1);
+    let limited_capacity = GpuConfig::new(1, 1, 4, 4096, one, one).unwrap();
+    assert!(
+        limited_capacity
+            .validate_environment_invocation_resources(&invocation, &environment)
+            .is_err()
+    );
+    let limited_bytes = GpuConfig::new(1, 1, 16, 120, one, one).unwrap();
+    assert!(
+        limited_bytes
+            .validate_environment_invocation_resources(&invocation, &environment)
+            .is_err()
+    );
+    let sufficient = GpuConfig::new(1, 1, 16, 4096, one, one).unwrap();
+    sufficient
+        .validate_environment_invocation_resources(&invocation, &environment)
+        .unwrap();
+    let oversized = Invocation {
+        max_new_tokens: 15,
+        ..invocation
+    };
+    assert!(
+        sufficient
+            .validate_environment_invocation_resources(&oversized, &environment)
+            .is_err()
+    );
+}
+
+#[test]
 fn session_program_and_asset_limits_recycle_before_runtime_rejection() {
     let one = Duration::from_secs(1);
     let config = GpuConfig::new(1, 10, 1, 1, one, one).unwrap();
@@ -239,4 +289,161 @@ fn a_stalled_consumer_fails_instead_of_blocking_the_worker() {
         Some(PbEvent::Chunk(_))
     ));
     assert!(receiver.try_recv().unwrap().unwrap().kind.is_none());
+}
+
+#[cfg(feature = "otel")]
+#[test]
+fn inference_telemetry_records_typed_outcomes_and_success_only_token_timings() {
+    use opentelemetry::metrics::MeterProvider;
+    use opentelemetry::trace::{SpanKind, Status, TracerProvider};
+    use opentelemetry::{Array, Value};
+    use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+    use opentelemetry_sdk::metrics::{InMemoryMetricExporter, SdkMeterProvider};
+    use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+    use tracing_subscriber::prelude::*;
+
+    let metric_exporter = InMemoryMetricExporter::default();
+    let meter_provider = SdkMeterProvider::builder()
+        .with_periodic_exporter(metric_exporter.clone())
+        .build();
+    let metrics = InferenceMetrics::from_meter(meter_provider.meter("test"));
+    let span_exporter = InMemorySpanExporter::default();
+    let tracer_provider = SdkTracerProvider::builder()
+        .with_simple_exporter(span_exporter.clone())
+        .build();
+    let subscriber = tracing_subscriber::registry()
+        .with(tracing_opentelemetry::layer().with_tracer(tracer_provider.tracer("test")));
+    tracing::subscriber::with_default(subscriber, || {
+        // Queue time is included in server duration/TTFT, but excluded from
+        // decoding time per output token. No GPU, sleeps or global SDK needed.
+        let accepted = Instant::now() - Duration::from_secs(2);
+        let mut completed = metrics.start(&tracing::Span::none(), accepted, 12, 2);
+        completed.token_generated();
+        completed.token_generated();
+        completed.cache_stats(8, 1);
+        completed.succeeded(StopReason::MaxNewTokens, 2);
+
+        let mut one_token = metrics.start(&tracing::Span::none(), accepted, 12, 2);
+        one_token.token_generated();
+        one_token.succeeded(StopReason::StopToken(99), 1);
+        metrics
+            .start(&tracing::Span::none(), accepted, 12, 2)
+            .succeeded(StopReason::StopToken(99), 0);
+
+        // A partial response is still a failed invocation: no successful token
+        // timings, no raw error text, no inferred final output count.
+        let mut failed = metrics.start(&tracing::Span::none(), accepted, 12, 2);
+        failed.token_generated();
+        failed.failed(&crate::ExecutorError::Execution(
+            "sensitive error text".into(),
+        ));
+        metrics
+            .start(&tracing::Span::none(), accepted, 12, 2)
+            .panicked();
+    });
+    tracer_provider.force_flush().unwrap();
+    meter_provider.force_flush().unwrap();
+    let spans = span_exporter.get_finished_spans().unwrap();
+    assert_eq!(spans.len(), 5);
+    let attribute = |index: usize, key: &str| {
+        spans[index]
+            .attributes
+            .iter()
+            .find(|kv| kv.key.as_str() == key)
+            .map(|kv| kv.value.clone())
+    };
+    for span in &spans {
+        assert_eq!(span.name, "text_completion");
+        assert_eq!(span.span_kind, SpanKind::Internal);
+        assert!(span.events.is_empty());
+        assert!(span.attributes.iter().all(|kv| {
+            kv.key.as_str() != "gen_ai.request.model"
+                && !kv.key.as_str().starts_with("hellas.reused")
+                && !kv.value.to_string().contains("sensitive error text")
+        }));
+    }
+    assert_eq!(
+        attribute(0, "gen_ai.usage.input_tokens"),
+        Some(Value::I64(12))
+    );
+    assert_eq!(
+        attribute(0, "gen_ai.usage.cache_read.input_tokens"),
+        Some(Value::I64(8))
+    );
+    assert_eq!(
+        attribute(0, "gen_ai.usage.output_tokens"),
+        Some(Value::I64(2))
+    );
+    for (index, reason) in ["length", "stop", "stop", "error", "error"]
+        .into_iter()
+        .enumerate()
+    {
+        assert_eq!(
+            attribute(index, "gen_ai.response.finish_reasons"),
+            Some(Value::Array(Array::String(vec![reason.into()])))
+        );
+    }
+    assert_eq!(spans[0].status, Status::Unset);
+    assert!(matches!(spans[3].status, Status::Error { .. }));
+    assert!(matches!(spans[4].status, Status::Error { .. }));
+    assert_eq!(
+        attribute(3, "error.type"),
+        Some(Value::from("execution_error"))
+    );
+    assert_eq!(attribute(4, "error.type"), Some(Value::from("panic")));
+    assert!(attribute(3, "gen_ai.usage.output_tokens").is_none());
+    assert!(attribute(3, "gen_ai.response.time_to_first_chunk").is_none());
+
+    let exported = metric_exporter.get_finished_metrics().unwrap();
+    let exported = exported
+        .iter()
+        .flat_map(|r| r.scope_metrics())
+        .flat_map(|s| s.metrics())
+        .collect::<Vec<_>>();
+    assert_eq!(exported.len(), 3);
+    for metric in exported {
+        assert_eq!(metric.unit(), "s");
+        let AggregatedMetrics::F64(MetricData::Histogram(histogram)) = metric.data() else {
+            panic!("expected seconds histogram");
+        };
+        let points = histogram.data_points().collect::<Vec<_>>();
+        let count = points.iter().map(|point| point.count()).sum::<u64>();
+        match metric.name() {
+            "gen_ai.server.request.duration" => {
+                assert_eq!(count, 5);
+                assert_eq!(points.len(), 3, "success, execution error, panic");
+                assert!(
+                    points
+                        .iter()
+                        .all(|point| point.sum() >= 2.0 * point.count() as f64)
+                );
+            }
+            "gen_ai.server.time_to_first_token" => {
+                assert_eq!(count, 2, "exclude zero-token and failed responses");
+                assert_eq!(points.len(), 1);
+                assert!(points[0].sum() >= 4.0);
+            }
+            "gen_ai.server.time_per_output_token" => {
+                assert_eq!(count, 1, "require at least two successful output tokens");
+                assert_eq!(points.len(), 1);
+            }
+            name => panic!("unexpected metric {name}"),
+        }
+        for point in points {
+            assert!(
+                point
+                    .attributes()
+                    .any(|kv| kv.key.as_str() == "gen_ai.operation.name"
+                        && kv.value == Value::from("text_completion"))
+            );
+            assert!(
+                point
+                    .attributes()
+                    .any(|kv| kv.key.as_str() == "gen_ai.provider.name"
+                        && kv.value == Value::from("hellas"))
+            );
+        }
+    }
+    tracer_provider.shutdown().unwrap();
+    meter_provider.shutdown().unwrap();
 }

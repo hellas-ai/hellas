@@ -6,7 +6,8 @@
 use anyhow::Context;
 use clap::Subcommand;
 use hellas_rpc::{
-    CausalLmEnvironment, ContentId, ContentRef, MAX_CAUSAL_LM_ENVIRONMENT_BYTES, StaticSlice,
+    CausalLmEnvironment, CausalLmGenerationSchedule, ContentId, ContentRef,
+    MAX_CAUSAL_LM_ENVIRONMENT_BYTES, StaticSlice,
 };
 use hellas_store::ContentStore;
 use serde::Deserialize;
@@ -34,6 +35,17 @@ pub enum EnvironmentCommand {
         settings: PathBuf,
         /// Canonical environment output. This is metadata, not a model archive.
         #[arg(long, value_name = "MODEL.environment")]
+        out: PathBuf,
+    },
+    /// Commit a fixed prefill schedule to existing verified environment metadata.
+    Schedule {
+        #[arg(long, value_name = "FILE")]
+        environment: PathBuf,
+        #[arg(long)]
+        fixed_capacity: u64,
+        #[arg(long)]
+        prefill_chunk_tokens: u32,
+        #[arg(long, value_name = "FILE")]
         out: PathBuf,
     },
     /// Strict-decode an environment and print its deterministic manifest identity.
@@ -74,6 +86,15 @@ struct EnvironmentSettings {
     state_bytes_per_capacity: Vec<u64>,
     vocabulary_size: u64,
     maximum_capacity: u64,
+    #[serde(default)]
+    generation: Option<GenerationSettings>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GenerationSettings {
+    fixed_capacity: u64,
+    prefill_chunk_tokens: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -86,6 +107,23 @@ struct StaticInputSettings {
 
 pub async fn run(command: EnvironmentCommand) -> CliResult {
     match command {
+        EnvironmentCommand::Schedule {
+            environment,
+            fixed_capacity,
+            prefill_chunk_tokens,
+            out,
+        } => {
+            let bytes = read_bounded_metadata(&environment, "environment")?;
+            let environment = CausalLmEnvironment::from_canonical_bytes(&bytes)?
+                .with_generation_schedule(CausalLmGenerationSchedule {
+                    fixed_capacity,
+                    prefill_chunk_tokens,
+                })?;
+            let bytes = environment.canonical_bytes();
+            atomic_write(&out, &bytes)?;
+            print_environment(&environment, &bytes, &out);
+            Ok(())
+        }
         EnvironmentCommand::Build {
             program,
             settings,
@@ -144,6 +182,13 @@ fn build(program_path: &Path, settings_path: &Path, out: &Path) -> CliResult {
         settings.maximum_capacity,
     )
     .map_err(|error| anyhow::anyhow!("invalid causal-LM environment: {error}"))?;
+    let environment = match settings.generation {
+        Some(schedule) => environment.with_generation_schedule(CausalLmGenerationSchedule {
+            fixed_capacity: schedule.fixed_capacity,
+            prefill_chunk_tokens: schedule.prefill_chunk_tokens,
+        })?,
+        None => environment,
+    };
     let bytes = environment.canonical_bytes();
     atomic_write(out, &bytes)?;
     print_environment(&environment, &bytes, out);
@@ -277,6 +322,12 @@ fn print_environment(environment: &CausalLmEnvironment, bytes: &[u8], path: &Pat
     println!("entrypoint  {}", environment.entrypoint());
     println!("vocabulary  {}", environment.vocabulary_size());
     println!("capacity    {}", environment.maximum_capacity());
+    if let Some(schedule) = environment.generation_schedule() {
+        println!(
+            "generation  fixed_capacity={} prefill_chunk_tokens={}",
+            schedule.fixed_capacity, schedule.prefill_chunk_tokens
+        );
+    }
 }
 
 /// Publish complete environment metadata and make both its bytes and directory

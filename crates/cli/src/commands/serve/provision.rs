@@ -55,7 +55,9 @@
 //! empty, and its timeout pays the staking party and nobody else, so
 //! there is one payout and it names the provider's own key. A second
 //! payout to that same party would only raise the close cost the payout
-//! has to clear. The kernel checks the rest when the Open reaches it —
+//! has to clear. Before signing, the timeout is checked against the
+//! authenticated finalized height and the chain's maximum edge lifetime.
+//! The kernel checks the remaining terms when the Open reaches it —
 //! that the payout total is the edge's close value, that the price cap
 //! covers a job, that the timeout is ahead of the block including it —
 //! and re-spelling any of that here would be a second answer to a
@@ -68,6 +70,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, bail};
 use hellas_chain::client::VerifiedRemoteLightClient;
+use hellas_chain::domain::MAX_EDGE_LIFETIME_BLOCKS;
 use hellas_chain::{ConsensusInfo, ConsensusVerifier, WorkBlocks};
 use hellas_kernel::{
     BlockHeight, CoinId, EdgeId, Funding, Key, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, NetworkId,
@@ -252,6 +255,18 @@ impl Offer {
     /// Journals revision 1, and returns only once a fresh open of the
     /// journal replays it.
     fn journal(self, floor: SetupScan) -> CliResult<Provisioned> {
+        let timeout = self.bond_terms.timeout.get();
+        anyhow::ensure!(
+            timeout > floor.height,
+            "--bond-timeout {timeout} must be after finalized height {}",
+            floor.height,
+        );
+        anyhow::ensure!(
+            timeout - floor.height <= MAX_EDGE_LIFETIME_BLOCKS,
+            "--bond-timeout {timeout} exceeds the chain's maximum edge lifetime of \
+             {MAX_EDGE_LIFETIME_BLOCKS} blocks from finalized height {}",
+            floor.height,
+        );
         let Self {
             network,
             journal_root,

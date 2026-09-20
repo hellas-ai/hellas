@@ -8,16 +8,18 @@ repository.workspace = true
 documentation.workspace = true
 
 [dependencies]
+async-stream.workspace = true
+futures.workspace = true
 hellas-kernel = { workspace = true, features = ["secp256k1"] }
 hellas-rpc = { workspace = true, features = ["work"] }
 hellas-wire.workspace = true
 hellas-xet.workspace = true
 prost = { version = "0.14", default-features = false, features = ["derive"] }
 thiserror.workspace = true
+tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
 bytes.workspace = true
 hellas-wire = { workspace = true, features = ["mux"] }
 tempfile.workspace = true
-tokio.workspace = true

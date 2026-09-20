@@ -70,8 +70,8 @@ let
     cargoLock = {
       lockFile = ../Cargo.lock;
       outputHashes = {
-        "catena-lang-0.1.0" = "sha256-Sd/zEpZadqk0XOLDU37EEQjwSkOeYUzaAeDN8l3hQdI=";
-        "commonware-actor-2026.7.0" = "sha256-LEVuwzWlttz1znLpe0bmEV/Gk+7v9BI9/Un25tR7naM=";
+        "catena-lang-0.1.0" = "sha256-NXu16282MSVMzg/0j0Ks8blMD2Fr4av++ylIGRHcxrQ=";
+        "commonware-actor-2026.7.0" = "sha256-SzlE5sQufUH2ukJ5Job5mEkIuF6m87hU9oLmeaEDFLE=";
       };
     };
     inherit stdenv;

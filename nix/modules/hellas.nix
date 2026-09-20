@@ -1,7 +1,7 @@
 { self }:
 rec {
-  # The ordinary production CLI carries the network, chain, gateway, and OTEL
-  # surfaces. Local Catena execution is the explicit `cli-catena` package.
+  # The ordinary CLI omits OTEL. Modules opt in through the package override.
+  # It carries the network, chain and gateway surfaces. Local Catena execution is the explicit `cli-catena` package.
   normalCliPackage = pkgs: self.packages.${pkgs.stdenv.hostPlatform.system}.cli;
   catenaPlatform = pkgs: pkgs.stdenv.hostPlatform.system == "x86_64-linux";
   catenaCliPackage = pkgs: self.packages.${pkgs.stdenv.hostPlatform.system}.cli-catena;
@@ -11,6 +11,35 @@ rec {
   pickCliPackage = normalCliPackage;
 
   renderEnvironment = builtins.mapAttrs (_: toString);
+
+  # Scope configuration to the ordinary CLI executable. In particular, an
+  # OTLP endpoint for Hellas must not enable telemetry in every other program
+  # launched by a Home Manager or Darwin login shell.
+  withEnvironment =
+    {
+      lib,
+      pkgs,
+      package,
+      environment,
+    }:
+    if environment == { } then
+      package
+    else
+      pkgs.symlinkJoin {
+        name = "hellas-configured";
+        paths = [ package ];
+        nativeBuildInputs = [ pkgs.makeWrapper ];
+        postBuild = ''
+          wrapProgram "$out/bin/hellas-cli" ${
+            lib.concatStringsSep " " (
+              lib.mapAttrsToList (
+                name: value: "--set-default ${lib.escapeShellArg name} ${lib.escapeShellArg (toString value)}"
+              ) environment
+            )
+          }
+        '';
+        inherit (package) meta;
+      };
 
   lexicallyNormalizeAbsolutePath =
     lib: path:
@@ -207,6 +236,8 @@ rec {
   ];
 
   protectedGatewayExtraArgs = [
+    "--paid-work-config"
+    "--bearer-token-file"
     "--identity"
     "--log-file"
     "--assurance"
@@ -216,6 +247,7 @@ rec {
     "--content-root"
     "--content-index"
     "--tokenizer"
+    "--chat-template"
     "--stop-token"
     "--host"
     "--port"
@@ -264,6 +296,7 @@ rec {
       lib,
       package,
       packageDescription,
+      otel,
     }:
     let
       inherit (lib) mkEnableOption mkOption types;
@@ -290,15 +323,34 @@ rec {
         };
         description = "Non-secret scalar environment variables exported to Hellas processes. Paths and packages are rejected so Nix cannot copy runtime model data into the store; the platform modules additionally reject store-valued strings. Use a platform runtime environment-file mechanism for secrets.";
       };
-      otel = otelOptions { inherit lib; };
+      otel = otelOptions {
+        inherit lib;
+        cfg = otel;
+      };
     };
 
   otelOptions =
-    { lib }:
+    {
+      lib,
+      cfg,
+      serviceName ? "hellas-node",
+    }:
     let
       inherit (lib) mkOption types;
     in
     {
+      enable = mkOption {
+        type = types.bool;
+        default = cfg.endpoint != null || cfg.collectorEndpoint != null;
+        defaultText = lib.literalExpression "otel.endpoint != null || otel.collectorEndpoint != null";
+        description = "Compile in OpenTelemetry and enable the configured exporters. Off when no endpoint is configured. The default package has no Hellas telemetry SDK or exporters.";
+      };
+      collectorEndpoint = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        example = "http://localhost:4318";
+        description = "OTEL_EXPORTER_OTLP_ENDPOINT — HTTP/protobuf collector base URL for traces and metrics. The SDK appends /v1/traces and /v1/metrics.";
+      };
       endpoint = mkOption {
         type = types.nullOr types.str;
         default = null;
@@ -307,7 +359,7 @@ rec {
       };
       serviceName = mkOption {
         type = types.str;
-        default = "hellas-node";
+        default = serviceName;
         description = "OTEL_SERVICE_NAME — service name attached to exported spans.";
       };
       sampleRate = mkOption {
@@ -576,6 +628,22 @@ rec {
     in
     {
       enable = mkEnableOption "Hellas HTTP gateway";
+      paidWorkConfig = mkOption {
+        type = types.nullOr runtimePath;
+        default = null;
+        description = "Runtime JSON provider pool for funded paid-work channels. Requests must match a configured provider's fixed generation policy; authenticated output is returned after payment acknowledgement.";
+      };
+      paidWorkJournalRoots = mkOption {
+        type = types.listOf runtimePath;
+        default = [ ];
+        description = "Client journal directories named in paidWorkConfig, made writable in the service sandbox. Preserve these across restarts and provision ownership before starting the service.";
+      };
+      bearerTokenFile = mkOption {
+        type = types.nullOr runtimePath;
+        default = null;
+        example = "/var/lib/hellas-gateway/bearer-token";
+        description = "Private bearer credential file. Created on first startup and reused across restarts; never logged.";
+      };
       host = mkOption {
         type = types.str;
         default = "127.0.0.1";
@@ -684,6 +752,17 @@ rec {
           the Hellas execution guarantee.
         '';
       };
+      chatTemplate = mkOption {
+        type = types.nullOr (
+          types.enum [
+            "qwen3"
+            "qwen3.5"
+            "qwen3.6"
+          ]
+        );
+        default = null;
+        description = "Shared text-chat model adapter with thinking disabled and tool-call support. Qwen3 uses JSON tool calls; Qwen3.5 and Qwen3.6 use XML function calls. Null supports plain completions only. Multimodal messages are unsupported.";
+      };
       stopTokenIds = mkOption {
         type = types.listOf u32;
         default = [ ];
@@ -787,12 +866,18 @@ rec {
       lib,
       otel,
     }:
-    lib.optionalAttrs (otel.endpoint != null) (
+    lib.optionalAttrs otel.enable (
       {
-        OTEL_EXPORTER_OTLP_TRACES_ENDPOINT = otel.endpoint;
         OTEL_SERVICE_NAME = otel.serviceName;
       }
+      // lib.optionalAttrs (otel.collectorEndpoint != null) {
+        OTEL_EXPORTER_OTLP_ENDPOINT = otel.collectorEndpoint;
+      }
+      // lib.optionalAttrs (otel.endpoint != null) {
+        OTEL_EXPORTER_OTLP_TRACES_ENDPOINT = otel.endpoint;
+      }
       // lib.optionalAttrs (otel.sampleRate != null) {
+        OTEL_TRACES_SAMPLER = "parentbased_traceidratio";
         OTEL_TRACES_SAMPLER_ARG = toString otel.sampleRate;
       }
       // lib.optionalAttrs (otel.headers != { }) {
@@ -898,6 +983,9 @@ rec {
       gateway.tokenizer
     ]
     ++ optArg "--model" gateway.model
+    ++ optArg "--paid-work-config" gateway.paidWorkConfig
+    ++ optArg "--bearer-token-file" gateway.bearerTokenFile
+    ++ optArg "--chat-template" gateway.chatTemplate
     ++ [
       "--host"
       gateway.host

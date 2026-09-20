@@ -39,6 +39,7 @@ pub struct ProofBundle {
     pub canonical_block: Vec<u8>,
     #[prost(uint64, tag = "9")]
     pub observed_at_ms: u64,
+    /// Epoch of the certified descendant, which may follow the target block's epoch.
     #[prost(uint64, tag = "10")]
     pub epoch: u64,
 }
@@ -139,10 +140,15 @@ impl ExplorerVerifier {
         {
             return Err(VerificationError::Identity);
         }
-        if bundle.canonical_block.len() > MAX_PROOF_BYTES || bundle.finalization.len() > 4096 {
+        if bundle.canonical_block.len() > MAX_PROOF_BYTES
+            || bundle.finalization.len() > crate::finality_proof::MAX_FINALITY_PROOF_BYTES
+        {
             return Err(VerificationError::Size);
         }
-        let epoch = self.trust.epoch_at(bundle.height)?;
+        let proof = crate::finality_proof::FinalityProof::decode(&bundle.finalization)?;
+        let epoch = self
+            .trust
+            .epoch_at(proof.certified_height(bundle.height)?)?;
         if bundle.epoch != epoch.epoch {
             return Err(VerificationError::Epoch);
         }
@@ -161,27 +167,24 @@ impl ExplorerVerifier {
             },
             block: bundle.canonical_block.clone(),
         };
-        let finalization = ConsensusVerifier::decode_finalization(&bundle.finalization)?;
-        #[cfg(any(feature = "indexer", feature = "validator"))]
-        let certificate_epoch = finalization.proposal.round.epoch().get();
-        #[cfg(not(any(feature = "indexer", feature = "validator")))]
-        let certificate_epoch = finalization.proposal.round.epoch;
-        if certificate_epoch != epoch.epoch {
+        if proof.certificate_epoch() != epoch.epoch {
             return Err(VerificationError::Epoch);
         }
-        self.verifiers[position].verify_finalization(&finalization, finalized.snapshot.payload)?;
+        proof.verify(&self.verifiers[position], &finalized.snapshot)?;
         let view = FinalizedBlockView::decode(&finalized)?;
         let block = crate::HellasBlock::decode(finalized.block.as_slice())
             .map_err(|_| VerificationError::Round)?;
-        let context = block.context();
-        #[cfg(any(feature = "indexer", feature = "validator"))]
-        let round_matches = context.round == finalization.proposal.round;
-        #[cfg(not(any(feature = "indexer", feature = "validator")))]
-        let round_matches = context.round.epoch().get() == finalization.proposal.round.epoch
-            && context.round.view().get() == finalization.proposal.round.view;
-        if !round_matches {
-            return Err(VerificationError::Round);
+        for candidate in std::iter::once(&block).chain(proof.descendants.iter()) {
+            use commonware_consensus::Heightable as _;
+            if self.trust.epoch_at(candidate.height().get())?.epoch
+                != candidate.context().round.epoch().get()
+            {
+                return Err(VerificationError::Epoch);
+            }
         }
+        proof
+            .verify_terminal_context(proof.descendants.last().unwrap_or(&block))
+            .map_err(|_| VerificationError::Round)?;
         let transaction_index = match query {
             ExplorerQuery::Block(FinalizedBlockQuery::Latest) => None,
             ExplorerQuery::Block(FinalizedBlockQuery::Height(height))

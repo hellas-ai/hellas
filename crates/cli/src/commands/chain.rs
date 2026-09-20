@@ -191,8 +191,9 @@ pub enum QueryCommand {
 pub enum IndexerCommand {
     /// Serve verified proofs from a local full follower on a loopback listener
     Serve {
-        #[arg(long)]
-        rpc: String,
+        /// Validator RPC endpoints; repeat to rotate after failure or a stale tip.
+        #[arg(long, required = true, value_delimiter = ',')]
+        rpc: Vec<String>,
         /// Authenticated trust document, provisioned independently of the RPC origin
         #[arg(long)]
         trust: PathBuf,
@@ -320,16 +321,6 @@ pub async fn run(command: ChainCommand) -> CliResult {
         ChainCommand::Indexer { command } => run_indexer(command).await,
         #[cfg(feature = "validator")]
         ChainCommand::Validator { command } => run_validator(command).await,
-    }
-}
-
-pub fn command_owns_tracing(command: &ChainCommand) -> bool {
-    match command {
-        #[cfg(feature = "validator")]
-        ChainCommand::Validator {
-            command: ValidatorCommand::Run { .. },
-        } => true,
-        _ => false,
     }
 }
 

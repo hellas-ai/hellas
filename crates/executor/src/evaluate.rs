@@ -506,11 +506,7 @@ impl EvaluateEngine {
         invocation: &Invocation,
     ) -> Result<(), ExecutorError> {
         self.gpu_config
-            .validate_invocation_resources(
-                invocation,
-                source.environment().state_bytes_per_capacity(),
-                source.environment().vocabulary_size(),
-            )
+            .validate_environment_invocation_resources(invocation, source.environment())
             .map_err(|error| {
                 ExecutorError::InvalidQuoteRequest(format!(
                     "environment {} exceeds the provider GPU resource envelope: {error}",
@@ -699,6 +695,7 @@ impl EvaluateEngine {
                 .recording()
                 .map_err(|error| ExecutorError::ArtifactStore(error.to_string()))?,
             output_cache: self.output_cache.clone(),
+            span: tracing::Span::current(),
             execution_id: execution_id.clone(),
             request_commitment,
             evaluate_request,
@@ -1325,6 +1322,7 @@ pub(crate) mod environment_admission_tests {
         ExecuteJob {
             cache_recording: None,
             output_cache: Default::default(),
+            span: tracing::Span::none(),
             execution_id: execution_id.to_string(),
             request_commitment: request_commitment(index.into()),
             evaluate_request,

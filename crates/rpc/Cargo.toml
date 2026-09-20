@@ -20,6 +20,7 @@ ignored = [
 
 [features]
 default = []
+otel = ["dep:opentelemetry", "dep:tracing-opentelemetry"]
 
 # === Protocol modules ======================================================
 # Each feature gates the generated items for one proto package, so binaries
@@ -55,6 +56,7 @@ hellas-kernel = { workspace = true, optional = true }
 hellas-wire = { workspace = true }
 hellas-xet = { workspace = true, features = ["chunking", "serde"] }
 k256 = { workspace = true }
+opentelemetry = { workspace = true, optional = true }
 p256 = { workspace = true }
 prost = { version = "0.14", default-features = false, features = ["derive"] }
 serde = { workspace = true }
@@ -66,6 +68,7 @@ thiserror = { workspace = true }
 # The measurement seams' one channel out. Nothing here decides on a
 # sample, and a node with no subscriber pays one atomic load per seam.
 tracing = { workspace = true }
+tracing-opentelemetry = { workspace = true, optional = true }
 web-time = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
@@ -94,5 +97,7 @@ hellas-kernel = { workspace = true, features = ["secp256k1"] }
 # rather than a handler call: framing, method routing, and trailers are
 # where a wire-shaped mistake actually shows up.
 hellas-wire = { workspace = true, features = ["mux"] }
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
 tempfile = { workspace = true }
 tokio.workspace = true
+tracing-subscriber = { workspace = true }
