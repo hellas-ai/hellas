@@ -140,6 +140,116 @@ async fn attested_fetch_client_never_follows_redirects() {
     assert_eq!(hits.load(Ordering::SeqCst), 0);
 }
 
+#[cfg(feature = "otel")]
+#[tokio::test]
+async fn fetch_http_propagates_parent_and_keeps_span_until_stream_is_consumed() {
+    use opentelemetry::trace::{SpanKind, TracerProvider};
+    use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+    use tracing::Instrument;
+    use tracing_subscriber::prelude::*;
+
+    opentelemetry::global::set_text_map_propagator(
+        opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+    );
+    let exporter = InMemorySpanExporter::default();
+    let provider = SdkTracerProvider::builder()
+        .with_simple_exporter(exporter.clone())
+        .build();
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_opentelemetry::layer()
+            .with_tracer(provider.tracer("test"))
+            .with_filter(tracing_subscriber::filter::filter_fn(|metadata| {
+                metadata.is_span()
+                    && (metadata.target() == "hellas_request"
+                        || metadata.name() == "test.fetch.request")
+            })),
+    );
+    let _subscriber = tracing::subscriber::set_default(subscriber);
+    let (headers_tx, mut headers_rx) = tokio::sync::mpsc::channel(1);
+    let endpoint = test_endpoint(
+        Router::new().route(
+            "/responses",
+            post(move |headers: HeaderMap| {
+                let headers_tx = headers_tx.clone();
+                async move {
+                    headers_tx.send(headers).await.unwrap();
+                    Response::builder()
+                        .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from("data: PRIVATE_RESPONSE_SENTINEL\n\n"))
+                        .unwrap()
+                }
+            }),
+        ),
+        "/responses?private_query=PRIVATE_QUERY_SENTINEL",
+    )
+    .await;
+    let parent = tracing::info_span!(parent: None, "test.fetch.request");
+    let mut response = execute_test_request(endpoint)
+        .instrument(parent.clone())
+        .await
+        .unwrap();
+    let headers = headers_rx.recv().await.unwrap();
+    let traceparent = headers
+        .get("traceparent")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        exporter.get_finished_spans().unwrap().is_empty(),
+        "HTTP headers must not close the streamed client span"
+    );
+    assert!(response.stream.next().await.unwrap().is_ok());
+    assert!(
+        exporter.get_finished_spans().unwrap().is_empty(),
+        "one body chunk must not close the client span"
+    );
+    assert!(response.stream.next().await.is_none());
+    drop(response);
+    drop(parent);
+    provider.force_flush().unwrap();
+    let spans = exporter.get_finished_spans().unwrap();
+    assert_eq!(spans.len(), 2, "one request and one HTTP transport span");
+    let request = spans
+        .iter()
+        .find(|span| span.name == "test.fetch.request")
+        .unwrap();
+    let http = spans
+        .iter()
+        .find(|span| span.span_kind == SpanKind::Client)
+        .unwrap();
+    assert_eq!(http.name, "POST");
+    assert_eq!(http.parent_span_id, request.span_context.span_id());
+    assert_eq!(
+        http.span_context.trace_id(),
+        request.span_context.trace_id()
+    );
+    assert_eq!(
+        traceparent,
+        format!(
+            "00-{}-{}-01",
+            http.span_context.trace_id(),
+            http.span_context.span_id()
+        )
+    );
+    assert!(
+        http.attributes
+            .iter()
+            .any(|kv| kv.key.as_str() == "http.response.status_code"
+                && kv.value == opentelemetry::Value::I64(200))
+    );
+    for span in spans {
+        assert!(span.events.is_empty());
+        assert!(span.attributes.iter().all(|kv| {
+            let value = kv.value.to_string();
+            !value.contains("PRIVATE_")
+                && !value.contains("secret")
+                && !value.contains("idempotency")
+        }));
+    }
+    provider.shutdown().unwrap();
+}
+
 #[tokio::test]
 async fn successful_fetch_requires_event_stream_content_type() {
     let endpoint = test_endpoint(

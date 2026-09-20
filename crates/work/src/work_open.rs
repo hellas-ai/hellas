@@ -81,6 +81,7 @@
 
 use std::collections::BTreeSet;
 
+use futures::{StreamExt as _, stream};
 use hellas_kernel::{CoinId, Edge, EdgeId, LeaseSlots, SigVerifier, Tx};
 
 use crate::work_close::{
@@ -457,11 +458,16 @@ where
         });
     }
 
-    if let Some(through) = fetch_history_batch(blocks, channel, verifier).await? {
+    if let Some((through, tip)) = fetch_history_batch(blocks, channel, verifier).await?
+        && through < tip
+    {
         return Ok(SetupAdvance::bare(SetupProgress::HistoryAdvanced {
             through,
         }));
     }
+    // Once this batch reaches the sampled tip, make the setup decision now.
+    // Returning for every new block starves funding on a chain that advances
+    // between polls, even after the history reader has caught up.
 
     // The journal is not held across the finalized read — that is what
     // keeps the ALPN answering while a step waits — so the question can
@@ -627,7 +633,7 @@ async fn fetch_history_batch<C, B, V>(
     blocks: &B,
     channel: &mut C,
     verifier: &V,
-) -> Result<Option<u64>, SetupDriveError>
+) -> Result<Option<(u64, u64)>, SetupDriveError>
 where
     C: SetupChannel,
     B: FinalizedBlocks + ?Sized,
@@ -654,11 +660,14 @@ where
     })?;
     let through = tip.min(scan.height.saturating_add(256));
     let mut history = Vec::with_capacity((through - scan.height) as usize);
-    for height in scan.height.saturating_add(1)..=through {
-        let block = blocks
-            .block_at(height)
-            .await?
-            .ok_or(SetupDriveError::OriginUnreadable { height })?;
+    // Fetch concurrently, but retain height order for the journal's existing
+    // parent-chain checks. The bounded batch is still committed atomically.
+    let pending = stream::iter(scan.height.saturating_add(1)..=through)
+        .map(|height| history_block(blocks, height))
+        .buffered(16);
+    futures::pin_mut!(pending);
+    while let Some(block) = pending.next().await {
+        let block = block?;
         history.push(SetupHistoryBlock {
             height: block.height,
             parent: block.parent,
@@ -677,7 +686,17 @@ where
         )?;
         Ok(())
     })?;
-    Ok(Some(through))
+    Ok(Some((through, tip)))
+}
+
+async fn history_block<B>(blocks: &B, height: u64) -> Result<FinalizedWork, SetupDriveError>
+where
+    B: FinalizedBlocks + ?Sized,
+{
+    blocks
+        .block_at(height)
+        .await?
+        .ok_or(SetupDriveError::OriginUnreadable { height })
 }
 
 fn mount_close_only<V: SigVerifier>(
@@ -849,12 +868,13 @@ where
     let tip = blocks.latest_height().await?.unwrap_or(0);
     let floor = scan.height;
     let mut expected_parent = scan.payload;
-    let mut height = floor.saturating_add(1);
-    while height <= tip {
-        let block = blocks
-            .block_at(height)
-            .await?
-            .ok_or(SetupDriveError::OriginUnreadable { height })?;
+    let pending = stream::iter(floor.saturating_add(1)..=tip)
+        .map(|height| history_block(blocks, height))
+        .buffered(16);
+    futures::pin_mut!(pending);
+    while let Some(block) = pending.next().await {
+        let block = block?;
+        let height = block.height;
         if block.parent != expected_parent {
             return Err(SetupDriveError::OriginNotContiguous { height });
         }
@@ -867,7 +887,6 @@ where
             });
         }
         expected_parent = block.payload;
-        height = height.saturating_add(1);
     }
     Err(SetupDriveError::OriginNotFound {
         floor,

@@ -88,7 +88,7 @@ let
     multiple-versions = "allow"
 
     [sources]
-    allow-git = ["https://github.com/commonwarexyz/monorepo", "https://github.com/hellas-ai/catena-lang"]
+    allow-git = ["https://github.com/georgewhewell/commonware-monorepo", "ssh://git@github.com/georgewhewell/exploratory-catena.git"]
   '';
   denyCommand = "cargo deny check --config ${denyConfig}";
 
@@ -177,35 +177,45 @@ let
       };
     in
     {
-      cli = pkgSpec.mkHellasPackage {
-        buildNoDefaultFeatures = true;
-        # Full network surface, but no local Catena runtime.
-        buildFeatures = [
-          "chain"
-          "gateway"
-        ]
-        ++ lib.optionals (crossSystem == null) [
-          "node"
-          "otel"
-        ];
-      };
-      cli-validator = pkgSpec.mkHellasPackage {
-        buildNoDefaultFeatures = true;
-        buildFeatures = [ "validator" ];
-      };
+      cli = lib.makeOverridable (
+        {
+          otel ? false,
+        }:
+        pkgSpec.mkHellasPackage {
+          buildNoDefaultFeatures = true;
+          # Full network surface, but no local Catena runtime.
+          buildFeatures = [
+            "chain"
+            "gateway"
+          ]
+          ++ lib.optionals (crossSystem == null) [ "node" ]
+          ++ lib.optional otel "otel";
+        }
+      ) { };
+      cli-validator = lib.makeOverridable (
+        {
+          otel ? false,
+        }:
+        pkgSpec.mkHellasPackage {
+          buildNoDefaultFeatures = true;
+          buildFeatures = [ "validator" ] ++ lib.optional otel "otel";
+        }
+      ) { };
     }
     # Do not advertise the safe local GPU runtime on platforms where the
     # packaged provider toolchain is not yet supported.
     //
       lib.optionalAttrs (crossSystem == null && pkgSpec.pkgs.stdenv.hostPlatform.system == "x86_64-linux")
         {
-          cli-catena = pkgSpec.mkHellasPackage {
-            buildNoDefaultFeatures = true;
-            buildFeatures = [
-              "evaluate"
-              "otel"
-            ];
-          };
+          cli-catena = lib.makeOverridable (
+            {
+              otel ? false,
+            }:
+            pkgSpec.mkHellasPackage {
+              buildNoDefaultFeatures = true;
+              buildFeatures = [ "evaluate" ] ++ lib.optional otel "otel";
+            }
+          ) { };
         };
 
   crossTargets = {

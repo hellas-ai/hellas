@@ -442,12 +442,16 @@ impl Executor {
 
     async fn handle_owed_request(&mut self, request: ExecutorOwedRequest) {
         match request {
-            ExecutorOwedRequest::RunPaidEvaluate { input, reply } => {
+            ExecutorOwedRequest::RunPaidEvaluate { input, reply, span } => {
                 #[cfg(feature = "evaluate")]
-                let result = self.evaluate.start_prepared_input(*input).await;
+                let result = tracing::Instrument::instrument(
+                    self.evaluate.start_prepared_input(*input),
+                    span.clone(),
+                )
+                .await;
                 #[cfg(not(feature = "evaluate"))]
                 let result = {
-                    let _ = input;
+                    let _ = (input, span);
                     Err(evaluate_disabled())
                 };
                 let _ = reply.send(result);
@@ -502,8 +506,14 @@ impl Executor {
                 };
                 let _ = reply.send(result);
             }
-            ExecutorRequest::Execute { request, reply } => {
-                let _ = reply.send(self.handle_execute(request).await);
+            ExecutorRequest::Execute {
+                span,
+                request,
+                reply,
+            } => {
+                let result =
+                    tracing::Instrument::instrument(self.handle_execute(request), span).await;
+                let _ = reply.send(result);
             }
             ExecutorRequest::GetStats { reply } => {
                 let _ = reply.send(Ok(GetStatsResponse {

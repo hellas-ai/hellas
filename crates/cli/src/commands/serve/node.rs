@@ -494,6 +494,17 @@ impl WorkHandler for UnmountedWork {
         }))
     }
 
+    async fn stream_result(
+        &self,
+        _request: DeliverResultRequest,
+        _context: TransportContext,
+    ) -> Result<hellas_work::work::PaidResultStream, WireStatus> {
+        Err(WireStatus::new(
+            hellas_wire::WireCode::Unavailable,
+            "paid work channel is not mounted",
+        ))
+    }
+
     fn admit_certificate(
         &self,
         _request: AdmitCertificateRequest,
@@ -620,30 +631,37 @@ impl AcceptedWorkDriver {
     /// request path or the close clock.
     fn spawn(&self, service: WorkService, ready: ReadyChannel, work_id: Digest) {
         let running = self.0.run(service, ready, work_id);
-        tokio::spawn(async move {
-            match running.await {
-                Ok(RunOutcome::Completed { .. }) => {
-                    debug!(?work_id, "the accepted paid job completed")
+        let span = hellas_rpc::request_span!(target: "hellas_request", "paid.provider.execute", hellas.work.id = ?work_id, otel.status_code = tracing::field::Empty);
+        tokio::spawn(tracing::Instrument::instrument(
+            async move {
+                match running.await {
+                    Ok(RunOutcome::Completed { .. }) => {
+                        debug!(?work_id, "the accepted paid job completed")
+                    }
+                    Ok(RunOutcome::Ready { .. }) => {
+                        debug!(?work_id, "the accepted paid job was already complete")
+                    }
+                    Ok(RunOutcome::Running) => {
+                        debug!(?work_id, "the accepted paid job was already running")
+                    }
+                    Ok(RunOutcome::Indeterminate) => {
+                        warn!(
+                            ?work_id,
+                            "the accepted paid job is indeterminate after restart"
+                        )
+                    }
+                    // `run_accepted_work` has already made backend and
+                    // transcript faults terminal before returning them. The
+                    // remaining errors have no node-local terminal policy;
+                    // keep the exact failure visible to the operator.
+                    Err(error) => {
+                        tracing::Span::current().record("otel.status_code", "ERROR");
+                        warn!(?work_id, %error, "the accepted paid job did not complete");
+                    }
                 }
-                Ok(RunOutcome::Ready { .. }) => {
-                    debug!(?work_id, "the accepted paid job was already complete")
-                }
-                Ok(RunOutcome::Running) => {
-                    debug!(?work_id, "the accepted paid job was already running")
-                }
-                Ok(RunOutcome::Indeterminate) => {
-                    warn!(
-                        ?work_id,
-                        "the accepted paid job is indeterminate after restart"
-                    )
-                }
-                // `run_accepted_work` has already made backend and
-                // transcript faults terminal before returning them. The
-                // remaining errors have no node-local terminal policy;
-                // keep the exact failure visible to the operator.
-                Err(error) => warn!(?work_id, %error, "the accepted paid job did not complete"),
-            }
-        });
+            },
+            span,
+        ));
     }
 }
 
@@ -688,6 +706,28 @@ where
         };
         refresh_work_admission(&self.service, self.descriptor.as_ref(), &source).await
     }
+
+    async fn refresh_delivery(&self, request: &DeliverResultRequest) -> anyhow::Result<()> {
+        let Ok(bytes) = request.work_id.as_slice().try_into() else {
+            return Ok(());
+        };
+        let work_id = Digest::from_bytes(bytes);
+        let active = self
+            .service
+            .with_state(|state| state.job_by_id(work_id).is_some());
+        if !matches!(active, Ok(true)) {
+            return Ok(());
+        }
+        // A restarted mount has no readiness cached. A retained result must
+        // be collectable without first accepting another job. Terminal replies
+        // need no fresh admission and are authenticated by the core service.
+        let _accepting = self.accepting.lock().await;
+        let result = self.refresh_admission().await;
+        if let Err(error) = &result {
+            debug!(%error, "a delivery attempt found no fresh channel readiness");
+        }
+        result.map(|_| ())
+    }
 }
 
 /// Re-establishes admission for the exact driven channel from one coherent
@@ -725,6 +765,25 @@ where
     let ready = descriptor
         .check_ready(&snapshot.observed_channel())
         .context("the fresh channel snapshot is not ready")?;
+    // Keep one snapshot as the target. Recovery runs on the clock itself,
+    // so waiting for another tick here would prevent the cursor advancing.
+    // Take the service's existing driver when available; a concurrent clock
+    // drive keeps that authority until it finishes its own catch-up.
+    for _ in 0..16 {
+        let cursor = service
+            .with_state(|state| state.cursor().0)
+            .context("the mounted channel cursor is unavailable")?;
+        if ready.check_caught_up(cursor).is_ok() {
+            break;
+        }
+        if let Ok(mut driver) = service.drive() {
+            driver
+                .catch_up(source)
+                .await
+                .context("the mounted channel could not catch up to the fresh snapshot")?;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
     let cursor = service
         .with_state(|state| state.cursor().0)
         .context("the mounted channel cursor is unavailable")?;
@@ -747,7 +806,15 @@ where
         _context: TransportContext,
     ) -> Result<impl Into<hellas_rpc::call::WithTrailer<AcceptWorkResponse>> + Send, WireStatus>
     {
+        if let Some(response) = self.service.precheck_acceptance(&request) {
+            return Ok(response);
+        }
         let _accepting = self.accepting.lock().await;
+        // A preceding request or the clock may have resolved this proposal
+        // while admission was serialized. Retained replies need no fresh read.
+        if let Some(response) = self.service.precheck_acceptance(&request) {
+            return Ok(response);
+        }
         let ready = match self.refresh_admission().await {
             Ok(ready) => ready,
             Err(error) => {
@@ -791,17 +858,40 @@ where
         Ok(response)
     }
 
-    fn deliver_result(
+    async fn deliver_result(
         &self,
         request: DeliverResultRequest,
         context: TransportContext,
-    ) -> impl core::future::Future<
-        Output = Result<
-            impl Into<hellas_rpc::call::WithTrailer<DeliverResultResponse>> + Send,
-            WireStatus,
-        >,
-    > + Send {
-        self.service.deliver_result(request, context)
+    ) -> Result<impl Into<hellas_rpc::call::WithTrailer<DeliverResultResponse>> + Send, WireStatus>
+    {
+        let response: hellas_rpc::call::WithTrailer<DeliverResultResponse> =
+            if self.refresh_delivery(&request).await.is_ok() {
+                self.service.deliver_result(request, context).await?.into()
+            } else {
+                DeliverResultResponse {
+                    outcome: Some(deliver_result_response::Outcome::Refused(WorkRefused {
+                        code: WorkRefusalCode::NotReady as i32,
+                        reason: "fresh channel readiness is unavailable".to_string(),
+                    })),
+                }
+                .into()
+            };
+        Ok(response)
+    }
+
+    async fn stream_result(
+        &self,
+        request: DeliverResultRequest,
+        context: TransportContext,
+    ) -> Result<hellas_work::work::PaidResultStream, WireStatus> {
+        if self.refresh_delivery(&request).await.is_ok() {
+            self.service.stream_result(request, context).await
+        } else {
+            Err(WireStatus::new(
+                hellas_wire::WireCode::Unavailable,
+                "fresh channel readiness is unavailable",
+            ))
+        }
     }
 
     fn admit_certificate(
@@ -1416,8 +1506,9 @@ impl WorkRunner<ProductionWorkSource> {
     }
 }
 
-/// Dials the configured validators in order and reads and submits
-/// through the first that answers.
+/// Rotate the first candidate on reconnect, including when a connected peer
+/// cannot supply historical finalized blocks. Reads and submissions use the
+/// selected verified connection.
 ///
 /// One endpoint for both directions. §1's concurrent fan-out to all six
 /// is a submission strategy with an outcome rule, and neither exists in
@@ -1427,7 +1518,10 @@ async fn connect_chain(
     validators: &[String],
     verifier: ConsensusVerifier,
 ) -> Option<ProductionWorkSource> {
-    for url in validators {
+    static NEXT_VALIDATOR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let start =
+        NEXT_VALIDATOR.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % validators.len();
+    for url in validators.iter().cycle().skip(start).take(validators.len()) {
         match VerifiedRemoteLightClient::connect(url.clone(), verifier.clone()).await {
             Ok(client) => {
                 info!(validator = %url, "the paid-work clock reads and submits here");

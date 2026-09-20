@@ -45,8 +45,6 @@ use commonware_storage::{
 };
 use commonware_utils::{N3f1, NZU64, NZUsize, ordered::Set};
 use futures::FutureExt;
-use opentelemetry::trace::TracerProvider as _;
-use opentelemetry_otlp::{WithExportConfig as _, WithHttpConfig as _};
 use prometheus_client::metrics::gauge::Gauge;
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use std::io;
@@ -64,12 +62,6 @@ use tracing::{error, info, warn};
 const NAMESPACE: &[u8] = b"hellas";
 const MAX_MESSAGE_SIZE: u32 = 1024 * 1024;
 const CHANNEL_BACKLOG: usize = 1024;
-const DEFAULT_OTLP_SERVICE_NAME: &str = "hellas-validator";
-const DEFAULT_OTLP_SAMPLE_RATE: f64 = 1.0;
-const OTLP_ENDPOINT_ENV: &str = "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT";
-const OTLP_SERVICE_NAME_ENV: &str = "OTEL_SERVICE_NAME";
-const OTLP_SAMPLE_RATE_ENV: &str = "OTEL_TRACES_SAMPLER_ARG";
-const OTLP_HEADERS_ENV: &str = "OTEL_EXPORTER_OTLP_HEADERS";
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn random_private_key() -> ed25519::PrivateKey {
@@ -713,146 +705,6 @@ mod owner_index_replay_tests {
     }
 }
 
-fn env_non_empty(key: &str) -> Option<String> {
-    std::env::var(key).ok().and_then(|value| {
-        let trimmed = value.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
-        }
-    })
-}
-
-fn otlp_sample_rate() -> f64 {
-    let Some(raw) = env_non_empty(OTLP_SAMPLE_RATE_ENV) else {
-        return DEFAULT_OTLP_SAMPLE_RATE;
-    };
-    match raw.parse::<f64>() {
-        Ok(value) if (0.0..=1.0).contains(&value) => value,
-        _ => {
-            eprintln!(
-                "warning: invalid OTLP sample rate `{raw}` in {OTLP_SAMPLE_RATE_ENV}; expected a value in [0.0, 1.0], using {}",
-                DEFAULT_OTLP_SAMPLE_RATE,
-            );
-            DEFAULT_OTLP_SAMPLE_RATE
-        }
-    }
-}
-
-/// Initialise the tracing subscriber.
-///
-/// When `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` is set (and non-empty), an
-/// OpenTelemetry OTLP layer is added that exports traces over HTTP/protobuf.
-///
-/// Supported environment variables:
-///   RUST_LOG                             — log filter (default: info)
-///   OTEL_EXPORTER_OTLP_TRACES_ENDPOINT   — collector URL
-///   OTEL_SERVICE_NAME                    — service name (default: hellas-validator)
-///   OTEL_TRACES_SAMPLER_ARG             — sample rate 0.0–1.0 (default: 1.0)
-///   OTEL_EXPORTER_OTLP_HEADERS          — extra headers as k=v,k=v
-fn init_telemetry() -> Option<opentelemetry_sdk::trace::SdkTracerProvider> {
-    use tracing_subscriber::prelude::*;
-    use tracing_subscriber::util::SubscriberInitExt;
-
-    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-
-    let fmt_layer = tracing_subscriber::fmt::layer()
-        .with_line_number(true)
-        .with_thread_ids(true)
-        .with_file(true)
-        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
-        .with_writer(std::io::stderr)
-        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
-        .compact();
-
-    let (otel_layer, provider) = init_otlp_layer();
-
-    let subscriber = tracing_subscriber::registry()
-        .with(env_filter)
-        .with(fmt_layer)
-        .with(otel_layer);
-
-    match subscriber.try_init() {
-        Ok(()) => provider,
-        Err(err) => {
-            eprintln!("warning: validator tracing subscriber not installed: {err}");
-            if let Some(provider) = provider
-                && let Err(shutdown_err) = provider.shutdown()
-            {
-                eprintln!("warning: failed to shut down unused validator tracer: {shutdown_err}");
-            }
-            None
-        }
-    }
-}
-
-fn init_otlp_layer<S>() -> (
-    Option<tracing_opentelemetry::OpenTelemetryLayer<S, opentelemetry_sdk::trace::Tracer>>,
-    Option<opentelemetry_sdk::trace::SdkTracerProvider>,
-)
-where
-    S: tracing::Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span>,
-{
-    let endpoint = match env_non_empty(OTLP_ENDPOINT_ENV) {
-        Some(v) => v,
-        None => return (None, None),
-    };
-
-    let service_name = env_non_empty(OTLP_SERVICE_NAME_ENV)
-        .unwrap_or_else(|| DEFAULT_OTLP_SERVICE_NAME.to_string());
-
-    let sample_rate = otlp_sample_rate();
-
-    let headers: std::collections::HashMap<String, String> = env_non_empty(OTLP_HEADERS_ENV)
-        .map(|raw| {
-            raw.split(',')
-                .filter_map(|pair| {
-                    let (k, v) = pair.split_once('=')?;
-                    Some((k.trim().to_string(), v.trim().to_string()))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let mut http = opentelemetry_otlp::SpanExporter::builder()
-        .with_http()
-        .with_endpoint(&endpoint);
-
-    if !headers.is_empty() {
-        http = http.with_headers(headers);
-    }
-
-    let exporter = match http.build() {
-        Ok(e) => e,
-        Err(err) => {
-            eprintln!("warning: failed to build OTLP exporter: {err}");
-            return (None, None);
-        }
-    };
-
-    let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
-        .with_batch_exporter(exporter)
-        .with_sampler(opentelemetry_sdk::trace::Sampler::TraceIdRatioBased(
-            sample_rate,
-        ))
-        .with_resource(
-            opentelemetry_sdk::Resource::builder()
-                .with_service_name(service_name.clone())
-                .build(),
-        )
-        .build();
-
-    opentelemetry::global::set_tracer_provider(provider.clone());
-    let tracer = provider.tracer(service_name.clone());
-
-    eprintln!("otlp: enabled endpoint={endpoint} service={service_name} sample_rate={sample_rate}");
-
-    let layer = tracing_opentelemetry::layer().with_tracer(tracer);
-    (Some(layer), Some(provider))
-}
-
 fn spawn_metrics_server(context: tokio::Context, addr: SocketAddr) {
     use axum::{Router, routing::get};
 
@@ -1181,8 +1033,6 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
     let runner = tokio::Runner::new(runtime_cfg);
 
     runner.start(move |context| async move {
-        let tracer_provider = init_telemetry();
-
         if let Some(addr) = metrics_addr {
             spawn_metrics_server(context.child("telemetry"), addr);
         }
@@ -1585,12 +1435,6 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
         }
 
         graceful_stop(context, signal_triggered).await;
-
-        if let Some(provider) = tracer_provider
-            && let Err(err) = provider.shutdown()
-        {
-            warn!(?err, "failed to flush OTLP traces on shutdown");
-        }
 
         // Any non-signal trigger means a sibling actor died unexpectedly. Exit non-zero so
         // systemd's `Restart=on-failure` kicks in instead of treating us as a clean shutdown.

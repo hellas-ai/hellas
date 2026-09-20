@@ -173,7 +173,7 @@ pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()
     // resulting token IDs, not this tokenizer, label, or decoded text.
     let presentation = Arc::new(TextPresentation::load(&options.tokenizer)?);
     let input_ids = presentation.encode(&options.prompt)?;
-    let mut decoder = TextOutputDecoder::new(presentation);
+    let mut decoder = TextOutputDecoder::new(&presentation);
     let manifest_id = options.causal_lm.manifest_id();
     info!(program_manifest = %manifest_id, "using canonical causal-LM environment");
     let runner_key = options.producer_key.clone();
@@ -276,6 +276,8 @@ pub async fn run(options: ExecuteOptions, secret_key: SecretKey) -> CliResult<()
                     }
                 }
                 ExecutionEvent::Done(Outcome::Completed { .. }) => {
+                    print!("{}", decoder.finish()?);
+                    io::stdout().flush()?;
                     completed = true;
                     break;
                 }

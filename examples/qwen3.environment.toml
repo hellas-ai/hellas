@@ -593,3 +593,9 @@ static_inputs = [
   { object = 1, offset = 11401845088, bytes = 8192 },
   { object = 1, offset = 9571539296, bytes = 622329856 },
 ]
+
+# This schedule is part of the environment identity. It bounds prefill memory
+# and permits exact-prefix state reuse across interactive requests.
+[generation]
+fixed_capacity = 32768
+prefill_chunk_tokens = 64

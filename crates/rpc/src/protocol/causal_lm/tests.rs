@@ -88,6 +88,47 @@ fn canonical_environment_round_trips_and_builds_the_exact_application() {
 }
 
 #[test]
+fn generation_schedule_is_committed_without_changing_legacy_environments() {
+    let legacy = example();
+    let scheduled = legacy
+        .clone()
+        .with_generation_schedule(CausalLmGenerationSchedule {
+            fixed_capacity: 8192,
+            prefill_chunk_tokens: 256,
+        })
+        .unwrap();
+    let bytes = scheduled.canonical_bytes();
+    assert_eq!(bytes[0], 0x88);
+    assert_eq!(
+        &bytes[1..legacy.canonical_bytes().len()],
+        &legacy.canonical_bytes()[1..]
+    );
+    assert_eq!(
+        CausalLmEnvironment::from_canonical_bytes(&bytes).unwrap(),
+        scheduled
+    );
+    assert_ne!(scheduled.content_id(), legacy.content_id());
+    assert_ne!(
+        scheduled.manifest().content_id(),
+        legacy.manifest().content_id()
+    );
+    for (fixed_capacity, prefill_chunk_tokens) in [(0, 1), (8193, 1), (8192, 0), (2, 3)] {
+        assert!(
+            legacy
+                .clone()
+                .with_generation_schedule(CausalLmGenerationSchedule {
+                    fixed_capacity,
+                    prefill_chunk_tokens,
+                })
+                .is_err()
+        );
+    }
+    let mut malformed = bytes;
+    malformed[legacy.canonical_bytes().len()] = 0x81;
+    assert!(CausalLmEnvironment::from_canonical_bytes(&malformed).is_err());
+}
+
+#[test]
 fn slice_ranges_and_state_sizes_are_checked() {
     let mut invalid_slice = example();
     invalid_slice.static_inputs[0] = StaticSlice::new(0, 4_080, 32);

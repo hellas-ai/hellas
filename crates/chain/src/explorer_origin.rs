@@ -1,8 +1,8 @@
 //! Private HTTP proof origin backed by the native Commonware follower archive.
 //! Bind only to loopback; Cloudflare Tunnel + Access supplies external authentication.
 use crate::{
-    Application, ApplicationConfig, ChainIndexer, ConsensusInfo, ConsensusVerifier,
-    FinalizedBlockQuery, LightClient as _,
+    Application, ApplicationConfig, ChainIndexer, ConsensusInfo, FinalizedBlockQuery,
+    LightClient as _,
     config::Config,
     domain::{Digest, PublicKey},
     follower::{FollowerStatusSink, ingest_finalized_block},
@@ -30,7 +30,7 @@ use std::{
 type OriginResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 pub struct OriginOptions {
-    pub rpc: String,
+    pub rpc: Vec<String>,
     pub trust: TrustDocument,
     /// Exact independently provisioned genesis JSON bytes; None uses the embedded devnet.
     pub genesis_json: Option<Vec<u8>>,
@@ -41,6 +41,9 @@ pub struct OriginOptions {
 }
 
 pub fn run(options: OriginOptions) -> OriginResult<()> {
+    if options.rpc.is_empty() || options.rpc.iter().any(|rpc| rpc.trim().is_empty()) {
+        return Err("explorer origin requires at least one nonempty RPC endpoint".into());
+    }
     if !options.listen.ip().is_loopback() {
         return Err("private explorer origin must bind to loopback".into());
     }
@@ -65,8 +68,17 @@ pub fn run(options: OriginOptions) -> OriginResult<()> {
                 .collect(),
             threshold_identity: hex::decode(&options.trust.epochs[0].threshold_identity)?,
         };
-        let leader = PublicKey::decode(hex::decode(&info.validators[0])?.as_slice())?;
-        let allocations = genesis
+        // Consensus uses the first participant in its ordered committee, not
+        // the first validator in the genesis document's deployment order.
+        let mut participants = Vec::with_capacity(info.validators.len());
+        for validator in &info.validators {
+            participants.push(PublicKey::decode(hex::decode(validator)?.as_slice())?);
+        }
+        let leader = participants
+            .into_iter()
+            .min()
+            .ok_or("genesis contains no validators")?;
+        let mut allocations = genesis
             .allocations
             .iter()
             .map(|entry| {
@@ -76,6 +88,9 @@ pub fn run(options: OriginOptions) -> OriginResult<()> {
                 ))
             })
             .collect::<Result<Vec<_>, crate::config::ConfigError>>()?;
+        // Coin IDs are assigned in the same settlement-key order used by
+        // ValidatorConfig::genesis_allocations.
+        allocations.sort_by_key(|entry| entry.0);
         let application = Application::new(
             context.child("app"),
             crate::domain::network_id(&genesis)?,
@@ -170,16 +185,25 @@ impl OwnerSnapshots {
     }
 }
 
+#[cfg(feature = "otel")]
+#[path = "explorer_origin/telemetry.rs"]
+mod telemetry;
+#[cfg(not(feature = "otel"))]
+#[path = "explorer_origin/telemetry_noop.rs"]
+mod telemetry;
+
 fn router(state: OriginState) -> Router {
-    Router::new()
-        .route("/api/v1/blocks/{selector}", get(block))
-        .route("/api/v1/blocks/{selector}/proof", get(block))
-        .route("/api/v1/blocks/by-payload/{payload}", get(payload))
-        .route("/api/v1/transactions/{digest}", get(transaction))
-        .route("/api/v1/transactions/{digest}/proof", get(transaction))
-        .route("/api/v1/addresses/{owner}/proof", get(address))
-        .route("/api/v1/addresses/{owner}", get(address))
-        .with_state(state)
+    telemetry::layer(
+        Router::new()
+            .route("/api/v1/blocks/{selector}", get(block))
+            .route("/api/v1/blocks/{selector}/proof", get(block))
+            .route("/api/v1/blocks/by-payload/{payload}", get(payload))
+            .route("/api/v1/transactions/{digest}", get(transaction))
+            .route("/api/v1/transactions/{digest}/proof", get(transaction))
+            .route("/api/v1/addresses/{owner}/proof", get(address))
+            .route("/api/v1/addresses/{owner}", get(address))
+            .with_state(state),
+    )
 }
 
 async fn block(
@@ -468,10 +492,8 @@ fn failure(status: StatusCode, message: &str) -> Response {
 }
 
 fn proof_bundle(state: &OriginState, finalized: crate::FinalizedBlock) -> ProofBundle {
-    let epoch = ConsensusVerifier::decode_finalization(&finalized.snapshot.finalization)
-        .map_or(u64::MAX, |finalization| {
-            finalization.proposal.round.epoch().get()
-        });
+    let epoch = crate::finality_proof::FinalityProof::decode(&finalized.snapshot.finalization)
+        .map_or(u64::MAX, |proof| proof.certificate_epoch());
     ProofBundle {
         schema_version: PROOF_SCHEMA_VERSION,
         network_id: state.network_id.clone(),
@@ -565,20 +587,24 @@ async fn index_transactions(state: OriginState) -> OriginResult<()> {
 
 async fn follow_trusted(
     state: OriginState,
-    rpc: String,
+    endpoints: Vec<String>,
     status: FollowerStatusSink,
 ) -> OriginResult<()> {
+    let mut next_upstream = 0;
     loop {
+        let upstream = next_upstream;
+        next_upstream = (next_upstream + 1) % endpoints.len();
         // The remote client is only a transport/codec here. The authenticated height-key
         // schedule below verifies every block before the native archive sees it.
-        let client = match crate::client::RemoteLightClient::connect(rpc.clone()).await {
-            Ok(client) => client,
-            Err(error) => {
-                tracing::warn!(%error,"explorer upstream connection failed");
-                ::tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                continue;
-            }
-        };
+        let client =
+            match crate::client::RemoteLightClient::connect(endpoints[upstream].clone()).await {
+                Ok(client) => client,
+                Err(error) => {
+                    tracing::warn!(upstream, %error,"explorer upstream connection failed");
+                    ::tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    continue;
+                }
+            };
         loop {
             let next = state
                 .indexer
@@ -591,19 +617,25 @@ async fn follow_trusted(
             {
                 Ok(Some(finalized)) => finalized,
                 Ok(None) => {
+                    // A lagging validator must not pin the archive indefinitely.
+                    // The next connection resumes at the same committed height.
                     ::tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                    continue;
+                    break;
                 }
                 Err(error) => {
-                    tracing::warn!(%error,"explorer upstream disconnected");
+                    tracing::warn!(upstream, height=next, %error,"explorer upstream disconnected");
                     ::tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                     break;
                 }
             };
-            state.verifier.verify(
+            if let Err(error) = state.verifier.verify(
                 proof_bundle(&state, remote.clone()),
                 ExplorerQuery::Block(FinalizedBlockQuery::Height(next)),
-            )?;
+            ) {
+                tracing::warn!(upstream, height=next, %error,"explorer upstream proof rejected");
+                ::tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                break;
+            }
             ingest_finalized_block(&state.indexer, remote, next, &status).await?;
             ::tokio::task::yield_now().await;
         }

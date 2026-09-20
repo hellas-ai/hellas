@@ -37,6 +37,7 @@ in
       rocm.rocm-core
       rocm.rocm-device-libs
       rocm.rocm-runtime
+      pkgs.rocmPackages.rocwmma
     ];
   };
   cudaToolkit = pkgs.symlinkJoin {

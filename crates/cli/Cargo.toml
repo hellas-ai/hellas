@@ -62,6 +62,11 @@ validator = ["indexer", "hellas-chain/validator"]
 # `serve/node.rs` collapse to identity, and iroh's metrics
 # module is not built.
 otel = [
+    "hellas-chain?/otel",
+    "hellas-rpc/otel",
+    "hellas-executor?/otel",
+    "hellas-gateway?/otel",
+    "hellas-providers/otel",
     "dep:opentelemetry",
     "dep:opentelemetry_sdk",
     "dep:opentelemetry-otlp",

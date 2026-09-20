@@ -27,6 +27,8 @@ fn anchor() -> ProviderTrustAnchor {
 /// A gateway pointed at one node, which callers then vary.
 fn options(provider_trust: Option<ProviderTrustAnchor>) -> GatewayOptions {
     GatewayOptions {
+        paid_work: None,
+        bearer_token_file: None,
         host: "127.0.0.1".to_string(),
         port: None,
         node_id: Some(endpoint(1)),
@@ -45,6 +47,7 @@ fn options(provider_trust: Option<ProviderTrustAnchor>) -> GatewayOptions {
         #[cfg(feature = "evaluate")]
         local_content_store: None,
         tokenizer: "tokenizer.json".into(),
+        chat_template: None,
         stop_token_ids: Vec::new(),
         metrics_port: None,
         responses_backend: ResponsesBackend::Hellas,

@@ -244,6 +244,10 @@ impl CausalLmExecutionEnvironment {
     pub const fn manifest_id(&self) -> ContentId {
         self.manifest_id
     }
+
+    pub(crate) fn environment(&self) -> &hellas_rpc::CausalLmEnvironment {
+        &self.environment
+    }
 }
 
 #[cfg(test)]

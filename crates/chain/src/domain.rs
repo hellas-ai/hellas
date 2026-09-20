@@ -1788,7 +1788,10 @@ mod tests {
             .iter()
             .map(|allocation| allocation.address.as_str())
             .collect();
-        let expected: Vec<String> = scalars.iter().copied().map(address_for).collect();
+        let mut expected: Vec<String> = scalars.iter().copied().map(address_for).collect();
+        // The foundation allocation is documented in the network README; its
+        // key is generated independently, not derived from a public scalar.
+        expected.push("25uDmUCQcwYUHHyXthtEspGB2KVTmbys8vTSqAMXKNqRV".to_string());
         assert_eq!(funded, expected, "{}", genesis.network_id);
     }
 

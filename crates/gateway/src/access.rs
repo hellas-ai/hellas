@@ -1,19 +1,4 @@
-//! The two things that stand between an HTTP caller and the executor: a
-//! per-run bearer credential, and a bind address that is loopback by
-//! parse rather than by spelling.
-//!
-//! The gateway's routes reach an `ExecutorHandle`. Before this module
-//! they were reachable by anyone who could open the port, which made the
-//! bind address the entire access control. Now every executor-reaching
-//! route — and, when it is switched on, the metrics endpoint — sits
-//! behind [`BearerLayer`], and the listener refuses to come up anywhere
-//! but loopback.
-//!
-//! The credential lives for one run. It is generated at startup, kept in
-//! memory, shown once on the controlling terminal, and never written
-//! anywhere else: [`Bearer`]'s `Debug` is redacted so it cannot reach a
-//! log through a `{:?}` on a struct that happens to contain it, and the
-//! refusal response names no value it was given.
+//! Bearer authentication for gateway HTTP requests.
 
 use axum::body::Body;
 use axum::http::{HeaderMap, Request, Response, StatusCode, header};
@@ -41,7 +26,7 @@ const NOT_A_DIGIT: usize = 0x100;
 #[cfg(test)]
 static DIGIT_STEPS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// The run's bearer credential.
+/// The gateway bearer credential.
 ///
 /// There is no `Display`, no `Serialize`, and no derived `Debug`: the
 /// only way out of this type is [`Bearer::announce`], which writes to the
@@ -51,8 +36,65 @@ pub(crate) struct Bearer {
 }
 
 impl Bearer {
-    /// Draw a fresh credential for this run. Not configured and not
-    /// persisted: a restart invalidates the old one, which is the point.
+    pub(crate) fn load_or_create(path: &std::path::Path) -> anyhow::Result<Self> {
+        use anyhow::Context as _;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path);
+        let mut file = match file {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let bearer = Self::generate();
+                bearer.write_private(path)?;
+                return Ok(bearer);
+            }
+            Err(error) => return Err(error).context("failed to open gateway credential"),
+        };
+        let metadata = file.metadata()?;
+        anyhow::ensure!(
+            metadata.is_file() && metadata.permissions().mode() & 0o077 == 0,
+            "gateway credential must be a private regular file"
+        );
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut std::io::Read::take(&mut file, 128), &mut bytes)?;
+        let text = std::str::from_utf8(&bytes)?.trim();
+        anyhow::ensure!(
+            text.len() == TOKEN_HEX_LEN,
+            "invalid gateway credential length"
+        );
+        let mut token = [0u8; TOKEN_BYTES];
+        for (index, byte) in token.iter_mut().enumerate() {
+            let hi = hex_digit(text.as_bytes()[index * 2]);
+            let lo = hex_digit(text.as_bytes()[index * 2 + 1]);
+            anyhow::ensure!(
+                hi < 16 && lo < 16,
+                "gateway credential must be lowercase hex"
+            );
+            *byte = ((hi << 4) | lo) as u8;
+        }
+        Ok(Self { token })
+    }
+
+    pub(crate) fn write_private(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        use anyhow::Context as _;
+        let parent = path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        // NamedTempFile creates mode 0600 and persist atomically replaces
+        // the destination without following an existing symlink.
+        let mut file = tempfile::NamedTempFile::new_in(parent)
+            .context("failed to create private gateway credential file")?;
+        writeln!(file, "{}", self.child_credential())?;
+        file.as_file().sync_all()?;
+        file.persist(path)
+            .context("failed to publish gateway credential file")?;
+        Ok(())
+    }
+
+    /// Draw a fresh credential; callers may persist it for managed clients.
     pub(crate) fn generate() -> Self {
         Self {
             token: rand::random(),
@@ -72,7 +114,7 @@ impl Bearer {
     /// credential itself stays in memory.
     pub(crate) fn announce(&self) {
         let line = format!(
-            "gateway bearer (this run only): Authorization: Bearer {}\n",
+            "gateway bearer: Authorization: Bearer {}\n",
             encode_hex(&self.token)
         );
         match std::fs::OpenOptions::new().write(true).open("/dev/tty") {
@@ -250,13 +292,8 @@ fn unauthorized() -> Response<Body> {
     response
 }
 
-/// Resolve `host:port` and refuse to bind anywhere but loopback.
-///
-/// The address is parsed and its `is_loopback` asked, never spelled
-/// against `"127.0.0.1"` or `"localhost"`: `127.0.0.2` is loopback and a
-/// spelling check would refuse it, and a `localhost` that resolves off
-/// this machine is not loopback however it is spelled.
-pub(crate) async fn loopback_addr(host: &str, port: u16) -> anyhow::Result<SocketAddr> {
+/// Resolve the explicitly configured listener address.
+pub(crate) async fn bind_addr(host: &str, port: u16) -> anyhow::Result<SocketAddr> {
     let resolved: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
         .await
         .map_err(|err| {
@@ -266,13 +303,6 @@ pub(crate) async fn loopback_addr(host: &str, port: u16) -> anyhow::Result<Socke
     let Some(first) = resolved.first().copied() else {
         anyhow::bail!("gateway bind address `{host}:{port}` resolved to no address");
     };
-    if let Some(exposed) = resolved.iter().find(|addr| !addr.ip().is_loopback()) {
-        anyhow::bail!(
-            "refusing to bind the gateway to `{host}:{port}`: it resolves to {}, which is not \
-             loopback, and these routes reach the executor",
-            exposed.ip()
-        );
-    }
     Ok(first)
 }
 

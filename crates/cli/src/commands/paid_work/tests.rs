@@ -3,6 +3,35 @@ use hellas_kernel::NetworkId;
 use hellas_rpc::peers::PeerId;
 
 #[test]
+fn recovery_skips_only_permanent_delivery_refusals() {
+    use hellas_client::work::CollectResultError;
+    use hellas_work::work::{DeliverError, WorkRefusal};
+
+    for (refusal, permanent) in [
+        (WorkRefusal::Declined, true),
+        (WorkRefusal::Expired, true),
+        (WorkRefusal::NotReady, false),
+        (WorkRefusal::Unavailable, false),
+    ] {
+        let delivery = || DeliverError::Refused {
+            refusal,
+            reason: "provider diagnostic".to_owned(),
+        };
+        assert_eq!(permanently_refused_delivery(&delivery().into()), permanent);
+        assert_eq!(
+            permanently_refused_delivery(&CollectResultError::Deliver(delivery()).into()),
+            permanent,
+        );
+    }
+    assert!(!permanently_refused_delivery(
+        &DeliverError::Malformed("result").into()
+    ));
+    assert!(!permanently_refused_delivery(&anyhow::anyhow!(
+        "connection lost"
+    )));
+}
+
+#[test]
 fn relative_deadlines_are_ordered_from_the_current_cursor() {
     let args = RunArgs {
         work_config: "work.json".into(),

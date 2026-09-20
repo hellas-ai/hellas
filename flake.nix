@@ -74,6 +74,9 @@
         default = self.nixosModules.hellas;
       };
 
+      darwinModules.hellas = import ./nix/modules/darwin.nix { inherit self; };
+      darwinModules.default = self.darwinModules.hellas;
+
       homeManagerModules.hellas = import ./nix/modules/home-manager.nix { inherit self; };
       homeManagerModules.default = self.homeManagerModules.hellas;
     };

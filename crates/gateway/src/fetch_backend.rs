@@ -58,8 +58,10 @@ impl ResponsesFetchBackend {
 impl ExecutionBackend for ResponsesFetchBackend {
     fn stream<'a>(&'a self, request: BackendRequest) -> BackendFuture<'a, BackendStream> {
         Box::pin(async move {
+            let mut inference = crate::backend::telemetry::Inference::new(&request);
             let ProviderRequestBody { payload, retention } =
-                provider_request_body(&request, &self.request_overrides)?;
+                provider_request_body(&request, &self.request_overrides)
+                    .inspect_err(|error| inference.fail(error))?;
             let (input, input_commitment) = signed_input_events_with_commitment(
                 &self.service,
                 &self.method,
@@ -70,16 +72,18 @@ impl ExecutionBackend for ResponsesFetchBackend {
                 retention,
             )
             .map_err(|source| {
-                BackendError::failed(format!("failed to sign fetch request: {source}"))
+                let error = BackendError::failed(format!("failed to sign fetch request: {source}"));
+                inference.fail(&error);
+                error
             })?;
             let fetch_request = FetchRequest { input };
             Ok(BackendStream::new(
-                fetch_events(
+                inference.stream(fetch_events(
                     self.runtime.clone(),
                     self.route.clone(),
                     fetch_request,
                     self.caller_key.clone(),
-                ),
+                )),
                 Some(Provenance {
                     call_commitment: Some(input_commitment),
                 }),

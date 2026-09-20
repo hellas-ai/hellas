@@ -26,6 +26,7 @@ let
     ;
 
   cfg = config.services.hellas-chain-validators;
+  hellas = import ./hellas.nix { inherit self; };
 
   localPorts = validator: basePort: genList (i: basePort + validator.nodeOffset + i) validator.nodes;
 
@@ -39,20 +40,10 @@ let
 
   mkOtelEnv =
     validator:
-    optionalAttrs (validator.otel.endpoint != null) (
-      {
-        OTEL_EXPORTER_OTLP_TRACES_ENDPOINT = validator.otel.endpoint;
-        OTEL_SERVICE_NAME = validator.otel.serviceName;
-      }
-      // optionalAttrs (validator.otel.sampleRate != null) {
-        OTEL_TRACES_SAMPLER_ARG = toString validator.otel.sampleRate;
-      }
-      // optionalAttrs (validator.otel.headers != { }) {
-        OTEL_EXPORTER_OTLP_HEADERS = concatStringsSep "," (
-          mapAttrsToList (name: value: "${name}=${value}") validator.otel.headers
-        );
-      }
-    );
+    hellas.mkOtelEnv {
+      inherit lib;
+      inherit (validator) otel;
+    };
 
   mkConfigFile =
     validator: index:
@@ -99,7 +90,9 @@ let
         enable = mkEnableOption "Hellas validator cluster";
         package = mkOption {
           type = types.package;
-          default = self.packages.${pkgs.stdenv.hostPlatform.system}.cli-validator;
+          default = self.packages.${pkgs.stdenv.hostPlatform.system}.cli-validator.override {
+            otel = config.otel.enable;
+          };
           defaultText = literalExpression "self.packages.\${system}.cli-validator";
           description = "Hellas CLI package built with the validator feature.";
         };
@@ -225,24 +218,10 @@ let
           example = "2G";
           description = "Optional systemd MemoryMax for each validator.";
         };
-        otel = {
-          endpoint = mkOption {
-            type = types.nullOr types.str;
-            default = null;
-            description = "OTLP HTTP trace endpoint.";
-          };
-          serviceName = mkOption {
-            type = types.str;
-            default = "hellas-validator";
-          };
-          sampleRate = mkOption {
-            type = types.nullOr (types.numbers.between 0.0 1.0);
-            default = null;
-          };
-          headers = mkOption {
-            type = types.attrsOf types.str;
-            default = { };
-          };
+        otel = hellas.otelOptions {
+          inherit lib;
+          cfg = config.otel;
+          serviceName = "hellas-validator";
         };
       };
 

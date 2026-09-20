@@ -1705,3 +1705,118 @@ async fn fetch_queue_dispatches_after_active_completion() {
     assert!(second_finished.terminal_output_event.is_some());
     assert_eq!(provider.calls(), 2);
 }
+
+#[cfg(feature = "otel")]
+#[tokio::test]
+async fn queued_fetch_preserves_each_request_parent_when_dispatched_later() {
+    use opentelemetry::trace::TracerProvider;
+    use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+    use tracing::Instrument;
+    use tracing_subscriber::prelude::*;
+
+    struct TracedProvider(ReleasableFetchProvider);
+    impl FetchProvider for TracedProvider {
+        fn execution_environment(&self) -> hellas_rpc::ContentId {
+            test_environment()
+        }
+        fn run(&self, request: PreparedFetchRequest) -> FetchProviderFuture<'_> {
+            Box::pin(
+                self.0
+                    .run(request)
+                    .instrument(tracing::info_span!("test.fetch.provider")),
+            )
+        }
+    }
+
+    let exporter = InMemorySpanExporter::default();
+    let tracer_provider = SdkTracerProvider::builder()
+        .with_simple_exporter(exporter.clone())
+        .build();
+    // This fixture uses Tokio's current-thread runtime, including the actor
+    // and the detached provider tasks. No process-global subscriber is changed.
+    let subscriber = tracing_subscriber::registry()
+        .with(tracing_opentelemetry::layer().with_tracer(tracer_provider.tracer("test")));
+    let _subscriber = tracing::subscriber::set_default(subscriber);
+    let signing_key = key();
+    let provider = ReleasableFetchProvider::default();
+    let handle = spawn_fetch_executor(Arc::new(TracedProvider(provider.clone())), 1, 1).await;
+    let first_ticket = handle
+        .create_fetch_ticket(fetch_request(&signing_key, "echo", "run", br#"{"n":1}"#))
+        .await
+        .unwrap()
+        .response;
+    let second_ticket = handle
+        .create_fetch_ticket(fetch_request(&signing_key, "echo", "run", br#"{"n":2}"#))
+        .await
+        .unwrap()
+        .response;
+
+    let first_parent = tracing::info_span!(parent: None, "test.first.request");
+    let second_parent = tracing::info_span!(parent: None, "test.queued.request");
+    let first_outcome = handle
+        .run_ticket_handle(run_ticket_request(first_ticket, &signing_key))
+        .instrument(first_parent.clone())
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(2), async {
+        while provider.calls() != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let second_outcome = handle
+        .run_ticket_handle(run_ticket_request(second_ticket, &signing_key))
+        .instrument(second_parent.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        provider.calls(),
+        1,
+        "the second request must actually be queued"
+    );
+    drop(first_parent);
+    drop(second_parent);
+
+    provider.release();
+    for outcome in [first_outcome, second_outcome] {
+        let (_, finished) = timeout(Duration::from_secs(2), drain_outcome(outcome.events))
+            .await
+            .unwrap();
+        assert!(finished.terminal_output_event.is_some());
+    }
+    assert_eq!(provider.calls(), 2);
+    // Each provider task sends its completion after the terminal event. Wait
+    // for those tasks to release their retained parent spans before inspecting.
+    timeout(Duration::from_secs(2), async {
+        while exporter.get_finished_spans().unwrap().len() < 4 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    tracer_provider.force_flush().unwrap();
+    let spans = exporter.get_finished_spans().unwrap();
+    assert_eq!(spans.len(), 4);
+    let parents = ["test.first.request", "test.queued.request"]
+        .map(|name| spans.iter().find(|span| span.name == name).unwrap());
+    assert_ne!(
+        parents[0].span_context.trace_id(),
+        parents[1].span_context.trace_id()
+    );
+    for parent in parents {
+        assert_eq!(
+            spans
+                .iter()
+                .filter(|span| {
+                    span.name == "test.fetch.provider"
+                        && span.parent_span_id == parent.span_context.span_id()
+                        && span.span_context.trace_id() == parent.span_context.trace_id()
+                })
+                .count(),
+            1,
+            "provider execution must retain its own admission parent"
+        );
+    }
+    tracer_provider.shutdown().unwrap();
+}

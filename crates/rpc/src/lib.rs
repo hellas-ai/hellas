@@ -60,6 +60,7 @@ pub mod run_ticket;
 pub mod serve;
 #[cfg(feature = "execute")]
 pub mod stream;
+pub mod telemetry;
 
 pub mod provenance;
 
@@ -74,14 +75,14 @@ pub use tokens::{
 pub use protocol::{
     APPLE_APP_ATTEST, AppleAppAttestEnrollment, Application, ApplicationError, Assurance,
     CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR, CODEX_RESPONSES_ADAPTOR, CODEX_RESPONSES_ENDPOINT,
-    CanonicalizationId, CausalLmEnvironment, CausalLmEnvironmentError, ContentId, ContentRef,
-    DagCborDecodeError, DagCborDecoder, DagCborEncodeError, DagCborEncoder, Digest, Evaluate,
-    EvaluateRequest, EventCommitment, FETCH_EVALUATOR, FetchEnvironment, InputCommitment,
-    InputEventBody, InputEventBodyParts, InputEventEnvelope, InputTranscriptBuilder, JobTerms,
-    JsonBytes, MAX_APPLICATION_ID_BYTES, MAX_CAUSAL_LM_ENVIRONMENT_BYTES,
-    MAX_CAUSAL_LM_STATIC_BYTES, OPEN_EXPORTER_LEN, OPEN_NONCE_LEN, OPEN_PROOF_DOMAIN,
-    OPEN_PROVIDER_ROLE, OPENAI_RESPONSES_ADAPTOR, OPENAI_RESPONSES_ENDPOINT, Operation,
-    OutputEventBody, OutputEventBodyParts, OutputEventEnvelope, OutputTranscriptBuilder,
+    CanonicalizationId, CausalLmEnvironment, CausalLmEnvironmentError, CausalLmGenerationSchedule,
+    ContentId, ContentRef, DagCborDecodeError, DagCborDecoder, DagCborEncodeError, DagCborEncoder,
+    Digest, Evaluate, EvaluateRequest, EventCommitment, FETCH_EVALUATOR, FetchEnvironment,
+    InputCommitment, InputEventBody, InputEventBodyParts, InputEventEnvelope,
+    InputTranscriptBuilder, JobTerms, JsonBytes, MAX_APPLICATION_ID_BYTES,
+    MAX_CAUSAL_LM_ENVIRONMENT_BYTES, MAX_CAUSAL_LM_STATIC_BYTES, OPEN_EXPORTER_LEN, OPEN_NONCE_LEN,
+    OPEN_PROOF_DOMAIN, OPEN_PROVIDER_ROLE, OPENAI_RESPONSES_ADAPTOR, OPENAI_RESPONSES_ENDPOINT,
+    Operation, OutputEventBody, OutputEventBodyParts, OutputEventEnvelope, OutputTranscriptBuilder,
     PlatformCredential, PlatformEnrollment, ProducerId, ProducerSigningKey, ProgramManifest,
     ProviderEnrollmentBundle, ProviderGenesisDecodeError, ProviderGenesisStatement,
     ProviderIdentityV1, PublicKey, RequestCommitment, Retention, RootKind, RootProof, SchemeId,

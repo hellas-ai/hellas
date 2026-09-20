@@ -277,6 +277,7 @@ impl Executor {
                         format!("{}/{}", provider_request.service, provider_request.method);
                     let (sender, receiver) = mpsc::channel(PER_EXECUTION_CHANNEL_CAPACITY);
                     let pending = PendingFetch {
+                        span: tracing::Span::current(),
                         request: provider_request,
                         provider: entry.provider,
                         input_commitment,
@@ -884,43 +885,48 @@ fn spawn_fetch_provider(
     producer_key: Arc<ProducerSigningKey>,
     pending: PendingFetch,
 ) {
-    tokio::spawn(async move {
-        let PendingFetch {
-            request,
-            provider,
-            projector,
-            quota_reservation,
-            input_commitment,
-            assurance,
-            request_commitment_id,
-            execution_id,
-            metric_name,
-            sender,
-        } = pending;
-        let result = run_fetch_provider(
-            provider,
-            request,
-            projector,
-            input_commitment,
-            assurance,
-            &producer_key,
-            sender.clone(),
-        )
-        .await;
-        let _ = completion_tx
-            .send(ExecutorCompletion::FetchFinished(Box::new(
-                FetchCompletion {
-                    input_commitment,
-                    request_commitment_id,
-                    quota_reservation,
-                    execution_id,
-                    metric_name,
-                    sender,
-                    result,
-                },
-            )))
+    let span = pending.span.clone();
+    tokio::spawn(tracing::Instrument::instrument(
+        async move {
+            let PendingFetch {
+                span: _,
+                request,
+                provider,
+                projector,
+                quota_reservation,
+                input_commitment,
+                assurance,
+                request_commitment_id,
+                execution_id,
+                metric_name,
+                sender,
+            } = pending;
+            let result = run_fetch_provider(
+                provider,
+                request,
+                projector,
+                input_commitment,
+                assurance,
+                &producer_key,
+                sender.clone(),
+            )
             .await;
-    });
+            let _ = completion_tx
+                .send(ExecutorCompletion::FetchFinished(Box::new(
+                    FetchCompletion {
+                        input_commitment,
+                        request_commitment_id,
+                        quota_reservation,
+                        execution_id,
+                        metric_name,
+                        sender,
+                        result,
+                    },
+                )))
+                .await;
+        },
+        span,
+    ));
 }
 
 async fn run_fetch_provider(

@@ -109,8 +109,12 @@ impl ExecutorHandle {
         &self,
         request: RunTicketRequest,
     ) -> Result<ExecuteOutcome, ExecutorError> {
-        self.send(|reply| ExecutorRequest::Execute { request, reply })
-            .await
+        self.send(|reply| ExecutorRequest::Execute {
+            span: tracing::Span::current(),
+            request,
+            reply,
+        })
+        .await
     }
 
     pub async fn get_stats_handle(&self) -> Result<GetStatsResponse, ExecutorError> {

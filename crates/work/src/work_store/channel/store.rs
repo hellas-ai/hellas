@@ -77,7 +77,7 @@ impl ChannelStore {
         state.indeterminate = state
             .jobs
             .values()
-            .filter(|job| job.phase == JobPhase::Running)
+            .filter(|job| matches!(job.phase, JobPhase::Running | JobPhase::Streaming))
             .map(|job| (job.work_id, ()))
             .collect();
         journal.observe_replay(replayed, replay.records.len());
