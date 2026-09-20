@@ -1,0 +1,874 @@
+use super::*;
+use crate::{
+    domain::{self, Transaction},
+    edge_index::{projection::EdgeIndexClient, types::*},
+    execution::test_support::{ConsensusFixture, consensus_fixture, finalization, run_qmdb},
+    verified_explorer::PROOF_SCHEMA_VERSION,
+};
+use commonware_codec::{DecodeExt as _, Encode as _};
+use commonware_consensus::{
+    CertifiableBlock as _,
+    simplex::types::Context,
+    types::{Epoch, Height, Round, View},
+};
+use commonware_cryptography::{Hasher as _, Sha256};
+use commonware_runtime::{Supervisor as _, tokio};
+use commonware_storage::{mmr::Location, qmdb::sync::Target};
+use commonware_utils::non_empty_range;
+use hellas_genesis::{
+    Genesis, GenesisAllocation, GenesisValidator, HELLAS_DEVNET_1_ID, TrustDocument, TrustEpoch,
+};
+use hellas_kernel::{
+    Auth, BlockHeight, CoinId, Funding, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Parties, Payout,
+    ProtocolCode, Secp256k1Signer, Terms, Tx,
+};
+
+struct Harness {
+    producer: UtxoDatabase<tokio::Context>,
+    replay: Replay<tokio::Context>,
+    index: EdgeIndex,
+    head: HellasBlock,
+    committee: ConsensusFixture,
+    verifier: ExplorerVerifier,
+    client: EdgeIndexClient,
+    allocations: Vec<(SettlementKey, u64)>,
+    network: hellas_kernel::NetworkId,
+    name: &'static str,
+    directory: tempfile::TempDir,
+    genesis_json: Vec<u8>,
+    trust: TrustDocument,
+}
+impl Harness {
+    async fn new(
+        runtime: tokio::Context,
+        allocations: Vec<(SettlementKey, u64)>,
+        name: &'static str,
+    ) -> Self {
+        let network = hellas_kernel::NetworkId::new(HELLAS_DEVNET_1_ID).unwrap();
+        let committee = consensus_fixture(7191);
+        let genesis = Genesis {
+            schema_version: 1,
+            network_id: HELLAS_DEVNET_1_ID.into(),
+            validators: committee
+                .leaders
+                .iter()
+                .enumerate()
+                .map(|(i, key)| GenesisValidator {
+                    public_key: hex::encode(key.encode()),
+                    label: format!("validator-{i}"),
+                })
+                .collect(),
+            allocations: allocations
+                .iter()
+                .map(|(key, value)| GenesisAllocation {
+                    address: key.to_string(),
+                    balance: *value,
+                })
+                .collect(),
+        };
+        let genesis_json = serde_json::to_vec(&genesis).unwrap();
+        let trust = TrustDocument {
+            schema_version: 1,
+            network_id: HELLAS_DEVNET_1_ID.into(),
+            genesis_sha256: hex::encode(Sha256::hash(&genesis_json)),
+            epochs: vec![TrustEpoch {
+                epoch: 0,
+                start_height: 0,
+                end_height: None,
+                threshold_identity: hex::encode(committee.assembler.identity().encode()),
+            }],
+        };
+        let verifier = ExplorerVerifier::with_genesis(trust.clone(), &genesis_json).unwrap();
+        let client = EdgeIndexClient::with_genesis(trust.clone(), &genesis_json).unwrap();
+        let (root, target) = crate::execution::store::empty_state(
+            runtime.child("genesis"),
+            "edge-test-genesis",
+            1024,
+            8,
+        )
+        .await;
+        let head = HellasBlock::genesis(committee.leaders[0].clone(), root, target);
+        let directory = tempfile::tempdir().unwrap();
+        let index = EdgeIndex::open(
+            &directory.path().join("index.redb"),
+            HELLAS_DEVNET_1_ID.into(),
+            trust.genesis_sha256.clone(),
+            verifier.trust_sha256().into(),
+        )
+        .unwrap();
+        let replay = Replay::new(
+            runtime.child("replay"),
+            "edge-test",
+            index.clone(),
+            network,
+            allocations.clone(),
+            head.clone(),
+            &verifier,
+        )
+        .await
+        .unwrap();
+        let producer = <UtxoDatabase<_> as DatabaseSet<_>>::init(
+            runtime.child("producer"),
+            utxo_db_config(&runtime, "edge-producer", 1024, 8),
+        )
+        .await;
+        Self {
+            producer,
+            replay,
+            index,
+            head,
+            committee,
+            verifier,
+            client,
+            allocations,
+            network,
+            name,
+            directory,
+            genesis_json,
+            trust,
+        }
+    }
+    async fn candidate(
+        &self,
+        txs: Vec<Transaction>,
+    ) -> (
+        HellasBlock,
+        ProofBundle,
+        <UtxoDatabase<tokio::Context> as DatabaseSet<tokio::Context>>::Merkleized,
+    ) {
+        let height = self.head.height().get() + 1;
+        let context = hellas_kernel::Context::with_fees(
+            self.network,
+            BlockHeight::new(height),
+            hellas_kernel::BlockHash::from_bytes(self.head.digest().0),
+            domain::KERNEL_FEES,
+        );
+        let (batch, _) = execute_all_observed(
+            context,
+            &ChainVerifier::new(),
+            &txs,
+            &self.allocations,
+            self.producer.new_batches().await,
+        )
+        .await
+        .unwrap();
+        let owner_root = crate::execution::owner_tree::root(&batch).await.unwrap();
+        let merkleized = batch.merkleize().await.unwrap();
+        let bounds = merkleized.bounds();
+        let target = Target {
+            root: merkleized.root(),
+            range: non_empty_range!(bounds.inactivity_floor, Location::new(bounds.total_size)),
+        };
+        let block = HellasBlock::new(
+            Context {
+                round: Round::new(Epoch::zero(), View::new(height)),
+                leader: self.committee.leaders[0].clone(),
+                parent: (self.head.context().round.view(), self.head.digest()),
+            },
+            self.head.digest(),
+            Height::new(height),
+            height,
+            merkleized.root(),
+            target,
+            txs,
+        )
+        .with_owner_root(owner_root);
+        let proof = self.certify(&block);
+        self.verifier
+            .verify(
+                proof.clone(),
+                ExplorerQuery::Block(FinalizedBlockQuery::Height(height)),
+            )
+            .unwrap();
+        (block, proof, merkleized)
+    }
+    fn certify(&self, block: &HellasBlock) -> ProofBundle {
+        ProofBundle {
+            schema_version: PROOF_SCHEMA_VERSION,
+            network_id: HELLAS_DEVNET_1_ID.into(),
+            trust_sha256: self.verifier.trust_sha256().into(),
+            height: block.height().get(),
+            payload: hex::encode(block.digest()),
+            state_root: hex::encode(block.state_root()),
+            finalization: finalization(&self.committee, block).encode().to_vec(),
+            canonical_block: block.encode().to_vec(),
+            observed_at_ms: block.height().get(),
+            epoch: 0,
+        }
+    }
+    async fn append(&mut self, txs: Vec<Transaction>) -> ProofBundle {
+        let (block, proof, merkleized) = self.candidate(txs).await;
+        self.producer.finalize(merkleized).await;
+        self.replay.apply(&block, proof.clone()).await.unwrap();
+        self.head = block;
+        proof
+    }
+    fn list(&self, limit: u32) -> ListEdgesResponse {
+        self.index
+            .list_edges(ListEdgesRequest {
+                schema_version: 1,
+                limit: Some(limit),
+                ..Default::default()
+            })
+            .unwrap()
+    }
+    fn detail(&self, id: hellas_kernel::EdgeId, payload: Option<String>) -> GetEdgeDetailResponse {
+        self.index
+            .get_edge_detail(GetEdgeDetailRequest {
+                schema_version: 1,
+                edge_id: hex::encode(id.as_bytes()),
+                payload,
+            })
+            .unwrap()
+    }
+    fn export<T: serde::Serialize + prost::Message>(&self, name: &str, value: &T) {
+        if let Ok(directory) = std::env::var("HELLAS_EDGE_FIXTURE_DIR") {
+            let directory = std::path::PathBuf::from(directory).join(self.name);
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(directory.join("genesis.json"), &self.genesis_json).unwrap();
+            std::fs::write(
+                directory.join("trust.json"),
+                serde_json::to_vec(&self.trust).unwrap(),
+            )
+            .unwrap();
+            std::fs::write(
+                directory.join(format!("{name}.json")),
+                serde_json::to_vec_pretty(value).unwrap(),
+            )
+            .unwrap();
+            std::fs::write(directory.join(format!("{name}.pb")), value.encode_to_vec()).unwrap();
+            let json = serde_json::to_value(value).unwrap();
+            let data = &json["data"];
+            let payload = json["snapshot"]["payload"].as_str().unwrap();
+            let (kind, path, edge_id) = if let Some(id) =
+                data["payment"]["summary"]["edge_id"].as_str()
+            {
+                (
+                    "channel",
+                    format!("/api/v1/channels/{id}"),
+                    Some(id.to_string()),
+                )
+            } else if let Some(id) = data["summary"]["edge_id"].as_str() {
+                ("edge", format!("/api/v1/edges/{id}"), Some(id.to_string()))
+            } else if data["items"][0].get("transaction").is_some() {
+                use base64ct::{Base64, Encoding};
+                let bytes =
+                    Base64::decode_vec(data["items"][0]["canonical_transaction"].as_str().unwrap())
+                        .unwrap();
+                let Transaction::Kernel(tx) = Transaction::decode(bytes.as_slice()).unwrap() else {
+                    panic!()
+                };
+                let id = match tx {
+                    Tx::Open { funding, terms, .. } => Tx::edge_id_of(&funding, &terms),
+                    Tx::Close { input, .. } => input,
+                    Tx::Move { action } => match action {
+                        hellas_kernel::Move::StartPaymentClose(start) => start.payment_edge(),
+                        hellas_kernel::Move::RespondPaymentClose(response) => {
+                            response.payment_edge()
+                        }
+                    },
+                };
+                let id = hex::encode(id.as_bytes());
+                ("events", format!("/api/v1/edges/{id}/events"), Some(id))
+            } else {
+                ("list", "/api/v1/edges".into(), None)
+            };
+            let manifest_path = directory.join("manifest.json");
+            let mut entries: Vec<serde_json::Value> = std::fs::read(&manifest_path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                .unwrap_or_default();
+            entries.retain(|entry| entry["name"].as_str() != Some(name));
+            entries.push(serde_json::json!({"name":name,"kind":kind,"api_path":path,"payload":payload,"height":json["snapshot"]["height"],"edge_id":edge_id,"json":format!("{name}.json"),"protobuf":format!("{name}.pb")}));
+            std::fs::write(manifest_path, serde_json::to_vec_pretty(&entries).unwrap()).unwrap();
+        }
+    }
+}
+fn signer(secret: u8) -> Secp256k1Signer {
+    Secp256k1Signer::from_secret_scalar([secret; 32]).unwrap()
+}
+fn funding(index: u16) -> Funding {
+    Funding::new(
+        List::take(
+            [CoinId::from_bytes(domain::genesis_object_id(index).0); MAX_PARTY_INPUTS],
+            1,
+        ),
+        List::take([CoinId::from_bytes([0; 32]); MAX_PARTY_INPUTS], 0),
+    )
+}
+fn open(
+    network: hellas_kernel::NetworkId,
+    funding: Funding,
+    terms: Terms,
+    maker: &Secp256k1Signer,
+    taker: &Secp256k1Signer,
+) -> Tx {
+    let hash = Tx::open_hash(network, &funding, &terms);
+    Tx::open(
+        funding,
+        terms,
+        Auth::native(maker.sign(hash)),
+        Auth::native(taker.sign(hash)),
+    )
+}
+fn basic(
+    network: hellas_kernel::NetworkId,
+    index: u16,
+    maker: &Secp256k1Signer,
+    taker: &Secp256k1Signer,
+) -> (hellas_kernel::EdgeId, Terms, Tx) {
+    let terms = Terms::basic(
+        ProtocolCode::new(7),
+        Parties::new(maker.party_key(), taker.party_key()),
+        BlockHeight::new(2),
+        List::take([Payout::new(maker.party_key(), 100); MAX_EDGE_OUTPUTS], 1),
+    );
+    let funding = funding(index);
+    let id = Tx::edge_id_of(&funding, &terms);
+    let tx = open(network, funding, terms.clone(), maker, taker);
+    (id, terms, tx)
+}
+#[test]
+fn native_edge_index_real_chain_pins_root_checks_and_restart() {
+    run_qmdb(|runtime| async move {
+        let maker = signer(19);
+        let taker = signer(20);
+        let maker2 = signer(21);
+        let maker3 = signer(22);
+        let allocations = vec![
+            (SettlementKey::from(maker.party_key()), 100),
+            (SettlementKey::from(maker2.party_key()), 100),
+            (SettlementKey::from(maker3.party_key()), 100),
+        ];
+        let mut h = Harness::new(runtime.child("h"), allocations, "basic").await;
+        assert_eq!(
+            h.index
+                .list_edges(ListEdgesRequest {
+                    schema_version: 1,
+                    ..Default::default()
+                })
+                .unwrap_err()
+                .code,
+            "index_not_ready"
+        );
+        let (id, terms, tx) = basic(h.network, 0, &maker, &taker);
+        let (_, _, tx2) = basic(h.network, 1, &maker2, &maker2);
+        let (_, _, tx3) = basic(h.network, 2, &maker3, &taker);
+        let opened = h
+            .append(vec![
+                Transaction::Kernel(tx),
+                Transaction::Kernel(tx2),
+                Transaction::Kernel(tx3),
+            ])
+            .await;
+        let first = h.list(1);
+        h.client.check_list(&first).unwrap();
+        h.export("edges", &first);
+        let cursor = first.data.next_cursor.clone().unwrap();
+        let detail = h.detail(id, None);
+        h.client.check_edge(&detail).unwrap();
+        h.export("edge", &detail);
+        let mut wrong = detail.clone();
+        wrong.data.opening.transaction.transaction_index = 12;
+        assert!(h.client.check_edge(&wrong).is_err());
+        if let Some(ObjectState::Present(object)) = &mut wrong.data.object_at_snapshot.answer {
+            object.decoded.value += 1;
+        }
+        assert!(h.client.check_edge(&wrong).is_err());
+        let (_, root_bad, _) = h.candidate(Vec::new()).await;
+        let mut bad = root_bad.clone();
+        bad.state_root = "00".repeat(32);
+        let block = HellasBlock::decode(root_bad.canonical_block.as_slice()).unwrap();
+        assert!(h.replay.apply(&block, bad).await.is_err());
+        assert_eq!(h.list(64).envelope.snapshot.height, 1);
+        // Even a valid threshold certificate cannot bypass deterministic state replay.
+        let mut target = block.sync_target();
+        target.root = Digest::from([91; 32]);
+        let invalid = HellasBlock::new(
+            block.context(),
+            block.parent(),
+            block.height(),
+            block.timestamp(),
+            target.root,
+            target,
+            block.txs().to_vec(),
+        )
+        .with_owner_root(block.owner_root());
+        let certificate = h.certify(&invalid);
+        h.verifier
+            .verify(
+                certificate.clone(),
+                ExplorerQuery::Block(FinalizedBlockQuery::Height(2)),
+            )
+            .unwrap();
+        assert!(h.replay.apply(&invalid, certificate).await.is_err());
+        let conflicting_parent = HellasBlock::new(
+            block.context(),
+            Digest::from([92; 32]),
+            block.height(),
+            block.timestamp(),
+            block.state_root(),
+            block.sync_target(),
+            block.txs().to_vec(),
+        )
+        .with_owner_root(block.owner_root());
+        assert!(
+            h.replay
+                .apply(&conflicting_parent, h.certify(&conflicting_parent))
+                .await
+                .is_err()
+        );
+        let gap = HellasBlock::new(
+            block.context(),
+            block.parent(),
+            Height::new(3),
+            block.timestamp(),
+            block.state_root(),
+            block.sync_target(),
+            block.txs().to_vec(),
+        )
+        .with_owner_root(block.owner_root());
+        assert!(h.replay.apply(&gap, h.certify(&gap)).await.is_err());
+        let mut conflict = opened.clone();
+        conflict.payload = "fe".repeat(32);
+        assert!(h.replay.apply(&h.head, conflict).await.is_err());
+        assert_eq!(h.list(64).envelope.snapshot.height, 1);
+
+        let closed = h
+            .append(vec![Transaction::Kernel(
+                Tx::timeout_close(id, &terms).unwrap(),
+            )])
+            .await;
+        let historical = h.detail(id, Some(opened.payload.clone()));
+        assert_eq!(historical.data.summary.lifecycle, "open");
+        h.client.check_edge(&historical).unwrap();
+        let live = h.detail(id, None);
+        assert_eq!(live.data.summary.lifecycle, "closed");
+        h.client.check_edge(&live).unwrap();
+        h.export("closed-edge", &live);
+        let next = h
+            .index
+            .list_edges(ListEdgesRequest {
+                schema_version: 1,
+                cursor: Some(cursor.clone()),
+                limit: Some(2),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(next.envelope.snapshot.payload, opened.payload);
+        assert_eq!(next.data.items.len(), 2);
+        assert!(next.data.next_cursor.is_none());
+        assert!(
+            h.index
+                .list_edges(ListEdgesRequest {
+                    schema_version: 1,
+                    cursor: Some(cursor),
+                    state: Some("closed".into()),
+                    ..Default::default()
+                })
+                .is_err()
+        );
+        let events = h
+            .index
+            .list_edge_events(ListEdgeEventsRequest {
+                schema_version: 1,
+                edge_id: hex::encode(id.as_bytes()),
+                limit: Some(1),
+                ..Default::default()
+            })
+            .unwrap();
+        h.client
+            .check_events(&events, &hex::encode(id.as_bytes()))
+            .unwrap();
+        assert!(events.data.next_cursor.is_some());
+        h.export("events", &events);
+        h.replay.apply(&h.head, closed).await.unwrap();
+        assert_eq!(h.list(64).data.items.len(), 2);
+        let in_flight = h.index.store.read(Some(&opened.payload)).unwrap();
+        for _ in 0..32 {
+            h.append(Vec::new()).await;
+        }
+        assert_eq!(
+            h.index
+                .get_edge_detail(GetEdgeDetailRequest {
+                    schema_version: 1,
+                    edge_id: hex::encode(id.as_bytes()),
+                    payload: Some(opened.payload)
+                })
+                .unwrap_err()
+                .code,
+            "snapshot_expired"
+        );
+        assert!(in_flight.object(id.as_bytes()).unwrap().is_some());
+        assert_eq!(
+            h.index
+                .get_edge_detail(GetEdgeDetailRequest {
+                    schema_version: 1,
+                    edge_id: hex::encode(id.as_bytes()),
+                    payload: Some("ff".repeat(32))
+                })
+                .unwrap_err()
+                .code,
+            "snapshot_unavailable"
+        );
+        let index_path = h.directory.path().join("index.redb");
+        assert!(index_path.exists());
+        // Crash after writing the intent, before QMDB finalize: recovery discards it.
+        let (_, proof, _) = h.candidate(Vec::new()).await;
+        h.index.store.prepare(proof.clone(), Vec::new()).unwrap();
+        let genesis = h.replay.genesis.clone();
+        let previous_height = h.head.height().get();
+        drop(h.replay);
+        let recovered = Replay::new(
+            runtime.child("recovered"),
+            "edge-test",
+            h.index.clone(),
+            h.network,
+            h.allocations.clone(),
+            genesis.clone(),
+            &h.verifier,
+        )
+        .await
+        .unwrap();
+        assert_eq!(recovered.cursor, previous_height);
+        assert!(h.index.store.intent().unwrap().is_none());
+        // Crash after QMDB finalize but before the index transaction: recover the exact
+        // certified intent and expose its rows/cursor together, once.
+        let context = hellas_kernel::Context::with_fees(
+            h.network,
+            BlockHeight::new(proof.height),
+            hellas_kernel::BlockHash::from_bytes(h.head.digest().0),
+            domain::KERNEL_FEES,
+        );
+        let (batch, changes) = execute_all_observed(
+            context,
+            &ChainVerifier::new(),
+            &[],
+            &h.allocations,
+            recovered.database.new_batches().await,
+        )
+        .await
+        .unwrap();
+        let merkleized = batch.merkleize().await.unwrap();
+        assert_eq!(hex::encode(merkleized.root()), proof.state_root);
+        h.index.store.prepare(proof.clone(), changes).unwrap();
+        recovered.database.finalize(merkleized).await;
+        drop(recovered);
+        let recovered = Replay::new(
+            runtime.child("recovered_after_finalize"),
+            "edge-test",
+            h.index.clone(),
+            h.network,
+            h.allocations,
+            genesis,
+            &h.verifier,
+        )
+        .await
+        .unwrap();
+        assert_eq!(recovered.cursor, proof.height);
+        assert_eq!(
+            h.index.store.latest().unwrap().unwrap().payload,
+            proof.payload
+        );
+    });
+}
+struct WorkPair {
+    client: Secp256k1Signer,
+    provider: Secp256k1Signer,
+    bond: hellas_kernel::EdgeId,
+    payment: hellas_kernel::EdgeId,
+    terms: Terms,
+    bond_terms: Terms,
+    bond_open: Tx,
+    payment_open: Tx,
+}
+fn work_pair(
+    network: hellas_kernel::NetworkId,
+    first: u16,
+    client_secret: u8,
+    provider_secret: u8,
+) -> WorkPair {
+    let client = signer(client_secret);
+    let provider = signer(provider_secret);
+    let body = hellas_kernel::WorkStakeBondTerms {
+        parties: Parties::new(provider.party_key(), client.party_key()),
+        timeout: BlockHeight::new(5),
+        timeout_outputs: List::take([Payout::new(provider.party_key(), 12); MAX_EDGE_OUTPUTS], 1),
+        max_job_price: 4,
+    };
+    let bond_terms = Terms::work_stake_bond(body.clone());
+    let bond_funding = funding(first + 1);
+    let bond = Tx::edge_id_of(&bond_funding, &bond_terms);
+    let bond_open = open(
+        network,
+        bond_funding,
+        bond_terms.clone(),
+        &provider,
+        &client,
+    );
+    let terms = Terms::work_payment(hellas_kernel::WorkPaymentTerms {
+        bond_edge: bond,
+        bond_terms: body,
+        private_policy_commitment: [7; 32],
+        omit_response_blocks: hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
+        start_validity_blocks: 8,
+        omission_bond: 2,
+    });
+    let payment_funding = funding(first);
+    let payment = Tx::edge_id_of(&payment_funding, &terms);
+    let payment_open = open(network, payment_funding, terms.clone(), &client, &provider);
+    WorkPair {
+        client,
+        provider,
+        bond,
+        payment,
+        terms,
+        bond_terms,
+        bond_open,
+        payment_open,
+    }
+}
+#[test]
+fn native_edge_index_work_channel_lifecycle_and_evidence() {
+    run_qmdb(|runtime| async move {
+        use hellas_kernel::{
+            EarnedCertificate, Move, Party, PaymentCloseResponse, PaymentCloseStart, PendingSlot,
+            Proof, RegistryChunk,
+        };
+        let network = hellas_kernel::NetworkId::new(HELLAS_DEVNET_1_ID).unwrap();
+        let a = work_pair(network, 0, 31, 32);
+        let b = work_pair(network, 2, 33, 34);
+        let allocations = vec![
+            (SettlementKey::from(a.client.party_key()), 100),
+            (SettlementKey::from(a.provider.party_key()), 12),
+            (SettlementKey::from(b.client.party_key()), 100),
+            (SettlementKey::from(b.provider.party_key()), 12),
+        ];
+        let mut h = Harness::new(runtime.child("h"), allocations, "work").await;
+        let opened = h
+            .append(
+                vec![
+                    a.bond_open.clone(),
+                    a.payment_open.clone(),
+                    b.bond_open.clone(),
+                    b.payment_open.clone(),
+                ]
+                .into_iter()
+                .map(Transaction::Kernel)
+                .collect(),
+            )
+            .await;
+        let channel = |h: &Harness, id: hellas_kernel::EdgeId, payload: Option<String>| {
+            h.index
+                .get_work_channel_detail(GetWorkChannelDetailRequest {
+                    schema_version: 1,
+                    payment_edge_id: hex::encode(id.as_bytes()),
+                    payload,
+                    funding: None,
+                })
+                .unwrap()
+        };
+        let initial = channel(&h, a.payment, None);
+        h.client.check_channel(&initial).unwrap();
+        assert_eq!(initial.data.funding_query.len(), 2);
+        assert!(initial.data.live_funding.is_empty());
+        h.export("channel-open", &initial);
+        h.export("edges-open", &h.list(64));
+        h.export("payment-open", &h.detail(a.payment, None));
+        h.export("bond-open", &h.detail(a.bond, None));
+        let mut bad = initial.clone();
+        bad.data.lease_slots.pop();
+        assert!(h.client.check_channel(&bad).is_err());
+        let empty = h
+            .index
+            .get_work_channel_detail(GetWorkChannelDetailRequest {
+                schema_version: 1,
+                payment_edge_id: hex::encode(a.payment.as_bytes()),
+                payload: None,
+                funding: Some(FundingQuery { coins: Vec::new() }),
+            })
+            .unwrap();
+        assert!(empty.data.funding_query.is_empty());
+        let understated = EarnedCertificate::new(a.payment, a.terms.hash(), 30);
+        let earned_hash = understated.digest(network);
+        let start_hash = hellas_kernel::start_digest(
+            network,
+            a.payment,
+            a.terms.hash(),
+            Party::Maker,
+            (2, 2),
+            earned_hash,
+        );
+        let start = Tx::move_action(Move::StartPaymentClose(PaymentCloseStart::new(
+            a.payment,
+            a.terms.clone(),
+            Party::Maker,
+            (2, 2),
+            Some((understated, a.client.sign(earned_hash))),
+            a.client.sign(start_hash),
+        )));
+        let start_id = hellas_kernel::start_id(start_hash, 2);
+        let earned = EarnedCertificate::new(a.payment, a.terms.hash(), 60);
+        let digest = earned.digest(network);
+        let response_hash = hellas_kernel::response_digest(
+            network,
+            a.payment,
+            a.terms.hash(),
+            start_id,
+            Party::Taker,
+            digest,
+        );
+        let response = Tx::move_action(Move::RespondPaymentClose(PaymentCloseResponse::new(
+            a.payment,
+            start_id,
+            Party::Taker,
+            (earned, a.client.sign(digest)),
+            a.provider.sign(response_hash),
+        )));
+        h.append(vec![Transaction::Kernel(start)]).await;
+        let started = channel(&h, a.payment, None);
+        h.client.check_channel(&started).unwrap();
+        assert!(matches!(
+            started.data.pending.answer,
+            Some(PendingState::Present(PendingProjection {
+                responded: false,
+                ..
+            }))
+        ));
+        h.export("channel-start", &started);
+        let moved = h.append(vec![Transaction::Kernel(response)]).await;
+        let pending = channel(&h, a.payment, None);
+        h.client.check_channel(&pending).unwrap();
+        assert_eq!(pending.data.payment.summary.lifecycle, "open");
+        assert!(matches!(
+            pending.data.pending.answer,
+            Some(PendingState::Present(PendingProjection {
+                responded: true,
+                penalty_due: true,
+                final_cumulative: 60,
+                ..
+            }))
+        ));
+        h.export("channel-pending", &pending);
+        let chunk: RegistryChunk = crate::edge_index::projection::decode_canonical(
+            pending.data.pending_slot.chunk.as_deref().unwrap(),
+        )
+        .unwrap();
+        let PendingSlot::Present(record) =
+            hellas_kernel::parse_pending_close(Some(chunk), a.payment)
+        else {
+            panic!()
+        };
+        let outputs = List::take(
+            {
+                let mut values = [Payout::default(); MAX_EDGE_OUTPUTS];
+                values[0] = Payout::new(a.provider.party_key(), 62);
+                values[1] = Payout::new(a.client.party_key(), 38);
+                values
+            },
+            2,
+        );
+        h.append(vec![Transaction::Kernel(Tx::close(
+            a.payment,
+            Proof::adjudicated(record.contest_commitment(network, a.payment, a.terms.hash())),
+            outputs,
+        ))])
+        .await;
+        let closed = channel(&h, a.payment, None);
+        h.client.check_channel(&closed).unwrap();
+        assert_eq!(closed.data.payment.summary.lifecycle, "closed");
+        assert!(matches!(
+            closed.data.lease.answer,
+            Some(LeaseState::Present(_))
+        ));
+        assert!(matches!(
+            closed.data.pending.answer,
+            Some(PendingState::Absent(_))
+        ));
+        h.export("channel-adjudicated", &closed);
+        assert_eq!(h.head.height().get(), 4);
+        assert_eq!(
+            channel(&h, b.payment, None).data.admission,
+            "before_horizon"
+        );
+        h.append(vec![
+            Transaction::Kernel(Tx::timeout_close(a.bond, &a.bond_terms).unwrap()),
+            Transaction::Kernel(Tx::timeout_close(b.bond, &b.bond_terms).unwrap()),
+        ])
+        .await;
+        let consumed = channel(&h, b.payment, None);
+        h.client.check_channel(&consumed).unwrap();
+        assert_eq!(consumed.data.bond_state, "consumed");
+        assert_eq!(consumed.data.payment.summary.lifecycle, "open");
+        assert_eq!(consumed.data.admission, "ended");
+        assert!(matches!(
+            consumed.data.lease.answer,
+            Some(LeaseState::Absent(_))
+        ));
+        h.export("channel-bond-consumed", &consumed);
+        let freeze_hash =
+            hellas_kernel::freeze_digest(network, b.payment, b.terms.hash(), 60, (6, 6));
+        let outputs = List::take(
+            {
+                let mut values = [Payout::default(); MAX_EDGE_OUTPUTS];
+                values[0] = Payout::new(b.provider.party_key(), 60);
+                values[1] = Payout::new(b.client.party_key(), 40);
+                values
+            },
+            2,
+        );
+        h.append(vec![Transaction::Kernel(Tx::close(
+            b.payment,
+            Proof::freeze(
+                60,
+                (6, 6),
+                b.client.sign(freeze_hash),
+                b.provider.sign(freeze_hash),
+            ),
+            outputs,
+        ))])
+        .await;
+        let frozen = channel(&h, b.payment, None);
+        h.client.check_channel(&frozen).unwrap();
+        assert_eq!(frozen.data.payment.summary.lifecycle, "closed");
+        assert_eq!(frozen.data.admission, "ended");
+        h.export("channel-frozen", &frozen);
+        assert!(h.list(64).data.items.is_empty());
+        h.export("edges-empty", &h.list(64));
+        let old = channel(&h, a.payment, Some(opened.payload));
+        h.client.check_channel(&old).unwrap();
+        assert_eq!(old.data.payment.summary.lifecycle, "open");
+        assert!(matches!(
+            old.data.pending.answer,
+            Some(PendingState::Absent(_))
+        ));
+        let old_pending = channel(&h, a.payment, Some(moved.payload));
+        h.client.check_channel(&old_pending).unwrap();
+        assert!(matches!(
+            old_pending.data.pending.answer,
+            Some(PendingState::Present(_))
+        ));
+        let events = h
+            .index
+            .list_edge_events(ListEdgeEventsRequest {
+                schema_version: 1,
+                edge_id: hex::encode(a.payment.as_bytes()),
+                limit: Some(64),
+                ..Default::default()
+            })
+            .unwrap();
+        h.client
+            .check_events(&events, &hex::encode(a.payment.as_bytes()))
+            .unwrap();
+        assert_eq!(
+            events
+                .data
+                .items
+                .iter()
+                .map(|event| event.kind.as_str())
+                .collect::<Vec<_>>(),
+            ["open", "move", "move", "close"]
+        );
+        h.export("payment-events", &events);
+    });
+}

@@ -95,7 +95,7 @@ pub fn run(options: OriginOptions) -> OriginResult<()> {
             context.child("app"),
             crate::domain::network_id(&genesis)?,
             leader,
-            allocations,
+            allocations.clone(),
             &format!("{}-genesis", options.partition_prefix),
             ApplicationConfig::default(),
         )
@@ -104,12 +104,38 @@ pub fn run(options: OriginOptions) -> OriginResult<()> {
             context.child("indexer"),
             &options.partition_prefix,
             Config::default(),
-            options.trust,
+            options.trust.clone(),
             &genesis_json,
             application.genesis_block(),
         )
         .await?;
+        let edge_scope = crate::edge_index::query::cursor_scope(
+            &genesis.network_id,
+            &options.trust.genesis_sha256,
+            verifier.trust_sha256(),
+        );
+        let edge_index = crate::edge_index::EdgeIndex::open(
+            &options.storage_dir.join(format!(
+                "{}-edge-index-v{}-{edge_scope}.redb",
+                options.partition_prefix,
+                crate::edge_index::SCHEMA_VERSION
+            )),
+            genesis.network_id.clone(),
+            options.trust.genesis_sha256.clone(),
+            verifier.trust_sha256().into(),
+        )?;
+        let replay = crate::edge_index::Replay::new(
+            context.child("edge_replay"),
+            &options.partition_prefix,
+            edge_index.clone(),
+            crate::domain::network_id(&genesis)?,
+            allocations,
+            application.genesis_block(),
+            &verifier,
+        )
+        .await?;
         let state = OriginState {
+            edge_index: Some(edge_index),
             owner_index: application.owner_index(),
             owners: Arc::new(RwLock::new(OwnerSnapshots::default())),
             indexer: indexer.clone(),
@@ -120,7 +146,7 @@ pub fn run(options: OriginOptions) -> OriginResult<()> {
         let app = router(state.clone());
         let listener = ::tokio::net::TcpListener::bind(options.listen).await?;
         ::tokio::select! {
-            result = index_transactions(state.clone()) => result,
+            result = index_transactions(state.clone(), replay) => result,
             result = axum::serve(listener,app) => result.map_err(Into::into),
             result = follow_trusted(state,options.rpc,options.status) => result,
         }
@@ -129,6 +155,7 @@ pub fn run(options: OriginOptions) -> OriginResult<()> {
 
 #[derive(Clone)]
 struct OriginState {
+    edge_index: Option<crate::edge_index::EdgeIndex>,
     indexer: ChainIndexer,
     verifier: Arc<ExplorerVerifier>,
     network_id: String,
@@ -195,6 +222,12 @@ mod telemetry;
 fn router(state: OriginState) -> Router {
     telemetry::layer(
         Router::new()
+            .route("/api/v1/edges", get(edge_index_http))
+            .route("/api/v1/edges/{edge_id}", get(edge_index_http))
+            .route("/api/v1/edges/{edge_id}/events", get(edge_index_http))
+            .route("/api/v1/edges/{edge_id}/evidence", get(edge_index_http))
+            .route("/api/v1/channels/{payment_edge_id}", get(edge_index_http))
+            .route("/api/v1/edge-index/rpc", get(edge_index_ws))
             .route("/api/v1/blocks/{selector}", get(block))
             .route("/api/v1/blocks/{selector}/proof", get(block))
             .route("/api/v1/blocks/by-payload/{payload}", get(payload))
@@ -204,6 +237,25 @@ fn router(state: OriginState) -> Router {
             .route("/api/v1/addresses/{owner}", get(address))
             .with_state(state),
     )
+}
+
+async fn edge_index_http(
+    State(state): State<OriginState>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+) -> Response {
+    crate::edge_index::http::handle(state.edge_index, uri, headers).await
+}
+async fn edge_index_ws(
+    State(state): State<OriginState>,
+    ws: axum::extract::ws::WebSocketUpgrade,
+) -> Response {
+    match state.edge_index {
+        Some(index) => {
+            ws.on_upgrade(move |socket| crate::edge_index::rpc::serve_socket(socket, index))
+        }
+        None => failure(StatusCode::SERVICE_UNAVAILABLE, "index_not_ready"),
+    }
 }
 
 async fn block(
@@ -255,14 +307,22 @@ async fn transaction(
     let Some(tx) = digest(&tx) else {
         return failure(StatusCode::BAD_REQUEST, "invalid transaction digest");
     };
-    let height = query.height.or_else(|| {
-        state
-            .transactions
-            .read()
-            .expect("transaction index lock")
-            .get(&tx)
-            .copied()
-    });
+    let height = query
+        .height
+        .or_else(|| {
+            state
+                .edge_index
+                .as_ref()
+                .and_then(|index| index.transaction_height(&hex::encode(tx)).ok().flatten())
+        })
+        .or_else(|| {
+            state
+                .transactions
+                .read()
+                .expect("transaction index lock")
+                .get(&tx)
+                .copied()
+        });
     let Some(height) = height else {
         return failure(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -432,7 +492,7 @@ fn default_proof_accept(mut headers: HeaderMap, uri: &axum::http::Uri) -> Header
     headers
 }
 
-fn representation(headers: &HeaderMap) -> Option<bool> {
+pub(crate) fn representation(headers: &HeaderMap) -> Option<bool> {
     let Some(accept) = headers.get(header::ACCEPT) else {
         return Some(false);
     };
@@ -509,7 +569,10 @@ fn proof_bundle(state: &OriginState, finalized: crate::FinalizedBlock) -> ProofB
         epoch,
     }
 }
-async fn index_transactions(state: OriginState) -> OriginResult<()> {
+async fn index_transactions(
+    state: OriginState,
+    mut replay: crate::edge_index::Replay<tokio::Context>,
+) -> OriginResult<()> {
     let mut height = 1_u64;
     let mut owner_tree = crate::owner_proof::MemoryOwnerTree::default();
     let mut previous = BTreeMap::new();
@@ -524,17 +587,9 @@ async fn index_transactions(state: OriginState) -> OriginResult<()> {
                     proof_bundle(&state, finalized),
                     ExplorerQuery::Block(FinalizedBlockQuery::Height(height)),
                 )?;
-                {
-                    let mut transactions =
-                        state.transactions.write().expect("transaction index lock");
-                    for tx in verified.view().txs() {
-                        transactions
-                            .entry(crate::verified_explorer::transaction_digest(tx))
-                            .or_insert(height);
-                    }
-                }
                 let block =
                     crate::HellasBlock::decode(verified.bundle().canonical_block.as_slice())?;
+                replay.apply(&block, verified.bundle().clone()).await?;
                 state.owner_index.apply_finalized(&block)?;
                 let current = state
                     .owner_index
@@ -788,6 +843,7 @@ mod tests {
             let tx = crate::verified_explorer::transaction_digest(&block.txs()[0]);
             let transactions = Arc::new(RwLock::new(BTreeMap::from([(tx, 1)])));
             let state = OriginState {
+                edge_index: None,
                 owner_index,
                 owners: Arc::new(RwLock::new(OwnerSnapshots::default())),
                 indexer,
