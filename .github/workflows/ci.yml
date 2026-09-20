@@ -103,8 +103,10 @@ jobs:
       - name: Require build-smoke-matrix + all smoke builds succeeded
         run: |
           set -Eeu
-          test '${{ needs.build-smoke-matrix.result }}' = 'success'
-          test '${{ needs.build-smoke.result }}' = 'success'
+          if [[ '${{ needs.build-smoke-matrix.result }}' != success || '${{ needs.build-smoke.result }}' != success ]]; then
+            echo '::error::Build smoke validation did not complete: matrix=${{ needs.build-smoke-matrix.result }}, builds=${{ needs.build-smoke.result }}. Inspect the first failed prerequisite, including Lints.'
+            exit 1
+          fi
 
   # ─── e2e (PR only) ──────────────────────────────────────────────────────
   # nixosTests run in QEMU VMs. They depend on the same package derivations
@@ -160,5 +162,7 @@ jobs:
       - name: Require e2e-matrix + all e2e succeeded
         run: |
           set -Eeu
-          test '${{ needs.e2e-matrix.result }}' = 'success'
-          test '${{ needs.e2e.result }}' = 'success'
+          if [[ '${{ needs.e2e-matrix.result }}' != success || '${{ needs.e2e.result }}' != success ]]; then
+            echo '::error::E2E validation did not complete: matrix=${{ needs.e2e-matrix.result }}, tests=${{ needs.e2e.result }}. Inspect the first failed prerequisite, including Lints and Build smoke passed.'
+            exit 1
+          fi

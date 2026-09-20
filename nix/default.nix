@@ -141,6 +141,7 @@ let
       rustToolchain
       workspaceNativeBuildInputs
       ;
+    cargoDeps = nativePackages.cli.cargoDeps;
     extraChecks = kernel.checks;
   };
 

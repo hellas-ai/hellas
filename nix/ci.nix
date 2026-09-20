@@ -1,6 +1,7 @@
 {
   bufLintCommand,
   denyCommand,
+  cargoDeps,
   pkgs,
   lib,
   rustToolchain,
@@ -17,6 +18,33 @@ let
         ${cmd}
       '';
     };
+
+  # Use the same fixed-output sources as release builds. In particular, Cargo
+  # must not try SSH credentials for a private git dependency during linting.
+  cargoConfig = pkgs.runCommand "hellas-ci-cargo-config" { } ''
+    substitute ${cargoDeps}/.cargo/config.toml "$out" \
+      --replace-fail 'directory = "cargo-vendor-dir"' 'directory = "${cargoDeps}"'
+  '';
+
+  # The audit needs registry index records to check crate yanks. Retain normal
+  # crates.io fetching there, while git dependencies still come from Nix.
+  cargoAuditConfig = pkgs.runCommand "hellas-ci-cargo-audit-config" { } ''
+    substitute ${cargoConfig} "$out" --replace-fail '[source.crates-io]
+    replace-with = "vendored-sources"' ""
+  '';
+
+  mkCargoConfigured =
+    config: offline: name: cmd: inputs:
+    mk name ''
+      cargo_home=$(mktemp -d)
+      trap 'rm -rf "$cargo_home"' EXIT
+      cp ${config} "$cargo_home/config.toml"
+      export CARGO_HOME="$cargo_home"
+      export CARGO_NET_OFFLINE=${lib.boolToString offline}
+      ${cmd}
+    '' ([ pkgs.coreutils ] ++ inputs);
+
+  mkCargo = mkCargoConfigured cargoConfig true;
 
   cargoEnv =
     toolchain:
@@ -37,15 +65,20 @@ let
   # CI-gating checks. These surface as `apps.<sys>.check-<name>` for local and
   # external matrix runners.
   baseChecks = {
+    # Resolve the entire locked graph with an empty Cargo home before compiling.
+    # This catches source replacement regressions without runner credentials.
+    cargo-sources =
+      mkCargo "check-cargo-sources" "cargo metadata --locked --format-version 1 > /dev/null"
+        [ rustToolchain ];
     fmt = mk "check-fmt" "cargo fmt --all -- --check" [ rustToolchain ];
-    clippy = mk "check-clippy" "cargo clippy --workspace --all-targets -- -D warnings" (
+    clippy = mkCargo "check-clippy" "cargo clippy --workspace --all-targets -- -D warnings" (
       cargoEnv rustToolchain
     );
     # Default features alone leave most of the CLI unlinted: `evaluate`,
     # `node` and `gateway` are all off by default, which is most of what
     # the binary actually does. So the buildable feature sets are named and
     # checked independently.
-    clippy-features = mk "check-clippy-features" (builtins.concatStringsSep " && " (
+    clippy-features = mkCargo "check-clippy-features" (builtins.concatStringsSep " && " (
       map
         (f: "cargo clippy -p hellas-cli --no-default-features --features ${f} --all-targets -- -D warnings")
         [
@@ -65,8 +98,10 @@ let
     # bearing: `secp256k1`, `webauthn`, and `test-support` gate whole test
     # files, and a bare `cargo test -p hellas-kernel` compiles them away
     # to empty binaries.
-    kernel = mk "check-kernel" "cargo test -p hellas-kernel --all-features" (cargoEnv rustToolchain);
-    executor = mk "check-executor" "cargo test -p hellas-executor" (cargoEnv rustToolchain);
+    kernel = mkCargo "check-kernel" "cargo test -p hellas-kernel --all-features" (
+      cargoEnv rustToolchain
+    );
+    executor = mkCargo "check-executor" "cargo test -p hellas-executor" (cargoEnv rustToolchain);
     # The paid-work wire records stay behind RPC's `work` feature, while
     # endpoint workflow and durable recovery live in `hellas-work`.
     # Neither enters the default graph, so both need an explicit gate.
@@ -78,7 +113,7 @@ let
     # Naming a single `--test` target would leave a rotated service id
     # unnoticed, which is exactly what happened once.
     rpc-work =
-      mk "check-rpc-work"
+      mkCargo "check-rpc-work"
         "cargo test -p hellas-rpc --features work && cargo test -p hellas-work && cargo clippy -p hellas-rpc --features work --all-targets -- -D warnings && cargo clippy -p hellas-work --all-targets -- -D warnings"
         (cargoEnv rustToolchain);
     # The client's paid-work half and the oracle inside it. `work` is off
@@ -87,7 +122,7 @@ let
     # oracle's own suite — the one that says what a failed independent
     # check does. All three run only here.
     client-work =
-      mk "check-client-work"
+      mkCargo "check-client-work"
         "cargo test -p hellas-client --features work && cargo clippy -p hellas-client --features work --all-targets -- -D warnings"
         (cargoEnv rustToolchain);
     # The chain service's wire-id pins compile only under `chain`, which
@@ -97,11 +132,11 @@ let
     # were pinned by a test no gate ran. A rotated chain id would have
     # reached deployed nodes with every check green.
     rpc-chain =
-      mk "check-rpc-chain"
+      mkCargo "check-rpc-chain"
         "cargo test -p hellas-rpc --features chain && cargo clippy -p hellas-rpc --features chain --all-targets -- -D warnings"
         (cargoEnv rustToolchain);
     validator =
-      mk "check-validator" "cargo test -p hellas-chain --no-default-features --features validator"
+      mkCargo "check-validator" "cargo test -p hellas-chain --no-default-features --features validator"
         (cargoEnv rustToolchain);
     # The finalized-block codec without a database or a mempool: the
     # feature an endpoint enables to read the block its channel opened
@@ -109,7 +144,7 @@ let
     # also enables the execution layer the split was made to avoid — so
     # only this line fails if the codec grows a dependency back on it.
     chain-block-view =
-      mk "check-chain-block-view"
+      mkCargo "check-chain-block-view"
         "cargo clippy -p hellas-chain --no-default-features --features block-view --all-targets -- -D warnings"
         (cargoEnv rustToolchain);
     # The settlement watcher's block source: the codec above plus the
@@ -118,7 +153,7 @@ let
     # one that fails when the two disagree about what a finalized block
     # hands a watcher.
     chain-work-watcher =
-      mk "check-chain-work-watcher"
+      mkCargo "check-chain-work-watcher"
         "cargo clippy -p hellas-chain --no-default-features --features work-watcher --all-targets -- -D warnings"
         (cargoEnv rustToolchain);
     # The setup driver end to end. It needs both halves at once —
@@ -128,7 +163,7 @@ let
     # in. This is the only line that runs a paid channel being opened
     # against real finalized blocks.
     chain-setup =
-      mk "check-chain-setup"
+      mkCargo "check-chain-setup"
         "cargo test -p hellas-chain --no-default-features --features validator,work-watcher"
         (cargoEnv rustToolchain);
     sort = mk "check-sort" "cargo-sort --workspace --check --no-format" [ pkgs.cargo-sort ];
@@ -138,7 +173,7 @@ let
           pkgs.taplo
         ];
     buf = mk "check-buf" bufLintCommand [ pkgs.buf ];
-    deny = mk "check-deny" denyCommand (
+    deny = mkCargoConfigured cargoAuditConfig false "check-deny" denyCommand (
       (cargoEnv rustToolchain)
       ++ [
         pkgs.cargo-deny
@@ -157,15 +192,15 @@ let
     flake-check = mk "check-flake-check" "nix flake check --accept-flake-config --no-build" [
       pkgs.nix
     ];
-    wasm-rpc = mk "check-wasm-rpc" "cargo check -p hellas-rpc --target wasm32-unknown-unknown" (
+    wasm-rpc = mkCargo "check-wasm-rpc" "cargo check -p hellas-rpc --target wasm32-unknown-unknown" (
       cargoEnv (rustToolchain.override { targets = [ "wasm32-unknown-unknown" ]; })
     );
-    wasm-chain = mk "check-wasm-chain" ''
+    wasm-chain = mkCargo "check-wasm-chain" ''
       export CC_wasm32_unknown_unknown=${lib.getExe' pkgs.llvmPackages.clang-unwrapped "clang"}
       export AR_wasm32_unknown_unknown=${lib.getExe' pkgs.llvmPackages.llvm "llvm-ar"}
       cargo check -p hellas-chain --no-default-features --features wasm-client --target wasm32-unknown-unknown
     '' (cargoEnv (rustToolchain.override { targets = [ "wasm32-unknown-unknown" ]; }));
-    wasm-xet = mk "check-wasm-xet" "cargo check -p hellas-xet --target wasm32-unknown-unknown" (
+    wasm-xet = mkCargo "check-wasm-xet" "cargo check -p hellas-xet --target wasm32-unknown-unknown" (
       cargoEnv (rustToolchain.override { targets = [ "wasm32-unknown-unknown" ]; })
     );
     # `hellas-xet` sits inside the `#![no_std]` kernel's dependency
@@ -174,7 +209,7 @@ let
     # this build is what fails — loudly, at compile time — the moment
     # someone reaches for a `Vec` there again. It cannot ride along with
     # `check-clippy`: a workspace build unifies `chunking` back on.
-    xet-no-alloc = mk "check-xet-no-alloc" "cargo build -p hellas-xet --no-default-features" (
+    xet-no-alloc = mkCargo "check-xet-no-alloc" "cargo build -p hellas-xet --no-default-features" (
       cargoEnv rustToolchain
     );
   };
@@ -185,7 +220,7 @@ let
   fixes = {
     fmt = mk "fix-fmt" "cargo fmt --all" [ rustToolchain ];
     clippy =
-      mk "fix-clippy" "cargo clippy --workspace --all-targets --fix --allow-dirty --allow-staged"
+      mkCargo "fix-clippy" "cargo clippy --workspace --all-targets --fix --allow-dirty --allow-staged"
         (cargoEnv rustToolchain);
     sort = mk "fix-sort" "cargo-sort --workspace --no-format" [ pkgs.cargo-sort ];
   };
