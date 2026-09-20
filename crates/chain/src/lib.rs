@@ -12,6 +12,8 @@ pub mod config;
 mod consensus;
 #[cfg(feature = "domain")]
 pub mod domain;
+#[cfg(feature = "verified-explorer")]
+pub mod edge_index;
 #[cfg(any(feature = "indexer", feature = "validator"))]
 mod execution;
 #[cfg(feature = "explorer-origin")]
