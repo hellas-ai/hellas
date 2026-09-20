@@ -5,7 +5,7 @@ use crate::{
     execution::test_support::{ConsensusFixture, consensus_fixture, finalization, run_qmdb},
     verified_explorer::PROOF_SCHEMA_VERSION,
 };
-use commonware_codec::{DecodeExt as _, Encode as _};
+use commonware_codec::Encode as _;
 use commonware_consensus::{
     CertifiableBlock as _,
     simplex::types::Context,
@@ -23,23 +23,23 @@ use hellas_kernel::{
     ProtocolCode, Secp256k1Signer, Terms, Tx,
 };
 
-struct Harness {
-    producer: UtxoDatabase<tokio::Context>,
-    replay: Replay<tokio::Context>,
-    index: EdgeIndex,
-    head: HellasBlock,
-    committee: ConsensusFixture,
-    verifier: ExplorerVerifier,
-    client: EdgeIndexClient,
-    allocations: Vec<(SettlementKey, u64)>,
-    network: hellas_kernel::NetworkId,
-    name: &'static str,
-    directory: tempfile::TempDir,
-    genesis_json: Vec<u8>,
-    trust: TrustDocument,
+pub(crate) struct Harness {
+    pub(crate) producer: UtxoDatabase<tokio::Context>,
+    pub(crate) replay: Replay<tokio::Context>,
+    pub(crate) index: EdgeIndex,
+    pub(crate) head: HellasBlock,
+    pub(crate) committee: ConsensusFixture,
+    pub(crate) verifier: ExplorerVerifier,
+    pub(crate) client: EdgeIndexClient,
+    pub(crate) allocations: Vec<(SettlementKey, u64)>,
+    pub(crate) network: hellas_kernel::NetworkId,
+    pub(crate) name: &'static str,
+    pub(crate) directory: tempfile::TempDir,
+    pub(crate) genesis_json: Vec<u8>,
+    pub(crate) trust: TrustDocument,
 }
 impl Harness {
-    async fn new(
+    pub(crate) async fn new(
         runtime: tokio::Context,
         allocations: Vec<(SettlementKey, u64)>,
         name: &'static str,
@@ -207,7 +207,7 @@ impl Harness {
             epoch: 0,
         }
     }
-    async fn append(&mut self, txs: Vec<Transaction>) -> ProofBundle {
+    pub(crate) async fn append(&mut self, txs: Vec<Transaction>) -> ProofBundle {
         let (block, proof, merkleized) = self.candidate(txs).await;
         self.producer.finalize(merkleized).await;
         self.replay.apply(&block, proof.clone()).await.unwrap();
@@ -338,7 +338,7 @@ fn open(
         Auth::native(taker.sign(hash)),
     )
 }
-fn basic(
+pub(crate) fn basic(
     network: hellas_kernel::NetworkId,
     index: u16,
     maker: &Secp256k1Signer,
@@ -540,6 +540,13 @@ fn native_edge_index_real_chain_pins_root_checks_and_restart() {
         );
         let index_path = h.directory.path().join("index.redb");
         assert!(index_path.exists());
+        let owner = SettlementKey::from(maker.party_key());
+        let committed_owner = h
+            .replay
+            .owner_proof(&h.verifier, owner, 0, 64, None)
+            .await
+            .unwrap()
+            .unwrap();
         // Crash after writing the intent, before QMDB finalize: recovery discards it.
         let (_, proof, _) = h.candidate(Vec::new()).await;
         h.index.store.prepare(proof.clone(), Vec::new()).unwrap();
@@ -559,6 +566,20 @@ fn native_edge_index_real_chain_pins_root_checks_and_restart() {
         .unwrap();
         assert_eq!(recovered.cursor, previous_height);
         assert!(h.index.store.intent().unwrap().is_none());
+        assert_eq!(recovered.next_height().unwrap(), previous_height + 1);
+        let owner_before_finalize = recovered
+            .owner_proof(&h.verifier, owner, 0, 64, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(owner_before_finalize.page, committed_owner.page);
+        assert_eq!(
+            owner_before_finalize.block.as_ref().unwrap().height,
+            previous_height
+        );
+        h.verifier
+            .verify_address(owner_before_finalize, owner, 0, 64)
+            .unwrap();
         // Crash after QMDB finalize but before the index transaction: recover the exact
         // certified intent and expose its rows/cursor together, once.
         let context = hellas_kernel::Context::with_fees(
@@ -597,6 +618,19 @@ fn native_edge_index_real_chain_pins_root_checks_and_restart() {
             h.index.store.latest().unwrap().unwrap().payload,
             proof.payload
         );
+        let owner_after_finalize = recovered
+            .owner_proof(&h.verifier, owner, 0, 64, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(owner_after_finalize.page, committed_owner.page);
+        assert_eq!(
+            owner_after_finalize.block.as_ref().unwrap().payload,
+            proof.payload
+        );
+        h.verifier
+            .verify_address(owner_after_finalize, owner, 0, 64)
+            .unwrap();
     });
 }
 struct WorkPair {
@@ -897,5 +931,82 @@ fn native_edge_index_work_channel_lifecycle_and_evidence() {
             ["open", "move", "move", "close"]
         );
         h.export("payment-events", &events);
+    });
+}
+
+#[test]
+fn native_edge_index_cold_open_serves_current_owners_without_archive_replay() {
+    run_qmdb(|runtime| async move {
+        let maker = signer(31);
+        let taker = signer(32);
+        let untouched = SettlementKey::from(signer(33).party_key());
+        let absent = SettlementKey::from(signer(34).party_key());
+        let owner = SettlementKey::from(maker.party_key());
+        let mut h = Harness::new(
+            runtime.child("cold"),
+            vec![(owner, 100), (untouched, 1000)],
+            "cold-owners",
+        )
+        .await;
+        let genesis = h.head.clone();
+        let (id, _, opened) = basic(h.network, 0, &maker, &taker);
+        let first = h.append(vec![Transaction::Kernel(opened)]).await;
+        let latest = h.append(Vec::new()).await;
+        let path = h.directory.path().join("index.redb");
+        drop(h.replay);
+        drop(h.index);
+        // Reopen both persistent stores. No follower, archive, or historical
+        // block callback exists in this test or in the owner-proof interface.
+        let index = EdgeIndex::open(
+            &path,
+            HELLAS_DEVNET_1_ID.into(),
+            h.trust.genesis_sha256.clone(),
+            h.verifier.trust_sha256().into(),
+        )
+        .unwrap();
+        let recovered = Replay::new(
+            runtime.child("reopened"),
+            "edge-test",
+            index.clone(),
+            h.network,
+            h.allocations,
+            genesis,
+            &h.verifier,
+        )
+        .await
+        .unwrap();
+        assert_eq!(recovered.next_height().unwrap(), latest.height + 1);
+        let listing = index
+            .list_edges(ListEdgesRequest {
+                schema_version: 1,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(listing.envelope.snapshot.payload, latest.payload);
+        assert_eq!(listing.data.items[0].edge_id, hex::encode(id.as_bytes()));
+        for (address, balance, count) in [(owner, 0, 1), (untouched, 1000, 1), (absent, 0, 0)] {
+            let bundle = recovered
+                .owner_proof(&h.verifier, address, 0, 64, None)
+                .await
+                .unwrap()
+                .unwrap();
+            let verified = h.verifier.verify_address(bundle, address, 0, 64).unwrap();
+            assert_eq!(verified.block().bundle().payload, latest.payload);
+            assert_eq!(verified.summary().balance, balance);
+            assert_eq!(verified.summary().count, count);
+        }
+        assert!(
+            recovered
+                .owner_proof(&h.verifier, owner, 0, 64, Some(&first.payload))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let pinned = recovered
+            .owner_proof(&h.verifier, owner, 0, 64, Some(&latest.payload))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pinned.block.unwrap().payload, latest.payload);
     });
 }

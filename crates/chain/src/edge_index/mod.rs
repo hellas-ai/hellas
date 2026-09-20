@@ -20,3 +20,6 @@ pub(crate) use replay::Replay;
 pub(crate) mod http;
 #[cfg(feature = "explorer-origin")]
 pub(crate) mod rpc;
+
+#[cfg(all(test, feature = "explorer-origin"))]
+pub(crate) use replay::tests::{Harness as ReplayHarness, basic as replay_basic};
