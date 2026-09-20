@@ -7,7 +7,7 @@
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, bail};
 use clap::{Args, Subcommand};
@@ -716,21 +716,25 @@ fn permanently_refused_delivery(error: &anyhow::Error) -> bool {
     matches!(delivery, Some(DeliverError::Refused { refusal, .. }) if !refusal.is_retryable())
 }
 
-/// Proposes, asking again while the provider answers with a retryable
-/// refusal. A provider still catching its own chain cursor up refuses
-/// as not ready; that is a state it recovers from, not an answer to
-/// the job. The proposal's retained bytes make every retry the same
-/// request, so the journal holds one proposal however often it is
-/// sent. The gateway's own timeout bounds the loop for HTTP callers;
-/// the bound here is what bounds the CLI.
+/// Proposes until a provider accepts or the caller's execution window closes.
+/// A provider catching its chain cursor up replies `NotReady`; that is not an
+/// answer to the job. The retained proposal makes each retry the same request,
+/// while bounded exponential backoff avoids turning recovery into a request
+/// flood.
 async fn propose_when_ready(
     dialer: &ProviderDialer,
     client: &mut ClientEndpoint,
     proposal: &JobProposal,
     retained: Option<hellas_rpc::Digest>,
     poll: Duration,
+    timeout: Duration,
 ) -> CliResult<hellas_rpc::Digest> {
-    for _ in 0..30 {
+    let deadline = Instant::now() + timeout;
+    let mut delay = poll.max(Duration::from_secs(1));
+    loop {
+        if Instant::now() >= deadline {
+            bail!("provider remained not ready for {timeout:?}");
+        }
         let transport = dialer.work().await?;
         let result = match retained {
             Some(work_id) => resume_work_proposal(transport, client, work_id).await,
@@ -741,12 +745,13 @@ async fn propose_when_ready(
             Err(hellas_work::work::ProposeError::Refused { refusal, .. })
                 if refusal.is_retryable() =>
             {
-                tokio::time::sleep(poll).await;
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                tokio::time::sleep(delay.min(remaining)).await;
+                delay = delay.saturating_mul(2).min(Duration::from_secs(10));
             }
             Err(error) => return Err(error.into()),
         }
     }
-    bail!("provider still not ready after 30 proposals")
 }
 
 enum JobLookup {
@@ -767,6 +772,7 @@ async fn execute_paid_job(
     progress: Option<&hellas_work::work::PaidProgress>,
     lookup: JobLookup,
 ) -> CliResult<PaidOutput> {
+    let readiness_timeout = Duration::from_secs(args.timeout_secs);
     let prepared_bytes = prepared.encode()?;
     let current = client.state().cursor().0;
     let deadlines = relative_deadlines(current, args)?;
@@ -795,14 +801,22 @@ async fn execute_paid_job(
     );
     let (work_id, already_collected) = match existing.first().copied() {
         Some((work_id, hellas_work::work_store::JobPhase::HalfSigned, _)) => (
-            propose_when_ready(dialer, client, &proposal, Some(work_id), poll).await?,
+            propose_when_ready(
+                dialer,
+                client,
+                &proposal,
+                Some(work_id),
+                poll,
+                readiness_timeout,
+            )
+            .await?,
             false,
         ),
         Some((work_id, hellas_work::work_store::JobPhase::Ready, _))
         | Some((work_id, hellas_work::work_store::JobPhase::Matched, _)) => (work_id, true),
         Some((work_id, _, _)) => (work_id, false),
         None => (
-            propose_when_ready(dialer, client, &proposal, None, poll).await?,
+            propose_when_ready(dialer, client, &proposal, None, poll, readiness_timeout).await?,
             false,
         ),
     };
