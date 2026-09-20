@@ -371,17 +371,11 @@ async fn address(
     {
         return failure(StatusCode::BAD_REQUEST, "invalid payload");
     }
-    let bundle = match state
+    let verified = match state
         .replay
         .lock()
         .await
-        .owner_proof(
-            &state.verifier,
-            owner,
-            query.offset,
-            query.limit,
-            query.payload.as_deref(),
-        )
+        .owner_proof(owner, query.offset, query.limit, query.payload.as_deref())
         .await
     {
         Ok(Some(bundle)) => bundle,
@@ -408,13 +402,6 @@ async fn address(
                 "durable owner proof failed verification",
             );
         }
-    };
-    let verified = match state
-        .verifier
-        .verify_address(bundle, owner, query.offset, query.limit)
-    {
-        Ok(verified) => verified,
-        Err(_) => return failure(StatusCode::BAD_GATEWAY, "owner proof failed verification"),
     };
     let (content_type, bytes) = if protobuf {
         (
@@ -607,12 +594,7 @@ async fn index_transactions(state: OriginState) -> OriginResult<()> {
                 )?;
                 let block =
                     crate::HellasBlock::decode(verified.bundle().canonical_block.as_slice())?;
-                state
-                    .replay
-                    .lock()
-                    .await
-                    .apply(&block, verified.bundle().clone())
-                    .await?;
+                state.replay.lock().await.apply(&block, verified).await?;
                 height = height
                     .checked_add(1)
                     .ok_or("transaction index height exhausted")?;
@@ -787,6 +769,60 @@ mod tests {
     }
 
     #[test]
+    fn http_origin_without_checkpoint_returns_unavailable() {
+        crate::execution::test_support::run_qmdb(|context| async move {
+            let owner = crate::domain::SettlementKey::from(
+                hellas_kernel::Secp256k1Signer::from_secret_scalar([19; 32])
+                    .unwrap()
+                    .party_key(),
+            );
+            let h = crate::edge_index::ReplayHarness::new(
+                context.child("h"),
+                vec![(owner, 100)],
+                "origin-empty",
+            )
+            .await;
+            let (indexer, _handle) = crate::spawn_follower_indexer(
+                context.child("follower"),
+                "origin-empty-test",
+                Config::default(),
+                h.committee.verifier.clone(),
+                h.head,
+            )
+            .await
+            .unwrap();
+            let app = router(OriginState {
+                edge_index: Some(h.index),
+                indexer,
+                replay: Arc::new(::tokio::sync::Mutex::new(h.replay)),
+                verifier: Arc::new(h.verifier),
+                network_id: HELLAS_DEVNET_1_ID.into(),
+            });
+            for suffix in ["", "/proof"] {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        axum::http::Request::builder()
+                            .uri(format!("/api/v1/addresses/{owner}{suffix}"))
+                            .body(axum::body::Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+                assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+                let body = axum::body::to_bytes(response.into_body(), 4096)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    &body[..],
+                    b"no durable verified owner checkpoint is available yet"
+                );
+            }
+        });
+    }
+
+    #[test]
     fn http_origin_returns_durable_owner_and_transaction_evidence() {
         crate::execution::test_support::run_qmdb(|context| async move {
             let maker = hellas_kernel::Secp256k1Signer::from_secret_scalar([19; 32]).unwrap();
@@ -800,7 +836,7 @@ mod tests {
             .await;
             assert!(
                 h.replay
-                    .owner_proof(&h.verifier, owner, 0, 64, None)
+                    .owner_proof(owner, 0, 64, None)
                     .await
                     .unwrap()
                     .is_none()
@@ -813,13 +849,13 @@ mod tests {
             let first_block = h.head.clone();
             let first_address = h
                 .replay
-                .owner_proof(&h.verifier, owner, 0, 64, Some(&first.payload))
+                .owner_proof(owner, 0, 64, Some(&first.payload))
                 .await
                 .unwrap()
                 .unwrap();
             assert_eq!(
                 h.verifier
-                    .verify_address(first_address, owner, 0, 64)
+                    .verify_address(first_address.bundle().clone(), owner, 0, 64)
                     .unwrap()
                     .summary()
                     .count,
@@ -897,6 +933,8 @@ mod tests {
                         .await
                         .unwrap();
                     assert_eq!(response.status(), StatusCode::CONFLICT);
+                    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+                    assert_eq!(response.headers()[header::VARY], "Accept");
                     assert_eq!(response.headers()[header::CONTENT_TYPE], accept);
                     let bytes = axum::body::to_bytes(response.into_body(), 4096)
                         .await
@@ -909,6 +947,12 @@ mod tests {
                         )
                         .unwrap()
                     };
+                    assert_eq!(error["schema_version"], PROOF_SCHEMA_VERSION);
+                    assert_eq!(error["network_id"], HELLAS_DEVNET_1_ID);
+                    assert_eq!(
+                        error["message"],
+                        "The requested verified owner snapshot is unavailable. Request latest holdings explicitly."
+                    );
                     assert_eq!(error["code"], "snapshot_unavailable");
                     assert_eq!(error["latest_url"], format!("/api/v1/addresses/{owner}"));
                     assert!(error.get("block").is_none());
@@ -945,29 +989,55 @@ mod tests {
                 format!("/api/v1/blocks/{}/proof", hex::encode(first_block.digest())),
                 format!("/api/v1/transactions/{}/proof", hex::encode(tx)),
             ] {
-                let response = app
-                    .clone()
-                    .oneshot(
-                        axum::http::Request::builder()
-                            .uri(uri)
-                            .body(axum::body::Body::empty())
-                            .unwrap(),
+                for accept in [
+                    None,
+                    Some("application/json"),
+                    Some("application/x-protobuf"),
+                    Some("application/protobuf"),
+                    Some("text/html"),
+                ] {
+                    let mut request = axum::http::Request::builder().uri(&uri);
+                    if let Some(accept) = accept {
+                        request = request.header(header::ACCEPT, accept);
+                    }
+                    let response = app
+                        .clone()
+                        .oneshot(request.body(axum::body::Body::empty()).unwrap())
+                        .await
+                        .unwrap();
+                    if accept == Some("text/html") {
+                        assert_eq!(response.status(), StatusCode::NOT_ACCEPTABLE);
+                        continue;
+                    }
+                    assert_eq!(response.status(), StatusCode::OK);
+                    assert_eq!(response.headers()[header::VARY], "Accept");
+                    let json = accept == Some("application/json");
+                    assert_eq!(
+                        response.headers()[header::CONTENT_TYPE],
+                        if json {
+                            "application/json"
+                        } else {
+                            "application/x-protobuf"
+                        }
+                    );
+                    let body = axum::body::to_bytes(
+                        response.into_body(),
+                        crate::verified_explorer::MAX_PROOF_BYTES,
                     )
                     .await
                     .unwrap();
-                assert_eq!(response.status(), StatusCode::OK);
-                let body = axum::body::to_bytes(
-                    response.into_body(),
-                    crate::verified_explorer::MAX_PROOF_BYTES,
-                )
-                .await
-                .unwrap();
-                let bundle = <ProofBundle as prost::Message>::decode(body).unwrap();
-                assert!(
-                    verifier
-                        .verify(bundle, ExplorerQuery::Block(FinalizedBlockQuery::Height(1)))
-                        .is_ok()
-                );
+                    let bundle = if json {
+                        serde_json::from_slice(&body).unwrap()
+                    } else {
+                        <ProofBundle as prost::Message>::decode(body).unwrap()
+                    };
+                    let query = if uri.contains("/transactions/") {
+                        ExplorerQuery::Transaction(tx)
+                    } else {
+                        ExplorerQuery::Block(FinalizedBlockQuery::Height(1))
+                    };
+                    assert!(verifier.verify(bundle, query).is_ok());
+                }
             }
             let absent = app
                 .oneshot(
