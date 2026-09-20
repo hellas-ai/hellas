@@ -24,7 +24,8 @@ pub mod work_setup;
 
 pub use causal_lm::{
     CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR, CausalLmEnvironment, CausalLmEnvironmentError,
-    ContentRef, MAX_CAUSAL_LM_ENVIRONMENT_BYTES, MAX_CAUSAL_LM_STATIC_BYTES, StaticSlice,
+    CausalLmGenerationSchedule, ContentRef, MAX_CAUSAL_LM_ENVIRONMENT_BYTES,
+    MAX_CAUSAL_LM_STATIC_BYTES, StaticSlice,
 };
 pub use commitment::{Assurance, Operation, RequestCommitment, SchemeId, scheme_id};
 pub use digest::{ContentId, Digest, hash_tuple};

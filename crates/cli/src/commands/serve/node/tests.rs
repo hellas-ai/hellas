@@ -43,7 +43,7 @@ use hellas_work::work_close::{BlockSourceError, FinalizedWork};
 use hellas_work::work_handshake::{apply_setup_exchange, prepare_setup_exchange};
 use hellas_work::work_open::{FinalizedSetup, SetupQuery};
 use hellas_work::work_store::{
-    ChannelRecord, SetupEnd, SetupOrigin, SetupRecord, SetupScan, TerminalOutcome,
+    ChannelRecord, ChannelState, SetupEnd, SetupOrigin, SetupRecord, SetupScan, TerminalOutcome,
 };
 use iroh::{EndpointAddr, TransportAddr};
 use tokio::sync::{Notify, Semaphore};
@@ -846,8 +846,9 @@ async fn completion_clears_and_mounts_only_the_completing_route() {
 }
 
 /// Readiness is recomputed from the selected route's fresh coherent
-/// snapshot before every signature. A contest on A invalidates only A;
-/// B's independent snapshot and service remain ready.
+/// snapshot before every new signature. A contest on A invalidates only A;
+/// B's independent snapshot and service remain ready. Retained answers and
+/// already-expired proposals do not wait for another admission decision.
 #[tokio::test]
 async fn fresh_readiness_is_per_request_and_per_routed_channel() {
     let dir = temp();
@@ -872,14 +873,77 @@ async fn fresh_readiness_is_per_request_and_per_routed_channel() {
         accept_mounted_route(&work_mount, first_route_peer(), first_request.clone()).await;
     assert!(
         matches!(
-            accepted.outcome,
+            accepted.outcome.as_ref(),
             Some(accept_work_response::Outcome::Accepted(_))
         ),
         "A's first fresh snapshot permits its signature",
     );
 
     source.set_snapshot(first.ready_snapshot(ORIGIN, Some(pending_contest(false))));
-    let refused = accept_mounted_route(&work_mount, first_route_peer(), first_request).await;
+    let handler = work_mount
+        .handler(&vouched_context(first_route_peer()))
+        .unwrap();
+    let checkpoint = handler
+        .service
+        .with_state(ChannelState::checkpoint)
+        .unwrap();
+    // Simulate a different admission request holding the slow chain read.
+    let held = handler.accepting.lock().await;
+    let repeated = tokio::time::timeout(
+        Duration::from_secs(1),
+        accept_mounted_route(&work_mount, first_route_peer(), first_request.clone()),
+    )
+    .await
+    .expect("a lost acknowledgement does not wait for admission");
+    assert_eq!(
+        repeated, accepted,
+        "only the existing co-signature is returned"
+    );
+
+    let mut expired_authorization = first.authorization();
+    expired_authorization.proposal_nonce = 2;
+    expired_authorization.acceptance_deadline = ORIGIN - 1;
+    let expired_id = work_id(first.descriptor().channel(), &expired_authorization);
+    let expired = AcceptWorkRequest {
+        authorization: expired_authorization.encode(),
+        client_signature: first
+            .client()
+            .sign(signing_hash(expired_id))
+            .as_bytes()
+            .to_vec(),
+        prepared_input: first_request.prepared_input.clone(),
+    };
+    let response = tokio::time::timeout(
+        Duration::from_secs(1),
+        accept_mounted_route(&work_mount, first_route_peer(), expired),
+    )
+    .await
+    .expect("known expiry does not wait for admission");
+    assert!(matches!(response.outcome,
+        Some(accept_work_response::Outcome::Refused(refusal))
+            if refusal.code == WorkRefusalCode::Expired as i32));
+    assert_eq!(
+        handler
+            .service
+            .with_state(ChannelState::checkpoint)
+            .unwrap(),
+        checkpoint
+    );
+    drop(held);
+
+    let mut fresh_authorization = first.authorization();
+    fresh_authorization.proposal_nonce = 2;
+    let fresh_id = work_id(first.descriptor().channel(), &fresh_authorization);
+    let fresh = AcceptWorkRequest {
+        authorization: fresh_authorization.encode(),
+        client_signature: first
+            .client()
+            .sign(signing_hash(fresh_id))
+            .as_bytes()
+            .to_vec(),
+        prepared_input: first_request.prepared_input,
+    };
+    let refused = accept_mounted_route(&work_mount, first_route_peer(), fresh).await;
     let Some(accept_work_response::Outcome::Refused(refusal)) = refused.outcome else {
         panic!("A's finalized contest prevents another provider signature")
     };
@@ -3548,6 +3612,59 @@ async fn the_clock_resumes_an_accepted_job_after_restart() {
         1,
         "a ready journal is never invoked again"
     );
+
+    // A second restart finds a result, not an Accepted job to resume. It must
+    // deliver that result without a new AcceptWork priming its readiness.
+    drop(runner);
+    drop(mount);
+    let mount = MountedWork::default();
+    let mut restarted = self::runner(dir.path(), provider_policy(), &mount);
+    assert!(restarted.tick(&chain).await);
+    let exporter = [0x5b; 32];
+    let mut context = vouched_context(default_route_peer());
+    context.open_exporter = Some(exporter);
+    let request = DeliverResultRequest {
+        work_id: work_id.as_bytes().to_vec(),
+        client_signature: client()
+            .sign(signing_hash(delivery_request_digest(
+                descriptor().channel(),
+                work_id,
+                &exporter,
+            )))
+            .as_bytes()
+            .to_vec(),
+    };
+    let handler = mount
+        .handler(&context)
+        .expect("restarted channel is mounted");
+    let response: WithTrailer<DeliverResultResponse> = tokio::time::timeout(
+        Duration::from_secs(5),
+        handler.deliver_result(request.clone(), context.clone()),
+    )
+    .await
+    .expect("retained result is immediately collectable")
+    .expect("delivery succeeds")
+    .into();
+    assert!(matches!(
+        response.response.outcome,
+        Some(deliver_result_response::Outcome::Delivered(_))
+    ));
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "delivery never reruns the model"
+    );
+
+    chain.set_snapshot(ready_channel_snapshot(ORIGIN, Some(pending_contest(false))));
+    let response: WithTrailer<DeliverResultResponse> = handler
+        .deliver_result(request, context)
+        .await
+        .expect("refusal is answered")
+        .into();
+    let Some(deliver_result_response::Outcome::Refused(refusal)) = response.response.outcome else {
+        panic!("cached readiness must not release data after a finalized contest");
+    };
+    assert_retryable_not_ready(refusal);
 }
 
 /// A request is answered while the clock waits on a slow chain.

@@ -216,6 +216,11 @@ impl CausalLmExecutionEnvironment {
     pub const fn manifest_id(&self) -> ContentId {
         self.manifest_id
     }
+
+    /// Returns the canonical environment used to prepare this execution.
+    pub fn environment(&self) -> &hellas_rpc::CausalLmEnvironment {
+        &self.environment
+    }
 }
 
 pub(super) fn genesis_text_execution_id(

@@ -4,8 +4,8 @@ use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::time::{Duration, Instant};
 
 use catena_lang::safe_gpu::causal_lm::{
-    GenerationControl, GenerationError, GenerationTermination, MAX_MODEL_STATIC_BYTES, Model,
-    ModelConfig, minimum_generation_device_bytes,
+    GenerationControl, GenerationError, GenerationOptions, GenerationTermination,
+    MAX_MODEL_STATIC_BYTES, Model, ModelConfig, minimum_generation_device_bytes,
 };
 use catena_lang::safe_gpu::{
     Asset, AssetOwner, MAX_RESIDENT_ASSET_BYTES, MAX_RESIDENT_ASSETS, Program, Session,
@@ -18,8 +18,8 @@ use hellas_rpc::pb::execute::{
 use hellas_rpc::protocol::artifacts::MAX_RETRIEVABLE_TOKEN_IDS;
 use hellas_rpc::stream::output_event_to_pb;
 use hellas_rpc::{
-    ContentId, ContentRef, EvaluateRequest, MAX_CAUSAL_LM_STATIC_BYTES, OutputEventEnvelope,
-    ProducerSigningKey,
+    CausalLmEnvironment, ContentId, ContentRef, EvaluateRequest, MAX_CAUSAL_LM_STATIC_BYTES,
+    OutputEventEnvelope, ProducerSigningKey,
 };
 use hellas_wire::WireStatus;
 use tokio::sync::mpsc as tokio_mpsc;
@@ -30,6 +30,14 @@ use crate::artifacts::PreparedTextArtifacts;
 use crate::environment::{CausalLmEnvironmentSource, read_verified_bytes};
 use crate::executor::ExecutorCompletion;
 use crate::state::{Invocation, StopReason};
+
+#[cfg(feature = "otel")]
+#[path = "worker/telemetry.rs"]
+mod telemetry;
+#[cfg(not(feature = "otel"))]
+#[path = "worker/telemetry_noop.rs"]
+mod telemetry;
+use telemetry::{InferenceMetrics, InferenceTelemetry};
 
 /// Default number of distinct programs admitted into one GPU worker session.
 ///
@@ -62,6 +70,10 @@ pub const DEFAULT_GPU_EXECUTION_TIMEOUT_SECS: u64 =
 /// Manifest-specific bindings are cheap to recreate from resident programs and
 /// assets. Keep only a small working set rather than growing them without bound.
 const MAX_RESIDENT_MODELS: usize = 16;
+
+/// One checkpoint is retained across requests in the isolated worker. Catena
+/// also charges it against the generation's configured device-memory envelope.
+const MAX_PREFIX_CACHE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 // The canonical protocol and Catena runtime live in separate crates. The
 // executor is their meeting point, so compilation must fail if their portable
@@ -186,6 +198,34 @@ impl GpuConfig {
             .ok_or_else(|| "causal-LM generation capacity overflowed".to_string())?;
         validate_generation_limits(self, capacity, state_byte_multipliers, vocabulary_size)
     }
+
+    pub(crate) fn validate_environment_invocation_resources(
+        self,
+        invocation: &Invocation,
+        environment: &CausalLmEnvironment,
+    ) -> Result<(), String> {
+        self.validate_invocation_resources(
+            invocation,
+            environment.state_bytes_per_capacity(),
+            environment.vocabulary_size(),
+        )?;
+        if let Some(schedule) = environment.generation_schedule() {
+            let required = invocation.input_ids.len() as u64 + u64::from(invocation.max_new_tokens);
+            if required > schedule.fixed_capacity {
+                return Err(format!(
+                    "invocation requires {required} tokens, exceeding the environment's fixed capacity {}",
+                    schedule.fixed_capacity
+                ));
+            }
+            validate_generation_limits(
+                self,
+                schedule.fixed_capacity,
+                environment.state_bytes_per_capacity(),
+                environment.vocabulary_size(),
+            )?;
+        }
+        Ok(())
+    }
 }
 
 impl Default for GpuConfig {
@@ -225,6 +265,7 @@ pub(crate) enum EnqueueError {
 pub(crate) struct ExecuteJob {
     pub output_cache: hellas_rpc::cache::CacheOptions,
     pub cache_recording: Option<hellas_rpc::cache::CacheRecording>,
+    pub span: tracing::Span,
     pub execution_id: String,
     pub request_commitment: [u8; 32],
     pub evaluate_request: EvaluateRequest,
@@ -319,6 +360,7 @@ fn worker_loop(
     // Starting the executor does not touch a GPU. Catena is created lazily
     // only after an authorized paid job reaches this dedicated thread.
     let mut runtime = ModelRuntime::new(config);
+    let metrics = InferenceMetrics::new();
     while let Ok(WorkerCommand::Execute(job)) = rx.recv() {
         let job = *job;
         let execution_id = job.execution_id.clone();
@@ -346,27 +388,42 @@ fn worker_loop(
             &mut output_events,
         );
 
-        let termination = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_job(job, on_progress, &mut runtime)
-        })) {
-            Ok(Ok((stop_reason, output_tokens))) => WorkerCompletionResult::Completed {
-                stop_reason,
-                output_tokens,
-                output_events,
-            },
-            Ok(Err(error)) => {
-                warn!(%execution_id, %execution_environment, "GPU execution failed");
-                WorkerCompletionResult::Failed {
-                    position,
-                    error: error.to_string(),
+        let termination = {
+            let mut telemetry = metrics.start(
+                &job.span,
+                job.accepted_at,
+                job.invocation.input_ids.len(),
+                job.invocation.max_new_tokens,
+            );
+            let span = telemetry.span().clone();
+            let _entered = span.enter();
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_job(job, on_progress, &mut runtime, &mut telemetry)
+            })) {
+                Ok(Ok((stop_reason, output_tokens))) => {
+                    telemetry.succeeded(stop_reason, output_tokens.len());
+                    WorkerCompletionResult::Completed {
+                        stop_reason,
+                        output_tokens,
+                        output_events,
+                    }
                 }
-            }
-            Err(_) => {
-                runtime.discard_session();
-                warn!(%execution_id, %execution_environment, "GPU worker panicked; session discarded");
-                WorkerCompletionResult::Failed {
-                    position,
-                    error: "GPU worker panicked; sensitive details suppressed".to_string(),
+                Ok(Err(error)) => {
+                    telemetry.failed(&error);
+                    warn!(%execution_id, %execution_environment, "GPU execution failed");
+                    WorkerCompletionResult::Failed {
+                        position,
+                        error: error.to_string(),
+                    }
+                }
+                Err(_) => {
+                    telemetry.panicked();
+                    runtime.discard_session();
+                    warn!(%execution_id, %execution_environment, "GPU worker panicked; session discarded");
+                    WorkerCompletionResult::Failed {
+                        position,
+                        error: "GPU worker panicked; sensitive details suppressed".to_string(),
+                    }
                 }
             }
         };
@@ -390,6 +447,7 @@ fn run_job(
     job: ExecuteJob,
     mut on_progress: impl FnMut(u32) -> Result<(), crate::ExecutorError>,
     runtime: &mut ModelRuntime,
+    telemetry: &mut InferenceTelemetry,
 ) -> Result<(StopReason, Vec<u32>), crate::ExecutorError> {
     if let Some(output) = crate::inference_cache::replay(&job, &mut on_progress)? {
         return Ok(output);
@@ -412,15 +470,32 @@ fn run_job(
 
     runtime.validate_generation_resources(&source, &invocation)?;
     let input_ids = Zeroizing::new(invocation.input_ids);
-    let result = runtime.model(&source)?.generate_tokens_streaming(
-        input_ids.as_slice(),
-        invocation.max_new_tokens,
-        &invocation.stop_token_ids,
-        |token| {
-            on_progress(token)?;
-            Ok(GenerationControl::Continue)
-        },
-    );
+    let emit = |token| {
+        telemetry.token_generated();
+        on_progress(token)?;
+        Ok(GenerationControl::Continue)
+    };
+    let model = runtime.model(&source)?;
+    let result = if let Some(schedule) = source.environment().generation_schedule() {
+        model.generate_tokens_streaming_with_options(
+            input_ids.as_slice(),
+            invocation.max_new_tokens,
+            &invocation.stop_token_ids,
+            GenerationOptions {
+                capacity: schedule.fixed_capacity,
+                prefill_chunk_tokens: schedule.prefill_chunk_tokens,
+                prefix_cache_max_bytes: MAX_PREFIX_CACHE_BYTES,
+            },
+            emit,
+        )
+    } else {
+        model.generate_tokens_streaming(
+            input_ids.as_slice(),
+            invocation.max_new_tokens,
+            &invocation.stop_token_ids,
+            emit,
+        )
+    };
 
     let result = match result {
         Ok(result) => result,
@@ -493,6 +568,18 @@ fn run_job(
             ));
         }
     };
+    telemetry.cache_stats(
+        result.stats.reused_prompt_tokens,
+        result.stats.prefill_steps,
+    );
+    debug!(
+        execution_environment = %source.manifest_id(),
+        prompt_tokens = result.stats.prompt_tokens,
+        reused_prompt_tokens = result.stats.reused_prompt_tokens,
+        prefill_steps = result.stats.prefill_steps,
+        output_tokens = result.generated_tokens.len(),
+        "GPU worker completed causal-LM execution"
+    );
     Ok((stop_reason, result.generated_tokens))
 }
 
@@ -586,11 +673,8 @@ impl ModelRuntime {
                 .map(|slice| slice.bytes()),
         )
         .and_then(|()| {
-            self.config.validate_invocation_resources(
-                invocation,
-                environment.state_bytes_per_capacity(),
-                environment.vocabulary_size(),
-            )
+            self.config
+                .validate_environment_invocation_resources(invocation, environment)
         })
         .map_err(|error| {
             crate::ExecutorError::Execution(format!(

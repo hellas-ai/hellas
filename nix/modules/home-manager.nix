@@ -60,10 +60,11 @@ in
   options.programs.hellas =
     hellas.commonOptions {
       inherit lib;
-      package = hellas.pickCliPackage pkgs;
+      package = (hellas.pickCliPackage pkgs).override { otel = cfg.otel.enable; };
+      inherit (cfg) otel;
       packageDescription = ''
-        The hellas network CLI, including chain, gateway, node, and OTEL
-        support. On x86_64-linux, overriding `programs.hellas.package` with
+        The hellas network CLI, including chain, gateway and node support. The shared
+        `otel` options select a telemetry-enabled build when configured. On x86_64-linux, overriding `programs.hellas.package` with
         this flake's `cli-catena` package enables interactive local Catena
         commands only. A Linux Catena provider daemon requires the NixOS
         `services.hellas` module; the Home Manager daemon is Darwin-only and
@@ -113,8 +114,13 @@ in
     }
 
     (mkIf cfg.enable {
-      home.packages = [ cfg.package ];
-      home.sessionVariables = hellas.renderEnvironment baseEnv;
+      home.packages = [
+        (hellas.withEnvironment {
+          inherit lib pkgs;
+          inherit (cfg) package;
+          environment = baseEnv;
+        })
+      ];
     })
 
     # Surface a clear assertion on Linux rather than a "no such option" error

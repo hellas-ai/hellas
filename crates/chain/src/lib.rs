@@ -1,6 +1,6 @@
 #[cfg(any(feature = "indexer", feature = "validator"))]
 mod app;
-#[cfg(feature = "block-view")]
+#[cfg(feature = "client-core")]
 pub mod block;
 #[cfg(feature = "block-view")]
 pub mod block_view;
@@ -18,6 +18,8 @@ mod execution;
 pub mod explorer_origin;
 #[cfg(feature = "validator")]
 pub mod faucet;
+#[cfg(feature = "client-core")]
+pub mod finality_proof;
 #[cfg(feature = "indexer")]
 pub mod follower;
 #[cfg(feature = "domain")]
@@ -61,7 +63,7 @@ pub use app::{ActivityReporter, Application, ApplicationConfig};
 /// follower build puts a transaction into one or takes one out.
 #[cfg(feature = "validator")]
 pub use app::{GENERAL_MEMPOOL_CAPACITY, Mempool};
-#[cfg(feature = "block-view")]
+#[cfg(feature = "client-core")]
 pub use block::{HellasBlock, UtxoSyncTarget};
 #[cfg(feature = "block-view")]
 pub use block_view::{BlockViewError, FinalizedBlockView};
@@ -110,10 +112,12 @@ mod genesis_reexport {
 
     #[test]
     fn the_documents_reached_through_chain_are_the_reviewed_bytes() {
-        let selector = "devnet";
-        let id = crate::genesis::HELLAS_DEVNET_1_ID;
-        let json = crate::genesis::HELLAS_DEVNET_1_JSON;
-        let expected = "caab04a9350edbe0d50aa9375dcee2742145cf5c24c57f42c844ebf4f27aa4b6";
+        let (selector, id, json, expected) = (
+            "devnet",
+            crate::genesis::HELLAS_DEVNET_1_ID,
+            crate::genesis::HELLAS_DEVNET_1_JSON,
+            "6e5e8d2b35f62724380afd2735ff8677f503bfc0c008e7bc8935e9a1214099bb",
+        );
         let hex: String = Sha256::digest(json.as_bytes())
             .iter()
             .map(|byte| format!("{byte:02x}"))

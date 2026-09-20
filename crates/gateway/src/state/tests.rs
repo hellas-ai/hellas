@@ -48,6 +48,8 @@ fn test_environment() -> CausalLmExecutionEnvironment {
 fn options(provider_trust: Option<ProviderTrustAnchor>) -> GatewayOptions {
     GatewayOptions {
         output_cache: Default::default(),
+        paid_work: None,
+        bearer_token_file: None,
         host: "127.0.0.1".to_string(),
         port: None,
         node_id: Some(endpoint(1)),
@@ -66,6 +68,7 @@ fn options(provider_trust: Option<ProviderTrustAnchor>) -> GatewayOptions {
         #[cfg(feature = "evaluate")]
         local_content_store: None,
         tokenizer: Some("tokenizer.json".into()),
+        chat_template: None,
         stop_token_ids: Vec::new(),
         metrics_port: None,
         responses_backend: ResponsesBackend::Hellas,
@@ -321,4 +324,41 @@ async fn proxy_without_causal_lm_does_not_bind_remote_transport() {
     let state = GatewayState::from_options(&options).await.unwrap();
     assert!(state.responses_proxy.is_some());
     assert!(state.runtime.remote_registry().is_err());
+}
+
+#[tokio::test]
+async fn paid_settlement_rejects_inference_caching_before_starting_runtime() {
+    use hellas_rpc::cache::{CacheOptions, CachePolicy, MemoryCacheStore};
+
+    struct UncalledPaidBackend;
+    impl crate::PaidExecutionBackend for UncalledPaidBackend {
+        fn execute(
+            &self,
+            _: crate::PaidExecutionRequest,
+        ) -> anyhow::Result<
+            futures::stream::BoxStream<'static, anyhow::Result<crate::ExecutionEvent>>,
+        > {
+            panic!("incompatible cache policy must not execute paid work")
+        }
+
+        fn drain(&self) -> futures::future::BoxFuture<'_, ()> {
+            Box::pin(async {})
+        }
+    }
+
+    for policy in [CachePolicy::Record, CachePolicy::ReplayOnly] {
+        let mut options = options(None);
+        options.paid_work = Some(Arc::new(UncalledPaidBackend));
+        options.output_cache = CacheOptions {
+            policy,
+            store: Some(Arc::new(MemoryCacheStore::default())),
+        };
+        // The fixture tokenizer does not exist: rejection must precede even
+        // presentation loading, and must never bind or contact a provider.
+        let error = GatewayState::from_options(&options).await.err().unwrap();
+        assert_eq!(
+            error.to_string(),
+            "paid work requires live settlement; disable inference caching"
+        );
+    }
 }

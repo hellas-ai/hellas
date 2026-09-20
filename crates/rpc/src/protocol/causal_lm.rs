@@ -11,6 +11,15 @@
 //! owned states, one owned `f32` logits buffer with `vocabulary_size` elements,
 //! and one greedy token as `u64`. Catena entry-point metadata supplies the value
 //! kinds, so this object does not repeat them.
+//!
+//! The legacy seven-field environment uses one full-prompt forward call and
+//! capacity equal to prompt length plus the requested output bound. An optional
+//! eighth field commits `[fixed_capacity, prefill_chunk_tokens]`: prefill calls
+//! consume consecutive chunks of that size (the last may be shorter), discard
+//! intermediate predictions, and decode one token per call thereafter. These
+//! schedules can differ for arbitrary programs and have distinct content IDs.
+//! Providers may reuse an exact-prefix checkpoint only if all mutable state is
+//! restored independently at the same capacity and chunk boundary.
 
 use crate::{Application, ContentId, DagCborEncoder, ProgramManifest};
 
@@ -107,6 +116,14 @@ impl StaticSlice {
     }
 }
 
+/// Forward-call semantics committed by an opt-in causal-LM environment.
+/// Capacity and chunk boundaries are observable by arbitrary Catena programs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CausalLmGenerationSchedule {
+    pub fixed_capacity: u64,
+    pub prefill_chunk_tokens: u32,
+}
+
 /// The complete token-native environment below a causal-LM manifest root.
 ///
 /// Each state multiplier describes a zero-initialized `f32` allocation of
@@ -122,6 +139,7 @@ pub struct CausalLmEnvironment {
     state_bytes_per_capacity: Vec<u64>,
     vocabulary_size: u64,
     maximum_capacity: u64,
+    generation_schedule: Option<CausalLmGenerationSchedule>,
 }
 
 impl CausalLmEnvironment {
@@ -148,9 +166,25 @@ impl CausalLmEnvironment {
             state_bytes_per_capacity,
             vocabulary_size,
             maximum_capacity,
+            generation_schedule: None,
         };
         environment.validate()?;
         Ok(environment)
+    }
+
+    /// Opt into a fixed schedule, producing a distinct committed environment.
+    pub fn with_generation_schedule(
+        mut self,
+        schedule: CausalLmGenerationSchedule,
+    ) -> Result<Self, CausalLmEnvironmentError> {
+        self.generation_schedule = Some(schedule);
+        self.validate()?;
+        Ok(self)
+    }
+
+    #[must_use]
+    pub const fn generation_schedule(&self) -> Option<CausalLmGenerationSchedule> {
+        self.generation_schedule
     }
 
     /// Returns the Catena source object.
@@ -227,7 +261,11 @@ impl CausalLmEnvironment {
     #[must_use]
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut encoder = DagCborEncoder::new();
-        encoder.array(7);
+        encoder.array(if self.generation_schedule.is_some() {
+            8
+        } else {
+            7
+        });
         encode_content_ref(&mut encoder, self.program);
         encoder.str(&self.entrypoint);
         encoder.array(self.static_objects.len() as u64);
@@ -247,6 +285,11 @@ impl CausalLmEnvironment {
         }
         encoder.u64(self.vocabulary_size);
         encoder.u64(self.maximum_capacity);
+        if let Some(schedule) = self.generation_schedule {
+            encoder.array(2);
+            encoder.u64(schedule.fixed_capacity);
+            encoder.u64(u64::from(schedule.prefill_chunk_tokens));
+        }
         encoder.into_bytes()
     }
 
@@ -259,7 +302,13 @@ impl CausalLmEnvironment {
             )));
         }
         let mut decoder = CanonicalDecoder::new(bytes);
-        decoder.array_exact(7)?;
+        let field_count = decoder.array_len()?;
+        if !matches!(field_count, 7 | 8) {
+            return Err(CanonicalDecodeError::new(
+                "causal-LM environment must contain 7 or 8 fields",
+            )
+            .into());
+        }
         let program = decode_content_ref(&mut decoder)?;
         let entrypoint = decoder.str()?;
         validate_entrypoint(entrypoint)?;
@@ -305,6 +354,15 @@ impl CausalLmEnvironment {
 
         let vocabulary_size = decoder.u64()?;
         let maximum_capacity = decoder.u64()?;
+        let schedule = if field_count == 8 {
+            decoder.array_exact(2)?;
+            Some(CausalLmGenerationSchedule {
+                fixed_capacity: decoder.u64()?,
+                prefill_chunk_tokens: decoder.u32()?,
+            })
+        } else {
+            None
+        };
         decoder.finish()?;
 
         let environment = Self::new(
@@ -316,6 +374,10 @@ impl CausalLmEnvironment {
             vocabulary_size,
             maximum_capacity,
         )?;
+        let environment = match schedule {
+            Some(schedule) => environment.with_generation_schedule(schedule)?,
+            None => environment,
+        };
         if environment.canonical_bytes() != bytes {
             return Err(CanonicalDecodeError::new(
                 "causal-LM environment is not in canonical DAG-CBOR form",
@@ -340,6 +402,17 @@ impl CausalLmEnvironment {
     }
 
     fn validate(&self) -> Result<(), CausalLmEnvironmentError> {
+        if let Some(schedule) = self.generation_schedule {
+            invalid_if(
+                schedule.fixed_capacity == 0 || schedule.fixed_capacity > self.maximum_capacity,
+                "fixed generation capacity must be in 1..=maximum_capacity",
+            )?;
+            invalid_if(
+                schedule.prefill_chunk_tokens == 0
+                    || u64::from(schedule.prefill_chunk_tokens) > schedule.fixed_capacity,
+                "prefill chunk must be in 1..=fixed_capacity",
+            )?;
+        }
         invalid_if(
             self.program.bytes == 0 || self.program.bytes > MAX_PROGRAM_BYTES,
             format!(

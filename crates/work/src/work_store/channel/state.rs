@@ -1034,7 +1034,10 @@ impl ChannelState {
             });
         }
         let (height, _) = self.cursor;
-        if height > job.authorization.acceptance_deadline {
+        // The provider must journal its signature before the deadline. The
+        // client may recover that already released signature after a lost
+        // response; recording evidence does not authorize new provider work.
+        if self.role == Role::Provider && height > job.authorization.acceptance_deadline {
             return Err(ChannelStateError::AcceptanceLate {
                 height,
                 deadline: job.authorization.acceptance_deadline,
@@ -1060,7 +1063,7 @@ impl ChannelState {
         self.require_role("a running marker", Role::Provider)?;
         let mut job = self.open_job(work_id, "a running marker")?;
         match job.phase {
-            JobPhase::Running => return Ok(Applied::Redundant),
+            JobPhase::Running | JobPhase::Streaming => return Ok(Applied::Redundant),
             JobPhase::Accepted => {}
             phase => {
                 return Err(ChannelStateError::WrongPhase {
@@ -1126,7 +1129,9 @@ impl ChannelState {
             Role::Provider => JobPhase::Running,
             Role::Client => JobPhase::Accepted,
         };
-        if job.phase != expected {
+        if job.phase != expected
+            && !(self.role == Role::Provider && job.phase == JobPhase::Streaming)
+        {
             return Err(ChannelStateError::WrongPhase {
                 step: "recording a result",
                 phase: job.phase.name(),
@@ -1172,7 +1177,11 @@ impl ChannelState {
         }
         job.result = Some((*result, provider_signature));
         job.transcript = transcript.to_vec();
-        job.phase = JobPhase::Ready;
+        job.phase = if job.phase == JobPhase::Streaming {
+            JobPhase::Delivered
+        } else {
+            JobPhase::Ready
+        };
         self.jobs.insert(work_id, job);
         Ok(Applied::Changed)
     }
@@ -1211,14 +1220,18 @@ impl ChannelState {
         if job.phase.delivered() {
             return Ok(Applied::Redundant);
         }
-        if job.phase != JobPhase::Ready {
+        if !matches!(job.phase, JobPhase::Ready | JobPhase::Running) {
             return Err(ChannelStateError::WrongPhase {
                 step: "releasing plaintext",
                 phase: job.phase.name(),
             });
         }
         self.check_delivery_limit(job.authorization.price)?;
-        job.phase = JobPhase::Delivered;
+        job.phase = if job.phase == JobPhase::Running {
+            JobPhase::Streaming
+        } else {
+            JobPhase::Delivered
+        };
         self.jobs.insert(work_id, job);
         Ok(Applied::Changed)
     }
@@ -1453,7 +1466,7 @@ impl ChannelState {
         let reserved = self
             .jobs
             .values()
-            .filter(|job| job.phase == JobPhase::Delivered)
+            .filter(|job| job.phase.delivered())
             .map(|job| job.authorization.price)
             .fold(0_u64, u64::saturating_add);
         if reserved.saturating_add(price) > limit {

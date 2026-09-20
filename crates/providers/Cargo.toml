@@ -7,12 +7,17 @@ license.workspace = true
 repository.workspace = true
 documentation.workspace = true
 
+[features]
+default = []
+otel = ["hellas-rpc/otel", "dep:hellas-wire"]
+
 [dependencies]
 anyhow = { workspace = true }
 async-stream = { workspace = true }
 futures.workspace = true
 hellas-adaptors.workspace = true
 hellas-executor = { workspace = true, default-features = false }
+hellas-wire = { workspace = true, optional = true }
 hellas-rpc = { workspace = true, features = ["fetch"] }
 reqwest.workspace = true
 serde.workspace = true
@@ -22,4 +27,8 @@ tracing.workspace = true
 
 [dev-dependencies]
 axum.workspace = true
+opentelemetry.workspace = true
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
+tracing-opentelemetry.workspace = true
+tracing-subscriber.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

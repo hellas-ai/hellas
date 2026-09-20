@@ -10,7 +10,7 @@ fn validate(settings: EnvironmentSettings, object_lengths: &[u64]) -> CausalLmEn
         .enumerate()
         .map(|(index, bytes)| ContentRef::new(ContentId::from_bytes([index as u8 + 2; 32]), *bytes))
         .collect();
-    CausalLmEnvironment::new(
+    let environment = CausalLmEnvironment::new(
         ContentRef::new(ContentId::from_bytes([1; 32]), 1),
         settings.entrypoint,
         objects,
@@ -23,7 +23,16 @@ fn validate(settings: EnvironmentSettings, object_lengths: &[u64]) -> CausalLmEn
         settings.vocabulary_size,
         settings.maximum_capacity,
     )
-    .unwrap()
+    .unwrap();
+    match settings.generation {
+        Some(schedule) => environment
+            .with_generation_schedule(hellas_rpc::CausalLmGenerationSchedule {
+                fixed_capacity: schedule.fixed_capacity,
+                prefill_chunk_tokens: schedule.prefill_chunk_tokens,
+            })
+            .unwrap(),
+        None => environment,
+    }
 }
 
 #[test]
@@ -220,7 +229,7 @@ fn atomic_output_requires_an_existing_parent() {
 fn checked_in_model_settings_match_the_pinned_generated_records() {
     // These identities pin every ordered static slice, not just the counts
     // below. Update them only when regenerating from the revision named in
-    // each settings file.
+    // each settings file or deliberately changing its committed schedule.
     assert_eq!(
         ContentId::hash(include_bytes!(
             "../../../../../examples/smollm2.environment.toml"
@@ -233,7 +242,7 @@ fn checked_in_model_settings_match_the_pinned_generated_records() {
             "../../../../../examples/qwen3.environment.toml"
         ))
         .to_string(),
-        "116674fd6e7e9aff0043ad18d32ffdea3de4985094efd004babbd26713fc5f30"
+        "68d831ee06da3a2716c49f310b25ad753b20eb7a13cf2486678c96131aa7995a"
     );
     let smol: EnvironmentSettings = toml::from_str(include_str!(
         "../../../../../examples/smollm2.environment.toml"
@@ -256,6 +265,40 @@ fn checked_in_model_settings_match_the_pinned_generated_records() {
     let qwen = validate(qwen, &[49_693_950_144, 11_401_853_280]);
     assert_eq!(qwen.vocabulary_size(), 151_936);
     assert_eq!(qwen.maximum_capacity(), 32_768);
+    assert_eq!(
+        qwen.generation_schedule(),
+        Some(hellas_rpc::CausalLmGenerationSchedule {
+            fixed_capacity: 32_768,
+            prefill_chunk_tokens: 64,
+        })
+    );
+}
+
+#[tokio::test]
+async fn schedule_changes_only_metadata_without_reopening_static_objects() {
+    let directory = tempfile::tempdir().unwrap();
+    let environment = provider_ready_environment(directory.path());
+    let original =
+        CausalLmEnvironment::from_canonical_bytes(&std::fs::read(&environment).unwrap()).unwrap();
+    std::fs::remove_file(directory.path().join("weights.bin")).unwrap();
+    std::fs::remove_file(directory.path().join("model.hex")).unwrap();
+    let out = directory.path().join("scheduled.environment");
+    super::run(super::EnvironmentCommand::Schedule {
+        environment,
+        fixed_capacity: 64,
+        prefill_chunk_tokens: 16,
+        out: out.clone(),
+    })
+    .await
+    .unwrap();
+    let scheduled =
+        CausalLmEnvironment::from_canonical_bytes(&std::fs::read(out).unwrap()).unwrap();
+    assert_eq!(scheduled.program(), original.program());
+    assert_eq!(scheduled.static_objects(), original.static_objects());
+    assert_ne!(
+        scheduled.manifest().content_id(),
+        original.manifest().content_id()
+    );
 }
 
 fn provider_ready_environment(directory: &Path) -> PathBuf {

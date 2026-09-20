@@ -21,12 +21,16 @@ service Work {
   // answers with the complete signed result and the transcript it was
   // derived from, or with one refusal code.
   //
-  // Unary and buffered, which is this profile's rule rather than a
-  // simplification: no plaintext token leaves the provider before the
-  // terminal result is durable and the job's price is reserved as
-  // delivery credit, so there is nothing to stream. A replay of the
-  // same call returns the same bytes and costs the same one debit.
+  // This unary form waits for the durable terminal result. The job's
+  // price is reserved as delivery credit before release; replay returns
+  // the same bytes without a second debit. StreamResult offers signed
+  // token prefixes under the same authorization and delivery credit.
   rpc DeliverResult(DeliverResultRequest) returns (DeliverResultResponse);
+
+  // Authenticated live output. Delivery credit is durably reserved before
+  // the first signed prefix leaves. Payment still requires the complete
+  // durable terminal result; a disconnect does not cancel accepted work.
+  rpc StreamResult(DeliverResultRequest) returns (stream WorkStreamEvent);
 
   // One payment. The client sends the certificate it has already signed
   // and the private binding saying which job's result it pays for; the
@@ -240,4 +244,12 @@ enum WorkRefusalCode {
   // The provider could not make the state durable. Retryable, and
   // nothing was released.
   WORK_REFUSAL_CODE_UNAVAILABLE = 6;
+}
+
+message WorkStreamEvent {
+  oneof outcome {
+    bytes prefix = 1; // canonical transcript containing signed output events
+    WorkDelivered delivered = 2;
+    WorkRefused refused = 3;
+  }
 }

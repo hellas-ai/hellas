@@ -1086,13 +1086,23 @@ where
     let Some(latest) = fresh_tip(source).await? else {
         return Ok(store.state().cursor().0);
     };
-    let mut next = store.state().cursor().0.saturating_add(1);
-    while next <= latest {
-        let block = one_block_fetch(source, next)
-            .await?
-            .ok_or(CatchUpError::Missing { height: next })?;
+    use futures::{StreamExt as _, stream};
+
+    let next = store.state().cursor().0.saturating_add(1);
+    // Fetch ahead without changing the journal's ordered, one-block commits.
+    // An idle gateway may have thousands of finalized blocks to read before
+    // its next request; serial network round trips can exceed that request.
+    let pending = stream::iter(next..=latest)
+        .map(|height| async move {
+            one_block_fetch(source, height)
+                .await?
+                .ok_or(CatchUpError::Missing { height })
+        })
+        .buffered(16);
+    futures::pin_mut!(pending);
+    while let Some(block) = pending.next().await {
+        let block = block?;
         observe(store, &block, verifier)?;
-        next = next.saturating_add(1);
     }
     Ok(store.state().cursor().0)
 }
