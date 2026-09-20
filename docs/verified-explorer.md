@@ -26,6 +26,11 @@ Transaction IDs are SHA-256 hashes of the canonical chain transaction encoding.
 `observed_at_ms` is advisory: a valid proof does not establish that it is the
 newest available answer.
 
+`VerifiedStore` backends retain immutable canonical evidence and a monotonic head
+cursor. Historical cache fills cannot move that cursor backward, and eviction
+cannot erase it. Reverify stored evidence against independently provisioned trust
+before rendering; the shared storage interface permits native and Worker backends.
+
 Address summaries and holdings pages use `AddressProofBundle`. Its bounded page
 is a JSON-encoded `OwnerPageProof` linked to the owner root in the certified
 block. `verify_address` checks the certificate and proof before exposing a
@@ -40,9 +45,9 @@ native-follower storage; old block encodings cannot be replayed with it.
 
 Owner paths prove membership or absence. Holdings paths include authenticated
 subtree counts, so a page cannot omit, reorder, duplicate, or substitute a
-holding. Limits are 1 through 64. The origin rebuilds owner snapshots from
-verified retained history and publishes a snapshot only after its root matches
-the certified block.
+holding. Limits are 1 through 64. The origin reads owner nodes from the durable
+QMDB checkpoint shared with finalized EdgeIndex replay. It publishes a checkpoint
+only after deterministic replay matches the certified state and owner roots.
 
 ## Run the native origin
 
@@ -76,11 +81,16 @@ to protobuf and return JSON for `Accept: application/json`; both
 default to JSON. Unknown representations receive 406. EdgeIndex commits transaction
 locators durably alongside finalized replay; unavailable or not-yet-indexed
 locators return 503. Add `?height=N` to resolve a transaction without its locator.
+Block and transaction evidence is reverified before serving. Owner checkpoints
+are certified on admission and reverified on disk recovery; address pages are
+verified against that immutable checkpoint without repeating its signature check.
 
 `/api/v1/addresses/{base58-owner}/proof?offset=0&limit=64` returns an address
-bundle. `payload=...` pins a snapshot for pagination. The origin retains the
-latest 32 snapshots by finalized height, rejects conflicting payload/height
-bindings, and rebuilds that window from the durable finalized archive on restart.
+bundle. `payload=...` pins the current durable owner checkpoint. The origin serves
+only that checkpoint, so a new finalized block makes an older pin unavailable,
+including between pagination requests. EdgeIndex's retained discovery snapshots
+do not extend owner-proof retention. The Worker may cache older verified pages,
+but cannot generate uncached pages for an old native checkpoint.
 
 An unavailable pin returns HTTP 409 with `Cache-Control: no-store`, `Vary: Accept`,
 and a typed JSON/protobuf error containing `schema_version`, `network_id`,
@@ -89,3 +99,10 @@ explicitly to restart pagination from latest holdings; the origin never silently
 substitutes another snapshot. For protobuf responses, HTTP 409 carries
 `OwnerSnapshotError`, while HTTP 200 carries `AddressProofBundle`. An unpinned
 request returns 503 when no verified owner snapshot is available yet.
+
+On restart, the origin recovers the QMDB/index publication intent and verifies
+the certificate, canonical block, state root, sync-target root/range, and durable
+owner root before listening. It serves holdings from disk and resumes replay at
+the next height; restoring owner proofs needs no archive rebuild. A replay mutex
+and one QMDB read guard bind each page to one committed checkpoint. Block history
+still uses the separate durable Commonware archive.

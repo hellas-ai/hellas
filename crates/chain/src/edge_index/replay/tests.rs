@@ -207,10 +207,17 @@ impl Harness {
             epoch: 0,
         }
     }
+    async fn apply(&mut self, block: &HellasBlock, proof: ProofBundle) -> Result<()> {
+        let verified = self.verifier.verify(
+            proof,
+            ExplorerQuery::Block(FinalizedBlockQuery::Height(block.height().get())),
+        )?;
+        self.replay.apply(block, verified).await
+    }
     pub(crate) async fn append(&mut self, txs: Vec<Transaction>) -> ProofBundle {
         let (block, proof, merkleized) = self.candidate(txs).await;
         self.producer.finalize(merkleized).await;
-        self.replay.apply(&block, proof.clone()).await.unwrap();
+        self.apply(&block, proof.clone()).await.unwrap();
         self.head = block;
         proof
     }
@@ -406,7 +413,29 @@ fn native_edge_index_real_chain_pins_root_checks_and_restart() {
         let mut bad = root_bad.clone();
         bad.state_root = "00".repeat(32);
         let block = HellasBlock::decode(root_bad.canonical_block.as_slice()).unwrap();
-        assert!(h.replay.apply(&block, bad).await.is_err());
+        assert!(h.apply(&block, bad).await.is_err());
+        // Typed evidence is valid but must certify the block replay will execute.
+        let other = h
+            .verifier
+            .verify(
+                opened.clone(),
+                ExplorerQuery::Block(FinalizedBlockQuery::Height(1)),
+            )
+            .unwrap();
+        assert!(h.replay.apply(&block, other).await.is_err());
+        // A typed block from another valid verifier is not this origin's trust anchor.
+        let mut other_trust = h.trust.clone();
+        other_trust.epochs[0].end_height = Some(100);
+        let other_verifier = ExplorerVerifier::with_genesis(other_trust, &h.genesis_json).unwrap();
+        let mut other_proof = root_bad.clone();
+        other_proof.trust_sha256 = other_verifier.trust_sha256().into();
+        let other = other_verifier
+            .verify(
+                other_proof,
+                ExplorerQuery::Block(FinalizedBlockQuery::Height(2)),
+            )
+            .unwrap();
+        assert!(h.replay.apply(&block, other).await.is_err());
         assert_eq!(h.list(64).envelope.snapshot.height, 1);
         // Even a valid threshold certificate cannot bypass deterministic state replay.
         let mut target = block.sync_target();
@@ -428,7 +457,7 @@ fn native_edge_index_real_chain_pins_root_checks_and_restart() {
                 ExplorerQuery::Block(FinalizedBlockQuery::Height(2)),
             )
             .unwrap();
-        assert!(h.replay.apply(&invalid, certificate).await.is_err());
+        assert!(h.apply(&invalid, certificate).await.is_err());
         let conflicting_parent = HellasBlock::new(
             block.context(),
             Digest::from([92; 32]),
@@ -440,8 +469,7 @@ fn native_edge_index_real_chain_pins_root_checks_and_restart() {
         )
         .with_owner_root(block.owner_root());
         assert!(
-            h.replay
-                .apply(&conflicting_parent, h.certify(&conflicting_parent))
+            h.apply(&conflicting_parent, h.certify(&conflicting_parent))
                 .await
                 .is_err()
         );
@@ -455,10 +483,10 @@ fn native_edge_index_real_chain_pins_root_checks_and_restart() {
             block.txs().to_vec(),
         )
         .with_owner_root(block.owner_root());
-        assert!(h.replay.apply(&gap, h.certify(&gap)).await.is_err());
+        assert!(h.apply(&gap, h.certify(&gap)).await.is_err());
         let mut conflict = opened.clone();
         conflict.payload = "fe".repeat(32);
-        assert!(h.replay.apply(&h.head, conflict).await.is_err());
+        assert!(h.apply(&h.head.clone(), conflict).await.is_err());
         assert_eq!(h.list(64).envelope.snapshot.height, 1);
 
         let closed = h
@@ -509,7 +537,7 @@ fn native_edge_index_real_chain_pins_root_checks_and_restart() {
             .unwrap();
         assert!(events.data.next_cursor.is_some());
         h.export("events", &events);
-        h.replay.apply(&h.head, closed).await.unwrap();
+        h.apply(&h.head.clone(), closed).await.unwrap();
         assert_eq!(h.list(64).data.items.len(), 2);
         let in_flight = h.index.store.read(Some(&opened.payload)).unwrap();
         for _ in 0..32 {
@@ -543,7 +571,7 @@ fn native_edge_index_real_chain_pins_root_checks_and_restart() {
         let owner = SettlementKey::from(maker.party_key());
         let committed_owner = h
             .replay
-            .owner_proof(&h.verifier, owner, 0, 64, None)
+            .owner_proof(owner, 0, 64, None)
             .await
             .unwrap()
             .unwrap();
@@ -568,17 +596,20 @@ fn native_edge_index_real_chain_pins_root_checks_and_restart() {
         assert!(h.index.store.intent().unwrap().is_none());
         assert_eq!(recovered.next_height().unwrap(), previous_height + 1);
         let owner_before_finalize = recovered
-            .owner_proof(&h.verifier, owner, 0, 64, None)
+            .owner_proof(owner, 0, 64, None)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(owner_before_finalize.page, committed_owner.page);
         assert_eq!(
-            owner_before_finalize.block.as_ref().unwrap().height,
+            owner_before_finalize.bundle().page,
+            committed_owner.bundle().page
+        );
+        assert_eq!(
+            owner_before_finalize.block().bundle().height,
             previous_height
         );
         h.verifier
-            .verify_address(owner_before_finalize, owner, 0, 64)
+            .verify_address(owner_before_finalize.bundle().clone(), owner, 0, 64)
             .unwrap();
         // Crash after QMDB finalize but before the index transaction: recover the exact
         // certified intent and expose its rows/cursor together, once.
@@ -619,17 +650,17 @@ fn native_edge_index_real_chain_pins_root_checks_and_restart() {
             proof.payload
         );
         let owner_after_finalize = recovered
-            .owner_proof(&h.verifier, owner, 0, 64, None)
+            .owner_proof(owner, 0, 64, None)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(owner_after_finalize.page, committed_owner.page);
         assert_eq!(
-            owner_after_finalize.block.as_ref().unwrap().payload,
-            proof.payload
+            owner_after_finalize.bundle().page,
+            committed_owner.bundle().page
         );
+        assert_eq!(owner_after_finalize.block().bundle().payload, proof.payload);
         h.verifier
-            .verify_address(owner_after_finalize, owner, 0, 64)
+            .verify_address(owner_after_finalize.bundle().clone(), owner, 0, 64)
             .unwrap();
     });
 }
@@ -986,27 +1017,30 @@ fn native_edge_index_cold_open_serves_current_owners_without_archive_replay() {
         assert_eq!(listing.data.items[0].edge_id, hex::encode(id.as_bytes()));
         for (address, balance, count) in [(owner, 0, 1), (untouched, 1000, 1), (absent, 0, 0)] {
             let bundle = recovered
-                .owner_proof(&h.verifier, address, 0, 64, None)
+                .owner_proof(address, 0, 64, None)
                 .await
                 .unwrap()
                 .unwrap();
-            let verified = h.verifier.verify_address(bundle, address, 0, 64).unwrap();
+            let verified = h
+                .verifier
+                .verify_address(bundle.bundle().clone(), address, 0, 64)
+                .unwrap();
             assert_eq!(verified.block().bundle().payload, latest.payload);
             assert_eq!(verified.summary().balance, balance);
             assert_eq!(verified.summary().count, count);
         }
         assert!(
             recovered
-                .owner_proof(&h.verifier, owner, 0, 64, Some(&first.payload))
+                .owner_proof(owner, 0, 64, Some(&first.payload))
                 .await
                 .unwrap()
                 .is_none()
         );
         let pinned = recovered
-            .owner_proof(&h.verifier, owner, 0, 64, Some(&latest.payload))
+            .owner_proof(owner, 0, 64, Some(&latest.payload))
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(pinned.block.unwrap().payload, latest.payload);
+        assert_eq!(pinned.block().bundle().payload, latest.payload);
     });
 }

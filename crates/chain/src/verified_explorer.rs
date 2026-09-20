@@ -233,6 +233,7 @@ fn parse_digest(value: &str) -> Result<Digest, VerificationError> {
 }
 
 /// Cannot be constructed without certificate, canonical-block, epoch, and route verification.
+#[derive(Clone)]
 pub struct VerifiedBlock {
     bundle: ProofBundle,
     view: FinalizedBlockView,
@@ -729,10 +730,32 @@ impl ExplorerVerifier {
             bundle.block.clone().ok_or(VerificationError::Query)?,
             ExplorerQuery::Block(FinalizedBlockQuery::Latest),
         )?;
+        block.verify_owner_page(bundle.page, owner, offset, limit)
+    }
+}
+
+impl VerifiedBlock {
+    /// Assemble and verify a local owner page against an already certified block.
+    /// The typed block keeps certificate admission separate from page generation.
+    pub(crate) fn verify_owner_page(
+        self,
+        page: Vec<u8>,
+        owner: crate::domain::SettlementKey,
+        offset: u64,
+        limit: u32,
+    ) -> Result<VerifiedAddress, VerificationError> {
+        if page.len() > MAX_PROOF_BYTES {
+            return Err(VerificationError::Identity);
+        }
+        let bundle = AddressProofBundle {
+            schema_version: PROOF_SCHEMA_VERSION,
+            block: Some(self.bundle.clone()),
+            page,
+        };
         let page: crate::owner_proof::OwnerPageProof =
             serde_json::from_slice(&bundle.page).map_err(|_| VerificationError::Query)?;
         let summary = crate::owner_proof::verify_owner_page(
-            block.view().owner_root(),
+            self.view().owner_root(),
             owner,
             offset,
             limit,
@@ -740,7 +763,7 @@ impl ExplorerVerifier {
         )
         .map_err(|_| VerificationError::Query)?;
         Ok(VerifiedAddress {
-            block,
+            block: self,
             page,
             summary,
             bundle,
