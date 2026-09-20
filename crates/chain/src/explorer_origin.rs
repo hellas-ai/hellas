@@ -17,6 +17,7 @@ use axum::{
 };
 use commonware_codec::DecodeExt as _;
 use commonware_runtime::{Runner as _, Supervisor as _, tokio};
+use commonware_utils::ordered::Set;
 use hellas_genesis::{Genesis, HELLAS_DEVNET_1_JSON, TrustDocument};
 use serde::Deserialize;
 use std::{
@@ -38,6 +39,26 @@ pub struct OriginOptions {
     pub partition_prefix: String,
     pub listen: SocketAddr,
     pub status: FollowerStatusSink,
+}
+
+pub(crate) fn genesis_leader(genesis: &Genesis) -> OriginResult<PublicKey> {
+    // Validators choose the first member of the canonical participant Set,
+    // independently of how the authenticated genesis JSON orders its entries.
+    let keys = genesis
+        .validators
+        .iter()
+        .map(|validator| {
+            Ok(PublicKey::decode(
+                hex::decode(&validator.public_key)?.as_slice(),
+            )?)
+        })
+        .collect::<OriginResult<Vec<_>>>()?;
+    let participants = Set::try_from(keys).map_err(|_| "duplicate genesis validators")?;
+    participants
+        .iter()
+        .next()
+        .cloned()
+        .ok_or_else(|| "empty genesis committee".into())
 }
 
 pub fn run(options: OriginOptions) -> OriginResult<()> {
@@ -68,16 +89,7 @@ pub fn run(options: OriginOptions) -> OriginResult<()> {
                 .collect(),
             threshold_identity: hex::decode(&options.trust.epochs[0].threshold_identity)?,
         };
-        // Consensus uses the first participant in its ordered committee, not
-        // the first validator in the genesis document's deployment order.
-        let mut participants = Vec::with_capacity(info.validators.len());
-        for validator in &info.validators {
-            participants.push(PublicKey::decode(hex::decode(validator)?.as_slice())?);
-        }
-        let leader = participants
-            .into_iter()
-            .min()
-            .ok_or("genesis contains no validators")?;
+        let leader = genesis_leader(&genesis)?;
         let mut allocations = genesis
             .allocations
             .iter()
