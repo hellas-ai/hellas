@@ -73,13 +73,19 @@ peer.
 `/api/v1/transactions/{digest}/proof` return `ProofBundle`. Proof routes default
 to protobuf and return JSON for `Accept: application/json`; both
 `application/x-protobuf` and `application/protobuf` are accepted. Other aliases
-default to JSON. Unknown representations receive 406. Transaction locators
-rebuild from the verified archive on restart; unavailable or not-yet-indexed
-locators return 503. Add `?height=N` to resolve a transaction without waiting
-for its locator.
+default to JSON. Unknown representations receive 406. EdgeIndex commits transaction
+locators durably alongside finalized replay; unavailable or not-yet-indexed
+locators return 503. Add `?height=N` to resolve a transaction without its locator.
 
 `/api/v1/addresses/{base58-owner}/proof?offset=0&limit=64` returns an address
-bundle. `payload=...` pins a snapshot for pagination and returns 503 once that
-snapshot falls outside the origin's 32-snapshot window. Snapshots are indexed by
-payload and height, reject conflicting bindings, and are rebuilt from the
-durable finalized archive after a restart.
+bundle. `payload=...` pins a snapshot for pagination. The origin retains the
+latest 32 snapshots by finalized height, rejects conflicting payload/height
+bindings, and rebuilds that window from the durable finalized archive on restart.
+
+An unavailable pin returns HTTP 409 with `Cache-Control: no-store`, `Vary: Accept`,
+and a typed JSON/protobuf error containing `schema_version`, `network_id`,
+`code: "snapshot_unavailable"`, `message`, and `latest_url`. Follow that URL
+explicitly to restart pagination from latest holdings; the origin never silently
+substitutes another snapshot. For protobuf responses, HTTP 409 carries
+`OwnerSnapshotError`, while HTTP 200 carries `AddressProofBundle`. An unpinned
+request returns 503 when no verified owner snapshot is available yet.
