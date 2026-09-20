@@ -11,7 +11,6 @@ use hellas_rpc::protocol::artifacts::{
     TextPolicy, TokenIds,
 };
 use serde::Deserialize;
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
@@ -46,9 +45,8 @@ const fn timeout_secs() -> u64 {
 }
 
 // An OpenCode conversation has a substantial shared chat prefix. Smaller
-// requests are not worth pinning, and otherwise evict useful conversations.
+// checkpoints are not worth routing work around.
 const MIN_CACHE_AFFINITY_TOKENS: usize = 128;
-const PROVIDER_PREFIX_HISTORY: usize = 8;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -69,32 +67,65 @@ struct Provider {
     /// A setup/channel journal has a single owner even with concurrent HTTP calls.
     serial: AsyncMutex<Option<OpenPaidChannel>>,
     pending: AtomicUsize,
-    prefixes: Mutex<PrefixHistory>,
+    cache: Mutex<PrefixCache>,
 }
 
 #[derive(Default)]
-struct PrefixHistory(VecDeque<Vec<u32>>);
+struct PrefixCache(Option<Vec<u32>>);
 
-impl PrefixHistory {
-    fn shared_prefix_len(&self, input: &[u32]) -> usize {
+impl PrefixCache {
+    fn affinity(&self, input: &[u32]) -> usize {
         self.0
-            .iter()
-            .map(|previous| shared_prefix_len(previous, input))
-            .max()
+            .as_deref()
+            .map(|checkpoint| shared_prefix_len(checkpoint, input))
+            .filter(|shared| *shared >= MIN_CACHE_AFFINITY_TOKENS)
             .unwrap_or_default()
     }
 
-    fn remember(&mut self, input: Vec<u32>) {
-        if input.len() < MIN_CACHE_AFFINITY_TOKENS {
-            return;
+    fn replace(&mut self, checkpoint: Option<Vec<u32>>) {
+        self.0 = checkpoint;
+    }
+}
+
+enum CacheUpdate {
+    Preserve,
+    Replace(Vec<u32>),
+    Clear,
+}
+
+impl CacheUpdate {
+    fn from_request(environment: &hellas_rpc::CausalLmEnvironment, input: &[u32]) -> Self {
+        let Some(schedule) = environment.generation_schedule() else {
+            return Self::Clear;
+        };
+        let chunk = schedule.prefill_chunk_tokens as usize;
+        if input.len() <= chunk {
+            // A one-chunk request is normally a title or tool bookkeeping.
+            // The deployed Catena runtime leaves a compatible checkpoint intact.
+            return Self::Preserve;
         }
-        if let Some(index) = self.0.iter().position(|previous| previous == &input) {
-            self.0.remove(index);
+
+        // A provider owns one checkpoint. Keep a prefix valid for the deployed
+        // runtime and for the newer runtime that leaves two mutable chat suffix
+        // chunks; every older routing hint is thereby discarded.
+        let checkpoint = input
+            .len()
+            .saturating_sub(1)
+            .checked_div(chunk)
+            .unwrap_or_default()
+            .saturating_sub(1)
+            .saturating_mul(chunk);
+        (checkpoint >= MIN_CACHE_AFFINITY_TOKENS)
+            .then(|| Self::Replace(input[..checkpoint].to_vec()))
+            .unwrap_or(Self::Clear)
+    }
+
+    fn apply(self, cache: &mut PrefixCache) {
+        match self {
+            Self::Preserve => {}
+            Self::Replace(checkpoint) => cache.replace(Some(checkpoint)),
+            Self::Clear => cache.replace(None),
         }
-        if self.0.len() == PROVIDER_PREFIX_HISTORY {
-            self.0.pop_front();
-        }
-        self.0.push_back(input);
     }
 }
 
@@ -105,16 +136,16 @@ fn shared_prefix_len(left: &[u32], right: &[u32]) -> usize {
         .count()
 }
 
-fn route_score(
-    prefixes: &PrefixHistory,
+#[derive(Clone, Copy)]
+struct Route {
+    cache_affinity_tokens: usize,
     pending: usize,
-    input: &[u32],
-) -> (usize, std::cmp::Reverse<usize>) {
-    let shared = prefixes.shared_prefix_len(input);
-    let affinity = (shared >= MIN_CACHE_AFFINITY_TOKENS)
-        .then_some(shared)
-        .unwrap_or_default();
-    (affinity, std::cmp::Reverse(pending))
+}
+
+impl Route {
+    fn score(self) -> (usize, std::cmp::Reverse<usize>) {
+        (self.cache_affinity_tokens, std::cmp::Reverse(self.pending))
+    }
 }
 
 struct ProviderUse(Arc<Provider>);
@@ -205,7 +236,7 @@ pub async fn load_gateway_backend(
             },
             serial: AsyncMutex::new(None),
             pending: AtomicUsize::new(0),
-            prefixes: Mutex::new(PrefixHistory::default()),
+            cache: Mutex::new(PrefixCache::default()),
         }));
     }
     let gateway = Arc::new(PaidGateway {
@@ -221,7 +252,7 @@ pub async fn load_gateway_backend(
     // Restart recovery uses the retained input and certificate, never a new job.
     // Empty journal roots do not fund a channel until an HTTP request arrives.
     for provider in &gateway.providers {
-        let _recovery = gateway.submit(provider.clone(), None);
+        let _recovery = gateway.submit(provider.clone(), None, None, None);
         let provider = provider.clone();
         gateway.followers.lock().expect("paid followers poisoned").push(tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(1));
@@ -243,11 +274,19 @@ impl PaidGateway {
         &self,
         provider: Arc<Provider>,
         prepared: Option<PreparedPaidInputV1>,
+        _route: Option<Route>,
+        cache_update: Option<CacheUpdate>,
     ) -> BoxStream<'static, CliResult<ExecutionEvent>> {
         let endpoint = self.endpoint.clone();
         let settlement_key = self.settlement_key.clone();
         let (sender, receiver) = mpsc::unbounded_channel();
-        let span = hellas_rpc::request_span!(target: "hellas_request", "paid.gateway", hellas.provider.id = %provider.args.provider, hellas.work.recovery = prepared.is_none());
+        let span = hellas_rpc::request_span!(
+            target: "hellas_request", "paid.gateway",
+            hellas.provider.id = %provider.args.provider,
+            hellas.work.recovery = prepared.is_none(),
+            hellas.route.cache_affinity_tokens = _route.map_or(0, |route| route.cache_affinity_tokens),
+            hellas.route.pending = _route.map_or(0, |route| route.pending),
+        );
         let occupied = prepared.as_ref().map(|_| ProviderUse(provider.clone()));
         let task = tokio::spawn(async move {
             let _occupied = occupied;
@@ -279,6 +318,14 @@ impl PaidGateway {
             .and_then(|result| result)
             .and_then(|output| output.map(output_events).transpose())
             .map(Option::unwrap_or_default);
+            if let Some(cache_update) = cache_update {
+                let mut cache = provider.cache.lock().expect("provider cache poisoned");
+                if result.is_ok() {
+                    cache_update.apply(&mut cache);
+                } else {
+                    cache.replace(None);
+                }
+            }
             if let Err(error) = &result {
                 tracing::error!(provider = %provider.args.provider, error = %format!("{error:#}"),
                     "paid gateway operation failed; durable journals retained for recovery");
@@ -310,6 +357,7 @@ impl PaidExecutionBackend for PaidGateway {
         request: PaidExecutionRequest,
     ) -> CliResult<BoxStream<'static, CliResult<ExecutionEvent>>> {
         let input_ids = request.input_ids.clone();
+        let cache_update = CacheUpdate::from_request(&request.environment, &input_ids);
         let prepared = prepare_request(request, &self.settlement_key)?;
         let eligible = self
             .providers
@@ -321,28 +369,21 @@ impl PaidExecutionBackend for PaidGateway {
             "no provider policy matches this environment, token limit, and stop token list"
         );
         let start = self.next.fetch_add(1, Ordering::Relaxed) % eligible.len();
-        let provider = (0..eligible.len())
-            .map(|offset| eligible[(start + offset) % eligible.len()])
-            .max_by_key(|provider| {
-                let prefixes = provider
-                    .prefixes
-                    .lock()
-                    .expect("provider prefixes poisoned");
-                route_score(
-                    &prefixes,
-                    provider.pending.load(Ordering::Relaxed),
-                    &input_ids,
-                )
+        let (provider, route) = (0..eligible.len())
+            .map(|offset| {
+                let provider = eligible[(start + offset) % eligible.len()];
+                let cache = provider.cache.lock().expect("provider cache poisoned");
+                let route = Route {
+                    cache_affinity_tokens: cache.affinity(&input_ids),
+                    pending: provider.pending.load(Ordering::Relaxed),
+                };
+                (provider, route)
             })
-            .expect("eligible provider exists")
-            .clone();
-        provider
-            .prefixes
-            .lock()
-            .expect("provider prefixes poisoned")
-            .remember(input_ids);
+            .max_by_key(|(_, route)| route.score())
+            .expect("eligible provider exists");
+        let provider = provider.clone();
         provider.pending.fetch_add(1, Ordering::Relaxed);
-        Ok(self.submit(provider, Some(prepared)))
+        Ok(self.submit(provider, Some(prepared), Some(route), Some(cache_update)))
     }
 
     fn drain(&self) -> BoxFuture<'_, ()> {
@@ -455,24 +496,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cache_affinity_precedes_an_idle_cold_provider() {
-        let input = vec![7; MIN_CACHE_AFFINITY_TOKENS];
-        let mut warm = PrefixHistory::default();
-        warm.remember(input.clone());
+    fn replacing_the_checkpoint_forgets_an_evicted_conversation() {
+        let first = vec![7; MIN_CACHE_AFFINITY_TOKENS];
+        let second = vec![9; MIN_CACHE_AFFINITY_TOKENS];
+        let mut cache = PrefixCache::default();
+        cache.replace(Some(first.clone()));
+        cache.replace(Some(second.clone()));
 
-        assert!(route_score(&warm, 1, &input) > route_score(&PrefixHistory::default(), 0, &input));
+        assert_eq!(cache.affinity(&first), 0);
+        assert_eq!(cache.affinity(&second), MIN_CACHE_AFFINITY_TOKENS);
     }
 
     #[test]
-    fn short_side_requests_do_not_displace_conversation_affinity() {
+    fn one_chunk_side_requests_preserve_a_checkpoint() {
         let conversation = vec![9; MIN_CACHE_AFFINITY_TOKENS];
-        let mut prefixes = PrefixHistory::default();
-        prefixes.remember(conversation.clone());
-        prefixes.remember(vec![4; MIN_CACHE_AFFINITY_TOKENS - 1]);
+        let mut cache = PrefixCache::default();
+        cache.replace(Some(conversation.clone()));
+        CacheUpdate::Preserve.apply(&mut cache);
 
-        assert_eq!(
-            prefixes.shared_prefix_len(&conversation),
-            conversation.len()
-        );
+        assert_eq!(cache.affinity(&conversation), conversation.len());
     }
 }
