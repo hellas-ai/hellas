@@ -46,7 +46,7 @@ impl Harness {
     ) -> Self {
         let network = hellas_kernel::NetworkId::new(HELLAS_DEVNET_1_ID).unwrap();
         let committee = consensus_fixture(7191);
-        let genesis = Genesis {
+        let mut genesis = Genesis {
             schema_version: 1,
             network_id: HELLAS_DEVNET_1_ID.into(),
             validators: committee
@@ -66,6 +66,11 @@ impl Harness {
                 })
                 .collect(),
         };
+        // JSON ordering is not the committee's canonical ordering. Keep this
+        // deliberately reversed so origin replay cannot rely on its first entry.
+        genesis
+            .validators
+            .sort_by(|a, b| b.public_key.cmp(&a.public_key));
         let genesis_json = serde_json::to_vec(&genesis).unwrap();
         let trust = TrustDocument {
             schema_version: 1,
@@ -87,7 +92,13 @@ impl Harness {
             8,
         )
         .await;
-        let head = HellasBlock::genesis(committee.leaders[0].clone(), root, target);
+        let leader = committee.leaders.iter().min().unwrap().clone();
+        let head = HellasBlock::genesis(leader, root, target.clone());
+        let origin_genesis = HellasBlock::genesis(
+            crate::explorer_origin::genesis_leader(&genesis).unwrap(),
+            root,
+            target,
+        );
         let directory = tempfile::tempdir().unwrap();
         let index = EdgeIndex::open(
             &directory.path().join("index.redb"),
@@ -102,7 +113,7 @@ impl Harness {
             index.clone(),
             network,
             allocations.clone(),
-            head.clone(),
+            origin_genesis,
             &verifier,
         )
         .await
@@ -283,6 +294,22 @@ impl Harness {
             std::fs::write(manifest_path, serde_json::to_vec_pretty(&entries).unwrap()).unwrap();
         }
     }
+}
+
+#[test]
+fn native_edge_index_unsorted_committee_genesis_matches_validator() {
+    run_qmdb(|runtime| async move {
+        let mut harness = Harness::new(runtime, Vec::new(), "unsorted-genesis").await;
+        let genesis: Genesis = serde_json::from_slice(&harness.genesis_json).unwrap();
+        assert!(genesis.validators.len() > 1);
+        assert_ne!(
+            genesis.validators[0].public_key,
+            hex::encode(harness.head.context().leader.encode()),
+        );
+        let proof = harness.append(Vec::new()).await;
+        assert_eq!(proof.height, 1);
+        assert_eq!(harness.list(2).envelope.snapshot.height, 1);
+    });
 }
 fn signer(secret: u8) -> Secp256k1Signer {
     Secp256k1Signer::from_secret_scalar([secret; 32]).unwrap()
