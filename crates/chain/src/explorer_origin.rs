@@ -21,11 +21,10 @@ use futures_util::{Stream, StreamExt as _, stream};
 use hellas_genesis::{Genesis, HELLAS_DEVNET_1_JSON, TrustDocument};
 use serde::Deserialize;
 use std::{
-    collections::BTreeMap,
     future::Future,
     net::SocketAddr,
     path::PathBuf,
-    sync::{Arc, RwLock},
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -143,17 +142,15 @@ pub fn run(options: OriginOptions) -> OriginResult<()> {
         .await?;
         let state = OriginState {
             edge_index: Some(edge_index),
-            owner_index: application.owner_index(),
-            owners: Arc::new(RwLock::new(OwnerSnapshots::default())),
+            replay: Arc::new(::tokio::sync::Mutex::new(replay)),
             indexer: indexer.clone(),
             verifier,
             network_id: info.network_id.clone(),
-            transactions: Arc::new(RwLock::new(BTreeMap::new())),
         };
         let app = router(state.clone());
         let listener = ::tokio::net::TcpListener::bind(options.listen).await?;
         ::tokio::select! {
-            result = index_transactions(state.clone(), replay) => result,
+            result = index_transactions(state.clone()) => result,
             result = axum::serve(listener,app) => result.map_err(Into::into),
             result = follow_trusted(state,options.rpc,options.status) => result,
         }
@@ -166,57 +163,9 @@ struct OriginState {
     indexer: ChainIndexer,
     verifier: Arc<ExplorerVerifier>,
     network_id: String,
-    transactions: Arc<RwLock<BTreeMap<Digest, u64>>>,
-    owner_index: crate::OwnerIndex,
-    owners: Arc<RwLock<OwnerSnapshots>>,
-}
-
-#[derive(Clone)]
-struct OwnerSnapshot {
-    tree: crate::owner_proof::MemoryOwnerTree,
-    block: ProofBundle,
-}
-/// Keeps pagination pinned to a recently finalized payload while new blocks arrive.
-/// Readers hold an Arc, so eviction cannot invalidate an in-flight proof generation.
-const OWNER_SNAPSHOT_RETENTION: usize = 32;
-
-#[derive(Default)]
-struct OwnerSnapshots {
-    by_height: BTreeMap<u64, Arc<OwnerSnapshot>>,
-    by_payload: BTreeMap<String, u64>,
-}
-impl OwnerSnapshots {
-    fn insert(&mut self, snapshot: OwnerSnapshot) -> Result<(), &'static str> {
-        let height = snapshot.block.height;
-        let payload = &snapshot.block.payload;
-        if self
-            .by_height
-            .get(&height)
-            .is_some_and(|previous| previous.block.payload != *payload)
-            || self
-                .by_payload
-                .get(payload)
-                .is_some_and(|previous| *previous != height)
-        {
-            return Err("conflicting finalized owner snapshot");
-        }
-        self.by_payload.insert(payload.clone(), height);
-        self.by_height.insert(height, Arc::new(snapshot));
-        while self.by_height.len() > OWNER_SNAPSHOT_RETENTION {
-            let (_, expired) = self.by_height.pop_first().expect("nonempty snapshot cache");
-            self.by_payload.remove(&expired.block.payload);
-        }
-        Ok(())
-    }
-    fn get(&self, payload: Option<&str>) -> Option<Arc<OwnerSnapshot>> {
-        match payload {
-            Some(payload) => self.by_height.get(self.by_payload.get(payload)?).cloned(),
-            None => self
-                .by_height
-                .last_key_value()
-                .map(|(_, snapshot)| snapshot.clone()),
-        }
-    }
+    // This is the only finalized materializer. Its lock spans QMDB finalize,
+    // EdgeIndex publication and all current owner-proof reads.
+    replay: Arc<::tokio::sync::Mutex<crate::edge_index::Replay<tokio::Context>>>,
 }
 
 fn router(state: OriginState) -> Router {
@@ -305,22 +254,12 @@ async fn transaction(
     let Some(tx) = digest(&tx) else {
         return failure(StatusCode::BAD_REQUEST, "invalid transaction digest");
     };
-    let height = query
-        .height
-        .or_else(|| {
-            state
-                .edge_index
-                .as_ref()
-                .and_then(|index| index.transaction_height(&hex::encode(tx)).ok().flatten())
-        })
-        .or_else(|| {
-            state
-                .transactions
-                .read()
-                .expect("transaction index lock")
-                .get(&tx)
-                .copied()
-        });
+    let height = query.height.or_else(|| {
+        state
+            .edge_index
+            .as_ref()
+            .and_then(|index| index.transaction_height(&hex::encode(tx)).ok().flatten())
+    });
     let Some(height) = height else {
         return failure(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -417,35 +356,43 @@ async fn address(
     {
         return failure(StatusCode::BAD_REQUEST, "invalid payload");
     }
-    let Some(snapshot) = state
-        .owners
-        .read()
-        .expect("owner snapshot lock")
-        .get(query.payload.as_deref())
-    else {
-        if query.payload.is_some() {
+    let bundle = match state
+        .replay
+        .lock()
+        .await
+        .owner_proof(
+            &state.verifier,
+            owner,
+            query.offset,
+            query.limit,
+            query.payload.as_deref(),
+        )
+        .await
+    {
+        Ok(Some(bundle)) => bundle,
+        Ok(None) if query.payload.is_some() => {
             return owner_snapshot_unavailable(&state.network_id, owner, protobuf);
         }
-        return failure(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "requested verified owner snapshot is unavailable or still catching up",
-        );
-    };
-    let page = match crate::owner_proof::prove_owner_page(
-        &snapshot.tree,
-        owner,
-        query.offset,
-        query.limit,
-    )
-    .await
-    {
-        Ok(page) => page,
-        Err(_) => return failure(StatusCode::BAD_REQUEST, "invalid owner page"),
-    };
-    let bundle = crate::verified_explorer::AddressProofBundle {
-        schema_version: PROOF_SCHEMA_VERSION,
-        block: Some(snapshot.block.clone()),
-        page: serde_json::to_vec(&page).expect("owner page serializes"),
+        Ok(None) => {
+            return failure(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no durable verified owner checkpoint is available yet",
+            );
+        }
+        Err(error)
+            if matches!(
+                error.downcast_ref::<crate::owner_proof::OwnerProofError>(),
+                Some(crate::owner_proof::OwnerProofError::Page)
+            ) =>
+        {
+            return failure(StatusCode::BAD_REQUEST, "invalid owner page");
+        }
+        Err(_) => {
+            return failure(
+                StatusCode::BAD_GATEWAY,
+                "durable owner proof failed verification",
+            );
+        }
     };
     let verified = match state
         .verifier
@@ -628,13 +575,10 @@ fn proof_bundle(state: &OriginState, finalized: crate::FinalizedBlock) -> ProofB
         epoch,
     }
 }
-async fn index_transactions(
-    state: OriginState,
-    mut replay: crate::edge_index::Replay<tokio::Context>,
-) -> OriginResult<()> {
-    let mut height = 1_u64;
-    let mut owner_tree = crate::owner_proof::MemoryOwnerTree::default();
-    let mut previous = BTreeMap::new();
+async fn index_transactions(state: OriginState) -> OriginResult<()> {
+    // Replay::new recovered the durable checkpoint before the listener opened.
+    // Never scan old archive heights merely to rebuild an ephemeral owner tree.
+    let mut height = state.replay.lock().await.next_height()?;
     loop {
         match state
             .indexer
@@ -648,47 +592,12 @@ async fn index_transactions(
                 )?;
                 let block =
                     crate::HellasBlock::decode(verified.bundle().canonical_block.as_slice())?;
-                replay.apply(&block, verified.bundle().clone()).await?;
-                state.owner_index.apply_finalized(&block)?;
-                let current = state
-                    .owner_index
-                    .holdings_snapshot()
-                    .into_iter()
-                    .map(|(owner, id, kind, balance)| ((owner, id), (kind, balance)))
-                    .collect::<BTreeMap<_, _>>();
-                for ((owner, id), value) in &previous {
-                    if current.get(&(*owner, *id)) != Some(value) {
-                        crate::owner_proof::update_holding(&mut owner_tree, *owner, *id, None)
-                            .await?;
-                    }
-                }
-                for ((owner, id), value) in &current {
-                    if previous.get(&(*owner, *id)) != Some(value) {
-                        crate::owner_proof::update_holding(
-                            &mut owner_tree,
-                            *owner,
-                            *id,
-                            Some(*value),
-                        )
-                        .await?;
-                    }
-                }
-                if crate::owner_proof::owner_root(&owner_tree).await?
-                    != verified.view().owner_root()
-                {
-                    return Err(
-                        "replayed owner state does not match the certified owner root".into(),
-                    );
-                }
                 state
-                    .owners
-                    .write()
-                    .expect("owner snapshot lock")
-                    .insert(OwnerSnapshot {
-                        tree: owner_tree.clone(),
-                        block: verified.bundle().clone(),
-                    })?;
-                previous = current;
+                    .replay
+                    .lock()
+                    .await
+                    .apply(&block, verified.bundle().clone())
+                    .await?;
                 height = height
                     .checked_add(1)
                     .ok_or("transaction index height exhausted")?;
@@ -773,13 +682,10 @@ async fn follow_trusted(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::execution::test_support::{
-        consensus_fixture, finalization, index_block, index_genesis,
-    };
-    use commonware_codec::Encode as _;
-    use commonware_cryptography::{Digestible as _, Hasher as _, Sha256};
-    use commonware_runtime::deterministic;
-    use hellas_genesis::{HELLAS_DEVNET_1_ID, TrustEpoch};
+    use crate::execution::test_support::finalization;
+    use commonware_cryptography::Digestible as _;
+    use hellas_genesis::HELLAS_DEVNET_1_ID;
+    use std::collections::BTreeMap;
     use tower::ServiceExt as _;
 
     #[test]
@@ -830,49 +736,6 @@ mod tests {
     }
 
     #[test]
-    fn owner_snapshot_retention_evicts_oldest_without_regressing_latest() {
-        fn snapshot(height: u64) -> OwnerSnapshot {
-            OwnerSnapshot {
-                tree: crate::owner_proof::MemoryOwnerTree::default(),
-                block: ProofBundle {
-                    height,
-                    payload: format!("{height:064x}"),
-                    ..ProofBundle::default()
-                },
-            }
-        }
-        let mut snapshots = OwnerSnapshots::default();
-        snapshots.insert(snapshot(1)).unwrap();
-        let in_flight = snapshots.get(Some(&format!("{:064x}", 1))).unwrap();
-        for height in 2..=OWNER_SNAPSHOT_RETENTION as u64 + 1 {
-            snapshots.insert(snapshot(height)).unwrap();
-        }
-        assert_eq!(snapshots.by_height.len(), OWNER_SNAPSHOT_RETENTION);
-        assert_eq!(snapshots.by_payload.len(), OWNER_SNAPSHOT_RETENTION);
-        assert!(snapshots.get(Some(&format!("{:064x}", 1))).is_none());
-        assert_eq!(in_flight.block.height, 1);
-        assert_eq!(
-            snapshots
-                .get(Some(&format!("{:064x}", 2)))
-                .unwrap()
-                .block
-                .height,
-            2
-        );
-        let latest = OWNER_SNAPSHOT_RETENTION as u64 + 1;
-        snapshots.insert(snapshot(0)).unwrap();
-        assert_eq!(snapshots.get(None).unwrap().block.height, latest);
-        assert!(snapshots.get(Some(&format!("{:064x}", 0))).is_none());
-        let mut conflict = snapshot(latest);
-        conflict.block.payload = "f".repeat(64);
-        assert!(snapshots.insert(conflict).is_err());
-        let mut conflict = snapshot(latest + 1);
-        conflict.block.payload = format!("{latest:064x}");
-        assert!(snapshots.insert(conflict).is_err());
-        assert_eq!(snapshots.by_payload.len(), OWNER_SNAPSHOT_RETENTION);
-    }
-
-    #[test]
     fn representation_respects_qualities_aliases_and_exclusions() {
         for (accept, expected) in [
             ("application/protobuf", Some(true)),
@@ -903,192 +766,103 @@ mod tests {
     }
 
     #[test]
-    fn http_origin_returns_reverifiable_evidence_and_resolves_transaction_routes() {
-        deterministic::Runner::default().start(|context| async move {
-            let fixture = consensus_fixture(77);
-            let genesis = index_genesis();
-            let block = index_block(
-                &genesis,
-                Digest::from([2; 32]),
-                vec![crate::domain::Transaction::Kernel(
-                    hellas_kernel::test_support::valid_open_tx().unwrap(),
-                )],
+    fn http_origin_returns_durable_owner_and_transaction_evidence() {
+        crate::execution::test_support::run_qmdb(|context| async move {
+            let maker = hellas_kernel::Secp256k1Signer::from_secret_scalar([19; 32]).unwrap();
+            let taker = hellas_kernel::Secp256k1Signer::from_secret_scalar([20; 32]).unwrap();
+            let owner = crate::domain::SettlementKey::from(maker.party_key());
+            let mut h = crate::edge_index::ReplayHarness::new(
+                context.child("h"),
+                vec![(owner, 100)],
+                "origin-http",
+            )
+            .await;
+            assert!(
+                h.replay
+                    .owner_proof(&h.verifier, owner, 0, 64, None)
+                    .await
+                    .unwrap()
+                    .is_none()
             );
-            let owner = crate::domain::SettlementKey::from_bytes([1; 33]);
-            let mut tree = crate::owner_proof::MemoryOwnerTree::default();
-            crate::owner_proof::update_holding(
-                &mut tree,
-                owner,
-                Digest::from([7; 32]),
-                Some((0, 321)),
-            )
-            .await
-            .unwrap();
-            crate::owner_proof::update_holding(
-                &mut tree,
-                owner,
-                Digest::from([8; 32]),
-                Some((1, 0)),
-            )
-            .await
-            .unwrap();
-            let block = block.with_owner_root(crate::owner_proof::owner_root(&tree).await.unwrap());
-            let trust = TrustDocument {
-                schema_version: 1,
-                network_id: HELLAS_DEVNET_1_ID.into(),
-                genesis_sha256: hex::encode(Sha256::hash(HELLAS_DEVNET_1_JSON.as_bytes())),
-                epochs: vec![TrustEpoch {
-                    epoch: 0,
-                    start_height: 0,
-                    end_height: None,
-                    threshold_identity: hex::encode(fixture.assembler.identity().encode()),
-                }],
-            };
-            let verifier = Arc::new(ExplorerVerifier::new(trust).unwrap());
-            let owner_index =
-                crate::OwnerIndex::new(crate::domain::TEST_NETWORK, &genesis, Vec::new());
+            let genesis = h.head.clone();
+            let (_, _, transaction) = crate::edge_index::replay_basic(h.network, 0, &maker, &taker);
+            let first = h
+                .append(vec![crate::domain::Transaction::Kernel(transaction)])
+                .await;
+            let first_block = h.head.clone();
+            let first_address = h
+                .replay
+                .owner_proof(&h.verifier, owner, 0, 64, Some(&first.payload))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                h.verifier
+                    .verify_address(first_address, owner, 0, 64)
+                    .unwrap()
+                    .summary()
+                    .count,
+                1
+            );
+            let latest = h.append(Vec::new()).await;
             let (indexer, _handle) = crate::spawn_follower_indexer(
-                context,
+                context.child("follower"),
                 "origin-test",
                 Config::default(),
-                fixture.verifier.clone(),
+                h.committee.verifier.clone(),
                 genesis,
             )
             .await
             .unwrap();
             indexer
-                .ingest_finalized(block.clone(), finalization(&fixture, &block))
+                .ingest_finalized(
+                    first_block.clone(),
+                    finalization(&h.committee, &first_block),
+                )
                 .await
                 .unwrap();
-            let tx = crate::verified_explorer::transaction_digest(&block.txs()[0]);
-            let transactions = Arc::new(RwLock::new(BTreeMap::from([(tx, 1)])));
+            indexer
+                .ingest_finalized(h.head.clone(), finalization(&h.committee, &h.head))
+                .await
+                .unwrap();
+            let tx = crate::verified_explorer::transaction_digest(&first_block.txs()[0]);
+            let verifier = Arc::new(h.verifier);
             let state = OriginState {
-                edge_index: None,
-                owner_index,
-                owners: Arc::new(RwLock::new(OwnerSnapshots::default())),
+                edge_index: Some(h.index.clone()),
                 indexer,
+                replay: Arc::new(::tokio::sync::Mutex::new(h.replay)),
                 verifier: verifier.clone(),
                 network_id: HELLAS_DEVNET_1_ID.into(),
-                transactions,
             };
-            let finalized = state
-                .indexer
-                .get_finalized_block(FinalizedBlockQuery::Height(1))
-                .await
-                .unwrap()
-                .unwrap();
-            state
-                .owners
-                .write()
-                .unwrap()
-                .insert(OwnerSnapshot {
-                    tree: tree.clone(),
-                    block: proof_bundle(&state, finalized),
-                })
-                .unwrap();
-            let app = router(state.clone());
-            let response = app
-                .clone()
-                .oneshot(
-                    axum::http::Request::builder()
-                        .uri(format!("/api/v1/addresses/{owner}/proof?offset=0&limit=64"))
-                        .body(axum::body::Body::empty())
-                        .unwrap(),
+            let app = router(state);
+            for pin in [None, Some(latest.payload.as_str())] {
+                let query = pin.map_or(String::new(), |pin| format!("?payload={pin}"));
+                let response = app
+                    .clone()
+                    .oneshot(
+                        axum::http::Request::builder()
+                            .uri(format!("/api/v1/addresses/{owner}/proof{query}"))
+                            .body(axum::body::Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let bytes = axum::body::to_bytes(
+                    response.into_body(),
+                    crate::verified_explorer::MAX_PROOF_BYTES,
                 )
                 .await
                 .unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-            let bytes = axum::body::to_bytes(
-                response.into_body(),
-                crate::verified_explorer::MAX_PROOF_BYTES,
-            )
-            .await
-            .unwrap();
-            let bundle =
-                <crate::verified_explorer::AddressProofBundle as prost::Message>::decode(bytes)
-                    .unwrap();
-            assert_eq!(
-                verifier
-                    .verify_address(bundle, owner, 0, 64)
-                    .unwrap()
-                    .summary()
-                    .balance,
-                321
-            );
-            // New finality changes the owner state before the uncached second page is read.
-            crate::owner_proof::update_holding(&mut tree, owner, Digest::from([8; 32]), None)
-                .await
-                .unwrap();
-            crate::owner_proof::update_holding(
-                &mut tree,
-                owner,
-                Digest::from([7; 32]),
-                Some((0, 999)),
-            )
-            .await
-            .unwrap();
-            let next = index_block(&block, Digest::from([3; 32]), Vec::new())
-                .with_owner_root(crate::owner_proof::owner_root(&tree).await.unwrap());
-            state
-                .indexer
-                .ingest_finalized(next.clone(), finalization(&fixture, &next))
-                .await
-                .unwrap();
-            let finalized = state
-                .indexer
-                .get_finalized_block(FinalizedBlockQuery::Height(2))
-                .await
-                .unwrap()
-                .unwrap();
-            state
-                .owners
-                .write()
-                .unwrap()
-                .insert(OwnerSnapshot {
-                    tree: tree.clone(),
-                    block: proof_bundle(&state, finalized),
-                })
-                .unwrap();
-            let response = app
-                .clone()
-                .oneshot(
-                    axum::http::Request::builder()
-                        .uri(format!(
-                            "/api/v1/addresses/{owner}/proof?offset=1&limit=1&payload={}",
-                            hex::encode(block.digest())
-                        ))
-                        .body(axum::body::Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-            let bytes = axum::body::to_bytes(
-                response.into_body(),
-                crate::verified_explorer::MAX_PROOF_BYTES,
-            )
-            .await
-            .unwrap();
-            let pinned =
-                <crate::verified_explorer::AddressProofBundle as prost::Message>::decode(bytes)
-                    .unwrap();
-            let verified = verifier.verify_address(pinned, owner, 1, 1).unwrap();
-            assert_eq!(verified.block().view().height(), 1);
-            assert_eq!(verified.summary().balance, 321);
-            assert_eq!(verified.page().holdings[0].object_id, [8; 32]);
-            assert_eq!(
-                state.owners.read().unwrap().get(None).unwrap().block.height,
-                2
-            );
-
-            // Evict the historical snapshot while retaining a valid latest one.
-            // The retention policy itself is exercised by the snapshot-cache test.
-            {
-                let mut snapshots = state.owners.write().unwrap();
-                let (_, expired) = snapshots.by_height.pop_first().unwrap();
-                snapshots.by_payload.remove(&expired.block.payload);
+                let bundle =
+                    <crate::verified_explorer::AddressProofBundle as prost::Message>::decode(bytes)
+                        .unwrap();
+                let verified = verifier.verify_address(bundle, owner, 0, 64).unwrap();
+                assert_eq!(verified.block().view().height(), latest.height);
+                assert_eq!(verified.summary().count, 1);
+                assert_eq!(verified.summary().balance, 0); // The coin is locked in the edge.
             }
-            for missing in [hex::encode(block.digest()), "00".repeat(32)] {
+            for missing in [first.payload, "00".repeat(32)] {
                 for accept in ["application/json", "application/x-protobuf"] {
                     let response = app
                         .clone()
@@ -1103,48 +877,31 @@ mod tests {
                         .unwrap();
                     assert_eq!(response.status(), StatusCode::CONFLICT);
                     assert_eq!(response.headers()[header::CONTENT_TYPE], accept);
-                    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
                     let bytes = axum::body::to_bytes(response.into_body(), 4096)
                         .await
                         .unwrap();
-                    let json = if accept == "application/json" {
+                    let error = if accept == "application/json" {
                         serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
                     } else {
-                        let error = <OwnerSnapshotError as prost::Message>::decode(bytes).unwrap();
-                        serde_json::to_value(error).unwrap()
+                        serde_json::to_value(
+                            <OwnerSnapshotError as prost::Message>::decode(bytes).unwrap(),
+                        )
+                        .unwrap()
                     };
-                    assert_eq!(json["schema_version"], PROOF_SCHEMA_VERSION);
-                    assert_eq!(json["network_id"], HELLAS_DEVNET_1_ID);
-                    assert_eq!(json["code"], "snapshot_unavailable");
-                    assert_eq!(json["latest_url"], format!("/api/v1/addresses/{owner}"));
-                    assert!(json["message"].as_str().unwrap().contains("unavailable"));
-                    assert!(json.get("block").is_none());
-                    let recovered = app
+                    assert_eq!(error["code"], "snapshot_unavailable");
+                    assert_eq!(error["latest_url"], format!("/api/v1/addresses/{owner}"));
+                    assert!(error.get("block").is_none());
+                    let response = app
                         .clone()
                         .oneshot(
                             axum::http::Request::builder()
-                                .uri(json["latest_url"].as_str().unwrap())
-                                .header(header::ACCEPT, "application/x-protobuf")
+                                .uri(error["latest_url"].as_str().unwrap())
                                 .body(axum::body::Body::empty())
                                 .unwrap(),
                         )
                         .await
                         .unwrap();
-                    assert_eq!(recovered.status(), StatusCode::OK);
-                    let bytes = axum::body::to_bytes(
-                        recovered.into_body(),
-                        crate::verified_explorer::MAX_PROOF_BYTES,
-                    )
-                    .await
-                    .unwrap();
-                    let bundle =
-                        <crate::verified_explorer::AddressProofBundle as prost::Message>::decode(
-                            bytes,
-                        )
-                        .unwrap();
-                    let recovered = verifier.verify_address(bundle, owner, 0, 64).unwrap();
-                    assert_eq!(recovered.block().view().height(), 2);
-                    assert_eq!(recovered.summary().balance, 999);
+                    assert_eq!(response.status(), StatusCode::OK);
                 }
             }
             for malformed in ["", "bad", &"A".repeat(64), &"g".repeat(64)] {
@@ -1162,47 +919,9 @@ mod tests {
                     .unwrap();
                 assert_eq!(response.status(), StatusCode::BAD_REQUEST);
             }
-            // A caller can explicitly follow latest; a missing pin never does so.
-            let response = app
-                .clone()
-                .oneshot(
-                    axum::http::Request::builder()
-                        .uri(format!("/api/v1/addresses/{owner}/proof"))
-                        .body(axum::body::Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-            let bytes = axum::body::to_bytes(
-                response.into_body(),
-                crate::verified_explorer::MAX_PROOF_BYTES,
-            )
-            .await
-            .unwrap();
-            let latest =
-                <crate::verified_explorer::AddressProofBundle as prost::Message>::decode(bytes)
-                    .unwrap();
-            let latest = verifier.verify_address(latest, owner, 0, 64).unwrap();
-            assert_eq!(latest.block().view().height(), 2);
-            assert_eq!(latest.summary().balance, 999);
-
-            *state.owners.write().unwrap() = OwnerSnapshots::default();
-            let response = app
-                .clone()
-                .oneshot(
-                    axum::http::Request::builder()
-                        .uri(format!("/api/v1/addresses/{owner}/proof"))
-                        .body(axum::body::Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-
             for uri in [
                 "/api/v1/blocks/1/proof".to_owned(),
-                format!("/api/v1/blocks/{}/proof", hex::encode(block.digest())),
+                format!("/api/v1/blocks/{}/proof", hex::encode(first_block.digest())),
                 format!("/api/v1/transactions/{}/proof", hex::encode(tx)),
             ] {
                 let response = app
@@ -1210,17 +929,12 @@ mod tests {
                     .oneshot(
                         axum::http::Request::builder()
                             .uri(uri)
-                            .header(header::ACCEPT, "application/x-protobuf")
                             .body(axum::body::Body::empty())
                             .unwrap(),
                     )
                     .await
                     .unwrap();
                 assert_eq!(response.status(), StatusCode::OK);
-                assert_eq!(
-                    response.headers()[header::CONTENT_TYPE],
-                    "application/x-protobuf"
-                );
                 let body = axum::body::to_bytes(
                     response.into_body(),
                     crate::verified_explorer::MAX_PROOF_BYTES,

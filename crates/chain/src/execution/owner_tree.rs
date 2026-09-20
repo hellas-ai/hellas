@@ -1,13 +1,76 @@
 //! Adapter from speculative QMDB batches to the shared authenticated owner tree.
-use super::{kernel::ExecutionError, store::UtxoDatabase};
+use super::{
+    kernel::ExecutionError,
+    store::{UtxoDatabase, UtxoDb},
+};
 use crate::{
     domain::{Object, ObjectId, SettlementKey},
-    owner_proof::{OWNER_NODE_BYTES, OwnerProofError, OwnerTreeStore, update_holding},
+    owner_proof::{
+        OWNER_NODE_BYTES, OwnerPageProof, OwnerProofError, OwnerTreeStore, update_holding,
+    },
 };
 use commonware_glue::stateful::db::DatabaseSet;
 use commonware_runtime::Spawner;
 use commonware_storage::Context as StorageContext;
 type Batch<E> = <UtxoDatabase<E> as DatabaseSet<E>>::Unmerkleized;
+
+/// Reads the owner metadata already committed alongside objects in QMDB.
+/// The caller must hold one database read guard for the entire proof/checkpoint
+/// operation so a concurrent finalize cannot mix nodes from different heights.
+struct StoredOwnerTree<'a, E: StorageContext + Spawner>(&'a UtxoDb<E>);
+
+impl<E: StorageContext + Spawner + Send + Sync + 'static> OwnerTreeStore
+    for StoredOwnerTree<'_, E>
+{
+    async fn get_node(
+        &self,
+        key: ObjectId,
+    ) -> Result<Option<[u8; OWNER_NODE_BYTES]>, OwnerProofError> {
+        match self
+            .0
+            .get(&key)
+            .await
+            .map_err(|error| OwnerProofError::Storage(format!("{error:?}")))?
+        {
+            None => Ok(None),
+            Some(Object::OwnerData(bytes)) => Ok(Some(bytes)),
+            Some(_) => Err(OwnerProofError::Invalid),
+        }
+    }
+
+    async fn put_node(
+        &mut self,
+        _: ObjectId,
+        _: Option<[u8; OWNER_NODE_BYTES]>,
+    ) -> Result<(), OwnerProofError> {
+        Err(OwnerProofError::Invalid)
+    }
+}
+
+/// Read the authenticated owner root from finalized QMDB state.
+/// Keep the same database read guard held across this call, checkpoint binding,
+/// and `prove_stored_owner_page`; separate guards can observe different heights.
+pub async fn stored_root<E>(database: &UtxoDb<E>) -> Result<[u8; 32], OwnerProofError>
+where
+    E: StorageContext + Spawner + Send + Sync + 'static,
+{
+    crate::owner_proof::owner_root(&StoredOwnerTree(database)).await
+}
+
+/// Prove holdings directly from finalized owner metadata without replaying it.
+/// The caller must hold one database read guard across the entire proof and its
+/// checkpoint/root checks, including any call to `stored_root`.
+pub async fn prove_stored_owner_page<E>(
+    database: &UtxoDb<E>,
+    owner: SettlementKey,
+    offset: u64,
+    limit: u32,
+) -> Result<OwnerPageProof, OwnerProofError>
+where
+    E: StorageContext + Spawner + Send + Sync + 'static,
+{
+    crate::owner_proof::prove_owner_page(&StoredOwnerTree(database), owner, offset, limit).await
+}
 
 struct BatchStore<E: StorageContext + Spawner> {
     batch: Option<Batch<E>>,
@@ -132,4 +195,59 @@ where
         }
     }
     crate::owner_proof::owner_root(&ReadBatch(batch)).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        domain::{Coin, Digest},
+        execution::{store::utxo_db_config, test_support::run_qmdb},
+        owner_proof::verify_owner_page,
+    };
+    use commonware_glue::stateful::db::Unmerkleized as _;
+
+    #[test]
+    fn stored_adapter_proves_committed_metadata_and_rejects_objects_and_writes() {
+        run_qmdb(|runtime| async move {
+            let config = utxo_db_config(&runtime, "stored-owner-adapter", 1024, 8);
+            let database = <UtxoDatabase<_> as DatabaseSet<_>>::init(runtime, config).await;
+            let owner = SettlementKey::from_bytes([1; 33]);
+            let id = Digest::from([7; 32]);
+            let batch = match write_owned(
+                database.new_batches().await,
+                id,
+                Some(Object::Coin(Coin { owner, value: 321 })),
+            )
+            .await
+            {
+                Ok(batch) => batch,
+                Err((_, error)) => panic!("write owner fixture: {error:?}"),
+            };
+            let expected_root = root(&batch).await.unwrap();
+            database.finalize(batch.merkleize().await.unwrap()).await;
+
+            let guard = database.read().await;
+            assert_eq!(stored_root(&guard).await.unwrap(), expected_root);
+            let page = prove_stored_owner_page(&guard, owner, 0, 64).await.unwrap();
+            let summary = verify_owner_page(expected_root, owner, 0, 64, &page).unwrap();
+            assert_eq!(summary.balance, 321);
+            assert_eq!(summary.count, 1);
+            assert_eq!(page.holdings[0].object_id, id.0);
+
+            let mut adapter = StoredOwnerTree(&*guard);
+            assert!(matches!(
+                adapter.get_node(id).await,
+                Err(OwnerProofError::Invalid)
+            ));
+            assert!(matches!(
+                adapter.put_node(id, None).await,
+                Err(OwnerProofError::Invalid)
+            ));
+            assert!(matches!(
+                guard.get(&id).await.unwrap(),
+                Some(Object::Coin(_))
+            ));
+        });
+    }
 }
