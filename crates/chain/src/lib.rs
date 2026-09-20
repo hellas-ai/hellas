@@ -1,6 +1,6 @@
 #[cfg(any(feature = "indexer", feature = "validator"))]
 mod app;
-#[cfg(feature = "block-view")]
+#[cfg(feature = "client-core")]
 pub mod block;
 #[cfg(feature = "block-view")]
 pub mod block_view;
@@ -18,6 +18,8 @@ mod execution;
 pub mod explorer_origin;
 #[cfg(feature = "validator")]
 pub mod faucet;
+#[cfg(feature = "client-core")]
+pub mod finality_proof;
 #[cfg(feature = "indexer")]
 pub mod follower;
 #[cfg(feature = "domain")]
@@ -61,7 +63,7 @@ pub use app::{ActivityReporter, Application, ApplicationConfig};
 /// follower build puts a transaction into one or takes one out.
 #[cfg(feature = "validator")]
 pub use app::{GENERAL_MEMPOOL_CAPACITY, Mempool};
-#[cfg(feature = "block-view")]
+#[cfg(feature = "client-core")]
 pub use block::{HellasBlock, UtxoSyncTarget};
 #[cfg(feature = "block-view")]
 pub use block_view::{BlockViewError, FinalizedBlockView};

@@ -1,7 +1,7 @@
 //! Loopback-only HTTP proof origin backed by the native Commonware follower archive.
 use crate::{
-    Application, ApplicationConfig, ChainIndexer, ConsensusInfo, ConsensusVerifier,
-    FinalizedBlockQuery, LightClient as _,
+    Application, ApplicationConfig, ChainIndexer, ConsensusInfo, FinalizedBlockQuery,
+    LightClient as _,
     config::Config,
     domain::{Digest, PublicKey},
     follower::{FollowerStatusSink, ingest_finalized_block},
@@ -467,10 +467,8 @@ fn failure(status: StatusCode, message: &str) -> Response {
 }
 
 fn proof_bundle(state: &OriginState, finalized: crate::FinalizedBlock) -> ProofBundle {
-    let epoch = ConsensusVerifier::decode_finalization(&finalized.snapshot.finalization)
-        .map_or(u64::MAX, |finalization| {
-            finalization.proposal.round.epoch().get()
-        });
+    let epoch = crate::finality_proof::FinalityProof::decode(&finalized.snapshot.finalization)
+        .map_or(u64::MAX, |proof| proof.certificate_epoch());
     ProofBundle {
         schema_version: PROOF_SCHEMA_VERSION,
         network_id: state.network_id.clone(),

@@ -45,7 +45,11 @@ client-core = [
     # `client.rs` samples what one validator's RPC cost; the sample's one
     # channel out is `tracing`.
     "dep:tracing",
-    "domain",
+    # Snapshot finality can require canonical descendant blocks. These are
+    # codec dependencies; no archive or consensus participant is started.
+    "domain-consensus",
+    "dep:commonware-storage",
+    "dep:commonware-utils",
 ]
 # The finalized-block codec and accepted-transaction view, without a
 # database, a mempool, or consensus participation. This is what an

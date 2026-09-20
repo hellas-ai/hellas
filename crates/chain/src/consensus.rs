@@ -79,8 +79,8 @@ mod full {
             &self,
             snapshot: &LatestBlock,
         ) -> Result<(), ConsensusVerificationError> {
-            let finalization = Self::decode_finalization(&snapshot.finalization)?;
-            self.verify_finalization(&finalization, snapshot.payload)
+            crate::finality_proof::FinalityProof::decode(&snapshot.finalization)?
+                .verify(self, snapshot)
         }
     }
 }
@@ -240,8 +240,8 @@ mod light {
             &self,
             snapshot: &LatestBlock,
         ) -> Result<(), ConsensusVerificationError> {
-            let finalization = Self::decode_finalization(&snapshot.finalization)?;
-            self.verify_finalization(&finalization, snapshot.payload)
+            crate::finality_proof::FinalityProof::decode(&snapshot.finalization)?
+                .verify(self, snapshot)
         }
     }
 
