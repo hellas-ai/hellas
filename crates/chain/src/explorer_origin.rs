@@ -17,10 +17,12 @@ use axum::{
 use commonware_codec::DecodeExt as _;
 use commonware_runtime::{Runner as _, Supervisor as _, tokio};
 use commonware_utils::ordered::Set;
+use futures_util::{Stream, StreamExt as _, stream};
 use hellas_genesis::{Genesis, HELLAS_DEVNET_1_JSON, TrustDocument};
 use serde::Deserialize;
 use std::{
     collections::BTreeMap,
+    future::Future,
     net::SocketAddr,
     path::PathBuf,
     sync::{Arc, RwLock},
@@ -651,6 +653,25 @@ async fn index_transactions(
     }
 }
 
+// Bound both outstanding requests and completed responses waiting for an
+// earlier height. Verification and archive ingestion remain serial below.
+const FINALIZED_FETCH_WINDOW: usize = 32;
+
+fn ordered_fetches<T, F, Fut>(first: u64, mut fetch: F) -> impl Stream<Item = (u64, T)>
+where
+    F: FnMut(u64) -> Fut,
+    Fut: Future<Output = T>,
+{
+    stream::iter(std::iter::successors(Some(first), |height| {
+        height.checked_add(1)
+    }))
+    .map(move |height| {
+        let pending = fetch(height);
+        async move { (height, pending.await) }
+    })
+    .buffered(FINALIZED_FETCH_WINDOW)
+}
+
 async fn follow_trusted(
     state: OriginState,
     endpoints: Vec<String>,
@@ -660,8 +681,8 @@ async fn follow_trusted(
     loop {
         let upstream = next_upstream;
         next_upstream = (next_upstream + 1) % endpoints.len();
-        // The remote client is only a transport/codec here. The authenticated height-key
-        // schedule below verifies every block before the native archive sees it.
+        // The remote client supplies transport/codec only. Independently
+        // provisioned trust verifies every block before archive ingestion.
         let client =
             match crate::client::RemoteLightClient::connect(endpoints[upstream].clone()).await {
                 Ok(client) => client,
@@ -671,40 +692,41 @@ async fn follow_trusted(
                     continue;
                 }
             };
-        loop {
-            let next = state
-                .indexer
-                .get_latest_block()
-                .await?
-                .map_or(1, |latest| latest.height.saturating_add(1));
-            let remote = match client
-                .get_finalized_block(FinalizedBlockQuery::Height(next))
-                .await
-            {
-                Ok(Some(finalized)) => finalized,
-                Ok(None) => {
-                    // A lagging validator must not pin the archive indefinitely.
-                    // The next connection resumes at the same committed height.
-                    ::tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let next = state
+            .indexer
+            .get_latest_block()
+            .await?
+            .map_or(1, |latest| latest.height.saturating_add(1));
+        {
+            let fetched = ordered_fetches(next, |height| {
+                client.get_finalized_block(FinalizedBlockQuery::Height(height))
+            });
+            futures_util::pin_mut!(fetched);
+            while let Some((height, result)) = fetched.next().await {
+                let remote = match result {
+                    Ok(Some(finalized)) => finalized,
+                    // Never skip a missing height or stay pinned to a lagging
+                    // validator. Drop the entire window and rotate upstream.
+                    Ok(None) => break,
+                    Err(error) => {
+                        tracing::warn!(upstream, height, %error,"explorer upstream disconnected");
+                        break;
+                    }
+                };
+                if let Err(error) = state.verifier.verify(
+                    proof_bundle(&state, remote.clone()),
+                    ExplorerQuery::Block(FinalizedBlockQuery::Height(height)),
+                ) {
+                    tracing::warn!(upstream, height, %error,"explorer upstream proof rejected");
                     break;
                 }
-                Err(error) => {
-                    tracing::warn!(upstream, height=next, %error,"explorer upstream disconnected");
-                    ::tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                    break;
-                }
-            };
-            if let Err(error) = state.verifier.verify(
-                proof_bundle(&state, remote.clone()),
-                ExplorerQuery::Block(FinalizedBlockQuery::Height(next)),
-            ) {
-                tracing::warn!(upstream, height=next, %error,"explorer upstream proof rejected");
-                ::tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                break;
+                ingest_finalized_block(&state.indexer, remote, height, &status).await?;
+                ::tokio::task::yield_now().await;
             }
-            ingest_finalized_block(&state.indexer, remote, next, &status).await?;
-            ::tokio::task::yield_now().await;
         }
+        // Pending responses are cancelled before reconnecting. The next
+        // upstream resumes at exactly the next contiguous committed height.
+        ::tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
 }
 
@@ -719,6 +741,53 @@ mod tests {
     use commonware_runtime::deterministic;
     use hellas_genesis::{HELLAS_DEVNET_1_ID, TrustEpoch};
     use tower::ServiceExt as _;
+
+    #[test]
+    fn fetch_window_is_bounded_and_orders_responses_before_missing_or_failed_heights() {
+        use ::tokio::sync::oneshot;
+        use futures_util::FutureExt as _;
+        use std::{cell::Cell, rc::Rc};
+
+        // Height three completes first, then a hole/error at two, then one.
+        // Neither the hole nor the later block may bypass the first response.
+        for stopped in [Ok(None), Err("upstream disconnected")] {
+            futures::executor::block_on(async {
+                let mut senders = BTreeMap::new();
+                let mut receivers = BTreeMap::new();
+                for height in 1..=FINALIZED_FETCH_WINDOW as u64 + 1 {
+                    let (send, receive) = oneshot::channel::<Result<Option<u64>, &str>>();
+                    senders.insert(height, send);
+                    receivers.insert(height, receive);
+                }
+                let started = Rc::new(Cell::new(0));
+                let count = started.clone();
+                let fetched = ordered_fetches(1, move |height| {
+                    count.set(count.get() + 1);
+                    let receive = receivers.remove(&height);
+                    async move {
+                        match receive {
+                            Some(receive) => receive.await.unwrap(),
+                            None => std::future::pending().await,
+                        }
+                    }
+                });
+                let mut fetched = Box::pin(fetched);
+                assert!(fetched.next().now_or_never().is_none());
+                assert_eq!(started.get(), FINALIZED_FETCH_WINDOW);
+                senders.remove(&3).unwrap().send(Ok(Some(3))).unwrap();
+                senders.remove(&2).unwrap().send(stopped).unwrap();
+                assert!(fetched.next().now_or_never().is_none());
+                assert_eq!(started.get(), FINALIZED_FETCH_WINDOW);
+                senders.remove(&1).unwrap().send(Ok(Some(1))).unwrap();
+                assert_eq!(fetched.next().await, Some((1, Ok(Some(1)))));
+                assert_eq!(fetched.next().await, Some((2, stopped)));
+                // The production consumer stops on this response and drops all
+                // later work, retrying from its last contiguous committed height.
+                drop(fetched);
+                assert!(senders.values().all(oneshot::Sender::is_closed));
+            });
+        }
+    }
 
     #[test]
     fn owner_snapshot_retention_evicts_oldest_without_regressing_latest() {
