@@ -387,7 +387,7 @@ fn owner_snapshot_unavailable(
         network_id: network_id.into(),
         code: "snapshot_unavailable".into(),
         message: "The requested verified owner snapshot is unavailable. Request latest holdings explicitly.".into(),
-        latest_url: Some(format!("/addresses/{owner}")),
+        latest_url: Some(format!("/api/v1/addresses/{owner}")),
     };
     let (content_type, bytes) = if protobuf {
         (
@@ -1137,9 +1137,35 @@ mod tests {
                     assert_eq!(json["schema_version"], PROOF_SCHEMA_VERSION);
                     assert_eq!(json["network_id"], HELLAS_DEVNET_1_ID);
                     assert_eq!(json["code"], "snapshot_unavailable");
-                    assert_eq!(json["latest_url"], format!("/addresses/{owner}"));
+                    assert_eq!(json["latest_url"], format!("/api/v1/addresses/{owner}"));
                     assert!(json["message"].as_str().unwrap().contains("unavailable"));
                     assert!(json.get("block").is_none());
+                    let recovered = app
+                        .clone()
+                        .oneshot(
+                            axum::http::Request::builder()
+                                .uri(json["latest_url"].as_str().unwrap())
+                                .header(header::ACCEPT, "application/x-protobuf")
+                                .body(axum::body::Body::empty())
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(recovered.status(), StatusCode::OK);
+                    let bytes = axum::body::to_bytes(
+                        recovered.into_body(),
+                        crate::verified_explorer::MAX_PROOF_BYTES,
+                    )
+                    .await
+                    .unwrap();
+                    let bundle =
+                        <crate::verified_explorer::AddressProofBundle as prost::Message>::decode(
+                            bytes,
+                        )
+                        .unwrap();
+                    let recovered = verifier.verify_address(bundle, owner, 0, 64).unwrap();
+                    assert_eq!(recovered.block().view().height(), 2);
+                    assert_eq!(recovered.summary().balance, 999);
                 }
             }
             for malformed in ["", "bad", &"A".repeat(64), &"g".repeat(64)] {
