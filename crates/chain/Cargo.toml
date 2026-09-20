@@ -60,7 +60,14 @@ block-view = [
     "dep:commonware-storage",
     "dep:commonware-utils",
 ]
-explorer-origin = ["verified-explorer", "indexer", "dep:axum"]
+explorer-origin = [
+    "verified-explorer",
+    "indexer",
+    "dep:axum",
+    "axum/ws",
+    "dep:redb",
+    "hellas-kernel/webauthn",
+]
 verified-explorer = ["block-view", "dep:serde", "dep:hex", "dep:prost"]
 indexer = [
     "block-view",
@@ -172,6 +179,7 @@ prost = { version = "0.14", default-features = false, features = [
 ], optional = true }
 rand = { workspace = true, optional = true }
 rand_core = { workspace = true, optional = true }
+redb = { version = "3", optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
