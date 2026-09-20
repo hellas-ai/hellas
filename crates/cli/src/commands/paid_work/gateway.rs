@@ -11,6 +11,7 @@ use hellas_rpc::protocol::artifacts::{
     TextPolicy, TokenIds,
 };
 use serde::Deserialize;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
@@ -44,6 +45,11 @@ const fn timeout_secs() -> u64 {
     300
 }
 
+// An OpenCode conversation has a substantial shared chat prefix. Smaller
+// requests are not worth pinning, and otherwise evict useful conversations.
+const MIN_CACHE_AFFINITY_TOKENS: usize = 128;
+const PROVIDER_PREFIX_HISTORY: usize = 8;
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProviderFile {
@@ -63,7 +69,52 @@ struct Provider {
     /// A setup/channel journal has a single owner even with concurrent HTTP calls.
     serial: AsyncMutex<Option<OpenPaidChannel>>,
     pending: AtomicUsize,
-    last_input: Mutex<Vec<u32>>,
+    prefixes: Mutex<PrefixHistory>,
+}
+
+#[derive(Default)]
+struct PrefixHistory(VecDeque<Vec<u32>>);
+
+impl PrefixHistory {
+    fn shared_prefix_len(&self, input: &[u32]) -> usize {
+        self.0
+            .iter()
+            .map(|previous| shared_prefix_len(previous, input))
+            .max()
+            .unwrap_or_default()
+    }
+
+    fn remember(&mut self, input: Vec<u32>) {
+        if input.len() < MIN_CACHE_AFFINITY_TOKENS {
+            return;
+        }
+        if let Some(index) = self.0.iter().position(|previous| previous == &input) {
+            self.0.remove(index);
+        }
+        if self.0.len() == PROVIDER_PREFIX_HISTORY {
+            self.0.pop_front();
+        }
+        self.0.push_back(input);
+    }
+}
+
+fn shared_prefix_len(left: &[u32], right: &[u32]) -> usize {
+    left.iter()
+        .zip(right)
+        .take_while(|(left, right)| left == right)
+        .count()
+}
+
+fn route_score(
+    prefixes: &PrefixHistory,
+    pending: usize,
+    input: &[u32],
+) -> (usize, std::cmp::Reverse<usize>) {
+    let shared = prefixes.shared_prefix_len(input);
+    let affinity = (shared >= MIN_CACHE_AFFINITY_TOKENS)
+        .then_some(shared)
+        .unwrap_or_default();
+    (affinity, std::cmp::Reverse(pending))
 }
 
 struct ProviderUse(Arc<Provider>);
@@ -154,7 +205,7 @@ pub async fn load_gateway_backend(
             },
             serial: AsyncMutex::new(None),
             pending: AtomicUsize::new(0),
-            last_input: Mutex::new(Vec::new()),
+            prefixes: Mutex::new(PrefixHistory::default()),
         }));
     }
     let gateway = Arc::new(PaidGateway {
@@ -273,20 +324,23 @@ impl PaidExecutionBackend for PaidGateway {
         let provider = (0..eligible.len())
             .map(|offset| eligible[(start + offset) % eligible.len()])
             .max_by_key(|provider| {
-                let previous = provider.last_input.lock().expect("provider input poisoned");
-                let shared = previous
-                    .iter()
-                    .zip(&input_ids)
-                    .take_while(|(left, right)| left == right)
-                    .count();
-                (
-                    std::cmp::Reverse(provider.pending.load(Ordering::Relaxed)),
-                    shared,
+                let prefixes = provider
+                    .prefixes
+                    .lock()
+                    .expect("provider prefixes poisoned");
+                route_score(
+                    &prefixes,
+                    provider.pending.load(Ordering::Relaxed),
+                    &input_ids,
                 )
             })
             .expect("eligible provider exists")
             .clone();
-        *provider.last_input.lock().expect("provider input poisoned") = input_ids;
+        provider
+            .prefixes
+            .lock()
+            .expect("provider prefixes poisoned")
+            .remember(input_ids);
         provider.pending.fetch_add(1, Ordering::Relaxed);
         Ok(self.submit(provider, Some(prepared)))
     }
@@ -394,4 +448,31 @@ fn output_events(output: PaidOutput) -> CliResult<Vec<ExecutionEvent>> {
         "paid inference result acknowledged",
     );
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_affinity_precedes_an_idle_cold_provider() {
+        let input = vec![7; MIN_CACHE_AFFINITY_TOKENS];
+        let mut warm = PrefixHistory::default();
+        warm.remember(input.clone());
+
+        assert!(route_score(&warm, 1, &input) > route_score(&PrefixHistory::default(), 0, &input));
+    }
+
+    #[test]
+    fn short_side_requests_do_not_displace_conversation_affinity() {
+        let conversation = vec![9; MIN_CACHE_AFFINITY_TOKENS];
+        let mut prefixes = PrefixHistory::default();
+        prefixes.remember(conversation.clone());
+        prefixes.remember(vec![4; MIN_CACHE_AFFINITY_TOKENS - 1]);
+
+        assert_eq!(
+            prefixes.shared_prefix_len(&conversation),
+            conversation.len()
+        );
+    }
 }
