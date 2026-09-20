@@ -70,7 +70,7 @@ let
     cargoLock = {
       lockFile = ../Cargo.lock;
       outputHashes = {
-        "catena-lang-0.1.0" = "sha256-NXu16282MSVMzg/0j0Ks8blMD2Fr4av++ylIGRHcxrQ=";
+        "catena-lang-0.1.0" = "sha256-NzPlFhyxivNYgChgFNMsDte/N8roD70LwEqFh1FLef0=";
         "commonware-actor-2026.7.0" = "sha256-SzlE5sQufUH2ukJ5Job5mEkIuF6m87hU9oLmeaEDFLE=";
       };
     };

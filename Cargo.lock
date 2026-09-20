@@ -592,7 +592,7 @@ dependencies = [
 [[package]]
 name = "catena-lang"
 version = "0.1.0"
-source = "git+ssh://git@github.com/georgewhewell/exploratory-catena.git?rev=ed5eca3148c3e31234fe2fe7620c9d0363903f38#ed5eca3148c3e31234fe2fe7620c9d0363903f38"
+source = "git+ssh://git@github.com/georgewhewell/exploratory-catena.git?rev=dbd750cf5b4c36fa99222612848651a2575faa31#dbd750cf5b4c36fa99222612848651a2575faa31"
 dependencies = [
  "anyhow",
  "clap",
