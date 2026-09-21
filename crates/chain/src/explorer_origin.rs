@@ -191,7 +191,9 @@ fn router(state: OriginState) -> Router {
         .route("/api/v1/addresses/{owner}", get(address))
         .with_state(state);
     #[cfg(feature = "otel")]
-    let router = router.layer(axum::middleware::from_fn(hellas_rpc::telemetry::http::trace_request));
+    let router = router.layer(axum::middleware::from_fn(
+        hellas_rpc::telemetry::http::trace_request,
+    ));
     router
 }
 
