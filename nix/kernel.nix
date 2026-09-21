@@ -194,11 +194,54 @@ let
     command = simulationCommand;
   };
 
-  modelVerify = mkModelApp {
+  modelVerifyLocal = mkModelApp {
     name = "hellas-kernel-model-verify";
     command = verificationCommand;
     needsJvm = true;
   };
+
+  # Quint reuses an Apalache server on localhost:8822 and terminates a server
+  # it started when it exits. Concurrent Linux CI jobs must therefore verify
+  # in separate Nix build sandboxes, each with its own loopback and processes.
+  # Track all Quint imports, but do not invalidate verification for docs/traces.
+  modelSource = lib.fileset.toSource {
+    root = ../crates/kernel;
+    fileset = lib.fileset.fileFilter (file: file.hasExt "qnt") ../crates/kernel/models;
+  };
+
+  modelVerifyResult =
+    pkgs.runCommand "hellas-kernel-model-verification"
+      {
+        src = modelSource;
+        nativeBuildInputs = modelRuntimePackages;
+      }
+      ''
+        set -o pipefail
+        cp -r "$src/models" ./models
+        chmod -R u+w ./models
+        export LD_LIBRARY_PATH="${pkgs.stdenv.cc.cc.lib}/lib''${LD_LIBRARY_PATH:+:''${LD_LIBRARY_PATH}}"
+        mkdir -p "$out"
+        {
+          ${verificationCommand}
+        } 2>&1 | tee "$out/verification.log"
+        touch "$out/passed"
+      '';
+
+  # Referencing the result forces the actual verification build, rather than
+  # merely building an executable that would still share the runner's port.
+  # Darwin has no private network namespace: retain its existing local command
+  # and make no claim that simultaneous Darwin invocations are isolated.
+  modelVerify =
+    if pkgs.stdenv.hostPlatform.isLinux then
+      pkgs.writeShellApplication {
+        name = "hellas-kernel-model-verify";
+        runtimeInputs = [ pkgs.coreutils ];
+        text = ''
+          cat ${modelVerifyResult}/verification.log
+        '';
+      }
+    else
+      modelVerifyLocal;
 
   # Committed ITF traces are what the Rust replays read. If a model
   # changes and the traces are not regenerated, the replay keeps
@@ -246,6 +289,10 @@ let
   };
 in
 {
+  buildChecks = lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+    kernel-model-verify = modelVerifyResult;
+  };
+
   devShell = pkgs.mkShell {
     packages = devShellPackages;
     RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";

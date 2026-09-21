@@ -524,7 +524,7 @@ in
           }
           // gpuEnvironment
         )
-        // lib.optionalAttrs (cfg.otel.enable) {
+        // lib.optionalAttrs cfg.otel.enable {
           # Distinguish gateway spans from the node's in shared trace storage.
           OTEL_SERVICE_NAME = "${cfg.otel.serviceName}-gateway";
         }
