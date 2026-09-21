@@ -9,10 +9,10 @@ documentation.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
+hellas-adaptors.workspace = true
+hellas-rpc = { workspace = true, features = ["execute"] }
+jsonschema = { version = "0.36", default-features = false }
 serde_json.workspace = true
 thiserror.workspace = true
-uuid = { version = "1", features = ["v4"] }
-hellas-adaptors.workspace = true
-jsonschema = { version = "0.36", default-features = false }
-hellas-rpc = { workspace = true, features = ["execute"] }
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
+uuid = { version = "1", features = ["v4"] }
