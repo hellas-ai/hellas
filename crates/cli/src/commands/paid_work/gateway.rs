@@ -66,6 +66,8 @@ const OUTPUT_BUFFER_BYTES: usize = 2 * MAX_RECORD_BYTES;
 const OUTPUT_EVENT_OVERHEAD: usize = 1024;
 const OUTPUT_BUFFER_EVENTS: usize = OUTPUT_BUFFER_BYTES / OUTPUT_EVENT_OVERHEAD;
 type BufferedEvent = (CliResult<ExecutionEvent>, OwnedSemaphorePermit);
+// A background catch-up pass yields within the request's lock-wait budget.
+const CHANNEL_FOLLOW_BUDGET: Duration = Duration::from_secs(1);
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -337,27 +339,30 @@ pub async fn load_gateway_backend(
             .lock()
             .expect("paid followers poisoned")
             .push(tokio::spawn(async move {
-                let mut interval = tokio::time::interval(Duration::from_secs(1));
-                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 let mut reported_failure = false;
                 loop {
-                    interval.tick().await;
+                    // Leave a gap after each pass, including a slow one, and
+                    // let startup recovery and waiting requests own the channel.
+                    tokio::time::sleep(CHANNEL_FOLLOW_BUDGET).await;
                     let result = {
-                        let mut session = provider.serial.lock().await;
-                        if let Some(session) = session.as_mut() {
-                            session.follow_chain().await
-                        } else {
-                            Ok(())
-                        }
+                        let Ok(mut session) = provider.serial.try_lock() else {
+                            continue;
+                        };
+                        let Some(session) = session.as_mut() else {
+                            continue;
+                        };
+                        // Catch-up journals complete blocks as it advances;
+                        // cancellation resumes from that durable cursor.
+                        tokio::time::timeout(CHANNEL_FOLLOW_BUDGET, session.follow_chain()).await
                     };
                     match result {
-                        Ok(()) => reported_failure = false,
-                        Err(error) if !reported_failure => {
+                        Ok(Ok(())) => reported_failure = false,
+                        Ok(Err(error)) if !reported_failure => {
                             reported_failure = true;
                             tracing::warn!(provider = %provider.args.provider, %error,
                             "paid channel chain follower will retry");
                         }
-                        Err(_) => {}
+                        Ok(Err(_)) | Err(_) => {}
                     }
                 }
             }));
@@ -427,19 +432,23 @@ impl PaidGateway {
                     task_span.record("hellas.provider.id", tracing::field::display(provider.args.provider));
                     task_span.record("hellas.route.cache_affinity_tokens", route.cache_affinity_tokens);
                     task_span.record("hellas.route.pending", route.pending);
-                    // Skip busy routes for interactive requests. Recovery may
-                    // wait for its own channel, within the same request budget.
+                    // Wait for a brief follower pass to yield, but route around
+                    // channels still occupied by recovery or other requests.
                     let mut session = if recovery {
                         before_proposal(
                             &sender, false, deadline,
                             |_| provider.serial.lock().instrument(hellas_rpc::request_span!(target: "hellas_request", "paid.queue")),
                         ).await?
                     } else {
-                        match provider.serial.try_lock() {
+                        match before_proposal(
+                            &sender, true, deadline,
+                            |_| tokio::time::timeout(CHANNEL_FOLLOW_BUDGET, provider.serial.lock())
+                                .instrument(hellas_rpc::request_span!(target: "hellas_request", "paid.queue")),
+                        ).await? {
                             Ok(session) => session,
                             Err(_) => {
                                 provider_errors.push(format!(
-                                    "{}: retained work recovery is in progress",
+                                    "{}: paid channel is busy",
                                     provider.args.provider
                                 ));
                                 continue;
@@ -471,7 +480,7 @@ impl PaidGateway {
                                     tracing::debug!(provider = %provider.args.provider, error = %format!("{error:#}"),
                                         "retained paid-work recovery could not open its channel");
                                 } else {
-                                    tracing::warn!(provider = %provider.args.provider, error = %format!("{error:#}"),
+                                    tracing::debug!(provider = %provider.args.provider, error = %format!("{error:#}"),
                                         "paid provider channel could not be opened");
                                 }
                                 provider_errors.push(format!("{}: {error:#}", provider.args.provider));
@@ -551,7 +560,7 @@ impl PaidGateway {
                             && session.client.state().proposal_nonce_high_water() == proposal_nonce
                         {
                             provider.connection_failed();
-                            tracing::warn!(provider = %provider.args.provider, error = %format!("{error:#}"),
+                            tracing::debug!(provider = %provider.args.provider, error = %format!("{error:#}"),
                                 "paid provider failed before proposing new work");
                             provider_errors.push(format!("{}: {error:#}", provider.args.provider));
                             continue;
@@ -1104,7 +1113,7 @@ mod tests {
             &sender,
             true,
             tokio::time::Instant::now() + Duration::from_millis(20),
-            |_| serial.lock(),
+            |_| tokio::time::timeout(CHANNEL_FOLLOW_BUDGET, serial.lock()),
         )
         .await;
         assert!(
