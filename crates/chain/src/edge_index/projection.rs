@@ -344,30 +344,62 @@ pub fn check_detail(
         return Err(ProjectionError::Binding);
     }
     let edge_id = hex::encode(kernel::Tx::edge_id_of(funding, terms).as_bytes());
-    if summary.edge_id != edge_id
-        || summary.terms_hash != hex::encode(terms.hash().as_bytes())
-        || summary.maker != terms.parties().maker().as_bytes()
-        || summary.taker != terms.parties().taker().as_bytes()
+    // A bond's opening cannot name a payment created later. Authenticate any
+    // claimed reverse association with that payment's own certified opening.
+    // Absence remains a discovery claim, not a proof that no payment exists.
+    if let Some(payment_id) = &related.payment_edge_id {
+        validate_id(payment_id).map_err(|e| ProjectionError::Malformed(e.into()))?;
+        if !matches!(terms.profile(), TermsProfile::WorkStakeBond(_))
+            || !blocks.iter().any(|block| {
+                let height = block.view().height();
+                height <= snapshot.height
+                    && block.view().txs().iter().enumerate().any(|(index, tx)| {
+                        if (height, index)
+                            <= (transaction.height, transaction.transaction_index as usize)
+                        {
+                            return false;
+                        }
+                        let crate::domain::Transaction::Kernel(kernel::Tx::Open {
+                            funding,
+                            terms,
+                            ..
+                        }) = tx
+                        else {
+                            return false;
+                        };
+                        let TermsProfile::WorkPayment(payment) = terms.profile() else {
+                            return false;
+                        };
+                        hex::encode(kernel::Tx::edge_id_of(funding, terms).as_bytes())
+                            == *payment_id
+                            && hex::encode(payment.bond_edge.as_bytes()) == edge_id
+                            && canonical_bytes(&kernel::Terms::work_stake_bond(
+                                payment.bond_terms.clone(),
+                            )) == opening.canonical_terms
+                    })
+            })
+        {
+            return Err(ProjectionError::Binding);
+        }
+    }
+    let expected = summary_from_open(
+        &edge_id,
+        transaction,
+        summary.closed.as_ref(),
+        funding,
+        terms,
+        related.payment_edge_id.as_deref(),
+        &snapshot.payload,
+    )?;
+    if summary != &expected
+        || related.bond_edge_id != expected.bond_edge_id
+        || required(&detail.events)?.href
+            != format!(
+                "/api/v1/edges/{edge_id}/events?payload={}",
+                snapshot.payload
+            )
     {
         return Err(ProjectionError::Binding);
-    }
-    let (kind, bond) = match terms.profile() {
-        TermsProfile::Basic => ("basic", None),
-        TermsProfile::WorkStakeBond(_) => ("work-stake-bond", None),
-        TermsProfile::WorkPayment(payment) => (
-            "work-payment",
-            Some(hex::encode(payment.bond_edge.as_bytes())),
-        ),
-    };
-    if summary.kind != kind
-        || summary.bond_edge_id != bond
-        || related.bond_edge_id != bond
-        || related.payment_edge_id != summary.payment_edge_id
-    {
-        return Err(ProjectionError::Binding);
-    }
-    if let Some(id) = &related.payment_edge_id {
-        validate_id(id).map_err(|e| ProjectionError::Malformed(e.into()))?;
     }
     match (&detail.closing, &summary.closed) {
         (None, None) if summary.lifecycle == "open" => {}
@@ -441,6 +473,7 @@ pub fn check_work_channel(
         return Err(ProjectionError::Binding);
     };
     if payment.bond_edge != bond_id
+        || bond_summary.payment_edge_id.as_deref() != Some(payment_summary.edge_id.as_str())
         || canonical_bytes(&kernel::Terms::work_stake_bond(payment.bond_terms.clone()))
             != bond_opening.canonical_terms
         || detail.admission != admission_at(height, &terms)
@@ -635,7 +668,6 @@ pub(crate) fn public_terms(terms: &kernel::Terms) -> Result<PublicTerms, Project
         terms: Some(projection),
     })
 }
-#[cfg(any(test, feature = "explorer-origin"))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn summary_from_open(
     edge_id: &str,

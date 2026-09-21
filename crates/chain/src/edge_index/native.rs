@@ -157,29 +157,46 @@ impl EdgeIndex {
         read: &ReadSnapshot,
         details: impl IntoIterator<Item = &'a EdgeDetail>,
     ) -> Result<EdgeIndexMetadata> {
-        let heights = details
-            .into_iter()
-            .flat_map(|detail| {
-                std::iter::once(
-                    detail
-                        .opening
-                        .as_ref()
-                        .expect("constructed opening")
-                        .transaction
-                        .as_ref()
-                        .expect("constructed reference")
-                        .height,
-                )
-                .chain(detail.closing.iter().map(|closing| {
+        let mut heights = std::collections::BTreeSet::new();
+        for detail in details {
+            heights.insert(
+                detail
+                    .opening
+                    .as_ref()
+                    .expect("constructed opening")
+                    .transaction
+                    .as_ref()
+                    .expect("constructed reference")
+                    .height,
+            );
+            if let Some(closing) = &detail.closing {
+                heights.insert(
                     closing
                         .transaction
                         .as_ref()
                         .expect("constructed reference")
-                        .height
-                }))
-            })
-            .filter(|height| *height != read.proof.height)
-            .collect::<std::collections::BTreeSet<_>>();
+                        .height,
+                );
+            }
+            if let Some(payment_id) = &detail
+                .related
+                .as_ref()
+                .expect("constructed related edges")
+                .payment_edge_id
+            {
+                let payment =
+                    read.edge(payment_id)
+                        .map_err(storage)?
+                        .ok_or_else(|| EdgeIndexError {
+                            status: 500,
+                            code: "index_corrupt",
+                            message: "associated payment is missing from indexed history".into(),
+                            snapshot: None,
+                        })?;
+                heights.insert(payment.opened.height);
+            }
+        }
+        heights.remove(&read.proof.height);
         let mut envelope = self.metadata(read);
         envelope.evidence = heights
             .into_iter()
