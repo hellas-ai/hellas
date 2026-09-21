@@ -376,6 +376,32 @@ mod tests {
     }
 
     #[test]
+    fn xml_preserves_a_valid_branch_before_optional_type_coercion() {
+        let mut request = request();
+        request.tools[0].parameters = json!({
+            "type": "object",
+            "properties": {"a": {"type": "string"}, "b": {"type": ["integer", "string"]}},
+            "required": ["a", "b"],
+            "oneOf": [
+                {"properties": {"a": {"const": "other"}, "b": {"type": "string"}}},
+                {"properties": {"a": {"const": "1"}, "b": {"type": "integer"}}}
+            ]
+        });
+        let mut presentation = presentation();
+        presentation.chat_template = Some(ChatTemplate::Qwen35);
+        let mut turn = presentation.prepare(&request).unwrap().turn;
+        let events = turn.feed("<tool_call><function=bash><parameter=a>1</parameter><parameter=b>2</parameter></function></tool_call>").unwrap();
+        let args = events
+            .iter()
+            .find_map(|event| match event {
+                OutputEvent::ToolCallEnd(call) => Some(&call.arguments),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(args, &json!({"a": "1", "b": 2}));
+    }
+
+    #[test]
     fn incomplete_or_invalid_tool_calls_cannot_finish_as_success() {
         for output in [
             "<tool_call>{\"name\":\"bash\",\"arguments\":{",

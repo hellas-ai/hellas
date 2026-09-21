@@ -112,6 +112,12 @@ fn parse_function_block_with_tools(
         // references, allOf and union types. Ignore errors in other parameters
         // while considering this one; validate the complete object in the engine.
         for (key, text) in text_arguments {
+            // Once the full object satisfies the schema, keep that solution.
+            // An optional substitution could otherwise select a different
+            // oneOf branch whose constraints conflict with earlier fields.
+            if validator.is_valid(&arguments) {
+                break;
+            }
             let parsed = std::mem::replace(&mut arguments[&key], text);
             let pointer = format!("/{}", key.replace('~', "~0").replace('/', "~1"));
             let descendants = format!("{pointer}/");
