@@ -35,35 +35,25 @@ pub(crate) async fn handle(index: Option<EdgeIndex>, uri: Uri, headers: HeaderMa
         Ok(value) => value,
         Err(error) => return failure(400, "invalid_request", &error, None, protobuf),
     };
-    let permit = match index.permits.clone().try_acquire_owned() {
-        Ok(permit) => permit,
-        Err(_) => {
-            return failure(
-                503,
-                "index_not_ready",
-                "index query capacity exhausted; retry later",
-                None,
-                protobuf,
-            );
-        }
-    };
-    let task = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        match request {
-            Request::List(request) => answer(index.list_edges(request), protobuf),
-            Request::Detail(request) => answer(index.get_edge_detail(request), protobuf),
-            Request::Events(request) => answer(index.list_edge_events(request), protobuf),
-            Request::Channel(request) => answer(index.get_work_channel_detail(request), protobuf),
-        }
-    });
-    match tokio::time::timeout(std::time::Duration::from_secs(2), task).await {
-        Ok(Ok(response)) => response,
-        Ok(Err(_)) => failure(503, "index_not_ready", "index query failed", None, protobuf),
-        Err(_) => failure(
-            503,
-            "index_not_ready",
-            "index query deadline exceeded; retry later",
-            None,
+    match index
+        .execute(move |index| {
+            Ok(match request {
+                Request::List(request) => answer(index.list_edges(request), protobuf),
+                Request::Detail(request) => answer(index.get_edge_detail(request), protobuf),
+                Request::Events(request) => answer(index.list_edge_events(request), protobuf),
+                Request::Channel(request) => {
+                    answer(index.get_work_channel_detail(request), protobuf)
+                }
+            })
+        })
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => failure(
+            error.status,
+            error.code,
+            &error.message,
+            error.snapshot.map(|v| *v),
             protobuf,
         ),
     }
@@ -117,26 +107,19 @@ fn answer<T: Serialize + Message>(result: Result<T, EdgeIndexError>, protobuf: b
     }
 }
 fn failure(
-    mut status: u16,
-    code: &str,
+    status: u16,
+    code: &'static str,
     message: &str,
     snapshot: Option<super::types::EdgeIndexMetadata>,
     protobuf: bool,
 ) -> Response {
-    let mut error = super::types::IndexError {
-        schema_version: super::types::SCHEMA_VERSION,
-        code: code.into(),
+    let (status, error) = EdgeIndexError {
+        status,
+        code,
         message: message.into(),
-        envelope: snapshot,
-    };
-    if error.encoded_len() > MAX_RESPONSE_BYTES
-        || serde_json::to_vec(&error).map_or(true, |bytes| bytes.len() > MAX_RESPONSE_BYTES)
-    {
-        status = 413;
-        error.code = "response_too_large".into();
-        error.message = "error evidence exceeds 8 MiB".into();
-        error.envelope = None;
+        snapshot: snapshot.map(Box::new),
     }
+    .into_details();
     let (content_type, body) = if protobuf {
         ("application/x-protobuf", error.encode_to_vec())
     } else {
