@@ -31,7 +31,7 @@ mod tests {
             proof: 2,
             lifetime: 3,
         };
-        let json = serde_json::to_value(&fees).unwrap();
+        let json = serde_json::to_value(fees).unwrap();
         assert_eq!(json["base"], u64::MAX.to_string());
         assert_eq!(serde_json::from_value::<CloseFees>(json).unwrap(), fees);
         for bad in [
