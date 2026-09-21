@@ -55,6 +55,8 @@ const PROVIDER_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 // A retained job is durable, but it must not monopolize the channel that
 // serves interactive requests after a restart or a provider interruption.
 const RECOVERY_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
+// A background catch-up pass yields within the request's lock-wait budget.
+const CHANNEL_FOLLOW_BUDGET: Duration = Duration::from_secs(1);
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -317,27 +319,30 @@ pub async fn load_gateway_backend(
             .lock()
             .expect("paid followers poisoned")
             .push(tokio::spawn(async move {
-                let mut interval = tokio::time::interval(Duration::from_secs(1));
-                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 let mut reported_failure = false;
                 loop {
-                    interval.tick().await;
+                    // Leave a gap after each pass, including a slow one, and
+                    // let startup recovery and waiting requests own the channel.
+                    tokio::time::sleep(CHANNEL_FOLLOW_BUDGET).await;
                     let result = {
-                        let mut session = provider.serial.lock().await;
-                        if let Some(session) = session.as_mut() {
-                            session.follow_chain().await
-                        } else {
-                            Ok(())
-                        }
+                        let Ok(mut session) = provider.serial.try_lock() else {
+                            continue;
+                        };
+                        let Some(session) = session.as_mut() else {
+                            continue;
+                        };
+                        // Catch-up journals complete blocks as it advances;
+                        // cancellation resumes from that durable cursor.
+                        tokio::time::timeout(CHANNEL_FOLLOW_BUDGET, session.follow_chain()).await
                     };
                     match result {
-                        Ok(()) => reported_failure = false,
-                        Err(error) if !reported_failure => {
+                        Ok(Ok(())) => reported_failure = false,
+                        Ok(Err(error)) if !reported_failure => {
                             reported_failure = true;
                             tracing::warn!(provider = %provider.args.provider, %error,
                             "paid channel chain follower will retry");
                         }
-                        Err(_) => {}
+                        Ok(Err(_)) | Err(_) => {}
                     }
                 }
             }));
@@ -391,10 +396,8 @@ impl PaidGateway {
                     task_span.record("hellas.provider.id", tracing::field::display(provider.args.provider));
                     task_span.record("hellas.route.cache_affinity_tokens", route.cache_affinity_tokens);
                     task_span.record("hellas.route.pending", route.pending);
-                    // A retained job owns its channel while it recovers. Do
-                    // not turn that background work into head-of-line blocking
-                    // for an interactive request; another provider may be
-                    // ready now.
+                    // Wait for a brief follower pass to yield, but route around
+                    // channels still occupied by recovery or other requests.
                     let mut session = if recovery {
                         provider
                             .serial
@@ -402,11 +405,14 @@ impl PaidGateway {
                             .instrument(hellas_rpc::request_span!(target: "hellas_request", "paid.queue"))
                             .await
                     } else {
-                        match provider.serial.try_lock() {
+                        match tokio::time::timeout(
+                            CHANNEL_FOLLOW_BUDGET,
+                            provider.serial.lock(),
+                        ).await {
                             Ok(session) => session,
                             Err(_) => {
                                 provider_errors.push(format!(
-                                    "{}: retained work recovery is in progress",
+                                    "{}: paid channel is busy",
                                     provider.args.provider
                                 ));
                                 continue;

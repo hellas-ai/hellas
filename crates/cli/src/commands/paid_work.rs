@@ -581,7 +581,7 @@ impl OpenPaidChannel {
                     return Err(error.into());
                 }
                 Err(error) => {
-                    tracing::warn!(%error, "paid channel will continue catch-up through another validator");
+                    tracing::debug!(%error, "paid channel will continue catch-up through another validator");
                     self.chain = connect_chain(&self.config, &mut self.next_validator).await?;
                     check_genesis(&self.config, &self.chain).await?;
                 }
