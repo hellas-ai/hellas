@@ -174,31 +174,25 @@ struct OriginState {
     replay: Arc<::tokio::sync::Mutex<crate::edge_index::Replay<tokio::Context>>>,
 }
 
-#[cfg(feature = "otel")]
-#[path = "explorer_origin/telemetry.rs"]
-mod telemetry;
-#[cfg(not(feature = "otel"))]
-#[path = "explorer_origin/telemetry_noop.rs"]
-mod telemetry;
-
 fn router(state: OriginState) -> Router {
-    telemetry::layer(
-        Router::new()
-            .route("/api/v1/edges", get(edge_index_http))
-            .route("/api/v1/edges/{edge_id}", get(edge_index_http))
-            .route("/api/v1/edges/{edge_id}/events", get(edge_index_http))
-            .route("/api/v1/edges/{edge_id}/evidence", get(edge_index_http))
-            .route("/api/v1/channels/{payment_edge_id}", get(edge_index_http))
-            .route("/api/v1/edge-index/rpc", get(edge_index_ws))
-            .route("/api/v1/blocks/{selector}", get(block))
-            .route("/api/v1/blocks/{selector}/proof", get(block))
-            .route("/api/v1/blocks/by-payload/{payload}", get(payload))
-            .route("/api/v1/transactions/{digest}", get(transaction))
-            .route("/api/v1/transactions/{digest}/proof", get(transaction))
-            .route("/api/v1/addresses/{owner}/proof", get(address))
-            .route("/api/v1/addresses/{owner}", get(address))
-            .with_state(state),
-    )
+    let router = Router::new()
+        .route("/api/v1/edges", get(edge_index_http))
+        .route("/api/v1/edges/{edge_id}", get(edge_index_http))
+        .route("/api/v1/edges/{edge_id}/events", get(edge_index_http))
+        .route("/api/v1/edges/{edge_id}/evidence", get(edge_index_http))
+        .route("/api/v1/channels/{payment_edge_id}", get(edge_index_http))
+        .route("/api/v1/edge-index/rpc", get(edge_index_ws))
+        .route("/api/v1/blocks/{selector}", get(block))
+        .route("/api/v1/blocks/{selector}/proof", get(block))
+        .route("/api/v1/blocks/by-payload/{payload}", get(payload))
+        .route("/api/v1/transactions/{digest}", get(transaction))
+        .route("/api/v1/transactions/{digest}/proof", get(transaction))
+        .route("/api/v1/addresses/{owner}/proof", get(address))
+        .route("/api/v1/addresses/{owner}", get(address))
+        .with_state(state);
+    #[cfg(feature = "otel")]
+    let router = router.layer(axum::middleware::from_fn(hellas_rpc::telemetry::http::trace_request));
+    router
 }
 
 async fn edge_index_http(

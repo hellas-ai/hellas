@@ -57,8 +57,9 @@ chain = [
 indexer = ["chain", "hellas-chain/explorer-origin"]
 validator = ["indexer", "hellas-chain/validator"]
 
-# Hellas OTLP export and iroh metrics exposure are opt-in. Transitive
-# Commonware and mDNS dependencies may still compile SDKs or collect metrics.
+# Hellas OTLP export and iroh metrics exposure are opt-in. Dependencies can
+# still compile telemetry: Commonware has its own SDK, and mDNS enables iroh
+# default features (including metrics collection).
 otel = [
     "hellas-chain?/otel",
     "hellas-rpc/otel",
