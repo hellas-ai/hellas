@@ -6,7 +6,7 @@ use super::{
 };
 use crate::domain::{Object, Transaction};
 use base64ct::{Base64UrlUnpadded, Encoding};
-use commonware_codec::DecodeExt as _;
+use commonware_codec::Encode as _;
 use hellas_kernel::{TermsProfile, Tx};
 use serde::Serialize;
 use std::{
@@ -232,7 +232,7 @@ impl EdgeIndex {
         })
     }
     fn summary(&self, read: &ReadSnapshot, edge: &StoredEdge) -> Result<EdgeSummary> {
-        let tx = Transaction::decode(edge.canonical_open.as_slice()).map_err(storage)?;
+        let tx = read.transaction(&edge.opened).map_err(storage)?;
         let Transaction::Kernel(Tx::Open { funding, terms, .. }) = tx else {
             return Err(EdgeIndexError::unavailable("stored opening is not Open"));
         };
@@ -258,7 +258,7 @@ impl EdgeIndex {
                 snapshot: Some(Box::new(self.metadata(read))),
             })?;
         let summary = self.summary(read, &edge)?;
-        let tx = Transaction::decode(edge.canonical_open.as_slice()).map_err(storage)?;
+        let tx = read.transaction(&edge.opened).map_err(storage)?;
         let Transaction::Kernel(Tx::Open { funding, terms, .. }) = tx else {
             return Err(EdgeIndexError::unavailable("stored opening is not Open"));
         };
@@ -500,16 +500,16 @@ impl EdgeIndex {
         };
         let items = events
             .into_iter()
-            .map(|event| EdgeEvent {
+            .map(|event| Ok(EdgeEvent {
+                canonical_transaction: read.transaction(&event.transaction).map_err(storage)?.encode().to_vec(),
                 kind: event.kind,
                 evidence_href: format!(
                     "/api/v1/transactions/{}/proof",
                     event.transaction.transaction_digest
                 ),
                 transaction: event.transaction,
-                canonical_transaction: event.canonical_transaction,
-            })
-            .collect();
+            }))
+            .collect::<Result<Vec<_>>>()?;
         bounded(ListEdgeEventsResponse {
             envelope: self.metadata(&read),
             data: EdgeEventsPage { items, next_cursor },

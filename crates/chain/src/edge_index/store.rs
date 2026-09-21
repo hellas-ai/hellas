@@ -8,11 +8,13 @@ use crate::{
 use commonware_codec::{DecodeExt as _, Encode as _};
 use commonware_consensus::{Block as _, Heightable as _};
 use hellas_kernel::{TermsProfile, Tx};
+use prost::Message as _;
 use redb::{Database, ReadableDatabase as _, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
-use std::{path::Path, sync::Arc};
+use std::{cell::RefCell, path::Path, sync::Arc};
 
 pub(super) type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+const STORAGE_VERSION: u32 = 2;
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("edge_metadata_v1");
 const PROOFS: TableDefinition<u64, &[u8]> = TableDefinition::new("edge_block_proofs_v1");
 const PAYLOADS: TableDefinition<&str, u64> = TableDefinition::new("edge_payload_heights_v1");
@@ -36,14 +38,12 @@ pub(super) struct StoredEdge {
     pub edge_id: String,
     pub opened: TransactionRef,
     pub closed: Option<TransactionRef>,
-    pub canonical_open: Vec<u8>,
     pub payment_edge_id: Option<String>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub(super) struct StoredEvent {
     pub kind: String,
     pub transaction: TransactionRef,
-    pub canonical_transaction: Vec<u8>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub(super) struct Intent {
@@ -62,6 +62,7 @@ pub(super) struct ReadSnapshot {
     pub proof: ProofBundle,
     pub retained_from_height: u64,
     pub indexed_through: ProofBundle,
+    block: RefCell<Option<(u64, crate::HellasBlock)>>,
 }
 #[derive(Debug, thiserror::Error)]
 pub(super) enum SnapshotError {
@@ -105,6 +106,18 @@ impl IndexStore {
         let write = db.begin_write()?;
         {
             let mut meta = write.open_table(META)?;
+            if meta.get("identity")?.is_some()
+                && meta
+                    .get("storage_version")?
+                    .map(|v| decode::<u32>(v.value()))
+                    .transpose()?
+                    != Some(STORAGE_VERSION)
+            {
+                return Err(
+                    "edge index storage format changed; rebuild in a new storage directory".into(),
+                );
+            }
+            meta.insert("storage_version", encode(&STORAGE_VERSION)?.as_slice())?;
             if let Some(previous) = meta.get("identity")? {
                 if decode::<Identity>(previous.value())? != identity {
                     return Err("edge index identity/schema mismatch; rebuild this index from genesis in a new storage directory".into());
@@ -138,7 +151,13 @@ impl IndexStore {
     pub fn latest(&self) -> Result<Option<ProofBundle>> {
         let read = self.db.begin_read()?;
         let table = read.open_table(META)?;
-        table.get("latest")?.map(|v| decode(v.value())).transpose()
+        let height: Option<u64> = table
+            .get("latest")?
+            .map(|v| decode(v.value()))
+            .transpose()?;
+        height
+            .map(|height| read_proof(&read.open_table(PROOFS)?, height))
+            .transpose()
     }
     pub fn intent(&self) -> Result<Option<Intent>> {
         let read = self.db.begin_read()?;
@@ -179,8 +198,11 @@ impl IndexStore {
         let write = self.db.begin_write()?;
         {
             let mut meta = write.open_table(META)?;
-            let previous: Option<ProofBundle> =
+            let previous: Option<u64> =
                 meta.get("latest")?.map(|v| decode(v.value())).transpose()?;
+            let previous = previous
+                .map(|height| read_proof(&write.open_table(PROOFS)?, height))
+                .transpose()?;
             if let Some(previous) = previous {
                 if previous.height == height && previous.payload == intent.proof.payload {
                     meta.remove("intent")?;
@@ -234,7 +256,6 @@ impl IndexStore {
                             edge_id: id.clone(),
                             opened: reference.clone(),
                             closed: None,
-                            canonical_open: transaction.encode().to_vec(),
                             payment_edge_id: None,
                         };
                         edges.insert(id.as_str(), encode(&edge)?.as_slice())?;
@@ -290,8 +311,17 @@ impl IndexStore {
                             return Err("edge closed twice".into());
                         }
                         edge.closed = Some(reference.clone());
+                        let opening_block;
+                        let opening = if edge.opened.height == height {
+                            &block
+                        } else {
+                            let proof = read_proof(&write.open_table(PROOFS)?, edge.opened.height)?;
+                            opening_block =
+                                crate::HellasBlock::decode(proof.canonical_block.as_slice())?;
+                            &opening_block
+                        };
                         let Transaction::Kernel(Tx::Open { terms, .. }) =
-                            Transaction::decode(edge.canonical_open.as_slice())?
+                            transaction_at(opening, &edge.opened)?
                         else {
                             return Err("stored opening is not Open".into());
                         };
@@ -319,7 +349,6 @@ impl IndexStore {
                 let event = StoredEvent {
                     kind: kind.into(),
                     transaction: reference,
-                    canonical_transaction: transaction.encode().to_vec(),
                 };
                 events.insert(
                     format!("{id}/{height:020}/{index:010}").as_str(),
@@ -362,11 +391,11 @@ impl IndexStore {
             }
             write
                 .open_table(PROOFS)?
-                .insert(height, encode(&intent.proof)?.as_slice())?;
+                .insert(height, intent.proof.encode_to_vec().as_slice())?;
             write
                 .open_table(PAYLOADS)?
                 .insert(intent.proof.payload.as_str(), height)?;
-            meta.insert("latest", encode(&intent.proof)?.as_slice())?;
+            meta.insert("latest", encode(&height)?.as_slice())?;
             meta.insert("retained_from", encode(&floor)?.as_slice())?;
             meta.remove("intent")?;
         }
@@ -375,12 +404,13 @@ impl IndexStore {
     }
     pub fn read(&self, payload: Option<&str>) -> Result<ReadSnapshot> {
         let tx = self.db.begin_read()?;
-        let indexed_through: ProofBundle = decode(
+        let latest: u64 = decode(
             tx.open_table(META)?
                 .get("latest")?
                 .ok_or(SnapshotError::NotReady)?
                 .value(),
         )?;
+        let indexed_through = read_proof(&tx.open_table(PROOFS)?, latest)?;
         let retained_from_height = decode(
             tx.open_table(META)?
                 .get("retained_from")?
@@ -398,17 +428,13 @@ impl IndexStore {
         if height < retained_from_height {
             return Err(SnapshotError::Expired.into());
         }
-        let proof = decode(
-            tx.open_table(PROOFS)?
-                .get(height)?
-                .ok_or(SnapshotError::Unavailable)?
-                .value(),
-        )?;
+        let proof = read_proof(&tx.open_table(PROOFS)?, height)?;
         Ok(ReadSnapshot {
             tx,
             proof,
             retained_from_height,
             indexed_through,
+            block: RefCell::new(None),
         })
     }
 }
@@ -443,13 +469,23 @@ impl ReadSnapshot {
         Ok(Some(edge))
     }
     pub fn proof(&self, height: u64) -> Result<ProofBundle> {
-        decode(
-            self.tx
-                .open_table(PROOFS)?
-                .get(height)?
-                .ok_or("opening proof missing")?
-                .value(),
-        )
+        read_proof(&self.tx.open_table(PROOFS)?, height)
+    }
+    pub fn transaction(&self, reference: &TransactionRef) -> Result<Transaction> {
+        // Adjacent events and edges commonly reference one block. Keep only one
+        // decoded block so a filtered scan cannot accumulate archive-sized memory.
+        let mut cached = self.block.borrow_mut();
+        if cached
+            .as_ref()
+            .is_none_or(|(height, _)| *height != reference.height)
+        {
+            let proof = self.proof(reference.height)?;
+            *cached = Some((
+                reference.height,
+                crate::HellasBlock::decode(proof.canonical_block.as_slice())?,
+            ));
+        }
+        transaction_at(&cached.as_ref().expect("block loaded above").1, reference)
     }
     pub fn object(&self, id: &[u8]) -> Result<Option<Object>> {
         if id.len() != 32 {
@@ -539,6 +575,26 @@ impl ReadSnapshot {
     }
 }
 
+fn read_proof(table: &impl ReadableTable<u64, &'static [u8]>, height: u64) -> Result<ProofBundle> {
+    let value = table.get(height)?.ok_or("canonical block proof missing")?;
+    Ok(<ProofBundle as prost::Message>::decode(value.value())?)
+}
+fn transaction_at(block: &crate::HellasBlock, reference: &TransactionRef) -> Result<Transaction> {
+    use commonware_cryptography::Digestible as _;
+    let transaction = block
+        .txs()
+        .get(reference.transaction_index as usize)
+        .ok_or("transaction locator is out of range")?;
+    if block.height().get() != reference.height
+        || hex::encode(block.digest()) != reference.payload
+        || hex::encode(crate::verified_explorer::transaction_digest(transaction))
+            != reference.transaction_digest
+    {
+        return Err("transaction locator differs from canonical block".into());
+    }
+    Ok(transaction.clone())
+}
+
 fn lookup_prefixes(terms: &hellas_kernel::Terms) -> Vec<String> {
     let maker = crate::domain::SettlementKey::from(terms.parties().maker()).to_string();
     let taker = crate::domain::SettlementKey::from(terms.parties().taker()).to_string();
@@ -597,20 +653,20 @@ mod tests {
                     .unwrap();
             }
             let mut meta = write.open_table(META).unwrap();
-            meta.insert("latest", encode(&proof).unwrap().as_slice())
+            meta.insert("latest", encode(&proof.height).unwrap().as_slice())
                 .unwrap();
             meta.insert("retained_from", encode(&99_970_u64).unwrap().as_slice())
                 .unwrap();
             write
                 .open_table(PROOFS)
                 .unwrap()
-                .insert(proof.height, encode(&proof).unwrap().as_slice())
+                .insert(proof.height, proof.encode_to_vec().as_slice())
                 .unwrap();
         }
         write.commit().unwrap();
         let page = index
             .list_edges(ListEdgesRequest {
-                schema_version: 1,
+                schema_version: super::super::SCHEMA_VERSION,
                 ..Default::default()
             })
             .unwrap();
