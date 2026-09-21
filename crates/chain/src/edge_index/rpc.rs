@@ -18,6 +18,7 @@ fn failure(error: EdgeIndexError) -> WireStatus {
             404 => WireCode::NotFound,
             409 | 410 => WireCode::FailedPrecondition,
             413 => WireCode::ResourceExhausted,
+            500 => WireCode::Internal,
             _ => WireCode::Unavailable,
         },
         format!("{}: {}", details.code, details.message),

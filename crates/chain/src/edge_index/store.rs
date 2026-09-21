@@ -487,6 +487,133 @@ mod tests {
     use super::*;
     use crate::edge_index::{EdgeIndex, ListEdgesRequest};
 
+    #[tokio::test]
+    async fn locator_uses_admission_and_preserves_storage_failures() {
+        let directory = tempfile::tempdir().unwrap();
+        let index = EdgeIndex::open(
+            &directory.path().join("index.redb"),
+            "test".into(),
+            "01".repeat(32),
+            "02".repeat(32),
+        )
+        .unwrap();
+        let digest = "03".repeat(32);
+        assert_eq!(
+            index.transaction_height(digest.clone()).await.unwrap(),
+            None
+        );
+        let permit = index.permits.clone().try_acquire_many_owned(16).unwrap();
+        let error = index.transaction_height(digest.clone()).await.unwrap_err();
+        assert_eq!((error.status, error.code), (503, "index_not_ready"));
+        drop(permit);
+
+        // A missing durable table is a storage fault, not a missing transaction.
+        let write = index.store.db.begin_write().unwrap();
+        write.delete_table(TRANSACTIONS).unwrap();
+        write.commit().unwrap();
+        let error = index.transaction_height(digest).await.unwrap_err();
+        assert_eq!((error.status, error.code), (500, "index_storage_error"));
+    }
+
+    #[tokio::test]
+    async fn corrupt_storage_has_matching_http_and_rpc_errors() {
+        use hellas_rpc::pb::services::edge_index::EdgeIndexHandler;
+        let directory = tempfile::tempdir().unwrap();
+        let index = EdgeIndex::open(
+            &directory.path().join("index.redb"),
+            "test".into(),
+            "01".repeat(32),
+            "02".repeat(32),
+        )
+        .unwrap();
+        let request = ListEdgesRequest {
+            schema_version: super::super::SCHEMA_VERSION,
+            ..Default::default()
+        };
+        assert_eq!(index.list_edges(request.clone()).unwrap_err().status, 503);
+        let write = index.store.db.begin_write().unwrap();
+        write
+            .open_table(META)
+            .unwrap()
+            .insert("latest", b"not a height".as_slice())
+            .unwrap();
+        write.commit().unwrap();
+
+        for protobuf in [false, true] {
+            let mut headers = axum::http::HeaderMap::new();
+            if protobuf {
+                headers.insert(
+                    axum::http::header::ACCEPT,
+                    "application/x-protobuf".parse().unwrap(),
+                );
+            }
+            let response = super::super::http::handle(
+                index.clone(),
+                "/api/v1/edges".parse().unwrap(),
+                headers,
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR
+            );
+            let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let error: super::super::types::IndexError = if protobuf {
+                prost::Message::decode(bytes).unwrap()
+            } else {
+                serde_json::from_slice(&bytes).unwrap()
+            };
+            assert_eq!(error.code, "index_storage_error");
+        }
+        let error = EdgeIndexHandler::list_edges(&index, request)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), hellas_wire::WireCode::Internal);
+        let details = super::super::types::IndexError::decode(error.details().clone()).unwrap();
+        assert_eq!(details.code, "index_storage_error");
+    }
+
+    #[test]
+    fn inconsistent_persisted_edge_is_corruption_not_catch_up() {
+        crate::execution::test_support::run_qmdb(|context| async move {
+            let maker = hellas_kernel::Secp256k1Signer::from_secret_scalar([19; 32]).unwrap();
+            let taker = hellas_kernel::Secp256k1Signer::from_secret_scalar([20; 32]).unwrap();
+            let owner = crate::domain::SettlementKey::from(maker.party_key());
+            let mut h =
+                crate::edge_index::ReplayHarness::new(context, vec![(owner, 100)], "corrupt-edge")
+                    .await;
+            let (_, _, tx) = crate::edge_index::replay_basic(h.network, 0, &maker, &taker);
+            h.append(vec![Transaction::Kernel(tx)]).await;
+            let page = h
+                .index
+                .list_edges(ListEdgesRequest {
+                    schema_version: super::super::SCHEMA_VERSION,
+                    ..Default::default()
+                })
+                .unwrap();
+            let id = &page.data.unwrap().items[0].edge_id;
+            let write = h.index.store.db.begin_write().unwrap();
+            write
+                .open_table(OBJECTS)
+                .unwrap()
+                .remove(hex::decode(id).unwrap().as_slice())
+                .unwrap();
+            write.commit().unwrap();
+            let error = h
+                .index
+                .get_edge_detail(super::super::types::GetEdgeDetailRequest {
+                    schema_version: super::super::SCHEMA_VERSION,
+                    edge_id: id.clone(),
+                    payload: None,
+                })
+                .unwrap_err();
+            assert_eq!((error.status, error.code), (500, "index_corrupt"));
+            assert!(error.message.contains("history/object state mismatch"));
+        });
+    }
+
     #[test]
     fn native_edge_index_open_queries_do_not_scan_closed_history() {
         // Synthetic lookup stress: the certificate/root checks are covered by the
