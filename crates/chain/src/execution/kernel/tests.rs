@@ -2234,3 +2234,24 @@ fn owner_commitments_are_speculative_replayable_and_match_native_reconstruction(
         }
     });
 }
+
+#[test]
+fn genesis_allocation_ids_stop_at_the_validator_index_boundary() {
+    let owner = SettlementKey::from_bytes([2; 33]);
+    let allocations: Vec<_> = (0..=u16::MAX as u64 + 1)
+        .map(|value| (owner, value))
+        .collect();
+    let coins: Vec<_> = genesis_coins(&allocations).collect();
+    assert_eq!(coins.len(), u16::MAX as usize + 1);
+    assert_eq!(coins[0], (genesis_object_id(0), Coin { owner, value: 0 }));
+    assert_eq!(
+        coins.last(),
+        Some(&(
+            genesis_object_id(u16::MAX),
+            Coin {
+                owner,
+                value: u16::MAX as u64
+            }
+        ))
+    );
+}

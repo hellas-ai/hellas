@@ -10,7 +10,7 @@ mod verifier;
 #[cfg(any(feature = "validator", feature = "explorer-origin"))]
 mod working_set;
 
-#[cfg(any(feature = "validator", test))]
+#[cfg(any(feature = "validator", all(test, feature = "explorer-origin")))]
 pub use kernel::execute_all;
 #[cfg(feature = "validator")]
 pub use kernel::{ExecutionError, execute_proposal};
