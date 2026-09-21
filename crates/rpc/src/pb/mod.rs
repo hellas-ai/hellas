@@ -211,6 +211,22 @@ mod id_pins {
 
     #[cfg(feature = "chain")]
     #[test]
+    fn edge_index_schema_two_ids_are_stable() {
+        use super::services::edge_index::{
+            EdgeIndex, GetEdgeDetail, GetWorkChannelDetail, ListEdgeEvents, ListEdges,
+        };
+        assert_eq!(<EdgeIndex as ServiceMarker>::SERVICE_ID, 0x3a28ca0e);
+        assert_eq!(<ListEdges as MethodMarker>::METHOD_ID, 0xd35e4324);
+        assert_eq!(<GetEdgeDetail as MethodMarker>::METHOD_ID, 0xe36e7683);
+        assert_eq!(<ListEdgeEvents as MethodMarker>::METHOD_ID, 0x7ce6f577);
+        assert_eq!(
+            <GetWorkChannelDetail as MethodMarker>::METHOD_ID,
+            0xf451a04d
+        );
+    }
+
+    #[cfg(feature = "chain")]
+    #[test]
     fn chain_ids_are_stable() {
         use super::services::light_client::{
             GetStateRoot, GetWorkChannelSnapshot, LightClient, SubmitWorkResponse,

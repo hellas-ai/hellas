@@ -29,7 +29,7 @@ default = []
 execute = []
 evaluate = ["execute"]
 fetch = ["execute", "dep:serde_json"]
-chain = []
+chain = ["dep:base64ct", "dep:hellas-kernel"]
 # Courtesy proto imports hellas.v1 (Ticket) and hellas.evaluate.v1
 # (EvaluateRequest), so the feature must pull both forward.
 courtesy = ["execute", "evaluate"]
@@ -47,6 +47,7 @@ all-protocols = ["swarm", "courtesy", "execute", "evaluate", "fetch", "chain"]
 work = ["dep:hellas-kernel", "evaluate", "hellas-kernel/secp256k1"]
 
 [dependencies]
+base64ct = { version = "1", optional = true, features = ["alloc"] }
 bytes = { workspace = true }
 ed25519-dalek = { workspace = true }
 futures-core = { workspace = true }
