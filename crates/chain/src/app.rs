@@ -101,6 +101,18 @@ pub const RESPONSE_MEMPOOL_CAPACITY: usize = 64;
 /// Canonical chain encoding of one `PaymentCloseResponse` transaction.
 #[cfg(feature = "validator")]
 pub const RESPONSE_TRANSACTION_BYTES: usize = 274;
+/// Mempool residents re-executed against committed state per finalized block.
+///
+/// Post-finalization reconciliation runs inside `finalized`, which consensus
+/// awaits, so its cost is paid by every validator on every block. Bounding it
+/// keeps that cost independent of how full the pool is; the offset rotates
+/// with height, so a pool of `GENERAL_MEMPOOL_CAPACITY +
+/// RESPONSE_MEMPOOL_CAPACITY` is still fully covered within a handful of
+/// blocks. Pruning is an optimisation and nothing depends on it happening in
+/// the same block that invalidated a transaction: `propose` re-checks every
+/// candidate it picks up.
+#[cfg(feature = "validator")]
+pub const RECONCILED_PER_BLOCK: usize = 32;
 
 #[cfg(feature = "validator")]
 #[derive(Clone)]
@@ -544,29 +556,58 @@ where
             .await;
         // Reconcile against committed state, never a speculative proposal.
         // Each candidate gets its own disposable batch so one candidate's
-        // effects cannot invalidate another. Admission bounds this work.
+        // effects cannot invalidate another.
         // Startup/state-sync notifications may trail the database checkpoint.
         if self.owner_index.cursor().height == block.height().get()
             && databases.read().await.root() == block.state_root()
         {
             let mut rejected = BTreeSet::new();
-            for transaction in self.mempool.snapshot().await {
+            let candidates = self.mempool.snapshot().await;
+            // Admission caps how many transactions the pool holds, not how
+            // often each is re-examined. Reconciling the whole pool here
+            // would make every validator pay one full kernel execution per
+            // resident per block, and `submit_general` admits without
+            // semantic validation while `ObjectNotFound` is transient and so
+            // retained -- a peer can park `GENERAL_MEMPOOL_CAPACITY`
+            // never-includable transactions and have them re-verified
+            // forever. Examine a bounded window instead, starting at an
+            // offset derived from the height so the whole pool is still
+            // covered, just across several blocks rather than all at once.
+            let examined = candidates.len().min(RECONCILED_PER_BLOCK);
+            let start = if candidates.is_empty() {
+                0
+            } else {
+                usize::try_from(block.height().get() % candidates.len() as u64).unwrap_or(0)
+            };
+            for offset in 0..examined {
+                let transaction = &candidates[(start + offset) % candidates.len()];
                 let digest = Sha256::hash(&transaction.encode());
-                let (_, included, retained) = execute_proposal(
+                let outcome = execute_proposal(
                     kernel_context(
                         self.network,
                         Height::new(block.height().get() + 1),
                         block.digest(),
                     ),
                     self.verifier.as_ref(),
-                    vec![transaction],
+                    vec![transaction.clone()],
                     &self.genesis_allocations,
                     MAX_TXS_PER_BLOCK,
                     MAX_BLOCK_TX_BYTES,
                     databases.new_batches().await,
                 )
-                .await
-                .expect("finalized mempool validation failed");
+                .await;
+                // `propose` treats this same error set as a skipped round
+                // (see `proposal execution failed` above). Pruning is an
+                // optimisation -- a transaction left in the pool is retried
+                // next block -- so a storage fault must not be more fatal
+                // here than it is there.
+                let (_, included, retained) = match outcome {
+                    Ok(outcome) => outcome,
+                    Err(err) => {
+                        error!(?err, "finalized mempool validation failed");
+                        break;
+                    }
+                };
                 if included.is_empty() && retained.is_empty() {
                     rejected.insert(digest);
                 }

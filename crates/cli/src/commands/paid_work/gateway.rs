@@ -694,9 +694,20 @@ fn emit(
     }
     let bytes = match &event {
         Ok(ExecutionEvent::Chunk { tokens, .. }) => tokens.len(),
+        // Payload bytes only. `OUTPUT_EVENT_OVERHEAD` is charged once below,
+        // for the one channel message this becomes -- it is the per-message
+        // constant that makes a full channel (`OUTPUT_BUFFER_EVENTS`) exactly
+        // exhaust `OUTPUT_BUFFER_BYTES`. Charging it per *contained* event
+        // instead conflated the transcript with the queue: a completion
+        // carrying ~8000 signed events, well inside the `MAX_RECORD_BYTES`
+        // transcript cap and ordinary for `max_new_tokens` in the thousands,
+        // asked for more permits than the semaphore can ever hold. The
+        // acquire then failed, `overflow` latched, and the client was told
+        // "paid output consumer is too slow" for work it had already paid
+        // for and was reading promptly.
         Ok(ExecutionEvent::Done(Outcome::Completed { output_events, .. })) => output_events
             .iter()
-            .map(|event| event.payload().len().saturating_add(OUTPUT_EVENT_OVERHEAD))
+            .map(|event| event.payload().len())
             .fold(0usize, usize::saturating_add),
         Ok(ExecutionEvent::Done(_)) => MAX_RECORD_BYTES,
         Err(error) => error.to_string().len(),
@@ -1041,6 +1052,28 @@ mod tests {
         );
         assert!(gateway.tasks.lock().unwrap().is_empty());
         assert_eq!(gateway.admission.available_permits(), 1);
+    }
+
+    #[test]
+    fn the_largest_possible_completion_fits_the_output_budget() {
+        // The terminal `Done(Completed)` is one channel message carrying the
+        // whole transcript, and a transcript is capped at `MAX_RECORD_BYTES`.
+        // `emit` must therefore charge it at most that, plus the single
+        // per-message `OUTPUT_EVENT_OVERHEAD`, or a completion the protocol
+        // permits cannot be delivered at all: `try_acquire_many_owned` fails,
+        // `overflow` latches, and the caller is told its reader is too slow
+        // for work it has already paid for.
+        //
+        // This is the invariant that a per-contained-event overhead broke.
+        // Multiplying the overhead by event count makes the charge unbounded
+        // with respect to `MAX_RECORD_BYTES` -- ~8000 small events exceeded
+        // the budget on their own -- so no value of `OUTPUT_BUFFER_BYTES`
+        // could satisfy this assertion.
+        let worst_case = MAX_RECORD_BYTES.saturating_add(OUTPUT_EVENT_OVERHEAD);
+        assert!(
+            worst_case <= OUTPUT_BUFFER_BYTES,
+            "a maximal completion charges {worst_case} against a {OUTPUT_BUFFER_BYTES} budget",
+        );
     }
 
     #[tokio::test]
