@@ -198,15 +198,9 @@ impl EdgeIndex {
                 .expect("constructed related edges")
                 .payment_edge_id
             {
-                let payment =
-                    read.edge(payment_id)
-                        .map_err(storage)?
-                        .ok_or_else(|| EdgeIndexError {
-                            status: 500,
-                            code: "index_corrupt",
-                            message: "associated payment is missing from indexed history".into(),
-                            snapshot: None,
-                        })?;
+                let payment = read.edge(payment_id).map_err(storage)?.ok_or_else(|| {
+                    EdgeIndexError::corrupt("associated payment is missing from indexed history")
+                })?;
                 heights.insert(payment.opened.height);
             }
         }

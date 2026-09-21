@@ -30,6 +30,9 @@ must match that checkpoint; after publication advances, requests return typed
 Consumers explicitly restart at latest rather than silently mixing checkpoints.
 An initial/incomplete index returns 503. `retained_from_height` equals the current
 checkpoint height; there is no state-retention window or retention setting.
+Durable data inconsistencies return 500 `index_corrupt`, and storage failures
+return 500 `index_storage_error`; RPC maps both to `Internal`. Admission, deadline
+and scan-budget exhaustion remain transient 503 responses.
 
 Closed-channel details, every edge event, transaction locator and opening/closing
 certificate remain available. Historical block and transaction proof routes are
