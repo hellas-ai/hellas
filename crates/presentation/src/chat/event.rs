@@ -77,14 +77,13 @@ pub enum DecodeEvent {
     /// Parsed call referenced a name not in the bound directory.
     /// **Terminal**: this event is followed by `Stop { ProtocolError }`
     /// and the parser ignores all subsequent input.
-    UnknownTool { name: String, raw_args: JsonValue },
+    UnknownTool { name: String },
 
     /// Parsed call's args failed JSON-schema validation. No
     /// `ToolCallStart` / `End` is emitted for this call. **Terminal**:
     /// followed by `Stop { ProtocolError }`; subsequent input ignored.
     InvalidArgs {
         name: String,
-        args: JsonValue,
         errors: Vec<SchemaError>,
     },
 
@@ -104,8 +103,6 @@ pub enum StopReason {
     EndOfText,
     /// Caller's `max_new_tokens` budget was exhausted.
     MaxTokens,
-    /// A configured stop sequence was matched.
-    StopSequence,
     /// Internal terminal marker emitted after a fatal parser error
     /// (`UnknownTool`, `InvalidArgs`, `ParseError`). The gateway must
     /// NOT render this as an OpenAI / Anthropic "success" `finish_reason`
@@ -150,11 +147,7 @@ pub enum ParserError {
     #[error("tool-call payload missing required field `{0}`")]
     MissingField(&'static str),
 
-    /// JSON deserialization error inside the payload. The message is
-    /// stringified at construction time so the variant is `Clone`-safe
-    /// — the poison contract requires that subsequent `feed` calls
-    /// after a failure return the SAME failure value, which would be
-    /// impossible if we held a `serde_json::Error` (it isn't `Clone`).
+    /// JSON deserialization error inside the payload.
     #[error("invalid JSON in tool-call payload: {0}")]
     Json(String),
 
