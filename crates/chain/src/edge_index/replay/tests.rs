@@ -743,7 +743,7 @@ fn native_edge_index_real_chain_pins_root_checks_and_restart() {
         )
         .await
         .unwrap();
-        assert_eq!(recovered.cursor, previous_height);
+        assert_eq!(recovered.next_height().unwrap(), previous_height + 1);
         assert!(h.index.store.intent().unwrap().is_none());
         assert_eq!(recovered.next_height().unwrap(), previous_height + 1);
         let read = h.index.store.read(None).unwrap();
@@ -818,7 +818,7 @@ fn native_edge_index_real_chain_pins_root_checks_and_restart() {
         )
         .await
         .unwrap();
-        assert_eq!(recovered.cursor, proof.height);
+        assert_eq!(recovered.next_height().unwrap(), proof.height + 1);
         let read = h.index.store.read(None).unwrap();
         assert!(read.object(id2.as_bytes()).unwrap().is_none());
         assert_eq!(
