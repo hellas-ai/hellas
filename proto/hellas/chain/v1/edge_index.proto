@@ -13,7 +13,7 @@ service EdgeIndex {
  rpc ListEdgeEvents(EdgeIndexListEdgeEventsRequest) returns (EdgeIndexListEdgeEventsResponse);
  rpc GetWorkChannelDetail(EdgeIndexGetWorkChannelDetailRequest) returns (EdgeIndexGetWorkChannelDetailResponse);
 }
-// Canonical proof transport definition, also re-exported as verified_explorer::ProofBundle.
+// Canonical proof transport definition, also re-exported as proof_verify::ProofBundle.
 // Schema-1 proof JSON retains numeric integers/byte arrays, including inside EdgeIndex.
 message EdgeIndexProofBundle {
  uint32 schema_version = 1; string network_id = 2; string trust_sha256 = 3;
@@ -106,16 +106,6 @@ message EdgeIndexGetWorkChannelDetailRequest {
  uint32 schema_version = 4;
 }
 
-message EdgeIndexEdgeLinks {
- string edge = 1;
- optional string channel = 2;
- string maker = 3;
- string taker = 4;
- string opening_transaction = 5;
- string opening_block = 6;
- string evidence = 7;
-}
-
 message EdgeIndexEdgeSummary {
  string edge_id = 1;
  string kind = 2;
@@ -127,7 +117,7 @@ message EdgeIndexEdgeSummary {
  string terms_hash = 8;
  optional string bond_edge_id = 9;
  optional string payment_edge_id = 10;
- EdgeIndexEdgeLinks links = 11;
+ reserved 11; // Hypermedia links: URLs are a client concern, derived from edge_id.
 }
 
 message EdgeIndexListEdgesPage {
@@ -218,24 +208,20 @@ message EdgeIndexRelatedEdges {
  optional string payment_edge_id = 2;
 }
 
-message EdgeIndexEventsLink {
- string href = 1;
-}
-
 message EdgeIndexEdgeDetail {
  EdgeIndexEdgeSummary summary = 1;
  EdgeIndexObjectAnswer object_at_snapshot = 2;
  EdgeIndexOpening opening = 3;
  optional EdgeIndexClosing closing = 4;
  EdgeIndexRelatedEdges related = 5;
- EdgeIndexEventsLink events = 6;
+ reserved 6; // Events link: the events route is derivable from edge_id.
 }
 
 message EdgeIndexEdgeEvent {
  string kind = 1;
  EdgeIndexTransactionRef transaction = 2;
  bytes canonical_transaction = 3;
- string evidence_href = 4;
+ reserved 4; // Evidence link: derivable from edge_id and transaction.payload.
 }
 
 message EdgeIndexEdgeEventsPage {

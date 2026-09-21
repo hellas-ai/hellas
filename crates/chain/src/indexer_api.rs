@@ -5,7 +5,7 @@ use crate::{
     config::Config,
     domain::{Digest, PublicKey},
     follower::{FollowerStatusSink, ingest_finalized_block},
-    verified_explorer::{ExplorerQuery, ExplorerVerifier, PROOF_SCHEMA_VERSION, ProofBundle},
+    proof_verify::{ProofQuery, ProofVerifier, PROOF_SCHEMA_VERSION, ProofBundle},
 };
 use axum::{
     Router,
@@ -63,12 +63,12 @@ pub(crate) fn genesis_leader(genesis: &Genesis) -> OriginResult<PublicKey> {
 
 pub fn run(options: OriginOptions) -> OriginResult<()> {
     if !options.listen.ip().is_loopback() {
-        return Err("private explorer origin must bind to loopback".into());
+        return Err("private indexer api must bind to loopback".into());
     }
     let genesis_json = options
         .genesis_json
         .unwrap_or_else(|| HELLAS_DEVNET_1_JSON.as_bytes().to_vec());
-    let verifier = Arc::new(ExplorerVerifier::with_genesis(
+    let verifier = Arc::new(ProofVerifier::with_genesis(
         options.trust.clone(),
         &genesis_json,
     )?);
@@ -161,7 +161,7 @@ pub fn run(options: OriginOptions) -> OriginResult<()> {
 struct OriginState {
     edge_index: crate::edge_index::EdgeIndex,
     indexer: ChainIndexer,
-    verifier: Arc<ExplorerVerifier>,
+    verifier: Arc<ProofVerifier>,
     network_id: String,
     // This is the only finalized materializer. Its lock spans QMDB finalize,
     // EdgeIndex publication and all current owner-proof reads.
@@ -219,7 +219,7 @@ async fn block(
     answer(
         state,
         query,
-        ExplorerQuery::Block(query),
+        ProofQuery::Block(query),
         default_proof_accept(headers, &uri),
     )
     .await
@@ -233,7 +233,7 @@ async fn payload(
         return failure(StatusCode::BAD_REQUEST, "invalid payload");
     };
     let query = FinalizedBlockQuery::Payload(payload);
-    answer(state, query, ExplorerQuery::Block(query), headers).await
+    answer(state, query, ProofQuery::Block(query), headers).await
 }
 #[derive(Deserialize)]
 struct TransactionQuery {
@@ -270,7 +270,7 @@ async fn transaction(
     answer(
         state,
         FinalizedBlockQuery::Height(height),
-        ExplorerQuery::Transaction(tx),
+        ProofQuery::Transaction(tx),
         default_proof_accept(headers, &uri),
     )
     .await
@@ -425,7 +425,7 @@ fn digest(value: &str) -> Option<Digest> {
 async fn answer(
     state: OriginState,
     lookup: FinalizedBlockQuery,
-    query: ExplorerQuery,
+    query: ProofQuery,
     headers: HeaderMap,
 ) -> Response {
     let Some(protobuf) = representation(&headers) else {
@@ -442,7 +442,7 @@ async fn answer(
     let bundle = proof_bundle(&state, finalized);
     let verified = match state.verifier.verify(bundle, query) {
         Ok(block) => block,
-        Err(crate::verified_explorer::VerificationError::Query) => {
+        Err(crate::proof_verify::VerificationError::Query) => {
             return failure(
                 StatusCode::NOT_FOUND,
                 "transaction is absent from the requested block",
@@ -458,7 +458,7 @@ async fn answer(
     match crate::http_api::encode(
         verified.bundle(),
         protobuf,
-        crate::verified_explorer::MAX_PROOF_BYTES,
+        crate::proof_verify::MAX_PROOF_BYTES,
     ) {
         Ok((content_type, body)) => respond(StatusCode::OK, content_type, body),
         Err(()) => failure(
@@ -511,7 +511,7 @@ async fn index_transactions(state: OriginState) -> OriginResult<()> {
             Some(finalized) => {
                 let verified = state.verifier.verify(
                     proof_bundle(&state, finalized),
-                    ExplorerQuery::Block(FinalizedBlockQuery::Height(height)),
+                    ProofQuery::Block(FinalizedBlockQuery::Height(height)),
                 )?;
                 let block =
                     crate::HellasBlock::decode(verified.bundle().canonical_block.as_slice())?;
@@ -556,7 +556,7 @@ async fn follow_trusted(
         let client = match crate::client::RemoteLightClient::connect(rpc.clone()).await {
             Ok(client) => client,
             Err(error) => {
-                tracing::warn!(%error,"explorer upstream connection failed");
+                tracing::warn!(%error,"indexer upstream connection failed");
                 ::tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 continue;
             }
@@ -581,14 +581,14 @@ async fn follow_trusted(
                         break;
                     }
                     Err(error) => {
-                        tracing::warn!(%error,"explorer upstream disconnected");
+                        tracing::warn!(%error,"indexer upstream disconnected");
                         ::tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                         break 'connection;
                     }
                 };
                 state.verifier.verify(
                     proof_bundle(&state, remote.clone()),
-                    ExplorerQuery::Block(FinalizedBlockQuery::Height(height)),
+                    ProofQuery::Block(FinalizedBlockQuery::Height(height)),
                 )?;
                 ingest_finalized_block(&state.indexer, remote, height, &status).await?;
                 ::tokio::task::yield_now().await;
@@ -797,7 +797,7 @@ mod tests {
                 .ingest_finalized(h.head.clone(), finalization(&h.committee, &h.head))
                 .await
                 .unwrap();
-            let tx = crate::verified_explorer::transaction_digest(&first_block.txs()[0]);
+            let tx = crate::proof_verify::transaction_digest(&first_block.txs()[0]);
             let verifier = Arc::new(h.verifier);
             let state = OriginState {
                 edge_index: h.index.clone(),
@@ -822,12 +822,12 @@ mod tests {
                 assert_eq!(response.status(), StatusCode::OK);
                 let bytes = axum::body::to_bytes(
                     response.into_body(),
-                    crate::verified_explorer::MAX_PROOF_BYTES,
+                    crate::proof_verify::MAX_PROOF_BYTES,
                 )
                 .await
                 .unwrap();
                 let bundle =
-                    <crate::verified_explorer::AddressProofBundle as prost::Message>::decode(bytes)
+                    <crate::proof_verify::AddressProofBundle as prost::Message>::decode(bytes)
                         .unwrap();
                 let verified = verifier.verify_address(bundle, owner, 0, 64).unwrap();
                 assert_eq!(verified.block().view().height(), latest.height);
@@ -937,7 +937,7 @@ mod tests {
                     );
                     let body = axum::body::to_bytes(
                         response.into_body(),
-                        crate::verified_explorer::MAX_PROOF_BYTES,
+                        crate::proof_verify::MAX_PROOF_BYTES,
                     )
                     .await
                     .unwrap();
@@ -947,9 +947,9 @@ mod tests {
                         <ProofBundle as prost::Message>::decode(body).unwrap()
                     };
                     let query = if uri.contains("/transactions/") {
-                        ExplorerQuery::Transaction(tx)
+                        ProofQuery::Transaction(tx)
                     } else {
-                        ExplorerQuery::Block(FinalizedBlockQuery::Height(1))
+                        ProofQuery::Block(FinalizedBlockQuery::Height(1))
                     };
                     assert!(verifier.verify(bundle, query).is_ok());
                 }

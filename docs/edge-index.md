@@ -97,7 +97,7 @@ representation is limited to 8 MiB without encoding the other representation.
 
 The common `hellas_chain::edge_index` types, parser, cursor normalization and
 shared projection checks compile for Wasm. Explorer uses these checks with its
-existing `ExplorerVerifier`; there is no parallel client facade. They check independently
+existing `ProofVerifier`; there is no parallel client facade. They check independently
 trusted block certificates, opening/closing inclusion, canonical terms and edge
 identity, decoded object fields and registry bindings. It returns ordinary
 reported-data types: discovery, current objects and completeness remain
@@ -108,7 +108,7 @@ For deterministic integration fixtures, run:
 
 ```sh
 HELLAS_EDGE_FIXTURE_DIR=/tmp/edge-fixtures cargo test -p hellas-chain \
-  --no-default-features --features explorer-origin --lib native_edge_index
+  --no-default-features --features indexer-api --lib native_edge_index
 ```
 
 `basic/` and `work/` each contain independent `trust.json`, `genesis.json`, a

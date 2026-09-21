@@ -168,10 +168,10 @@ fn descendant_finality_verifies_with_full_and_light_consensus() {
     );
 }
 
-#[cfg(feature = "verified-explorer")]
+#[cfg(feature = "proof-verify")]
 #[test]
 fn descendant_finality_uses_the_certified_height_trust_and_checks_each_epoch() {
-    use crate::verified_explorer::{ExplorerQuery, ExplorerVerifier, ProofBundle};
+    use crate::proof_verify::{ProofQuery, ProofVerifier, ProofBundle};
     use commonware_cryptography::{Hasher as _, Sha256};
     use hellas_genesis::{HELLAS_DEVNET_1_ID, HELLAS_DEVNET_1_JSON, TrustDocument, TrustEpoch};
     let (_, blocks, certificate, identity) = fixture_with_epochs(true);
@@ -194,7 +194,7 @@ fn descendant_finality_uses_the_certified_height_trust_and_checks_each_epoch() {
             },
         ],
     };
-    let verifier = ExplorerVerifier::new(trust.clone()).unwrap();
+    let verifier = ProofVerifier::new(trust.clone()).unwrap();
     let target = &blocks[1];
     let bundle = ProofBundle {
         schema_version: 1,
@@ -208,9 +208,9 @@ fn descendant_finality_uses_the_certified_height_trust_and_checks_each_epoch() {
         observed_at_ms: 0,
         epoch: 1,
     };
-    let query = ExplorerQuery::Block(crate::FinalizedBlockQuery::Height(1));
+    let query = ProofQuery::Block(crate::FinalizedBlockQuery::Height(1));
     verifier.verify(bundle.clone(), query).unwrap();
-    #[cfg(feature = "explorer-origin")]
+    #[cfg(feature = "indexer-api")]
     {
         use commonware_runtime::{Runner as _, deterministic};
         let trust = trust.clone();
@@ -238,7 +238,7 @@ fn descendant_finality_uses_the_certified_height_trust_and_checks_each_epoch() {
     assert!(verifier.verify(wrong_epoch, query).is_err());
     trust.epochs[0].end_height = Some(3);
     trust.epochs[1].start_height = 3;
-    let wrong_schedule = ExplorerVerifier::new(trust).unwrap();
+    let wrong_schedule = ProofVerifier::new(trust).unwrap();
     let mut wrong_bundle = bundle;
     wrong_bundle.trust_sha256 = wrong_schedule.trust_sha256().into();
     // The terminal certificate still belongs to epoch 1 at height 3, but the

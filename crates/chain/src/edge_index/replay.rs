@@ -7,8 +7,8 @@ use crate::{
         ChainVerifier, execute_all_observed,
         store::{UtxoDatabase, UtxoDb, utxo_db_config},
     },
-    verified_explorer::{
-        ExplorerQuery, ExplorerVerifier, ProofBundle, VerifiedAddress, VerifiedBlock,
+    proof_verify::{
+        ProofQuery, ProofVerifier, ProofBundle, VerifiedAddress, VerifiedBlock,
     },
 };
 use commonware_codec::DecodeExt as _;
@@ -34,7 +34,7 @@ impl<E: StorageContext + Spawner + Send + Sync + 'static> Replay<E> {
         network: hellas_kernel::NetworkId,
         allocations: Vec<(SettlementKey, u64)>,
         genesis: HellasBlock,
-        verifier: &ExplorerVerifier,
+        verifier: &ProofVerifier,
     ) -> Result<Self> {
         let config = utxo_db_config(
             &context,
@@ -55,7 +55,7 @@ impl<E: StorageContext + Spawner + Send + Sync + 'static> Replay<E> {
         if let Some(intent) = index.store.intent()? {
             verifier.verify(
                 intent.proof.clone(),
-                ExplorerQuery::Block(FinalizedBlockQuery::Height(intent.proof.height)),
+                ProofQuery::Block(FinalizedBlockQuery::Height(intent.proof.height)),
             )?;
             if hex::encode(root) == intent.proof.state_root {
                 index.store.publish_intent()?;
@@ -107,11 +107,11 @@ impl<E: StorageContext + Spawner + Send + Sync + 'static> Replay<E> {
     async fn check_checkpoint(
         database: &UtxoDatabase<E>,
         proof: &ProofBundle,
-        verifier: &ExplorerVerifier,
+        verifier: &ProofVerifier,
     ) -> Result<VerifiedBlock> {
         let verified = verifier.verify(
             proof.clone(),
-            ExplorerQuery::Block(FinalizedBlockQuery::Height(proof.height)),
+            ProofQuery::Block(FinalizedBlockQuery::Height(proof.height)),
         )?;
         let database = database.read().await;
         let target = <UtxoDb<E> as ManagedDb<E>>::sync_target(&database);

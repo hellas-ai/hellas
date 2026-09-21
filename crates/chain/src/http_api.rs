@@ -3,7 +3,7 @@
 //! Content negotiation, bounded encoding and the response envelope were
 //! written twice: once for the EdgeIndex routes and once for the block,
 //! transaction and address routes. The header triple below appeared three
-//! times. `edge_index::http` also had to reach into `explorer_origin` for
+//! times. `edge_index::http` also had to reach into `indexer_api` for
 //! negotiation, pointing the index module at the server that hosts it.
 //! Both adapters now depend on this instead of on each other.
 use axum::{

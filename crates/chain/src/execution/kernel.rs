@@ -881,7 +881,7 @@ where
 /// Finalized replay with the authoritative kernel object and registry diffs.
 /// Owner metadata remains in the QMDB batch and therefore participates in its root;
 /// the public object projection stores only spendable/edge/registry objects.
-#[cfg(feature = "explorer-origin")]
+#[cfg(feature = "indexer-api")]
 pub(crate) async fn execute_all_observed<E>(
     context: KernelContext,
     verifier: &ChainVerifier,

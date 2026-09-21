@@ -12,13 +12,13 @@ pub mod config;
 mod consensus;
 #[cfg(feature = "domain")]
 pub mod domain;
-#[cfg(feature = "verified-explorer")]
+#[cfg(feature = "proof-verify")]
 pub mod edge_index;
 #[cfg(any(feature = "indexer", feature = "validator"))]
 mod execution;
-#[cfg(feature = "explorer-origin")]
-pub mod explorer_origin;
-#[cfg(feature = "explorer-origin")]
+#[cfg(feature = "indexer-api")]
+pub mod indexer_api;
+#[cfg(feature = "indexer-api")]
 pub(crate) mod http_api;
 #[cfg(feature = "validator")]
 pub mod faucet;
@@ -28,8 +28,8 @@ pub mod finality_proof;
 pub mod follower;
 #[cfg(feature = "domain")]
 pub mod owner_proof;
-#[cfg(feature = "verified-explorer")]
-pub mod verified_explorer;
+#[cfg(feature = "proof-verify")]
+pub mod proof_verify;
 /// The shipped genesis documents and the type that reads them. It is its
 /// own `std` crate because a browser build and the relay in another
 /// repository read the same bytes a validator does; re-exported whole so
