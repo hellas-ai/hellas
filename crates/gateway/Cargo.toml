@@ -9,7 +9,12 @@ documentation.workspace = true
 
 [features]
 default = []
-otel = ["hellas-rpc/otel", "hellas-rpc/http-tracing", "dep:opentelemetry", "dep:tracing-opentelemetry"]
+otel = [
+    "hellas-rpc/otel",
+    "hellas-rpc/http-tracing",
+    "dep:opentelemetry",
+    "dep:tracing-opentelemetry",
+]
 evaluate = [
     "dep:hellas-executor",
     "hellas-executor/evaluate",

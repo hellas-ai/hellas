@@ -50,7 +50,6 @@ work = ["dep:hellas-kernel", "evaluate", "hellas-kernel/secp256k1"]
 
 [dependencies]
 axum = { workspace = true, optional = true }
-http-body = { version = "1", optional = true }
 bytes = { workspace = true }
 ed25519-dalek = { workspace = true }
 futures-core = { workspace = true }
@@ -58,6 +57,7 @@ futures-util = { version = "0.3", default-features = false }
 hellas-kernel = { workspace = true, optional = true }
 hellas-wire = { workspace = true }
 hellas-xet = { workspace = true, features = ["chunking", "serde"] }
+http-body = { version = "1", optional = true }
 k256 = { workspace = true }
 opentelemetry = { workspace = true, optional = true }
 p256 = { workspace = true }
@@ -92,7 +92,6 @@ hellas-wire = { workspace = true, features = ["unix", "ws"] }
 tokio-tungstenite.workspace = true
 
 [dev-dependencies]
-tower = { version = "0.5", features = ["util"] }
 # Real settlement signatures in the paid-work vectors: the kernel's own
 # secp256k1 signer, not a placeholder that proves nothing about the keys
 # a channel actually settles with.
@@ -104,4 +103,5 @@ hellas-wire = { workspace = true, features = ["mux"] }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 tempfile = { workspace = true }
 tokio.workspace = true
+tower = { version = "0.5", features = ["util"] }
 tracing-subscriber = { workspace = true }
