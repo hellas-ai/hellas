@@ -22,7 +22,7 @@
     self
     pkgs
     lib
-    package
-    validatorPackage
     ;
+  package = package.override { otel = true; };
+  validatorPackage = validatorPackage.override { otel = true; };
 })

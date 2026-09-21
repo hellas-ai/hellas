@@ -207,11 +207,13 @@ hellas-cli --software-root gateway \
   --model smollm2-135m
 ```
 
-It binds loopback and shows a fresh bearer credential once on its controlling
-terminal. The Hellas causal-LM backend accepts plain text at
-`/v1/completions` and simple text input at `/v1/responses`. It rejects chat,
-tool, and reasoning structures because no trusted or implicit chat template
-exists. The proxy and attested Fetch Responses backends have their own explicit
+It binds loopback by default. Non-loopback listening requires `--allow-remote`
+and `--bearer-token-file FILE`; the private credential file is created once and
+reused across restarts. Without a file, a fresh credential is shown on the
+controlling terminal. The causal-LM backend accepts plain text at
+`/v1/completions` and `/v1/responses`. Set `--chat-template` to enable the shared
+model adapter for chat, reasoning and tool calls supported by that model.
+The proxy and attested Fetch Responses backends have their own explicit
 semantics. `--responses-backend` changes only `/v1/responses`; every other
 route remains bound to the causal-LM environment, so `--environment` and
 `--tokenizer` are still required.
@@ -557,3 +559,45 @@ cargo audit                # security advisories
 cargo outdated --workspace --root-deps-only  # outdated deps
 cargo update --workspace   # update Cargo.lock
 ```
+
+### Optional OpenTelemetry
+
+The `otel` Cargo feature is opt-in across the CLI (including Fetch, node,
+gateway, indexer and validator commands). Default Nix packages, including
+public musl builds, omit the telemetry SDK/exporters. Request instrumentation
+uses shared enabled/no-op implementations; ordinary operational logs remain.
+Commonware is pinned to our four-file optional-telemetry patch so it does not
+silently pull a second SDK into these builds.
+
+The exported NixOS, nix-darwin and Home Manager modules share `otel` options:
+
+```nix
+# NixOS node and gateway:
+services.hellas.otel = {
+  enable = true;
+  collectorEndpoint = "http://127.0.0.1:4318";
+  sampleRate = 1.0;
+};
+# nix-darwin CLI or Home Manager CLI (including Darwin's launchd agent):
+programs.hellas.otel.collectorEndpoint = "http://127.0.0.1:4318";
+# Validator clusters use services.hellas-chain-validators.<name>.otel.
+```
+
+A configured endpoint enables the feature on the module's default package;
+`otel.enable = false` explicitly selects the build without telemetry. Custom
+packages remain the caller's choice. `collectorEndpoint` is the standard OTLP
+HTTP/protobuf base URL for traces and metrics; the existing `endpoint` option
+continues to accept an exact trace URL. Home Manager and nix-darwin scope
+variables to `hellas-cli`, rather than enabling unrelated applications.
+Home Manager's `programs.hellas.serve` supplies the Darwin user service.
+Direct package users can use `cli.override { otel = true; }` (also
+`cli-catena` and `cli-validator`) and the standard `OTEL_*` environment variables.
+
+One CLI SDK lifecycle owns traces and metrics, including validators. Native
+operations follow the GenAI Development conventions at
+`c88d504ab3d9879f8e50d3cc87e69775e11db234`; these conventions are still evolving.
+Hellas-specific work/payment metadata uses `hellas.*`, with W3C TraceContext
+in RPC metadata and HTTP headers. Prompts, model output, tool arguments and
+credentials are not recorded. Log events stay in the local log sinks, rather
+than being duplicated into OTLP. Normal shutdown flushes both providers;
+existing forced-exit paths cannot guarantee a final flush.
