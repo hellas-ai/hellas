@@ -309,17 +309,35 @@ pub async fn load_gateway_backend(
             Some(RECOVERY_ATTEMPT_TIMEOUT),
         );
         let provider = provider.clone();
-        gateway.followers.lock().expect("paid followers poisoned").push(tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(1));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                interval.tick().await;
-                let mut session = provider.serial.lock().await;
-                if let Some(session) = session.as_mut() && let Err(error) = session.follow_chain().await {
-                    tracing::warn!(provider = %provider.args.provider, %error, "paid channel chain follower will retry");
+        gateway
+            .followers
+            .lock()
+            .expect("paid followers poisoned")
+            .push(tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(1));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                let mut reported_failure = false;
+                loop {
+                    interval.tick().await;
+                    let result = {
+                        let mut session = provider.serial.lock().await;
+                        if let Some(session) = session.as_mut() {
+                            session.follow_chain().await
+                        } else {
+                            Ok(())
+                        }
+                    };
+                    match result {
+                        Ok(()) => reported_failure = false,
+                        Err(error) if !reported_failure => {
+                            reported_failure = true;
+                            tracing::warn!(provider = %provider.args.provider, %error,
+                            "paid channel chain follower will retry");
+                        }
+                        Err(_) => {}
+                    }
                 }
-            }
-        }));
+            }));
     }
     Ok(gateway)
 }
@@ -396,8 +414,13 @@ impl PaidGateway {
                             }
                             Err(error) => {
                                 provider.connection_failed();
-                                tracing::warn!(provider = %provider.args.provider, error = %format!("{error:#}"),
-                                    "paid provider channel could not be opened");
+                                if recovery {
+                                    tracing::debug!(provider = %provider.args.provider, error = %format!("{error:#}"),
+                                        "retained paid-work recovery could not open its channel");
+                                } else {
+                                    tracing::warn!(provider = %provider.args.provider, error = %format!("{error:#}"),
+                                        "paid provider channel could not be opened");
+                                }
                                 provider_errors.push(format!("{}: {error:#}", provider.args.provider));
                                 continue;
                             }
@@ -449,6 +472,12 @@ impl PaidGateway {
                         .map(Option::unwrap_or_default);
                     if let Err(error) = &result {
                         provider.cache.lock().expect("provider cache poisoned").replace(None);
+                        if recovery {
+                            provider.connection_failed();
+                            return result.with_context(|| {
+                                format!("retained paid work at provider {}", provider.args.provider)
+                            });
+                        }
                         // A failed journal append can leave a durable proposal that
                         // is not reflected in memory yet. Keep that failure with
                         // this provider, just like a proposal with no response.
