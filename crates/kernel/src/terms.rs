@@ -263,6 +263,15 @@ impl Terms {
         }
     }
 
+    /// Returns the protocol code committed by basic bilateral terms.
+    #[must_use]
+    pub const fn basic_protocol(&self) -> Option<ProtocolCode> {
+        match &self.body {
+            TermsBody::Basic { protocol, .. } => Some(*protocol),
+            TermsBody::WorkPayment(_) | TermsBody::WorkStakeBond(_) => None,
+        }
+    }
+
     /// Returns the committed parties.
     #[must_use]
     pub const fn parties(&self) -> Parties {

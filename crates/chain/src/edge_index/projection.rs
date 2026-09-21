@@ -631,14 +631,7 @@ fn bond_terms(bond: &kernel::WorkStakeBondTerms) -> WorkStakeBondTerms {
 pub fn public_terms(terms: &kernel::Terms) -> Result<PublicTerms, ProjectionError> {
     let projection = match terms.profile() {
         TermsProfile::Basic => {
-            // Terms currently exposes its basic protocol only in the canonical encoding.
-            // Decode that field with the kernel codec after the envelope and known basic tag.
-            let bytes = canonical_bytes(terms);
-            let offset = 3; // two-byte canonical envelope followed by the basic variant tag
-            let (protocol, _) = kernel::ProtocolCode::decode(
-                bytes.get(offset..).ok_or(ProjectionError::Unsupported)?,
-            )
-            .map_err(|_| ProjectionError::Unsupported)?;
+            let protocol = terms.basic_protocol().ok_or(ProjectionError::Unsupported)?;
             TermsKind::Basic(BasicTerms {
                 protocol: u32::from(protocol.get()),
                 maker: terms.parties().maker().as_bytes().to_vec(),
