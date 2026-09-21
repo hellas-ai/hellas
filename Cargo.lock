@@ -226,7 +226,7 @@ checksum = "c7c24de15d275a1ecfd47a380fb4d5ec9bfe0933f309ed5e705b775596a3574d"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn",
 ]
 
 [[package]]
@@ -237,7 +237,7 @@ checksum = "9035ad2d096bed7955a320ee7e2230574d28fd3c3a0f186cbea1ff3c7eed5dbb"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn",
 ]
 
 [[package]]
@@ -595,7 +595,7 @@ dependencies = [
 [[package]]
 name = "catena-lang"
 version = "0.1.0"
-source = "git+ssh://git@github.com/georgewhewell/exploratory-catena.git?rev=ed5eca3148c3e31234fe2fe7620c9d0363903f38#ed5eca3148c3e31234fe2fe7620c9d0363903f38"
+source = "git+https://github.com/hellas-ai/catena-lang?rev=eb2ae44bd4c165cbd442fcd0cbba2af7587163df#eb2ae44bd4c165cbd442fcd0cbba2af7587163df"
 dependencies = [
  "anyhow",
  "clap",
@@ -606,7 +606,6 @@ dependencies = [
  "memmap2",
  "metacat",
  "open-hypergraphs",
- "open-hypergraphs-dot",
  "postcard",
  "rustix",
  "serde",
@@ -799,7 +798,7 @@ dependencies = [
  "heck",
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn",
 ]
 
 [[package]]
@@ -851,7 +850,7 @@ dependencies = [
 [[package]]
 name = "commonware-actor"
 version = "2026.7.0"
-source = "git+https://github.com/georgewhewell/commonware-monorepo?rev=4da2958e095dbff2236091e7294f6890806dc800#4da2958e095dbff2236091e7294f6890806dc800"
+source = "git+https://github.com/commonwarexyz/monorepo?rev=4c3ebe4274d908557d91b637240e8b93609fb32f#4c3ebe4274d908557d91b637240e8b93609fb32f"
 dependencies = [
  "cfg-if 1.0.4",
  "commonware-macros",
@@ -864,7 +863,7 @@ dependencies = [
 [[package]]
 name = "commonware-broadcast"
 version = "2026.7.0"
-source = "git+https://github.com/georgewhewell/commonware-monorepo?rev=4da2958e095dbff2236091e7294f6890806dc800#4da2958e095dbff2236091e7294f6890806dc800"
+source = "git+https://github.com/commonwarexyz/monorepo?rev=4c3ebe4274d908557d91b637240e8b93609fb32f#4c3ebe4274d908557d91b637240e8b93609fb32f"
 dependencies = [
  "commonware-actor",
  "commonware-codec",
@@ -880,7 +879,7 @@ dependencies = [
 [[package]]
 name = "commonware-codec"
 version = "2026.7.0"
-source = "git+https://github.com/georgewhewell/commonware-monorepo?rev=4da2958e095dbff2236091e7294f6890806dc800#4da2958e095dbff2236091e7294f6890806dc800"
+source = "git+https://github.com/commonwarexyz/monorepo?rev=4c3ebe4274d908557d91b637240e8b93609fb32f#4c3ebe4274d908557d91b637240e8b93609fb32f"
 dependencies = [
  "bytes",
  "cfg-if 1.0.4",
@@ -894,18 +893,18 @@ dependencies = [
 [[package]]
 name = "commonware-codec-macros"
 version = "2026.7.0"
-source = "git+https://github.com/georgewhewell/commonware-monorepo?rev=4da2958e095dbff2236091e7294f6890806dc800#4da2958e095dbff2236091e7294f6890806dc800"
+source = "git+https://github.com/commonwarexyz/monorepo?rev=4c3ebe4274d908557d91b637240e8b93609fb32f#4c3ebe4274d908557d91b637240e8b93609fb32f"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn",
 ]
 
 [[package]]
 name = "commonware-coding"
 version = "2026.7.0"
-source = "git+https://github.com/georgewhewell/commonware-monorepo?rev=4da2958e095dbff2236091e7294f6890806dc800#4da2958e095dbff2236091e7294f6890806dc800"
+source = "git+https://github.com/commonwarexyz/monorepo?rev=4c3ebe4274d908557d91b637240e8b93609fb32f#4c3ebe4274d908557d91b637240e8b93609fb32f"
 dependencies = [
  "bytes",
  "commonware-codec",
@@ -923,7 +922,7 @@ dependencies = [
 [[package]]
 name = "commonware-consensus"
 version = "2026.7.0"
-source = "git+https://github.com/georgewhewell/commonware-monorepo?rev=4da2958e095dbff2236091e7294f6890806dc800#4da2958e095dbff2236091e7294f6890806dc800"
+source = "git+https://github.com/commonwarexyz/monorepo?rev=4c3ebe4274d908557d91b637240e8b93609fb32f#4c3ebe4274d908557d91b637240e8b93609fb32f"
 dependencies = [
  "bytes",
  "cfg-if 1.0.4",
@@ -954,7 +953,7 @@ dependencies = [
 [[package]]
 name = "commonware-cryptography"
 version = "2026.7.0"
-source = "git+https://github.com/georgewhewell/commonware-monorepo?rev=4da2958e095dbff2236091e7294f6890806dc800#4da2958e095dbff2236091e7294f6890806dc800"
+source = "git+https://github.com/commonwarexyz/monorepo?rev=4c3ebe4274d908557d91b637240e8b93609fb32f#4c3ebe4274d908557d91b637240e8b93609fb32f"
 dependencies = [
  "ahash",
  "anyhow",
@@ -995,7 +994,7 @@ dependencies = [
 [[package]]
 name = "commonware-formatting"
 version = "2026.7.0"
-source = "git+https://github.com/georgewhewell/commonware-monorepo?rev=4da2958e095dbff2236091e7294f6890806dc800#4da2958e095dbff2236091e7294f6890806dc800"
+source = "git+https://github.com/commonwarexyz/monorepo?rev=4c3ebe4274d908557d91b637240e8b93609fb32f#4c3ebe4274d908557d91b637240e8b93609fb32f"
 dependencies = [
  "commonware-macros",
  "const-hex",
@@ -1004,7 +1003,7 @@ dependencies = [
 [[package]]
 name = "commonware-glue"
 version = "2026.7.0"
-source = "git+https://github.com/georgewhewell/commonware-monorepo?rev=4da2958e095dbff2236091e7294f6890806dc800#4da2958e095dbff2236091e7294f6890806dc800"
+source = "git+https://github.com/commonwarexyz/monorepo?rev=4c3ebe4274d908557d91b637240e8b93609fb32f#4c3ebe4274d908557d91b637240e8b93609fb32f"
 dependencies = [
  "bytes",
  "commonware-actor",
@@ -1028,7 +1027,7 @@ dependencies = [
 [[package]]
 name = "commonware-macros"
 version = "2026.7.0"
-source = "git+https://github.com/georgewhewell/commonware-monorepo?rev=4da2958e095dbff2236091e7294f6890806dc800#4da2958e095dbff2236091e7294f6890806dc800"
+source = "git+https://github.com/commonwarexyz/monorepo?rev=4c3ebe4274d908557d91b637240e8b93609fb32f#4c3ebe4274d908557d91b637240e8b93609fb32f"
 dependencies = [
  "commonware-macros-impl",
  "tokio",
@@ -1037,19 +1036,19 @@ dependencies = [
 [[package]]
 name = "commonware-macros-impl"
 version = "2026.7.0"
-source = "git+https://github.com/georgewhewell/commonware-monorepo?rev=4da2958e095dbff2236091e7294f6890806dc800#4da2958e095dbff2236091e7294f6890806dc800"
+source = "git+https://github.com/commonwarexyz/monorepo?rev=4c3ebe4274d908557d91b637240e8b93609fb32f#4c3ebe4274d908557d91b637240e8b93609fb32f"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn",
  "toml",
 ]
 
 [[package]]
 name = "commonware-math"
 version = "2026.7.0"
-source = "git+https://github.com/georgewhewell/commonware-monorepo?rev=4da2958e095dbff2236091e7294f6890806dc800#4da2958e095dbff2236091e7294f6890806dc800"
+source = "git+https://github.com/commonwarexyz/monorepo?rev=4c3ebe4274d908557d91b637240e8b93609fb32f#4c3ebe4274d908557d91b637240e8b93609fb32f"
 dependencies = [
  "bytes",
  "commonware-codec",
@@ -1062,7 +1061,7 @@ dependencies = [
 [[package]]
 name = "commonware-p2p"
 version = "2026.7.0"
-source = "git+https://github.com/georgewhewell/commonware-monorepo?rev=4da2958e095dbff2236091e7294f6890806dc800#4da2958e095dbff2236091e7294f6890806dc800"
+source = "git+https://github.com/commonwarexyz/monorepo?rev=4c3ebe4274d908557d91b637240e8b93609fb32f#4c3ebe4274d908557d91b637240e8b93609fb32f"
 dependencies = [
  "commonware-actor",
  "commonware-codec",
@@ -1088,7 +1087,7 @@ dependencies = [
 [[package]]
 name = "commonware-parallel"
 version = "2026.7.0"
-source = "git+https://github.com/georgewhewell/commonware-monorepo?rev=4da2958e095dbff2236091e7294f6890806dc800#4da2958e095dbff2236091e7294f6890806dc800"
+source = "git+https://github.com/commonwarexyz/monorepo?rev=4c3ebe4274d908557d91b637240e8b93609fb32f#4c3ebe4274d908557d91b637240e8b93609fb32f"
 dependencies = [
  "cfg-if 1.0.4",
  "commonware-macros",
@@ -1100,7 +1099,7 @@ dependencies = [
 [[package]]
 name = "commonware-resolver"
 version = "2026.7.0"
-source = "git+https://github.com/georgewhewell/commonware-monorepo?rev=4da2958e095dbff2236091e7294f6890806dc800#4da2958e095dbff2236091e7294f6890806dc800"
+source = "git+https://github.com/commonwarexyz/monorepo?rev=4c3ebe4274d908557d91b637240e8b93609fb32f#4c3ebe4274d908557d91b637240e8b93609fb32f"
 dependencies = [
  "bytes",
  "commonware-actor",
@@ -1121,7 +1120,7 @@ dependencies = [
 [[package]]
 name = "commonware-runtime"
 version = "2026.7.0"
-source = "git+https://github.com/georgewhewell/commonware-monorepo?rev=4da2958e095dbff2236091e7294f6890806dc800#4da2958e095dbff2236091e7294f6890806dc800"
+source = "git+https://github.com/commonwarexyz/monorepo?rev=4c3ebe4274d908557d91b637240e8b93609fb32f#4c3ebe4274d908557d91b637240e8b93609fb32f"
 dependencies = [
  "ahash",
  "axum",
@@ -1141,6 +1140,9 @@ dependencies = [
  "getrandom 0.4.3",
  "governor",
  "libc",
+ "opentelemetry 0.32.0",
+ "opentelemetry-otlp 0.32.0",
+ "opentelemetry_sdk 0.32.1",
  "prometheus-client",
  "rand 0.10.2",
  "rand_core 0.10.1",
@@ -1150,24 +1152,25 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "tracing-opentelemetry 0.33.0",
  "tracing-subscriber",
 ]
 
 [[package]]
 name = "commonware-runtime-macros"
 version = "2026.7.0"
-source = "git+https://github.com/georgewhewell/commonware-monorepo?rev=4da2958e095dbff2236091e7294f6890806dc800#4da2958e095dbff2236091e7294f6890806dc800"
+source = "git+https://github.com/commonwarexyz/monorepo?rev=4c3ebe4274d908557d91b637240e8b93609fb32f#4c3ebe4274d908557d91b637240e8b93609fb32f"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn",
 ]
 
 [[package]]
 name = "commonware-storage"
 version = "2026.7.0"
-source = "git+https://github.com/georgewhewell/commonware-monorepo?rev=4da2958e095dbff2236091e7294f6890806dc800#4da2958e095dbff2236091e7294f6890806dc800"
+source = "git+https://github.com/commonwarexyz/monorepo?rev=4c3ebe4274d908557d91b637240e8b93609fb32f#4c3ebe4274d908557d91b637240e8b93609fb32f"
 dependencies = [
  "ahash",
  "anyhow",
@@ -1191,7 +1194,7 @@ dependencies = [
 [[package]]
 name = "commonware-stream"
 version = "2026.7.0"
-source = "git+https://github.com/georgewhewell/commonware-monorepo?rev=4da2958e095dbff2236091e7294f6890806dc800#4da2958e095dbff2236091e7294f6890806dc800"
+source = "git+https://github.com/commonwarexyz/monorepo?rev=4c3ebe4274d908557d91b637240e8b93609fb32f#4c3ebe4274d908557d91b637240e8b93609fb32f"
 dependencies = [
  "chacha20poly1305",
  "commonware-codec",
@@ -1210,7 +1213,7 @@ dependencies = [
 [[package]]
 name = "commonware-utils"
 version = "2026.7.0"
-source = "git+https://github.com/georgewhewell/commonware-monorepo?rev=4da2958e095dbff2236091e7294f6890806dc800#4da2958e095dbff2236091e7294f6890806dc800"
+source = "git+https://github.com/commonwarexyz/monorepo?rev=4c3ebe4274d908557d91b637240e8b93609fb32f#4c3ebe4274d908557d91b637240e8b93609fb32f"
 dependencies = [
  "ahash",
  "bytes",
@@ -1565,7 +1568,7 @@ checksum = "f46882e17999c6cc590af592290432be3bce0428cb0d5f8b6715e4dc7b383eb3"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn",
 ]
 
 [[package]]
@@ -1599,7 +1602,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "strsim",
- "syn 2.0.119",
+ "syn",
 ]
 
 [[package]]
@@ -1612,7 +1615,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "strsim",
- "syn 2.0.119",
+ "syn",
 ]
 
 [[package]]
@@ -1623,7 +1626,7 @@ checksum = "fc34b93ccb385b40dc71c6fceac4b2ad23662c7eeb248cf10d529b7e055b6ead"
 dependencies = [
  "darling_core 0.20.11",
  "quote",
- "syn 2.0.119",
+ "syn",
 ]
 
 [[package]]
@@ -1634,7 +1637,7 @@ checksum = "ac3984ec7bd6cfa798e62b4a642426a5be0e68f9401cfc2a01e3fa9ea2fcdb8d"
 dependencies = [
  "darling_core 0.23.0",
  "quote",
- "syn 2.0.119",
+ "syn",
 ]
 
 [[package]]
@@ -1704,7 +1707,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccc2776f0c61eca1ca32528f85548abd1a4be8fb53d1b21c013e4f18da1e7090"
 dependencies = [
  "data-encoding",
- "syn 2.0.119",
+ "syn",
 ]
 
 [[package]]
@@ -1738,7 +1741,7 @@ checksum = "8034092389675178f570469e6c3b0465d3d30b4505c294a6550db47f3c17ad18"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn",
 ]
 
 [[package]]
@@ -1768,7 +1771,7 @@ dependencies = [
  "darling 0.20.11",
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn",
 ]
 
 [[package]]
@@ -1778,7 +1781,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ab63b0e2bf4d5928aff72e83a7dace85d7bba5fe12dcc3c5a572d78caffd3f3c"
 dependencies = [
  "derive_builder_core",
- "syn 2.0.119",
+ "syn",
 ]
 
 [[package]]
@@ -1800,7 +1803,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "rustc_version",
- "syn 2.0.119",
+ "syn",
  "unicode-xid",
 ]
 
@@ -1875,7 +1878,7 @@ checksum = "1ac70aa55017e108007fbaf5aa0f54b021c98f92ff8af59d42eda9da96e3dd4f"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn",
 ]
 
 [[package]]
@@ -1897,21 +1900,6 @@ checksum = "d4b8a88685455ed29a21542a33abd9cb6510b6b129abadabdcef0f4c55bc8f61"
 dependencies = [
  "litrs",
 ]
-
-[[package]]
-name = "dot-generator"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0aaac7ada45f71873ebce336491d1c1bc4a7c8042c7cea978168ad59e805b871"
-dependencies = [
- "dot-structures",
-]
-
-[[package]]
-name = "dot-structures"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "498cfcded997a93eb31edd639361fa33fd229a8784e953b37d71035fe3890b7b"
 
 [[package]]
 name = "dtoa"
@@ -2061,7 +2049,7 @@ checksum = "3ed8956bd5c1f0415200516e78ff07ec9e16415ade83c056c230d7b7ea0d55b7"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn",
 ]
 
 [[package]]
@@ -2294,7 +2282,7 @@ checksum = "e835b70203e41293343137df5c0664546da5745f82ec9b84d40be8336958447b"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn",
 ]
 
 [[package]]
@@ -2457,21 +2445,6 @@ dependencies = [
  "smallvec",
  "spinning_top",
  "web-time",
-]
-
-[[package]]
-name = "graphviz-rust"
-version = "0.9.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d50c23bbf5cea2a6d93e3602d3cd6688dc97dbb882a3d18a5f74ba0970d43ad"
-dependencies = [
- "dot-generator",
- "dot-structures",
- "into-attr",
- "into-attr-derive",
- "pest",
- "pest_derive",
- "tempfile",
 ]
 
 [[package]]
@@ -2689,9 +2662,9 @@ dependencies = [
  "iroh-mdns-address-lookup",
  "iroh-metrics",
  "libc",
- "opentelemetry",
- "opentelemetry-otlp",
- "opentelemetry_sdk",
+ "opentelemetry 0.31.0",
+ "opentelemetry-otlp 0.31.1",
+ "opentelemetry_sdk 0.31.0",
  "p256",
  "prometheus-client",
  "qrcode",
@@ -2707,7 +2680,7 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
- "tracing-opentelemetry",
+ "tracing-opentelemetry 0.32.1",
  "tracing-subscriber",
 ]
 
@@ -2760,8 +2733,8 @@ dependencies = [
  "hellas-wire",
  "hellas-work",
  "libc",
- "opentelemetry",
- "opentelemetry_sdk",
+ "opentelemetry 0.31.0",
+ "opentelemetry_sdk 0.31.0",
  "prometheus-client",
  "rand 0.10.2",
  "serde",
@@ -2771,7 +2744,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tracing",
- "tracing-opentelemetry",
+ "tracing-opentelemetry 0.32.1",
  "tracing-subscriber",
  "uuid",
  "zeroize",
@@ -2795,7 +2768,7 @@ dependencies = [
  "http-body",
  "iroh",
  "libc",
- "opentelemetry",
+ "opentelemetry 0.31.0",
  "prometheus-client",
  "rand 0.10.2",
  "reqwest 0.13.1",
@@ -2806,7 +2779,7 @@ dependencies = [
  "tokio",
  "tower",
  "tracing",
- "tracing-opentelemetry",
+ "tracing-opentelemetry 0.32.1",
 ]
 
 [[package]]
@@ -2865,14 +2838,14 @@ dependencies = [
  "hellas-executor",
  "hellas-rpc",
  "hellas-wire",
- "opentelemetry",
- "opentelemetry_sdk",
+ "opentelemetry 0.31.0",
+ "opentelemetry_sdk 0.31.0",
  "reqwest 0.13.1",
  "serde",
  "serde_json",
  "tokio",
  "tracing",
- "tracing-opentelemetry",
+ "tracing-opentelemetry 0.32.1",
  "tracing-subscriber",
 ]
 
@@ -2889,8 +2862,8 @@ dependencies = [
  "hellas-wire",
  "hellas-xet",
  "k256",
- "opentelemetry",
- "opentelemetry_sdk",
+ "opentelemetry 0.31.0",
+ "opentelemetry_sdk 0.31.0",
  "p256",
  "prettyplease",
  "proc-macro2",
@@ -2904,13 +2877,13 @@ dependencies = [
  "serde_ipld_dagcbor",
  "serde_json",
  "smol_str 0.3.6",
- "syn 2.0.119",
+ "syn",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-tungstenite",
  "tracing",
- "tracing-opentelemetry",
+ "tracing-opentelemetry 0.32.1",
  "tracing-subscriber",
  "web-time",
 ]
@@ -3469,28 +3442,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "into-attr"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "18b48c537e49a709e678caec3753a7dba6854661a1eaa27675024283b3f8b376"
-dependencies = [
- "dot-structures",
-]
-
-[[package]]
-name = "into-attr-derive"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ecac7c1ae6cd2c6a3a64d1061a8bdc7f52ff62c26a831a2301e54c1b5d70d5b1"
-dependencies = [
- "dot-generator",
- "dot-structures",
- "into-attr",
- "quote",
- "syn 1.0.109",
-]
-
-[[package]]
 name = "ipconfig"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3661,7 +3612,7 @@ dependencies = [
  "heck",
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn",
 ]
 
 [[package]]
@@ -3794,7 +3745,7 @@ dependencies = [
  "quote",
  "rustc_version",
  "simd_cesu8",
- "syn 2.0.119",
+ "syn",
 ]
 
 [[package]]
@@ -3822,7 +3773,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "38c0b942f458fe50cdac086d2f946512305e5631e720728f2a61aabcd47a6264"
 dependencies = [
  "quote",
- "syn 2.0.119",
+ "syn",
 ]
 
 [[package]]
@@ -4007,7 +3958,7 @@ dependencies = [
  "quote",
  "regex-syntax",
  "rustc_version",
- "syn 2.0.119",
+ "syn",
 ]
 
 [[package]]
@@ -4021,7 +3972,7 @@ dependencies = [
  "quote",
  "regex-automata",
  "regex-syntax",
- "syn 2.0.119",
+ "syn",
 ]
 
 [[package]]
@@ -4137,7 +4088,7 @@ checksum = "757aee279b8bdbb9f9e676796fd459e4207a1f986e87886700abf589f5abf771"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn",
 ]
 
 [[package]]
@@ -4200,7 +4151,7 @@ checksum = "db5b29714e950dbb20d5e6f74f9dcec4edbcc1067bb7f8ed198c097b8c1a818b"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn",
 ]
 
 [[package]]
@@ -4262,7 +4213,7 @@ checksum = "e4db6d5580af57bf992f59068d4ea26fd518574ff48d7639b255a36f9de6e7e9"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn",
 ]
 
 [[package]]
@@ -4312,7 +4263,7 @@ checksum = "e2acd8b070213b0299282f884b4beba4e7b52d624fdcd504a3ad3665390c11e1"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn",
 ]
 
 [[package]]
@@ -4696,7 +4647,7 @@ dependencies = [
  "proc-macro-crate",
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn",
 ]
 
 [[package]]
@@ -4870,17 +4821,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "open-hypergraphs-dot"
-version = "0.2.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf800a0036834718dcd70c606745afdaa93e8fb80828806341bbf8454cc76c0f"
-dependencies = [
- "dot-structures",
- "graphviz-rust",
- "open-hypergraphs",
-]
-
-[[package]]
 name = "openssl-probe"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4901,6 +4841,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "opentelemetry"
+version = "0.32.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b0142c63252a9e054e68a4c61a5778f7b14f576274d593f8ce883d191a099682"
+dependencies = [
+ "futures-core",
+ "futures-sink",
+ "js-sys",
+ "pin-project-lite",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "opentelemetry-http"
 version = "0.31.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4909,8 +4863,21 @@ dependencies = [
  "async-trait",
  "bytes",
  "http",
- "opentelemetry",
+ "opentelemetry 0.31.0",
  "reqwest 0.12.28",
+]
+
+[[package]]
+name = "opentelemetry-http"
+version = "0.32.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5683015d09e2df236ef005b17f6f196f0d5f6313c4fa43a7b6a53b52776e4331"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "http",
+ "opentelemetry 0.32.0",
+ "reqwest 0.13.1",
 ]
 
 [[package]]
@@ -4920,12 +4887,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1f69cd6acbb9af919df949cd1ec9e5e7fdc2ef15d234b6b795aaa525cc02f71f"
 dependencies = [
  "http",
- "opentelemetry",
- "opentelemetry-http",
- "opentelemetry-proto",
- "opentelemetry_sdk",
+ "opentelemetry 0.31.0",
+ "opentelemetry-http 0.31.0",
+ "opentelemetry-proto 0.31.0",
+ "opentelemetry_sdk 0.31.0",
  "prost",
  "reqwest 0.12.28",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "opentelemetry-otlp"
+version = "0.32.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9966929966d17620d7c316c643ba62631826e10021409357772d5eea84f62c35"
+dependencies = [
+ "http",
+ "opentelemetry 0.32.0",
+ "opentelemetry-http 0.32.0",
+ "opentelemetry-proto 0.32.0",
+ "opentelemetry_sdk 0.32.1",
+ "prost",
+ "reqwest 0.13.1",
  "thiserror 2.0.18",
 ]
 
@@ -4935,11 +4918,22 @@ version = "0.31.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a7175df06de5eaee9909d4805a3d07e28bb752c34cab57fa9cff549da596b30f"
 dependencies = [
- "opentelemetry",
- "opentelemetry_sdk",
+ "opentelemetry 0.31.0",
+ "opentelemetry_sdk 0.31.0",
  "prost",
  "tonic",
  "tonic-prost",
+]
+
+[[package]]
+name = "opentelemetry-proto"
+version = "0.32.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "56d658ba1faf63f7b9c492cfbe6e0ec365440a16132d3270c1065f7b33f1b638"
+dependencies = [
+ "opentelemetry 0.32.0",
+ "opentelemetry_sdk 0.32.1",
+ "prost",
 ]
 
 [[package]]
@@ -4951,8 +4945,26 @@ dependencies = [
  "futures-channel",
  "futures-executor",
  "futures-util",
- "opentelemetry",
+ "opentelemetry 0.31.0",
  "percent-encoding",
+ "rand 0.9.4",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+]
+
+[[package]]
+name = "opentelemetry_sdk"
+version = "0.32.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9b59f80e1ac4d5ff7a2db8fb6c80badb7f0f3f858211fba08dd9aaec750894f9"
+dependencies = [
+ "futures-channel",
+ "futures-executor",
+ "futures-util",
+ "opentelemetry 0.32.0",
+ "percent-encoding",
+ "portable-atomic",
  "rand 0.9.4",
  "thiserror 2.0.18",
  "tokio",
@@ -5084,7 +5096,7 @@ dependencies = [
  "pest_meta",
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn",
 ]
 
 [[package]]
@@ -5134,7 +5146,7 @@ checksum = "c96395f0a926bc13b1c17622aaddda1ecb55d49c8f1bf9777e4d877800a43f8b"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn",
 ]
 
 [[package]]
@@ -5291,7 +5303,7 @@ checksum = "e0232bd009a197ceec9cc881ba46f727fcd8060a2d8d6a9dde7a69030a6fe2bb"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn",
 ]
 
 [[package]]
@@ -5336,7 +5348,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "479ca8adacdd7ce8f1fb39ce9ecccbfe93a3f1344b3d0d97f20bc0196208f62b"
 dependencies = [
  "proc-macro2",
- "syn 2.0.119",
+ "syn",
 ]
 
 [[package]]
@@ -5404,7 +5416,7 @@ checksum = "9adf1691c04c0a5ff46ff8f262b58beb07b0dbb61f96f9f54f6cbd82106ed87f"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn",
 ]
 
 [[package]]
@@ -5460,7 +5472,7 @@ dependencies = [
  "prost",
  "prost-types",
  "regex",
- "syn 2.0.119",
+ "syn",
  "tempfile",
 ]
 
@@ -5474,7 +5486,7 @@ dependencies = [
  "itertools 0.14.0",
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn",
 ]
 
 [[package]]
@@ -5818,7 +5830,7 @@ checksum = "b7186006dcb21920990093f30e3dea63b7d6e977bf1256be20c3563a5db070da"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn",
 ]
 
 [[package]]
@@ -5913,6 +5925,7 @@ checksum = "04e9018c9d814e5f30cc16a0f03271aeab3571e609612d9fe78c1aa8d11c2f62"
 dependencies = [
  "base64 0.22.1",
  "bytes",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "http",
@@ -6307,7 +6320,7 @@ checksum = "d540f220d3187173da220f885ab66608367b6574e925011a9353e4badda91d79"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn",
 ]
 
 [[package]]
@@ -6396,7 +6409,7 @@ dependencies = [
  "darling 0.23.0",
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn",
 ]
 
 [[package]]
@@ -6570,7 +6583,7 @@ checksum = "c87e960f4dca2788eeb86bbdde8dd246be8948790b7618d656e68f9b720a86e8"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn",
 ]
 
 [[package]]
@@ -6685,7 +6698,7 @@ dependencies = [
  "heck",
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn",
 ]
 
 [[package]]
@@ -6707,17 +6720,6 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
-]
-
-[[package]]
-name = "syn"
-version = "1.0.109"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72b64191b275b66ffe2469e8af2c1cfe3bafa67b529ead792a6d0160888b4237"
-dependencies = [
- "proc-macro2",
- "quote",
- "unicode-ident",
 ]
 
 [[package]]
@@ -6748,7 +6750,7 @@ checksum = "728a70f3dbaf5bab7f0c4b1ac8d7ae5ea60a4b5549c8a5914361c99147a709d2"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn",
 ]
 
 [[package]]
@@ -6832,7 +6834,7 @@ checksum = "4fee6c4efc90059e10f81e6d42c60a18f76588c3d74cb83a0b242a2b6c7504c1"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn",
 ]
 
 [[package]]
@@ -6843,7 +6845,7 @@ checksum = "ebc4ee7f67670e9b64d05fa4253e753e016c6c95ff35b89b7941d6b856dec1d5"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn",
 ]
 
 [[package]]
@@ -7000,7 +7002,7 @@ checksum = "385a6cb71ab9ab790c5fe8d67f1645e6c450a7ce006a33de03daa956cf70a496"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn",
 ]
 
 [[package]]
@@ -7227,7 +7229,7 @@ checksum = "7490cfa5ec963746568740651ac6781f701c9c5ea257c58e057f3ba8cf69e8da"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn",
 ]
 
 [[package]]
@@ -7258,7 +7260,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ac28f2d093c6c477eaa76b23525478f38de514fa9aeb1285738d4b97a9552fc"
 dependencies = [
  "js-sys",
- "opentelemetry",
+ "opentelemetry 0.31.0",
+ "smallvec",
+ "tracing",
+ "tracing-core",
+ "tracing-log",
+ "tracing-subscriber",
+ "web-time",
+]
+
+[[package]]
+name = "tracing-opentelemetry"
+version = "0.33.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "adbc64cba7137545b8044cb1fe9814f7aacf3c6b5f9b45be8bb5db538befdb26"
+dependencies = [
+ "js-sys",
+ "opentelemetry 0.32.0",
  "smallvec",
  "tracing",
  "tracing-core",
@@ -7612,7 +7630,7 @@ dependencies = [
  "bumpalo",
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn",
  "wasm-bindgen-shared",
 ]
 
@@ -7775,7 +7793,7 @@ checksum = "053e2e040ab57b9dc951b72c264860db7eb3b0200ba345b4e4c3b14f67855ddf"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn",
 ]
 
 [[package]]
@@ -7786,7 +7804,7 @@ checksum = "3f316c4a2570ba26bbec722032c4099d8c8bc095efccdc15688708623367e358"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn",
 ]
 
 [[package]]
@@ -8113,7 +8131,7 @@ checksum = "de844c262c8848816172cef550288e7dc6c7b7814b4ee56b3e1553f275f1858e"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn",
  "synstructure",
 ]
 
@@ -8134,7 +8152,7 @@ checksum = "1ae7f38b72ec2a254e2b87ef277cf2cd4fb97cbebf944faa6f33354da0867930"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn",
 ]
 
 [[package]]
@@ -8154,7 +8172,7 @@ checksum = "11532158c46691caf0f2593ea8358fed6bbf68a0315e80aae9bd41fbade684a1"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn",
  "synstructure",
 ]
 
@@ -8175,7 +8193,7 @@ checksum = "3c50655cbb0fe3fc43170059e702f1ce5e19b84cec58dc87b037a09935c2f328"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn",
 ]
 
 [[package]]
@@ -8208,7 +8226,7 @@ checksum = "625dc425cab0dca6dc3c3319506e6593dcb08a9f387ea3b284dbd52a92c40555"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn",
 ]
 
 [[package]]

@@ -88,7 +88,7 @@ let
     multiple-versions = "allow"
 
     [sources]
-    allow-git = ["https://github.com/georgewhewell/commonware-monorepo", "ssh://git@github.com/georgewhewell/exploratory-catena.git"]
+    allow-git = ["https://github.com/commonwarexyz/monorepo", "https://github.com/hellas-ai/catena-lang"]
   '';
   denyCommand = "cargo deny check --config ${denyConfig}";
 
