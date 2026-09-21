@@ -41,6 +41,8 @@ impl core::fmt::Display for SubmitTxOutcome {
 
 pub mod cache;
 pub mod call;
+#[cfg(feature = "chain")]
+pub mod edge_index;
 #[cfg(feature = "evaluate")]
 pub mod evaluate;
 #[cfg(feature = "fetch")]

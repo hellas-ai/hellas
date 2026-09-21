@@ -1,0 +1,340 @@
+syntax = "proto3";
+package hellas.chain.v1;
+message EdgeIndexIndexError {
+ uint32 schema_version = 1;
+ string code = 2;
+ string message = 3;
+ optional EdgeIndexEdgeIndexMetadata envelope = 4;
+}
+// Reported discovery and current state, deliberately separate from LightClient's verified API.
+service EdgeIndex {
+ rpc ListEdges(EdgeIndexListEdgesRequest) returns (EdgeIndexListEdgesResponse);
+ rpc GetEdgeDetail(EdgeIndexGetEdgeDetailRequest) returns (EdgeIndexGetEdgeDetailResponse);
+ rpc ListEdgeEvents(EdgeIndexListEdgeEventsRequest) returns (EdgeIndexListEdgeEventsResponse);
+ rpc GetWorkChannelDetail(EdgeIndexGetWorkChannelDetailRequest) returns (EdgeIndexGetWorkChannelDetailResponse);
+}
+// Canonical proof transport definition, also re-exported as verified_explorer::ProofBundle.
+// Schema-1 proof JSON retains numeric integers/byte arrays, including inside EdgeIndex.
+message EdgeIndexProofBundle {
+ uint32 schema_version = 1; string network_id = 2; string trust_sha256 = 3;
+ uint64 height = 4; string payload = 5; string state_root = 6;
+ bytes finalization = 7; bytes canonical_block = 8; uint64 observed_at_ms = 9; uint64 epoch = 10;
+}
+
+message EdgeIndexTransactionRef {
+ uint64 height = 1;
+ string payload = 2;
+ string transaction_digest = 3;
+ uint32 transaction_index = 4;
+}
+
+message EdgeIndexSnapshot {
+ uint64 height = 1;
+ string payload = 2;
+ string state_root = 3;
+ EdgeIndexProofBundle block_proof = 4;
+}
+
+message EdgeIndexObservedHead {
+ uint64 height = 1;
+ string payload = 2;
+}
+
+message EdgeIndexIndexCoverage {
+ uint32 schema_version = 1;
+ uint64 indexed_from_height = 2;
+ uint64 indexed_through_height = 3;
+ string indexed_through_payload = 4;
+ bool complete_through_snapshot = 5;
+ optional EdgeIndexObservedHead observed_head = 6;
+ uint64 observed_at_ms = 7;
+ uint64 retained_from_height = 8;
+}
+
+message EdgeIndexProvenance {
+ string block = 1;
+ string discovery = 2;
+ string current_objects = 3;
+ string completeness = 4;
+}
+
+message EdgeIndexEdgeIndexMetadata {
+ uint32 schema_version = 1;
+ string network_id = 2;
+ string genesis_sha256 = 3;
+ string trust_sha256 = 4;
+ EdgeIndexSnapshot snapshot = 5;
+ EdgeIndexIndexCoverage index = 6;
+ EdgeIndexProvenance provenance = 7;
+ // Distinct historical proofs; the snapshot proof is never repeated here.
+ repeated EdgeIndexProofBundle evidence = 8;
+}
+
+message EdgeIndexListEdgesRequest {
+ optional string payload = 1;
+ optional string cursor = 2;
+ optional uint32 limit = 3;
+ optional string state = 4;
+ optional string kind = 5;
+ optional bytes party = 6;
+ optional string role = 7;
+ uint32 schema_version = 8;
+}
+
+message EdgeIndexGetEdgeDetailRequest {
+ string edge_id = 1;
+ optional string payload = 2;
+ uint32 schema_version = 3;
+}
+
+message EdgeIndexListEdgeEventsRequest {
+ string edge_id = 1;
+ optional string payload = 2;
+ optional string cursor = 3;
+ optional uint32 limit = 4;
+ uint32 schema_version = 5;
+}
+
+message EdgeIndexFundingQuery {
+ repeated string coins = 1;
+}
+
+message EdgeIndexGetWorkChannelDetailRequest {
+ string payment_edge_id = 1;
+ optional string payload = 2;
+ optional EdgeIndexFundingQuery funding = 3;
+ uint32 schema_version = 4;
+}
+
+message EdgeIndexEdgeLinks {
+ string edge = 1;
+ optional string channel = 2;
+ string maker = 3;
+ string taker = 4;
+ string opening_transaction = 5;
+ string opening_block = 6;
+ string evidence = 7;
+}
+
+message EdgeIndexEdgeSummary {
+ string edge_id = 1;
+ string kind = 2;
+ bytes maker = 3;
+ bytes taker = 4;
+ EdgeIndexTransactionRef opened = 5;
+ optional EdgeIndexTransactionRef closed = 6;
+ string lifecycle = 7;
+ string terms_hash = 8;
+ optional string bond_edge_id = 9;
+ optional string payment_edge_id = 10;
+ EdgeIndexEdgeLinks links = 11;
+}
+
+message EdgeIndexListEdgesPage {
+ repeated EdgeIndexEdgeSummary items = 1;
+ optional string next_cursor = 2;
+}
+
+message EdgeIndexCloseFees {
+ uint64 base = 1;
+ uint64 slot = 2;
+ uint64 proof = 3;
+ uint64 lifetime = 4;
+}
+
+message EdgeIndexEdgeProjection {
+ uint64 value = 1;
+ uint64 reserve = 2;
+ EdgeIndexCloseFees close_fees = 3;
+ uint64 timeout = 4;
+ bytes maker = 5;
+ bytes taker = 6;
+ string terms_hash = 7;
+ repeated string allowed_close_kinds = 8;
+}
+
+message EdgeIndexPresentEdge {
+ bytes canonical = 1;
+ EdgeIndexEdgeProjection decoded = 2;
+ string provenance = 3;
+}
+
+message EdgeIndexAbsentObject {
+ string provenance = 1;
+}
+
+message EdgeIndexPublicPayout {
+ bytes owner = 1;
+ uint64 value = 2;
+}
+
+message EdgeIndexBasicTerms {
+ uint32 protocol = 1;
+ bytes maker = 2;
+ bytes taker = 3;
+ uint64 timeout = 4;
+ repeated EdgeIndexPublicPayout timeout_payouts = 5;
+}
+
+message EdgeIndexWorkStakeBondTerms {
+ bytes maker = 1;
+ bytes taker = 2;
+ uint64 timeout = 3;
+ repeated EdgeIndexPublicPayout timeout_payouts = 4;
+ uint64 max_job_price = 5;
+}
+
+message EdgeIndexWorkPaymentTerms {
+ string bond_edge_id = 1;
+ bytes canonical_bond_terms = 2;
+ EdgeIndexWorkStakeBondTerms bond_terms = 3;
+ string bond_terms_hash = 4;
+ bytes maker = 5;
+ bytes taker = 6;
+ uint64 admission_horizon = 7;
+ string private_policy_commitment = 8;
+ uint64 omission_bond = 9;
+ uint64 omit_response_blocks = 10;
+ uint64 start_validity_blocks = 11;
+ repeated string allowed_close_kinds = 12;
+}
+
+message EdgeIndexOpening {
+ EdgeIndexTransactionRef transaction = 1;
+ reserved 2; // Evidence is resolved by transaction.payload in the response metadata.
+ repeated string funding_maker = 3;
+ repeated string funding_taker = 4;
+ bytes canonical_terms = 5;
+ EdgeIndexPublicTerms terms = 6;
+}
+
+message EdgeIndexClosing {
+ EdgeIndexTransactionRef transaction = 1;
+ reserved 2; // Evidence is resolved by transaction.payload in the response metadata.
+}
+
+message EdgeIndexRelatedEdges {
+ optional string bond_edge_id = 1;
+ optional string payment_edge_id = 2;
+}
+
+message EdgeIndexEventsLink {
+ string href = 1;
+}
+
+message EdgeIndexEdgeDetail {
+ EdgeIndexEdgeSummary summary = 1;
+ EdgeIndexObjectAnswer object_at_snapshot = 2;
+ EdgeIndexOpening opening = 3;
+ optional EdgeIndexClosing closing = 4;
+ EdgeIndexRelatedEdges related = 5;
+ EdgeIndexEventsLink events = 6;
+}
+
+message EdgeIndexEdgeEvent {
+ string kind = 1;
+ EdgeIndexTransactionRef transaction = 2;
+ bytes canonical_transaction = 3;
+ string evidence_href = 4;
+}
+
+message EdgeIndexEdgeEventsPage {
+ repeated EdgeIndexEdgeEvent items = 1;
+ optional string next_cursor = 2;
+}
+
+message EdgeIndexRegistrySlot {
+ string object_id = 1;
+ optional bytes chunk = 2;
+}
+
+message EdgeIndexLeaseProjection {
+ string bond_edge_id = 1;
+ string payment_edge_id = 2;
+ string payment_terms_hash = 3;
+ string private_policy_commitment = 4;
+ uint64 admission_horizon = 5;
+}
+
+message EdgeIndexPendingProjection {
+ string payment_edge_id = 1;
+ string opener_role = 2;
+ string start_id = 3;
+ uint64 response_deadline = 4;
+ uint64 start_cumulative = 5;
+ uint64 final_cumulative = 6;
+ bool responded = 7;
+ bool penalty_due = 8;
+ uint64 penalty_amount = 9;
+}
+
+message EdgeIndexParserAbsent {
+}
+
+message EdgeIndexParserInvalid {
+ string reason = 1;
+}
+
+message EdgeIndexWorkChannelDetail {
+ EdgeIndexEdgeDetail payment = 1;
+ EdgeIndexEdgeDetail bond = 2;
+ repeated string funding_query = 3;
+ repeated string live_funding = 4;
+ repeated EdgeIndexRegistrySlot lease_slots = 5;
+ EdgeIndexRegistrySlot pending_slot = 6;
+ EdgeIndexLeaseAnswer lease = 7;
+ EdgeIndexPendingAnswer pending = 8;
+ string admission = 9;
+ string bond_state = 10;
+}
+
+message EdgeIndexListEdgesResponse {
+ EdgeIndexEdgeIndexMetadata envelope = 1;
+ EdgeIndexListEdgesPage data = 2;
+}
+
+message EdgeIndexGetEdgeDetailResponse {
+ EdgeIndexEdgeIndexMetadata envelope = 1;
+ EdgeIndexEdgeDetail data = 2;
+}
+
+message EdgeIndexListEdgeEventsResponse {
+ EdgeIndexEdgeIndexMetadata envelope = 1;
+ EdgeIndexEdgeEventsPage data = 2;
+}
+
+message EdgeIndexGetWorkChannelDetailResponse {
+ EdgeIndexEdgeIndexMetadata envelope = 1;
+ EdgeIndexWorkChannelDetail data = 2;
+}
+
+message EdgeIndexObjectAnswer {
+ oneof answer {
+ EdgeIndexPresentEdge present = 1;
+ EdgeIndexAbsentObject absent = 2;
+ }
+}
+
+message EdgeIndexPublicTerms {
+ oneof terms {
+ EdgeIndexBasicTerms basic = 1;
+ EdgeIndexWorkPaymentTerms work_payment = 2;
+ EdgeIndexWorkStakeBondTerms work_stake_bond = 3;
+ }
+}
+
+message EdgeIndexLeaseAnswer {
+ oneof answer {
+ EdgeIndexLeaseProjection present = 1;
+ EdgeIndexParserAbsent absent = 2;
+ EdgeIndexParserInvalid invalid = 3;
+ }
+}
+
+message EdgeIndexPendingAnswer {
+ oneof answer {
+ EdgeIndexPendingProjection present = 1;
+ EdgeIndexParserAbsent absent = 2;
+ EdgeIndexParserInvalid invalid = 3;
+ }
+}

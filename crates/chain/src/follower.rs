@@ -308,8 +308,9 @@ pub(crate) async fn ingest_finalized_block(
         });
     }
 
-    let finalization = ChainIndexer::decode_finalization(&finalized.snapshot.finalization)?;
-    let outcome = indexer.ingest_finalized(block, finalization).await?;
+    let outcome = indexer
+        .ingest_finalized_proof(block, &finalized.snapshot.finalization)
+        .await?;
     status.emit(FollowerStatus::BlockIngested {
         height: block_height,
         outcome,

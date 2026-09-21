@@ -30,6 +30,8 @@ use prost_types::field_descriptor_proto::{Label, Type as FieldType};
 use prost_types::{DescriptorProto, EnumDescriptorProto, FieldDescriptorProto, FileDescriptorSet};
 use quote::{format_ident, quote};
 
+mod edge_index_codegen;
+
 fn main() {
     emit_git_rev();
     regenerate();
@@ -93,6 +95,7 @@ fn regenerate() {
         "hellas.v1.WorkEvent.kind",
         "#[allow(clippy::large_enum_variant)]",
     );
+    edge_index_codegen::configure(&mut config, &fds, &out_dir);
     config
         .compile_fds(fds)
         .expect("prost-build failed to emit message types");

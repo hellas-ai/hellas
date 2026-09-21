@@ -46,7 +46,11 @@ client-core = [
     # `client.rs` samples what one validator's RPC cost; the sample's one
     # channel out is `tracing`.
     "dep:tracing",
-    "domain",
+    # Snapshot finality can require canonical descendant blocks. These are
+    # codec dependencies; no archive or consensus participant is started.
+    "domain-consensus",
+    "dep:commonware-storage",
+    "dep:commonware-utils",
 ]
 # The finalized-block codec and accepted-transaction view, without a
 # database, a mempool, or consensus participation. This is what an
@@ -61,7 +65,14 @@ block-view = [
     "dep:commonware-storage",
     "dep:commonware-utils",
 ]
-explorer-origin = ["verified-explorer", "indexer", "dep:axum"]
+explorer-origin = [
+    "verified-explorer",
+    "indexer",
+    "dep:axum",
+    "axum/ws",
+    "dep:redb",
+    "hellas-kernel/webauthn",
+]
 verified-explorer = ["block-view", "dep:serde", "dep:hex", "dep:prost"]
 indexer = [
     "block-view",
@@ -165,6 +176,7 @@ prost = { version = "0.14", default-features = false, features = [
 ], optional = true }
 rand = { workspace = true, optional = true }
 rand_core = { workspace = true, optional = true }
+redb = { version = "3", optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
