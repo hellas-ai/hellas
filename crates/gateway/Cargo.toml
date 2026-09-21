@@ -9,7 +9,12 @@ documentation.workspace = true
 
 [features]
 default = []
-otel = ["hellas-rpc/otel", "dep:opentelemetry", "dep:tracing-opentelemetry"]
+otel = [
+    "hellas-rpc/otel",
+    "hellas-rpc/http-tracing",
+    "dep:opentelemetry",
+    "dep:tracing-opentelemetry",
+]
 evaluate = [
     "dep:hellas-executor",
     "hellas-executor/evaluate",
@@ -29,7 +34,6 @@ hellas-presentation.workspace = true
 hellas-rpc = { workspace = true, features = ["courtesy", "fetch"] }
 hellas-store = { workspace = true, optional = true }
 hellas-wire = { workspace = true, features = ["iroh"] }
-http-body = "1"
 iroh.workspace = true
 libc = "0.2"
 opentelemetry = { workspace = true, optional = true }

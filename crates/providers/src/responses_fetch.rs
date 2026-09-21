@@ -6,7 +6,8 @@ use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use std::time::Duration;
 use tracing::Instrument;
 
-#[cfg_attr(not(feature = "otel"), path = "responses_fetch/telemetry_noop.rs")]
+#[cfg_attr(feature = "otel", path = "responses_fetch/telemetry/otel.rs")]
+#[cfg_attr(not(feature = "otel"), path = "responses_fetch/telemetry/noop.rs")]
 mod telemetry;
 
 /// Maximum diagnostic prefix retained from an unsuccessful HTTP response.
