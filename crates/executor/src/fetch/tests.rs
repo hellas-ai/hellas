@@ -501,27 +501,101 @@ fn concurrent_distinct_filesystem_starts_share_one_capacity_reservation() {
     let first_barrier = Arc::clone(&barrier);
     let first = std::thread::spawn(move || {
         first_barrier.wait();
-        first_state.start(first_input)
+        let result = first_state.start(first_input);
+        (first_state, first_input, result)
     });
     let second = std::thread::spawn(move || {
         barrier.wait();
-        second_state.start(second_input)
+        let result = second_state.start(second_input);
+        (second_state, second_input, result)
     });
     let results = [first.join().unwrap(), second.join().unwrap()];
 
-    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
     assert_eq!(
         results
             .iter()
-            .filter(|result| matches!(
-                result,
-                Err(FetchStateError::Store(FetchStoreError::Capacity {
-                    capacity: 1
-                }))
-            ))
+            .filter(|(_, _, result)| result.is_ok())
             .count(),
         1
     );
+    assert_eq!(retained_file_count(&dir), 1);
+    for (mut state, input, result) in results {
+        if let Err(error) = result {
+            // The winner may spend more than the bounded lock wait in fsync
+            // or waiting to be scheduled. That is a transient admission
+            // refusal, not a second capacity reservation. Once both threads
+            // have joined, the loser must observe the durable capacity limit.
+            assert!(
+                matches!(
+                    error,
+                    FetchStateError::Store(FetchStoreError::Capacity { capacity: 1 })
+                ) || is_bounded_capacity_contention(&error),
+                "unexpected concurrent start rejection: {error}"
+            );
+            assert!(!state.store.has_running(input).unwrap());
+            assert!(matches!(
+                state.start(input).unwrap_err(),
+                FetchStateError::Store(FetchStoreError::Capacity { capacity: 1 })
+            ));
+            assert!(!state.store.has_running(input).unwrap());
+        } else {
+            assert!(state.store.has_running(input).unwrap());
+        }
+    }
+    assert_eq!(retained_file_count(&dir), 1);
+    let _ = fs::remove_dir_all(dir);
+}
+
+fn is_bounded_capacity_contention(error: &FetchStateError) -> bool {
+    const TIMEOUT: &str = "timed out waiting for the fetch transcript capacity lock";
+    match error {
+        FetchStateError::Store(FetchStoreError::Io(error)) => {
+            error.kind() == io::ErrorKind::WouldBlock && error.to_string() == TIMEOUT
+        }
+        FetchStateError::StartMarkerRollback { start, cleanup } => {
+            let expected = format!("I/O error: {TIMEOUT}");
+            start == &expected && cleanup == &expected
+        }
+        _ => false,
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_bounded_start_and_cleanup_lock_timeout_preserves_the_winning_reservation() {
+    let dir = root("fs-capacity-timeout-retry");
+    let caller = key(31);
+    let producer = key(32);
+    let (winner, _) = transcript_for(&caller, &producer, hellas_rpc::Retention::Retain, b"first");
+    let (loser, _) = transcript_for(&caller, &producer, hellas_rpc::Retention::Retain, b"second");
+    let winner_input = winner.input_commitment;
+    let loser_input = loser.input_commitment;
+    let mut state = FetchStateMachine::new(
+        fs_store_with_capacity(&dir, 1),
+        FetchCallerPolicy::new([caller.public_key()]),
+    );
+    state.quote_input(winner.input).unwrap();
+    state.quote_input(loser.input).unwrap();
+    state.start(winner_input).unwrap();
+
+    // Keep the root lock held until start and its cleanup both time out.
+    // This exercises the real bounded-lock failure without relying on a
+    // particular disk speed or scheduler interleaving.
+    let held = crate::private_fs::open_directory(&dir).unwrap();
+    held.lock().unwrap();
+    let error = state.start(loser_input).unwrap_err();
+    assert!(matches!(error, FetchStateError::StartMarkerRollback { .. }));
+    assert!(is_bounded_capacity_contention(&error), "{error}");
+    drop(held);
+
+    assert!(state.store.has_running(winner_input).unwrap());
+    assert!(!state.store.has_running(loser_input).unwrap());
+    assert!(matches!(
+        state.start(loser_input).unwrap_err(),
+        FetchStateError::Store(FetchStoreError::Capacity { capacity: 1 })
+    ));
+    assert!(state.store.has_running(winner_input).unwrap());
+    assert!(!state.store.has_running(loser_input).unwrap());
     assert_eq!(retained_file_count(&dir), 1);
     let _ = fs::remove_dir_all(dir);
 }
