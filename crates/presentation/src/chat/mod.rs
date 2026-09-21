@@ -58,6 +58,9 @@ impl TextPresentation {
                 Some(ChatTemplate::Qwen35) => Box::new(
                     codecs::xml_function::XmlFunctionCodec::new(directory.clone()),
                 ),
+                Some(ChatTemplate::SmolLm2) => {
+                    anyhow::bail!("SmolLM2 text chat does not support function tools")
+                }
                 None => anyhow::bail!("tools require a model adapter supporting them"),
             };
             Box::new(sentinel_engine::SentinelEngine::new_pair(

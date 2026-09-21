@@ -758,6 +758,7 @@ rec {
             "qwen3"
             "qwen3.5"
             "qwen3.6"
+            "smollm2"
           ]
         );
         default = null;

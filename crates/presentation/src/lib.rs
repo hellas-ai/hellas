@@ -30,6 +30,8 @@ pub enum ChatTemplate {
     Qwen3,
     /// Qwen3.5/3.6 text chat and XML function calls, with thinking disabled.
     Qwen35,
+    /// SmolLM2 Instruct text chat.
+    SmolLm2,
 }
 
 impl FromStr for ChatTemplate {
@@ -39,7 +41,10 @@ impl FromStr for ChatTemplate {
         match value {
             "qwen3" => Ok(Self::Qwen3),
             "qwen3.5" | "qwen3.6" => Ok(Self::Qwen35),
-            _ => anyhow::bail!("unsupported chat template {value:?}; expected qwen3 or qwen3.5"),
+            "smollm2" => Ok(Self::SmolLm2),
+            _ => anyhow::bail!(
+                "unsupported chat template {value:?}; expected qwen3, qwen3.5/qwen3.6, or smollm2"
+            ),
         }
     }
 }
@@ -63,8 +68,10 @@ impl ChatTemplate {
         tools: &[serde_json::Value],
     ) -> Result<String> {
         anyhow::ensure!(!messages.is_empty(), "chat requires at least one message");
-        if self == Self::Qwen35 {
-            return qwen35::render(messages, tools);
+        match self {
+            Self::Qwen35 => return qwen35::render(messages, tools),
+            Self::SmolLm2 => return render_smollm2(messages, tools),
+            Self::Qwen3 => {}
         }
         // Qwen/Qwen3-30B-A3B tokenizer_config.json at
         // ad44e777bcd18fa416d9da3bd8f70d33ebb85d39: text-only branch,
@@ -202,7 +209,7 @@ impl TextPresentation {
         tools: &[serde_json::Value],
     ) -> Result<Vec<u32>> {
         let template = self.chat_template.context(
-            "chat requires an explicitly configured --chat-template (qwen3 or qwen3.5/qwen3.6)",
+            "chat requires an explicitly configured --chat-template (qwen3, qwen3.5/qwen3.6, or smollm2)",
         )?;
         self.encode(&template.render_with_tools(messages, tools)?)
     }
@@ -224,6 +231,42 @@ impl TextPresentation {
             .map_err(anyhow::Error::msg)
             .context("failed to decode tokens")
     }
+}
+
+fn render_smollm2(messages: &[ChatMessage], tools: &[serde_json::Value]) -> Result<String> {
+    anyhow::ensure!(
+        tools.is_empty(),
+        "SmolLM2 text chat does not support function tools"
+    );
+
+    // HuggingFaceTB/SmolLM2-135M-Instruct tokenizer_config.json at
+    // 12fd25f77366fa6b3b4b768ec3050bf629380bac, with
+    // add_generation_prompt=true. The checkpoint expects the default system
+    // turn when a conversation does not begin with one.
+    let mut prompt = String::new();
+    if messages[0].role != "system" {
+        prompt.push_str(
+            "<|im_start|>system\nYou are a helpful AI assistant named SmolLM, trained by Hugging Face<|im_end|>\n",
+        );
+    }
+    for message in messages {
+        anyhow::ensure!(
+            matches!(message.role.as_str(), "system" | "user" | "assistant"),
+            "SmolLM2 text chat does not support role {:?}",
+            message.role
+        );
+        anyhow::ensure!(
+            message.tool_calls.is_empty(),
+            "SmolLM2 text chat does not support tool-call history"
+        );
+        prompt.push_str("<|im_start|>");
+        prompt.push_str(&message.role);
+        prompt.push('\n');
+        prompt.push_str(&message.content);
+        prompt.push_str("<|im_end|>\n");
+    }
+    prompt.push_str("<|im_start|>assistant\n");
+    Ok(prompt)
 }
 
 /// Stateful streamed-token decoder for presentation UIs.
@@ -346,6 +389,24 @@ mod tests {
             chat_template: Some(ChatTemplate::Qwen3),
         };
         assert_eq!(selected.encode("hello world").unwrap(), [0, 1]);
+    }
+
+    #[test]
+    fn smollm2_chat_matches_instruct_template() {
+        let messages = [ChatMessage {
+            role: "user".into(),
+            content: "Say hello".into(),
+            ..Default::default()
+        }];
+        assert_eq!(
+            ChatTemplate::SmolLm2.render(&messages).unwrap(),
+            concat!(
+                "<|im_start|>system\n",
+                "You are a helpful AI assistant named SmolLM, trained by Hugging Face<|im_end|>\n",
+                "<|im_start|>user\nSay hello<|im_end|>\n",
+                "<|im_start|>assistant\n",
+            )
+        );
     }
 
     #[test]
