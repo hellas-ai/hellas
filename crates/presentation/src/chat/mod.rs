@@ -351,6 +351,31 @@ mod tests {
     }
 
     #[test]
+    fn xml_composed_object_schemas_coerce_multiple_strings_and_numbers() {
+        for combinator in ["oneOf", "anyOf"] {
+            let mut request = request();
+            let properties = json!({"a": {"type": "string"}, "b": {"$ref": "#/$defs/text"}, "c": {"type": "integer"}});
+            request.tools[0].parameters = json!({
+                "type": "object", "$defs": {"text": {"type": "string"}},
+                "properties": properties, "required": ["a", "b", "c"],
+                (combinator): [{"properties": properties}]
+            });
+            let mut presentation = presentation();
+            presentation.chat_template = Some(ChatTemplate::Qwen35);
+            let mut turn = presentation.prepare(&request).unwrap().turn;
+            let events = turn.feed("<tool_call><function=bash><parameter=a>1</parameter><parameter=b>2</parameter><parameter=c>3</parameter></function></tool_call>").unwrap();
+            let args = events
+                .iter()
+                .find_map(|event| match event {
+                    OutputEvent::ToolCallEnd(call) => Some(&call.arguments),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(args, &json!({"a": "1", "b": "2", "c": 3}));
+        }
+    }
+
+    #[test]
     fn incomplete_or_invalid_tool_calls_cannot_finish_as_success() {
         for output in [
             "<tool_call>{\"name\":\"bash\",\"arguments\":{",

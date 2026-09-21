@@ -115,16 +115,40 @@ fn parse_function_block_with_tools(
             let parsed = std::mem::replace(&mut arguments[&key], text);
             let pointer = format!("/{}", key.replace('~', "~0").replace('/', "~1"));
             let descendants = format!("{pointer}/");
-            let invalid = validator.iter_errors(&arguments).any(|error| {
-                let path = error.instance_path.as_str();
-                path.is_empty() || path == pointer || path.starts_with(&descendants)
-            });
+            let invalid = validator
+                .iter_errors(&arguments)
+                .any(|error| rejects_parameter(&error, &pointer, &descendants));
             if invalid {
                 arguments[&key] = parsed;
             }
         }
     }
     Ok((name, arguments))
+}
+
+// A root anyOf/oneOf failure may concern only another parameter. Inspect
+// the validator's branch errors rather than treating that aggregate failure
+// as rejection of every text value. The engine still validates the entire
+// object, including relationships between fields, before emitting a call.
+fn rejects_parameter(
+    error: &jsonschema::ValidationError<'_>,
+    pointer: &str,
+    descendants: &str,
+) -> bool {
+    use jsonschema::error::ValidationErrorKind;
+    match &error.kind {
+        ValidationErrorKind::AnyOf { context } | ValidationErrorKind::OneOfNotValid { context } => {
+            context.iter().all(|branch| {
+                branch
+                    .iter()
+                    .any(|error| rejects_parameter(error, pointer, descendants))
+            })
+        }
+        _ => {
+            let path = error.instance_path.as_str();
+            path.is_empty() || path == pointer || path.starts_with(descendants)
+        }
+    }
 }
 
 fn parse_scalar(text: &str) -> JsonValue {
