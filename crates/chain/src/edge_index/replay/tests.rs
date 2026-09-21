@@ -917,6 +917,100 @@ fn work_pair(
     }
 }
 #[test]
+fn native_edge_index_bond_reverse_link_requires_payment_opening_evidence() {
+    run_qmdb(|runtime| async move {
+        let network = hellas_kernel::NetworkId::new(HELLAS_DEVNET_1_ID).unwrap();
+        let a = work_pair(network, 0, 31, 32);
+        let b = work_pair(network, 2, 33, 34);
+        let allocations = vec![
+            (SettlementKey::from(a.client.party_key()), 100),
+            (SettlementKey::from(a.provider.party_key()), 12),
+            (SettlementKey::from(b.client.party_key()), 100),
+            (SettlementKey::from(b.provider.party_key()), 12),
+        ];
+        let mut h = Harness::new(runtime.child("h"), allocations, "reverse-link").await;
+        h.append(vec![
+            Transaction::Kernel(a.bond_open.clone()),
+            Transaction::Kernel(b.bond_open.clone()),
+        ])
+        .await;
+        let payments = h
+            .append(vec![
+                Transaction::Kernel(a.payment_open.clone()),
+                Transaction::Kernel(b.payment_open.clone()),
+            ])
+            .await;
+        h.append(Vec::new()).await;
+        let detail = h.detail(a.bond, None);
+        h.check_edge(&detail).unwrap();
+        assert!(
+            detail
+                .envelope
+                .as_ref()
+                .unwrap()
+                .evidence
+                .iter()
+                .any(|proof| proof.payload == payments.payload),
+            "standalone bond detail must include its payment's historical opening"
+        );
+        for payment_id in ["00".repeat(32), hex::encode(b.payment.as_bytes())] {
+            let mut bad = detail.clone();
+            let payload = bad
+                .envelope
+                .as_ref()
+                .unwrap()
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .payload
+                .clone();
+            let data = bad.data.as_mut().unwrap();
+            data.related.as_mut().unwrap().payment_edge_id = Some(payment_id.clone());
+            let summary = data.summary.as_mut().unwrap();
+            summary.payment_edge_id = Some(payment_id.clone());
+            summary.links.as_mut().unwrap().channel =
+                Some(format!("/channels/{payment_id}?payload={payload}"));
+            assert!(
+                h.check_edge(&bad).is_err(),
+                "unrelated payment {payment_id}"
+            );
+        }
+        let mut bad_link = detail.clone();
+        bad_link
+            .data
+            .as_mut()
+            .unwrap()
+            .summary
+            .as_mut()
+            .unwrap()
+            .links
+            .as_mut()
+            .unwrap()
+            .channel = Some(format!("/channels/{}", hex::encode(b.payment.as_bytes())));
+        assert!(h.check_edge(&bad_link).is_err());
+        let mut bad_events = detail.clone();
+        bad_events
+            .data
+            .as_mut()
+            .unwrap()
+            .events
+            .as_mut()
+            .unwrap()
+            .href = format!("/api/v1/edges/{}/events", hex::encode(b.bond.as_bytes()));
+        assert!(h.check_edge(&bad_events).is_err());
+        let mut missing_proof = detail.clone();
+        missing_proof
+            .envelope
+            .as_mut()
+            .unwrap()
+            .evidence
+            .retain(|proof| proof.payload != payments.payload);
+        assert!(h.check_edge(&missing_proof).is_err());
+        runtime.stop(0, None).await.unwrap();
+    });
+}
+
+#[test]
 fn native_edge_index_work_channel_lifecycle_and_evidence() {
     run_qmdb(|runtime| async move {
         use hellas_kernel::{
@@ -958,6 +1052,19 @@ fn native_edge_index_work_channel_lifecycle_and_evidence() {
         };
         let initial = channel(&h, a.payment, None);
         h.check_channel(&initial).unwrap();
+        let mut missing_reverse = initial.clone();
+        let bond = missing_reverse
+            .data
+            .as_mut()
+            .unwrap()
+            .bond
+            .as_mut()
+            .unwrap();
+        bond.related.as_mut().unwrap().payment_edge_id = None;
+        let summary = bond.summary.as_mut().unwrap();
+        summary.payment_edge_id = None;
+        summary.links.as_mut().unwrap().channel = None;
+        assert!(h.check_channel(&missing_reverse).is_err());
         assert_eq!(initial.data.as_ref().unwrap().funding_query.len(), 2);
         assert!(initial.data.as_ref().unwrap().live_funding.is_empty());
         h.export("channel-open", &initial);

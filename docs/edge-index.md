@@ -49,7 +49,11 @@ proof remains in `snapshot.block_proof`; `evidence` contains distinct historical
 proofs sorted by payload. Open/close references resolve against the decoded
 `VerifiedBlock` views retained by `projection::verify_metadata`; each certificate
 and block is verified once per response. Opening and closing objects do not embed
-additional proofs. Both transports use the same generated message definitions and JSON
+additional proofs. A bond detail that names an associated payment also includes that
+payment's opening proof: clients check its edge ID, referenced bond and embedded bond
+terms. Derived links must match those checked fields. A missing reverse association
+is still an indexer-reported discovery claim, not authenticated absence.
+Both transports use the same generated message definitions and JSON
 adapters from `hellas-rpc`; no protobuf transcode sits between RPC and the index.
 The standalone block/address proof API remains schema 1 with its existing JSON.
 
