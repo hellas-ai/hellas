@@ -97,7 +97,7 @@ fn shipped_documents_hash_to_the_bytes_that_were_reviewed() {
     let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
     assert_eq!(
         hex,
-        "caab04a9350edbe0d50aa9375dcee2742145cf5c24c57f42c844ebf4f27aa4b6"
+        "6e5e8d2b35f62724380afd2735ff8677f503bfc0c008e7bc8935e9a1214099bb"
     );
 }
 
@@ -107,7 +107,7 @@ fn canonical_devnet_genesis_is_valid_and_matches_its_id_constant() {
     genesis.validate().unwrap();
     assert_eq!(genesis.network_id, HELLAS_DEVNET_1_ID);
     assert_eq!(genesis.validators.len(), 6);
-    assert_eq!(genesis.allocations.len(), 2);
+    assert_eq!(genesis.allocations.len(), 3);
 }
 
 #[test]

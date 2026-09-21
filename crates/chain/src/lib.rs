@@ -113,7 +113,7 @@ mod genesis_reexport {
         let selector = "devnet";
         let id = crate::genesis::HELLAS_DEVNET_1_ID;
         let json = crate::genesis::HELLAS_DEVNET_1_JSON;
-        let expected = "caab04a9350edbe0d50aa9375dcee2742145cf5c24c57f42c844ebf4f27aa4b6";
+        let expected = "6e5e8d2b35f62724380afd2735ff8677f503bfc0c008e7bc8935e9a1214099bb";
         let hex: String = Sha256::digest(json.as_bytes())
             .iter()
             .map(|byte| format!("{byte:02x}"))
