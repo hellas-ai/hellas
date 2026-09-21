@@ -14,7 +14,7 @@ service EdgeIndex {
  rpc GetWorkChannelDetail(EdgeIndexGetWorkChannelDetailRequest) returns (EdgeIndexGetWorkChannelDetailResponse);
 }
 // Canonical proof transport definition, also re-exported as verified_explorer::ProofBundle.
-// JSON proof routes retain numeric integers/byte arrays; EdgeIndex uses its explicit adapters.
+// Schema-1 proof JSON retains numeric integers/byte arrays, including inside EdgeIndex.
 message EdgeIndexProofBundle {
  uint32 schema_version = 1; string network_id = 2; string trust_sha256 = 3;
  uint64 height = 4; string payload = 5; string state_root = 6;

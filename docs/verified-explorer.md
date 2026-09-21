@@ -88,9 +88,9 @@ verified against that immutable checkpoint without repeating its signature check
 `/api/v1/addresses/{base58-owner}/proof?offset=0&limit=64` returns an address
 bundle. `payload=...` pins the current durable owner checkpoint. The origin serves
 only that checkpoint, so a new finalized block makes an older pin unavailable,
-including between pagination requests. EdgeIndex's retained discovery snapshots
-do not extend owner-proof retention. The Worker may cache older verified pages,
-but cannot generate uncached pages for an old native checkpoint.
+including between pagination requests. EdgeIndex and owner proofs both use the
+current checkpoint. The Worker may cache older verified pages, but cannot generate
+uncached pages for an old native checkpoint.
 
 An unavailable pin returns HTTP 409 with `Cache-Control: no-store`, `Vary: Accept`,
 and a typed JSON/protobuf error containing `schema_version`, `network_id`,

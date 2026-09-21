@@ -180,6 +180,16 @@ pub enum Request {
     Events(ListEdgeEventsRequest),
     Channel(GetWorkChannelDetailRequest),
 }
+impl Request {
+    pub fn payload(&self) -> Option<&str> {
+        match self {
+            Self::List(q) => q.payload.as_deref(),
+            Self::Detail(q) => q.payload.as_deref(),
+            Self::Events(q) => q.payload.as_deref(),
+            Self::Channel(q) => q.payload.as_deref(),
+        }
+    }
+}
 /// Paths are canonical API paths. Duplicate, unknown and malformed parameters fail closed.
 pub fn parse_request(path: &str, raw_query: Option<&str>) -> Result<Request, String> {
     let raw = raw_query.unwrap_or("");

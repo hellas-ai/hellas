@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
     domain::{self, Transaction},
-    edge_index::{projection::EdgeIndexClient, types::*},
+    edge_index::{projection, types::*},
     execution::test_support::{ConsensusFixture, consensus_fixture, finalization, run_qmdb},
     verified_explorer::PROOF_SCHEMA_VERSION,
 };
@@ -30,7 +30,6 @@ pub(crate) struct Harness {
     pub(crate) head: HellasBlock,
     pub(crate) committee: ConsensusFixture,
     pub(crate) verifier: ExplorerVerifier,
-    pub(crate) client: EdgeIndexClient,
     pub(crate) allocations: Vec<(SettlementKey, u64)>,
     pub(crate) network: hellas_kernel::NetworkId,
     pub(crate) name: &'static str,
@@ -39,6 +38,55 @@ pub(crate) struct Harness {
     pub(crate) trust: TrustDocument,
 }
 impl Harness {
+    fn check_edge(
+        &self,
+        response: &GetEdgeDetailResponse,
+    ) -> std::result::Result<(), projection::ProjectionError> {
+        let envelope = response
+            .envelope
+            .as_ref()
+            .ok_or(projection::ProjectionError::Binding)?;
+        let blocks = projection::verify_metadata(envelope, &self.verifier, &self.trust)?;
+        projection::check_detail(
+            response
+                .data
+                .as_ref()
+                .ok_or(projection::ProjectionError::Binding)?,
+            envelope,
+            &blocks,
+        )
+    }
+    fn check_channel(
+        &self,
+        response: &GetWorkChannelDetailResponse,
+    ) -> std::result::Result<(), projection::ProjectionError> {
+        let envelope = response
+            .envelope
+            .as_ref()
+            .ok_or(projection::ProjectionError::Binding)?;
+        let blocks = projection::verify_metadata(envelope, &self.verifier, &self.trust)?;
+        projection::check_work_channel(
+            response
+                .data
+                .as_ref()
+                .ok_or(projection::ProjectionError::Binding)?,
+            self.network,
+            envelope,
+            &blocks,
+        )
+    }
+    fn check_list(
+        &self,
+        response: &ListEdgesResponse,
+    ) -> std::result::Result<(), projection::ProjectionError> {
+        projection::verify_metadata(
+            response.envelope.as_ref().unwrap(),
+            &self.verifier,
+            &self.trust,
+        )?;
+        projection::check_list(response)
+    }
+
     pub(crate) async fn new(
         runtime: tokio::Context,
         allocations: Vec<(SettlementKey, u64)>,
@@ -84,7 +132,6 @@ impl Harness {
             }],
         };
         let verifier = ExplorerVerifier::with_genesis(trust.clone(), &genesis_json).unwrap();
-        let client = EdgeIndexClient::with_genesis(trust.clone(), &genesis_json).unwrap();
         let (root, target) = crate::execution::store::empty_state(
             runtime.child("genesis"),
             "edge-test-genesis",
@@ -130,7 +177,6 @@ impl Harness {
             head,
             committee,
             verifier,
-            client,
             allocations,
             network,
             name,
@@ -315,7 +361,18 @@ fn native_edge_index_unsorted_committee_genesis_matches_validator() {
         );
         let proof = harness.append(Vec::new()).await;
         assert_eq!(proof.height, 1);
-        assert_eq!(harness.list(2).envelope.snapshot.height, 1);
+        assert_eq!(
+            harness
+                .list(2)
+                .envelope
+                .as_ref()
+                .unwrap()
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .height,
+            1
+        );
     });
 }
 fn signer(secret: u8) -> Secp256k1Signer {
@@ -396,19 +453,37 @@ fn native_edge_index_real_chain_pins_root_checks_and_restart() {
             ])
             .await;
         let first = h.list(1);
-        h.client.check_list(&first).unwrap();
+        h.check_list(&first).unwrap();
         h.export("edges", &first);
-        let cursor = first.data.next_cursor.clone().unwrap();
+        let cursor = first.data.as_ref().unwrap().next_cursor.clone().unwrap();
         let detail = h.detail(id, None);
-        h.client.check_edge(&detail).unwrap();
+        h.check_edge(&detail).unwrap();
         h.export("edge", &detail);
         let mut wrong = detail.clone();
-        wrong.data.opening.transaction.transaction_index = 12;
-        assert!(h.client.check_edge(&wrong).is_err());
-        if let Some(ObjectState::Present(object)) = &mut wrong.data.object_at_snapshot.answer {
-            object.decoded.value += 1;
+        wrong
+            .data
+            .as_mut()
+            .unwrap()
+            .opening
+            .as_mut()
+            .unwrap()
+            .transaction
+            .as_mut()
+            .unwrap()
+            .transaction_index = 12;
+        assert!(h.check_edge(&wrong).is_err());
+        if let Some(ObjectState::Present(object)) = &mut wrong
+            .data
+            .as_mut()
+            .unwrap()
+            .object_at_snapshot
+            .as_mut()
+            .unwrap()
+            .answer
+        {
+            object.decoded.as_mut().unwrap().value += 1;
         }
-        assert!(h.client.check_edge(&wrong).is_err());
+        assert!(h.check_edge(&wrong).is_err());
         let (_, root_bad, _) = h.candidate(Vec::new()).await;
         let mut bad = root_bad.clone();
         bad.state_root = "00".repeat(32);
@@ -436,7 +511,17 @@ fn native_edge_index_real_chain_pins_root_checks_and_restart() {
             )
             .unwrap();
         assert!(h.replay.apply(&block, other).await.is_err());
-        assert_eq!(h.list(64).envelope.snapshot.height, 1);
+        assert_eq!(
+            h.list(64)
+                .envelope
+                .as_ref()
+                .unwrap()
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .height,
+            1
+        );
         // Even a valid threshold certificate cannot bypass deterministic state replay.
         let mut target = block.sync_target();
         target.root = Digest::from([91; 32]);
@@ -487,7 +572,17 @@ fn native_edge_index_real_chain_pins_root_checks_and_restart() {
         let mut conflict = opened.clone();
         conflict.payload = "fe".repeat(32);
         assert!(h.apply(&h.head.clone(), conflict).await.is_err());
-        assert_eq!(h.list(64).envelope.snapshot.height, 1);
+        assert_eq!(
+            h.list(64)
+                .envelope
+                .as_ref()
+                .unwrap()
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .height,
+            1
+        );
 
         // A single in-flight read remains coherent while a new state is published.
         let in_flight = h.index.store.read(Some(&opened.payload)).unwrap();
@@ -500,8 +595,8 @@ fn native_edge_index_real_chain_pins_root_checks_and_restart() {
                 ..Default::default()
             })
             .unwrap();
-        assert_eq!(next.data.items.len(), 2);
-        assert!(next.data.next_cursor.is_none());
+        assert_eq!(next.data.as_ref().unwrap().items.len(), 2);
+        assert!(next.data.as_ref().unwrap().next_cursor.is_none());
         let closed = h
             .append(vec![Transaction::Kernel(
                 Tx::timeout_close(id, &terms).unwrap(),
@@ -516,10 +611,22 @@ fn native_edge_index_real_chain_pins_root_checks_and_restart() {
             })
             .unwrap_err();
         assert_eq!((stale.status, stale.code), (409, "snapshot_unavailable"));
-        assert_eq!(stale.snapshot.unwrap().snapshot.payload, closed.payload);
+        assert_eq!(
+            stale.snapshot.unwrap().snapshot.as_ref().unwrap().payload,
+            closed.payload
+        );
         let live = h.detail(id, None);
-        assert_eq!(live.data.summary.lifecycle, "closed");
-        h.client.check_edge(&live).unwrap();
+        assert_eq!(
+            live.data
+                .as_ref()
+                .unwrap()
+                .summary
+                .as_ref()
+                .unwrap()
+                .lifecycle,
+            "closed"
+        );
+        h.check_edge(&live).unwrap();
         h.export("closed-edge", &live);
         let stale = h
             .index
@@ -550,13 +657,11 @@ fn native_edge_index_real_chain_pins_root_checks_and_restart() {
                 ..Default::default()
             })
             .unwrap();
-        h.client
-            .check_events(&events, &hex::encode(id.as_bytes()))
-            .unwrap();
-        assert!(events.data.next_cursor.is_some());
+        projection::check_events(&events, &hex::encode(id.as_bytes())).unwrap();
+        assert!(events.data.as_ref().unwrap().next_cursor.is_some());
         h.export("events", &events);
         h.apply(&h.head.clone(), closed).await.unwrap();
-        assert_eq!(h.list(64).data.items.len(), 2);
+        assert_eq!(h.list(64).data.as_ref().unwrap().items.len(), 2);
         for _ in 0..2 {
             h.append(Vec::new()).await;
         }
@@ -852,16 +957,48 @@ fn native_edge_index_work_channel_lifecycle_and_evidence() {
                 .unwrap()
         };
         let initial = channel(&h, a.payment, None);
-        h.client.check_channel(&initial).unwrap();
-        assert_eq!(initial.data.funding_query.len(), 2);
-        assert!(initial.data.live_funding.is_empty());
+        h.check_channel(&initial).unwrap();
+        assert_eq!(initial.data.as_ref().unwrap().funding_query.len(), 2);
+        assert!(initial.data.as_ref().unwrap().live_funding.is_empty());
         h.export("channel-open", &initial);
         h.export("edges-open", &h.list(64));
         h.export("payment-open", &h.detail(a.payment, None));
         h.export("bond-open", &h.detail(a.bond, None));
+        // Ordinary Proto3 decoding preserves absence. The shared consumer
+        // boundary must reject missing messages before any renderer can use them.
+        for path in [
+            "/envelope",
+            "/data",
+            "/envelope/snapshot",
+            "/envelope/index",
+            "/envelope/provenance",
+            "/envelope/snapshot/block_proof",
+            "/data/payment",
+            "/data/bond",
+            "/data/lease",
+            "/data/pending",
+            "/data/pending_slot",
+            "/data/payment/summary",
+            "/data/payment/opening",
+            "/data/payment/object_at_snapshot",
+            "/data/payment/related",
+            "/data/payment/events",
+            "/data/payment/summary/opened",
+            "/data/payment/summary/links",
+            "/data/payment/opening/transaction",
+            "/data/payment/opening/terms",
+        ] {
+            let mut json = serde_json::to_value(&initial).unwrap();
+            *json.pointer_mut(path).unwrap() = serde_json::Value::Null;
+            let missing: GetWorkChannelDetailResponse = serde_json::from_value(json).unwrap();
+            use prost::Message;
+            let missing =
+                GetWorkChannelDetailResponse::decode(missing.encode_to_vec().as_slice()).unwrap();
+            assert!(h.check_channel(&missing).is_err(), "{path}");
+        }
         let mut bad = initial.clone();
-        bad.data.lease_slots.pop();
-        assert!(h.client.check_channel(&bad).is_err());
+        bad.data.as_mut().unwrap().lease_slots.pop();
+        assert!(h.check_channel(&bad).is_err());
         let empty = h
             .index
             .get_work_channel_detail(GetWorkChannelDetailRequest {
@@ -871,7 +1008,7 @@ fn native_edge_index_work_channel_lifecycle_and_evidence() {
                 funding: Some(FundingQuery { coins: Vec::new() }),
             })
             .unwrap();
-        assert!(empty.data.funding_query.is_empty());
+        assert!(empty.data.as_ref().unwrap().funding_query.is_empty());
         let understated = EarnedCertificate::new(a.payment, a.terms.hash(), 30);
         let earned_hash = understated.digest(network);
         let start_hash = hellas_kernel::start_digest(
@@ -910,42 +1047,68 @@ fn native_edge_index_work_channel_lifecycle_and_evidence() {
         )));
         h.append(vec![Transaction::Kernel(start)]).await;
         let started = channel(&h, a.payment, None);
-        h.client.check_channel(&started).unwrap();
+        h.check_channel(&started).unwrap();
         // Both openings belong to the same historical block. Evidence occurs once,
         // and every locator is checked against the bytes of that certified block.
-        assert!(initial.envelope.evidence.is_empty());
-        assert_eq!(started.envelope.evidence.len(), 1);
-        assert_eq!(started.envelope.evidence[0].payload, opened.payload);
+        assert!(initial.envelope.as_ref().unwrap().evidence.is_empty());
+        assert_eq!(started.envelope.as_ref().unwrap().evidence.len(), 1);
+        assert_eq!(
+            started.envelope.as_ref().unwrap().evidence[0].payload,
+            opened.payload
+        );
         let json = serde_json::to_value(&started).unwrap();
         assert!(json["data"]["payment"]["opening"].get("proof").is_none());
         assert!(json["data"]["bond"]["opening"].get("proof").is_none());
-        assert_eq!(json["evidence"].as_array().unwrap().len(), 1);
+        assert_eq!(json["envelope"]["evidence"].as_array().unwrap().len(), 1);
         for mutate in [
             |value: &mut GetWorkChannelDetailResponse| {
-                value.envelope.evidence.clear();
+                value.envelope.as_mut().unwrap().evidence.clear();
+            },
+            |value: &mut GetWorkChannelDetailResponse| {
+                let envelope = value.envelope.as_mut().unwrap();
+                envelope.evidence.push(envelope.evidence[0].clone());
+            },
+            |value: &mut GetWorkChannelDetailResponse| {
+                value.envelope.as_mut().unwrap().evidence[0].canonical_block[0] ^= 1;
             },
             |value: &mut GetWorkChannelDetailResponse| {
                 value
-                    .envelope
-                    .evidence
-                    .push(value.envelope.evidence[0].clone());
+                    .data
+                    .as_mut()
+                    .unwrap()
+                    .payment
+                    .as_mut()
+                    .unwrap()
+                    .opening
+                    .as_mut()
+                    .unwrap()
+                    .transaction
+                    .as_mut()
+                    .unwrap()
+                    .transaction_index += 1;
             },
             |value: &mut GetWorkChannelDetailResponse| {
-                value.envelope.evidence[0].canonical_block[0] ^= 1;
-            },
-            |value: &mut GetWorkChannelDetailResponse| {
-                value.data.payment.opening.transaction.transaction_index += 1;
-            },
-            |value: &mut GetWorkChannelDetailResponse| {
-                value.envelope.schema_version = 1;
+                value.envelope.as_mut().unwrap().schema_version = 1;
             },
         ] {
             let mut changed = started.clone();
             mutate(&mut changed);
-            assert!(h.client.check_channel(&changed).is_err());
+            assert!(h.check_channel(&changed).is_err());
         }
         let read = h.index.store.read(None).unwrap();
-        let reference = &started.data.payment.opening.transaction;
+        let reference = started
+            .data
+            .as_ref()
+            .unwrap()
+            .payment
+            .as_ref()
+            .unwrap()
+            .opening
+            .as_ref()
+            .unwrap()
+            .transaction
+            .as_ref()
+            .unwrap();
         assert!(read.transaction(reference).is_ok());
         let mut corrupt = reference.clone();
         corrupt.transaction_index += 1;
@@ -955,7 +1118,14 @@ fn native_edge_index_work_channel_lifecycle_and_evidence() {
         assert!(read.transaction(&corrupt).is_err());
         drop(read);
         assert!(matches!(
-            started.data.pending.answer,
+            started
+                .data
+                .as_ref()
+                .unwrap()
+                .pending
+                .as_ref()
+                .unwrap()
+                .answer,
             Some(PendingState::Present(PendingProjection {
                 responded: false,
                 ..
@@ -964,10 +1134,30 @@ fn native_edge_index_work_channel_lifecycle_and_evidence() {
         h.export("channel-start", &started);
         let moved = h.append(vec![Transaction::Kernel(response)]).await;
         let pending = channel(&h, a.payment, None);
-        h.client.check_channel(&pending).unwrap();
-        assert_eq!(pending.data.payment.summary.lifecycle, "open");
+        h.check_channel(&pending).unwrap();
+        assert_eq!(
+            pending
+                .data
+                .as_ref()
+                .unwrap()
+                .payment
+                .as_ref()
+                .unwrap()
+                .summary
+                .as_ref()
+                .unwrap()
+                .lifecycle,
+            "open"
+        );
         assert!(matches!(
-            pending.data.pending.answer,
+            pending
+                .data
+                .as_ref()
+                .unwrap()
+                .pending
+                .as_ref()
+                .unwrap()
+                .answer,
             Some(PendingState::Present(PendingProjection {
                 responded: true,
                 penalty_due: true,
@@ -977,7 +1167,16 @@ fn native_edge_index_work_channel_lifecycle_and_evidence() {
         ));
         h.export("channel-pending", &pending);
         let chunk: RegistryChunk = crate::edge_index::projection::decode_canonical(
-            pending.data.pending_slot.chunk.as_deref().unwrap(),
+            pending
+                .data
+                .as_ref()
+                .unwrap()
+                .pending_slot
+                .as_ref()
+                .unwrap()
+                .chunk
+                .as_deref()
+                .unwrap(),
         )
         .unwrap();
         let PendingSlot::Present(record) =
@@ -1001,20 +1200,44 @@ fn native_edge_index_work_channel_lifecycle_and_evidence() {
         ))])
         .await;
         let closed = channel(&h, a.payment, None);
-        h.client.check_channel(&closed).unwrap();
-        assert_eq!(closed.data.payment.summary.lifecycle, "closed");
+        h.check_channel(&closed).unwrap();
+        assert_eq!(
+            closed
+                .data
+                .as_ref()
+                .unwrap()
+                .payment
+                .as_ref()
+                .unwrap()
+                .summary
+                .as_ref()
+                .unwrap()
+                .lifecycle,
+            "closed"
+        );
         assert!(matches!(
-            closed.data.lease.answer,
+            closed.data.as_ref().unwrap().lease.as_ref().unwrap().answer,
             Some(LeaseState::Present(_))
         ));
         assert!(matches!(
-            closed.data.pending.answer,
+            closed
+                .data
+                .as_ref()
+                .unwrap()
+                .pending
+                .as_ref()
+                .unwrap()
+                .answer,
             Some(PendingState::Absent(_))
         ));
         h.export("channel-adjudicated", &closed);
         assert_eq!(h.head.height().get(), 4);
         assert_eq!(
-            channel(&h, b.payment, None).data.admission,
+            channel(&h, b.payment, None)
+                .data
+                .as_ref()
+                .unwrap()
+                .admission,
             "before_horizon"
         );
         h.append(vec![
@@ -1023,12 +1246,32 @@ fn native_edge_index_work_channel_lifecycle_and_evidence() {
         ])
         .await;
         let consumed = channel(&h, b.payment, None);
-        h.client.check_channel(&consumed).unwrap();
-        assert_eq!(consumed.data.bond_state, "consumed");
-        assert_eq!(consumed.data.payment.summary.lifecycle, "open");
-        assert_eq!(consumed.data.admission, "ended");
+        h.check_channel(&consumed).unwrap();
+        assert_eq!(consumed.data.as_ref().unwrap().bond_state, "consumed");
+        assert_eq!(
+            consumed
+                .data
+                .as_ref()
+                .unwrap()
+                .payment
+                .as_ref()
+                .unwrap()
+                .summary
+                .as_ref()
+                .unwrap()
+                .lifecycle,
+            "open"
+        );
+        assert_eq!(consumed.data.as_ref().unwrap().admission, "ended");
         assert!(matches!(
-            consumed.data.lease.answer,
+            consumed
+                .data
+                .as_ref()
+                .unwrap()
+                .lease
+                .as_ref()
+                .unwrap()
+                .answer,
             Some(LeaseState::Absent(_))
         ));
         h.export("channel-bond-consumed", &consumed);
@@ -1055,11 +1298,24 @@ fn native_edge_index_work_channel_lifecycle_and_evidence() {
         ))])
         .await;
         let frozen = channel(&h, b.payment, None);
-        h.client.check_channel(&frozen).unwrap();
-        assert_eq!(frozen.data.payment.summary.lifecycle, "closed");
-        assert_eq!(frozen.data.admission, "ended");
+        h.check_channel(&frozen).unwrap();
+        assert_eq!(
+            frozen
+                .data
+                .as_ref()
+                .unwrap()
+                .payment
+                .as_ref()
+                .unwrap()
+                .summary
+                .as_ref()
+                .unwrap()
+                .lifecycle,
+            "closed"
+        );
+        assert_eq!(frozen.data.as_ref().unwrap().admission, "ended");
         h.export("channel-frozen", &frozen);
-        assert!(h.list(64).data.items.is_empty());
+        assert!(h.list(64).data.as_ref().unwrap().items.is_empty());
         h.export("edges-empty", &h.list(64));
         for payload in [opened.payload, moved.payload] {
             let error = h
@@ -1073,8 +1329,15 @@ fn native_edge_index_work_channel_lifecycle_and_evidence() {
                 .unwrap_err();
             assert_eq!((error.status, error.code), (409, "snapshot_unavailable"));
             assert_eq!(
-                error.snapshot.unwrap().snapshot.payload,
-                frozen.envelope.snapshot.payload
+                error.snapshot.unwrap().snapshot.as_ref().unwrap().payload,
+                frozen
+                    .envelope
+                    .as_ref()
+                    .unwrap()
+                    .snapshot
+                    .as_ref()
+                    .unwrap()
+                    .payload
             );
         }
         let events = h
@@ -1086,12 +1349,12 @@ fn native_edge_index_work_channel_lifecycle_and_evidence() {
                 ..Default::default()
             })
             .unwrap();
-        h.client
-            .check_events(&events, &hex::encode(a.payment.as_bytes()))
-            .unwrap();
+        projection::check_events(&events, &hex::encode(a.payment.as_bytes())).unwrap();
         assert_eq!(
             events
                 .data
+                .as_ref()
+                .unwrap()
                 .items
                 .iter()
                 .map(|event| event.kind.as_str())
@@ -1150,8 +1413,21 @@ fn native_edge_index_cold_open_serves_current_owners_without_archive_replay() {
                 ..Default::default()
             })
             .unwrap();
-        assert_eq!(listing.envelope.snapshot.payload, latest.payload);
-        assert_eq!(listing.data.items[0].edge_id, hex::encode(id.as_bytes()));
+        assert_eq!(
+            listing
+                .envelope
+                .as_ref()
+                .unwrap()
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .payload,
+            latest.payload
+        );
+        assert_eq!(
+            listing.data.as_ref().unwrap().items[0].edge_id,
+            hex::encode(id.as_bytes())
+        );
         for (address, balance, count) in [(owner, 0, 1), (untouched, 1000, 1), (absent, 0, 0)] {
             let bundle = recovered
                 .owner_proof(address, 0, 64, None)

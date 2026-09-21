@@ -6,7 +6,7 @@ mod tests {
     use super::*;
     use prost::Message;
     #[test]
-    fn proof_routes_keep_their_schema_one_json_and_required_json_members() {
+    fn proof_routes_keep_schema_one_json_and_proto3_preserves_absence() {
         let proof = ProofBundle {
             schema_version: PROOF_SCHEMA_VERSION,
             height: 7,
@@ -17,10 +17,21 @@ mod tests {
         assert_eq!(json["schema_version"], 1);
         assert_eq!(json["height"], 7);
         assert_eq!(json["canonical_block"], serde_json::json!([0, 255]));
-        assert!(serde_json::from_str::<GetEdgeDetailResponse>("{}").is_err());
+        let missing = serde_json::from_str::<GetEdgeDetailResponse>("{}").unwrap();
+        assert!(missing.envelope.is_none());
+        assert!(
+            super::super::projection::check_detail(
+                &EdgeDetail::default(),
+                &EdgeIndexMetadata::default(),
+                &[],
+            )
+            .is_err()
+        );
         assert!(
             serde_json::from_str::<Snapshot>(r#"{"height":"1","payload":"","state_root":""}"#)
-                .is_err()
+                .unwrap()
+                .block_proof
+                .is_none()
         );
     }
     #[test]
@@ -68,56 +79,45 @@ mod tests {
             funding: Some(FundingQuery { coins: vec![] }),
             schema_version: SCHEMA_VERSION,
         };
-        let generated = hellas_rpc::pb::chain::EdgeIndexGetWorkChannelDetailRequest::decode(
-            request.encode_to_vec().as_slice(),
-        )
-        .unwrap();
+        let generated =
+            GetWorkChannelDetailRequest::decode(request.encode_to_vec().as_slice()).unwrap();
         assert!(generated.funding.is_some());
-        assert_eq!(
-            GetWorkChannelDetailRequest::decode(generated.encode_to_vec().as_slice()).unwrap(),
-            request
-        );
         let response = ListEdgesResponse {
-            envelope: EdgeIndexMetadata {
+            envelope: Some(EdgeIndexMetadata {
                 schema_version: SCHEMA_VERSION,
                 network_id: "hellas-devnet-1".into(),
                 genesis_sha256: "a1".repeat(32),
                 trust_sha256: "b2".repeat(32),
-                snapshot: Snapshot {
+                snapshot: Some(Snapshot {
                     height: u64::MAX,
                     payload: "c3".repeat(32),
                     state_root: "d4".repeat(32),
-                    block_proof: ProofBundle {
+                    block_proof: Some(ProofBundle {
                         height: u64::MAX,
                         canonical_block: vec![0, 255],
                         ..Default::default()
-                    },
-                },
-                index: IndexCoverage {
+                    }),
+                }),
+                index: Some(IndexCoverage {
                     indexed_through_height: u64::MAX,
                     ..Default::default()
-                },
-                provenance: Provenance::reported(),
+                }),
+                provenance: Some(Provenance::reported()),
                 evidence: vec![],
-            },
-            data: ListEdgesPage {
+            }),
+            data: Some(ListEdgesPage {
                 items: vec![],
                 next_cursor: None,
-            },
+            }),
         };
-        let generated = hellas_rpc::pb::chain::EdgeIndexListEdgesResponse::decode(
-            response.encode_to_vec().as_slice(),
-        )
-        .unwrap();
-        assert_eq!(
-            ListEdgesResponse::decode(generated.encode_to_vec().as_slice()).unwrap(),
-            response
-        );
         let json = serde_json::to_value(&response).unwrap();
-        assert!(json.get("envelope").is_none());
-        assert_eq!(json["schema_version"], SCHEMA_VERSION);
-        assert_eq!(json["snapshot"]["height"], u64::MAX.to_string());
-        assert_eq!(json["snapshot"]["block_proof"]["canonical_block"], "AP8=");
+        assert!(json.get("envelope").is_some());
+        assert_eq!(json["envelope"]["schema_version"], SCHEMA_VERSION);
+        assert_eq!(json["envelope"]["snapshot"]["height"], u64::MAX.to_string());
+        assert_eq!(
+            json["envelope"]["snapshot"]["block_proof"]["canonical_block"],
+            serde_json::json!([0, 255])
+        );
         assert_eq!(
             serde_json::from_value::<ListEdgesResponse>(json).unwrap(),
             response
@@ -131,7 +131,7 @@ mod tests {
             })),
         };
         let json = serde_json::to_value(&absent).unwrap();
-        assert_eq!(json["state"], "absent");
+        assert!(json["answer"].get("absent").is_some());
         assert_eq!(
             serde_json::from_value::<ObjectAnswer>(json).unwrap(),
             absent
@@ -142,7 +142,7 @@ mod tests {
             })),
         };
         let json = serde_json::to_value(&invalid).unwrap();
-        assert_eq!(json["state"], "invalid");
+        assert!(json["answer"].get("invalid").is_some());
         assert_eq!(
             serde_json::from_value::<PendingAnswer>(json).unwrap(),
             invalid

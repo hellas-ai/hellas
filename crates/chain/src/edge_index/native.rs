@@ -129,13 +129,13 @@ impl EdgeIndex {
             network_id: self.store.identity.network_id.clone(),
             genesis_sha256: self.store.identity.genesis_sha256.clone(),
             trust_sha256: self.store.identity.trust_sha256.clone(),
-            snapshot: Snapshot {
+            snapshot: Some(Snapshot {
                 height: read.proof.height,
                 payload: read.proof.payload.clone(),
                 state_root: read.proof.state_root.clone(),
-                block_proof: read.proof.clone(),
-            },
-            index: IndexCoverage {
+                block_proof: Some(read.proof.clone()),
+            }),
+            index: Some(IndexCoverage {
                 schema_version: SCHEMA_VERSION,
                 indexed_from_height: 0,
                 indexed_through_height: read.proof.height,
@@ -147,8 +147,8 @@ impl EdgeIndex {
                 }),
                 observed_at_ms: read.proof.observed_at_ms,
                 retained_from_height: read.proof.height,
-            },
-            provenance: Provenance::reported(),
+            }),
+            provenance: Some(Provenance::reported()),
             evidence: Vec::new(),
         }
     }
@@ -160,12 +160,23 @@ impl EdgeIndex {
         let heights = details
             .into_iter()
             .flat_map(|detail| {
-                std::iter::once(detail.opening.transaction.height).chain(
+                std::iter::once(
                     detail
-                        .closing
-                        .iter()
-                        .map(|closing| closing.transaction.height),
+                        .opening
+                        .as_ref()
+                        .expect("constructed opening")
+                        .transaction
+                        .as_ref()
+                        .expect("constructed reference")
+                        .height,
                 )
+                .chain(detail.closing.iter().map(|closing| {
+                    closing
+                        .transaction
+                        .as_ref()
+                        .expect("constructed reference")
+                        .height
+                }))
             })
             .filter(|height| *height != read.proof.height)
             .collect::<std::collections::BTreeSet<_>>();
@@ -253,8 +264,8 @@ impl EdgeIndex {
             None
         };
         Ok(ListEdgesResponse {
-            envelope: self.metadata(&read),
-            data: ListEdgesPage { items, next_cursor },
+            envelope: Some(self.metadata(&read)),
+            data: Some(ListEdgesPage { items, next_cursor }),
         })
     }
     fn summary(&self, read: &ReadSnapshot, edge: &StoredEdge) -> Result<EdgeSummary> {
@@ -315,7 +326,7 @@ impl EdgeIndex {
             .as_ref()
             .map(|closed| {
                 Ok(Closing {
-                    transaction: closed.clone(),
+                    transaction: Some(closed.clone()),
                 })
             })
             .transpose()?;
@@ -324,14 +335,16 @@ impl EdgeIndex {
             payment_edge_id: summary.payment_edge_id.clone(),
         };
         Ok(EdgeDetail {
-            summary,
-            object_at_snapshot: object_answer(object.as_ref()),
-            opening: opening_projection(edge.opened.clone(), &funding, &terms).map_err(storage)?,
+            summary: Some(summary),
+            object_at_snapshot: Some(object_answer(object.as_ref())),
+            opening: Some(
+                opening_projection(edge.opened.clone(), &funding, &terms).map_err(storage)?,
+            ),
             closing,
-            related,
-            events: EventsLink {
+            related: Some(related),
+            events: Some(EventsLink {
                 href: format!("/api/v1/edges/{id}/events?payload={}", read.proof.payload),
-            },
+            }),
         })
     }
     pub fn get_work_channel_detail(
@@ -341,14 +354,17 @@ impl EdgeIndex {
         validate_request(request.schema_version, &request.payment_edge_id)?;
         let read = self.snapshot(request.payload.as_deref())?;
         let payment = self.detail(&read, &request.payment_edge_id)?;
-        let terms = decode_canonical::<hellas_kernel::Terms>(&payment.opening.canonical_terms)
+        let payment_opening = payment.opening.as_ref().expect("constructed opening");
+        let terms = decode_canonical::<hellas_kernel::Terms>(&payment_opening.canonical_terms)
             .map_err(storage)?;
         let TermsProfile::WorkPayment(work) = terms.profile() else {
             return Err(EdgeIndexError::bad("edge is not a work payment"));
         };
         let bond_id = hex::encode(work.bond_edge.as_bytes());
         let bond = self.detail(&read, &bond_id)?;
-        if bond.summary.terms_hash != hex::encode(work.bond_terms_hash().as_bytes()) {
+        let bond_opening = bond.opening.as_ref().expect("constructed opening");
+        let bond_summary = bond.summary.as_ref().expect("constructed summary");
+        if bond_summary.terms_hash != hex::encode(work.bond_terms_hash().as_bytes()) {
             return Err(EdgeIndexError::unavailable(
                 "bond does not match payment terms",
             ));
@@ -358,13 +374,12 @@ impl EdgeIndex {
                 super::query::validate_funding(&query.coins).map_err(EdgeIndexError::bad)?;
                 query.coins
             }
-            None => payment
-                .opening
+            None => payment_opening
                 .funding_maker
                 .iter()
-                .chain(&payment.opening.funding_taker)
-                .chain(&bond.opening.funding_maker)
-                .chain(&bond.opening.funding_taker)
+                .chain(&payment_opening.funding_taker)
+                .chain(&bond_opening.funding_maker)
+                .chain(&bond_opening.funding_taker)
                 .cloned()
                 .collect::<std::collections::BTreeSet<_>>()
                 .into_iter()
@@ -414,30 +429,31 @@ impl EdgeIndex {
         let lease = lease_projection(raw_slots, work.bond_edge, payment_id, &terms);
         let pending = pending_projection(raw_pending, payment_id);
         let admission = admission_at(read.proof.height, &terms).into();
-        let bond_state = if bond.summary.closed.is_some() {
+        let bond_state = if bond_summary.closed.is_some() {
             "consumed"
         } else {
             "live"
         }
         .into();
+        let envelope = self.detail_metadata(&read, [&payment, &bond])?;
         let data = WorkChannelDetail {
-            payment,
-            bond,
+            payment: Some(payment),
+            bond: Some(bond),
             funding_query,
             live_funding,
             lease_slots,
-            pending_slot: RegistrySlot {
+            pending_slot: Some(RegistrySlot {
                 object_id: hex::encode(pending_id),
                 chunk: raw_pending.as_ref().map(canonical_bytes),
-            },
-            lease,
-            pending,
+            }),
+            lease: Some(lease),
+            pending: Some(pending),
             admission,
             bond_state,
         };
         Ok(GetWorkChannelDetailResponse {
-            envelope: self.detail_metadata(&read, [&data.payment, &data.bond])?,
-            data,
+            envelope: Some(envelope),
+            data: Some(data),
         })
     }
     pub fn get_edge_detail(&self, request: GetEdgeDetailRequest) -> Result<GetEdgeDetailResponse> {
@@ -445,8 +461,8 @@ impl EdgeIndex {
         let read = self.snapshot(request.payload.as_deref())?;
         let data = self.detail(&read, &request.edge_id)?;
         Ok(GetEdgeDetailResponse {
-            envelope: self.detail_metadata(&read, [&data])?,
-            data,
+            envelope: Some(self.detail_metadata(&read, [&data])?),
+            data: Some(data),
         })
     }
     pub fn list_edge_events(
@@ -532,13 +548,13 @@ impl EdgeIndex {
                         "/api/v1/transactions/{}/proof",
                         event.transaction.transaction_digest
                     ),
-                    transaction: event.transaction,
+                    transaction: Some(event.transaction),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(ListEdgeEventsResponse {
-            envelope: self.metadata(&read),
-            data: EdgeEventsPage { items, next_cursor },
+            envelope: Some(self.metadata(&read)),
+            data: Some(EdgeEventsPage { items, next_cursor }),
         })
     }
 }
