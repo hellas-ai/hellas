@@ -33,7 +33,7 @@ async fn execute_test_request(endpoint: Url) -> Result<FetchProviderResponse, Fe
 
 #[tokio::test]
 async fn fetch_http_propagates_parent_and_keeps_span_until_stream_is_consumed() {
-    use opentelemetry::trace::{SpanKind, TracerProvider};
+    use opentelemetry::trace::{SpanKind, Status, TracerProvider};
     use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
     use tracing::Instrument;
     use tracing_subscriber::prelude::*;
@@ -109,6 +109,7 @@ async fn fetch_http_propagates_parent_and_keeps_span_until_stream_is_consumed() 
         .find(|span| span.span_kind == SpanKind::Client)
         .unwrap();
     assert_eq!(http.name, "POST");
+    assert!(!matches!(http.status, Status::Error { .. }));
     assert_eq!(http.parent_span_id, request.span_context.span_id());
     assert_eq!(
         http.span_context.trace_id(),
@@ -137,5 +138,33 @@ async fn fetch_http_propagates_parent_and_keeps_span_until_stream_is_consumed() 
                 && !value.contains("idempotency")
         }));
     }
+    let endpoint = test_endpoint(
+        Router::new().route(
+            "/responses",
+            post(|| async {
+                Response::builder()
+                    .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
+                    .body(Body::from_stream(futures::stream::pending::<
+                        Result<Vec<u8>, std::io::Error>,
+                    >()))
+                    .unwrap()
+            }),
+        ),
+        "/responses",
+    )
+    .await;
+    let response = execute_test_request(endpoint).await.unwrap();
+    drop(response);
+    provider.force_flush().unwrap();
+    let spans = exporter.get_finished_spans().unwrap();
+    let cancelled = spans.last().unwrap();
+    assert!(matches!(cancelled.status, Status::Error { .. }));
+    assert!(
+        cancelled
+            .attributes
+            .iter()
+            .any(|kv| kv.key.as_str() == "error.type"
+                && kv.value == opentelemetry::Value::from("cancelled"))
+    );
     provider.shutdown().unwrap();
 }

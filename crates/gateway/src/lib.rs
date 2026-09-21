@@ -13,8 +13,6 @@ mod provenance_layer;
 mod proxy;
 mod responses;
 mod state;
-#[cfg_attr(not(feature = "otel"), path = "telemetry_disabled.rs")]
-mod telemetry;
 mod wrap;
 
 use anyhow::{Context, bail};
@@ -253,9 +251,12 @@ async fn start_gateway(options: GatewayOptions) -> anyhow::Result<GatewayHandle>
         .route("/v1/messages", post(anthropic::handle))
         .route("/v1/completions", post(plain::handle))
         .with_state(state.clone())
-        .layer(provenance_layer::ProvenanceLayer)
-        .layer(axum::middleware::from_fn(telemetry::trace_request))
-        .layer(access::BearerLayer::new(bearer.clone()));
+        .layer(provenance_layer::ProvenanceLayer);
+    #[cfg(feature = "otel")]
+    let app = app.layer(axum::middleware::from_fn(
+        hellas_rpc::telemetry::http::trace_request,
+    ));
+    let app = app.layer(access::BearerLayer::new(bearer.clone()));
 
     if let Some(metrics_port) = options.metrics_port {
         let registry = Arc::new(prometheus_client::registry::Registry::default());
@@ -310,9 +311,12 @@ pub async fn start_fetch(options: FetchGatewayOptions) -> anyhow::Result<Gateway
     let app = Router::new()
         .route("/v1/responses", post(responses::handle))
         .with_state(state)
-        .layer(provenance_layer::ProvenanceLayer)
-        .layer(axum::middleware::from_fn(telemetry::trace_request))
-        .layer(access::BearerLayer::new(bearer.clone()));
+        .layer(provenance_layer::ProvenanceLayer);
+    #[cfg(feature = "otel")]
+    let app = app.layer(axum::middleware::from_fn(
+        hellas_rpc::telemetry::http::trace_request,
+    ));
+    let app = app.layer(access::BearerLayer::new(bearer.clone()));
     let listener = bind_gateway(&options.host, options.port, false).await?;
     launch_gateway(app, listener, bearer, None, &[], None).await
 }

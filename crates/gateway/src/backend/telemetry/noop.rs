@@ -2,12 +2,20 @@ use futures::Stream;
 use hellas_adaptors::{BackendError, BackendRequest, OutputEvent};
 use tracing::Span;
 
+#[derive(Clone)]
+pub(crate) struct InferenceMetrics;
+impl InferenceMetrics {
+    pub(crate) fn new() -> Self {
+        Self
+    }
+}
+
 pub(crate) struct Inference {
     pub(crate) span: Span,
 }
 
 impl Inference {
-    pub(crate) fn new(_: &BackendRequest) -> Self {
+    pub(crate) fn new(_: &BackendRequest, _: &InferenceMetrics) -> Self {
         Self { span: Span::none() }
     }
 

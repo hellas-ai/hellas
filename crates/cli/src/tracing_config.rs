@@ -10,11 +10,8 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::reload;
 
-#[cfg(feature = "otel")]
-#[path = "tracing_config/otel.rs"]
-mod telemetry;
-#[cfg(not(feature = "otel"))]
-#[path = "tracing_config/noop.rs"]
+#[cfg_attr(feature = "otel", path = "tracing_config/otel.rs")]
+#[cfg_attr(not(feature = "otel"), path = "tracing_config/noop.rs")]
 mod telemetry;
 
 pub use telemetry::TracerGuard;

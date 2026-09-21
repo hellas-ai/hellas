@@ -7,7 +7,8 @@ use hellas_adaptors::{
 
 mod generation;
 mod provenance;
-#[cfg_attr(not(feature = "otel"), path = "telemetry_disabled.rs")]
+#[cfg_attr(feature = "otel", path = "telemetry/otel.rs")]
+#[cfg_attr(not(feature = "otel"), path = "telemetry/noop.rs")]
 pub(crate) mod telemetry;
 mod text;
 
@@ -42,7 +43,7 @@ impl GatewayBackend {
 impl ExecutionBackend for GatewayBackend {
     fn stream<'a>(&'a self, request: BackendRequest) -> BackendFuture<'a, BackendStream> {
         Box::pin(async move {
-            let mut inference = telemetry::Inference::new(&request);
+            let mut inference = telemetry::Inference::new(&request, &self.state.inference_metrics);
             let prepared = match self
                 .prepare(&request)
                 .instrument(inference.span.clone())

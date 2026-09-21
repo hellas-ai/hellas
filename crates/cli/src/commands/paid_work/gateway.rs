@@ -1138,5 +1138,4 @@ mod tests {
         assert!(result.is_err());
         assert!(!started.load(Ordering::Relaxed));
     }
-
 }

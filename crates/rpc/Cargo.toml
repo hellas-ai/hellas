@@ -20,6 +20,7 @@ ignored = [
 
 [features]
 default = []
+http-tracing = ["dep:axum", "dep:http-body"]
 otel = ["dep:opentelemetry", "dep:tracing-opentelemetry"]
 
 # === Protocol modules ======================================================
@@ -48,6 +49,7 @@ all-protocols = ["swarm", "courtesy", "execute", "evaluate", "fetch", "chain"]
 work = ["dep:hellas-kernel", "evaluate", "hellas-kernel/secp256k1"]
 
 [dependencies]
+axum = { workspace = true, optional = true }
 base64ct = { version = "1", optional = true, features = ["alloc"] }
 bytes = { workspace = true }
 ed25519-dalek = { workspace = true }
@@ -56,6 +58,7 @@ futures-util = { version = "0.3", default-features = false }
 hellas-kernel = { workspace = true, optional = true }
 hellas-wire = { workspace = true }
 hellas-xet = { workspace = true, features = ["chunking", "serde"] }
+http-body = { version = "1", optional = true }
 k256 = { workspace = true }
 n0-future = { version = "0.3", default-features = false }
 opentelemetry = { workspace = true, optional = true }
@@ -98,6 +101,7 @@ hellas-wire = { workspace = true, features = ["mux"] }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
+tower = { version = "0.5", features = ["util"] }
 tracing-subscriber = { workspace = true }
 
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]

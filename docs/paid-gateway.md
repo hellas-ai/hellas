@@ -99,7 +99,8 @@ accept complete URLs instead. Give these services distinct `OTEL_SERVICE_NAME`
 values. Validators require both `validator` and `otel`. Sampling honors the
 upstream sampled flag; `OTEL_TRACES_SAMPLER=parentbased_traceidratio` with
 `OTEL_TRACES_SAMPLER_ARG` controls new root traces. Default packages omit the
-telemetry SDK and exporters; Nix module `otel` options select enabled builds.
+Hellas telemetry exporters; transitive dependencies still include metrics and SDK
+crates. Nix module `otel` options select enabled builds.
 
 The gateway accepts W3C `traceparent`/`tracestate` headers and returns
 `traceparent` plus `x-hellas-trace-id` for trace lookup. Without an incoming

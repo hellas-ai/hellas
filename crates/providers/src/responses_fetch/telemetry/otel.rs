@@ -6,10 +6,12 @@ use tracing::{Instrument, Span};
 
 pub(super) struct Request {
     pub span: Span,
+    complete: bool,
 }
 impl Request {
     pub fn new(endpoint: &reqwest::Url) -> Self {
         Self {
+            complete: false,
             span: hellas_rpc::request_span!(target: "hellas_request", "POST",
                 otel.kind = "client", http.request.method = "POST",
                 server.address = endpoint.host_str().unwrap_or(""),
@@ -34,7 +36,12 @@ impl Request {
         self.span
             .record("http.response.status_code", i64::from(code));
     }
+    fn complete(&mut self) {
+        self.complete = true;
+    }
+
     pub fn fail(&mut self, error: &'static str) {
+        self.complete = true;
         self.span.record("error.type", error);
         self.span.record("otel.status_code", "ERROR");
     }
@@ -51,6 +58,15 @@ impl Request {
             if chunk.is_err() { self.fail("stream_error"); }
             yield chunk;
         }
+        self.complete();
+        }
+    }
+}
+
+impl Drop for Request {
+    fn drop(&mut self) {
+        if !self.complete {
+            self.fail("cancelled");
         }
     }
 }
