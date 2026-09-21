@@ -85,10 +85,6 @@ protox = "0.9"
 quote = "1"
 syn = { version = "2", features = ["full"] }
 
-[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
-hellas-wire = { workspace = true, features = ["unix", "ws"] }
-tokio-tungstenite.workspace = true
-
 [dev-dependencies]
 # Real settlement signatures in the paid-work vectors: the kernel's own
 # secp256k1 signer, not a placeholder that proves nothing about the keys
@@ -102,3 +98,7 @@ opentelemetry_sdk = { workspace = true, features = ["testing"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { workspace = true }
+
+[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
+hellas-wire = { workspace = true, features = ["unix", "ws"] }
+tokio-tungstenite.workspace = true
