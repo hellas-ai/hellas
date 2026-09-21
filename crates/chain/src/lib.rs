@@ -16,16 +16,16 @@ pub mod domain;
 pub mod edge_index;
 #[cfg(any(feature = "indexer", feature = "validator"))]
 mod execution;
-#[cfg(feature = "indexer-api")]
-pub mod indexer_api;
-#[cfg(feature = "indexer-api")]
-pub(crate) mod http_api;
 #[cfg(feature = "validator")]
 pub mod faucet;
 #[cfg(feature = "client-core")]
 pub mod finality_proof;
 #[cfg(feature = "indexer")]
 pub mod follower;
+#[cfg(feature = "indexer-api")]
+pub(crate) mod http_api;
+#[cfg(feature = "indexer-api")]
+pub mod indexer_api;
 #[cfg(feature = "domain")]
 pub mod owner_proof;
 #[cfg(feature = "proof-verify")]

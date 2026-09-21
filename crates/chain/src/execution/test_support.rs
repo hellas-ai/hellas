@@ -16,9 +16,11 @@ use commonware_cryptography::{
     Digest as _, Digestible, Signer as _, bls12381::dkg::feldman_desmedt::deal, ed25519,
 };
 use commonware_parallel::Sequential;
+#[cfg(any(feature = "validator", feature = "indexer-api"))]
 use commonware_runtime::{Runner as _, tokio};
 use commonware_storage::{merkle::Location, mmr};
 use commonware_utils::{N3f1, non_empty_range, ordered::Set};
+#[cfg(any(feature = "validator", feature = "indexer-api"))]
 use core::future::Future;
 use hellas_kernel::{
     Auth, BlockHeight, CloseKind, CoinId, EdgeId, Funding, List, MAX_EDGE_OUTPUTS,
@@ -100,6 +102,9 @@ pub(crate) fn finalization(fixture: &ConsensusFixture, block: &HellasBlock) -> F
     Finalization::from_finalizes(&fixture.assembler, &votes, &Sequential).expect("finalization")
 }
 
+// Drives a QMDB runtime for the app and replay tests; the `indexer`-only
+// build compiles neither.
+#[cfg(any(feature = "validator", feature = "indexer-api"))]
 pub(crate) fn run_qmdb<F, Fut, T>(test: F) -> T
 where
     F: FnOnce(tokio::Context) -> Fut,
@@ -161,6 +166,14 @@ pub(crate) fn index_block(
     )
 }
 
+// `timeout_close`, `maker_passkey` and `taker_passkey` are read only by the
+// kernel tests. `kernel_fixture` still builds them for every caller, so they
+// cannot be `cfg`-ed out without splitting the constructor; scope the
+// allowance to exactly the build where nothing reads them.
+#[cfg_attr(
+    not(any(feature = "validator", feature = "indexer-api")),
+    allow(dead_code)
+)]
 pub(crate) struct KernelFixture {
     pub(crate) allocations: Vec<(SettlementKey, u64)>,
     pub(crate) maker: SettlementKey,
@@ -180,6 +193,8 @@ impl KernelFixture {
         Tx::close_output_ids(self.edge, &self.outputs)
     }
 
+    // Read only by the kernel tests, and `kernel` is gated.
+    #[cfg(any(feature = "validator", feature = "indexer-api"))]
     pub(crate) fn bad_auth_open(&self) -> Result<Tx, SoftPasskeyError> {
         let hash = Tx::open_hash(crate::domain::TEST_NETWORK, &self.funding, &self.terms);
         let wrong_hash = Tx::payload_hash(

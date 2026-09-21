@@ -29,9 +29,7 @@ use hellas_rpc::{
     SubmitTxOutcome,
     call::{GeneralSubmitRoute, WorkResponseRoute},
 };
-use hellas_wire::{
-    PeerIdentity, StreamTransport, TransportContext, WireCode, WireStatus,
-};
+use hellas_wire::{PeerIdentity, StreamTransport, TransportContext, WireCode, WireStatus};
 use p256::ecdsa::Signature as P256Signature;
 use std::{
     collections::HashMap,

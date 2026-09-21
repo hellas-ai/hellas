@@ -25,9 +25,9 @@ pub fn verify_metadata(
             verifier
                 .verify(
                     proof.clone(),
-                    crate::proof_verify::ProofQuery::Block(
-                        crate::FinalizedBlockQuery::Payload(digest(&proof.payload)?),
-                    ),
+                    crate::proof_verify::ProofQuery::Block(crate::FinalizedBlockQuery::Payload(
+                        digest(&proof.payload)?,
+                    )),
                 )
                 .map_err(|e| ProjectionError::Malformed(e.to_string()))
         })
@@ -381,8 +381,7 @@ pub fn check_detail(
         related.payment_edge_id.as_deref(),
         &snapshot.payload,
     )?;
-    if summary != &expected || related.bond_edge_id != expected.bond_edge_id
-    {
+    if summary != &expected || related.bond_edge_id != expected.bond_edge_id {
         return Err(ProjectionError::Binding);
     }
     match (&detail.closing, &summary.closed) {

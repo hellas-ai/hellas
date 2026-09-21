@@ -702,9 +702,7 @@ fn native_edge_index_real_chain_pins_root_checks_and_restart() {
             Tx::timeout_close(id2, &terms2).unwrap(),
         )];
         let (_, proof, _) = h.candidate(transactions.clone()).await;
-        let tx_digest = hex::encode(crate::proof_verify::transaction_digest(
-            &transactions[0],
-        ));
+        let tx_digest = hex::encode(crate::proof_verify::transaction_digest(&transactions[0]));
         let context = hellas_kernel::Context::with_fees(
             h.network,
             BlockHeight::new(proof.height),

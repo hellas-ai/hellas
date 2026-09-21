@@ -1,13 +1,13 @@
 //! Adapter from speculative QMDB batches to the shared authenticated owner tree.
-use super::{kernel::ExecutionError, store::UtxoDatabase};
 #[cfg(feature = "indexer-api")]
 use super::store::UtxoDb;
+use super::{kernel::ExecutionError, store::UtxoDatabase};
+#[cfg(feature = "indexer-api")]
+use crate::owner_proof::OwnerPageProof;
 use crate::{
     domain::{Object, ObjectId, SettlementKey},
     owner_proof::{OWNER_NODE_BYTES, OwnerProofError, OwnerTreeStore, update_holding},
 };
-#[cfg(feature = "indexer-api")]
-use crate::owner_proof::OwnerPageProof;
 use commonware_glue::stateful::db::DatabaseSet;
 use commonware_runtime::Spawner;
 use commonware_storage::Context as StorageContext;

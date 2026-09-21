@@ -114,12 +114,42 @@ pub(crate) fn respond(status: StatusCode, content_type: &'static str, body: Vec<
         .into_response()
 }
 
-/// Plain-text failure, for routes that do not carry a structured error body.
-pub(crate) fn text_failure(status: StatusCode, message: &str) -> Response {
-    (
-        status,
-        [(header::CACHE_CONTROL, "no-store")],
-        message.to_owned(),
-    )
-        .into_response()
+/// Structured failure, in the negotiated representation.
+///
+/// Every route on this API now answers errors the same way. The proof
+/// routes used to return a bare string while the EdgeIndex routes returned
+/// an encoded `IndexError`, so a client could not parse failures uniformly
+/// and had to branch on which path it had called.
+///
+/// The code is derived from the status rather than supplied per call site,
+/// which keeps the vocabulary closed: the same condition cannot acquire two
+/// spellings in two handlers.
+pub(crate) fn failure(headers: &HeaderMap, status: StatusCode, message: &str) -> Response {
+    let code = match status {
+        StatusCode::BAD_REQUEST => "invalid_request",
+        StatusCode::NOT_FOUND => "not_found",
+        StatusCode::NOT_ACCEPTABLE => "not_acceptable",
+        StatusCode::PAYLOAD_TOO_LARGE => "response_too_large",
+        StatusCode::BAD_GATEWAY => "verification_failed",
+        StatusCode::SERVICE_UNAVAILABLE => "unavailable",
+        _ => "internal",
+    };
+    let error = hellas_rpc::edge_index::IndexError {
+        schema_version: hellas_rpc::edge_index::SCHEMA_VERSION,
+        code: code.into(),
+        message: message.to_owned(),
+        envelope: None,
+    };
+    // Negotiation may itself be why we are here; JSON is the documented
+    // default and is readable by any client.
+    let protobuf = representation(headers).unwrap_or(false);
+    match encode(&error, protobuf, crate::proof_verify::MAX_PROOF_BYTES) {
+        Ok((content_type, body)) => respond(status, content_type, body),
+        Err(()) => (
+            status,
+            [(header::CACHE_CONTROL, "no-store")],
+            "error too large",
+        )
+            .into_response(),
+    }
 }

@@ -142,6 +142,20 @@ let
     validator =
       mkCargo "check-validator" "cargo test -p hellas-chain --no-default-features --features validator"
         (cargoEnv rustToolchain);
+    # `check-validator` above runs tests, where `dead_code` is only a
+    # warning, so the two feature sets a node actually ships in were the
+    # only ones never linted. Three items in `execution::owner_tree` and
+    # four test-support helpers sat dead in them until 2026-09-22, and the
+    # same shape had already shipped once as a broken `cfg` on
+    # `kernel::execute_all`. Lint both.
+    chain-validator-lint =
+      mkCargo "check-chain-validator-lint"
+        "cargo clippy -p hellas-chain --no-default-features --features validator --all-targets -- -D warnings"
+        (cargoEnv rustToolchain);
+    chain-indexer-lint =
+      mkCargo "check-chain-indexer-lint"
+        "cargo clippy -p hellas-chain --no-default-features --features indexer --all-targets -- -D warnings && cargo clippy -p hellas-chain --no-default-features --features indexer-api --all-targets -- -D warnings"
+        (cargoEnv rustToolchain);
     # The finalized-block codec without a database or a mempool: the
     # feature an endpoint enables to read the block its channel opened
     # in. Every other gate reaches this code through `indexer`, which

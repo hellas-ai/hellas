@@ -7,9 +7,7 @@ use crate::{
         ChainVerifier, execute_all_observed,
         store::{UtxoDatabase, UtxoDb, utxo_db_config},
     },
-    proof_verify::{
-        ProofQuery, ProofVerifier, ProofBundle, VerifiedAddress, VerifiedBlock,
-    },
+    proof_verify::{ProofBundle, ProofQuery, ProofVerifier, VerifiedAddress, VerifiedBlock},
 };
 use commonware_codec::DecodeExt as _;
 use commonware_consensus::{Block as _, Heightable as _};

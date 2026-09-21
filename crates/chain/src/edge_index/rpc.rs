@@ -92,10 +92,11 @@ pub(crate) async fn serve_socket(socket: axum::extract::ws::WebSocket, index: Ed
     // Bounded: every EdgeIndex method is a short read, so capping concurrent
     // dispatches costs nothing and keeps one connection from monopolising the
     // index. Unlike the light-client service, nothing here holds a stream open.
-    let served = hellas_wire::serve_dispatched(transport, "edge-index", Some(MAX_IN_FLIGHT), || {
-        EdgeIndexServer(index.clone())
-    })
-    .await;
+    let served =
+        hellas_wire::serve_dispatched(transport, "edge-index", Some(MAX_IN_FLIGHT), || {
+            EdgeIndexServer(index.clone())
+        })
+        .await;
     if let Err(error) = served {
         tracing::warn!(%error, "edge index rpc transport closed with an error");
     }

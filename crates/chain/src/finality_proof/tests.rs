@@ -171,7 +171,7 @@ fn descendant_finality_verifies_with_full_and_light_consensus() {
 #[cfg(feature = "proof-verify")]
 #[test]
 fn descendant_finality_uses_the_certified_height_trust_and_checks_each_epoch() {
-    use crate::proof_verify::{ProofQuery, ProofVerifier, ProofBundle};
+    use crate::proof_verify::{ProofBundle, ProofQuery, ProofVerifier};
     use commonware_cryptography::{Hasher as _, Sha256};
     use hellas_genesis::{HELLAS_DEVNET_1_ID, HELLAS_DEVNET_1_JSON, TrustDocument, TrustEpoch};
     let (_, blocks, certificate, identity) = fixture_with_epochs(true);

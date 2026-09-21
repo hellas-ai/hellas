@@ -166,9 +166,7 @@ impl ProofVerifier {
             .map_err(|_| VerificationError::Round)?;
         let transaction_index = match query {
             ProofQuery::Block(FinalizedBlockQuery::Latest) => None,
-            ProofQuery::Block(FinalizedBlockQuery::Height(height))
-                if height == view.height() =>
-            {
+            ProofQuery::Block(FinalizedBlockQuery::Height(height)) if height == view.height() => {
                 None
             }
             ProofQuery::Block(FinalizedBlockQuery::Payload(payload))

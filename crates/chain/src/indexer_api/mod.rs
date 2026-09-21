@@ -5,7 +5,7 @@ use crate::{
     config::Config,
     domain::{Digest, PublicKey},
     follower::{FollowerStatusSink, ingest_finalized_block},
-    proof_verify::{ProofQuery, ProofVerifier, PROOF_SCHEMA_VERSION, ProofBundle},
+    proof_verify::{PROOF_SCHEMA_VERSION, ProofBundle, ProofQuery, ProofVerifier},
 };
 use axum::{
     Router,
@@ -206,6 +206,9 @@ async fn block(
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
 ) -> Response {
+    // Normalise Accept once: `failure` negotiates too, so it must see the
+    // same headers the success path does.
+    let headers = default_proof_accept(headers, &uri);
     let query = if selector == "latest" {
         FinalizedBlockQuery::Latest
     } else if let Some(payload) = digest(&selector) {
@@ -213,16 +216,10 @@ async fn block(
     } else {
         match selector.parse::<u64>() {
             Ok(height) => FinalizedBlockQuery::Height(height),
-            Err(_) => return failure(StatusCode::BAD_REQUEST, "invalid block height"),
+            Err(_) => return failure(&headers, StatusCode::BAD_REQUEST, "invalid block height"),
         }
     };
-    answer(
-        state,
-        query,
-        ProofQuery::Block(query),
-        default_proof_accept(headers, &uri),
-    )
-    .await
+    answer(state, query, ProofQuery::Block(query), headers).await
 }
 async fn payload(
     State(state): State<OriginState>,
@@ -230,7 +227,7 @@ async fn payload(
     headers: HeaderMap,
 ) -> Response {
     let Some(payload) = digest(&payload) else {
-        return failure(StatusCode::BAD_REQUEST, "invalid payload");
+        return failure(&headers, StatusCode::BAD_REQUEST, "invalid payload");
     };
     let query = FinalizedBlockQuery::Payload(payload);
     answer(state, query, ProofQuery::Block(query), headers).await
@@ -246,8 +243,13 @@ async fn transaction(
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
 ) -> Response {
+    let headers = default_proof_accept(headers, &uri);
     let Some(tx) = digest(&tx) else {
-        return failure(StatusCode::BAD_REQUEST, "invalid transaction digest");
+        return failure(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            "invalid transaction digest",
+        );
     };
     let height = match query.height {
         Some(height) => Some(height),
@@ -255,6 +257,7 @@ async fn transaction(
             Ok(height) => height,
             Err(error) => {
                 return failure(
+                    &headers,
                     StatusCode::from_u16(error.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
                     &error.to_string(),
                 );
@@ -263,6 +266,7 @@ async fn transaction(
     };
     let Some(height) = height else {
         return failure(
+            &headers,
             StatusCode::SERVICE_UNAVAILABLE,
             "transaction locator is unavailable or still catching up",
         );
@@ -271,7 +275,7 @@ async fn transaction(
         state,
         FinalizedBlockQuery::Height(height),
         ProofQuery::Transaction(tx),
-        default_proof_accept(headers, &uri),
+        headers,
     )
     .await
 }
@@ -345,17 +349,22 @@ async fn address(
     headers: HeaderMap,
 ) -> Response {
     let Ok(owner) = owner.parse::<crate::domain::SettlementKey>() else {
-        return failure(StatusCode::BAD_REQUEST, "invalid owner");
+        return failure(&headers, StatusCode::BAD_REQUEST, "invalid owner");
     };
-    let Some(protobuf) = representation(&default_proof_accept(headers, &uri)) else {
-        return failure(StatusCode::NOT_ACCEPTABLE, "unsupported representation");
+    let headers = default_proof_accept(headers, &uri);
+    let Some(protobuf) = representation(&headers) else {
+        return failure(
+            &headers,
+            StatusCode::NOT_ACCEPTABLE,
+            "unsupported representation",
+        );
     };
     if query
         .payload
         .as_ref()
         .is_some_and(|payload| digest(payload).is_none())
     {
-        return failure(StatusCode::BAD_REQUEST, "invalid payload");
+        return failure(&headers, StatusCode::BAD_REQUEST, "invalid payload");
     }
     let verified = match state
         .replay
@@ -370,6 +379,7 @@ async fn address(
         }
         Ok(None) => {
             return failure(
+                &headers,
                 StatusCode::SERVICE_UNAVAILABLE,
                 "no durable verified owner checkpoint is available yet",
             );
@@ -380,10 +390,11 @@ async fn address(
                 Some(crate::owner_proof::OwnerProofError::Page)
             ) =>
         {
-            return failure(StatusCode::BAD_REQUEST, "invalid owner page");
+            return failure(&headers, StatusCode::BAD_REQUEST, "invalid owner page");
         }
         Err(_) => {
             return failure(
+                &headers,
                 StatusCode::BAD_GATEWAY,
                 "durable owner proof failed verification",
             );
@@ -430,26 +441,41 @@ async fn answer(
 ) -> Response {
     let Some(protobuf) = representation(&headers) else {
         return failure(
+            &headers,
             StatusCode::NOT_ACCEPTABLE,
             "supported types are application/json and application/x-protobuf",
         );
     };
     let finalized = match state.indexer.get_finalized_block(lookup).await {
         Ok(Some(block)) => block,
-        Ok(None) => return failure(StatusCode::NOT_FOUND, "finalized block is unavailable"),
-        Err(_) => return failure(StatusCode::SERVICE_UNAVAILABLE, "archive is unavailable"),
+        Ok(None) => {
+            return failure(
+                &headers,
+                StatusCode::NOT_FOUND,
+                "finalized block is unavailable",
+            );
+        }
+        Err(_) => {
+            return failure(
+                &headers,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "archive is unavailable",
+            );
+        }
     };
     let bundle = proof_bundle(&state, finalized);
     let verified = match state.verifier.verify(bundle, query) {
         Ok(block) => block,
         Err(crate::proof_verify::VerificationError::Query) => {
             return failure(
+                &headers,
                 StatusCode::NOT_FOUND,
                 "transaction is absent from the requested block",
             );
         }
         Err(_) => {
             return failure(
+                &headers,
                 StatusCode::BAD_GATEWAY,
                 "archived proof failed verification",
             );
@@ -462,6 +488,7 @@ async fn answer(
     ) {
         Ok((content_type, body)) => respond(StatusCode::OK, content_type, body),
         Err(()) => failure(
+            &headers,
             StatusCode::PAYLOAD_TOO_LARGE,
             "proof exceeds the response budget",
         ),
@@ -477,8 +504,7 @@ fn default_proof_accept(mut headers: HeaderMap, uri: &axum::http::Uri) -> Header
     headers
 }
 
-
-use crate::http_api::{representation, respond, text_failure as failure};
+use crate::http_api::{failure, representation, respond};
 
 fn proof_bundle(state: &OriginState, finalized: crate::FinalizedBlock) -> ProofBundle {
     let epoch = crate::finality_proof::FinalityProof::decode(&finalized.snapshot.finalization)
@@ -498,104 +524,10 @@ fn proof_bundle(state: &OriginState, finalized: crate::FinalizedBlock) -> ProofB
         epoch,
     }
 }
-async fn index_transactions(state: OriginState) -> OriginResult<()> {
-    // Replay::new recovered the durable checkpoint before the listener opened.
-    // Never scan old archive heights merely to rebuild an ephemeral owner tree.
-    let mut height = state.replay.lock().await.next_height()?;
-    loop {
-        match state
-            .indexer
-            .get_finalized_block(FinalizedBlockQuery::Height(height))
-            .await?
-        {
-            Some(finalized) => {
-                let verified = state.verifier.verify(
-                    proof_bundle(&state, finalized),
-                    ProofQuery::Block(FinalizedBlockQuery::Height(height)),
-                )?;
-                let block =
-                    crate::HellasBlock::decode(verified.bundle().canonical_block.as_slice())?;
-                state.replay.lock().await.apply(&block, verified).await?;
-                height = height
-                    .checked_add(1)
-                    .ok_or("transaction index height exhausted")?;
-                ::tokio::task::yield_now().await;
-            }
-            None => ::tokio::time::sleep(std::time::Duration::from_secs(1)).await,
-        }
-    }
-}
-
-// Bound both outstanding requests and completed responses waiting for an
-// earlier height. Verification and archive ingestion remain serial below.
-const FINALIZED_FETCH_WINDOW: usize = 32;
-
-fn ordered_fetches<T, F, Fut>(first: u64, mut fetch: F) -> impl Stream<Item = (u64, T)>
-where
-    F: FnMut(u64) -> Fut,
-    Fut: Future<Output = T>,
-{
-    stream::iter(std::iter::successors(Some(first), |height| {
-        height.checked_add(1)
-    }))
-    .map(move |height| {
-        let pending = fetch(height);
-        async move { (height, pending.await) }
-    })
-    .buffered(FINALIZED_FETCH_WINDOW)
-}
-
-async fn follow_trusted(
-    state: OriginState,
-    rpc: String,
-    status: FollowerStatusSink,
-) -> OriginResult<()> {
-    loop {
-        // The remote client is only a transport/codec here. The authenticated height-key
-        // schedule below verifies every block before the native archive sees it.
-        let client = match crate::client::RemoteLightClient::connect(rpc.clone()).await {
-            Ok(client) => client,
-            Err(error) => {
-                tracing::warn!(%error,"indexer upstream connection failed");
-                ::tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                continue;
-            }
-        };
-        'connection: loop {
-            let next = state
-                .indexer
-                .get_latest_block()
-                .await?
-                .map_or(1, |latest| latest.height.saturating_add(1));
-            let fetched = ordered_fetches(next, |height| {
-                client.get_finalized_block(FinalizedBlockQuery::Height(height))
-            });
-            futures_util::pin_mut!(fetched);
-            while let Some((height, result)) = fetched.next().await {
-                let remote = match result {
-                    Ok(Some(finalized)) => finalized,
-                    Ok(None) => {
-                        // Never skip a missing height, even if later responses
-                        // already arrived. Retry from the committed archive head.
-                        ::tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                        break;
-                    }
-                    Err(error) => {
-                        tracing::warn!(%error,"indexer upstream disconnected");
-                        ::tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                        break 'connection;
-                    }
-                };
-                state.verifier.verify(
-                    proof_bundle(&state, remote.clone()),
-                    ProofQuery::Block(FinalizedBlockQuery::Height(height)),
-                )?;
-                ingest_finalized_block(&state.indexer, remote, height, &status).await?;
-                ::tokio::task::yield_now().await;
-            }
-        }
-    }
-}
+mod follower;
+#[cfg(test)]
+use follower::{FINALIZED_FETCH_WINDOW, ordered_fetches};
+use follower::{follow_trusted, index_transactions};
 
 #[cfg(test)]
 mod tests {
@@ -729,9 +661,26 @@ mod tests {
                 let body = axum::body::to_bytes(response.into_body(), 4096)
                     .await
                     .unwrap();
+                // Structured, like every other route on this API, and in the
+                // negotiated representation: `/proof` defaults to protobuf,
+                // so the error follows the body it replaces rather than
+                // always being JSON.
+                let (code, message) = if suffix == "/proof" {
+                    let error =
+                        <crate::edge_index::types::IndexError as prost::Message>::decode(&body[..])
+                            .unwrap();
+                    (error.code, error.message)
+                } else {
+                    let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    (
+                        error["code"].as_str().unwrap().to_owned(),
+                        error["message"].as_str().unwrap().to_owned(),
+                    )
+                };
+                assert_eq!(code, "unavailable");
                 assert_eq!(
-                    &body[..],
-                    b"no durable verified owner checkpoint is available yet"
+                    message,
+                    "no durable verified owner checkpoint is available yet"
                 );
             }
         });
