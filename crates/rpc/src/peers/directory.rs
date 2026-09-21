@@ -275,15 +275,29 @@ mod tests {
         PeerId::from([byte; 32])
     }
 
-    fn mark_node(directory: &PeerDirectory, id: PeerId) {
+    /// Record a peer at a caller-chosen timestamp instead of the manager's
+    /// clock, so that several peers can share one `last_seen_ms`.
+    ///
+    /// `recommendation_score` derives recency from `now_ms - last_seen_ms` and
+    /// truncates with `as i64`, so a peer observed in the query's own
+    /// millisecond scores 1000 while one observed a single millisecond earlier
+    /// scores 999 — the next honest decrement is ~0.9 s away. Marking peers
+    /// through the wall clock therefore produces unequal scores whenever the
+    /// loop straddles a millisecond, which is exactly what a loaded CI runner
+    /// does. Those runs never reach the PeerId tie-break this test exists to
+    /// pin.
+    fn mark_node_at(directory: &PeerDirectory, id: PeerId, now_ms: u64) {
         directory
             .manager
-            .peer(id)
-            .service::<NodeService>()
-            .observe_discovered(
-                DiscoverySource::Transport("test"),
-                TransportSecurity::Untrusted,
-            )
+            .with_registry_mut(|registry| {
+                registry.observe_discovered_service(
+                    now_ms,
+                    id,
+                    DiscoverySource::Transport("test"),
+                    <NodeService as ServiceMarker>::NAME,
+                    TransportSecurity::Untrusted,
+                )
+            })
             .expect("service should be recorded");
     }
 
@@ -294,6 +308,11 @@ mod tests {
         // tiebreaker so the public response is deterministic — repeated
         // calls against the same state return the same vector, even when
         // the registry contains many peers with identical scores.
+        // Every peer is observed at this one instant. Non-zero so the entries
+        // are not sitting on the manager's own epoch, and far enough below
+        // `stale_peer_after_ms` that nothing is filtered as stale.
+        const SHARED_OBSERVATION_MS: u64 = 1_000;
+
         let local = peer(0);
         let requester = peer(99);
         let mut ids = vec![peer(5), peer(2), peer(7), peer(1), peer(3)];
@@ -313,7 +332,10 @@ mod tests {
             let directory = PeerDirectory::with_config(local, config.clone());
             ids.rotate_left(trial % id_count);
             for id in &ids {
-                mark_node(&directory, *id);
+                // One shared timestamp for every peer: the scores are then
+                // equal by construction and the PeerId tie-break is the only
+                // thing that can order them.
+                mark_node_at(&directory, *id, SHARED_OBSERVATION_MS);
             }
             let peers = directory
                 .ranked_known_peers(requester, <NodeService as ServiceMarker>::ALPN, 64)
