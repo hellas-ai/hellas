@@ -141,7 +141,7 @@ pub fn run(options: OriginOptions) -> OriginResult<()> {
         )
         .await?;
         let state = OriginState {
-            edge_index: Some(edge_index),
+            edge_index,
             replay: Arc::new(::tokio::sync::Mutex::new(replay)),
             indexer: indexer.clone(),
             verifier,
@@ -159,7 +159,7 @@ pub fn run(options: OriginOptions) -> OriginResult<()> {
 
 #[derive(Clone)]
 struct OriginState {
-    edge_index: Option<crate::edge_index::EdgeIndex>,
+    edge_index: crate::edge_index::EdgeIndex,
     indexer: ChainIndexer,
     verifier: Arc<ExplorerVerifier>,
     network_id: String,
@@ -197,12 +197,7 @@ async fn edge_index_ws(
     State(state): State<OriginState>,
     ws: axum::extract::ws::WebSocketUpgrade,
 ) -> Response {
-    match state.edge_index {
-        Some(index) => {
-            ws.on_upgrade(move |socket| crate::edge_index::rpc::serve_socket(socket, index))
-        }
-        None => failure(StatusCode::SERVICE_UNAVAILABLE, "index_not_ready"),
-    }
+    ws.on_upgrade(move |socket| crate::edge_index::rpc::serve_socket(socket, state.edge_index))
 }
 
 async fn block(
@@ -257,8 +252,9 @@ async fn transaction(
     let height = query.height.or_else(|| {
         state
             .edge_index
-            .as_ref()
-            .and_then(|index| index.transaction_height(&hex::encode(tx)).ok().flatten())
+            .transaction_height(&hex::encode(tx))
+            .ok()
+            .flatten()
     });
     let Some(height) = height else {
         return failure(
@@ -771,7 +767,7 @@ mod tests {
             .await
             .unwrap();
             let app = router(OriginState {
-                edge_index: Some(h.index),
+                edge_index: h.index,
                 indexer,
                 replay: Arc::new(::tokio::sync::Mutex::new(h.replay)),
                 verifier: Arc::new(h.verifier),
@@ -864,7 +860,7 @@ mod tests {
             let tx = crate::verified_explorer::transaction_digest(&first_block.txs()[0]);
             let verifier = Arc::new(h.verifier);
             let state = OriginState {
-                edge_index: Some(h.index.clone()),
+                edge_index: h.index.clone(),
                 indexer,
                 replay: Arc::new(::tokio::sync::Mutex::new(h.replay)),
                 verifier: verifier.clone(),

@@ -1,4 +1,4 @@
-//! Durable finalized index. Object versions and publication metadata commit in one redb
+//! Durable finalized index. Current objects and publication metadata commit in one redb
 //! transaction. A small intent bridges that transaction to QMDB's independent finalize.
 use super::types::TransactionRef;
 use crate::{
@@ -14,17 +14,15 @@ use serde::{Deserialize, Serialize};
 use std::{cell::RefCell, path::Path, sync::Arc};
 
 pub(super) type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
-const STORAGE_VERSION: u32 = 2;
+const STORAGE_VERSION: u32 = 3;
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("edge_metadata_v1");
 const PROOFS: TableDefinition<u64, &[u8]> = TableDefinition::new("edge_block_proofs_v1");
-const PAYLOADS: TableDefinition<&str, u64> = TableDefinition::new("edge_payload_heights_v1");
 const EDGES: TableDefinition<&str, &[u8]> = TableDefinition::new("edge_history_v1");
 const LOOKUP: TableDefinition<&str, &str> = TableDefinition::new("edge_lookup_v1");
-const OBJECTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("edge_object_versions_v1");
+const OBJECTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("edge_current_objects_v3");
 const TRANSACTIONS: TableDefinition<&str, u64> =
     TableDefinition::new("edge_transaction_locator_v1");
 const EVENTS: TableDefinition<&str, &[u8]> = TableDefinition::new("edge_events_v1");
-const EXPIRE: TableDefinition<&str, &[u8]> = TableDefinition::new("edge_open_expiry_v1");
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub(super) struct Identity {
@@ -54,22 +52,17 @@ pub(super) struct Intent {
 pub(super) struct IndexStore {
     db: Arc<Database>,
     pub identity: Identity,
-    pub retention: u64,
 }
-/// A read transaction pins every table version even while publication/pruning proceeds.
+/// One read transaction observes current objects, history and checkpoint atomically.
 pub(super) struct ReadSnapshot {
     tx: redb::ReadTransaction,
     pub proof: ProofBundle,
-    pub retained_from_height: u64,
-    pub indexed_through: ProofBundle,
     block: RefCell<Option<(u64, crate::HellasBlock)>>,
 }
 #[derive(Debug, thiserror::Error)]
 pub(super) enum SnapshotError {
     #[error("index_not_ready")]
     NotReady,
-    #[error("snapshot_expired")]
-    Expired,
     #[error("snapshot_unavailable")]
     Unavailable,
 }
@@ -79,27 +72,9 @@ fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>> {
 fn decode<T: serde::de::DeserializeOwned>(value: &[u8]) -> Result<T> {
     Ok(serde_json::from_slice(value)?)
 }
-fn version_key(id: &[u8], height: u64) -> Vec<u8> {
-    let mut key = id.to_vec();
-    key.extend_from_slice(&height.to_be_bytes());
-    key
-}
 impl IndexStore {
     pub fn open(path: &Path, identity: Identity) -> Result<Self> {
         std::fs::create_dir_all(path.parent().ok_or("index path has no parent")?)?;
-        let retention = match std::env::var("HELLAS_EDGE_SNAPSHOT_RETENTION") {
-            Ok(raw) => {
-                let value = raw.parse::<u64>()?;
-                if value.to_string() != raw || !(32..=1024).contains(&value) {
-                    return Err(
-                        "HELLAS_EDGE_SNAPSHOT_RETENTION must be canonical decimal 32..1024".into(),
-                    );
-                }
-                value
-            }
-            Err(std::env::VarError::NotPresent) => 32,
-            Err(error) => return Err(error.into()),
-        };
         let db = Database::builder()
             .set_cache_size(64 * 1024 * 1024)
             .create(path)?;
@@ -127,18 +102,15 @@ impl IndexStore {
             }
         }
         write.open_table(PROOFS)?;
-        write.open_table(PAYLOADS)?;
         write.open_table(EDGES)?;
         write.open_table(LOOKUP)?;
         write.open_table(OBJECTS)?;
         write.open_table(EVENTS)?;
-        write.open_table(EXPIRE)?;
         write.open_table(TRANSACTIONS)?;
         write.commit()?;
         Ok(Self {
             db: Arc::new(db),
             identity,
-            retention,
         })
     }
     pub fn transaction_height(&self, digest: &str) -> Result<Option<u64>> {
@@ -221,13 +193,6 @@ impl IndexStore {
             if block.height().get() != height {
                 return Err("edge index height mismatch".into());
             }
-            let previous_floor: u64 = meta
-                .get("retained_from")?
-                .map(|v| decode(v.value()))
-                .transpose()?
-                .unwrap_or(1);
-            let floor = previous_floor.max(height.saturating_sub(self.retention - 1).max(1));
-            let mut expiry = write.open_table(EXPIRE)?;
             let mut edges = write.open_table(EDGES)?;
             let mut lookup = write.open_table(LOOKUP)?;
             let mut events = write.open_table(EVENTS)?;
@@ -259,37 +224,21 @@ impl IndexStore {
                             payment_edge_id: None,
                         };
                         edges.insert(id.as_str(), encode(&edge)?.as_slice())?;
-                        let maker =
-                            crate::domain::SettlementKey::from(terms.parties().maker()).to_string();
-                        let taker =
-                            crate::domain::SettlementKey::from(terms.parties().taker()).to_string();
-                        let kind = match terms.profile() {
-                            TermsProfile::Basic => "basic",
-                            TermsProfile::WorkStakeBond(_) => "work-stake-bond",
-                            TermsProfile::WorkPayment(payment) => {
-                                let bond_id = hex::encode(payment.bond_edge.as_bytes());
-                                let mut bond: StoredEdge = decode(
-                                    edges
-                                        .get(bond_id.as_str())?
-                                        .ok_or("payment names unindexed bond")?
-                                        .value(),
-                                )?;
-                                if bond.payment_edge_id.is_some() {
-                                    return Err("bond already has an indexed payment".into());
-                                }
-                                bond.payment_edge_id = Some(id.clone());
-                                edges.insert(bond_id.as_str(), encode(&bond)?.as_slice())?;
-                                "work-payment"
+                        if let TermsProfile::WorkPayment(payment) = terms.profile() {
+                            let bond_id = hex::encode(payment.bond_edge.as_bytes());
+                            let mut bond: StoredEdge = decode(
+                                edges
+                                    .get(bond_id.as_str())?
+                                    .ok_or("payment names unindexed bond")?
+                                    .value(),
+                            )?;
+                            if bond.payment_edge_id.is_some() {
+                                return Err("bond already has an indexed payment".into());
                             }
-                        };
-                        for prefix in [
-                            "a/".to_string(),
-                            format!("k/{kind}/"),
-                            format!("m/{maker}/"),
-                            format!("t/{taker}/"),
-                            format!("p/{maker}/"),
-                            format!("p/{taker}/"),
-                        ] {
+                            bond.payment_edge_id = Some(id.clone());
+                            edges.insert(bond_id.as_str(), encode(&bond)?.as_slice())?;
+                        }
+                        for prefix in lookup_prefixes(terms) {
                             for state in ["all", "open"] {
                                 lookup.insert(
                                     format!("{state}/{prefix}{id}").as_str(),
@@ -327,12 +276,9 @@ impl IndexStore {
                         };
                         let prefixes = lookup_prefixes(&terms);
                         for prefix in &prefixes {
+                            lookup.remove(format!("open/{prefix}{id}").as_str())?;
                             lookup.insert(format!("closed/{prefix}{id}").as_str(), id.as_str())?;
                         }
-                        expiry.insert(
-                            format!("{height:020}/{id}").as_str(),
-                            encode(&prefixes)?.as_slice(),
-                        )?;
                         edges.insert(id.as_str(), encode(&edge)?.as_slice())?;
                         (id, "close")
                     }
@@ -355,48 +301,21 @@ impl IndexStore {
                     encode(&event)?.as_slice(),
                 )?;
             }
-            // Closed edges remain in the open lookup only while a retained pin can
-            // still precede their close. Old closed history never burdens open scans.
-            let expired = expiry
-                .range(..format!("{floor:020}/").as_str())?
-                .map(|entry| {
-                    entry.map(|(key, value)| (key.value().to_string(), value.value().to_vec()))
-                })
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            for (key, value) in expired {
-                let (_, id) = key.split_once('/').ok_or("invalid expiry key")?;
-                for prefix in decode::<Vec<String>>(&value)? {
-                    lookup.remove(format!("open/{prefix}{id}").as_str())?;
-                }
-                expiry.remove(key.as_str())?;
-            }
             let mut objects = write.open_table(OBJECTS)?;
             for (id, value) in &intent.changes {
-                // First byte distinguishes a tombstone from a canonical object.
-                let mut bytes = vec![u8::from(value.is_some())];
-                if let Some(value) = value {
-                    bytes.extend(value);
-                }
-                objects.insert(version_key(id, height).as_slice(), bytes.as_slice())?;
-                // Retain one baseline at/before the oldest advertised snapshot plus
-                // every newer version. Readers already holding the old transaction
-                // keep its pages alive through redb MVCC.
-                let old = objects
-                    .range(version_key(id, 0).as_slice()..=version_key(id, floor).as_slice())?
-                    .map(|entry| entry.map(|(key, _)| key.value().to_vec()))
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
-                for key in old.iter().take(old.len().saturating_sub(1)) {
-                    objects.remove(key.as_slice())?;
+                match value {
+                    Some(value) => {
+                        objects.insert(id.as_slice(), value.as_slice())?;
+                    }
+                    None => {
+                        objects.remove(id.as_slice())?;
+                    }
                 }
             }
             write
                 .open_table(PROOFS)?
                 .insert(height, intent.proof.encode_to_vec().as_slice())?;
-            write
-                .open_table(PAYLOADS)?
-                .insert(intent.proof.payload.as_str(), height)?;
             meta.insert("latest", encode(&height)?.as_slice())?;
-            meta.insert("retained_from", encode(&floor)?.as_slice())?;
             meta.remove("intent")?;
         }
         write.commit()?;
@@ -410,63 +329,24 @@ impl IndexStore {
                 .ok_or(SnapshotError::NotReady)?
                 .value(),
         )?;
-        let indexed_through = read_proof(&tx.open_table(PROOFS)?, latest)?;
-        let retained_from_height = decode(
-            tx.open_table(META)?
-                .get("retained_from")?
-                .ok_or("missing retention cursor")?
-                .value(),
-        )?;
-        let height = match payload {
-            Some(payload) => tx
-                .open_table(PAYLOADS)?
-                .get(payload)?
-                .ok_or(SnapshotError::Unavailable)?
-                .value(),
-            None => indexed_through.height,
-        };
-        if height < retained_from_height {
-            return Err(SnapshotError::Expired.into());
+        let proof = read_proof(&tx.open_table(PROOFS)?, latest)?;
+        if payload.is_some_and(|payload| payload != proof.payload) {
+            return Err(SnapshotError::Unavailable.into());
         }
-        let proof = read_proof(&tx.open_table(PROOFS)?, height)?;
         Ok(ReadSnapshot {
             tx,
             proof,
-            retained_from_height,
-            indexed_through,
             block: RefCell::new(None),
         })
     }
 }
 impl ReadSnapshot {
     pub fn edge(&self, id: &str) -> Result<Option<StoredEdge>> {
-        let table = self.tx.open_table(EDGES)?;
-        let mut edge: StoredEdge = match table.get(id)? {
-            Some(value) => decode(value.value())?,
-            None => return Ok(None),
-        };
-        if edge.opened.height > self.proof.height {
-            return Ok(None);
-        }
-        if edge
-            .closed
-            .as_ref()
-            .is_some_and(|reference| reference.height > self.proof.height)
-        {
-            edge.closed = None;
-        }
-        if let Some(payment) = &edge.payment_edge_id {
-            let payment: StoredEdge = decode(
-                table
-                    .get(payment.as_str())?
-                    .ok_or("missing indexed payment")?
-                    .value(),
-            )?;
-            if payment.opened.height > self.proof.height {
-                edge.payment_edge_id = None;
-            }
-        }
-        Ok(Some(edge))
+        self.tx
+            .open_table(EDGES)?
+            .get(id)?
+            .map(|value| decode(value.value()))
+            .transpose()
     }
     pub fn proof(&self, height: u64) -> Result<ProofBundle> {
         read_proof(&self.tx.open_table(PROOFS)?, height)
@@ -491,19 +371,11 @@ impl ReadSnapshot {
         if id.len() != 32 {
             return Err("object id length".into());
         }
-        let table = self.tx.open_table(OBJECTS)?;
-        let low = version_key(id, 0);
-        let high = version_key(id, self.proof.height);
-        let mut range = table.range(low.as_slice()..=high.as_slice())?;
-        let Some(value) = range.next_back() else {
-            return Ok(None);
-        };
-        let (_, bytes) = value?;
-        match bytes.value().split_first() {
-            Some((0, [])) => Ok(None),
-            Some((1, canonical)) => Ok(Some(Object::decode(canonical)?)),
-            _ => Err("invalid stored object version".into()),
-        }
+        self.tx
+            .open_table(OBJECTS)?
+            .get(id)?
+            .map(|value| Object::decode(value.value()).map_err(Into::into))
+            .transpose()
     }
     /// Indexed prefix seek with a bounded visit budget; callers additionally enforce time.
     pub fn scan_edges(
@@ -555,9 +427,6 @@ impl ReadSnapshot {
                 break;
             }
             let event: StoredEvent = decode(value.value())?;
-            if event.transaction.height > self.proof.height {
-                break;
-            }
             if after
                 == Some((
                     event.transaction.height,
@@ -654,8 +523,6 @@ mod tests {
             }
             let mut meta = write.open_table(META).unwrap();
             meta.insert("latest", encode(&proof.height).unwrap().as_slice())
-                .unwrap();
-            meta.insert("retained_from", encode(&99_970_u64).unwrap().as_slice())
                 .unwrap();
             write
                 .open_table(PROOFS)

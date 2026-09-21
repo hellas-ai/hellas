@@ -8,7 +8,6 @@ use crate::domain::{Object, Transaction};
 use base64ct::{Base64UrlUnpadded, Encoding};
 use commonware_codec::Encode as _;
 use hellas_kernel::{TermsProfile, Tx};
-use serde::Serialize;
 use std::{
     path::Path,
     time::{Duration, Instant},
@@ -106,7 +105,6 @@ impl EdgeIndex {
         self.store.read(payload).map_err(|error| {
             if let Some(kind) = error.downcast_ref::<SnapshotError>() {
                 let (status, code) = match kind {
-                    SnapshotError::Expired => (410, "snapshot_expired"),
                     SnapshotError::Unavailable => (409, "snapshot_unavailable"),
                     SnapshotError::NotReady => (503, "index_not_ready"),
                 };
@@ -144,11 +142,11 @@ impl EdgeIndex {
                 indexed_through_payload: read.proof.payload.clone(),
                 complete_through_snapshot: true,
                 observed_head: Some(ObservedHead {
-                    height: read.indexed_through.height,
-                    payload: read.indexed_through.payload.clone(),
+                    height: read.proof.height,
+                    payload: read.proof.payload.clone(),
                 }),
                 observed_at_ms: read.proof.observed_at_ms,
-                retained_from_height: read.retained_from_height,
+                retained_from_height: read.proof.height,
             },
             provenance: Provenance::reported(),
             evidence: Vec::new(),
@@ -192,7 +190,6 @@ impl EdgeIndex {
             .as_deref()
             .map(|value| self.cursor(value))
             .transpose()?;
-        request.validate().map_err(EdgeIndexError::bad)?;
         let read = self.snapshot(request.payload.as_deref())?;
         let filters = Filters {
             s: request.state.unwrap_or_else(|| "open".into()),
@@ -225,12 +222,15 @@ impl EdgeIndex {
             if started.elapsed() > Duration::from_millis(250) {
                 return Err("query deadline exceeded".into());
             }
+            if (filters.s == "open" && edge.closed.is_some())
+                || (filters.s == "closed" && edge.closed.is_none())
+            {
+                return Ok(true);
+            }
             let summary = self
                 .summary(&read, &edge)
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-            if filters.s != "all" && filters.s != summary.lifecycle
-                || filters.k.as_ref().is_some_and(|kind| kind != &summary.kind)
-            {
+            if filters.k.as_ref().is_some_and(|kind| kind != &summary.kind) {
                 return Ok(true);
             }
             items.push(summary);
@@ -252,7 +252,7 @@ impl EdgeIndex {
         } else {
             None
         };
-        bounded(ListEdgesResponse {
+        Ok(ListEdgesResponse {
             envelope: self.metadata(&read),
             data: ListEdgesPage { items, next_cursor },
         })
@@ -283,11 +283,20 @@ impl EdgeIndex {
                 message: "edge is absent from indexed history at this snapshot".into(),
                 snapshot: Some(Box::new(self.metadata(read))),
             })?;
-        let summary = self.summary(read, &edge)?;
         let tx = read.transaction(&edge.opened).map_err(storage)?;
         let Transaction::Kernel(Tx::Open { funding, terms, .. }) = tx else {
             return Err(EdgeIndexError::unavailable("stored opening is not Open"));
         };
+        let summary = summary_from_open(
+            &edge.edge_id,
+            &edge.opened,
+            edge.closed.as_ref(),
+            &funding,
+            &terms,
+            edge.payment_edge_id.as_deref(),
+            &read.proof.payload,
+        )
+        .map_err(storage)?;
         let object = read
             .object(&hex::decode(id).map_err(EdgeIndexError::bad)?)
             .map_err(storage)?;
@@ -426,7 +435,7 @@ impl EdgeIndex {
             admission,
             bond_state,
         };
-        bounded(GetWorkChannelDetailResponse {
+        Ok(GetWorkChannelDetailResponse {
             envelope: self.detail_metadata(&read, [&data.payment, &data.bond])?,
             data,
         })
@@ -435,7 +444,7 @@ impl EdgeIndex {
         validate_request(request.schema_version, &request.edge_id)?;
         let read = self.snapshot(request.payload.as_deref())?;
         let data = self.detail(&read, &request.edge_id)?;
-        bounded(GetEdgeDetailResponse {
+        Ok(GetEdgeDetailResponse {
             envelope: self.detail_metadata(&read, [&data])?,
             data,
         })
@@ -527,7 +536,7 @@ impl EdgeIndex {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        bounded(ListEdgeEventsResponse {
+        Ok(ListEdgeEventsResponse {
             envelope: self.metadata(&read),
             data: EdgeEventsPage { items, next_cursor },
         })
@@ -539,21 +548,6 @@ fn validate_request(schema: u32, id: &str) -> Result<()> {
     }
     validate_id(id).map_err(EdgeIndexError::bad)
 }
-fn bounded<T: Serialize + prost::Message>(value: T) -> Result<T> {
-    if value.encoded_len() > MAX_RESPONSE_BYTES
-        || serde_json::to_vec(&value).map_err(storage)?.len() > MAX_RESPONSE_BYTES
-    {
-        Err(EdgeIndexError {
-            status: 413,
-            code: "response_too_large",
-            message: "response exceeds 8 MiB".into(),
-            snapshot: None,
-        })
-    } else {
-        Ok(value)
-    }
-}
-
 fn registry_chunk(read: &ReadSnapshot, id: &[u8]) -> Result<Option<hellas_kernel::RegistryChunk>> {
     match read.object(id).map_err(storage)? {
         Some(Object::RegistryChunk(chunk)) => Ok(Some(chunk)),

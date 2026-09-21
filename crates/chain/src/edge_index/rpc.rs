@@ -8,7 +8,13 @@ use hellas_wire::{Dispatcher, StreamTransport, WireCode, WireStatus};
 use prost::Message;
 
 fn failure(error: EdgeIndexError) -> WireStatus {
-    let (status, details) = error.into_details();
+    let (mut status, mut details) = error.into_details();
+    if details.encoded_len() > types::MAX_RESPONSE_BYTES {
+        status = 413;
+        details.code = "response_too_large".into();
+        details.message = "error evidence exceeds 8 MiB".into();
+        details.envelope = None;
+    }
     let mut status = WireStatus::new(
         match status {
             400 => WireCode::InvalidArgument,
@@ -30,6 +36,14 @@ macro_rules! method {
                 .execute(move |index| index.$name(request))
                 .await
                 .map_err(failure)?;
+            if result.encoded_len() > types::MAX_RESPONSE_BYTES {
+                return Err(failure(EdgeIndexError {
+                    status: 413,
+                    code: "response_too_large",
+                    message: "response exceeds 8 MiB".into(),
+                    snapshot: None,
+                }));
+            }
             Ok(result)
         }
     };
@@ -119,12 +133,9 @@ mod tests {
             axum::http::header::ACCEPT,
             axum::http::HeaderValue::from_static("application/x-protobuf"),
         );
-        let response = super::super::http::handle(
-            Some(index.clone()),
-            "/api/v1/edges".parse().unwrap(),
-            headers,
-        )
-        .await;
+        let response =
+            super::super::http::handle(index.clone(), "/api/v1/edges".parse().unwrap(), headers)
+                .await;
         assert_eq!(
             response.status(),
             axum::http::StatusCode::SERVICE_UNAVAILABLE
