@@ -141,6 +141,7 @@ let
       rustToolchain
       workspaceNativeBuildInputs
       ;
+    cargoDeps = nativePackages.cli.cargoDeps;
     extraChecks = kernel.checks;
   };
 
@@ -529,9 +530,12 @@ in
   ci = { inherit (ci) checks builds; };
 
   # nixosTests are also surfaced under `checks` so `nix flake check` runs them.
-  checks = (linuxOutputs.nixosTests or { }) // {
-    "no-catgrad-lock" = noCatgradLock;
-  };
+  checks =
+    (linuxOutputs.nixosTests or { })
+    // kernel.buildChecks
+    // {
+      "no-catgrad-lock" = noCatgradLock;
+    };
   nixosTests = linuxOutputs.nixosTests or { };
 
   hydraJobs = {
