@@ -20,6 +20,7 @@ ignored = [
 
 [features]
 default = []
+http-tracing = ["dep:axum", "dep:http-body"]
 otel = ["dep:opentelemetry", "dep:tracing-opentelemetry"]
 
 # === Protocol modules ======================================================
@@ -48,6 +49,8 @@ all-protocols = ["swarm", "courtesy", "execute", "evaluate", "fetch", "chain"]
 work = ["dep:hellas-kernel", "evaluate", "hellas-kernel/secp256k1"]
 
 [dependencies]
+axum = { workspace = true, optional = true }
+http-body = { version = "1", optional = true }
 bytes = { workspace = true }
 ed25519-dalek = { workspace = true }
 futures-core = { workspace = true }
@@ -89,6 +92,7 @@ hellas-wire = { workspace = true, features = ["unix", "ws"] }
 tokio-tungstenite.workspace = true
 
 [dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
 # Real settlement signatures in the paid-work vectors: the kernel's own
 # secp256k1 signer, not a placeholder that proves nothing about the keys
 # a channel actually settles with.

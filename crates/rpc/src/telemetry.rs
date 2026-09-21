@@ -25,12 +25,37 @@ macro_rules! request_span {
     };
 }
 
-#[cfg(feature = "otel")]
-#[path = "telemetry/otel.rs"]
-mod implementation;
-#[cfg(not(feature = "otel"))]
-#[path = "telemetry/noop.rs"]
+#[cfg_attr(feature = "otel", path = "telemetry/otel.rs")]
+#[cfg_attr(not(feature = "otel"), path = "telemetry/noop.rs")]
 mod implementation;
 
-pub(crate) use implementation::{client_span, record_status, server_span};
+pub(crate) use implementation::{CallSpan, client_span, server_span};
 pub use implementation::{inject, inject_current, set_remote_parent};
+
+/// HTTP server spans including streamed response bodies.
+#[cfg(all(feature = "otel", feature = "http-tracing"))]
+pub mod http;
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn injecting_absent_context_removes_stale_headers_only() {
+        let mut headers = hellas_wire::Metadata::new();
+        headers.insert_text("traceparent", "stale-parent");
+        headers.insert_text("tracestate", "stale-state");
+        headers.insert_text("authorization", "retained");
+        super::inject(&tracing::Span::none(), &mut headers);
+        assert!(headers.get("traceparent").is_none());
+        assert!(headers.get("tracestate").is_none());
+        assert_eq!(
+            headers.get("authorization").unwrap().as_text(),
+            Some("retained")
+        );
+    }
+
+    #[cfg(not(feature = "otel"))]
+    #[test]
+    fn disabled_request_span_does_not_evaluate_fields() {
+        let _span = crate::request_span!("unused", value = panic!("evaluated disabled span field"));
+    }
+}

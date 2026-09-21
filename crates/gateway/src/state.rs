@@ -30,6 +30,7 @@ pub(super) const DEFAULT_INFERENCE_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Clone)]
 pub(super) struct GatewayState {
+    pub(super) inference_metrics: super::backend::telemetry::InferenceMetrics,
     pub(super) output_cache: Option<Arc<super::cache::OutputCache>>,
     #[cfg(feature = "evaluate")]
     pub(super) local: bool,
@@ -273,6 +274,7 @@ impl GatewayState {
         };
 
         Ok(Self {
+            inference_metrics: super::backend::telemetry::InferenceMetrics::new(),
             output_cache,
             #[cfg(feature = "evaluate")]
             local: options.local,
@@ -328,6 +330,7 @@ impl GatewayState {
             options.request_overrides.clone(),
         ));
         Ok(Self {
+            inference_metrics: super::backend::telemetry::InferenceMetrics::new(),
             output_cache: None,
             #[cfg(feature = "evaluate")]
             local: false,

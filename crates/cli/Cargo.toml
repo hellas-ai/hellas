@@ -57,10 +57,8 @@ chain = [
 indexer = ["chain", "hellas-chain/explorer-origin"]
 validator = ["indexer", "hellas-chain/validator"]
 
-# Hellas OpenTelemetry / OTLP exporter + iroh-internal metrics. When off,
-# trace context propagation paths in `serve/node.rs` collapse to identity,
-# and iroh's metrics module is not built. Upstream Commonware still depends
-# on its telemetry SDK crates.
+# Hellas OTLP export and iroh metrics exposure are opt-in. Transitive
+# Commonware and mDNS dependencies may still compile SDKs or collect metrics.
 otel = [
     "hellas-chain?/otel",
     "hellas-rpc/otel",
@@ -72,6 +70,7 @@ otel = [
     "dep:opentelemetry-otlp",
     "dep:tracing-opentelemetry",
     "dep:iroh-metrics",
+    "iroh/metrics",
 ]
 
 [target.'cfg(unix)'.dependencies]
@@ -110,7 +109,7 @@ hellas-wire = { workspace = true, features = [
 hellas-work = { workspace = true, optional = true }
 hellas-xet = { workspace = true }
 hex.workspace = true
-iroh = { workspace = true, features = ["tls-ring", "metrics"] }
+iroh = { workspace = true, features = ["tls-ring"] }
 iroh-mdns-address-lookup = { workspace = true }
 iroh-metrics = { version = "1", default-features = false, features = [
     "metrics",
