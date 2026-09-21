@@ -127,7 +127,7 @@ mod tests {
     #[test]
     fn parse_scalar_promotes_json_values() {
         assert_eq!(parse_scalar("42"), json!(42));
-        assert_eq!(parse_scalar("3.14"), json!(3.14));
+        assert_eq!(parse_scalar("2.5"), json!(2.5));
         assert_eq!(parse_scalar("true"), json!(true));
         assert_eq!(parse_scalar("null"), json!(null));
         assert_eq!(parse_scalar("\"hi\""), json!("hi"));
