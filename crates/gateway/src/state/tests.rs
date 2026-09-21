@@ -459,3 +459,41 @@ async fn paid_generation_records_after_payment_and_replays_without_a_backend() {
     assert!(miss.message.contains("replay miss"));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
+
+#[tokio::test]
+async fn paid_capacity_is_a_retryable_error_and_uses_the_pool_deadline() {
+    struct Busy;
+    impl crate::PaidExecutionBackend for Busy {
+        fn timeout(&self) -> Duration {
+            Duration::from_secs(17)
+        }
+        fn execute(
+            &self,
+            _: crate::PaidExecutionRequest,
+        ) -> anyhow::Result<
+            futures::stream::BoxStream<'static, anyhow::Result<crate::ExecutionEvent>>,
+        > {
+            Err(crate::PaidGatewayBusy.into())
+        }
+        fn drain(&self) -> futures::future::BoxFuture<'_, ()> {
+            Box::pin(async {})
+        }
+    }
+    let tokenizer = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(
+        tokenizer.path(),
+        br#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"hello":0,"<unk>":1},"unk_token":"<unk>"}}"#,
+    ).unwrap();
+    let mut options = options(None);
+    options.tokenizer = Some(tokenizer.path().into());
+    options.paid_work = Some(Arc::new(Busy));
+    let state = GatewayState::from_options(&options).await.unwrap();
+    assert_eq!(state.inference_timeout, Duration::from_secs(17));
+    let error = state
+        .finalize_generation(vec![0], 1, "capacity", Retention::Ephemeral)
+        .await
+        .err()
+        .expect("busy backend must reject admission");
+    assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(error.message.contains("retry later"));
+}

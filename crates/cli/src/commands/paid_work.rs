@@ -7,6 +7,7 @@
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, bail};
@@ -596,6 +597,17 @@ impl OpenPaidChannel {
         recover: bool,
         progress: Option<hellas_work::work::PaidProgress>,
     ) -> CliResult<Option<PaidOutput>> {
+        self.run_with_admission(prepared, recover, progress, None)
+            .await
+    }
+
+    async fn run_with_admission(
+        &mut self,
+        prepared: Option<PreparedPaidInputV1>,
+        recover: bool,
+        progress: Option<hellas_work::work::PaidProgress>,
+        proposed: Option<&AtomicBool>,
+    ) -> CliResult<Option<PaidOutput>> {
         self.follow_chain().await?;
         let Self {
             args,
@@ -651,6 +663,7 @@ impl OpenPaidChannel {
                     config.poll,
                     None,
                     JobLookup::Retained(work_id),
+                    None,
                 )
                 .await;
                 if let Err(error) = &result
@@ -693,6 +706,7 @@ impl OpenPaidChannel {
                         } else {
                             JobLookup::PreparedInput
                         },
+                        proposed,
                     )
                     .await?,
                 )
@@ -728,6 +742,7 @@ async fn propose_when_ready(
     retained: Option<hellas_rpc::Digest>,
     poll: Duration,
     timeout: Duration,
+    proposed: Option<&AtomicBool>,
 ) -> CliResult<hellas_rpc::Digest> {
     let deadline = Instant::now() + timeout;
     let mut delay = poll.max(Duration::from_secs(1));
@@ -736,6 +751,11 @@ async fn propose_when_ready(
             bail!("provider remained not ready for {timeout:?}");
         }
         let transport = dialer.work().await?;
+        // Once a proposal can leave this process, a lost acknowledgement must
+        // be treated as accepted work. HTTP cancellation may no longer stop it.
+        if let Some(proposed) = proposed {
+            proposed.store(true, Ordering::Release);
+        }
         let result = match retained {
             Some(work_id) => resume_work_proposal(transport, client, work_id).await,
             None => propose_work(transport, client, proposal).await,
@@ -771,6 +791,7 @@ async fn execute_paid_job(
     poll: Duration,
     progress: Option<&hellas_work::work::PaidProgress>,
     lookup: JobLookup,
+    proposed: Option<&AtomicBool>,
 ) -> CliResult<PaidOutput> {
     let readiness_timeout = Duration::from_secs(args.timeout_secs);
     let prepared_bytes = prepared.encode()?;
@@ -799,6 +820,11 @@ async fn execute_paid_job(
         existing.len() <= 1,
         "more than one active job matches this prepared input; inspect the retained channel journal",
     );
+    if !existing.is_empty()
+        && let Some(proposed) = proposed
+    {
+        proposed.store(true, Ordering::Release);
+    }
     let (work_id, already_collected) = match existing.first().copied() {
         Some((work_id, hellas_work::work_store::JobPhase::HalfSigned, _)) => (
             propose_when_ready(
@@ -808,6 +834,7 @@ async fn execute_paid_job(
                 Some(work_id),
                 poll,
                 readiness_timeout,
+                proposed,
             )
             .await?,
             false,
@@ -816,7 +843,16 @@ async fn execute_paid_job(
         | Some((work_id, hellas_work::work_store::JobPhase::Matched, _)) => (work_id, true),
         Some((work_id, _, _)) => (work_id, false),
         None => (
-            propose_when_ready(dialer, client, &proposal, None, poll, readiness_timeout).await?,
+            propose_when_ready(
+                dialer,
+                client,
+                &proposal,
+                None,
+                poll,
+                readiness_timeout,
+                proposed,
+            )
+            .await?,
             false,
         ),
     };
