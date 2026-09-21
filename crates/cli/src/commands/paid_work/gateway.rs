@@ -453,7 +453,7 @@ impl PaidGateway {
                                     tracing::debug!(provider = %provider.args.provider, error = %format!("{error:#}"),
                                         "retained paid-work recovery could not open its channel");
                                 } else {
-                                    tracing::warn!(provider = %provider.args.provider, error = %format!("{error:#}"),
+                                    tracing::debug!(provider = %provider.args.provider, error = %format!("{error:#}"),
                                         "paid provider channel could not be opened");
                                 }
                                 provider_errors.push(format!("{}: {error:#}", provider.args.provider));
@@ -524,7 +524,7 @@ impl PaidGateway {
                             && session.client.state().proposal_nonce_high_water() == proposal_nonce
                         {
                             provider.connection_failed();
-                            tracing::warn!(provider = %provider.args.provider, error = %format!("{error:#}"),
+                            tracing::debug!(provider = %provider.args.provider, error = %format!("{error:#}"),
                                 "paid provider failed before proposing new work");
                             provider_errors.push(format!("{}: {error:#}", provider.args.provider));
                             continue;
