@@ -10,7 +10,7 @@ fn validate(settings: EnvironmentSettings, object_lengths: &[u64]) -> CausalLmEn
         .enumerate()
         .map(|(index, bytes)| ContentRef::new(ContentId::from_bytes([index as u8 + 2; 32]), *bytes))
         .collect();
-    let environment = CausalLmEnvironment::new(
+    CausalLmEnvironment::new(
         ContentRef::new(ContentId::from_bytes([1; 32]), 1),
         settings.entrypoint,
         objects,
@@ -27,8 +27,7 @@ fn validate(settings: EnvironmentSettings, object_lengths: &[u64]) -> CausalLmEn
             prefill_chunk_tokens: settings.generation.prefill_chunk_tokens,
         },
     )
-    .unwrap();
-    environment
+    .unwrap()
 }
 
 #[test]
