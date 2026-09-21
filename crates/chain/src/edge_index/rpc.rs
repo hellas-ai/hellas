@@ -7,63 +7,28 @@ use hellas_rpc::{
 use hellas_wire::{Dispatcher, StreamTransport, WireCode, WireStatus};
 use prost::Message;
 
-fn failure(mut error: EdgeIndexError) -> WireStatus {
-    let mut details = types::IndexError {
-        schema_version: types::SCHEMA_VERSION,
-        code: error.code.into(),
-        message: error.message.clone(),
-        envelope: error.snapshot.take().map(|value| *value),
-    };
-    if details.encoded_len() > types::MAX_RESPONSE_BYTES
-        || serde_json::to_vec(&details)
-            .map_or(true, |bytes| bytes.len() > types::MAX_RESPONSE_BYTES)
-    {
-        error.status = 413;
-        error.code = "response_too_large";
-        error.message = "error evidence exceeds 8 MiB".into();
-        details.code = error.code.into();
-        details.message = error.message.clone();
-        details.envelope = None;
-    }
+fn failure(error: EdgeIndexError) -> WireStatus {
+    let (status, details) = error.into_details();
     let mut status = WireStatus::new(
-        match error.status {
+        match status {
             400 => WireCode::InvalidArgument,
             404 => WireCode::NotFound,
             409 | 410 => WireCode::FailedPrecondition,
             413 => WireCode::ResourceExhausted,
             _ => WireCode::Unavailable,
         },
-        format!("{}: {}", error.code, error.message),
+        format!("{}: {}", details.code, details.message),
     );
     status.details = details.encode_to_vec().into();
     status
-}
-fn unavailable(message: &str) -> WireStatus {
-    failure(EdgeIndexError {
-        status: 503,
-        code: "index_not_ready",
-        message: message.into(),
-        snapshot: None,
-    })
 }
 macro_rules! method {
     ($name:ident,$req:ident,$res:ident,$shared:ident) => {
         async fn $name(&self, request: pb::$req) -> Result<pb::$res, WireStatus> {
             let request: types::$shared = request;
-            let index = self.clone();
-            let permit = index
-                .permits
-                .clone()
-                .try_acquire_owned()
-                .map_err(|_| unavailable("index query capacity exhausted; retry later"))?;
-            let task = tokio::task::spawn_blocking(move || {
-                let _permit = permit;
-                index.$name(request)
-            });
-            let result = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            let result = self
+                .execute(move |index| index.$name(request))
                 .await
-                .map_err(|_| unavailable("index query deadline exceeded; retry later"))?
-                .map_err(|_| unavailable("index query failed"))?
                 .map_err(failure)?;
             Ok(result)
         }
@@ -175,7 +140,7 @@ mod tests {
             pb::EdgeIndexGetEdgeDetailRequest {
                 edge_id: "01".repeat(32),
                 payload: None,
-                schema_version: 1,
+                schema_version: super::types::SCHEMA_VERSION,
             },
         )
         .await
