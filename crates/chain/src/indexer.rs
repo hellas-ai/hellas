@@ -229,6 +229,7 @@ impl ChainIndexer {
     ) -> Result<IngestOutcome, IngestError> {
         let _guard = self.ingest_lock.lock().await;
         let terminal = proof.descendants.last().unwrap_or(&block);
+        #[cfg(feature = "explorer-origin")]
         let finalization = &proof.certificate;
         #[cfg(feature = "explorer-origin")]
         let scheduled = self

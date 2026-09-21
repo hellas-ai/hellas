@@ -123,7 +123,7 @@ pub async fn execute_all<E>(
 where
     E: StorageContext + Spawner + Send + Sync + 'static,
 {
-    let mut batches = maybe_seed_genesis(context, genesis_allocations, batches).await?;
+    let mut batches = maybe_seed_genesis(context, genesis_allocations, batches, None).await?;
     for tx in txs {
         let next = apply_transaction(batches, context, verifier, tx)
             .await
@@ -146,7 +146,7 @@ pub async fn execute_proposal<E>(
 where
     E: StorageContext + Spawner + Send + Sync + 'static,
 {
-    let mut batches = maybe_seed_genesis(context, genesis_allocations, batches).await?;
+    let mut batches = maybe_seed_genesis(context, genesis_allocations, batches, None).await?;
     let mut included = Vec::new();
     let mut retained = Vec::new();
     let mut included_bytes = 0_usize;
@@ -200,10 +200,36 @@ fn response_contest_was_removed(transaction: &Transaction, error: &ExecutionErro
     )
 }
 
+// Preserve the validator's allocation limit and identifier derivation for replay.
+fn genesis_coins(
+    allocations: &[(SettlementKey, u64)],
+) -> impl Iterator<Item = (ObjectId, Coin)> + '_ {
+    allocations
+        .iter()
+        .enumerate()
+        .map_while(|(idx, (owner, balance))| {
+            let Ok(index) = u16::try_from(idx) else {
+                warn!(
+                    index = idx,
+                    "validator index overflow; truncating genesis allocation"
+                );
+                return None;
+            };
+            Some((
+                genesis_object_id(index),
+                Coin {
+                    owner: *owner,
+                    value: *balance,
+                },
+            ))
+        })
+}
+
 async fn maybe_seed_genesis<E>(
     context: KernelContext,
     genesis_allocations: &[(SettlementKey, u64)],
     mut batches: Batch<E>,
+    mut changes: Option<&mut Vec<(ObjectId, Option<Object>)>>,
 ) -> Result<Batch<E>, ExecutionError>
 where
     E: StorageContext + Spawner + Send + Sync + 'static,
@@ -212,22 +238,13 @@ where
         return Ok(batches);
     }
 
-    for (idx, (owner, balance)) in genesis_allocations.iter().enumerate() {
-        let Ok(validator_index) = u16::try_from(idx) else {
-            warn!(
-                index = idx,
-                "validator index overflow; truncating genesis allocation"
-            );
-            break;
-        };
-        let id = genesis_object_id(validator_index);
-        let coin = Coin {
-            owner: *owner,
-            value: *balance,
-        };
+    for (id, coin) in genesis_coins(genesis_allocations) {
         batches = super::owner_tree::write_owned(batches, id, Some(Object::Coin(coin)))
             .await
             .map_err(|(_, error)| error)?;
+        if let Some(changes) = changes.as_deref_mut() {
+            changes.push((id, Some(Object::Coin(coin))));
+        }
     }
     Ok(batches)
 }
@@ -875,21 +892,9 @@ pub(crate) async fn execute_all_observed<E>(
 where
     E: StorageContext + Spawner + Send + Sync + 'static,
 {
-    let mut batches = maybe_seed_genesis(context, genesis_allocations, batches).await?;
     let mut changes = Vec::new();
-    if context.block_height().get() == 1 {
-        for (index, (owner, value)) in genesis_allocations.iter().enumerate() {
-            let index = u16::try_from(index)
-                .map_err(|_| ExecutionError::Storage("too many genesis allocations".into()))?;
-            changes.push((
-                genesis_object_id(index),
-                Some(Object::Coin(Coin {
-                    owner: *owner,
-                    value: *value,
-                })),
-            ));
-        }
-    }
+    let mut batches =
+        maybe_seed_genesis(context, genesis_allocations, batches, Some(&mut changes)).await?;
     for tx in txs {
         if let Transaction::Kernel(kernel) = tx {
             batches = apply_kernel_transaction_observed(
