@@ -89,7 +89,9 @@ impl EdgeIndexClient {
         {
             return Err(ProjectionError::Binding);
         }
-        self.check_proof(&envelope.snapshot.block_proof)?;
+        for proof in std::iter::once(&envelope.snapshot.block_proof).chain(&envelope.evidence) {
+            self.check_proof(proof)?;
+        }
         Ok(())
     }
     fn check_proof(
@@ -106,38 +108,16 @@ impl EdgeIndexClient {
             .map_err(|e| ProjectionError::Malformed(e.to_string()))?;
         Ok(())
     }
-    fn check_nested_detail(
-        &self,
-        envelope: &EdgeIndexMetadata,
-        detail: &EdgeDetail,
-    ) -> Result<(), ProjectionError> {
-        check_detail(detail)?;
-        for proof in
-            std::iter::once(&detail.opening.proof).chain(detail.closing.iter().map(|c| &c.proof))
-        {
-            if proof.height > envelope.snapshot.height {
-                return Err(ProjectionError::Binding);
-            }
-            self.check_proof(proof)?;
-        }
-        Ok(())
-    }
     pub fn check_edge(&self, response: &GetEdgeDetailResponse) -> Result<(), ProjectionError> {
         self.check_envelope(&response.envelope)?;
-        self.check_nested_detail(&response.envelope, &response.data)
+        check_detail(&response.data, &response.envelope)
     }
     pub fn check_channel(
         &self,
         response: &GetWorkChannelDetailResponse,
     ) -> Result<(), ProjectionError> {
         self.check_envelope(&response.envelope)?;
-        self.check_nested_detail(&response.envelope, &response.data.payment)?;
-        self.check_nested_detail(&response.envelope, &response.data.bond)?;
-        check_work_channel(
-            &response.data,
-            self.network,
-            response.envelope.snapshot.height,
-        )
+        check_work_channel(&response.data, self.network, &response.envelope)
     }
     pub fn check_list(&self, response: &ListEdgesResponse) -> Result<(), ProjectionError> {
         self.check_envelope(&response.envelope)?;
@@ -352,21 +332,30 @@ fn referenced_transaction(
 }
 /// Checks public projections against their canonical evidence. Does not verify consensus
 /// signatures, current-state membership, global discovery, or completeness.
-pub fn check_detail(detail: &EdgeDetail) -> Result<(), ProjectionError> {
+pub fn check_detail(
+    detail: &EdgeDetail,
+    envelope: &EdgeIndexMetadata,
+) -> Result<(), ProjectionError> {
     let opening = &detail.opening;
-    if opening.transaction != detail.summary.opened {
+    if opening.transaction != detail.summary.opened
+        || opening.transaction.height > envelope.snapshot.height
+        || detail
+            .closing
+            .as_ref()
+            .is_some_and(|c| c.transaction.height > envelope.snapshot.height)
+    {
         return Err(ProjectionError::Binding);
     }
-    let tx = referenced_transaction(&opening.transaction, &opening.proof)?;
+    let tx = referenced_transaction(
+        &opening.transaction,
+        envelope
+            .proof(&opening.transaction.payload)
+            .map_err(|_| ProjectionError::Binding)?,
+    )?;
     let crate::domain::Transaction::Kernel(kernel::Tx::Open { funding, terms, .. }) = tx else {
         return Err(ProjectionError::Binding);
     };
-    let expected_opening = opening_projection(
-        opening.transaction.clone(),
-        opening.proof.clone(),
-        &funding,
-        &terms,
-    )?;
+    let expected_opening = opening_projection(opening.transaction.clone(), &funding, &terms)?;
     if &expected_opening != opening {
         return Err(ProjectionError::Binding);
     }
@@ -408,7 +397,12 @@ pub fn check_detail(detail: &EdgeDetail) -> Result<(), ProjectionError> {
             {
                 return Err(ProjectionError::Binding);
             }
-            let close = referenced_transaction(reference, &closing.proof)?;
+            let close = referenced_transaction(
+                reference,
+                envelope
+                    .proof(&reference.payload)
+                    .map_err(|_| ProjectionError::Binding)?,
+            )?;
             match close {
                 crate::domain::Transaction::Kernel(kernel::Tx::Close { input, .. })
                     if hex::encode(input.as_bytes()) == edge_id => {}
@@ -451,10 +445,11 @@ fn edge_id(value: &str) -> Result<kernel::EdgeId, ProjectionError> {
 pub fn check_work_channel(
     detail: &WorkChannelDetail,
     network: kernel::NetworkId,
-    height: u64,
+    envelope: &EdgeIndexMetadata,
 ) -> Result<(), ProjectionError> {
-    check_detail(&detail.payment)?;
-    check_detail(&detail.bond)?;
+    let height = envelope.snapshot.height;
+    check_detail(&detail.payment, envelope)?;
+    check_detail(&detail.bond, envelope)?;
     let payment_id = edge_id(&detail.payment.summary.edge_id)?;
     let bond_id = edge_id(&detail.bond.summary.edge_id)?;
     let terms: kernel::Terms = decode_canonical(&detail.payment.opening.canonical_terms)?;
@@ -733,13 +728,11 @@ pub fn summary_from_open(
 }
 pub fn opening_projection(
     transaction: TransactionRef,
-    proof: crate::verified_explorer::ProofBundle,
     funding: &kernel::Funding,
     terms: &kernel::Terms,
 ) -> Result<Opening, ProjectionError> {
     Ok(Opening {
         transaction,
-        proof,
         funding_maker: funding
             .maker()
             .as_slice()

@@ -13,7 +13,8 @@ service EdgeIndex {
  rpc ListEdgeEvents(EdgeIndexListEdgeEventsRequest) returns (EdgeIndexListEdgeEventsResponse);
  rpc GetWorkChannelDetail(EdgeIndexGetWorkChannelDetailRequest) returns (EdgeIndexGetWorkChannelDetailResponse);
 }
-// Identical field/tag schema to verified_explorer::ProofBundle; never detached certificates.
+// Canonical proof transport definition, also re-exported as verified_explorer::ProofBundle.
+// JSON proof routes retain numeric integers/byte arrays; EdgeIndex uses its explicit adapters.
 message EdgeIndexProofBundle {
  uint32 schema_version = 1; string network_id = 2; string trust_sha256 = 3;
  uint64 height = 4; string payload = 5; string state_root = 6;
@@ -65,6 +66,8 @@ message EdgeIndexEdgeIndexMetadata {
  EdgeIndexSnapshot snapshot = 5;
  EdgeIndexIndexCoverage index = 6;
  EdgeIndexProvenance provenance = 7;
+ // Distinct historical proofs; the snapshot proof is never repeated here.
+ repeated EdgeIndexProofBundle evidence = 8;
 }
 
 message EdgeIndexListEdgesRequest {
@@ -198,7 +201,7 @@ message EdgeIndexWorkPaymentTerms {
 
 message EdgeIndexOpening {
  EdgeIndexTransactionRef transaction = 1;
- EdgeIndexProofBundle proof = 2;
+ reserved 2; // Evidence is resolved by transaction.payload in the response metadata.
  repeated string funding_maker = 3;
  repeated string funding_taker = 4;
  bytes canonical_terms = 5;
@@ -207,7 +210,7 @@ message EdgeIndexOpening {
 
 message EdgeIndexClosing {
  EdgeIndexTransactionRef transaction = 1;
- EdgeIndexProofBundle proof = 2;
+ reserved 2; // Evidence is resolved by transaction.payload in the response metadata.
 }
 
 message EdgeIndexRelatedEdges {

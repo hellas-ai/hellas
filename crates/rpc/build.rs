@@ -30,6 +30,8 @@ use prost_types::field_descriptor_proto::{Label, Type as FieldType};
 use prost_types::{DescriptorProto, EnumDescriptorProto, FieldDescriptorProto, FileDescriptorSet};
 use quote::{format_ident, quote};
 
+mod edge_index_codegen;
+
 fn main() {
     emit_git_rev();
     regenerate();
@@ -71,7 +73,7 @@ fn regenerate() {
     }
 
     // 1. Parse with protox.
-    let fds: FileDescriptorSet = protox::compile(&protos, [&proto_root])
+    let mut fds: FileDescriptorSet = protox::compile(&protos, [&proto_root])
         .expect("protox failed to parse hellas .proto files");
 
     // 2. Build a schema table so we can resolve `.package.Name` references
@@ -93,9 +95,11 @@ fn regenerate() {
         "hellas.v1.WorkEvent.kind",
         "#[allow(clippy::large_enum_variant)]",
     );
+    edge_index_codegen::configure(&mut config, &mut fds, &out_dir);
     config
         .compile_fds(fds)
         .expect("prost-build failed to emit message types");
+    edge_index_codegen::finish(&out_dir);
 
     // 4. Render and write the service / marker / client / server modules,
     //    keyed off the collected `RpcService` list and the schema index.

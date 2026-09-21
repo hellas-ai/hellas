@@ -16,33 +16,7 @@ use serde::{Deserialize, Serialize};
 pub const PROOF_SCHEMA_VERSION: u32 = 1;
 pub const MAX_PROOF_BYTES: usize = 16 * 1024 * 1024;
 
-/// The JSON and protobuf representations carry identical proof fields. Byte vectors are JSON
-/// arrays; no JSON rendering or observation timestamp is covered by the consensus certificate.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, prost::Message)]
-#[serde(deny_unknown_fields)]
-pub struct ProofBundle {
-    #[prost(uint32, tag = "1")]
-    pub schema_version: u32,
-    #[prost(string, tag = "2")]
-    pub network_id: String,
-    #[prost(string, tag = "3")]
-    pub trust_sha256: String,
-    #[prost(uint64, tag = "4")]
-    pub height: u64,
-    #[prost(string, tag = "5")]
-    pub payload: String,
-    #[prost(string, tag = "6")]
-    pub state_root: String,
-    #[prost(bytes = "vec", tag = "7")]
-    pub finalization: Vec<u8>,
-    #[prost(bytes = "vec", tag = "8")]
-    pub canonical_block: Vec<u8>,
-    #[prost(uint64, tag = "9")]
-    pub observed_at_ms: u64,
-    /// Epoch of the certified descendant, which may follow the target block's epoch.
-    #[prost(uint64, tag = "10")]
-    pub epoch: u64,
-}
+pub use hellas_rpc::edge_index::ProofBundle;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExplorerQuery {
