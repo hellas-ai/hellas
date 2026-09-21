@@ -15,6 +15,8 @@ pub fn inject_current(headers: &mut Metadata) {
 pub fn inject(span: &Span, headers: &mut Metadata) {
     use opentelemetry::propagation::Injector;
     use tracing_opentelemetry::OpenTelemetrySpanExt;
+    headers.remove("traceparent");
+    headers.remove("tracestate");
     struct Carrier<'a>(&'a mut Metadata);
     impl Injector for Carrier<'_> {
         fn set(&mut self, key: &str, value: String) {
@@ -124,5 +126,46 @@ fn status_name(code: hellas_wire::WireCode) -> &'static str {
         WireCode::Unavailable => "UNAVAILABLE",
         WireCode::DataLoss => "DATA_LOSS",
         WireCode::Unauthenticated => "UNAUTHENTICATED",
+    }
+}
+
+/// Shared by the two halves of a streaming call. The last owner reports
+/// cancellation unless a terminal result has already been observed.
+#[derive(Clone)]
+pub(crate) struct CallSpan(std::sync::Arc<CallState>);
+
+struct CallState {
+    span: Span,
+    finished: std::sync::atomic::AtomicBool,
+}
+
+impl CallSpan {
+    pub(crate) fn new(span: Span) -> Self {
+        Self(std::sync::Arc::new(CallState {
+            span,
+            finished: std::sync::atomic::AtomicBool::new(false),
+        }))
+    }
+
+    pub(crate) fn span(&self) -> &Span {
+        &self.0.span
+    }
+
+    pub(crate) fn finish(&self, code: hellas_wire::WireCode) {
+        if !self
+            .0
+            .finished
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            record_status(&self.0.span, code);
+        }
+    }
+}
+
+impl Drop for CallState {
+    fn drop(&mut self) {
+        if !*self.finished.get_mut() {
+            record_status(&self.span, hellas_wire::WireCode::Cancelled);
+        }
     }
 }
