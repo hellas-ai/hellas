@@ -81,7 +81,7 @@ opentelemetry-otlp = { version = "0.31", default-features = false, features = [
     "reqwest-blocking-client",
     "reqwest-rustls-webpki-roots",
 ] }
-opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
 p256 = { version = "0.14", default-features = false, features = ["ecdsa"] }
 prometheus-client = "0.25"
 rand = "0.10"
