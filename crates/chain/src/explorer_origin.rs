@@ -169,16 +169,25 @@ impl OwnerSnapshots {
     }
 }
 
+#[cfg(feature = "otel")]
+#[path = "explorer_origin/telemetry.rs"]
+mod telemetry;
+#[cfg(not(feature = "otel"))]
+#[path = "explorer_origin/telemetry_noop.rs"]
+mod telemetry;
+
 fn router(state: OriginState) -> Router {
-    Router::new()
-        .route("/api/v1/blocks/{selector}", get(block))
-        .route("/api/v1/blocks/{selector}/proof", get(block))
-        .route("/api/v1/blocks/by-payload/{payload}", get(payload))
-        .route("/api/v1/transactions/{digest}", get(transaction))
-        .route("/api/v1/transactions/{digest}/proof", get(transaction))
-        .route("/api/v1/addresses/{owner}/proof", get(address))
-        .route("/api/v1/addresses/{owner}", get(address))
-        .with_state(state)
+    telemetry::layer(
+        Router::new()
+            .route("/api/v1/blocks/{selector}", get(block))
+            .route("/api/v1/blocks/{selector}/proof", get(block))
+            .route("/api/v1/blocks/by-payload/{payload}", get(payload))
+            .route("/api/v1/transactions/{digest}", get(transaction))
+            .route("/api/v1/transactions/{digest}/proof", get(transaction))
+            .route("/api/v1/addresses/{owner}/proof", get(address))
+            .route("/api/v1/addresses/{owner}", get(address))
+            .with_state(state),
+    )
 }
 
 async fn block(

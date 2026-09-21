@@ -6,6 +6,7 @@ license.workspace = true
 
 [features]
 default = []
+otel = ["hellas-rpc?/otel"]
 # Chain/light-client domain vocabulary: addresses, transactions,
 # WebAuthn signature policy, and challenge derivation (`domain` module).
 domain = [
@@ -115,13 +116,8 @@ validator = [
     "server",
     "dep:axum",
     "dep:commonware-broadcast",
-    "dep:opentelemetry",
-    "dep:opentelemetry-otlp",
-    "dep:opentelemetry_sdk",
     "dep:rand_core",
     "dep:toml",
-    "dep:tracing-opentelemetry",
-    "dep:tracing-subscriber",
     "hellas-kernel/secp256k1",
     "hellas-kernel/webauthn",
 ]
@@ -162,9 +158,6 @@ hellas-rpc = { workspace = true, optional = true, features = ["chain"] }
 hellas-wire = { workspace = true, optional = true }
 hellas-work = { workspace = true, optional = true }
 hex = { workspace = true, optional = true }
-opentelemetry = { workspace = true, optional = true }
-opentelemetry-otlp = { workspace = true, optional = true }
-opentelemetry_sdk = { workspace = true, optional = true }
 p256 = { workspace = true, optional = true }
 prometheus-client = { workspace = true, optional = true }
 prost = { version = "0.14", default-features = false, features = [
@@ -186,12 +179,6 @@ tokio-stream = { workspace = true, optional = true, features = ["sync"] }
 tokio-tungstenite = { workspace = true, optional = true }
 toml = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
-tracing-opentelemetry = { workspace = true, optional = true }
-tracing-subscriber = { workspace = true, optional = true, features = [
-    "fmt",
-    "json",
-    "env-filter",
-] }
 url = { version = "2", optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
