@@ -225,6 +225,10 @@ where
                         "terminal result changed streamed output",
                     ));
                 }
+                if stream.next().await.transpose()?.is_some() {
+                    return Err(DeliverError::Malformed("event after terminal result"));
+                }
+                stream.finish()?;
                 let result = endpoint.receive(work_id, ready, &delivered)?;
                 for event in &events[streamed.len()..] {
                     if event.event().body().kind() == hellas_rpc::evaluate::TOKEN_DELTA_EVENT_KIND {
@@ -243,6 +247,7 @@ where
             None => return Err(DeliverError::Malformed("empty stream event")),
         }
     }
+    stream.finish()?;
     Err(DeliverError::Malformed(
         "result stream ended without terminal result",
     ))

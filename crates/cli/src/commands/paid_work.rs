@@ -827,18 +827,49 @@ async fn execute_paid_job(
             .map(|job| job.transcript().to_vec())
             .context("collected job disappeared from its journal")?
     } else if let Some(progress) = progress {
-        let delivery = hellas_work::work::fetch_result_stream(
-            dialer.work().await?,
-            client,
-            ready,
-            work_id,
-            |event| {
-                progress(event.clone()).map_err(|error| {
-                    hellas_rpc::protocol::work::PaidWorkError::Transcript(error.to_string())
-                })
-            },
-        )
-        .await?;
+        let mut emitted = false;
+        let delivery = loop {
+            let result = hellas_work::work::fetch_result_stream(
+                dialer.work().await?,
+                client,
+                ready,
+                work_id,
+                |event| {
+                    emitted = true;
+                    progress(event.clone()).map_err(|error| {
+                        hellas_rpc::protocol::work::PaidWorkError::Transcript(error.to_string())
+                    })
+                },
+            )
+            .await;
+            let error = match result {
+                Ok(delivery) => break delivery,
+                Err(error) => error,
+            };
+            let retryable = match &error {
+                hellas_work::work::DeliverError::Transport(status) => {
+                    status.code == hellas_wire::WireCode::Unavailable
+                }
+                hellas_work::work::DeliverError::Refused { refusal, .. } => refusal.is_retryable(),
+                _ => false,
+            };
+            // Retry delivery of this accepted job only before exposing output.
+            // Reopening after a prefix would replay it into the user's stream.
+            if emitted || !retryable {
+                return Err(error.into());
+            }
+            client.catch_up(chain).await?;
+            let job = client
+                .state()
+                .job_by_id(work_id)
+                .context("accepted job disappeared")?;
+            anyhow::ensure!(
+                client.state().cursor().0 <= job.authorization().payment_deadline,
+                "payment deadline elapsed while waiting for result stream"
+            );
+            tracing::debug!(%error, %work_id, "waiting for paid result stream readiness");
+            tokio::time::sleep(poll.max(Duration::from_secs(1))).await;
+        };
         client.catch_up(chain).await?;
         anyhow::ensure!(
             client.state().cursor().0 <= proposal.deadlines.payment,

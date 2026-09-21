@@ -1551,3 +1551,99 @@ async fn live_prefix_precedes_terminal_and_reserves_delivery_credit() {
     assert_eq!(job.phase(), JobPhase::Delivered);
     assert_eq!(job.transcript(), delivered.transcript);
 }
+
+#[tokio::test]
+async fn paid_stream_checks_status_and_terminal_shape_before_recording_delivery() {
+    use hellas_rpc::pb::work::{WorkStreamEvent, work_stream_event};
+    use hellas_rpc::services::work::StreamResult;
+    use hellas_wire::{WireCode, WireStatus};
+    use hellas_work::work::fetch_result_stream;
+
+    for (terminal_count, status) in [
+        (0, WireCode::Unavailable),
+        (1, WireCode::Unavailable),
+        (2, WireCode::Ok),
+        (1, WireCode::Ok),
+    ] {
+        let client_root = temp();
+        let provider_root = temp();
+        let ready = ready();
+        let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR);
+        let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
+        let (id, _) = accept(
+            &execution_policy(),
+            &mut [&mut client_store, &mut provider_store],
+            1,
+        );
+        let service = WorkService::new(
+            ProviderEndpoint::new(ready.clone(), provider_store, provider()).unwrap(),
+        );
+        run_to_result(&service, &ready, id).await;
+        let delivered = service
+            .deliver(&delivery_request(ready.channel(), id), &EXPORTER)
+            .unwrap();
+        let event = WorkStreamEvent {
+            outcome: Some(work_stream_event::Outcome::Delivered(WorkDelivered {
+                result: delivered.result.encode(),
+                provider_signature: delivered.signature.as_bytes().to_vec(),
+                transcript: delivered.transcript.clone(),
+            })),
+        };
+        let (transport, server_transport) = transport_pair();
+        let serving = tokio::spawn(async move {
+            let inbound = server_transport.accept().await.unwrap().unwrap();
+            hellas_rpc::call::dispatch_server_streaming::<MuxTransport, StreamResult, _, _, _>(
+                inbound,
+                move |_| async move {
+                    if terminal_count == 0 {
+                        return Err(WireStatus::new(status, "not ready"));
+                    }
+                    let mut events = vec![Ok(event); terminal_count];
+                    if status != WireCode::Ok {
+                        events.push(Err(WireStatus::new(status, "delivery interrupted")));
+                    }
+                    Ok(futures::stream::iter(events))
+                },
+            )
+            .await
+            .unwrap();
+        });
+        let mut endpoint = ClientEndpoint::new(ready.clone(), client_store, client()).unwrap();
+        let mut prefixes = 0;
+        let result = fetch_result_stream(transport, &mut endpoint, &ready, id, |_| {
+            prefixes += 1;
+            Ok(())
+        })
+        .await;
+        serving.await.unwrap();
+        if status != WireCode::Ok {
+            assert!(matches!(result, Err(DeliverError::Transport(error)) if error.code == status));
+        } else if terminal_count != 1 {
+            assert!(matches!(
+                result,
+                Err(DeliverError::Malformed("event after terminal result"))
+            ));
+        } else {
+            assert_eq!(result.unwrap(), delivered);
+            assert_eq!(prefixes, 1);
+            assert_eq!(
+                endpoint.state().job_by_id(id).unwrap().phase(),
+                JobPhase::Ready
+            );
+            continue;
+        }
+        assert_eq!(prefixes, 0);
+        assert_eq!(
+            endpoint.state().job_by_id(id).unwrap().phase(),
+            JobPhase::Accepted
+        );
+        let (transport, server_transport) = transport_pair();
+        let serving = serve(server_transport, service.clone());
+        let recovered = fetch_result_stream(transport, &mut endpoint, &ready, id, |_| Ok(()))
+            .await
+            .unwrap();
+        assert_eq!(recovered, delivered);
+        serving.abort();
+        let _ = serving.await;
+    }
+}
