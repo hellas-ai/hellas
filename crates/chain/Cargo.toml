@@ -65,7 +65,7 @@ block-view = [
     "dep:commonware-storage",
     "dep:commonware-utils",
 ]
-explorer-origin = ["verified-explorer", "indexer", "dep:axum"]
+explorer-origin = ["verified-explorer", "indexer", "dep:axum", "hellas-rpc/http-tracing"]
 verified-explorer = ["block-view", "dep:serde", "dep:hex", "dep:prost"]
 indexer = [
     "block-view",
