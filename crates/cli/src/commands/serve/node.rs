@@ -16,7 +16,7 @@ use std::time::Duration;
 use anyhow::Context;
 use futures::future::BoxFuture;
 use hellas_chain::client::VerifiedRemoteLightClient;
-use hellas_chain::work_blocks::advance_paid_work_clock;
+use hellas_chain::work_blocks::{PaidWorkClockError, advance_paid_work_clock};
 use hellas_chain::{
     ConsensusInfo, ConsensusVerifier, FinalizedWorkView, WorkBlocks, WorkChannelQuery,
 };
@@ -61,7 +61,7 @@ use hellas_wire::{Dispatcher, ServiceMarker, StreamTransport, TransportContext, 
 use hellas_work::work::{
     CloseEndpoint, PaidEvaluateBackend, RunError, RunOutcome, WorkService, run_accepted_work,
 };
-use hellas_work::work_close::{FinalizedBlocks, TxSink};
+use hellas_work::work_close::{CatchUpError, FinalizedBlocks, TxSink};
 use hellas_work::work_handshake::{PaymentAdmission, SetupEndpoint, SetupService};
 use hellas_work::work_open::{SetupAdvance, SetupDriveError, SetupProgress, SetupView};
 use hellas_work::work_store::{ChannelStore, JobPhase, Role, SetupStore, discover_setups};
@@ -1269,6 +1269,12 @@ impl SetupClock {
             }
             match advance_paid_work_clock(&channel.service, source).await {
                 Ok(progress) => debug!(bond, ?progress, "the channel advanced"),
+                // `resume_accepted` owns the channel while it starts the
+                // durable execution. The clock's concurrent close pass has
+                // no work to do until that owner returns the cursor.
+                Err(PaidWorkClockError::CloseDrive(CatchUpError::Busy)) => {
+                    debug!(bond, "the channel is already being driven")
+                }
                 Err(error) => {
                     answered &= !error.source_failed();
                     warn!(bond, %error, "this channel's close did not advance");

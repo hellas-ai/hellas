@@ -34,9 +34,11 @@ fn with_default_directives(filter: EnvFilter) -> EnvFilter {
     filter
         .add_directive("hellas_request=info".parse().unwrap())
         .add_directive("noq::connection=error".parse().unwrap())
+        .add_directive("noq_proto::connection=error".parse().unwrap())
         .add_directive("netlink_packet_route=error".parse().unwrap())
         .add_directive("iroh::net_report=error".parse().unwrap())
         .add_directive("iroh::address_lookup=error".parse().unwrap())
+        .add_directive("iroh::socket::transports::relay=error".parse().unwrap())
 }
 
 /// Local logs contain event fields; request span attributes belong to traces.
