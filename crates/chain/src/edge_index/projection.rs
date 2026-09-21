@@ -2,167 +2,151 @@
 use super::types::*;
 use hellas_kernel::{self as kernel, Decode, Encode, TermsProfile};
 
-/// Evidence-checking facade shared by native and Wasm consumers. The returned values
-/// remain reported EdgeIndex models, never authenticated light-client object types.
-pub struct EdgeIndexClient {
-    verifier: crate::verified_explorer::ExplorerVerifier,
-    genesis_sha256: String,
-    network: kernel::NetworkId,
-}
-impl EdgeIndexClient {
-    /// Checks reported event bytes and ordering; linked evidence must be fetched separately
-    /// before calling any individual event consensus-included.
-    pub fn check_events(
-        &self,
-        response: &ListEdgeEventsResponse,
-        expected_edge_id: &str,
-    ) -> Result<(), ProjectionError> {
-        use commonware_codec::{DecodeExt as _, Encode as _};
-        self.check_envelope(&response.envelope)?;
-        validate_id(expected_edge_id).map_err(|e| ProjectionError::Malformed(e.into()))?;
-        if response.data.items.len() > 64
-            || !response.data.items.windows(2).all(|v| {
-                (v[0].transaction.height, v[0].transaction.transaction_index)
-                    < (v[1].transaction.height, v[1].transaction.transaction_index)
-            })
-        {
-            return Err(ProjectionError::Binding);
-        }
-        for event in &response.data.items {
-            if event.transaction.height > response.envelope.snapshot.height {
-                return Err(ProjectionError::Binding);
-            }
-            validate_id(&event.transaction.payload)
-                .map_err(|e| ProjectionError::Malformed(e.into()))?;
-            let tx = crate::domain::Transaction::decode(event.canonical_transaction.as_slice())
-                .map_err(|e| ProjectionError::Malformed(e.to_string()))?;
-            if tx.encode().as_ref() != event.canonical_transaction
-                || crate::verified_explorer::transaction_digest(&tx)
-                    != digest(&event.transaction.transaction_digest)?
-            {
-                return Err(ProjectionError::Binding);
-            }
-            let (id, kind) = match tx {
-                crate::domain::Transaction::Kernel(kernel::Tx::Open { funding, terms, .. }) => {
-                    (kernel::Tx::edge_id_of(&funding, &terms), "open")
-                }
-                crate::domain::Transaction::Kernel(kernel::Tx::Close { input, .. }) => {
-                    (input, "close")
-                }
-                crate::domain::Transaction::Kernel(kernel::Tx::Move { action }) => (
-                    match action {
-                        kernel::Move::StartPaymentClose(start) => start.payment_edge(),
-                        kernel::Move::RespondPaymentClose(response) => response.payment_edge(),
-                    },
-                    "move",
-                ),
-                _ => return Err(ProjectionError::Binding),
-            };
-            if hex::encode(id.as_bytes()) != expected_edge_id || event.kind != kind {
-                return Err(ProjectionError::Binding);
-            }
-        }
-        Ok(())
+/// Verify each evidence block once and retain its decoded transactions for the
+/// projection checks. Discovery and current objects remain indexer-reported.
+pub fn verify_metadata(
+    metadata: &EdgeIndexMetadata,
+    verifier: &crate::verified_explorer::ExplorerVerifier,
+    trust: &hellas_genesis::TrustDocument,
+) -> Result<Vec<crate::verified_explorer::VerifiedBlock>, ProjectionError> {
+    metadata
+        .validate()
+        .map_err(|e| ProjectionError::Malformed(e.into()))?;
+    if metadata.genesis_sha256 != trust.genesis_sha256
+        || metadata.network_id != trust.network_id
+        || metadata.trust_sha256 != verifier.trust_sha256()
+    {
+        return Err(ProjectionError::Binding);
     }
-
-    pub fn with_genesis(
-        trust: hellas_genesis::TrustDocument,
-        genesis_json: &[u8],
-    ) -> Result<Self, ProjectionError> {
-        let network = kernel::NetworkId::new(&trust.network_id).ok_or(ProjectionError::Binding)?;
-        let genesis_sha256 = trust.genesis_sha256.clone();
-        let verifier =
-            crate::verified_explorer::ExplorerVerifier::with_genesis(trust, genesis_json)
-                .map_err(|e| ProjectionError::Malformed(e.to_string()))?;
-        Ok(Self {
-            verifier,
-            genesis_sha256,
-            network,
+    let snapshot = required(&metadata.snapshot)?;
+    std::iter::once(required(&snapshot.block_proof)?)
+        .chain(&metadata.evidence)
+        .map(|proof| {
+            verifier
+                .verify(
+                    proof.clone(),
+                    crate::verified_explorer::ExplorerQuery::Block(
+                        crate::FinalizedBlockQuery::Payload(digest(&proof.payload)?),
+                    ),
+                )
+                .map_err(|e| ProjectionError::Malformed(e.to_string()))
         })
+        .collect()
+}
+fn required<T>(value: &Option<T>) -> Result<&T, ProjectionError> {
+    value.as_ref().ok_or(ProjectionError::Binding)
+}
+fn check_ref(
+    reference: &TransactionRef,
+    metadata: &EdgeIndexMetadata,
+) -> Result<(), ProjectionError> {
+    validate_id(&reference.payload).map_err(|e| ProjectionError::Malformed(e.into()))?;
+    validate_id(&reference.transaction_digest).map_err(|e| ProjectionError::Malformed(e.into()))?;
+    if reference.height > required(&metadata.snapshot)?.height {
+        return Err(ProjectionError::Binding);
     }
-    pub fn check_envelope(&self, envelope: &EdgeIndexMetadata) -> Result<(), ProjectionError> {
-        envelope
-            .validate()
-            .map_err(|e| ProjectionError::Malformed(e.into()))?;
-        if envelope.genesis_sha256 != self.genesis_sha256
-            || envelope.network_id != self.network.as_str()
-        {
+    Ok(())
+}
+fn check_summary(
+    summary: &EdgeSummary,
+    metadata: &EdgeIndexMetadata,
+) -> Result<(), ProjectionError> {
+    for id in [&summary.edge_id, &summary.terms_hash]
+        .into_iter()
+        .chain(summary.bond_edge_id.iter())
+        .chain(summary.payment_edge_id.iter())
+    {
+        validate_id(id).map_err(|e| ProjectionError::Malformed(e.into()))?;
+    }
+    let opened = required(&summary.opened)?;
+    required(&summary.links)?;
+    if summary.maker.len() != kernel::Key::LENGTH
+        || summary.taker.len() != kernel::Key::LENGTH
+        || !matches!(
+            summary.kind.as_str(),
+            "basic" | "work-payment" | "work-stake-bond"
+        )
+        || !matches!(
+            (summary.lifecycle.as_str(), &summary.closed),
+            ("open", None) | ("closed", Some(_))
+        )
+    {
+        return Err(ProjectionError::Binding);
+    }
+    check_ref(opened, metadata)?;
+    if let Some(closed) = &summary.closed {
+        check_ref(closed, metadata)?;
+        if (closed.height, closed.transaction_index) <= (opened.height, opened.transaction_index) {
             return Err(ProjectionError::Binding);
         }
-        for proof in std::iter::once(&envelope.snapshot.block_proof).chain(&envelope.evidence) {
-            self.check_proof(proof)?;
-        }
-        Ok(())
     }
-    fn check_proof(
-        &self,
-        proof: &crate::verified_explorer::ProofBundle,
-    ) -> Result<(), ProjectionError> {
-        self.verifier
-            .verify(
-                proof.clone(),
-                crate::verified_explorer::ExplorerQuery::Block(
-                    crate::FinalizedBlockQuery::Payload(digest(&proof.payload)?),
-                ),
-            )
+    Ok(())
+}
+pub fn check_list(response: &ListEdgesResponse) -> Result<(), ProjectionError> {
+    let metadata = required(&response.envelope)?;
+    let data = required(&response.data)?;
+    if data.items.len() > 64 || !data.items.windows(2).all(|v| v[0].edge_id < v[1].edge_id) {
+        return Err(ProjectionError::Binding);
+    }
+    for summary in &data.items {
+        check_summary(summary, metadata)?;
+    }
+    Ok(())
+}
+/// Checks reported event bytes and ordering; linked evidence must be fetched separately
+/// before calling any individual event consensus-included.
+pub fn check_events(
+    response: &ListEdgeEventsResponse,
+    expected_edge_id: &str,
+) -> Result<(), ProjectionError> {
+    use commonware_codec::{DecodeExt as _, Encode as _};
+    let metadata = required(&response.envelope)?;
+    let snapshot = required(&metadata.snapshot)?;
+    let data = required(&response.data)?;
+    validate_id(expected_edge_id).map_err(|e| ProjectionError::Malformed(e.into()))?;
+    if data.items.len() > 64 {
+        return Err(ProjectionError::Binding);
+    }
+    let mut previous = None;
+    for event in &data.items {
+        let transaction = required(&event.transaction)?;
+        check_ref(transaction, metadata)?;
+        let position = (transaction.height, transaction.transaction_index);
+        if previous.is_some_and(|p| p >= position) {
+            return Err(ProjectionError::Binding);
+        }
+        previous = Some(position);
+        if transaction.height > snapshot.height {
+            return Err(ProjectionError::Binding);
+        }
+        validate_id(&transaction.payload).map_err(|e| ProjectionError::Malformed(e.into()))?;
+        let tx = crate::domain::Transaction::decode(event.canonical_transaction.as_slice())
             .map_err(|e| ProjectionError::Malformed(e.to_string()))?;
-        Ok(())
-    }
-    pub fn check_edge(&self, response: &GetEdgeDetailResponse) -> Result<(), ProjectionError> {
-        self.check_envelope(&response.envelope)?;
-        check_detail(&response.data, &response.envelope)
-    }
-    pub fn check_channel(
-        &self,
-        response: &GetWorkChannelDetailResponse,
-    ) -> Result<(), ProjectionError> {
-        self.check_envelope(&response.envelope)?;
-        check_work_channel(&response.data, self.network, &response.envelope)
-    }
-    pub fn check_list(&self, response: &ListEdgesResponse) -> Result<(), ProjectionError> {
-        self.check_envelope(&response.envelope)?;
-        if response.data.items.len() > 64
-            || !response
-                .data
-                .items
-                .windows(2)
-                .all(|v| v[0].edge_id < v[1].edge_id)
+        if tx.encode().as_ref() != event.canonical_transaction
+            || crate::verified_explorer::transaction_digest(&tx)
+                != digest(&transaction.transaction_digest)?
         {
             return Err(ProjectionError::Binding);
         }
-        for summary in &response.data.items {
-            for id in [
-                &summary.edge_id,
-                &summary.terms_hash,
-                &summary.opened.payload,
-                &summary.opened.transaction_digest,
-            ] {
-                validate_id(id).map_err(|e| ProjectionError::Malformed(e.into()))?;
+        let (id, kind) = match tx {
+            crate::domain::Transaction::Kernel(kernel::Tx::Open { funding, terms, .. }) => {
+                (kernel::Tx::edge_id_of(&funding, &terms), "open")
             }
-            if summary.opened.height > response.envelope.snapshot.height
-                || summary.maker.len() != kernel::Key::LENGTH
-                || summary.taker.len() != kernel::Key::LENGTH
-                || !matches!(
-                    summary.kind.as_str(),
-                    "basic" | "work-payment" | "work-stake-bond"
-                )
-                || !matches!(
-                    (&summary.closed, summary.lifecycle.as_str()),
-                    (Some(_), "closed") | (None, "open")
-                )
-            {
-                return Err(ProjectionError::Binding);
-            }
-            if summary
-                .closed
-                .as_ref()
-                .is_some_and(|c| c.height > response.envelope.snapshot.height)
-            {
-                return Err(ProjectionError::Binding);
-            }
+            crate::domain::Transaction::Kernel(kernel::Tx::Close { input, .. }) => (input, "close"),
+            crate::domain::Transaction::Kernel(kernel::Tx::Move { action }) => (
+                match action {
+                    kernel::Move::StartPaymentClose(start) => start.payment_edge(),
+                    kernel::Move::RespondPaymentClose(response) => response.payment_edge(),
+                },
+                "move",
+            ),
+            _ => return Err(ProjectionError::Binding),
+        };
+        if hex::encode(id.as_bytes()) != expected_edge_id || event.kind != kind {
+            return Err(ProjectionError::Binding);
         }
-        Ok(())
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -263,6 +247,8 @@ mod tests {
         assert!(
             summary
                 .links
+                .as_ref()
+                .unwrap()
                 .edge
                 .ends_with(&format!("?payload={}", "ef".repeat(32)))
         );
@@ -303,67 +289,65 @@ fn digest(value: &str) -> Result<crate::domain::Digest, ProjectionError> {
         .map_err(|_| ProjectionError::Binding)?;
     Ok(crate::domain::Digest::from(bytes))
 }
-fn referenced_transaction(
+fn referenced_transaction<'a>(
     reference: &TransactionRef,
-    proof: &crate::verified_explorer::ProofBundle,
-) -> Result<crate::domain::Transaction, ProjectionError> {
-    if reference.height != proof.height || reference.payload != proof.payload {
+    blocks: &'a [crate::verified_explorer::VerifiedBlock],
+) -> Result<&'a crate::domain::Transaction, ProjectionError> {
+    let block = blocks
+        .iter()
+        .find(|b| b.bundle().payload == reference.payload)
+        .ok_or(ProjectionError::Binding)?;
+    if reference.height != block.view().height() {
         return Err(ProjectionError::Binding);
     }
-    let block = crate::FinalizedBlock {
-        snapshot: crate::LatestBlock {
-            height: proof.height,
-            payload: digest(&proof.payload)?,
-            state_root: digest(&proof.state_root)?,
-            finalization: proof.finalization.clone(),
-        },
-        block: proof.canonical_block.clone(),
-    };
-    let view = crate::FinalizedBlockView::decode(&block)
-        .map_err(|e| ProjectionError::Malformed(e.to_string()))?;
-    let tx = view
+    let tx = block
+        .view()
         .txs()
         .get(reference.transaction_index as usize)
         .ok_or(ProjectionError::Binding)?;
     if crate::verified_explorer::transaction_digest(tx) != digest(&reference.transaction_digest)? {
         return Err(ProjectionError::Binding);
     }
-    Ok(tx.clone())
+    Ok(tx)
 }
 /// Checks public projections against their canonical evidence. Does not verify consensus
 /// signatures, current-state membership, global discovery, or completeness.
 pub fn check_detail(
     detail: &EdgeDetail,
     envelope: &EdgeIndexMetadata,
+    blocks: &[crate::verified_explorer::VerifiedBlock],
 ) -> Result<(), ProjectionError> {
-    let opening = &detail.opening;
-    if opening.transaction != detail.summary.opened
-        || opening.transaction.height > envelope.snapshot.height
-        || detail
-            .closing
-            .as_ref()
-            .is_some_and(|c| c.transaction.height > envelope.snapshot.height)
+    let summary = required(&detail.summary)?;
+    check_summary(summary, envelope)?;
+    let snapshot = required(&envelope.snapshot)?;
+    let related = required(&detail.related)?;
+    required(&detail.events)?;
+    let object = required(&detail.object_at_snapshot)?;
+    let opening = required(&detail.opening)?;
+    let transaction = required(&opening.transaction)?;
+    if Some(transaction) != summary.opened.as_ref()
+        || transaction.height > snapshot.height
+        || detail.closing.as_ref().is_some_and(|c| {
+            c.transaction
+                .as_ref()
+                .is_none_or(|t| t.height > snapshot.height)
+        })
     {
         return Err(ProjectionError::Binding);
     }
-    let tx = referenced_transaction(
-        &opening.transaction,
-        envelope
-            .proof(&opening.transaction.payload)
-            .map_err(|_| ProjectionError::Binding)?,
-    )?;
+    let tx = referenced_transaction(transaction, blocks)?;
     let crate::domain::Transaction::Kernel(kernel::Tx::Open { funding, terms, .. }) = tx else {
         return Err(ProjectionError::Binding);
     };
-    let expected_opening = opening_projection(opening.transaction.clone(), &funding, &terms)?;
+    let expected_opening = opening_projection(transaction.clone(), funding, terms)?;
     if &expected_opening != opening {
         return Err(ProjectionError::Binding);
     }
-    let edge_id = hex::encode(kernel::Tx::edge_id_of(&funding, &terms).as_bytes());
-    if detail.summary.edge_id != edge_id
-        || detail.summary.terms_hash != hex::encode(terms.hash().as_bytes())
-        || detail.summary.maker != terms.parties().maker().as_bytes()
-        || detail.summary.taker != terms.parties().taker().as_bytes()
+    let edge_id = hex::encode(kernel::Tx::edge_id_of(funding, terms).as_bytes());
+    if summary.edge_id != edge_id
+        || summary.terms_hash != hex::encode(terms.hash().as_bytes())
+        || summary.maker != terms.parties().maker().as_bytes()
+        || summary.taker != terms.parties().taker().as_bytes()
     {
         return Err(ProjectionError::Binding);
     }
@@ -375,34 +359,26 @@ pub fn check_detail(
             Some(hex::encode(payment.bond_edge.as_bytes())),
         ),
     };
-    if detail.summary.kind != kind
-        || detail.summary.bond_edge_id != bond
-        || detail.related.bond_edge_id != bond
-        || detail.related.payment_edge_id != detail.summary.payment_edge_id
+    if summary.kind != kind
+        || summary.bond_edge_id != bond
+        || related.bond_edge_id != bond
+        || related.payment_edge_id != summary.payment_edge_id
     {
         return Err(ProjectionError::Binding);
     }
-    if let Some(id) = &detail.related.payment_edge_id {
+    if let Some(id) = &related.payment_edge_id {
         validate_id(id).map_err(|e| ProjectionError::Malformed(e.into()))?;
     }
-    match (&detail.closing, &detail.summary.closed) {
-        (None, None) if detail.summary.lifecycle == "open" => {}
-        (Some(closing), Some(reference)) if detail.summary.lifecycle == "closed" => {
-            if &closing.transaction != reference
+    match (&detail.closing, &summary.closed) {
+        (None, None) if summary.lifecycle == "open" => {}
+        (Some(closing), Some(reference)) if summary.lifecycle == "closed" => {
+            if closing.transaction.as_ref() != Some(reference)
                 || (reference.height, reference.transaction_index)
-                    <= (
-                        opening.transaction.height,
-                        opening.transaction.transaction_index,
-                    )
+                    <= (transaction.height, transaction.transaction_index)
             {
                 return Err(ProjectionError::Binding);
             }
-            let close = referenced_transaction(
-                reference,
-                envelope
-                    .proof(&reference.payload)
-                    .map_err(|_| ProjectionError::Binding)?,
-            )?;
+            let close = referenced_transaction(reference, blocks)?;
             match close {
                 crate::domain::Transaction::Kernel(kernel::Tx::Close { input, .. })
                     if hex::encode(input.as_bytes()) == edge_id => {}
@@ -411,13 +387,13 @@ pub fn check_detail(
         }
         _ => return Err(ProjectionError::Binding),
     }
-    match &detail.object_at_snapshot.answer {
+    match &object.answer {
         Some(ObjectState::Present(present)) => {
-            if present.provenance != "indexer-reported" || detail.summary.lifecycle != "open" {
+            if present.provenance != "indexer-reported" || summary.lifecycle != "open" {
                 return Err(ProjectionError::Binding);
             }
             let edge: kernel::Edge = decode_canonical(&present.canonical)?;
-            if edge_projection(&edge) != present.decoded
+            if Some(edge_projection(&edge)) != present.decoded
                 || edge.parties() != terms.parties()
                 || edge.terms() != terms.hash()
                 || edge.timeout() != terms.timeout()
@@ -427,7 +403,7 @@ pub fn check_detail(
             }
         }
         Some(ObjectState::Absent(absent))
-            if absent.provenance == "indexer-reported" && detail.summary.lifecycle == "closed" => {}
+            if absent.provenance == "indexer-reported" && summary.lifecycle == "closed" => {}
         _ => return Err(ProjectionError::Binding),
     }
     Ok(())
@@ -446,25 +422,33 @@ pub fn check_work_channel(
     detail: &WorkChannelDetail,
     network: kernel::NetworkId,
     envelope: &EdgeIndexMetadata,
+    blocks: &[crate::verified_explorer::VerifiedBlock],
 ) -> Result<(), ProjectionError> {
-    let height = envelope.snapshot.height;
-    check_detail(&detail.payment, envelope)?;
-    check_detail(&detail.bond, envelope)?;
-    let payment_id = edge_id(&detail.payment.summary.edge_id)?;
-    let bond_id = edge_id(&detail.bond.summary.edge_id)?;
-    let terms: kernel::Terms = decode_canonical(&detail.payment.opening.canonical_terms)?;
+    let height = required(&envelope.snapshot)?.height;
+    let payment_detail = required(&detail.payment)?;
+    let bond_detail = required(&detail.bond)?;
+    check_detail(payment_detail, envelope, blocks)?;
+    check_detail(bond_detail, envelope, blocks)?;
+    let payment_summary = required(&payment_detail.summary)?;
+    let bond_summary = required(&bond_detail.summary)?;
+    let payment_opening = required(&payment_detail.opening)?;
+    let bond_opening = required(&bond_detail.opening)?;
+    let pending_slot = required(&detail.pending_slot)?;
+    let payment_id = edge_id(&payment_summary.edge_id)?;
+    let bond_id = edge_id(&bond_summary.edge_id)?;
+    let terms: kernel::Terms = decode_canonical(&payment_opening.canonical_terms)?;
     let TermsProfile::WorkPayment(payment) = terms.profile() else {
         return Err(ProjectionError::Binding);
     };
     if payment.bond_edge != bond_id
         || canonical_bytes(&kernel::Terms::work_stake_bond(payment.bond_terms.clone()))
-            != detail.bond.opening.canonical_terms
+            != bond_opening.canonical_terms
         || detail.admission != admission_at(height, &terms)
     {
         return Err(ProjectionError::Binding);
     }
     if detail.bond_state
-        != if detail.bond.summary.lifecycle == "open" {
+        != if bond_summary.lifecycle == "open" {
             "live"
         } else {
             "consumed"
@@ -487,21 +471,20 @@ pub fn check_work_channel(
             .map(|b| decode_canonical::<kernel::RegistryChunk>(b))
             .transpose()?;
     }
-    if detail.lease != lease_projection(chunks, bond_id, payment_id, &terms) {
+    if detail.lease.as_ref() != Some(&lease_projection(chunks, bond_id, payment_id, &terms)) {
         return Err(ProjectionError::Binding);
     }
-    if detail.pending_slot.object_id
+    if pending_slot.object_id
         != hex::encode(kernel::pending_payment_close_slot(network, payment_id).as_bytes())
     {
         return Err(ProjectionError::Binding);
     }
-    let pending = detail
-        .pending_slot
+    let pending = pending_slot
         .chunk
         .as_ref()
         .map(|b| decode_canonical::<kernel::RegistryChunk>(b))
         .transpose()?;
-    if detail.pending != pending_projection(pending, payment_id) {
+    if detail.pending.as_ref() != Some(&pending_projection(pending, payment_id)) {
         return Err(ProjectionError::Binding);
     }
     if detail.funding_query.len() > kernel::MAX_EDGE_INPUTS * 2
@@ -520,17 +503,6 @@ pub fn check_work_channel(
     {
         return Err(ProjectionError::Binding);
     }
-    for edge in [&detail.payment, &detail.bond] {
-        if edge.summary.opened.height > height
-            || edge
-                .summary
-                .closed
-                .as_ref()
-                .is_some_and(|c| c.height > height)
-        {
-            return Err(ProjectionError::Binding);
-        }
-    }
     Ok(())
 }
 
@@ -543,12 +515,12 @@ pub enum ProjectionError {
     #[error("edge ID does not match its retained opening")]
     Binding,
 }
-pub fn canonical_bytes<T: Encode>(value: &T) -> Vec<u8> {
+pub(crate) fn canonical_bytes<T: Encode>(value: &T) -> Vec<u8> {
     let mut bytes = vec![0; value.encoded_size()];
     value.write_to(&mut bytes);
     bytes
 }
-pub fn decode_canonical<T: Decode + Encode>(bytes: &[u8]) -> Result<T, ProjectionError> {
+pub(crate) fn decode_canonical<T: Decode + Encode>(bytes: &[u8]) -> Result<T, ProjectionError> {
     let (value, consumed) =
         T::decode(bytes).map_err(|e| ProjectionError::Malformed(format!("{e:?}")))?;
     if consumed != bytes.len() || canonical_bytes(&value) != bytes {
@@ -558,7 +530,7 @@ pub fn decode_canonical<T: Decode + Encode>(bytes: &[u8]) -> Result<T, Projectio
     }
     Ok(value)
 }
-pub fn close_kinds(kinds: kernel::CloseKindSet) -> Vec<String> {
+pub(crate) fn close_kinds(kinds: kernel::CloseKindSet) -> Vec<String> {
     kernel::CloseKind::ALL
         .into_iter()
         .filter(|kind| kinds.contains(*kind))
@@ -573,17 +545,17 @@ pub fn close_kinds(kinds: kernel::CloseKindSet) -> Vec<String> {
         })
         .collect()
 }
-pub fn edge_projection(edge: &kernel::Edge) -> EdgeProjection {
+pub(crate) fn edge_projection(edge: &kernel::Edge) -> EdgeProjection {
     let fees = edge.close_fees();
     EdgeProjection {
         value: edge.value(),
         reserve: edge.reserve(),
-        close_fees: CloseFees {
+        close_fees: Some(CloseFees {
             base: fees.base(),
             slot: fees.slot(),
             proof: fees.proof(),
             lifetime: fees.lifetime(),
-        },
+        }),
         timeout: edge.timeout().get(),
         maker: edge.parties().maker().as_bytes().to_vec(),
         taker: edge.parties().taker().as_bytes().to_vec(),
@@ -591,12 +563,13 @@ pub fn edge_projection(edge: &kernel::Edge) -> EdgeProjection {
         allowed_close_kinds: close_kinds(edge.allowed_closes()),
     }
 }
-pub fn object_answer(edge: Option<&kernel::Edge>) -> ObjectAnswer {
+#[cfg(feature = "explorer-origin")]
+pub(crate) fn object_answer(edge: Option<&kernel::Edge>) -> ObjectAnswer {
     ObjectAnswer {
         answer: Some(match edge {
             Some(edge) => ObjectState::Present(PresentEdge {
                 canonical: canonical_bytes(edge),
-                decoded: edge_projection(edge),
+                decoded: Some(edge_projection(edge)),
                 provenance: "indexer-reported".into(),
             }),
             None => ObjectState::Absent(AbsentObject {
@@ -623,7 +596,7 @@ fn bond_terms(bond: &kernel::WorkStakeBondTerms) -> WorkStakeBondTerms {
         max_job_price: bond.max_job_price,
     }
 }
-pub fn public_terms(terms: &kernel::Terms) -> Result<PublicTerms, ProjectionError> {
+pub(crate) fn public_terms(terms: &kernel::Terms) -> Result<PublicTerms, ProjectionError> {
     let projection = match terms.profile() {
         TermsProfile::Basic => {
             let protocol = terms.basic_protocol().ok_or(ProjectionError::Unsupported)?;
@@ -646,7 +619,7 @@ pub fn public_terms(terms: &kernel::Terms) -> Result<PublicTerms, ProjectionErro
             canonical_bond_terms: canonical_bytes(&kernel::Terms::work_stake_bond(
                 payment.bond_terms.clone(),
             )),
-            bond_terms: bond_terms(&payment.bond_terms),
+            bond_terms: Some(bond_terms(&payment.bond_terms)),
             bond_terms_hash: hex::encode(payment.bond_terms_hash().as_bytes()),
             maker: payment.parties().maker().as_bytes().to_vec(),
             taker: payment.parties().taker().as_bytes().to_vec(),
@@ -662,8 +635,9 @@ pub fn public_terms(terms: &kernel::Terms) -> Result<PublicTerms, ProjectionErro
         terms: Some(projection),
     })
 }
+#[cfg(any(test, feature = "explorer-origin"))]
 #[allow(clippy::too_many_arguments)]
-pub fn summary_from_open(
+pub(crate) fn summary_from_open(
     edge_id: &str,
     opened: &TransactionRef,
     closed: Option<&TransactionRef>,
@@ -703,13 +677,13 @@ pub fn summary_from_open(
         kind: kind.into(),
         maker: maker.clone(),
         taker: taker.clone(),
-        opened: opened.clone(),
+        opened: Some(opened.clone()),
         closed: closed.cloned(),
         lifecycle: if closed.is_some() { "closed" } else { "open" }.into(),
         terms_hash: hex::encode(terms.hash().as_bytes()),
         bond_edge_id,
         payment_edge_id: payment_edge_id.map(str::to_owned),
-        links: EdgeLinks {
+        links: Some(EdgeLinks {
             edge: format!("/edges/{edge_id}?payload={payload}"),
             channel: channel_id.map(|id| format!("/channels/{id}?payload={payload}")),
             maker: format!(
@@ -723,16 +697,16 @@ pub fn summary_from_open(
             opening_transaction: format!("/transactions/{}", opened.transaction_digest),
             opening_block: format!("/blocks/{}", opened.payload),
             evidence: format!("/api/v1/edges/{edge_id}/evidence?payload={payload}"),
-        },
+        }),
     })
 }
-pub fn opening_projection(
+pub(crate) fn opening_projection(
     transaction: TransactionRef,
     funding: &kernel::Funding,
     terms: &kernel::Terms,
 ) -> Result<Opening, ProjectionError> {
     Ok(Opening {
-        transaction,
+        transaction: Some(transaction),
         funding_maker: funding
             .maker()
             .as_slice()
@@ -746,11 +720,11 @@ pub fn opening_projection(
             .map(|id| hex::encode(id.as_bytes()))
             .collect(),
         canonical_terms: canonical_bytes(terms),
-        terms: public_terms(terms)?,
+        terms: Some(public_terms(terms)?),
     })
 }
 /// The shared lease contract admits only strictly before the horizon.
-pub fn admission_at(height: u64, terms: &kernel::Terms) -> &'static str {
+pub(crate) fn admission_at(height: u64, terms: &kernel::Terms) -> &'static str {
     match terms.profile() {
         TermsProfile::WorkPayment(payment) if height < payment.admission_horizon().get() => {
             "before_horizon"
@@ -759,7 +733,7 @@ pub fn admission_at(height: u64, terms: &kernel::Terms) -> &'static str {
         _ => "not_applicable",
     }
 }
-pub fn lease_projection(
+pub(crate) fn lease_projection(
     slots: [Option<kernel::RegistryChunk>; kernel::BOND_LEASE_CHUNKS as usize],
     bond_edge: kernel::EdgeId,
     payment_edge: kernel::EdgeId,
@@ -800,7 +774,7 @@ pub fn lease_projection(
         answer: Some(state),
     }
 }
-pub fn pending_projection(
+pub(crate) fn pending_projection(
     chunk: Option<kernel::RegistryChunk>,
     payment_edge: kernel::EdgeId,
 ) -> PendingAnswer {

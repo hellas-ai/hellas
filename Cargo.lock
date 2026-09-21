@@ -2788,7 +2788,6 @@ name = "hellas-rpc"
 version = "0.1.0"
 dependencies = [
  "base64ct",
- "bs58",
  "bytes",
  "ed25519-dalek",
  "futures-core",

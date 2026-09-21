@@ -38,14 +38,18 @@ is unsupported. An already running read keeps its coherent redb transaction.
 
 IDs and list ordering are canonical raw 32-byte identifiers rendered as lowercase
 hex. Cursors bind identity, checkpoint, normalized filters and final position.
-Page limits are 1–64; JSON u64 fields are exact decimal strings and canonical
-opaque bytes are base64.
+Page limits are 1–64. EdgeIndex JSON uses nested `envelope` and `data` objects;
+message unions use ordinary externally tagged Serde objects under `answer` or
+`terms`. EdgeIndex u64 fields are exact decimal strings, and all byte fields
+(including addresses) use base64. HTML displays addresses as base58 links.
+The reused schema-1 proof objects retain numeric integers and byte arrays.
 
 Schema 2 includes each canonical block proof once per response. The snapshot
 proof remains in `snapshot.block_proof`; `evidence` contains distinct historical
-proofs sorted by payload. Open/close transaction references resolve through
-`EdgeIndexMetadata::proof(payload)`. Opening and closing objects no longer embed
-proofs. Both transports use the same generated message definitions and JSON
+proofs sorted by payload. Open/close references resolve against the decoded
+`VerifiedBlock` views retained by `projection::verify_metadata`; each certificate
+and block is verified once per response. Opening and closing objects do not embed
+additional proofs. Both transports use the same generated message definitions and JSON
 adapters from `hellas-rpc`; no protobuf transcode sits between RPC and the index.
 The standalone block/address proof API remains schema 1 with its existing JSON.
 
@@ -92,7 +96,8 @@ list scans also have bounded visit/time budgets, and the selected response
 representation is limited to 8 MiB without encoding the other representation.
 
 The common `hellas_chain::edge_index` types, parser, cursor normalization and
-`projection::EdgeIndexClient` compile for Wasm. The client checks independently
+shared projection checks compile for Wasm. Explorer uses these checks with its
+existing `ExplorerVerifier`; there is no parallel client facade. They check independently
 trusted block certificates, opening/closing inclusion, canonical terms and edge
 identity, decoded object fields and registry bindings. It returns ordinary
 reported-data types: discovery, current objects and completeness remain

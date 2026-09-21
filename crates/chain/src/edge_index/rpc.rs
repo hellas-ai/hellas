@@ -1,9 +1,6 @@
 //! Separate read-only EdgeIndex RPC service, exposed by the native indexer.
 use super::{EdgeIndex, EdgeIndexError, types};
-use hellas_rpc::{
-    pb::hellas::chain::v1 as pb,
-    pb::services::edge_index::{EdgeIndexHandler, EdgeIndexServer},
-};
+use hellas_rpc::pb::services::edge_index::{EdgeIndexHandler, EdgeIndexServer};
 use hellas_wire::{Dispatcher, StreamTransport, WireCode, WireStatus};
 use prost::Message;
 
@@ -29,9 +26,8 @@ fn failure(error: EdgeIndexError) -> WireStatus {
     status
 }
 macro_rules! method {
-    ($name:ident,$req:ident,$res:ident,$shared:ident) => {
-        async fn $name(&self, request: pb::$req) -> Result<pb::$res, WireStatus> {
-            let request: types::$shared = request;
+    ($name:ident,$req:ident,$res:ident) => {
+        async fn $name(&self, request: types::$req) -> Result<types::$res, WireStatus> {
             let result = self
                 .execute(move |index| index.$name(request))
                 .await
@@ -50,29 +46,17 @@ macro_rules! method {
 }
 #[allow(refining_impl_trait)]
 impl EdgeIndexHandler for EdgeIndex {
-    method!(
-        list_edges,
-        EdgeIndexListEdgesRequest,
-        EdgeIndexListEdgesResponse,
-        ListEdgesRequest
-    );
-    method!(
-        get_edge_detail,
-        EdgeIndexGetEdgeDetailRequest,
-        EdgeIndexGetEdgeDetailResponse,
-        GetEdgeDetailRequest
-    );
+    method!(list_edges, ListEdgesRequest, ListEdgesResponse);
+    method!(get_edge_detail, GetEdgeDetailRequest, GetEdgeDetailResponse);
     method!(
         list_edge_events,
-        EdgeIndexListEdgeEventsRequest,
-        EdgeIndexListEdgeEventsResponse,
-        ListEdgeEventsRequest
+        ListEdgeEventsRequest,
+        ListEdgeEventsResponse
     );
     method!(
         get_work_channel_detail,
-        EdgeIndexGetWorkChannelDetailRequest,
-        EdgeIndexGetWorkChannelDetailResponse,
-        GetWorkChannelDetailRequest
+        GetWorkChannelDetailRequest,
+        GetWorkChannelDetailResponse
     );
 }
 struct Pipe(axum::extract::ws::WebSocket);
@@ -107,7 +91,11 @@ pub(crate) async fn serve_socket(socket: axum::extract::ws::WebSocket, index: Ed
             let _ = calls.join_next().await;
         }
         let server = EdgeIndexServer(index.clone());
-        calls.spawn(async move{let _=<EdgeIndexServer<EdgeIndex> as Dispatcher<hellas_wire::mux::MuxTransport>>::dispatch(&server,inbound).await;});
+        calls.spawn(async move {
+            let _ = <EdgeIndexServer<EdgeIndex> as Dispatcher<hellas_wire::mux::MuxTransport>>::dispatch(
+                &server, inbound,
+            ).await;
+        });
         while calls.try_join_next().is_some() {}
     }
     calls.abort_all();
@@ -148,7 +136,7 @@ mod tests {
         assert!(error.message.contains("capacity"));
         let status = EdgeIndexHandler::get_edge_detail(
             &index,
-            pb::EdgeIndexGetEdgeDetailRequest {
+            types::GetEdgeDetailRequest {
                 edge_id: "01".repeat(32),
                 payload: None,
                 schema_version: super::types::SCHEMA_VERSION,

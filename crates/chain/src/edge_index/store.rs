@@ -537,7 +537,7 @@ mod tests {
                 ..Default::default()
             })
             .unwrap();
-        assert!(page.data.items.is_empty());
-        assert!(page.data.next_cursor.is_none());
+        assert!(page.data.as_ref().unwrap().items.is_empty());
+        assert!(page.data.as_ref().unwrap().next_cursor.is_none());
     }
 }
