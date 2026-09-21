@@ -15,8 +15,8 @@
 //! reference implementations. Both protocols emit at most one call per
 //! sentinel block.
 //!
-//! String parameters retain their text according to the offered schema.
-//! Other parameters try JSON first, then fall back to trimmed text.
+//! Values use JSON scalars unless the offered schema accepts the parameter as
+//! text. The complete arguments are schema-checked before a call is emitted.
 
 use super::super::ToolDirectory;
 use serde_json::{Map as JsonMap, Value as JsonValue};
@@ -58,56 +58,73 @@ fn parse_function_block_with_tools(
     payload: &str,
     tools: Option<&ToolDirectory>,
 ) -> Result<(String, JsonValue), ParserError> {
-    let function_start = payload.find(FUNCTION_OPEN).ok_or_else(|| {
-        ParserError::Malformed("tool-call payload missing <function=...> block".into())
+    let header = payload.strip_prefix(FUNCTION_OPEN).ok_or_else(|| {
+        ParserError::Malformed("tool-call payload must start with <function=...>".into())
     })?;
-    let header = &payload[function_start + FUNCTION_OPEN.len()..];
-    let name_end = header
-        .find('>')
+    let (name, body) = header
+        .split_once('>')
         .ok_or_else(|| ParserError::Malformed("unterminated <function=...> tag".into()))?;
-    let name = header[..name_end].trim().to_string();
+    let name = name.trim().to_string();
     if name.is_empty() {
         return Err(ParserError::MissingField("name"));
     }
-    let body = &header[name_end + 1..];
-    let body_end = body
-        .find(FUNCTION_CLOSE)
-        .ok_or_else(|| ParserError::Malformed("missing </function> in tool-call payload".into()))?;
-    let function_body = &body[..body_end];
-
-    let mut arguments = JsonMap::new();
-    let mut rest = function_body;
-    while let Some(parameter_start) = rest.find(PARAMETER_OPEN) {
-        let block = &rest[parameter_start + PARAMETER_OPEN.len()..];
-        let key_end = block
-            .find('>')
+    let body = body.strip_suffix(FUNCTION_CLOSE).ok_or_else(|| {
+        ParserError::Malformed("tool-call payload must end with </function>".into())
+    })?;
+    let mut text_arguments = JsonMap::new();
+    let mut rest = body.trim();
+    while !rest.is_empty() {
+        let block = rest
+            .strip_prefix(PARAMETER_OPEN)
+            .ok_or_else(|| ParserError::Malformed("unexpected content in function block".into()))?;
+        let (key, value_text) = block
+            .split_once('>')
             .ok_or_else(|| ParserError::Malformed("unterminated <parameter=...> tag".into()))?;
-        let key = block[..key_end].trim().to_string();
-        if key.is_empty() {
+        let key = key.trim().to_string();
+        if key.is_empty() || text_arguments.contains_key(&key) {
             return Err(ParserError::Malformed(
-                "tool-call parameter has empty name".into(),
+                "empty or duplicate tool-call parameter name".into(),
             ));
         }
-        let value_text = &block[key_end + 1..];
-        let value_end = value_text.find(PARAMETER_CLOSE).ok_or_else(|| {
+        let (value, tail) = value_text.split_once(PARAMETER_CLOSE).ok_or_else(|| {
             ParserError::Malformed("missing </parameter> in tool-call payload".into())
         })?;
-        let value = &value_text[..value_end];
-        let string_parameter = tools
-            .and_then(|tools| tools.lookup(&name))
-            .is_some_and(|(spec, _)| spec.parameters["properties"][&key]["type"] == "string");
-        arguments.insert(
-            key,
-            if string_parameter {
-                JsonValue::String(value.trim().to_string())
-            } else {
-                parse_scalar(value)
-            },
-        );
-        rest = &value_text[value_end + PARAMETER_CLOSE.len()..];
+        text_arguments.insert(key, JsonValue::String(value.trim().to_string()));
+        rest = tail.trim();
     }
-
-    Ok((name, JsonValue::Object(arguments)))
+    let mut arguments = JsonValue::Object(
+        text_arguments
+            .iter()
+            .map(|(key, value)| {
+                (
+                    key.clone(),
+                    parse_scalar(value.as_str().expect("parameter text")),
+                )
+            })
+            .collect(),
+    );
+    if let Some((_, validator)) = tools.and_then(|tools| tools.lookup(&name)) {
+        let text = JsonValue::Object(text_arguments.clone());
+        if validator.is_valid(&text) {
+            return Ok((name, text));
+        }
+        // Let the compiled schema decide whether a value is text, including
+        // references, allOf and union types. Ignore errors in other parameters
+        // while considering this one; validate the complete object in the engine.
+        for (key, text) in text_arguments {
+            let parsed = std::mem::replace(&mut arguments[&key], text);
+            let pointer = format!("/{}", key.replace('~', "~0").replace('/', "~1"));
+            let descendants = format!("{pointer}/");
+            let invalid = validator.iter_errors(&arguments).any(|error| {
+                let path = error.instance_path.as_str();
+                path.is_empty() || path == pointer || path.starts_with(&descendants)
+            });
+            if invalid {
+                arguments[&key] = parsed;
+            }
+        }
+    }
+    Ok((name, arguments))
 }
 
 fn parse_scalar(text: &str) -> JsonValue {
@@ -206,6 +223,26 @@ mod tests {
         // rather than raise a JSON parse error.
         let (_, args) = decode_one("<function=op><parameter=mode>div</parameter></function>");
         assert_eq!(args["mode"], json!("div"));
+    }
+
+    #[test]
+    fn duplicate_parameters_and_unconsumed_content_are_rejected() {
+        for payload in [
+            "<function=f><parameter=x>1</parameter><parameter=x>2</parameter></function>",
+            "prefix<function=f></function>",
+            "<function=f></function>suffix",
+            "<function=f>garbage<parameter=x>1</parameter></function>",
+            "<function=f><parameter=x>1</parameter>garbage</function>",
+            "<function=f></function><function=g></function>",
+        ] {
+            assert!(
+                matches!(
+                    XmlFunctionCodec::default().parse(payload),
+                    CodecOutcome::Error(_)
+                ),
+                "accepted {payload}"
+            );
+        }
     }
 
     #[test]

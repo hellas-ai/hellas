@@ -2,20 +2,20 @@
 //! to the same offered tools. The incremental decoder is adapted from
 //! catgrad-llm ac0e432; it has no GPU, HTTP server, or payment dependency.
 
-pub mod codecs;
+mod codecs;
 mod event;
 mod input;
-pub mod parser;
-pub mod sentinel_engine;
+mod parser;
+mod sentinel_engine;
 mod tool_spec;
 
 use crate::{ChatTemplate, TextPresentation};
 use anyhow::{Context, Result, ensure};
-pub use event::{DecodeEvent, ParserError, SchemaError, StopReason};
+use event::{DecodeEvent, SchemaError, StopReason};
 use hellas_adaptors::{CanonicalExecution, Input, OutputEvent, TextChannel, ToolChoice};
-pub use parser::{IncrementalToolCallParser, PassthroughParser};
+use parser::{IncrementalToolCallParser, PassthroughParser};
 use std::sync::Arc;
-pub use tool_spec::ToolDirectory;
+use tool_spec::ToolDirectory;
 
 pub struct PreparedChat {
     pub input_ids: Vec<u32>,
@@ -32,6 +32,10 @@ pub struct ChatTurn {
 
 impl TextPresentation {
     pub fn prepare(&self, request: &CanonicalExecution) -> Result<PreparedChat> {
+        ensure!(
+            request.reasoning.is_none(),
+            "reasoning options are not supported by the configured chat template"
+        );
         let tools = input::chat_tools(request)?;
         let selected = request
             .tools
@@ -52,9 +56,7 @@ impl TextPresentation {
         } else {
             let directory = Arc::new(ToolDirectory::new(selected)?);
             let codec: Box<dyn sentinel_engine::PayloadCodec> = match self.chat_template {
-                Some(ChatTemplate::Qwen3) => {
-                    Box::new(codecs::json::JsonObjectOrArrayCodec::permissive())
-                }
+                Some(ChatTemplate::Qwen3) => Box::new(codecs::json::JsonObjectOrArrayCodec),
                 Some(ChatTemplate::Qwen35) => Box::new(
                     codecs::xml_function::XmlFunctionCodec::new(directory.clone()),
                 ),
@@ -174,8 +176,10 @@ impl ChatTurn {
                 DecodeEvent::InvalidArgs { name, errors, .. } => {
                     anyhow::bail!("model produced invalid arguments for {name}: {errors:?}")
                 }
-                DecodeEvent::ParseError { source, .. } => {
-                    return Err(source).context("model tool call could not be decoded");
+                DecodeEvent::ParseError { sentinel, source } => {
+                    return Err(source).with_context(|| {
+                        format!("model tool call at {sentinel} could not be decoded")
+                    });
                 }
             });
         }
@@ -301,6 +305,48 @@ mod tests {
                 .unwrap();
             assert!(rendered.contains(&output));
             assert!(rendered.ends_with("<|im_start|>user\n<tool_response>\n/home: 74% used\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+        }
+    }
+
+    #[test]
+    fn unsupported_reasoning_is_rejected_for_text_and_chat() {
+        let mut request = request();
+        request.reasoning = Some(hellas_adaptors::ReasoningOptions {
+            value: json!({"effort": "high"}),
+        });
+        assert!(presentation().prepare(&request).is_err());
+        request.input = Input::Text("hello".into());
+        request.tools.clear();
+        assert!(presentation().prepare(&request).is_err());
+    }
+
+    #[test]
+    fn xml_string_types_use_schema_validation_including_references() {
+        for string_schema in [
+            json!({"type": ["string"]}),
+            json!({"allOf": [{"type": "string"}]}),
+            json!({"$ref": "#/$defs/text"}),
+        ] {
+            let mut request = request();
+            request.tools[0].parameters = json!({
+                "type": "object", "$defs": {"text": {"type": "string"}},
+                "properties": {"command": string_schema, "count": {"type": "integer"}},
+                "required": ["command", "count"], "additionalProperties": false
+            });
+            let mut presentation = presentation();
+            presentation.chat_template = Some(ChatTemplate::Qwen35);
+            for text in ["123", "true", "null"] {
+                let mut turn = presentation.prepare(&request).unwrap().turn;
+                let events = turn.feed(&format!("<tool_call><function=bash><parameter=command>{text}</parameter><parameter=count>2</parameter></function></tool_call>")).unwrap();
+                let args = events
+                    .iter()
+                    .find_map(|event| match event {
+                        OutputEvent::ToolCallEnd(call) => Some(&call.arguments),
+                        _ => None,
+                    })
+                    .unwrap();
+                assert_eq!(args, &json!({"command": text, "count": 2}));
+            }
         }
     }
 
