@@ -25,7 +25,8 @@ configuration:
   "acceptance_blocks": 16,
   "terminal_blocks": 64,
   "payment_blocks": 32,
-  "timeout_secs": 300
+  "timeout_secs": 300,
+  "max_pending_requests": 64
 }
 ```
 
@@ -61,14 +62,29 @@ providers or validators.
 Keep gateway and provider identities and journals across service restarts,
 including when the operating system's store is ephemeral. Startup recovers
 unfinished jobs and re-sends retained payments idempotently. Disconnecting an
-HTTP client does not cancel its accepted work or payment. SIGTERM drains the
-outstanding tasks; set the service stop timeout above `timeout_secs` (and allow
-for queued requests). Abrupt termination retains journal recovery data.
+HTTP client cancels work that has not yet been proposed. Once a signed proposal
+may have reached a provider, collection and payment continue despite disconnects.
+The pool admits at most `max_pending_requests` queued or running requests (default
+64); additional requests receive HTTP 503 and may be retried. `timeout_secs`
+bounds queueing, recovery, provider fallback, execution and payment together,
+rather than restarting for each provider. Interactive requests skip busy provider
+channels; each connection attempt gets at most 10 seconds before trying another
+route within that shared budget. The HTTP paid route uses this same
+configured budget; non-paid routes retain their existing 3600-second default. HTTP delivery has an
+8 MiB byte budget (including event overhead), allowing retained-result bursts.
+A consumer that exhausts it receives a stream error; its accepted work continues
+settlement without waiting for HTTP backpressure.
+
+SIGTERM and wrapped-command failures drain outstanding operations. Set the service
+stop timeout above `timeout_secs`. An operation that reaches its deadline retains
+its journal for recovery, as does abrupt process termination.
 
 For systemd, set `--bearer-token-file /var/lib/hellas-gateway/bearer-token`.
 The file is created with mode 0600 and reused across restarts. Clients read its
 trimmed contents as `Authorization: Bearer <credential>`. The configured listener
-may bind a LAN address; every route still requires bearer authentication.
+may bind an explicitly selected LAN address; the default stays `127.0.0.1`.
+Every route still requires bearer authentication. Use a trusted local network or
+a TLS reverse proxy when configuring remote access.
 
 The NixOS options are `services.hellas.gateway.paidWorkConfig`,
 `paidWorkJournalRoots` (the writable client journal directories), and
