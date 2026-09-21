@@ -355,7 +355,8 @@ impl PaidGateway {
                 Ok(())
             });
             let result = async {
-                let mut open_errors = Vec::new();
+                let prepared_bytes = prepared.as_ref().map(PreparedPaidInputV1::encode).transpose()?;
+                let mut provider_errors = Vec::new();
                 for (provider, route) in candidates {
                     let _occupied = occupied.take().or_else(|| {
                         prepared.as_ref().map(|_| ProviderUse::new(provider.clone()))
@@ -369,13 +370,13 @@ impl PaidGateway {
                     }
                     let timeout = Duration::from_secs(provider.args.timeout_secs);
                     let deadline = tokio::time::Instant::now() + timeout;
+                    // Recheck after queueing, including restored channels whose
+                    // setup journal opened without contacting the provider.
+                    if !provider.available() {
+                        provider_errors.push(format!("{}: provider is backing off", provider.args.provider));
+                        continue;
+                    }
                     if session.is_none() {
-                        // Recheck after queueing: an earlier request may have just
-                        // discovered this provider is unreachable.
-                        if !provider.available() {
-                            open_errors.push(format!("{}: channel opening is backing off", provider.args.provider));
-                            continue;
-                        }
                         match tokio::time::timeout_at(
                             deadline,
                             OpenPaidChannel::open(provider.args.clone(), endpoint.clone(), settlement_key.clone()),
@@ -385,40 +386,61 @@ impl PaidGateway {
                         {
                             Ok(opened) => {
                                 *session = Some(opened);
-                                provider.connection_succeeded();
                             }
                             Err(error) => {
                                 provider.connection_failed();
                                 tracing::warn!(provider = %provider.args.provider, error = %format!("{error:#}"),
                                     "paid provider channel could not be opened");
-                                open_errors.push(format!("{}: {error:#}", provider.args.provider));
+                                provider_errors.push(format!("{}: {error:#}", provider.args.provider));
                                 continue;
                             }
                         }
                     }
-                    // Opening a channel cannot admit this request. Once run starts,
-                    // keep its journal with this provider even if the response is lost.
+                    let session = session.as_mut().expect("channel was opened");
+                    // ClientEndpoint journals the proposal nonce before releasing
+                    // its signature. Recovery and a failed dial need not propose
+                    // this request; a lost acceptance response does advance it.
+                    let proposal_nonce = session.client.state().proposal_nonce_high_water();
+                    let already_proposed = prepared_bytes.as_ref().is_some_and(|input| {
+                        session.client.state().jobs().any(|job| job.prepared_input() == input)
+                    });
                     let result = tokio::time::timeout_at(
                         deadline,
-                        session.as_mut().expect("channel was opened").run(prepared, true, streamed.then_some(progress)),
+                        session.run(prepared.clone(), true, streamed.then(|| progress.clone())),
                     ).await
                         .map_err(|_| anyhow::anyhow!("paid execution exceeded its {timeout:?} limit"))
                         .and_then(|result| result)
                         .and_then(|output| output.map(output_events).transpose())
                         .map(Option::unwrap_or_default);
-                    if let Some(cache_update) = cache_update {
-                        let mut cache = provider.cache.lock().expect("provider cache poisoned");
-                        if result.is_ok() {
-                            cache_update.apply(&mut cache);
-                        } else {
-                            cache.replace(None);
+                    if let Err(error) = &result {
+                        provider.cache.lock().expect("provider cache poisoned").replace(None);
+                        // A failed journal append can leave a durable proposal that
+                        // is not reflected in memory yet. Keep that failure with
+                        // this provider, just like a proposal with no response.
+                        let uncertain_append = matches!(
+                            error.downcast_ref::<hellas_work::work::ProposeError>(),
+                            Some(hellas_work::work::ProposeError::Store(_)),
+                        );
+                        if !already_proposed && !uncertain_append
+                            && session.client.state().proposal_nonce_high_water() == proposal_nonce
+                        {
+                            provider.connection_failed();
+                            tracing::warn!(provider = %provider.args.provider, error = %format!("{error:#}"),
+                                "paid provider failed before proposing new work");
+                            provider_errors.push(format!("{}: {error:#}", provider.args.provider));
+                            continue;
+                        }
+                    } else {
+                        provider.connection_succeeded();
+                        if let Some(cache_update) = cache_update {
+                            cache_update.apply(&mut provider.cache.lock().expect("provider cache poisoned"));
                         }
                     }
                     return result.with_context(|| format!("paid provider {}", provider.args.provider));
                 }
                 Err(anyhow::anyhow!(
-                    "no eligible paid provider could establish a channel: {}",
-                    open_errors.join("; ")
+                    "no eligible paid provider could start this request: {}",
+                    provider_errors.join("; ")
                 ))
             }.await;
             if let Err(error) = &result {
