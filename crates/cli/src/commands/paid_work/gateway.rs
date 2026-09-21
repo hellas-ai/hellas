@@ -49,6 +49,9 @@ const fn timeout_secs() -> u64 {
 // checkpoints are not worth routing work around.
 const MIN_CACHE_AFFINITY_TOKENS: usize = 128;
 const UNREACHABLE_PROVIDER_BACKOFF: Duration = Duration::from_secs(30);
+// A retained job is durable, but it must not monopolize the channel that
+// serves interactive requests after a restart or a provider interruption.
+const RECOVERY_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -303,6 +306,7 @@ pub async fn load_gateway_backend(
             )],
             None,
             None,
+            Some(RECOVERY_ATTEMPT_TIMEOUT),
         );
         let provider = provider.clone();
         gateway.followers.lock().expect("paid followers poisoned").push(tokio::spawn(async move {
@@ -326,6 +330,7 @@ impl PaidGateway {
         candidates: Vec<(Arc<Provider>, Route)>,
         prepared: Option<PreparedPaidInputV1>,
         cache_update: Option<CacheUpdate>,
+        recovery_timeout: Option<Duration>,
     ) -> BoxStream<'static, CliResult<ExecutionEvent>> {
         let endpoint = self.endpoint.clone();
         let settlement_key = self.settlement_key.clone();
@@ -347,6 +352,7 @@ impl PaidGateway {
         let task = tokio::spawn(async move {
             let token_sender = sender.clone();
             let streamed = prepared.is_some();
+            let recovery = !streamed;
             let progress: hellas_work::work::PaidProgress = Arc::new(move |event| {
                 let delta = hellas_rpc::evaluate::decode_token_delta_payload(event.payload())
                     .map_err(|error| hellas_work::work::BackendFault::new(error.to_string()))?;
@@ -368,7 +374,8 @@ impl PaidGateway {
                     if prepared.is_none() && (!provider.args.journal_root.try_exists()? || std::fs::read_dir(&provider.args.journal_root)?.next().is_none()) {
                         return Ok(Vec::new());
                     }
-                    let timeout = Duration::from_secs(provider.args.timeout_secs);
+                    let timeout = recovery_timeout
+                        .unwrap_or_else(|| Duration::from_secs(provider.args.timeout_secs));
                     let deadline = tokio::time::Instant::now() + timeout;
                     // Recheck after queueing, including restored channels whose
                     // setup journal opened without contacting the provider.
@@ -397,6 +404,34 @@ impl PaidGateway {
                         }
                     }
                     let session = session.as_mut().expect("channel was opened");
+                    if prepared.is_some() && session.needs_recovery {
+                        let recovery_deadline = deadline.min(
+                            tokio::time::Instant::now() + RECOVERY_ATTEMPT_TIMEOUT,
+                        );
+                        let recovery = tokio::time::timeout_at(
+                            recovery_deadline,
+                            session.run(None, true, None),
+                        )
+                        .await
+                        .map_err(|_| anyhow::anyhow!(
+                            "retained paid work did not recover within {RECOVERY_ATTEMPT_TIMEOUT:?}"
+                        ))
+                        .and_then(|result| result);
+                        if let Err(error) = recovery {
+                            // Nothing in this path has proposed the fresh request.
+                            // Keep the journal for a later recovery and route this
+                            // interactive request to another paid provider now.
+                            provider.cache.lock().expect("provider cache poisoned").replace(None);
+                            provider.connection_failed();
+                            tracing::debug!(provider = %provider.args.provider, error = %format!("{error:#}"),
+                                "retained paid work deferred before a fresh request");
+                            provider_errors.push(format!(
+                                "{}: retained work recovery deferred: {error:#}",
+                                provider.args.provider
+                            ));
+                            continue;
+                        }
+                    }
                     // ClientEndpoint journals the proposal nonce before releasing
                     // its signature. Recovery and a failed dial need not propose
                     // this request; a lost acceptance response does advance it.
@@ -444,8 +479,13 @@ impl PaidGateway {
                 ))
             }.await;
             if let Err(error) = &result {
-                tracing::error!(error = %format!("{error:#}"),
-                    "paid gateway operation failed; durable journals retained for recovery");
+                if recovery {
+                    tracing::debug!(error = %format!("{error:#}"),
+                        "retained paid-work recovery deferred");
+                } else {
+                    tracing::error!(error = %format!("{error:#}"),
+                        "paid gateway operation failed; durable journals retained for recovery");
+                }
             }
             // Dropping an HTTP request drops only its receiver. The task still
             // collects and pays for accepted work, then releases the journal.
@@ -500,7 +540,7 @@ impl PaidExecutionBackend for PaidGateway {
             .collect::<Vec<_>>();
         // Stable sorting preserves the rotating order for equally ranked routes.
         candidates.sort_by_key(|(_, route)| std::cmp::Reverse(route.score()));
-        Ok(self.submit(candidates, Some(prepared), Some(cache_update)))
+        Ok(self.submit(candidates, Some(prepared), Some(cache_update), None))
     }
 
     fn drain(&self) -> BoxFuture<'_, ()> {
