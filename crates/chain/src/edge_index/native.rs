@@ -30,6 +30,14 @@ impl EdgeIndexError {
             snapshot: None,
         }
     }
+    fn corrupt(message: impl ToString) -> Self {
+        Self {
+            status: 500,
+            code: "index_corrupt",
+            message: message.to_string(),
+            snapshot: None,
+        }
+    }
     pub(super) fn unavailable(message: impl ToString) -> Self {
         Self {
             status: 503,
@@ -41,7 +49,12 @@ impl EdgeIndexError {
 }
 type Result<T> = std::result::Result<T, EdgeIndexError>;
 fn storage(error: impl std::fmt::Display) -> EdgeIndexError {
-    EdgeIndexError::unavailable(error)
+    EdgeIndexError {
+        status: 500,
+        code: "index_storage_error",
+        message: error.to_string(),
+        snapshot: None,
+    }
 }
 #[derive(Clone)]
 pub struct EdgeIndex {
@@ -71,8 +84,9 @@ impl EdgeIndex {
             permits: std::sync::Arc::new(tokio::sync::Semaphore::new(16)),
         })
     }
-    pub(crate) fn transaction_height(&self, digest: &str) -> Result<Option<u64>> {
-        self.store.transaction_height(digest).map_err(storage)
+    pub(crate) async fn transaction_height(&self, digest: String) -> Result<Option<u64>> {
+        self.execute(move |index| index.store.transaction_height(&digest).map_err(storage))
+            .await
     }
     fn scope(&self) -> String {
         let i = &self.store.identity;
@@ -288,7 +302,7 @@ impl EdgeIndex {
     fn summary(&self, read: &ReadSnapshot, edge: &StoredEdge) -> Result<EdgeSummary> {
         let tx = read.transaction(&edge.opened).map_err(storage)?;
         let Transaction::Kernel(Tx::Open { funding, terms, .. }) = tx else {
-            return Err(EdgeIndexError::unavailable("stored opening is not Open"));
+            return Err(EdgeIndexError::corrupt("stored opening is not Open"));
         };
         summary_from_open(
             &edge.edge_id,
@@ -313,7 +327,7 @@ impl EdgeIndex {
             })?;
         let tx = read.transaction(&edge.opened).map_err(storage)?;
         let Transaction::Kernel(Tx::Open { funding, terms, .. }) = tx else {
-            return Err(EdgeIndexError::unavailable("stored opening is not Open"));
+            return Err(EdgeIndexError::corrupt("stored opening is not Open"));
         };
         let summary = summary_from_open(
             &edge.edge_id,
@@ -331,10 +345,10 @@ impl EdgeIndex {
         let object = match object {
             Some(Object::Edge(edge)) => Some(edge),
             None => None,
-            _ => return Err(EdgeIndexError::unavailable("wrong object kind at edge id")),
+            _ => return Err(EdgeIndexError::corrupt("wrong object kind at edge id")),
         };
         if object.is_some() != edge.closed.is_none() {
-            return Err(EdgeIndexError::unavailable(
+            return Err(EdgeIndexError::corrupt(
                 "edge history/object state mismatch",
             ));
         }
@@ -382,9 +396,7 @@ impl EdgeIndex {
         let bond_opening = bond.opening.as_ref().expect("constructed opening");
         let bond_summary = bond.summary.as_ref().expect("constructed summary");
         if bond_summary.terms_hash != hex::encode(work.bond_terms_hash().as_bytes()) {
-            return Err(EdgeIndexError::unavailable(
-                "bond does not match payment terms",
-            ));
+            return Err(EdgeIndexError::corrupt("bond does not match payment terms"));
         }
         let funding_query = match request.funding {
             Some(query) => {
@@ -411,14 +423,12 @@ impl EdgeIndex {
                 Some(Object::Coin(_)) => live_funding.push(id.clone()),
                 None => {}
                 _ => {
-                    return Err(EdgeIndexError::unavailable(
-                        "wrong object kind for funding coin",
-                    ));
+                    return Err(EdgeIndexError::bad("wrong object kind for funding coin"));
                 }
             }
         }
         let network = hellas_kernel::NetworkId::new(&self.store.identity.network_id)
-            .ok_or_else(|| EdgeIndexError::unavailable("invalid network identity"))?;
+            .ok_or_else(|| EdgeIndexError::corrupt("invalid network identity"))?;
         let payment_id = hellas_kernel::EdgeId::from_bytes(
             hex::decode(&request.payment_edge_id)
                 .map_err(EdgeIndexError::bad)?
@@ -585,7 +595,7 @@ fn registry_chunk(read: &ReadSnapshot, id: &[u8]) -> Result<Option<hellas_kernel
     match read.object(id).map_err(storage)? {
         Some(Object::RegistryChunk(chunk)) => Ok(Some(chunk)),
         None => Ok(None),
-        _ => Err(EdgeIndexError::unavailable(
+        _ => Err(EdgeIndexError::corrupt(
             "wrong object kind at registry slot",
         )),
     }

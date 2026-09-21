@@ -249,13 +249,18 @@ async fn transaction(
     let Some(tx) = digest(&tx) else {
         return failure(StatusCode::BAD_REQUEST, "invalid transaction digest");
     };
-    let height = query.height.or_else(|| {
-        state
-            .edge_index
-            .transaction_height(&hex::encode(tx))
-            .ok()
-            .flatten()
-    });
+    let height = match query.height {
+        Some(height) => Some(height),
+        None => match state.edge_index.transaction_height(hex::encode(tx)).await {
+            Ok(height) => height,
+            Err(error) => {
+                return failure(
+                    StatusCode::from_u16(error.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                    &error.to_string(),
+                );
+            }
+        },
+    };
     let Some(height) = height else {
         return failure(
             StatusCode::SERVICE_UNAVAILABLE,
