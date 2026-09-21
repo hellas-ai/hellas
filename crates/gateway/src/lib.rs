@@ -53,10 +53,29 @@ pub struct PaidExecutionRequest {
     pub stop_token_ids: Vec<u32>,
 }
 
+/// Paid admission capacity is exhausted or the backend is shutting down.
+#[derive(Debug)]
+pub struct PaidGatewayBusy;
+
+impl std::fmt::Display for PaidGatewayBusy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("paid gateway is busy; retry later")
+    }
+}
+
+impl std::error::Error for PaidGatewayBusy {}
+
 pub trait PaidExecutionBackend: Send + Sync {
+    /// End-to-end budget, including queued time, advertised to HTTP consumers.
+    fn timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(300)
+    }
+
     /// Reject incompatible policies before opening a channel. The returned
-    /// operation survives HTTP cancellation. Prefixes are authenticated as
-    /// they arrive; completion is emitted after durable payment acknowledgement.
+    /// operation may stop on HTTP cancellation before a proposal is released;
+    /// afterwards it retains responsibility for collection and payment. Prefixes
+    /// are authenticated as they arrive; completion follows durable payment
+    /// acknowledgement.
     fn execute(
         &self,
         request: PaidExecutionRequest,
@@ -199,6 +218,17 @@ impl Drop for GatewayHandle {
 
 /// Start a gateway without installing process signal handlers.
 pub async fn start(options: GatewayOptions) -> anyhow::Result<GatewayHandle> {
+    let paid_work = options.paid_work.clone();
+    let result = start_gateway(options).await;
+    if result.is_err()
+        && let Some(backend) = paid_work
+    {
+        backend.drain().await;
+    }
+    result
+}
+
+async fn start_gateway(options: GatewayOptions) -> anyhow::Result<GatewayHandle> {
     let state = Arc::new(GatewayState::from_options(&options).await?);
 
     // Every route below reaches an executor, so every route below is
@@ -319,33 +349,34 @@ async fn launch_gateway(
 
     let task_shutdown = shutdown.clone();
     let task = tokio::spawn(async move {
-        match wrap_child {
-            Some(mut child) => {
-                tokio::pin!(server);
-                tokio::select! {
-                    res = &mut server => {
-                        // Gateway stopped or errored; kill_on_drop tears the
-                        // wrapped child down too.
-                        res.context("gateway server failed")?;
-                    }
-                    status = child.wait() => {
-                        let status = status.context("waiting on wrapped child failed")?;
-                        task_shutdown.notify_one();
-                        server.await.context("gateway server failed")?;
-                        if !status.success() {
-                            bail!("wrapped command exited with status {status}");
+        let result = async {
+            match wrap_child {
+                Some(mut child) => {
+                    tokio::pin!(server);
+                    tokio::select! {
+                        res = &mut server => {
+                            // Gateway stopped or errored; kill_on_drop tears the
+                            // wrapped child down too.
+                            res.context("gateway server failed")?;
+                        }
+                        status = child.wait() => {
+                            let status = status.context("waiting on wrapped child failed")?;
+                            task_shutdown.notify_one();
+                            server.await.context("gateway server failed")?;
+                            if !status.success() {
+                                bail!("wrapped command exited with status {status}");
+                            }
                         }
                     }
                 }
+                None => {
+                    server.await.context("gateway server failed")?;
+                }
             }
-            None => {
-                server.await.context("gateway server failed")?;
-            }
+            Ok(())
         }
-        if let Some(backend) = paid_work {
-            backend.drain().await;
-        }
-        Ok(())
+        .await;
+        finish_paid_work(paid_work, result).await
     });
 
     Ok(GatewayHandle {
@@ -354,6 +385,18 @@ async fn launch_gateway(
         shutdown,
         task,
     })
+}
+
+// Keep cleanup outside the fallible server/child branch: a failed wrapper is
+// also a normal reason for its HTTP requests to have been disconnected.
+async fn finish_paid_work(
+    paid_work: Option<Arc<dyn PaidExecutionBackend>>,
+    result: anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    if let Some(backend) = paid_work {
+        backend.drain().await;
+    }
+    result
 }
 
 /// CLI lifecycle wrapper around [`start`].
@@ -464,4 +507,39 @@ fn timeout_secs_until(deadline: tokio::time::Instant) -> u64 {
         .saturating_duration_since(tokio::time::Instant::now())
         .as_secs()
         .max(1)
+}
+
+#[cfg(test)]
+mod paid_shutdown_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct Backend(AtomicBool);
+    impl PaidExecutionBackend for Backend {
+        fn execute(
+            &self,
+            _: PaidExecutionRequest,
+        ) -> anyhow::Result<futures::stream::BoxStream<'static, anyhow::Result<ExecutionEvent>>>
+        {
+            unreachable!("shutdown does not submit new work")
+        }
+        fn drain(&self) -> futures::future::BoxFuture<'_, ()> {
+            Box::pin(async {
+                self.0.store(true, Ordering::Relaxed);
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_wrapped_process_still_drains_paid_work() {
+        let backend = Arc::new(Backend(AtomicBool::new(false)));
+        let error = finish_paid_work(
+            Some(backend.clone()),
+            Err(anyhow::anyhow!("wrapped command exited with status 1")),
+        )
+        .await
+        .unwrap_err();
+        assert!(backend.0.load(Ordering::Relaxed));
+        assert_eq!(error.to_string(), "wrapped command exited with status 1");
+    }
 }
