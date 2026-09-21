@@ -337,7 +337,7 @@ mod tests {
         let trust = "cd".repeat(32);
         let payload = "ef".repeat(32);
         let cursor = Cursor {
-            v: 1,
+            v: SCHEMA_VERSION,
             s: cursor_scope("hellas-devnet-1", &genesis, &trust),
             p: payload.clone(),
             f: Filters {
@@ -355,7 +355,7 @@ mod tests {
             Base64UrlUnpadded::encode_string(&serde_json::to_vec(cursor).unwrap())
         };
         let request = ListEdgesRequest {
-            schema_version: 1,
+            schema_version: SCHEMA_VERSION,
             cursor: Some(encode(&cursor)),
             limit: Some(64),
             ..Default::default()
@@ -396,7 +396,7 @@ mod tests {
         event.h = Some(9);
         event.t = Some(0);
         let request = ListEdgeEventsRequest {
-            schema_version: 1,
+            schema_version: SCHEMA_VERSION,
             edge_id: event.a.clone(),
             cursor: Some(encode(&event)),
             ..Default::default()
@@ -416,7 +416,7 @@ mod tests {
             "role=maker",
             "limit=1&limit=2",
             "unknown=1",
-            "schema_version=2",
+            "schema_version=1",
             "party=%GG",
         ] {
             assert!(

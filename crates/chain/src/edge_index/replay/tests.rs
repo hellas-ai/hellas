@@ -224,7 +224,7 @@ impl Harness {
     fn list(&self, limit: u32) -> ListEdgesResponse {
         self.index
             .list_edges(ListEdgesRequest {
-                schema_version: 1,
+                schema_version: crate::edge_index::SCHEMA_VERSION,
                 limit: Some(limit),
                 ..Default::default()
             })
@@ -233,7 +233,7 @@ impl Harness {
     fn detail(&self, id: hellas_kernel::EdgeId, payload: Option<String>) -> GetEdgeDetailResponse {
         self.index
             .get_edge_detail(GetEdgeDetailRequest {
-                schema_version: 1,
+                schema_version: crate::edge_index::SCHEMA_VERSION,
                 edge_id: hex::encode(id.as_bytes()),
                 payload,
             })
@@ -378,7 +378,7 @@ fn native_edge_index_real_chain_pins_root_checks_and_restart() {
         assert_eq!(
             h.index
                 .list_edges(ListEdgesRequest {
-                    schema_version: 1,
+                    schema_version: crate::edge_index::SCHEMA_VERSION,
                     ..Default::default()
                 })
                 .unwrap_err()
@@ -504,7 +504,7 @@ fn native_edge_index_real_chain_pins_root_checks_and_restart() {
         let next = h
             .index
             .list_edges(ListEdgesRequest {
-                schema_version: 1,
+                schema_version: crate::edge_index::SCHEMA_VERSION,
                 cursor: Some(cursor.clone()),
                 limit: Some(2),
                 ..Default::default()
@@ -516,7 +516,7 @@ fn native_edge_index_real_chain_pins_root_checks_and_restart() {
         assert!(
             h.index
                 .list_edges(ListEdgesRequest {
-                    schema_version: 1,
+                    schema_version: crate::edge_index::SCHEMA_VERSION,
                     cursor: Some(cursor),
                     state: Some("closed".into()),
                     ..Default::default()
@@ -526,7 +526,7 @@ fn native_edge_index_real_chain_pins_root_checks_and_restart() {
         let events = h
             .index
             .list_edge_events(ListEdgeEventsRequest {
-                schema_version: 1,
+                schema_version: crate::edge_index::SCHEMA_VERSION,
                 edge_id: hex::encode(id.as_bytes()),
                 limit: Some(1),
                 ..Default::default()
@@ -546,7 +546,7 @@ fn native_edge_index_real_chain_pins_root_checks_and_restart() {
         assert_eq!(
             h.index
                 .get_edge_detail(GetEdgeDetailRequest {
-                    schema_version: 1,
+                    schema_version: crate::edge_index::SCHEMA_VERSION,
                     edge_id: hex::encode(id.as_bytes()),
                     payload: Some(opened.payload)
                 })
@@ -558,7 +558,7 @@ fn native_edge_index_real_chain_pins_root_checks_and_restart() {
         assert_eq!(
             h.index
                 .get_edge_detail(GetEdgeDetailRequest {
-                    schema_version: 1,
+                    schema_version: crate::edge_index::SCHEMA_VERSION,
                     edge_id: hex::encode(id.as_bytes()),
                     payload: Some("ff".repeat(32))
                 })
@@ -753,7 +753,7 @@ fn native_edge_index_work_channel_lifecycle_and_evidence() {
         let channel = |h: &Harness, id: hellas_kernel::EdgeId, payload: Option<String>| {
             h.index
                 .get_work_channel_detail(GetWorkChannelDetailRequest {
-                    schema_version: 1,
+                    schema_version: crate::edge_index::SCHEMA_VERSION,
                     payment_edge_id: hex::encode(id.as_bytes()),
                     payload,
                     funding: None,
@@ -774,7 +774,7 @@ fn native_edge_index_work_channel_lifecycle_and_evidence() {
         let empty = h
             .index
             .get_work_channel_detail(GetWorkChannelDetailRequest {
-                schema_version: 1,
+                schema_version: crate::edge_index::SCHEMA_VERSION,
                 payment_edge_id: hex::encode(a.payment.as_bytes()),
                 payload: None,
                 funding: Some(FundingQuery { coins: Vec::new() }),
@@ -820,6 +820,49 @@ fn native_edge_index_work_channel_lifecycle_and_evidence() {
         h.append(vec![Transaction::Kernel(start)]).await;
         let started = channel(&h, a.payment, None);
         h.client.check_channel(&started).unwrap();
+        // Both openings belong to the same historical block. Evidence occurs once,
+        // and every locator is checked against the bytes of that certified block.
+        assert!(initial.envelope.evidence.is_empty());
+        assert_eq!(started.envelope.evidence.len(), 1);
+        assert_eq!(started.envelope.evidence[0].payload, opened.payload);
+        let json = serde_json::to_value(&started).unwrap();
+        assert!(json["data"]["payment"]["opening"].get("proof").is_none());
+        assert!(json["data"]["bond"]["opening"].get("proof").is_none());
+        assert_eq!(json["evidence"].as_array().unwrap().len(), 1);
+        for mutate in [
+            |value: &mut GetWorkChannelDetailResponse| {
+                value.envelope.evidence.clear();
+            },
+            |value: &mut GetWorkChannelDetailResponse| {
+                value
+                    .envelope
+                    .evidence
+                    .push(value.envelope.evidence[0].clone());
+            },
+            |value: &mut GetWorkChannelDetailResponse| {
+                value.envelope.evidence[0].canonical_block[0] ^= 1;
+            },
+            |value: &mut GetWorkChannelDetailResponse| {
+                value.data.payment.opening.transaction.transaction_index += 1;
+            },
+            |value: &mut GetWorkChannelDetailResponse| {
+                value.envelope.schema_version = 1;
+            },
+        ] {
+            let mut changed = started.clone();
+            mutate(&mut changed);
+            assert!(h.client.check_channel(&changed).is_err());
+        }
+        let read = h.index.store.read(None).unwrap();
+        let reference = &started.data.payment.opening.transaction;
+        assert!(read.transaction(reference).is_ok());
+        let mut corrupt = reference.clone();
+        corrupt.transaction_index += 1;
+        assert!(read.transaction(&corrupt).is_err());
+        corrupt = reference.clone();
+        corrupt.payload = "00".repeat(32);
+        assert!(read.transaction(&corrupt).is_err());
+        drop(read);
         assert!(matches!(
             started.data.pending.answer,
             Some(PendingState::Present(PendingProjection {
@@ -943,7 +986,7 @@ fn native_edge_index_work_channel_lifecycle_and_evidence() {
         let events = h
             .index
             .list_edge_events(ListEdgeEventsRequest {
-                schema_version: 1,
+                schema_version: crate::edge_index::SCHEMA_VERSION,
                 edge_id: hex::encode(a.payment.as_bytes()),
                 limit: Some(64),
                 ..Default::default()
@@ -1009,7 +1052,7 @@ fn native_edge_index_cold_open_serves_current_owners_without_archive_replay() {
         assert_eq!(recovered.next_height().unwrap(), latest.height + 1);
         let listing = index
             .list_edges(ListEdgesRequest {
-                schema_version: 1,
+                schema_version: crate::edge_index::SCHEMA_VERSION,
                 ..Default::default()
             })
             .unwrap();

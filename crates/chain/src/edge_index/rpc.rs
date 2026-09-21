@@ -7,9 +7,6 @@ use hellas_rpc::{
 use hellas_wire::{Dispatcher, StreamTransport, WireCode, WireStatus};
 use prost::Message;
 
-fn transcode<A: Message, B: Message + Default>(value: A) -> Result<B, WireStatus> {
-    B::decode(value.encode_to_vec().as_slice()).map_err(|e| WireStatus::internal(e.to_string()))
-}
 fn failure(mut error: EdgeIndexError) -> WireStatus {
     let mut details = types::IndexError {
         schema_version: types::SCHEMA_VERSION,
@@ -52,7 +49,7 @@ fn unavailable(message: &str) -> WireStatus {
 macro_rules! method {
     ($name:ident,$req:ident,$res:ident,$shared:ident) => {
         async fn $name(&self, request: pb::$req) -> Result<pb::$res, WireStatus> {
-            let request: types::$shared = transcode(request)?;
+            let request: types::$shared = request;
             let index = self.clone();
             let permit = index
                 .permits
@@ -68,7 +65,7 @@ macro_rules! method {
                 .map_err(|_| unavailable("index query deadline exceeded; retry later"))?
                 .map_err(|_| unavailable("index query failed"))?
                 .map_err(failure)?;
-            transcode(result)
+            Ok(result)
         }
     };
 }

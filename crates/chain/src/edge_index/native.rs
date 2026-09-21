@@ -31,7 +31,7 @@ impl EdgeIndexError {
             snapshot: None,
         }
     }
-    fn unavailable(message: impl ToString) -> Self {
+    pub(super) fn unavailable(message: impl ToString) -> Self {
         Self {
             status: 503,
             code: "index_not_ready",
@@ -151,7 +151,33 @@ impl EdgeIndex {
                 retained_from_height: read.retained_from_height,
             },
             provenance: Provenance::reported(),
+            evidence: Vec::new(),
         }
+    }
+    fn detail_metadata<'a>(
+        &self,
+        read: &ReadSnapshot,
+        details: impl IntoIterator<Item = &'a EdgeDetail>,
+    ) -> Result<EdgeIndexMetadata> {
+        let heights = details
+            .into_iter()
+            .flat_map(|detail| {
+                std::iter::once(detail.opening.transaction.height).chain(
+                    detail
+                        .closing
+                        .iter()
+                        .map(|closing| closing.transaction.height),
+                )
+            })
+            .filter(|height| *height != read.proof.height)
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut envelope = self.metadata(read);
+        envelope.evidence = heights
+            .into_iter()
+            .map(|height| read.proof(height).map_err(storage))
+            .collect::<Result<_>>()?;
+        envelope.evidence.sort_by(|a, b| a.payload.cmp(&b.payload));
+        Ok(envelope)
     }
     pub fn list_edges(&self, mut request: ListEdgesRequest) -> Result<ListEdgesResponse> {
         request = super::query::normalize_list_request(
@@ -281,7 +307,6 @@ impl EdgeIndex {
             .map(|closed| {
                 Ok(Closing {
                     transaction: closed.clone(),
-                    proof: read.proof(closed.height).map_err(storage)?,
                 })
             })
             .transpose()?;
@@ -292,22 +317,7 @@ impl EdgeIndex {
         Ok(EdgeDetail {
             summary,
             object_at_snapshot: object_answer(object.as_ref()),
-            opening: Opening {
-                transaction: edge.opened.clone(),
-                proof: read.proof(edge.opened.height).map_err(storage)?,
-                funding_maker: funding
-                    .maker()
-                    .iter()
-                    .map(|id| hex::encode(id.as_bytes()))
-                    .collect(),
-                funding_taker: funding
-                    .taker()
-                    .iter()
-                    .map(|id| hex::encode(id.as_bytes()))
-                    .collect(),
-                canonical_terms: canonical(&terms),
-                terms: public_terms(&terms).map_err(storage)?,
-            },
+            opening: opening_projection(edge.opened.clone(), &funding, &terms).map_err(storage)?,
             closing,
             related,
             events: EventsLink {
@@ -417,16 +427,17 @@ impl EdgeIndex {
             bond_state,
         };
         bounded(GetWorkChannelDetailResponse {
-            envelope: self.metadata(&read),
+            envelope: self.detail_metadata(&read, [&data.payment, &data.bond])?,
             data,
         })
     }
     pub fn get_edge_detail(&self, request: GetEdgeDetailRequest) -> Result<GetEdgeDetailResponse> {
         validate_request(request.schema_version, &request.edge_id)?;
         let read = self.snapshot(request.payload.as_deref())?;
+        let data = self.detail(&read, &request.edge_id)?;
         bounded(GetEdgeDetailResponse {
-            envelope: self.metadata(&read),
-            data: self.detail(&read, &request.edge_id)?,
+            envelope: self.detail_metadata(&read, [&data])?,
+            data,
         })
     }
     pub fn list_edge_events(
@@ -500,15 +511,21 @@ impl EdgeIndex {
         };
         let items = events
             .into_iter()
-            .map(|event| Ok(EdgeEvent {
-                canonical_transaction: read.transaction(&event.transaction).map_err(storage)?.encode().to_vec(),
-                kind: event.kind,
-                evidence_href: format!(
-                    "/api/v1/transactions/{}/proof",
-                    event.transaction.transaction_digest
-                ),
-                transaction: event.transaction,
-            }))
+            .map(|event| {
+                Ok(EdgeEvent {
+                    canonical_transaction: read
+                        .transaction(&event.transaction)
+                        .map_err(storage)?
+                        .encode()
+                        .to_vec(),
+                    kind: event.kind,
+                    evidence_href: format!(
+                        "/api/v1/transactions/{}/proof",
+                        event.transaction.transaction_digest
+                    ),
+                    transaction: event.transaction,
+                })
+            })
             .collect::<Result<Vec<_>>>()?;
         bounded(ListEdgeEventsResponse {
             envelope: self.metadata(&read),
@@ -521,11 +538,6 @@ fn validate_request(schema: u32, id: &str) -> Result<()> {
         return Err(EdgeIndexError::bad("unsupported schema version"));
     }
     validate_id(id).map_err(EdgeIndexError::bad)
-}
-fn canonical<T: hellas_kernel::Encode>(value: &T) -> Vec<u8> {
-    let mut bytes = vec![0; value.encoded_size()];
-    value.write_to(&mut bytes);
-    bytes
 }
 fn bounded<T: Serialize + prost::Message>(value: T) -> Result<T> {
     if value.encoded_len() > MAX_RESPONSE_BYTES
