@@ -55,6 +55,9 @@ const fn timeout_secs() -> u64 {
 // checkpoints are not worth routing work around.
 const MIN_CACHE_AFFINITY_TOKENS: usize = 128;
 const UNREACHABLE_PROVIDER_BACKOFF: Duration = Duration::from_secs(30);
+// Opening a route is control-plane work. It must not inherit the model's
+// execution allowance: an offline provider should yield to another route.
+const PROVIDER_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 // A retained job is durable, but it must not monopolize the channel that
 // serves interactive requests after a restart or a provider interruption.
 const RECOVERY_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -424,10 +427,25 @@ impl PaidGateway {
                     task_span.record("hellas.provider.id", tracing::field::display(provider.args.provider));
                     task_span.record("hellas.route.cache_affinity_tokens", route.cache_affinity_tokens);
                     task_span.record("hellas.route.pending", route.pending);
-                    let mut session = before_proposal(
-                        &sender, streamed, deadline,
-                        |_| provider.serial.lock().instrument(hellas_rpc::request_span!(target: "hellas_request", "paid.queue")),
-                    ).await?;
+                    // Skip busy routes for interactive requests. Recovery may
+                    // wait for its own channel, within the same request budget.
+                    let mut session = if recovery {
+                        before_proposal(
+                            &sender, false, deadline,
+                            |_| provider.serial.lock().instrument(hellas_rpc::request_span!(target: "hellas_request", "paid.queue")),
+                        ).await?
+                    } else {
+                        match provider.serial.try_lock() {
+                            Ok(session) => session,
+                            Err(_) => {
+                                provider_errors.push(format!(
+                                    "{}: retained work recovery is in progress",
+                                    provider.args.provider
+                                ));
+                                continue;
+                            }
+                        }
+                    };
                     if prepared.is_none() && (!provider.args.journal_root.try_exists()? || std::fs::read_dir(&provider.args.journal_root)?.next().is_none()) {
                         return Ok(Vec::new());
                     }
@@ -438,10 +456,10 @@ impl PaidGateway {
                         continue;
                     }
                     if session.is_none() {
-                        match before_proposal(
-                            &sender, streamed, deadline,
-                            |_| OpenPaidChannel::open(provider.args.clone(), endpoint.clone(), settlement_key.clone()),
-                        ).await.and_then(|result| result)
+                        match connect_before_deadline(
+                            &sender, streamed, deadline, PROVIDER_CONNECTION_TIMEOUT,
+                            OpenPaidChannel::open(provider.args.clone(), endpoint.clone(), settlement_key.clone()),
+                        ).await
                         {
                             Ok(opened) => {
                                 *session = Some(opened);
@@ -722,6 +740,28 @@ enum RequestStopped {
     Deadline,
 }
 
+// A route's short connection allowance is recoverable by trying another
+// provider; only the enclosing request deadline or disconnect is terminal.
+async fn connect_before_deadline<T>(
+    sender: &mpsc::Sender<BufferedEvent>,
+    cancel_on_disconnect: bool,
+    deadline: tokio::time::Instant,
+    connection_timeout: Duration,
+    connection: impl std::future::Future<Output = CliResult<T>>,
+) -> CliResult<T> {
+    let connection_deadline = deadline.min(tokio::time::Instant::now() + connection_timeout);
+    before_proposal(sender, cancel_on_disconnect, deadline, |_| async {
+        tokio::time::timeout_at(connection_deadline, connection)
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "paid provider connection exceeded its {connection_timeout:?} limit"
+                )
+            })?
+    })
+    .await?
+}
+
 /// Cancel an unproposed HTTP operation without interrupting work whose
 /// proposal signature may already have reached a provider.
 async fn before_proposal<T, F: std::future::Future<Output = T>>(
@@ -908,6 +948,40 @@ mod tests {
         let (result, ()) = tokio::join!(operation, disconnect);
         assert!(result.unwrap_err().is::<RequestStopped>());
         assert!(!signed.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn connection_timeout_allows_fallback_within_the_request_deadline() {
+        let (sender, _receiver) = mpsc::channel(OUTPUT_BUFFER_EVENTS);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        let failed = connect_before_deadline(
+            &sender,
+            true,
+            deadline,
+            Duration::from_millis(10),
+            std::future::pending::<CliResult<()>>(),
+        )
+        .await
+        .unwrap_err();
+        assert!(!failed.is::<RequestStopped>());
+        assert_eq!(
+            connect_before_deadline(&sender, true, deadline, Duration::from_millis(10), async {
+                Ok("second provider")
+            },)
+            .await
+            .unwrap(),
+            "second provider"
+        );
+        let expired = connect_before_deadline(
+            &sender,
+            true,
+            tokio::time::Instant::now(),
+            Duration::from_secs(10),
+            async { Ok(()) },
+        )
+        .await
+        .unwrap_err();
+        assert!(expired.is::<RequestStopped>());
     }
 
     #[tokio::test]

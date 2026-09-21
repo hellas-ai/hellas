@@ -67,7 +67,9 @@ may have reached a provider, collection and payment continue despite disconnects
 The pool admits at most `max_pending_requests` queued or running requests (default
 64); additional requests receive HTTP 503 and may be retried. `timeout_secs`
 bounds queueing, recovery, provider fallback, execution and payment together,
-rather than restarting for each provider. The HTTP paid route uses this same
+rather than restarting for each provider. Interactive requests skip busy provider
+channels; each connection attempt gets at most 10 seconds before trying another
+route within that shared budget. The HTTP paid route uses this same
 configured budget; non-paid routes retain their existing 3600-second default. HTTP delivery has an
 8 MiB byte budget (including event overhead), allowing retained-result bursts.
 A consumer that exhausts it receives a stream error; its accepted work continues
