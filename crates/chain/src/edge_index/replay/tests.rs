@@ -1,6 +1,6 @@
 use super::*;
 use crate::{
-    domain::{self, Transaction},
+    domain::{self, Digest, Transaction},
     edge_index::{projection, types::*},
     execution::test_support::{ConsensusFixture, consensus_fixture, finalization, run_qmdb},
     verified_explorer::PROOF_SCHEMA_VERSION,
