@@ -42,17 +42,24 @@ pub async fn trace_request(request: Request, next: Next) -> Response {
         }
     }
     super::set_remote_parent(&span, &metadata);
-    let started = Instant::now();
-    let mut response = next.run(request).instrument(span.clone()).await;
-    span.record(
+    let mut trace = ResponseTrace {
+        span,
+        started: Instant::now(),
+        bytes: 0,
+        first: true,
+        complete: false,
+        failed: false,
+    };
+    let mut response = next.run(request).instrument(trace.span.clone()).await;
+    trace.span.record(
         "http.response.status_code",
         i64::from(response.status().as_u16()),
     );
     if response.status().is_server_error() {
-        span.record("otel.status_code", "ERROR");
+        trace.span.record("otel.status_code", "ERROR");
     }
     let mut context = Metadata::new();
-    super::inject(&span, &mut context);
+    super::inject(&trace.span, &mut context);
     if let Some(value) = context.get("traceparent").and_then(|value| value.as_text()) {
         if let Ok(header) = HeaderValue::from_str(value) {
             response.headers_mut().insert("traceparent", header);
@@ -64,20 +71,19 @@ pub async fn trace_request(request: Request, next: Next) -> Response {
         }
     }
     response.map(|body| {
-        Body::new(TracedBody {
-            body,
-            span,
-            started,
-            bytes: 0,
-            first: true,
-            complete: false,
-            failed: false,
-        })
+        trace.complete = body.is_end_stream();
+        Body::new(TracedBody { body, trace })
     })
 }
 
 struct TracedBody {
     body: Body,
+    trace: ResponseTrace,
+}
+
+/// The handler owns this guard until it transfers it to the response body.
+/// Dropping either stage before completion records the same cancellation.
+struct ResponseTrace {
     span: Span,
     started: Instant,
     bytes: u64,
@@ -86,13 +92,13 @@ struct TracedBody {
     failed: bool,
 }
 
-impl Drop for TracedBody {
+impl Drop for ResponseTrace {
     fn drop(&mut self) {
         self.span.record(
             "http.response.body.size",
             i64::try_from(self.bytes).unwrap_or(i64::MAX),
         );
-        let complete = !self.failed && (self.complete || self.body.is_end_stream());
+        let complete = !self.failed && self.complete;
         self.span.record("hellas.response.complete", complete);
         if !complete && !self.failed {
             self.span.record("error.type", "cancelled");
@@ -110,31 +116,32 @@ impl HttpBody for TracedBody {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
         let this = self.get_mut();
-        let _entered = this.span.enter();
+        let _entered = this.trace.span.enter();
         let result = Pin::new(&mut this.body).poll_frame(cx);
         match &result {
             Poll::Ready(Some(Ok(frame))) => {
                 if let Some(data) = frame.data_ref() {
-                    if this.first && !data.is_empty() {
-                        this.span.record(
+                    if this.trace.first && !data.is_empty() {
+                        this.trace.span.record(
                             "hellas.first_response_body_ms",
-                            this.started.elapsed().as_secs_f64() * 1_000.0,
+                            this.trace.started.elapsed().as_secs_f64() * 1_000.0,
                         );
-                        this.first = false;
+                        this.trace.first = false;
                     }
-                    this.bytes += data.len() as u64;
+                    this.trace.bytes += data.len() as u64;
                 }
             }
             Poll::Ready(Some(Err(_))) => {
-                this.span.record("otel.status_code", "ERROR");
-                this.span.record("error.type", "body_error");
-                this.failed = true;
+                this.trace.span.record("otel.status_code", "ERROR");
+                this.trace.span.record("error.type", "body_error");
+                this.trace.failed = true;
             }
             Poll::Ready(None) => {
-                this.complete = true;
+                this.trace.complete = true;
             }
             Poll::Pending => {}
         }
+        this.trace.complete |= this.body.is_end_stream();
         result
     }
 
@@ -159,7 +166,7 @@ mod tests {
     use tracing_subscriber::prelude::*;
 
     #[tokio::test]
-    async fn http_spans_cover_body_completion_errors_and_cancellation() {
+    async fn http_spans_cover_handler_and_body_completion_errors_and_cancellation() {
         let exporter = InMemorySpanExporter::default();
         let provider = SdkTracerProvider::builder()
             .with_simple_exporter(exporter.clone())
@@ -170,6 +177,8 @@ mod tests {
         );
         let app = axum::Router::new()
             .route("/ok", get(|| async { "hello" }))
+            .route("/empty", get(|| async { Body::empty() }))
+            .route("/pending", get(std::future::pending::<&'static str>))
             .route(
                 "/bad",
                 get(|| async { (StatusCode::INTERNAL_SERVER_ERROR, "failed") }),
@@ -192,7 +201,7 @@ mod tests {
                 }),
             )
             .layer(axum::middleware::from_fn(trace_request));
-        for (index, route) in ["/ok", "/bad", "/cancel", "/body-error"]
+        for (index, route) in ["/ok", "/bad", "/cancel", "/body-error", "/empty"]
             .into_iter()
             .enumerate()
         {
@@ -216,14 +225,43 @@ mod tests {
             }
             drop(body);
         }
+        let mut pending = Box::pin(
+            app.oneshot(
+                Request::builder()
+                    .uri("/pending")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .with_subscriber(dispatch),
+        );
+        assert!(futures_util::poll!(&mut pending).is_pending());
+        assert_eq!(exporter.get_finished_spans().unwrap().len(), 5);
+        drop(pending);
         provider.force_flush().unwrap();
         let spans = exporter.get_finished_spans().unwrap();
-        assert_eq!(spans.len(), 4);
+        assert_eq!(spans.len(), 6);
+        let cancelled = spans.last().unwrap();
+        assert!(
+            cancelled
+                .attributes
+                .iter()
+                .any(|kv| kv.key.as_str() == "error.type"
+                    && kv.value == opentelemetry::Value::from("cancelled"))
+        );
+        assert!(
+            !cancelled
+                .attributes
+                .iter()
+                .any(|kv| kv.key.as_str() == "http.response.status_code"),
+            "cancelled handler never produced response headers"
+        );
         for (span, (route, complete, failed)) in spans.iter().zip([
             ("/ok", true, false),
             ("/bad", true, true),
             ("/cancel", false, true),
             ("/body-error", false, true),
+            ("/empty", true, false),
+            ("/pending", false, true),
         ]) {
             assert!(
                 span.attributes
