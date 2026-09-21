@@ -79,14 +79,7 @@ and event rows hold transaction locators, not additional canonical transaction
 copies. The latest cursor is a height reference into that table. Each read caches
 at most one decoded block while resolving locators.
 
-The intent is a recovery bridge, not another source of consensus truth. Every
-publication must reproduce the certified root and sync range. Moving this intent
-to Commonware Metadata alone would add an independently synced third participant
-without making redb publication atomic with QMDB. Rebuilding the derived index
-uses finalized history and fresh replay storage, never edits the certified state.
-Canonical evidence still overlaps the follower archive; removing that remaining
-copy requires an asynchronous archive-hydration query boundary. The synchronous
-range queries deliberately do not call an async runtime with `block_on`.
+Rebuilding the derived index uses finalized history and fresh replay storage.
 
 Index files and replay partitions are scoped by genesis, trust and schema. A new
 scope builds from genesis/archive in a separate namespace; old data is retained.
@@ -109,7 +102,7 @@ trusted block certificates, opening/closing inclusion, canonical terms and edge
 identity, decoded object fields and registry bindings. It returns ordinary
 reported-data types: discovery, current objects and completeness remain
 **indexer-reported**. An opening certificate does not prove that its edge is still
-open. Object membership/range proofs are a separate future protocol version.
+open. Object membership and range proofs are not provided.
 
 For deterministic integration fixtures, run:
 
@@ -121,7 +114,7 @@ HELLAS_EDGE_FIXTURE_DIR=/tmp/edge-fixtures cargo test -p hellas-chain \
 `basic/` and `work/` each contain independent `trust.json`, `genesis.json`, a
 `manifest.json` route/payload map and paired JSON/protobuf responses. The work
 fixtures execute Open, Start, Response, Adjudicated, bond Timeout and Freeze on
-real QMDB roots and verify all nested evidence with the client facade. The tests
+real QMDB roots and verify all nested evidence with the shared verifier. The tests
 also cover pagination within a checkpoint, typed restart after publication, old in-flight
 readers, gap/parent/root refusal, nonempty publication recovery on both sides of
 QMDB finalize, and a large cold closed index. Fixture blocks are produced by the

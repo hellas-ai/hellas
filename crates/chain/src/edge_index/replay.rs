@@ -2,7 +2,7 @@
 use super::{native::EdgeIndex, store::Result};
 use crate::{
     FinalizedBlockQuery, HellasBlock,
-    domain::{Digest, SettlementKey},
+    domain::SettlementKey,
     execution::{
         ChainVerifier, execute_all_observed,
         store::{UtxoDatabase, UtxoDb, utxo_db_config},
@@ -24,7 +24,6 @@ pub(crate) struct Replay<E: StorageContext + Spawner> {
     network: hellas_kernel::NetworkId,
     allocations: Vec<(SettlementKey, u64)>,
     genesis: HellasBlock,
-    cursor: u64,
     checkpoint: Option<VerifiedBlock>,
 }
 impl<E: StorageContext + Spawner + Send + Sync + 'static> Replay<E> {
@@ -88,19 +87,19 @@ impl<E: StorageContext + Spawner + Send + Sync + 'static> Replay<E> {
             Some(proof) => Some(Self::check_checkpoint(&database, proof, verifier).await?),
             None => None,
         };
-        let cursor = latest.as_ref().map_or(0, |proof| proof.height);
         Ok(Self {
             database,
             index,
             network,
             allocations,
             genesis,
-            cursor,
             checkpoint,
         })
     }
     pub fn next_height(&self) -> Result<u64> {
-        self.cursor
+        self.checkpoint
+            .as_ref()
+            .map_or(0, |block| block.view().height())
             .checked_add(1)
             .ok_or_else(|| "replay height overflow".into())
     }
@@ -177,7 +176,11 @@ impl<E: StorageContext + Spawner + Send + Sync + 'static> Replay<E> {
             return Err("replay checkpoint uses a different trust configuration".into());
         }
         let height = block.height().get();
-        if height <= self.cursor {
+        let current_height = self
+            .checkpoint
+            .as_ref()
+            .map_or(0, |block| block.view().height());
+        if height <= current_height {
             // Archive redelivery is harmless only when it is the exact same finalized payload.
             let stored = self.index.store.read(None)?.proof(height)?;
             if stored.payload != proof.payload {
@@ -185,21 +188,13 @@ impl<E: StorageContext + Spawner + Send + Sync + 'static> Replay<E> {
             }
             return Ok(());
         }
-        if height != self.cursor.checked_add(1).ok_or("replay height overflow")? {
+        if height != self.next_height()? {
             return Err("finalized replay gap".into());
         }
         let parent = self
-            .index
-            .store
-            .latest()?
-            .map_or(self.genesis.digest(), |proof| {
-                Digest(
-                    hex::decode(proof.payload)
-                        .expect("stored payload")
-                        .try_into()
-                        .expect("stored hash"),
-                )
-            });
+            .checkpoint
+            .as_ref()
+            .map_or(self.genesis.digest(), |block| block.view().payload());
         if block.parent() != parent {
             return Err("finalized replay parent mismatch".into());
         }
@@ -241,7 +236,6 @@ impl<E: StorageContext + Spawner + Send + Sync + 'static> Replay<E> {
         self.index.store.prepare(proof.clone(), changes)?;
         self.database.finalize(merkleized).await;
         self.index.store.publish_intent()?;
-        self.cursor = height;
         self.checkpoint = Some(verified);
         Ok(())
     }
