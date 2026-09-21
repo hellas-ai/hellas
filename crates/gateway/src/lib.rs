@@ -13,6 +13,8 @@ mod provenance_layer;
 mod proxy;
 mod responses;
 mod state;
+#[cfg_attr(not(feature = "otel"), path = "telemetry_disabled.rs")]
+mod telemetry;
 mod wrap;
 
 use anyhow::{Context, bail};
@@ -43,10 +45,36 @@ pub use execution::{
 
 const DEFAULT_HTTP_PORT: u16 = 8080;
 
+/// Token-native input handed to a configured paid-work client.
+pub struct PaidExecutionRequest {
+    pub environment: hellas_rpc::CausalLmEnvironment,
+    pub input_ids: Vec<u32>,
+    pub max_new_tokens: u32,
+    pub stop_token_ids: Vec<u32>,
+}
+
+pub trait PaidExecutionBackend: Send + Sync {
+    /// Reject incompatible policies before opening a channel. The returned
+    /// operation survives HTTP cancellation. Prefixes are authenticated as
+    /// they arrive; completion is emitted after durable payment acknowledgement.
+    fn execute(
+        &self,
+        request: PaidExecutionRequest,
+    ) -> anyhow::Result<futures::stream::BoxStream<'static, anyhow::Result<ExecutionEvent>>>;
+
+    /// Finish outstanding payment operations during graceful shutdown.
+    fn drain(&self) -> futures::future::BoxFuture<'_, ()>;
+}
+
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 pub struct GatewayOptions {
     pub output_cache: cache::CacheOptions,
+    pub paid_work: Option<Arc<dyn PaidExecutionBackend>>,
+    /// Load or create a stable bearer credential in a private file.
+    pub bearer_token_file: Option<PathBuf>,
+    /// Permit a non-loopback listener, with a persistent bearer credential.
+    pub allow_remote: bool,
     pub host: String,
     pub port: Option<u16>,
     pub node_id: Option<EndpointId>,
@@ -74,6 +102,8 @@ pub struct GatewayOptions {
     /// Application-selected tokenizer used only before and after execution.
     /// It is not part of the Catena environment or Hellas execution claim.
     pub tokenizer: Option<PathBuf>,
+    /// Explicit local chat format; plain completions remain plain text.
+    pub chat_template: Option<hellas_presentation::ChatTemplate>,
     /// Application-selected stop IDs sent explicitly with every request.
     pub stop_token_ids: Vec<u32>,
     pub metrics_port: Option<u16>,
@@ -128,7 +158,7 @@ pub enum ResponsesBackend {
     Fetch,
 }
 
-/// A running loopback HTTP gateway owned by its embedding process.
+/// A running authenticated HTTP gateway owned by its embedding process.
 pub struct GatewayHandle {
     address: SocketAddr,
     bearer: String,
@@ -171,13 +201,22 @@ impl Drop for GatewayHandle {
 
 /// Start a gateway without installing process signal handlers.
 pub async fn start(options: GatewayOptions) -> anyhow::Result<GatewayHandle> {
+    let listener = bind_gateway(
+        &options.host,
+        options.port,
+        options.allow_remote && options.bearer_token_file.is_some(),
+    )
+    .await?;
     let state = Arc::new(GatewayState::from_options(&options).await?);
 
     // Every route below reaches an executor, so every route below is
     // behind this run's credential. The layer goes on last, which in axum
     // puts it outermost: a request without the credential is answered
     // before a handler, the provenance layer, or the executor sees it.
-    let bearer = Arc::new(access::Bearer::generate());
+    let bearer = Arc::new(match options.bearer_token_file.as_ref() {
+        Some(path) => access::Bearer::load_or_create(path)?,
+        None => access::Bearer::generate(),
+    });
     let app = Router::new()
         .route("/v1/chat/completions", post(openai::handle))
         .route("/v1/responses", post(responses::handle))
@@ -185,6 +224,7 @@ pub async fn start(options: GatewayOptions) -> anyhow::Result<GatewayHandle> {
         .route("/v1/completions", post(plain::handle))
         .with_state(state.clone())
         .layer(provenance_layer::ProvenanceLayer)
+        .layer(axum::middleware::from_fn(telemetry::trace_request))
         .layer(access::BearerLayer::new(bearer.clone()));
 
     if let Some(metrics_port) = options.metrics_port {
@@ -224,11 +264,11 @@ pub async fn start(options: GatewayOptions) -> anyhow::Result<GatewayHandle> {
 
     launch_gateway(
         app,
-        &options.host,
-        options.port,
+        listener,
         bearer,
         options.wrap.as_deref(),
         &options.wrap_args,
+        options.paid_work.clone(),
     )
     .await
 }
@@ -241,19 +281,20 @@ pub async fn start_fetch(options: FetchGatewayOptions) -> anyhow::Result<Gateway
         .route("/v1/responses", post(responses::handle))
         .with_state(state)
         .layer(provenance_layer::ProvenanceLayer)
+        .layer(axum::middleware::from_fn(telemetry::trace_request))
         .layer(access::BearerLayer::new(bearer.clone()));
-    launch_gateway(app, &options.host, options.port, bearer, None, &[]).await
+    let listener = bind_gateway(&options.host, options.port, false).await?;
+    launch_gateway(app, listener, bearer, None, &[], None).await
 }
 
 async fn launch_gateway(
     app: Router,
-    host: &str,
-    port: Option<u16>,
+    listener: tokio::net::TcpListener,
     bearer: Arc<access::Bearer>,
     wrap_command: Option<&str>,
     wrap_args: &[String],
+    paid_work: Option<Arc<dyn PaidExecutionBackend>>,
 ) -> anyhow::Result<GatewayHandle> {
-    let listener = bind_gateway(host, port).await?;
     let bound_addr = listener
         .local_addr()
         .context("listener has no local address")?;
@@ -307,6 +348,9 @@ async fn launch_gateway(
                 server.await.context("gateway server failed")?;
             }
         }
+        if let Some(backend) = paid_work {
+            backend.drain().await;
+        }
         Ok(())
     });
 
@@ -322,8 +366,8 @@ async fn launch_gateway(
 pub async fn run(options: GatewayOptions) -> anyhow::Result<()> {
     let mut handle = start(options).await?;
     tokio::select! {
-        signal = tokio::signal::ctrl_c() => {
-            signal.context("failed to listen for ctrl-c")?;
+        signal = shutdown_signal() => {
+            signal?;
             handle.request_shutdown();
             (&mut handle.task)
                 .await
@@ -335,21 +379,38 @@ pub async fn run(options: GatewayOptions) -> anyhow::Result<()> {
     }
 }
 
-/// Bind the gateway listener. The host is resolved and required to be
-/// loopback before anything is bound — these routes reach the executor,
-/// so the listener does not come up on an address other machines can
-/// dial. With `--port`, fail loud on conflict (the user asked for that
+async fn shutdown_signal() -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result?,
+            _ = terminate.recv() => {},
+        }
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c().await?;
+    Ok(())
+}
+
+/// Bind the configured gateway interface. All inference routes require
+/// bearer authentication. With `--port`, fail on conflict (the user asked for that
 /// exact port). Without it, try 8080 first and fall back to an
 /// OS-assigned port on EADDRINUSE so a stray dev gateway doesn't block a
 /// fresh one.
-async fn bind_gateway(host: &str, port: Option<u16>) -> anyhow::Result<tokio::net::TcpListener> {
+async fn bind_gateway(
+    host: &str,
+    port: Option<u16>,
+    allow_remote: bool,
+) -> anyhow::Result<tokio::net::TcpListener> {
     if let Some(p) = port {
-        let addr = access::loopback_addr(host, p).await?;
+        let addr = access::bind_addr(host, p, allow_remote).await?;
         return tokio::net::TcpListener::bind(addr)
             .await
             .with_context(|| format!("failed to bind gateway on {addr}"));
     }
-    let preferred = access::loopback_addr(host, DEFAULT_HTTP_PORT).await?;
+    let preferred = access::bind_addr(host, DEFAULT_HTTP_PORT, allow_remote).await?;
     match tokio::net::TcpListener::bind(preferred).await {
         Ok(listener) => Ok(listener),
         Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {

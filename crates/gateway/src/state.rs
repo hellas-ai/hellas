@@ -2,12 +2,12 @@ use super::proxy::ResponsesProxy;
 use super::{FetchGatewayOptions, GatewayOptions, ResponsesBackend, json_error};
 use crate::execution::{
     CausalLmExecutionEnvironment, CliRuntime, ExecutionRequest, ExecutionRequestOptions,
-    ExecutionStrategy, PreparedExecution,
+    ExecutionStrategy,
 };
 use anyhow::Context;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use hellas_adaptors::{ExecutionRequest as WireExecutionRequest, Input};
+use hellas_adaptors::ExecutionRequest as WireExecutionRequest;
 use hellas_client::{ExecutionRoute, RemoteNodeTarget};
 #[cfg(feature = "evaluate")]
 use hellas_executor::{
@@ -26,7 +26,7 @@ use tokio::time::Duration;
 
 /// End-to-end deadline applied while consuming a prepared generation.
 /// Covers preparation (quote / discovery) AND the entire decode stream.
-pub(super) const DEFAULT_INFERENCE_TIMEOUT: Duration = Duration::from_secs(300);
+pub(super) const DEFAULT_INFERENCE_TIMEOUT: Duration = Duration::from_secs(3600);
 
 #[derive(Clone)]
 pub(super) struct GatewayState {
@@ -52,6 +52,7 @@ pub(super) struct GatewayState {
     /// deliberately not kept: there is no second place a route could be
     /// assembled, and so no place one could be assembled without an anchor.
     strategy: Option<ExecutionStrategy>,
+    paid_work: Option<Arc<dyn super::PaidExecutionBackend>>,
 }
 
 /// The execution strategy these options describe, or `None` when they
@@ -114,7 +115,9 @@ fn local_runtime_needs_remote(options: &GatewayOptions) -> bool {
 }
 
 pub(super) struct PreparedGeneration {
-    pub(super) prepared: PreparedExecution,
+    pub(super) chat: Option<hellas_presentation::chat::ChatTurn>,
+    pub(super) prepared:
+        futures::stream::BoxStream<'static, hellas_client::ClientResult<crate::ExecutionEvent>>,
     /// Pre-flight provenance the executor committed to. `None` for routes
     /// that defer their quote until streaming starts (`RemoteDiscovery`);
     /// in that case headers can't be set and clients must rely on the
@@ -155,11 +158,15 @@ impl GatewayState {
             options.responses_backend != ResponsesBackend::Hellas || options.causal_lm.is_some(),
             "Hellas backend requires an environment and tokenizer"
         );
+        let chat_template = options.chat_template;
         let presentation = if let Some(tokenizer) = options.tokenizer.clone() {
             Some(Arc::new(
-                tokio::task::spawn_blocking(move || TextPresentation::load(&tokenizer))
-                    .await
-                    .context("tokenizer loader panicked")??,
+                tokio::task::spawn_blocking(move || {
+                    TextPresentation::load(&tokenizer)
+                        .map(|presentation| presentation.with_chat_template(chat_template))
+                })
+                .await
+                .context("tokenizer loader panicked")??,
             ))
         } else {
             None
@@ -212,11 +219,14 @@ impl GatewayState {
             } else {
                 runtime
             }
+        } else if options.paid_work.is_some() {
+            CliRuntime::default()
         } else {
             CliRuntime::remote(options.secret_key.clone()).await?
         };
         #[cfg(not(feature = "evaluate"))]
         let runtime = if replay_only
+            || options.paid_work.is_some()
             || (options.responses_backend == ResponsesBackend::Proxy && options.causal_lm.is_none())
         {
             CliRuntime::default()
@@ -285,6 +295,11 @@ impl GatewayState {
             } else {
                 configured_strategy(options)
             },
+            paid_work: if replay_only {
+                None
+            } else {
+                options.paid_work.clone()
+            },
         })
     }
 
@@ -328,6 +343,7 @@ impl GatewayState {
             runner_key,
             assurance: options.assurance,
             strategy: None,
+            paid_work: None,
         })
     }
 
@@ -356,6 +372,61 @@ impl GatewayState {
             status: StatusCode::NOT_FOUND,
             message: "this gateway exposes only the Fetch-backed Responses route".to_string(),
         })?;
+        if let Some(backend) = self.paid_work.as_ref() {
+            use futures::StreamExt;
+            use hellas_client::execution::{genesis_text_execution_id, prepare_evaluate_stream};
+            let identity = genesis_text_execution_id(
+                causal_lm.manifest_id(),
+                &input_ids,
+                max_tokens,
+                &self.stop_token_ids,
+            );
+            let prepared = prepare_evaluate_stream(identity, self.output_cache.clone(), async {
+                let payment = backend
+                    .execute(super::PaidExecutionRequest {
+                        environment: causal_lm.environment().clone(),
+                        input_ids,
+                        max_new_tokens: max_tokens,
+                        stop_token_ids: self.stop_token_ids.clone(),
+                    })
+                    .map_err(|error| {
+                        hellas_client::ClientError::External(error.into_boxed_dyn_error())
+                    })?;
+                Ok((
+                    None,
+                    payment
+                        .map(|result| {
+                            result.map_err(|error| {
+                                hellas_client::ClientError::External(error.into_boxed_dyn_error())
+                            })
+                        })
+                        .boxed(),
+                ))
+            })
+            .await
+            .map_err(|error| match error {
+                hellas_client::ClientError::External(error) => HttpError {
+                    status: StatusCode::BAD_REQUEST,
+                    message: format!("Request does not match a paid provider policy: {error}"),
+                },
+                error => HttpError {
+                    status: StatusCode::BAD_GATEWAY,
+                    message: format!("{prepare_error}: {}", format_error_causes(&error)),
+                },
+            })?;
+            let provenance = prepared.provenance().cloned();
+            return Ok(PreparedGeneration {
+                chat: None,
+                prepared: prepared.stream(),
+                provenance,
+                prompt_tokens,
+                presentation: self
+                    .presentation
+                    .clone()
+                    .expect("causal-LM presentation is loaded"),
+                inference_timeout: self.inference_timeout,
+            });
+        }
         let request = ExecutionRequest::new(
             self.runtime.clone(),
             causal_lm,
@@ -391,11 +462,12 @@ impl GatewayState {
         let provenance = prepared.provenance().cloned();
 
         Ok(PreparedGeneration {
+            chat: None,
             presentation: self.presentation.clone().ok_or_else(|| HttpError {
                 status: StatusCode::NOT_FOUND,
                 message: "this gateway has no causal-LM presentation".to_string(),
             })?,
-            prepared,
+            prepared: prepared.stream(),
             provenance,
             prompt_tokens,
             inference_timeout: self.inference_timeout,
@@ -412,40 +484,27 @@ impl GatewayState {
             .sampling
             .max_output_tokens
             .unwrap_or(self.default_max_tokens);
-        let input_ids = match &req.canonical.input {
-            Input::Text(prompt)
-                if req.canonical.tools.is_empty() && req.canonical.reasoning.is_none() =>
-            {
-                self.presentation
-                    .as_ref()
-                    .ok_or_else(|| HttpError {
-                        status: StatusCode::NOT_FOUND,
-                        message: "this gateway has no causal-LM presentation".to_string(),
-                    })?
-                    .encode(prompt)
-                    .map_err(|err| HttpError {
-                        status: StatusCode::BAD_REQUEST,
-                        message: format!(
-                            "Failed to tokenize completion prompt: {}",
-                            format_error_causes(err.as_ref())
-                        ),
-                    })?
-            }
-            Input::Text(_) | Input::Messages(_) | Input::Items(_) => {
-                return Err(HttpError {
-                    status: StatusCode::BAD_REQUEST,
-                    message: "the configured text presentation has no chat/tool template; use plain text completions or select the proxy/fetch Responses backend".to_string(),
-                });
-            }
-        };
+        let presentation = self.presentation.as_ref().ok_or_else(|| HttpError {
+            status: StatusCode::NOT_FOUND,
+            message: "this gateway has no causal-LM presentation".into(),
+        })?;
+        let chat = presentation
+            .prepare(&req.canonical)
+            .map_err(|err| HttpError {
+                status: StatusCode::BAD_REQUEST,
+                message: format!("Failed to prepare model input: {err:#}"),
+            })?;
 
-        self.finalize_generation(
-            input_ids,
-            max_tokens,
-            "Failed to prepare Responses input",
-            retention,
-        )
-        .await
+        let mut generation = self
+            .finalize_generation(
+                chat.input_ids,
+                max_tokens,
+                "Failed to prepare model input",
+                retention,
+            )
+            .await?;
+        generation.chat = Some(chat.turn);
+        Ok(generation)
     }
 
     pub(super) fn cached<B>(&self, backend: B) -> super::cache::CachedBackend<B> {
