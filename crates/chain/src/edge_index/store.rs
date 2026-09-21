@@ -66,6 +66,13 @@ pub(super) enum SnapshotError {
     #[error("snapshot_unavailable")]
     Unavailable,
 }
+#[derive(Debug, thiserror::Error)]
+pub(super) enum ScanLimit {
+    #[error("query deadline exceeded")]
+    Deadline,
+    #[error("query budget exceeded")]
+    VisitBudget,
+}
 fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     Ok(serde_json::to_vec(value)?)
 }
@@ -398,7 +405,7 @@ impl ReadSnapshot {
             }
             count += 1;
             if count > 100_000 {
-                return Err("query budget exceeded".into());
+                return Err(ScanLimit::VisitBudget.into());
             }
             if let Some(edge) = self.edge(id.value())?
                 && !visit(edge)?
@@ -666,5 +673,16 @@ mod tests {
             .unwrap();
         assert!(page.data.as_ref().unwrap().items.is_empty());
         assert!(page.data.as_ref().unwrap().next_cursor.is_none());
+        // All-state lookup crosses the visit cap without invoking the visitor:
+        // these synthetic history rows deliberately have no corresponding edge.
+        let error = index
+            .list_edges(ListEdgesRequest {
+                schema_version: super::super::SCHEMA_VERSION,
+                state: Some("all".into()),
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert_eq!((error.status, error.code), (503, "index_not_ready"));
+        assert_eq!(error.message, "query budget exceeded");
     }
 }

@@ -1,7 +1,7 @@
 use super::query::{Cursor, Filters};
 use super::{
     projection::*,
-    store::{Identity, IndexStore, ReadSnapshot, SnapshotError, StoredEdge},
+    store::{Identity, IndexStore, ReadSnapshot, ScanLimit, SnapshotError, StoredEdge},
     types::*,
 };
 use crate::domain::{Object, Transaction};
@@ -54,6 +54,15 @@ fn storage(error: impl std::fmt::Display) -> EdgeIndexError {
         code: "index_storage_error",
         message: error.to_string(),
         snapshot: None,
+    }
+}
+// A scan can fail in storage, in the visitor, or on its resource bounds.
+// Preserve typed visitor errors instead of relabeling them as storage faults.
+fn scan_error(error: Box<dyn std::error::Error + Send + Sync>) -> EdgeIndexError {
+    match error.downcast::<EdgeIndexError>() {
+        Ok(error) => *error,
+        Err(error) if error.is::<ScanLimit>() => EdgeIndexError::unavailable(error),
+        Err(error) => storage(error),
     }
 }
 #[derive(Clone)]
@@ -256,7 +265,7 @@ impl EdgeIndex {
         let prefix = format!("{}/{prefix}", filters.s);
         read.scan_edges(&prefix, cursor.as_ref().map(|v| v.a.as_str()), |edge| {
             if started.elapsed() > Duration::from_millis(250) {
-                return Err("query deadline exceeded".into());
+                return Err(ScanLimit::Deadline.into());
             }
             if (filters.s == "open" && edge.closed.is_some())
                 || (filters.s == "closed" && edge.closed.is_none())
@@ -272,7 +281,7 @@ impl EdgeIndex {
             items.push(summary);
             Ok(items.len() <= limit)
         })
-        .map_err(storage)?;
+        .map_err(scan_error)?;
         let next_cursor = if items.len() > limit {
             items.pop();
             Some(self.encode_cursor(Cursor {
@@ -592,5 +601,28 @@ fn registry_chunk(read: &ReadSnapshot, id: &[u8]) -> Result<Option<hellas_kernel
         _ => Err(EdgeIndexError::corrupt(
             "wrong object kind at registry slot",
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scan_boundary_preserves_visitor_errors_and_classifies_limits() {
+        for limit in [ScanLimit::Deadline, ScanLimit::VisitBudget] {
+            let message = limit.to_string();
+            let error = scan_error(Box::new(limit));
+            assert_eq!((error.status, error.code), (503, "index_not_ready"));
+            assert_eq!(error.message, message);
+        }
+        let error = scan_error(Box::new(EdgeIndexError::corrupt(
+            "stored opening is not Open",
+        )));
+        assert_eq!((error.status, error.code), (500, "index_corrupt"));
+        assert_eq!(error.message, "stored opening is not Open");
+        let error = scan_error(Box::new(std::io::Error::other("read failed")));
+        assert_eq!((error.status, error.code), (500, "index_storage_error"));
+        assert_eq!(error.message, "read failed");
     }
 }
