@@ -30,7 +30,7 @@ use hellas_rpc::{
     call::{GeneralSubmitRoute, WorkResponseRoute},
 };
 use hellas_wire::{
-    Dispatcher, PeerIdentity, StreamTransport, TransportContext, WireCode, WireStatus,
+    PeerIdentity, StreamTransport, TransportContext, WireCode, WireStatus,
 };
 use p256::ecdsa::Signature as P256Signature;
 use std::{
@@ -193,36 +193,18 @@ where
     <T::Stream as hellas_wire::Stream>::SendHalf: 'static,
     C: LightClientApi + FinalizedWorkView,
 {
-    let mut calls = tokio::task::JoinSet::new();
-    while let Some(inbound) = transport.accept().await? {
-        let dispatch = LightClientServer(
+    // Unbounded on purpose: this service exposes long-lived server-streaming
+    // calls (activity subscriptions), and an in-flight cap counts open
+    // streams, so a handful of subscribers would starve every later call on
+    // the connection.
+    hellas_wire::serve_dispatched(transport, "light-client", None, || {
+        LightClientServer(
             service.clone(),
             service.state.response_route.clone(),
             service.state.general_route.clone(),
-        );
-        calls.spawn(async move {
-            <LightClientServer<LightClientRpc<C>> as Dispatcher<T>>::dispatch(&dispatch, inbound)
-                .await
-        });
-
-        while let Some(result) = calls.try_join_next() {
-            match result {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => warn!(%error, "light client rpc failed"),
-                Err(error) => warn!(%error, "light client rpc task failed"),
-            }
-        }
-    }
-
-    calls.abort_all();
-    while let Some(result) = calls.join_next().await {
-        match result {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => warn!(%error, "light client rpc failed"),
-            Err(error) if error.is_cancelled() => {}
-            Err(error) => warn!(%error, "light client rpc task failed"),
-        }
-    }
+        )
+    })
+    .await?;
     Ok(())
 }
 

@@ -1,7 +1,7 @@
 //! Separate read-only EdgeIndex RPC service, exposed by the native indexer.
 use super::{EdgeIndex, EdgeIndexError, types};
 use hellas_rpc::pb::services::edge_index::{EdgeIndexHandler, EdgeIndexServer};
-use hellas_wire::{Dispatcher, StreamTransport, WireCode, WireStatus};
+use hellas_wire::{WireCode, WireStatus};
 use prost::Message;
 
 fn failure(error: EdgeIndexError) -> WireStatus {
@@ -78,6 +78,9 @@ impl hellas_wire::mux::MessagePipe for Pipe {
         Ok(None)
     }
 }
+/// Concurrent dispatches allowed per EdgeIndex connection.
+const MAX_IN_FLIGHT: usize = 16;
+
 pub(crate) async fn serve_socket(socket: axum::extract::ws::WebSocket, index: EdgeIndex) {
     let transport = hellas_wire::mux::MuxTransport::spawn::<32, hellas_wire::clock::DefaultClock, _>(
         hellas_wire::mux::Role::Server,
@@ -86,21 +89,16 @@ pub(crate) async fn serve_socket(socket: axum::extract::ws::WebSocket, index: Ed
         Pipe(socket),
         hellas_wire::TransportContext::default(),
     );
-    let mut calls = tokio::task::JoinSet::new();
-    while let Ok(Some(inbound)) = transport.accept().await {
-        while calls.len() >= 16 {
-            let _ = calls.join_next().await;
-        }
-        let server = EdgeIndexServer(index.clone());
-        calls.spawn(async move {
-            let _ = <EdgeIndexServer<EdgeIndex> as Dispatcher<hellas_wire::mux::MuxTransport>>::dispatch(
-                &server, inbound,
-            ).await;
-        });
-        while calls.try_join_next().is_some() {}
+    // Bounded: every EdgeIndex method is a short read, so capping concurrent
+    // dispatches costs nothing and keeps one connection from monopolising the
+    // index. Unlike the light-client service, nothing here holds a stream open.
+    let served = hellas_wire::serve_dispatched(transport, "edge-index", Some(MAX_IN_FLIGHT), || {
+        EdgeIndexServer(index.clone())
+    })
+    .await;
+    if let Err(error) = served {
+        tracing::warn!(%error, "edge index rpc transport closed with an error");
     }
-    calls.abort_all();
-    while calls.join_next().await.is_some() {}
 }
 
 #[cfg(test)]

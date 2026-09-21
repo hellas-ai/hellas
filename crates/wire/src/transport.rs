@@ -241,3 +241,72 @@ pub trait Dispatcher<T: StreamTransport> {
         inbound: Inbound<T::Stream>,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
+
+/// Accept inbound streams and dispatch each to `service` on its own task.
+///
+/// Every server built on this crate needs the same loop: accept, spawn one
+/// dispatch per stream so a long-lived server-streaming call cannot block
+/// unary calls on other mux streams, bound how many run at once, reap
+/// finished tasks, and cancel the rest when the transport closes. The two
+/// servers in `hellas-chain` had each grown their own copy, which had
+/// already drifted apart -- one capped in-flight calls and swallowed every
+/// error, the other logged errors and had no cap at all.
+///
+/// `max_in_flight` bounds concurrent dispatches, waiting for a slot rather
+/// than dropping work. Pass `None` for unbounded, which is **required** for
+/// any service exposing long-lived server-streaming calls: a cap counts open
+/// streams, so N held subscriptions would starve every subsequent call on
+/// that connection. Bound only services whose calls are all short reads.
+///
+/// `service` names the server in logs.
+///
+/// Returns when the transport closes cleanly, or with the transport's own
+/// error if `accept` fails. Individual dispatch failures are logged and do
+/// not stop the loop: one bad call must not take the connection down.
+#[cfg(not(target_family = "wasm"))]
+pub async fn serve_dispatched<T, D, F>(
+    transport: T,
+    service: &'static str,
+    max_in_flight: Option<usize>,
+    dispatcher: F,
+) -> Result<(), T::Error>
+where
+    T: StreamTransport,
+    T::Stream: Send + 'static,
+    D: Dispatcher<T> + Send + 'static,
+    F: Fn() -> D,
+{
+    fn report<E: std::fmt::Display>(
+        service: &'static str,
+        result: Result<Result<(), E>, tokio::task::JoinError>,
+    ) {
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::warn!(%service, %error, "rpc dispatch failed"),
+            Err(error) if error.is_cancelled() => {}
+            Err(error) => tracing::warn!(%service, %error, "rpc dispatch task failed"),
+        }
+    }
+
+    let mut calls = tokio::task::JoinSet::new();
+    // A cap of zero would spin: never room to start, nothing to reap.
+    let max_in_flight = max_in_flight.map_or(usize::MAX, |cap| cap.max(1));
+    while let Some(inbound) = transport.accept().await? {
+        while calls.len() >= max_in_flight {
+            if let Some(result) = calls.join_next().await {
+                report(service, result);
+            }
+        }
+        let dispatch = dispatcher();
+        calls.spawn(async move { dispatch.dispatch(inbound).await });
+        while let Some(result) = calls.try_join_next() {
+            report(service, result);
+        }
+    }
+
+    calls.abort_all();
+    while let Some(result) = calls.join_next().await {
+        report(service, result);
+    }
+    Ok(())
+}
