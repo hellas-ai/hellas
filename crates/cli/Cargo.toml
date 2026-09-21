@@ -57,10 +57,10 @@ chain = [
 indexer = ["chain", "hellas-chain/explorer-origin"]
 validator = ["indexer", "hellas-chain/validator"]
 
-# OpenTelemetry / OTLP exporter + iroh-internal metrics. When off, none of the
-# opentelemetry crates compile, the trace context propagation paths in
-# `serve/node.rs` collapse to identity, and iroh's metrics
-# module is not built.
+# Hellas OpenTelemetry / OTLP exporter + iroh-internal metrics. When off,
+# trace context propagation paths in `serve/node.rs` collapse to identity,
+# and iroh's metrics module is not built. Upstream Commonware still depends
+# on its telemetry SDK crates.
 otel = [
     "hellas-chain?/otel",
     "hellas-rpc/otel",
