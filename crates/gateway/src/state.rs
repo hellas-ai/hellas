@@ -26,7 +26,7 @@ use tokio::time::Duration;
 
 /// End-to-end deadline applied while consuming a prepared generation.
 /// Covers preparation (quote / discovery) AND the entire decode stream.
-pub(super) const DEFAULT_INFERENCE_TIMEOUT: Duration = Duration::from_secs(300);
+pub(super) const DEFAULT_INFERENCE_TIMEOUT: Duration = Duration::from_secs(3600);
 
 #[derive(Clone)]
 pub(super) struct GatewayState {

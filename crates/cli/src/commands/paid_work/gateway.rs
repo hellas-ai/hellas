@@ -327,7 +327,7 @@ pub async fn load_gateway_backend(
             None,
             Some(RECOVERY_ATTEMPT_TIMEOUT),
             None,
-        );
+        )?;
         let provider = provider.clone();
         gateway
             .followers
@@ -370,7 +370,13 @@ impl PaidGateway {
         cache_update: Option<CacheUpdate>,
         recovery_timeout: Option<Duration>,
         permit: Option<OwnedSemaphorePermit>,
-    ) -> BoxStream<'static, CliResult<ExecutionEvent>> {
+    ) -> CliResult<BoxStream<'static, CliResult<ExecutionEvent>>> {
+        // Admission can precede local request preparation. Serialize the final
+        // gate check and registration with drain's close-and-snapshot boundary.
+        let mut tasks = self.tasks.lock().expect("paid task list poisoned");
+        if self.admission.is_closed() {
+            return Err(hellas_gateway::PaidGatewayBusy.into());
+        }
         let endpoint = self.endpoint.clone();
         let settlement_key = self.settlement_key.clone();
         let (sender, receiver) = mpsc::channel(OUTPUT_BUFFER_EVENTS);
@@ -419,8 +425,8 @@ impl PaidGateway {
                     task_span.record("hellas.route.cache_affinity_tokens", route.cache_affinity_tokens);
                     task_span.record("hellas.route.pending", route.pending);
                     let mut session = before_proposal(
-                        &sender, streamed, &AtomicBool::new(false), deadline,
-                        provider.serial.lock().instrument(hellas_rpc::request_span!(target: "hellas_request", "paid.queue")),
+                        &sender, streamed, deadline,
+                        |_| provider.serial.lock().instrument(hellas_rpc::request_span!(target: "hellas_request", "paid.queue")),
                     ).await?;
                     if prepared.is_none() && (!provider.args.journal_root.try_exists()? || std::fs::read_dir(&provider.args.journal_root)?.next().is_none()) {
                         return Ok(Vec::new());
@@ -433,15 +439,15 @@ impl PaidGateway {
                     }
                     if session.is_none() {
                         match before_proposal(
-                            &sender, streamed, &AtomicBool::new(false), deadline,
-                            OpenPaidChannel::open(provider.args.clone(), endpoint.clone(), settlement_key.clone()),
+                            &sender, streamed, deadline,
+                            |_| OpenPaidChannel::open(provider.args.clone(), endpoint.clone(), settlement_key.clone()),
                         ).await.and_then(|result| result)
                         {
                             Ok(opened) => {
                                 *session = Some(opened);
                             }
                             Err(error) => {
-                                if error.is::<RequestStopped>() { return Err(error); }
+                                if !recovery && error.is::<RequestStopped>() { return Err(error); }
                                 provider.connection_failed();
                                 if recovery {
                                     tracing::debug!(provider = %provider.args.provider, error = %format!("{error:#}"),
@@ -491,16 +497,22 @@ impl PaidGateway {
                     let already_proposed = prepared_bytes.as_ref().is_some_and(|input| {
                         session.client.state().jobs().any(|job| job.prepared_input() == input)
                     });
-                    let proposed = AtomicBool::new(already_proposed);
+                    let request_session = &mut *session;
+                    let input = prepared.clone();
+                    let on_progress = streamed.then(|| progress.clone());
                     let result = before_proposal(
-                        &sender, streamed, &proposed, deadline,
-                        session.run_with_admission(prepared.clone(), true, streamed.then(|| progress.clone()), Some(&proposed)),
+                        &sender, streamed, deadline,
+                        |proposed| async move {
+                            request_session.run_with_admission(input, true, on_progress, Some(&proposed)).await
+                        },
                     ).await
                         .and_then(|result| result)
                         .and_then(|output| output.map(output_events).transpose())
                         .map(Option::unwrap_or_default);
                     if let Err(error) = &result {
-                        if error.is::<RequestStopped>() && !proposed.load(Ordering::Acquire) {
+                        if !recovery && error.is::<RequestStopped>()
+                            && session.client.state().proposal_nonce_high_water() == proposal_nonce
+                        {
                             return result;
                         }
                         provider.cache.lock().expect("provider cache poisoned").replace(None);
@@ -560,10 +572,9 @@ impl PaidGateway {
                 Err(error) => { emit(&sender, &overflow, &output_budget, Err(error)); }
             }
         }.instrument(span));
-        let mut tasks = self.tasks.lock().expect("paid task list poisoned");
         tasks.retain(|task| !task.is_finished());
         tasks.push(task);
-        response_stream(receiver, overflow_receiver)
+        Ok(response_stream(receiver, overflow_receiver))
     }
 }
 
@@ -608,17 +619,21 @@ impl PaidExecutionBackend for PaidGateway {
             .collect::<Vec<_>>();
         // Stable sorting preserves the rotating order for equally ranked routes.
         candidates.sort_by_key(|(_, route)| std::cmp::Reverse(route.score()));
-        Ok(self.submit(
+        self.submit(
             candidates,
             Some(prepared),
             Some(cache_update),
             None,
             Some(permit),
-        ))
+        )
     }
 
     fn drain(&self) -> BoxFuture<'_, ()> {
-        self.admission.close();
+        let tasks = {
+            let mut tasks = self.tasks.lock().expect("paid task list poisoned");
+            self.admission.close();
+            std::mem::take(&mut *tasks)
+        };
         for follower in self
             .followers
             .lock()
@@ -627,7 +642,6 @@ impl PaidExecutionBackend for PaidGateway {
         {
             follower.abort();
         }
-        let tasks = std::mem::take(&mut *self.tasks.lock().expect("paid task list poisoned"));
         Box::pin(async move {
             for task in tasks {
                 if let Err(error) = task.await {
@@ -710,17 +724,20 @@ enum RequestStopped {
 
 /// Cancel an unproposed HTTP operation without interrupting work whose
 /// proposal signature may already have reached a provider.
-async fn before_proposal<T>(
+async fn before_proposal<T, F: std::future::Future<Output = T>>(
     sender: &mpsc::Sender<BufferedEvent>,
     cancel_on_disconnect: bool,
-    proposed: &AtomicBool,
     deadline: tokio::time::Instant,
-    operation: impl std::future::Future<Output = T>,
+    operation: impl FnOnce(Arc<AtomicBool>) -> F,
 ) -> CliResult<T> {
     if tokio::time::Instant::now() >= deadline {
         return Err(RequestStopped::Deadline.into());
     }
-    let operation = tokio::time::timeout_at(deadline, operation);
+    // This flag belongs to this operation, never to retained matching input.
+    // A prior journal record may prevent fallback but cannot authorize a new
+    // request after its HTTP receiver has gone away.
+    let proposed = Arc::new(AtomicBool::new(false));
+    let operation = tokio::time::timeout_at(deadline, operation(proposed.clone()));
     tokio::pin!(operation);
     let result = tokio::select! {
         biased;
@@ -831,9 +848,8 @@ mod tests {
         let result = before_proposal(
             &sender,
             true,
-            &AtomicBool::new(false),
             tokio::time::Instant::now() + Duration::from_secs(1),
-            async {
+            |_| async {
                 started.store(true, Ordering::Relaxed);
             },
         )
@@ -845,15 +861,13 @@ mod tests {
     #[tokio::test]
     async fn disconnect_after_proposal_still_finishes_payment() {
         let (sender, receiver) = mpsc::channel(OUTPUT_BUFFER_EVENTS);
-        let proposed = AtomicBool::new(false);
         let (proposal_sent, proposal_seen) = tokio::sync::oneshot::channel();
         let (payment_ready, payment_wait) = tokio::sync::oneshot::channel();
         let work = before_proposal(
             &sender,
             true,
-            &proposed,
             tokio::time::Instant::now() + Duration::from_secs(1),
-            async {
+            |proposed| async move {
                 proposed.store(true, Ordering::Release);
                 proposal_sent.send(()).unwrap();
                 payment_wait.await.unwrap();
@@ -873,17 +887,18 @@ mod tests {
     #[tokio::test]
     async fn disconnect_during_dial_cancels_before_signature_release() {
         let (sender, receiver) = mpsc::channel(OUTPUT_BUFFER_EVENTS);
-        let proposed = AtomicBool::new(false);
+        let signed = AtomicBool::new(false);
+        let signed_ref = &signed;
         let (dial_started, dial_seen) = tokio::sync::oneshot::channel();
         let operation = before_proposal(
             &sender,
             true,
-            &proposed,
             tokio::time::Instant::now() + Duration::from_secs(1),
-            async {
+            |proposed| async move {
                 dial_started.send(()).unwrap();
                 std::future::pending::<()>().await;
                 proposed.store(true, Ordering::Release);
+                signed_ref.store(true, Ordering::Release);
             },
         );
         let disconnect = async {
@@ -892,7 +907,54 @@ mod tests {
         };
         let (result, ()) = tokio::join!(operation, disconnect);
         assert!(result.unwrap_err().is::<RequestStopped>());
-        assert!(!proposed.load(Ordering::Acquire));
+        assert!(!signed.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn previous_proposal_does_not_authorize_disconnected_next_operation() {
+        let (sender, receiver) = mpsc::channel(OUTPUT_BUFFER_EVENTS);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        before_proposal(&sender, true, deadline, |proposed| async move {
+            proposed.store(true, Ordering::Release);
+        })
+        .await
+        .unwrap();
+        // A retained proposal from the earlier operation may still exist, but
+        // the next operation must establish its own signature-release boundary.
+        drop(receiver);
+        let started = AtomicBool::new(false);
+        let result = before_proposal(&sender, true, deadline, |_| async {
+            started.store(true, Ordering::Release);
+        })
+        .await;
+        assert!(result.unwrap_err().is::<RequestStopped>());
+        assert!(!started.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn shutdown_rejects_admitted_work_not_yet_registered() {
+        let gateway = PaidGateway {
+            providers: Vec::new(),
+            next: AtomicUsize::new(0),
+            endpoint: Endpoint::builder(presets::Minimal).bind().await.unwrap(),
+            settlement_key: Secp256k1Signer::from_secret_scalar([7; 32]).unwrap(),
+            admission: Arc::new(Semaphore::new(1)),
+            tasks: Mutex::new(Vec::new()),
+            followers: Mutex::new(Vec::new()),
+        };
+        // Deterministically pause execute at the point after admission but
+        // before preparation/routing has reached task registration.
+        let permit = gateway.admission.clone().try_acquire_owned().unwrap();
+        gateway.drain().await;
+        let result = gateway.submit(Vec::new(), None, None, None, Some(permit));
+        assert!(
+            result
+                .err()
+                .expect("submission after drain")
+                .is::<hellas_gateway::PaidGatewayBusy>()
+        );
+        assert!(gateway.tasks.lock().unwrap().is_empty());
+        assert_eq!(gateway.admission.available_permits(), 1);
     }
 
     #[tokio::test]
@@ -967,9 +1029,8 @@ mod tests {
         let result = before_proposal(
             &sender,
             true,
-            &AtomicBool::new(false),
             tokio::time::Instant::now() + Duration::from_millis(20),
-            serial.lock(),
+            |_| serial.lock(),
         )
         .await;
         assert!(
@@ -984,15 +1045,9 @@ mod tests {
     async fn expired_request_does_not_start_a_fallback_provider() {
         let (sender, _receiver) = mpsc::channel(OUTPUT_BUFFER_EVENTS);
         let started = AtomicBool::new(false);
-        let result = before_proposal(
-            &sender,
-            true,
-            &AtomicBool::new(false),
-            tokio::time::Instant::now(),
-            async {
-                started.store(true, Ordering::Relaxed);
-            },
-        )
+        let result = before_proposal(&sender, true, tokio::time::Instant::now(), |_| async {
+            started.store(true, Ordering::Relaxed);
+        })
         .await;
         assert!(result.is_err());
         assert!(!started.load(Ordering::Relaxed));

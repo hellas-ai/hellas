@@ -68,7 +68,7 @@ The pool admits at most `max_pending_requests` queued or running requests (defau
 64); additional requests receive HTTP 503 and may be retried. `timeout_secs`
 bounds queueing, recovery, provider fallback, execution and payment together,
 rather than restarting for each provider. The HTTP paid route uses this same
-configured budget; courtesy routes default to 300 seconds. HTTP delivery has an
+configured budget; non-paid routes retain their existing 3600-second default. HTTP delivery has an
 8 MiB byte budget (including event overhead), allowing retained-result bursts.
 A consumer that exhausts it receives a stream error; its accepted work continues
 settlement without waiting for HTTP backpressure.
