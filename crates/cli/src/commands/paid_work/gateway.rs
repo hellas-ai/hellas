@@ -49,6 +49,9 @@ const fn timeout_secs() -> u64 {
 // checkpoints are not worth routing work around.
 const MIN_CACHE_AFFINITY_TOKENS: usize = 128;
 const UNREACHABLE_PROVIDER_BACKOFF: Duration = Duration::from_secs(30);
+// Opening a route is control-plane work. It must not inherit the model's
+// execution allowance: an offline provider should yield to another route.
+const PROVIDER_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 // A retained job is durable, but it must not monopolize the channel that
 // serves interactive requests after a restart or a provider interruption.
 const RECOVERY_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -388,7 +391,28 @@ impl PaidGateway {
                     task_span.record("hellas.provider.id", tracing::field::display(provider.args.provider));
                     task_span.record("hellas.route.cache_affinity_tokens", route.cache_affinity_tokens);
                     task_span.record("hellas.route.pending", route.pending);
-                    let mut session = provider.serial.lock().instrument(hellas_rpc::request_span!(target: "hellas_request", "paid.queue")).await;
+                    // A retained job owns its channel while it recovers. Do
+                    // not turn that background work into head-of-line blocking
+                    // for an interactive request; another provider may be
+                    // ready now.
+                    let mut session = if recovery {
+                        provider
+                            .serial
+                            .lock()
+                            .instrument(hellas_rpc::request_span!(target: "hellas_request", "paid.queue"))
+                            .await
+                    } else {
+                        match provider.serial.try_lock() {
+                            Ok(session) => session,
+                            Err(_) => {
+                                provider_errors.push(format!(
+                                    "{}: retained work recovery is in progress",
+                                    provider.args.provider
+                                ));
+                                continue;
+                            }
+                        }
+                    };
                     if prepared.is_none() && (!provider.args.journal_root.try_exists()? || std::fs::read_dir(&provider.args.journal_root)?.next().is_none()) {
                         return Ok(Vec::new());
                     }
@@ -402,11 +426,16 @@ impl PaidGateway {
                         continue;
                     }
                     if session.is_none() {
+                        let connection_deadline = deadline.min(
+                            tokio::time::Instant::now() + PROVIDER_CONNECTION_TIMEOUT,
+                        );
                         match tokio::time::timeout_at(
-                            deadline,
+                            connection_deadline,
                             OpenPaidChannel::open(provider.args.clone(), endpoint.clone(), settlement_key.clone()),
                         ).await
-                            .map_err(|_| anyhow::anyhow!("paid provider connection exceeded its {timeout:?} limit"))
+                            .map_err(|_| anyhow::anyhow!(
+                                "paid provider connection exceeded its {PROVIDER_CONNECTION_TIMEOUT:?} limit"
+                            ))
                             .and_then(|result| result)
                         {
                             Ok(opened) => {
