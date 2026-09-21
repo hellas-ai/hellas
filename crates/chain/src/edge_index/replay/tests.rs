@@ -154,7 +154,7 @@ impl Harness {
             hellas_kernel::BlockHash::from_bytes(self.head.digest().0),
             domain::KERNEL_FEES,
         );
-        let (batch, _) = execute_all_observed(
+        let batch = crate::execution::execute_all(
             context,
             &ChainVerifier::new(),
             &txs,
@@ -386,7 +386,7 @@ fn native_edge_index_real_chain_pins_root_checks_and_restart() {
             "index_not_ready"
         );
         let (id, terms, tx) = basic(h.network, 0, &maker, &taker);
-        let (_, _, tx2) = basic(h.network, 1, &maker2, &maker2);
+        let (id2, terms2, tx2) = basic(h.network, 1, &maker2, &maker2);
         let (_, _, tx3) = basic(h.network, 2, &maker3, &taker);
         let opened = h
             .append(vec![
@@ -489,30 +489,48 @@ fn native_edge_index_real_chain_pins_root_checks_and_restart() {
         assert!(h.apply(&h.head.clone(), conflict).await.is_err());
         assert_eq!(h.list(64).envelope.snapshot.height, 1);
 
-        let closed = h
-            .append(vec![Transaction::Kernel(
-                Tx::timeout_close(id, &terms).unwrap(),
-            )])
-            .await;
-        let historical = h.detail(id, Some(opened.payload.clone()));
-        assert_eq!(historical.data.summary.lifecycle, "open");
-        h.client.check_edge(&historical).unwrap();
-        let live = h.detail(id, None);
-        assert_eq!(live.data.summary.lifecycle, "closed");
-        h.client.check_edge(&live).unwrap();
-        h.export("closed-edge", &live);
+        // A single in-flight read remains coherent while a new state is published.
+        let in_flight = h.index.store.read(Some(&opened.payload)).unwrap();
         let next = h
             .index
             .list_edges(ListEdgesRequest {
-                schema_version: crate::edge_index::SCHEMA_VERSION,
+                schema_version: SCHEMA_VERSION,
                 cursor: Some(cursor.clone()),
                 limit: Some(2),
                 ..Default::default()
             })
             .unwrap();
-        assert_eq!(next.envelope.snapshot.payload, opened.payload);
         assert_eq!(next.data.items.len(), 2);
         assert!(next.data.next_cursor.is_none());
+        let closed = h
+            .append(vec![Transaction::Kernel(
+                Tx::timeout_close(id, &terms).unwrap(),
+            )])
+            .await;
+        let stale = h
+            .index
+            .get_edge_detail(GetEdgeDetailRequest {
+                schema_version: SCHEMA_VERSION,
+                edge_id: hex::encode(id.as_bytes()),
+                payload: Some(opened.payload.clone()),
+            })
+            .unwrap_err();
+        assert_eq!((stale.status, stale.code), (409, "snapshot_unavailable"));
+        assert_eq!(stale.snapshot.unwrap().snapshot.payload, closed.payload);
+        let live = h.detail(id, None);
+        assert_eq!(live.data.summary.lifecycle, "closed");
+        h.client.check_edge(&live).unwrap();
+        h.export("closed-edge", &live);
+        let stale = h
+            .index
+            .list_edges(ListEdgesRequest {
+                schema_version: SCHEMA_VERSION,
+                cursor: Some(cursor.clone()),
+                limit: Some(2),
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert_eq!((stale.status, stale.code), (409, "snapshot_unavailable"));
         assert!(
             h.index
                 .list_edges(ListEdgesRequest {
@@ -539,8 +557,7 @@ fn native_edge_index_real_chain_pins_root_checks_and_restart() {
         h.export("events", &events);
         h.apply(&h.head.clone(), closed).await.unwrap();
         assert_eq!(h.list(64).data.items.len(), 2);
-        let in_flight = h.index.store.read(Some(&opened.payload)).unwrap();
-        for _ in 0..32 {
+        for _ in 0..2 {
             h.append(Vec::new()).await;
         }
         assert_eq!(
@@ -552,7 +569,7 @@ fn native_edge_index_real_chain_pins_root_checks_and_restart() {
                 })
                 .unwrap_err()
                 .code,
-            "snapshot_expired"
+            "snapshot_unavailable"
         );
         assert!(in_flight.object(id.as_bytes()).unwrap().is_some());
         assert_eq!(
@@ -568,7 +585,7 @@ fn native_edge_index_real_chain_pins_root_checks_and_restart() {
         );
         let index_path = h.directory.path().join("index.redb");
         assert!(index_path.exists());
-        let owner = SettlementKey::from(maker.party_key());
+        let owner = SettlementKey::from(maker2.party_key());
         let committed_owner = h
             .replay
             .owner_proof(owner, 0, 64, None)
@@ -576,8 +593,37 @@ fn native_edge_index_real_chain_pins_root_checks_and_restart() {
             .unwrap()
             .unwrap();
         // Crash after writing the intent, before QMDB finalize: recovery discards it.
-        let (_, proof, _) = h.candidate(Vec::new()).await;
-        h.index.store.prepare(proof.clone(), Vec::new()).unwrap();
+        let transactions = vec![Transaction::Kernel(
+            Tx::timeout_close(id2, &terms2).unwrap(),
+        )];
+        let (_, proof, _) = h.candidate(transactions.clone()).await;
+        let tx_digest = hex::encode(crate::verified_explorer::transaction_digest(
+            &transactions[0],
+        ));
+        let context = hellas_kernel::Context::with_fees(
+            h.network,
+            BlockHeight::new(proof.height),
+            hellas_kernel::BlockHash::from_bytes(h.head.digest().0),
+            domain::KERNEL_FEES,
+        );
+        let (_, changes) = execute_all_observed(
+            context,
+            &ChainVerifier::new(),
+            &transactions,
+            &h.allocations,
+            h.replay.database.new_batches().await,
+        )
+        .await
+        .unwrap();
+        assert!(!changes.is_empty());
+        h.index.store.prepare(proof.clone(), changes).unwrap();
+        assert!(
+            h.index
+                .store
+                .transaction_height(&tx_digest)
+                .unwrap()
+                .is_none()
+        );
         let genesis = h.replay.genesis.clone();
         let previous_height = h.head.height().get();
         drop(h.replay);
@@ -595,6 +641,29 @@ fn native_edge_index_real_chain_pins_root_checks_and_restart() {
         assert_eq!(recovered.cursor, previous_height);
         assert!(h.index.store.intent().unwrap().is_none());
         assert_eq!(recovered.next_height().unwrap(), previous_height + 1);
+        let read = h.index.store.read(None).unwrap();
+        assert!(read.object(id2.as_bytes()).unwrap().is_some());
+        assert!(
+            read.edge(&hex::encode(id2.as_bytes()))
+                .unwrap()
+                .unwrap()
+                .closed
+                .is_none()
+        );
+        assert_eq!(
+            read.events(&hex::encode(id2.as_bytes()), None, 64)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            h.index
+                .store
+                .transaction_height(&tx_digest)
+                .unwrap()
+                .is_none()
+        );
+        drop(read);
         let owner_before_finalize = recovered
             .owner_proof(owner, 0, 64, None)
             .await
@@ -622,7 +691,7 @@ fn native_edge_index_real_chain_pins_root_checks_and_restart() {
         let (batch, changes) = execute_all_observed(
             context,
             &ChainVerifier::new(),
-            &[],
+            &transactions,
             &h.allocations,
             recovered.database.new_batches().await,
         )
@@ -645,6 +714,28 @@ fn native_edge_index_real_chain_pins_root_checks_and_restart() {
         .await
         .unwrap();
         assert_eq!(recovered.cursor, proof.height);
+        let read = h.index.store.read(None).unwrap();
+        assert!(read.object(id2.as_bytes()).unwrap().is_none());
+        assert_eq!(
+            read.edge(&hex::encode(id2.as_bytes()))
+                .unwrap()
+                .unwrap()
+                .closed
+                .unwrap()
+                .height,
+            proof.height
+        );
+        assert_eq!(
+            read.events(&hex::encode(id2.as_bytes()), None, 64)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            h.index.store.transaction_height(&tx_digest).unwrap(),
+            Some(proof.height)
+        );
+        drop(read);
         assert_eq!(
             h.index.store.latest().unwrap().unwrap().payload,
             proof.payload
@@ -654,7 +745,7 @@ fn native_edge_index_real_chain_pins_root_checks_and_restart() {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(
+        assert_ne!(
             owner_after_finalize.bundle().page,
             committed_owner.bundle().page
         );
@@ -970,19 +1061,22 @@ fn native_edge_index_work_channel_lifecycle_and_evidence() {
         h.export("channel-frozen", &frozen);
         assert!(h.list(64).data.items.is_empty());
         h.export("edges-empty", &h.list(64));
-        let old = channel(&h, a.payment, Some(opened.payload));
-        h.client.check_channel(&old).unwrap();
-        assert_eq!(old.data.payment.summary.lifecycle, "open");
-        assert!(matches!(
-            old.data.pending.answer,
-            Some(PendingState::Absent(_))
-        ));
-        let old_pending = channel(&h, a.payment, Some(moved.payload));
-        h.client.check_channel(&old_pending).unwrap();
-        assert!(matches!(
-            old_pending.data.pending.answer,
-            Some(PendingState::Present(_))
-        ));
+        for payload in [opened.payload, moved.payload] {
+            let error = h
+                .index
+                .get_work_channel_detail(GetWorkChannelDetailRequest {
+                    schema_version: SCHEMA_VERSION,
+                    payment_edge_id: hex::encode(a.payment.as_bytes()),
+                    payload: Some(payload),
+                    funding: None,
+                })
+                .unwrap_err();
+            assert_eq!((error.status, error.code), (409, "snapshot_unavailable"));
+            assert_eq!(
+                error.snapshot.unwrap().snapshot.payload,
+                frozen.envelope.snapshot.payload
+            );
+        }
         let events = h
             .index
             .list_edge_events(ListEdgeEventsRequest {

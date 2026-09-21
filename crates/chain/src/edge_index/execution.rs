@@ -1,9 +1,8 @@
 //! Shared admission, deadline, and error policy for both EdgeIndex transports.
 use super::{
     EdgeIndex, EdgeIndexError,
-    types::{IndexError, MAX_RESPONSE_BYTES, SCHEMA_VERSION},
+    types::{IndexError, SCHEMA_VERSION},
 };
-use prost::Message;
 
 impl EdgeIndex {
     pub(super) async fn execute<T: Send + 'static>(
@@ -28,21 +27,14 @@ impl EdgeIndex {
 
 impl EdgeIndexError {
     pub(super) fn into_details(self) -> (u16, IndexError) {
-        let mut status = self.status;
-        let mut details = IndexError {
-            schema_version: SCHEMA_VERSION,
-            code: self.code.into(),
-            message: self.message,
-            envelope: self.snapshot.map(|value| *value),
-        };
-        if details.encoded_len() > MAX_RESPONSE_BYTES
-            || serde_json::to_vec(&details).map_or(true, |bytes| bytes.len() > MAX_RESPONSE_BYTES)
-        {
-            status = 413;
-            details.code = "response_too_large".into();
-            details.message = "error evidence exceeds 8 MiB".into();
-            details.envelope = None;
-        }
-        (status, details)
+        (
+            self.status,
+            IndexError {
+                schema_version: SCHEMA_VERSION,
+                code: self.code.into(),
+                message: self.message,
+                envelope: self.snapshot.map(|value| *value),
+            },
+        )
     }
 }
