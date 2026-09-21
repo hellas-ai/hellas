@@ -94,7 +94,7 @@ pub mod optional_base58_address {
 pub mod proof_json {
     use super::*;
     #[derive(Serialize, Deserialize)]
-    #[serde(deny_unknown_fields)]
+    #[serde(remote = "ProofBundle", deny_unknown_fields)]
     struct JsonProof {
         schema_version: u32,
         network_id: String,
@@ -113,34 +113,10 @@ pub mod proof_json {
         epoch: u64,
     }
     pub fn serialize<S: serde::Serializer>(v: &ProofBundle, s: S) -> Result<S::Ok, S::Error> {
-        JsonProof {
-            schema_version: v.schema_version,
-            network_id: v.network_id.clone(),
-            trust_sha256: v.trust_sha256.clone(),
-            height: v.height,
-            payload: v.payload.clone(),
-            state_root: v.state_root.clone(),
-            finalization: v.finalization.clone(),
-            canonical_block: v.canonical_block.clone(),
-            observed_at_ms: v.observed_at_ms,
-            epoch: v.epoch,
-        }
-        .serialize(s)
+        JsonProof::serialize(v, s)
     }
     pub fn deserialize<'de, D: serde::Deserializer<'de>>(d: D) -> Result<ProofBundle, D::Error> {
-        let v = JsonProof::deserialize(d)?;
-        Ok(ProofBundle {
-            schema_version: v.schema_version,
-            network_id: v.network_id,
-            trust_sha256: v.trust_sha256,
-            height: v.height,
-            payload: v.payload,
-            state_root: v.state_root,
-            finalization: v.finalization,
-            canonical_block: v.canonical_block,
-            observed_at_ms: v.observed_at_ms,
-            epoch: v.epoch,
-        })
+        JsonProof::deserialize(d)
     }
 }
 
@@ -153,12 +129,9 @@ pub mod proofs_json {
         proofs: &[ProofBundle],
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
-        proofs
-            .iter()
-            .cloned()
-            .map(Proof)
-            .collect::<Vec<_>>()
-            .serialize(serializer)
+        #[derive(Serialize)]
+        struct ProofRef<'a>(#[serde(with = "proof_json")] &'a ProofBundle);
+        serializer.collect_seq(proofs.iter().map(ProofRef))
     }
     pub fn deserialize<'de, D: serde::Deserializer<'de>>(
         deserializer: D,

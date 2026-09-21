@@ -13,10 +13,9 @@ use commonware_cryptography::{Hasher as _, Sha256};
 use hellas_genesis::{HELLAS_DEVNET_1_JSON, TrustDocument};
 use serde::{Deserialize, Serialize};
 
-pub const PROOF_SCHEMA_VERSION: u32 = 1;
 pub const MAX_PROOF_BYTES: usize = 16 * 1024 * 1024;
 
-pub use hellas_rpc::edge_index::ProofBundle;
+pub use hellas_rpc::edge_index::{PROOF_SCHEMA_VERSION, ProofBundle};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExplorerQuery {
