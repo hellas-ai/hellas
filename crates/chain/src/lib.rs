@@ -18,6 +18,8 @@ pub mod edge_index;
 mod execution;
 #[cfg(feature = "explorer-origin")]
 pub mod explorer_origin;
+#[cfg(feature = "explorer-origin")]
+pub(crate) mod http_api;
 #[cfg(feature = "validator")]
 pub mod faucet;
 #[cfg(feature = "client-core")]

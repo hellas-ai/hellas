@@ -455,26 +455,17 @@ async fn answer(
             );
         }
     };
-    let (content_type, body) = if protobuf {
-        (
-            "application/x-protobuf",
-            prost::Message::encode_to_vec(verified.bundle()),
-        )
-    } else {
-        (
-            "application/json",
-            serde_json::to_vec(verified.bundle()).expect("proof serializes"),
-        )
-    };
-    (
-        [
-            (header::CONTENT_TYPE, content_type),
-            (header::CACHE_CONTROL, "no-store"),
-            (header::VARY, "Accept"),
-        ],
-        body,
-    )
-        .into_response()
+    match crate::http_api::encode(
+        verified.bundle(),
+        protobuf,
+        crate::verified_explorer::MAX_PROOF_BYTES,
+    ) {
+        Ok((content_type, body)) => respond(StatusCode::OK, content_type, body),
+        Err(()) => failure(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "proof exceeds the response budget",
+        ),
+    }
 }
 fn default_proof_accept(mut headers: HeaderMap, uri: &axum::http::Uri) -> HeaderMap {
     if !headers.contains_key(header::ACCEPT) && uri.path().ends_with("/proof") {
@@ -486,64 +477,8 @@ fn default_proof_accept(mut headers: HeaderMap, uri: &axum::http::Uri) -> Header
     headers
 }
 
-pub(crate) fn representation(headers: &HeaderMap) -> Option<bool> {
-    let Some(accept) = headers.get(header::ACCEPT) else {
-        return Some(false);
-    };
-    let accept = accept.to_str().ok()?;
-    let mut json = None;
-    let mut protobuf = None;
-    let mut protobuf_alias = None;
-    for range in accept.split(',') {
-        let mut parts = range.trim().split(';');
-        let media = parts.next()?.trim();
-        let mut quality = 1.0_f32;
-        for part in parts {
-            if let Some(value) = part.trim().strip_prefix("q=") {
-                quality = value.parse().ok()?;
-            }
-        }
-        if !quality.is_finite() || !(0.0..=1.0).contains(&quality) {
-            return None;
-        }
-        let specificity = match media {
-            "application/json" | "application/protobuf" | "application/x-protobuf" => 2,
-            "application/*" => 1,
-            "*/*" => 0,
-            _ => continue,
-        };
-        let applies_json = matches!(media, "application/json" | "application/*" | "*/*");
-        let applies_proto = matches!(media, "application/x-protobuf" | "application/*" | "*/*");
-        let applies_alias = matches!(media, "application/protobuf" | "application/*" | "*/*");
-        for (applies, slot) in [
-            (applies_json, &mut json),
-            (applies_proto, &mut protobuf),
-            (applies_alias, &mut protobuf_alias),
-        ] {
-            if applies && slot.is_none_or(|(previous, _)| specificity > previous) {
-                *slot = Some((specificity, quality));
-            }
-        }
-    }
-    let json = json.map_or(0.0, |(_, q)| q);
-    let protobuf = protobuf
-        .map_or(0.0_f32, |(_, q)| q)
-        .max(protobuf_alias.map_or(0.0, |(_, q)| q));
-    if json == 0.0 && protobuf == 0.0 {
-        None
-    } else {
-        Some(protobuf > json)
-    }
-}
 
-fn failure(status: StatusCode, message: &str) -> Response {
-    (
-        status,
-        [(header::CACHE_CONTROL, "no-store")],
-        message.to_owned(),
-    )
-        .into_response()
-}
+use crate::http_api::{representation, respond, text_failure as failure};
 
 fn proof_bundle(state: &OriginState, finalized: crate::FinalizedBlock) -> ProofBundle {
     let epoch = crate::finality_proof::FinalityProof::decode(&finalized.snapshot.finalization)
