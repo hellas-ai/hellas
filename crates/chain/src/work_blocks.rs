@@ -1068,25 +1068,28 @@ mod tests {
             chain.seal().await;
 
             let mut restarted = open_store(provider_root.path(), Role::Provider);
-            assert!(matches!(
-                advance_setup(&blocks, &blocks, &blocks, &mut restarted, &verifier).await,
-                Ok(SetupAdvance {
-                    progress: SetupProgress::HistoryAdvanced { .. },
-                    ..
-                })
-            ));
+            advance_setup(&blocks, &blocks, &blocks, &mut restarted, &verifier)
+                .await
+                .expect("the finalized Open is applied before the next setup decision");
             assert!(
                 !restarted.state().bond_submitted(),
                 "the finalized Open discharges the journal obligation",
             );
-            restarted
-                .commit(
+            assert!(
+                restarted.state().payment_submitted(),
+                "after catching up, the driver immediately submits the payment Open",
+            );
+            assert!(matches!(
+                restarted.commit(
                     SetupRecord::Ended {
                         outcome: SetupEnd::Aborted(SetupAbort::PaymentFundingSpent),
                     },
                     &verifier,
-                )
-                .expect("the resolved Open no longer blocks an end");
+                ),
+                Err(WorkStoreError::Setup(
+                    SetupStateError::SubmittedOpenUnresolved
+                ))
+            ));
         });
     }
 

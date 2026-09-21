@@ -21,7 +21,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio::time::{Duration, timeout};
-use tracing::warn;
 
 mod codex_provider;
 mod node;
@@ -244,21 +243,32 @@ async fn run_with_store(
     eprintln!("Explorer:     {add_url}");
 
     println!("RPC server running. Press Ctrl+C to stop.");
-    tokio::signal::ctrl_c()
+    wait_for_shutdown_signal()
         .await
         .context("failed to listen for shutdown signal")?;
 
     println!("Shutting down...");
-    match timeout(Duration::from_secs(5), node.shutdown()).await {
-        Ok(result) => result.context("failed to shut down RPC server")?,
-        Err(_) => {
-            warn!("graceful shutdown timed out; forcing shutdown");
-            // At this point, drop will signal shutdown; exit to avoid hanging
-            std::process::exit(0);
-        }
-    }
+    // Return failures through the CLI so its telemetry guard still flushes.
+    timeout(Duration::from_secs(5), node.shutdown())
+        .await
+        .context("RPC server graceful shutdown timed out")?
+        .context("failed to shut down RPC server")?;
 
     Ok(())
+}
+
+async fn wait_for_shutdown_signal() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result,
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c().await
 }
 
 /// Load the unified fetch configuration: the route table (sealed destinations,

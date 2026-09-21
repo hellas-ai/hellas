@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::Bytes;
+use futures::StreamExt as _;
 use hellas_kernel::{
     BlockHeight, Decode as _, Edge, EdgeId, EdgeValues, Fees, Key, LeaseSlots, List,
     MAX_EDGE_OUTPUTS, Parties, Payout, PendingSlot, Secp256k1Verifier, Terms, TermsHash,
@@ -46,10 +47,13 @@ use hellas_rpc::{
 use hellas_wire::mux::{MessagePipe, MuxConfig, MuxTransport, Role as MuxRole};
 use hellas_wire::{DefaultClock, Dispatcher, StreamTransport};
 use hellas_work::work::{
-    BackendFault, ClientEndpoint, DeliverError, PaidEvaluateBackend, PreparedEvaluateInput,
-    ProviderEndpoint, RunError, RunOutcome, WorkService, fetch_result, run_accepted_work,
+    BackendFault, ClientEndpoint, CloseEndpoint, DeliverError, PaidEvaluateBackend,
+    PreparedEvaluateInput, ProviderEndpoint, RunError, RunOutcome, WorkService, fetch_result,
+    run_accepted_work,
 };
-use hellas_work::work_store::{ChannelRecord, ChannelStore, JobPhase, JobState, Role, SetupOrigin};
+use hellas_work::work_store::{
+    ChannelRecord, ChannelStore, JobPhase, JobState, Role, SetupOrigin, TerminalOutcome,
+};
 use tokio::sync::mpsc;
 
 mod support;
@@ -710,6 +714,137 @@ async fn a_job_with_no_result_releases_nothing_yet() {
     );
 }
 
+/// An authenticated retry learns the durable failure; an unbound caller
+/// cannot distinguish a retained terminal from another channel's work.
+#[tokio::test]
+async fn a_failed_job_returns_its_terminal_after_authentication() {
+    struct FailingBackend;
+    impl PaidEvaluateBackend for FailingBackend {
+        async fn evaluate(
+            &self,
+            _input: PreparedEvaluateInput,
+        ) -> Result<Vec<OutputEventEnvelope>, BackendFault> {
+            Err(BackendFault::new("fixture content is unavailable"))
+        }
+    }
+
+    let provider_root = temp();
+    let ready = ready();
+    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
+    let (id, _) = accept(&execution_policy(), &mut [&mut provider_store], 1);
+    let endpoint = ProviderEndpoint::new(ready.clone(), provider_store, provider())
+        .expect("the provider endpoint binds");
+    let service = WorkService::new(endpoint);
+    assert!(matches!(
+        run_accepted_work(&service, &ready, &FailingBackend, id).await,
+        Err(RunError::Backend(_))
+    ));
+
+    let (transport, server_transport) = transport_pair();
+    let serving = serve(server_transport, service.clone());
+    let client = WorkClientImpl::new(transport);
+    let mut unbound = delivery_request(ready.channel(), id);
+    unbound.client_signature = provider()
+        .sign(signing_hash(delivery_request_digest(
+            ready.channel(),
+            id,
+            &EXPORTER,
+        )))
+        .as_bytes()
+        .to_vec();
+    let response = client
+        .deliver_result(unbound)
+        .await
+        .expect("the call completes");
+    assert_eq!(refusal_code(&response), WorkRefusalCode::Invalid);
+    let response = client
+        .deliver_result(delivery_request(ready.channel(), id))
+        .await
+        .expect("the authenticated retry completes");
+    assert_eq!(refusal_code(&response), WorkRefusalCode::Declined);
+    let Some(Outcome::Refused(refusal)) = response.outcome else {
+        panic!("the failed job is refused");
+    };
+    assert_eq!(refusal.reason, "the job ended permanently as failed");
+    serving.abort();
+    let _ = serving.await;
+    drop(service);
+
+    let recovered = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
+    assert!(recovered.state().job_by_id(id).is_none());
+    assert_eq!(
+        recovered
+            .state()
+            .terminal_by_id(id)
+            .map(|terminal| &terminal.outcome),
+        Some(&TerminalOutcome::Failed { code: 1 })
+    );
+    let endpoint = CloseEndpoint::new(recovered, provider())
+        .expect("the recovered provider close endpoint binds without admission");
+    let service = WorkService::close_only(endpoint);
+    let checkpoint = service
+        .with_state(|state| state.checkpoint())
+        .expect("the restored state is available");
+    assert!(matches!(
+        service.deliver(&delivery_request(ready.channel(), id), &EXPORTER),
+        Err(DeliverError::Terminated { outcome: "failed" })
+    ));
+    let (transport, server_transport) = transport_pair();
+    let serving = serve(server_transport, service.clone());
+    let client = WorkClientImpl::new(transport);
+    for authenticated in [false, true] {
+        let mut request = delivery_request(ready.channel(), id);
+        if !authenticated {
+            request.client_signature = provider()
+                .sign(signing_hash(delivery_request_digest(
+                    ready.channel(),
+                    id,
+                    &EXPORTER,
+                )))
+                .as_bytes()
+                .to_vec();
+        }
+        let expected = if authenticated {
+            WorkRefusalCode::Declined
+        } else {
+            WorkRefusalCode::Invalid
+        };
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.deliver_result(request.clone()),
+        )
+        .await
+        .expect("a terminal does not wait for admission readiness")
+        .expect("the restored endpoint answers");
+        assert_eq!(refusal_code(&response), expected);
+        let mut stream = client
+            .stream_result(request)
+            .await
+            .expect("the stream opens");
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+            .await
+            .expect("a terminal stream does not wait for admission readiness")
+            .expect("the stream carries its refusal")
+            .expect("the refusal is an application response");
+        let Some(hellas_rpc::pb::work::work_stream_event::Outcome::Refused(refusal)) =
+            event.outcome
+        else {
+            panic!("the restored failed job must not release plaintext");
+        };
+        assert_eq!(refusal.code, expected as i32);
+        if authenticated {
+            assert_eq!(refusal.reason, "the job ended permanently as failed");
+        }
+    }
+    assert_eq!(
+        service.with_state(|state| state.checkpoint()).unwrap(),
+        checkpoint,
+        "terminal diagnostics do not change the journal state",
+    );
+    serving.abort();
+    let _ = serving.await;
+}
+
 /// A release the deadline has passed is `EXPIRED` on the wire, not a
 /// wait.
 ///
@@ -1318,4 +1453,197 @@ async fn a_transport_without_an_exporter_delivers_nothing() {
         Some(JobPhase::Ready),
         "nothing was released",
     );
+}
+
+/// A real signed prefix reaches the client while computation is blocked;
+/// reserving credit precedes that byte, and final delivery remains durable.
+#[tokio::test]
+async fn live_prefix_precedes_terminal_and_reserves_delivery_credit() {
+    use hellas_work::work::{PaidProgress, fetch_result_stream};
+    struct PausedBackend {
+        release: Arc<tokio::sync::Notify>,
+    }
+    impl PaidEvaluateBackend for PausedBackend {
+        async fn evaluate(
+            &self,
+            input: PreparedEvaluateInput,
+        ) -> Result<Vec<OutputEventEnvelope>, BackendFault> {
+            Ok(transcript_for(input.evaluate_request(), &ANSWER))
+        }
+        async fn evaluate_stream(
+            &self,
+            input: PreparedEvaluateInput,
+            progress: PaidProgress,
+        ) -> Result<Vec<OutputEventEnvelope>, BackendFault> {
+            let transcript = transcript_for(input.evaluate_request(), &ANSWER);
+            progress(transcript[0].clone())?;
+            self.release.notified().await;
+            Ok(transcript)
+        }
+    }
+    let client_root = temp();
+    let provider_root = temp();
+    let ready = ready();
+    let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR);
+    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
+    let (id, _) = accept(
+        &execution_policy(),
+        &mut [&mut client_store, &mut provider_store],
+        1,
+    );
+    let service =
+        WorkService::new(ProviderEndpoint::new(ready.clone(), provider_store, provider()).unwrap());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let backend = PausedBackend {
+        release: release.clone(),
+    };
+    let running_service = service.clone();
+    let running_ready = ready.clone();
+    let computation = tokio::spawn(async move {
+        run_accepted_work(&running_service, &running_ready, &backend, id).await
+    });
+    let (transport, server_transport) = transport_pair();
+    let serving = serve(server_transport, service.clone());
+    let mut endpoint = ClientEndpoint::new(ready.clone(), client_store, client()).unwrap();
+    let mut prefixes = 0;
+    let delivered = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        fetch_result_stream(transport, &mut endpoint, &ready, id, |_| {
+            assert!(
+                !computation.is_finished(),
+                "live tokens must not await completion"
+            );
+            assert_eq!(
+                service
+                    .with_state(|state| state.job_by_id(id).map(JobState::phase))
+                    .unwrap(),
+                Some(JobPhase::Streaming)
+            );
+            prefixes += 1;
+            release.notify_one();
+            Ok(())
+        }),
+    )
+    .await
+    .expect("stream must make progress")
+    .expect("signed delivery succeeds");
+    assert_eq!(prefixes, 1);
+    assert!(matches!(
+        computation.await.unwrap(),
+        Ok(RunOutcome::Completed { .. })
+    ));
+    assert_eq!(
+        endpoint.state().job_by_id(id).unwrap().phase(),
+        JobPhase::Ready
+    );
+    assert_eq!(
+        service
+            .with_state(|state| state.job_by_id(id).map(JobState::phase))
+            .unwrap(),
+        Some(JobPhase::Delivered)
+    );
+    serving.abort();
+    let _ = serving.await;
+    drop(service);
+    drop(endpoint);
+    let recovered = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
+    let job = recovered.state().job_by_id(id).unwrap();
+    assert_eq!(job.phase(), JobPhase::Delivered);
+    assert_eq!(job.transcript(), delivered.transcript);
+}
+
+#[tokio::test]
+async fn paid_stream_checks_status_and_terminal_shape_before_recording_delivery() {
+    use hellas_rpc::pb::work::{WorkStreamEvent, work_stream_event};
+    use hellas_rpc::services::work::StreamResult;
+    use hellas_wire::{WireCode, WireStatus};
+    use hellas_work::work::fetch_result_stream;
+
+    for (terminal_count, status) in [
+        (0, WireCode::Unavailable),
+        (1, WireCode::Unavailable),
+        (2, WireCode::Ok),
+        (1, WireCode::Ok),
+    ] {
+        let client_root = temp();
+        let provider_root = temp();
+        let ready = ready();
+        let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR);
+        let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
+        let (id, _) = accept(
+            &execution_policy(),
+            &mut [&mut client_store, &mut provider_store],
+            1,
+        );
+        let service = WorkService::new(
+            ProviderEndpoint::new(ready.clone(), provider_store, provider()).unwrap(),
+        );
+        run_to_result(&service, &ready, id).await;
+        let delivered = service
+            .deliver(&delivery_request(ready.channel(), id), &EXPORTER)
+            .unwrap();
+        let event = WorkStreamEvent {
+            outcome: Some(work_stream_event::Outcome::Delivered(WorkDelivered {
+                result: delivered.result.encode(),
+                provider_signature: delivered.signature.as_bytes().to_vec(),
+                transcript: delivered.transcript.clone(),
+            })),
+        };
+        let (transport, server_transport) = transport_pair();
+        let serving = tokio::spawn(async move {
+            let inbound = server_transport.accept().await.unwrap().unwrap();
+            hellas_rpc::call::dispatch_server_streaming::<MuxTransport, StreamResult, _, _, _>(
+                inbound,
+                move |_| async move {
+                    if terminal_count == 0 {
+                        return Err(WireStatus::new(status, "not ready"));
+                    }
+                    let mut events = vec![Ok(event); terminal_count];
+                    if status != WireCode::Ok {
+                        events.push(Err(WireStatus::new(status, "delivery interrupted")));
+                    }
+                    Ok(futures::stream::iter(events))
+                },
+            )
+            .await
+            .unwrap();
+        });
+        let mut endpoint = ClientEndpoint::new(ready.clone(), client_store, client()).unwrap();
+        let mut prefixes = 0;
+        let result = fetch_result_stream(transport, &mut endpoint, &ready, id, |_| {
+            prefixes += 1;
+            Ok(())
+        })
+        .await;
+        serving.await.unwrap();
+        if status != WireCode::Ok {
+            assert!(matches!(result, Err(DeliverError::Transport(error)) if error.code == status));
+        } else if terminal_count != 1 {
+            assert!(matches!(
+                result,
+                Err(DeliverError::Malformed("event after terminal result"))
+            ));
+        } else {
+            assert_eq!(result.unwrap(), delivered);
+            assert_eq!(prefixes, 1);
+            assert_eq!(
+                endpoint.state().job_by_id(id).unwrap().phase(),
+                JobPhase::Ready
+            );
+            continue;
+        }
+        assert_eq!(prefixes, 0);
+        assert_eq!(
+            endpoint.state().job_by_id(id).unwrap().phase(),
+            JobPhase::Accepted
+        );
+        let (transport, server_transport) = transport_pair();
+        let serving = serve(server_transport, service.clone());
+        let recovered = fetch_result_stream(transport, &mut endpoint, &ready, id, |_| Ok(()))
+            .await
+            .unwrap();
+        assert_eq!(recovered, delivered);
+        serving.abort();
+        let _ = serving.await;
+    }
 }

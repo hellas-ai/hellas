@@ -187,10 +187,13 @@ mod id_pins {
     #[cfg(feature = "work")]
     #[test]
     fn work_ids_are_stable() {
-        use super::services::work::{AcceptWork, AdmitCertificate, DeliverResult, Work};
-        assert_eq!(<Work as ServiceMarker>::SERVICE_ID, 0xf61c_cea0);
+        use super::services::work::{
+            AcceptWork, AdmitCertificate, DeliverResult, StreamResult, Work,
+        };
+        assert_eq!(<Work as ServiceMarker>::SERVICE_ID, 0x1a6d_285a);
         assert_eq!(<AcceptWork as MethodMarker>::METHOD_ID, 0xe6a7_13c2);
         assert_eq!(<DeliverResult as MethodMarker>::METHOD_ID, 0xf15a_a80e);
+        assert_eq!(<StreamResult as MethodMarker>::METHOD_ID, 0xf9e8_388a);
         assert_eq!(<AdmitCertificate as MethodMarker>::METHOD_ID, 0x0ffb_b4f9);
     }
 

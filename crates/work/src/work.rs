@@ -117,6 +117,9 @@
 //! What neither endpoint does here is wait. `advance_close` is one
 //! step, and the caller that owns a clock is the one that repeats it.
 
+mod stream;
+pub use stream::{PaidProgress, PaidResultStream, fetch_result_stream};
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -647,11 +650,11 @@ impl ProviderEndpoint {
     /// channel for answers and not two. Transport faults stay the
     /// transport's.
     ///
-    /// A channel holding no readiness decision refuses every proposal as
-    /// `NotReady`, before a byte of it is read and before anything is
-    /// journaled. It is retryable because it is about this endpoint's
-    /// own state and not the proposal: a fresh readiness decision is all
-    /// that stands between the same bytes and a co-signature.
+    /// An authenticated retry returns its retained co-signature or terminal
+    /// before readiness is consulted. An unaccepted proposal already past
+    /// its acceptance deadline at the persisted cursor is permanently expired.
+    /// Everything still requiring a new co-signature needs a readiness
+    /// decision; without one it is retryable `NotReady`.
     ///
     /// On the accepting path the client's proposal is journaled — which
     /// is what reserves the compute credit — before the co-signature is
@@ -663,41 +666,69 @@ impl ProviderEndpoint {
     /// before the answer reaches the client leaves an accepted job, and
     /// the retry returns the retained signature.
     pub fn accept(&mut self, request: &AcceptWorkRequest) -> AcceptWorkResponse {
-        match self.decide(request) {
-            Ok((work_id, signature)) => AcceptWorkResponse {
-                outcome: Some(Outcome::Accepted(WorkAccepted {
-                    provider_signature: signature.as_bytes().to_vec(),
-                    work_id: work_id.as_bytes().to_vec(),
-                })),
-            },
-            Err(refusal) => AcceptWorkResponse {
-                outcome: Some(Outcome::Refused(WorkRefused {
-                    code: refusal.code.code() as i32,
-                    reason: refusal.reason,
-                })),
-            },
-        }
+        acceptance_response(self.decide(request))
     }
 
-    fn decide(&mut self, request: &AcceptWorkRequest) -> Result<(Digest, Sig), Refusal> {
-        let ready = self
-            .admitting()
-            .map_err(|error| Refusal::new(endpoint_refusal(error), error.to_string()))?
-            .clone();
+    fn authenticate_proposal(
+        &self,
+        request: &AcceptWorkRequest,
+    ) -> Result<(PaidJobAuthorizationV1, Sig, Digest), Refusal> {
         let authorization = PaidJobAuthorizationV1::decode(&request.authorization)?;
         let client_signature = signature(&request.client_signature)
             .ok_or_else(|| Refusal::invalid("the client signature is not 64 bytes"))?;
-        let work_id = work_id(ready.channel(), &authorization);
+        let channel = self.state().channel();
+        let work_id = work_id(channel, &authorization);
+        if !Secp256k1Verifier::new().verify_sig(
+            client_signature,
+            channel.client_key(),
+            signing_hash(work_id),
+        ) {
+            return Err(Refusal::invalid(
+                "the client signature does not authorize this proposal",
+            ));
+        }
+        Ok((authorization, client_signature, work_id))
+    }
 
+    fn prior_acceptance(
+        &self,
+        authorization: &PaidJobAuthorizationV1,
+        work_id: Digest,
+    ) -> Result<Option<Sig>, Refusal> {
         // A question already answered is answered again, with the same
         // bytes and without re-deciding it. The deadlines are not
         // rechecked here on purpose: this co-signature is already
         // durable and already the client's, and a height that has passed
         // since cannot unsay it.
         if let Some(retained) = self.retained_signature(work_id) {
+            return Ok(Some(retained));
+        }
+        if let Some(terminal) = self.state().terminal_by_id(work_id) {
+            return Err(Refusal::new(
+                WorkRefusal::Conflict,
+                format!("the job ended permanently as {}", terminal.outcome.name()),
+            ));
+        }
+        let (finalized_height, _) = self.state().cursor();
+        if finalized_height > authorization.acceptance_deadline {
+            return Err(PaidWorkError::AcceptanceExpired {
+                height: finalized_height,
+                deadline: authorization.acceptance_deadline,
+            }
+            .into());
+        }
+        Ok(None)
+    }
+
+    fn decide(&mut self, request: &AcceptWorkRequest) -> Result<(Digest, Sig), Refusal> {
+        let (authorization, client_signature, work_id) = self.authenticate_proposal(request)?;
+        if let Some(retained) = self.prior_acceptance(&authorization, work_id)? {
             return Ok((work_id, retained));
         }
-
+        let ready = self
+            .admitting()
+            .map_err(|error| Refusal::new(endpoint_refusal(error), error.to_string()))?
+            .clone();
         let (cursor_height, _) = self.state().cursor();
         let policy = *ready.execution_policy();
         check_authorization(ready.channel(), &authorization, &policy, cursor_height)?;
@@ -795,10 +826,12 @@ impl ProviderEndpoint {
             });
         }
         match job.phase() {
-            JobPhase::Running if self.state().job_is_indeterminate(work_id) => {
+            JobPhase::Running | JobPhase::Streaming
+                if self.state().job_is_indeterminate(work_id) =>
+            {
                 return Ok(RunAdmission::Indeterminate);
             }
-            JobPhase::Running => return Ok(RunAdmission::Running),
+            JobPhase::Running | JobPhase::Streaming => return Ok(RunAdmission::Running),
             JobPhase::Accepted => {}
             phase => return Err(RunError::NotAccepted { phase }),
         }
@@ -939,8 +972,10 @@ impl ProviderEndpoint {
     /// # Errors
     ///
     /// [`DeliverError::Malformed`] when a field is not the identifier
-    /// or signature it must be, [`DeliverError::NoSuchJob`] when no
-    /// open job carries this `work_id`, [`DeliverError::Unbound`] when
+    /// or signature it must be, [`DeliverError::NoSuchJob`] when neither
+    /// an open job nor a retained terminal carries this `work_id`,
+    /// [`DeliverError::Terminated`] when the job has ended permanently,
+    /// [`DeliverError::Unbound`] when
     /// the signature is not the channel's client's over this connection,
     /// [`DeliverError::NoResult`] before the result is
     /// signed, [`DeliverError::Endpoint`] when `ready` is not this
@@ -955,29 +990,44 @@ impl ProviderEndpoint {
         ready: &ReadyChannel,
         exporter: &[u8; 32],
     ) -> Result<Delivery, DeliverError> {
+        self.deliver_with_readiness(request, Some(ready), exporter)
+    }
+
+    /// A retained terminal needs authentication, but no permission to admit
+    /// new work. Actual delivery still uses this endpoint's readiness, or
+    /// the explicitly supplied decision checked against it below.
+    fn deliver_with_readiness(
+        &mut self,
+        request: &DeliverResultRequest,
+        ready: Option<&ReadyChannel>,
+        exporter: &[u8; 32],
+    ) -> Result<Delivery, DeliverError> {
         let work_id = work_id_bytes(&request.work_id).ok_or(DeliverError::Malformed("work id"))?;
         let signature = signature(&request.client_signature)
             .ok_or(DeliverError::Malformed("client signature"))?;
-        let job = self
-            .state()
-            .job_by_id(work_id)
-            .ok_or(DeliverError::NoSuchJob)?;
-        let admitted = self.admitting()?.clone();
+        let channel = self.state().channel();
         // Who is asking, on this connection. A `work_id` says which job;
         // it says nothing about who may be handed it, and it travels —
         // so without this the plaintext goes to whoever learned one, and
         // the debit for it lands on the client that never asked.
         if !Secp256k1Verifier::new().verify_sig(
             signature,
-            admitted.channel().client_key(),
-            signing_hash(delivery_request_digest(
-                admitted.channel(),
-                work_id,
-                exporter,
-            )),
+            channel.client_key(),
+            signing_hash(delivery_request_digest(channel, work_id, exporter)),
         ) {
             return Err(DeliverError::Unbound);
         }
+        let job = self.state().job_by_id(work_id).ok_or_else(|| {
+            self.state()
+                .terminal_by_id(work_id)
+                .map_or(DeliverError::NoSuchJob, |terminal| {
+                    DeliverError::Terminated {
+                        outcome: terminal.outcome.name(),
+                    }
+                })
+        })?;
+        let admitted = self.admitting()?.clone();
+        let ready = ready.unwrap_or(&admitted);
         let Some((result, signature)) = job.result() else {
             return Err(DeliverError::NoResult { phase: job.phase() });
         };
@@ -1625,12 +1675,31 @@ impl PreparedEvaluateInput {
 /// Implementors must invoke once per call. That is not a property this
 /// trait can check, and it is not the one the gate rests on: the gate
 /// calls this at most once per `work_id` whatever the implementor does.
-pub trait PaidEvaluateBackend {
+pub trait PaidEvaluateBackend: Sync {
     /// Runs one journaled Evaluate input to its terminal.
     fn evaluate(
         &self,
         input: PreparedEvaluateInput,
     ) -> impl core::future::Future<Output = Result<Vec<OutputEventEnvelope>, BackendFault>> + Send;
+
+    /// Run once, exposing authenticated token prefixes while retaining the
+    /// complete transcript for durable terminal delivery.
+    fn evaluate_stream(
+        &self,
+        input: PreparedEvaluateInput,
+        progress: PaidProgress,
+    ) -> impl core::future::Future<Output = Result<Vec<OutputEventEnvelope>, BackendFault>> + Send
+    {
+        async move {
+            let events = self.evaluate(input).await?;
+            for event in &events {
+                if event.event().body().kind() == hellas_rpc::evaluate::TOKEN_DELTA_EVENT_KIND {
+                    progress(event.clone())?;
+                }
+            }
+            Ok(events)
+        }
+    }
 }
 
 /// What [`ProviderEndpoint::begin_run`] found, and what may be done next.
@@ -1773,7 +1842,10 @@ where
         }
     };
 
-    let transcript = match backend.evaluate(input).await {
+    let progress_service = service.clone();
+    let progress: PaidProgress =
+        Arc::new(move |event| progress_service.publish_progress(work_id, event));
+    let transcript = match backend.evaluate_stream(input, progress).await {
         Ok(transcript) => transcript,
         Err(fault) => return Err(end_failed(service, work_id, RunError::Backend(fault))),
     };
@@ -1839,6 +1911,12 @@ pub enum DeliverError {
     /// No open job on this channel carries this `work_id`.
     #[error("no open job on this channel carries this work id")]
     NoSuchJob,
+    /// The retained terminal records a permanent end to this job.
+    #[error("the job ended permanently as {outcome}")]
+    Terminated {
+        /// The terminal's stable diagnostic name, without backend details.
+        outcome: &'static str,
+    },
     /// The job has no signed result, so there is nothing to deliver.
     #[error("a {phase} job has no result to deliver")]
     NoResult {
@@ -1910,8 +1988,10 @@ impl From<DeliverError> for Refusal {
     fn from(error: DeliverError) -> Self {
         let reason = error.to_string();
         let code = match error {
-            DeliverError::NoSuchJob => WorkRefusal::Declined,
+            DeliverError::NoSuchJob | DeliverError::Terminated { .. } => WorkRefusal::Declined,
             DeliverError::NoResult { .. } => WorkRefusal::NotReady,
+            DeliverError::Endpoint(EndpointError::CatchingUp) => WorkRefusal::NotReady,
+            DeliverError::Endpoint(EndpointError::NotAdmitting) => WorkRefusal::Unavailable,
             DeliverError::Unbound => WorkRefusal::Invalid,
             DeliverError::Setup(setup) => return Refusal::from(setup),
             DeliverError::Store(store) => return Refusal::from(store),
@@ -2042,6 +2122,8 @@ fn end_failed(service: &WorkService, work_id: Digest, fault: RunError) -> RunErr
 pub struct WorkService {
     endpoint: Arc<Mutex<ProviderEndpoint>>,
     driving: Arc<AtomicBool>,
+    changed: Arc<tokio::sync::Notify>,
+    progress: Arc<Mutex<std::collections::BTreeMap<Digest, Vec<OutputEventEnvelope>>>>,
 }
 
 /// The authority to advance this channel's cursor, and the only thing
@@ -2260,6 +2342,8 @@ impl WorkService {
         Self {
             endpoint: Arc::new(Mutex::new(endpoint)),
             driving: Arc::new(AtomicBool::new(false)),
+            changed: Arc::new(tokio::sync::Notify::new()),
+            progress: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
         }
     }
 
@@ -2441,6 +2525,9 @@ impl WorkService {
         source: &S,
         request: &AcceptWorkRequest,
     ) -> Result<AcceptWorkResponse, CatchUpError> {
+        if let Some(response) = self.precheck_acceptance(request) {
+            return Ok(response);
+        }
         let work_id = {
             let endpoint = self.endpoint().map_err(|_| CatchUpError::Busy)?;
             let channel = endpoint.state().channel();
@@ -2452,6 +2539,28 @@ impl WorkService {
             self.catch_up_job(source, work_id).await?;
         }
         Ok(self.accept(request))
+    }
+
+    /// Answers an authenticated proposal from retained state alone, when
+    /// possible, without signing, writing the journal, or requiring readiness.
+    ///
+    /// A retained acceptance takes precedence over expiry: its acknowledgement
+    /// may have been lost. Otherwise a retained terminal or an acceptance
+    /// deadline already passed by the persisted cursor is permanent. Malformed
+    /// or unauthenticated requests are refused before consulting job state.
+    /// `None` means fresh readiness and the normal acceptance checks are needed.
+    #[must_use]
+    pub fn precheck_acceptance(&self, request: &AcceptWorkRequest) -> Option<AcceptWorkResponse> {
+        let result = self
+            .endpoint()
+            .map_err(|error| Refusal::new(endpoint_refusal(error), error.to_string()))
+            .and_then(|endpoint| {
+                let (authorization, _, work_id) = endpoint.authenticate_proposal(request)?;
+                Ok(endpoint
+                    .prior_acceptance(&authorization, work_id)?
+                    .map(|signature| (work_id, signature)))
+            });
+        result.transpose().map(acceptance_response)
     }
 
     /// Answers one proposal, or says the endpoint is unreachable.
@@ -2483,7 +2592,9 @@ impl WorkService {
         work_id: Digest,
         ready: &ReadyChannel,
     ) -> Result<RunAdmission, RunError> {
-        self.endpoint()?.begin_run(work_id, ready)
+        let result = self.endpoint()?.begin_run(work_id, ready);
+        self.changed.notify_waiters();
+        result
     }
 
     /// Signs and journals the result of one invocation's transcript.
@@ -2497,7 +2608,15 @@ impl WorkService {
         work_id: Digest,
         transcript: &[OutputEventEnvelope],
     ) -> Result<(PaidJobResultV1, Sig), RunError> {
-        self.endpoint()?.record_result(work_id, transcript)
+        let result = self.endpoint()?.record_result(work_id, transcript);
+        if result.is_ok() {
+            self.progress
+                .lock()
+                .expect("paid progress poisoned")
+                .remove(&work_id);
+        }
+        self.changed.notify_waiters();
+        result
     }
 
     /// Ends the open job as this provider's own failure.
@@ -2507,7 +2626,13 @@ impl WorkService {
     /// [`RunError::Endpoint`] when the endpoint is unreachable, and
     /// whatever [`ProviderEndpoint::end_run`] raises otherwise.
     pub fn end_run(&self, work_id: Digest) -> Result<(), RunError> {
-        self.endpoint()?.end_run(work_id)
+        let result = self.endpoint()?.end_run(work_id);
+        self.progress
+            .lock()
+            .expect("paid progress poisoned")
+            .remove(&work_id);
+        self.changed.notify_waiters();
+        result
     }
 
     /// Releases one job's plaintext against this service's own
@@ -2527,9 +2652,8 @@ impl WorkService {
         request: &DeliverResultRequest,
         exporter: &[u8; 32],
     ) -> Result<Delivery, DeliverError> {
-        let mut endpoint = self.endpoint()?;
-        let ready = endpoint.admitting()?.clone();
-        endpoint.deliver(request, &ready, exporter)
+        self.endpoint()?
+            .deliver_with_readiness(request, None, exporter)
     }
 
     /// Releases one job's answer, or says why not.
@@ -2551,18 +2675,9 @@ impl WorkService {
         context: &TransportContext,
     ) -> DeliverResultResponse {
         let outcome = match (self.endpoint(), context.open_exporter) {
-            (Ok(mut endpoint), Some(exporter)) => {
-                let admitted = endpoint.admitting().cloned();
-                match admitted {
-                    Ok(ready) => endpoint
-                        .deliver(request, &ready, &exporter)
-                        .map_err(Refusal::from),
-                    // A channel that admits no new work releases no
-                    // plaintext either: the readiness the margins are
-                    // measured against is the one that admitted the job.
-                    Err(error) => Err(Refusal::new(endpoint_refusal(error), error.to_string())),
-                }
-            }
+            (Ok(mut endpoint), Some(exporter)) => endpoint
+                .deliver_with_readiness(request, None, &exporter)
+                .map_err(Refusal::from),
             (Ok(_), None) => Err(Refusal::from(DeliverError::Unbindable)),
             (Err(error), _) => Err(Refusal::new(endpoint_refusal(error), error.to_string())),
         };
@@ -2630,17 +2745,21 @@ impl WorkHandler for WorkService {
         core::future::ready(Ok(self.accept(&request)))
     }
 
-    fn deliver_result(
+    async fn deliver_result(
         &self,
         request: DeliverResultRequest,
         context: TransportContext,
-    ) -> impl core::future::Future<
-        Output = Result<
-            impl Into<hellas_rpc::call::WithTrailer<DeliverResultResponse>> + Send,
-            WireStatus,
-        >,
-    > + Send {
-        core::future::ready(Ok(self.release(&request, &context)))
+    ) -> Result<impl Into<hellas_rpc::call::WithTrailer<DeliverResultResponse>> + Send, WireStatus>
+    {
+        Ok(self.release(&request, &context))
+    }
+
+    async fn stream_result(
+        &self,
+        request: DeliverResultRequest,
+        context: TransportContext,
+    ) -> Result<PaidResultStream, WireStatus> {
+        Ok(self.result_stream(request, context))
     }
 
     fn admit_certificate(
@@ -2767,12 +2886,9 @@ impl ClientEndpoint {
     /// so the nonce was never spent, and the retry proposes the same
     /// job at the same number.
     ///
-    /// Called again while a proposal is outstanding it returns that
-    /// proposal's retained bytes rather than a second one — the crash
-    /// after journaling and before sending. `proposal` must rebuild to
-    /// the retained authorization for that to happen: this is one job at
-    /// a time, and a caller asking for a different job is told so rather
-    /// than being handed the old one under a new name.
+    /// A matching outstanding proposal returns its retained bytes. Use
+    /// [`Self::resume_proposal`] to retry a known job after the configured
+    /// execution policy has changed. Other proposals receive fresh nonces.
     ///
     /// # Errors
     ///
@@ -2846,6 +2962,27 @@ impl ClientEndpoint {
             &Secp256k1Verifier::new(),
         )?;
         Ok(wire_request(&authorization, signature, prepared_input))
+    }
+
+    /// Resend a half-signed proposal exactly as journaled, including the
+    /// original policy and deadlines. No nonce or new signature is created.
+    ///
+    /// # Errors
+    /// Returns [`ProposeError::NoOpenJob`] for an unknown job and
+    /// [`ProposeError::JobInFlight`] if the provider already co-signed it.
+    pub fn resume_proposal(&self, work_id: Digest) -> Result<AcceptWorkRequest, ProposeError> {
+        let job = self
+            .state()
+            .job_by_id(work_id)
+            .ok_or(ProposeError::NoOpenJob)?;
+        if job.phase() != JobPhase::HalfSigned {
+            return Err(ProposeError::JobInFlight { phase: job.phase() });
+        }
+        Ok(wire_request(
+            job.authorization(),
+            job.client_signature(),
+            job.prepared_input().to_vec(),
+        ))
     }
 
     /// Applies one provider answer, and returns the accepted `work_id`.
@@ -3347,7 +3484,42 @@ where
     endpoint.accepted(&response)
 }
 
+/// Resend a retained proposal over a live transport and journal its answer.
+///
+/// # Errors
+/// Returns transport errors and errors from [`ClientEndpoint::resume_proposal`]
+/// or [`ClientEndpoint::accepted`].
+pub async fn resume_work_proposal<T>(
+    transport: T,
+    endpoint: &mut ClientEndpoint,
+    work_id: Digest,
+) -> Result<Digest, ProposeError>
+where
+    T: StreamTransport + Sync,
+    T::Error: std::error::Error + Send + Sync + 'static,
+    T::Stream: 'static,
+{
+    let request = endpoint.resume_proposal(work_id)?;
+    let response = WorkClientImpl::new(transport).accept_work(request).await?;
+    endpoint.accepted(&response)
+}
+
 // ── Wire shapes ───────────────────────────────────────────────────────
+
+fn acceptance_response(result: Result<(Digest, Sig), Refusal>) -> AcceptWorkResponse {
+    AcceptWorkResponse {
+        outcome: Some(match result {
+            Ok((work_id, signature)) => Outcome::Accepted(WorkAccepted {
+                provider_signature: signature.as_bytes().to_vec(),
+                work_id: work_id.as_bytes().to_vec(),
+            }),
+            Err(refusal) => Outcome::Refused(WorkRefused {
+                code: refusal.code.code() as i32,
+                reason: refusal.reason,
+            }),
+        }),
+    }
+}
 
 fn wire_request(
     authorization: &PaidJobAuthorizationV1,

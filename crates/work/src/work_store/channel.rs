@@ -200,6 +200,8 @@ pub enum JobPhase {
     Accepted,
     /// The backend may have been invoked. Provider-only.
     Running,
+    /// Live output may leave; delivery credit is reserved before terminal.
+    Streaming,
     /// A signed terminal result exists.
     Ready,
     /// The client's own re-execution reproduced the answer and it
@@ -221,6 +223,7 @@ impl JobPhase {
             Self::HalfSigned => "half-signed",
             Self::Accepted => "accepted",
             Self::Running => "running",
+            Self::Streaming => "streaming",
             Self::Ready => "ready",
             Self::Matched => "matched",
             Self::Delivered => "delivered",
@@ -229,7 +232,7 @@ impl JobPhase {
 
     /// Whether reaching this phase means plaintext left the provider.
     const fn delivered(self) -> bool {
-        matches!(self, Self::Delivered)
+        matches!(self, Self::Delivered | Self::Streaming)
     }
 
     const fn code(self) -> u8 {
@@ -240,6 +243,7 @@ impl JobPhase {
             Self::Ready => 3,
             Self::Matched => 4,
             Self::Delivered => 5,
+            Self::Streaming => 6,
         }
     }
 
@@ -251,6 +255,7 @@ impl JobPhase {
             3 => Ok(Self::Ready),
             4 => Ok(Self::Matched),
             5 => Ok(Self::Delivered),
+            6 => Ok(Self::Streaming),
             _ => Err(ChannelStateError::Malformed),
         }
     }
@@ -259,7 +264,7 @@ impl JobPhase {
     /// it.
     const fn only_role(self) -> Option<Role> {
         match self {
-            Self::Running | Self::Delivered => Some(Role::Provider),
+            Self::Running | Self::Streaming | Self::Delivered => Some(Role::Provider),
             Self::Matched => Some(Role::Client),
             _ => None,
         }
@@ -331,7 +336,8 @@ pub enum TerminalOutcome {
 
 impl TerminalOutcome {
     /// A one-word name for this terminal, for a refusal message.
-    const fn name(&self) -> &'static str {
+    #[must_use]
+    pub const fn name(&self) -> &'static str {
         match self {
             Self::Certified { .. } => "certified",
             Self::Refuted { .. } => "refuted",
