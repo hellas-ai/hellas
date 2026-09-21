@@ -159,11 +159,11 @@ impl Inference {
                 if let Some(model) = &completed.server_model {
                     self.response_model(model);
                 }
-                if let Some(details) = &completed.usage.input_tokens_details {
-                    if let Ok(count) = i64::try_from(details.cached_tokens) {
-                        self.span
-                            .record("gen_ai.usage.cache_read.input_tokens", count);
-                    }
+                if let Some(details) = &completed.usage.input_tokens_details
+                    && let Ok(count) = i64::try_from(details.cached_tokens)
+                {
+                    self.span
+                        .record("gen_ai.usage.cache_read.input_tokens", count);
                 }
             }
             OutputEvent::Finished { stop_reason, usage } => {
