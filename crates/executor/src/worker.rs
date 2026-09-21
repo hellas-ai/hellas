@@ -146,6 +146,11 @@ impl GpuConfig {
     }
 
     #[must_use]
+    pub const fn backend(self) -> catena_lang::safe_gpu::Backend {
+        self.backend
+    }
+
+    #[must_use]
     pub const fn session_programs(self) -> usize {
         self.session_programs
     }
