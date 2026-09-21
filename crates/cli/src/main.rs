@@ -476,8 +476,8 @@ enum Commands {
         /// Load a private bearer credential file, creating it when absent.
         #[arg(long = "bearer-token-file", value_name = "FILE")]
         bearer_token_file: Option<PathBuf>,
-        /// Explicit local text-chat template. Qwen3 disables thinking for new replies.
-        #[arg(long = "chat-template", value_name = "qwen3")]
+        /// Explicit local text-chat template.
+        #[arg(long = "chat-template", value_name = "TEMPLATE")]
         chat_template: Option<hellas_presentation::ChatTemplate>,
         #[command(flatten)]
         remote_trust: RemoteTrustArgs,
