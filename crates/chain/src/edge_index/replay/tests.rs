@@ -303,7 +303,7 @@ impl Harness {
             std::fs::write(directory.join(format!("{name}.pb")), value.encode_to_vec()).unwrap();
             let json = serde_json::to_value(value).unwrap();
             let data = &json["data"];
-            let payload = json["snapshot"]["payload"].as_str().unwrap();
+            let payload = json["envelope"]["snapshot"]["payload"].as_str().unwrap();
             let (kind, path, edge_id) = if let Some(id) =
                 data["payment"]["summary"]["edge_id"].as_str()
             {
@@ -343,7 +343,7 @@ impl Harness {
                 .and_then(|bytes| serde_json::from_slice(&bytes).ok())
                 .unwrap_or_default();
             entries.retain(|entry| entry["name"].as_str() != Some(name));
-            entries.push(serde_json::json!({"name":name,"kind":kind,"api_path":path,"payload":payload,"height":json["snapshot"]["height"],"edge_id":edge_id,"json":format!("{name}.json"),"protobuf":format!("{name}.pb")}));
+            entries.push(serde_json::json!({"name":name,"kind":kind,"api_path":path,"payload":payload,"height":json["envelope"]["snapshot"]["height"],"edge_id":edge_id,"json":format!("{name}.json"),"protobuf":format!("{name}.pb")}));
             std::fs::write(manifest_path, serde_json::to_vec_pretty(&entries).unwrap()).unwrap();
         }
     }
