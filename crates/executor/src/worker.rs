@@ -31,11 +31,8 @@ use crate::environment::{CausalLmEnvironmentSource, read_verified_bytes};
 use crate::executor::ExecutorCompletion;
 use crate::state::{Invocation, StopReason};
 
-#[cfg(feature = "otel")]
-#[path = "worker/telemetry.rs"]
-mod telemetry;
-#[cfg(not(feature = "otel"))]
-#[path = "worker/telemetry_noop.rs"]
+#[cfg_attr(feature = "otel", path = "worker/telemetry/otel.rs")]
+#[cfg_attr(not(feature = "otel"), path = "worker/telemetry/noop.rs")]
 mod telemetry;
 use telemetry::{InferenceMetrics, InferenceTelemetry};
 
@@ -146,6 +143,11 @@ impl GpuConfig {
     pub const fn with_backend(mut self, backend: catena_lang::safe_gpu::Backend) -> Self {
         self.backend = backend;
         self
+    }
+
+    #[must_use]
+    pub const fn backend(self) -> catena_lang::safe_gpu::Backend {
+        self.backend
     }
 
     #[must_use]

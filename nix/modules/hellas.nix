@@ -343,7 +343,7 @@ rec {
         type = types.bool;
         default = cfg.endpoint != null || cfg.collectorEndpoint != null;
         defaultText = lib.literalExpression "otel.endpoint != null || otel.collectorEndpoint != null";
-        description = "Compile in OpenTelemetry and enable the configured exporters. Off when no endpoint is configured. The default package has no Hellas telemetry SDK or exporters.";
+        description = "Compile in OpenTelemetry and enable the configured exporters. Off when no endpoint is configured. The default package disables Hellas telemetry exporters.";
       };
       collectorEndpoint = mkOption {
         type = types.nullOr types.str;

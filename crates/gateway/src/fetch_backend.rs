@@ -16,6 +16,7 @@ use hellas_client::cache::fetch_output_stream;
 
 #[derive(Clone)]
 pub(super) struct ResponsesFetchBackend {
+    metrics: crate::backend::telemetry::InferenceMetrics,
     runtime: CliRuntime,
     route: Option<ExecutionRoute>,
     service: String,
@@ -37,6 +38,7 @@ impl ResponsesFetchBackend {
     ) -> Self {
         let (service, method, execution_environment) = target;
         Self {
+            metrics: crate::backend::telemetry::InferenceMetrics::new(),
             runtime,
             route,
             service: service.to_string(),
@@ -56,7 +58,7 @@ impl ResponsesFetchBackend {
 impl ExecutionBackend for ResponsesFetchBackend {
     fn stream<'a>(&'a self, request: BackendRequest) -> BackendFuture<'a, BackendStream> {
         Box::pin(async move {
-            let mut inference = crate::backend::telemetry::Inference::new(&request);
+            let mut inference = crate::backend::telemetry::Inference::new(&request, &self.metrics);
             let ProviderRequestBody { payload, retention } =
                 provider_request_body(&request, &self.request_overrides)
                     .inspect_err(|error| inference.fail(error))?;

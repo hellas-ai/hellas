@@ -31,12 +31,7 @@ pub trait IncrementalToolCallParser: Send {
     fn finish(&mut self, reason: StopReason) -> Vec<DecodeEvent>;
 }
 
-/// No-tools parser. Forwards every byte as `TextDelta`; emits `Stop`
-/// on finish. Used by
-/// [`ChatTurn::make_parser`](super::ChatTurn::make_parser) when the
-/// turn has no [`ToolDirectory`](super::ToolDirectory) bound, and
-/// available publicly so consumers (and tests) can construct one
-/// directly without needing a `ChatTurn`.
+/// Pass plain text through when no tools were offered.
 pub struct PassthroughParser;
 
 impl IncrementalToolCallParser for PassthroughParser {
@@ -84,10 +79,6 @@ impl SentinelMatcher {
         }
     }
 
-    pub fn sentinel(&self) -> &'static str {
-        self.sentinel
-    }
-
     pub fn push(&mut self, chunk: &str) {
         self.buffer.push_str(chunk);
     }
@@ -115,16 +106,6 @@ impl SentinelMatcher {
     /// Drain everything in the buffer (used on stream close).
     pub fn finish(&mut self) -> String {
         std::mem::take(&mut self.buffer)
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.buffer.is_empty()
-    }
-
-    /// Number of bytes currently buffered (used by per-arch parsers to
-    /// enforce a hard payload-size cap inside an open sentinel block).
-    pub fn buffered_bytes(&self) -> usize {
-        self.buffer.len()
     }
 }
 

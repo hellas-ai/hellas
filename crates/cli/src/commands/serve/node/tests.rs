@@ -3575,109 +3575,137 @@ async fn the_clock_serves_work_from_the_channel_it_was_handed() {
 /// Discovery must resume the obligation already recorded by an Accepted
 /// journal; no client retries a request and no transient Courtesy state is
 /// present after this simulated process restart.
-#[tokio::test(flavor = "multi_thread")]
-async fn the_clock_resumes_an_accepted_job_after_restart() {
+#[test]
+fn the_clock_resumes_an_accepted_job_after_restart() {
     let dir = temp();
     write_setup_journal(dir.path());
     let work_id = write_accepted_channel(dir.path());
     let calls = Arc::new(AtomicUsize::new(0));
-    let mount = MountedWork::with_backend(AnsweringPaidBackend {
-        calls: Arc::clone(&calls),
-    });
-    let mut runner = runner(dir.path(), provider_policy(), &mount);
     let chain = TestChain::new();
     chain.set_snapshot(ready_channel_snapshot(ORIGIN, None));
+    let runtime = || {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("the process runtime starts")
+    };
+    let first_process = runtime();
+    first_process.block_on(async {
+        let mount = MountedWork::with_backend(AnsweringPaidBackend {
+            calls: Arc::clone(&calls),
+        });
+        let mut runner = runner(dir.path(), provider_policy(), &mount);
 
-    assert!(runner.tick(&chain).await, "the recovery read answers");
+        assert!(runner.tick(&chain).await, "the recovery read answers");
 
-    let finished = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let phase = mount
-                .service(&vouched_context(default_route_peer()))
-                .and_then(|service| {
-                    service
-                        .with_state(|state| {
-                            state
-                                .jobs()
-                                .next()
-                                .filter(|job| job.work_id() == work_id)
-                                .map(|job| job.phase())
-                        })
-                        .ok()
-                        .flatten()
-                });
-            if calls.load(Ordering::SeqCst) == 1 && phase == Some(JobPhase::Ready) {
-                break;
+        let finished = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let phase = mount
+                    .service(&vouched_context(default_route_peer()))
+                    .and_then(|service| {
+                        service
+                            .with_state(|state| {
+                                state
+                                    .jobs()
+                                    .next()
+                                    .filter(|job| job.work_id() == work_id)
+                                    .map(|job| job.phase())
+                            })
+                            .ok()
+                            .flatten()
+                    });
+                if calls.load(Ordering::SeqCst) == 1 && phase == Some(JobPhase::Ready) {
+                    break;
+                }
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await;
-    assert!(
-        finished.is_ok(),
-        "the recovered accepted job reaches one durable result"
-    );
+        })
+        .await;
+        assert!(
+            finished.is_ok(),
+            "the recovered accepted job reaches one durable result"
+        );
 
-    assert!(runner.tick(&chain).await, "the next recovery read answers");
-    tokio::task::yield_now().await;
-    assert_eq!(
-        calls.load(Ordering::SeqCst),
-        1,
-        "a ready journal is never invoked again"
-    );
+        assert!(runner.tick(&chain).await, "the next recovery read answers");
+        tokio::task::yield_now().await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a ready journal is never invoked again"
+        );
+
+        // Deterministically retain a channel handle in an unfinished task, as the
+        // detached execution task may still do just after publishing Ready.
+        let retained = mount
+            .service(&vouched_context(default_route_peer()))
+            .unwrap();
+        tokio::spawn(async move {
+            std::future::pending::<()>().await;
+            drop(retained);
+        });
+        drop(runner);
+        drop(mount);
+    });
+    // Ready is durable before the detached execution future necessarily drops
+    // its channel handle. End the old process's tasks and file locks before
+    // discovering journals again, as a real process restart would.
+    drop(first_process);
 
     // A second restart finds a result, not an Accepted job to resume. It must
     // deliver that result without a new AcceptWork priming its readiness.
-    drop(runner);
-    drop(mount);
-    let mount = MountedWork::default();
-    let mut restarted = self::runner(dir.path(), provider_policy(), &mount);
-    assert!(restarted.tick(&chain).await);
-    let exporter = [0x5b; 32];
-    let mut context = vouched_context(default_route_peer());
-    context.open_exporter = Some(exporter);
-    let request = DeliverResultRequest {
-        work_id: work_id.as_bytes().to_vec(),
-        client_signature: client()
-            .sign(signing_hash(delivery_request_digest(
-                descriptor().channel(),
-                work_id,
-                &exporter,
-            )))
-            .as_bytes()
-            .to_vec(),
-    };
-    let handler = mount
-        .handler(&context)
-        .expect("restarted channel is mounted");
-    let response: WithTrailer<DeliverResultResponse> = tokio::time::timeout(
-        Duration::from_secs(5),
-        handler.deliver_result(request.clone(), context.clone()),
-    )
-    .await
-    .expect("retained result is immediately collectable")
-    .expect("delivery succeeds")
-    .into();
-    assert!(matches!(
-        response.response.outcome,
-        Some(deliver_result_response::Outcome::Delivered(_))
-    ));
-    assert_eq!(
-        calls.load(Ordering::SeqCst),
-        1,
-        "delivery never reruns the model"
-    );
-
-    chain.set_snapshot(ready_channel_snapshot(ORIGIN, Some(pending_contest(false))));
-    let response: WithTrailer<DeliverResultResponse> = handler
-        .deliver_result(request, context)
+    let restarted_process = runtime();
+    restarted_process.block_on(async {
+        let mount = MountedWork::default();
+        let mut restarted = self::runner(dir.path(), provider_policy(), &mount);
+        assert!(restarted.tick(&chain).await);
+        let exporter = [0x5b; 32];
+        let mut context = vouched_context(default_route_peer());
+        context.open_exporter = Some(exporter);
+        let request = DeliverResultRequest {
+            work_id: work_id.as_bytes().to_vec(),
+            client_signature: client()
+                .sign(signing_hash(delivery_request_digest(
+                    descriptor().channel(),
+                    work_id,
+                    &exporter,
+                )))
+                .as_bytes()
+                .to_vec(),
+        };
+        let handler = mount
+            .handler(&context)
+            .expect("restarted channel is mounted");
+        let response: WithTrailer<DeliverResultResponse> = tokio::time::timeout(
+            Duration::from_secs(5),
+            handler.deliver_result(request.clone(), context.clone()),
+        )
         .await
-        .expect("refusal is answered")
+        .expect("retained result is immediately collectable")
+        .expect("delivery succeeds")
         .into();
-    let Some(deliver_result_response::Outcome::Refused(refusal)) = response.response.outcome else {
-        panic!("cached readiness must not release data after a finalized contest");
-    };
-    assert_retryable_not_ready(refusal);
+        assert!(matches!(
+            response.response.outcome,
+            Some(deliver_result_response::Outcome::Delivered(_))
+        ));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "delivery never reruns the model"
+        );
+
+        chain.set_snapshot(ready_channel_snapshot(ORIGIN, Some(pending_contest(false))));
+        let response: WithTrailer<DeliverResultResponse> = handler
+            .deliver_result(request, context)
+            .await
+            .expect("refusal is answered")
+            .into();
+        let Some(deliver_result_response::Outcome::Refused(refusal)) = response.response.outcome
+        else {
+            panic!("cached readiness must not release data after a finalized contest");
+        };
+        assert_retryable_not_ready(refusal);
+    });
 }
 
 #[tokio::test(flavor = "multi_thread")]

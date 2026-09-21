@@ -15,6 +15,45 @@ use tracing::Span;
 use opentelemetry::{Array, KeyValue, Value};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
+#[derive(Clone)]
+pub(crate) struct InferenceMetrics {
+    duration: opentelemetry::metrics::Histogram<f64>,
+    tokens: opentelemetry::metrics::Histogram<u64>,
+    first_chunk_time: opentelemetry::metrics::Histogram<f64>,
+}
+
+impl InferenceMetrics {
+    pub(crate) fn new() -> Self {
+        let meter = opentelemetry::global::meter("hellas.gateway.gen_ai");
+        let latency_buckets = vec![
+            0.01, 0.02, 0.04, 0.08, 0.16, 0.32, 0.64, 1.28, 2.56, 5.12, 10.24, 20.48, 40.96, 81.92,
+        ];
+        Self {
+            duration: meter
+                .f64_histogram("gen_ai.client.operation.duration")
+                .with_unit("s")
+                .with_description("GenAI operation duration.")
+                .with_boundaries(latency_buckets.clone())
+                .build(),
+            tokens: meter
+                .u64_histogram("gen_ai.client.token.usage")
+                .with_unit("{token}")
+                .with_description("Number of input and output tokens used.")
+                .with_boundaries(vec![
+                    1., 4., 16., 64., 256., 1024., 4096., 16384., 65536., 262144., 1048576.,
+                    4194304., 16777216., 67108864.,
+                ])
+                .build(),
+            first_chunk_time: meter
+                .f64_histogram("gen_ai.client.operation.time_to_first_chunk")
+                .with_unit("s")
+                .with_description("Time from the generation request to its first response chunk.")
+                .with_boundaries(latency_buckets)
+                .build(),
+        }
+    }
+}
+
 pub(crate) struct Inference {
     pub(crate) span: Span,
     started: Instant,
@@ -22,13 +61,11 @@ pub(crate) struct Inference {
     first_chunk: bool,
     streaming: bool,
     attributes: Vec<KeyValue>,
-    duration: opentelemetry::metrics::Histogram<f64>,
-    tokens: opentelemetry::metrics::Histogram<u64>,
-    first_chunk_time: opentelemetry::metrics::Histogram<f64>,
+    metrics: InferenceMetrics,
 }
 
 impl Inference {
-    pub(crate) fn new(request: &BackendRequest) -> Self {
+    pub(crate) fn new(request: &BackendRequest, metrics: &InferenceMetrics) -> Self {
         let canonical = &request.execution.canonical;
         let operation = match canonical.input {
             Input::Text(_) => "text_completion",
@@ -62,10 +99,6 @@ impl Inference {
             error.type = tracing::field::Empty,
             otel.status_code = tracing::field::Empty,
         );
-        let meter = opentelemetry::global::meter("hellas.gateway.gen_ai");
-        let latency_buckets = vec![
-            0.01, 0.02, 0.04, 0.08, 0.16, 0.32, 0.64, 1.28, 2.56, 5.12, 10.24, 20.48, 40.96, 81.92,
-        ];
         Self {
             span,
             started: Instant::now(),
@@ -77,27 +110,7 @@ impl Inference {
                 KeyValue::new("gen_ai.provider.name", "hellas"),
                 KeyValue::new("gen_ai.request.model", model.clone()),
             ],
-            duration: meter
-                .f64_histogram("gen_ai.client.operation.duration")
-                .with_unit("s")
-                .with_description("GenAI operation duration.")
-                .with_boundaries(latency_buckets.clone())
-                .build(),
-            tokens: meter
-                .u64_histogram("gen_ai.client.token.usage")
-                .with_unit("{token}")
-                .with_description("Number of input and output tokens used.")
-                .with_boundaries(vec![
-                    1., 4., 16., 64., 256., 1024., 4096., 16384., 65536., 262144., 1048576.,
-                    4194304., 16777216., 67108864.,
-                ])
-                .build(),
-            first_chunk_time: meter
-                .f64_histogram("gen_ai.client.operation.time_to_first_chunk")
-                .with_unit("s")
-                .with_description("Time from the generation request to its first response chunk.")
-                .with_boundaries(latency_buckets)
-                .build(),
+            metrics: metrics.clone(),
         }
     }
 
@@ -147,7 +160,9 @@ impl Inference {
                 let seconds = self.started.elapsed().as_secs_f64();
                 self.span
                     .record("gen_ai.response.time_to_first_chunk", seconds);
-                self.first_chunk_time.record(seconds, &self.attributes);
+                self.metrics
+                    .first_chunk_time
+                    .record(seconds, &self.attributes);
             }
         }
         match event {
@@ -179,7 +194,7 @@ impl Inference {
                             {
                                 let mut attributes = self.attributes.clone();
                                 attributes.push(KeyValue::new("gen_ai.token.type", kind));
-                                self.tokens.record(count, &attributes);
+                                self.metrics.tokens.record(count, &attributes);
                             }
                         }
                     }
@@ -210,7 +225,8 @@ impl Inference {
             self.span.record("otel.status_code", "ERROR");
             self.attributes.push(KeyValue::new("error.type", error));
         }
-        self.duration
+        self.metrics
+            .duration
             .record(self.started.elapsed().as_secs_f64(), &self.attributes);
     }
 }

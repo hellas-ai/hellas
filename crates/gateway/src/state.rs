@@ -30,6 +30,7 @@ pub(super) const DEFAULT_INFERENCE_TIMEOUT: Duration = Duration::from_secs(3600)
 
 #[derive(Clone)]
 pub(super) struct GatewayState {
+    pub(super) inference_metrics: super::backend::telemetry::InferenceMetrics,
     pub(super) output_cache: Option<Arc<super::cache::OutputCache>>,
     #[cfg(feature = "evaluate")]
     pub(super) local: bool,
@@ -273,6 +274,7 @@ impl GatewayState {
         };
 
         Ok(Self {
+            inference_metrics: super::backend::telemetry::InferenceMetrics::new(),
             output_cache,
             #[cfg(feature = "evaluate")]
             local: options.local,
@@ -282,7 +284,10 @@ impl GatewayState {
             default_max_tokens: options.default_max_tokens,
             model_name: options.model_name.clone(),
             causal_lm: options.causal_lm.clone(),
-            inference_timeout: DEFAULT_INFERENCE_TIMEOUT,
+            inference_timeout: options
+                .paid_work
+                .as_ref()
+                .map_or(DEFAULT_INFERENCE_TIMEOUT, |backend| backend.timeout()),
             runtime,
             presentation,
             stop_token_ids: options.stop_token_ids.clone(),
@@ -325,6 +330,7 @@ impl GatewayState {
             options.request_overrides.clone(),
         ));
         Ok(Self {
+            inference_metrics: super::backend::telemetry::InferenceMetrics::new(),
             output_cache: None,
             #[cfg(feature = "evaluate")]
             local: false,
@@ -390,7 +396,14 @@ impl GatewayState {
                         stop_token_ids: self.stop_token_ids.clone(),
                     })
                     .map_err(|error| {
-                        hellas_client::ClientError::External(error.into_boxed_dyn_error())
+                        // anyhow's allocation-preserving conversion hides the
+                        // concrete error type from std::error::Error downcasts.
+                        let error: Box<dyn std::error::Error + Send + Sync> =
+                            match error.downcast::<super::PaidGatewayBusy>() {
+                                Ok(busy) => Box::new(busy),
+                                Err(error) => error.into_boxed_dyn_error(),
+                            };
+                        hellas_client::ClientError::External(error)
                     })?;
                 Ok((
                     None,
@@ -406,8 +419,12 @@ impl GatewayState {
             .await
             .map_err(|error| match error {
                 hellas_client::ClientError::External(error) => HttpError {
-                    status: StatusCode::BAD_REQUEST,
-                    message: format!("Request does not match a paid provider policy: {error}"),
+                    status: if error.is::<super::PaidGatewayBusy>() {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    } else {
+                        StatusCode::BAD_REQUEST
+                    },
+                    message: error.to_string(),
                 },
                 error => HttpError {
                     status: StatusCode::BAD_GATEWAY,

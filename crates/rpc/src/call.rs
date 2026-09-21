@@ -21,6 +21,7 @@ use hellas_wire::transport::{
 };
 
 use crate::observe::{LEVEL, TARGET, Timing};
+use crate::telemetry::CallSpan;
 
 /// Unary call: send one request, receive one response.
 pub async fn unary<T, M>(
@@ -57,7 +58,8 @@ where
     T::Error: std::error::Error + Send + Sync + 'static,
 {
     let span = crate::telemetry::client_span::<M>();
-    let result = tracing::Instrument::instrument(
+    let call = CallSpan::new(span.clone());
+    let result: Result<_, WireStatus> = tracing::Instrument::instrument(
         async move {
             let mut headers = headers;
             crate::telemetry::inject_current(&mut headers);
@@ -127,17 +129,16 @@ where
         span.clone(),
     )
     .await;
-    crate::telemetry::record_status(
-        &span,
-        result
-            .as_ref()
-            .map_or_else(|error| error.code, |_| WireCode::Ok),
-    );
+    if let Err(error) = &result {
+        call.finish(error.code);
+    }
+    if result.is_ok() {
+        call.finish(WireCode::Ok);
+    }
     result
 }
 
 fn trailer_to_status(t: &Trailer) -> WireStatus {
-    crate::telemetry::record_status(&tracing::Span::current(), t.status);
     WireStatus {
         code: t.status,
         message: t.message.clone(),
@@ -170,7 +171,9 @@ where
     T::Error: std::error::Error + Send + Sync + 'static,
 {
     let span = crate::telemetry::client_span::<M>();
-    tracing::Instrument::instrument(
+    let call = CallSpan::new(span.clone());
+    let operation = call.clone();
+    let result: Result<_, WireStatus> = tracing::Instrument::instrument(
         async move {
             let mut headers = headers;
             crate::telemetry::inject_current(&mut headers);
@@ -191,11 +194,15 @@ where
                 .await
                 .map_err(|e| WireStatus::internal(format!("close_send: {e}")))?;
 
-            Ok(StreamingCall::new(recv))
+            Ok(StreamingCall::new(recv, operation))
         },
         span,
     )
-    .await
+    .await;
+    if let Err(error) = &result {
+        call.finish(error.code);
+    }
+    result
 }
 
 /// Bidirectional streaming call: open a request/response stream and let
@@ -219,7 +226,9 @@ where
     T::Error: std::error::Error + Send + Sync + 'static,
 {
     let span = crate::telemetry::client_span::<M>();
-    tracing::Instrument::instrument(
+    let call = CallSpan::new(span.clone());
+    let operation = call.clone();
+    let result: Result<_, WireStatus> = tracing::Instrument::instrument(
         async move {
             let mut headers = headers;
             crate::telemetry::inject_current(&mut headers);
@@ -228,15 +237,18 @@ where
                 .await
                 .map_err(transport_to_status)?;
             let (send, recv) = WireStream::split(stream);
-            Ok(BidiStreamingCall::new(send, recv))
+            Ok(BidiStreamingCall::new(send, recv, operation))
         },
         span,
     )
-    .await
+    .await;
+    if let Err(error) = &result {
+        call.finish(error.code);
+    }
+    result
 }
 
 fn transport_to_status<E: std::error::Error>(err: E) -> WireStatus {
-    crate::telemetry::record_status(&tracing::Span::current(), WireCode::Unavailable);
     WireStatus::new(WireCode::Unavailable, err.to_string())
 }
 
@@ -257,7 +269,7 @@ fn transport_to_status<E: std::error::Error>(err: E) -> WireStatus {
 pub struct StreamingCall<R> {
     inner: Pin<Box<dyn ErasedRecv + Send>>,
     eof: bool,
-    span: tracing::Span,
+    call: CallSpan,
     _r: PhantomData<R>,
 }
 
@@ -359,7 +371,7 @@ where
 }
 
 impl<R> StreamingCall<R> {
-    fn new<H>(recv: H) -> Self
+    fn new<H>(recv: H, call: CallSpan) -> Self
     where
         H: RecvHalf + Unpin + Send + 'static,
         H::Error: std::error::Error + Send + Sync + 'static,
@@ -367,7 +379,7 @@ impl<R> StreamingCall<R> {
         Self {
             inner: Box::pin(RecvAdapter { recv }),
             eof: false,
-            span: tracing::Span::current(),
+            call,
             _r: PhantomData,
         }
     }
@@ -384,20 +396,20 @@ impl<R> StreamingCall<R> {
             self.eof,
             "StreamingCall::finish() called before the Stream returned None"
         );
-        let _entered = self.span.enter();
-        match self.inner.take_trailer() {
-            Some(t) if t.status == WireCode::Ok => {
-                crate::telemetry::record_status(&self.span, t.status);
-                Ok(t)
-            }
+        let _entered = self.call.span().enter();
+        let result = match self.inner.take_trailer() {
+            Some(t) if t.status == WireCode::Ok => Ok(t),
             Some(t) => Err(trailer_to_status(&t)),
-            None => {
-                crate::telemetry::record_status(&self.span, WireCode::Internal);
-                Err(WireStatus::internal(
-                    "stream ended without terminal trailer",
-                ))
-            }
-        }
+            None => Err(WireStatus::internal(
+                "stream ended without terminal trailer",
+            )),
+        };
+        self.call.finish(
+            result
+                .as_ref()
+                .map_or_else(|error| error.code, |_| WireCode::Ok),
+        );
+        result
     }
 }
 
@@ -408,20 +420,20 @@ impl<R: Message + Default> futures_core::Stream for StreamingCall<R> {
         if self.eof {
             return Poll::Ready(None);
         }
-        let span = self.span.clone();
+        let span = self.call.span().clone();
         let _entered = span.enter();
         match self.inner.as_mut().poll_chunk(cx) {
             Poll::Ready(Some(Ok(bytes))) => match R::decode(&bytes[..]) {
                 Ok(msg) => Poll::Ready(Some(Ok(msg))),
                 Err(e) => {
-                    crate::telemetry::record_status(&self.span, WireCode::Internal);
+                    self.call.finish(WireCode::Internal);
                     Poll::Ready(Some(Err(WireStatus::internal(format!(
                         "prost decode: {e}"
                     )))))
                 }
             },
             Poll::Ready(Some(Err(s))) => {
-                crate::telemetry::record_status(&self.span, s.code);
+                self.call.finish(s.code);
                 Poll::Ready(Some(Err(s)))
             }
             Poll::Ready(None) => {
@@ -438,14 +450,14 @@ impl<R: Message + Default> futures_core::Stream for StreamingCall<R> {
 pub struct StreamingSink<Q> {
     inner: Pin<Box<dyn ErasedSend + Send>>,
     closed: bool,
-    span: tracing::Span,
+    call: CallSpan,
     _q: PhantomData<Q>,
 }
 
 impl<Q> Unpin for StreamingSink<Q> {}
 
 impl<Q> StreamingSink<Q> {
-    fn new<S>(send: S) -> Self
+    fn new<S>(send: S, call: CallSpan) -> Self
     where
         S: SendHalf + 'static,
         S::Error: std::error::Error + Send + Sync + 'static,
@@ -453,12 +465,13 @@ impl<Q> StreamingSink<Q> {
         Self {
             inner: Box::pin(SendAdapter { send }),
             closed: false,
-            span: tracing::Span::current(),
+            call,
             _q: PhantomData,
         }
     }
 
     pub fn reset(&mut self, code: WireCode) {
+        self.call.finish(code);
         self.closed = true;
         self.inner.as_mut().reset(code);
     }
@@ -478,17 +491,22 @@ impl<Q: Message> StreamingSink<Q> {
             .map_err(|e| WireStatus::internal(format!("prost encode: {e}")))?;
         tracing::Instrument::instrument(
             self.inner.as_mut().send_body(buf.freeze()),
-            self.span.clone(),
+            self.call.span().clone(),
         )
         .await
+        .inspect_err(|error| self.call.finish(error.code))
     }
 
     pub async fn close(&mut self) -> Result<(), WireStatus> {
         if self.closed {
             return Ok(());
         }
-        tracing::Instrument::instrument(self.inner.as_mut().close_send(None), self.span.clone())
-            .await?;
+        tracing::Instrument::instrument(
+            self.inner.as_mut().close_send(None),
+            self.call.span().clone(),
+        )
+        .await
+        .inspect_err(|error| self.call.finish(error.code))?;
         self.closed = true;
         Ok(())
     }
@@ -497,6 +515,7 @@ impl<Q: Message> StreamingSink<Q> {
 impl<Q> Drop for StreamingSink<Q> {
     fn drop(&mut self) {
         if !self.closed {
+            self.call.finish(WireCode::Cancelled);
             self.inner.as_mut().reset(WireCode::Cancelled);
         }
     }
@@ -515,7 +534,7 @@ pub struct BidiStreamingCall<Q, R> {
 impl<Q, R> Unpin for BidiStreamingCall<Q, R> {}
 
 impl<Q, R> BidiStreamingCall<Q, R> {
-    fn new<S, H>(send: S, recv: H) -> Self
+    fn new<S, H>(send: S, recv: H, call: CallSpan) -> Self
     where
         S: SendHalf + 'static,
         S::Error: std::error::Error + Send + Sync + 'static,
@@ -523,8 +542,8 @@ impl<Q, R> BidiStreamingCall<Q, R> {
         H::Error: std::error::Error + Send + Sync + 'static,
     {
         Self {
-            sink: StreamingSink::new(send),
-            responses: StreamingCall::new(recv),
+            sink: StreamingSink::new(send, call.clone()),
+            responses: StreamingCall::new(recv, call),
         }
     }
 
@@ -764,17 +783,24 @@ where
     RespOrTrailer: Into<WithTrailer<M::Response>>,
 {
     let Some(_permit) = route.permits.try_acquire() else {
+        let call = CallSpan::new(crate::telemetry::server_span::<M>(&inbound.headers));
         let (mut send, _recv) = WireStream::split(inbound.stream);
-        send.close_send(Some(
-            WireStatus::new(
-                WireCode::ResourceExhausted,
-                "general submission route is full",
-            )
-            .into(),
-        ))
-        .await
-        .map_err(|error| TransportError::Io(format!("close-with-status: {error}")))?;
-        return Ok(());
+        let result = send
+            .close_send(Some(
+                WireStatus::new(
+                    WireCode::ResourceExhausted,
+                    "general submission route is full",
+                )
+                .into(),
+            ))
+            .await
+            .map_err(|error| TransportError::Io(format!("close-with-status: {error}")));
+        call.finish(if result.is_ok() {
+            WireCode::ResourceExhausted
+        } else {
+            WireCode::Internal
+        });
+        return result;
     };
     // `general_worker_ms`: everything this route does once it holds one
     // of its 48 permits — receive the body, check the raw cap, decode,
@@ -818,7 +844,9 @@ where
     RespOrTrailer: Into<WithTrailer<M::Response>>,
 {
     let span = crate::telemetry::server_span::<M>(&inbound.headers);
-    tracing::Instrument::instrument(
+    let call = CallSpan::new(span.clone());
+    let operation = call.clone();
+    let result = tracing::Instrument::instrument(
         async move {
             let Some(_permit) = route.permits.try_acquire() else {
                 let (mut send, _recv) = WireStream::split(inbound.stream);
@@ -828,6 +856,7 @@ where
                 ))
                 .await
                 .map_err(|error| TransportError::Io(format!("close-with-status: {error}")))?;
+                operation.finish(WireCode::ResourceExhausted);
                 return Ok(());
             };
 
@@ -843,9 +872,11 @@ where
             };
             if let Some(status) = raw_request_limit_status(req_bytes.len(), Some(max_request_bytes))
             {
+                let code = status.code;
                 send.close_send(Some(status.into()))
                     .await
                     .map_err(|error| TransportError::Io(format!("close-with-status: {error}")))?;
+                operation.finish(code);
                 return Ok(());
             }
             finish_unary_request(recv.as_mut().get_mut()).await?;
@@ -871,44 +902,17 @@ where
                     ms,
                 );
             }
-            match handled {
-                Ok(result) => {
-                    let WithTrailer { response, metadata } = result.into();
-                    let mut buf = BytesMut::with_capacity(response.encoded_len());
-                    response.encode(&mut buf).map_err(|error| {
-                        TransportError::Protocol(format!("prost encode: {error}"))
-                    })?;
-                    send.send_body(buf.freeze())
-                        .await
-                        .map_err(|error| TransportError::Io(format!("send: {error}")))?;
-                    let trailer = if metadata.is_empty() {
-                        Trailer::ok()
-                    } else {
-                        Trailer {
-                            status: WireCode::Ok,
-                            message: smol_str::SmolStr::new_static(""),
-                            metadata,
-                        }
-                    };
-                    crate::telemetry::record_status(&tracing::Span::current(), trailer.status);
-                    send.close_send(Some(trailer))
-                        .await
-                        .map_err(|error| TransportError::Io(format!("close: {error}")))?;
-                }
-                Err(status) => {
-                    crate::telemetry::record_status(&tracing::Span::current(), status.code);
-                    send.close_send(Some(status.into()))
-                        .await
-                        .map_err(|error| {
-                            TransportError::Io(format!("close-with-status: {error}"))
-                        })?;
-                }
-            }
-            Ok(())
+            write_unary_response(&mut send, handled.map(Into::into), &operation).await
         },
         span,
     )
-    .await
+    .await;
+    call.finish(if result.is_ok() {
+        WireCode::Ok
+    } else {
+        WireCode::Internal
+    });
+    result
 }
 
 /// Context-aware unary dispatch. This is used by connection-bound protocols
@@ -940,6 +944,66 @@ fn raw_request_limit_status(len: usize, max: Option<usize>) -> Option<WireStatus
     })
 }
 
+/// Every response writer records a terminal status only after its trailer
+/// was sent. The caller records transport errors and cancellation.
+async fn write_trailer<S: SendHalf>(
+    send: &mut S,
+    trailer: Trailer,
+    call: &CallSpan,
+) -> Result<(), TransportError> {
+    let code = trailer.status;
+    send.close_send(Some(trailer))
+        .await
+        .map_err(|error| TransportError::Io(format!("close: {error}")))?;
+    call.finish(code);
+    Ok(())
+}
+
+async fn write_unary_response<S: SendHalf, R: Message>(
+    send: &mut S,
+    result: Result<WithTrailer<R>, WireStatus>,
+    call: &CallSpan,
+) -> Result<(), TransportError> {
+    let trailer = match result {
+        Ok(WithTrailer { response, metadata }) => {
+            let mut buf = BytesMut::with_capacity(response.encoded_len());
+            response
+                .encode(&mut buf)
+                .map_err(|error| TransportError::Protocol(format!("prost encode: {error}")))?;
+            send.send_body(buf.freeze())
+                .await
+                .map_err(|error| TransportError::Io(format!("send: {error}")))?;
+            Trailer {
+                metadata,
+                ..Trailer::ok()
+            }
+        }
+        Err(status) => status.into(),
+    };
+    write_trailer(send, trailer, call).await
+}
+
+async fn write_streaming_response<S: SendHalf, R: Message>(
+    send: &mut S,
+    mut responses: impl futures_util::Stream<Item = Result<R, WireStatus>> + Unpin,
+    call: &CallSpan,
+) -> Result<(), TransportError> {
+    while let Some(response) = responses.next().await {
+        let response = match response {
+            Ok(response) => response,
+            Err(status) => return write_trailer(send, status.into(), call).await,
+        };
+        let mut buf = BytesMut::with_capacity(response.encoded_len());
+        response
+            .encode(&mut buf)
+            .map_err(|error| TransportError::Protocol(format!("prost encode: {error}")))?;
+        send.send_body(buf.freeze())
+            .await
+            .map_err(|error| TransportError::Io(format!("send: {error}")))?;
+    }
+    write_trailer(send, Trailer::ok(), call).await
+}
+
 async fn dispatch_unary_with_context_and_limit<T, M, F, Fut, RespOrTrailer>(
     inbound: hellas_wire::transport::Inbound<T::Stream>,
     max_request_bytes: Option<usize>,
@@ -955,7 +1019,9 @@ where
     RespOrTrailer: Into<WithTrailer<M::Response>>,
 {
     let span = crate::telemetry::server_span::<M>(&inbound.headers);
-    tracing::Instrument::instrument(
+    let call = CallSpan::new(span.clone());
+    let operation = call.clone();
+    let result = tracing::Instrument::instrument(
         async move {
             let context = inbound.context;
             let (mut send, recv) = WireStream::split(inbound.stream);
@@ -969,51 +1035,33 @@ where
                 None => return Err(TransportError::Protocol("empty unary request".into())),
             };
             if let Some(status) = raw_request_limit_status(req_bytes.len(), max_request_bytes) {
+                let code = status.code;
                 send.close_send(Some(status.into()))
                     .await
                     .map_err(|e| TransportError::Io(format!("close-with-status: {e}")))?;
+                operation.finish(code);
                 return Ok(());
             }
             finish_unary_request(recv.as_mut().get_mut()).await?;
             let request = M::Request::decode(&req_bytes[..])
                 .map_err(|e| TransportError::Protocol(format!("prost decode: {e}")))?;
 
-            match handler(request, context).await {
-                Ok(result) => {
-                    let WithTrailer { response, metadata } = result.into();
-                    let mut buf = BytesMut::with_capacity(response.encoded_len());
-                    response
-                        .encode(&mut buf)
-                        .map_err(|e| TransportError::Protocol(format!("prost encode: {e}")))?;
-                    send.send_body(buf.freeze())
-                        .await
-                        .map_err(|e| TransportError::Io(format!("send: {e}")))?;
-                    let trailer = if metadata.is_empty() {
-                        Trailer::ok()
-                    } else {
-                        Trailer {
-                            status: WireCode::Ok,
-                            message: smol_str::SmolStr::new_static(""),
-                            metadata,
-                        }
-                    };
-                    crate::telemetry::record_status(&tracing::Span::current(), trailer.status);
-                    send.close_send(Some(trailer))
-                        .await
-                        .map_err(|e| TransportError::Io(format!("close: {e}")))?;
-                }
-                Err(status) => {
-                    crate::telemetry::record_status(&tracing::Span::current(), status.code);
-                    send.close_send(Some(status.into()))
-                        .await
-                        .map_err(|e| TransportError::Io(format!("close-with-status: {e}")))?;
-                }
-            }
-            Ok(())
+            write_unary_response(
+                &mut send,
+                handler(request, context).await.map(Into::into),
+                &operation,
+            )
+            .await
         },
         span,
     )
-    .await
+    .await;
+    call.finish(if result.is_ok() {
+        WireCode::Ok
+    } else {
+        WireCode::Internal
+    });
+    result
 }
 
 const UNARY_RECEIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -1070,7 +1118,9 @@ where
     S: futures_util::Stream<Item = Result<M::Response, WireStatus>> + Send + Unpin,
 {
     let span = crate::telemetry::server_span::<M>(&inbound.headers);
-    tracing::Instrument::instrument(
+    let call = CallSpan::new(span.clone());
+    let operation = call.clone();
+    let result = tracing::Instrument::instrument(
         async move {
             let (mut send, recv) = WireStream::split(inbound.stream);
             let mut recv = Box::pin(recv);
@@ -1086,51 +1136,24 @@ where
             let request = M::Request::decode(&req_bytes[..])
                 .map_err(|e| TransportError::Protocol(format!("prost decode: {e}")))?;
 
-            let mut stream = match handler(request).await {
+            let stream = match handler(request).await {
                 Ok(s) => s,
                 Err(status) => {
-                    crate::telemetry::record_status(&tracing::Span::current(), status.code);
-                    send.close_send(Some(status.into()))
-                        .await
-                        .map_err(|e| TransportError::Io(format!("close-with-status: {e}")))?;
-                    return Ok(());
+                    return write_trailer(&mut send, status.into(), &operation).await;
                 }
             };
 
-            while let Some(item) = stream.next().await {
-                match item {
-                    Ok(response) => {
-                        let mut buf = BytesMut::with_capacity(response.encoded_len());
-                        response
-                            .encode(&mut buf)
-                            .map_err(|e| TransportError::Protocol(format!("prost encode: {e}")))?;
-                        send.send_body(buf.freeze())
-                            .await
-                            .map_err(|e| TransportError::Io(format!("send: {e}")))?;
-                    }
-                    Err(status) => {
-                        crate::telemetry::record_status(&tracing::Span::current(), status.code);
-                        send.close_send(Some(Trailer {
-                            status: status.code,
-                            message: status.message,
-                            metadata: status.metadata,
-                        }))
-                        .await
-                        .map_err(|e| TransportError::Io(format!("close-with-status: {e}")))?;
-                        return Ok(());
-                    }
-                }
-            }
-
-            crate::telemetry::record_status(&tracing::Span::current(), WireCode::Ok);
-            send.close_send(Some(Trailer::ok()))
-                .await
-                .map_err(|e| TransportError::Io(format!("close: {e}")))?;
-            Ok(())
+            write_streaming_response(&mut send, stream, &operation).await
         },
         span,
     )
-    .await
+    .await;
+    call.finish(if result.is_ok() {
+        WireCode::Ok
+    } else {
+        WireCode::Internal
+    });
+    result
 }
 
 /// Server-side helper for bidirectional streaming methods.
@@ -1151,59 +1174,35 @@ where
         std::error::Error + Send + Sync + 'static,
 {
     let span = crate::telemetry::server_span::<M>(&inbound.headers);
-    tracing::Instrument::instrument(
+    let call = CallSpan::new(span.clone());
+    let operation = call.clone();
+    let result = tracing::Instrument::instrument(
         async move {
             let (mut send, recv) = WireStream::split(inbound.stream);
-            let requests = RequestStream::new(recv);
-            let mut stream = match handler(requests).await {
+            let requests = RequestStream::new(recv, operation.clone());
+            let stream = match handler(requests).await {
                 Ok(s) => s,
                 Err(status) => {
-                    crate::telemetry::record_status(&tracing::Span::current(), status.code);
-                    send.close_send(Some(status.into()))
-                        .await
-                        .map_err(|e| TransportError::Io(format!("close-with-status: {e}")))?;
-                    return Ok(());
+                    return write_trailer(&mut send, status.into(), &operation).await;
                 }
             };
 
-            while let Some(item) = stream.next().await {
-                match item {
-                    Ok(response) => {
-                        let mut buf = BytesMut::with_capacity(response.encoded_len());
-                        response
-                            .encode(&mut buf)
-                            .map_err(|e| TransportError::Protocol(format!("prost encode: {e}")))?;
-                        send.send_body(buf.freeze())
-                            .await
-                            .map_err(|e| TransportError::Io(format!("send: {e}")))?;
-                    }
-                    Err(status) => {
-                        crate::telemetry::record_status(&tracing::Span::current(), status.code);
-                        send.close_send(Some(Trailer {
-                            status: status.code,
-                            message: status.message,
-                            metadata: status.metadata,
-                        }))
-                        .await
-                        .map_err(|e| TransportError::Io(format!("close-with-status: {e}")))?;
-                        return Ok(());
-                    }
-                }
-            }
-
-            crate::telemetry::record_status(&tracing::Span::current(), WireCode::Ok);
-            send.close_send(Some(Trailer::ok()))
-                .await
-                .map_err(|e| TransportError::Io(format!("close: {e}")))?;
-            Ok(())
+            write_streaming_response(&mut send, stream, &operation).await
         },
         span,
     )
-    .await
+    .await;
+    call.finish(if result.is_ok() {
+        WireCode::Ok
+    } else {
+        WireCode::Internal
+    });
+    result
 }
 
 /// Decoded request stream passed to bidirectional server handlers.
 pub struct RequestStream<Q> {
+    call: CallSpan,
     inner: Pin<Box<dyn ErasedRecv + Send>>,
     eof: bool,
     _q: PhantomData<Q>,
@@ -1212,12 +1211,13 @@ pub struct RequestStream<Q> {
 impl<Q> Unpin for RequestStream<Q> {}
 
 impl<Q> RequestStream<Q> {
-    fn new<H>(recv: H) -> Self
+    fn new<H>(recv: H, call: CallSpan) -> Self
     where
         H: RecvHalf + Unpin + Send + 'static,
         H::Error: std::error::Error + Send + Sync + 'static,
     {
         Self {
+            call,
             inner: Box::pin(RecvAdapter { recv }),
             eof: false,
             _q: PhantomData,
@@ -1236,19 +1236,31 @@ impl<Q: Message + Default> futures_core::Stream for RequestStream<Q> {
         match this.inner.as_mut().poll_chunk(cx) {
             Poll::Ready(Some(Ok(bytes))) => match Q::decode(&bytes[..]) {
                 Ok(msg) => Poll::Ready(Some(Ok(msg))),
-                Err(e) => Poll::Ready(Some(Err(WireStatus::internal(format!(
-                    "prost decode: {e}"
-                ))))),
+                Err(e) => {
+                    this.call.finish(WireCode::Internal);
+                    Poll::Ready(Some(Err(WireStatus::internal(format!(
+                        "prost decode: {e}"
+                    )))))
+                }
             },
-            Poll::Ready(Some(Err(s))) => Poll::Ready(Some(Err(s))),
+            Poll::Ready(Some(Err(s))) => {
+                this.call.finish(s.code);
+                Poll::Ready(Some(Err(s)))
+            }
             Poll::Ready(None) => {
                 this.eof = true;
                 match this.inner.take_trailer() {
                     Some(t) if t.status == WireCode::Ok => Poll::Ready(None),
-                    Some(t) => Poll::Ready(Some(Err(trailer_to_status(&t)))),
-                    None => Poll::Ready(Some(Err(WireStatus::internal(
-                        "request stream ended without terminal trailer",
-                    )))),
+                    Some(t) => {
+                        this.call.finish(t.status);
+                        Poll::Ready(Some(Err(trailer_to_status(&t))))
+                    }
+                    None => {
+                        this.call.finish(WireCode::Internal);
+                        Poll::Ready(Some(Err(WireStatus::internal(
+                            "request stream ended without terminal trailer",
+                        ))))
+                    }
                 }
             }
             Poll::Pending => Poll::Pending,
@@ -1323,7 +1335,7 @@ mod streaming_call_tests {
                 trailer,
             }),
             eof: false,
-            span: tracing::Span::none(),
+            call: CallSpan::new(tracing::Span::none()),
             _r: PhantomData,
         }
     }
@@ -1339,6 +1351,8 @@ mod streaming_call_tests {
         bodies: Arc<Mutex<Vec<Bytes>>>,
         close: Arc<Mutex<Option<Option<Trailer>>>>,
         reset: Arc<Mutex<Option<WireCode>>>,
+        fail_send: bool,
+        fail_close: bool,
     }
 
     struct MockSend {
@@ -1349,11 +1363,17 @@ mod streaming_call_tests {
         type Error = std::io::Error;
 
         async fn send_body(&mut self, payload: Bytes) -> Result<(), Self::Error> {
+            if self.state.fail_send {
+                return Err(std::io::Error::other("send failed"));
+            }
             self.state.bodies.lock().unwrap().push(payload);
             Ok(())
         }
 
         async fn close_send(&mut self, trailer: Option<Trailer>) -> Result<(), Self::Error> {
+            if self.state.fail_close {
+                return Err(std::io::Error::other("close failed"));
+            }
             *self.state.close.lock().unwrap() = Some(trailer);
             Ok(())
         }
@@ -1472,6 +1492,192 @@ mod streaming_call_tests {
             },
             state,
         )
+    }
+
+    #[cfg(feature = "otel")]
+    #[tokio::test]
+    async fn telemetry_records_transport_protocol_and_cancellation_failures() {
+        use opentelemetry::trace::{Status, TracerProvider};
+        use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+        use tracing::instrument::WithSubscriber;
+        use tracing_subscriber::prelude::*;
+
+        struct ReplyTransport(Mutex<Option<MockWireStream>>);
+        impl StreamTransport for ReplyTransport {
+            type Stream = MockWireStream;
+            type Error = std::io::Error;
+            async fn open(&self, _: u32, _: Metadata) -> Result<Self::Stream, Self::Error> {
+                Ok(self.0.lock().unwrap().take().unwrap())
+            }
+            async fn accept(
+                &self,
+            ) -> Result<Option<hellas_wire::Inbound<Self::Stream>>, Self::Error> {
+                Ok(None)
+            }
+        }
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let dispatch = tracing::Dispatch::new(
+            tracing_subscriber::registry()
+                .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("rpc-failures"))),
+        );
+        let expected = async {
+            let mut expected = Vec::new();
+            // Both malformed peer responses and transport write failures are errors.
+            for fail_send in [false, true] {
+                let (mut inbound, _) =
+                    route_inbound(Some(Bytes::from_static(&[0xff])), false, None);
+                inbound.stream.send.state.fail_send = fail_send;
+                let transport = ReplyTransport(Mutex::new(Some(inbound.stream)));
+                let error =
+                    unary::<_, MockMethod>(&transport, BytesMsg::default(), Metadata::new())
+                        .await
+                        .unwrap_err();
+                assert_eq!(error.code, WireCode::Internal);
+                expected.push("INTERNAL");
+            }
+            // A successful handler whose terminal write fails is not a successful RPC.
+            let (mut inbound, _) = route_inbound(
+                Some(BytesMsg::default().encode_to_vec().into()),
+                false,
+                None,
+            );
+            inbound.stream.send.state.fail_close = true;
+            assert!(
+                dispatch_unary::<MockTransport, MockMethod, _, _, BytesMsg>(
+                    inbound,
+                    |request| async { Ok(request) }
+                )
+                .await
+                .is_err()
+            );
+            expected.push("INTERNAL");
+            let (inbound, _) = route_inbound(Some(Bytes::from_static(&[0; 2])), false, None);
+            dispatch_unary_bounded::<MockTransport, MockMethod, _, _, BytesMsg>(
+                inbound,
+                1,
+                |_| async { panic!("oversized request reached handler") },
+            )
+            .await
+            .unwrap();
+            expected.push("INVALID_ARGUMENT");
+
+            for (chunks, trailer, poll) in [
+                (vec![], None, true),
+                (
+                    vec![Ok(Bytes::from_static(&[0xff]))],
+                    Some(Trailer::ok()),
+                    true,
+                ),
+                (vec![], Some(Trailer::ok()), false),
+                (
+                    vec![Err(WireStatus::new(
+                        WireCode::DataLoss,
+                        "private peer detail",
+                    ))],
+                    Some(Trailer::ok()),
+                    true,
+                ),
+            ] {
+                let mut response = call(chunks, trailer);
+                response.call = CallSpan::new(crate::telemetry::client_span::<MockMethod>());
+                if poll {
+                    while response.next().await.is_some() {}
+                    let _ = response.finish();
+                } else {
+                    drop(response);
+                }
+            }
+            expected.extend(["INTERNAL", "INTERNAL", "CANCELLED", "DATA_LOSS"]);
+
+            // The request and response halves share one terminal observation.
+            // A cancelled sender cannot later become OK; dropping an already
+            // successful call's sender cannot turn success into cancellation.
+            for finish_first in [false, true] {
+                let observer = CallSpan::new(crate::telemetry::client_span::<MockMethod>());
+                let mut response = call(vec![], Some(Trailer::ok()));
+                response.call = observer.clone();
+                let sink = StreamingSink::<U32Msg>::new(
+                    MockSend {
+                        state: MockSendState::default(),
+                    },
+                    observer,
+                );
+                assert!(response.next().await.is_none());
+                if finish_first {
+                    response.finish().unwrap();
+                    drop(sink);
+                    expected.push("OK");
+                } else {
+                    drop(sink);
+                    response.finish().unwrap();
+                    expected.push("CANCELLED");
+                }
+            }
+            let route = WorkResponseRoute::default();
+            let _permits: Vec<_> = (0..16)
+                .map(|_| route.permits.try_acquire().unwrap())
+                .collect();
+            let (inbound, _) = route_inbound(None, true, None);
+            dispatch_work_response_bounded::<MockTransport, MockMethod, _, _, BytesMsg>(
+                inbound,
+                &route,
+                1,
+                |_| async { panic!("full route ran handler") },
+            )
+            .await
+            .unwrap();
+            expected.push("RESOURCE_EXHAUSTED");
+            let route = GeneralSubmitRoute::default();
+            let _permits: Vec<_> = (0..48)
+                .map(|_| route.permits.try_acquire().unwrap())
+                .collect();
+            let (inbound, _) = route_inbound(None, true, None);
+            dispatch_general_submit_bounded::<MockTransport, MockMethod, _, _, BytesMsg>(
+                inbound,
+                &route,
+                1,
+                |_, _| async { panic!("full route ran handler") },
+            )
+            .await
+            .unwrap();
+            expected.push("RESOURCE_EXHAUSTED");
+
+            // Cancelling an in-flight handler before it has a request is observed.
+            let (inbound, _) = route_inbound(None, true, None);
+            let mut pending =
+                Box::pin(dispatch_unary::<MockTransport, MockMethod, _, _, BytesMsg>(
+                    inbound,
+                    |request| async { Ok(request) },
+                ));
+            assert!(futures_util::poll!(&mut pending).is_pending());
+            drop(pending);
+            expected.push("CANCELLED");
+            expected
+        }
+        .with_subscriber(dispatch)
+        .await;
+        provider.force_flush().unwrap();
+        let spans = exporter.get_finished_spans().unwrap();
+        assert_eq!(spans.len(), expected.len());
+        for (span, expected) in spans.iter().zip(expected) {
+            assert_eq!(
+                matches!(span.status, Status::Error { .. }),
+                expected != "OK",
+                "{span:?}"
+            );
+            assert!(
+                span.attributes
+                    .iter()
+                    .any(|kv| kv.key.as_str() == "rpc.response.status_code"
+                        && kv.value == opentelemetry::Value::from(expected)),
+                "{span:?}"
+            );
+            assert!(!format!("{span:?}").contains("private peer detail"));
+        }
+        provider.shutdown().unwrap();
     }
 
     #[tokio::test]
@@ -1610,6 +1816,7 @@ mod streaming_call_tests {
     #[tokio::test]
     async fn request_stream_decodes_body_frames() {
         let mut stream = RequestStream {
+            call: CallSpan::new(tracing::Span::none()),
             inner: Box::pin(MockRecv {
                 chunks: vec![Ok(body(21))].into(),
                 trailer: Some(Trailer::ok()),
@@ -1625,6 +1832,7 @@ mod streaming_call_tests {
     #[tokio::test]
     async fn request_stream_surfaces_terminal_error() {
         let mut stream = RequestStream {
+            call: CallSpan::new(tracing::Span::none()),
             inner: Box::pin(MockRecv {
                 chunks: VecDeque::new(),
                 trailer: Some(Trailer::from_status(WireCode::Cancelled, "client closed")),
@@ -1642,9 +1850,12 @@ mod streaming_call_tests {
     #[tokio::test]
     async fn streaming_sink_encodes_requests_and_closes() {
         let state = MockSendState::default();
-        let mut sink = StreamingSink::<U32Msg>::new(MockSend {
-            state: state.clone(),
-        });
+        let mut sink = StreamingSink::<U32Msg>::new(
+            MockSend {
+                state: state.clone(),
+            },
+            CallSpan::new(tracing::Span::none()),
+        );
 
         sink.send(U32Msg { x: 34 }).await.unwrap();
         sink.close().await.unwrap();

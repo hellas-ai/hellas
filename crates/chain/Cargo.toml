@@ -72,6 +72,7 @@ explorer-origin = [
     "axum/ws",
     "dep:redb",
     "hellas-kernel/webauthn",
+    "hellas-rpc/http-tracing",
 ]
 verified-explorer = ["block-view", "dep:serde", "dep:hex", "dep:prost"]
 indexer = [

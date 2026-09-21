@@ -1,8 +1,6 @@
-// Adapted from catgrad-llm ac0e432 (MIT); model-independent chat parsing.
-//! Reusable sentinel-bounded tool-call parser engine.
-//!
-//! The engine buffers sentinel-delimited payloads, passes them to a codec,
-//! and validates each call against the supplied tool directory before emitting it.
+// Adapted from catgrad-llm ac0e432 (MIT).
+//! Paired-sentinel parsing shared by Qwen3 JSON and Qwen3.5 XML tool calls.
+//! A complete call is validated before any of its events leave the parser.
 
 use std::sync::Arc;
 
@@ -51,42 +49,12 @@ pub trait PayloadCodec: Send {
     fn parse(&self, payload: &str) -> CodecOutcome;
 }
 
-/// How the wire frames each tool-call block.
-#[derive(Debug, Clone, Copy)]
-pub enum SentinelKind {
-    /// `<open>...payload...<close>` — payload boundary is mid-stream.
-    Pair {
-        open: &'static str,
-        close: &'static str,
-    },
-    /// `<open>...payload...EOS` — payload drains on `finish()`. No
-    /// closing marker; everything after `open` belongs to the payload.
-    Prefix { open: &'static str },
-}
-
-impl SentinelKind {
-    fn open(&self) -> &'static str {
-        match self {
-            Self::Pair { open, .. } => open,
-            Self::Prefix { open } => open,
-        }
-    }
-    fn close(&self) -> Option<&'static str> {
-        match self {
-            Self::Pair { close, .. } => Some(close),
-            Self::Prefix { .. } => None,
-        }
-    }
-}
-
 enum State {
     /// Watching for the opening sentinel.
     Outside { matcher: SentinelMatcher },
-    /// Inside an open block. `close` is `Some` for Pair (still scanning
-    /// for the close sentinel) and `None` for Prefix (draining at
-    /// `finish()`).
+    /// Buffer a call until its closing sentinel arrives.
     Inside {
-        close: Option<SentinelMatcher>,
+        close: SentinelMatcher,
         payload: String,
     },
     /// A fatal error has been emitted; subsequent calls return empty.
@@ -96,47 +64,29 @@ enum State {
 pub struct SentinelEngine {
     directory: Arc<ToolDirectory>,
     codec: Box<dyn PayloadCodec>,
-    sentinel: SentinelKind,
+    open: &'static str,
+    close: &'static str,
     state: State,
     next_index: usize,
 }
 
 impl SentinelEngine {
-    pub fn new(
-        directory: Arc<ToolDirectory>,
-        codec: Box<dyn PayloadCodec>,
-        sentinel: SentinelKind,
-    ) -> Self {
-        let matcher = SentinelMatcher::new(sentinel.open());
-        Self {
-            directory,
-            codec,
-            sentinel,
-            state: State::Outside { matcher },
-            next_index: 0,
-        }
-    }
-
-    /// Convenience: paired-sentinel engine. `open` and `close` are
-    /// independent strings (Gemma-4's `<|tool_call>` / `<tool_call|>`
-    /// pair is asymmetric and intentional).
     pub fn new_pair(
         directory: Arc<ToolDirectory>,
         codec: Box<dyn PayloadCodec>,
         open: &'static str,
         close: &'static str,
     ) -> Self {
-        Self::new(directory, codec, SentinelKind::Pair { open, close })
-    }
-
-    /// Convenience: prefix-only-sentinel engine. Payload drains on
-    /// `finish()` because the wire has no closing marker.
-    pub fn new_prefix(
-        directory: Arc<ToolDirectory>,
-        codec: Box<dyn PayloadCodec>,
-        open: &'static str,
-    ) -> Self {
-        Self::new(directory, codec, SentinelKind::Prefix { open })
+        Self {
+            directory,
+            codec,
+            open,
+            close,
+            state: State::Outside {
+                matcher: SentinelMatcher::new(open),
+            },
+            next_index: 0,
+        }
     }
 
     /// Construct the post-fatal events: the supplied error event, then
@@ -159,17 +109,13 @@ impl SentinelEngine {
         let mut events = Vec::new();
         for call in calls {
             if self.directory.lookup(&call.name).is_none() {
-                events.extend(self.fatal(DecodeEvent::UnknownTool {
-                    name: call.name,
-                    raw_args: call.args,
-                }));
+                events.extend(self.fatal(DecodeEvent::UnknownTool { name: call.name }));
                 return events;
             }
             let errors = self.directory.validate_args(&call.name, &call.args);
             if !errors.is_empty() {
                 events.extend(self.fatal(DecodeEvent::InvalidArgs {
                     name: call.name,
-                    args: call.args,
                     errors,
                 }));
                 return events;
@@ -193,11 +139,10 @@ impl SentinelEngine {
         events
     }
 
-    /// Drain a complete payload through the codec + validator. Called
-    /// when a close sentinel commits (Pair) or at `finish()` (Prefix).
+    /// Decode and validate a complete payload.
     fn drain_payload(&mut self, payload: String) -> Vec<DecodeEvent> {
         let outcome = self.codec.parse(&payload);
-        let sentinel_label = self.sentinel.open();
+        let sentinel_label = self.open;
         match outcome {
             CodecOutcome::Calls(calls) => self.validate_and_emit(calls),
             CodecOutcome::PartialThenError { calls, error } => {
@@ -226,62 +171,44 @@ impl SentinelEngine {
         let State::Inside { close, payload } = &mut self.state else {
             return InsideStep::StateChanged(input);
         };
-        match close {
-            Some(close_matcher) => {
-                close_matcher.push(&input);
-                input.clear();
-                if let Some((before, after)) = close_matcher.try_match() {
-                    payload.push_str(&before);
-                    if payload.len() > MAX_TOOL_CALL_PAYLOAD_BYTES {
-                        events.extend(self.fatal(DecodeEvent::ParseError {
-                            sentinel: self.sentinel.open(),
-                            source: ParserError::PayloadTooLarge {
-                                limit_bytes: MAX_TOOL_CALL_PAYLOAD_BYTES,
-                            },
-                        }));
-                        return InsideStep::Done;
-                    }
-                    let payload_owned = std::mem::take(payload);
-                    // Reset to Outside before draining so any
-                    // fatal transition during drain leaves us
-                    // Terminated, not Inside.
-                    self.state = State::Outside {
-                        matcher: SentinelMatcher::new(self.sentinel.open()),
-                    };
-                    events.extend(self.drain_payload(payload_owned));
-                    if matches!(self.state, State::Terminated) {
-                        return InsideStep::Done;
-                    }
-                    InsideStep::StateChanged(after)
-                } else {
-                    let safe = close_matcher.flush_safe_text();
-                    payload.push_str(&safe);
-                    if payload.len() > MAX_TOOL_CALL_PAYLOAD_BYTES {
-                        events.extend(self.fatal(DecodeEvent::ParseError {
-                            sentinel: self.sentinel.open(),
-                            source: ParserError::PayloadTooLarge {
-                                limit_bytes: MAX_TOOL_CALL_PAYLOAD_BYTES,
-                            },
-                        }));
-                        return InsideStep::Done;
-                    }
-                    InsideStep::Done
-                }
+        close.push(&input);
+        input.clear();
+        if let Some((before, after)) = close.try_match() {
+            payload.push_str(&before);
+            if payload.len() > MAX_TOOL_CALL_PAYLOAD_BYTES {
+                events.extend(self.fatal(DecodeEvent::ParseError {
+                    sentinel: self.open,
+                    source: ParserError::PayloadTooLarge {
+                        limit_bytes: MAX_TOOL_CALL_PAYLOAD_BYTES,
+                    },
+                }));
+                return InsideStep::Done;
             }
-            None => {
-                payload.push_str(&input);
-                input.clear();
-                if payload.len() > MAX_TOOL_CALL_PAYLOAD_BYTES {
-                    events.extend(self.fatal(DecodeEvent::ParseError {
-                        sentinel: self.sentinel.open(),
-                        source: ParserError::PayloadTooLarge {
-                            limit_bytes: MAX_TOOL_CALL_PAYLOAD_BYTES,
-                        },
-                    }));
-                    return InsideStep::Done;
-                }
-                InsideStep::Done
+            let payload_owned = std::mem::take(payload);
+            // Reset to Outside before draining so any
+            // fatal transition during drain leaves us
+            // Terminated, not Inside.
+            self.state = State::Outside {
+                matcher: SentinelMatcher::new(self.open),
+            };
+            events.extend(self.drain_payload(payload_owned));
+            if matches!(self.state, State::Terminated) {
+                return InsideStep::Done;
             }
+            InsideStep::StateChanged(after)
+        } else {
+            let safe = close.flush_safe_text();
+            payload.push_str(&safe);
+            if payload.len() > MAX_TOOL_CALL_PAYLOAD_BYTES {
+                events.extend(self.fatal(DecodeEvent::ParseError {
+                    sentinel: self.open,
+                    source: ParserError::PayloadTooLarge {
+                        limit_bytes: MAX_TOOL_CALL_PAYLOAD_BYTES,
+                    },
+                }));
+                return InsideStep::Done;
+            }
+            InsideStep::Done
         }
     }
 }
@@ -310,8 +237,8 @@ impl IncrementalToolCallParser for SentinelEngine {
                             events.push(DecodeEvent::TextDelta(before));
                         }
                         // Transition to Inside with an empty buffer +
-                        // a fresh close matcher (Pair only).
-                        let close = self.sentinel.close().map(SentinelMatcher::new);
+                        // a fresh close matcher.
+                        let close = SentinelMatcher::new(self.close);
                         self.state = State::Inside {
                             close,
                             payload: String::new(),
@@ -358,28 +285,11 @@ impl IncrementalToolCallParser for SentinelEngine {
                 }
                 events.push(DecodeEvent::Stop { reason });
             }
-            State::Inside { close, payload } => {
-                let payload_owned = std::mem::take(payload);
-                match close {
-                    Some(_) => {
-                        // Pair shape: open seen but close never arrived.
-                        // Per protocol contract this is a fatal
-                        // Unterminated error, not "drain whatever's
-                        // there as a payload."
-                        events.extend(self.fatal(DecodeEvent::ParseError {
-                            sentinel: self.sentinel.open(),
-                            source: ParserError::Unterminated,
-                        }));
-                    }
-                    None => {
-                        // Prefix shape: drain the buffered payload
-                        // through the codec.
-                        events.extend(self.drain_payload(payload_owned));
-                        if !matches!(self.state, State::Terminated) {
-                            events.push(DecodeEvent::Stop { reason });
-                        }
-                    }
-                }
+            State::Inside { .. } => {
+                events.extend(self.fatal(DecodeEvent::ParseError {
+                    sentinel: self.open,
+                    source: ParserError::Unterminated,
+                }));
             }
             State::Terminated => unreachable!("checked above"),
         }
