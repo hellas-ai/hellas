@@ -564,8 +564,8 @@ The `otel` Cargo feature is opt-in across the CLI (including Fetch, node,
 gateway, indexer and validator commands). Default Nix packages, including
 public musl builds, disable Hellas telemetry exporters. Request instrumentation
 uses shared enabled/no-op implementations; ordinary operational logs remain.
-The upstream Commonware dependency still includes its telemetry SDK dependencies;
-disabling `otel` does not remove those transitive crates.
+Transitive dependencies still include metrics collection and telemetry SDK crates;
+disabling `otel` does not remove those dependencies.
 
 The exported NixOS, nix-darwin and Home Manager modules share `otel` options:
 
