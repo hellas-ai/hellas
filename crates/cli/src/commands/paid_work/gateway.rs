@@ -13,6 +13,7 @@ use hellas_rpc::protocol::artifacts::{
 use serde::Deserialize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tokio::task::JoinHandle;
 use tracing::Instrument;
@@ -47,6 +48,7 @@ const fn timeout_secs() -> u64 {
 // An OpenCode conversation has a substantial shared chat prefix. Smaller
 // checkpoints are not worth routing work around.
 const MIN_CACHE_AFFINITY_TOKENS: usize = 128;
+const UNREACHABLE_PROVIDER_BACKOFF: Duration = Duration::from_secs(30);
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -68,6 +70,31 @@ struct Provider {
     serial: AsyncMutex<Option<OpenPaidChannel>>,
     pending: AtomicUsize,
     cache: Mutex<PrefixCache>,
+    unavailable_until: Mutex<Option<Instant>>,
+}
+
+impl Provider {
+    fn available(&self) -> bool {
+        self.unavailable_until
+            .lock()
+            .expect("provider availability poisoned")
+            .is_none_or(|until| until <= Instant::now())
+    }
+
+    fn connection_failed(&self) {
+        *self
+            .unavailable_until
+            .lock()
+            .expect("provider availability poisoned") =
+            Some(Instant::now() + UNREACHABLE_PROVIDER_BACKOFF);
+    }
+
+    fn connection_succeeded(&self) {
+        *self
+            .unavailable_until
+            .lock()
+            .expect("provider availability poisoned") = None;
+    }
 }
 
 #[derive(Default)]
@@ -138,17 +165,29 @@ fn shared_prefix_len(left: &[u32], right: &[u32]) -> usize {
 
 #[derive(Clone, Copy)]
 struct Route {
+    available: bool,
     cache_affinity_tokens: usize,
     pending: usize,
 }
 
 impl Route {
-    fn score(self) -> (usize, std::cmp::Reverse<usize>) {
-        (self.cache_affinity_tokens, std::cmp::Reverse(self.pending))
+    fn score(self) -> (bool, usize, std::cmp::Reverse<usize>) {
+        (
+            self.available,
+            self.cache_affinity_tokens,
+            std::cmp::Reverse(self.pending),
+        )
     }
 }
 
 struct ProviderUse(Arc<Provider>);
+impl ProviderUse {
+    fn new(provider: Arc<Provider>) -> Self {
+        provider.pending.fetch_add(1, Ordering::Relaxed);
+        Self(provider)
+    }
+}
+
 impl Drop for ProviderUse {
     fn drop(&mut self) {
         self.0.pending.fetch_sub(1, Ordering::Relaxed);
@@ -237,6 +276,7 @@ pub async fn load_gateway_backend(
             serial: AsyncMutex::new(None),
             pending: AtomicUsize::new(0),
             cache: Mutex::new(PrefixCache::default()),
+            unavailable_until: Mutex::new(None),
         }));
     }
     let gateway = Arc::new(PaidGateway {
@@ -252,7 +292,18 @@ pub async fn load_gateway_backend(
     // Restart recovery uses the retained input and certificate, never a new job.
     // Empty journal roots do not fund a channel until an HTTP request arrives.
     for provider in &gateway.providers {
-        let _recovery = gateway.submit(provider.clone(), None, None, None);
+        let _recovery = gateway.submit(
+            vec![(
+                provider.clone(),
+                Route {
+                    available: true,
+                    cache_affinity_tokens: 0,
+                    pending: 0,
+                },
+            )],
+            None,
+            None,
+        );
         let provider = provider.clone();
         gateway.followers.lock().expect("paid followers poisoned").push(tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(1));
@@ -272,26 +323,28 @@ pub async fn load_gateway_backend(
 impl PaidGateway {
     fn submit(
         &self,
-        provider: Arc<Provider>,
+        candidates: Vec<(Arc<Provider>, Route)>,
         prepared: Option<PreparedPaidInputV1>,
-        _route: Option<Route>,
         cache_update: Option<CacheUpdate>,
     ) -> BoxStream<'static, CliResult<ExecutionEvent>> {
         let endpoint = self.endpoint.clone();
         let settlement_key = self.settlement_key.clone();
         let (sender, receiver) = mpsc::unbounded_channel();
+        let (initial_provider, _initial_route) = candidates.first().expect("paid provider exists");
         let span = hellas_rpc::request_span!(
             target: "hellas_request", "paid.gateway",
-            hellas.provider.id = %provider.args.provider,
+            hellas.provider.id = %initial_provider.args.provider,
             hellas.work.recovery = prepared.is_none(),
-            hellas.route.cache_affinity_tokens = _route.map_or(0, |route| route.cache_affinity_tokens),
-            hellas.route.pending = _route.map_or(0, |route| route.pending),
+            hellas.route.cache_affinity_tokens = _initial_route.cache_affinity_tokens,
+            hellas.route.pending = _initial_route.pending,
         );
-        let occupied = prepared.as_ref().map(|_| ProviderUse(provider.clone()));
+        // Reserve the first route synchronously so concurrent HTTP requests see
+        // both queued and executing work. Each failed candidate releases its slot.
+        let mut occupied = prepared
+            .as_ref()
+            .map(|_| ProviderUse::new(initial_provider.clone()));
+        let task_span = span.clone();
         let task = tokio::spawn(async move {
-            let _occupied = occupied;
-            let mut session = provider.serial.lock().instrument(hellas_rpc::request_span!(target: "hellas_request", "paid.queue")).await;
-            let timeout = Duration::from_secs(provider.args.timeout_secs);
             let token_sender = sender.clone();
             let streamed = prepared.is_some();
             let progress: hellas_work::work::PaidProgress = Arc::new(move |event| {
@@ -301,33 +354,75 @@ impl PaidGateway {
                 let _ = token_sender.send(Ok(ExecutionEvent::Chunk { position, tokens: delta.token_bytes() }));
                 Ok(())
             });
-            let result = tokio::time::timeout(
-                timeout,
-                async {
+            let result = async {
+                let mut open_errors = Vec::new();
+                for (provider, route) in candidates {
+                    let _occupied = occupied.take().or_else(|| {
+                        prepared.as_ref().map(|_| ProviderUse::new(provider.clone()))
+                    });
+                    task_span.record("hellas.provider.id", tracing::field::display(provider.args.provider));
+                    task_span.record("hellas.route.cache_affinity_tokens", route.cache_affinity_tokens);
+                    task_span.record("hellas.route.pending", route.pending);
+                    let mut session = provider.serial.lock().instrument(hellas_rpc::request_span!(target: "hellas_request", "paid.queue")).await;
                     if prepared.is_none() && (!provider.args.journal_root.try_exists()? || std::fs::read_dir(&provider.args.journal_root)?.next().is_none()) {
-                        return Ok(None);
+                        return Ok(Vec::new());
                     }
+                    let timeout = Duration::from_secs(provider.args.timeout_secs);
+                    let deadline = tokio::time::Instant::now() + timeout;
                     if session.is_none() {
-                        *session = Some(OpenPaidChannel::open(provider.args.clone(), endpoint, settlement_key).await?);
+                        // Recheck after queueing: an earlier request may have just
+                        // discovered this provider is unreachable.
+                        if !provider.available() {
+                            open_errors.push(format!("{}: channel opening is backing off", provider.args.provider));
+                            continue;
+                        }
+                        match tokio::time::timeout_at(
+                            deadline,
+                            OpenPaidChannel::open(provider.args.clone(), endpoint.clone(), settlement_key.clone()),
+                        ).await
+                            .map_err(|_| anyhow::anyhow!("paid provider connection exceeded its {timeout:?} limit"))
+                            .and_then(|result| result)
+                        {
+                            Ok(opened) => {
+                                *session = Some(opened);
+                                provider.connection_succeeded();
+                            }
+                            Err(error) => {
+                                provider.connection_failed();
+                                tracing::warn!(provider = %provider.args.provider, error = %format!("{error:#}"),
+                                    "paid provider channel could not be opened");
+                                open_errors.push(format!("{}: {error:#}", provider.args.provider));
+                                continue;
+                            }
+                        }
                     }
-                    session.as_mut().expect("channel was opened").run(prepared, true, streamed.then_some(progress)).await
-                },
-            )
-            .await
-            .map_err(|_| anyhow::anyhow!("paid execution exceeded its {timeout:?} limit"))
-            .and_then(|result| result)
-            .and_then(|output| output.map(output_events).transpose())
-            .map(Option::unwrap_or_default);
-            if let Some(cache_update) = cache_update {
-                let mut cache = provider.cache.lock().expect("provider cache poisoned");
-                if result.is_ok() {
-                    cache_update.apply(&mut cache);
-                } else {
-                    cache.replace(None);
+                    // Opening a channel cannot admit this request. Once run starts,
+                    // keep its journal with this provider even if the response is lost.
+                    let result = tokio::time::timeout_at(
+                        deadline,
+                        session.as_mut().expect("channel was opened").run(prepared, true, streamed.then_some(progress)),
+                    ).await
+                        .map_err(|_| anyhow::anyhow!("paid execution exceeded its {timeout:?} limit"))
+                        .and_then(|result| result)
+                        .and_then(|output| output.map(output_events).transpose())
+                        .map(Option::unwrap_or_default);
+                    if let Some(cache_update) = cache_update {
+                        let mut cache = provider.cache.lock().expect("provider cache poisoned");
+                        if result.is_ok() {
+                            cache_update.apply(&mut cache);
+                        } else {
+                            cache.replace(None);
+                        }
+                    }
+                    return result.with_context(|| format!("paid provider {}", provider.args.provider));
                 }
-            }
+                Err(anyhow::anyhow!(
+                    "no eligible paid provider could establish a channel: {}",
+                    open_errors.join("; ")
+                ))
+            }.await;
             if let Err(error) = &result {
-                tracing::error!(provider = %provider.args.provider, error = %format!("{error:#}"),
+                tracing::error!(error = %format!("{error:#}"),
                     "paid gateway operation failed; durable journals retained for recovery");
             }
             // Dropping an HTTP request drops only its receiver. The task still
@@ -369,21 +464,21 @@ impl PaidExecutionBackend for PaidGateway {
             "no provider policy matches this environment, token limit, and stop token list"
         );
         let start = self.next.fetch_add(1, Ordering::Relaxed) % eligible.len();
-        let (provider, route) = (0..eligible.len())
+        let mut candidates = (0..eligible.len())
             .map(|offset| {
                 let provider = eligible[(start + offset) % eligible.len()];
                 let cache = provider.cache.lock().expect("provider cache poisoned");
                 let route = Route {
+                    available: provider.available(),
                     cache_affinity_tokens: cache.affinity(&input_ids),
                     pending: provider.pending.load(Ordering::Relaxed),
                 };
-                (provider, route)
+                (provider.clone(), route)
             })
-            .max_by_key(|(_, route)| route.score())
-            .expect("eligible provider exists");
-        let provider = provider.clone();
-        provider.pending.fetch_add(1, Ordering::Relaxed);
-        Ok(self.submit(provider, Some(prepared), Some(route), Some(cache_update)))
+            .collect::<Vec<_>>();
+        // Stable sorting preserves the rotating order for equally ranked routes.
+        candidates.sort_by_key(|(_, route)| std::cmp::Reverse(route.score()));
+        Ok(self.submit(candidates, Some(prepared), Some(cache_update)))
     }
 
     fn drain(&self) -> BoxFuture<'_, ()> {
