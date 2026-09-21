@@ -279,6 +279,7 @@ mod tests {
         );
         let (sender, _receiver) = tokio::sync::mpsc::channel(4);
         let job = ExecuteJob {
+            span: tracing::Span::none(),
             cache_recording: options.recording().unwrap(),
             output_cache: options,
             execution_id: "cached".into(),

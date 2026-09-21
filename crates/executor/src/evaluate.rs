@@ -506,11 +506,7 @@ impl EvaluateEngine {
         invocation: &Invocation,
     ) -> Result<(), ExecutorError> {
         self.gpu_config
-            .validate_invocation_resources(
-                invocation,
-                source.environment().state_bytes_per_capacity(),
-                source.environment().vocabulary_size(),
-            )
+            .validate_environment_invocation_resources(invocation, source.environment())
             .map_err(|error| {
                 ExecutorError::InvalidQuoteRequest(format!(
                     "environment {} exceeds the provider GPU resource envelope: {error}",
@@ -699,6 +695,7 @@ impl EvaluateEngine {
                 .recording()
                 .map_err(|error| ExecutorError::ArtifactStore(error.to_string()))?,
             output_cache: self.output_cache.clone(),
+            span: tracing::Span::current(),
             execution_id: execution_id.clone(),
             request_commitment,
             evaluate_request,
@@ -1180,6 +1177,10 @@ pub(crate) mod environment_admission_tests {
 
     impl EnvironmentFixture {
         pub(crate) fn new() -> Self {
+            Self::with_generation_capacity(1_024)
+        }
+
+        fn with_generation_capacity(fixed_capacity: u64) -> Self {
             let scratch = Scratch::new();
             let store = ContentStore::new();
             let program_path = scratch.write("model.hex", b"fn model() { return; }");
@@ -1196,6 +1197,10 @@ pub(crate) mod environment_admission_tests {
                 vec![4],
                 256,
                 1_024,
+                hellas_rpc::CausalLmGenerationSchedule {
+                    fixed_capacity,
+                    prefill_chunk_tokens: u32::try_from(fixed_capacity.min(64)).unwrap(),
+                },
             )
             .expect("valid environment");
             let environment_path =
@@ -1232,6 +1237,10 @@ pub(crate) mod environment_admission_tests {
                 vec![4],
                 256,
                 1_024,
+                hellas_rpc::CausalLmGenerationSchedule {
+                    fixed_capacity: 1_024,
+                    prefill_chunk_tokens: 64,
+                },
             )
             .expect("valid distinct environment");
             let environment_path = self._scratch.write(
@@ -1325,6 +1334,7 @@ pub(crate) mod environment_admission_tests {
         ExecuteJob {
             cache_recording: None,
             output_cache: Default::default(),
+            span: tracing::Span::none(),
             execution_id: execution_id.to_string(),
             request_commitment: request_commitment(index.into()),
             evaluate_request,
@@ -1538,7 +1548,7 @@ pub(crate) mod environment_admission_tests {
 
     #[tokio::test]
     async fn courtesy_quote_rejects_provider_capacity_and_state_envelopes() {
-        let fixture = EnvironmentFixture::new();
+        let fixture = EnvironmentFixture::with_generation_capacity(4);
         for (gpu_config, expected) in [
             (
                 GpuConfig::new(
@@ -1562,7 +1572,7 @@ pub(crate) mod environment_admission_tests {
                     Duration::from_secs(1),
                 )
                 .unwrap(),
-                "1080 minimum generation device bytes",
+                "minimum generation device bytes",
             ),
         ] {
             let mut engine = engine(fixture.store.clone(), gpu_config);

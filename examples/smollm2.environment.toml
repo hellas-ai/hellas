@@ -283,3 +283,7 @@ static_inputs = [
   { object = 0, offset = 212419016, bytes = 1769472 },
   { object = 0, offset = 269059400, bytes = 1152 },
 ]
+
+[generation]
+fixed_capacity = 8192
+prefill_chunk_tokens = 64
