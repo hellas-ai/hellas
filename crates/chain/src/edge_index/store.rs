@@ -3,7 +3,7 @@
 use super::types::TransactionRef;
 use crate::{
     domain::{Digest, Object, Transaction},
-    verified_explorer::ProofBundle,
+    proof_verify::ProofBundle,
 };
 use commonware_codec::{DecodeExt as _, Encode as _};
 use commonware_consensus::{Block as _, Heightable as _};
@@ -205,7 +205,7 @@ impl IndexStore {
             let mut events = write.open_table(EVENTS)?;
             for (index, transaction) in block.txs().iter().enumerate() {
                 let transaction_digest =
-                    hex::encode(crate::verified_explorer::transaction_digest(transaction));
+                    hex::encode(crate::proof_verify::transaction_digest(transaction));
                 write
                     .open_table(TRANSACTIONS)?
                     .insert(transaction_digest.as_str(), height)?;
@@ -463,7 +463,7 @@ fn transaction_at(block: &crate::HellasBlock, reference: &TransactionRef) -> Res
         .ok_or("transaction locator is out of range")?;
     if block.height().get() != reference.height
         || hex::encode(block.digest()) != reference.payload
-        || hex::encode(crate::verified_explorer::transaction_digest(transaction))
+        || hex::encode(crate::proof_verify::transaction_digest(transaction))
             != reference.transaction_digest
     {
         return Err("transaction locator differs from canonical block".into());

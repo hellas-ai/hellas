@@ -1,7 +1,7 @@
 use crate::domain::{Object, ObjectId};
 use commonware_cryptography::{Sha256, sha256::Digest};
 use commonware_glue::stateful::db::ManagedDb;
-#[cfg(any(feature = "validator", feature = "explorer-origin"))]
+#[cfg(any(feature = "validator", feature = "indexer-api"))]
 use commonware_glue::stateful::db::Shared;
 use commonware_parallel::Sequential;
 use commonware_runtime::{BufferPooler, Spawner, buffer::paged::CacheRef};
@@ -20,7 +20,7 @@ pub type UtxoDb<E> = AnyFixedDb<mmr::Family, E, ObjectId, Object, Sha256, EightC
 /// alias is crate-internal — and only the `validator` build executes
 /// transactions against it. An `indexer` build reads blocks, it does not
 /// replay them.
-#[cfg(any(feature = "validator", feature = "explorer-origin"))]
+#[cfg(any(feature = "validator", feature = "indexer-api"))]
 pub type UtxoDatabase<E> = Shared<UtxoDb<E>>;
 pub type UtxoDbConfig = FixedConfig<EightCap, Sequential>;
 pub use crate::block::UtxoSyncTarget;

@@ -64,15 +64,15 @@ block-view = [
     "dep:commonware-storage",
     "dep:commonware-utils",
 ]
-explorer-origin = [
-    "verified-explorer",
+indexer-api = [
+    "proof-verify",
     "indexer",
     "dep:axum",
     "axum/ws",
     "dep:redb",
     "hellas-kernel/webauthn",
 ]
-verified-explorer = ["block-view", "dep:serde", "dep:hex", "dep:prost"]
+proof-verify = ["block-view", "dep:serde", "dep:hex", "dep:prost"]
 indexer = [
     "block-view",
     "client",

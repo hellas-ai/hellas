@@ -4,13 +4,13 @@ use super::{
     types::MAX_RESPONSE_BYTES,
 };
 use axum::{
-    http::{HeaderMap, StatusCode, Uri, header},
-    response::{IntoResponse, Response},
+    http::{HeaderMap, StatusCode, Uri},
+    response::Response,
 };
 use prost::Message;
 use serde::Serialize;
 pub(crate) async fn handle(index: EdgeIndex, uri: Uri, headers: HeaderMap) -> Response {
-    let protobuf = match crate::explorer_origin::representation(&headers) {
+    let protobuf = match crate::http_api::representation(&headers) {
         Some(value) => value,
         None => {
             return failure(
@@ -65,15 +65,7 @@ fn answer<T: Serialize + Message>(result: Result<T, EdgeIndexError>, protobuf: b
                     );
                 }
             };
-            (
-                [
-                    (header::CONTENT_TYPE, content_type),
-                    (header::CACHE_CONTROL, "no-store"),
-                    (header::VARY, "Accept"),
-                ],
-                body,
-            )
-                .into_response()
+            crate::http_api::respond(StatusCode::OK, content_type, body)
         }
         Err(error) => failure(
             error.status,
@@ -110,45 +102,18 @@ fn failure(
             );
         }
     };
-    (
+    crate::http_api::respond(
         StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-        [
-            (header::CONTENT_TYPE, content_type),
-            (header::CACHE_CONTROL, "no-store"),
-            (header::VARY, "Accept"),
-        ],
+        content_type,
         body,
     )
-        .into_response()
 }
 
-/// Encode only the negotiated representation and stop JSON at the response budget.
 fn encode<T: Serialize + Message>(
     value: &T,
     protobuf: bool,
 ) -> Result<(&'static str, Vec<u8>), ()> {
-    if protobuf {
-        if value.encoded_len() > MAX_RESPONSE_BYTES {
-            return Err(());
-        }
-        return Ok(("application/x-protobuf", value.encode_to_vec()));
-    }
-    struct Limited(Vec<u8>);
-    impl std::io::Write for Limited {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            if bytes.len() > MAX_RESPONSE_BYTES.saturating_sub(self.0.len()) {
-                return Err(std::io::Error::other("response too large"));
-            }
-            self.0.extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let mut output = Limited(Vec::new());
-    serde_json::to_writer(&mut output, value).map_err(|_| ())?;
-    Ok(("application/json", output.0))
+    crate::http_api::encode(value, protobuf, MAX_RESPONSE_BYTES)
 }
 
 #[cfg(test)]
