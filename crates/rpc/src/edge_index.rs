@@ -5,7 +5,7 @@ pub use crate::pb::chain::{
     edge_index_lease_answer::Answer as LeaseState, edge_index_object_answer::Answer as ObjectState,
     edge_index_pending_answer::Answer as PendingState, edge_index_public_terms::Terms as TermsKind,
 };
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 pub const PROOF_SCHEMA_VERSION: u32 = 1;
 
 pub const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;

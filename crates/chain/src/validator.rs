@@ -582,11 +582,8 @@ mod genesis_allocation_tests {
         let trust = export_trust(&config, &document).unwrap();
         assert_eq!(trust.genesis_sha256, hex::encode(Sha256::hash(&document)));
         assert_eq!(trust.epochs[0].threshold_identity.len(), 96);
-        #[cfg(feature = "verified-explorer")]
-        assert!(
-            crate::verified_explorer::ExplorerVerifier::with_genesis(trust.clone(), &document)
-                .is_ok()
-        );
+        #[cfg(feature = "proof-verify")]
+        assert!(crate::proof_verify::ProofVerifier::with_genesis(trust.clone(), &document).is_ok());
         let public = serde_json::to_string(&trust).unwrap();
         assert!(!public.contains(&config.private_key));
         assert!(!public.contains(&config.threshold_share));

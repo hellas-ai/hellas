@@ -1,4 +1,10 @@
-//! Runtime-independent verification and persistence boundary for native and edge explorers.
+//! Runtime-independent proof verification for untrusted read responses.
+//!
+//! Any client that reads from an indexer it does not trust needs this: it
+//! turns a response plus its embedded evidence into something checked against
+//! consensus. Named for the capability, not for the explorer that happens to
+//! be its first consumer -- a browser, a relay and a CLI all verify the same
+//! way.
 //!
 //! A trust document must be authenticated independently of the indexer. An embedded bundle
 //! proves consensus finality, not that its observation timestamp or latest-block claim is fresh.
@@ -18,7 +24,7 @@ pub const MAX_PROOF_BYTES: usize = 16 * 1024 * 1024;
 pub use hellas_rpc::edge_index::{PROOF_SCHEMA_VERSION, ProofBundle};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ExplorerQuery {
+pub enum ProofQuery {
     Block(FinalizedBlockQuery),
     /// SHA-256 of the transaction's canonical chain encoding.
     Transaction(Digest),
@@ -48,13 +54,13 @@ pub enum VerificationError {
     Query,
 }
 
-pub struct ExplorerVerifier {
+pub struct ProofVerifier {
     trust: TrustDocument,
     trust_sha256: String,
     verifiers: Vec<ConsensusVerifier>,
 }
 
-impl ExplorerVerifier {
+impl ProofVerifier {
     /// `trust` is an authenticated deployment input, never a document accepted from a query peer.
     pub fn new(trust: TrustDocument) -> Result<Self, VerificationError> {
         Self::with_genesis(trust, HELLAS_DEVNET_1_JSON.as_bytes())
@@ -105,7 +111,7 @@ impl ExplorerVerifier {
     pub fn verify(
         &self,
         bundle: ProofBundle,
-        query: ExplorerQuery,
+        query: ProofQuery,
     ) -> Result<VerifiedBlock, VerificationError> {
         if bundle.schema_version != PROOF_SCHEMA_VERSION
             || bundle.network_id != self.trust.network_id
@@ -159,18 +165,16 @@ impl ExplorerVerifier {
             .verify_terminal_context(proof.descendants.last().unwrap_or(&block))
             .map_err(|_| VerificationError::Round)?;
         let transaction_index = match query {
-            ExplorerQuery::Block(FinalizedBlockQuery::Latest) => None,
-            ExplorerQuery::Block(FinalizedBlockQuery::Height(height))
-                if height == view.height() =>
-            {
+            ProofQuery::Block(FinalizedBlockQuery::Latest) => None,
+            ProofQuery::Block(FinalizedBlockQuery::Height(height)) if height == view.height() => {
                 None
             }
-            ExplorerQuery::Block(FinalizedBlockQuery::Payload(payload))
+            ProofQuery::Block(FinalizedBlockQuery::Payload(payload))
                 if payload == view.payload() =>
             {
                 None
             }
-            ExplorerQuery::Transaction(wanted) => Some(
+            ProofQuery::Transaction(wanted) => Some(
                 view.txs()
                     .iter()
                     .position(|tx| transaction_digest(tx) == wanted)
@@ -336,31 +340,31 @@ mod tests {
         genesis.validators[0].label = "disposable-demo".into();
         let document = serde_json::to_vec(&genesis).unwrap();
         trust.genesis_sha256 = hex::encode(Sha256::hash(&document));
-        assert!(ExplorerVerifier::with_genesis(trust.clone(), &document).is_ok());
+        assert!(ProofVerifier::with_genesis(trust.clone(), &document).is_ok());
         assert!(matches!(
-            ExplorerVerifier::new(trust.clone()),
+            ProofVerifier::new(trust.clone()),
             Err(VerificationError::Genesis)
         ));
         let mut changed = document.clone();
         changed.push(b'\n');
         assert!(matches!(
-            ExplorerVerifier::with_genesis(trust.clone(), &changed),
+            ProofVerifier::with_genesis(trust.clone(), &changed),
             Err(VerificationError::Genesis)
         ));
         genesis.network_id = "untrusted-network".into();
         let document = serde_json::to_vec(&genesis).unwrap();
         trust.genesis_sha256 = hex::encode(Sha256::hash(&document));
         assert!(matches!(
-            ExplorerVerifier::with_genesis(trust, &document),
+            ProofVerifier::with_genesis(trust, &document),
             Err(VerificationError::Genesis)
         ));
     }
 
-    fn fixture() -> (ExplorerVerifier, ProofBundle) {
+    fn fixture() -> (ProofVerifier, ProofBundle) {
         fixture_at_height(1)
     }
 
-    fn fixture_at_height(height: u64) -> (ExplorerVerifier, ProofBundle) {
+    fn fixture_at_height(height: u64) -> (ProofVerifier, ProofBundle) {
         let keys = (0..4)
             .map(ed25519::PrivateKey::from_seed)
             .collect::<Vec<_>>();
@@ -397,7 +401,7 @@ mod tests {
                 threshold_identity: hex::encode(assembler.identity().encode()),
             }],
         };
-        let verifier = ExplorerVerifier::new(trust).unwrap();
+        let verifier = ProofVerifier::new(trust).unwrap();
         let block = crate::HellasBlock::new(
             Context {
                 round: Round::new(Epoch::zero(), View::new(height)),
@@ -561,12 +565,12 @@ mod tests {
         .unwrap();
         assert_eq!(json, proto);
         let block = verifier
-            .verify(json, ExplorerQuery::Block(FinalizedBlockQuery::Height(1)))
+            .verify(json, ProofQuery::Block(FinalizedBlockQuery::Height(1)))
             .unwrap();
         let tx = transaction_digest(&block.view().txs()[0]);
         assert_eq!(
             verifier
-                .verify(proto, ExplorerQuery::Transaction(tx))
+                .verify(proto, ProofQuery::Transaction(tx))
                 .unwrap()
                 .transaction_index(),
             Some(0)
@@ -574,12 +578,12 @@ mod tests {
         assert!(matches!(
             verifier.verify(
                 bundle.clone(),
-                ExplorerQuery::Block(FinalizedBlockQuery::Height(2))
+                ProofQuery::Block(FinalizedBlockQuery::Height(2))
             ),
             Err(VerificationError::Query)
         ));
         assert!(matches!(
-            verifier.verify(bundle, ExplorerQuery::Transaction(Digest::from([9; 32]))),
+            verifier.verify(bundle, ProofQuery::Transaction(Digest::from([9; 32]))),
             Err(VerificationError::Query)
         ));
     }
@@ -587,7 +591,7 @@ mod tests {
     #[test]
     fn rejects_tampered_certificate_block_snapshot_and_identity() {
         let (verifier, bundle) = fixture();
-        let query = ExplorerQuery::Block(FinalizedBlockQuery::Latest);
+        let query = ProofQuery::Block(FinalizedBlockQuery::Latest);
         let mut bad = bundle.clone();
         bad.finalization[10] ^= 1;
         assert!(verifier.verify(bad, query).is_err());
@@ -688,7 +692,7 @@ impl VerifiedAddress {
         &self.bundle
     }
 }
-impl ExplorerVerifier {
+impl ProofVerifier {
     pub fn verify_address(
         &self,
         bundle: AddressProofBundle,
@@ -701,7 +705,7 @@ impl ExplorerVerifier {
         }
         let block = self.verify(
             bundle.block.clone().ok_or(VerificationError::Query)?,
-            ExplorerQuery::Block(FinalizedBlockQuery::Latest),
+            ProofQuery::Block(FinalizedBlockQuery::Latest),
         )?;
         block.verify_owner_page(bundle.page, owner, offset, limit)
     }

@@ -1,24 +1,29 @@
 //! Adapter from speculative QMDB batches to the shared authenticated owner tree.
-use super::{
-    kernel::ExecutionError,
-    store::{UtxoDatabase, UtxoDb},
-};
+#[cfg(feature = "indexer-api")]
+use super::store::UtxoDb;
+use super::{kernel::ExecutionError, store::UtxoDatabase};
+#[cfg(feature = "indexer-api")]
+use crate::owner_proof::OwnerPageProof;
 use crate::{
     domain::{Object, ObjectId, SettlementKey},
-    owner_proof::{
-        OWNER_NODE_BYTES, OwnerPageProof, OwnerProofError, OwnerTreeStore, update_holding,
-    },
+    owner_proof::{OWNER_NODE_BYTES, OwnerProofError, OwnerTreeStore, update_holding},
 };
 use commonware_glue::stateful::db::DatabaseSet;
 use commonware_runtime::Spawner;
 use commonware_storage::Context as StorageContext;
 type Batch<E> = <UtxoDatabase<E> as DatabaseSet<E>>::Unmerkleized;
 
+// These three serve `edge_index::replay` and nothing else. `owner_tree` as a
+// whole is also needed by `validator` (for `root`), so the module gate is
+// deliberately wider than these items: gate them to their actual consumer
+// rather than leaving them dead in a validator-only build.
+#[cfg(feature = "indexer-api")]
 /// Reads the owner metadata already committed alongside objects in QMDB.
 /// The caller must hold one database read guard for the entire proof/checkpoint
 /// operation so a concurrent finalize cannot mix nodes from different heights.
 struct StoredOwnerTree<'a, E: StorageContext + Spawner>(&'a UtxoDb<E>);
 
+#[cfg(feature = "indexer-api")]
 impl<E: StorageContext + Spawner + Send + Sync + 'static> OwnerTreeStore
     for StoredOwnerTree<'_, E>
 {
@@ -47,6 +52,7 @@ impl<E: StorageContext + Spawner + Send + Sync + 'static> OwnerTreeStore
     }
 }
 
+#[cfg(feature = "indexer-api")]
 /// Read the authenticated owner root from finalized QMDB state.
 /// Keep the same database read guard held across this call, checkpoint binding,
 /// and `prove_stored_owner_page`; separate guards can observe different heights.
@@ -57,6 +63,7 @@ where
     crate::owner_proof::owner_root(&StoredOwnerTree(database)).await
 }
 
+#[cfg(feature = "indexer-api")]
 /// Prove holdings directly from finalized owner metadata without replaying it.
 /// The caller must hold one database read guard across the entire proof and its
 /// checkpoint/root checks, including any call to `stored_root`.
@@ -197,7 +204,10 @@ where
     crate::owner_proof::owner_root(&ReadBatch(batch)).await
 }
 
-#[cfg(test)]
+// Everything here exercises the `Stored*` adapter, which exists only for
+// the indexer; the module would be empty of tests and full of unused
+// imports in a validator-only build.
+#[cfg(all(test, feature = "indexer-api"))]
 mod tests {
     use super::*;
     use crate::{

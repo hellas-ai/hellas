@@ -3,7 +3,7 @@ use crate::{
     domain::{self, Digest, Transaction},
     edge_index::{projection, types::*},
     execution::test_support::{ConsensusFixture, consensus_fixture, finalization, run_qmdb},
-    verified_explorer::PROOF_SCHEMA_VERSION,
+    proof_verify::PROOF_SCHEMA_VERSION,
 };
 use commonware_codec::Encode as _;
 use commonware_consensus::{
@@ -29,7 +29,7 @@ pub(crate) struct Harness {
     pub(crate) index: EdgeIndex,
     pub(crate) head: HellasBlock,
     pub(crate) committee: ConsensusFixture,
-    pub(crate) verifier: ExplorerVerifier,
+    pub(crate) verifier: ProofVerifier,
     pub(crate) allocations: Vec<(SettlementKey, u64)>,
     pub(crate) network: hellas_kernel::NetworkId,
     pub(crate) name: &'static str,
@@ -131,7 +131,7 @@ impl Harness {
                 threshold_identity: hex::encode(committee.assembler.identity().encode()),
             }],
         };
-        let verifier = ExplorerVerifier::with_genesis(trust.clone(), &genesis_json).unwrap();
+        let verifier = ProofVerifier::with_genesis(trust.clone(), &genesis_json).unwrap();
         let (root, target) = crate::execution::store::empty_state(
             runtime.child("genesis"),
             "edge-test-genesis",
@@ -142,7 +142,7 @@ impl Harness {
         let leader = committee.leaders.iter().min().unwrap().clone();
         let head = HellasBlock::genesis(leader, root, target.clone());
         let origin_genesis = HellasBlock::genesis(
-            crate::explorer_origin::genesis_leader(&genesis).unwrap(),
+            crate::indexer_api::genesis_leader(&genesis).unwrap(),
             root,
             target,
         );
@@ -234,7 +234,7 @@ impl Harness {
         self.verifier
             .verify(
                 proof.clone(),
-                ExplorerQuery::Block(FinalizedBlockQuery::Height(height)),
+                ProofQuery::Block(FinalizedBlockQuery::Height(height)),
             )
             .unwrap();
         (block, proof, merkleized)
@@ -256,7 +256,7 @@ impl Harness {
     async fn apply(&mut self, block: &HellasBlock, proof: ProofBundle) -> Result<()> {
         let verified = self.verifier.verify(
             proof,
-            ExplorerQuery::Block(FinalizedBlockQuery::Height(block.height().get())),
+            ProofQuery::Block(FinalizedBlockQuery::Height(block.height().get())),
         )?;
         self.replay.apply(block, verified).await
     }
@@ -494,20 +494,20 @@ fn native_edge_index_real_chain_pins_root_checks_and_restart() {
             .verifier
             .verify(
                 opened.clone(),
-                ExplorerQuery::Block(FinalizedBlockQuery::Height(1)),
+                ProofQuery::Block(FinalizedBlockQuery::Height(1)),
             )
             .unwrap();
         assert!(h.replay.apply(&block, other).await.is_err());
         // A typed block from another valid verifier is not this origin's trust anchor.
         let mut other_trust = h.trust.clone();
         other_trust.epochs[0].end_height = Some(100);
-        let other_verifier = ExplorerVerifier::with_genesis(other_trust, &h.genesis_json).unwrap();
+        let other_verifier = ProofVerifier::with_genesis(other_trust, &h.genesis_json).unwrap();
         let mut other_proof = root_bad.clone();
         other_proof.trust_sha256 = other_verifier.trust_sha256().into();
         let other = other_verifier
             .verify(
                 other_proof,
-                ExplorerQuery::Block(FinalizedBlockQuery::Height(2)),
+                ProofQuery::Block(FinalizedBlockQuery::Height(2)),
             )
             .unwrap();
         assert!(h.replay.apply(&block, other).await.is_err());
@@ -539,7 +539,7 @@ fn native_edge_index_real_chain_pins_root_checks_and_restart() {
         h.verifier
             .verify(
                 certificate.clone(),
-                ExplorerQuery::Block(FinalizedBlockQuery::Height(2)),
+                ProofQuery::Block(FinalizedBlockQuery::Height(2)),
             )
             .unwrap();
         assert!(h.apply(&invalid, certificate).await.is_err());
@@ -702,9 +702,7 @@ fn native_edge_index_real_chain_pins_root_checks_and_restart() {
             Tx::timeout_close(id2, &terms2).unwrap(),
         )];
         let (_, proof, _) = h.candidate(transactions.clone()).await;
-        let tx_digest = hex::encode(crate::verified_explorer::transaction_digest(
-            &transactions[0],
-        ));
+        let tx_digest = hex::encode(crate::proof_verify::transaction_digest(&transactions[0]));
         let context = hellas_kernel::Context::with_fees(
             h.network,
             BlockHeight::new(proof.height),
@@ -955,49 +953,15 @@ fn native_edge_index_bond_reverse_link_requires_payment_opening_evidence() {
         );
         for payment_id in ["00".repeat(32), hex::encode(b.payment.as_bytes())] {
             let mut bad = detail.clone();
-            let payload = bad
-                .envelope
-                .as_ref()
-                .unwrap()
-                .snapshot
-                .as_ref()
-                .unwrap()
-                .payload
-                .clone();
             let data = bad.data.as_mut().unwrap();
             data.related.as_mut().unwrap().payment_edge_id = Some(payment_id.clone());
             let summary = data.summary.as_mut().unwrap();
             summary.payment_edge_id = Some(payment_id.clone());
-            summary.links.as_mut().unwrap().channel =
-                Some(format!("/channels/{payment_id}?payload={payload}"));
             assert!(
                 h.check_edge(&bad).is_err(),
                 "unrelated payment {payment_id}"
             );
         }
-        let mut bad_link = detail.clone();
-        bad_link
-            .data
-            .as_mut()
-            .unwrap()
-            .summary
-            .as_mut()
-            .unwrap()
-            .links
-            .as_mut()
-            .unwrap()
-            .channel = Some(format!("/channels/{}", hex::encode(b.payment.as_bytes())));
-        assert!(h.check_edge(&bad_link).is_err());
-        let mut bad_events = detail.clone();
-        bad_events
-            .data
-            .as_mut()
-            .unwrap()
-            .events
-            .as_mut()
-            .unwrap()
-            .href = format!("/api/v1/edges/{}/events", hex::encode(b.bond.as_bytes()));
-        assert!(h.check_edge(&bad_events).is_err());
         let mut missing_proof = detail.clone();
         missing_proof
             .envelope
@@ -1063,7 +1027,6 @@ fn native_edge_index_work_channel_lifecycle_and_evidence() {
         bond.related.as_mut().unwrap().payment_edge_id = None;
         let summary = bond.summary.as_mut().unwrap();
         summary.payment_edge_id = None;
-        summary.links.as_mut().unwrap().channel = None;
         assert!(h.check_channel(&missing_reverse).is_err());
         assert_eq!(initial.data.as_ref().unwrap().funding_query.len(), 2);
         assert!(initial.data.as_ref().unwrap().live_funding.is_empty());
@@ -1089,9 +1052,7 @@ fn native_edge_index_work_channel_lifecycle_and_evidence() {
             "/data/payment/opening",
             "/data/payment/object_at_snapshot",
             "/data/payment/related",
-            "/data/payment/events",
             "/data/payment/summary/opened",
-            "/data/payment/summary/links",
             "/data/payment/opening/transaction",
             "/data/payment/opening/terms",
         ] {
