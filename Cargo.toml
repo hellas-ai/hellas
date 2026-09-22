@@ -74,15 +74,15 @@ hex = "0.4"
 iroh = { version = "1", default-features = false }
 iroh-mdns-address-lookup = "0.4"
 k256 = { version = "0.13", features = ["ecdsa"] }
-opentelemetry = "0.31"
-opentelemetry-otlp = { version = "0.31", default-features = false, features = [
+opentelemetry = "0.32"
+opentelemetry-otlp = { version = "0.32", default-features = false, features = [
     "http-proto",
     "trace",
     "metrics",
     "reqwest-blocking-client",
     "reqwest-rustls-webpki-roots",
 ] }
-opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
 p256 = { version = "0.14", default-features = false, features = ["ecdsa"] }
 prometheus-client = "0.25"
 rand = "0.10"
@@ -113,7 +113,7 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-tungstenite = "0.29"
 toml = "1.1"
 tracing = "0.1"
-tracing-opentelemetry = "0.32"
+tracing-opentelemetry = "0.33"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 web-time = "1"
 webpki = { package = "rustls-webpki", version = "0.103.9", default-features = false }
