@@ -1,6 +1,6 @@
 # Verified explorer
 
-`hellas-chain/verified-explorer` verifies consensus-backed block and address proofs.
+`hellas-chain/proof-verify` verifies consensus-backed block and address proofs.
 The included native origin follows the chain archive and listens only on loopback.
 
 Provision a `hellas_genesis::TrustDocument` independently of the RPC peer. It has
@@ -19,7 +19,7 @@ and integer fields use unsigned decimal without padding. Install the exact trust
 document with every verifier; a document retrieved from the proof origin is not
 a trust anchor.
 
-`ProofBundle` has matching JSON and protobuf fields. `ExplorerVerifier::verify`
+`ProofBundle` has matching JSON and protobuf fields. `ProofVerifier::verify`
 checks the trust identifier, network, epoch, threshold certificate, canonical
 block bytes, payload, height, state root, and requested block or transaction.
 Transaction IDs are SHA-256 hashes of the canonical chain transaction encoding.
@@ -64,8 +64,8 @@ public trust data. Authenticate `network/trust.json` and the exact genesis file
 separately from the RPC peer. Do not parse, reserialize, trim, or otherwise
 change the provisioned genesis bytes.
 
-`ExplorerVerifier::with_genesis(trust, genesis_bytes)` pins both inputs.
-`ExplorerVerifier::new(trust)` and `chain indexer serve` without `--genesis` use
+`ProofVerifier::with_genesis(trust, genesis_bytes)` pins both inputs.
+`ProofVerifier::new(trust)` and `chain indexer serve` without `--genesis` use
 the embedded devnet genesis.
 
 `hellas-cli chain indexer serve --rpc wss://relay.example/ws --trust trust.json

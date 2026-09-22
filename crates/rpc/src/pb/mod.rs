@@ -214,17 +214,22 @@ mod id_pins {
 
     #[cfg(feature = "chain")]
     #[test]
-    fn edge_index_schema_two_ids_are_stable() {
+    fn edge_index_schema_three_ids_are_stable() {
         use super::services::edge_index::{
             EdgeIndex, GetEdgeDetail, GetWorkChannelDetail, ListEdgeEvents, ListEdges,
         };
-        assert_eq!(<EdgeIndex as ServiceMarker>::SERVICE_ID, 0x3a28ca0e);
-        assert_eq!(<ListEdges as MethodMarker>::METHOD_ID, 0xd35e4324);
-        assert_eq!(<GetEdgeDetail as MethodMarker>::METHOD_ID, 0xe36e7683);
-        assert_eq!(<ListEdgeEvents as MethodMarker>::METHOD_ID, 0x7ce6f577);
+        // Schema 3. These moved from their schema-2 values because removing
+        // `EdgeIndexEdgeLinks`, `EdgeIndexEventsLink` and `evidence_href`
+        // changes the descriptor the IDs are derived from. That is the point
+        // of pinning them: a wire-visible change must be a deliberate edit
+        // here, never a silent reshuffle.
+        assert_eq!(<EdgeIndex as ServiceMarker>::SERVICE_ID, 0x4376d207);
+        assert_eq!(<ListEdges as MethodMarker>::METHOD_ID, 0x8bc7cf02);
+        assert_eq!(<GetEdgeDetail as MethodMarker>::METHOD_ID, 0x76092836);
+        assert_eq!(<ListEdgeEvents as MethodMarker>::METHOD_ID, 0xec962f60);
         assert_eq!(
             <GetWorkChannelDetail as MethodMarker>::METHOD_ID,
-            0xf451a04d
+            0x22179a2f
         );
     }
 

@@ -5,11 +5,11 @@ use crate::{
     config::Config,
     domain::{Digest, PublicKey},
     follower::{FollowerStatusSink, ingest_finalized_block},
-    verified_explorer::{ExplorerQuery, ExplorerVerifier, PROOF_SCHEMA_VERSION, ProofBundle},
+    proof_verify::{PROOF_SCHEMA_VERSION, ProofBundle, ProofQuery, ProofVerifier},
 };
 use axum::{
     Router,
-    extract::{OriginalUri, Path, Query, State},
+    extract::{OriginalUri, Path, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
     routing::get,
@@ -63,12 +63,12 @@ pub(crate) fn genesis_leader(genesis: &Genesis) -> OriginResult<PublicKey> {
 
 pub fn run(options: OriginOptions) -> OriginResult<()> {
     if !options.listen.ip().is_loopback() {
-        return Err("private explorer origin must bind to loopback".into());
+        return Err("private indexer api must bind to loopback".into());
     }
     let genesis_json = options
         .genesis_json
         .unwrap_or_else(|| HELLAS_DEVNET_1_JSON.as_bytes().to_vec());
-    let verifier = Arc::new(ExplorerVerifier::with_genesis(
+    let verifier = Arc::new(ProofVerifier::with_genesis(
         options.trust.clone(),
         &genesis_json,
     )?);
@@ -161,7 +161,7 @@ pub fn run(options: OriginOptions) -> OriginResult<()> {
 struct OriginState {
     edge_index: crate::edge_index::EdgeIndex,
     indexer: ChainIndexer,
-    verifier: Arc<ExplorerVerifier>,
+    verifier: Arc<ProofVerifier>,
     network_id: String,
     // This is the only finalized materializer. Its lock spans QMDB finalize,
     // EdgeIndex publication and all current owner-proof reads.
@@ -211,6 +211,9 @@ async fn block(
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
 ) -> Response {
+    // Normalise Accept once: `failure` negotiates too, so it must see the
+    // same headers the success path does.
+    let headers = default_proof_accept(headers, &uri);
     let query = if selector == "latest" {
         FinalizedBlockQuery::Latest
     } else if let Some(payload) = digest(&selector) {
@@ -218,16 +221,10 @@ async fn block(
     } else {
         match selector.parse::<u64>() {
             Ok(height) => FinalizedBlockQuery::Height(height),
-            Err(_) => return failure(StatusCode::BAD_REQUEST, "invalid block height"),
+            Err(_) => return failure(&headers, StatusCode::BAD_REQUEST, "invalid block height"),
         }
     };
-    answer(
-        state,
-        query,
-        ExplorerQuery::Block(query),
-        default_proof_accept(headers, &uri),
-    )
-    .await
+    answer(state, query, ProofQuery::Block(query), headers).await
 }
 async fn payload(
     State(state): State<OriginState>,
@@ -235,10 +232,10 @@ async fn payload(
     headers: HeaderMap,
 ) -> Response {
     let Some(payload) = digest(&payload) else {
-        return failure(StatusCode::BAD_REQUEST, "invalid payload");
+        return failure(&headers, StatusCode::BAD_REQUEST, "invalid payload");
     };
     let query = FinalizedBlockQuery::Payload(payload);
-    answer(state, query, ExplorerQuery::Block(query), headers).await
+    answer(state, query, ProofQuery::Block(query), headers).await
 }
 #[derive(Deserialize)]
 struct TransactionQuery {
@@ -247,12 +244,17 @@ struct TransactionQuery {
 async fn transaction(
     State(state): State<OriginState>,
     Path(tx): Path<String>,
-    Query(query): Query<TransactionQuery>,
+    crate::http_api::ApiQuery(query): crate::http_api::ApiQuery<TransactionQuery>,
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
 ) -> Response {
+    let headers = default_proof_accept(headers, &uri);
     let Some(tx) = digest(&tx) else {
-        return failure(StatusCode::BAD_REQUEST, "invalid transaction digest");
+        return failure(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            "invalid transaction digest",
+        );
     };
     let height = match query.height {
         Some(height) => Some(height),
@@ -260,6 +262,7 @@ async fn transaction(
             Ok(height) => height,
             Err(error) => {
                 return failure(
+                    &headers,
                     StatusCode::from_u16(error.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
                     &error.to_string(),
                 );
@@ -268,6 +271,7 @@ async fn transaction(
     };
     let Some(height) = height else {
         return failure(
+            &headers,
             StatusCode::SERVICE_UNAVAILABLE,
             "transaction locator is unavailable or still catching up",
         );
@@ -275,8 +279,8 @@ async fn transaction(
     answer(
         state,
         FinalizedBlockQuery::Height(height),
-        ExplorerQuery::Transaction(tx),
-        default_proof_accept(headers, &uri),
+        ProofQuery::Transaction(tx),
+        headers,
     )
     .await
 }
@@ -345,22 +349,30 @@ fn owner_snapshot_unavailable(
 async fn address(
     State(state): State<OriginState>,
     Path(owner): Path<String>,
-    Query(query): Query<AddressQuery>,
+    crate::http_api::ApiQuery(query): crate::http_api::ApiQuery<AddressQuery>,
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
 ) -> Response {
+    // Normalise Accept before validating anything, so a rejected request is
+    // encoded the same way an accepted one would have been. Parsing the owner
+    // first made `/proof` errors JSON while `/proof` successes were protobuf.
+    let headers = default_proof_accept(headers, &uri);
     let Ok(owner) = owner.parse::<crate::domain::SettlementKey>() else {
-        return failure(StatusCode::BAD_REQUEST, "invalid owner");
+        return failure(&headers, StatusCode::BAD_REQUEST, "invalid owner");
     };
-    let Some(protobuf) = representation(&default_proof_accept(headers, &uri)) else {
-        return failure(StatusCode::NOT_ACCEPTABLE, "unsupported representation");
+    let Some(protobuf) = representation(&headers) else {
+        return failure(
+            &headers,
+            StatusCode::NOT_ACCEPTABLE,
+            "unsupported representation",
+        );
     };
     if query
         .payload
         .as_ref()
         .is_some_and(|payload| digest(payload).is_none())
     {
-        return failure(StatusCode::BAD_REQUEST, "invalid payload");
+        return failure(&headers, StatusCode::BAD_REQUEST, "invalid payload");
     }
     let verified = match state
         .replay
@@ -375,6 +387,7 @@ async fn address(
         }
         Ok(None) => {
             return failure(
+                &headers,
                 StatusCode::SERVICE_UNAVAILABLE,
                 "no durable verified owner checkpoint is available yet",
             );
@@ -385,10 +398,11 @@ async fn address(
                 Some(crate::owner_proof::OwnerProofError::Page)
             ) =>
         {
-            return failure(StatusCode::BAD_REQUEST, "invalid owner page");
+            return failure(&headers, StatusCode::BAD_REQUEST, "invalid owner page");
         }
         Err(_) => {
             return failure(
+                &headers,
                 StatusCode::BAD_GATEWAY,
                 "durable owner proof failed verification",
             );
@@ -430,58 +444,65 @@ fn digest(value: &str) -> Option<Digest> {
 async fn answer(
     state: OriginState,
     lookup: FinalizedBlockQuery,
-    query: ExplorerQuery,
+    query: ProofQuery,
     headers: HeaderMap,
 ) -> Response {
     let Some(protobuf) = representation(&headers) else {
         return failure(
+            &headers,
             StatusCode::NOT_ACCEPTABLE,
             "supported types are application/json and application/x-protobuf",
         );
     };
     let finalized = match state.indexer.get_finalized_block(lookup).await {
         Ok(Some(block)) => block,
-        Ok(None) => return failure(StatusCode::NOT_FOUND, "finalized block is unavailable"),
-        Err(_) => return failure(StatusCode::SERVICE_UNAVAILABLE, "archive is unavailable"),
+        Ok(None) => {
+            return failure(
+                &headers,
+                StatusCode::NOT_FOUND,
+                "finalized block is unavailable",
+            );
+        }
+        Err(_) => {
+            return failure(
+                &headers,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "archive is unavailable",
+            );
+        }
     };
     let bundle = proof_bundle(&state, finalized);
     let verified = match state.verifier.verify(bundle, query) {
         Ok(block) => block,
-        Err(crate::verified_explorer::VerificationError::Query) => {
+        Err(crate::proof_verify::VerificationError::Query) => {
             return failure(
+                &headers,
                 StatusCode::NOT_FOUND,
                 "transaction is absent from the requested block",
             );
         }
         Err(_) => {
             return failure(
+                &headers,
                 StatusCode::BAD_GATEWAY,
                 "archived proof failed verification",
             );
         }
     };
-    let (content_type, body) = if protobuf {
-        (
-            "application/x-protobuf",
-            prost::Message::encode_to_vec(verified.bundle()),
-        )
-    } else {
-        (
-            "application/json",
-            serde_json::to_vec(verified.bundle()).expect("proof serializes"),
-        )
-    };
-    (
-        [
-            (header::CONTENT_TYPE, content_type),
-            (header::CACHE_CONTROL, "no-store"),
-            (header::VARY, "Accept"),
-        ],
-        body,
-    )
-        .into_response()
+    match crate::http_api::encode(
+        verified.bundle(),
+        protobuf,
+        crate::proof_verify::MAX_PROOF_BYTES,
+    ) {
+        Ok((content_type, body)) => respond(StatusCode::OK, content_type, body),
+        Err(()) => failure(
+            &headers,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "proof exceeds the response budget",
+        ),
+    }
 }
-fn default_proof_accept(mut headers: HeaderMap, uri: &axum::http::Uri) -> HeaderMap {
+pub(crate) fn default_proof_accept(mut headers: HeaderMap, uri: &axum::http::Uri) -> HeaderMap {
     if !headers.contains_key(header::ACCEPT) && uri.path().ends_with("/proof") {
         headers.insert(
             header::ACCEPT,
@@ -491,64 +512,7 @@ fn default_proof_accept(mut headers: HeaderMap, uri: &axum::http::Uri) -> Header
     headers
 }
 
-pub(crate) fn representation(headers: &HeaderMap) -> Option<bool> {
-    let Some(accept) = headers.get(header::ACCEPT) else {
-        return Some(false);
-    };
-    let accept = accept.to_str().ok()?;
-    let mut json = None;
-    let mut protobuf = None;
-    let mut protobuf_alias = None;
-    for range in accept.split(',') {
-        let mut parts = range.trim().split(';');
-        let media = parts.next()?.trim();
-        let mut quality = 1.0_f32;
-        for part in parts {
-            if let Some(value) = part.trim().strip_prefix("q=") {
-                quality = value.parse().ok()?;
-            }
-        }
-        if !quality.is_finite() || !(0.0..=1.0).contains(&quality) {
-            return None;
-        }
-        let specificity = match media {
-            "application/json" | "application/protobuf" | "application/x-protobuf" => 2,
-            "application/*" => 1,
-            "*/*" => 0,
-            _ => continue,
-        };
-        let applies_json = matches!(media, "application/json" | "application/*" | "*/*");
-        let applies_proto = matches!(media, "application/x-protobuf" | "application/*" | "*/*");
-        let applies_alias = matches!(media, "application/protobuf" | "application/*" | "*/*");
-        for (applies, slot) in [
-            (applies_json, &mut json),
-            (applies_proto, &mut protobuf),
-            (applies_alias, &mut protobuf_alias),
-        ] {
-            if applies && slot.is_none_or(|(previous, _)| specificity > previous) {
-                *slot = Some((specificity, quality));
-            }
-        }
-    }
-    let json = json.map_or(0.0, |(_, q)| q);
-    let protobuf = protobuf
-        .map_or(0.0_f32, |(_, q)| q)
-        .max(protobuf_alias.map_or(0.0, |(_, q)| q));
-    if json == 0.0 && protobuf == 0.0 {
-        None
-    } else {
-        Some(protobuf > json)
-    }
-}
-
-fn failure(status: StatusCode, message: &str) -> Response {
-    (
-        status,
-        [(header::CACHE_CONTROL, "no-store")],
-        message.to_owned(),
-    )
-        .into_response()
-}
+use crate::http_api::{failure, representation, respond};
 
 fn proof_bundle(state: &OriginState, finalized: crate::FinalizedBlock) -> ProofBundle {
     let epoch = crate::finality_proof::FinalityProof::decode(&finalized.snapshot.finalization)
@@ -568,104 +532,10 @@ fn proof_bundle(state: &OriginState, finalized: crate::FinalizedBlock) -> ProofB
         epoch,
     }
 }
-async fn index_transactions(state: OriginState) -> OriginResult<()> {
-    // Replay::new recovered the durable checkpoint before the listener opened.
-    // Never scan old archive heights merely to rebuild an ephemeral owner tree.
-    let mut height = state.replay.lock().await.next_height()?;
-    loop {
-        match state
-            .indexer
-            .get_finalized_block(FinalizedBlockQuery::Height(height))
-            .await?
-        {
-            Some(finalized) => {
-                let verified = state.verifier.verify(
-                    proof_bundle(&state, finalized),
-                    ExplorerQuery::Block(FinalizedBlockQuery::Height(height)),
-                )?;
-                let block =
-                    crate::HellasBlock::decode(verified.bundle().canonical_block.as_slice())?;
-                state.replay.lock().await.apply(&block, verified).await?;
-                height = height
-                    .checked_add(1)
-                    .ok_or("transaction index height exhausted")?;
-                ::tokio::task::yield_now().await;
-            }
-            None => ::tokio::time::sleep(std::time::Duration::from_secs(1)).await,
-        }
-    }
-}
-
-// Bound both outstanding requests and completed responses waiting for an
-// earlier height. Verification and archive ingestion remain serial below.
-const FINALIZED_FETCH_WINDOW: usize = 32;
-
-fn ordered_fetches<T, F, Fut>(first: u64, mut fetch: F) -> impl Stream<Item = (u64, T)>
-where
-    F: FnMut(u64) -> Fut,
-    Fut: Future<Output = T>,
-{
-    stream::iter(std::iter::successors(Some(first), |height| {
-        height.checked_add(1)
-    }))
-    .map(move |height| {
-        let pending = fetch(height);
-        async move { (height, pending.await) }
-    })
-    .buffered(FINALIZED_FETCH_WINDOW)
-}
-
-async fn follow_trusted(
-    state: OriginState,
-    rpc: String,
-    status: FollowerStatusSink,
-) -> OriginResult<()> {
-    loop {
-        // The remote client is only a transport/codec here. The authenticated height-key
-        // schedule below verifies every block before the native archive sees it.
-        let client = match crate::client::RemoteLightClient::connect(rpc.clone()).await {
-            Ok(client) => client,
-            Err(error) => {
-                tracing::warn!(%error,"explorer upstream connection failed");
-                ::tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                continue;
-            }
-        };
-        'connection: loop {
-            let next = state
-                .indexer
-                .get_latest_block()
-                .await?
-                .map_or(1, |latest| latest.height.saturating_add(1));
-            let fetched = ordered_fetches(next, |height| {
-                client.get_finalized_block(FinalizedBlockQuery::Height(height))
-            });
-            futures_util::pin_mut!(fetched);
-            while let Some((height, result)) = fetched.next().await {
-                let remote = match result {
-                    Ok(Some(finalized)) => finalized,
-                    Ok(None) => {
-                        // Never skip a missing height, even if later responses
-                        // already arrived. Retry from the committed archive head.
-                        ::tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                        break;
-                    }
-                    Err(error) => {
-                        tracing::warn!(%error,"explorer upstream disconnected");
-                        ::tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                        break 'connection;
-                    }
-                };
-                state.verifier.verify(
-                    proof_bundle(&state, remote.clone()),
-                    ExplorerQuery::Block(FinalizedBlockQuery::Height(height)),
-                )?;
-                ingest_finalized_block(&state.indexer, remote, height, &status).await?;
-                ::tokio::task::yield_now().await;
-            }
-        }
-    }
-}
+mod follower;
+#[cfg(test)]
+use follower::{FINALIZED_FETCH_WINDOW, ordered_fetches};
+use follower::{follow_trusted, index_transactions};
 
 #[cfg(test)]
 mod tests {
@@ -799,9 +669,26 @@ mod tests {
                 let body = axum::body::to_bytes(response.into_body(), 4096)
                     .await
                     .unwrap();
+                // Structured, like every other route on this API, and in the
+                // negotiated representation: `/proof` defaults to protobuf,
+                // so the error follows the body it replaces rather than
+                // always being JSON.
+                let (code, message) = if suffix == "/proof" {
+                    let error =
+                        <crate::edge_index::types::IndexError as prost::Message>::decode(&body[..])
+                            .unwrap();
+                    (error.code, error.message)
+                } else {
+                    let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    (
+                        error["code"].as_str().unwrap().to_owned(),
+                        error["message"].as_str().unwrap().to_owned(),
+                    )
+                };
+                assert_eq!(code, "unavailable");
                 assert_eq!(
-                    &body[..],
-                    b"no durable verified owner checkpoint is available yet"
+                    message,
+                    "no durable verified owner checkpoint is available yet"
                 );
             }
         });
@@ -867,7 +754,7 @@ mod tests {
                 .ingest_finalized(h.head.clone(), finalization(&h.committee, &h.head))
                 .await
                 .unwrap();
-            let tx = crate::verified_explorer::transaction_digest(&first_block.txs()[0]);
+            let tx = crate::proof_verify::transaction_digest(&first_block.txs()[0]);
             let verifier = Arc::new(h.verifier);
             let state = OriginState {
                 edge_index: h.index.clone(),
@@ -892,12 +779,12 @@ mod tests {
                 assert_eq!(response.status(), StatusCode::OK);
                 let bytes = axum::body::to_bytes(
                     response.into_body(),
-                    crate::verified_explorer::MAX_PROOF_BYTES,
+                    crate::proof_verify::MAX_PROOF_BYTES,
                 )
                 .await
                 .unwrap();
                 let bundle =
-                    <crate::verified_explorer::AddressProofBundle as prost::Message>::decode(bytes)
+                    <crate::proof_verify::AddressProofBundle as prost::Message>::decode(bytes)
                         .unwrap();
                 let verified = verifier.verify_address(bundle, owner, 0, 64).unwrap();
                 assert_eq!(verified.block().view().height(), latest.height);
@@ -1007,7 +894,7 @@ mod tests {
                     );
                     let body = axum::body::to_bytes(
                         response.into_body(),
-                        crate::verified_explorer::MAX_PROOF_BYTES,
+                        crate::proof_verify::MAX_PROOF_BYTES,
                     )
                     .await
                     .unwrap();
@@ -1017,9 +904,9 @@ mod tests {
                         <ProofBundle as prost::Message>::decode(body).unwrap()
                     };
                     let query = if uri.contains("/transactions/") {
-                        ExplorerQuery::Transaction(tx)
+                        ProofQuery::Transaction(tx)
                     } else {
-                        ExplorerQuery::Block(FinalizedBlockQuery::Height(1))
+                        ProofQuery::Block(FinalizedBlockQuery::Height(1))
                     };
                     assert!(verifier.verify(bundle, query).is_ok());
                 }
@@ -1034,6 +921,108 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(absent.status(), StatusCode::SERVICE_UNAVAILABLE);
+        });
+    }
+    #[test]
+    fn a_rejected_owner_on_proof_answers_in_protobuf() {
+        crate::execution::test_support::run_qmdb(|context| async move {
+            let owner = crate::domain::SettlementKey::from(
+                hellas_kernel::Secp256k1Signer::from_secret_scalar([19; 32])
+                    .unwrap()
+                    .party_key(),
+            );
+            let h = crate::edge_index::ReplayHarness::new(
+                context.child("h"),
+                vec![(owner, 100)],
+                "origin-empty",
+            )
+            .await;
+            let (indexer, _handle) = crate::spawn_follower_indexer(
+                context.child("follower"),
+                "origin-empty-test",
+                Config::default(),
+                h.committee.verifier.clone(),
+                h.head,
+            )
+            .await
+            .unwrap();
+            let app = router(OriginState {
+                edge_index: h.index,
+                indexer,
+                replay: Arc::new(::tokio::sync::Mutex::new(h.replay)),
+                verifier: Arc::new(h.verifier),
+                network_id: HELLAS_DEVNET_1_ID.into(),
+            });
+            let request =
+                axum::http::Request::builder().uri("/api/v1/addresses/not-an-owner/proof");
+            let response = app
+                .oneshot(request.body(axum::body::Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let status = response.status();
+            let headers = response.headers().clone();
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(headers[header::CONTENT_TYPE], "application/x-protobuf");
+            assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+            assert_eq!(headers[header::VARY], "Accept");
+            let error =
+                <crate::edge_index::types::IndexError as prost::Message>::decode(body).unwrap();
+            assert_eq!(error.code, "invalid_request");
+        });
+    }
+
+    #[test]
+    fn a_rejected_query_parameter_answers_in_protobuf() {
+        crate::execution::test_support::run_qmdb(|context| async move {
+            let owner = crate::domain::SettlementKey::from(
+                hellas_kernel::Secp256k1Signer::from_secret_scalar([19; 32])
+                    .unwrap()
+                    .party_key(),
+            );
+            let h = crate::edge_index::ReplayHarness::new(
+                context.child("h"),
+                vec![(owner, 100)],
+                "origin-empty",
+            )
+            .await;
+            let (indexer, _handle) = crate::spawn_follower_indexer(
+                context.child("follower"),
+                "origin-empty-test",
+                Config::default(),
+                h.committee.verifier.clone(),
+                h.head,
+            )
+            .await
+            .unwrap();
+            let app = router(OriginState {
+                edge_index: h.index,
+                indexer,
+                replay: Arc::new(::tokio::sync::Mutex::new(h.replay)),
+                verifier: Arc::new(h.verifier),
+                network_id: HELLAS_DEVNET_1_ID.into(),
+            });
+            let request = axum::http::Request::builder()
+                .uri("/api/v1/transactions/0000000000000000000000000000000000000000000000000000000000000000/proof?height=bad");
+            let request = request.header(header::ACCEPT, "application/x-protobuf");
+            let response = app
+                .oneshot(request.body(axum::body::Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let status = response.status();
+            let headers = response.headers().clone();
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(headers[header::CONTENT_TYPE], "application/x-protobuf");
+            assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+            assert_eq!(headers[header::VARY], "Accept");
+            let error =
+                <crate::edge_index::types::IndexError as prost::Message>::decode(body).unwrap();
+            assert_eq!(error.code, "invalid_request");
         });
     }
 }

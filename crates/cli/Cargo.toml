@@ -54,7 +54,7 @@ chain = [
     "hellas-kernel/secp256k1",
     "hellas-kernel/webauthn",
 ]
-indexer = ["chain", "hellas-chain/explorer-origin"]
+indexer = ["chain", "hellas-chain/indexer-api"]
 validator = ["indexer", "hellas-chain/validator"]
 
 # Hellas OTLP export and iroh metrics exposure are opt-in. Dependencies can

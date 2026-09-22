@@ -1,4 +1,4 @@
-#[cfg(feature = "explorer-origin")]
+#[cfg(feature = "indexer-api")]
 mod trusted_epochs;
 use crate::domain::{PublicKey, Scheme};
 use crate::{
@@ -30,7 +30,7 @@ use commonware_utils::{Acknowledgement, NZU64, sync::AsyncMutex, vec::NonEmptyVe
 use rand_core::CryptoRng;
 use std::{marker::PhantomData, num::NonZeroU64, num::NonZeroUsize, sync::Arc};
 use thiserror::Error;
-#[cfg(feature = "explorer-origin")]
+#[cfg(feature = "indexer-api")]
 use trusted_epochs::TrustedEpochs;
 
 pub type FinalizationStore<E = tokio::Context> = immutable::Archive<E, Digest, Finalization>;
@@ -122,7 +122,7 @@ where
 pub struct ChainIndexer {
     marshal: MarshalMailbox,
     verifier: Option<ConsensusVerifier>,
-    #[cfg(feature = "explorer-origin")]
+    #[cfg(feature = "indexer-api")]
     schedule: Option<TrustedEpochs>,
     ingest_lock: Arc<AsyncMutex<()>>,
 }
@@ -168,7 +168,7 @@ impl ChainIndexer {
         Self {
             marshal,
             verifier: None,
-            #[cfg(feature = "explorer-origin")]
+            #[cfg(feature = "indexer-api")]
             schedule: None,
             ingest_lock: Arc::new(AsyncMutex::new(())),
         }
@@ -229,9 +229,9 @@ impl ChainIndexer {
     ) -> Result<IngestOutcome, IngestError> {
         let _guard = self.ingest_lock.lock().await;
         let terminal = proof.descendants.last().unwrap_or(&block);
-        #[cfg(feature = "explorer-origin")]
+        #[cfg(feature = "indexer-api")]
         let finalization = &proof.certificate;
-        #[cfg(feature = "explorer-origin")]
+        #[cfg(feature = "indexer-api")]
         let scheduled = self
             .schedule
             .as_ref()
@@ -243,11 +243,11 @@ impl ChainIndexer {
                 schedule.verifier(terminal.height(), finalization.proposal.round.epoch())
             })
             .transpose()?;
-        #[cfg(feature = "explorer-origin")]
+        #[cfg(feature = "indexer-api")]
         let verifier = scheduled
             .or(self.verifier.as_ref())
             .ok_or(IngestError::MissingVerifier)?;
-        #[cfg(not(feature = "explorer-origin"))]
+        #[cfg(not(feature = "indexer-api"))]
         let verifier = self.verifier.as_ref().ok_or(IngestError::MissingVerifier)?;
         proof.verify(
             verifier,
@@ -473,7 +473,7 @@ where
     .await
 }
 
-#[cfg(feature = "explorer-origin")]
+#[cfg(feature = "indexer-api")]
 pub async fn spawn_trusted_follower_indexer<E>(
     context: E,
     partition_prefix: &str,
@@ -496,7 +496,7 @@ where
 }
 
 /// Initialize a follower using an independently provisioned genesis document and trust schedule.
-#[cfg(feature = "explorer-origin")]
+#[cfg(feature = "indexer-api")]
 pub async fn spawn_trusted_follower_indexer_with_genesis<E>(
     context: E,
     partition_prefix: &str,

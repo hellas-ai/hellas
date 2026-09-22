@@ -158,7 +158,8 @@ impl OwnerIndex {
         (state.cursor, coins)
     }
 
-    #[cfg(test)]
+    // Only the kernel tests read this, and they need `kernel`.
+    #[cfg(all(test, any(feature = "validator", feature = "indexer-api")))]
     pub(crate) fn all_coins_for_test(&self) -> BTreeMap<ObjectId, Coin> {
         self.inner
             .read()

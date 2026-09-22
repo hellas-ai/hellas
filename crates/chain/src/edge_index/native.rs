@@ -376,9 +376,6 @@ impl EdgeIndex {
             ),
             closing,
             related: Some(related),
-            events: Some(EventsLink {
-                href: format!("/api/v1/edges/{id}/events?payload={}", read.proof.payload),
-            }),
         })
     }
     pub fn get_work_channel_detail(
@@ -574,10 +571,6 @@ impl EdgeIndex {
                         .encode()
                         .to_vec(),
                     kind: event.kind,
-                    evidence_href: format!(
-                        "/api/v1/transactions/{}/proof",
-                        event.transaction.transaction_digest
-                    ),
                     transaction: Some(event.transaction),
                 })
             })

@@ -6,9 +6,9 @@ use hellas_kernel::{self as kernel, Decode, Encode, TermsProfile};
 /// projection checks. Discovery and current objects remain indexer-reported.
 pub fn verify_metadata(
     metadata: &EdgeIndexMetadata,
-    verifier: &crate::verified_explorer::ExplorerVerifier,
+    verifier: &crate::proof_verify::ProofVerifier,
     trust: &hellas_genesis::TrustDocument,
-) -> Result<Vec<crate::verified_explorer::VerifiedBlock>, ProjectionError> {
+) -> Result<Vec<crate::proof_verify::VerifiedBlock>, ProjectionError> {
     metadata
         .validate()
         .map_err(|e| ProjectionError::Malformed(e.into()))?;
@@ -25,9 +25,9 @@ pub fn verify_metadata(
             verifier
                 .verify(
                     proof.clone(),
-                    crate::verified_explorer::ExplorerQuery::Block(
-                        crate::FinalizedBlockQuery::Payload(digest(&proof.payload)?),
-                    ),
+                    crate::proof_verify::ProofQuery::Block(crate::FinalizedBlockQuery::Payload(
+                        digest(&proof.payload)?,
+                    )),
                 )
                 .map_err(|e| ProjectionError::Malformed(e.to_string()))
         })
@@ -59,7 +59,6 @@ fn check_summary(
         validate_id(id).map_err(|e| ProjectionError::Malformed(e.into()))?;
     }
     let opened = required(&summary.opened)?;
-    required(&summary.links)?;
     if summary.maker.len() != kernel::Key::LENGTH
         || summary.taker.len() != kernel::Key::LENGTH
         || !matches!(
@@ -123,7 +122,7 @@ pub fn check_events(
         let tx = crate::domain::Transaction::decode(event.canonical_transaction.as_slice())
             .map_err(|e| ProjectionError::Malformed(e.to_string()))?;
         if tx.encode().as_ref() != event.canonical_transaction
-            || crate::verified_explorer::transaction_digest(&tx)
+            || crate::proof_verify::transaction_digest(&tx)
                 != digest(&transaction.transaction_digest)?
         {
             return Err(ProjectionError::Binding);
@@ -245,14 +244,6 @@ mod tests {
         assert_eq!(summary.maker, vec![2; kernel::Key::LENGTH]);
         assert_eq!(summary.bond_edge_id, Some("03".repeat(32)));
         assert!(
-            summary
-                .links
-                .as_ref()
-                .unwrap()
-                .edge
-                .ends_with(&format!("?payload={}", "ef".repeat(32)))
-        );
-        assert!(
             summary_from_open(
                 &"00".repeat(32),
                 &opened,
@@ -291,7 +282,7 @@ fn digest(value: &str) -> Result<crate::domain::Digest, ProjectionError> {
 }
 fn referenced_transaction<'a>(
     reference: &TransactionRef,
-    blocks: &'a [crate::verified_explorer::VerifiedBlock],
+    blocks: &'a [crate::proof_verify::VerifiedBlock],
 ) -> Result<&'a crate::domain::Transaction, ProjectionError> {
     let block = blocks
         .iter()
@@ -305,7 +296,7 @@ fn referenced_transaction<'a>(
         .txs()
         .get(reference.transaction_index as usize)
         .ok_or(ProjectionError::Binding)?;
-    if crate::verified_explorer::transaction_digest(tx) != digest(&reference.transaction_digest)? {
+    if crate::proof_verify::transaction_digest(tx) != digest(&reference.transaction_digest)? {
         return Err(ProjectionError::Binding);
     }
     Ok(tx)
@@ -315,13 +306,12 @@ fn referenced_transaction<'a>(
 pub fn check_detail(
     detail: &EdgeDetail,
     envelope: &EdgeIndexMetadata,
-    blocks: &[crate::verified_explorer::VerifiedBlock],
+    blocks: &[crate::proof_verify::VerifiedBlock],
 ) -> Result<(), ProjectionError> {
     let summary = required(&detail.summary)?;
     check_summary(summary, envelope)?;
     let snapshot = required(&envelope.snapshot)?;
     let related = required(&detail.related)?;
-    required(&detail.events)?;
     let object = required(&detail.object_at_snapshot)?;
     let opening = required(&detail.opening)?;
     let transaction = required(&opening.transaction)?;
@@ -391,14 +381,7 @@ pub fn check_detail(
         related.payment_edge_id.as_deref(),
         &snapshot.payload,
     )?;
-    if summary != &expected
-        || related.bond_edge_id != expected.bond_edge_id
-        || required(&detail.events)?.href
-            != format!(
-                "/api/v1/edges/{edge_id}/events?payload={}",
-                snapshot.payload
-            )
-    {
+    if summary != &expected || related.bond_edge_id != expected.bond_edge_id {
         return Err(ProjectionError::Binding);
     }
     match (&detail.closing, &summary.closed) {
@@ -454,7 +437,7 @@ pub fn check_work_channel(
     detail: &WorkChannelDetail,
     network: kernel::NetworkId,
     envelope: &EdgeIndexMetadata,
-    blocks: &[crate::verified_explorer::VerifiedBlock],
+    blocks: &[crate::proof_verify::VerifiedBlock],
 ) -> Result<(), ProjectionError> {
     let height = required(&envelope.snapshot)?.height;
     let payment_detail = required(&detail.payment)?;
@@ -596,7 +579,7 @@ pub(crate) fn edge_projection(edge: &kernel::Edge) -> EdgeProjection {
         allowed_close_kinds: close_kinds(edge.allowed_closes()),
     }
 }
-#[cfg(feature = "explorer-origin")]
+#[cfg(feature = "indexer-api")]
 pub(crate) fn object_answer(edge: Option<&kernel::Edge>) -> ObjectAnswer {
     ObjectAnswer {
         answer: Some(match edge {
@@ -699,11 +682,6 @@ pub(crate) fn summary_from_open(
     };
     let maker = terms.parties().maker().as_bytes().to_vec();
     let taker = terms.parties().taker().as_bytes().to_vec();
-    let channel_id = if kind == "work-payment" {
-        Some(edge_id)
-    } else {
-        payment_edge_id
-    };
     Ok(EdgeSummary {
         edge_id: edge_id.into(),
         kind: kind.into(),
@@ -715,21 +693,6 @@ pub(crate) fn summary_from_open(
         terms_hash: hex::encode(terms.hash().as_bytes()),
         bond_edge_id,
         payment_edge_id: payment_edge_id.map(str::to_owned),
-        links: Some(EdgeLinks {
-            edge: format!("/edges/{edge_id}?payload={payload}"),
-            channel: channel_id.map(|id| format!("/channels/{id}?payload={payload}")),
-            maker: format!(
-                "/addresses/{}?payload={payload}",
-                bs58::encode(maker).into_string()
-            ),
-            taker: format!(
-                "/addresses/{}?payload={payload}",
-                bs58::encode(taker).into_string()
-            ),
-            opening_transaction: format!("/transactions/{}", opened.transaction_digest),
-            opening_block: format!("/blocks/{}", opened.payload),
-            evidence: format!("/api/v1/edges/{edge_id}/evidence?payload={payload}"),
-        }),
     })
 }
 pub(crate) fn opening_projection(

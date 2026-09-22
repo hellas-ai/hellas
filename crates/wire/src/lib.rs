@@ -38,6 +38,8 @@ pub use crate::schema::{
     ServiceSchema, TypeSchema,
 };
 pub use crate::status::{WireCode, WireStatus};
+#[cfg(not(target_family = "wasm"))]
+pub use crate::transport::serve_dispatched;
 pub use crate::transport::{
     AuthLevel, Dispatcher, Inbound, MethodMarker, PeerIdentity, RecvHalf, SendHalf, ServiceMarker,
     Stream, StreamTransport, TransportContext,

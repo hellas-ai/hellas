@@ -746,7 +746,7 @@ async fn run_indexer(command: IndexerCommand) -> CliResult {
             let trust = serde_json::from_slice(&fs::read(&trust)?)?;
             let genesis_json = genesis.map(fs::read).transpose()?;
             tokio::task::spawn_blocking(move || {
-                hellas_chain::explorer_origin::run(hellas_chain::explorer_origin::OriginOptions {
+                hellas_chain::indexer_api::run(hellas_chain::indexer_api::OriginOptions {
                     rpc,
                     trust,
                     genesis_json,
