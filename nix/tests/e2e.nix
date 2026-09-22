@@ -650,15 +650,51 @@ in
                   coins[parts[0]] = int(parts[1])
           return coins, output
 
-      def wait_coin(owner, value):
-          deadline = time.time() + 90
-          while time.time() < deadline:
-              coins, output = coin_map(owner)
-              matches = [object_id for object_id, amount in coins.items() if amount == value]
-              if len(matches) == 1:
-                  return matches[0]
+      # These waits used a fixed 90s wall clock. That budget assumes a quiet
+      # host: inside a CI VM the clock still runs at real time while the work
+      # does not, so a loaded runner fails a follower that is healthy and
+      # simply slow. `chain-edge-settlement` failed that way three times on
+      # commits that pass locally and on a dedicated builder, each time with
+      # the chain still producing views.
+      #
+      # Wait on progress instead. A follower that is still advancing keeps its
+      # budget renewed; only one that stalls for `stall` seconds fails, and
+      # `cap` bounds the whole wait so a genuinely wedged run cannot hang the
+      # job.
+      def wait_progress(check, describe, stall=90, cap=600):
+          start = time.time()
+          stall_deadline = start + stall
+          seen = follower_height()
+          while True:
+              done = check()
+              if done is not None:
+                  return done
+              if time.time() > start + cap:
+                  raise Exception(f"{describe()} (gave up after {cap}s)")
               time.sleep(1)
-          raise Exception(f"owner {owner} did not acquire one {value}-value coin:\n{output}")
+              height = follower_height()
+              if height > seen:
+                  # The follower moved, so this run is slow rather than stuck.
+                  seen = height
+                  stall_deadline = time.time() + stall
+              elif time.time() > stall_deadline:
+                  raise Exception(
+                      f"{describe()} (follower stalled at height {seen} for {stall}s)"
+                  )
+
+      def wait_coin(owner, value):
+          last = [""]
+
+          def check():
+              coins, output = coin_map(owner)
+              last[0] = output
+              matches = [object_id for object_id, amount in coins.items() if amount == value]
+              return matches[0] if len(matches) == 1 else None
+
+          return wait_progress(
+              check,
+              lambda: f"owner {owner} did not acquire one {value}-value coin:\n{last[0]}",
+          )
 
       def edge_output(edge_id):
           deadline = time.time() + 30
@@ -674,15 +710,21 @@ in
 
       def wait_edge(edge_id, present):
           try:
-              deadline = time.time() + 90
-              while time.time() < deadline:
+              last = [""]
+
+              def check():
                   output = edge_output(edge_id)
+                  last[0] = output
                   found = any(line.startswith("value ") for line in output.splitlines())
                   absent = "none" in output.splitlines()
                   if (present and found) or (not present and absent):
                       return int(latest_block()["height"])
-                  time.sleep(1)
-              raise Exception(f"edge {edge_id} presence did not become {present}:\n{output}")
+                  return None
+
+              return wait_progress(
+                  check,
+                  lambda: f"edge {edge_id} presence did not become {present}:\n{last[0]}",
+              )
           except Exception as err:
               procs = machine.succeed("ps aux | grep -i hellas | grep -v grep || true")
               follower = machine.succeed(f"tail -40 {follower_log} || true")
@@ -697,20 +739,28 @@ in
           return follower_height(), follower_activity_events()
 
       def wait_follower(baseline):
-          deadline = time.time() + 90
-          while time.time() < deadline:
+          def check():
               height = follower_height()
               events = follower_activity_events()
-              if height > baseline[0] and events > baseline[1]:
-                  return
-              time.sleep(1)
-          follower = machine.succeed(f"cat {follower_log} || true")
-          validator = machine.succeed(f"cat {validator_log} || true")
-          raise Exception(
-              f"follower did not advance after transition from height {baseline[0]} "
-              f"and {baseline[1]} activity events\n"
-              f"follower:\n{follower}\nvalidator:\n{validator}"
-          )
+              return True if height > baseline[0] and events > baseline[1] else None
+
+          try:
+              wait_progress(
+                  check,
+                  lambda: (
+                      f"follower did not advance after transition from height "
+                      f"{baseline[0]} and {baseline[1]} activity events"
+                  ),
+              )
+          except Exception as err:
+              # Keep `err`: it says whether the follower stalled or the hard
+              # cap expired, which is the difference between a wedged run and
+              # a slow one.
+              follower = machine.succeed(f"cat {follower_log} || true")
+              validator = machine.succeed(f"cat {validator_log} || true")
+              raise Exception(
+                  f"{err}\nfollower:\n{follower}\nvalidator:\n{validator}"
+              ) from err
 
       machine.succeed(
           "printf '0000000000000000000000000000000000000000000000000000000000000001\\n' "
