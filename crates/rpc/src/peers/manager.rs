@@ -22,7 +22,7 @@ use super::{
 /// Timestamps are milliseconds since the manager was constructed — not wall
 /// clock. This means age and latency arithmetic is immune to NTP/manual clock
 /// changes. Absolute calendar timestamps must be carried in caller-owned
-/// fields, not derived from `PeerEntry::{first_seen_ms, last_seen_ms}`.
+/// fields, not derived from `PeerEntry::last_seen_ms`.
 #[derive(Clone, Debug)]
 pub struct PeerManager {
     registry: Arc<Mutex<PeerRegistry>>,
@@ -134,7 +134,7 @@ impl PeerManager {
     }
 
     /// Record that a peer just made an inbound request. Bumps the
-    /// per-peer `total_requests` + `last_seen_ms` + RTT EMA; ensures
+    /// per-peer `last_seen_ms` + RTT EMA; ensures
     /// the peer exists in the registry. No rate-limit policy lives
     /// here — callers that need to reject abusive peers wrap their
     /// dispatch in middleware that consults their own bucket. Handler

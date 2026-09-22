@@ -183,7 +183,6 @@ pub enum ServiceStatus {
 pub struct ServiceState {
     pub service: &'static str,
     pub status: ServiceStatus,
-    pub first_seen_ms: u64,
     pub last_seen_ms: u64,
     pub transport_security: TransportSecurity,
     pub success_count: u64,
@@ -197,7 +196,6 @@ impl ServiceState {
         Self {
             service,
             status: ServiceStatus::Observed,
-            first_seen_ms: now_ms,
             last_seen_ms: now_ms,
             transport_security,
             success_count: 0,
@@ -233,7 +231,6 @@ impl ServiceState {
 #[derive(Clone, Debug, PartialEq)]
 pub struct PeerEntry {
     pub id: PeerId,
-    pub first_seen_ms: u64,
     pub last_seen_ms: u64,
     pub last_source: Option<DiscoverySource>,
     pub transport_security: TransportSecurity,
@@ -244,9 +241,6 @@ pub struct PeerEntry {
     pub success_count: u64,
     pub error_count: u64,
     pub cancelled_count: u64,
-    pub total_requests: u64,
-    pub invalid_request_count: u64,
-    pub rate_limited_count: u64,
     pub in_flight: usize,
     pub last_error: Option<String>,
     /// Set by `PeerEvent::Forgotten` when the peer still has outstanding
@@ -262,7 +256,6 @@ impl PeerEntry {
     fn new(id: PeerId, now_ms: u64, bucket_capacity: f64, rtt_alpha: f64) -> Self {
         Self {
             id,
-            first_seen_ms: now_ms,
             last_seen_ms: now_ms,
             last_source: None,
             transport_security: TransportSecurity::Untrusted,
@@ -276,9 +269,6 @@ impl PeerEntry {
             success_count: 0,
             error_count: 0,
             cancelled_count: 0,
-            total_requests: 0,
-            invalid_request_count: 0,
-            rate_limited_count: 0,
             in_flight: 0,
             last_error: None,
             tombstoned: false,
@@ -448,7 +438,7 @@ impl PeerRegistry {
     }
 
     /// Record an inbound request from a peer. Ensures the peer is
-    /// tracked, bumps `total_requests` + `last_seen_ms`, and records
+    /// tracked, bumps `last_seen_ms`, and records
     /// any observed RTT into the EMA. No rate-limit decision is made
     /// here; admission-policy logic lives at the caller's middleware
     /// layer when it exists (today: only esp32 calls this directly,
@@ -472,7 +462,6 @@ impl PeerRegistry {
             });
         };
         entry.last_seen_ms = now_ms;
-        entry.total_requests = entry.total_requests.saturating_add(1);
         if let Some(rtt_ms) = rtt_ms {
             entry.rtt.record(rtt_ms);
         }
@@ -621,9 +610,7 @@ impl PeerRegistry {
             PeerEvent::LabelSet { label } => {
                 entry.label = Some(truncate_string(label, max_label_len));
             }
-            PeerEvent::InvalidRequest => {
-                entry.invalid_request_count = entry.invalid_request_count.saturating_add(1);
-            }
+            PeerEvent::InvalidRequest => {}
             PeerEvent::Forgotten => unreachable!("forgotten events are handled before insert"),
         }
 
@@ -674,7 +661,6 @@ impl PeerRegistry {
             self.config.bucket_capacity,
             self.config.bucket_refill_per_sec,
         ) {
-            entry.rate_limited_count = entry.rate_limited_count.saturating_add(1);
             return Err(AcquireDenied::RateLimited {
                 peer,
                 retry_after_ms,
@@ -682,7 +668,6 @@ impl PeerRegistry {
         }
 
         entry.in_flight += 1;
-        entry.total_requests = entry.total_requests.saturating_add(1);
         entry.last_seen_ms = now_ms;
         self.total_in_flight += 1;
 
