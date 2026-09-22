@@ -240,6 +240,11 @@ let
         builtins.removeAttrs baseChecks [
           "validator"
           "chain-setup"
+          # Same reason as `validator` above: validators are deployed on x86
+          # only, so the feature set is not built on other hosts. Linting it
+          # there would widen what non-x86 runners compile without widening
+          # what they ship.
+          "chain-validator-lint"
         ]
     )
     // extraChecks;

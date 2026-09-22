@@ -9,7 +9,7 @@ use crate::{
 };
 use axum::{
     Router,
-    extract::{OriginalUri, Path, Query, State},
+    extract::{OriginalUri, Path, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
     routing::get,
@@ -239,7 +239,7 @@ struct TransactionQuery {
 async fn transaction(
     State(state): State<OriginState>,
     Path(tx): Path<String>,
-    Query(query): Query<TransactionQuery>,
+    crate::http_api::ApiQuery(query): crate::http_api::ApiQuery<TransactionQuery>,
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
 ) -> Response {
@@ -344,14 +344,17 @@ fn owner_snapshot_unavailable(
 async fn address(
     State(state): State<OriginState>,
     Path(owner): Path<String>,
-    Query(query): Query<AddressQuery>,
+    crate::http_api::ApiQuery(query): crate::http_api::ApiQuery<AddressQuery>,
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
 ) -> Response {
+    // Normalise Accept before validating anything, so a rejected request is
+    // encoded the same way an accepted one would have been. Parsing the owner
+    // first made `/proof` errors JSON while `/proof` successes were protobuf.
+    let headers = default_proof_accept(headers, &uri);
     let Ok(owner) = owner.parse::<crate::domain::SettlementKey>() else {
         return failure(&headers, StatusCode::BAD_REQUEST, "invalid owner");
     };
-    let headers = default_proof_accept(headers, &uri);
     let Some(protobuf) = representation(&headers) else {
         return failure(
             &headers,
@@ -494,7 +497,7 @@ async fn answer(
         ),
     }
 }
-fn default_proof_accept(mut headers: HeaderMap, uri: &axum::http::Uri) -> HeaderMap {
+pub(crate) fn default_proof_accept(mut headers: HeaderMap, uri: &axum::http::Uri) -> HeaderMap {
     if !headers.contains_key(header::ACCEPT) && uri.path().ends_with("/proof") {
         headers.insert(
             header::ACCEPT,
@@ -913,6 +916,108 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(absent.status(), StatusCode::SERVICE_UNAVAILABLE);
+        });
+    }
+    #[test]
+    fn a_rejected_owner_on_proof_answers_in_protobuf() {
+        crate::execution::test_support::run_qmdb(|context| async move {
+            let owner = crate::domain::SettlementKey::from(
+                hellas_kernel::Secp256k1Signer::from_secret_scalar([19; 32])
+                    .unwrap()
+                    .party_key(),
+            );
+            let h = crate::edge_index::ReplayHarness::new(
+                context.child("h"),
+                vec![(owner, 100)],
+                "origin-empty",
+            )
+            .await;
+            let (indexer, _handle) = crate::spawn_follower_indexer(
+                context.child("follower"),
+                "origin-empty-test",
+                Config::default(),
+                h.committee.verifier.clone(),
+                h.head,
+            )
+            .await
+            .unwrap();
+            let app = router(OriginState {
+                edge_index: h.index,
+                indexer,
+                replay: Arc::new(::tokio::sync::Mutex::new(h.replay)),
+                verifier: Arc::new(h.verifier),
+                network_id: HELLAS_DEVNET_1_ID.into(),
+            });
+            let request =
+                axum::http::Request::builder().uri("/api/v1/addresses/not-an-owner/proof");
+            let response = app
+                .oneshot(request.body(axum::body::Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let status = response.status();
+            let headers = response.headers().clone();
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(headers[header::CONTENT_TYPE], "application/x-protobuf");
+            assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+            assert_eq!(headers[header::VARY], "Accept");
+            let error =
+                <crate::edge_index::types::IndexError as prost::Message>::decode(body).unwrap();
+            assert_eq!(error.code, "invalid_request");
+        });
+    }
+
+    #[test]
+    fn a_rejected_query_parameter_answers_in_protobuf() {
+        crate::execution::test_support::run_qmdb(|context| async move {
+            let owner = crate::domain::SettlementKey::from(
+                hellas_kernel::Secp256k1Signer::from_secret_scalar([19; 32])
+                    .unwrap()
+                    .party_key(),
+            );
+            let h = crate::edge_index::ReplayHarness::new(
+                context.child("h"),
+                vec![(owner, 100)],
+                "origin-empty",
+            )
+            .await;
+            let (indexer, _handle) = crate::spawn_follower_indexer(
+                context.child("follower"),
+                "origin-empty-test",
+                Config::default(),
+                h.committee.verifier.clone(),
+                h.head,
+            )
+            .await
+            .unwrap();
+            let app = router(OriginState {
+                edge_index: h.index,
+                indexer,
+                replay: Arc::new(::tokio::sync::Mutex::new(h.replay)),
+                verifier: Arc::new(h.verifier),
+                network_id: HELLAS_DEVNET_1_ID.into(),
+            });
+            let request = axum::http::Request::builder()
+                .uri("/api/v1/transactions/0000000000000000000000000000000000000000000000000000000000000000/proof?height=bad");
+            let request = request.header(header::ACCEPT, "application/x-protobuf");
+            let response = app
+                .oneshot(request.body(axum::body::Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let status = response.status();
+            let headers = response.headers().clone();
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(headers[header::CONTENT_TYPE], "application/x-protobuf");
+            assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+            assert_eq!(headers[header::VARY], "Accept");
+            let error =
+                <crate::edge_index::types::IndexError as prost::Message>::decode(body).unwrap();
+            assert_eq!(error.code, "invalid_request");
         });
     }
 }

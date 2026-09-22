@@ -153,3 +153,41 @@ pub(crate) fn failure(headers: &HeaderMap, status: StatusCode, message: &str) ->
             .into_response(),
     }
 }
+
+/// `Query<T>` that reports rejection through [`failure`].
+///
+/// Axum's own `Query` rejection is emitted before any handler runs, so it
+/// escapes the negotiated error layer entirely: a malformed `?height=bad`
+/// came back as `400 text/plain` with none of the shared headers, no code,
+/// and no protobuf encoding, however the client had negotiated. Extractors
+/// run first, so uniformity has to be implemented here rather than in the
+/// handler.
+pub(crate) struct ApiQuery<T>(pub(crate) T);
+
+impl<S, T> axum::extract::FromRequestParts<S> for ApiQuery<T>
+where
+    T: serde::de::DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        match axum::extract::Query::<T>::from_request_parts(parts, state).await {
+            Ok(axum::extract::Query(value)) => Ok(Self(value)),
+            Err(rejection) => {
+                // Honour the same `Accept` defaulting the handlers apply, so a
+                // `/proof` rejection is protobuf exactly like a `/proof` answer.
+                let headers =
+                    crate::indexer_api::default_proof_accept(parts.headers.clone(), &parts.uri);
+                Err(failure(
+                    &headers,
+                    StatusCode::BAD_REQUEST,
+                    rejection.body_text().as_str(),
+                ))
+            }
+        }
+    }
+}
