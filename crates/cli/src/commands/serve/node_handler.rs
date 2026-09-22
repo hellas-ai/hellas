@@ -1,6 +1,6 @@
 //! `NodeHandler` impl for `hellas serve node`.
 //!
-//! Surfaces self-identity + uptime via `get_node_info` and a ranked
+//! Surfaces self-identity + uptime via `get_node_info` and a filtered
 //! view of known peers via `get_known_peers`. Backed by the
 //! `PeerDirectory` the server constructs at spawn time.
 //!
@@ -80,7 +80,7 @@ impl NodeHandler for NodeHandlerImpl {
         const DISCLOSURE_LIMIT: usize = 64;
         let peers = self
             .directory
-            .ranked_known_peers(requester, &request.service_alpn, DISCLOSURE_LIMIT)
+            .known_peers(requester, &request.service_alpn, DISCLOSURE_LIMIT)
             .map_err(|e| WireStatus::new(WireCode::Internal, format!("known peers: {e}")))?;
         Ok(WithTrailer::new(GetKnownPeersResponse {
             peer_ids: peers.into_iter().map(|id| id.as_bytes().to_vec()).collect(),

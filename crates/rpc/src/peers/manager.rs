@@ -68,19 +68,9 @@ impl PeerManager {
         Ok(read(&registry))
     }
 
-    /// Mutable counterpart to [`Self::with_registry`], for callers that must
-    /// supply their own `now_ms` rather than read this manager's clock.
-    ///
-    /// `PeerRegistry` is the deterministic sans-io state machine and every one
-    /// of its mutators already takes an explicit timestamp; `PeerManager` only
-    /// adds `Instant`-derived time on top. Tests that need several peers to
-    /// share one timestamp — so that score ties are genuine ties — have no way
-    /// to express that through the wall-clock wrappers.
-    ///
-    /// Test-only on purpose. Production code must go through the wall-clock
-    /// wrappers so that every stored timestamp comes from one monotonic
-    /// source; handing out a mutable registry with a caller-chosen `now_ms`
-    /// would make that guarantee unenforceable.
+    /// Mutable registry access for tests that need explicit observation times,
+    /// e.g. to exercise exact disclosure freshness boundaries. Production code
+    /// uses the clock wrappers so timestamps share one monotonic source.
     #[cfg(test)]
     pub(crate) fn with_registry_mut<R>(
         &self,
