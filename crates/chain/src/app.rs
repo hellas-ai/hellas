@@ -54,7 +54,7 @@ use prometheus_client::metrics::gauge::Gauge;
 #[cfg(feature = "validator")]
 use rand::Rng;
 #[cfg(feature = "validator")]
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 #[cfg(feature = "validator")]
 use std::sync::Arc;
 #[cfg(feature = "validator")]
@@ -85,7 +85,8 @@ impl Default for ApplicationConfig {
 //
 // The two things that put a transaction in it are `rpc.rs`, the submit
 // path, and `server.rs`, the socket in front of that path; the one thing
-// that takes transactions out is `StatefulApplication::propose` below.
+// that removes included transactions is `StatefulApplication::finalized`.
+// Invalid candidates are also pruned only against finalized state.
 // All three are `validator`. A follower forwards what it is handed
 // upstream through its light client and proposes no block, so on an
 // `indexer` build this held nothing and nobody read it — the same reason
@@ -100,6 +101,18 @@ pub const RESPONSE_MEMPOOL_CAPACITY: usize = 64;
 /// Canonical chain encoding of one `PaymentCloseResponse` transaction.
 #[cfg(feature = "validator")]
 pub const RESPONSE_TRANSACTION_BYTES: usize = 274;
+/// Mempool residents re-executed against committed state per finalized block.
+///
+/// Post-finalization reconciliation runs inside `finalized`, which consensus
+/// awaits, so its cost is paid by every validator on every block. Bounding it
+/// keeps that cost independent of how full the pool is; the offset rotates
+/// with height, so a pool of `GENERAL_MEMPOOL_CAPACITY +
+/// RESPONSE_MEMPOOL_CAPACITY` is still fully covered within a handful of
+/// blocks. Pruning is an optimisation and nothing depends on it happening in
+/// the same block that invalidated a transaction: `propose` re-checks every
+/// candidate it picks up.
+#[cfg(feature = "validator")]
+pub const RECONCILED_PER_BLOCK: usize = 32;
 
 #[cfg(feature = "validator")]
 #[derive(Clone)]
@@ -127,13 +140,6 @@ pub(crate) type ResponseSlot = (hellas_kernel::EdgeId, hellas_kernel::StartId);
 pub(crate) struct MempoolState {
     pub(crate) general: VecDeque<MempoolEntry>,
     pub(crate) responses: BTreeMap<ResponseSlot, MempoolEntry>,
-}
-
-#[cfg(feature = "validator")]
-struct MempoolSnapshot {
-    transactions: Vec<Transaction>,
-    general_digests: Vec<Digest>,
-    response_digests: BTreeMap<ResponseSlot, Digest>,
 }
 
 #[cfg(feature = "validator")]
@@ -173,56 +179,26 @@ impl Mempool {
             .collect()
     }
 
-    /// Proposal-time only. The one caller is
-    /// `StatefulApplication::propose`, which is what makes this whole
-    /// file's mempool a validator's.
-    async fn snapshot(&self) -> MempoolSnapshot {
+    async fn snapshot(&self) -> Vec<Transaction> {
         let mempool = self.inner.lock().await;
-        let response_digests = mempool
-            .responses
-            .iter()
-            .map(|(slot, entry)| (*slot, entry.digest))
-            .collect();
-        let general_digests = mempool.general.iter().map(|entry| entry.digest).collect();
-        let transactions = mempool
+        mempool
             .responses
             .values()
             .chain(mempool.general.iter())
             .map(|entry| entry.transaction.clone())
-            .collect();
-        MempoolSnapshot {
-            transactions,
-            general_digests,
-            response_digests,
-        }
+            .collect()
     }
 
-    async fn commit_snapshot(&self, snapshot: MempoolSnapshot, retained: Vec<Transaction>) {
+    async fn remove(&self, digests: &BTreeSet<Digest>) {
         let mut mempool = self.inner.lock().await;
-        for (slot, digest) in snapshot.response_digests {
-            if mempool
-                .responses
-                .get(&slot)
-                .is_some_and(|entry| entry.digest == digest)
-            {
-                mempool.responses.remove(&slot);
-            }
-        }
+        // Exact-digest removal cannot replace a newer response or reinsert an
+        // entry removed while validation was in flight.
         mempool
             .general
-            .retain(|entry| !snapshot.general_digests.contains(&entry.digest));
-
-        let mut retained_general = VecDeque::new();
-        for transaction in retained {
-            let entry = MempoolEntry::new(transaction);
-            if let Some(slot) = response_slot(&entry.transaction) {
-                mempool.responses.entry(slot).or_insert(entry);
-            } else {
-                retained_general.push_back(entry);
-            }
-        }
-        retained_general.append(&mut mempool.general);
-        mempool.general = retained_general;
+            .retain(|entry| !digests.contains(&entry.digest));
+        mempool
+            .responses
+            .retain(|_, entry| !digests.contains(&entry.digest));
     }
 }
 
@@ -259,9 +235,16 @@ pub struct Application {
     owner_index: OwnerIndex,
     #[cfg(feature = "validator")]
     verifier: Arc<ChainVerifier>,
+    #[cfg(feature = "validator")]
+    mempool: Mempool,
 }
 
 impl Application {
+    #[cfg(feature = "validator")]
+    pub(crate) fn mempool(&self) -> Mempool {
+        self.mempool.clone()
+    }
+
     pub fn genesis_block(&self) -> HellasBlock {
         self.genesis.clone()
     }
@@ -307,6 +290,8 @@ impl Application {
             owner_index,
             #[cfg(feature = "validator")]
             verifier: Arc::new(ChainVerifier::new()),
+            #[cfg(feature = "validator")]
+            mempool: Mempool::default(),
         }
     }
 }
@@ -369,26 +354,56 @@ where
         let mut ancestry = Box::pin(ancestry);
         let parent = ancestry.next().await?;
         let snapshot = input.snapshot().await;
-        let response_count = snapshot.response_digests.len();
+        // A proposed block is not a commitment. Keep resident transactions
+        // until finality, but do not execute them twice in one ancestry.
+        let finalized_height = self.owner_index.cursor().height;
+        let resident_digests: BTreeSet<_> = snapshot
+            .iter()
+            .map(|tx| Sha256::hash(&tx.encode()))
+            .collect();
+        let mut ancestor_transactions = BTreeSet::new();
+        let mut ancestor = Some(parent.clone());
+        if !snapshot.is_empty() {
+            while let Some(block) = ancestor {
+                if block.height().get() <= finalized_height {
+                    break;
+                }
+                ancestor_transactions.extend(
+                    block
+                        .txs()
+                        .iter()
+                        .map(|tx| Sha256::hash(&tx.encode()))
+                        .filter(|digest| resident_digests.contains(digest)),
+                );
+                if ancestor_transactions.len() == resident_digests.len() {
+                    break;
+                }
+                ancestor = ancestry.next().await;
+            }
+        }
+        let pending: Vec<_> = snapshot
+            .into_iter()
+            .filter(|tx| !ancestor_transactions.contains(&Sha256::hash(&tx.encode())))
+            .collect();
+        let response_count = pending
+            .iter()
+            .take_while(|tx| response_slot(tx).is_some())
+            .count();
         let response_bytes = response_count.saturating_mul(RESPONSE_TRANSACTION_BYTES);
         let general_count_budget = MAX_TXS_PER_BLOCK.saturating_sub(response_count);
         let general_byte_budget = MAX_BLOCK_TX_BYTES.saturating_sub(response_bytes);
-        let (responses, general) = snapshot.transactions.split_at(response_count);
+        let (responses, general) = pending.split_at(response_count);
         debug_assert!(responses.iter().all(|transaction| {
             crate::light_client::canonical_submission_size(transaction)
                 == RESPONSE_TRANSACTION_BYTES
         }));
         let mut candidates = responses.to_vec();
-        let mut deferred_general = Vec::new();
         let mut general_bytes = 0_usize;
-        let mut general = general.iter().cloned();
-        while let Some(transaction) = general.next() {
+        for transaction in general.iter().cloned() {
             let next_bytes = general_bytes.saturating_add(transaction.encode_size());
             if candidates.len().saturating_sub(response_count) >= general_count_budget
                 || next_bytes > general_byte_budget
             {
-                deferred_general.push(transaction);
-                deferred_general.extend(general);
                 break;
             }
             general_bytes = next_bytes;
@@ -396,7 +411,7 @@ where
         }
         let block_height = Height::new(parent.height().get() + 1);
         let block_parent = parent.digest();
-        let (batches, txs, mut retained) = match execute_proposal(
+        let (batches, txs, _retained) = match execute_proposal(
             kernel_context(self.network, block_height, block_parent),
             self.verifier.as_ref(),
             candidates,
@@ -413,10 +428,8 @@ where
                 return None;
             }
         };
-        retained.extend(deferred_general);
         let owner_root = crate::execution::owner_tree::root(&batches).await.ok()?;
         let merkleized = batches.merkleize().await.expect("UTXO merkleize failed");
-        input.commit_snapshot(snapshot, retained).await;
 
         let timestamp = runtime.current().epoch_millis().max(parent.timestamp());
         let block = HellasBlock::new(
@@ -525,13 +538,82 @@ where
         &mut self,
         _context: (E, Self::Context),
         block: &Self::Block,
-        _databases: &Self::Databases,
+        databases: &Self::Databases,
     ) {
         self.finalized_height
             .set(i64::try_from(block.height().get()).unwrap_or(i64::MAX));
         self.owner_index
             .apply_finalized(block)
             .expect("finalized block indexing failed");
+        self.mempool
+            .remove(
+                &block
+                    .txs()
+                    .iter()
+                    .map(|tx| Sha256::hash(&tx.encode()))
+                    .collect(),
+            )
+            .await;
+        // Reconcile against committed state, never a speculative proposal.
+        // Each candidate gets its own disposable batch so one candidate's
+        // effects cannot invalidate another.
+        // Startup/state-sync notifications may trail the database checkpoint.
+        if self.owner_index.cursor().height == block.height().get()
+            && databases.read().await.root() == block.state_root()
+        {
+            let mut rejected = BTreeSet::new();
+            let candidates = self.mempool.snapshot().await;
+            // Admission caps how many transactions the pool holds, not how
+            // often each is re-examined. Reconciling the whole pool here
+            // would make every validator pay one full kernel execution per
+            // resident per block, and `submit_general` admits without
+            // semantic validation while `ObjectNotFound` is transient and so
+            // retained -- a peer can park `GENERAL_MEMPOOL_CAPACITY`
+            // never-includable transactions and have them re-verified
+            // forever. Examine a bounded window instead, starting at an
+            // offset derived from the height so the whole pool is still
+            // covered, just across several blocks rather than all at once.
+            let examined = candidates.len().min(RECONCILED_PER_BLOCK);
+            let start = if candidates.is_empty() {
+                0
+            } else {
+                usize::try_from(block.height().get() % candidates.len() as u64).unwrap_or(0)
+            };
+            for offset in 0..examined {
+                let transaction = &candidates[(start + offset) % candidates.len()];
+                let digest = Sha256::hash(&transaction.encode());
+                let outcome = execute_proposal(
+                    kernel_context(
+                        self.network,
+                        Height::new(block.height().get() + 1),
+                        block.digest(),
+                    ),
+                    self.verifier.as_ref(),
+                    vec![transaction.clone()],
+                    &self.genesis_allocations,
+                    MAX_TXS_PER_BLOCK,
+                    MAX_BLOCK_TX_BYTES,
+                    databases.new_batches().await,
+                )
+                .await;
+                // `propose` treats this same error set as a skipped round
+                // (see `proposal execution failed` above). Pruning is an
+                // optimisation -- a transaction left in the pool is retried
+                // next block -- so a storage fault must not be more fatal
+                // here than it is there.
+                let (_, included, retained) = match outcome {
+                    Ok(outcome) => outcome,
+                    Err(err) => {
+                        error!(?err, "finalized mempool validation failed");
+                        break;
+                    }
+                };
+                if included.is_empty() && retained.is_empty() {
+                    rejected.insert(digest);
+                }
+            }
+            self.mempool.remove(&rejected).await;
+        }
         info!(
             name: "app.finalized",
             height = %block.height(),
@@ -653,6 +735,11 @@ mod tests {
         candidates: Vec<Transaction>,
         label: &'static str,
     ) -> (Proposed<Application, tokio::Context>, Vec<Transaction>) {
+        if parent.height().get() > app.owner_index.cursor().height {
+            app.owner_index
+                .apply_finalized(parent)
+                .expect("finalized test parent");
+        }
         let mut mempool = Mempool::default();
         for tx in candidates {
             mempool.test_submit(tx).await;
@@ -666,7 +753,7 @@ mod tests {
             )
             .await
             .expect("application proposal");
-        (proposed, mempool.snapshot().await.transactions)
+        (proposed, mempool.snapshot().await)
     }
 
     async fn verifies_from(
@@ -711,6 +798,115 @@ mod tests {
     }
 
     #[test]
+    fn abandoned_proposal_keeps_accepted_transaction_for_retry() {
+        run_qmdb(|runtime| async move {
+            let fixture = kernel_fixture(100).expect("kernel fixture");
+            let mut app = Application::new(
+                runtime.child("app"),
+                crate::domain::TEST_NETWORK,
+                validator_key(0).public_key(),
+                fixture.allocations.clone(),
+                "abandoned_proposal_app",
+                ApplicationConfig {
+                    page_cache_size: 1024,
+                    page_cache_count: 8,
+                },
+            )
+            .await;
+            let database_context = runtime.child("database");
+            let config = utxo_db_config(&database_context, "abandoned_proposal_db", 1024, 8);
+            let database =
+                <UtxoDatabase<_> as DatabaseSet<_>>::init(database_context, config).await;
+            let genesis = app.genesis_block();
+            let mut mempool = app.mempool();
+            let transaction = Transaction::Kernel(fixture.open.clone());
+            let bad_auth = Transaction::Kernel(fixture.bad_auth_open().expect("invalid signature"));
+            // An empty finalized block from another proposer must prune bad
+            // signatures without consuming this node's valid pending Open.
+            let mut empty_pool = Mempool::default();
+            let empty = app
+                .propose(
+                    (runtime.child("empty"), next_consensus_context(&genesis)),
+                    stream::iter([Arc::new(genesis.clone())]),
+                    database.new_batches().await,
+                    &mut empty_pool,
+                )
+                .await
+                .expect("empty block");
+            mempool.test_submit(transaction.clone()).await;
+            mempool.test_submit(bad_auth).await;
+            let Proposed {
+                block: parent,
+                merkleized,
+            } = empty;
+            database.finalize(merkleized).await;
+            app.finalized(
+                (runtime.child("empty_finalized"), parent.context()),
+                &parent,
+                &database,
+            )
+            .await;
+            assert_eq!(mempool.test_transactions().await.len(), 1);
+            let genesis = parent;
+            assert_eq!(
+                mempool.test_submit(transaction.clone()).await,
+                SubmitTxOutcome::Duplicate
+            );
+            for label in ["abandoned", "retry"] {
+                let proposed = app
+                    .propose(
+                        (runtime.child(label), next_consensus_context(&genesis)),
+                        stream::iter([Arc::new(genesis.clone())]),
+                        database.new_batches().await,
+                        &mut mempool,
+                    )
+                    .await
+                    .expect("proposal");
+                assert_eq!(proposed.block.txs().len(), 1);
+                assert_eq!(proposed.block.txs()[0].encode(), transaction.encode());
+                // Consensus may abandon this completed proposal after its view
+                // times out. Neither the block nor its batches are finalized.
+                drop(proposed);
+            }
+            let proposed = app
+                .propose(
+                    (
+                        runtime.child("to_finalize"),
+                        next_consensus_context(&genesis),
+                    ),
+                    stream::iter([Arc::new(genesis.clone())]),
+                    database.new_batches().await,
+                    &mut mempool,
+                )
+                .await
+                .expect("proposal to finalize");
+            let Proposed { block, merkleized } = proposed;
+            // Supply this parent's state without notifying Application yet:
+            // descendant selection must skip its tx, but retain it in the pool.
+            database.finalize(merkleized).await;
+            let descendant = app
+                .propose(
+                    (runtime.child("descendant"), next_consensus_context(&block)),
+                    stream::iter([Arc::new(block.clone()), Arc::new(genesis)]),
+                    database.new_batches().await,
+                    &mut mempool,
+                )
+                .await
+                .expect("descendant proposal");
+            assert!(descendant.block.txs().is_empty());
+            assert_eq!(mempool.test_transactions().await.len(), 1);
+            app.finalized(
+                (runtime.child("finalized"), block.context()),
+                &block,
+                &database,
+            )
+            .await;
+            assert!(mempool.test_transactions().await.is_empty());
+            runtime.stop(0, None).await.unwrap();
+        });
+    }
+
+    #[test]
     fn proposal_and_verify_use_block_height_at_timeout_boundary() {
         run_qmdb(|runtime| async move {
             let fixture = kernel_fixture(3).expect("kernel fixture");
@@ -741,7 +937,7 @@ mod tests {
                 "propose_open",
             )
             .await;
-            assert!(remaining.is_empty());
+            assert_eq!(remaining.len(), 1);
             assert!(matches!(
                 open.block.txs(),
                 [Transaction::Kernel(tx)] if tx == &fixture.open
@@ -774,7 +970,7 @@ mod tests {
                 "propose_mutual_before_timeout",
             )
             .await;
-            assert!(remaining.is_empty());
+            assert_eq!(remaining.len(), 1);
             assert!(matches!(
                 mutual_before_timeout.block.txs(),
                 [Transaction::Kernel(tx)] if tx == &fixture.mutual_close
@@ -832,6 +1028,45 @@ mod tests {
             .await;
             assert!(empty_height_two.block.txs().is_empty());
             assert!(remaining.is_empty());
+            // A valid signature can fail only because a speculative branch
+            // reached its expiry. Abandoning that branch must allow retry on
+            // the shorter finalized ancestry, where it is still valid.
+            let mut branch_pool = Mempool::default();
+            branch_pool
+                .test_submit(Transaction::Kernel(fixture.mutual_close.clone()))
+                .await;
+            let expired_branch = app
+                .propose(
+                    (
+                        runtime.child("expired_branch"),
+                        next_consensus_context(&empty_height_two.block),
+                    ),
+                    stream::iter([
+                        Arc::new(empty_height_two.block.clone()),
+                        Arc::new(open_block.clone()),
+                    ]),
+                    UtxoDatabase::<tokio::Context>::fork_batches(&empty_height_two.merkleized),
+                    &mut branch_pool,
+                )
+                .await
+                .expect("expired speculative proposal");
+            assert!(expired_branch.block.txs().is_empty());
+            assert_eq!(branch_pool.test_transactions().await.len(), 1);
+            let retry = app
+                .propose(
+                    (
+                        runtime.child("shorter_branch"),
+                        next_consensus_context(&open_block),
+                    ),
+                    stream::iter([Arc::new(open_block.clone())]),
+                    database.new_batches().await,
+                    &mut branch_pool,
+                )
+                .await
+                .expect("retry on finalized parent");
+            assert!(
+                matches!(retry.block.txs(), [Transaction::Kernel(tx)] if tx == &fixture.mutual_close)
+            );
             let Proposed {
                 block: height_two_block,
                 merkleized,
@@ -839,7 +1074,7 @@ mod tests {
             database.finalize(merkleized).await;
 
             // Height 3 is the timeout: mutual close is now ProofExpired and is
-            // dropped, while timeout close becomes admissible.
+            // omitted (pruned at finalization), while timeout close becomes admissible.
             let (mutual_at_timeout, remaining) = propose_from(
                 &mut app,
                 &runtime,
@@ -850,7 +1085,7 @@ mod tests {
             )
             .await;
             assert!(mutual_at_timeout.block.txs().is_empty());
-            assert!(remaining.is_empty());
+            assert_eq!(remaining.len(), 1);
             let expired_mutual = candidate_block(
                 &height_two_block,
                 Transaction::Kernel(fixture.mutual_close.clone()),
@@ -876,7 +1111,7 @@ mod tests {
                 "propose_timeout_at_height",
             )
             .await;
-            assert!(remaining.is_empty());
+            assert_eq!(remaining.len(), 1);
             assert!(matches!(
                 timeout_at_height.block.txs(),
                 [Transaction::Kernel(tx)] if tx == &fixture.timeout_close

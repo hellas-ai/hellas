@@ -4,7 +4,7 @@ use crate::domain::{
 };
 use crate::{
     ActivityReporter, Application, ApplicationConfig, BlockStore, ChainIndexer, ConsensusInfo,
-    LightClientRpcState, Mempool, OwnerIndex, UtxoDb,
+    LightClientRpcState, OwnerIndex, UtxoDb,
     config::{
         Config, ConfigError, Genesis, GenesisEntry, GenesisValidator, PeerEntry, ValidatorConfig,
         encode_private_key, encode_threshold_polynomial, encode_threshold_share,
@@ -1098,7 +1098,6 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
         let fetch_concurrent =
             NonZeroUsize::new(chain_config.fetch_concurrent).unwrap_or(NonZeroUsize::MIN);
         let max_pending_acks = NZUsize!(1);
-        let mempool = Mempool::default();
         let genesis_leader = scheme
             .participants()
             .iter()
@@ -1117,6 +1116,7 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
             },
         )
         .await;
+        let mempool = application.mempool();
         let owner_index = application.owner_index();
         if let Err(err) = replay_owner_index(&owner_index, &finalized_blocks).await {
             error!(?err, "owner index replay failed");
