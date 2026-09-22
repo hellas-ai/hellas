@@ -4,6 +4,11 @@ use hellas_executor::{FetchProviderError, FetchProviderResponse, FetchProviderRe
 use reqwest::Url;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use std::time::Duration;
+use tracing::Instrument;
+
+#[cfg_attr(feature = "otel", path = "responses_fetch/telemetry/otel.rs")]
+#[cfg_attr(not(feature = "otel"), path = "responses_fetch/telemetry/noop.rs")]
+mod telemetry;
 
 /// Maximum diagnostic prefix retained from an unsuccessful HTTP response.
 const MAX_FETCH_ERROR_BODY_BYTES: usize = 2 * 1024;
@@ -36,20 +41,26 @@ pub async fn execute_responses_request(
     idempotency_key: &str,
     label: &str,
 ) -> Result<FetchProviderResponse, FetchProviderError> {
-    let upstream = client
-        .post(endpoint)
+    let mut telemetry = telemetry::Request::new(&endpoint);
+    let request = telemetry
+        .propagate(client.post(endpoint))
         .header(CONTENT_TYPE, "application/json")
         .header(AUTHORIZATION, format!("Bearer {bearer_token}"))
         .header("Idempotency-Key", idempotency_key)
-        .body(body)
+        .body(body);
+    let upstream = request
         .send()
+        .instrument(telemetry.span.clone())
         .await
         .map_err(|source| {
+            telemetry.fail("transport_error");
             FetchProviderError::failed(format!("{label} request failed: {source}"))
         })?;
 
     let status = upstream.status();
+    telemetry.status(status.as_u16());
     if !status.is_success() {
+        telemetry.fail("http_error");
         let diagnostic = error_body_prefix(upstream).await;
         tracing::warn!(
             provider = label,
@@ -70,17 +81,19 @@ pub async fn execute_responses_request(
         .and_then(|value| value.split(';').next())
         .map(str::trim);
     if !content_type.is_some_and(|value| value.eq_ignore_ascii_case("text/event-stream")) {
+        telemetry.fail("invalid_content_type");
         return Err(FetchProviderError::failed(format!(
             "{label} returned successful HTTP {status} without text/event-stream content"
         )));
     }
 
     let head = FetchProviderResponseHead {
-        effective_model: effective_model_from_headers(upstream.headers())?,
+        effective_model: effective_model_from_headers(upstream.headers())
+            .inspect_err(|_| telemetry.fail("invalid_response_headers"))?,
     };
     Ok(FetchProviderResponse {
         head,
-        stream: Box::pin(stream_response(upstream, label.to_string())),
+        stream: Box::pin(telemetry.stream(stream_response(upstream, label.to_string()))),
     })
 }
 

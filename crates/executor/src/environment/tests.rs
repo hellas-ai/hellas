@@ -91,6 +91,10 @@ fn environment(program: ContentRef, weights: ContentRef) -> CausalLmEnvironment 
         vec![4],
         32,
         64,
+        hellas_rpc::CausalLmGenerationSchedule {
+            fixed_capacity: 64,
+            prefill_chunk_tokens: 64,
+        },
     )
     .expect("valid fixture environment")
 }

@@ -169,7 +169,7 @@ struct OriginState {
 }
 
 fn router(state: OriginState) -> Router {
-    Router::new()
+    let router = Router::new()
         .route("/api/v1/edges", get(edge_index_http))
         .route("/api/v1/edges/{edge_id}", get(edge_index_http))
         .route("/api/v1/edges/{edge_id}/events", get(edge_index_http))
@@ -183,7 +183,12 @@ fn router(state: OriginState) -> Router {
         .route("/api/v1/transactions/{digest}/proof", get(transaction))
         .route("/api/v1/addresses/{owner}/proof", get(address))
         .route("/api/v1/addresses/{owner}", get(address))
-        .with_state(state)
+        .with_state(state);
+    #[cfg(feature = "otel")]
+    let router = router.layer(axum::middleware::from_fn(
+        hellas_rpc::telemetry::http::trace_request,
+    ));
+    router
 }
 
 async fn edge_index_http(

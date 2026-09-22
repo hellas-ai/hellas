@@ -2021,6 +2021,62 @@ fn a_finalized_bond_timeout_reclaims_the_stake_cleanly() {
     );
 }
 
+#[tokio::test]
+async fn setup_completes_without_waiting_for_a_quiet_chain() {
+    struct AdvancingBlocks {
+        history: Blocks,
+        reads: AtomicUsize,
+    }
+    impl FinalizedBlocks for AdvancingBlocks {
+        async fn latest_height(&self) -> Result<Option<u64>, BlockSourceError> {
+            let offset = self.reads.fetch_add(1, Ordering::SeqCst) + 1;
+            Ok(Some(scan().height + offset as u64))
+        }
+
+        async fn block_at(&self, height: u64) -> Result<Option<FinalizedWork>, BlockSourceError> {
+            self.history.block_at(height).await
+        }
+    }
+
+    let dir = temp();
+    let mut journal = completed_store(dir.path());
+    let payment_open = completed(countersigned(proposed()))
+        .payment_open()
+        .expect("the signed payment Open");
+    let blocks = AdvancingBlocks {
+        history: Blocks {
+            blocks: vec![
+                FinalizedWork {
+                    height: scan().height + 1,
+                    parent: scan().payload,
+                    payload: [0xa1; 32],
+                    txs: vec![payment_open],
+                },
+                FinalizedWork {
+                    height: scan().height + 2,
+                    parent: [0xa1; 32],
+                    payload: [0xa2; 32],
+                    txs: vec![],
+                },
+            ],
+        },
+        reads: AtomicUsize::new(0),
+    };
+    let view = LiveChannel::at(scan().height + 1, payment_object());
+    let advance = advance_setup(
+        &view,
+        &blocks,
+        &NoSink,
+        &mut journal,
+        &Secp256k1Verifier::new(),
+    )
+    .await
+    .expect("a moving tip does not postpone the setup decision");
+    assert!(matches!(advance.progress, SetupProgress::Complete(_)));
+    assert!(advance.mounted.is_some());
+    assert!(blocks.reads.load(Ordering::SeqCst) > 1);
+}
+
 /// A completed setup hands back the channel it mounted, opened at the
 /// origin it recorded and settled against the edge it read.
 ///
@@ -2051,15 +2107,6 @@ async fn a_completed_setup_hands_back_the_channel_it_mounted() {
     };
     let view = LiveChannel::at(scan().height + 1, overfunded_payment_object());
 
-    match advance_setup(&view, &blocks, &NoSink, &mut journal, &verifier).await {
-        Ok(advance) => match advance.progress {
-            SetupProgress::HistoryAdvanced { through } => {
-                assert_eq!(through, scan().height + 1);
-            }
-            other => panic!("the history batch is fetched first: {other:?}"),
-        },
-        Err(error) => panic!("the history batch is fetched first: {error}"),
-    }
     let advance = match advance_setup(&view, &blocks, &NoSink, &mut journal, &verifier).await {
         Ok(advance) => advance,
         Err(error) => panic!("a live leased pair completes: {error}"),
@@ -2241,21 +2288,6 @@ async fn a_setup_is_driven_while_its_alpn_is_served_from_the_same_journal() {
         reached: AtomicUsize::new(0),
         released: Arc::clone(&released),
     });
-
-    // The history batch, which is decided from blocks alone and never
-    // reaches the held view.
-    match service
-        .advance_setup(view.as_ref(), blocks.as_ref(), &NoSink)
-        .await
-    {
-        Ok(advance) => match advance.progress {
-            SetupProgress::HistoryAdvanced { through } => {
-                assert_eq!(through, scan().height + 1);
-            }
-            other => panic!("the history batch is fetched first: {other:?}"),
-        },
-        Err(error) => panic!("the history batch is fetched first: {error}"),
-    }
 
     // The completing step, stopped at its finalized read.
     let driving = tokio::spawn({
@@ -2614,18 +2646,7 @@ async fn a_mount_replays_a_same_block_contest() {
         ],
     };
 
-    // The history batch is fetched and journaled first, and the mount
-    // runs on the next step.
     let view = SurvivingPayment::at(scan().height + 2, payment_object());
-    match advance_setup(&view, &blocks, &NoSink, &mut journal, &verifier).await {
-        Ok(advance) => match advance.progress {
-            SetupProgress::HistoryAdvanced { through } => {
-                assert_eq!(through, scan().height + 2);
-            }
-            other => panic!("the history batch is fetched first: {other:?}"),
-        },
-        Err(error) => panic!("the history batch is fetched first: {error}"),
-    }
     let advance = match advance_setup(&view, &blocks, &NoSink, &mut journal, &verifier).await {
         Ok(advance) => advance,
         Err(error) => panic!("a bond-timed-out payment mounts close-only: {error}"),
@@ -2696,15 +2717,7 @@ async fn a_client_history_crosses_a_permissionless_bond_timeout() {
     };
     let view = SurvivingPayment::at(scan().height + 2, payment_object());
 
-    match advance_setup(&view, &blocks, &NoSink, &mut journal, &verifier).await {
-        Ok(advance) => match advance.progress {
-            SetupProgress::HistoryAdvanced { through } => {
-                assert_eq!(through, scan().height + 2);
-            }
-            other => panic!("the client's history crosses the bond Timeout: {other:?}"),
-        },
-        Err(error) => panic!("the client's history crosses the bond Timeout: {error}"),
-    }
+    let advance = advance_setup(&view, &blocks, &NoSink, &mut journal, &verifier).await;
     assert_eq!(
         journal.state().history_cursor().map(|scan| scan.height),
         Some(scan().height + 2),
@@ -2728,7 +2741,7 @@ async fn a_client_history_crosses_a_permissionless_bond_timeout() {
 
     // The client is not stuck: the surviving payment edge mounts, and
     // its origin is the block its own Open landed in.
-    match advance_setup(&view, &blocks, &NoSink, &mut journal, &verifier).await {
+    match advance {
         Ok(advance) => match advance.progress {
             SetupProgress::CloseOnly { origin, settled } => {
                 assert!(!settled, "the payment edge outlived the bond");
@@ -2784,20 +2797,6 @@ async fn an_overfunded_close_only_channel_settles_at_the_edge_it_holds() {
     };
     let view = SurvivingPayment::at(scan().height + 2, overfunded_payment_object());
 
-    match advance_setup(&view, &blocks, &NoSink, &mut journal, &verifier).await {
-        Ok(advance) => match advance.progress {
-            SetupProgress::HistoryAdvanced { through } => {
-                assert_eq!(through, scan().height + 2);
-            }
-            other => panic!("the history batch is fetched first: {other:?}"),
-        },
-        Err(error) => panic!("the history batch is fetched first: {error}"),
-    }
-    assert!(
-        journal.state().close_only_recovery(),
-        "the provider's own history proves this channel is close-only",
-    );
-
     // The first mount, on the journal-only route: it still reads.
     let advance = match advance_setup(&view, &blocks, &NoSink, &mut journal, &verifier).await {
         Ok(advance) => advance,
@@ -2809,6 +2808,7 @@ async fn an_overfunded_close_only_channel_settles_at_the_edge_it_holds() {
             advance.progress
         );
     };
+    assert!(journal.state().close_only_recovery());
     assert!(!settled, "the payment edge outlived the bond");
     assert_eq!(
         view.reads(),

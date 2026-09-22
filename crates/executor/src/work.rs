@@ -44,7 +44,7 @@
 use crate::ExecutorError;
 use crate::executor::{ExecutorHandle, ExecutorOwedRequest};
 use hellas_rpc::OutputEventEnvelope;
-use hellas_work::work::{BackendFault, PaidEvaluateBackend, PreparedEvaluateInput};
+use hellas_work::work::{BackendFault, PaidEvaluateBackend, PaidProgress, PreparedEvaluateInput};
 
 impl ExecutorHandle {
     /// Runs one already-authorized paid job to its terminal.
@@ -63,16 +63,30 @@ impl ExecutorHandle {
         &self,
         input: PreparedEvaluateInput,
     ) -> Result<Vec<OutputEventEnvelope>, ExecutorError> {
-        // The actor admits this durable obligation exactly once. If the GPU
-        // worker is occupied, EvaluateEngine retains it in its owed FIFO and
-        // dispatches it ahead of peer-admitted work.
-        let outcome = self
-            .send_owed(|reply| ExecutorOwedRequest::RunPaidEvaluate {
-                input: Box::new(input),
-                reply,
-            })
-            .await?;
-        drain_transcript(outcome).await
+        self.run_paid_evaluate_stream(input, None).await
+    }
+
+    async fn run_paid_evaluate_stream(
+        &self,
+        input: PreparedEvaluateInput,
+        progress: Option<PaidProgress>,
+    ) -> Result<Vec<OutputEventEnvelope>, ExecutorError> {
+        use tracing::Instrument;
+        async move {
+            // The actor admits this durable obligation exactly once. If the GPU
+            // worker is occupied, EvaluateEngine retains it in its owed FIFO and
+            // dispatches it ahead of peer-admitted work.
+            let outcome = self
+                .send_owed(|reply| ExecutorOwedRequest::RunPaidEvaluate {
+                    span: tracing::Span::current(),
+                    input: Box::new(input),
+                    reply,
+                })
+                .await?;
+            drain_transcript_with_progress(outcome, progress).await
+        }
+        .instrument(hellas_rpc::request_span!(target: "hellas_request", "paid.executor.stream"))
+        .await
     }
 }
 
@@ -82,8 +96,16 @@ impl ExecutorHandle {
 /// A failure and a stream that simply stops are two different faults and
 /// are reported as two: the first is what the engine said went wrong,
 /// the second is that it never said anything.
+#[cfg(test)]
 async fn drain_transcript(
     outcome: crate::executor::ExecuteOutcome,
+) -> Result<Vec<OutputEventEnvelope>, ExecutorError> {
+    drain_transcript_with_progress(outcome, None).await
+}
+
+async fn drain_transcript_with_progress(
+    outcome: crate::executor::ExecuteOutcome,
+    progress: Option<PaidProgress>,
 ) -> Result<Vec<OutputEventEnvelope>, ExecutorError> {
     use hellas_rpc::pb::execute::work_event;
 
@@ -109,6 +131,10 @@ async fn drain_transcript(
                 transcript.push(hellas_rpc::stream::output_event_from_pb(event).map_err(
                     |err| ExecutorError::Execution(format!("paid evaluate output event: {err}")),
                 )?);
+                if let Some(progress) = &progress {
+                    progress(transcript.last().expect("chunk was appended").clone())
+                        .map_err(|error| ExecutorError::Execution(error.to_string()))?;
+                }
             }
             Some(work_event::Kind::Finished(finished)) => {
                 let event = finished.terminal_output_event.ok_or_else(|| {
@@ -149,6 +175,15 @@ impl PaidEvaluateBackend for ExecutorHandle {
         input: PreparedEvaluateInput,
     ) -> Result<Vec<OutputEventEnvelope>, BackendFault> {
         self.run_paid_evaluate(input)
+            .await
+            .map_err(|error| BackendFault::new(error.to_string()))
+    }
+    async fn evaluate_stream(
+        &self,
+        input: PreparedEvaluateInput,
+        progress: PaidProgress,
+    ) -> Result<Vec<OutputEventEnvelope>, BackendFault> {
+        self.run_paid_evaluate_stream(input, Some(progress))
             .await
             .map_err(|error| BackendFault::new(error.to_string()))
     }

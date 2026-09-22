@@ -2,7 +2,6 @@ use super::*;
 use axum::Router;
 use axum::routing::get;
 use std::sync::Mutex;
-use std::sync::atomic::Ordering;
 use tower::ServiceExt;
 
 /// A bearer with a known token, so tests can present the right one.
@@ -152,9 +151,9 @@ fn compare_does_not_short_circuit_on_length() {
         format!("{hex}{hex}"),
         "z".repeat(4096),
     ] {
-        DIGIT_STEPS.store(0, Ordering::Relaxed);
+        DIGIT_STEPS.set(0);
         let _ = bearer.accepts(credential.as_bytes());
-        counts.push(DIGIT_STEPS.load(Ordering::Relaxed));
+        counts.push(DIGIT_STEPS.get());
     }
     assert!(
         counts.iter().all(|count| *count == TOKEN_HEX_LEN),
@@ -310,7 +309,7 @@ async fn loopback_is_decided_by_parsing_not_by_spelling() {
     // `127.0.0.2` is loopback and is not the string `127.0.0.1`, so
     // only a parsed check accepts it.
     for host in ["127.0.0.1", "127.0.0.2", "::1"] {
-        let addr = loopback_addr(host, 0)
+        let addr = bind_addr(host, 0, false)
             .await
             .unwrap_or_else(|err| panic!("`{host}` should be loopback: {err}"));
         assert!(addr.ip().is_loopback());
@@ -318,14 +317,14 @@ async fn loopback_is_decided_by_parsing_not_by_spelling() {
 }
 
 #[tokio::test]
-async fn non_loopback_bind_is_refused() {
-    for host in ["0.0.0.0", "::", "10.0.0.1", "192.168.1.7"] {
-        let Err(err) = loopback_addr(host, 0).await else {
-            panic!("`{host}` is not loopback and must be refused");
-        };
-        assert!(
-            err.to_string().contains("not loopback"),
-            "unexpected refusal for `{host}`: {err}"
-        );
+async fn explicitly_configured_network_bind_is_resolved() {
+    let addr = bind_addr("192.0.2.1", 8080, true).await.unwrap();
+    assert_eq!(addr, "192.0.2.1:8080".parse().unwrap());
+}
+
+#[tokio::test]
+async fn non_loopback_requires_explicit_remote_access() {
+    for host in ["0.0.0.0", "192.0.2.1", "::"] {
+        assert!(bind_addr(host, 8080, false).await.is_err());
     }
 }

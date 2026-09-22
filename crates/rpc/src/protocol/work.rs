@@ -24,6 +24,7 @@ use hellas_xet::{MIN_CHUNK_SIZE, SingleChunkHasher, XetFileHasher};
 use crate::evaluate::{EvaluateTerminal, validate_terminal_stop_witness, verify_output_events};
 use crate::protocol::artifacts::{
     Canonical, InputAddressed, OutputAddressed, PreparedPaidInputV1, SourceRef, TextArtifact,
+    TextPolicy,
 };
 use crate::protocol::value::{CanonicalDecodeError, canonical_dag_cbor, decode_dag_cbor};
 use crate::{
@@ -886,6 +887,36 @@ pub fn generation_policy_digest(
     ))
 }
 
+/// Match a request against the channel's generation ceiling and stop policy.
+/// The commitment is the canonical policy at the maximum permitted length;
+/// the job authorization separately commits to the exact requested length.
+pub fn matches_generation_policy(
+    policy: &PaidExecutionPolicyV1,
+    requested: &TextPolicy,
+) -> Result<bool, PaidWorkError> {
+    if requested.max_new_tokens() == 0 {
+        return Err(PaidWorkError::PolicyZero {
+            field: "request max_new_tokens",
+        });
+    }
+    if requested.max_new_tokens() > policy.max_new_tokens {
+        return Err(PaidWorkError::OverEnvelope {
+            field: "max_new_tokens",
+            actual: u64::from(requested.max_new_tokens()),
+            limit: u64::from(policy.max_new_tokens),
+        });
+    }
+    let ceiling = TextPolicy::new(
+        policy.max_new_tokens,
+        requested.stop_token_ids().iter().copied(),
+    );
+    Ok(
+        generation_policy_digest(&requested.canonical_bytes())? == policy.generation_policy_digest
+            || generation_policy_digest(&ceiling.canonical_bytes())?
+                == policy.generation_policy_digest,
+    )
+}
+
 /// Returns the commitment to a canonical identity-artifact body.
 pub fn identity_source_digest(
     canonical_identity_artifact_bytes: &[u8],
@@ -1426,8 +1457,7 @@ pub fn check_prepared_input(
         ),
         (
             "generation_policy_digest",
-            generation_policy_digest(&parts.text_policy.canonical_bytes())?.as_bytes()
-                == policy.generation_policy_digest.as_bytes(),
+            matches_generation_policy(policy, &parts.text_policy)?,
         ),
         (
             "identity_source_digest",

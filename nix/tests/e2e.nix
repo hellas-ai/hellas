@@ -8,6 +8,7 @@
 let
   inherit (pkgs.hellasLib) executorPort;
   hellasModule = import ../modules/nixos.nix { inherit self; };
+  runTest = import ./telemetry.nix { inherit pkgs lib; };
 
   gatewayPort = 8080;
   chainRpcPort = 31246;
@@ -179,7 +180,7 @@ let
 
       cli = "${validatorPackage}/bin/hellas-cli"
       rpc = "ws://127.0.0.1:${toString chainRpcPort}"
-      home = "HOME=${homePrefix}/client-home"
+      home = "HOME=${homePrefix}/client-home OTEL_SERVICE_NAME=hellas-test-client"
       validator_log = "${validatorLog}"
       follower_log = "${followerLog}"
 
@@ -241,7 +242,7 @@ let
           f"{cli} chain validator check-config --config ${homePrefix}/validator.toml | grep -Fx ok"
       )
       machine.succeed(
-          f"HOME=${homePrefix}/validator-home RUST_LOG=info {cli} chain validator run "
+          f"HOME=${homePrefix}/validator-home OTEL_SERVICE_NAME=hellas-test-validator RUST_LOG=info {cli} chain validator run "
           f"--config ${homePrefix}/validator.toml "
           f"> {validator_log} 2>&1 & echo $! > ${homePrefix}/validator.pid"
       )
@@ -251,7 +252,7 @@ let
           print(machine.succeed(f"cat {validator_log} || true"))
           raise
       machine.succeed(
-          f"HOME=${homePrefix}/follower-home RUST_LOG=info {cli} chain indexer follow "
+          f"HOME=${homePrefix}/follower-home OTEL_SERVICE_NAME=hellas-test-indexer RUST_LOG=info {cli} chain indexer follow "
           f"--rpc {rpc} --storage-dir ${homePrefix}/follower-store "
           "--partition-prefix ${followerPartitionPrefix} "
           f"> {follower_log} 2>&1 & echo $! > ${homePrefix}/follower.pid"
@@ -264,7 +265,7 @@ let
     '';
 in
 {
-  discovery-monitor = pkgs.testers.runNixOSTest {
+  discovery-monitor = runTest {
     name = "hellas-discovery-monitor";
     nodes.machine = _: {
       imports = [ hellasModule ];
@@ -282,6 +283,7 @@ in
             enable = true;
             inherit package;
             environment.RUST_LOG = "hellas_executor=info";
+            environment.OTEL_SERVICE_NAME = "hellas-test-provider";
             port = executorPort;
             openFirewall = true;
             executePolicy = "any";
@@ -322,8 +324,8 @@ in
           "printf 'also-not-valid-catena-%s\\n' \"$nonce\" > /var/lib/hellas-e2e/missing.hex; "
           "printf 'runtime-only-weights-%s' \"$nonce\" > /srv/hellas-content/weights.bin; "
           "printf 'missing-runtime-weights-%s' \"$nonce\" > /var/lib/hellas-e2e/missing-weights.bin; "
-          "printf 'entrypoint = \"e2e_%s\"\\nstatic_objects = [\"/srv/hellas-content/weights.bin\"]\\nstatic_inputs = [{ object = 0, offset = 0, bytes = 16 }]\\nstate_bytes_per_capacity = [4]\\nvocabulary_size = 3\\nmaximum_capacity = 8\\n' \"$nonce\" > /var/lib/hellas-e2e/environment.toml; "
-          "printf 'entrypoint = \"e2e_%s\"\\nstatic_objects = [\"/var/lib/hellas-e2e/missing-weights.bin\"]\\nstatic_inputs = [{ object = 0, offset = 0, bytes = 16 }]\\nstate_bytes_per_capacity = [4]\\nvocabulary_size = 3\\nmaximum_capacity = 8\\n' \"$nonce\" > /var/lib/hellas-e2e/missing-static.toml; "
+          "printf 'entrypoint = \"e2e_%s\"\\nstatic_objects = [\"/srv/hellas-content/weights.bin\"]\\nstatic_inputs = [{ object = 0, offset = 0, bytes = 16 }]\\nstate_bytes_per_capacity = [4]\\nvocabulary_size = 3\\nmaximum_capacity = 8\\n[generation]\\nfixed_capacity = 8\\nprefill_chunk_tokens = 2\\n' \"$nonce\" > /var/lib/hellas-e2e/environment.toml; "
+          "printf 'entrypoint = \"e2e_%s\"\\nstatic_objects = [\"/var/lib/hellas-e2e/missing-weights.bin\"]\\nstatic_inputs = [{ object = 0, offset = 0, bytes = 16 }]\\nstate_bytes_per_capacity = [4]\\nvocabulary_size = 3\\nmaximum_capacity = 8\\n[generation]\\nfixed_capacity = 8\\nprefill_chunk_tokens = 2\\n' \"$nonce\" > /var/lib/hellas-e2e/missing-static.toml; "
           "printf '%s\\n' "
           "'{\"version\":\"1.0\",\"truncation\":null,\"padding\":null,\"added_tokens\":[],\"normalizer\":null,\"pre_tokenizer\":{\"type\":\"Whitespace\"},\"post_processor\":null,\"decoder\":null,\"model\":{\"type\":\"WordLevel\",\"vocab\":{\"hello\":0,\"world\":1,\"<unk>\":2},\"unk_token\":\"<unk>\"}}' "
           "> /var/lib/hellas-e2e/tokenizer.json; "
@@ -353,7 +355,7 @@ in
           "HOME=/var/lib/hellas ${package}/bin/hellas-cli identity show-enrollment-id"
       ).strip()
       client = (
-          "HOME=/var/lib/hellas-e2e ${package}/bin/hellas-cli "
+          "HOME=/var/lib/hellas-e2e OTEL_SERVICE_NAME=hellas-test-client ${package}/bin/hellas-cli "
           "--identity /var/lib/hellas-e2e/client.identity --software-root llm "
           f"{node_id} --node-addr 127.0.0.1:${toString executorPort} "
           f"--provider {provider} "
@@ -435,18 +437,21 @@ in
           "test \"$(cat /sys/fs/cgroup/system.slice/hellas.service/memory.swap.max)\" = 0"
       )
 
-      machine.wait_until_succeeds(
-          "${package}/bin/hellas-cli monitor --timeout-secs 5 > /tmp/hellas-monitor.log 2>&1"
-          " && grep -q 'event=discovered service=node' /tmp/hellas-monitor.log"
-          " && grep -q 'event=node-info' /tmp/hellas-monitor.log"
-      )
-      monitor_output = machine.succeed("cat /tmp/hellas-monitor.log")
-      print(monitor_output)
+      try:
+          machine.wait_until_succeeds(
+              "${package}/bin/hellas-cli monitor --timeout-secs 5 > /tmp/hellas-monitor.log 2>&1"
+              " && grep -q 'event=discovered service=node' /tmp/hellas-monitor.log"
+              " && grep -q 'event=node-info' /tmp/hellas-monitor.log",
+              timeout=30,
+          )
+      finally:
+          monitor_output = machine.succeed("cat /tmp/hellas-monitor.log")
+          print(monitor_output)
       assert "graffiti=e2e-discovery" in monitor_output
     '';
   };
 
-  gateway-proxy-responses = pkgs.testers.runNixOSTest {
+  gateway-proxy-responses = runTest {
     name = "hellas-gateway-proxy-responses";
     nodes.gateway = _: {
       imports = [ hellasModule ];
@@ -457,6 +462,7 @@ in
           services.hellas = {
             inherit package;
             environment.OPENAI_API_KEY = "proxy-secret";
+            environment.OTEL_SERVICE_NAME = "hellas-test-gateway";
             gateway = {
               enable = true;
               port = gatewayPort;
@@ -499,6 +505,9 @@ in
             state_bytes_per_capacity = [4]
             vocabulary_size = 3
             maximum_capacity = 8
+            [generation]
+            fixed_capacity = 8
+            prefill_chunk_tokens = 2
             EOF
             ${package}/bin/hellas-cli environment build \
               --program /var/lib/hellas-gateway/test.hex \
@@ -541,7 +550,7 @@ in
     '';
   };
 
-  chain-validator-follower = pkgs.testers.runNixOSTest {
+  chain-validator-follower = runTest {
     name = "hellas-chain-validator-follower";
     nodes.machine = _: {
       config = lib.mkMerge [
@@ -606,11 +615,10 @@ in
       coin_lines = [line for line in coins.splitlines() if line.endswith(" 424242")]
       assert len(coin_lines) == 1, coins
 
-      machine.succeed("kill $(cat /tmp/chain-e2e/follower.pid) $(cat /tmp/chain-e2e/validator.pid)")
     '';
   };
 
-  chain-edge-settlement = pkgs.testers.runNixOSTest {
+  chain-edge-settlement = runTest {
     name = "hellas-chain-edge-settlement";
     nodes.machine = _: {
       config = lib.mkMerge [
@@ -858,9 +866,6 @@ in
       wait_follower(baseline)
       assert wait_coin(maker, 80)
 
-      machine.succeed(
-          "kill $(cat /tmp/chain-settlement/follower.pid) $(cat /tmp/chain-settlement/validator.pid)"
-      )
     '';
   };
 }

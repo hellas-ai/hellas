@@ -9,6 +9,12 @@ documentation.workspace = true
 
 [features]
 default = []
+otel = [
+    "hellas-rpc/otel",
+    "hellas-rpc/http-tracing",
+    "dep:opentelemetry",
+    "dep:tracing-opentelemetry",
+]
 evaluate = [
     "dep:hellas-executor",
     "hellas-executor/evaluate",
@@ -29,15 +35,19 @@ hellas-rpc = { workspace = true, features = ["courtesy", "fetch"] }
 hellas-store = { workspace = true, optional = true }
 hellas-wire = { workspace = true, features = ["iroh"] }
 iroh.workspace = true
+libc = "0.2"
+opentelemetry = { workspace = true, optional = true }
 prometheus-client.workspace = true
 rand.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tower = { version = "0.5", default-features = false, features = ["util"] }
 tracing.workspace = true
+tracing-opentelemetry = { workspace = true, optional = true }
 
 [dev-dependencies]
 hellas-rpc = { workspace = true, features = ["host-control"] }

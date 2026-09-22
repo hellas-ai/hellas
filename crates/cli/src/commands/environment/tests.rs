@@ -22,6 +22,10 @@ fn validate(settings: EnvironmentSettings, object_lengths: &[u64]) -> CausalLmEn
         settings.state_bytes_per_capacity,
         settings.vocabulary_size,
         settings.maximum_capacity,
+        hellas_rpc::CausalLmGenerationSchedule {
+            fixed_capacity: settings.generation.fixed_capacity,
+            prefill_chunk_tokens: settings.generation.prefill_chunk_tokens,
+        },
     )
     .unwrap()
 }
@@ -34,6 +38,10 @@ static_objects = ["weights.safetensors"]
 state_bytes_per_capacity = [1024]
 vocabulary_size = 32000
 maximum_capacity = 4096
+
+[generation]
+fixed_capacity = 4096
+prefill_chunk_tokens = 64
 
 [[static_inputs]]
 object = 0
@@ -53,6 +61,9 @@ fn rejects_unknown_human_settings() {
 state_bytes_per_capacity = [1024]
 vocabulary_size = 32000
 maximum_capacity = 4096
+[generation]
+fixed_capacity = 4096
+prefill_chunk_tokens = 64
 unexpected = true
 "#,
     )
@@ -106,22 +117,22 @@ fn inspect_rejects_a_device_before_reading_from_it() {
 
 #[cfg(unix)]
 #[test]
-fn atomic_output_does_not_follow_the_legacy_fixed_temporary_symlink() {
+fn atomic_output_does_not_follow_a_preexisting_fixed_temporary_symlink() {
     use std::os::unix::fs::symlink;
 
     let directory = tempfile::tempdir().unwrap();
     let output = directory.path().join("model.environment");
     let victim = directory.path().join("operator-data");
-    let legacy_temporary = output.with_extension("tmp");
+    let preexisting_temporary = output.with_extension("tmp");
     std::fs::write(&victim, b"must survive").unwrap();
-    symlink(&victim, &legacy_temporary).unwrap();
+    symlink(&victim, &preexisting_temporary).unwrap();
 
     atomic_write(&output, b"complete environment").unwrap();
 
     assert_eq!(std::fs::read(&output).unwrap(), b"complete environment");
     assert_eq!(std::fs::read(&victim).unwrap(), b"must survive");
     assert!(
-        std::fs::symlink_metadata(&legacy_temporary)
+        std::fs::symlink_metadata(&preexisting_temporary)
             .unwrap()
             .file_type()
             .is_symlink()
@@ -220,20 +231,20 @@ fn atomic_output_requires_an_existing_parent() {
 fn checked_in_model_settings_match_the_pinned_generated_records() {
     // These identities pin every ordered static slice, not just the counts
     // below. Update them only when regenerating from the revision named in
-    // each settings file.
+    // each settings file or deliberately changing its committed schedule.
     assert_eq!(
         ContentId::hash(include_bytes!(
             "../../../../../examples/smollm2.environment.toml"
         ))
         .to_string(),
-        "7add9e6a063fa47d467623023f904e2ea4cc2c4d42abbdca6168546b423d8073"
+        "ce93212873a10c4b336b6e24d86a7d3b06deac85c133395c4c825c6c6b9fab2b"
     );
     assert_eq!(
         ContentId::hash(include_bytes!(
             "../../../../../examples/qwen3.environment.toml"
         ))
         .to_string(),
-        "116674fd6e7e9aff0043ad18d32ffdea3de4985094efd004babbd26713fc5f30"
+        "68d831ee06da3a2716c49f310b25ad753b20eb7a13cf2486678c96131aa7995a"
     );
     let smol: EnvironmentSettings = toml::from_str(include_str!(
         "../../../../../examples/smollm2.environment.toml"
@@ -256,6 +267,40 @@ fn checked_in_model_settings_match_the_pinned_generated_records() {
     let qwen = validate(qwen, &[49_693_950_144, 11_401_853_280]);
     assert_eq!(qwen.vocabulary_size(), 151_936);
     assert_eq!(qwen.maximum_capacity(), 32_768);
+    assert_eq!(
+        qwen.generation_schedule(),
+        hellas_rpc::CausalLmGenerationSchedule {
+            fixed_capacity: 32_768,
+            prefill_chunk_tokens: 64,
+        }
+    );
+}
+
+#[tokio::test]
+async fn schedule_changes_only_metadata_without_reopening_static_objects() {
+    let directory = tempfile::tempdir().unwrap();
+    let environment = provider_ready_environment(directory.path());
+    let original =
+        CausalLmEnvironment::from_canonical_bytes(&std::fs::read(&environment).unwrap()).unwrap();
+    std::fs::remove_file(directory.path().join("weights.bin")).unwrap();
+    std::fs::remove_file(directory.path().join("model.hex")).unwrap();
+    let out = directory.path().join("scheduled.environment");
+    super::run(super::EnvironmentCommand::Schedule {
+        environment,
+        fixed_capacity: 64,
+        prefill_chunk_tokens: 16,
+        out: out.clone(),
+    })
+    .await
+    .unwrap();
+    let scheduled =
+        CausalLmEnvironment::from_canonical_bytes(&std::fs::read(out).unwrap()).unwrap();
+    assert_eq!(scheduled.program(), original.program());
+    assert_eq!(scheduled.static_objects(), original.static_objects());
+    assert_ne!(
+        scheduled.manifest().content_id(),
+        original.manifest().content_id()
+    );
 }
 
 fn provider_ready_environment(directory: &Path) -> PathBuf {
@@ -275,6 +320,10 @@ fn provider_ready_environment(directory: &Path) -> PathBuf {
         vec![4],
         32,
         64,
+        hellas_rpc::CausalLmGenerationSchedule {
+            fixed_capacity: 64,
+            prefill_chunk_tokens: 64,
+        },
     )
     .unwrap();
     let path = directory.join("model.environment");

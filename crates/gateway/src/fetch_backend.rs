@@ -8,6 +8,7 @@ use hellas_rpc::stream::input_event_to_pb;
 use hellas_rpc::{Assurance, ContentId, ProducerSigningKey, Retention};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use std::sync::Arc;
+use tracing::Instrument;
 
 use crate::execution::CliRuntime;
 use hellas_client::ExecutionRoute;
@@ -15,6 +16,7 @@ use hellas_client::cache::fetch_output_stream;
 
 #[derive(Clone)]
 pub(super) struct ResponsesFetchBackend {
+    metrics: crate::backend::telemetry::InferenceMetrics,
     runtime: CliRuntime,
     route: Option<ExecutionRoute>,
     service: String,
@@ -36,6 +38,7 @@ impl ResponsesFetchBackend {
     ) -> Self {
         let (service, method, execution_environment) = target;
         Self {
+            metrics: crate::backend::telemetry::InferenceMetrics::new(),
             runtime,
             route,
             service: service.to_string(),
@@ -55,8 +58,10 @@ impl ResponsesFetchBackend {
 impl ExecutionBackend for ResponsesFetchBackend {
     fn stream<'a>(&'a self, request: BackendRequest) -> BackendFuture<'a, BackendStream> {
         Box::pin(async move {
+            let mut inference = crate::backend::telemetry::Inference::new(&request, &self.metrics);
             let ProviderRequestBody { payload, retention } =
-                provider_request_body(&request, &self.request_overrides)?;
+                provider_request_body(&request, &self.request_overrides)
+                    .inspect_err(|error| inference.fail(error))?;
             let (input, _) = signed_input_events_with_commitment(
                 &self.service,
                 &self.method,
@@ -67,18 +72,29 @@ impl ExecutionBackend for ResponsesFetchBackend {
                 retention,
             )
             .map_err(|source| {
-                BackendError::failed(format!("failed to sign fetch request: {source}"))
+                let error = BackendError::failed(format!("failed to sign fetch request: {source}"));
+                inference.fail(&error);
+                error
             })?;
             let fetch_request = FetchRequest { input };
-            fetch_output_stream(
+            let stream = fetch_output_stream(
                 self.runtime.clone(),
                 fetch_request,
                 self.route.clone(),
                 self.caller_key.clone(),
                 None,
             )
+            .instrument(inference.span.clone())
             .await
-            .map_err(|error| BackendError::failed(error.to_string()))
+            .map_err(|error| {
+                let error = BackendError::failed(error.to_string());
+                inference.fail(&error);
+                error
+            })?;
+            Ok(BackendStream::new(
+                inference.stream(stream.events),
+                stream.initial_provenance,
+            ))
         })
     }
 }

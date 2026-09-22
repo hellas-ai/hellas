@@ -10,6 +10,7 @@ documentation.workspace = true
 [features]
 default = ["evaluate"]
 evaluate = ["dep:catena-lang", "dep:commonware-runtime", "dep:hellas-store"]
+otel = ["hellas-rpc/otel", "dep:opentelemetry", "dep:tracing-opentelemetry"]
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -32,6 +33,7 @@ hellas-rpc = { workspace = true, features = [
 hellas-store = { workspace = true, optional = true }
 hellas-wire = { workspace = true }
 hellas-work.workspace = true
+opentelemetry = { workspace = true, optional = true }
 prometheus-client = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
@@ -41,5 +43,10 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tracing = { workspace = true }
+tracing-opentelemetry = { workspace = true, optional = true }
 uuid = { version = "1", features = ["v4"] }
 zeroize = "1"
+
+[dev-dependencies]
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
+tracing-subscriber = { workspace = true }

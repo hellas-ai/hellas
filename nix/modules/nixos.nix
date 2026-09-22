@@ -59,6 +59,11 @@ let
         builtins.dirOf (normalizeRuntimePath gateway.contentIndex)
       )
     ) (builtins.dirOf (normalizeRuntimePath gateway.contentIndex))
+    ++ map normalizeRuntimePath gateway.paidWorkJournalRoots
+    ++ lib.optional (
+      gateway.bearerTokenFile != null
+      && outsideManagedRoots gatewayManagedWritableRoots gateway.bearerTokenFile
+    ) (builtins.dirOf (normalizeRuntimePath gateway.bearerTokenFile))
   );
   providerWritablePathsAreDisjoint = lib.all (
     writable: lib.all (content: !pathsOverlap writable content) providerContentPaths
@@ -134,6 +139,9 @@ let
     ++ gateway.contentRoots
     ++ lib.optional (gateway.contentIndex != null) gateway.contentIndex
     ++ lib.optional (gateway.environmentFile != null) gateway.environmentFile
+    ++ lib.optional (gateway.paidWorkConfig != null) gateway.paidWorkConfig
+    ++ lib.optional (gateway.bearerTokenFile != null) gateway.bearerTokenFile
+    ++ gateway.paidWorkJournalRoots
   );
   gpuDeviceAccess = {
     # DynamicUser does not inherit an interactive user's device groups.
@@ -184,7 +192,8 @@ in
   options.services.hellas =
     hellas.commonOptions {
       inherit lib;
-      package = hellas.nixosCliPackage pkgs;
+      package = (hellas.nixosCliPackage pkgs).override { otel = cfg.otel.enable; };
+      inherit (cfg) otel;
       packageDescription =
         if hellas.catenaPlatform pkgs then
           ''
@@ -358,6 +367,7 @@ in
         assertion =
           !gateway.enable
           || gateway.provider != null
+          || gateway.paidWorkConfig != null
           || gateway.local
           || (
             gateway.responsesBackend == "proxy"
@@ -365,7 +375,21 @@ in
             && gateway.nodeId == null
             && gateway.verifyNodeId == null
           );
-        message = "services.hellas.gateway.provider is required by remote Hellas execution (including discovery and verifyLocal), nodeId, verifyNodeId, and responsesBackend = \"fetch\"; only local and proxy-only gateways dial no provider.";
+        message = "services.hellas.gateway.provider is required by courtesy remote execution; a paid gateway uses its paidWorkConfig channel identities.";
+      }
+      {
+        assertion =
+          gateway.paidWorkConfig == null
+          || (
+            !gateway.local
+            && !gateway.verifyLocal
+            && gateway.verifyNodeId == null
+            && gateway.nodeId == null
+            && gateway.provider == null
+            && gateway.responsesBackend == "hellas"
+            && gateway.assurance == "producer-signed"
+          );
+        message = "services.hellas.gateway.paidWorkConfig requires remote producer-signed Hellas execution without courtesy target or verification overrides.";
       }
       {
         assertion =
@@ -500,7 +524,7 @@ in
           }
           // gpuEnvironment
         )
-        // lib.optionalAttrs (cfg.otel.endpoint != null) {
+        // lib.optionalAttrs cfg.otel.enable {
           # Distinguish gateway spans from the node's in shared trace storage.
           OTEL_SERVICE_NAME = "${cfg.otel.serviceName}-gateway";
         }

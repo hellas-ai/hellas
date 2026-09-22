@@ -81,6 +81,7 @@ pub(crate) enum ExecutorRequest {
     /// (queueing if the worker is busy), and return a Receiver wired to
     /// the worker's per-execution sender.
     Execute {
+        span: tracing::Span,
         request: RunTicketRequest,
         reply: oneshot::Sender<Result<ExecuteOutcome, ExecutorError>>,
     },
@@ -112,6 +113,7 @@ pub(crate) enum ExecutorOwedRequest {
     /// decided this invocation was owed and made that decision durable before
     /// this message was sent.
     RunPaidEvaluate {
+        span: tracing::Span,
         input: Box<hellas_work::work::PreparedEvaluateInput>,
         reply: oneshot::Sender<Result<ExecuteOutcome, ExecutorError>>,
     },
@@ -155,6 +157,7 @@ pub(crate) struct FetchProviderFailure {
 
 pub(crate) struct PendingFetch {
     pub(in crate::executor) cache: Option<actor::execution::cache::FetchCacheRequest>,
+    pub span: tracing::Span,
     pub request: PreparedFetchRequest,
     pub provider: Arc<dyn FetchProvider>,
     pub projector: Box<dyn FetchProjector>,

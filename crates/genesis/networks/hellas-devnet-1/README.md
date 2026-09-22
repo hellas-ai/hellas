@@ -15,3 +15,8 @@ public secret scalars:
 
 These credentials are intentionally public and unsafe for any production or
 value-bearing deployment.
+
+The foundation account `25uDmUCQcwYUHHyXthtEspGB2KVTmbys8vTSqAMXKNqRV`
+has 1,000,000 development units for compute-provider stakes and gateway payment
+channels. Its independently generated P-256 signing key is managed outside
+this repository and is not one of the public development scalars above.

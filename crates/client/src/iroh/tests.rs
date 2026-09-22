@@ -140,6 +140,10 @@ fn valid_token_quote() -> (
         Vec::new(),
         16,
         16,
+        hellas_rpc::CausalLmGenerationSchedule {
+            fixed_capacity: 16,
+            prefill_chunk_tokens: 16,
+        },
     )
     .unwrap();
     let manifest = environment.manifest();
@@ -277,6 +281,10 @@ fn token_quote_rejects_noncanonical_or_unbound_application_bodies() {
         Vec::new(),
         16,
         16,
+        hellas_rpc::CausalLmGenerationSchedule {
+            fixed_capacity: 16,
+            prefill_chunk_tokens: 16,
+        },
     )
     .unwrap();
     let error = validate_evaluate_quote_response(

@@ -13,6 +13,10 @@ fn example() -> CausalLmEnvironment {
         vec![4_608],
         49_152,
         8_192,
+        CausalLmGenerationSchedule {
+            fixed_capacity: 8_192,
+            prefill_chunk_tokens: 256,
+        },
     )
     .unwrap()
 }
@@ -49,7 +53,7 @@ fn canonical_environment_round_trips_and_builds_the_exact_application() {
     assert_eq!(
         hex(&bytes),
         concat!(
-            "87", // seven environment fields
+            "88", // eight environment fields
             "82",
             "5820",
             "0101010101010101010101010101010101010101010101010101010101010101",
@@ -74,17 +78,58 @@ fn canonical_environment_round_trips_and_builds_the_exact_application() {
             "191200", // one state, 4,608 bytes per capacity
             "19c000", // vocabulary size 49,152
             "192000", // maximum capacity 8,192
+            "82",     // generation schedule
+            "192000", // fixed capacity 8,192
+            "190100", // prefill chunk 256
         )
     );
     assert_eq!(actual, expected);
     assert_eq!(actual.content_id(), ContentId::hash(&bytes));
     assert_eq!(
         actual.content_id().to_string(),
-        "da691d14643cd45eb9e8428a7f41c6c1f29c2ad6e54a03c0de5e8d5b60ef60b4"
+        "840d556c9f216b65b6585198f1d6a7c33cff8c659a180b8753f669536aa1940c"
     );
     let manifest = actual.manifest();
     assert_eq!(manifest.application().evaluator(), CATENA_GPU_EVALUATOR);
     assert_eq!(manifest.application().adaptor(), CAUSAL_LM_ADAPTOR);
+}
+
+#[test]
+fn generation_schedule_is_committed_and_required() {
+    let environment = example();
+    let scheduled = environment
+        .clone()
+        .with_generation_schedule(CausalLmGenerationSchedule {
+            fixed_capacity: 8192,
+            prefill_chunk_tokens: 128,
+        })
+        .unwrap();
+    let bytes = scheduled.canonical_bytes();
+    assert_eq!(bytes[0], 0x88);
+    assert_eq!(
+        CausalLmEnvironment::from_canonical_bytes(&bytes).unwrap(),
+        scheduled
+    );
+    assert_ne!(scheduled.content_id(), environment.content_id());
+    assert_ne!(
+        scheduled.manifest().content_id(),
+        environment.manifest().content_id()
+    );
+    for (fixed_capacity, prefill_chunk_tokens) in [(0, 1), (8193, 1), (8192, 0), (2, 3)] {
+        assert!(
+            environment
+                .clone()
+                .with_generation_schedule(CausalLmGenerationSchedule {
+                    fixed_capacity,
+                    prefill_chunk_tokens,
+                })
+                .is_err()
+        );
+    }
+    let mut incomplete = environment.canonical_bytes();
+    incomplete[0] = 0x87;
+    incomplete.truncate(incomplete.len() - 7);
+    assert!(CausalLmEnvironment::from_canonical_bytes(&incomplete).is_err());
 }
 
 #[test]
@@ -115,6 +160,10 @@ fn slice_ranges_and_state_sizes_are_checked() {
 
     let mut aggregate_state = example();
     aggregate_state.maximum_capacity = 1;
+    aggregate_state.generation_schedule = CausalLmGenerationSchedule {
+        fixed_capacity: 1,
+        prefill_chunk_tokens: 1,
+    };
     aggregate_state.state_bytes_per_capacity = vec![MAX_STATE_BYTES, 4];
     assert!(matches!(
         aggregate_state.validate(),
@@ -184,7 +233,7 @@ fn decoder_rejects_trailing_and_noncanonical_data() {
     assert!(CausalLmEnvironment::from_canonical_bytes(&trailing).is_err());
 
     let canonical = example().canonical_bytes();
-    let mut noncanonical = vec![0x98, 0x07];
+    let mut noncanonical = vec![0x98, 0x08];
     noncanonical.extend_from_slice(&canonical[1..]);
     assert!(matches!(
         CausalLmEnvironment::from_canonical_bytes(&noncanonical),
@@ -193,14 +242,14 @@ fn decoder_rejects_trailing_and_noncanonical_data() {
     ));
 
     let mut oversized = vec![0; MAX_CAUSAL_LM_ENVIRONMENT_BYTES + 1];
-    oversized[0] = 0x87;
+    oversized[0] = 0x88;
     assert!(matches!(
         CausalLmEnvironment::from_canonical_bytes(&oversized),
             Err(CausalLmEnvironmentError::Invalid(message)) if message.contains("over")
     ));
 
     let mut excessive_objects = DagCborEncoder::new();
-    excessive_objects.array(7);
+    excessive_objects.array(8);
     encode_content_ref(
         &mut excessive_objects,
         ContentRef::new(ContentId::from_bytes([1; 32]), 1),

@@ -323,16 +323,6 @@ pub async fn run(command: ChainCommand) -> CliResult {
     }
 }
 
-pub fn command_owns_tracing(command: &ChainCommand) -> bool {
-    match command {
-        #[cfg(feature = "validator")]
-        ChainCommand::Validator {
-            command: ValidatorCommand::Run { .. },
-        } => true,
-        _ => false,
-    }
-}
-
 async fn run_query(rpc: String, query: QueryCommand) -> CliResult {
     let client = connect_verified(rpc).await?;
     match query {

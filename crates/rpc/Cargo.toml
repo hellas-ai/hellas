@@ -20,6 +20,8 @@ ignored = [
 
 [features]
 default = []
+http-tracing = ["dep:axum", "dep:http-body"]
+otel = ["dep:opentelemetry", "dep:tracing-opentelemetry"]
 
 # === Protocol modules ======================================================
 # Each feature gates the generated items for one proto package, so binaries
@@ -47,6 +49,7 @@ all-protocols = ["swarm", "courtesy", "execute", "evaluate", "fetch", "chain"]
 work = ["dep:hellas-kernel", "evaluate", "hellas-kernel/secp256k1"]
 
 [dependencies]
+axum = { workspace = true, optional = true }
 base64ct = { version = "1", optional = true, features = ["alloc"] }
 bytes = { workspace = true }
 ed25519-dalek = { workspace = true }
@@ -55,7 +58,10 @@ futures-util = { version = "0.3", default-features = false }
 hellas-kernel = { workspace = true, optional = true }
 hellas-wire = { workspace = true }
 hellas-xet = { workspace = true, features = ["chunking", "serde"] }
+http-body = { version = "1", optional = true }
 k256 = { workspace = true }
+n0-future = { version = "0.3", default-features = false }
+opentelemetry = { workspace = true, optional = true }
 p256 = { workspace = true }
 prost = { version = "0.14", default-features = false, features = ["derive"] }
 serde = { workspace = true }
@@ -67,6 +73,7 @@ thiserror = { workspace = true }
 # The measurement seams' one channel out. Nothing here decides on a
 # sample, and a node with no subscriber pays one atomic load per seam.
 tracing = { workspace = true }
+tracing-opentelemetry = { workspace = true, optional = true }
 web-time = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
@@ -82,10 +89,6 @@ protox = "0.9"
 quote = "1"
 syn = { version = "2", features = ["full"] }
 
-[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
-hellas-wire = { workspace = true, features = ["unix", "ws"] }
-tokio-tungstenite.workspace = true
-
 [dev-dependencies]
 # Real settlement signatures in the paid-work vectors: the kernel's own
 # secp256k1 signer, not a placeholder that proves nothing about the keys
@@ -95,5 +98,12 @@ hellas-kernel = { workspace = true, features = ["secp256k1"] }
 # rather than a handler call: framing, method routing, and trailers are
 # where a wire-shaped mistake actually shows up.
 hellas-wire = { workspace = true, features = ["mux"] }
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
 tempfile = { workspace = true }
-tokio.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+tower = { version = "0.5", features = ["util"] }
+tracing-subscriber = { workspace = true }
+
+[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
+hellas-wire = { workspace = true, features = ["unix", "ws"] }
+tokio-tungstenite.workspace = true

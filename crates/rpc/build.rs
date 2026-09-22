@@ -764,7 +764,7 @@ fn handler_signature(m: &MethodPlan) -> TokenStream {
         Shape::BidiStreaming => boxed_stream(request),
         _ => quote! { #request },
     };
-    let context = if (m.connection_bound || m.bounded_submit_tx) && m.shape == Shape::Unary {
+    let context = if m.connection_bound || (m.bounded_submit_tx && m.shape == Shape::Unary) {
         quote! { , context: ::hellas_wire::TransportContext }
     } else {
         quote! {}
@@ -849,6 +849,17 @@ fn dispatch_arm(m: &MethodPlan) -> TokenStream {
                     },
                 )
                 .await
+            }
+        };
+    }
+    if m.connection_bound && m.shape == Shape::ServerStreaming {
+        return quote! {
+            <#marker as ::hellas_wire::MethodMarker>::METHOD_ID => {
+                let context = inbound.context.clone();
+                crate::call::dispatch_server_streaming::<T, #marker, _, _, _>(inbound, |req| {
+                    let h = &self.0;
+                    async move { h.#fn_name(req, context).await }
+                }).await
             }
         };
     }

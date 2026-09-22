@@ -305,6 +305,7 @@ impl Executor {
                     let (sender, receiver) = mpsc::channel(PER_EXECUTION_CHANNEL_CAPACITY);
                     let pending = PendingFetch {
                         cache,
+                        span: tracing::Span::current(),
                         request: provider_request,
                         provider: entry.provider,
                         input_commitment,
@@ -912,70 +913,75 @@ fn spawn_fetch_provider(
     producer_key: Arc<ProducerSigningKey>,
     pending: PendingFetch,
 ) {
-    tokio::spawn(async move {
-        let PendingFetch {
-            cache,
-            request,
-            provider,
-            projector,
-            quota_reservation,
-            input_commitment,
-            assurance,
-            request_commitment_id,
-            execution_id,
-            metric_name,
-            sender,
-        } = pending;
-        let result = async {
-            let _guard = if let Some(cache) = &cache {
-                let (recording, guard) = cache.read().await?;
-                if let Some(recording) = recording {
-                    return cache::replay(
-                        recording,
-                        input_commitment,
-                        assurance,
-                        &producer_key,
-                        &sender,
-                    )
-                    .await;
-                }
-                Some(guard)
-            } else {
-                None
-            };
-            let run = run_fetch_provider(
-                provider,
+    let span = pending.span.clone();
+    tokio::spawn(tracing::Instrument::instrument(
+        async move {
+            let PendingFetch {
+                span: _,
+                cache,
                 request,
+                provider,
                 projector,
+                quota_reservation,
                 input_commitment,
                 assurance,
-                &producer_key,
-                sender.clone(),
-            )
-            .await?;
-            if let Some(cache) = &cache {
-                cache.record(&run).await.map_err(|mut error| {
-                    error.position = run.position;
-                    error
-                })?;
-            }
-            Ok(run)
-        }
-        .await;
-        let _ = completion_tx
-            .send(ExecutorCompletion::FetchFinished(Box::new(
-                FetchCompletion {
+                request_commitment_id,
+                execution_id,
+                metric_name,
+                sender,
+            } = pending;
+            let result = async {
+                let _guard = if let Some(cache) = &cache {
+                    let (recording, guard) = cache.read().await?;
+                    if let Some(recording) = recording {
+                        return cache::replay(
+                            recording,
+                            input_commitment,
+                            assurance,
+                            &producer_key,
+                            &sender,
+                        )
+                        .await;
+                    }
+                    Some(guard)
+                } else {
+                    None
+                };
+                let run = run_fetch_provider(
+                    provider,
+                    request,
+                    projector,
                     input_commitment,
-                    request_commitment_id,
-                    quota_reservation,
-                    execution_id,
-                    metric_name,
-                    sender,
-                    result,
-                },
-            )))
+                    assurance,
+                    &producer_key,
+                    sender.clone(),
+                )
+                .await?;
+                if let Some(cache) = &cache {
+                    cache.record(&run).await.map_err(|mut error| {
+                        error.position = run.position;
+                        error
+                    })?;
+                }
+                Ok(run)
+            }
             .await;
-    });
+            let _ = completion_tx
+                .send(ExecutorCompletion::FetchFinished(Box::new(
+                    FetchCompletion {
+                        input_commitment,
+                        request_commitment_id,
+                        quota_reservation,
+                        execution_id,
+                        metric_name,
+                        sender,
+                        result,
+                    },
+                )))
+                .await;
+        },
+        span,
+    ));
 }
 
 async fn run_fetch_provider(

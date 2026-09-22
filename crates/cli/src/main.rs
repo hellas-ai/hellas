@@ -42,10 +42,9 @@ fn validate_serve_assurance(
 /// creating one is what the operator asked for.
 ///
 /// Identity queries read the file and create nothing as a side effect: doing
-/// so could race with a running service's own creator. Two other commands read
-/// an existing identity because they settle paid work:
-/// a `serve` that was handed a work configuration, and the `provision`
-/// that stakes the bond such a node offers. Both sign with the stored
+/// so could race with a running service's own creator. Paid-work commands also read
+/// an existing identity: providers, provisioning, the operator client, and
+/// gateways configured with a paid provider pool. They sign with the stored
 /// identity's key, so the key must be one an operator already made —
 /// `identity init` is where it comes from. Minting one here would give
 /// the node a settlement party nobody has funded and no bond names, and
@@ -70,6 +69,15 @@ fn load_command_identity(
     );
     #[cfg(not(feature = "node"))]
     let settles_paid_work = false;
+    #[cfg(all(feature = "node", feature = "gateway"))]
+    let settles_paid_work = settles_paid_work
+        || matches!(
+            command,
+            Commands::Gateway {
+                paid_work_config: Some(_),
+                ..
+            }
+        );
     let read_only = settles_paid_work
         || matches!(
             command,
@@ -432,13 +440,11 @@ enum Commands {
     #[cfg(feature = "gateway")]
     /// Run HTTP gateway exposing OpenAI/Anthropic/plain APIs over Hellas network
     ///
-    /// The gateway's routes reach an executor, so it binds loopback only
-    /// and every route requires a credential drawn fresh at startup and
-    /// printed once to your terminal. Send it as
-    /// `Authorization: Bearer <token>`; a restart draws a new one. Hellas
-    /// routes use the one operator-selected causal-LM environment below. Text
-    /// tokenization and decoding are a separate, unattested presentation
-    /// concern configured explicitly by `--tokenizer`.
+    /// Every route requires `Authorization: Bearer <token>`. Use
+    /// --bearer-token-file to retain the credential across restarts.
+    /// Hellas routes use the configured causal-LM environment; the shared
+    /// model adapter handles text and tool calls using --tokenizer and
+    /// --chat-template.
     #[cfg_attr(
         feature = "evaluate",
         command(group(
@@ -463,13 +469,24 @@ enum Commands {
         mut_arg("tokenizer", |arg| arg.required(false).requires("environment"))
     )]
     Gateway {
+        /// Pay a pool of providers using durable on-chain funded work channels.
+        #[cfg(feature = "node")]
+        #[arg(long = "paid-work-config", value_name = "FILE")]
+        paid_work_config: Option<PathBuf>,
+        /// Load a private bearer credential file, creating it when absent.
+        #[arg(long = "bearer-token-file", value_name = "FILE")]
+        bearer_token_file: Option<PathBuf>,
+        /// Allow a non-loopback listener; requires --bearer-token-file.
+        #[arg(long)]
+        allow_remote: bool,
+        /// Explicit local text-chat template.
+        #[arg(long = "chat-template", value_name = "TEMPLATE")]
+        chat_template: Option<hellas_presentation::ChatTemplate>,
         #[command(flatten)]
         remote_trust: RemoteTrustArgs,
         #[command(flatten)]
         causal_lm: Option<CausalLmArgs>,
-        /// Host interface to bind. Must resolve to a loopback address;
-        /// anything else is refused, because these routes reach an
-        /// executor.
+        /// Host interface to bind. Every request requires bearer authentication.
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
         /// Port to listen on. Omit to try 8080 with fallback to an OS-assigned port.
@@ -814,6 +831,11 @@ fn validate_identity_options(
         | Commands::Provision { .. } => true,
         #[cfg(feature = "node")]
         Commands::PaidWork { .. } => true,
+        #[cfg(all(feature = "node", feature = "gateway"))]
+        Commands::Gateway {
+            paid_work_config: Some(_),
+            ..
+        } => true,
         _ => false,
     };
     if software_root && reads_existing_identity {
@@ -880,11 +902,7 @@ async fn async_main() {
         eprintln!("error: failed to harden provider process: {err}");
         std::process::exit(1);
     }
-    let tracer_provider = if command_owns_tracing(&cli.command) {
-        tracing_config::TracerGuard::noop()
-    } else {
-        tracing_config::init_tracing(cli.log_file.as_deref())
-    };
+    let tracer_provider = tracing_config::init_tracing(cli.log_file.as_deref());
     if let Commands::ProducerKey {
         command: ProducerKeyCommand::Show,
     } = &cli.command
@@ -1142,6 +1160,11 @@ async fn async_main() {
         Commands::OutputCache(..) => unreachable!("cache commands handled before identity load"),
         #[cfg(feature = "gateway")]
         Commands::Gateway {
+            #[cfg(feature = "node")]
+            paid_work_config,
+            bearer_token_file,
+            allow_remote,
+            chat_template,
             remote_trust,
             causal_lm,
             host,
@@ -1238,7 +1261,40 @@ async fn async_main() {
                 let assurance = remote_trust.assurance;
                 #[cfg(not(feature = "evaluate"))]
                 let local = false;
-                let provider_trust = if output_cache == hellas_rpc::cache::CachePolicy::ReplayOnly {
+                #[cfg(feature = "node")]
+                let paid_work = if let Some(path) = paid_work_config.as_ref()
+                    && output_cache != hellas_rpc::cache::CachePolicy::ReplayOnly
+                {
+                    anyhow::ensure!(
+                        !local && verify.is_none() && node_id.is_none()
+                            && responses_backend == GatewayResponsesBackend::Hellas,
+                        "--paid-work-config requires remote Hellas execution without --local, --verify, --node-id, or a Responses override",
+                    );
+                    #[cfg(feature = "evaluate")]
+                    anyhow::ensure!(!verify_local, "--paid-work-config cannot use --verify-local");
+                    anyhow::ensure!(
+                        assurance == hellas_rpc::Assurance::ProducerSigned,
+                        "paid-work execution uses producer-signed assurance",
+                    );
+                    anyhow::ensure!(
+                        remote_trust.provider_genesis.is_none(),
+                        "--paid-work-config uses the pool's bond and endpoint identities; omit the courtesy --provider pin",
+                    );
+                    Some(
+                        commands::paid_work::load_gateway_backend(
+                            path,
+                            secret_key.clone(),
+                            identity::settlement_signer(&local_identity),
+                        ).await?
+                    )
+                } else {
+                    None
+                };
+                #[cfg(not(feature = "node"))]
+                let paid_work = None;
+                let provider_trust = if paid_work.is_some()
+                    || output_cache == hellas_rpc::cache::CachePolicy::ReplayOnly
+                {
                     None
                 } else {
                     gateway_provider_trust(
@@ -1252,6 +1308,10 @@ async fn async_main() {
                 };
                 hellas_gateway::run(hellas_gateway::GatewayOptions {
                     output_cache: cache_options,
+                    paid_work,
+                    bearer_token_file,
+            allow_remote,
+                    chat_template,
                     host,
                     port,
                     node_id,
@@ -1470,14 +1530,6 @@ async fn async_main() {
     if let Err(err) = result {
         eprintln!("error: {err:#}");
         std::process::exit(1);
-    }
-}
-
-fn command_owns_tracing(command: &Commands) -> bool {
-    match command {
-        #[cfg(feature = "chain")]
-        Commands::Chain { command } => commands::chain::command_owns_tracing(command),
-        _ => false,
     }
 }
 
