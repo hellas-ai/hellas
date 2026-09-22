@@ -112,11 +112,30 @@ impl PeerDirectory {
                 })
                 .map(|peer| peer.id)
                 .collect();
-            candidates.sort_unstable();
+            // Order by XOR distance from this node's own id, not by id.
+            // A plain id sort makes the lowest ids win truncation at every
+            // responder, so once a network exceeds the disclosure limit a
+            // high-id peer is never disclosed by anyone and can never be
+            // discovered -- which defeats the point of peer exchange.
+            // Distance from the responder gives each node a different
+            // deterministic permutation of the same candidates, so every
+            // peer is near the front for someone.
+            candidates.sort_unstable_by_key(|peer| distance(self.local_peer, *peer));
             candidates.truncate(response_limit);
             candidates
         })
     }
+}
+
+/// XOR distance between two ids.
+///
+/// Not a routing metric here, and it makes no claim about proximity: it is
+/// just a deterministic permutation of the candidate set that differs per
+/// responder. A peer cannot improve its place by behaving differently, and
+/// grinding an id buys a place at one responder rather than at all of them.
+fn distance(a: PeerId, b: PeerId) -> [u8; 32] {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    std::array::from_fn(|index| a[index] ^ b[index])
 }
 
 #[cfg(test)]
@@ -215,5 +234,59 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn truncation_discloses_a_different_slice_at_each_responder() {
+        // The property XOR ordering exists for. Sorting candidates by id
+        // alone would hand every responder the same lowest-N peers, so once
+        // a network exceeds the disclosure limit a high-id peer would never
+        // be disclosed by anyone and could never be discovered. Distance
+        // from the responder's own id puts every candidate near the front
+        // for someone.
+        const CANDIDATES: u8 = 24;
+        const LIMIT: usize = 3;
+
+        let mut disclosed = std::collections::BTreeSet::new();
+        for responder in 200u8..240 {
+            let directory = PeerDirectory::with_config(
+                peer(responder),
+                PeerDirectoryConfig {
+                    stale_peer_after_ms: 100,
+                    service_aliases: vec![ServiceAlias::new("/node/1", "node")],
+                    ..Default::default()
+                },
+            );
+            directory
+                .manager
+                .with_registry_mut(|registry| {
+                    for id in 0..CANDIDATES {
+                        registry.observe_discovered_service(
+                            1_000,
+                            peer(id),
+                            DiscoverySource::Manual,
+                            "node",
+                            Authenticated,
+                        );
+                    }
+                })
+                .unwrap();
+            let peers = directory
+                .known_peers_at(peer(255), "/node/1", LIMIT, 1_000)
+                .expect("known peers");
+            assert_eq!(
+                peers.len(),
+                LIMIT,
+                "responder {responder} truncated wrongly"
+            );
+            disclosed.extend(peers);
+        }
+
+        // A plain id sort would make this set exactly the lowest LIMIT ids.
+        assert!(
+            disclosed.len() > LIMIT * 4,
+            "40 responders disclosed only {} of {CANDIDATES} candidates: {disclosed:?}",
+            disclosed.len()
+        );
     }
 }
