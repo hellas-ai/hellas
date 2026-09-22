@@ -197,7 +197,6 @@ mod tests {
                         registry
                             .observe_inbound_request(1_000, peer(9), Some(1.0))
                             .unwrap();
-                        registry.apply(1_000, peer(9), PeerEvent::InvalidRequest);
                     }
                 })
                 .unwrap();
