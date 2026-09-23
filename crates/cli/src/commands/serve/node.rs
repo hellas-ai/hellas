@@ -392,12 +392,7 @@ where
     let transport = Arc::new(IrohTransport::new(conn));
     let context = transport.context();
 
-    // Every generated `XServer` is wrapped in `AccountingDispatcher`
-    // so per-peer counters (`total_requests`, `last_seen_ms`, RTT
-    // EMA) are populated for every inbound. That's the producer side
-    // of the data that `PeerDirectory::ranked_known_peers` consumes
-    // when surfacing `Node/get_known_peers`; without this wrapper
-    // the directory the node hands out is always empty.
+    // Account for inbound requests and refresh last_seen_ms in the shared registry.
     if alpn == CacheControl::ALPN.as_bytes() {
         serve_loop(
             transport,

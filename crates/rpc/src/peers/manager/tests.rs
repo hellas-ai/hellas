@@ -65,7 +65,6 @@ fn connect_error_does_not_authenticate_or_observe_service() {
     assert_eq!(entry.transport_security, TransportSecurity::Untrusted);
     assert!(!entry.has_service_key::<Node>());
     assert_eq!(entry.in_flight, 0);
-    assert_eq!(entry.error_count, 1);
 }
 
 #[test]
@@ -84,7 +83,6 @@ fn dropped_guard_records_cancellation() {
 
     let registry = manager.snapshot().expect("registry should be readable");
     let entry = registry.get(id).expect("peer should exist");
-    assert_eq!(entry.cancelled_count, 1);
     assert_eq!(entry.in_flight, 0);
     assert_eq!(registry.total_in_flight(), 0);
 }

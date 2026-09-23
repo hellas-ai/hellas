@@ -15,7 +15,6 @@ const DEFAULT_BUCKET_CAPACITY: f64 = 24.0;
 const DEFAULT_BUCKET_REFILL_PER_SEC: f64 = 2.0;
 const DEFAULT_RTT_EMA_ALPHA: f64 = 0.2;
 const DEFAULT_MAX_LABEL_LEN: usize = 128;
-const DEFAULT_MAX_ERROR_LEN: usize = 256;
 
 /// Memory and admission bounds for a peer registry.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -28,7 +27,6 @@ pub struct PeerRegistryConfig {
     pub bucket_refill_per_sec: f64,
     pub rtt_ema_alpha: f64,
     pub max_label_len: usize,
-    pub max_error_len: usize,
 }
 
 impl Default for PeerRegistryConfig {
@@ -42,7 +40,6 @@ impl Default for PeerRegistryConfig {
             bucket_refill_per_sec: DEFAULT_BUCKET_REFILL_PER_SEC,
             rtt_ema_alpha: DEFAULT_RTT_EMA_ALPHA,
             max_label_len: DEFAULT_MAX_LABEL_LEN,
-            max_error_len: DEFAULT_MAX_ERROR_LEN,
         }
     }
 }
@@ -121,7 +118,6 @@ pub enum PeerEvent {
     LabelSet {
         label: String,
     },
-    InvalidRequest,
     Forgotten,
 }
 
@@ -183,13 +179,9 @@ pub enum ServiceStatus {
 pub struct ServiceState {
     pub service: &'static str,
     pub status: ServiceStatus,
-    pub first_seen_ms: u64,
     pub last_seen_ms: u64,
     pub transport_security: TransportSecurity,
     pub success_count: u64,
-    pub error_count: u64,
-    pub last_rtt_ms: Option<f64>,
-    pub last_error: Option<String>,
 }
 
 impl ServiceState {
@@ -197,13 +189,9 @@ impl ServiceState {
         Self {
             service,
             status: ServiceStatus::Observed,
-            first_seen_ms: now_ms,
             last_seen_ms: now_ms,
             transport_security,
             success_count: 0,
-            error_count: 0,
-            last_rtt_ms: None,
-            last_error: None,
         }
     }
 
@@ -212,20 +200,15 @@ impl ServiceState {
         self.transport_security = self.transport_security.strongest(transport_security);
     }
 
-    fn record_success(&mut self, now_ms: u64, rtt_ms: f64) {
+    fn record_success(&mut self, now_ms: u64) {
         self.status = ServiceStatus::Healthy;
         self.last_seen_ms = now_ms;
         self.success_count = self.success_count.saturating_add(1);
-        self.last_rtt_ms = finite_nonneg(rtt_ms);
-        self.last_error = None;
     }
 
-    fn record_error(&mut self, now_ms: u64, rtt_ms: Option<f64>, error: String) {
+    fn record_error(&mut self, now_ms: u64) {
         self.status = ServiceStatus::Failed;
         self.last_seen_ms = now_ms;
-        self.error_count = self.error_count.saturating_add(1);
-        self.last_rtt_ms = rtt_ms.and_then(finite_nonneg);
-        self.last_error = Some(error);
     }
 }
 
@@ -233,22 +216,14 @@ impl ServiceState {
 #[derive(Clone, Debug, PartialEq)]
 pub struct PeerEntry {
     pub id: PeerId,
-    pub first_seen_ms: u64,
     pub last_seen_ms: u64,
-    pub last_source: Option<DiscoverySource>,
     pub transport_security: TransportSecurity,
     pub auth_level: AuthLevel,
     pub label: Option<String>,
     pub services: HashMap<&'static str, ServiceState>,
     pub rtt: EwmaLatency,
     pub success_count: u64,
-    pub error_count: u64,
-    pub cancelled_count: u64,
-    pub total_requests: u64,
-    pub invalid_request_count: u64,
-    pub rate_limited_count: u64,
     pub in_flight: usize,
-    pub last_error: Option<String>,
     /// Set by `PeerEvent::Forgotten` when the peer still has outstanding
     /// permits. The entry is excluded from public queries (`get`, `iter`,
     /// `with_service`) but stays in the underlying map so the `release`
@@ -262,9 +237,7 @@ impl PeerEntry {
     fn new(id: PeerId, now_ms: u64, bucket_capacity: f64, rtt_alpha: f64) -> Self {
         Self {
             id,
-            first_seen_ms: now_ms,
             last_seen_ms: now_ms,
-            last_source: None,
             transport_security: TransportSecurity::Untrusted,
             auth_level: AuthLevel::Untrusted,
             label: None,
@@ -274,13 +247,7 @@ impl PeerEntry {
                 est_ms: None,
             },
             success_count: 0,
-            error_count: 0,
-            cancelled_count: 0,
-            total_requests: 0,
-            invalid_request_count: 0,
-            rate_limited_count: 0,
             in_flight: 0,
-            last_error: None,
             tombstoned: false,
             bucket: TokenBucket::new(now_ms, bucket_capacity),
         }
@@ -448,7 +415,7 @@ impl PeerRegistry {
     }
 
     /// Record an inbound request from a peer. Ensures the peer is
-    /// tracked, bumps `total_requests` + `last_seen_ms`, and records
+    /// tracked, bumps `last_seen_ms`, and records
     /// any observed RTT into the EMA. No rate-limit decision is made
     /// here; admission-policy logic lives at the caller's middleware
     /// layer when it exists (today: only esp32 calls this directly,
@@ -472,7 +439,6 @@ impl PeerRegistry {
             });
         };
         entry.last_seen_ms = now_ms;
-        entry.total_requests = entry.total_requests.saturating_add(1);
         if let Some(rtt_ms) = rtt_ms {
             entry.rtt.record(rtt_ms);
         }
@@ -602,10 +568,8 @@ impl PeerRegistry {
 
         match event {
             PeerEvent::Discovered {
-                source,
-                transport_security,
+                transport_security, ..
             } => {
-                entry.last_source = Some(source);
                 entry.observe_transport(transport_security);
             }
             PeerEvent::ServiceObserved {
@@ -620,9 +584,6 @@ impl PeerRegistry {
             }
             PeerEvent::LabelSet { label } => {
                 entry.label = Some(truncate_string(label, max_label_len));
-            }
-            PeerEvent::InvalidRequest => {
-                entry.invalid_request_count = entry.invalid_request_count.saturating_add(1);
             }
             PeerEvent::Forgotten => unreachable!("forgotten events are handled before insert"),
         }
@@ -674,7 +635,6 @@ impl PeerRegistry {
             self.config.bucket_capacity,
             self.config.bucket_refill_per_sec,
         ) {
-            entry.rate_limited_count = entry.rate_limited_count.saturating_add(1);
             return Err(AcquireDenied::RateLimited {
                 peer,
                 retry_after_ms,
@@ -682,7 +642,6 @@ impl PeerRegistry {
         }
 
         entry.in_flight += 1;
-        entry.total_requests = entry.total_requests.saturating_add(1);
         entry.last_seen_ms = now_ms;
         self.total_in_flight += 1;
 
@@ -695,7 +654,6 @@ impl PeerRegistry {
 
         let peer = permit.peer();
         let max_services = self.config.max_services_per_peer;
-        let max_error_len = self.config.max_error_len;
 
         let Some(entry) = self.peers.get_mut(&peer) else {
             return PeerChange::dropped(peer);
@@ -715,24 +673,18 @@ impl PeerRegistry {
                     max_services,
                 );
                 if let Some(service) = entry.services.get_mut(permit.kind().service) {
-                    service.record_success(now_ms, rtt_ms);
+                    service.record_success(now_ms);
                 }
-                entry.last_error = None;
             }
-            Outcome::Err { rtt_ms, error } => {
-                entry.error_count = entry.error_count.saturating_add(1);
+            Outcome::Err { rtt_ms, .. } => {
                 if let Some(rtt_ms) = rtt_ms {
                     entry.rtt.record(rtt_ms);
                 }
-                let error = truncate_string(error, max_error_len);
                 if let Some(service) = entry.services.get_mut(permit.kind().service) {
-                    service.record_error(now_ms, rtt_ms, error.clone());
+                    service.record_error(now_ms);
                 }
-                entry.last_error = Some(error);
             }
-            Outcome::Cancelled => {
-                entry.cancelled_count = entry.cancelled_count.saturating_add(1);
-            }
+            Outcome::Cancelled => {}
         }
 
         // Final-release purge for tombstoned peers: once the last in-flight
@@ -790,10 +742,6 @@ impl PeerRegistry {
             .min_by_key(|(_, peer)| peer.eviction_key())
             .map(|(id, _)| *id)
     }
-}
-
-fn finite_nonneg(rtt_ms: f64) -> Option<f64> {
-    (rtt_ms.is_finite() && rtt_ms >= 0.0).then_some(rtt_ms)
 }
 
 fn truncate_string(mut value: String, max_len: usize) -> String {

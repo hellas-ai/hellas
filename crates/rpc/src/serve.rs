@@ -6,12 +6,8 @@
 //! (per-peer accounting, admission policy, tracing, OTel) belong in
 //! middleware wrappers around them, not in the codegen output.
 //!
-//! [`AccountingDispatcher`] is the first such wrapper: every inbound
-//! that carries a peer identity bumps the corresponding `PeerManager`
-//! record. That's the producer side of the data flow that
-//! `PeerDirectory::ranked_known_peers` consumes when emitting
-//! `Node::get_known_peers` responses — without this middleware, that
-//! consumer is forever surfacing an empty directory.
+//! [`AccountingDispatcher`] records inbound requests and refreshes
+//! `last_seen_ms` in the shared peer registry.
 
 use std::marker::PhantomData;
 
