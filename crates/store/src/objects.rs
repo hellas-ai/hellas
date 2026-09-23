@@ -1,4 +1,4 @@
-use std::fs::{self, File};
+use std::fs;
 use std::io::Write;
 use std::path::Path;
 
@@ -22,7 +22,7 @@ pub(crate) fn publish(path: &Path, bytes: &[u8], immutable: bool) -> std::io::Re
         temporary.persist(path).map_err(|error| error.error)?;
     }
     #[cfg(unix)]
-    File::open(parent)?.sync_all()?;
+    fs::File::open(parent)?.sync_all()?;
     Ok(())
 }
 
@@ -42,7 +42,7 @@ impl ContentStore {
             return Err(format!("corrupt existing object {id}").into());
         }
         #[cfg(unix)]
-        File::open(root)?.sync_all()?;
+        fs::File::open(root)?.sync_all()?;
         Ok(indexed)
     }
 }

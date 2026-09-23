@@ -11,15 +11,9 @@ use hellas_rpc::{
 };
 use hellas_store::ContentStore;
 use serde::Deserialize;
-use std::ffi::OsString;
-use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::commands::CliResult;
-
-const MAX_TEMPORARY_CREATE_ATTEMPTS: usize = 128;
-static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Subcommand)]
 pub enum EnvironmentCommand {
@@ -331,90 +325,8 @@ fn print_environment(environment: &CausalLmEnvironment, bytes: &[u8], path: &Pat
 /// write runs; this function does not pretend that recursive directory creation
 /// became crash-durable by syncing only the final leaf.
 fn atomic_write(path: &Path, bytes: &[u8]) -> CliResult {
-    use std::io::Write as _;
-
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let (temporary, mut file) = create_temporary(path, parent).with_context(|| {
-        format!(
-            "failed to create temporary output beside {}",
-            path.display()
-        )
-    })?;
-    let mut published = false;
-    let result = (|| {
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        drop(file);
-        std::fs::rename(&temporary, path)?;
-        published = true;
-        sync_directory(parent)?;
-        Ok::<_, std::io::Error>(())
-    })();
-    if !published {
-        let _ = std::fs::remove_file(&temporary);
-    }
-    result.with_context(|| format!("failed to atomically write {}", path.display()))
-}
-
-fn create_temporary(path: &Path, parent: &Path) -> std::io::Result<(PathBuf, File)> {
-    let file_name = path.file_name().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("{} has no file name", path.display()),
-        )
-    })?;
-    let mut last_collision = None;
-    for _ in 0..MAX_TEMPORARY_CREATE_ATTEMPTS {
-        let sequence = TEMPORARY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let mut temporary_name = OsString::from(".");
-        temporary_name.push(file_name);
-        temporary_name.push(format!(
-            ".{}.{sequence}.environment.tmp",
-            std::process::id()
-        ));
-        let temporary = parent.join(temporary_name);
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
-        }
-        match options.open(&temporary) {
-            Ok(file) => return Ok((temporary, file)),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                last_collision = Some(error);
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    Err(last_collision.unwrap_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            "could not create a unique environment temporary file",
-        )
-    }))
-}
-
-fn sync_directory(path: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-
-        OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NONBLOCK)
-            .open(path)?
-            .sync_all()
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-        Ok(())
-    }
+    hellas_private::write_atomically(path, ".environment.tmp", bytes)
+        .with_context(|| format!("failed to atomically write {}", path.display()))
 }
 
 pub fn index_content(

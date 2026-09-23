@@ -1,8 +1,14 @@
-use std::fs::{self, File, OpenOptions};
+use std::fs::{File, OpenOptions};
 use std::io::{self, Read as _};
 use std::path::Path;
-#[cfg(unix)]
-use std::path::PathBuf;
+
+/// A retained directory descriptor pins the opened inode for locking,
+/// permission changes and syncing even if a child name is later unlinked and
+/// recreated. It does not make later path-based child access
+/// descriptor-relative: those callers still require stable, trusted
+/// ancestors. Directory advisory locks coordinate cooperating processes; they
+/// cannot exclude malicious code running as the same user.
+pub(crate) use hellas_private::open_directory;
 
 /// Creates and durably publishes a runtime-state directory that only its owner
 /// can traverse.
@@ -14,61 +20,10 @@ use std::path::PathBuf;
 /// pre-existing parent, so a successful return means the complete new path can
 /// survive a power loss rather than only the files later written beneath it.
 pub(crate) fn create_private_dir_all(path: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
-
-        let path = absolute(path)?;
-        let missing = missing_ancestry(&path)?;
-        let mut builder = fs::DirBuilder::new();
-        builder.recursive(true).mode(0o700).create(&path)?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
-
-        if missing.is_empty() {
-            sync_directory(&path)?;
-        } else {
-            for directory in &missing {
-                sync_directory(directory)?;
-            }
-            if let Some(parent) = missing.last().and_then(|directory| directory.parent()) {
-                sync_directory(parent)?;
-            }
-        }
-        Ok(())
-    }
-
-    #[cfg(not(unix))]
-    {
-        fs::create_dir_all(path)
-    }
-}
-
-/// Opens the directory inode named by `path` without allowing a concurrent
-/// replacement with a FIFO or device to turn the open into a wait.
-///
-/// Symlinks to directories remain supported for operator-managed state paths.
-/// A retained descriptor pins the opened inode for locking, permission changes,
-/// and syncing even if a child name is later unlinked and recreated. It does
-/// not make later path-based child access descriptor-relative: those callers
-/// still require stable, trusted ancestors. Directory advisory locks coordinate
-/// cooperating processes; they cannot exclude malicious code running as the
-/// same user.
-pub(crate) fn open_directory(path: &Path) -> io::Result<File> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_DIRECTORY | libc::O_NONBLOCK);
-    }
-    let directory = options.open(path)?;
-    if !directory.metadata()?.is_dir() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("{} is not a directory", path.display()),
-        ));
-    }
-    Ok(directory)
+    hellas_private::create_dir_all_durable(path)?;
+    hellas_private::restrict_directory(path)?;
+    // Makes the narrowing durable, and the leaf's entries when it pre-existed.
+    hellas_private::sync_directory(path)
 }
 
 /// Narrows the opened directory inode itself, rather than looking its path up
@@ -78,26 +33,12 @@ pub(crate) fn make_directory_private(directory: &File) -> io::Result<()> {
     {
         use std::os::unix::fs::PermissionsExt as _;
 
-        directory.set_permissions(fs::Permissions::from_mode(0o700))?;
+        directory.set_permissions(std::fs::Permissions::from_mode(0o700))?;
         directory.sync_all()
     }
     #[cfg(not(unix))]
     {
         let _ = directory;
-        Ok(())
-    }
-}
-
-/// Makes prior directory-entry changes durable without a name-based blocking
-/// open if the directory path was concurrently replaced.
-pub(crate) fn sync_directory(path: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        open_directory(path)?.sync_all()
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
         Ok(())
     }
 }
@@ -143,44 +84,6 @@ fn too_large(path: &Path, maximum: usize) -> io::Error {
     )
 }
 
-#[cfg(unix)]
-fn absolute(path: &Path) -> io::Result<PathBuf> {
-    if path.is_absolute() {
-        Ok(path.to_path_buf())
-    } else {
-        Ok(std::env::current_dir()?.join(path))
-    }
-}
-
-/// Missing directories from the requested leaf back to, but not including,
-/// the first ancestor already present on disk.
-#[cfg(unix)]
-fn missing_ancestry(path: &Path) -> io::Result<Vec<PathBuf>> {
-    let mut missing = Vec::new();
-    let mut candidate = path;
-    loop {
-        match fs::metadata(candidate) {
-            Ok(metadata) if metadata.is_dir() => return Ok(missing),
-            Ok(_) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    format!("{} exists and is not a directory", candidate.display()),
-                ));
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                missing.push(candidate.to_path_buf());
-            }
-            Err(error) => return Err(error),
-        }
-        candidate = candidate.parent().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("{} has no existing directory ancestor", path.display()),
-            )
-        })?;
-    }
-}
-
 /// Runs a complete filesystem transaction while preserving synchronous ordering.
 ///
 /// On a multithread Tokio runtime, `block_in_place` hands off the worker before
@@ -217,6 +120,7 @@ where
 
 #[cfg(all(test, unix))]
 mod tests {
+    use std::fs;
     use std::os::unix::fs::PermissionsExt as _;
 
     use super::*;

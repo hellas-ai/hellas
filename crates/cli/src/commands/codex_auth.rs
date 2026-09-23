@@ -197,7 +197,9 @@ impl CodexAuthStore {
 
     fn save_unlocked(&self, state: &CodexAuthState) -> Result<(), CodexAuthError> {
         let bytes = serde_json::to_vec_pretty(state).map_err(CodexAuthError::Encode)?;
-        atomic_write_restricted(&self.path, &bytes).map_err(CodexAuthError::Io)
+        // Private from creation on every platform, including an
+        // operator-supplied path whose directory ACL we did not choose.
+        hellas_private::write_atomically(&self.path, ".tmp", &bytes).map_err(CodexAuthError::Io)
     }
 }
 
@@ -755,14 +757,27 @@ fn now_timestamp() -> String {
     unix_seconds().to_string()
 }
 
+/// The user's home directory. Windows does not set `HOME`; the Codex CLI
+/// itself uses `%USERPROFILE%` there.
+fn home_dir() -> Result<PathBuf, CodexAuthError> {
+    std::env::var_os("HOME")
+        .or_else(|| {
+            if cfg!(windows) {
+                std::env::var_os("USERPROFILE")
+            } else {
+                None
+            }
+        })
+        .map(PathBuf::from)
+        .ok_or(CodexAuthError::MissingHome)
+}
+
 fn default_auth_path() -> Result<PathBuf, CodexAuthError> {
-    let home = std::env::var("HOME").map_err(|_| CodexAuthError::MissingHome)?;
-    Ok(PathBuf::from(home).join(".hellas").join("codex-auth.json"))
+    Ok(home_dir()?.join(".hellas").join("codex-auth.json"))
 }
 
 fn default_codex_cli_auth_path() -> Result<PathBuf, CodexAuthError> {
-    let home = std::env::var("HOME").map_err(|_| CodexAuthError::MissingHome)?;
-    Ok(PathBuf::from(home).join(".codex").join("auth.json"))
+    Ok(home_dir()?.join(".codex").join("auth.json"))
 }
 
 fn create_dir_restricted(path: &Path) -> std::io::Result<()> {
@@ -780,103 +795,46 @@ fn create_dir_restricted(path: &Path) -> std::io::Result<()> {
     }
 }
 
-fn atomic_write_restricted(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    let dir = path.parent().ok_or_else(|| {
-        std::io::Error::new(ErrorKind::InvalidInput, "auth path has no parent directory")
-    })?;
-    let tmp = dir.join(format!(
-        ".codex-auth.json.tmp.{}.{:?}",
-        std::process::id(),
-        std::thread::current().id()
-    ));
-    write_file_restricted(&tmp, data)?;
-    match fs::rename(&tmp, path) {
-        Ok(()) => Ok(()),
-        Err(err) => {
-            let _ = fs::remove_file(&tmp);
-            Err(err)
-        }
-    }
-}
-
-fn write_file_restricted(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(path)?;
-        file.write_all(data)?;
-        file.sync_all()
-    }
-    #[cfg(not(unix))]
-    {
-        fs::write(path, data)
-    }
-}
-
+/// Exclusive advisory lock beside the auth file (flock on Unix, LockFileEx
+/// on Windows), released when the file is dropped.
 struct FileLock {
-    #[cfg(unix)]
-    file: fs::File,
+    _file: fs::File,
 }
 
 impl FileLock {
     fn lock(path: &Path) -> Result<Self, CodexAuthError> {
+        let mut options = fs::OpenOptions::new();
+        options
+            .read(true)
+            .write(true)
+            .create(true)
+            // Lock files carry no content; never clobber what's there.
+            .truncate(false);
         #[cfg(unix)]
         {
-            use std::os::fd::AsRawFd;
-            use std::os::unix::fs::OpenOptionsExt;
-            let lock_path = path.with_extension("lock");
-            let file = fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                // Lock files carry no content; never clobber what's there.
-                .truncate(false)
-                .mode(0o600)
-                .open(lock_path)
-                .map_err(CodexAuthError::Io)?;
-            let deadline = Instant::now() + AUTH_FILE_LOCK_TIMEOUT;
-            loop {
-                let result =
-                    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-                if result == 0 {
-                    break;
-                }
-                let error = std::io::Error::last_os_error();
-                if error.kind() != ErrorKind::WouldBlock {
-                    return Err(CodexAuthError::Io(error));
-                }
-                if Instant::now() >= deadline {
-                    return Err(CodexAuthError::Io(std::io::Error::new(
-                        ErrorKind::TimedOut,
-                        format!(
-                            "timed out after {} seconds waiting for Codex auth file lock",
-                            AUTH_FILE_LOCK_TIMEOUT.as_secs()
-                        ),
-                    )));
-                }
-                std::thread::sleep(Duration::from_millis(25));
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let file = options
+            .open(path.with_extension("lock"))
+            .map_err(CodexAuthError::Io)?;
+        let deadline = Instant::now() + AUTH_FILE_LOCK_TIMEOUT;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(Self { _file: file }),
+                Err(fs::TryLockError::WouldBlock) => {}
+                Err(fs::TryLockError::Error(error)) => return Err(CodexAuthError::Io(error)),
             }
-            Ok(Self { file })
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = path;
-            Ok(Self {})
-        }
-    }
-}
-
-#[cfg(unix)]
-impl Drop for FileLock {
-    fn drop(&mut self) {
-        use std::os::fd::AsRawFd;
-        unsafe {
-            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+            if Instant::now() >= deadline {
+                return Err(CodexAuthError::Io(std::io::Error::new(
+                    ErrorKind::TimedOut,
+                    format!(
+                        "timed out after {} seconds waiting for Codex auth file lock",
+                        AUTH_FILE_LOCK_TIMEOUT.as_secs()
+                    ),
+                )));
+            }
+            std::thread::sleep(Duration::from_millis(25));
         }
     }
 }

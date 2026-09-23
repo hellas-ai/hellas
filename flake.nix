@@ -56,6 +56,8 @@
       nixosTests = forAllSystems (system: perSystem.${system}.nixosTests);
       ci = forAllSystems (system: perSystem.${system}.ci);
       hydraJobs = forHydraSystems (system: perSystem.${system}.hydraJobs);
+      # CI-only Windows cross build and on-Windows smoke test; see nix/default.nix.
+      windowsJobs.x86_64-linux = perSystem.x86_64-linux.windowsJobs;
       formatter = forAllSystems (system: perSystem.${system}.formatter);
 
       overlays.default = final: _prev: {

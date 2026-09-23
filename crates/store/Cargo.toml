@@ -11,6 +11,7 @@ documentation.workspace = true
 libc = "0.2"
 
 [dependencies]
+hellas-private.workspace = true
 hellas-rpc.workspace = true
 hellas-xet = { workspace = true, features = ["chunking"] }
 lz4_flex = { version = "0.14", default-features = false, features = ["frame"] }

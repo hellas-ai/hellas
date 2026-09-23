@@ -78,7 +78,7 @@ pub enum OutputCacheCommand {
 
 enum Access {
     Local(CacheController),
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     Socket(CacheControlClientImpl<hellas_wire::mux::MuxTransport>),
     Iroh(CacheControlClientImpl<IrohTransport>),
 }
@@ -98,7 +98,7 @@ impl Access {
             }
             _ => {
                 let mut call = match self {
-                    #[cfg(unix)]
+                    #[cfg(any(unix, windows))]
                     Self::Socket(client) => client.manage_cache(request).await?,
                     Self::Iroh(client) => client.manage_cache(request).await?,
                     _ => unreachable!(),
@@ -180,12 +180,9 @@ pub async fn run(
             root.is_none(),
             "--socket and --store-dir are mutually exclusive"
         );
-        #[cfg(not(unix))]
-        anyhow::bail!("local cache RPC requires Unix sockets");
-        #[cfg(unix)]
         Access::Socket(
             hellas_rpc::services::cache_control::CacheControlClientImpl::new(
-                hellas_wire::unix::connect(socket).await?,
+                hellas_wire::local::connect(socket).await?,
             ),
         )
     } else {
@@ -417,12 +414,11 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[tokio::test]
     async fn rpc_cli_uses_the_live_writer_and_reads_large_entries_in_chunks() {
-        use std::os::unix::fs::PermissionsExt;
         let directory = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        hellas_private::restrict_directory(directory.path()).unwrap();
         let root = directory.path().join("store");
         let socket = directory.path().join("control.sock");
         let store = Arc::new(FsCacheStore::open(&root, true).unwrap());
@@ -437,7 +433,7 @@ mod tests {
         assert!(FsCacheStore::open(&root, true).is_err());
         let access = Access::Socket(
             hellas_rpc::services::cache_control::CacheControlClientImpl::new(
-                hellas_wire::unix::connect(&socket).await.unwrap(),
+                hellas_wire::local::connect(&socket).await.unwrap(),
             ),
         );
         assert_eq!(
@@ -489,5 +485,45 @@ mod tests {
         .await
         .unwrap();
         assert!(store.list().unwrap().is_empty());
+    }
+}
+
+/// Regression: large streamed replies must survive small transport buffers.
+/// Before the framed reader became cancel-safe, a 1 KiB duplex lost frames
+/// whenever the mux driver's `select!` dropped a half-read message, which
+/// is how Windows' 64 KiB named-pipe buffers first exposed it.
+#[cfg(all(test, any(unix, windows)))]
+mod small_buffer_tests {
+    use super::*;
+    use hellas_store::cache::FsCacheStore;
+    use hellas_wire::TransportContext;
+    use hellas_wire::local::{serve_connection, transport};
+    use hellas_wire::mux::Role;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn large_streamed_replies_survive_a_one_kilobyte_transport_buffer() {
+        for _ in 0..5 {
+            let directory = tempfile::tempdir().unwrap();
+            let store =
+                Arc::new(FsCacheStore::open(&directory.path().join("store"), true).unwrap());
+            let key = CacheKey::hash(CacheKind::Proxy, &[b"large"]);
+            store.insert(&key, &vec![7_u8; 600_000], 1).unwrap();
+            let options = CacheOptions {
+                policy: CachePolicy::Record,
+                store: Some(store.clone()),
+            };
+            let (server, client) = tokio::io::duplex(1024);
+            tokio::spawn(serve_connection(
+                server,
+                Arc::new(crate::commands::local_control::cache_control(&options)),
+            ));
+            let client = transport(client, Role::Client, TransportContext::default()).unwrap();
+            let access = Access::Socket(CacheControlClientImpl::new(client));
+            let read = access
+                .read(hellas_rpc::cache::control::key_to_pb(key))
+                .await
+                .unwrap();
+            assert_eq!(read.len(), 600_000);
+        }
     }
 }

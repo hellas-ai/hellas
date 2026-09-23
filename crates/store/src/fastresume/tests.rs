@@ -169,6 +169,7 @@ fn concurrent_saves_publish_only_complete_parseable_indexes() {
     std::fs::remove_file(path).expect("remove index");
 }
 
+#[cfg(unix)]
 #[test]
 fn save_durably_creates_a_private_parent() {
     use std::os::unix::fs::PermissionsExt as _;

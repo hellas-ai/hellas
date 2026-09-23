@@ -780,12 +780,12 @@ impl FetchTranscriptStore for FsFetchTranscriptStore {
         match fs::remove_file(self.running_path(input)) {
             Ok(()) => {
                 #[cfg(unix)]
-                crate::private_fs::sync_directory(&self.root).map_err(FetchStoreError::Io)?;
+                hellas_private::sync_directory(&self.root).map_err(FetchStoreError::Io)?;
                 Ok(())
             }
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
                 #[cfg(unix)]
-                crate::private_fs::sync_directory(&self.root).map_err(FetchStoreError::Io)?;
+                hellas_private::sync_directory(&self.root).map_err(FetchStoreError::Io)?;
                 Ok(())
             }
             Err(err) => Err(FetchStoreError::Io(err)),
@@ -822,7 +822,7 @@ fn atomic_create_no_clobber(path: &Path, bytes: &[u8]) -> Result<(), FetchStoreE
                 // process crash. This matters for the running marker, which
                 // is the only record that a paid provider call may exist.
                 #[cfg(unix)]
-                crate::private_fs::sync_directory(parent).map_err(FetchStoreError::Io)?;
+                hellas_private::sync_directory(parent).map_err(FetchStoreError::Io)?;
                 Ok(())
             }
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {

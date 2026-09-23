@@ -10,6 +10,7 @@ members = [
     "crates/genesis",
     "crates/kernel",
     "crates/presentation",
+    "crates/private",
     "crates/providers",
     "crates/rpc",
     "crates/sdk",
@@ -63,6 +64,7 @@ hellas-gateway = { path = "crates/gateway", default-features = false }
 hellas-genesis = { path = "crates/genesis", default-features = false }
 hellas-kernel = { path = "crates/kernel", default-features = false }
 hellas-presentation = { path = "crates/presentation", default-features = false }
+hellas-private = { path = "crates/private" }
 hellas-providers = { path = "crates/providers", default-features = false }
 hellas-rpc = { path = "crates/rpc", default-features = false }
 hellas-sdk = { path = "crates/sdk", default-features = false }
