@@ -25,6 +25,12 @@ pub mod ws;
 #[cfg(all(feature = "unix", unix, not(target_os = "espidf")))]
 pub mod unix;
 
+#[cfg(all(feature = "unix", windows))]
+pub mod pipe;
+
+#[cfg(all(feature = "unix", any(all(unix, not(target_os = "espidf")), windows)))]
+pub mod local;
+
 pub use crate::canonical::{Encode, Writer};
 pub use crate::clock::{Clock, DefaultClock};
 pub use crate::error::TransportError;

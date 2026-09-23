@@ -23,6 +23,7 @@ futures-core = { workspace = true }
 futures-util = "0.3"
 hellas-chain = { workspace = true, features = ["client"] }
 hellas-kernel = { workspace = true, features = ["secp256k1"] }
+hellas-private.workspace = true
 hellas-rpc = { workspace = true, features = [
     "execute",
     "evaluate",

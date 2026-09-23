@@ -49,7 +49,6 @@ pub mod state;
 pub mod xorb;
 
 use std::collections::HashMap;
-#[cfg(any(unix, test))]
 use std::fs::OpenOptions;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -192,14 +191,26 @@ fn open_regular_file_impl(path: &Path) -> io::Result<std::fs::File> {
     Ok(file)
 }
 
-/// Best available fallback for non-Unix targets.
+/// Best available fallback where Unix descriptors are absent. Windows adds a
+/// read-only share mode, so no writer can open the file while it is being
+/// hashed -- the guarantee the Unix paths approximate with identity checks
+/// (fastresume's Windows identity is deliberately weak; see there).
 #[cfg(not(unix))]
 fn open_regular_file_impl(path: &Path) -> io::Result<std::fs::File> {
     let expected = std::fs::metadata(path)?;
     if !expected.file_type().is_file() {
         return Err(not_a_regular_file(path));
     }
-    let file = std::fs::File::open(path)?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        // FILE_SHARE_READ: other readers may share the file; writers and
+        // deleters are refused until it is closed.
+        options.share_mode(0x0000_0001);
+    }
+    let file = options.open(path)?;
     if !file.metadata()?.file_type().is_file() {
         return Err(not_a_regular_file(path));
     }
@@ -532,9 +543,7 @@ impl ContentStore {
             // an ordinary rewrite leaves the path there and the entry
             // false, and `have` must not claim bytes the store no longer
             // holds.
-            if std::fs::metadata(&entry.path)
-                .is_ok_and(|metadata| fastresume::FileIdentity::of(&metadata) == entry.identity)
-            {
+            if entry_still_holds(id, &entry) {
                 return Some(entry.path);
             }
             if let Ok(mut index) = self.index.write() {
@@ -773,11 +782,41 @@ fn verify_opened_indexed_file(
     }
     let actual = metadata.len();
     check_length(id, actual, &entry.path, length)?;
+    let mut file = file;
+    if !fastresume::FileIdentity::REMEMBERS {
+        // An unchanged identity does not prove unchanged bytes here (see
+        // `fastresume`), so prove it by hashing. The descriptor denies
+        // writers (`open_regular_file`), so the bytes returned are the
+        // bytes hashed.
+        use std::io::Seek as _;
+        let read = |source| StoreError::Read {
+            path: entry.path.clone(),
+            source,
+        };
+        match hash_exact_length(&mut file, actual).map_err(read)? {
+            Some(indexed) if indexed.id == id => {}
+            _ => return Ok(None),
+        }
+        file.seek(std::io::SeekFrom::Start(0)).map_err(read)?;
+    }
     Ok(Some(VerifiedFile {
         file,
         id,
         len: actual,
     }))
+}
+
+/// Whether `entry.path` still holds the bytes that produced `id`.
+///
+/// Where file identity is strong (Unix), an unchanged identity answers that
+/// without reading. Where it is not (Windows), it is answered exactly as
+/// `open_verified` answers it: by the verified open, which hashes.
+fn entry_still_holds(id: XetHash, entry: &Entry) -> bool {
+    if fastresume::FileIdentity::REMEMBERS {
+        return std::fs::metadata(&entry.path)
+            .is_ok_and(|metadata| fastresume::FileIdentity::of(&metadata) == entry.identity);
+    }
+    open_indexed_file(id, LengthContract::AtMost(u64::MAX), entry).is_ok_and(|file| file.is_some())
 }
 
 fn check_length(id: XetHash, actual: u64, path: &Path, contract: LengthContract) -> Result<()> {
@@ -855,5 +894,6 @@ impl core::fmt::Debug for ContentStore {
     }
 }
 
-#[cfg(test)]
+// Symlink, descriptor-flag and inode tests: Unix-specific by construction.
+#[cfg(all(test, unix))]
 mod tests;

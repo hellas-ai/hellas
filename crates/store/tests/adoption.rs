@@ -60,12 +60,16 @@ impl Cache {
             // Lock files live alongside blobs — this is the debris that
             // a naive indexer ingests.
             std::fs::write(base.join("blobs").join(format!("{etag}.lock")), b"").expect("lock");
+            // Snapshot links need symlinks, which Windows hands out only
+            // with a privilege; the blobs alone are what adoption indexes.
             #[cfg(unix)]
             std::os::unix::fs::symlink(
                 PathBuf::from("../../blobs").join(&etag),
                 base.join("snapshots").join(commit).join(name),
             )
             .expect("symlink");
+            #[cfg(not(unix))]
+            let _ = name;
         }
         std::fs::create_dir_all(base.join(".no_exist").join(commit)).expect("no_exist");
         std::fs::write(
@@ -117,6 +121,7 @@ fn a_blob_shared_by_two_revisions_is_indexed_once() {
     let base = cache.0.join("models--org--name");
     let second = base.join("snapshots/2222222222222222222222222222222222222222");
     std::fs::create_dir_all(&second).expect("second snapshot");
+    #[cfg(unix)]
     let etag = format!("{:016x}", shared.len() as u64 * 2_654_435_761);
     #[cfg(unix)]
     std::os::unix::fs::symlink(
@@ -155,6 +160,8 @@ fn the_cache_substitutes_for_content_it_holds() {
 
 /// A persisted record must survive a restart, and must still be
 /// validated against the live file rather than trusted.
+// Windows remembers nothing (see fastresume); nothing to persist or reuse.
+#[cfg(unix)]
 #[test]
 fn fastresume_survives_a_restart_but_is_still_checked() {
     let cache = Cache::new("persist");
@@ -190,6 +197,8 @@ fn fastresume_survives_a_restart_but_is_still_checked() {
 /// A file changed while the record was on disk must not be served from
 /// that record. This is the whole reason the key is an identity and not
 /// a path.
+// Windows remembers nothing (see fastresume); nothing to persist or reuse.
+#[cfg(unix)]
 #[test]
 fn a_record_for_a_changed_file_is_not_used() {
     let cache = Cache::new("stale");
@@ -244,4 +253,25 @@ fn an_unreadable_record_file_yields_nothing() {
         0,
         "a future version is discarded"
     );
+}
+
+/// Windows has no identity strong enough to key remembered work, so a scan
+/// records nothing and every later scan re-hashes.
+#[cfg(windows)]
+#[test]
+fn windows_remembers_no_hashing_work() {
+    let cache = Cache::new("windows");
+    let weights = bytes(100_000, 41);
+    cache.repo(
+        "models--org--name",
+        "6666666666666666666666666666666666666666",
+        &[("model.safetensors", &weights)],
+    );
+    let store = ContentStore::new();
+    HfCache::new(&cache.0).adopt_into(&store).expect("adopt");
+    assert!(
+        store.have(XetHash::hash(&weights)),
+        "adopted content is available"
+    );
+    assert_eq!(store.records().remembered(), 0);
 }

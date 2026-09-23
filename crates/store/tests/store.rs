@@ -117,6 +117,7 @@ fn adopting_a_directory_answers_have_for_everything_in_it() {
 /// `/dev/zero` reads until the disk fills; a symlink to an unrelated
 /// readable file indexes bytes from outside the cache under an id this
 /// node then claims to hold.
+#[cfg(unix)]
 #[test]
 fn adoption_indexes_regular_files_and_nothing_else() {
     let fixture = Fixture::new("file-types");
@@ -311,11 +312,15 @@ fn a_substituter_can_answer_for_content_the_store_lacks() {
     file.read_to_end(&mut read)
         .expect("read verified descriptor");
     assert_eq!(read, content);
-    assert_eq!(
-        store.records().remembered(),
-        1,
-        "a substituter's answer must be indexed before it is lent",
-    );
+    // Windows keeps no fastresume records (see `fastresume`); there the
+    // content is proven by hashing instead of by a remembered identity.
+    if hellas_store::fastresume::FileIdentity::REMEMBERS {
+        assert_eq!(
+            store.records().remembered(),
+            1,
+            "a substituter's answer must be indexed before it is lent",
+        );
+    }
 }
 
 /// Opening an entry the store already indexed is an identity check, not a

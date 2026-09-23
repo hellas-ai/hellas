@@ -30,6 +30,20 @@
 //!
 //! Any disagreement discards the entry. There is no partial trust.
 //!
+//! # Windows
+//!
+//! Stable `std` exposes no inode (volume serial + file index are behind the
+//! unstable `windows_by_handle`), and NTFS's ChangeTime -- the obvious
+//! stand-in for `ctime` -- *can* be set from userspace through
+//! `SetFileInformationByHandle(FileBasicInfo)`, so it would not close the
+//! backdating hole `ctime` closes here. Rather than trust a weaker key,
+//! Windows remembers nothing: [`Records`] stays empty and every scan
+//! re-hashes, and the store proves an indexed file still holds its content
+//! by hashing it rather than by comparing identities. [`FileIdentity`]
+//! still exists there, built from size, last-write and creation time, for
+//! the before/after check around a read, which Windows backs with a share
+//! mode that denies writers for the duration (see `open_regular_file`).
+//!
 //! # Persistence
 //!
 //! Records survive restarts via [`load`] and [`save`], because a store
@@ -44,13 +58,12 @@
 //! is. The file is a cache of work, never a source of truth.
 
 use std::collections::HashMap;
-use std::ffi::OsString;
-use std::fs::{File, Metadata, OpenOptions};
-use std::io::{Read, Write as _};
+use std::fs::Metadata;
+use std::io::Read;
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{Indexed, open_regular_file};
 use hellas_xet::{Chunk, XetHash};
@@ -74,7 +87,12 @@ pub struct FileIdentity {
 }
 
 impl FileIdentity {
+    /// Whether this platform's identity is strong enough to key remembered
+    /// work (see the module docs); where it is not, [`Records`] stays empty.
+    pub const REMEMBERS: bool = cfg!(unix);
+
     /// This file's identity, as `stat` describes it.
+    #[cfg(unix)]
     #[must_use]
     pub fn of(metadata: &Metadata) -> Self {
         Self {
@@ -85,6 +103,25 @@ impl FileIdentity {
                 + i128::from(metadata.mtime_nsec()),
             ctime_ns: i128::from(metadata.ctime()) * 1_000_000_000
                 + i128::from(metadata.ctime_nsec()),
+        }
+    }
+
+    /// This file's identity as far as stable `std` can describe it on
+    /// Windows: no file id, and creation time where `ctime` would be. Good
+    /// for comparing one file against itself across a read; never used as
+    /// a [`Records`] key (`REMEMBERS` is false).
+    #[cfg(windows)]
+    #[must_use]
+    pub fn of(metadata: &Metadata) -> Self {
+        use std::os::windows::fs::MetadataExt as _;
+
+        // FILETIMEs count 100 ns intervals.
+        Self {
+            dev: 0,
+            ino: 0,
+            size: metadata.file_size(),
+            mtime_ns: i128::from(metadata.last_write_time()) * 100,
+            ctime_ns: i128::from(metadata.creation_time()) * 100,
         }
     }
 }
@@ -108,6 +145,9 @@ impl Records {
     /// two revisions' snapshot symlinks is hashed once.
     #[must_use]
     pub fn get(&self, metadata: &Metadata) -> Option<Indexed> {
+        if !FileIdentity::REMEMBERS {
+            return None;
+        }
         let identity = FileIdentity::of(metadata);
         self.entries
             .lock()
@@ -121,6 +161,9 @@ impl Records {
     /// costs a full read, and the chunk list is what a later partial
     /// fetch needs to be verifiable.
     pub fn put(&self, metadata: &Metadata, indexed: &Indexed) {
+        if !FileIdentity::REMEMBERS {
+            return;
+        }
         let identity = FileIdentity::of(metadata);
         if let Ok(mut entries) = self.entries.lock() {
             entries.insert(identity, indexed.clone());
@@ -164,8 +207,6 @@ const MAX_FASTRESUME_RECORDS: usize = 1_000_000;
 const FASTRESUME_HEADER_BYTES: usize = 8 + 4 + 8;
 const FASTRESUME_RECORD_FIXED_BYTES: usize = 8 + 8 + 8 + 16 + 16 + 32 + 8 + 8;
 const FASTRESUME_CHUNK_BYTES: usize = 32 + 8;
-const MAX_TEMPORARY_CREATE_ATTEMPTS: usize = 128;
-static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Writes a bounded subset of remembered records to `path`, atomically.
 ///
@@ -241,140 +282,26 @@ impl Records {
             .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
         create_durable_parent(parent)?;
-        let (temporary, mut file) = create_temporary(path, parent)?;
-        let mut published = false;
-        let result = (|| {
-            file.write_all(&out)?;
-            file.sync_all()?;
-            drop(file);
-            std::fs::rename(&temporary, path)?;
-            published = true;
-            sync_directory(parent)?;
-            Ok(saved)
-        })();
-        if !published {
-            let _ = std::fs::remove_file(temporary);
-        }
-        result
-    }
-}
-
-fn create_temporary(path: &Path, parent: &Path) -> std::io::Result<(PathBuf, File)> {
-    let file_name = path.file_name().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("{} has no file name", path.display()),
-        )
-    })?;
-    let mut last_collision = None;
-    for _ in 0..MAX_TEMPORARY_CREATE_ATTEMPTS {
-        let sequence = TEMPORARY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let mut temporary_name = OsString::from(".");
-        temporary_name.push(file_name);
-        temporary_name.push(format!(".{}.{sequence}.fastresume.tmp", std::process::id()));
-        let temporary = parent.join(temporary_name);
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
-        }
-        match options.open(&temporary) {
-            Ok(file) => return Ok((temporary, file)),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                last_collision = Some(error);
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    Err(last_collision.unwrap_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            "could not create a unique fastresume temporary file",
-        )
-    }))
-}
-
-fn sync_directory(path: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-
-        OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NONBLOCK)
-            .open(path)?
-            .sync_all()
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-        Ok(())
+        hellas_private::write_atomically(path, ".fastresume.tmp", &out)?;
+        Ok(saved)
     }
 }
 
 /// Create any missing index-parent components and durably link every new
 /// directory into its parent before the index itself is published.
 fn create_durable_parent(path: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
+    // Checked on every platform before anything is created.
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
     {
-        use std::os::unix::fs::DirBuilderExt as _;
-        use std::path::Component;
-
-        if path
-            .components()
-            .any(|component| matches!(component, Component::ParentDir))
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("{} contains a parent-directory component", path.display()),
-            ));
-        }
-
-        let absolute = if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            std::env::current_dir()?.join(path)
-        };
-        let mut missing = Vec::new();
-        let mut candidate = absolute.as_path();
-        loop {
-            match std::fs::metadata(candidate) {
-                Ok(metadata) if metadata.is_dir() => break,
-                Ok(_) => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::AlreadyExists,
-                        format!("{} exists and is not a directory", candidate.display()),
-                    ));
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    missing.push(candidate.to_path_buf());
-                }
-                Err(error) => return Err(error),
-            }
-            candidate = candidate.parent().ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!("{} has no existing directory ancestor", path.display()),
-                )
-            })?;
-        }
-
-        let mut builder = std::fs::DirBuilder::new();
-        builder.recursive(true).mode(0o700).create(&absolute)?;
-        for directory in &missing {
-            sync_directory(directory)?;
-        }
-        if let Some(existing_parent) = missing.last().and_then(|directory| directory.parent()) {
-            sync_directory(existing_parent)?;
-        }
-        Ok(())
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} contains a parent-directory component", path.display()),
+        ));
     }
-    #[cfg(not(unix))]
-    {
-        std::fs::create_dir_all(path)
-    }
+    hellas_private::create_dir_all_durable(path)?;
+    Ok(())
 }
 
 /// Reads records from `path` into memory, returning how many were

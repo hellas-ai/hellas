@@ -2678,6 +2678,7 @@ dependencies = [
  "hellas-gateway",
  "hellas-kernel",
  "hellas-presentation",
+ "hellas-private",
  "hellas-providers",
  "hellas-rpc",
  "hellas-store",
@@ -2755,6 +2756,7 @@ dependencies = [
  "futures-util",
  "hellas-chain",
  "hellas-kernel",
+ "hellas-private",
  "hellas-rpc",
  "hellas-store",
  "hellas-wire",
@@ -2789,6 +2791,7 @@ dependencies = [
  "hellas-client",
  "hellas-executor",
  "hellas-presentation",
+ "hellas-private",
  "hellas-rpc",
  "hellas-store",
  "hellas-wire",
@@ -2850,6 +2853,15 @@ dependencies = [
  "thiserror 2.0.18",
  "tokenizers",
  "uuid",
+]
+
+[[package]]
+name = "hellas-private"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "tempfile",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2942,6 +2954,7 @@ dependencies = [
 name = "hellas-store"
 version = "0.1.0"
 dependencies = [
+ "hellas-private",
  "hellas-rpc",
  "hellas-xet",
  "libc",
@@ -2959,10 +2972,12 @@ name = "hellas-wire"
 version = "0.1.0"
 dependencies = [
  "async-stream",
+ "blake3",
  "bytes",
  "data-encoding",
  "futures",
  "futures-core",
+ "hellas-private",
  "hellas-xet",
  "iroh",
  "iroh-mdns-address-lookup",
@@ -2982,6 +2997,7 @@ dependencies = [
  "tracing",
  "wasm-bindgen-futures",
  "web-time",
+ "windows-sys 0.61.2",
  "ws_stream_wasm",
 ]
 
@@ -2993,6 +3009,7 @@ dependencies = [
  "bytes",
  "futures",
  "hellas-kernel",
+ "hellas-private",
  "hellas-rpc",
  "hellas-wire",
  "hellas-xet",

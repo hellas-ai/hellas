@@ -41,11 +41,7 @@ pub(crate) struct Bearer {
 impl Bearer {
     pub(crate) fn load_or_create(path: &std::path::Path) -> anyhow::Result<Self> {
         use anyhow::Context as _;
-        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(path);
+        let file = hellas_private::open_nofollow(path);
         let mut file = match file {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -55,11 +51,8 @@ impl Bearer {
             }
             Err(error) => return Err(error).context("failed to open gateway credential"),
         };
-        let metadata = file.metadata()?;
         anyhow::ensure!(
-            metadata.is_file()
-                && metadata.permissions().mode() & 0o077 == 0
-                && metadata.uid() == unsafe { libc::geteuid() },
+            hellas_private::is_private(&file)?,
             "gateway credential must be a private regular file owned by the gateway user"
         );
         let mut bytes = Vec::new();
@@ -84,19 +77,15 @@ impl Bearer {
 
     pub(crate) fn write_private(&self, path: &std::path::Path) -> anyhow::Result<()> {
         use anyhow::Context as _;
-        let parent = path
-            .parent()
-            .filter(|path| !path.as_os_str().is_empty())
-            .unwrap_or_else(|| std::path::Path::new("."));
-        // NamedTempFile creates mode 0600 and persist atomically replaces
+        // Private from creation (0600 / an owner-only protected DACL), so the
+        // secret never sits in a readable file; the rename atomically replaces
         // the destination without following an existing symlink.
-        let mut file = tempfile::NamedTempFile::new_in(parent)
-            .context("failed to create private gateway credential file")?;
-        writeln!(file, "{}", self.child_credential())?;
-        file.as_file().sync_all()?;
-        file.persist(path)
-            .context("failed to publish gateway credential file")?;
-        Ok(())
+        hellas_private::write_atomically(
+            path,
+            ".tmp",
+            format!("{}\n", self.child_credential()).as_bytes(),
+        )
+        .context("failed to publish gateway credential file")
     }
 
     /// Draw a fresh credential; callers may persist it for managed clients.
@@ -122,10 +111,13 @@ impl Bearer {
             "gateway bearer: Authorization: Bearer {}\n",
             encode_hex(&self.token)
         );
-        match std::fs::OpenOptions::new().write(true).open("/dev/tty") {
+        // CONOUT$ is Windows' /dev/tty: the attached console, bypassing any
+        // redirection of stdout and stderr.
+        let terminal = if cfg!(windows) { "CONOUT$" } else { "/dev/tty" };
+        match std::fs::OpenOptions::new().write(true).open(terminal) {
             Ok(mut tty) => {
                 if let Err(err) = tty.write_all(line.as_bytes()) {
-                    warn!("gateway bearer not shown: writing to /dev/tty failed: {err}");
+                    warn!("gateway bearer not shown: writing to {terminal} failed: {err}");
                 }
             }
             Err(err) => {

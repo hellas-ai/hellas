@@ -30,6 +30,18 @@ pub struct FsCacheStore {
 
 impl FsCacheStore {
     pub fn open(root: &Path, writable: bool) -> CacheResult<Self> {
+        // Say so explicitly: Windows reports `<file>\index` as merely not
+        // found, which would otherwise read as an empty cache over a file.
+        match fs::metadata(root) {
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotADirectory,
+                    format!("{} is not a directory", root.display()),
+                )
+                .into());
+            }
+            _ => {}
+        }
         if writable {
             fs::create_dir_all(root)?;
         }
