@@ -31,6 +31,7 @@ hellas-adaptors.workspace = true
 hellas-client = { workspace = true, features = ["iroh", "evaluate"] }
 hellas-executor = { workspace = true, optional = true }
 hellas-presentation.workspace = true
+hellas-private.workspace = true
 hellas-rpc = { workspace = true, features = ["courtesy", "fetch"] }
 hellas-store = { workspace = true, optional = true }
 hellas-wire = { workspace = true, features = ["iroh"] }

@@ -234,6 +234,12 @@ let
   };
 
   nativePackages = packagesFor null;
+
+  # Windows (x86_64-pc-windows-gnu, mingw-w64) is CI-only. Hydra cross-builds
+  # it and runs it on a real Windows host (windowsJobs), but it stays out of
+  # `packages`, `crossTargets` and the required aggregate until the store has
+  # a Windows file identity as strong as the Unix one (see crossTargets).
+  windowsPackages = packagesFor nixpkgs.lib.systems.examples.mingwW64;
   isX86_64Linux = pkgs.stdenv.hostPlatform.system == "x86_64-linux";
   # Flat `cross-<target>-<name>` packages. Nested `packages.<sys>.cross.<target>.<name>`
   # violates the flake schema (each entry must be a derivation), which `nix flake check`
@@ -537,6 +543,33 @@ in
       "no-catgrad-lock" = noCatgradLock;
     };
   nixosTests = linuxOutputs.nixosTests or { };
+
+  # Evaluated by a separate, non-reporting Hydra jobset (infra
+  # services/ci/hydra.nix). Deliberately not under hydraJobs: nothing here may
+  # join `required` or report a GitHub status.
+  windowsJobs = lib.optionalAttrs isX86_64Linux {
+    inherit (windowsPackages) cli;
+    # Runs on the `wsl` builder (NixOS-WSL inside a Windows VM), whose sandbox
+    # exposes WSL interop. Interop translates the working directory to a
+    # Windows path, so exec from `/` -- the sandbox-only /build fails EINVAL.
+    smoke =
+      pkgs.runCommand "hellas-cli-windows-smoke"
+        {
+          requiredSystemFeatures = [ "wsl" ];
+          exe = "${windowsPackages.cli}/bin/hellas-cli.exe";
+        }
+        ''
+          cd /
+          export WSL_INTEROP=/run/WSL/1_interop
+          if ! "$exe" --version >"$TMPDIR/version" 2>&1; then
+            cat "$TMPDIR/version"
+            exit 1
+          fi
+          cat "$TMPDIR/version"
+          grep -q . "$TMPDIR/version"
+          cp "$TMPDIR/version" "$out"
+        '';
+  };
 
   hydraJobs = {
     devShell = defaultDevShell;

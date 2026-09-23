@@ -28,8 +28,11 @@ pub use provider::{OpenAiProviderOptions, ProviderHandle, start_openai_provider}
 #[cfg(feature = "client")]
 pub use remote::{ClientIdentity, HellasClient, RemoteFetchRequest};
 
-#[cfg(all(feature = "local-control", unix, not(target_os = "espidf")))]
+#[cfg(all(
+    feature = "local-control",
+    any(all(unix, not(target_os = "espidf")), windows)
+))]
 pub mod local {
     pub use hellas_rpc::cache::control::CacheController;
-    pub use hellas_wire::unix::{LOCAL_MUX_SLOTS, LocalControlServer, connect, transport};
+    pub use hellas_wire::local::{LOCAL_MUX_SLOTS, LocalControlServer, connect, transport};
 }

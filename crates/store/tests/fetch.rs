@@ -148,6 +148,7 @@ fn content_that_does_not_hash_to_its_id_is_not_kept() {
 /// `std::fs::write` did all three. The bytes are verified before this
 /// point and cannot change; the *destination* can, and a symlink at
 /// `dest` sent the whole download somewhere else entirely.
+#[cfg(unix)]
 #[test]
 fn verified_bytes_are_published_atomically_and_follow_nothing() {
     use hellas_store::hf::publish;

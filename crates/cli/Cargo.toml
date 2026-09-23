@@ -94,6 +94,7 @@ hellas-executor = { workspace = true, default-features = false, optional = true 
 hellas-gateway = { workspace = true, optional = true }
 hellas-kernel = { workspace = true, default-features = false, optional = true }
 hellas-presentation = { workspace = true, optional = true }
+hellas-private.workspace = true
 hellas-providers.workspace = true
 hellas-rpc = { workspace = true, default-features = false, features = [
     "all-protocols",

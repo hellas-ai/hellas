@@ -517,7 +517,7 @@ impl Journal {
         // directory entry durable, so a crash cannot leave a channel
         // with a signature exported and no file to find it in.
         if let Some(parent) = self.path.parent() {
-            sync_directory(parent)?;
+            hellas_private::sync_directory(parent)?;
         }
         Ok(())
     }
@@ -997,7 +997,7 @@ fn write_candidate(
 /// and the directory `fsync` that makes the rename itself durable.
 fn install(candidate: &Path, installed: &Path, directory: &Path) -> Result<(), JournalError> {
     fs::rename(candidate, installed)?;
-    sync_directory(directory)
+    Ok(hellas_private::sync_directory(directory)?)
 }
 
 /// Step three: the predecessor's name goes, and the directory is fsynced
@@ -1012,7 +1012,7 @@ fn retire(predecessor: &Path, directory: &Path) -> Result<(), JournalError> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error.into()),
     }
-    sync_directory(directory)
+    Ok(hellas_private::sync_directory(directory)?)
 }
 
 /// Returns why one retired envelope version cannot be migrated.
@@ -1113,24 +1113,6 @@ fn frame_digest(header: Digest, seq: u64, payload: &[u8]) -> Digest {
     hasher.update(&(payload.len() as u64).to_be_bytes());
     hasher.update(payload);
     hasher.finalize()
-}
-
-/// Fsyncs a directory, so a file created in it survives a crash.
-///
-/// Not every platform can open a directory as a file. Where it cannot,
-/// the file's own `fsync` is what survives, and the directory entry is
-/// the platform's business; the failure is not reported as this
-/// endpoint's, because there is nothing it could do differently.
-fn sync_directory(path: &Path) -> Result<(), JournalError> {
-    match File::open(path) {
-        Ok(directory) => match directory.sync_all() {
-            Ok(()) => Ok(()),
-            Err(_) if cfg!(not(unix)) => Ok(()),
-            Err(error) => Err(error.into()),
-        },
-        Err(_) if cfg!(not(unix)) => Ok(()),
-        Err(error) => Err(error.into()),
-    }
 }
 
 #[cfg(test)]

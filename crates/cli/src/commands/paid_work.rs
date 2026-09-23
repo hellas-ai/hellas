@@ -1219,35 +1219,15 @@ fn read_prepared_input(path: &Path) -> CliResult<PreparedPaidInputV1> {
 
 #[cfg(feature = "llm")]
 fn write_private(path: &Path, bytes: &[u8]) -> CliResult<()> {
-    use std::io::Write as _;
-    let parent = path
+    if let Some(parent) = path
         .parent()
-        .filter(|parent| !parent.as_os_str().is_empty());
-    if let Some(parent) = parent {
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
-    }
-    let mut file = options
-        .open(path)
-        .with_context(|| format!("failed to open {}", path.display()))?;
-    file.write_all(bytes)
-        .with_context(|| format!("failed to write {}", path.display()))?;
-    file.sync_all()
-        .with_context(|| format!("failed to sync {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("failed to restrict {}", path.display()))?;
-    }
-    Ok(())
+    hellas_private::write_atomically(path, ".tmp", bytes)
+        .with_context(|| format!("failed to write {}", path.display()))
 }
 
 fn edge_id(flag: &str, value: &str) -> CliResult<EdgeId> {

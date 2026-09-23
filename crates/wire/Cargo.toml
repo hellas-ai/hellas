@@ -32,9 +32,16 @@ discovery-mdns = [
 # Mux is shared infrastructure for transports without native substreams.
 mux = []
 ws = ["mux", "dep:tokio-tungstenite"]
-# Local native transport. Unix sockets provide the byte stream; `mux` keeps
-# the RPC framing and service dispatch identical to WebSocket carriers.
-unix = ["mux", "tokio/net"]
+# Local native transport: a Unix socket, or an owner-authenticated named pipe
+# on Windows. `mux` keeps the RPC framing and service dispatch identical to
+# WebSocket carriers.
+unix = [
+    "mux",
+    "tokio/net",
+    "dep:blake3",
+    "dep:hellas-private",
+    "dep:windows-sys",
+]
 # Opt-in TLS for native WebSocket clients. Keeping this separate from `ws`
 # preserves a TLS-free transport build for constrained native targets.
 ws-rustls = ["ws", "dep:rustls", "tokio-tungstenite/rustls-tls-webpki-roots"]
@@ -95,6 +102,14 @@ tokio = { workspace = true, features = [
 tokio = { version = "1", default-features = false, features = [
     "sync",
     "macros",
+] }
+
+[target.'cfg(windows)'.dependencies]
+blake3 = { version = "1", optional = true }
+hellas-private = { workspace = true, optional = true }
+windows-sys = { version = "0.61", optional = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Pipes",
 ] }
 
 [dev-dependencies]

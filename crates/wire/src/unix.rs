@@ -4,7 +4,8 @@ pub use crate::framed::{DEFAULT_MAX_MESSAGE_BYTES, LengthDelimitedMessagePipe};
 use std::{io, path::Path};
 use tokio::net::UnixStream;
 mod server;
-pub use server::{LOCAL_MUX_SLOTS, LocalControlServer, connect, transport};
+pub use crate::local::{LOCAL_MUX_SLOTS, transport};
+pub use server::{LocalControlServer, connect};
 
 pub type UnixMessagePipe = LengthDelimitedMessagePipe<UnixStream>;
 

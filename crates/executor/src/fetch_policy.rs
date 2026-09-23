@@ -932,7 +932,7 @@ fn atomic_replace(path: &Path, bytes: &[u8]) -> Result<(), FetchAccessError> {
         drop(file);
         fs::rename(&tmp, path).map_err(FetchAccessError::Io)?;
         #[cfg(unix)]
-        crate::private_fs::sync_directory(parent).map_err(FetchAccessError::Io)?;
+        hellas_private::sync_directory(parent).map_err(FetchAccessError::Io)?;
         Ok(())
     })();
 

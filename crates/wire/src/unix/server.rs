@@ -3,28 +3,11 @@
 use std::io;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
-use crate::mux::{MuxConfig, MuxTransport, Role};
-use crate::unix::{DEFAULT_MAX_MESSAGE_BYTES, UnixMessagePipe};
-use crate::{AuthLevel, DefaultClock, Dispatcher, StreamTransport, TransportContext};
+use crate::local::{serve_accepted, transport};
+use crate::mux::{MuxTransport, Role};
+use crate::{Dispatcher, TransportContext};
 use tokio::net::{UnixListener, UnixStream};
-
-pub const LOCAL_MUX_SLOTS: usize = 32;
-
-pub fn transport(
-    stream: UnixStream,
-    role: Role,
-    context: TransportContext,
-) -> io::Result<MuxTransport> {
-    Ok(MuxTransport::spawn::<LOCAL_MUX_SLOTS, _, _>(
-        role,
-        DefaultClock,
-        MuxConfig::default(),
-        UnixMessagePipe::new(stream, DEFAULT_MAX_MESSAGE_BYTES)?,
-        context,
-    ))
-}
 
 pub async fn connect(path: impl AsRef<Path>) -> io::Result<MuxTransport> {
     transport(
@@ -66,41 +49,16 @@ impl LocalControlServer {
         let listener = UnixListener::bind(path)?;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
         let metadata = std::fs::symlink_metadata(path)?;
-        let dispatcher = Arc::new(dispatcher);
-        let task = tokio::spawn(async move {
-            let mut connections = tokio::task::JoinSet::new();
-            loop {
-                tokio::select! {
-                    incoming = listener.accept() => {
-                        let Ok((stream, _)) = incoming else {
-                            break;
-                        };
-                        if connections.len() >= 16
-                            || !stream.peer_cred().is_ok_and(|cred| cred.uid() == uid)
-                        {
-                            continue;
-                        }
-                        let dispatcher = dispatcher.clone();
-                        connections.spawn(async move {
-                            let Ok(transport) = transport(
-                                stream, Role::Server, TransportContext {
-                                    auth_level: AuthLevel::LocalOwner,
-                                    ..TransportContext::default()
-                                },
-                            ) else {
-                                return;
-                            };
-                            while let Ok(Some(inbound)) = transport.accept().await {
-                                if dispatcher.dispatch(inbound).await.is_err() {
-                                    break;
-                                }
-                            }
-                        });
-                    }
-                    _ = connections.join_next(), if !connections.is_empty() => {}
-                }
-            }
-        });
+        let task = tokio::spawn(serve_accepted(
+            async move || {
+                let (stream, _) = listener.accept().await?;
+                Ok(stream
+                    .peer_cred()
+                    .is_ok_and(|cred| cred.uid() == uid)
+                    .then_some(stream))
+            },
+            dispatcher,
+        ));
         Ok(Self {
             task,
             socket: path.to_owned(),
