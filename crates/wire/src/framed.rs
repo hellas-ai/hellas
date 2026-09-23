@@ -3,7 +3,7 @@
 
 use std::io;
 
-use bytes::Bytes;
+use bytes::{Buf as _, Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 
 use crate::mux::MessagePipe;
@@ -16,6 +16,9 @@ pub struct LengthDelimitedMessagePipe<S> {
     reader: ReadHalf<S>,
     writer: WriteHalf<S>,
     max_message_bytes: usize,
+    /// Bytes read but not yet returned as a message. Keeping them here, not
+    /// in a future's locals, is what makes `recv_message` cancel-safe.
+    read_buffer: BytesMut,
 }
 
 impl<S> LengthDelimitedMessagePipe<S>
@@ -34,6 +37,7 @@ where
             reader,
             writer,
             max_message_bytes,
+            read_buffer: BytesMut::with_capacity(8 * 1024),
         })
     }
 
@@ -70,17 +74,36 @@ where
         self.writer.flush().await
     }
 
+    /// Cancel-safe: the mux driver polls this inside `select!`, so it is
+    /// routinely dropped mid-frame when a command wins the race. Every byte
+    /// read goes straight into `read_buffer`, so a dropped call loses
+    /// nothing; the next call resumes the same frame. (A `read_exact` into a
+    /// local lost the partial frame and desynchronized the stream whenever a
+    /// frame spanned more than one read -- small socket or pipe buffers, or a
+    /// slow link -- killing the transport mid-response.)
     async fn recv_message(&mut self) -> io::Result<Option<Bytes>> {
-        let mut prefix = [0_u8; 4];
-        if self.reader.read(&mut prefix[..1]).await? == 0 {
-            return Ok(None);
+        loop {
+            if self.read_buffer.len() >= 4 {
+                let prefix: [u8; 4] = self.read_buffer[..4].try_into().expect("four bytes");
+                let len = u32::from_be_bytes(prefix) as usize;
+                self.checked_len(len)?;
+                if self.read_buffer.len() >= 4 + len {
+                    self.read_buffer.advance(4);
+                    return Ok(Some(self.read_buffer.split_to(len).freeze()));
+                }
+                self.read_buffer.reserve(4 + len - self.read_buffer.len());
+            }
+            if self.reader.read_buf(&mut self.read_buffer).await? == 0 {
+                return if self.read_buffer.is_empty() {
+                    Ok(None)
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "stream ended inside a framed message",
+                    ))
+                };
+            }
         }
-        self.reader.read_exact(&mut prefix[1..]).await?;
-        let len = u32::from_be_bytes(prefix) as usize;
-        self.checked_len(len)?;
-        let mut body = vec![0; len];
-        self.reader.read_exact(&mut body).await?;
-        Ok(Some(Bytes::from(body)))
     }
 }
 
@@ -105,6 +128,42 @@ mod tests {
 
         assert_eq!(receiver.recv_message().await.unwrap().unwrap(), "first");
         assert_eq!(receiver.recv_message().await.unwrap().unwrap(), "second");
+    }
+
+    /// A receive dropped mid-frame (as `select!` does in the mux driver)
+    /// must not lose the bytes it already read.
+    #[tokio::test]
+    async fn a_cancelled_receive_resumes_the_same_frame() {
+        let (mut left, right) = tokio::io::duplex(1024);
+        let mut receiver = LengthDelimitedMessagePipe::new(right, 1024).unwrap();
+        let message = b"a frame split across two reads";
+        let mut framed = (message.len() as u32).to_be_bytes().to_vec();
+        framed.extend_from_slice(message);
+
+        left.write_all(&framed[..7]).await.unwrap();
+        // Poll once so the partial frame is read, then drop the future.
+        let cancelled = tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            receiver.recv_message(),
+        )
+        .await;
+        assert!(cancelled.is_err(), "the frame is incomplete");
+
+        left.write_all(&framed[7..]).await.unwrap();
+        assert_eq!(
+            receiver.recv_message().await.unwrap().unwrap(),
+            &message[..]
+        );
+    }
+
+    #[tokio::test]
+    async fn eof_inside_a_frame_is_an_error_not_a_clean_close() {
+        let (mut left, right) = tokio::io::duplex(1024);
+        let mut receiver = LengthDelimitedMessagePipe::new(right, 1024).unwrap();
+        left.write_all(&[0, 0, 0, 9, b'x']).await.unwrap();
+        drop(left);
+        let error = receiver.recv_message().await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
     }
 
     #[tokio::test]
