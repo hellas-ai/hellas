@@ -58,7 +58,7 @@ impl WorkService {
             .admitting()
             .map_err(|error| BackendFault::new(error.to_string()))?
             .execution_policy()
-            .max_spool_bytes;
+            .max_spool_bytes();
         let mut progress = self.progress.lock().expect("paid progress poisoned");
         let events = progress.entry(work_id).or_default();
         // Signed token events are bounded by the same spool as final delivery.
@@ -171,8 +171,14 @@ where
         .state()
         .job_by_id(work_id)
         .ok_or(DeliverError::NoSuchJob)?;
-    let prepared = PreparedPaidInputV1::decode(job.prepared_input(), MAX_RECORD_BYTES)
-        .map_err(PaidWorkError::from)?;
+    let PreparedPaidWorkInput::Evaluate(prepared) =
+        PreparedPaidWorkInput::decode(job.prepared_input(), MAX_RECORD_BYTES)
+            .map_err(PaidWorkError::from)?
+    else {
+        return Err(DeliverError::Malformed(
+            "live token delivery requires Evaluate",
+        ));
+    };
     let parts = prepared.parts().map_err(PaidWorkError::from)?;
     let input = hellas_rpc::evaluate::input_commitment(&parts.evaluate_request);
     let mut token_count = 0u64;
@@ -208,7 +214,7 @@ where
                     token_count = token_count.saturating_add(delta.token_ids.len() as u64);
                     retained_bytes = retained_bytes.saturating_add(event.payload().len() + 1024);
                     if token_count > u64::from(parts.text_policy.max_new_tokens())
-                        || retained_bytes as u64 > ready.execution_policy().max_spool_bytes
+                        || retained_bytes as u64 > ready.execution_policy().max_spool_bytes()
                     {
                         return Err(DeliverError::Malformed(
                             "live result exceeds authorized output",

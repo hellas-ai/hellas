@@ -45,12 +45,17 @@ all-protocols = ["swarm", "courtesy", "execute", "evaluate", "fetch", "chain"]
 # needs the consensus kernel's types — the certificate, the network id,
 # and the edge/terms commitments — and a wasm or fetch-only client has no
 # use for them. The alternative was restating those kernel types here,
-# which is how two definitions of a signed digest start.
-work = ["dep:hellas-kernel", "evaluate", "hellas-kernel/secp256k1"]
+# which is how two definitions of a signed digest start. Both paid
+# profiles are pulled forward: `evaluate` for the causal-LM profile and
+# `fetch` for the sealed-fetch profile (`protocol::work_fetch`), whose
+# records commit to signed fetch transcripts.
+work = ["dep:hellas-kernel", "evaluate", "fetch", "hellas-kernel/secp256k1"]
 
 [dependencies]
 axum = { workspace = true, optional = true }
+base64.workspace = true
 base64ct = { version = "1", optional = true, features = ["alloc"] }
+url = "2"
 bytes = { workspace = true }
 ed25519-dalek = { workspace = true }
 futures-core = { workspace = true }

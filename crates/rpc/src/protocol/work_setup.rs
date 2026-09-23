@@ -18,8 +18,8 @@ use hellas_kernel::{
 
 use crate::protocol::work::{
     PaidChannel, PaidChannelPolicyV1, PaidExecutionPolicyV1, PaidWorkError, PrivateRecord,
-    check_execution_policy,
 };
+use crate::protocol::work_profile::PaidWorkPolicy;
 
 /// Why a configured channel is not one this endpoint may work over.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -226,7 +226,7 @@ pub struct WorkChannelConfig {
     /// The credit policy those terms commit to.
     pub channel_policy: PaidChannelPolicyV1,
     /// The execution policy in force on this channel.
-    pub execution_policy: PaidExecutionPolicyV1,
+    pub execution_policy: PaidWorkPolicy,
     /// The payment edge's value, reserve, and close fees as the
     /// operator expects them to be funded.
     pub expected_payment_values: EdgeValues,
@@ -252,7 +252,7 @@ pub struct ProviderChannelPolicy {
     /// The credit policy this provider will work under.
     pub channel_policy: PaidChannelPolicyV1,
     /// The execution policy this provider will run jobs under.
-    pub execution_policy: PaidExecutionPolicyV1,
+    pub execution_policy: PaidWorkPolicy,
     /// The payment edge's value, reserve, and close fees as the provider
     /// requires them to be funded.
     pub expected_payment_values: EdgeValues,
@@ -293,7 +293,7 @@ impl ProviderChannelPolicy {
             &self.policy_salt,
             self.channel_policy,
         )?;
-        check_execution_policy(&self.execution_policy)?;
+        self.execution_policy.check()?;
         if work_payment_settlement(
             self.expected_payment_values,
             channel.payment_terms().omission_bond,
@@ -306,7 +306,7 @@ impl ProviderChannelPolicy {
             channel,
             bond_edge,
             policy_salt: self.policy_salt,
-            execution_policy: self.execution_policy,
+            execution_policy: self.execution_policy.clone(),
             expected_payment_values: self.expected_payment_values,
         })
     }
@@ -361,7 +361,7 @@ impl ProviderChannelPolicy {
             payment_terms,
             policy_salt: self.policy_salt,
             channel_policy: self.channel_policy,
-            execution_policy: self.execution_policy,
+            execution_policy: self.execution_policy.clone(),
             expected_payment_values: self.expected_payment_values,
         })
     }
@@ -380,7 +380,7 @@ pub struct WorkChannelDescriptor {
     bond_edge: EdgeId,
     bond_terms_hash: TermsHash,
     policy_salt: [u8; 32],
-    execution_policy: PaidExecutionPolicyV1,
+    execution_policy: PaidWorkPolicy,
     expected_payment_values: EdgeValues,
 }
 
@@ -418,7 +418,7 @@ impl WorkChannelDescriptor {
             &config.policy_salt,
             config.channel_policy,
         )?;
-        check_execution_policy(&config.execution_policy)?;
+        config.execution_policy.check()?;
 
         let settlement = work_payment_settlement(config.expected_payment_values, omission_bond)
             .ok_or(WorkSetupError::Unsettleable)?;
@@ -445,7 +445,7 @@ impl WorkChannelDescriptor {
     }
 
     /// Returns the execution policy in force on this channel.
-    pub const fn execution_policy(&self) -> &PaidExecutionPolicyV1 {
+    pub const fn execution_policy(&self) -> &PaidWorkPolicy {
         &self.execution_policy
     }
 
@@ -462,7 +462,7 @@ impl WorkChannelDescriptor {
             channel: self.channel.clone(),
             bond_edge: self.bond_edge,
             policy_salt: self.policy_salt,
-            execution_policy: self.execution_policy,
+            execution_policy: self.execution_policy.clone(),
             expected_payment_values: self.expected_payment_values,
         }
     }
@@ -578,7 +578,7 @@ impl WorkChannelDescriptor {
 
         Ok(ReadyChannel {
             channel: self.channel.clone(),
-            execution_policy: self.execution_policy,
+            execution_policy: self.execution_policy.clone(),
             settlement,
             finalized_height: observed.height,
             admission_horizon: horizon,
@@ -607,7 +607,7 @@ pub struct CloseDescriptor {
     channel: PaidChannel,
     bond_edge: EdgeId,
     policy_salt: [u8; 32],
-    execution_policy: PaidExecutionPolicyV1,
+    execution_policy: PaidWorkPolicy,
     expected_payment_values: EdgeValues,
 }
 
@@ -630,7 +630,7 @@ impl CloseDescriptor {
 
     /// Returns the execution policy the armed endpoint accepted.
     #[must_use]
-    pub const fn execution_policy(&self) -> &PaidExecutionPolicyV1 {
+    pub const fn execution_policy(&self) -> &PaidWorkPolicy {
         &self.execution_policy
     }
 
@@ -673,7 +673,12 @@ impl CloseDescriptor {
     /// Returns the descriptor's canonical journal bytes.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = vec![CLOSE_DESCRIPTOR_VERSION];
+        let version = if matches!(self.execution_policy, PaidWorkPolicy::Evaluate(_)) {
+            CLOSE_DESCRIPTOR_VERSION
+        } else {
+            2
+        };
+        let mut out = vec![version];
         push_kernel(&mut out, &self.channel.network());
         push_kernel(&mut out, &self.channel.payment_edge());
         push_kernel(
@@ -682,7 +687,11 @@ impl CloseDescriptor {
         );
         out.extend_from_slice(&self.policy_salt);
         out.extend_from_slice(&self.channel.channel_policy().encode());
-        out.extend_from_slice(&self.execution_policy.encode());
+        let policy_bytes = self.execution_policy.encode();
+        if version == 2 {
+            out.extend_from_slice(&(policy_bytes.len() as u64).to_be_bytes());
+        }
+        out.extend_from_slice(&policy_bytes);
         out.extend_from_slice(&self.expected_payment_values.value().to_be_bytes());
         out.extend_from_slice(&self.expected_payment_values.reserve().to_be_bytes());
         push_kernel(&mut out, &self.expected_payment_values.close_fees());
@@ -697,7 +706,8 @@ impl CloseDescriptor {
     /// rerun them.
     pub fn decode(bytes: &[u8]) -> Result<Self, WorkSetupError> {
         let mut cursor = CloseCursor { bytes };
-        if cursor.byte()? != CLOSE_DESCRIPTOR_VERSION {
+        let version = cursor.byte()?;
+        if version != CLOSE_DESCRIPTOR_VERSION && version != 2 {
             return Err(WorkSetupError::DescriptorMalformed);
         }
         let network = cursor.network()?;
@@ -710,9 +720,18 @@ impl CloseDescriptor {
         let channel_policy =
             PaidChannelPolicyV1::decode(cursor.take(PaidChannelPolicyV1::ENCODED_SIZE)?)
                 .map_err(|_| WorkSetupError::DescriptorMalformed)?;
-        let execution_policy =
-            PaidExecutionPolicyV1::decode(cursor.take(PaidExecutionPolicyV1::ENCODED_SIZE)?)
-                .map_err(|_| WorkSetupError::DescriptorMalformed)?;
+        let policy_len = if version == CLOSE_DESCRIPTOR_VERSION {
+            PaidExecutionPolicyV1::ENCODED_SIZE
+        } else {
+            usize::try_from(cursor.u64()?).map_err(|_| WorkSetupError::DescriptorMalformed)?
+        };
+        let execution_policy = PaidWorkPolicy::decode(cursor.take(policy_len)?)
+            .map_err(|_| WorkSetupError::DescriptorMalformed)?;
+        if (version == CLOSE_DESCRIPTOR_VERSION)
+            != matches!(execution_policy, PaidWorkPolicy::Evaluate(_))
+        {
+            return Err(WorkSetupError::DescriptorMalformed);
+        }
         let expected_payment_values =
             EdgeValues::new(cursor.u64()?, cursor.u64()?, cursor.field::<Fees>()?);
         if !cursor.bytes.is_empty() {
@@ -726,7 +745,7 @@ impl CloseDescriptor {
             &policy_salt,
             channel_policy,
         )?;
-        check_execution_policy(&execution_policy)?;
+        execution_policy.check()?;
         if work_payment_settlement(
             expected_payment_values,
             channel.payment_terms().omission_bond,
@@ -851,7 +870,7 @@ pub struct ObservedChannel<'a> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReadyChannel {
     channel: PaidChannel,
-    execution_policy: PaidExecutionPolicyV1,
+    execution_policy: PaidWorkPolicy,
     settlement: WorkPaymentSettlement,
     finalized_height: u64,
     admission_horizon: u64,
@@ -875,7 +894,7 @@ impl ReadyChannel {
     /// whose margins [`Self::check_signable`] measures against and whose
     /// digest the authorization names. Carrying it here is what stops
     /// those three from being three copies.
-    pub const fn execution_policy(&self) -> &PaidExecutionPolicyV1 {
+    pub const fn execution_policy(&self) -> &PaidWorkPolicy {
         &self.execution_policy
     }
 
@@ -936,18 +955,18 @@ impl ReadyChannel {
             });
         }
 
-        let policy = &self.execution_policy;
+        let (dispatch, delivery, oracle_grace) = self.execution_policy.margins();
         let reachable = cursor_height
-            .checked_add(policy.dispatch_margin_blocks)
-            .and_then(|sum| sum.checked_add(policy.delivery_margin_blocks))
+            .checked_add(dispatch)
+            .and_then(|sum| sum.checked_add(delivery))
             .ok_or(PaidWorkError::Overflow {
                 field: "dispatch and delivery margins",
             })?;
         if reachable > terminal_deadline {
             return Err(WorkSetupError::TerminalUnreachable {
                 height: cursor_height,
-                dispatch: policy.dispatch_margin_blocks,
-                delivery: policy.delivery_margin_blocks,
+                dispatch,
+                delivery,
                 terminal: terminal_deadline,
             });
         }
@@ -958,12 +977,12 @@ impl ReadyChannel {
                 .ok_or(PaidWorkError::Overflow {
                     field: "oracle grace interval",
                 })?;
-        if grace < policy.oracle_grace_blocks {
+        if grace < oracle_grace {
             return Err(WorkSetupError::OracleGraceTooShort {
                 terminal: terminal_deadline,
                 payment: payment_deadline,
                 actual: grace,
-                grace: policy.oracle_grace_blocks,
+                grace: oracle_grace,
             });
         }
         Ok(())
@@ -1018,7 +1037,7 @@ impl ReadyChannel {
         terminal_deadline: u64,
     ) -> Result<(), WorkSetupError> {
         self.check_caught_up(cursor_height)?;
-        let delivery = self.execution_policy.delivery_margin_blocks;
+        let delivery = self.execution_policy.margins().1;
         let arrives = cursor_height
             .checked_add(delivery)
             .ok_or(PaidWorkError::Overflow {

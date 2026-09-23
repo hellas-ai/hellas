@@ -1364,6 +1364,7 @@ async fn async_main() {
                 command,
                 secret_key,
                 identity::settlement_signer(&local_identity),
+                local_identity.producer_key.clone(),
             )
             .await
         }

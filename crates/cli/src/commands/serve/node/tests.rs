@@ -634,7 +634,7 @@ async fn two_vouched_peers_receive_their_distinct_configured_offers() {
         setup_mount.clone(),
     )
     .expect("both owned provider journals are discovered");
-    assert_eq!(runner.clocks.len(), 2, "both journals keep a clock");
+    assert_eq!(runner.journal_count(), 2, "both journals keep a clock");
 
     let alpn = <WorkSetup as ServiceMarker>::ALPN.as_bytes();
     let server = Endpoint::builder(presets::Minimal)
@@ -880,15 +880,31 @@ async fn fresh_readiness_is_per_request_and_per_routed_channel() {
     );
 
     source.set_snapshot(first.ready_snapshot(ORIGIN, Some(pending_contest(false))));
-    let handler = work_mount
-        .handler(&vouched_context(first_route_peer()))
+    let service = work_mount
+        .service(&vouched_context(first_route_peer()))
         .unwrap();
-    let checkpoint = handler
-        .service
-        .with_state(ChannelState::checkpoint)
-        .unwrap();
-    // Simulate a different admission request holding the slow chain read.
-    let held = handler.accepting.lock().await;
+    let checkpoint = service.with_state(ChannelState::checkpoint).unwrap();
+    // Hold a real fresh admission in its chain read through the public handler.
+    let entered = Arc::new(Semaphore::new(0));
+    let release = Arc::new(Semaphore::new(0));
+    source.0.lock().unwrap().next_read = Some((entered.clone(), release.clone()));
+    let mut waiting_authorization = first.authorization();
+    waiting_authorization.proposal_nonce = 3;
+    let waiting_id = work_id(first.descriptor().channel(), &waiting_authorization);
+    let waiting_request = AcceptWorkRequest {
+        authorization: waiting_authorization.encode(),
+        client_signature: first
+            .client()
+            .sign(signing_hash(waiting_id))
+            .as_bytes()
+            .to_vec(),
+        prepared_input: first_request.prepared_input.clone(),
+    };
+    let waiting_mount = work_mount.clone();
+    let waiting = tokio::spawn(async move {
+        accept_mounted_route(&waiting_mount, first_route_peer(), waiting_request).await
+    });
+    entered.acquire().await.unwrap().forget();
     let repeated = tokio::time::timeout(
         Duration::from_secs(1),
         accept_mounted_route(&work_mount, first_route_peer(), first_request.clone()),
@@ -923,13 +939,11 @@ async fn fresh_readiness_is_per_request_and_per_routed_channel() {
         Some(accept_work_response::Outcome::Refused(refusal))
             if refusal.code == WorkRefusalCode::Expired as i32));
     assert_eq!(
-        handler
-            .service
-            .with_state(ChannelState::checkpoint)
-            .unwrap(),
+        service.with_state(ChannelState::checkpoint).unwrap(),
         checkpoint
     );
-    drop(held);
+    release.add_permits(1);
+    waiting.await.unwrap();
 
     let mut fresh_authorization = first.authorization();
     fresh_authorization.proposal_nonce = 2;
@@ -1041,7 +1055,7 @@ async fn one_tick_drives_every_owned_journal_without_connected_clients() {
         "one tick submits all three exact duties"
     );
     assert_eq!(
-        runner.clocks.len(),
+        runner.journal_count(),
         2,
         "both journals remain on the clock without a client",
     );
@@ -1354,7 +1368,7 @@ fn provider_policy() -> ProviderChannelPolicy {
         network: network(),
         policy_salt: SALT,
         channel_policy: channel_policy(),
-        execution_policy: execution_policy(),
+        execution_policy: execution_policy().into(),
         expected_payment_values: EdgeValues::new(PAYMENT_VALUE, PAYMENT_RESERVE, Fees::ZERO),
         min_omit_response_blocks: MIN_OMIT_RESPONSE_BLOCKS,
     }
@@ -1634,7 +1648,7 @@ struct AnsweringPaidBackend {
     calls: Arc<AtomicUsize>,
 }
 
-impl PaidEvaluateBackend for AnsweringPaidBackend {
+impl PaidWorkBackend for AnsweringPaidBackend {
     async fn evaluate(
         &self,
         input: PreparedEvaluateInput,
@@ -1676,7 +1690,7 @@ impl BlockingPaidBackend {
     }
 }
 
-impl PaidEvaluateBackend for BlockingPaidBackend {
+impl PaidWorkBackend for BlockingPaidBackend {
     async fn evaluate_stream(
         &self,
         input: PreparedEvaluateInput,
@@ -2118,6 +2132,7 @@ impl TxSink for TestChain {
 struct RoutedChain(Arc<Mutex<RoutedChainState>>);
 
 struct RoutedChainState {
+    next_read: Option<(Arc<Semaphore>, Arc<Semaphore>)>,
     completed_setups: Vec<EdgeId>,
     snapshots: Vec<WorkChannelSnapshot>,
     submitted: Vec<Tx>,
@@ -2129,6 +2144,7 @@ impl RoutedChain {
         snapshots: impl IntoIterator<Item = WorkChannelSnapshot>,
     ) -> Self {
         Self(Arc::new(Mutex::new(RoutedChainState {
+            next_read: None,
             completed_setups: completed_setups.into_iter().collect(),
             snapshots: snapshots.into_iter().collect(),
             submitted: Vec::new(),
@@ -2192,6 +2208,11 @@ impl FinalizedWorkView for RoutedChain {
         &self,
         query: WorkChannelQuery,
     ) -> Result<Option<WorkChannelSnapshot>, QueryError> {
+        let gate = self.0.lock().unwrap().next_read.take();
+        if let Some((entered, release)) = gate {
+            entered.add_permits(1);
+            release.acquire().await.unwrap().forget();
+        }
         match self.0.lock() {
             Ok(held) => held
                 .snapshots
@@ -3561,10 +3582,7 @@ async fn the_clock_serves_work_from_the_channel_it_was_handed() {
 
     // And the setup is not driven again, so no second journal is
     // opened on the file the first mount holds.
-    let [clock] = runner.clocks.as_slice() else {
-        panic!("one setup journal was written and one is driven")
-    };
-    assert!(matches!(clock.driven, Driven::Channel(_)));
+    assert_eq!(runner.channel_count(), 1);
     assert!(
         runner.tick(&chain).await,
         "a second tick drives the channel"

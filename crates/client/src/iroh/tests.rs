@@ -430,6 +430,16 @@ fn apple_open_response(
     exporter: &[u8; 32],
     nonce: &[u8; 32],
     counter: u32,
+    counters: Arc<TestCounterStore>,
+) -> (ProviderTrustAnchor, OpenResponse, [u8; 33]) {
+    apple_open_response_for_alpn(exporter, nonce, ALPN, counter, counters)
+}
+
+fn apple_open_response_for_alpn(
+    exporter: &[u8; 32],
+    nonce: &[u8; 32],
+    alpn: &[u8],
+    counter: u32,
     counter_store: Arc<TestCounterStore>,
 ) -> (ProviderTrustAnchor, OpenResponse, [u8; 33]) {
     let signing_key = P256SigningKey::from_bytes((&[7; 32]).into()).unwrap();
@@ -474,7 +484,7 @@ fn apple_open_response(
         nonce,
         &bundle.genesis.statement.producer_public_key,
         expected_genesis,
-        ALPN,
+        alpn,
     );
     let apple = AppleAppAttestTrust::new("TESTTEAM.example.app", vec![cd_hash], counter_store);
     *apple.credential.lock().unwrap() = Some(RegisteredAppleCredential {
@@ -905,4 +915,72 @@ async fn fetch_open_ticket_and_signed_output_share_one_verified_connection() {
         "Fetch must not dial a second connection after confidential Open",
     );
     server.close().await;
+}
+
+#[cfg(feature = "work")]
+#[test]
+fn paid_services_app_attest_binds_the_exact_connection_and_service() {
+    for alpn in [
+        hellas_rpc::services::work::Work::ALPN,
+        hellas_rpc::services::work_setup::WorkSetup::ALPN,
+    ] {
+        let counters = Arc::new(TestCounterStore::default());
+        let (trust, response, _) =
+            apple_open_response_for_alpn(&[1; 32], &[2; 32], alpn.as_bytes(), 1, counters);
+        assert!(
+            verify_open_response(
+                &trust,
+                &[1; 32],
+                &[2; 32],
+                ALPN,
+                ENROLLED_PEER,
+                response.clone()
+            )
+            .is_err()
+        );
+        assert!(
+            verify_open_response(
+                &trust,
+                &[3; 32],
+                &[2; 32],
+                alpn.as_bytes(),
+                ENROLLED_PEER,
+                response.clone()
+            )
+            .is_err()
+        );
+        assert!(
+            verify_open_response(
+                &trust,
+                &[1; 32],
+                &[4; 32],
+                alpn.as_bytes(),
+                ENROLLED_PEER,
+                response.clone()
+            )
+            .is_err()
+        );
+        assert!(
+            verify_open_response(
+                &trust,
+                &[1; 32],
+                &[2; 32],
+                alpn.as_bytes(),
+                ENROLLED_PEER,
+                response.clone()
+            )
+            .is_ok()
+        );
+        assert!(
+            verify_open_response(
+                &trust,
+                &[1; 32],
+                &[2; 32],
+                alpn.as_bytes(),
+                ENROLLED_PEER,
+                response
+            )
+            .is_err()
+        );
+    }
 }

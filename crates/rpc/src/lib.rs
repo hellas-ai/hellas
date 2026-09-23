@@ -47,6 +47,8 @@ pub mod edge_index;
 pub mod evaluate;
 #[cfg(feature = "fetch")]
 pub mod fetch;
+#[cfg(feature = "fetch")]
+pub mod http_fetch;
 pub mod observe;
 #[cfg(feature = "execute")]
 pub mod open;

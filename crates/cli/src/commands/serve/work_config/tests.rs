@@ -1,4 +1,46 @@
 use super::*;
+use hellas_kernel::{EdgeValues, Fees, Key, NetworkId};
+use hellas_rpc::peers::PeerId;
+use hellas_rpc::protocol::Digest;
+use hellas_rpc::protocol::work::*;
+use hellas_rpc::protocol::work_profile::PaidWorkPolicy;
+use hellas_rpc::protocol::work_setup::ProviderChannelPolicy;
+use std::time::Duration;
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
+type CliResult<T> = anyhow::Result<T>;
+
+#[test]
+fn fetch_policy_loads_and_cannot_be_combined_with_evaluate() {
+    let mut value = config();
+    value["policies"]["fetch"] = serde_json::json!({
+        "allowed_environment": hex32(0x11),
+        "service": "openai", "method": "responses",
+        "max_request_body_bytes": 4096, "max_output_events": 64,
+        "max_output_bytes": 16384, "max_spool_bytes": 65536,
+        "max_encoded_result_frame": 65536, "max_encoded_prepared_input": 65536,
+        "dispatch_margin_blocks": 4, "delivery_margin_blocks": 2,
+        "oracle_grace_blocks": 6, "fixed_price": 10,
+    });
+    assert!(load(value.clone()).is_err());
+    value["policies"]
+        .as_object_mut()
+        .unwrap()
+        .remove("execution");
+    let loaded = load(value.clone()).unwrap();
+    assert!(matches!(
+        loaded.execution_policy,
+        PaidWorkPolicy::Fetch { .. }
+    ));
+    assert_eq!(
+        PaidWorkPolicy::decode(&loaded.execution_policy.encode()).unwrap(),
+        loaded.execution_policy
+    );
+    value["policies"].as_object_mut().unwrap().remove("fetch");
+    assert!(load(value).is_err());
+}
 
 fn hex32(byte: u8) -> String {
     hex::encode([byte; 32])
@@ -129,8 +171,14 @@ fn a_work_config_round_trips_from_a_file() {
     assert_eq!(route.client, Key::from_bytes([0x02; Key::LENGTH]));
     assert_eq!(loaded.policy_salt, [0x5a; 32]);
     assert_eq!(loaded.channel_policy.compute_credit_limit, 40);
-    assert_eq!(loaded.execution_policy.fixed_price, 10);
-    assert_eq!(loaded.execution_policy.max_stop_token_ids, 4);
+    assert_eq!(loaded.execution_policy.fixed_price(), 10);
+    assert_eq!(
+        match loaded.execution_policy {
+            PaidWorkPolicy::Evaluate(policy) => policy.max_stop_token_ids,
+            _ => panic!("expected Evaluate policy"),
+        },
+        4
+    );
     assert_eq!(loaded.poll, Duration::from_millis(250));
     assert_eq!(
         loaded.expected_payment_values,
@@ -354,7 +402,13 @@ fn a_zero_execution_policy_field_is_refused() {
     let mut value = config();
     value["policies"]["execution"]["max_stop_token_ids"] = serde_json::json!(0);
     let loaded = load(value).expect("no stop tokens is a usable channel");
-    assert_eq!(loaded.execution_policy.max_stop_token_ids, 0);
+    assert_eq!(
+        match loaded.execution_policy {
+            PaidWorkPolicy::Evaluate(policy) => policy.max_stop_token_ids,
+            _ => panic!("expected Evaluate policy"),
+        },
+        0
+    );
 }
 
 #[test]
@@ -617,7 +671,7 @@ fn a_configuration_makes_its_policy_field_for_field() {
     assert_eq!(policy.network, network());
     assert_eq!(policy.policy_salt, [0x5a; 32]);
     assert_eq!(policy.channel_policy.compute_credit_limit, 40);
-    assert_eq!(policy.execution_policy.fixed_price, 10);
+    assert_eq!(policy.execution_policy.fixed_price(), 10);
     assert_eq!(
         policy.expected_payment_values,
         EdgeValues::new(PAYMENT_VALUE, PAYMENT_RESERVE, Fees::new(0, 0, 0, 0)),

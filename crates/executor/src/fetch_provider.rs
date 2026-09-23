@@ -16,11 +16,18 @@ pub type FetchProviderStream =
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FetchProviderResponseHead {
     pub effective_model: Option<String>,
+    pub http: Option<HttpResponseHead>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HttpResponseHead {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
 }
 
 impl FetchProviderResponseHead {
     pub const fn is_empty(&self) -> bool {
-        self.effective_model.is_none()
+        self.effective_model.is_none() && self.http.is_none()
     }
 }
 

@@ -88,6 +88,7 @@ pub async fn execute_responses_request(
     let head = FetchProviderResponseHead {
         effective_model: effective_model_from_headers(upstream.headers())
             .inspect_err(|_| telemetry.fail("invalid_response_headers"))?,
+        http: None,
     };
     Ok(FetchProviderResponse {
         head,

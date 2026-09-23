@@ -807,7 +807,7 @@ impl Executor {
         self.finish_fetch_slot();
     }
 
-    fn dispatch_next_fetch(&mut self) {
+    pub(super) fn dispatch_next_fetch(&mut self) {
         while self.active_fetches < self.fetch_max_in_flight {
             let Some(pending) = self.pending_fetches.pop_front() else {
                 return;
@@ -984,7 +984,7 @@ fn spawn_fetch_provider(
     ));
 }
 
-async fn run_fetch_provider(
+pub(super) async fn run_fetch_provider(
     provider: Arc<dyn FetchProvider>,
     request: PreparedFetchRequest,
     mut projector: Box<dyn FetchProjector>,

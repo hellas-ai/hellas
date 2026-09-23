@@ -53,7 +53,7 @@ use hellas_rpc::{
 use hellas_wire::mux::MuxTransport;
 use hellas_wire::{Dispatcher, StreamTransport};
 use hellas_work::work::{
-    BackendFault, ClientEndpoint, PaidEvaluateBackend, PaymentError, PreparedEvaluateInput,
+    BackendFault, ClientEndpoint, PaidWorkBackend, PaymentError, PreparedEvaluateInput,
     ProviderEndpoint, RunError, RunOutcome, WorkRefusal, WorkService, admit_payment, fetch_result,
     run_accepted_work,
 };
@@ -167,7 +167,7 @@ fn descriptor() -> WorkChannelDescriptor {
         payment_terms: payment_terms(),
         policy_salt: SALT,
         channel_policy: channel_policy(),
-        execution_policy: execution_policy(),
+        execution_policy: execution_policy().into(),
         expected_payment_values: payment_values(),
     };
     match WorkChannelDescriptor::open(config) {
@@ -378,7 +378,7 @@ impl AnsweringBackend {
     }
 }
 
-impl PaidEvaluateBackend for AnsweringBackend {
+impl PaidWorkBackend for AnsweringBackend {
     fn evaluate(
         &self,
         input: PreparedEvaluateInput,

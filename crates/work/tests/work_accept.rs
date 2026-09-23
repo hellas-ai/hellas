@@ -144,7 +144,7 @@ fn descriptor_with_policy(policy: PaidExecutionPolicyV1) -> WorkChannelDescripto
         payment_terms: payment_terms(),
         policy_salt: SALT,
         channel_policy: channel_policy(),
-        execution_policy: policy,
+        execution_policy: policy.into(),
         expected_payment_values: payment_values(),
     };
     match WorkChannelDescriptor::open(config) {
@@ -312,7 +312,7 @@ const fn deadlines() -> JobDeadlines {
 
 fn proposal(nonce: u8) -> JobProposal {
     JobProposal {
-        prepared_input: bundle(nonce),
+        prepared_input: bundle(nonce).into(),
         deadlines: deadlines(),
     }
 }
@@ -1087,7 +1087,7 @@ fn a_proposal_refused_before_signing_leaves_no_job() {
     // Terminal deadline inside the measured dispatch and delivery
     // margins: legal, ordered, and unreachable.
     let unreachable = JobProposal {
-        prepared_input: bundle(1),
+        prepared_input: bundle(1).into(),
         deadlines: JobDeadlines {
             acceptance: 11,
             terminal: 12,

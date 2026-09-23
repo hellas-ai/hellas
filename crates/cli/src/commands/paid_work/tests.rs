@@ -3,37 +3,11 @@ use hellas_kernel::NetworkId;
 use hellas_rpc::peers::PeerId;
 
 #[test]
-fn recovery_skips_only_permanent_delivery_refusals() {
-    use hellas_client::work::CollectResultError;
-    use hellas_work::work::{DeliverError, WorkRefusal};
-
-    for (refusal, permanent) in [
-        (WorkRefusal::Declined, true),
-        (WorkRefusal::Expired, true),
-        (WorkRefusal::NotReady, false),
-        (WorkRefusal::Unavailable, false),
-    ] {
-        let delivery = || DeliverError::Refused {
-            refusal,
-            reason: "provider diagnostic".to_owned(),
-        };
-        assert_eq!(permanently_refused_delivery(&delivery().into()), permanent);
-        assert_eq!(
-            permanently_refused_delivery(&CollectResultError::Deliver(delivery()).into()),
-            permanent,
-        );
-    }
-    assert!(!permanently_refused_delivery(
-        &DeliverError::Malformed("result").into()
-    ));
-    assert!(!permanently_refused_delivery(&anyhow::anyhow!(
-        "connection lost"
-    )));
-}
-
-#[test]
 fn relative_deadlines_are_ordered_from_the_current_cursor() {
     let args = RunArgs {
+        provider_genesis: None,
+        apple_app_id: None,
+        apple_cd_hashes: Vec::new(),
         work_config: "work.json".into(),
         journal_root: "journal".into(),
         provider: SecretKey::generate().public(),
@@ -179,4 +153,40 @@ fn prepare_input_builds_a_bundle_from_an_environment_and_prompt() {
         parts.evaluate_request.execution_environment,
         environment.manifest().content_id(),
     );
+}
+#[test]
+fn prepare_fetch_signs_an_ephemeral_client_request() {
+    let root = tempfile::tempdir().unwrap();
+    let payload_file = root.path().join("request.json");
+    let out = root.path().join("input.bin");
+    std::fs::write(&payload_file, br#"{"input":"private prompt"}"#).unwrap();
+    let key = hellas_rpc::ProducerSigningKey::from_secret_bytes([7; 32]).unwrap();
+    prepare_fetch(
+        PrepareFetchArgs {
+            assurance: "producer-signed".into(),
+            service: "openai".into(),
+            method: "responses".into(),
+            execution_environment: "openai-responses".into(),
+            payload_file,
+            out: out.clone(),
+        },
+        &key,
+    )
+    .unwrap();
+    let PreparedPaidWorkInput::Fetch(input) = read_prepared_work_input(&out).unwrap() else {
+        panic!("a Fetch bundle");
+    };
+    let parts = input.parts().unwrap();
+    let request = hellas_rpc::fetch::verify_input_events(&parts.fetch_input_transcript).unwrap();
+    assert_eq!(request.retention, hellas_rpc::Retention::Ephemeral);
+    assert_eq!(request.caller_key, key.public_key());
+    assert_eq!(request.execution_environment, parts.manifest.content_id());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            std::fs::metadata(out).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
 }

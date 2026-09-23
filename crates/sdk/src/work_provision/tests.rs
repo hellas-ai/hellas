@@ -6,8 +6,8 @@ use hellas_rpc::protocol::work::{PaidChannelPolicyV1, PaidExecutionPolicyV1};
 use hellas_rpc::protocol::work_setup::ProviderChannelPolicy;
 use hellas_work::work_close::{BlockSourceError, FinalizedWork};
 
-use super::super::work_config::load_work_config;
 use super::*;
+use crate::work_config::load_work_config;
 
 fn network() -> NetworkId {
     let Some(network) = NetworkId::new("hellas-devnet") else {
@@ -66,7 +66,8 @@ fn policy() -> ProviderChannelPolicy {
             delivery_margin_blocks: 2,
             oracle_grace_blocks: 6,
             fixed_price: 10,
-        },
+        }
+        .into(),
         expected_payment_values: EdgeValues::new(1_000, 200, Fees::new(0, 0, 0, 0)),
         min_omit_response_blocks: MIN_OMIT_RESPONSE_BLOCKS,
     }

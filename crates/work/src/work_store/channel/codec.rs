@@ -41,6 +41,10 @@ impl ChannelRecord {
     /// bytes whose digests the signatures beside them cover.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
+        self.encode_for_storage(false)
+    }
+
+    pub(super) fn encode_for_storage(&self, metadata_only: bool) -> Vec<u8> {
         let mut out = Vec::new();
         match self {
             Self::CursorAdvanced {
@@ -64,7 +68,9 @@ impl ChannelRecord {
                 // Last field, and the whole of the rest: the journal
                 // frame already carries this record's length, and a
                 // second length here could disagree with it.
-                out.extend_from_slice(prepared_input);
+                if !metadata_only {
+                    out.extend_from_slice(prepared_input);
+                }
             }
             Self::JobAccepted {
                 work_id,
@@ -91,7 +97,9 @@ impl ChannelRecord {
                 // Last field, and the whole of the rest, for the reason
                 // `JobProposed`'s bundle is: the journal frame already
                 // carries this record's length.
-                out.extend_from_slice(transcript);
+                if !metadata_only {
+                    out.extend_from_slice(transcript);
+                }
             }
             Self::PlaintextReleased { work_id } => {
                 out.push(tag::PLAINTEXT);
@@ -406,6 +414,10 @@ impl ChannelState {
     /// is one channel and not two that happen to agree.
     #[must_use]
     pub fn checkpoint(&self) -> Vec<u8> {
+        self.checkpoint_for_storage(false)
+    }
+
+    pub(super) fn checkpoint_for_storage(&self, metadata_only: bool) -> Vec<u8> {
         let Self {
             channel,
             settlement,
@@ -453,8 +465,8 @@ impl ChannelState {
                 out.extend_from_slice(&result.encode());
                 out.extend_from_slice(signature.as_bytes());
             });
-            put_bytes(&mut out, prepared_input);
-            put_bytes(&mut out, transcript);
+            put_bytes(&mut out, if metadata_only { &[] } else { prepared_input });
+            put_bytes(&mut out, if metadata_only { &[] } else { transcript });
         }
         put_u64(&mut out, terminals.len() as u64);
         for terminal in terminals.values() {

@@ -350,6 +350,10 @@ struct FetchConfigRoute {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
 enum FetchDestination {
+    /// Caller-signed HTTPS URL and TLS settings with operator-owned account aliases.
+    Http {
+        config: hellas_providers::HttpProviderConfig,
+    },
     /// Official Codex Responses, authenticated by the local Codex OAuth store.
     CodexResponses {
         #[serde(default)]
@@ -371,6 +375,7 @@ impl FetchDestination {
     fn into_entry(self, capabilities: FetchRoutePolicy) -> CliResult<FetchRouteEntry> {
         let (environment, provider): (FetchEnvironment, Arc<dyn hellas_executor::FetchProvider>) =
             match self {
+                Self::Http { config } => return Ok(config.into_entry(capabilities)?),
                 Self::CodexResponses { auth_path } => (
                     FetchEnvironment::CodexResponses,
                     Arc::new(codex_provider::CodexResponsesFetchProvider::new(
