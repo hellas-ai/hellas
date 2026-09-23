@@ -10,13 +10,10 @@ use tracing::Instrument;
 #[cfg_attr(not(feature = "otel"), path = "responses_fetch/telemetry/noop.rs")]
 mod telemetry;
 
-/// Maximum diagnostic prefix retained from an unsuccessful HTTP response.
-const MAX_FETCH_ERROR_BODY_BYTES: usize = 2 * 1024;
 /// A total request deadline bounds the whole call; this independent idle
 /// deadline prevents a peer that stops producing SSE bytes from occupying a
 /// Fetch execution slot for that entire window. Ordinary SSE keepalives count
-/// as activity and reset it. Error bodies are diagnostic only, so the same
-/// duration bounds their entire prefix read without renewal.
+/// as activity and reset it. Unsuccessful response bodies are never read or logged.
 const FETCH_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// HTTP client for attested Fetch egress. Redirects are disabled because the
@@ -61,12 +58,13 @@ pub async fn execute_responses_request(
     telemetry.status(status.as_u16());
     if !status.is_success() {
         telemetry.fail("http_error");
-        let diagnostic = error_body_prefix(upstream).await;
+        // Error bodies can echo customer input. Drop them without reading or
+        // logging a prefix, even when the request itself is ephemeral.
+        drop(upstream);
         tracing::warn!(
             provider = label,
             upstream_status = status.as_u16(),
-            upstream_diagnostic = %diagnostic,
-            "upstream Fetch request failed; response details are omitted from the caller error"
+            "upstream Fetch request failed"
         );
         return Err(FetchProviderError::failed(format!(
             "{label} upstream rejected the request (HTTP {})",
@@ -131,82 +129,6 @@ fn unique_model_header(
         value = Some(text.to_owned());
     }
     Ok(value)
-}
-
-async fn error_body_prefix(upstream: reqwest::Response) -> String {
-    error_body_prefix_with_deadline(upstream, FETCH_STREAM_IDLE_TIMEOUT).await
-}
-
-async fn error_body_prefix_with_deadline(
-    upstream: reqwest::Response,
-    read_timeout: Duration,
-) -> String {
-    let mut body = Vec::new();
-    let mut chunks = upstream.bytes_stream();
-    let deadline = tokio::time::Instant::now() + read_timeout;
-
-    while body.len() < MAX_FETCH_ERROR_BODY_BYTES {
-        let next = match tokio::time::timeout_at(deadline, chunks.next()).await {
-            Ok(next) => next,
-            Err(_) => {
-                let excerpt = diagnostic_excerpt(&body);
-                let note = format!(
-                    "[error body read timed out after {} seconds]",
-                    read_timeout.as_secs_f64()
-                );
-                return if excerpt.is_empty() {
-                    note
-                } else {
-                    format!("{excerpt} {note}")
-                };
-            }
-        };
-        let Some(chunk) = next else {
-            break;
-        };
-        let chunk = match chunk {
-            Ok(chunk) => chunk,
-            Err(source) => {
-                let excerpt = diagnostic_excerpt(&body);
-                let note = format!("[error body read failed: {source}]");
-                return if excerpt.is_empty() {
-                    note
-                } else {
-                    format!("{excerpt} {note}")
-                };
-            }
-        };
-        let remaining = MAX_FETCH_ERROR_BODY_BYTES - body.len();
-        let retained = remaining.min(chunk.len());
-        body.extend_from_slice(&chunk[..retained]);
-        if retained < chunk.len() {
-            break;
-        }
-    }
-
-    let limited = body.len() == MAX_FETCH_ERROR_BODY_BYTES;
-    let body = diagnostic_excerpt(&body);
-    if limited {
-        format!("{body} [body prefix limited to {MAX_FETCH_ERROR_BODY_BYTES} bytes]")
-    } else {
-        body
-    }
-}
-
-fn diagnostic_excerpt(body: &[u8]) -> String {
-    String::from_utf8_lossy(body)
-        .chars()
-        .map(|character| {
-            if character.is_control() {
-                ' '
-            } else {
-                character
-            }
-        })
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 fn stream_response(
