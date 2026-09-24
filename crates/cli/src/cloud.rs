@@ -24,21 +24,15 @@ pub(super) async fn run(command: Commands, identity_path: Option<&Path>) -> Resu
     }
 }
 
-#[cfg(feature = "gateway")]
-pub(super) async fn gateway_route(
+pub(super) async fn machine_route(
     machine: Option<&str>,
     key: &iroh::SecretKey,
     node_id: Option<iroh::EndpointId>,
     mut trust: super::RemoteTrustArgs,
-    backend: super::GatewayResponsesBackend,
 ) -> Result<(Option<iroh::EndpointId>, super::RemoteTrustArgs)> {
     let Some(machine) = machine else {
         return Ok((node_id, trust));
     };
-    anyhow::ensure!(
-        matches!(backend, super::GatewayResponsesBackend::Hellas),
-        "--machine requires the Hellas backend"
-    );
     anyhow::ensure!(
         trust.assurance == hellas_rpc::Assurance::ProducerSigned,
         "owned machine currently supports producer-signed assurance only"

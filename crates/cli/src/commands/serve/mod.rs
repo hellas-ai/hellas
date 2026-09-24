@@ -277,6 +277,10 @@ async fn wait_for_shutdown_signal() -> std::io::Result<()> {
 /// credentials, capabilities) and the caller access policy, cross-validated so
 /// a caller grant naming an undefined route is a load error rather than a
 /// silent dead entry.
+pub(crate) fn validate_fetch_config(path: &std::path::Path) -> CliResult<()> {
+    load_fetch_config(path).map(|_| ())
+}
+
 fn load_fetch_config(path: &std::path::Path) -> CliResult<(FetchRouteRegistry, FetchAccessPolicy)> {
     let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
     let file: FetchConfigFile = serde_json::from_slice(&bytes)

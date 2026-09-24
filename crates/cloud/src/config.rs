@@ -126,6 +126,7 @@ pub fn validate_serve_args(args: &[String]) -> Result<()> {
                 "--help",
                 "-h",
                 "--version",
+                "--check-config",
                 "-V"
             ]
             .contains(&key),
