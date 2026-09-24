@@ -1,52 +1,15 @@
-//! The paid-work configuration file: what an operator writes down, and
-//! what a node refuses to start without.
+//! Paid-work configuration: chain identity, routes, execution policy and funding.
 //!
-//! `--work-config` was a path whose *presence* advertised two ALPNs and
-//! whose contents were never opened. A node cannot mount a channel from
-//! a path, so this is the schema and the loader for what is in it: the
-//! three-part chain cross-check, the six validator URLs a write is
-//! fanned to, the journal root, the bilateral route table, the two
-//! policies this provider works under, the watcher's poll cadence, the
-//! funding it expects a payment edge to carry, and the shortest response
-//! window it will sign terms over.
-//!
-//! # The cross-check is not an anchor
-//!
-//! `(network_id, genesis_payload_digest, threshold_identity)` is a
-//! fail-fast configuration cross-check. Only the threshold identity ever
-//! authenticates a finalized block; the other two are how a node started
-//! against the wrong chain says so at startup instead of at the first
-//! settlement. The identity is decoded here, by the same constructor
-//! consensus verification uses, so a typo is a startup error and not a
-//! block that never verifies.
-//!
-//! # What is deliberately not here
-//!
-//! There is no Start-span field, no mutual-margin field, and no journal
-//! cap. All were deleted: the Start span is fixed at 64, a work-payment
-//! edge has no Mutual route, and the journal's active and checkpoint
-//! ceilings are constants it enforces on itself
-//! ([`MAX_ACTIVE_JOURNAL_BYTES`]), so any of them appearing in a file is
-//! an operator configuring something that does not exist. Every struct
-//! below denies unknown fields, which is what turns that into an error
-//! naming the field.
-//!
-//! Nor is there a measured artifact. An earlier design derived the
-//! response window and an alarm margin from latencies a bootstrap probe
-//! recorded, pinned to the digest of the measuring binary; no deployed
-//! node ever carried one, and every rebuild would have invalidated it.
-//! The two numbers that design would have produced are written down
-//! here instead, by the operator, and [`WorkConfig::provider_policy`] is
-//! the whole of what is made from them.
-//!
-//! [`MAX_ACTIVE_JOURNAL_BYTES`]: hellas_work::work_store::journal::MAX_ACTIVE_JOURNAL_BYTES
+//! The threshold identity authenticates finalized blocks; the network and genesis
+//! digest detect configuration mismatches. Unknown fields are rejected. Call
+//! `validate_work_routes` before serving to check the configuration against journals.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Context as _, bail};
+use anyhow::{Context as _, Result, bail};
 use hellas_kernel::{
     EdgeId, EdgeValues, Fees, Key, MIN_OMIT_RESPONSE_BLOCKS, NetworkId, Secp256k1Verifier,
 };
@@ -64,36 +27,16 @@ use hellas_rpc::protocol::work_setup::ProviderChannelPolicy;
 use hellas_work::work_store::{Role, SetupStore, discover_setups};
 use serde::Deserialize;
 
-type CliResult<T> = anyhow::Result<T>;
-
-/// How many validator RPCs a write names.
-///
-/// Reads come from a follower and writes are fanned to all six; a
-/// configuration naming five has one validator whose acceptance this
-/// node can never win, and one naming seven names something this
-/// deployment does not have.
+/// Number of distinct validator RPC URLs required by this deployment.
 pub const VALIDATOR_COUNT: usize = 6;
 
-/// One operator's complete paid-work configuration, loaded and structurally
-/// checked.
-///
-/// A plain record with public fields, for [`WorkChannelConfig`]'s
-/// reason: this is the shape a file fills in. Every file-local gate has
-/// already run in [`load_work_config`]; the serve path then runs
-/// [`validate_work_routes`] against the journals that must exist when it
-/// starts. Provisioning shares the file loader before it creates one, which is
-/// why disk agreement is not pretended to be a parse-time fact.
-///
-/// [`WorkChannelConfig`]: hellas_rpc::protocol::work_setup::WorkChannelConfig
+/// Parsed paid-work configuration. `load_work_config` checks its fields;
+/// `validate_work_routes` checks agreement with provider journals at startup.
 #[derive(Clone, Debug)]
-#[allow(
-    dead_code,
-    reason = "the fields a mount consumes are read by the node runner; loading and checking them is this half"
-)]
 pub struct WorkConfig {
     /// The chain this node believes it is configured against.
     pub chain: ChainCrossCheck,
-    /// The six validator RPC URLs every write is fanned to.
+    /// Validator RPC URLs used for chain reads and transaction submission.
     pub validators: Vec<String>,
     /// Directory holding the setup and channel journals.
     pub journal_root: PathBuf,
@@ -114,12 +57,8 @@ pub struct WorkConfig {
     pub min_omit_response_blocks: u64,
 }
 
-/// One bilateral setup route written in the paid-work configuration.
-///
-/// The bond names the provider setup journal under [`WorkConfig::journal_root`].
-/// The client key is repeated here deliberately: startup compares it with the
-/// taker committed inside that journal, turning a stale or mistyped route into
-/// a refusal before the node binds.
+/// Maps an authenticated peer to a bond and its client settlement key.
+/// Startup checks the client key against the journal before mounting the route.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WorkRoute {
     /// The transport-authenticated peer allowed to reach this bond.
@@ -130,11 +69,7 @@ pub struct WorkRoute {
     pub client: Key,
 }
 
-/// Paid-work routes keyed by their authenticated peer.
-///
-/// Construction is private to the checked file loader. In particular, there
-/// is no insertion API through which a caller could recreate last-one-wins
-/// handling after duplicate peers and bonds have been refused.
+/// Routes indexed by authenticated peer, with duplicate peers and bonds rejected.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct WorkRoutes {
     by_peer: BTreeMap<PeerId, WorkRoute>,
@@ -158,7 +93,7 @@ impl WorkRoutes {
         self.by_peer.is_empty()
     }
 
-    fn from_files(files: Vec<WorkRouteFile>) -> CliResult<Self> {
+    fn from_files(files: Vec<WorkRouteFile>) -> Result<Self> {
         let mut by_peer = BTreeMap::new();
         let mut bonds = BTreeSet::new();
         for file in files {
@@ -181,12 +116,7 @@ impl WorkRoutes {
 }
 
 impl WorkConfig {
-    /// The provider policy this configuration makes.
-    ///
-    /// Every field is the operator's: the four the policy commits to,
-    /// the funding it expects, and the window it insists on. Nothing is
-    /// measured and nothing is inferred, so a node with a configuration
-    /// has a policy and countersigns over it.
+    /// Builds the policy used by both provisioning and channel admission.
     #[must_use]
     pub fn provider_policy(&self) -> ProviderChannelPolicy {
         ProviderChannelPolicy {
@@ -202,10 +132,6 @@ impl WorkConfig {
 
 /// The three fields that say which chain this is.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(
-    dead_code,
-    reason = "the fields a mount consumes are read by the node runner; loading and checking them is this half"
-)]
 pub struct ChainCrossCheck {
     /// The network every signature on this node's channels is bound to.
     pub network: NetworkId,
@@ -215,24 +141,9 @@ pub struct ChainCrossCheck {
     pub threshold_identity: Vec<u8>,
 }
 
-/// Loads and checks one paid-work configuration file.
-///
-/// Every failure is a startup failure naming the field that failed, for
-/// the reason §4 gives: a node that started with an unreadable
-/// configuration would be one whose first symptom is an unsettleable
-/// channel.
-///
-/// # Errors
-///
-/// The read and the parse, and then: a network id that is not one, a
-/// digest that is not thirty-two bytes, a threshold identity consensus
-/// cannot decode, a validator list that is not exactly
-/// [`VALIDATOR_COUNT`] URLs with distinct normalised forms, an execution
-/// policy the protocol's own [`check_execution_policy`] rejects, an
-/// empty journal root, a route field of the wrong width, duplicate peers or
-/// bonds in the route table, a zero poll cadence, and a response window
-/// under the kernel's own minimum.
-pub fn load_work_config(path: &Path) -> CliResult<WorkConfig> {
+/// Loads configuration, checks chain identity and policy bounds, and normalizes
+/// validator URLs. Route-to-journal validation is deferred until serve startup.
+pub fn load_work_config(path: &Path) -> Result<WorkConfig> {
     let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
     let file: WorkConfigFile = serde_json::from_slice(&bytes)
         .with_context(|| format!("failed to parse {}", path.display()))?;
@@ -240,21 +151,9 @@ pub fn load_work_config(path: &Path) -> CliResult<WorkConfig> {
         .with_context(|| format!("invalid work config {}", path.display()))
 }
 
-/// Verifies that every configured route names this root's provider journal
-/// and the client settlement key committed by its bond terms.
-///
-/// This is a serve-startup check rather than part of [`load_work_config`]:
-/// provisioning uses the same configuration loader before it creates a
-/// journal, while a serving node must already have every journal it promises.
-/// Discovery comes first so [`SetupStore::open`] is never allowed to create a
-/// missing journal merely because a route named its bond.
-///
-/// # Errors
-///
-/// The root cannot be enumerated, a route's provider journal is absent from
-/// that root or cannot be opened, the journal holds no bond proposal, or its
-/// bond names a taker other than the route's configured client.
-pub fn validate_work_routes(config: &WorkConfig) -> CliResult<()> {
+/// Checks each route against a provider journal under the configured root,
+/// including its bond and client key. Run after provisioning and before serving.
+pub fn validate_work_routes(config: &WorkConfig) -> Result<()> {
     if config.routes.is_empty() {
         return Ok(());
     }
@@ -331,7 +230,7 @@ struct WorkConfigFile {
 }
 
 impl WorkConfigFile {
-    fn into_config(self) -> CliResult<WorkConfig> {
+    fn into_config(self) -> Result<WorkConfig> {
         let Some(network) = NetworkId::new(self.chain.network_id.trim()) else {
             bail!(
                 "chain.network_id {:?} is not a network id",
@@ -391,11 +290,7 @@ impl WorkConfigFile {
     }
 }
 
-/// One bilateral route exactly as the operator writes it.
-///
-/// All three values are fixed-width lowercase-or-uppercase hexadecimal on
-/// input and canonical byte values after loading. A peer or bond written in a
-/// second spelling is therefore still the same key for duplicate detection.
+/// Hex-encoded route fields, parsed before duplicate detection.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WorkRouteFile {
@@ -404,22 +299,8 @@ struct WorkRouteFile {
     client: String,
 }
 
-/// Parses the six validator RPC URLs, and refuses anything that is not
-/// one.
-///
-/// Both halves matter. A string that is not a URL is not an address this
-/// node can ever fan a write to, and "trimmed and non-empty" admits `not
-/// a URL` verbatim — a configuration whose first symptom would be five
-/// validators answering and one that never does. And uniqueness is a
-/// question about *addresses*, not about spellings: `HTTP://Host:443/`
-/// and `http://host:443/` are one validator written twice, and a fan-out
-/// to five validators is not six however it is spelled. So the
-/// comparison is between parsed, normalised URLs, and the normalised
-/// forms are what is kept.
-///
-/// A host is required, because these are dialled: a `mailto:` or a
-/// `data:` parses perfectly well and is not a validator.
-fn parse_validators(entries: Vec<String>) -> CliResult<Vec<String>> {
+/// Normalizes validator URLs and requires distinct addresses with hosts.
+fn parse_validators(entries: Vec<String>) -> Result<Vec<String>> {
     let mut validators: Vec<String> = Vec::with_capacity(VALIDATOR_COUNT);
     for entry in entries {
         let entry = entry.trim();
@@ -454,12 +335,6 @@ struct ChainFile {
     threshold_identity: String,
 }
 
-/// Where the work journals live.
-///
-/// A root and nothing else. How large a journal may grow is not an
-/// operator's to say: the active and checkpoint ceilings are constants
-/// the journal enforces on itself, so a cap here would be a number
-/// written down and ignored.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct JournalFile {
@@ -467,7 +342,7 @@ struct JournalFile {
 }
 
 impl JournalFile {
-    fn into_root(self) -> CliResult<PathBuf> {
+    fn into_root(self) -> Result<PathBuf> {
         if self.root.as_os_str().is_empty() {
             bail!("journal.root must be a path");
         }
@@ -485,7 +360,7 @@ struct PoliciesFile {
 }
 
 impl PoliciesFile {
-    fn into_policies(self) -> CliResult<([u8; 32], PaidChannelPolicyV1, PaidWorkPolicy)> {
+    fn into_policies(self) -> Result<([u8; 32], PaidChannelPolicyV1, PaidWorkPolicy)> {
         let salt = parse_fixed_hex("policies.policy_salt", &self.policy_salt)?;
         Ok((
             salt,
@@ -509,11 +384,7 @@ struct ChannelPolicyFile {
     delivery_credit_limit: u64,
 }
 
-/// The execution policy, field for field.
-///
-/// Spelled out rather than flattened from some smaller shape because
-/// every one of these is a value both parties sign: a default here would
-/// be this node quietly proposing a policy its operator never wrote.
+/// Required execution-policy fields. Defaults could change the terms being signed.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ExecutionPolicyFile {
@@ -533,7 +404,7 @@ struct ExecutionPolicyFile {
 }
 
 impl ExecutionPolicyFile {
-    fn into_policy(self) -> CliResult<PaidExecutionPolicyV1> {
+    fn into_policy(self) -> Result<PaidExecutionPolicyV1> {
         let allowed_environment: ContentId =
             self.allowed_environment.parse().with_context(|| {
                 format!(
@@ -562,12 +433,7 @@ impl ExecutionPolicyFile {
             oracle_grace_blocks: self.oracle_grace_blocks,
             fixed_price: self.fixed_price,
         };
-        // The protocol's own gate, run here rather than at the first
-        // admission. A zero here is not a small bound, it is an absent
-        // one — a zero margin gives a deadline no time to be met in, and
-        // a zero price is a job nobody is paid for. Copying the fields
-        // through unchecked moves that discovery to the moment a
-        // counterparty is already waiting on a proposal.
+        // Validate with the protocol rules before any channel is proposed.
         check_execution_policy(&policy)
             .map_err(|error| anyhow::anyhow!("policies.execution is not usable: {error}"))?;
         Ok(policy)
@@ -603,7 +469,7 @@ struct OpenFetchPolicyFile {
 }
 
 impl FetchPolicyFile {
-    fn into_policy(self) -> CliResult<PaidWorkPolicy> {
+    fn into_policy(self) -> Result<PaidWorkPolicy> {
         let route = match (self.service, self.method, self.open_fetch) {
             (Some(service), Some(method), None) => {
                 PaidFetchRoutePolicy::sealed_route(service, method)?
@@ -636,13 +502,7 @@ impl FetchPolicyFile {
     }
 }
 
-/// The payment edge's funding, field for field, as this provider requires
-/// a client to fund it.
-///
-/// Spelled out for [`ExecutionPolicyFile`]'s reason: every one of these
-/// bounds what a certificate on the channel may name, so a default here
-/// would be this node quietly accepting funding its operator never
-/// priced.
+/// Required funding values and close fees.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PaymentValuesFile {
@@ -675,7 +535,7 @@ impl PaymentValuesFile {
     }
 }
 
-fn parse_hex(field: &str, raw: &str) -> CliResult<Vec<u8>> {
+fn parse_hex(field: &str, raw: &str) -> Result<Vec<u8>> {
     let bytes = hex::decode(raw.trim()).with_context(|| format!("{field} is not hexadecimal"))?;
     if bytes.is_empty() {
         bail!("{field} must not be empty");
@@ -683,7 +543,7 @@ fn parse_hex(field: &str, raw: &str) -> CliResult<Vec<u8>> {
     Ok(bytes)
 }
 
-fn parse_fixed_hex<const N: usize>(field: &str, raw: &str) -> CliResult<[u8; N]> {
+fn parse_fixed_hex<const N: usize>(field: &str, raw: &str) -> Result<[u8; N]> {
     let bytes = parse_hex(field, raw)?;
     let Ok(bytes) = <[u8; N]>::try_from(bytes.as_slice()) else {
         bail!("{field} must be {N} bytes, found {}", bytes.len());
@@ -691,6 +551,6 @@ fn parse_fixed_hex<const N: usize>(field: &str, raw: &str) -> CliResult<[u8; N]>
     Ok(bytes)
 }
 
-fn parse_digest(field: &str, raw: &str) -> CliResult<Digest> {
+fn parse_digest(field: &str, raw: &str) -> Result<Digest> {
     Ok(Digest::from_bytes(parse_fixed_hex(field, raw)?))
 }

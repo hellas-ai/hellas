@@ -1,5 +1,5 @@
-//! Caller-signed HTTPS request vocabulary. Account secrets are selected by
-//! alias and never carried in a client request.
+//! Caller-signed HTTPS request vocabulary. Provider-owned credentials are selected
+//! by alias; their secret values stay with the provider.
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};

@@ -1770,9 +1770,6 @@ pub trait PaidWorkBackend: Sync {
     }
 }
 
-/// Compatibility name for implementations that provide only Evaluate.
-pub use PaidWorkBackend as PaidEvaluateBackend;
-
 /// What [`ProviderEndpoint::begin_run`] found, and what may be done next.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RunAdmission {

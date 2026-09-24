@@ -161,6 +161,10 @@ impl InputIdentities {
         let parts = prepared
             .parts()
             .context("prepared input contains a non-canonical body")?;
+        Self::from_parts(&parts)
+    }
+
+    fn from_parts(parts: &hellas_rpc::protocol::artifacts::PreparedPaidInputParts) -> Result<Self> {
         let allowed_environment = parts.manifest.content_id();
         anyhow::ensure!(
             parts.evaluate_request.execution_environment == allowed_environment,
@@ -184,7 +188,6 @@ impl InputIdentities {
 /// Cancellation retains recovery state; call `run(None, true, None)` to resume it.
 pub struct PaidWorkSession {
     args: PaidWorkOptions,
-    config: WorkConfig,
     descriptor: WorkChannelDescriptor,
     dialer: ProviderDialer,
     chain: WorkBlocks<VerifiedRemoteLightClient>,
@@ -208,13 +211,13 @@ impl PaidWorkSession {
             "paid-work timeout must be positive"
         );
 
-        let config = args.config.clone();
+        let config = &args.config;
         let policy = config.provider_policy();
         let bond = args.bond;
         let payment_funding = args.payment_funding.clone();
         let mut next_validator = 0;
-        let chain = connect_chain(&config, &mut next_validator).await?;
-        check_genesis(&config, &chain).await?;
+        let chain = connect_chain(config, &mut next_validator).await?;
+        check_genesis(config, &chain).await?;
 
         std::fs::create_dir_all(&args.journal_root).with_context(|| {
             format!(
@@ -272,7 +275,7 @@ impl PaidWorkSession {
             setup.arm_scan(finalized_floor(&chain).await?)?;
         }
         if setup.state().revision() == Some(1) {
-            let terms = payment_terms(&config, &policy, &bundle, args.omission_bond);
+            let terms = payment_terms(config, &policy, &bundle, args.omission_bond);
             setup.propose_payment(payment_funding, terms)?;
         }
         if setup.state().revision() == Some(2) {
@@ -291,7 +294,6 @@ impl PaidWorkSession {
 
         Ok(Self {
             args,
-            config,
             descriptor,
             dialer,
             chain,
@@ -334,22 +336,22 @@ impl PaidWorkSession {
                 }
                 CloseProgress::Opened { .. } | CloseProgress::Nothing => {}
             }
-            tokio::time::sleep(self.config.poll).await;
+            tokio::time::sleep(self.args.config.poll).await;
         }
     }
 
     /// Refreshes finalized state, rotating through configured validators on failure.
     pub async fn follow_chain(&mut self) -> Result<()> {
-        for attempt in 0..self.config.validators.len() {
+        for attempt in 0..self.args.config.validators.len() {
             match self.client.catch_up(&self.chain).await {
                 Ok(_) => return Ok(()),
-                Err(error) if attempt + 1 == self.config.validators.len() => {
+                Err(error) if attempt + 1 == self.args.config.validators.len() => {
                     return Err(error.into());
                 }
                 Err(error) => {
                     tracing::debug!(%error, "paid channel will continue catch-up through another validator");
-                    self.chain = connect_chain(&self.config, &mut self.next_validator).await?;
-                    check_genesis(&self.config, &self.chain).await?;
+                    self.chain = connect_chain(&self.args.config, &mut self.next_validator).await?;
+                    check_genesis(&self.args.config, &self.chain).await?;
                 }
             }
         }
@@ -382,7 +384,6 @@ impl PaidWorkSession {
         self.follow_chain().await?;
         let Self {
             args,
-            config,
             descriptor,
             dialer,
             chain,
@@ -390,6 +391,7 @@ impl PaidWorkSession {
             needs_recovery,
             ..
         } = self;
+        let config = &args.config;
         if let Some(prepared) = prepared.as_ref() {
             check_request(
                 &config.provider_policy(),
@@ -781,8 +783,8 @@ pub fn check_evaluate_input(
     policy: &ProviderChannelPolicy,
     prepared: &PreparedPaidInputV1,
 ) -> Result<()> {
-    let input = InputIdentities::from_prepared(prepared)?;
     let parts = prepared.parts()?;
+    let input = InputIdentities::from_parts(&parts)?;
     let PaidWorkPolicy::Evaluate(expected) = &policy.execution_policy else {
         bail!("work config does not select the Evaluate profile");
     };

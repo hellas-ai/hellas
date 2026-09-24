@@ -91,7 +91,7 @@ fn route(peer: u8, bond: EdgeId, client: Key) -> serde_json::Value {
 /// Loads routes through the production parser, so their duplicate-peer
 /// and duplicate-bond invariants are facts these provisioning tests use,
 /// not a test-only constructor that can make impossible route tables.
-fn routed_work_config(root: &Path, routes: Vec<serde_json::Value>) -> CliResult<WorkConfig> {
+fn routed_work_config(root: &Path, routes: Vec<serde_json::Value>) -> Result<WorkConfig> {
     let validators: Vec<String> = (1..=6)
         .map(|index| format!("http://127.0.0.1:900{index}"))
         .collect();
@@ -174,14 +174,14 @@ fn provision(
     root: &Path,
     policy: ProviderChannelPolicy,
     max_job_price: u64,
-) -> CliResult<Provisioned> {
+) -> Result<Provisioned> {
     provision_options(&options(root, max_job_price), policy)
 }
 
 fn provision_options(
     options: &ProvisionOptions,
     policy: ProviderChannelPolicy,
-) -> CliResult<Provisioned> {
+) -> Result<Provisioned> {
     let candidate = BondCandidate::plan(options)?;
     Offer::plan(options, policy, candidate)?.journal(floor())
 }
@@ -236,19 +236,17 @@ fn preview_and_real_offer_use_the_identical_bond_candidate() {
     let offer = Offer::plan(&options, policy(), candidate)
         .unwrap_or_else(|error| panic!("the routed offer plans: {error:#}"));
     assert_eq!(expected, expected_bond(40));
-    assert_eq!(offer.bond_edge, expected);
+    assert_eq!(offer.candidate.bond_edge, expected);
 }
 
-#[tokio::test]
-async fn preview_needs_neither_a_route_nor_a_chain_nor_a_journal() {
+#[test]
+fn preview_needs_neither_a_route_nor_a_chain_nor_a_journal() {
     let root = tempfile::tempdir().unwrap();
     let config = routed_work_config(root.path(), Vec::new())
         .unwrap_or_else(|error| panic!("a route-free config loads: {error:#}"));
-    let mut options = options_for(config, client().party_key(), &[0xa1], 40);
-    options.print_bond_only = true;
+    let options = options_for(config, client().party_key(), &[0xa1], 40);
 
-    run_provision(options)
-        .await
+    preview_bond(&options)
         .unwrap_or_else(|error| panic!("the isolated preview succeeds: {error:#}"));
     assert_eq!(
         provider_setups(root.path()),

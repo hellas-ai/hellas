@@ -311,7 +311,7 @@ impl PreparedPaidWorkInput {
                 let parts = bundle.parts()?;
                 let input = crate::fetch::verify_input_events(&parts.fetch_input_transcript)
                     .map_err(|e| PaidWorkError::Transcript(e.to_string()))?;
-                let result = work_fetch::terminal_fetch_result_with_assurance(
+                let result = work_fetch::terminal_fetch_result(
                     channel,
                     authorization,
                     transcript,

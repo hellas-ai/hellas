@@ -1381,8 +1381,13 @@ fn terminal_fetch_result_is_pinned() {
     let channel = channel();
     let authorization = authorization();
     let transcript = output_transcript(&authorization);
-    let result = terminal_fetch_result(&channel, &authorization, &transcript)
-        .expect("a legal terminal transcript");
+    let result = terminal_fetch_result(
+        &channel,
+        &authorization,
+        &transcript,
+        Assurance::ProducerSigned,
+    )
+    .expect("a legal terminal transcript");
 
     assert_eq!(result.work_id, work_id(&channel, &authorization));
     assert_eq!(
@@ -1421,7 +1426,7 @@ fn terminal_fetch_result_refusals() {
 
     // MUTATION: an empty transcript.
     assert!(matches!(
-        terminal_fetch_result(&channel, &authorization, &[]),
+        terminal_fetch_result(&channel, &authorization, &[], Assurance::ProducerSigned),
         Err(PaidWorkError::Transcript(_))
     ));
 
@@ -1432,7 +1437,12 @@ fn terminal_fetch_result_refusals() {
     let builder = FetchOutputTranscriptBuilder::new(wrong_input, Assurance::ProducerSigned, &key);
     let wrong_request = builder.finish(terminal_payload()).unwrap();
     assert!(matches!(
-        terminal_fetch_result(&channel, &authorization, &wrong_request),
+        terminal_fetch_result(
+            &channel,
+            &authorization,
+            &wrong_request,
+            Assurance::ProducerSigned
+        ),
         Err(PaidWorkError::Transcript(_))
     ));
 
@@ -1444,7 +1454,12 @@ fn terminal_fetch_result_refusals() {
     builder.push_event(event_payload("paid ")).unwrap();
     let client_signed = builder.finish(terminal_payload()).unwrap();
     assert_eq!(
-        terminal_fetch_result(&channel, &authorization, &client_signed),
+        terminal_fetch_result(
+            &channel,
+            &authorization,
+            &client_signed,
+            Assurance::ProducerSigned
+        ),
         Err(PaidWorkError::Mismatch {
             field: "transcript producer key"
         })
@@ -1464,7 +1479,12 @@ fn terminal_fetch_result_refusals() {
         .unwrap();
     let no_terminal = builder.finish().unwrap().0;
     assert!(matches!(
-        terminal_fetch_result(&channel, &authorization, &no_terminal),
+        terminal_fetch_result(
+            &channel,
+            &authorization,
+            &no_terminal,
+            Assurance::ProducerSigned
+        ),
         Err(PaidWorkError::Transcript(_))
     ));
 }
@@ -1552,8 +1572,13 @@ fn fetch_result_pays_through_the_shared_ledger() {
     let channel = channel();
     let authorization = authorization();
     let transcript = output_transcript(&authorization);
-    let result = terminal_fetch_result(&channel, &authorization, &transcript)
-        .expect("a legal terminal transcript");
+    let result = terminal_fetch_result(
+        &channel,
+        &authorization,
+        &transcript,
+        Assurance::ProducerSigned,
+    )
+    .expect("a legal terminal transcript");
 
     let (certificate, binding) =
         next_payment(&channel, &authorization, &result, 0, capacity()).expect("a legal payment");
@@ -1600,8 +1625,13 @@ fn the_real_input_constructor_passes_the_whole_pipeline() {
         .expect("a legal prepared input");
 
     let transcript = output_transcript(&authorization);
-    let result = terminal_fetch_result(&channel, &authorization, &transcript)
-        .expect("a legal terminal transcript");
+    let result = terminal_fetch_result(
+        &channel,
+        &authorization,
+        &transcript,
+        Assurance::ProducerSigned,
+    )
+    .expect("a legal terminal transcript");
     assert_eq!(result.work_id, work_id(&channel, &authorization));
 }
 

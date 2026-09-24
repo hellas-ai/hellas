@@ -121,21 +121,7 @@ impl WorkHandler for UnmountedWork {
     }
 }
 
-// ── The clock ─────────────────────────────────────────────────────────
-//
-// Everything below is a runner and nothing below is a decision. It
-// builds no transaction, fixes no deadline, chooses no settlement,
-// judges no duty due, and does not decide whether admission is on: each
-// of those is a library edge it calls on a cadence, and the cadence is
-// the whole of what this file adds. What it owns is *when* — and the
-// journals, which is why it hands them to nobody.
-
-/// What the clock over one node's paid-work journals is built from.
-///
-/// Every field is something the serve path has already loaded and
-/// checked. The policy most of all: it is the loaded work
-/// configuration's, carried here rather than derived again, so there is
-/// no second place a node could decide what it countersigns over.
+/// Validated configuration for driving provider journals.
 pub struct WorkRunnerConfig {
     /// The network the journals are keyed and the signatures bound to.
     pub network: NetworkId,
@@ -155,14 +141,8 @@ pub struct WorkRunnerConfig {
     pub policy: ProviderChannelPolicy,
 }
 
-/// The channel this node answers `Work` from, once the runner has been
-/// handed one.
-///
-/// Written by the runner and read by the accept loop. What crosses is a
-/// clone of a handler whose mutable pieces are themselves behind `Arc`s,
-/// so the lock is held for a clone and never across a request: the
-/// dispatch path never waits while holding the mount, and the clock never
-/// waits on a request.
+/// Channels indexed by authenticated peer. Handlers share the runner's state;
+/// mount locks are released before processing requests.
 #[derive(Clone)]
 pub struct MountedWork<S> {
     mounted: Arc<Mutex<BTreeMap<PeerId, Vec<MountedWorkService<S>>>>>,
@@ -178,59 +158,32 @@ impl<S> Default for MountedWork<S> {
     }
 }
 
-/// A cloneable, type-erased owner of the backend that runs accepted work.
-///
-/// The production value owns an [`hellas_executor::ExecutorHandle`].
-/// Keeping the backend behind this narrow local seam means the clock and
-/// ALPN dispatcher stay parameterized only over their finalized source;
-/// neither has a second opinion about paid admission or execution failure.
+/// Type-erased runner for an accepted job.
+type RunAcceptedWork = dyn Fn(WorkService, ReadyChannel, Digest) -> BoxFuture<'static, Result<RunOutcome, RunError>>
+    + Send
+    + Sync;
+
 #[derive(Clone)]
-struct AcceptedWorkDriver(Arc<dyn DriveAcceptedWork>);
-
-trait DriveAcceptedWork: Send + Sync {
-    fn run(
-        &self,
-        service: WorkService,
-        ready: ReadyChannel,
-        work_id: Digest,
-    ) -> BoxFuture<'static, Result<RunOutcome, RunError>>;
-}
-
-struct BackendWorkDriver<B> {
-    backend: Arc<B>,
-}
-
-impl<B> DriveAcceptedWork for BackendWorkDriver<B>
-where
-    B: PaidWorkBackend + Send + Sync + 'static,
-{
-    fn run(
-        &self,
-        service: WorkService,
-        ready: ReadyChannel,
-        work_id: Digest,
-    ) -> BoxFuture<'static, Result<RunOutcome, RunError>> {
-        let backend = Arc::clone(&self.backend);
-        Box::pin(
-            async move { run_accepted_work(&service, &ready, backend.as_ref(), work_id).await },
-        )
-    }
-}
+struct AcceptedWorkDriver(Arc<RunAcceptedWork>);
 
 impl AcceptedWorkDriver {
     fn new<B>(backend: B) -> Self
     where
         B: PaidWorkBackend + Send + Sync + 'static,
     {
-        Self(Arc::new(BackendWorkDriver {
-            backend: Arc::new(backend),
+        let backend = Arc::new(backend);
+        Self(Arc::new(move |service, ready, work_id| {
+            let backend = Arc::clone(&backend);
+            Box::pin(
+                async move { run_accepted_work(&service, &ready, backend.as_ref(), work_id).await },
+            )
         }))
     }
 
     /// Starts one accepted job without lending its lifetime to either the
     /// request path or the close clock.
     fn spawn(&self, service: WorkService, ready: ReadyChannel, work_id: Digest) {
-        let running = self.0.run(service, ready, work_id);
+        let running = (self.0)(service, ready, work_id);
         let span = hellas_rpc::request_span!(target: "hellas_request", "paid.provider.execute", hellas.work.id = ?work_id, otel.status_code = tracing::field::Empty);
         tokio::spawn(tracing::Instrument::instrument(
             async move {
@@ -265,13 +218,9 @@ impl AcceptedWorkDriver {
     }
 }
 
-/// One mounted channel's served handler.
-///
-/// `source` is replaceable because the runner redials a failed validator.
-/// The request path copies the current source under the plain mutex and
-/// drops that guard before its coherent read awaits. `accepting` spans the
-/// complete fresh-read-to-signature sequence, so two acceptance attempts
-/// cannot each refresh and then race to consume the same channel credit.
+/// One channel's handler. The runner replaces `source` when it redials a validator.
+/// `accepting` serializes each fresh readiness read through signing to prevent
+/// concurrent requests from consuming the same credit.
 #[derive(Clone)]
 pub struct MountedWorkService<S> {
     bond_edge: EdgeId,
@@ -286,17 +235,10 @@ impl<S> MountedWorkService<S>
 where
     S: FinalizedBlocks + FinalizedWorkView + Sync,
 {
-    /// Re-establishes admission from one fresh coherent read.
-    ///
-    /// The service is the exact clone the runner drives. Its cursor is
-    /// checked after readiness, and that same service receives the fresh
-    /// decision before the raw handler is reached. A missing policy,
-    /// failed read, failed predicate, lagging cursor, or endpoint failure
-    /// therefore leaves the request on the retryable `NotReady` side.
+    /// Refreshes admission and checks the cursor using one coherent finalized read.
+    /// Any failure leaves admission disabled until a later successful refresh.
     pub async fn refresh_admission(&self) -> anyhow::Result<ReadyChannel> {
-        // A `std::sync::MutexGuard` is deliberately confined to this
-        // block. Holding the source-slot guard across the read would make
-        // this handler's future non-`Send` and is not a valid dispatch.
+        // Drop the source lock before awaiting the chain read.
         let source = {
             let held = self
                 .source
@@ -330,12 +272,8 @@ where
     }
 }
 
-/// Re-establishes admission for the exact driven channel from one coherent
-/// finalized read.
-///
-/// Both the wire handler and restart recovery call this function. A recovered
-/// job therefore gets no weaker interpretation of readiness than a new job,
-/// and neither path can accidentally trust the readiness cached at mount.
+/// Shared readiness check for live requests and restart recovery.
+/// Both paths use a fresh finalized snapshot.
 async fn refresh_work_admission<S>(
     service: &WorkService,
     descriptor: Option<&WorkChannelDescriptor>,
@@ -540,12 +478,7 @@ impl<S: Clone> MountedWork<S> {
         }
     }
 
-    /// Adds one owned channel under its authenticated peer.
-    ///
-    /// A peer is served only while exactly one channel is mounted under
-    /// it. Retaining a second candidate rather than overwriting either one
-    /// makes an ambiguity fail closed instead of turning insertion order
-    /// into routing policy.
+    /// Mounts a channel for a peer. Multiple candidates disable routing for that peer.
     pub fn mount(
         &self,
         peer: PeerId,
@@ -591,11 +524,7 @@ impl<S: Clone> MountedWork<S> {
         self.handler(context).map(|mounted| mounted.service)
     }
 
-    /// Replaces the finalized source for the matching driven channel.
-    ///
-    /// A reconnect reaches handlers already cloned by live connections,
-    /// because they share this inner source slot. Neither mount lock is
-    /// held across a source request.
+    /// Updates the shared source, including handlers held by live connections.
     fn refresh_source(&self, peer: PeerId, bond_edge: EdgeId, source: &S) {
         let source_slot = self.mounted.lock().ok().and_then(|held| {
             held.get(&peer)?
@@ -610,12 +539,7 @@ impl<S: Clone> MountedWork<S> {
         }
     }
 
-    /// Stops serving `Work` from every channel.
-    ///
-    /// The clock's last act. A channel nobody is advancing is not a
-    /// channel to answer from — its journal is closed the moment the
-    /// runner drops it, and a handler still holding it open would be the
-    /// one thing keeping the files this process no longer owns.
+    /// Unmounts all channels when the clock stops, releasing its journal handles.
     pub fn clear_all(&self) {
         if let Ok(mut held) = self.mounted.lock() {
             held.clear();
@@ -623,12 +547,7 @@ impl<S: Clone> MountedWork<S> {
     }
 }
 
-/// Provider setups this node answers `WorkSetup` from by authenticated peer.
-///
-/// Written by discovery and read by the accept loop, beside
-/// [`MountedWork`]. The clone in this slot is the exact [`SetupService`]
-/// stored in [`Driven::Setup`], so serving and driving share one exclusive
-/// journal rather than attempting to reopen it.
+/// Setups indexed by authenticated peer. Serving and driving share each journal.
 #[derive(Clone, Debug, Default)]
 pub struct MountedSetup(Arc<Mutex<BTreeMap<PeerId, Vec<MountedSetupService>>>>);
 
@@ -688,14 +607,8 @@ impl MountedSetup {
     }
 }
 
-/// One journal, and what the clock drives it as.
-///
-/// Two live states and one transition between them: a setup is driven
-/// until it hands back the channel it mounted, and from then on the
-/// channel is what is driven. Nothing here re-derives a mount —
-/// [`SetupAdvance::mounted`] is the only way a [`ChannelStore`] reaches
-/// this file, and the setup is not driven again afterwards, because a
-/// second step would open a second journal on the same file.
+/// A journal transitions from setup to channel when `advance_setup` returns its
+/// mounted store. The store is transferred without reopening its exclusive file.
 enum Driven {
     /// The journal is driven behind the setup service that answers for
     /// it. The policy is retained beside the service: it is the provider
@@ -704,16 +617,7 @@ enum Driven {
     Setup {
         /// The endpoint this journal is both driven and served behind.
         service: SetupService,
-        /// The retained provider authority, behind a pointer.
-        ///
-        /// Boxed because it is the widest thing this enum carries by a
-        /// long way — every other payload here is a handle or a store
-        /// pointer, one or two words each — and a journal is one value
-        /// with three shapes, so the two that hold no policy would
-        /// otherwise each be as large as the one that does.
-        /// [`PaymentAdmission`] already holds it behind the same
-        /// indirection, and this is built from that one, once per
-        /// journal at startup.
+        /// Boxed to keep the other enum variants small.
         policy: Box<ProviderChannelPolicy>,
     },
     /// The channel this setup mounted, including the recovery authority
@@ -724,12 +628,8 @@ enum Driven {
     Done,
 }
 
-/// One mounted channel as driven by the paid-work clock.
-///
-/// Recovery lives here rather than in the served route: an accepted job is an
-/// obligation recorded by this journal even if peer routing changes while the
-/// process is down. `accepting` is also lent to the route when one is mounted,
-/// so live acceptance and restart recovery serialize their readiness checks.
+/// A driven channel recovers accepted jobs even without a peer route.
+/// Live acceptance and recovery share the same admission lock.
 struct DrivenChannel {
     service: WorkService,
     descriptor: Option<WorkChannelDescriptor>,
@@ -748,12 +648,8 @@ impl DrivenChannel {
             .context("the driven channel state is unavailable")
     }
 
-    /// Starts a journaled Accepted job after proving current readiness.
-    ///
-    /// No in-memory `attempted` marker is needed. A racing live request or
-    /// clock tick reaches the same endpoint; its durable `JobRunning` record
-    /// lets exactly one caller receive `Invoke` and every other caller receive
-    /// `Running`.
+    /// Resumes accepted work after a fresh readiness check. The durable `JobRunning`
+    /// record admits one invocation even when a live request races this clock tick.
     async fn resume_accepted<S>(&self, source: &S) -> anyhow::Result<bool>
     where
         S: FinalizedBlocks + FinalizedWorkView + Sync,
@@ -789,13 +685,7 @@ struct SetupClock {
 }
 
 impl SetupClock {
-    /// Takes this journal's one step, and says whether the chain
-    /// answered.
-    ///
-    /// A source failure is the only outcome the caller acts on: a
-    /// validator that stopped answering is dialled again rather than
-    /// asked forever. Everything else is this journal's own business and
-    /// is logged where it happens.
+    /// Advances the journal; returns false on a source failure so the caller redials.
     async fn tick<S>(
         &mut self,
         source: &S,
@@ -866,12 +756,7 @@ impl SetupClock {
         answered
     }
 
-    /// Mounts the store the driver handed back.
-    ///
-    /// Handed back, never reopened: the journal is exclusive, so a
-    /// second `ChannelStore::open` on the same file is a refusal rather
-    /// than a second view, and the settlement and origin this one
-    /// carries are the ones the completing read established.
+    /// Transfers the mounted store returned by setup, preserving its exclusive lock.
     fn take_mount<S: Clone>(
         &mut self,
         store: ChannelStore,
@@ -881,10 +766,7 @@ impl SetupClock {
         mount: &MountedWork<S>,
     ) {
         let bond = hex::encode(self.bond_edge.to_bytes());
-        // The setup's retained policy supplies the provider-controlled
-        // fields, while the mounted channel supplies the payment edge and
-        // complete terms the two parties actually signed. This is a full
-        // descriptor reconstruction, not a mount-time readiness cache.
+        // Rebuild the descriptor from the retained policy and signed payment terms.
         let descriptor = {
             let channel = store.state().channel();
             match policy.admit(channel.payment_edge(), channel.payment_terms().clone()) {
@@ -965,22 +847,9 @@ impl<S> WorkRunner<S>
 where
     S: SetupView + FinalizedBlocks + FinalizedWorkView + TxSink + Sync,
 {
-    /// Opens every setup journal under the configured root.
-    ///
-    /// The root and the network are the whole of what a restarting node
-    /// is told; the bond each journal is about and the role it was
-    /// written at come out of the files, which is what `discover_setups`
-    /// is for. A journal that cannot be named is reported and not
-    /// skipped silently: a file this node cannot open may be a channel
-    /// it still owes a close.
-    ///
-    /// # Errors
-    ///
-    /// When the root itself cannot be enumerated.
-    /// Every owned journal is driven. A configured route additionally
-    /// mounts its exact setup service under the authenticated peer that
-    /// names it; an unconfigured journal remains a close duty, not a
-    /// fallback answer.
+    /// Discovers provider journals and mounts configured routes. Unrouted journals
+    /// are still driven through close. Unreadable journals are logged; failure to
+    /// enumerate the root is returned to the caller.
     pub fn discover(
         config: WorkRunnerConfig,
         work_mount: MountedWork<S>,
@@ -1086,11 +955,7 @@ where
         answered
     }
 
-    /// The loop, over whatever chain `dial` produces.
-    ///
-    /// One tick of every journal per period, and a chain that stopped
-    /// answering is dialled again rather than asked forever. The whole
-    /// of the cadence is here, and none of the decisions are.
+    /// Ticks each journal once per period and redials after a source failure.
     pub async fn run_over<D, F>(mut self, mut stop: oneshot::Receiver<()>, dial: D)
     where
         D: Fn() -> F,
@@ -1137,14 +1002,8 @@ impl WorkRunner<ProductionWorkSource> {
     }
 }
 
-/// Rotate the first candidate on reconnect, including when a connected peer
-/// cannot supply historical finalized blocks. Reads and submissions use the
-/// selected verified connection.
-///
-/// One endpoint for both directions. §1's concurrent fan-out to all six
-/// is a submission strategy with an outcome rule, and neither exists in
-/// this tree yet; inventing one here would be the runner deciding what
-/// a submission means.
+/// Rotates the first candidate on reconnect. Chain reads and submissions use
+/// the selected verified connection.
 async fn connect_chain(
     validators: &[String],
     verifier: ConsensusVerifier,
