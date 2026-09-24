@@ -26,25 +26,8 @@ pub struct HttpBackend {
     pub credential: Option<String>,
     pub routes: Vec<HttpRoute>,
     pub max_in_flight: Option<usize>,
-    pub provider: Option<Provider>,
-}
-
-#[derive(Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Provider {
-    pub node_id: iroh::EndpointId,
-    #[serde(default)]
-    pub node_addrs: Vec<std::net::SocketAddr>,
-    #[serde(deserialize_with = "genesis_from_hex")]
-    pub genesis: hellas_rpc::ContentId,
-}
-
-fn genesis_from_hex<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<hellas_rpc::ContentId, D::Error> {
-    String::deserialize(deserializer)?
-        .parse()
-        .map_err(serde::de::Error::custom)
+    /// Endpoint in the paid pool. May be omitted when there is exactly one.
+    pub provider: Option<iroh::EndpointId>,
 }
 
 fn default_concurrency() -> usize {

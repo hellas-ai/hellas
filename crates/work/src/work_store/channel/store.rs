@@ -50,7 +50,7 @@ impl ChannelStore {
         Self::open_inner(root, channel, settlement, role, origin, verifier, false)
     }
 
-    /// Opens a provider journal that stores accounting evidence only.
+    /// Opens a journal that stores accounting evidence only.
     ///
     /// Inputs and output transcripts are verified before commit and retained
     /// in memory. Append and checkpoint encodings omit both bodies. After a
@@ -61,18 +61,11 @@ impl ChannelStore {
         root: &Path,
         channel: PaidChannel,
         settlement: WorkPaymentSettlement,
+        role: Role,
         origin: SetupOrigin,
         verifier: &V,
     ) -> Result<Self, WorkStoreError> {
-        Self::open_inner(
-            root,
-            channel,
-            settlement,
-            Role::Provider,
-            origin,
-            verifier,
-            true,
-        )
+        Self::open_inner(root, channel, settlement, role, origin, verifier, true)
     }
 
     fn open_inner<V: SigVerifier>(

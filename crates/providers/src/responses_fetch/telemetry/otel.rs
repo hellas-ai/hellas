@@ -43,10 +43,9 @@ impl Request {
                     .get(name)
                     .and_then(|v| v.as_text())
                     .filter(|value| !value.is_empty())
+                    && let Ok(value) = value.parse()
                 {
-                    if let Ok(value) = value.parse() {
-                        request.headers_mut().insert(name, value);
-                    }
+                    request.headers_mut().insert(name, value);
                 }
             }
         }

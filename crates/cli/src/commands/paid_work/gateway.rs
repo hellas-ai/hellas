@@ -4,12 +4,15 @@ use super::*;
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use hellas_gateway::{
-    ExecutionEvent, Outcome, PaidExecutionBackend, PaidExecutionRequest, StopReason,
+    ExecutionEvent, Outcome, PaidExecutionBackend, PaidExecutionRequest, PaidFetchRequest,
+    StopReason,
 };
+use hellas_rpc::output::OutputEvent as FetchEvent;
 use hellas_rpc::protocol::artifacts::{
     BoundTermId, InputAddressed as _, OutputAddressed as _, SourceRef, TextArtifact, TextExecution,
     TextPolicy, TokenIds,
 };
+use hellas_rpc::protocol::work_profile::{PaidWorkPolicy, PreparedPaidWorkInput};
 use iroh::Endpoint;
 use serde::Deserialize;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -68,7 +71,18 @@ const CHANNEL_FOLLOW_BUDGET: Duration = Duration::from_secs(1);
 const OUTPUT_BUFFER_BYTES: usize = 2 * MAX_RECORD_BYTES;
 const OUTPUT_EVENT_OVERHEAD: usize = 1024;
 const OUTPUT_BUFFER_EVENTS: usize = OUTPUT_BUFFER_BYTES / OUTPUT_EVENT_OVERHEAD;
-type BufferedEvent = (CliResult<ExecutionEvent>, OwnedSemaphorePermit);
+type BufferedEvent<E = ExecutionEvent> = (CliResult<E>, OwnedSemaphorePermit);
+
+trait GatewayEvent: Send + 'static {
+    fn prefix(event: hellas_rpc::OutputEventEnvelope) -> CliResult<Self>
+    where
+        Self: Sized;
+    fn completed(output: PaidOutput) -> CliResult<Vec<Self>>
+    where
+        Self: Sized;
+    fn is_terminal(&self) -> bool;
+    fn bytes(&self) -> usize;
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -81,11 +95,17 @@ struct ProviderFile {
     bond: String,
     payment_coins: Vec<String>,
     omission_bond: u64,
+    /// Required enrollment pin for attested providers; optional for producer-signed work.
+    provider_genesis: Option<String>,
+    apple_app_id: Option<String>,
+    #[serde(default)]
+    apple_cd_hashes: Vec<String>,
 }
 
 struct Provider {
     args: RunArgs,
     policy: ProviderChannelPolicy,
+    assurance: hellas_rpc::Assurance,
     /// A setup/channel journal has a single owner even with concurrent HTTP calls.
     serial: AsyncMutex<Option<OpenPaidChannel>>,
     pending: AtomicUsize,
@@ -210,6 +230,7 @@ struct PaidGateway {
     next: AtomicUsize,
     endpoint: Endpoint,
     settlement_key: Secp256k1Signer,
+    producer_key: hellas_rpc::ProducerSigningKey,
     admission: Arc<Semaphore>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
     followers: Mutex<Vec<JoinHandle<()>>>,
@@ -219,7 +240,14 @@ pub async fn load_gateway_backend(
     path: &Path,
     transport_key: SecretKey,
     settlement_key: Secp256k1Signer,
+    producer_key: hellas_rpc::ProducerSigningKey,
+    assurance: hellas_rpc::Assurance,
 ) -> CliResult<Arc<dyn PaidExecutionBackend>> {
+    anyhow::ensure!(
+        producer_key.public_key()
+            == hellas_rpc::PublicKey::Secp256k1(settlement_key.party_key().to_bytes()),
+        "paid Fetch signer must match the settlement identity"
+    );
     let bytes =
         crate::commands::read_bounded_regular_file(path, "paid gateway config", MAX_RECORD_BYTES)?;
     let file: PoolFile = serde_json::from_slice(&bytes)
@@ -273,10 +301,18 @@ pub async fn load_gateway_backend(
         let config = load_work_config(&provider.work_config)?;
         providers.push(Arc::new(Provider {
             policy: config.provider_policy(),
+            assurance,
             args: RunArgs {
-                provider_genesis: None,
-                apple_app_id: None,
-                apple_cd_hashes: Vec::new(),
+                provider_genesis: provider
+                    .provider_genesis
+                    .map(|value| value.parse())
+                    .transpose()?,
+                apple_app_id: provider.apple_app_id,
+                apple_cd_hashes: provider
+                    .apple_cd_hashes
+                    .iter()
+                    .map(|value| fixed_hex::<32>("apple_cd_hashes", value))
+                    .collect::<CliResult<_>>()?,
                 work_config: provider.work_config,
                 journal_root: provider.journal_root,
                 provider: provider.provider,
@@ -297,6 +333,8 @@ pub async fn load_gateway_backend(
             cache: Mutex::new(PrefixCache::default()),
             unavailable_until: Mutex::new(None),
         }));
+        let provider = providers.last().expect("provider just added");
+        paid_provider_trust(&provider.args, provider.assurance)?;
     }
     let gateway = Arc::new(PaidGateway {
         admission: Arc::new(Semaphore::new(file.max_pending_requests)),
@@ -306,13 +344,14 @@ pub async fn load_gateway_backend(
         // provider and request for the lifetime of this gateway.
         endpoint: bind_paid_endpoint(transport_key).await?,
         settlement_key,
+        producer_key,
         tasks: Mutex::new(Vec::new()),
         followers: Mutex::new(Vec::new()),
     });
     // Restart recovery uses the retained input and certificate, never a new job.
     // Empty journal roots do not fund a channel until an HTTP request arrives.
     for provider in &gateway.providers {
-        let _recovery = gateway.submit(
+        let _recovery = gateway.submit::<ExecutionEvent>(
             vec![(
                 provider.clone(),
                 Route {
@@ -364,245 +403,7 @@ pub async fn load_gateway_backend(
 }
 
 impl PaidGateway {
-    fn submit(
-        &self,
-        candidates: Vec<(Arc<Provider>, Route)>,
-        prepared: Option<PreparedPaidInputV1>,
-        cache_update: Option<CacheUpdate>,
-        recovery_timeout: Option<Duration>,
-        permit: Option<OwnedSemaphorePermit>,
-    ) -> CliResult<BoxStream<'static, CliResult<ExecutionEvent>>> {
-        // Admission can precede local request preparation. Serialize the final
-        // gate check and registration with drain's close-and-snapshot boundary.
-        let mut tasks = self.tasks.lock().expect("paid task list poisoned");
-        if self.admission.is_closed() {
-            return Err(hellas_gateway::PaidGatewayBusy.into());
-        }
-        let endpoint = self.endpoint.clone();
-        let settlement_key = self.settlement_key.clone();
-        let (sender, receiver) = mpsc::channel(OUTPUT_BUFFER_EVENTS);
-        let (overflow, overflow_receiver) = watch::channel(false);
-        let output_budget = Arc::new(Semaphore::new(OUTPUT_BUFFER_BYTES));
-        let (initial_provider, _initial_route) = candidates.first().expect("paid provider exists");
-        let span = hellas_rpc::request_span!(
-            target: "hellas_request", "paid.gateway",
-            hellas.provider.id = %initial_provider.args.provider,
-            hellas.work.recovery = prepared.is_none(),
-            hellas.route.cache_affinity_tokens = _initial_route.cache_affinity_tokens,
-            hellas.route.pending = _initial_route.pending,
-        );
-        // Reserve the first route synchronously so concurrent HTTP requests see
-        // both queued and executing work. Each failed candidate releases its slot.
-        let mut occupied = prepared
-            .as_ref()
-            .map(|_| ProviderUse::new(initial_provider.clone()));
-        let timeout = recovery_timeout
-            .unwrap_or_else(|| Duration::from_secs(initial_provider.args.timeout_secs));
-        // Queueing, recovery and fallback all consume the same request budget.
-        let deadline = tokio::time::Instant::now() + timeout;
-        let task_span = span.clone();
-        let task = tokio::spawn(async move {
-            let _permit = permit;
-            let token_sender = sender.clone();
-            let token_overflow = overflow.clone();
-            let token_budget = output_budget.clone();
-            let streamed = prepared.is_some();
-            let recovery = !streamed;
-            let progress: hellas_work::work::PaidProgress = Arc::new(move |event| {
-                let delta = hellas_rpc::evaluate::decode_token_delta_payload(event.payload())
-                    .map_err(|error| hellas_work::work::BackendFault::new(error.to_string()))?;
-                let position = delta.end_position().map_err(|error| hellas_work::work::BackendFault::new(error.to_string()))?;
-                emit(&token_sender, &token_overflow, &token_budget, Ok(ExecutionEvent::Chunk { position, tokens: delta.token_bytes() }));
-                Ok(())
-            });
-            let result = async {
-                let prepared_bytes = prepared.as_ref().map(PreparedPaidInputV1::encode).transpose()?;
-                let mut provider_errors = Vec::new();
-                for (provider, route) in candidates {
-                    let _occupied = occupied.take().or_else(|| {
-                        prepared.as_ref().map(|_| ProviderUse::new(provider.clone()))
-                    });
-                    task_span.record("hellas.provider.id", tracing::field::display(provider.args.provider));
-                    task_span.record("hellas.route.cache_affinity_tokens", route.cache_affinity_tokens);
-                    task_span.record("hellas.route.pending", route.pending);
-                    // Wait for a brief follower pass to yield, but route around
-                    // channels still occupied by recovery or other requests.
-                    let mut session = if recovery {
-                        before_proposal(
-                            &sender, false, deadline,
-                            |_| provider.serial.lock().instrument(hellas_rpc::request_span!(target: "hellas_request", "paid.queue")),
-                        ).await?
-                    } else {
-                        match tokio::time::timeout(
-                            CHANNEL_FOLLOW_BUDGET,
-                            provider.serial.lock(),
-                        ).await {
-                            Ok(session) => session,
-                            Err(_) => {
-                                provider_errors.push(format!(
-                                    "{}: paid channel is busy",
-                                    provider.args.provider
-                                ));
-                                continue;
-                            }
-                        }
-                    };
-                    if prepared.is_none() && (!provider.args.journal_root.try_exists()? || std::fs::read_dir(&provider.args.journal_root)?.next().is_none()) {
-                        continue;
-                    }
-                    // Recheck after queueing, including restored channels whose
-                    // setup journal opened without contacting the provider.
-                    if !provider.available() {
-                        provider_errors.push(format!("{}: provider is backing off", provider.args.provider));
-                        continue;
-                    }
-                    if session.is_none() {
-                        match connect_before_deadline(
-                            &sender, streamed, deadline, PROVIDER_CONNECTION_TIMEOUT,
-                            open_paid_channel(&provider.args, endpoint.clone(), settlement_key.clone(), hellas_rpc::Assurance::ProducerSigned),
-                        ).await
-                        {
-                            Ok(opened) => {
-                                *session = Some(opened);
-                            }
-                            Err(error) => {
-                                if !recovery && error.is::<RequestStopped>() { return Err(error); }
-                                provider.connection_failed();
-                                if recovery {
-                                    tracing::debug!(provider = %provider.args.provider, error = %format!("{error:#}"),
-                                        "retained paid-work recovery could not open its channel");
-                                } else {
-                                    tracing::debug!(provider = %provider.args.provider, error = %format!("{error:#}"),
-                                        "paid provider channel could not be opened");
-                                }
-                                provider_errors.push(format!("{}: {error:#}", provider.args.provider));
-                                continue;
-                            }
-                        }
-                    }
-                    let session = session.as_mut().expect("channel was opened");
-                    if prepared.is_some() && session.needs_recovery() {
-                        let recovery_deadline = deadline.min(
-                            tokio::time::Instant::now() + RECOVERY_ATTEMPT_TIMEOUT,
-                        );
-                        let recovery = tokio::time::timeout_at(
-                            recovery_deadline,
-                            session.run(None, true, None),
-                        )
-                        .await
-                        .map_err(|_| anyhow::anyhow!(
-                            "retained paid work did not recover within {RECOVERY_ATTEMPT_TIMEOUT:?}"
-                        ))
-                        .and_then(|result| result);
-                        if let Err(error) = recovery {
-                            // Nothing in this path has proposed the fresh request.
-                            // Keep the journal for a later recovery and route this
-                            // interactive request to another paid provider now.
-                            provider.cache.lock().expect("provider cache poisoned").replace(None);
-                            provider.connection_failed();
-                            tracing::debug!(provider = %provider.args.provider, error = %format!("{error:#}"),
-                                "retained paid work deferred before a fresh request");
-                            provider_errors.push(format!(
-                                "{}: retained work recovery deferred: {error:#}",
-                                provider.args.provider
-                            ));
-                            continue;
-                        }
-                    }
-                    // ClientEndpoint journals the proposal nonce before releasing
-                    // its signature. Recovery and a failed dial need not propose
-                    // this request; a lost acceptance response does advance it.
-                    let proposal_nonce = session.state().proposal_nonce_high_water();
-                    let already_proposed = prepared_bytes.as_ref().is_some_and(|input| {
-                        session.state().jobs().any(|job| job.prepared_input() == input)
-                    });
-                    let request_session = &mut *session;
-                    let input = prepared.clone();
-                    let on_progress = streamed.then(|| progress.clone());
-                    let result = before_proposal(
-                        &sender, streamed, deadline,
-                        |proposed| async move {
-                            request_session.run_with_admission(input.map(Into::into), true, on_progress, Some(&proposed)).await
-                        },
-                    ).await
-                        .and_then(|result| result)
-                        .and_then(|output| output.map(output_events).transpose())
-                        .map(Option::unwrap_or_default);
-                    if let Err(error) = &result {
-                        if !recovery && error.is::<RequestStopped>()
-                            && session.state().proposal_nonce_high_water() == proposal_nonce
-                        {
-                            return result;
-                        }
-                        provider.cache.lock().expect("provider cache poisoned").replace(None);
-                        if recovery {
-                            provider.connection_failed();
-                            return result.with_context(|| {
-                                format!("retained paid work at provider {}", provider.args.provider)
-                            });
-                        }
-                        // A failed journal append can leave a durable proposal that
-                        // is not reflected in memory yet. Keep that failure with
-                        // this provider, just like a proposal with no response.
-                        let uncertain_append = matches!(
-                            error.downcast_ref::<hellas_work::work::ProposeError>(),
-                            Some(hellas_work::work::ProposeError::Store(_)),
-                        );
-                        if !already_proposed && !uncertain_append
-                            && session.state().proposal_nonce_high_water() == proposal_nonce
-                        {
-                            provider.connection_failed();
-                            tracing::debug!(provider = %provider.args.provider, error = %format!("{error:#}"),
-                                "paid provider failed before proposing new work");
-                            provider_errors.push(format!("{}: {error:#}", provider.args.provider));
-                            continue;
-                        }
-                    } else {
-                        provider.connection_succeeded();
-                        if let Some(cache_update) = cache_update {
-                            cache_update.apply(&mut provider.cache.lock().expect("provider cache poisoned"));
-                        }
-                    }
-                    return result.with_context(|| format!("paid provider {}", provider.args.provider));
-                }
-                Err(anyhow::anyhow!(
-                    "no eligible paid provider could start this request: {}",
-                    provider_errors.join("; ")
-                ))
-            }.await;
-            if let Err(error) = &result {
-                if recovery {
-                    tracing::debug!(error = %format!("{error:#}"),
-                        "retained paid-work recovery deferred");
-                } else {
-                    tracing::error!(error = %format!("{error:#}"),
-                        "paid gateway operation failed; durable journals retained for recovery");
-                }
-            }
-            // A disconnected request stops before proposal. After proposal, it
-            // still collects and pays until the deadline; journals retain any
-            // unfinished operation for recovery.
-            match result {
-                Ok(events) => for event in events {
-                    if !streamed || matches!(event, ExecutionEvent::Done(_)) {
-                        emit(&sender, &overflow, &output_budget, Ok(event));
-                    }
-                },
-                Err(error) => { emit(&sender, &overflow, &output_budget, Err(error)); }
-            }
-        }.instrument(span));
-        tasks.retain(|task| !task.is_finished());
-        tasks.push(task);
-        Ok(response_stream(receiver, overflow_receiver))
-    }
-}
-
-impl PaidExecutionBackend for PaidGateway {
-    fn timeout(&self) -> Duration {
-        Duration::from_secs(self.providers[0].args.timeout_secs)
-    }
-
-    fn execute(
+    fn execute_tokens(
         &self,
         request: PaidExecutionRequest,
     ) -> CliResult<BoxStream<'static, CliResult<ExecutionEvent>>> {
@@ -640,11 +441,308 @@ impl PaidExecutionBackend for PaidGateway {
         candidates.sort_by_key(|(_, route)| std::cmp::Reverse(route.score()));
         self.submit(
             candidates,
-            Some(prepared),
+            Some(prepared.into()),
             Some(cache_update),
             None,
             Some(permit),
         )
+    }
+
+    fn submit<E: GatewayEvent>(
+        &self,
+        candidates: Vec<(Arc<Provider>, Route)>,
+        prepared: Option<PreparedPaidWorkInput>,
+        cache_update: Option<CacheUpdate>,
+        recovery_timeout: Option<Duration>,
+        permit: Option<OwnedSemaphorePermit>,
+    ) -> CliResult<BoxStream<'static, CliResult<E>>> {
+        // Admission can precede local request preparation. Serialize the final
+        // gate check and registration with drain's close-and-snapshot boundary.
+        let mut tasks = self.tasks.lock().expect("paid task list poisoned");
+        if self.admission.is_closed() {
+            return Err(hellas_gateway::PaidGatewayBusy.into());
+        }
+        let endpoint = self.endpoint.clone();
+        let settlement_key = self.settlement_key.clone();
+        let (sender, receiver) = mpsc::channel::<BufferedEvent<E>>(OUTPUT_BUFFER_EVENTS);
+        let (overflow, overflow_receiver) = watch::channel(false);
+        let output_budget = Arc::new(Semaphore::new(OUTPUT_BUFFER_BYTES));
+        let (initial_provider, _initial_route) = candidates.first().expect("paid provider exists");
+        let span = hellas_rpc::request_span!(
+            target: "hellas_request", "paid.gateway",
+            hellas.provider.id = %initial_provider.args.provider,
+            hellas.work.recovery = prepared.is_none(),
+            hellas.route.cache_affinity_tokens = _initial_route.cache_affinity_tokens,
+            hellas.route.pending = _initial_route.pending,
+        );
+        // Reserve the first route synchronously so concurrent HTTP requests see
+        // both queued and executing work. Each failed candidate releases its slot.
+        let mut occupied = prepared
+            .as_ref()
+            .map(|_| ProviderUse::new(initial_provider.clone()));
+        let timeout = recovery_timeout
+            .unwrap_or_else(|| Duration::from_secs(initial_provider.args.timeout_secs));
+        // Queueing, recovery and fallback all consume the same request budget.
+        let deadline = tokio::time::Instant::now() + timeout;
+        let task_span = span.clone();
+        let task = tokio::spawn(async move {
+            let _permit = permit;
+            let token_sender = sender.clone();
+            let token_overflow = overflow.clone();
+            let token_budget = output_budget.clone();
+            let streamed = prepared.is_some();
+            let recovery = !streamed;
+            let progress: hellas_work::work::PaidProgress = Arc::new(move |event| {
+                let event = E::prefix(event).map_err(|error| hellas_work::work::BackendFault::new(error.to_string()))?;
+                emit(&token_sender, &token_overflow, &token_budget, Ok(event));
+                Ok(())
+            });
+            let result = async {
+                let prepared_bytes = prepared.as_ref().map(PreparedPaidWorkInput::encode).transpose()?;
+                let mut provider_errors = Vec::new();
+                for (provider, route) in candidates {
+                    let _occupied = occupied.take().or_else(|| {
+                        prepared.as_ref().map(|_| ProviderUse::new(provider.clone()))
+                    });
+                    task_span.record("hellas.provider.id", tracing::field::display(provider.args.provider));
+                    task_span.record("hellas.route.cache_affinity_tokens", route.cache_affinity_tokens);
+                    task_span.record("hellas.route.pending", route.pending);
+                    // Wait for a brief follower pass to yield, but route around
+                    // channels still occupied by recovery or other requests.
+                    let mut session = if recovery || matches!(prepared, Some(PreparedPaidWorkInput::Fetch(_))) {
+                        before_proposal(
+                            &sender, streamed, deadline,
+                            |_| provider.serial.lock().instrument(hellas_rpc::request_span!(target: "hellas_request", "paid.queue")),
+                        ).await?
+                    } else {
+                        match tokio::time::timeout(
+                            CHANNEL_FOLLOW_BUDGET,
+                            provider.serial.lock(),
+                        ).await {
+                            Ok(session) => session,
+                            Err(_) => {
+                                provider_errors.push(format!(
+                                    "{}: paid channel is busy",
+                                    provider.args.provider
+                                ));
+                                continue;
+                            }
+                        }
+                    };
+                    if prepared.is_none() && (!provider.args.journal_root.try_exists()? || std::fs::read_dir(&provider.args.journal_root)?.next().is_none()) {
+                        continue;
+                    }
+                    // Recheck after queueing, including restored channels whose
+                    // setup journal opened without contacting the provider.
+                    if !provider.available() {
+                        provider_errors.push(format!("{}: provider is backing off", provider.args.provider));
+                        continue;
+                    }
+                    if session.is_none() {
+                        match connect_before_deadline(
+                            &sender, streamed, deadline, PROVIDER_CONNECTION_TIMEOUT,
+                            open_paid_channel(&provider.args, endpoint.clone(), settlement_key.clone(), provider.assurance),
+                        ).await
+                        {
+                            Ok(opened) => {
+                                *session = Some(opened);
+                            }
+                            Err(error) => {
+                                if !recovery && error.is::<RequestStopped>() { return Err(error); }
+                                provider.connection_failed();
+                                if recovery {
+                                    tracing::debug!(provider = %provider.args.provider, error = %format!("{error:#}"),
+                                        "retained paid-work recovery could not open its channel");
+                                } else {
+                                    tracing::debug!(provider = %provider.args.provider, error = %format!("{error:#}"),
+                                        "paid provider channel could not be opened");
+                                }
+                                provider_errors.push(format!("{}: {error:#}", provider.args.provider));
+                                continue;
+                            }
+                        }
+                    }
+                    let session = session.as_mut().expect("channel was opened");
+                    if prepared.is_some() && session.needs_recovery() {
+                        let recovery_deadline = deadline.min(
+                            tokio::time::Instant::now() + RECOVERY_ATTEMPT_TIMEOUT,
+                        );
+                        let recovery = tokio::time::timeout_at(
+                            recovery_deadline,
+                            session.run(None, true, None),
+                        )
+                        .await
+                        .map_err(|_| anyhow::anyhow!(
+                            "retained paid work did not recover within {RECOVERY_ATTEMPT_TIMEOUT:?}"
+                        ))
+                        .and_then(|result| result.map_err(anyhow::Error::from));
+                        if let Err(error) = recovery {
+                            // Nothing in this path has proposed the fresh request.
+                            // Keep the journal for a later recovery and route this
+                            // interactive request to another paid provider now.
+                            provider.cache.lock().expect("provider cache poisoned").replace(None);
+                            provider.connection_failed();
+                            tracing::debug!(provider = %provider.args.provider, error = %format!("{error:#}"),
+                                "retained paid work deferred before a fresh request");
+                            provider_errors.push(format!(
+                                "{}: retained work recovery deferred: {error:#}",
+                                provider.args.provider
+                            ));
+                            continue;
+                        }
+                    }
+                    // ClientEndpoint journals the proposal nonce before releasing
+                    // its signature. Recovery and a failed dial need not propose
+                    // this request; a lost acceptance response does advance it.
+                    let proposal_nonce = session.state().proposal_nonce_high_water();
+                    let already_proposed = prepared_bytes.as_ref().is_some_and(|input| {
+                        session.state().jobs().any(|job| job.prepared_input() == input)
+                    });
+                    let request_session = &mut *session;
+                    let input = prepared.clone();
+                    let on_progress = streamed.then(|| progress.clone());
+                    let result = before_proposal(
+                        &sender, streamed, deadline,
+                        |proposed| async move {
+                            request_session.run_with_admission(input, true, on_progress, Some(&proposed)).await
+                        },
+                    ).await
+                        .and_then(|result| result.map_err(anyhow::Error::from))
+                        .and_then(|output| output.map(E::completed).transpose())
+                        .map(Option::unwrap_or_default);
+                    if let Err(error) = &result {
+                        if !recovery && error.is::<RequestStopped>()
+                            && session.state().proposal_nonce_high_water() == proposal_nonce
+                        {
+                            return result;
+                        }
+                        provider.cache.lock().expect("provider cache poisoned").replace(None);
+                        if recovery {
+                            provider.connection_failed();
+                            return result.with_context(|| {
+                                format!("retained paid work at provider {}", provider.args.provider)
+                            });
+                        }
+                        // A failed journal append can leave a durable proposal that
+                        // is not reflected in memory yet. Keep that failure with
+                        // this provider, just like a proposal with no response.
+                        let uncertain_append = matches!(
+                            error.downcast_ref::<hellas_sdk::paid_client::PaidClientError>(),
+                            Some(hellas_sdk::paid_client::PaidClientError::Propose(hellas_work::work::ProposeError::Store(_))),
+                        );
+                        if !already_proposed && !uncertain_append
+                            && session.state().proposal_nonce_high_water() == proposal_nonce
+                        {
+                            provider.connection_failed();
+                            tracing::debug!(provider = %provider.args.provider, error = %format!("{error:#}"),
+                                "paid provider failed before proposing new work");
+                            provider_errors.push(format!("{}: {error:#}", provider.args.provider));
+                            continue;
+                        }
+                    } else {
+                        provider.connection_succeeded();
+                        if let Some(cache_update) = cache_update {
+                            cache_update.apply(&mut provider.cache.lock().expect("provider cache poisoned"));
+                        }
+                    }
+                    return result.with_context(|| format!("paid provider {}", provider.args.provider));
+                }
+                Err(anyhow::anyhow!(
+                    "no eligible paid provider could start this request: {}",
+                    provider_errors.join("; ")
+                ))
+            }.await;
+            if let Err(error) = &result {
+                if recovery {
+                    tracing::debug!(error = %format!("{error:#}"),
+                        "retained paid-work recovery deferred");
+                } else {
+                    tracing::error!(error = %format!("{error:#}"),
+                        "paid gateway operation failed; durable journals retained for recovery");
+                }
+            }
+            // A disconnected request stops before proposal. After proposal, it
+            // still collects and pays until the deadline; journals retain any
+            // unfinished operation for recovery.
+            match result {
+                Ok(events) => for event in events {
+                    if !streamed || event.is_terminal() {
+                        emit(&sender, &overflow, &output_budget, Ok(event));
+                    }
+                },
+                Err(error) => { emit(&sender, &overflow, &output_budget, Err(error)); }
+            }
+        }.instrument(span));
+        tasks.retain(|task| !task.is_finished());
+        tasks.push(task);
+        Ok(response_stream(receiver, overflow_receiver))
+    }
+}
+
+impl PaidExecutionBackend for PaidGateway {
+    fn fetch_providers(&self) -> Vec<EndpointId> {
+        self.providers.iter().filter(|provider| matches!(provider.policy.execution_policy,
+            PaidWorkPolicy::Fetch { policy, .. } if policy.allowed_environment == hellas_rpc::FetchEnvironment::Http.manifest_id()))
+            .map(|provider| provider.args.provider).collect()
+    }
+
+    fn fetch(
+        &self,
+        request: PaidFetchRequest,
+    ) -> Result<hellas_gateway::PaidFetchStream, hellas_gateway::PaidGatewayError> {
+        use hellas_gateway::PaidGatewayError;
+        let provider = self.providers.iter().find(|provider| provider.args.provider == request.provider
+            && matches!(provider.policy.execution_policy, PaidWorkPolicy::Fetch { policy, .. }
+                if policy.allowed_environment == hellas_rpc::FetchEnvironment::Http.manifest_id()))
+            .ok_or(PaidGatewayError::Provider(request.provider))?;
+        let permit = self
+            .admission
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| hellas_gateway::PaidGatewayBusy)?;
+        let submit = || -> CliResult<_> {
+            let environment = hellas_rpc::FetchEnvironment::Http;
+            let input = hellas_rpc::fetch::build_input_events_with_retention(
+                &request.service,
+                &request.method,
+                &request.body,
+                environment.manifest_id(),
+                provider.assurance,
+                &self.producer_key,
+                hellas_rpc::Retention::Ephemeral,
+            )?;
+            let prepared = hellas_rpc::protocol::work_fetch::PreparedPaidFetchInputV1::new(
+                &input,
+                &environment.manifest(),
+            )?;
+            let route = Route {
+                available: provider.available(),
+                cache_affinity_tokens: 0,
+                pending: provider.pending.load(Ordering::Relaxed),
+            };
+            // Account/session selection is already final. Never substitute another
+            // provider, including on failure before acceptance.
+            self.submit::<FetchEvent>(
+                vec![(provider.clone(), route)],
+                Some(prepared.into()),
+                None,
+                None,
+                Some(permit),
+            )
+        };
+        paid_stream(submit())
+    }
+
+    fn timeout(&self) -> Duration {
+        Duration::from_secs(self.providers[0].args.timeout_secs)
+    }
+
+    fn execute(
+        &self,
+        request: PaidExecutionRequest,
+    ) -> Result<hellas_gateway::PaidOutputStream<ExecutionEvent>, hellas_gateway::PaidGatewayError>
+    {
+        paid_stream(self.execute_tokens(request))
     }
 
     fn drain(&self) -> BoxFuture<'_, ()> {
@@ -687,33 +785,32 @@ impl PaidExecutionBackend for PaidGateway {
     }
 }
 
-fn emit(
-    sender: &mpsc::Sender<BufferedEvent>,
+fn paid_stream<E: Send + 'static>(
+    stream: CliResult<BoxStream<'static, CliResult<E>>>,
+) -> Result<hellas_gateway::PaidOutputStream<E>, hellas_gateway::PaidGatewayError> {
+    use futures::StreamExt as _;
+    fn convert(error: anyhow::Error) -> hellas_gateway::PaidGatewayError {
+        match error.downcast::<hellas_gateway::PaidGatewayBusy>() {
+            Ok(busy) => busy.into(),
+            Err(error) => hellas_gateway::PaidGatewayError::Payment(error.into_boxed_dyn_error()),
+        }
+    }
+    Ok(Box::pin(
+        stream.map_err(convert)?.map(|event| event.map_err(convert)),
+    ))
+}
+
+fn emit<E: GatewayEvent>(
+    sender: &mpsc::Sender<BufferedEvent<E>>,
     overflow: &watch::Sender<bool>,
     budget: &Arc<Semaphore>,
-    event: CliResult<ExecutionEvent>,
+    event: CliResult<E>,
 ) {
     if *overflow.borrow() || sender.is_closed() {
         return;
     }
     let bytes = match &event {
-        Ok(ExecutionEvent::Chunk { tokens, .. }) => tokens.len(),
-        // Payload bytes only. `OUTPUT_EVENT_OVERHEAD` is charged once below,
-        // for the one channel message this becomes -- it is the per-message
-        // constant that makes a full channel (`OUTPUT_BUFFER_EVENTS`) exactly
-        // exhaust `OUTPUT_BUFFER_BYTES`. Charging it per *contained* event
-        // instead conflated the transcript with the queue: a completion
-        // carrying ~8000 signed events, well inside the `MAX_RECORD_BYTES`
-        // transcript cap and ordinary for `max_new_tokens` in the thousands,
-        // asked for more permits than the semaphore can ever hold. The
-        // acquire then failed, `overflow` latched, and the client was told
-        // "paid output consumer is too slow" for work it had already paid
-        // for and was reading promptly.
-        Ok(ExecutionEvent::Done(Outcome::Completed { output_events, .. })) => output_events
-            .iter()
-            .map(|event| event.payload().len())
-            .fold(0usize, usize::saturating_add),
-        Ok(ExecutionEvent::Done(_)) => MAX_RECORD_BYTES,
+        Ok(event) => event.bytes(),
         Err(error) => error.to_string().len(),
     }
     .saturating_add(OUTPUT_EVENT_OVERHEAD);
@@ -732,10 +829,10 @@ fn emit(
     }
 }
 
-fn response_stream(
-    mut receiver: mpsc::Receiver<BufferedEvent>,
+fn response_stream<E: Send + 'static>(
+    mut receiver: mpsc::Receiver<BufferedEvent<E>>,
     mut overflow: watch::Receiver<bool>,
-) -> BoxStream<'static, CliResult<ExecutionEvent>> {
+) -> BoxStream<'static, CliResult<E>> {
     Box::pin(async_stream::try_stream! {
         loop {
             let full = *overflow.borrow();
@@ -769,8 +866,8 @@ enum RequestStopped {
 
 // A route's short connection allowance is recoverable by trying another
 // provider; only the enclosing request deadline or disconnect is terminal.
-async fn connect_before_deadline<T>(
-    sender: &mpsc::Sender<BufferedEvent>,
+async fn connect_before_deadline<T, E>(
+    sender: &mpsc::Sender<BufferedEvent<E>>,
     cancel_on_disconnect: bool,
     deadline: tokio::time::Instant,
     connection_timeout: Duration,
@@ -791,8 +888,8 @@ async fn connect_before_deadline<T>(
 
 /// Cancel an unproposed HTTP operation without interrupting work whose
 /// proposal signature may already have reached a provider.
-async fn before_proposal<T, F: std::future::Future<Output = T>>(
-    sender: &mpsc::Sender<BufferedEvent>,
+async fn before_proposal<T, F: std::future::Future<Output = T>, E>(
+    sender: &mpsc::Sender<BufferedEvent<E>>,
     cancel_on_disconnect: bool,
     deadline: tokio::time::Instant,
     operation: impl FnOnce(Arc<AtomicBool>) -> F,
@@ -903,6 +1000,62 @@ fn output_events(output: PaidOutput) -> CliResult<Vec<ExecutionEvent>> {
     Ok(result)
 }
 
+impl GatewayEvent for ExecutionEvent {
+    fn prefix(event: hellas_rpc::OutputEventEnvelope) -> CliResult<Self> {
+        let delta = hellas_rpc::evaluate::decode_token_delta_payload(event.payload())?;
+        Ok(Self::Chunk {
+            position: delta.end_position()?,
+            tokens: delta.token_bytes(),
+        })
+    }
+    fn completed(output: PaidOutput) -> CliResult<Vec<Self>> {
+        output_events(output)
+    }
+    fn is_terminal(&self) -> bool {
+        matches!(self, Self::Done(_))
+    }
+    fn bytes(&self) -> usize {
+        match self {
+            Self::Chunk { tokens, .. } => tokens.len(),
+            Self::Done(Outcome::Completed { output_events, .. }) => output_events
+                .iter()
+                .map(|event| event.payload().len())
+                .fold(0usize, usize::saturating_add),
+            Self::Done(_) => MAX_RECORD_BYTES,
+        }
+    }
+}
+
+impl GatewayEvent for FetchEvent {
+    fn prefix(event: hellas_rpc::OutputEventEnvelope) -> CliResult<Self> {
+        Ok(hellas_rpc::fetch::decode_fetch_event_payload(
+            event.payload(),
+        )?)
+    }
+    fn completed(output: PaidOutput) -> CliResult<Vec<Self>> {
+        let events = hellas_rpc::protocol::work::decode_transcript(
+            &output.transcript,
+            hellas_rpc::protocol::work_fetch::MAX_FETCH_TRANSCRIPT_BYTES,
+        )?;
+        let terminal = events.last().context("paid Fetch omitted terminal")?;
+        anyhow::ensure!(
+            terminal.event().body().kind() == hellas_rpc::fetch::OUTPUT_TERMINAL_KIND,
+            "paid Fetch terminal kind"
+        );
+        let terminal =
+            hellas_rpc::fetch::decode_fetch_terminal_payload(terminal.payload())?.to_output_event();
+        tracing::info!(work_id = %hex::encode(output.work_id.as_bytes()), job_price = output.job_price,
+            credited_cumulative = output.credited_cumulative, result_bytes = output.transcript.len(), "paid Fetch result acknowledged");
+        Ok(vec![terminal])
+    }
+    fn is_terminal(&self) -> bool {
+        self.terminal().is_some()
+    }
+    fn bytes(&self) -> usize {
+        serde_json::to_vec(self).map_or(MAX_RECORD_BYTES, |bytes| bytes.len())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -910,7 +1063,7 @@ mod tests {
 
     #[tokio::test]
     async fn disconnected_queued_request_never_starts_work() {
-        let (sender, receiver) = mpsc::channel(OUTPUT_BUFFER_EVENTS);
+        let (sender, receiver) = mpsc::channel::<BufferedEvent>(OUTPUT_BUFFER_EVENTS);
         drop(receiver);
         let started = AtomicBool::new(false);
         let result = before_proposal(
@@ -928,7 +1081,7 @@ mod tests {
 
     #[tokio::test]
     async fn disconnect_after_proposal_still_finishes_payment() {
-        let (sender, receiver) = mpsc::channel(OUTPUT_BUFFER_EVENTS);
+        let (sender, receiver) = mpsc::channel::<BufferedEvent>(OUTPUT_BUFFER_EVENTS);
         let (proposal_sent, proposal_seen) = tokio::sync::oneshot::channel();
         let (payment_ready, payment_wait) = tokio::sync::oneshot::channel();
         let work = before_proposal(
@@ -954,7 +1107,7 @@ mod tests {
 
     #[tokio::test]
     async fn disconnect_during_dial_cancels_before_signature_release() {
-        let (sender, receiver) = mpsc::channel(OUTPUT_BUFFER_EVENTS);
+        let (sender, receiver) = mpsc::channel::<BufferedEvent>(OUTPUT_BUFFER_EVENTS);
         let signed = AtomicBool::new(false);
         let signed_ref = &signed;
         let (dial_started, dial_seen) = tokio::sync::oneshot::channel();
@@ -980,7 +1133,7 @@ mod tests {
 
     #[tokio::test]
     async fn connection_timeout_allows_fallback_within_the_request_deadline() {
-        let (sender, _receiver) = mpsc::channel(OUTPUT_BUFFER_EVENTS);
+        let (sender, _receiver) = mpsc::channel::<BufferedEvent>(OUTPUT_BUFFER_EVENTS);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
         let failed = connect_before_deadline(
             &sender,
@@ -1014,7 +1167,7 @@ mod tests {
 
     #[tokio::test]
     async fn previous_proposal_does_not_authorize_disconnected_next_operation() {
-        let (sender, receiver) = mpsc::channel(OUTPUT_BUFFER_EVENTS);
+        let (sender, receiver) = mpsc::channel::<BufferedEvent>(OUTPUT_BUFFER_EVENTS);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
         before_proposal(&sender, true, deadline, |proposed| async move {
             proposed.store(true, Ordering::Release);
@@ -1043,6 +1196,7 @@ mod tests {
                 .await
                 .unwrap(),
             settlement_key: Secp256k1Signer::from_secret_scalar([7; 32]).unwrap(),
+            producer_key: hellas_rpc::ProducerSigningKey::from_secret_bytes([7; 32]).unwrap(),
             admission: Arc::new(Semaphore::new(1)),
             tasks: Mutex::new(Vec::new()),
             followers: Mutex::new(Vec::new()),
@@ -1051,7 +1205,7 @@ mod tests {
         // before preparation/routing has reached task registration.
         let permit = gateway.admission.clone().try_acquire_owned().unwrap();
         gateway.drain().await;
-        let result = gateway.submit(Vec::new(), None, None, None, Some(permit));
+        let result = gateway.submit::<ExecutionEvent>(Vec::new(), None, None, None, Some(permit));
         assert!(
             result
                 .err()
@@ -1087,7 +1241,7 @@ mod tests {
     #[tokio::test]
     async fn buffered_reconnect_burst_is_delivered_and_releases_byte_budget() {
         use futures::StreamExt;
-        let (sender, receiver) = mpsc::channel(OUTPUT_BUFFER_EVENTS);
+        let (sender, receiver) = mpsc::channel::<BufferedEvent>(OUTPUT_BUFFER_EVENTS);
         let (overflow, overflow_receiver) = watch::channel(false);
         let budget = Arc::new(Semaphore::new(OUTPUT_BUFFER_BYTES));
         // Retained output can arrive in one burst before HTTP gets a poll.
@@ -1117,7 +1271,7 @@ mod tests {
     #[tokio::test]
     async fn slow_reader_gets_an_error_without_blocking_payment() {
         use futures::StreamExt;
-        let (sender, receiver) = mpsc::channel(OUTPUT_BUFFER_EVENTS);
+        let (sender, receiver) = mpsc::channel::<BufferedEvent>(OUTPUT_BUFFER_EVENTS);
         let (overflow, overflow_receiver) = watch::channel(false);
         let budget = Arc::new(Semaphore::new(OUTPUT_BUFFER_BYTES));
         // A stalled reader cannot retain more than the byte budget, and the
@@ -1150,7 +1304,7 @@ mod tests {
 
     #[tokio::test]
     async fn queue_wait_uses_the_execution_deadline() {
-        let (sender, _receiver) = mpsc::channel(OUTPUT_BUFFER_EVENTS);
+        let (sender, _receiver) = mpsc::channel::<BufferedEvent>(OUTPUT_BUFFER_EVENTS);
         let serial = AsyncMutex::new(());
         let _busy = serial.lock().await;
         let result = before_proposal(
@@ -1170,7 +1324,7 @@ mod tests {
 
     #[tokio::test]
     async fn expired_request_does_not_start_a_fallback_provider() {
-        let (sender, _receiver) = mpsc::channel(OUTPUT_BUFFER_EVENTS);
+        let (sender, _receiver) = mpsc::channel::<BufferedEvent>(OUTPUT_BUFFER_EVENTS);
         let started = AtomicBool::new(false);
         let result = before_proposal(&sender, true, tokio::time::Instant::now(), |_| async {
             started.store(true, Ordering::Relaxed);

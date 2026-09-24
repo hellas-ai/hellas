@@ -469,8 +469,9 @@ enum Commands {
         mut_arg("tokenizer", |arg| arg.required(false).requires("environment"))
     )]
     Gateway {
-        /// Serve exact HTTP routes through the generic HTTPS Fetch environment.
+        /// Serve exact HTTP routes through paid HTTPS Fetch.
         #[arg(long, value_name = "FILE", conflicts_with_all = ["responses_backend", "environment"])]
+        #[cfg_attr(feature = "node", arg(requires = "paid_work_config"))]
         http_fetch_config: Option<PathBuf>,
         /// Request/response archive directory (default: ~/.hellas/gateway-archive).
         #[arg(long, value_name = "DIRECTORY")]
@@ -1284,19 +1285,21 @@ async fn async_main() {
                     );
                     #[cfg(feature = "evaluate")]
                     anyhow::ensure!(!verify_local, "--paid-work-config cannot use --verify-local");
+                    anyhow::ensure!(http_fetch_config.is_some() || assurance == hellas_rpc::Assurance::ProducerSigned,
+                        "token-native paid work uses producer-signed assurance");
                     anyhow::ensure!(
-                        assurance == hellas_rpc::Assurance::ProducerSigned,
-                        "paid-work execution uses producer-signed assurance",
-                    );
-                    anyhow::ensure!(
-                        remote_trust.provider_genesis.is_none(),
-                        "--paid-work-config uses the pool's bond and endpoint identities; omit the courtesy --provider pin",
+                        remote_trust.provider_genesis.is_none()
+                            && remote_trust.apple_app_attest_app_id.is_none()
+                            && remote_trust.apple_app_attest_cdhashes.is_empty(),
+                        "set provider enrollment and Apple trust pins in --paid-work-config",
                     );
                     Some(
                         commands::paid_work::load_gateway_backend(
                             path,
                             secret_key.clone(),
                             identity::settlement_signer(&local_identity),
+                            local_identity.producer_key.clone(),
+                            assurance,
                         ).await?
                     )
                 } else {

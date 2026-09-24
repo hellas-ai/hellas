@@ -448,6 +448,7 @@ fn open_metadata(root: &std::path::Path) -> ChannelStore {
         root,
         channel(),
         settlement(),
+        Role::Provider,
         origin_of(&channel()),
         &Secp256k1Verifier::new(),
     )
@@ -580,6 +581,7 @@ fn journal_retention_mode_cannot_change_when_reopened() {
                 root.path(),
                 channel(),
                 settlement(),
+                Role::Provider,
                 origin_of(&channel()),
                 &Secp256k1Verifier::new(),
             )

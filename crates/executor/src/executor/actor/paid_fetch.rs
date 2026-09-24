@@ -17,6 +17,7 @@ impl Executor {
     pub(super) fn start_paid_fetch(
         &mut self,
         input: PreparedFetchInput,
+        progress: Option<hellas_work::work::PaidProgress>,
         reply: oneshot::Sender<Result<Vec<OutputEventEnvelope>, ExecutorError>>,
     ) {
         let prepared = self.prepare_paid_fetch(input);
@@ -41,27 +42,46 @@ impl Executor {
                 &key,
                 sender,
             );
-            // The shared runner emits wire events as well as its final signed
-            // transcript. Drain the bounded channel without publishing or
-            // retaining a second copy of the response.
-            let drain = async { while receiver.recv().await.is_some() {} };
-            let (result, ()) = tokio::join!(run, drain);
-            let result = result
-                .map_err(|_| {
-                    ExecutorError::Execution("paid fetch upstream or projection failed".into())
-                })
-                .and_then(|run| {
-                    hellas_rpc::protocol::work_fetch::check_fetch_output_limits(
-                        &policy,
-                        &run.output_events,
-                    )
+            let drain = async move {
+                while let Some(event) = receiver.recv().await {
+                    let event =
+                        event.map_err(|error| ExecutorError::Execution(error.to_string()))?;
+                    if let Some(hellas_rpc::pb::execute::work_event::Kind::Chunk(chunk)) =
+                        event.kind
+                        && let Some(progress) = &progress
+                    {
+                        let event = chunk.output_event.ok_or_else(|| {
+                            ExecutorError::Execution(
+                                "paid Fetch chunk omitted its signature".into(),
+                            )
+                        })?;
+                        let event = hellas_rpc::stream::output_event_from_pb(event)
+                            .map_err(|error| ExecutorError::Execution(error.to_string()))?;
+                        progress(event)
+                            .map_err(|error| ExecutorError::Execution(error.to_string()))?;
+                    }
+                }
+                Ok::<_, ExecutorError>(())
+            };
+            let (result, drained) = tokio::join!(run, drain);
+            let result = drained.and_then(|()| {
+                result
                     .map_err(|_| {
-                        ExecutorError::Execution(
-                            "paid fetch output exceeds its signed limits".into(),
+                        ExecutorError::Execution("paid fetch upstream or projection failed".into())
+                    })
+                    .and_then(|run| {
+                        hellas_rpc::protocol::work_fetch::check_fetch_output_limits(
+                            &policy,
+                            &run.output_events,
                         )
-                    })?;
-                    Ok(run.output_events)
-                });
+                        .map_err(|_| {
+                            ExecutorError::Execution(
+                                "paid fetch output exceeds its signed limits".into(),
+                            )
+                        })?;
+                        Ok(run.output_events)
+                    })
+            });
             let _ = completion
                 .send(ExecutorCompletion::PaidFetch { reply, result })
                 .await;

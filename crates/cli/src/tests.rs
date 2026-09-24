@@ -445,6 +445,25 @@ fn gateway_requires_explicit_environment_and_tokenizer() {
     assert!(Cli::try_parse_from(["hellas", "gateway", "--tokenizer", TEST_TOKENIZER]).is_err());
 }
 
+#[cfg(all(feature = "gateway", feature = "node"))]
+#[test]
+fn http_gateway_requires_a_paid_pool() {
+    assert!(
+        Cli::try_parse_from(["hellas", "gateway", "--http-fetch-config", "/http.json"]).is_err()
+    );
+    assert!(
+        Cli::try_parse_from([
+            "hellas",
+            "gateway",
+            "--http-fetch-config",
+            "/http.json",
+            "--paid-work-config",
+            "/pool.json"
+        ])
+        .is_ok()
+    );
+}
+
 #[cfg(feature = "llm")]
 #[test]
 fn package_flags_are_not_accepted_as_compatibility_aliases() {

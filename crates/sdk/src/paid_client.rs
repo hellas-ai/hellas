@@ -5,7 +5,9 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context as _, Result, bail};
+mod error;
+pub use error::PaidClientError;
+type Result<T, E = PaidClientError> = std::result::Result<T, E>;
 use hellas_chain::client::VerifiedRemoteLightClient;
 use hellas_chain::{
     ConsensusInfo, ConsensusVerifier, FinalizedWorkView as _, WorkBlocks, WorkChannelQuery,
@@ -91,10 +93,9 @@ pub async fn run_paid_work(
     transport_key: SecretKey,
     settlement_key: Secp256k1Signer,
 ) -> Result<PaidWorkResult> {
-    anyhow::ensure!(
-        !args.timeout.is_zero(),
-        "paid-work timeout must be positive"
-    );
+    if args.timeout.is_zero() {
+        return Err(PaidClientError::InvalidOptions("timeout must be positive"));
+    }
     tokio::time::timeout(args.timeout, async move {
         let PaidWorkRun {
             config,
@@ -137,7 +138,9 @@ pub async fn run_paid_work(
         let mut result = session
             .run(Some(prepared_input), false, None)
             .await?
-            .context("paid execution returned no result")?;
+            .ok_or(PaidClientError::MissingState(
+                "paid execution returned no result",
+            ))?;
         if settle {
             result.settled_provider_payout = Some(session.settle().await?);
         }
@@ -145,9 +148,7 @@ pub async fn run_paid_work(
         Ok(result)
     })
     .await
-    .map_err(|_| {
-        anyhow::anyhow!("paid-work run timed out; client journals retain its payment state")
-    })?
+    .map_err(|_| PaidClientError::Timeout { stage: "paid job" })?
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct InputIdentities {
@@ -158,20 +159,15 @@ pub struct InputIdentities {
 
 impl InputIdentities {
     pub fn from_prepared(prepared: &PreparedPaidInputV1) -> Result<Self> {
-        let parts = prepared
-            .parts()
-            .context("prepared input contains a non-canonical body")?;
+        let parts = prepared.parts()?;
         Self::from_parts(&parts)
     }
 
     fn from_parts(parts: &hellas_rpc::protocol::artifacts::PreparedPaidInputParts) -> Result<Self> {
         let allowed_environment = parts.manifest.content_id();
-        anyhow::ensure!(
-            parts.evaluate_request.execution_environment == allowed_environment,
-            "prepared input request names environment {}, but its manifest derives {}",
-            parts.evaluate_request.execution_environment,
-            allowed_environment,
-        );
+        if parts.evaluate_request.execution_environment != allowed_environment {
+            return Err(PaidClientError::InputMismatch("environment manifest"));
+        }
         Ok(Self {
             allowed_environment,
             generation_policy_digest: generation_policy_digest(
@@ -202,14 +198,14 @@ impl PaidWorkSession {
         endpoint: Endpoint,
         settlement_key: Secp256k1Signer,
     ) -> Result<Self> {
-        anyhow::ensure!(
-            args.acceptance_blocks > 0 && args.terminal_blocks > 0 && args.payment_blocks > 0,
-            "all three deadline spans must be greater than zero",
-        );
-        anyhow::ensure!(
-            !args.timeout.is_zero(),
-            "paid-work timeout must be positive"
-        );
+        if !(args.acceptance_blocks > 0 && args.terminal_blocks > 0 && args.payment_blocks > 0) {
+            return Err(PaidClientError::InvalidOptions(
+                "deadline spans must be positive",
+            ));
+        }
+        if args.timeout.is_zero() {
+            return Err(PaidClientError::InvalidOptions("timeout must be positive"));
+        }
 
         let config = &args.config;
         let policy = config.provider_policy();
@@ -219,11 +215,11 @@ impl PaidWorkSession {
         let chain = connect_chain(config, &mut next_validator).await?;
         check_genesis(config, &chain).await?;
 
-        std::fs::create_dir_all(&args.journal_root).with_context(|| {
-            format!(
-                "failed to create client journal root {}",
-                args.journal_root.display(),
-            )
+        std::fs::create_dir_all(&args.journal_root).map_err(|source| {
+            PaidClientError::JournalDirectory {
+                path: args.journal_root.clone(),
+                source,
+            }
         })?;
         let store = SetupStore::open(
             &args.journal_root,
@@ -231,13 +227,7 @@ impl PaidWorkSession {
             bond,
             Role::Client,
             &Secp256k1Verifier::new(),
-        )
-        .with_context(|| {
-            format!(
-                "failed to open client setup journal under {}",
-                args.journal_root.display(),
-            )
-        })?;
+        )?;
         let mut setup = SetupEndpoint::new(
             store,
             settlement_key.clone(),
@@ -257,17 +247,15 @@ impl PaidWorkSession {
             .state()
             .bundle()
             .cloned()
-            .context("provider returned no bond proposal")?;
-        anyhow::ensure!(
-            bundle.bond_edge() == bond,
-            "provider proposed a different bond edge"
-        );
-        anyhow::ensure!(
-            bundle.bond_terms().parties.taker() == settlement_key.party_key(),
-            "provider bond names client settlement key {}, not this identity's {}",
-            hex::encode(bundle.bond_terms().parties.taker().to_bytes()),
-            hex::encode(settlement_key.party_key().to_bytes()),
-        );
+            .ok_or(PaidClientError::MissingState(
+                "provider returned no bond proposal",
+            ))?;
+        if bundle.bond_edge() != bond {
+            return Err(PaidClientError::InputMismatch("bond edge"));
+        }
+        if bundle.bond_terms().parties.taker() != settlement_key.party_key() {
+            return Err(PaidClientError::InputMismatch("client settlement identity"));
+        }
         dialer.require_producer(hellas_rpc::PublicKey::Secp256k1(
             bundle.bond_terms().parties.maker().to_bytes(),
         ))?;
@@ -281,10 +269,11 @@ impl PaidWorkSession {
         if setup.state().revision() == Some(2) {
             exchange_setup(&dialer, &mut setup).await?;
         }
-        anyhow::ensure!(
-            setup.state().revision() == Some(3),
-            "setup did not reach its countersigned revision",
-        );
+        if setup.state().revision() != Some(3) {
+            return Err(PaidClientError::MissingState(
+                "countersigned setup revision",
+            ));
+        }
 
         let setup_service = SetupService::new(setup);
         let (mounted, descriptor) =
@@ -320,16 +309,9 @@ impl PaidWorkSession {
 
     /// Opens the client close and waits for its finalized provider payout.
     pub async fn settle(&mut self) -> Result<u64> {
-        self.client
-            .prepare_close()
-            .context("failed to prepare the client payment close")?;
+        self.client.prepare_close()?;
         loop {
-            match self
-                .client
-                .advance_close(&self.chain, &self.chain)
-                .await
-                .context("failed to advance the client payment close")?
-            {
+            match self.client.advance_close(&self.chain, &self.chain).await? {
                 CloseProgress::Settled { provider_payout } => return Ok(provider_payout),
                 CloseProgress::Submitted { outcome, .. } => {
                     tracing::info!(?outcome, "client payment close submitted")
@@ -355,13 +337,13 @@ impl PaidWorkSession {
                 }
             }
         }
-        bail!("no configured validator supplied finalized history")
+        Err(PaidClientError::NoValidators)
     }
 
     /// Runs a request and pays only after verifying its complete result.
     /// With `recover`, resume payable journaled work first and admit this as a new
     /// job; otherwise reuse a still-active job matching the input. `None` only
-    /// performs recovery. Incremental progress is currently supported for Evaluate.
+    /// performs recovery. Prefixes are authenticated before incremental delivery.
     pub async fn run(
         &mut self,
         prepared: Option<PreparedPaidWorkInput>,
@@ -399,10 +381,6 @@ impl PaidWorkSession {
                 dialer.trust.as_ref(),
                 hellas_rpc::PublicKey::Secp256k1(descriptor.channel().client_key().to_bytes()),
             )?;
-            anyhow::ensure!(
-                progress.is_none() || matches!(prepared, PreparedPaidWorkInput::Evaluate(_)),
-                "incremental result delivery is only supported for Evaluate"
-            );
         }
         let ready = caught_up_channel(descriptor, client, &*chain).await?;
         if recover && *needs_recovery {
@@ -430,8 +408,17 @@ impl PaidWorkSession {
                     payable
                 })
                 .map(|job| {
+                    // Fetch journals retain accounting only. A restart cannot
+                    // reconstruct a lost request or authorize another execution.
+                    if job.prepared_input().is_empty() {
+                        return Err(PaidClientError::MissingPayload {
+                            work_id: job.work_id(),
+                            payment_deadline: job.authorization().payment_deadline,
+                        });
+                    }
                     PreparedPaidWorkInput::decode(job.prepared_input(), MAX_RECORD_BYTES)
                         .map(|input| (job.work_id(), job.phase(), input))
+                        .map_err(PaidClientError::from)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             for (work_id, phase, pending) in pending {
@@ -457,8 +444,8 @@ impl PaidWorkSession {
                 if let Err(error) = &result
                     && ((phase == hellas_work::work_store::JobPhase::HalfSigned
                         && matches!(
-                            error.downcast_ref::<hellas_work::work::ProposeError>(),
-                            Some(hellas_work::work::ProposeError::Refused {
+                            error,
+                            PaidClientError::Propose(hellas_work::work::ProposeError::Refused {
                                 refusal,
                                 ..
                             }) if !refusal.is_retryable()
@@ -506,15 +493,14 @@ impl PaidWorkSession {
     }
 }
 
-fn permanently_refused_delivery(error: &anyhow::Error) -> bool {
+fn permanently_refused_delivery(error: &PaidClientError) -> bool {
     use hellas_client::work::CollectResultError;
     use hellas_work::work::DeliverError;
-    let delivery = error.downcast_ref::<DeliverError>().or_else(|| {
-        match error.downcast_ref::<CollectResultError>() {
-            Some(CollectResultError::Deliver(delivery)) => Some(delivery),
-            _ => None,
-        }
-    });
+    let delivery = match error {
+        PaidClientError::Deliver(error)
+        | PaidClientError::Collect(CollectResultError::Deliver(error)) => Some(error),
+        _ => None,
+    };
     matches!(delivery, Some(DeliverError::Refused { refusal, .. }) if !refusal.is_retryable())
 }
 
@@ -536,7 +522,9 @@ async fn propose_when_ready(
     let mut delay = poll.max(Duration::from_secs(1));
     loop {
         if Instant::now() >= deadline {
-            bail!("provider remained not ready for {timeout:?}");
+            return Err(PaidClientError::Timeout {
+                stage: "provider admission",
+            });
         }
         let transport = dialer.work().await?;
         // Once a proposal can leave this process, a lost acknowledgement must
@@ -609,10 +597,9 @@ async fn execute_paid_job(
         })
         .map(|job| (job.work_id(), job.phase(), *job.authorization()))
         .collect::<Vec<_>>();
-    anyhow::ensure!(
-        existing.len() <= 1,
-        "more than one active job matches this prepared input; inspect the retained channel journal",
-    );
+    if existing.len() > 1 {
+        return Err(PaidClientError::AmbiguousRecovery);
+    }
     if !existing.is_empty()
         && let Some(proposed) = proposed
     {
@@ -654,8 +641,12 @@ async fn execute_paid_job(
             .state()
             .job_by_id(work_id)
             .map(|job| job.transcript().to_vec())
-            .context("collected job disappeared from its journal")?
-    } else if let Some(progress) = progress {
+            .ok_or(PaidClientError::MissingState(
+                "collected job disappeared from its journal",
+            ))?
+    } else if progress.is_some()
+        || matches!(proposal.prepared_input, PreparedPaidWorkInput::Fetch(_))
+    {
         let mut emitted = false;
         let delivery = loop {
             let result = hellas_work::work::fetch_result_stream(
@@ -665,9 +656,12 @@ async fn execute_paid_job(
                 work_id,
                 |event| {
                     emitted = true;
-                    progress(event.clone()).map_err(|error| {
-                        hellas_rpc::protocol::work::PaidWorkError::Transcript(error.to_string())
-                    })
+                    if let Some(progress) = progress {
+                        progress(event.clone()).map_err(|error| {
+                            hellas_rpc::protocol::work::PaidWorkError::Transcript(error.to_string())
+                        })?;
+                    }
+                    Ok(())
                 },
             )
             .await;
@@ -691,25 +685,24 @@ async fn execute_paid_job(
             let job = client
                 .state()
                 .job_by_id(work_id)
-                .context("accepted job disappeared")?;
-            anyhow::ensure!(
-                client.state().cursor().0 <= job.authorization().payment_deadline,
-                "payment deadline elapsed while waiting for result stream"
-            );
+                .ok_or(PaidClientError::MissingState("accepted job disappeared"))?;
+            if client.state().cursor().0 > job.authorization().payment_deadline {
+                return Err(PaidClientError::PaymentExpired);
+            }
             tracing::debug!(%error, %work_id, "waiting for paid result stream readiness");
             tokio::time::sleep(poll.max(Duration::from_secs(1))).await;
         };
         client.catch_up(chain).await?;
-        anyhow::ensure!(
-            client.state().cursor().0
-                <= client
-                    .state()
-                    .job_by_id(work_id)
-                    .context("accepted job disappeared")?
-                    .authorization()
-                    .payment_deadline,
-            "payment deadline elapsed during delivery"
-        );
+        if client.state().cursor().0
+            > client
+                .state()
+                .job_by_id(work_id)
+                .ok_or(PaidClientError::MissingState("accepted job disappeared"))?
+                .authorization()
+                .payment_deadline
+        {
+            return Err(PaidClientError::PaymentExpired);
+        }
         delivery.transcript
     } else {
         collect_until_ready(dialer, client, ready, chain, work_id, poll).await?
@@ -733,16 +726,19 @@ fn check_request(
     caller: hellas_rpc::PublicKey,
 ) -> Result<()> {
     let assurance = prepared.assurance()?;
-    anyhow::ensure!(
-        trust
-            .as_ref()
-            .is_none_or(|trust| trust.required_assurance == assurance),
-        "paid request assurance differs from provider trust"
-    );
-    anyhow::ensure!(
-        assurance == hellas_rpc::Assurance::ProducerSigned || trust.is_some(),
-        "attested paid work requires a provider trust anchor before disclosure"
-    );
+    if trust
+        .as_ref()
+        .is_some_and(|trust| trust.required_assurance != assurance)
+    {
+        return Err(PaidClientError::InputMismatch(
+            "assurance differs from provider trust",
+        ));
+    }
+    if assurance != hellas_rpc::Assurance::ProducerSigned && trust.is_none() {
+        return Err(PaidClientError::InvalidOptions(
+            "attested work requires a provider trust anchor",
+        ));
+    }
     match (prepared, &policy.execution_policy) {
         (PreparedPaidWorkInput::Evaluate(input), PaidWorkPolicy::Evaluate(_)) => {
             check_evaluate_input(policy, input)?;
@@ -750,31 +746,29 @@ fn check_request(
         (PreparedPaidWorkInput::Fetch(input), PaidWorkPolicy::Fetch { policy, route }) => {
             let parts = input.parts()?;
             let request = hellas_rpc::fetch::verify_input_events(&parts.fetch_input_transcript)?;
-            anyhow::ensure!(
-                request.caller_key == caller,
-                "prepared fetch caller does not match the client identity"
-            );
-            anyhow::ensure!(
-                request.execution_environment == policy.allowed_environment
-                    && parts.manifest.content_id() == policy.allowed_environment,
-                "prepared fetch environment does not match work config"
-            );
-            anyhow::ensure!(
-                request.retention == hellas_rpc::Retention::Ephemeral,
-                "paid fetch requires ephemeral retention"
-            );
+            if request.caller_key != caller {
+                return Err(PaidClientError::InputMismatch("Fetch caller"));
+            }
+            if !(request.execution_environment == policy.allowed_environment
+                && parts.manifest.content_id() == policy.allowed_environment)
+            {
+                return Err(PaidClientError::InputMismatch("Fetch environment"));
+            }
+            if request.retention != hellas_rpc::Retention::Ephemeral {
+                return Err(PaidClientError::InputMismatch(
+                    "Fetch retention must be ephemeral",
+                ));
+            }
             if let hellas_rpc::protocol::work_fetch::FetchRoutePolicy::SealedRoute {
                 service,
                 method,
             } = route
+                && (&request.service != service || &request.method != method)
             {
-                anyhow::ensure!(
-                    &request.service == service && &request.method == method,
-                    "prepared fetch route does not match work config"
-                );
+                return Err(PaidClientError::InputMismatch("Fetch route"));
             }
         }
-        _ => bail!("prepared input and work config select different profiles"),
+        _ => return Err(PaidClientError::InputMismatch("work profile")),
     }
     Ok(())
 }
@@ -786,22 +780,17 @@ pub fn check_evaluate_input(
     let parts = prepared.parts()?;
     let input = InputIdentities::from_parts(&parts)?;
     let PaidWorkPolicy::Evaluate(expected) = &policy.execution_policy else {
-        bail!("work config does not select the Evaluate profile");
+        return Err(PaidClientError::InputMismatch("expected Evaluate profile"));
     };
-    anyhow::ensure!(
-        expected.allowed_environment == input.allowed_environment,
-        "work config allows environment {}, but prepared input uses {}",
-        expected.allowed_environment,
-        input.allowed_environment,
-    );
-    anyhow::ensure!(
-        hellas_rpc::protocol::work::matches_generation_policy(expected, &parts.text_policy)?,
-        "work config generation_policy_digest does not match prepared input",
-    );
-    anyhow::ensure!(
-        expected.identity_source_digest == input.identity_source_digest,
-        "work config identity_source_digest does not match prepared input",
-    );
+    if expected.allowed_environment != input.allowed_environment {
+        return Err(PaidClientError::InputMismatch("Evaluate environment"));
+    }
+    if !(hellas_rpc::protocol::work::matches_generation_policy(expected, &parts.text_policy)?) {
+        return Err(PaidClientError::InputMismatch("generation policy"));
+    }
+    if expected.identity_source_digest != input.identity_source_digest {
+        return Err(PaidClientError::InputMismatch("identity source"));
+    }
     Ok(())
 }
 
@@ -832,21 +821,17 @@ async fn drive_setup(
     poll: Duration,
 ) -> Result<(hellas_work::work_store::ChannelStore, WorkChannelDescriptor)> {
     loop {
-        let SetupAdvance { progress, mounted } = setup
-            .advance_setup(chain, chain, chain)
-            .await
-            .context("failed to advance paid-work setup")?;
+        let SetupAdvance { progress, mounted } = setup.advance_setup(chain, chain, chain).await?;
         if let Some(store) = mounted {
             let channel = store.state().channel();
-            let descriptor = policy
-                .admit(channel.payment_edge(), channel.payment_terms().clone())
-                .context("the funded channel no longer satisfies the configured policy")?;
+            let descriptor =
+                policy.admit(channel.payment_edge(), channel.payment_terms().clone())?;
             return Ok((store, descriptor));
         }
         match progress {
-            SetupProgress::Aborted(reason) => bail!("paid-work setup aborted: {reason:?}"),
-            SetupProgress::Faulted(reason) => bail!("paid-work setup faulted: {reason:?}"),
-            SetupProgress::TimeoutBond => bail!("provider bond timed out before setup completed"),
+            end @ (SetupProgress::Aborted(_)
+            | SetupProgress::Faulted(_)
+            | SetupProgress::TimeoutBond) => return Err(PaidClientError::SetupEnded(end)),
             _ => tokio::time::sleep(poll).await,
         }
     }
@@ -861,13 +846,16 @@ async fn ready_channel(
         payment_edge: descriptor.channel().payment_edge(),
         funding: Default::default(),
     };
-    let snapshot = chain
-        .work_channel_snapshot(query)
-        .await?
-        .context("no finalized channel snapshot is available")?;
+    let snapshot =
+        chain
+            .work_channel_snapshot(query)
+            .await?
+            .ok_or(PaidClientError::MissingState(
+                "no finalized channel snapshot is available",
+            ))?;
     descriptor
         .check_ready(&snapshot.observed_channel())
-        .context("the finalized channel is not ready")
+        .map_err(PaidClientError::from)
 }
 
 /// Reads the ready snapshot once the client has processed it.
@@ -923,15 +911,18 @@ pub fn deadlines(
     terminal_blocks: u64,
     payment_blocks: u64,
 ) -> Result<JobDeadlines> {
-    let acceptance = current
-        .checked_add(acceptance_blocks)
-        .context("acceptance deadline overflow")?;
+    let acceptance =
+        current
+            .checked_add(acceptance_blocks)
+            .ok_or(PaidClientError::DeadlineOverflow {
+                stage: "acceptance",
+            })?;
     let terminal = acceptance
         .checked_add(terminal_blocks)
-        .context("terminal deadline overflow")?;
+        .ok_or(PaidClientError::DeadlineOverflow { stage: "terminal" })?;
     let payment = terminal
         .checked_add(payment_blocks)
-        .context("payment deadline overflow")?;
+        .ok_or(PaidClientError::DeadlineOverflow { stage: "payment" })?;
     Ok(JobDeadlines {
         acceptance,
         terminal,
@@ -950,7 +941,7 @@ pub async fn bind_paid_endpoint(secret_key: SecretKey) -> Result<Endpoint> {
         ])
         .bind()
         .await
-        .context("failed to bind paid-work Iroh endpoint")
+        .map_err(PaidClientError::from)
 }
 
 async fn exchange_setup(dialer: &ProviderDialer, setup: &mut SetupEndpoint) -> Result<()> {
@@ -989,11 +980,10 @@ impl ProviderDialer {
         let mut expected = self
             .producer
             .lock()
-            .map_err(|_| anyhow::anyhow!("provider key lock poisoned"))?;
-        anyhow::ensure!(
-            expected.as_ref().is_none_or(|old| *old == key),
-            "authenticated provider key differs from the payment channel"
-        );
+            .map_err(|_| PaidClientError::ProviderIdentityPoisoned)?;
+        if expected.as_ref().is_some_and(|old| *old != key) {
+            return Err(PaidClientError::ProviderIdentityChanged);
+        }
         *expected = Some(key);
         Ok(())
     }
@@ -1013,7 +1003,10 @@ impl ProviderDialer {
             .endpoint
             .connect(self.provider.clone(), alpn)
             .await
-            .with_context(|| format!("failed to connect to provider {}", self.provider.id))?;
+            .map_err(|source| PaidClientError::Connect {
+                provider: self.provider.id,
+                source,
+            })?;
         let transport = IrohTransport::new(connection);
         if let Some(trust) = &self.trust {
             let producer = if alpn == hellas_rpc::services::work::Work::ALPN.as_bytes() {
@@ -1041,8 +1034,7 @@ async fn connect_chain(
         validators: config.validators.clone(),
         threshold_identity: config.chain.threshold_identity.clone(),
         network_id: config.chain.network.as_str().to_owned(),
-    })
-    .context("configured threshold identity is unusable")?;
+    })?;
     // A peer can accept connections while lacking a historical certificate.
     // Reconnects must make progress through the configured alternatives.
     let start = *next_validator;
@@ -1057,10 +1049,10 @@ async fn connect_chain(
         *next_validator = (*next_validator + 1) % config.validators.len();
         match VerifiedRemoteLightClient::connect(url.clone(), verifier.clone()).await {
             Ok(client) => return Ok(WorkBlocks::new(client)),
-            Err(error) => failures.push(format!("{url}: {error}")),
+            Err(error) => failures.push((url.clone(), error)),
         }
     }
-    bail!("no configured validator answered: {}", failures.join("; "))
+    Err(PaidClientError::ValidatorsUnavailable(failures))
 }
 
 async fn check_genesis(
@@ -1070,21 +1062,21 @@ async fn check_genesis(
     let first = chain
         .block_at(1)
         .await?
-        .context(
-            "configured validator has no finalized block 1; genesis cannot be authenticated until block 1 is finalized",
-        )?;
+        .ok_or(PaidClientError::MissingState(
+            "finalized block 1 for genesis authentication",
+        ))?;
     check_genesis_payload(
         config.chain.genesis_payload_digest.as_bytes(),
         &first.parent,
     )
 }
 pub fn check_genesis_payload(expected: &[u8; 32], actual: &[u8; 32]) -> Result<()> {
-    anyhow::ensure!(
-        actual == expected,
-        "validator genesis payload {} does not match configured {}",
-        hex::encode(actual),
-        hex::encode(expected),
-    );
+    if actual != expected {
+        return Err(PaidClientError::GenesisMismatch {
+            expected: *expected,
+            actual: *actual,
+        });
+    }
     Ok(())
 }
 
@@ -1092,11 +1084,15 @@ async fn finalized_floor(chain: &WorkBlocks<VerifiedRemoteLightClient>) -> Resul
     let height = chain
         .latest_height()
         .await?
-        .context("configured validator has finalized no blocks")?;
+        .ok_or(PaidClientError::MissingState(
+            "configured validator has finalized no blocks",
+        ))?;
     let block = chain
         .block_at(height)
         .await?
-        .context("configured validator did not return its finalized tip")?;
+        .ok_or(PaidClientError::MissingState(
+            "configured validator did not return its finalized tip",
+        ))?;
     Ok(SetupScan {
         height,
         payload: block.payload,

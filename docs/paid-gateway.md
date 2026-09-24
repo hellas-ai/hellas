@@ -1,10 +1,15 @@
-# Paid inference gateway
+# Paid gateway
 
 `hellas-cli gateway --paid-work-config /srv/hellas/pool.json` sends token-native
 inference to the configured providers and pays through their real funded work
 channels. Each provider has its own endpoint identity, bond, payment funding,
 and client journals. The gateway prefers idle matching providers and matching
 prompt prefixes, then serializes requests within each channel.
+
+With `--http-fetch-config`, the same pool carries HTTP Fetch requests. Its work
+config must select the HTTP Fetch manifest and a matching Fetch route policy;
+see [HTTP routing](http-gateway.md). The HTTP router chooses the provider and
+account, so this path never falls back to a different provider or Courtesy.
 
 The pool file uses the provider's existing `--work-config` policy and chain
 configuration:
@@ -29,6 +34,12 @@ configuration:
   "max_pending_requests": 64
 }
 ```
+
+For `--assurance apple-app-attest`, each pool entry also needs
+`provider_genesis` (hex enrollment ContentId), `apple_app_id`, and
+`apple_cd_hashes` (an array of hex 32-byte hashes). Setup and work connections
+verify this anchor before disclosing requests. Producer-signed entries may also
+pin `provider_genesis`; their funded bond fixes the settlement identity in all cases.
 
 Provision provider bonds with `hellas-cli provision`; coin
 values and policy terms must agree with the provider work config. Payment coins
@@ -61,13 +72,15 @@ providers or validators.
 
 Keep gateway and provider identities and journals across service restarts,
 including when the operating system's store is ephemeral. Startup recovers
-unfinished jobs and re-sends retained payments idempotently. Disconnecting an
+retained Evaluate jobs and re-sends payment certificates idempotently. Fetch
+journals omit bodies: a lost, unpaid Fetch payload cannot be recovered and keeps
+the channel reserved until its payment deadline. It is never submitted anew. Disconnecting an
 HTTP client cancels work that has not yet been proposed. Once a signed proposal
 may have reached a provider, collection and payment continue despite disconnects.
 The pool admits at most `max_pending_requests` queued or running requests (default
 64); additional requests receive HTTP 503 and may be retried. `timeout_secs`
 bounds queueing, recovery, provider fallback, execution and payment together,
-rather than restarting for each provider. Interactive requests skip busy provider
+rather than restarting for each provider. Token-native requests skip busy provider
 channels; each connection attempt gets at most 10 seconds before trying another
 route within that shared budget. The HTTP paid route uses this same
 configured budget; non-paid routes retain their existing 3600-second default. HTTP delivery has an

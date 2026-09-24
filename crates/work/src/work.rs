@@ -949,16 +949,27 @@ impl ProviderEndpoint {
         // ledger charges this client for over an answer it was never
         // able to take. The client's own check is the other end of the
         // same bound, against a provider that does not apply this one.
-        let frame = u64::try_from(
-            WorkDelivered {
-                result: result.encode(),
-                provider_signature: signature.as_bytes().to_vec(),
-                transcript: spool.clone(),
+        let delivered = WorkDelivered {
+            result: result.encode(),
+            provider_signature: signature.as_bytes().to_vec(),
+            transcript: spool.clone(),
+        };
+        let frame = if matches!(ready.execution_policy(), PaidWorkPolicy::Fetch { .. }) {
+            if spool.len() > hellas_rpc::protocol::work_fetch::MAX_FETCH_TRANSCRIPT_BYTES {
+                return Err(RunError::Record(PaidWorkError::OverEnvelope {
+                    field: "Fetch transcript",
+                    actual: spool.len() as u64,
+                    limit: hellas_rpc::protocol::work_fetch::MAX_FETCH_TRANSCRIPT_BYTES as u64,
+                }));
             }
-            .encoded_len(),
-        )
-        .unwrap_or(u64::MAX);
-        let frame_limit = u64::from(ready.execution_policy().max_encoded_result_frame());
+            stream::fetch_frames(&delivered, transcript).try_fold(0, |size, frame| {
+                Ok::<_, RunError>(size.max(frame?.encoded_len() as u64))
+            })?
+        } else {
+            delivered.encoded_len() as u64
+        };
+        let frame_limit = u64::from(ready.execution_policy().max_encoded_result_frame())
+            .min(hellas_wire::frame::MAX_FRAME_BYTES as u64);
         if frame > frame_limit {
             return Err(RunError::Record(PaidWorkError::OverEnvelope {
                 field: "encoded result frame",
@@ -1741,6 +1752,24 @@ pub trait PaidWorkBackend: Sync {
     {
         async { Err(BackendFault::new("paid fetch backend is unavailable")) }
     }
+
+    /// Runs once, exposing signed Fetch prefixes before terminal delivery.
+    fn fetch_stream(
+        &self,
+        input: PreparedFetchInput,
+        progress: PaidProgress,
+    ) -> impl core::future::Future<Output = Result<Vec<OutputEventEnvelope>, BackendFault>> + Send
+    {
+        async move {
+            let events = self.fetch(input).await?;
+            for event in &events {
+                if event.event().body().kind() == hellas_rpc::fetch::OUTPUT_EVENT_KIND {
+                    progress(event.clone())?;
+                }
+            }
+            Ok(events)
+        }
+    }
     /// Runs one journaled Evaluate input to its terminal.
     fn evaluate(
         &self,
@@ -1907,7 +1936,7 @@ where
         Arc::new(move |event| progress_service.publish_progress(work_id, event));
     let invoked = match admission {
         RunAdmission::Invoke(input) => backend.evaluate_stream(*input, progress).await,
-        RunAdmission::InvokeFetch(input) => backend.fetch(*input).await,
+        RunAdmission::InvokeFetch(input) => backend.fetch_stream(*input, progress).await,
         RunAdmission::Running => return Ok(RunOutcome::Running),
         RunAdmission::Indeterminate => return Ok(RunOutcome::Indeterminate),
         RunAdmission::Ready { result, signature } => {
@@ -2193,7 +2222,7 @@ pub struct WorkService {
     endpoint: Arc<Mutex<ProviderEndpoint>>,
     driving: Arc<AtomicBool>,
     changed: Arc<tokio::sync::Notify>,
-    progress: Arc<Mutex<std::collections::BTreeMap<Digest, Vec<OutputEventEnvelope>>>>,
+    progress: Arc<Mutex<std::collections::BTreeMap<Digest, stream::Progress>>>,
 }
 
 /// The authority to advance this channel's cursor, and the only thing
@@ -3192,6 +3221,16 @@ impl ClientEndpoint {
         ready: &ReadyChannel,
         delivered: &WorkDelivered,
     ) -> Result<Delivery, DeliverError> {
+        self.receive_inner(work_id, ready, delivered, false)
+    }
+
+    fn receive_inner(
+        &mut self,
+        work_id: Digest,
+        ready: &ReadyChannel,
+        delivered: &WorkDelivered,
+        streamed: bool,
+    ) -> Result<Delivery, DeliverError> {
         self.state()
             .job_by_id(work_id)
             .ok_or(DeliverError::NoSuchJob)?;
@@ -3208,7 +3247,7 @@ impl ClientEndpoint {
         // it is the transport's and is not measured here.
         let limit = u64::from(ready.execution_policy().max_encoded_result_frame());
         let actual = u64::try_from(delivered.encoded_len()).unwrap_or(u64::MAX);
-        if actual > limit {
+        if !streamed && actual > limit {
             return Err(DeliverError::OverFrame { actual, limit });
         }
 
@@ -3231,7 +3270,7 @@ impl ClientEndpoint {
                 .authorization();
             let transcript = hellas_rpc::protocol::work::decode_transcript(
                 &delivered.transcript,
-                MAX_RECORD_BYTES,
+                hellas_rpc::protocol::work_fetch::MAX_FETCH_TRANSCRIPT_BYTES,
             )?;
             let input = PreparedPaidWorkInput::decode(
                 self.state()

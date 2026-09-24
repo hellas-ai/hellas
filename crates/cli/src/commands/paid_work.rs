@@ -420,6 +420,22 @@ async fn inspect_chain(validators: &[String]) -> CliResult<()> {
     Ok(())
 }
 
+fn paid_provider_trust(
+    args: &RunArgs,
+    assurance: hellas_rpc::Assurance,
+) -> CliResult<Option<hellas_client::ProviderTrustAnchor>> {
+    if args.provider_genesis.is_some() || assurance != hellas_rpc::Assurance::ProducerSigned {
+        Ok(Some(crate::identity::provider_trust(
+            args.provider_genesis,
+            assurance,
+            args.apple_app_id.clone(),
+            args.apple_cd_hashes.clone(),
+        )?))
+    } else {
+        Ok(None)
+    }
+}
+
 async fn open_paid_channel(
     args: &RunArgs,
     endpoint: iroh::Endpoint,
@@ -430,17 +446,7 @@ async fn open_paid_channel(
         !args.payment_coins.is_empty(),
         "at least one --payment-coin is required"
     );
-    let provider_trust =
-        if args.provider_genesis.is_some() || assurance != hellas_rpc::Assurance::ProducerSigned {
-            Some(crate::identity::provider_trust(
-                args.provider_genesis,
-                assurance,
-                args.apple_app_id.clone(),
-                args.apple_cd_hashes.clone(),
-            )?)
-        } else {
-            None
-        };
+    let provider_trust = paid_provider_trust(args, assurance)?;
     OpenPaidChannel::open(
         hellas_sdk::paid_client::PaidWorkOptions {
             config: load_work_config(&args.work_config)?,
@@ -460,6 +466,7 @@ async fn open_paid_channel(
         settlement_key,
     )
     .await
+    .map_err(Into::into)
 }
 
 async fn run_one(
@@ -517,6 +524,7 @@ fn relative_deadlines(current: u64, args: &RunArgs) -> CliResult<JobDeadlines> {
         args.terminal_blocks,
         args.payment_blocks,
     )
+    .map_err(Into::into)
 }
 #[cfg(test)]
 use hellas_sdk::paid_client::check_genesis_payload;

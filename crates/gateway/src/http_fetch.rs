@@ -8,7 +8,7 @@ pub use config::HttpGatewayConfig;
 #[cfg(test)]
 mod tests;
 
-use anyhow::{Context, bail, ensure};
+use anyhow::{Context, ensure};
 use axum::{
     Router,
     body::{Body, Bytes},
@@ -17,15 +17,11 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use futures::StreamExt;
-use hellas_client::{ExecutionRoute, cache::fetch_output_stream};
-use hellas_rpc::{
-    Assurance, FetchEnvironment, ProducerSigningKey, Retention,
-    output::{AdaptorEvent, HttpResponseEvent, OutputEvent, StopReason},
-};
+use hellas_rpc::output::{AdaptorEvent, HttpResponseEvent, OutputEvent, StopReason};
 use std::sync::Arc;
 use tracing::Instrument;
 
-use super::{GatewayHandle, GatewayOptions, access, execution::CliRuntime};
+use super::{GatewayHandle, GatewayOptions, PaidExecutionBackend, PaidFetchRequest, access};
 
 #[derive(Clone)]
 pub(crate) struct BackendName(pub String);
@@ -38,11 +34,21 @@ fn attributed(mut response: Response, name: &str) -> Response {
 struct HttpState {
     service: String,
     method: String,
-    runtime: CliRuntime,
+    paid: Arc<dyn PaidExecutionBackend>,
     routing: Arc<routing::Routing>,
-    signer: Arc<ProducerSigningKey>,
-    assurance: Assurance,
     metrics: observation::Metrics,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum HttpOpenError {
+    #[error("HTTP proxy requires a paid Fetch backend")]
+    MissingPaidBackend,
+    #[error("missing authenticated HTTP response head")]
+    MissingHead,
+    #[error(transparent)]
+    Paid(#[from] super::PaidGatewayError),
+    #[error(transparent)]
+    Headers(#[from] hellas_rpc::http_fetch::HttpRequestError),
 }
 
 pub(super) async fn start(options: GatewayOptions) -> anyhow::Result<GatewayHandle> {
@@ -52,34 +58,22 @@ pub(super) async fn start(options: GatewayOptions) -> anyhow::Result<GatewayHand
         .context("missing HTTP configuration")?
         .clone();
     config.validate()?;
-    ensure!(
-        options.paid_work.is_none(),
-        "HTTP routes cannot use a token-native paid pool"
-    );
+    let paid = options
+        .paid_work
+        .clone()
+        .ok_or(HttpOpenError::MissingPaidBackend)?;
     ensure!(
         options.output_cache.policy == hellas_rpc::cache::CachePolicy::Off,
         "HTTP routes archive exchanges; inference replay must be off"
     );
     let archive_policy = super::archive::Policy::new(options.archive.clone(), false);
     archive_policy.prepare();
-    let trust = options
-        .provider_trust
-        .clone()
-        .context("HTTP Fetch requires a provider trust anchor")?;
-    let route = ExecutionRoute::remote(
-        options.node_id,
-        options.node_addrs.clone(),
-        options.retries,
-        trust.clone(),
-    );
-    let routing = Arc::new(routing::Routing::new(&config, route, trust)?);
+    let routing = Arc::new(routing::Routing::new(&config, &paid.fetch_providers())?);
     let state = Arc::new(HttpState {
         service: config.service,
         method: config.method,
-        runtime: CliRuntime::remote(options.secret_key.clone()).await?,
+        paid: paid.clone(),
         routing,
-        signer: Arc::new(options.producer_key.clone()),
-        assurance: options.assurance,
         metrics: observation::Metrics::new(),
     });
     let bearer = Arc::new(match &options.bearer_token_file {
@@ -119,7 +113,7 @@ pub(super) async fn start(options: GatewayOptions) -> anyhow::Result<GatewayHand
         bearer,
         options.wrap.as_deref(),
         &options.wrap_args,
-        None,
+        Some(paid),
     )
     .await
 }
@@ -209,11 +203,21 @@ async fn handle(State(state): State<Arc<HttpState>>, request: Request) -> Respon
             return error(StatusCode::BAD_REQUEST, "invalid HTTP request");
         }
     };
-    let result = open(&state, backend.remote.clone(), &payload)
+    let result = open(&state, backend.provider, payload)
         .instrument(observed.span.clone())
         .await;
     let (status, headers, mut events) = match result {
         Ok(value) => value,
+        Err(HttpOpenError::Paid(super::PaidGatewayError::Busy(_))) => {
+            observed.status(503);
+            return attributed(
+                error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "paid Fetch is busy; retry later",
+                ),
+                &backend.name,
+            );
+        }
         Err(_) => {
             observed.status(502);
             state.routing.transport_failed(selected.backend);
@@ -298,37 +302,15 @@ async fn handle(State(state): State<Arc<HttpState>>, request: Request) -> Respon
 
 async fn open(
     state: &HttpState,
-    remote: ExecutionRoute,
-    payload: &[u8],
-) -> anyhow::Result<(
-    u16,
-    Vec<(String, String)>,
-    hellas_adaptors::OutputEventStream,
-)> {
-    let events = hellas_rpc::fetch::build_input_events_with_retention(
-        &state.service,
-        &state.method,
-        payload,
-        FetchEnvironment::Http.manifest_id(),
-        state.assurance,
-        state.signer.as_ref(),
-        Retention::Ephemeral,
-    )?;
-    let request = hellas_rpc::pb::fetch::FetchRequest {
-        input: events
-            .iter()
-            .map(hellas_rpc::stream::input_event_to_pb)
-            .collect(),
-    };
-    let mut stream = fetch_output_stream(
-        state.runtime.clone(),
-        request,
-        Some(remote),
-        state.signer.clone(),
-        None,
-    )
-    .await?
-    .events;
+    provider: iroh::EndpointId,
+    payload: Vec<u8>,
+) -> Result<(u16, Vec<(String, String)>, super::PaidFetchStream), HttpOpenError> {
+    let mut stream = state.paid.fetch(PaidFetchRequest {
+        provider,
+        service: state.service.clone(),
+        method: state.method.clone(),
+        body: payload,
+    })?;
     match stream.next().await.transpose()? {
         Some(OutputEvent::Adaptor(AdaptorEvent::Http(HttpResponseEvent::Head {
             status,
@@ -337,7 +319,7 @@ async fn open(
             hellas_rpc::http_fetch::check_headers(&headers, false)?;
             Ok((status, headers, stream))
         }
-        _ => bail!("missing authenticated HTTP response head"),
+        _ => Err(HttpOpenError::MissingHead),
     }
 }
 

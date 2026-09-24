@@ -11,8 +11,8 @@ use k256::elliptic_curve::rand_core::{OsRng, RngCore};
 
 const INPUT_CANONICALIZATION: &[u8] = b"hellas.fetch.input.v3";
 const OUTPUT_CANONICALIZATION: &[u8] = b"hellas.fetch.output.v2";
-const OUTPUT_EVENT_KIND: &str = "response.event";
-const OUTPUT_TERMINAL_KIND: &str = "response.terminal";
+pub const OUTPUT_EVENT_KIND: &str = "response.event";
+pub const OUTPUT_TERMINAL_KIND: &str = "response.terminal";
 const INPUT_EVENT_KINDS: [&str; 8] = [
     "assurance",
     "execution.environment",

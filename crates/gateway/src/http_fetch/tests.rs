@@ -6,6 +6,98 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+#[tokio::test]
+async fn http_uses_the_paid_backend_and_waits_for_its_payment_completion() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Paid {
+        requests: AtomicUsize,
+        ack: Arc<tokio::sync::Notify>,
+        provider: iroh::EndpointId,
+        busy: bool,
+    }
+    impl PaidExecutionBackend for Paid {
+        fn execute(
+            &self,
+            _: crate::PaidExecutionRequest,
+        ) -> Result<crate::PaidOutputStream<crate::ExecutionEvent>, crate::PaidGatewayError>
+        {
+            unreachable!("HTTP must use Fetch")
+        }
+        fn fetch(
+            &self,
+            request: PaidFetchRequest,
+        ) -> Result<crate::PaidFetchStream, crate::PaidGatewayError> {
+            self.requests.fetch_add(1, Ordering::Relaxed);
+            assert_eq!(request.provider, self.provider);
+            assert_eq!((&*request.service, &*request.method), ("http", "request"));
+            let http = hellas_rpc::http_fetch::HttpFetchRequest::decode(&request.body).unwrap();
+            assert_eq!(http.url, "https://example.com/v1/responses?x=%2F&x=y");
+            assert_eq!(http.body().unwrap(), b"opaque request");
+            assert_eq!(http.credential.as_deref(), Some("account"));
+            if self.busy {
+                return Err(crate::PaidGatewayBusy.into());
+            }
+            let ack = self.ack.clone();
+            Ok(Box::pin(async_stream::try_stream! {
+                yield OutputEvent::Adaptor(AdaptorEvent::Http(HttpResponseEvent::Head {
+                    status: 200, headers: vec![("content-type".into(), "application/octet-stream".into())],
+                }));
+                yield OutputEvent::Adaptor(AdaptorEvent::Http(HttpResponseEvent::Body { base64: "AP8K".into() }));
+                ack.notified().await;
+                yield OutputEvent::Finished { stop_reason: StopReason::EndOfText, usage: None };
+            }))
+        }
+        fn drain(&self) -> futures::future::BoxFuture<'_, ()> {
+            Box::pin(async {})
+        }
+    }
+    for busy in [false, true] {
+        let provider = iroh::SecretKey::from_bytes(&[12; 32]).public();
+        let paid = Arc::new(Paid {
+            requests: AtomicUsize::new(0),
+            ack: Arc::default(),
+            provider,
+            busy,
+        });
+        let config: HttpGatewayConfig = serde_json::from_value(serde_json::json!({
+            "service":"http", "method":"request", "routes":[{
+                "path":"/v1/responses", "method":"POST", "url":"https://example.com/v1/responses", "credential":"account"
+            }]
+        })).unwrap();
+        let state = Arc::new(HttpState {
+            service: config.service.clone(),
+            method: config.method.clone(),
+            routing: Arc::new(routing::Routing::new(&config, &[provider]).unwrap()),
+            paid: paid.clone(),
+            metrics: observation::Metrics::new(),
+        });
+        let response = handle(
+            State(state),
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses?x=%2F&x=y")
+                .body(Body::from("opaque request"))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(paid.requests.load(Ordering::Relaxed), 1);
+        if busy {
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        } else {
+            assert_eq!(response.status(), StatusCode::OK);
+            let mut body = response.into_body().into_data_stream();
+            assert_eq!(body.next().await.unwrap().unwrap(), &b"\x00\xff\n"[..]);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), body.next())
+                    .await
+                    .is_err()
+            );
+            paid.ack.notify_one();
+            assert!(body.next().await.is_none());
+        }
+    }
+}
+
 #[test]
 fn forward_only_protocol_headers_and_keep_retry_and_quota_metadata() {
     let route = HttpRoute {

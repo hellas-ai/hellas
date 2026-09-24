@@ -49,6 +49,7 @@ paid-work = [
 ]
 
 [dependencies]
+thiserror.workspace = true
 async-stream = { workspace = true, optional = true }
 hellas-chain = { workspace = true, default-features = false, optional = true }
 hellas-kernel = { workspace = true, default-features = false, optional = true }

@@ -53,11 +53,10 @@ fn genesis_check_compares_the_configured_digest_with_block_ones_parent() {
     assert!(check_genesis_payload(&configured, &configured).is_ok());
 
     let observed_parent = [0x32; 32];
-    let error = check_genesis_payload(&configured, &observed_parent)
-        .unwrap_err()
-        .to_string();
-    assert!(error.contains(&hex::encode(observed_parent)), "{error}");
-    assert!(error.contains(&hex::encode(configured)), "{error}");
+    let error = check_genesis_payload(&configured, &observed_parent).unwrap_err();
+    assert!(matches!(error,
+        hellas_sdk::paid_client::PaidClientError::GenesisMismatch { expected, actual }
+            if expected == configured && actual == observed_parent));
 }
 
 #[test]

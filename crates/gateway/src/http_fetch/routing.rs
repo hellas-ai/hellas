@@ -2,9 +2,7 @@ use super::{
     affinity::{Hints, family},
     config::{HttpBackend, HttpGatewayConfig, HttpRoute},
 };
-use anyhow::ensure;
 use axum::http::{HeaderMap, StatusCode};
-use hellas_client::{ExecutionRoute, ProviderTrustAnchor};
 use hellas_rpc::ContentId;
 use std::{
     collections::HashMap,
@@ -66,11 +64,28 @@ impl Account {
 const MAX_BINDINGS: usize = 16_384;
 const SESSION_IDLE: Duration = Duration::from_secs(24 * 60 * 60);
 
+#[derive(Debug, thiserror::Error)]
+pub(super) enum RoutingError {
+    #[error("HTTP backend {backend} must name a provider from the paid pool")]
+    AmbiguousProvider { backend: String },
+    #[error(
+        "HTTP backend {backend} names provider {provider} without a paid HTTP Fetch configuration"
+    )]
+    UnfundedProvider {
+        backend: String,
+        provider: iroh::EndpointId,
+    },
+    #[error("HTTP backend {backend} must use one account or origin")]
+    MixedAccounts { backend: String },
+    #[error("HTTP backend {backend} shares an account with a different concurrency limit")]
+    InconsistentCapacity { backend: String },
+}
+
 pub(super) struct Backend {
     pub name: String,
     pub models: Vec<String>,
     pub routes: Vec<HttpRoute>,
-    pub remote: ExecutionRoute,
+    pub provider: iroh::EndpointId,
     account: Arc<Account>,
 }
 
@@ -208,9 +223,8 @@ impl Unavailable {
 impl Routing {
     pub fn new(
         config: &HttpGatewayConfig,
-        remote: ExecutionRoute,
-        trust: ProviderTrustAnchor,
-    ) -> anyhow::Result<Self> {
+        providers: &[iroh::EndpointId],
+    ) -> Result<Self, RoutingError> {
         let routes = config.routes.iter().enumerate().map(|(index, route)| {
             (
                 format!("route-{index}"),
@@ -226,47 +240,36 @@ impl Routing {
         let mut backends = Vec::new();
         let mut accounts = HashMap::new();
         for (name, mut backend) in routes.chain(config.backends.clone()) {
-            let remote = match backend.provider {
-                Some(provider) => ExecutionRoute::remote(
-                    Some(provider.node_id),
-                    provider.node_addrs,
-                    0,
-                    ProviderTrustAnchor {
-                        expected_genesis: provider.genesis,
-                        ..trust.clone()
-                    },
-                ),
-                None => remote.clone(),
+            let provider = match backend.provider {
+                Some(provider) => provider,
+                None if providers.len() == 1 => providers[0],
+                None => return Err(RoutingError::AmbiguousProvider { backend: name }),
             };
+            if !providers.contains(&provider) {
+                return Err(RoutingError::UnfundedProvider {
+                    backend: name,
+                    provider,
+                });
+            }
             for route in &mut backend.routes {
                 route.credential = backend.credential.clone();
             }
             let account = backend.routes[0].account();
-            ensure!(
-                backend.routes.iter().all(|r| r.account() == account),
-                "a backend must use one account or origin"
-            );
-            // Enrollment pins share admission across direct and discovered routes.
-            let genesis = match &remote {
-                ExecutionRoute::RemoteDirect(target) => target.provider_trust.expected_genesis,
-                ExecutionRoute::RemoteDiscovery { provider_trust, .. } => {
-                    provider_trust.expected_genesis
-                }
-                ExecutionRoute::Local => unreachable!(),
-            };
+            if backend.routes.iter().any(|r| r.account() != account) {
+                return Err(RoutingError::MixedAccounts { backend: name });
+            }
             let capacity = backend.max_in_flight.unwrap_or(config.max_in_flight);
             let account = accounts
-                .entry((genesis, account))
+                .entry((provider, account))
                 .or_insert_with(|| Arc::new(Account::new(capacity)));
-            ensure!(
-                account.capacity == capacity,
-                "shared accounts require the same concurrency limit"
-            );
+            if account.capacity != capacity {
+                return Err(RoutingError::InconsistentCapacity { backend: name });
+            }
             backends.push(Backend {
                 name,
                 models: backend.models,
                 routes: backend.routes,
-                remote,
+                provider,
                 account: account.clone(),
             });
         }

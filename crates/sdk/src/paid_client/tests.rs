@@ -185,9 +185,9 @@ fn recovery_skips_only_permanent_delivery_refusals() {
     assert!(!permanently_refused_delivery(
         &DeliverError::Malformed("result").into()
     ));
-    assert!(!permanently_refused_delivery(&anyhow::anyhow!(
-        "connection lost"
-    )));
+    assert!(!permanently_refused_delivery(&PaidClientError::Timeout {
+        stage: "connection"
+    }));
 }
 
 fn fetch_request(
@@ -253,7 +253,7 @@ fn fetch_preflight_requires_matching_trust_caller_and_ephemeral_retention() {
     use hellas_rpc::Retention;
     let (policy, prepared, caller) = fetch_request(Assurance::AppleAppAttest, Retention::Ephemeral);
     let error = check_request(&policy, &prepared, None, caller).unwrap_err();
-    assert!(error.to_string().contains("trust anchor before disclosure"));
+    assert!(matches!(error, PaidClientError::InvalidOptions(_)));
     let mut trust = hellas_client::ProviderTrustAnchor {
         expected_genesis: hellas_rpc::ContentId::from_bytes([8; 32]),
         required_assurance: Assurance::ProducerSigned,
@@ -275,7 +275,7 @@ fn fetch_preflight_requires_matching_trust_caller_and_ephemeral_retention() {
         check_request(&policy, &prepared, Some(&trust), other)
             .unwrap_err()
             .to_string()
-            .contains("caller does not match")
+            .contains("Fetch caller")
     );
     let (policy, prepared, caller) = fetch_request(Assurance::ProducerSigned, Retention::Ephemeral);
     check_request(&policy, &prepared, None, caller).unwrap();
@@ -285,6 +285,6 @@ fn fetch_preflight_requires_matching_trust_caller_and_ephemeral_retention() {
         check_request(&policy, &retained, None, caller)
             .unwrap_err()
             .to_string()
-            .contains("ephemeral retention")
+            .contains("ephemeral")
     );
 }

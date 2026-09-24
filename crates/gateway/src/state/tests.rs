@@ -355,8 +355,7 @@ async fn paid_generation_records_after_payment_and_replays_without_a_backend() {
         fn execute(
             &self,
             request: PaidExecutionRequest,
-        ) -> anyhow::Result<futures::stream::BoxStream<'static, anyhow::Result<ExecutionEvent>>>
-        {
+        ) -> Result<crate::PaidOutputStream<ExecutionEvent>, crate::PaidGatewayError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             assert_eq!(request.input_ids, vec![0]);
             assert_eq!(request.max_new_tokens, 1);
@@ -479,9 +478,8 @@ async fn paid_capacity_is_a_retryable_error_and_uses_the_pool_deadline() {
         fn execute(
             &self,
             _: crate::PaidExecutionRequest,
-        ) -> anyhow::Result<
-            futures::stream::BoxStream<'static, anyhow::Result<crate::ExecutionEvent>>,
-        > {
+        ) -> Result<crate::PaidOutputStream<crate::ExecutionEvent>, crate::PaidGatewayError>
+        {
             Err(crate::PaidGatewayBusy.into())
         }
         fn drain(&self) -> futures::future::BoxFuture<'_, ()> {

@@ -176,6 +176,21 @@ impl PaidWorkBackend for ExecutorHandle {
     ) -> Result<Vec<OutputEventEnvelope>, BackendFault> {
         self.send_owed(|reply| ExecutorOwedRequest::RunPaidFetch {
             input: Box::new(input),
+            progress: None,
+            reply,
+        })
+        .await
+        .map_err(|error| BackendFault::new(error.to_string()))
+    }
+
+    async fn fetch_stream(
+        &self,
+        input: hellas_work::work::PreparedFetchInput,
+        progress: PaidProgress,
+    ) -> Result<Vec<OutputEventEnvelope>, BackendFault> {
+        self.send_owed(|reply| ExecutorOwedRequest::RunPaidFetch {
+            input: Box::new(input),
+            progress: Some(progress),
             reply,
         })
         .await

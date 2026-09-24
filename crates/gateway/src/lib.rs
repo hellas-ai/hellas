@@ -55,19 +55,46 @@ pub struct PaidExecutionRequest {
     pub stop_token_ids: Vec<u32>,
 }
 
-/// Paid admission capacity is exhausted or the backend is shutting down.
-#[derive(Debug)]
-pub struct PaidGatewayBusy;
-
-impl std::fmt::Display for PaidGatewayBusy {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("paid gateway is busy; retry later")
-    }
+/// A Fetch pinned to one funded provider by the HTTP account router.
+pub struct PaidFetchRequest {
+    pub provider: EndpointId,
+    pub service: String,
+    pub method: String,
+    pub body: Vec<u8>,
 }
 
-impl std::error::Error for PaidGatewayBusy {}
+#[derive(Debug, thiserror::Error)]
+pub enum PaidGatewayError {
+    #[error("paid backend does not support HTTP Fetch")]
+    Unsupported,
+    #[error("provider {0} has no paid HTTP Fetch configuration")]
+    Provider(EndpointId),
+    #[error(transparent)]
+    Busy(#[from] PaidGatewayBusy),
+    #[error("paid work failed: {0}")]
+    Payment(#[source] Box<dyn std::error::Error + Send + Sync>),
+}
+
+pub type PaidOutputStream<E> = futures::stream::BoxStream<'static, Result<E, PaidGatewayError>>;
+pub type PaidFetchStream = PaidOutputStream<hellas_rpc::output::OutputEvent>;
+
+/// Paid admission capacity is exhausted or the backend is shutting down.
+#[derive(Debug, thiserror::Error)]
+#[error("paid gateway is busy; retry later")]
+pub struct PaidGatewayBusy;
 
 pub trait PaidExecutionBackend: Send + Sync {
+    /// Providers with a funded-pool configuration for the HTTP Fetch manifest.
+    fn fetch_providers(&self) -> Vec<EndpointId> {
+        Vec::new()
+    }
+
+    /// Authenticated prefixes, followed by completion only after payment ACK.
+    /// After proposal the backend owns collection and payment across disconnects.
+    fn fetch(&self, _request: PaidFetchRequest) -> Result<PaidFetchStream, PaidGatewayError> {
+        Err(PaidGatewayError::Unsupported)
+    }
+
     /// End-to-end budget, including queued time, advertised to HTTP consumers.
     fn timeout(&self) -> std::time::Duration {
         std::time::Duration::from_secs(300)
@@ -81,7 +108,7 @@ pub trait PaidExecutionBackend: Send + Sync {
     fn execute(
         &self,
         request: PaidExecutionRequest,
-    ) -> anyhow::Result<futures::stream::BoxStream<'static, anyhow::Result<ExecutionEvent>>>;
+    ) -> Result<PaidOutputStream<ExecutionEvent>, PaidGatewayError>;
 
     /// Finish outstanding payment operations during graceful shutdown.
     fn drain(&self) -> futures::future::BoxFuture<'_, ()>;
@@ -574,8 +601,7 @@ mod paid_shutdown_tests {
         fn execute(
             &self,
             _: PaidExecutionRequest,
-        ) -> anyhow::Result<futures::stream::BoxStream<'static, anyhow::Result<ExecutionEvent>>>
-        {
+        ) -> Result<PaidOutputStream<ExecutionEvent>, PaidGatewayError> {
             unreachable!("shutdown does not submit new work")
         }
         fn drain(&self) -> futures::future::BoxFuture<'_, ()> {

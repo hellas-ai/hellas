@@ -31,6 +31,10 @@ const PREPARED_FETCH_INPUT: &[u8] = b"hellas.work.prepared-fetch-input.v1";
 /// The normalized fetch answer authenticated by the signed transcript.
 const FETCH_OUTPUT: &[u8] = b"hellas.work.fetch-output.v1";
 
+/// RAM bound for a complete Fetch transcript, including signed envelopes.
+/// Wire frames remain independently bounded; Fetch journals omit this payload.
+pub const MAX_FETCH_TRANSCRIPT_BYTES: usize = 32 * 1024 * 1024;
+
 // ── The route policy ──────────────────────────────────────────────────
 
 /// Schema tag of the sealed-route body.

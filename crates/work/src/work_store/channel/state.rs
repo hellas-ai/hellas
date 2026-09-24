@@ -20,9 +20,15 @@ impl ChannelState {
                 Err(ChannelStateError::Malformed)
             };
         }
-        let events = decode_transcript(transcript, MAX_RECORD_BYTES)?;
         let input = PreparedPaidWorkInput::decode(&job.prepared_input, MAX_RECORD_BYTES)
             .map_err(PaidWorkError::from)?;
+        let budget = match &input {
+            PreparedPaidWorkInput::Fetch(_) => {
+                hellas_rpc::protocol::work_fetch::MAX_FETCH_TRANSCRIPT_BYTES
+            }
+            PreparedPaidWorkInput::Evaluate(_) => MAX_RECORD_BYTES,
+        };
+        let events = decode_transcript(transcript, budget)?;
         if input.terminal_result(&self.channel, &job.authorization, &events)? != *result {
             return Err(ChannelStateError::WrongChannel {
                 field: "result against its transcript",

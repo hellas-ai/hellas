@@ -1,10 +1,10 @@
 # HTTP APIs through Fetch
 
-`gateway --http-fetch-config FILE` exposes exact HTTP routes over the generic
-HTTPS Fetch environment. Request and response bodies keep the upstream format,
-including SSE, tool calls and non-2xx errors. It requires a provider trust anchor
-and a provider route with a caller grant; it does not use the token-native paid
-pool. See [provider account and egress configuration](../crates/providers/HTTPS.md).
+`gateway --http-fetch-config FILE --paid-work-config POOL` exposes exact HTTP
+routes over paid HTTPS Fetch. Request and response bodies keep the upstream
+format, including SSE, tool calls and non-2xx errors. Every request uses a funded
+channel from the [paid pool](paid-gateway.md); missing payment configuration is a
+startup error. See [provider account and egress configuration](../crates/providers/HTTPS.md).
 
 The gateway's standard API paths can serve several accounts or provider nodes.
 It reads the requested model, finds backends configured to serve that model and
@@ -48,12 +48,27 @@ optional backend `max_in_flight` overrides the global per-account limit. Routes
 sharing a credential alias on the same provider share capacity and cooldown;
 duplicating that alias does not multiply its allowance.
 
-Backends use the CLI's provider target by default. An optional backend `provider`
-selects another node with `node_id`, `node_addrs` (an array of `IP:port` strings)
-and `genesis` (the hex enrollment ContentId). The gateway's assurance and Apple
-trust policy still apply; each node is verified against its configured enrollment
-pin. Each provider must authorize this gateway's caller key and expose the
-configured Fetch service/method.
+A backend's optional `provider` is an endpoint ID from the paid pool. It may be
+omitted only when the pool contains exactly one provider for the HTTP Fetch
+manifest. Addresses, funding, journals and enrollment/Apple trust pins belong in
+the pool. The provider must mount a paid Fetch channel for the gateway's transport
+and settlement identities and expose the configured service/method.
+
+The gateway bearer authorizes access to the gateway's payment identity. The
+router selects an account, then the paid client signs the exact Fetch request
+and proposes it on that provider's channel. The provider checks the funded edge,
+credit, deadlines, signature and Fetch policy before durably accepting work;
+only that accepted job can invoke the upstream. The credential's origin, path
+and method restrictions remain enforced by the provider. Courtesy caller grants
+do not authorize this HTTP path.
+
+Signed response prefixes stream as they arrive. Successful HTTP completion
+follows verification of the complete result and the provider's durable payment
+acknowledgement. Each accepted valid terminal costs the channel's agreed fixed
+price, including HTTP error statuses. Requests are not retried on another
+provider after account selection. The pool serializes work within each provider
+channel; concurrent requests assigned to that provider queue within its deadline, including requests for different
+accounts on that provider. Separate providers have independent channels.
 
 Paths and methods match exactly; query parameters retain their order, repeats
 and percent encoding. Ordinary client headers, including idempotency keys and
@@ -75,8 +90,7 @@ provider. Private destinations also require its explicit egress opt-in.
 ```sh
 hellas-cli --identity ./gateway.identity gateway \
   --http-fetch-config ./http-gateway.json \
-  --provider "$PROVIDER_ENROLLMENT" \
-  --node-id "$PROVIDER_NODE_ID" --node-addr "$PROVIDER_ADDRESS" \
+  --paid-work-config /srv/hellas/paid-pool.json \
   --port 8080 --bearer-token-file ./gateway.bearer
 ```
 
@@ -130,6 +144,14 @@ an eligible backend; account-specific quota endpoints are not aggregated.
 
 ## Archives and ZDR
 
+Fetch payment journals on both endpoints retain hashes, signatures and accounting
+records, with payloads held in memory. After a restart they can re-send an existing
+payment certificate, but cannot reconstruct or replay a lost request/response.
+Unpaid work with a lost payload keeps its channel reserved until its payment
+deadline; it is never re-executed from a new request. Existing payload-bearing
+Fetch journals are refused instead of silently changing their retention policy.
+The HTTP archive below is the gateway's separate payload persistence policy.
+
 CLI gateways archive authenticated requests and responses by default under
 `~/.hellas/gateway-archive`, or `--archive-dir DIRECTORY`. This applies to the
 existing inference routes as well as HTTP Fetch. Each exchange has owner-only
@@ -171,12 +193,21 @@ its host-managed storage policy.
 
 HTTP input is limited to 1,523,712 bytes, reserving envelope space inside the
 2 MiB signed Fetch request. Responses are limited to 8 MiB and the Fetch stream
-to 32,768 events and 16 MiB of signed payload. The provider has a 20 minute total
-HTTP deadline and a 90 second response idle timeout. Exceeding a stream limit
-closes it as incomplete. A slow response consumer applies bounded backpressure,
-with a 90 second drain timeout. QUIC cancellation stops an idle upstream without
-waiting for its next byte. Individual upstream deliveries are forwarded promptly,
-split at 16 KiB; the provider does not wait for a full buffer.
+to 32,768 events and 16 MiB of signed payload. The paid policy can impose tighter
+limits; its transcript spool is capped at 32 MiB. Configure the spool and output
+budgets for the encoded HTTP response (including base64 and signed envelopes).
+Each wire frame remains bounded independently: Fetch completion authenticates
+all preceding prefixes without packing the full response back into one frame.
+
+The provider has a 20 minute total HTTP deadline and a 90 second response idle
+timeout. The pool's `timeout_secs` and on-chain block deadlines must also fit the
+expected execution time. Exceeding a stream limit closes it as incomplete.
+Individual upstream deliveries are forwarded promptly, split at 16 KiB.
+Before proposal, a disconnect cancels the request. After proposal, collection and
+payment continue independently of the HTTP reader. The bounded HTTP output queue
+reports an error to a stalled reader without stopping settlement; graceful
+shutdown drains accepted operations. Unfinished operations retain their accounting
+evidence for recovery, subject to Fetch's in-memory payload lifetime.
 
 No generation is automatically retried upstream. Upstream status and end-to-end
 response headers reach the client, including Location, ETag, `Retry-After`,

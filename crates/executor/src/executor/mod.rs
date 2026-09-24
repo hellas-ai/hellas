@@ -109,6 +109,7 @@ pub(crate) enum ExecutorRequest {
 pub(crate) enum ExecutorOwedRequest {
     RunPaidFetch {
         input: Box<hellas_work::work::PreparedFetchInput>,
+        progress: Option<hellas_work::work::PaidProgress>,
         reply: oneshot::Sender<Result<Vec<hellas_rpc::OutputEventEnvelope>, ExecutorError>>,
     },
     /// Start one already-authorized paid job.

@@ -490,8 +490,12 @@ impl Executor {
 
     async fn handle_owed_request(&mut self, request: ExecutorOwedRequest) {
         match request {
-            ExecutorOwedRequest::RunPaidFetch { input, reply } => {
-                self.start_paid_fetch(*input, reply);
+            ExecutorOwedRequest::RunPaidFetch {
+                input,
+                progress,
+                reply,
+            } => {
+                self.start_paid_fetch(*input, progress, reply);
             }
             ExecutorOwedRequest::RunPaidEvaluate { input, reply, span } => {
                 #[cfg(feature = "evaluate")]
