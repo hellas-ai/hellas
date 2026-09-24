@@ -1,0 +1,20 @@
+# Backport https://github.com/n0-computer/noq/pull/775
+# Reviewed at c239d5fbcb8647e721c538480b891f9d5f4e094c.
+# musl cmsghdr alignment is weaker than its timestamp payload.
+--- a/src/cmsg/mod.rs
++++ b/src/cmsg/mod.rs
+@@ -44 +43,0 @@
+-    /// - If `T` has stricter alignment requirements than `M::ControlMessage`
+@@ -46 +44,0 @@
+-        assert!(align_of::<T>() <= align_of::<M::ControlMessage>());
+@@ -57 +55,2 @@
+-            ptr::write(cmsg.cmsg_data() as *const T as *mut T, value);
++            // Unaligned: `align_of::<M::ControlMessage>()` is 4 on musl.
++            ptr::write_unaligned(cmsg.cmsg_data() as *const T as *mut T, value);
+@@ -81 +79,0 @@
+-    assert!(align_of::<T>() <= align_of::<C>());
+@@ -83 +81,3 @@
+-    unsafe { ptr::read(cmsg.cmsg_data() as *const T) }
++    // Unaligned: `align_of::<libc::cmsghdr>()` is 4 on musl, but payloads such as
++    // `libc::timespec` (SCM_TIMESTAMPNS) need 8.
++    unsafe { ptr::read_unaligned(cmsg.cmsg_data() as *const T) }
