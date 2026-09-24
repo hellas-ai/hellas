@@ -2908,6 +2908,7 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-opentelemetry",
+ "zstd",
 ]
 
 [[package]]

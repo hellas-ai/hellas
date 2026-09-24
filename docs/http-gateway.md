@@ -6,39 +6,65 @@ including SSE, tool calls and non-2xx errors. It requires a provider trust ancho
 and a provider route with a caller grant; it does not use the token-native paid
 pool. See [provider account and egress configuration](../crates/providers/HTTPS.md).
 
-Example gateway configuration for Kimi Code:
+The gateway's standard API paths can serve several accounts or provider nodes.
+It reads the requested model, finds backends configured to serve that model and
+route, and keeps an existing session on its assigned backend. Model names and
+request/response bodies are forwarded unchanged.
+
+Example with two Kimi accounts behind one endpoint:
 
 ```json
 {
   "service": "https",
   "method": "request",
   "max_in_flight": 2,
-  "routes": [{
-    "path": "/v1/chat/completions",
-    "method": "POST",
-    "url": "https://api.kimi.com/coding/v1/chat/completions",
-    "credential": "kimi"
-  }]
+  "backends": {
+    "kimi-a": {
+      "models": ["k3"],
+      "credential": "kimi-a",
+      "routes": [{
+        "path": "/v1/chat/completions",
+        "method": "POST",
+        "url": "https://api.kimi.com/coding/v1/chat/completions"
+      }]
+    },
+    "kimi-b": {
+      "models": ["k3"],
+      "credential": "kimi-b",
+      "routes": [{
+        "path": "/v1/chat/completions",
+        "method": "POST",
+        "url": "https://api.kimi.com/coding/v1/chat/completions"
+      }]
+    }
+  }
 }
 ```
 
-The service and method must match the provider's configured Fetch route. The
-credential alias belongs to that provider. Each alias shares a concurrency
-limit and cooldown across its HTTP routes. Paths and methods match exactly;
-query parameters retain their order, repeats and percent encoding. Ordinary
-client headers, including idempotency keys and vendor extensions, pass through.
-Connection-specific headers, credentials, cookies and gateway control headers
-are removed; the caller's gateway bearer never becomes an upstream credential. Optional
-`headers` holds operator-supplied `[name, value]` pairs, with lowercase names.
-Configured values override the corresponding client header. The former
-`forward_headers` whitelist has been removed.
+Both accounts use the same client base URL, such as `http://127.0.0.1:8080/v1`.
+Add backends with their exact supported models and API routes for other accounts.
+The configured service and method must match the provider's Fetch route. An
+optional backend `max_in_flight` overrides the global per-account limit. Routes
+sharing a credential alias on the same provider share capacity and cooldown;
+duplicating that alias does not multiply its allowance.
 
-Several accounts at one upstream can use distinct aliases and gateway paths,
-such as `/kimi-a/v1/chat/completions` and `/kimi-b/v1/chat/completions`, both
-mapped to the upstream's chat endpoint. The client's base URL selects the route.
-Each alias has independent admission and cooldown; routes sharing an alias
-share those limits. This gateway targets one Hellas provider node. It does not
-automatically select accounts, fail over between them or route using quota data.
+Backends use the CLI's provider target by default. An optional backend `provider`
+selects another node with `node_id`, `node_addrs` (an array of `IP:port` strings)
+and `genesis` (the hex enrollment ContentId). The gateway's assurance and Apple
+trust policy still apply; each node is verified against its configured enrollment
+pin. Each provider must authorize this gateway's caller key and expose the
+configured Fetch service/method.
+
+Paths and methods match exactly; query parameters retain their order, repeats
+and percent encoding. Ordinary client headers, including idempotency keys and
+vendor extensions, pass through. Connection-specific headers, credentials,
+cookies and gateway control headers are removed; the caller's gateway bearer
+never becomes an upstream credential. Optional route `headers` holds operator
+`[name, value]` pairs, with lowercase names. Configured values override the
+corresponding client header. Account credentials belong on the backend.
+
+The earlier top-level `routes` configuration remains supported for opaque HTTP
+passthrough, without model selection. Use either `backends` or `routes`, not both.
 
 Omit `credential` for an unauthenticated upstream. Such routes share admission
 by origin. Optional `tls` uses the [Fetch TLS vocabulary](../crates/providers/HTTPS.md)
@@ -64,13 +90,50 @@ the wrapper supplies `KIMI_MODEL_BASE_URL` and `KIMI_MODEL_API_KEY`. A separatel
 launched client can use the same variables and the private gateway bearer file.
 Choose a context size that fits the byte limits below.
 
+## Model selection and session affinity
+
+New sessions use an eligible account outside cooldown with available capacity.
+The gateway chooses the least occupied account, rotating ties. Existing sessions
+stay pinned even when that account becomes busy or rate-limited: they receive a
+retry response; new sessions can use another account. A request is sent once.
+Neither a transport failure nor an upstream error causes automatic replay on a
+different backend. A transport failure briefly excludes that backend from new
+sessions. Quota polling remains monitoring; selection uses configured model
+capabilities, current capacity and observed response cooldowns, not estimates
+from token usage or external quota scrapes.
+
+Affinity recognizes `x-hellas-session-id`, Claude Code's
+`x-claude-code-session-id`, Codex's `session-id`/`thread-id`, Claude's session ID
+in `metadata.user_id`, and `prompt_cache_key` (used by Kimi Code), in that order.
+An explicit session survives changes of client connection. Without one, requests
+for the same model/API on the same accepted HTTP connection stay together.
+Different explicit sessions may share that connection. Affinity is scoped by
+model and API family; Responses compaction and Messages token counting share
+their generation API's family.
+
+Responses API IDs observed in JSON or SSE bind `previous_response_id` and
+`conversation` continuations to the original backend, including continuations
+that omit the model. Unknown, expired or
+conflicting state returns 409 before contacting an upstream. Session identifiers
+are held as salted hashes in a bounded memory table (16,384 entries, 24 hours
+idle). Unexpired entries are not evicted to admit new sessions; a full table
+returns 503. Restarting the gateway clears affinity. Server-side continuations
+whose mapping was lost require full context rather than being sent to a guessed
+account. Full-history requests can establish new affinity after a restart.
+
+Model routing reads JSON, gzip or zstd requests with an 8 MiB decoded limit and
+an 8 MiB zstd window limit. It forwards the original encoded bytes. An unsupported
+model receives 404; malformed or unsupported routing input receives 400. These
+checks precede upstream execution. Model-less, empty-body auxiliary requests use
+an eligible backend; account-specific quota endpoints are not aggregated.
+
 ## Archives and ZDR
 
 CLI gateways archive authenticated requests and responses by default under
 `~/.hellas/gateway-archive`, or `--archive-dir DIRECTORY`. This applies to the
 existing inference routes as well as HTTP Fetch. Each exchange has owner-only
 `request.bin`, `response.bin` and `metadata.json` files. Metadata records status,
-size, content type/encoding, elapsed time, completion and trace context; it excludes authentication
+size, content type/encoding, elapsed time, completion, selected backend and trace context; it excludes authentication
 headers. `x-hellas-request-id` identifies the exchange. Failed or cancelled
 streams retain an incomplete archive. Archiving is best-effort: failures during
 setup, request/response writes or finalization are reported without replacing
@@ -126,6 +189,9 @@ concurrency returns 503 with `Retry-After: 1`.
 
 With `otel`, traces connect HTTP ingress, Fetch RPCs, credential refresh and
 upstream HTTP. Span attributes exclude request/response bodies and credentials.
+`hellas.backend` and `gen_ai.request.model` identify configured backend/model
+choices in request metrics and traces; `hellas.routing.affinity` records the
+selection reason in traces. Raw session IDs are not exported.
 Outbound trace context replaces the caller's propagation headers instead of
 appending duplicates. Upstream response `traceparent` and `tracestate` are
 preserved; `x-hellas-trace-id` identifies the gateway's trace independently.

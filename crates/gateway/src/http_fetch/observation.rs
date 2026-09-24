@@ -55,6 +55,10 @@ pub(super) struct Observation {
     usage: Usage,
     compressed_usage: Option<flate2::write::GzDecoder<Usage>>,
     #[cfg(feature = "otel")]
+    backend: Option<String>,
+    #[cfg(feature = "otel")]
+    model: Option<String>,
+    #[cfg(feature = "otel")]
     route: String,
     #[cfg(feature = "otel")]
     metrics: Metrics,
@@ -67,6 +71,9 @@ impl Observation {
         Self {
             span: hellas_rpc::request_span!(target: "hellas_request", "http.fetch",
                 otel.kind = "client", http.route = route,
+                hellas.backend = tracing::field::Empty,
+                gen_ai.request.model = tracing::field::Empty,
+                hellas.routing.affinity = tracing::field::Empty,
                 http.response.status_code = tracing::field::Empty,
                 http.response.body.size = tracing::field::Empty,
                 gen_ai.usage.input_tokens = tracing::field::Empty,
@@ -84,6 +91,10 @@ impl Observation {
             usage: Usage::default(),
             compressed_usage: None,
             #[cfg(feature = "otel")]
+            backend: None,
+            #[cfg(feature = "otel")]
+            model: None,
+            #[cfg(feature = "otel")]
             route: route.into(),
             #[cfg(feature = "otel")]
             metrics: Metrics {
@@ -92,6 +103,26 @@ impl Observation {
                 first_byte: metrics.first_byte.clone(),
                 tokens: metrics.tokens.clone(),
             },
+        }
+    }
+    pub(super) fn backend(&mut self, name: &str, affinity: &'static str) {
+        self.span.record("hellas.backend", name);
+        self.span.record("hellas.routing.affinity", affinity);
+        #[cfg(feature = "otel")]
+        {
+            self.backend = Some(name.into());
+        }
+    }
+    pub(super) fn bind_response(&mut self, binding: Option<super::routing::ResponseBinding>) {
+        self.usage.binding = binding;
+    }
+    pub(super) fn model(&mut self, model: Option<&str>) {
+        if let Some(model) = model {
+            self.span.record("gen_ai.request.model", model);
+            #[cfg(feature = "otel")]
+            {
+                self.model = Some(model.into());
+            }
         }
     }
     pub(super) fn status(&mut self, status: u16) {
@@ -179,11 +210,17 @@ impl Drop for Observation {
         #[cfg(feature = "otel")]
         {
             use opentelemetry::KeyValue;
-            let labels = [
+            let mut labels = vec![
                 KeyValue::new("http.route", self.route.clone()),
                 KeyValue::new("http.response.status_code", i64::from(self.status)),
                 KeyValue::new("hellas.response.complete", self.complete),
             ];
+            if let Some(backend) = &self.backend {
+                labels.push(KeyValue::new("hellas.backend", backend.clone()));
+            }
+            if let Some(model) = &self.model {
+                labels.push(KeyValue::new("gen_ai.request.model", model.clone()));
+            }
             self.metrics.requests.add(1, &labels);
             self.metrics
                 .duration
@@ -210,6 +247,7 @@ impl Drop for Observation {
 /// Observe standard usage fields without reserializing or delaying the wire body.
 #[derive(Default)]
 struct Usage {
+    binding: Option<super::routing::ResponseBinding>,
     sse: bool,
     pending: Vec<u8>,
     input: Option<u64>,
@@ -271,6 +309,9 @@ impl Usage {
         let Ok(value) = serde_json::from_slice::<Value>(bytes) else {
             return;
         };
+        if let Some(binding) = &self.binding {
+            binding.observe(&value);
+        }
         let Some(usage) = value
             .get("usage")
             .or_else(|| value.pointer("/message/usage"))

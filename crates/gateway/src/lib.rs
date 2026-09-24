@@ -89,6 +89,19 @@ pub trait PaidExecutionBackend: Send + Sync {
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
+#[derive(Clone, Copy)]
+struct ConnectionId(u64);
+
+impl
+    axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, tokio::net::TcpListener>>
+    for ConnectionId
+{
+    fn connect_info(_: axum::serve::IncomingStream<'_, tokio::net::TcpListener>) -> Self {
+        static NEXT_CONNECTION: AtomicU64 = AtomicU64::new(1);
+        Self(NEXT_CONNECTION.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
 pub struct GatewayOptions {
     pub archive: ArchiveOptions,
     pub http_fetch: Option<HttpGatewayConfig>,
@@ -370,7 +383,11 @@ async fn launch_gateway(
     let shutdown = Arc::new(tokio::sync::Notify::new());
     let server_shutdown = shutdown.clone();
     let server = std::future::IntoFuture::into_future(
-        axum::serve(listener, app).with_graceful_shutdown(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<ConnectionId>(),
+        )
+        .with_graceful_shutdown(async move {
             server_shutdown.notified().await;
         }),
     );

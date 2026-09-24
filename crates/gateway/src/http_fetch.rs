@@ -1,5 +1,11 @@
 //! HTTP bytes over authenticated Fetch, without translating vendor schemas.
+mod affinity;
+mod config;
 mod observation;
+mod routing;
+
+pub use config::HttpGatewayConfig;
+use config::HttpRoute;
 #[cfg(test)]
 mod tests;
 
@@ -30,164 +36,21 @@ use tracing::Instrument;
 
 use super::{GatewayHandle, GatewayOptions, access, execution::CliRuntime};
 
-#[derive(Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct HttpGatewayConfig {
-    pub service: String,
-    pub method: String,
-    pub routes: Vec<HttpRoute>,
-    #[serde(default = "default_concurrency")]
-    pub max_in_flight: usize,
-}
+#[derive(Clone)]
+pub(crate) struct BackendName(pub String);
 
-fn default_concurrency() -> usize {
-    4
-}
-
-#[derive(Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct HttpRoute {
-    pub path: String,
-    pub method: String,
-    pub url: String,
-    pub credential: Option<String>,
-    #[serde(default = "public_tls")]
-    pub tls: HttpTls,
-    #[serde(default)]
-    pub headers: Vec<(String, String)>,
-}
-
-fn public_tls() -> HttpTls {
-    HttpTls {
-        roots: HttpTrustRoots::WebPki,
-        spki_sha256: vec![],
-    }
-}
-
-struct Account {
-    slots: Arc<Semaphore>,
-    backoff: Mutex<Option<(Instant, u16)>>,
-}
-
-impl Account {
-    fn cooldown(&self) -> Option<(u16, Duration)> {
-        let (until, status) = (*self.backoff.lock().unwrap())?;
-        let delay = until.saturating_duration_since(Instant::now());
-        (!delay.is_zero()).then_some((status, delay))
-    }
-
-    fn observe(&self, status: u16, headers: &HeaderMap) {
-        if status == 429 || (status >= 500 && headers.contains_key("retry-after")) {
-            let delay = retry_delay(headers).min(Duration::from_secs(u32::MAX as u64));
-            let until = Instant::now() + delay;
-            let mut backoff = self.backoff.lock().unwrap();
-            if backoff.is_none_or(|(previous, _)| until > previous) {
-                *backoff = Some((until, status));
-            }
-        }
-    }
+fn attributed(mut response: Response, name: &str) -> Response {
+    response.extensions_mut().insert(BackendName(name.into()));
+    response
 }
 
 struct HttpState {
     config: HttpGatewayConfig,
     runtime: CliRuntime,
-    route: ExecutionRoute,
+    routing: Arc<routing::Routing>,
     signer: Arc<ProducerSigningKey>,
     assurance: Assurance,
-    accounts: BTreeMap<String, Arc<Account>>,
     metrics: observation::Metrics,
-}
-
-impl HttpGatewayConfig {
-    fn validate(&self) -> anyhow::Result<()> {
-        ensure!(
-            !self.routes.is_empty(),
-            "HTTP gateway needs at least one route"
-        );
-        ensure!(
-            self.max_in_flight > 0 && self.max_in_flight <= 1024,
-            "invalid HTTP concurrency limit"
-        );
-        let mut paths = std::collections::BTreeSet::new();
-        for route in &self.routes {
-            ensure!(
-                route.path.starts_with('/') && !route.path.contains(['?', '#', '{', '}']),
-                "HTTP routes must be exact paths"
-            );
-            ensure!(
-                paths.insert((&route.path, &route.method)),
-                "duplicate HTTP route"
-            );
-            ensure!(
-                route.headers.iter().all(|(name, _)| !matches!(
-                    name.as_str(),
-                    "authorization" | "x-api-key" | "cookie"
-                )),
-                "use a provider credential alias for authentication"
-            );
-            route.request(Bytes::new(), &HeaderMap::new())?.validate()?;
-        }
-        Ok(())
-    }
-}
-
-impl HttpRoute {
-    fn account(&self) -> String {
-        match &self.credential {
-            Some(alias) => format!("credential:{alias}"),
-            None => format!(
-                "origin:{}",
-                self.url
-                    .parse::<reqwest::Url>()
-                    .expect("validated URL")
-                    .origin()
-                    .ascii_serialization()
-            ),
-        }
-    }
-
-    fn request(&self, body: Bytes, incoming: &HeaderMap) -> anyhow::Result<HttpFetchRequest> {
-        let mut headers = self.headers.clone();
-        let connection = connection_headers(
-            incoming
-                .iter()
-                .map(|(name, value)| (name.as_str(), value.to_str().unwrap_or_default())),
-        );
-        for (name, value) in incoming {
-            let name = name.as_str();
-            if !hop_header(name)
-                && !connection.iter().any(|token| token == name)
-                && !matches!(
-                    name,
-                    "host"
-                        | "content-length"
-                        | "authorization"
-                        | "x-api-key"
-                        | "api-key"
-                        | "x-goog-api-key"
-                        | "cookie"
-                        | "forwarded"
-                )
-                && !name.starts_with("x-hellas-")
-                && !name.starts_with("x-forwarded-")
-                && !self
-                    .headers
-                    .iter()
-                    .any(|(configured, _)| configured == name)
-            {
-                headers.push((name.into(), value.to_str()?.into()));
-            }
-        }
-        Ok(HttpFetchRequest {
-            url: self.url.clone(),
-            method: self.method.clone(),
-            headers,
-            body_base64: STANDARD.encode(body),
-            tls: self.tls.clone(),
-            credential: self.credential.clone(),
-            max_response_bytes: hellas_rpc::http_fetch::MAX_HTTP_RESPONSE_BYTES,
-        })
-    }
 }
 
 pub(super) async fn start(options: GatewayOptions) -> anyhow::Result<GatewayHandle> {
@@ -207,35 +70,23 @@ pub(super) async fn start(options: GatewayOptions) -> anyhow::Result<GatewayHand
     );
     let archive_policy = super::archive::Policy::new(options.archive.clone(), false);
     archive_policy.prepare();
+    let trust = options
+        .provider_trust
+        .clone()
+        .context("HTTP Fetch requires a provider trust anchor")?;
     let route = ExecutionRoute::remote(
         options.node_id,
         options.node_addrs.clone(),
         options.retries,
-        options
-            .provider_trust
-            .clone()
-            .context("HTTP Fetch requires a provider trust anchor")?,
+        trust.clone(),
     );
-    let accounts = config
-        .routes
-        .iter()
-        .map(|route| {
-            (
-                route.account(),
-                Arc::new(Account {
-                    slots: Arc::new(Semaphore::new(config.max_in_flight)),
-                    backoff: Mutex::new(None),
-                }),
-            )
-        })
-        .collect();
+    let routing = Arc::new(routing::Routing::new(&config, route, trust)?);
     let state = Arc::new(HttpState {
         config,
         runtime: CliRuntime::remote(options.secret_key.clone()).await?,
-        route,
+        routing,
         signer: Arc::new(options.producer_key.clone()),
         assurance: options.assurance,
-        accounts,
         metrics: observation::Metrics::new(),
     });
     let bearer = Arc::new(match &options.bearer_token_file {
@@ -244,10 +95,10 @@ pub(super) async fn start(options: GatewayOptions) -> anyhow::Result<GatewayHand
     });
     let mut app = Router::new();
     let paths: std::collections::BTreeSet<_> = state
-        .config
-        .routes
+        .routing
+        .backends
         .iter()
-        .map(|route| route.path.as_str())
+        .flat_map(|backend| backend.routes.iter().map(|route| route.path.as_str()))
         .collect();
     for path in paths {
         app = app.route(path, axum::routing::any(handle));
@@ -288,36 +139,8 @@ fn error(status: StatusCode, message: &'static str) -> Response {
         .into_response()
 }
 
-fn limited(status: StatusCode, seconds: u64) -> Response {
-    let mut response = error(
-        status,
-        "provider temporarily unavailable; retry after the indicated delay",
-    );
-    response.headers_mut().insert(
-        "retry-after",
-        HeaderValue::from_str(&seconds.max(1).to_string()).unwrap(),
-    );
-    response
-}
-
 async fn handle(State(state): State<Arc<HttpState>>, request: Request) -> Response {
-    let Some(route) = state.config.routes.iter().find(|route| {
-        route.path == request.uri().path() && route.method == request.method().as_str()
-    }) else {
-        return error(StatusCode::NOT_FOUND, "no configured HTTP route");
-    };
-    let mut observed = observation::Observation::new(&state.metrics, &route.path);
-    let account = state.accounts[&route.account()].clone();
-    if let Some((status, delay)) = account.cooldown() {
-        observed.status(status);
-        observed.complete();
-        return limited(StatusCode::from_u16(status).unwrap(), delay.as_secs() + 1);
-    }
-    let Ok(permit) = account.slots.clone().try_acquire_owned() else {
-        observed.status(503);
-        observed.complete();
-        return limited(StatusCode::SERVICE_UNAVAILABLE, 1);
-    };
+    let mut observed = observation::Observation::new(&state.metrics, request.uri().path());
     let (parts, body) = request.into_parts();
     // Reserve space for URL, headers and JSON around the base64 body.
     let body_limit = (hellas_rpc::fetch::MAX_FETCH_REQUEST_BODY_BYTES - 64 * 1024) / 4 * 3;
@@ -332,6 +155,45 @@ async fn handle(State(state): State<Arc<HttpState>>, request: Request) -> Respon
             );
         }
     };
+    let connection = parts
+        .extensions
+        .get::<axum::extract::ConnectInfo<super::ConnectionId>>()
+        .map(|c| c.0.0);
+    let selected = match state.routing.select(
+        parts.uri.path(),
+        parts.method.as_str(),
+        &parts.headers,
+        &body,
+        connection,
+    ) {
+        Ok(selected) => selected,
+        Err(failure) => {
+            observed.status(failure.status.as_u16());
+            observed.complete();
+            let mut response = error(failure.status, failure.message);
+            if let Some(seconds) = failure.retry {
+                response
+                    .headers_mut()
+                    .insert("retry-after", seconds.to_string().parse().unwrap());
+            }
+            if let Some(backend) = failure.backend {
+                let name = &state.routing.backends[backend].name;
+                observed.backend(name, "session");
+                return attributed(response, name);
+            }
+            return response;
+        }
+    };
+    let backend = &state.routing.backends[selected.backend];
+    let route = &backend.routes[selected.endpoint];
+    let permit = selected.permit;
+    observed.backend(&backend.name, selected.affinity);
+    observed.model(selected.model.as_deref());
+    observed.bind_response(
+        state
+            .routing
+            .response_binding(selected.backend, &route.path),
+    );
     let mut upstream = match route.request(body, &parts.headers) {
         Ok(upstream) => upstream,
         Err(_) => {
@@ -354,14 +216,18 @@ async fn handle(State(state): State<Arc<HttpState>>, request: Request) -> Respon
             return error(StatusCode::BAD_REQUEST, "invalid HTTP request");
         }
     };
-    let result = open(&state, &payload)
+    let result = open(&state, backend.remote.clone(), &payload)
         .instrument(observed.span.clone())
         .await;
     let (status, headers, mut events) = match result {
         Ok(value) => value,
         Err(_) => {
             observed.status(502);
-            return error(StatusCode::BAD_GATEWAY, "authenticated Fetch failed");
+            state.routing.transport_failed(selected.backend);
+            return attributed(
+                error(StatusCode::BAD_GATEWAY, "authenticated Fetch failed"),
+                &backend.name,
+            );
         }
     };
     observed.status(status);
@@ -385,7 +251,7 @@ async fn handle(State(state): State<Arc<HttpState>>, request: Request) -> Respon
             .get("content-encoding")
             .and_then(|value| value.to_str().ok()),
     );
-    account.observe(status, &headers);
+    state.routing.observe(selected.backend, status, &headers);
     if parts.method == axum::http::Method::HEAD || status == 204 || status == 304 {
         let end = events.next().instrument(observed.span.clone()).await;
         if !matches!(
@@ -402,7 +268,7 @@ async fn handle(State(state): State<Arc<HttpState>>, request: Request) -> Respon
         let mut response = Response::new(Body::empty());
         *response.status_mut() = StatusCode::from_u16(status).unwrap();
         *response.headers_mut() = std::mem::take(&mut headers);
-        return response;
+        return attributed(response, &backend.name);
     }
     let stream = async_stream::try_stream! {
         let _permit = permit;
@@ -434,11 +300,12 @@ async fn handle(State(state): State<Arc<HttpState>>, request: Request) -> Respon
     let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = StatusCode::from_u16(status).unwrap();
     *response.headers_mut() = headers;
-    response
+    attributed(response, &backend.name)
 }
 
 async fn open(
     state: &HttpState,
+    remote: ExecutionRoute,
     payload: &[u8],
 ) -> anyhow::Result<(
     u16,
@@ -463,7 +330,7 @@ async fn open(
     let mut stream = fetch_output_stream(
         state.runtime.clone(),
         request,
-        Some(state.route.clone()),
+        Some(remote),
         state.signer.clone(),
         None,
     )

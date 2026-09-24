@@ -1,3 +1,5 @@
+use super::config::public_tls;
+use super::routing::Account;
 use super::*;
 
 #[test]
@@ -107,6 +109,7 @@ fn credentials_and_hop_headers_cannot_be_configured_as_static_headers() {
             service: "http".into(),
             method: "request".into(),
             max_in_flight: 2,
+            backends: BTreeMap::new(),
             routes: vec![HttpRoute {
                 path: "/v1/messages".into(),
                 method: "POST".into(),

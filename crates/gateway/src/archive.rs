@@ -143,6 +143,12 @@ async fn archive_response(
             .headers_mut()
             .insert("x-hellas-request-id", id.parse().unwrap());
     }
+    if let Some(backend) = response
+        .extensions()
+        .get::<super::http_fetch::BackendName>()
+    {
+        archive.metadata["backend"] = json!(backend.0);
+    }
     if let Err(error) = archive
         .head(response.status().as_u16(), response.headers())
         .await
