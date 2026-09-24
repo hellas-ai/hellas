@@ -8,8 +8,8 @@ mod responses_fetch;
 mod responses_projector;
 mod stream;
 pub use http::{
-    HttpCredential, HttpCredentialConfig, HttpEgressPolicy, HttpFetchAdaptorFactory,
-    HttpFetchProvider, HttpProviderConfig,
+    CredentialRefresh, HttpCredential, HttpCredentialConfig, HttpEgressPolicy,
+    HttpFetchAdaptorFactory, HttpFetchProvider, HttpProviderConfig, HttpSecret,
 };
 
 pub use openai::OpenAiResponsesFetchProvider;

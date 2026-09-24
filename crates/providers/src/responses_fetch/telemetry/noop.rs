@@ -2,11 +2,14 @@ use futures::Stream;
 use hellas_executor::FetchProviderError;
 use tracing::Span;
 
-pub(super) struct Request {
+pub(crate) struct Request {
     pub span: Span,
 }
 impl Request {
     pub fn new(_: &reqwest::Url) -> Self {
+        Self { span: Span::none() }
+    }
+    pub fn for_method(_: &reqwest::Url, _: &str) -> Self {
         Self { span: Span::none() }
     }
     pub fn propagate(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {

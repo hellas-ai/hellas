@@ -25,9 +25,7 @@ pub(crate) const MAX_FETCH_IN_MEMORY_TICKETS: usize = MAX_OUTSTANDING_QUOTES;
 pub(crate) const MAX_FETCH_IN_MEMORY_INPUT_BYTES: usize = 32 * 1024 * 1024;
 const FETCH_CAPACITY_LOCK_WAIT: Duration = Duration::from_millis(100);
 const MAX_FETCH_CAPACITY_METADATA_BYTES: usize = 32;
-/// Persisted DAG-CBOR contains at most eight input and 4,096 output envelopes.
-/// One KiB of structural/signature headroom per envelope is deliberately
-/// generous beside the protocol's bounded three MiB of signed payload.
+/// Payload budgets plus one KiB of encoding/signature headroom per envelope.
 const MAX_FETCH_TRANSCRIPT_BYTES: usize = MAX_FETCH_REQUEST_BODY_BYTES
     + MAX_FETCH_OUTPUT_PAYLOAD_BYTES
     + (MAX_FETCH_OUTPUT_EVENTS + 8) * 1024;

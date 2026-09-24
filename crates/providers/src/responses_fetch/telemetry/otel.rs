@@ -4,16 +4,19 @@ use hellas_executor::FetchProviderError;
 use hellas_wire::metadata::Metadata;
 use tracing::{Instrument, Span};
 
-pub(super) struct Request {
+pub(crate) struct Request {
     pub span: Span,
     complete: bool,
 }
 impl Request {
     pub fn new(endpoint: &reqwest::Url) -> Self {
+        Self::for_method(endpoint, "POST")
+    }
+    pub fn for_method(endpoint: &reqwest::Url, method: &str) -> Self {
         Self {
             complete: false,
-            span: hellas_rpc::request_span!(target: "hellas_request", "POST",
-                otel.kind = "client", http.request.method = "POST",
+            span: hellas_rpc::request_span!(target: "hellas_request", "http.upstream",
+                otel.kind = "client", otel.name = method, http.request.method = method,
                 server.address = endpoint.host_str().unwrap_or(""),
                 server.port = endpoint.port_or_known_default().map(i64::from),
                 url.scheme = endpoint.scheme(),

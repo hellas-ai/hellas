@@ -26,6 +26,8 @@ evaluate = [
 anyhow = { workspace = true }
 async-stream = { workspace = true }
 axum = { workspace = true }
+base64.workspace = true
+httpdate = "1"
 futures = { workspace = true }
 hellas-adaptors.workspace = true
 hellas-client = { workspace = true, features = ["iroh", "evaluate"] }

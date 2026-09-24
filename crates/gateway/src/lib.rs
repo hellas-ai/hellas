@@ -3,9 +3,11 @@ extern crate tracing;
 
 mod access;
 mod anthropic;
+mod archive;
 mod backend;
 mod dispatch;
 mod fetch_backend;
+mod http_fetch;
 mod metrics;
 mod openai;
 mod plain;
@@ -36,10 +38,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use self::state::GatewayState;
 
+pub use archive::ArchiveOptions;
 pub use execution::{
     CausalLmExecutionEnvironment, CliRuntime, ExecutionEvent, ExecutionRequest,
     ExecutionRequestOptions, ExecutionStrategy, Outcome, PreparedExecution, StopReason,
 };
+pub use http_fetch::HttpGatewayConfig;
 
 const DEFAULT_HTTP_PORT: u16 = 8080;
 
@@ -86,6 +90,8 @@ pub trait PaidExecutionBackend: Send + Sync {
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 pub struct GatewayOptions {
+    pub archive: ArchiveOptions,
+    pub http_fetch: Option<HttpGatewayConfig>,
     pub output_cache: cache::CacheOptions,
     pub paid_work: Option<Arc<dyn PaidExecutionBackend>>,
     /// Load or create a stable bearer credential in a private file.
@@ -229,6 +235,9 @@ pub async fn start(options: GatewayOptions) -> anyhow::Result<GatewayHandle> {
 }
 
 async fn start_gateway(options: GatewayOptions) -> anyhow::Result<GatewayHandle> {
+    if options.http_fetch.is_some() {
+        return http_fetch::start(options).await;
+    }
     let listener = bind_gateway(
         &options.host,
         options.port,
@@ -236,6 +245,9 @@ async fn start_gateway(options: GatewayOptions) -> anyhow::Result<GatewayHandle>
     )
     .await?;
     let state = Arc::new(GatewayState::from_options(&options).await?);
+    if !options.archive.zdr {
+        archive::prepare(&options.archive.directory)?;
+    }
 
     // Every route below reaches an executor, so every route below is
     // behind this run's credential. The layer goes on last, which in axum
@@ -251,7 +263,14 @@ async fn start_gateway(options: GatewayOptions) -> anyhow::Result<GatewayHandle>
         .route("/v1/messages", post(anthropic::handle))
         .route("/v1/completions", post(plain::handle))
         .with_state(state.clone())
-        .layer(provenance_layer::ProvenanceLayer);
+        .layer(provenance_layer::ProvenanceLayer)
+        .layer(axum::middleware::from_fn_with_state(
+            archive::Policy {
+                options: options.archive.clone(),
+                cache_enabled: options.output_cache.policy != cache::CachePolicy::Off,
+            },
+            archive::record,
+        ));
     #[cfg(feature = "otel")]
     let app = app.layer(axum::middleware::from_fn(
         hellas_rpc::telemetry::http::trace_request,

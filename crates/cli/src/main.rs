@@ -463,12 +463,21 @@ enum Commands {
     #[command(
         mut_arg("environment", |arg| arg
             .required(false)
-            .required_unless_present("responses_backend")
+            .required_unless_present_any(["responses_backend", "http_fetch_config"])
             .required_if_eq("responses_backend", "hellas")
             .requires("tokenizer")),
         mut_arg("tokenizer", |arg| arg.required(false).requires("environment"))
     )]
     Gateway {
+        /// Serve exact HTTP routes through the generic HTTPS Fetch environment.
+        #[arg(long, value_name = "FILE", conflicts_with_all = ["responses_backend", "environment"])]
+        http_fetch_config: Option<PathBuf>,
+        /// Request/response archive directory (default: ~/.hellas/gateway-archive).
+        #[arg(long, value_name = "DIRECTORY")]
+        archive_dir: Option<PathBuf>,
+        /// Disable payload archives and require ZDR for every HTTP request.
+        #[arg(long)]
+        zdr: bool,
         /// Pay a pool of providers using durable on-chain funded work channels.
         #[cfg(feature = "node")]
         #[arg(long = "paid-work-config", value_name = "FILE")]
@@ -1160,6 +1169,9 @@ async fn async_main() {
         Commands::OutputCache(..) => unreachable!("cache commands handled before identity load"),
         #[cfg(feature = "gateway")]
         Commands::Gateway {
+            http_fetch_config,
+            archive_dir,
+            zdr,
             #[cfg(feature = "node")]
             paid_work_config,
             bearer_token_file,
@@ -1307,6 +1319,15 @@ async fn async_main() {
                     )?
                 };
                 hellas_gateway::run(hellas_gateway::GatewayOptions {
+                    archive: hellas_gateway::ArchiveOptions {
+                        directory: archive_dir.map(Ok).unwrap_or_else(identity::default_gateway_archive_path)?,
+                        zdr,
+                    },
+                    http_fetch: http_fetch_config
+                        .map(|path| -> anyhow::Result<_> {
+                            Ok(serde_json::from_slice(&std::fs::read(path)?)?)
+                        })
+                        .transpose()?,
                     output_cache: cache_options,
                     paid_work,
                     bearer_token_file,

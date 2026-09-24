@@ -8,7 +8,7 @@ use tracing::Instrument;
 
 #[cfg_attr(feature = "otel", path = "responses_fetch/telemetry/otel.rs")]
 #[cfg_attr(not(feature = "otel"), path = "responses_fetch/telemetry/noop.rs")]
-mod telemetry;
+pub(crate) mod telemetry;
 
 /// A total request deadline bounds the whole call; this independent idle
 /// deadline prevents a peer that stops producing SSE bytes from occupying a

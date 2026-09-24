@@ -22,7 +22,7 @@ body, encoded as standard padded base64.
 
 `body_base64` above is `{}`; replace it with your actual API request. Header
 names are lowercase. `credential` may be omitted for unauthenticated requests
-or caller-owned authorization headers. The response ceiling is at most 512 KiB.
+or caller-owned authorization headers. The response ceiling is at most 8 MiB.
 All final HTTP statuses, including errors and redirects, are returned to the
 client as signed responses; they are never logged with their bodies. Redirects
 are not followed. A transport failure or an oversized response is not a
@@ -65,7 +65,31 @@ The operator configures account aliases separately:
 
 Aliases select independent accounts, including several accounts at the same
 origin. Secrets are read from the provider process's environment and held in
-memory. They are injected only for an exact authorized origin, path and method,
+memory. Alternatively, replace `secret_env` with `secret_file` and `secret_field`
+to read a private JSON login file on each request. The loader rejects symlinks,
+non-regular files, files that are not owner-only, and files over 64 KiB; atomic
+token rotation is picked up without restarting the provider.
+
+For short-lived tokens, a file credential can include:
+
+```json
+{
+  "secret_file": "/private/account.json",
+  "secret_field": "access_token",
+  "refresh": {
+    "expires_field": "expires_at",
+    "command": ["/absolute/path/to/account-tool", "refresh"]
+  }
+}
+```
+
+`expires_at` is Unix time in seconds. The trusted operator command runs when
+expiry is within 30 seconds, with no customer data or captured output. Refreshes
+are serialized per account, have a 30 second timeout, and must replace the file
+with a renewed token. Failures impose a cooldown. The account's login tool owns
+OAuth and refresh-token persistence; Hellas does not interpret vendor logins.
+
+Resolved secrets are injected only for an exact authorized origin, path and method,
 with public WebPKI roots. Callers cannot override that account's header or
 change trust roots to impersonate its origin. Restrict paths to the inference
 endpoints the account is intended to expose.

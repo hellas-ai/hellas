@@ -16,6 +16,19 @@ async fn server(
     Arc<AtomicUsize>,
     tokio::task::JoinHandle<()>,
 ) {
+    server_with_pause(status, bytes, location, None).await
+}
+
+async fn server_with_pause(
+    status: u16,
+    bytes: Vec<u8>,
+    location: Option<String>,
+    pause: Option<Arc<tokio::sync::Notify>>,
+) -> (
+    HttpFetchRequest,
+    Arc<AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+) {
     let key = generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let cert = key.cert.der().clone();
     let parsed = x509_cert::Certificate::from_der(cert.as_ref()).unwrap();
@@ -52,6 +65,7 @@ async fn server(
             let seen = seen.clone();
             let bytes = bytes.clone();
             let location = location.clone();
+            let pause = pause.clone();
             tokio::spawn(async move {
                 let Ok(mut socket) = acceptor.accept(socket).await else {
                     return;
@@ -68,11 +82,24 @@ async fn server(
                 let location = location
                     .map(|v| format!("Location: {v}\r\n"))
                     .unwrap_or_default();
+                let retry_after = if status == 429 {
+                    "Retry-After: 7\r\n"
+                } else {
+                    ""
+                };
                 let header = format!(
-                    "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n{location}\r\n",
+                    "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n{location}{retry_after}\r\n",
                     bytes.len()
                 );
                 let _ = socket.write_all(header.as_bytes()).await;
+                if let Some(pause) = pause {
+                    let _ = socket.write_all(&bytes[..1]).await;
+                    let _ = socket.flush().await;
+                    pause.notified().await;
+                    let _ = socket.write_all(&bytes[1..]).await;
+                    let _ = socket.shutdown().await;
+                    return;
+                }
                 let _ = socket.write_all(&bytes).await;
                 let _ = socket.shutdown().await;
             });
@@ -96,6 +123,59 @@ async fn server(
         calls,
         task,
     )
+}
+
+#[tokio::test]
+async fn rate_limit_is_returned_with_its_body_and_delay_without_retrying() {
+    let body = br#"{"error":{"type":"rate_limit"}}"#.to_vec();
+    let (request, calls, task) = server(429, body.clone(), None).await;
+    let mut response = provider().run(prepared(&request)).await.unwrap();
+    let head = response.head.http.unwrap();
+    assert_eq!(head.status, 429);
+    assert!(head.headers.contains(&("retry-after".into(), "7".into())));
+    let mut received = Vec::new();
+    while let Some(chunk) = response.stream.next().await {
+        received.extend(chunk.unwrap());
+    }
+    assert_eq!(received, body);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    task.abort();
+}
+
+#[tokio::test]
+async fn coding_response_can_exceed_the_old_half_megabyte_ceiling() {
+    let body = vec![b'x'; 1024 * 1024];
+    let (mut request, calls, task) = server(200, body.clone(), None).await;
+    request.max_response_bytes = hellas_rpc::http_fetch::MAX_HTTP_RESPONSE_BYTES;
+    let mut response = provider().run(prepared(&request)).await.unwrap();
+    let mut received = Vec::new();
+    while let Some(chunk) = response.stream.next().await {
+        let chunk = chunk.unwrap();
+        assert!(chunk.len() <= CHUNK_BYTES);
+        received.extend(chunk);
+    }
+    assert_eq!(received, body);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    task.abort();
+}
+
+#[tokio::test]
+async fn small_stream_delivery_does_not_wait_for_record_capacity_or_eof() {
+    let resume = Arc::new(tokio::sync::Notify::new());
+    let (request, _, server) =
+        server_with_pause(200, b"ab".to_vec(), None, Some(resume.clone())).await;
+    let provider = provider();
+    let mut response = provider.run(prepared(&request)).await.unwrap();
+    let first = tokio::time::timeout(Duration::from_secs(1), response.stream.next())
+        .await
+        .expect("first byte was held until EOF")
+        .unwrap()
+        .unwrap();
+    assert_eq!(first, b"a");
+    resume.notify_one();
+    assert_eq!(response.stream.next().await.unwrap().unwrap(), b"b");
+    assert!(response.stream.next().await.is_none());
+    server.abort();
 }
 
 fn provider() -> HttpFetchProvider {

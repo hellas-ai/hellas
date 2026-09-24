@@ -4,7 +4,7 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 
-pub const MAX_HTTP_RESPONSE_BYTES: u32 = 512 * 1024;
+pub const MAX_HTTP_RESPONSE_BYTES: u32 = 8 * 1024 * 1024;
 pub const MAX_HTTP_HEADERS_BYTES: usize = 16 * 1024;
 pub const MAX_HTTP_HEADERS: usize = 64;
 

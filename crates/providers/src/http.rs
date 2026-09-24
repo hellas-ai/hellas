@@ -22,9 +22,10 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+use tracing::Instrument;
 mod config;
 mod tls;
-pub use config::{HttpCredentialConfig, HttpProviderConfig};
+pub use config::{CredentialRefresh, HttpCredentialConfig, HttpProviderConfig, HttpSecret};
 
 const CHUNK_BYTES: usize = 16 * 1024;
 const IDLE: Duration = Duration::from_secs(90);
@@ -46,7 +47,7 @@ pub struct HttpCredential {
     pub allowed_paths: Vec<String>,
     pub allowed_methods: Vec<String>,
     pub header_name: String,
-    pub header_value: String,
+    pub header_value: HttpSecret,
 }
 
 impl std::fmt::Debug for HttpCredential {
@@ -96,14 +97,12 @@ impl HttpFetchProvider {
                     "credential requires an alias, exact origins, paths and methods",
                 ));
             }
-            check_headers(
-                &[(
-                    credential.header_name.clone(),
-                    credential.header_value.clone(),
-                )],
-                true,
-            )
-            .map_err(|_| fault("invalid credential header"))?;
+            check_headers(&[(credential.header_name.clone(), String::new())], true)
+                .map_err(|_| fault("invalid credential header"))?;
+            if let HttpSecret::Value(value) = &credential.header_value {
+                check_headers(&[(credential.header_name.clone(), value.clone())], true)
+                    .map_err(|_| fault("invalid credential header"))?;
+            }
             for path in &credential.allowed_paths {
                 let parsed = Url::parse(&format!("https://scope.invalid{path}"))
                     .map_err(|_| fault("invalid credential path"))?;
@@ -237,7 +236,7 @@ impl HttpFetchProvider {
             .redirect(reqwest::redirect::Policy::none())
             .retry(reqwest::retry::never())
             .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(300))
+            .timeout(Duration::from_secs(20 * 60))
             .resolve_to_addrs(host, &addresses)
             .tls_backend_preconfigured(tls)
             .build()
@@ -255,16 +254,25 @@ impl HttpFetchProvider {
             );
         }
         if let Some(credential) = credential {
-            let mut value = HeaderValue::from_str(&credential.header_value)
-                .map_err(|_| fault("invalid credential header"))?;
+            let secret = credential.header_value.resolve().await?;
+            let mut value =
+                HeaderValue::from_str(&secret).map_err(|_| fault("invalid credential header"))?;
             value.set_sensitive(true);
             outbound = outbound.header(&credential.header_name, value);
         }
-        let response = outbound
+        let mut trace =
+            crate::responses_fetch::telemetry::Request::for_method(&url, &request.method);
+        let response = trace
+            .propagate(outbound)
             .body(request.body().map_err(|_| fault("invalid HTTP body"))?)
             .send()
+            .instrument(trace.span.clone())
             .await
-            .map_err(|_| fault("HTTPS transport or certificate verification failed"))?;
+            .map_err(|_| {
+                trace.fail("transport_error");
+                fault("HTTPS transport or certificate verification failed")
+            })?;
+        trace.status(response.status().as_u16());
         // A non-2xx status is still a completed HTTP exchange. Return it, with
         // its exact body, to the authenticated client; do not log it.
         let headers = response
@@ -287,7 +295,6 @@ impl HttpFetchProvider {
         let limit = request.max_response_bytes as usize;
         let stream = async_stream::try_stream! {
             let mut upstream = response.bytes_stream();
-            let mut buffered = Vec::with_capacity(CHUNK_BYTES);
             let mut received = 0usize;
             loop {
                 let next = tokio::time::timeout(IDLE, upstream.next()).await
@@ -296,24 +303,19 @@ impl HttpFetchProvider {
                 let chunk = chunk.map_err(|_| fault("HTTPS response stream failed"))?;
                 received = received.checked_add(chunk.len()).ok_or_else(|| fault("HTTPS response size overflow"))?;
                 if received > limit { Err(fault("HTTPS response exceeds signed byte limit"))?; }
-                let mut remaining = chunk.as_ref();
-                while !remaining.is_empty() {
-                    let count = (CHUNK_BYTES - buffered.len()).min(remaining.len());
-                    buffered.extend_from_slice(&remaining[..count]);
-                    remaining = &remaining[count..];
-                    if buffered.len() == CHUNK_BYTES {
-                        yield std::mem::replace(&mut buffered, Vec::with_capacity(CHUNK_BYTES));
-                    }
+                // Flush each upstream delivery. Waiting for a full 16 KiB
+                // record otherwise holds small SSE responses until EOF.
+                for part in chunk.chunks(CHUNK_BYTES) {
+                    yield part.to_vec();
                 }
             }
-            if !buffered.is_empty() { yield buffered; }
         };
         Ok(FetchProviderResponse {
             head: FetchProviderResponseHead {
                 effective_model: None,
                 http: Some(head),
             },
-            stream: Box::pin(stream),
+            stream: Box::pin(trace.stream(stream)),
         })
     }
 }
