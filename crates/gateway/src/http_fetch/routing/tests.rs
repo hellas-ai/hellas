@@ -94,14 +94,20 @@ fn models_admission_and_cooldowns_do_not_move_existing_sessions() {
 fn connection_is_a_fallback_and_explicit_sessions_survive_reconnects() {
     let routing = routing(config());
     let body = br#"{"model":"k3"}"#;
-    let request = |connection, headers: &HeaderMap| {
+    let connections: Vec<_> = (0..4)
+        .map(|id| crate::ConnectionId {
+            id,
+            alive: Arc::new(()),
+        })
+        .collect();
+    let request = |connection: usize, headers: &HeaderMap| {
         routing
             .select(
                 "/v1/chat/completions",
                 "POST",
                 headers,
                 body,
-                Some(connection),
+                Some(&connections[connection]),
             )
             .unwrap()
     };
@@ -225,6 +231,7 @@ fn full_affinity_table_does_not_evict_live_sessions_and_expired_server_state_is_
                 Binding {
                     backend: 1,
                     touched: Instant::now(),
+                    connection: None,
                 },
             );
         }
@@ -307,4 +314,27 @@ fn repeated_aliases_share_limits_but_distinct_provider_nodes_keep_them_separate(
     assert!(
         matches!(&split.backends[1].remote, ExecutionRoute::RemoteDirect(target) if target.addr.id==node && target.provider_trust.expected_genesis==ContentId::hash(b"other"))
     );
+}
+
+#[test]
+fn closed_client_connections_release_their_affinity_entries() {
+    let routing = routing(config());
+    for id in 0..32 {
+        let connection = crate::ConnectionId {
+            id,
+            alive: Arc::new(()),
+        };
+        routing
+            .select(
+                "/v1/chat/completions",
+                "POST",
+                &HeaderMap::new(),
+                br#"{"model":"k3"}"#,
+                Some(&connection),
+            )
+            .unwrap();
+        assert_eq!(routing.state.lock().unwrap().bindings.len(), 1);
+    }
+    select(&routing, "k3", "explicit-session").unwrap();
+    assert_eq!(routing.state.lock().unwrap().bindings.len(), 1);
 }

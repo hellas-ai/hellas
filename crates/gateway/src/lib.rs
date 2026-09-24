@@ -89,8 +89,11 @@ pub trait PaidExecutionBackend: Send + Sync {
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
-#[derive(Clone, Copy)]
-struct ConnectionId(u64);
+#[derive(Clone)]
+struct ConnectionId {
+    id: u64,
+    alive: Arc<()>,
+}
 
 impl
     axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, tokio::net::TcpListener>>
@@ -98,7 +101,10 @@ impl
 {
     fn connect_info(_: axum::serve::IncomingStream<'_, tokio::net::TcpListener>) -> Self {
         static NEXT_CONNECTION: AtomicU64 = AtomicU64::new(1);
-        Self(NEXT_CONNECTION.fetch_add(1, Ordering::Relaxed))
+        Self {
+            id: NEXT_CONNECTION.fetch_add(1, Ordering::Relaxed),
+            alive: Arc::new(()),
+        }
     }
 }
 

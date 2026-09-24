@@ -44,6 +44,7 @@ pub(super) struct Backend {
 struct Binding {
     backend: usize,
     touched: Instant,
+    connection: Option<std::sync::Weak<()>>,
 }
 
 #[derive(Default)]
@@ -212,7 +213,7 @@ impl Routing {
         method: &str,
         headers: &HeaderMap,
         body: &[u8],
-        connection: Option<u64>,
+        connection: Option<&crate::ConnectionId>,
     ) -> Result<Selected, Unavailable> {
         let hints = if self.pooled {
             Some(Hints::read(headers, body).map_err(|message| Unavailable {
@@ -266,14 +267,15 @@ impl Routing {
             .as_ref()
             .and_then(|h| h.session.as_ref())
             .map(|(kind, id)| self.key("session", &[family, model.unwrap_or(""), kind, id]));
-        let connection_key = connection
-            .filter(|_| self.pooled && session.is_none())
-            .map(|id| {
-                self.key(
-                    "connection",
-                    &[family, model.unwrap_or(""), &id.to_string()],
-                )
-            });
+        let connection_key =
+            connection
+                .filter(|_| self.pooled && session.is_none())
+                .map(|connection| {
+                    self.key(
+                        "connection",
+                        &[family, model.unwrap_or(""), &connection.id.to_string()],
+                    )
+                });
         let affinity_key = session.or(connection_key);
         let state_keys: Vec<_> = hints
             .as_ref()
@@ -292,9 +294,10 @@ impl Routing {
             .collect();
         let mut state = self.state.lock().unwrap();
         let now = Instant::now();
-        state
-            .bindings
-            .retain(|_, b| now.duration_since(b.touched) < SESSION_IDLE);
+        state.bindings.retain(|_, b| {
+            now.duration_since(b.touched) < SESSION_IDLE
+                && b.connection.as_ref().is_none_or(|c| c.strong_count() > 0)
+        });
         let mut pinned = None;
         for key in &state_keys {
             let binding = state.bindings.get_mut(key).ok_or_else(|| {
@@ -360,6 +363,11 @@ impl Routing {
                     Binding {
                         backend,
                         touched: now,
+                        connection: if Some(key) == connection_key {
+                            connection.map(|c| Arc::downgrade(&c.alive))
+                        } else {
+                            None
+                        },
                     },
                 );
             }
@@ -463,6 +471,7 @@ impl ResponseBinding {
                     Binding {
                         backend: self.backend,
                         touched: Instant::now(),
+                        connection: None,
                     },
                 );
             }

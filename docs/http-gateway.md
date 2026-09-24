@@ -107,7 +107,8 @@ Affinity recognizes `x-hellas-session-id`, Claude Code's
 in `metadata.user_id`, and `prompt_cache_key` (used by Kimi Code), in that order.
 An explicit session survives changes of client connection. Without one, requests
 for the same model/API on the same accepted HTTP connection stay together.
-Different explicit sessions may share that connection. Affinity is scoped by
+Connection-only bindings are reclaimed once that connection closes. Different
+explicit sessions may share that connection. Affinity is scoped by
 model and API family; Responses compaction and Messages token counting share
 their generation API's family.
 

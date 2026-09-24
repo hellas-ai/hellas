@@ -158,7 +158,7 @@ async fn handle(State(state): State<Arc<HttpState>>, request: Request) -> Respon
     let connection = parts
         .extensions
         .get::<axum::extract::ConnectInfo<super::ConnectionId>>()
-        .map(|c| c.0.0);
+        .map(|c| &c.0);
     let selected = match state.routing.select(
         parts.uri.path(),
         parts.method.as_str(),
