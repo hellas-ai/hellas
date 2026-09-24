@@ -130,8 +130,18 @@ impl Configuration {
             .tempdir_in(parent)
             .map_err(|_| "could not create worker configuration directory")?;
         let files = stage.path().join("files");
-        crate::management::private_directory(&files)
-            .map_err(|_| "worker filesystem could not create an owner-only credential directory")?;
+        crate::management::private_directory(&files).map_err(|_| {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            match std::fs::symlink_metadata(&files) {
+                Ok(meta) if meta.uid() != unsafe { libc::geteuid() } => {
+                    "worker filesystem does not preserve credential directory ownership"
+                }
+                Ok(meta) if meta.permissions().mode() & 0o077 != 0 => {
+                    "worker filesystem does not preserve private credential directory permissions"
+                }
+                _ => "worker filesystem could not create an owner-only credential directory",
+            }
+        })?;
         for (name, value) in &self.files {
             crate::config::save_private(&files.join(name), value, true)
                 .map_err(|_| "could not write private worker credential file")?;
