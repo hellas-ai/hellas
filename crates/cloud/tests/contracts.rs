@@ -48,6 +48,7 @@ fn reject_mutable_images_unsupported_trust_and_identity_overrides() {
 fn runpod_preserves_entrypoint_and_mounts_persistent_identity() {
     let spec = spec(ProviderConfig::Runpod {
         account: None,
+        template_id: Some("foundation-template".into()),
         gpu_type: "NVIDIA A100 80GB PCIe".into(),
         interruptible: false,
         disk_gb: 20,
@@ -60,9 +61,20 @@ fn runpod_preserves_entrypoint_and_mounts_persistent_identity() {
     let body = provider
         .create_body(&spec, credentials.env(&spec).unwrap())
         .unwrap();
-    assert_eq!(body["imageName"], spec.image);
-    assert_eq!(body["volumeMountPath"], "/var/lib/hellas");
-    assert_eq!(body["containerRegistryAuthId"], "registry-credential-id");
+    assert_eq!(body["templateId"], "foundation-template");
+    for key in [
+        "imageName",
+        "volumeMountPath",
+        "containerDiskInGb",
+        "volumeInGb",
+        "containerRegistryAuthId",
+        "ports",
+    ] {
+        assert!(
+            body.get(key).is_none(),
+            "template setting overridden: {key}"
+        );
+    }
     assert_eq!(body["env"]["HELLAS_REMOTE_TOKEN"], credentials.token);
     assert_eq!(
         body["env"]["HELLAS_REMOTE_OWNER"],

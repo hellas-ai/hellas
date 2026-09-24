@@ -52,24 +52,15 @@ pub enum RunpodCommand {
     Create {
         #[arg(long)]
         name: String,
-        /// Companion image pinned as repository@sha256:...
-        #[arg(long)]
-        image: String,
+        /// Existing Hellas Runpod template; its image must be digest-pinned.
+        #[arg(long, value_parser = parse_id)]
+        template: String,
         #[arg(long = "gpu")]
         gpu_type: String,
         /// Request a spot pod that Runpod may interrupt at any time.
         #[arg(long)]
         #[serde(default)]
         interruptible: bool,
-        #[arg(long, default_value_t = 20)]
-        #[serde(default = "default_disk")]
-        disk_gb: u32,
-        #[arg(long, default_value_t = 20)]
-        #[serde(default = "default_disk")]
-        volume_gb: u32,
-        /// Existing Runpod private-registry credential ID.
-        #[arg(long)]
-        registry_auth_id: Option<String>,
         /// Optional receipt path; defaults to the owner machine inventory.
         #[arg(long)]
         state: Option<PathBuf>,
@@ -91,10 +82,6 @@ pub enum RunpodCommand {
         #[arg(long)]
         state: Option<PathBuf>,
     },
-}
-
-fn default_disk() -> u32 {
-    20
 }
 
 fn parse_id(value: &str) -> std::result::Result<String, String> {
@@ -156,12 +143,9 @@ impl RunpodArgs {
             }
             RunpodCommand::Create {
                 name,
-                image,
+                template,
                 gpu_type,
                 interruptible,
-                disk_gb,
-                volume_gb,
-                registry_auth_id,
                 state,
                 dry_run,
                 mut serve_args,
@@ -171,16 +155,17 @@ impl RunpodArgs {
                 }
                 let spec = Spec {
                     name,
-                    image,
+                    image: String::new(),
                     trust: Trust::Token,
                     serve_args,
                     provider: ProviderConfig::Runpod {
                         account: account.clone(),
+                        template_id: Some(template),
                         gpu_type,
                         interruptible,
-                        disk_gb,
-                        volume_gb,
-                        container_registry_auth_id: registry_auth_id,
+                        disk_gb: 0,
+                        volume_gb: 0,
+                        container_registry_auth_id: None,
                     },
                 };
                 spec.validate()?;

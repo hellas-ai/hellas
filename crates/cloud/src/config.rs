@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 #[serde(deny_unknown_fields)]
 pub struct Spec {
     pub name: String,
-    /// The companion image, derived from the CI-built Hellas image.
+    /// Digest-pinned image; resolved from the template before Runpod allocation.
+    #[serde(default)]
     pub image: String,
     pub provider: ProviderConfig,
     #[serde(default)]
@@ -28,10 +29,15 @@ pub enum ProviderConfig {
         /// Named credential profile; omitted for the legacy RUNPOD_API_KEY account.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         account: Option<String>,
+        /// None only for receipts from the earlier image-based prototype.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        template_id: Option<String>,
         gpu_type: String,
         #[serde(default)]
         interruptible: bool,
+        #[serde(default)]
         disk_gb: u32,
+        #[serde(default)]
         volume_gb: u32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         container_registry_auth_id: Option<String>,
@@ -65,7 +71,17 @@ impl Spec {
                     .all(|b| b.is_ascii_alphanumeric() || b == b'-'),
             "name must contain 1..48 ASCII letters, digits, or hyphens"
         );
-        if let (ProviderConfig::Docker { .. }, Some(digest)) =
+        let unresolved_template = self.image.is_empty()
+            && matches!(
+                &self.provider,
+                ProviderConfig::Runpod {
+                    template_id: Some(_),
+                    ..
+                }
+            );
+        if unresolved_template {
+            // A credential-free dry run cannot resolve account template metadata.
+        } else if let (ProviderConfig::Docker { .. }, Some(digest)) =
             (&self.provider, self.image.strip_prefix("sha256:"))
         {
             validate_hex(digest)?;
@@ -88,6 +104,7 @@ impl Spec {
         match &self.provider {
             ProviderConfig::Runpod {
                 account,
+                template_id,
                 gpu_type,
                 disk_gb,
                 volume_gb,
@@ -96,8 +113,12 @@ impl Spec {
                 if let Some(account) = account {
                     crate::accounts::validate_name(account)?;
                 }
+                if let Some(id) = template_id {
+                    crate::provider::validate_id(id)?;
+                }
                 ensure!(
-                    !gpu_type.trim().is_empty() && *disk_gb > 0 && *volume_gb > 0,
+                    !gpu_type.trim().is_empty()
+                        && (unresolved_template || (*disk_gb > 0 && *volume_gb > 0)),
                     "Runpod requires a GPU type and positive disk/volume sizes"
                 );
             }
