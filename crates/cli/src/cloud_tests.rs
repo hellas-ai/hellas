@@ -88,6 +88,10 @@ async fn owner_controls_admin_and_hellas_rpc_even_when_receipt_is_stolen() {
                 node_addr.port().to_string(),
                 "--execute-policy".into(),
                 "none".into(),
+                "--output-cache".into(),
+                "record".into(),
+                "--store-dir".into(),
+                dir.path().join("store").to_string_lossy().into_owned(),
             ],
         })
         .await
