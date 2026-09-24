@@ -49,6 +49,7 @@ fn runpod_preserves_entrypoint_and_mounts_persistent_identity() {
     let spec = spec(ProviderConfig::Runpod {
         account: None,
         gpu_type: "NVIDIA A100 80GB PCIe".into(),
+        interruptible: false,
         disk_gb: 20,
         volume_gb: 80,
         container_registry_auth_id: Some("registry-credential-id".into()),
