@@ -65,9 +65,21 @@ existing inference routes as well as HTTP Fetch. Each exchange has owner-only
 `request.bin`, `response.bin` and `metadata.json` files. Metadata records status,
 size, content type/encoding, elapsed time, completion and trace context; it excludes authentication
 headers. `x-hellas-request-id` identifies the exchange. Failed or cancelled
-streams retain an incomplete archive. The gateway refuses requests when it
-cannot open their archive, and stops streaming on an archive write failure.
-There is no automatic archive pruning.
+streams retain an incomplete archive. Archiving is best-effort: failures during
+setup, request/response writes or finalization are reported without replacing
+the upstream status or interrupting its response. After a write fails, archiving
+stops for that exchange; the next ordinary request attempts a fresh archive.
+`x-hellas-request-id` identifies an archive attempt, not a guarantee of a complete
+durable record. There is no automatic archive pruning.
+
+Archive failures emit a `hellas_archive` warning with the operation, I/O error
+kind and OS error code, without payloads, credentials, paths or raw error text.
+With `otel`, `hellas.gateway.archive.failures` counts failures by `archive.stage`
+(`prepare`, `request`, `response_head`, `response_body`, `finish`) and `error.type`.
+The Prometheus name is `hellas_gateway_archive_failures_total`. Successful HTTP
+responses remain successful in request telemetry even when their archive fails;
+monitor the archive counter separately. ZDR requests do not attempt archival or
+increment this counter.
 
 `x-hellas-zdr: true` disables application payload persistence for that request.
 `--zdr` enforces this for all requests. Ambiguous flags, `store: true`, and ZDR
@@ -117,6 +129,7 @@ token totals alone cannot determine subscription quota or billing.
 This is an HTTP API bridge with explicit routes, authentication and resource
 limits. It does not implement CONNECT, WebSocket upgrades, streaming uploads,
 HTTP trailers or automatic rewriting of redirect URLs. Clients using Responses
-WebSockets must select their HTTP/SSE transport. Archive unavailability currently
-fails requests closed. These are contract differences from a general transparent
-HTTP proxy, even when inference and tool-call payloads are preserved exactly.
+WebSockets must select their HTTP/SSE transport. Archive I/O remains on the
+response path, although its errors no longer fail requests. These are contract
+differences from a general transparent HTTP proxy, even when inference and
+tool-call payloads are preserved exactly.

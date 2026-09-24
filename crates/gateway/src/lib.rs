@@ -245,9 +245,11 @@ async fn start_gateway(options: GatewayOptions) -> anyhow::Result<GatewayHandle>
     )
     .await?;
     let state = Arc::new(GatewayState::from_options(&options).await?);
-    if !options.archive.zdr {
-        archive::prepare(&options.archive.directory)?;
-    }
+    let archive_policy = archive::Policy::new(
+        options.archive.clone(),
+        options.output_cache.policy != cache::CachePolicy::Off,
+    );
+    archive_policy.prepare();
 
     // Every route below reaches an executor, so every route below is
     // behind this run's credential. The layer goes on last, which in axum
@@ -265,10 +267,7 @@ async fn start_gateway(options: GatewayOptions) -> anyhow::Result<GatewayHandle>
         .with_state(state.clone())
         .layer(provenance_layer::ProvenanceLayer)
         .layer(axum::middleware::from_fn_with_state(
-            archive::Policy {
-                options: options.archive.clone(),
-                cache_enabled: options.output_cache.policy != cache::CachePolicy::Off,
-            },
+            archive_policy,
             archive::record,
         ));
     #[cfg(feature = "otel")]

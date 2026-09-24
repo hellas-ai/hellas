@@ -205,9 +205,8 @@ pub(super) async fn start(options: GatewayOptions) -> anyhow::Result<GatewayHand
         options.output_cache.policy == hellas_rpc::cache::CachePolicy::Off,
         "HTTP routes archive exchanges; inference replay must be off"
     );
-    if !options.archive.zdr {
-        super::archive::prepare(&options.archive.directory)?;
-    }
+    let archive_policy = super::archive::Policy::new(options.archive.clone(), false);
+    archive_policy.prepare();
     let route = ExecutionRoute::remote(
         options.node_id,
         options.node_addrs.clone(),
@@ -256,10 +255,7 @@ pub(super) async fn start(options: GatewayOptions) -> anyhow::Result<GatewayHand
     let app = app
         .with_state(state)
         .layer(axum::middleware::from_fn_with_state(
-            super::archive::Policy {
-                options: options.archive.clone(),
-                cache_enabled: false,
-            },
+            archive_policy,
             super::archive::record,
         ));
     #[cfg(feature = "otel")]

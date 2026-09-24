@@ -55,4 +55,5 @@ tracing-opentelemetry = { workspace = true, optional = true }
 [dev-dependencies]
 hellas-rpc = { workspace = true, features = ["host-control"] }
 hellas-wire = { workspace = true, features = ["unix"] }
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
 tempfile = "3"

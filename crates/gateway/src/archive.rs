@@ -23,6 +23,49 @@ pub struct ArchiveOptions {
 pub(crate) struct Policy {
     pub options: ArchiveOptions,
     pub cache_enabled: bool,
+    #[cfg(feature = "otel")]
+    failures: opentelemetry::metrics::Counter<u64>,
+}
+
+impl Policy {
+    pub(crate) fn new(options: ArchiveOptions, cache_enabled: bool) -> Self {
+        Self {
+            options,
+            cache_enabled,
+            #[cfg(feature = "otel")]
+            failures: opentelemetry::global::meter("hellas.gateway.archive")
+                .u64_counter("hellas.gateway.archive.failures")
+                .build(),
+        }
+    }
+
+    pub(crate) fn prepare(&self) {
+        if !self.options.zdr
+            && let Err(error) = prepare(&self.options.directory)
+        {
+            self.failed("prepare", &error);
+        }
+    }
+
+    fn failed(&self, stage: &'static str, error: &io::Error) {
+        // Filesystem error strings can contain paths. Report only bounded
+        // classifications, never request bodies, credentials or raw errors.
+        warn!(
+            target: "hellas_archive",
+            archive_stage = stage,
+            error_kind = ?error.kind(),
+            error_os_code = error.raw_os_error(),
+            "archive failed; continuing response delivery"
+        );
+        #[cfg(feature = "otel")]
+        self.failures.add(
+            1,
+            &[
+                opentelemetry::KeyValue::new("archive.stage", stage),
+                opentelemetry::KeyValue::new("error.type", format!("{:?}", error.kind())),
+            ],
+        );
+    }
 }
 
 pub(crate) fn zdr(headers: &HeaderMap, required: bool) -> Result<bool, &'static str> {
@@ -65,7 +108,7 @@ pub(crate) async fn record(
             .run(axum::extract::Request::from_parts(parts, Body::from(body)))
             .await;
     }
-    let mut archive = match Exchange::new(
+    let archive = match Exchange::new(
         &policy.options.directory,
         parts.uri.path(),
         parts.method.as_str(),
@@ -74,28 +117,33 @@ pub(crate) async fn record(
     )
     .await
     {
-        Ok(archive) => archive,
-        Err(_) => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "request archive unavailable",
-            )
-                .into_response();
+        Ok(archive) => Some(archive),
+        Err(error) => {
+            policy.failed("request", &error);
+            None
         }
     };
     let response = next
         .run(axum::extract::Request::from_parts(parts, Body::from(body)))
         .await;
-    if archive
+    match archive {
+        Some(archive) => archive_response(policy, archive, response).await,
+        None => response,
+    }
+}
+
+async fn archive_response(
+    policy: Policy,
+    mut archive: Exchange,
+    response: axum::response::Response,
+) -> axum::response::Response {
+    use axum::body::Body;
+    if let Err(error) = archive
         .head(response.status().as_u16(), response.headers())
         .await
-        .is_err()
     {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "response archive unavailable",
-        )
-            .into_response();
+        policy.failed("response_head", &error);
+        return response;
     }
     let (mut parts, body) = response.into_parts();
     if let Some(id) = archive.directory.file_name().and_then(|id| id.to_str()) {
@@ -104,24 +152,30 @@ pub(crate) async fn record(
             .insert("x-hellas-request-id", id.parse().unwrap());
     }
     if body.is_end_stream() {
-        if archive.finish().await.is_err() {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "response archive unavailable",
-            )
-                .into_response();
+        if let Err(error) = archive.finish().await {
+            policy.failed("finish", &error);
         }
         return axum::response::Response::from_parts(parts, body);
     }
     let mut source = body.into_data_stream();
+    let mut archive = Some(archive);
     let stream: futures::stream::BoxStream<'static, Result<Bytes, io::Error>> =
         Box::pin(async_stream::try_stream! {
             while let Some(bytes) = source.next().await {
                 let bytes = bytes.map_err(|_| io::Error::other("response stream failed"))?;
-                archive.chunk(&bytes).await?;
+                if let Some(exchange) = archive.as_mut()
+                    && let Err(error) = exchange.chunk(&bytes).await
+                {
+                    policy.failed("response_body", &error);
+                    archive = None;
+                }
                 yield bytes;
             }
-            archive.finish().await?;
+            if let Some(mut exchange) = archive
+                && let Err(error) = exchange.finish().await
+            {
+                policy.failed("finish", &error);
+            }
         });
     axum::response::Response::from_parts(parts, Body::from_stream(stream))
 }

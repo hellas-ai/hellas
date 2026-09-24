@@ -2869,6 +2869,7 @@ dependencies = [
  "iroh",
  "libc",
  "opentelemetry",
+ "opentelemetry_sdk",
  "prometheus-client",
  "rand 0.10.2",
  "reqwest",
