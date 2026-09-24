@@ -85,6 +85,9 @@ pub enum JournalKind {
     Setup,
     /// One channel's job, credit, and certificate.
     Channel,
+    /// Provider accounting whose request and response bodies never reach disk.
+    /// A different kind prevents reopening a payload-bearing journal as ZDR.
+    MetadataChannel,
 }
 
 impl JournalKind {
@@ -92,6 +95,7 @@ impl JournalKind {
         match self {
             Self::Setup => 1,
             Self::Channel => 2,
+            Self::MetadataChannel => 3,
         }
     }
 
@@ -99,6 +103,7 @@ impl JournalKind {
         match code {
             1 => Some(Self::Setup),
             2 => Some(Self::Channel),
+            3 => Some(Self::MetadataChannel),
             _ => None,
         }
     }

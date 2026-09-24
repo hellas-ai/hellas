@@ -30,7 +30,34 @@ provider = [
 ]
 local-control = ["dep:tokio", "hellas-rpc/host-control", "hellas-wire/unix"]
 
+paid-work = [
+    "dep:async-stream",
+    "provider",
+    "dep:hellas-chain",
+    "hellas-chain/client",
+    "hellas-chain/work-watcher",
+    "dep:hellas-kernel",
+    "hellas-kernel/secp256k1",
+    "dep:hellas-work",
+    "hellas-client/work",
+    "hellas-rpc/work",
+    "dep:futures",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:hex",
+    "dep:url",
+]
+
 [dependencies]
+async-stream = { workspace = true, optional = true }
+hellas-chain = { workspace = true, default-features = false, optional = true }
+hellas-kernel = { workspace = true, default-features = false, optional = true }
+hellas-work = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+hex = { workspace = true, optional = true }
+url = { version = "2", optional = true }
 anyhow = { workspace = true, optional = true }
 futures-core = { workspace = true, optional = true }
 hellas-attestation.workspace = true

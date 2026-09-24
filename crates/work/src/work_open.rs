@@ -755,14 +755,28 @@ fn mount<V: SigVerifier>(
         None => descriptor.expected_settlement().map_err(to_store)?,
         Some(payment) => descriptor.funded_settlement(payment).map_err(to_store)?,
     };
-    let mut channel = ChannelStore::open(
-        store.root(),
-        descriptor.channel().clone(),
-        settlement,
-        store.role(),
-        origin,
-        verifier,
-    )?;
+    let mut channel = if store.role() == crate::work_store::Role::Provider
+        && matches!(
+            descriptor.execution_policy(),
+            hellas_rpc::protocol::work_profile::PaidWorkPolicy::Fetch { .. }
+        ) {
+        ChannelStore::open_metadata_only(
+            store.root(),
+            descriptor.channel().clone(),
+            settlement,
+            origin,
+            verifier,
+        )?
+    } else {
+        ChannelStore::open(
+            store.root(),
+            descriptor.channel().clone(),
+            settlement,
+            store.role(),
+            origin,
+            verifier,
+        )?
+    };
     // The origin block carries the payment Open that established this
     // channel, and the store opened with its cursor already on that block.
     // A `StartPaymentClose` ordered after the Open in the very same block

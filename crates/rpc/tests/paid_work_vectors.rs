@@ -431,7 +431,8 @@ fn envelope_and_length_mutations_reject() {
         })
     );
 
-    // MUTATION: an unassigned tag.
+    // MUTATION: a tag this record does not own (5 is the fetch profile's
+    // policy tag).
     let mut unknown_tag = bytes.clone();
     unknown_tag[1] = 5;
     assert_eq!(

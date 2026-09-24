@@ -26,6 +26,9 @@ evaluate = [
 anyhow = { workspace = true }
 async-stream = { workspace = true }
 axum = { workspace = true }
+base64.workspace = true
+httpdate = "1"
+flate2 = "1"
 futures = { workspace = true }
 hellas-adaptors.workspace = true
 hellas-client = { workspace = true, features = ["iroh", "evaluate"] }
@@ -53,4 +56,5 @@ tracing-opentelemetry = { workspace = true, optional = true }
 [dev-dependencies]
 hellas-rpc = { workspace = true, features = ["host-control"] }
 hellas-wire = { workspace = true, features = ["unix"] }
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
 tempfile = "3"

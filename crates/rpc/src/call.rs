@@ -988,7 +988,22 @@ async fn write_streaming_response<S: SendHalf, R: Message>(
     mut responses: impl futures_util::Stream<Item = Result<R, WireStatus>> + Unpin,
     call: &CallSpan,
 ) -> Result<(), TransportError> {
-    while let Some(response) = responses.next().await {
+    loop {
+        let next = match futures_util::future::select(
+            Box::pin(responses.next()),
+            Box::pin(send.stopped()),
+        )
+        .await
+        {
+            futures_util::future::Either::Left((next, _)) => next,
+            futures_util::future::Either::Right(_) => {
+                call.finish(WireCode::Cancelled);
+                return Err(TransportError::Io("response consumer disconnected".into()));
+            }
+        };
+        let Some(response) = next else {
+            break;
+        };
         let response = match response {
             Ok(response) => response,
             Err(status) => return write_trailer(send, status.into(), call).await,
@@ -1279,6 +1294,35 @@ mod streaming_call_tests {
     struct U32Msg {
         #[prost(uint32, tag = "1")]
         x: u32,
+    }
+
+    #[tokio::test]
+    async fn stopped_consumer_cancels_an_idle_response_stream() {
+        struct StoppedSend;
+        impl SendHalf for StoppedSend {
+            type Error = std::io::Error;
+            async fn send_body(&mut self, _: Bytes) -> Result<(), Self::Error> {
+                panic!("no response available");
+            }
+            async fn close_send(&mut self, _: Option<Trailer>) -> Result<(), Self::Error> {
+                panic!("cancelled transport");
+            }
+            fn reset(&mut self, _: WireCode) {}
+            async fn stopped(&mut self) {}
+        }
+        let mut send = StoppedSend;
+        let call = CallSpan::new(tracing::Span::none());
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            write_streaming_response(
+                &mut send,
+                futures_util::stream::pending::<Result<U32Msg, WireStatus>>(),
+                &call,
+            ),
+        )
+        .await
+        .expect("idle cancellation must not wait for another response");
+        assert!(result.is_err());
     }
 
     #[derive(Clone, PartialEq, ::prost::Message)]

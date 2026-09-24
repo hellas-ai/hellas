@@ -39,14 +39,16 @@ use hellas_rpc::{
     OutputEventEnvelope, ProducerSigningKey, ProgramManifest, PublicKey,
 };
 use hellas_work::work::{
-    BackendFault, PaidEvaluateBackend, PreparedEvaluateInput, ProviderEndpoint, RunAdmission,
-    RunError, RunOutcome, WorkService, run_accepted_work,
+    BackendFault, PaidWorkBackend, PreparedEvaluateInput, ProviderEndpoint, RunAdmission, RunError,
+    RunOutcome, WorkService, run_accepted_work,
 };
 use hellas_work::work_store::{
     ChannelRecord, ChannelStateError, ChannelStore, JobPhase, JobState, Role, SetupOrigin,
     TerminalOutcome, WorkStoreError,
 };
 
+#[path = "work_run/fetch.rs"]
+mod fetch;
 mod support;
 use support::{advance, bond_edge, client, network, payload_at, payment_edge, provider, temp};
 
@@ -163,14 +165,16 @@ fn payment_values() -> EdgeValues {
     EdgeValues::new(PAYMENT_VALUE, PAYMENT_RESERVE, Fees::new(0, 0, 0, 0))
 }
 
-fn descriptor_with(policy: PaidExecutionPolicyV1) -> WorkChannelDescriptor {
+fn descriptor_with(
+    policy: impl Into<hellas_rpc::protocol::work_profile::PaidWorkPolicy>,
+) -> WorkChannelDescriptor {
     let config = WorkChannelConfig {
         network: network(),
         payment_edge: payment_edge(),
         payment_terms: payment_terms(),
         policy_salt: SALT,
         channel_policy: channel_policy(),
-        execution_policy: policy,
+        execution_policy: policy.into(),
         expected_payment_values: payment_values(),
     };
     match WorkChannelDescriptor::open(config) {
@@ -452,7 +456,7 @@ impl CountingBackend {
     }
 }
 
-impl PaidEvaluateBackend for CountingBackend {
+impl PaidWorkBackend for CountingBackend {
     fn evaluate(
         &self,
         input: PreparedEvaluateInput,

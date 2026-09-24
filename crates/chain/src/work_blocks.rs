@@ -476,7 +476,7 @@ mod tests {
             network: TEST_NETWORK,
             policy_salt: SALT,
             channel_policy: channel_policy(),
-            execution_policy: execution_policy(),
+            execution_policy: execution_policy().into(),
             expected_payment_values: expected_values(),
             min_omit_response_blocks: hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
         }
@@ -893,7 +893,7 @@ mod tests {
                 payment_terms: payment_terms(),
                 policy_salt: SALT,
                 channel_policy: channel_policy(),
-                execution_policy: execution_policy(),
+                execution_policy: execution_policy().into(),
                 expected_payment_values: expected_values(),
             }) {
                 Ok(descriptor) => descriptor,

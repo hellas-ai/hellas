@@ -786,11 +786,7 @@ impl PreparedPaidInputV1 {
                 bytes.len()
             )));
         }
-        let mut reader = BundleReader {
-            bytes,
-            offset: 0,
-            budget,
-        };
+        let mut reader = BundleReader::new(bytes, budget);
         let bundle = Self {
             evaluate_request: reader.body("evaluate_request")?,
             manifest: reader.body("manifest")?,
@@ -834,14 +830,39 @@ impl PreparedPaidInputV1 {
     }
 }
 
-struct BundleReader<'a> {
+/// Cursor over a length-prefixed bundle's bodies.
+///
+/// Shared with the fetch profile's two-body bundle
+/// ([`super::work_fetch::PreparedPaidFetchInputV1`]) so the two rules that
+/// keep a declared length honest — never past the input, never past the
+/// budget — exist once. The error messages name "prepared input"; the
+/// fetch bundle is one.
+pub(crate) struct BundleReader<'a> {
     bytes: &'a [u8],
     offset: usize,
     budget: usize,
 }
 
-impl BundleReader<'_> {
-    fn body(&mut self, field: &'static str) -> Result<Vec<u8>, CanonicalDecodeError> {
+impl<'a> BundleReader<'a> {
+    pub(crate) const fn new(bytes: &'a [u8], budget: usize) -> Self {
+        Self {
+            bytes,
+            offset: 0,
+            budget,
+        }
+    }
+
+    /// Bytes consumed so far; the caller compares it against the input
+    /// length to refuse trailing bytes.
+    ///
+    /// Used by the fetch profile's bundle; the evaluate bundle reads the
+    /// field directly, one module over.
+    #[cfg(feature = "work")]
+    pub(crate) const fn offset(&self) -> usize {
+        self.offset
+    }
+
+    pub(crate) fn body(&mut self, field: &'static str) -> Result<Vec<u8>, CanonicalDecodeError> {
         let start = self
             .offset
             .checked_add(LENGTH_PREFIX)

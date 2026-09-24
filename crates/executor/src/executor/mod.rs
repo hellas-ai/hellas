@@ -107,6 +107,10 @@ pub(crate) enum ExecutorRequest {
 /// This has a distinct bounded ingress so peer RPC traffic cannot delay its
 /// admission past queued best-effort execution.
 pub(crate) enum ExecutorOwedRequest {
+    RunPaidFetch {
+        input: Box<hellas_work::work::PreparedFetchInput>,
+        reply: oneshot::Sender<Result<Vec<hellas_rpc::OutputEventEnvelope>, ExecutorError>>,
+    },
     /// Start one already-authorized paid job.
     ///
     /// No ticket, no quote, and no admission of its own: the paid endpoint
@@ -128,6 +132,10 @@ pub(crate) enum ExecutorOwedRequest {
 
 /// Trusted notifications from the bounded set of active execution producers.
 pub(crate) enum ExecutorCompletion {
+    PaidFetch {
+        reply: oneshot::Sender<Result<Vec<hellas_rpc::OutputEventEnvelope>, ExecutorError>>,
+        result: Result<Vec<hellas_rpc::OutputEventEnvelope>, ExecutorError>,
+    },
     #[cfg(feature = "evaluate")]
     EvaluateFinished(Box<WorkerCompletion>),
     FetchFinished(Box<FetchCompletion>),

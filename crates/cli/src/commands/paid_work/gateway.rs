@@ -10,6 +10,7 @@ use hellas_rpc::protocol::artifacts::{
     BoundTermId, InputAddressed as _, OutputAddressed as _, SourceRef, TextArtifact, TextExecution,
     TextPolicy, TokenIds,
 };
+use iroh::Endpoint;
 use serde::Deserialize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -273,6 +274,9 @@ pub async fn load_gateway_backend(
         providers.push(Arc::new(Provider {
             policy: config.provider_policy(),
             args: RunArgs {
+                provider_genesis: None,
+                apple_app_id: None,
+                apple_cd_hashes: Vec::new(),
                 work_config: provider.work_config,
                 journal_root: provider.journal_root,
                 provider: provider.provider,
@@ -455,7 +459,7 @@ impl PaidGateway {
                     if session.is_none() {
                         match connect_before_deadline(
                             &sender, streamed, deadline, PROVIDER_CONNECTION_TIMEOUT,
-                            OpenPaidChannel::open(provider.args.clone(), endpoint.clone(), settlement_key.clone()),
+                            open_paid_channel(&provider.args, endpoint.clone(), settlement_key.clone(), hellas_rpc::Assurance::ProducerSigned),
                         ).await
                         {
                             Ok(opened) => {
@@ -477,7 +481,7 @@ impl PaidGateway {
                         }
                     }
                     let session = session.as_mut().expect("channel was opened");
-                    if prepared.is_some() && session.needs_recovery {
+                    if prepared.is_some() && session.needs_recovery() {
                         let recovery_deadline = deadline.min(
                             tokio::time::Instant::now() + RECOVERY_ATTEMPT_TIMEOUT,
                         );
@@ -508,9 +512,9 @@ impl PaidGateway {
                     // ClientEndpoint journals the proposal nonce before releasing
                     // its signature. Recovery and a failed dial need not propose
                     // this request; a lost acceptance response does advance it.
-                    let proposal_nonce = session.client.state().proposal_nonce_high_water();
+                    let proposal_nonce = session.state().proposal_nonce_high_water();
                     let already_proposed = prepared_bytes.as_ref().is_some_and(|input| {
-                        session.client.state().jobs().any(|job| job.prepared_input() == input)
+                        session.state().jobs().any(|job| job.prepared_input() == input)
                     });
                     let request_session = &mut *session;
                     let input = prepared.clone();
@@ -518,7 +522,7 @@ impl PaidGateway {
                     let result = before_proposal(
                         &sender, streamed, deadline,
                         |proposed| async move {
-                            request_session.run_with_admission(input, true, on_progress, Some(&proposed)).await
+                            request_session.run_with_admission(input.map(Into::into), true, on_progress, Some(&proposed)).await
                         },
                     ).await
                         .and_then(|result| result)
@@ -526,7 +530,7 @@ impl PaidGateway {
                         .map(Option::unwrap_or_default);
                     if let Err(error) = &result {
                         if !recovery && error.is::<RequestStopped>()
-                            && session.client.state().proposal_nonce_high_water() == proposal_nonce
+                            && session.state().proposal_nonce_high_water() == proposal_nonce
                         {
                             return result;
                         }
@@ -545,7 +549,7 @@ impl PaidGateway {
                             Some(hellas_work::work::ProposeError::Store(_)),
                         );
                         if !already_proposed && !uncertain_append
-                            && session.client.state().proposal_nonce_high_water() == proposal_nonce
+                            && session.state().proposal_nonce_high_water() == proposal_nonce
                         {
                             provider.connection_failed();
                             tracing::debug!(provider = %provider.args.provider, error = %format!("{error:#}"),
@@ -902,6 +906,7 @@ fn output_events(output: PaidOutput) -> CliResult<Vec<ExecutionEvent>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iroh::Endpoint;
 
     #[tokio::test]
     async fn disconnected_queued_request_never_starts_work() {
@@ -1033,7 +1038,10 @@ mod tests {
         let gateway = PaidGateway {
             providers: Vec::new(),
             next: AtomicUsize::new(0),
-            endpoint: Endpoint::builder(presets::Minimal).bind().await.unwrap(),
+            endpoint: Endpoint::builder(iroh::endpoint::presets::Minimal)
+                .bind()
+                .await
+                .unwrap(),
             settlement_key: Secp256k1Signer::from_secret_scalar([7; 32]).unwrap(),
             admission: Arc::new(Semaphore::new(1)),
             tasks: Mutex::new(Vec::new()),

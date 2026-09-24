@@ -290,6 +290,11 @@ fn default_path() -> anyhow::Result<PathBuf> {
     default_hellas_path(IDENTITY_FILE, "--identity")
 }
 
+#[cfg(feature = "gateway")]
+pub(crate) fn default_gateway_archive_path() -> anyhow::Result<PathBuf> {
+    default_hellas_path("gateway-archive", "--archive-dir")
+}
+
 #[cfg(feature = "node")]
 pub(crate) fn default_artifact_store_path() -> anyhow::Result<PathBuf> {
     default_hellas_path(ARTIFACT_STORE_DIR, "--artifact-store-path")

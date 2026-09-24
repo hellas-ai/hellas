@@ -28,6 +28,7 @@ pub(crate) fn parse_fetch_environment(s: &str) -> Result<hellas_rpc::ContentId, 
     match s {
         "codex-responses" => Ok(hellas_rpc::FetchEnvironment::CodexResponses.manifest_id()),
         "openai-responses" => Ok(hellas_rpc::FetchEnvironment::OpenAiResponses.manifest_id()),
+        "http" => Ok(hellas_rpc::FetchEnvironment::Http.manifest_id()),
         content_id => parse_content_id_hex(content_id),
     }
 }

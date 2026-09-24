@@ -115,3 +115,4 @@ windows-sys = { version = "0.61", optional = true, features = [
 [dev-dependencies]
 iroh = { workspace = true, features = ["tls-ring"] }
 tokio = { workspace = true, features = ["full"] }
+tracing-subscriber = { workspace = true }

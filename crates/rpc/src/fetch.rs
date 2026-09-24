@@ -29,18 +29,18 @@ const INPUT_EVENT_KINDS: [&str; 8] = [
 ///
 /// Each envelope has its own wire frame; this bound limits retained state and
 /// transcript verification work rather than the size of a terminal frame.
-pub const MAX_FETCH_OUTPUT_EVENTS: usize = 4_096;
+pub const MAX_FETCH_OUTPUT_EVENTS: usize = 32_768;
 
 /// Maximum cumulative payload bytes across all signed Fetch output envelopes,
 /// including the terminal payload.
-pub const MAX_FETCH_OUTPUT_PAYLOAD_BYTES: usize = 2 * 1024 * 1024;
+pub const MAX_FETCH_OUTPUT_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 
 /// Maximum UTF-8 JSON bytes in the signed Fetch `request.body` event.
 ///
 /// This is checked before callers allocate/sign a transcript and again after
 /// verifiers authenticate it, so every Fetch implementation shares the same
 /// v0.0.1 admission bound.
-pub const MAX_FETCH_REQUEST_BODY_BYTES: usize = 1024 * 1024;
+pub const MAX_FETCH_REQUEST_BODY_BYTES: usize = 2 * 1024 * 1024;
 
 /// Maximum UTF-8 bytes in each signed Fetch route component (`service` and
 /// `method`).

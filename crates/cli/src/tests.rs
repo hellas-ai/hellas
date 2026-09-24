@@ -753,7 +753,10 @@ fn fetch_accepts_payload() {
 
 #[test]
 fn direct_fetch_accepts_builtin_environment_aliases_and_exact_id() {
-    for (spelling, expected) in fetch_environment_cases() {
+    for (spelling, expected) in fetch_environment_cases()
+        .into_iter()
+        .chain([("http", hellas_rpc::FetchEnvironment::Http.manifest_id())])
+    {
         let cli = Cli::try_parse_from([
             "hellas",
             "fetch",
