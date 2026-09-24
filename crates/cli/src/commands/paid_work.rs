@@ -527,7 +527,7 @@ fn read_prepared_work_input(path: &Path) -> CliResult<PreparedPaidWorkInput> {
         .map_err(|error| anyhow::anyhow!("invalid prepared paid input {}: {error}", path.display()))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "llm"))]
 fn read_prepared_input(path: &Path) -> CliResult<PreparedPaidInputV1> {
     let bytes = super::read_bounded_regular_file(path, "prepared paid input", MAX_RECORD_BYTES)?;
     PreparedPaidInputV1::decode(&bytes, MAX_RECORD_BYTES)
