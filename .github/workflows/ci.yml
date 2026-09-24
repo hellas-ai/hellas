@@ -97,6 +97,11 @@ jobs:
           BUILD_OUTPUT: ${{ steps.build.outputs.output }}
         run: |
           set -euo pipefail
+          if [ "$BUILD_NAME" = hellas-rpc-wasm ]; then
+            test -s "$BUILD_OUTPUT/lib/libhellas_rpc.rlib"
+          else
+            test -x "$BUILD_OUTPUT/bin/hellas-cli"
+          fi
           mkdir artifacts
           tar --dereference -C "$BUILD_OUTPUT" -czf "artifacts/hellas-$BUILD_NAME-$GITHUB_SHA.tar.gz" .
           cd artifacts
