@@ -287,15 +287,25 @@ let
       nativePkg.commonArgs
       // {
         pname = "hellas-rpc-wasm";
-        cargoBuildFlags = [
-          "-p"
-          "hellas-rpc"
-        ];
-        CARGO_BUILD_TARGET = "wasm32-unknown-unknown";
-        # wasm tests need wasm-bindgen-test infra (deferred). buildRustPackage's
-        # canExecute heuristic doesn't see our CARGO_BUILD_TARGET override, so
-        # without this it'd try to invoke `cargo test` against wasm and fail.
+        # cargoBuildHook passes the native --target explicitly, which overrides
+        # CARGO_BUILD_TARGET. Select the wasm target in the actual command.
+        buildPhase = ''
+          runHook preBuild
+          cargo build --offline --release --target wasm32-unknown-unknown -p hellas-rpc --jobs "$NIX_BUILD_CORES"
+          runHook postBuild
+        '';
+        # Wasm tests need a wasm test runtime.
         doCheck = false;
+        dontStrip = true;
+        separateDebugInfo = false;
+        # The default Cargo install hook installs executables, not this rlib.
+        installPhase = ''
+          runHook preInstall
+          install -Dm644 target/wasm32-unknown-unknown/release/libhellas_rpc.rlib "$out/lib/libhellas_rpc.rlib"
+          mkdir -p "$out/lib/deps"
+          cp target/wasm32-unknown-unknown/release/deps/*.rlib "$out/lib/deps/"
+          runHook postInstall
+        '';
       }
     );
 
