@@ -25,6 +25,7 @@ fn receipt() -> Deployment {
             provider: ProviderConfig::Runpod {
                 account: Some("work".into()),
                 gpu_type: "NVIDIA L4".into(),
+                interruptible: false,
                 disk_gb: 20,
                 volume_gb: 20,
                 container_registry_auth_id: None,
@@ -64,29 +65,70 @@ fn command_contract_requires_info_target_and_explicit_destroy_target() {
 #[tokio::test]
 async fn dry_run_needs_no_profile_credentials_or_receipt() {
     let image = format!("registry/image@sha256:{}", "a".repeat(64));
-    let cli = Cli::try_parse_from([
-        "hellas",
-        "cloud",
-        "runpod",
-        "--account",
-        "unconfigured",
-        "create",
-        "--name",
-        "trial",
-        "--image",
-        &image,
-        "--gpu",
-        "NVIDIA L4",
-        "--dry-run",
-    ])
-    .unwrap();
-    let Command::Cloud(CloudArgs {
-        provider: CloudCommand::Runpod(args),
-        ..
-    }) = cli.command;
-    let value = args.run().await.unwrap();
-    assert_eq!(value["account"], "unconfigured");
-    assert_eq!(value["result"]["env"], serde_json::json!({}));
+    for interruptible in [false, true] {
+        let mut argv = vec![
+            "hellas",
+            "cloud",
+            "runpod",
+            "--account",
+            "unconfigured",
+            "create",
+            "--name",
+            "trial",
+            "--image",
+            &image,
+            "--gpu",
+            "NVIDIA L4",
+            "--dry-run",
+        ];
+        if interruptible {
+            argv.push("--interruptible");
+        }
+        let cli = Cli::try_parse_from(argv).unwrap();
+        let Command::Cloud(CloudArgs {
+            provider: CloudCommand::Runpod(args),
+            ..
+        }) = cli.command;
+        // The control socket serializes the same command before dispatching it.
+        let mut rpc = serde_json::to_value(args).unwrap();
+        assert_eq!(rpc["command"]["interruptible"], interruptible);
+        if !interruptible {
+            // Clients predating the flag still request on-demand pods.
+            rpc["command"]
+                .as_object_mut()
+                .unwrap()
+                .remove("interruptible");
+        }
+        let value = serde_json::from_value::<RunpodArgs>(rpc)
+            .unwrap()
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(value["account"], "unconfigured");
+        assert_eq!(value["result"]["env"], serde_json::json!({}));
+        assert_eq!(value["result"]["interruptible"], interruptible);
+    }
+}
+
+#[test]
+fn receipts_preserve_spot_choice_and_default_old_receipts_to_on_demand() {
+    let mut state = receipt();
+    let mut old = serde_json::to_value(&state).unwrap();
+    old["spec"]["provider"]
+        .as_object_mut()
+        .unwrap()
+        .remove("interruptible");
+    let old: Deployment = serde_json::from_value(old).unwrap();
+    assert_eq!(old.spec.provider, state.spec.provider);
+
+    if let ProviderConfig::Runpod { interruptible, .. } = &mut state.spec.provider {
+        *interruptible = true;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("receipt.json");
+    save_state(&path, &state, true).unwrap();
+    let saved: Deployment = read_json(&path).unwrap();
+    assert_eq!(saved.spec.provider, state.spec.provider);
 }
 
 #[tokio::test]

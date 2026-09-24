@@ -57,6 +57,10 @@ pub enum RunpodCommand {
         image: String,
         #[arg(long = "gpu")]
         gpu_type: String,
+        /// Request a spot pod that Runpod may interrupt at any time.
+        #[arg(long)]
+        #[serde(default)]
+        interruptible: bool,
         #[arg(long, default_value_t = 20)]
         #[serde(default = "default_disk")]
         disk_gb: u32,
@@ -154,6 +158,7 @@ impl RunpodArgs {
                 name,
                 image,
                 gpu_type,
+                interruptible,
                 disk_gb,
                 volume_gb,
                 registry_auth_id,
@@ -172,6 +177,7 @@ impl RunpodArgs {
                     provider: ProviderConfig::Runpod {
                         account: account.clone(),
                         gpu_type,
+                        interruptible,
                         disk_gb,
                         volume_gb,
                         container_registry_auth_id: registry_auth_id,

@@ -207,6 +207,7 @@ impl Cloud {
                 CloudKind::Runpod,
                 ProviderConfig::Runpod {
                     gpu_type,
+                    interruptible,
                     disk_gb,
                     volume_gb,
                     container_registry_auth_id,
@@ -215,7 +216,7 @@ impl Cloud {
             ) => {
                 let mut body = json!({
                 "name":spec.name, "imageName":spec.image, "computeType":"GPU", "cloudType":"SECURE",
-                "gpuTypeIds":[gpu_type], "gpuCount":1, "interruptible":false,
+                "gpuTypeIds":[gpu_type], "gpuCount":1, "interruptible":interruptible,
                 "containerDiskInGb":disk_gb, "volumeInGb":volume_gb, "volumeMountPath":"/var/lib/hellas",
                 "env":env, "ports":[]
                 });
@@ -307,6 +308,7 @@ fn runpod_summary(value: &Value) -> Value {
     json!({"id":value["id"], "name":value["name"],
         "desired_status":value["desiredStatus"], "image":value["imageName"],
         "gpu_count":value["gpuCount"], "hourly_rate":value["costPerHr"],
+        "interruptible":value["interruptible"],
         "disk_gb":value["containerDiskInGb"], "volume_gb":value["volumeInGb"]})
 }
 

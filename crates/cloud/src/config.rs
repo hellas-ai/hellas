@@ -29,6 +29,8 @@ pub enum ProviderConfig {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         account: Option<String>,
         gpu_type: String,
+        #[serde(default)]
+        interruptible: bool,
         disk_gb: u32,
         volume_gb: u32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
