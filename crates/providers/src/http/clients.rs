@@ -36,7 +36,7 @@ impl Clients {
             tls: request.tls.clone(),
             credential: request.credential.clone(),
         };
-        if let Some(client) = self.cached(&key) {
+        if let Some(client) = Self::cached(&mut self.0.lock().unwrap(), &key) {
             return Ok(client);
         }
         // Build outside the lock. A concurrent miss may build a second client,
@@ -58,10 +58,7 @@ impl Clients {
             .build()
             .map_err(|_| fault("HTTPS client initialization failed"))?;
         let mut entries = self.0.lock().unwrap();
-        if let Some(index) = entries.iter().position(|(existing, _)| *existing == key) {
-            let entry = entries.remove(index).unwrap();
-            let client = entry.1.clone();
-            entries.push_back(entry);
+        if let Some(client) = Self::cached(&mut entries, &key) {
             return Ok(client);
         }
         if entries.len() == MAX_CLIENTS {
@@ -71,8 +68,7 @@ impl Clients {
         Ok(client)
     }
 
-    fn cached(&self, key: &Key) -> Option<Client> {
-        let mut entries = self.0.lock().unwrap();
+    fn cached(entries: &mut VecDeque<(Key, Client)>, key: &Key) -> Option<Client> {
         let index = entries.iter().position(|(existing, _)| existing == key)?;
         let entry = entries.remove(index).unwrap();
         let client = entry.1.clone();

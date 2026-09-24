@@ -1,33 +1,67 @@
-use super::*;
+use super::{
+    affinity::{Hints, family},
+    config::{HttpBackend, HttpGatewayConfig, HttpRoute},
+};
+use anyhow::ensure;
+use axum::http::{HeaderMap, StatusCode};
+use hellas_client::{ExecutionRoute, ProviderTrustAnchor};
+use hellas_rpc::ContentId;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex, Weak},
+    time::{Duration, Instant, SystemTime},
+};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-pub(super) struct Account {
-    pub(super) slots: Arc<Semaphore>,
-    pub(super) backoff: Mutex<Option<(Instant, u16)>>,
+struct Account {
+    capacity: usize,
+    slots: Arc<Semaphore>,
+    backoff: Mutex<Option<(Instant, u16)>>,
 }
 
 impl Account {
-    pub(super) fn cooldown(&self) -> Option<(u16, Duration)> {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            slots: Arc::new(Semaphore::new(capacity)),
+            backoff: Mutex::new(None),
+        }
+    }
+
+    fn load(&self) -> usize {
+        (self.capacity - self.slots.available_permits()) * 1024 / self.capacity
+    }
+
+    fn acquire(&self) -> Result<OwnedSemaphorePermit, (u16, Duration)> {
+        if let Some((status, delay)) = self.cooldown() {
+            return Err((status, delay));
+        }
+        self.slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| (503, Duration::ZERO))
+    }
+
+    fn cooldown(&self) -> Option<(u16, Duration)> {
         let (until, status) = (*self.backoff.lock().unwrap())?;
         let delay = until.saturating_duration_since(Instant::now());
         (!delay.is_zero()).then_some((status, delay))
     }
 
-    pub(super) fn observe(&self, status: u16, headers: &HeaderMap) {
+    fn observe(&self, status: u16, headers: &HeaderMap) {
         if status == 429 || (status >= 500 && headers.contains_key("retry-after")) {
-            let delay = retry_delay(headers).min(Duration::from_secs(u32::MAX as u64));
-            let until = Instant::now() + delay;
-            let mut backoff = self.backoff.lock().unwrap();
-            if backoff.is_none_or(|(previous, _)| until > previous) {
-                *backoff = Some((until, status));
-            }
+            self.back_off(status, retry_delay(headers));
+        }
+    }
+
+    fn back_off(&self, status: u16, delay: Duration) {
+        let until = Instant::now() + delay.min(Duration::from_secs(u32::MAX as u64));
+        let mut backoff = self.backoff.lock().unwrap();
+        if backoff.is_none_or(|(previous, _)| until > previous) {
+            *backoff = Some((until, status));
         }
     }
 }
-
-use super::affinity::{Hints, family};
-use hellas_rpc::ContentId;
-use std::collections::HashMap;
-use tokio::sync::OwnedSemaphorePermit;
 
 const MAX_BINDINGS: usize = 16_384;
 const SESSION_IDLE: Duration = Duration::from_secs(24 * 60 * 60);
@@ -37,20 +71,90 @@ pub(super) struct Backend {
     pub models: Vec<String>,
     pub routes: Vec<HttpRoute>,
     pub remote: ExecutionRoute,
-    capacity: usize,
     account: Arc<Account>,
 }
 
 struct Binding {
-    backend: usize,
+    // None means different backends reported the same server-side identifier.
+    backend: Option<usize>,
     touched: Instant,
-    connection: Option<std::sync::Weak<()>>,
+    connection: Option<Weak<()>>,
 }
 
 #[derive(Default)]
 struct State {
     bindings: HashMap<ContentId, Binding>,
     next: usize,
+}
+
+impl State {
+    fn resolve(
+        &mut self,
+        session: Option<ContentId>,
+        continuations: &[ContentId],
+    ) -> Result<Option<usize>, Unavailable> {
+        let now = Instant::now();
+        self.bindings.retain(|_, binding| {
+            now.duration_since(binding.touched) < SESSION_IDLE
+                && binding
+                    .connection
+                    .as_ref()
+                    .is_none_or(|c| c.strong_count() > 0)
+        });
+        let mut pinned = None;
+        for (key, required) in continuations
+            .iter()
+            .map(|key| (*key, true))
+            .chain(session.map(|key| (key, false)))
+        {
+            let Some(binding) = self.bindings.get_mut(&key) else {
+                if required {
+                    return Err(Unavailable::conflict(
+                        "unknown or expired server-side continuation; resend full context",
+                    ));
+                }
+                continue;
+            };
+            binding.touched = now;
+            let backend = binding
+                .backend
+                .ok_or_else(|| Unavailable::conflict("ambiguous server-side continuation"))?;
+            if pinned.is_some_and(|p| p != backend) {
+                return Err(Unavailable::conflict(
+                    "conflicting session or continuation backends",
+                ));
+            }
+            pinned = Some(backend);
+        }
+        Ok(pinned)
+    }
+
+    fn check_capacity(&self, session: Option<ContentId>) -> Result<(), Unavailable> {
+        if session.is_some_and(|key| !self.bindings.contains_key(&key))
+            && self.bindings.len() >= MAX_BINDINGS
+        {
+            return Err(Unavailable::busy(503, Duration::ZERO));
+        }
+        Ok(())
+    }
+
+    fn bind(&mut self, key: ContentId, backend: usize, connection: Option<Weak<()>>) {
+        // Never overwrite a conflicting identifier or evict a live session.
+        // An unrecorded or ambiguous continuation will fail closed later.
+        if let Some(binding) = self.bindings.get_mut(&key) {
+            binding.backend = binding.backend.filter(|existing| *existing == backend);
+            binding.touched = Instant::now();
+        } else if self.bindings.len() < MAX_BINDINGS {
+            self.bindings.insert(
+                key,
+                Binding {
+                    backend: Some(backend),
+                    touched: Instant::now(),
+                    connection,
+                },
+            );
+        }
+    }
 }
 
 pub(super) struct Routing {
@@ -77,20 +181,26 @@ pub(super) struct Unavailable {
 }
 
 impl Unavailable {
-    fn conflict(message: &'static str) -> Self {
+    fn new(status: StatusCode, message: &'static str) -> Self {
         Self {
-            status: StatusCode::CONFLICT,
+            status,
             message,
             retry: None,
             backend: None,
         }
     }
+
+    fn conflict(message: &'static str) -> Self {
+        Self::new(StatusCode::CONFLICT, message)
+    }
+
     fn busy(status: u16, delay: Duration) -> Self {
         Self {
-            status: StatusCode::from_u16(status).unwrap(),
-            message: "selected backend is temporarily unavailable",
             retry: Some(delay.as_secs() + 1),
-            backend: None,
+            ..Self::new(
+                StatusCode::from_u16(status).unwrap(),
+                "selected backend is temporarily unavailable",
+            )
         }
     }
 }
@@ -99,99 +209,66 @@ impl Routing {
     pub fn new(
         config: &HttpGatewayConfig,
         remote: ExecutionRoute,
-        trust: hellas_client::ProviderTrustAnchor,
+        trust: ProviderTrustAnchor,
     ) -> anyhow::Result<Self> {
+        let routes = config.routes.iter().enumerate().map(|(index, route)| {
+            (
+                format!("route-{index}"),
+                HttpBackend {
+                    models: vec![],
+                    credential: route.credential.clone(),
+                    routes: vec![route.clone()],
+                    max_in_flight: None,
+                    provider: None,
+                },
+            )
+        });
         let mut backends = Vec::new();
-        let mut accounts: BTreeMap<String, (usize, Arc<Account>)> = BTreeMap::new();
-        let mut add = |name: String,
-                       models: Vec<String>,
-                       routes: Vec<HttpRoute>,
-                       remote: ExecutionRoute,
-                       limit: usize|
-         -> anyhow::Result<()> {
-            let account = routes[0].account();
+        let mut accounts = HashMap::new();
+        for (name, mut backend) in routes.chain(config.backends.clone()) {
+            let remote = match backend.provider {
+                Some(provider) => ExecutionRoute::remote(
+                    Some(provider.node_id),
+                    provider.node_addrs,
+                    0,
+                    ProviderTrustAnchor {
+                        expected_genesis: provider.genesis,
+                        ..trust.clone()
+                    },
+                ),
+                None => remote.clone(),
+            };
+            for route in &mut backend.routes {
+                route.credential = backend.credential.clone();
+            }
+            let account = backend.routes[0].account();
             ensure!(
-                routes.iter().all(|r| r.account() == account),
+                backend.routes.iter().all(|r| r.account() == account),
                 "a backend must use one account or origin"
             );
-            // The enrollment pin identifies the provider even when one route
-            // uses discovery and another dials that provider directly.
-            let scope = match &remote {
-                ExecutionRoute::RemoteDirect(target) => {
-                    target.provider_trust.expected_genesis.to_string()
-                }
+            // Enrollment pins share admission across direct and discovered routes.
+            let genesis = match &remote {
+                ExecutionRoute::RemoteDirect(target) => target.provider_trust.expected_genesis,
                 ExecutionRoute::RemoteDiscovery { provider_trust, .. } => {
-                    provider_trust.expected_genesis.to_string()
+                    provider_trust.expected_genesis
                 }
                 ExecutionRoute::Local => unreachable!(),
             };
-            let (configured_limit, shared) = accounts
-                .entry(format!("{scope}:{account}"))
-                .or_insert_with(|| {
-                    (
-                        limit,
-                        Arc::new(Account {
-                            slots: Arc::new(Semaphore::new(limit)),
-                            backoff: Mutex::new(None),
-                        }),
-                    )
-                });
+            let capacity = backend.max_in_flight.unwrap_or(config.max_in_flight);
+            let account = accounts
+                .entry((genesis, account))
+                .or_insert_with(|| Arc::new(Account::new(capacity)));
             ensure!(
-                *configured_limit == limit,
+                account.capacity == capacity,
                 "shared accounts require the same concurrency limit"
             );
-            let shared = shared.clone();
             backends.push(Backend {
                 name,
-                models,
-                routes,
+                models: backend.models,
+                routes: backend.routes,
                 remote,
-                capacity: limit,
-                account: shared,
+                account: account.clone(),
             });
-            Ok(())
-        };
-        if config.backends.is_empty() {
-            for (index, route) in config.routes.iter().enumerate() {
-                add(
-                    format!("route-{index}"),
-                    vec![],
-                    vec![route.clone()],
-                    remote.clone(),
-                    config.max_in_flight,
-                )?;
-            }
-        } else {
-            for (name, backend) in &config.backends {
-                let remote = if let Some(provider) = &backend.provider {
-                    let mut trust = trust.clone();
-                    trust.expected_genesis = provider.genesis;
-                    ExecutionRoute::remote(
-                        Some(provider.node_id),
-                        provider.node_addrs.clone(),
-                        0,
-                        trust,
-                    )
-                } else {
-                    remote.clone()
-                };
-                let routes = backend
-                    .routes
-                    .iter()
-                    .cloned()
-                    .map(|mut r| {
-                        r.credential = backend.credential.clone();
-                        r
-                    })
-                    .collect();
-                add(
-                    name.clone(),
-                    backend.models.clone(),
-                    routes,
-                    remote,
-                    backend.max_in_flight.unwrap_or(config.max_in_flight),
-                )?;
-            }
         }
         Ok(Self {
             backends,
@@ -216,110 +293,65 @@ impl Routing {
         connection: Option<&crate::ConnectionId>,
     ) -> Result<Selected, Unavailable> {
         let hints = if self.pooled {
-            Some(Hints::read(headers, body).map_err(|message| Unavailable {
-                status: StatusCode::BAD_REQUEST,
-                message,
-                retry: None,
-                backend: None,
-            })?)
+            Hints::read(headers, body)
+                .map_err(|message| Unavailable::new(StatusCode::BAD_REQUEST, message))?
         } else {
-            None
+            Hints::default()
         };
-        let model = hints.as_ref().and_then(|h| h.model.as_deref());
-        let mut candidates = Vec::new();
-        for (index, backend) in self.backends.iter().enumerate() {
-            if let Some(endpoint) = backend
-                .routes
-                .iter()
-                .position(|r| r.path == path && r.method == method)
-            {
-                if model.is_none_or(|model| {
+        let model = hints.model.as_deref();
+        let mut candidates: Vec<_> = self
+            .backends
+            .iter()
+            .enumerate()
+            .filter(|(_, backend)| {
+                model.is_none_or(|model| {
                     backend.models.is_empty() || backend.models.iter().any(|m| m == model)
-                }) {
-                    candidates.push((index, endpoint));
-                }
-            }
-        }
+                })
+            })
+            .filter_map(|(index, backend)| {
+                backend
+                    .routes
+                    .iter()
+                    .position(|r| r.path == path && r.method == method)
+                    .map(|endpoint| (index, endpoint))
+            })
+            .collect();
         if candidates.is_empty() {
-            return Err(Unavailable {
-                status: StatusCode::NOT_FOUND,
-                message: "no backend serves this route and model",
-                retry: None,
-                backend: None,
-            });
-        }
-        if self.pooled
-            && model.is_none()
-            && !body.is_empty()
-            && !hints
-                .as_ref()
-                .is_some_and(|h| h.previous.is_some() || h.conversation.is_some())
-        {
-            return Err(Unavailable {
-                status: StatusCode::BAD_REQUEST,
-                message: "model is required",
-                retry: None,
-                backend: None,
-            });
+            return Err(Unavailable::new(
+                StatusCode::NOT_FOUND,
+                "no backend serves this route and model",
+            ));
         }
         let family = family(path);
+        let continuations: Vec<_> = [
+            ("response", &hints.previous),
+            ("conversation", &hints.conversation),
+        ]
+        .into_iter()
+        .filter_map(|(kind, id)| id.as_ref().map(|id| self.key(kind, &[family, id])))
+        .collect();
+        if self.pooled && model.is_none() && !body.is_empty() && continuations.is_empty() {
+            return Err(Unavailable::new(
+                StatusCode::BAD_REQUEST,
+                "model is required",
+            ));
+        }
+        let connection = connection.filter(|_| self.pooled && hints.session.is_none());
         let session = hints
+            .session
             .as_ref()
-            .and_then(|h| h.session.as_ref())
-            .map(|(kind, id)| self.key("session", &[family, model.unwrap_or(""), kind, id]));
-        let connection_key =
-            connection
-                .filter(|_| self.pooled && session.is_none())
-                .map(|connection| {
+            .map(|(kind, id)| self.key("session", &[family, model.unwrap_or(""), kind, id]))
+            .or_else(|| {
+                connection.map(|c| {
                     self.key(
                         "connection",
-                        &[family, model.unwrap_or(""), &connection.id.to_string()],
+                        &[family, model.unwrap_or(""), &c.id.to_string()],
                     )
-                });
-        let affinity_key = session.or(connection_key);
-        let state_keys: Vec<_> = hints
-            .as_ref()
-            .into_iter()
-            .flat_map(|h| {
-                [
-                    h.previous
-                        .as_ref()
-                        .map(|id| self.key("response", &[family, id])),
-                    h.conversation
-                        .as_ref()
-                        .map(|id| self.key("conversation", &[family, id])),
-                ]
-            })
-            .flatten()
-            .collect();
+                })
+            });
+        // Keep resolution, admission and first binding atomic across requests.
         let mut state = self.state.lock().unwrap();
-        let now = Instant::now();
-        state.bindings.retain(|_, b| {
-            now.duration_since(b.touched) < SESSION_IDLE
-                && b.connection.as_ref().is_none_or(|c| c.strong_count() > 0)
-        });
-        let mut pinned = None;
-        for key in &state_keys {
-            let binding = state.bindings.get_mut(key).ok_or_else(|| {
-                Unavailable::conflict(
-                    "unknown or expired server-side continuation; resend full context",
-                )
-            })?;
-            binding.touched = now;
-            if pinned.is_some_and(|p| p != binding.backend) {
-                return Err(Unavailable::conflict("conflicting continuation backends"));
-            }
-            pinned = Some(binding.backend);
-        }
-        if let Some(binding) = affinity_key.and_then(|k| state.bindings.get_mut(&k)) {
-            binding.touched = now;
-            if pinned.is_some_and(|p| p != binding.backend) {
-                return Err(Unavailable::conflict(
-                    "session and continuation refer to different backends",
-                ));
-            }
-            pinned = Some(binding.backend);
-        }
+        let pinned = state.resolve(session, &continuations)?;
         if let Some(index) = pinned {
             candidates.retain(|(backend, _)| *backend == index);
             if candidates.is_empty() {
@@ -328,67 +360,48 @@ impl Routing {
                 ));
             }
         }
-        if affinity_key.is_some_and(|key| !state.bindings.contains_key(&key))
-            && state.bindings.len() >= MAX_BINDINGS
-        {
-            return Err(Unavailable::busy(503, Duration::ZERO));
-        }
+        state.check_capacity(session)?;
         let count = self.backends.len();
-        candidates.sort_by_key(|(index, _)| {
-            let backend = &self.backends[*index];
-            // Least active first, rotating equal candidates. Shared account permits
-            // also cover aliases used by multiple model configurations.
+        // Snapshot loads before sorting: other responses may release permits.
+        // Least occupied account first, rotating ties; aliases share its permits.
+        candidates.sort_by_cached_key(|(index, _)| {
             (
-                (backend.capacity - backend.account.slots.available_permits()) * 1024
-                    / backend.capacity,
+                self.backends[*index].account.load(),
                 (*index + count - state.next) % count,
             )
         });
-        let mut unavailable = None;
+        let mut unavailable: Option<(u16, Duration)> = None;
         for (backend, endpoint) in candidates {
-            let account = &self.backends[backend].account;
-            if let Some((status, delay)) = account.cooldown() {
-                if unavailable.as_ref().is_none_or(|(_, old)| delay < *old) {
-                    unavailable = Some((status, delay));
+            let permit = match self.backends[backend].account.acquire() {
+                Ok(permit) => permit,
+                Err(failure) => {
+                    if unavailable.as_ref().is_none_or(|old| failure.1 < old.1) {
+                        unavailable = Some(failure);
+                    }
+                    continue;
                 }
-                continue;
-            }
-            let Ok(permit) = account.slots.clone().try_acquire_owned() else {
-                unavailable = Some((503, Duration::ZERO));
-                continue;
             };
-            for key in state_keys.iter().copied().chain(affinity_key) {
-                state.bindings.insert(
-                    key,
-                    Binding {
-                        backend,
-                        touched: now,
-                        connection: if Some(key) == connection_key {
-                            connection.map(|c| Arc::downgrade(&c.alive))
-                        } else {
-                            None
-                        },
-                    },
-                );
+            if let Some(key) = session {
+                state.bind(key, backend, connection.map(|c| Arc::downgrade(&c.alive)));
             }
             state.next = (backend + 1) % count;
             return Ok(Selected {
                 backend,
                 endpoint,
                 permit,
-                model: model.map(str::to_owned),
-                affinity: if !state_keys.is_empty() {
+                model: hints.model,
+                affinity: if !continuations.is_empty() {
                     "continuation"
-                } else if pinned.is_some() && connection_key.is_some() {
-                    "connection"
-                } else if pinned.is_some() {
-                    "session"
-                } else {
+                } else if pinned.is_none() {
                     "new"
+                } else if connection.is_some() {
+                    "connection"
+                } else {
+                    "session"
                 },
             });
         }
-        let (status, delay) = unavailable.unwrap_or((503, Duration::ZERO));
+        let (status, delay) = unavailable.expect("nonempty backend candidates");
         let mut failure = Unavailable::busy(status, delay);
         failure.backend = pinned;
         Err(failure)
@@ -400,14 +413,9 @@ impl Routing {
 
     pub fn transport_failed(&self, backend: usize) {
         if self.pooled {
-            self.observe(
-                backend,
-                503,
-                &HeaderMap::from_iter([(
-                    "retry-after".parse().unwrap(),
-                    HeaderValue::from_static("1"),
-                )]),
-            );
+            self.backends[backend]
+                .account
+                .back_off(503, Duration::from_secs(1));
         }
     }
 
@@ -457,26 +465,33 @@ impl ResponseBinding {
                 continue;
             };
             let key = self.routing.key(kind, &[&self.family, id]);
-            let mut state = self.routing.state.lock().unwrap();
-            // Never silently overwrite another account's identifier or evict a
-            // live session. An unrecorded continuation will fail closed later.
-            if let Some(existing) = state.bindings.get_mut(&key) {
-                if existing.backend != self.backend {
-                    existing.backend = usize::MAX;
-                }
-                existing.touched = Instant::now();
-            } else if state.bindings.len() < MAX_BINDINGS {
-                state.bindings.insert(
-                    key,
-                    Binding {
-                        backend: self.backend,
-                        touched: Instant::now(),
-                        connection: None,
-                    },
-                );
-            }
+            self.routing
+                .state
+                .lock()
+                .unwrap()
+                .bind(key, self.backend, None);
         }
     }
+}
+
+pub(super) fn retry_delay(headers: &HeaderMap) -> Duration {
+    let value = headers
+        .get("retry-after")
+        .and_then(|value| value.to_str().ok());
+    value
+        .and_then(|value| {
+            value
+                .parse::<u64>()
+                .ok()
+                .map(Duration::from_secs)
+                .or_else(|| {
+                    httpdate::parse_http_date(value)
+                        .ok()
+                        .map(|date| date.duration_since(SystemTime::now()).unwrap_or_default())
+                })
+        })
+        .unwrap_or(Duration::from_secs(1))
+        .max(Duration::from_secs(1))
 }
 
 #[cfg(test)]

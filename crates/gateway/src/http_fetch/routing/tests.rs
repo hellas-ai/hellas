@@ -1,4 +1,7 @@
+use super::super::config;
 use super::*;
+use axum::http::HeaderValue;
+use hellas_rpc::Assurance;
 use serde_json::json;
 
 fn config() -> HttpGatewayConfig {
@@ -80,7 +83,7 @@ fn models_admission_and_cooldowns_do_not_move_existing_sessions() {
             .unwrap()
             .bindings
             .values()
-            .any(|b| b.backend == 0 && b.touched.elapsed() < Duration::from_secs(1)),
+            .any(|b| b.backend == Some(0) && b.touched.elapsed() < Duration::from_secs(1)),
         "rate-limited retries still keep a session active"
     );
     assert_eq!(pinned.status, StatusCode::TOO_MANY_REQUESTS);
@@ -206,17 +209,20 @@ fn server_state_uses_its_original_backend_and_unknown_or_conflicting_state_fails
             .status,
         StatusCode::CONFLICT
     );
-    routing
-        .response_binding(1, "/v1/responses")
-        .unwrap()
-        .observe(&json!({"object":"response","id":"resp_a"}));
-    assert_eq!(
-        request(json!({"model":"k3","previous_response_id":"resp_a"}))
-            .err()
+    // Neither account may repair a collision by reporting the ID again.
+    for backend in [1, 0, 1] {
+        routing
+            .response_binding(backend, "/v1/responses")
             .unwrap()
-            .status,
-        StatusCode::CONFLICT
-    );
+            .observe(&json!({"object":"response","id":"resp_a"}));
+        assert_eq!(
+            request(json!({"model":"k3","previous_response_id":"resp_a"}))
+                .err()
+                .unwrap()
+                .status,
+            StatusCode::CONFLICT
+        );
+    }
 }
 
 #[test]
@@ -229,7 +235,7 @@ fn full_affinity_table_does_not_evict_live_sessions_and_expired_server_state_is_
             state.bindings.insert(
                 ContentId::hash(&i.to_le_bytes()),
                 Binding {
-                    backend: 1,
+                    backend: Some(1),
                     touched: Instant::now(),
                     connection: None,
                 },
@@ -337,4 +343,48 @@ fn closed_client_connections_release_their_affinity_entries() {
     }
     select(&routing, "k3", "explicit-session").unwrap();
     assert_eq!(routing.state.lock().unwrap().bindings.len(), 1);
+}
+
+#[test]
+fn account_backoff_is_shared_and_never_shortened_by_another_response() {
+    let account = Arc::new(Account::new(1));
+    let other_route = account.clone();
+    let header = |seconds: &'static str| {
+        HeaderMap::from_iter([(
+            "retry-after".parse().unwrap(),
+            HeaderValue::from_static(seconds),
+        )])
+    };
+    assert!(account.cooldown().is_none());
+    account.observe(429, &header("60"));
+    assert!(other_route.cooldown().unwrap().1 > Duration::from_secs(59));
+    other_route.observe(429, &header("1"));
+    assert!(account.cooldown().unwrap().1 > Duration::from_secs(59));
+    other_route.observe(503, &header("120"));
+    assert_eq!(account.cooldown().unwrap().0, 503);
+    assert!(account.cooldown().unwrap().1 > Duration::from_secs(119));
+    // A short rate limit must not turn a retriable overload into a quota error.
+    other_route.observe(429, &header("1"));
+    assert_eq!(account.cooldown().unwrap().0, 503);
+    account.observe(200, &header("600"));
+    assert!(account.cooldown().unwrap().1 < Duration::from_secs(121));
+    *account.backoff.lock().unwrap() = Some((Instant::now(), 503));
+    assert!(account.cooldown().is_none());
+    let permit = account.slots.clone().try_acquire_owned().unwrap();
+    assert!(other_route.slots.clone().try_acquire_owned().is_err());
+    drop(permit);
+    assert!(other_route.slots.clone().try_acquire_owned().is_ok());
+}
+
+#[test]
+fn new_sessions_use_relative_account_load() {
+    let mut config = config();
+    config.backends.get_mut("b").unwrap().max_in_flight = Some(2);
+    let routing = routing(config);
+    let a = select(&routing, "k3", "a").unwrap();
+    let b = select(&routing, "k3", "b").unwrap();
+    let c = select(&routing, "k3", "c").unwrap();
+    assert_eq!((a.backend, b.backend, c.backend), (0, 1, 1));
+    drop(a);
+    assert_eq!(select(&routing, "k3", "d").unwrap().backend, 0);
 }

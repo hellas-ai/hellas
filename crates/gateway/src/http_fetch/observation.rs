@@ -1,6 +1,7 @@
 use serde_json::Value;
 use std::{io::Write, time::Instant};
 
+#[derive(Clone)]
 pub(super) struct Metrics {
     #[cfg(feature = "otel")]
     requests: opentelemetry::metrics::Counter<u64>,
@@ -97,12 +98,7 @@ impl Observation {
             #[cfg(feature = "otel")]
             route: route.into(),
             #[cfg(feature = "otel")]
-            metrics: Metrics {
-                requests: metrics.requests.clone(),
-                duration: metrics.duration.clone(),
-                first_byte: metrics.first_byte.clone(),
-                tokens: metrics.tokens.clone(),
-            },
+            metrics: metrics.clone(),
         }
     }
     pub(super) fn backend(&mut self, name: &str, affinity: &'static str) {

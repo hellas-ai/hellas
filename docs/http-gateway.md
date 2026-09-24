@@ -63,8 +63,8 @@ never becomes an upstream credential. Optional route `headers` holds operator
 `[name, value]` pairs, with lowercase names. Configured values override the
 corresponding client header. Account credentials belong on the backend.
 
-The earlier top-level `routes` configuration remains supported for opaque HTTP
-passthrough, without model selection. Use either `backends` or `routes`, not both.
+For opaque HTTP passthrough without model selection, configure top-level `routes`
+instead of `backends`.
 
 Omit `credential` for an unauthenticated upstream. Such routes share admission
 by origin. Optional `tls` uses the [Fetch TLS vocabulary](../crates/providers/HTTPS.md)

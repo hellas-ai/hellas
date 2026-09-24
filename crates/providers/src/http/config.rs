@@ -125,20 +125,20 @@ impl HttpSecret {
                     None => None,
                 };
                 let mut object = read_credential(path.clone()).await?;
-                if let Some(refresh) = refresh {
-                    if refresh.due(&object)? {
-                        let retry_at = guard.as_mut().expect("refresh holds its account lock");
-                        if retry_at.is_some_and(|deadline| deadline > std::time::Instant::now()) {
-                            return Err(super::fault("credential refresh is cooling down"));
-                        }
-                        **retry_at = Some(std::time::Instant::now() + Duration::from_secs(30));
-                        refresh.run().await?;
-                        object = read_credential(path.clone()).await?;
-                        if refresh.due(&object)? {
-                            return Err(super::fault("credential refresh did not renew the token"));
-                        }
-                        **retry_at = None;
+                if let Some(refresh) = refresh
+                    && refresh.due(&object)?
+                {
+                    let retry_at = guard.as_mut().expect("refresh holds its account lock");
+                    if retry_at.is_some_and(|deadline| deadline > std::time::Instant::now()) {
+                        return Err(super::fault("credential refresh is cooling down"));
                     }
+                    **retry_at = Some(std::time::Instant::now() + Duration::from_secs(30));
+                    refresh.run().await?;
+                    object = read_credential(path.clone()).await?;
+                    if refresh.due(&object)? {
+                        return Err(super::fault("credential refresh did not renew the token"));
+                    }
+                    **retry_at = None;
                 }
                 let secret = credential_field(&object, field)
                     .and_then(serde_json::Value::as_str)

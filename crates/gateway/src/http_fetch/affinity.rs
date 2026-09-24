@@ -1,8 +1,9 @@
 //! Read routing hints without changing the bytes forwarded upstream.
-use super::*;
+use axum::http::HeaderMap;
 use serde_json::Value;
 use std::io::Read;
 
+#[derive(Default)]
 pub(super) struct Hints {
     pub model: Option<String>,
     pub session: Option<(String, String)>,
@@ -79,19 +80,19 @@ impl Hints {
                 }
             }
         }
-        if session.is_none() {
-            if let Some(user) = value.pointer("/metadata/user_id").and_then(Value::as_str) {
-                let id = serde_json::from_str::<Value>(user)
-                    .ok()
-                    .and_then(|v| {
-                        v.get("session_id")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned)
-                    })
-                    .or_else(|| user.rsplit_once("_session_").map(|(_, id)| id.to_owned()));
-                if let Some(id) = id.filter(|s| !s.is_empty() && s.len() <= 1024) {
-                    session = Some(("claude-session".into(), id));
-                }
+        if session.is_none()
+            && let Some(user) = value.pointer("/metadata/user_id").and_then(Value::as_str)
+        {
+            let id = serde_json::from_str::<Value>(user)
+                .ok()
+                .and_then(|v| {
+                    v.get("session_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .or_else(|| user.rsplit_once("_session_").map(|(_, id)| id.to_owned()));
+            if let Some(id) = id.filter(|s| !s.is_empty() && s.len() <= 1024) {
+                session = Some(("claude-session".into(), id));
             }
         }
         if session.is_none() {
@@ -118,6 +119,7 @@ pub(super) fn family(path: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::HeaderValue;
     use std::io::Write;
 
     #[test]

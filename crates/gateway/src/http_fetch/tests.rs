@@ -1,40 +1,10 @@
-use super::config::public_tls;
-use super::routing::Account;
+use super::config::{HttpRoute, public_tls};
+use super::routing::retry_delay;
 use super::*;
-
-#[test]
-fn account_backoff_is_shared_and_never_shortened_by_another_response() {
-    let account = Arc::new(Account {
-        slots: Arc::new(Semaphore::new(1)),
-        backoff: Mutex::new(None),
-    });
-    let other_route = account.clone();
-    let header = |seconds: &'static str| {
-        HeaderMap::from_iter([(
-            "retry-after".parse().unwrap(),
-            HeaderValue::from_static(seconds),
-        )])
-    };
-    assert!(account.cooldown().is_none());
-    account.observe(429, &header("60"));
-    assert!(other_route.cooldown().unwrap().1 > Duration::from_secs(59));
-    other_route.observe(429, &header("1"));
-    assert!(account.cooldown().unwrap().1 > Duration::from_secs(59));
-    other_route.observe(503, &header("120"));
-    assert_eq!(account.cooldown().unwrap().0, 503);
-    assert!(account.cooldown().unwrap().1 > Duration::from_secs(119));
-    // A short rate limit must not turn a retriable overload into a quota error.
-    other_route.observe(429, &header("1"));
-    assert_eq!(account.cooldown().unwrap().0, 503);
-    account.observe(200, &header("600"));
-    assert!(account.cooldown().unwrap().1 < Duration::from_secs(121));
-    *account.backoff.lock().unwrap() = Some((Instant::now(), 503));
-    assert!(account.cooldown().is_none());
-    let permit = account.slots.clone().try_acquire_owned().unwrap();
-    assert!(other_route.slots.clone().try_acquire_owned().is_err());
-    drop(permit);
-    assert!(other_route.slots.clone().try_acquire_owned().is_ok());
-}
+use std::{
+    collections::BTreeMap,
+    time::{Duration, SystemTime},
+};
 
 #[test]
 fn forward_only_protocol_headers_and_keep_retry_and_quota_metadata() {

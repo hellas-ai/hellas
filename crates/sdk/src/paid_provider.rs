@@ -8,6 +8,7 @@ use hellas_chain::{
     ConsensusInfo, ConsensusVerifier, FinalizedWorkView, WorkBlocks, WorkChannelQuery,
 };
 use hellas_kernel::{EdgeId, NetworkId, Secp256k1Signer, Secp256k1Verifier};
+use hellas_rpc::call::WithTrailer;
 use hellas_rpc::pb::work::*;
 use hellas_rpc::peers::PeerId;
 use hellas_rpc::protocol::Digest;
@@ -47,51 +48,36 @@ fn not_ready() -> WorkRefused {
 }
 
 impl WorkSetupHandler for UnmountedWork {
-    fn exchange_setup(
+    async fn exchange_setup(
         &self,
         _request: ExchangeSetupRequest,
         _context: TransportContext,
-    ) -> impl core::future::Future<
-        Output = Result<
-            impl Into<hellas_rpc::call::WithTrailer<ExchangeSetupResponse>> + Send,
-            WireStatus,
-        >,
-    > + Send {
-        core::future::ready(Ok(ExchangeSetupResponse {
+    ) -> Result<impl Into<WithTrailer<ExchangeSetupResponse>> + Send, WireStatus> {
+        Ok(ExchangeSetupResponse {
             outcome: Some(exchange_setup_response::Outcome::Refused(not_ready())),
-        }))
+        })
     }
 }
 
 impl WorkHandler for UnmountedWork {
-    fn accept_work(
+    async fn accept_work(
         &self,
         _request: AcceptWorkRequest,
         _context: TransportContext,
-    ) -> impl core::future::Future<
-        Output = Result<
-            impl Into<hellas_rpc::call::WithTrailer<AcceptWorkResponse>> + Send,
-            WireStatus,
-        >,
-    > + Send {
-        core::future::ready(Ok(AcceptWorkResponse {
+    ) -> Result<impl Into<WithTrailer<AcceptWorkResponse>> + Send, WireStatus> {
+        Ok(AcceptWorkResponse {
             outcome: Some(accept_work_response::Outcome::Refused(not_ready())),
-        }))
+        })
     }
 
-    fn deliver_result(
+    async fn deliver_result(
         &self,
         _request: DeliverResultRequest,
         _context: TransportContext,
-    ) -> impl core::future::Future<
-        Output = Result<
-            impl Into<hellas_rpc::call::WithTrailer<DeliverResultResponse>> + Send,
-            WireStatus,
-        >,
-    > + Send {
-        core::future::ready(Ok(DeliverResultResponse {
+    ) -> Result<impl Into<WithTrailer<DeliverResultResponse>> + Send, WireStatus> {
+        Ok(DeliverResultResponse {
             outcome: Some(deliver_result_response::Outcome::Refused(not_ready())),
-        }))
+        })
     }
 
     async fn stream_result(
@@ -105,19 +91,14 @@ impl WorkHandler for UnmountedWork {
         ))
     }
 
-    fn admit_certificate(
+    async fn admit_certificate(
         &self,
         _request: AdmitCertificateRequest,
         _context: TransportContext,
-    ) -> impl core::future::Future<
-        Output = Result<
-            impl Into<hellas_rpc::call::WithTrailer<AdmitCertificateResponse>> + Send,
-            WireStatus,
-        >,
-    > + Send {
-        core::future::ready(Ok(AdmitCertificateResponse {
+    ) -> Result<impl Into<WithTrailer<AdmitCertificateResponse>> + Send, WireStatus> {
+        Ok(AdmitCertificateResponse {
             outcome: Some(admit_certificate_response::Outcome::Refused(not_ready())),
-        }))
+        })
     }
 }
 
@@ -342,8 +323,7 @@ where
         &self,
         request: AcceptWorkRequest,
         _context: TransportContext,
-    ) -> Result<impl Into<hellas_rpc::call::WithTrailer<AcceptWorkResponse>> + Send, WireStatus>
-    {
+    ) -> Result<impl Into<WithTrailer<AcceptWorkResponse>> + Send, WireStatus> {
         if let Some(response) = self.service.precheck_acceptance(&request) {
             return Ok(response);
         }
@@ -400,9 +380,8 @@ where
         &self,
         request: DeliverResultRequest,
         context: TransportContext,
-    ) -> Result<impl Into<hellas_rpc::call::WithTrailer<DeliverResultResponse>> + Send, WireStatus>
-    {
-        let response: hellas_rpc::call::WithTrailer<DeliverResultResponse> =
+    ) -> Result<impl Into<WithTrailer<DeliverResultResponse>> + Send, WireStatus> {
+        let response: WithTrailer<DeliverResultResponse> =
             if self.refresh_delivery(&request).await.is_ok() {
                 self.service.deliver_result(request, context).await?.into()
             } else {
@@ -453,17 +432,12 @@ where
         }))
     }
 
-    fn admit_certificate(
+    async fn admit_certificate(
         &self,
         request: AdmitCertificateRequest,
         context: TransportContext,
-    ) -> impl core::future::Future<
-        Output = Result<
-            impl Into<hellas_rpc::call::WithTrailer<AdmitCertificateResponse>> + Send,
-            WireStatus,
-        >,
-    > + Send {
-        self.service.admit_certificate(request, context)
+    ) -> Result<impl Into<WithTrailer<AdmitCertificateResponse>> + Send, WireStatus> {
+        self.service.admit_certificate(request, context).await
     }
 }
 

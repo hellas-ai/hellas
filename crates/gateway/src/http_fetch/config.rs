@@ -1,4 +1,10 @@
-use super::*;
+use super::{connection_headers, hop_header};
+use anyhow::ensure;
+use axum::{body::Bytes, http::HeaderMap};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use hellas_rpc::http_fetch::{HttpFetchRequest, HttpTls, HttpTrustRoots};
+use serde::Deserialize;
+use std::collections::BTreeMap;
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -69,7 +75,7 @@ impl HttpGatewayConfig {
     pub(super) fn validate(&self) -> anyhow::Result<()> {
         ensure!(
             self.routes.is_empty() != self.backends.is_empty(),
-            "configure either HTTP backends or legacy routes"
+            "configure either HTTP backends or opaque routes"
         );
         ensure!(
             self.max_in_flight > 0 && self.max_in_flight <= 1024,

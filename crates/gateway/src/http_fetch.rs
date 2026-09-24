@@ -5,7 +5,6 @@ mod observation;
 mod routing;
 
 pub use config::HttpGatewayConfig;
-use config::HttpRoute;
 #[cfg(test)]
 mod tests;
 
@@ -17,21 +16,13 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
 };
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures::StreamExt;
 use hellas_client::{ExecutionRoute, cache::fetch_output_stream};
 use hellas_rpc::{
     Assurance, FetchEnvironment, ProducerSigningKey, Retention,
-    http_fetch::{HttpFetchRequest, HttpTls, HttpTrustRoots},
     output::{AdaptorEvent, HttpResponseEvent, OutputEvent, StopReason},
 };
-use serde::Deserialize;
-use std::{
-    collections::BTreeMap,
-    sync::{Arc, Mutex},
-    time::{Duration, Instant, SystemTime},
-};
-use tokio::sync::Semaphore;
+use std::sync::Arc;
 use tracing::Instrument;
 
 use super::{GatewayHandle, GatewayOptions, access, execution::CliRuntime};
@@ -45,7 +36,8 @@ fn attributed(mut response: Response, name: &str) -> Response {
 }
 
 struct HttpState {
-    config: HttpGatewayConfig,
+    service: String,
+    method: String,
     runtime: CliRuntime,
     routing: Arc<routing::Routing>,
     signer: Arc<ProducerSigningKey>,
@@ -82,7 +74,8 @@ pub(super) async fn start(options: GatewayOptions) -> anyhow::Result<GatewayHand
     );
     let routing = Arc::new(routing::Routing::new(&config, route, trust)?);
     let state = Arc::new(HttpState {
-        config,
+        service: config.service,
+        method: config.method,
         runtime: CliRuntime::remote(options.secret_key.clone()).await?,
         routing,
         signer: Arc::new(options.producer_key.clone()),
@@ -313,8 +306,8 @@ async fn open(
     hellas_adaptors::OutputEventStream,
 )> {
     let events = hellas_rpc::fetch::build_input_events_with_retention(
-        &state.config.service,
-        &state.config.method,
+        &state.service,
+        &state.method,
         payload,
         FetchEnvironment::Http.manifest_id(),
         state.assurance,
@@ -360,13 +353,12 @@ fn response_headers(headers: Vec<(String, String)>) -> HeaderMap {
             && !connection.contains(&name)
             && !matches!(name.as_str(), "content-length" | "set-cookie")
             && !name.starts_with("x-hellas-")
-        {
-            if let (Ok(name), Ok(value)) = (
+            && let (Ok(name), Ok(value)) = (
                 name.parse::<axum::http::HeaderName>(),
                 value.parse::<HeaderValue>(),
-            ) {
-                result.append(name, value);
-            }
+            )
+        {
+            result.append(name, value);
         }
     }
     result
@@ -393,24 +385,4 @@ fn connection_headers<'a>(headers: impl Iterator<Item = (&'a str, &'a str)>) -> 
         .flat_map(|(_, value)| value.split(','))
         .map(|name| name.trim().to_ascii_lowercase())
         .collect()
-}
-
-fn retry_delay(headers: &HeaderMap) -> Duration {
-    let value = headers
-        .get("retry-after")
-        .and_then(|value| value.to_str().ok());
-    value
-        .and_then(|value| {
-            value
-                .parse::<u64>()
-                .ok()
-                .map(Duration::from_secs)
-                .or_else(|| {
-                    httpdate::parse_http_date(value)
-                        .ok()
-                        .map(|date| date.duration_since(SystemTime::now()).unwrap_or_default())
-                })
-        })
-        .unwrap_or(Duration::from_secs(1))
-        .max(Duration::from_secs(1))
 }
