@@ -44,6 +44,9 @@ pin `provider_genesis`; their funded bond fixes the settlement identity in all c
 Provision provider bonds with `hellas-cli provision`; coin
 values and policy terms must agree with the provider work config. Payment coins
 must be owned by the gateway settlement identity and cannot fund two channels.
+The omission bond must exceed the remaining payment capacity: with 1,000 units
+and zero fees/reserve, a bond of 501 leaves 499 spendable units. The client checks
+this before signing setup terms or creating a journal.
 The provider's route table must authorize the gateway transport and settlement
 identities. All participants must use the same compatible chain revision.
 

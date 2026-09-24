@@ -962,7 +962,12 @@ impl ProviderEndpoint {
                     limit: hellas_rpc::protocol::work_fetch::MAX_FETCH_TRANSCRIPT_BYTES as u64,
                 }));
             }
-            stream::fetch_frames(&delivered, transcript).try_fold(0, |size, frame| {
+            stream::fetch_frames(
+                &delivered,
+                transcript,
+                ready.execution_policy().max_encoded_result_frame(),
+            )
+            .try_fold(0, |size, frame| {
                 Ok::<_, RunError>(size.max(frame?.encoded_len() as u64))
             })?
         } else {

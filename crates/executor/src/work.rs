@@ -175,6 +175,7 @@ impl PaidWorkBackend for ExecutorHandle {
         input: hellas_work::work::PreparedFetchInput,
     ) -> Result<Vec<OutputEventEnvelope>, BackendFault> {
         self.send_owed(|reply| ExecutorOwedRequest::RunPaidFetch {
+            span: hellas_rpc::request_span!(target: "hellas_request", "paid.executor.fetch"),
             input: Box::new(input),
             progress: None,
             reply,
@@ -189,6 +190,7 @@ impl PaidWorkBackend for ExecutorHandle {
         progress: PaidProgress,
     ) -> Result<Vec<OutputEventEnvelope>, BackendFault> {
         self.send_owed(|reply| ExecutorOwedRequest::RunPaidFetch {
+            span: hellas_rpc::request_span!(target: "hellas_request", "paid.executor.fetch"),
             input: Box::new(input),
             progress: Some(progress),
             reply,

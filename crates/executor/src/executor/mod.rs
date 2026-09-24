@@ -108,6 +108,7 @@ pub(crate) enum ExecutorRequest {
 /// admission past queued best-effort execution.
 pub(crate) enum ExecutorOwedRequest {
     RunPaidFetch {
+        span: tracing::Span,
         input: Box<hellas_work::work::PreparedFetchInput>,
         progress: Option<hellas_work::work::PaidProgress>,
         reply: oneshot::Sender<Result<Vec<hellas_rpc::OutputEventEnvelope>, ExecutorError>>,

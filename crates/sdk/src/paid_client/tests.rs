@@ -7,6 +7,73 @@ use hellas_rpc::{
 };
 use hellas_wire::{MethodMarker, StreamTransport, WireStatus};
 
+#[tokio::test]
+async fn insufficient_collateral_is_rejected_before_network_or_journal_creation() {
+    let (policy, _, _) = fetch_request(Assurance::ProducerSigned, hellas_rpc::Retention::Ephemeral);
+    let root = tempfile::tempdir().unwrap();
+    let journal_root = root.path().join("journal");
+    let endpoint = Endpoint::builder(presets::Minimal)
+        .bind_addr("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+        .unwrap()
+        .bind()
+        .await
+        .unwrap();
+    let args = PaidWorkOptions {
+        config: WorkConfig {
+            chain: crate::work_config::ChainCrossCheck {
+                network: policy.network,
+                genesis_payload_digest: [0; 32].into(),
+                threshold_identity: Vec::new(),
+            },
+            // No chain is needed to reject these terms.
+            validators: Vec::new(),
+            journal_root: root.path().join("provider"),
+            routes: Default::default(),
+            policy_salt: policy.policy_salt,
+            channel_policy: policy.channel_policy,
+            execution_policy: policy.execution_policy,
+            poll: Duration::from_millis(200),
+            expected_payment_values: hellas_kernel::EdgeValues::new(
+                1000,
+                0,
+                hellas_kernel::Fees::ZERO,
+            ),
+            min_omit_response_blocks: policy.min_omit_response_blocks,
+        },
+        journal_root: journal_root.clone(),
+        provider: endpoint.id(),
+        provider_addrs: Vec::new(),
+        provider_trust: None,
+        bond: EdgeId::from_bytes([0; 32]),
+        payment_funding: Funding::new(
+            hellas_kernel::List::empty(hellas_kernel::CoinId::from_bytes([0; 32])),
+            hellas_kernel::List::empty(hellas_kernel::CoinId::from_bytes([0; 32])),
+        ),
+        omission_bond: 51,
+        acceptance_blocks: 300,
+        terminal_blocks: 3000,
+        payment_blocks: 600,
+        timeout: Duration::from_secs(30),
+    };
+    let result = PaidWorkSession::open(
+        args,
+        endpoint.clone(),
+        Secp256k1Signer::from_secret_scalar([1; 32]).unwrap(),
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Err(PaidClientError::WorkSetup(
+            hellas_rpc::protocol::work_setup::WorkSetupError::Undercollateralised {
+                bond: 51,
+                capacity: 949,
+            }
+        ))
+    ));
+    assert!(!journal_root.exists());
+    endpoint.close().await;
+}
+
 fn enrollment(peer: EndpointId) -> (ProviderEnrollmentBundle, ProducerSigningKey) {
     let root = ProducerSigningKey::from_secret_bytes([1; 32]).unwrap();
     let producer = ProducerSigningKey::from_secret_bytes([2; 32]).unwrap();

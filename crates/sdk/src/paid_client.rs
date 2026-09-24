@@ -208,6 +208,16 @@ impl PaidWorkSession {
         }
 
         let config = &args.config;
+        // Reject impossible funding before signing either setup transaction.
+        let settlement = hellas_kernel::work_payment_settlement(
+            config.expected_payment_values,
+            args.omission_bond,
+        )
+        .ok_or(hellas_rpc::protocol::work_setup::WorkSetupError::Unsettleable)?;
+        hellas_rpc::protocol::work_setup::check_collateral(
+            args.omission_bond,
+            settlement.capacity(),
+        )?;
         let policy = config.provider_policy();
         let bond = args.bond;
         let payment_funding = args.payment_funding.clone();

@@ -6,6 +6,7 @@ use std::sync::Arc;
 use hellas_rpc::OutputEventEnvelope;
 use hellas_work::work::PreparedFetchInput;
 use tokio::sync::{mpsc, oneshot};
+use tracing::Instrument as _;
 
 use super::Executor;
 use crate::ExecutorError;
@@ -19,6 +20,7 @@ impl Executor {
         input: PreparedFetchInput,
         progress: Option<hellas_work::work::PaidProgress>,
         reply: oneshot::Sender<Result<Vec<OutputEventEnvelope>, ExecutorError>>,
+        span: tracing::Span,
     ) {
         let prepared = self.prepare_paid_fetch(input);
         let (entry, session, request, policy) = match prepared {
@@ -31,7 +33,7 @@ impl Executor {
         self.active_fetches += 1;
         let completion = self.completion_tx.clone();
         let key = Arc::clone(&self.provider.producer_key);
-        tokio::spawn(async move {
+        let task = async move {
             let (sender, mut receiver) = mpsc::channel(64);
             let run = super::execution::run_fetch_provider(
                 entry.provider,
@@ -85,7 +87,8 @@ impl Executor {
             let _ = completion
                 .send(ExecutorCompletion::PaidFetch { reply, result })
                 .await;
-        });
+        };
+        tokio::spawn(task.instrument(span));
     }
 
     fn prepare_paid_fetch(

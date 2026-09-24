@@ -300,6 +300,12 @@ where
                 .catch_up(source)
                 .await
                 .context("the mounted channel could not catch up to the fresh snapshot")?;
+            let cursor = service
+                .with_state(|state| state.cursor().0)
+                .context("the mounted channel cursor is unavailable")?;
+            if ready.check_caught_up(cursor).is_ok() {
+                break;
+            }
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }

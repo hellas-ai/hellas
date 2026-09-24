@@ -22,21 +22,60 @@ pub(super) struct Progress {
 pub(super) fn fetch_frames<'a>(
     delivered: &'a WorkDelivered,
     events: &'a [OutputEventEnvelope],
+    frame_limit: u32,
 ) -> impl Iterator<Item = Result<WorkStreamEvent, PaidWorkError>> + 'a {
-    events.iter().enumerate().map(|(index, event)| {
-        let transcript = encode_transcript(std::slice::from_ref(event))?;
-        let outcome = if index + 1 == events.len() {
-            work_stream_event::Outcome::Terminal(hellas_rpc::pb::work::WorkStreamTerminal {
-                result: delivered.result.clone(),
-                provider_signature: delivered.provider_signature.clone(),
-                terminal_transcript: transcript,
+    let prefixes = &events[..events.len().saturating_sub(1)];
+    prefix_batches(prefixes, frame_limit, true)
+        .map(|batch| {
+            Ok(WorkStreamEvent {
+                outcome: Some(work_stream_event::Outcome::Prefix(encode_transcript(
+                    batch,
+                )?)),
             })
-        } else {
-            work_stream_event::Outcome::Prefix(transcript)
-        };
-        Ok(WorkStreamEvent {
-            outcome: Some(outcome),
         })
+        .chain(events.last().into_iter().map(|event| {
+            let transcript = encode_transcript(std::slice::from_ref(event))?;
+            let outcome =
+                work_stream_event::Outcome::Terminal(hellas_rpc::pb::work::WorkStreamTerminal {
+                    result: delivered.result.clone(),
+                    provider_signature: delivered.provider_signature.clone(),
+                    terminal_transcript: transcript,
+                });
+            Ok(WorkStreamEvent {
+                outcome: Some(outcome),
+            })
+        }))
+}
+
+// Batch only events already available. Each bounded frame still passes the
+// provider's fresh chain check; each envelope is verified separately by the client.
+fn prefix_batches(
+    mut events: &[OutputEventEnvelope],
+    frame_limit: u32,
+    fetch: bool,
+) -> impl Iterator<Item = &[OutputEventEnvelope]> {
+    let budget = if fetch {
+        (frame_limit as usize).min(64 * 1024).saturating_sub(32)
+    } else {
+        0
+    };
+    std::iter::from_fn(move || {
+        if events.is_empty() {
+            return None;
+        }
+        let mut bytes = 0usize;
+        let mut count = 0;
+        for event in events {
+            let next = bytes.saturating_add(spool_charge(event, fetch));
+            if count > 0 && next > budget {
+                break;
+            }
+            bytes = next;
+            count += 1;
+        }
+        let (batch, rest) = events.split_at(count);
+        events = rest;
+        Some(batch)
     })
 }
 
@@ -147,6 +186,17 @@ impl WorkService {
                     .and_then(|mut endpoint| endpoint.reserve_stream(&request, &exporter));
                 match reserved {
                     Ok(()) => {
+                        let limits = service.endpoint().and_then(|endpoint| {
+                            let policy = endpoint.admitting()?.execution_policy();
+                            Ok((policy.max_encoded_result_frame(), matches!(policy, PaidWorkPolicy::Fetch { .. })))
+                        });
+                        let (frame_limit, fetch) = match limits {
+                            Ok(limits) => limits,
+                            Err(error) => {
+                                yield Err(WireStatus::new(hellas_wire::WireCode::Unavailable, error.to_string()));
+                                return;
+                            }
+                        };
                         let response = service.release(&request, &context);
                         match response.outcome {
                             Some(DeliverOutcome::Delivered(delivered)) => {
@@ -158,7 +208,11 @@ impl WorkService {
                                     }
                                 };
                                 if events.last().is_some_and(|event| event.event().body().kind() == hellas_rpc::fetch::OUTPUT_TERMINAL_KIND) {
-                                    for frame in fetch_frames(&delivered, &events).skip(position) {
+                                    let Some(tail) = events.get(position..) else {
+                                        yield Err(WireStatus::new(hellas_wire::WireCode::Internal, "terminal result is shorter than streamed output"));
+                                        return;
+                                    };
+                                    for frame in fetch_frames(&delivered, tail, frame_limit) {
                                         yield frame.map_err(|error| WireStatus::new(hellas_wire::WireCode::Internal, error.to_string()));
                                     }
                                 } else {
@@ -176,10 +230,10 @@ impl WorkService {
                             let progress = service.progress.lock().expect("paid progress poisoned");
                             progress.get(&work_id).map(|progress| progress.events[position.min(progress.events.len())..].to_vec()).unwrap_or_default()
                         };
-                        for event in pending {
-                            match encode_transcript(&[event]) {
+                        for batch in prefix_batches(&pending, frame_limit, fetch) {
+                            match encode_transcript(batch) {
                                 Ok(prefix) => {
-                                    position += 1;
+                                    position += batch.len();
                                     yield Ok(WorkStreamEvent { outcome: Some(work_stream_event::Outcome::Prefix(prefix)) });
                                 }
                                 Err(error) => {
@@ -405,4 +459,54 @@ where
     Err(DeliverError::Malformed(
         "result stream ended without terminal result",
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn batched_fetch_preserves_every_envelope_and_bounds_each_frame() {
+        let key = hellas_rpc::ProducerSigningKey::from_secret_bytes([1; 32]).unwrap();
+        let mut builder = hellas_rpc::fetch::FetchOutputTranscriptBuilder::new(
+            hellas_rpc::InputCommitment::from_digest(hellas_rpc::Digest::from_bytes([2; 32])),
+            hellas_rpc::Assurance::ProducerSigned,
+            &key,
+        );
+        for _ in 0..100 {
+            builder.push_event(vec![7; 256]).unwrap();
+        }
+        let events = builder.finish(vec![8; 16]).unwrap();
+        let delivered = WorkDelivered {
+            result: vec![3; 128],
+            provider_signature: vec![4; 64],
+            transcript: encode_transcript(&events).unwrap(),
+        };
+        for limit in [4096, 65536] {
+            // Resuming after an arbitrary prefix must skip envelopes, not batches.
+            for position in [0, 1, 47, 100] {
+                let frames = fetch_frames(&delivered, &events[position..], limit)
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                let mut decoded = Vec::new();
+                for frame in &frames {
+                    assert!(frame.encoded_len() <= limit as usize);
+                    let bytes = match frame.outcome.as_ref().unwrap() {
+                        work_stream_event::Outcome::Prefix(bytes) => bytes,
+                        work_stream_event::Outcome::Terminal(end) => &end.terminal_transcript,
+                        _ => panic!("unexpected frame"),
+                    };
+                    decoded.extend(decode_transcript(bytes, MAX_RECORD_BYTES).unwrap());
+                }
+                assert_eq!(decoded, events[position..]);
+                assert!(matches!(
+                    frames.last().unwrap().outcome,
+                    Some(work_stream_event::Outcome::Terminal(_))
+                ));
+                if position == 0 {
+                    assert!(frames.len() < events.len());
+                }
+            }
+        }
+    }
 }
