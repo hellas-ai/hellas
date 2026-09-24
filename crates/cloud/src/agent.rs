@@ -119,17 +119,21 @@ impl Process {
     async fn configure(
         &mut self,
         configuration: crate::configuration::Configuration,
-    ) -> Result<()> {
-        configuration.validate()?;
-        ensure!(
-            !self
-                .args
-                .iter()
-                .any(|arg| arg.split('=').next() == Some("--fetch-config")),
-            "managed configuration conflicts with a launch-time fetch config"
-        );
-        let parent = self.identity.parent().context("missing data directory")?;
-        let (candidate, installed) = configuration.stage(parent)?;
+    ) -> Result<(), &'static str> {
+        configuration
+            .validate()
+            .map_err(|_| "invalid worker configuration")?;
+        if self
+            .args
+            .iter()
+            .any(|arg| arg.split('=').next() == Some("--fetch-config"))
+        {
+            return Err("managed configuration conflicts with a launch-time fetch config");
+        }
+        let parent = self.identity.parent().ok_or("missing data directory")?;
+        let (candidate, installed) = configuration
+            .stage(parent)
+            .map_err(|_| "could not stage private worker configuration")?;
         // The worker's own CLI validates the exact config and credentials before
         // disrupting the running process. Validation output can contain secrets.
         let checked = tokio::time::timeout(
@@ -148,27 +152,41 @@ impl Process {
                 .kill_on_drop(true)
                 .status(),
         )
-        .await??;
-        ensure!(checked.success(), "worker rejected fetch configuration");
+        .await
+        .map_err(|_| "worker configuration validator timed out")?
+        .map_err(|_| "could not run worker configuration validator")?;
+        if !checked.success() {
+            return Err("worker rejected fetch configuration");
+        }
         let path = self.identity.with_file_name("configuration.json");
-        self.stop().await?;
+        self.stop()
+            .await
+            .map_err(|_| "could not stop worker for configuration")?;
         let previous = self.configuration.replace(installed);
-        let applied = self.start().and_then(|()| {
-            crate::config::save_private(&path, self.configuration.as_ref().unwrap(), false)
-        });
+        let applied = self
+            .start()
+            .map_err(|_| "could not start configured worker")
+            .and_then(|()| {
+                crate::config::save_private(&path, self.configuration.as_ref().unwrap(), false)
+                    .map_err(|_| "could not persist worker configuration")
+            });
         if let Err(error) = applied {
-            self.stop().await?;
+            self.stop()
+                .await
+                .map_err(|_| "could not stop worker during configuration rollback")?;
             self.configuration = previous;
             if let Some(previous) = &self.configuration {
-                crate::config::save_private(&path, previous, false)?;
+                crate::config::save_private(&path, previous, false)
+                    .map_err(|_| "could not restore previous worker configuration")?;
             } else {
                 match std::fs::remove_file(&path) {
                     Ok(()) => {}
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(error.into()),
+                    Err(_) => return Err("could not remove failed worker configuration"),
                 }
             }
-            self.start()?;
+            self.start()
+                .map_err(|_| "could not restart worker after configuration rollback")?;
             return Err(error);
         }
         let _ = candidate.keep();
@@ -247,7 +265,13 @@ impl State {
                 }
                 Operation::Configure { configuration } => {
                     let mut process = self.process.lock().await;
-                    process.configure(configuration).await?;
+                    // Only static stage labels cross this boundary, never the
+                    // validator's output or errors containing credential paths.
+                    if let Err(message) = process.configure(configuration).await {
+                        return Ok(Response::Error {
+                            message: message.into(),
+                        });
+                    }
                     Ok(Response::Status {
                         enrollment: self.enrollment.clone(),
                         owner: self.owner.map(|owner| owner.to_string()),
