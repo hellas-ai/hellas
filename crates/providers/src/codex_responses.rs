@@ -686,7 +686,6 @@ impl CodexResponseWireItem {
             } => {
                 nonempty_bounded("call_id", &call_id, MAX_NAME_BYTES)?;
                 validate_tool_name(&name)?;
-                validate_json_arguments(&arguments)?;
                 CodexResponseItem::FunctionCall {
                     id: validate_optional_id(id)?,
                     call_id,
@@ -1465,7 +1464,11 @@ impl CodexProjector {
                 ..
             } => {
                 validate_declared_call(&self.contract, CallKind::Function, name)?;
-                validate_json_arguments(arguments)?;
+                // An added function call starts empty; its deltas and done item
+                // carry the JSON. Completed calls must always be valid objects.
+                if done || !arguments.is_empty() {
+                    validate_json_arguments(arguments)?;
+                }
                 self.authorize_call_id(call_id, done)?;
             }
             CodexResponseItem::CustomToolCall { call_id, name, .. } => {
@@ -2457,6 +2460,8 @@ struct ToolDonePayload {
 struct FunctionDeltaPayload {
     item_id: String,
     delta: String,
+    #[serde(default, rename = "obfuscation")]
+    _obfuscation: Option<IgnoredAny>,
     #[serde(default, rename = "output_index")]
     _output_index: Option<u64>,
 }

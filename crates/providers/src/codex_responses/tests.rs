@@ -616,6 +616,35 @@ fn sealed_sse_requires_one_delimited_event_and_one_data_line_per_frame() {
 }
 
 #[test]
+fn streamed_function_arguments_start_empty_but_finish_valid_and_consistent() {
+    let mut events = vec![
+        json!({"type":"response.created","response":{"id":"resp_1"}}),
+        json!({"type":"response.output_item.added","output_index":0,"item":{
+            "type":"function_call","id":"fc_1","call_id":"call_1",
+            "name":"exec_command","arguments":"","status":"in_progress"}}),
+        json!({"type":"response.function_call_arguments.delta","item_id":"fc_1",
+            "output_index":0,"delta":"{}","obfuscation":"fixture"}),
+        json!({"type":"response.function_call_arguments.done","item_id":"fc_1",
+            "output_index":0,"name":"exec_command","arguments":"{}"}),
+        json!({"type":"response.output_item.done","output_index":0,"item":{
+            "type":"function_call","id":"fc_1","call_id":"call_1",
+            "name":"exec_command","arguments":"{}","status":"completed"}}),
+        response_events().pop().unwrap(),
+    ];
+    let project = |events: &[JsonValue]| {
+        let prepared = prepare_request(&call(request(Vec::new()))).unwrap();
+        let mut projector = CodexProjector::new(prepared.contract);
+        projector.project(&sse(events))?;
+        projector.finish()
+    };
+    project(&events).unwrap();
+    for arguments in ["", "not-json", r#"{"different":true}"#] {
+        events[4]["item"]["arguments"] = json!(arguments);
+        assert!(project(&events).is_err(), "accepted {arguments:?}");
+    }
+}
+
+#[test]
 fn contract_rejects_undeclared_duplicate_and_invalid_function_calls() {
     let cases = [
         json!({"type":"response.output_item.done","item":{
