@@ -686,6 +686,7 @@ impl CodexResponseWireItem {
             } => {
                 nonempty_bounded("call_id", &call_id, MAX_NAME_BYTES)?;
                 validate_tool_name(&name)?;
+                validate_json_arguments(&arguments)?;
                 CodexResponseItem::FunctionCall {
                     id: validate_optional_id(id)?,
                     call_id,
@@ -1464,11 +1465,7 @@ impl CodexProjector {
                 ..
             } => {
                 validate_declared_call(&self.contract, CallKind::Function, name)?;
-                // An added function call starts empty; its deltas and done item
-                // carry the JSON. Completed calls must always be valid objects.
-                if done || !arguments.is_empty() {
-                    validate_json_arguments(arguments)?;
-                }
+                validate_json_arguments(arguments)?;
                 self.authorize_call_id(call_id, done)?;
             }
             CodexResponseItem::CustomToolCall { call_id, name, .. } => {
@@ -2220,14 +2217,6 @@ struct LifecycleResponse {
     _output: Option<IgnoredAny>,
     #[serde(default, rename = "usage")]
     _usage: Option<IgnoredAny>,
-    #[serde(default, rename = "access_programs")]
-    _access_programs: Option<IgnoredAny>,
-    #[serde(default, rename = "max_tool_calls")]
-    _max_tool_calls: Option<IgnoredAny>,
-    #[serde(default, rename = "moderation")]
-    _moderation: Option<IgnoredAny>,
-    #[serde(default, rename = "tool_usage")]
-    _tool_usage: Option<IgnoredAny>,
     #[serde(default, rename = "background")]
     _background: Option<IgnoredAny>,
     #[serde(default, rename = "completed_at")]
@@ -2460,8 +2449,6 @@ struct ToolDonePayload {
 struct FunctionDeltaPayload {
     item_id: String,
     delta: String,
-    #[serde(default, rename = "obfuscation")]
-    _obfuscation: Option<IgnoredAny>,
     #[serde(default, rename = "output_index")]
     _output_index: Option<u64>,
 }
@@ -2562,14 +2549,6 @@ struct CompletedResponse {
     model: Option<JsonValue>,
     #[serde(default, rename = "output")]
     _output: Option<IgnoredAny>,
-    #[serde(default, rename = "access_programs")]
-    _access_programs: Option<IgnoredAny>,
-    #[serde(default, rename = "max_tool_calls")]
-    _max_tool_calls: Option<IgnoredAny>,
-    #[serde(default, rename = "moderation")]
-    _moderation: Option<IgnoredAny>,
-    #[serde(default, rename = "tool_usage")]
-    _tool_usage: Option<IgnoredAny>,
     #[serde(default, rename = "background")]
     _background: Option<IgnoredAny>,
     #[serde(default, rename = "completed_at")]
@@ -2673,9 +2652,6 @@ impl CompletedResponse {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct UsageWire {
-    // Per-item attribution is diagnostic; billing uses the validated totals below.
-    #[serde(default, rename = "attribution")]
-    _attribution: Option<IgnoredAny>,
     input_tokens: u64,
     #[serde(default)]
     input_tokens_details: Option<InputTokenDetailsWire>,

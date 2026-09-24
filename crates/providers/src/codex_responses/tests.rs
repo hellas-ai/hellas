@@ -525,31 +525,6 @@ fn tool_search_call_is_projected_without_losing_its_client_contract() {
 }
 
 #[test]
-fn live_codex_service_metadata_does_not_enter_the_signed_projection() {
-    let project = |events: &[JsonValue]| {
-        let prepared = prepare_request(&call(request(Vec::new()))).unwrap();
-        let mut projector = CodexProjector::new(prepared.contract);
-        let mut output = projector.project(&sse(events)).unwrap();
-        output.extend(projector.finish().unwrap());
-        output
-    };
-    let mut events = response_events();
-    let expected = project(&events);
-    for event in &mut events {
-        if let Some(response) = event.get_mut("response") {
-            response["access_programs"] = json!({"private":"fixture"});
-            response["max_tool_calls"] = JsonValue::Null;
-            response["moderation"] = JsonValue::Null;
-            response["tool_usage"] = json!({"private":"fixture"});
-            if let Some(usage) = response.get_mut("usage") {
-                usage["attribution"] = json!({"items":{"private":"fixture"}});
-            }
-        }
-    }
-    assert_eq!(project(&events), expected);
-}
-
-#[test]
 fn projection_is_independent_of_every_byte_split() {
     let bytes = sse(&response_events());
     let expected = {
@@ -613,35 +588,6 @@ fn sealed_sse_requires_one_delimited_event_and_one_data_line_per_frame() {
         .unwrap_err()
         .to_string();
     assert!(error.contains("non-canonical SSE framing"));
-}
-
-#[test]
-fn streamed_function_arguments_start_empty_but_finish_valid_and_consistent() {
-    let mut events = vec![
-        json!({"type":"response.created","response":{"id":"resp_1"}}),
-        json!({"type":"response.output_item.added","output_index":0,"item":{
-            "type":"function_call","id":"fc_1","call_id":"call_1",
-            "name":"exec_command","arguments":"","status":"in_progress"}}),
-        json!({"type":"response.function_call_arguments.delta","item_id":"fc_1",
-            "output_index":0,"delta":"{}","obfuscation":"fixture"}),
-        json!({"type":"response.function_call_arguments.done","item_id":"fc_1",
-            "output_index":0,"name":"exec_command","arguments":"{}"}),
-        json!({"type":"response.output_item.done","output_index":0,"item":{
-            "type":"function_call","id":"fc_1","call_id":"call_1",
-            "name":"exec_command","arguments":"{}","status":"completed"}}),
-        response_events().pop().unwrap(),
-    ];
-    let project = |events: &[JsonValue]| {
-        let prepared = prepare_request(&call(request(Vec::new()))).unwrap();
-        let mut projector = CodexProjector::new(prepared.contract);
-        projector.project(&sse(events))?;
-        projector.finish()
-    };
-    project(&events).unwrap();
-    for arguments in ["", "not-json", r#"{"different":true}"#] {
-        events[4]["item"]["arguments"] = json!(arguments);
-        assert!(project(&events).is_err(), "accepted {arguments:?}");
-    }
 }
 
 #[test]
