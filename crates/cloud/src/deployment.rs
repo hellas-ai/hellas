@@ -12,14 +12,19 @@ pub async fn create(spec: Spec, state: &Path) -> Result<String> {
 }
 
 pub async fn create_with_credentials(
-    spec: Spec,
+    mut spec: Spec,
     state: &Path,
     credentials: Credentials,
 ) -> Result<String> {
     credentials.secret_key()?;
     let _lock = lock_state(state)?;
     spec.validate()?;
+    ensure!(
+        !state.exists(),
+        "state already exists; allocation was not attempted"
+    );
     let provider = provider::adapter(&spec.provider)?;
+    provider.prepare(&mut spec).await?;
     let mut deployment = Deployment {
         spec,
         credentials,
@@ -36,6 +41,10 @@ pub async fn create_with_credentials(
     eprintln!("allocated resource: {id}");
     deployment.resource_id = Some(id.clone());
     save_state(state, &deployment, false)?;
+    provider
+        .verify(&deployment.spec, &id)
+        .await
+        .context("allocated pod retained in receipt; inspect or destroy it before retrying")?;
     Ok(id)
 }
 
