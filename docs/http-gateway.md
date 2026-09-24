@@ -17,8 +17,7 @@ Example gateway configuration for Kimi Code:
     "path": "/v1/chat/completions",
     "method": "POST",
     "url": "https://api.kimi.com/coding/v1/chat/completions",
-    "credential": "kimi",
-    "forward_headers": ["content-type", "accept", "user-agent"]
+    "credential": "kimi"
   }]
 }
 ```
@@ -26,9 +25,19 @@ Example gateway configuration for Kimi Code:
 The service and method must match the provider's configured Fetch route. The
 credential alias belongs to that provider. Each alias shares a concurrency
 limit and cooldown across its HTTP routes. Paths and methods match exactly;
-query parameters are rejected. The forward list only accepts protocol headers;
-the caller's gateway bearer never becomes an upstream credential. Optional
+query parameters retain their order, repeats and percent encoding. Ordinary
+client headers, including idempotency keys and vendor extensions, pass through.
+Connection-specific headers, credentials, cookies and gateway control headers
+are removed; the caller's gateway bearer never becomes an upstream credential. Optional
 `headers` holds operator-supplied `[name, value]` pairs, with lowercase names.
+Configured values override the corresponding client header. The former
+`forward_headers` whitelist has been removed.
+
+Omit `credential` for an unauthenticated upstream. Such routes share admission
+by origin. Optional `tls` uses the [Fetch TLS vocabulary](../crates/providers/HTTPS.md)
+for exact trust anchors and pins, defaulting to WebPKI. Custom roots cannot be
+combined with a provider credential; that restriction remains enforced by the
+provider. Private destinations also require its explicit egress opt-in.
 
 ```sh
 hellas-cli --identity ./gateway.identity gateway \
@@ -54,7 +63,7 @@ CLI gateways archive authenticated requests and responses by default under
 `~/.hellas/gateway-archive`, or `--archive-dir DIRECTORY`. This applies to the
 existing inference routes as well as HTTP Fetch. Each exchange has owner-only
 `request.bin`, `response.bin` and `metadata.json` files. Metadata records status,
-size, elapsed time, completion and trace context; it excludes authentication
+size, content type/encoding, elapsed time, completion and trace context; it excludes authentication
 headers. `x-hellas-request-id` identifies the exchange. Failed or cancelled
 streams retain an incomplete archive. The gateway refuses requests when it
 cannot open their archive, and stops streaming on an archive write failure.
@@ -64,7 +73,9 @@ There is no automatic archive pruning.
 `--zdr` enforces this for all requests. Ambiguous flags, `store: true`, and ZDR
 with inference caching enabled are rejected before archive writes. A non-ZDR
 request may be archived even when its upstream `store` is false. Unauthorized,
-oversized and invalid ZDR requests are rejected without payload archives.
+invalid ZDR requests and bodies exceeding the 2 MiB ingress limit are rejected
+without payload archives. Non-ZDR requests that pass ingress but exceed the
+smaller Fetch envelope limit are archived with their 413 response.
 
 These switches govern this gateway's application writes. They do not establish
 OS swap/dump protection, a remote provider's host policy, upstream retention,
@@ -78,13 +89,19 @@ HTTP input is limited to 1,523,712 bytes, reserving envelope space inside the
 2 MiB signed Fetch request. Responses are limited to 8 MiB and the Fetch stream
 to 32,768 events and 16 MiB of signed payload. The provider has a 20 minute total
 HTTP deadline and a 90 second response idle timeout. Exceeding a stream limit
-closes it as incomplete. Individual upstream deliveries are forwarded promptly,
+closes it as incomplete. A slow response consumer applies bounded backpressure,
+with a 90 second drain timeout. QUIC cancellation stops an idle upstream without
+waiting for its next byte. Individual upstream deliveries are forwarded promptly,
 split at 16 KiB; the provider does not wait for a full buffer.
 
-No generation is automatically retried upstream. Upstream status, `Retry-After`,
-request IDs and rate-limit headers reach the client. A 429, or a 5xx carrying
-`Retry-After`, starts a shared account cooldown; delta seconds and HTTP dates
-are accepted. Missing or invalid delays on a 429 use one second. Excess
+No generation is automatically retried upstream. Upstream status and end-to-end
+response headers reach the client, including Location, ETag, `Retry-After`,
+request IDs and rate limits. Hop-by-hop headers and cookies are removed. Body
+framing is regenerated; representation Content-Length is retained for HEAD/304.
+A 429, or a 5xx carrying `Retry-After`, starts a shared account cooldown;
+delta seconds and HTTP dates are accepted. Requests during cooldown receive
+the status that established the longest remaining delay: a 503 remains a 503,
+so clients can keep retrying overloads. Missing or invalid delays on a 429 use one second. Excess
 concurrency returns 503 with `Retry-After: 1`.
 
 With `otel`, traces connect HTTP ingress, Fetch RPCs, credential refresh and
@@ -92,5 +109,14 @@ upstream HTTP. Span attributes exclude request/response bodies and credentials.
 `hellas.gateway.http.requests`, `.duration`, `.time_to_first_byte` and `.tokens`
 record status, completion, timings and standard OpenAI/Anthropic usage fields.
 Usage is unknown when upstream omits it; cached tokens are reported separately.
+Bodies remain encoded on the wire and in archives; usage extraction currently
+requires an uncompressed JSON/SSE response.
 Account quota windows still come from the upstream quota exporter. Request
 token totals alone cannot determine subscription quota or billing.
+
+This is an HTTP API bridge with explicit routes, authentication and resource
+limits. It does not implement CONNECT, WebSocket upgrades, streaming uploads,
+HTTP trailers or automatic rewriting of redirect URLs. Clients using Responses
+WebSockets must select their HTTP/SSE transport. Archive unavailability currently
+fails requests closed. These are contract differences from a general transparent
+HTTP proxy, even when inference and tool-call payloads are preserved exactly.

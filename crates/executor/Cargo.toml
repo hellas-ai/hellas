@@ -49,5 +49,6 @@ uuid = { version = "1", features = ["v4"] }
 zeroize = "1"
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 tracing-subscriber = { workspace = true }

@@ -1220,7 +1220,7 @@ async fn fetch_projection_rejects_event_buffered_after_terminal() {
     assert_eq!(projection_budget.events, 1);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn fetch_projection_preserves_one_permit_for_failure_terminal() {
     let signing_key = key();
     let input_commitment = InputCommitment::from_digest(Digest::from_bytes([8; 32]));
@@ -1266,6 +1266,48 @@ async fn fetch_projection_preserves_one_permit_for_failure_terminal() {
         receiver.recv().await.unwrap().unwrap().kind,
         Some(work_event::Kind::Failed(WorkFailed { position: 0, .. }))
     ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn fetch_projection_waits_for_temporary_backpressure_then_delivers_in_order() {
+    let signing_key = key();
+    let input = InputCommitment::from_digest(Digest::from_bytes([8; 32]));
+    let mut builder = FetchOutputTranscriptBuilder::new(input, test_assurance(), &signing_key);
+    let mut terminal = None;
+    let mut budget = FetchProjectionBudget::default();
+    let mut position = 0;
+    let (sender, mut receiver) = mpsc::channel(2);
+    sender
+        .try_send(Ok(WorkEvent {
+            kind: Some(work_event::Kind::Chunk(WorkChunk { output_event: None })),
+        }))
+        .unwrap();
+    let delayed_reader = async {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(receiver.recv().await.unwrap().unwrap().kind.is_some());
+        let event = receiver.recv().await.unwrap().unwrap();
+        assert!(matches!(
+            event.kind,
+            Some(work_event::Kind::Chunk(WorkChunk {
+                output_event: Some(_)
+            }))
+        ));
+    };
+    let deliver = process_projected_fetch(
+        vec![ProjectedFetch::Event(b"delayed".to_vec())],
+        &mut builder,
+        &mut terminal,
+        &mut budget,
+        &mut position,
+        &sender,
+    );
+    let (result, ()) = tokio::join!(deliver, delayed_reader);
+    let Ok(reached_terminal) = result else {
+        panic!("temporary backpressure truncated the response");
+    };
+    assert!(!reached_terminal);
+    assert_eq!(position, 7);
+    assert_eq!(budget.events, 1);
 }
 
 #[tokio::test]

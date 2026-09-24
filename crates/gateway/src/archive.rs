@@ -1,4 +1,7 @@
-use axum::{body::Bytes, http::HeaderMap};
+use axum::{
+    body::{Bytes, HttpBody},
+    http::HeaderMap,
+};
 use futures::StreamExt;
 use serde_json::json;
 use std::{
@@ -67,6 +70,7 @@ pub(crate) async fn record(
         parts.uri.path(),
         parts.method.as_str(),
         &body,
+        &parts.headers,
     )
     .await
     {
@@ -98,6 +102,16 @@ pub(crate) async fn record(
         parts
             .headers
             .insert("x-hellas-request-id", id.parse().unwrap());
+    }
+    if body.is_end_stream() {
+        if archive.finish().await.is_err() {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "response archive unavailable",
+            )
+                .into_response();
+        }
+        return axum::response::Response::from_parts(parts, body);
     }
     let mut source = body.into_data_stream();
     let stream: futures::stream::BoxStream<'static, Result<Bytes, io::Error>> =
@@ -131,6 +145,7 @@ impl Exchange {
         path: &str,
         method: &str,
         body: &Bytes,
+        headers: &HeaderMap,
     ) -> io::Result<Self> {
         let root = root.to_owned();
         let body = body.clone();
@@ -138,6 +153,8 @@ impl Exchange {
             "version": 1, "path": path, "method": method, "complete": false,
             "started_unix_ms": SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
             "request_bytes": body.len(),
+            "request_content_type": headers.get("content-type").and_then(|value| value.to_str().ok()),
+            "request_content_encoding": headers.get("content-encoding").and_then(|value| value.to_str().ok()),
         });
         #[cfg(feature = "otel")]
         {
@@ -176,6 +193,11 @@ impl Exchange {
         self.metadata["content_type"] = json!(
             headers
                 .get("content-type")
+                .and_then(|value| value.to_str().ok())
+        );
+        self.metadata["content_encoding"] = json!(
+            headers
+                .get("content-encoding")
                 .and_then(|value| value.to_str().ok())
         );
         self.save().await

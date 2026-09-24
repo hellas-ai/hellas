@@ -4,7 +4,7 @@ use super::*;
 fn account_backoff_is_shared_and_never_shortened_by_another_response() {
     let account = Arc::new(Account {
         slots: Arc::new(Semaphore::new(1)),
-        retry_at: Mutex::new(Instant::now()),
+        backoff: Mutex::new(None),
     });
     let other_route = account.clone();
     let header = |seconds: &'static str| {
@@ -13,14 +13,21 @@ fn account_backoff_is_shared_and_never_shortened_by_another_response() {
             HeaderValue::from_static(seconds),
         )])
     };
+    assert!(account.cooldown().is_none());
     account.observe(429, &header("60"));
-    assert!(other_route.delay() > Duration::from_secs(59));
+    assert!(other_route.cooldown().unwrap().1 > Duration::from_secs(59));
     other_route.observe(429, &header("1"));
-    assert!(account.delay() > Duration::from_secs(59));
+    assert!(account.cooldown().unwrap().1 > Duration::from_secs(59));
     other_route.observe(503, &header("120"));
-    assert!(account.delay() > Duration::from_secs(119));
+    assert_eq!(account.cooldown().unwrap().0, 503);
+    assert!(account.cooldown().unwrap().1 > Duration::from_secs(119));
+    // A short rate limit must not turn a retriable overload into a quota error.
+    other_route.observe(429, &header("1"));
+    assert_eq!(account.cooldown().unwrap().0, 503);
     account.observe(200, &header("600"));
-    assert!(account.delay() < Duration::from_secs(121));
+    assert!(account.cooldown().unwrap().1 < Duration::from_secs(121));
+    *account.backoff.lock().unwrap() = Some((Instant::now(), 503));
+    assert!(account.cooldown().is_none());
     let permit = account.slots.clone().try_acquire_owned().unwrap();
     assert!(other_route.slots.clone().try_acquire_owned().is_err());
     drop(permit);
@@ -33,9 +40,9 @@ fn forward_only_protocol_headers_and_keep_retry_and_quota_metadata() {
         path: "/v1/messages".into(),
         method: "POST".into(),
         url: "https://api.example.com/v1/messages".into(),
-        credential: "account".into(),
+        credential: Some("account".into()),
+        tls: public_tls(),
         headers: vec![("anthropic-version".into(), "2023-06-01".into())],
-        forward_headers: vec!["content-type".into(), "anthropic-version".into()],
     };
     let incoming = HeaderMap::from_iter([
         (
@@ -55,7 +62,9 @@ fn forward_only_protocol_headers_and_keep_retry_and_quota_metadata() {
             HeaderValue::from_static("override"),
         ),
     ]);
-    let request = route.request(Bytes::from_static(b"{\"private\":1}"), &incoming);
+    let request = route
+        .request(Bytes::from_static(b"{\"private\":1}"), &incoming)
+        .unwrap();
     assert_eq!(request.body().unwrap(), b"{\"private\":1}");
     assert_eq!(
         request.headers,
@@ -92,7 +101,7 @@ fn retry_after_supports_dates_and_has_a_nonzero_fallback() {
 }
 
 #[test]
-fn credential_and_hop_headers_cannot_be_added_to_the_forward_list() {
+fn credentials_and_hop_headers_cannot_be_configured_as_static_headers() {
     for name in ["authorization", "x-api-key", "cookie", "host", "connection"] {
         let config = HttpGatewayConfig {
             service: "http".into(),
@@ -102,11 +111,53 @@ fn credential_and_hop_headers_cannot_be_added_to_the_forward_list() {
                 path: "/v1/messages".into(),
                 method: "POST".into(),
                 url: "https://example.com/v1/messages".into(),
-                credential: "account".into(),
-                headers: vec![],
-                forward_headers: vec![name.into()],
+                credential: Some("account".into()),
+                tls: public_tls(),
+                headers: vec![(name.into(), "secret".into())],
             }],
         };
         assert!(config.validate().is_err());
     }
+}
+
+#[test]
+fn extension_headers_and_duplicates_survive_but_connection_tokens_do_not() {
+    let route: HttpRoute = serde_json::from_value(serde_json::json!({
+        "path":"/v1/chat/completions", "method":"POST", "url":"https://example.com/v1/chat/completions"
+    })).unwrap();
+    let mut headers = HeaderMap::new();
+    for (name, value) in [
+        ("idempotency-key", "key"),
+        ("x-stainless-retry-count", "0"),
+        ("content-encoding", "gzip"),
+        ("connection", "X-Private-Hop"),
+        ("x-private-hop", "secret"),
+        ("x-beta", "one"),
+        ("x-beta", "two"),
+        ("x-hellas-zdr", "true"),
+        ("cookie", "secret"),
+    ] {
+        headers.append(name, value.parse().unwrap());
+    }
+    let request = route.request(Bytes::new(), &headers).unwrap();
+    assert_eq!(request.headers.len(), 5);
+    assert_eq!(
+        request
+            .headers
+            .iter()
+            .filter(|(n, _)| n == "x-beta")
+            .count(),
+        2
+    );
+    assert!(!request.headers.iter().any(|(name, _)| {
+        ["connection", "x-private-hop", "cookie", "x-hellas-zdr"].contains(&name.as_str())
+    }));
+    let response = response_headers(vec![
+        ("connection".into(), "X-Private-Hop".into()),
+        ("x-private-hop".into(), "secret".into()),
+        ("location".into(), "/next".into()),
+        ("etag".into(), "v1".into()),
+    ]);
+    assert_eq!(response.len(), 2);
+    assert_eq!(response["location"], "/next");
 }

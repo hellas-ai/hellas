@@ -60,9 +60,10 @@ use super::{
 };
 
 /// Backpressure buffer for the per-execution event channel. The worker keeps
-/// one slot reserved for the terminal frame and cancels a consumer that does
-/// not drain the rest; it never blocks the sole execution thread.
+/// one slot reserved for the terminal frame. Backpressure waits in the spawned
+/// provider task, leaving the execution actor free to admit and finish work.
 const PER_EXECUTION_CHANNEL_CAPACITY: usize = 64;
+const FETCH_STREAM_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 const FETCH_STREAM_STALLED_ERROR: &str =
     "fetch stream consumer did not drain its bounded event channel";
 
@@ -997,9 +998,10 @@ pub(super) async fn run_fetch_provider(
     let mut position = 0_u64;
     let mut terminal = None;
     let mut projection_budget = FetchProjectionBudget::default();
-    let response = provider
-        .run(request)
-        .await
+    let response = tokio::select! {
+        response = provider.run(request) => response,
+        _ = sender.closed() => Err(FetchProviderError::failed("fetch stream consumer disconnected")),
+    }
         .map_err(|error| FetchProviderFailure { position, error })?;
     let projected = projector
         .begin(response.head)
@@ -1018,7 +1020,16 @@ pub(super) async fn run_fetch_provider(
     .await?;
     let mut stream = response.stream;
 
-    while let Some(next) = stream.next().await {
+    loop {
+        let next = tokio::select! {
+            next = stream.next() => next,
+            _ = sender.closed() => return Err(FetchProviderFailure {
+                position, error: FetchProviderError::failed("fetch stream consumer disconnected"),
+            }),
+        };
+        let Some(next) = next else {
+            break;
+        };
         let chunk = next.map_err(|error| FetchProviderFailure { position, error })?;
         let projected = projector
             .project(&chunk)
@@ -1096,15 +1107,19 @@ async fn process_projected_fetch(
                         ),
                     });
                 }
-                // The actor needs one guaranteed permit for WorkFinished or
-                // WorkFailed. Fail before signing another chunk when only that
-                // permit remains; never await a slow consumer here.
-                if sender.capacity() <= 1 {
-                    return Err(FetchProviderFailure {
-                        position: *position,
-                        error: FetchProviderError::failed(FETCH_STREAM_STALLED_ERROR),
-                    });
-                }
+                // Reserve the event and terminal slots together. Temporary
+                // backpressure must not truncate a valid upstream response.
+                let mut permits =
+                    tokio::time::timeout(FETCH_STREAM_DRAIN_TIMEOUT, sender.reserve_many(2))
+                        .await
+                        .map_err(|_| FetchProviderFailure {
+                            position: *position,
+                            error: FetchProviderError::failed(FETCH_STREAM_STALLED_ERROR),
+                        })?
+                        .map_err(|_| FetchProviderFailure {
+                            position: *position,
+                            error: FetchProviderError::failed("fetch stream consumer disconnected"),
+                        })?;
                 let payload_len =
                     projection_budget
                         .record_event(payload.len())
@@ -1128,31 +1143,16 @@ async fn process_projected_fetch(
                                 "fetch output event transcript failed: {err}"
                             )),
                         })?;
-                match sender.try_send(Ok(WorkEvent {
-                    kind: Some(work_event::Kind::Chunk(WorkChunk {
-                        output_event: Some(output_event_to_pb(&output_event)),
-                    })),
-                })) {
-                    Ok(()) => {
-                        *position = next_position;
-                        // Give the just-returned RPC receiver a scheduling
-                        // opportunity before classifying a full burst as a
-                        // stalled consumer.
-                        tokio::task::yield_now().await;
-                    }
-                    Err(mpsc::error::TrySendError::Full(_)) => {
-                        return Err(FetchProviderFailure {
-                            position: *position,
-                            error: FetchProviderError::failed(FETCH_STREAM_STALLED_ERROR),
-                        });
-                    }
-                    Err(mpsc::error::TrySendError::Closed(_)) => {
-                        return Err(FetchProviderFailure {
-                            position: *position,
-                            error: FetchProviderError::failed("fetch stream consumer disconnected"),
-                        });
-                    }
-                }
+                permits
+                    .next()
+                    .expect("two reserved permits")
+                    .send(Ok(WorkEvent {
+                        kind: Some(work_event::Kind::Chunk(WorkChunk {
+                            output_event: Some(output_event_to_pb(&output_event)),
+                        })),
+                    }));
+                drop(permits);
+                *position = next_position;
             }
             ProjectedFetch::Terminal(payload) => {
                 if terminal.is_some() {

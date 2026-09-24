@@ -50,32 +50,40 @@ pub struct HttpRoute {
     pub path: String,
     pub method: String,
     pub url: String,
-    pub credential: String,
+    pub credential: Option<String>,
+    #[serde(default = "public_tls")]
+    pub tls: HttpTls,
     #[serde(default)]
     pub headers: Vec<(String, String)>,
-    /// Only these caller headers cross the gateway; credentials never do.
-    #[serde(default)]
-    pub forward_headers: Vec<String>,
+}
+
+fn public_tls() -> HttpTls {
+    HttpTls {
+        roots: HttpTrustRoots::WebPki,
+        spki_sha256: vec![],
+    }
 }
 
 struct Account {
     slots: Arc<Semaphore>,
-    retry_at: Mutex<Instant>,
+    backoff: Mutex<Option<(Instant, u16)>>,
 }
 
 impl Account {
-    fn delay(&self) -> Duration {
-        self.retry_at
-            .lock()
-            .unwrap()
-            .saturating_duration_since(Instant::now())
+    fn cooldown(&self) -> Option<(u16, Duration)> {
+        let (until, status) = (*self.backoff.lock().unwrap())?;
+        let delay = until.saturating_duration_since(Instant::now());
+        (!delay.is_zero()).then_some((status, delay))
     }
 
     fn observe(&self, status: u16, headers: &HeaderMap) {
         if status == 429 || (status >= 500 && headers.contains_key("retry-after")) {
             let delay = retry_delay(headers).min(Duration::from_secs(u32::MAX as u64));
-            let mut retry_at = self.retry_at.lock().unwrap();
-            *retry_at = (*retry_at).max(Instant::now() + delay);
+            let until = Instant::now() + delay;
+            let mut backoff = self.backoff.lock().unwrap();
+            if backoff.is_none_or(|(previous, _)| until > previous) {
+                *backoff = Some((until, status));
+            }
         }
     }
 }
@@ -111,53 +119,74 @@ impl HttpGatewayConfig {
                 "duplicate HTTP route"
             );
             ensure!(
-                route.forward_headers.iter().all(|name| matches!(
-                    name.as_str(),
-                    "content-type"
-                        | "accept"
-                        | "anthropic-version"
-                        | "anthropic-beta"
-                        | "user-agent"
-                )),
-                "unsupported forwarded header"
-            );
-            ensure!(
                 route.headers.iter().all(|(name, _)| !matches!(
                     name.as_str(),
                     "authorization" | "x-api-key" | "cookie"
                 )),
                 "use a provider credential alias for authentication"
             );
-            route.request(Bytes::new(), &HeaderMap::new()).validate()?;
+            route.request(Bytes::new(), &HeaderMap::new())?.validate()?;
         }
         Ok(())
     }
 }
 
 impl HttpRoute {
-    fn request(&self, body: Bytes, incoming: &HeaderMap) -> HttpFetchRequest {
+    fn account(&self) -> String {
+        match &self.credential {
+            Some(alias) => format!("credential:{alias}"),
+            None => format!(
+                "origin:{}",
+                self.url
+                    .parse::<reqwest::Url>()
+                    .expect("validated URL")
+                    .origin()
+                    .ascii_serialization()
+            ),
+        }
+    }
+
+    fn request(&self, body: Bytes, incoming: &HeaderMap) -> anyhow::Result<HttpFetchRequest> {
         let mut headers = self.headers.clone();
-        for name in &self.forward_headers {
-            if !headers.iter().any(|(configured, _)| configured == name) {
-                for value in incoming.get_all(name) {
-                    if let Ok(value) = value.to_str() {
-                        headers.push((name.clone(), value.into()));
-                    }
-                }
+        let connection = connection_headers(
+            incoming
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.to_str().unwrap_or_default())),
+        );
+        for (name, value) in incoming {
+            let name = name.as_str();
+            if !hop_header(name)
+                && !connection.iter().any(|token| token == name)
+                && !matches!(
+                    name,
+                    "host"
+                        | "content-length"
+                        | "authorization"
+                        | "x-api-key"
+                        | "api-key"
+                        | "x-goog-api-key"
+                        | "cookie"
+                        | "forwarded"
+                )
+                && !name.starts_with("x-hellas-")
+                && !name.starts_with("x-forwarded-")
+                && !self
+                    .headers
+                    .iter()
+                    .any(|(configured, _)| configured == name)
+            {
+                headers.push((name.into(), value.to_str()?.into()));
             }
         }
-        HttpFetchRequest {
+        Ok(HttpFetchRequest {
             url: self.url.clone(),
             method: self.method.clone(),
             headers,
             body_base64: STANDARD.encode(body),
-            tls: HttpTls {
-                roots: HttpTrustRoots::WebPki,
-                spki_sha256: vec![],
-            },
-            credential: Some(self.credential.clone()),
+            tls: self.tls.clone(),
+            credential: self.credential.clone(),
             max_response_bytes: hellas_rpc::http_fetch::MAX_HTTP_RESPONSE_BYTES,
-        }
+        })
     }
 }
 
@@ -193,10 +222,10 @@ pub(super) async fn start(options: GatewayOptions) -> anyhow::Result<GatewayHand
         .iter()
         .map(|route| {
             (
-                route.credential.clone(),
+                route.account(),
                 Arc::new(Account {
                     slots: Arc::new(Semaphore::new(config.max_in_flight)),
-                    retry_at: Mutex::new(Instant::now()),
+                    backoff: Mutex::new(None),
                 }),
             )
         })
@@ -281,19 +310,12 @@ async fn handle(State(state): State<Arc<HttpState>>, request: Request) -> Respon
     }) else {
         return error(StatusCode::NOT_FOUND, "no configured HTTP route");
     };
-    if request.uri().query().is_some() {
-        return error(
-            StatusCode::BAD_REQUEST,
-            "query parameters are not supported on this route",
-        );
-    }
     let mut observed = observation::Observation::new(&state.metrics, &route.path);
-    let account = state.accounts[&route.credential].clone();
-    let delay = account.delay();
-    if !delay.is_zero() {
-        observed.status(429);
+    let account = state.accounts[&route.account()].clone();
+    if let Some((status, delay)) = account.cooldown() {
+        observed.status(status);
         observed.complete();
-        return limited(StatusCode::TOO_MANY_REQUESTS, delay.as_secs() + 1);
+        return limited(StatusCode::from_u16(status).unwrap(), delay.as_secs() + 1);
     }
     let Ok(permit) = account.slots.clone().try_acquire_owned() else {
         observed.status(503);
@@ -314,7 +336,20 @@ async fn handle(State(state): State<Arc<HttpState>>, request: Request) -> Respon
             );
         }
     };
-    let upstream = route.request(body, &parts.headers);
+    let mut upstream = match route.request(body, &parts.headers) {
+        Ok(upstream) => upstream,
+        Err(_) => {
+            observed.status(400);
+            observed.complete();
+            return error(StatusCode::BAD_REQUEST, "unsupported HTTP header encoding");
+        }
+    };
+    if let Some(query) = parts.uri.query() {
+        upstream
+            .url
+            .push(if upstream.url.contains('?') { '&' } else { '?' });
+        upstream.url.push_str(query);
+    }
     let payload = match serde_json::to_vec(&upstream) {
         Ok(payload) if upstream.validate().is_ok() => payload,
         _ => {
@@ -334,13 +369,42 @@ async fn handle(State(state): State<Arc<HttpState>>, request: Request) -> Respon
         }
     };
     observed.status(status);
-    let headers = response_headers(headers);
+    let representation_length = if parts.method == axum::http::Method::HEAD || status == 304 {
+        headers
+            .iter()
+            .find(|(name, _)| name == "content-length")
+            .and_then(|(_, value)| HeaderValue::from_str(value).ok())
+    } else {
+        None
+    };
+    let mut headers = response_headers(headers);
+    if let Some(length) = representation_length {
+        headers.insert("content-length", length);
+    }
     observed.content_type(
         headers
             .get("content-type")
             .and_then(|value| value.to_str().ok()),
     );
     account.observe(status, &headers);
+    if parts.method == axum::http::Method::HEAD || status == 204 || status == 304 {
+        let end = events.next().instrument(observed.span.clone()).await;
+        if !matches!(
+            end,
+            Some(Ok(OutputEvent::Finished {
+                stop_reason: StopReason::EndOfText,
+                usage: None
+            }))
+        ) {
+            observed.status(502);
+            return error(StatusCode::BAD_GATEWAY, "invalid bodyless HTTP completion");
+        }
+        observed.complete();
+        let mut response = Response::new(Body::empty());
+        *response.status_mut() = StatusCode::from_u16(status).unwrap();
+        *response.headers_mut() = std::mem::take(&mut headers);
+        return response;
+    }
     let stream = async_stream::try_stream! {
         let _permit = permit;
         let mut size = 0usize;
@@ -420,13 +484,16 @@ async fn open(
 
 fn response_headers(headers: Vec<(String, String)>) -> HeaderMap {
     let mut result = HeaderMap::new();
+    let connection = connection_headers(
+        headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str())),
+    );
     for (name, value) in headers {
-        if matches!(
-            name.as_str(),
-            "content-type" | "content-encoding" | "retry-after" | "request-id" | "x-request-id"
-        ) || name.starts_with("x-ratelimit-")
-            || name.starts_with("ratelimit-")
-            || name.starts_with("anthropic-ratelimit-")
+        if !hop_header(&name)
+            && !connection.contains(&name)
+            && !matches!(name.as_str(), "content-length" | "set-cookie")
+            && !name.starts_with("x-hellas-")
         {
             if let (Ok(name), Ok(value)) = (
                 name.parse::<axum::http::HeaderName>(),
@@ -437,6 +504,29 @@ fn response_headers(headers: Vec<(String, String)>) -> HeaderMap {
         }
     }
     result
+}
+
+fn hop_header(name: &str) -> bool {
+    matches!(
+        name,
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "proxy-connection"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+    )
+}
+
+fn connection_headers<'a>(headers: impl Iterator<Item = (&'a str, &'a str)>) -> Vec<String> {
+    headers
+        .filter(|(name, _)| *name == "connection")
+        .flat_map(|(_, value)| value.split(','))
+        .map(|name| name.trim().to_ascii_lowercase())
+        .collect()
 }
 
 fn retry_delay(headers: &HeaderMap) -> Duration {

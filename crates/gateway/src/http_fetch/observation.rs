@@ -210,11 +210,11 @@ impl Usage {
         let Ok(value) = serde_json::from_slice::<Value>(bytes) else {
             return;
         };
-        let Some(usage) = value.get("usage").or_else(|| {
-            value
-                .get("message")
-                .and_then(|message| message.get("usage"))
-        }) else {
+        let Some(usage) = value
+            .get("usage")
+            .or_else(|| value.pointer("/message/usage"))
+            .or_else(|| value.pointer("/response/usage"))
+        else {
             return;
         };
         fn update(target: &mut Option<u64>, value: Option<u64>) {
@@ -241,6 +241,7 @@ impl Usage {
             usage
                 .get("cache_read_input_tokens")
                 .or_else(|| usage.pointer("/prompt_tokens_details/cached_tokens"))
+                .or_else(|| usage.pointer("/input_tokens_details/cached_tokens"))
                 .and_then(Value::as_u64),
         );
     }
@@ -282,5 +283,24 @@ mod tests {
         absent.push(b"{\"error\":\"private message\"}");
         absent.finish();
         assert_eq!(absent.input, None);
+    }
+
+    #[test]
+    fn responses_completed_usage_survives_fragmented_delivery() {
+        let wire = b"event: response.completed\ndata: {\"response\":{\"usage\":{\"input_tokens\":12,\"output_tokens\":3,\"input_tokens_details\":{\"cached_tokens\":8}}}}\n\n";
+        for size in 1..=wire.len() {
+            let mut usage = Usage {
+                sse: true,
+                ..Default::default()
+            };
+            for chunk in wire.chunks(size) {
+                usage.push(chunk);
+            }
+            usage.finish();
+            assert_eq!(
+                (usage.input, usage.output, usage.cached),
+                (Some(12), Some(3), Some(8))
+            );
+        }
     }
 }
