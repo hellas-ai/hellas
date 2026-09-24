@@ -13,7 +13,15 @@ use crate::config::{Credentials, ProviderConfig, Spec};
 pub trait Provider: Send + Sync {
     /// Pure, credential-free description for review before allocation.
     fn plan(&self, spec: &Spec) -> Result<Value>;
+    /// Resolve provider metadata before saving the pending allocation receipt.
+    async fn prepare(&self, spec: &mut Spec) -> Result<()> {
+        spec.validate()
+    }
     async fn create(&self, spec: &Spec, credentials: &Credentials) -> Result<String>;
+    /// Check the allocated resource after its ID is safely recorded.
+    async fn verify(&self, _spec: &Spec, _id: &str) -> Result<()> {
+        Ok(())
+    }
     async fn inspect(&self, id: &str) -> Result<Value>;
     async fn destroy(&self, id: &str) -> Result<()>;
 }
@@ -206,25 +214,24 @@ impl Cloud {
             (
                 CloudKind::Runpod,
                 ProviderConfig::Runpod {
+                    template_id,
                     gpu_type,
                     interruptible,
-                    disk_gb,
-                    volume_gb,
-                    container_registry_auth_id,
                     ..
                 },
             ) => {
-                let mut body = json!({
-                "name":spec.name, "imageName":spec.image, "computeType":"GPU", "cloudType":"SECURE",
-                "gpuTypeIds":[gpu_type], "gpuCount":1, "interruptible":interruptible,
-                "containerDiskInGb":disk_gb, "volumeInGb":volume_gb, "volumeMountPath":"/var/lib/hellas",
-                "env":env, "ports":[]
-                });
-                if let Some(id) = container_registry_auth_id {
-                    validate_id(id)?;
-                    body["containerRegistryAuthId"] = json!(id);
-                }
-                Ok(body)
+                let template_id = template_id
+                    .as_deref()
+                    .context("Runpod creation requires a template")?;
+                validate_id(template_id)?;
+                // Inherit image, disks, registry auth, ports and startup settings.
+                // Cloning a template into an ad-hoc image request loses attribution.
+                Ok(json!({
+                    "name":spec.name, "templateId":template_id,
+                    "computeType":"GPU", "cloudType":"SECURE",
+                    "gpuTypeIds":[gpu_type], "gpuCount":1,
+                    "interruptible":interruptible, "env":env
+                }))
             }
             (CloudKind::Vast, ProviderConfig::Vast { disk_gb, .. }) => {
                 // Values are generated hex only, never arbitrary shell fragments.
@@ -250,6 +257,39 @@ impl Cloud {
 impl Provider for Cloud {
     fn plan(&self, spec: &Spec) -> Result<Value> {
         self.create_body(spec, BTreeMap::new())
+    }
+
+    async fn prepare(&self, spec: &mut Spec) -> Result<()> {
+        if let ProviderConfig::Runpod { template_id, .. } = &spec.provider {
+            let id = template_id
+                .as_deref()
+                .context("Runpod creation requires a template")?;
+            validate_id(id)?;
+            let template = self
+                .request(reqwest::Method::GET, &format!("/templates/{id}"), None)
+                .await?;
+            resolve_runpod_template(spec, &template)?;
+        }
+        spec.validate()
+    }
+
+    async fn verify(&self, spec: &Spec, id: &str) -> Result<()> {
+        if let ProviderConfig::Runpod {
+            template_id: Some(template_id),
+            ..
+        } = &spec.provider
+        {
+            let pod = self.inspect(id).await?;
+            ensure!(
+                pod["template_id"].as_str() == Some(template_id),
+                "Runpod did not retain the requested template attribution"
+            );
+            ensure!(
+                pod["image"].as_str() == Some(&spec.image),
+                "Runpod image differs from the resolved template; template may have changed"
+            );
+        }
+        Ok(())
     }
 
     async fn create(&self, spec: &Spec, credentials: &Credentials) -> Result<String> {
@@ -303,10 +343,53 @@ impl Provider for Cloud {
     }
 }
 
+fn resolve_runpod_template(spec: &mut Spec, template: &Value) -> Result<()> {
+    let ProviderConfig::Runpod {
+        template_id,
+        disk_gb,
+        volume_gb,
+        ..
+    } = &mut spec.provider
+    else {
+        bail!("template resolution requires Runpod");
+    };
+    ensure!(
+        template["id"].as_str() == template_id.as_deref(),
+        "unexpected Runpod template"
+    );
+    ensure!(
+        template["isServerless"] != true,
+        "Hellas requires a Pod template"
+    );
+    ensure!(
+        template["volumeMountPath"] == "/var/lib/hellas",
+        "template must mount persistent worker data at /var/lib/hellas"
+    );
+    let image = template["imageName"]
+        .as_str()
+        .context("template has no image")?;
+    ensure!(
+        spec.image.is_empty() || spec.image == image,
+        "template image changed from the requested digest"
+    );
+    spec.image = image.to_owned();
+    *disk_gb = template["containerDiskInGb"]
+        .as_u64()
+        .and_then(|v| u32::try_from(v).ok())
+        .context("invalid template container disk size")?;
+    *volume_gb = template["volumeInGb"]
+        .as_u64()
+        .and_then(|v| u32::try_from(v).ok())
+        .context("invalid template volume size")?;
+    // Only non-secret deployment metadata is copied into the receipt.
+    spec.validate()
+}
+
 /// Provider responses also contain environment secrets: project an allowlist.
 fn runpod_summary(value: &Value) -> Value {
     json!({"id":value["id"], "name":value["name"],
-        "desired_status":value["desiredStatus"], "image":value["imageName"],
+        "desired_status":value["desiredStatus"], "image":value.get("imageName").filter(|v| v.is_string()).unwrap_or(&value["image"]),
+        "template_id":value["templateId"],
         "gpu_count":value["gpuCount"], "hourly_rate":value["costPerHr"],
         "interruptible":value["interruptible"],
         "disk_gb":value["containerDiskInGb"], "volume_gb":value["volumeInGb"]})
@@ -326,6 +409,118 @@ pub fn validate_id(id: &str) -> Result<()> {
 mod tests {
     use super::*;
     use std::io::{Read, Write};
+
+    fn template_spec() -> Spec {
+        Spec {
+            name: "test-worker".into(),
+            image: String::new(),
+            provider: ProviderConfig::Runpod {
+                account: None,
+                template_id: Some("foundation-template".into()),
+                gpu_type: "NVIDIA L4".into(),
+                interruptible: true,
+                disk_gb: 0,
+                volume_gb: 0,
+                container_registry_auth_id: None,
+            },
+            trust: crate::config::Trust::Token,
+            serve_args: vec![],
+        }
+    }
+
+    fn template() -> Value {
+        json!({"id":"foundation-template", "imageName":format!("registry/image@sha256:{}", "a".repeat(64)),
+            "containerDiskInGb":20, "volumeInGb":4, "volumeMountPath":"/var/lib/hellas",
+            "env":{"UPSTREAM_KEY":"must-not-enter-receipt"}})
+    }
+
+    #[test]
+    fn template_resolution_requires_pinned_image_and_preserves_only_metadata() {
+        let mut spec = template_spec();
+        resolve_runpod_template(&mut spec, &template()).unwrap();
+        assert_eq!(spec.image, template()["imageName"]);
+        assert!(
+            !serde_json::to_string(&spec)
+                .unwrap()
+                .contains("must-not-enter-receipt")
+        );
+        for (field, value) in [
+            ("id", json!("another-template")),
+            ("imageName", json!("registry/image:latest")),
+            ("volumeMountPath", json!("/workspace")),
+            ("volumeInGb", json!(0)),
+            ("isServerless", json!(true)),
+        ] {
+            let mut invalid = template();
+            invalid[field] = value;
+            assert!(resolve_runpod_template(&mut template_spec(), &invalid).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn template_api_preserves_attribution_and_detects_missing_attribution() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for index in 0..4 {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                while !bytes.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    socket.read_exact(&mut byte).unwrap();
+                    bytes.push(byte[0]);
+                }
+                let headers = String::from_utf8(bytes).unwrap();
+                let response = match index {
+                    0 => {
+                        assert!(headers.starts_with("GET /templates/foundation-template "));
+                        template()
+                    }
+                    1 => {
+                        assert!(headers.starts_with("POST /pods "));
+                        let length: usize = headers.lines().find_map(|line| line.to_lowercase()
+                            .strip_prefix("content-length: ").map(str::parse)).unwrap().unwrap();
+                        let mut body = vec![0; length];
+                        socket.read_exact(&mut body).unwrap();
+                        let body: Value = serde_json::from_slice(&body).unwrap();
+                        assert_eq!(body["templateId"], "foundation-template");
+                        assert_eq!(body["interruptible"], true);
+                        assert!(body["env"]["HELLAS_REMOTE_TOKEN"].is_string());
+                        assert!(body.get("imageName").is_none());
+                        assert!(body.get("volumeMountPath").is_none());
+                        json!({"id":"test-pod"})
+                    }
+                    _ => {
+                        assert!(headers.starts_with("GET /pods/test-pod "));
+                        // Live REST responses use `image`, not always `imageName`.
+                        json!({"id":"test-pod", "templateId":if index == 2 { json!("foundation-template") } else { Value::Null },
+                            "image":template()["imageName"], "env":{"secret":"do-not-leak"}})
+                    }
+                }.to_string();
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", response.len(), response).unwrap();
+            }
+        });
+        let mut cloud = Cloud::new(CloudKind::Runpod).unwrap();
+        cloud.base = format!("http://{address}");
+        cloud.credential =
+            crate::accounts::CredentialSource::Command(vec!["printf".into(), "fixture".into()]);
+        let mut spec = template_spec();
+        cloud.prepare(&mut spec).await.unwrap();
+        let id = cloud.create(&spec, &Credentials::generate()).await.unwrap();
+        cloud.verify(&spec, &id).await.unwrap();
+        assert!(
+            cloud
+                .verify(&spec, &id)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("attribution")
+        );
+        server.join().unwrap();
+    }
 
     #[tokio::test]
     async fn concurrent_accounts_keep_their_own_tokens_and_redact_pod_environment() {

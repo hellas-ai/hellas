@@ -24,6 +24,7 @@ fn receipt() -> Deployment {
             image: format!("registry/image@sha256:{}", "a".repeat(64)),
             provider: ProviderConfig::Runpod {
                 account: Some("work".into()),
+                template_id: Some("foundation-template".into()),
                 gpu_type: "NVIDIA L4".into(),
                 interruptible: false,
                 disk_gb: 20,
@@ -64,7 +65,6 @@ fn command_contract_requires_info_target_and_explicit_destroy_target() {
 
 #[tokio::test]
 async fn dry_run_needs_no_profile_credentials_or_receipt() {
-    let image = format!("registry/image@sha256:{}", "a".repeat(64));
     for interruptible in [false, true] {
         let mut argv = vec![
             "hellas",
@@ -75,8 +75,8 @@ async fn dry_run_needs_no_profile_credentials_or_receipt() {
             "create",
             "--name",
             "trial",
-            "--image",
-            &image,
+            "--template",
+            "foundation-template",
             "--gpu",
             "NVIDIA L4",
             "--dry-run",
@@ -107,6 +107,8 @@ async fn dry_run_needs_no_profile_credentials_or_receipt() {
         assert_eq!(value["account"], "unconfigured");
         assert_eq!(value["result"]["env"], serde_json::json!({}));
         assert_eq!(value["result"]["interruptible"], interruptible);
+        assert_eq!(value["result"]["templateId"], "foundation-template");
+        assert!(value["result"].get("imageName").is_none());
     }
 }
 
