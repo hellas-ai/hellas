@@ -122,15 +122,19 @@ impl Configuration {
     pub(crate) fn stage(
         &self,
         parent: &Path,
-    ) -> Result<(tempfile::TempDir, InstalledConfiguration)> {
-        self.validate()?;
+    ) -> Result<(tempfile::TempDir, InstalledConfiguration), &'static str> {
+        self.validate()
+            .map_err(|_| "invalid worker configuration")?;
         let stage = tempfile::Builder::new()
             .prefix(".worker-config-")
-            .tempdir_in(parent)?;
+            .tempdir_in(parent)
+            .map_err(|_| "could not create worker configuration directory")?;
         let files = stage.path().join("files");
-        crate::management::private_directory(&files)?;
+        crate::management::private_directory(&files)
+            .map_err(|_| "worker filesystem could not create an owner-only credential directory")?;
         for (name, value) in &self.files {
-            crate::config::save_private(&files.join(name), value, true)?;
+            crate::config::save_private(&files.join(name), value, true)
+                .map_err(|_| "could not write private worker credential file")?;
         }
         fn resolve(value: &mut Value, files: &Path, names: &BTreeMap<String, Value>) -> Result<()> {
             match value {
@@ -157,9 +161,11 @@ impl Configuration {
             Ok(())
         }
         let mut fetch_config = self.fetch_config.clone();
-        resolve(&mut fetch_config, &files, &self.files)?;
+        resolve(&mut fetch_config, &files, &self.files)
+            .map_err(|_| "fetch config references a missing credential file")?;
         let path = stage.path().join("fetch.json");
-        crate::config::save_private(&path, &fetch_config, true)?;
+        crate::config::save_private(&path, &fetch_config, true)
+            .map_err(|_| "could not write private worker fetch configuration")?;
         Ok((
             stage,
             InstalledConfiguration {

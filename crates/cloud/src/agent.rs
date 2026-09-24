@@ -131,9 +131,7 @@ impl Process {
             return Err("managed configuration conflicts with a launch-time fetch config");
         }
         let parent = self.identity.parent().ok_or("missing data directory")?;
-        let (candidate, installed) = configuration
-            .stage(parent)
-            .map_err(|_| "could not stage private worker configuration")?;
+        let (candidate, installed) = configuration.stage(parent)?;
         // The worker's own CLI validates the exact config and credentials before
         // disrupting the running process. Validation output can contain secrets.
         let checked = tokio::time::timeout(
