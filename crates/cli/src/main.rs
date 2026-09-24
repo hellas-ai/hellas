@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 #[cfg(feature = "evaluate")]
 use std::time::Duration;
 
+#[cfg(all(feature = "cloud", unix))]
+mod cloud;
 mod commands;
 mod identity;
 #[cfg(feature = "node")]
@@ -78,7 +80,18 @@ fn load_command_identity(
                 ..
             }
         );
-    let read_only = settles_paid_work
+    #[cfg(all(feature = "cloud", feature = "gateway", unix))]
+    let owned_gateway = matches!(
+        command,
+        Commands::Gateway {
+            machine: Some(_),
+            ..
+        }
+    );
+    #[cfg(not(all(feature = "cloud", feature = "gateway", unix)))]
+    let owned_gateway = false;
+    let read_only = owned_gateway
+        || settles_paid_work
         || matches!(
             command,
             Commands::Identity {
@@ -313,6 +326,15 @@ enum CodexAuthCommand {
 #[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Commands {
+    #[cfg(all(feature = "cloud", unix))]
+    /// Provision and inspect remote Hellas workers.
+    Cloud(hellas_cloud::cloud::CloudArgs),
+    #[cfg(all(feature = "cloud", unix))]
+    /// Discover and administer machines owned by the selected Hellas identity.
+    Machines(hellas_cloud::machines::MachinesArgs),
+    #[cfg(all(feature = "cloud", unix))]
+    /// Internal management RPC for local applications.
+    Control(hellas_cloud::machines::ControlArgs),
     #[cfg(feature = "node")]
     /// Run the RPC server
     Serve {
@@ -320,6 +342,9 @@ enum Commands {
         /// all cached transcripts and clearing them. Omitted means no remote admin.
         #[arg(long = "admin-peer")]
         admin_peers: Vec<iroh::EndpointId>,
+        /// Restrict every inbound Hellas RPC connection to this owner identity.
+        #[arg(long)]
+        owner: Option<EndpointId>,
         /// Assurance offered by this provider.
         #[arg(long, default_value = "producer-signed", value_parser = parse_assurance)]
         assurance: hellas_rpc::Assurance,
@@ -482,6 +507,12 @@ enum Commands {
         /// Explicit local text-chat template.
         #[arg(long = "chat-template", value_name = "TEMPLATE")]
         chat_template: Option<hellas_presentation::ChatTemplate>,
+        /// Select an owned machine from this identity's inventory.
+        #[cfg(all(feature = "cloud", unix))]
+        #[arg(long, conflicts_with_all = ["node_id", "node_addrs", "provider_genesis", "apple_app_attest_app_id", "apple_app_attest_cdhashes"])]
+        #[cfg_attr(feature = "evaluate", arg(conflicts_with = "local"))]
+        #[cfg_attr(feature = "node", arg(conflicts_with = "paid_work_config"))]
+        machine: Option<String>,
         #[command(flatten)]
         remote_trust: RemoteTrustArgs,
         #[command(flatten)]
@@ -819,6 +850,12 @@ fn validate_identity_options(
 
     let reads_existing_identity = match command {
         Commands::OutputCache(args) => args.node_id.is_some(),
+        #[cfg(all(feature = "cloud", feature = "gateway", unix))]
+        Commands::Gateway {
+            machine: Some(_), ..
+        } => true,
+        #[cfg(all(feature = "cloud", unix))]
+        Commands::Cloud(_) | Commands::Machines(_) | Commands::Control(_) => true,
         Commands::Identity {
             command: IdentityCommand::ShowNodeId | IdentityCommand::ShowEnrollmentId,
         }
@@ -955,6 +992,16 @@ async fn async_main() {
             }
             return;
         }
+        #[cfg(all(feature = "cloud", unix))]
+        command @ (Commands::Cloud(_) | Commands::Machines(_) | Commands::Control(_)) => {
+            let result = cloud::run(command, cli.identity.as_deref()).await;
+            tracer_provider.shutdown();
+            if let Err(err) = result {
+                eprintln!("error: {err:#}");
+                std::process::exit(1);
+            }
+            return;
+        }
         Commands::Store { command } => {
             let result = commands::store::run(command, cli.store_dir).await;
             tracer_provider.shutdown();
@@ -1015,6 +1062,7 @@ async fn async_main() {
     let result = match command {
         #[cfg(feature = "node")]
         Commands::Serve {
+            owner,
             assurance,
             admin_peers,
             port,
@@ -1090,6 +1138,7 @@ async fn async_main() {
                         commands::serve::run(commands::serve::ServeOptions {
                             admin_peers,
                             output_cache: cache_options,
+                            owner,
                             port,
                             execute_policy,
                             queue_size,
@@ -1165,6 +1214,8 @@ async fn async_main() {
             bearer_token_file,
             allow_remote,
             chat_template,
+            #[cfg(all(feature = "cloud", unix))]
+            machine,
             remote_trust,
             causal_lm,
             host,
@@ -1258,6 +1309,15 @@ async fn async_main() {
                 };
                 #[cfg(not(feature = "evaluate"))]
                 let () = local_content_store;
+                #[cfg(all(feature = "cloud", unix))]
+                let (node_id, remote_trust) = cloud::gateway_route(
+                    machine.as_deref(),
+                    &secret_key,
+                    node_id,
+                    remote_trust,
+                    responses_backend,
+                )
+                .await?;
                 let assurance = remote_trust.assurance;
                 #[cfg(not(feature = "evaluate"))]
                 let local = false;
@@ -1370,6 +1430,10 @@ async fn async_main() {
         #[cfg(feature = "chain")]
         Commands::Chain { .. } => unreachable!("chain commands handled before identity load"),
         Commands::Store { .. } => unreachable!("store commands handled before identity load"),
+        #[cfg(all(feature = "cloud", unix))]
+        Commands::Cloud(_) | Commands::Machines(_) | Commands::Control(_) => {
+            unreachable!("management commands handled before identity load")
+        }
         Commands::Environment { .. } => {
             unreachable!("environment commands handled before identity load")
         }

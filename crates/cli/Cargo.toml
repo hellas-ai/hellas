@@ -10,6 +10,9 @@ documentation.workspace = true
 [features]
 default = []
 
+# Remote machine management; credentials stay with the operator identity.
+cloud = ["dep:hellas-cloud"]
+
 # Enables Apple App Attest verification for clients. Native enrollment and
 # proof production belong to the signed host application (Gate), not the CLI.
 apple-app-attest = []
@@ -90,6 +93,7 @@ hellas-adaptors.workspace = true
 hellas-attestation = { workspace = true, features = ["apple-app-attest"] }
 hellas-chain = { workspace = true, default-features = false, optional = true }
 hellas-client = { workspace = true, features = ["iroh"] }
+hellas-cloud = { workspace = true, optional = true }
 hellas-executor = { workspace = true, default-features = false, optional = true }
 hellas-gateway = { workspace = true, optional = true }
 hellas-kernel = { workspace = true, default-features = false, optional = true }

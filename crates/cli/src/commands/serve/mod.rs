@@ -34,6 +34,7 @@ pub use work_config::{WorkConfig, load_work_config};
 pub struct ServeOptions {
     pub admin_peers: Vec<iroh::EndpointId>,
     pub output_cache: hellas_rpc::cache::CacheOptions,
+    pub owner: Option<iroh::EndpointId>,
     pub port: Option<u16>,
     pub execute_policy: ExecutePolicy,
     pub queue_size: usize,
@@ -197,6 +198,7 @@ async fn run_with_store(
     let node = node::spawn_node(node::NodeConfig {
         admin_peers: options.admin_peers,
         output_cache: options.output_cache,
+        owner: options.owner,
         port: options.port,
         execute_policy: options.execute_policy.clone(),
         queue_size: options.queue_size,

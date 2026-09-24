@@ -189,6 +189,7 @@ let
             "chain"
             "gateway"
           ]
+          ++ lib.optional pkgSpec.pkgs.stdenv.hostPlatform.isUnix "cloud"
           ++ lib.optionals (crossSystem == null) [ "node" ]
           ++ lib.optional otel "otel";
         }
@@ -203,6 +204,22 @@ let
         }
       ) { };
     }
+    // lib.optionalAttrs (crossSystem == null) {
+      agent = pkgSpec.mkHellasPackage {
+        pname = "hellas-agent";
+        cargoBuildFlags = [
+          "-p"
+          "hellas-cloud"
+          "--bin"
+          "hellas-agent"
+        ];
+        cargoTestFlags = [
+          "-p"
+          "hellas-cloud"
+        ];
+        meta.mainProgram = "hellas-agent";
+      };
+    }
     # Do not advertise the safe local GPU runtime on platforms where the
     # packaged provider toolchain is not yet supported.
     //
@@ -214,7 +231,11 @@ let
             }:
             pkgSpec.mkHellasPackage {
               buildNoDefaultFeatures = true;
-              buildFeatures = [ "evaluate" ] ++ lib.optional otel "otel";
+              buildFeatures = [
+                "evaluate"
+                "cloud"
+              ]
+              ++ lib.optional otel "otel";
             }
           ) { };
         };
@@ -286,16 +307,19 @@ let
           rustToolchain
           ;
         inherit (nativePackages) cli;
+        revision = self.rev or self.dirtyRev or "unknown";
       };
       dockerCuda = import ./docker.nix {
         inherit pkgs rustToolchain;
         cli = nativePackages.cli-catena;
         backend = "cuda";
+        revision = self.rev or self.dirtyRev or "unknown";
       };
       dockerHip = import ./docker.nix {
         inherit pkgs rustToolchain;
         cli = nativePackages.cli-catena;
         backend = "hip";
+        revision = self.rev or self.dirtyRev or "unknown";
       };
 
       nixosTests = lib.optionalAttrs isX86_64Linux (
@@ -310,10 +334,32 @@ let
     {
       packages = {
         docker = docker.image;
+        docker-cloud =
+          (import ./docker.nix {
+            inherit pkgs rustToolchain;
+            inherit (nativePackages) cli agent;
+            revision = self.rev or self.dirtyRev or "unknown";
+          }).image;
       }
       // lib.optionalAttrs isX86_64Linux {
         docker-cuda = dockerCuda.image;
         docker-hip = dockerHip.image;
+        docker-cloud-cuda =
+          (import ./docker.nix {
+            inherit pkgs rustToolchain;
+            cli = nativePackages.cli-catena;
+            inherit (nativePackages) agent;
+            backend = "cuda";
+            revision = self.rev or self.dirtyRev or "unknown";
+          }).image;
+        docker-cloud-hip =
+          (import ./docker.nix {
+            inherit pkgs rustToolchain;
+            cli = nativePackages.cli-catena;
+            inherit (nativePackages) agent;
+            backend = "hip";
+            revision = self.rev or self.dirtyRev or "unknown";
+          }).image;
       };
 
       apps = {
