@@ -41,7 +41,6 @@ pub async fn execute_responses_request(
     idempotency_key: &str,
     label: &str,
 ) -> Result<FetchProviderResponse, FetchProviderError> {
-    let codex_endpoint = endpoint.as_str() == hellas_rpc::CODEX_RESPONSES_ENDPOINT;
     let mut telemetry = telemetry::Request::new(&endpoint);
     let request = telemetry
         .propagate(client.post(endpoint))
@@ -81,13 +80,7 @@ pub async fn execute_responses_request(
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.split(';').next())
         .map(str::trim);
-    // The fixed Codex endpoint can omit Content-Type on a successful SSE stream.
-    // Explicit non-SSE types remain errors. The sealed projector still requires
-    // a valid SSE lifecycle and terminal event before accepting the transcript.
-    let omitted_codex_type = codex_endpoint && !upstream.headers().contains_key(CONTENT_TYPE);
-    if !omitted_codex_type
-        && !content_type.is_some_and(|value| value.eq_ignore_ascii_case("text/event-stream"))
-    {
+    if !content_type.is_some_and(|value| value.eq_ignore_ascii_case("text/event-stream")) {
         telemetry.fail("invalid_content_type");
         return Err(FetchProviderError::failed(format!(
             "{label} returned successful HTTP {status} without text/event-stream content"
