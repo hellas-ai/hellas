@@ -2217,6 +2217,14 @@ struct LifecycleResponse {
     _output: Option<IgnoredAny>,
     #[serde(default, rename = "usage")]
     _usage: Option<IgnoredAny>,
+    #[serde(default, rename = "access_programs")]
+    _access_programs: Option<IgnoredAny>,
+    #[serde(default, rename = "max_tool_calls")]
+    _max_tool_calls: Option<IgnoredAny>,
+    #[serde(default, rename = "moderation")]
+    _moderation: Option<IgnoredAny>,
+    #[serde(default, rename = "tool_usage")]
+    _tool_usage: Option<IgnoredAny>,
     #[serde(default, rename = "background")]
     _background: Option<IgnoredAny>,
     #[serde(default, rename = "completed_at")]
@@ -2549,6 +2557,14 @@ struct CompletedResponse {
     model: Option<JsonValue>,
     #[serde(default, rename = "output")]
     _output: Option<IgnoredAny>,
+    #[serde(default, rename = "access_programs")]
+    _access_programs: Option<IgnoredAny>,
+    #[serde(default, rename = "max_tool_calls")]
+    _max_tool_calls: Option<IgnoredAny>,
+    #[serde(default, rename = "moderation")]
+    _moderation: Option<IgnoredAny>,
+    #[serde(default, rename = "tool_usage")]
+    _tool_usage: Option<IgnoredAny>,
     #[serde(default, rename = "background")]
     _background: Option<IgnoredAny>,
     #[serde(default, rename = "completed_at")]
@@ -2652,6 +2668,9 @@ impl CompletedResponse {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct UsageWire {
+    // Per-item attribution is diagnostic; billing uses the validated totals below.
+    #[serde(default, rename = "attribution")]
+    _attribution: Option<IgnoredAny>,
     input_tokens: u64,
     #[serde(default)]
     input_tokens_details: Option<InputTokenDetailsWire>,

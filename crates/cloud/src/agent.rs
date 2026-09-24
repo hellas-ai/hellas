@@ -38,6 +38,8 @@ struct Process {
     args: Vec<String>,
     identity: PathBuf,
     owner: Option<String>,
+    cli: PathBuf,
+    configuration: Option<crate::configuration::InstalledConfiguration>,
 }
 
 impl Process {
@@ -70,6 +72,12 @@ impl Process {
             .kill_on_drop(true);
         if let Some(owner) = &self.owner {
             command.args(["--owner", owner]);
+        }
+        if let Some(configuration) = &self.configuration {
+            command
+                .arg("--fetch-config")
+                .arg(&configuration.fetch_config)
+                .envs(&configuration.env);
         }
         #[cfg(unix)]
         command.process_group(0);
@@ -104,6 +112,74 @@ impl Process {
                 }
                 child.kill().await?;
             }
+        }
+        Ok(())
+    }
+
+    async fn configure(
+        &mut self,
+        configuration: crate::configuration::Configuration,
+    ) -> Result<()> {
+        configuration.validate()?;
+        ensure!(
+            !self
+                .args
+                .iter()
+                .any(|arg| arg.split('=').next() == Some("--fetch-config")),
+            "managed configuration conflicts with a launch-time fetch config"
+        );
+        let parent = self.identity.parent().context("missing data directory")?;
+        let (candidate, installed) = configuration.stage(parent)?;
+        // The worker's own CLI validates the exact config and credentials before
+        // disrupting the running process. Validation output can contain secrets.
+        let checked = tokio::time::timeout(
+            Duration::from_secs(30),
+            Command::new(&self.cli)
+                .args(["serve", "--check-config", "--fetch-config"])
+                .arg(&installed.fetch_config)
+                .envs(&configuration.env)
+                .env_remove("HELLAS_REMOTE_KEY")
+                .env_remove("HELLAS_REMOTE_TOKEN")
+                .env_remove("HELLAS_REMOTE_ARGS")
+                .env_remove("HELLAS_REMOTE_OWNER")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .status(),
+        )
+        .await??;
+        ensure!(checked.success(), "worker rejected fetch configuration");
+        let path = self.identity.with_file_name("configuration.json");
+        self.stop().await?;
+        let previous = self.configuration.replace(installed);
+        let applied = self.start().and_then(|()| {
+            crate::config::save_private(&path, self.configuration.as_ref().unwrap(), false)
+        });
+        if let Err(error) = applied {
+            self.stop().await?;
+            self.configuration = previous;
+            if let Some(previous) = &self.configuration {
+                crate::config::save_private(&path, previous, false)?;
+            } else {
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            self.start()?;
+            return Err(error);
+        }
+        let _ = candidate.keep();
+        if let Some(previous) = previous
+            && let Some(directory) = previous.fetch_config.parent()
+            && directory.parent() == self.identity.parent()
+            && directory
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(".worker-config-"))
+        {
+            let _ = std::fs::remove_dir_all(directory);
         }
         Ok(())
     }
@@ -169,6 +245,15 @@ impl State {
                         running: process.running()?,
                     })
                 }
+                Operation::Configure { configuration } => {
+                    let mut process = self.process.lock().await;
+                    process.configure(configuration).await?;
+                    Ok(Response::Status {
+                        enrollment: self.enrollment.clone(),
+                        owner: self.owner.map(|owner| owner.to_string()),
+                        running: process.running()?,
+                    })
+                }
                 Operation::Fetch { url, sha256, bytes } => {
                     let _permit = self
                         .downloads
@@ -210,6 +295,11 @@ pub async fn run(options: AgentOptions) -> Result<()> {
     let content = options.data.join("content");
     tokio::fs::create_dir_all(&content).await?;
     let identity = options.data.join("identity");
+    let configuration_path = options.data.join("configuration.json");
+    let configuration: Option<crate::configuration::InstalledConfiguration> = configuration_path
+        .exists()
+        .then(|| crate::config::read_json(&configuration_path))
+        .transpose()?;
     identity_command(&options.cli, &identity, "init").await?;
     let enrollment = Enrollment {
         node_id: identity_command(&options.cli, &identity, "show-node-id").await?,
@@ -232,6 +322,8 @@ pub async fn run(options: AgentOptions) -> Result<()> {
         args: options.serve_args,
         identity,
         owner: options.credentials.owner.clone(),
+        cli: options.cli,
+        configuration,
     };
     process.start()?;
     let state = Arc::new(State {

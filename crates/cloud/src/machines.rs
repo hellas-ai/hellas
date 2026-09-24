@@ -26,6 +26,19 @@ pub enum MachineCommand {
     Restart {
         name: String,
     },
+    /// Install fetch routes and provider credentials over iroh, then restart Hellas.
+    Configure {
+        name: String,
+        /// Local JSON route configuration, including its caller grants.
+        #[arg(long)]
+        fetch_config: PathBuf,
+        /// Copy a credential from this local environment variable. Repeat as needed.
+        #[arg(long = "env", value_name = "NAME")]
+        env: Vec<String>,
+        /// Upload a private JSON credential file, referenced in config as @files/NAME.
+        #[arg(long = "file", value_name = "NAME=PATH")]
+        files: Vec<String>,
+    },
     Fetch {
         name: String,
         #[arg(long)]
@@ -57,6 +70,57 @@ impl MachinesArgs {
             MachineCommand::Status { name } => Request::Status { name },
             MachineCommand::Resolve { name } => Request::Resolve { name },
             MachineCommand::Restart { name } => Request::Restart { name },
+            MachineCommand::Configure {
+                name,
+                fetch_config,
+                env,
+                files,
+            } => {
+                let metadata = std::fs::metadata(&fetch_config)?;
+                anyhow::ensure!(
+                    metadata.is_file() && metadata.len() <= 48 * 1024,
+                    "fetch configuration must be a regular file of at most 48 KiB"
+                );
+                let fetch_config = serde_json::from_slice(&std::fs::read(fetch_config)?)
+                    .map_err(|_| anyhow::anyhow!("invalid fetch configuration JSON"))?;
+                let env = env
+                    .into_iter()
+                    .map(|name| {
+                        let value = std::env::var(&name).map_err(|_| {
+                            anyhow::anyhow!("credential environment variable is unset or invalid")
+                        })?;
+                        Ok((name, value))
+                    })
+                    .collect::<Result<_>>()?;
+                let files = files
+                    .into_iter()
+                    .map(|argument| {
+                        let (name, path) = argument
+                            .split_once('=')
+                            .ok_or_else(|| anyhow::anyhow!("--file requires NAME=PATH"))?;
+                        let metadata = std::fs::metadata(path)?;
+                        anyhow::ensure!(
+                            metadata.is_file() && metadata.len() <= 48 * 1024,
+                            "credential file must be a regular file of at most 48 KiB"
+                        );
+                        let value =
+                            serde_json::from_slice(&std::fs::read(path)?).map_err(|_| {
+                                anyhow::anyhow!("invalid credential JSON; contents withheld")
+                            })?;
+                        Ok((name.to_owned(), value))
+                    })
+                    .collect::<Result<_>>()?;
+                let configuration = crate::configuration::Configuration {
+                    fetch_config,
+                    env,
+                    files,
+                };
+                configuration.validate()?;
+                Request::Configure {
+                    name,
+                    configuration,
+                }
+            }
             MachineCommand::Fetch {
                 name,
                 url,

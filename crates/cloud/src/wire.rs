@@ -21,6 +21,9 @@ pub struct Request {
 pub enum Operation {
     Status,
     Restart,
+    Configure {
+        configuration: crate::configuration::Configuration,
+    },
     Fetch {
         url: String,
         sha256: String,

@@ -57,6 +57,7 @@ async fn dispatch(service: &Service, input: &[u8]) -> Option<Value> {
             | "machines.status"
             | "machines.resolve"
             | "machines.restart"
+            | "machines.configure"
             | "machines.fetch"
             | "machines.prepare"
             | "machines.destroy"

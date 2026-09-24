@@ -86,7 +86,29 @@ jobs:
       - if: runner.environment == 'github-hosted'
         uses: NixOS/nix-installer-action@62c1943b776c509394b550f3f983adc14e9212d6
       - name: nix build .#${{ matrix.attr }}
-        run: nix build --accept-flake-config --print-build-logs --no-link '.#packages.x86_64-linux.${{ matrix.attr }}'
+        id: build
+        run: |
+          output=$(nix build --accept-flake-config --print-build-logs --no-link --print-out-paths '.#packages.x86_64-linux.${{ matrix.attr }}')
+          echo "output=$output" >> "$GITHUB_OUTPUT"
+      - name: Package portable binaries and WASM
+        if: startsWith(matrix.name, 'static-') || matrix.name == 'hellas-rpc-wasm'
+        env:
+          BUILD_NAME: ${{ matrix.name }}
+          BUILD_OUTPUT: ${{ steps.build.outputs.output }}
+        run: |
+          set -euo pipefail
+          mkdir artifacts
+          tar --dereference -C "$BUILD_OUTPUT" -czf "artifacts/hellas-$BUILD_NAME-$GITHUB_SHA.tar.gz" .
+          cd artifacts
+          sha256sum ./*.tar.gz > SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: startsWith(matrix.name, 'static-') || matrix.name == 'hellas-rpc-wasm'
+        with:
+          name: hellas-${{ matrix.name }}
+          path: artifacts/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
 
   build-smoke-passed:
     if: always()

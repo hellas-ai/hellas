@@ -28,6 +28,11 @@ pub enum Request {
     Resolve { name: String },
     #[serde(rename = "machines.restart")]
     Restart { name: String },
+    #[serde(rename = "machines.configure")]
+    Configure {
+        name: String,
+        configuration: crate::configuration::Configuration,
+    },
     #[serde(rename = "machines.fetch")]
     Fetch {
         name: String,
@@ -315,6 +320,17 @@ impl Service {
             Request::Restart { name } => {
                 self.resolve(&name).await?;
                 self.admin(&name, Operation::Restart).await
+            }
+            Request::Configure {
+                name,
+                configuration,
+            } => {
+                configuration.validate()?;
+                // Authenticate and check the pinned enrollment even when a previous
+                // configuration stopped the child. Configuration must remain repairable.
+                self.admin(&name, Operation::Status).await?;
+                self.admin(&name, Operation::Configure { configuration })
+                    .await
             }
             Request::Fetch {
                 name,
