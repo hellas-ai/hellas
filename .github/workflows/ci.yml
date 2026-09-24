@@ -1,10 +1,10 @@
 name: CI
 
 # Trigger model:
-#   pull_request                → lints + release builds + e2e
-#   push to master              → lints + release builds
-#   workflow_dispatch (release) → push artifacts (TODO)
+#   pull_request → checks + image builds; publish previews for trusted branches
+#   push to master / workflow_dispatch → checks + commit-tagged images
 on:
+  workflow_dispatch:
   pull_request:
   push:
     branches: [master]
@@ -160,3 +160,105 @@ jobs:
             echo '::error::E2E validation did not complete: matrix=${{ needs.e2e-matrix.result }}, tests=${{ needs.e2e.result }}. Inspect the first failed prerequisite, including Lints and Build smoke passed.'
             exit 1
           fi
+
+  # Build archives with read-only permissions. No registry login, Docker daemon,
+  # or provider credential is needed. Forks exercise the network variants only.
+  images:
+    needs: lints
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'shared' }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: ${{ fromJSON(github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork && '["network"]' || '["network","cuda","hip"]') }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - if: runner.environment == 'github-hosted'
+        uses: NixOS/nix-installer-action@62c1943b776c509394b550f3f983adc14e9212d6
+      - name: Build ordinary and managed images
+        env:
+          BACKEND: ${{ matrix.backend }}
+        run: |
+          set -euo pipefail
+          mkdir images
+          for variant in node cloud; do
+            attr=docker
+            flavor="$BACKEND"
+            if [ "$variant" = cloud ]; then
+              attr=docker-cloud
+              flavor="cloud-$BACKEND"
+            fi
+            if [ "$BACKEND" != network ]; then
+              attr="$attr-$BACKEND"
+            fi
+            stream=$(nix build --accept-flake-config --print-build-logs --no-link --print-out-paths ".#packages.x86_64-linux.$attr")
+            "$stream" | gzip -1 > "images/$flavor.tar.gz"
+          done
+          cd images
+          sha256sum ./*.tar.gz > SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: images-${{ matrix.backend }}
+          path: images/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
+
+  # Publishing consumes image archives only, on a fresh hosted runner. The job
+  # never checks out or executes PR scripts with the package-write token.
+  publish-images:
+    needs: [images, build-smoke-passed, e2e-passed]
+    if: >-
+      always() &&
+      needs.images.result == 'success' &&
+      needs.build-smoke-passed.result == 'success' &&
+      (github.event_name != 'pull_request' || needs.e2e-passed.result == 'success') &&
+      (github.event_name != 'pull_request' ||
+        (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [network, cuda, hip]
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: images-${{ matrix.backend }}
+          path: images
+      - name: Verify and load archives
+        working-directory: images
+        run: |
+          set -euo pipefail
+          sha256sum --check SHA256SUMS
+          for archive in ./*.tar.gz; do
+            docker load --input "$archive"
+          done
+      - name: Publish commit-tagged images
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BACKEND: ${{ matrix.backend }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          repository="ghcr.io/${GITHUB_REPOSITORY,,}"
+          config_dir=$(mktemp -d)
+          export DOCKER_CONFIG="$config_dir"
+          trap 'rm -rf "$config_dir"' EXIT
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          prefix="sha-$GITHUB_SHA"
+          if [ -n "$PR_NUMBER" ]; then prefix="pr-$PR_NUMBER-$GITHUB_SHA"; fi
+          for flavor in "$BACKEND" "cloud-$BACKEND"; do
+            source="ghcr.io/hellas-ai/hellas:$flavor"
+            target="$repository:$prefix-$flavor"
+            docker tag "$source" "$target"
+            docker push "$target"
+            digest=$(docker image inspect --format '{{index .RepoDigests 0}}' "$target")
+            [[ "$digest" == "$repository@sha256:"* ]]
+            printf '%s: %s\n\nPull by digest: %s\n\n' "$flavor" "$target" "$digest" >> "$GITHUB_STEP_SUMMARY"
+          done

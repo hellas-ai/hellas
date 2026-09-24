@@ -2768,6 +2768,7 @@ dependencies = [
  "hellas-attestation",
  "hellas-chain",
  "hellas-client",
+ "hellas-cloud",
  "hellas-executor",
  "hellas-gateway",
  "hellas-kernel",
@@ -2838,6 +2839,26 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tracing",
+]
+
+[[package]]
+name = "hellas-cloud"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "clap",
+ "hellas-private",
+ "hex",
+ "iroh",
+ "libc",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "subtle",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -6078,6 +6099,8 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "rustls-platform-verifier",
+ "serde",
+ "serde_json",
  "sync_wrapper",
  "tokio",
  "tokio-rustls",

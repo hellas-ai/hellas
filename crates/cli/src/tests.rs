@@ -1,5 +1,9 @@
 use super::*;
 
+#[cfg(all(feature = "cloud", unix))]
+#[path = "cloud_tests.rs"]
+mod cloud;
+
 #[cfg(feature = "llm")]
 const TEST_ENVIRONMENT: &str = "/path/to/model.environment";
 #[cfg(feature = "llm")]
