@@ -33,6 +33,13 @@ are removed; the caller's gateway bearer never becomes an upstream credential. O
 Configured values override the corresponding client header. The former
 `forward_headers` whitelist has been removed.
 
+Several accounts at one upstream can use distinct aliases and gateway paths,
+such as `/kimi-a/v1/chat/completions` and `/kimi-b/v1/chat/completions`, both
+mapped to the upstream's chat endpoint. The client's base URL selects the route.
+Each alias has independent admission and cooldown; routes sharing an alias
+share those limits. This gateway targets one Hellas provider node. It does not
+automatically select accounts, fail over between them or route using quota data.
+
 Omit `credential` for an unauthenticated upstream. Such routes share admission
 by origin. Optional `tls` uses the [Fetch TLS vocabulary](../crates/providers/HTTPS.md)
 for exact trust anchors and pins, defaulting to WebPKI. Custom roots cannot be
@@ -69,8 +76,9 @@ streams retain an incomplete archive. Archiving is best-effort: failures during
 setup, request/response writes or finalization are reported without replacing
 the upstream status or interrupting its response. After a write fails, archiving
 stops for that exchange; the next ordinary request attempts a fresh archive.
-`x-hellas-request-id` identifies an archive attempt, not a guarantee of a complete
-durable record. There is no automatic archive pruning.
+Once an archive has been created, `x-hellas-request-id` remains present even if
+saving its response metadata fails. It identifies an archive attempt, not a
+guarantee of a complete durable record. There is no automatic archive pruning.
 
 Archive failures emit a `hellas_archive` warning with the operation, I/O error
 kind and OS error code, without payloads, credentials, paths or raw error text.
@@ -118,6 +126,9 @@ concurrency returns 503 with `Retry-After: 1`.
 
 With `otel`, traces connect HTTP ingress, Fetch RPCs, credential refresh and
 upstream HTTP. Span attributes exclude request/response bodies and credentials.
+Outbound trace context replaces the caller's propagation headers instead of
+appending duplicates. Upstream response `traceparent` and `tracestate` are
+preserved; `x-hellas-trace-id` identifies the gateway's trace independently.
 Pooled QUIC connections have separate root spans so their lifetime cannot delay
 exporting the first request's trace.
 `hellas.gateway.http.requests`, `.duration`, `.time_to_first_byte` and `.tokens`

@@ -39,14 +39,14 @@ pub async fn execute_responses_request(
     label: &str,
 ) -> Result<FetchProviderResponse, FetchProviderError> {
     let mut telemetry = telemetry::Request::new(&endpoint);
-    let request = telemetry
-        .propagate(client.post(endpoint))
+    let request = client
+        .post(endpoint)
         .header(CONTENT_TYPE, "application/json")
         .header(AUTHORIZATION, format!("Bearer {bearer_token}"))
         .header("Idempotency-Key", idempotency_key)
         .body(body);
-    let upstream = request
-        .send()
+    let upstream = telemetry
+        .send(request)
         .instrument(telemetry.span.clone())
         .await
         .map_err(|source| {

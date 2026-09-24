@@ -135,9 +135,14 @@ pub(crate) async fn record(
 async fn archive_response(
     policy: Policy,
     mut archive: Exchange,
-    response: axum::response::Response,
+    mut response: axum::response::Response,
 ) -> axum::response::Response {
     use axum::body::Body;
+    if let Some(id) = archive.directory.file_name().and_then(|id| id.to_str()) {
+        response
+            .headers_mut()
+            .insert("x-hellas-request-id", id.parse().unwrap());
+    }
     if let Err(error) = archive
         .head(response.status().as_u16(), response.headers())
         .await
@@ -145,12 +150,7 @@ async fn archive_response(
         policy.failed("response_head", &error);
         return response;
     }
-    let (mut parts, body) = response.into_parts();
-    if let Some(id) = archive.directory.file_name().and_then(|id| id.to_str()) {
-        parts
-            .headers
-            .insert("x-hellas-request-id", id.parse().unwrap());
-    }
+    let (parts, body) = response.into_parts();
     if body.is_end_stream() {
         if let Err(error) = archive.finish().await {
             policy.failed("finish", &error);

@@ -217,6 +217,13 @@ async fn unavailable_archive_preserves_errors_and_recovers_on_the_next_request()
 async fn response_head_archive_failure_preserves_status_headers_and_body() {
     let root = tempfile::tempdir().unwrap();
     let archive = exchange(root.path()).await;
+    let id = archive
+        .directory
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
     let moved = root.path().join("moved");
     std::fs::rename(&archive.directory, &moved).unwrap();
     std::fs::write(&archive.directory, b"unavailable").unwrap();
@@ -227,6 +234,7 @@ async fn response_head_archive_failure_preserves_status_headers_and_body() {
         .unwrap();
     let response = archive_response(policy(root.path()), archive, response).await;
     assert_eq!(response.status(), 429);
+    assert_eq!(response.headers()["x-hellas-request-id"], id);
     assert_eq!(response.headers()["retry-after"], "3");
     assert_eq!(
         axum::body::to_bytes(response.into_body(), 1024)

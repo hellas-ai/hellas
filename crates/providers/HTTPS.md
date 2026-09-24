@@ -98,7 +98,11 @@ with public WebPKI roots. Callers cannot override that account's header or
 change trust roots to impersonate its origin. Restrict paths to the inference
 endpoints the account is intended to expose.
 
-DNS answers are checked and pinned to the request's connection. Private,
+DNS answers are resolved and checked on every request. Connections are reused
+only for the same origin, DNS address set, TLS roots/pins and credential alias.
+Each provider retains at most 32 client pools, with at most four idle connections
+per origin and a 90 second idle expiry. Credentials are still resolved per request;
+the pools contain no default authorization headers. Private,
 loopback, link-local, multicast and other special-purpose addresses are denied
 by default. An operator can explicitly enable private addresses only with a
 nonempty exact host allowlist, for controlled private services. Environment

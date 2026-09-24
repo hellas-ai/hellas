@@ -14,6 +14,7 @@ async fn server(
 ) -> (
     HttpFetchRequest,
     Arc<AtomicUsize>,
+    Arc<AtomicUsize>,
     tokio::task::JoinHandle<()>,
 ) {
     server_with_pause(status, bytes, location, None).await
@@ -26,6 +27,7 @@ async fn server_with_pause(
     pause: Option<Arc<tokio::sync::Notify>>,
 ) -> (
     HttpFetchRequest,
+    Arc<AtomicUsize>,
     Arc<AtomicUsize>,
     tokio::task::JoinHandle<()>,
 ) {
@@ -59,8 +61,11 @@ async fn server_with_pause(
     );
     let calls = Arc::new(AtomicUsize::new(0));
     let seen = calls.clone();
+    let connections = Arc::new(AtomicUsize::new(0));
+    let accepted = connections.clone();
     let task = tokio::spawn(async move {
         while let Ok((socket, _)) = listener.accept().await {
+            accepted.fetch_add(1, Ordering::SeqCst);
             let acceptor = acceptor.clone();
             let seen = seen.clone();
             let bytes = bytes.clone();
@@ -70,38 +75,42 @@ async fn server_with_pause(
                 let Ok(mut socket) = acceptor.accept(socket).await else {
                     return;
                 };
-                let mut request = Vec::new();
-                let mut byte = [0u8; 1];
-                while !request.ends_with(b"\r\n\r\n") && request.len() < 32768 {
-                    if socket.read_exact(&mut byte).await.is_err() {
+                loop {
+                    let mut request = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while !request.ends_with(b"\r\n\r\n") && request.len() < 32768 {
+                        if socket.read_exact(&mut byte).await.is_err() {
+                            return;
+                        }
+                        request.push(byte[0]);
+                    }
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    let location = location
+                        .as_ref()
+                        .map(|v| format!("Location: {v}\r\n"))
+                        .unwrap_or_default();
+                    let retry_after = if status == 429 {
+                        "Retry-After: 7\r\n"
+                    } else {
+                        ""
+                    };
+                    let header = format!(
+                        "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: keep-alive\r\n{location}{retry_after}\r\n",
+                        bytes.len()
+                    );
+                    let _ = socket.write_all(header.as_bytes()).await;
+                    if let Some(pause) = pause.as_ref() {
+                        let _ = socket.write_all(&bytes[..1]).await;
+                        let _ = socket.flush().await;
+                        pause.notified().await;
+                        let _ = socket.write_all(&bytes[1..]).await;
+                        let _ = socket.shutdown().await;
                         return;
                     }
-                    request.push(byte[0]);
+                    if socket.write_all(&bytes).await.is_err() || socket.flush().await.is_err() {
+                        return;
+                    }
                 }
-                seen.fetch_add(1, Ordering::SeqCst);
-                let location = location
-                    .map(|v| format!("Location: {v}\r\n"))
-                    .unwrap_or_default();
-                let retry_after = if status == 429 {
-                    "Retry-After: 7\r\n"
-                } else {
-                    ""
-                };
-                let header = format!(
-                    "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n{location}{retry_after}\r\n",
-                    bytes.len()
-                );
-                let _ = socket.write_all(header.as_bytes()).await;
-                if let Some(pause) = pause {
-                    let _ = socket.write_all(&bytes[..1]).await;
-                    let _ = socket.flush().await;
-                    pause.notified().await;
-                    let _ = socket.write_all(&bytes[1..]).await;
-                    let _ = socket.shutdown().await;
-                    return;
-                }
-                let _ = socket.write_all(&bytes).await;
-                let _ = socket.shutdown().await;
             });
         }
     });
@@ -121,6 +130,7 @@ async fn server_with_pause(
             max_response_bytes: 4096,
         },
         calls,
+        connections,
         task,
     )
 }
@@ -128,7 +138,7 @@ async fn server_with_pause(
 #[tokio::test]
 async fn rate_limit_is_returned_with_its_body_and_delay_without_retrying() {
     let body = br#"{"error":{"type":"rate_limit"}}"#.to_vec();
-    let (request, calls, task) = server(429, body.clone(), None).await;
+    let (request, calls, _, task) = server(429, body.clone(), None).await;
     let mut response = provider().run(prepared(&request)).await.unwrap();
     let head = response.head.http.unwrap();
     assert_eq!(head.status, 429);
@@ -145,7 +155,7 @@ async fn rate_limit_is_returned_with_its_body_and_delay_without_retrying() {
 #[tokio::test]
 async fn coding_response_can_exceed_the_old_half_megabyte_ceiling() {
     let body = vec![b'x'; 1024 * 1024];
-    let (mut request, calls, task) = server(200, body.clone(), None).await;
+    let (mut request, calls, _, task) = server(200, body.clone(), None).await;
     request.max_response_bytes = hellas_rpc::http_fetch::MAX_HTTP_RESPONSE_BYTES;
     let mut response = provider().run(prepared(&request)).await.unwrap();
     let mut received = Vec::new();
@@ -162,7 +172,7 @@ async fn coding_response_can_exceed_the_old_half_megabyte_ceiling() {
 #[tokio::test]
 async fn small_stream_delivery_does_not_wait_for_record_capacity_or_eof() {
     let resume = Arc::new(tokio::sync::Notify::new());
-    let (request, _, server) =
+    let (request, _, _, server) =
         server_with_pause(200, b"ab".to_vec(), None, Some(resume.clone())).await;
     let provider = provider();
     let mut response = provider.run(prepared(&request)).await.unwrap();
@@ -204,7 +214,7 @@ fn prepared(request: &HttpFetchRequest) -> PreparedFetchRequest {
 #[tokio::test]
 async fn custom_roots_and_spki_deliver_exact_binary_bytes() {
     let bytes = vec![0, 255, 1, 13, 10, 128];
-    let (request, calls, task) = server(200, bytes.clone(), None).await;
+    let (request, calls, _, task) = server(200, bytes.clone(), None).await;
     let mut response = provider().run(prepared(&request)).await.unwrap();
     assert_eq!(response.head.http.as_ref().unwrap().status, 200);
     let mut body = Vec::new();
@@ -218,7 +228,7 @@ async fn custom_roots_and_spki_deliver_exact_binary_bytes() {
 
 #[tokio::test]
 async fn wrong_pin_wrong_roots_and_wrong_hostname_send_no_http_request() {
-    let (valid, calls, task) = server(200, b"ok".to_vec(), None).await;
+    let (valid, calls, _, task) = server(200, b"ok".to_vec(), None).await;
     let mut wrong_pin = valid.clone();
     wrong_pin.tls.spki_sha256 = vec!["00".repeat(32)];
     let mut wrong_root = valid.clone();
@@ -233,17 +243,131 @@ async fn wrong_pin_wrong_roots_and_wrong_hostname_send_no_http_request() {
         BTreeMap::new(),
     )
     .unwrap();
+    let response = configured.run(prepared(&valid)).await.unwrap();
+    assert_eq!(collect(response).await, b"ok");
     for request in [wrong_pin, wrong_root, wrong_name] {
         assert!(configured.run(prepared(&request)).await.is_err());
     }
-    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "a warm connection must not bypass TLS validation"
+    );
+    task.abort();
+}
+
+async fn collect(mut response: FetchProviderResponse) -> Vec<u8> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.stream.next().await {
+        body.extend(chunk.unwrap());
+    }
+    body
+}
+
+#[tokio::test]
+async fn repeated_requests_reuse_https_but_still_validate_each_request() {
+    let (request, calls, connections, task) = server(200, b"ok".to_vec(), None).await;
+    let provider = provider();
+    for _ in 0..3 {
+        assert_eq!(
+            collect(provider.run(prepared(&request)).await.unwrap()).await,
+            b"ok"
+        );
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    assert_eq!(connections.load(Ordering::SeqCst), 1);
+    let mut forbidden = request.clone();
+    forbidden.credential = Some("unknown-account".into());
+    assert!(provider.run(prepared(&forbidden)).await.is_err());
+    forbidden.credential = None;
+    forbidden.max_response_bytes = 1;
+    let mut response = provider.run(prepared(&forbidden)).await.unwrap();
+    assert!(response.stream.next().await.unwrap().is_err());
+    assert_eq!(connections.load(Ordering::SeqCst), 1);
+    task.abort();
+}
+
+#[tokio::test]
+async fn client_pools_separate_dns_answers_aliases_and_tls_settings_and_evict() {
+    let (mut request, calls, connections, task) = server(200, b"ok".to_vec(), None).await;
+    let valid_tls = request.tls.clone();
+    let url = request.parsed_url().unwrap();
+    let address = SocketAddr::from(([127, 0, 0, 1], url.port().unwrap()));
+    let other = SocketAddr::from(([127, 0, 0, 2], url.port().unwrap()));
+    let clients = clients::Clients::default();
+    for addresses in [vec![address, other], vec![other, address, address]] {
+        let client = clients.get(&request, &url, addresses).unwrap();
+        assert_eq!(
+            client
+                .get(url.clone())
+                .send()
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap(),
+            "ok"
+        );
+    }
+    assert_eq!(
+        connections.load(Ordering::SeqCst),
+        1,
+        "DNS order must not discard a usable pool"
+    );
+    let denied = clients.get(&request, &url, vec![other]).unwrap();
+    assert!(
+        denied.get(url.clone()).send().await.is_err(),
+        "a new DNS answer must not reuse the old address"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    // Exercise the cache boundary directly: production credential authorization
+    // runs before this method and requires public roots, tested separately.
+    request.credential = Some("second-account".into());
+    let client = clients.get(&request, &url, vec![address, other]).unwrap();
+    assert_eq!(
+        client
+            .get(url.clone())
+            .send()
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap(),
+        "ok"
+    );
+    drop(client);
+    assert_eq!(connections.load(Ordering::SeqCst), 2);
+    request.tls.spki_sha256 = vec!["00".repeat(32)];
+    let client = clients.get(&request, &url, vec![address, other]).unwrap();
+    assert!(client.get(url.clone()).send().await.is_err());
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        3,
+        "wrong pins must not reuse a verified socket"
+    );
+    drop(client);
+    request.tls.spki_sha256.clear();
+    // More distinct policies than the cache admits must evict its old pools.
+    for index in 0..40 {
+        request.credential = Some(format!("account-{index}"));
+        clients.get(&request, &url, vec![address]).unwrap();
+    }
+    let before = connections.load(Ordering::SeqCst);
+    request.credential = None;
+    request.tls = valid_tls;
+    let client = clients.get(&request, &url, vec![address, other]).unwrap();
+    assert_eq!(
+        client.get(url).send().await.unwrap().bytes().await.unwrap(),
+        "ok"
+    );
+    assert_eq!(connections.load(Ordering::SeqCst), before + 1);
     task.abort();
 }
 
 #[tokio::test]
 async fn redirects_are_returned_without_following_them() {
-    let (target, target_calls, target_task) = server(200, b"private".to_vec(), None).await;
-    let (origin, origin_calls, origin_task) = server(302, vec![], Some(target.url)).await;
+    let (target, target_calls, _, target_task) = server(200, b"private".to_vec(), None).await;
+    let (origin, origin_calls, _, origin_task) = server(302, vec![], Some(target.url)).await;
     let response = provider().run(prepared(&origin)).await.unwrap();
     assert_eq!(response.head.http.unwrap().status, 302);
     assert_eq!(origin_calls.load(Ordering::SeqCst), 1);
@@ -254,7 +378,7 @@ async fn redirects_are_returned_without_following_them() {
 
 #[tokio::test]
 async fn signed_response_size_and_default_private_address_denial_are_enforced() {
-    let (mut request, calls, task) = server(200, vec![42; 100], None).await;
+    let (mut request, calls, _, task) = server(200, vec![42; 100], None).await;
     let public = HttpFetchProvider::new(HttpEgressPolicy::default(), BTreeMap::new()).unwrap();
     assert!(public.run(prepared(&request)).await.is_err());
     assert_eq!(calls.load(Ordering::SeqCst), 0);

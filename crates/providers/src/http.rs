@@ -23,6 +23,7 @@ use std::{
     time::Duration,
 };
 use tracing::Instrument;
+mod clients;
 mod config;
 mod tls;
 pub use config::{CredentialRefresh, HttpCredentialConfig, HttpProviderConfig, HttpSecret};
@@ -63,6 +64,7 @@ impl std::fmt::Debug for HttpCredential {
 pub struct HttpFetchProvider {
     policy: HttpEgressPolicy,
     credentials: Arc<BTreeMap<String, HttpCredential>>,
+    clients: Arc<clients::Clients>,
 }
 
 fn fault(message: &'static str) -> FetchProviderError {
@@ -134,6 +136,7 @@ impl HttpFetchProvider {
         Ok(Self {
             policy,
             credentials: Arc::new(credentials),
+            clients: Arc::new(clients::Clients::default()),
         })
     }
 
@@ -226,21 +229,7 @@ impl HttpFetchProvider {
         {
             return Err(fault("HTTPS DNS addresses are outside the egress policy"));
         }
-        let tls = tls::config(&request.tls).map_err(fault)?;
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .no_gzip()
-            .no_brotli()
-            .no_deflate()
-            .no_zstd()
-            .redirect(reqwest::redirect::Policy::none())
-            .retry(reqwest::retry::never())
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(20 * 60))
-            .resolve_to_addrs(host, &addresses)
-            .tls_backend_preconfigured(tls)
-            .build()
-            .map_err(|_| fault("HTTPS client initialization failed"))?;
+        let client = self.clients.get(&request, &url, addresses)?;
         let method = request
             .method
             .parse()
@@ -263,9 +252,7 @@ impl HttpFetchProvider {
         let mut trace =
             crate::responses_fetch::telemetry::Request::for_method(&url, &request.method);
         let response = trace
-            .propagate(outbound)
-            .body(request.body().map_err(|_| fault("invalid HTTP body"))?)
-            .send()
+            .send(outbound.body(request.body().map_err(|_| fault("invalid HTTP body"))?))
             .instrument(trace.span.clone())
             .await
             .map_err(|_| {

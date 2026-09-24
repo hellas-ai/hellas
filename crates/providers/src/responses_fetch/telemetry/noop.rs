@@ -12,8 +12,11 @@ impl Request {
     pub fn for_method(_: &reqwest::Url, _: &str) -> Self {
         Self { span: Span::none() }
     }
-    pub fn propagate(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        request
+    pub async fn send(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> reqwest::Result<reqwest::Response> {
+        request.send().await
     }
     pub fn status(&self, _: u16) {}
     pub fn fail(&mut self, _: &'static str) {}
