@@ -69,6 +69,10 @@ memory. Alternatively, replace `secret_env` with `secret_file` and `secret_field
 to read a private JSON login file on each request. The loader rejects symlinks,
 non-regular files, files that are not owner-only, and files over 64 KiB; atomic
 token rotation is picked up without restarting the provider.
+`secret_field` and `expires_field` accept a top-level key or a JSON Pointer
+starting with `/`, for example `/tokens/access_token` or `/claudeAiOauth/accessToken`.
+This lets the provider read native login files directly. The native login tool
+still owns token refresh; do not independently rotate a CLI's refresh token.
 
 For short-lived tokens, a file credential can include:
 

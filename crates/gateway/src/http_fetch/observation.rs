@@ -1,5 +1,5 @@
 use serde_json::Value;
-use std::time::Instant;
+use std::{io::Write, time::Instant};
 
 pub(super) struct Metrics {
     #[cfg(feature = "otel")]
@@ -53,6 +53,7 @@ pub(super) struct Observation {
     bytes: u64,
     first_byte: Option<f64>,
     usage: Usage,
+    compressed_usage: Option<flate2::write::GzDecoder<Usage>>,
     #[cfg(feature = "otel")]
     route: String,
     #[cfg(feature = "otel")]
@@ -71,6 +72,7 @@ impl Observation {
                 gen_ai.usage.input_tokens = tracing::field::Empty,
                 gen_ai.usage.output_tokens = tracing::field::Empty,
                 gen_ai.usage.cache_read.input_tokens = tracing::field::Empty,
+                gen_ai.usage.cache_creation.input_tokens = tracing::field::Empty,
                 hellas.response.time_to_first_byte = tracing::field::Empty,
                 hellas.response.complete = tracing::field::Empty,
                 error.type = tracing::field::Empty, otel.status_code = tracing::field::Empty),
@@ -80,6 +82,7 @@ impl Observation {
             bytes: 0,
             first_byte: None,
             usage: Usage::default(),
+            compressed_usage: None,
             #[cfg(feature = "otel")]
             route: route.into(),
             #[cfg(feature = "otel")]
@@ -95,18 +98,41 @@ impl Observation {
         self.status = status;
         self.span.record("http.response.status_code", status);
     }
-    pub(super) fn content_type(&mut self, value: Option<&str>) {
+    pub(super) fn content(&mut self, value: Option<&str>, encoding: Option<&str>) {
         self.usage.sse =
             value.is_some_and(|value| value.split(';').next() == Some("text/event-stream"));
+        match encoding.map(str::trim) {
+            None | Some("") => {}
+            Some(value) if value.eq_ignore_ascii_case("identity") => {}
+            Some(value) if value.eq_ignore_ascii_case("gzip") => {
+                self.compressed_usage = Some(flate2::write::GzDecoder::new(std::mem::take(
+                    &mut self.usage,
+                )));
+            }
+            Some(_) => self.usage.overflow = true,
+        }
     }
     pub(super) fn chunk(&mut self, bytes: &[u8]) {
         if self.first_byte.is_none() {
             self.first_byte = Some(self.started.elapsed().as_secs_f64());
         }
         self.bytes += bytes.len() as u64;
-        self.usage.push(bytes);
+        if let Some(decoder) = self.compressed_usage.as_mut() {
+            if decoder.write_all(bytes).is_err() {
+                self.compressed_usage = None;
+                self.usage.overflow = true;
+            }
+        } else {
+            self.usage.push(bytes);
+        }
     }
     pub(super) fn complete(&mut self) {
+        if let Some(decoder) = self.compressed_usage.take() {
+            self.usage = decoder.finish().unwrap_or_else(|_| Usage {
+                overflow: true,
+                ..Default::default()
+            });
+        }
         self.usage.finish();
         self.complete = true;
     }
@@ -114,15 +140,24 @@ impl Observation {
 
 impl Drop for Observation {
     fn drop(&mut self) {
+        let usage = self
+            .compressed_usage
+            .as_ref()
+            .map(|decoder| decoder.get_ref())
+            .unwrap_or(&self.usage);
         self.span.record("http.response.body.size", self.bytes);
         self.span.record("hellas.response.complete", self.complete);
         if let Some(ttfb) = self.first_byte {
             self.span.record("hellas.response.time_to_first_byte", ttfb);
         }
         for (field, value) in [
-            ("gen_ai.usage.input_tokens", self.usage.input),
-            ("gen_ai.usage.output_tokens", self.usage.output),
-            ("gen_ai.usage.cache_read.input_tokens", self.usage.cached),
+            ("gen_ai.usage.input_tokens", usage.input),
+            ("gen_ai.usage.output_tokens", usage.output),
+            ("gen_ai.usage.cache_read.input_tokens", usage.cached),
+            (
+                "gen_ai.usage.cache_creation.input_tokens",
+                usage.cache_write,
+            ),
         ] {
             if let Some(value) = value {
                 self.span.record(field, value);
@@ -157,9 +192,10 @@ impl Drop for Observation {
                 self.metrics.first_byte.record(ttfb, &labels);
             }
             for (kind, value) in [
-                ("input", self.usage.input),
-                ("output", self.usage.output),
-                ("cache_read", self.usage.cached),
+                ("input", usage.input),
+                ("output", usage.output),
+                ("cache_read", usage.cached),
+                ("cache_write", usage.cache_write),
             ] {
                 if let Some(value) = value {
                     let mut labels = labels.to_vec();
@@ -179,7 +215,26 @@ struct Usage {
     input: Option<u64>,
     output: Option<u64>,
     cached: Option<u64>,
+    cache_write: Option<u64>,
     overflow: bool,
+    decoded_bytes: usize,
+}
+
+impl std::io::Write for Usage {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        // Observation must not allow compressed data to consume unbounded CPU
+        // or memory. Stopping this sink never changes the response sent onward.
+        self.decoded_bytes = self.decoded_bytes.saturating_add(bytes.len());
+        if self.overflow || self.decoded_bytes > 32 * 1024 * 1024 {
+            return Err(std::io::Error::other("usage observation limit"));
+        }
+        self.push(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 impl Usage {
@@ -188,18 +243,24 @@ impl Usage {
             return;
         }
         self.pending.extend_from_slice(bytes);
-        if !self.sse {
-            return;
-        }
-        while let Some(end) = self.pending.iter().position(|byte| *byte == b'\n') {
+        // Some Responses endpoints omit Content-Type. Detect their SSE prelude
+        // after enough bytes have arrived, without changing the forwarded body.
+        self.sse |= self.pending.starts_with(b"event:")
+            || self.pending.starts_with(b"data:")
+            || self.pending.starts_with(b":");
+        while self.sse
+            && let Some(end) = self.pending.iter().position(|byte| *byte == b'\n')
+        {
             let line: Vec<_> = self.pending.drain(..=end).collect();
             if let Some(data) = line.strip_prefix(b"data:") {
                 self.parse(data);
             }
         }
         if self.pending.len() > 512 * 1024 {
-            self.pending.clear();
-            self.overflow = true;
+            *self = Self {
+                overflow: true,
+                ..Default::default()
+            };
         }
     }
     fn finish(&mut self) {
@@ -244,6 +305,14 @@ impl Usage {
                 .or_else(|| usage.pointer("/input_tokens_details/cached_tokens"))
                 .and_then(Value::as_u64),
         );
+        update(
+            &mut self.cache_write,
+            usage
+                .get("cache_creation_input_tokens")
+                .or_else(|| usage.pointer("/input_tokens_details/cache_write_tokens"))
+                .or_else(|| usage.pointer("/prompt_tokens_details/cache_write_tokens"))
+                .and_then(Value::as_u64),
+        );
     }
 }
 
@@ -251,9 +320,73 @@ impl Usage {
 mod tests {
     use super::*;
 
+    fn gzip(bytes: &[u8]) -> Vec<u8> {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(bytes).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    #[test]
+    fn compressed_usage_survives_fragmentation_without_changing_wire_accounting() {
+        let wire = gzip(b"event: message_start\ndata: {\"message\":{\"usage\":{\"input_tokens\":2,\"cache_creation_input_tokens\":400,\"cache_read_input_tokens\":1244}}}\n\ndata: {\"usage\":{\"output_tokens\":99}}\n\n");
+        for size in 1..=wire.len() {
+            let mut observed = Observation::new(&Metrics::new(), "/v1/messages");
+            observed.content(Some("text/event-stream; charset=utf-8"), Some("gzip"));
+            for chunk in wire.chunks(size) {
+                observed.chunk(chunk);
+            }
+            observed.complete();
+            assert!(observed.complete);
+            assert_eq!(observed.bytes, wire.len() as u64);
+            assert_eq!(
+                (
+                    observed.usage.input,
+                    observed.usage.output,
+                    observed.usage.cached,
+                    observed.usage.cache_write
+                ),
+                (Some(2), Some(99), Some(1244), Some(400))
+            );
+        }
+    }
+
+    #[test]
+    fn bad_or_unsupported_compression_leaves_usage_unknown() {
+        let wire = gzip(b"{\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}");
+        let mut corrupt = wire.clone();
+        let crc = corrupt.len() - 8;
+        corrupt[crc] ^= 1;
+        for (bytes, encoding) in [
+            (&wire[..wire.len() - 4], "gzip"),
+            (corrupt.as_slice(), "gzip"),
+            (wire.as_slice(), "br"),
+        ] {
+            let mut observed = Observation::new(&Metrics::new(), "/v1/responses");
+            observed.content(Some("application/json"), Some(encoding));
+            observed.chunk(bytes);
+            observed.complete();
+            assert!(observed.complete);
+            assert_eq!(observed.bytes, bytes.len() as u64);
+            assert_eq!((observed.usage.input, observed.usage.output), (None, None));
+        }
+    }
+
+    #[test]
+    fn compressed_observation_stops_at_its_budget() {
+        let data = b": ping\n\n".repeat(32 * 1024 * 1024 / 8 + 1);
+        let wire = gzip(&data);
+        let mut observed = Observation::new(&Metrics::new(), "/v1/messages");
+        observed.content(Some("text/event-stream"), Some("gzip"));
+        observed.chunk(&wire);
+        observed.complete();
+        assert!(observed.usage.overflow);
+        assert_eq!(observed.bytes, wire.len() as u64);
+        assert_eq!(observed.usage.input, None);
+    }
+
     #[test]
     fn usage_survives_arbitrary_sse_boundaries_and_cumulative_updates() {
-        let wire = b"event: message_start\r\ndata: {\"message\":{\"usage\":{\"input_tokens\":11,\"output_tokens\":1,\"cache_read_input_tokens\":7}}}\r\n\r\ndata: {\"usage\":{\"output_tokens\":5}}\n\ndata: {\"usage\":{\"output_tokens\":5}}\n\ndata: [DONE]\n\n";
+        let wire = b"event: message_start\r\ndata: {\"message\":{\"usage\":{\"input_tokens\":11,\"output_tokens\":1,\"cache_read_input_tokens\":7,\"cache_creation_input_tokens\":13}}}\r\n\r\ndata: {\"usage\":{\"output_tokens\":5}}\n\ndata: {\"usage\":{\"output_tokens\":5}}\n\ndata: [DONE]\n\n";
         for size in 1..=wire.len() {
             let mut usage = Usage {
                 sse: true,
@@ -267,6 +400,7 @@ mod tests {
                 (usage.input, usage.output, usage.cached),
                 (Some(11), Some(5), Some(7))
             );
+            assert_eq!(usage.cache_write, Some(13));
         }
     }
 
@@ -287,12 +421,10 @@ mod tests {
 
     #[test]
     fn responses_completed_usage_survives_fragmented_delivery() {
-        let wire = b"event: response.completed\ndata: {\"response\":{\"usage\":{\"input_tokens\":12,\"output_tokens\":3,\"input_tokens_details\":{\"cached_tokens\":8}}}}\n\n";
+        let wire = b"event: response.completed\ndata: {\"response\":{\"usage\":{\"input_tokens\":12,\"output_tokens\":3,\"input_tokens_details\":{\"cached_tokens\":8,\"cache_write_tokens\":2}}}}\n\n";
         for size in 1..=wire.len() {
-            let mut usage = Usage {
-                sse: true,
-                ..Default::default()
-            };
+            // Live subscription Responses can omit Content-Type entirely.
+            let mut usage = Usage::default();
             for chunk in wire.chunks(size) {
                 usage.push(chunk);
             }
@@ -301,6 +433,7 @@ mod tests {
                 (usage.input, usage.output, usage.cached),
                 (Some(12), Some(3), Some(8))
             );
+            assert_eq!(usage.cache_write, Some(2));
         }
     }
 }

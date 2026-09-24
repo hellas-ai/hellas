@@ -51,8 +51,7 @@ pub struct CredentialRefresh {
 
 impl CredentialRefresh {
     fn due(&self, object: &serde_json::Value) -> Result<bool, FetchProviderError> {
-        let expiry = object
-            .get(&self.expires_field)
+        let expiry = credential_field(object, &self.expires_field)
             .and_then(serde_json::Value::as_f64)
             .filter(|value| value.is_finite())
             .ok_or_else(|| super::fault("credential expiry unavailable"))?;
@@ -141,14 +140,24 @@ impl HttpSecret {
                         **retry_at = None;
                     }
                 }
-                let secret = object
-                    .get(field)
+                let secret = credential_field(&object, field)
                     .and_then(serde_json::Value::as_str)
                     .filter(|secret| !secret.is_empty())
                     .ok_or_else(|| super::fault("credential field unavailable"))?;
                 Ok(format!("{prefix}{secret}"))
             }
         }
+    }
+}
+
+fn credential_field<'a>(
+    object: &'a serde_json::Value,
+    field: &str,
+) -> Option<&'a serde_json::Value> {
+    if field.starts_with('/') {
+        object.pointer(field)
+    } else {
+        object.get(field)
     }
 }
 
@@ -240,6 +249,51 @@ impl HttpProviderConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn nested_file_credentials_follow_rotation_and_reject_missing_fields() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("account.json");
+        let source = HttpSecret::JsonFile {
+            path: path.clone(),
+            field: "/tokens/access_token".into(),
+            prefix: "Bearer ".into(),
+            refresh: None,
+        };
+        for token in ["first", "rotated"] {
+            hellas_private::write_atomically(
+                &path,
+                ".tmp",
+                &serde_json::to_vec(&serde_json::json!({"tokens":{"access_token":token}})).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(source.resolve().await.unwrap(), format!("Bearer {token}"));
+        }
+        hellas_private::write_atomically(
+            &path,
+            ".tmp",
+            b"{\"tokens\":{\"refresh_token\":\"private\"}}",
+        )
+        .unwrap();
+        assert!(source.resolve().await.is_err());
+        let refresh = CredentialRefresh {
+            command: vec!["unused".into()],
+            expires_field: "/tokens/expires_at".into(),
+            lock: Default::default(),
+        };
+        assert!(
+            refresh
+                .due(&serde_json::json!({"tokens":{"expires_at":0}}))
+                .unwrap()
+        );
+        assert!(
+            !refresh
+                .due(&serde_json::json!({"tokens":{"expires_at":4102444800_u64}}))
+                .unwrap()
+        );
+        assert!(refresh.due(&serde_json::json!({"tokens":{}})).is_err());
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn failed_refresh_is_not_repeated_by_waiting_requests() {

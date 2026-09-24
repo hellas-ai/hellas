@@ -118,11 +118,18 @@ concurrency returns 503 with `Retry-After: 1`.
 
 With `otel`, traces connect HTTP ingress, Fetch RPCs, credential refresh and
 upstream HTTP. Span attributes exclude request/response bodies and credentials.
+Pooled QUIC connections have separate root spans so their lifetime cannot delay
+exporting the first request's trace.
 `hellas.gateway.http.requests`, `.duration`, `.time_to_first_byte` and `.tokens`
 record status, completion, timings and standard OpenAI/Anthropic usage fields.
-Usage is unknown when upstream omits it; cached tokens are reported separately.
-Bodies remain encoded on the wire and in archives; usage extraction currently
-requires an uncompressed JSON/SSE response.
+SSE usage is recognized even when the upstream omits Content-Type. Cache reads
+and writes are reported separately as `cache_read` and `cache_write` token kinds;
+the input/output counts retain the upstream's meaning. Usage is unknown when
+upstream omits it.
+Bodies remain encoded on the wire and in archives. Usage observation accepts
+plain JSON/SSE and gzip, with a 32 MiB decoded-byte budget and a 512 KiB pending
+JSON/line budget. Invalid compression, unsupported encodings or exceeded budgets
+leave usage unknown without affecting delivery.
 Account quota windows still come from the upstream quota exporter. Request
 token totals alone cannot determine subscription quota or billing.
 

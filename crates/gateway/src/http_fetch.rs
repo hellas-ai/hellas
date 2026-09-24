@@ -377,9 +377,12 @@ async fn handle(State(state): State<Arc<HttpState>>, request: Request) -> Respon
     if let Some(length) = representation_length {
         headers.insert("content-length", length);
     }
-    observed.content_type(
+    observed.content(
         headers
             .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        headers
+            .get("content-encoding")
             .and_then(|value| value.to_str().ok()),
     );
     account.observe(status, &headers);
