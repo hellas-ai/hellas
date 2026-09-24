@@ -49,28 +49,28 @@ paid-work = [
 ]
 
 [dependencies]
-async-stream = { workspace = true, optional = true }
-hellas-chain = { workspace = true, default-features = false, optional = true }
-hellas-kernel = { workspace = true, default-features = false, optional = true }
-hellas-work = { workspace = true, optional = true }
-futures = { workspace = true, optional = true }
-serde = { workspace = true, optional = true }
-serde_json = { workspace = true, optional = true }
-hex = { workspace = true, optional = true }
-url = { version = "2", optional = true }
 anyhow = { workspace = true, optional = true }
+async-stream = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
 futures-core = { workspace = true, optional = true }
 hellas-attestation.workspace = true
+hellas-chain = { workspace = true, default-features = false, optional = true }
 hellas-client = { workspace = true, optional = true }
 hellas-executor = { workspace = true, default-features = false, optional = true }
 hellas-gateway = { workspace = true, optional = true }
+hellas-kernel = { workspace = true, default-features = false, optional = true }
 hellas-providers = { workspace = true, optional = true }
 hellas-rpc = { workspace = true, features = ["execute", "fetch", "courtesy"] }
 hellas-wire = { workspace = true, features = ["mux"] }
+hellas-work = { workspace = true, optional = true }
+hex = { workspace = true, optional = true }
 iroh = { workspace = true, features = ["tls-ring"], optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["net", "sync"], optional = true }
 tracing = { workspace = true, optional = true }
+url = { version = "2", optional = true }
 
 [dev-dependencies]
 tokio.workspace = true

@@ -27,7 +27,6 @@ anyhow = { workspace = true }
 async-stream = { workspace = true }
 axum = { workspace = true }
 base64.workspace = true
-httpdate = "1"
 flate2 = "1"
 futures = { workspace = true }
 hellas-adaptors.workspace = true
@@ -38,6 +37,7 @@ hellas-private.workspace = true
 hellas-rpc = { workspace = true, features = ["courtesy", "fetch"] }
 hellas-store = { workspace = true, optional = true }
 hellas-wire = { workspace = true, features = ["iroh"] }
+httpdate = "1"
 iroh.workspace = true
 libc = "0.2"
 opentelemetry = { workspace = true, optional = true }

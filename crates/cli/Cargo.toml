@@ -102,12 +102,12 @@ hellas-kernel = { workspace = true, default-features = false, optional = true }
 hellas-presentation = { workspace = true, optional = true }
 hellas-private.workspace = true
 hellas-providers.workspace = true
-hellas-sdk = { workspace = true, default-features = false, optional = true }
 hellas-rpc = { workspace = true, default-features = false, features = [
     "all-protocols",
     "work",
     "host-control",
 ] }
+hellas-sdk = { workspace = true, default-features = false, optional = true }
 hellas-store = { workspace = true }
 hellas-wire = { workspace = true, features = [
     "unix",
