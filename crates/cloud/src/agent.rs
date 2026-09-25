@@ -24,6 +24,8 @@ use crate::{
 pub struct AgentOptions {
     pub credentials: Credentials,
     pub data: PathBuf,
+    /// Separate private filesystem for credentials when the data volume lacks Unix modes.
+    pub configuration_dir: Option<PathBuf>,
     pub cli: PathBuf,
     /// Original OCI entrypoint, including `serve` and GPU backend defaults.
     pub launcher: Vec<String>,
@@ -40,6 +42,7 @@ struct Process {
     owner: Option<String>,
     cli: PathBuf,
     configuration: Option<crate::configuration::InstalledConfiguration>,
+    configuration_dir: PathBuf,
 }
 
 impl Process {
@@ -130,8 +133,7 @@ impl Process {
         {
             return Err("managed configuration conflicts with a launch-time fetch config");
         }
-        let parent = self.identity.parent().ok_or("missing data directory")?;
-        let (candidate, installed) = configuration.stage(parent)?;
+        let (candidate, installed) = configuration.stage(&self.configuration_dir)?;
         // The worker's own CLI validates the exact config and credentials before
         // disrupting the running process. Validation output can contain secrets.
         let checked = tokio::time::timeout(
@@ -156,7 +158,7 @@ impl Process {
         if !checked.success() {
             return Err("worker rejected fetch configuration");
         }
-        let path = self.identity.with_file_name("configuration.json");
+        let path = self.configuration_dir.join("configuration.json");
         self.stop()
             .await
             .map_err(|_| "could not stop worker for configuration")?;
@@ -190,7 +192,7 @@ impl Process {
         let _ = candidate.keep();
         if let Some(previous) = previous
             && let Some(directory) = previous.fetch_config.parent()
-            && directory.parent() == self.identity.parent()
+            && directory.parent() == Some(self.configuration_dir.as_path())
             && directory
                 .file_name()
                 .is_some_and(|name| name.to_string_lossy().starts_with(".worker-config-"))
@@ -317,7 +319,13 @@ pub async fn run(options: AgentOptions) -> Result<()> {
     let content = options.data.join("content");
     tokio::fs::create_dir_all(&content).await?;
     let identity = options.data.join("identity");
-    let configuration_path = options.data.join("configuration.json");
+    let configuration_dir = options
+        .configuration_dir
+        .unwrap_or_else(|| options.data.clone());
+    if configuration_dir != options.data {
+        crate::management::private_directory(&configuration_dir)?;
+    }
+    let configuration_path = configuration_dir.join("configuration.json");
     let configuration: Option<crate::configuration::InstalledConfiguration> = configuration_path
         .exists()
         .then(|| crate::config::read_json(&configuration_path))
@@ -346,6 +354,7 @@ pub async fn run(options: AgentOptions) -> Result<()> {
         owner: options.credentials.owner.clone(),
         cli: options.cli,
         configuration,
+        configuration_dir,
     };
     process.start()?;
     let state = Arc::new(State {
