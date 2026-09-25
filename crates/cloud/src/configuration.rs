@@ -29,6 +29,22 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
+    fn staging_restricts_permissions_but_refuses_symlinks() {
+        let parent = tempfile::tempdir().unwrap();
+        let directory = parent.path().join("fresh");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o777)).unwrap();
+        restrict_staging_directory(&directory).unwrap();
+        assert_eq!(
+            std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let link = parent.path().join("link");
+        std::os::unix::fs::symlink(&directory, &link).unwrap();
+        assert!(restrict_staging_directory(&link).is_err());
+    }
+
+    #[test]
     fn staged_credentials_are_private_and_missing_references_leave_no_files() {
         let parent = tempfile::tempdir().unwrap();
         let mut configuration = Configuration {
@@ -129,19 +145,10 @@ impl Configuration {
             .prefix(".worker-config-")
             .tempdir_in(parent)
             .map_err(|_| "could not create worker configuration directory")?;
+        restrict_staging_directory(stage.path())?;
         let files = stage.path().join("files");
-        crate::management::private_directory(&files).map_err(|_| {
-            use std::os::unix::fs::{MetadataExt, PermissionsExt};
-            match std::fs::symlink_metadata(&files) {
-                Ok(meta) if meta.uid() != unsafe { libc::geteuid() } => {
-                    "worker filesystem does not preserve credential directory ownership"
-                }
-                Ok(meta) if meta.permissions().mode() & 0o077 != 0 => {
-                    "worker filesystem does not preserve private credential directory permissions"
-                }
-                _ => "worker filesystem could not create an owner-only credential directory",
-            }
-        })?;
+        std::fs::create_dir(&files).map_err(|_| "could not create worker credential directory")?;
+        restrict_staging_directory(&files)?;
         for (name, value) in &self.files {
             crate::config::save_private(&files.join(name), value, true)
                 .map_err(|_| "could not write private worker credential file")?;
@@ -184,4 +191,35 @@ impl Configuration {
             },
         ))
     }
+}
+
+// Only for fresh, empty staging directories. Some provider filesystems ignore
+// mkdir's mode but support chmod. Verify the result before writing any secrets.
+fn restrict_staging_directory(path: &Path) -> Result<(), &'static str> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    let directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|_| "could not open worker credential directory")?;
+    let metadata = directory
+        .metadata()
+        .map_err(|_| "could not inspect worker credential directory")?;
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        return Err("worker filesystem does not preserve credential directory ownership");
+    }
+    directory
+        .set_permissions(std::fs::Permissions::from_mode(0o700))
+        .map_err(|_| "could not restrict worker credential directory permissions")?;
+    if directory
+        .metadata()
+        .map_err(|_| "could not inspect worker credential directory")?
+        .permissions()
+        .mode()
+        & 0o777
+        != 0o700
+    {
+        return Err("worker filesystem does not preserve private credential directory permissions");
+    }
+    Ok(())
 }
