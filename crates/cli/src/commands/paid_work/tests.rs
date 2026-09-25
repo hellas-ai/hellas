@@ -131,7 +131,8 @@ fn prepare_input_builds_a_bundle_from_an_environment_and_prompt() {
     )
     .unwrap();
 
-    let PreparedPaidWorkInput::Evaluate(prepared) = read_prepared_work_input(&output).unwrap() else {
+    let PreparedPaidWorkInput::Evaluate(prepared) = read_prepared_work_input(&output).unwrap()
+    else {
         panic!("an Evaluate bundle");
     };
     let parts = prepared.parts().unwrap();
