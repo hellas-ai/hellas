@@ -170,6 +170,7 @@ async fn run_with_store(
             routes: work.routes.clone(),
             validators: work.validators.clone(),
             poll: work.poll,
+            max_observation_age: work.max_observation_age,
             settlement_key: options.settlement_key.clone(),
             policy: work.provider_policy(),
         });

@@ -363,7 +363,7 @@ async fn remote_cache_cli_uses_the_nodes_existing_dispatch_and_admin_grant() {
         let accepting = server.clone();
         let task = tokio::spawn(async move {
             let connection = accepting.accept().await.unwrap().await.unwrap();
-            serve_connection::<NodeChain>(
+            serve_connection(
                 connection.alpn().to_vec(),
                 connection,
                 execution,
@@ -466,7 +466,7 @@ async fn production_fetch_alpn_dispatches_run_ticket_on_its_connection() {
             .expect("the server accepts the Fetch dial")
             .await
             .expect("the Fetch handshake completes");
-        serve_connection::<NodeChain>(
+        serve_connection(
             connection.alpn().to_vec(),
             connection,
             test_remote_execution(),
@@ -541,7 +541,7 @@ async fn exchange_routed_setup(
             .expect("the routed setup connection starts")
             .await
             .expect("the routed setup handshake completes");
-        serve_connection::<TestChain>(
+        serve_connection(
             connection.alpn().to_vec(),
             connection,
             test_remote_execution(),
@@ -627,10 +627,11 @@ async fn two_vouched_peers_receive_their_distinct_configured_offers() {
             ]),
             validators: Vec::new(),
             poll: Duration::from_millis(1),
+            max_observation_age: Duration::from_secs(5),
             settlement_key: provider(),
             policy: provider_policy(),
         },
-        MountedWork::<TestChain>::default(),
+        MountedWork::default(),
         setup_mount.clone(),
     )
     .expect("both owned provider journals are discovered");
@@ -714,9 +715,9 @@ async fn two_vouched_peers_receive_their_distinct_configured_offers() {
 
 fn discover_two_route_runner(
     root: &Path,
-    work_mount: &MountedWork<RoutedChain>,
+    work_mount: &MountedWork,
     setup_mount: &MountedSetup,
-) -> WorkRunner<RoutedChain> {
+) -> WorkRunner {
     let first = OfferFixture::first();
     let second = OfferFixture::second();
     match WorkRunner::discover(
@@ -738,6 +739,7 @@ fn discover_two_route_runner(
             ]),
             validators: Vec::new(),
             poll: Duration::from_millis(1),
+            max_observation_age: Duration::from_secs(5),
             settlement_key: provider(),
             policy: provider_policy(),
         },
@@ -750,7 +752,7 @@ fn discover_two_route_runner(
 }
 
 async fn accept_mounted_route(
-    mount: &MountedWork<RoutedChain>,
+    mount: &MountedWork,
     peer: PeerId,
     request: AcceptWorkRequest,
 ) -> AcceptWorkResponse {
@@ -850,7 +852,7 @@ async fn completion_clears_and_mounts_only_the_completing_route() {
 /// B's independent snapshot and service remain ready. Retained answers and
 /// already-expired proposals do not wait for another admission decision.
 #[tokio::test]
-async fn fresh_readiness_is_per_request_and_per_routed_channel() {
+async fn requests_use_local_observation_and_one_contested_route_does_not_disable_another() {
     let dir = temp();
     let first = OfferFixture::first();
     let second = OfferFixture::second();
@@ -869,6 +871,7 @@ async fn fresh_readiness_is_per_request_and_per_routed_channel() {
 
     assert!(runner.tick(&source).await, "both completed routes mount");
     let first_request = first.signed_accept_request();
+    let reads_before_request = source.0.lock().unwrap().snapshot_reads;
     let accepted =
         accept_mounted_route(&work_mount, first_route_peer(), first_request.clone()).await;
     assert!(
@@ -879,31 +882,24 @@ async fn fresh_readiness_is_per_request_and_per_routed_channel() {
         "A's first fresh snapshot permits its signature",
     );
 
+    assert_eq!(
+        source.0.lock().unwrap().snapshot_reads,
+        reads_before_request,
+        "acceptance performs no validator reads"
+    );
+
     source.set_snapshot(first.ready_snapshot(ORIGIN, Some(pending_contest(false))));
     let service = work_mount
         .service(&vouched_context(first_route_peer()))
         .unwrap();
     let checkpoint = service.with_state(ChannelState::checkpoint).unwrap();
-    // Hold a real fresh admission in its chain read through the public handler.
+    // Block the observer's read, not a request. Existing local evidence still
+    // permits replies, and those replies cannot initiate validator I/O.
     let entered = Arc::new(Semaphore::new(0));
     let release = Arc::new(Semaphore::new(0));
     source.0.lock().unwrap().next_read = Some((entered.clone(), release.clone()));
-    let mut waiting_authorization = first.authorization();
-    waiting_authorization.proposal_nonce = 3;
-    let waiting_id = work_id(first.descriptor().channel(), &waiting_authorization);
-    let waiting_request = AcceptWorkRequest {
-        authorization: waiting_authorization.encode(),
-        client_signature: first
-            .client()
-            .sign(signing_hash(waiting_id))
-            .as_bytes()
-            .to_vec(),
-        prepared_input: first_request.prepared_input.clone(),
-    };
-    let waiting_mount = work_mount.clone();
-    let waiting = tokio::spawn(async move {
-        accept_mounted_route(&waiting_mount, first_route_peer(), waiting_request).await
-    });
+    let observer_source = source.clone();
+    let observing = tokio::spawn(async move { runner.tick(&observer_source).await });
     entered.acquire().await.unwrap().forget();
     let repeated = tokio::time::timeout(
         Duration::from_secs(1),
@@ -943,7 +939,7 @@ async fn fresh_readiness_is_per_request_and_per_routed_channel() {
         checkpoint
     );
     release.add_permits(1);
-    waiting.await.unwrap();
+    assert!(observing.await.unwrap());
 
     let mut fresh_authorization = first.authorization();
     fresh_authorization.proposal_nonce = 2;
@@ -2132,6 +2128,7 @@ impl TxSink for TestChain {
 struct RoutedChain(Arc<Mutex<RoutedChainState>>);
 
 struct RoutedChainState {
+    snapshot_reads: usize,
     next_read: Option<(Arc<Semaphore>, Arc<Semaphore>)>,
     completed_setups: Vec<EdgeId>,
     snapshots: Vec<WorkChannelSnapshot>,
@@ -2144,6 +2141,7 @@ impl RoutedChain {
         snapshots: impl IntoIterator<Item = WorkChannelSnapshot>,
     ) -> Self {
         Self(Arc::new(Mutex::new(RoutedChainState {
+            snapshot_reads: 0,
             next_read: None,
             completed_setups: completed_setups.into_iter().collect(),
             snapshots: snapshots.into_iter().collect(),
@@ -2208,7 +2206,11 @@ impl FinalizedWorkView for RoutedChain {
         &self,
         query: WorkChannelQuery,
     ) -> Result<Option<WorkChannelSnapshot>, QueryError> {
-        let gate = self.0.lock().unwrap().next_read.take();
+        let gate = {
+            let mut state = self.0.lock().unwrap();
+            state.snapshot_reads += 1;
+            state.next_read.take()
+        };
         if let Some((entered, release)) = gate {
             entered.add_permits(1);
             release.acquire().await.unwrap().forget();
@@ -2471,11 +2473,7 @@ impl TxSink for NodeChain {
 
 /// The runner a node starts with: the configured root, the stored
 /// identity, and the policy it was configured with.
-fn runner(
-    root: &Path,
-    policy: ProviderChannelPolicy,
-    mount: &MountedWork<TestChain>,
-) -> WorkRunner<TestChain> {
+fn runner(root: &Path, policy: ProviderChannelPolicy, mount: &MountedWork) -> WorkRunner {
     match WorkRunner::discover(
         WorkRunnerConfig {
             network: network(),
@@ -2484,6 +2482,7 @@ fn runner(
             routes: configured_routes(&[(default_route_peer(), bond_edge(), client().party_key())]),
             validators: Vec::new(),
             poll: Duration::from_millis(1),
+            max_observation_age: Duration::from_secs(5),
             settlement_key: provider(),
             policy,
         },
@@ -2947,7 +2946,7 @@ struct RunningPaidNode {
     runner_task: JoinHandle<()>,
     stop: Option<oneshot::Sender<()>>,
     setup_mount: MountedSetup,
-    work_mount: MountedWork<NodeChain>,
+    work_mount: MountedWork,
     execution_calls: Arc<AtomicUsize>,
     peer: PeerId,
 }
@@ -2968,6 +2967,7 @@ impl RunningPaidNode {
                 routes: configured_routes(&[(peer, bond_edge(), client().party_key())]),
                 validators: Vec::new(),
                 poll: Duration::from_millis(1),
+                max_observation_age: Duration::from_secs(5),
                 settlement_key: provider(),
                 policy,
             },
@@ -3312,17 +3312,22 @@ async fn run_advertised_paid_exchange(
         "the production clock submits and finalizes both setup Opens",
     );
 
-    // Deliberately leave the raw driven service holding the readiness
-    // that was true when the channel mounted. The advertised Work
-    // wrapper must not trust that cached value: the contested arm below
-    // changes the coherent source before its first network request.
-    let mounted = node
-        .work_mount
-        .handler(&node.context())
-        .expect("the production clock mounted a request handler");
-    if let Err(error) = mounted.refresh_admission().await {
-        panic!("mount-time readiness primes the exact driven service: {error}");
-    }
+    // The observer must publish readiness before the first request. Request
+    // handling itself has no validator connection and cannot refresh it.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if node
+                .work_mount
+                .service(&node.context())
+                .is_some_and(|service| service.readiness().is_ok())
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the channel observer publishes readiness");
 
     if contested {
         let contest_height = source.open_contest();
@@ -3713,6 +3718,7 @@ fn the_clock_resumes_an_accepted_job_after_restart() {
         );
 
         chain.set_snapshot(ready_channel_snapshot(ORIGIN, Some(pending_contest(false))));
+        assert!(restarted.tick(&chain).await);
         let response: WithTrailer<DeliverResultResponse> = handler
             .deliver_result(request, context)
             .await
@@ -3766,12 +3772,21 @@ async fn open_result_stream_stops_when_a_contest_finalizes() {
     ));
 
     chain.set_snapshot(ready_channel_snapshot(ORIGIN, Some(pending_contest(false))));
+    assert!(runner.tick(&chain).await);
     backend.finish();
     let next = tokio::time::timeout(Duration::from_secs(5), stream.next())
         .await
         .unwrap()
         .expect("the open stream terminates with a refusal");
-    assert_eq!(next.unwrap_err().code, hellas_wire::WireCode::Unavailable);
+    assert!(
+        match next {
+            Err(status) => status.code == hellas_wire::WireCode::Unavailable,
+            Ok(event) => matches!(event.outcome,
+            Some(hellas_rpc::pb::work::work_stream_event::Outcome::Refused(refusal))
+                if refusal.code == WorkRefusalCode::NotReady as i32 || refusal.code == WorkRefusalCode::Unavailable as i32),
+        },
+        "no payload is released after the observer revokes readiness"
+    );
     assert!(stream.next().await.is_none());
 }
 
@@ -3788,6 +3803,9 @@ async fn the_clock_does_not_starve_the_request_path() {
     let backend = BlockingPaidBackend::new();
     let mount = MountedWork::with_backend(backend.clone());
     let mut runner = runner(dir.path(), provider_policy(), &mount);
+    let initial = TestChain::new();
+    initial.set_snapshot(ready_channel_snapshot(ORIGIN, None));
+    assert!(runner.tick(&initial).await);
     let chain = TestChain::slow();
     chain.set_snapshot(ready_channel_snapshot(ORIGIN, None));
 
@@ -3909,5 +3927,77 @@ async fn a_clean_shutdown_leaves_a_replayable_journal() {
         channel.state().close_responded().map(|held| held.start_id),
         Some(start_id),
         "the answer the clock fixed replays",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_blocked_channel_observer_does_not_stop_other_channels_or_shutdown() {
+    let dir = temp();
+    let first = OfferFixture::first();
+    let second = OfferFixture::second();
+    first.write_completed_setup(dir.path());
+    second.write_completed_setup(dir.path());
+    let source = RoutedChain::new(
+        [first.bond_edge(), second.bond_edge()],
+        [
+            first.ready_snapshot(ORIGIN, None),
+            second.ready_snapshot(ORIGIN, None),
+        ],
+    );
+    let entered = Arc::new(Semaphore::new(0));
+    let release = Arc::new(Semaphore::new(0));
+    source.0.lock().unwrap().next_read = Some((entered.clone(), release));
+    let mount = MountedWork::default();
+    let setups = MountedSetup::default();
+    let runner = discover_two_route_runner(dir.path(), &mount, &setups);
+    let (stop, stopped) = oneshot::channel();
+    let observing = tokio::spawn(async move {
+        runner
+            .run_over(stopped, move || {
+                let source = source.clone();
+                async move { Some(source) }
+            })
+            .await;
+    });
+    tokio::time::timeout(Duration::from_secs(2), entered.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if mount
+                .service(&vouched_context(second_route_peer()))
+                .is_some_and(|service| service.readiness().is_ok())
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the second channel advances while the first source is blocked");
+    let response =
+        accept_mounted_route(&mount, second_route_peer(), second.signed_accept_request()).await;
+    assert!(matches!(
+        response.outcome,
+        Some(accept_work_response::Outcome::Accepted(_))
+    ));
+    let held = mount
+        .service(&vouched_context(second_route_peer()))
+        .unwrap();
+    stop.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), observing)
+        .await
+        .expect("shutdown cancels the blocked read")
+        .unwrap();
+    assert!(
+        held.readiness().is_err(),
+        "already-held handlers cannot admit after shutdown"
+    );
+    assert!(
+        mount
+            .service(&vouched_context(second_route_peer()))
+            .is_none()
     );
 }

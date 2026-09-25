@@ -48,7 +48,7 @@ pub(super) fn fetch_frames<'a>(
 }
 
 // Batch only events already available. Each bounded frame still passes the
-// provider's fresh chain check; each envelope is verified separately by the client.
+// provider's local readiness check; the client verifies each envelope separately.
 fn prefix_batches(
     mut events: &[OutputEventEnvelope],
     frame_limit: u32,
@@ -126,6 +126,17 @@ impl ProviderEndpoint {
 }
 
 impl WorkService {
+    fn check_stream_release(
+        &self,
+        request: &DeliverResultRequest,
+        exporter: &[u8; 32],
+    ) -> Result<(), WireStatus> {
+        self.endpoint()
+            .map_err(DeliverError::from)
+            .and_then(|mut endpoint| endpoint.reserve_stream(request, exporter))
+            .map_err(|error| WireStatus::new(hellas_wire::WireCode::Unavailable, error.to_string()))
+    }
+
     pub(super) fn publish_progress(
         &self,
         work_id: Digest,
@@ -134,8 +145,9 @@ impl WorkService {
         let policy = self
             .endpoint()
             .map_err(|error| BackendFault::new(error.to_string()))?
-            .admitting()
-            .map_err(|error| BackendFault::new(error.to_string()))?
+            .ready
+            .as_ref()
+            .ok_or_else(|| BackendFault::new("channel has no execution policy"))?
             .execution_policy()
             .clone();
         let limit = match &policy {
@@ -213,6 +225,10 @@ impl WorkService {
                                         return;
                                     };
                                     for frame in fetch_frames(&delivered, tail, frame_limit) {
+                                        if let Err(error) = service.check_stream_release(&request, &exporter) {
+                                            yield Err(error);
+                                            return;
+                                        }
                                         yield frame.map_err(|error| WireStatus::new(hellas_wire::WireCode::Internal, error.to_string()));
                                     }
                                 } else {
@@ -231,6 +247,10 @@ impl WorkService {
                             progress.get(&work_id).map(|progress| progress.events[position.min(progress.events.len())..].to_vec()).unwrap_or_default()
                         };
                         for batch in prefix_batches(&pending, frame_limit, fetch) {
+                            if let Err(error) = service.check_stream_release(&request, &exporter) {
+                                yield Err(error);
+                                return;
+                            }
                             match encode_transcript(batch) {
                                 Ok(prefix) => {
                                     position += batch.len();
@@ -264,7 +284,7 @@ impl WorkService {
 /// The caller pays only after this returns; it must keep running if its UI drops.
 pub async fn fetch_result_stream<T>(
     transport: T,
-    endpoint: &mut ClientEndpoint,
+    endpoint: &mut impl ClientChannel,
     ready: &ReadyChannel,
     work_id: Digest,
     mut progress: impl FnMut(&OutputEventEnvelope) -> Result<(), PaidWorkError>,
@@ -278,13 +298,16 @@ where
         .context()
         .open_exporter
         .ok_or(DeliverError::Unbindable)?;
-    let request = endpoint.request_delivery(work_id, &exporter)?;
-    let job = endpoint
-        .state()
-        .job_by_id(work_id)
-        .ok_or(DeliverError::NoSuchJob)?;
-    let prepared = PreparedPaidWorkInput::decode(job.prepared_input(), MAX_RECORD_BYTES)
-        .map_err(PaidWorkError::from)?;
+    let (request, prepared) = endpoint.with_client(|endpoint| {
+        let request = endpoint.request_delivery(work_id, &exporter)?;
+        let job = endpoint
+            .state()
+            .job_by_id(work_id)
+            .ok_or(DeliverError::NoSuchJob)?;
+        let prepared = PreparedPaidWorkInput::decode(job.prepared_input(), MAX_RECORD_BYTES)
+            .map_err(PaidWorkError::from)?;
+        Ok::<_, DeliverError>((request, prepared))
+    })??;
     let input = prepared.input_commitment()?;
     let (operation, kind, max_tokens, max_events, max_bytes) =
         match (&prepared, ready.execution_policy()) {
@@ -398,7 +421,8 @@ where
                     return Err(DeliverError::Malformed("event after terminal result"));
                 }
                 stream.finish()?;
-                let result = endpoint.receive(work_id, ready, &delivered)?;
+                let result = endpoint
+                    .with_client(|endpoint| endpoint.receive(work_id, ready, &delivered))??;
                 for event in &events[streamed.len()..] {
                     if event.event().body().kind() == kind {
                         progress(event)?;
@@ -434,16 +458,18 @@ where
                 stream.finish()?;
                 streamed.append(&mut tail);
                 let transcript = encode_transcript(&streamed)?;
-                return endpoint.receive_inner(
-                    work_id,
-                    ready,
-                    &WorkDelivered {
-                        result: terminal.result,
-                        provider_signature: terminal.provider_signature,
-                        transcript,
-                    },
-                    true,
-                );
+                return endpoint.with_client(|endpoint| {
+                    endpoint.receive_inner(
+                        work_id,
+                        ready,
+                        &WorkDelivered {
+                            result: terminal.result,
+                            provider_signature: terminal.provider_signature,
+                            transcript,
+                        },
+                        true,
+                    )
+                })?;
             }
             Some(work_stream_event::Outcome::Refused(refused)) => {
                 return Err(DeliverError::Refused {

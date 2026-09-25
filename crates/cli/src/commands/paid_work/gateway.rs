@@ -65,8 +65,8 @@ const PROVIDER_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 // A retained job is durable, but it must not monopolize the channel that
 // serves interactive requests after a restart or a provider interruption.
 const RECOVERY_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
-// A background catch-up pass yields within the request's lock-wait budget.
-const CHANNEL_FOLLOW_BUDGET: Duration = Duration::from_secs(1);
+// Bound queueing for Evaluate routes that can try another funded provider.
+const CHANNEL_QUEUE_BUDGET: Duration = Duration::from_secs(1);
 // Bound HTTP delivery independently of the authenticated transcript spool.
 const OUTPUT_BUFFER_BYTES: usize = 2 * MAX_RECORD_BYTES;
 const OUTPUT_EVENT_OVERHEAD: usize = 1024;
@@ -233,7 +233,6 @@ struct PaidGateway {
     producer_key: hellas_rpc::ProducerSigningKey,
     admission: Arc<Semaphore>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
-    followers: Mutex<Vec<JoinHandle<()>>>,
 }
 
 pub async fn load_gateway_backend(
@@ -346,7 +345,6 @@ pub async fn load_gateway_backend(
         settlement_key,
         producer_key,
         tasks: Mutex::new(Vec::new()),
-        followers: Mutex::new(Vec::new()),
     });
     // Restart recovery uses the retained input and certificate, never a new job.
     // Empty journal roots do not fund a channel until an HTTP request arrives.
@@ -365,39 +363,6 @@ pub async fn load_gateway_backend(
             Some(RECOVERY_ATTEMPT_TIMEOUT),
             None,
         )?;
-        let provider = provider.clone();
-        gateway
-            .followers
-            .lock()
-            .expect("paid followers poisoned")
-            .push(tokio::spawn(async move {
-                let mut reported_failure = false;
-                loop {
-                    // Leave a gap after each pass, including a slow one, and
-                    // let startup recovery and waiting requests own the channel.
-                    tokio::time::sleep(CHANNEL_FOLLOW_BUDGET).await;
-                    let result = {
-                        let Ok(mut session) = provider.serial.try_lock() else {
-                            continue;
-                        };
-                        let Some(session) = session.as_mut() else {
-                            continue;
-                        };
-                        // Catch-up journals complete blocks as it advances;
-                        // cancellation resumes from that durable cursor.
-                        tokio::time::timeout(CHANNEL_FOLLOW_BUDGET, session.follow_chain()).await
-                    };
-                    match result {
-                        Ok(Ok(())) => reported_failure = false,
-                        Ok(Err(error)) if !reported_failure => {
-                            reported_failure = true;
-                            tracing::warn!(provider = %provider.args.provider, %error,
-                            "paid channel chain follower will retry");
-                        }
-                        Ok(Err(_)) | Err(_) => {}
-                    }
-                }
-            }));
     }
     Ok(gateway)
 }
@@ -507,8 +472,7 @@ impl PaidGateway {
                     task_span.record("hellas.provider.id", tracing::field::display(provider.args.provider));
                     task_span.record("hellas.route.cache_affinity_tokens", route.cache_affinity_tokens);
                     task_span.record("hellas.route.pending", route.pending);
-                    // Wait for a brief follower pass to yield, but route around
-                    // channels still occupied by recovery or other requests.
+                    // Serialize jobs on one funded channel; its observer runs independently.
                     let mut session = if recovery || matches!(prepared, Some(PreparedPaidWorkInput::Fetch(_))) {
                         before_proposal(
                             &sender, streamed, deadline,
@@ -516,7 +480,7 @@ impl PaidGateway {
                         ).await?
                     } else {
                         match tokio::time::timeout(
-                            CHANNEL_FOLLOW_BUDGET,
+                            CHANNEL_QUEUE_BUDGET,
                             provider.serial.lock(),
                         ).await {
                             Ok(session) => session,
@@ -594,10 +558,8 @@ impl PaidGateway {
                     // ClientEndpoint journals the proposal nonce before releasing
                     // its signature. Recovery and a failed dial need not propose
                     // this request; a lost acceptance response does advance it.
-                    let proposal_nonce = session.state().proposal_nonce_high_water();
-                    let already_proposed = prepared_bytes.as_ref().is_some_and(|input| {
-                        session.state().jobs().any(|job| job.prepared_input() == input)
-                    });
+                    let proposal_nonce = session.with_state(|state| state.proposal_nonce_high_water())?;
+                    let already_proposed = session.with_state(|state| prepared_bytes.as_ref().is_some_and(|input| state.jobs().any(|job| job.prepared_input() == input)))?;
                     let request_session = &mut *session;
                     let input = prepared.clone();
                     let on_progress = streamed.then(|| progress.clone());
@@ -612,7 +574,7 @@ impl PaidGateway {
                         .map(Option::unwrap_or_default);
                     if let Err(error) = &result {
                         if !recovery && error.is::<RequestStopped>()
-                            && session.state().proposal_nonce_high_water() == proposal_nonce
+                            && session.with_state(|state| state.proposal_nonce_high_water())? == proposal_nonce
                         {
                             return result;
                         }
@@ -631,7 +593,7 @@ impl PaidGateway {
                             Some(hellas_sdk::paid_client::PaidClientError::Propose(hellas_work::work::ProposeError::Store(_))),
                         );
                         if !already_proposed && !uncertain_append
-                            && session.state().proposal_nonce_high_water() == proposal_nonce
+                            && session.with_state(|state| state.proposal_nonce_high_water())? == proposal_nonce
                         {
                             provider.connection_failed();
                             tracing::debug!(provider = %provider.args.provider, error = %format!("{error:#}"),
@@ -751,14 +713,6 @@ impl PaidExecutionBackend for PaidGateway {
             self.admission.close();
             std::mem::take(&mut *tasks)
         };
-        for follower in self
-            .followers
-            .lock()
-            .expect("paid followers poisoned")
-            .drain(..)
-        {
-            follower.abort();
-        }
         Box::pin(async move {
             let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
             let mut interrupted = 0;
@@ -770,6 +724,7 @@ impl PaidExecutionBackend for PaidGateway {
                     }
                     Err(_) => {
                         task.abort();
+                        let _ = task.await;
                         interrupted += 1;
                     }
                 }
@@ -779,6 +734,11 @@ impl PaidExecutionBackend for PaidGateway {
                     interrupted,
                     "paid gateway shutdown deadline reached; retained work will recover on startup"
                 );
+            }
+            for provider in &self.providers {
+                if let Some(mut session) = provider.serial.lock().await.take() {
+                    session.shutdown().await;
+                }
             }
             self.endpoint.close().await;
         })
@@ -1199,7 +1159,6 @@ mod tests {
             producer_key: hellas_rpc::ProducerSigningKey::from_secret_bytes([7; 32]).unwrap(),
             admission: Arc::new(Semaphore::new(1)),
             tasks: Mutex::new(Vec::new()),
-            followers: Mutex::new(Vec::new()),
         };
         // Deterministically pause execute at the point after admission but
         // before preparation/routing has reached task registration.

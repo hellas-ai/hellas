@@ -33,6 +33,7 @@ async fn insufficient_collateral_is_rejected_before_network_or_journal_creation(
             channel_policy: policy.channel_policy,
             execution_policy: policy.execution_policy,
             poll: Duration::from_millis(200),
+            max_observation_age: Duration::from_secs(5),
             expected_payment_values: hellas_kernel::EdgeValues::new(
                 1000,
                 0,

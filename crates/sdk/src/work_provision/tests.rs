@@ -137,7 +137,7 @@ fn routed_work_config(root: &Path, routes: Vec<serde_json::Value>) -> Result<Wor
     let path = root.join("work-config.json");
     fs::write(&path, file.to_string())
         .with_context(|| format!("the route fixture writes {}", path.display()))?;
-    load_work_config(&path)
+    Ok(load_work_config(&path)?)
 }
 
 fn options(root: &Path, max_job_price: u64) -> ProvisionOptions {

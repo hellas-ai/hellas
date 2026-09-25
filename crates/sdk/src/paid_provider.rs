@@ -1,9 +1,8 @@
 //! Shared provider routing and finalized-chain clock for paid work.
 use crate::work_config::WorkRoutes;
-use anyhow::Context;
 use futures::future::BoxFuture;
 use hellas_chain::client::VerifiedRemoteLightClient;
-use hellas_chain::work_blocks::{PaidWorkClockError, advance_paid_work_clock};
+use hellas_chain::work_blocks::advance_paid_work_clock;
 use hellas_chain::{
     ConsensusInfo, ConsensusVerifier, FinalizedWorkView, WorkBlocks, WorkChannelQuery,
 };
@@ -24,7 +23,7 @@ use hellas_wire::{TransportContext, WireStatus};
 use hellas_work::work::{
     CloseEndpoint, PaidWorkBackend, RunError, RunOutcome, WorkService, run_accepted_work,
 };
-use hellas_work::work_close::{CatchUpError, FinalizedBlocks, TxSink};
+use hellas_work::work_close::{FinalizedBlocks, TxSink};
 use hellas_work::work_handshake::{PaymentAdmission, SetupEndpoint, SetupService};
 use hellas_work::work_open::{SetupAdvance, SetupDriveError, SetupProgress, SetupView};
 use hellas_work::work_store::{ChannelStore, JobPhase, Role, SetupStore, discover_setups};
@@ -34,8 +33,38 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
-use tokio::sync::{Mutex as AsyncMutex, oneshot};
-use tracing::{debug, info, warn};
+use tokio::sync::oneshot;
+use tracing::{Instrument as _, debug, info, warn};
+/// Provider observation and recovery failures preserve their typed causes.
+#[derive(Debug, thiserror::Error)]
+pub enum PaidProviderError {
+    #[error("channel has no admission descriptor")]
+    NoDescriptor,
+    #[error("no finalized channel snapshot is available")]
+    NoSnapshot,
+    #[error("finalized snapshot names another channel")]
+    WrongSnapshot,
+    #[error("accepted work has no execution backend")]
+    NoBackend,
+    #[error("observer age must exceed a positive polling interval")]
+    InvalidObservationPolicy,
+    #[error(transparent)]
+    Endpoint(#[from] hellas_work::work::EndpointError),
+    #[error(transparent)]
+    Setup(#[from] hellas_rpc::protocol::work_setup::WorkSetupError),
+    #[error(transparent)]
+    Query(#[from] hellas_chain::QueryError),
+    #[error(transparent)]
+    CatchUp(#[from] hellas_work::work_close::CatchUpError),
+    #[error(transparent)]
+    Consensus(#[from] hellas_chain::ConsensusVerificationError),
+    #[error("cannot discover work journals under {}: {source}", path.display())]
+    Discover {
+        path: PathBuf,
+        source: hellas_work::work_store::WorkStoreError,
+    },
+}
+
 pub type ProductionWorkSource = WorkBlocks<VerifiedRemoteLightClient>;
 #[derive(Clone, Copy, Debug)]
 pub struct UnmountedWork;
@@ -116,6 +145,8 @@ pub struct WorkRunnerConfig {
     pub validators: Vec<String>,
     /// How often the clock ticks.
     pub poll: Duration,
+    /// Bounds observer stalls and the age of local admission evidence.
+    pub max_observation_age: Duration,
     /// The key every settlement this node signs is signed with.
     pub settlement_key: Secp256k1Signer,
     /// What every setup endpoint this node builds countersigns over.
@@ -125,12 +156,12 @@ pub struct WorkRunnerConfig {
 /// Channels indexed by authenticated peer. Handlers share the runner's state;
 /// mount locks are released before processing requests.
 #[derive(Clone)]
-pub struct MountedWork<S> {
-    mounted: Arc<Mutex<BTreeMap<PeerId, Vec<MountedWorkService<S>>>>>,
+pub struct MountedWork {
+    mounted: Arc<Mutex<BTreeMap<PeerId, Vec<MountedWorkService>>>>,
     driver: Option<AcceptedWorkDriver>,
 }
 
-impl<S> Default for MountedWork<S> {
+impl Default for MountedWork {
     fn default() -> Self {
         Self {
             mounted: Arc::new(Mutex::new(BTreeMap::new())),
@@ -199,132 +230,14 @@ impl AcceptedWorkDriver {
     }
 }
 
-/// One channel's handler. The runner replaces `source` when it redials a validator.
-/// `accepting` serializes each fresh readiness read through signing to prevent
-/// concurrent requests from consuming the same credit.
+/// A peer's local paid channel. Validator connections belong to the observer.
 #[derive(Clone)]
-pub struct MountedWorkService<S> {
-    bond_edge: EdgeId,
+pub struct MountedWorkService {
     service: WorkService,
-    descriptor: Option<WorkChannelDescriptor>,
-    source: Arc<Mutex<S>>,
-    accepting: Arc<AsyncMutex<()>>,
     driver: Option<AcceptedWorkDriver>,
 }
 
-impl<S> MountedWorkService<S>
-where
-    S: FinalizedBlocks + FinalizedWorkView + Sync,
-{
-    /// Refreshes admission and checks the cursor using one coherent finalized read.
-    /// Any failure leaves admission disabled until a later successful refresh.
-    pub async fn refresh_admission(&self) -> anyhow::Result<ReadyChannel> {
-        // Drop the source lock before awaiting the chain read.
-        let source = {
-            let held = self
-                .source
-                .lock()
-                .map_err(|_| anyhow::anyhow!("the finalized source lock is poisoned"))?;
-            held.clone()
-        };
-        refresh_work_admission(&self.service, self.descriptor.as_ref(), &source).await
-    }
-
-    async fn refresh_delivery(&self, request: &DeliverResultRequest) -> anyhow::Result<()> {
-        let Ok(bytes) = request.work_id.as_slice().try_into() else {
-            return Ok(());
-        };
-        let work_id = Digest::from_bytes(bytes);
-        let active = self
-            .service
-            .with_state(|state| state.job_by_id(work_id).is_some());
-        if !matches!(active, Ok(true)) {
-            return Ok(());
-        }
-        // A restarted mount has no readiness cached. A retained result must
-        // be collectable without first accepting another job. Terminal replies
-        // need no fresh admission and are authenticated by the core service.
-        let _accepting = self.accepting.lock().await;
-        let result = self.refresh_admission().await;
-        if let Err(error) = &result {
-            debug!(%error, "a delivery attempt found no fresh channel readiness");
-        }
-        result.map(|_| ())
-    }
-}
-
-/// Shared readiness check for live requests and restart recovery.
-/// Both paths use a fresh finalized snapshot.
-async fn refresh_work_admission<S>(
-    service: &WorkService,
-    descriptor: Option<&WorkChannelDescriptor>,
-    source: &S,
-) -> anyhow::Result<ReadyChannel>
-where
-    S: FinalizedBlocks + FinalizedWorkView + Sync,
-{
-    let Some(descriptor) = descriptor else {
-        anyhow::bail!("this channel has no admission descriptor");
-    };
-    let query = WorkChannelQuery {
-        bond_edge: descriptor.bond_edge(),
-        payment_edge: descriptor.channel().payment_edge(),
-        funding: Default::default(),
-    };
-    let Some(snapshot) = source
-        .work_channel_snapshot(query.clone())
-        .await
-        .context("the fresh coherent channel read failed")?
-    else {
-        anyhow::bail!("no finalized channel snapshot is available");
-    };
-    if snapshot.query() != &query {
-        anyhow::bail!("the finalized source answered for another channel");
-    }
-    let ready = descriptor
-        .check_ready(&snapshot.observed_channel())
-        .context("the fresh channel snapshot is not ready")?;
-    // Keep one snapshot as the target. Recovery runs on the clock itself,
-    // so waiting for another tick here would prevent the cursor advancing.
-    // Take the service's existing driver when available; a concurrent clock
-    // drive keeps that authority until it finishes its own catch-up.
-    for _ in 0..16 {
-        let cursor = service
-            .with_state(|state| state.cursor().0)
-            .context("the mounted channel cursor is unavailable")?;
-        if ready.check_caught_up(cursor).is_ok() {
-            break;
-        }
-        if let Ok(mut driver) = service.drive() {
-            driver
-                .catch_up(source)
-                .await
-                .context("the mounted channel could not catch up to the fresh snapshot")?;
-            let cursor = service
-                .with_state(|state| state.cursor().0)
-                .context("the mounted channel cursor is unavailable")?;
-            if ready.check_caught_up(cursor).is_ok() {
-                break;
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    }
-    let cursor = service
-        .with_state(|state| state.cursor().0)
-        .context("the mounted channel cursor is unavailable")?;
-    ready
-        .check_caught_up(cursor)
-        .context("the mounted channel has not caught up to the fresh snapshot")?;
-    service
-        .admit_new_work(ready.clone())
-        .context("the driven work service refused its fresh readiness")?;
-    Ok(ready)
-}
-
-impl<S> WorkHandler for MountedWorkService<S>
-where
-    S: FinalizedBlocks + FinalizedWorkView + Sync,
-{
+impl WorkHandler for MountedWorkService {
     async fn accept_work(
         &self,
         request: AcceptWorkRequest,
@@ -333,20 +246,14 @@ where
         if let Some(response) = self.service.precheck_acceptance(&request) {
             return Ok(response);
         }
-        let _accepting = self.accepting.lock().await;
-        // A preceding request or the clock may have resolved this proposal
-        // while admission was serialized. Retained replies need no fresh read.
-        if let Some(response) = self.service.precheck_acceptance(&request) {
-            return Ok(response);
-        }
-        let ready = match self.refresh_admission().await {
+        let ready = match self.service.readiness() {
             Ok(ready) => ready,
             Err(error) => {
-                debug!(%error, "an acceptance attempt found no fresh channel readiness");
+                debug!(%error, "channel observer is not ready for acceptance");
                 return Ok(AcceptWorkResponse {
                     outcome: Some(accept_work_response::Outcome::Refused(WorkRefused {
                         code: WorkRefusalCode::NotReady as i32,
-                        reason: "fresh channel readiness is unavailable".to_string(),
+                        reason: error.to_string(),
                     })),
                 });
             }
@@ -387,19 +294,7 @@ where
         request: DeliverResultRequest,
         context: TransportContext,
     ) -> Result<impl Into<WithTrailer<DeliverResultResponse>> + Send, WireStatus> {
-        let response: WithTrailer<DeliverResultResponse> =
-            if self.refresh_delivery(&request).await.is_ok() {
-                self.service.deliver_result(request, context).await?.into()
-            } else {
-                DeliverResultResponse {
-                    outcome: Some(deliver_result_response::Outcome::Refused(WorkRefused {
-                        code: WorkRefusalCode::NotReady as i32,
-                        reason: "fresh channel readiness is unavailable".to_string(),
-                    })),
-                }
-                .into()
-            };
-        Ok(response)
+        self.service.deliver_result(request, context).await
     }
 
     async fn stream_result(
@@ -407,35 +302,7 @@ where
         request: DeliverResultRequest,
         context: TransportContext,
     ) -> Result<hellas_work::work::PaidResultStream, WireStatus> {
-        self.refresh_delivery(&request).await.map_err(|_| {
-            WireStatus::new(
-                hellas_wire::WireCode::Unavailable,
-                "fresh channel readiness is unavailable",
-            )
-        })?;
-        let mounted = self.clone();
-        let mut stream = self.service.stream_result(request.clone(), context).await?;
-        Ok(Box::pin(async_stream::try_stream! {
-            let mut refresh = tokio::time::interval(Duration::from_secs(1));
-            loop {
-                let event = tokio::select! {
-                    event = futures::StreamExt::next(&mut stream) => Some(event),
-                    _ = refresh.tick() => None,
-                };
-                // Even buffered prefixes need a fresh finalized decision before
-                // leaving the node; a contest can start after this stream opens.
-                mounted.refresh_delivery(&request).await.map_err(|_| WireStatus::new(
-                    hellas_wire::WireCode::Unavailable,
-                    "fresh channel readiness is unavailable",
-                ))?;
-                if let Some(event) = event {
-                    match event {
-                        Some(event) => yield event?,
-                        None => break,
-                    }
-                }
-            }
-        }))
+        self.service.stream_result(request, context).await
     }
 
     async fn admit_certificate(
@@ -447,7 +314,7 @@ where
     }
 }
 
-impl<S: Clone> MountedWork<S> {
+impl MountedWork {
     pub fn with_backend<B>(backend: B) -> Self
     where
         B: PaidWorkBackend + Send + Sync + 'static,
@@ -459,24 +326,12 @@ impl<S: Clone> MountedWork<S> {
     }
 
     /// Mounts a channel for a peer. Multiple candidates disable routing for that peer.
-    pub fn mount(
-        &self,
-        peer: PeerId,
-        bond_edge: EdgeId,
-        service: &WorkService,
-        descriptor: Option<WorkChannelDescriptor>,
-        accepting: Arc<AsyncMutex<()>>,
-        source: &S,
-    ) -> bool {
+    pub fn mount(&self, peer: PeerId, service: &WorkService) -> bool {
         match self.mounted.lock() {
             Ok(mut held) => {
                 let mounted = held.entry(peer).or_default();
                 mounted.push(MountedWorkService {
-                    bond_edge,
                     service: service.clone(),
-                    descriptor,
-                    source: Arc::new(Mutex::new(source.clone())),
-                    accepting,
                     driver: self.driver.clone(),
                 });
                 mounted.len() == 1
@@ -486,7 +341,7 @@ impl<S: Clone> MountedWork<S> {
     }
 
     /// The one handler mounted for the transport-vouched peer.
-    pub fn handler(&self, context: &TransportContext) -> Option<MountedWorkService<S>> {
+    pub fn handler(&self, context: &TransportContext) -> Option<MountedWorkService> {
         let peer = context
             .vouched_peer()
             .map(|peer| PeerId::from_bytes(peer.0))?;
@@ -499,29 +354,17 @@ impl<S: Clone> MountedWork<S> {
     }
 
     /// Returns the local service for journal inspection and recovery.
-    /// Remote requests must use `handler`, which refreshes finalized readiness.
+    /// Remote requests must use `handler`, which enforces local observer readiness.
     pub fn service(&self, context: &TransportContext) -> Option<WorkService> {
         self.handler(context).map(|mounted| mounted.service)
-    }
-
-    /// Updates the shared source, including handlers held by live connections.
-    fn refresh_source(&self, peer: PeerId, bond_edge: EdgeId, source: &S) {
-        let source_slot = self.mounted.lock().ok().and_then(|held| {
-            held.get(&peer)?
-                .iter()
-                .find(|mounted| mounted.bond_edge == bond_edge)
-                .map(|mounted| Arc::clone(&mounted.source))
-        });
-        if let Some(source_slot) = source_slot
-            && let Ok(mut held) = source_slot.lock()
-        {
-            *held = source.clone();
-        }
     }
 
     /// Unmounts all channels when the clock stops, releasing its journal handles.
     pub fn clear_all(&self) {
         if let Ok(mut held) = self.mounted.lock() {
+            for channel in held.values().flatten() {
+                let _ = channel.service.suspend();
+            }
             held.clear();
         }
     }
@@ -609,43 +452,68 @@ enum Driven {
 }
 
 /// A driven channel recovers accepted jobs even without a peer route.
-/// Live acceptance and recovery share the same admission lock.
+/// Live acceptance and recovery use the same journaled running marker.
 struct DrivenChannel {
     service: WorkService,
     descriptor: Option<WorkChannelDescriptor>,
-    accepting: Arc<AsyncMutex<()>>,
+    max_observation_age: Duration,
     driver: Option<AcceptedWorkDriver>,
 }
 
 impl DrivenChannel {
-    fn accepted_work_id(&self) -> anyhow::Result<Option<Digest>> {
+    async fn refresh<S>(
+        &self,
+        source: &S,
+        started: hellas_work::work::ObservationTime,
+        snapshot: Option<hellas_chain::WorkChannelSnapshot>,
+    ) -> Result<(), PaidProviderError>
+    where
+        S: FinalizedBlocks + FinalizedWorkView + Sync,
+    {
+        let descriptor = self
+            .descriptor
+            .as_ref()
+            .ok_or(PaidProviderError::NoDescriptor)?;
+        let query = WorkChannelQuery {
+            bond_edge: descriptor.bond_edge(),
+            payment_edge: descriptor.channel().payment_edge(),
+            funding: Default::default(),
+        };
+        let snapshot = snapshot.ok_or(PaidProviderError::NoSnapshot)?;
+        if snapshot.query() != &query {
+            return Err(PaidProviderError::WrongSnapshot);
+        }
+        let ready = descriptor.check_ready(&snapshot.observed_channel())?;
+        let cursor = self.service.with_state(|state| state.cursor().0)?;
+        if ready.check_caught_up(cursor).is_err() {
+            self.service
+                .drive()?
+                .catch_up_to(source, ready.finalized_height())
+                .await?;
+        }
+        self.service
+            .observe_ready(ready, started, self.max_observation_age)?;
+        Ok(())
+    }
+
+    fn accepted_work_id(&self) -> Result<Option<Digest>, PaidProviderError> {
         self.service
             .with_state(|state| {
                 let mut jobs = state.jobs();
                 let job = jobs.next()?;
                 (jobs.next().is_none() && job.phase() == JobPhase::Accepted).then(|| job.work_id())
             })
-            .context("the driven channel state is unavailable")
+            .map_err(PaidProviderError::from)
     }
 
     /// Resumes accepted work after a fresh readiness check. The durable `JobRunning`
     /// record admits one invocation even when a live request races this clock tick.
-    async fn resume_accepted<S>(&self, source: &S) -> anyhow::Result<bool>
-    where
-        S: FinalizedBlocks + FinalizedWorkView + Sync,
-    {
-        if self.accepted_work_id()?.is_none() {
-            return Ok(false);
-        }
-        let _accepting = self.accepting.lock().await;
+    fn resume_accepted(&self) -> Result<bool, PaidProviderError> {
         let Some(work_id) = self.accepted_work_id()? else {
             return Ok(false);
         };
-        let driver = self
-            .driver
-            .as_ref()
-            .context("the accepted paid job has no execution backend")?;
-        let ready = refresh_work_admission(&self.service, self.descriptor.as_ref(), source).await?;
+        let driver = self.driver.as_ref().ok_or(PaidProviderError::NoBackend)?;
+        let ready = self.service.readiness()?;
         driver.spawn(self.service.clone(), ready, work_id);
         Ok(true)
     }
@@ -653,6 +521,7 @@ impl DrivenChannel {
 
 /// One setup journal on a clock.
 struct SetupClock {
+    max_observation_age: Duration,
     /// The bond this journal stakes, so a log line names which one.
     bond_edge: EdgeId,
     /// The authenticated peer whose configured route names this bond.
@@ -670,7 +539,7 @@ impl SetupClock {
         &mut self,
         source: &S,
         signer: &Secp256k1Signer,
-        work_mount: &MountedWork<S>,
+        work_mount: &MountedWork,
         setup_mount: &MountedSetup,
     ) -> bool
     where
@@ -695,7 +564,7 @@ impl SetupClock {
                         if let Some(peer) = self.route_peer {
                             setup_mount.clear(peer, self.bond_edge);
                         }
-                        self.take_mount(store, signer, &policy, source, work_mount);
+                        self.take_mount(store, signer, &policy, work_mount);
                     } else if matches!(
                         progress,
                         SetupProgress::Aborted(_) | SetupProgress::Faulted(_)
@@ -713,37 +582,42 @@ impl SetupClock {
             }
         }
         if let Driven::Channel(channel) = &self.driven {
-            if let Some(peer) = self.route_peer {
-                work_mount.refresh_source(peer, self.bond_edge, source);
-            }
-            if let Err(error) = channel.resume_accepted(source).await {
-                warn!(bond, %error, "an accepted paid job did not resume");
-            }
-            match advance_paid_work_clock(&channel.service, source).await {
-                Ok(progress) => debug!(bond, ?progress, "the channel advanced"),
-                // `resume_accepted` owns the channel while it starts the
-                // durable execution. The clock's concurrent close pass has
-                // no work to do until that owner returns the cursor.
-                Err(PaidWorkClockError::CloseDrive(CatchUpError::Busy)) => {
-                    debug!(bond, "the channel is already being driven")
+            let started = hellas_work::work::ObservationTime::now();
+            let snapshot = match advance_paid_work_clock(&channel.service, source).await {
+                Ok(progress) => {
+                    debug!(bond, close = ?progress.close, "the channel advanced");
+                    progress.snapshot
                 }
                 Err(error) => {
-                    answered &= !error.source_failed();
+                    let _ = channel.service.suspend();
                     warn!(bond, %error, "this channel's close did not advance");
+                    return !error.source_failed();
                 }
+            };
+            if let Err(error) = channel.refresh(source, started, snapshot).await {
+                let _ = channel.service.suspend();
+                debug!(bond, %error, "channel observation did not renew admission");
+                answered &= !matches!(
+                    error,
+                    PaidProviderError::Query(_)
+                        | PaidProviderError::CatchUp(
+                            hellas_work::work_close::CatchUpError::Source(_)
+                        )
+                );
+            } else if let Err(error) = channel.resume_accepted() {
+                warn!(bond, %error, "an accepted paid job did not resume");
             }
         }
         answered
     }
 
     /// Transfers the mounted store returned by setup, preserving its exclusive lock.
-    fn take_mount<S: Clone>(
+    fn take_mount(
         &mut self,
         store: ChannelStore,
         signer: &Secp256k1Signer,
         policy: &ProviderChannelPolicy,
-        source: &S,
-        mount: &MountedWork<S>,
+        mount: &MountedWork,
     ) {
         let bond = hex::encode(self.bond_edge.to_bytes());
         // Rebuild the descriptor from the retained policy and signed payment terms.
@@ -760,17 +634,15 @@ impl SetupClock {
         match CloseEndpoint::new(store, signer.clone()) {
             Ok(close) => {
                 let service = WorkService::close_only(close);
-                let accepting = Arc::new(AsyncMutex::new(()));
-                if self.route_peer.is_some_and(|peer| {
-                    mount.mount(
-                        peer,
-                        self.bond_edge,
-                        &service,
-                        descriptor.clone(),
-                        Arc::clone(&accepting),
-                        source,
-                    )
-                }) {
+                if let Err(error) = service.require_observer() {
+                    warn!(bond, %error, "channel observer could not be installed");
+                    self.driven = Driven::Done;
+                    return;
+                }
+                if self
+                    .route_peer
+                    .is_some_and(|peer| mount.mount(peer, &service))
+                {
                     info!(
                         bond,
                         "this node now answers Work from the channel it mounted"
@@ -784,7 +656,7 @@ impl SetupClock {
                 self.driven = Driven::Channel(Box::new(DrivenChannel {
                     service,
                     descriptor,
-                    accepting,
+                    max_observation_age: self.max_observation_age,
                     driver: mount.driver.clone(),
                 }));
             }
@@ -801,17 +673,17 @@ impl SetupClock {
 }
 
 /// The clock, over every paid-work journal this node owns.
-pub struct WorkRunner<S> {
+pub struct WorkRunner {
     clocks: Vec<SetupClock>,
     signer: Secp256k1Signer,
-    work_mount: MountedWork<S>,
+    work_mount: MountedWork,
     setup_mount: MountedSetup,
     poll: Duration,
     validators: Vec<String>,
     consensus_verifier: ConsensusVerifier,
 }
 
-impl<S> WorkRunner<S> {
+impl WorkRunner {
     pub fn journal_count(&self) -> usize {
         self.clocks.len()
     }
@@ -823,30 +695,29 @@ impl<S> WorkRunner<S> {
     }
 }
 
-impl<S> WorkRunner<S>
-where
-    S: SetupView + FinalizedBlocks + FinalizedWorkView + TxSink + Sync,
-{
+impl WorkRunner {
     /// Discovers provider journals and mounts configured routes. Unrouted journals
     /// are still driven through close. Unreadable journals are logged; failure to
     /// enumerate the root is returned to the caller.
     pub fn discover(
         config: WorkRunnerConfig,
-        work_mount: MountedWork<S>,
+        work_mount: MountedWork,
         setup_mount: MountedSetup,
-    ) -> anyhow::Result<Self> {
+    ) -> Result<Self, PaidProviderError> {
+        if config.poll.is_zero() || config.max_observation_age <= config.poll {
+            return Err(PaidProviderError::InvalidObservationPolicy);
+        }
         let consensus_verifier = ConsensusVerifier::new(&ConsensusInfo {
             validators: config.validators.clone(),
             threshold_identity: config.threshold_identity,
             network_id: config.network.as_str().to_owned(),
-        })
-        .context("the configured threshold identity is not usable")?;
+        })?;
         let settlement_verifier = Secp256k1Verifier::new();
-        let found = discover_setups(&config.journal_root, config.network).with_context(|| {
-            format!(
-                "failed to enumerate the work journals under {}",
-                config.journal_root.display(),
-            )
+        let found = discover_setups(&config.journal_root, config.network).map_err(|source| {
+            PaidProviderError::Discover {
+                path: config.journal_root.clone(),
+                source,
+            }
         })?;
         for unnamed in &found.unidentified {
             warn!(
@@ -907,6 +778,7 @@ where
             }
             let driven = Driven::Setup { service, policy };
             clocks.push(SetupClock {
+                max_observation_age: config.max_observation_age,
                 bond_edge: setup.bond_edge,
                 route_peer,
                 driven,
@@ -925,7 +797,10 @@ where
 
     /// Takes one step of every journal, and says whether the chain
     /// answered all of them.
-    pub async fn tick(&mut self, source: &S) -> bool {
+    pub async fn tick<S>(&mut self, source: &S) -> bool
+    where
+        S: SetupView + FinalizedBlocks + FinalizedWorkView + TxSink + Sync,
+    {
         let mut answered = true;
         for clock in &mut self.clocks {
             answered &= clock
@@ -936,8 +811,9 @@ where
     }
 
     /// Ticks each journal once per period and redials after a source failure.
-    pub async fn run_over<D, F>(mut self, mut stop: oneshot::Receiver<()>, dial: D)
+    pub async fn run_over<S, D, F>(mut self, mut stop: oneshot::Receiver<()>, dial: D)
     where
+        S: SetupView + FinalizedBlocks + FinalizedWorkView + TxSink + Sync,
         D: Fn() -> F,
         F: core::future::Future<Output = Option<S>>,
     {
@@ -947,18 +823,53 @@ where
             self.setup_mount.clear_all();
             return;
         }
-        let mut chain = None;
-        loop {
-            tokio::select! {
-                _ = &mut stop => break,
-                () = tokio::time::sleep(self.poll) => {}
-            }
-            let Some(source) = chain.take() else {
-                chain = dial().await;
-                continue;
-            };
-            if self.tick(&source).await {
-                chain = Some(source);
+        // Each channel owns its observer loop. A slow source or a large restart
+        // backlog on one channel cannot stop another channel's close response.
+        {
+            use futures::{StreamExt as _, stream::FuturesUnordered};
+            let signer = &self.signer;
+            let work_mount = &self.work_mount;
+            let setup_mount = &self.setup_mount;
+            let dial = &dial;
+            let poll = self.poll;
+            let mut observers = self
+                .clocks
+                .iter_mut()
+                .map(|clock| async move {
+                    let mut chain = None;
+                    loop {
+                        let budget = clock.max_observation_age;
+                        if chain.is_none() {
+                            chain = tokio::time::timeout(budget, dial()).await.ok().flatten();
+                        }
+                        if let Some(source) = chain.as_ref() {
+                            match tokio::time::timeout(
+                                budget,
+                                clock.tick(source, signer, work_mount, setup_mount).instrument(hellas_rpc::request_span!(target: "hellas_request", parent: None, "paid.channel.observe", hellas.channel.role = "provider")),
+                            )
+                            .await
+                            {
+                                Ok(true) => {}
+                                Ok(false) | Err(_) => {
+                                    if let Driven::Channel(channel) = &clock.driven {
+                                        let _ = channel.service.suspend();
+                                    }
+                                    chain = None;
+                                }
+                            }
+                        }
+                        if matches!(clock.driven, Driven::Done) {
+                            break;
+                        }
+                        tokio::time::sleep(poll).await;
+                    }
+                })
+                .collect::<FuturesUnordered<_>>();
+            loop {
+                tokio::select! {
+                    _ = &mut stop => break,
+                    next = observers.next() => if next.is_none() { break; },
+                }
             }
         }
         self.work_mount.clear_all();
@@ -967,7 +878,7 @@ where
     }
 }
 
-impl WorkRunner<ProductionWorkSource> {
+impl WorkRunner {
     /// Ticks until told to stop, over the validators the configuration
     /// names.
     pub async fn run(self, stop: oneshot::Receiver<()>) {

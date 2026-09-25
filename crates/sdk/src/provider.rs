@@ -215,7 +215,7 @@ where
     let executor = Executor::spawn_configured(executor_config).await?;
 
     #[cfg(feature = "paid-work")]
-    let work_mount = crate::paid_provider::MountedWork::<crate::paid_provider::ProductionWorkSource>::with_backend(executor.clone());
+    let work_mount = crate::paid_provider::MountedWork::with_backend(executor.clone());
     #[cfg(feature = "paid-work")]
     let setup_mount = crate::paid_provider::MountedSetup::default();
     #[cfg(feature = "paid-work")]
@@ -245,6 +245,7 @@ where
                 routes: config.routes,
                 validators: config.validators,
                 poll: config.poll,
+                max_observation_age: config.max_observation_age,
                 settlement_key,
                 policy,
             },

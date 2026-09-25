@@ -859,14 +859,12 @@ pub struct ObservedChannel<'a> {
 /// method here, because the objects it would have to re-read are not
 /// carried.
 ///
-/// So the obligation is the holder's, in the same way [`ObservedChannel`]
-/// owes coherence: run [`WorkChannelDescriptor::check_ready`] again
-/// against a fresh snapshot before each signature, and sign against the
-/// `ReadyChannel` that read produced. [`Self::check_signable`] is the
-/// per-signature *arithmetic* — the horizon and the deadline margins,
-/// against the height the endpoint has actually reached. It is not a
-/// substitute for the refresh, and it does not claim to be one: no
-/// arithmetic over a stale read can see a contest that opened after it.
+/// A live channel observer must apply finalized history and refresh this
+/// decision independently of requests. Admission, delivery and new certificates
+/// check local observer freshness and the journal's close cutoff under the same
+/// state lock. An expired observer must suspend those operations; cached
+/// arithmetic alone cannot establish that the channel remains open.
+/// [`Self::check_signable`] checks deadline margins against the applied cursor.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReadyChannel {
     channel: PaidChannel,

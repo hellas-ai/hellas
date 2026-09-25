@@ -1987,3 +1987,144 @@ fn the_wire_carries_the_authorization_the_signature_covers() {
         "the signature on the wire verifies over the work id",
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn client_observer_does_not_hold_the_journal_during_chain_io() {
+    use hellas_work::work::{ClientChannel as _, ClientService};
+    let root = temp();
+    let mut service = ClientService::new(client_endpoint(root.path()));
+    service
+        .observer()
+        .observe_ready(
+            ready(),
+            hellas_work::work::ObservationTime::now(),
+            std::time::Duration::from_secs(30),
+        )
+        .unwrap();
+    let released = Arc::new(AtomicBool::new(false));
+    let source = HeldChain::over(CURSOR + 1..=CURSOR + 1, &released);
+    let observer = service.observer();
+    let held_source = source.clone();
+    let driving =
+        tokio::spawn(async move { observer.drive().unwrap().catch_up(&*held_source).await });
+    reaches(&source.fetches, 1).await;
+    assert!(matches!(
+        service.observer().drive(),
+        Err(EndpointError::CatchingUp)
+    ));
+    // The provider exchange can sign and journal while the observer waits.
+    let request = service
+        .with_client(|endpoint| endpoint.propose(&proposal(1)))
+        .unwrap()
+        .unwrap();
+    assert!(!request.client_signature.is_empty());
+    assert_eq!(
+        service
+            .with_state(|state| state.proposal_nonce_high_water())
+            .unwrap(),
+        1
+    );
+    released.store(true, Ordering::SeqCst);
+    assert_eq!(driving.await.unwrap().unwrap(), CURSOR + 1);
+    assert!(service.observer().drive().is_ok());
+}
+
+#[tokio::test]
+async fn shared_client_can_follow_blocks_while_waiting_for_provider_acceptance() {
+    use hellas_work::work::ClientService;
+    let client_root = temp();
+    let provider_root = temp();
+    let mut client = ClientService::new(client_endpoint(client_root.path()));
+    client
+        .observer()
+        .observe_ready(
+            ready(),
+            hellas_work::work::ObservationTime::now(),
+            std::time::Duration::from_secs(30),
+        )
+        .unwrap();
+    let observer = client.observer();
+    let (client_transport, server_transport) = transport_pair();
+    let request =
+        tokio::spawn(
+            async move { propose_work(client_transport, &mut client, &proposal(1)).await },
+        );
+    // No server is running yet, so the request must wait for its response.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while observer
+            .with_state(|state| state.proposal_nonce_high_water())
+            .unwrap()
+            == 0
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    observer
+        .drive()
+        .unwrap()
+        .observe_finalized(&FinalizedWork {
+            height: CURSOR + 1,
+            parent: payload_at(CURSOR),
+            payload: payload_at(CURSOR + 1),
+            txs: Vec::new(),
+        })
+        .unwrap();
+    let serving = serve(
+        server_transport,
+        WorkService::new(provider_endpoint(provider_root.path())),
+    );
+    request.await.unwrap().unwrap();
+    assert_eq!(
+        observer.with_state(|state| state.cursor().0).unwrap(),
+        CURSOR + 1
+    );
+    serving.abort();
+}
+
+#[test]
+fn managed_observers_start_closed_and_old_tips_cannot_renew_expired_readiness() {
+    use hellas_work::work::{ClientChannel as _, ClientService};
+    let client_root = temp();
+    let provider_root = temp();
+    let mut client = ClientService::new(client_endpoint(client_root.path()));
+    let provider = WorkService::new(provider_endpoint(provider_root.path()));
+    provider.require_observer().unwrap();
+    assert!(matches!(
+        client.readiness(),
+        Err(EndpointError::ObservationStale)
+    ));
+    assert_eq!(
+        refusal_code(&provider.accept(&signed_request(1, 1))),
+        WorkRefusalCode::NotReady
+    );
+    for max_age in [
+        std::time::Duration::ZERO,
+        std::time::Duration::from_secs(30),
+    ] {
+        let started = hellas_work::work::ObservationTime::now();
+        client
+            .observer()
+            .observe_ready(ready(), started, max_age)
+            .unwrap();
+        provider.observe_ready(ready(), started, max_age).unwrap();
+        assert!(matches!(
+            client
+                .with_client(|endpoint| endpoint.propose(&proposal(1)))
+                .unwrap(),
+            Err(ProposeError::Endpoint(EndpointError::ObservationStale))
+        ));
+        assert_eq!(
+            refusal_code(&provider.accept(&signed_request(1, 1))),
+            WorkRefusalCode::NotReady
+        );
+    }
+    assert_eq!(
+        client
+            .with_state(|state| state.proposal_nonce_high_water())
+            .unwrap(),
+        0
+    );
+    assert_eq!(provider.with_state(|state| state.jobs().len()).unwrap(), 0);
+}

@@ -63,6 +63,8 @@ pub struct WorkBlocks<C>(C);
 /// What one production clock step did for a mounted paid channel.
 #[derive(Debug)]
 pub struct PaidWorkClockAdvance {
+    /// The verified snapshot already read for settlement, reusable by admission.
+    pub snapshot: Option<WorkChannelSnapshot>,
     /// The journaled start-or-response drive that ran first.
     pub close: CloseProgress,
     /// Submission outcome for a due adjudicated payment close.
@@ -158,6 +160,7 @@ where
         .map_err(PaidWorkClockError::Snapshot)?
     else {
         return Ok(PaidWorkClockAdvance {
+            snapshot: None,
             close,
             adjudication: None,
             bond_timeout: None,
@@ -194,6 +197,7 @@ where
         };
 
     Ok(PaidWorkClockAdvance {
+        snapshot: Some(snapshot),
         close,
         adjudication,
         bond_timeout,

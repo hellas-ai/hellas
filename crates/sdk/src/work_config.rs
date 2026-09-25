@@ -9,7 +9,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Context as _, Result, bail};
+mod error;
+pub use error::WorkConfigError;
+type Result<T> = std::result::Result<T, WorkConfigError>;
 use hellas_kernel::{
     EdgeId, EdgeValues, Fees, Key, MIN_OMIT_RESPONSE_BLOCKS, NetworkId, Secp256k1Verifier,
 };
@@ -50,6 +52,8 @@ pub struct WorkConfig {
     pub execution_policy: PaidWorkPolicy,
     /// How often the watcher asks the chain for the next block.
     pub poll: Duration,
+    /// Maximum time without new verified finalized progress before admission stops.
+    pub max_observation_age: Duration,
     /// The payment edge's value, reserve, and close fees as this provider
     /// requires a client to fund them.
     pub expected_payment_values: EdgeValues,
@@ -102,13 +106,10 @@ impl WorkRoutes {
             let client = Key::from_bytes(parse_fixed_hex("routes[].client", &file.client)?);
             let route = WorkRoute { peer, bond, client };
             if by_peer.insert(peer, route).is_some() {
-                bail!("routes names peer {peer:#} twice; one authenticated peer has one route");
+                return Err(WorkConfigError::DuplicatePeer(peer));
             }
             if !bonds.insert(bond) {
-                bail!(
-                    "routes names bond {} twice; one provider journal has one route",
-                    hex::encode(bond.to_bytes()),
-                );
+                return Err(WorkConfigError::DuplicateBond(bond));
             }
         }
         Ok(Self { by_peer })
@@ -144,11 +145,19 @@ pub struct ChainCrossCheck {
 /// Loads configuration, checks chain identity and policy bounds, and normalizes
 /// validator URLs. Route-to-journal validation is deferred until serve startup.
 pub fn load_work_config(path: &Path) -> Result<WorkConfig> {
-    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-    let file: WorkConfigFile = serde_json::from_slice(&bytes)
-        .with_context(|| format!("failed to parse {}", path.display()))?;
-    file.into_config()
-        .with_context(|| format!("invalid work config {}", path.display()))
+    let bytes = fs::read(path).map_err(|source| WorkConfigError::Read {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let file: WorkConfigFile =
+        serde_json::from_slice(&bytes).map_err(|source| WorkConfigError::Parse {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    file.into_config().map_err(|source| WorkConfigError::File {
+        path: path.to_path_buf(),
+        source: Box::new(source),
+    })
 }
 
 /// Checks each route against a provider journal under the configured root,
@@ -157,11 +166,11 @@ pub fn validate_work_routes(config: &WorkConfig) -> Result<()> {
     if config.routes.is_empty() {
         return Ok(());
     }
-    let found = discover_setups(&config.journal_root, config.chain.network).with_context(|| {
-        format!(
-            "failed to enumerate configured work routes under journal.root {}",
-            config.journal_root.display(),
-        )
+    let found = discover_setups(&config.journal_root, config.chain.network).map_err(|source| {
+        WorkConfigError::Journal {
+            root: config.journal_root.clone(),
+            source,
+        }
     })?;
     for route in config.routes.iter() {
         if !found
@@ -169,13 +178,10 @@ pub fn validate_work_routes(config: &WorkConfig) -> Result<()> {
             .iter()
             .any(|setup| setup.role == Role::Provider && setup.bond_edge == route.bond)
         {
-            bail!(
-                "route for peer {:#} names bond {}, but its provider setup journal is not under \
-                 journal.root {}",
-                route.peer,
-                hex::encode(route.bond.to_bytes()),
-                config.journal_root.display(),
-            );
+            return Err(WorkConfigError::MissingRoute {
+                bond: route.bond,
+                root: config.journal_root.clone(),
+            });
         }
         let store = SetupStore::open(
             &config.journal_root,
@@ -184,32 +190,20 @@ pub fn validate_work_routes(config: &WorkConfig) -> Result<()> {
             Role::Provider,
             &Secp256k1Verifier::new(),
         )
-        .with_context(|| {
-            format!(
-                "route for peer {:#} could not open provider setup journal for bond {} under {}",
-                route.peer,
-                hex::encode(route.bond.to_bytes()),
-                config.journal_root.display(),
-            )
+        .map_err(|source| WorkConfigError::Journal {
+            root: config.journal_root.clone(),
+            source,
         })?;
         let Some(bundle) = store.state().bundle() else {
-            bail!(
-                "route for peer {:#} names provider setup journal for bond {}, but it holds no \
-                 bond proposal",
-                route.peer,
-                hex::encode(route.bond.to_bytes()),
-            );
+            return Err(WorkConfigError::MissingProposal(route.bond));
         };
         let journal_client = bundle.bond_terms().parties.taker();
         if journal_client != route.client {
-            bail!(
-                "route for peer {:#} expects client settlement key {}, but provider setup journal \
-                 for bond {} names {} as its taker",
-                route.peer,
-                hex::encode(route.client.to_bytes()),
-                hex::encode(route.bond.to_bytes()),
-                hex::encode(journal_client.to_bytes()),
-            );
+            return Err(WorkConfigError::WrongClient {
+                bond: route.bond,
+                expected: route.client,
+                actual: journal_client,
+            });
         }
     }
     Ok(())
@@ -225,17 +219,23 @@ struct WorkConfigFile {
     policies: PoliciesFile,
     /// How often the watcher asks the chain for the next block.
     poll_ms: u64,
+    #[serde(default = "default_observation_age_ms")]
+    max_observation_age_ms: u64,
     expected_payment_values: PaymentValuesFile,
     min_omit_response_blocks: u64,
+}
+
+fn default_observation_age_ms() -> u64 {
+    5_000
 }
 
 impl WorkConfigFile {
     fn into_config(self) -> Result<WorkConfig> {
         let Some(network) = NetworkId::new(self.chain.network_id.trim()) else {
-            bail!(
-                "chain.network_id {:?} is not a network id",
-                self.chain.network_id
-            );
+            return Err(WorkConfigError::Invalid {
+                field: "chain.network_id",
+                reason: "not a network id",
+            });
         };
         let threshold_identity =
             parse_hex("chain.threshold_identity", &self.chain.threshold_identity)?;
@@ -249,23 +249,31 @@ impl WorkConfigFile {
             validators: validators.clone(),
             threshold_identity: threshold_identity.clone(),
             network_id: self.chain.network_id.clone(),
-        })
-        .map_err(|error| anyhow::anyhow!("chain.threshold_identity is not usable: {error}"))?;
+        })?;
 
         let journal_root = self.journal.into_root()?;
         let routes = WorkRoutes::from_files(self.routes)?;
         let policies = self.policies.into_policies()?;
         if self.poll_ms == 0 {
-            bail!("poll_ms must be greater than zero");
+            return Err(WorkConfigError::Invalid {
+                field: "poll_ms",
+                reason: "must be greater than zero",
+            });
+        }
+        if self.max_observation_age_ms <= self.poll_ms {
+            return Err(WorkConfigError::Invalid {
+                field: "max_observation_age_ms",
+                reason: "must exceed poll_ms",
+            });
         }
         // The kernel refuses a shorter window at every payment open, so a
         // configuration under it would sign terms consensus then throws
         // away.
         if self.min_omit_response_blocks < MIN_OMIT_RESPONSE_BLOCKS {
-            bail!(
-                "min_omit_response_blocks {} is under the kernel's minimum {MIN_OMIT_RESPONSE_BLOCKS}",
-                self.min_omit_response_blocks,
-            );
+            return Err(WorkConfigError::ResponseWindow {
+                actual: self.min_omit_response_blocks,
+                minimum: MIN_OMIT_RESPONSE_BLOCKS,
+            });
         }
 
         Ok(WorkConfig {
@@ -284,6 +292,7 @@ impl WorkConfigFile {
             channel_policy: policies.1,
             execution_policy: policies.2,
             poll: Duration::from_millis(self.poll_ms),
+            max_observation_age: Duration::from_millis(self.max_observation_age_ms),
             expected_payment_values: self.expected_payment_values.into_values(),
             min_omit_response_blocks: self.min_omit_response_blocks,
         })
@@ -305,24 +314,29 @@ fn parse_validators(entries: Vec<String>) -> Result<Vec<String>> {
     for entry in entries {
         let entry = entry.trim();
         if entry.is_empty() {
-            bail!("validators entries must be non-empty");
+            return Err(WorkConfigError::Invalid {
+                field: "validators",
+                reason: "entries must be non-empty",
+            });
         }
-        let url = url::Url::parse(entry)
-            .with_context(|| format!("validators entry {entry:?} is not a URL"))?;
+        let url = url::Url::parse(entry).map_err(|source| WorkConfigError::ValidatorUrl {
+            entry: entry.to_owned(),
+            source,
+        })?;
         if url.host_str().is_none() {
-            bail!("validators entry {entry:?} names no host to dial");
+            return Err(WorkConfigError::ValidatorHost(entry.to_owned()));
         }
         let normalised = url.as_str().to_string();
         if validators.contains(&normalised) {
-            bail!("validators names {normalised} twice; a fan-out to five validators is not six");
+            return Err(WorkConfigError::DuplicateValidator(normalised));
         }
         validators.push(normalised);
     }
     if validators.len() != VALIDATOR_COUNT {
-        bail!(
-            "validators must name exactly {VALIDATOR_COUNT} validator URLs, found {}",
-            validators.len(),
-        );
+        return Err(WorkConfigError::ValidatorCount {
+            expected: VALIDATOR_COUNT,
+            actual: validators.len(),
+        });
     }
     Ok(validators)
 }
@@ -344,7 +358,10 @@ struct JournalFile {
 impl JournalFile {
     fn into_root(self) -> Result<PathBuf> {
         if self.root.as_os_str().is_empty() {
-            bail!("journal.root must be a path");
+            return Err(WorkConfigError::Invalid {
+                field: "journal.root",
+                reason: "must be a path",
+            });
         }
         Ok(self.root)
     }
@@ -371,7 +388,12 @@ impl PoliciesFile {
             match (self.execution, self.fetch) {
                 (Some(execution), None) => execution.into_policy()?.into(),
                 (None, Some(fetch)) => fetch.into_policy()?,
-                _ => bail!("policies must select exactly one of execution or fetch"),
+                _ => {
+                    return Err(WorkConfigError::Invalid {
+                        field: "policies",
+                        reason: "must select exactly one of execution or fetch",
+                    });
+                }
             },
         ))
     }
@@ -406,12 +428,12 @@ struct ExecutionPolicyFile {
 impl ExecutionPolicyFile {
     fn into_policy(self) -> Result<PaidExecutionPolicyV1> {
         let allowed_environment: ContentId =
-            self.allowed_environment.parse().with_context(|| {
-                format!(
-                    "policies.execution.allowed_environment {:?} is not a ContentId",
-                    self.allowed_environment
-                )
-            })?;
+            self.allowed_environment
+                .parse()
+                .map_err(|source| WorkConfigError::ContentId {
+                    field: "policies.execution.allowed_environment",
+                    source,
+                })?;
         let policy = PaidExecutionPolicyV1 {
             allowed_environment,
             generation_policy_digest: parse_digest(
@@ -434,8 +456,7 @@ impl ExecutionPolicyFile {
             fixed_price: self.fixed_price,
         };
         // Validate with the protocol rules before any channel is proposed.
-        check_execution_policy(&policy)
-            .map_err(|error| anyhow::anyhow!("policies.execution is not usable: {error}"))?;
+        check_execution_policy(&policy)?;
         Ok(policy)
     }
 }
@@ -477,13 +498,20 @@ impl FetchPolicyFile {
             (None, None, Some(open)) => {
                 PaidFetchRoutePolicy::open_fetch(open.require_spki_pin, open.allowed_hosts)
             }
-            _ => bail!("policies.fetch requires service+method or open_fetch"),
+            _ => {
+                return Err(WorkConfigError::Invalid {
+                    field: "policies.fetch",
+                    reason: "requires service+method or open_fetch",
+                });
+            }
         };
         let policy = PaidFetchPolicyV1 {
-            allowed_environment: self
-                .allowed_environment
-                .parse()
-                .context("policies.fetch.allowed_environment is not a ContentId")?,
+            allowed_environment: self.allowed_environment.parse().map_err(|source| {
+                WorkConfigError::ContentId {
+                    field: "policies.fetch.allowed_environment",
+                    source,
+                }
+            })?,
             route_commitment: fetch_route_commitment(&route.canonical_body_bytes())?,
             max_request_body_bytes: self.max_request_body_bytes,
             max_output_events: self.max_output_events,
@@ -497,7 +525,7 @@ impl FetchPolicyFile {
             fixed_price: self.fixed_price,
         };
         let profile = PaidWorkPolicy::Fetch { policy, route };
-        profile.check().context("policies.fetch is not usable")?;
+        profile.check()?;
         Ok(profile)
     }
 }
@@ -535,22 +563,29 @@ impl PaymentValuesFile {
     }
 }
 
-fn parse_hex(field: &str, raw: &str) -> Result<Vec<u8>> {
-    let bytes = hex::decode(raw.trim()).with_context(|| format!("{field} is not hexadecimal"))?;
+fn parse_hex(field: &'static str, raw: &str) -> Result<Vec<u8>> {
+    let bytes = hex::decode(raw.trim()).map_err(|source| WorkConfigError::Hex { field, source })?;
     if bytes.is_empty() {
-        bail!("{field} must not be empty");
+        return Err(WorkConfigError::Invalid {
+            field,
+            reason: "must not be empty",
+        });
     }
     Ok(bytes)
 }
 
-fn parse_fixed_hex<const N: usize>(field: &str, raw: &str) -> Result<[u8; N]> {
+fn parse_fixed_hex<const N: usize>(field: &'static str, raw: &str) -> Result<[u8; N]> {
     let bytes = parse_hex(field, raw)?;
     let Ok(bytes) = <[u8; N]>::try_from(bytes.as_slice()) else {
-        bail!("{field} must be {N} bytes, found {}", bytes.len());
+        return Err(WorkConfigError::Length {
+            field,
+            expected: N,
+            actual: bytes.len(),
+        });
     };
     Ok(bytes)
 }
 
-fn parse_digest(field: &str, raw: &str) -> Result<Digest> {
+fn parse_digest(field: &'static str, raw: &str) -> Result<Digest> {
     Ok(Digest::from_bytes(parse_fixed_hex(field, raw)?))
 }

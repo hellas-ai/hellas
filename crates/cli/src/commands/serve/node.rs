@@ -15,6 +15,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::Context;
+#[cfg(test)]
 use hellas_chain::FinalizedWorkView;
 #[cfg(feature = "evaluate")]
 use hellas_executor::ArtifactStoreConfig;
@@ -56,6 +57,7 @@ use hellas_wire::{Dispatcher, ServiceMarker, StreamTransport};
 use hellas_wire::{TransportContext, WireStatus};
 #[cfg(test)]
 use hellas_work::work::PaidWorkBackend;
+#[cfg(test)]
 use hellas_work::work_close::FinalizedBlocks;
 #[cfg(test)]
 use hellas_work::work_close::TxSink;
@@ -75,7 +77,7 @@ use crate::commands::discovery::{DiscoveryAdvertiser, served_alpns, start_server
 use crate::identity::OpenIdentity;
 
 pub(super) use hellas_sdk::paid_provider::{
-    MountedSetup, MountedWork, ProductionWorkSource, UnmountedWork, WorkRunner, WorkRunnerConfig,
+    MountedSetup, MountedWork, UnmountedWork, WorkRunner, WorkRunnerConfig,
 };
 
 /// Keep peer-controlled transport state finite. A connection can multiplex
@@ -282,7 +284,7 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
         executor: handle.clone(),
         open_identity: config.open_identity,
     };
-    let work_mount: MountedWork<ProductionWorkSource> = MountedWork::with_backend(handle);
+    let work_mount: MountedWork = MountedWork::with_backend(handle);
     let setup_mount = MountedSetup::default();
     let work = config.work.map(|work| {
         let poll = work.poll;
@@ -379,18 +381,15 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
 
 /// Per-connection serve: each inbound substream is dispatched to the
 /// service selected by the connection's negotiated ALPN.
-async fn serve_connection<S>(
+async fn serve_connection(
     alpn: Vec<u8>,
     conn: Connection,
     remote_execution: RemoteExecutionServices,
     node_handler: NodeHandlerImpl,
     manager: PeerManager,
     setup: Option<MountedSetup>,
-    work: Option<MountedWork<S>>,
-) -> anyhow::Result<()>
-where
-    S: FinalizedBlocks + FinalizedWorkView + Sync,
-{
+    work: Option<MountedWork>,
+) -> anyhow::Result<()> {
     let transport = Arc::new(IrohTransport::new(conn));
     let context = transport.context();
 

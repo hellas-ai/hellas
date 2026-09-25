@@ -128,7 +128,7 @@ fn write(dir: &tempfile::TempDir, value: &serde_json::Value) -> PathBuf {
 
 fn load(value: serde_json::Value) -> CliResult<WorkConfig> {
     let dir = tempfile::tempdir().unwrap();
-    load_work_config(&write(&dir, &value))
+    Ok(load_work_config(&write(&dir, &value))?)
 }
 
 /// Delete `field` from the object at `path`.
@@ -829,4 +829,28 @@ fn a_restarted_node_rebuilds_its_endpoint_from_the_root_and_the_identity() {
         .expect("the rebuilt endpoint answers for the journal it reopened");
 
     assert_eq!(state.revision(), Some(1));
+}
+
+#[test]
+fn observer_freshness_must_leave_time_for_a_poll() {
+    let poll = config()["poll_ms"].as_u64().unwrap();
+    for age in [0, poll] {
+        let error = load(with(
+            config(),
+            "max_observation_age_ms",
+            serde_json::json!(age),
+        ))
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("max_observation_age_ms"));
+    }
+    let configured = load(with(
+        config(),
+        "max_observation_age_ms",
+        serde_json::json!(poll + 1),
+    ))
+    .unwrap();
+    assert_eq!(
+        configured.max_observation_age,
+        std::time::Duration::from_millis(poll + 1)
+    );
 }

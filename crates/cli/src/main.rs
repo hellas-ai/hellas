@@ -1070,7 +1070,7 @@ async fn async_main() {
                 .map(commands::serve::load_work_config)
                 .transpose()
             {
-                Err(error) => Err(error),
+                Err(error) => Err(error.into()),
                 Ok(work_config) => {
                     async {
                         // The key every settlement this node signs is signed
@@ -1149,7 +1149,7 @@ async fn async_main() {
             max_job_price,
             print_bond_only,
         } => match commands::serve::load_work_config(&work_config) {
-            Err(error) => Err(error),
+            Err(error) => Err(error.into()),
             Ok(work_config) => {
                 commands::serve::run_provision(commands::serve::ProvisionOptions {
                     work_config,

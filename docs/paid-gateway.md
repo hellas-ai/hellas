@@ -63,9 +63,36 @@ The provider reserves delivery credit before streaming signed token prefixes.
 The gateway verifies each prefix as it arrives, then authenticates and journals
 the complete result and obtains the provider's durable payment acknowledgement
 before reporting completion. One open subscription replaces repeated result
-polls. Payment is an accumulating channel certificate. Channels stay open and
-follow finalized blocks while idle; they settle through the existing close
-protocol. The pool does not automatically refill exhausted channels.
+polls. Payment is an accumulating channel certificate. An established, healthy
+channel performs no validator RPCs on its request or streaming paths. Requests
+use local credit checks, signatures and journal commits. Channels settle through
+the existing close protocol; the pool does not automatically refill them.
+
+Each channel observes finalized history independently of its requests. The client
+has one request owner and a separate observer handle, so a slow response cannot
+block close monitoring or reorder payment exchanges. The provider also drives
+channels independently: one stalled channel cannot block another's recovery.
+Applying a close and crediting a certificate use the same short journal lock.
+Jobs within a channel still finish in order, including collection and payment
+after an HTTP client disconnects. A server that keeps an HTTP response open after
+an application completion event therefore holds that channel until EOF. The
+generic HTTP route preserves those trailing bytes. Separate funded channels
+execute independently; `paid.queue` measures time waiting for a channel.
+
+The work configuration accepts `max_observation_age_ms` (default 5000), which
+must exceed `poll_ms`. Admission, delivery and new certificates stop when the
+observer fails or no new verified finalized height arrives within that age.
+Repeated reads of an old tip do not renew it. The bound starts before the chain
+read, not after it finishes, and readiness is published only after all intervening
+blocks have been applied. Results may still be retained during an observation
+outage; existing payment certificates remain safe to retransmit.
+
+This is an online channel: its observer must detect unilateral closes and submit
+any response within `omit_response_blocks`. Configure observation age, network
+recovery and submission latency to fit that window at the deployment's block
+rate. The local age limit cannot guarantee recovery through a partition longer
+than the on-chain response window. Setup and restart catch-up may wait on
+validators; ordinary requests do not perform that work.
 
 The shared `--output-cache record` mode also covers paid inference. Repeating
 an identical recorded request reuses its output without another paid job. A
@@ -126,7 +153,7 @@ Hellas RPC metadata carries the context over both Iroh and WebSocket mux
 connections, including validator queries and submissions. Transparent frame
 relays preserve this metadata. The explorer relay continues the context through
 its forwarding span, and proof-origin HTTP queries continue the caller trace.
-Background indexer polling is independent of the paid request trace.
+Background chain observation uses separate `paid.channel.observe` traces.
 
 Useful spans include `http.server`, `paid.gateway`, `paid.queue`,
 `paid.executor.stream`, GenAI `chat MODEL` and `text_completion` operations,

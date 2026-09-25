@@ -117,6 +117,13 @@
 //! What neither endpoint does here is wait. `advance_close` is one
 //! step, and the caller that owns a clock is the one that repeats it.
 
+mod observation;
+use observation::Observation;
+pub use observation::ObservationTime;
+
+mod client_channel;
+pub use client_channel::{ClientChannel, ClientDriver, ClientObserver, ClientService};
+
 mod stream;
 pub use stream::{PaidProgress, PaidResultStream, fetch_result_stream};
 
@@ -379,6 +386,9 @@ const fn channel_refusal(error: &ChannelStateError) -> WorkRefusal {
 /// new work.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum EndpointError {
+    /// The background observer has not confirmed recent finalized progress.
+    #[error("channel observation is stale; awaiting finalized progress")]
+    ObservationStale,
     /// The journal is another channel's.
     #[error("the store's channel is not the one this readiness decided")]
     WrongChannel,
@@ -531,6 +541,7 @@ pub struct CloseEndpoint {
 pub struct ProviderEndpoint {
     close: CloseEndpoint,
     ready: Option<ReadyChannel>,
+    observation: Option<Observation>,
 }
 
 /// How far this process has got with the answer to a live contest.
@@ -606,6 +617,7 @@ impl ProviderEndpoint {
                 close_handoff: None,
             },
             ready: Some(ready),
+            observation: None,
         })
     }
 
@@ -616,7 +628,11 @@ impl ProviderEndpoint {
     /// [`WorkService::close_only`] serves it behind, where one type has
     /// to carry both halves because one handler answers the wire.
     const fn close_only(close: CloseEndpoint) -> Self {
-        Self { close, ready: None }
+        Self {
+            close,
+            ready: None,
+            observation: None,
+        }
     }
 
     /// The readiness this endpoint admits new work under, or the refusal
@@ -627,6 +643,9 @@ impl ProviderEndpoint {
     /// [`EndpointError::NotAdmitting`] when no readiness decision is
     /// held. Nothing about a close reaches this.
     fn admitting(&self) -> Result<&ReadyChannel, EndpointError> {
+        if let Some(observation) = &self.observation {
+            observation.check()?;
+        }
         self.ready.as_ref().ok_or(EndpointError::NotAdmitting)
     }
 
@@ -921,7 +940,11 @@ impl ProviderEndpoint {
         let authorization = *job.authorization();
         let input = PreparedPaidWorkInput::decode(job.prepared_input(), MAX_RECORD_BYTES)
             .map_err(|e| RunError::Transcript(e.into()))?;
-        let ready = self.admitting()?.clone();
+        let ready = self
+            .ready
+            .as_ref()
+            .ok_or(EndpointError::NotAdmitting)?
+            .clone();
         let channel = ready.channel();
         let result = ready
             .execution_policy()
@@ -1144,6 +1167,12 @@ impl ProviderEndpoint {
             .ok_or(PaymentError::Malformed("binding signature"))?;
         let certificate_signature = signature(&request.certificate_signature)
             .ok_or(PaymentError::Malformed("certificate signature"))?;
+
+        if self.state().payment(work_id).is_none()
+            && let Some(observation) = &self.observation
+        {
+            observation.check()?;
+        }
 
         let state = self.close.store.commit(
             ChannelRecord::JobTerminated {
@@ -2094,7 +2123,9 @@ impl From<DeliverError> for Refusal {
         let code = match error {
             DeliverError::NoSuchJob | DeliverError::Terminated { .. } => WorkRefusal::Declined,
             DeliverError::NoResult { .. } => WorkRefusal::NotReady,
-            DeliverError::Endpoint(EndpointError::CatchingUp) => WorkRefusal::NotReady,
+            DeliverError::Endpoint(EndpointError::CatchingUp | EndpointError::ObservationStale) => {
+                WorkRefusal::NotReady
+            }
             DeliverError::Endpoint(EndpointError::NotAdmitting) => WorkRefusal::Unavailable,
             DeliverError::Unbound => WorkRefusal::Invalid,
             DeliverError::Setup(setup) => return Refusal::from(setup),
@@ -2114,6 +2145,9 @@ impl From<DeliverError> for Refusal {
 /// only one of them can raise are documented where they are mapped.
 #[derive(Debug, thiserror::Error)]
 pub enum PaymentError {
+    /// The shared client endpoint is unavailable.
+    #[error(transparent)]
+    Endpoint(#[from] EndpointError),
     /// No open job on this channel carries this `work_id`.
     #[error("no open job on this channel carries this work id")]
     NoSuchJob,
@@ -2173,6 +2207,7 @@ impl From<PaymentError> for Refusal {
         let code = match error {
             PaymentError::NoSuchJob => WorkRefusal::Declined,
             PaymentError::NotPayable { .. } => WorkRefusal::NotReady,
+            PaymentError::Endpoint(error) => endpoint_refusal(error),
             PaymentError::Store(store) => return Refusal::from(store),
             _ => WorkRefusal::Invalid,
         };
@@ -2351,10 +2386,20 @@ impl ChannelDriver<'_> {
         &mut self,
         source: &S,
     ) -> Result<u64, CatchUpError> {
-        let mut cursor = self.cursor()?;
+        let cursor = self.cursor()?;
         let Some(latest) = source.latest_height().await? else {
             return Ok(cursor);
         };
+        self.catch_up_to(source, latest).await
+    }
+
+    /// Applies history through a fixed snapshot height, respecting close duties.
+    pub async fn catch_up_to<S: FinalizedBlocks + ?Sized>(
+        &mut self,
+        source: &S,
+        latest: u64,
+    ) -> Result<u64, CatchUpError> {
+        let mut cursor = self.cursor()?;
         while cursor < latest {
             let next = cursor.saturating_add(1);
             let block = source
@@ -2480,6 +2525,53 @@ impl WorkService {
     /// channel at its own settlement.
     pub fn admit_new_work(&self, ready: ReadyChannel) -> Result<(), EndpointError> {
         self.endpoint()?.admit_new_work(ready)
+    }
+
+    /// Requires a live background observer before accepting or releasing work.
+    pub fn require_observer(&self) -> Result<(), EndpointError> {
+        self.endpoint()?.observation = Some(Observation::default());
+        Ok(())
+    }
+
+    /// Publishes readiness after applying all blocks through its snapshot.
+    pub fn observe_ready(
+        &self,
+        ready: ReadyChannel,
+        started: ObservationTime,
+        max_age: std::time::Duration,
+    ) -> Result<(), EndpointError> {
+        let mut endpoint = self.endpoint()?;
+        if ready.check_caught_up(endpoint.state().cursor().0).is_err() {
+            return Err(EndpointError::CatchingUp);
+        }
+        let height = ready.finalized_height();
+        endpoint.admit_new_work(ready)?;
+        endpoint
+            .observation
+            .get_or_insert_with(Observation::default)
+            .confirm(height, started, max_age);
+        drop(endpoint);
+        self.changed.notify_waiters();
+        Ok(())
+    }
+
+    /// Reads current local admission; no chain I/O is performed.
+    pub fn readiness(&self) -> Result<ReadyChannel, EndpointError> {
+        let endpoint = self.endpoint()?;
+        if endpoint.state().is_closing() {
+            return Err(EndpointError::NotAdmitting);
+        }
+        endpoint.admitting().cloned()
+    }
+
+    /// Revokes observer freshness without discarding results or close duties.
+    pub fn suspend(&self) -> Result<(), EndpointError> {
+        self.endpoint()?
+            .observation
+            .get_or_insert_with(Observation::default)
+            .suspend();
+        self.changed.notify_waiters();
+        Ok(())
     }
 
     /// Borrows the endpoint, privately.
@@ -2830,7 +2922,9 @@ impl WorkService {
 /// proposal is wrong.
 const fn endpoint_refusal(error: EndpointError) -> WorkRefusal {
     match error {
-        EndpointError::CatchingUp | EndpointError::NotAdmitting => WorkRefusal::NotReady,
+        EndpointError::CatchingUp
+        | EndpointError::NotAdmitting
+        | EndpointError::ObservationStale => WorkRefusal::NotReady,
         _ => WorkRefusal::Unavailable,
     }
 }
@@ -2905,6 +2999,9 @@ pub struct JobProposal {
 /// Why a client could not complete one acceptance exchange.
 #[derive(Debug, thiserror::Error)]
 pub enum ProposeError {
+    /// The shared client endpoint is unavailable.
+    #[error(transparent)]
+    Endpoint(#[from] EndpointError),
     /// The provider refused.
     #[error("the provider refused as {refusal}: {reason}")]
     Refused {
@@ -2949,7 +3046,8 @@ pub enum ProposeError {
 /// It owns one channel's journal and proposes on that channel alone.
 #[derive(Debug)]
 pub struct ClientEndpoint {
-    ready: ReadyChannel,
+    ready: Option<ReadyChannel>,
+    observation: Option<Observation>,
     store: ChannelStore,
     signer: Secp256k1Signer,
 }
@@ -2968,7 +3066,19 @@ impl ClientEndpoint {
     ) -> Result<Self, EndpointError> {
         bind(&ready, &store, &signer, Role::Client)?;
         Ok(Self {
-            ready,
+            ready: Some(ready),
+            observation: None,
+            store,
+            signer,
+        })
+    }
+
+    /// Reopens accounting and close duties without requiring an open channel.
+    pub fn recover(store: ChannelStore, signer: Secp256k1Signer) -> Result<Self, EndpointError> {
+        bind_store(&store, &signer, Role::Client)?;
+        Ok(Self {
+            ready: None,
+            observation: None,
             store,
             signer,
         })
@@ -3001,8 +3111,12 @@ impl ClientEndpoint {
     /// outstanding, and the record, readiness, and journal errors the
     /// proposal itself raises.
     pub fn propose(&mut self, proposal: &JobProposal) -> Result<AcceptWorkRequest, ProposeError> {
+        if let Some(observation) = &self.observation {
+            observation.check()?;
+        }
         let (cursor_height, _) = self.state().cursor();
-        let policy = self.ready.execution_policy();
+        let ready = self.ready.as_ref().ok_or(EndpointError::NotAdmitting)?;
+        let policy = ready.execution_policy();
 
         for job in self
             .state()
@@ -3011,7 +3125,7 @@ impl ClientEndpoint {
         {
             let retained = *job.authorization();
             let rebuilt = policy.propose(
-                self.ready.channel(),
+                self.state().channel(),
                 &proposal.prepared_input,
                 retained.proposal_nonce,
                 proposal.deadlines,
@@ -3031,18 +3145,18 @@ impl ClientEndpoint {
         // the sequence move backwards or reuse a number.
         let proposal_nonce = self.state().proposal_nonce_high_water().saturating_add(1);
         let authorization = policy.propose(
-            self.ready.channel(),
+            self.state().channel(),
             &proposal.prepared_input,
             proposal_nonce,
             proposal.deadlines,
         )?;
-        policy.check_authorization(self.ready.channel(), &authorization, cursor_height)?;
+        policy.check_authorization(self.state().channel(), &authorization, cursor_height)?;
         policy.check_input(
-            self.ready.channel(),
+            self.state().channel(),
             &authorization,
             &proposal.prepared_input,
         )?;
-        self.ready.check_signable(
+        ready.check_signable(
             cursor_height,
             authorization.terminal_deadline,
             authorization.payment_deadline,
@@ -3051,7 +3165,7 @@ impl ClientEndpoint {
             .prepared_input
             .encode()
             .map_err(PaidWorkError::from)?;
-        let work_id = work_id(self.ready.channel(), &authorization);
+        let work_id = work_id(self.state().channel(), &authorization);
 
         let signature = self.signer.sign(signing_hash(work_id));
         self.store.commit(
@@ -3160,7 +3274,7 @@ impl ClientEndpoint {
             return Ok(retained.clone());
         }
         let start = close_start(
-            self.ready.channel(),
+            self.state().channel(),
             Party::Maker,
             height,
             self.state().executable_certificate(),
@@ -3241,7 +3355,13 @@ impl ClientEndpoint {
             .ok_or(DeliverError::NoSuchJob)?;
 
         bind(ready, &self.store, &self.signer, Role::Client)?;
-        if ready.execution_policy() != self.ready.execution_policy() {
+        if ready.execution_policy()
+            != self
+                .ready
+                .as_ref()
+                .ok_or(EndpointError::NotAdmitting)?
+                .execution_policy()
+        {
             return Err(DeliverError::Policy);
         }
         let (cursor_height, _) = self.state().cursor();
@@ -3338,7 +3458,7 @@ impl ClientEndpoint {
             .job_by_id(work_id)
             .ok_or(DeliverError::NoSuchJob)?;
         let signature = self.signer.sign(signing_hash(delivery_request_digest(
-            self.ready.channel(),
+            self.state().channel(),
             work_id,
             exporter,
         )));
@@ -3396,7 +3516,7 @@ impl ClientEndpoint {
             .job_by_id(work_id)
             .ok_or(DeliverError::NoSuchJob)?;
         let (result, _) = job.result().ok_or(DeliverError::NoSuchJob)?;
-        let result_digest = result_digest(self.ready.channel(), result);
+        let result_digest = result_digest(self.state().channel(), result);
         self.store.commit(
             ChannelRecord::JobTerminated {
                 work_id,
@@ -3443,6 +3563,9 @@ impl ClientEndpoint {
         if let Some(retained) = self.state().payment(work_id) {
             return Ok(admit_request(&retained));
         }
+        if let Some(observation) = &self.observation {
+            observation.check()?;
+        }
         let job = self
             .state()
             .job_by_id(work_id)
@@ -3453,19 +3576,19 @@ impl ClientEndpoint {
         let (authorization, result) = (*job.authorization(), *result);
 
         let (certificate, binding) = next_payment(
-            self.ready.channel(),
+            self.state().channel(),
             &authorization,
             &result,
             self.state().ledger().credited_cumulative(),
             self.state().settlement(),
         )?;
         let binding_signature = self.signer.sign(signing_hash(payment_binding_digest(
-            self.ready.channel(),
+            self.state().channel(),
             &binding,
         )));
         let certificate_signature = self
             .signer
-            .sign(certificate.digest(self.ready.channel().network()));
+            .sign(certificate.digest(self.state().channel().network()));
 
         self.store.commit(
             ChannelRecord::JobTerminated {
@@ -3550,7 +3673,7 @@ impl ClientEndpoint {
 /// raises.
 pub async fn admit_payment<T>(
     client: &WorkClientImpl<T>,
-    endpoint: &mut ClientEndpoint,
+    endpoint: &mut impl ClientChannel,
     work_id: Digest,
 ) -> Result<u64, PaymentError>
 where
@@ -3558,9 +3681,9 @@ where
     T::Error: std::error::Error + Send + Sync + 'static,
     T::Stream: 'static,
 {
-    let request = endpoint.pay(work_id)?;
+    let request = endpoint.with_client(|endpoint| endpoint.pay(work_id))??;
     let response = client.admit_certificate(request).await?;
-    endpoint.acknowledged(work_id, &response)
+    endpoint.with_client(|endpoint| endpoint.acknowledged(work_id, &response))?
 }
 
 /// Asks for one accepted job's answer over a live transport and makes it
@@ -3582,7 +3705,7 @@ where
 /// raise.
 pub async fn fetch_result<T>(
     transport: T,
-    endpoint: &mut ClientEndpoint,
+    endpoint: &mut impl ClientChannel,
     ready: &ReadyChannel,
     work_id: Digest,
 ) -> Result<Delivery, DeliverError>
@@ -3594,12 +3717,15 @@ where
     let Some(exporter) = transport.context().open_exporter else {
         return Err(DeliverError::Unbindable);
     };
-    let request = endpoint.request_delivery(work_id, &exporter)?;
+    let request =
+        endpoint.with_client(|endpoint| endpoint.request_delivery(work_id, &exporter))??;
     let response = WorkClientImpl::new(transport)
         .deliver_result(request)
         .await?;
     match response.outcome {
-        Some(DeliverOutcome::Delivered(delivered)) => endpoint.receive(work_id, ready, &delivered),
+        Some(DeliverOutcome::Delivered(delivered)) => {
+            endpoint.with_client(|endpoint| endpoint.receive(work_id, ready, &delivered))?
+        }
         Some(DeliverOutcome::Refused(refused)) => Err(DeliverError::Refused {
             refusal: WorkRefusal::from_code(refused.code)
                 .ok_or(DeliverError::Malformed("refusal code"))?,
@@ -3623,7 +3749,7 @@ where
 /// raises.
 pub async fn propose_work<T>(
     transport: T,
-    endpoint: &mut ClientEndpoint,
+    endpoint: &mut impl ClientChannel,
     proposal: &JobProposal,
 ) -> Result<Digest, ProposeError>
 where
@@ -3631,9 +3757,9 @@ where
     T::Error: std::error::Error + Send + Sync + 'static,
     T::Stream: 'static,
 {
-    let request = endpoint.propose(proposal)?;
+    let request = endpoint.with_client(|endpoint| endpoint.propose(proposal))??;
     let response = WorkClientImpl::new(transport).accept_work(request).await?;
-    endpoint.accepted(&response)
+    endpoint.with_client(|endpoint| endpoint.accepted(&response))?
 }
 
 /// Resend a retained proposal over a live transport and journal its answer.
@@ -3643,7 +3769,7 @@ where
 /// or [`ClientEndpoint::accepted`].
 pub async fn resume_work_proposal<T>(
     transport: T,
-    endpoint: &mut ClientEndpoint,
+    endpoint: &mut impl ClientChannel,
     work_id: Digest,
 ) -> Result<Digest, ProposeError>
 where
@@ -3651,9 +3777,9 @@ where
     T::Error: std::error::Error + Send + Sync + 'static,
     T::Stream: 'static,
 {
-    let request = endpoint.resume_proposal(work_id)?;
+    let request = endpoint.with_client(|endpoint| endpoint.resume_proposal(work_id))??;
     let response = WorkClientImpl::new(transport).accept_work(request).await?;
-    endpoint.accepted(&response)
+    endpoint.with_client(|endpoint| endpoint.accepted(&response))?
 }
 
 // ── Wire shapes ───────────────────────────────────────────────────────
