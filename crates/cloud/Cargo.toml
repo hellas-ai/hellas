@@ -1,0 +1,28 @@
+[package]
+name = "hellas-cloud"
+description = "Identity-bound remote machine management for Hellas"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation.workspace = true
+
+[[bin]]
+name = "hellas-agent"
+path = "src/bin/agent.rs"
+
+[dependencies]
+anyhow.workspace = true
+async-trait = "0.1"
+clap = { version = "4", features = ["derive"] }
+hellas-private.workspace = true
+hex.workspace = true
+iroh = { workspace = true, features = ["tls-ring"] }
+libc = "0.2"
+reqwest = { workspace = true, features = ["json", "stream"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+subtle = "2"
+tempfile.workspace = true
+tokio.workspace = true

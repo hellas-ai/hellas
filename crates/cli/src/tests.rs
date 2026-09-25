@@ -1,5 +1,9 @@
 use super::*;
 
+#[cfg(all(feature = "cloud", unix))]
+#[path = "cloud_tests.rs"]
+mod cloud;
+
 #[cfg(feature = "llm")]
 const TEST_ENVIRONMENT: &str = "/path/to/model.environment";
 #[cfg(feature = "llm")]
@@ -868,7 +872,7 @@ fn fetch_retention_defaults_off_and_can_be_enabled() {
 }
 
 #[test]
-fn fetch_rejects_node_addr_without_node_id() {
+fn fetch_rejects_node_addr_without_a_target() {
     let result = Cli::try_parse_from([
         "hellas",
         "fetch",
@@ -888,7 +892,7 @@ fn fetch_rejects_node_addr_without_node_id() {
         .err()
         .expect("node address must be rejected")
         .to_string();
-    assert!(error.contains("<NODE_ID>"), "{error}");
+    assert!(error.contains("NODE_ID"), "{error}");
 }
 
 #[test]

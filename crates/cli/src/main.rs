@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 #[cfg(feature = "evaluate")]
 use std::time::Duration;
 
+#[cfg(all(feature = "cloud", unix))]
+mod cloud;
 mod commands;
 mod identity;
 #[cfg(feature = "node")]
@@ -78,7 +80,12 @@ fn load_command_identity(
                 ..
             }
         );
-    let read_only = settles_paid_work
+    #[cfg(all(feature = "cloud", unix))]
+    let owned_machine = command.owned_machine().is_some();
+    #[cfg(not(all(feature = "cloud", unix)))]
+    let owned_machine = false;
+    let read_only = owned_machine
+        || settles_paid_work
         || matches!(
             command,
             Commands::Identity {
@@ -313,6 +320,15 @@ enum CodexAuthCommand {
 #[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Commands {
+    #[cfg(all(feature = "cloud", unix))]
+    /// Provision and inspect remote Hellas workers.
+    Cloud(hellas_cloud::cloud::CloudArgs),
+    #[cfg(all(feature = "cloud", unix))]
+    /// Discover and administer machines owned by the selected Hellas identity.
+    Machines(hellas_cloud::machines::MachinesArgs),
+    #[cfg(all(feature = "cloud", unix))]
+    /// Internal management RPC for local applications.
+    Control(hellas_cloud::machines::ControlArgs),
     #[cfg(feature = "node")]
     /// Run the RPC server
     Serve {
@@ -320,6 +336,9 @@ enum Commands {
         /// all cached transcripts and clearing them. Omitted means no remote admin.
         #[arg(long = "admin-peer")]
         admin_peers: Vec<iroh::EndpointId>,
+        /// Restrict every inbound Hellas RPC connection to this owner identity.
+        #[arg(long)]
+        owner: Option<EndpointId>,
         /// Assurance offered by this provider.
         #[arg(long, default_value = "producer-signed", value_parser = parse_assurance)]
         assurance: hellas_rpc::Assurance,
@@ -407,6 +426,9 @@ enum Commands {
         /// means this node serves no Fetch routes.
         #[arg(long = "fetch-config")]
         fetch_config_file: Option<PathBuf>,
+        /// Validate fetch routes and credentials without starting a node.
+        #[arg(long, requires = "fetch_config_file")]
+        check_config: bool,
         /// Maximum number of Fetch provider streams running at once.
         #[arg(
             long = "fetch-max-in-flight",
@@ -468,6 +490,9 @@ enum Commands {
             .requires("tokenizer")),
         mut_arg("tokenizer", |arg| arg.required(false).requires("environment"))
     )]
+    #[cfg_attr(all(feature = "cloud", unix), command(group(
+        clap::ArgGroup::new("remote_target").args(["node_id", "machine"])
+    )))]
     Gateway {
         /// Pay a pool of providers using durable on-chain funded work channels.
         #[cfg(feature = "node")]
@@ -482,6 +507,12 @@ enum Commands {
         /// Explicit local text-chat template.
         #[arg(long = "chat-template", value_name = "TEMPLATE")]
         chat_template: Option<hellas_presentation::ChatTemplate>,
+        /// Select an owned machine from this identity's inventory.
+        #[cfg(all(feature = "cloud", unix))]
+        #[arg(long, conflicts_with_all = ["node_id", "provider_genesis", "apple_app_attest_app_id", "apple_app_attest_cdhashes"])]
+        #[cfg_attr(feature = "evaluate", arg(conflicts_with = "local"))]
+        #[cfg_attr(feature = "node", arg(conflicts_with = "paid_work_config"))]
+        machine: Option<String>,
         #[command(flatten)]
         remote_trust: RemoteTrustArgs,
         #[command(flatten)]
@@ -496,7 +527,9 @@ enum Commands {
         #[arg(long)]
         node_id: Option<EndpointId>,
         /// Direct UDP address hint for the target node. Repeat or use commas.
-        #[arg(long = "node-addr", value_delimiter = ',', requires = "node_id")]
+        #[arg(long = "node-addr", value_delimiter = ',')]
+        #[cfg_attr(all(feature = "cloud", unix), arg(requires = "remote_target"))]
+        #[cfg_attr(not(all(feature = "cloud", unix)), arg(requires = "node_id"))]
         node_addrs: Vec<SocketAddr>,
         /// Run locally with Catena instead of the Hellas network
         #[cfg(feature = "evaluate")]
@@ -638,7 +671,15 @@ enum Commands {
                 .multiple(true)
         ))
     )]
+    #[cfg_attr(all(feature = "cloud", unix), command(group(
+        clap::ArgGroup::new("remote_target").args(["node_id", "machine"])
+    )))]
     Llm {
+        /// Select any owned cloud or bare-metal machine from this identity's inventory.
+        #[cfg(all(feature = "cloud", unix))]
+        #[arg(long, conflicts_with_all = ["node_id", "provider_genesis", "apple_app_attest_app_id", "apple_app_attest_cdhashes"])]
+        #[cfg_attr(feature = "evaluate", arg(conflicts_with_all = ["local", "verify_local"]))]
+        machine: Option<String>,
         #[command(flatten)]
         remote_trust: RemoteTrustArgs,
         #[command(flatten)]
@@ -646,7 +687,9 @@ enum Commands {
         /// Node ID to run on remotely (omit to auto-discover)
         node_id: Option<EndpointId>,
         /// Direct UDP address hint for the target node. Repeat or use commas.
-        #[arg(long = "node-addr", value_delimiter = ',', requires = "node_id")]
+        #[arg(long = "node-addr", value_delimiter = ',')]
+        #[cfg_attr(all(feature = "cloud", unix), arg(requires = "remote_target"))]
+        #[cfg_attr(not(all(feature = "cloud", unix)), arg(requires = "node_id"))]
         node_addrs: Vec<SocketAddr>,
         /// Prompt to send (required)
         #[arg(short = 'p', long = "prompt")]
@@ -688,13 +731,22 @@ enum Commands {
     /// The selected Fetch contract strictly structures the upstream request
     /// and destructures its adversarial response into signed output. A
     /// platform-backed assurance authenticates the app; producer-signed does not.
+    #[cfg_attr(all(feature = "cloud", unix), command(group(
+        clap::ArgGroup::new("remote_target").args(["node_id", "machine"])
+    )))]
     Fetch {
+        /// Select any owned cloud or bare-metal machine from this identity's inventory.
+        #[cfg(all(feature = "cloud", unix))]
+        #[arg(long, conflicts_with_all = ["node_id", "provider_genesis", "apple_app_attest_app_id", "apple_app_attest_cdhashes"])]
+        machine: Option<String>,
         #[command(flatten)]
         remote_trust: RemoteTrustArgs,
         /// Node ID to run on remotely (omit to auto-discover)
         node_id: Option<EndpointId>,
         /// Direct UDP address hint for the target node. Repeat or use commas.
-        #[arg(long = "node-addr", value_delimiter = ',', requires = "node_id")]
+        #[arg(long = "node-addr", value_delimiter = ',')]
+        #[cfg_attr(all(feature = "cloud", unix), arg(requires = "remote_target"))]
+        #[cfg_attr(not(all(feature = "cloud", unix)), arg(requires = "node_id"))]
         node_addrs: Vec<SocketAddr>,
         /// Fetch service label. The protocol records it but does not interpret it.
         #[arg(long)]
@@ -789,6 +841,20 @@ enum Commands {
     },
 }
 
+#[cfg(all(feature = "cloud", unix))]
+impl Commands {
+    fn owned_machine(&self) -> Option<&str> {
+        match self {
+            Self::Fetch { machine, .. } => machine.as_deref(),
+            #[cfg(feature = "llm")]
+            Self::Llm { machine, .. } => machine.as_deref(),
+            #[cfg(feature = "gateway")]
+            Self::Gateway { machine, .. } => machine.as_deref(),
+            _ => None,
+        }
+    }
+}
+
 fn validate_identity_options(
     command: &Commands,
     identity: Option<&Path>,
@@ -798,6 +864,10 @@ fn validate_identity_options(
         Commands::OutputCache(args) if args.node_id.is_none() => Some("output-cache"),
         Commands::Store { .. } => Some("store"),
         Commands::Environment { .. } => Some("environment"),
+        #[cfg(feature = "node")]
+        Commands::Serve {
+            check_config: true, ..
+        } => Some("serve --check-config"),
         #[cfg(feature = "chain")]
         Commands::Chain { .. } => Some("chain"),
         Commands::CodexAuth { .. } => Some("codex-auth"),
@@ -819,6 +889,10 @@ fn validate_identity_options(
 
     let reads_existing_identity = match command {
         Commands::OutputCache(args) => args.node_id.is_some(),
+        #[cfg(all(feature = "cloud", unix))]
+        command if command.owned_machine().is_some() => true,
+        #[cfg(all(feature = "cloud", unix))]
+        Commands::Cloud(_) | Commands::Machines(_) | Commands::Control(_) => true,
         Commands::Identity {
             command: IdentityCommand::ShowNodeId | IdentityCommand::ShowEnrollmentId,
         }
@@ -903,6 +977,22 @@ async fn async_main() {
         std::process::exit(1);
     }
     let tracer_provider = tracing_config::init_tracing(cli.log_file.as_deref());
+    #[cfg(feature = "node")]
+    if let Commands::Serve {
+        check_config: true,
+        fetch_config_file: Some(path),
+        ..
+    } = &cli.command
+    {
+        let result = commands::serve::validate_fetch_config(path);
+        tracer_provider.shutdown();
+        if let Err(error) = result {
+            eprintln!("error: {error:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     if let Commands::ProducerKey {
         command: ProducerKeyCommand::Show,
     } = &cli.command
@@ -951,6 +1041,16 @@ async fn async_main() {
             tracer_provider.shutdown();
             if let Err(error) = result {
                 eprintln!("error: {error:#}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        #[cfg(all(feature = "cloud", unix))]
+        command @ (Commands::Cloud(_) | Commands::Machines(_) | Commands::Control(_)) => {
+            let result = cloud::run(command, cli.identity.as_deref()).await;
+            tracer_provider.shutdown();
+            if let Err(err) = result {
+                eprintln!("error: {err:#}");
                 std::process::exit(1);
             }
             return;
@@ -1015,6 +1115,7 @@ async fn async_main() {
     let result = match command {
         #[cfg(feature = "node")]
         Commands::Serve {
+            owner,
             assurance,
             admin_peers,
             port,
@@ -1047,6 +1148,7 @@ async fn async_main() {
             metrics_port,
             graffiti,
             fetch_config_file,
+            check_config: _,
             fetch_max_in_flight,
             fetch_queue_size,
             fetch_retained_transcript_capacity,
@@ -1090,6 +1192,7 @@ async fn async_main() {
                         commands::serve::run(commands::serve::ServeOptions {
                             admin_peers,
                             output_cache: cache_options,
+                            owner,
                             port,
                             execute_policy,
                             queue_size,
@@ -1165,6 +1268,8 @@ async fn async_main() {
             bearer_token_file,
             allow_remote,
             chat_template,
+            #[cfg(all(feature = "cloud", unix))]
+            machine,
             remote_trust,
             causal_lm,
             host,
@@ -1258,6 +1363,19 @@ async fn async_main() {
                 };
                 #[cfg(not(feature = "evaluate"))]
                 let () = local_content_store;
+                #[cfg(all(feature = "cloud", unix))]
+                anyhow::ensure!(
+                    machine.is_none() || responses_backend != GatewayResponsesBackend::Proxy,
+                    "--machine cannot be used with the external proxy backend"
+                );
+                #[cfg(all(feature = "cloud", unix))]
+                let (node_id, remote_trust) = cloud::machine_route(
+                    machine.as_deref(),
+                    &secret_key,
+                    node_id,
+                    remote_trust,
+                )
+                .await?;
                 let assurance = remote_trust.assurance;
                 #[cfg(not(feature = "evaluate"))]
                 let local = false;
@@ -1370,11 +1488,17 @@ async fn async_main() {
         #[cfg(feature = "chain")]
         Commands::Chain { .. } => unreachable!("chain commands handled before identity load"),
         Commands::Store { .. } => unreachable!("store commands handled before identity load"),
+        #[cfg(all(feature = "cloud", unix))]
+        Commands::Cloud(_) | Commands::Machines(_) | Commands::Control(_) => {
+            unreachable!("management commands handled before identity load")
+        }
         Commands::Environment { .. } => {
             unreachable!("environment commands handled before identity load")
         }
         #[cfg(feature = "llm")]
         Commands::Llm {
+            #[cfg(all(feature = "cloud", unix))]
+            machine,
             remote_trust,
             causal_lm,
             node_id,
@@ -1424,6 +1548,10 @@ async fn async_main() {
                             }),
                         )?
                     };
+                #[cfg(all(feature = "cloud", unix))]
+                let (node_id, remote_trust) = cloud::machine_route(
+                    machine.as_deref(), &secret_key, node_id, remote_trust,
+                ).await?;
                 commands::llm::run(
                     commands::llm::ExecuteOptions {
                         output_cache: commands::output_cache::options(
@@ -1461,6 +1589,8 @@ async fn async_main() {
             .await
         }
         Commands::Fetch {
+            #[cfg(all(feature = "cloud", unix))]
+            machine,
             remote_trust,
             node_id,
             node_addrs,
@@ -1481,6 +1611,10 @@ async fn async_main() {
             match payload {
                 Ok(payload) => {
                     async {
+                        #[cfg(all(feature = "cloud", unix))]
+                        let (node_id, remote_trust) = cloud::machine_route(
+                            machine.as_deref(), &secret_key, node_id, remote_trust,
+                        ).await?;
                         commands::fetch::run(
                             commands::fetch::ExecuteOptions {
                                 output_cache: commands::output_cache::options(

@@ -34,6 +34,7 @@ pub use work_config::{WorkConfig, load_work_config};
 pub struct ServeOptions {
     pub admin_peers: Vec<iroh::EndpointId>,
     pub output_cache: hellas_rpc::cache::CacheOptions,
+    pub owner: Option<iroh::EndpointId>,
     pub port: Option<u16>,
     pub execute_policy: ExecutePolicy,
     pub queue_size: usize,
@@ -197,6 +198,7 @@ async fn run_with_store(
     let node = node::spawn_node(node::NodeConfig {
         admin_peers: options.admin_peers,
         output_cache: options.output_cache,
+        owner: options.owner,
         port: options.port,
         execute_policy: options.execute_policy.clone(),
         queue_size: options.queue_size,
@@ -275,6 +277,10 @@ async fn wait_for_shutdown_signal() -> std::io::Result<()> {
 /// credentials, capabilities) and the caller access policy, cross-validated so
 /// a caller grant naming an undefined route is a load error rather than a
 /// silent dead entry.
+pub(crate) fn validate_fetch_config(path: &std::path::Path) -> CliResult<()> {
+    load_fetch_config(path).map(|_| ())
+}
+
 fn load_fetch_config(path: &std::path::Path) -> CliResult<(FetchRouteRegistry, FetchAccessPolicy)> {
     let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
     let file: FetchConfigFile = serde_json::from_slice(&bytes)

@@ -142,6 +142,7 @@ impl NodeHandle {
 pub(super) struct NodeConfig {
     pub(super) admin_peers: Vec<EndpointId>,
     pub(super) output_cache: hellas_rpc::cache::CacheOptions,
+    pub(super) owner: Option<EndpointId>,
     pub(super) port: Option<u16>,
     pub(super) execute_policy: ExecutePolicy,
     pub(super) queue_size: usize,
@@ -187,6 +188,7 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
         peers: config
             .admin_peers
             .iter()
+            .chain(config.owner.iter())
             .map(|peer| hellas_wire::PeerIdentity(*peer.as_bytes()))
             .collect(),
     };
@@ -304,6 +306,7 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
 
     // -- Accept loop: one task per inbound Connection; per-Connection
     //    dispatch routed by ALPN to the matching service handler.
+    let owner = config.owner;
     let accept_endpoint = endpoint.clone();
     let accept_task = tokio::spawn(async move {
         let connection_slots = Arc::new(Semaphore::new(MAX_ACTIVE_RPC_CONNECTIONS));
@@ -344,6 +347,10 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
                         return;
                     }
                 };
+                if owner.is_some_and(|owner| owner != conn.remote_id()) {
+                    conn.close(0u32.into(), b"unauthorized");
+                    return;
+                }
                 let alpn = conn.alpn().to_vec();
                 debug!(
                     alpn = %String::from_utf8_lossy(&alpn),

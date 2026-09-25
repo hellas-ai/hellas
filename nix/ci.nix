@@ -91,11 +91,24 @@ let
             "node"
             "llm"
             "gateway"
+            "cloud"
+            "cloud,node,gateway"
             "otel"
           ]
           ++ lib.optionals isValidatorHost [ "validator" ]
         )
     )) (cargoEnv rustToolchain);
+    cloud = mkCargo "check-cloud" ''
+      cargo test -p hellas-cloud
+      cargo test -p hellas-cli --features cloud,node,gateway
+      cargo build -p hellas-cli --features cloud,node,gateway
+      cargo build -p hellas-cloud --bin hellas-agent
+      target_dir="''${CARGO_TARGET_DIR:-target}"
+      HELLAS_CLI="$(realpath "$target_dir/debug/hellas-cli")" \
+      HELLAS_AGENT="$(realpath "$target_dir/debug/hellas-agent")" \
+        cargo test -p hellas-cli --features cloud,node,gateway \
+          owner_controls_admin_and_hellas_rpc_even_when_receipt_is_stolen -- --ignored
+    '' (cargoEnv rustToolchain);
     # The kernel's whole suite, including `tests/itf.rs` — the Quint↔Rust
     # replay that the entire abstract-correspondence story rests on — and
     # the exact-error pins in `tests/channel/`. `--all-features` is load
@@ -278,9 +291,10 @@ let
   }
   // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
     docker = "docker";
+    docker-cloud = "docker-cloud";
   }
-  # CUDA and HIP images are intentionally omitted from the hosted matrix.
-  # Build them on the self-hosted release runner once it is registered again.
+  # CUDA/HIP images run in the dedicated trusted-branch image job, which
+  # streams archives for publishing without requiring a Docker daemon.
   // lib.optionalAttrs isValidatorHost {
     cli-validator = "cli-validator";
     cli-catena = "cli-catena";
