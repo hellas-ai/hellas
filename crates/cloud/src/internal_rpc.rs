@@ -74,6 +74,12 @@ async fn dispatch(service: &Service, input: &[u8]) -> Option<Value> {
             Err(_) => error(id.clone(), -32602, "Invalid params"),
             Ok(request) => match service.execute(request).await {
                 Ok(result) => json!({"jsonrpc":"2.0", "id":id, "result":result}),
+                // This typed setup hint contains only public, static text.
+                Err(cause) if cause.is::<crate::accounts::RunpodAccountRequired>() => error(
+                    id,
+                    -32000,
+                    &crate::accounts::RunpodAccountRequired.to_string(),
+                ),
                 // Provider errors and malformed credential commands must never leak secrets.
                 Err(_) => error(
                     id,
@@ -213,6 +219,8 @@ pub async fn call(socket: &Path, request: Request) -> Result<Value> {
         anyhow::bail!(
             "internal management RPC failed: {}",
             response["error"]["message"]
+                .as_str()
+                .unwrap_or("Management operation failed")
         );
     }
     response
