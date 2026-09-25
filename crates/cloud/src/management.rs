@@ -219,7 +219,7 @@ impl Service {
         save_private(&path, &machine, true)?;
         let result = crate::deployment::create_with_credentials(spec, &receipt, credentials).await;
         if result.is_err() && !receipt.exists() {
-            // No API call can precede the receipt. A local preflight failure is retryable.
+            // No allocation can precede the receipt. A local preflight failure is retryable.
             std::fs::remove_file(&path)?;
         }
         let id = result?;
