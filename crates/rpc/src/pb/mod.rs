@@ -190,11 +190,14 @@ mod id_pins {
         use super::services::work::{
             AcceptWork, AdmitCertificate, DeliverResult, Open, StreamResult, Work,
         };
-        assert_eq!(<Work as ServiceMarker>::SERVICE_ID, 0x3b672fa8);
+        // Fetch's separate terminal frame extends WorkStreamEvent, deliberately
+        // changing StreamResult and its enclosing service. Other method IDs stay
+        // pinned: gateways and providers must upgrade together for this schema.
+        assert_eq!(<Work as ServiceMarker>::SERVICE_ID, 0x22b5_f1f8);
         assert_eq!(<Open as MethodMarker>::METHOD_ID, 0x93cb0b39);
         assert_eq!(<AcceptWork as MethodMarker>::METHOD_ID, 0xe6a7_13c2);
         assert_eq!(<DeliverResult as MethodMarker>::METHOD_ID, 0xf15a_a80e);
-        assert_eq!(<StreamResult as MethodMarker>::METHOD_ID, 0xf9e8_388a);
+        assert_eq!(<StreamResult as MethodMarker>::METHOD_ID, 0x76bf_afcf);
         assert_eq!(<AdmitCertificate as MethodMarker>::METHOD_ID, 0x0ffb_b4f9);
     }
 

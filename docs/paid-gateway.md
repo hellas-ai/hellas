@@ -11,6 +11,10 @@ config must select the HTTP Fetch manifest and a matching Fetch route policy;
 see [HTTP routing](http-gateway.md). The HTTP router chooses the provider and
 account, so this path never falls back to a different provider or Courtesy.
 
+Paid Fetch extends the Work/WorkSetup service descriptors and the StreamResult
+response schema. Upgrade gateways and providers together: older peers reject
+the changed wire IDs. The on-chain payment certificate format is unchanged.
+
 The pool file uses the provider's existing `--work-config` policy and chain
 configuration:
 
