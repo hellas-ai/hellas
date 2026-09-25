@@ -94,6 +94,10 @@ let
             "${runtime}/bin/hellas-cli"
             "--launcher"
             "${launcher}"
+            # Provider volumes may ignore Unix permissions. Keep credentials on
+            # the container disk; identity/content still use the mounted volume.
+            "--configuration-dir"
+            "/var/lib/hellas-private"
           ];
       Labels = {
         "org.opencontainers.image.source" = "https://github.com/hellas-ai/hellas";

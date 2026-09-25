@@ -17,6 +17,10 @@ use std::{collections::BTreeMap, net::SocketAddr, path::PathBuf};
 struct Args {
     #[arg(long, default_value = "/var/lib/hellas")]
     data: PathBuf,
+    /// Private settings/credentials directory; defaults to --data.
+    /// Use a filesystem supporting owner-only permissions.
+    #[arg(long)]
+    configuration_dir: Option<PathBuf>,
     /// Private environment map prepared by `hellas machines prepare`.
     #[arg(long)]
     bootstrap: Option<PathBuf>,
@@ -38,6 +42,7 @@ struct Args {
 async fn main() -> Result<()> {
     let Args {
         data,
+        configuration_dir,
         bootstrap,
         cli,
         launcher,
@@ -77,6 +82,7 @@ async fn main() -> Result<()> {
     agent::run(agent::AgentOptions {
         credentials,
         data,
+        configuration_dir,
         cli,
         launcher,
         serve_args,
