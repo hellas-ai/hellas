@@ -172,7 +172,15 @@ impl Cloud {
         path: &str,
         body: Option<Value>,
     ) -> Result<Value> {
-        let key = self.credential.token().await?;
+        let key = self.credential.token().await.map_err(|error| {
+            if matches!(self.kind, CloudKind::Runpod)
+                && error.is::<crate::accounts::MissingCredential>()
+            {
+                error.context(crate::accounts::RunpodAccountRequired)
+            } else {
+                error
+            }
+        })?;
         let mut request = self
             .client
             .request(method, format!("{}{path}", self.base))
