@@ -66,7 +66,7 @@ Signed response prefixes stream as they arrive. Successful HTTP completion
 follows verification of the complete result and the provider's durable payment
 acknowledgement. Each accepted valid terminal costs the channel's agreed fixed
 price, including HTTP error statuses. Already available prefixes share bounded
-wire frames, with a fresh chain-state check before each frame and individual
+wire frames, with a local observer-readiness check before each frame and individual
 signature checks for every event. Batching does not wait for more upstream data.
 Requests are not retried on another
 provider after account selection. The pool serializes work within each provider
