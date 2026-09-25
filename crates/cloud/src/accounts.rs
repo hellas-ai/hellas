@@ -3,6 +3,33 @@ use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 
+/// Public signup attribution for the account owning the Foundation templates.
+pub const RUNPOD_REFERRAL_URL: &str = "https://runpod.io?ref=u887dgii";
+
+#[derive(Debug)]
+pub(crate) struct RunpodAccountRequired;
+
+impl std::fmt::Display for RunpodAccountRequired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Runpod account is not configured. Set RUNPOD_API_KEY or configure a named account.\n\
+             Use Hellas' referral link to support the foundation: {RUNPOD_REFERRAL_URL}"
+        )
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct MissingCredential;
+
+impl std::fmt::Display for MissingCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("credential environment variable is unset or empty")
+    }
+}
+
+impl std::error::Error for MissingCredential {}
+
 /// Profiles contain references to credentials, never API keys.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -20,7 +47,16 @@ pub enum CredentialSource {
 impl CredentialSource {
     pub async fn token(&self) -> Result<String> {
         let token = match self {
-            Self::Env(name) => std::env::var(name).with_context(|| format!("set {name}"))?,
+            Self::Env(name) => {
+                let token = std::env::var(name)
+                    .map_err(|error| match error {
+                        std::env::VarError::NotPresent => anyhow::Error::new(MissingCredential),
+                        error => error.into(),
+                    })
+                    .with_context(|| format!("set {name}"))?;
+                ensure!(!token.trim().is_empty(), MissingCredential);
+                token
+            }
             Self::Command(args) => {
                 let (program, args) = args.split_first().context("empty credential command")?;
                 let output = tokio::time::timeout(
@@ -77,7 +113,15 @@ pub fn runpod(account: Option<&str>) -> Result<CredentialSource> {
             root.join("hellas/cloud-accounts.json")
         }
     };
-    let bytes = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+    let bytes = std::fs::read(&path).map_err(|error| {
+        let missing = error.kind() == std::io::ErrorKind::NotFound;
+        let error = anyhow::Error::new(error).context(format!("read {}", path.display()));
+        if missing {
+            error.context(RunpodAccountRequired)
+        } else {
+            error
+        }
+    })?;
     let accounts: Accounts = serde_json::from_slice(&bytes)
         .map_err(|_| anyhow::anyhow!("invalid account configuration in {}", path.display()))?;
     accounts
@@ -85,6 +129,7 @@ pub fn runpod(account: Option<&str>) -> Result<CredentialSource> {
         .get(account)
         .cloned()
         .with_context(|| format!("unknown Runpod account {account:?} in {}", path.display()))
+        .context(RunpodAccountRequired)
 }
 
 pub fn validate_name(name: &str) -> Result<()> {
