@@ -1,10 +1,19 @@
-# Paid inference gateway
+# Paid gateway
 
 `hellas-cli gateway --paid-work-config /srv/hellas/pool.json` sends token-native
 inference to the configured providers and pays through their real funded work
 channels. Each provider has its own endpoint identity, bond, payment funding,
 and client journals. The gateway prefers idle matching providers and matching
 prompt prefixes, then serializes requests within each channel.
+
+With `--http-fetch-config`, the same pool carries HTTP Fetch requests. Its work
+config must select the HTTP Fetch manifest and a matching Fetch route policy;
+see [HTTP routing](http-gateway.md). The HTTP router chooses the provider and
+account, so this path never falls back to a different provider or Courtesy.
+
+Paid Fetch extends the Work/WorkSetup service descriptors and the StreamResult
+response schema. Upgrade gateways and providers together: older peers reject
+the changed wire IDs. The on-chain payment certificate format is unchanged.
 
 The pool file uses the provider's existing `--work-config` policy and chain
 configuration:
@@ -30,9 +39,18 @@ configuration:
 }
 ```
 
+For `--assurance apple-app-attest`, each pool entry also needs
+`provider_genesis` (hex enrollment ContentId), `apple_app_id`, and
+`apple_cd_hashes` (an array of hex 32-byte hashes). Setup and work connections
+verify this anchor before disclosing requests. Producer-signed entries may also
+pin `provider_genesis`; their funded bond fixes the settlement identity in all cases.
+
 Provision provider bonds with `hellas-cli provision`; coin
 values and policy terms must agree with the provider work config. Payment coins
 must be owned by the gateway settlement identity and cannot fund two channels.
+The omission bond must exceed the remaining payment capacity: with 1,000 units
+and zero fees/reserve, a bond of 501 leaves 499 spendable units. The client checks
+this before signing setup terms or creating a journal.
 The provider's route table must authorize the gateway transport and settlement
 identities. All participants must use the same compatible chain revision.
 
@@ -49,9 +67,39 @@ The provider reserves delivery credit before streaming signed token prefixes.
 The gateway verifies each prefix as it arrives, then authenticates and journals
 the complete result and obtains the provider's durable payment acknowledgement
 before reporting completion. One open subscription replaces repeated result
-polls. Payment is an accumulating channel certificate. Channels stay open and
-follow finalized blocks while idle; they settle through the existing close
-protocol. The pool does not automatically refill exhausted channels.
+polls. Payment is an accumulating channel certificate. An established, healthy
+channel performs no validator RPCs on its request or streaming paths. Requests
+use local credit checks, signatures and journal commits. Channels settle through
+the existing close protocol; the pool does not automatically refill them.
+
+Each channel observes finalized history independently of its requests. The client
+has one request owner and a separate observer handle, so a slow response cannot
+block close monitoring or reorder payment exchanges. The provider also drives
+channels independently: one stalled channel cannot block another's recovery.
+Applying a close and crediting a certificate use the same short journal lock.
+Jobs within a channel still finish in order, including collection and payment
+after an HTTP client disconnects. A server that keeps an HTTP response open after
+an application completion event therefore holds that channel until EOF. The
+generic HTTP route preserves those trailing bytes. Separate funded channels
+execute independently; `paid.queue` measures time waiting for a channel.
+
+The work configuration accepts `max_observation_age_ms` (default 5000), which
+must exceed `poll_ms`. Admission, delivery and new certificates stop when the
+observer fails or no new verified finalized height arrives within that age.
+Repeated reads of an old tip do not renew it. The bound starts before the chain
+read, not after it finishes, and readiness is published only after all intervening
+blocks have been applied. Results may still be retained during an observation
+outage; existing payment certificates remain safe to retransmit. Because renewal
+requires an *advancing* finalized height, this age should also exceed the
+deployment's block interval by a comfortable margin: a chain finalizing slower
+than the age spends every gap stale, and admission flaps on each block.
+
+This is an online channel: its observer must detect unilateral closes and submit
+any response within `omit_response_blocks`. Configure observation age, network
+recovery and submission latency to fit that window at the deployment's block
+rate. The local age limit cannot guarantee recovery through a partition longer
+than the on-chain response window. Setup and restart catch-up may wait on
+validators; ordinary requests do not perform that work.
 
 The shared `--output-cache record` mode also covers paid inference. Repeating
 an identical recorded request reuses its output without another paid job. A
@@ -61,13 +109,15 @@ providers or validators.
 
 Keep gateway and provider identities and journals across service restarts,
 including when the operating system's store is ephemeral. Startup recovers
-unfinished jobs and re-sends retained payments idempotently. Disconnecting an
+retained Evaluate jobs and re-sends payment certificates idempotently. Fetch
+journals omit bodies: a lost, unpaid Fetch payload cannot be recovered and keeps
+the channel reserved until its payment deadline. It is never submitted anew. Disconnecting an
 HTTP client cancels work that has not yet been proposed. Once a signed proposal
 may have reached a provider, collection and payment continue despite disconnects.
 The pool admits at most `max_pending_requests` queued or running requests (default
 64); additional requests receive HTTP 503 and may be retried. `timeout_secs`
 bounds queueing, recovery, provider fallback, execution and payment together,
-rather than restarting for each provider. Interactive requests skip busy provider
+rather than restarting for each provider. Token-native requests skip busy provider
 channels; each connection attempt gets at most 10 seconds before trying another
 route within that shared budget. The HTTP paid route uses this same
 configured budget; non-paid routes retain their existing 3600-second default. HTTP delivery has an
@@ -110,7 +160,7 @@ Hellas RPC metadata carries the context over both Iroh and WebSocket mux
 connections, including validator queries and submissions. Transparent frame
 relays preserve this metadata. The explorer relay continues the context through
 its forwarding span, and proof-origin HTTP queries continue the caller trace.
-Background indexer polling is independent of the paid request trace.
+Background chain observation uses separate `paid.channel.observe` traces.
 
 Useful spans include `http.server`, `paid.gateway`, `paid.queue`,
 `paid.executor.stream`, GenAI `chat MODEL` and `text_completion` operations,

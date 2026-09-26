@@ -26,7 +26,9 @@ pub use fetch::{
     verified_fetch_input, verify_fetch_work_event,
 };
 #[cfg(feature = "iroh")]
-pub use iroh::{AppleAppAttestTrust, ExecutionRoute, ProviderTrustAnchor, RemoteNodeTarget};
+pub use iroh::{
+    AppleAppAttestTrust, ExecutionRoute, ProviderTrustAnchor, RemoteNodeTarget, confidential_open,
+};
 pub use run_ticket::{runner_public_key, signed_run_ticket_request};
 
 /// Client capabilities shared by local and transport-specific orchestration.

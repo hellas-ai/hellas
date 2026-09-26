@@ -7,6 +7,7 @@ pub struct ChannelStore {
     journal: Journal,
     state: ChannelState,
     torn_tail: bool,
+    metadata_only: bool,
 }
 
 impl ChannelStore {
@@ -46,6 +47,36 @@ impl ChannelStore {
         origin: SetupOrigin,
         verifier: &V,
     ) -> Result<Self, WorkStoreError> {
+        Self::open_inner(root, channel, settlement, role, origin, verifier, false)
+    }
+
+    /// Opens a journal that stores accounting evidence only.
+    ///
+    /// Inputs and output transcripts are verified before commit and retained
+    /// in memory. Append and checkpoint encodings omit both bodies. After a
+    /// restart an accepted request cannot run and a completed response cannot
+    /// be replayed; a signed payment for an already delivered result can still
+    /// be credited. Existing payload-bearing journals are refused.
+    pub fn open_metadata_only<V: SigVerifier>(
+        root: &Path,
+        channel: PaidChannel,
+        settlement: WorkPaymentSettlement,
+        role: Role,
+        origin: SetupOrigin,
+        verifier: &V,
+    ) -> Result<Self, WorkStoreError> {
+        Self::open_inner(root, channel, settlement, role, origin, verifier, true)
+    }
+
+    fn open_inner<V: SigVerifier>(
+        root: &Path,
+        channel: PaidChannel,
+        settlement: WorkPaymentSettlement,
+        role: Role,
+        origin: SetupOrigin,
+        verifier: &V,
+        metadata_only: bool,
+    ) -> Result<Self, WorkStoreError> {
         if origin.payment_edge != channel.payment_edge() {
             return Err(ChannelStateError::WrongChannel {
                 field: "setup origin payment_edge",
@@ -58,21 +89,30 @@ impl ChannelStore {
             root,
             &format!("channel-{}", hex(&key)),
             JournalId {
-                kind: JournalKind::Channel,
+                kind: if metadata_only {
+                    JournalKind::MetadataChannel
+                } else {
+                    JournalKind::Channel
+                },
                 role,
                 key,
                 generation: 0,
             },
         )?;
         let mut state = match &replay.checkpoint {
-            Some(bytes) => {
-                ChannelState::from_checkpoint(bytes, channel, settlement, role, verifier)?
-            }
+            Some(bytes) => ChannelState::from_checkpoint(
+                bytes,
+                channel,
+                settlement,
+                role,
+                verifier,
+                metadata_only,
+            )?,
             None => ChannelState::new(channel, settlement, role, origin),
         };
         for bytes in &replay.records {
             let record = ChannelRecord::decode(bytes)?;
-            state.apply(&record, verifier)?;
+            state.apply(&record, verifier, metadata_only)?;
         }
         state.indeterminate = state
             .jobs
@@ -85,6 +125,7 @@ impl ChannelStore {
             journal,
             state,
             torn_tail: replay.truncated_tail,
+            metadata_only,
         };
         Ok(store)
     }
@@ -107,6 +148,12 @@ impl ChannelStore {
         &self.state
     }
 
+    /// Whether this journal excludes request and response bodies from disk.
+    #[must_use]
+    pub const fn metadata_only(&self) -> bool {
+        self.metadata_only
+    }
+
     /// Journals one step, and returns only once it is on the disk.
     ///
     /// The rule this exists to enforce: call it *before* the bytes it
@@ -126,9 +173,19 @@ impl ChannelStore {
         verifier: &V,
     ) -> Result<&ChannelState, WorkStoreError> {
         // Applied to a copy first: a record the rules refuse must leave
-        // neither the file nor the state touched.
+        // neither the file nor the state touched. A cheap exact check
+        // first: the stream replay path offers a redundant release per
+        // emitted frame, and the copy would clone the whole transcript.
+        if self.state.is_redundant(&record) {
+            return Ok(&self.state);
+        }
         let mut next = self.state.clone();
-        if next.apply(&record, verifier)? == Applied::Changed {
+        // The `false` keeps commit-time validation at full strength even
+        // for a metadata-only journal: bodies are verified — digest and
+        // transcript-to-result reproduction — before they are stripped
+        // from the bytes written. Only replay and checkpoint validation
+        // downgrade for body-less records.
+        if next.apply(&record, verifier, false)? == Applied::Changed {
             // The signature this record carries leaves after this
             // returns, so the state that authorises it has to be one a
             // rotation can still carry. The proposed job is charged the
@@ -136,13 +193,17 @@ impl ChannelStore {
             // answered with and the terminal that pays for it — because
             // by then there is no refusal left that costs nothing.
             if let Some(tail) = record.checkpoint_tail() {
-                let len = next.checkpoint().len().saturating_add(tail);
+                let len = next
+                    .checkpoint_for_storage(self.metadata_only)
+                    .len()
+                    .saturating_add(tail);
                 if len > MAX_CHECKPOINT_BYTES {
                     return Err(JournalError::CheckpointTooLarge { len }.into());
                 }
             }
             self.rotate_if_full(record.is_new_work())?;
-            self.journal.append(&record.encode())?;
+            self.journal
+                .append(&record.encode_for_storage(self.metadata_only))?;
             self.state = next;
         }
         Ok(&self.state)
@@ -162,7 +223,8 @@ impl ChannelStore {
     /// [`WorkStoreError::Journal`] when the checkpoint does not fit one
     /// frame or an install step fails.
     pub fn rotate(&mut self) -> Result<(), WorkStoreError> {
-        self.journal.rotate(&self.state.checkpoint())?;
+        self.journal
+            .rotate(&self.state.checkpoint_for_storage(self.metadata_only))?;
         Ok(())
     }
 
@@ -178,7 +240,10 @@ impl ChannelStore {
         if !self.journal.at_soft_limit() {
             return Ok(());
         }
-        match self.journal.rotate(&self.state.checkpoint()) {
+        match self
+            .journal
+            .rotate(&self.state.checkpoint_for_storage(self.metadata_only))
+        {
             Ok(()) => Ok(()),
             Err(error) if new_work => Err(error.into()),
             Err(_) => Ok(()),

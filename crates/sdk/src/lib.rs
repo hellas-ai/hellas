@@ -24,7 +24,18 @@ pub use hellas_gateway as gateway;
 #[cfg(feature = "provider")]
 mod provider;
 #[cfg(feature = "provider")]
-pub use provider::{OpenAiProviderOptions, ProviderHandle, start_openai_provider};
+pub use hellas_executor::{FetchRoute, FetchRouteEntry, FetchRoutePolicy, FetchRouteRegistry};
+#[cfg(feature = "paid-work")]
+pub use hellas_kernel as kernel;
+#[cfg(feature = "provider")]
+pub use hellas_providers::{
+    HttpProviderConfig, OpenAiResponsesFetchProvider, ResponsesFetchAdaptorFactory,
+};
+#[cfg(feature = "provider")]
+pub use provider::{
+    FetchProviderOptions, OpenAiProviderOptions, ProviderHandle, start_fetch_provider,
+    start_openai_provider,
+};
 #[cfg(feature = "client")]
 pub use remote::{ClientIdentity, HellasClient, RemoteFetchRequest};
 
@@ -36,3 +47,14 @@ pub mod local {
     pub use hellas_rpc::cache::control::CacheController;
     pub use hellas_wire::local::{LOCAL_MUX_SLOTS, LocalControlServer, connect, transport};
 }
+
+#[cfg(feature = "paid-work")]
+pub mod paid_provider;
+#[cfg(feature = "paid-work")]
+pub mod work_config;
+
+#[cfg(feature = "paid-work")]
+pub mod paid_client;
+
+#[cfg(feature = "paid-work")]
+pub mod work_provision;

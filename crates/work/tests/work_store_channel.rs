@@ -443,6 +443,156 @@ fn commit_all(store: &mut ChannelStore, records: &[ChannelRecord]) {
     }
 }
 
+fn open_metadata(root: &std::path::Path) -> ChannelStore {
+    ChannelStore::open_metadata_only(
+        root,
+        channel(),
+        settlement(),
+        Role::Provider,
+        origin_of(&channel()),
+        &Secp256k1Verifier::new(),
+    )
+    .expect("metadata provider journal opens")
+}
+
+fn assert_payloads_absent(root: &std::path::Path, needles: &[&[u8]]) {
+    for entry in std::fs::read_dir(root).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            assert_payloads_absent(&path, needles);
+        } else {
+            let bytes = std::fs::read(&path).unwrap();
+            for needle in needles {
+                assert!(!needle.is_empty());
+                assert!(
+                    !bytes.windows(needle.len()).any(|window| window == *needle),
+                    "customer payload reached {}",
+                    path.display()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn metadata_journal_never_writes_payloads_at_any_commit_or_rotation() {
+    let channel = channel();
+    let job = job_at(&channel, 1, 0);
+    let sequence = provider_sequence(&channel, &job);
+    let input = bundle_bytes(1);
+    let output = spool(&job.transcript);
+    let payloads = [&input[..], &output[..], job.transcript[0].payload()];
+    for boundary in 1..=sequence.len() {
+        let root = temp();
+        let mut store = open_metadata(root.path());
+        for record in &sequence[..boundary] {
+            store
+                .commit(record.clone(), &Secp256k1Verifier::new())
+                .unwrap();
+            assert_payloads_absent(root.path(), &payloads);
+        }
+        if let Some(active) = store.state().job_by_id(job.work_id) {
+            assert_eq!(active.prepared_input(), input);
+            if active.result().is_some() {
+                assert_eq!(active.transcript(), output);
+            }
+        }
+        store.rotate().unwrap();
+        assert_payloads_absent(root.path(), &payloads);
+        drop(store);
+        let reopened = open_metadata(root.path());
+        if let Some(active) = reopened.state().job_by_id(job.work_id) {
+            assert!(active.prepared_input().is_empty());
+            assert!(active.transcript().is_empty());
+            assert_eq!(active.authorization(), &job.authorization);
+        } else {
+            assert_eq!(reopened.state().ledger().credited_cumulative(), PRICE);
+        }
+    }
+}
+
+#[test]
+fn metadata_journal_can_credit_an_already_delivered_result_after_restart() {
+    let root = temp();
+    let channel = channel();
+    let job = job_at(&channel, 1, 0);
+    let mut store = open_metadata(root.path());
+    commit_all(&mut store, &provider_sequence(&channel, &job)[..5]);
+    drop(store);
+    let mut recovered = open_metadata(root.path());
+    recovered
+        .commit(job.paid(&channel), &Secp256k1Verifier::new())
+        .unwrap();
+    assert_eq!(recovered.state().ledger().credited_cumulative(), PRICE);
+    recovered.rotate().unwrap();
+    drop(recovered);
+    assert_eq!(
+        open_metadata(root.path())
+            .state()
+            .ledger()
+            .credited_cumulative(),
+        PRICE
+    );
+}
+
+#[test]
+fn metadata_replay_does_not_weaken_live_payload_validation() {
+    let root = temp();
+    let channel = channel();
+    let job = job_at(&channel, 1, 0);
+    let mut store = open_metadata(root.path());
+    let mut proposal = job.proposed();
+    if let ChannelRecord::JobProposed { prepared_input, .. } = &mut proposal {
+        prepared_input.clear();
+    }
+    assert!(store.commit(proposal, &Secp256k1Verifier::new()).is_err());
+    assert!(store.is_empty());
+    commit_all(&mut store, &provider_sequence(&channel, &job)[..3]);
+    let mut result = job.result_record(&channel);
+    if let ChannelRecord::JobResult { transcript, .. } = &mut result {
+        transcript.clear();
+    }
+    let records = store.len();
+    assert!(store.commit(result, &Secp256k1Verifier::new()).is_err());
+    assert_eq!(store.len(), records);
+}
+
+#[test]
+fn journal_retention_mode_cannot_change_when_reopened() {
+    for metadata in [false, true] {
+        let root = temp();
+        let store = if metadata {
+            open_metadata(root.path())
+        } else {
+            open(root.path(), Role::Provider)
+        };
+        drop(store);
+        let reopened = if metadata {
+            ChannelStore::open(
+                root.path(),
+                channel(),
+                settlement(),
+                Role::Provider,
+                origin_of(&channel()),
+                &Secp256k1Verifier::new(),
+            )
+        } else {
+            ChannelStore::open_metadata_only(
+                root.path(),
+                channel(),
+                settlement(),
+                Role::Provider,
+                origin_of(&channel()),
+                &Secp256k1Verifier::new(),
+            )
+        };
+        assert!(
+            reopened.is_err(),
+            "retention mode is part of journal identity"
+        );
+    }
+}
+
 // ── The happy path ────────────────────────────────────────────────────
 
 /// One paid job credits its certificate and rests at a certified

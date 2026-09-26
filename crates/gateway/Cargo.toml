@@ -26,6 +26,8 @@ evaluate = [
 anyhow = { workspace = true }
 async-stream = { workspace = true }
 axum = { workspace = true }
+base64.workspace = true
+flate2 = "1"
 futures = { workspace = true }
 hellas-adaptors.workspace = true
 hellas-client = { workspace = true, features = ["iroh", "evaluate"] }
@@ -35,6 +37,7 @@ hellas-private.workspace = true
 hellas-rpc = { workspace = true, features = ["courtesy", "fetch"] }
 hellas-store = { workspace = true, optional = true }
 hellas-wire = { workspace = true, features = ["iroh"] }
+httpdate = "1"
 iroh.workspace = true
 libc = "0.2"
 opentelemetry = { workspace = true, optional = true }
@@ -49,8 +52,10 @@ tokio.workspace = true
 tower = { version = "0.5", default-features = false, features = ["util"] }
 tracing.workspace = true
 tracing-opentelemetry = { workspace = true, optional = true }
+zstd = "0.13"
 
 [dev-dependencies]
 hellas-rpc = { workspace = true, features = ["host-control"] }
 hellas-wire = { workspace = true, features = ["unix"] }
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
 tempfile = "3"

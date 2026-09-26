@@ -20,6 +20,10 @@ pub mod work;
 #[cfg(feature = "work")]
 pub mod work_bundle;
 #[cfg(feature = "work")]
+pub mod work_fetch;
+#[cfg(feature = "work")]
+pub mod work_profile;
+#[cfg(feature = "work")]
 pub mod work_setup;
 
 pub use causal_lm::{

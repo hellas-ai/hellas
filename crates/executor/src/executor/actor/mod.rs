@@ -1,4 +1,5 @@
 pub(super) mod execution;
+mod paid_fetch;
 mod quote;
 
 use crate::ExecutorError;
@@ -150,6 +151,39 @@ pub struct ExecutorSpawnConfig {
     pub content_store: ContentStore,
     #[cfg(feature = "evaluate")]
     pub gpu_config: crate::GpuConfig,
+}
+
+impl ExecutorSpawnConfig {
+    /// Construct a Fetch-only runtime independently of whether another Cargo
+    /// consumer enables Evaluate. Hosts can then override limits and stores.
+    pub fn fetch_only(
+        producer_key: Arc<ProducerSigningKey>,
+        provider_genesis: Arc<Vec<u8>>,
+        assurance: Assurance,
+        fetch_routes: FetchRouteRegistry,
+    ) -> Self {
+        Self {
+            output_cache: hellas_rpc::cache::CacheOptions::default(),
+            execute_policy: ExecutePolicy::Deny,
+            queue_capacity: 1,
+            metrics: Arc::new(ExecutorMetrics::default()),
+            producer_key,
+            provider_genesis,
+            assurance,
+            fetch_access_policy: FetchAccessPolicy::trusted_callers([]),
+            fetch_routes,
+            fetch_max_in_flight: hellas_rpc::DEFAULT_FETCH_MAX_IN_FLIGHT,
+            fetch_queue_capacity: hellas_rpc::DEFAULT_FETCH_QUEUE_CAPACITY,
+            fetch_replay_max_in_flight: hellas_rpc::DEFAULT_FETCH_REPLAY_MAX_IN_FLIGHT,
+            fetch_store: FetchTranscriptStoreBackend::memory(),
+            #[cfg(feature = "evaluate")]
+            artifact_store: ArtifactStoreConfig::memory(),
+            #[cfg(feature = "evaluate")]
+            content_store: ContentStore::new(),
+            #[cfg(feature = "evaluate")]
+            gpu_config: crate::GpuConfig::default(),
+        }
+    }
 }
 
 struct ExecutorRuntimeConfig {
@@ -419,6 +453,14 @@ impl Executor {
                 self.evaluate.on_completion(*completion).await;
                 true
             }
+            ExecutorCompletion::PaidFetch { reply, result } => {
+                self.active_fetches = self.active_fetches.saturating_sub(1);
+                self.dispatch_next_fetch();
+                self.retry_deferred_fetch_quota_settlements();
+                self.retry_deferred_fetch_quota_cancellations();
+                let _ = reply.send(result);
+                false
+            }
             ExecutorCompletion::FetchFinished(completion) => {
                 self.handle_fetch_finished(*completion);
                 false
@@ -450,6 +492,14 @@ impl Executor {
 
     async fn handle_owed_request(&mut self, request: ExecutorOwedRequest) {
         match request {
+            ExecutorOwedRequest::RunPaidFetch {
+                span,
+                input,
+                progress,
+                reply,
+            } => {
+                self.start_paid_fetch(*input, progress, reply, span);
+            }
             ExecutorOwedRequest::RunPaidEvaluate { input, reply, span } => {
                 #[cfg(feature = "evaluate")]
                 let result = tracing::Instrument::instrument(

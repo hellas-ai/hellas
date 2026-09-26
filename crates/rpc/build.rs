@@ -776,6 +776,27 @@ fn handler_signature(m: &MethodPlan) -> TokenStream {
         Shape::Unary => quote! { impl Into<crate::call::WithTrailer<#response>> + Send },
         _ => boxed_stream(response),
     };
+    // Every service carries the confidential-Open handshake method, named
+    // `open` in each package. A dispatcher that never mounted an OpenHandler
+    // must still answer it: refusing with Unavailable keeps a missing mount
+    // a runtime refusal for the peer instead of a compile error here. The
+    // match is on the bare method name, so any future `open` rpc in any
+    // package gets this same default.
+    if fn_name == "open" {
+        let allow_open_context_unused = if m.connection_bound {
+            quote! { let _ = context; }
+        } else {
+            quote! {}
+        };
+        return quote! {
+            fn #fn_name(&self, _request: #request_ty #context)
+                -> impl ::core::future::Future<Output = Result<#response, ::hellas_wire::WireStatus>> + Send {
+                #allow_open_context_unused
+                ::core::future::ready(Err(::hellas_wire::WireStatus::new(
+                    ::hellas_wire::WireCode::Unavailable, "confidential Open is not mounted")))
+            }
+        };
+    }
     quote! {
         fn #fn_name(
             &self,

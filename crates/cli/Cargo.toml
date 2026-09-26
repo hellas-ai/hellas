@@ -23,6 +23,8 @@ apple-app-attest = []
 # is driven from; without it the runner has a chain and no way to ask it
 # anything.
 node = [
+    "dep:hellas-sdk",
+    "hellas-sdk/paid-work",
     "chain",
     "dep:async-stream",
     "dep:axum",
@@ -101,6 +103,7 @@ hellas-rpc = { workspace = true, default-features = false, features = [
     "work",
     "host-control",
 ] }
+hellas-sdk = { workspace = true, default-features = false, optional = true }
 hellas-store = { workspace = true }
 hellas-wire = { workspace = true, features = [
     "unix",

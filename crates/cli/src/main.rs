@@ -463,12 +463,22 @@ enum Commands {
     #[command(
         mut_arg("environment", |arg| arg
             .required(false)
-            .required_unless_present("responses_backend")
+            .required_unless_present_any(["responses_backend", "http_fetch_config"])
             .required_if_eq("responses_backend", "hellas")
             .requires("tokenizer")),
         mut_arg("tokenizer", |arg| arg.required(false).requires("environment"))
     )]
     Gateway {
+        /// Serve exact HTTP routes through paid HTTPS Fetch.
+        #[arg(long, value_name = "FILE", conflicts_with_all = ["responses_backend", "environment"])]
+        #[cfg_attr(feature = "node", arg(requires = "paid_work_config"))]
+        http_fetch_config: Option<PathBuf>,
+        /// Request/response archive directory (default: ~/.hellas/gateway-archive).
+        #[arg(long, value_name = "DIRECTORY")]
+        archive_dir: Option<PathBuf>,
+        /// Disable payload archives and require ZDR for every HTTP request.
+        #[arg(long)]
+        zdr: bool,
         /// Pay a pool of providers using durable on-chain funded work channels.
         #[cfg(feature = "node")]
         #[arg(long = "paid-work-config", value_name = "FILE")]
@@ -1060,7 +1070,7 @@ async fn async_main() {
                 .map(commands::serve::load_work_config)
                 .transpose()
             {
-                Err(error) => Err(error),
+                Err(error) => Err(error.into()),
                 Ok(work_config) => {
                     async {
                         // The key every settlement this node signs is signed
@@ -1139,7 +1149,7 @@ async fn async_main() {
             max_job_price,
             print_bond_only,
         } => match commands::serve::load_work_config(&work_config) {
-            Err(error) => Err(error),
+            Err(error) => Err(error.into()),
             Ok(work_config) => {
                 commands::serve::run_provision(commands::serve::ProvisionOptions {
                     work_config,
@@ -1160,6 +1170,9 @@ async fn async_main() {
         Commands::OutputCache(..) => unreachable!("cache commands handled before identity load"),
         #[cfg(feature = "gateway")]
         Commands::Gateway {
+            http_fetch_config,
+            archive_dir,
+            zdr,
             #[cfg(feature = "node")]
             paid_work_config,
             bearer_token_file,
@@ -1272,19 +1285,21 @@ async fn async_main() {
                     );
                     #[cfg(feature = "evaluate")]
                     anyhow::ensure!(!verify_local, "--paid-work-config cannot use --verify-local");
+                    anyhow::ensure!(http_fetch_config.is_some() || assurance == hellas_rpc::Assurance::ProducerSigned,
+                        "token-native paid work uses producer-signed assurance");
                     anyhow::ensure!(
-                        assurance == hellas_rpc::Assurance::ProducerSigned,
-                        "paid-work execution uses producer-signed assurance",
-                    );
-                    anyhow::ensure!(
-                        remote_trust.provider_genesis.is_none(),
-                        "--paid-work-config uses the pool's bond and endpoint identities; omit the courtesy --provider pin",
+                        remote_trust.provider_genesis.is_none()
+                            && remote_trust.apple_app_attest_app_id.is_none()
+                            && remote_trust.apple_app_attest_cdhashes.is_empty(),
+                        "set provider enrollment and Apple trust pins in --paid-work-config",
                     );
                     Some(
                         commands::paid_work::load_gateway_backend(
                             path,
                             secret_key.clone(),
                             identity::settlement_signer(&local_identity),
+                            local_identity.producer_key.clone(),
+                            assurance,
                         ).await?
                     )
                 } else {
@@ -1307,6 +1322,23 @@ async fn async_main() {
                     )?
                 };
                 hellas_gateway::run(hellas_gateway::GatewayOptions {
+                    archive: hellas_gateway::ArchiveOptions {
+                        directory: archive_dir.map(Ok).unwrap_or_else(identity::default_gateway_archive_path)?,
+                        zdr,
+                    },
+                    http_fetch: http_fetch_config
+                        .map(|path| -> anyhow::Result<_> {
+                            // 4 MiB, the same bound the pool-file loader
+                            // takes from hellas-work, which this binary
+                            // links only in some feature builds.
+                            let bytes = commands::read_bounded_regular_file(
+                                &path,
+                                "HTTP gateway config",
+                                4 << 20,
+                            )?;
+                            Ok(serde_json::from_slice(&bytes)?)
+                        })
+                        .transpose()?,
                     output_cache: cache_options,
                     paid_work,
                     bearer_token_file,
@@ -1364,6 +1396,7 @@ async fn async_main() {
                 command,
                 secret_key,
                 identity::settlement_signer(&local_identity),
+                local_identity.producer_key.clone(),
             )
             .await
         }

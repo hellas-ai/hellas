@@ -395,22 +395,13 @@ impl GatewayState {
                         max_new_tokens: max_tokens,
                         stop_token_ids: self.stop_token_ids.clone(),
                     })
-                    .map_err(|error| {
-                        // anyhow's allocation-preserving conversion hides the
-                        // concrete error type from std::error::Error downcasts.
-                        let error: Box<dyn std::error::Error + Send + Sync> =
-                            match error.downcast::<super::PaidGatewayBusy>() {
-                                Ok(busy) => Box::new(busy),
-                                Err(error) => error.into_boxed_dyn_error(),
-                            };
-                        hellas_client::ClientError::External(error)
-                    })?;
+                    .map_err(|error| hellas_client::ClientError::External(Box::new(error)))?;
                 Ok((
                     None,
                     payment
                         .map(|result| {
                             result.map_err(|error| {
-                                hellas_client::ClientError::External(error.into_boxed_dyn_error())
+                                hellas_client::ClientError::External(Box::new(error))
                             })
                         })
                         .boxed(),
@@ -419,7 +410,10 @@ impl GatewayState {
             .await
             .map_err(|error| match error {
                 hellas_client::ClientError::External(error) => HttpError {
-                    status: if error.is::<super::PaidGatewayBusy>() {
+                    status: if matches!(
+                        error.downcast_ref::<super::PaidGatewayError>(),
+                        Some(super::PaidGatewayError::Busy(_))
+                    ) {
                         StatusCode::SERVICE_UNAVAILABLE
                     } else {
                         StatusCode::BAD_REQUEST

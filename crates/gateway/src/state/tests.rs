@@ -51,6 +51,11 @@ fn test_environment() -> CausalLmExecutionEnvironment {
 /// A gateway pointed at one node, which callers then vary.
 fn options(provider_trust: Option<ProviderTrustAnchor>) -> GatewayOptions {
     GatewayOptions {
+        archive: super::super::ArchiveOptions {
+            directory: "unused-test-archive".into(),
+            zdr: true,
+        },
+        http_fetch: None,
         output_cache: Default::default(),
         paid_work: None,
         bearer_token_file: None,
@@ -143,6 +148,10 @@ data: {"type":"response.completed","response":{"id":"resp_1","object":"response"
         store: Some(Arc::new(MemoryCacheStore::default())),
     };
     let directory = tempfile::tempdir().unwrap();
+    options.archive = crate::ArchiveOptions {
+        directory: directory.path().join("archive"),
+        zdr: false,
+    };
     std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let socket = directory.path().join("control.sock");
     let _control = LocalControlServer::bind(
@@ -346,8 +355,7 @@ async fn paid_generation_records_after_payment_and_replays_without_a_backend() {
         fn execute(
             &self,
             request: PaidExecutionRequest,
-        ) -> anyhow::Result<futures::stream::BoxStream<'static, anyhow::Result<ExecutionEvent>>>
-        {
+        ) -> Result<crate::PaidOutputStream<ExecutionEvent>, crate::PaidGatewayError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             assert_eq!(request.input_ids, vec![0]);
             assert_eq!(request.max_new_tokens, 1);
@@ -470,9 +478,8 @@ async fn paid_capacity_is_a_retryable_error_and_uses_the_pool_deadline() {
         fn execute(
             &self,
             _: crate::PaidExecutionRequest,
-        ) -> anyhow::Result<
-            futures::stream::BoxStream<'static, anyhow::Result<crate::ExecutionEvent>>,
-        > {
+        ) -> Result<crate::PaidOutputStream<crate::ExecutionEvent>, crate::PaidGatewayError>
+        {
             Err(crate::PaidGatewayBusy.into())
         }
         fn drain(&self) -> futures::future::BoxFuture<'_, ()> {

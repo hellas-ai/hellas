@@ -1,6 +1,42 @@
 use super::*;
 
 impl ChannelState {
+    fn check_result_payload(
+        &self,
+        job: &JobState,
+        result: &PaidJobResultV1,
+        transcript: &[u8],
+        metadata_only: bool,
+    ) -> Result<(), ChannelStateError> {
+        if result.work_id != job.work_id {
+            return Err(ChannelStateError::WrongChannel {
+                field: "result work_id",
+            });
+        }
+        if metadata_only {
+            return if transcript.is_empty() {
+                Ok(())
+            } else {
+                Err(ChannelStateError::Malformed)
+            };
+        }
+        let input = PreparedPaidWorkInput::decode(&job.prepared_input, MAX_RECORD_BYTES)
+            .map_err(PaidWorkError::from)?;
+        let budget = match &input {
+            PreparedPaidWorkInput::Fetch(_) => {
+                hellas_rpc::protocol::work_fetch::MAX_FETCH_TRANSCRIPT_BYTES
+            }
+            PreparedPaidWorkInput::Evaluate(_) => MAX_RECORD_BYTES,
+        };
+        let events = decode_transcript(transcript, budget)?;
+        if input.terminal_result(&self.channel, &job.authorization, &events)? != *result {
+            return Err(ChannelStateError::WrongChannel {
+                field: "result against its transcript",
+            });
+        }
+        Ok(())
+    }
+
     pub(super) fn new(
         channel: PaidChannel,
         settlement: WorkPaymentSettlement,
@@ -37,9 +73,10 @@ impl ChannelState {
         settlement: WorkPaymentSettlement,
         role: Role,
         verifier: &V,
+        metadata_only: bool,
     ) -> Result<Self, ChannelStateError> {
         let state = Self::decode_checkpoint(bytes, channel, settlement, role)?;
-        state.revalidate(verifier)?;
+        state.revalidate(verifier, metadata_only)?;
         Ok(state)
     }
 
@@ -51,7 +88,7 @@ impl ChannelState {
     /// the client's authorization, the provider's co-signature, the
     /// provider's result, and the client's binding and certificate. The
     /// result is rebuilt from the transcript beside it by
-    /// [`terminal_result`], exactly as a record replay rebuilds it. The
+    /// [`hellas_rpc::protocol::work::terminal_result`], exactly as a record replay rebuilds it. The
     /// inputs are hashed against the digest the authorization commits
     /// to. The retained close start is checked against this channel and
     /// this role, and the fixed answer is re-derived from the contest
@@ -64,7 +101,11 @@ impl ChannelState {
     /// is the one thing this does not claim, and it is the reason the
     /// deadline rules stay where they are — on the records, at the
     /// heights they were taken.
-    fn revalidate<V: SigVerifier>(&self, verifier: &V) -> Result<(), ChannelStateError> {
+    fn revalidate<V: SigVerifier>(
+        &self,
+        verifier: &V,
+        metadata_only: bool,
+    ) -> Result<(), ChannelStateError> {
         // The one number consensus sees, against the one terminal that
         // could have moved it. A ledger the terminal does not produce is
         // a channel that would credit a second payment.
@@ -77,7 +118,7 @@ impl ChannelState {
             if job.work_id != work_id(&self.channel, &job.authorization) {
                 return Err(ChannelStateError::WrongChannel { field: "work_id" });
             }
-            self.check_authorization(&job.authorization, &job.prepared_input)?;
+            self.check_authorization(&job.authorization, &job.prepared_input, metadata_only)?;
             if job.phase.only_role().is_some_and(|role| role != self.role)
                 || job.provider_signature.is_some() != (job.phase != JobPhase::HalfSigned)
                 || job.result.is_some() != job.phase.has_result()
@@ -110,12 +151,7 @@ impl ChannelState {
                 });
             }
             if let Some((result, provider_signature)) = &job.result {
-                let events = decode_transcript(&job.transcript, MAX_RECORD_BYTES)?;
-                if terminal_result(&self.channel, &job.authorization, &events)? != *result {
-                    return Err(ChannelStateError::WrongChannel {
-                        field: "result against its transcript",
-                    });
-                }
+                self.check_result_payload(job, result, &job.transcript, metadata_only)?;
                 if !verifier.verify_sig(
                     *provider_signature,
                     self.provider_key(),
@@ -552,6 +588,28 @@ impl ChannelState {
         }
     }
 
+    /// Whether this record would apply as [`Applied::Redundant`], answered
+    /// without cloning the state. Only checks that stay cheap at the largest
+    /// legal state belong here; anything else falls through to the full
+    /// [`Self::apply`], which decides.
+    pub(super) fn is_redundant(&self, record: &ChannelRecord) -> bool {
+        match record {
+            // The stream replay path commits a release per emitted frame,
+            // and every one after the first is redundant. Detecting that
+            // here keeps a full-state clone — transcript included — off
+            // the per-frame hot path. The arms mirror apply_plaintext:
+            // any doubt falls through to the full apply and its refusal.
+            ChannelRecord::PlaintextReleased { work_id } => {
+                self.role == Role::Provider
+                    && self
+                        .jobs
+                        .get(work_id)
+                        .is_some_and(|job| job.phase.delivered())
+            }
+            _ => false,
+        }
+    }
+
     /// Applies one record, or says why it may not be applied.
     ///
     /// Every rule this endpoint has is here, and replay runs it too, so
@@ -561,6 +619,7 @@ impl ChannelState {
         &mut self,
         record: &ChannelRecord,
         verifier: &V,
+        metadata_only: bool,
     ) -> Result<Applied, ChannelStateError> {
         match record {
             ChannelRecord::CursorAdvanced {
@@ -572,7 +631,13 @@ impl ChannelState {
                 authorization,
                 client_signature,
                 prepared_input,
-            } => self.apply_proposed(authorization, *client_signature, prepared_input, verifier),
+            } => self.apply_proposed(
+                authorization,
+                *client_signature,
+                prepared_input,
+                verifier,
+                metadata_only,
+            ),
             ChannelRecord::JobAccepted {
                 work_id,
                 provider_signature,
@@ -583,7 +648,14 @@ impl ChannelState {
                 result,
                 provider_signature,
                 transcript,
-            } => self.apply_result(*work_id, result, *provider_signature, transcript, verifier),
+            } => self.apply_result(
+                *work_id,
+                result,
+                *provider_signature,
+                transcript,
+                verifier,
+                metadata_only,
+            ),
             ChannelRecord::PlaintextReleased { work_id } => self.apply_plaintext(*work_id),
             ChannelRecord::ResultMatched { work_id } => self.apply_matched(*work_id),
             ChannelRecord::JobTerminated { work_id, outcome } => {
@@ -873,6 +945,7 @@ impl ChannelState {
         &self,
         authorization: &PaidJobAuthorizationV1,
         prepared_input: &[u8],
+        metadata_only: bool,
     ) -> Result<(), ChannelStateError> {
         let terms = self.channel.payment_terms();
         for (field, holds) in [
@@ -902,9 +975,16 @@ impl ChannelState {
         // The inputs this job will be executed from, against the digest
         // the authorization both parties sign commits to. A bundle that
         // does not hash to it is a job neither party agreed to run.
-        let bundle = PreparedPaidInputV1::decode(prepared_input, MAX_RECORD_BYTES)
+        if metadata_only {
+            return if prepared_input.is_empty() {
+                Ok(())
+            } else {
+                Err(ChannelStateError::Malformed)
+            };
+        }
+        let bundle = PreparedPaidWorkInput::decode(prepared_input, MAX_RECORD_BYTES)
             .map_err(PaidWorkError::from)?;
-        if prepared_input_digest(&self.channel, &bundle)?.as_bytes()
+        if bundle.digest(&self.channel)?.as_bytes()
             != authorization.prepared_input_digest.as_bytes()
         {
             return Err(ChannelStateError::Record(PaidWorkError::Mismatch {
@@ -958,6 +1038,7 @@ impl ChannelState {
         client_signature: Sig,
         prepared_input: &[u8],
         verifier: &V,
+        metadata_only: bool,
     ) -> Result<Applied, ChannelStateError> {
         let work_id = work_id(&self.channel, authorization);
         if let Some(job) = self.jobs.get(&work_id) {
@@ -978,7 +1059,7 @@ impl ChannelState {
         // whose payment no close could carry.
         self.refuse_if_closing("proposing a job")?;
 
-        self.check_authorization(authorization, prepared_input)?;
+        self.check_authorization(authorization, prepared_input, metadata_only)?;
         if authorization.proposal_nonce <= self.proposal_nonce_high_water {
             return Err(ChannelStateError::WrongChannel {
                 field: "proposal_nonce",
@@ -1088,7 +1169,7 @@ impl ChannelState {
     /// summarises.
     ///
     /// The rule that makes this more than a signature check is the
-    /// reproduction below: [`terminal_result`] is handed the stored
+    /// reproduction below: [`hellas_rpc::protocol::work::terminal_result`] is handed the stored
     /// events and this job's own authorization, and what it builds must
     /// be the result byte for byte. That establishes, on commit and on
     /// every replay, that the events are one verified signed chain for
@@ -1106,6 +1187,7 @@ impl ChannelState {
         provider_signature: Sig,
         transcript: &[u8],
         verifier: &V,
+        metadata_only: bool,
     ) -> Result<Applied, ChannelStateError> {
         let mut job = self.open_job(work_id, "recording a result")?;
         if let Some((held, signature)) = &job.result {
@@ -1159,12 +1241,7 @@ impl ChannelState {
             });
         }
 
-        let events = decode_transcript(transcript, MAX_RECORD_BYTES)?;
-        if terminal_result(&self.channel, &job.authorization, &events)? != *result {
-            return Err(ChannelStateError::WrongChannel {
-                field: "result against its transcript",
-            });
-        }
+        self.check_result_payload(&job, result, transcript, metadata_only)?;
         if !verifier.verify_sig(
             provider_signature,
             self.provider_key(),

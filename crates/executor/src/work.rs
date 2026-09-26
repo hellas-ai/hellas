@@ -2,7 +2,7 @@
 //!
 //! # What this is
 //!
-//! One implementation of [`PaidEvaluateBackend`], over this crate's own
+//! One implementation of [`PaidWorkBackend`], over this crate's own
 //! Evaluate engine. The gate that decides whether a backend may be
 //! called at all is [`hellas_work::work::run_accepted_work`]'s, and it is
 //! not here: it belongs beside the journal that records the decision,
@@ -44,7 +44,7 @@
 use crate::ExecutorError;
 use crate::executor::{ExecutorHandle, ExecutorOwedRequest};
 use hellas_rpc::OutputEventEnvelope;
-use hellas_work::work::{BackendFault, PaidEvaluateBackend, PaidProgress, PreparedEvaluateInput};
+use hellas_work::work::{BackendFault, PaidProgress, PaidWorkBackend, PreparedEvaluateInput};
 
 impl ExecutorHandle {
     /// Runs one already-authorized paid job to its terminal.
@@ -169,7 +169,36 @@ async fn drain_transcript_with_progress(
     }
 }
 
-impl PaidEvaluateBackend for ExecutorHandle {
+impl PaidWorkBackend for ExecutorHandle {
+    async fn fetch(
+        &self,
+        input: hellas_work::work::PreparedFetchInput,
+    ) -> Result<Vec<OutputEventEnvelope>, BackendFault> {
+        self.send_owed(|reply| ExecutorOwedRequest::RunPaidFetch {
+            span: hellas_rpc::request_span!(target: "hellas_request", "paid.executor.fetch"),
+            input: Box::new(input),
+            progress: None,
+            reply,
+        })
+        .await
+        .map_err(|error| BackendFault::new(error.to_string()))
+    }
+
+    async fn fetch_stream(
+        &self,
+        input: hellas_work::work::PreparedFetchInput,
+        progress: PaidProgress,
+    ) -> Result<Vec<OutputEventEnvelope>, BackendFault> {
+        self.send_owed(|reply| ExecutorOwedRequest::RunPaidFetch {
+            span: hellas_rpc::request_span!(target: "hellas_request", "paid.executor.fetch"),
+            input: Box::new(input),
+            progress: Some(progress),
+            reply,
+        })
+        .await
+        .map_err(|error| BackendFault::new(error.to_string()))
+    }
+
     async fn evaluate(
         &self,
         input: PreparedEvaluateInput,

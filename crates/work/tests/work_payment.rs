@@ -53,7 +53,7 @@ use hellas_rpc::{
 use hellas_wire::mux::MuxTransport;
 use hellas_wire::{Dispatcher, StreamTransport};
 use hellas_work::work::{
-    BackendFault, ClientEndpoint, PaidEvaluateBackend, PaymentError, PreparedEvaluateInput,
+    BackendFault, ClientEndpoint, PaidWorkBackend, PaymentError, PreparedEvaluateInput,
     ProviderEndpoint, RunError, RunOutcome, WorkRefusal, WorkService, admit_payment, fetch_result,
     run_accepted_work,
 };
@@ -167,7 +167,7 @@ fn descriptor() -> WorkChannelDescriptor {
         payment_terms: payment_terms(),
         policy_salt: SALT,
         channel_policy: channel_policy(),
-        execution_policy: execution_policy(),
+        execution_policy: execution_policy().into(),
         expected_payment_values: payment_values(),
     };
     match WorkChannelDescriptor::open(config) {
@@ -378,7 +378,7 @@ impl AnsweringBackend {
     }
 }
 
-impl PaidEvaluateBackend for AnsweringBackend {
+impl PaidWorkBackend for AnsweringBackend {
     fn evaluate(
         &self,
         input: PreparedEvaluateInput,
@@ -1159,4 +1159,158 @@ async fn a_defaulted_job_is_not_paid_for_as_well() {
             .expect("the endpoint is reachable"),
         PRICE,
     );
+}
+
+#[tokio::test]
+async fn stale_observation_blocks_new_money_but_preserves_retransmission() {
+    use hellas_work::work::{ClientChannel as _, ClientService, EndpointError};
+    let fixture = checked_job().await;
+    let mut client = ClientService::new(fixture.client);
+    let id = fixture.id;
+    assert!(matches!(
+        client.with_client(|endpoint| endpoint.pay(id)).unwrap(),
+        Err(PaymentError::Endpoint(EndpointError::ObservationStale))
+    ));
+    assert_eq!(
+        client
+            .with_state(|state| state.ledger().credited_cumulative())
+            .unwrap(),
+        0
+    );
+    client
+        .observer()
+        .observe_ready(
+            fixture.ready.clone(),
+            hellas_work::work::ObservationTime::now(),
+            std::time::Duration::from_secs(30),
+        )
+        .unwrap();
+    let request = client
+        .with_client(|endpoint| endpoint.pay(id))
+        .unwrap()
+        .unwrap();
+    client.observer().suspend().unwrap();
+    assert_eq!(
+        client
+            .with_client(|endpoint| endpoint.pay(id))
+            .unwrap()
+            .unwrap(),
+        request
+    );
+
+    fixture.service.require_observer().unwrap();
+    let refused = admit_response(&fixture.service, request.clone()).await;
+    assert_eq!(refusal_of(&refused), WorkRefusalCode::NotReady);
+    assert_nothing_credited(&fixture.service, "observer has not initialized").await;
+    fixture
+        .service
+        .observe_ready(
+            fixture.ready,
+            hellas_work::work::ObservationTime::now(),
+            std::time::Duration::from_secs(30),
+        )
+        .unwrap();
+    let accepted = admit_response(&fixture.service, request.clone()).await;
+    assert!(matches!(accepted.outcome, Some(AdmitOutcome::Paid(_))));
+    fixture.service.suspend().unwrap();
+    assert_eq!(admit_response(&fixture.service, request).await, accepted);
+    assert_eq!(
+        fixture
+            .service
+            .with_state(|state| state.ledger().credited_cumulative())
+            .unwrap(),
+        PRICE
+    );
+}
+
+#[tokio::test]
+async fn client_close_recovery_does_not_require_new_work_readiness() {
+    let mut fixture = checked_job().await;
+    fixture.client.pay(fixture.id).unwrap();
+    let start = fixture.client.prepare_close().unwrap();
+    drop(fixture.client);
+    let recovered_store = store_at(
+        fixture.client_root.path(),
+        &fixture.ready,
+        Role::Client,
+        CURSOR,
+    );
+    let mut recovered = ClientEndpoint::recover(recovered_store, client()).unwrap();
+    assert!(recovered.state().is_closing());
+    assert_eq!(recovered.prepare_close().unwrap(), start);
+    assert_eq!(recovered.state().max_executable_certificate(), PRICE);
+}
+
+#[tokio::test]
+async fn observed_close_and_payment_have_one_journal_order() {
+    use hellas_work::work::{ClientChannel as _, ClientService, ObservationTime};
+    use hellas_work::work_close::close_start;
+    for payment_first in [false, true] {
+        let fixture = checked_job().await;
+        let mut client = ClientService::new(fixture.client);
+        let observer = client.observer();
+        observer
+            .observe_ready(
+                fixture.ready.clone(),
+                ObservationTime::now(),
+                std::time::Duration::from_secs(30),
+            )
+            .unwrap();
+        let start = close_start(
+            fixture.ready.channel(),
+            hellas_kernel::Party::Maker,
+            CURSOR,
+            None,
+            &self::client(),
+        )
+        .unwrap();
+        let block = FinalizedWork {
+            height: CURSOR + 1,
+            parent: payload_at(CURSOR),
+            payload: payload_at(CURSOR + 1),
+            txs: vec![hellas_kernel::Tx::move_action(
+                hellas_kernel::Move::StartPaymentClose(start),
+            )],
+        };
+        if payment_first {
+            let request = client
+                .with_client(|endpoint| endpoint.pay(fixture.id))
+                .unwrap()
+                .unwrap();
+            let credited = admit_response(&fixture.service, request).await;
+            assert!(matches!(credited.outcome, Some(AdmitOutcome::Paid(_))));
+        }
+        observer.drive().unwrap().observe_finalized(&block).unwrap();
+        fixture
+            .service
+            .drive()
+            .unwrap()
+            .observe_finalized(&block)
+            .unwrap();
+        assert!(observer.with_state(|state| state.is_closing()).unwrap());
+        let retried = client
+            .with_client(|endpoint| endpoint.pay(fixture.id))
+            .unwrap();
+        if payment_first {
+            // Retrying the durable certificate is allowed after close observation.
+            let response = admit_response(&fixture.service, retried.unwrap()).await;
+            assert!(matches!(response.outcome, Some(AdmitOutcome::Paid(_))));
+        } else {
+            assert!(matches!(retried, Err(PaymentError::NoSuchJob)));
+        }
+        let expected = if payment_first { PRICE } else { 0 };
+        assert_eq!(
+            client
+                .with_state(|state| state.max_executable_certificate())
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            fixture
+                .service
+                .with_state(|state| state.max_executable_certificate())
+                .unwrap(),
+            expected
+        );
+    }
 }

@@ -208,6 +208,12 @@ impl Drop for IrohSendHalf {
 impl crate::transport::SendHalf for IrohSendHalf {
     type Error = std::io::Error;
 
+    async fn stopped(&mut self) {
+        if let Some(send) = self.send.as_mut() {
+            let _ = send.stopped().await;
+        }
+    }
+
     async fn send_body(&mut self, payload: Bytes) -> Result<(), Self::Error> {
         self.write_framed(Frame::Body(payload)).await
     }

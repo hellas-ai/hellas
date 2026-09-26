@@ -128,7 +128,7 @@ use hellas_rpc::{
 use hellas_wire::mux::{MessagePipe, MuxConfig, MuxTransport, Role as MuxRole};
 use hellas_wire::{DefaultClock, Dispatcher, StreamTransport as _, TransportContext};
 use hellas_work::work::{
-    BackendFault, ClientEndpoint, CloseEndpoint, JobProposal, PaidEvaluateBackend, PaymentError,
+    BackendFault, ClientEndpoint, CloseEndpoint, JobProposal, PaidWorkBackend, PaymentError,
     PreparedEvaluateInput, RunOutcome, WorkService, propose_work, run_accepted_work,
 };
 use hellas_work::work_close::{CloseProgress, TxSink, close_start};
@@ -396,7 +396,7 @@ fn provider_policy() -> ProviderChannelPolicy {
         network: TEST_NETWORK,
         policy_salt: SALT,
         channel_policy: channel_policy(),
-        execution_policy: execution_policy(),
+        execution_policy: execution_policy().into(),
         expected_payment_values: expected_values(),
         min_omit_response_blocks: hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
     }
@@ -409,7 +409,7 @@ fn descriptor(allocations: &[(SettlementKey, u64)]) -> WorkChannelDescriptor {
         payment_terms: payment_terms(allocations),
         policy_salt: SALT,
         channel_policy: channel_policy(),
-        execution_policy: execution_policy(),
+        execution_policy: execution_policy().into(),
         expected_payment_values: expected_values(),
     }) {
         Ok(descriptor) => descriptor,
@@ -901,7 +901,7 @@ struct ProviderBackend {
     prompt: Vec<u32>,
 }
 
-impl PaidEvaluateBackend for ProviderBackend {
+impl PaidWorkBackend for ProviderBackend {
     fn evaluate(
         &self,
         input: PreparedEvaluateInput,
@@ -1276,7 +1276,7 @@ async fn run_one_paid_job(devnet: &Devnet, opened: &mut Opened) -> u64 {
         calls: Arc::clone(&client_calls),
     };
     let proposal = JobProposal {
-        prepared_input: prepared_input(),
+        prepared_input: prepared_input().into(),
         deadlines: deadlines(),
     };
 

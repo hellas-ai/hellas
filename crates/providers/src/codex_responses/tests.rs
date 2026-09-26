@@ -645,6 +645,7 @@ fn model_head_and_lifecycle_claims_are_correlated_before_signing() {
     projector
         .begin(FetchProviderResponseHead {
             effective_model: Some("routed-model".to_string()),
+            http: None,
         })
         .unwrap();
     let events = vec![
@@ -663,6 +664,7 @@ fn model_head_and_lifecycle_claims_are_correlated_before_signing() {
     projector
         .begin(FetchProviderResponseHead {
             effective_model: Some("header-model".to_string()),
+            http: None,
         })
         .unwrap();
     let conflicting =

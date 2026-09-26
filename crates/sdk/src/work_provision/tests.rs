@@ -6,8 +6,8 @@ use hellas_rpc::protocol::work::{PaidChannelPolicyV1, PaidExecutionPolicyV1};
 use hellas_rpc::protocol::work_setup::ProviderChannelPolicy;
 use hellas_work::work_close::{BlockSourceError, FinalizedWork};
 
-use super::super::work_config::load_work_config;
 use super::*;
+use crate::work_config::load_work_config;
 
 fn network() -> NetworkId {
     let Some(network) = NetworkId::new("hellas-devnet") else {
@@ -66,7 +66,8 @@ fn policy() -> ProviderChannelPolicy {
             delivery_margin_blocks: 2,
             oracle_grace_blocks: 6,
             fixed_price: 10,
-        },
+        }
+        .into(),
         expected_payment_values: EdgeValues::new(1_000, 200, Fees::new(0, 0, 0, 0)),
         min_omit_response_blocks: MIN_OMIT_RESPONSE_BLOCKS,
     }
@@ -90,7 +91,7 @@ fn route(peer: u8, bond: EdgeId, client: Key) -> serde_json::Value {
 /// Loads routes through the production parser, so their duplicate-peer
 /// and duplicate-bond invariants are facts these provisioning tests use,
 /// not a test-only constructor that can make impossible route tables.
-fn routed_work_config(root: &Path, routes: Vec<serde_json::Value>) -> CliResult<WorkConfig> {
+fn routed_work_config(root: &Path, routes: Vec<serde_json::Value>) -> Result<WorkConfig> {
     let validators: Vec<String> = (1..=6)
         .map(|index| format!("http://127.0.0.1:900{index}"))
         .collect();
@@ -136,7 +137,7 @@ fn routed_work_config(root: &Path, routes: Vec<serde_json::Value>) -> CliResult<
     let path = root.join("work-config.json");
     fs::write(&path, file.to_string())
         .with_context(|| format!("the route fixture writes {}", path.display()))?;
-    load_work_config(&path)
+    Ok(load_work_config(&path)?)
 }
 
 fn options(root: &Path, max_job_price: u64) -> ProvisionOptions {
@@ -173,14 +174,14 @@ fn provision(
     root: &Path,
     policy: ProviderChannelPolicy,
     max_job_price: u64,
-) -> CliResult<Provisioned> {
+) -> Result<Provisioned> {
     provision_options(&options(root, max_job_price), policy)
 }
 
 fn provision_options(
     options: &ProvisionOptions,
     policy: ProviderChannelPolicy,
-) -> CliResult<Provisioned> {
+) -> Result<Provisioned> {
     let candidate = BondCandidate::plan(options)?;
     Offer::plan(options, policy, candidate)?.journal(floor())
 }
@@ -235,19 +236,17 @@ fn preview_and_real_offer_use_the_identical_bond_candidate() {
     let offer = Offer::plan(&options, policy(), candidate)
         .unwrap_or_else(|error| panic!("the routed offer plans: {error:#}"));
     assert_eq!(expected, expected_bond(40));
-    assert_eq!(offer.bond_edge, expected);
+    assert_eq!(offer.candidate.bond_edge, expected);
 }
 
-#[tokio::test]
-async fn preview_needs_neither_a_route_nor_a_chain_nor_a_journal() {
+#[test]
+fn preview_needs_neither_a_route_nor_a_chain_nor_a_journal() {
     let root = tempfile::tempdir().unwrap();
     let config = routed_work_config(root.path(), Vec::new())
         .unwrap_or_else(|error| panic!("a route-free config loads: {error:#}"));
-    let mut options = options_for(config, client().party_key(), &[0xa1], 40);
-    options.print_bond_only = true;
+    let options = options_for(config, client().party_key(), &[0xa1], 40);
 
-    run_provision(options)
-        .await
+    preview_bond(&options)
         .unwrap_or_else(|error| panic!("the isolated preview succeeds: {error:#}"));
     assert_eq!(
         provider_setups(root.path()),
