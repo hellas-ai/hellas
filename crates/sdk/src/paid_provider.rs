@@ -48,6 +48,8 @@ pub enum PaidProviderError {
     NoBackend,
     #[error("observer age must exceed a positive polling interval")]
     InvalidObservationPolicy,
+    #[error("the paid-work clock requires at least one validator")]
+    NoValidators,
     #[error(transparent)]
     Endpoint(#[from] hellas_work::work::EndpointError),
     #[error(transparent)]
@@ -707,6 +709,9 @@ impl WorkRunner {
         if config.poll.is_zero() || config.max_observation_age <= config.poll {
             return Err(PaidProviderError::InvalidObservationPolicy);
         }
+        if config.validators.is_empty() {
+            return Err(PaidProviderError::NoValidators);
+        }
         let consensus_verifier = ConsensusVerifier::new(&ConsensusInfo {
             validators: config.validators.clone(),
             threshold_identity: config.threshold_identity,
@@ -884,24 +889,28 @@ impl WorkRunner {
     pub async fn run(self, stop: oneshot::Receiver<()>) {
         let validators = self.validators.clone();
         let verifier = self.consensus_verifier.clone();
+        let next = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         self.run_over(stop, move || {
             let validators = validators.clone();
             let verifier = verifier.clone();
-            async move { connect_chain(&validators, verifier).await }
+            let next = next.clone();
+            async move { connect_chain(&validators, verifier, &next).await }
         })
         .await;
     }
 }
 
-/// Rotates the first candidate on reconnect. Chain reads and submissions use
-/// the selected verified connection.
+/// Rotates the first candidate on reconnect, per runner. Chain reads and
+/// submissions use the selected verified connection.
 async fn connect_chain(
     validators: &[String],
     verifier: ConsensusVerifier,
+    next: &std::sync::atomic::AtomicUsize,
 ) -> Option<ProductionWorkSource> {
-    static NEXT_VALIDATOR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let start =
-        NEXT_VALIDATOR.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % validators.len();
+    if validators.is_empty() {
+        return None;
+    }
+    let start = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % validators.len();
     for url in validators.iter().cycle().skip(start).take(validators.len()) {
         match VerifiedRemoteLightClient::connect(url.clone(), verifier.clone()).await {
             Ok(client) => {

@@ -53,6 +53,8 @@ pub struct WorkConfig {
     /// How often the watcher asks the chain for the next block.
     pub poll: Duration,
     /// Maximum time without new verified finalized progress before admission stops.
+    /// Renewal requires an advancing finalized height, so this must also fit
+    /// the deployment's block interval, not only the polling interval.
     pub max_observation_age: Duration,
     /// The payment edge's value, reserve, and close fees as this provider
     /// requires a client to fund them.
@@ -248,7 +250,7 @@ impl WorkConfigFile {
         hellas_chain::ConsensusVerifier::new(&hellas_chain::light_client::ConsensusInfo {
             validators: validators.clone(),
             threshold_identity: threshold_identity.clone(),
-            network_id: self.chain.network_id.clone(),
+            network_id: network.as_str().to_owned(),
         })?;
 
         let journal_root = self.journal.into_root()?;

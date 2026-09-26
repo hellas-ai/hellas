@@ -193,6 +193,11 @@ where
             }
             _ => anyhow::bail!("Fetch provider requires a paid Fetch policy"),
         }
+        anyhow::ensure!(
+            options.retained_transcript_capacity == 0,
+            "paid Fetch provider requires zero retained transcript capacity"
+        );
+        crate::work_config::validate_work_routes(config)?;
     }
     let producer_key = Arc::new(options.identity.caller_key().clone());
     let access = FetchAccessPolicy::trusted_callers(options.allowed_callers).with_store(
@@ -220,18 +225,6 @@ where
     let setup_mount = crate::paid_provider::MountedSetup::default();
     #[cfg(feature = "paid-work")]
     let work = if let Some(config) = options.paid_work {
-        anyhow::ensure!(
-            matches!(
-                config.execution_policy,
-                hellas_rpc::protocol::work_profile::PaidWorkPolicy::Fetch { .. }
-            ),
-            "Fetch provider requires a paid Fetch policy"
-        );
-        anyhow::ensure!(
-            options.retained_transcript_capacity == 0,
-            "paid Fetch provider requires zero retained transcript capacity"
-        );
-        crate::work_config::validate_work_routes(&config)?;
         let policy = config.provider_policy();
         let settlement_key = hellas_kernel::Secp256k1Signer::from_secret_scalar(
             options.identity.caller_secret_bytes(),
