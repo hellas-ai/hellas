@@ -176,6 +176,33 @@ async fn zdr_rejects_ambiguous_flags_retain_and_enabled_replay_before_disk_write
 }
 
 #[tokio::test]
+async fn zdr_rejects_compressed_store_true_before_forwarding() {
+    use std::io::Write as _;
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("must-not-exist");
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    encoder.write_all(b"{\"store\":true}").unwrap();
+    let body = encoder.finish().unwrap();
+    let response = router(&path, true, false)
+        .oneshot(
+            Request::post("/v1/test")
+                .header("content-encoding", "gzip")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap(),
+        "ZDR forbids store=true"
+    );
+    assert!(!path.exists());
+}
+
+#[tokio::test]
 async fn unavailable_archive_preserves_errors_and_recovers_on_the_next_request() {
     let root = tempfile::tempdir().unwrap();
     let archive = root.path().join("unavailable");

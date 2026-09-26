@@ -1,7 +1,46 @@
 //! Read routing hints without changing the bytes forwarded upstream.
 use axum::http::HeaderMap;
 use serde_json::Value;
+use std::borrow::Cow;
 use std::io::Read;
+
+/// Decodes a gzip/zstd request body the same way routing does, bounding the
+/// decoded size. Callers that make decisions on body contents must use this
+/// rather than the wire bytes, or a compressed body bypasses their check.
+pub(crate) fn decoded_body<'a>(
+    headers: &HeaderMap,
+    body: &'a [u8],
+) -> Result<Cow<'a, [u8]>, &'static str> {
+    let decode = |reader: &mut dyn Read| -> Result<Vec<u8>, &'static str> {
+        let mut output = Vec::new();
+        reader
+            .take(8 * 1024 * 1024 + 1)
+            .read_to_end(&mut output)
+            .map_err(|_| "invalid compressed request body")?;
+        if output.len() > 8 * 1024 * 1024 {
+            return Err("decoded request body exceeds limit");
+        }
+        Ok(output)
+    };
+    let encoding = headers
+        .get("content-encoding")
+        .map(|v| v.to_str().map(|s| s.trim().to_ascii_lowercase()))
+        .transpose()
+        .map_err(|_| "invalid request encoding")?;
+    Ok(match encoding.as_deref() {
+        None | Some("") | Some("identity") => Cow::Borrowed(body),
+        Some("gzip") => Cow::Owned(decode(&mut flate2::read::MultiGzDecoder::new(body))?),
+        Some("zstd") => {
+            let mut decoder = zstd::stream::read::Decoder::new(body)
+                .map_err(|_| "invalid compressed request body")?;
+            decoder
+                .window_log_max(23)
+                .map_err(|_| "invalid compressed request body")?;
+            Cow::Owned(decode(&mut decoder)?)
+        }
+        _ => return Err("unsupported request encoding for model routing"),
+    })
+}
 
 #[derive(Default)]
 pub(super) struct Hints {
@@ -13,44 +52,11 @@ pub(super) struct Hints {
 
 impl Hints {
     pub fn read(headers: &HeaderMap, body: &[u8]) -> Result<Self, &'static str> {
-        let decoded;
-        let decode = |reader: &mut dyn Read| -> Result<Vec<u8>, &'static str> {
-            let mut output = Vec::new();
-            reader
-                .take(8 * 1024 * 1024 + 1)
-                .read_to_end(&mut output)
-                .map_err(|_| "invalid compressed routing request")?;
-            if output.len() > 8 * 1024 * 1024 {
-                return Err("decoded routing request exceeds limit");
-            }
-            Ok(output)
-        };
-        let encoding = headers
-            .get("content-encoding")
-            .map(|v| v.to_str().map(|s| s.trim().to_ascii_lowercase()))
-            .transpose()
-            .map_err(|_| "invalid request encoding")?;
-        let bytes = match encoding.as_deref() {
-            None | Some("") | Some("identity") => body,
-            Some("gzip") => {
-                decoded = decode(&mut flate2::read::MultiGzDecoder::new(body))?;
-                &decoded
-            }
-            Some("zstd") => {
-                let mut decoder = zstd::stream::read::Decoder::new(body)
-                    .map_err(|_| "invalid compressed routing request")?;
-                decoder
-                    .window_log_max(23)
-                    .map_err(|_| "invalid compressed routing request")?;
-                decoded = decode(&mut decoder)?;
-                &decoded
-            }
-            _ => return Err("unsupported request encoding for model routing"),
-        };
+        let bytes = decoded_body(headers, body)?;
         let value = if bytes.is_empty() {
             Value::Null
         } else {
-            serde_json::from_slice::<Value>(bytes)
+            serde_json::from_slice::<Value>(&bytes)
                 .map_err(|_| "model routing requires a JSON request")?
         };
         fn field(value: Option<&Value>) -> Result<Option<String>, &'static str> {

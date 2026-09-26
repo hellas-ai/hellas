@@ -180,7 +180,9 @@ increment this counter.
 
 `x-hellas-zdr: true` disables application payload persistence for that request.
 `--zdr` enforces this for all requests. Ambiguous flags, `store: true`, and ZDR
-with inference caching enabled are rejected before archive writes. A non-ZDR
+with inference caching enabled are rejected before archive writes. The
+`store: true` check reads the decoded body, so a gzip or zstd request cannot
+smuggle the flag past it. A non-ZDR
 request may be archived even when its upstream `store` is false. Unauthorized,
 invalid ZDR requests and bodies exceeding the 2 MiB ingress limit are rejected
 without payload archives. Non-ZDR requests that pass ingress but exceed the

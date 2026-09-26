@@ -97,7 +97,13 @@ pub(crate) async fn record(
         Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
     };
     if ephemeral {
-        if serde_json::from_slice::<serde_json::Value>(&body)
+        // Decide retention on the decoded body: a compressed store=true must
+        // not slip past this check onto a retaining upstream.
+        let decoded = match super::http_fetch::affinity::decoded_body(&parts.headers, &body) {
+            Ok(decoded) => decoded,
+            Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+        };
+        if serde_json::from_slice::<serde_json::Value>(&decoded)
             .ok()
             .and_then(|value| value.get("store").cloned())
             == Some(json!(true))
