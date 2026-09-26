@@ -9,13 +9,6 @@ pub enum PaidClientError {
     InputMismatch(&'static str),
     #[error("paid-work state is missing: {0}")]
     MissingState(&'static str),
-    #[error(
-        "pending Fetch {work_id} lost its in-memory payload; channel remains reserved until payment deadline {payment_deadline}"
-    )]
-    MissingPayload {
-        work_id: hellas_rpc::Digest,
-        payment_deadline: u64,
-    },
     #[error("multiple active jobs match this prepared input")]
     AmbiguousRecovery,
     #[error("payment deadline elapsed during result delivery")]
@@ -24,8 +17,6 @@ pub enum PaidClientError {
     DeadlineOverflow { stage: &'static str },
     #[error("{stage} timed out; journals retain payment state")]
     Timeout { stage: &'static str },
-    #[error("no validators are configured")]
-    NoValidators,
     #[error("no configured validator answered ({0:?})")]
     ValidatorsUnavailable(Vec<(String, hellas_chain::QueryError)>),
     #[error("authenticated provider key differs from the payment channel")]

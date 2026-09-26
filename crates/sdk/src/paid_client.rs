@@ -453,6 +453,9 @@ impl PaidWorkSession {
     }
 
     /// Opens a close; the independent observer drives its finalized payout.
+    /// There is no deadline here: with the observer stopped or validators
+    /// unreachable this waits as long as the process runs. Callers that need
+    /// a bound should wrap it in one.
     pub async fn settle(&mut self) -> Result<u64> {
         if !self.client.with_state(|state| state.is_closing())? {
             self.client.with_client(|client| client.prepare_close())??;
@@ -523,6 +526,21 @@ impl PaidWorkSession {
         }
         let ready = client.readiness()?;
         if recover && *needs_recovery {
+            enum RecoveredJob {
+                /// The result was delivered, verified and committed before the
+                /// restart; only its payment is outstanding, and settling it
+                /// needs none of the payload a Fetch journal strips.
+                Delivered(hellas_rpc::protocol::Digest),
+                /// No payload and no result: the job can neither execute nor
+                /// settle. Its evidence is retained until the payment deadline
+                /// filters it out, without blocking every later request.
+                Unrecoverable(hellas_rpc::protocol::Digest),
+                Replay(
+                    hellas_rpc::protocol::Digest,
+                    hellas_work::work_store::JobPhase,
+                    PreparedPaidWorkInput,
+                ),
+            }
             let pending = client.with_state(|state| {
                 state
                     .jobs()
@@ -543,20 +561,38 @@ impl PaidWorkSession {
                     })
                     .map(|job| {
                         // Fetch journals retain accounting only. A restart cannot
-                        // reconstruct a lost request or authorize another execution.
+                        // reconstruct a lost request or authorize another
+                        // execution, but an already delivered result still
+                        // settles: signing payment needs no payload.
                         if job.prepared_input().is_empty() {
-                            return Err(PaidClientError::MissingPayload {
-                                work_id: job.work_id(),
-                                payment_deadline: job.authorization().payment_deadline,
+                            return Ok(if job.result().is_some() {
+                                RecoveredJob::Delivered(job.work_id())
+                            } else {
+                                RecoveredJob::Unrecoverable(job.work_id())
                             });
                         }
                         PreparedPaidWorkInput::decode(job.prepared_input(), MAX_RECORD_BYTES)
-                            .map(|input| (job.work_id(), job.phase(), input))
+                            .map(|input| RecoveredJob::Replay(job.work_id(), job.phase(), input))
                             .map_err(PaidClientError::from)
                     })
                     .collect::<Result<Vec<_>, _>>()
             })??;
-            for (work_id, phase, pending) in pending {
+            for recovered in pending {
+                let (work_id, phase, pending) = match recovered {
+                    RecoveredJob::Delivered(work_id) => {
+                        pay_for_result(dialer.work().await?, client, work_id).await?;
+                        continue;
+                    }
+                    RecoveredJob::Unrecoverable(work_id) => {
+                        tracing::warn!(
+                            %work_id,
+                            "retaining an unpaid job whose request payload is lost; \
+                             it can neither execute nor settle before its payment deadline"
+                        );
+                        continue;
+                    }
+                    RecoveredJob::Replay(work_id, phase, input) => (work_id, phase, input),
+                };
                 check_request(
                     &config.provider_policy(),
                     &pending,
@@ -596,7 +632,10 @@ impl PaidWorkSession {
             }
         }
         // Keep recovery armed across any error or cancellation after acceptance.
-        *needs_recovery = prepared.is_some();
+        // A caller that declined recovery keeps the flag for a later run.
+        if recover {
+            *needs_recovery = prepared.is_some();
+        }
         let result = match prepared {
             Some(prepared) => {
                 let ready = client.readiness()?;
@@ -621,7 +660,9 @@ impl PaidWorkSession {
             }
             None => None,
         };
-        *needs_recovery = false;
+        if recover {
+            *needs_recovery = false;
+        }
         Ok(result)
     }
 }
@@ -790,8 +831,10 @@ async fn execute_paid_job(
                 ready,
                 work_id,
                 |event| {
-                    emitted = true;
+                    // Output is only exposed when a user stream observes it;
+                    // recovery without one may safely retry after any event.
                     if let Some(progress) = progress {
+                        emitted = true;
                         progress(event.clone()).map_err(|error| {
                             hellas_rpc::protocol::work::PaidWorkError::Transcript(error.to_string())
                         })?;
@@ -992,6 +1035,7 @@ async fn collect_until_ready(
             Err(hellas_work::work::DeliverError::Refused { refusal, reason })
                 if refusal.is_retryable() =>
             {
+                check_payment_window(client, work_id)?;
                 tracing::debug!(%reason, "waiting for paid result");
                 tokio::time::sleep(poll.max(Duration::from_secs(1))).await;
             }
