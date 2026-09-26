@@ -89,7 +89,10 @@ observer fails or no new verified finalized height arrives within that age.
 Repeated reads of an old tip do not renew it. The bound starts before the chain
 read, not after it finishes, and readiness is published only after all intervening
 blocks have been applied. Results may still be retained during an observation
-outage; existing payment certificates remain safe to retransmit.
+outage; existing payment certificates remain safe to retransmit. Because renewal
+requires an *advancing* finalized height, this age should also exceed the
+deployment's block interval by a comfortable margin: a chain finalizing slower
+than the age spends every gap stale, and admission flaps on each block.
 
 This is an online channel: its observer must detect unilateral closes and submit
 any response within `omit_response_blocks`. Configure observation age, network

@@ -803,14 +803,17 @@ impl ProviderEndpoint {
     /// Decides whether the backend may be invoked for `work_id`, and
     /// makes that decision durable before it is returned.
     ///
-    /// [`RunAdmission::Invoke`] is returned only when the job was
+    /// [`RunAdmission::Invoke`] or [`RunAdmission::InvokeFetch`] is
+    /// returned only when the job was
     /// accepted and not yet running, and only after the running marker
     /// is on the disk — so a crash between the marker and the answer
     /// costs the invocation, never a second one. Every other phase past
     /// acceptance answers with what it already is: a job this process is
     /// running, a job whose result is already signed, or a job whose
     /// marker was found by a process that did not write it. A job that
-    /// was never co-signed is refused rather than answered.
+    /// was never co-signed is refused rather than answered. A job whose
+    /// input a metadata-only journal no longer holds is
+    /// [`RunAdmission::Indeterminate`]: it must not be executed again.
     ///
     /// `ready` is a *fresh* readiness decision, and the freshness is the
     /// caller's to owe in exactly the sense [`ReadyChannel`] already
@@ -945,6 +948,11 @@ impl ProviderEndpoint {
             .as_ref()
             .ok_or(EndpointError::NotAdmitting)?
             .clone();
+        // The last fresh readiness, deliberately not `admitting()`: a result
+        // signature commits nothing the payment path does not gate on its
+        // own freshness check, and refusing here would discard completed
+        // upstream work that the client may still pay for. Release and
+        // payment still require a fresh observation.
         let channel = ready.channel();
         let result = ready
             .execution_policy()
@@ -1753,6 +1761,12 @@ pub struct PreparedFetchInput {
 }
 
 impl PreparedFetchInput {
+    /// Builds an admitted input from its verified parts and channel policy.
+    #[must_use]
+    pub const fn new(parts: PreparedPaidFetchInputParts, policy: PaidFetchPolicyV1) -> Self {
+        Self { parts, policy }
+    }
+
     /// Returns the fixed output bounds the provider must enforce while running.
     pub const fn policy(&self) -> &PaidFetchPolicyV1 {
         &self.policy
@@ -2566,11 +2580,12 @@ impl WorkService {
 
     /// Revokes observer freshness without discarding results or close duties.
     pub fn suspend(&self) -> Result<(), EndpointError> {
-        self.endpoint()?
-            .observation
-            .get_or_insert_with(Observation::default)
-            .suspend();
-        self.changed.notify_waiters();
+        // An endpoint without an observer has no freshness to revoke;
+        // installing a defaulted one here would only close admission.
+        if let Some(observation) = self.endpoint()?.observation.as_mut() {
+            observation.suspend();
+            self.changed.notify_waiters();
+        }
         Ok(())
     }
 

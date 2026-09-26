@@ -588,6 +588,28 @@ impl ChannelState {
         }
     }
 
+    /// Whether this record would apply as [`Applied::Redundant`], answered
+    /// without cloning the state. Only checks that stay cheap at the largest
+    /// legal state belong here; anything else falls through to the full
+    /// [`Self::apply`], which decides.
+    pub(super) fn is_redundant(&self, record: &ChannelRecord) -> bool {
+        match record {
+            // The stream replay path commits a release per emitted frame,
+            // and every one after the first is redundant. Detecting that
+            // here keeps a full-state clone — transcript included — off
+            // the per-frame hot path. The arms mirror apply_plaintext:
+            // any doubt falls through to the full apply and its refusal.
+            ChannelRecord::PlaintextReleased { work_id } => {
+                self.role == Role::Provider
+                    && self
+                        .jobs
+                        .get(work_id)
+                        .is_some_and(|job| job.phase.delivered())
+            }
+            _ => false,
+        }
+    }
+
     /// Applies one record, or says why it may not be applied.
     ///
     /// Every rule this endpoint has is here, and replay runs it too, so

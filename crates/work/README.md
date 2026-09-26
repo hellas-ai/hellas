@@ -23,9 +23,12 @@ through Courtesy's transcript store or replay cache. Upstream and projection
 faults are reduced to fixed error messages before they reach the paid-work
 driver's logs.
 
-The client may store its own inputs and received responses. This policy covers
-application-managed provider storage; it does not establish the upstream API's
-retention policy or replace host memory/swap/crash-dump controls.
+Fetch channels open metadata-only journals on both endpoints: a client
+restart cannot reconstruct a lost request or replay a received response,
+though a delivered result's retained evidence still settles payment.
+This policy covers application-managed storage; it does not establish the
+upstream API's retention policy or replace host memory/swap/crash-dump
+controls.
 
 ## Restart behavior
 
@@ -141,8 +144,8 @@ rejects a weaker output scheme.
 
 A session serializes its jobs. After cancellation, recover the journal before
 admitting another job. Evaluate supports authenticated incremental token delivery;
-Fetch currently returns a complete bounded response. Client journals may retain
-payloads; the Fetch provider's journal remains metadata-only.
+Fetch currently returns a complete bounded response. Fetch journals are
+metadata-only on both endpoints; Evaluate client journals may retain payloads.
 
 Apple App Attest requires a provisioned, signed macOS host. `ProducerSigned`
 verifies the key and transcript but does not attest the binary. These are the

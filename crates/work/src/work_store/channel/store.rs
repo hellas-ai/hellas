@@ -173,8 +173,18 @@ impl ChannelStore {
         verifier: &V,
     ) -> Result<&ChannelState, WorkStoreError> {
         // Applied to a copy first: a record the rules refuse must leave
-        // neither the file nor the state touched.
+        // neither the file nor the state touched. A cheap exact check
+        // first: the stream replay path offers a redundant release per
+        // emitted frame, and the copy would clone the whole transcript.
+        if self.state.is_redundant(&record) {
+            return Ok(&self.state);
+        }
         let mut next = self.state.clone();
+        // The `false` keeps commit-time validation at full strength even
+        // for a metadata-only journal: bodies are verified — digest and
+        // transcript-to-result reproduction — before they are stripped
+        // from the bytes written. Only replay and checkpoint validation
+        // downgrade for body-less records.
         if next.apply(&record, verifier, false)? == Applied::Changed {
             // The signature this record carries leaves after this
             // returns, so the state that authorises it has to be one a
