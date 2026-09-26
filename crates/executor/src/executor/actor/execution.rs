@@ -62,7 +62,7 @@ use super::{
 /// Backpressure buffer for the per-execution event channel. The worker keeps
 /// one slot reserved for the terminal frame. Backpressure waits in the spawned
 /// provider task, leaving the execution actor free to admit and finish work.
-const PER_EXECUTION_CHANNEL_CAPACITY: usize = 64;
+pub(super) const PER_EXECUTION_CHANNEL_CAPACITY: usize = 64;
 const FETCH_STREAM_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 const FETCH_STREAM_STALLED_ERROR: &str =
     "fetch stream consumer did not drain its bounded event channel";
@@ -595,7 +595,7 @@ impl Executor {
         result.map_err(|error| error.to_string())
     }
 
-    fn retry_deferred_fetch_quota_cancellations(&mut self) {
+    pub(super) fn retry_deferred_fetch_quota_cancellations(&mut self) {
         let attempts = self
             .pending_fetch_quota_cancellations
             .len()
@@ -668,7 +668,7 @@ impl Executor {
         }
     }
 
-    fn retry_deferred_fetch_quota_settlements(&mut self) {
+    pub(super) fn retry_deferred_fetch_quota_settlements(&mut self) {
         let attempts = self
             .pending_fetch_quota_settlements
             .len()

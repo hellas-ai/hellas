@@ -456,6 +456,8 @@ impl Executor {
             ExecutorCompletion::PaidFetch { reply, result } => {
                 self.active_fetches = self.active_fetches.saturating_sub(1);
                 self.dispatch_next_fetch();
+                self.retry_deferred_fetch_quota_settlements();
+                self.retry_deferred_fetch_quota_cancellations();
                 let _ = reply.send(result);
                 false
             }
