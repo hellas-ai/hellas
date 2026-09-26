@@ -776,6 +776,12 @@ fn handler_signature(m: &MethodPlan) -> TokenStream {
         Shape::Unary => quote! { impl Into<crate::call::WithTrailer<#response>> + Send },
         _ => boxed_stream(response),
     };
+    // Every service carries the confidential-Open handshake method, named
+    // `open` in each package. A dispatcher that never mounted an OpenHandler
+    // must still answer it: refusing with Unavailable keeps a missing mount
+    // a runtime refusal for the peer instead of a compile error here. The
+    // match is on the bare method name, so any future `open` rpc in any
+    // package gets this same default.
     if fn_name == "open" {
         let allow_open_context_unused = if m.connection_bound {
             quote! { let _ = context; }

@@ -188,7 +188,9 @@ pub fn check_headers(headers: &[(String, String)], request: bool) -> Result<(), 
                     | "content-length"
                     | "transfer-encoding"
                     | "connection"
+                    | "keep-alive"
                     | "upgrade"
+                    | "proxy-authenticate"
                     | "proxy-authorization"
                     | "proxy-connection"
                     | "te"
@@ -226,7 +228,9 @@ impl HttpFetchResponse {
                     status,
                     headers,
                 })) if response.is_none() => {
-                    if !(100..=599).contains(&status) {
+                    // Only a final status can answer the job: an interim 1xx
+                    // is a hop artifact, not a completed paid response.
+                    if !(200..=599).contains(&status) {
                         return Err(HttpRequestError("response status"));
                     }
                     check_headers(&headers, false)?;

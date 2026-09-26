@@ -99,7 +99,15 @@ impl FetchRoutePolicy {
     /// exact hosts and required pins; the HTTPS driver checks certificates and addresses.
     #[must_use]
     pub fn open_fetch(require_spki_pin: bool, allowed_hosts: impl Into<Vec<String>>) -> Self {
-        let mut allowed_hosts = allowed_hosts.into();
+        // Admission compares against Url::host_str, which is lowercase
+        // punycode; normalize here so a host spelled with case or padding
+        // can still match, and drop entries that never could.
+        let mut allowed_hosts: Vec<String> = allowed_hosts
+            .into()
+            .into_iter()
+            .map(|host| host.trim().to_ascii_lowercase())
+            .filter(|host| !host.is_empty())
+            .collect();
         allowed_hosts.sort_unstable();
         allowed_hosts.dedup();
         Self::OpenFetch {
@@ -566,6 +574,18 @@ pub fn check_prepared_fetch_input(
         {
             return Err(PaidWorkError::Mismatch {
                 field: "open-fetch host or pin policy",
+            });
+        }
+        // A response cap the channel can never deliver would run the
+        // provider's upstream fetch and refuse the terminal at payment.
+        // Base64 body events carry at most three raw bytes per four
+        // payload bytes, so that bound is decidable before admission.
+        let deliverable = u64::from(policy.max_output_bytes) / 4 * 3;
+        if u64::from(request.max_response_bytes) > deliverable {
+            return Err(PaidWorkError::OverEnvelope {
+                field: "max_response_bytes",
+                actual: u64::from(request.max_response_bytes),
+                limit: deliverable,
             });
         }
     }

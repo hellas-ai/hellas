@@ -613,6 +613,9 @@ pub struct CloseDescriptor {
 
 /// First byte of the close descriptor stored in an armed setup record.
 const CLOSE_DESCRIPTOR_VERSION: u8 = 1;
+/// Version 2 length-prefixes the execution policy so the Fetch profile can
+/// extend it; v1 is the fixed-size Evaluate policy exactly.
+const CLOSE_DESCRIPTOR_VERSION_V2: u8 = 2;
 
 impl CloseDescriptor {
     /// Returns the payment channel, including both complete terms bodies and
@@ -676,7 +679,7 @@ impl CloseDescriptor {
         let version = if matches!(self.execution_policy, PaidWorkPolicy::Evaluate(_)) {
             CLOSE_DESCRIPTOR_VERSION
         } else {
-            2
+            CLOSE_DESCRIPTOR_VERSION_V2
         };
         let mut out = vec![version];
         push_kernel(&mut out, &self.channel.network());
@@ -688,7 +691,7 @@ impl CloseDescriptor {
         out.extend_from_slice(&self.policy_salt);
         out.extend_from_slice(&self.channel.channel_policy().encode());
         let policy_bytes = self.execution_policy.encode();
-        if version == 2 {
+        if version == CLOSE_DESCRIPTOR_VERSION_V2 {
             out.extend_from_slice(&(policy_bytes.len() as u64).to_be_bytes());
         }
         out.extend_from_slice(&policy_bytes);
@@ -707,7 +710,7 @@ impl CloseDescriptor {
     pub fn decode(bytes: &[u8]) -> Result<Self, WorkSetupError> {
         let mut cursor = CloseCursor { bytes };
         let version = cursor.byte()?;
-        if version != CLOSE_DESCRIPTOR_VERSION && version != 2 {
+        if version != CLOSE_DESCRIPTOR_VERSION && version != CLOSE_DESCRIPTOR_VERSION_V2 {
             return Err(WorkSetupError::DescriptorMalformed);
         }
         let network = cursor.network()?;
