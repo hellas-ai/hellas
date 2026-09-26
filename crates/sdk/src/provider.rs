@@ -16,7 +16,7 @@ use hellas_rpc::services::fetch::{Fetch, Open as FetchOpen};
 use hellas_rpc::{
     Assurance, OPEN_NONCE_LEN, ProviderEnrollmentBundle, PublicKey, RootProof, open_proof_binding,
 };
-use hellas_wire::iroh::IrohTransport;
+use hellas_wire::iroh::{IrohTransport, IrohTransportError};
 use hellas_wire::{
     Dispatcher, ServiceMarker, StreamTransport, TransportContext, WireCode, WireStatus,
 };
@@ -398,28 +398,29 @@ where
     })
 }
 
+/// Serves one connection until the peer leaves or a dispatch fails. Dispatch
+/// is deliberately unbounded here: streaming methods such as `StreamResult`
+/// stay open for the lifetime of a job and enforce their own application-level
+/// deadlines, so a wall-clock timeout at this layer would cancel paid work
+/// mid-delivery.
 async fn serve<S>(transport: Arc<IrohTransport>, server: S)
 where
     S: Dispatcher<IrohTransport> + Send + Sync + 'static,
-    S::Error: Send + Sync + 'static,
+    S::Error: std::fmt::Display + Send + Sync + 'static,
 {
     loop {
-        let incoming =
-            tokio::time::timeout(std::time::Duration::from_secs(120), transport.accept()).await;
-        match incoming {
-            Ok(Ok(Some(inbound))) => {
-                if !matches!(
-                    tokio::time::timeout(
-                        std::time::Duration::from_secs(30),
-                        server.dispatch(inbound)
-                    )
-                    .await,
-                    Ok(Ok(()))
-                ) {
+        match transport.accept().await {
+            Ok(Some(inbound)) => {
+                if let Err(error) = Dispatcher::<IrohTransport>::dispatch(&server, inbound).await {
+                    tracing::warn!(%error, "provider RPC failed");
                     break;
                 }
             }
-            _ => break,
+            Ok(None) | Err(IrohTransportError::Connection(_)) => break,
+            Err(error) => {
+                tracing::warn!(%error, "provider transport failed");
+                break;
+            }
         }
     }
 }
