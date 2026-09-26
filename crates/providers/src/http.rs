@@ -262,9 +262,27 @@ impl HttpFetchProvider {
         trace.status(response.status().as_u16());
         // A non-2xx status is still a completed HTTP exchange. Return it, with
         // its exact body, to the authenticated client; do not log it.
+        // The signed head carries end-to-end headers only: hop-by-hop and
+        // framing headers describe this connection, not the response, and a
+        // content-length could contradict the body the events actually carry.
         let headers = response
             .headers()
             .iter()
+            .filter(|(k, _)| {
+                !matches!(
+                    k.as_str(),
+                    "connection"
+                        | "keep-alive"
+                        | "proxy-authenticate"
+                        | "proxy-authorization"
+                        | "proxy-connection"
+                        | "te"
+                        | "trailer"
+                        | "transfer-encoding"
+                        | "upgrade"
+                        | "content-length"
+                )
+            })
             .map(|(k, v)| {
                 Ok((
                     k.to_string(),

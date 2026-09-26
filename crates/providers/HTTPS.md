@@ -96,7 +96,9 @@ OAuth and refresh-token persistence; Hellas does not interpret vendor logins.
 Resolved secrets are injected only for an exact authorized origin, path and method,
 with public WebPKI roots. Callers cannot override that account's header or
 change trust roots to impersonate its origin. Restrict paths to the inference
-endpoints the account is intended to expose.
+endpoints the account is intended to expose. Path restrictions do not cover
+query strings: if an API selects models or pricing through query parameters,
+a caller can still steer cost within an allowed path.
 
 DNS answers are resolved and checked on every request. Connections are reused
 only for the same origin, DNS address set, TLS roots/pins and credential alias.
@@ -126,6 +128,16 @@ route grants. On Gate's Run page, `http` is accepted as the execution environmen
 For CLI paid requests, `paid-work prepare-fetch --execution-environment http`
 prints the manifest ID to put in the work config.
 
+Generic HTTP responses carry no token usage, so a successful courtesy `http`
+request settles zero billable units: courtesy spend quotas (`max_units` per
+window) never accumulate on `http` routes, only concurrency is bounded. Paid
+channels are unaffected — they charge the payment policy's fixed price per job.
+If courtesy callers reach provider-funded accounts, bound their exposure with
+`fetch_max_in_flight`/queue limits, or require a paid channel.
+
 Results contain one `Adaptor.Http.Head` event followed by base64 body events
-and a signed terminal. `HttpFetchResponse::from_output` reconstructs the body
+and a signed terminal. Hop-by-hop and framing headers (`connection`,
+`transfer-encoding`, `content-length` and friends) describe the provider's own
+connection, so they are not part of the signed head; the body bytes are the
+only length truth. `HttpFetchResponse::from_output` reconstructs the body
 and checks ordering and size after transcript signature verification.
