@@ -1328,7 +1328,15 @@ async fn async_main() {
                     },
                     http_fetch: http_fetch_config
                         .map(|path| -> anyhow::Result<_> {
-                            Ok(serde_json::from_slice(&std::fs::read(path)?)?)
+                            // 4 MiB, the same bound the pool-file loader
+                            // takes from hellas-work, which this binary
+                            // links only in some feature builds.
+                            let bytes = commands::read_bounded_regular_file(
+                                &path,
+                                "HTTP gateway config",
+                                4 << 20,
+                            )?;
+                            Ok(serde_json::from_slice(&bytes)?)
                         })
                         .transpose()?,
                     output_cache: cache_options,

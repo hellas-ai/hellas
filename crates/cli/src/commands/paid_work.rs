@@ -19,11 +19,11 @@ use hellas_rpc::protocol::work_fetch::PreparedPaidFetchInputV1;
 use hellas_rpc::protocol::work_profile::PreparedPaidWorkInput;
 #[cfg(feature = "gateway")]
 use hellas_rpc::protocol::work_setup::ProviderChannelPolicy;
+#[cfg(test)]
+use hellas_sdk::paid_client::check_genesis_payload;
+use hellas_sdk::paid_client::{InputIdentities, PaidWorkSession, bind_paid_endpoint};
 #[cfg(feature = "gateway")]
-use hellas_sdk::paid_client::{
-    PaidWorkResult as PaidOutput, check_evaluate_input as check_policy_input,
-};
-use hellas_sdk::paid_client::{PaidWorkSession as OpenPaidChannel, bind_paid_endpoint};
+use hellas_sdk::paid_client::{PaidWorkResult, check_evaluate_input};
 use hellas_work::work_store::journal::MAX_RECORD_BYTES;
 use iroh::{EndpointId, SecretKey};
 use std::net::SocketAddr;
@@ -353,8 +353,6 @@ fn inspect_prepared(
     Ok(())
 }
 
-use hellas_sdk::paid_client::InputIdentities;
-
 async fn inspect_chain(validators: &[String]) -> CliResult<()> {
     anyhow::ensure!(
         validators.len() == 6,
@@ -441,13 +439,13 @@ async fn open_paid_channel(
     endpoint: iroh::Endpoint,
     settlement_key: Secp256k1Signer,
     assurance: hellas_rpc::Assurance,
-) -> CliResult<OpenPaidChannel> {
+) -> CliResult<PaidWorkSession> {
     anyhow::ensure!(
         !args.payment_coins.is_empty(),
         "at least one --payment-coin is required"
     );
     let provider_trust = paid_provider_trust(args, assurance)?;
-    OpenPaidChannel::open(
+    PaidWorkSession::open(
         hellas_sdk::paid_client::PaidWorkOptions {
             config: load_work_config(&args.work_config)?,
             journal_root: args.journal_root.clone(),
@@ -526,8 +524,6 @@ fn relative_deadlines(current: u64, args: &RunArgs) -> CliResult<JobDeadlines> {
     )
     .map_err(Into::into)
 }
-#[cfg(test)]
-use hellas_sdk::paid_client::check_genesis_payload;
 
 fn read_prepared_work_input(path: &Path) -> CliResult<PreparedPaidWorkInput> {
     let bytes = super::read_bounded_regular_file(path, "prepared paid input", MAX_RECORD_BYTES)?;

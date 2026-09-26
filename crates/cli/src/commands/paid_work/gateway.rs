@@ -77,7 +77,7 @@ trait GatewayEvent: Send + 'static {
     fn prefix(event: hellas_rpc::OutputEventEnvelope) -> CliResult<Self>
     where
         Self: Sized;
-    fn completed(output: PaidOutput) -> CliResult<Vec<Self>>
+    fn completed(output: PaidWorkResult) -> CliResult<Vec<Self>>
     where
         Self: Sized;
     fn is_terminal(&self) -> bool;
@@ -107,7 +107,7 @@ struct Provider {
     policy: ProviderChannelPolicy,
     assurance: hellas_rpc::Assurance,
     /// A setup/channel journal has a single owner even with concurrent HTTP calls.
-    serial: AsyncMutex<Option<OpenPaidChannel>>,
+    serial: AsyncMutex<Option<PaidWorkSession>>,
     pending: AtomicUsize,
     cache: Mutex<PrefixCache>,
     unavailable_until: Mutex<Option<Instant>>,
@@ -333,6 +333,8 @@ pub async fn load_gateway_backend(
             unavailable_until: Mutex::new(None),
         }));
         let provider = providers.last().expect("provider just added");
+        // Validated now so a bad pin fails startup before the gateway binds;
+        // the anchor itself is recomputed when the channel opens.
         paid_provider_trust(&provider.args, provider.assurance)?;
     }
     let gateway = Arc::new(PaidGateway {
@@ -383,7 +385,7 @@ impl PaidGateway {
         let eligible = self
             .providers
             .iter()
-            .filter(|provider| check_policy_input(&provider.policy, &prepared).is_ok())
+            .filter(|provider| check_evaluate_input(&provider.policy, &prepared).is_ok())
             .collect::<Vec<_>>();
         anyhow::ensure!(
             !eligible.is_empty(),
@@ -432,7 +434,9 @@ impl PaidGateway {
         let (sender, receiver) = mpsc::channel::<BufferedEvent<E>>(OUTPUT_BUFFER_EVENTS);
         let (overflow, overflow_receiver) = watch::channel(false);
         let output_budget = Arc::new(Semaphore::new(OUTPUT_BUFFER_BYTES));
-        let (initial_provider, _initial_route) = candidates.first().expect("paid provider exists");
+        let Some((initial_provider, _initial_route)) = candidates.first() else {
+            anyhow::bail!("paid gateway has no provider candidate");
+        };
         let span = hellas_rpc::request_span!(
             target: "hellas_request", "paid.gateway",
             hellas.provider.id = %initial_provider.args.provider,
@@ -917,7 +921,7 @@ fn prepare_request(
     ))
 }
 
-fn output_events(output: PaidOutput) -> CliResult<Vec<ExecutionEvent>> {
+fn output_events(output: PaidWorkResult) -> CliResult<Vec<ExecutionEvent>> {
     let events =
         hellas_rpc::protocol::work::decode_transcript(&output.transcript, MAX_RECORD_BYTES)?;
     let verified = hellas_rpc::evaluate::verify_output_events_for_producer(
@@ -968,7 +972,7 @@ impl GatewayEvent for ExecutionEvent {
             tokens: delta.token_bytes(),
         })
     }
-    fn completed(output: PaidOutput) -> CliResult<Vec<Self>> {
+    fn completed(output: PaidWorkResult) -> CliResult<Vec<Self>> {
         output_events(output)
     }
     fn is_terminal(&self) -> bool {
@@ -992,7 +996,7 @@ impl GatewayEvent for FetchEvent {
             event.payload(),
         )?)
     }
-    fn completed(output: PaidOutput) -> CliResult<Vec<Self>> {
+    fn completed(output: PaidWorkResult) -> CliResult<Vec<Self>> {
         let events = hellas_rpc::protocol::work::decode_transcript(
             &output.transcript,
             hellas_rpc::protocol::work_fetch::MAX_FETCH_TRANSCRIPT_BYTES,
