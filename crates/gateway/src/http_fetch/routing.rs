@@ -193,6 +193,9 @@ pub(super) struct Unavailable {
     pub message: &'static str,
     pub retry: Option<u64>,
     pub backend: Option<usize>,
+    /// Affinity that produced `backend`, matching `Selected::affinity`'s
+    /// vocabulary, for failure attribution. None when nothing was pinned.
+    pub affinity: Option<&'static str>,
 }
 
 impl Unavailable {
@@ -202,6 +205,7 @@ impl Unavailable {
             message,
             retry: None,
             backend: None,
+            affinity: None,
         }
     }
 
@@ -407,6 +411,13 @@ impl Routing {
         let (status, delay) = unavailable.expect("nonempty backend candidates");
         let mut failure = Unavailable::busy(status, delay);
         failure.backend = pinned;
+        failure.affinity = if !continuations.is_empty() {
+            Some("continuation")
+        } else if connection.is_some() {
+            Some("connection")
+        } else {
+            pinned.map(|_| "session")
+        };
         Err(failure)
     }
 

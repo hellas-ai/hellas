@@ -140,10 +140,16 @@ impl HttpRoute {
         incoming: &HeaderMap,
     ) -> anyhow::Result<HttpFetchRequest> {
         let mut headers = self.headers.clone();
+        // Connection values are ASCII by contract; a non-UTF-8 value still
+        // names its tokens, so parse lossily rather than silently keeping
+        // every header it named.
+        let values: Vec<String> = incoming
+            .get_all("connection")
+            .iter()
+            .map(|value| String::from_utf8_lossy(value.as_bytes()).into_owned())
+            .collect();
         let connection = connection_headers(
-            incoming
-                .iter()
-                .map(|(name, value)| (name.as_str(), value.to_str().unwrap_or_default())),
+            std::iter::repeat("connection").zip(values.iter().map(String::as_str)),
         );
         for (name, value) in incoming {
             let name = name.as_str();

@@ -1,5 +1,5 @@
 //! HTTP bytes over authenticated Fetch, without translating vendor schemas.
-mod affinity;
+pub(crate) mod affinity;
 mod config;
 mod observation;
 mod routing;
@@ -66,6 +66,12 @@ pub(super) async fn start(options: GatewayOptions) -> anyhow::Result<GatewayHand
         options.output_cache.policy == hellas_rpc::cache::CachePolicy::Off,
         "HTTP routes archive exchanges; inference replay must be off"
     );
+    if options.metrics_port.is_some() {
+        tracing::warn!(
+            "the Prometheus metrics endpoint is not served in HTTP Fetch mode; \
+             --metrics-port has no effect (otel metrics remain on the usual exporter)"
+        );
+    }
     let archive_policy = super::archive::Policy::new(options.archive.clone(), false);
     archive_policy.prepare();
     let routing = Arc::new(routing::Routing::new(&config, &paid.fetch_providers())?);
@@ -165,7 +171,7 @@ async fn handle(State(state): State<Arc<HttpState>>, request: Request) -> Respon
             }
             if let Some(backend) = failure.backend {
                 let name = &state.routing.backends[backend].name;
-                observed.backend(name, "session");
+                observed.backend(name, failure.affinity.unwrap_or("session"));
                 return attributed(response, name);
             }
             return response;
@@ -277,8 +283,11 @@ async fn handle(State(state): State<Arc<HttpState>>, request: Request) -> Respon
                     let bytes = hellas_rpc::http_fetch::decode_base64(&base64)
                         .map_err(|_| std::io::Error::other("invalid HTTP response encoding"))?;
                     size = size.saturating_add(bytes.len());
-                    if bytes.is_empty() || size > upstream.max_response_bytes as usize {
+                    if size > upstream.max_response_bytes as usize {
                         Err(std::io::Error::other("HTTP response exceeds Fetch limit"))?;
+                    }
+                    if bytes.is_empty() {
+                        continue;
                     }
                     observed.chunk(&bytes);
                     yield Bytes::from(bytes);
