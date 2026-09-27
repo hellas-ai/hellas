@@ -16,7 +16,7 @@ use hellas_rpc::services::fetch::{Fetch, Open as FetchOpen};
 use hellas_rpc::{
     Assurance, OPEN_NONCE_LEN, ProviderEnrollmentBundle, PublicKey, RootProof, open_proof_binding,
 };
-use hellas_wire::iroh::{IrohTransport, IrohTransportError};
+use hellas_wire::iroh::IrohTransport;
 use hellas_wire::{
     Dispatcher, ServiceMarker, StreamTransport, TransportContext, WireCode, WireStatus,
 };
@@ -233,6 +233,7 @@ where
         let runner = crate::paid_provider::WorkRunner::discover(
             crate::paid_provider::WorkRunnerConfig {
                 network: config.chain.network,
+                genesis_payload_digest: config.chain.genesis_payload_digest,
                 threshold_identity: config.chain.threshold_identity,
                 journal_root: config.journal_root,
                 routes: config.routes,
@@ -257,7 +258,13 @@ where
         root: options.root,
         enrollment: options.enrollment,
     };
-    let alpns = vec![<Fetch as ServiceMarker>::ALPN.as_bytes().to_vec()];
+    // A paid provider must not expose a second, unpaid route to the same
+    // upstream credentials, even when legacy Courtesy callers are configured.
+    let alpns = if has_paid_work {
+        Vec::new()
+    } else {
+        vec![<Fetch as ServiceMarker>::ALPN.as_bytes().to_vec()]
+    };
     #[cfg(feature = "paid-work")]
     let alpns = if has_paid_work {
         let mut alpns = alpns;
@@ -369,7 +376,7 @@ where
                     }
                     return;
                 }
-                if alpn != Fetch::ALPN.as_bytes() {
+                if has_paid_work || alpn != Fetch::ALPN.as_bytes() {
                     return;
                 }
                 let server = OpenDispatcher::<_, _, FetchOpen>::new(
@@ -396,27 +403,32 @@ where
 /// stay open for the lifetime of a job and enforce their own application-level
 /// deadlines, so a wall-clock timeout at this layer would cancel paid work
 /// mid-delivery.
-async fn serve<S>(transport: Arc<IrohTransport>, server: S)
+async fn serve<T, S>(transport: Arc<T>, server: S)
 where
-    S: Dispatcher<IrohTransport> + Send + Sync + 'static,
+    T: StreamTransport + Send + Sync + 'static,
+    T::Error: std::fmt::Display,
+    S: Dispatcher<T> + Send + Sync + 'static,
     S::Error: std::fmt::Display + Send + Sync + 'static,
 {
     loop {
         match transport.accept().await {
             Ok(Some(inbound)) => {
-                if let Err(error) = Dispatcher::<IrohTransport>::dispatch(&server, inbound).await {
+                if let Err(error) = Dispatcher::<T>::dispatch(&server, inbound).await {
                     tracing::warn!(%error, "provider RPC failed");
                     break;
                 }
             }
-            Ok(None) | Err(IrohTransportError::Connection(_)) => break,
+            Ok(None) => break,
             Err(error) => {
-                tracing::warn!(%error, "provider transport failed");
+                tracing::debug!(%error, "provider transport ended");
                 break;
             }
         }
     }
 }
+
+#[cfg(all(test, feature = "paid-work"))]
+mod tests;
 
 struct ProviderOpen<R> {
     root: Arc<R>,

@@ -58,3 +58,6 @@ pub mod paid_client;
 
 #[cfg(feature = "paid-work")]
 pub mod work_provision;
+
+#[cfg(all(test, feature = "paid-work"))]
+mod test_support;

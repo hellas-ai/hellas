@@ -809,6 +809,7 @@ impl Executor {
     }
 
     pub(super) fn dispatch_next_fetch(&mut self) {
+        self.dispatch_paid_fetches();
         while self.active_fetches < self.fetch_max_in_flight {
             let Some(pending) = self.pending_fetches.pop_front() else {
                 return;

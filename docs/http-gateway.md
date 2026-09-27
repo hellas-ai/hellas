@@ -62,6 +62,14 @@ only that accepted job can invoke the upstream. The credential's origin, path
 and method restrictions remain enforced by the provider. Courtesy caller grants
 do not authorize this HTTP path.
 
+The SDK Fetch provider advertises only Work and WorkSetup when configured for
+paid work; legacy allowed callers cannot reach its credentials through unpaid
+Fetch. Accepted paid Fetch jobs wait in a bounded provider queue when upstream
+concurrency is full. Further submissions wait at the executor mailbox while
+completion handling remains available. Provider validator connections check the
+configured genesis digest before advancing payment state; this check runs on
+connection, not per HTTP request.
+
 Signed response prefixes stream as they arrive. Successful HTTP completion
 follows verification of the complete result and the provider's durable payment
 acknowledgement. Each accepted valid terminal costs the channel's agreed fixed

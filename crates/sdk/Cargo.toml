@@ -74,4 +74,5 @@ tracing = { workspace = true, optional = true }
 url = { version = "2", optional = true }
 
 [dev-dependencies]
-tokio.workspace = true
+bytes.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

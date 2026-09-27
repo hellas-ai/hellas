@@ -110,8 +110,10 @@ providers or validators.
 Keep gateway and provider identities and journals across service restarts,
 including when the operating system's store is ephemeral. Startup recovers
 retained Evaluate jobs and re-sends payment certificates idempotently. Fetch
-journals omit bodies: a lost, unpaid Fetch payload cannot be recovered and keeps
-the channel reserved until its payment deadline. It is never submitted anew. Disconnecting an
+journals omit bodies. A verified delivery recorded before a crash is paid from
+its retained evidence, even when the payload is gone. Jobs without either payload
+or verified delivery retain their credit reservation until the payment deadline;
+recovery skips them and never submits them anew. Disconnecting an
 HTTP client cancels work that has not yet been proposed. Once a signed proposal
 may have reached a provider, collection and payment continue despite disconnects.
 The pool admits at most `max_pending_requests` queued or running requests (default

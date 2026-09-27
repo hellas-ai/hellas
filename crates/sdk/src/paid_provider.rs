@@ -50,6 +50,12 @@ pub enum PaidProviderError {
     InvalidObservationPolicy,
     #[error("the paid-work clock requires at least one validator")]
     NoValidators,
+    #[error("validator has no finalized block 1 for genesis authentication")]
+    MissingGenesis,
+    #[error("validator genesis does not match the configured payload digest")]
+    GenesisMismatch,
+    #[error(transparent)]
+    BlockSource(#[from] hellas_work::work_close::BlockSourceError),
     #[error(transparent)]
     Endpoint(#[from] hellas_work::work::EndpointError),
     #[error(transparent)]
@@ -137,6 +143,8 @@ impl WorkHandler for UnmountedWork {
 pub struct WorkRunnerConfig {
     /// The network the journals are keyed and the signatures bound to.
     pub network: NetworkId,
+    /// The parent payload digest authenticated by finalized block 1.
+    pub genesis_payload_digest: Digest,
     /// The threshold identity finalized blocks must authenticate under.
     pub threshold_identity: Vec<u8>,
     /// The configured root the setup journals live under.
@@ -683,6 +691,7 @@ pub struct WorkRunner {
     poll: Duration,
     validators: Vec<String>,
     consensus_verifier: ConsensusVerifier,
+    genesis_payload_digest: Digest,
 }
 
 impl WorkRunner {
@@ -797,6 +806,7 @@ impl WorkRunner {
             poll: config.poll,
             validators: config.validators,
             consensus_verifier,
+            genesis_payload_digest: config.genesis_payload_digest,
         })
     }
 
@@ -889,12 +899,13 @@ impl WorkRunner {
     pub async fn run(self, stop: oneshot::Receiver<()>) {
         let validators = self.validators.clone();
         let verifier = self.consensus_verifier.clone();
+        let genesis = self.genesis_payload_digest;
         let next = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         self.run_over(stop, move || {
             let validators = validators.clone();
             let verifier = verifier.clone();
             let next = next.clone();
-            async move { connect_chain(&validators, verifier, &next).await }
+            async move { connect_chain(&validators, verifier, genesis, &next).await }
         })
         .await;
     }
@@ -905,6 +916,7 @@ impl WorkRunner {
 async fn connect_chain(
     validators: &[String],
     verifier: ConsensusVerifier,
+    genesis: Digest,
     next: &std::sync::atomic::AtomicUsize,
 ) -> Option<ProductionWorkSource> {
     if validators.is_empty() {
@@ -914,11 +926,102 @@ async fn connect_chain(
     for url in validators.iter().cycle().skip(start).take(validators.len()) {
         match VerifiedRemoteLightClient::connect(url.clone(), verifier.clone()).await {
             Ok(client) => {
+                let source = WorkBlocks::new(client);
+                if let Err(error) = authenticate_genesis(&source, genesis).await {
+                    warn!(validator = %url, %error, "validator failed genesis authentication");
+                    continue;
+                }
                 info!(validator = %url, "the paid-work clock reads and submits here");
-                return Some(WorkBlocks::new(client));
+                return Some(source);
             }
             Err(error) => warn!(validator = %url, %error, "a configured validator did not answer"),
         }
     }
     None
+}
+
+async fn authenticate_genesis(
+    source: &impl FinalizedBlocks,
+    expected: Digest,
+) -> Result<(), PaidProviderError> {
+    let first = source
+        .block_at(1)
+        .await?
+        .ok_or(PaidProviderError::MissingGenesis)?;
+    if &first.parent != expected.as_bytes() {
+        return Err(PaidProviderError::GenesisMismatch);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hellas_work::work_close::{BlockSourceError, FinalizedWork};
+
+    struct Source(Result<Option<FinalizedWork>, BlockSourceError>);
+
+    impl FinalizedBlocks for Source {
+        async fn latest_height(&self) -> Result<Option<u64>, BlockSourceError> {
+            panic!("genesis authentication must request block 1 directly")
+        }
+
+        async fn block_at(&self, height: u64) -> Result<Option<FinalizedWork>, BlockSourceError> {
+            assert_eq!(height, 1);
+            self.0.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn validator_connection_requires_the_configured_genesis() {
+        let block = FinalizedWork {
+            height: 1,
+            parent: [7; 32],
+            payload: [8; 32],
+            txs: Vec::new(),
+        };
+        authenticate_genesis(&Source(Ok(Some(block.clone()))), [7; 32].into())
+            .await
+            .unwrap();
+        assert!(matches!(
+            authenticate_genesis(&Source(Ok(Some(block))), [9; 32].into()).await,
+            Err(PaidProviderError::GenesisMismatch)
+        ));
+        assert!(matches!(
+            authenticate_genesis(&Source(Ok(None)), [7; 32].into()).await,
+            Err(PaidProviderError::MissingGenesis)
+        ));
+        assert!(matches!(
+            authenticate_genesis(
+                &Source(Err(BlockSourceError::new("offline"))),
+                [7; 32].into()
+            )
+            .await,
+            Err(PaidProviderError::BlockSource(_))
+        ));
+    }
+
+    #[test]
+    fn missing_validators_are_rejected_before_discovering_journals() {
+        let fixture = crate::test_support::PaidFixture::new();
+        let config = &fixture.config;
+        let runner = WorkRunner::discover(
+            WorkRunnerConfig {
+                network: config.chain.network,
+                genesis_payload_digest: config.chain.genesis_payload_digest,
+                threshold_identity: config.chain.threshold_identity.clone(),
+                journal_root: config.journal_root.clone(),
+                routes: config.routes.clone(),
+                validators: Vec::new(),
+                poll: config.poll,
+                max_observation_age: config.max_observation_age,
+                settlement_key: crate::test_support::signer(2),
+                policy: config.provider_policy(),
+            },
+            MountedWork::default(),
+            MountedSetup::default(),
+        );
+        assert!(matches!(runner, Err(PaidProviderError::NoValidators)));
+        assert!(!config.journal_root.exists());
+    }
 }

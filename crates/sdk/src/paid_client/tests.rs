@@ -1,10 +1,8 @@
 use super::*;
+use crate::test_support::enrollment;
+mod recovery;
 use hellas_rpc::pb::execute::{OpenRequest, OpenResponse, open_response};
-use hellas_rpc::{
-    Assurance, Digest, PlatformCredential, PlatformEnrollment, ProducerSigningKey,
-    ProviderEnrollmentBundle, ProviderGenesisStatement, PublicKey, RootKind, RootProof,
-    SignedProviderGenesis,
-};
+use hellas_rpc::{Assurance, ProducerSigningKey, ProviderEnrollmentBundle, PublicKey};
 use hellas_wire::{MethodMarker, StreamTransport, WireStatus};
 
 #[tokio::test]
@@ -73,32 +71,6 @@ async fn insufficient_collateral_is_rejected_before_network_or_journal_creation(
     ));
     assert!(!journal_root.exists());
     endpoint.close().await;
-}
-
-fn enrollment(peer: EndpointId) -> (ProviderEnrollmentBundle, ProducerSigningKey) {
-    let root = ProducerSigningKey::from_secret_bytes([1; 32]).unwrap();
-    let producer = ProducerSigningKey::from_secret_bytes([2; 32]).unwrap();
-    let statement = ProviderGenesisStatement {
-        root_kind: RootKind::Software,
-        root_public_key: root.public_key(),
-        producer_public_key: producer.public_key(),
-        transport_public_key: PublicKey::Ed25519(*peer.as_bytes()),
-        platform_credential: PlatformCredential::Absent,
-        installation_nonce: [3; 32],
-    };
-    let proof = root
-        .sign_digest(Digest::hash(&statement.canonical_bytes()))
-        .unwrap();
-    (
-        ProviderEnrollmentBundle {
-            genesis: SignedProviderGenesis {
-                statement,
-                root_proof: RootProof::Software(proof),
-            },
-            platform: PlatformEnrollment::Absent,
-        },
-        producer,
-    )
 }
 
 async fn serve_open<M>(

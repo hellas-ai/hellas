@@ -66,6 +66,7 @@ struct InboxArbiter {
     preference: TrustedPreference,
     request_open: bool,
     owed_open: bool,
+    owed_paused: bool,
 }
 
 impl Default for InboxArbiter {
@@ -74,6 +75,7 @@ impl Default for InboxArbiter {
             preference: TrustedPreference::Owed,
             request_open: true,
             owed_open: true,
+            owed_paused: false,
         }
     }
 }
@@ -123,6 +125,7 @@ pub struct Executor {
     pub(super) fetch_routes: FetchRouteRegistry,
     pub(super) fetch_cache: Option<Arc<execution::cache::FetchCache>>,
     pub(super) pending_fetches: VecDeque<PendingFetch>,
+    pending_paid_fetches: VecDeque<paid_fetch::PendingPaidFetch>,
     pending_fetch_quota_cancellations: VecDeque<DeferredFetchQuotaCancellation>,
     pending_fetch_quota_settlements: VecDeque<DeferredFetchQuotaSettlement>,
     pub(super) fetch_max_in_flight: usize,
@@ -402,6 +405,7 @@ impl Executor {
             fetch_access_policy: config.fetch_access_policy,
             fetch_routes: config.fetch_routes,
             pending_fetches: VecDeque::new(),
+            pending_paid_fetches: VecDeque::new(),
             fetch_cache: execution::cache::FetchCache::open(config.output_cache)?,
             pending_fetch_quota_cancellations: VecDeque::new(),
             pending_fetch_quota_settlements: VecDeque::new(),
@@ -419,14 +423,18 @@ impl Executor {
 
     async fn run(mut self) {
         let mut arbiter = InboxArbiter::default();
-        while let Some(message) = recv_next(
-            &mut self.request_rx,
-            &mut self.owed_rx,
-            &mut self.completion_rx,
-            &mut arbiter,
-        )
-        .await
-        {
+        loop {
+            arbiter.owed_paused = self.pending_paid_fetches.len() >= EXECUTOR_OWED_MAILBOX_CAPACITY;
+            let Some(message) = recv_next(
+                &mut self.request_rx,
+                &mut self.owed_rx,
+                &mut self.completion_rx,
+                &mut arbiter,
+            )
+            .await
+            else {
+                break;
+            };
             match message {
                 ExecutorInbox::Completion(completion) => {
                     let evaluate_finished = self.handle_completion(completion).await;
@@ -475,6 +483,9 @@ impl Executor {
         let ready = self.owed_rx.len();
         let mut admitted = 0;
         for _ in 0..ready {
+            if self.pending_paid_fetches.len() >= EXECUTOR_OWED_MAILBOX_CAPACITY {
+                break;
+            }
             let Ok(request) = self.owed_rx.try_recv() else {
                 break;
             };
@@ -616,7 +627,7 @@ async fn recv_next(
             TrustedPreference::Owed => {
                 tokio::select! {
                     biased;
-                    owed = owed_rx.recv(), if arbiter.owed_open => {
+                    owed = owed_rx.recv(), if arbiter.owed_open && !arbiter.owed_paused => {
                         match owed {
                             Some(request) => Some(ExecutorInbox::Owed(request)),
                             None => {
@@ -645,7 +656,7 @@ async fn recv_next(
                     Some(completion) = completion_rx.recv() => {
                         Some(ExecutorInbox::Completion(completion))
                     }
-                    owed = owed_rx.recv(), if arbiter.owed_open => {
+                    owed = owed_rx.recv(), if arbiter.owed_open && !arbiter.owed_paused => {
                         match owed {
                             Some(request) => Some(ExecutorInbox::Owed(request)),
                             None => {
@@ -785,6 +796,7 @@ mod mailbox_tests {
             fetch_access_policy: FetchAccessPolicy::trusted_callers([caller]),
             fetch_routes: FetchRouteRegistry::default(),
             pending_fetches: VecDeque::new(),
+            pending_paid_fetches: VecDeque::new(),
             pending_fetch_quota_cancellations: VecDeque::new(),
             pending_fetch_quota_settlements: VecDeque::new(),
             fetch_max_in_flight: 1,

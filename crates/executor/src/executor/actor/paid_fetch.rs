@@ -14,15 +14,20 @@ use crate::executor::ExecutorCompletion;
 use crate::fetch_policy::FetchRoute;
 use crate::fetch_provider::FetchCall;
 
+pub(super) struct PendingPaidFetch {
+    input: PreparedFetchInput,
+    progress: Option<hellas_work::work::PaidProgress>,
+    reply: oneshot::Sender<Result<Vec<OutputEventEnvelope>, ExecutorError>>,
+    span: tracing::Span,
+}
+
 impl Executor {
     /// Admits one journaled paid Fetch, or refuses it before any provider
     /// work begins.
     ///
-    /// Capacity refusal is deliberately fail-fast: the work layer journals it
-    /// as that job's terminal failure rather than queueing, unlike paid
-    /// Evaluate, which waits for a dispatch slot. A paid burst beyond
-    /// `fetch_max_in_flight` therefore ends the excess jobs, so operators
-    /// should size the limit for paid bursts, not for average load.
+    /// Already accepted work waits in a bounded FIFO when dispatch is full.
+    /// Backpressure then reaches the owed mailbox; peer requests and completion
+    /// handling remain live while the upstream is busy.
     pub(super) fn start_paid_fetch(
         &mut self,
         input: PreparedFetchInput,
@@ -30,6 +35,15 @@ impl Executor {
         reply: oneshot::Sender<Result<Vec<OutputEventEnvelope>, ExecutorError>>,
         span: tracing::Span,
     ) {
+        if self.active_fetches >= self.fetch_max_in_flight {
+            self.pending_paid_fetches.push_back(PendingPaidFetch {
+                input,
+                progress,
+                reply,
+                span,
+            });
+            return;
+        }
         let prepared = self.prepare_paid_fetch(input);
         let (entry, session, request, policy) = match prepared {
             Ok(prepared) => prepared,
@@ -120,11 +134,6 @@ impl Executor {
         ),
         ExecutorError,
     > {
-        if self.active_fetches >= self.fetch_max_in_flight {
-            return Err(ExecutorError::ResourceExhausted(
-                "fetch concurrency limit reached".into(),
-            ));
-        }
         let policy = *input.policy();
         let parts = input.into_parts();
         let request = hellas_rpc::fetch::verify_input_events(&parts.fetch_input_transcript)
@@ -162,6 +171,16 @@ impl Executor {
                 ExecutorError::PolicyDenied("paid fetch exceeds route capabilities".into())
             })?;
         Ok((entry, session, request, policy))
+    }
+
+    pub(super) fn dispatch_paid_fetches(&mut self) {
+        while self.active_fetches < self.fetch_max_in_flight {
+            let Some(pending) = self.pending_paid_fetches.pop_front() else {
+                break;
+            };
+            // The durable invocation is owed even if its original waiter left.
+            self.start_paid_fetch(pending.input, pending.progress, pending.reply, pending.span);
+        }
     }
 }
 
@@ -595,7 +614,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn paid_fetch_at_capacity_fails_fast_instead_of_queueing() {
+    async fn paid_fetch_waits_for_capacity_without_blocking_the_actor() {
         let provider = BlockingFetchProvider::new(environment().manifest_id());
         let handle = spawn_executor(
             routes(
@@ -620,29 +639,101 @@ mod tests {
         .await
         .expect("first paid fetch reaches the provider");
 
-        // The single slot is occupied: the refusal must arrive while the
-        // first fetch is still blocked, not after it drains.
-        let second = run_paid_fetch(
-            &handle,
-            prepared_input(input_events(
-                Retention::Ephemeral,
-                Assurance::ProducerSigned,
-            )),
-            None,
-        )
-        .await;
-        assert!(
-            matches!(second, Err(ExecutorError::ResourceExhausted(error)) if error == "fetch concurrency limit reached")
-        );
+        let second = tokio::spawn({
+            let handle = handle.clone();
+            async move {
+                run_paid_fetch(
+                    &handle,
+                    prepared_input(input_events(
+                        Retention::Ephemeral,
+                        Assurance::ProducerSigned,
+                    )),
+                    None,
+                )
+                .await
+            }
+        });
+        // Peer-facing requests remain serviceable while both paid jobs wait.
+        timeout(Duration::from_secs(1), handle.get_stats_handle())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!second.is_finished());
+        assert_eq!(provider.started(), 1);
 
         provider.release();
         let output = first
             .await
             .expect("first paid fetch task completes")
             .expect("first paid fetch succeeds");
-        assert_eq!(provider.started(), 1);
+        second.await.unwrap().expect("queued paid fetch succeeds");
+        assert_eq!(provider.started(), 2);
         verify_output_events(first_commitment, Assurance::ProducerSigned, &output)
             .expect("first paid fetch output verifies");
+    }
+
+    #[tokio::test]
+    async fn full_paid_queue_backpressures_ingress_but_keeps_completions_live() {
+        timeout(Duration::from_secs(10), async {
+            let provider = BlockingFetchProvider::new(environment().manifest_id());
+            let handle = spawn_executor(
+                routes(
+                    Arc::new(provider.clone()),
+                    stub_adaptor(environment().manifest_id()),
+                    FetchRoutePolicy::default(),
+                ),
+                1,
+            )
+            .await;
+            let input = prepared_input(input_events(
+                Retention::Ephemeral,
+                Assurance::ProducerSigned,
+            ));
+            let request = |reply| crate::executor::ExecutorOwedRequest::RunPaidFetch {
+                span: tracing::Span::none(),
+                input: Box::new(input.clone()),
+                progress: None,
+                reply,
+            };
+            let (reply, first) = oneshot::channel();
+            handle.owed_tx.send(request(reply)).await.unwrap();
+            while provider.started() == 0 {
+                tokio::task::yield_now().await;
+            }
+            let mut pending = Vec::new();
+            // One bounded actor FIFO plus its bounded ingress mailbox.
+            for _ in 0..2 * super::super::EXECUTOR_OWED_MAILBOX_CAPACITY {
+                let (reply, result) = oneshot::channel();
+                handle.owed_tx.send(request(reply)).await.unwrap();
+                pending.push(result);
+            }
+            let (reply, last) = oneshot::channel();
+            let blocked = handle.owed_tx.send(request(reply));
+            tokio::pin!(blocked);
+            assert!(
+                timeout(Duration::from_millis(50), &mut blocked)
+                    .await
+                    .is_err()
+            );
+            handle.get_stats_handle().await.unwrap();
+            assert_eq!(handle.owed_tx.capacity(), 0);
+            assert_eq!(provider.started(), 1);
+            // An abandoned waiter cannot discard an already owed invocation.
+            drop(pending.pop().unwrap());
+            provider.release();
+            blocked.await.unwrap();
+            first.await.unwrap().unwrap();
+            for result in pending {
+                result.await.unwrap().unwrap();
+            }
+            last.await.unwrap().unwrap();
+            assert_eq!(
+                provider.started(),
+                2 + 2 * super::super::EXECUTOR_OWED_MAILBOX_CAPACITY
+            );
+        })
+        .await
+        .expect("queue drains once the upstream is available");
     }
 
     #[tokio::test]

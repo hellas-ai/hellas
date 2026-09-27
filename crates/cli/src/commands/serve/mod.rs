@@ -165,6 +165,7 @@ async fn run_with_store(
         );
         work_runner = Some(node::WorkRunnerConfig {
             network: work.chain.network,
+            genesis_payload_digest: work.chain.genesis_payload_digest,
             threshold_identity: work.chain.threshold_identity.clone(),
             journal_root: work.journal_root.clone(),
             routes: work.routes.clone(),

@@ -619,13 +619,14 @@ async fn two_vouched_peers_receive_their_distinct_configured_offers() {
     let runner = WorkRunner::discover(
         WorkRunnerConfig {
             network: network(),
+            genesis_payload_digest: [0; 32].into(),
             threshold_identity: threshold_identity(),
             journal_root: dir.path().to_path_buf(),
             routes: configured_routes(&[
                 (first_peer, first.bond_edge(), first.client().party_key()),
                 (second_peer, second.bond_edge(), second.client().party_key()),
             ]),
-            validators: Vec::new(),
+            validators: vec!["ws://unused.invalid".to_owned()],
             poll: Duration::from_millis(1),
             max_observation_age: Duration::from_secs(5),
             settlement_key: provider(),
@@ -723,6 +724,7 @@ fn discover_two_route_runner(
     match WorkRunner::discover(
         WorkRunnerConfig {
             network: network(),
+            genesis_payload_digest: [0; 32].into(),
             threshold_identity: threshold_identity(),
             journal_root: root.to_path_buf(),
             routes: configured_routes(&[
@@ -737,7 +739,7 @@ fn discover_two_route_runner(
                     second.client().party_key(),
                 ),
             ]),
-            validators: Vec::new(),
+            validators: vec!["ws://unused.invalid".to_owned()],
             poll: Duration::from_millis(1),
             max_observation_age: Duration::from_secs(5),
             settlement_key: provider(),
@@ -2477,10 +2479,11 @@ fn runner(root: &Path, policy: ProviderChannelPolicy, mount: &MountedWork) -> Wo
     match WorkRunner::discover(
         WorkRunnerConfig {
             network: network(),
+            genesis_payload_digest: [0; 32].into(),
             threshold_identity: threshold_identity(),
             journal_root: root.to_path_buf(),
             routes: configured_routes(&[(default_route_peer(), bond_edge(), client().party_key())]),
-            validators: Vec::new(),
+            validators: vec!["ws://unused.invalid".to_owned()],
             poll: Duration::from_millis(1),
             max_observation_age: Duration::from_secs(5),
             settlement_key: provider(),
@@ -2962,10 +2965,11 @@ impl RunningPaidNode {
         let runner = match WorkRunner::discover(
             WorkRunnerConfig {
                 network: network(),
+                genesis_payload_digest: [0; 32].into(),
                 threshold_identity: threshold_identity(),
                 journal_root: root.to_path_buf(),
                 routes: configured_routes(&[(peer, bond_edge(), client().party_key())]),
-                validators: Vec::new(),
+                validators: vec!["ws://unused.invalid".to_owned()],
                 poll: Duration::from_millis(1),
                 max_observation_age: Duration::from_secs(5),
                 settlement_key: provider(),
