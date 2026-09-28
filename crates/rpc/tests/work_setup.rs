@@ -116,7 +116,7 @@ fn config() -> WorkChannelConfig {
         payment_terms: payment_terms(),
         policy_salt: SALT,
         channel_policy: channel_policy(),
-        execution_policy: execution_policy(),
+        execution_policy: execution_policy().into(),
         expected_payment_values: payment_values(),
     }
 }
@@ -375,7 +375,12 @@ fn a_descriptor_opens_only_against_its_own_committed_policy() {
     );
 
     let mut zero_price = config();
-    zero_price.execution_policy.fixed_price = 0;
+    let hellas_rpc::protocol::work_profile::PaidWorkPolicy::Evaluate(policy) =
+        &mut zero_price.execution_policy
+    else {
+        panic!("fixture uses Evaluate");
+    };
+    policy.fixed_price = 0;
     assert_eq!(
         WorkChannelDescriptor::open(zero_price),
         Err(WorkSetupError::Record(PaidWorkError::PolicyZero {

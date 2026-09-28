@@ -11,8 +11,9 @@
 //! upstream credentials, and access policy remain provider-local and are
 //! deliberately absent from this root.
 //! Selecting the upstream destination is trusted execution semantics, so every
-//! built-in root commits an exact HTTPS endpoint and driver contract. The
-//! service at that endpoint and every response claim remain adversarial input.
+//! built-in root commits a driver contract. Sealed roots fix the endpoint; the
+//! HTTP root interprets the URL and TLS policy in the caller-signed request.
+//! The upstream service and every response claim remain adversarial input.
 
 use crate::{Application, ContentId, DagCborEncoder, ProgramManifest};
 
@@ -41,11 +42,13 @@ const FETCH_ENVIRONMENT_DOMAIN: &str = "hellas.fetch.environment.v1";
 
 /// An exact built-in request/response transformation and its trusted config.
 ///
-/// The first version has no configurable trusted inputs: its complete
-/// behaviour is compiled into the attested application. Adding trusted config
-/// later requires a new canonical variant (and therefore a new manifest ID).
+/// Each variant fixes the interpreter compiled into the attested application.
+/// The HTTP interpreter binds request-selected destinations and TLS settings
+/// through the signed input; it does not enumerate upstream vendors.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FetchEnvironment {
+    /// HTTPS to the signed URL with selected trust roots and optional SPKI pins.
+    Http,
     /// Build an official Codex Responses request, send it only to the fixed
     /// ChatGPT Codex endpoint, and project its SSE response.
     CodexResponses,
@@ -61,6 +64,7 @@ impl FetchEnvironment {
     #[must_use]
     pub const fn adaptor(self) -> &'static str {
         match self {
+            Self::Http => "http-0.0.1",
             Self::CodexResponses => CODEX_RESPONSES_ADAPTOR,
             Self::OpenAiResponses => OPENAI_RESPONSES_ADAPTOR,
         }
@@ -70,6 +74,7 @@ impl FetchEnvironment {
     #[must_use]
     pub const fn driver(self) -> &'static str {
         match self {
+            Self::Http => "https-request-roots-and-spki-no-redirect-0.0.1",
             Self::CodexResponses => CODEX_RESPONSES_DRIVER,
             Self::OpenAiResponses => OPENAI_RESPONSES_DRIVER,
         }
@@ -79,6 +84,7 @@ impl FetchEnvironment {
     #[must_use]
     pub const fn endpoint(self) -> &'static str {
         match self {
+            Self::Http => "caller-signed:https-url",
             Self::CodexResponses => CODEX_RESPONSES_ENDPOINT,
             Self::OpenAiResponses => OPENAI_RESPONSES_ENDPOINT,
         }
@@ -111,6 +117,11 @@ impl FetchEnvironment {
         decoder.finish()?;
 
         let environment = match (adaptor, driver, endpoint) {
+            (
+                "http-0.0.1",
+                "https-request-roots-and-spki-no-redirect-0.0.1",
+                "caller-signed:https-url",
+            ) => Self::Http,
             (CODEX_RESPONSES_ADAPTOR, CODEX_RESPONSES_DRIVER, CODEX_RESPONSES_ENDPOINT) => {
                 Self::CodexResponses
             }

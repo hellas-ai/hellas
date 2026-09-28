@@ -333,7 +333,8 @@ pub fn build_client_registry(endpoint: &::iroh::Endpoint) -> ClientResult<Client
     })
 }
 
-async fn confidential_open<M>(
+/// Authenticates a provider on this live connection before disclosing a request.
+pub async fn confidential_open<M>(
     transport: &IrohTransport,
     trust: &ProviderTrustAnchor,
 ) -> ClientResult<PublicKey>

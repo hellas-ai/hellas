@@ -22,13 +22,9 @@ mod linux {
 /// is configured with `kill_on_drop(true)` so dropping the returned `Child`
 /// (e.g. on gateway shutdown) tears it down too.
 ///
-/// The gateway's routes require this run's credential, so the child is
-/// handed it in the two environment variables whose clients put it in
-/// `Authorization: Bearer …` — `OPENAI_API_KEY` and, for Anthropic
-/// clients, `ANTHROPIC_AUTH_TOKEN` rather than `ANTHROPIC_API_KEY`, which
-/// would send `x-api-key` and be refused. Both overwrite whatever the
-/// operator had: the base URL already points at us, so an upstream key
-/// would be the wrong secret to send anyway.
+/// OpenAI, Anthropic and Kimi clients receive the gateway URL and its bearer
+/// credential through their environment overrides. Anthropic uses
+/// `ANTHROPIC_AUTH_TOKEN` so it sends the required Authorization header.
 pub fn spawn(
     cmd: &str,
     args: &[String],
@@ -42,6 +38,8 @@ pub fn spawn(
         .env("ANTHROPIC_BASE_URL", base_url)
         .env("OPENAI_API_KEY", credential)
         .env("ANTHROPIC_AUTH_TOKEN", credential)
+        .env("KIMI_MODEL_BASE_URL", format!("{base_url}/v1"))
+        .env("KIMI_MODEL_API_KEY", credential)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())

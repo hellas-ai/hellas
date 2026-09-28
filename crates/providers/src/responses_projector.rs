@@ -35,6 +35,9 @@ impl FetchAdaptorFactory for ResponsesFetchAdaptorFactory {
     }
 
     fn create(&self, request: &FetchCall) -> Result<FetchAdaptorSession, FetchAdaptorError> {
+        if self.environment == FetchEnvironment::Http {
+            return Err(fetch_failed("HTTP requires the HTTP adaptor"));
+        }
         if self.environment == FetchEnvironment::CodexResponses {
             return super::codex_responses::create_session(request);
         }

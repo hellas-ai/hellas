@@ -250,7 +250,11 @@ fn verifier_bounds_retained_streamed_event_count() {
         .verify_chunk(builder.push_event(Vec::new()).unwrap())
         .unwrap_err();
 
-    assert!(error.to_string().contains("4095-chunk limit"));
+    assert!(
+        error
+            .to_string()
+            .contains(&format!("{}-chunk limit", MAX_FETCH_OUTPUT_EVENTS - 1))
+    );
     assert_eq!(verifier.events.len(), MAX_FETCH_OUTPUT_EVENTS - 1);
 }
 
@@ -274,11 +278,9 @@ fn verifier_bounds_retained_streamed_payload_bytes() {
         .verify_chunk(builder.push_event(vec![1]).unwrap())
         .unwrap_err();
 
-    assert!(
-        error
-            .to_string()
-            .contains("2097152-byte signed payload limit")
-    );
+    assert!(error.to_string().contains(&format!(
+        "{MAX_FETCH_OUTPUT_PAYLOAD_BYTES}-byte signed payload limit"
+    )));
     assert_eq!(verifier.events.len(), 1);
     assert_eq!(
         verifier.next_position,

@@ -165,11 +165,13 @@ async fn run_with_store(
         );
         work_runner = Some(node::WorkRunnerConfig {
             network: work.chain.network,
+            genesis_payload_digest: work.chain.genesis_payload_digest,
             threshold_identity: work.chain.threshold_identity.clone(),
             journal_root: work.journal_root.clone(),
             routes: work.routes.clone(),
             validators: work.validators.clone(),
             poll: work.poll,
+            max_observation_age: work.max_observation_age,
             settlement_key: options.settlement_key.clone(),
             policy: work.provider_policy(),
         });
@@ -350,6 +352,10 @@ struct FetchConfigRoute {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
 enum FetchDestination {
+    /// Caller-signed HTTPS URL and TLS settings with operator-owned account aliases.
+    Http {
+        config: hellas_providers::HttpProviderConfig,
+    },
     /// Official Codex Responses, authenticated by the local Codex OAuth store.
     CodexResponses {
         #[serde(default)]
@@ -371,6 +377,7 @@ impl FetchDestination {
     fn into_entry(self, capabilities: FetchRoutePolicy) -> CliResult<FetchRouteEntry> {
         let (environment, provider): (FetchEnvironment, Arc<dyn hellas_executor::FetchProvider>) =
             match self {
+                Self::Http { config } => return Ok(config.into_entry(capabilities)?),
                 Self::CodexResponses { auth_path } => (
                     FetchEnvironment::CodexResponses,
                     Arc::new(codex_provider::CodexResponsesFetchProvider::new(

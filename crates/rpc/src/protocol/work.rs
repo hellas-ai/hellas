@@ -72,13 +72,16 @@ const FORMAT_VERSION: u8 = 1;
 ///
 /// These are RPC-protocol tags. They are not kernel canonical tags and
 /// they are never accepted L1 bytes; the numbers are local to this
-/// module and shared only between the two endpoints.
-mod tag {
-    pub(super) const PAID_CHANNEL_POLICY: u8 = 0;
-    pub(super) const PAID_EXECUTION_POLICY: u8 = 1;
-    pub(super) const PAID_JOB_AUTHORIZATION: u8 = 2;
-    pub(super) const PAID_JOB_RESULT: u8 = 3;
-    pub(super) const PAYMENT_BINDING: u8 = 4;
+/// module and shared only between the two endpoints. The fetch profile's
+/// policy record ([`super::work_fetch`]) takes its tag from this same
+/// registry, so two profiles can never assign one number.
+pub(crate) mod tag {
+    pub(crate) const PAID_CHANNEL_POLICY: u8 = 0;
+    pub(crate) const PAID_EXECUTION_POLICY: u8 = 1;
+    pub(crate) const PAID_JOB_AUTHORIZATION: u8 = 2;
+    pub(crate) const PAID_JOB_RESULT: u8 = 3;
+    pub(crate) const PAYMENT_BINDING: u8 = 4;
+    pub(crate) const PAID_FETCH_POLICY: u8 = 5;
 }
 
 /// Bytes the envelope occupies: `format_version:u8 || record_tag:u8`.
@@ -564,11 +567,11 @@ impl PrivateRecord for PaymentBindingV1 {
 
 // ── Body reading and writing ──────────────────────────────────────────
 
-fn put_u32(out: &mut Vec<u8>, value: u32) {
+pub(crate) fn put_u32(out: &mut Vec<u8>, value: u32) {
     out.extend_from_slice(&value.to_be_bytes());
 }
 
-fn put_u64(out: &mut Vec<u8>, value: u64) {
+pub(crate) fn put_u64(out: &mut Vec<u8>, value: u64) {
     out.extend_from_slice(&value.to_be_bytes());
 }
 
@@ -597,7 +600,7 @@ impl BodyReader<'_> {
         Ok(out)
     }
 
-    fn bytes32(&mut self) -> Result<[u8; 32], PaidWorkError> {
+    pub(crate) fn bytes32(&mut self) -> Result<[u8; 32], PaidWorkError> {
         self.take::<32>()
     }
 
@@ -605,11 +608,11 @@ impl BodyReader<'_> {
         self.take::<2>().map(u16::from_be_bytes)
     }
 
-    fn u32(&mut self) -> Result<u32, PaidWorkError> {
+    pub(crate) fn u32(&mut self) -> Result<u32, PaidWorkError> {
         self.take::<4>().map(u32::from_be_bytes)
     }
 
-    fn u64(&mut self) -> Result<u64, PaidWorkError> {
+    pub(crate) fn u64(&mut self) -> Result<u64, PaidWorkError> {
         self.take::<8>().map(u64::from_be_bytes)
     }
 }
@@ -623,13 +626,13 @@ impl BodyReader<'_> {
 /// digests are the same bytes inside a kernel authorization hash. The
 /// length prefix is why a two-character id followed by a channel cannot
 /// hash like a one-character id followed by a different one.
-struct EncodedNetwork {
+pub(crate) struct EncodedNetwork {
     bytes: [u8; <NetworkId as Encode>::MAX_ENCODED_SIZE],
     len: usize,
 }
 
 impl EncodedNetwork {
-    fn new(network: NetworkId) -> Self {
+    pub(crate) fn new(network: NetworkId) -> Self {
         let mut bytes = [0_u8; <NetworkId as Encode>::MAX_ENCODED_SIZE];
         let mut writer = BufferWriter::new(&mut bytes);
         network.encode_to(&mut writer);
@@ -646,7 +649,7 @@ impl EncodedNetwork {
     /// zero-padded buffer — and every digest in this module would move
     /// silently under it. A bug that cannot happen should not have a
     /// second answer ready.
-    fn as_slice(&self) -> &[u8] {
+    pub(crate) fn as_slice(&self) -> &[u8] {
         &self.bytes[..self.len]
     }
 }
@@ -657,7 +660,7 @@ impl EncodedNetwork {
 /// Every caller's complete preimage is bounded at compile time by an
 /// assertion below, because [`SingleChunkHasher::update`] panics rather
 /// than erroring once a preimage reaches [`MIN_CHUNK_SIZE`].
-fn xh(domain: &[u8], fields: &[&[u8]]) -> Digest {
+pub(crate) fn xh(domain: &[u8], fields: &[&[u8]]) -> Digest {
     let mut hasher = SingleChunkHasher::new();
     hasher.update(domain);
     for field in fields {
@@ -672,7 +675,7 @@ fn xh(domain: &[u8], fields: &[&[u8]]) -> Digest {
 /// one-shot [`Digest::hash`] of the same concatenation under every write
 /// segmentation, which is what lets a caller stream a large body without
 /// holding it.
-fn xfh(domain: &[u8], fields: &[&[u8]]) -> Digest {
+pub(crate) fn xfh(domain: &[u8], fields: &[&[u8]]) -> Digest {
     let mut hasher = XetFileHasher::new();
     hasher.update(domain);
     for field in fields {
@@ -844,7 +847,7 @@ impl PaidChannel {
         self.payment_terms.parties().taker()
     }
 
-    fn network_bytes(&self) -> EncodedNetwork {
+    pub(crate) fn network_bytes(&self) -> EncodedNetwork {
         EncodedNetwork::new(self.network)
     }
 }
@@ -941,7 +944,7 @@ pub fn identity_source_digest(
 /// separates nothing. A body that large is unreachable through any
 /// bounded decoder here; it is refused rather than truncated because a
 /// truncated prefix is a second legal spelling of the same bytes.
-fn length_prefix(bytes: &[u8], field: &'static str) -> Result<[u8; 4], PaidWorkError> {
+pub(crate) fn length_prefix(bytes: &[u8], field: &'static str) -> Result<[u8; 4], PaidWorkError> {
     let len = u32::try_from(bytes.len()).map_err(|_| PaidWorkError::Overflow { field })?;
     Ok(len.to_be_bytes())
 }
@@ -1252,7 +1255,34 @@ pub fn check_authorization(
     finalized_height: u64,
 ) -> Result<Digest, PaidWorkError> {
     check_execution_policy(policy)?;
+    check_authorization_core(
+        channel,
+        authorization,
+        execution_policy_digest(channel, policy),
+        policy.allowed_environment,
+        policy.fixed_price,
+        finalized_height,
+    )
+}
 
+/// The authorization arithmetic every paid-work profile shares.
+///
+/// The profiles differ in what a policy *is* — the evaluate profile's is
+/// [`PaidExecutionPolicyV1`], the fetch profile's is in
+/// [`super::work_fetch`] — but not in what signing one *means*: the same
+/// channel fields, the same bond cover, the same credit-limit cover, the
+/// same deadline window. That part is written once here so the two
+/// profiles cannot drift into two different definitions of acceptance.
+/// What each caller supplies is its own policy digest, environment, and
+/// price; what this function supplies is everything else.
+pub(crate) fn check_authorization_core(
+    channel: &PaidChannel,
+    authorization: &PaidJobAuthorizationV1,
+    policy_digest: Digest,
+    allowed_environment: ContentId,
+    fixed_price: u64,
+    finalized_height: u64,
+) -> Result<Digest, PaidWorkError> {
     let terms = channel.payment_terms();
     let expected = [
         (
@@ -1277,13 +1307,11 @@ pub fn check_authorization(
         ),
         (
             "execution_policy_digest",
-            authorization.execution_policy_digest.as_bytes()
-                == execution_policy_digest(channel, policy).as_bytes(),
+            authorization.execution_policy_digest.as_bytes() == policy_digest.as_bytes(),
         ),
         (
             "environment_commitment",
-            authorization.environment_commitment.as_bytes()
-                == policy.allowed_environment.as_bytes(),
+            authorization.environment_commitment.as_bytes() == allowed_environment.as_bytes(),
         ),
     ];
     for (field, holds) in expected {
@@ -1299,11 +1327,11 @@ pub fn check_authorization(
             max_job_price,
         });
     }
-    if authorization.price != policy.fixed_price {
+    if authorization.price != fixed_price {
         return Err(PaidWorkError::Mismatch { field: "price" });
     }
 
-    // The execution policy is per-authorization and only its digest is
+    // The policy is per-authorization and only its digest is
     // signed, so a channel may see many of them. The credit limits are
     // per-channel and are opened once, at construction. That is why the
     // two are compared here, against this job's price, rather than once

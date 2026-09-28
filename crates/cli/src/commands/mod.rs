@@ -1,7 +1,6 @@
 pub type CliResult<T = ()> = anyhow::Result<T>;
 
 use anyhow::Context as _;
-use std::io::Read as _;
 use std::path::Path;
 use std::time::Duration;
 
@@ -38,20 +37,12 @@ pub(crate) fn read_bounded_regular_file(
     label: &str,
     maximum: usize,
 ) -> CliResult<Vec<u8>> {
-    let file = hellas_store::open_regular_file(path)
-        .with_context(|| format!("failed to open {label} {}", path.display()))?;
-    let limit = u64::try_from(maximum).unwrap_or(u64::MAX).saturating_add(1);
-    let mut bytes = Vec::new();
-    file.take(limit)
-        .read_to_end(&mut bytes)
-        .with_context(|| format!("failed to read {label} {}", path.display()))?;
-    anyhow::ensure!(
-        bytes.len() <= maximum,
-        "{label} {} is {} bytes, over the {maximum}-byte limit",
-        path.display(),
-        bytes.len()
-    );
-    Ok(bytes)
+    hellas_private::read_bounded_regular_file(path, maximum).with_context(|| {
+        format!(
+            "failed to read {label} {} (limit {maximum} bytes)",
+            path.display()
+        )
+    })
 }
 
 pub(crate) fn http_client(request_timeout: Duration) -> reqwest::Client {

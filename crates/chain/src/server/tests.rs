@@ -384,7 +384,7 @@ async fn bound_and_relay_transports_answer_from_one_node_state() {
     .await
     .expect("the second transport receives a prompt saturation result")
     .expect_err("all sixteen node response permits are held by the first transport");
-    assert_eq!(overflow.code(), WireCode::ResourceExhausted);
+    assert_eq!(overflow.code(), WireCode::ResourceExhausted, "{overflow:?}");
 
     blocker.release.add_permits(16);
     for call in held {

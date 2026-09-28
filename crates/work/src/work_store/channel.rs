@@ -22,12 +22,12 @@ use crate::work_store::{
     take_option,
 };
 use hellas_rpc::protocol::Digest;
-use hellas_rpc::protocol::artifacts::PreparedPaidInputV1;
 use hellas_rpc::protocol::work::{
     CreditLedger, PaidChannel, PaidJobAuthorizationV1, PaidJobResultV1, PaidWorkError,
-    PaymentBindingV1, PrivateRecord as _, decode_transcript, payment_binding_digest,
-    prepared_input_digest, result_digest, signing_hash, terminal_result, work_id,
+    PaymentBindingV1, PrivateRecord as _, decode_transcript, payment_binding_digest, result_digest,
+    signing_hash, work_id,
 };
+use hellas_rpc::protocol::work_profile::PreparedPaidWorkInput;
 
 mod codec;
 mod state;

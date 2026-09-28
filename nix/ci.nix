@@ -96,6 +96,10 @@ let
           ++ lib.optionals isValidatorHost [ "validator" ]
         )
     )) (cargoEnv rustToolchain);
+    # Run command tests locally as well as in the release package builds.
+    cli = mkCargo "check-cli" "cargo test -p hellas-cli --no-default-features --features node,gateway" (
+      cargoEnv rustToolchain
+    );
     # The kernel's whole suite, including `tests/itf.rs` — the Quint↔Rust
     # replay that the entire abstract-correspondence story rests on — and
     # the exact-error pins in `tests/channel/`. `--all-features` is load
@@ -128,6 +132,17 @@ let
     client-work =
       mkCargo "check-client-work"
         "cargo test -p hellas-client --features work && cargo clippy -p hellas-client --features work --all-targets -- -D warnings"
+        (cargoEnv rustToolchain);
+    # HTTP boundaries and the bounded file primitives shared by hosts.
+    http-fetch =
+      mkCargo "check-http-fetch"
+        "cargo test -p hellas-gateway -p hellas-providers -p hellas-private -p hellas-store"
+        (cargoEnv rustToolchain);
+    # Exercise the production provider loop and paid session recovery; their
+    # feature is absent from the SDK's default tests.
+    sdk-paid-work =
+      mkCargo "check-sdk-paid-work"
+        "cargo test -p hellas-sdk --features paid-client,paid-provider,paid-gateway && cargo clippy -p hellas-sdk --features paid-client,paid-provider,paid-gateway --all-targets -- -D warnings && cargo clippy -p hellas-sdk --no-default-features --features paid-client --all-targets -- -D warnings && cargo clippy -p hellas-sdk --no-default-features --features paid-provider --all-targets -- -D warnings && cargo clippy -p hellas-sdk --no-default-features --features paid-gateway --all-targets -- -D warnings"
         (cargoEnv rustToolchain);
     # The chain service's wire-id pins compile only under `chain`, which
     # `work` does not pull in. `check-validator` links hellas-rpc with

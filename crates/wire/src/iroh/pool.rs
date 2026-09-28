@@ -39,6 +39,7 @@ use ::iroh::{Endpoint, EndpointId};
 // Xtensa (esp32-s3) lacks native 64-bit atomics; portable-atomic provides a
 // mutex-fallback so embedded targets still compile.
 use portable_atomic::{AtomicU64, Ordering};
+use tracing::Instrument;
 use web_time::Instant;
 
 use crate::iroh::transport::IrohTransport;
@@ -235,10 +236,15 @@ impl Pool {
         // loser's connection is dropped immediately when we re-insert.
         // Pass the full EndpointAddr to iroh::Endpoint::connect so any
         // CLI-supplied direct addresses become dial hints.
+        // The QUIC driver retains the current span for the connection's entire
+        // lifetime. Give it a root span so it cannot keep the dialing request
+        // and its ancestors open while subsequent requests reuse the connection.
+        let span = tracing::info_span!(target: "hellas_request", parent: None, "quic.connection");
         let connect = self
             .inner
             .endpoint
-            .connect(target, self.inner.alpn.as_slice());
+            .connect(target, self.inner.alpn.as_slice())
+            .instrument(span);
         let conn = n0_future::time::timeout(self.inner.options.connect_timeout, connect)
             .await
             .map_err(|_| PoolError::Timeout)?
@@ -360,5 +366,61 @@ impl Drop for Pool {
         if Arc::strong_count(&self.inner) == 1 {
             self.inner.closed.set();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tracing::instrument::{Instrument, WithSubscriber};
+    use tracing_subscriber::{Layer, layer::Context, prelude::*, registry::LookupSpan};
+
+    #[derive(Clone, Default)]
+    struct ClosedSpans(Arc<Mutex<Vec<&'static str>>>);
+
+    impl<S: tracing::Subscriber + for<'a> LookupSpan<'a>> Layer<S> for ClosedSpans {
+        fn on_close(&self, id: tracing::span::Id, ctx: Context<'_, S>) {
+            self.0.lock().unwrap().push(ctx.span(&id).unwrap().name());
+        }
+    }
+
+    #[tokio::test]
+    async fn pooled_connection_does_not_hold_request_span_open() {
+        let closed = ClosedSpans::default();
+        let dispatch = tracing::Dispatch::new(
+            tracing_subscriber::registry()
+                .with(tracing_subscriber::filter::LevelFilter::INFO)
+                .with(closed.clone()),
+        );
+        async {
+            let alpn = b"/hellas-test/pool/1";
+            let server = Endpoint::builder(::iroh::endpoint::presets::Minimal)
+                .alpns(vec![alpn.to_vec()])
+                .bind()
+                .await
+                .unwrap();
+            let client = Endpoint::builder(::iroh::endpoint::presets::Minimal)
+                .bind()
+                .await
+                .unwrap();
+            let pool = Pool::new(client.clone(), alpn, PoolOptions::default());
+            let request = tracing::info_span!("request");
+            let (connected, accepted) =
+                tokio::join!(pool.connection(server.addr()).instrument(request), async {
+                    server.accept().await.unwrap().await.unwrap()
+                },);
+            let connected = connected.unwrap();
+            assert!(connected.close_reason().is_none());
+            assert!(accepted.close_reason().is_none());
+            assert!(
+                closed.0.lock().unwrap().contains(&"request"),
+                "request span must close while the pooled connection is still live"
+            );
+            pool.shutdown();
+            client.close().await;
+            server.close().await;
+        }
+        .with_subscriber(dispatch)
+        .await;
     }
 }

@@ -7,7 +7,7 @@
 use hellas_rpc::protocol::Digest;
 use hellas_rpc::services::work::WorkClientImpl;
 use hellas_wire::StreamTransport;
-use hellas_work::work::{ClientEndpoint, PaymentError, admit_payment};
+use hellas_work::work::{ClientChannel, PaymentError, admit_payment};
 
 /// Signs and admits payment for one authenticated result.
 ///
@@ -22,7 +22,7 @@ use hellas_work::work::{ClientEndpoint, PaymentError, admit_payment};
 /// journal rejects the transition, or the acknowledgement names another amount.
 pub async fn pay_for_result<T>(
     transport: T,
-    endpoint: &mut ClientEndpoint,
+    endpoint: &mut impl ClientChannel,
     work_id: Digest,
 ) -> Result<u64, PaymentError>
 where

@@ -52,6 +52,18 @@ impl OutputEvent {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum AdaptorEvent {
     CodexResponses(CodexResponsesEvent),
+    /// Exact HTTP metadata and bytes, without LLM-specific projection.
+    Http(HttpResponseEvent),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HttpResponseEvent {
+    Head {
+        status: u16,
+        headers: Vec<(String, String)>,
+    },
+    /// Standard padded base64, preserving arbitrary binary bodies.
+    Body { base64: String },
 }
 
 /// The subset of Codex Responses streaming semantics committed by the sealed

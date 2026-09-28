@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package hellas.work.v1;
 
+import "hellas/v1/hellas.proto";
+
 // The paid-work service: the wire by which a client proposes one job on
 // one payment channel and a provider accepts or refuses it.
 //
@@ -11,6 +13,8 @@ package hellas.work.v1;
 // exact encodings. A protobuf re-spelling of an authorization would be a
 // second definition of what both parties signed.
 service Work {
+  rpc Open(.hellas.v1.OpenRequest) returns (.hellas.v1.OpenResponse);
+
   // One bilateral acceptance. The client sends the authorization it has
   // already signed; the provider answers with its co-signature or with
   // one refusal code.
@@ -24,7 +28,8 @@ service Work {
   // This unary form waits for the durable terminal result. The job's
   // price is reserved as delivery credit before release; replay returns
   // the same bytes without a second debit. StreamResult offers signed
-  // token prefixes under the same authorization and delivery credit.
+  // prefixes under the same authorization and delivery credit. Use StreamResult
+  // for Fetch responses that do not fit in one wire frame.
   rpc DeliverResult(DeliverResultRequest) returns (DeliverResultResponse);
 
   // Authenticated live output. Delivery credit is durably reserved before
@@ -58,6 +63,8 @@ service Work {
 // would make every paid method answer for a channel that does not exist
 // yet, and every setup method answer for one that already does.
 service WorkSetup {
+  rpc Open(.hellas.v1.OpenRequest) returns (.hellas.v1.OpenResponse);
+
   // One step of the handshake: the caller offers the revision it holds,
   // and is answered with the revision that extends it.
   //
@@ -251,5 +258,14 @@ message WorkStreamEvent {
     bytes prefix = 1; // canonical transcript containing signed output events
     WorkDelivered delivered = 2;
     WorkRefused refused = 3;
+    // Fetch completion after all nonterminal envelopes in prefix frames.
+    // The receiver verifies the assembled transcript against this result.
+    WorkStreamTerminal terminal = 4;
   }
+}
+
+message WorkStreamTerminal {
+  bytes result = 1;
+  bytes provider_signature = 2;
+  bytes terminal_transcript = 3; // exactly one signed terminal envelope
 }

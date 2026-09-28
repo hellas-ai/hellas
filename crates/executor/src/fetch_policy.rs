@@ -624,7 +624,7 @@ impl FetchRoutePolicy {
         }
     }
 
-    fn validate(&self, request: &FetchRequestView) -> Result<(), FetchAccessError> {
+    pub(crate) fn validate(&self, request: &FetchRequestView) -> Result<(), FetchAccessError> {
         if let Some(models) = &self.allowed_models {
             let Some(model) = &request.model else {
                 return Err(FetchAccessError::Denied(

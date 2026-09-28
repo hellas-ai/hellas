@@ -9,7 +9,36 @@ use futures::stream;
 use reqwest::header::{HeaderMap, HeaderValue};
 use std::convert::Infallible;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+#[derive(Clone, Default)]
+struct CapturedLogs(Arc<Mutex<String>>);
+
+impl tracing::field::Visit for CapturedLogs {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        use std::fmt::Write as _;
+        write!(self.0.lock().unwrap(), "{field}={value:?} ").unwrap();
+    }
+}
+
+impl tracing::Subscriber for CapturedLogs {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, values: &tracing::span::Record<'_>) {
+        values.record(&mut self.clone());
+    }
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        event.record(&mut self.clone());
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
 
 async fn redirect() -> Redirect {
     Redirect::temporary("/sink")
@@ -23,15 +52,6 @@ async fn json_success() -> Response {
     Response::builder()
         .header(axum::http::header::CONTENT_TYPE, "application/json")
         .body(Body::from(r#"{"ok":true}"#))
-        .unwrap()
-}
-
-async fn oversized_error() -> Response {
-    let mut body = vec![b'x'; MAX_FETCH_ERROR_BODY_BYTES];
-    body.extend_from_slice(b"SECRET_AFTER_LIMIT");
-    Response::builder()
-        .status(StatusCode::BAD_REQUEST)
-        .body(Body::from(body))
         .unwrap()
 }
 
@@ -57,43 +77,6 @@ async fn oversized_event_stream() -> Response {
         )
         .body(Body::from_stream(chunks))
         .unwrap()
-}
-
-fn stalled_error_before_first_byte() -> reqwest::Response {
-    axum::http::Response::builder()
-        .status(StatusCode::BAD_GATEWAY)
-        .body(reqwest::Body::wrap_stream(stream::pending::<
-            Result<Bytes, Infallible>,
-        >()))
-        .unwrap()
-        .into()
-}
-
-fn stalled_error_after_partial_body() -> reqwest::Response {
-    let chunks =
-        stream::once(async { Ok::<_, Infallible>(Bytes::from_static(b"useful diagnostic")) })
-            .chain(stream::pending());
-    axum::http::Response::builder()
-        .status(StatusCode::BAD_GATEWAY)
-        .body(reqwest::Body::wrap_stream(chunks))
-        .unwrap()
-        .into()
-}
-
-fn promptly_streamed_error() -> reqwest::Response {
-    let chunks = stream::iter([
-        Bytes::from_static(b"useful "),
-        Bytes::from_static(b"diagnostic"),
-    ])
-    .then(|chunk| async move {
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        Ok::<_, Infallible>(chunk)
-    });
-    axum::http::Response::builder()
-        .status(StatusCode::BAD_GATEWAY)
-        .body(reqwest::Body::wrap_stream(chunks))
-        .unwrap()
-        .into()
 }
 
 async fn test_endpoint(app: Router, path: &str) -> Url {
@@ -156,31 +139,17 @@ async fn successful_fetch_requires_event_stream_content_type() {
 }
 
 #[tokio::test]
-async fn provider_local_error_diagnostic_retains_only_a_bounded_body_prefix() {
-    let endpoint = test_endpoint(
-        Router::new().route("/responses", post(oversized_error)),
-        "/responses",
-    )
-    .await;
-
-    let response = responses_http_client().post(endpoint).send().await.unwrap();
-    let diagnostic = error_body_prefix(response).await;
-
-    assert!(diagnostic.contains(&format!(
-        "body prefix limited to {MAX_FETCH_ERROR_BODY_BYTES} bytes"
-    )));
-    assert!(!diagnostic.contains("SECRET_AFTER_LIMIT"));
-    assert!(diagnostic.len() < MAX_FETCH_ERROR_BODY_BYTES + 256);
-}
-
-#[tokio::test]
-async fn unsuccessful_fetch_never_forwards_the_upstream_body_to_the_caller() {
+async fn unsuccessful_fetch_never_logs_or_returns_the_upstream_body() {
     let endpoint = test_endpoint(
         Router::new().route("/responses", post(sensitive_error)),
         "/responses",
     )
     .await;
 
+    let logs = CapturedLogs::default();
+    // Keep this subscriber installed for the test binary: other HTTP tests
+    // also register the shared warning callsite on their runtime threads.
+    tracing::subscriber::set_global_default(logs.clone()).unwrap();
     let Err(error) = execute_test_request(endpoint).await else {
         panic!("HTTP error unexpectedly passed");
     };
@@ -191,45 +160,33 @@ async fn unsuccessful_fetch_never_forwards_the_upstream_body_to_the_caller() {
         "fetch provider failed: test upstream rejected the request (HTTP 422)"
     );
     assert!(!message.contains("UPSTREAM_PRIVATE_SENTINEL"));
+    let logged = logs.0.lock().unwrap();
+    assert!(logged.contains("upstream_status=422"), "{logged}");
+    assert!(!logged.contains("UPSTREAM_PRIVATE_SENTINEL"), "{logged}");
 }
 
-#[tokio::test(start_paused = true)]
-async fn error_body_stalled_before_first_byte_hits_the_read_deadline() {
-    let upstream = stalled_error_before_first_byte();
-    let read_timeout = Duration::from_secs(5);
-    let started = tokio::time::Instant::now();
-
-    let diagnostic = error_body_prefix_with_deadline(upstream, read_timeout).await;
-
-    assert_eq!(started.elapsed(), read_timeout);
-    assert_eq!(diagnostic, "[error body read timed out after 5 seconds]");
-}
-
-#[tokio::test(start_paused = true)]
-async fn partial_error_body_is_retained_when_the_read_deadline_expires() {
-    let upstream = stalled_error_after_partial_body();
-    let read_timeout = Duration::from_secs(5);
-    let started = tokio::time::Instant::now();
-
-    let diagnostic = error_body_prefix_with_deadline(upstream, read_timeout).await;
-
-    assert_eq!(started.elapsed(), read_timeout);
-    assert_eq!(
-        diagnostic,
-        "useful diagnostic [error body read timed out after 5 seconds]"
-    );
-}
-
-#[tokio::test(start_paused = true)]
-async fn promptly_streamed_error_body_completes_within_the_read_deadline() {
-    let upstream = promptly_streamed_error();
-    let read_timeout = Duration::from_secs(5);
-    let started = tokio::time::Instant::now();
-
-    let diagnostic = error_body_prefix_with_deadline(upstream, read_timeout).await;
-
-    assert_eq!(started.elapsed(), Duration::from_secs(2));
-    assert_eq!(diagnostic, "useful diagnostic");
+#[tokio::test]
+async fn an_unsuccessful_fetch_does_not_wait_for_an_error_body() {
+    async fn stalled() -> Response {
+        Response::builder()
+            .status(StatusCode::BAD_GATEWAY)
+            .body(Body::from_stream(stream::pending::<
+                Result<Bytes, Infallible>,
+            >()))
+            .unwrap()
+    }
+    let endpoint = test_endpoint(
+        Router::new().route("/responses", post(stalled)),
+        "/responses",
+    )
+    .await;
+    let result = tokio::time::timeout(Duration::from_secs(2), execute_test_request(endpoint))
+        .await
+        .expect("the response body must not be polled");
+    let Err(error) = result else {
+        panic!("HTTP error unexpectedly passed");
+    };
+    assert!(error.to_string().contains("HTTP 502"));
 }
 
 #[tokio::test]

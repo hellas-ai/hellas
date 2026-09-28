@@ -194,7 +194,11 @@ trusted app itself requires a platform-backed assurance.
 
 ## HTTP gateway
 
-The gateway requires the same canonical causal-LM environment and an explicit
+For upstream APIs, [HTTP Fetch routes](docs/http-gateway.md) preserve the vendor's
+request, response and streaming formats. CLI gateways archive payloads by default;
+`--zdr` or `x-hellas-zdr: true` disables application payload persistence.
+
+The causal-LM gateway requires the same canonical environment and an explicit
 presentation tokenizer. `--model` is only an API response label; when omitted,
 the manifest ID is used.
 

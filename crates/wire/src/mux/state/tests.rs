@@ -169,6 +169,43 @@ fn credit_returns_only_after_application_consumption() {
 }
 
 #[test]
+fn request_end_still_allows_response_credit_and_cancellation() {
+    let cfg = MuxConfig { stream_window: 8 };
+    let mut client: Multiplexer<8, _> = Multiplexer::new(Role::Client, DefaultClock, cfg);
+    let mut server: Multiplexer<8, _> = Multiplexer::new(Role::Server, DefaultClock, cfg);
+    let slot = client.open(7, Metadata::new()).unwrap();
+    drain(&mut client, &mut server);
+    client.close_send(slot, None).unwrap();
+    drain(&mut client, &mut server);
+    queue_body(&mut server, slot, Bytes::from_static(b"response"));
+    drain(&mut server, &mut client);
+    assert!(matches!(
+        server.try_send_body(slot, Bytes::from_static(b"next")),
+        Ok(SendBodyOutcome::Blocked(_))
+    ));
+    client.consume(slot, 8).unwrap();
+    assert!(matches!(
+        drain(&mut client, &mut server).as_slice(),
+        [Event::PeerCredit { .. }]
+    ));
+    queue_body(&mut server, slot, Bytes::from_static(b"next"));
+    drain(&mut server, &mut client);
+    client.reset(slot, WireCode::Cancelled);
+    assert!(matches!(
+        drain(&mut client, &mut server).as_slice(),
+        [Event::ResetStream {
+            code: WireCode::Cancelled,
+            ..
+        }]
+    ));
+    assert!(
+        server
+            .try_send_body(slot, Bytes::from_static(b"late"))
+            .is_err()
+    );
+}
+
+#[test]
 fn stale_gen_discarded() {
     let (mut client, mut server) = pair::<32>();
     let s1 = client.open(0x1, Metadata::new()).unwrap();

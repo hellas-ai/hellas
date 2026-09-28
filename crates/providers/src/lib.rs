@@ -2,11 +2,16 @@
 //! hosts and the Hellas CLI.
 
 mod codex_responses;
+mod http;
 mod openai;
 mod responses_fetch;
 mod responses_projector;
 mod stream;
+pub use http::{
+    CredentialRefresh, HttpCredential, HttpCredentialConfig, HttpEgressPolicy,
+    HttpFetchAdaptorFactory, HttpFetchProvider, HttpProviderConfig, HttpSecret,
+};
 
-pub use openai::OpenAiResponsesFetchProvider;
+pub use openai::{EmptyOpenAiKey, OpenAiResponsesFetchProvider};
 pub use responses_fetch::{execute_responses_request, responses_http_client};
 pub use responses_projector::ResponsesFetchAdaptorFactory;

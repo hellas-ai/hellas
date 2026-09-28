@@ -50,4 +50,5 @@ zeroize = "1"
 
 [dev-dependencies]
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
+tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { workspace = true }

@@ -47,7 +47,7 @@ use hellas_rpc::{
 use hellas_wire::mux::{MessagePipe, MuxConfig, MuxTransport, Role as MuxRole};
 use hellas_wire::{DefaultClock, Dispatcher, StreamTransport};
 use hellas_work::work::{
-    BackendFault, ClientEndpoint, CloseEndpoint, DeliverError, PaidEvaluateBackend,
+    BackendFault, ClientEndpoint, CloseEndpoint, DeliverError, PaidWorkBackend,
     PreparedEvaluateInput, ProviderEndpoint, RunError, RunOutcome, WorkService, fetch_result,
     run_accepted_work,
 };
@@ -171,7 +171,7 @@ fn descriptor_with(policy: PaidExecutionPolicyV1) -> WorkChannelDescriptor {
         payment_terms: payment_terms(),
         policy_salt: SALT,
         channel_policy: channel_policy(),
-        execution_policy: policy,
+        execution_policy: policy.into(),
         expected_payment_values: payment_values(),
     };
     match WorkChannelDescriptor::open(config) {
@@ -392,7 +392,7 @@ impl AnsweringBackend {
     }
 }
 
-impl PaidEvaluateBackend for AnsweringBackend {
+impl PaidWorkBackend for AnsweringBackend {
     fn evaluate(
         &self,
         input: PreparedEvaluateInput,
@@ -719,7 +719,7 @@ async fn a_job_with_no_result_releases_nothing_yet() {
 #[tokio::test]
 async fn a_failed_job_returns_its_terminal_after_authentication() {
     struct FailingBackend;
-    impl PaidEvaluateBackend for FailingBackend {
+    impl PaidWorkBackend for FailingBackend {
         async fn evaluate(
             &self,
             _input: PreparedEvaluateInput,
@@ -1463,7 +1463,7 @@ async fn live_prefix_precedes_terminal_and_reserves_delivery_credit() {
     struct PausedBackend {
         release: Arc<tokio::sync::Notify>,
     }
-    impl PaidEvaluateBackend for PausedBackend {
+    impl PaidWorkBackend for PausedBackend {
         async fn evaluate(
             &self,
             input: PreparedEvaluateInput,

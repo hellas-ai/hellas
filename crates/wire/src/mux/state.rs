@@ -514,8 +514,12 @@ impl<const N: usize, C: Clock> Multiplexer<N, C> {
         if slot.generation != keyed.key.generation {
             return Ok(events); // stale-generation drop
         }
-        if slot.peer_terminal {
-            return Ok(events); // peer already terminal; drop late frames
+        // End closes the peer's send half. It can still consume our response
+        // (returning credit) or cancel it until our own send half ends.
+        if slot.peer_terminal
+            && (slot.local_terminal || !matches!(keyed.frame, Frame::Credit(_) | Frame::Reset(_)))
+        {
+            return Ok(events);
         }
 
         match keyed.frame {

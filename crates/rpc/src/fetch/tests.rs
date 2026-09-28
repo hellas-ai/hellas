@@ -148,6 +148,13 @@ fn request_body_limit_accepts_the_exact_boundary() {
     .unwrap();
 
     assert_eq!(verify_input_events(&events).unwrap().body.as_bytes(), body);
+    let request = crate::pb::fetch::FetchRequest {
+        input: events
+            .iter()
+            .map(crate::stream::input_event_to_pb)
+            .collect(),
+    };
+    assert!(prost::Message::encoded_len(&request) < hellas_wire::frame::MAX_FRAME_BYTES);
 }
 
 #[test]

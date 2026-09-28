@@ -185,7 +185,7 @@ fn provider_policy() -> ProviderChannelPolicy {
         network: network(),
         policy_salt: SALT,
         channel_policy: channel_policy(),
-        execution_policy: execution_policy(),
+        execution_policy: execution_policy().into(),
         expected_payment_values: EdgeValues::new(
             PAYMENT_VALUE,
             PAYMENT_RESERVE,

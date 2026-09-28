@@ -23,6 +23,9 @@ apple-app-attest = []
 # is driven from; without it the runner has a chain and no way to ask it
 # anything.
 node = [
+    "dep:hellas-sdk",
+    "hellas-sdk/paid-client",
+    "hellas-sdk/paid-provider",
     "chain",
     "dep:async-stream",
     "dep:axum",
@@ -37,7 +40,7 @@ node = [
 # This deliberately does not pull Catena into a client that only dials a node.
 llm = ["hellas-client/evaluate", "dep:hellas-presentation"]
 # HTTP gateway front-end (OpenAI/Anthropic/plain APIs).
-gateway = ["llm", "dep:hellas-gateway"]
+gateway = ["llm", "dep:hellas-gateway", "hellas-sdk?/paid-gateway"]
 evaluate = [
     "node",
     "gateway",
@@ -101,6 +104,7 @@ hellas-rpc = { workspace = true, default-features = false, features = [
     "work",
     "host-control",
 ] }
+hellas-sdk = { workspace = true, default-features = false, optional = true }
 hellas-store = { workspace = true }
 hellas-wire = { workspace = true, features = [
     "unix",

@@ -100,6 +100,13 @@ impl FetchRouteRegistry {
         }
     }
 
+    /// Whether at least one configured route implements this trusted manifest.
+    pub fn has_environment(&self, environment: ContentId) -> bool {
+        self.routes
+            .values()
+            .any(|entry| entry.execution_environment() == environment)
+    }
+
     pub fn entry(&self, route: &FetchRoute) -> Option<&FetchRouteEntry> {
         self.routes.get(route)
     }

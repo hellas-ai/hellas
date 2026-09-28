@@ -47,7 +47,8 @@ pub use fetch_projection::{
 };
 pub use fetch_provider::{
     FetchCall, FetchProvider, FetchProviderError, FetchProviderFuture, FetchProviderResponse,
-    FetchProviderResponseHead, FetchProviderStream, MockFetchProvider, PreparedFetchRequest,
+    FetchProviderResponseHead, FetchProviderStream, HttpResponseHead, MockFetchProvider,
+    PreparedFetchRequest,
 };
 pub use fetch_registry::{
     DuplicateFetchRoute, FetchRouteBindingError, FetchRouteEntry, FetchRouteRegistry,

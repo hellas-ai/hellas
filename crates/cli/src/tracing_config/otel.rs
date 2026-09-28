@@ -89,6 +89,8 @@ where
         .with_tracer(tracer)
         .with_filter(tracing_subscriber::filter::filter_fn(|metadata| {
             metadata.is_span()
+                && (metadata.target() == "hellas_request"
+                    || metadata.fields().field("otel.kind").is_some())
         }));
     (Some(layer), Some(provider))
 }

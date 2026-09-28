@@ -67,19 +67,8 @@ where
                 .open(M::METHOD_ID, headers)
                 .await
                 .map_err(transport_to_status)?;
-            let (mut send, recv) = WireStream::split(stream);
-            let mut recv = Box::pin(recv);
-
-            let mut buf = BytesMut::with_capacity(request.encoded_len());
-            request
-                .encode(&mut buf)
-                .map_err(|e| WireStatus::internal(format!("prost encode: {e}")))?;
-            send.send_body(buf.freeze())
-                .await
-                .map_err(|e| WireStatus::internal(format!("send: {e}")))?;
-            send.close_send(None)
-                .await
-                .map_err(|e| WireStatus::internal(format!("close_send: {e}")))?;
+            let (mut send, mut recv) = WireStream::split(stream);
+            send_request(&mut send, &mut recv, request).await?;
 
             // Unary protocol shape: exactly one body chunk, then EOF, then a
             // terminal trailer. Anything else is a server-side bug and must
@@ -147,6 +136,42 @@ fn trailer_to_status(t: &Trailer) -> WireStatus {
     }
 }
 
+/// A server may reject at Open, before accepting the request body. Preserve
+/// its refusal when stopping the upload also makes a local write fail.
+async fn send_request<S: SendHalf, R: RecvHalf, Q: Message>(
+    send: &mut S,
+    recv: &mut R,
+    request: Q,
+) -> Result<(), WireStatus> {
+    let mut buf = BytesMut::with_capacity(request.encoded_len());
+    request
+        .encode(&mut buf)
+        .map_err(|e| WireStatus::internal(format!("prost encode: {e}")))?;
+    let written = async {
+        send.send_body(buf.freeze())
+            .await
+            .map_err(|e| WireStatus::internal(format!("send: {e}")))?;
+        send.close_send(None)
+            .await
+            .map_err(|e| WireStatus::internal(format!("close_send: {e}")))
+    }
+    .await;
+    if let Err(error) = written {
+        // Only a terminal error can explain an early rejection. Do not drain
+        // arbitrary bodies or wait indefinitely for a peer that stopped reading.
+        if matches!(
+            n0_future::time::timeout(UNARY_RECEIVE_TIMEOUT, recv.next()).await,
+            Ok(None)
+        ) && let Some(trailer) = recv.trailer()
+            && trailer.status != WireCode::Ok
+        {
+            return Err(trailer_to_status(trailer));
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
 /// Server-streaming call: send one request, receive a stream of responses
 /// + a terminal trailer.
 ///
@@ -181,18 +206,8 @@ where
                 .open(M::METHOD_ID, headers)
                 .await
                 .map_err(transport_to_status)?;
-            let (mut send, recv) = WireStream::split(stream);
-
-            let mut buf = BytesMut::with_capacity(request.encoded_len());
-            request
-                .encode(&mut buf)
-                .map_err(|e| WireStatus::internal(format!("prost encode: {e}")))?;
-            send.send_body(buf.freeze())
-                .await
-                .map_err(|e| WireStatus::internal(format!("send: {e}")))?;
-            send.close_send(None)
-                .await
-                .map_err(|e| WireStatus::internal(format!("close_send: {e}")))?;
+            let (mut send, mut recv) = WireStream::split(stream);
+            send_request(&mut send, &mut recv, request).await?;
 
             Ok(StreamingCall::new(recv, operation))
         },
@@ -988,7 +1003,22 @@ async fn write_streaming_response<S: SendHalf, R: Message>(
     mut responses: impl futures_util::Stream<Item = Result<R, WireStatus>> + Unpin,
     call: &CallSpan,
 ) -> Result<(), TransportError> {
-    while let Some(response) = responses.next().await {
+    loop {
+        let next = match futures_util::future::select(
+            Box::pin(responses.next()),
+            Box::pin(send.stopped()),
+        )
+        .await
+        {
+            futures_util::future::Either::Left((next, _)) => next,
+            futures_util::future::Either::Right(_) => {
+                call.finish(WireCode::Cancelled);
+                return Err(TransportError::Io("response consumer disconnected".into()));
+            }
+        };
+        let Some(response) = next else {
+            break;
+        };
         let response = match response {
             Ok(response) => response,
             Err(status) => return write_trailer(send, status.into(), call).await,
@@ -1281,6 +1311,35 @@ mod streaming_call_tests {
         x: u32,
     }
 
+    #[tokio::test]
+    async fn stopped_consumer_cancels_an_idle_response_stream() {
+        struct StoppedSend;
+        impl SendHalf for StoppedSend {
+            type Error = std::io::Error;
+            async fn send_body(&mut self, _: Bytes) -> Result<(), Self::Error> {
+                panic!("no response available");
+            }
+            async fn close_send(&mut self, _: Option<Trailer>) -> Result<(), Self::Error> {
+                panic!("cancelled transport");
+            }
+            fn reset(&mut self, _: WireCode) {}
+            async fn stopped(&mut self) {}
+        }
+        let mut send = StoppedSend;
+        let call = CallSpan::new(tracing::Span::none());
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            write_streaming_response(
+                &mut send,
+                futures_util::stream::pending::<Result<U32Msg, WireStatus>>(),
+                &call,
+            ),
+        )
+        .await
+        .expect("idle cancellation must not wait for another response");
+        assert!(result.is_err());
+    }
+
     #[derive(Clone, PartialEq, ::prost::Message)]
     struct BytesMsg {
         #[prost(bytes = "vec", tag = "1")]
@@ -1448,6 +1507,21 @@ mod streaming_call_tests {
 
     struct MockTransport;
 
+    struct ReplyTransport(Mutex<Option<MockWireStream>>);
+
+    impl StreamTransport for ReplyTransport {
+        type Stream = MockWireStream;
+        type Error = std::io::Error;
+
+        async fn open(&self, _: u32, _: Metadata) -> Result<Self::Stream, Self::Error> {
+            Ok(self.0.lock().unwrap().take().unwrap())
+        }
+
+        async fn accept(&self) -> Result<Option<hellas_wire::Inbound<Self::Stream>>, Self::Error> {
+            Ok(None)
+        }
+    }
+
     impl StreamTransport for MockTransport {
         type Stream = MockWireStream;
         type Error = std::io::Error;
@@ -1494,6 +1568,74 @@ mod streaming_call_tests {
         )
     }
 
+    #[tokio::test]
+    async fn early_refusal_survives_request_body_and_close_write_failures() {
+        for streaming in [false, true] {
+            for fail_close in [false, true] {
+                let (mut inbound, _) = route_inbound(None, false, None);
+                inbound.stream.send.state.fail_send = !fail_close;
+                inbound.stream.send.state.fail_close = fail_close;
+                let mut trailer = Trailer::from_status(WireCode::ResourceExhausted, "route full");
+                trailer.metadata.insert_text("retry-after", "1");
+                inbound.stream.recv.trailer = trailer;
+                let transport = ReplyTransport(Mutex::new(Some(inbound.stream)));
+                let request = BytesMsg::default();
+                let result = if streaming {
+                    server_streaming::<_, MockMethod>(&transport, request, Metadata::new())
+                        .await
+                        .map(|_| ())
+                } else {
+                    unary::<_, MockMethod>(&transport, request, Metadata::new())
+                        .await
+                        .map(|_| ())
+                };
+                let error = result.expect_err("early rejection remains a wire refusal");
+                assert_eq!(error.code, WireCode::ResourceExhausted);
+                assert_eq!(error.message, "route full");
+                assert_eq!(
+                    error.metadata.get("retry-after").unwrap().as_text(),
+                    Some("1")
+                );
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_upload_does_not_accept_success_or_drain_a_stalled_response() {
+        for streaming in [false, true] {
+            for (body, pending) in [
+                (None, false),
+                (Some(Bytes::from_static(b"unsolicited body")), false),
+                (None, true),
+            ] {
+                let (mut inbound, _) = route_inbound(body, pending, None);
+                inbound.stream.send.state.fail_send = true;
+                let transport = ReplyTransport(Mutex::new(Some(inbound.stream)));
+                let request = BytesMsg::default();
+                let result = async {
+                    if streaming {
+                        server_streaming::<_, MockMethod>(&transport, request, Metadata::new())
+                            .await
+                            .map(|_| ())
+                    } else {
+                        unary::<_, MockMethod>(&transport, request, Metadata::new())
+                            .await
+                            .map(|_| ())
+                    }
+                };
+                let error = tokio::time::timeout(
+                    UNARY_RECEIVE_TIMEOUT + std::time::Duration::from_secs(1),
+                    result,
+                )
+                .await
+                .expect("recovering an early refusal has a deadline")
+                .expect_err("a failed upload cannot become a successful call");
+                assert_eq!(error.code, WireCode::Internal);
+                assert_eq!(error.message, "send: send failed");
+            }
+        }
+    }
+
     #[cfg(feature = "otel")]
     #[tokio::test]
     async fn telemetry_records_transport_protocol_and_cancellation_failures() {
@@ -1502,19 +1644,6 @@ mod streaming_call_tests {
         use tracing::instrument::WithSubscriber;
         use tracing_subscriber::prelude::*;
 
-        struct ReplyTransport(Mutex<Option<MockWireStream>>);
-        impl StreamTransport for ReplyTransport {
-            type Stream = MockWireStream;
-            type Error = std::io::Error;
-            async fn open(&self, _: u32, _: Metadata) -> Result<Self::Stream, Self::Error> {
-                Ok(self.0.lock().unwrap().take().unwrap())
-            }
-            async fn accept(
-                &self,
-            ) -> Result<Option<hellas_wire::Inbound<Self::Stream>>, Self::Error> {
-                Ok(None)
-            }
-        }
         let exporter = InMemorySpanExporter::default();
         let provider = SdkTracerProvider::builder()
             .with_simple_exporter(exporter.clone())

@@ -62,7 +62,10 @@ pub async fn trace_request(request: Request, next: Next) -> Response {
     super::inject(&trace.span, &mut context);
     if let Some(value) = context.get("traceparent").and_then(|value| value.as_text()) {
         if let Ok(header) = HeaderValue::from_str(value) {
-            response.headers_mut().insert("traceparent", header);
+            response
+                .headers_mut()
+                .entry("traceparent")
+                .or_insert(header);
         }
         if let Some(trace_id) = value.split('-').nth(1)
             && let Ok(header) = HeaderValue::from_str(trace_id)
@@ -164,6 +167,69 @@ mod tests {
     use tower::ServiceExt;
     use tracing::instrument::WithSubscriber;
     use tracing_subscriber::prelude::*;
+
+    #[tokio::test]
+    async fn upstream_trace_headers_survive_with_separate_gateway_correlation() {
+        opentelemetry::global::set_text_map_propagator(
+            opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+        );
+        let provider = SdkTracerProvider::builder().build();
+        let dispatch = tracing::Dispatch::new(
+            tracing_subscriber::registry()
+                .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("headers"))),
+        );
+        const UPSTREAM: &str = "00-33333333333333333333333333333333-4444444444444444-01";
+        const CALLER: &str = "00-11111111111111111111111111111111-2222222222222222-01";
+        let app = axum::Router::new()
+            .route("/plain", get(|| async { "ok" }))
+            .route(
+                "/upstream",
+                get(|| async {
+                    Response::builder()
+                        .header("traceparent", UPSTREAM)
+                        .header("tracestate", "vendor=upstream")
+                        .body(Body::from("ok"))
+                        .unwrap()
+                }),
+            )
+            .layer(axum::middleware::from_fn(trace_request));
+        for path in ["/upstream", "/plain"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .header("traceparent", CALLER)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .with_subscriber(dispatch.clone())
+                .await
+                .unwrap();
+            assert_eq!(
+                response.headers()["x-hellas-trace-id"],
+                "11111111111111111111111111111111"
+            );
+            assert_eq!(response.headers().get_all("traceparent").iter().count(), 1);
+            if path == "/upstream" {
+                assert_eq!(response.headers()["traceparent"], UPSTREAM);
+                assert_eq!(response.headers()["tracestate"], "vendor=upstream");
+            } else {
+                assert!(
+                    response.headers()["traceparent"]
+                        .to_str()
+                        .unwrap()
+                        .starts_with("00-11111111111111111111111111111111-")
+                );
+            }
+            assert_eq!(
+                axum::body::to_bytes(response.into_body(), 16)
+                    .await
+                    .unwrap(),
+                "ok"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn http_spans_cover_handler_and_body_completion_errors_and_cancellation() {

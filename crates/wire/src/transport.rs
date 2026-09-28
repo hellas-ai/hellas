@@ -163,6 +163,12 @@ pub trait SendHalf: Send {
 
     /// Cancel both directions of the underlying stream. Idempotent.
     fn reset(&mut self, code: WireCode);
+
+    /// Wait until the peer stops receiving. Carriers without a cancellation
+    /// notification retain the default pending future and detect write errors.
+    fn stopped(&mut self) -> impl Future<Output = ()> + Send {
+        std::future::pending()
+    }
 }
 
 /// Recv half. Yields body chunks; trailer is available after the
