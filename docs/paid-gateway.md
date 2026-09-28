@@ -215,3 +215,31 @@ prefill chunks when its memory budget permits. The gateway conservatively
 clears its affinity hint after short requests; the provider decides actual
 reuse. Worker spans report that observed reuse as
 `gen_ai.usage.cache_read.input_tokens` without recording token values.
+
+## Embedding
+
+The CLI and native hosts use `hellas_sdk::paid_gateway::PaidGateway`. Enable
+`paid-gateway`, load the same pool file with `load_pool_options(path, assurance)`,
+and pass the resulting typed `PaidGatewayOptions` and a `ClientIdentity` to
+`PaidGateway::open`. Applications can also construct the options directly from
+`PaidWorkOptions`; the pool validates duplicate providers, journals and funding
+before opening any connections. It owns recovery, admission, per-channel
+serialization and payment tasks. No CLI argument structures are part of its API.
+
+For transparent HTTP, pass this pool to `hellas_gateway::start_http` using
+`HttpGatewayOptions`. Its `paid` field is required. The options contain HTTP
+routes, archive policy, listener authentication and optional process wrapping;
+they have no model, tokenizer, inference cache or Evaluate settings. Shutting
+down the returned handle drains accepted paid work. Failed startup also drains
+recovery tasks. A host using the pool without a gateway must call its
+`PaidExecutionBackend::drain` method when shutting down.
+
+`paid-client` enables sessions without the executor or upstream-provider
+crates. `paid-provider` enables the provider runner and provisioning. Both
+include `work`, the shared typed configuration and provisioning API. Apple
+verification additionally needs `apple-verifier`; the file loader stores
+assertion counters under each provider's journal root in `apple-counters`.
+Counter files alone do not trigger channel funding during startup recovery.
+Work and WorkSetup each reuse an authenticated QUIC connection. Reconnection
+repeats Open with that connection's exporter and the channel's producer pin;
+no new consensus query is added to the per-request path.

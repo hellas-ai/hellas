@@ -55,7 +55,6 @@ fn options(provider_trust: Option<ProviderTrustAnchor>) -> GatewayOptions {
             directory: "unused-test-archive".into(),
             zdr: true,
         },
-        http_fetch: None,
         output_cache: Default::default(),
         paid_work: None,
         bearer_token_file: None,

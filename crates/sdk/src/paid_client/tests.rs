@@ -167,8 +167,19 @@ async fn both_paid_connections_open_before_disclosure_and_refuse_wrong_assurance
                 .unwrap(),
             Some(trust),
         );
-        dialer.setup().await.expect("setup authenticates");
-        dialer.work().await.expect("work authenticates");
+        let setup = dialer.setup().await.expect("setup authenticates");
+        let work = dialer.work().await.expect("work authenticates");
+        for _ in 0..3 {
+            assert_eq!(
+                setup.open_exporter().unwrap(),
+                dialer.setup().await.unwrap().open_exporter().unwrap()
+            );
+            assert_eq!(
+                work.open_exporter().unwrap(),
+                dialer.work().await.unwrap().open_exporter().unwrap()
+            );
+        }
+        work.connection().close(0u32.into(), b"test reconnect");
         *dialer.producer.lock().unwrap() = Some(
             ProducerSigningKey::from_secret_bytes([6; 32])
                 .unwrap()
@@ -185,6 +196,7 @@ async fn both_paid_connections_open_before_disclosure_and_refuse_wrong_assurance
                 .contains("differs from the payment channel")
         );
         *dialer.producer.lock().unwrap() = None;
+        setup.connection().close(0u32.into(), b"test reconnect");
         dialer.trust.as_mut().unwrap().required_assurance = Assurance::AppleAppAttest;
         let error = dialer
             .setup()

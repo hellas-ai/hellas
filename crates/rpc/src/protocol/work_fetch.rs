@@ -701,6 +701,16 @@ pub fn terminal_fetch_result(
     transcript: &[OutputEventEnvelope],
     assurance: Assurance,
 ) -> Result<PaidJobResultV1, PaidWorkError> {
+    Ok(verify_terminal_fetch_result(channel, authorization, transcript, assurance)?.0)
+}
+
+/// Keep the authenticated output for profile-specific checks at the same boundary.
+pub(super) fn verify_terminal_fetch_result(
+    channel: &PaidChannel,
+    authorization: &PaidJobAuthorizationV1,
+    transcript: &[OutputEventEnvelope],
+    assurance: Assurance,
+) -> Result<(PaidJobResultV1, crate::fetch::FetchOutput), PaidWorkError> {
     let input = InputCommitment::from_digest(authorization.request_commitment.digest());
     let output = crate::fetch::verify_output_events(input, assurance, transcript)
         .map_err(|error| PaidWorkError::Transcript(error.to_string()))?;
@@ -727,16 +737,19 @@ pub fn terminal_fetch_result(
     crate::fetch::decode_fetch_terminal_payload(terminal_payload)
         .map_err(|error| PaidWorkError::Transcript(error.to_string()))?;
     let work_id = work_id(channel, authorization);
-    Ok(PaidJobResultV1 {
-        work_id,
-        terminal_transcript_commitment: terminal_event.event_commitment(),
-        canonical_output_digest: fetch_canonical_output_digest(
-            channel.network(),
+    Ok((
+        PaidJobResultV1 {
             work_id,
-            event_payloads,
-            terminal_payload,
-        ),
-    })
+            terminal_transcript_commitment: terminal_event.event_commitment(),
+            canonical_output_digest: fetch_canonical_output_digest(
+                channel.network(),
+                work_id,
+                event_payloads,
+                terminal_payload,
+            ),
+        },
+        output,
+    ))
 }
 
 // ── Bounds ────────────────────────────────────────────────────────────

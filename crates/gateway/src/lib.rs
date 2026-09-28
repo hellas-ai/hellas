@@ -43,7 +43,7 @@ pub use execution::{
     CausalLmExecutionEnvironment, CliRuntime, ExecutionEvent, ExecutionRequest,
     ExecutionRequestOptions, ExecutionStrategy, Outcome, PreparedExecution, StopReason,
 };
-pub use http_fetch::HttpGatewayConfig;
+pub use http_fetch::{HttpGatewayConfig, HttpGatewayOptions, start_http};
 
 const DEFAULT_HTTP_PORT: u16 = 8080;
 
@@ -137,7 +137,6 @@ impl
 
 pub struct GatewayOptions {
     pub archive: ArchiveOptions,
-    pub http_fetch: Option<HttpGatewayConfig>,
     pub output_cache: cache::CacheOptions,
     pub paid_work: Option<Arc<dyn PaidExecutionBackend>>,
     /// Load or create a stable bearer credential in a private file.
@@ -281,9 +280,6 @@ pub async fn start(options: GatewayOptions) -> anyhow::Result<GatewayHandle> {
 }
 
 async fn start_gateway(options: GatewayOptions) -> anyhow::Result<GatewayHandle> {
-    if options.http_fetch.is_some() {
-        return http_fetch::start(options).await;
-    }
     let listener = bind_gateway(
         &options.host,
         options.port,
@@ -479,7 +475,15 @@ async fn finish_paid_work(
 
 /// CLI lifecycle wrapper around [`start`].
 pub async fn run(options: GatewayOptions) -> anyhow::Result<()> {
-    let mut handle = start(options).await?;
+    wait_for_shutdown(start(options).await?).await
+}
+
+/// Run a paid HTTP gateway with process signal handling.
+pub async fn run_http(options: HttpGatewayOptions) -> anyhow::Result<()> {
+    wait_for_shutdown(start_http(options).await?).await
+}
+
+async fn wait_for_shutdown(mut handle: GatewayHandle) -> anyhow::Result<()> {
     tokio::select! {
         signal = shutdown_signal() => {
             signal?;

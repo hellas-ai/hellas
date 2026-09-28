@@ -8,6 +8,10 @@ use reqwest::Url;
 
 use super::responses_fetch::{execute_responses_request, responses_http_client};
 
+#[derive(Debug, thiserror::Error)]
+#[error("OpenAI API key is empty")]
+pub struct EmptyOpenAiKey;
+
 #[derive(Clone)]
 pub struct OpenAiResponsesFetchProvider {
     client: reqwest::Client,
@@ -23,16 +27,16 @@ impl OpenAiResponsesFetchProvider {
         if bearer_token.is_empty() {
             bail!("environment variable {api_key_env} is empty");
         }
-        Self::with_bearer(bearer_token)
+        Ok(Self::with_bearer(bearer_token)?)
     }
 
     /// Construct from a secret supplied by an embedding host without routing
     /// it through process-wide environment state.
-    pub fn with_bearer(bearer_token: impl Into<String>) -> anyhow::Result<Self> {
+    pub fn with_bearer(bearer_token: impl Into<String>) -> Result<Self, EmptyOpenAiKey> {
         let bearer_token = bearer_token.into();
         let bearer_token = bearer_token.trim().to_owned();
         if bearer_token.is_empty() {
-            bail!("OpenAI API key is empty");
+            return Err(EmptyOpenAiKey);
         }
         let endpoint = Url::parse(OPENAI_RESPONSES_ENDPOINT)
             .expect("built-in OpenAI Responses endpoint is valid");

@@ -2987,6 +2987,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "tempfile",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-rustls",
  "tracing",
@@ -3047,7 +3048,6 @@ dependencies = [
 name = "hellas-sdk"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "async-stream",
  "bytes",
  "futures",
@@ -3058,12 +3058,14 @@ dependencies = [
  "hellas-executor",
  "hellas-gateway",
  "hellas-kernel",
+ "hellas-private",
  "hellas-providers",
  "hellas-rpc",
  "hellas-wire",
  "hellas-work",
  "hex",
  "iroh",
+ "rand 0.10.2",
  "serde",
  "serde_json",
  "tempfile",

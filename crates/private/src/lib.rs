@@ -8,6 +8,9 @@
 //! in a Windows DACL for the same reason root is on Unix: they can reach the
 //! object regardless of what it says.
 
+mod regular;
+pub use regular::{open_regular_file, read_bounded_regular_file};
+
 use std::fs::File;
 use std::io::{self, Write as _};
 use std::path::Path;

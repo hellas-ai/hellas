@@ -1,6 +1,22 @@
-//! HTTP gateway adapter over the same durable paid-work client as the CLI.
+//! Reusable paid gateway pool over durable client-owned state channels.
 
-use super::*;
+use crate::paid_client::{
+    PaidClientError, PaidWorkOptions, PaidWorkResult, PaidWorkSession, bind_paid_endpoint,
+    check_evaluate_input,
+};
+use hellas_kernel::Secp256k1Signer;
+use hellas_rpc::protocol::artifacts::PreparedPaidInputV1;
+use hellas_rpc::protocol::work_setup::ProviderChannelPolicy;
+use hellas_work::work_store::journal::MAX_RECORD_BYTES;
+use iroh::EndpointId;
+use std::sync::atomic::AtomicBool;
+use std::time::Duration;
+
+mod config;
+mod error;
+pub use config::{PaidGatewayOptions, load_pool_options};
+pub use error::PoolError;
+type Result<T, E = PoolError> = std::result::Result<T, E>;
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use hellas_gateway::{
@@ -14,46 +30,12 @@ use hellas_rpc::protocol::artifacts::{
 };
 use hellas_rpc::protocol::work_profile::{PaidWorkPolicy, PreparedPaidWorkInput};
 use iroh::Endpoint;
-use serde::Deserialize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::Instrument;
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PoolFile {
-    providers: Vec<ProviderFile>,
-    #[serde(default = "acceptance_blocks")]
-    acceptance_blocks: u64,
-    #[serde(default = "terminal_blocks")]
-    terminal_blocks: u64,
-    #[serde(default = "payment_blocks")]
-    payment_blocks: u64,
-    #[serde(default = "timeout_secs")]
-    timeout_secs: u64,
-    #[serde(default = "max_pending_requests")]
-    max_pending_requests: usize,
-}
-
-const fn max_pending_requests() -> usize {
-    64
-}
-
-const fn acceptance_blocks() -> u64 {
-    16
-}
-const fn terminal_blocks() -> u64 {
-    64
-}
-const fn payment_blocks() -> u64 {
-    32
-}
-const fn timeout_secs() -> u64 {
-    300
-}
 
 // An OpenCode conversation has a substantial shared chat prefix. Smaller
 // checkpoints are not worth routing work around.
@@ -71,39 +53,21 @@ const CHANNEL_QUEUE_BUDGET: Duration = Duration::from_secs(1);
 const OUTPUT_BUFFER_BYTES: usize = 2 * MAX_RECORD_BYTES;
 const OUTPUT_EVENT_OVERHEAD: usize = 1024;
 const OUTPUT_BUFFER_EVENTS: usize = OUTPUT_BUFFER_BYTES / OUTPUT_EVENT_OVERHEAD;
-type BufferedEvent<E = ExecutionEvent> = (CliResult<E>, OwnedSemaphorePermit);
+type BufferedEvent<E = ExecutionEvent> = (Result<E>, OwnedSemaphorePermit);
 
 trait GatewayEvent: Send + 'static {
-    fn prefix(event: hellas_rpc::OutputEventEnvelope) -> CliResult<Self>
+    fn prefix(event: hellas_rpc::OutputEventEnvelope) -> Result<Self>
     where
         Self: Sized;
-    fn completed(output: PaidWorkResult) -> CliResult<Vec<Self>>
+    fn completed(output: PaidWorkResult) -> Result<Vec<Self>>
     where
         Self: Sized;
     fn is_terminal(&self) -> bool;
     fn bytes(&self) -> usize;
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ProviderFile {
-    work_config: PathBuf,
-    journal_root: PathBuf,
-    provider: EndpointId,
-    #[serde(default)]
-    provider_addrs: Vec<SocketAddr>,
-    bond: String,
-    payment_coins: Vec<String>,
-    omission_bond: u64,
-    /// Required enrollment pin for attested providers; optional for producer-signed work.
-    provider_genesis: Option<String>,
-    apple_app_id: Option<String>,
-    #[serde(default)]
-    apple_cd_hashes: Vec<String>,
-}
-
 struct Provider {
-    args: RunArgs,
+    args: PaidWorkOptions,
     policy: ProviderChannelPolicy,
     assurance: hellas_rpc::Assurance,
     /// A setup/channel journal has a single owner even with concurrent HTTP calls.
@@ -225,7 +189,7 @@ impl Drop for ProviderUse {
     }
 }
 
-struct PaidGateway {
+pub struct PaidGateway {
     providers: Vec<Arc<Provider>>,
     next: AtomicUsize,
     endpoint: Endpoint,
@@ -235,145 +199,74 @@ struct PaidGateway {
     tasks: Mutex<Vec<JoinHandle<()>>>,
 }
 
-pub async fn load_gateway_backend(
-    path: &Path,
-    transport_key: SecretKey,
-    settlement_key: Secp256k1Signer,
-    producer_key: hellas_rpc::ProducerSigningKey,
-    assurance: hellas_rpc::Assurance,
-) -> CliResult<Arc<dyn PaidExecutionBackend>> {
-    anyhow::ensure!(
-        producer_key.public_key()
-            == hellas_rpc::PublicKey::Secp256k1(settlement_key.party_key().to_bytes()),
-        "paid Fetch signer must match the settlement identity"
-    );
-    let bytes =
-        crate::commands::read_bounded_regular_file(path, "paid gateway config", MAX_RECORD_BYTES)?;
-    let file: PoolFile = serde_json::from_slice(&bytes)
-        .with_context(|| format!("invalid paid gateway config {}", path.display()))?;
-    anyhow::ensure!(
-        !file.providers.is_empty(),
-        "paid gateway requires at least one provider"
-    );
-    anyhow::ensure!(
-        file.timeout_secs > 0,
-        "paid gateway timeout_secs must be greater than zero"
-    );
-    anyhow::ensure!(
-        file.acceptance_blocks > 0 && file.terminal_blocks > 0 && file.payment_blocks > 0,
-        "paid gateway deadline spans must be greater than zero"
-    );
-    anyhow::ensure!(
-        file.max_pending_requests > 0 && file.max_pending_requests <= Semaphore::MAX_PERMITS,
-        "paid gateway max_pending_requests must be a positive supported semaphore capacity"
-    );
-    let mut providers = Vec::new();
-    let mut journals = std::collections::BTreeSet::new();
-    let mut endpoints = std::collections::BTreeSet::new();
-    let mut funding = std::collections::BTreeSet::new();
-    for provider in file.providers {
-        anyhow::ensure!(
-            provider.work_config.is_absolute() && provider.journal_root.is_absolute(),
-            "paid gateway work_config and journal_root must be absolute runtime paths"
-        );
-        anyhow::ensure!(
-            journals.insert(provider.journal_root.clone()),
-            "paid providers must have distinct journal roots"
-        );
-        anyhow::ensure!(
-            endpoints.insert(provider.provider),
-            "paid gateway repeats provider {}",
-            provider.provider
-        );
-        anyhow::ensure!(
-            !provider.payment_coins.is_empty(),
-            "paid provider needs payment_coins"
-        );
-        coins(&provider.payment_coins)?;
-        edge_id("bond", &provider.bond)?;
-        for coin in &provider.payment_coins {
-            anyhow::ensure!(
-                funding.insert(fixed_hex::<32>("payment_coins", coin)?),
-                "a payment coin cannot fund two provider channels"
-            );
+impl PaidGateway {
+    /// Open a reusable pool. Funding, recovery, queueing and payment are shared
+    /// by CLI and embedding applications. Call `drain` during host shutdown.
+    pub async fn open(
+        options: PaidGatewayOptions,
+        identity: crate::ClientIdentity,
+    ) -> Result<Arc<Self>> {
+        options.validate()?;
+        let settlement_key = Secp256k1Signer::from_secret_scalar(identity.caller_secret_bytes())
+            .map_err(|_| PoolError::Invalid("settlement identity is not secp256k1"))?;
+        let providers = options
+            .providers
+            .into_iter()
+            .map(|args| {
+                Arc::new(Provider {
+                    policy: args.config.provider_policy(),
+                    assurance: args
+                        .provider_trust
+                        .as_ref()
+                        .map_or(hellas_rpc::Assurance::ProducerSigned, |trust| {
+                            trust.required_assurance
+                        }),
+                    args,
+                    serial: AsyncMutex::new(None),
+                    pending: AtomicUsize::new(0),
+                    cache: Mutex::new(PrefixCache::default()),
+                    unavailable_until: Mutex::new(None),
+                })
+            })
+            .collect();
+        let gateway = Arc::new(PaidGateway {
+            admission: Arc::new(Semaphore::new(options.max_pending_requests)),
+            providers,
+            next: AtomicUsize::new(0),
+            // One transport identity has one relay registration, shared by every
+            // provider and request for the lifetime of this gateway.
+            endpoint: bind_paid_endpoint(identity.transport_key()).await?,
+            settlement_key,
+            producer_key: identity.caller_key().clone(),
+            tasks: Mutex::new(Vec::new()),
+        });
+        // Restart recovery uses the retained input and certificate, never a new job.
+        // Empty journal roots do not fund a channel until an HTTP request arrives.
+        for provider in &gateway.providers {
+            let _recovery = gateway.submit::<ExecutionEvent>(
+                vec![(
+                    provider.clone(),
+                    Route {
+                        available: true,
+                        cache_affinity_tokens: 0,
+                        pending: 0,
+                    },
+                )],
+                None,
+                None,
+                Some(RECOVERY_ATTEMPT_TIMEOUT),
+                None,
+            )?;
         }
-        let config = load_work_config(&provider.work_config)?;
-        providers.push(Arc::new(Provider {
-            policy: config.provider_policy(),
-            assurance,
-            args: RunArgs {
-                provider_genesis: provider
-                    .provider_genesis
-                    .map(|value| value.parse())
-                    .transpose()?,
-                apple_app_id: provider.apple_app_id,
-                apple_cd_hashes: provider
-                    .apple_cd_hashes
-                    .iter()
-                    .map(|value| fixed_hex::<32>("apple_cd_hashes", value))
-                    .collect::<CliResult<_>>()?,
-                work_config: provider.work_config,
-                journal_root: provider.journal_root,
-                provider: provider.provider,
-                provider_addrs: provider.provider_addrs,
-                bond: provider.bond,
-                payment_coins: provider.payment_coins,
-                omission_bond: provider.omission_bond,
-                prepared_input: PathBuf::new(),
-                output: None,
-                acceptance_blocks: file.acceptance_blocks,
-                terminal_blocks: file.terminal_blocks,
-                payment_blocks: file.payment_blocks,
-                timeout_secs: file.timeout_secs,
-                settle: false,
-            },
-            serial: AsyncMutex::new(None),
-            pending: AtomicUsize::new(0),
-            cache: Mutex::new(PrefixCache::default()),
-            unavailable_until: Mutex::new(None),
-        }));
-        let provider = providers.last().expect("provider just added");
-        // Validated now so a bad pin fails startup before the gateway binds;
-        // the anchor itself is recomputed when the channel opens.
-        paid_provider_trust(&provider.args, provider.assurance)?;
+        Ok(gateway)
     }
-    let gateway = Arc::new(PaidGateway {
-        admission: Arc::new(Semaphore::new(file.max_pending_requests)),
-        providers,
-        next: AtomicUsize::new(0),
-        // One transport identity has one relay registration, shared by every
-        // provider and request for the lifetime of this gateway.
-        endpoint: bind_paid_endpoint(transport_key).await?,
-        settlement_key,
-        producer_key,
-        tasks: Mutex::new(Vec::new()),
-    });
-    // Restart recovery uses the retained input and certificate, never a new job.
-    // Empty journal roots do not fund a channel until an HTTP request arrives.
-    for provider in &gateway.providers {
-        let _recovery = gateway.submit::<ExecutionEvent>(
-            vec![(
-                provider.clone(),
-                Route {
-                    available: true,
-                    cache_affinity_tokens: 0,
-                    pending: 0,
-                },
-            )],
-            None,
-            None,
-            Some(RECOVERY_ATTEMPT_TIMEOUT),
-            None,
-        )?;
-    }
-    Ok(gateway)
 }
 
 impl PaidGateway {
     fn execute_tokens(
         &self,
         request: PaidExecutionRequest,
-    ) -> CliResult<BoxStream<'static, CliResult<ExecutionEvent>>> {
+    ) -> Result<BoxStream<'static, Result<ExecutionEvent>>> {
         let permit = self
             .admission
             .clone()
@@ -387,10 +280,9 @@ impl PaidGateway {
             .iter()
             .filter(|provider| check_evaluate_input(&provider.policy, &prepared).is_ok())
             .collect::<Vec<_>>();
-        anyhow::ensure!(
-            !eligible.is_empty(),
-            "no provider policy matches this environment, token limit, and stop token list"
-        );
+        if eligible.is_empty() {
+            return Err(PoolError::NoMatchingPolicy);
+        }
         let start = self.next.fetch_add(1, Ordering::Relaxed) % eligible.len();
         let mut candidates = (0..eligible.len())
             .map(|offset| {
@@ -422,7 +314,7 @@ impl PaidGateway {
         cache_update: Option<CacheUpdate>,
         recovery_timeout: Option<Duration>,
         permit: Option<OwnedSemaphorePermit>,
-    ) -> CliResult<BoxStream<'static, CliResult<E>>> {
+    ) -> Result<BoxStream<'static, Result<E>>> {
         // Admission can precede local request preparation. Serialize the final
         // gate check and registration with drain's close-and-snapshot boundary.
         let mut tasks = self.tasks.lock().expect("paid task list poisoned");
@@ -435,7 +327,7 @@ impl PaidGateway {
         let (overflow, overflow_receiver) = watch::channel(false);
         let output_budget = Arc::new(Semaphore::new(OUTPUT_BUFFER_BYTES));
         let Some((initial_provider, _initial_route)) = candidates.first() else {
-            anyhow::bail!("paid gateway has no provider candidate");
+            return Err(PoolError::NoMatchingPolicy);
         };
         let span = hellas_rpc::request_span!(
             target: "hellas_request", "paid.gateway",
@@ -449,8 +341,7 @@ impl PaidGateway {
         let mut occupied = prepared
             .as_ref()
             .map(|_| ProviderUse::new(initial_provider.clone()));
-        let timeout = recovery_timeout
-            .unwrap_or_else(|| Duration::from_secs(initial_provider.args.timeout_secs));
+        let timeout = recovery_timeout.unwrap_or_else(|| initial_provider.args.timeout);
         // Queueing, recovery and fallback all consume the same request budget.
         let deadline = tokio::time::Instant::now() + timeout;
         let task_span = span.clone();
@@ -497,7 +388,7 @@ impl PaidGateway {
                             }
                         }
                     };
-                    if prepared.is_none() && (!provider.args.journal_root.try_exists()? || std::fs::read_dir(&provider.args.journal_root)?.next().is_none()) {
+                    if prepared.is_none() && !has_retained_setup(&provider.args)? {
                         continue;
                     }
                     // Recheck after queueing, including restored channels whose
@@ -509,14 +400,14 @@ impl PaidGateway {
                     if session.is_none() {
                         match connect_before_deadline(
                             &sender, streamed, deadline, PROVIDER_CONNECTION_TIMEOUT,
-                            open_paid_channel(&provider.args, endpoint.clone(), settlement_key.clone(), provider.assurance),
+                            async { PaidWorkSession::open(provider.args.clone(), endpoint.clone(), settlement_key.clone()).await.map_err(PoolError::from) },
                         ).await
                         {
                             Ok(opened) => {
                                 *session = Some(opened);
                             }
                             Err(error) => {
-                                if !recovery && error.is::<RequestStopped>() { return Err(error); }
+                                if !recovery && matches!(error, PoolError::Stopped(_)) { return Err(error); }
                                 provider.connection_failed();
                                 if recovery {
                                     tracing::debug!(provider = %provider.args.provider, error = %format!("{error:#}"),
@@ -540,10 +431,8 @@ impl PaidGateway {
                             session.run(None, true, None),
                         )
                         .await
-                        .map_err(|_| anyhow::anyhow!(
-                            "retained paid work did not recover within {RECOVERY_ATTEMPT_TIMEOUT:?}"
-                        ))
-                        .and_then(|result| result.map_err(anyhow::Error::from));
+                        .map_err(|_| PoolError::RecoveryTimeout)
+                        .and_then(|result| result.map_err(PoolError::from));
                         if let Err(error) = recovery {
                             // Nothing in this path has proposed the fresh request.
                             // Keep the journal for a later recovery and route this
@@ -573,11 +462,11 @@ impl PaidGateway {
                             request_session.run_with_admission(input, true, on_progress, Some(&proposed)).await
                         },
                     ).await
-                        .and_then(|result| result.map_err(anyhow::Error::from))
+                        .and_then(|result| result.map_err(PoolError::from))
                         .and_then(|output| output.map(E::completed).transpose())
                         .map(Option::unwrap_or_default);
                     if let Err(error) = &result {
-                        if !recovery && error.is::<RequestStopped>()
+                        if !recovery && matches!(error, PoolError::Stopped(_))
                             && session.with_state(|state| state.proposal_nonce_high_water())? == proposal_nonce
                         {
                             return result;
@@ -585,16 +474,14 @@ impl PaidGateway {
                         provider.cache.lock().expect("provider cache poisoned").replace(None);
                         if recovery {
                             provider.connection_failed();
-                            return result.with_context(|| {
-                                format!("retained paid work at provider {}", provider.args.provider)
-                            });
+                            return result.map_err(|source| PoolError::Provider { provider: provider.args.provider, source: Box::new(source) });
                         }
                         // A failed journal append can leave a durable proposal that
                         // is not reflected in memory yet. Keep that failure with
                         // this provider, just like a proposal with no response.
                         let uncertain_append = matches!(
-                            error.downcast_ref::<hellas_sdk::paid_client::PaidClientError>(),
-                            Some(hellas_sdk::paid_client::PaidClientError::Propose(hellas_work::work::ProposeError::Store(_))),
+                            error,
+                            PoolError::Client(PaidClientError::Propose(hellas_work::work::ProposeError::Store(_))),
                         );
                         if !already_proposed && !uncertain_append
                             && session.with_state(|state| state.proposal_nonce_high_water())? == proposal_nonce
@@ -611,12 +498,9 @@ impl PaidGateway {
                             cache_update.apply(&mut provider.cache.lock().expect("provider cache poisoned"));
                         }
                     }
-                    return result.with_context(|| format!("paid provider {}", provider.args.provider));
+                    return result.map_err(|source| PoolError::Provider { provider: provider.args.provider, source: Box::new(source) });
                 }
-                Err(anyhow::anyhow!(
-                    "no eligible paid provider could start this request: {}",
-                    provider_errors.join("; ")
-                ))
+                Err(PoolError::ProvidersUnavailable(provider_errors))
             }.await;
             if let Err(error) = &result {
                 if recovery {
@@ -645,6 +529,20 @@ impl PaidGateway {
     }
 }
 
+fn has_retained_setup(options: &PaidWorkOptions) -> Result<bool> {
+    let found = hellas_work::work_store::discover_setups(
+        &options.journal_root,
+        options.config.chain.network,
+    )?;
+    // Counter files and other metadata alone must never trigger channel funding.
+    // Unidentified setup journals still go through ordinary recovery and fail
+    // closed; discovery is only a prefilter, not a signature check.
+    Ok(!found.unidentified.is_empty()
+        || found.setups.iter().any(|setup| {
+            setup.role == hellas_work::work_store::Role::Client && setup.bond_edge == options.bond
+        }))
+}
+
 impl PaidExecutionBackend for PaidGateway {
     fn fetch_providers(&self) -> Vec<EndpointId> {
         self.providers.iter().filter(|provider| matches!(provider.policy.execution_policy,
@@ -666,7 +564,7 @@ impl PaidExecutionBackend for PaidGateway {
             .clone()
             .try_acquire_owned()
             .map_err(|_| hellas_gateway::PaidGatewayBusy)?;
-        let submit = || -> CliResult<_> {
+        let submit = || -> Result<_> {
             let environment = hellas_rpc::FetchEnvironment::Http;
             let input = hellas_rpc::fetch::build_input_events_with_retention(
                 &request.service,
@@ -700,7 +598,11 @@ impl PaidExecutionBackend for PaidGateway {
     }
 
     fn timeout(&self) -> Duration {
-        Duration::from_secs(self.providers[0].args.timeout_secs)
+        self.providers
+            .iter()
+            .map(|provider| provider.args.timeout)
+            .max()
+            .unwrap_or_default()
     }
 
     fn execute(
@@ -750,13 +652,13 @@ impl PaidExecutionBackend for PaidGateway {
 }
 
 fn paid_stream<E: Send + 'static>(
-    stream: CliResult<BoxStream<'static, CliResult<E>>>,
+    stream: Result<BoxStream<'static, Result<E>>>,
 ) -> Result<hellas_gateway::PaidOutputStream<E>, hellas_gateway::PaidGatewayError> {
     use futures::StreamExt as _;
-    fn convert(error: anyhow::Error) -> hellas_gateway::PaidGatewayError {
-        match error.downcast::<hellas_gateway::PaidGatewayBusy>() {
-            Ok(busy) => busy.into(),
-            Err(error) => hellas_gateway::PaidGatewayError::Payment(error.into_boxed_dyn_error()),
+    fn convert(error: PoolError) -> hellas_gateway::PaidGatewayError {
+        match error {
+            PoolError::Busy(busy) => busy.into(),
+            error => hellas_gateway::PaidGatewayError::Payment(Box::new(error)),
         }
     }
     Ok(Box::pin(
@@ -768,7 +670,7 @@ fn emit<E: GatewayEvent>(
     sender: &mpsc::Sender<BufferedEvent<E>>,
     overflow: &watch::Sender<bool>,
     budget: &Arc<Semaphore>,
-    event: CliResult<E>,
+    event: Result<E>,
 ) {
     if *overflow.borrow() || sender.is_closed() {
         return;
@@ -796,13 +698,13 @@ fn emit<E: GatewayEvent>(
 fn response_stream<E: Send + 'static>(
     mut receiver: mpsc::Receiver<BufferedEvent<E>>,
     mut overflow: watch::Receiver<bool>,
-) -> BoxStream<'static, CliResult<E>> {
+) -> BoxStream<'static, Result<E>> {
     Box::pin(async_stream::try_stream! {
         loop {
             let full = *overflow.borrow();
             if full {
                 receiver.close();
-                Err(anyhow::anyhow!("paid output consumer is too slow; accepted work continues settlement"))?;
+                Err(PoolError::SlowConsumer)?;
             }
             let event = tokio::select! {
                 biased;
@@ -821,7 +723,7 @@ fn response_stream<E: Send + 'static>(
 }
 
 #[derive(Debug, thiserror::Error)]
-enum RequestStopped {
+pub enum RequestStopped {
     #[error("paid request disconnected before proposal")]
     Disconnected,
     #[error("paid request deadline elapsed, including queue wait")]
@@ -835,17 +737,13 @@ async fn connect_before_deadline<T, E>(
     cancel_on_disconnect: bool,
     deadline: tokio::time::Instant,
     connection_timeout: Duration,
-    connection: impl std::future::Future<Output = CliResult<T>>,
-) -> CliResult<T> {
+    connection: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
     let connection_deadline = deadline.min(tokio::time::Instant::now() + connection_timeout);
     before_proposal(sender, cancel_on_disconnect, deadline, |_| async {
         tokio::time::timeout_at(connection_deadline, connection)
             .await
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "paid provider connection exceeded its {connection_timeout:?} limit"
-                )
-            })?
+            .map_err(|_| PoolError::ConnectionTimeout(connection_timeout))?
     })
     .await?
 }
@@ -857,7 +755,7 @@ async fn before_proposal<T, F: std::future::Future<Output = T>, E>(
     cancel_on_disconnect: bool,
     deadline: tokio::time::Instant,
     operation: impl FnOnce(Arc<AtomicBool>) -> F,
-) -> CliResult<T> {
+) -> Result<T> {
     if tokio::time::Instant::now() >= deadline {
         return Err(RequestStopped::Deadline.into());
     }
@@ -883,11 +781,12 @@ async fn before_proposal<T, F: std::future::Future<Output = T>, E>(
 fn prepare_request(
     request: PaidExecutionRequest,
     signer: &Secp256k1Signer,
-) -> CliResult<PreparedPaidInputV1> {
-    anyhow::ensure!(
-        request.max_new_tokens > 0,
-        "max_new_tokens must be greater than zero"
-    );
+) -> Result<PreparedPaidInputV1> {
+    if request.max_new_tokens == 0 {
+        return Err(PoolError::Invalid(
+            "max_new_tokens must be greater than zero",
+        ));
+    }
     let manifest = request.environment.manifest();
     hellas_client::iroh::validate_causal_lm_quote_request(
         &hellas_rpc::pb::courtesy::QuoteTokensRequest {
@@ -921,7 +820,7 @@ fn prepare_request(
     ))
 }
 
-fn output_events(output: PaidWorkResult) -> CliResult<Vec<ExecutionEvent>> {
+fn output_events(output: PaidWorkResult) -> Result<Vec<ExecutionEvent>> {
     let events =
         hellas_rpc::protocol::work::decode_transcript(&output.transcript, MAX_RECORD_BYTES)?;
     let verified = hellas_rpc::evaluate::verify_output_events_for_producer(
@@ -940,11 +839,9 @@ fn output_events(output: PaidWorkResult) -> CliResult<Vec<ExecutionEvent>> {
     let terminal = verified.terminal;
     let stop_reason =
         if terminal.stop_reason == hellas_rpc::evaluate::EvaluateStopReason::STOP_TOKEN {
-            StopReason::StopToken(
-                terminal
-                    .matched_stop_token_id
-                    .context("signed stop-token result omitted its token ID")?,
-            )
+            StopReason::StopToken(terminal.matched_stop_token_id.ok_or(
+                PoolError::MissingOutput("signed stop-token result omitted its token ID"),
+            )?)
         } else {
             StopReason::MaxNewTokens
         };
@@ -965,14 +862,14 @@ fn output_events(output: PaidWorkResult) -> CliResult<Vec<ExecutionEvent>> {
 }
 
 impl GatewayEvent for ExecutionEvent {
-    fn prefix(event: hellas_rpc::OutputEventEnvelope) -> CliResult<Self> {
+    fn prefix(event: hellas_rpc::OutputEventEnvelope) -> Result<Self> {
         let delta = hellas_rpc::evaluate::decode_token_delta_payload(event.payload())?;
         Ok(Self::Chunk {
             position: delta.end_position()?,
             tokens: delta.token_bytes(),
         })
     }
-    fn completed(output: PaidWorkResult) -> CliResult<Vec<Self>> {
+    fn completed(output: PaidWorkResult) -> Result<Vec<Self>> {
         output_events(output)
     }
     fn is_terminal(&self) -> bool {
@@ -991,21 +888,22 @@ impl GatewayEvent for ExecutionEvent {
 }
 
 impl GatewayEvent for FetchEvent {
-    fn prefix(event: hellas_rpc::OutputEventEnvelope) -> CliResult<Self> {
+    fn prefix(event: hellas_rpc::OutputEventEnvelope) -> Result<Self> {
         Ok(hellas_rpc::fetch::decode_fetch_event_payload(
             event.payload(),
         )?)
     }
-    fn completed(output: PaidWorkResult) -> CliResult<Vec<Self>> {
+    fn completed(output: PaidWorkResult) -> Result<Vec<Self>> {
         let events = hellas_rpc::protocol::work::decode_transcript(
             &output.transcript,
             hellas_rpc::protocol::work_fetch::MAX_FETCH_TRANSCRIPT_BYTES,
         )?;
-        let terminal = events.last().context("paid Fetch omitted terminal")?;
-        anyhow::ensure!(
-            terminal.event().body().kind() == hellas_rpc::fetch::OUTPUT_TERMINAL_KIND,
-            "paid Fetch terminal kind"
-        );
+        let terminal = events
+            .last()
+            .ok_or(PoolError::MissingOutput("paid Fetch omitted terminal"))?;
+        if terminal.event().body().kind() != hellas_rpc::fetch::OUTPUT_TERMINAL_KIND {
+            return Err(PoolError::MissingOutput("paid Fetch terminal kind"));
+        }
         let terminal =
             hellas_rpc::fetch::decode_fetch_terminal_payload(terminal.payload())?.to_output_event();
         tracing::info!(work_id = %hex::encode(output.work_id.as_bytes()), job_price = output.job_price,
@@ -1024,6 +922,76 @@ impl GatewayEvent for FetchEvent {
 mod tests {
     use super::*;
     use iroh::Endpoint;
+
+    fn pool_options(fixture: &crate::test_support::PaidFixture) -> PaidGatewayOptions {
+        use hellas_kernel::{CoinId, Funding, List};
+        PaidGatewayOptions {
+            max_pending_requests: 4,
+            providers: vec![PaidWorkOptions {
+                config: fixture.config.clone(),
+                journal_root: fixture.root.path().join("client"),
+                provider: iroh::SecretKey::from_bytes(&[3; 32]).public(),
+                provider_addrs: Vec::new(),
+                provider_trust: None,
+                bond: fixture.descriptor.bond_edge(),
+                payment_funding: Funding::new(
+                    List::take([CoinId::from_bytes([1; 32]); 4], 1),
+                    List::empty(CoinId::from_bytes([0; 32])),
+                ),
+                omission_bond: 601,
+                acceptance_blocks: 16,
+                terminal_blocks: 64,
+                payment_blocks: 32,
+                timeout: Duration::from_secs(30),
+            }],
+        }
+    }
+
+    #[test]
+    fn counter_files_do_not_trigger_funding_but_incomplete_setup_recovers() {
+        let fixture = crate::test_support::PaidFixture::new();
+        let options = pool_options(&fixture);
+        let provider = &options.providers[0];
+        assert!(!has_retained_setup(provider).unwrap());
+        std::fs::create_dir_all(provider.journal_root.join("apple-counters")).unwrap();
+        std::fs::write(
+            provider
+                .journal_root
+                .join("apple-counters/producer.counter"),
+            [1],
+        )
+        .unwrap();
+        assert!(!has_retained_setup(provider).unwrap());
+        let store = hellas_work::work_store::SetupStore::open(
+            &provider.journal_root,
+            provider.config.chain.network,
+            provider.bond,
+            hellas_work::work_store::Role::Client,
+            &hellas_kernel::Secp256k1Verifier::new(),
+        )
+        .unwrap();
+        drop(store);
+        assert!(has_retained_setup(provider).unwrap());
+    }
+
+    #[tokio::test]
+    async fn shared_pool_rejects_reused_funding_before_opening_or_writing() {
+        let fixture = crate::test_support::PaidFixture::new();
+        let mut options = pool_options(&fixture);
+        let mut second = options.providers[0].clone();
+        second.provider = iroh::SecretKey::from_bytes(&[4; 32]).public();
+        second.journal_root = fixture.root.path().join("other");
+        options.providers.push(second);
+        let result = PaidGateway::open(options, crate::ClientIdentity::generate()).await;
+        assert!(matches!(
+            result,
+            Err(PoolError::Invalid(
+                "a payment coin cannot fund two provider channels or appear twice"
+            ))
+        ));
+        assert!(!fixture.root.path().join("client").exists());
+        assert!(!fixture.root.path().join("other").exists());
+    }
 
     #[tokio::test]
     async fn disconnected_queued_request_never_starts_work() {
@@ -1091,7 +1059,7 @@ mod tests {
             drop(receiver);
         };
         let (result, ()) = tokio::join!(operation, disconnect);
-        assert!(result.unwrap_err().is::<RequestStopped>());
+        assert!(matches!(result.unwrap_err(), PoolError::Stopped(_)));
         assert!(!signed.load(Ordering::Acquire));
     }
 
@@ -1104,11 +1072,11 @@ mod tests {
             true,
             deadline,
             Duration::from_millis(10),
-            std::future::pending::<CliResult<()>>(),
+            std::future::pending::<Result<()>>(),
         )
         .await
         .unwrap_err();
-        assert!(!failed.is::<RequestStopped>());
+        assert!(!matches!(failed, PoolError::Stopped(_)));
         assert_eq!(
             connect_before_deadline(&sender, true, deadline, Duration::from_millis(10), async {
                 Ok("second provider")
@@ -1126,7 +1094,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(expired.is::<RequestStopped>());
+        assert!(matches!(expired, PoolError::Stopped(_)));
     }
 
     #[tokio::test]
@@ -1146,7 +1114,7 @@ mod tests {
             started.store(true, Ordering::Release);
         })
         .await;
-        assert!(result.unwrap_err().is::<RequestStopped>());
+        assert!(matches!(result.unwrap_err(), PoolError::Stopped(_)));
         assert!(!started.load(Ordering::Acquire));
     }
 
@@ -1169,12 +1137,10 @@ mod tests {
         let permit = gateway.admission.clone().try_acquire_owned().unwrap();
         gateway.drain().await;
         let result = gateway.submit::<ExecutionEvent>(Vec::new(), None, None, None, Some(permit));
-        assert!(
-            result
-                .err()
-                .expect("submission after drain")
-                .is::<hellas_gateway::PaidGatewayBusy>()
-        );
+        assert!(matches!(
+            result.err().expect("submission after drain"),
+            PoolError::Busy(_)
+        ));
         assert!(gateway.tasks.lock().unwrap().is_empty());
         assert_eq!(gateway.admission.available_permits(), 1);
     }

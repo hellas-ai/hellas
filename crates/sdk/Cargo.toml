@@ -20,7 +20,6 @@ apple-verifier = ["hellas-attestation/apple-app-attest"]
 gateway = ["dep:hellas-gateway"]
 provider = [
     "client",
-    "dep:anyhow",
     "dep:hellas-executor",
     "dep:hellas-providers",
     "dep:iroh",
@@ -30,16 +29,22 @@ provider = [
 ]
 local-control = ["dep:tokio", "hellas-rpc/host-control", "hellas-wire/unix"]
 
-paid-work = [
-    "dep:async-stream",
-    "provider",
+paid-client = ["work", "client", "dep:async-stream", "hellas-client/work"]
+paid-provider = ["work", "provider"]
+paid-gateway = ["paid-client", "gateway", "dep:rand"]
+# Shared channel configuration and provisioning, independent of execution servers.
+work = [
+    "dep:iroh",
+    "hellas-wire/iroh",
+    "dep:tokio",
+    "dep:tracing",
     "dep:hellas-chain",
     "hellas-chain/client",
     "hellas-chain/work-watcher",
     "dep:hellas-kernel",
     "hellas-kernel/secp256k1",
     "dep:hellas-work",
-    "hellas-client/work",
+    "dep:hellas-private",
     "hellas-rpc/work",
     "dep:futures",
     "dep:serde",
@@ -49,7 +54,6 @@ paid-work = [
 ]
 
 [dependencies]
-anyhow = { workspace = true, optional = true }
 async-stream = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 futures-core = { workspace = true, optional = true }
@@ -59,12 +63,14 @@ hellas-client = { workspace = true, optional = true }
 hellas-executor = { workspace = true, default-features = false, optional = true }
 hellas-gateway = { workspace = true, optional = true }
 hellas-kernel = { workspace = true, default-features = false, optional = true }
+hellas-private = { workspace = true, optional = true }
 hellas-providers = { workspace = true, optional = true }
 hellas-rpc = { workspace = true, features = ["execute", "fetch", "courtesy"] }
 hellas-wire = { workspace = true, features = ["mux"] }
 hellas-work = { workspace = true, optional = true }
 hex = { workspace = true, optional = true }
 iroh = { workspace = true, features = ["tls-ring"], optional = true }
+rand = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 tempfile = { workspace = true }

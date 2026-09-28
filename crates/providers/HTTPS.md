@@ -141,3 +141,28 @@ and a signed terminal. Hop-by-hop and framing headers (`connection`,
 connection, so they are not part of the signed head; the body bytes are the
 only length truth. `HttpFetchResponse::from_output` reconstructs the body
 and checks ordering and size after transcript signature verification.
+
+## Provider-owned credential demonstration
+
+Generic HTTPS preserves provider-side API-key injection. The buyer signs only
+`credential: "account-1"`; the provider resolves that alias and inserts its
+secret header immediately before sending HTTPS. The key is absent from the
+buyer input transcript and the normal response transcript. Credentialed
+requests require public trust roots, an exact permitted origin/path/method,
+and no caller override of the credential header. Redirects are not followed.
+Scope aliases to upstreams you trust: an upstream receives the header and could
+include it in its response; a transparent proxy cannot promise to hide a secret
+that the upstream itself returns.
+
+Run the offline TLS demonstration from the Hellas checkout:
+
+```sh
+nix develop --command cargo test -p hellas-providers provider_injects_secret -- --nocapture
+```
+
+It runs the production HTTP provider and adaptor against a local TLS server,
+checks that the server receives the key, verifies the signed input and output,
+and confirms neither transcript contains the key. It also checks that warmed
+connection pools cannot bypass credential scope or header-override checks. The
+fixture installs its own CA in the test client pool; production credentialed
+requests still refuse buyer-supplied roots.

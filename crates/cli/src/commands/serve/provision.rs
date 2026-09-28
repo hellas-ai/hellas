@@ -3,8 +3,8 @@ use super::super::CliResult;
 pub use hellas_sdk::work_provision::ProvisionOptions;
 use hellas_sdk::work_provision::{preview_bond, provision_offer};
 
-pub async fn run_provision(options: ProvisionOptions) -> CliResult<()> {
-    if options.print_bond_only {
+pub async fn run_provision(options: ProvisionOptions, print_bond_only: bool) -> CliResult<()> {
+    if print_bond_only {
         println!(
             "bond_edge: {}",
             hex::encode(preview_bond(&options)?.to_bytes())

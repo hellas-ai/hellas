@@ -129,11 +129,16 @@ let
       mkCargo "check-client-work"
         "cargo test -p hellas-client --features work && cargo clippy -p hellas-client --features work --all-targets -- -D warnings"
         (cargoEnv rustToolchain);
+    # HTTP boundaries and the bounded file primitives shared by hosts.
+    http-fetch =
+      mkCargo "check-http-fetch"
+        "cargo test -p hellas-gateway -p hellas-providers -p hellas-private -p hellas-store"
+        (cargoEnv rustToolchain);
     # Exercise the production provider loop and paid session recovery; their
     # feature is absent from the SDK's default tests.
     sdk-paid-work =
       mkCargo "check-sdk-paid-work"
-        "cargo test -p hellas-sdk --features paid-work && cargo clippy -p hellas-sdk --features paid-work --all-targets -- -D warnings"
+        "cargo test -p hellas-sdk --features paid-client,paid-provider,paid-gateway && cargo clippy -p hellas-sdk --features paid-client,paid-provider,paid-gateway --all-targets -- -D warnings && cargo clippy -p hellas-sdk --no-default-features --features paid-client --all-targets -- -D warnings && cargo clippy -p hellas-sdk --no-default-features --features paid-provider --all-targets -- -D warnings && cargo clippy -p hellas-sdk --no-default-features --features paid-gateway --all-targets -- -D warnings"
         (cargoEnv rustToolchain);
     # The chain service's wire-id pins compile only under `chain`, which
     # `work` does not pull in. `check-validator` links hellas-rpc with

@@ -17,28 +17,17 @@ use hellas_rpc::protocol::artifacts::PreparedPaidInputV1;
 use hellas_rpc::protocol::work::{JobDeadlines, private_policy_commitment};
 use hellas_rpc::protocol::work_fetch::PreparedPaidFetchInputV1;
 use hellas_rpc::protocol::work_profile::PreparedPaidWorkInput;
-#[cfg(feature = "gateway")]
-use hellas_rpc::protocol::work_setup::ProviderChannelPolicy;
 #[cfg(test)]
 use hellas_sdk::paid_client::check_genesis_payload;
 use hellas_sdk::paid_client::{InputIdentities, PaidWorkSession, bind_paid_endpoint};
-#[cfg(feature = "gateway")]
-use hellas_sdk::paid_client::{PaidWorkResult, check_evaluate_input};
 use hellas_work::work_store::journal::MAX_RECORD_BYTES;
 use iroh::{EndpointId, SecretKey};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-#[cfg(feature = "gateway")]
-use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use super::CliResult;
 use super::serve::work_config::load_work_config;
-
-#[cfg(feature = "gateway")]
-mod gateway;
-#[cfg(feature = "gateway")]
-pub use gateway::load_gateway_backend;
 
 /// Paid-work commands intended for deployment bring-up and smoke tests.
 #[derive(Debug, Subcommand)]
@@ -567,7 +556,7 @@ fn empty_coins() -> List<CoinId, MAX_PARTY_INPUTS> {
     )
 }
 
-fn fixed_hex<const N: usize>(flag: &str, value: &str) -> CliResult<[u8; N]> {
+pub(crate) fn fixed_hex<const N: usize>(flag: &str, value: &str) -> CliResult<[u8; N]> {
     let bytes = hex::decode(value).with_context(|| format!("{flag} is not hex"))?;
     bytes
         .try_into()

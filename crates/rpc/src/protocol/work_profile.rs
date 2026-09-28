@@ -311,22 +311,21 @@ impl PreparedPaidWorkInput {
                 let parts = bundle.parts()?;
                 let input = crate::fetch::verify_input_events(&parts.fetch_input_transcript)
                     .map_err(|e| PaidWorkError::Transcript(e.to_string()))?;
-                let result = work_fetch::terminal_fetch_result(
+                let (result, output) = work_fetch::verify_terminal_fetch_result(
                     channel,
                     authorization,
                     transcript,
                     input.assurance,
                 )?;
+                if input.input_commitment.digest() != authorization.request_commitment.digest() {
+                    return Err(PaidWorkError::Mismatch {
+                        field: "Fetch input commitment",
+                    });
+                }
                 if input.execution_environment == crate::FetchEnvironment::Http.manifest_id() {
                     let request =
                         crate::http_fetch::HttpFetchRequest::decode(input.body.as_bytes())
                             .map_err(|e| PaidWorkError::Transcript(e.to_string()))?;
-                    let output = crate::fetch::verify_output_events(
-                        input.input_commitment,
-                        input.assurance,
-                        transcript,
-                    )
-                    .map_err(|e| PaidWorkError::Transcript(e.to_string()))?;
                     crate::http_fetch::HttpFetchResponse::from_output(&request, &output)
                         .map_err(|e| PaidWorkError::Transcript(e.to_string()))?;
                 }

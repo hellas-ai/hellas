@@ -8,7 +8,6 @@ pub use config::HttpGatewayConfig;
 #[cfg(test)]
 mod tests;
 
-use anyhow::{Context, ensure};
 use axum::{
     Router,
     body::{Body, Bytes},
@@ -21,7 +20,7 @@ use hellas_rpc::output::{AdaptorEvent, HttpResponseEvent, OutputEvent, StopReaso
 use std::sync::Arc;
 use tracing::Instrument;
 
-use super::{GatewayHandle, GatewayOptions, PaidExecutionBackend, PaidFetchRequest, access};
+use super::{GatewayHandle, PaidExecutionBackend, PaidFetchRequest, access};
 
 #[derive(Clone)]
 pub(crate) struct BackendName(pub String);
@@ -41,8 +40,6 @@ struct HttpState {
 
 #[derive(Debug, thiserror::Error)]
 enum HttpOpenError {
-    #[error("HTTP proxy requires a paid Fetch backend")]
-    MissingPaidBackend,
     #[error("missing authenticated HTTP response head")]
     MissingHead,
     #[error(transparent)]
@@ -51,27 +48,34 @@ enum HttpOpenError {
     Headers(#[from] hellas_rpc::http_fetch::HttpRequestError),
 }
 
-pub(super) async fn start(options: GatewayOptions) -> anyhow::Result<GatewayHandle> {
-    let config = options
-        .http_fetch
-        .as_ref()
-        .context("missing HTTP configuration")?
-        .clone();
-    config.validate()?;
-    let paid = options
-        .paid_work
-        .clone()
-        .ok_or(HttpOpenError::MissingPaidBackend)?;
-    ensure!(
-        options.output_cache.policy == hellas_rpc::cache::CachePolicy::Off,
-        "HTTP routes archive exchanges; inference replay must be off"
-    );
-    if options.metrics_port.is_some() {
-        tracing::warn!(
-            "the Prometheus metrics endpoint is not served in HTTP Fetch mode; \
-             --metrics-port has no effect (otel metrics remain on the usual exporter)"
-        );
+/// Configuration for transparent HTTP over paid Fetch. Every route uses the
+/// supplied paid pool; tokenizers and inference replay do not apply here.
+pub struct HttpGatewayOptions {
+    pub config: HttpGatewayConfig,
+    pub paid: Arc<dyn PaidExecutionBackend>,
+    pub archive: super::ArchiveOptions,
+    pub host: String,
+    pub port: Option<u16>,
+    pub bearer_token_file: Option<std::path::PathBuf>,
+    pub allow_remote: bool,
+    pub wrap: Option<String>,
+    pub wrap_args: Vec<String>,
+}
+
+/// Start without signal handlers. Failed startup drains any recovering paid jobs.
+pub async fn start_http(options: HttpGatewayOptions) -> anyhow::Result<GatewayHandle> {
+    let paid = options.paid.clone();
+    let result = start(options).await;
+    if result.is_err() {
+        paid.drain().await;
     }
+    result
+}
+
+async fn start(options: HttpGatewayOptions) -> anyhow::Result<GatewayHandle> {
+    let config = options.config;
+    config.validate()?;
+    let paid = options.paid;
     let archive_policy = super::archive::Policy::new(options.archive.clone(), false);
     archive_policy.prepare();
     let routing = Arc::new(routing::Routing::new(&config, &paid.fetch_providers())?);

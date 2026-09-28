@@ -31,6 +31,21 @@ async fn server_with_pause(
     Arc<AtomicUsize>,
     tokio::task::JoinHandle<()>,
 ) {
+    server_fixture(status, bytes, location, pause, None).await
+}
+
+async fn server_fixture(
+    status: u16,
+    bytes: Vec<u8>,
+    location: Option<String>,
+    pause: Option<Arc<tokio::sync::Notify>>,
+    capture: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
+) -> (
+    HttpFetchRequest,
+    Arc<AtomicUsize>,
+    Arc<AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+) {
     let key = generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let cert = key.cert.der().clone();
     let parsed = x509_cert::Certificate::from_der(cert.as_ref()).unwrap();
@@ -71,6 +86,7 @@ async fn server_with_pause(
             let bytes = bytes.clone();
             let location = location.clone();
             let pause = pause.clone();
+            let capture = capture.clone();
             tokio::spawn(async move {
                 let Ok(mut socket) = acceptor.accept(socket).await else {
                     return;
@@ -83,6 +99,9 @@ async fn server_with_pause(
                             return;
                         }
                         request.push(byte[0]);
+                    }
+                    if let Some(capture) = &capture {
+                        let _ = capture.send(request);
                     }
                     seen.fetch_add(1, Ordering::SeqCst);
                     let location = location
@@ -470,4 +489,127 @@ fn special_addresses_never_qualify_as_public_egress() {
     }
     assert!(public_address("8.8.8.8".parse().unwrap()));
     assert!(public_address("2606:4700:4700::1111".parse().unwrap()));
+}
+
+/// Offline demonstration: the TLS upstream sees the provider's credential;
+/// the signed buyer request and authenticated response contain only the alias.
+#[tokio::test]
+async fn provider_injects_secret_without_disclosing_it_to_the_buyer() {
+    use hellas_rpc::fetch::{
+        FetchOutputTranscriptBuilder, build_input_events_with_retention, verify_input_events,
+        verify_output_events,
+    };
+    use hellas_rpc::{Assurance, ProducerSigningKey, Retention};
+    const SECRET: &str = "Bearer provider-only-demo-key";
+    let (capture, mut captured) = tokio::sync::mpsc::unbounded_channel();
+    let (mut request, calls, _, server) = server_fixture(
+        200,
+        b"upstream response".to_vec(),
+        None,
+        None,
+        Some(capture),
+    )
+    .await;
+    let url = request.parsed_url().unwrap();
+    request.credential = Some("provider-account".into());
+    let provider = HttpFetchProvider::new(
+        HttpEgressPolicy {
+            allowed_hosts: vec!["localhost".into()],
+            allow_private_addresses: true,
+        },
+        BTreeMap::from([(
+            "provider-account".into(),
+            HttpCredential {
+                allowed_origins: vec![url.origin().ascii_serialization()],
+                allowed_paths: vec!["/resource".into()],
+                allowed_methods: vec!["GET".into()],
+                header_name: "authorization".into(),
+                header_value: HttpSecret::Value(SECRET.into()),
+            },
+        )]),
+    )
+    .unwrap();
+    let addresses = tokio::net::lookup_host(("localhost", url.port().unwrap()))
+        .await
+        .unwrap()
+        .take(65)
+        .collect();
+    provider.clients.trust_fixture(&request, &url, addresses);
+    request.tls.roots = HttpTrustRoots::WebPki;
+    let buyer = ProducerSigningKey::from_secret_bytes([71; 32]).unwrap();
+    let seller = ProducerSigningKey::from_secret_bytes([72; 32]).unwrap();
+    let input_events = build_input_events_with_retention(
+        "http",
+        "request",
+        &serde_json::to_vec(&request).unwrap(),
+        FetchEnvironment::Http.manifest_id(),
+        Assurance::ProducerSigned,
+        &buyer,
+        Retention::Ephemeral,
+    )
+    .unwrap();
+    let input = verify_input_events(&input_events).unwrap();
+    let call = FetchCall::new(
+        &input.service,
+        &input.method,
+        input.body.clone(),
+        input.input_commitment,
+    );
+    let session = HttpFetchAdaptorFactory.create(&call).unwrap();
+    let mut projector = session.projector;
+    let response = provider.run(session.provider_request).await.unwrap();
+    let mut projected = projector.begin(response.head).unwrap();
+    let mut stream = response.stream;
+    while let Some(chunk) = stream.next().await {
+        projected.extend(projector.project(&chunk.unwrap()).unwrap());
+    }
+    projected.extend(projector.finish().unwrap());
+    let terminal = match projected.pop().unwrap() {
+        ProjectedFetch::Terminal(bytes) => bytes,
+        _ => panic!("terminal"),
+    };
+    let mut output =
+        FetchOutputTranscriptBuilder::new(input.input_commitment, input.assurance, &seller);
+    for event in projected {
+        let ProjectedFetch::Event(bytes) = event else {
+            panic!("event")
+        };
+        output.push_event(bytes).unwrap();
+    }
+    let output_events = output.finish(terminal).unwrap();
+    let verified =
+        verify_output_events(input.input_commitment, input.assurance, &output_events).unwrap();
+    let delivered =
+        hellas_rpc::http_fetch::HttpFetchResponse::from_output(&request, &verified).unwrap();
+    assert_eq!(delivered.body, b"upstream response");
+    let upstream = String::from_utf8(captured.recv().await.unwrap()).unwrap();
+    assert!(upstream.contains(&format!("authorization: {SECRET}\r\n")));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(input_events.iter().all(|event| {
+        !event
+            .payload()
+            .windows(SECRET.len())
+            .any(|w| w == SECRET.as_bytes())
+    }));
+    assert!(output_events.iter().all(|event| {
+        !event
+            .payload()
+            .windows(SECRET.len())
+            .any(|w| w == SECRET.as_bytes())
+    }));
+    // Reusing the TLS pool cannot bypass credential scope or override checks.
+    for (path, headers) in [
+        ("/elsewhere", vec![]),
+        (
+            "/resource",
+            vec![("authorization".into(), "buyer override".into())],
+        ),
+    ] {
+        let mut forbidden = request.clone();
+        forbidden.url = format!("{}{path}", url.origin().ascii_serialization());
+        forbidden.headers = headers;
+        assert!(provider.run(prepared(&forbidden)).await.is_err());
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    server.abort();
 }

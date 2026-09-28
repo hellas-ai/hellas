@@ -12,6 +12,7 @@ default = []
 otel = ["hellas-rpc/otel", "dep:hellas-wire"]
 
 [dependencies]
+thiserror.workspace = true
 anyhow = { workspace = true }
 async-stream = { workspace = true }
 base64.workspace = true

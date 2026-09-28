@@ -1,4 +1,6 @@
 //! A funded, metadata-only Fetch channel for SDK boundary tests.
+// Client and provider feature suites use different parts of this fixture.
+#![allow(dead_code)]
 use crate::work_config::{ChainCrossCheck, WorkConfig};
 use hellas_kernel::{
     BlockHeight, Decode as _, Edge, EdgeId, EdgeValues, Fees, Key, LeaseSlots, List,

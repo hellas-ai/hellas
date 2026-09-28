@@ -27,6 +27,41 @@ use crate::ClientIdentity;
 const MAX_ACTIVE_CONNECTIONS: usize = 64;
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// Startup errors, before a provider accepts requests.
+#[derive(Debug, thiserror::Error)]
+pub enum ProviderError {
+    #[error("provider requires allowed callers or paid-work configuration")]
+    MissingAccessPolicy,
+    #[error("paid channel names an unavailable Fetch route or manifest")]
+    MissingPaidRoute,
+    #[error("Fetch provider requires a paid Fetch policy")]
+    WrongPaidPolicy,
+    #[error("paid Fetch provider requires zero retained transcript capacity")]
+    PaidRetention,
+    #[error("invalid provider settlement key")]
+    SettlementKey,
+    #[error(transparent)]
+    OpenAiKey(#[from] hellas_providers::EmptyOpenAiKey),
+    #[error(transparent)]
+    RouteBinding(#[from] hellas_executor::FetchRouteBindingError),
+    #[error(transparent)]
+    DuplicateRoute(#[from] hellas_executor::DuplicateFetchRoute),
+    #[error(transparent)]
+    Executor(#[from] hellas_executor::ExecutorError),
+    #[error(transparent)]
+    Bind(#[from] iroh::endpoint::BindError),
+    #[error(transparent)]
+    Address(#[from] iroh::endpoint::InvalidSocketAddr),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[cfg(feature = "paid-provider")]
+    #[error(transparent)]
+    Config(#[from] crate::work_config::WorkConfigError),
+    #[cfg(feature = "paid-provider")]
+    #[error(transparent)]
+    Paid(#[from] crate::paid_provider::PaidProviderError),
+}
+
 pub struct OpenAiProviderOptions<R> {
     pub port: Option<u16>,
     pub identity: ClientIdentity,
@@ -56,17 +91,17 @@ pub struct FetchProviderOptions<R> {
     pub fetch_queue_capacity: usize,
     pub retained_transcript_capacity: usize,
     pub fetch_replay_max_in_flight: usize,
-    #[cfg(feature = "paid-work")]
+    #[cfg(feature = "paid-provider")]
     pub paid_work: Option<crate::work_config::WorkConfig>,
 }
 
-#[cfg(feature = "paid-work")]
+#[cfg(feature = "paid-provider")]
 struct WorkWatcher {
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     task: tokio::task::JoinHandle<()>,
 }
 
-#[cfg(feature = "paid-work")]
+#[cfg(feature = "paid-provider")]
 impl Drop for WorkWatcher {
     fn drop(&mut self) {
         self.stop.take();
@@ -76,7 +111,7 @@ impl Drop for WorkWatcher {
 pub struct ProviderHandle {
     endpoint: Endpoint,
     accept_task: tokio::task::JoinHandle<()>,
-    #[cfg(feature = "paid-work")]
+    #[cfg(feature = "paid-provider")]
     work: Option<WorkWatcher>,
 }
 
@@ -92,7 +127,7 @@ impl ProviderHandle {
     pub async fn shutdown(mut self) {
         self.accept_task.abort();
         let _ = (&mut self.accept_task).await;
-        #[cfg(feature = "paid-work")]
+        #[cfg(feature = "paid-provider")]
         if let Some(mut work) = self.work.take() {
             if let Some(stop) = work.stop.take() {
                 let _ = stop.send(());
@@ -106,7 +141,7 @@ impl ProviderHandle {
 impl Drop for ProviderHandle {
     fn drop(&mut self) {
         self.accept_task.abort();
-        #[cfg(feature = "paid-work")]
+        #[cfg(feature = "paid-provider")]
         if let Some(work) = &mut self.work {
             work.stop.take();
         }
@@ -115,7 +150,7 @@ impl Drop for ProviderHandle {
 
 pub async fn start_openai_provider<R>(
     options: OpenAiProviderOptions<R>,
-) -> anyhow::Result<ProviderHandle>
+) -> Result<ProviderHandle, ProviderError>
 where
     R: RootProver + Send + Sync + 'static,
 {
@@ -142,7 +177,7 @@ where
         fetch_queue_capacity: options.fetch_queue_capacity,
         retained_transcript_capacity: options.retained_transcript_capacity,
         fetch_replay_max_in_flight: options.fetch_replay_max_in_flight,
-        #[cfg(feature = "paid-work")]
+        #[cfg(feature = "paid-provider")]
         paid_work: None,
     })
     .await
@@ -150,19 +185,18 @@ where
 
 pub async fn start_fetch_provider<R>(
     options: FetchProviderOptions<R>,
-) -> anyhow::Result<ProviderHandle>
+) -> Result<ProviderHandle, ProviderError>
 where
     R: RootProver + Send + Sync + 'static,
 {
-    #[cfg(feature = "paid-work")]
+    #[cfg(feature = "paid-provider")]
     let has_paid_work = options.paid_work.is_some();
-    #[cfg(not(feature = "paid-work"))]
+    #[cfg(not(feature = "paid-provider"))]
     let has_paid_work = false;
-    anyhow::ensure!(
-        !options.allowed_callers.is_empty() || has_paid_work,
-        "provider requires allowed callers or paid-work configuration"
-    );
-    #[cfg(feature = "paid-work")]
+    if options.allowed_callers.is_empty() && !has_paid_work {
+        return Err(ProviderError::MissingAccessPolicy);
+    }
+    #[cfg(feature = "paid-provider")]
     if let Some(config) = &options.paid_work {
         use hellas_rpc::protocol::{
             work_fetch::FetchRoutePolicy as PaidRoute, work_profile::PaidWorkPolicy,
@@ -172,31 +206,29 @@ where
                 policy,
                 route: PaidRoute::SealedRoute { service, method },
             } => {
-                anyhow::ensure!(
-                    options
-                        .routes
-                        .entry(&FetchRoute::new(service, method))
-                        .is_some_and(
-                            |entry| entry.execution_environment() == policy.allowed_environment
-                        ),
-                    "paid channel names an unavailable Fetch route or manifest"
-                );
+                if !options
+                    .routes
+                    .entry(&FetchRoute::new(service, method))
+                    .is_some_and(|entry| {
+                        entry.execution_environment() == policy.allowed_environment
+                    })
+                {
+                    return Err(ProviderError::MissingPaidRoute);
+                }
             }
             PaidWorkPolicy::Fetch {
                 policy,
                 route: PaidRoute::OpenFetch { .. },
             } => {
-                anyhow::ensure!(
-                    options.routes.has_environment(policy.allowed_environment),
-                    "paid channel names an unavailable HTTPS manifest"
-                );
+                if !options.routes.has_environment(policy.allowed_environment) {
+                    return Err(ProviderError::MissingPaidRoute);
+                }
             }
-            _ => anyhow::bail!("Fetch provider requires a paid Fetch policy"),
+            _ => return Err(ProviderError::WrongPaidPolicy),
         }
-        anyhow::ensure!(
-            options.retained_transcript_capacity == 0,
-            "paid Fetch provider requires zero retained transcript capacity"
-        );
+        if options.retained_transcript_capacity != 0 {
+            return Err(ProviderError::PaidRetention);
+        }
         crate::work_config::validate_work_routes(config)?;
     }
     let producer_key = Arc::new(options.identity.caller_key().clone());
@@ -219,17 +251,17 @@ where
     );
     let executor = Executor::spawn_configured(executor_config).await?;
 
-    #[cfg(feature = "paid-work")]
+    #[cfg(feature = "paid-provider")]
     let work_mount = crate::paid_provider::MountedWork::with_backend(executor.clone());
-    #[cfg(feature = "paid-work")]
+    #[cfg(feature = "paid-provider")]
     let setup_mount = crate::paid_provider::MountedSetup::default();
-    #[cfg(feature = "paid-work")]
+    #[cfg(feature = "paid-provider")]
     let work = if let Some(config) = options.paid_work {
         let policy = config.provider_policy();
         let settlement_key = hellas_kernel::Secp256k1Signer::from_secret_scalar(
             options.identity.caller_secret_bytes(),
         )
-        .map_err(|_| anyhow::anyhow!("invalid provider settlement key"))?;
+        .map_err(|_| ProviderError::SettlementKey)?;
         let runner = crate::paid_provider::WorkRunner::discover(
             crate::paid_provider::WorkRunnerConfig {
                 network: config.chain.network,
@@ -265,7 +297,7 @@ where
     } else {
         vec![<Fetch as ServiceMarker>::ALPN.as_bytes().to_vec()]
     };
-    #[cfg(feature = "paid-work")]
+    #[cfg(feature = "paid-provider")]
     let alpns = if has_paid_work {
         let mut alpns = alpns;
         alpns.extend([
@@ -282,7 +314,7 @@ where
         .secret_key(options.identity.transport_key())
         .alpns(alpns);
     if let Some(port) = options.port {
-        builder = builder.bind_addr(format!("0.0.0.0:{port}").parse::<std::net::SocketAddr>()?)?;
+        builder = builder.bind_addr(std::net::SocketAddr::from(([0, 0, 0, 0], port)))?;
     }
     let endpoint = builder.bind().await?;
     let accept_endpoint = endpoint.clone();
@@ -314,7 +346,7 @@ where
                 }
             };
             let executor = executor.clone();
-            #[cfg(feature = "paid-work")]
+            #[cfg(feature = "paid-provider")]
             let (work_mount, setup_mount) = (work_mount.clone(), setup_mount.clone());
             let open = open.clone();
             connections.spawn(async move {
@@ -332,7 +364,7 @@ where
                 };
                 let alpn = connection.alpn().to_vec();
                 let transport = Arc::new(IrohTransport::new(connection));
-                #[cfg(feature = "paid-work")]
+                #[cfg(feature = "paid-provider")]
                 if has_paid_work && alpn == hellas_rpc::services::work::Work::ALPN.as_bytes() {
                     let context = transport.context();
                     if let Some(handler) = work_mount.handler(&context) {
@@ -352,7 +384,7 @@ where
                     }
                     return;
                 }
-                #[cfg(feature = "paid-work")]
+                #[cfg(feature = "paid-provider")]
                 if has_paid_work
                     && alpn == hellas_rpc::services::work_setup::WorkSetup::ALPN.as_bytes()
                 {
@@ -393,7 +425,7 @@ where
     Ok(ProviderHandle {
         endpoint,
         accept_task,
-        #[cfg(feature = "paid-work")]
+        #[cfg(feature = "paid-provider")]
         work,
     })
 }
@@ -427,7 +459,7 @@ where
     }
 }
 
-#[cfg(all(test, feature = "paid-work"))]
+#[cfg(all(test, feature = "paid-provider", feature = "paid-client"))]
 mod tests;
 
 struct ProviderOpen<R> {

@@ -1150,22 +1150,23 @@ async fn async_main() {
             print_bond_only,
         } => match commands::serve::load_work_config(&work_config) {
             Err(error) => Err(error.into()),
-            Ok(work_config) => {
+            Ok(work_config) => async {
                 commands::serve::run_provision(commands::serve::ProvisionOptions {
                     work_config,
                     // The bond is staked by the party this node already
                     // settles as, taken from the identity loaded above
                     // and never made here.
                     settlement_key: identity::settlement_signer(&local_identity),
-                    client,
-                    stake_coins: stake_coin,
+                    client: hellas_kernel::Key::from_bytes(commands::paid_work::fixed_hex("--client", &client)?),
+                    stake_coins: stake_coin.iter().map(|coin| {
+                        commands::paid_work::fixed_hex("--stake-coin", coin).map(hellas_kernel::CoinId::from_bytes)
+                    }).collect::<anyhow::Result<_>>()?,
                     bond_timeout,
                     timeout_payout,
                     max_job_price,
-                    print_bond_only,
-                })
+                }, print_bond_only)
                 .await
-            }
+            }.await
         },
         Commands::OutputCache(..) => unreachable!("cache commands handled before identity load"),
         #[cfg(feature = "gateway")]
@@ -1294,13 +1295,10 @@ async fn async_main() {
                         "set provider enrollment and Apple trust pins in --paid-work-config",
                     );
                     Some(
-                        commands::paid_work::load_gateway_backend(
-                            path,
-                            secret_key.clone(),
-                            identity::settlement_signer(&local_identity),
-                            local_identity.producer_key.clone(),
-                            assurance,
-                        ).await?
+                        hellas_sdk::paid_gateway::PaidGateway::open(
+                            hellas_sdk::paid_gateway::load_pool_options(path, assurance)?,
+                            hellas_sdk::ClientIdentity::from_secret_bytes(secret_key.to_bytes(), local_identity.producer_key.to_secret_bytes())?,
+                        ).await? as std::sync::Arc<dyn hellas_gateway::PaidExecutionBackend>
                     )
                 } else {
                     None
@@ -1321,24 +1319,23 @@ async fn async_main() {
                         remote_trust.apple_app_attest_cdhashes,
                     )?
                 };
+                let archive = hellas_gateway::ArchiveOptions {
+                    directory: archive_dir.map(Ok).unwrap_or_else(identity::default_gateway_archive_path)?,
+                    zdr,
+                };
+                if let Some(path) = http_fetch_config {
+                    anyhow::ensure!(output_cache == hellas_rpc::cache::CachePolicy::Off,
+                        "HTTP routes archive exchanges; inference replay must be off");
+                    anyhow::ensure!(metrics_port.is_none(), "HTTP Fetch exports OpenTelemetry metrics; --metrics-port is unsupported");
+                    let bytes = commands::read_bounded_regular_file(&path, "HTTP gateway config", 4 << 20)?;
+                    return hellas_gateway::run_http(hellas_gateway::HttpGatewayOptions {
+                        config: serde_json::from_slice(&bytes)?,
+                        paid: paid_work.ok_or_else(|| anyhow::anyhow!("HTTP proxy requires --paid-work-config"))?,
+                        archive, bearer_token_file, allow_remote, host, port, wrap, wrap_args,
+                    }).await;
+                }
                 hellas_gateway::run(hellas_gateway::GatewayOptions {
-                    archive: hellas_gateway::ArchiveOptions {
-                        directory: archive_dir.map(Ok).unwrap_or_else(identity::default_gateway_archive_path)?,
-                        zdr,
-                    },
-                    http_fetch: http_fetch_config
-                        .map(|path| -> anyhow::Result<_> {
-                            // 4 MiB, the same bound the pool-file loader
-                            // takes from hellas-work, which this binary
-                            // links only in some feature builds.
-                            let bytes = commands::read_bounded_regular_file(
-                                &path,
-                                "HTTP gateway config",
-                                4 << 20,
-                            )?;
-                            Ok(serde_json::from_slice(&bytes)?)
-                        })
-                        .transpose()?,
+                    archive,
                     output_cache: cache_options,
                     paid_work,
                     bearer_token_file,

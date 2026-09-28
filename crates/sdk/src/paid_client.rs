@@ -44,6 +44,7 @@ use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey, TransportAddr};
 use crate::work_config::WorkConfig;
 
 /// Options shared by all jobs on a paid channel.
+#[derive(Clone)]
 pub struct PaidWorkOptions {
     pub config: WorkConfig,
     pub journal_root: PathBuf,
@@ -1095,6 +1096,10 @@ struct ProviderDialer {
     provider: EndpointAddr,
     trust: Option<hellas_client::ProviderTrustAnchor>,
     producer: std::sync::Mutex<Option<hellas_rpc::PublicKey>>,
+    // Open is authenticated once per exact connection and ALPN. Serialize dials
+    // so concurrent callers cannot reuse a connection before its proof passes.
+    setup_connection: tokio::sync::Mutex<Option<iroh::endpoint::Connection>>,
+    work_connection: tokio::sync::Mutex<Option<iroh::endpoint::Connection>>,
 }
 
 impl ProviderDialer {
@@ -1107,6 +1112,8 @@ impl ProviderDialer {
         Self {
             trust,
             producer: std::sync::Mutex::new(None),
+            setup_connection: tokio::sync::Mutex::new(None),
+            work_connection: tokio::sync::Mutex::new(None),
             endpoint,
             provider: EndpointAddr::from_parts(
                 provider,
@@ -1138,6 +1145,18 @@ impl ProviderDialer {
     }
 
     async fn connect(&self, alpn: &[u8]) -> Result<IrohTransport> {
+        let cache = if alpn == hellas_rpc::services::work::Work::ALPN.as_bytes() {
+            &self.work_connection
+        } else {
+            &self.setup_connection
+        };
+        let mut cached = cache.lock().await;
+        if let Some(connection) = cached.as_ref().filter(|c| c.close_reason().is_none()) {
+            return Ok(IrohTransport::new(connection.clone()));
+        }
+        // A failed authentication never enters the cache. Reconnects repeat Open
+        // and still have to match the producer pinned by the payment channel.
+        *cached = None;
         let connection = self
             .endpoint
             .connect(self.provider.clone(), alpn)
@@ -1161,6 +1180,7 @@ impl ProviderDialer {
             };
             self.require_producer(producer)?;
         }
+        *cached = Some(transport.connection().clone());
         Ok(transport)
     }
 }

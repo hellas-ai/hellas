@@ -5,7 +5,6 @@
 //! `validate_work_routes` before serving to check the configuration against journals.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -147,7 +146,11 @@ pub struct ChainCrossCheck {
 /// Loads configuration, checks chain identity and policy bounds, and normalizes
 /// validator URLs. Route-to-journal validation is deferred until serve startup.
 pub fn load_work_config(path: &Path) -> Result<WorkConfig> {
-    let bytes = fs::read(path).map_err(|source| WorkConfigError::Read {
+    let bytes = hellas_private::read_bounded_regular_file(
+        path,
+        hellas_work::work_store::journal::MAX_RECORD_BYTES,
+    )
+    .map_err(|source| WorkConfigError::Read {
         path: path.to_path_buf(),
         source,
     })?;

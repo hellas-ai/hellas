@@ -8,14 +8,18 @@ use std::{
 
 #[tokio::test]
 async fn http_uses_the_paid_backend_and_waits_for_its_payment_completion() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     struct Paid {
         requests: AtomicUsize,
+        drained: AtomicBool,
         ack: Arc<tokio::sync::Notify>,
         provider: iroh::EndpointId,
         busy: bool,
     }
     impl PaidExecutionBackend for Paid {
+        fn fetch_providers(&self) -> Vec<iroh::EndpointId> {
+            vec![self.provider]
+        }
         fn execute(
             &self,
             _: crate::PaidExecutionRequest,
@@ -48,13 +52,16 @@ async fn http_uses_the_paid_backend_and_waits_for_its_payment_completion() {
             }))
         }
         fn drain(&self) -> futures::future::BoxFuture<'_, ()> {
-            Box::pin(async {})
+            Box::pin(async {
+                self.drained.store(true, Ordering::Relaxed);
+            })
         }
     }
     for busy in [false, true] {
         let provider = iroh::SecretKey::from_bytes(&[12; 32]).public();
         let paid = Arc::new(Paid {
             requests: AtomicUsize::new(0),
+            drained: AtomicBool::new(false),
             ack: Arc::default(),
             provider,
             busy,
@@ -64,28 +71,49 @@ async fn http_uses_the_paid_backend_and_waits_for_its_payment_completion() {
                 "path":"/v1/responses", "method":"POST", "url":"https://example.com/v1/responses", "credential":"account"
             }]
         })).unwrap();
-        let state = Arc::new(HttpState {
-            service: config.service.clone(),
-            method: config.method.clone(),
-            routing: Arc::new(routing::Routing::new(&config, &[provider]).unwrap()),
+        let archive = tempfile::tempdir().unwrap();
+        let handle = start_http(HttpGatewayOptions {
+            config,
             paid: paid.clone(),
-            metrics: observation::Metrics::new(),
-        });
-        let response = handle(
-            State(state),
-            Request::builder()
-                .method("POST")
-                .uri("/v1/responses?x=%2F&x=y")
-                .body(Body::from("opaque request"))
-                .unwrap(),
-        )
-        .await;
+            archive: crate::ArchiveOptions {
+                directory: archive.path().into(),
+                zdr: true,
+            },
+            host: "127.0.0.1".into(),
+            port: Some(0),
+            bearer_token_file: None,
+            allow_remote: false,
+            wrap: None,
+            wrap_args: Vec::new(),
+        })
+        .await
+        .unwrap();
+        let client = reqwest::Client::new();
+        let url = format!("http://{}/v1/responses?x=%2F&x=y", handle.address());
+        assert_eq!(
+            client
+                .post(&url)
+                .body("opaque request")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(paid.requests.load(Ordering::Relaxed), 0);
+        let response = client
+            .post(&url)
+            .bearer_auth(handle.bearer())
+            .body("opaque request")
+            .send()
+            .await
+            .unwrap();
         assert_eq!(paid.requests.load(Ordering::Relaxed), 1);
         if busy {
             assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         } else {
             assert_eq!(response.status(), StatusCode::OK);
-            let mut body = response.into_body().into_data_stream();
+            let mut body = response.bytes_stream();
             assert_eq!(body.next().await.unwrap().unwrap(), &b"\x00\xff\n"[..]);
             assert!(
                 tokio::time::timeout(Duration::from_millis(20), body.next())
@@ -95,6 +123,9 @@ async fn http_uses_the_paid_backend_and_waits_for_its_payment_completion() {
             paid.ack.notify_one();
             assert!(body.next().await.is_none());
         }
+        handle.shutdown().await.unwrap();
+        assert!(paid.drained.load(Ordering::Relaxed));
+        assert_eq!(std::fs::read_dir(archive.path()).unwrap().count(), 0);
     }
 }
 

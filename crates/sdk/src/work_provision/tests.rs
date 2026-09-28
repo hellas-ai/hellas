@@ -91,7 +91,10 @@ fn route(peer: u8, bond: EdgeId, client: Key) -> serde_json::Value {
 /// Loads routes through the production parser, so their duplicate-peer
 /// and duplicate-bond invariants are facts these provisioning tests use,
 /// not a test-only constructor that can make impossible route tables.
-fn routed_work_config(root: &Path, routes: Vec<serde_json::Value>) -> Result<WorkConfig> {
+fn routed_work_config(
+    root: &Path,
+    routes: Vec<serde_json::Value>,
+) -> std::result::Result<WorkConfig, Box<dyn std::error::Error>> {
     let validators: Vec<String> = (1..=6)
         .map(|index| format!("http://127.0.0.1:900{index}"))
         .collect();
@@ -135,8 +138,7 @@ fn routed_work_config(root: &Path, routes: Vec<serde_json::Value>) -> Result<Wor
         "min_omit_response_blocks": MIN_OMIT_RESPONSE_BLOCKS,
     });
     let path = root.join("work-config.json");
-    fs::write(&path, file.to_string())
-        .with_context(|| format!("the route fixture writes {}", path.display()))?;
+    fs::write(&path, file.to_string())?;
     Ok(load_work_config(&path)?)
 }
 
@@ -157,15 +159,14 @@ fn options_for(
     ProvisionOptions {
         work_config,
         settlement_key: provider(),
-        client: hex::encode(client.to_bytes()),
+        client,
         stake_coins: stake_coins
             .iter()
-            .map(|coin| hex::encode([*coin; 32]))
+            .map(|coin| CoinId::from_bytes([*coin; 32]))
             .collect(),
         bond_timeout: 500,
         timeout_payout: 64,
         max_job_price,
-        print_bond_only: false,
     }
 }
 
@@ -583,7 +584,7 @@ fn a_stake_wider_than_an_open_is_refused_rather_than_truncated() {
     let dir = tempfile::tempdir().unwrap();
     let mut options = options(dir.path(), 40);
     options.stake_coins = (0..=u8::try_from(MAX_PARTY_INPUTS).unwrap())
-        .map(|byte| hex::encode([byte; 32]))
+        .map(|byte| CoinId::from_bytes([byte; 32]))
         .collect();
 
     let Err(error) = BondCandidate::plan(&options) else {
