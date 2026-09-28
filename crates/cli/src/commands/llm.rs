@@ -411,7 +411,10 @@ mod tests {
         let error = load_environment(&path, None)
             .err()
             .expect("oversize is refused");
-        assert!(error.to_string().contains("over the"));
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::InvalidData
+        );
     }
 
     #[cfg(unix)]

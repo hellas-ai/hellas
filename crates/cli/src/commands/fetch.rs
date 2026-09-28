@@ -147,9 +147,10 @@ mod tests {
         std::fs::write(&path, vec![b' '; MAX_FETCH_REQUEST_BODY_BYTES + 1]).unwrap();
 
         let error = load_payload_file(&path).expect_err("oversized payload must be refused");
-        assert!(error.to_string().contains(&format!(
-            "over the {MAX_FETCH_REQUEST_BODY_BYTES}-byte limit"
-        )));
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::InvalidData
+        );
     }
 
     #[cfg(unix)]

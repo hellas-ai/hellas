@@ -96,6 +96,10 @@ let
           ++ lib.optionals isValidatorHost [ "validator" ]
         )
     )) (cargoEnv rustToolchain);
+    # Run command tests locally as well as in the release package builds.
+    cli = mkCargo "check-cli" "cargo test -p hellas-cli --no-default-features --features node,gateway" (
+      cargoEnv rustToolchain
+    );
     # The kernel's whole suite, including `tests/itf.rs` — the Quint↔Rust
     # replay that the entire abstract-correspondence story rests on — and
     # the exact-error pins in `tests/channel/`. `--all-features` is load

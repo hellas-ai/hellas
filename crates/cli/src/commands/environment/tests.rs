@@ -86,7 +86,10 @@ fn build_rejects_oversized_settings_before_indexing_artifacts() {
         .expect_err("oversized settings must be refused before artifact indexing");
     let message = error.to_string();
     assert!(message.contains("environment settings"), "{message}");
-    assert!(message.contains("byte limit"), "{message}");
+    assert_eq!(
+        error.downcast_ref::<std::io::Error>().unwrap().kind(),
+        std::io::ErrorKind::InvalidData
+    );
     assert!(!output.exists());
 }
 
@@ -103,7 +106,10 @@ fn inspect_rejects_oversized_environment_metadata() {
     let error = inspect(&environment).expect_err("oversized environment must be refused");
     let message = error.to_string();
     assert!(message.contains("environment"), "{message}");
-    assert!(message.contains("byte limit"), "{message}");
+    assert_eq!(
+        error.downcast_ref::<std::io::Error>().unwrap().kind(),
+        std::io::ErrorKind::InvalidData
+    );
 }
 
 #[cfg(unix)]
@@ -111,8 +117,11 @@ fn inspect_rejects_oversized_environment_metadata() {
 fn inspect_rejects_a_device_before_reading_from_it() {
     let error =
         inspect(Path::new("/dev/zero")).expect_err("environment metadata must be an ordinary file");
-    assert!(error.to_string().contains("failed to open environment"));
-    assert!(format!("{error:#}").contains("not a regular file"));
+    assert!(error.to_string().contains("environment"));
+    assert_eq!(
+        error.downcast_ref::<std::io::Error>().unwrap().kind(),
+        std::io::ErrorKind::InvalidInput
+    );
 }
 
 #[cfg(unix)]
