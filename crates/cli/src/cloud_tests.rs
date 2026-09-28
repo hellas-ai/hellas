@@ -97,6 +97,22 @@ fn gateway_can_select_owned_machines_without_conflicting_route_pins() {
     assert!(parse_gateway(&["--machine", "gpu", "--paid-work-config", "work.json"]).is_err());
 }
 
+#[cfg(feature = "gateway")]
+#[test]
+fn http_gateway_requires_a_paid_pool_instead_of_an_owned_machine() {
+    let error = Cli::try_parse_from([
+        "hellas",
+        "gateway",
+        "--machine",
+        "metal",
+        "--http-fetch-config",
+        "gateway.json",
+    ])
+    .err()
+    .expect("HTTP gateway cannot select a machine without a paid pool");
+    assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+}
+
 /// Actual local companion + Hellas server, with two real stored Hellas identities.
 #[cfg(feature = "node")]
 #[tokio::test]

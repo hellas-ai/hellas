@@ -496,6 +496,7 @@ enum Commands {
     Gateway {
         /// Serve exact HTTP routes through paid HTTPS Fetch.
         #[arg(long, value_name = "FILE", conflicts_with_all = ["responses_backend", "environment"])]
+        #[cfg_attr(all(feature = "cloud", unix), arg(conflicts_with = "machine"))]
         #[cfg_attr(feature = "node", arg(requires = "paid_work_config"))]
         http_fetch_config: Option<PathBuf>,
         /// Request/response archive directory (default: ~/.hellas/gateway-archive).
