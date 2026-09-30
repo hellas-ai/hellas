@@ -43,7 +43,7 @@ use hellas_wire::{Dispatcher, ServiceMarker, StreamTransport};
 #[cfg(test)]
 use hellas_wire::{TransportContext, WireStatus};
 #[cfg(test)]
-use hellas_work::work::PaidWorkBackend;
+use hellas_work::work::WorkBackend;
 #[cfg(test)]
 use hellas_work::work_close::FinalizedBlocks;
 #[cfg(test)]
@@ -64,7 +64,7 @@ use crate::commands::discovery::{DiscoveryAdvertiser, served_alpns, start_server
 use crate::identity::OpenIdentity;
 
 pub(super) use hellas_sdk::paid_provider::{
-    MountedSetup, MountedWork, UnmountedWork, WorkRunner, WorkRunnerConfig,
+    MountedSetup, MountedWork, WorkRunner, WorkRunnerConfig,
 };
 
 /// Keep peer-controlled transport state finite. A connection can multiplex
@@ -334,7 +334,6 @@ async fn serve_connection(
     work: Option<MountedWork>,
 ) -> anyhow::Result<()> {
     let transport = Arc::new(IrohTransport::new(conn));
-    let context = transport.context();
 
     // Account for inbound requests and refresh last_seen_ms in the shared registry.
     if alpn == <Node as ServiceMarker>::ALPN.as_bytes() {
@@ -343,54 +342,23 @@ async fn serve_connection(
     } else if let Some(setup) =
         setup.filter(|_| alpn == <WorkSetup as ServiceMarker>::ALPN.as_bytes())
     {
-        match setup.service(&context) {
-            Some(mounted) => {
-                let server = AccountingDispatcher::new(
-                    OpenDispatcher::<_, _, hellas_rpc::services::work_setup::Open>::new(
-                        WorkSetupServer(mounted),
-                        remote_execution.open_identity.clone(),
-                    ),
-                    manager,
-                );
-                serve_loop(transport, server).await
-            }
-            None => {
-                let server = AccountingDispatcher::new(
-                    OpenDispatcher::<_, _, hellas_rpc::services::work_setup::Open>::new(
-                        WorkSetupServer(UnmountedWork),
-                        remote_execution.open_identity.clone(),
-                    ),
-                    manager,
-                );
-                serve_loop(transport, server).await
-            }
-        }
+        let server = AccountingDispatcher::new(
+            OpenDispatcher::<_, _, hellas_rpc::services::work_setup::Open>::new(
+                WorkSetupServer(setup),
+                remote_execution.open_identity.clone(),
+            ),
+            manager,
+        );
+        serve_loop(transport, server).await
     } else if let Some(work) = work.filter(|_| alpn == <Work as ServiceMarker>::ALPN.as_bytes()) {
-        // The mounted channel answers for itself. Until the runner has
-        // been handed one there is no channel to answer from, and this
-        // is still the bounded retryable `NotReady` §3 left here.
-        match work.handler(&context) {
-            Some(mounted) => {
-                let server = AccountingDispatcher::new(
-                    OpenDispatcher::<_, _, hellas_rpc::services::work::Open>::new(
-                        WorkServer(mounted),
-                        remote_execution.open_identity.clone(),
-                    ),
-                    manager,
-                );
-                serve_loop(transport, server).await
-            }
-            None => {
-                let server = AccountingDispatcher::new(
-                    OpenDispatcher::<_, _, hellas_rpc::services::work::Open>::new(
-                        WorkServer(UnmountedWork),
-                        remote_execution.open_identity.clone(),
-                    ),
-                    manager,
-                );
-                serve_loop(transport, server).await
-            }
-        }
+        let server = AccountingDispatcher::new(
+            OpenDispatcher::<_, _, hellas_rpc::services::work::Open>::new(
+                WorkServer(work),
+                remote_execution.open_identity.clone(),
+            ),
+            manager,
+        );
+        serve_loop(transport, server).await
     } else {
         warn!("Unknown ALPN: {:?}", String::from_utf8_lossy(&alpn));
         Ok(())

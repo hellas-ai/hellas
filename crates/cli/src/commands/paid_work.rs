@@ -16,7 +16,7 @@ use hellas_rpc::protocol::artifacts::PreparedPaidInputV1;
 #[cfg(test)]
 use hellas_rpc::protocol::work::{JobDeadlines, private_policy_commitment};
 use hellas_rpc::protocol::work_fetch::PreparedPaidFetchInputV1;
-use hellas_rpc::protocol::work_profile::PreparedPaidWorkInput;
+use hellas_rpc::protocol::work_profile::PreparedWorkInput;
 #[cfg(test)]
 use hellas_sdk::paid_client::check_genesis_payload;
 use hellas_sdk::paid_client::{InputIdentities, PaidWorkSession, bind_paid_endpoint};
@@ -109,9 +109,9 @@ pub struct InspectChainArgs {
 
 #[derive(Clone, Debug, Args)]
 pub struct RunArgs {
-    /// Out-of-band provider enrollment pin (required for App Attest).
+    /// Provider enrollment content ID from the paid offer.
     #[arg(long)]
-    provider_genesis: Option<hellas_rpc::ContentId>,
+    provider_genesis: hellas_rpc::ContentId,
     #[arg(long)]
     apple_app_id: Option<String>,
     #[arg(long, value_delimiter = ',', value_parser = crate::parse_hex_array::<32>)]
@@ -304,10 +304,10 @@ fn inspect_input(
     settlement_key: &Secp256k1Signer,
 ) -> CliResult<()> {
     match read_prepared_work_input(path)? {
-        PreparedPaidWorkInput::Evaluate(prepared) => {
+        PreparedWorkInput::Evaluate(prepared) => {
             inspect_prepared(&prepared, transport_key, settlement_key)
         }
-        PreparedPaidWorkInput::Fetch(prepared) => {
+        PreparedWorkInput::Fetch(prepared) => {
             let parts = prepared.parts()?;
             let request = hellas_rpc::fetch::verify_input_events(&parts.fetch_input_transcript)?;
             println!(
@@ -414,17 +414,13 @@ async fn inspect_chain(validators: &[String]) -> CliResult<()> {
 fn paid_provider_trust(
     args: &RunArgs,
     assurance: hellas_rpc::Assurance,
-) -> CliResult<Option<hellas_client::ProviderTrustAnchor>> {
-    if args.provider_genesis.is_some() || assurance != hellas_rpc::Assurance::ProducerSigned {
-        Ok(Some(crate::identity::provider_trust(
-            args.provider_genesis,
-            assurance,
-            args.apple_app_id.clone(),
-            args.apple_cd_hashes.clone(),
-        )?))
-    } else {
-        Ok(None)
-    }
+) -> CliResult<hellas_client::ProviderTrustAnchor> {
+    crate::identity::provider_trust(
+        Some(args.provider_genesis),
+        assurance,
+        args.apple_app_id.clone(),
+        args.apple_cd_hashes.clone(),
+    )
 }
 
 async fn open_paid_channel(
@@ -518,9 +514,9 @@ fn relative_deadlines(current: u64, args: &RunArgs) -> CliResult<JobDeadlines> {
     .map_err(Into::into)
 }
 
-fn read_prepared_work_input(path: &Path) -> CliResult<PreparedPaidWorkInput> {
+fn read_prepared_work_input(path: &Path) -> CliResult<PreparedWorkInput> {
     let bytes = super::read_bounded_regular_file(path, "prepared paid input", MAX_RECORD_BYTES)?;
-    PreparedPaidWorkInput::decode(&bytes, MAX_RECORD_BYTES)
+    PreparedWorkInput::decode(&bytes, MAX_RECORD_BYTES)
         .map_err(|error| anyhow::anyhow!("invalid prepared paid input {}: {error}", path.display()))
 }
 

@@ -4,7 +4,7 @@
 //! checks every transition at its recorded cursor height, preserving per-job
 //! credit limits and terminal outcomes across restart.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use hellas_kernel::{
@@ -23,11 +23,17 @@ use crate::work_store::{
 };
 use hellas_rpc::protocol::Digest;
 use hellas_rpc::protocol::work::{
-    CreditLedger, PaidChannel, PaidJobAuthorizationV1, PaidJobResultV1, PaidWorkError,
+    CreditLedger, PaidChannel, PaidJobAuthorizationV2, PaidJobResultV1, PaidWorkError,
     PaymentBindingV1, PrivateRecord as _, decode_transcript, payment_binding_digest, result_digest,
     signing_hash, work_id,
 };
-use hellas_rpc::protocol::work_profile::PreparedPaidWorkInput;
+use hellas_rpc::protocol::work_profile::PreparedWorkInput;
+
+mod book;
+pub mod funding;
+pub use book::JobBook;
+use funding::{Clock, ClockReading};
+pub use funding::{FinalizedHeight, Funding, PaymentFunding};
 
 mod codec;
 mod state;
@@ -106,24 +112,20 @@ pub enum ChannelStateError {
     Indeterminate,
     /// A provider co-signature was applied after its authorization's
     /// acceptance deadline.
-    #[error(
-        "a job accepted at finalized height {height} is past the acceptance deadline {deadline}"
-    )]
+    #[error("a job accepted at {now} is past the acceptance deadline {deadline}")]
     AcceptanceLate {
-        /// Finalized cursor consumed by the durable apply.
-        height: u64,
+        /// Typed clock reading consumed by the durable apply.
+        now: ClockReading,
         /// Deadline the authorization carries.
-        deadline: u64,
+        deadline: ClockReading,
     },
     /// Backend dispatch was durably applied after the terminal deadline.
-    #[error(
-        "a job dispatched at finalized height {height} is past the terminal deadline {deadline}"
-    )]
+    #[error("a job dispatched at {now} is past the terminal deadline {deadline}")]
     DispatchLate {
-        /// Finalized cursor consumed by the durable apply.
-        height: u64,
+        /// Typed clock reading consumed by the durable apply.
+        now: ClockReading,
         /// Deadline the authorization carries.
-        deadline: u64,
+        deadline: ClockReading,
     },
     /// A result reached the client after the height it was owed by.
     ///
@@ -235,7 +237,7 @@ impl JobPhase {
         matches!(self, Self::Delivered | Self::Streaming)
     }
 
-    const fn code(self) -> u8 {
+    pub(in crate::work_store) const fn code(self) -> u8 {
         match self {
             Self::HalfSigned => 0,
             Self::Accepted => 1,
@@ -247,7 +249,7 @@ impl JobPhase {
         }
     }
 
-    const fn from_code(code: u8) -> Result<Self, ChannelStateError> {
+    pub(in crate::work_store) const fn from_code(code: u8) -> Result<Self, ChannelStateError> {
         match code {
             0 => Ok(Self::HalfSigned),
             1 => Ok(Self::Accepted),
@@ -353,13 +355,13 @@ impl TerminalOutcome {
 /// Replays and retries consult this record to avoid completing or paying
 /// the same job twice. A channel retains a terminal for each finished job.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct JobTerminal {
+pub struct JobTerminal<F: Funding = PaymentFunding> {
     /// The job that ended.
     pub work_id: Digest,
     /// The phase it had reached when it ended.
     pub phase: JobPhase,
     /// How it ended.
-    pub outcome: TerminalOutcome,
+    pub outcome: F::Terminal,
 }
 
 mod outcome_code {
@@ -373,6 +375,14 @@ mod outcome_code {
 /// One durable step of a channel's life.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ChannelRecord {
+    /// Client-side exchange state, fsynced before a retry leaves or a known
+    /// refusal permits another nonce. This never releases funding obligations.
+    ProposalExchange {
+        /// Retained half-signed proposal whose exchange is being recorded.
+        work_id: Digest,
+        /// True before sending; false after receiving a well-formed refusal.
+        pending: bool,
+    },
     /// Finalized blocks have been processed through this block.
     ///
     /// The parent rides with the payload because a cursor is only worth
@@ -396,7 +406,7 @@ pub enum ChannelRecord {
     /// authorization carries only the digest of those inputs.
     JobProposed {
         /// The body both parties sign.
-        authorization: PaidJobAuthorizationV1,
+        authorization: PaidJobAuthorizationV2,
         /// The client's signature over its `work_id`.
         client_signature: Sig,
         /// The canonical prepared-input bundle the authorization's
@@ -467,7 +477,7 @@ pub enum ChannelRecord {
     /// close that left out a certificate it was still admitting would
     /// be a close below what was earned. Once the window has passed
     /// with no contest on this disk, the signature can reach nothing
-    /// and holds nothing shut; see [`ChannelState::is_closing`].
+    /// and holds nothing shut; see [`Channel::is_closing`].
     ClosePrepared {
         /// The signed start, exactly as it will be submitted.
         ///
@@ -513,7 +523,7 @@ pub enum ChannelRecord {
     /// journal holding an answer consensus has never seen. Read as
     /// "handed off" it would be a lie exactly then, which is why nothing
     /// in the duty rule consults it — see
-    /// [`ChannelState::answerable_contest`], which decides what is owed
+    /// [`Channel::answerable_contest`], which decides what is owed
     /// from the contest and the certificate alone.
     ///
     /// The digest rather than the bytes, because the bytes are derived
@@ -541,6 +551,7 @@ pub enum ChannelRecord {
 }
 
 mod tag {
+    pub(super) const PROPOSAL_EXCHANGE: u8 = 12;
     pub(super) const CURSOR: u8 = 0;
     pub(super) const PROPOSED: u8 = 1;
     pub(super) const ACCEPTED: u8 = 2;
@@ -567,25 +578,26 @@ const JOB_TAIL_BYTES: usize = PaidJobResultV1::ENCODED_SIZE
     + PaymentBindingV1::ENCODED_SIZE
     + EarnedCertificate::ENCODED_SIZE
     + 4 * Sig::LENGTH
-    + 64;
+    + 64
+    + 33;
 
 /// One active job on a channel.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct JobState {
-    authorization: PaidJobAuthorizationV1,
-    work_id: Digest,
-    prepared_input: Vec<u8>,
-    client_signature: Sig,
-    provider_signature: Option<Sig>,
-    phase: JobPhase,
-    result: Option<(PaidJobResultV1, Sig)>,
-    transcript: Vec<u8>,
+pub struct JobState<F: Funding = PaymentFunding> {
+    pub(in crate::work_store) authorization: F::Authorization,
+    pub(in crate::work_store) work_id: Digest,
+    pub(in crate::work_store) prepared_input: Vec<u8>,
+    pub(in crate::work_store) client_signature: F::Signature,
+    pub(in crate::work_store) provider_signature: Option<F::Signature>,
+    pub(in crate::work_store) phase: JobPhase,
+    pub(in crate::work_store) result: Option<(F::Result, F::Signature)>,
+    pub(in crate::work_store) transcript: Vec<u8>,
 }
 
-impl JobState {
+impl<F: Funding> JobState<F> {
     /// Returns the authorization both parties sign.
     #[must_use]
-    pub const fn authorization(&self) -> &PaidJobAuthorizationV1 {
+    pub const fn authorization(&self) -> &F::Authorization {
         &self.authorization
     }
 
@@ -615,19 +627,19 @@ impl JobState {
 
     /// Returns the client's signature over the `work_id`.
     #[must_use]
-    pub const fn client_signature(&self) -> Sig {
+    pub const fn client_signature(&self) -> F::Signature {
         self.client_signature
     }
 
     /// Returns the provider's co-signature, once it exists.
     #[must_use]
-    pub const fn provider_signature(&self) -> Option<Sig> {
+    pub const fn provider_signature(&self) -> Option<F::Signature> {
         self.provider_signature
     }
 
     /// Returns the signed result, once it exists.
     #[must_use]
-    pub const fn result(&self) -> Option<&(PaidJobResultV1, Sig)> {
+    pub const fn result(&self) -> Option<&(F::Result, F::Signature)> {
         self.result.as_ref()
     }
 
@@ -667,16 +679,26 @@ pub struct PaidCertificate {
 
 /// What one endpoint durably knows about one channel.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ChannelState {
+pub struct Channel<F: Funding = PaymentFunding> {
+    pub(in crate::work_store) funding: F::State,
+    pub(in crate::work_store) ledger: F::Ledger,
+    pub(in crate::work_store) role: Role,
+    pub(in crate::work_store) book: JobBook<F>,
+}
+
+impl<F: Funding> Channel<F> {
+    /// Shared lifecycle state, without funding-specific mutation authority.
+    pub const fn job_book(&self) -> &JobBook<F> {
+        &self.book
+    }
+}
+
+/// Payment-only identity, finalized observation and close obligations.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PaymentState {
     channel: PaidChannel,
     settlement: WorkPaymentSettlement,
-    role: Role,
-    ledger: CreditLedger,
-    jobs: BTreeMap<Digest, JobState>,
-    terminals: BTreeMap<Digest, JobTerminal>,
-    proposal_nonce_high_water: u64,
     cursor: (u64, [u8; 32]),
-    indeterminate: BTreeMap<Digest, ()>,
     close_prepared: Option<PaymentCloseStart>,
     close_opened: Option<OpenContest>,
     close_responded: Option<RespondedContest>,

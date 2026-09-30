@@ -1,5 +1,4 @@
 pub const HASH_TUPLE_V2: &str = "hellas.hash_tuple.v2";
-pub const RUN_TICKET_SIGNATURE_V2: &str = "hellas.run_ticket.signature.v2";
 pub const PRODUCER_ID_V2: &str = "hellas.producer_id.v2";
 
 pub const STREAM_CANONICALIZATION_ID_V2: &str = "hellas.stream.canonicalization.id.v2";

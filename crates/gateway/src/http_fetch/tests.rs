@@ -16,21 +16,21 @@ async fn http_uses_the_paid_backend_and_waits_for_its_payment_completion() {
         provider: iroh::EndpointId,
         busy: bool,
     }
-    impl PaidExecutionBackend for Paid {
+    impl WorkExecutionBackend for Paid {
         fn fetch_providers(&self) -> Vec<iroh::EndpointId> {
             vec![self.provider]
         }
         fn execute(
             &self,
-            _: crate::PaidExecutionRequest,
-        ) -> Result<crate::PaidOutputStream<crate::ExecutionEvent>, crate::PaidGatewayError>
+            _: crate::WorkExecutionRequest,
+        ) -> Result<crate::WorkOutputStream<crate::ExecutionEvent>, crate::WorkGatewayError>
         {
             unreachable!("HTTP must use Fetch")
         }
         fn fetch(
             &self,
-            request: PaidFetchRequest,
-        ) -> Result<crate::PaidFetchStream, crate::PaidGatewayError> {
+            request: WorkFetchRequest,
+        ) -> Result<crate::WorkFetchStream, crate::WorkGatewayError> {
             self.requests.fetch_add(1, Ordering::Relaxed);
             assert_eq!(request.provider, self.provider);
             assert_eq!((&*request.service, &*request.method), ("http", "request"));
@@ -39,7 +39,7 @@ async fn http_uses_the_paid_backend_and_waits_for_its_payment_completion() {
             assert_eq!(http.body().unwrap(), b"opaque request");
             assert_eq!(http.credential.as_deref(), Some("account"));
             if self.busy {
-                return Err(crate::PaidGatewayBusy.into());
+                return Err(crate::WorkGatewayBusy.into());
             }
             let ack = self.ack.clone();
             Ok(Box::pin(async_stream::try_stream! {

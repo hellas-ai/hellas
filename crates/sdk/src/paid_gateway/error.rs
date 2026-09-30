@@ -2,6 +2,8 @@ use std::{path::PathBuf, time::Duration};
 
 #[derive(Debug, thiserror::Error)]
 pub enum PoolError {
+    #[error(transparent)]
+    Gateway(#[from] hellas_gateway::WorkGatewayError),
     #[error("invalid paid pool: {0}")]
     Invalid(&'static str),
     #[error("paid gateway repeats provider {0}")]
@@ -41,7 +43,7 @@ pub enum PoolError {
     #[error(transparent)]
     Stopped(#[from] super::RequestStopped),
     #[error(transparent)]
-    Busy(#[from] hellas_gateway::PaidGatewayBusy),
+    Busy(#[from] hellas_gateway::WorkGatewayBusy),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]

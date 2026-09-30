@@ -45,8 +45,8 @@ pub use http_fetch::{HttpGatewayConfig, HttpGatewayOptions, start_http};
 
 const DEFAULT_HTTP_PORT: u16 = 8080;
 
-/// Token-native input handed to a configured paid-work client.
-pub struct PaidExecutionRequest {
+/// Token-native input handed to a funded Work client.
+pub struct WorkExecutionRequest {
     pub environment: hellas_rpc::CausalLmEnvironment,
     pub input_ids: Vec<u32>,
     pub max_new_tokens: u32,
@@ -54,7 +54,7 @@ pub struct PaidExecutionRequest {
 }
 
 /// A Fetch pinned to one funded provider by the HTTP account router.
-pub struct PaidFetchRequest {
+pub struct WorkFetchRequest {
     pub provider: EndpointId,
     pub service: String,
     pub method: String,
@@ -62,35 +62,41 @@ pub struct PaidFetchRequest {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum PaidGatewayError {
-    #[error("paid backend does not support HTTP Fetch")]
+pub enum WorkGatewayError {
+    #[error("request does not match its resource: {0}")]
+    Rejected(#[source] Box<dyn std::error::Error + Send + Sync>),
+    #[error("grant access refused: {0}")]
+    Denied(#[source] Box<dyn std::error::Error + Send + Sync>),
+    #[error("resource allowance exhausted: {0}")]
+    Quota(#[source] Box<dyn std::error::Error + Send + Sync>),
+    #[error("Work backend does not support HTTP Fetch")]
     Unsupported,
-    #[error("provider {0} has no paid HTTP Fetch configuration")]
+    #[error("provider {0} has no HTTP Fetch resource")]
     Provider(EndpointId),
     #[error(transparent)]
-    Busy(#[from] PaidGatewayBusy),
-    #[error("paid work failed: {0}")]
-    Payment(#[source] Box<dyn std::error::Error + Send + Sync>),
+    Busy(#[from] WorkGatewayBusy),
+    #[error("Work execution failed: {0}")]
+    Execution(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
 
-pub type PaidOutputStream<E> = futures::stream::BoxStream<'static, Result<E, PaidGatewayError>>;
-pub type PaidFetchStream = PaidOutputStream<hellas_rpc::output::OutputEvent>;
+pub type WorkOutputStream<E> = futures::stream::BoxStream<'static, Result<E, WorkGatewayError>>;
+pub type WorkFetchStream = WorkOutputStream<hellas_rpc::output::OutputEvent>;
 
-/// Paid admission capacity is exhausted or the backend is shutting down.
+/// Work admission capacity is exhausted or the backend is shutting down.
 #[derive(Debug, thiserror::Error)]
-#[error("paid gateway is busy; retry later")]
-pub struct PaidGatewayBusy;
+#[error("Work gateway is busy; retry later")]
+pub struct WorkGatewayBusy;
 
-pub trait PaidExecutionBackend: Send + Sync {
-    /// Providers with a funded-pool configuration for the HTTP Fetch manifest.
+pub trait WorkExecutionBackend: Send + Sync {
+    /// Providers configured for the HTTP Fetch manifest.
     fn fetch_providers(&self) -> Vec<EndpointId> {
         Vec::new()
     }
 
-    /// Authenticated prefixes, followed by completion only after payment ACK.
-    /// After proposal the backend owns collection and payment across disconnects.
-    fn fetch(&self, _request: PaidFetchRequest) -> Result<PaidFetchStream, PaidGatewayError> {
-        Err(PaidGatewayError::Unsupported)
+    /// Authenticated prefixes, then durable completion. After proposal the
+    /// backend owns collection and funding obligations across disconnects.
+    fn fetch(&self, _request: WorkFetchRequest) -> Result<WorkFetchStream, WorkGatewayError> {
+        Err(WorkGatewayError::Unsupported)
     }
 
     /// End-to-end budget, including queued time, advertised to HTTP consumers.
@@ -100,15 +106,14 @@ pub trait PaidExecutionBackend: Send + Sync {
 
     /// Reject incompatible policies before opening a channel. The returned
     /// operation may stop on HTTP cancellation before a proposal is released;
-    /// afterwards it retains responsibility for collection and payment. Prefixes
-    /// are authenticated as they arrive; completion follows durable payment
-    /// acknowledgement.
+    /// afterwards it retains responsibility for collection and funding obligations.
+    /// Prefixes are authenticated as they arrive; completion is durably recorded.
     fn execute(
         &self,
-        request: PaidExecutionRequest,
-    ) -> Result<PaidOutputStream<ExecutionEvent>, PaidGatewayError>;
+        request: WorkExecutionRequest,
+    ) -> Result<WorkOutputStream<ExecutionEvent>, WorkGatewayError>;
 
-    /// Finish outstanding payment operations during graceful shutdown.
+    /// Finish accepted work and its funding obligations during graceful shutdown.
     fn drain(&self) -> futures::future::BoxFuture<'_, ()>;
 }
 
@@ -136,7 +141,7 @@ impl
 pub struct GatewayOptions {
     pub archive: ArchiveOptions,
     pub output_cache: cache::CacheOptions,
-    pub paid_work: Option<Arc<dyn PaidExecutionBackend>>,
+    pub paid_work: Option<Arc<dyn WorkExecutionBackend>>,
     /// Load or create a stable bearer credential in a private file.
     pub bearer_token_file: Option<PathBuf>,
     /// Permit a non-loopback listener, with a persistent bearer credential.
@@ -184,24 +189,8 @@ pub struct GatewayOptions {
     pub wrap_args: Vec<String>,
 }
 
-/// Minimal embedded gateway for a single verified Fetch-backed Responses
-/// route. It deliberately has no tokenizer, Catena environment, local
-/// evaluator, metrics server, or child-process wrapper.
-pub struct FetchGatewayOptions {
-    pub host: String,
-    pub port: Option<u16>,
-    pub node_id: Option<EndpointId>,
-    pub node_addrs: Vec<SocketAddr>,
-    pub retries: usize,
-    pub service: String,
-    pub method: String,
-    pub execution_environment: hellas_rpc::ContentId,
-    pub request_overrides: JsonMap<String, JsonValue>,
-    pub provider_trust: hellas_client::ProviderTrustAnchor,
-    pub caller_key: ProducerSigningKey,
-    pub assurance: hellas_rpc::Assurance,
-    pub secret_key: SecretKey,
-}
+mod fetch_gateway;
+pub use fetch_gateway::{FetchGatewayOptions, start_fetch};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResponsesBackend {
@@ -332,18 +321,13 @@ async fn start_gateway(options: GatewayOptions) -> anyhow::Result<GatewayHandle>
     .await
 }
 
-/// Start the small Responses-only gateway used by native hosts such as Gate.
-pub async fn start_fetch(_options: FetchGatewayOptions) -> anyhow::Result<GatewayHandle> {
-    Err(hellas_client::ClientError::OwnerGrantRequired.into())
-}
-
 async fn launch_gateway(
     app: Router,
     listener: tokio::net::TcpListener,
     bearer: Arc<access::Bearer>,
     wrap_command: Option<&str>,
     wrap_args: &[String],
-    paid_work: Option<Arc<dyn PaidExecutionBackend>>,
+    paid_work: Option<Arc<dyn WorkExecutionBackend>>,
 ) -> anyhow::Result<GatewayHandle> {
     let bound_addr = listener
         .local_addr()
@@ -420,7 +404,7 @@ async fn launch_gateway(
 // Keep cleanup outside the fallible server/child branch: a failed wrapper is
 // also a normal reason for its HTTP requests to have been disconnected.
 async fn finish_paid_work(
-    paid_work: Option<Arc<dyn PaidExecutionBackend>>,
+    paid_work: Option<Arc<dyn WorkExecutionBackend>>,
     result: anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     if let Some(backend) = paid_work {
@@ -557,11 +541,11 @@ mod paid_shutdown_tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     struct Backend(AtomicBool);
-    impl PaidExecutionBackend for Backend {
+    impl WorkExecutionBackend for Backend {
         fn execute(
             &self,
-            _: PaidExecutionRequest,
-        ) -> Result<PaidOutputStream<ExecutionEvent>, PaidGatewayError> {
+            _: WorkExecutionRequest,
+        ) -> Result<WorkOutputStream<ExecutionEvent>, WorkGatewayError> {
             unreachable!("shutdown does not submit new work")
         }
         fn drain(&self) -> futures::future::BoxFuture<'_, ()> {

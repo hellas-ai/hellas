@@ -633,7 +633,16 @@ impl SetupService {
     /// nothing between taking it and dropping it can await.
     fn exchange(&self, request: &ExchangeSetupRequest) -> ExchangeSetupResponse {
         let outcome = match self.endpoint.lock() {
-            Ok(mut endpoint) => endpoint.advance(&request.bundle),
+            Ok(mut endpoint) => {
+                if request.bond_edge != endpoint.state().bond_edge().as_bytes() {
+                    Err(Refusal::new(
+                        WorkRefusal::Invalid,
+                        "setup route names another bond",
+                    ))
+                } else {
+                    endpoint.advance(&request.bundle)
+                }
+            }
             // A handler panicked mid-commit while holding this. The
             // durable effect of that is not knowable here, so the
             // endpoint is not recovered and every later call says so.
@@ -693,6 +702,7 @@ impl WorkSetupHandler for SetupService {
 #[must_use]
 pub fn prepare_setup_exchange(endpoint: &SetupEndpoint) -> ExchangeSetupRequest {
     ExchangeSetupRequest {
+        bond_edge: endpoint.state().bond_edge().as_bytes().to_vec(),
         bundle: endpoint
             .state()
             .bundle_bytes()

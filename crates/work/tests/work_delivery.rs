@@ -30,10 +30,10 @@ use hellas_rpc::protocol::artifacts::{
     SourceRef, TextArtifact, TextExecution, TextPolicy, TokenIds,
 };
 use hellas_rpc::protocol::work::{
-    JobDeadlines, PaidChannelPolicyV1, PaidExecutionPolicyV1, PaidJobAuthorizationV1,
-    PaidWorkError, PrivateRecord as _, delivery_request_digest, encode_transcript,
-    generation_policy_digest, identity_source_digest, private_policy_commitment,
-    propose_authorization, signing_hash, terminal_result, work_id,
+    EvaluatePolicyV2, JobDeadlines, PaidChannelPolicyV1, PaidJobAuthorizationV2, PaidWorkError,
+    PrivateRecord as _, delivery_request_digest, encode_transcript, generation_policy_digest,
+    identity_source_digest, private_policy_commitment, propose_authorization, signing_hash,
+    terminal_result, work_id,
 };
 use hellas_rpc::protocol::work_setup::{
     ObservedChannel, ReadyChannel, WorkChannelConfig, WorkChannelDescriptor, WorkSetupError,
@@ -47,8 +47,8 @@ use hellas_rpc::{
 use hellas_wire::mux::{MessagePipe, MuxConfig, MuxTransport, Role as MuxRole};
 use hellas_wire::{DefaultClock, Dispatcher, StreamTransport};
 use hellas_work::work::{
-    BackendFault, ClientEndpoint, CloseEndpoint, DeliverError, PaidWorkBackend,
-    PreparedEvaluateInput, ProviderEndpoint, RunError, RunOutcome, WorkService, fetch_result,
+    BackendFault, ClientEndpoint, CloseEndpoint, DeliverError, PreparedEvaluateInput,
+    ProviderEndpoint, RunError, RunOutcome, WorkBackend, WorkService, fetch_result,
     run_accepted_work,
 };
 use hellas_work::work_store::{
@@ -131,8 +131,8 @@ fn payment_terms() -> WorkPaymentTerms {
 
 /// The execution policy, with the one bound a test varies as its
 /// argument.
-fn policy_with(max_encoded_result_frame: u32) -> PaidExecutionPolicyV1 {
-    PaidExecutionPolicyV1 {
+fn policy_with(max_encoded_result_frame: u32) -> EvaluatePolicyV2 {
+    EvaluatePolicyV2 {
         allowed_environment: manifest().content_id(),
         generation_policy_digest: match generation_policy_digest(&text_policy().canonical_bytes()) {
             Ok(digest) => digest,
@@ -148,15 +148,11 @@ fn policy_with(max_encoded_result_frame: u32) -> PaidExecutionPolicyV1 {
         max_stop_token_ids: 4,
         max_spool_bytes: 1_048_576,
         max_encoded_result_frame,
-        max_encoded_quote_response: 1_048_576,
-        dispatch_margin_blocks: 4,
-        delivery_margin_blocks: 2,
-        oracle_grace_blocks: 6,
-        fixed_price: PRICE,
+        max_encoded_prepared_input: 1_048_576,
     }
 }
 
-fn execution_policy() -> PaidExecutionPolicyV1 {
+fn work_policy() -> EvaluatePolicyV2 {
     policy_with(WIDE_FRAME)
 }
 
@@ -164,14 +160,15 @@ fn payment_values() -> EdgeValues {
     EdgeValues::new(PAYMENT_VALUE, PAYMENT_RESERVE, Fees::new(0, 0, 0, 0))
 }
 
-fn descriptor_with(policy: PaidExecutionPolicyV1) -> WorkChannelDescriptor {
+fn descriptor_with(policy: EvaluatePolicyV2) -> WorkChannelDescriptor {
     let config = WorkChannelConfig {
+        payment_policy: payment_policy(),
         network: network(),
         payment_edge: payment_edge(),
         payment_terms: payment_terms(),
         policy_salt: SALT,
         channel_policy: channel_policy(),
-        execution_policy: policy.into(),
+        work_policy: policy.into(),
         expected_payment_values: payment_values(),
     };
     match WorkChannelDescriptor::open(config) {
@@ -197,7 +194,7 @@ fn ready_of(descriptor: &WorkChannelDescriptor, height: u64) -> ReadyChannel {
 }
 
 fn ready_at(height: u64) -> ReadyChannel {
-    ready_of(&descriptor_with(execution_policy()), height)
+    ready_of(&descriptor_with(work_policy()), height)
 }
 
 fn ready() -> ReadyChannel {
@@ -299,10 +296,11 @@ fn bundle(nonce: u8) -> PreparedPaidInputV1 {
     )
 }
 
-fn authorization(policy: &PaidExecutionPolicyV1, nonce: u8) -> PaidJobAuthorizationV1 {
+fn authorization(policy: &EvaluatePolicyV2, nonce: u8) -> PaidJobAuthorizationV2 {
     match propose_authorization(
         ready_of(&descriptor_with(*policy), CURSOR).channel(),
         policy,
+        &payment_policy(),
         &bundle(nonce),
         u64::from(nonce),
         deadlines(),
@@ -317,10 +315,10 @@ fn authorization(policy: &PaidExecutionPolicyV1, nonce: u8) -> PaidJobAuthorizat
 /// The acceptance exchange has its own file; these tests are about what
 /// happens after both signatures exist.
 fn accept(
-    policy: &PaidExecutionPolicyV1,
+    policy: &EvaluatePolicyV2,
     stores: &mut [&mut ChannelStore],
     nonce: u8,
-) -> (Digest, PaidJobAuthorizationV1) {
+) -> (Digest, PaidJobAuthorizationV2) {
     let authorization = authorization(policy, nonce);
     let ready = ready_of(&descriptor_with(*policy), CURSOR);
     let id = work_id(ready.channel(), &authorization);
@@ -392,7 +390,7 @@ impl AnsweringBackend {
     }
 }
 
-impl PaidWorkBackend for AnsweringBackend {
+impl WorkBackend for AnsweringBackend {
     fn evaluate(
         &self,
         input: PreparedEvaluateInput,
@@ -444,6 +442,7 @@ fn delivery_request(
     work_id: Digest,
 ) -> DeliverResultRequest {
     DeliverResultRequest {
+        route: Some(hellas_rpc::pb::work::WorkRoute::payment(channel.id())),
         work_id: work_id.as_bytes().to_vec(),
         client_signature: client()
             .sign(signing_hash(delivery_request_digest(
@@ -526,7 +525,7 @@ async fn one_answer_crosses_the_wire_and_is_debited_once() {
     let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR);
     let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
     let (id, authorization) = accept(
-        &execution_policy(),
+        &work_policy(),
         &mut [&mut client_store, &mut provider_store],
         1,
     );
@@ -626,7 +625,7 @@ async fn the_last_height_the_delivery_margin_fits_is_the_last_that_may_release()
         let provider_root = temp();
         let early = ready_at(CURSOR);
         let mut provider_store = store_at(provider_root.path(), &early, Role::Provider, CURSOR);
-        let (id, _) = accept(&execution_policy(), &mut [&mut provider_store], 1);
+        let (id, _) = accept(&work_policy(), &mut [&mut provider_store], 1);
         let Ok(endpoint) = ProviderEndpoint::new(early.clone(), provider_store, provider()) else {
             panic!("the provider endpoint binds");
         };
@@ -678,7 +677,7 @@ async fn a_job_with_no_result_releases_nothing_yet() {
     let provider_root = temp();
     let ready = ready();
     let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
-    let (id, _) = accept(&execution_policy(), &mut [&mut provider_store], 1);
+    let (id, _) = accept(&work_policy(), &mut [&mut provider_store], 1);
     let Ok(endpoint) = ProviderEndpoint::new(ready.clone(), provider_store, provider()) else {
         panic!("the provider endpoint binds");
     };
@@ -719,7 +718,7 @@ async fn a_job_with_no_result_releases_nothing_yet() {
 #[tokio::test]
 async fn a_failed_job_returns_its_terminal_after_authentication() {
     struct FailingBackend;
-    impl PaidWorkBackend for FailingBackend {
+    impl WorkBackend for FailingBackend {
         async fn evaluate(
             &self,
             _input: PreparedEvaluateInput,
@@ -731,7 +730,7 @@ async fn a_failed_job_returns_its_terminal_after_authentication() {
     let provider_root = temp();
     let ready = ready();
     let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
-    let (id, _) = accept(&execution_policy(), &mut [&mut provider_store], 1);
+    let (id, _) = accept(&work_policy(), &mut [&mut provider_store], 1);
     let endpoint = ProviderEndpoint::new(ready.clone(), provider_store, provider())
         .expect("the provider endpoint binds");
     let service = WorkService::new(endpoint);
@@ -857,7 +856,7 @@ async fn a_release_past_the_deadline_is_expired_on_the_wire() {
     let provider_root = temp();
     let early = ready_at(CURSOR);
     let mut provider_store = store_at(provider_root.path(), &early, Role::Provider, CURSOR);
-    let (id, _) = accept(&execution_policy(), &mut [&mut provider_store], 1);
+    let (id, _) = accept(&work_policy(), &mut [&mut provider_store], 1);
     let Ok(endpoint) = ProviderEndpoint::new(early.clone(), provider_store, provider()) else {
         panic!("the provider endpoint binds");
     };
@@ -901,14 +900,14 @@ async fn a_delivery_named_for_another_job_finds_nothing() {
     let provider_root = temp();
     let ready = ready();
     let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
-    let (id, _) = accept(&execution_policy(), &mut [&mut provider_store], 1);
+    let (id, _) = accept(&work_policy(), &mut [&mut provider_store], 1);
     let Ok(endpoint) = ProviderEndpoint::new(ready.clone(), provider_store, provider()) else {
         panic!("the provider endpoint binds");
     };
     let service = WorkService::new(endpoint);
     run_to_result(&service, &ready, id).await;
 
-    let other = work_id(ready.channel(), &authorization(&execution_policy(), 2));
+    let other = work_id(ready.channel(), &authorization(&work_policy(), 2));
     assert_ne!(other, id);
     for (name, work_id) in [
         ("another job", other.as_bytes().to_vec()),
@@ -918,6 +917,9 @@ async fn a_delivery_named_for_another_job_finds_nothing() {
         let serving = serve(server_transport, service.clone());
         let response = match WorkClientImpl::new(transport)
             .deliver_result(DeliverResultRequest {
+                route: Some(hellas_rpc::pb::work::WorkRoute::payment(
+                    ready.channel().id(),
+                )),
                 work_id,
                 client_signature: client()
                     .sign(signing_hash(delivery_request_digest(
@@ -1098,7 +1100,7 @@ async fn a_transcript_swapped_in_transit_is_not_recorded() {
     let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR);
     let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
     let (id, _) = accept(
-        &execution_policy(),
+        &work_policy(),
         &mut [&mut client_store, &mut provider_store],
         1,
     );
@@ -1162,7 +1164,7 @@ async fn a_client_behind_its_readiness_records_no_receipt() {
     let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR);
     let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
     let (id, _) = accept(
-        &execution_policy(),
+        &work_policy(),
         &mut [&mut client_store, &mut provider_store],
         1,
     );
@@ -1308,7 +1310,7 @@ async fn a_work_id_alone_releases_nothing() {
     let provider_root = temp();
     let ready = ready();
     let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
-    let (id, _) = accept(&execution_policy(), &mut [&mut provider_store], 1);
+    let (id, _) = accept(&work_policy(), &mut [&mut provider_store], 1);
     let Ok(endpoint) = ProviderEndpoint::new(ready.clone(), provider_store, provider()) else {
         panic!("the provider endpoint binds");
     };
@@ -1317,6 +1319,9 @@ async fn a_work_id_alone_releases_nothing() {
 
     let signed_with =
         |signer: &hellas_kernel::Secp256k1Signer, exporter: &[u8; 32]| DeliverResultRequest {
+            route: Some(hellas_rpc::pb::work::WorkRoute::payment(
+                ready.channel().id(),
+            )),
             work_id: id.as_bytes().to_vec(),
             client_signature: signer
                 .sign(signing_hash(delivery_request_digest(
@@ -1331,6 +1336,9 @@ async fn a_work_id_alone_releases_nothing() {
         (
             "a bare work id",
             DeliverResultRequest {
+                route: Some(hellas_rpc::pb::work::WorkRoute::payment(
+                    ready.channel().id(),
+                )),
                 work_id: id.as_bytes().to_vec(),
                 client_signature: Vec::new(),
             },
@@ -1402,7 +1410,7 @@ async fn a_transport_without_an_exporter_delivers_nothing() {
     let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
     let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR);
     let (id, _) = accept(
-        &execution_policy(),
+        &work_policy(),
         &mut [&mut client_store, &mut provider_store],
         1,
     );
@@ -1463,7 +1471,7 @@ async fn live_prefix_precedes_terminal_and_reserves_delivery_credit() {
     struct PausedBackend {
         release: Arc<tokio::sync::Notify>,
     }
-    impl PaidWorkBackend for PausedBackend {
+    impl WorkBackend for PausedBackend {
         async fn evaluate(
             &self,
             input: PreparedEvaluateInput,
@@ -1487,7 +1495,7 @@ async fn live_prefix_precedes_terminal_and_reserves_delivery_credit() {
     let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR);
     let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
     let (id, _) = accept(
-        &execution_policy(),
+        &work_policy(),
         &mut [&mut client_store, &mut provider_store],
         1,
     );
@@ -1571,7 +1579,7 @@ async fn paid_stream_checks_status_and_terminal_shape_before_recording_delivery(
         let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR);
         let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
         let (id, _) = accept(
-            &execution_policy(),
+            &work_policy(),
             &mut [&mut client_store, &mut provider_store],
             1,
         );
@@ -1645,5 +1653,14 @@ async fn paid_stream_checks_status_and_terminal_shape_before_recording_delivery(
         assert_eq!(recovered, delivered);
         serving.abort();
         let _ = serving.await;
+    }
+}
+
+fn payment_policy() -> hellas_rpc::protocol::work::JobPaymentPolicyV2 {
+    hellas_rpc::protocol::work::JobPaymentPolicyV2 {
+        fixed_price: PRICE,
+        dispatch_margin_blocks: 4,
+        delivery_margin_blocks: 2,
+        oracle_grace_blocks: 6,
     }
 }

@@ -8,6 +8,8 @@ pub type ClientResult<T> = Result<T, ClientError>;
 
 #[derive(Debug, Error)]
 pub enum ClientError {
+    #[error("execution requires a funded Work backend")]
+    FundingRequired,
     #[error("owner execution requires a grant; select a payment-funded Work channel")]
     OwnerGrantRequired,
     #[error("{0}")]

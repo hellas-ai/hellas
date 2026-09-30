@@ -47,7 +47,7 @@ impl ClientService {
     }
 
     /// Reads local accounting without holding a borrow across an await.
-    pub fn with_state<R>(&self, read: impl FnOnce(&ChannelState) -> R) -> Result<R, EndpointError> {
+    pub fn with_state<R>(&self, read: impl FnOnce(&Channel) -> R) -> Result<R, EndpointError> {
         self.observer.with_state(read)
     }
 
@@ -71,7 +71,7 @@ impl ClientObserver {
     }
 
     /// Reads local state without holding it across an await.
-    pub fn with_state<R>(&self, read: impl FnOnce(&ChannelState) -> R) -> Result<R, EndpointError> {
+    pub fn with_state<R>(&self, read: impl FnOnce(&Channel) -> R) -> Result<R, EndpointError> {
         Ok(read(self.endpoint()?.state()))
     }
 

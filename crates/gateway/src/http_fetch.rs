@@ -20,7 +20,7 @@ use hellas_rpc::output::{AdaptorEvent, HttpResponseEvent, OutputEvent, StopReaso
 use std::sync::Arc;
 use tracing::Instrument;
 
-use super::{GatewayHandle, PaidExecutionBackend, PaidFetchRequest, access};
+use super::{GatewayHandle, WorkExecutionBackend, WorkFetchRequest, access};
 
 #[derive(Clone)]
 pub(crate) struct BackendName(pub String);
@@ -33,7 +33,7 @@ fn attributed(mut response: Response, name: &str) -> Response {
 struct HttpState {
     service: String,
     method: String,
-    paid: Arc<dyn PaidExecutionBackend>,
+    paid: Arc<dyn WorkExecutionBackend>,
     routing: Arc<routing::Routing>,
     metrics: observation::Metrics,
 }
@@ -43,7 +43,7 @@ enum HttpOpenError {
     #[error("missing authenticated HTTP response head")]
     MissingHead,
     #[error(transparent)]
-    Paid(#[from] super::PaidGatewayError),
+    Paid(#[from] super::WorkGatewayError),
     #[error(transparent)]
     Headers(#[from] hellas_rpc::http_fetch::HttpRequestError),
 }
@@ -52,7 +52,7 @@ enum HttpOpenError {
 /// supplied paid pool; tokenizers and inference replay do not apply here.
 pub struct HttpGatewayOptions {
     pub config: HttpGatewayConfig,
-    pub paid: Arc<dyn PaidExecutionBackend>,
+    pub paid: Arc<dyn WorkExecutionBackend>,
     pub archive: super::ArchiveOptions,
     pub host: String,
     pub port: Option<u16>,
@@ -218,7 +218,7 @@ async fn handle(State(state): State<Arc<HttpState>>, request: Request) -> Respon
         .await;
     let (status, headers, mut events) = match result {
         Ok(value) => value,
-        Err(HttpOpenError::Paid(super::PaidGatewayError::Busy(_))) => {
+        Err(HttpOpenError::Paid(super::WorkGatewayError::Busy(_))) => {
             observed.status(503);
             return attributed(
                 error(
@@ -317,8 +317,8 @@ async fn open(
     state: &HttpState,
     provider: iroh::EndpointId,
     payload: Vec<u8>,
-) -> Result<(u16, Vec<(String, String)>, super::PaidFetchStream), HttpOpenError> {
-    let mut stream = state.paid.fetch(PaidFetchRequest {
+) -> Result<(u16, Vec<(String, String)>, super::WorkFetchStream), HttpOpenError> {
+    let mut stream = state.paid.fetch(WorkFetchRequest {
         provider,
         service: state.service.clone(),
         method: state.method.clone(),

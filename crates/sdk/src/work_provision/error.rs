@@ -1,9 +1,10 @@
 use hellas_kernel::{CoinId, EdgeId, Key};
-use hellas_rpc::peers::PeerId;
 use std::path::PathBuf;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProvisionError {
+    #[error(transparent)]
+    Offer(#[from] hellas_rpc::protocol::work_offer::PaidOfferError),
     #[error("bond timeout {timeout} must be after finalized height {height}")]
     ExpiredBond { timeout: u64, height: u64 },
     #[error("bond timeout exceeds the chain maximum lifetime")]
@@ -18,8 +19,6 @@ pub enum ProvisionError {
     MissingProposal(EdgeId),
     #[error("candidate bond {} collides with an existing provider offer", hex::encode(.0.to_bytes()))]
     BondCollision(EdgeId),
-    #[error("candidate peer {peer:#} collides with bond {}", hex::encode(bond.to_bytes()))]
-    PeerCollision { peer: PeerId, bond: EdgeId },
     #[error("candidate stake coin {} is reserved by bond {}", hex::encode(coin.to_bytes()), hex::encode(bond.to_bytes()))]
     ReservedCoin { coin: CoinId, bond: EdgeId },
     #[error("route for bond {} expects client {}, but the bond names {}", hex::encode(bond.to_bytes()), hex::encode(expected.to_bytes()), hex::encode(actual.to_bytes()))]

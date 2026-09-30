@@ -2,7 +2,7 @@ use std::fs;
 
 use hellas_kernel::{EdgeValues, Fees, MIN_OMIT_RESPONSE_BLOCKS};
 use hellas_rpc::protocol::Digest;
-use hellas_rpc::protocol::work::{PaidChannelPolicyV1, PaidExecutionPolicyV1};
+use hellas_rpc::protocol::work::{EvaluatePolicyV2, PaidChannelPolicyV1};
 use hellas_rpc::protocol::work_setup::ProviderChannelPolicy;
 use hellas_work::work_close::{BlockSourceError, FinalizedWork};
 
@@ -28,6 +28,31 @@ fn provider() -> Secp256k1Signer {
     signer(0x22)
 }
 
+fn enrollment() -> hellas_rpc::ProviderEnrollmentBundle {
+    use hellas_rpc::*;
+    let root = ProducerSigningKey::from_secret_bytes([0x22; 32]).unwrap();
+    let statement = ProviderGenesisStatement {
+        root_kind: RootKind::Software,
+        root_public_key: root.public_key(),
+        producer_public_key: root.public_key(),
+        transport_public_key: PublicKey::Ed25519(
+            *iroh::SecretKey::from_bytes(&[0x51; 32]).public().as_bytes(),
+        ),
+        platform_credential: PlatformCredential::Absent,
+        installation_nonce: [3; 32],
+    };
+    let proof = root
+        .sign_digest(Digest::hash(&statement.canonical_bytes()))
+        .unwrap();
+    ProviderEnrollmentBundle {
+        genesis: SignedProviderGenesis {
+            statement,
+            root_proof: RootProof::Software(proof),
+        },
+        platform: PlatformEnrollment::Absent,
+    }
+}
+
 /// The client the bond names as taker.
 fn client() -> Secp256k1Signer {
     signer(0x21)
@@ -46,13 +71,14 @@ fn policy() -> ProviderChannelPolicy {
         panic!("the fixture environment id is one");
     };
     ProviderChannelPolicy {
+        payment_policy: payment_policy(),
         network: network(),
         policy_salt: [0x5a; 32],
         channel_policy: PaidChannelPolicyV1 {
             compute_credit_limit: 40,
             delivery_credit_limit: 40,
         },
-        execution_policy: PaidExecutionPolicyV1 {
+        work_policy: EvaluatePolicyV2 {
             allowed_environment: environment,
             generation_policy_digest: Digest::from_bytes([0x12; 32]),
             identity_source_digest: Digest::from_bytes([0x13; 32]),
@@ -61,11 +87,7 @@ fn policy() -> ProviderChannelPolicy {
             max_stop_token_ids: 4,
             max_spool_bytes: 1 << 20,
             max_encoded_result_frame: 262_144,
-            max_encoded_quote_response: 1 << 20,
-            dispatch_margin_blocks: 4,
-            delivery_margin_blocks: 2,
-            oracle_grace_blocks: 6,
-            fixed_price: 10,
+            max_encoded_prepared_input: 1 << 20,
         }
         .into(),
         expected_payment_values: EdgeValues::new(1_000, 200, Fees::new(0, 0, 0, 0)),
@@ -122,7 +144,9 @@ fn routed_work_config(
                 "max_stop_token_ids": 4,
                 "max_spool_bytes": 1_048_576_u64,
                 "max_encoded_result_frame": 262_144,
-                "max_encoded_quote_response": 1_048_576_u64,
+                "max_encoded_prepared_input": 1_048_576_u64,
+            },
+            "payment": {
                 "dispatch_margin_blocks": 4,
                 "delivery_margin_blocks": 2,
                 "oracle_grace_blocks": 6,
@@ -159,6 +183,8 @@ fn options_for(
     ProvisionOptions {
         work_config,
         settlement_key: provider(),
+        provider: enrollment(),
+        addresses: vec![],
         client,
         stake_coins: stake_coins
             .iter()
@@ -487,45 +513,35 @@ fn a_restart_refuses_a_coin_reserved_by_an_unanswered_offer_before_signing_or_wr
     );
 }
 
-/// Route-table construction itself is the pre-signing peer collision
-/// gate. A duplicate peer cannot become the configuration passed to the
-/// second provisioning attempt.
+/// Distinct bonds and disjoint stake may be offered to the same peer.
 #[test]
-fn a_second_offer_cannot_reuse_the_first_offers_peer() {
+fn a_second_offer_can_reuse_the_first_offers_peer() {
     let dir = tempfile::tempdir().unwrap();
     let first_client = client().party_key();
     let second_client = signer(0x23).party_key();
     let first_bond = expected_bond_for(first_client, &[0xa1], 40);
     let second_bond = expected_bond_for(second_client, &[0xb1], 41);
-    let first_config = routed_work_config(dir.path(), vec![route(0x51, first_bond, first_client)])
-        .unwrap_or_else(|error| panic!("the first route loads: {error:#}"));
-    let first = options_for(first_config, first_client, &[0xa1], 40);
-    provision_options(&first, policy())
-        .unwrap_or_else(|error| panic!("the first offer is made: {error:#}"));
-
-    let error = routed_work_config(
+    let config = routed_work_config(
         dir.path(),
         vec![
             route(0x51, first_bond, first_client),
             route(0x51, second_bond, second_client),
         ],
     )
-    .expect_err("one authenticated peer cannot name the second offer too");
-    let said = format!("{error:#}");
-    assert!(
-        said.contains("names peer") && said.contains("twice"),
-        "unexpected duplicate-peer refusal: {said}",
-    );
-    assert_eq!(provider_setups(dir.path()), 1);
-    assert!(
-        root_holds_signature(dir.path(), &proposal_signature(first_client, &[0xa1], 40)),
-        "the signature scan cannot find the offer that was made",
-    );
-    assert_no_offer_artifact(
+    .unwrap();
+    let first = options_for(config.clone(), first_client, &[0xa1], 40);
+    provision_options(&first, policy()).unwrap();
+    let second = options_for(config, second_client, &[0xb1], 41);
+    provision_options(&second, policy()).unwrap();
+    assert_eq!(provider_setups(dir.path()), 2);
+    assert!(root_holds_signature(
         dir.path(),
-        second_bond,
-        &proposal_signature(second_client, &[0xb1], 41),
-    );
+        &proposal_signature(first_client, &[0xa1], 40)
+    ));
+    assert!(root_holds_signature(
+        dir.path(),
+        &proposal_signature(second_client, &[0xb1], 41)
+    ));
 }
 
 /// A repeated provision is still a second promise over the same bond.
@@ -655,4 +671,87 @@ impl FinalizedBlocks for Chain {
             .clone()
             .filter(|block| block.height == height)))
     }
+}
+
+fn payment_policy() -> hellas_rpc::protocol::work::JobPaymentPolicyV2 {
+    hellas_rpc::protocol::work::JobPaymentPolicyV2 {
+        fixed_price: 10,
+        dispatch_margin_blocks: 4,
+        delivery_margin_blocks: 2,
+        oracle_grace_blocks: 6,
+    }
+}
+
+#[test]
+fn paid_offer_binds_enrollment_proposal_and_addresses_to_the_settlement_signer() {
+    use hellas_rpc::protocol::work_offer::{PaidOffer, SignedPaidOffer};
+    let root = tempfile::tempdir().unwrap();
+    let made = provision(root.path(), policy(), 40).unwrap();
+    let signed = made.offer;
+    signed.check().unwrap();
+    assert_eq!(signed.offer().proposal.bond_edge(), made.bond_edge);
+    assert_eq!(
+        SignedPaidOffer::decode(&signed.encode().unwrap()).unwrap(),
+        signed
+    );
+    let imported: SignedPaidOffer =
+        serde_json::from_value(serde_json::to_value(&signed).unwrap()).unwrap();
+    imported.check().unwrap();
+    assert_eq!(imported, signed);
+    for field in ["addresses", "provider", "proposal"] {
+        let mut changed = serde_json::to_value(&signed).unwrap();
+        match field {
+            "addresses" => changed["offer"][field] = serde_json::json!(["127.0.0.1:99"]),
+            "provider" => {
+                let mut provider = signed.offer().provider.clone();
+                provider.genesis.statement.installation_nonce[0] ^= 1;
+                changed["offer"][field] = serde_json::json!(provider.canonical_bytes());
+            }
+            "proposal" => {
+                let other = tempfile::tempdir().unwrap();
+                let proposal = provision(other.path(), policy(), 39)
+                    .unwrap()
+                    .offer
+                    .offer()
+                    .proposal
+                    .clone();
+                changed["offer"][field] = serde_json::json!(proposal.encode());
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            serde_json::from_value::<SignedPaidOffer>(changed)
+                .map(|s| s.check().is_err())
+                .unwrap_or(true),
+            "{field}"
+        );
+    }
+    assert!(SignedPaidOffer::sign(signed.offer().clone(), &client()).is_err());
+    let mut different = signed.offer().provider.clone();
+    different.genesis.statement.producer_public_key =
+        hellas_rpc::PublicKey::Secp256k1(client().party_key().to_bytes());
+    assert!(
+        SignedPaidOffer::sign(
+            PaidOffer {
+                provider: different,
+                ..signed.offer().clone()
+            },
+            &provider()
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn malformed_paid_offer_is_rejected_before_reserving_a_bond() {
+    let root = tempfile::tempdir().unwrap();
+    let mut options = options(root.path(), 40);
+    options.addresses = vec!["not-a-socket".into()];
+    assert!(Offer::plan(&options, policy(), BondCandidate::plan(&options).unwrap()).is_err());
+    assert!(
+        discover_setups(root.path(), network())
+            .unwrap()
+            .setups
+            .is_empty()
+    );
 }

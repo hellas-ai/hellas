@@ -30,7 +30,7 @@
 //! is the one the provider signed, that it names this job, and that the
 //! transcript it summarises is this job's — those are the endpoint
 //! journal's, established when the delivery was recorded
-//! (`hellas_work::work_store::ChannelState`), on commit and on every
+//! (`hellas_work::work_store::Channel`), on commit and on every
 //! replay. Repeating them here would be a second opinion about a question
 //! already settled.
 //!

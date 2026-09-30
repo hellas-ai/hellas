@@ -342,7 +342,7 @@ mod tests {
     use hellas_rpc::call::WithTrailer;
     use hellas_rpc::pb::work::{ExchangeSetupRequest, exchange_setup_response::Outcome};
     use hellas_rpc::protocol::work::{
-        PaidChannelPolicyV1, PaidExecutionPolicyV1, private_policy_commitment,
+        EvaluatePolicyV2, PaidChannelPolicyV1, private_policy_commitment,
     };
     use hellas_rpc::protocol::work_setup::{
         ProviderChannelPolicy, WorkChannelConfig, WorkChannelDescriptor,
@@ -451,8 +451,8 @@ mod tests {
         }
     }
 
-    fn execution_policy() -> PaidExecutionPolicyV1 {
-        PaidExecutionPolicyV1 {
+    fn work_policy() -> EvaluatePolicyV2 {
+        EvaluatePolicyV2 {
             allowed_environment: ContentId::from_bytes([0x31; 32]),
             generation_policy_digest: ProtocolDigest::from_bytes([0x32; 32]),
             identity_source_digest: ProtocolDigest::from_bytes([0x33; 32]),
@@ -461,11 +461,7 @@ mod tests {
             max_stop_token_ids: 4,
             max_spool_bytes: 1_048_576,
             max_encoded_result_frame: 262_144,
-            max_encoded_quote_response: 1_048_576,
-            dispatch_margin_blocks: 4,
-            delivery_margin_blocks: 2,
-            oracle_grace_blocks: 6,
-            fixed_price: 10,
+            max_encoded_prepared_input: 1_048_576,
         }
     }
 
@@ -477,10 +473,11 @@ mod tests {
 
     fn provider_policy() -> ProviderChannelPolicy {
         ProviderChannelPolicy {
+            payment_policy: payment_policy(),
             network: TEST_NETWORK,
             policy_salt: SALT,
             channel_policy: channel_policy(),
-            execution_policy: execution_policy().into(),
+            work_policy: work_policy().into(),
             expected_payment_values: expected_values(),
             min_omit_response_blocks: hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
         }
@@ -695,7 +692,10 @@ mod tests {
     async fn exchange(service: &SetupService, bundle: Vec<u8>) -> Vec<u8> {
         let answered = WorkSetupHandler::exchange_setup(
             service,
-            ExchangeSetupRequest { bundle },
+            ExchangeSetupRequest {
+                bond_edge: bond_edge().as_bytes().to_vec(),
+                bundle,
+            },
             TransportContext::default(),
         )
         .await
@@ -892,12 +892,13 @@ mod tests {
             assert_eq!(funded.capacity(), FUNDING - OMISSION_BOND);
             drop(recovered);
             let descriptor = match WorkChannelDescriptor::open(WorkChannelConfig {
+                payment_policy: payment_policy(),
                 network: TEST_NETWORK,
                 payment_edge,
                 payment_terms: payment_terms(),
                 policy_salt: SALT,
                 channel_policy: channel_policy(),
-                execution_policy: execution_policy().into(),
+                work_policy: work_policy().into(),
                 expected_payment_values: expected_values(),
             }) {
                 Ok(descriptor) => descriptor,
@@ -1234,6 +1235,15 @@ mod tests {
                 Ok(advance) => return advance.progress,
                 Err(error) => panic!("the driver takes a step: {error}"),
             }
+        }
+    }
+
+    fn payment_policy() -> hellas_rpc::protocol::work::JobPaymentPolicyV2 {
+        hellas_rpc::protocol::work::JobPaymentPolicyV2 {
+            fixed_price: 10,
+            dispatch_margin_blocks: 4,
+            delivery_margin_blocks: 2,
+            oracle_grace_blocks: 6,
         }
     }
 }

@@ -21,11 +21,11 @@ use hellas_work::work_store::journal::{Journal, JournalId, JournalKind};
 /// generation, key.
 const HEADER_BYTES: usize = 65;
 
-/// `hellas.work-journal.v1`, then `06` version, `02` channel, `02`
+/// `hellas.work-journal.v1`, then `07` version, `02` channel, `02`
 /// provider, the eight-byte generation, then the 32-byte key.
 const GOLDEN_HEADER: &str = concat!(
     "68656c6c61732e776f726b2d6a6f75726e616c2e7631",
-    "06",
+    "07",
     "02",
     "02",
     "0000000000000000",
@@ -37,264 +37,48 @@ const GOLDEN_HEADER: &str = concat!(
 const GOLDEN_FRAME: &str = concat!(
     "0000000a",
     "6f6e65207265636f7264",
-    "c954ab65afded981062cd1f8f0cbee864c20ae9c01104104ee7a9081c743b5bd",
+    "426b31f7176b3929136b6da7ca6d474e9b3d272c87efc95b96a1f69abe245889",
 );
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// Version 1 files are pre-deployment casualties: they have no recovery
-/// arming records and cannot be upgraded without inventing the observation
-/// floor they failed to retain.
+/// A mismatched format is rejected before records are read or the file is changed.
 #[test]
-fn a_v1_journal_is_refused() {
-    let Ok(dir) = tempfile::tempdir() else {
-        panic!("a temporary directory");
-    };
-    let path = dir.path().join("old.0000000000000000.journal");
+fn mismatched_formats_are_refused_before_any_record_is_decoded() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("format.0000000000000000.journal");
     let id = JournalId {
         kind: JournalKind::Channel,
         role: Role::Provider,
         key: [0x11; 32],
         generation: 0,
     };
-    {
-        let Ok((journal, _)) = Journal::open(&path, id) else {
-            panic!("the current journal opens");
-        };
-        drop(journal);
+    let (journal, _) = Journal::open(&path, id).unwrap();
+    drop(journal);
+    let header = std::fs::read(&path).unwrap();
+    for found in (0..=u8::MAX).filter(|version| *version != 7) {
+        let mut bytes = header.clone();
+        bytes[b"hellas.work-journal.v1".len()] = found;
+        bytes.extend_from_slice(b"intentionally invalid record");
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(matches!(
+            Journal::open(&path, id),
+            Err(hellas_work::work_store::JournalError::VersionMismatch {
+                found: actual,
+                expected: 7,
+            }) if actual == found
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert!(matches!(
+            Journal::inspect(&path),
+            Err(hellas_work::work_store::JournalError::VersionMismatch {
+                found: actual,
+                expected: 7,
+            }) if actual == found
+        ));
     }
-    let Ok(mut bytes) = std::fs::read(&path) else {
-        panic!("the current journal reads");
-    };
-    bytes[b"hellas.work-journal.v1".len()] = 1;
-    if let Err(error) = std::fs::write(&path, bytes) {
-        panic!("the old header writes: {error}");
-    }
-    let error = Journal::open(&path, id).expect_err("v1 lacks recovery arming state");
-    assert!(
-        matches!(
-            error,
-            hellas_work::work_store::JournalError::OldVersion {
-                found: 1,
-                expected: 6,
-                ..
-            }
-        ),
-        "unexpected error: {error}",
-    );
-}
-
-/// Version 5 journals encode one implicit job and therefore cannot be
-/// replayed as the version 6 format, where every follow-on record names
-/// its job.
-#[test]
-fn a_v5_single_job_journal_is_refused() {
-    let Ok(dir) = tempfile::tempdir() else {
-        panic!("a temporary directory");
-    };
-    let path = dir.path().join("v5.0000000000000000.journal");
-    let id = JournalId {
-        kind: JournalKind::Channel,
-        role: Role::Provider,
-        key: [0x11; 32],
-        generation: 0,
-    };
-    {
-        let Ok((journal, _)) = Journal::open(&path, id) else {
-            panic!("the current journal opens");
-        };
-        drop(journal);
-    }
-    let Ok(mut bytes) = std::fs::read(&path) else {
-        panic!("the current journal reads");
-    };
-    bytes[b"hellas.work-journal.v1".len()] = 5;
-    if let Err(error) = std::fs::write(&path, bytes) {
-        panic!("the old header writes: {error}");
-    }
-    let error = Journal::open(&path, id).expect_err("v5 has no per-record work IDs");
-    let hellas_work::work_store::JournalError::OldVersion {
-        found,
-        expected,
-        retirement,
-    } = error
-    else {
-        panic!("unexpected error: {error}");
-    };
-    assert_eq!((found, expected), (5, 6));
-    assert!(
-        retirement.contains("single-job"),
-        "the reason given is v5's own: {retirement}",
-    );
-}
-
-/// Version 2 files are refused before a single frame is decoded.
-///
-/// Between v2 and v3 the channel-record tags were reassigned: 7–11 meant
-/// admitted-payment, ending, and the three close records, and the same
-/// tag bytes now mean the terminal and shifted close records. The file
-/// below is a genuine v2 file — its one frame's digest verifies under
-/// the v2 header — and its payload is the old `ResultVerified` record,
-/// whose single byte decodes *cleanly* today as a different record. The
-/// version byte is the only thing standing between such a file and a
-/// silent misread, which is why an old file must fail on it rather than
-/// reach the decoder.
-#[test]
-fn a_v2_channel_journal_is_refused_not_misread() {
-    use hellas_rpc::protocol::Digest;
-    use hellas_work::work_store::ChannelRecord;
-
-    // The old encoding under the new decoder: the v2 tag 6 meant the
-    // oracle-verified record, and the same byte decodes today, without
-    // error, as the re-execution match. Nothing in the record layer can
-    // tell the two apart, which is what makes the refusal the journal
-    // header's job.
-    assert!(
-        ChannelRecord::decode(&[0x06]).is_err(),
-        "a v4 job marker requires its work id",
-    );
-
-    // A genuine v2 file, written byte by byte: the v2 header, then one
-    // frame whose digest verifies under that header, carrying the old
-    // record above. The digests are recomputed here from the pinned
-    // domains rather than taken from the writer, which no longer writes
-    // this version.
-    let mut header = Vec::new();
-    header.extend_from_slice(b"hellas.work-journal.v1");
-    header.push(2); // the retired FORMAT_VERSION
-    header.push(2); // JournalKind::Channel
-    header.push(2); // Role::Provider
-    header.extend_from_slice(&[0x11; 32]);
-    // A v2 header carried no generation: thirty-two key bytes followed
-    // the role byte, and nothing else did.
-    let mut header_preimage = b"hellas.work.journal-header.v1".to_vec();
-    header_preimage.extend_from_slice(&header);
-    let header_digest = Digest::hash(&header_preimage);
-
-    let payload = [0x06_u8];
-    let mut frame_preimage = b"hellas.work.journal-frame.v1".to_vec();
-    frame_preimage.extend_from_slice(header_digest.as_bytes());
-    frame_preimage.extend_from_slice(&0_u64.to_be_bytes());
-    frame_preimage.extend_from_slice(&(payload.len() as u64).to_be_bytes());
-    frame_preimage.extend_from_slice(&payload);
-    let frame_digest = Digest::hash(&frame_preimage);
-
-    let mut bytes = header;
-    bytes.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-    bytes.extend_from_slice(&payload);
-    bytes.extend_from_slice(frame_digest.as_bytes());
-
-    let Ok(dir) = tempfile::tempdir() else {
-        panic!("a temporary directory");
-    };
-    let path = dir.path().join("v2.0000000000000000.journal");
-    if let Err(error) = std::fs::write(&path, bytes) {
-        panic!("the v2 fixture writes: {error}");
-    }
-    let id = JournalId {
-        kind: JournalKind::Channel,
-        role: Role::Provider,
-        key: [0x11; 32],
-        generation: 0,
-    };
-    let error =
-        Journal::open(&path, id).expect_err("v2 channel records mis-replay under the v3 tags");
-    assert!(
-        matches!(
-            error,
-            hellas_work::work_store::JournalError::OldVersion {
-                found: 2,
-                expected: 6,
-                ..
-            }
-        ),
-        "unexpected error: {error}",
-    );
-}
-
-/// Version 3 files are refused for a different reason, and the version
-/// byte is the only thing that can refuse them.
-///
-/// Nothing moved between v3 and v4: the tags did not shift, they ran
-/// out. The frame below carries a `CloseOpened` — a contest, which is a
-/// duty — and it decodes today into exactly the record it was written
-/// as, so no reader downstream of the header has any grounds to object.
-/// What that file cannot express is the twelfth tag: the answer this
-/// endpoint fixed for that contest. Replayed, a channel whose answer was
-/// decided reads as one that decided nothing and is free to decide
-/// differently, which is why the header refuses it rather than the
-/// records.
-#[test]
-fn a_v3_channel_journal_is_refused_for_the_answer_it_cannot_hold() {
-    use hellas_rpc::protocol::Digest;
-    use hellas_work::work_store::ChannelRecord;
-
-    // The v3 record set is today's minus the answer, and every tag it
-    // does use means today what it meant then.
-    let contest = ChannelRecord::CloseOpened {
-        start_id: hellas_kernel::StartId::from_bytes([0x7c; 32]),
-        opener: hellas_kernel::Party::Maker,
-        response_deadline: 166,
-        claimed: 0,
-    };
-    let payload = contest.encode();
-    assert_eq!(
-        ChannelRecord::decode(&payload),
-        Ok(contest),
-        "a v3 record body still decodes as itself under the v4 tags",
-    );
-
-    let mut header = Vec::new();
-    header.extend_from_slice(b"hellas.work-journal.v1");
-    header.push(3); // the retired FORMAT_VERSION
-    header.push(2); // JournalKind::Channel
-    header.push(2); // Role::Provider
-    header.extend_from_slice(&[0x11; 32]);
-    let mut header_preimage = b"hellas.work.journal-header.v1".to_vec();
-    header_preimage.extend_from_slice(&header);
-    let header_digest = Digest::hash(&header_preimage);
-
-    let mut frame_preimage = b"hellas.work.journal-frame.v1".to_vec();
-    frame_preimage.extend_from_slice(header_digest.as_bytes());
-    frame_preimage.extend_from_slice(&0_u64.to_be_bytes());
-    frame_preimage.extend_from_slice(&(payload.len() as u64).to_be_bytes());
-    frame_preimage.extend_from_slice(&payload);
-    let frame_digest = Digest::hash(&frame_preimage);
-
-    let mut bytes = header;
-    bytes.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-    bytes.extend_from_slice(&payload);
-    bytes.extend_from_slice(frame_digest.as_bytes());
-
-    let Ok(dir) = tempfile::tempdir() else {
-        panic!("a temporary directory");
-    };
-    let path = dir.path().join("v3.0000000000000000.journal");
-    if let Err(error) = std::fs::write(&path, bytes) {
-        panic!("the v3 fixture writes: {error}");
-    }
-    let id = JournalId {
-        kind: JournalKind::Channel,
-        role: Role::Provider,
-        key: [0x11; 32],
-        generation: 0,
-    };
-    let error = Journal::open(&path, id).expect_err("v3 cannot record an answered contest");
-    let hellas_work::work_store::JournalError::OldVersion {
-        found,
-        expected,
-        retirement,
-    } = error
-    else {
-        panic!("unexpected error: {error}");
-    };
-    assert_eq!((found, expected), (3, 6));
-    assert!(
-        retirement.contains("answered contest"),
-        "the reason given is v3's own, not v2's: {retirement}",
-    );
 }
 
 /// One journal holding one record is these exact bytes.

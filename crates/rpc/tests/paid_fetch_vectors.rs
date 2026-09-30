@@ -26,12 +26,12 @@ use hellas_rpc::fetch::{
 };
 use hellas_rpc::output::{OutputEvent, StopReason, TextChannel, Usage};
 use hellas_rpc::protocol::work::{
-    CreditLedger, JobDeadlines, PaidChannel, PaidChannelPolicyV1, PaidJobAuthorizationV1,
-    PaidWorkError, PrivateRecord, check_authorization, check_result, execution_policy_digest,
-    next_payment, result_digest, signing_hash, work_id,
+    CreditLedger, JobDeadlines, PaidChannel, PaidChannelPolicyV1, PaidJobAuthorizationV2,
+    PaidWorkError, PrivateRecord, check_authorization, check_result, next_payment, result_digest,
+    signing_hash, work_id, work_policy_digest,
 };
 use hellas_rpc::protocol::work_fetch::{
-    FetchRoutePolicy, PaidFetchPolicyV1, PreparedPaidFetchInputV1, check_fetch_authorization,
+    FetchPolicyV2, FetchRoutePolicy, PreparedPaidFetchInputV1, check_fetch_authorization,
     check_fetch_policy, check_prepared_fetch_input, fetch_canonical_output_digest,
     fetch_policy_digest, fetch_route_commitment, prepared_fetch_input_digest,
     propose_fetch_authorization, terminal_fetch_result,
@@ -178,8 +178,8 @@ fn route_commitment() -> Digest {
     fetch_route_commitment(&route().canonical_body_bytes()).expect("a representable route body")
 }
 
-fn fetch_policy() -> PaidFetchPolicyV1 {
-    PaidFetchPolicyV1 {
+fn fetch_policy() -> FetchPolicyV2 {
+    FetchPolicyV2 {
         allowed_environment: environment().manifest_id(),
         route_commitment: route_commitment(),
         max_request_body_bytes: 4_096,
@@ -188,10 +188,6 @@ fn fetch_policy() -> PaidFetchPolicyV1 {
         max_spool_bytes: 65_536,
         max_encoded_result_frame: 262_144,
         max_encoded_prepared_input: 1_048_576,
-        dispatch_margin_blocks: 20,
-        delivery_margin_blocks: 10,
-        oracle_grace_blocks: 30,
-        fixed_price: 250,
     }
 }
 
@@ -265,14 +261,21 @@ fn bundle() -> PreparedPaidFetchInputV1 {
 
 fn propose(
     channel: &PaidChannel,
-    policy: &PaidFetchPolicyV1,
+    policy: &FetchPolicyV2,
     bundle: &PreparedPaidFetchInputV1,
-) -> PaidJobAuthorizationV1 {
-    propose_fetch_authorization(channel, policy, bundle, PROPOSAL_NONCE, deadlines())
-        .expect("a legal proposal")
+) -> PaidJobAuthorizationV2 {
+    propose_fetch_authorization(
+        channel,
+        policy,
+        &payment_policy(),
+        bundle,
+        PROPOSAL_NONCE,
+        deadlines(),
+    )
+    .expect("a legal proposal")
 }
 
-fn authorization() -> PaidJobAuthorizationV1 {
+fn authorization() -> PaidJobAuthorizationV2 {
     propose(&channel(), &fetch_policy(), &bundle())
 }
 
@@ -317,7 +320,7 @@ fn terminal_payload() -> Vec<u8> {
 
 /// The provider-signed output transcript answering the authorization's
 /// request: two semantic events and a terminal.
-fn output_transcript(authorization: &PaidJobAuthorizationV1) -> Vec<OutputEventEnvelope> {
+fn output_transcript(authorization: &PaidJobAuthorizationV2) -> Vec<OutputEventEnvelope> {
     let input = InputCommitment::from_digest(authorization.request_commitment.digest());
     let key = producer_key();
     let mut builder = FetchOutputTranscriptBuilder::new(input, Assurance::ProducerSigned, &key);
@@ -331,10 +334,10 @@ fn output_transcript(authorization: &PaidJobAuthorizationV1) -> Vec<OutputEventE
 /// The fetch policy record's exact bytes, decoded field by field.
 #[test]
 fn golden_fetch_policy_encoding_is_pinned() {
-    assert_eq!(PaidFetchPolicyV1::BODY_SIZE, 124);
-    assert_eq!(PaidFetchPolicyV1::ENCODED_SIZE, 126);
+    assert_eq!(FetchPolicyV2::BODY_SIZE, 92);
+    assert_eq!(FetchPolicyV2::ENCODED_SIZE, 94);
 
-    let policy = PaidFetchPolicyV1 {
+    let policy = FetchPolicyV2 {
         allowed_environment: ContentId::from_bytes([0x40; 32]),
         route_commitment: Digest::from_bytes([0x41; 32]),
         max_request_body_bytes: 1,
@@ -343,16 +346,12 @@ fn golden_fetch_policy_encoding_is_pinned() {
         max_spool_bytes: 4,
         max_encoded_result_frame: 5,
         max_encoded_prepared_input: 6,
-        dispatch_margin_blocks: 7,
-        delivery_margin_blocks: 8,
-        oracle_grace_blocks: 9,
-        fixed_price: 10,
     };
     assert_eq!(
         hex(&policy.encode()),
         concat!(
             "01",
-            "05", // format version 1, tag 5 = PAID_FETCH_POLICY
+            "07", // format version 1, tag 7 = FETCH_POLICY_V2
             "4040404040404040404040404040404040404040404040404040404040404040", // environment
             "4141414141414141414141414141414141414141414141414141414141414141", // route
             "00000001", // max_request_body_bytes
@@ -361,13 +360,9 @@ fn golden_fetch_policy_encoding_is_pinned() {
             "0000000000000004", // max_spool_bytes
             "00000005", // max_encoded_result_frame
             "00000006", // max_encoded_prepared_input
-            "0000000000000007", // dispatch_margin_blocks
-            "0000000000000008", // delivery_margin_blocks
-            "0000000000000009", // oracle_grace_blocks
-            "000000000000000a", // fixed_price
         )
     );
-    assert_eq!(PaidFetchPolicyV1::decode(&policy.encode()), Ok(policy));
+    assert_eq!(FetchPolicyV2::decode(&policy.encode()), Ok(policy));
 }
 
 /// Wrong tag, wrong version, truncation, and a trailing byte all reject,
@@ -375,17 +370,17 @@ fn golden_fetch_policy_encoding_is_pinned() {
 #[test]
 fn fetch_policy_envelope_mutations_reject() {
     let bytes = fetch_policy().encode();
-    assert!(PaidFetchPolicyV1::decode(&bytes).is_ok());
+    assert!(FetchPolicyV2::decode(&bytes).is_ok());
 
     // MUTATION: the fetch policy presented under the evaluate policy tag.
     // Both are policies; only the envelope says which profile they are.
     let mut evaluate_tag = bytes.clone();
-    evaluate_tag[1] = 1;
+    evaluate_tag[1] = 6;
     assert_eq!(
-        PaidFetchPolicyV1::decode(&evaluate_tag),
+        FetchPolicyV2::decode(&evaluate_tag),
         Err(PaidWorkError::WrongRecordTag {
-            expected: 5,
-            actual: 1
+            expected: 7,
+            actual: 6
         })
     );
 
@@ -393,17 +388,17 @@ fn fetch_policy_envelope_mutations_reject() {
     let mut wrong_version = bytes.clone();
     wrong_version[0] = 2;
     assert_eq!(
-        PaidFetchPolicyV1::decode(&wrong_version),
+        FetchPolicyV2::decode(&wrong_version),
         Err(PaidWorkError::UnknownFormatVersion { actual: 2 })
     );
 
     // MUTATION: one byte short.
     let truncated = &bytes[..bytes.len() - 1];
     assert_eq!(
-        PaidFetchPolicyV1::decode(truncated),
+        FetchPolicyV2::decode(truncated),
         Err(PaidWorkError::RecordLength {
-            expected: 126,
-            actual: 125
+            expected: 94,
+            actual: 93
         })
     );
 
@@ -411,10 +406,10 @@ fn fetch_policy_envelope_mutations_reject() {
     let mut trailing = bytes.clone();
     trailing.push(0);
     assert_eq!(
-        PaidFetchPolicyV1::decode(&trailing),
+        FetchPolicyV2::decode(&trailing),
         Err(PaidWorkError::RecordLength {
-            expected: 126,
-            actual: 127
+            expected: 94,
+            actual: 95
         })
     );
 }
@@ -586,10 +581,10 @@ fn golden_fetch_digests_are_pinned() {
         "55e7ccf1928e21128357726422c637ddc5cf0437dde10568f0f2f83e0d69c299"
     );
     let channel = channel();
-    // XH("hellas.work.fetch-policy.v1" || network || channel || record).
+    // XH("hellas.work.fetch-policy.v2" || network || channel || record).
     assert_eq!(
         hex(fetch_policy_digest(&channel, &fetch_policy()).as_bytes()),
-        "6a675a75bd5b40e8fad1e35272f1c971a1a9cc34a8b756ab5298cc747ff55ede"
+        "28e20aa1694696dbe4e50011bd0345d3540187c0e2f426165b58932fc4cf90a1"
     );
     // XFH("hellas.work.prepared-fetch-input.v1" || network || channel ||
     // bundle).
@@ -597,11 +592,11 @@ fn golden_fetch_digests_are_pinned() {
         hex(input_digest(&channel, &bundle()).as_bytes()),
         "8bb0796694ed05a0e32fe2f40d32b16256bc802fbe073a8a5a06e6c59e58c3a9"
     );
-    // XH("hellas.work.paid-job-authorize.v1" || network || channel ||
+    // XH("hellas.work.paid-job-authorize.v2" || network || channel ||
     // authorization): the shared record, signed under this profile.
     assert_eq!(
         hex(work_id(&channel, &authorization()).as_bytes()),
-        "0258caba196b7a4c13c1ad8ea8f575ea9b943f58e80d73c17a3d41d534de0f30"
+        "7e312f330113bde95d9932f0ef417e4910b8907a4823ee59a63ddbd58df27aa7"
     );
 }
 
@@ -632,7 +627,13 @@ fn fetch_records_do_not_cross_channels() {
         // MUTATION: replay this channel's fetch authorization on another
         // one.
         assert_eq!(
-            check_fetch_authorization(other, &authorization, &fetch_policy(), 900),
+            check_fetch_authorization(
+                other,
+                &authorization,
+                &fetch_policy(),
+                &payment_policy(),
+                900
+            ),
             Err(PaidWorkError::Mismatch {
                 field: "channel_id"
             }),
@@ -767,7 +768,7 @@ fn prepared_fetch_input_mutations_reject() {
 fn fetch_policy_preimage_is_reproducible_by_hand() {
     let channel = channel();
 
-    let mut preimage = b"hellas.work.fetch-policy.v1".to_vec();
+    let mut preimage = b"hellas.work.fetch-policy.v2".to_vec();
     preimage.push(NETWORK.len() as u8);
     preimage.extend_from_slice(NETWORK.as_bytes());
     preimage.extend_from_slice(channel.id().as_bytes());
@@ -813,7 +814,7 @@ fn propose_fetch_authorization_derives_every_field() {
         channel.payment_terms_hash()
     );
     assert_eq!(
-        authorization.execution_policy_digest,
+        authorization.work_policy_digest,
         fetch_policy_digest(&channel, &fetch_policy())
     );
     assert_eq!(
@@ -833,8 +834,14 @@ fn propose_fetch_authorization_derives_every_field() {
 
     // The signing bytes both parties produce are the authorization's
     // `work_id`, and both settlement keys verify over them.
-    let id = check_fetch_authorization(&channel, &authorization, &fetch_policy(), 900)
-        .expect("a legal authorization");
+    let id = check_fetch_authorization(
+        &channel,
+        &authorization,
+        &fetch_policy(),
+        &payment_policy(),
+        900,
+    )
+    .expect("a legal authorization");
     assert_eq!(id, work_id(&channel, &authorization));
     let payload = signing_hash(id);
     let verifier = Secp256k1Verifier;
@@ -849,16 +856,16 @@ fn check_fetch_authorization_refusals() {
     let channel = channel();
     let policy = fetch_policy();
     let base = authorization();
-    assert!(check_fetch_authorization(&channel, &base, &policy, 900).is_ok());
+    assert!(check_fetch_authorization(&channel, &base, &policy, &payment_policy(), 900).is_ok());
 
     // MUTATION: a policy whose digest is not the one the authorization
     // names.
     let mut other_policy = policy;
     other_policy.max_output_events += 1;
     assert_eq!(
-        check_fetch_authorization(&channel, &base, &other_policy, 900),
+        check_fetch_authorization(&channel, &base, &other_policy, &payment_policy(), 900),
         Err(PaidWorkError::Mismatch {
-            field: "execution_policy_digest"
+            field: "work_policy_digest"
         })
     );
 
@@ -868,7 +875,7 @@ fn check_fetch_authorization_refusals() {
     zeroed_policy.max_output_bytes = 0;
     let zeroed = propose(&channel, &zeroed_policy, &bundle());
     assert_eq!(
-        check_fetch_authorization(&channel, &zeroed, &zeroed_policy, 900),
+        check_fetch_authorization(&channel, &zeroed, &zeroed_policy, &payment_policy(), 900),
         Err(PaidWorkError::PolicyZero {
             field: "max_output_bytes"
         })
@@ -878,17 +885,23 @@ fn check_fetch_authorization_refusals() {
     let mut mispriced = base;
     mispriced.price = 249;
     assert_eq!(
-        check_fetch_authorization(&channel, &mispriced, &policy, 900),
+        check_fetch_authorization(&channel, &mispriced, &policy, &payment_policy(), 900),
         Err(PaidWorkError::Mismatch { field: "price" })
     );
 
     // MUTATION: a price the bond does not cover, honestly proposed under
     // a policy that names it.
-    let mut dear_policy = policy;
+    let mut dear_policy = payment_policy();
     dear_policy.fixed_price = 501;
-    let dear = propose(&channel, &dear_policy, &bundle());
+    let mut dear = propose(&channel, &policy, &bundle());
+    dear.price = dear_policy.fixed_price;
+    dear.payment_policy_digest = hellas_rpc::protocol::work::job_payment_policy_digest(
+        channel.network(),
+        channel.id(),
+        &dear_policy,
+    );
     assert_eq!(
-        check_fetch_authorization(&channel, &dear, &dear_policy, 900),
+        check_fetch_authorization(&channel, &dear, &policy, &dear_policy, 900),
         Err(PaidWorkError::PriceOutOfRange {
             price: 501,
             max_job_price: 500
@@ -897,7 +910,7 @@ fn check_fetch_authorization_refusals() {
 
     // MUTATION: signing after the acceptance window closed.
     assert_eq!(
-        check_fetch_authorization(&channel, &base, &policy, 1_001),
+        check_fetch_authorization(&channel, &base, &policy, &payment_policy(), 1_001),
         Err(PaidWorkError::AcceptanceExpired {
             height: 1_001,
             deadline: 1_000
@@ -908,7 +921,7 @@ fn check_fetch_authorization_refusals() {
     let mut late = base;
     late.payment_deadline = 5_000;
     assert_eq!(
-        check_fetch_authorization(&channel, &late, &policy, 900),
+        check_fetch_authorization(&channel, &late, &policy, &payment_policy(), 900),
         Err(PaidWorkError::DeadlineOrder {
             acceptance: 1_000,
             terminal: 1_050,
@@ -925,79 +938,51 @@ fn an_absent_fetch_policy_bound_is_refused() {
     let base = fetch_policy();
     assert!(check_fetch_policy(&base).is_ok());
 
-    let zeroed: Vec<(&str, PaidFetchPolicyV1)> = vec![
-        (
-            "fixed_price",
-            PaidFetchPolicyV1 {
-                fixed_price: 0,
-                ..base
-            },
-        ),
+    let zeroed: Vec<(&str, FetchPolicyV2)> = vec![
         (
             "max_request_body_bytes",
-            PaidFetchPolicyV1 {
+            FetchPolicyV2 {
                 max_request_body_bytes: 0,
                 ..base
             },
         ),
         (
             "max_output_events",
-            PaidFetchPolicyV1 {
+            FetchPolicyV2 {
                 max_output_events: 0,
                 ..base
             },
         ),
         (
             "max_output_bytes",
-            PaidFetchPolicyV1 {
+            FetchPolicyV2 {
                 max_output_bytes: 0,
                 ..base
             },
         ),
         (
             "max_spool_bytes",
-            PaidFetchPolicyV1 {
+            FetchPolicyV2 {
                 max_spool_bytes: 0,
                 ..base
             },
         ),
         (
             "max_encoded_result_frame",
-            PaidFetchPolicyV1 {
+            FetchPolicyV2 {
                 max_encoded_result_frame: 0,
                 ..base
             },
         ),
         (
             "max_encoded_prepared_input",
-            PaidFetchPolicyV1 {
+            FetchPolicyV2 {
                 max_encoded_prepared_input: 0,
                 ..base
             },
         ),
-        (
-            "dispatch_margin_blocks",
-            PaidFetchPolicyV1 {
-                dispatch_margin_blocks: 0,
-                ..base
-            },
-        ),
-        (
-            "delivery_margin_blocks",
-            PaidFetchPolicyV1 {
-                delivery_margin_blocks: 0,
-                ..base
-            },
-        ),
-        (
-            "oracle_grace_blocks",
-            PaidFetchPolicyV1 {
-                oracle_grace_blocks: 0,
-                ..base
-            },
-        ),
     ];
-    assert_eq!(zeroed.len(), 10, "every required bound must be zeroed");
+    assert_eq!(zeroed.len(), 6, "every required bound must be zeroed");
     for (field, policy) in zeroed {
         assert_eq!(
             check_fetch_policy(&policy),
@@ -1014,7 +999,7 @@ fn every_fetch_policy_field_moves_its_digest() {
     let base = fetch_policy();
     let pinned = fetch_policy_digest(&channel, &base);
 
-    let mutations: Vec<(&str, PaidFetchPolicyV1)> = vec![
+    let mutations: Vec<(&str, FetchPolicyV2)> = vec![
         ("allowed_environment", {
             let mut m = base;
             m.allowed_environment = ContentId::from_bytes([0; 32]);
@@ -1055,28 +1040,8 @@ fn every_fetch_policy_field_moves_its_digest() {
             m.max_encoded_prepared_input += 1;
             m
         }),
-        ("dispatch_margin_blocks", {
-            let mut m = base;
-            m.dispatch_margin_blocks += 1;
-            m
-        }),
-        ("delivery_margin_blocks", {
-            let mut m = base;
-            m.delivery_margin_blocks += 1;
-            m
-        }),
-        ("oracle_grace_blocks", {
-            let mut m = base;
-            m.oracle_grace_blocks += 1;
-            m
-        }),
-        ("fixed_price", {
-            let mut m = base;
-            m.fixed_price += 1;
-            m
-        }),
     ];
-    assert_eq!(mutations.len(), 12, "every field must be mutated");
+    assert_eq!(mutations.len(), 8, "every field must be mutated");
     for (field, mutated) in mutations {
         assert_ne!(
             fetch_policy_digest(&channel, &mutated),
@@ -1137,7 +1102,7 @@ fn each_fetch_input_binding_is_checked_on_its_own() {
     // A bundle larger than the policy's prepared-input bound. Refused
     // before its digest is even computed.
     let encoded = bundle().encode().expect("a representable bundle");
-    let cramped = PaidFetchPolicyV1 {
+    let cramped = FetchPolicyV2 {
         max_encoded_prepared_input: 100,
         ..policy
     };
@@ -1150,7 +1115,7 @@ fn each_fetch_input_binding_is_checked_on_its_own() {
         })
     );
     // The exact length is legal; one byte less is not.
-    let exact = PaidFetchPolicyV1 {
+    let exact = FetchPolicyV2 {
         max_encoded_prepared_input: encoded.len() as u32,
         ..policy
     };
@@ -1277,7 +1242,7 @@ fn each_fetch_input_binding_is_checked_on_its_own() {
     // A request body over the policy's bound. The fetch protocol's own
     // 1 MiB bound still holds; the policy's tighter one is what refuses
     // here.
-    let tight = PaidFetchPolicyV1 {
+    let tight = FetchPolicyV2 {
         max_request_body_bytes: 2,
         ..policy
     };
@@ -1345,7 +1310,7 @@ fn open_fetch_checks_manifest_host_and_tls_pins() {
 
 #[test]
 fn paid_fetch_result_cannot_downgrade_the_signed_assurance() {
-    use hellas_rpc::protocol::work_profile::PreparedPaidWorkInput;
+    use hellas_rpc::protocol::work_profile::PreparedWorkInput;
     let channel = channel();
     let input = signed_input(
         &caller_key(),
@@ -1357,7 +1322,7 @@ fn paid_fetch_result_cannot_downgrade_the_signed_assurance() {
     );
     let bundle = PreparedPaidFetchInputV1::new(&input, &manifest()).unwrap();
     let auth = propose(&channel, &fetch_policy(), &bundle);
-    let prepared = PreparedPaidWorkInput::Fetch(bundle);
+    let prepared = PreparedWorkInput::Fetch(bundle);
     let weaker = output_transcript(&auth);
     assert!(prepared.terminal_result(&channel, &auth, &weaker).is_err());
     let key = producer_key();
@@ -1396,11 +1361,11 @@ fn terminal_fetch_result_is_pinned() {
     );
     assert_eq!(
         hex(result.canonical_output_digest.as_bytes()),
-        "d7749786cb4d09c0949760f9cad1c6289a32a3fbfa62217f14c51eba40567975"
+        "a29fd5e96cd21db32b360e79c80fa83fd82b3999bcca695952fbf4057d32bbc9"
     );
     assert_eq!(
         hex(result_digest(&channel, &result).as_bytes()),
-        "2d8d52936484533b65b37ed0e6d983eff30a7e8cf0d82c81821879d58888265b"
+        "684dbc5f77c3b73a4771c597298cff9fb91a3becff2e9c91d9d9172be0f51b99"
     );
 
     // The result record round-trips through the wire codec and the
@@ -1558,7 +1523,7 @@ fn fetch_output_digest_normalizes_chunking() {
     // stream and nothing else.
     assert_eq!(
         hex(digest.as_bytes()),
-        "d7749786cb4d09c0949760f9cad1c6289a32a3fbfa62217f14c51eba40567975"
+        "a29fd5e96cd21db32b360e79c80fa83fd82b3999bcca695952fbf4057d32bbc9"
     );
 }
 
@@ -1619,8 +1584,14 @@ fn the_real_input_constructor_passes_the_whole_pipeline() {
     let bundle = PreparedPaidFetchInputV1::new(&events, &manifest()).expect("a legal transcript");
     let authorization = propose(&channel, &fetch_policy(), &bundle);
 
-    check_fetch_authorization(&channel, &authorization, &fetch_policy(), 900)
-        .expect("a legal authorization");
+    check_fetch_authorization(
+        &channel,
+        &authorization,
+        &fetch_policy(),
+        &payment_policy(),
+        900,
+    )
+    .expect("a legal authorization");
     check_prepared_fetch_input(&channel, &authorization, &fetch_policy(), &route(), &bundle)
         .expect("a legal prepared input");
 
@@ -1646,12 +1617,10 @@ fn widest_fetch_preimage_is_measured() {
         NetworkId::new(&"n".repeat(hellas_kernel::MAX_NETWORK_ID_LENGTH)).expect("legal id");
     let encoded_network = 1 + hellas_kernel::MAX_NETWORK_ID_LENGTH;
 
-    let widest = "hellas.work.fetch-policy.v1".len()
-        + encoded_network
-        + 32
-        + PaidFetchPolicyV1::ENCODED_SIZE;
-    assert_eq!(widest, 27 + 64 + 32 + 126);
-    assert_eq!(widest, 249);
+    let widest =
+        "hellas.work.fetch-policy.v2".len() + encoded_network + 32 + FetchPolicyV2::ENCODED_SIZE;
+    assert_eq!(widest, 27 + 64 + 32 + 94);
+    assert_eq!(widest, 217);
     assert!(widest < hellas_xet::MIN_CHUNK_SIZE);
 
     // The variable-body domains are streamed; asserting their digests
@@ -1685,7 +1654,7 @@ fn the_two_profiles_do_not_mix() {
 
     // An evaluate execution policy over the same environment is not a
     // fetch policy: different domains, different digests.
-    let evaluate_policy = hellas_rpc::protocol::work::PaidExecutionPolicyV1 {
+    let evaluate_policy = hellas_rpc::protocol::work::EvaluatePolicyV2 {
         allowed_environment: fetch_policy.allowed_environment,
         generation_policy_digest: Digest::from_bytes([0x41; 32]),
         identity_source_digest: Digest::from_bytes([0x42; 32]),
@@ -1694,33 +1663,50 @@ fn the_two_profiles_do_not_mix() {
         max_stop_token_ids: 4,
         max_spool_bytes: fetch_policy.max_spool_bytes,
         max_encoded_result_frame: fetch_policy.max_encoded_result_frame,
-        max_encoded_quote_response: fetch_policy.max_encoded_prepared_input,
-        dispatch_margin_blocks: fetch_policy.dispatch_margin_blocks,
-        delivery_margin_blocks: fetch_policy.delivery_margin_blocks,
-        oracle_grace_blocks: fetch_policy.oracle_grace_blocks,
-        fixed_price: fetch_policy.fixed_price,
+        max_encoded_prepared_input: fetch_policy.max_encoded_prepared_input,
     };
     assert_ne!(
-        execution_policy_digest(&channel, &evaluate_policy),
+        work_policy_digest(&channel, &evaluate_policy),
         fetch_policy_digest(&channel, &fetch_policy)
     );
 
     // The fetch authorization names the fetch policy's digest, so the
     // evaluate check refuses it on exactly that field.
     assert_eq!(
-        check_authorization(&channel, &authorization(), &evaluate_policy, 900),
+        check_authorization(
+            &channel,
+            &authorization(),
+            &evaluate_policy,
+            &payment_policy(),
+            900
+        ),
         Err(PaidWorkError::Mismatch {
-            field: "execution_policy_digest"
+            field: "work_policy_digest"
         })
     );
     // And the fetch check refuses an authorization that names the
     // evaluate policy.
     let mut evaluate_signed = authorization();
-    evaluate_signed.execution_policy_digest = execution_policy_digest(&channel, &evaluate_policy);
+    evaluate_signed.work_policy_digest = work_policy_digest(&channel, &evaluate_policy);
     assert_eq!(
-        check_fetch_authorization(&channel, &evaluate_signed, &fetch_policy, 900),
+        check_fetch_authorization(
+            &channel,
+            &evaluate_signed,
+            &fetch_policy,
+            &payment_policy(),
+            900
+        ),
         Err(PaidWorkError::Mismatch {
-            field: "execution_policy_digest"
+            field: "work_policy_digest"
         })
     );
+}
+
+fn payment_policy() -> hellas_rpc::protocol::work::JobPaymentPolicyV2 {
+    hellas_rpc::protocol::work::JobPaymentPolicyV2 {
+        fixed_price: 250,
+        dispatch_margin_blocks: 20,
+        delivery_margin_blocks: 10,
+        oracle_grace_blocks: 30,
+    }
 }

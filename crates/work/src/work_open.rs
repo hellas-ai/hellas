@@ -756,8 +756,8 @@ fn mount<V: SigVerifier>(
         Some(payment) => descriptor.funded_settlement(payment).map_err(to_store)?,
     };
     let mut channel = if matches!(
-        descriptor.execution_policy(),
-        hellas_rpc::protocol::work_profile::PaidWorkPolicy::Fetch { .. }
+        descriptor.work_policy(),
+        hellas_rpc::protocol::work_profile::WorkPolicy::Fetch { .. }
     ) {
         ChannelStore::open_metadata_only(
             store.root(),

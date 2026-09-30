@@ -27,7 +27,10 @@ pub(super) enum GenerationError {
 
 impl From<GenerationError> for BackendError {
     fn from(error: GenerationError) -> Self {
-        Self::failed(error.to_string())
+        match error {
+            GenerationError::Execution(error) => super::execution_error(error),
+            error => Self::failed(error.to_string()),
+        }
     }
 }
 

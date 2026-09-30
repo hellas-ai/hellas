@@ -8,8 +8,8 @@ use hellas_attestation::{
 use hellas_rpc::pb::execute::{OpenRequest, OpenResponse, open_response};
 use hellas_rpc::{
     AppleAppAttestEnrollment, Assurance, CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR,
-    CausalLmEnvironment, ContentId, PlatformCredential, PlatformEnrollment, ProgramManifest,
-    ProviderEnrollmentBundle, PublicKey, RootKind,
+    CausalLmEnvironment, ContentId, Digest, PlatformCredential, PlatformEnrollment,
+    ProgramManifest, ProviderEnrollmentBundle, PublicKey, RootKind, RootProof,
 };
 use hellas_wire::iroh::IrohTransport;
 use hellas_wire::iroh::swarm::{DhtBackend, MdnsBackend, PeerExchangeBackend, ServiceRegistry};
@@ -99,6 +99,68 @@ pub struct ProviderTrustAnchor {
     pub expected_genesis: ContentId,
     pub required_assurance: Assurance,
     pub apple_app_attest: Option<AppleAppAttestTrust>,
+}
+
+impl ProviderTrustAnchor {
+    /// Verify reusable enrollment evidence, without advancing a live assertion
+    /// counter. Every remote connection must additionally authenticate Open.
+    pub fn verify_enrollment(&self, bundle: &ProviderEnrollmentBundle) -> ClientResult<()> {
+        if bundle.content_id() != self.expected_genesis {
+            return Err(ClientError::protocol("provider genesis pin mismatch"));
+        }
+        let genesis = &bundle.genesis;
+        let statement = &genesis.statement;
+        if self.required_assurance == Assurance::AppleAppAttest
+            && statement.root_kind != RootKind::SecureEnclave
+        {
+            return Err(ClientError::protocol(
+                "Apple App Attest assurance requires a Secure Enclave provider root",
+            ));
+        }
+        match (&statement.root_kind, &genesis.root_proof, &bundle.platform) {
+            (RootKind::Software, RootProof::Software(signature), PlatformEnrollment::Absent)
+                if statement.platform_credential == PlatformCredential::Absent =>
+            {
+                hellas_rpc::signature::verify_digest_signature(
+                    &statement.root_public_key,
+                    signature,
+                    Digest::hash(&statement.canonical_bytes()),
+                )
+                .map_err(|e| {
+                    ClientError::source("provider enrollment root signature is invalid", e)
+                })?;
+            }
+            (
+                RootKind::SecureEnclave,
+                RootProof::AppleAppAttest(_),
+                PlatformEnrollment::AppleAppAttest(enrollment),
+            ) => {
+                let apple = self.apple_app_attest.as_ref().ok_or_else(|| ClientError::protocol(
+                    "pinned Apple provider requires an App Attest app identity and CDhash allowlist"))?;
+                let credential = apple.registered_credential(enrollment)?;
+                hellas_attestation::verify_apple_provider_genesis(
+                    &bundle.genesis,
+                    &credential,
+                    &ApplePolicy {
+                        expected_rp_id_hash: apple_app_id_hash(&apple.app_id),
+                        allowed_cd_hashes: apple.allowed_cd_hashes.clone(),
+                    },
+                )
+                .map_err(|e| {
+                    ClientError::source(
+                        "provider enrollment root assertion or credential is invalid",
+                        e,
+                    )
+                })?;
+            }
+            _ => {
+                return Err(ClientError::protocol(
+                    "provider enrollment root evidence is inconsistent",
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// A remote dial target: the canonical iroh identity plus optional dial hints.
@@ -280,14 +342,8 @@ fn verify_open_response(
         .map_err(|source| {
             ClientError::source("provider returned invalid enrollment bundle", source)
         })?;
+    trust.verify_enrollment(&bundle)?;
     let genesis = &bundle.genesis;
-    if trust.required_assurance == Assurance::AppleAppAttest
-        && genesis.statement.root_kind != RootKind::SecureEnclave
-    {
-        return Err(ClientError::protocol(
-            "Apple App Attest assurance requires a Secure Enclave provider root",
-        ));
-    }
     if genesis.statement.transport_public_key != PublicKey::Ed25519(peer.0) {
         return Err(ClientError::protocol(format!(
             "provider transport key mismatch: pinned genesis names {:?}, live QUIC peer is {peer:#}",
@@ -351,14 +407,6 @@ fn verify_open_response(
                 )
             })?;
             let credential = apple.registered_credential(enrollment)?;
-            if genesis.statement.platform_credential
-                != PlatformCredential::Registered(credential.id)
-                || genesis.statement.root_public_key != PublicKey::P256(credential.public_key)
-            {
-                return Err(ClientError::protocol(
-                    "Apple provider genesis does not match its chain-verified credential",
-                ));
-            }
             let claims = verify_apple_assertion(
                 &assertion,
                 binding.as_bytes(),

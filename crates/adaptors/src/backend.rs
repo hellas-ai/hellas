@@ -371,6 +371,12 @@ mod tests {
 pub enum BackendError {
     #[error("backend rejected request: {0}")]
     Rejected(String),
+    #[error("backend access denied: {0}")]
+    Denied(String),
+    #[error("backend allowance exhausted: {0}")]
+    Quota(String),
+    #[error("backend busy: {0}")]
+    Busy(String),
     #[error("backend failed: {0}")]
     Failed(String),
 }

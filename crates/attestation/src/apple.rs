@@ -403,3 +403,30 @@ struct Assertion {
     authenticator_data: ByteBuf,
     signature: ByteBuf,
 }
+
+/// Verify the reusable provider genesis assertion under an already registered
+/// Apple credential. Enrollment assertions never advance the live Open counter.
+pub fn verify_apple_provider_genesis(
+    genesis: &hellas_rpc::SignedProviderGenesis,
+    credential: &RegisteredAppleCredential,
+    policy: &ApplePolicy,
+) -> Result<(), AttestationError> {
+    use hellas_rpc::{PlatformCredential, PublicKey, RootKind, RootProof};
+    let statement = &genesis.statement;
+    if statement.root_kind != RootKind::SecureEnclave
+        || statement.platform_credential != PlatformCredential::Registered(credential.id)
+        || statement.root_public_key != PublicKey::P256(credential.public_key)
+    {
+        return Err(AttestationError::Credential);
+    }
+    let RootProof::AppleAppAttest(assertion) = &genesis.root_proof else {
+        return Err(AttestationError::Codec);
+    };
+    verify_apple_assertion(
+        assertion,
+        &apple_client_data_hash(&statement.canonical_bytes()),
+        credential,
+        policy,
+    )?;
+    Ok(())
+}

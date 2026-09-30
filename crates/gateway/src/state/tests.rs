@@ -95,7 +95,7 @@ async fn proxy_without_causal_lm_does_not_bind_remote_transport() {
 
 #[tokio::test]
 async fn paid_generation_records_after_payment_and_replays_without_a_backend() {
-    use crate::{ExecutionEvent, Outcome, PaidExecutionBackend, PaidExecutionRequest, StopReason};
+    use crate::{ExecutionEvent, Outcome, StopReason, WorkExecutionBackend, WorkExecutionRequest};
     use futures::{StreamExt, TryStreamExt};
     use hellas_rpc::cache::{CacheOptions, CachePolicy, CacheStore, MemoryCacheStore};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -104,11 +104,11 @@ async fn paid_generation_records_after_payment_and_replays_without_a_backend() {
         calls: Arc<AtomicUsize>,
         payment_ack: Arc<tokio::sync::Notify>,
     }
-    impl PaidExecutionBackend for Paid {
+    impl WorkExecutionBackend for Paid {
         fn execute(
             &self,
-            request: PaidExecutionRequest,
-        ) -> Result<crate::PaidOutputStream<ExecutionEvent>, crate::PaidGatewayError> {
+            request: WorkExecutionRequest,
+        ) -> Result<crate::WorkOutputStream<ExecutionEvent>, crate::WorkGatewayError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             assert_eq!(request.input_ids, vec![0]);
             assert_eq!(request.max_new_tokens, 1);
@@ -218,16 +218,16 @@ async fn paid_generation_records_after_payment_and_replays_without_a_backend() {
 #[tokio::test]
 async fn paid_capacity_is_a_retryable_error_and_uses_the_pool_deadline() {
     struct Busy;
-    impl crate::PaidExecutionBackend for Busy {
+    impl crate::WorkExecutionBackend for Busy {
         fn timeout(&self) -> Duration {
             Duration::from_secs(17)
         }
         fn execute(
             &self,
-            _: crate::PaidExecutionRequest,
-        ) -> Result<crate::PaidOutputStream<crate::ExecutionEvent>, crate::PaidGatewayError>
+            _: crate::WorkExecutionRequest,
+        ) -> Result<crate::WorkOutputStream<crate::ExecutionEvent>, crate::WorkGatewayError>
         {
-            Err(crate::PaidGatewayBusy.into())
+            Err(crate::WorkGatewayBusy.into())
         }
         fn drain(&self) -> futures::future::BoxFuture<'_, ()> {
             Box::pin(async {})

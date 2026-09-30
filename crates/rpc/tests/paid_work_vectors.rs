@@ -23,12 +23,12 @@ use hellas_rpc::protocol::artifacts::{
     TextArtifact, TextExecution, TextExecutionId, TextPolicy, TextState, TokenIds, completed_text,
 };
 use hellas_rpc::protocol::work::{
-    CreditLedger, PaidChannel, PaidChannelPolicyV1, PaidExecutionPolicyV1, PaidJobAuthorizationV1,
-    PaidJobResultV1, PaidWorkError, PaymentBindingV1, PrivateRecord, canonical_output_digest,
-    check_authorization, check_execution_policy, check_prepared_input, check_result,
-    decode_transcript, encode_transcript, execution_policy_digest, generation_policy_digest,
-    identity_source_digest, next_payment, payment_binding_digest, prepared_input_digest,
-    private_policy_commitment, result_digest, work_id,
+    CreditLedger, EvaluatePolicyV2, JobPaymentPolicyV2, PaidChannel, PaidChannelPolicyV1,
+    PaidJobAuthorizationV2, PaidJobResultV1, PaidWorkError, PaymentBindingV1, PrivateRecord,
+    canonical_output_digest, check_authorization, check_payment_policy_binding,
+    check_prepared_input, check_result, check_work_policy, decode_transcript, encode_transcript,
+    generation_policy_digest, identity_source_digest, next_payment, payment_binding_digest,
+    prepared_input_digest, private_policy_commitment, result_digest, work_id, work_policy_digest,
 };
 use hellas_rpc::{
     Application, Assurance, CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR, ContentId, Digest, Evaluate,
@@ -209,8 +209,8 @@ fn bundle() -> PreparedPaidInputV1 {
     )
 }
 
-fn execution_policy() -> PaidExecutionPolicyV1 {
-    PaidExecutionPolicyV1 {
+fn work_policy() -> EvaluatePolicyV2 {
+    EvaluatePolicyV2 {
         allowed_environment: manifest().content_id(),
         generation_policy_digest: policy_digest_of(&text_policy()),
         identity_source_digest: identity_digest_of(&identity_artifact()),
@@ -219,24 +219,25 @@ fn execution_policy() -> PaidExecutionPolicyV1 {
         max_stop_token_ids: 4,
         max_spool_bytes: 65_536,
         max_encoded_result_frame: 262_144,
-        max_encoded_quote_response: 1_048_576,
-        dispatch_margin_blocks: 20,
-        delivery_margin_blocks: 10,
-        oracle_grace_blocks: 30,
-        fixed_price: 250,
+        max_encoded_prepared_input: 1_048_576,
     }
 }
 
-fn authorization() -> PaidJobAuthorizationV1 {
+fn authorization() -> PaidJobAuthorizationV2 {
     let channel = channel();
     let terms = payment_terms();
-    PaidJobAuthorizationV1 {
+    PaidJobAuthorizationV2 {
         channel_id: channel.id(),
         bond_edge: terms.bond_edge,
         bond_terms_hash: terms.bond_terms_hash(),
         payment_edge: channel.payment_edge(),
         payment_terms_hash: channel.payment_terms_hash(),
-        execution_policy_digest: execution_policy_digest(&channel, &execution_policy()),
+        work_policy_digest: work_policy_digest(&channel, &work_policy()),
+        payment_policy_digest: hellas_rpc::protocol::work::job_payment_policy_digest(
+            channel.network(),
+            channel.id(),
+            &payment_policy(),
+        ),
         prepared_input_digest: input_digest(&channel, &bundle()),
         proposal_nonce: 0x0102_0304_0506_0708,
         acceptance_deadline: 1_000,
@@ -268,10 +269,10 @@ fn job_result(work_id: Digest) -> PaidJobResultV1 {
 fn golden_record_encodings_are_pinned() {
     assert_eq!(PaidChannelPolicyV1::BODY_SIZE, 16);
     assert_eq!(PaidChannelPolicyV1::ENCODED_SIZE, 18);
-    assert_eq!(PaidExecutionPolicyV1::BODY_SIZE, 154);
-    assert_eq!(PaidExecutionPolicyV1::ENCODED_SIZE, 156);
-    assert_eq!(PaidJobAuthorizationV1::BODY_SIZE, 328);
-    assert_eq!(PaidJobAuthorizationV1::ENCODED_SIZE, 330);
+    assert_eq!(EvaluatePolicyV2::BODY_SIZE, 122);
+    assert_eq!(EvaluatePolicyV2::ENCODED_SIZE, 124);
+    assert_eq!(PaidJobAuthorizationV2::BODY_SIZE, 360);
+    assert_eq!(PaidJobAuthorizationV2::ENCODED_SIZE, 362);
     assert_eq!(PaidJobResultV1::BODY_SIZE, 96);
     assert_eq!(PaidJobResultV1::ENCODED_SIZE, 98);
     assert_eq!(PaymentBindingV1::BODY_SIZE, 96);
@@ -319,7 +320,7 @@ fn golden_record_encodings_are_pinned() {
     );
     assert_eq!(PaymentBindingV1::decode(&binding.encode()), Ok(binding));
 
-    let policy = PaidExecutionPolicyV1 {
+    let policy = EvaluatePolicyV2 {
         allowed_environment: ContentId::from_bytes([0x40; 32]),
         generation_policy_digest: Digest::from_bytes([0x41; 32]),
         identity_source_digest: Digest::from_bytes([0x42; 32]),
@@ -328,17 +329,13 @@ fn golden_record_encodings_are_pinned() {
         max_stop_token_ids: 3,
         max_spool_bytes: 5,
         max_encoded_result_frame: 6,
-        max_encoded_quote_response: 7,
-        dispatch_margin_blocks: 8,
-        delivery_margin_blocks: 9,
-        oracle_grace_blocks: 10,
-        fixed_price: 11,
+        max_encoded_prepared_input: 7,
     };
     assert_eq!(
         hex(&policy.encode()),
         concat!(
             "01",
-            "01", // format version 1, tag 1 = PAID_EXECUTION_POLICY
+            "06", // format version 1, tag 6 = EVALUATE_POLICY_V2
             "4040404040404040404040404040404040404040404040404040404040404040", // environment
             "4141414141414141414141414141414141414141414141414141414141414141", // generation
             "4242424242424242424242424242424242424242424242424242424242424242", // identity
@@ -347,21 +344,18 @@ fn golden_record_encodings_are_pinned() {
             "0003", // max_stop_token_ids
             "0000000000000005", // max_spool_bytes
             "00000006", // max_encoded_result_frame
-            "00000007", // max_encoded_quote_response
-            "0000000000000008", // dispatch_margin_blocks
-            "0000000000000009", // delivery_margin_blocks
-            "000000000000000a", // oracle_grace_blocks
-            "000000000000000b", // fixed_price
+            "00000007", // max_encoded_prepared_input
         )
     );
 
-    let authorization = PaidJobAuthorizationV1 {
+    let authorization = PaidJobAuthorizationV2 {
         channel_id: Digest::from_bytes([0x50; 32]),
         bond_edge: EdgeId::from_bytes([0x51; 32]),
         bond_terms_hash: TermsHash::from_bytes([0x52; 32]),
         payment_edge: EdgeId::from_bytes([0x53; 32]),
         payment_terms_hash: TermsHash::from_bytes([0x54; 32]),
-        execution_policy_digest: Digest::from_bytes([0x55; 32]),
+        work_policy_digest: Digest::from_bytes([0x55; 32]),
+        payment_policy_digest: Digest::from_bytes([0x59; 32]),
         prepared_input_digest: Digest::from_bytes([0x56; 32]),
         proposal_nonce: 1,
         acceptance_deadline: 2,
@@ -375,13 +369,14 @@ fn golden_record_encodings_are_pinned() {
         hex(&authorization.encode()),
         concat!(
             "01",
-            "02", // format version 1, tag 2 = PAID_JOB_AUTHORIZATION
+            "09", // format version 1, tag 9 = PAID_JOB_AUTHORIZATION_V2
             "5050505050505050505050505050505050505050505050505050505050505050", // channel_id
             "5151515151515151515151515151515151515151515151515151515151515151", // bond_edge
             "5252525252525252525252525252525252525252525252525252525252525252", // bond_terms
             "5353535353535353535353535353535353535353535353535353535353535353", // payment_edge
             "5454545454545454545454545454545454545454545454545454545454545454", // payment_terms
             "5555555555555555555555555555555555555555555555555555555555555555", // policy digest
+            "5959595959595959595959595959595959595959595959595959595959595959", // payment policy
             "5656565656565656565656565656565656565656565656565656565656565656", // prepared input
             "0000000000000001", // proposal_nonce
             "0000000000000002", // acceptance_deadline
@@ -404,12 +399,12 @@ fn maximum_value_bodies_stay_fixed_width() {
     authorization.terminal_deadline = u64::MAX;
     authorization.payment_deadline = u64::MAX;
     let bytes = authorization.encode();
-    assert_eq!(bytes.len(), PaidJobAuthorizationV1::ENCODED_SIZE);
-    assert_eq!(PaidJobAuthorizationV1::decode(&bytes), Ok(authorization));
+    assert_eq!(bytes.len(), PaidJobAuthorizationV2::ENCODED_SIZE);
+    assert_eq!(PaidJobAuthorizationV2::decode(&bytes), Ok(authorization));
     // The five `u64`s, all `ff`, at the offsets the layout puts them.
-    assert_eq!(hex(&bytes[226..242]), "ffffffffffffffffffffffffffffffff");
+    assert_eq!(hex(&bytes[258..274]), "ffffffffffffffffffffffffffffffff");
     assert_eq!(
-        hex(&bytes[306..330]),
+        hex(&bytes[338..362]),
         "ffffffffffffffffffffffffffffffffffffffffffffffff"
     );
 }
@@ -494,8 +489,8 @@ fn envelope_and_length_mutations_reject() {
 fn a_body_cannot_be_reinterpreted_under_another_record() {
     let sizes = [
         ("channel policy", PaidChannelPolicyV1::ENCODED_SIZE),
-        ("execution policy", PaidExecutionPolicyV1::ENCODED_SIZE),
-        ("authorization", PaidJobAuthorizationV1::ENCODED_SIZE),
+        ("execution policy", EvaluatePolicyV2::ENCODED_SIZE),
+        ("authorization", PaidJobAuthorizationV2::ENCODED_SIZE),
         ("result", PaidJobResultV1::ENCODED_SIZE),
         ("payment binding", PaymentBindingV1::ENCODED_SIZE),
     ];
@@ -530,24 +525,24 @@ fn a_body_cannot_be_reinterpreted_under_another_record() {
         })
     );
 
-    let policy = execution_policy().encode();
+    let policy = work_policy().encode();
     assert_eq!(
-        PaidJobAuthorizationV1::decode(&policy),
+        PaidJobAuthorizationV2::decode(&policy),
         Err(PaidWorkError::RecordLength {
-            expected: 330,
-            actual: 156
+            expected: 362,
+            actual: 124
         })
     );
 
     // The tag relabelled too, which changes nothing: the length is read
     // before the envelope is.
     let mut disguised = policy.clone();
-    disguised[1] = 2;
+    disguised[1] = 9;
     assert_eq!(
-        PaidJobAuthorizationV1::decode(&disguised),
+        PaidJobAuthorizationV2::decode(&disguised),
         Err(PaidWorkError::RecordLength {
-            expected: 330,
-            actual: 156
+            expected: 362,
+            actual: 124
         })
     );
 }
@@ -568,7 +563,7 @@ fn golden_digests_bind_the_encoded_network() {
     );
     assert_eq!(
         hex(&work_id(&channel, &authorization()).into_bytes()),
-        "7ebf09a0d7c77b8747d53b56cbd981b7cad754ec3c4a913f16cfe8f6545c0ee4"
+        "fdc1f978817cfe2d3374705dc56acd1b678dc6cba3345c945db70787ca725051"
     );
 
     let other = channel_on(
@@ -626,8 +621,8 @@ fn records_do_not_cross_channels() {
             "{label} shares this channel's payment binding digest"
         );
         assert_ne!(
-            execution_policy_digest(&here, &execution_policy()),
-            execution_policy_digest(other, &execution_policy()),
+            work_policy_digest(&here, &work_policy()),
+            work_policy_digest(other, &work_policy()),
             "{label} shares this channel's policy digest"
         );
         assert_ne!(
@@ -637,7 +632,13 @@ fn records_do_not_cross_channels() {
         );
         // MUTATION: replay this channel's authorization on another one.
         assert_eq!(
-            check_authorization(other, &authorization, &execution_policy(), 900),
+            check_authorization(
+                other,
+                &authorization,
+                &work_policy(),
+                &payment_policy(),
+                900
+            ),
             Err(PaidWorkError::Mismatch {
                 field: "channel_id"
             }),
@@ -903,12 +904,12 @@ fn widest_fixed_preimage_is_measured() {
     let encoded_network = 1 + hellas_kernel::MAX_NETWORK_ID_LENGTH;
     for size in [
         PaidChannelPolicyV1::ENCODED_SIZE,
-        PaidExecutionPolicyV1::ENCODED_SIZE,
+        EvaluatePolicyV2::ENCODED_SIZE,
         PaidJobResultV1::ENCODED_SIZE,
         PaymentBindingV1::ENCODED_SIZE,
     ] {
         assert!(
-            size <= PaidJobAuthorizationV1::ENCODED_SIZE,
+            size <= PaidJobAuthorizationV2::ENCODED_SIZE,
             "{size} is wider than the record the bound is taken over"
         );
     }
@@ -916,9 +917,9 @@ fn widest_fixed_preimage_is_measured() {
         "hellas.work.channel.v2",
         "hellas.work.generation-policy.v1",
         "hellas.work.identity-source.v1",
-        "hellas.work.execution-policy.v1",
+        "hellas.work.evaluate-policy.v2",
         "hellas.work.prepared-input.v1",
-        "hellas.work.paid-job-authorize.v1",
+        "hellas.work.paid-job-authorize.v2",
         "hellas.work.paid-job-result.v1",
         "hellas.work.payment-binding.v1",
         "hellas.work.evaluate-output.v2",
@@ -931,9 +932,9 @@ fn widest_fixed_preimage_is_measured() {
     let widest = "hellas.work.paid-channel-policy.v1".len()
         + encoded_network
         + 32
-        + PaidJobAuthorizationV1::ENCODED_SIZE;
-    assert_eq!(widest, 34 + 64 + 32 + 330);
-    assert_eq!(widest, 460);
+        + PaidJobAuthorizationV2::ENCODED_SIZE;
+    assert_eq!(widest, 34 + 64 + 32 + 362);
+    assert_eq!(widest, 492);
     assert!(widest < hellas_xet::MIN_CHUNK_SIZE);
 
     // The one shape that is not record-shaped is bounded too: the
@@ -958,9 +959,15 @@ fn widest_fixed_preimage_is_measured() {
 fn both_parties_sign_one_authorization_digest() {
     let channel = channel();
     let authorization = authorization();
-    let work_id = check_authorization(&channel, &authorization, &execution_policy(), 900)
-        .expect("a legal authorization");
-    check_prepared_input(&channel, &authorization, &execution_policy(), &bundle())
+    let work_id = check_authorization(
+        &channel,
+        &authorization,
+        &work_policy(),
+        &payment_policy(),
+        900,
+    )
+    .expect("a legal authorization");
+    check_prepared_input(&channel, &authorization, &work_policy(), &bundle())
         .expect("a legal bundle");
 
     let payload = hellas_kernel::PayloadHash::from_bytes(work_id.into_bytes());
@@ -979,7 +986,7 @@ fn both_parties_sign_one_authorization_digest() {
 
 fn work_id_payload(
     channel: &PaidChannel,
-    authorization: &PaidJobAuthorizationV1,
+    authorization: &PaidJobAuthorizationV2,
 ) -> hellas_kernel::PayloadHash {
     hellas_kernel::PayloadHash::from_bytes(work_id(channel, authorization).into_bytes())
 }
@@ -994,7 +1001,7 @@ fn every_authorization_field_moves_the_work_id() {
     let base = authorization();
     let signed = work_id(&channel, &base);
 
-    let mutations: Vec<(&str, PaidJobAuthorizationV1)> = vec![
+    let mutations: Vec<(&str, PaidJobAuthorizationV2)> = vec![
         ("channel_id", {
             let mut m = base;
             m.channel_id = Digest::from_bytes([0; 32]);
@@ -1020,9 +1027,9 @@ fn every_authorization_field_moves_the_work_id() {
             m.payment_terms_hash = TermsHash::from_bytes([0; 32]);
             m
         }),
-        ("execution_policy_digest", {
+        ("work_policy_digest", {
             let mut m = base;
-            m.execution_policy_digest = Digest::from_bytes([0; 32]);
+            m.work_policy_digest = Digest::from_bytes([0; 32]);
             m
         }),
         ("prepared_input_digest", {
@@ -1081,18 +1088,22 @@ fn every_authorization_field_moves_the_work_id() {
 #[test]
 fn authorization_rules_reject_their_violations() {
     let channel = channel();
-    let policy = execution_policy();
+    let policy = work_policy();
     let base = authorization();
-    assert!(check_authorization(&channel, &base, &policy, 900).is_ok());
+    assert!(check_authorization(&channel, &base, &policy, &payment_policy(), 900).is_ok());
 
     // MUTATION: a free job.
     let mut zero_price = base;
     zero_price.price = 0;
-    let mut zero_policy = policy;
+    let mut zero_policy = payment_policy();
     zero_policy.fixed_price = 0;
-    zero_price.execution_policy_digest = execution_policy_digest(&channel, &zero_policy);
+    zero_price.payment_policy_digest = hellas_rpc::protocol::work::job_payment_policy_digest(
+        channel.network(),
+        channel.id(),
+        &zero_policy,
+    );
     assert_eq!(
-        check_authorization(&channel, &zero_price, &zero_policy, 900),
+        check_authorization(&channel, &zero_price, &work_policy(), &zero_policy, 900),
         Err(PaidWorkError::PolicyZero {
             field: "fixed_price"
         })
@@ -1101,11 +1112,15 @@ fn authorization_rules_reject_their_violations() {
     // MUTATION: a price the bond does not cover.
     let mut over_bond = base;
     over_bond.price = 501;
-    let mut over_policy = policy;
+    let mut over_policy = payment_policy();
     over_policy.fixed_price = 501;
-    over_bond.execution_policy_digest = execution_policy_digest(&channel, &over_policy);
+    over_bond.payment_policy_digest = hellas_rpc::protocol::work::job_payment_policy_digest(
+        channel.network(),
+        channel.id(),
+        &over_policy,
+    );
     assert_eq!(
-        check_authorization(&channel, &over_bond, &over_policy, 900),
+        check_authorization(&channel, &over_bond, &work_policy(), &over_policy, 900),
         Err(PaidWorkError::PriceOutOfRange {
             price: 501,
             max_job_price: 500
@@ -1116,13 +1131,13 @@ fn authorization_rules_reject_their_violations() {
     let mut mispriced = base;
     mispriced.price = 249;
     assert_eq!(
-        check_authorization(&channel, &mispriced, &policy, 900),
+        check_authorization(&channel, &mispriced, &policy, &payment_policy(), 900),
         Err(PaidWorkError::Mismatch { field: "price" })
     );
 
     // MUTATION: signing after the acceptance window closed.
     assert_eq!(
-        check_authorization(&channel, &base, &policy, 1_001),
+        check_authorization(&channel, &base, &policy, &payment_policy(), 1_001),
         Err(PaidWorkError::AcceptanceExpired {
             height: 1_001,
             deadline: 1_000
@@ -1133,7 +1148,7 @@ fn authorization_rules_reject_their_violations() {
     let mut late = base;
     late.payment_deadline = 5_000;
     assert_eq!(
-        check_authorization(&channel, &late, &policy, 900),
+        check_authorization(&channel, &late, &policy, &payment_policy(), 900),
         Err(PaidWorkError::DeadlineOrder {
             acceptance: 1_000,
             terminal: 1_050,
@@ -1147,7 +1162,7 @@ fn authorization_rules_reject_their_violations() {
     inverted.terminal_deadline = 1_100;
     inverted.payment_deadline = 1_050;
     assert!(matches!(
-        check_authorization(&channel, &inverted, &policy, 900),
+        check_authorization(&channel, &inverted, &policy, &payment_policy(), 900),
         Err(PaidWorkError::DeadlineOrder { .. })
     ));
 }
@@ -1156,13 +1171,13 @@ fn authorization_rules_reject_their_violations() {
 /// pins, so a locally re-decoded policy that differs anywhere fails the
 /// comparison.
 #[test]
-fn every_execution_policy_field_moves_its_digest() {
+fn every_work_policy_field_moves_its_digest() {
     let channel = channel();
-    let base = execution_policy();
-    let pinned = execution_policy_digest(&channel, &base);
+    let base = work_policy();
+    let pinned = work_policy_digest(&channel, &base);
     let authorization = authorization();
 
-    let mutations: Vec<(&str, PaidExecutionPolicyV1)> = vec![
+    let mutations: Vec<(&str, EvaluatePolicyV2)> = vec![
         ("allowed_environment", {
             let mut m = base;
             m.allowed_environment = ContentId::from_bytes([0; 32]);
@@ -1203,45 +1218,25 @@ fn every_execution_policy_field_moves_its_digest() {
             m.max_encoded_result_frame += 1;
             m
         }),
-        ("max_encoded_quote_response", {
+        ("max_encoded_prepared_input", {
             let mut m = base;
-            m.max_encoded_quote_response += 1;
-            m
-        }),
-        ("dispatch_margin_blocks", {
-            let mut m = base;
-            m.dispatch_margin_blocks += 1;
-            m
-        }),
-        ("delivery_margin_blocks", {
-            let mut m = base;
-            m.delivery_margin_blocks += 1;
-            m
-        }),
-        ("oracle_grace_blocks", {
-            let mut m = base;
-            m.oracle_grace_blocks += 1;
-            m
-        }),
-        ("fixed_price", {
-            let mut m = base;
-            m.fixed_price += 1;
+            m.max_encoded_prepared_input += 1;
             m
         }),
     ];
-    assert_eq!(mutations.len(), 13, "every field must be mutated");
+    assert_eq!(mutations.len(), 9, "every field must be mutated");
     for (field, mutated) in mutations {
         assert_ne!(
-            execution_policy_digest(&channel, &mutated),
+            work_policy_digest(&channel, &mutated),
             pinned,
             "{field} left the policy digest alone"
         );
         // A recomputed digest does not help: the authorization pins the
         // one both parties agreed to.
         assert_eq!(
-            check_authorization(&channel, &authorization, &mutated, 900).err(),
+            check_authorization(&channel, &authorization, &mutated, &payment_policy(), 900).err(),
             Some(PaidWorkError::Mismatch {
-                field: "execution_policy_digest"
+                field: "work_policy_digest"
             }),
             "{field} was accepted under a recomputed digest"
         );
@@ -1294,9 +1289,9 @@ fn a_channel_cannot_be_built_on_an_uncommitted_credit_policy() {
 /// policy happened to be in hand. This one compares against this job's.
 #[test]
 fn a_price_above_the_channel_credit_limits_is_refused() {
-    let policy = execution_policy();
+    let policy = work_policy();
     let base = authorization();
-    assert!(check_authorization(&channel(), &base, &policy, 900).is_ok());
+    assert!(check_authorization(&channel(), &base, &policy, &payment_policy(), 900).is_ok());
 
     // A second execution policy on the same channel, priced above the
     // compute credit limit and still inside `max_job_price`. The channel
@@ -1318,17 +1313,22 @@ fn a_price_above_the_channel_credit_limits_is_refused() {
     )
     .expect("terms that commit to this credit policy");
 
-    let mut dear = execution_policy();
+    let mut dear = payment_policy();
     dear.fixed_price = 500;
     let mut authorization = authorization();
     authorization.channel_id = channel.id();
     authorization.payment_terms_hash = channel.payment_terms_hash();
     authorization.price = 500;
-    authorization.execution_policy_digest = execution_policy_digest(&channel, &dear);
+    authorization.payment_policy_digest = hellas_rpc::protocol::work::job_payment_policy_digest(
+        channel.network(),
+        channel.id(),
+        &dear,
+    );
+    authorization.work_policy_digest = work_policy_digest(&channel, &work_policy());
     authorization.prepared_input_digest = input_digest(&channel, &bundle());
 
     assert_eq!(
-        check_authorization(&channel, &authorization, &dear, 900),
+        check_authorization(&channel, &authorization, &work_policy(), &dear, 900),
         Err(PaidWorkError::OverEnvelope {
             field: "price against compute_credit_limit",
             actual: 500,
@@ -1356,9 +1356,14 @@ fn a_price_above_the_channel_credit_limits_is_refused() {
     .expect("terms that commit to this credit policy");
     authorization.payment_terms_hash = channel.payment_terms_hash();
     authorization.channel_id = channel.id();
-    authorization.execution_policy_digest = execution_policy_digest(&channel, &dear);
+    authorization.payment_policy_digest = hellas_rpc::protocol::work::job_payment_policy_digest(
+        channel.network(),
+        channel.id(),
+        &dear,
+    );
+    authorization.work_policy_digest = work_policy_digest(&channel, &work_policy());
     assert_eq!(
-        check_authorization(&channel, &authorization, &dear, 900),
+        check_authorization(&channel, &authorization, &work_policy(), &dear, 900),
         Err(PaidWorkError::OverEnvelope {
             field: "price against delivery_credit_limit",
             actual: 500,
@@ -1370,79 +1375,51 @@ fn a_price_above_the_channel_credit_limits_is_refused() {
 /// Every bound the profile requires to be positive is refused at zero,
 /// one field at a time.
 #[test]
-fn an_absent_execution_policy_bound_is_refused() {
-    let base = execution_policy();
-    assert!(check_execution_policy(&base).is_ok());
+fn an_absent_work_policy_bound_is_refused() {
+    let base = work_policy();
+    assert!(check_work_policy(&base).is_ok());
 
-    let zeroed: Vec<(&str, PaidExecutionPolicyV1)> = vec![
-        (
-            "fixed_price",
-            PaidExecutionPolicyV1 {
-                fixed_price: 0,
-                ..base
-            },
-        ),
+    let zeroed: Vec<(&str, EvaluatePolicyV2)> = vec![
         (
             "max_prompt_tokens",
-            PaidExecutionPolicyV1 {
+            EvaluatePolicyV2 {
                 max_prompt_tokens: 0,
                 ..base
             },
         ),
         (
             "max_new_tokens",
-            PaidExecutionPolicyV1 {
+            EvaluatePolicyV2 {
                 max_new_tokens: 0,
                 ..base
             },
         ),
         (
             "max_spool_bytes",
-            PaidExecutionPolicyV1 {
+            EvaluatePolicyV2 {
                 max_spool_bytes: 0,
                 ..base
             },
         ),
         (
             "max_encoded_result_frame",
-            PaidExecutionPolicyV1 {
+            EvaluatePolicyV2 {
                 max_encoded_result_frame: 0,
                 ..base
             },
         ),
         (
-            "max_encoded_quote_response",
-            PaidExecutionPolicyV1 {
-                max_encoded_quote_response: 0,
-                ..base
-            },
-        ),
-        (
-            "dispatch_margin_blocks",
-            PaidExecutionPolicyV1 {
-                dispatch_margin_blocks: 0,
-                ..base
-            },
-        ),
-        (
-            "delivery_margin_blocks",
-            PaidExecutionPolicyV1 {
-                delivery_margin_blocks: 0,
-                ..base
-            },
-        ),
-        (
-            "oracle_grace_blocks",
-            PaidExecutionPolicyV1 {
-                oracle_grace_blocks: 0,
+            "max_encoded_prepared_input",
+            EvaluatePolicyV2 {
+                max_encoded_prepared_input: 0,
                 ..base
             },
         ),
     ];
-    assert_eq!(zeroed.len(), 9, "every required bound must be zeroed");
+    assert_eq!(zeroed.len(), 5, "every required bound must be zeroed");
     for (field, policy) in zeroed {
         assert_eq!(
-            check_execution_policy(&policy),
+            check_work_policy(&policy),
             Err(PaidWorkError::PolicyZero { field }),
             "{field} was accepted at zero"
         );
@@ -1451,7 +1428,7 @@ fn an_absent_execution_policy_bound_is_refused() {
     // `max_stop_token_ids` is the one bound that may be zero: a channel
     // that admits no stop tokens is a usable channel.
     assert!(
-        check_execution_policy(&PaidExecutionPolicyV1 {
+        check_work_policy(&EvaluatePolicyV2 {
             max_stop_token_ids: 0,
             ..base
         })
@@ -1466,7 +1443,7 @@ fn an_absent_execution_policy_bound_is_refused() {
 #[test]
 fn prepared_input_graph_is_checked_not_assumed() {
     let channel = channel();
-    let policy = execution_policy();
+    let policy = work_policy();
     let authorization = authorization();
     assert!(check_prepared_input(&channel, &authorization, &policy, &bundle()).is_ok());
 
@@ -1612,7 +1589,7 @@ fn prepared_input_graph_is_checked_not_assumed() {
 #[test]
 fn each_graph_binding_is_checked_on_its_own() {
     let channel = channel();
-    let policy = execution_policy();
+    let policy = work_policy();
     let base = authorization();
 
     // A prompt body the execution does not name.
@@ -1780,7 +1757,7 @@ fn each_graph_binding_is_checked_on_its_own() {
 #[test]
 fn each_envelope_bound_is_checked_on_its_own() {
     let channel = channel();
-    let base = execution_policy();
+    let base = work_policy();
     let authorization = authorization();
     assert!(check_prepared_input(&channel, &authorization, &base, &bundle()).is_ok());
 
@@ -1788,8 +1765,8 @@ fn each_envelope_bound_is_checked_on_its_own() {
     // agreed to hold. Refused before its digest is even computed: an
     // endpoint does not hash a body it has not agreed to receive.
     let encoded = bundle().encode().expect("a representable bundle");
-    let cramped = PaidExecutionPolicyV1 {
-        max_encoded_quote_response: 100,
+    let cramped = EvaluatePolicyV2 {
+        max_encoded_prepared_input: 100,
         ..base
     };
     assert_eq!(
@@ -1801,14 +1778,14 @@ fn each_envelope_bound_is_checked_on_its_own() {
         })
     );
     // The exact length is legal; one byte less is not.
-    let exact = PaidExecutionPolicyV1 {
-        max_encoded_quote_response: encoded.len() as u32,
+    let exact = EvaluatePolicyV2 {
+        max_encoded_prepared_input: encoded.len() as u32,
         ..base
     };
     assert!(check_prepared_input(&channel, &authorization, &exact, &bundle()).is_ok());
 
     // A generation longer than the policy admits.
-    let short = PaidExecutionPolicyV1 {
+    let short = EvaluatePolicyV2 {
         max_new_tokens: 63,
         ..base
     };
@@ -1822,7 +1799,7 @@ fn each_envelope_bound_is_checked_on_its_own() {
     );
 
     // More stop tokens than the policy admits.
-    let few = PaidExecutionPolicyV1 {
+    let few = EvaluatePolicyV2 {
         max_stop_token_ids: 1,
         ..base
     };
@@ -1840,7 +1817,7 @@ fn each_envelope_bound_is_checked_on_its_own() {
     // reached by the graph check before the envelope loop runs.
     let silent = TextPolicy::from_u32_stop_tokens(0, [2, 1]);
     let (silent_bundle, silent_auth) = bundle_with_policy(&channel, &silent);
-    let admits_silence = PaidExecutionPolicyV1 {
+    let admits_silence = EvaluatePolicyV2 {
         generation_policy_digest: policy_digest_of(&silent),
         ..base
     };
@@ -1857,7 +1834,7 @@ fn each_envelope_bound_is_checked_on_its_own() {
 fn bundle_with_policy(
     channel: &PaidChannel,
     policy: &TextPolicy,
-) -> (PreparedPaidInputV1, PaidJobAuthorizationV1) {
+) -> (PreparedPaidInputV1, PaidJobAuthorizationV2) {
     let execution = TextExecution::new(
         SourceRef::output(identity_artifact().output_id()),
         prompt_tokens().output_id(),
@@ -1875,7 +1852,7 @@ fn bundle_with_policy(
         policy,
         &identity_artifact(),
     );
-    let authorization = PaidJobAuthorizationV1 {
+    let authorization = PaidJobAuthorizationV2 {
         prepared_input_digest: input_digest(channel, &bundle),
         request_commitment: Evaluate::commit_request(&request),
         ..authorization()
@@ -1916,14 +1893,14 @@ fn only_the_identity_artifact_may_start_a_paid_job() {
         &text_policy(),
         &resumed,
     );
-    let authorization = PaidJobAuthorizationV1 {
+    let authorization = PaidJobAuthorizationV2 {
         prepared_input_digest: input_digest(&channel, &bundle),
         request_commitment: Evaluate::commit_request(&request),
         ..authorization()
     };
-    let policy = PaidExecutionPolicyV1 {
+    let policy = EvaluatePolicyV2 {
         identity_source_digest: identity_digest_of(&resumed),
-        ..execution_policy()
+        ..work_policy()
     };
     assert_eq!(
         check_prepared_input(&channel, &authorization, &policy, &bundle),
@@ -2048,7 +2025,7 @@ fn payment_at(
     credited: u64,
     nonce: u64,
 ) -> (
-    PaidJobAuthorizationV1,
+    PaidJobAuthorizationV2,
     PaidJobResultV1,
     EarnedCertificate,
     PaymentBindingV1,
@@ -2484,7 +2461,7 @@ fn digest_preimages_are_reproducible_by_hand() {
     assert_eq!(preimage.len(), 30 + 16 + 32 + 98);
     assert_eq!(
         hex(&Digest::hash(&preimage).into_bytes()),
-        "7af77e5376b3f26a934861afd93c3a4bfe1cdcffd4a642d9bc2f22a55823f196"
+        "83bb5166e608eb7e0ef4078074ead44efc220474a264c149205820e0caa5da70"
     );
 
     // The payment binding, whose three fields are all 32 bytes: a round
@@ -2565,7 +2542,7 @@ fn the_canonical_output_preimage_is_reproducible_by_hand() {
     );
     assert_eq!(
         hex(&Digest::hash(&preimage).into_bytes()),
-        "83aa7b2b6e7f992893b308cf934e258540f9443dca657cd41102249870f7e027"
+        "782f58af12859938749283772c36b3269f6b0506197dcde7ef3466ab3ef81b68"
     );
 }
 
@@ -2607,7 +2584,7 @@ fn spool_transcript() -> Vec<hellas_rpc::OutputEventEnvelope> {
 /// Nothing in the protocol hashes these bytes, so what this pins is the
 /// round trip and the budget — not a layout. The pairing that gives the
 /// bytes their meaning is
-/// `work_store::ChannelState`'s rebuild, and it is tested there.
+/// `work_store::Channel`'s rebuild, and it is tested there.
 #[test]
 fn a_spooled_transcript_decodes_to_the_events_that_were_spooled() {
     let transcript = spool_transcript();
@@ -2732,4 +2709,58 @@ fn the_completed_output_derivation_is_reproducible_by_hand() {
     let longer = completed_text(execution, &[9, 8, 7, 6, 5], &output_tokens);
     assert_eq!(longer.generated_tokens, completed.generated_tokens);
     assert_ne!(longer.artifact, completed.artifact);
+}
+
+fn payment_policy() -> hellas_rpc::protocol::work::JobPaymentPolicyV2 {
+    hellas_rpc::protocol::work::JobPaymentPolicyV2 {
+        fixed_price: 250,
+        dispatch_margin_blocks: 20,
+        delivery_margin_blocks: 10,
+        oracle_grace_blocks: 30,
+    }
+}
+
+#[test]
+fn every_payment_term_is_committed_and_checked_separately() {
+    let channel = channel();
+    let policy = work_policy();
+    let base = payment_policy();
+    let authorization = authorization();
+    let mutations = [
+        JobPaymentPolicyV2 {
+            fixed_price: base.fixed_price + 1,
+            ..base
+        },
+        JobPaymentPolicyV2 {
+            dispatch_margin_blocks: base.dispatch_margin_blocks + 1,
+            ..base
+        },
+        JobPaymentPolicyV2 {
+            delivery_margin_blocks: base.delivery_margin_blocks + 1,
+            ..base
+        },
+        JobPaymentPolicyV2 {
+            oracle_grace_blocks: base.oracle_grace_blocks + 1,
+            ..base
+        },
+    ];
+    for changed in mutations {
+        assert_eq!(
+            check_authorization(&channel, &authorization, &policy, &changed, 900),
+            Err(PaidWorkError::Mismatch {
+                field: "payment_policy_digest"
+            })
+        );
+        assert_eq!(
+            check_payment_policy_binding(&channel, &authorization, &changed),
+            Err(PaidWorkError::Mismatch {
+                field: "payment_policy_digest"
+            })
+        );
+    }
+    // Recovery after the acceptance deadline checks the retained terms only.
+    assert_eq!(
+        check_payment_policy_binding(&channel, &authorization, &base),
+        Ok(())
+    );
 }

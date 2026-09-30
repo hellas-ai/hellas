@@ -25,7 +25,7 @@ use hellas_rpc::protocol::artifacts::{
     TextArtifact, TextExecution, TextExecutionId, TextPolicy, TokenIds, completed_text,
 };
 use hellas_rpc::protocol::work::{
-    JobDeadlines, PaidChannel, PaidChannelPolicyV1, PaidExecutionPolicyV1, PaidJobAuthorizationV1,
+    EvaluatePolicyV2, JobDeadlines, PaidChannel, PaidChannelPolicyV1, PaidJobAuthorizationV2,
     PaidJobResultV1, generation_policy_digest, identity_source_digest, private_policy_commitment,
     propose_authorization, terminal_result, work_id,
 };
@@ -160,8 +160,8 @@ fn bundle() -> PreparedPaidInputV1 {
     )
 }
 
-fn execution_policy() -> PaidExecutionPolicyV1 {
-    PaidExecutionPolicyV1 {
+fn work_policy() -> EvaluatePolicyV2 {
+    EvaluatePolicyV2 {
         allowed_environment: manifest().content_id(),
         generation_policy_digest: match generation_policy_digest(
             &hellas_rpc::protocol::artifacts::Canonical::canonical_bytes(&text_policy()),
@@ -180,18 +180,15 @@ fn execution_policy() -> PaidExecutionPolicyV1 {
         max_stop_token_ids: 4,
         max_spool_bytes: 1_048_576,
         max_encoded_result_frame: 262_144,
-        max_encoded_quote_response: 1_048_576,
-        dispatch_margin_blocks: 4,
-        delivery_margin_blocks: 2,
-        oracle_grace_blocks: 6,
-        fixed_price: PRICE,
+        max_encoded_prepared_input: 1_048_576,
     }
 }
 
-fn authorization() -> PaidJobAuthorizationV1 {
+fn authorization() -> PaidJobAuthorizationV2 {
     match propose_authorization(
         &channel(),
-        &execution_policy(),
+        &work_policy(),
+        &payment_policy(),
         &bundle(),
         1,
         JobDeadlines {
@@ -589,4 +586,13 @@ async fn the_answer_is_bound_to_the_job_it_answers() {
         ),
         "another network does not reproduce",
     );
+}
+
+fn payment_policy() -> hellas_rpc::protocol::work::JobPaymentPolicyV2 {
+    hellas_rpc::protocol::work::JobPaymentPolicyV2 {
+        fixed_price: PRICE,
+        dispatch_margin_blocks: 4,
+        delivery_margin_blocks: 2,
+        oracle_grace_blocks: 6,
+    }
 }

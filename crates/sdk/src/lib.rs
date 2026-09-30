@@ -63,3 +63,12 @@ mod test_support;
 
 #[cfg(feature = "paid-gateway")]
 pub mod paid_gateway;
+
+#[cfg(feature = "paid-client")]
+mod work_link;
+#[cfg(feature = "paid-client")]
+pub mod work_session;
+#[cfg(feature = "paid-client")]
+pub use work_session::WorkSession;
+#[cfg(feature = "paid-gateway")]
+mod gateway_work;

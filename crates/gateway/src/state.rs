@@ -29,7 +29,7 @@ pub(super) struct GatewayState {
     /// [`configured_strategy`]. The dial targets it was built from are
     /// deliberately not kept: there is no second place a route could be
     /// assembled, and so no place one could be assembled without an anchor.
-    paid_work: Option<Arc<dyn super::PaidExecutionBackend>>,
+    paid_work: Option<Arc<dyn super::WorkExecutionBackend>>,
 }
 
 pub(super) struct PreparedGeneration {
@@ -96,7 +96,7 @@ impl GatewayState {
                 && (options.causal_lm.is_some()
                     || options.responses_backend == ResponsesBackend::Hellas))
         {
-            return Err(hellas_client::ClientError::OwnerGrantRequired.into());
+            return Err(hellas_client::ClientError::FundingRequired.into());
         }
         Ok(Self {
             inference_metrics: super::backend::telemetry::InferenceMetrics::new(),
@@ -144,9 +144,9 @@ impl GatewayState {
             let backend = self
                 .paid_work
                 .as_ref()
-                .ok_or(hellas_client::ClientError::OwnerGrantRequired)?;
+                .ok_or(hellas_client::ClientError::FundingRequired)?;
             let payment = backend
-                .execute(super::PaidExecutionRequest {
+                .execute(super::WorkExecutionRequest {
                     environment: causal_lm.environment().clone(),
                     input_ids,
                     max_new_tokens: max_tokens,
@@ -166,13 +166,12 @@ impl GatewayState {
         .await
         .map_err(|error| match error {
             hellas_client::ClientError::External(error) => HttpError {
-                status: if matches!(
-                    error.downcast_ref::<super::PaidGatewayError>(),
-                    Some(super::PaidGatewayError::Busy(_))
-                ) {
-                    StatusCode::SERVICE_UNAVAILABLE
-                } else {
-                    StatusCode::BAD_REQUEST
+                status: match error.downcast_ref::<super::WorkGatewayError>() {
+                    Some(super::WorkGatewayError::Busy(_)) => StatusCode::SERVICE_UNAVAILABLE,
+                    Some(super::WorkGatewayError::Denied(_)) => StatusCode::FORBIDDEN,
+                    Some(super::WorkGatewayError::Quota(_)) => StatusCode::TOO_MANY_REQUESTS,
+                    Some(super::WorkGatewayError::Rejected(_)) => StatusCode::BAD_REQUEST,
+                    _ => StatusCode::BAD_GATEWAY,
                 },
                 message: error.to_string(),
             },

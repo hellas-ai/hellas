@@ -16,10 +16,9 @@ use super::hex;
 
 /// First bytes of every journal file.
 const MAGIC: &[u8] = b"hellas.work-journal.v1";
-/// Version 6 stores explicit work IDs and active/completed job collections.
-/// Older versions omit required recovery markers, contest responses, journal
-/// generations, or job IDs. They are rejected rather than migrated.
-const FORMAT_VERSION: u8 = 6;
+/// Version 7 stores split V2 policies/authorizations, v3 close descriptors,
+/// proposal-exchange records and pending WorkIds in channel checkpoints.
+const FORMAT_VERSION: u8 = 7;
 /// Domain of the header digest every frame is bound to.
 const HEADER_DOMAIN: &[u8] = b"hellas.work.journal-header.v1";
 /// Domain of one frame's digest.
@@ -37,7 +36,7 @@ const FRAME_OVERHEAD: usize = 4 + Digest::LEN;
 /// signature, and the whole prepared-input bundle the provider must
 /// still be able to execute after a restart. The demonstration profile
 /// bounds that bundle at a megabyte through
-/// `max_encoded_quote_response`, and that bound is checked where the
+/// `max_encoded_prepared_input`, and that bound is checked where the
 /// profile is known. This is the coarser bound of the two: the length
 /// past which a length field is more likely to be corruption than a
 /// record.
@@ -88,6 +87,8 @@ pub enum JournalKind {
     /// Provider accounting whose request and response bodies never reach disk.
     /// A different kind prevents reopening a payload-bearing journal as ZDR.
     MetadataChannel,
+    /// Provider-wide, metadata-only grant tree and channel books.
+    Grant,
 }
 
 impl JournalKind {
@@ -96,6 +97,7 @@ impl JournalKind {
             Self::Setup => 1,
             Self::Channel => 2,
             Self::MetadataChannel => 3,
+            Self::Grant => 4,
         }
     }
 
@@ -104,6 +106,7 @@ impl JournalKind {
             1 => Some(Self::Setup),
             2 => Some(Self::Channel),
             3 => Some(Self::MetadataChannel),
+            4 => Some(Self::Grant),
             _ => None,
         }
     }
@@ -205,16 +208,13 @@ pub enum JournalError {
         /// File that is already locked.
         path: PathBuf,
     },
-    /// The file is a recognized journal envelope whose recovery contract has
-    /// been retired.
-    #[error("journal format {found} is retired; expected {expected}: {retirement}")]
-    OldVersion {
+    /// The journal format differs from the one this binary reads.
+    #[error("journal format {found} does not match {expected}")]
+    VersionMismatch {
         /// Version byte found after the journal magic.
         found: u8,
         /// Version this binary writes and reads.
         expected: u8,
-        /// Operator-facing reason this version cannot be migrated safely.
-        retirement: &'static str,
     },
     /// The file does not begin with a header this binary writes at all,
     /// so there is no kind, role or key in it to name.
@@ -403,13 +403,12 @@ impl Journal {
             if bytes.starts_with(MAGIC)
                 && bytes
                     .get(MAGIC.len())
-                    .is_some_and(|found| *found < FORMAT_VERSION)
+                    .is_some_and(|found| *found != FORMAT_VERSION)
             {
                 let found = bytes[MAGIC.len()];
-                return Err(JournalError::OldVersion {
+                return Err(JournalError::VersionMismatch {
                     found,
                     expected: FORMAT_VERSION,
-                    retirement: retirement(found),
                 });
             }
             // A file that is a strict prefix of the header this journal
@@ -562,8 +561,8 @@ impl Journal {
     /// # Errors
     ///
     /// [`JournalError::NotAJournal`] when the file does not begin with a
-    /// header this binary writes, [`JournalError::OldVersion`] for a
-    /// retired one, [`JournalError::Corrupt`] when a complete frame does
+    /// header this binary writes, [`JournalError::VersionMismatch`] for a
+    /// different format, [`JournalError::Corrupt`] when a complete frame does
     /// not verify, [`JournalError::RecordTooLarge`] for a frame longer
     /// than the ceiling, and [`JournalError::Io`] for the filesystem.
     pub fn inspect(path: &Path) -> Result<(JournalId, Replay), JournalError> {
@@ -643,7 +642,15 @@ impl Journal {
     /// of a duty.
     #[must_use]
     pub const fn at_soft_limit(&self) -> bool {
-        self.next_seq >= MAX_ACTIVE_FRAMES.saturating_sub(DUTY_RESERVE_FRAMES)
+        self.at_soft_limit_with_frames(DUTY_RESERVE_FRAMES)
+    }
+
+    /// A shared journal may owe more transitions than a single channel. Its
+    /// writer reserves enough frames for every duty it admits; the byte reserve
+    /// and hard bounds remain common to all journals.
+    #[must_use]
+    pub const fn at_soft_limit_with_frames(&self, duty_frames: u64) -> bool {
+        self.next_seq >= MAX_ACTIVE_FRAMES.saturating_sub(duty_frames)
             || self.bytes >= MAX_ACTIVE_JOURNAL_BYTES.saturating_sub(DUTY_RESERVE_BYTES)
     }
 
@@ -839,15 +846,11 @@ fn read_id(path: &Path, bytes: &[u8]) -> Result<JournalId, JournalError> {
         return Err(not_a_journal());
     }
     let version = bytes[MAGIC.len()];
-    if version < FORMAT_VERSION {
-        return Err(JournalError::OldVersion {
+    if version != FORMAT_VERSION {
+        return Err(JournalError::VersionMismatch {
             found: version,
             expected: FORMAT_VERSION,
-            retirement: retirement(version),
         });
-    }
-    if version > FORMAT_VERSION {
-        return Err(not_a_journal());
     }
     let (Some(kind), Some(role)) = (
         JournalKind::from_code(bytes[MAGIC.len() + 1]),
@@ -1018,26 +1021,6 @@ fn retire(predecessor: &Path, directory: &Path) -> Result<(), JournalError> {
         Err(error) => return Err(error.into()),
     }
     Ok(hellas_private::sync_directory(directory)?)
-}
-
-/// Returns why one retired envelope version cannot be migrated.
-const fn retirement(found: u8) -> &'static str {
-    match found {
-        0 | 1 => "pre-arming journals have no recoverable scan floor or close descriptor",
-        2 => {
-            "pre-terminal channel journals reuse tags 7-11 with other meanings and would mis-replay"
-        }
-        3 => {
-            "pre-response channel journals cannot record an answered contest, so a fixed answer replays as one never given"
-        }
-        4 => {
-            "pre-rotation journals bind no generation, so a predecessor's frames verify in its successor and a retired file opens as the live one"
-        }
-        5 => {
-            "single-job journals do not identify follow-on records and cannot be replayed as concurrent-job journals"
-        }
-        _ => "unknown retired journal format",
-    }
 }
 
 /// What one walk of a file found: the complete frames, whether a partial

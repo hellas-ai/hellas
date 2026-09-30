@@ -102,6 +102,15 @@ where
     let header_provenance = backend_stream.initial_provenance.clone();
     let stream_provenance = backend_stream.initial_provenance;
     let mut output_events = backend_stream.events;
+    // Admission is asynchronous. Preserve its HTTP refusal before committing
+    // SSE headers; failures after the first output remain stream errors.
+    let first = match output_events.next().await {
+        Some(Ok(event)) => event,
+        Some(Err(error)) => return backend_error(surface, error),
+        None => return backend_error(surface, BackendError::failed("backend returned no output")),
+    };
+    let mut output_events =
+        futures::stream::once(std::future::ready(Ok(first))).chain(output_events);
 
     let mut response = sse_response(async_stream::stream! {
         let mut state = adaptor.initial_state(&parsed, context);
@@ -178,6 +187,9 @@ pub(super) fn adaptor_error(surface: &str, error: AdaptorError) -> Response {
 fn backend_error(surface: &str, error: BackendError) -> Response {
     let status = match error {
         BackendError::Rejected(_) => StatusCode::BAD_REQUEST,
+        BackendError::Denied(_) => StatusCode::FORBIDDEN,
+        BackendError::Quota(_) => StatusCode::TOO_MANY_REQUESTS,
+        BackendError::Busy(_) => StatusCode::SERVICE_UNAVAILABLE,
         BackendError::Failed(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
     json_error(status, format!("{surface}: {error}"))

@@ -30,12 +30,12 @@ impl GatewayBackend {
         self.state
             .prepare_wire_execution(&request.execution, retention)
             .await
-            .map_err(|err| {
-                if err.status.is_client_error() {
-                    BackendError::rejected(err.message)
-                } else {
-                    BackendError::failed(err.message)
-                }
+            .map_err(|err| match err.status {
+                axum::http::StatusCode::FORBIDDEN => BackendError::Denied(err.message),
+                axum::http::StatusCode::TOO_MANY_REQUESTS => BackendError::Quota(err.message),
+                axum::http::StatusCode::SERVICE_UNAVAILABLE => BackendError::Busy(err.message),
+                status if status.is_client_error() => BackendError::rejected(err.message),
+                _ => BackendError::failed(err.message),
             })
     }
 }
@@ -84,4 +84,19 @@ fn retention_from_json_object(
         Some(JsonValue::Bool(store)) => Ok(Retention::from_retain(*store)),
         Some(_) => Err(BackendError::rejected("`store` must be a boolean")),
     }
+}
+
+fn execution_error(error: hellas_client::ClientError) -> BackendError {
+    if let hellas_client::ClientError::External(ref source) = error
+        && let Some(work) = source.downcast_ref::<crate::WorkGatewayError>()
+    {
+        return match work {
+            crate::WorkGatewayError::Rejected(_) => BackendError::rejected(work.to_string()),
+            crate::WorkGatewayError::Denied(_) => BackendError::Denied(work.to_string()),
+            crate::WorkGatewayError::Quota(_) => BackendError::Quota(work.to_string()),
+            crate::WorkGatewayError::Busy(_) => BackendError::Busy(work.to_string()),
+            _ => BackendError::failed(work.to_string()),
+        };
+    }
+    BackendError::failed(error.to_string())
 }

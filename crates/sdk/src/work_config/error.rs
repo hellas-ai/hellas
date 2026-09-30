@@ -1,4 +1,4 @@
-use super::{ContentId, EdgeId, Key, PeerId};
+use super::{ContentId, EdgeId, Key};
 use std::path::PathBuf;
 
 /// Configuration errors retain the field, route or file that failed.
@@ -21,8 +21,6 @@ pub enum WorkConfigError {
         field: &'static str,
         reason: &'static str,
     },
-    #[error("routes names peer {0:#} twice; one authenticated peer has one route")]
-    DuplicatePeer(PeerId),
     #[error("routes names bond {} twice; one provider journal has one route", hex::encode(.0.to_bytes()))]
     DuplicateBond(EdgeId),
     #[error("provider setup journal for bond {} is not under journal.root {}", hex::encode(bond.to_bytes()), root.display())]

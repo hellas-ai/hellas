@@ -4,37 +4,73 @@
 use super::artifacts::PreparedPaidInputV1;
 use super::value::CanonicalDecodeError;
 use super::work::{
-    self, JobDeadlines, PaidChannel, PaidExecutionPolicyV1, PaidJobAuthorizationV1,
+    self, EvaluatePolicyV2, JobDeadlines, JobPaymentPolicyV2, PaidChannel, PaidJobAuthorizationV2,
     PaidJobResultV1, PaidWorkError, PrivateRecord,
 };
-use super::work_fetch::{self, FetchRoutePolicy, PaidFetchPolicyV1, PreparedPaidFetchInputV1};
+use super::work_fetch::{self, FetchPolicyV2, FetchRoutePolicy, PreparedPaidFetchInputV1};
 use crate::{ContentId, Digest, OutputEventEnvelope};
 
+/// Identity bindings independent of the payment obligations. This contains no
+/// financial edge, credit, clock or settlement constructor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WorkContext {
+    pub network: hellas_kernel::NetworkId,
+    pub channel: Digest,
+    pub client: hellas_kernel::Key,
+    pub provider: hellas_kernel::Key,
+}
+impl From<&PaidChannel> for WorkContext {
+    fn from(channel: &PaidChannel) -> Self {
+        Self {
+            network: channel.network(),
+            channel: channel.id(),
+            client: channel.client_key(),
+            provider: channel.provider_key(),
+        }
+    }
+}
+
+/// Application commitments, independent of how the job was funded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JobInputBinding {
+    pub prepared_input_digest: Digest,
+    pub request_commitment: crate::RequestCommitment,
+    pub environment_commitment: ContentId,
+}
+impl From<&PaidJobAuthorizationV2> for JobInputBinding {
+    fn from(auth: &PaidJobAuthorizationV2) -> Self {
+        Self {
+            prepared_input_digest: auth.prepared_input_digest,
+            request_commitment: auth.request_commitment,
+            environment_commitment: auth.environment_commitment,
+        }
+    }
+}
 /// The execution contract fixed when a channel is mounted.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum PaidWorkPolicy {
+pub enum WorkPolicy {
     /// Reproducible local evaluation.
-    Evaluate(PaidExecutionPolicyV1),
+    Evaluate(EvaluatePolicyV2),
     /// An authenticated fetch transcript under the committed route policy.
     Fetch {
-        /// Fixed-width resource and price envelope.
-        policy: PaidFetchPolicyV1,
+        /// Fixed-width resource envelope.
+        policy: FetchPolicyV2,
         /// Canonical body opening the policy's route commitment.
         route: FetchRoutePolicy,
     },
 }
 
-impl From<PaidExecutionPolicyV1> for PaidWorkPolicy {
-    fn from(policy: PaidExecutionPolicyV1) -> Self {
+impl From<EvaluatePolicyV2> for WorkPolicy {
+    fn from(policy: EvaluatePolicyV2) -> Self {
         Self::Evaluate(policy)
     }
 }
 
-impl PaidWorkPolicy {
+impl WorkPolicy {
     /// Checks the envelope and opens every variable policy commitment.
     pub fn check(&self) -> Result<(), PaidWorkError> {
         match self {
-            Self::Evaluate(policy) => work::check_execution_policy(policy),
+            Self::Evaluate(policy) => work::check_work_policy(policy),
             Self::Fetch { policy, route } => {
                 work_fetch::check_fetch_policy(policy)?;
                 let body = route.canonical_body_bytes();
@@ -64,14 +100,6 @@ impl PaidWorkPolicy {
         }
     }
 
-    /// Fixed price both endpoints derive before admission.
-    pub const fn fixed_price(&self) -> u64 {
-        match self {
-            Self::Evaluate(p) => p.fixed_price,
-            Self::Fetch { policy, .. } => policy.fixed_price,
-        }
-    }
-
     /// Maximum retained encoded transcript.
     pub const fn max_spool_bytes(&self) -> u64 {
         match self {
@@ -88,36 +116,25 @@ impl PaidWorkPolicy {
         }
     }
 
-    /// Dispatch, delivery, and oracle grace margins, in finalized blocks.
-    pub const fn margins(&self) -> (u64, u64, u64) {
-        match self {
-            Self::Evaluate(p) => (
-                p.dispatch_margin_blocks,
-                p.delivery_margin_blocks,
-                p.oracle_grace_blocks,
-            ),
-            Self::Fetch { policy: p, .. } => (
-                p.dispatch_margin_blocks,
-                p.delivery_margin_blocks,
-                p.oracle_grace_blocks,
-            ),
-        }
-    }
-
     /// Checks a proposal against this profile's commitment and envelope.
     pub fn check_authorization(
         &self,
         channel: &PaidChannel,
-        authorization: &PaidJobAuthorizationV1,
+        payment: &JobPaymentPolicyV2,
+        authorization: &PaidJobAuthorizationV2,
         height: u64,
     ) -> Result<Digest, PaidWorkError> {
         match self {
             Self::Evaluate(policy) => {
-                work::check_authorization(channel, authorization, policy, height)
+                work::check_authorization(channel, authorization, policy, payment, height)
             }
-            Self::Fetch { policy, .. } => {
-                work_fetch::check_fetch_authorization(channel, authorization, policy, height)
-            }
+            Self::Fetch { policy, .. } => work_fetch::check_fetch_authorization(
+                channel,
+                authorization,
+                policy,
+                payment,
+                height,
+            ),
         }
     }
 
@@ -125,16 +142,19 @@ impl PaidWorkPolicy {
     pub fn propose(
         &self,
         channel: &PaidChannel,
-        input: &PreparedPaidWorkInput,
+        payment: &JobPaymentPolicyV2,
+        input: &PreparedWorkInput,
         nonce: u64,
         deadlines: JobDeadlines,
-    ) -> Result<PaidJobAuthorizationV1, PaidWorkError> {
+    ) -> Result<PaidJobAuthorizationV2, PaidWorkError> {
         match (self, input) {
-            (Self::Evaluate(policy), PreparedPaidWorkInput::Evaluate(input)) => {
-                work::propose_authorization(channel, policy, input, nonce, deadlines)
+            (Self::Evaluate(policy), PreparedWorkInput::Evaluate(input)) => {
+                work::propose_authorization(channel, policy, payment, input, nonce, deadlines)
             }
-            (Self::Fetch { policy, .. }, PreparedPaidWorkInput::Fetch(input)) => {
-                work_fetch::propose_fetch_authorization(channel, policy, input, nonce, deadlines)
+            (Self::Fetch { policy, .. }, PreparedWorkInput::Fetch(input)) => {
+                work_fetch::propose_fetch_authorization(
+                    channel, policy, payment, input, nonce, deadlines,
+                )
             }
             _ => Err(PaidWorkError::Mismatch {
                 field: "paid work profile",
@@ -146,21 +166,25 @@ impl PaidWorkPolicy {
     pub fn check_input(
         &self,
         channel: &PaidChannel,
-        authorization: &PaidJobAuthorizationV1,
-        input: &PreparedPaidWorkInput,
+        authorization: &PaidJobAuthorizationV2,
+        input: &PreparedWorkInput,
+    ) -> Result<(), PaidWorkError> {
+        self.check_bound_input(&channel.into(), &authorization.into(), input)
+    }
+
+    /// Validates the same resource contract under either funding model.
+    pub fn check_bound_input(
+        &self,
+        context: &WorkContext,
+        binding: &JobInputBinding,
+        input: &PreparedWorkInput,
     ) -> Result<(), PaidWorkError> {
         match (self, input) {
-            (Self::Evaluate(policy), PreparedPaidWorkInput::Evaluate(input)) => {
-                work::check_prepared_input(channel, authorization, policy, input)
+            (Self::Evaluate(policy), PreparedWorkInput::Evaluate(input)) => {
+                work::check_bound_evaluate_input(context, binding, policy, input)
             }
-            (Self::Fetch { policy, route }, PreparedPaidWorkInput::Fetch(input)) => {
-                work_fetch::check_prepared_fetch_input(
-                    channel,
-                    authorization,
-                    policy,
-                    route,
-                    input,
-                )?;
+            (Self::Fetch { policy, route }, PreparedWorkInput::Fetch(input)) => {
+                work_fetch::check_bound_fetch_input(context, binding, policy, route, input)?;
                 let parts = input.parts()?;
                 let request = crate::fetch::verify_input_events(&parts.fetch_input_transcript)
                     .map_err(|error| PaidWorkError::Transcript(error.to_string()))?;
@@ -181,18 +205,46 @@ impl PaidWorkPolicy {
     pub fn terminal_result(
         &self,
         channel: &PaidChannel,
-        authorization: &PaidJobAuthorizationV1,
-        input: &PreparedPaidWorkInput,
+        authorization: &PaidJobAuthorizationV2,
+        input: &PreparedWorkInput,
         transcript: &[OutputEventEnvelope],
     ) -> Result<PaidJobResultV1, PaidWorkError> {
-        self.check_input(channel, authorization, input)?;
+        self.bound_terminal_result(
+            &channel.into(),
+            work::work_id(channel, authorization),
+            &authorization.into(),
+            input,
+            transcript,
+        )
+    }
+
+    /// A verified result has the same record and digest for either funding.
+    pub fn bound_terminal_result(
+        &self,
+        context: &WorkContext,
+        work_id: Digest,
+        binding: &JobInputBinding,
+        input: &PreparedWorkInput,
+        transcript: &[OutputEventEnvelope],
+    ) -> Result<PaidJobResultV1, PaidWorkError> {
+        self.check_bound_input(context, binding, input)?;
         if let Self::Fetch { policy, .. } = self {
             work_fetch::check_fetch_output_limits(policy, transcript)?;
         }
-        input.terminal_result(channel, authorization, transcript)
+        input.bound_terminal_result(context, work_id, binding, transcript)
     }
 
-    /// Canonical bytes retained in a close descriptor. Evaluate bytes are unchanged.
+    /// Commits to this resource policy in a funding-separated channel.
+    pub fn digest(&self, network: hellas_kernel::NetworkId, channel: Digest) -> Digest {
+        match self {
+            Self::Evaluate(p) => work::evaluate_policy_v2_digest(network, channel, p),
+            Self::Fetch { policy, .. } => {
+                work_fetch::fetch_policy_v2_digest(network, channel, policy)
+            }
+        }
+    }
+
+    /// Canonical bytes retained in a close descriptor. Both profiles use their V2 record tags.
     pub fn encode(&self) -> Vec<u8> {
         match self {
             Self::Evaluate(policy) => policy.encode(),
@@ -206,16 +258,16 @@ impl PaidWorkPolicy {
 
     /// Strictly decodes one complete profile policy.
     pub fn decode(bytes: &[u8]) -> Result<Self, PaidWorkError> {
-        let profile = if bytes.get(1) == Some(&5) {
+        let profile = if bytes.get(1) == Some(&7) {
             let (record, body) = bytes
-                .split_at_checked(PaidFetchPolicyV1::ENCODED_SIZE)
+                .split_at_checked(FetchPolicyV2::ENCODED_SIZE)
                 .ok_or_else(|| CanonicalDecodeError::new("truncated fetch policy"))?;
             Self::Fetch {
-                policy: PaidFetchPolicyV1::decode(record)?,
+                policy: FetchPolicyV2::decode(record)?,
                 route: FetchRoutePolicy::from_canonical_body_bytes(body)?,
             }
         } else {
-            Self::Evaluate(PaidExecutionPolicyV1::decode(bytes)?)
+            Self::Evaluate(EvaluatePolicyV2::decode(bytes)?)
         };
         profile.check()?;
         Ok(profile)
@@ -228,26 +280,26 @@ impl PaidWorkPolicy {
 /// Fetch exactly two. Both decoders reject trailing bytes. Dispatch therefore
 /// preserves existing Evaluate bytes without guessing from unsigned metadata.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum PreparedPaidWorkInput {
+pub enum PreparedWorkInput {
     /// The committed local artifact graph.
     Evaluate(PreparedPaidInputV1),
     /// The signed fetch request and its manifest.
     Fetch(PreparedPaidFetchInputV1),
 }
 
-impl From<PreparedPaidInputV1> for PreparedPaidWorkInput {
+impl From<PreparedPaidInputV1> for PreparedWorkInput {
     fn from(input: PreparedPaidInputV1) -> Self {
         Self::Evaluate(input)
     }
 }
 
-impl From<PreparedPaidFetchInputV1> for PreparedPaidWorkInput {
+impl From<PreparedPaidFetchInputV1> for PreparedWorkInput {
     fn from(input: PreparedPaidFetchInputV1) -> Self {
         Self::Fetch(input)
     }
 }
 
-impl PreparedPaidWorkInput {
+impl PreparedWorkInput {
     /// Decodes a complete bounded bundle under exactly one profile.
     pub fn decode(bytes: &[u8], budget: usize) -> Result<Self, CanonicalDecodeError> {
         if let Ok(input) = PreparedPaidInputV1::decode(bytes, budget) {
@@ -292,9 +344,20 @@ impl PreparedPaidWorkInput {
 
     /// Recomputes the prepared-input commitment during journal replay.
     pub fn digest(&self, channel: &PaidChannel) -> Result<Digest, PaidWorkError> {
+        self.bound_digest(channel.network(), channel.id())
+    }
+
+    /// Prepared-input bytes and domains are unchanged across funding models.
+    pub fn bound_digest(
+        &self,
+        network: hellas_kernel::NetworkId,
+        channel: Digest,
+    ) -> Result<Digest, PaidWorkError> {
         match self {
-            Self::Evaluate(input) => work::prepared_input_digest(channel, input),
-            Self::Fetch(input) => work_fetch::prepared_fetch_input_digest(channel, input),
+            Self::Evaluate(input) => work::bound_prepared_input_digest(network, channel, input),
+            Self::Fetch(input) => {
+                work_fetch::bound_prepared_fetch_input_digest(network, channel, input)
+            }
         }
     }
 
@@ -302,22 +365,44 @@ impl PreparedPaidWorkInput {
     pub fn terminal_result(
         &self,
         channel: &PaidChannel,
-        authorization: &PaidJobAuthorizationV1,
+        authorization: &PaidJobAuthorizationV2,
+        transcript: &[OutputEventEnvelope],
+    ) -> Result<PaidJobResultV1, PaidWorkError> {
+        self.bound_terminal_result(
+            &channel.into(),
+            work::work_id(channel, authorization),
+            &authorization.into(),
+            transcript,
+        )
+    }
+
+    /// Rebuilds a result from resource identity rather than payment terms.
+    pub fn bound_terminal_result(
+        &self,
+        context: &WorkContext,
+        work_id: Digest,
+        binding: &JobInputBinding,
         transcript: &[OutputEventEnvelope],
     ) -> Result<PaidJobResultV1, PaidWorkError> {
         match self {
-            Self::Evaluate(_) => work::terminal_result(channel, authorization, transcript),
+            Self::Evaluate(_) => work::bound_evaluate_terminal_result(
+                context,
+                work_id,
+                binding.request_commitment,
+                transcript,
+            ),
             Self::Fetch(bundle) => {
                 let parts = bundle.parts()?;
                 let input = crate::fetch::verify_input_events(&parts.fetch_input_transcript)
                     .map_err(|e| PaidWorkError::Transcript(e.to_string()))?;
-                let (result, output) = work_fetch::verify_terminal_fetch_result(
-                    channel,
-                    authorization,
+                let (result, output) = work_fetch::bound_fetch_terminal_result(
+                    context,
+                    work_id,
+                    binding.request_commitment,
                     transcript,
                     input.assurance,
                 )?;
-                if input.input_commitment.digest() != authorization.request_commitment.digest() {
+                if input.input_commitment.digest() != binding.request_commitment.digest() {
                     return Err(PaidWorkError::Mismatch {
                         field: "Fetch input commitment",
                     });
@@ -332,5 +417,21 @@ impl PreparedPaidWorkInput {
                 Ok(result)
             }
         }
+    }
+}
+
+impl crate::pb::work::WorkRoute {
+    /// Selects a payment-funded channel without granting authority to use it.
+    pub fn payment(channel_id: Digest) -> Self {
+        Self {
+            funding_kind: crate::pb::work::FundingKind::Payment as i32,
+            channel_id: channel_id.as_bytes().to_vec(),
+        }
+    }
+
+    /// Checks the routing selector before any journal lookup or release.
+    pub fn selects_payment(&self, channel_id: Digest) -> bool {
+        self.funding_kind == crate::pb::work::FundingKind::Payment as i32
+            && self.channel_id == channel_id.as_bytes()
     }
 }

@@ -32,6 +32,8 @@ pub enum ProviderError {
     MissingPaidRoute,
     #[error("Fetch provider requires a paid Fetch policy")]
     WrongPaidPolicy,
+    #[error("provider enrollment differs from its runtime identity")]
+    Identity,
     #[error("invalid provider settlement key")]
     SettlementKey,
     #[error(transparent)]
@@ -185,10 +187,10 @@ where
     #[cfg(feature = "paid-provider")]
     if let Some(config) = &options.paid_work {
         use hellas_rpc::protocol::{
-            work_fetch::FetchRoutePolicy as PaidRoute, work_profile::PaidWorkPolicy,
+            work_fetch::FetchRoutePolicy as PaidRoute, work_profile::WorkPolicy,
         };
-        match &config.execution_policy {
-            PaidWorkPolicy::Fetch {
+        match &config.work_policy {
+            WorkPolicy::Fetch {
                 policy,
                 route: PaidRoute::SealedRoute { service, method },
             } => {
@@ -202,7 +204,7 @@ where
                     return Err(ProviderError::MissingPaidRoute);
                 }
             }
-            PaidWorkPolicy::Fetch {
+            WorkPolicy::Fetch {
                 policy,
                 route: PaidRoute::OpenFetch { .. },
             } => {
@@ -214,12 +216,22 @@ where
         }
         crate::work_config::validate_work_routes(config)?;
     }
+    hellas_rpc::protocol::work_offer::check_provider(&options.enrollment)
+        .map_err(|_| ProviderError::Identity)?;
+    if options.enrollment.genesis.statement.producer_public_key
+        != options.identity.caller_key().public_key()
+        || options.enrollment.genesis.statement.transport_public_key
+            != hellas_rpc::PublicKey::Ed25519(*options.identity.node_id().as_bytes())
+    {
+        return Err(ProviderError::Identity);
+    }
+    let assurance = match options.enrollment.genesis.statement.root_kind {
+        hellas_rpc::RootKind::Software => Assurance::ProducerSigned,
+        hellas_rpc::RootKind::SecureEnclave => Assurance::AppleAppAttest,
+    };
     let producer_key = Arc::new(options.identity.caller_key().clone());
-    let mut executor_config = ExecutorSpawnConfig::fetch_only(
-        producer_key.clone(),
-        Assurance::AppleAppAttest,
-        options.routes,
-    );
+    let mut executor_config =
+        ExecutorSpawnConfig::fetch_only(producer_key.clone(), assurance, options.routes);
     executor_config.fetch_max_in_flight = options.fetch_max_in_flight;
     executor_config.fetch_queue_capacity = options.fetch_queue_capacity;
     let executor = Executor::spawn_configured(executor_config).await?;
@@ -260,6 +272,7 @@ where
         None
     };
     let open = ProviderOpen {
+        signer: producer_key.clone(),
         root: options.root,
         enrollment: options.enrollment,
     };
@@ -324,46 +337,23 @@ where
                 let transport = Arc::new(IrohTransport::new(connection));
                 #[cfg(feature = "paid-provider")]
                 if has_paid_work && alpn == hellas_rpc::services::work::Work::ALPN.as_bytes() {
-                    let context = transport.context();
-                    if let Some(handler) = work_mount.handler(&context) {
-                        let server = OpenDispatcher::<_, _, hellas_rpc::services::work::Open>::new(
-                            hellas_rpc::services::work::WorkServer(handler),
-                            open,
-                        );
-                        serve(transport, server).await;
-                    } else {
-                        let server = OpenDispatcher::<_, _, hellas_rpc::services::work::Open>::new(
-                            hellas_rpc::services::work::WorkServer(
-                                crate::paid_provider::UnmountedWork,
-                            ),
-                            open,
-                        );
-                        serve(transport, server).await;
-                    }
+                    let server = OpenDispatcher::<_, _, hellas_rpc::services::work::Open>::new(
+                        hellas_rpc::services::work::WorkServer(work_mount),
+                        open,
+                    );
+                    serve(transport, server).await;
                     return;
                 }
                 #[cfg(feature = "paid-provider")]
                 if has_paid_work
                     && alpn == hellas_rpc::services::work_setup::WorkSetup::ALPN.as_bytes()
                 {
-                    let context = transport.context();
-                    if let Some(handler) = setup_mount.service(&context) {
-                        let server =
-                            OpenDispatcher::<_, _, hellas_rpc::services::work_setup::Open>::new(
-                                hellas_rpc::services::work_setup::WorkSetupServer(handler),
-                                open,
-                            );
-                        serve(transport, server).await;
-                    } else {
-                        let server =
-                            OpenDispatcher::<_, _, hellas_rpc::services::work_setup::Open>::new(
-                                hellas_rpc::services::work_setup::WorkSetupServer(
-                                    crate::paid_provider::UnmountedWork,
-                                ),
-                                open,
-                            );
-                        serve(transport, server).await;
-                    }
+                    let server =
+                        OpenDispatcher::<_, _, hellas_rpc::services::work_setup::Open>::new(
+                            hellas_rpc::services::work_setup::WorkSetupServer(setup_mount),
+                            open,
+                        );
+                    serve(transport, server).await;
                 }
             });
         }
@@ -409,6 +399,7 @@ where
 mod tests;
 
 struct ProviderOpen<R> {
+    signer: Arc<hellas_rpc::ProducerSigningKey>,
     root: Arc<R>,
     enrollment: ProviderEnrollmentBundle,
 }
@@ -416,6 +407,7 @@ struct ProviderOpen<R> {
 impl<R> Clone for ProviderOpen<R> {
     fn clone(&self) -> Self {
         Self {
+            signer: self.signer.clone(),
             root: self.root.clone(),
             enrollment: self.enrollment.clone(),
         }
@@ -454,20 +446,30 @@ where
             self.enrollment.content_id(),
             alpn,
         );
-        let proof = match self
-            .root
-            .prove_open_binding(binding)
-            .await
-            .map_err(|error| {
-                tracing::warn!(%error, "provider open proof generation failed");
-                WireStatus::internal("provider open proof generation failed")
-            })? {
-            RootProof::Software(signature) => {
-                open_response::Proof::ProducerSignature(signature_to_pb(&signature))
+        let proof = match self.enrollment.genesis.statement.root_kind {
+            hellas_rpc::RootKind::Software => {
+                open_response::Proof::ProducerSignature(signature_to_pb(
+                    &self
+                        .signer
+                        .sign_digest(binding)
+                        .map_err(|_| WireStatus::internal("provider signature failed"))?,
+                ))
             }
-            RootProof::AppleAppAttest(assertion) => {
-                open_response::Proof::AppleAppAttestAssertion(assertion)
-            }
+            hellas_rpc::RootKind::SecureEnclave => match self
+                .root
+                .prove_open_binding(binding)
+                .await
+                .map_err(|_| WireStatus::internal("provider open assertion failed"))?
+            {
+                RootProof::AppleAppAttest(assertion) => {
+                    open_response::Proof::AppleAppAttestAssertion(assertion)
+                }
+                _ => {
+                    return Err(WireStatus::internal(
+                        "provider root returned incompatible proof",
+                    ));
+                }
+            },
         };
         Ok(OpenResponse {
             provider_genesis: self.enrollment.canonical_bytes(),

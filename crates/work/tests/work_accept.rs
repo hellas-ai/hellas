@@ -25,9 +25,9 @@ use hellas_rpc::protocol::artifacts::{
     SourceRef, TextArtifact, TextExecution, TextPolicy, TokenIds,
 };
 use hellas_rpc::protocol::work::{
-    JobDeadlines, PaidChannel, PaidChannelPolicyV1, PaidExecutionPolicyV1, PaidJobAuthorizationV1,
-    PrivateRecord as _, execution_policy_digest, generation_policy_digest, identity_source_digest,
-    prepared_input_digest, private_policy_commitment, propose_authorization, signing_hash, work_id,
+    EvaluatePolicyV2, JobDeadlines, PaidChannel, PaidChannelPolicyV1, PaidJobAuthorizationV2,
+    PrivateRecord as _, generation_policy_digest, identity_source_digest, prepared_input_digest,
+    private_policy_commitment, propose_authorization, signing_hash, work_id, work_policy_digest,
 };
 use hellas_rpc::protocol::work_setup::{
     ObservedChannel, ReadyChannel, WorkChannelConfig, WorkChannelDescriptor, payment_terms_hash,
@@ -45,8 +45,7 @@ use hellas_work::work::{
 };
 use hellas_work::work_close::{BlockSourceError, CatchUpError, FinalizedBlocks, FinalizedWork};
 use hellas_work::work_store::{
-    ChannelRecord, ChannelState, ChannelStore, JobPhase, JobState, Role, SetupOrigin,
-    TerminalOutcome,
+    Channel, ChannelRecord, ChannelStore, JobPhase, JobState, Role, SetupOrigin, TerminalOutcome,
 };
 
 mod support;
@@ -104,8 +103,8 @@ fn payment_terms() -> WorkPaymentTerms {
     }
 }
 
-fn execution_policy() -> PaidExecutionPolicyV1 {
-    PaidExecutionPolicyV1 {
+fn work_policy() -> EvaluatePolicyV2 {
+    EvaluatePolicyV2 {
         allowed_environment: manifest().content_id(),
         generation_policy_digest: match generation_policy_digest(&text_policy().canonical_bytes()) {
             Ok(digest) => digest,
@@ -121,11 +120,7 @@ fn execution_policy() -> PaidExecutionPolicyV1 {
         max_stop_token_ids: 4,
         max_spool_bytes: 1_048_576,
         max_encoded_result_frame: 262_144,
-        max_encoded_quote_response: 1_048_576,
-        dispatch_margin_blocks: 4,
-        delivery_margin_blocks: 2,
-        oracle_grace_blocks: 6,
-        fixed_price: PRICE,
+        max_encoded_prepared_input: 1_048_576,
     }
 }
 
@@ -134,17 +129,18 @@ fn payment_values() -> EdgeValues {
 }
 
 fn descriptor() -> WorkChannelDescriptor {
-    descriptor_with_policy(execution_policy())
+    descriptor_with_policy(work_policy())
 }
 
-fn descriptor_with_policy(policy: PaidExecutionPolicyV1) -> WorkChannelDescriptor {
+fn descriptor_with_policy(policy: EvaluatePolicyV2) -> WorkChannelDescriptor {
     let config = WorkChannelConfig {
+        payment_policy: payment_policy(),
         network: network(),
         payment_edge: payment_edge(),
         payment_terms: payment_terms(),
         policy_salt: SALT,
         channel_policy: channel_policy(),
-        execution_policy: policy.into(),
+        work_policy: policy.into(),
         expected_payment_values: payment_values(),
     };
     match WorkChannelDescriptor::open(config) {
@@ -319,10 +315,11 @@ fn proposal(nonce: u8) -> JobProposal {
 
 /// The authorization the client would build for one proposal at one
 /// nonce, computed here rather than taken from the endpoint.
-fn authorization(nonce: u8, proposal_nonce: u64) -> PaidJobAuthorizationV1 {
+fn authorization(nonce: u8, proposal_nonce: u64) -> PaidJobAuthorizationV2 {
     match propose_authorization(
         ready().channel(),
-        &execution_policy(),
+        &work_policy(),
+        &payment_policy(),
         &bundle(nonce),
         proposal_nonce,
         deadlines(),
@@ -334,8 +331,11 @@ fn authorization(nonce: u8, proposal_nonce: u64) -> PaidJobAuthorizationV1 {
 
 /// A request built by hand rather than by the client endpoint, so a
 /// provider test can vary exactly one field of it.
-fn request(authorization: &PaidJobAuthorizationV1, signature: Sig, nonce: u8) -> AcceptWorkRequest {
+fn request(authorization: &PaidJobAuthorizationV2, signature: Sig, nonce: u8) -> AcceptWorkRequest {
     AcceptWorkRequest {
+        route: Some(hellas_rpc::pb::work::WorkRoute::payment(
+            authorization.channel_id,
+        )),
         authorization: authorization.encode(),
         client_signature: signature.as_bytes().to_vec(),
         prepared_input: bundle_bytes(nonce),
@@ -353,7 +353,8 @@ fn signed_request_with(
 ) -> AcceptWorkRequest {
     let authorization = match propose_authorization(
         ready().channel(),
-        &execution_policy(),
+        &work_policy(),
+        &payment_policy(),
         &bundle(nonce),
         proposal_nonce,
         deadlines,
@@ -1134,7 +1135,7 @@ fn a_retained_proposal_survives_restart_expiry_and_policy_change() {
     let response = provider_endpoint.accept(&first);
     drop(endpoint); // The provider response was lost before journaling.
 
-    let mut policy = execution_policy();
+    let mut policy = work_policy();
     policy.allowed_environment = ContentId::from_bytes([0x99; 32]);
     let changed = ready_with_descriptor(descriptor_with_policy(policy));
     let reopened = at_height(
@@ -1150,19 +1151,91 @@ fn a_retained_proposal_survives_restart_expiry_and_policy_change() {
 }
 
 #[test]
-fn a_different_proposal_while_one_is_outstanding_opens_concurrently() {
+fn a_different_proposal_waits_for_the_outstanding_reply() {
     let root = temp();
     let mut endpoint = client_endpoint(root.path());
-    let Ok(_) = endpoint.propose(&proposal(1)) else {
-        panic!("the first proposal is built");
-    };
-    let second = endpoint.propose(&proposal(2));
-    assert!(
-        second.is_ok(),
-        "a second job may share the channel, got {second:?}",
+    let first = endpoint.propose(&proposal(1)).unwrap();
+    assert!(matches!(
+        endpoint.propose(&proposal(2)),
+        Err(ProposeError::Conflict)
+    ));
+    assert_eq!(endpoint.state().jobs().len(), 1);
+    assert_eq!(endpoint.state().proposal_nonce_high_water(), 1);
+    assert_eq!(endpoint.propose(&proposal(1)).unwrap(), first);
+    let provider_root = temp();
+    let mut provider_endpoint = provider_endpoint(provider_root.path());
+    let response = provider_endpoint.accept(&first);
+    endpoint.accepted(&response).unwrap();
+    assert!(endpoint.propose(&proposal(2)).is_ok());
+    assert_eq!(
+        endpoint.state().jobs().len(),
+        2,
+        "accepted executions still overlap"
     );
-    assert_eq!(endpoint.state().jobs().len(), 2);
     assert_eq!(endpoint.state().proposal_nonce_high_water(), 2);
+    let pending = endpoint.state().job_book().pending_proposal();
+    assert!(matches!(
+        endpoint.accepted(&response),
+        Err(ProposeError::Conflict)
+    ));
+    assert_eq!(
+        endpoint.state().job_book().pending_proposal(),
+        pending,
+        "a signed reply for another job cannot answer this exchange"
+    );
+}
+
+#[test]
+fn a_known_refusal_releases_only_the_proposal_slot_durably() {
+    let root = temp();
+    let mut endpoint = client_endpoint(root.path());
+    let first = endpoint.propose(&proposal(1)).unwrap();
+    let id = endpoint.state().job_book().pending_proposal().unwrap();
+    let refused = AcceptWorkResponse {
+        outcome: Some(Outcome::Refused(WorkRefused {
+            code: WorkRefusalCode::NotReady as i32,
+            reason: String::new(),
+        })),
+    };
+    assert!(matches!(
+        endpoint.accepted(&refused),
+        Err(ProposeError::Refused { .. })
+    ));
+    assert_eq!(endpoint.state().job_book().pending_proposal(), None);
+    assert_eq!(
+        endpoint.state().job_by_id(id).unwrap().phase(),
+        JobPhase::HalfSigned
+    );
+    drop(endpoint);
+    let mut reopened = client_endpoint(root.path());
+    assert_eq!(reopened.state().job_book().pending_proposal(), None);
+    assert_eq!(reopened.resume_proposal(id).unwrap(), first);
+    assert_eq!(reopened.state().job_book().pending_proposal(), Some(id));
+    assert!(matches!(
+        reopened.propose(&proposal(2)),
+        Err(ProposeError::Conflict)
+    ));
+    reopened.accepted(&refused).unwrap_err();
+    assert!(reopened.propose(&proposal(2)).is_ok());
+    assert_eq!(reopened.state().jobs().len(), 2);
+}
+
+#[test]
+fn a_lost_reply_blocks_new_nonces_across_restart_and_malformed_replies() {
+    let root = temp();
+    let mut endpoint = client_endpoint(root.path());
+    let request = endpoint.propose(&proposal(1)).unwrap();
+    let id = endpoint.state().job_book().pending_proposal().unwrap();
+    drop(endpoint);
+    let mut reopened = client_endpoint(root.path());
+    assert!(matches!(
+        reopened.propose(&proposal(2)),
+        Err(ProposeError::Conflict)
+    ));
+    assert!(reopened.accepted(&AcceptWorkResponse::default()).is_err());
+    assert_eq!(reopened.state().job_book().pending_proposal(), Some(id));
+    assert_eq!(reopened.resume_proposal(id).unwrap(), request);
+    assert_eq!(reopened.state().proposal_nonce_high_water(), 1);
 }
 
 #[test]
@@ -1314,7 +1387,7 @@ fn accepted_response(signature: Sig) -> AcceptWorkResponse {
     }
 }
 
-fn phase_of(state: &ChannelState) -> Option<JobPhase> {
+fn phase_of(state: &Channel) -> Option<JobPhase> {
     state.jobs().next().map(JobState::phase)
 }
 
@@ -1424,7 +1497,7 @@ fn a_retry_after_the_deadline_still_returns_the_retained_signature() {
         deadlines().acceptance + 1,
     );
     let service = WorkService::close_only(CloseEndpoint::new(late, provider()).unwrap());
-    let checkpoint = service.with_state(ChannelState::checkpoint).unwrap();
+    let checkpoint = service.with_state(Channel::checkpoint).unwrap();
     let mut caller = client_endpoint(client_root.path());
     assert_eq!(phase_of(caller.state()), Some(JobPhase::HalfSigned));
     let id = work_id(ready().channel(), &authorization(1, 1));
@@ -1443,10 +1516,7 @@ fn a_retry_after_the_deadline_still_returns_the_retained_signature() {
         "an answer already given is not unsaid by a passing height",
     );
     assert_eq!(service.accept(&resumed), again);
-    assert_eq!(
-        service.with_state(ChannelState::checkpoint).unwrap(),
-        checkpoint
-    );
+    assert_eq!(service.with_state(Channel::checkpoint).unwrap(), checkpoint);
     assert_eq!(caller.accepted(&again).unwrap(), id);
     assert_eq!(phase_of(caller.state()), Some(JobPhase::Accepted));
 
@@ -1463,7 +1533,7 @@ fn a_retry_after_the_deadline_still_returns_the_retained_signature() {
         )
         .unwrap();
     let service = WorkService::close_only(CloseEndpoint::new(ended, provider()).unwrap());
-    let checkpoint = service.with_state(ChannelState::checkpoint).unwrap();
+    let checkpoint = service.with_state(Channel::checkpoint).unwrap();
     assert_eq!(
         refusal_code(&service.precheck_acceptance(&forged).unwrap()),
         WorkRefusalCode::Invalid
@@ -1472,10 +1542,7 @@ fn a_retry_after_the_deadline_still_returns_the_retained_signature() {
         refusal_code(&service.precheck_acceptance(&resumed).unwrap()),
         WorkRefusalCode::Conflict
     );
-    assert_eq!(
-        service.with_state(ChannelState::checkpoint).unwrap(),
-        checkpoint
-    );
+    assert_eq!(service.with_state(Channel::checkpoint).unwrap(), checkpoint);
 }
 
 #[test]
@@ -1541,7 +1608,7 @@ fn an_authorization_past_its_acceptance_deadline_expires() {
     let service = WorkService::close_only(
         CloseEndpoint::new(store(root.path(), Role::Provider), provider()).unwrap(),
     );
-    let checkpoint = service.with_state(ChannelState::checkpoint).unwrap();
+    let checkpoint = service.with_state(Channel::checkpoint).unwrap();
     let expired = signed_request(1, 1);
     assert_eq!(
         refusal_code(&service.precheck_acceptance(&expired).unwrap()),
@@ -1580,10 +1647,7 @@ fn an_authorization_past_its_acceptance_deadline_expires() {
         refusal_code(&service.accept(&fresh)),
         WorkRefusalCode::NotReady
     );
-    assert_eq!(
-        service.with_state(ChannelState::checkpoint).unwrap(),
-        checkpoint
-    );
+    assert_eq!(service.with_state(Channel::checkpoint).unwrap(), checkpoint);
 }
 
 #[test]
@@ -1650,7 +1714,8 @@ fn a_bundle_the_policy_does_not_allow_is_refused_though_its_digest_matches() {
     ] {
         let authorization = match propose_authorization(
             ready().channel(),
-            &execution_policy(),
+            &work_policy(),
+            &payment_policy(),
             &bundle,
             1,
             deadlines(),
@@ -1663,6 +1728,9 @@ fn a_bundle_the_policy_does_not_allow_is_refused_though_its_digest_matches() {
             panic!("{what} encodes");
         };
         let response = endpoint.accept(&AcceptWorkRequest {
+            route: Some(hellas_rpc::pb::work::WorkRoute::payment(
+                authorization.channel_id,
+            )),
             authorization: authorization.encode(),
             client_signature: signature.as_bytes().to_vec(),
             prepared_input: bytes,
@@ -1908,7 +1976,7 @@ fn an_endpoint_needs_its_own_store_settlement_role_and_key() {
 #[test]
 fn the_authorization_derives_every_field_it_does_not_choose() {
     let channel = ready().channel().clone();
-    let policy = execution_policy();
+    let policy = work_policy();
     let built = authorization(7, 3);
     let request = evaluate_request(7);
 
@@ -1924,8 +1992,8 @@ fn the_authorization_derives_every_field_it_does_not_choose() {
         payment_terms_hash(payment_terms()),
     );
     assert_eq!(
-        built.execution_policy_digest,
-        execution_policy_digest(&channel, &policy),
+        built.work_policy_digest,
+        work_policy_digest(&channel, &policy),
     );
     assert_eq!(
         built.prepared_input_digest,
@@ -1938,7 +2006,7 @@ fn the_authorization_derives_every_field_it_does_not_choose() {
     assert_eq!(built.acceptance_deadline, deadlines().acceptance);
     assert_eq!(built.request_commitment, Evaluate::commit_request(&request));
     assert_eq!(built.environment_commitment, manifest().content_id());
-    assert_eq!(built.price, policy.fixed_price);
+    assert_eq!(built.price, payment_policy().fixed_price);
     assert_eq!(built.terminal_deadline, deadlines().terminal);
     assert_eq!(built.payment_deadline, deadlines().payment);
 
@@ -1965,8 +2033,8 @@ fn the_wire_carries_the_authorization_the_signature_covers() {
     );
     assert_eq!(
         request.authorization.get(..2),
-        Some(&[1_u8, 2_u8][..]),
-        "format version 1, private record tag 2",
+        Some(&[1_u8, 9_u8][..]),
+        "format version 1, private record tag 9",
     );
     assert_eq!(request.prepared_input, bundle_bytes(1));
 
@@ -2121,4 +2189,13 @@ fn managed_observers_start_closed_and_old_tips_cannot_renew_expired_readiness() 
         0
     );
     assert_eq!(provider.with_state(|state| state.jobs().len()).unwrap(), 0);
+}
+
+fn payment_policy() -> hellas_rpc::protocol::work::JobPaymentPolicyV2 {
+    hellas_rpc::protocol::work::JobPaymentPolicyV2 {
+        fixed_price: PRICE,
+        dispatch_margin_blocks: 4,
+        delivery_margin_blocks: 2,
+        oracle_grace_blocks: 6,
+    }
 }

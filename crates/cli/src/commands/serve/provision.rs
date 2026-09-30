@@ -23,5 +23,17 @@ pub async fn run_provision(options: ProvisionOptions, print_bond_only: bool) -> 
         made.floor.height,
         hex::encode(made.floor.payload)
     );
+    println!(
+        "provider enrollment: {}",
+        made.offer.offer().provider.content_id()
+    );
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "provider": hex::encode(made.offer.offer().provider.genesis.statement.transport_public_key.bytes()),
+            "provider_genesis": made.offer,
+            "bond": hex::encode(made.bond_edge.to_bytes()),
+        }))?
+    );
     Ok(())
 }

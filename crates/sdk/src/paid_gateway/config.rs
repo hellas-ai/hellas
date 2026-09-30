@@ -112,12 +112,29 @@ pub fn load_pool_options(path: &Path, assurance: Assurance) -> Result<PaidGatewa
                     .copied()
                     .unwrap_or(CoinId::from_bytes([0; CoinId::LENGTH]))
             });
-            let provider_trust = trust(&p, assurance)?;
+            let config = load_work_config(&p.work_config)?;
+            let provider_trust = trust(&p, assurance, &config)?;
+            let provider_addrs = if p.provider_addrs.is_empty() {
+                match &p.provider_genesis {
+                    EnrollmentSource::Offer(signed) => signed
+                        .offer()
+                        .addresses
+                        .iter()
+                        .map(|a| {
+                            a.parse()
+                                .map_err(|_| PoolError::Invalid("paid offer address"))
+                        })
+                        .collect::<Result<_>>()?,
+                    EnrollmentSource::Pin(_) => vec![],
+                }
+            } else {
+                p.provider_addrs
+            };
             Ok(PaidWorkOptions {
-                config: load_work_config(&p.work_config)?,
+                config,
                 journal_root: p.journal_root,
                 provider: p.provider,
-                provider_addrs: p.provider_addrs,
+                provider_addrs,
                 provider_trust,
                 bond: EdgeId::from_bytes(fixed("bond", &p.bond)?),
                 payment_funding: Funding::new(
@@ -143,16 +160,27 @@ pub fn load_pool_options(path: &Path, assurance: Assurance) -> Result<PaidGatewa
 fn trust(
     p: &ProviderFile,
     assurance: Assurance,
-) -> Result<Option<hellas_client::ProviderTrustAnchor>> {
-    if p.provider_genesis.is_none() && assurance == Assurance::ProducerSigned {
-        if p.apple_app_id.is_some() || !p.apple_cd_hashes.is_empty() {
-            return Err(PoolError::Invalid("Apple trust requires provider_genesis"));
+    config: &crate::work_config::WorkConfig,
+) -> Result<hellas_client::ProviderTrustAnchor> {
+    let expected_genesis = match &p.provider_genesis {
+        EnrollmentSource::Pin(pin) => *pin,
+        EnrollmentSource::Offer(signed) => {
+            signed
+                .check()
+                .map_err(|_| PoolError::Invalid("paid offer signature or bond is invalid"))?;
+            let offer = signed.offer();
+            if offer.proposal.network() != config.chain.network
+                || offer.proposal.bond_edge().to_bytes() != fixed::<32>("bond", &p.bond)?
+                || offer.provider.genesis.statement.transport_public_key
+                    != hellas_rpc::PublicKey::Ed25519(*p.provider.as_bytes())
+            {
+                return Err(PoolError::Invalid(
+                    "paid offer differs from the configured network, bond or provider",
+                ));
+            }
+            offer.provider.content_id()
         }
-        return Ok(None);
-    }
-    let expected_genesis = p.provider_genesis.ok_or(PoolError::Invalid(
-        "attested paid providers require provider_genesis",
-    ))?;
+    };
     let apple_app_attest = if p.apple_app_id.is_none()
         && p.apple_cd_hashes.is_empty()
         && assurance == Assurance::ProducerSigned
@@ -187,11 +215,21 @@ fn trust(
             ));
         }
     };
-    Ok(Some(hellas_client::ProviderTrustAnchor {
+    let trust = hellas_client::ProviderTrustAnchor {
         expected_genesis,
         required_assurance: assurance,
         apple_app_attest,
-    }))
+    };
+    if let EnrollmentSource::Offer(signed) = &p.provider_genesis {
+        trust
+            .verify_enrollment(&signed.offer().provider)
+            .map_err(|_| {
+                PoolError::Invalid(
+                    "paid offer enrollment does not satisfy the provider trust policy",
+                )
+            })?;
+    }
+    Ok(trust)
 }
 
 fn fixed<const N: usize>(field: &'static str, value: &str) -> Result<[u8; N]> {
@@ -242,8 +280,74 @@ struct ProviderFile {
     bond: String,
     payment_coins: Vec<String>,
     omission_bond: u64,
-    provider_genesis: Option<ContentId>,
+    provider_genesis: EnrollmentSource,
     apple_app_id: Option<String>,
     #[serde(default)]
     apple_cd_hashes: Vec<String>,
+}
+
+/// The field is mandatory: either an independently obtained pin or the signed
+/// enrollment-bearing offer exported by provider provisioning.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum EnrollmentSource {
+    Pin(ContentId),
+    Offer(Box<hellas_rpc::protocol::work_offer::SignedPaidOffer>),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{PaidFixture, enrollment, signer};
+    use hellas_rpc::protocol::work_offer::{PaidOffer, SignedPaidOffer};
+
+    #[test]
+    fn imported_offer_derives_the_pin_and_checks_network_bond_transport_and_assurance() {
+        let fixture = PaidFixture::new();
+        let peer = iroh::SecretKey::from_bytes(&[4; 32]).public();
+        let provider = enrollment(peer).0;
+        let signed = SignedPaidOffer::sign(
+            PaidOffer {
+                provider: provider.clone(),
+                proposal: fixture.proposal.clone(),
+                addresses: vec![],
+            },
+            &signer(2),
+        )
+        .unwrap();
+        let value = serde_json::json!({
+            "work_config": "/config/work.json", "journal_root": "/state/client", "provider": peer,
+            "bond": hex::encode(fixture.proposal.bond_edge().to_bytes()), "payment_coins": [hex::encode([1; 32])],
+            "omission_bond": 601, "provider_genesis": signed,
+        });
+        let entry: ProviderFile = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(
+            trust(&entry, Assurance::ProducerSigned, &fixture.config)
+                .unwrap()
+                .expected_genesis,
+            provider.content_id()
+        );
+        assert!(trust(&entry, Assurance::AppleAppAttest, &fixture.config).is_err());
+        let mut other_network = fixture.config.clone();
+        other_network.chain.network = hellas_kernel::NetworkId::new("other-network").unwrap();
+        assert!(trust(&entry, Assurance::ProducerSigned, &other_network).is_err());
+        for (field, replacement) in [
+            ("bond", serde_json::json!(hex::encode([7; 32]))),
+            (
+                "provider",
+                serde_json::json!(iroh::SecretKey::from_bytes(&[8; 32]).public()),
+            ),
+        ] {
+            let mut altered = value.clone();
+            altered[field] = replacement;
+            let entry = serde_json::from_value(altered).unwrap();
+            assert!(
+                trust(&entry, Assurance::ProducerSigned, &fixture.config).is_err(),
+                "{field}"
+            );
+        }
+        let mut no_pin = value;
+        no_pin.as_object_mut().unwrap().remove("provider_genesis");
+        assert!(serde_json::from_value::<ProviderFile>(no_pin).is_err());
+    }
 }

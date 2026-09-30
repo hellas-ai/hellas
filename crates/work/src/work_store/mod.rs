@@ -12,8 +12,9 @@ pub mod setup;
 mod cursor;
 
 pub use channel::{
-    ChannelRecord, ChannelState, ChannelStateError, ChannelStore, CloseSettlement, JobPhase,
-    JobState, JobTerminal, OpenContest, PaidCertificate, RespondedContest, TerminalOutcome,
+    Channel, ChannelRecord, ChannelStateError, ChannelStore, CloseSettlement, FinalizedHeight,
+    Funding, JobBook, JobPhase, JobState, JobTerminal, OpenContest, PaidCertificate,
+    PaymentFunding, RespondedContest, TerminalOutcome,
 };
 pub use journal::{JournalError, Role};
 pub use setup::{

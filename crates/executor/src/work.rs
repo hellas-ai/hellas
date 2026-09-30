@@ -2,7 +2,7 @@
 //!
 //! # What this is
 //!
-//! One implementation of [`PaidWorkBackend`], over this crate's own
+//! One implementation of [`WorkBackend`], over this crate's own
 //! Evaluate engine. The gate that decides whether a backend may be
 //! called at all is [`hellas_work::work::run_accepted_work`]'s, and it is
 //! not here: it belongs beside the journal that records the decision,
@@ -44,7 +44,7 @@
 use crate::ExecutorError;
 use crate::executor::{ExecutorHandle, ExecutorOwedRequest};
 use hellas_rpc::OutputEventEnvelope;
-use hellas_work::work::{BackendFault, PaidProgress, PaidWorkBackend, PreparedEvaluateInput};
+use hellas_work::work::{BackendFault, PaidProgress, PreparedEvaluateInput, WorkBackend};
 
 impl ExecutorHandle {
     /// Runs one already-authorized paid job to its terminal.
@@ -169,7 +169,7 @@ async fn drain_transcript_with_progress(
     }
 }
 
-impl PaidWorkBackend for ExecutorHandle {
+impl WorkBackend for ExecutorHandle {
     async fn fetch(
         &self,
         input: hellas_work::work::PreparedFetchInput,

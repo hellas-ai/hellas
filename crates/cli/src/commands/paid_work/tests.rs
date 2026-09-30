@@ -5,7 +5,7 @@ use hellas_rpc::peers::PeerId;
 #[test]
 fn relative_deadlines_are_ordered_from_the_current_cursor() {
     let args = RunArgs {
-        provider_genesis: None,
+        provider_genesis: hellas_rpc::ContentId::from_bytes([1; 32]),
         apple_app_id: None,
         apple_cd_hashes: Vec::new(),
         work_config: "work.json".into(),
@@ -131,8 +131,7 @@ fn prepare_input_builds_a_bundle_from_an_environment_and_prompt() {
     )
     .unwrap();
 
-    let PreparedPaidWorkInput::Evaluate(prepared) = read_prepared_work_input(&output).unwrap()
-    else {
+    let PreparedWorkInput::Evaluate(prepared) = read_prepared_work_input(&output).unwrap() else {
         panic!("an Evaluate bundle");
     };
     let parts = prepared.parts().unwrap();
@@ -175,7 +174,7 @@ fn prepare_fetch_signs_an_ephemeral_client_request() {
         &key,
     )
     .unwrap();
-    let PreparedPaidWorkInput::Fetch(input) = read_prepared_work_input(&out).unwrap() else {
+    let PreparedWorkInput::Fetch(input) = read_prepared_work_input(&out).unwrap() else {
         panic!("a Fetch bundle");
     };
     let parts = input.parts().unwrap();

@@ -8,7 +8,7 @@
 //! job's deadlines are still reachable, whether plaintext released now
 //! can still arrive, and whether a readiness decision may be acted on.
 //! Every one of them reads
-//! [`ChannelState::cursor`](crate::work_store::ChannelState::cursor). Until this module
+//! [`Channel::cursor`](crate::work_store::Channel::cursor). Until this module
 //! there was no writer for it outside tests, and a cursor that never
 //! moves makes every one of those rules pass: a receipt three hundred
 //! blocks late reads as timely against a height that stopped.
@@ -553,7 +553,7 @@ where
 /// # Nothing is written for a block this journal may not read
 ///
 /// The height and the parent are checked first, against
-/// [`ChannelState::reading`](crate::work_store::ChannelState) — the
+/// [`Channel::reading`](crate::work_store::Channel) — the
 /// same rule the cursor record itself applies, asked before any of the
 /// block's meaning reaches the disk. It has to be first. The
 /// transitions below move money and shut the channel, and a block that
@@ -744,7 +744,7 @@ pub(crate) fn apply_finalized_txs<V: SigVerifier>(
 /// Only a provider applies them. A client ending a job it might still be
 /// paying for would be a client deciding against itself.
 fn expiry_at(
-    state: &crate::work_store::ChannelState,
+    state: &crate::work_store::Channel,
     height: u64,
     payload: [u8; 32],
 ) -> Vec<(hellas_rpc::protocol::Digest, TerminalOutcome)> {
@@ -1039,7 +1039,7 @@ where
 /// it to read.
 ///
 /// A contest is one while
-/// [`ChannelState::answerable_contest`](crate::work_store::ChannelState::answerable_contest)
+/// [`Channel::answerable_contest`](crate::work_store::Channel::answerable_contest)
 /// says an answer is owed and `suppressed` is not that contest. Two things
 /// are deliberately not consulted here.
 ///
@@ -1065,7 +1065,7 @@ where
 /// Retrying is a separate question, and its answer is in
 /// [`crate::work::ProviderEndpoint::advance_close`].
 pub(crate) fn close_duty_present(
-    state: &crate::work_store::ChannelState,
+    state: &crate::work_store::Channel,
     suppressed: Option<StartId>,
 ) -> bool {
     state.close_settled().is_some()

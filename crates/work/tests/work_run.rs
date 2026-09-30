@@ -25,8 +25,8 @@ use hellas_rpc::protocol::artifacts::{
     SourceRef, TextArtifact, TextExecution, TextPolicy, TokenIds,
 };
 use hellas_rpc::protocol::work::{
-    JobDeadlines, PaidChannelPolicyV1, PaidExecutionPolicyV1, PaidJobAuthorizationV1,
-    PaidWorkError, canonical_output_digest, generation_policy_digest, identity_source_digest,
+    EvaluatePolicyV2, JobDeadlines, PaidChannelPolicyV1, PaidJobAuthorizationV2, PaidWorkError,
+    canonical_output_digest, generation_policy_digest, identity_source_digest,
     private_policy_commitment, propose_authorization, result_digest, signing_hash, terminal_result,
     work_id,
 };
@@ -39,8 +39,8 @@ use hellas_rpc::{
     OutputEventEnvelope, ProducerSigningKey, ProgramManifest, PublicKey,
 };
 use hellas_work::work::{
-    BackendFault, PaidWorkBackend, PreparedEvaluateInput, ProviderEndpoint, RunAdmission, RunError,
-    RunOutcome, WorkService, run_accepted_work,
+    BackendFault, PreparedEvaluateInput, ProviderEndpoint, RunAdmission, RunError, RunOutcome,
+    WorkBackend, WorkService, run_accepted_work,
 };
 use hellas_work::work_store::{
     ChannelRecord, ChannelStateError, ChannelStore, JobPhase, JobState, Role, SetupOrigin,
@@ -128,8 +128,8 @@ fn payment_terms() -> WorkPaymentTerms {
     }
 }
 
-fn execution_policy() -> PaidExecutionPolicyV1 {
-    PaidExecutionPolicyV1 {
+fn work_policy() -> EvaluatePolicyV2 {
+    EvaluatePolicyV2 {
         allowed_environment: manifest().content_id(),
         generation_policy_digest: match generation_policy_digest(&text_policy().canonical_bytes()) {
             Ok(digest) => digest,
@@ -145,19 +145,15 @@ fn execution_policy() -> PaidExecutionPolicyV1 {
         max_stop_token_ids: 4,
         max_spool_bytes: 1_048_576,
         max_encoded_result_frame: 262_144,
-        max_encoded_quote_response: 1_048_576,
-        dispatch_margin_blocks: 4,
-        delivery_margin_blocks: 2,
-        oracle_grace_blocks: 6,
-        fixed_price: PRICE,
+        max_encoded_prepared_input: 1_048_576,
     }
 }
 
-/// A second policy, differing from the first in one measured margin.
-fn other_execution_policy() -> PaidExecutionPolicyV1 {
-    PaidExecutionPolicyV1 {
-        dispatch_margin_blocks: 5,
-        ..execution_policy()
+/// A second policy, differing from the first in one resource limit.
+fn other_work_policy() -> EvaluatePolicyV2 {
+    EvaluatePolicyV2 {
+        max_prompt_tokens: work_policy().max_prompt_tokens + 1,
+        ..work_policy()
     }
 }
 
@@ -166,15 +162,16 @@ fn payment_values() -> EdgeValues {
 }
 
 fn descriptor_with(
-    policy: impl Into<hellas_rpc::protocol::work_profile::PaidWorkPolicy>,
+    policy: impl Into<hellas_rpc::protocol::work_profile::WorkPolicy>,
 ) -> WorkChannelDescriptor {
     let config = WorkChannelConfig {
+        payment_policy: payment_policy(),
         network: network(),
         payment_edge: payment_edge(),
         payment_terms: payment_terms(),
         policy_salt: SALT,
         channel_policy: channel_policy(),
-        execution_policy: policy.into(),
+        work_policy: policy.into(),
         expected_payment_values: payment_values(),
     };
     match WorkChannelDescriptor::open(config) {
@@ -184,7 +181,7 @@ fn descriptor_with(
 }
 
 fn descriptor() -> WorkChannelDescriptor {
-    descriptor_with(execution_policy())
+    descriptor_with(work_policy())
 }
 
 /// One readiness decision, taken at `height` against a healthy channel.
@@ -327,10 +324,11 @@ fn bundle_bytes(nonce: u8) -> Vec<u8> {
     }
 }
 
-fn authorization(nonce: u8) -> PaidJobAuthorizationV1 {
+fn authorization(nonce: u8) -> PaidJobAuthorizationV2 {
     match propose_authorization(
         ready().channel(),
-        &execution_policy(),
+        &work_policy(),
+        &payment_policy(),
         &bundle(nonce),
         u64::from(nonce),
         deadlines(),
@@ -456,7 +454,7 @@ impl CountingBackend {
     }
 }
 
-impl PaidWorkBackend for CountingBackend {
+impl WorkBackend for CountingBackend {
     fn evaluate(
         &self,
         input: PreparedEvaluateInput,
@@ -980,7 +978,7 @@ fn a_dispatch_is_decided_against_this_endpoints_own_channel() {
 
     // MUTATION: a readiness decided under another execution policy —
     // other measured margins, and therefore another dispatch gate.
-    let other = ready_of(descriptor_with(other_execution_policy()), CURSOR);
+    let other = ready_of(descriptor_with(other_work_policy()), CURSOR);
     let refused = endpoint.begin_run(id, &other);
     assert!(
         matches!(refused, Err(RunError::Policy)),
@@ -1159,4 +1157,13 @@ fn payment_object() -> Edge {
         allowed: WORK_PAYMENT_CLOSES,
     }
     .build()
+}
+
+fn payment_policy() -> hellas_rpc::protocol::work::JobPaymentPolicyV2 {
+    hellas_rpc::protocol::work::JobPaymentPolicyV2 {
+        fixed_price: PRICE,
+        dispatch_margin_blocks: 4,
+        delivery_margin_blocks: 2,
+        oracle_grace_blocks: 6,
+    }
 }
