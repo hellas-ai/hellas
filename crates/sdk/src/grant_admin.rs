@@ -241,12 +241,12 @@ mod tests {
         );
         let response = client
             .grant_control(GrantControlRequest {
-                command: GrantCommand::List.encode().unwrap(),
+                command: GrantCommand::Users(UserCommand::List).encode().unwrap(),
             })
             .await
             .unwrap();
         assert!(
-            matches!(GrantReply::decode(&response.reply).unwrap(), GrantReply::Listing(entries) if entries.is_empty())
+            matches!(GrantReply::decode(&response.reply).unwrap(), GrantReply::Users(entries) if entries.len() == 1 && entries[0].permissions == UserPermissions::Owner)
         );
     }
     #[tokio::test]

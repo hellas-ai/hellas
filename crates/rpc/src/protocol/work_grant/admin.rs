@@ -20,25 +20,6 @@ pub struct GrantTerms {
 #[serde(deny_unknown_fields)]
 pub enum GrantCommand {
     Users(UserCommand),
-    Create {
-        id: GrantId,
-        principal: Principal,
-        terms: GrantTerms,
-    },
-    Revise {
-        id: GrantId,
-        expected_revision: Revision,
-        terms: GrantTerms,
-    },
-    SetState {
-        id: GrantId,
-        expected_revision: Revision,
-        state: GrantState,
-    },
-    InitializeOwner {
-        principal: Principal,
-    },
-    List,
     Inspect {
         id: GrantId,
     },
@@ -67,7 +48,6 @@ pub struct GrantSummary {
 pub enum GrantReply {
     Users(Vec<UserSummary>),
     User(Box<UserStatus>),
-    Listing(Vec<GrantSummary>),
     Status {
         offer: Box<SignedOffer>,
         now: UnixMillis,

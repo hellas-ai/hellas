@@ -374,10 +374,49 @@ fn gateway_trust(args: &[&str]) -> anyhow::Result<Option<hellas_client::Provider
 
 #[cfg(feature = "gateway")]
 #[test]
-fn gateway_rejects_node_addr_without_node_id() {
-    let result = parse_gateway(&["--node-addr", "127.0.0.1:31145"]);
+fn gateway_rejects_address_without_node_id() {
+    let result = parse_gateway(&["--address", "127.0.0.1:31145"]);
 
     assert!(result.is_err());
+}
+
+#[cfg(feature = "node")]
+#[test]
+fn admin_target_is_shared_and_requires_an_identity_pin() {
+    for operation in [vec!["users", "list"], vec!["repair-resource", "chat"]] {
+        for before in [true, false] {
+            let target = [
+                "--contact",
+                "node.contact",
+                "--address",
+                "127.0.0.1:9000,[::1]:9000",
+            ];
+            let mut argv = vec!["hellas", "admin"];
+            if before {
+                argv.extend(target);
+            }
+            argv.extend(operation.iter().copied());
+            if !before {
+                argv.extend(target);
+            }
+            let Commands::Admin(args) = Cli::try_parse_from(argv).unwrap().command else {
+                panic!("admin");
+            };
+            assert_eq!(args.node_contact, Some(PathBuf::from("node.contact")));
+            assert_eq!(args.addresses.len(), 2);
+        }
+        for invalid in [
+            vec!["--address", "127.0.0.1:9000"],
+            vec!["--contact", "node.contact", "--control-socket", "node.sock"],
+            vec!["--store-dir", "store"],
+            vec!["--output-cache", "off"],
+        ] {
+            let mut argv = vec!["hellas", "admin"];
+            argv.extend(operation.iter().copied());
+            argv.extend(invalid);
+            assert!(Cli::try_parse_from(argv).is_err());
+        }
+    }
 }
 
 #[cfg(feature = "node")]

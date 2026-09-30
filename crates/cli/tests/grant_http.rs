@@ -372,11 +372,11 @@ async fn contact_grant_offer_gateway_uses_private_ca_and_durable_allowances() {
         .await;
     let remote = [
         "admin",
-        "users",
-        "--provider-contact",
+        "--contact",
         string(&provider_contact),
         "--address",
         direct,
+        "users",
         "list",
     ];
     assert!(
@@ -677,7 +677,7 @@ async fn managed_owner_bootstrap_standing_fetch_and_restart_preserve_allowances(
             "gateway",
             "--machine",
             "worker",
-            "--node-addr",
+            "--address",
             &work_address.to_string(),
             "--port",
             "0",
@@ -711,7 +711,7 @@ async fn managed_owner_bootstrap_standing_fetch_and_restart_preserve_allowances(
             "gateway",
             "--machine",
             "worker",
-            "--node-addr",
+            "--address",
             &work_address.to_string(),
             "--port",
             "0",

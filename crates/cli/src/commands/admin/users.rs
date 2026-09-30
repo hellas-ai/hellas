@@ -18,82 +18,106 @@ use std::{
 use super::{AdminArgs, AdminCommand};
 #[derive(clap::Args)]
 pub struct UserArgs {
-    #[arg(long, global = true, conflicts_with = "provider_contact")]
-    control_socket: Option<PathBuf>,
-    /// Verified provider contact; its transport key pins the remote node.
-    #[arg(long, global = true)]
-    provider_contact: Option<PathBuf>,
-    #[arg(long, global = true, requires = "provider_contact")]
-    address: Vec<std::net::SocketAddr>,
     #[command(subcommand)]
     command: Users,
 }
 #[derive(clap::Subcommand)]
 enum Users {
+    /// List this node's users and permission summaries.
     List,
+    /// Register a verified contact and optionally grant admin or Work permission.
     Add {
+        /// File containing the user's verified contact enrollment.
         contact: PathBuf,
+        /// Allow this user to administer the node; grants no Work permission.
         #[arg(long)]
         admin: bool,
         #[command(flatten)]
         terms: Terms,
     },
+    /// Show a user, or the terms and counters of one selected grant.
     Show {
+        /// Principal ID printed by add or list.
         user: String,
+        /// Select a Work grant by its hexadecimal ID.
         #[arg(long)]
         grant: Option<String>,
     },
+    /// Atomically edit a user's permissions and selected Work grant.
     Update {
+        /// Principal ID printed by add or list.
         user: String,
+        /// Grant permission to administer this node.
         #[arg(long, conflicts_with = "no_admin")]
         admin: bool,
+        /// Remove admin permission while retaining Work grants.
         #[arg(long)]
         no_admin: bool,
+        /// Select a Work grant; required when the user has several current grants.
         #[arg(long, conflicts_with = "new_grant")]
         grant: Option<String>,
+        /// Create an additional Work grant using the supplied policies and bounds.
         #[arg(long)]
         new_grant: bool,
+        /// Stop new jobs on the selected grant; open result streams may finish.
         #[arg(long, conflicts_with_all = ["resume", "new_grant", "new_generation", "policies"])]
         pause: bool,
+        /// Allow new jobs on the selected paused grant.
         #[arg(long, conflicts_with_all = ["new_grant", "new_generation", "policies"])]
         resume: bool,
+        /// Permanently revoke the selected grant and stop its result delivery.
         #[arg(long, conflicts_with_all = ["pause", "resume", "new_grant", "new_generation", "policies"])]
         revoke: bool,
+        /// Recover from a lost client journal without resetting quota counters.
         #[arg(long, conflicts_with_all = ["new_grant", "policies", "admin", "no_admin"])]
         new_generation: bool,
         #[command(flatten)]
         terms: Terms,
     },
+    /// Revoke all of a user's permissions while retaining quota counters.
     Remove {
+        /// Principal ID printed by add or list; the owner cannot be removed.
         user: String,
     },
+    /// Export the signed Offer for one of the user's Work grants.
     Offer {
+        /// Principal ID printed by add or list.
         user: String,
+        /// Select a Work grant; required when the user has several current grants.
         #[arg(long)]
         grant: Option<String>,
+        /// Write the private signed Offer to this file.
         #[arg(long)]
         out: PathBuf,
     },
 }
 #[derive(clap::Args, Default)]
 struct Terms {
+    /// Allow a configured resource policy; repeat to select several policies.
     #[arg(long = "policy")]
     policies: Vec<String>,
-    /// requests=2000/day, output-tokens=200000/day; hour/day/week/total.
+    /// Set meter=amount/window, e.g. requests=2000/day; windows: hour/day/week/total.
     #[arg(long = "limit", conflicts_with = "clear_limits")]
     limits: Vec<String>,
+    /// Remove the selected grant's quota limits; machine limits still apply.
     #[arg(long)]
     clear_limits: bool,
+    /// Maximum simultaneous jobs (creation default: 1).
     #[arg(long)]
     max_in_flight: Option<NonZeroU16>,
+    /// Absolute job lifetime bound, e.g. 90s or 2m (creation default: 90s).
     #[arg(long)]
     max_job: Option<String>,
+    /// Expire the grant after this duration, e.g. 7d; updates otherwise preserve expiry.
     #[arg(long, conflicts_with = "no_expiry")]
     expires: Option<String>,
+    /// Remove the grant's expiry; other resource and quota bounds still apply.
     #[arg(long)]
     no_expiry: bool,
+    /// Consent to resources backed by the node operator's upstream accounts.
     #[arg(long, conflicts_with = "no_account_backed")]
     allow_account_backed: bool,
+    /// Remove consent to account-backed resources.
     #[arg(long)]
     no_account_backed: bool,
 }
@@ -293,31 +317,12 @@ fn select(status: &UserStatus, value: Option<&str>) -> CliResult<GrantSummary> {
 #[cfg(feature = "node")]
 pub async fn run(args: AdminArgs, identity: &crate::identity::LocalIdentity) -> CliResult<()> {
     let owner = principal(identity)?;
-    let args = match args.command {
-        AdminCommand::Users(args) => args,
-        AdminCommand::RepairResource {
-            policy,
-            control_socket,
-        } => {
-            let socket = control_socket.unwrap_or(data_root(&owner)?.join("control.sock"));
-            let client = Client::Local(HostControlClientImpl::new(
-                hellas_sdk::local::connect(&socket).await?,
-            ));
-            client
-                .request(GrantCommand::RepairResource { policy })
-                .await?;
-            println!("{{\"repaired\":true}}");
-            return Ok(());
-        }
-        #[cfg(all(feature = "cloud", unix))]
-        AdminCommand::Serve { .. } => unreachable!("management serve uses the cloud adapter"),
-    };
     let mut endpoint = None;
-    let client = if let Some(contact) = args.provider_contact {
+    let client = if let Some(contact) = args.node_contact {
         use hellas_wire::ServiceMarker;
         let provider = Principal::decode(&read_bounded_regular_file(
             &contact,
-            "provider contact",
+            "node contact",
             MAX_PRINCIPAL_BYTES,
         )?)?;
         let ep = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
@@ -326,7 +331,7 @@ pub async fn run(args: AdminArgs, identity: &crate::identity::LocalIdentity) -> 
             .await?;
         let address = iroh::EndpointAddr::from_parts(
             iroh::EndpointId::from_bytes(&provider.transport())?,
-            args.address.into_iter().map(iroh::TransportAddr::Ip),
+            args.addresses.into_iter().map(iroh::TransportAddr::Ip),
         );
         let connection = tokio::time::timeout(
             std::time::Duration::from_secs(15),
@@ -348,7 +353,18 @@ pub async fn run(args: AdminArgs, identity: &crate::identity::LocalIdentity) -> 
             hellas_sdk::local::connect(&socket).await?,
         ))
     };
-    let result = users(args.command, &client).await;
+    let result = match args.command {
+        AdminCommand::Users(args) => users(args.command, &client).await,
+        AdminCommand::RepairResource { policy } => {
+            client
+                .request(GrantCommand::RepairResource { policy })
+                .await?;
+            println!("{{\"repaired\":true}}");
+            Ok(())
+        }
+        #[cfg(all(feature = "cloud", unix))]
+        AdminCommand::Serve { .. } => unreachable!("management serve uses the cloud adapter"),
+    };
     if let Some(endpoint) = endpoint {
         endpoint.close().await;
     }

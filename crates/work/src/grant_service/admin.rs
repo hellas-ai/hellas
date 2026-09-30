@@ -47,58 +47,6 @@ impl GrantService {
                 GrantCommand::Users(command) => {
                     return users(store, now, command, resources, max_job_millis);
                 }
-                GrantCommand::Create {
-                    id,
-                    principal,
-                    terms,
-                } => {
-                    if store.state().grant(id).is_some() {
-                        return Err(GrantError::Malformed.into());
-                    }
-                    let definition = terms.definition(
-                        id,
-                        Revision(1),
-                        GrantKind::Principal(principal),
-                        GrantState::Active,
-                        resources,
-                        max_job_millis,
-                        now,
-                    )?;
-                    store.define(definition, now)?;
-                    id
-                }
-                GrantCommand::Revise {
-                    id,
-                    expected_revision,
-                    terms,
-                } => {
-                    let previous = existing(store, id, expected_revision)?;
-                    let definition = terms.definition(
-                        id,
-                        next_revision(previous.revision)?,
-                        previous.kind,
-                        previous.state,
-                        resources,
-                        max_job_millis,
-                        now,
-                    )?;
-                    store.define(definition, now)?;
-                    id
-                }
-                GrantCommand::SetState {
-                    id,
-                    expected_revision,
-                    state,
-                } => {
-                    let mut definition = existing(store, id, expected_revision)?;
-                    definition.revision = next_revision(definition.revision)?;
-                    definition.state = state;
-                    store.define(definition, now)?;
-                    id
-                }
-                GrantCommand::InitializeOwner { principal } => {
-                    store.initialize_owner(principal, resources.to_vec(), max_job_millis, now)?
-                }
                 GrantCommand::Inspect { id } => id,
                 GrantCommand::NewGeneration {
                     id,
@@ -115,11 +63,6 @@ impl GrantService {
                         .ok_or(GrantError::OutOfScope)?;
                     store.repair_resource(policy.resource_id()?, now)?;
                     return Ok(GrantReply::Repaired);
-                }
-                GrantCommand::List => {
-                    return Ok(GrantReply::Listing(
-                        store.state().grants().map(|g| summary(store, g)).collect(),
-                    ));
                 }
             };
             Ok(GrantReply::Status {

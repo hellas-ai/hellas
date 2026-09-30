@@ -33,163 +33,6 @@ fn terms() -> GrantTerms {
         allow_account_backed: true,
     }
 }
-#[test]
-fn local_revisions_preserve_reservations_and_pause_releases_queued_work() {
-    let root = tempfile::tempdir().unwrap();
-    let mut store = setup(root.path());
-    let (authorization, signature, input) = proposal(&store, 1);
-    store
-        .accept(
-            authorization,
-            signature,
-            &input,
-            &principal(2).1,
-            UnixMillis(1000),
-        )
-        .unwrap();
-    let service = make_service(store);
-    let invoke = |command| service.control(command, &[policy()], NonZeroU64::new(10000).unwrap());
-    let GrantReply::Status { offer, nodes, .. } = invoke(GrantCommand::Revise {
-        id: GrantId([1; 16]),
-        expected_revision: Revision(1),
-        terms: terms(),
-    })
-    .unwrap() else {
-        panic!("status");
-    };
-    assert_eq!(offer.offer().grant.revision, Revision(2));
-    assert_eq!(nodes[0].active, 1);
-    assert_eq!(
-        nodes[0]
-            .counters
-            .iter()
-            .find(|c| c.meter == Meter::Requests && c.window == Window::Total)
-            .unwrap()
-            .reserved,
-        1
-    );
-    assert!(
-        invoke(GrantCommand::SetState {
-            id: GrantId([1; 16]),
-            expected_revision: Revision(1),
-            state: GrantState::Paused
-        })
-        .is_err()
-    );
-    let GrantReply::Status { nodes, .. } = invoke(GrantCommand::SetState {
-        id: GrantId([1; 16]),
-        expected_revision: Revision(2),
-        state: GrantState::Paused,
-    })
-    .unwrap() else {
-        panic!("status");
-    };
-    assert_eq!(nodes[0].active, 0);
-    assert_eq!(
-        nodes[0]
-            .counters
-            .iter()
-            .find(|c| c.meter == Meter::Requests && c.window == Window::Total)
-            .unwrap()
-            .reserved,
-        0
-    );
-    let GrantReply::Status { offer, .. } = invoke(GrantCommand::NewGeneration {
-        id: GrantId([1; 16]),
-        expected_revision: Revision(3),
-    })
-    .unwrap() else {
-        panic!("status");
-    };
-    assert_eq!(offer.offer().generation, 1);
-    invoke(GrantCommand::SetState {
-        id: GrantId([1; 16]),
-        expected_revision: Revision(3),
-        state: GrantState::Revoked,
-    })
-    .unwrap();
-    assert!(
-        invoke(GrantCommand::SetState {
-            id: GrantId([1; 16]),
-            expected_revision: Revision(4),
-            state: GrantState::Active
-        })
-        .is_err()
-    );
-}
-#[test]
-fn owner_bootstrap_can_deny_all_and_principal_creation_requires_explicit_resource_consent() {
-    let root = tempfile::tempdir().unwrap();
-    let service = make_service(setup(root.path()));
-    let max = NonZeroU64::new(10000).unwrap();
-    let GrantReply::Status { offer, .. } = service
-        .control(
-            GrantCommand::InitializeOwner {
-                principal: principal(3).0,
-            },
-            &[],
-            max,
-        )
-        .unwrap()
-    else {
-        panic!("status");
-    };
-    assert!(offer.offer().grant.policies.is_empty());
-    assert!(matches!(offer.offer().grant.kind, GrantKind::Owner(_)));
-    let mut without_consent = terms();
-    without_consent.allow_account_backed = false;
-    assert!(
-        service
-            .control(
-                GrantCommand::Create {
-                    id: GrantId([3; 16]),
-                    principal: principal(3).0,
-                    terms: without_consent
-                },
-                &[policy()],
-                max
-            )
-            .is_err()
-    );
-    assert!(
-        service
-            .control(
-                GrantCommand::Inspect {
-                    id: GrantId([3; 16])
-                },
-                &[policy()],
-                max
-            )
-            .is_err()
-    );
-    let mut outside = terms();
-    outside.policies = vec!["missing".into()];
-    assert!(
-        service
-            .control(
-                GrantCommand::Create {
-                    id: GrantId([3; 16]),
-                    principal: principal(3).0,
-                    terms: outside
-                },
-                &[policy()],
-                max
-            )
-            .is_err()
-    );
-    service
-        .control(
-            GrantCommand::Create {
-                id: GrantId([3; 16]),
-                principal: principal(3).0,
-                terms: terms(),
-            },
-            &[policy()],
-            max,
-        )
-        .unwrap();
-}
-
 fn context(seed: u8) -> hellas_wire::TransportContext {
     hellas_wire::TransportContext {
         peer: Some(hellas_wire::PeerIdentity([seed; 32])),
@@ -267,7 +110,7 @@ fn removing_a_user_revokes_every_permission_atomically_and_preserves_running_dut
     assert!(
         service
             .control_as(
-                GrantCommand::List,
+                GrantCommand::Users(UserCommand::List),
                 &[],
                 NonZeroU64::new(1).unwrap(),
                 &claimed
@@ -585,7 +428,12 @@ fn journal_io_failure_stops_authorization_until_reopened() {
     };
     assert!(
         service
-            .control_as(GrantCommand::List, &[], NonZeroU64::new(1).unwrap(), &owner)
+            .control_as(
+                GrantCommand::Users(UserCommand::List),
+                &[],
+                NonZeroU64::new(1).unwrap(),
+                &owner
+            )
             .is_ok()
     );
     // An actual filesystem failure during checkpoint installation, with the old
@@ -595,7 +443,12 @@ fn journal_io_failure_stops_authorization_until_reopened() {
     std::fs::write(&path, b"not a directory").unwrap();
     assert!(service.administer(|store, _| store.rotate()).is_err());
     assert!(matches!(
-        service.control_as(GrantCommand::List, &[], NonZeroU64::new(1).unwrap(), &owner),
+        service.control_as(
+            GrantCommand::Users(UserCommand::List),
+            &[],
+            NonZeroU64::new(1).unwrap(),
+            &owner
+        ),
         Err(GrantStoreError::Unavailable)
     ));
     drop(service);

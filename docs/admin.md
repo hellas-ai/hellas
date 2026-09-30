@@ -46,11 +46,15 @@ the same removed principal; its old grants remain revoked and their counters
 remain visible. New work permission requires a new grant.
 
 Remote administrators pin the node using its verified software contact, then
-use their own identity. The transport proves possession of the pinned node key
-and the caller's registered key; headers cannot supply either identity.
+use their own identity. `--contact` selects the verified node contact;
+`--address` supplies direct UDP address hints (repeat or use commas).
+Alternatively, `--control-socket` selects a local node. These options belong
+to `hellas admin` and apply to its user and resource operations. The transport
+proves possession of the pinned node key and the caller's registered key;
+headers cannot supply either identity.
 
 ```sh
-hellas admin users --provider-contact node.contact --address 192.0.2.10:9000 list
+hellas admin --contact node.contact --address 192.0.2.10:9000 users list
 ```
 
 Authorization is checked on every RPC and again when the writer applies a

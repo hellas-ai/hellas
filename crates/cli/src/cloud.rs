@@ -18,9 +18,19 @@ pub(super) async fn run(command: Commands, identity_path: Option<&Path>) -> Resu
     match command {
         Commands::Cloud(args) => args.run_owned(service.as_ref()).await,
         Commands::Machines(args) => args.run(service.context("owner identity required")?).await,
-        Commands::Admin(crate::commands::admin::AdminArgs {
-            command: crate::commands::admin::AdminCommand::Serve { socket },
-        }) => {
+        Commands::Admin(args) => {
+            #[cfg(feature = "node")]
+            anyhow::ensure!(
+                args.node_contact.is_none()
+                    && args.control_socket.is_none()
+                    && args.addresses.is_empty(),
+                "admin serve starts a local management service; use --socket to select its listener"
+            );
+            let socket = match args.command {
+                crate::commands::admin::AdminCommand::Serve { socket } => socket,
+                #[cfg(feature = "node")]
+                _ => unreachable!("only management commands reach this adapter"),
+            };
             let service = service.context("owner identity required")?;
             let socket = socket
                 .map(Ok)

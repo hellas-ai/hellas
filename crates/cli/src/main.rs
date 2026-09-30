@@ -237,14 +237,6 @@ struct CausalLmArgs {
 #[command(version)]
 #[command(about = "Hellas node CLI")]
 struct Cli {
-    /// Inference reuse policy shared by execution commands. In record mode,
-    /// a cache write failure fails the request, even if inference succeeded.
-    #[arg(long, global = true, default_value = "off")]
-    output_cache: hellas_rpc::cache::CachePolicy,
-
-    /// Hellas content store state (default: HELLAS_STORE_DIR or ~/.hellas/store)
-    #[arg(long, global = true)]
-    store_dir: Option<PathBuf>,
     /// Path to the versioned local identity for commands that use one
     /// (default: $HOME/.hellas/identity).
     #[arg(long = "identity", global = true)]
@@ -330,6 +322,10 @@ enum Commands {
     #[cfg(feature = "node")]
     /// Run the RPC server
     Serve {
+        /// Content store state used by local execution (default: HELLAS_STORE_DIR or ~/.hellas/store).
+        #[cfg(feature = "evaluate")]
+        #[arg(long)]
+        store_dir: Option<PathBuf>,
         /// Assurance offered by this provider.
         #[arg(long, default_value = "producer-signed", value_parser = parse_assurance)]
         assurance: hellas_rpc::Assurance,
@@ -463,6 +459,12 @@ enum Commands {
     )))]
     #[cfg_attr(all(feature = "cloud", unix), command(mut_arg("environment", |arg| arg.required_unless_present_any(["responses_backend", "http_fetch_config", "offer", "machine"]))))]
     Gateway {
+        /// Inference reuse policy; record mode fails requests if cache writes fail.
+        #[arg(long, default_value = "off")]
+        output_cache: hellas_rpc::cache::CachePolicy,
+        /// Content and output cache state (default: HELLAS_STORE_DIR or ~/.hellas/store).
+        #[arg(long)]
+        store_dir: Option<PathBuf>,
         /// Use a private Offer previously verified by `offer import`.
         #[arg(long, value_name = "ALIAS", conflicts_with_all = ["node_id", "node_addrs", "provider_genesis", "responses_backend", "http_fetch_config"])]
         #[cfg_attr(feature = "node", arg(conflicts_with = "paid_work_config"))]
@@ -516,7 +518,7 @@ enum Commands {
         #[arg(long)]
         node_id: Option<EndpointId>,
         /// Direct UDP address hint for the target node. Repeat or use commas.
-        #[arg(long = "node-addr", value_delimiter = ',')]
+        #[arg(long = "address", value_delimiter = ',')]
         #[cfg_attr(all(feature = "cloud", unix), arg(requires = "remote_target"))]
         #[cfg_attr(not(all(feature = "cloud", unix)), arg(requires = "node_id"))]
         node_addrs: Vec<SocketAddr>,
@@ -592,7 +594,7 @@ enum Commands {
         /// Node ID to check
         node_id: EndpointId,
         /// Direct UDP address hint for the target node. Repeat or use commas.
-        #[arg(long = "node-addr", value_delimiter = ',')]
+        #[arg(long = "address", value_delimiter = ',')]
         node_addrs: Vec<SocketAddr>,
     },
     /// Inspect or run the durable paid-work client path.
@@ -603,6 +605,9 @@ enum Commands {
     },
     /// Inspect and fill the content store
     Store {
+        /// Content store state (default: HELLAS_STORE_DIR or ~/.hellas/store).
+        #[arg(long, global = true)]
+        store_dir: Option<PathBuf>,
         #[command(subcommand)]
         command: commands::store::StoreCommand,
     },
@@ -883,6 +888,7 @@ async fn async_main() {
         #[cfg(all(feature = "cloud", unix))]
         command @ Commands::Admin(commands::admin::AdminArgs {
             command: commands::admin::AdminCommand::Serve { .. },
+            ..
         }) => {
             let result = cloud::run(command, cli.identity.as_deref()).await;
             tracer_provider.shutdown();
@@ -902,8 +908,8 @@ async fn async_main() {
             }
             return;
         }
-        Commands::Store { command } => {
-            let result = commands::store::run(command, cli.store_dir).await;
+        Commands::Store { command, store_dir } => {
+            let result = commands::store::run(command, store_dir).await;
             tracer_provider.shutdown();
             if let Err(err) = result {
                 eprintln!("error: {err:#}");
@@ -969,6 +975,8 @@ async fn async_main() {
 
         #[cfg(feature = "node")]
         Commands::Serve {
+            #[cfg(feature = "evaluate")]
+            store_dir,
             assurance,
             port,
             queue_size,
@@ -1055,7 +1063,7 @@ async fn async_main() {
                             content_roots,
                             #[cfg(feature = "evaluate")]
                             content_index: content_index.or_else(|| {
-                                cli.store_dir
+                                store_dir
                                     .as_deref()
                                     .map(hellas_store::state::records_path_at)
                             }),
@@ -1113,6 +1121,8 @@ async fn async_main() {
         },
         #[cfg(feature = "gateway")]
         Commands::Gateway {
+            output_cache,
+            store_dir,
             offer,
             grant_policy,
             http_fetch_config,
@@ -1153,12 +1163,11 @@ async fn async_main() {
                 let local_content = causal_lm.as_ref().map(|args| commands::grant_gateway::local::LocalContent {
                     paths: std::iter::once(args.environment.clone()).chain(args.content_paths.iter().cloned()).collect(),
                     roots: args.content_roots.clone(),
-                    index: args.content_index.clone().or_else(|| cli.store_dir.as_deref().map(hellas_store::state::records_path_at)),
+                    index: args.content_index.clone().or_else(|| store_dir.as_deref().map(hellas_store::state::records_path_at)),
                     queue_size,
                 });
-                let output_cache = cli.output_cache;
                 let cache_options =
-                    commands::gateway_cache::options(output_cache, cli.store_dir.clone())?;
+                    commands::gateway_cache::options(output_cache, store_dir.clone())?;
                 let (
                     loaded_environment,
                     model_name,
