@@ -5,6 +5,8 @@ package hellas.host.v1;
 // Administrative lifecycle control. Hosts must authorize each connection before
 // dispatch, regardless of whether the carrier is local or remote.
 service HostControl {
+  // Local owner only; versioned canonical grant administration records.
+  rpc GrantControl(GrantControlRequest) returns (GrantControlResponse);
   rpc GetHostStatus(GetHostStatusRequest) returns (HostStatus);
   rpc SetProviderState(SetProviderStateRequest) returns (HostStatus);
   rpc SetGatewayState(SetGatewayStateRequest) returns (HostStatus);
@@ -69,3 +71,6 @@ message GatewayAccess {
   string address = 1;
   string bearer = 2;
 }
+
+message GrantControlRequest { bytes command = 1; }
+message GrantControlResponse { bytes reply = 1; }

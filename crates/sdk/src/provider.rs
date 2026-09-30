@@ -2,10 +2,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use hellas_attestation::RootProver;
-use hellas_executor::{
-    Executor, ExecutorSpawnConfig, FetchRoute, FetchRouteEntry, FetchRoutePolicy,
-    FetchRouteRegistry,
-};
+use hellas_executor::{Executor, ExecutorSpawnConfig, FetchRoute, FetchRouteRegistry};
+#[cfg(any(test, feature = "grant-provider"))]
+use hellas_executor::{FetchRouteEntry, FetchRoutePolicy};
 use hellas_rpc::open::OpenDispatcher;
 use hellas_rpc::pb::execute::{OpenRequest, OpenResponse, open_response};
 use hellas_rpc::signature_wire::signature_to_pb;
@@ -26,14 +25,20 @@ const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15
 /// Startup errors, before a provider accepts requests.
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
-    #[error("owner execution requires a grant; configure a payment-funded Work provider")]
-    OwnerGrantRequired,
+    #[error("provider requires a Work funding configuration")]
+    FundingRequired,
     #[error("paid channel names an unavailable Fetch route or manifest")]
     MissingPaidRoute,
     #[error("Fetch provider requires a paid Fetch policy")]
     WrongPaidPolicy,
-    #[error("provider enrollment differs from its runtime identity")]
+    #[error("provider enrollment does not match this identity")]
     Identity,
+    #[error("a revoked contact cannot be re-enabled; import a newly issued contact enrollment")]
+    RevokedContact,
+    #[error(transparent)]
+    Grant(#[from] hellas_rpc::protocol::work_grant::records::GrantError),
+    #[error(transparent)]
+    GrantStore(#[from] hellas_work::work_store::grant::GrantStoreError),
     #[error("invalid provider settlement key")]
     SettlementKey,
     #[error(transparent)]
@@ -58,6 +63,7 @@ pub enum ProviderError {
     Paid(#[from] crate::paid_provider::PaidProviderError),
 }
 
+#[cfg(feature = "grant-provider")]
 pub struct OpenAiProviderOptions<R> {
     pub port: Option<u16>,
     pub identity: ClientIdentity,
@@ -67,7 +73,10 @@ pub struct OpenAiProviderOptions<R> {
     pub service: String,
     pub method: String,
     pub bearer_token: String,
-    pub paid_work: Option<crate::work_config::WorkConfig>,
+    pub grantees: Vec<hellas_rpc::protocol::work_grant::records::Principal>,
+    /// Per-contact counters. The machine shares the configured execution capacity.
+    pub limits: Vec<hellas_rpc::protocol::work_grant::budget::Limit>,
+    pub max_job_millis: std::num::NonZeroU64,
     pub fetch_max_in_flight: usize,
     pub fetch_queue_capacity: usize,
 }
@@ -79,6 +88,8 @@ pub struct FetchProviderOptions<R> {
     pub enrollment: ProviderEnrollmentBundle,
     pub root: Arc<R>,
     pub state_directory: PathBuf,
+    #[cfg(feature = "grant-provider")]
+    pub grants: Option<crate::GrantProviderOptions>,
     pub routes: FetchRouteRegistry,
     pub fetch_max_in_flight: usize,
     pub fetch_queue_capacity: usize,
@@ -100,6 +111,8 @@ impl Drop for WorkWatcher {
 }
 
 pub struct ProviderHandle {
+    #[cfg(feature = "grant-provider")]
+    grants: Option<hellas_work::grant_service::GrantService>,
     endpoint: Endpoint,
     accept_task: tokio::task::JoinHandle<()>,
     #[cfg(feature = "paid-provider")]
@@ -115,9 +128,46 @@ impl ProviderHandle {
         self.endpoint.bound_sockets()
     }
 
+    /// Export fresh private Offers to distribute to the configured contacts.
+    #[cfg(feature = "grant-provider")]
+    pub fn offers(
+        &self,
+    ) -> Result<Vec<hellas_rpc::protocol::work_grant::records::SignedOffer>, ProviderError> {
+        use hellas_rpc::protocol::work_grant::{admin::*, records::*};
+        let Some(service) = &self.grants else {
+            return Ok(vec![]);
+        };
+        let ids = service.administer(|store, _| {
+            Ok(store
+                .state()
+                .grants()
+                .filter(|g| g.state == GrantState::Active)
+                .map(|g| g.id)
+                .collect::<Vec<_>>())
+        })?;
+        ids.into_iter()
+            .map(|id| {
+                match service.control(
+                    GrantCommand::Inspect { id },
+                    &[],
+                    std::num::NonZeroU64::new(1).unwrap(),
+                )? {
+                    GrantReply::Status { offer, .. } => Ok(*offer),
+                    _ => Err(ProviderError::FundingRequired),
+                }
+            })
+            .collect()
+    }
+
     pub async fn shutdown(mut self) {
         self.accept_task.abort();
         let _ = (&mut self.accept_task).await;
+        #[cfg(feature = "grant-provider")]
+        if let Some(grants) = &self.grants
+            && let Err(error) = grants.drain().await
+        {
+            tracing::error!(%error, "grant provider drain failed");
+        }
         #[cfg(feature = "paid-provider")]
         if let Some(mut work) = self.work.take() {
             if let Some(stop) = work.stop.take() {
@@ -139,12 +189,14 @@ impl Drop for ProviderHandle {
     }
 }
 
+#[cfg(feature = "grant-provider")]
 pub async fn start_openai_provider<R>(
     options: OpenAiProviderOptions<R>,
 ) -> Result<ProviderHandle, ProviderError>
 where
     R: RootProver + Send + Sync + 'static,
 {
+    let policy = crate::grant_provider::responses_policy(&options.service, &options.method)?;
     let upstream = Arc::new(hellas_providers::OpenAiResponsesFetchProvider::with_bearer(
         options.bearer_token,
     )?);
@@ -163,10 +215,16 @@ where
         root: options.root,
         state_directory: options.state_directory,
         routes,
+        grants: Some(crate::GrantProviderOptions {
+            grantees: options.grantees,
+            policies: vec![policy],
+            limits: options.limits,
+            max_job_millis: options.max_job_millis,
+        }),
         fetch_max_in_flight: options.fetch_max_in_flight,
         fetch_queue_capacity: options.fetch_queue_capacity,
         #[cfg(feature = "paid-provider")]
-        paid_work: options.paid_work,
+        paid_work: None,
     })
     .await
 }
@@ -181,8 +239,12 @@ where
     let has_paid_work = options.paid_work.is_some();
     #[cfg(not(feature = "paid-provider"))]
     let has_paid_work = false;
-    if !has_paid_work {
-        return Err(ProviderError::OwnerGrantRequired);
+    #[cfg(feature = "grant-provider")]
+    let has_grants = options.grants.is_some();
+    #[cfg(not(feature = "grant-provider"))]
+    let has_grants = false;
+    if !has_paid_work && !has_grants {
+        return Err(ProviderError::FundingRequired);
     }
     #[cfg(feature = "paid-provider")]
     if let Some(config) = &options.paid_work {
@@ -216,12 +278,10 @@ where
         }
         crate::work_config::validate_work_routes(config)?;
     }
-    hellas_rpc::protocol::work_offer::check_provider(&options.enrollment)
-        .map_err(|_| ProviderError::Identity)?;
+    options.enrollment.check_grant_provider()?;
     if options.enrollment.genesis.statement.producer_public_key
         != options.identity.caller_key().public_key()
-        || options.enrollment.genesis.statement.transport_public_key
-            != hellas_rpc::PublicKey::Ed25519(*options.identity.node_id().as_bytes())
+        || options.enrollment.grant_transport()? != *options.identity.node_id().as_bytes()
     {
         return Err(ProviderError::Identity);
     }
@@ -229,6 +289,20 @@ where
         hellas_rpc::RootKind::Software => Assurance::ProducerSigned,
         hellas_rpc::RootKind::SecureEnclave => Assurance::AppleAppAttest,
     };
+    #[cfg(feature = "grant-provider")]
+    let grant_store = options
+        .grants
+        .as_ref()
+        .map(|grants| {
+            crate::grant_provider::prepare(
+                grants,
+                &options.state_directory,
+                options.enrollment.clone(),
+                &options.routes,
+                options.fetch_max_in_flight,
+            )
+        })
+        .transpose()?;
     let producer_key = Arc::new(options.identity.caller_key().clone());
     let mut executor_config =
         ExecutorSpawnConfig::fetch_only(producer_key.clone(), assurance, options.routes);
@@ -276,12 +350,14 @@ where
         root: options.root,
         enrollment: options.enrollment,
     };
-    let alpns = vec![
-        hellas_rpc::services::work::Work::ALPN.as_bytes().to_vec(),
-        hellas_rpc::services::work_setup::WorkSetup::ALPN
-            .as_bytes()
-            .to_vec(),
-    ];
+    let mut alpns = vec![hellas_rpc::services::work::Work::ALPN.as_bytes().to_vec()];
+    if has_paid_work {
+        alpns.push(
+            hellas_rpc::services::work_setup::WorkSetup::ALPN
+                .as_bytes()
+                .to_vec(),
+        );
+    }
     let mut builder = Endpoint::builder(presets::N0)
         .secret_key(options.identity.transport_key())
         .alpns(alpns);
@@ -289,6 +365,28 @@ where
         builder = builder.bind_addr(std::net::SocketAddr::from(([0, 0, 0, 0], port)))?;
     }
     let endpoint = builder.bind().await?;
+    #[cfg(feature = "grant-provider")]
+    let grants = grant_store
+        .map(|store| {
+            hellas_work::grant_service::GrantService::new(
+                store,
+                producer_key,
+                executor,
+                endpoint
+                    .addr()
+                    .ip_addrs()
+                    .map(ToString::to_string)
+                    .collect(),
+                Arc::new(hellas_work::grant_service::wall_clock),
+            )
+        })
+        .transpose()?;
+    #[cfg(all(feature = "paid-provider", feature = "grant-provider"))]
+    if let Some(grants) = &grants {
+        assert!(work_mount.mount_grants(grants.clone()));
+    }
+    #[cfg(all(feature = "grant-provider", not(feature = "paid-provider")))]
+    let grant_mount = grants.clone();
     let accept_endpoint = endpoint.clone();
     let accept_task = tokio::spawn(async move {
         let slots = Arc::new(tokio::sync::Semaphore::new(MAX_ACTIVE_CONNECTIONS));
@@ -319,6 +417,8 @@ where
             };
             #[cfg(feature = "paid-provider")]
             let (work_mount, setup_mount) = (work_mount.clone(), setup_mount.clone());
+            #[cfg(all(feature = "grant-provider", not(feature = "paid-provider")))]
+            let grant_mount = grant_mount.clone();
             let open = open.clone();
             connections.spawn(async move {
                 let _slot = slot;
@@ -336,13 +436,23 @@ where
                 let alpn = connection.alpn().to_vec();
                 let transport = Arc::new(IrohTransport::new(connection));
                 #[cfg(feature = "paid-provider")]
-                if has_paid_work && alpn == hellas_rpc::services::work::Work::ALPN.as_bytes() {
+                if alpn == hellas_rpc::services::work::Work::ALPN.as_bytes() {
                     let server = OpenDispatcher::<_, _, hellas_rpc::services::work::Open>::new(
                         hellas_rpc::services::work::WorkServer(work_mount),
                         open,
                     );
                     serve(transport, server).await;
                     return;
+                }
+                #[cfg(all(feature = "grant-provider", not(feature = "paid-provider")))]
+                if alpn == hellas_rpc::services::work::Work::ALPN.as_bytes()
+                    && let Some(service) = grant_mount
+                {
+                    let server = OpenDispatcher::<_, _, hellas_rpc::services::work::Open>::new(
+                        hellas_rpc::services::work::WorkServer(service),
+                        open,
+                    );
+                    serve(transport, server).await;
                 }
                 #[cfg(feature = "paid-provider")]
                 if has_paid_work
@@ -359,6 +469,8 @@ where
         }
     });
     Ok(ProviderHandle {
+        #[cfg(feature = "grant-provider")]
+        grants,
         endpoint,
         accept_task,
         #[cfg(feature = "paid-provider")]
@@ -397,6 +509,9 @@ where
 
 #[cfg(all(test, feature = "paid-provider", feature = "paid-client"))]
 mod tests;
+
+#[cfg(all(test, feature = "grant-provider", feature = "grant-gateway"))]
+mod grant_tests;
 
 struct ProviderOpen<R> {
     signer: Arc<hellas_rpc::ProducerSigningKey>,

@@ -5,7 +5,8 @@ use serde_json::json;
 #[test]
 fn configuration_bounds_credentials_and_withholds_debug_contents() {
     let mut config = Configuration {
-        fetch_config: json!({"routes": [], "callers": []}),
+        fetch_config: json!({"routes": []}),
+        grant_config: json!({"resources":[],"machine_limits":[]}),
         env: [("UPSTREAM_API_KEY".into(), "test-private-value".into())].into(),
         files: Default::default(),
     };
@@ -40,6 +41,6 @@ fn configuration_bounds_credentials_and_withholds_debug_contents() {
         assert!(config.validate().is_err());
     }
     config.files.clear();
-    config.fetch_config = json!({"routes": []});
+    config.fetch_config = json!({"routes": [], "callers": []});
     assert!(config.validate().is_err());
 }

@@ -42,6 +42,25 @@ enum WorkerState {
     Stopped,
 }
 
+enum PendingExecution {
+    Prepared {
+        input: hellas_work::work::PreparedEvaluateInput,
+        complete: tokio::sync::oneshot::Sender<()>,
+        sender:
+            mpsc::Sender<Result<hellas_rpc::execution_event::WorkEvent, hellas_wire::WireStatus>>,
+    },
+    #[cfg(test)]
+    Resolved(ExecuteJob),
+}
+impl PendingExecution {
+    fn is_owed(&self) -> bool {
+        match self {
+            Self::Prepared { input, .. } => input.admission().is_owed(),
+            #[cfg(test)]
+            Self::Resolved(_) => true,
+        }
+    }
+}
 pub struct EvaluateEngine {
     content_store: ContentStore,
     environments: HashMap<ContentId, CausalLmEnvironmentSource>,
@@ -49,7 +68,7 @@ pub struct EvaluateEngine {
     worker: ExecuteWorker,
     worker_state: WorkerState,
     gpu_config: GpuConfig,
-    pending_owed_executions: VecDeque<ExecuteJob>,
+    pending_owed_executions: VecDeque<PendingExecution>,
     queue_capacity: usize,
     metrics: Arc<ExecutorMetrics>,
     provider: ProviderContext,
@@ -232,7 +251,8 @@ impl EvaluateEngine {
             invocation,
             sender,
             result,
-            ..
+            running: _running,
+            complete: _complete,
         } = completion;
 
         match &self.worker_state {
@@ -311,10 +331,19 @@ impl EvaluateEngine {
         &mut self,
         input: hellas_work::work::PreparedEvaluateInput,
     ) -> Result<ExecuteOutcome, ExecutorError> {
-        let (manifest, resolved) = resolve_prepared_paid_input(input.into_parts())?;
-        let source = self.get_or_bind_environment(&manifest.canonical_bytes())?;
-        let job = self.admit_resolved_job(resolved, source)?;
-        self.start(job, new_execution_id())
+        let (sender, events) = mpsc::channel(PER_EXECUTION_CHANNEL_CAPACITY);
+        let (complete, completion) = tokio::sync::oneshot::channel();
+        self.pending_owed_executions
+            .push_back(PendingExecution::Prepared {
+                input,
+                sender,
+                complete,
+            });
+        self.dispatch_next_execution();
+        Ok(ExecuteOutcome {
+            events,
+            completion: Some(completion),
+        })
     }
 
     pub(crate) fn has_queue_capacity(&self) -> bool {
@@ -325,14 +354,42 @@ impl EvaluateEngine {
             || !self.pending_owed_executions.is_empty()
     }
     pub(crate) fn dispatch_next_execution(&mut self) {
-        while let Some(job) = self.pending_owed_executions.pop_front() {
+        if matches!(self.worker_state, WorkerState::Busy { .. }) {
+            return;
+        }
+        loop {
+            let next = self
+                .pending_owed_executions
+                .iter()
+                .position(PendingExecution::is_owed)
+                .unwrap_or(0);
+            let Some(pending) = self.pending_owed_executions.remove(next) else {
+                return;
+            };
+            let job = match pending {
+                #[cfg(test)]
+                PendingExecution::Resolved(job) => job,
+                PendingExecution::Prepared {
+                    input,
+                    sender,
+                    complete,
+                } => {
+                    if matches!(self.worker_state, WorkerState::Stopped) {
+                        let _ = sender.try_send(Err(ExecutorError::ChannelClosed.into()));
+                        continue;
+                    }
+                    match self.prepare_for_dispatch(input, sender.clone(), complete) {
+                        Ok(job) => job,
+                        Err(error) => {
+                            let _ = sender.try_send(Err(error.into()));
+                            continue;
+                        }
+                    }
+                }
+            };
             match self.try_start_execution(job) {
                 Ok(()) => return,
-                Err(StartExecutionError::Busy(job)) => {
-                    self.pending_owed_executions.push_front(*job);
-                    return;
-                }
-                Err(StartExecutionError::Closed(job)) => {
+                Err(StartExecutionError::Busy(job) | StartExecutionError::Closed(job)) => {
                     let _ = job
                         .sender
                         .try_send(Err(ExecutorError::ChannelClosed.into()));
@@ -343,6 +400,41 @@ impl EvaluateEngine {
             }
         }
     }
+    fn prepare_for_dispatch(
+        &mut self,
+        input: hellas_work::work::PreparedEvaluateInput,
+        sender: mpsc::Sender<
+            Result<hellas_rpc::execution_event::WorkEvent, hellas_wire::WireStatus>,
+        >,
+        complete: tokio::sync::oneshot::Sender<()>,
+    ) -> Result<ExecuteJob, ExecutorError> {
+        let (parts, admission) = input.into_parts_and_admission();
+        let running = admission
+            .dispatch()
+            .map_err(|e| ExecutorError::PolicyDenied(e.to_string()))?;
+        let (manifest, resolved) = resolve_prepared_paid_input(parts)?;
+        let source = self.get_or_bind_environment(&manifest.canonical_bytes())?;
+        let job = self.admit_resolved_job(resolved, source)?;
+        running
+            .check_deadline()
+            .map_err(|e| ExecutorError::PolicyDenied(e.to_string()))?;
+        let prompt = job.invocation.input_ids.len() as u64;
+        self.metrics
+            .record_execution_started("evaluate", "causal-lm", prompt, prompt);
+        Ok(ExecuteJob {
+            span: tracing::Span::current(),
+            execution_id: new_execution_id(),
+            evaluate_request: job.evaluate_request,
+            source: job.source,
+            invocation: job.invocation,
+            accepted_at: Instant::now(),
+            sender,
+            producer_key: self.provider.producer_key.clone(),
+            running: Some(running),
+            complete: Some(complete),
+        })
+    }
+    #[cfg(test)]
     fn start(
         &mut self,
         job: EvaluateJob,
@@ -351,7 +443,6 @@ impl EvaluateEngine {
         let stat_prompt = job.invocation.input_ids.len() as u64;
         let (sender, events) = mpsc::channel(PER_EXECUTION_CHANNEL_CAPACITY);
         let job = ExecuteJob {
-            deadline: None,
             span: tracing::Span::current(),
             execution_id,
             evaluate_request: job.evaluate_request,
@@ -360,20 +451,28 @@ impl EvaluateEngine {
             accepted_at: Instant::now(),
             sender,
             producer_key: self.provider.producer_key.clone(),
+            running: None,
+            complete: None,
         };
         if !self.pending_owed_executions.is_empty() {
-            self.pending_owed_executions.push_back(job);
+            self.pending_owed_executions
+                .push_back(PendingExecution::Resolved(job));
         } else {
             match self.try_start_execution(job) {
                 Ok(()) => {}
-                Err(StartExecutionError::Busy(job)) => self.pending_owed_executions.push_back(*job),
+                Err(StartExecutionError::Busy(job)) => self
+                    .pending_owed_executions
+                    .push_back(PendingExecution::Resolved(*job)),
                 Err(StartExecutionError::Closed(_)) => return Err(ExecutorError::ChannelClosed),
                 Err(StartExecutionError::Rejected { error, .. }) => return Err(error),
             }
         }
         self.metrics
             .record_execution_started("evaluate", "causal-lm", stat_prompt, stat_prompt);
-        Ok(ExecuteOutcome { events })
+        Ok(ExecuteOutcome {
+            events,
+            completion: None,
+        })
     }
 }
 fn evaluate_stop_reason(stop_reason: StopReason) -> (EvaluateStopReason, Option<u32>) {
@@ -698,6 +797,8 @@ pub(crate) mod environment_admission_tests {
                 evaluate_request: job.evaluate_request,
                 invocation: job.invocation,
                 sender: job.sender,
+                running: job.running,
+                complete: job.complete,
                 result: WorkerCompletionResult::Failed {
                     position: 0,
                     error: "fixture".into(),

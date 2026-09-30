@@ -898,7 +898,7 @@ fn proxy_cache_needs_no_causal_lm_files() {
 
 #[cfg(feature = "gateway")]
 #[test]
-fn unpaid_gateway_routes_are_explicitly_unsupported_until_grants() {
+fn unfunded_gateway_routes_require_a_work_backend() {
     assert!(
         gateway_trust(&["--responses-backend", "proxy"])
             .unwrap()
@@ -916,7 +916,7 @@ fn unpaid_gateway_routes_are_explicitly_unsupported_until_grants() {
         let error = gateway_trust(&args).unwrap_err();
         assert!(matches!(
             error.downcast_ref::<hellas_client::ClientError>(),
-            Some(hellas_client::ClientError::OwnerGrantRequired)
+            Some(hellas_client::ClientError::FundingRequired)
         ));
     }
 }
@@ -942,4 +942,65 @@ fn serve_uses_bounded_fetch_defaults() {
     };
     assert_eq!(fetch_max_in_flight, hellas_rpc::DEFAULT_FETCH_MAX_IN_FLIGHT);
     assert_eq!(fetch_queue_size, hellas_rpc::DEFAULT_FETCH_QUEUE_CAPACITY);
+}
+
+#[cfg(feature = "gateway")]
+#[test]
+fn offer_gateway_uses_its_private_resources_and_existing_identity() {
+    let cli = Cli::try_parse_from([
+        "hellas",
+        "gateway",
+        "--offer",
+        "lan-model",
+        "--grant-policy",
+        "chat",
+    ])
+    .unwrap();
+    assert!(validate_identity_options(&cli.command, None, true).is_err());
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("missing-identity");
+    assert!(load_command_identity(&cli.command, Some(&path)).is_err());
+    assert!(!path.exists());
+    for args in [
+        vec!["--responses-backend", "proxy"],
+        vec![
+            "--node-id",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ],
+        vec!["--http-fetch-config", "/http.json"],
+    ] {
+        let mut argv = vec!["hellas", "gateway", "--offer", "lan-model"];
+        argv.extend(args);
+        assert!(Cli::try_parse_from(argv).is_err());
+    }
+}
+
+#[cfg(feature = "gateway")]
+#[test]
+fn offer_gateway_accepts_independent_apple_trust_policy() {
+    let cli = Cli::try_parse_from([
+        "hellas",
+        "gateway",
+        "--offer",
+        "provider",
+        "--assurance",
+        "apple-app-attest",
+        "--apple-app-attest-app-id",
+        "TEAM.app",
+        "--apple-app-attest-cdhashes",
+        &"11".repeat(32),
+    ])
+    .unwrap();
+    let Commands::Gateway { remote_trust, .. } = cli.command else {
+        panic!("gateway");
+    };
+    assert_eq!(
+        remote_trust.assurance,
+        hellas_rpc::Assurance::AppleAppAttest
+    );
+    assert_eq!(
+        remote_trust.apple_app_attest_app_id.as_deref(),
+        Some("TEAM.app")
+    );
+    assert_eq!(remote_trust.apple_app_attest_cdhashes, vec![[0x11; 32]]);
 }

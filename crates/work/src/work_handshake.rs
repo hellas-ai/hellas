@@ -655,6 +655,7 @@ impl SetupService {
             outcome: Some(match outcome {
                 Ok(bundle) => Outcome::Advanced(SetupAdvanced { bundle }),
                 Err(refusal) => Outcome::Refused(WorkRefused {
+                    grant: None,
                     code: refusal.code.code() as i32,
                     reason: refusal.reason,
                 }),

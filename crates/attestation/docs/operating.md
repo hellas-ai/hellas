@@ -20,18 +20,20 @@ Attestation only works on a genuine, locked-down Apple machine.
    `ProviderEnrollmentBundle` = signed genesis + the original Apple
    attestation object. Hellas core supplies only the generic `RootProver`
    interface and the portable verifier.
-3. **Publish the pin.** The bundle's ContentId is the out-of-band trust anchor.
-   Distribute it (and the bundle) to requesters through a channel you trust —
-   this is the one thing that cannot be bootstrapped over the connection.
+3. **Publish the offer.** Paid offers carry the enrollment and signed bond
+   proposal, bound together by the provider's settlement key. Grant Offers
+   carry the enrollment with the grant. A requester derives the bundle's pin
+   from the verified offer and selects Apple app policy independently.
 4. **Serve with Apple assurance:** start the sealed-Fetch provider from Gate.
    The command-line node intentionally no longer owns DeviceCheck enrollment
    or native proof production.
 
 ## Requester
 
-Use the paid HTTPS Fetch gateway. Obtain the provider's enrollment-bundle
-ContentId (the pin) out of band, and configure each entry in the paid pool with
-`provider_genesis`, `apple_app_id` and `apple_cd_hashes`. See the
+Use the paid HTTPS Fetch gateway. Configure each pool entry's mandatory
+`provider_genesis` with the signed paid offer or an independently obtained
+ContentId pin. Select `apple_app_id` and `apple_cd_hashes` from trusted release
+metadata. See the
 [paid gateway guide](../../../docs/paid-gateway.md) for funding and pool fields,
 and [HTTP routing](../../../docs/http-gateway.md) for exact route configuration.
 
@@ -47,7 +49,7 @@ hellas-cli gateway \
 HTTP request. Paid Fetch journals contain accounting metadata, never request
 or response bodies. These storage rules do not establish an upstream API's
 retention policy. Native token Work remains producer-signed; Apple assurance
-here is the paid Fetch path.
+here is the paid Fetch path. Owner and principal routes use grant-funded Work with the same provider authentication.
 
 Before any prompt byte leaves the requester, the client verifies, in order:
 pin match → decode bundle → live peer == genesis transport key →

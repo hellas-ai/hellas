@@ -1,3 +1,6 @@
+#[cfg(feature = "construction-audit")]
+pub mod construction_audit;
+
 #[cfg(any(feature = "indexer", feature = "validator"))]
 mod app;
 #[cfg(feature = "client-core")]

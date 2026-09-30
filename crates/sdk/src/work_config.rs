@@ -424,7 +424,7 @@ struct ChannelPolicyFile {
 /// Required execution-policy fields. Defaults could change the terms being signed.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ExecutionPolicyFile {
+pub(crate) struct ExecutionPolicyFile {
     allowed_environment: String,
     generation_policy_digest: String,
     identity_source_digest: String,
@@ -437,7 +437,7 @@ struct ExecutionPolicyFile {
 }
 
 impl ExecutionPolicyFile {
-    fn into_policy(self) -> Result<EvaluatePolicyV2> {
+    pub(crate) fn into_policy(self) -> Result<EvaluatePolicyV2> {
         let allowed_environment: ContentId =
             self.allowed_environment
                 .parse()
@@ -470,7 +470,7 @@ impl ExecutionPolicyFile {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct FetchPolicyFile {
+pub(crate) struct FetchPolicyFile {
     allowed_environment: String,
     service: Option<String>,
     method: Option<String>,
@@ -493,7 +493,7 @@ struct OpenFetchPolicyFile {
 }
 
 impl FetchPolicyFile {
-    fn into_policy(self) -> Result<WorkPolicy> {
+    pub(crate) fn into_policy(self) -> Result<WorkPolicy> {
         let route = match (self.service, self.method, self.open_fetch) {
             (Some(service), Some(method), None) => {
                 PaidFetchRoutePolicy::sealed_route(service, method)?

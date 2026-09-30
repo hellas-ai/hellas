@@ -410,6 +410,7 @@ async fn signed_response_size_and_default_private_address_denial_are_enforced() 
 #[test]
 fn credentials_cannot_be_redirected_or_used_with_caller_trust_anchors() {
     let credential = HttpCredential {
+        trust_roots: HttpTrustRoots::WebPki,
         allowed_origins: vec!["https://api.example.com".into()],
         allowed_paths: vec!["/path".into()],
         allowed_methods: vec!["POST".into()],
@@ -520,6 +521,7 @@ async fn provider_injects_secret_without_disclosing_it_to_the_buyer() {
         BTreeMap::from([(
             "provider-account".into(),
             HttpCredential {
+                trust_roots: request.tls.roots.clone(),
                 allowed_origins: vec![url.origin().ascii_serialization()],
                 allowed_paths: vec!["/resource".into()],
                 allowed_methods: vec!["GET".into()],
@@ -529,13 +531,10 @@ async fn provider_injects_secret_without_disclosing_it_to_the_buyer() {
         )]),
     )
     .unwrap();
-    let addresses = tokio::net::lookup_host(("localhost", url.port().unwrap()))
-        .await
-        .unwrap()
-        .take(65)
-        .collect();
-    provider.clients.trust_fixture(&request, &url, addresses);
-    request.tls.roots = HttpTrustRoots::WebPki;
+    let mut substituted = request.clone();
+    substituted.tls.roots = HttpTrustRoots::WebPki;
+    assert!(provider.run(prepared(&substituted)).await.is_err());
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
     let buyer = ProducerSigningKey::from_secret_bytes([71; 32]).unwrap();
     let seller = ProducerSigningKey::from_secret_bytes([72; 32]).unwrap();
     let input_events = build_input_events_with_retention(

@@ -26,12 +26,15 @@ pub enum MachineCommand {
     Restart {
         name: String,
     },
-    /// Install fetch routes and provider credentials over iroh, then restart Hellas.
+    /// Replace Work resources, Fetch routes and credentials, then restart Hellas.
     Configure {
         name: String,
-        /// Local JSON route configuration, including its caller grants.
+        /// Local JSON Fetch route configuration.
         #[arg(long)]
         fetch_config: PathBuf,
+        /// Local JSON Work resource configuration and machine limits.
+        #[arg(long)]
+        grant_config: PathBuf,
         /// Copy a credential from this local environment variable. Repeat as needed.
         #[arg(long = "env", value_name = "NAME")]
         env: Vec<String>,
@@ -73,6 +76,7 @@ impl MachinesArgs {
             MachineCommand::Configure {
                 name,
                 fetch_config,
+                grant_config,
                 env,
                 files,
             } => {
@@ -83,6 +87,10 @@ impl MachinesArgs {
                 );
                 let fetch_config = serde_json::from_slice(&std::fs::read(fetch_config)?)
                     .map_err(|_| anyhow::anyhow!("invalid fetch configuration JSON"))?;
+                let grant_config = serde_json::from_slice(
+                    &hellas_private::read_bounded_regular_file(&grant_config, 48 * 1024)?,
+                )
+                .map_err(|_| anyhow::anyhow!("invalid grant configuration JSON"))?;
                 let env = env
                     .into_iter()
                     .map(|name| {
@@ -112,6 +120,7 @@ impl MachinesArgs {
                     .collect::<Result<_>>()?;
                 let configuration = crate::configuration::Configuration {
                     fetch_config,
+                    grant_config,
                     env,
                     files,
                 };

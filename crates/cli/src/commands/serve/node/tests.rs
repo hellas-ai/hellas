@@ -1,3 +1,4 @@
+use super::super::prepare_grants;
 use futures::StreamExt;
 use hellas_sdk::paid_provider::UnmountedWork;
 use std::collections::BTreeSet;
@@ -755,7 +756,11 @@ async fn requests_use_local_observation_and_one_contested_route_does_not_disable
     // permits replies, and those replies cannot initiate validator I/O.
     let entered = Arc::new(Semaphore::new(0));
     let release = Arc::new(Semaphore::new(0));
-    source.0.lock().unwrap().next_read = Some((entered.clone(), release.clone()));
+    source.0.lock().unwrap().next_read = Some(BlockedRead {
+        bond: first.bond_edge(),
+        entered: entered.clone(),
+        release: release.clone(),
+    });
     let observer_source = source.clone();
     let observing = tokio::spawn(async move { runner.tick(&observer_source).await });
     entered.acquire().await.unwrap().forget();
@@ -1983,9 +1988,15 @@ impl TxSink for TestChain {
 #[derive(Clone)]
 struct RoutedChain(Arc<Mutex<RoutedChainState>>);
 
+struct BlockedRead {
+    bond: EdgeId,
+    entered: Arc<Semaphore>,
+    release: Arc<Semaphore>,
+}
+
 struct RoutedChainState {
     snapshot_reads: usize,
-    next_read: Option<(Arc<Semaphore>, Arc<Semaphore>)>,
+    next_read: Option<BlockedRead>,
     completed_setups: Vec<EdgeId>,
     snapshots: Vec<WorkChannelSnapshot>,
     submitted: Vec<Tx>,
@@ -2065,9 +2076,20 @@ impl FinalizedWorkView for RoutedChain {
         let gate = {
             let mut state = self.0.lock().unwrap();
             state.snapshot_reads += 1;
-            state.next_read.take()
+            if state
+                .next_read
+                .as_ref()
+                .is_some_and(|gate| gate.bond == query.bond_edge)
+            {
+                state.next_read.take()
+            } else {
+                None
+            }
         };
-        if let Some((entered, release)) = gate {
+        if let Some(BlockedRead {
+            entered, release, ..
+        }) = gate
+        {
             entered.add_permits(1);
             release.acquire().await.unwrap().forget();
         }
@@ -2843,7 +2865,7 @@ impl RunningPaidNode {
             Err(error) => panic!("the node discovers its provider offer: {error}"),
         };
 
-        let alpns = served_alpns(true);
+        let alpns = served_alpns(true, false);
         assert!(
             alpns.contains(&<WorkSetup as ServiceMarker>::ALPN.as_bytes().to_vec())
                 && alpns.contains(&<Work as ServiceMarker>::ALPN.as_bytes().to_vec()),
@@ -3863,7 +3885,11 @@ async fn a_blocked_channel_observer_does_not_stop_other_channels_or_shutdown() {
     );
     let entered = Arc::new(Semaphore::new(0));
     let release = Arc::new(Semaphore::new(0));
-    source.0.lock().unwrap().next_read = Some((entered.clone(), release));
+    source.0.lock().unwrap().next_read = Some(BlockedRead {
+        bond: first.bond_edge(),
+        entered: entered.clone(),
+        release,
+    });
     let mount = MountedWork::default();
     let setups = MountedSetup::default();
     let runner = discover_two_route_runner(dir.path(), &mount, &setups);
@@ -4026,11 +4052,14 @@ async fn one_peer_routes_distinct_channels_without_crossing_journals() {
         response.response.outcome,
         Some(admit_certificate_response::Outcome::Refused(_))
     ));
-    for kind in [
-        FundingKind::Grant as i32,
-        FundingKind::Unspecified as i32,
-        99,
-    ] {
+    let mut unmounted_grant = first.signed_accept_request();
+    unmounted_grant.route.as_mut().unwrap().funding_kind = FundingKind::Grant as i32;
+    let response = accept_mounted_route(&mounted, peer, unmounted_grant).await;
+    assert!(
+        matches!(response.outcome, Some(accept_work_response::Outcome::Refused(refusal))
+        if refusal.code == WorkRefusalCode::NotReady as i32)
+    );
+    for kind in [FundingKind::Unspecified as i32, 99] {
         let mut request = first.signed_accept_request();
         request.route.as_mut().unwrap().funding_kind = kind;
         assert!(mounted.accept_work(request, context.clone()).await.is_err());
@@ -4049,4 +4078,329 @@ async fn one_peer_routes_distinct_channels_without_crossing_journals() {
     );
     assert_eq!(a.with_state(Channel::checkpoint).unwrap(), before_a);
     assert_eq!(b.with_state(Channel::checkpoint).unwrap(), before_b);
+}
+
+#[test]
+fn owner_bootstrap_and_explicit_resource_revision_preserve_machine_limits() {
+    use hellas_rpc::protocol::work_grant::{budget::*, records::*, *};
+    use hellas_sdk::grant_config::GrantConfig;
+    let root = temp();
+    let identity = crate::identity::load_or_create(Some(&root.path().join("identity"))).unwrap();
+    let provider = Principal::verify(identity.enrollment).unwrap();
+    let config = || super::super::GrantNodeConfig {
+        config: GrantConfig::unconfigured(root.path()),
+        provider: provider.clone(),
+        owner: Some(provider.clone()),
+    };
+    let (_, mut store) = prepare_grants(config()).unwrap();
+    let id = owner_grant_id(
+        store.state().network(),
+        provider.bundle().content_id(),
+        provider.id(),
+    );
+    assert!(store.state().grant(id).unwrap().policies.is_empty());
+    let limit = Limit {
+        meter: Meter::Requests,
+        window: Window::Day,
+        amount: 7,
+    };
+    store
+        .configure_machine(vec![limit], 2, hellas_work::grant_service::wall_clock())
+        .unwrap();
+    drop(store);
+    let (_, store) = prepare_grants(config()).unwrap();
+    let machine = store.state().ledger().node(BudgetNode::Machine).unwrap();
+    assert_eq!(machine.limits(), &[limit]);
+    assert_eq!(machine.concurrent(), 2);
+    drop(store);
+    let mut explicit = config();
+    explicit.config.machine_limits = Some(vec![limit]);
+    explicit.config.max_in_flight = 2;
+    explicit.config.resources = vec![GrantPolicy {
+        name: "evaluate".into(),
+        work: work_policy().into(),
+        https: None,
+    }];
+    let (_, store) = prepare_grants(explicit).unwrap();
+    assert_eq!(store.state().grant(id).unwrap().revision, Revision(2));
+    assert_eq!(store.state().grant(id).unwrap().policies.len(), 1);
+    drop(store);
+    let (_, store) = prepare_grants(config()).unwrap();
+    assert_eq!(store.state().grant(id).unwrap().revision, Revision(2));
+    assert_eq!(store.state().grant(id).unwrap().policies.len(), 1);
+}
+
+#[tokio::test]
+async fn grant_and_paid_work_share_a_peer_but_never_a_journal() {
+    use hellas_rpc::protocol::{
+        work_grant::{self as grant, budget::*, records::*},
+        work_profile::PreparedWorkInput,
+    };
+    use hellas_work::{
+        grant_service::{GrantService, wall_clock},
+        work::admission::{CapacityDomain, WorkPermit},
+        work_store::grant::GrantStore,
+    };
+    #[derive(Clone)]
+    struct Backend {
+        calls: Arc<AtomicUsize>,
+        slots: Arc<Semaphore>,
+    }
+    impl WorkBackend for Backend {
+        fn try_admit(&self, domain: CapacityDomain) -> Result<WorkPermit, BackendFault> {
+            Ok(WorkPermit::new(
+                domain,
+                self.slots
+                    .clone()
+                    .try_acquire_owned()
+                    .map_err(|_| BackendFault::new("full"))?,
+            ))
+        }
+        async fn evaluate(
+            &self,
+            input: PreparedEvaluateInput,
+        ) -> Result<Vec<OutputEventEnvelope>, BackendFault> {
+            let (_, admission) = input.into_parts_and_admission();
+            let _running = admission.dispatch()?;
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(answer_transcript())
+        }
+    }
+    fn principal(key: &ProducerSigningKey, transport: PeerId) -> Principal {
+        let statement = hellas_rpc::ProviderGenesisStatement {
+            root_kind: hellas_rpc::RootKind::Software,
+            root_public_key: key.public_key(),
+            producer_public_key: key.public_key(),
+            transport_public_key: PublicKey::Ed25519(transport.into_bytes()),
+            platform_credential: hellas_rpc::PlatformCredential::Absent,
+            installation_nonce: [7; 32],
+        };
+        let proof = key
+            .sign_digest(Digest::hash(&statement.canonical_bytes()))
+            .unwrap();
+        Principal::verify(hellas_rpc::ProviderEnrollmentBundle {
+            genesis: hellas_rpc::SignedProviderGenesis {
+                statement,
+                root_proof: hellas_rpc::RootProof::Software(proof),
+            },
+            platform: hellas_rpc::PlatformEnrollment::Absent,
+        })
+        .unwrap()
+    }
+    let root = temp();
+    write_setup_journal(root.path());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let backend = Backend {
+        calls: calls.clone(),
+        slots: Arc::new(Semaphore::new(2)),
+    };
+    let mounted = MountedWork::with_backend(backend.clone());
+    let mut observer = runner(root.path(), provider_policy(), &mounted);
+    let chain = TestChain::new();
+    chain.set_snapshot(ready_channel_snapshot(ORIGIN, None));
+    assert!(observer.tick(&chain).await);
+    let peer = default_route_peer();
+    let paid = mounted
+        .service(&vouched_context(peer), descriptor().channel().id())
+        .unwrap();
+    let grantee_key = ProducerSigningKey::from_secret_bytes([0x21; 32]).unwrap();
+    let provider_key = provider_producer();
+    let network = grant::grant_network();
+    let mut store = GrantStore::open(
+        &root.path().join("grants"),
+        network,
+        principal(&provider_key, PeerId::from_bytes([0x22; 32]))
+            .bundle()
+            .clone(),
+        wall_clock(),
+    )
+    .unwrap();
+    store
+        .configure_machine(
+            vec![Limit {
+                meter: Meter::Requests,
+                window: Window::Total,
+                amount: 3,
+            }],
+            2,
+            wall_clock(),
+        )
+        .unwrap();
+    let id = grant::GrantId([99; 16]);
+    store
+        .define(
+            GrantDef {
+                id,
+                revision: grant::Revision(1),
+                kind: GrantKind::Principal(principal(&grantee_key, peer)),
+                policies: vec![GrantPolicy {
+                    name: "native".into(),
+                    work: work_policy().into(),
+                    https: None,
+                }],
+                limits: vec![],
+                weight: std::num::NonZeroU16::new(1).unwrap(),
+                max_job_millis: std::num::NonZeroU64::new(10_000).unwrap(),
+                max_in_flight: std::num::NonZeroU16::new(1).unwrap(),
+                expires: None,
+                state: GrantState::Active,
+                allow_account_backed: false,
+            },
+            wall_clock(),
+        )
+        .unwrap();
+    let channel = store.state().channel_id(id).unwrap();
+    let input = PreparedWorkInput::Evaluate(bundle());
+    let now = wall_clock().0;
+    let auth = grant::GrantJobAuthorizationV1 {
+        channel_id: channel,
+        grant_id: id,
+        grant_revision: grant::Revision(1),
+        catalogue_revision: grant::Revision(0),
+        work_policy_digest: store.state().grant(id).unwrap().policies[0]
+            .work
+            .digest(network, channel.0),
+        prepared_input_digest: input.bound_digest(network, channel.0).unwrap(),
+        proposal_nonce: 1,
+        acceptance_deadline_ms: grant::UnixMillis(now + 1000),
+        terminal_deadline_ms: grant::UnixMillis(now + 5000),
+        delivery_deadline_ms: grant::UnixMillis(now + 10000),
+        request_commitment: hellas_rpc::RequestCommitment::from_digest(
+            input.input_commitment().unwrap().digest(),
+        ),
+        environment_commitment: work_policy().allowed_environment,
+    };
+    let request = AcceptWorkRequest {
+        route: Some(hellas_rpc::pb::work::WorkRoute::grant(channel)),
+        authorization: auth.encode(),
+        client_signature: grantee_key
+            .sign_digest(grant::grant_work_id(network, &auth))
+            .unwrap()
+            .bytes()
+            .to_vec(),
+        prepared_input: input.encode().unwrap(),
+    };
+    let service = GrantService::new(
+        store,
+        Arc::new(provider_key),
+        backend,
+        vec![],
+        Arc::new(wall_clock),
+    )
+    .unwrap();
+    assert!(mounted.mount_grants(service.clone()));
+    let response = accept_mounted_route(&mounted, peer, signed_accept_request()).await;
+    assert!(matches!(
+        response.outcome,
+        Some(accept_work_response::Outcome::Accepted(_))
+    ));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !paid
+            .with_state(|state| state.jobs().any(|job| job.phase() == JobPhase::Ready))
+            .unwrap()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let before_paid = paid.with_state(Channel::checkpoint).unwrap();
+    let mut context = vouched_context(peer);
+    context.open_exporter = Some([7; 32]);
+    let response: WithTrailer<AcceptWorkResponse> = mounted
+        .accept_work(request.clone(), context.clone())
+        .await
+        .unwrap()
+        .into();
+    assert!(matches!(
+        response.response.outcome,
+        Some(accept_work_response::Outcome::Accepted(_))
+    ));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if service
+                .administer(|store, _| {
+                    Ok(store
+                        .state()
+                        .channel(channel)
+                        .unwrap()
+                        .job_book()
+                        .jobs()
+                        .next()
+                        .is_none())
+                })
+                .unwrap()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(paid.with_state(Channel::checkpoint).unwrap(), before_paid);
+    let before_grant = service
+        .administer(|store, _| {
+            Ok(store
+                .state()
+                .ledger()
+                .node(BudgetNode::Machine)
+                .unwrap()
+                .counter(Meter::Requests, Window::Total)
+                .used)
+        })
+        .unwrap();
+    assert_eq!(before_grant, 1);
+    let mut crossed = request;
+    crossed.route = Some(hellas_rpc::pb::work::WorkRoute::payment(
+        descriptor().channel().id(),
+    ));
+    let response: WithTrailer<AcceptWorkResponse> = mounted
+        .accept_work(crossed, context.clone())
+        .await
+        .unwrap()
+        .into();
+    assert!(matches!(
+        response.response.outcome,
+        Some(accept_work_response::Outcome::Refused(_))
+    ));
+    let mut crossed = signed_accept_request();
+    crossed.route = Some(hellas_rpc::pb::work::WorkRoute::grant(channel));
+    let response: WithTrailer<AcceptWorkResponse> = mounted
+        .accept_work(crossed, context.clone())
+        .await
+        .unwrap()
+        .into();
+    assert!(matches!(
+        response.response.outcome,
+        Some(accept_work_response::Outcome::Refused(_))
+    ));
+    assert_eq!(paid.with_state(Channel::checkpoint).unwrap(), before_paid);
+    service
+        .administer(|store, _| {
+            assert_eq!(
+                store
+                    .state()
+                    .ledger()
+                    .node(BudgetNode::Machine)
+                    .unwrap()
+                    .counter(Meter::Requests, Window::Total)
+                    .used,
+                before_grant
+            );
+            Ok(())
+        })
+        .unwrap();
+    mounted.clear_all();
+    assert!(
+        mounted
+            .service(&context, descriptor().channel().id())
+            .is_none()
+    );
+    assert!(
+        mounted.grant_service().is_some(),
+        "paid observer failure cannot unmount grant authority"
+    );
+    service.drain().await.unwrap();
 }

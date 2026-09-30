@@ -47,6 +47,8 @@ pub struct HttpCredential {
     pub allowed_origins: Vec<String>,
     pub allowed_paths: Vec<String>,
     pub allowed_methods: Vec<String>,
+    /// Operator-owned trust boundary. Caller pins may only narrow these roots.
+    pub trust_roots: hellas_rpc::http_fetch::HttpTrustRoots,
     pub header_name: String,
     pub header_value: HttpSecret,
 }
@@ -90,6 +92,12 @@ impl HttpFetchProvider {
             }
         }
         for (alias, credential) in &credentials {
+            hellas_rpc::http_fetch::HttpTls {
+                roots: credential.trust_roots.clone(),
+                spki_sha256: vec![],
+            }
+            .validate()
+            .map_err(|_| fault("invalid credential trust roots"))?;
             if alias.is_empty()
                 || credential.allowed_origins.is_empty()
                 || credential.allowed_paths.is_empty()
@@ -166,13 +174,10 @@ impl HttpFetchProvider {
             ));
         }
         // A caller-controlled CA could impersonate the allowed origin and
-        // steal the provider's credential. Account requests must keep the
-        // public WebPKI trust boundary; additional pins can only narrow it.
-        if !matches!(
-            request.tls.roots,
-            hellas_rpc::http_fetch::HttpTrustRoots::WebPki
-        ) {
-            return Err(fault("provider credentials require WebPKI roots"));
+        // steal its credential. Only the operator selects this trust boundary;
+        // additional caller pins can narrow it, never replace its roots.
+        if request.tls.roots != credential.trust_roots {
+            return Err(fault("credential trust roots mismatch"));
         }
         if request
             .headers

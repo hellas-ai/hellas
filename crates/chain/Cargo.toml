@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [features]
+# Test instrumentation for proving which execution paths reach a chain client.
+construction-audit = []
 default = []
 otel = ["hellas-rpc?/otel"]
 # Chain/light-client domain vocabulary: addresses, transactions,
@@ -217,4 +219,5 @@ hellas-rpc = { workspace = true, features = ["work"] }
 hellas-work.workspace = true
 serde = { workspace = true, features = ["derive"] }
 tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt"] }
 tower = { version = "0.5", features = ["util"] }

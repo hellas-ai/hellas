@@ -79,6 +79,7 @@ pub struct UnmountedWork;
 
 fn not_ready() -> WorkRefused {
     WorkRefused {
+        grant: None,
         code: WorkRefusalCode::NotReady as i32,
         reason: "work state is not mounted".to_string(),
     }
@@ -97,6 +98,16 @@ impl WorkSetupHandler for UnmountedWork {
 }
 
 impl WorkHandler for UnmountedWork {
+    async fn get_standing(
+        &self,
+        _request: GetStandingRequest,
+        _context: TransportContext,
+    ) -> Result<impl Into<WithTrailer<GetStandingResponse>> + Send, WireStatus> {
+        Ok(GetStandingResponse {
+            outcome: Some(get_standing_response::Outcome::Refused(not_ready())),
+        })
+    }
+
     async fn accept_work(
         &self,
         _request: AcceptWorkRequest,
@@ -170,6 +181,7 @@ type MountedChannels = BTreeMap<(FundingKind, Digest), (PeerId, MountedWorkServi
 #[derive(Clone)]
 pub struct MountedWork {
     mounted: Arc<Mutex<MountedChannels>>,
+    grants: Arc<Mutex<Option<hellas_work::grant_service::GrantService>>>,
     driver: Option<AcceptedWorkDriver>,
 }
 
@@ -177,6 +189,7 @@ impl Default for MountedWork {
     fn default() -> Self {
         Self {
             mounted: Arc::new(Mutex::new(BTreeMap::new())),
+            grants: Arc::new(Mutex::new(None)),
             driver: None,
         }
     }
@@ -250,6 +263,16 @@ pub struct MountedWorkService {
 }
 
 impl WorkHandler for MountedWorkService {
+    async fn get_standing(
+        &self,
+        _request: GetStandingRequest,
+        _context: TransportContext,
+    ) -> Result<impl Into<WithTrailer<GetStandingResponse>> + Send, WireStatus> {
+        Ok(GetStandingResponse {
+            outcome: Some(get_standing_response::Outcome::Refused(not_ready())),
+        })
+    }
+
     async fn accept_work(
         &self,
         request: AcceptWorkRequest,
@@ -264,6 +287,7 @@ impl WorkHandler for MountedWorkService {
                 debug!(%error, "channel observer is not ready for acceptance");
                 return Ok(AcceptWorkResponse {
                     outcome: Some(accept_work_response::Outcome::Refused(WorkRefused {
+                        grant: None,
                         code: WorkRefusalCode::NotReady as i32,
                         reason: error.to_string(),
                     })),
@@ -327,12 +351,45 @@ impl WorkHandler for MountedWorkService {
 }
 
 impl MountedWork {
+    /// Grant authority has one provider-wide journal, so dynamic channels are
+    /// selected by that writer rather than separately mounted in the paid map.
+    pub fn mount_grants(&self, service: hellas_work::grant_service::GrantService) -> bool {
+        let Ok(mut held) = self.grants.lock() else {
+            return false;
+        };
+        if held.is_some() {
+            return false;
+        }
+        *held = Some(service);
+        true
+    }
+    pub fn grant_service(&self) -> Option<hellas_work::grant_service::GrantService> {
+        self.grants.lock().ok().and_then(|held| held.clone())
+    }
+    fn grant_handler(
+        &self,
+        route: Option<&WorkRoute>,
+    ) -> Option<hellas_work::grant_service::GrantService> {
+        if route?.funding_kind != FundingKind::Grant as i32 {
+            return None;
+        }
+        self.grant_service()
+    }
+    pub async fn drain_grants(
+        &self,
+    ) -> Result<(), hellas_work::work_store::grant::GrantStoreError> {
+        if let Some(service) = self.grant_service() {
+            service.drain().await?;
+        }
+        Ok(())
+    }
     pub fn with_backend<B>(backend: B) -> Self
     where
         B: WorkBackend + Send + Sync + 'static,
     {
         Self {
             mounted: Arc::new(Mutex::new(BTreeMap::new())),
+            grants: Arc::new(Mutex::new(None)),
             driver: Some(AcceptedWorkDriver::new(backend)),
         }
     }
@@ -377,12 +434,7 @@ impl MountedWork {
         })?;
         match kind {
             FundingKind::Payment => {}
-            FundingKind::Grant => {
-                return Err(WireStatus::new(
-                    hellas_wire::WireCode::Unimplemented,
-                    "payment funding required",
-                ));
-            }
+            FundingKind::Grant => return Ok(None),
             FundingKind::Unspecified => {
                 return Err(WireStatus::new(
                     hellas_wire::WireCode::InvalidArgument,
@@ -486,11 +538,29 @@ impl WorkSetupHandler for MountedSetup {
 }
 
 impl WorkHandler for MountedWork {
+    async fn get_standing(
+        &self,
+        request: GetStandingRequest,
+        context: TransportContext,
+    ) -> Result<impl Into<WithTrailer<GetStandingResponse>> + Send, WireStatus> {
+        Ok(match self.grant_handler(request.route.as_ref()) {
+            Some(service) => service.standing(&request, &context),
+            None => GetStandingResponse {
+                outcome: Some(get_standing_response::Outcome::Refused(not_ready())),
+            },
+        })
+    }
+
     async fn accept_work(
         &self,
         request: AcceptWorkRequest,
         context: TransportContext,
     ) -> Result<impl Into<WithTrailer<AcceptWorkResponse>> + Send, WireStatus> {
+        if let Some(service) = self.grant_handler(request.route.as_ref()) {
+            return Ok(Into::<WithTrailer<AcceptWorkResponse>>::into(
+                service.accept_work(request, context).await?,
+            ));
+        }
         match self.handler(&context, request.route.as_ref())? {
             Some(service) => Ok(Into::<WithTrailer<AcceptWorkResponse>>::into(
                 service.accept_work(request, context).await?,
@@ -505,6 +575,11 @@ impl WorkHandler for MountedWork {
         request: DeliverResultRequest,
         context: TransportContext,
     ) -> Result<impl Into<WithTrailer<DeliverResultResponse>> + Send, WireStatus> {
+        if let Some(service) = self.grant_handler(request.route.as_ref()) {
+            return Ok(Into::<WithTrailer<DeliverResultResponse>>::into(
+                service.deliver_result(request, context).await?,
+            ));
+        }
         match self.handler(&context, request.route.as_ref())? {
             Some(service) => Ok(Into::<WithTrailer<DeliverResultResponse>>::into(
                 service.deliver_result(request, context).await?,
@@ -519,6 +594,9 @@ impl WorkHandler for MountedWork {
         request: DeliverResultRequest,
         context: TransportContext,
     ) -> Result<hellas_work::work::PaidResultStream, WireStatus> {
+        if let Some(service) = self.grant_handler(request.route.as_ref()) {
+            return service.stream_result(request, context).await;
+        }
         match self.handler(&context, request.route.as_ref())? {
             Some(service) => service.stream_result(request, context).await,
             None => UnmountedWork.stream_result(request, context).await,
@@ -529,6 +607,11 @@ impl WorkHandler for MountedWork {
         request: AdmitCertificateRequest,
         context: TransportContext,
     ) -> Result<impl Into<WithTrailer<AdmitCertificateResponse>> + Send, WireStatus> {
+        if let Some(service) = self.grant_handler(request.route.as_ref()) {
+            return Ok(Into::<WithTrailer<AdmitCertificateResponse>>::into(
+                service.admit_certificate(request, context).await?,
+            ));
+        }
         match self.handler(&context, request.route.as_ref())? {
             Some(service) => Ok(Into::<WithTrailer<AdmitCertificateResponse>>::into(
                 service.admit_certificate(request, context).await?,

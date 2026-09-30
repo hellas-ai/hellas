@@ -59,6 +59,8 @@ async fn provider_advertises_only_work_protocols() {
             fetch_max_in_flight: 1,
             fetch_queue_capacity: 1,
             paid_work: Some(fixture.config),
+            #[cfg(feature = "grant-provider")]
+            grants: None,
         })
         .await
         .unwrap();

@@ -68,7 +68,10 @@ fn outcome_items(events: Vec<Result<WorkEvent, hellas_wire::WireStatus>>) -> Exe
         }
     }
     drop(sender);
-    ExecuteOutcome { events: receiver }
+    ExecuteOutcome {
+        events: receiver,
+        completion: None,
+    }
 }
 
 fn outcome(events: Vec<WorkEvent>) -> ExecuteOutcome {
@@ -232,4 +235,21 @@ async fn an_unretained_request_still_yields_its_transcript() {
     // And it is a different transcript than the retained request's,
     // because the request commitment binds retention.
     assert_ne!(events, transcript());
+}
+#[tokio::test]
+async fn consumer_failure_waits_for_physical_worker_completion() {
+    let mut outcome = outcome_items(vec![Err(hellas_wire::WireStatus::new(
+        hellas_wire::WireCode::Internal,
+        "fixture stream failure",
+    ))]);
+    let (complete, completion) = tokio::sync::oneshot::channel();
+    outcome.completion = Some(completion);
+    let mut task = tokio::spawn(super::drain_until_terminated(outcome, None));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(10), &mut task)
+            .await
+            .is_err()
+    );
+    drop(complete);
+    assert!(task.await.unwrap().is_err());
 }

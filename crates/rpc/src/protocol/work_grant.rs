@@ -5,24 +5,38 @@ use super::work::{
 use crate::{ContentId, Digest, RequestCommitment};
 use hellas_kernel::{Encode, NetworkId};
 use hellas_xet::MIN_CHUNK_SIZE;
+use serde::{Deserialize, Serialize};
+pub mod admin;
+pub mod budget;
+pub mod records;
+pub mod resource;
+pub mod standing;
+
+/// Standalone Work namespace shared by CLI providers and managed workers.
+/// It names no financial chain and does not require a chain client.
+pub fn grant_network() -> NetworkId {
+    NetworkId::new("hellas-grants-v1").expect("fixed grant namespace")
+}
 
 /// Stable provider-local grant identity.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct GrantId(pub [u8; 16]);
 /// Stable project-local track identity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TrackId(pub [u8; 16]);
 /// Canonical enrollment identity.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PrincipalId(pub ContentId);
 /// Funding-separated channel identity.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ChannelId(pub Digest);
 /// Monotone grant or catalogue revision.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Revision(pub u64);
 /// Absolute Unix wall-clock milliseconds, never a finalized block height.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
+)]
 pub struct UnixMillis(pub u64);
 
 /// A grant job has signed resource authority and deadlines, with no payment edges or price.
@@ -94,7 +108,7 @@ pub(crate) const GRANT_JOB_AUTHORIZE: &[u8] = b"hellas.work.grant-job-authorize.
 /// Derives a channel without consuming funds or creating a grant.
 pub fn grant_channel_id(
     network: NetworkId,
-    provider: PrincipalId,
+    provider: ContentId,
     grant: GrantId,
     client: PrincipalId,
     generation: u64,
@@ -103,7 +117,7 @@ pub fn grant_channel_id(
         GRANT_CHANNEL,
         &[
             EncodedNetwork::new(network).as_slice(),
-            provider.0.as_bytes(),
+            provider.as_bytes(),
             &grant.0,
             client.0.as_bytes(),
             &generation.to_be_bytes(),
@@ -130,3 +144,18 @@ const _: () = assert!(
     GRANT_CHANNEL.len() + <NetworkId as Encode>::MAX_ENCODED_SIZE + 32 + 16 + 32 + 8
         < MIN_CHUNK_SIZE
 );
+
+/// Stable identity: recreating owner configuration never recreates allowance.
+pub fn owner_grant_id(network: NetworkId, provider: ContentId, owner: PrincipalId) -> GrantId {
+    let digest = xh(
+        b"hellas.work.owner-grant.v1",
+        &[
+            EncodedNetwork::new(network).as_slice(),
+            provider.as_bytes(),
+            owner.0.as_bytes(),
+        ],
+    );
+    let mut id = [0; 16];
+    id.copy_from_slice(&digest.as_bytes()[..16]);
+    GrantId(id)
+}

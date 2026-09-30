@@ -4,7 +4,7 @@ mod config;
 mod observation;
 mod routing;
 
-pub use config::HttpGatewayConfig;
+pub use config::{HttpGatewayConfig, HttpRoute};
 #[cfg(test)]
 mod tests;
 
@@ -223,10 +223,31 @@ async fn handle(State(state): State<Arc<HttpState>>, request: Request) -> Respon
             return attributed(
                 error(
                     StatusCode::SERVICE_UNAVAILABLE,
-                    "paid Fetch is busy; retry later",
+                    "Work Fetch is busy; retry later",
                 ),
                 &backend.name,
             );
+        }
+        Err(HttpOpenError::Paid(
+            ref failure @ (super::WorkGatewayError::Rejected(_)
+            | super::WorkGatewayError::Denied(_)
+            | super::WorkGatewayError::Quota(_)),
+        )) => {
+            let (status, message) = match failure {
+                super::WorkGatewayError::Rejected(_) => (
+                    StatusCode::BAD_REQUEST,
+                    "request exceeds or mismatches the granted resource",
+                ),
+                super::WorkGatewayError::Denied(_) => {
+                    (StatusCode::FORBIDDEN, "grant access refused")
+                }
+                _ => (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "resource allowance exhausted",
+                ),
+            };
+            observed.status(status.as_u16());
+            return attributed(error(status, message), &backend.name);
         }
         Err(_) => {
             observed.status(502);

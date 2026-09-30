@@ -44,9 +44,37 @@
 use crate::ExecutorError;
 use crate::executor::{ExecutorHandle, ExecutorOwedRequest};
 use hellas_rpc::OutputEventEnvelope;
+use hellas_work::work::admission::{CapacityDomain, WorkAdmission, WorkPermit};
 use hellas_work::work::{BackendFault, PaidProgress, PreparedEvaluateInput, WorkBackend};
 
 impl ExecutorHandle {
+    fn capacity(
+        &self,
+        domain: CapacityDomain,
+    ) -> Result<std::sync::Arc<tokio::sync::Semaphore>, BackendFault> {
+        match domain {
+            CapacityDomain::Fetch => Ok(self.fetch_capacity.clone()),
+            CapacityDomain::Gpu => self
+                .gpu_capacity
+                .clone()
+                .ok_or_else(|| BackendFault::new("GPU execution is unavailable")),
+        }
+    }
+    async fn reserve_payment_capacity(
+        &self,
+        admission: &mut WorkAdmission,
+        domain: CapacityDomain,
+    ) -> Result<(), BackendFault> {
+        if admission.needs_permit() {
+            let permit = self
+                .capacity(domain)?
+                .acquire_owned()
+                .await
+                .map_err(|_| BackendFault::new("executor is closed"))?;
+            admission.attach_payment_permit(WorkPermit::new(domain, permit))?;
+        }
+        Ok(())
+    }
     /// Runs one already-authorized paid job to its terminal.
     ///
     /// The receiver is owned by this future, not by a transport. A
@@ -68,11 +96,14 @@ impl ExecutorHandle {
 
     async fn run_paid_evaluate_stream(
         &self,
-        input: PreparedEvaluateInput,
+        mut input: PreparedEvaluateInput,
         progress: Option<PaidProgress>,
     ) -> Result<Vec<OutputEventEnvelope>, ExecutorError> {
         use tracing::Instrument;
         async move {
+            self.reserve_payment_capacity(input.admission_mut(), CapacityDomain::Gpu)
+                .await
+                .map_err(|e| ExecutorError::ResourceExhausted(e.to_string()))?;
             // The actor admits this durable obligation exactly once. If the GPU
             // worker is occupied, EvaluateEngine retains it in its owed FIFO and
             // dispatches it ahead of peer-admitted work.
@@ -83,11 +114,25 @@ impl ExecutorHandle {
                     reply,
                 })
                 .await?;
-            drain_transcript_with_progress(outcome, progress).await
+            drain_until_terminated(outcome, progress).await
         }
         .instrument(hellas_rpc::request_span!(target: "hellas_request", "paid.executor.stream"))
         .await
     }
+}
+
+async fn drain_until_terminated(
+    mut outcome: crate::executor::ExecuteOutcome,
+    progress: Option<PaidProgress>,
+) -> Result<Vec<OutputEventEnvelope>, ExecutorError> {
+    let completion = outcome.completion.take();
+    let result = drain_transcript_with_progress(outcome, progress).await;
+    // A reader/callback failure cannot settle the grant while its worker is
+    // still unwinding or terminating a GPU operation.
+    if let Some(completion) = completion {
+        let _ = completion.await;
+    }
+    result
 }
 
 /// Reads one execution's events to its end, and returns the transcript
@@ -170,10 +215,19 @@ async fn drain_transcript_with_progress(
 }
 
 impl WorkBackend for ExecutorHandle {
+    fn try_admit(&self, domain: CapacityDomain) -> Result<WorkPermit, BackendFault> {
+        let permit = self
+            .capacity(domain)?
+            .try_acquire_owned()
+            .map_err(|_| BackendFault::new("executor queue is full"))?;
+        Ok(WorkPermit::new(domain, permit))
+    }
     async fn fetch(
         &self,
-        input: hellas_work::work::PreparedFetchInput,
+        mut input: hellas_work::work::PreparedFetchInput,
     ) -> Result<Vec<OutputEventEnvelope>, BackendFault> {
+        self.reserve_payment_capacity(input.admission_mut(), CapacityDomain::Fetch)
+            .await?;
         self.send_owed(|reply| ExecutorOwedRequest::RunPaidFetch {
             span: hellas_rpc::request_span!(target: "hellas_request", "paid.executor.fetch"),
             input: Box::new(input),
@@ -186,9 +240,11 @@ impl WorkBackend for ExecutorHandle {
 
     async fn fetch_stream(
         &self,
-        input: hellas_work::work::PreparedFetchInput,
+        mut input: hellas_work::work::PreparedFetchInput,
         progress: PaidProgress,
     ) -> Result<Vec<OutputEventEnvelope>, BackendFault> {
+        self.reserve_payment_capacity(input.admission_mut(), CapacityDomain::Fetch)
+            .await?;
         self.send_owed(|reply| ExecutorOwedRequest::RunPaidFetch {
             span: hellas_rpc::request_span!(target: "hellas_request", "paid.executor.fetch"),
             input: Box::new(input),

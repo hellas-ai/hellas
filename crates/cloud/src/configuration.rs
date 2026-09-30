@@ -12,8 +12,10 @@ use serde_json::Value;
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Configuration {
-    /// The CLI's fetch route file, including explicit caller grants.
+    /// The CLI's Fetch routes. Authority comes exclusively from Work grants.
     pub fetch_config: Value,
+    /// Complete Work resources and machine limits; journal/socket paths are managed.
+    pub grant_config: Value,
     /// Provider-local credential environment, never returned by status or inventory.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
@@ -48,7 +50,8 @@ mod tests {
     fn staged_credentials_are_private_and_missing_references_leave_no_files() {
         let parent = tempfile::tempdir().unwrap();
         let mut configuration = Configuration {
-            fetch_config: json!({"routes":[{"auth_path":"@files/auth.json"}],"callers":[]}),
+            fetch_config: json!({"routes":[{"auth_path":"@files/auth.json"}]}),
+            grant_config: json!({"resources":[],"machine_limits":[]}),
             env: BTreeMap::new(),
             files: [("auth.json".into(), json!({"token":"fixture"}))].into(),
         };
@@ -81,6 +84,8 @@ mod tests {
 #[serde(deny_unknown_fields)]
 pub(crate) struct InstalledConfiguration {
     pub fetch_config: PathBuf,
+    #[serde(default)]
+    pub grant_config: Option<PathBuf>,
     pub env: BTreeMap<String, String>,
 }
 
@@ -95,11 +100,22 @@ impl Configuration {
         ensure!(
             self.fetch_config.is_object()
                 && self.fetch_config.get("routes").is_some_and(Value::is_array)
+                && self.fetch_config.get("callers").is_none(),
+            "fetch configuration requires routes; legacy callers are unsupported"
+        );
+        ensure!(
+            self.grant_config.is_object()
                 && self
-                    .fetch_config
-                    .get("callers")
-                    .is_some_and(Value::is_array),
-            "fetch configuration requires routes and callers arrays"
+                    .grant_config
+                    .get("resources")
+                    .is_some_and(Value::is_array)
+                && self
+                    .grant_config
+                    .get("machine_limits")
+                    .is_some_and(Value::is_array)
+                && self.grant_config.get("journal_root").is_none()
+                && self.grant_config.get("control_socket").is_none(),
+            "grant configuration requires resources and machine_limits; journal and socket paths are managed"
         );
         for (name, value) in &self.env {
             ensure!(
@@ -183,10 +199,19 @@ impl Configuration {
         let path = stage.path().join("fetch.json");
         crate::config::save_private(&path, &fetch_config, true)
             .map_err(|_| "could not write private worker fetch configuration")?;
+        let mut grant_config = self.grant_config.clone();
+        grant_config["journal_root"] = serde_json::json!(parent.join("grants"));
+        grant_config["control_socket"] = serde_json::json!(parent.join("control.sock"));
+        resolve(&mut grant_config, &files, &self.files)
+            .map_err(|_| "grant config references a missing credential file")?;
+        let grant_path = stage.path().join("grant.json");
+        crate::config::save_private(&grant_path, &grant_config, true)
+            .map_err(|_| "could not write private worker grant configuration")?;
         Ok((
             stage,
             InstalledConfiguration {
                 fetch_config: path,
+                grant_config: Some(grant_path),
                 env: self.env.clone(),
             },
         ))

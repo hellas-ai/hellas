@@ -4,6 +4,7 @@ use hellas_rpc::protocol::work_offer::{PaidOffer, SignedPaidOffer};
 use hellas_rpc::services::work::{Work, WorkServer};
 use hellas_wire::Dispatcher;
 use hellas_work::work::ObservationTime;
+use std::sync::Arc;
 
 /// Chain readiness is supplied by the funded-channel fixture. Offer import,
 /// Open, acceptance, execution, streamed delivery and payment use real SDK/RPC.
@@ -53,18 +54,62 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
             hellas_rpc::peers::PeerId::from_bytes(*client_endpoint.id().as_bytes()),
             &service
         ));
+        use crate::grant_client::tests::{definition, network, principal};
+        use crate::grant_client::{GrantSessionOptions, GrantTransport, UnpinnedOffer};
+        use hellas_rpc::protocol::work_grant::{
+            GrantId, UnixMillis,
+            records::{Offer, SignedOffer},
+        };
+        let now = hellas_work::grant_service::wall_clock();
+        let grant = definition(GrantId([1; 16]), principal(1).0);
+        let mut store = hellas_work::work_store::grant::GrantStore::open(
+            &fixture.root.path().join("grants"),
+            network(),
+            bundle.clone(),
+            now,
+        )
+        .unwrap();
+        store.configure_machine(vec![], 2, now).unwrap();
+        store.define(grant.clone(), now).unwrap();
+        let grants = hellas_work::grant_service::GrantService::new(
+            store,
+            Arc::new(producer.clone()),
+            super::recovery::Backend::default(),
+            vec![],
+            Arc::new(hellas_work::grant_service::wall_clock),
+        )
+        .unwrap();
+        assert!(mount.mount_grants(grants.clone()));
+        let offer = SignedOffer::sign(
+            Offer {
+                network: network(),
+                provider: bundle.clone(),
+                grant,
+                generation: 0,
+                sequence: 1,
+                valid_until: UnixMillis(now.0 + 60_000),
+                addresses: signed.offer().addresses.clone(),
+            },
+            &producer,
+        )
+        .unwrap();
+        let grant_target =
+            UnpinnedOffer::decode(&offer.encode().unwrap(), principal(1).0.id(), now)
+                .unwrap()
+                .pin(&trust)
+                .unwrap();
         let serving = tokio::spawn({
             let server = server.clone();
             async move {
                 let mut tasks = tokio::task::JoinSet::new();
-                for index in 0..3 {
+                for index in 0..4 {
                     let connection = server.accept().await.unwrap().await.unwrap();
                     let bundle = bundle.clone();
                     let producer = producer.clone();
                     let mount = mount.clone();
                     tasks.spawn(async move {
                         let transport = IrohTransport::new(connection);
-                        if index == 2 {
+                        if index == 3 {
                             // A peer that implements Work but has no Open must
                             // receive only the failed authentication request.
                             let inbound = transport.accept().await.unwrap().unwrap();
@@ -82,7 +127,7 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
                         )
                         .await;
                         while let Ok(Some(inbound)) = transport.accept().await {
-                            assert!(index < 1, "failed Open must not disclose a Work request");
+                            assert!(index < 2, "failed Open must not disclose a Work request");
                             let _ = Dispatcher::<IrohTransport>::dispatch(
                                 &WorkServer(mount.clone()),
                                 inbound,
@@ -146,6 +191,25 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
                 .unwrap(),
             crate::test_support::PRICE
         );
+        let mut authorized = crate::WorkSession::<crate::work_session::GrantFunding>::open(
+            GrantSessionOptions {
+                target: grant_target,
+                client: principal(1).0,
+                signer: Arc::new(principal(1).1),
+                journal_root: fixture.root.path().join("grant-client"),
+                timeout: Duration::from_secs(5),
+            },
+            GrantTransport::Remote(client_endpoint.clone()),
+        )
+        .await
+        .unwrap();
+        let result = authorized
+            .run("responses", fixture.proposal().prepared_input, None)
+            .await
+            .unwrap();
+        assert!(!result.events.is_empty());
+        authorized.shutdown().await.unwrap();
+        grants.drain().await.unwrap();
         session
             .dialer
             .work()

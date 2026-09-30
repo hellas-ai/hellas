@@ -84,7 +84,16 @@ fn load_command_identity(
     let owned_machine = command.owned_machine().is_some();
     #[cfg(not(all(feature = "cloud", unix)))]
     let owned_machine = false;
-    let read_only = owned_machine
+    let grant_identity = matches!(command, Commands::Contact { .. } | Commands::Offer { .. });
+    #[cfg(feature = "node")]
+    let grant_identity = grant_identity || matches!(command, Commands::Grant(_));
+    #[cfg(feature = "gateway")]
+    let grant_identity =
+        grant_identity || matches!(command, Commands::Gateway { offer: Some(_), .. });
+    #[cfg(feature = "evaluate")]
+    let grant_identity = grant_identity || matches!(command, Commands::Gateway { local: true, .. });
+    let read_only = grant_identity
+        || owned_machine
         || settles_paid_work
         || matches!(
             command,
@@ -118,13 +127,13 @@ impl From<GatewayResponsesBackend> for hellas_gateway::ResponsesBackend {
     }
 }
 
-/// Unfunded execution routes await grants; proxy mode has no Hellas peer.
+/// Execution requires an explicit Work backend; proxy mode has no Hellas peer.
 #[cfg(feature = "gateway")]
 fn gateway_provider_trust(
     responses_backend: GatewayResponsesBackend,
 ) -> anyhow::Result<Option<hellas_client::ProviderTrustAnchor>> {
     if responses_backend != GatewayResponsesBackend::Proxy {
-        return Err(hellas_client::ClientError::OwnerGrantRequired.into());
+        return Err(hellas_client::ClientError::FundingRequired.into());
     }
     Ok(None)
 }
@@ -308,6 +317,19 @@ enum Commands {
     #[cfg(all(feature = "cloud", unix))]
     /// Internal management RPC for local applications.
     Control(hellas_cloud::machines::ControlArgs),
+    /// Share this identity's verified public enrollment.
+    Contact {
+        #[command(subcommand)]
+        command: commands::contributions::ContactCommand,
+    },
+    /// Import a private provider Offer addressed to this identity.
+    Offer {
+        #[command(subcommand)]
+        command: commands::contributions::OfferCommand,
+    },
+    #[cfg(feature = "node")]
+    /// Administer provider grants over local owner control.
+    Grant(commands::contributions::grants::GrantArgs),
     #[cfg(feature = "node")]
     /// Run the RPC server
     Serve {
@@ -370,6 +392,16 @@ enum Commands {
         /// Work remains retryably not ready until the configured state mounts.
         #[arg(long = "work-config")]
         work_config_file: Option<PathBuf>,
+        /// Grant resources and machine safety limits; no chain configuration is needed.
+        #[arg(long = "grant-config")]
+        grant_config_file: Option<PathBuf>,
+        /// Explicitly initialize the local identity as owner.
+        #[arg(long, conflicts_with_all = ["owner_enrollment", "check_config"])]
+        init_owner: bool,
+        /// Authenticated managed-machine owner enrollment supplied by the agent.
+        #[arg(long, value_name = "FILE", conflicts_with = "check_config")]
+        owner_enrollment: Option<PathBuf>,
+
         /// Prometheus metrics port (e.g. 9090)
         #[arg(long = "metrics-port")]
         metrics_port: Option<u16>,
@@ -377,12 +409,12 @@ enum Commands {
         #[arg(long = "graffiti", default_value = "")]
         graffiti: String,
         /// Fetch configuration file: sealed upstream destinations and
-        /// credentials, route capabilities, and caller access policy. No file
+        /// credentials and route capabilities. No file
         /// means this node serves no Fetch routes.
         #[arg(long = "fetch-config")]
         fetch_config_file: Option<PathBuf>,
-        /// Validate fetch routes and credentials without starting a node.
-        #[arg(long, requires = "fetch_config_file")]
+        /// Validate Fetch and grant resources without starting a node.
+        #[arg(long)]
         check_config: bool,
         /// Maximum number of Fetch provider streams running at once.
         #[arg(
@@ -424,7 +456,7 @@ enum Commands {
     #[command(
         mut_arg("environment", |arg| arg
             .required(false)
-            .required_unless_present_any(["responses_backend", "http_fetch_config"])
+            .required_unless_present_any(["responses_backend", "http_fetch_config", "offer"])
             .required_if_eq("responses_backend", "hellas")
             .requires("tokenizer")),
         mut_arg("tokenizer", |arg| arg.required(false).requires("environment"))
@@ -432,7 +464,17 @@ enum Commands {
     #[cfg_attr(all(feature = "cloud", unix), command(group(
         clap::ArgGroup::new("remote_target").args(["node_id", "machine"])
     )))]
+    #[cfg_attr(all(feature = "cloud", unix), command(mut_arg("environment", |arg| arg.required_unless_present_any(["responses_backend", "http_fetch_config", "offer", "machine"]))))]
     Gateway {
+        /// Use a private Offer previously verified by `offer import`.
+        #[arg(long, value_name = "ALIAS", conflicts_with_all = ["node_id", "node_addrs", "provider_genesis", "responses_backend", "http_fetch_config"])]
+        #[cfg_attr(feature = "node", arg(conflicts_with = "paid_work_config"))]
+        #[cfg_attr(all(feature = "cloud", unix), arg(conflicts_with = "machine"))]
+        #[cfg_attr(feature = "evaluate", arg(conflicts_with = "local"))]
+        offer: Option<String>,
+        /// Select one resource when the Offer includes several matching policies.
+        #[arg(long)]
+        grant_policy: Option<String>,
         /// Serve exact HTTP routes through paid HTTPS Fetch.
         #[arg(long, value_name = "FILE", conflicts_with_all = ["responses_backend", "environment"])]
         #[cfg_attr(all(feature = "cloud", unix), arg(conflicts_with = "machine"))]
@@ -481,7 +523,7 @@ enum Commands {
         #[cfg_attr(all(feature = "cloud", unix), arg(requires = "remote_target"))]
         #[cfg_attr(not(all(feature = "cloud", unix)), arg(requires = "node_id"))]
         node_addrs: Vec<SocketAddr>,
-        /// Select an owner machine; requires an owner grant
+        /// Execute locally through this identity's durable owner grant
         #[cfg(feature = "evaluate")]
         #[arg(
             long = "local",
@@ -690,6 +732,11 @@ fn validate_identity_options(
         command if command.owned_machine().is_some() => true,
         #[cfg(all(feature = "cloud", unix))]
         Commands::Cloud(_) | Commands::Machines(_) | Commands::Control(_) => true,
+        Commands::Contact { .. } | Commands::Offer { .. } => true,
+        #[cfg(feature = "gateway")]
+        Commands::Gateway { offer: Some(_), .. } => true,
+        #[cfg(feature = "node")]
+        Commands::Grant(_) => true,
         Commands::Identity {
             command: IdentityCommand::ShowNodeId | IdentityCommand::ShowEnrollmentId,
         }
@@ -777,11 +824,15 @@ async fn async_main() {
     #[cfg(feature = "node")]
     if let Commands::Serve {
         check_config: true,
-        fetch_config_file: Some(path),
+        fetch_config_file,
+        grant_config_file,
         ..
     } = &cli.command
     {
-        let result = commands::serve::validate_fetch_config(path);
+        let result = commands::serve::validate_provider_config(
+            fetch_config_file.as_deref(),
+            grant_config_file.as_deref(),
+        );
         tracer_provider.shutdown();
         if let Err(error) = result {
             eprintln!("error: {error:#}");
@@ -900,6 +951,11 @@ async fn async_main() {
     }
 
     let result = match command {
+        Commands::Contact { command } => commands::contributions::contact(command, &local_identity),
+        Commands::Offer { command } => commands::contributions::offer(command, &local_identity),
+        #[cfg(feature = "node")]
+        Commands::Grant(args) => commands::contributions::grants::run(args, &local_identity).await,
+
         #[cfg(feature = "node")]
         Commands::Serve {
             assurance,
@@ -926,6 +982,9 @@ async fn async_main() {
             #[cfg(feature = "evaluate")]
             gpu_execution_timeout_secs,
             work_config_file,
+            grant_config_file,
+            init_owner,
+            owner_enrollment,
             metrics_port,
             graffiti,
             fetch_config_file,
@@ -949,6 +1008,22 @@ async fn async_main() {
                         // never made here.
                         let settlement_key = identity::settlement_signer(&local_identity);
                         let open_identity = local_identity.open_identity();
+                        let grants = if grant_config_file.is_some() || init_owner || owner_enrollment.is_some() {
+                            anyhow::ensure!(assurance == hellas_rpc::Assurance::ProducerSigned, "grants require producer-signed assurance");
+                            let provider = commands::contributions::principal(&local_identity)?;
+                            let root = commands::contributions::data_root(&provider)?;
+                            let config = if let Some(path) = grant_config_file.as_deref() {
+                                hellas_sdk::grant_config::GrantConfig::load(path, &root)?
+                            } else { hellas_sdk::grant_config::GrantConfig::unconfigured(&root) };
+                            let owner = if init_owner { Some(provider.clone()) } else {
+                                owner_enrollment.as_deref().map(|path| {
+                                    let bytes = commands::read_bounded_regular_file(path, "owner enrollment", hellas_rpc::protocol::work_grant::records::MAX_PRINCIPAL_BYTES)?;
+                                    Ok::<_,anyhow::Error>(hellas_rpc::protocol::work_grant::records::Principal::decode(&bytes)?)
+                                }).transpose()?
+                            };
+                            Some(commands::serve::GrantNodeConfig { config, provider, owner })
+                        } else { None };
+
                         #[cfg(feature = "evaluate")]
                         let gpu_config = hellas_executor::GpuConfig::new(
                             gpu_session_programs,
@@ -975,7 +1050,8 @@ async fn async_main() {
                             }),
                             #[cfg(feature = "evaluate")]
                             gpu_config,
-                                            work_config,
+                            work_config,
+                            grants,
                             metrics_port,
                             graffiti,
                             fetch_config_file,
@@ -1026,6 +1102,8 @@ async fn async_main() {
         },
         #[cfg(feature = "gateway")]
         Commands::Gateway {
+            offer,
+            grant_policy,
             http_fetch_config,
             archive_dir,
             zdr,
@@ -1045,7 +1123,7 @@ async fn async_main() {
             #[cfg(feature = "evaluate")]
             local,
             #[cfg(feature = "evaluate")]
-            queue_size: _,
+            queue_size,
             retries,
             default_max_tokens,
             metrics_port,
@@ -1061,9 +1139,12 @@ async fn async_main() {
         } => {
             async {
                 #[cfg(feature = "evaluate")]
-                if local {
-                    return Err(hellas_client::ClientError::OwnerGrantRequired.into());
-                }
+                let local_content = causal_lm.as_ref().map(|args| commands::grant_gateway::local::LocalContent {
+                    paths: std::iter::once(args.environment.clone()).chain(args.content_paths.iter().cloned()).collect(),
+                    roots: args.content_roots.clone(),
+                    index: args.content_index.clone().or_else(|| cli.store_dir.as_deref().map(hellas_store::state::records_path_at)),
+                    queue_size,
+                });
                 let output_cache = cli.output_cache;
                 let cache_options =
                     commands::gateway_cache::options(output_cache, cli.store_dir.clone())?;
@@ -1105,14 +1186,6 @@ async fn async_main() {
                     machine.is_none() || responses_backend != GatewayResponsesBackend::Proxy,
                     "--machine cannot be used with the external proxy backend"
                 );
-                #[cfg(all(feature = "cloud", unix))]
-                let (node_id, remote_trust) = cloud::machine_route(
-                    machine.as_deref(),
-                    &secret_key,
-                    node_id,
-                    remote_trust,
-                )
-                .await?;
                 let assurance = remote_trust.assurance;
                 #[cfg(all(feature = "node", not(feature = "evaluate")))]
                 let local = false;
@@ -1145,6 +1218,46 @@ async fn async_main() {
                 };
                 #[cfg(not(feature = "node"))]
                 let paid_work = None;
+                let grant_target = if let Some(name) = offer.as_deref() {
+                    let client = commands::contributions::principal(&local_identity)?;
+                    let offer = commands::contributions::load_offer(&client, name)?;
+                    Some(hellas_sdk::grant_client::UnpinnedOffer::decode(
+                        &offer.encode()?, client.id(), hellas_rpc::protocol::work_grant::UnixMillis(0),
+                    )?.pin(&identity::provider_trust(
+                        Some(offer.offer().provider.content_id()), assurance,
+                        remote_trust.apple_app_attest_app_id.clone(),
+                        remote_trust.apple_app_attest_cdhashes.clone(),
+                    )?)?)
+                } else { None };
+                #[cfg(all(feature = "cloud", unix))]
+                let grant_target = if let Some(name) = machine.as_deref()
+                    && output_cache != hellas_rpc::cache::CachePolicy::ReplayOnly {
+                    Some(cloud::machine_target(name, &local_identity, node_addrs.clone()).await?)
+                } else { grant_target };
+                #[cfg(feature = "evaluate")]
+                let local_grant = if local && output_cache != hellas_rpc::cache::CachePolicy::ReplayOnly {
+                    anyhow::ensure!(responses_backend == GatewayResponsesBackend::Hellas, "--local requires the Hellas execution backend");
+                    anyhow::ensure!(grant_policy.as_deref().is_none_or(|name| name == "local"), "the local owner resource is named local");
+                    anyhow::ensure!(assurance == hellas_rpc::Assurance::ProducerSigned, "local Work requires producer-signed assurance");
+                    Some(commands::grant_gateway::local::open(
+                        loaded_environment.as_ref().ok_or_else(|| anyhow::anyhow!("--local requires a causal-LM environment"))?.environment(),
+                        &stop_token_ids,
+                        local_content.ok_or_else(|| anyhow::anyhow!("--local requires indexed content"))?,
+                        &local_identity,
+                    ).await?)
+                } else { None };
+                #[cfg(not(feature = "evaluate"))]
+                let local_grant = None;
+                anyhow::ensure!(grant_policy.is_none() || grant_target.is_some() || local_grant.is_some(), "--grant-policy requires an Offer or owner grant");
+                let grant_gateway = if let Some(target) = grant_target
+                    && output_cache != hellas_rpc::cache::CachePolicy::ReplayOnly {
+                    anyhow::ensure!(assurance == target.trust().required_assurance, "requested assurance differs from the pinned grant provider");
+                    Some(commands::grant_gateway::remote(target, &local_identity, grant_policy).await?)
+                } else { None };
+                let grant_gateway = grant_gateway.or(local_grant);
+                let paid_work = grant_gateway.as_ref().map(|backend| backend.clone() as std::sync::Arc<dyn hellas_gateway::WorkExecutionBackend>).or(paid_work);
+                let shutdown = paid_work.clone();
+                let result = async {
                 let provider_trust = if paid_work.is_some()
                     || output_cache == hellas_rpc::cache::CachePolicy::ReplayOnly
                 {
@@ -1156,14 +1269,19 @@ async fn async_main() {
                     directory: archive_dir.map(Ok).unwrap_or_else(identity::default_gateway_archive_path)?,
                     zdr,
                 };
-                if let Some(path) = http_fetch_config {
+                let http_config = if let Some(path) = http_fetch_config {
+                    let bytes = commands::read_bounded_regular_file(&path, "HTTP gateway config", 4 << 20)?;
+                    Some(serde_json::from_slice(&bytes)?)
+                } else if loaded_environment.is_none() {
+                    grant_gateway.as_ref().map(|gateway| gateway.http_config()).transpose()?
+                } else { None };
+                if let Some(config) = http_config {
                     anyhow::ensure!(output_cache == hellas_rpc::cache::CachePolicy::Off,
                         "HTTP routes archive exchanges; inference replay must be off");
                     anyhow::ensure!(metrics_port.is_none(), "HTTP Fetch exports OpenTelemetry metrics; --metrics-port is unsupported");
-                    let bytes = commands::read_bounded_regular_file(&path, "HTTP gateway config", 4 << 20)?;
                     return hellas_gateway::run_http(hellas_gateway::HttpGatewayOptions {
-                        config: serde_json::from_slice(&bytes)?,
-                        paid: paid_work.ok_or_else(|| anyhow::anyhow!("HTTP proxy requires --paid-work-config"))?,
+                        config,
+                        paid: paid_work.ok_or_else(|| anyhow::anyhow!("HTTP proxy requires a Work backend"))?,
                         archive, bearer_token_file, allow_remote, host, port, wrap, wrap_args,
                     }).await;
                 }
@@ -1201,6 +1319,9 @@ async fn async_main() {
                     wrap_args,
                 })
                 .await
+                }.await;
+                if let Some(backend) = shutdown { backend.drain().await; }
+                result
             }
             .await
         }

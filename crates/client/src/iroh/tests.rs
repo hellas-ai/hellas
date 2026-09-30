@@ -453,3 +453,103 @@ fn paid_services_app_attest_binds_the_exact_connection_and_service() {
         );
     }
 }
+
+#[cfg(feature = "work")]
+#[test]
+fn apple_offer_pin_verifies_static_root_policy_then_open_and_result() {
+    use crate::{FetchChunkVerifier, ProducerTrust, UnpinnedOffer};
+    use hellas_rpc::protocol::work_grant::{records::*, *};
+    use std::num::{NonZeroU16, NonZeroU64};
+    let counters = Arc::new(TestCounterStore::default());
+    let (trust, response, public_key) =
+        apple_open_response(&[5; 32], &[6; 32], 2, counters.clone());
+    let bundle =
+        ProviderEnrollmentBundle::from_canonical_bytes(&response.provider_genesis).unwrap();
+    assert!(
+        Principal::verify(bundle.clone()).is_err(),
+        "platform roots remain provider-only"
+    );
+    let (_, software) = signed_open_response(&[5; 32], &[6; 32]);
+    let client = Principal::verify(
+        ProviderEnrollmentBundle::from_canonical_bytes(&software.provider_genesis).unwrap(),
+    )
+    .unwrap();
+    let producer = ProducerSigningKey::from_secret_bytes([2; 32]).unwrap();
+    let offer = SignedOffer::sign(
+        Offer {
+            network: grant_network(),
+            provider: bundle.clone(),
+            grant: GrantDef {
+                id: GrantId([1; 16]),
+                revision: Revision(1),
+                kind: GrantKind::Owner(client.clone()),
+                policies: vec![],
+                limits: vec![],
+                weight: NonZeroU16::new(1).unwrap(),
+                max_job_millis: NonZeroU64::new(1000).unwrap(),
+                max_in_flight: NonZeroU16::new(1).unwrap(),
+                expires: None,
+                state: GrantState::Active,
+                allow_account_backed: true,
+            },
+            generation: 0,
+            sequence: 1,
+            valid_until: UnixMillis(2000),
+            addresses: vec![],
+        },
+        &producer,
+    )
+    .unwrap();
+    let import =
+        || UnpinnedOffer::decode(&offer.encode().unwrap(), client.id(), UnixMillis(1000)).unwrap();
+    let pinned = import().pin(&trust).unwrap();
+    import().pin(&trust).unwrap();
+    assert!(
+        counters.counters.lock().unwrap().is_empty(),
+        "static enrollment is reusable"
+    );
+    for wrong_app in [true, false] {
+        let mut bad = trust.clone();
+        let apple = bad.apple_app_attest.as_mut().unwrap();
+        if wrong_app {
+            apple.app_id = "OTHER.app".into();
+        } else {
+            apple.allowed_cd_hashes = vec![[0; 32]];
+        }
+        assert!(import().pin(&bad).is_err());
+    }
+    let verified = verify_open_response(
+        pinned.trust(),
+        &[5; 32],
+        &[6; 32],
+        ALPN,
+        ENROLLED_PEER,
+        response.clone(),
+    )
+    .unwrap();
+    assert_eq!(counters.counters.lock().unwrap().get(&public_key), Some(&2));
+    let input = hellas_rpc::InputCommitment::from_digest(Digest::hash(b"grant input"));
+    let terminal = hellas_rpc::fetch::encode_fetch_terminal_payload(
+        &hellas_rpc::output::OutputEvent::Finished {
+            stop_reason: hellas_rpc::output::StopReason::EndOfText,
+            usage: None,
+        },
+    )
+    .unwrap();
+    let events = hellas_rpc::fetch::FetchOutputTranscriptBuilder::new(
+        input,
+        Assurance::AppleAppAttest,
+        &producer,
+    )
+    .finish(terminal)
+    .unwrap();
+    let mut verifier = FetchChunkVerifier::new(
+        input,
+        pinned.trust().required_assurance,
+        ProducerTrust::keys([verified]),
+    );
+    verifier.verify_terminal(events[0].clone()).unwrap();
+    assert!(
+        verify_open_response(&trust, &[5; 32], &[6; 32], ALPN, ENROLLED_PEER, response).is_err()
+    );
+}

@@ -4,8 +4,8 @@ package hellas.work.v1;
 
 import "hellas/v1/hellas.proto";
 
-// The paid-work service: the wire by which a client proposes one job on
-// one payment channel and a provider accepts or refuses it.
+// Work executes under payment or grant funding. Funding selects authority and
+// accounting; prepared inputs and signed results share the execution protocol.
 //
 // Nothing here is hashed. Every digest and every signature in the paid
 // protocol is taken over the canonical private records in
@@ -19,6 +19,10 @@ service Work {
   // already signed; the provider answers with its co-signature or with
   // one refusal code.
   rpc AcceptWork(AcceptWorkRequest) returns (AcceptWorkResponse);
+
+  // Private grant status and current Offer, bound to this connection. A stale
+  // generation may discover the current one; it cannot authorize new work.
+  rpc GetStanding(GetStandingRequest) returns (GetStandingResponse);
 
   // One whole delivery. The client asks for an accepted job's answer,
   // proving on this connection that it is the client; the provider
@@ -117,11 +121,26 @@ message SetupAdvanced {
 enum FundingKind {
   FUNDING_KIND_UNSPECIFIED = 0;
   FUNDING_KIND_PAYMENT = 1;
-  FUNDING_KIND_GRANT = 2; // Reserved selector; this provider requires payment funding.
+  FUNDING_KIND_GRANT = 2;
 }
 message WorkRoute {
   FundingKind funding_kind = 1;
   bytes channel_id = 2; // Exactly 32 bytes; required on every Work request.
+}
+
+message GetStandingRequest {
+  WorkRoute route = 1;
+  // Fixed 88-byte StandingLocator: provider PrincipalId, GrantId, client
+  // PrincipalId, last-known generation. Channel is derived, never allocated.
+  bytes locator = 2;
+  // Compact secp256k1 over get-standing.v1, locator, channel and TLS exporter.
+  bytes client_signature = 3;
+}
+message GetStandingResponse {
+  oneof outcome {
+    bytes standing = 1; // Canonical bounded Standing, including a signed Offer.
+    WorkRefused refused = 2;
+  }
 }
 
 message AcceptWorkRequest {
@@ -234,6 +253,60 @@ message WorkRefused {
   // Diagnostic text for an operator reading a log. Nothing decides on
   // it, and no test asserts its wording.
   string reason = 2;
+  // Present only for grant operations. Never infer a decision from reason.
+  GrantRefusal grant = 3;
+}
+
+message GrantRefusal {
+  GrantRefusalCode code = 1;
+  uint64 current_revision = 2; // Nonzero only for STALE_REVISION.
+  // Authenticated delivery status when retained output is unavailable. Metadata
+  // never substitutes for the transcript required to verify an execution.
+  GrantTerminalMetadata terminal = 3;
+}
+message GrantTerminalMetadata {
+  bytes work_id = 1;
+  GrantTerminalState state = 2;
+  // Canonical PaidJobResultV1 and its bound provider signature, both present
+  // when a result was durably recorded. Never includes output payloads.
+  bytes result = 3;
+  bytes provider_signature = 4;
+}
+enum GrantTerminalState {
+  GRANT_TERMINAL_STATE_UNSPECIFIED = 0;
+  GRANT_TERMINAL_STATE_FINISHED = 1;
+  GRANT_TERMINAL_STATE_FAILED = 2;
+  GRANT_TERMINAL_STATE_RELEASED = 3;
+  GRANT_TERMINAL_STATE_INDETERMINATE = 4;
+}
+enum GrantRefusalCode {
+  GRANT_REFUSAL_CODE_UNSPECIFIED = 0;
+  GRANT_REFUSAL_CODE_UNAUTHORIZED = 1;
+  GRANT_REFUSAL_CODE_WRONG_TRANSPORT = 2;
+  GRANT_REFUSAL_CODE_EXPIRED = 3;
+  GRANT_REFUSAL_CODE_PAUSED = 4;
+  GRANT_REFUSAL_CODE_REVOKED = 5;
+  GRANT_REFUSAL_CODE_STALE_REVISION = 6;
+  GRANT_REFUSAL_CODE_STALE_GENERATION = 7;
+  GRANT_REFUSAL_CODE_OUT_OF_SCOPE = 8;
+  GRANT_REFUSAL_CODE_BUDGET = 9;
+  GRANT_REFUSAL_CODE_CONCURRENCY = 10;
+  GRANT_REFUSAL_CODE_STATE_CAPACITY = 11;
+  GRANT_REFUSAL_CODE_QUEUE_CAPACITY = 12;
+  GRANT_REFUSAL_CODE_QUARANTINED = 13;
+  GRANT_REFUSAL_CODE_MALFORMED = 14;
+  GRANT_REFUSAL_CODE_ORIGIN = 15;
+  GRANT_REFUSAL_CODE_PATH_METHOD = 16;
+  GRANT_REFUSAL_CODE_TLS = 17;
+  GRANT_REFUSAL_CODE_CREDENTIAL = 18;
+  GRANT_REFUSAL_CODE_HEADERS = 19;
+  GRANT_REFUSAL_CODE_GENERATION_CAP = 20;
+  GRANT_REFUSAL_CODE_STREAM_USAGE = 21;
+  GRANT_REFUSAL_CODE_RESPONSE_CAP = 22;
+  GRANT_REFUSAL_CODE_OUTPUT_UNAVAILABLE = 23;
+  GRANT_REFUSAL_CODE_RELEASED = 24;
+  GRANT_REFUSAL_CODE_INDETERMINATE = 25;
+  GRANT_REFUSAL_CODE_STORAGE_UNAVAILABLE = 26;
 }
 
 // Why a proposal was not accepted. Closed, and each value says what the

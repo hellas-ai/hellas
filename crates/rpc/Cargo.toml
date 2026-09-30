@@ -29,7 +29,7 @@ otel = ["dep:opentelemetry", "dep:tracing-opentelemetry"]
 # `execute` gates the shared identity and signed-transcript vocabulary.
 execute = []
 evaluate = ["execute"]
-fetch = ["execute", "dep:serde_json"]
+fetch = ["execute", "dep:serde_json", "dep:flate2", "dep:brotli"]
 chain = ["dep:base64ct", "dep:hellas-kernel"]
 swarm = []
 # Host administration. Explicitly mounted behind admin authorization, not
@@ -48,6 +48,8 @@ all-protocols = ["swarm", "execute", "evaluate", "fetch", "chain"]
 work = ["dep:hellas-kernel", "evaluate", "fetch", "hellas-kernel/secp256k1"]
 
 [dependencies]
+flate2 = { version = "1", optional = true }
+brotli = { version = "8", optional = true }
 axum = { workspace = true, optional = true }
 base64.workspace = true
 base64ct = { version = "1", optional = true, features = ["alloc"] }

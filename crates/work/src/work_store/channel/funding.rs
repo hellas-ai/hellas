@@ -85,7 +85,8 @@ impl JobOutcome for TerminalOutcome {
     }
 }
 
-/// Closed set of funding models, with obligations fixed by the funding type.
+/// Closed set of supported funding models. Only payment is implemented in M1.
+/// Adding grants requires an explicit implementation inside this crate.
 pub trait Funding: sealed::Funding + Copy + Debug + Eq {
     /// Signed proposal carrying this funding model's authority.
     type Authorization: JobAuthorization<Clock = Self::Clock>;
@@ -115,4 +116,39 @@ impl Funding for PaymentFunding {
     type Result = PaidJobResultV1;
     type Signature = Sig;
     type Terminal = TerminalOutcome;
+}
+
+impl sealed::Clock for hellas_rpc::protocol::work_grant::UnixMillis {}
+impl Clock for hellas_rpc::protocol::work_grant::UnixMillis {
+    const UNIT: &'static str = "Unix milliseconds";
+    fn value(self) -> u64 {
+        self.0
+    }
+}
+impl sealed::Authorization for hellas_rpc::protocol::work_grant::GrantJobAuthorizationV1 {}
+impl JobAuthorization for hellas_rpc::protocol::work_grant::GrantJobAuthorizationV1 {
+    type Clock = hellas_rpc::protocol::work_grant::UnixMillis;
+    fn proposal_nonce(&self) -> u64 {
+        self.proposal_nonce
+    }
+    fn acceptance_deadline(&self) -> Self::Clock {
+        self.acceptance_deadline_ms
+    }
+    fn terminal_deadline(&self) -> Self::Clock {
+        self.terminal_deadline_ms
+    }
+}
+/// Uninhabited marker: grant channels have no financial state or certificates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GrantFunding {}
+impl sealed::Funding for GrantFunding {}
+impl Funding for GrantFunding {
+    type Authorization = hellas_rpc::protocol::work_grant::GrantJobAuthorizationV1;
+    type Clock = hellas_rpc::protocol::work_grant::UnixMillis;
+    type State = crate::work_store::grant::GrantChannelState;
+    // Shared ancestor accounting is owned once by the provider journal.
+    type Ledger = ();
+    type Result = PaidJobResultV1;
+    type Signature = hellas_rpc::Signature;
+    type Terminal = crate::work_store::grant::GrantTerminal;
 }

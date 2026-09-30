@@ -16,6 +16,9 @@ anyhow.workspace = true
 async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
 hellas-private.workspace = true
+hellas-rpc = { workspace = true, default-features = false, features = ["work", "host-control"] }
+hellas-work.workspace = true
+hellas-wire = { workspace = true, features = ["unix"] }
 hex.workspace = true
 iroh = { workspace = true, features = ["tls-ring"] }
 libc = "0.2"

@@ -124,7 +124,9 @@ pub use observation::ObservationTime;
 mod client_channel;
 pub use client_channel::{ClientChannel, ClientDriver, ClientObserver, ClientService};
 
+pub mod admission;
 mod stream;
+use admission::{CapacityDomain, WorkAdmission, WorkPermit};
 pub use stream::{PaidProgress, PaidResultStream, fetch_result_stream};
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -921,12 +923,14 @@ impl ProviderEndpoint {
             (PreparedWorkInput::Evaluate(bundle), WorkPolicy::Evaluate(_)) => {
                 RunAdmission::Invoke(Box::new(PreparedEvaluateInput {
                     parts: bundle.parts().map_err(PaidWorkError::from)?,
+                    admission: WorkAdmission::payment(),
                 }))
             }
             (PreparedWorkInput::Fetch(bundle), WorkPolicy::Fetch { policy, .. }) => {
                 RunAdmission::InvokeFetch(Box::new(PreparedFetchInput {
                     parts: bundle.parts().map_err(PaidWorkError::from)?,
                     policy: *policy,
+                    admission: WorkAdmission::payment(),
                 }))
             }
             _ => return Err(RunError::Policy),
@@ -1763,12 +1767,25 @@ impl BackendFault {
 /// identity here is what lets a backend run after restart without depending on
 /// transient executor state. Environment bytes remain content-store data below
 /// the manifest root and do not cross this seam.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct PreparedEvaluateInput {
     parts: PreparedPaidInputParts,
+    admission: WorkAdmission,
 }
 
 impl PreparedEvaluateInput {
+    pub(crate) fn admitted(parts: PreparedPaidInputParts, admission: WorkAdmission) -> Self {
+        Self { parts, admission }
+    }
+    pub fn admission(&self) -> &WorkAdmission {
+        &self.admission
+    }
+    pub fn admission_mut(&mut self) -> &mut WorkAdmission {
+        &mut self.admission
+    }
+    pub fn into_parts_and_admission(self) -> (PreparedPaidInputParts, WorkAdmission) {
+        (self.parts, self.admission)
+    }
     /// Returns the Evaluate request rebuilt from the journal.
     #[must_use]
     pub const fn evaluate_request(&self) -> &EvaluateRequest {
@@ -1790,17 +1807,42 @@ impl PreparedEvaluateInput {
 
 /// A paid Fetch input admitted under a channel policy. It is held only in
 /// memory on the provider, even while the job's accounting state is durable.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct PreparedFetchInput {
     parts: PreparedPaidFetchInputParts,
     policy: FetchPolicyV2,
+    admission: WorkAdmission,
 }
 
 impl PreparedFetchInput {
     /// Builds an admitted input from its verified parts and channel policy.
     #[must_use]
-    pub const fn new(parts: PreparedPaidFetchInputParts, policy: FetchPolicyV2) -> Self {
-        Self { parts, policy }
+    pub fn new(parts: PreparedPaidFetchInputParts, policy: FetchPolicyV2) -> Self {
+        Self {
+            parts,
+            policy,
+            admission: WorkAdmission::payment(),
+        }
+    }
+    pub(crate) fn admitted(
+        parts: PreparedPaidFetchInputParts,
+        policy: FetchPolicyV2,
+        admission: WorkAdmission,
+    ) -> Self {
+        Self {
+            parts,
+            policy,
+            admission,
+        }
+    }
+    pub fn admission(&self) -> &WorkAdmission {
+        &self.admission
+    }
+    pub fn admission_mut(&mut self) -> &mut WorkAdmission {
+        &mut self.admission
+    }
+    pub fn into_parts_and_admission(self) -> (PreparedPaidFetchInputParts, WorkAdmission) {
+        (self.parts, self.admission)
     }
 
     /// Returns the fixed output bounds the provider must enforce while running.
@@ -1828,6 +1870,11 @@ impl PreparedFetchInput {
 /// trait can check, and it is not the one the gate rests on: the gate
 /// calls this at most once per `work_id` whatever the implementor does.
 pub trait WorkBackend: Sync {
+    /// A grant must reserve bounded executor capacity before co-signature.
+    /// Backends without an explicit admission implementation refuse grants.
+    fn try_admit(&self, _domain: CapacityDomain) -> Result<WorkPermit, BackendFault> {
+        Err(BackendFault::new("grant executor capacity is unavailable"))
+    }
     /// Runs an authorized Fetch without persisting request or response bodies.
     fn fetch(
         &self,
@@ -1884,7 +1931,7 @@ pub trait WorkBackend: Sync {
 }
 
 /// What [`ProviderEndpoint::begin_run`] found, and what may be done next.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum RunAdmission {
     /// The marker is durable and the backend has not been called.
     /// Invoke exactly once, with this journaled input.
@@ -2776,6 +2823,7 @@ impl WorkService {
             Ok(mut endpoint) => endpoint.accept(request),
             Err(error) => AcceptWorkResponse {
                 outcome: Some(Outcome::Refused(WorkRefused {
+                    grant: None,
                     code: endpoint_refusal(error).code() as i32,
                     reason: error.to_string(),
                 })),
@@ -2892,6 +2940,7 @@ impl WorkService {
                     transcript: delivery.transcript,
                 }),
                 Err(refusal) => DeliverOutcome::Refused(WorkRefused {
+                    grant: None,
                     code: refusal.code.code() as i32,
                     reason: refusal.reason,
                 }),
@@ -2915,6 +2964,7 @@ impl WorkService {
                     credited_cumulative,
                 }),
                 Err(refusal) => AdmitOutcome::Refused(WorkRefused {
+                    grant: None,
                     code: refusal.code.code() as i32,
                     reason: refusal.reason,
                 }),
@@ -2937,6 +2987,24 @@ const fn endpoint_refusal(error: EndpointError) -> WorkRefusal {
 }
 
 impl WorkHandler for WorkService {
+    async fn get_standing(
+        &self,
+        _request: hellas_rpc::pb::work::GetStandingRequest,
+        _context: TransportContext,
+    ) -> Result<
+        impl Into<hellas_rpc::call::WithTrailer<hellas_rpc::pb::work::GetStandingResponse>> + Send,
+        WireStatus,
+    > {
+        use hellas_rpc::pb::work::{GetStandingResponse, get_standing_response};
+        Ok(GetStandingResponse {
+            outcome: Some(get_standing_response::Outcome::Refused(WorkRefused {
+                code: WorkRefusalCode::Invalid as i32,
+                reason: "GetStanding requires grant funding".into(),
+                grant: None,
+            })),
+        })
+    }
+
     fn accept_work(
         &self,
         request: AcceptWorkRequest,
@@ -3875,6 +3943,7 @@ fn acceptance_response(result: Result<(Digest, Sig), Refusal>) -> AcceptWorkResp
                 work_id: work_id.as_bytes().to_vec(),
             }),
             Err(refusal) => Outcome::Refused(WorkRefused {
+                grant: None,
                 code: refusal.code.code() as i32,
                 reason: refusal.reason,
             }),

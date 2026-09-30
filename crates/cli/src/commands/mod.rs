@@ -7,11 +7,14 @@ use std::time::Duration;
 #[cfg(feature = "chain")]
 pub mod chain;
 pub(crate) mod codex_auth;
+pub mod contributions;
 #[cfg(feature = "node")]
 pub(crate) mod discovery;
 pub mod environment;
 #[cfg(feature = "gateway")]
 pub mod gateway_cache;
+#[cfg(feature = "gateway")]
+pub mod grant_gateway;
 pub mod identity;
 #[cfg(feature = "gateway")]
 pub mod llm;

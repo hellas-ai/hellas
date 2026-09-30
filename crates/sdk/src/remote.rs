@@ -36,6 +36,33 @@ impl ClientIdentity {
         self.caller_key.to_secret_bytes()
     }
 
+    /// Hosts persist `root` separately from the provider's platform enrollment.
+    pub fn contact_enrollment(
+        &self,
+        root: &ProducerSigningKey,
+    ) -> hellas_client::ClientResult<hellas_rpc::ProviderEnrollmentBundle> {
+        use hellas_rpc::*;
+        let statement = ProviderGenesisStatement {
+            root_kind: RootKind::Software,
+            root_public_key: root.public_key(),
+            producer_public_key: self.caller_key.public_key(),
+            transport_public_key: PublicKey::Ed25519(*self.node_id().as_bytes()),
+            platform_credential: PlatformCredential::Absent,
+            installation_nonce: *Digest::hash(root.public_key().bytes()).as_bytes(),
+        };
+        let root_proof = RootProof::Software(
+            root.sign_digest(Digest::hash(&statement.canonical_bytes()))
+                .map_err(hellas_client::ClientError::external)?,
+        );
+        Ok(ProviderEnrollmentBundle {
+            genesis: SignedProviderGenesis {
+                statement,
+                root_proof,
+            },
+            platform: PlatformEnrollment::Absent,
+        })
+    }
+
     pub fn node_id(&self) -> EndpointId {
         self.transport_key.public()
     }

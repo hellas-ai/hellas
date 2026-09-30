@@ -37,10 +37,12 @@ A platform-backed Assurance authenticates the Fetch application. The
 it does not authenticate a running binary. The sealed Responses adaptor sends
 `store=false` upstream and accepts text and client-executed function tools.
 
-Work is the execution protocol, using payment-funded channels. Owner execution
-requires a grant; selecting a machine or an unpaid route returns `OwnerGrantRequired`.
-Work-side local reproduction is available. Accepted paid inputs and results stay
-in the channel's recovery/evidence journal, independently of gateway archives.
+Work is the only execution protocol. This milestone supports payment-funded
+channels. Owner and principal grants share the Work protocol, including
+`gateway --machine` and sealed Fetch. Delegated project tracks remain a later milestone. Ticket execution, shadow verification, public retained-artifact
+retrieval and CacheControl have been removed. Work-side local reproduction
+remains available. Accepted paid inputs and results remain in the channel's
+recovery/evidence journal, independently of gateway archive settings.
 
 ## Causal-LM environments
 
@@ -127,7 +129,7 @@ the manifest ID is used.
 
 Configure a funded pool using the [paid gateway guide](docs/paid-gateway.md),
 then pass `--paid-work-config POOL` together with `--environment` and
-`--tokenizer`.
+`--tokenizer`. The former in-process local route awaits owner grant funding.
 
 It binds loopback by default. Non-loopback listening requires `--allow-remote`
 and `--bearer-token-file FILE`; the private credential file is created once and
@@ -136,7 +138,7 @@ controlling terminal. The causal-LM backend accepts plain text at
 `/v1/completions` and `/v1/responses`. Set `--chat-template` to enable the shared
 model adapter for chat, reasoning and tool calls supported by that model.
 The proxy Responses backend retains its explicit upstream semantics.
-`--responses-backend` changes only `/v1/responses`; every other
+The unpaid attested Fetch Responses backend awaits grant funding. `--responses-backend` changes only `/v1/responses`; every other
 route remains bound to the causal-LM environment, so `--environment` and
 `--tokenizer` are still required.
 

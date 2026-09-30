@@ -6,6 +6,7 @@
 //! protect against rollback of its backing storage.
 
 pub mod channel;
+pub mod grant;
 pub mod journal;
 pub mod setup;
 

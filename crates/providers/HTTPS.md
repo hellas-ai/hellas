@@ -122,15 +122,14 @@ accounts. In the CLI's Fetch route file, use:
 }
 ```
 
-The route file wraps entries in `routes`; the former `callers` field is
-rejected. Work payment channels authorize jobs and charge their fixed price.
+The route file wraps entries in `routes`. Work payment channels authorize jobs
+and charge their fixed price; grants authorize jobs within their allowances.
 For CLI paid requests, `paid-work prepare-fetch --execution-environment http`
-prints the manifest ID to put in the work config. Unpaid provider access is
-unsupported until grant funding is implemented.
+prints the manifest ID to put in the work config.
 
 Results contain one `Adaptor.Http.Head` event followed by base64 body events
 and a signed terminal. Hop-by-hop and framing headers (`connection`,
-`transfer-encoding`, `content-length` and friends) describe the provider's own
+`transfer-encoding` and `content-length`) describe the provider's own
 connection, so they are not part of the signed head; the body bytes are the
 only length truth. `HttpFetchResponse::from_output` reconstructs the body
 and checks ordering and size after transcript signature verification.
