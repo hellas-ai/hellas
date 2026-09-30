@@ -483,3 +483,60 @@ fn input_event_commitment_vector_pinned() {
         "4f9db9f69e97d60b7355e3583226e221711c5d738554c128fd5dc56f7b7df6f5"
     );
 }
+
+/// The two bodies share one signature domain, so the canonical bytes are
+/// what keep a signature from crossing over — and they cannot meet: an
+/// input body opens with an eight-element array header and the input
+/// tag, an output body with a ten-element header and the output tag.
+/// Both halves are pinned against bodies sharing every field the two
+/// types have in common, so a refactor that collapsed the distinction
+/// would fail here rather than become a confusion risk.
+#[test]
+fn input_and_output_signature_preimages_cannot_meet() {
+    let signer = key(1);
+    let scheme = scheme_id(Operation::Evaluate, Assurance::ProducerSigned);
+    let previous_event = EventCommitment::from_canonical_bytes(b"shared previous");
+    let payload = Digest::hash(b"shared payload");
+    let canonicalization = canon("shared.canonicalizer");
+    let input = InputCommitment::from_digest(Digest::hash(b"shared input"));
+    let input_body = InputEventBody::from_parts(InputEventBodyParts {
+        scheme,
+        sequence: 7,
+        previous_event,
+        kind: "shared".to_string(),
+        payload,
+        signer: signer.producer_id(),
+        canonicalization,
+    });
+    let output_body = OutputEventBody::from_parts(OutputEventBodyParts {
+        scheme,
+        input,
+        stream_id: StreamId::from_input_commitment(input),
+        sequence: 7,
+        previous_event,
+        kind: "shared".to_string(),
+        payload,
+        signer: signer.producer_id(),
+        canonicalization,
+    });
+
+    let input_bytes = input_body.canonical_bytes();
+    let output_bytes = output_body.canonical_bytes();
+    assert_eq!(input_bytes[0], 0x88, "input body opens with array(8)");
+    assert_eq!(output_bytes[0], 0x8a, "output body opens with array(10)");
+    assert!(
+        input_bytes
+            .windows(tags::STREAM_INPUT_EVENT_V2.len())
+            .any(|window| window == tags::STREAM_INPUT_EVENT_V2.as_bytes())
+    );
+    assert!(
+        output_bytes
+            .windows(tags::STREAM_OUTPUT_EVENT_V2.len())
+            .any(|window| window == tags::STREAM_OUTPUT_EVENT_V2.as_bytes())
+    );
+
+    assert_ne!(
+        input_body.signature_preimage(),
+        output_body.signature_preimage()
+    );
+}

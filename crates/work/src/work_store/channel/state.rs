@@ -418,17 +418,6 @@ impl ChannelState {
         }
     }
 
-    /// Returns the finalized contest in full, including the window and
-    /// the amount an answer must strictly exceed.
-    ///
-    /// Where [`Self::close_opened`] answers "is there a contest, and
-    /// whose", this answers "may this endpoint still answer it, and with
-    /// what floor" — the two facts a restart services the response from.
-    #[must_use]
-    pub const fn open_contest(&self) -> Option<OpenContest> {
-        self.close_opened
-    }
-
     /// Returns the answer this endpoint has already fixed for the
     /// contest on this edge, if it has fixed one.
     ///

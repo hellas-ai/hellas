@@ -176,6 +176,19 @@ impl InputEventBody {
         EventCommitment::from_canonical_bytes(&self.canonical_bytes())
     }
 
+    /// The digest this body is signed over.
+    ///
+    /// Input and output bodies are signed under the one
+    /// [`tags::STREAM_EVENT_SIGNATURE_V2`] domain, so the tag alone does
+    /// not say which side of a stream a signature is for; the canonical
+    /// bytes inside it do. An input body always opens with an
+    /// eight-element array header (`0x88`) and the
+    /// [`tags::STREAM_INPUT_EVENT_V2`] string, an output body with a
+    /// ten-element header (`0x8a`) and [`tags::STREAM_OUTPUT_EVENT_V2`],
+    /// so no input body's preimage can ever be an output body's: the two
+    /// differ at byte 0. The embedded string is also what domains
+    /// [`Self::event_commitment`], which hashes the same bytes with no
+    /// outer tag at all.
     pub fn signature_preimage(&self) -> Digest {
         hash_tuple(tags::STREAM_EVENT_SIGNATURE_V2, &[&self.canonical_bytes()])
     }
@@ -278,6 +291,10 @@ impl OutputEventBody {
         EventCommitment::from_canonical_bytes(&self.canonical_bytes())
     }
 
+    /// The digest this body is signed over. It shares the
+    /// [`tags::STREAM_EVENT_SIGNATURE_V2`] domain with the input side;
+    /// why a preimage cannot cross over is spelled out on
+    /// [`InputEventBody::signature_preimage`].
     pub fn signature_preimage(&self) -> Digest {
         hash_tuple(tags::STREAM_EVENT_SIGNATURE_V2, &[&self.canonical_bytes()])
     }
@@ -708,14 +725,6 @@ pub fn output_genesis(input: InputCommitment, stream_id: StreamId) -> EventCommi
     ))
 }
 
-pub fn verify_input_transcript(
-    scheme: SchemeId,
-    caller_key: &PublicKey,
-    events: &[SignedInputEvent],
-) -> Result<InputCommitment, StreamVerifyError> {
-    verify_input_event_chain(scheme, caller_key, events.iter(), true)
-}
-
 pub fn verify_input_event_envelopes(
     scheme: SchemeId,
     caller_key: &PublicKey,
@@ -728,7 +737,6 @@ pub fn verify_input_event_envelopes(
         scheme,
         caller_key,
         events.iter().map(InputEventEnvelope::event),
-        false,
     )
 }
 
@@ -736,15 +744,11 @@ fn verify_input_event_chain<'a>(
     scheme: SchemeId,
     caller_key: &PublicKey,
     events: impl IntoIterator<Item = &'a SignedInputEvent>,
-    verify_signature: bool,
 ) -> Result<InputCommitment, StreamVerifyError> {
     let mut previous = input_genesis(scheme, caller_key);
     let mut saw_event = false;
     for (expected_sequence, event) in events.into_iter().enumerate() {
         saw_event = true;
-        if verify_signature {
-            event.verify(caller_key)?;
-        }
         let body = event.body();
         if body.scheme() != scheme {
             return Err(StreamVerifyError::SchemeMismatch);
@@ -768,15 +772,6 @@ fn verify_input_event_chain<'a>(
     } else {
         Err(StreamVerifyError::EmptyTranscript)
     }
-}
-
-pub fn verify_output_transcript(
-    scheme: SchemeId,
-    input: InputCommitment,
-    producer_key: &PublicKey,
-    events: &[SignedOutputEvent],
-) -> Result<EventCommitment, StreamVerifyError> {
-    verify_output_event_chain(scheme, input, producer_key, events.iter(), true)
 }
 
 pub fn verify_output_event_envelopes(
@@ -841,52 +836,6 @@ pub(crate) fn verify_output_event_envelope_iter<'a>(
             event,
         )?;
     }
-    if saw_event {
-        Ok(previous)
-    } else {
-        Err(StreamVerifyError::EmptyTranscript)
-    }
-}
-
-fn verify_output_event_chain<'a>(
-    scheme: SchemeId,
-    input: InputCommitment,
-    producer_key: &PublicKey,
-    events: impl IntoIterator<Item = &'a SignedOutputEvent>,
-    verify_signature: bool,
-) -> Result<EventCommitment, StreamVerifyError> {
-    let stream_id = StreamId::from_input_commitment(input);
-    let mut previous = output_genesis(input, stream_id);
-    let mut saw_event = false;
-    for (expected_sequence, event) in events.into_iter().enumerate() {
-        saw_event = true;
-        if verify_signature {
-            event.verify(producer_key)?;
-        }
-        let body = event.body();
-        if body.scheme() != scheme {
-            return Err(StreamVerifyError::SchemeMismatch);
-        }
-        if body.input() != input {
-            return Err(StreamVerifyError::InputCommitmentMismatch);
-        }
-        if body.stream_id() != stream_id {
-            return Err(StreamVerifyError::StreamIdMismatch);
-        }
-        let expected_sequence =
-            u64::try_from(expected_sequence).map_err(|_| StreamVerifyError::SequenceOverflow)?;
-        if body.sequence() != expected_sequence {
-            return Err(StreamVerifyError::SequenceMismatch {
-                expected: expected_sequence,
-                actual: body.sequence(),
-            });
-        }
-        if body.previous_event() != previous {
-            return Err(StreamVerifyError::PreviousEventMismatch);
-        }
-        previous = event.event_commitment();
-    }
-
     if saw_event {
         Ok(previous)
     } else {

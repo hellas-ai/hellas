@@ -238,6 +238,7 @@ pub(crate) enum EnqueueError {
 }
 
 pub(crate) struct ExecuteJob {
+    pub deadline: Option<Instant>,
     pub output_cache: hellas_rpc::cache::CacheOptions,
     pub cache_recording: Option<hellas_rpc::cache::CacheRecording>,
     pub span: tracing::Span,
@@ -338,6 +339,7 @@ fn worker_loop(
     let metrics = InferenceMetrics::new();
     while let Ok(WorkerCommand::Execute(job)) = rx.recv() {
         let job = *job;
+        let deadline = job.deadline;
         let execution_id = job.execution_id.clone();
         let request_commitment = job.request_commitment;
         let execution_environment = job.evaluate_request.execution_environment;
@@ -355,15 +357,14 @@ fn worker_loop(
             &producer_key,
         );
         let mut output_events = Vec::new();
-        let on_progress = make_on_progress(
-            &mut position,
-            sender.clone(),
-            execution_id.clone(),
-            &mut output_builder,
-            &mut output_events,
-        );
-
-        let termination = {
+        let execute = || {
+            let on_progress = make_on_progress(
+                &mut position,
+                sender.clone(),
+                execution_id.clone(),
+                &mut output_builder,
+                &mut output_events,
+            );
             let mut telemetry = metrics.start(
                 &job.span,
                 job.accepted_at,
@@ -401,6 +402,11 @@ fn worker_loop(
                     }
                 }
             }
+        };
+
+        let termination = match deadline {
+            Some(deadline) => catena_lang::safe_runtime::with_job_deadline(deadline, execute),
+            None => execute(),
         };
 
         let _ = completion_tx.blocking_send(ExecutorCompletion::EvaluateFinished(Box::new(

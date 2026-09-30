@@ -897,6 +897,9 @@ pub fn matches_generation_policy(
     policy: &PaidExecutionPolicyV1,
     requested: &TextPolicy,
 ) -> Result<bool, PaidWorkError> {
+    // Zero is not "no limit" here, whatever a quote parser elsewhere
+    // makes of it: a job authorized to generate nothing has no terminal
+    // result to be paid for.
     if requested.max_new_tokens() == 0 {
         return Err(PaidWorkError::PolicyZero {
             field: "request max_new_tokens",
@@ -1506,11 +1509,6 @@ pub fn check_prepared_input(
             u64::from(policy.max_prompt_tokens),
         ),
         (
-            "max_new_tokens",
-            u64::from(parts.text_policy.max_new_tokens()),
-            u64::from(policy.max_new_tokens),
-        ),
-        (
             "stop token ids",
             parts.text_policy.stop_token_ids().len() as u64,
             u64::from(policy.max_stop_token_ids),
@@ -1524,14 +1522,6 @@ pub fn check_prepared_input(
                 limit,
             });
         }
-    }
-    // Zero is not "no limit" here, whatever a quote parser elsewhere
-    // makes of it: a job authorized to generate nothing has no terminal
-    // result to be paid for.
-    if parts.text_policy.max_new_tokens() == 0 {
-        return Err(PaidWorkError::PolicyZero {
-            field: "request max_new_tokens",
-        });
     }
 
     Ok(())

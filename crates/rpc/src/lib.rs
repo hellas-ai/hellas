@@ -89,13 +89,12 @@ pub use protocol::{
     OPEN_PROOF_DOMAIN, OPEN_PROVIDER_ROLE, OPENAI_RESPONSES_ADAPTOR, OPENAI_RESPONSES_ENDPOINT,
     Operation, OutputEventBody, OutputEventBodyParts, OutputEventEnvelope, OutputTranscriptBuilder,
     PlatformCredential, PlatformEnrollment, ProducerId, ProducerSigningKey, ProgramManifest,
-    ProviderEnrollmentBundle, ProviderGenesisDecodeError, ProviderGenesisStatement,
-    ProviderIdentityV1, PublicKey, RequestCommitment, Retention, RootKind, RootProof, SchemeId,
-    Signature, SignatureError, SignatureKind, SignedInputEvent, SignedOutputEvent,
-    SignedProviderGenesis, StaticSlice, StreamId, StreamVerifyError, canonical_dag_cbor,
-    decode_dag_cbor, hash_tuple, input_genesis, open_proof_binding, output_genesis, scheme_id,
-    verify_input_event_envelopes, verify_input_transcript, verify_output_event_continuation,
-    verify_output_event_envelopes, verify_output_transcript,
+    ProviderEnrollmentBundle, ProviderGenesisDecodeError, ProviderGenesisStatement, PublicKey,
+    RequestCommitment, Retention, RootKind, RootProof, SchemeId, Signature, SignatureError,
+    SignatureKind, SignedInputEvent, SignedOutputEvent, SignedProviderGenesis, StaticSlice,
+    StreamId, StreamVerifyError, canonical_dag_cbor, decode_dag_cbor, hash_tuple, input_genesis,
+    open_proof_binding, output_genesis, scheme_id, verify_input_event_envelopes,
+    verify_output_event_continuation, verify_output_event_envelopes,
 };
 pub use protocol::{commitment, digest, retention, signature, tags, value};
 

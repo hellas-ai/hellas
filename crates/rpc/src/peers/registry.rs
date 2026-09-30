@@ -112,9 +112,6 @@ pub enum PeerEvent {
         service: &'static str,
         transport_security: TransportSecurity,
     },
-    RttSample {
-        rtt_ms: f64,
-    },
     LabelSet {
         label: String,
     },
@@ -578,9 +575,6 @@ impl PeerRegistry {
             } => {
                 entry.observe_transport(transport_security);
                 let _ = entry.observe_service(service, now_ms, transport_security, max_services);
-            }
-            PeerEvent::RttSample { rtt_ms } => {
-                entry.rtt.record(rtt_ms);
             }
             PeerEvent::LabelSet { label } => {
                 entry.label = Some(truncate_string(label, max_label_len));

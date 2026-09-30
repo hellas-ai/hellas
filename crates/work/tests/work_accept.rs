@@ -1227,6 +1227,37 @@ fn a_refusal_is_read_back_as_the_refusal_it_names() {
 }
 
 #[test]
+fn every_wire_code_reads_back_as_the_refusal_it_names() {
+    // A known refusal releases the proposal slot, so each code is read
+    // against its own fresh proposal.
+    for (code, refusal) in [
+        (WorkRefusalCode::NotReady, WorkRefusal::NotReady),
+        (WorkRefusalCode::Expired, WorkRefusal::Expired),
+        (WorkRefusalCode::Invalid, WorkRefusal::Invalid),
+        (WorkRefusalCode::Conflict, WorkRefusal::Conflict),
+        (WorkRefusalCode::Declined, WorkRefusal::Declined),
+        (WorkRefusalCode::Unavailable, WorkRefusal::Unavailable),
+    ] {
+        let root = temp();
+        let mut endpoint = client_endpoint(root.path());
+        let Ok(_) = endpoint.propose(&proposal(1)) else {
+            panic!("the proposal is built");
+        };
+        let response = AcceptWorkResponse {
+            outcome: Some(Outcome::Refused(WorkRefused {
+                code: code as i32,
+                reason: "no".into(),
+            })),
+        };
+        let refused = endpoint.accepted(&response);
+        assert!(
+            matches!(refused, Err(ProposeError::Refused { refusal: got, .. }) if got == refusal),
+            "{code:?} reads back as {refusal:?}, got {refused:?}",
+        );
+    }
+}
+
+#[test]
 fn a_response_this_service_does_not_define_is_malformed() {
     let root = temp();
     let mut endpoint = client_endpoint(root.path());
@@ -1552,43 +1583,6 @@ fn an_authorization_past_its_acceptance_deadline_expires() {
     assert_eq!(
         service.with_state(ChannelState::checkpoint).unwrap(),
         checkpoint
-    );
-}
-
-#[tokio::test]
-async fn acceptance_workflow_catches_up_before_committing_the_signature() {
-    struct Chain(Vec<FinalizedWork>);
-    impl FinalizedBlocks for Chain {
-        async fn latest_height(&self) -> Result<Option<u64>, BlockSourceError> {
-            Ok(self.0.last().map(|block| block.height))
-        }
-        async fn block_at(&self, height: u64) -> Result<Option<FinalizedWork>, BlockSourceError> {
-            Ok(self.0.iter().find(|block| block.height == height).cloned())
-        }
-    }
-
-    let root = temp();
-    let service = WorkService::new(provider_endpoint(root.path()));
-    let deadline = deadlines().acceptance;
-    let chain = Chain(
-        ((CURSOR + 1)..=(deadline + 1))
-            .map(|height| FinalizedWork {
-                height,
-                parent: payload_at(height - 1),
-                payload: payload_at(height),
-                txs: Vec::new(),
-            })
-            .collect(),
-    );
-    let response = service
-        .accept_after_catch_up(&chain, &signed_request(1, 1))
-        .await
-        .expect("the phase-boundary catch-up completes");
-    assert_eq!(refusal_code(&response), WorkRefusalCode::Expired);
-    assert!(
-        service
-            .with_state(|state| state.jobs().next().is_none())
-            .expect("the endpoint is readable")
     );
 }
 
