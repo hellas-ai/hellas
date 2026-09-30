@@ -27,7 +27,7 @@ fn management_commands_require_an_existing_identity_and_do_not_generate_one() {
     let missing = temp.path().join("identity");
     for args in [
         vec!["hellas", "machines", "list"],
-        vec!["hellas", "control", "serve"],
+        vec!["hellas", "admin", "serve"],
     ] {
         let cli = Cli::try_parse_from(args).unwrap();
         assert!(validate_identity_options(&cli.command, Some(&missing), false).is_ok());

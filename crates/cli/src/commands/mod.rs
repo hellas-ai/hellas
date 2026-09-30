@@ -4,6 +4,8 @@ use anyhow::Context as _;
 use std::path::Path;
 use std::time::Duration;
 
+#[cfg(any(feature = "node", all(feature = "cloud", unix)))]
+pub mod admin;
 #[cfg(feature = "chain")]
 pub mod chain;
 pub(crate) mod codex_auth;

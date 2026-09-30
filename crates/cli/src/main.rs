@@ -86,7 +86,7 @@ fn load_command_identity(
     let owned_machine = false;
     let grant_identity = matches!(command, Commands::Contact { .. } | Commands::Offer { .. });
     #[cfg(feature = "node")]
-    let grant_identity = grant_identity || matches!(command, Commands::Grant(_));
+    let grant_identity = grant_identity || matches!(command, Commands::Admin(_));
     #[cfg(feature = "gateway")]
     let grant_identity =
         grant_identity || matches!(command, Commands::Gateway { offer: Some(_), .. });
@@ -314,9 +314,6 @@ enum Commands {
     #[cfg(all(feature = "cloud", unix))]
     /// Discover and administer machines owned by the selected Hellas identity.
     Machines(hellas_cloud::machines::MachinesArgs),
-    #[cfg(all(feature = "cloud", unix))]
-    /// Internal management RPC for local applications.
-    Control(hellas_cloud::machines::ControlArgs),
     /// Share this identity's verified public enrollment.
     Contact {
         #[command(subcommand)]
@@ -327,9 +324,9 @@ enum Commands {
         #[command(subcommand)]
         command: commands::contributions::OfferCommand,
     },
-    #[cfg(feature = "node")]
-    /// Administer provider grants over local owner control.
-    Grant(commands::contributions::grants::GrantArgs),
+    #[cfg(any(feature = "node", all(feature = "cloud", unix)))]
+    /// Administer this node and its users.
+    Admin(commands::admin::AdminArgs),
     #[cfg(feature = "node")]
     /// Run the RPC server
     Serve {
@@ -731,12 +728,12 @@ fn validate_identity_options(
         #[cfg(all(feature = "cloud", unix))]
         command if command.owned_machine().is_some() => true,
         #[cfg(all(feature = "cloud", unix))]
-        Commands::Cloud(_) | Commands::Machines(_) | Commands::Control(_) => true,
+        Commands::Cloud(_) | Commands::Machines(_) => true,
         Commands::Contact { .. } | Commands::Offer { .. } => true,
         #[cfg(feature = "gateway")]
         Commands::Gateway { offer: Some(_), .. } => true,
-        #[cfg(feature = "node")]
-        Commands::Grant(_) => true,
+        #[cfg(any(feature = "node", all(feature = "cloud", unix)))]
+        Commands::Admin(_) => true,
         Commands::Identity {
             command: IdentityCommand::ShowNodeId | IdentityCommand::ShowEnrollmentId,
         }
@@ -884,7 +881,19 @@ async fn async_main() {
     // build where there is deliberately no writable home directory.
     let command = match cli.command {
         #[cfg(all(feature = "cloud", unix))]
-        command @ (Commands::Cloud(_) | Commands::Machines(_) | Commands::Control(_)) => {
+        command @ Commands::Admin(commands::admin::AdminArgs {
+            command: commands::admin::AdminCommand::Serve { .. },
+        }) => {
+            let result = cloud::run(command, cli.identity.as_deref()).await;
+            tracer_provider.shutdown();
+            if let Err(err) = result {
+                eprintln!("error: {err:#}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        #[cfg(all(feature = "cloud", unix))]
+        command @ (Commands::Cloud(_) | Commands::Machines(_)) => {
             let result = cloud::run(command, cli.identity.as_deref()).await;
             tracer_provider.shutdown();
             if let Err(err) = result {
@@ -954,7 +963,9 @@ async fn async_main() {
         Commands::Contact { command } => commands::contributions::contact(command, &local_identity),
         Commands::Offer { command } => commands::contributions::offer(command, &local_identity),
         #[cfg(feature = "node")]
-        Commands::Grant(args) => commands::contributions::grants::run(args, &local_identity).await,
+        Commands::Admin(args) => commands::admin::users::run(args, &local_identity).await,
+        #[cfg(all(feature = "cloud", unix, not(feature = "node")))]
+        Commands::Admin(_) => unreachable!("admin serve returned above"),
 
         #[cfg(feature = "node")]
         Commands::Serve {
@@ -1343,7 +1354,7 @@ async fn async_main() {
         Commands::Chain { .. } => unreachable!("chain commands handled before identity load"),
         Commands::Store { .. } => unreachable!("store commands handled before identity load"),
         #[cfg(all(feature = "cloud", unix))]
-        Commands::Cloud(_) | Commands::Machines(_) | Commands::Control(_) => {
+        Commands::Cloud(_) | Commands::Machines(_) => {
             unreachable!("management commands handled before identity load")
         }
         Commands::Environment { .. } => {

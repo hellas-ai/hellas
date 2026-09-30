@@ -298,6 +298,18 @@ where
                 grants,
                 &options.state_directory,
                 options.enrollment.clone(),
+                hellas_rpc::protocol::work_grant::records::Principal::verify(
+                    options.enrollment.clone(),
+                )
+                .or_else(|_| {
+                    options
+                        .identity
+                        .contact_enrollment(options.identity.caller_key())
+                        .map_err(|_| {
+                            hellas_rpc::protocol::work_grant::records::GrantError::Signature
+                        })
+                        .and_then(hellas_rpc::protocol::work_grant::records::Principal::verify)
+                })?,
                 &options.routes,
                 options.fetch_max_in_flight,
             )

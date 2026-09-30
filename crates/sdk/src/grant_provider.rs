@@ -50,6 +50,7 @@ pub(crate) fn prepare(
     options: &GrantProviderOptions,
     directory: &Path,
     provider: ProviderEnrollmentBundle,
+    owner: Principal,
     routes: &FetchRouteRegistry,
     concurrent: usize,
 ) -> Result<GrantStore, ProviderError> {
@@ -106,6 +107,7 @@ pub(crate) fn prepare(
     }
     let now = wall_clock();
     let mut store = GrantStore::open(&directory.join("grants"), grant_network(), provider, now)?;
+    store.bind_owner(owner, now)?;
     // Preflight the entire list before updating terms. Failed startup never opens
     // a listener; interruption between durable records is completed on restart.
     let existing: Vec<_> = store.state().grants().cloned().collect();

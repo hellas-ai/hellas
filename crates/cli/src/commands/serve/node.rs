@@ -240,7 +240,7 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
         open_identity: config.open_identity,
     };
     let work_mount: MountedWork = MountedWork::with_backend(handle.clone());
-    let (grants, control) = if let Some((grant_config, store)) = prepared_grants {
+    let (grants, control, admin) = if let Some((grant_config, store)) = prepared_grants {
         let service = hellas_work::grant_service::GrantService::new(
             store,
             signer,
@@ -264,15 +264,15 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
         );
         let control = hellas_sdk::local::LocalControlServer::bind(
             &grant_config.control_socket,
-            admin.dispatcher(),
+            admin.clone().dispatcher(),
         )?;
         anyhow::ensure!(
             work_mount.mount_grants(service.clone()),
             "grant mount is unavailable"
         );
-        (Some(service), Some(control))
+        (Some(service), Some(control), Some(admin))
     } else {
-        (None, None)
+        (None, None, None)
     };
     let discovery = start_server_advertising(&endpoint, &advertised_alpns)
         .context("failed to start service discovery advertising")?;
@@ -326,6 +326,7 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
             let execution_for_conn = remote_execution.clone();
             let work_for_conn = serves_work.clone();
             let setup_for_conn = serves_setup.clone();
+            let admin_for_conn = admin.clone();
             tokio::spawn(async move {
                 let _connection_slot = connection_slot;
                 let conn = match tokio::time::timeout(RPC_HANDSHAKE_TIMEOUT, accepting).await {
@@ -352,6 +353,7 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
                     manager_for_conn,
                     setup_for_conn,
                     work_for_conn,
+                    admin_for_conn,
                 )
                 .await
                 {
@@ -374,6 +376,7 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
 
 /// Per-connection serve: each inbound substream is dispatched to the
 /// service selected by the connection's negotiated ALPN.
+#[allow(clippy::too_many_arguments)]
 async fn serve_connection(
     alpn: Vec<u8>,
     conn: Connection,
@@ -382,6 +385,7 @@ async fn serve_connection(
     manager: PeerManager,
     setup: Option<MountedSetup>,
     work: Option<MountedWork>,
+    admin: Option<hellas_sdk::grant_admin::GrantAdmin>,
 ) -> anyhow::Result<()> {
     let transport = Arc::new(IrohTransport::new(conn));
 
@@ -409,6 +413,10 @@ async fn serve_connection(
             manager,
         );
         serve_loop(transport, server).await
+    } else if let Some(admin) =
+        admin.filter(|_| alpn == hellas_rpc::services::host_control::HostControl::ALPN.as_bytes())
+    {
+        serve_loop(transport, admin.dispatcher()).await
     } else {
         warn!("Unknown ALPN: {:?}", String::from_utf8_lossy(&alpn));
         Ok(())

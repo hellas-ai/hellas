@@ -5,6 +5,7 @@ use crate::work_store::{Applied, Channel, JobBook, JobPhase, JobState, JobTermin
 use hellas_kernel::NetworkId;
 use hellas_rpc::ProviderEnrollmentBundle;
 use hellas_rpc::protocol::work::bound_result_digest;
+use hellas_rpc::protocol::work_grant::admin::{User, UserPermissions};
 use hellas_rpc::protocol::work_grant::{budget::*, records::*, *};
 use hellas_rpc::{Digest, PublicKey};
 use std::collections::BTreeMap;
@@ -14,6 +15,7 @@ pub struct State {
     pub(super) network: NetworkId,
     pub(super) provider: ProviderEnrollmentBundle,
     pub(super) grants: BTreeMap<GrantId, GrantDef>,
+    pub(super) users: BTreeMap<PrincipalId, User>,
     pub(super) channels: BTreeMap<Digest, Channel<GrantFunding>>,
     pub(super) ledger: Ledger,
     pub(super) history: BTreeMap<(GrantId, Revision), GrantDef>,
@@ -40,6 +42,10 @@ pub(super) enum Change {
         concurrent: u16,
     },
     Define(GrantDef),
+    User {
+        user: User,
+        grants: Vec<GrantDef>,
+    },
     Generation {
         grant: GrantId,
         generation: u64,
@@ -80,6 +86,19 @@ impl State {
     }
     pub fn grant(&self, id: GrantId) -> Option<&GrantDef> {
         self.grants.get(&id)
+    }
+    pub fn users(&self) -> impl Iterator<Item = &User> {
+        self.users.values()
+    }
+    pub fn user(&self, id: PrincipalId) -> Option<&User> {
+        self.users.get(&id)
+    }
+    pub fn allows_admin(&self, context: &hellas_wire::TransportContext) -> bool {
+        context.auth_level == hellas_wire::AuthLevel::LocalOwner
+            || context.vouched_peer().is_some_and(|peer| {
+                self.users()
+                    .any(|u| u.is_admin() && u.principal.transport() == peer.0)
+            })
     }
     pub fn channel(&self, id: ChannelId) -> Option<&Channel<GrantFunding>> {
         self.channels.get(&id.0)
@@ -125,6 +144,7 @@ impl State {
             network,
             provider,
             grants: BTreeMap::new(),
+            users: BTreeMap::new(),
             channels: BTreeMap::new(),
             ledger: Ledger::default(),
             history: BTreeMap::new(),
@@ -169,6 +189,27 @@ impl State {
         }
         self.ledger.advance(frame.now);
         match &frame.change {
+            Change::User { user, grants } => {
+                self.apply_user(user)?;
+                for def in grants {
+                    if def.kind.principal().id() != user.principal.id() {
+                        return Err(GrantError::Audience.into());
+                    }
+                    self.apply(&Frame {
+                        namespace: frame.namespace.clone(),
+                        now: frame.now,
+                        change: Change::Define(def.clone()),
+                    })?;
+                }
+                if !user.is_active()
+                    && self.grants.values().any(|g| {
+                        g.kind.principal().id() == user.principal.id()
+                            && g.state != GrantState::Revoked
+                    })
+                {
+                    return Err(GrantError::Unauthorized.into());
+                }
+            }
             Change::Clock => {}
             Change::RepairResource(id) => {
                 let health = self.resources.get_mut(id).ok_or(GrantError::OutOfScope)?;
@@ -198,6 +239,18 @@ impl State {
             }
             Change::Define(def) => {
                 def.validate()?;
+                let principal = def.kind.principal();
+                if let Some(user) = self.user(principal.id()) {
+                    if !user.is_active() && def.state != GrantState::Revoked {
+                        return Err(GrantError::Revoked.into());
+                    }
+                } else {
+                    self.apply_user(&User {
+                        principal: principal.clone(),
+                        revision: Revision(1),
+                        permissions: UserPermissions::Active { admin: false },
+                    })?;
+                }
                 let machine = self
                     .ledger
                     .node(BudgetNode::Machine)
@@ -558,6 +611,7 @@ pub(super) struct Snapshot {
     #[serde(with = "provider_bytes")]
     provider: ProviderEnrollmentBundle,
     grants: Vec<GrantDef>,
+    users: Vec<User>,
     ledger: Ledger,
     history: Vec<GrantDef>,
     resources: Vec<(Digest, ResourceHealth)>,
@@ -585,6 +639,7 @@ impl State {
             network: self.network,
             provider: self.provider.clone(),
             grants: self.grants.values().cloned().collect(),
+            users: self.users.values().cloned().collect(),
             ledger: self.ledger.clone(),
             history: self.history.values().cloned().collect(),
             resources: self.resources.iter().map(|(id, h)| (*id, *h)).collect(),
@@ -616,12 +671,19 @@ impl State {
     pub(super) fn restore(s: Snapshot) -> Result<Self, GrantStoreError> {
         if s.namespace != "hellas.work.grant-checkpoint.v1"
             || s.grants.len() > 256
+            || s.users.len() > 256
             || s.channels.len() > 256
         {
             return Err(GrantStoreError::Malformed);
         }
         s.provider.check_grant_provider()?;
         let mut state = Self::empty(s.network, s.provider);
+        for user in s.users {
+            state.validate_user(&user)?;
+            if user.revision.0 == 0 || state.users.insert(user.principal.id(), user).is_some() {
+                return Err(GrantStoreError::Malformed);
+            }
+        }
         state.ledger = s.ledger;
         for def in s.history {
             def.validate()?;
@@ -751,6 +813,12 @@ impl State {
             }
         }
         for def in state.grants.values().chain(state.history.values()) {
+            let user = state
+                .user(def.kind.principal().id())
+                .ok_or(GrantStoreError::Malformed)?;
+            if user.principal != *def.kind.principal() {
+                return Err(GrantStoreError::Malformed);
+            }
             if matches!(def.kind, GrantKind::Owner(_))
                 && def.id
                     != owner_grant_id(
@@ -820,6 +888,14 @@ impl State {
             }
         }
         state.ledger.validate_definitions(state.grants.values())?;
+        if state.grants.values().any(|g| {
+            g.state != GrantState::Revoked
+                && !state
+                    .user(g.kind.principal().id())
+                    .is_some_and(User::is_active)
+        }) {
+            return Err(GrantStoreError::Malformed);
+        }
         state.ledger.validate_reservations(
             state
                 .channels

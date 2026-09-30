@@ -57,7 +57,7 @@ fn alias(root: &Path, kind: &str, name: &str) -> CliResult<PathBuf> {
     );
     Ok(root.join(kind).join(name))
 }
-fn save(path: &Path, bytes: &[u8]) -> CliResult<()> {
+pub(super) fn save(path: &Path, bytes: &[u8]) -> CliResult<()> {
     let directory = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -65,15 +65,6 @@ fn save(path: &Path, bytes: &[u8]) -> CliResult<()> {
     hellas_private::create_dir_all_durable(directory)?;
     hellas_private::write_atomically(path, ".record", bytes)?;
     Ok(())
-}
-#[cfg(feature = "node")]
-pub fn load_contact(identity: &Principal, name: &str) -> CliResult<Principal> {
-    let path = alias(&data_root(identity)?, "contacts", name)?;
-    Ok(Principal::decode(&read_bounded_regular_file(
-        &path,
-        "contact",
-        MAX_PRINCIPAL_BYTES,
-    )?)?)
 }
 pub fn contact(
     command: ContactCommand,
@@ -153,9 +144,6 @@ pub fn offer(command: OfferCommand, identity: &crate::identity::LocalIdentity) -
     }
     Ok(())
 }
-
-#[cfg(feature = "node")]
-pub mod grants;
 
 #[cfg(feature = "gateway")]
 pub fn client_journal_root(identity: &Principal) -> CliResult<PathBuf> {

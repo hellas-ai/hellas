@@ -364,6 +364,7 @@ async fn exchange_routed_setup(
             directory.manager(),
             Some(setup),
             None,
+            None,
         )
         .await
         .expect("the routed setup connection is served");
@@ -2943,6 +2944,7 @@ impl RunningPaidNode {
                         manager,
                         Some(setup),
                         Some(work),
+                        None,
                     )
                     .await
                     {

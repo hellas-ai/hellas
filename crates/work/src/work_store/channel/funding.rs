@@ -85,7 +85,7 @@ impl JobOutcome for TerminalOutcome {
     }
 }
 
-/// Closed set of supported funding models. Only payment is implemented in M1.
+/// Closed set of funding models with distinct authority and terminal duties.
 /// Adding grants requires an explicit implementation inside this crate.
 pub trait Funding: sealed::Funding + Copy + Debug + Eq {
     /// Signed proposal carrying this funding model's authority.

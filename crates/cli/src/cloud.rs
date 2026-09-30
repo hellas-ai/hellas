@@ -18,7 +18,20 @@ pub(super) async fn run(command: Commands, identity_path: Option<&Path>) -> Resu
     match command {
         Commands::Cloud(args) => args.run_owned(service.as_ref()).await,
         Commands::Machines(args) => args.run(service.context("owner identity required")?).await,
-        Commands::Control(args) => args.run(service.context("owner identity required")?).await,
+        Commands::Admin(crate::commands::admin::AdminArgs {
+            command: crate::commands::admin::AdminCommand::Serve { socket },
+        }) => {
+            let service = service.context("owner identity required")?;
+            let socket = socket
+                .map(Ok)
+                .unwrap_or_else(|| hellas_cloud::internal_rpc::default_socket(&service.owner()))?;
+            eprintln!(
+                "management owner: {}\nmanagement socket: {}",
+                service.owner(),
+                socket.display()
+            );
+            hellas_cloud::internal_rpc::serve(service, &socket).await
+        }
         _ => unreachable!("only management commands reach this adapter"),
     }
 }

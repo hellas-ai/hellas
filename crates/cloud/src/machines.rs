@@ -169,33 +169,3 @@ impl MachinesArgs {
         Ok(())
     }
 }
-
-#[derive(Args)]
-pub struct ControlArgs {
-    #[command(subcommand)]
-    pub command: ControlCommand,
-}
-
-#[derive(Subcommand)]
-pub enum ControlCommand {
-    /// Serve private JSON-RPC for local applications, using the selected identity.
-    Serve {
-        #[arg(long)]
-        socket: Option<PathBuf>,
-    },
-}
-
-impl ControlArgs {
-    pub async fn run(self, service: Service) -> Result<()> {
-        let ControlCommand::Serve { socket } = self.command;
-        let socket = socket
-            .map(Ok)
-            .unwrap_or_else(|| crate::internal_rpc::default_socket(&service.owner()))?;
-        eprintln!(
-            "management owner: {}\nmanagement socket: {}",
-            service.owner(),
-            socket.display()
-        );
-        crate::internal_rpc::serve(service, &socket).await
-    }
-}

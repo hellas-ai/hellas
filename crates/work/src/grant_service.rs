@@ -94,6 +94,11 @@ impl GrantService {
         {
             return Err(GrantError::Signature.into());
         }
+        if !store.state().users().any(|user| {
+            user.permissions == hellas_rpc::protocol::work_grant::admin::UserPermissions::Owner
+        }) {
+            return Err(GrantError::Unauthorized.into());
+        }
         let backend = Arc::new(backend);
         let capacity = backend.clone();
         let run = Arc::new(move |input, policy: GrantPolicy, admission, progress| {
@@ -160,6 +165,17 @@ impl GrantService {
         }
         let now = (self.clock)().max(held.store.state().now());
         let result = op(&mut held.store, now);
+        // A failed write/sync can leave permission durability uncertain. Do not
+        // continue authorizing against the in-memory view until replay succeeds.
+        if matches!(
+            &result,
+            Err(GrantStoreError::Journal(
+                crate::work_store::journal::JournalError::Io(_)
+                    | crate::work_store::journal::JournalError::Poisoned
+            ))
+        ) {
+            held.failed = true;
+        }
         drop(held);
         self.changed.notify_waiters();
         result
@@ -180,6 +196,9 @@ impl GrantService {
                 .inner
                 .lock()
                 .map_err(|_| refused(GrantRefusalCode::StorageUnavailable))?;
+            if held.failed {
+                return Err(refused(GrantRefusalCode::StorageUnavailable));
+            }
             if !request.route.as_ref().is_some_and(|r| {
                 r.selects_grant(query.locator.channel(held.store.state().network()))
             }) {
@@ -623,6 +642,14 @@ impl GrantService {
             .live
             .get(&id)
             .ok_or_else(|| refused(GrantRefusalCode::OutputUnavailable))?;
+        if held
+            .store
+            .state()
+            .grant(live.authorization.grant_id)
+            .is_none_or(|g| g.state == GrantState::Revoked)
+        {
+            return Err(refused(GrantRefusalCode::Revoked));
+        }
         if let Some(code) = live.refusal {
             return Err(held
                 .store

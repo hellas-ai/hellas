@@ -44,6 +44,13 @@ pub(crate) fn served_alpns(work_configured: bool, grants_configured: bool) -> Ve
     if grants_configured && !work_configured {
         alpns.push(Work::ALPN.as_bytes().to_vec());
     }
+    if grants_configured {
+        alpns.push(
+            hellas_rpc::services::host_control::HostControl::ALPN
+                .as_bytes()
+                .to_vec(),
+        );
+    }
     alpns
 }
 
@@ -89,9 +96,16 @@ mod tests {
         assert_eq!(served_alpns(false, false), [Node::ALPN.as_bytes()]);
         assert_eq!(
             served_alpns(false, true),
-            [Node::ALPN.as_bytes(), Work::ALPN.as_bytes()]
+            [
+                Node::ALPN.as_bytes(),
+                Work::ALPN.as_bytes(),
+                hellas_rpc::services::host_control::HostControl::ALPN.as_bytes()
+            ]
         );
-        assert_eq!(served_alpns(true, true), served_alpns(true, false));
+        assert_eq!(
+            served_alpns(true, true).len(),
+            served_alpns(true, false).len() + 1
+        );
         assert_eq!(
             served_alpns(true, false),
             [

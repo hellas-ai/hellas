@@ -2,6 +2,7 @@
 mod client;
 mod codec;
 pub mod refusal;
+mod users;
 pub use client::GrantClientStore;
 /// Evidence supplied by the authenticated live transport, never request bytes.
 #[derive(Clone, Copy, Debug)]

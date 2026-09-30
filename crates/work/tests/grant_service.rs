@@ -771,3 +771,79 @@ async fn verified_usage_survives_error_status_and_late_settlement_without_faulti
         assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
     }
 }
+
+#[tokio::test]
+async fn user_removal_stops_open_result_delivery_without_dropping_running_accounting() {
+    use hellas_rpc::protocol::work_grant::admin::{GrantCommand, UserCommand};
+    let dir = tempfile::tempdir().unwrap();
+    let store = setup(dir.path());
+    let request = request(&store, 1);
+    let auth = GrantJobAuthorizationV1::decode(&request.authorization).unwrap();
+    let backend = Backend::new();
+    let service = service(store, backend.clone());
+    let id = accepted_id(service.accept(&request, &context()));
+    backend.started.notified().await;
+    let mut stream = service.stream(
+        DeliverResultRequest {
+            route: Some(WorkRoute::grant(auth.channel_id)),
+            work_id: id.as_bytes().to_vec(),
+            client_signature: principal(1)
+                .1
+                .sign_digest(bound_delivery_request_digest(
+                    network(),
+                    auth.channel_id.0,
+                    id,
+                    &[7; 32],
+                ))
+                .unwrap()
+                .bytes()
+                .to_vec(),
+        },
+        context(),
+    );
+    assert!(matches!(
+        stream.next().await.unwrap().unwrap().outcome,
+        Some(work_stream_event::Outcome::Prefix(_))
+    ));
+    service
+        .control(
+            GrantCommand::Users(UserCommand::Remove {
+                id: principal(1).0.id(),
+                expected_revision: Revision(1),
+            }),
+            &[],
+            std::num::NonZeroU64::new(1).unwrap(),
+        )
+        .unwrap();
+    let Some(work_stream_event::Outcome::Refused(refusal)) =
+        stream.next().await.unwrap().unwrap().outcome
+    else {
+        panic!("revoked stream must refuse");
+    };
+    assert_eq!(
+        refusal.grant.unwrap().code,
+        GrantRefusalCode::Revoked as i32
+    );
+    assert!(stream.next().await.is_none());
+    backend.finish.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(3), service.drain())
+        .await
+        .unwrap()
+        .unwrap();
+    service
+        .administer(|store, _| {
+            assert_eq!(store.state().ledger().active_count(BudgetNode::Machine), 0);
+            assert_eq!(
+                store
+                    .state()
+                    .ledger()
+                    .node(BudgetNode::Grant(auth.grant_id))
+                    .unwrap()
+                    .counter(Meter::Requests, Window::Total)
+                    .used,
+                1
+            );
+            Ok(())
+        })
+        .unwrap();
+}
