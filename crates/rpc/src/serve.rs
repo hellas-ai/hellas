@@ -9,10 +9,8 @@
 //! [`AccountingDispatcher`] records inbound requests and refreshes
 //! `last_seen_ms` in the shared peer registry.
 
-use std::marker::PhantomData;
-
+use hellas_wire::Dispatcher;
 use hellas_wire::transport::{Inbound, StreamTransport};
-use hellas_wire::{Dispatcher, MethodMarker};
 
 use crate::peers::{PeerId, PeerManager};
 
@@ -65,47 +63,6 @@ where
                 .map_err(|e| hellas_wire::TransportError::Io(e.to_string()));
         }
         self.service.dispatch(inbound).await
-    }
-}
-
-/// Routes one method to `selected` and every other method to `fallback`.
-///
-/// This lets one connection-bound service carry a method whose protobuf
-/// service marker is different without opening a second transport. In
-/// particular, confidential Open, quote, and RunTicket can remain on the
-/// exact same QUIC connection and exporter binding.
-pub struct MethodDispatcher<S, F, M> {
-    selected: S,
-    fallback: F,
-    marker: PhantomData<fn() -> M>,
-}
-
-impl<S, F, M> MethodDispatcher<S, F, M> {
-    pub fn new(selected: S, fallback: F) -> Self {
-        Self {
-            selected,
-            fallback,
-            marker: PhantomData,
-        }
-    }
-}
-
-impl<T, S, F, M> Dispatcher<T> for MethodDispatcher<S, F, M>
-where
-    T: StreamTransport + Send + Sync,
-    T::Stream: Send,
-    S: Dispatcher<T> + Send + Sync,
-    F: Dispatcher<T, Error = S::Error> + Send + Sync,
-    M: MethodMarker + Send + Sync,
-{
-    type Error = S::Error;
-
-    async fn dispatch(&self, inbound: Inbound<T::Stream>) -> Result<(), Self::Error> {
-        if inbound.method_id == M::METHOD_ID {
-            self.selected.dispatch(inbound).await
-        } else {
-            self.fallback.dispatch(inbound).await
-        }
     }
 }
 

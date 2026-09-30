@@ -286,7 +286,6 @@ in
             environment.OTEL_SERVICE_NAME = "hellas-test-provider";
             port = executorPort;
             openFirewall = true;
-            executePolicy = "any";
             queueSize = 2;
             contentRoots = [ "/srv/hellas-content" ];
             contentIndex = "/var/lib/hellas/content-index.bin";
@@ -314,8 +313,7 @@ in
       # Materialize three previously unknown environments entirely at VM
       # runtime. All canonical roots are adopted from the configured content
       # root on restart. The admitted case has both its program and weights;
-      # the two refusal cases independently omit one of them so quote
-      # preparation cannot confuse missing content with executePolicy.
+      # the two refusal cases independently omit one of them.
       machine.succeed(
           "systemctl stop hellas.service; "
           "install -d -m 0755 /var/lib/hellas-e2e; "
@@ -348,80 +346,22 @@ in
       machine.wait_for_unit("hellas.service")
       machine.succeed("test -s /var/lib/hellas/content-index.bin")
 
-      node_id = machine.succeed(
-          "HOME=/var/lib/hellas ${package}/bin/hellas-cli identity show-node-id"
-      ).strip()
-      provider = machine.succeed(
-          "HOME=/var/lib/hellas ${package}/bin/hellas-cli identity show-enrollment-id"
-      ).strip()
-      client = (
-          "HOME=/var/lib/hellas-e2e OTEL_SERVICE_NAME=hellas-test-client ${package}/bin/hellas-cli "
-          "--identity /var/lib/hellas-e2e/client.identity --software-root llm "
-          f"{node_id} --node-addr 127.0.0.1:${toString executorPort} "
-          f"--provider {provider} "
-          "--tokenizer /var/lib/hellas-e2e/tokenizer.json "
-          "--prompt hello --max-new-tokens 1"
-      )
-
-      missing = machine.succeed(
-          "set +e; "
-          f"{client} --environment /srv/hellas-content/missing-program.environment "
-          "> /var/lib/hellas-e2e/missing-program.log 2>&1; "
-          "status=$?; test \"$status\" -ne 0; "
-          "cat /var/lib/hellas-e2e/missing-program.log"
-      )
-      print(missing)
-      assert "is not locally available" in missing
-      assert "policy denied" not in missing
-      assert "execute policy denied" not in missing
-
-      missing_static = machine.succeed(
-          "set +e; "
-          f"{client} --environment /srv/hellas-content/missing-static.environment "
-          "> /var/lib/hellas-e2e/missing-static.log 2>&1; "
-          "status=$?; test \"$status\" -ne 0; "
-          "cat /var/lib/hellas-e2e/missing-static.log"
-      )
-      print(missing_static)
-      assert "is not locally available" in missing_static
-      assert "policy denied" not in missing_static
-      assert "execute policy denied" not in missing_static
-
-      admitted = machine.succeed(
-          "set +e; "
-          f"{client} --environment /srv/hellas-content/arbitrary.environment "
-          "> /var/lib/hellas-e2e/admitted.log 2>&1; "
-          "status=$?; test \"$status\" -ne 0; "
-          "cat /var/lib/hellas-e2e/admitted.log"
-      )
-      print(admitted)
-      assert (
-          "did not compile" in admitted
-          or "GPU runtime is unavailable" in admitted
-      ), admitted
-      assert "policy denied" not in admitted
-      assert "is not locally available" not in admitted
-
-      provider_log = machine.succeed("journalctl -u hellas.service --no-pager")
-      print(provider_log)
-      assert "quoted causal-LM evaluate execution" in provider_log
-      assert "accepted evaluate execution" in provider_log
-      assert (
-          "Catena program compilation failed" in provider_log
-          or "failed to start Catena GPU asset owner" in provider_log
-      ), provider_log
+      # Readiness remains a local content check, independent of execution funding.
+      verifier = "${package}/bin/hellas-cli environment verify --content-root /srv/hellas-content --content-index /var/lib/hellas-e2e/verify-index.bin"
+      machine.succeed(f"{verifier} --environment /srv/hellas-content/arbitrary.environment")
+      for missing in ["missing-program", "missing-static"]:
+          machine.fail(f"{verifier} --environment /srv/hellas-content/{missing}.environment")
+      machine.fail("${package}/bin/hellas-cli llm --help")
 
       unit = machine.succeed(
           "systemctl show hellas.service "
           "--property=Environment --property=ExecStart --property=LimitMEMLOCK "
           "--property=MemoryMax --property=MemorySwapMax --property=OOMPolicy"
       )
-      assert "--execute-policy any" in unit
       assert "--content-root /srv/hellas-content" in unit
       assert "--content-index /var/lib/hellas/content-index.bin" in unit
       assert "--gpu-session-programs 3" in unit
       assert "--gpu-session-asset-bytes 1073741824" in unit
-      assert "LimitMEMLOCK=infinity" in unit
       assert "MemoryMax=1879048192" in unit
       assert "MemorySwapMax=0" in unit
       assert "OOMPolicy=kill" in unit

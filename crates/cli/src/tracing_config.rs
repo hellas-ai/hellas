@@ -116,21 +116,6 @@ pub fn init_tracing(log_file: Option<&Path>) -> TracerGuard {
     install_with_otel(registry)
 }
 
-/// Suppress known one-shot transport tail logs after CLI execute has already finished.
-pub fn suppress_execute_tail_logs() {
-    let Some(handle) = LOG_FILTER.get() else {
-        return;
-    };
-
-    let filter = base_env_filter()
-        .add_directive("iroh::socket=off".parse().unwrap())
-        .add_directive("noq::connection=off".parse().unwrap())
-        .add_directive("noq_proto::connection=off".parse().unwrap())
-        .add_directive("acto::tokio=off".parse().unwrap());
-
-    let _ = handle.reload(filter);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

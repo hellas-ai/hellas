@@ -3,18 +3,14 @@ use std::sync::Arc;
 
 use hellas_attestation::RootProver;
 use hellas_executor::{
-    ExecuteServer, Executor, ExecutorSpawnConfig, FetchAccessPolicy, FetchQuotaStoreBackend,
-    FetchRoute, FetchRouteEntry, FetchRoutePolicy, FetchRouteRegistry, FetchServer,
-    FetchTranscriptStoreBackend,
+    Executor, ExecutorSpawnConfig, FetchRoute, FetchRouteEntry, FetchRoutePolicy,
+    FetchRouteRegistry,
 };
 use hellas_rpc::open::OpenDispatcher;
 use hellas_rpc::pb::execute::{OpenRequest, OpenResponse, open_response};
-use hellas_rpc::run_ticket::signature_to_pb;
-use hellas_rpc::serve::MethodDispatcher;
-use hellas_rpc::services::execute::RunTicket;
-use hellas_rpc::services::fetch::{Fetch, Open as FetchOpen};
+use hellas_rpc::signature_wire::signature_to_pb;
 use hellas_rpc::{
-    Assurance, OPEN_NONCE_LEN, ProviderEnrollmentBundle, PublicKey, RootProof, open_proof_binding,
+    Assurance, OPEN_NONCE_LEN, ProviderEnrollmentBundle, RootProof, open_proof_binding,
 };
 use hellas_wire::iroh::IrohTransport;
 use hellas_wire::{
@@ -30,14 +26,12 @@ const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15
 /// Startup errors, before a provider accepts requests.
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
-    #[error("provider requires allowed callers or paid-work configuration")]
-    MissingAccessPolicy,
+    #[error("owner execution requires a grant; configure a payment-funded Work provider")]
+    OwnerGrantRequired,
     #[error("paid channel names an unavailable Fetch route or manifest")]
     MissingPaidRoute,
     #[error("Fetch provider requires a paid Fetch policy")]
     WrongPaidPolicy,
-    #[error("paid Fetch provider requires zero retained transcript capacity")]
-    PaidRetention,
     #[error("invalid provider settlement key")]
     SettlementKey,
     #[error(transparent)]
@@ -71,11 +65,9 @@ pub struct OpenAiProviderOptions<R> {
     pub service: String,
     pub method: String,
     pub bearer_token: String,
-    pub allowed_callers: Vec<PublicKey>,
+    pub paid_work: Option<crate::work_config::WorkConfig>,
     pub fetch_max_in_flight: usize,
     pub fetch_queue_capacity: usize,
-    pub retained_transcript_capacity: usize,
-    pub fetch_replay_max_in_flight: usize,
 }
 
 /// An attested Fetch provider with an operator-supplied route registry.
@@ -86,11 +78,8 @@ pub struct FetchProviderOptions<R> {
     pub root: Arc<R>,
     pub state_directory: PathBuf,
     pub routes: FetchRouteRegistry,
-    pub allowed_callers: Vec<PublicKey>,
     pub fetch_max_in_flight: usize,
     pub fetch_queue_capacity: usize,
-    pub retained_transcript_capacity: usize,
-    pub fetch_replay_max_in_flight: usize,
     #[cfg(feature = "paid-provider")]
     pub paid_work: Option<crate::work_config::WorkConfig>,
 }
@@ -172,13 +161,10 @@ where
         root: options.root,
         state_directory: options.state_directory,
         routes,
-        allowed_callers: options.allowed_callers,
         fetch_max_in_flight: options.fetch_max_in_flight,
         fetch_queue_capacity: options.fetch_queue_capacity,
-        retained_transcript_capacity: options.retained_transcript_capacity,
-        fetch_replay_max_in_flight: options.fetch_replay_max_in_flight,
         #[cfg(feature = "paid-provider")]
-        paid_work: None,
+        paid_work: options.paid_work,
     })
     .await
 }
@@ -193,8 +179,8 @@ where
     let has_paid_work = options.paid_work.is_some();
     #[cfg(not(feature = "paid-provider"))]
     let has_paid_work = false;
-    if options.allowed_callers.is_empty() && !has_paid_work {
-        return Err(ProviderError::MissingAccessPolicy);
+    if !has_paid_work {
+        return Err(ProviderError::OwnerGrantRequired);
     }
     #[cfg(feature = "paid-provider")]
     if let Some(config) = &options.paid_work {
@@ -226,29 +212,16 @@ where
             }
             _ => return Err(ProviderError::WrongPaidPolicy),
         }
-        if options.retained_transcript_capacity != 0 {
-            return Err(ProviderError::PaidRetention);
-        }
         crate::work_config::validate_work_routes(config)?;
     }
     let producer_key = Arc::new(options.identity.caller_key().clone());
-    let access = FetchAccessPolicy::trusted_callers(options.allowed_callers).with_store(
-        FetchQuotaStoreBackend::fs(options.state_directory.join("quota")),
-    );
     let mut executor_config = ExecutorSpawnConfig::fetch_only(
         producer_key.clone(),
-        Arc::new(options.enrollment.canonical_bytes()),
         Assurance::AppleAppAttest,
         options.routes,
     );
-    executor_config.fetch_access_policy = access;
     executor_config.fetch_max_in_flight = options.fetch_max_in_flight;
     executor_config.fetch_queue_capacity = options.fetch_queue_capacity;
-    executor_config.fetch_replay_max_in_flight = options.fetch_replay_max_in_flight;
-    executor_config.fetch_store = FetchTranscriptStoreBackend::fs_with_capacity(
-        options.state_directory.join("transcripts"),
-        options.retained_transcript_capacity,
-    );
     let executor = Executor::spawn_configured(executor_config).await?;
 
     #[cfg(feature = "paid-provider")]
@@ -290,26 +263,12 @@ where
         root: options.root,
         enrollment: options.enrollment,
     };
-    // A paid provider must not expose a second, unpaid route to the same
-    // upstream credentials, even when legacy Courtesy callers are configured.
-    let alpns = if has_paid_work {
-        Vec::new()
-    } else {
-        vec![<Fetch as ServiceMarker>::ALPN.as_bytes().to_vec()]
-    };
-    #[cfg(feature = "paid-provider")]
-    let alpns = if has_paid_work {
-        let mut alpns = alpns;
-        alpns.extend([
-            hellas_rpc::services::work::Work::ALPN.as_bytes().to_vec(),
-            hellas_rpc::services::work_setup::WorkSetup::ALPN
-                .as_bytes()
-                .to_vec(),
-        ]);
-        alpns
-    } else {
-        alpns
-    };
+    let alpns = vec![
+        hellas_rpc::services::work::Work::ALPN.as_bytes().to_vec(),
+        hellas_rpc::services::work_setup::WorkSetup::ALPN
+            .as_bytes()
+            .to_vec(),
+    ];
     let mut builder = Endpoint::builder(presets::N0)
         .secret_key(options.identity.transport_key())
         .alpns(alpns);
@@ -345,7 +304,6 @@ where
                     continue;
                 }
             };
-            let executor = executor.clone();
             #[cfg(feature = "paid-provider")]
             let (work_mount, setup_mount) = (work_mount.clone(), setup_mount.clone());
             let open = open.clone();
@@ -406,19 +364,7 @@ where
                             );
                         serve(transport, server).await;
                     }
-                    return;
                 }
-                if has_paid_work || alpn != Fetch::ALPN.as_bytes() {
-                    return;
-                }
-                let server = OpenDispatcher::<_, _, FetchOpen>::new(
-                    MethodDispatcher::<_, _, RunTicket>::new(
-                        ExecuteServer(executor.clone()),
-                        FetchServer(executor),
-                    ),
-                    open,
-                );
-                serve(transport, server).await;
             });
         }
     });

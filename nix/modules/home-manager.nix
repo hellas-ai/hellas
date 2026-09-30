@@ -28,7 +28,6 @@ let
   ++ cfg.serve.content
   ++ cfg.serve.contentRoots
   ++ lib.optional (cfg.serve.contentIndex != null) cfg.serve.contentIndex
-  ++ lib.optional (cfg.serve.artifactStorePath != null) cfg.serve.artifactStorePath
   ++ lib.optional (cfg.serve.workConfigFile != null) cfg.serve.workConfigFile
   ++ lib.optional (cfg.serve.fetchConfigFile != null) cfg.serve.fetchConfigFile
   ++ lib.optional (cfg.serve.environmentFile != null) cfg.serve.environmentFile;

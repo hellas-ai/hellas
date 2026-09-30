@@ -1,5 +1,7 @@
 use crate::commitment::TagError;
-use crate::run_ticket::{public_key_from_pb, public_key_to_pb, signature_from_pb, signature_to_pb};
+use crate::signature_wire::{
+    public_key_from_pb, public_key_to_pb, signature_from_pb, signature_to_pb,
+};
 #[cfg(test)]
 use crate::{Assurance, Operation, scheme_id};
 use crate::{
@@ -164,7 +166,7 @@ pub enum StreamEnvelopeError {
     #[error("signature error: {0}")]
     Signature(#[from] crate::SignatureError),
     #[error("signature wire error: {0}")]
-    SignatureWire(#[from] crate::run_ticket::RunTicketAuthError),
+    SignatureWire(#[from] crate::signature_wire::SignatureWireError),
     #[error("stream verification error: {0}")]
     Stream(#[from] StreamVerifyError),
 }

@@ -189,6 +189,7 @@ impl Service {
     }
 
     pub async fn create(&self, spec: Spec, receipt: Option<PathBuf>) -> Result<Value> {
+        crate::agent::check_owner_execution(Some(&self.owner()))?;
         spec.validate()?;
         let _lock = lock_state(&self.root.join("inventory"))?;
         let path = self.path(&spec.name)?;
@@ -231,14 +232,12 @@ impl Service {
         name: String,
         bootstrap_file: PathBuf,
         admin_addr: Option<SocketAddr>,
-        mut serve_args: Vec<String>,
+        serve_args: Vec<String>,
     ) -> Result<Value> {
+        crate::agent::check_owner_execution(Some(&self.owner()))?;
         let _lock = lock_state(&self.root.join("inventory"))?;
         let path = self.path(&name)?;
         ensure!(!path.exists(), "machine name already exists");
-        if serve_args.is_empty() {
-            serve_args = vec!["--execute-policy".into(), "none".into()];
-        }
         validate_serve_args(&serve_args)?;
         let mut credentials = Credentials::generate();
         credentials.owner = Some(self.owner());
@@ -286,7 +285,7 @@ impl Service {
                 } else {
                     ensure!(
                         *running,
-                        "Hellas is not running; check the image supports serve --owner"
+                        "Hellas is not running; check the image supports owner grant funding"
                     );
                     machine.enrollment = Some(enrollment.clone());
                 }

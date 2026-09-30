@@ -45,8 +45,25 @@ struct Process {
     configuration_dir: PathBuf,
 }
 
+#[derive(Debug)]
+pub struct OwnerGrantRequired;
+impl std::fmt::Display for OwnerGrantRequired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("owner execution requires a grant")
+    }
+}
+impl std::error::Error for OwnerGrantRequired {}
+
+pub(crate) fn check_owner_execution(owner: Option<&str>) -> Result<()> {
+    if owner.is_some() {
+        return Err(OwnerGrantRequired.into());
+    }
+    Ok(())
+}
+
 impl Process {
     fn start(&mut self) -> Result<()> {
+        check_owner_execution(self.owner.as_deref())?;
         let (program, args) = self
             .launcher
             .split_first()
@@ -57,13 +74,6 @@ impl Process {
             .args(&self.args)
             .arg("--identity")
             .arg(&self.identity)
-            .arg("--artifact-store-path")
-            .arg(
-                self.identity
-                    .parent()
-                    .context("identity needs a data directory")?
-                    .join("artifacts"),
-            )
             .args(["--assurance", "producer-signed"])
             .env_remove("HELLAS_REMOTE_KEY")
             .env_remove("HELLAS_REMOTE_TOKEN")
@@ -73,9 +83,6 @@ impl Process {
             .stdout(Stdio::from(std::io::stderr()))
             .stderr(Stdio::inherit())
             .kill_on_drop(true);
-        if let Some(owner) = &self.owner {
-            command.args(["--owner", owner]);
-        }
         if let Some(configuration) = &self.configuration {
             command
                 .arg("--fetch-config")
@@ -500,6 +507,23 @@ async fn receive_content(
 mod tests {
     use super::*;
     use tokio::io::AsyncReadExt;
+
+    #[test]
+    fn owner_process_cannot_launch_before_grant_funding() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut process = Process {
+            child: None,
+            launcher: vec!["must-not-launch".into()],
+            args: vec![],
+            identity: dir.path().join("identity"),
+            owner: Some("owner".into()),
+            cli: dir.path().join("cli"),
+            configuration: None,
+            configuration_dir: dir.path().to_owned(),
+        };
+        assert!(process.start().unwrap_err().is::<OwnerGrantRequired>());
+        assert!(process.child.is_none());
+    }
 
     async fn response(body: &'static [u8]) -> reqwest::Response {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

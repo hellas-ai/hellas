@@ -34,7 +34,7 @@ pub struct FetchRouteEntry {
 impl FetchRouteEntry {
     /// Binds one provider-local credential source to a trusted adaptor.
     ///
-    /// Credentials and capabilities remain local policy. The quoted manifest
+    /// Credentials and capabilities remain local policy. The bound manifest
     /// identity is always derived from the same adaptor object that constructs
     /// the request and interprets the response.
     pub fn new(
@@ -58,7 +58,7 @@ impl FetchRouteEntry {
         })
     }
 
-    /// Returns the trusted execution-environment commitment quoted for this
+    /// Returns the trusted execution-environment commitment selected for this
     /// route.
     #[must_use]
     pub const fn execution_environment(&self) -> ContentId {

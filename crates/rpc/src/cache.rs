@@ -10,8 +10,6 @@ use crate::{ContentId, Digest};
 
 mod manage;
 pub use manage::{CacheFilter, CachePrune, CacheStats, Eviction};
-#[cfg(feature = "host-control")]
-pub mod control;
 
 pub type CacheError = Box<dyn std::error::Error + Send + Sync>;
 pub type CacheResult<T> = Result<T, CacheError>;

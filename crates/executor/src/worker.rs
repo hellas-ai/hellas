@@ -12,7 +12,7 @@ use catena_lang::safe_gpu::{
     SessionTimeouts,
 };
 use hellas_rpc::evaluate::{EvaluateOutputTranscriptBuilder, input_commitment};
-use hellas_rpc::pb::execute::{
+use hellas_rpc::execution_event::{
     WorkChunk as PbChunk, WorkEvent as PbWorkEvent, work_event::Kind as PbEvent,
 };
 use hellas_rpc::protocol::artifacts::MAX_RETRIEVABLE_TOKEN_IDS;
@@ -26,7 +26,6 @@ use tokio::sync::mpsc as tokio_mpsc;
 use tracing::{debug, warn};
 use zeroize::Zeroizing;
 
-use crate::artifacts::PreparedTextArtifacts;
 use crate::environment::{CausalLmEnvironmentSource, read_verified_bytes};
 use crate::executor::ExecutorCompletion;
 use crate::state::{Invocation, StopReason};
@@ -239,27 +238,20 @@ pub(crate) enum EnqueueError {
 
 pub(crate) struct ExecuteJob {
     pub deadline: Option<Instant>,
-    pub output_cache: hellas_rpc::cache::CacheOptions,
-    pub cache_recording: Option<hellas_rpc::cache::CacheRecording>,
     pub span: tracing::Span,
     pub execution_id: String,
-    pub request_commitment: [u8; 32],
     pub evaluate_request: EvaluateRequest,
     pub source: CausalLmEnvironmentSource,
     pub invocation: Invocation,
-    pub prepared_artifacts: Option<PreparedTextArtifacts>,
     pub accepted_at: Instant,
     pub sender: tokio_mpsc::Sender<Result<PbWorkEvent, WireStatus>>,
     pub producer_key: Arc<ProducerSigningKey>,
 }
 
 pub(crate) struct WorkerCompletion {
-    pub cache_recording: Option<hellas_rpc::cache::CacheRecording>,
     pub execution_id: String,
-    pub request_commitment: [u8; 32],
     pub evaluate_request: EvaluateRequest,
     pub invocation: Invocation,
-    pub prepared_artifacts: Option<PreparedTextArtifacts>,
     pub sender: tokio_mpsc::Sender<Result<PbWorkEvent, WireStatus>>,
     pub result: WorkerCompletionResult,
 }
@@ -341,14 +333,11 @@ fn worker_loop(
         let job = *job;
         let deadline = job.deadline;
         let execution_id = job.execution_id.clone();
-        let request_commitment = job.request_commitment;
         let execution_environment = job.evaluate_request.execution_environment;
         let sender = job.sender.clone();
         let evaluate_request = job.evaluate_request.clone();
         let invocation = job.invocation.clone();
-        let prepared_artifacts = job.prepared_artifacts.clone();
         let producer_key = job.producer_key.clone();
-        let cache_recording = job.cache_recording.clone();
 
         let mut position = 0;
         let mut output_builder = EvaluateOutputTranscriptBuilder::new(
@@ -411,12 +400,9 @@ fn worker_loop(
 
         let _ = completion_tx.blocking_send(ExecutorCompletion::EvaluateFinished(Box::new(
             WorkerCompletion {
-                cache_recording,
                 execution_id,
-                request_commitment,
                 evaluate_request,
                 invocation,
-                prepared_artifacts,
                 sender,
                 result: termination,
             },
@@ -430,9 +416,6 @@ fn run_job(
     runtime: &mut ModelRuntime,
     telemetry: &mut InferenceTelemetry,
 ) -> Result<(StopReason, Vec<u32>), crate::ExecutorError> {
-    if let Some(output) = crate::inference_cache::replay(&job, &mut on_progress)? {
-        return Ok(output);
-    }
     let ExecuteJob {
         execution_id,
         source,
@@ -1075,7 +1058,7 @@ fn validate_generation_limits(
         ));
     }
     // Catena owns the causal-LM ABI and therefore owns this arithmetic. Keep
-    // quote-time admission on the same floor its safe runtime enforces before
+    // execution admission on the same floor its safe runtime enforces before
     // allocating resident state, token staging, logits, or next-token output.
     let minimum_device_bytes =
         minimum_generation_device_bytes(state_byte_multipliers, capacity, vocabulary_size)

@@ -6,7 +6,6 @@ mod anthropic;
 mod archive;
 mod backend;
 mod dispatch;
-mod fetch_backend;
 mod http_fetch;
 mod metrics;
 mod openai;
@@ -40,8 +39,7 @@ use self::state::GatewayState;
 
 pub use archive::ArchiveOptions;
 pub use execution::{
-    CausalLmExecutionEnvironment, CliRuntime, ExecutionEvent, ExecutionRequest,
-    ExecutionRequestOptions, ExecutionStrategy, Outcome, PreparedExecution, StopReason,
+    CausalLmExecutionEnvironment, ExecutionEvent, Outcome, PreparedExecution, StopReason,
 };
 pub use http_fetch::{HttpGatewayConfig, HttpGatewayOptions, start_http};
 
@@ -147,13 +145,6 @@ pub struct GatewayOptions {
     pub port: Option<u16>,
     pub node_id: Option<EndpointId>,
     pub node_addrs: Vec<SocketAddr>,
-    #[cfg(feature = "evaluate")]
-    pub local: bool,
-    #[cfg(feature = "evaluate")]
-    pub verify_local: bool,
-    pub verify: Option<EndpointId>,
-    #[cfg(feature = "evaluate")]
-    pub queue_size: usize,
     pub retries: usize,
     pub default_max_tokens: u32,
     /// Fixed presentation label returned to API clients. It is not sent to an
@@ -162,11 +153,6 @@ pub struct GatewayOptions {
     /// Strict canonical Catena causal-LM manifest and locally checked root
     /// metadata, bound to an independent caller pin.
     pub causal_lm: Option<CausalLmExecutionEnvironment>,
-    /// Locally available Xet content used by a local execution leg. The
-    /// executor may only reopen the objects named below the manifest root; it
-    /// does not fetch or compile while admitting the environment.
-    #[cfg(feature = "evaluate")]
-    pub local_content_store: Option<hellas_store::ContentStore>,
     /// Application-selected tokenizer used only before and after execution.
     /// It is not part of the Catena environment or Hellas execution claim.
     pub tokenizer: Option<PathBuf>,
@@ -192,8 +178,6 @@ pub struct GatewayOptions {
     /// gateway given none has no remote route to run and says so.
     pub provider_trust: Option<hellas_client::ProviderTrustAnchor>,
     pub producer_key: ProducerSigningKey,
-    #[cfg(feature = "evaluate")]
-    pub provider_genesis: Vec<u8>,
     pub assurance: hellas_rpc::Assurance,
     pub secret_key: SecretKey,
     pub wrap: Option<String>,
@@ -328,22 +312,6 @@ async fn start_gateway(options: GatewayOptions) -> anyhow::Result<GatewayHandle>
         );
     }
 
-    #[cfg(feature = "evaluate")]
-    if state.local {
-        info!("local Catena execution, queue size: {}", options.queue_size);
-    } else if state.verify_local {
-        info!(
-            "local Catena verification, queue size: {}",
-            options.queue_size
-        );
-    } else if let Some(verify_node) = state.verify_node_id.as_ref() {
-        info!("Verifying primary node against remote shadow node {verify_node}");
-    }
-    #[cfg(not(feature = "evaluate"))]
-    if let Some(verify_node) = state.verify_node_id.as_ref() {
-        info!("Verifying primary node against remote shadow node {verify_node}");
-    }
-
     info!("timeout: {}s", state.inference_timeout.as_secs());
     if let Some(causal_lm) = state.causal_lm.as_ref() {
         info!(
@@ -365,20 +333,8 @@ async fn start_gateway(options: GatewayOptions) -> anyhow::Result<GatewayHandle>
 }
 
 /// Start the small Responses-only gateway used by native hosts such as Gate.
-pub async fn start_fetch(options: FetchGatewayOptions) -> anyhow::Result<GatewayHandle> {
-    let state = Arc::new(GatewayState::from_fetch_options(&options).await?);
-    let bearer = Arc::new(access::Bearer::generate());
-    let app = Router::new()
-        .route("/v1/responses", post(responses::handle))
-        .with_state(state)
-        .layer(provenance_layer::ProvenanceLayer);
-    #[cfg(feature = "otel")]
-    let app = app.layer(axum::middleware::from_fn(
-        hellas_rpc::telemetry::http::trace_request,
-    ));
-    let app = app.layer(access::BearerLayer::new(bearer.clone()));
-    let listener = bind_gateway(&options.host, options.port, false).await?;
-    launch_gateway(app, listener, bearer, None, &[], None).await
+pub async fn start_fetch(_options: FetchGatewayOptions) -> anyhow::Result<GatewayHandle> {
+    Err(hellas_client::ClientError::OwnerGrantRequired.into())
 }
 
 async fn launch_gateway(

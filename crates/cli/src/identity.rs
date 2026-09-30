@@ -1,4 +1,5 @@
 use anyhow::{Context, bail};
+#[cfg(any(feature = "node", test))]
 use hellas_attestation::{AssertionCounterStore, AttestationError};
 use hellas_rpc::signature::verify_digest_signature;
 use hellas_rpc::{
@@ -11,7 +12,7 @@ use hellas_rpc::{
     open::OpenHandler,
     open_proof_binding,
     pb::execute::{OpenRequest, OpenResponse, open_response},
-    run_ticket::signature_to_pb,
+    signature_wire::signature_to_pb,
 };
 use hellas_rpc::{PlatformEnrollment, ProviderEnrollmentBundle};
 #[cfg(feature = "node")]
@@ -24,18 +25,21 @@ use std::sync::Arc;
 
 const IDENTITY_DIR: &str = ".hellas";
 const IDENTITY_FILE: &str = "identity";
+#[cfg(any(feature = "node", test))]
 const APPLE_OPEN_COUNTER_STORE_DIR: &str = "apple-app-attest-open-counters";
-#[cfg(feature = "node")]
-const ARTIFACT_STORE_DIR: &str = "artifacts";
+#[cfg(feature = "evaluate")]
+const CONTENT_INDEX_FILE: &str = "content-index.bin";
 const VERSION: u8 = 3;
 const IDENTITY_TAG: &str = "hellas.provider.identity.persistence.v3";
 
 /// Filesystem-backed assertion-counter high-water marks, keyed by public key.
+#[cfg(any(feature = "node", test))]
 #[derive(Clone, Debug)]
 struct FilesystemAssertionCounterStore {
     directory: PathBuf,
 }
 
+#[cfg(any(feature = "node", test))]
 impl FilesystemAssertionCounterStore {
     fn new(directory: impl Into<PathBuf>) -> Self {
         Self {
@@ -64,6 +68,7 @@ impl FilesystemAssertionCounterStore {
     }
 }
 
+#[cfg(any(feature = "node", test))]
 impl AssertionCounterStore for FilesystemAssertionCounterStore {
     fn advance(&self, public_key: &[u8; 33], counter: u32) -> Result<(), AttestationError> {
         create_dir_restricted(&self.directory).map_err(|_| AttestationError::State)?;
@@ -117,7 +122,7 @@ impl AssertionCounterStore for FilesystemAssertionCounterStore {
 pub(crate) struct LocalIdentity {
     pub(crate) transport_key: SecretKey,
     pub(crate) producer_key: ProducerSigningKey,
-    #[cfg(any(feature = "node", test))]
+    #[cfg(test)]
     pub(crate) genesis: SignedProviderGenesis,
     pub(crate) enrollment: ProviderEnrollmentBundle,
     #[cfg(feature = "node")]
@@ -295,11 +300,12 @@ pub(crate) fn default_gateway_archive_path() -> anyhow::Result<PathBuf> {
     default_hellas_path("gateway-archive", "--archive-dir")
 }
 
-#[cfg(feature = "node")]
-pub(crate) fn default_artifact_store_path() -> anyhow::Result<PathBuf> {
-    default_hellas_path(ARTIFACT_STORE_DIR, "--artifact-store-path")
+#[cfg(feature = "evaluate")]
+pub(crate) fn default_content_index_path() -> anyhow::Result<PathBuf> {
+    default_hellas_path(CONTENT_INDEX_FILE, "--content-index")
 }
 
+#[cfg(any(feature = "node", test))]
 pub(crate) fn provider_trust(
     expected_genesis: Option<hellas_rpc::ContentId>,
     required_assurance: hellas_rpc::Assurance,
@@ -369,7 +375,7 @@ fn create(path: &Path) -> anyhow::Result<LocalIdentity> {
     let identity = LocalIdentity {
         transport_key,
         producer_key,
-        #[cfg(any(feature = "node", test))]
+        #[cfg(test)]
         genesis,
         enrollment,
         #[cfg(feature = "node")]
@@ -435,7 +441,7 @@ fn materialize(stored: &StoredIdentity) -> anyhow::Result<LocalIdentity> {
     Ok(LocalIdentity {
         transport_key,
         producer_key,
-        #[cfg(any(feature = "node", test))]
+        #[cfg(test)]
         genesis,
         enrollment,
         #[cfg(feature = "node")]

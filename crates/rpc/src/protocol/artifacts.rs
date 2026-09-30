@@ -36,7 +36,7 @@ const TEXT_ARTIFACT_OUTPUT_SCHEMA: &str = "hellas.evaluate.text.artifact.output.
 /// Conservative maximum number of token IDs in one retained token artifact.
 ///
 /// Every possible artifact at this bound, including the five-byte DAG-CBOR
-/// encoding of `u32::MAX`, fits in one 4 MiB Courtesy response frame. Providers
+/// encoding of `u32::MAX`, fits within the historical 4 MiB artifact bound. Providers
 /// may choose a lower generation limit, but must not admit a retained execution
 /// whose prompt-plus-output artifact can no longer be retrieved.
 pub const MAX_RETRIEVABLE_TOKEN_IDS: u64 = 524_288;

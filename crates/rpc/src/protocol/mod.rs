@@ -42,7 +42,7 @@ pub use identity::{
     ProviderEnrollmentBundle, ProviderGenesisDecodeError, ProviderGenesisStatement, RootKind,
     RootProof, SignedProviderGenesis,
 };
-pub use job::{APPLE_APP_ATTEST, JobTerms};
+pub use job::APPLE_APP_ATTEST;
 pub use manifest::{Application, ApplicationError, MAX_APPLICATION_ID_BYTES, ProgramManifest};
 pub use open::{
     OPEN_EXPORTER_LEN, OPEN_NONCE_LEN, OPEN_PROOF_DOMAIN, OPEN_PROVIDER_ROLE, open_proof_binding,

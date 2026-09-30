@@ -82,24 +82,6 @@ rec {
     && !lib.hasInfix "${builtins.storeDir}/" value
     && (!lib.hasPrefix "/" value || runtimePathIsOutsideStore lib value);
 
-  executionEnvironmentGlobIsValid =
-    pattern: builtins.isString pattern && builtins.match "[0-9a-f*]{1,64}" pattern != null;
-
-  executePolicyIsValid =
-    policy:
-    policy == null
-    || (
-      if builtins.isString policy then
-        policy == "any"
-        || policy == "none"
-        || builtins.match "only\\([0-9a-f*]{1,64}(,[0-9a-f*]{1,64})*\\)" policy != null
-      else
-        builtins.isList policy && policy != [ ] && builtins.all executionEnvironmentGlobIsValid policy
-    );
-
-  executePolicyEnablesCatena =
-    policy: executePolicyIsValid policy && policy != null && policy != "none";
-
   # launchd has no EnvironmentFile equivalent. This generic executable reads
   # an operator-managed file only after launchd starts it; no value is captured
   # in the derivation. The target is opened exactly once, and parsing and exec
@@ -211,7 +193,6 @@ rec {
     "--log-file"
     "--assurance"
     "--port"
-    "--execute-policy"
     "--queue-size"
     "--content"
     "--content-root"
@@ -223,16 +204,12 @@ rec {
     "--gpu-max-generation-device-bytes"
     "--gpu-compile-timeout-secs"
     "--gpu-execution-timeout-secs"
-    "--evaluate-retained-execution-capacity"
-    "--artifact-store-path"
     "--work-config"
     "--metrics-port"
     "--graffiti"
     "--fetch-config"
     "--fetch-max-in-flight"
     "--fetch-queue-size"
-    "--fetch-retained-transcript-capacity"
-    "--fetch-replay-max-in-flight"
   ];
 
   protectedGatewayExtraArgs = [
@@ -254,8 +231,6 @@ rec {
     "--node-id"
     "--node-addr"
     "--local"
-    "--verify-local"
-    "--verify"
     "--provider"
     "--queue-size"
     "--retries"
@@ -278,8 +253,7 @@ rec {
 
   catenaConfigured =
     serve:
-    executePolicyEnablesCatena serve.executePolicy
-    || serve.content != [ ]
+    serve.content != [ ]
     || serve.contentRoots != [ ]
     || serve.contentIndex != null
     || serve.gpuBackend != null
@@ -288,8 +262,7 @@ rec {
     || serve.gpuMaxGenerationCapacity != null
     || serve.gpuMaxGenerationDeviceBytes != null
     || serve.gpuCompileTimeoutSeconds != null
-    || serve.gpuExecutionTimeoutSeconds != null
-    || serve.evaluateRetainedExecutionCapacity != null;
+    || serve.gpuExecutionTimeoutSeconds != null;
 
   commonOptions =
     {
@@ -422,20 +395,6 @@ rec {
           operator-managed runtime data and must remain outside the Nix store.
         '';
       };
-      executePolicy = mkOption {
-        type = types.addCheck (types.nullOr (types.either types.str (types.listOf types.str))) executePolicyIsValid;
-        default = "none";
-        example = [ "0123456789abcdef*" ];
-        description = ''
-          Catena evaluate policy. The default, "none", refuses all Evaluate
-          executions without activating the local Catena/ROCm runtime. Set
-          "any" explicitly to accept every supported environment for which the
-          provider has all content, or use "only(ID_GLOB,...)" to restrict exact
-          execution-environment content identities. Every glob must contain
-          one to 64 lowercase hexadecimal digits or `*`; whitespace is not
-          accepted. A nonempty list is shorthand for "only(p1,p2,...)".
-        '';
-      };
       queueSize = mkOption {
         type = types.nullOr types.ints.unsigned;
         default = null;
@@ -478,25 +437,6 @@ rec {
           alone is insufficient because index files are owner-only. Never
           chown persistent data to a transient numeric dynamic UID. Keep the
           path and its ancestors stable and trusted while the service runs.
-        '';
-      };
-      artifactStorePath = mkOption {
-        type = types.nullOr runtimePath;
-        default = null;
-        example = "/srv/hellas/artifacts";
-        description = ''
-          Persistent canonical artifact-store root passed as
-          --artifact-store-path. Keep it as dedicated operator-managed runtime
-          data outside the Nix store and outside content/contentRoots. With the
-          NixOS DynamicUser unit, pre-create a custom root and grant write
-          access through an id-mapped mount, or override the unit to use a
-          dedicated static user that owns it. The service intentionally narrows
-          the root to owner-only permissions, so group write access alone is
-          insufficient; never chown persistent data to a transient numeric
-          dynamic UID. Its path and ancestors must remain stable and trusted
-          while the service runs.
-          Null omits the flag and uses the securely managed CLI default,
-          $HOME/.hellas/artifacts.
         '';
       };
       gpuBackend = mkOption {
@@ -549,7 +489,7 @@ rec {
         example = "/run/secrets/hellas-fetch.json";
         description = ''
           Runtime JSON file containing sealed Fetch destinations, credential
-          references, capabilities, and caller policy. Passed as
+          references and capabilities. Passed as
           --fetch-config without copying its contents into the Nix store.
           Null disables Fetch serving.
         '';
@@ -563,35 +503,6 @@ rec {
         type = types.nullOr types.ints.unsigned;
         default = null;
         description = "Maximum number of Fetch executions waiting behind active provider streams.";
-      };
-      fetchRetainedTranscriptCapacity = mkOption {
-        type = types.nullOr types.ints.unsigned;
-        default = null;
-        description = ''
-          Maximum distinct retained Fetch inputs across completed transcripts
-          and indeterminate running markers. Zero disables new retention. The
-          value is persisted per transcript-store root; stop every process
-          sharing that root before changing it or removing the capacity
-          metadata. Existing evidence is never deleted, and an over-cap root
-          still starts and replays but refuses new retention. Null uses the CLI
-          default of 1024.
-        '';
-      };
-      fetchReplayMaxInFlight = mkOption {
-        type = types.nullOr types.ints.positive;
-        default = null;
-        description = "Maximum retained Fetch replays whose consumers have not drained or dropped their streams. Null uses the CLI default of 16.";
-      };
-      evaluateRetainedExecutionCapacity = mkOption {
-        type = types.nullOr types.ints.unsigned;
-        default = null;
-        description = ''
-          Maximum distinct retained Evaluate executions. Zero disables new
-          retained completions. The value is persisted with the Evaluate
-          artifact-store root, which one provider process owns exclusively;
-          stop it before changing this value or removing its metadata. Null
-          uses the CLI default of 1024.
-        '';
       };
       metricsPort = mkOption {
         type = types.nullOr types.port;
@@ -668,22 +579,12 @@ rec {
       local = mkOption {
         type = types.bool;
         default = false;
-        description = "Run the gateway against an in-process Catena executor.";
-      };
-      verifyLocal = mkOption {
-        type = types.bool;
-        default = false;
-        description = "Verify remote responses against an in-process Catena executor.";
-      };
-      verifyNodeId = mkOption {
-        type = types.nullOr types.str;
-        default = null;
-        description = "Remote node id used as the verification shadow.";
+        description = "Reserved for owner grant funding; currently returns an unsupported error.";
       };
       provider = mkOption {
         type = types.nullOr types.str;
         default = null;
-        description = "Out-of-band ContentId pin on the enrollment bundle of the provider this gateway dials. Required whenever it dials one: with nodeId, verifyNodeId, or responsesBackend = \"fetch\".";
+        description = "Out-of-band ContentId pin on the enrollment bundle of the provider this gateway dials. Required whenever it dials one: with nodeId or responsesBackend = \"fetch\".";
       };
       queueSize = mkOption {
         type = types.nullOr types.ints.unsigned;
@@ -904,14 +805,6 @@ rec {
           flag
           (toString value)
         ];
-      renderPolicy =
-        value:
-        if value == null then
-          null
-        else if lib.isList value then
-          "only(${lib.concatStringsSep "," value})"
-        else
-          value;
     in
     [
       "serve"
@@ -919,7 +812,6 @@ rec {
       serve.identityPath
     ]
     ++ optArg "--port" serve.port
-    ++ optArg "--execute-policy" (renderPolicy serve.executePolicy)
     ++ optArg "--queue-size" serve.queueSize
     ++ lib.concatMap (path: [
       "--content"
@@ -937,7 +829,6 @@ rec {
     ++ optArg "--gpu-max-generation-device-bytes" serve.gpuMaxGenerationDeviceBytes
     ++ optArg "--gpu-compile-timeout-secs" serve.gpuCompileTimeoutSeconds
     ++ optArg "--gpu-execution-timeout-secs" serve.gpuExecutionTimeoutSeconds
-    ++ optArg "--artifact-store-path" serve.artifactStorePath
     ++ optArg "--work-config" serve.workConfigFile
     ++ optArg "--metrics-port" serve.metricsPort
     ++ [
@@ -948,9 +839,6 @@ rec {
     ++ optArg "--fetch-config" serve.fetchConfigFile
     ++ optArg "--fetch-max-in-flight" serve.fetchMaxInFlight
     ++ optArg "--fetch-queue-size" serve.fetchQueueSize
-    ++ optArg "--fetch-retained-transcript-capacity" serve.fetchRetainedTranscriptCapacity
-    ++ optArg "--fetch-replay-max-in-flight" serve.fetchReplayMaxInFlight
-    ++ optArg "--evaluate-retained-execution-capacity" serve.evaluateRetainedExecutionCapacity
     ++ serve.extraArgs;
 
   mkGatewayArgs =
@@ -1000,8 +888,6 @@ rec {
       addr
     ]) gateway.nodeAddrs
     ++ lib.optionals gateway.local [ "--local" ]
-    ++ lib.optionals gateway.verifyLocal [ "--verify-local" ]
-    ++ optArg "--verify" gateway.verifyNodeId
     ++ optArg "--provider" gateway.provider
     ++ optArg "--queue-size" gateway.queueSize
     ++ optArg "--retries" gateway.retries

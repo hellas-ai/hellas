@@ -65,7 +65,7 @@ hellas-gateway = { workspace = true, optional = true }
 hellas-kernel = { workspace = true, default-features = false, optional = true }
 hellas-private = { workspace = true, optional = true }
 hellas-providers = { workspace = true, optional = true }
-hellas-rpc = { workspace = true, features = ["execute", "fetch", "courtesy"] }
+hellas-rpc = { workspace = true, features = ["execute", "fetch"] }
 hellas-wire = { workspace = true, features = ["mux"] }
 hellas-work = { workspace = true, optional = true }
 hex = { workspace = true, optional = true }

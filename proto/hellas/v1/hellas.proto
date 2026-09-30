@@ -2,27 +2,7 @@ syntax = "proto3";
 
 package hellas.v1;
 
-// Core Hellas work protocol. This file owns the generic ticket and execution
-// surface plus transport-neutral event shapes. Scheme-specific ticket
-// creation lives in evaluate.proto / fetch.proto; non-core helper APIs live in
-// courtesy.proto; p2p/node discovery lives in swarm.proto.
-
-service Execute {
-  rpc RunTicket(RunTicketRequest) returns (stream WorkEvent);
-}
-
-message Ticket {
-  bytes request_commitment = 1; // exactly 32 bytes
-  JobTerms terms = 2;
-  bytes provider_genesis = 3; // canonical ProviderEnrollmentBundle
-}
-
-message JobTerms {
-  bytes provider_genesis = 1; // ContentId
-  Assurance assurance = 2;
-  uint64 amount = 3;
-  uint64 ttl_ms = 4;
-}
+// Shared identity, confidential Open and signed transcript messages.
 
 // Numeric values are canonical protocol tags and must not be renumbered.
 enum Assurance {
@@ -30,12 +10,6 @@ enum Assurance {
   // buf:lint:ignore ENUM_ZERO_VALUE_SUFFIX
   ASSURANCE_PRODUCER_SIGNED = 0;
   ASSURANCE_APPLE_APP_ATTEST = 1;
-}
-
-message RunTicketRequest {
-  Ticket ticket = 1;
-  Signature signature = 2;
-  PublicKey public_key = 3;
 }
 
 message PublicKey {
@@ -104,38 +78,8 @@ message OutputEventEnvelope {
   bytes payload = 4;
 }
 
-// Wire protocol: zero or more WorkChunk events, terminated by exactly one
-// WorkFinished or WorkFailed, after which the stream ends. WorkChunk events
-// carry the signed non-terminal prefix as it becomes available; WorkFinished
-// carries exactly the next signed terminal event. Successful result commitment
-// lives in that terminal event; WorkFinished is stream framing, not a second
-// copy of the transcript or a scheme result carrier.
-message WorkEvent {
-  oneof kind {
-    WorkChunk chunk = 1;
-    WorkFinished finished = 2;
-    WorkFailed failed = 3;
-  }
-}
-
-message WorkChunk {
-  OutputEventEnvelope output_event = 1;
-}
-
-message WorkFinished {
-  reserved 1, 2;
-  OutputEventEnvelope terminal_output_event = 3;
-  repeated AssuranceEvidence assurance_evidence = 4;
-}
-
 message AssuranceEvidence {
   string codec = 1;
   bytes credential = 2;
   bytes proof = 3;
-}
-
-message WorkFailed {
-  // Units emitted before failure (tokens for evaluate text, bytes for fetch).
-  uint64 position = 1;
-  string error = 2;
 }

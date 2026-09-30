@@ -3,8 +3,8 @@
 //! Per-package message types are generated into `OUT_DIR` by the build
 //! script (`prost-build` driven by `protox`). Each `.proto` package gets a
 //! Rust module here with the matching nesting (`hellas::v1`,
-//! `hellas::courtesy::v1`, …) so prost's `super::super::v1::Ticket`-style
-//! cross-package references resolve.
+//! `hellas::work::v1`, …) so prost's cross-package
+//! references resolve.
 //!
 //! Service/method markers, typed client traits, and the server dispatchers
 //! live in [`services`].
@@ -15,14 +15,6 @@ pub mod hellas {
     #[allow(dead_code)]
     pub mod v1 {
         include!(concat!(env!("OUT_DIR"), "/hellas.v1.rs"));
-    }
-
-    #[cfg(feature = "courtesy")]
-    #[allow(dead_code)]
-    pub mod courtesy {
-        pub mod v1 {
-            include!(concat!(env!("OUT_DIR"), "/hellas.courtesy.v1.rs"));
-        }
     }
 
     #[cfg(feature = "fetch")]
@@ -92,12 +84,6 @@ pub mod fetch {
     pub use crate::pb::hellas::fetch::v1::*;
 }
 
-/// Re-exports of `hellas.courtesy.v1`.
-#[cfg(feature = "courtesy")]
-pub mod courtesy {
-    pub use crate::pb::hellas::courtesy::v1::*;
-}
-
 /// Re-exports of `hellas.swarm.v1`.
 #[cfg(feature = "swarm")]
 pub mod swarm {
@@ -139,50 +125,6 @@ pub mod services {
 mod id_pins {
     #[allow(unused_imports)]
     use hellas_wire::{MethodMarker, ServiceMarker};
-
-    #[cfg(feature = "execute")]
-    #[test]
-    fn execute_ids_are_stable() {
-        use super::services::execute::{Execute, RunTicket};
-        assert_eq!(super::execute::Assurance::ProducerSigned as i32, 0);
-        assert_eq!(super::execute::Assurance::AppleAppAttest as i32, 1);
-        assert_eq!(<Execute as ServiceMarker>::SERVICE_ID, 0x2a0f_bee1);
-        assert_eq!(<RunTicket as MethodMarker>::METHOD_ID, 0xc808_8d01);
-    }
-
-    #[cfg(feature = "evaluate")]
-    #[test]
-    fn evaluate_ids_are_stable() {
-        use super::services::evaluate::{CreateTicket, Evaluate};
-        assert_eq!(<Evaluate as ServiceMarker>::SERVICE_ID, 0x70872e46);
-        assert_eq!(<CreateTicket as MethodMarker>::METHOD_ID, 0xcf212df5);
-    }
-
-    #[cfg(feature = "fetch")]
-    #[test]
-    fn fetch_ids_are_stable() {
-        use super::services::fetch::{CreateTicket, Fetch, Open};
-        assert_eq!(<Fetch as ServiceMarker>::SERVICE_ID, 0x4e98fdd1);
-        assert_eq!(<Open as MethodMarker>::METHOD_ID, 0x55da4412);
-        assert_eq!(<CreateTicket as MethodMarker>::METHOD_ID, 0x39183beb);
-    }
-
-    #[cfg(feature = "host-control")]
-    #[test]
-    fn cache_control_ids_are_stable() {
-        use super::services::cache_control::{CacheControl, ManageCache};
-        assert_eq!(<CacheControl as ServiceMarker>::SERVICE_ID, 0x506b_ebfb);
-        assert_eq!(<ManageCache as MethodMarker>::METHOD_ID, 0x8bb7_91fb);
-    }
-
-    #[cfg(feature = "courtesy")]
-    #[test]
-    fn courtesy_ids_are_stable() {
-        use super::services::courtesy::{Courtesy, Open, QuoteTokens};
-        assert_eq!(<Courtesy as ServiceMarker>::SERVICE_ID, 0xa842_0437);
-        assert_eq!(<Open as MethodMarker>::METHOD_ID, 0x18351e7d);
-        assert_eq!(<QuoteTokens as MethodMarker>::METHOD_ID, 0x4186_3eda);
-    }
 
     #[cfg(feature = "work")]
     #[test]

@@ -8,10 +8,6 @@ import "hellas/v1/hellas.proto";
 // Request structuring and semantic response destructuring belong to that
 // application. The upstream endpoint and every response claim remain
 // adversarial; only a platform-backed Assurance authenticates the running app.
-service Fetch {
-  rpc Open(.hellas.v1.OpenRequest) returns (.hellas.v1.OpenResponse);
-  rpc CreateTicket(FetchRequest) returns (.hellas.v1.Ticket);
-}
 
 message FetchRequest {
   repeated .hellas.v1.InputEventEnvelope input = 1;

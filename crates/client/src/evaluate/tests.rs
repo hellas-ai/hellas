@@ -3,7 +3,7 @@ use hellas_rpc::evaluate::{
     EvaluateOutputTranscriptBuilder, EvaluateProtocolError, EvaluateStopReason, EvaluateTerminal,
     EvaluateUsage, encode_terminal_payload, input_commitment,
 };
-use hellas_rpc::pb::execute::{WorkChunk, WorkEvent, WorkFailed, WorkFinished, work_event};
+use hellas_rpc::execution_event::{WorkChunk, WorkEvent, WorkFailed, WorkFinished, work_event};
 use hellas_rpc::stream::output_event_to_pb;
 use hellas_rpc::{
     ContentId, EvaluateRequest, OutputTranscriptBuilder, ProducerSigningKey, Signature,
@@ -425,7 +425,7 @@ fn stop_terminal_must_match_the_committed_stop_policy() {
 }
 
 #[test]
-fn rejects_wrong_ticket_commitment_length() {
+fn rejects_wrong_request_commitment_length() {
     assert!(matches!(
         evaluate_input_from_request_commitment(&[0; 31]),
         Err(ClientError::Protocol(_))

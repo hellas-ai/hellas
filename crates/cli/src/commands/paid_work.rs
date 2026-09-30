@@ -208,7 +208,11 @@ fn prepare_fetch(args: PrepareFetchArgs, key: &hellas_rpc::ProducerSigningKey) -
         "http" => hellas_rpc::FetchEnvironment::Http,
         _ => bail!("unsupported fetch environment"),
     };
-    let payload = super::fetch::load_payload_file(&args.payload_file)?;
+    let payload = super::read_bounded_regular_file(
+        &args.payload_file,
+        "--payload-file",
+        hellas_rpc::fetch::MAX_FETCH_REQUEST_BODY_BYTES,
+    )?;
     if environment == hellas_rpc::FetchEnvironment::Http {
         hellas_rpc::http_fetch::HttpFetchRequest::decode(&payload)?;
     }

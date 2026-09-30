@@ -148,11 +148,8 @@ impl RunpodArgs {
                 interruptible,
                 state,
                 dry_run,
-                mut serve_args,
+                serve_args,
             } => {
-                if serve_args.is_empty() {
-                    serve_args = vec!["--execute-policy".into(), "none".into()];
-                }
                 let spec = Spec {
                     name,
                     image: String::new(),

@@ -13,7 +13,7 @@ use tracing::Span;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use super::StopReason;
-use crate::{ExecutorError, StateError};
+use crate::ExecutorError;
 
 #[derive(Clone)]
 pub(super) struct InferenceMetrics {
@@ -200,18 +200,12 @@ fn metric_attributes() -> [KeyValue; 2] {
 fn error_type(error: &ExecutorError) -> &'static str {
     match error {
         ExecutorError::ChannelClosed => "channel_closed",
-        ExecutorError::QueueFull { .. }
-        | ExecutorError::ResourceExhausted(_)
-        | ExecutorError::QuotaExceeded { .. } => "resource_exhausted",
-        ExecutorError::InvalidQuoteRequest(_)
+        ExecutorError::ResourceExhausted(_) => "resource_exhausted",
+        ExecutorError::InvalidInput(_)
         | ExecutorError::InvalidTokenPayload(_)
         | ExecutorError::TokenBytes(_) => "invalid_request",
         ExecutorError::Execution(_) => "execution_error",
-        ExecutorError::ArtifactNotFound(_) | ExecutorError::State(StateError::QuoteNotFound(_)) => {
-            "not_found"
-        }
-        ExecutorError::ArtifactStore(_) => "artifact_store_error",
+        ExecutorError::ContentNotFound(_) => "not_found",
         ExecutorError::PolicyDenied(_) => "policy_denied",
-        ExecutorError::State(StateError::QuoteExpired(_)) => "expired",
     }
 }

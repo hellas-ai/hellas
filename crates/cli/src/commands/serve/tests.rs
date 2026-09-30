@@ -1,16 +1,4 @@
 use super::*;
-use hellas_executor::{FetchAccessError, FetchRequestView};
-use hellas_rpc::{Digest, FetchEnvironment, InputCommitment, ProducerSigningKey};
-
-fn public_key_hex(byte: u8) -> String {
-    let key = ProducerSigningKey::from_secret_bytes([byte; 32])
-        .unwrap()
-        .public_key();
-    key.bytes()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
 
 fn write_config(dir: &tempfile::TempDir, config: serde_json::Value) -> PathBuf {
     let path = dir.path().join("fetch-config.json");
@@ -52,72 +40,6 @@ fn authenticated_codex_route(
 }
 
 #[test]
-fn load_fetch_config_parses_routes_limits_and_quotas() {
-    let dir = tempfile::tempdir().unwrap();
-    let public_key = public_key_hex(1);
-    let path = write_config(
-        &dir,
-        serde_json::json!({
-            "routes": [authenticated_codex_route(&dir, serde_json::json!({}))],
-            "callers": [{
-                "public_key": public_key,
-                "routes": [{
-                    "service": "codex",
-                    "method": "responses",
-                    "models": ["gpt-5.5-codex"],
-                    "max_output_tokens": 32
-                }],
-                "request_rate": { "capacity": 2.0, "refill_per_sec": 1.0 },
-                "spend": { "max_units": 64, "window_seconds": 60 }
-            }]
-        }),
-    );
-    let caller = ProducerSigningKey::from_secret_bytes([1; 32])
-        .unwrap()
-        .public_key();
-    let (registry, mut policy) = load_fetch_config(&path).unwrap();
-
-    let route = FetchRoute::new("codex", "responses");
-    let entry = registry.entry(&route).unwrap();
-    assert_eq!(
-        entry.execution_environment(),
-        FetchEnvironment::CodexResponses.manifest_id()
-    );
-    let capabilities = entry.capabilities.clone();
-    policy
-        .authorize_admission(
-            &caller,
-            &FetchRequestView {
-                service: "codex".to_string(),
-                method: "responses".to_string(),
-                model: Some("gpt-5.5-codex".to_string()),
-                max_output_units: Some(32),
-            },
-            1_000,
-            "r1".to_string(),
-            InputCommitment::from_digest(Digest::from_bytes([1; 32])),
-            &capabilities,
-        )
-        .unwrap();
-    let denied = policy
-        .authorize_admission(
-            &caller,
-            &FetchRequestView {
-                service: "codex".to_string(),
-                method: "responses".to_string(),
-                model: Some("other".to_string()),
-                max_output_units: Some(1),
-            },
-            1_000,
-            "r2".to_string(),
-            InputCommitment::from_digest(Digest::from_bytes([2; 32])),
-            &capabilities,
-        )
-        .unwrap_err();
-    assert!(matches!(denied, FetchAccessError::Denied(_)));
-}
-
-#[test]
 fn load_fetch_config_parses_route_capabilities() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_config(
@@ -130,7 +52,7 @@ fn load_fetch_config_parses_route_capabilities() {
         }),
     );
 
-    let (registry, _) = load_fetch_config(&path).unwrap();
+    let registry = load_fetch_config(&path).unwrap();
 
     let capabilities = &registry
         .entry(&FetchRoute::new("codex", "responses"))
@@ -144,25 +66,6 @@ fn load_fetch_config_parses_route_capabilities() {
             .unwrap()
             .contains("gpt-5.5-codex")
     );
-}
-
-#[test]
-fn load_fetch_config_rejects_grant_for_undefined_route() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = write_config(
-        &dir,
-        serde_json::json!({
-            "routes": [authenticated_codex_route(&dir, serde_json::json!({}))],
-            "callers": [{
-                "public_key": public_key_hex(1),
-                "routes": [{ "service": "openai", "method": "responses" }]
-            }]
-        }),
-    );
-
-    let err = load_fetch_config(&path).unwrap_err();
-
-    assert!(err.to_string().contains("undefined route openai/responses"));
 }
 
 #[test]
@@ -181,40 +84,6 @@ fn load_fetch_config_rejects_duplicate_route() {
     let err = load_fetch_config(&path).unwrap_err();
 
     assert!(err.to_string().contains("registered twice"));
-}
-
-#[test]
-fn load_fetch_config_rejects_duplicate_callers_and_caller_routes() {
-    let dir = tempfile::tempdir().unwrap();
-    let caller = serde_json::json!({
-        "public_key": public_key_hex(1),
-        "routes": [{ "service": "codex", "method": "responses" }]
-    });
-    let duplicate_callers = write_config(
-        &dir,
-        serde_json::json!({
-            "routes": [authenticated_codex_route(&dir, serde_json::json!({}))],
-            "callers": [caller.clone(), caller]
-        }),
-    );
-    let error = load_fetch_config(&duplicate_callers).unwrap_err();
-    assert!(error.to_string().contains("more than once"), "{error:#}");
-
-    let duplicate_routes = write_config(
-        &dir,
-        serde_json::json!({
-            "routes": [authenticated_codex_route(&dir, serde_json::json!({}))],
-            "callers": [{
-                "public_key": public_key_hex(1),
-                "routes": [
-                    { "service": "codex", "method": "responses" },
-                    { "service": "codex", "method": "responses" }
-                ]
-            }]
-        }),
-    );
-    let error = load_fetch_config(&duplicate_routes).unwrap_err();
-    assert!(error.to_string().contains("duplicate route"), "{error:#}");
 }
 
 #[test]
@@ -277,45 +146,11 @@ fn config_has_two_sealed_destination_variants_and_no_url_field() {
 }
 
 #[test]
-fn fetch_config_rejects_unknown_policy_fields_at_every_level() {
-    type Mutation = (&'static str, fn(&mut serde_json::Value));
-
-    let base = serde_json::json!({
-        "routes": [codex_route(serde_json::json!({}))],
-        "callers": [{
-            "public_key": public_key_hex(1),
-            "routes": [{ "service": "codex", "method": "responses" }],
-            "request_rate": { "capacity": 2.0, "refill_per_sec": 1.0 },
-            "spend": { "max_units": 64, "window_seconds": 60 }
-        }]
-    });
-    let mutations: &[Mutation] = &[
-        ("modles", |value| {
-            value["routes"][0]["capabilities"]["modles"] = serde_json::json!(["gpt"]);
-        }),
-        ("route_typo", |value| {
-            value["callers"][0]["routes"][0]["route_typo"] = serde_json::json!(true);
-        }),
-        ("caller_typo", |value| {
-            value["callers"][0]["caller_typo"] = serde_json::json!(true);
-        }),
-        ("rate_typo", |value| {
-            value["callers"][0]["request_rate"]["rate_typo"] = serde_json::json!(1);
-        }),
-        ("spend_typo", |value| {
-            value["callers"][0]["spend"]["spend_typo"] = serde_json::json!(1);
-        }),
-    ];
-
-    for (field, mutate) in mutations {
-        let mut value = base.clone();
-        mutate(&mut value);
-        let error = serde_json::from_value::<FetchConfigFile>(value).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains(&format!("unknown field `{field}`")),
-            "unexpected error for {field}: {error}"
-        );
+fn obsolete_callers_and_unknown_capabilities_are_rejected() {
+    for value in [
+        serde_json::json!({"routes": [], "callers": []}),
+        serde_json::json!({"routes": [codex_route(serde_json::json!({"modles": []}))]}),
+    ] {
+        assert!(serde_json::from_value::<FetchConfigFile>(value).is_err());
     }
 }

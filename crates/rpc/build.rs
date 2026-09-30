@@ -91,10 +91,6 @@ fn regenerate() {
     // NB: prost's `bytes(["."])` (decode `bytes` fields as `bytes::Bytes`
     // for zero-copy) is disabled because current call sites produce `Vec<u8>`.
     config.out_dir(&out_dir);
-    config.enum_attribute(
-        "hellas.v1.WorkEvent.kind",
-        "#[allow(clippy::large_enum_variant)]",
-    );
     edge_index_codegen::configure(&mut config, &fds, &out_dir);
     config
         .compile_fds(fds)
@@ -127,18 +123,18 @@ fn collect_proto_files(dir: &Path, out: &mut Vec<PathBuf>) {
 
 /// The service surface the renderer needs, straight from the descriptors.
 struct RpcService {
-    /// `hellas.courtesy.v1`.
+    /// `hellas.work.v1`.
     package: String,
-    /// `Courtesy`.
+    /// `Work`.
     proto_name: String,
     methods: Vec<RpcMethod>,
 }
 
 struct RpcMethod {
-    /// `QuoteTokens` (as it appears in the .proto).
+    /// `AcceptWork` (as it appears in the .proto).
     proto_name: String,
     /// Fully-qualified proto request type with a leading dot, e.g.
-    /// `.hellas.courtesy.v1.QuoteTokensRequest` — matching `SchemaIndex` keys.
+    /// `.hellas.work.v1.AcceptWorkRequest` — matching `SchemaIndex` keys.
     request_proto_type: String,
     /// Fully-qualified proto response type with a leading dot.
     response_proto_type: String,
@@ -202,7 +198,7 @@ struct SchemaIndex {
 
 #[derive(Clone, Debug)]
 struct IndexedMessage {
-    /// Short proto name (`QuoteTokensRequest`).
+    /// Short proto name (`AcceptWorkRequest`).
     short_name: String,
     fields: Vec<IndexedField>,
 }
@@ -435,7 +431,7 @@ fn classify_field(f: &FieldDescriptorProto) -> IndexedFieldType {
 
 /// Per-method render inputs.
 struct MethodPlan {
-    /// Marker type ident (`QuoteTokens`).
+    /// Marker type ident (`AcceptWork`).
     marker: Ident,
     /// Client / handler method ident (`quote_prompt`).
     fn_name: Ident,
@@ -468,7 +464,7 @@ enum Shape {
 struct ServicePlan {
     feature: &'static str,
     module: Ident,
-    /// Service marker ident (`Courtesy`).
+    /// Service marker ident (`Work`).
     service: Ident,
     fqn: String,
     alpn: String,
@@ -967,7 +963,6 @@ fn rust_path(proto_fqn: &str) -> syn::Path {
 fn feature_for_package(package: &str) -> &'static str {
     match package {
         "hellas.v1" => "execute",
-        "hellas.courtesy.v1" => "courtesy",
         "hellas.fetch.v1" => "fetch",
         "hellas.swarm.v1" => "swarm",
         "hellas.evaluate.v1" => "evaluate",

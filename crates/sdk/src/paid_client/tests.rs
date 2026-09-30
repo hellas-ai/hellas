@@ -97,7 +97,7 @@ async fn serve_open<M>(
             Ok::<_, WireStatus>(OpenResponse {
                 provider_genesis: bundle.canonical_bytes(),
                 proof: Some(open_response::Proof::ProducerSignature(
-                    hellas_rpc::run_ticket::signature_to_pb(
+                    hellas_rpc::signature_wire::signature_to_pb(
                         &producer.sign_digest(binding).unwrap(),
                     ),
                 )),

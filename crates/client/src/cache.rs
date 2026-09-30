@@ -1,8 +1,5 @@
 //! Reusable inference recording, independent of HTTP and native storage.
 
-mod fetch;
-pub use fetch::fetch_output_stream;
-
 use std::sync::Arc;
 
 use futures::{StreamExt, stream::BoxStream};

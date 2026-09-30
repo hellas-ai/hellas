@@ -8,10 +8,10 @@
 
 const TOKEN_BYTES_LEN: usize = std::mem::size_of::<u32>();
 
-/// Default generation bound when a token quote uses protobuf's zero value.
+/// Default generation bound for text presentation.
 pub const DEFAULT_MAX_NEW_TOKENS: u32 = 16;
 
-/// Maximum distinct caller-selected stop IDs accepted by one token quote.
+/// Maximum distinct caller-selected stop IDs accepted by one token invocation.
 ///
 /// Catena checks this list during every decode step, so it is a work factor,
 /// not merely request metadata.

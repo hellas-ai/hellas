@@ -8,10 +8,6 @@ import "hellas/v1/hellas.proto";
 // one canonical Catena causal-LM program, ABI, and content-addressed runtime
 // inputs. Tokenization and text decoding remain outside this protocol.
 
-service Evaluate {
-  rpc CreateTicket(EvaluateRequest) returns (.hellas.v1.Ticket);
-}
-
 message EvaluateRequest {
   // Content-addressed TextExecution artifact; exactly 32 bytes.
   bytes text_execution = 1;
@@ -20,6 +16,6 @@ message EvaluateRequest {
   bytes nonce = 4; // exactly 32 bytes
   .hellas.v1.Assurance assurance = 5;
   // Whether the provider may persist and publish prompt- or token-bearing
-  // artifacts through Courtesy. Absence means false.
+  // artifacts. Work funding defines the storage contract. Absence means false.
   optional bool retain = 6;
 }
