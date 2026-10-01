@@ -277,7 +277,7 @@ in
           systemd.services.hellas-monitor = {
             environment.OTEL_SERVICE_NAME = "hellas-test-monitor";
             serviceConfig = {
-              ExecStart = "${package}/bin/hellas-cli monitor";
+              ExecStart = "${package}/bin/hellas-cli --identity /tmp/hellas-monitor.key monitor";
               KillSignal = "SIGINT";
               StandardOutput = "file:/tmp/hellas-monitor.log";
               StandardError = "inherit";
