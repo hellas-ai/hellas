@@ -188,7 +188,7 @@ impl Cli {
             .env("OTEL_SDK_DISABLED", "true")
             .stdin(Stdio::null())
             .kill_on_drop(true);
-        if matches!(args.first(), Some(&"serve" | &"gateway")) {
+        if cfg!(feature = "evaluate") && matches!(args.first(), Some(&"serve" | &"gateway")) {
             command.arg("--store-dir").arg(self.root.join("store"));
         }
         command
@@ -615,6 +615,17 @@ async fn managed_owner_bootstrap_standing_fetch_and_restart_preserve_allowances(
     let data = root.join("worker");
     let private = root.join("private");
     let cli = PathBuf::from(env!("CARGO_BIN_EXE_hellas-cli"));
+    let mut serve_args = vec![
+        "--port".into(),
+        work_address.port().to_string(),
+        "--no-discovery".into(),
+    ];
+    if cfg!(feature = "evaluate") {
+        serve_args.extend([
+            "--store-dir".into(),
+            data.join("store").to_string_lossy().into_owned(),
+        ]);
+    }
     let (stop, stopped) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(agent::run_until(
         AgentOptions {
@@ -631,13 +642,7 @@ async fn managed_owner_bootstrap_standing_fetch_and_restart_preserve_allowances(
                 cli.to_string_lossy().into_owned(),
                 "serve".into(),
             ],
-            serve_args: vec![
-                "--store-dir".into(),
-                data.join("store").to_string_lossy().into_owned(),
-                "--port".into(),
-                work_address.port().to_string(),
-                "--no-discovery".into(),
-            ],
+            serve_args,
             bind: Some(admin_address),
             no_relay: true,
         },
