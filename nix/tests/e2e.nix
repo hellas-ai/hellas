@@ -272,6 +272,15 @@ in
             # Nix evaluation or the store.
             "d /srv/hellas-content 0755 root root -"
           ];
+          systemd.services.hellas-monitor = {
+            environment.OTEL_SERVICE_NAME = "hellas-test-monitor";
+            serviceConfig = {
+              ExecStart = "${package}/bin/hellas-cli monitor";
+              KillSignal = "SIGINT";
+              StandardOutput = "file:/tmp/hellas-monitor.log";
+              StandardError = "inherit";
+            };
+          };
           services.hellas = {
             enable = true;
             inherit package;
@@ -370,17 +379,23 @@ in
           "test \"$(cat /sys/fs/cgroup/system.slice/hellas.service/memory.swap.max)\" = 0"
       )
 
+      # Keep the discovery subscriber alive before the provider advertises.
+      machine.succeed("systemctl stop hellas.service")
+      machine.succeed("systemctl start hellas-monitor.service")
       try:
+          machine.wait_until_succeeds("grep -q 'event=monitor-ready' /tmp/hellas-monitor.log", timeout=30)
+          machine.succeed("systemctl start hellas.service")
           machine.wait_until_succeeds(
-              "${package}/bin/hellas-cli monitor --timeout-secs 5 > /tmp/hellas-monitor.log 2>&1"
-              " && grep -q 'event=discovered service=node' /tmp/hellas-monitor.log"
+              "grep -q 'event=discovered service=node' /tmp/hellas-monitor.log"
               " && grep -q 'event=node-info' /tmp/hellas-monitor.log",
               timeout=30,
           )
       finally:
+          machine.succeed("systemctl stop hellas-monitor.service")
           monitor_output = machine.succeed("cat /tmp/hellas-monitor.log")
           print(monitor_output)
       assert "graffiti=e2e-discovery" in monitor_output
+      assert "event=monitor-stop reason=signal" in monitor_output
     '';
   };
 
