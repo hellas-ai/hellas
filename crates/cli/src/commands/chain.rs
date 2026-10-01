@@ -189,10 +189,11 @@ pub enum QueryCommand {
 #[cfg(feature = "indexer")]
 #[derive(Subcommand)]
 pub enum IndexerCommand {
-    /// Serve verified proofs from a local full follower on a loopback listener
+    /// Serve verified proofs from a full node on a loopback listener
     Serve {
+        /// Initial validator or relay WebSocket source; repeat for multiple seeds
         #[arg(long)]
-        rpc: String,
+        rpc: Vec<String>,
         /// Authenticated trust document, provisioned independently of the RPC origin
         #[arg(long)]
         trust: PathBuf,
@@ -203,21 +204,12 @@ pub enum IndexerCommand {
         storage_dir: PathBuf,
         #[arg(long, default_value = "hellas-explorer")]
         partition_prefix: String,
+        /// Retain only the last N executed blocks; the default keeps the complete archive
+        #[arg(long)]
+        chain_archive_blocks: Option<std::num::NonZeroU64>,
         /// Loopback listener for the local tunnel daemon
         #[arg(long, default_value = "127.0.0.1:8788")]
         listen: std::net::SocketAddr,
-    },
-    /// Follow a validator and maintain a verified finalized-block archive
-    Follow {
-        /// Chain light-client RPC endpoint
-        #[arg(long)]
-        rpc: String,
-        /// Local storage directory
-        #[arg(long)]
-        storage_dir: Option<PathBuf>,
-        /// Storage partition prefix
-        #[arg(long, default_value = "hellas-follower")]
-        partition_prefix: String,
     },
 }
 
@@ -741,6 +733,7 @@ async fn run_indexer(command: IndexerCommand) -> CliResult {
             genesis,
             storage_dir,
             partition_prefix,
+            chain_archive_blocks,
             listen,
         } => {
             let trust = serde_json::from_slice(&fs::read(&trust)?)?;
@@ -753,45 +746,14 @@ async fn run_indexer(command: IndexerCommand) -> CliResult {
                     storage_dir,
                     partition_prefix,
                     listen,
-                    status: follower_status_sink(),
+                    archive_blocks: chain_archive_blocks,
                 })
             })
             .await?
             .map_err(anyhow::Error::from_boxed)?;
         }
-
-        IndexerCommand::Follow {
-            rpc,
-            storage_dir,
-            partition_prefix,
-        } => {
-            tokio::task::spawn_blocking(move || {
-                hellas_chain::follower::run(hellas_chain::follower::FollowerOptions {
-                    rpc,
-                    storage_dir,
-                    partition_prefix,
-                    status: follower_status_sink(),
-                })
-            })
-            .await??
-        }
     }
     Ok(())
-}
-
-#[cfg(feature = "indexer")]
-fn follower_status_sink() -> hellas_chain::follower::FollowerStatusSink {
-    hellas_chain::follower::FollowerStatusSink::callback(|status| match status {
-        hellas_chain::follower::FollowerStatus::ActivityStreamSubscribed => {
-            println!("activity stream subscribed");
-        }
-        hellas_chain::follower::FollowerStatus::ActivityFinalization { payload } => {
-            println!("activity finalization {}", hex::encode(payload));
-        }
-        hellas_chain::follower::FollowerStatus::BlockIngested { height, outcome } => {
-            println!("height {height} {outcome:?}");
-        }
-    })
 }
 
 #[cfg(feature = "validator")]

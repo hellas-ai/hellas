@@ -17,8 +17,6 @@ use hellas_rpc::protocol::artifacts::PreparedPaidInputV1;
 use hellas_rpc::protocol::work::{JobDeadlines, private_policy_commitment};
 use hellas_rpc::protocol::work_fetch::PreparedPaidFetchInputV1;
 use hellas_rpc::protocol::work_profile::PreparedWorkInput;
-#[cfg(test)]
-use hellas_sdk::paid_client::check_genesis_payload;
 use hellas_sdk::paid_client::{InputIdentities, PaidWorkSession, bind_paid_endpoint};
 use hellas_work::work_store::journal::MAX_RECORD_BYTES;
 use iroh::{EndpointId, SecretKey};
@@ -109,6 +107,8 @@ pub struct InspectChainArgs {
 
 #[derive(Clone, Debug, Args)]
 pub struct RunArgs {
+    #[command(flatten)]
+    chain_node: super::chain_node::ChainNodeArgs,
     /// Provider enrollment content ID from the paid offer.
     #[arg(long)]
     provider_genesis: hellas_rpc::ContentId,
@@ -129,7 +129,7 @@ pub struct RunArgs {
     provider: EndpointId,
 
     /// Direct UDP address for the provider. Repeat or comma-separate.
-    #[arg(long = "provider-addr", value_delimiter = ',', value_name = "IP:PORT")]
+    #[arg(long = "address", value_delimiter = ',', value_name = "IP:PORT")]
     provider_addrs: Vec<SocketAddr>,
 
     /// Provider bond edge advertised for this client.
@@ -194,9 +194,16 @@ pub async fn run(
                 "--timeout-secs must be greater than zero"
             );
             let timeout = Duration::from_secs(args.timeout_secs);
-            tokio::time::timeout(timeout, run_one(*args, transport_key, settlement_key))
-                .await
-                .map_err(|_| anyhow::anyhow!("paid-work run exceeded its {timeout:?} limit"))?
+            let config = load_work_config(&args.work_config)?;
+            let node = args.chain_node.start(&config).await?;
+            let result = tokio::time::timeout(
+                timeout,
+                run_one(*args, transport_key, settlement_key, node.clone()),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("paid-work run exceeded its {timeout:?} limit"));
+            node.shutdown().await?;
+            result?
         }
     }
 }
@@ -428,15 +435,17 @@ async fn open_paid_channel(
     endpoint: iroh::Endpoint,
     settlement_key: Secp256k1Signer,
     assurance: hellas_rpc::Assurance,
+    node: hellas_sdk::FullNode,
 ) -> CliResult<PaidWorkSession> {
     anyhow::ensure!(
         !args.payment_coins.is_empty(),
         "at least one --payment-coin is required"
     );
     let provider_trust = paid_provider_trust(args, assurance)?;
+    let config = load_work_config(&args.work_config)?;
     PaidWorkSession::open(
         hellas_sdk::paid_client::PaidWorkOptions {
-            config: load_work_config(&args.work_config)?,
+            config,
             journal_root: args.journal_root.clone(),
             provider: args.provider,
             provider_addrs: args.provider_addrs.clone(),
@@ -451,6 +460,7 @@ async fn open_paid_channel(
         },
         endpoint,
         settlement_key,
+        node,
     )
     .await
     .map_err(Into::into)
@@ -460,6 +470,7 @@ async fn run_one(
     args: RunArgs,
     transport_key: SecretKey,
     settlement_key: Secp256k1Signer,
+    node: hellas_sdk::FullNode,
 ) -> CliResult<()> {
     let prepared = read_prepared_work_input(&args.prepared_input)?;
     let endpoint = bind_paid_endpoint(transport_key).await?;
@@ -468,6 +479,7 @@ async fn run_one(
         endpoint.clone(),
         settlement_key,
         prepared.assurance()?,
+        node,
     )
     .await?;
     println!(

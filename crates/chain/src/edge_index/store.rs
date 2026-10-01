@@ -162,6 +162,7 @@ impl IndexStore {
         write.commit()?;
         Ok(())
     }
+    #[cfg(test)]
     pub fn clear_intent(&self) -> Result<()> {
         let write = self.db.begin_write()?;
         write.open_table(META)?.remove("intent")?;

@@ -48,6 +48,7 @@ impl Channel<PaymentFunding> {
                 channel,
                 settlement,
                 cursor: (origin.height, origin.payload),
+                origin_observed: false,
                 close_prepared: None,
                 close_opened: None,
                 close_responded: None,
@@ -378,6 +379,12 @@ impl Channel<PaymentFunding> {
     ///
     /// There is no "before the first block" case, and that is the whole
     /// point of the origin: an endpoint whose clock could be absent is
+    /// Whether the opening block's same-block close effects were journaled.
+    #[must_use]
+    pub const fn origin_observed(&self) -> bool {
+        self.funding.origin_observed
+    }
+
     /// an endpoint every deadline rule passes for.
     #[must_use]
     pub const fn cursor(&self) -> (u64, [u8; 32]) {
@@ -583,6 +590,13 @@ impl Channel<PaymentFunding> {
         metadata_only: bool,
     ) -> Result<Applied, ChannelStateError> {
         match record {
+            ChannelRecord::OriginObserved => {
+                if self.funding.origin_observed {
+                    return Ok(Applied::Redundant);
+                }
+                self.funding.origin_observed = true;
+                Ok(Applied::Changed)
+            }
             ChannelRecord::ProposalExchange { work_id, pending } => {
                 self.require_role("recording proposal exchange", Role::Client)?;
                 self.book.proposal_exchange(*work_id, *pending)

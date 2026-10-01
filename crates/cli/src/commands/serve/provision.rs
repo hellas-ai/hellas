@@ -3,7 +3,11 @@ use super::super::CliResult;
 pub use hellas_sdk::work_provision::ProvisionOptions;
 use hellas_sdk::work_provision::{preview_bond, provision_offer};
 
-pub async fn run_provision(options: ProvisionOptions, print_bond_only: bool) -> CliResult<()> {
+pub async fn run_provision(
+    options: ProvisionOptions,
+    print_bond_only: bool,
+    chain: super::super::chain_node::ChainNodeArgs,
+) -> CliResult<()> {
     if print_bond_only {
         println!(
             "bond_edge: {}",
@@ -12,7 +16,10 @@ pub async fn run_provision(options: ProvisionOptions, print_bond_only: bool) -> 
         return Ok(());
     }
     let root = options.work_config.journal_root.clone();
-    let made = provision_offer(options).await?;
+    let node = chain.start(&options.work_config).await?;
+    let result = provision_offer(options, &node).await;
+    node.shutdown().await?;
+    let made = result?;
     println!(
         "offer journaled: bond {} under {}",
         hex::encode(made.bond_edge.to_bytes()),

@@ -27,9 +27,10 @@ impl RootProver for UnusedRoot {
 }
 
 #[tokio::test]
-async fn provider_advertises_only_work_protocols() {
+async fn paid_provider_advertises_work_and_chain_services() {
     tokio::time::timeout(Duration::from_secs(15), async {
-        let fixture = crate::test_support::PaidFixture::new();
+        let mut fixture = crate::test_support::PaidFixture::new();
+        let node = fixture.node().await;
         let identity = ClientIdentity::from_secret_bytes([4; 32], [2; 32]).unwrap();
         let (enrollment, _) = crate::test_support::enrollment(identity.transport_key().public());
         let mut routes = FetchRouteRegistry::new();
@@ -58,7 +59,7 @@ async fn provider_advertises_only_work_protocols() {
             routes,
             fetch_max_in_flight: 1,
             fetch_queue_capacity: 1,
-            paid_work: Some(fixture.config),
+            paid_work: Some(crate::PaidProviderOptions::new(fixture.config, node.clone()).unwrap()),
             #[cfg(feature = "grant-provider")]
             grants: None,
         })
@@ -82,11 +83,13 @@ async fn provider_advertises_only_work_protocols() {
         );
         assert!(
             client
-                .connect(addr.clone(), b"retired-execution-service")
+                .connect(addr.clone(), b"unregistered-service")
                 .await
                 .is_err()
         );
         for alpn in [
+            hellas_rpc::services::chain_sync::ChainSync::ALPN,
+            hellas_rpc::services::node::Node::ALPN,
             hellas_rpc::services::work::Work::ALPN,
             hellas_rpc::services::work_setup::WorkSetup::ALPN,
         ] {
@@ -95,6 +98,7 @@ async fn provider_advertises_only_work_protocols() {
         }
         client.close().await;
         provider.shutdown().await;
+        node.shutdown().await.unwrap();
     })
     .await
     .expect("paid provider protocol negotiation completes");

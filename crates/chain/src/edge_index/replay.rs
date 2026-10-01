@@ -1,18 +1,20 @@
 //! Root-compatible finalized replay and crash recovery of the index/QMDB commit boundary.
 use super::{native::EdgeIndex, store::Result};
+#[cfg(test)]
+use crate::execution::store::utxo_db_config;
 use crate::{
     FinalizedBlockQuery, HellasBlock,
     domain::SettlementKey,
     execution::{
         ChainVerifier, execute_all_observed,
-        store::{UtxoDatabase, UtxoDb, utxo_db_config},
+        store::{UtxoDatabase, UtxoDb},
     },
     proof_verify::{ProofBundle, ProofQuery, ProofVerifier, VerifiedAddress, VerifiedBlock},
 };
 use commonware_codec::DecodeExt as _;
 use commonware_consensus::{Block as _, Heightable as _};
 use commonware_cryptography::Digestible as _;
-use commonware_glue::stateful::db::{DatabaseSet, ManagedDb, Merkleized as _, Unmerkleized as _};
+use commonware_glue::stateful::db::{DatabaseSet, ManagedDb};
 use commonware_runtime::Spawner;
 use commonware_storage::Context as StorageContext;
 
@@ -25,6 +27,7 @@ pub(crate) struct Replay<E: StorageContext + Spawner> {
     checkpoint: Option<VerifiedBlock>,
 }
 impl<E: StorageContext + Spawner + Send + Sync + 'static> Replay<E> {
+    #[cfg(test)]
     pub async fn new(
         context: E,
         partition: &str,
@@ -49,6 +52,19 @@ impl<E: StorageContext + Spawner + Send + Sync + 'static> Replay<E> {
             128,
         );
         let database = <UtxoDatabase<E> as DatabaseSet<E>>::init(context, config).await;
+        Self::attach(database, index, network, allocations, genesis, verifier).await
+    }
+
+    /// Attach publication to the full node's execution database. Recovery
+    /// finishes before either the local view or the read API becomes visible.
+    pub(crate) async fn attach(
+        database: UtxoDatabase<E>,
+        index: EdgeIndex,
+        network: hellas_kernel::NetworkId,
+        allocations: Vec<(SettlementKey, u64)>,
+        genesis: HellasBlock,
+        verifier: &ProofVerifier,
+    ) -> Result<Self> {
         let root = database.read().await.root();
         if let Some(intent) = index.store.intent()? {
             verifier.verify(
@@ -163,7 +179,11 @@ impl<E: StorageContext + Spawner + Send + Sync + 'static> Replay<E> {
         )?))
     }
 
-    pub async fn apply(&mut self, block: &HellasBlock, verified: VerifiedBlock) -> Result<()> {
+    pub async fn prepare(
+        &mut self,
+        block: &HellasBlock,
+        verified: &VerifiedBlock,
+    ) -> Result<crate::execution::finalized::Executed<E>> {
         if block.digest() != verified.view().payload() {
             return Err("replay block differs from certified checkpoint".into());
         }
@@ -174,18 +194,6 @@ impl<E: StorageContext + Spawner + Send + Sync + 'static> Replay<E> {
             return Err("replay checkpoint uses a different trust configuration".into());
         }
         let height = block.height().get();
-        let current_height = self
-            .checkpoint
-            .as_ref()
-            .map_or(0, |block| block.view().height());
-        if height <= current_height {
-            // Archive redelivery is harmless only when it is the exact same finalized payload.
-            let stored = self.index.store.read(None)?.proof(height)?;
-            if stored.payload != proof.payload {
-                return Err("conflicting finalized replay payload".into());
-            }
-            return Ok(());
-        }
         if height != self.next_height()? {
             return Err("finalized replay gap".into());
         }
@@ -210,32 +218,35 @@ impl<E: StorageContext + Spawner + Send + Sync + 'static> Replay<E> {
             self.database.new_batches().await,
         )
         .await?;
-        let owner_root = crate::execution::owner_tree::root(&batches).await?;
-        if owner_root != block.owner_root() {
-            return Err("replayed owner root differs from certified block".into());
-        }
-        let merkleized = batches
-            .merkleize()
-            .await
-            .map_err(|e| format!("merkleize: {e:?}"))?;
-        if merkleized.root() != block.state_root()
-            || hex::encode(merkleized.root()) != proof.state_root
-        {
-            return Err("replayed state root differs from certified block".into());
-        }
-        let bounds = merkleized.bounds();
-        let target = block.sync_target();
-        if target.root != merkleized.root()
-            || target.range.start() != bounds.inactivity_floor
-            || target.range.end() != commonware_storage::mmr::Location::new(bounds.total_size)
-        {
-            return Err("replayed sync target differs from certified block".into());
-        }
+        let merkleized = crate::execution::finalized::check(block, batches).await?;
         self.index.store.prepare(proof.clone(), changes)?;
-        self.database.finalize(merkleized).await;
+        Ok(merkleized)
+    }
+
+    pub(crate) fn publish(&mut self, verified: VerifiedBlock) -> Result<()> {
         self.index.store.publish_intent()?;
         self.checkpoint = Some(verified);
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub async fn apply(&mut self, block: &HellasBlock, verified: VerifiedBlock) -> Result<()> {
+        if block.height().get() < self.next_height()? {
+            if self
+                .index
+                .store
+                .read(None)?
+                .proof(block.height().get())?
+                .payload
+                != verified.bundle().payload
+            {
+                return Err("conflicting finalized replay payload".into());
+            }
+            return Ok(());
+        }
+        let executed = self.prepare(block, &verified).await?;
+        self.database.finalize(executed).await;
+        self.publish(verified)
     }
 }
 

@@ -40,8 +40,7 @@ about complete transaction history.
 
 Consensus updates the sparse owner tree in the same speculative QMDB batch as
 coin and edge mutations. Canonical `HLS2` blocks commit both the QMDB state root
-and the owner root. The new QMDB partition format requires fresh devnet and
-native-follower storage; old block encodings cannot be replayed with it.
+and the owner root.
 
 Owner paths prove membership or absence. Holdings paths include authenticated
 subtree counts, so a page cannot omit, reorder, duplicate, or substitute a
@@ -70,9 +69,17 @@ the embedded devnet genesis.
 
 `hellas-cli chain indexer serve --rpc wss://relay.example/ws --trust trust.json
 --storage-dir /var/lib/hellas/explorer --listen 127.0.0.1:8788` starts the local
-origin. Publish or protect that loopback service with your normal deployment
-infrastructure. The process never downloads trust configuration from the RPC
-peer.
+origin over a full executing chain node. Repeat `--rpc` for multiple validator
+or relay seeds; the node also discovers iroh ChainSync peers from its provisioned
+committee. Trust and genesis are always provisioned locally. Publish or protect
+the loopback API with your deployment infrastructure.
+
+The node executes finalized blocks through the validator kernel and checks
+state and owner roots before publishing the read index. The complete block
+archive is retained by default; `--chain-archive-blocks N` exposes the last N
+executed blocks and reclaims older storage in sections. Fresh nodes replay from
+genesis and require sources retaining the missing history. Paid consumers read
+this same local state. Grant-only processes do not start a chain node.
 
 `/api/v1/blocks/{latest|height|payload}/proof` and
 `/api/v1/transactions/{digest}/proof` return `ProofBundle`. Proof routes default

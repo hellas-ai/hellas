@@ -264,22 +264,29 @@ impl ValidatorConfig {
     }
 
     pub fn genesis_allocations(&self) -> Result<Vec<(UserSettlementKey, u64)>, ConfigError> {
-        self.validate_genesis()?;
-        let mut allocations: Vec<(UserSettlementKey, u64)> = self
-            .genesis
-            .allocations
-            .iter()
-            .map(|entry| -> Result<(UserSettlementKey, u64), ConfigError> {
-                let key = parse_genesis_settlement_key(&entry.address)?;
-                Ok((key, entry.balance))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        allocations.sort_by_key(|entry| entry.0);
-        if allocations.windows(2).any(|pair| pair[0].0 == pair[1].0) {
-            return Err(ConfigError::DuplicateGenesisAddresses);
-        }
-        Ok(allocations)
+        genesis_allocations(&self.genesis)
     }
+}
+
+/// Canonical genesis coin ordering shared by consensus and replay.
+pub(crate) fn genesis_allocations(
+    genesis: &Genesis,
+) -> Result<Vec<(UserSettlementKey, u64)>, ConfigError> {
+    genesis.validate()?;
+    crate::domain::network_id(genesis)?;
+    let mut allocations: Vec<(UserSettlementKey, u64)> = genesis
+        .allocations
+        .iter()
+        .map(|entry| -> Result<(UserSettlementKey, u64), ConfigError> {
+            let key = parse_genesis_settlement_key(&entry.address)?;
+            Ok((key, entry.balance))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    allocations.sort_by_key(|entry| entry.0);
+    if allocations.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+        return Err(ConfigError::DuplicateGenesisAddresses);
+    }
+    Ok(allocations)
 }
 
 pub(crate) fn parse_genesis_settlement_key(entry: &str) -> Result<UserSettlementKey, ConfigError> {

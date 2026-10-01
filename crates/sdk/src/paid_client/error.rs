@@ -17,17 +17,10 @@ pub enum PaidClientError {
     DeadlineOverflow { stage: &'static str },
     #[error("{stage} timed out; journals retain payment state")]
     Timeout { stage: &'static str },
-    #[error("no configured validator answered ({0:?})")]
-    ValidatorsUnavailable(Vec<(String, hellas_chain::QueryError)>),
     #[error("authenticated provider key differs from the payment channel")]
     ProviderIdentityChanged,
     #[error("provider identity lock poisoned")]
     ProviderIdentityPoisoned,
-    #[error("validator genesis differs from the configured genesis")]
-    GenesisMismatch {
-        expected: [u8; 32],
-        actual: [u8; 32],
-    },
     #[error("paid-work setup ended: {0:?}")]
     SetupEnded(hellas_work::work_open::SetupProgress),
     #[error("cannot create journal directory {}: {source}", path.display())]
@@ -73,7 +66,7 @@ pub enum PaidClientError {
     #[error(transparent)]
     BlockSource(#[from] hellas_work::work_close::BlockSourceError),
     #[error(transparent)]
-    Consensus(#[from] hellas_chain::ConsensusVerificationError),
+    Config(#[from] crate::work_config::WorkConfigError),
     #[error(transparent)]
     Query(#[from] hellas_chain::QueryError),
     #[error(transparent)]

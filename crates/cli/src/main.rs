@@ -385,6 +385,8 @@ enum Commands {
         /// Work remains retryably not ready until the configured state mounts.
         #[arg(long = "work-config")]
         work_config_file: Option<PathBuf>,
+        #[command(flatten)]
+        chain_node: commands::chain_node::ChainNodeArgs,
         /// Grant resources and machine safety limits; no chain configuration is needed.
         #[arg(long = "grant-config")]
         grant_config_file: Option<PathBuf>,
@@ -489,6 +491,9 @@ enum Commands {
         #[cfg(feature = "node")]
         #[arg(long = "paid-work-config", value_name = "FILE")]
         paid_work_config: Option<PathBuf>,
+        #[cfg(feature = "node")]
+        #[command(flatten)]
+        chain_node: commands::chain_node::ChainNodeArgs,
         /// Load a private bearer credential file, creating it when absent.
         #[arg(long = "bearer-token-file", value_name = "FILE")]
         bearer_token_file: Option<PathBuf>,
@@ -648,6 +653,8 @@ enum Commands {
     /// it. A root may hold several offers only when their configured routes,
     /// bonds, and every staked coin are pairwise disjoint.
     Provision {
+        #[command(flatten)]
+        chain_node: commands::chain_node::ChainNodeArgs,
         /// The paid-work configuration this offer is made under
         #[arg(long = "work-config")]
         work_config: PathBuf,
@@ -1001,6 +1008,7 @@ async fn async_main() {
             #[cfg(feature = "evaluate")]
             gpu_execution_timeout_secs,
             work_config_file,
+            chain_node,
             grant_config_file,
             init_owner,
             owner_enrollment,
@@ -1070,6 +1078,7 @@ async fn async_main() {
                             #[cfg(feature = "evaluate")]
                             gpu_config,
                             work_config,
+                            chain_node,
                             grants,
                             metrics_port,
                             graffiti,
@@ -1090,6 +1099,7 @@ async fn async_main() {
         }
         #[cfg(feature = "node")]
         Commands::Provision {
+            chain_node,
             work_config,
             client,
             stake_coin,
@@ -1115,7 +1125,7 @@ async fn async_main() {
                     bond_timeout,
                     timeout_payout,
                     max_job_price,
-                }, print_bond_only)
+                }, print_bond_only, chain_node)
                 .await
             }.await
         },
@@ -1130,6 +1140,8 @@ async fn async_main() {
             zdr,
             #[cfg(feature = "node")]
             paid_work_config,
+            #[cfg(feature = "node")]
+            chain_node,
             bearer_token_file,
             allow_remote,
             chat_template,
@@ -1210,6 +1222,8 @@ async fn async_main() {
                 #[cfg(all(feature = "node", not(feature = "evaluate")))]
                 let local = false;
                 #[cfg(feature = "node")]
+                let mut chain_shutdown = None;
+                #[cfg(feature = "node")]
                 let paid_work = if let Some(path) = paid_work_config.as_ref()
                     && output_cache != hellas_rpc::cache::CachePolicy::ReplayOnly
                 {
@@ -1227,10 +1241,14 @@ async fn async_main() {
                             && remote_trust.apple_app_attest_cdhashes.is_empty(),
                         "set provider enrollment and Apple trust pins in --paid-work-config",
                     );
+                    let options = hellas_sdk::paid_gateway::load_pool_options(path, assurance)?;
+                    let node = chain_node.start(&options.providers.first().ok_or_else(|| anyhow::anyhow!("paid pool has no providers"))?.config).await?;
+                    chain_shutdown = Some(node.clone());
                     Some(
                         hellas_sdk::paid_gateway::PaidGateway::open(
-                            hellas_sdk::paid_gateway::load_pool_options(path, assurance)?,
+                            options,
                             hellas_sdk::ClientIdentity::from_secret_bytes(secret_key.to_bytes(), local_identity.producer_key.to_secret_bytes())?,
+                            node,
                         ).await? as std::sync::Arc<dyn hellas_gateway::WorkExecutionBackend>
                     )
                 } else {
@@ -1341,6 +1359,8 @@ async fn async_main() {
                 .await
                 }.await;
                 if let Some(backend) = shutdown { backend.drain().await; }
+                #[cfg(feature = "node")]
+                if let Some(node) = chain_shutdown { node.shutdown().await?; }
                 result
             }
             .await

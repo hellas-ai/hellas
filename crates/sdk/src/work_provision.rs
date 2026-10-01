@@ -12,9 +12,9 @@ use std::path::{Path, PathBuf};
 mod error;
 pub use error::ProvisionError;
 type Result<T, E = ProvisionError> = std::result::Result<T, E>;
-use hellas_chain::client::VerifiedRemoteLightClient;
+#[cfg(any(feature = "paid-client", feature = "paid-provider"))]
+use hellas_chain::WorkBlocks;
 use hellas_chain::domain::MAX_EDGE_LIFETIME_BLOCKS;
-use hellas_chain::{ConsensusInfo, ConsensusVerifier, WorkBlocks};
 use hellas_kernel::{
     BlockHeight, CoinId, EdgeId, Funding, Key, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, NetworkId,
     Parties, Payout, Secp256k1Signer, Secp256k1Verifier, Terms, Tx, WorkStakeBondTerms,
@@ -23,7 +23,7 @@ use hellas_rpc::protocol::work_setup::ProviderChannelPolicy;
 use hellas_work::work_close::FinalizedBlocks;
 use hellas_work::work_handshake::{PaymentAdmission, SetupEndpoint};
 use hellas_work::work_store::{Role, SetupScan, SetupStore, discover_setups};
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::work_config::{WorkConfig, WorkRoute};
 
@@ -55,10 +55,21 @@ pub fn preview_bond(options: &ProvisionOptions) -> Result<EdgeId> {
 }
 
 /// Sign and journal an offer under an existing provider identity.
-pub async fn provision_offer(options: ProvisionOptions) -> Result<Provisioned> {
+#[cfg(any(feature = "paid-client", feature = "paid-provider"))]
+pub async fn provision_offer(
+    options: ProvisionOptions,
+    node: &hellas_chain::node::FullNode,
+) -> Result<Provisioned> {
+    options.work_config.check_node(node)?;
     let candidate = BondCandidate::plan(&options)?;
     let offer = Offer::plan(&options, options.work_config.provider_policy(), candidate)?;
-    offer.journal(finalized_floor(&options.work_config).await?)
+    let view = tokio::time::timeout(std::time::Duration::from_secs(30), node.wait_ready())
+        .await
+        .map_err(|_| ProvisionError::NoFinalizedBlock)??;
+    let floor = floor_of(&WorkBlocks::new(view.client()))
+        .await?
+        .ok_or(ProvisionError::NoFinalizedBlock)?;
+    offer.journal(floor)
 }
 
 /// One offer as the disk holds it, read back after it was written.
@@ -334,34 +345,6 @@ fn funding_coins(funding: &Funding) -> BTreeSet<CoinId> {
         .chain(funding.taker().iter())
         .copied()
         .collect()
-}
-
-/// Reads one finalized block from the first configured validator that
-/// answers, as the floor this setup's history starts above.
-async fn finalized_floor(config: &WorkConfig) -> Result<SetupScan> {
-    let verifier = ConsensusVerifier::new(&ConsensusInfo {
-        validators: config.validators.clone(),
-        threshold_identity: config.chain.threshold_identity.clone(),
-        network_id: config.chain.network.as_str().to_owned(),
-    })?;
-    for url in &config.validators {
-        let client = match VerifiedRemoteLightClient::connect(url.clone(), verifier.clone()).await {
-            Ok(client) => client,
-            Err(error) => {
-                warn!(validator = %url, %error, "a configured validator did not answer");
-                continue;
-            }
-        };
-        match floor_of(&WorkBlocks::new(client)).await {
-            Ok(Some(floor)) => {
-                info!(validator = %url, height = floor.height, "the history floor was read here");
-                return Ok(floor);
-            }
-            Ok(None) => warn!(validator = %url, "a configured validator has finalized nothing"),
-            Err(error) => warn!(validator = %url, %error, "a configured validator did not answer"),
-        }
-    }
-    Err(ProvisionError::NoFinalizedBlock)
 }
 
 /// Returns the finalized tip and its payload, or `None` before the first block.

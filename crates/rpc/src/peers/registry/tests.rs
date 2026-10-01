@@ -460,3 +460,30 @@ fn peer_id_display_alternate_emits_full_hex() {
     assert_eq!(full.len(), 64, "alternate emits 64 hex chars");
     assert!(full.chars().all(|c| c.is_ascii_hexdigit()));
 }
+
+#[test]
+fn quarantine_survives_discovery_completion_and_eviction_until_expiry() {
+    let mut registry = PeerRegistry::with_config(PeerRegistryConfig {
+        max_peers: 1,
+        ..config()
+    });
+    let id = peer(1);
+    let permit = registry.try_acquire(0, id, GET_NODE_INFO).unwrap();
+    registry.apply(1, id, PeerEvent::Blocked { until_ms: 100 });
+    registry.apply(
+        2,
+        id,
+        PeerEvent::Discovered {
+            source: DiscoverySource::Manual,
+            transport_security: TransportSecurity::Authenticated,
+        },
+    );
+    registry.release(3, permit, Outcome::ok(3.0));
+    assert!(registry.try_acquire(4, id, GET_NODE_INFO).is_err());
+    assert!(registry.try_acquire(4, peer(2), GET_NODE_INFO).is_err());
+    assert_eq!(registry.get(id).unwrap().blocked_until_ms, 100);
+    let permit = registry.try_acquire(100, id, GET_NODE_INFO).unwrap();
+    registry.release(101, permit, Outcome::ok(1.0));
+    let permit = registry.try_acquire(102, peer(2), GET_NODE_INFO).unwrap();
+    registry.release(103, permit, Outcome::ok(1.0));
+}

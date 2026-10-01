@@ -99,6 +99,7 @@ impl PeerDirectory {
                 .iter()
                 .filter(|peer| {
                     peer.id != self.local_peer
+                        && peer.blocked_until_ms <= now
                         && peer.id != requester
                         && peer
                             .auth_level

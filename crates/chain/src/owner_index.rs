@@ -103,6 +103,18 @@ impl OwnerIndex {
             .apply_finalized(block)
     }
 
+    #[cfg(feature = "full-node")]
+    pub(crate) fn publish_cursor(&self, block: &HellasBlock) {
+        self.inner
+            .write()
+            .expect("owner index lock poisoned")
+            .cursor = OwnerCursor {
+            height: block.height().get(),
+            payload: block.digest(),
+            state_root: block.state_root(),
+        };
+    }
+
     pub fn cursor(&self) -> OwnerCursor {
         self.inner.read().expect("owner index lock poisoned").cursor
     }
@@ -159,7 +171,7 @@ impl OwnerIndex {
     }
 
     // Only the kernel tests read this, and they need `kernel`.
-    #[cfg(all(test, any(feature = "validator", feature = "indexer-api")))]
+    #[cfg(all(test, any(feature = "validator", feature = "full-node")))]
     pub(crate) fn all_coins_for_test(&self) -> BTreeMap<ObjectId, Coin> {
         self.inner
             .read()

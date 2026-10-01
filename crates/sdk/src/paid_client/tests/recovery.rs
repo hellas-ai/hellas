@@ -195,6 +195,7 @@ async fn restart_pays_delivered_fetch_once_and_skips_lost_payload_jobs() {
                 .await
                 .unwrap();
             let mut session = PaymentSession {
+                chain: SessionChain::Constructed,
                 args: PaidWorkOptions {
                     config: fixture.config.clone(),
                     journal_root: fixture.root.path().join("client"),

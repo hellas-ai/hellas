@@ -12,6 +12,7 @@ use commonware_consensus::{
     types::{Epoch, Height, Round, View},
 };
 use commonware_cryptography::{Hasher as _, Sha256};
+use commonware_glue::stateful::db::{Merkleized as _, Unmerkleized as _};
 use commonware_runtime::{Supervisor as _, tokio};
 use commonware_storage::{mmr::Location, qmdb::sync::Target};
 use commonware_utils::non_empty_range;

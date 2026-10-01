@@ -16,11 +16,11 @@ use commonware_cryptography::{
     Digest as _, Digestible, Signer as _, bls12381::dkg::feldman_desmedt::deal, ed25519,
 };
 use commonware_parallel::Sequential;
-#[cfg(any(feature = "validator", feature = "indexer-api"))]
+#[cfg(any(feature = "validator", feature = "full-node"))]
 use commonware_runtime::{Runner as _, tokio};
 use commonware_storage::{merkle::Location, mmr};
 use commonware_utils::{N3f1, non_empty_range, ordered::Set};
-#[cfg(any(feature = "validator", feature = "indexer-api"))]
+#[cfg(any(feature = "validator", feature = "full-node"))]
 use core::future::Future;
 use hellas_kernel::{
     Auth, BlockHeight, CloseKind, CoinId, EdgeId, Funding, List, MAX_EDGE_OUTPUTS,
@@ -104,7 +104,7 @@ pub(crate) fn finalization(fixture: &ConsensusFixture, block: &HellasBlock) -> F
 
 // Drives a QMDB runtime for the app and replay tests; the `indexer`-only
 // build compiles neither.
-#[cfg(any(feature = "validator", feature = "indexer-api"))]
+#[cfg(any(feature = "validator", feature = "full-node"))]
 pub(crate) fn run_qmdb<F, Fut, T>(test: F) -> T
 where
     F: FnOnce(tokio::Context) -> Fut,
@@ -171,7 +171,7 @@ pub(crate) fn index_block(
 // cannot be `cfg`-ed out without splitting the constructor; scope the
 // allowance to exactly the build where nothing reads them.
 #[cfg_attr(
-    not(any(feature = "validator", feature = "indexer-api")),
+    not(any(feature = "validator", feature = "full-node")),
     allow(dead_code)
 )]
 pub(crate) struct KernelFixture {
@@ -194,7 +194,7 @@ impl KernelFixture {
     }
 
     // Read only by the kernel tests, and `kernel` is gated.
-    #[cfg(any(feature = "validator", feature = "indexer-api"))]
+    #[cfg(any(feature = "validator", feature = "full-node"))]
     pub(crate) fn bad_auth_open(&self) -> Result<Tx, SoftPasskeyError> {
         let hash = Tx::open_hash(crate::domain::TEST_NETWORK, &self.funding, &self.terms);
         let wrong_hash = Tx::payload_hash(

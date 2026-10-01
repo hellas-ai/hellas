@@ -44,6 +44,58 @@ pub(crate) fn signer(byte: u8) -> Secp256k1Signer {
 }
 
 impl PaidFixture {
+    /// A real idle node for SDK startup/admission tests. The fixture supplies
+    /// genesis itself; no network endpoint is trusted to choose its execution inputs.
+    pub async fn node(&mut self) -> crate::FullNode {
+        use commonware_codec::DecodeExt as _;
+        use commonware_cryptography::Digestible as _;
+        use commonware_runtime::Runner as _;
+        let mut genesis: hellas_chain::genesis::Genesis =
+            serde_json::from_str(hellas_chain::genesis::HELLAS_DEVNET_1_JSON).unwrap();
+        genesis.network_id = self.config.chain.network.as_str().into();
+        genesis.allocations.clear();
+        let leader = genesis
+            .validators
+            .iter()
+            .map(|validator| {
+                hellas_chain::domain::PublicKey::decode(
+                    hex::decode(&validator.public_key).unwrap().as_slice(),
+                )
+                .unwrap()
+            })
+            .min()
+            .unwrap();
+        let directory = self.root.path().join("genesis-probe");
+        let network = self.config.chain.network;
+        let digest = tokio::task::spawn_blocking(move || {
+            let runtime = commonware_runtime::tokio::Runner::new(
+                commonware_runtime::tokio::Config::new().with_storage_directory(directory),
+            );
+            runtime.start(move |context| async move {
+                let application = hellas_chain::Application::new(
+                    context,
+                    network,
+                    leader,
+                    vec![],
+                    "fixture",
+                    Default::default(),
+                )
+                .await;
+                application.genesis_block().digest()
+            })
+        })
+        .await
+        .unwrap();
+        self.config.chain.genesis = Some(genesis);
+        self.config.chain.genesis_payload_digest = digest.0.into();
+        let mut config = self
+            .config
+            .node_config(self.root.path().join("chain"), None)
+            .unwrap();
+        config.validators.clear();
+        crate::FullNode::start(config).await.unwrap()
+    }
+
     pub fn new() -> Self {
         let root = tempfile::tempdir().unwrap();
         let network = NetworkId::new("sdk-paid-test").unwrap();
@@ -164,7 +216,7 @@ impl PaidFixture {
             .unwrap();
         let config = WorkConfig {
         payment_policy: payment_policy(),
-            chain: ChainCrossCheck { network, genesis_payload_digest: [0; 32].into(), threshold_identity: hex::decode("97f1d3a73197d7942695638c4fa9ac0fc3688c4f9774b905a14e3a3f171bac586c55e83ff97a1aeffb3af00adb22c6bb").unwrap() },
+            chain: ChainCrossCheck { network, genesis: None, genesis_payload_digest: [0; 32].into(), threshold_identity: hex::decode("97f1d3a73197d7942695638c4fa9ac0fc3688c4f9774b905a14e3a3f171bac586c55e83ff97a1aeffb3af00adb22c6bb").unwrap() },
             validators: vec!["ws://unused.invalid".to_owned()], journal_root: root.path().join("provider"), routes: Default::default(),
             policy_salt: [9; 32], channel_policy, work_policy,
             poll: std::time::Duration::from_millis(10), max_observation_age: std::time::Duration::from_secs(60),

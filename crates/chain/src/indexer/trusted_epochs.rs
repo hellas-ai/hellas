@@ -4,7 +4,7 @@ use commonware_cryptography::certificate::{Provider, Scoped};
 use hellas_genesis::TrustDocument;
 
 #[derive(Clone)]
-pub(super) struct TrustedEpochs {
+pub(crate) struct TrustedEpochs {
     trust: Arc<TrustDocument>,
     verifiers: Arc<Vec<ConsensusVerifier>>,
 }
@@ -45,6 +45,7 @@ impl TrustedEpochs {
             verifiers: Arc::new(verifiers),
         })
     }
+    #[cfg(test)]
     pub fn verifier(
         &self,
         height: Height,
@@ -156,15 +157,10 @@ mod tests {
                 base.sync_target(),
                 Vec::new(),
             );
-            let (indexer, _handle) = spawn_trusted_follower_indexer(
-                context,
-                "rotated-origin",
-                Config::default(),
-                trust,
-                genesis,
-            )
-            .await
-            .unwrap();
+            let (indexer, _handle) =
+                spawn_trusted_archive(context, "rotated-origin", Config::default(), trust, genesis)
+                    .await
+                    .unwrap();
             indexer
                 .ingest_finalized(block1.clone(), finalization(&first, &block1))
                 .await

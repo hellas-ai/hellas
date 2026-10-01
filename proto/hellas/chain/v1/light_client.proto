@@ -2,12 +2,33 @@ syntax = "proto3";
 
 package hellas.chain.v1;
 
+// Self-verifying finalized data shared by validators and executing full nodes.
+service ChainSync {
+  rpc GetLatestBlock(GetLatestBlockRequest) returns (GetFinalizedBlockResponse);
+  rpc GetFinalizedBlock(GetFinalizedBlockRequest) returns (GetFinalizedBlockResponse);
+  rpc SubscribeFinalized(GetLatestBlockRequest) returns (stream GetFinalizedBlockResponse);
+  rpc GetFinalization(GetFinalizationRequest) returns (GetFinalizationResponse);
+  rpc GetOperations(GetOperationsRequest) returns (GetOperationsResponse);
+}
+
+// Authenticated QMDB operation ranges; the receiver verifies against a certified root.
+message GetOperationsRequest {
+  uint64 op_count = 1;
+  uint64 start = 2;
+  uint64 max_ops = 3;
+  bool include_pinned_nodes = 4;
+}
+message GetOperationsResponse {
+  bytes proof = 1;
+  repeated bytes operations = 2;
+  repeated bytes pinned_nodes = 3;
+}
+
 service LightClient {
   rpc GetStateRoot(GetStateRootRequest) returns (GetStateRootResponse);
   rpc GetProof(GetProofRequest) returns (GetProofResponse);
   rpc GetCoin(GetCoinRequest) returns (GetCoinResponse);
   rpc GetEdge(GetEdgeRequest) returns (GetEdgeResponse);
-  rpc GetWorkChannelSnapshot(GetWorkChannelSnapshotRequest) returns (GetWorkChannelSnapshotResponse);
   rpc GetFinalization(GetFinalizationRequest) returns (GetFinalizationResponse);
   rpc GetLatestBlock(GetLatestBlockRequest) returns (GetLatestBlockResponse);
   rpc GetFinalizedBlock(GetFinalizedBlockRequest) returns (GetFinalizedBlockResponse);
@@ -67,52 +88,6 @@ message EdgeState {
 message GetEdgeResponse {
   EdgeState edge = 1;
   optional bytes state_root = 2;
-}
-
-// One work channel, named by the two edges that constitute it, and the
-// coins whose liveness must be read at the same block.
-//
-// The coins are the caller's to name: only the transactions it retained
-// say which coins its setup spends. Asking here rather than in a second
-// call is what makes the answer a fact about the same state the edges
-// came from.
-message GetWorkChannelSnapshotRequest {
-  bytes bond_edge = 1;
-  bytes payment_edge = 2;
-  repeated bytes funding_coins = 3;
-}
-
-// One registry slot's contents, as canonical kernel chunk bytes.
-//
-// The chunk is optional because an empty slot is an answer, not a
-// missing field: absence is what permits a payment open to take the
-// bond's lease and what permits a channel to admit new work.
-message RegistrySlot {
-  optional bytes chunk = 1;
-}
-
-// Every object one paid work channel is decided from, read under one
-// database snapshot at one finalized block.
-//
-// Absent `snapshot` means the node has no finalized state to answer
-// from at all. A present `snapshot` with absent objects means those
-// objects do not exist at that block.
-message GetWorkChannelSnapshotResponse {
-  FinalizedSnapshot snapshot = 1;
-  // Canonical kernel `Edge` bytes, so the caller reads the same object
-  // consensus stored rather than a re-spelling of its fields.
-  optional bytes bond_edge = 2;
-  optional bytes payment_edge = 3;
-  // The bond's derived lease slots, in slot order. Exactly the number
-  // of chunks one lease occupies; any other count is malformed.
-  repeated RegistrySlot lease_slots = 4;
-  // The payment edge's derived pending-close slot.
-  RegistrySlot pending_slot = 5;
-  // Which of the request's `funding_coins` still exist at this block,
-  // in the same canonical order the request's set has. A coin the
-  // request named and this list omits is a coin that is gone; a coin
-  // here that the request did not name is a reply to another question.
-  repeated bytes live_funding = 6;
 }
 
 message GetFinalizationRequest {

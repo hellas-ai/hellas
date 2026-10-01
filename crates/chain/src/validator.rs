@@ -3,47 +3,34 @@ use crate::domain::{
     ThresholdVariant, UserPublicKey,
 };
 use crate::{
-    ActivityReporter, Application, ApplicationConfig, BlockStore, ChainIndexer, ConsensusInfo,
-    LightClientRpcState, OwnerIndex, UtxoDb,
+    ActivityReporter, Application, ApplicationConfig, ConsensusInfo, LightClientRpcState, UtxoDb,
     config::{
         Config, ConfigError, Genesis, GenesisEntry, GenesisValidator, PeerEntry, ValidatorConfig,
         encode_private_key, encode_threshold_polynomial, encode_threshold_share,
         parse_genesis_settlement_key,
     },
-    init_block_store, init_finalization_store,
     relay::{authenticated_relay_request, serve_light_client_relay},
     rpc::LocalLightClient,
-    spawn_light_client_server, utxo_db_config,
+    spawn_light_client_server,
 };
 use commonware_broadcast::buffered;
 use commonware_codec::{DecodeExt, Encode};
 use commonware_consensus::{
     marshal::{
-        self,
-        core::Actor as MarshalActor,
         resolver::p2p as marshal_resolver,
         standard::{Deferred, Standard},
     },
     simplex::{self, config::ForwardingPolicy, elector::RoundRobin},
-    types::{Epoch, FixedEpocher, Height, ViewDelta},
+    types::{Epoch, FixedEpocher, ViewDelta},
 };
 use commonware_cryptography::bls12381::dkg::feldman_desmedt::deal;
-use commonware_cryptography::certificate::ConstantProvider;
 use commonware_cryptography::{Digestible as _, Signer, ed25519};
-use commonware_glue::stateful::{
-    Config as StatefulConfig, Stateful as StatefulActor, SyncPlan,
-    db::{SyncEngineConfig, p2p::standard as qmdb_resolver},
-};
+use commonware_glue::stateful::{SyncPlan, db::p2p::standard as qmdb_resolver};
 use commonware_p2p::{AddressableManager, authenticated::lookup};
 use commonware_parallel::Sequential;
-use commonware_runtime::{
-    BufferPooler, Clock, Metrics, Quota, Runner, Spawner, Storage, Supervisor as _, tokio,
-};
-use commonware_storage::{
-    archive::{Archive as _, Identifier as ArchiveIdentifier},
-    mmr,
-};
-use commonware_utils::{N3f1, NZU64, NZUsize, ordered::Set};
+use commonware_runtime::{Metrics, Quota, Runner, Spawner, Supervisor as _, tokio};
+use commonware_storage::mmr;
+use commonware_utils::{N3f1, NZU64, ordered::Set};
 use futures::FutureExt;
 use prometheus_client::metrics::gauge::Gauge;
 use rand::{Rng, SeedableRng, rngs::StdRng};
@@ -57,7 +44,7 @@ use std::{
     path::PathBuf,
 };
 use thiserror::Error;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 const NAMESPACE: &[u8] = b"hellas";
 const MAX_MESSAGE_SIZE: u32 = 1024 * 1024;
@@ -117,8 +104,6 @@ pub enum ValidatorError {
     Scheme(String),
     #[error("storage directory is not valid UTF-8: {0}")]
     NonUtf8StorageDirectory(PathBuf),
-    #[error("failed to replay owner index: {0}")]
-    OwnerIndex(String),
     #[error("failed to bind light-client server at {addr}: {source}")]
     LightClientBind { addr: SocketAddr, source: io::Error },
     #[error("invalid relay configuration")]
@@ -617,91 +602,6 @@ mod genesis_allocation_tests {
     }
 }
 
-#[cfg(test)]
-mod owner_index_replay_tests {
-    use super::*;
-    use crate::HellasBlock;
-    use crate::execution::test_support::{index_block, index_genesis};
-    use commonware_consensus::Heightable as _;
-    use commonware_cryptography::{Digest as _, sha256::Digest};
-    use commonware_runtime::deterministic;
-
-    /// Builds a chain of `len` empty blocks above genesis and stores every
-    /// height except those in `skip`.
-    async fn archive(
-        context: deterministic::Context,
-        genesis: &HellasBlock,
-        len: u64,
-        skip: &[u64],
-    ) -> (BlockStore<deterministic::Context>, Vec<HellasBlock>) {
-        let mut store = init_block_store(context, "replay", &Config::default()).await;
-        let mut chain = vec![genesis.clone()];
-        for _ in 0..len {
-            let next = index_block(chain.last().unwrap(), Digest::EMPTY, Vec::new());
-            chain.push(next);
-        }
-        for block in &chain {
-            let height = block.height().get();
-            if skip.contains(&height) {
-                continue;
-            }
-            store
-                .put(height, block.digest(), block.clone())
-                .await
-                .expect("put");
-        }
-        store.sync().await.expect("sync");
-        (store, chain)
-    }
-
-    #[test]
-    fn owner_index_replay_stops_at_archive_hole() {
-        deterministic::Runner::default().start(|context| async move {
-            let genesis = index_genesis();
-            let (store, chain) = archive(context, &genesis, 6, &[3, 4]).await;
-            assert_eq!(store.ranges().collect::<Vec<_>>(), vec![(0, 2), (5, 6)]);
-            let index = OwnerIndex::new(crate::domain::TEST_NETWORK, &genesis, Vec::new());
-
-            replay_owner_index(&index, &store).await.expect("replay");
-
-            let cursor = index.cursor();
-            assert_eq!(cursor.height, 2);
-            assert_eq!(cursor.payload, chain[2].digest());
-        });
-    }
-
-    #[test]
-    fn owner_index_replay_covers_contiguous_archive() {
-        deterministic::Runner::default().start(|context| async move {
-            let genesis = index_genesis();
-            let (store, chain) = archive(context, &genesis, 6, &[]).await;
-            let index = OwnerIndex::new(crate::domain::TEST_NETWORK, &genesis, Vec::new());
-
-            replay_owner_index(&index, &store).await.expect("replay");
-
-            let cursor = index.cursor();
-            assert_eq!(cursor.height, 6);
-            assert_eq!(cursor.payload, chain[6].digest());
-        });
-    }
-
-    #[test]
-    fn owner_index_must_reach_marshal_processed_height() {
-        assert!(check_owner_index_reaches_marshal(2, None).is_ok());
-        assert!(check_owner_index_reaches_marshal(2, Some(Height::new(1))).is_ok());
-        assert!(check_owner_index_reaches_marshal(2, Some(Height::new(2))).is_ok());
-        let err = check_owner_index_reaches_marshal(2, Some(Height::new(5)))
-            .expect_err("processed height above the replayed prefix");
-        assert!(matches!(
-            err,
-            ValidatorError::OwnerIndex(ref message)
-                if message.contains("processed finalized height 5")
-                    && message.contains("through height 2")
-                    && message.contains("3..=5")
-        ));
-    }
-}
-
 fn spawn_metrics_server(context: tokio::Context, addr: SocketAddr) {
     use axum::{Router, routing::get};
 
@@ -787,6 +687,7 @@ enum ShutdownTrigger {
     NetworkExited,
     EngineExited,
     LightClientServerExited,
+    ChainPeerServiceExited,
     RelayExited,
 }
 
@@ -813,71 +714,6 @@ async fn graceful_stop(context: tokio::Context, monitor_second_signal: bool) {
     if let Err(err) = context.stop(0, Some(SHUTDOWN_TIMEOUT)).await {
         warn!(?err, "runtime stop failed or timed out");
     }
-}
-
-/// Replays the contiguous prefix of the archive. The index needs every block
-/// in order from genesis, so a range beyond a hole is left for marshal, which
-/// backfills the hole and delivers it in order.
-async fn replay_owner_index<E>(
-    indexer: &OwnerIndex,
-    finalized_blocks: &BlockStore<E>,
-) -> Result<(), ValidatorError>
-where
-    E: BufferPooler + Clock + Metrics + Storage,
-{
-    for (start, end) in finalized_blocks.ranges() {
-        let cursor = indexer.cursor().height;
-        if start > cursor.saturating_add(1) {
-            warn!(
-                missing_from = cursor + 1,
-                missing_to = start - 1,
-                "finalized block archive has a hole; owner index replay stops before it",
-            );
-            break;
-        }
-        for height in start..=end {
-            let block = finalized_blocks
-                .get(ArchiveIdentifier::Index(height))
-                .await
-                .map_err(|err| {
-                    ValidatorError::OwnerIndex(format!(
-                        "failed to load finalized block at height {height}: {err}"
-                    ))
-                })?;
-            let Some(block) = block else {
-                continue;
-            };
-            indexer.apply_finalized(&block).map_err(|err| {
-                ValidatorError::OwnerIndex(format!(
-                    "failed to index finalized block at height {height}: {err}"
-                ))
-            })?;
-        }
-    }
-    Ok(())
-}
-
-/// Marshal resumes delivery above its processed height and never refetches
-/// below it, so an index that stops short of that height can never be
-/// completed and must not run.
-fn check_owner_index_reaches_marshal(
-    indexed: u64,
-    processed: Option<Height>,
-) -> Result<(), ValidatorError> {
-    let Some(processed) = processed.map(|height| height.get()) else {
-        return Ok(());
-    };
-    if processed <= indexed {
-        return Ok(());
-    }
-    Err(ValidatorError::OwnerIndex(format!(
-        "marshal has already processed finalized height {processed} but the finalized \
-         block archive is only contiguous from genesis through height {indexed}; the owner \
-         index needs every finalized block and heights {}..={processed} cannot be recovered \
-         from peers. Restore the finalized block archive from a complete copy or resync this \
-         validator from genesis.",
-        indexed + 1,
-    )))
 }
 
 /// Run all `ValidatorConfig` validations the runtime would perform at startup.
@@ -1017,6 +853,7 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
 
     // Configure tokio runtime
     let storage_dir = validator_config.storage_directory()?;
+    let _directory_lock = crate::execution::pipeline::lock(&storage_dir)?;
     let storage_dir_utf8 = storage_dir
         .to_str()
         .ok_or_else(|| ValidatorError::NonUtf8StorageDirectory(storage_dir.clone()))?;
@@ -1078,33 +915,19 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
         });
 
         let chain_config = Config::default();
-        let partition_prefix = format!("hellas_{me}");
+        let partition_prefix = "chain".to_owned();
         let page_cache = chain_config.page_cache(&context);
-        let finalizations_by_height = init_finalization_store(
-            context.child("finalizations_by_height"),
-            &partition_prefix,
-            &chain_config,
-        )
-        .await;
-        let finalized_blocks = init_block_store(
-            context.child("finalized_blocks"),
-            &partition_prefix,
-            &chain_config,
-        )
-        .await;
-
         let mailbox_size =
             NonZeroUsize::new(chain_config.mailbox_size).unwrap_or(NonZeroUsize::MIN);
         let fetch_concurrent =
             NonZeroUsize::new(chain_config.fetch_concurrent).unwrap_or(NonZeroUsize::MIN);
-        let max_pending_acks = NZUsize!(1);
         let genesis_leader = scheme
             .participants()
             .iter()
             .next()
             .cloned()
             .unwrap_or_else(|| me.clone());
-        let application = Application::new(
+        let mut application = Application::new(
             context.child("app"),
             network_id,
             genesis_leader,
@@ -1118,60 +941,39 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
         .await;
         let mempool = application.mempool();
         let owner_index = application.owner_index();
-        if let Err(err) = replay_owner_index(&owner_index, &finalized_blocks).await {
-            error!(?err, "owner index replay failed");
-            panic!("{err}");
-        }
-        let owner_index_cursor = owner_index.cursor();
-        info!(
-            height = owner_index_cursor.height,
-            payload = ?owner_index_cursor.payload,
-            "owner index replayed",
-        );
         let genesis_block = application.genesis_block();
+        crate::execution::pipeline::pin(
+            &storage_dir,
+            &validator_config.genesis,
+            &consensus_info.threshold_identity,
+            genesis_block.digest(),
+        )
+        .expect("provisioned chain identity");
         let stateful_startup_context = context.child("stateful_startup");
         let plan = SyncPlan::<_, Scheme, Standard<crate::HellasBlock>>::init(
             &stateful_startup_context,
             partition_prefix.clone(),
         )
         .await;
+        let trust = crate::node::Trust::Genesis(std::sync::Arc::new(
+            crate::ConsensusVerifier::new(&consensus_info).expect("provisioned consensus identity"),
+        ));
+        crate::execution::pipeline::verify_floor(&plan, &trust)
+            .expect("provisioned floor certificate");
+        let startup = plan.sync_height();
         let sync_floor = plan.floor().cloned();
 
         let epocher = FixedEpocher::new(NonZeroU64::new(u64::MAX).unwrap());
-        let marshal_config = marshal::Config {
-            provider: ConstantProvider::new(scheme.clone()),
-            epocher: epocher.clone(),
-            start: plan.marshal_start(genesis_block.clone()),
-            partition_prefix: partition_prefix.clone(),
-            mailbox_size,
-            view_retention_timeout: ViewDelta::new(chain_config.activity_timeout),
-            prunable_items_per_section: NZU64!(256),
-            page_cache: page_cache.clone(),
-            replay_buffer: NonZeroUsize::new(chain_config.replay_buffer)
-                .unwrap_or(NonZeroUsize::MIN),
-            key_write_buffer: NonZeroUsize::new(chain_config.write_buffer)
-                .unwrap_or(NonZeroUsize::MIN),
-            value_write_buffer: NonZeroUsize::new(chain_config.write_buffer)
-                .unwrap_or(NonZeroUsize::MIN),
-            block_codec_config: (),
-            max_repair: NonZeroUsize::new(chain_config.max_repair).unwrap_or(NonZeroUsize::MIN),
-            max_pending_acks,
-            strategy: Sequential,
-        };
-        let (marshal_actor, marshal_mailbox, marshal_processed_height) =
-            MarshalActor::<_, Standard<crate::HellasBlock>, _, _, _, _, _>::init(
-                context.child("marshal"),
-                finalizations_by_height,
-                finalized_blocks,
-                marshal_config,
-            )
-            .await;
-        if let Err(err) =
-            check_owner_index_reaches_marshal(owner_index_cursor.height, marshal_processed_height)
-        {
-            error!(?err, "owner index cannot reach marshal's processed height");
-            panic!("{err}");
-        }
+        let (marshal_actor, chain_indexer, processed) = crate::indexer::init(
+            context.child("archive"),
+            &partition_prefix,
+            &chain_config,
+            plan.marshal_start(genesis_block.clone()),
+            trust,
+            epocher.clone(),
+        )
+        .await;
+        let marshal_mailbox = chain_indexer.marshal.clone();
 
         let broadcast_config = buffered::Config {
             public_key: me.clone(),
@@ -1221,31 +1023,14 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
             );
         let qmdb_resolver_handle = qmdb_resolver_actor.start(qmdb_resolver_network);
 
-        let db_config = utxo_db_config(
-            &context,
-            &partition_prefix,
-            chain_config.page_cache_size,
-            chain_config.page_cache_count,
-        );
-        let (stateful_actor, stateful_mailbox) = StatefulActor::init(
+        let (stateful_actor, stateful_mailbox) = crate::execution::pipeline::init(
             context.child("stateful"),
-            StatefulConfig {
-                application,
-                db_config,
-                input_provider: mempool.clone(),
-                marshal: marshal_mailbox.clone(),
-                mailbox_size,
-                plan,
-                resolvers: qmdb_sync_resolver.clone(),
-                sync_config: SyncEngineConfig {
-                    fetch_batch_size: NZU64!(64),
-                    apply_batch_size: 1024,
-                    max_outstanding_requests: 8,
-                    update_channel_size: NZUsize!(256),
-                    max_retained_roots: 8,
-                },
-                prune_config: None,
-            },
+            application,
+            &chain_config,
+            marshal_mailbox.clone(),
+            plan,
+            qmdb_sync_resolver.clone(),
+            None,
         );
 
         let deferred = Deferred::new(
@@ -1289,6 +1074,14 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
         let stateful_handle = stateful_actor.start();
 
         let databases = stateful_mailbox.subscribe_databases().await;
+        crate::execution::pipeline::restore(
+            &chain_indexer,
+            &databases,
+            &owner_index,
+            startup.into_iter().chain(processed).max(),
+        )
+        .await
+        .expect("executed chain checkpoint");
         let startup_root = databases.read().await.root();
         info!(?startup_root, "application startup barrier passed");
 
@@ -1303,9 +1096,21 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
             databases.clone(),
             owner_index.clone(),
             mempool.clone(),
-            ChainIndexer::new(marshal_mailbox.clone()),
+            chain_indexer.clone(),
             consensus_info.clone(),
         );
+        let peer_key: [u8; 32] = relay_private_key
+            .encode()
+            .as_ref()
+            .try_into()
+            .expect("an Ed25519 private key is 32 bytes");
+        let peer_service = ::tokio::spawn(crate::node::serve_validator_archive(
+            chain_indexer.clone(),
+            activity_tx.clone(),
+            iroh::SecretKey::from_bytes(&peer_key),
+            databases.clone(),
+            crate::ConsensusVerifier::new(&consensus_info).expect("provisioned consensus identity"),
+        ));
         let light_client_rpc_state = LightClientRpcState::default();
         let light_client_server_handle = if let Some(addr) = validator_config.light_client_bind {
             Some(
@@ -1400,6 +1205,9 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
             broadcast_waiter,
             stateful_waiter,
             qmdb_resolver_waiter,
+            peer_service
+                .map(|_| ShutdownTrigger::ChainPeerServiceExited)
+                .boxed(),
         ];
         if let Some(waiter) = light_client_server_waiter {
             waiters.push(waiter);
@@ -1422,6 +1230,9 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
             }
             ShutdownTrigger::EngineExited => {
                 warn!("engine task exited unexpectedly; triggering shutdown");
+            }
+            ShutdownTrigger::ChainPeerServiceExited => {
+                warn!("chain peer service exited unexpectedly; triggering shutdown");
             }
             ShutdownTrigger::LightClientServerExited => {
                 warn!("light-client server exited unexpectedly; triggering shutdown");

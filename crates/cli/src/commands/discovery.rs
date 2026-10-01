@@ -37,6 +37,9 @@ pub(crate) fn served_alpns(work_configured: bool, grants_configured: bool) -> Ve
     let mut alpns = vec![Node::ALPN.as_bytes().to_vec()];
     if work_configured {
         alpns.extend([
+            hellas_rpc::services::chain_sync::ChainSync::ALPN
+                .as_bytes()
+                .to_vec(),
             WorkSetup::ALPN.as_bytes().to_vec(),
             Work::ALPN.as_bytes().to_vec(),
         ]);
@@ -110,6 +113,7 @@ mod tests {
             served_alpns(true, false),
             [
                 Node::ALPN.as_bytes(),
+                hellas_rpc::services::chain_sync::ChainSync::ALPN.as_bytes(),
                 WorkSetup::ALPN.as_bytes(),
                 Work::ALPN.as_bytes()
             ]

@@ -33,9 +33,11 @@ impl WorkSession<PaymentFunding> {
         options: crate::paid_client::PaidWorkOptions,
         endpoint: iroh::Endpoint,
         signer: hellas_kernel::Secp256k1Signer,
+        node: hellas_chain::node::FullNode,
     ) -> Result<Self, crate::paid_client::PaidClientError> {
         Ok(Self {
-            inner: crate::paid_client::PaymentSession::open(options, endpoint, signer).await?,
+            inner: crate::paid_client::PaymentSession::open(options, endpoint, signer, node)
+                .await?,
         })
     }
 }
