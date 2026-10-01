@@ -143,8 +143,8 @@ tracing-opentelemetry = { workspace = true, optional = true }
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
-reqwest = { workspace = true, features = ["json"] }
 ciborium.workspace = true
 p256.workspace = true
+reqwest = { workspace = true, features = ["json"] }
 serde_bytes.workspace = true
 sha2.workspace = true
