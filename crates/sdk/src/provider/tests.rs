@@ -1,6 +1,7 @@
 use super::*;
 use bytes::Bytes;
 use futures::StreamExt as _;
+use hellas_executor::{FetchRouteEntry, FetchRoutePolicy};
 use hellas_rpc::pb::work::{DeliverResultRequest, WorkStreamEvent};
 use hellas_rpc::services::work::StreamResult;
 use hellas_wire::mux::{MessagePipe, MuxConfig, MuxTransport, Role};
