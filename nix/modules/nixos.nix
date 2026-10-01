@@ -125,11 +125,9 @@ let
   ++ lib.optional (cfg.fetchConfigFile != null) cfg.fetchConfigFile
   ++ lib.optional (cfg.environmentFile != null) cfg.environmentFile;
   gatewayRuntimePaths = lib.optionals gateway.enable (
-    [
-      gateway.causalLmEnvironment
-      gateway.tokenizer
-      gateway.identityPath
-    ]
+    lib.optional (gateway.causalLmEnvironment != null) gateway.causalLmEnvironment
+    ++ lib.optional (gateway.tokenizer != null) gateway.tokenizer
+    ++ [ gateway.identityPath ]
     ++ gateway.content
     ++ gateway.contentRoots
     ++ lib.optional (gateway.contentIndex != null) gateway.contentIndex
@@ -320,6 +318,15 @@ in
       {
         assertion = hellas.catenaPlatform pkgs || (!providerCatenaConfigured && !gateway.local);
         message = "Local Catena execution is supported only on x86_64-linux; omit content, contentRoots, contentIndex, GPU resource bounds, gateway.local on this platform.";
+      }
+      {
+        assertion =
+          !gateway.enable
+          || (
+            (gateway.causalLmEnvironment == null) == (gateway.tokenizer == null)
+            && (gateway.causalLmEnvironment != null || (!gateway.local && gateway.responsesBackend != "hellas"))
+          );
+        message = "services.hellas.gateway.causalLmEnvironment and tokenizer must be set together and are required for native inference.";
       }
       {
         assertion = gateway.nodeAddrs == [ ] || gateway.nodeId != null;
