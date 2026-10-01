@@ -1,3 +1,4 @@
+#[cfg(any(test, feature = "full-node"))]
 mod retention;
 #[cfg(feature = "indexer-api")]
 pub(crate) mod trusted_epochs;
@@ -5,37 +6,43 @@ pub(crate) mod trusted_epochs;
 use crate::ConsensusVerifier;
 #[cfg(test)]
 use crate::domain::PublicKey;
-use crate::domain::Scheme;
 use crate::{
     app::{HellasBlock, MarshalMailbox},
-    config::Config,
-    consensus::{ConsensusVerificationError, Finalization},
+    consensus::ConsensusVerificationError,
     light_client::{FinalizedBlock, FinalizedBlockQuery, LatestBlock, QueryError},
 };
+#[cfg(any(test, feature = "full-node"))]
+use crate::{config::Config, consensus::Finalization, domain::Scheme};
 #[cfg(test)]
 use commonware_actor::Feedback;
 #[cfg(test)]
 use commonware_codec::DecodeExt;
 use commonware_codec::Encode;
 use commonware_consensus::{
-    Block as _, CertifiableBlock, Heightable,
-    marshal::{
-        self, Identifier as MarshalIdentifier, Start, core::Actor as MarshalActor,
-        standard::Standard,
-    },
-    types::{Height, ViewDelta},
+    Block as _, CertifiableBlock, Heightable, marshal::Identifier as MarshalIdentifier,
+    types::Height,
+};
+#[cfg(any(test, feature = "full-node"))]
+use commonware_consensus::{
+    marshal::{self, Start, core::Actor as MarshalActor, standard::Standard},
+    types::ViewDelta,
 };
 use commonware_cryptography::{Digestible, sha256::Digest};
+#[cfg(any(test, feature = "full-node"))]
 use commonware_runtime::{BufferPooler, Clock, Handle, Metrics, Spawner, Storage};
+#[cfg(any(test, feature = "full-node"))]
 use commonware_utils::NZU64;
 #[cfg(test)]
 use commonware_utils::sync::AsyncMutex;
+#[cfg(any(test, feature = "full-node"))]
 use rand_core::CryptoRng;
+#[cfg(any(test, feature = "full-node"))]
 use std::{num::NonZeroUsize, sync::Arc};
 use thiserror::Error;
 #[cfg(all(test, feature = "indexer-api"))]
 use trusted_epochs::TrustedEpochs;
 
+#[cfg(any(test, feature = "full-node"))]
 pub(crate) type Archive<E, V> = retention::Retained<
     commonware_storage::archive::prunable::Archive<
         commonware_storage::translator::EightCap,
@@ -44,6 +51,7 @@ pub(crate) type Archive<E, V> = retention::Retained<
         V,
     >,
 >;
+#[cfg(any(test, feature = "full-node"))]
 pub(crate) type ArchiveActor<E, P, H> = MarshalActor<
     E,
     Standard<HellasBlock>,
@@ -55,6 +63,7 @@ pub(crate) type ArchiveActor<E, P, H> = MarshalActor<
 >;
 
 /// All roles open exactly these stores with the same codec and partition names.
+#[cfg(any(test, feature = "full-node"))]
 pub(crate) async fn init<E, P, H>(
     context: E,
     partition_prefix: &str,
@@ -127,7 +136,9 @@ pub struct ChainIndexer {
     ingest_lock: Arc<AsyncMutex<()>>,
     #[cfg(test)]
     fixture_source: FixtureSource,
+    #[cfg(feature = "full-node")]
     retained_from: Arc<std::sync::atomic::AtomicU64>,
+    #[cfg(any(test, feature = "full-node"))]
     storage_floor: Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -193,7 +204,9 @@ impl ChainIndexer {
             ingest_lock: Arc::new(AsyncMutex::new(())),
             #[cfg(test)]
             fixture_source: FixtureSource::default(),
+            #[cfg(feature = "full-node")]
             retained_from: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(any(test, feature = "full-node"))]
             storage_floor: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
