@@ -24,6 +24,7 @@ pub(super) async fn run(command: Commands, identity_path: Option<&Path>) -> Resu
     }
 }
 
+#[cfg(feature = "gateway")]
 pub(super) async fn machine_route(
     machine: Option<&str>,
     _key: &iroh::SecretKey,
