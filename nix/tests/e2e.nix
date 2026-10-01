@@ -17,13 +17,6 @@ let
   chainSettlementTaker = "236h7pukvqi6u8ADu53erbWyLYXNyNEuB9BRNMXtVKUfZ";
   chainSettlementNative = "jesTu2BpszP8DKSoi1R5G6ggjHrsrVnboLdx6V47vkoR";
 
-  # Presentation is deliberately independent of every Catena execution
-  # environment. The proxy test never runs inference, but the gateway still
-  # requires an explicit tokenizer and stop policy at its text boundary.
-  # Its bytes are materialized at VM runtime below, never by a store derivation.
-  testTokenizerPath = "/var/lib/hellas-gateway/test-tokenizer.json";
-  testEnvironmentPath = "/var/lib/hellas-gateway/test.environment";
-
   responsesMock = pkgs.writeText "responses-mock.py" ''
     import json
     from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -406,10 +399,6 @@ in
             gateway = {
               enable = true;
               port = gatewayPort;
-              causalLmEnvironment = testEnvironmentPath;
-              model = "smollm2-135m";
-              tokenizer = testTokenizerPath;
-              stopTokenIds = [ 2 ];
               responsesBackend = "proxy";
               responsesProxyUrl = "http://127.0.0.1:18080/v1/responses";
               responsesProxyApiKeyEnv = "OPENAI_API_KEY";
@@ -421,39 +410,6 @@ in
               ];
             };
           };
-          systemd.services.hellas-gateway.preStart = ''
-            cat > ${testTokenizerPath} <<'EOF'
-            {
-              "version": "1.0",
-              "truncation": null,
-              "padding": null,
-              "added_tokens": [],
-              "normalizer": null,
-              "pre_tokenizer": { "type": "Whitespace" },
-              "post_processor": null,
-              "decoder": null,
-              "model": {
-                "type": "WordLevel",
-                "vocab": { "hello": 0, "world": 1, "<unk>": 2 },
-                "unk_token": "<unk>"
-              }
-            }
-            EOF
-            printf 'test Catena source\n' > /var/lib/hellas-gateway/test.hex
-            cat > /var/lib/hellas-gateway/test.toml <<'EOF'
-            entrypoint = "test"
-            state_bytes_per_capacity = [4]
-            vocabulary_size = 3
-            maximum_capacity = 8
-            [generation]
-            fixed_capacity = 8
-            prefill_chunk_tokens = 2
-            EOF
-            ${package}/bin/hellas-cli environment build \
-              --program /var/lib/hellas-gateway/test.hex \
-              --settings /var/lib/hellas-gateway/test.toml \
-              --out ${testEnvironmentPath}
-          '';
         }
       ];
     };
@@ -464,9 +420,10 @@ in
       gateway.wait_until_succeeds("curl -sS -o /dev/null -X POST -H 'content-type: application/json' -H 'authorization: Bearer proxy-secret' -d '{\"model\":\"probe\",\"input\":\"hi\"}' http://127.0.0.1:18080/v1/responses")
       gateway.wait_for_unit("hellas-gateway.service")
       unit = gateway.succeed("systemctl show hellas-gateway.service --property=Environment --property=ExecStart")
-      assert "--environment ${testEnvironmentPath}" in unit
-      assert "--model smollm2-135m" in unit
-      assert "--tokenizer ${testTokenizerPath}" in unit
+      assert "--responses-backend proxy" in unit
+      assert "--responses-proxy-url http://127.0.0.1:18080/v1/responses" in unit
+      assert "--environment" not in unit
+      assert "--tokenizer" not in unit
       assert "TMPDIR=/var/cache/hellas-gateway" not in unit
       gateway.wait_for_open_port(${toString gatewayPort})
       gateway.wait_until_succeeds("test -e /var/lib/hellas-gateway/probed")
