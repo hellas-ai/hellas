@@ -338,7 +338,7 @@ in
         message = "services.hellas.gateway.contentIndex is only valid for local execution.";
       }
       {
-        assertion = !(gateway.local) || gateway.content != [ ] || gateway.contentRoots != [ ];
+        assertion = !gateway.local || gateway.content != [ ] || gateway.contentRoots != [ ];
         message = "services.hellas.gateway local execution require content or contentRoots.";
       }
       {
@@ -482,7 +482,7 @@ in
       unitConfig = lib.optionalAttrs (gatewayRuntimePaths != [ ]) {
         RequiresMountsFor = gatewayRuntimePaths;
       };
-      path = lib.optionals (gateway.local) gpuPackages;
+      path = lib.optionals gateway.local gpuPackages;
       environment = hellas.renderEnvironment (
         hellas.mkOtelEnv {
           inherit lib;
@@ -492,7 +492,7 @@ in
         // {
           HOME = "/var/lib/hellas-gateway";
         }
-        // lib.optionalAttrs (gateway.local) (
+        // lib.optionalAttrs gateway.local (
           {
             # Local Catena execution dlopens generated shared objects, which
             # cannot live below DynamicUser's noexec CacheDirectory.
@@ -530,7 +530,7 @@ in
         # unit's systemd-managed writable directories.
         ReadOnlyPaths = gatewayContentPaths;
       }
-      // lib.optionalAttrs (gateway.local) (
+      // lib.optionalAttrs gateway.local (
         {
           RuntimeDirectory = "hellas-gateway";
           RuntimeDirectoryMode = "0700";
