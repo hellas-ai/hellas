@@ -84,6 +84,7 @@ pub(crate) fn prepare_grants(
 pub struct ServeOptions {
     pub grants: Option<GrantNodeConfig>,
     pub port: Option<u16>,
+    pub discovery: bool,
     pub queue_size: usize,
     #[cfg(feature = "evaluate")]
     pub content_paths: Vec<PathBuf>,
@@ -247,6 +248,7 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
     let shutdown = shutdown_signal().context("failed to listen for shutdown signal")?;
     let node = node::spawn_node(node::NodeConfig {
         port: options.port,
+        discovery: options.discovery,
         queue_size: options.queue_size,
         #[cfg(feature = "evaluate")]
         content_store,

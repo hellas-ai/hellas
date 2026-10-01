@@ -332,6 +332,9 @@ enum Commands {
         /// Port to listen on. Omit it to let the OS select an available port.
         #[arg(long)]
         port: Option<u16>,
+        /// Disable mDNS and DHT service advertising; clients must use direct addresses.
+        #[arg(long)]
+        no_discovery: bool,
         /// Maximum number of queued executions waiting behind the active worker
         #[arg(
             long = "queue-size",
@@ -979,6 +982,7 @@ async fn async_main() {
             store_dir,
             assurance,
             port,
+            no_discovery,
             queue_size,
             #[cfg(feature = "evaluate")]
             content_paths,
@@ -1056,6 +1060,7 @@ async fn async_main() {
                         .with_backend(gpu_backend);
                         commands::serve::run(commands::serve::ServeOptions {
                             port,
+                            discovery: !no_discovery,
                             queue_size,
                             #[cfg(feature = "evaluate")]
                             content_paths,
