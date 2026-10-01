@@ -45,7 +45,12 @@ node = [
 # This deliberately does not pull Catena into a client that only dials a node.
 llm = ["hellas-client/evaluate", "dep:hellas-presentation"]
 # HTTP gateway front-end (OpenAI/Anthropic/plain APIs).
-gateway = ["llm", "dep:hellas-gateway", "hellas-sdk/grant-gateway", "hellas-sdk?/paid-gateway"]
+gateway = [
+    "llm",
+    "dep:hellas-gateway",
+    "hellas-sdk/grant-gateway",
+    "hellas-sdk?/paid-gateway",
+]
 evaluate = [
     "node",
     "gateway",
@@ -145,12 +150,19 @@ tracing-opentelemetry = { workspace = true, optional = true }
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+ciborium.workspace = true
 hellas-chain = { workspace = true, features = ["client", "construction-audit"] }
+p256.workspace = true
 rcgen = "0.14"
 reqwest = { workspace = true, features = ["json"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
-ciborium.workspace = true
-p256.workspace = true
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+] }
 serde_bytes.workspace = true
 sha2.workspace = true
+tokio-rustls = { version = "0.26", default-features = false, features = [
+    "ring",
+    "tls12",
+] }
