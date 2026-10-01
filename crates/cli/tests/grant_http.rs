@@ -176,8 +176,6 @@ impl Cli {
         command
             .arg("--identity")
             .arg(&self.identity)
-            .arg("--store-dir")
-            .arg(self.root.join("store"))
             .args(args)
             .env("HELLAS_GRANT_DATA_DIR", self.root.join("grants"))
             .env("HELLAS_STORE_DIR", self.root.join("store"))
@@ -190,6 +188,9 @@ impl Cli {
             .env("OTEL_SDK_DISABLED", "true")
             .stdin(Stdio::null())
             .kill_on_drop(true);
+        if matches!(args.first(), Some(&"serve" | &"gateway")) {
+            command.arg("--store-dir").arg(self.root.join("store"));
+        }
         command
     }
     async fn output(&self, args: &[&str]) -> std::process::Output {
