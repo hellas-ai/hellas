@@ -142,6 +142,7 @@ impl NodeHandle {
 pub(super) struct NodeConfig {
     pub(super) grants: Option<super::GrantNodeConfig>,
     pub(super) port: Option<u16>,
+    pub(super) discovery: bool,
     pub(super) queue_size: usize,
     #[cfg(feature = "evaluate")]
     pub(super) content_store: hellas_store::ContentStore,
@@ -283,7 +284,10 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
     } else {
         (None, None, None)
     };
-    let discovery = start_server_advertising(&endpoint, &advertised_alpns)
+    let discovery = config
+        .discovery
+        .then(|| start_server_advertising(&endpoint, &advertised_alpns))
+        .transpose()
         .context("failed to start service discovery advertising")?;
     let setup_mount = MountedSetup::default();
     let chain = config.work.as_ref().map(|(_, chain)| chain.clone());
@@ -381,7 +385,7 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
         node_id,
         accept_task: Some(accept_task),
         endpoint,
-        discovery: Some(discovery),
+        discovery,
         work,
     })
 }

@@ -328,6 +328,7 @@ async fn contact_grant_offer_gateway_uses_private_ca_and_durable_allowances() {
     let mut node = provider.spawn(
         &[
             "serve",
+            "--no-discovery",
             "--fetch-config",
             string(&fetch),
             "--grant-config",
@@ -627,7 +628,11 @@ async fn managed_owner_bootstrap_standing_fetch_and_restart_preserve_allowances(
                 cli.to_string_lossy().into_owned(),
                 "serve".into(),
             ],
-            serve_args: vec!["--port".into(), work_address.port().to_string()],
+            serve_args: vec![
+                "--port".into(),
+                work_address.port().to_string(),
+                "--no-discovery".into(),
+            ],
             bind: Some(admin_address),
             no_relay: true,
         },
