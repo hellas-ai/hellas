@@ -59,12 +59,10 @@ router selects an account, then the paid client signs the exact Fetch request
 and proposes it on that provider's channel. The provider checks the funded edge,
 credit, deadlines, signature and Fetch policy before durably accepting work;
 only that accepted job can invoke the upstream. The credential's origin, path
-and method restrictions remain enforced by the provider. Courtesy caller grants
-do not authorize this HTTP path.
+and method restrictions remain enforced by the provider. Every execution is authorized by Work.
 
 The SDK Fetch provider advertises only Work and WorkSetup when configured for
-paid work; legacy allowed callers cannot reach its credentials through unpaid
-Fetch. Accepted paid Fetch jobs wait in a bounded provider queue when upstream
+paid work; the unpaid Fetch execution service has been removed. Accepted paid Fetch jobs wait in a bounded provider queue when upstream
 concurrency is full. Further submissions wait at the executor mailbox while
 completion handling remains available. Provider validator connections check the
 configured genesis digest before advancing payment state; this check runs on
@@ -199,8 +197,8 @@ smaller Fetch envelope limit are archived with their 413 response.
 These switches govern this gateway's application writes. They do not establish
 OS swap/dump protection, a remote provider's host policy, upstream retention,
 or the coding client's own session-log policy. Software identities do not
-attest those properties. The embedded Responses-only `start_fetch` API retains
-its host-managed storage policy.
+attest those properties. The embedded Responses-only `start_fetch` API is unsupported until grant
+funding is implemented.
 
 ## Limits and telemetry
 

@@ -29,24 +29,25 @@ Attestation only works on a genuine, locked-down Apple machine.
 
 ## Requester
 
-Obtain the provider's enrollment-bundle ContentId (the pin) out of band, then:
+Use the paid HTTPS Fetch gateway. Obtain the provider's enrollment-bundle
+ContentId (the pin) out of band, and configure each entry in the paid pool with
+`provider_genesis`, `apple_app_id` and `apple_cd_hashes`. See the
+[paid gateway guide](../../../docs/paid-gateway.md) for funding and pool fields,
+and [HTTP routing](../../../docs/http-gateway.md) for exact route configuration.
 
-```
-hellas-cli \
+```sh
+hellas-cli gateway \
   --assurance apple-app-attest \
-  --provider-genesis <bundle-content-id-hex> \
-  --apple-app-attest-app-id <teamID>.<bundleID> \
-  --apple-app-attest-cdhashes <allowlisted build CDhashes> \
-  llm ...            # or: fetch ...
+  --paid-work-config /srv/hellas/pool.json \
+  --http-fetch-config /srv/hellas/http-routes.json \
+  --zdr
 ```
 
-| Flag | Meaning |
-|---|---|
-| `--assurance apple-app-attest` | Require an attested provider (default is `producer-signed`). |
-| `--provider-genesis <content-id>` | The out-of-band pin. The provider's returned bundle must hash to this. |
-| `--apple-app-attest-app-id <teamID.bundleID>` | The app identity. The RP-ID is `SHA256` of this; the assertion must match. |
-| `--apple-app-attest-cdhashes <...>` | Allowlist of build CDhashes you trust not to leak. A build outside it is rejected. |
-| `--retain` | Explicitly allow the provider to persist and publish prompt/token/transcript bytes (`llm`/`fetch`; default is ephemeral). Also expressible as OpenAI `store:true` in the body for `fetch`. |
+`--zdr` disables gateway payload archives and requires a ZDR policy for every
+HTTP request. Paid Fetch journals contain accounting metadata, never request
+or response bodies. These storage rules do not establish an upstream API's
+retention policy. Native token Work remains producer-signed; Apple assurance
+here is the paid Fetch path.
 
 Before any prompt byte leaves the requester, the client verifies, in order:
 pin match → decode bundle → live peer == genesis transport key →
@@ -60,10 +61,10 @@ Any failure aborts before send.
 2. Create a fresh App Attest identity; publish the bundle; capture the pin.
 3. From a second machine, connect with the pin + app-id + cdhashes; confirm the
    open gate blocks any prompt before verification completes.
-4. Run one `llm` (Evaluate) and one `fetch`; confirm the returned result
-   verifies.
-5. Without `--retain`, confirm zero prompt-bearing files under the provider's
-   data dir.
+4. Send a request through the paid HTTPS gateway; confirm the returned
+   transcript verifies and its payment is acknowledged.
+5. With `--zdr`, confirm no payload archive is created and no request/response
+   body is present in either Fetch journal.
 6. Restart the provider; confirm resume requires a fresh open verification.
 7. Confirm a CDhash outside the allowlist is rejected at open.
 8. Downgrade SIP / boot policy; confirm attestation fails and attested serving

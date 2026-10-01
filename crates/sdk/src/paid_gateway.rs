@@ -788,16 +788,11 @@ fn prepare_request(
         ));
     }
     let manifest = request.environment.manifest();
-    hellas_client::iroh::validate_causal_lm_quote_request(
-        &hellas_rpc::pb::courtesy::QuoteTokensRequest {
-            program_manifest: manifest.canonical_bytes(),
-            prompt_token_ids: request.input_ids.clone(),
-            max_new_tokens: Some(request.max_new_tokens),
-            stop_token_ids: request.stop_token_ids.clone(),
-            ..Default::default()
-        },
-        manifest.content_id(),
+    hellas_client::execution::validate_causal_lm_invocation(
         &request.environment,
+        &request.input_ids,
+        request.max_new_tokens,
+        &request.stop_token_ids,
     )?;
     let tokens = TokenIds::from_u32s(request.input_ids);
     let policy = TextPolicy::from_u32_stop_tokens(request.max_new_tokens, request.stop_token_ids);

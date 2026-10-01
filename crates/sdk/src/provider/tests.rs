@@ -27,7 +27,7 @@ impl RootProver for UnusedRoot {
 }
 
 #[tokio::test]
-async fn paid_provider_refuses_unpaid_fetch_even_with_legacy_allowed_callers() {
+async fn provider_advertises_only_work_protocols() {
     tokio::time::timeout(Duration::from_secs(15), async {
         let fixture = crate::test_support::PaidFixture::new();
         let identity = ClientIdentity::from_secret_bytes([4; 32], [2; 32]).unwrap();
@@ -56,15 +56,8 @@ async fn paid_provider_refuses_unpaid_fetch_even_with_legacy_allowed_callers() {
             root: Arc::new(UnusedRoot),
             state_directory: fixture.root.path().join("state"),
             routes,
-            allowed_callers: vec![
-                hellas_rpc::ProducerSigningKey::from_secret_bytes([1; 32])
-                    .unwrap()
-                    .public_key(),
-            ],
             fetch_max_in_flight: 1,
             fetch_queue_capacity: 1,
-            retained_transcript_capacity: 0,
-            fetch_replay_max_in_flight: 1,
             paid_work: Some(fixture.config),
         })
         .await
@@ -87,7 +80,7 @@ async fn paid_provider_refuses_unpaid_fetch_even_with_legacy_allowed_callers() {
         );
         assert!(
             client
-                .connect(addr.clone(), Fetch::ALPN.as_bytes())
+                .connect(addr.clone(), b"retired-execution-service")
                 .await
                 .is_err()
         );

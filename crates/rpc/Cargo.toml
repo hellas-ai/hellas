@@ -26,20 +26,16 @@ otel = ["dep:opentelemetry", "dep:tracing-opentelemetry"]
 # === Protocol modules ======================================================
 # Each feature gates the generated items for one proto package, so binaries
 # only include the protocols they use.
-# `execute` is the foundation — evaluate, fetch, and courtesy all reference
-# `hellas.v1.Ticket` and related types.
+# `execute` gates the shared identity and signed-transcript vocabulary.
 execute = []
 evaluate = ["execute"]
 fetch = ["execute", "dep:serde_json"]
 chain = ["dep:base64ct", "dep:hellas-kernel"]
-# Courtesy proto imports hellas.v1 (Ticket) and hellas.evaluate.v1
-# (EvaluateRequest), so the feature must pull both forward.
-courtesy = ["execute", "evaluate"]
 swarm = []
 # Host administration. Explicitly mounted behind admin authorization, not
 # included in the ordinary peer-service discovery catalogue.
 host-control = []
-all-protocols = ["swarm", "courtesy", "execute", "evaluate", "fetch", "chain"]
+all-protocols = ["swarm", "execute", "evaluate", "fetch", "chain"]
 # Paid private work: the canonical authorization, result, invoice, and
 # allocation records. Gated because it is the only protocol module that
 # needs the consensus kernel's types — the certificate, the network id,

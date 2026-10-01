@@ -26,7 +26,7 @@ impl GatewayBackend {
     }
 
     async fn prepare(&self, request: &BackendRequest) -> Result<PreparedGeneration, BackendError> {
-        let retention = super::fetch_backend::retention_from_json(request.raw.value())?;
+        let retention = retention_from_json(request.raw.value())?;
         self.state
             .prepare_wire_execution(&request.execution, retention)
             .await
@@ -65,5 +65,23 @@ impl ExecutionBackend for GatewayBackend {
                 initial_provenance,
             ))
         })
+    }
+}
+
+use hellas_rpc::Retention;
+use serde_json::{Map as JsonMap, Value as JsonValue};
+pub(super) fn retention_from_json(value: &JsonValue) -> Result<Retention, BackendError> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| BackendError::rejected("request body must be a JSON object"))?;
+    retention_from_json_object(object)
+}
+fn retention_from_json_object(
+    object: &JsonMap<String, JsonValue>,
+) -> Result<Retention, BackendError> {
+    match object.get("store") {
+        None => Ok(Retention::Ephemeral),
+        Some(JsonValue::Bool(store)) => Ok(Retention::from_retain(*store)),
+        Some(_) => Err(BackendError::rejected("`store` must be a boolean")),
     }
 }

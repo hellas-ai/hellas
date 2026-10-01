@@ -4,8 +4,7 @@ use hellas_rpc::evaluate::{
     EvaluateOutputTranscriptBuilder, EvaluateStopReason, EvaluateTerminal, EvaluateUsage,
     input_commitment,
 };
-use hellas_rpc::pb::execute::{WorkChunk, WorkEvent, WorkFailed, WorkFinished, work_event};
-use hellas_rpc::provenance::ExecutionProvenance;
+use hellas_rpc::execution_event::{WorkChunk, WorkEvent, WorkFailed, WorkFinished, work_event};
 use hellas_rpc::stream::output_event_to_pb;
 use hellas_rpc::{Assurance, ContentId, Digest, EvaluateRequest, ProducerSigningKey, Retention};
 use tokio::sync::mpsc;
@@ -69,12 +68,7 @@ fn outcome_items(events: Vec<Result<WorkEvent, hellas_wire::WireStatus>>) -> Exe
         }
     }
     drop(sender);
-    ExecuteOutcome {
-        provenance: ExecutionProvenance {
-            commitment_id: [0; 32],
-        },
-        events: receiver,
-    }
+    ExecuteOutcome { events: receiver }
 }
 
 fn outcome(events: Vec<WorkEvent>) -> ExecuteOutcome {

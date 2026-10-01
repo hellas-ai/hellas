@@ -4,7 +4,7 @@
 //! available through a local [`ContentStore`]. It neither acquires nor compiles
 //! anything. The manifest root is itself reopened as bounded, verified content,
 //! so an accepted paid job can reconstruct the same environment after a
-//! restart without depending on a prior Courtesy quote. The parsed environment
+//! restart without depending on a prior in-memory state. The parsed environment
 //! is immutable. A paid worker reopens
 //! verified descriptors while constructing its persistent safe runtime, so
 //! replacing a cache path cannot retarget an already-open descriptor. This is
@@ -131,14 +131,6 @@ impl CausalLmEnvironmentSource {
     #[must_use]
     pub fn environment(&self) -> &CausalLmEnvironment {
         self.environment.as_ref()
-    }
-
-    /// Conservative logical heap pinned through this source's environment
-    /// `Arc`. The environment cache may share the allocation with many
-    /// quotes, but quote admission deliberately charges the full metadata to
-    /// every quote so sharing cannot weaken the aggregate cap.
-    pub(crate) fn retained_heap_bytes(&self) -> Option<usize> {
-        self.environment.retained_heap_bytes()
     }
 
     /// Reopens the exact program and ordered static objects for one paid worker.

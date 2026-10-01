@@ -2,7 +2,7 @@ use hellas_rpc::evaluate::{
     EvaluateOutput, EvaluateTokenDelta, TERMINAL_EVENT_KIND, TOKEN_DELTA_EVENT_KIND,
     decode_terminal_payload, decode_token_delta_payload, output_canonicalization,
 };
-use hellas_rpc::pb::execute::{WorkEvent, work_event};
+use hellas_rpc::execution_event::{WorkEvent, work_event};
 use hellas_rpc::protocol::artifacts::{OutputAddressed, TextExecutionId, completed_text};
 use hellas_rpc::stream::output_event_from_pb;
 use hellas_rpc::{
@@ -362,7 +362,7 @@ pub fn evaluate_input_from_request_commitment(
 ) -> ClientResult<InputCommitment> {
     let digest: [u8; 32] = request_commitment.try_into().map_err(|_| {
         ClientError::protocol(format!(
-            "ticket request_commitment must be 32 bytes, got {}",
+            "request_commitment must be 32 bytes, got {}",
             request_commitment.len()
         ))
     })?;

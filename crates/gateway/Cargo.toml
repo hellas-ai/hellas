@@ -18,7 +18,7 @@ otel = [
 evaluate = [
     "dep:hellas-executor",
     "hellas-executor/evaluate",
-    "hellas-client/local",
+
     "dep:hellas-store",
 ]
 
@@ -34,7 +34,7 @@ hellas-client = { workspace = true, features = ["iroh", "evaluate"] }
 hellas-executor = { workspace = true, optional = true }
 hellas-presentation.workspace = true
 hellas-private.workspace = true
-hellas-rpc = { workspace = true, features = ["courtesy", "fetch"] }
+hellas-rpc = { workspace = true, features = ["fetch"] }
 hellas-store = { workspace = true, optional = true }
 hellas-wire = { workspace = true, features = ["iroh"] }
 httpdate = "1"

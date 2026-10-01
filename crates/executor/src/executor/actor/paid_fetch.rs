@@ -1,5 +1,5 @@
 //! Paid Fetch runs have their own durable admission in hellas-work. Bodies
-//! remain in memory; neither Courtesy replay nor its transcript store is used.
+//! remain in memory; the payment journal owns recovery.
 
 use std::sync::Arc;
 
@@ -71,7 +71,7 @@ impl Executor {
                 while let Some(event) = receiver.recv().await {
                     let event =
                         event.map_err(|error| ExecutorError::Execution(error.to_string()))?;
-                    if let Some(hellas_rpc::pb::execute::work_event::Kind::Chunk(chunk)) =
+                    if let Some(hellas_rpc::execution_event::work_event::Kind::Chunk(chunk)) =
                         event.kind
                         && let Some(progress) = &progress
                     {
@@ -137,21 +137,22 @@ impl Executor {
         let policy = *input.policy();
         let parts = input.into_parts();
         let request = hellas_rpc::fetch::verify_input_events(&parts.fetch_input_transcript)
-            .map_err(|_| ExecutorError::InvalidQuoteRequest("invalid paid fetch input".into()))?;
+            .map_err(|_| ExecutorError::InvalidInput("invalid paid fetch input".into()))?;
         if request.retention != hellas_rpc::Retention::Ephemeral
             || request.assurance != self.provider.assurance
             || request.execution_environment != parts.manifest.content_id()
         {
-            return Err(ExecutorError::InvalidQuoteRequest(
+            return Err(ExecutorError::InvalidInput(
                 "paid fetch contract mismatch".into(),
             ));
         }
         let route = FetchRoute::new(&request.service, &request.method);
-        let entry = self.fetch_routes.entry(&route).cloned().ok_or_else(|| {
-            ExecutorError::InvalidQuoteRequest("paid fetch route is unavailable".into())
-        })?;
+        let entry =
+            self.fetch_routes.entry(&route).cloned().ok_or_else(|| {
+                ExecutorError::InvalidInput("paid fetch route is unavailable".into())
+            })?;
         if entry.execution_environment() != request.execution_environment {
-            return Err(ExecutorError::InvalidQuoteRequest(
+            return Err(ExecutorError::InvalidInput(
                 "paid fetch route manifest mismatch".into(),
             ));
         }
@@ -162,7 +163,7 @@ impl Executor {
             request.input_commitment,
         );
         let session = entry.adaptor_factory.create(&call).map_err(|_| {
-            ExecutorError::InvalidQuoteRequest("paid fetch adaptor rejected request".into())
+            ExecutorError::InvalidInput("paid fetch adaptor rejected request".into())
         })?;
         entry
             .capabilities
@@ -406,11 +407,11 @@ mod tests {
     ) -> ExecutorHandle {
         let mut config = ExecutorSpawnConfig::fetch_only(
             Arc::new(signing_key()),
-            Arc::new(b"paid-fetch-tests".to_vec()),
             Assurance::ProducerSigned,
             routes,
         );
         config.fetch_max_in_flight = fetch_max_in_flight;
+        config.fetch_queue_capacity = super::super::EXECUTOR_OWED_MAILBOX_CAPACITY;
         Executor::spawn_configured(config)
             .await
             .expect("test executor spawns")
@@ -480,7 +481,7 @@ mod tests {
         let result = run_paid_fetch(&handle, prepared_input(events), None).await;
 
         assert!(
-            matches!(result, Err(ExecutorError::InvalidQuoteRequest(error)) if error == "invalid paid fetch input")
+            matches!(result, Err(ExecutorError::InvalidInput(error)) if error == "invalid paid fetch input")
         );
     }
 
@@ -492,7 +493,7 @@ mod tests {
         let result = run_paid_fetch(&handle, prepared_input(events), None).await;
 
         assert!(
-            matches!(result, Err(ExecutorError::InvalidQuoteRequest(error)) if error == "paid fetch contract mismatch")
+            matches!(result, Err(ExecutorError::InvalidInput(error)) if error == "paid fetch contract mismatch")
         );
     }
 
@@ -504,7 +505,7 @@ mod tests {
         let result = run_paid_fetch(&handle, prepared_input(events), None).await;
 
         assert!(
-            matches!(result, Err(ExecutorError::InvalidQuoteRequest(error)) if error == "paid fetch contract mismatch")
+            matches!(result, Err(ExecutorError::InvalidInput(error)) if error == "paid fetch contract mismatch")
         );
     }
 
@@ -527,7 +528,7 @@ mod tests {
         let result = run_paid_fetch(&handle, prepared_input(events), None).await;
 
         assert!(
-            matches!(result, Err(ExecutorError::InvalidQuoteRequest(error)) if error == "paid fetch contract mismatch")
+            matches!(result, Err(ExecutorError::InvalidInput(error)) if error == "paid fetch contract mismatch")
         );
     }
 
@@ -539,7 +540,7 @@ mod tests {
         let result = run_paid_fetch(&handle, prepared_input(events), None).await;
 
         assert!(
-            matches!(result, Err(ExecutorError::InvalidQuoteRequest(error)) if error == "paid fetch route is unavailable")
+            matches!(result, Err(ExecutorError::InvalidInput(error)) if error == "paid fetch route is unavailable")
         );
     }
 
@@ -560,7 +561,7 @@ mod tests {
         let result = run_paid_fetch(&handle, prepared_input(events), None).await;
 
         assert!(
-            matches!(result, Err(ExecutorError::InvalidQuoteRequest(error)) if error == "paid fetch route manifest mismatch")
+            matches!(result, Err(ExecutorError::InvalidInput(error)) if error == "paid fetch route manifest mismatch")
         );
     }
 
@@ -584,7 +585,7 @@ mod tests {
         let result = run_paid_fetch(&handle, prepared_input(events), None).await;
 
         assert!(
-            matches!(result, Err(ExecutorError::InvalidQuoteRequest(error)) if error == "paid fetch adaptor rejected request")
+            matches!(result, Err(ExecutorError::InvalidInput(error)) if error == "paid fetch adaptor rejected request")
         );
         assert_eq!(provider.calls(SERVICE, METHOD, BODY), 0);
     }
@@ -614,17 +615,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn paid_fetch_waits_for_capacity_without_blocking_the_actor() {
+    async fn zero_waiting_queue_backpressures_owed_fetch_and_drains_completions() {
         let provider = BlockingFetchProvider::new(environment().manifest_id());
-        let handle = spawn_executor(
+        let mut config = ExecutorSpawnConfig::fetch_only(
+            Arc::new(signing_key()),
+            Assurance::ProducerSigned,
             routes(
                 Arc::new(provider.clone()),
                 stub_adaptor(environment().manifest_id()),
                 FetchRoutePolicy::default(),
             ),
-            1,
-        )
-        .await;
+        );
+        config.fetch_max_in_flight = 1;
+        config.fetch_queue_capacity = 0;
+        let handle = Executor::spawn_configured(config).await.unwrap();
         let first_events = input_events(Retention::Ephemeral, Assurance::ProducerSigned);
         let first_commitment = commitment_of(&first_events);
         let first = tokio::spawn({
@@ -653,11 +657,8 @@ mod tests {
                 .await
             }
         });
-        // Peer-facing requests remain serviceable while both paid jobs wait.
-        timeout(Duration::from_secs(1), handle.get_stats_handle())
-            .await
-            .unwrap()
-            .unwrap();
+        // The second job waits for the bounded execution slot.
+        tokio::task::yield_now().await;
         assert!(!second.is_finished());
         assert_eq!(provider.started(), 1);
 
@@ -715,7 +716,6 @@ mod tests {
                     .await
                     .is_err()
             );
-            handle.get_stats_handle().await.unwrap();
             assert_eq!(handle.owed_tx.capacity(), 0);
             assert_eq!(provider.started(), 1);
             // An abandoned waiter cannot discard an already owed invocation.

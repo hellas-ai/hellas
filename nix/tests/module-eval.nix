@@ -55,6 +55,11 @@ let
     lib.findFirst (
       assertion: lib.hasInfix "services.hellas.gateway.provider is required" assertion.message
     ) (throw "missing gateway provider assertion") evaluation.config.assertions;
+  gatewayModelAssertion =
+    evaluation:
+    lib.findFirst (
+      assertion: lib.hasInfix "gateway.causalLmEnvironment and tokenizer" assertion.message
+    ) (throw "missing gateway model assertion") evaluation.config.assertions;
   runtimeStoreAssertion =
     evaluation:
     lib.findFirst (
@@ -240,13 +245,6 @@ let
     if matched == null then throw "validator ExecStart has no config" else builtins.head matched;
   paidWorkValidatorServices = paidWorkValidators.config.systemd.services;
   validatorConfig2 = validatorConfigPath paidWorkValidatorServices."hellas-validator-devnet-node2";
-  executePolicyEvaluation =
-    executePolicy:
-    builtins.tryEval (
-      builtins.deepSeq
-        (evalProvider { inherit executePolicy; }).config.systemd.services.hellas.serviceConfig
-        true
-    );
   evalHomeManagerWith =
     homeManagerPkgs: configuration:
     lib.evalModules {
@@ -341,7 +339,23 @@ let
       };
     };
   discoveryGateway = evalGateway { };
-  proxyOnlyGateway = evalGateway { responsesBackend = "proxy"; };
+  proxyOnlyGateway = evalGateway {
+    responsesBackend = "proxy";
+    causalLmEnvironment = null;
+    tokenizer = null;
+  };
+  nativeGatewayWithoutModel = evalGateway {
+    causalLmEnvironment = null;
+    tokenizer = null;
+  };
+  localProxyWithoutModel = evalGateway {
+    responsesBackend = "proxy";
+    local = true;
+    causalLmEnvironment = null;
+    tokenizer = null;
+  };
+  gatewayWithoutEnvironment = evalGateway { causalLmEnvironment = null; };
+  gatewayWithoutTokenizer = evalGateway { tokenizer = null; };
   storePathGateway = evalGateway {
     responsesBackend = "proxy";
     environmentFile = "${builtins.storeDir}/secret.env";
@@ -361,36 +375,6 @@ let
     content = [ "${builtins.storeDir}/model.hex" ];
   };
   defaultIdentityProvider = evalProvider { };
-  invalidEmptyPolicyList = executePolicyEvaluation [ ];
-  invalidBogusPolicy = executePolicyEvaluation "sometimes";
-  invalidPaddedNonePolicy = executePolicyEvaluation " none ";
-  invalidEmptyOnlyPolicy = executePolicyEvaluation "only()";
-  invalidEmptyGlobPolicy = executePolicyEvaluation "only(ab,,cd)";
-  invalidCharacterGlobPolicy = executePolicyEvaluation "only(abcG*)";
-  invalidLongGlobPolicy = executePolicyEvaluation "only(${
-    builtins.concatStringsSep "" (builtins.genList (_: "a") 65)
-  })";
-  invalidEmptyListGlobPolicy = executePolicyEvaluation [ "" ];
-  validAnyPolicyProvider = evalProvider { executePolicy = "any"; };
-  validNonePolicyProvider = evalProvider { executePolicy = "none"; };
-  validOnlyPolicyProvider = evalProvider { executePolicy = "only(0123*,abcdef)"; };
-  validListPolicyProvider = evalProvider {
-    executePolicy = [
-      "0123*"
-      "abcdef"
-    ];
-  };
-  storePathArtifactStore = evalProvider {
-    artifactStorePath = "${builtins.storeDir}/artifacts";
-  };
-  contextualArtifactStore = evalProvider {
-    artifactStorePath = contextualRuntimePath;
-  };
-  relativeArtifactStore =
-    let
-      evaluation = evalProvider { artifactStorePath = "relative/artifacts"; };
-    in
-    builtins.tryEval evaluation.config.services.hellas.artifactStorePath;
   storePathWorkConfig = evalProvider {
     workConfigFile = "${builtins.storeDir}/work.json";
   };
@@ -400,28 +384,21 @@ let
   storePathProviderEnvironmentFile = evalProvider {
     environmentFile = "${builtins.storeDir}/provider.env";
   };
-  verifyLocalProxyGateway = evalGateway {
+  localProxyGateway = evalGateway {
     responsesBackend = "proxy";
-    verifyLocal = true;
+    local = true;
     contentRoots = [ "/srv/hellas/content" ];
     contentIndex = "/srv/hellas-gateway-index/content-index.bin";
   };
-  rootArtifactStoreProvider = evalProvider {
-    artifactStorePath = "/";
-  };
-  overlappingArtifactStoreProvider = evalProvider {
-    contentRoots = [ "/srv/hellas/content" ];
-    artifactStorePath = "/srv/hellas/content/artifacts";
-  };
   rootContentIndexGateway = evalGateway {
     responsesBackend = "proxy";
-    verifyLocal = true;
+    local = true;
     contentRoots = [ "/srv/hellas/content" ];
     contentIndex = "/content-index.bin";
   };
   overlappingContentIndexGateway = evalGateway {
     responsesBackend = "proxy";
-    verifyLocal = true;
+    local = true;
     contentRoots = [ "/srv/hellas/content" ];
     contentIndex = "/srv/hellas/content/index/content-index.bin";
   };
@@ -430,9 +407,6 @@ let
   };
   unsafeServeAssuranceArgs = evalProvider {
     extraArgs = [ "--assurance=producer-signed" ];
-  };
-  unsafeServeArtifactStoreArgs = evalProvider {
-    extraArgs = [ "--artifact-store-path=/srv/hellas/other-artifacts" ];
   };
   unsafeGatewayExtraArgs = evalGateway {
     responsesBackend = "proxy";
@@ -443,7 +417,6 @@ let
   };
   unsupportedProviderApple = evalProvider {
     assurance = "apple-app-attest";
-    executePolicy = "none";
   };
   incompleteAppleTrust = evalGateway {
     responsesBackend = "proxy";
@@ -459,12 +432,12 @@ let
         gpuMaxGenerationCapacity = 524289;
       }).config.systemd.services.hellas.serviceConfig.ExecStart;
   cudaProvider = evalProvider {
+    workConfigFile = "/run/hellas/work.json";
     gpuBackend = "cuda";
-    executePolicy = "any";
   };
   hipProvider = evalProvider {
+    workConfigFile = "/run/hellas/work.json";
     gpuBackend = "hip";
-    executePolicy = "any";
   };
   maxGpuSessionAssetBytes = evalProvider {
     gpuSessionAssetBytes = 4398046511104;
@@ -490,7 +463,7 @@ let
   };
   managedContentGateway = evalGateway {
     responsesBackend = "proxy";
-    verifyLocal = true;
+    local = true;
     contentRoots = [ "/var/lib/hellas-gateway/content" ];
   };
   storePathReadinessProvider = evalProvider {
@@ -560,7 +533,6 @@ let
   };
   homeManagerDarwinServe = evalDarwinServe {
     identityPath = "/Users/hellas/Library/Application Support/Hellas/identity";
-    artifactStorePath = "/Users/hellas/Library/Application Support/Hellas/artifacts";
     environmentFile = "/Users/hellas/.config/hellas/provider.env";
     fetchConfigFile = "/Users/hellas/.config/hellas/fetch.json";
     assurance = "apple-app-attest";
@@ -574,17 +546,6 @@ let
   homeManagerDarwinStoreContent = evalDarwinServe {
     content = [ "${builtins.storeDir}/model.hex" ];
   };
-  homeManagerDarwinStoreArtifactStore = evalDarwinServe {
-    artifactStorePath = "${builtins.storeDir}/artifacts";
-  };
-  homeManagerDarwinContextualArtifactStore = evalDarwinServe {
-    artifactStorePath = contextualRuntimePath;
-  };
-  homeManagerDarwinRelativeArtifactStore = builtins.tryEval (
-    builtins.deepSeq
-      (evalDarwinServe { artifactStorePath = "relative/artifacts"; }).config.launchd.agents.hellas
-      true
-  );
   homeManagerDarwinStoreWorkConfig = evalDarwinServe {
     workConfigFile = "${builtins.storeDir}/work.json";
   };
@@ -631,7 +592,6 @@ let
     extraArgs = [ "--assurance=producer-signed" ];
   };
   homeManagerDarwinLocalCatena = evalDarwinServe {
-    executePolicy = "any";
     contentRoots = [ "/srv/hellas/content" ];
   };
   homeManagerRelativeEnvironmentFile = builtins.tryEval (
@@ -656,20 +616,15 @@ let
           inherit package;
           # An operator explicitly enables arbitrary locally satisfiable
           # Evaluate work, including restart from an already-populated index.
-          executePolicy = "any";
           identityPath = "/var/lib/hellas/.hellas/identity-v3";
           contentRoots = [ "/srv/hellas/content" ];
           contentIndex = "/srv/hellas-index/content-index.bin";
           readinessEnvironments = [ "/srv/hellas/content/smollm2.environment" ];
-          artifactStorePath = "/srv/hellas/artifacts";
           gpuSessionAssetBytes = 1073741824;
           memoryMaxBytes = 2147483648;
           workConfigFile = "/run/hellas/work.json";
           queueSize = 0;
           fetchConfigFile = "/run/hellas/fetch.json";
-          fetchRetainedTranscriptCapacity = 0;
-          evaluateRetainedExecutionCapacity = 0;
-          fetchReplayMaxInFlight = 3;
           environmentFile = "/run/hellas/provider.env";
           gateway = {
             enable = true;
@@ -697,7 +652,7 @@ let
   managedContentProviderService = managedContentProvider.config.systemd.services.hellas;
   managedContentGatewayService = managedContentGateway.config.systemd.services.hellas-gateway;
   gatewayService = evaluated.config.systemd.services.hellas-gateway;
-  verifyLocalGatewayService = verifyLocalProxyGateway.config.systemd.services.hellas-gateway;
+  localGatewayService = localProxyGateway.config.systemd.services.hellas-gateway;
 in
 {
   provider-content-index-eval =
@@ -733,8 +688,6 @@ in
       ];
     assert lib.elem "/dev/kfd rw" service.serviceConfig.DeviceAllow;
     assert lib.elem "char-drm rw" service.serviceConfig.DeviceAllow;
-    assert lib.hasInfix "--execute-policy any" service.serviceConfig.ExecStart;
-    assert lib.hasInfix "--execute-policy none" defaultProviderService.serviceConfig.ExecStart;
     assert !(defaultProviderService.environment ? ROCM_PATH);
     assert !(defaultProviderService.environment ? HIP_PATH);
     assert !(lib.elem pkgs.rocmPackages.clang defaultProviderService.path);
@@ -756,35 +709,31 @@ in
     assert lib.hasInfix "--queue-size 0" service.serviceConfig.ExecStart;
     assert lib.hasInfix "--content-index /srv/hellas-index/content-index.bin"
       service.serviceConfig.ExecStart;
-    assert lib.hasInfix "--artifact-store-path /srv/hellas/artifacts" service.serviceConfig.ExecStart;
-    assert !(lib.hasInfix "--artifact-store-path" defaultProviderService.serviceConfig.ExecStart);
     assert lib.hasInfix "--assurance producer-signed" service.serviceConfig.ExecStart;
     assert lib.all (path: lib.elem path service.unitConfig.RequiresMountsFor) [
       "/var/lib/hellas/.hellas/identity-v3"
       "/srv/hellas/content"
       "/srv/hellas/content/smollm2.environment"
       "/srv/hellas-index/content-index.bin"
-      "/srv/hellas/artifacts"
       "/run/hellas/work.json"
       "/run/hellas/fetch.json"
       "/run/hellas/provider.env"
     ];
     assert
       service.serviceConfig.ReadWritePaths == [
-        "/srv/hellas/artifacts"
         "/srv/hellas-index"
       ];
     assert service.serviceConfig.ReadOnlyPaths == [ "/srv/hellas/content" ];
     assert !(lib.elem "/srv/hellas/content" service.serviceConfig.ReadWritePaths);
     assert
-      verifyLocalGatewayService.serviceConfig.ReadWritePaths == [
+      localGatewayService.serviceConfig.ReadWritePaths == [
         "/srv/hellas-gateway-index"
       ];
-    assert verifyLocalGatewayService.serviceConfig.ReadOnlyPaths == [ "/srv/hellas/content" ];
-    assert !(lib.elem "/srv/hellas/content" verifyLocalGatewayService.serviceConfig.ReadWritePaths);
-    assert verifyLocalGatewayService.environment.TMPDIR == "/run/hellas-gateway";
-    assert verifyLocalGatewayService.serviceConfig.RuntimeDirectory == "hellas-gateway";
-    assert verifyLocalGatewayService.serviceConfig.RuntimeDirectoryMode == "0700";
+    assert localGatewayService.serviceConfig.ReadOnlyPaths == [ "/srv/hellas/content" ];
+    assert !(lib.elem "/srv/hellas/content" localGatewayService.serviceConfig.ReadWritePaths);
+    assert localGatewayService.environment.TMPDIR == "/run/hellas-gateway";
+    assert localGatewayService.serviceConfig.RuntimeDirectory == "hellas-gateway";
+    assert localGatewayService.serviceConfig.RuntimeDirectoryMode == "0700";
     assert
       managedContentProviderService.serviceConfig.ReadOnlyPaths == [
         "/var/lib/hellas/content"
@@ -798,9 +747,6 @@ in
     assert service.serviceConfig.EnvironmentFile == "/run/hellas/provider.env";
     assert lib.hasInfix "--work-config /run/hellas/work.json" service.serviceConfig.ExecStart;
     assert lib.hasInfix "--fetch-config /run/hellas/fetch.json" service.serviceConfig.ExecStart;
-    assert lib.hasInfix "--fetch-retained-transcript-capacity 0" service.serviceConfig.ExecStart;
-    assert lib.hasInfix "--evaluate-retained-execution-capacity 0" service.serviceConfig.ExecStart;
-    assert lib.hasInfix "--fetch-replay-max-in-flight 3" service.serviceConfig.ExecStart;
     assert
       (builtins.length (lib.splitString "--retries" gatewayService.serviceConfig.ExecStart) - 1) == 1;
     assert lib.hasInfix "--responses-fetch-execution-environment openai-responses"
@@ -821,15 +767,11 @@ in
     assert !(runtimeStoreAssertion storePathTokenizerGateway).assertion;
     assert !(runtimeStoreAssertion storePathIdentityProvider).assertion;
     assert !(runtimeStoreAssertion storePathContentProvider).assertion;
-    assert !(runtimeStoreAssertion storePathArtifactStore).assertion;
-    assert !(runtimeStoreAssertion contextualArtifactStore).assertion;
-    assert !relativeArtifactStore.success;
     assert !(runtimeStoreAssertion storePathWorkConfig).assertion;
     assert !(runtimeStoreAssertion storePathFetchConfig).assertion;
     assert !(runtimeStoreAssertion storePathProviderEnvironmentFile).assertion;
     assert !(serveExtraArgsAssertion unsafeServeExtraArgs).assertion;
     assert !(serveExtraArgsAssertion unsafeServeAssuranceArgs).assertion;
-    assert !(serveExtraArgsAssertion unsafeServeArtifactStoreArgs).assertion;
     assert !(gatewayExtraArgsAssertion unsafeGatewayExtraArgs).assertion;
     assert (serveExtraArgsAssertion harmlessExtraArgs).assertion;
     assert !(providerAssuranceAssertion unsupportedProviderApple).assertion;
@@ -839,26 +781,8 @@ in
     assert !(memoryHeadroomAssertion insufficientMemoryHeadroom).assertion;
     assert !(memoryHeadroomAssertion insufficientDefaultMemoryHeadroom).assertion;
     assert !(readinessContentAssertion readinessWithoutContent).assertion;
-    assert !(writableRootAssertion rootArtifactStoreProvider).assertion;
     assert !(writableRootAssertion rootContentIndexGateway).assertion;
-    assert !(writableContentDisjointAssertion overlappingArtifactStoreProvider).assertion;
     assert !(writableContentDisjointAssertion overlappingContentIndexGateway).assertion;
-    assert !invalidEmptyPolicyList.success;
-    assert !invalidBogusPolicy.success;
-    assert !invalidPaddedNonePolicy.success;
-    assert !invalidEmptyOnlyPolicy.success;
-    assert !invalidEmptyGlobPolicy.success;
-    assert !invalidCharacterGlobPolicy.success;
-    assert !invalidLongGlobPolicy.success;
-    assert !invalidEmptyListGlobPolicy.success;
-    assert validAnyPolicyProvider.config.systemd.services.hellas.serviceConfig ? LimitMEMLOCK;
-    assert !(validNonePolicyProvider.config.systemd.services.hellas.serviceConfig ? LimitMEMLOCK);
-    assert validOnlyPolicyProvider.config.systemd.services.hellas.serviceConfig ? LimitMEMLOCK;
-    assert validListPolicyProvider.config.systemd.services.hellas.serviceConfig ? LimitMEMLOCK;
-    assert lib.hasInfix "only(0123*,abcdef)"
-      validOnlyPolicyProvider.config.systemd.services.hellas.serviceConfig.ExecStart;
-    assert lib.hasInfix "only(0123*,abcdef)"
-      validListPolicyProvider.config.systemd.services.hellas.serviceConfig.ExecStart;
     assert !(runtimeStoreAssertion storePathReadinessProvider).assertion;
     assert lib.hasInfix "--gpu-session-asset-bytes 4398046511104"
       maxGpuSessionAssetBytes.config.systemd.services.hellas.serviceConfig.ExecStart;
@@ -920,10 +844,6 @@ in
         "/Users/hellas/Library/Application Support/Hellas/identity"
         "--port"
         "31145"
-        "--execute-policy"
-        "none"
-        "--artifact-store-path"
-        "/Users/hellas/Library/Application Support/Hellas/artifacts"
         "--assurance"
         "apple-app-attest"
         "--fetch-config"
@@ -939,8 +859,6 @@ in
         "/Users/hellas/.hellas/identity"
         "--port"
         "31145"
-        "--execute-policy"
-        "none"
         "--assurance"
         "producer-signed"
       ];
@@ -948,9 +866,6 @@ in
     assert (homeManagerRuntimeStoreAssertion homeManagerDarwinServe).assertion;
     assert !(homeManagerRuntimeStoreAssertion homeManagerDarwinStoreIdentity).assertion;
     assert !(homeManagerRuntimeStoreAssertion homeManagerDarwinStoreContent).assertion;
-    assert !(homeManagerRuntimeStoreAssertion homeManagerDarwinStoreArtifactStore).assertion;
-    assert !(homeManagerRuntimeStoreAssertion homeManagerDarwinContextualArtifactStore).assertion;
-    assert !homeManagerDarwinRelativeArtifactStore.success;
     assert !(homeManagerRuntimeStoreAssertion homeManagerDarwinStoreWorkConfig).assertion;
     assert !(homeManagerRuntimeStoreAssertion homeManagerDarwinStoreFetchConfig).assertion;
     assert !(homeManagerRuntimeStoreAssertion homeManagerDarwinStoreEnvironmentFile).assertion;
@@ -968,7 +883,17 @@ in
     assert !homeManagerNixPathEnvironmentFile.success;
     assert !(providerAssertion discoveryGateway).assertion;
     assert (providerAssertion proxyOnlyGateway).assertion;
-    assert !(providerAssertion verifyLocalProxyGateway).assertion;
+    assert (gatewayModelAssertion proxyOnlyGateway).assertion;
+    assert (gatewayModelAssertion discoveryGateway).assertion;
+    assert !(gatewayModelAssertion nativeGatewayWithoutModel).assertion;
+    assert !(gatewayModelAssertion localProxyWithoutModel).assertion;
+    assert !(gatewayModelAssertion gatewayWithoutEnvironment).assertion;
+    assert !(gatewayModelAssertion gatewayWithoutTokenizer).assertion;
+    assert
+      !(lib.hasInfix "--environment" proxyOnlyGateway.config.systemd.services.hellas-gateway.serviceConfig.ExecStart);
+    assert
+      !(lib.hasInfix "--tokenizer" proxyOnlyGateway.config.systemd.services.hellas-gateway.serviceConfig.ExecStart);
+    assert (providerAssertion localProxyGateway).assertion;
     pkgs.runCommand "hellas-provider-content-index-module-eval" { } ''
       umask 077
       environment_file="$PWD/provider.env"

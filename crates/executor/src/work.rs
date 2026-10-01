@@ -107,7 +107,7 @@ async fn drain_transcript_with_progress(
     outcome: crate::executor::ExecuteOutcome,
     progress: Option<PaidProgress>,
 ) -> Result<Vec<OutputEventEnvelope>, ExecutorError> {
-    use hellas_rpc::pb::execute::work_event;
+    use hellas_rpc::execution_event::work_event;
 
     let mut events = outcome.events;
     let mut transcript = Vec::new();

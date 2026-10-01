@@ -1,11 +1,5 @@
 //! Argument parsers for the CLI's clap definitions.
 
-#[cfg(feature = "node")]
-pub(crate) fn parse_public_key_hex(s: &str) -> Result<hellas_rpc::PublicKey, String> {
-    let bytes = parse_hex_array::<33>(s)?;
-    Ok(hellas_rpc::PublicKey::Secp256k1(bytes))
-}
-
 pub(crate) fn parse_hex_array<const N: usize>(s: &str) -> Result<[u8; N], String> {
     if s.len() != N * 2 {
         return Err(format!("expected {} hex chars, got {}", N * 2, s.len()));
@@ -24,6 +18,7 @@ pub(crate) fn parse_content_id_hex(s: &str) -> Result<hellas_rpc::ContentId, Str
         .map_err(|error| format!("invalid ContentId: {error}"))
 }
 
+#[cfg(feature = "gateway")]
 pub(crate) fn parse_fetch_environment(s: &str) -> Result<hellas_rpc::ContentId, String> {
     match s {
         "codex-responses" => Ok(hellas_rpc::FetchEnvironment::CodexResponses.manifest_id()),

@@ -122,18 +122,11 @@ accounts. In the CLI's Fetch route file, use:
 }
 ```
 
-The normal route file still needs its `routes` and `callers` envelope. Paid
-channels use their payment policy for admission; Courtesy callers use explicit
-route grants. On Gate's Run page, `http` is accepted as the execution environment.
+The route file wraps entries in `routes`; the former `callers` field is
+rejected. Work payment channels authorize jobs and charge their fixed price.
 For CLI paid requests, `paid-work prepare-fetch --execution-environment http`
-prints the manifest ID to put in the work config.
-
-Generic HTTP responses carry no token usage, so a successful courtesy `http`
-request settles zero billable units: courtesy spend quotas (`max_units` per
-window) never accumulate on `http` routes, only concurrency is bounded. Paid
-channels are unaffected — they charge the payment policy's fixed price per job.
-If courtesy callers reach provider-funded accounts, bound their exposure with
-`fetch_max_in_flight`/queue limits, or require a paid channel.
+prints the manifest ID to put in the work config. Unpaid provider access is
+unsupported until grant funding is implemented.
 
 Results contain one `Adaptor.Http.Head` event followed by base64 body events
 and a signed terminal. Hop-by-hop and framing headers (`connection`,

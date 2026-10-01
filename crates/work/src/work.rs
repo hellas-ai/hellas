@@ -1725,7 +1725,7 @@ impl BackendFault {
 /// All six bodies come from the same strictly decoded [`hellas_rpc::protocol::artifacts::PreparedPaidInputV1`]
 /// whose digest the parties signed. Keeping the execution, tokens, policy, and
 /// identity here is what lets a backend run after restart without depending on
-/// transient Courtesy state. Environment bytes remain content-store data below
+/// transient executor state. Environment bytes remain content-store data below
 /// the manifest root and do not cross this seam.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PreparedEvaluateInput {

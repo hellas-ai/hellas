@@ -34,18 +34,13 @@ checks and transformation ran, not that the remote service's claims are true.
 
 A platform-backed Assurance authenticates the Fetch application. The
 `ProducerSigned` mode authenticates only the producer key and signed transcript;
-it does not authenticate a running binary. The Responses-facing `store` switch
-controls Hellas Courtesy transcript retention. The upstream call made by the
-attested app is always stateless and sends `store=false`. This first sealed adaptor accepts text
-and client-executed function tools; it rejects provider-account references,
-provider-side tools, file/image inputs, and unknown top-level fields.
+it does not authenticate a running binary. The sealed Responses adaptor sends
+`store=false` upstream and accepts text and client-executed function tools.
 
-Retention is opt-in. `--retain` (or a request-level `retain=true` / `store=true`)
-publishes prompt- and token-bearing artifacts through content-addressed Courtesy
-`GetArtifact`; a digest is an address, not an authorization capability. Omission
-keeps the execution ephemeral. This is not a deletion promise for an accepted paid job: the signed
-prepared input remains in that channel's recovery/evidence journal as required
-to resume safely after a crash.
+Work is the execution protocol, using payment-funded channels. Owner execution
+requires a grant; selecting a machine or an unpaid route returns `OwnerGrantRequired`.
+Work-side local reproduction is available. Accepted paid inputs and results stay
+in the channel's recovery/evidence journal, independently of gateway archives.
 
 ## Causal-LM environments
 
@@ -68,7 +63,7 @@ hellas-cli environment verify \
   --content-index /var/lib/hellas/content.index
 ```
 
-For `llm` and `gateway`, the caller selects the environment trust anchor before
+For `gateway`, the caller selects the environment trust anchor before
 any route starts. By default, the exact local `--environment` file bytes are
 that anchor and the CLI derives their manifest ID. When a manifest ID was
 distributed separately, pass `--manifest-id <CONTENT_ID>`; a file deriving
@@ -80,15 +75,14 @@ satisfiable supported environment; it need not register a model name:
 
 ```sh
 hellas-cli --software-root serve \
-  --execute-policy any \
+  --work-config /run/hellas/work.json \
   --content-root /srv/hellas/content
 ```
 
-`QuoteTokens` strictly decodes the submitted manifest. The first binding opens
+Work execution strictly decodes the submitted manifest. The first binding opens
 its root by exact local content ID and verifies every declared program/static
-object; later quotes for that exact manifest may reuse the immutable verified
-binding without reopening or rehashing those files. Quoting neither fetches nor
-compiles. The authorized worker is the final availability and integrity
+object; later executions for that exact manifest may reuse the immutable verified
+binding without reopening or rehashing those files. Binding does not acquire content. The authorized worker is the final availability and integrity
 boundary: before nonresident content enters the safe runtime, it reopens the
 descriptor and enforces the exact ID and length; an already-resident exact
 mapping is reused. The provider then compiles the Catena source for its visible
@@ -100,7 +94,7 @@ Providers independently bound compilation with `--gpu-compile-timeout-secs`
 and each complete generation with `--gpu-execution-timeout-secs`; expiry kills
 the isolated worker process group and the next request starts a fresh session.
 `--gpu-max-generation-capacity` is additionally capped at 524288 tokens so a
-retained token transcript fits Hellas's 4 MiB unary artifact transport.
+token transcripts stay within the canonical artifact size bound.
 
 Indexed provider content is an immutable local-cache assumption. Hellas pins
 the verified read-only descriptor and detects path/inode replacement; it does
@@ -114,83 +108,12 @@ selects the trusted adaptor, fixed official endpoint, no-redirect HTTP driver,
 and response projector as one unit. A configuration cannot supply a URL or
 claim a different adaptor identity.
 
-For an OpenAI Responses route, first create the caller identity and obtain its
-producer public key:
-
-```sh
-hellas-cli --identity caller.identity --software-root identity init
-CALLER_KEY=$(hellas-cli --identity caller.identity producer-key show |
-  awk '$1 == "public_key:" { print $2 }')
-export CALLER_KEY
-export OPENAI_API_KEY='<provider-local credential>'
-```
-
-Write `fetch.json`; the model/output limits shown are optional:
-
-```json
-{
-  "routes": [{
-    "service": "openai",
-    "method": "responses",
-    "destination": {
-      "type": "openai-responses",
-      "api_key_env": "OPENAI_API_KEY"
-    },
-    "capabilities": {
-      "models": ["gpt-5.5"],
-      "max_output_tokens": 4096
-    }
-  }],
-  "callers": [{
-    "public_key": "REPLACE_WITH_CALLER_KEY",
-    "routes": [{
-      "service": "openai",
-      "method": "responses",
-      "models": ["gpt-5.5"],
-      "max_output_tokens": 512
-    }]
-  }]
-}
-```
-
-Replace `REPLACE_WITH_CALLER_KEY` with `$CALLER_KEY`, then start the provider
-and obtain its node and enrollment IDs through a trusted channel:
-
-```sh
-hellas-cli --identity provider.identity --software-root identity init
-NODE_ID=$(hellas-cli --identity provider.identity identity show-node-id)
-ENROLLMENT_ID=$(hellas-cli --identity provider.identity identity show-enrollment-id)
-
-hellas-cli --identity provider.identity --software-root serve \
-  --port 49152 \
-  --fetch-config fetch.json
-```
-
-The OpenAI sealed manifest ID is
-`a4ff1dbe22fe5d6888258bd95d21a288855c11d40b59c86ad834ab747033e8e8`.
-Run one strict provider-shaped request from another terminal:
-
-```sh
-hellas-cli --identity caller.identity --software-root fetch "$NODE_ID" \
-  --node-addr 127.0.0.1:49152 \
-  --provider "$ENROLLMENT_ID" \
-  --service openai \
-  --method responses \
-  --execution-environment openai-responses \
-  --payload '{"model":"gpt-5.5","input":"Say hello","stream":true,"store":false,"max_output_tokens":32}'
-```
-
-Output is JSON Lines of semantic response events followed by one terminal
-event; raw upstream SSE is never the signed result. The caller's exact input
-bytes are signed, but the trusted app parses and reconstructs a fresh upstream
-body before egress. Open, ticket creation, execution, and output-key
-verification all remain on the same confidentially opened transport.
-
-The Codex alternative uses destination type `codex-responses`, a local
-`auth_path` populated by `hellas-cli codex-auth login`, and sealed manifest ID
-`82ebed7724b614bfcca6082924710098821cafc95789f136f770667e16ef9785`.
-In both cases, `ProducerSigned` proves only the key and transcript. Claiming the
-trusted app itself requires a platform-backed assurance.
+A provider route file contains a `routes` array. Each route has `service`,
+`method`, `destination` and optional `capabilities` (model and output limits).
+The former `callers` field is rejected; the mounted Work channel authorizes jobs.
+Use `serve --fetch-config FILE --work-config FILE` to mount paid execution.
+See [paid Work](crates/work/README.md) for channel configuration and
+[HTTPS Fetch](crates/providers/HTTPS.md) for provider credentials and egress.
 
 ## HTTP gateway
 
@@ -202,14 +125,9 @@ The causal-LM gateway requires the same canonical environment and an explicit
 presentation tokenizer. `--model` is only an API response label; when omitted,
 the manifest ID is used.
 
-```sh
-hellas-cli --software-root gateway \
-  --local \
-  --environment smollm2.environment \
-  --content-root /srv/hellas/content \
-  --tokenizer /srv/hellas-presentation/tokenizer.json \
-  --model smollm2-135m
-```
+Configure a funded pool using the [paid gateway guide](docs/paid-gateway.md),
+then pass `--paid-work-config POOL` together with `--environment` and
+`--tokenizer`.
 
 It binds loopback by default. Non-loopback listening requires `--allow-remote`
 and `--bearer-token-file FILE`; the private credential file is created once and
@@ -217,8 +135,8 @@ reused across restarts. Without a file, a fresh credential is shown on the
 controlling terminal. The causal-LM backend accepts plain text at
 `/v1/completions` and `/v1/responses`. Set `--chat-template` to enable the shared
 model adapter for chat, reasoning and tool calls supported by that model.
-The proxy and attested Fetch Responses backends have their own explicit
-semantics. `--responses-backend` changes only `/v1/responses`; every other
+The proxy Responses backend retains its explicit upstream semantics.
+`--responses-backend` changes only `/v1/responses`; every other
 route remains bound to the causal-LM environment, so `--environment` and
 `--tokenizer` are still required.
 
@@ -327,7 +245,7 @@ The NixOS module provisions the matching toolchain and device access:
 ```nix
 services.hellas = {
   enable = true;
-  executePolicy = "any";
+  workConfigFile = "/srv/hellas/work.json";
   gpuBackend = "cuda"; # or "hip" / "auto"
   contentRoots = [ "/srv/hellas/content" ];
 };
@@ -341,16 +259,8 @@ provider-local secrets such as `OPENAI_API_KEY`. Do not put either file in a
 Nix expression or in the store. In particular, never interpolate the file as a
 Nix path and never use `builtins.readFile` on it: both operations expose its
 contents during evaluation, before any module assertion or runtime validation
-can protect it. Retained Fetch evidence is bounded across both
-completed transcripts and indeterminate running markers by
-`fetchRetainedTranscriptCapacity` (default 1024; zero disables new retention).
-`fetchReplayMaxInFlight` separately bounds replay consumers (default 16), and a
-slot remains occupied until its event stream is drained or dropped. The
-retention capacity is persisted per transcript-store root so processes sharing
-one root cannot disagree. Stop every such process before changing the capacity
-or removing its metadata; existing transcripts and running markers are never
-deleted, and an already over-cap root still starts and replays while refusing
-new retention.
+can protect it. Paid Fetch uses metadata-only journals; see
+[provider retention](crates/work/README.md).
 
 On Darwin, the Home Manager launch agent remains network-only but supports the
 same runtime-secret boundary:
@@ -360,6 +270,7 @@ programs.hellas = {
   enable = true;
   serve = {
     enable = true;
+    workConfigFile = "/Users/alice/.config/hellas/work.json";
     fetchConfigFile = "/Users/alice/.config/hellas/fetch.json";
     environmentFile = "/Users/alice/.config/hellas/provider.env";
   };
@@ -380,14 +291,6 @@ check stop the agent before Hellas runs. The launchd plist contains the absolute
 file path, never its contents. As above, never use Nix interpolation or
 `builtins.readFile` for this file; validation cannot undo an evaluation-time
 secret leak.
-
-Retained Evaluate artifacts are separately bounded by
-`evaluateRetainedExecutionCapacity` (default 1024; zero disables new retained
-completions). Each unique execution reserves one persistent slot before its
-graph is published; a crash can leave that slot and up to eight canonical
-objects behind, but cannot grow the store past the configured execution bound.
-The Evaluate root is exclusively locked for the provider lifetime, and its
-capacity metadata must match on every restart.
 
 Work on the kernel Quint models:
 
@@ -435,84 +338,22 @@ owner. HIP resident sharing requires version 7.15 or newer.
 
 ## Inference cache and reproducible agent runs
 
-Inference reuse is opt-in: `--output-cache off` (the default), `record`
-(reuse the first successful result, record misses), or `replay-only` (fail
-on a miss without inference). These are local trust-on-first-use recordings,
-independent of the protocol's public `--retain` setting. Enabling recording
-persists inference outputs even for otherwise ephemeral requests.
+The gateway retains its local inference archive: `--output-cache off`, `record`
+(reuse complete successful results and record misses), or `replay-only` (fail
+on misses without execution). Paid completion and payment acknowledgement finish
+before a successful result is recorded. Proxy requests also support recording.
+The executor's separate replay cache and the cache administration RPC/CLI have
+been removed.
 
-Caching applies to native CLI/library execution, gateway requests, and executor
-requests from uncached clients. Executor replay verifies its original signed
-evidence before signing for the new ticket; client replay preserves provenance.
-Only complete successful streams are recorded, and recording failures are
-reported rather than silently losing the material required for later replay.
-
-| Kind | Input identity |
-| --- | --- |
-| Evaluate | Catena execution identity: environment, input state, prompt token IDs and decode policy |
-| Responses proxy | Endpoint and effective forwarded body after model/stream normalization |
-| Inference Fetch | Sealed Responses environment, service, method and body, excluding caller signatures |
-
-General Fetch operations bypass recording and are refused in replay-only mode.
-Agent tool execution is not cached. Shadow verification requires live execution.
-
-The cache uses the existing Hellas store (`--store-dir`, `HELLAS_STORE_DIR`,
-or `~/.hellas/store`): Xet-addressed objects and a DAG-CBOR inference index.
-One process owns the writable index; administer its live store through RPC.
-Offline read-only opens are snapshots. Clear/remove/prune remove mappings, not
-shared objects or executor ticket history, and prevent older in-flight work
-from republishing. Replay-only administration is read-only.
-
-Client-side Fetch recordings (CLI/gateway) share keys with executor recordings,
-but omit the signed evidence required for executor replay. Reusing that store
-with `serve` can therefore fail with a missing `signed` field, in both `record`
-and `replay-only` modes; invalid entries never trigger live fallback. Remove
-the affected entry with
-`hellas-cli output-cache --kind fetch --key "$IDENTITY" remove`, then let the
-executor record it afresh. For a running writer, add `--socket` or `--node-id`
-as described below. Executor recordings remain readable by clients.
+The archive uses the existing Hellas store (`--store-dir`, `HELLAS_STORE_DIR`,
+or `~/.hellas/store`). One process owns a writable index. Stop the writer before
+copying a complete store snapshot for offline replay. Recording persists payloads
+and is incompatible with gateway ZDR mode. Agent tool execution is not cached.
 
 ```sh
 hellas-cli --output-cache record gateway --responses-backend proxy --wrap opencode
 hellas-cli --output-cache replay-only gateway --responses-backend proxy --wrap opencode
-hellas-cli output-cache --kind proxy list
-hellas-cli output-cache --kind proxy --key "$IDENTITY" show
-hellas-cli output-cache --json stats
-hellas-cli output-cache --kind proxy prune --max-entries 1000 --dry-run
-hellas-cli output-cache export --to ./agent-recordings
 ```
-
-Control is ordinary transport-independent RPC with separate admin grants.
-For an owner-only Unix socket (also supported by `serve`):
-
-```sh
-mkdir -m 700 ./hellas-control
-hellas-cli --output-cache record --control-socket ./hellas-control/control.sock \
-  gateway --responses-backend proxy
-hellas-cli output-cache --socket ./hellas-control/control.sock --kind proxy clear
-```
-
-For remote node administration, explicitly allow the administrator's Iroh node
-ID, then use that administrator's existing identity to connect:
-
-```sh
-hellas-cli --output-cache record serve --admin-peer "$ADMIN_NODE_ID"
-hellas-cli --identity ./admin.identity output-cache --node-id "$NODE_ID" clear
-```
-
-All management commands accept either `--socket` or `--node-id` (with optional
-`--node-addr`); `reset` aliases `clear`. Without either they operate offline.
-Remote admin is disabled by default and is not publicly advertised. An
-authenticated peer is not an administrator unless explicitly granted access.
-An admin grant permits reading/exporting every cached transcript as well as
-clearing it; those transcripts may contain private prompts, source, or outputs.
-
-Embedders compose `CacheControlServer(CacheController)` with `Authorized` and
-`AdminPolicy`, reusing the existing dispatcher and carriers. WebSocket and
-serial hosts must authenticate their connection before supplying its identity;
-raw connectivity grants nothing. The shared framed byte-stream adapter also
-accepts serial I/O. Unix checks OS ownership; its socket is mode `0600` under
-an owner-only directory, and existing paths are not overwritten.
 
 For a Linux Nix agent build, use the overlay's `pkgs.hellasLib.agent` helpers:
 
@@ -536,7 +377,7 @@ in {
 ```
 
 Run the recorder executable with a writable store directory outside the Nix
-build, with provider credentials in its runtime environment. Export a snapshot
+build, with provider credentials in its runtime environment. Stop the writer, copy a complete store snapshot,
 and use it as `cache`. `mkAgentRun` starts a replay-only gateway inside the
 sandbox, runs OpenCode, and returns its resulting workspace. Both phases use
 `/build/workspace`, the same pinned tools/configuration, and an explicit system

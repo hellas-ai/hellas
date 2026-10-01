@@ -9,7 +9,7 @@ prompt prefixes, then serializes requests within each channel.
 With `--http-fetch-config`, the same pool carries HTTP Fetch requests. Its work
 config must select the HTTP Fetch manifest and a matching Fetch route policy;
 see [HTTP routing](http-gateway.md). The HTTP router chooses the provider and
-account, so this path never falls back to a different provider or Courtesy.
+account, so this path never falls back to a different provider or funding source.
 
 Paid Fetch extends the Work/WorkSetup service descriptors and the StreamResult
 response schema. Upgrade gateways and providers together: older peers reject

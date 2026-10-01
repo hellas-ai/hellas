@@ -42,10 +42,6 @@ let
   );
   providerWritablePaths = lib.unique (
     lib.optional (
-      cfg.artifactStorePath != null
-      && outsideManagedRoots providerManagedWritableRoots cfg.artifactStorePath
-    ) (normalizeRuntimePath cfg.artifactStorePath)
-    ++ lib.optional (
       cfg.contentIndex != null
       && outsideManagedRoots providerManagedWritableRoots (
         builtins.dirOf (normalizeRuntimePath cfg.contentIndex)
@@ -72,7 +68,7 @@ let
     writable: lib.all (content: !pathsOverlap writable content) gatewayContentPaths
   ) gatewayWritablePaths;
   providerCatenaConfigured = hellas.catenaConfigured cfg || cfg.readinessEnvironments != [ ];
-  providerLocalExecutionEnabled = hellas.executePolicyEnablesCatena cfg.executePolicy;
+  providerLocalExecutionEnabled = cfg.workConfigFile != null && hellas.catenaConfigured cfg;
   providerGpuConfigured = hellas.catenaPlatform pkgs && providerLocalExecutionEnabled;
   defaultGpuSessionAssetBytes = 128 * 1024 * 1024 * 1024;
   effectiveGpuSessionAssetBytes =
@@ -125,16 +121,13 @@ let
   ++ cfg.contentRoots
   ++ cfg.readinessEnvironments
   ++ lib.optional (cfg.contentIndex != null) cfg.contentIndex
-  ++ lib.optional (cfg.artifactStorePath != null) cfg.artifactStorePath
   ++ lib.optional (cfg.workConfigFile != null) cfg.workConfigFile
   ++ lib.optional (cfg.fetchConfigFile != null) cfg.fetchConfigFile
   ++ lib.optional (cfg.environmentFile != null) cfg.environmentFile;
   gatewayRuntimePaths = lib.optionals gateway.enable (
-    [
-      gateway.causalLmEnvironment
-      gateway.tokenizer
-      gateway.identityPath
-    ]
+    lib.optional (gateway.causalLmEnvironment != null) gateway.causalLmEnvironment
+    ++ lib.optional (gateway.tokenizer != null) gateway.tokenizer
+    ++ [ gateway.identityPath ]
     ++ gateway.content
     ++ gateway.contentRoots
     ++ lib.optional (gateway.contentIndex != null) gateway.contentIndex
@@ -252,7 +245,7 @@ in
           closures must verify before the provider starts. Each environment
           must also be discoverable through content or contentRoots; the path
           is not an implicit content source. This is a readiness baseline,
-          never an execution allowlist: executePolicy still governs admission
+          never an execution allowlist: Work funding governs admission
           of every locally satisfiable environment. Routine startup trusts the
           persistent content index and does not re-hash unchanged large assets.
         '';
@@ -292,7 +285,7 @@ in
       }
       {
         assertion = !cfg.enable || lib.all (path: path != "/") providerWritablePaths;
-        message = "services.hellas artifactStorePath and the parent of contentIndex must not expose the filesystem root as writable.";
+        message = "services.hellas the parent of contentIndex must not expose the filesystem root as writable.";
       }
       {
         assertion = !gateway.enable || lib.all (path: path != "/") gatewayWritablePaths;
@@ -300,7 +293,7 @@ in
       }
       {
         assertion = !cfg.enable || providerWritablePathsAreDisjoint;
-        message = "services.hellas external artifactStorePath and contentIndex parent must be dedicated writable locations outside content and contentRoots.";
+        message = "services.hellas external contentIndex parent must be dedicated writable locations outside content and contentRoots.";
       }
       {
         assertion = !gateway.enable || gatewayWritablePathsAreDisjoint;
@@ -323,45 +316,37 @@ in
         message = "services.hellas.gateway.extraArgs may not override module-managed runtime, content, identity, trust, or configuration flags; use the corresponding option instead.";
       }
       {
+        assertion = hellas.catenaPlatform pkgs || (!providerCatenaConfigured && !gateway.local);
+        message = "Local Catena execution is supported only on x86_64-linux; omit content, contentRoots, contentIndex, GPU resource bounds, gateway.local on this platform.";
+      }
+      {
         assertion =
-          hellas.catenaPlatform pkgs || (!providerCatenaConfigured && !gateway.local && !gateway.verifyLocal);
-        message = "Local Catena execution is supported only on x86_64-linux; use executePolicy = \"none\" and omit content, contentRoots, contentIndex, GPU resource bounds, gateway.local, and gateway.verifyLocal on this platform.";
+          !gateway.enable
+          || (
+            (gateway.causalLmEnvironment == null) == (gateway.tokenizer == null)
+            && (gateway.causalLmEnvironment != null || (!gateway.local && gateway.responsesBackend != "hellas"))
+          );
+        message = "services.hellas.gateway.causalLmEnvironment and tokenizer must be set together and are required for native inference.";
       }
       {
         assertion = gateway.nodeAddrs == [ ] || gateway.nodeId != null;
         message = "services.hellas.gateway.nodeAddrs requires services.hellas.gateway.nodeId.";
       }
       {
-        assertion =
-          !gateway.local
-          || (gateway.nodeId == null && gateway.nodeAddrs == [ ] && gateway.verifyNodeId == null);
-        message = "services.hellas.gateway.local cannot be combined with direct or verification node ids.";
+        assertion = !gateway.local || (gateway.nodeId == null && gateway.nodeAddrs == [ ]);
+        message = "services.hellas.gateway.local cannot be combined with direct node ids.";
       }
       {
-        assertion = !(gateway.local && gateway.verifyLocal);
-        message = "services.hellas.gateway.local and services.hellas.gateway.verifyLocal are mutually exclusive.";
+        assertion = gateway.local || (gateway.content == [ ] && gateway.contentRoots == [ ]);
+        message = "services.hellas.gateway.content and contentRoots are only valid for local execution.";
       }
       {
-        assertion = !(gateway.verifyLocal && gateway.verifyNodeId != null);
-        message = "services.hellas.gateway.verifyLocal and services.hellas.gateway.verifyNodeId are mutually exclusive.";
+        assertion = gateway.local || gateway.contentIndex == null;
+        message = "services.hellas.gateway.contentIndex is only valid for local execution.";
       }
       {
-        assertion =
-          gateway.local || gateway.verifyLocal || (gateway.content == [ ] && gateway.contentRoots == [ ]);
-        message = "services.hellas.gateway.content and contentRoots are only valid for local execution or local verification.";
-      }
-      {
-        assertion = gateway.local || gateway.verifyLocal || gateway.contentIndex == null;
-        message = "services.hellas.gateway.contentIndex is only valid for local execution or local verification.";
-      }
-      {
-        assertion =
-          !(gateway.local || gateway.verifyLocal) || gateway.content != [ ] || gateway.contentRoots != [ ];
-        message = "services.hellas.gateway local execution and verification require content or contentRoots.";
-      }
-      {
-        assertion = gateway.verifyNodeId == null || gateway.nodeId != null;
-        message = "services.hellas.gateway.verifyNodeId requires services.hellas.gateway.nodeId.";
+        assertion = !gateway.local || gateway.content != [ ] || gateway.contentRoots != [ ];
+        message = "services.hellas.gateway local execution require content or contentRoots.";
       }
       {
         assertion =
@@ -371,25 +356,24 @@ in
           || gateway.local
           || (
             gateway.responsesBackend == "proxy"
-            && !gateway.verifyLocal
+
             && gateway.nodeId == null
-            && gateway.verifyNodeId == null
+
           );
-        message = "services.hellas.gateway.provider is required by courtesy remote execution; a paid gateway uses its paidWorkConfig channel identities.";
+        message = "services.hellas.gateway.provider is required by remote execution pending grant funding; a paid gateway uses its paidWorkConfig channel identities.";
       }
       {
         assertion =
           gateway.paidWorkConfig == null
           || (
             !gateway.local
-            && !gateway.verifyLocal
-            && gateway.verifyNodeId == null
+
             && gateway.nodeId == null
             && gateway.provider == null
             && gateway.responsesBackend == "hellas"
             && gateway.assurance == "producer-signed"
           );
-        message = "services.hellas.gateway.paidWorkConfig requires remote producer-signed Hellas execution without courtesy target or verification overrides.";
+        message = "services.hellas.gateway.paidWorkConfig requires remote producer-signed Hellas execution without target overrides.";
       }
       {
         assertion =
@@ -505,7 +489,7 @@ in
       unitConfig = lib.optionalAttrs (gatewayRuntimePaths != [ ]) {
         RequiresMountsFor = gatewayRuntimePaths;
       };
-      path = lib.optionals (gateway.local || gateway.verifyLocal) gpuPackages;
+      path = lib.optionals gateway.local gpuPackages;
       environment = hellas.renderEnvironment (
         hellas.mkOtelEnv {
           inherit lib;
@@ -515,7 +499,7 @@ in
         // {
           HOME = "/var/lib/hellas-gateway";
         }
-        // lib.optionalAttrs (gateway.local || gateway.verifyLocal) (
+        // lib.optionalAttrs gateway.local (
           {
             # Local Catena execution dlopens generated shared objects, which
             # cannot live below DynamicUser's noexec CacheDirectory.
@@ -553,7 +537,7 @@ in
         # unit's systemd-managed writable directories.
         ReadOnlyPaths = gatewayContentPaths;
       }
-      // lib.optionalAttrs (gateway.local || gateway.verifyLocal) (
+      // lib.optionalAttrs gateway.local (
         {
           RuntimeDirectory = "hellas-gateway";
           RuntimeDirectoryMode = "0700";

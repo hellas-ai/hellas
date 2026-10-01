@@ -21,7 +21,7 @@ pub use iroh;
 mod remote;
 #[cfg(feature = "gateway")]
 pub use hellas_gateway as gateway;
-#[cfg(feature = "provider")]
+#[cfg(feature = "paid-provider")]
 mod provider;
 #[cfg(feature = "provider")]
 pub use hellas_executor::{FetchRoute, FetchRouteEntry, FetchRoutePolicy, FetchRouteRegistry};
@@ -31,20 +31,19 @@ pub use hellas_kernel as kernel;
 pub use hellas_providers::{
     HttpProviderConfig, OpenAiResponsesFetchProvider, ResponsesFetchAdaptorFactory,
 };
-#[cfg(feature = "provider")]
+#[cfg(feature = "paid-provider")]
 pub use provider::{
     FetchProviderOptions, OpenAiProviderOptions, ProviderError, ProviderHandle,
     start_fetch_provider, start_openai_provider,
 };
 #[cfg(feature = "client")]
-pub use remote::{ClientIdentity, HellasClient, RemoteFetchRequest};
+pub use remote::ClientIdentity;
 
 #[cfg(all(
     feature = "local-control",
     any(all(unix, not(target_os = "espidf")), windows)
 ))]
 pub mod local {
-    pub use hellas_rpc::cache::control::CacheController;
     pub use hellas_wire::local::{LOCAL_MUX_SLOTS, LocalControlServer, connect, transport};
 }
 

@@ -46,7 +46,7 @@ pub trait FetchProvider: Send + Sync + 'static {
     fn run(&self, request: PreparedFetchRequest) -> FetchProviderFuture<'_>;
 }
 
-/// Caller-signed adaptor input retained with a quote. It is never accepted by
+/// Caller-signed adaptor input bound into a Work input. It is never accepted by
 /// a [`FetchProvider`]; only a trusted adaptor can turn it into provider wire.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FetchCall {

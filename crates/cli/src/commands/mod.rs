@@ -4,21 +4,18 @@ use anyhow::Context as _;
 use std::path::Path;
 use std::time::Duration;
 
-pub mod artifact;
 #[cfg(feature = "chain")]
 pub mod chain;
 pub(crate) mod codex_auth;
 #[cfg(feature = "node")]
 pub(crate) mod discovery;
 pub mod environment;
-pub mod fetch;
+#[cfg(feature = "gateway")]
+pub mod gateway_cache;
 pub mod identity;
-#[cfg(feature = "llm")]
+#[cfg(feature = "gateway")]
 pub mod llm;
-#[cfg(any(feature = "gateway", feature = "node", test))]
-pub mod local_control;
 pub mod monitor;
-pub mod output_cache;
 #[cfg(feature = "node")]
 pub mod paid_work;
 pub mod rpc;

@@ -117,6 +117,7 @@ impl ExecutorMetrics {
         }
     }
 
+    #[cfg(feature = "evaluate")]
     fn execution_label(scheme: &str, name: &str) -> ExecutionLabel {
         ExecutionLabel {
             scheme: scheme.to_string(),
@@ -124,6 +125,7 @@ impl ExecutorMetrics {
         }
     }
 
+    #[cfg(feature = "evaluate")]
     pub(crate) fn record_execution_started(
         &self,
         scheme: &str,
@@ -146,6 +148,7 @@ impl ExecutorMetrics {
         }
     }
 
+    #[cfg(feature = "evaluate")]
     pub(crate) fn record_execution_completed(&self, scheme: &str, name: &str, generated: u64) {
         let label = Self::execution_label(scheme, name);
         self.by_execution_completed.get_or_create(&label).inc();
@@ -158,6 +161,7 @@ impl ExecutorMetrics {
         }
     }
 
+    #[cfg(feature = "evaluate")]
     pub(crate) fn record_execution_failed(&self, scheme: &str, name: &str, generated: u64) {
         let label = Self::execution_label(scheme, name);
         self.by_execution_failed.get_or_create(&label).inc();
@@ -168,43 +172,5 @@ impl ExecutorMetrics {
                 .get_or_create(&label)
                 .inc_by(generated);
         }
-    }
-
-    /// Snapshot Catena evaluate counters for the Courtesy GetStats RPC.
-    pub(crate) fn global_snapshot(&self) -> hellas_rpc::pb::courtesy::TokenStats {
-        hellas_rpc::pb::courtesy::TokenStats {
-            executions_started: self.evaluate_executions_started.get(),
-            executions_completed: self.evaluate_executions_completed.get(),
-            executions_failed: self.evaluate_executions_failed.get(),
-            prompt_tokens: self.evaluate_prompt_tokens.get(),
-            prefill_tokens: self.evaluate_prefill_tokens.get(),
-            generated_tokens: self.evaluate_generated_tokens.get(),
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::ExecutorMetrics;
-
-    #[test]
-    fn courtesy_totals_are_evaluate_tokens_not_fetch_units() {
-        let metrics = ExecutorMetrics::default();
-        metrics.record_execution_started("fetch", "codex/responses", 0, 0);
-        metrics.record_execution_completed("fetch", "codex/responses", 99);
-
-        let empty = metrics.global_snapshot();
-        assert_eq!(empty.executions_started, 0);
-        assert_eq!(empty.executions_completed, 0);
-        assert_eq!(empty.generated_tokens, 0);
-
-        metrics.record_execution_started("evaluate", "smollm2-135m", 3, 3);
-        metrics.record_execution_completed("evaluate", "smollm2-135m", 2);
-        let evaluate = metrics.global_snapshot();
-        assert_eq!(evaluate.executions_started, 1);
-        assert_eq!(evaluate.executions_completed, 1);
-        assert_eq!(evaluate.prompt_tokens, 3);
-        assert_eq!(evaluate.prefill_tokens, 3);
-        assert_eq!(evaluate.generated_tokens, 2);
     }
 }

@@ -128,21 +128,6 @@ fn binds_and_reopens_exact_local_files() {
 }
 
 #[test]
-fn bound_source_reports_the_environment_metadata_pinned_by_its_arc() {
-    let fixture = Fixture::new();
-    let bound = fixture.bind().expect("bind environment");
-
-    assert_eq!(
-        bound.retained_heap_bytes(),
-        bound.environment().retained_heap_bytes()
-    );
-    assert!(
-        bound.retained_heap_bytes().unwrap()
-            >= std::mem::size_of::<hellas_rpc::CausalLmEnvironment>()
-    );
-}
-
-#[test]
 fn bounded_verified_read_rejects_growth_and_truncation() {
     let grown = Fixture::new();
     let bound = grown.bind().expect("bind grown fixture");

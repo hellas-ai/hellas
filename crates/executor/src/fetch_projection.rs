@@ -60,7 +60,7 @@ pub trait FetchAdaptorFactory: Send + Sync + 'static {
     /// The complete manifest commitment for the exact structuring,
     /// destructuring, and trusted config implemented by this factory.
     ///
-    /// A route derives its quoted execution environment from this method; an
+    /// A route derives its execution environment from this method; an
     /// operator cannot pair this adaptor with a separately claimed
     /// environment identity.
     fn execution_environment(&self) -> ContentId;

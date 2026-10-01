@@ -27,7 +27,6 @@ hellas-rpc = { workspace = true, features = [
     "execute",
     "evaluate",
     "fetch",
-    "courtesy",
     "work",
 ] }
 hellas-store = { workspace = true, optional = true }

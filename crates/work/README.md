@@ -19,7 +19,7 @@ and delivery markers, payment certificates, ledger state, and close state.
 It omits prepared requests and output transcripts from both append records and
 rotation checkpoints. Those bodies exist in memory while the job is active.
 The paid executor invokes the configured Fetch route directly, without passing
-through Courtesy's transcript store or replay cache. Upstream and projection
+through a separate transcript store or replay cache. Upstream and projection
 faults are reduced to fixed error messages before they reach the paid-work
 driver's logs.
 
@@ -87,8 +87,7 @@ one is allowed):
 
 The route must also exist in the provider's Fetch route configuration.
 Route-wide capabilities and shared Fetch concurrency limits remain enforced.
-Courtesy's caller quota policy is not the paid admission policy; a paid channel
-authorizes its own work.
+The mounted Work channel authorizes its jobs.
 
 ## Generic HTTPS and App Attest
 

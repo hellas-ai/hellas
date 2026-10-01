@@ -6,7 +6,7 @@ use hellas_rpc::fetch::{
 };
 use hellas_rpc::output::{OutputEvent, StopReason, TextChannel};
 use hellas_rpc::stream::{input_event_to_pb, output_event_to_pb};
-use hellas_rpc::{ContentId, JobTerms, ProducerSigningKey as SigningKey, RequestCommitment};
+use hellas_rpc::{ContentId, ProducerSigningKey as SigningKey};
 
 const TEST_ASSURANCE: Assurance = Assurance::ProducerSigned;
 
@@ -88,35 +88,6 @@ fn fetch_finished_verifies_signed_output_transcript() {
         }
     );
     assert_eq!(output_events.len(), 1);
-}
-
-#[test]
-fn fetch_ticket_must_name_the_pinned_provider_genesis() {
-    let caller = key(1);
-    let request = fetch_request(&caller, "echo", "run", br#"{"x":1}"#);
-    let input = input_commitment_for(&request);
-    let provider_genesis = b"provider enrollment".to_vec();
-    let actual_provider = ContentId::hash(&provider_genesis);
-    let ticket = hellas_rpc::run_ticket::ticket_to_pb(
-        JobTerms {
-            request: RequestCommitment::from_digest(input.digest()),
-            provider_genesis: actual_provider,
-            assurance: TEST_ASSURANCE,
-            amount: 1,
-            ttl_ms: 1_000,
-        },
-        provider_genesis,
-    )
-    .unwrap();
-
-    let error = validate_fetch_ticket(
-        ticket,
-        input,
-        TEST_ASSURANCE,
-        ContentId::from_bytes([0x42; 32]),
-    )
-    .unwrap_err();
-    assert!(error.to_string().contains("pinned provider"));
 }
 
 #[test]
@@ -204,9 +175,11 @@ fn multi_event_replay_framing_verifies_end_to_end() {
     for output_event in streamed {
         expected_position += output_event.payload().len() as u64;
         let wire = WorkEvent {
-            kind: Some(work_event::Kind::Chunk(pb::WorkChunk {
-                output_event: Some(output_event_to_pb(&output_event)),
-            })),
+            kind: Some(work_event::Kind::Chunk(
+                hellas_rpc::execution_event::WorkChunk {
+                    output_event: Some(output_event_to_pb(&output_event)),
+                },
+            )),
         };
         let FetchExecutionEvent::Chunk { position, .. } =
             verify_fetch_work_event(&mut verifier, wire).unwrap()
@@ -296,10 +269,12 @@ fn verifier_rejects_events_after_terminal_outcome() {
     let input = input_commitment_for(&request);
     let mut verifier = FetchChunkVerifier::new(input, TEST_ASSURANCE, trust_in(&[&producer]));
     let failed = || WorkEvent {
-        kind: Some(work_event::Kind::Failed(pb::WorkFailed {
-            position: 0,
-            error: "failed".to_string(),
-        })),
+        kind: Some(work_event::Kind::Failed(
+            hellas_rpc::execution_event::WorkFailed {
+                position: 0,
+                error: "failed".to_string(),
+            },
+        )),
     };
 
     assert!(matches!(
@@ -323,10 +298,12 @@ fn failure_position_must_match_verified_signed_prefix() {
     verifier.verify_chunk(chunk).unwrap();
 
     let failed = |position| WorkEvent {
-        kind: Some(work_event::Kind::Failed(pb::WorkFailed {
-            position,
-            error: "failed".to_string(),
-        })),
+        kind: Some(work_event::Kind::Failed(
+            hellas_rpc::execution_event::WorkFailed {
+                position,
+                error: "failed".to_string(),
+            },
+        )),
     };
     let error = verify_fetch_work_event(&mut verifier, failed(0)).unwrap_err();
     assert!(error.to_string().contains("failure position mismatch"));

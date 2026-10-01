@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use hellas_rpc::execution_event::{WorkEvent, WorkFinished, work_event};
 #[cfg(test)]
 use hellas_rpc::fetch::verify_output_events;
 use hellas_rpc::fetch::{
@@ -8,7 +9,6 @@ use hellas_rpc::fetch::{
     verify_input_events,
 };
 use hellas_rpc::output::OutputEvent;
-use hellas_rpc::pb::execute::{self as pb, Ticket, WorkEvent, WorkFinished, work_event};
 use hellas_rpc::pb::fetch::FetchRequest;
 use hellas_rpc::stream::{input_event_from_pb, output_event_from_pb};
 use hellas_rpc::{
@@ -54,7 +54,7 @@ pub enum FetchOutcome {
         output_events: Vec<OutputEventEnvelope>,
         terminal: FetchTerminalPayload,
     },
-    /// An unsigned RunTicket failure. Remote Fetch authenticates its source
+    /// An unsigned execution failure. Remote Fetch authenticates its source
     /// only through the retained verified transport; this is not transcript
     /// evidence and callers must surface it as failure.
     Failed { position: u64, error: String },
@@ -411,43 +411,6 @@ pub fn verified_fetch_input(request: &FetchRequest) -> ClientResult<FetchInput> 
         .collect::<Result<Vec<_>, _>>()
         .map_err(|source| ClientError::FetchStreamEnvelope { source })?;
     verify_input_events(&input).map_err(|source| ClientError::FetchTranscript { source })
-}
-
-pub fn validate_fetch_ticket(
-    ticket: pb::Ticket,
-    input_commitment: InputCommitment,
-    assurance: Assurance,
-    expected_provider_genesis: hellas_rpc::ContentId,
-) -> ClientResult<Ticket> {
-    let request_commitment: [u8; 32] =
-        ticket
-            .request_commitment
-            .as_slice()
-            .try_into()
-            .map_err(|_| {
-                ClientError::protocol(format!(
-                    "fetch ticket request_commitment must be 32 bytes, got {}",
-                    ticket.request_commitment.len()
-                ))
-            })?;
-    if request_commitment != *input_commitment.as_bytes() {
-        return Err(ClientError::protocol(
-            "fetch ticket request_commitment does not match signed input transcript",
-        ));
-    }
-    let terms = hellas_rpc::run_ticket::job_terms_from_pb(&ticket)
-        .map_err(|source| ClientError::source("invalid fetch ticket terms", source))?;
-    if terms.assurance != assurance {
-        return Err(ClientError::protocol(
-            "fetch ticket assurance does not match signed input transcript",
-        ));
-    }
-    if terms.provider_genesis != expected_provider_genesis {
-        return Err(ClientError::protocol(
-            "fetch ticket provider genesis does not match the pinned provider",
-        ));
-    }
-    Ok(ticket)
 }
 
 #[cfg(test)]

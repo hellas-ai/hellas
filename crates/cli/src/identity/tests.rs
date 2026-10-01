@@ -137,10 +137,10 @@ fn default_path_uses_home() {
     let dir = tempfile::tempdir().unwrap();
     unsafe { env::set_var("HOME", dir.path()) };
     assert_eq!(default_path().unwrap(), dir.path().join(".hellas/identity"));
-    #[cfg(feature = "node")]
+    #[cfg(feature = "evaluate")]
     assert_eq!(
-        default_artifact_store_path().unwrap(),
-        dir.path().join(".hellas/artifacts")
+        default_content_index_path().unwrap(),
+        dir.path().join(".hellas/content-index.bin")
     );
     unsafe { env::remove_var("HOME") };
 }

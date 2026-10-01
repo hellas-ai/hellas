@@ -4,11 +4,11 @@ use super::*;
 #[path = "cloud_tests.rs"]
 mod cloud;
 
-#[cfg(feature = "llm")]
+#[cfg(feature = "gateway")]
 const TEST_ENVIRONMENT: &str = "/path/to/model.environment";
-#[cfg(feature = "llm")]
+#[cfg(feature = "gateway")]
 const TEST_MANIFEST_ID: &str = "4444444444444444444444444444444444444444444444444444444444444444";
-#[cfg(feature = "llm")]
+#[cfg(feature = "gateway")]
 const TEST_TOKENIZER: &str = "/path/to/tokenizer.json";
 #[cfg(feature = "evaluate")]
 const TEST_CONTENT: &str = "/path/to/model.hex";
@@ -26,6 +26,7 @@ const TEST_REMOTE_TRUST_ARGS: &[&str] = &[
     TEST_CDHASHES,
 ];
 
+#[cfg(feature = "gateway")]
 fn assert_test_remote_trust(remote_trust: &RemoteTrustArgs) {
     assert_eq!(
         remote_trust.provider_genesis,
@@ -45,6 +46,7 @@ fn assert_test_remote_trust(remote_trust: &RemoteTrustArgs) {
     );
 }
 
+#[cfg(feature = "gateway")]
 fn fetch_environment_cases() -> [(&'static str, hellas_rpc::ContentId); 3] {
     [
         (
@@ -62,37 +64,10 @@ fn fetch_environment_cases() -> [(&'static str, hellas_rpc::ContentId); 3] {
     ]
 }
 
-#[cfg(feature = "llm")]
-fn parse_llm(args: &[&str]) -> Result<Cli, clap::Error> {
-    #[cfg(feature = "evaluate")]
-    let local = args.contains(&"--local") || args.contains(&"--verify-local");
-    #[cfg(feature = "evaluate")]
-    let local_content: &[&str] = if local {
-        &["--content", TEST_CONTENT]
-    } else {
-        &[]
-    };
-    #[cfg(not(feature = "evaluate"))]
-    let local_content: &[&str] = &[];
-    Cli::try_parse_from(
-        [
-            "hellas",
-            "llm",
-            "--environment",
-            TEST_ENVIRONMENT,
-            "--tokenizer",
-            TEST_TOKENIZER,
-        ]
-        .into_iter()
-        .chain(local_content.iter().copied())
-        .chain(args.iter().copied()),
-    )
-}
-
 #[cfg(feature = "gateway")]
 fn parse_gateway(args: &[&str]) -> Result<Cli, clap::Error> {
     #[cfg(feature = "evaluate")]
-    let local = args.contains(&"--local") || args.contains(&"--verify-local");
+    let local = args.contains(&"--local");
     #[cfg(feature = "evaluate")]
     let local_content: &[&str] = if local {
         &["--content", TEST_CONTENT]
@@ -116,115 +91,13 @@ fn parse_gateway(args: &[&str]) -> Result<Cli, clap::Error> {
     )
 }
 
-#[cfg(feature = "llm")]
+#[cfg(feature = "gateway")]
 fn causal_lm_args(command: Commands) -> CausalLmArgs {
     match command {
-        Commands::Llm { causal_lm, .. } => causal_lm,
         #[cfg(feature = "gateway")]
         Commands::Gateway { causal_lm, .. } => causal_lm.expect("causal-LM arguments"),
         _ => panic!("expected causal-LM command"),
     }
-}
-
-#[test]
-fn cache_reset_can_target_a_live_control_socket_without_an_identity() {
-    let cli = Cli::try_parse_from([
-        "hellas",
-        "output-cache",
-        "--socket",
-        "/run/user/1000/hellas/control.sock",
-        "reset",
-    ])
-    .unwrap();
-    assert!(matches!(&cli.command, Commands::OutputCache(_)));
-    assert!(validate_identity_options(&cli.command, None, false).is_ok());
-}
-
-#[test]
-fn remote_cache_management_uses_an_existing_identity_and_exclusive_transport() {
-    let peer = "bb18ebc065d836ecc7e1f33972d2c17eac9894cd33ce4916f66cb1165ccc7550";
-    let cli = Cli::try_parse_from([
-        "hellas",
-        "--identity",
-        "owner.identity",
-        "output-cache",
-        "--node-id",
-        peer,
-        "--kind",
-        "proxy",
-        "--key",
-        peer,
-        "show",
-    ])
-    .unwrap();
-    assert!(validate_identity_options(&cli.command, cli.identity.as_deref(), false).is_ok());
-    assert!(validate_identity_options(&cli.command, cli.identity.as_deref(), true).is_err());
-    assert_eq!(
-        cli.identity.as_deref(),
-        Some(std::path::Path::new("owner.identity"))
-    );
-    let Commands::OutputCache(args) = cli.command else {
-        panic!()
-    };
-    assert_eq!(args.key.as_deref(), Some(peer));
-    let offline = Cli::try_parse_from([
-        "hellas",
-        "output-cache",
-        "--kind",
-        "proxy",
-        "--key",
-        peer,
-        "show",
-    ])
-    .unwrap();
-    assert!(offline.identity.is_none());
-    assert!(
-        Cli::try_parse_from([
-            "hellas",
-            "output-cache",
-            "--node-id",
-            peer,
-            "--socket",
-            "control.sock",
-            "clear"
-        ])
-        .is_err()
-    );
-}
-
-#[cfg(feature = "node")]
-#[test]
-fn remote_admin_is_explicitly_granted() {
-    let cli = Cli::try_parse_from(["hellas", "serve"]).unwrap();
-    let Commands::Serve { admin_peers, .. } = cli.command else {
-        panic!()
-    };
-    assert!(admin_peers.is_empty());
-    let peer = "bb18ebc065d836ecc7e1f33972d2c17eac9894cd33ce4916f66cb1165ccc7550";
-    let cli = Cli::try_parse_from(["hellas", "serve", "--admin-peer", peer]).unwrap();
-    let Commands::Serve { admin_peers, .. } = cli.command else {
-        panic!()
-    };
-    assert_eq!(admin_peers, [peer.parse::<iroh::EndpointId>().unwrap()]);
-}
-
-#[cfg(feature = "gateway")]
-#[test]
-fn control_socket_is_not_cache_specific_and_does_not_require_record_mode() {
-    let cli = Cli::try_parse_from([
-        "hellas",
-        "--control-socket",
-        "/run/user/1000/hellas/control.sock",
-        "gateway",
-        "--responses-backend",
-        "proxy",
-    ])
-    .unwrap();
-    assert_eq!(
-        cli.control_socket.as_deref(),
-        Some(std::path::Path::new("/run/user/1000/hellas/control.sock"))
-    );
-    assert_eq!(cli.output_cache, hellas_rpc::cache::CachePolicy::Off);
 }
 
 #[test]
@@ -338,36 +211,14 @@ fn serve_accepts_only_its_command_local_assurance() {
     }
 }
 
-#[cfg(feature = "llm")]
-#[test]
-fn llm_accepts_remote_trust_policy() {
-    let mut args = TEST_REMOTE_TRUST_ARGS.to_vec();
-    args.extend(["-p", "hello"]);
-    assert!(parse_llm(&args).is_ok());
-}
-
-#[cfg(feature = "llm")]
-#[test]
-fn llm_accepts_an_optional_strict_environment_pin() {
-    let pinned = causal_lm_args(
-        parse_llm(&["--manifest-id", TEST_MANIFEST_ID, "-p", "hello"])
-            .unwrap()
-            .command,
-    );
-    assert_eq!(
-        pinned.manifest_id,
-        Some(hellas_rpc::ContentId::from_bytes([0x44; 32]))
-    );
-
-    let derived = causal_lm_args(parse_llm(&["-p", "hello"]).unwrap().command);
-    assert!(derived.manifest_id.is_none());
-    assert!(parse_llm(&["--manifest-id", "not-a-content-id", "-p", "hello"]).is_err());
-}
-
 #[cfg(feature = "gateway")]
 #[test]
 fn gateway_accepts_remote_trust_policy() {
-    assert!(parse_gateway(TEST_REMOTE_TRUST_ARGS).is_ok());
+    let cli = parse_gateway(TEST_REMOTE_TRUST_ARGS).unwrap();
+    let Commands::Gateway { remote_trust, .. } = cli.command else {
+        panic!("gateway");
+    };
+    assert_test_remote_trust(&remote_trust);
 }
 
 #[cfg(feature = "gateway")]
@@ -381,61 +232,6 @@ fn gateway_accepts_the_optional_environment_pin() {
     assert_eq!(
         pinned.manifest_id,
         Some(hellas_rpc::ContentId::from_bytes([0x44; 32]))
-    );
-}
-
-#[cfg(feature = "evaluate")]
-#[test]
-fn llm_accepts_local_mode() {
-    let cli = parse_llm(&["--local", "-p", "hello"]).unwrap();
-    match cli.command {
-        Commands::Llm {
-            causal_lm,
-            node_id,
-            node_addrs,
-            local,
-            verify_local,
-            ..
-        } => {
-            assert!(node_id.is_none());
-            assert!(node_addrs.is_empty());
-            assert!(local);
-            assert!(!verify_local);
-            assert_eq!(causal_lm.environment, PathBuf::from(TEST_ENVIRONMENT));
-            assert!(causal_lm.manifest_id.is_none());
-            assert_eq!(causal_lm.content_paths, vec![PathBuf::from(TEST_CONTENT)]);
-            assert_eq!(causal_lm.tokenizer, PathBuf::from(TEST_TOKENIZER));
-            assert!(causal_lm.stop_token_ids.is_empty());
-        }
-        _ => panic!("expected llm command"),
-    }
-}
-
-#[cfg(feature = "llm")]
-#[test]
-fn llm_requires_explicit_environment_and_tokenizer() {
-    assert!(Cli::try_parse_from(["hellas", "llm", "-p", "hello"]).is_err());
-    assert!(
-        Cli::try_parse_from([
-            "hellas",
-            "llm",
-            "--environment",
-            TEST_ENVIRONMENT,
-            "-p",
-            "hello",
-        ])
-        .is_err()
-    );
-    assert!(
-        Cli::try_parse_from([
-            "hellas",
-            "llm",
-            "--tokenizer",
-            TEST_TOKENIZER,
-            "-p",
-            "hello",
-        ])
-        .is_err()
     );
 }
 
@@ -468,38 +264,6 @@ fn http_gateway_requires_a_paid_pool() {
     );
 }
 
-#[cfg(feature = "llm")]
-#[test]
-fn package_flags_are_not_accepted_as_compatibility_aliases() {
-    assert!(
-        parse_llm(&["--package", "old-package", "-p", "hello"]).is_err(),
-        "the removed package selector was accepted"
-    );
-    assert!(
-        parse_llm(&[
-            "--package-id",
-            "0808080808080808080808080808080808080808080808080808080808080808",
-            "-p",
-            "hello",
-        ])
-        .is_err(),
-        "the removed package identity was accepted"
-    );
-}
-
-#[cfg(feature = "llm")]
-#[test]
-fn llm_model_is_only_an_optional_label() {
-    let args = causal_lm_args(
-        parse_llm(&["--model", "friendly-name", "-p", "hello"])
-            .unwrap()
-            .command,
-    );
-    assert_eq!(args.model.as_deref(), Some("friendly-name"));
-    let args = causal_lm_args(parse_llm(&["-p", "hello"]).unwrap().command);
-    assert!(args.model.is_none());
-}
-
 #[cfg(feature = "gateway")]
 #[test]
 fn gateway_model_is_only_an_optional_api_label() {
@@ -512,8 +276,6 @@ fn gateway_model_is_only_an_optional_api_label() {
 #[cfg(feature = "evaluate")]
 #[test]
 fn local_content_flags_are_scoped_to_local_modes() {
-    assert!(parse_llm(&["--content", TEST_CONTENT, "-p", "hello"]).is_err());
-    assert!(parse_llm(&["--content-root", "/content", "-p", "hello"]).is_err());
     assert!(parse_gateway(&["--content", TEST_CONTENT]).is_err());
     assert!(parse_gateway(&["--content-index", "/state/index.bin"]).is_err());
 }
@@ -523,7 +285,7 @@ fn local_content_flags_are_scoped_to_local_modes() {
 fn local_modes_accept_repeatable_content_and_roots() {
     let cli = Cli::try_parse_from([
         "hellas",
-        "llm",
+        "gateway",
         "--environment",
         TEST_ENVIRONMENT,
         "--tokenizer",
@@ -537,8 +299,6 @@ fn local_modes_accept_repeatable_content_and_roots() {
         "/content/cache",
         "--content-index",
         "/state/index.bin",
-        "-p",
-        "hello",
     ])
     .unwrap();
     let args = causal_lm_args(cli.command);
@@ -548,43 +308,6 @@ fn local_modes_accept_repeatable_content_and_roots() {
     );
     assert_eq!(args.content_roots, vec![PathBuf::from("/content/cache")]);
     assert_eq!(args.content_index, Some(PathBuf::from("/state/index.bin")));
-}
-
-#[cfg(feature = "llm")]
-#[test]
-fn llm_retention_defaults_off_and_can_be_enabled() {
-    let default = parse_llm(&["-p", "hello"]).unwrap();
-    assert!(matches!(
-        default.command,
-        Commands::Llm { retain: false, .. }
-    ));
-
-    let enabled = parse_llm(&["--retain", "-p", "hello"]).unwrap();
-    assert!(matches!(
-        enabled.command,
-        Commands::Llm { retain: true, .. }
-    ));
-}
-
-#[cfg(feature = "evaluate")]
-#[test]
-fn llm_rejects_local_with_node_id() {
-    let result = parse_llm(&[
-        "bb18ebc065d836ecc7e1f33972d2c17eac9894cd33ce4916f66cb1165ccc7550",
-        "--local",
-        "-p",
-        "hello",
-    ]);
-
-    assert!(result.is_err());
-}
-
-#[cfg(feature = "evaluate")]
-#[test]
-fn llm_rejects_conflicting_local_modes() {
-    let result = parse_llm(&["--local", "--verify-local", "-p", "hello"]);
-
-    assert!(result.is_err());
 }
 
 #[cfg(feature = "evaluate")]
@@ -637,90 +360,16 @@ fn gateway_rejects_local_with_node_id() {
     assert!(result.is_err());
 }
 
-/// The anchor `hellas gateway <args>` would run with.
 #[cfg(feature = "gateway")]
 fn gateway_trust(args: &[&str]) -> anyhow::Result<Option<hellas_client::ProviderTrustAnchor>> {
     let cli = parse_gateway(args).expect("valid gateway arguments");
     let Commands::Gateway {
-        remote_trust,
-        responses_backend,
-        #[cfg(feature = "evaluate")]
-        local,
-        ..
+        responses_backend, ..
     } = cli.command
     else {
-        panic!("expected gateway command");
+        panic!("gateway");
     };
-    #[cfg(not(feature = "evaluate"))]
-    let local = false;
-    gateway_provider_trust(
-        local,
-        responses_backend,
-        remote_trust.provider_genesis,
-        remote_trust.assurance,
-        remote_trust.apple_app_attest_app_id,
-        remote_trust.apple_app_attest_cdhashes,
-    )
-}
-
-#[cfg(feature = "gateway")]
-#[test]
-fn gateway_demands_a_provider_anchor_exactly_where_it_dials_one() {
-    const NODE: &str = "bb18ebc065d836ecc7e1f33972d2c17eac9894cd33ce4916f66cb1165ccc7550";
-    const SHADOW: &str = "edfadcefb3917925de1111087f11925542c97e14ab00cf42b9447f7567a25b62";
-    const PROVIDER: &str = "1111111111111111111111111111111111111111111111111111111111111111";
-    const ENVIRONMENT: &str = "0909090909090909090909090909090909090909090909090909090909090909";
-
-    // Local and proxy-only modes do not dial a Hellas provider.
-    #[cfg(feature = "evaluate")]
-    assert!(gateway_trust(&["--local"]).unwrap().is_none());
-    assert!(
-        gateway_trust(&["--responses-backend", "proxy"])
-            .unwrap()
-            .is_none()
-    );
-
-    // Names one: `--provider` is required, and its absence is refused
-    // by the flag that would supply it.
-    for dialling in [
-        vec![],
-        vec!["--node-id", NODE],
-        vec!["--node-id", NODE, "--verify", SHADOW],
-        vec![
-            "--responses-backend",
-            "fetch",
-            "--responses-fetch-execution-environment",
-            ENVIRONMENT,
-        ],
-    ] {
-        let refusal = gateway_trust(&dialling).unwrap_err().to_string();
-        assert!(refusal.contains("--provider <content-id>"), "{refusal}");
-    }
-
-    #[cfg(feature = "evaluate")]
-    {
-        let refusal = gateway_trust(&["--verify-local"]).unwrap_err().to_string();
-        assert!(refusal.contains("--provider <content-id>"), "{refusal}");
-    }
-
-    // Named with its pin: the anchor carries the provider it pins.
-    let anchor = gateway_trust(&["--node-id", NODE, "--provider", PROVIDER])
-        .unwrap()
-        .expect("a dialling gateway carries an anchor");
-    assert_eq!(
-        anchor.expected_genesis,
-        hellas_rpc::ContentId::from_bytes([0x11; 32])
-    );
-    // A discovery gateway given one keeps the routes it always had.
-    assert!(gateway_trust(&["--provider", PROVIDER]).unwrap().is_some());
-}
-
-#[cfg(feature = "llm")]
-#[test]
-fn llm_rejects_node_addr_without_node_id() {
-    let result = parse_llm(&["--node-addr", "127.0.0.1:31145", "-p", "hello"]);
-
-    assert!(result.is_err());
+    gateway_provider_trust(responses_backend)
 }
 
 #[cfg(feature = "gateway")]
@@ -729,116 +378,6 @@ fn gateway_rejects_node_addr_without_node_id() {
     let result = parse_gateway(&["--node-addr", "127.0.0.1:31145"]);
 
     assert!(result.is_err());
-}
-
-#[test]
-fn fetch_accepts_payload() {
-    let cli = Cli::try_parse_from([
-        "hellas",
-        "fetch",
-        "--service",
-        "echo",
-        "--method",
-        "run",
-        "--execution-environment",
-        "0909090909090909090909090909090909090909090909090909090909090909",
-        "--payload",
-        r#"{"x":1}"#,
-        "--assurance",
-        "apple-app-attest",
-    ])
-    .unwrap();
-    match cli.command {
-        Commands::Fetch {
-            remote_trust,
-            service,
-            method,
-            payload,
-            retain,
-            ..
-        } => {
-            assert_eq!(
-                remote_trust.assurance,
-                hellas_rpc::Assurance::AppleAppAttest
-            );
-            assert_eq!(service, "echo");
-            assert_eq!(method, "run");
-            assert_eq!(payload.as_deref(), Some(r#"{"x":1}"#));
-            assert!(!retain);
-        }
-        _ => panic!("expected fetch command"),
-    }
-}
-
-#[test]
-fn direct_fetch_accepts_builtin_environment_aliases_and_exact_id() {
-    for (spelling, expected) in fetch_environment_cases() {
-        let cli = Cli::try_parse_from([
-            "hellas",
-            "fetch",
-            "--service",
-            "echo",
-            "--method",
-            "run",
-            "--execution-environment",
-            spelling,
-            "--payload",
-            r#"{"x":1}"#,
-        ])
-        .unwrap();
-        let Commands::Fetch {
-            execution_environment,
-            ..
-        } = cli.command
-        else {
-            panic!("expected fetch command");
-        };
-        assert_eq!(execution_environment, expected);
-    }
-}
-
-#[test]
-fn fetch_output_signer_is_derived_from_the_pinned_provider() {
-    let result = Cli::try_parse_from([
-        "hellas",
-        "fetch",
-        "--service",
-        "echo",
-        "--method",
-        "run",
-        "--execution-environment",
-        "0909090909090909090909090909090909090909090909090909090909090909",
-        "--payload",
-        r#"{"x":1}"#,
-        "--trusted-producer-public-key",
-        "02aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    ]);
-    assert!(result.is_err());
-}
-
-#[test]
-fn fetch_accepts_remote_trust_policy() {
-    let cli = Cli::try_parse_from(
-        [
-            "hellas",
-            "fetch",
-            "--service",
-            "echo",
-            "--method",
-            "run",
-            "--execution-environment",
-            "0909090909090909090909090909090909090909090909090909090909090909",
-            "--payload",
-            r#"{"x":1}"#,
-        ]
-        .into_iter()
-        .chain(TEST_REMOTE_TRUST_ARGS.iter().copied()),
-    )
-    .unwrap();
-    let Commands::Fetch { remote_trust, .. } = cli.command else {
-        panic!("expected fetch command");
-    };
-    assert_test_remote_trust(&remote_trust);
 }
 
 #[cfg(feature = "node")]
@@ -861,141 +400,6 @@ fn serve_rejects_software_root_with_apple_assurance() {
         )
         .is_ok()
     );
-}
-
-#[test]
-fn fetch_retention_defaults_off_and_can_be_enabled() {
-    let base = [
-        "hellas",
-        "fetch",
-        "--service",
-        "echo",
-        "--method",
-        "run",
-        "--execution-environment",
-        "0909090909090909090909090909090909090909090909090909090909090909",
-        "--payload",
-        r#"{"x":1}"#,
-    ];
-    let default = Cli::try_parse_from(base).unwrap();
-    assert!(matches!(
-        default.command,
-        Commands::Fetch { retain: false, .. }
-    ));
-
-    let enabled = Cli::try_parse_from(base.into_iter().chain(["--retain"])).unwrap();
-    assert!(matches!(
-        enabled.command,
-        Commands::Fetch { retain: true, .. }
-    ));
-}
-
-#[test]
-fn fetch_rejects_node_addr_without_a_target() {
-    let result = Cli::try_parse_from([
-        "hellas",
-        "fetch",
-        "--service",
-        "echo",
-        "--method",
-        "run",
-        "--execution-environment",
-        "0909090909090909090909090909090909090909090909090909090909090909",
-        "--payload",
-        r#"{"x":1}"#,
-        "--node-addr",
-        "127.0.0.1:31145",
-    ]);
-
-    let error = result
-        .err()
-        .expect("node address must be rejected")
-        .to_string();
-    assert!(error.contains("NODE_ID"), "{error}");
-}
-
-#[test]
-fn fetch_rejects_missing_payload() {
-    let result = Cli::try_parse_from([
-        "hellas",
-        "fetch",
-        "--service",
-        "echo",
-        "--method",
-        "run",
-        "--execution-environment",
-        "0909090909090909090909090909090909090909090909090909090909090909",
-    ]);
-
-    let error = result
-        .err()
-        .expect("missing payload must be rejected")
-        .to_string();
-    assert!(error.contains("--payload"), "{error}");
-}
-
-#[test]
-fn artifact_get_accepts_digest_and_output() {
-    let digest = "00".repeat(32);
-    let cli = Cli::try_parse_from([
-        "hellas",
-        "artifact",
-        "get",
-        "bb18ebc065d836ecc7e1f33972d2c17eac9894cd33ce4916f66cb1165ccc7550",
-        &digest,
-        "--output",
-        "/tmp/artifact.cbor",
-    ])
-    .unwrap();
-    match cli.command {
-        Commands::Artifact {
-            command:
-                commands::artifact::ArtifactCommand::Get {
-                    node_id: _,
-                    node_addrs,
-                    digest: parsed_digest,
-                    output,
-                },
-        } => {
-            assert!(node_addrs.is_empty());
-            assert_eq!(parsed_digest, hellas_rpc::Digest::ZERO);
-            assert_eq!(output, std::path::Path::new("/tmp/artifact.cbor"));
-        }
-        _ => panic!("expected artifact get command"),
-    }
-}
-
-#[cfg(feature = "llm")]
-#[test]
-fn llm_accepts_explicit_stop_tokens_without_inference() {
-    let cli = parse_llm(&[
-        "--stop-token",
-        "1,2",
-        "--stop-token",
-        "3",
-        "--max-new-tokens",
-        "32",
-        "-p",
-        "hi",
-    ])
-    .unwrap();
-    match cli.command {
-        Commands::Llm {
-            causal_lm: CausalLmArgs { stop_token_ids, .. },
-            max_new_tokens,
-            ..
-        } => {
-            assert_eq!(stop_token_ids, vec![1, 2, 3]);
-            assert_eq!(max_new_tokens, 32);
-        }
-        _ => panic!("expected llm command"),
-    }
-}
-
-#[cfg(feature = "llm")]
-#[test]
-fn llm_rejects_an_explicit_zero_output_limit() {
-    assert!(parse_llm(&["--max-new-tokens", "0", "-p", "hi"]).is_err());
 }
 
 #[cfg(feature = "gateway")]
@@ -1089,28 +493,6 @@ fn producer_key_show_accepts_global_identity_path() {
             command: ProducerKeyCommand::Show,
         } => {}
         _ => panic!("expected producer-key show command"),
-    }
-}
-
-#[cfg(feature = "node")]
-#[test]
-fn serve_accepts_artifact_store_path() {
-    let cli = Cli::try_parse_from([
-        "hellas",
-        "serve",
-        "--artifact-store-path",
-        "/tmp/hellas-artifacts",
-    ])
-    .unwrap();
-    match cli.command {
-        Commands::Serve {
-            artifact_store_path,
-            ..
-        } => assert_eq!(
-            artifact_store_path.as_deref(),
-            Some(std::path::Path::new("/tmp/hellas-artifacts"))
-        ),
-        _ => panic!("expected serve command"),
     }
 }
 
@@ -1400,10 +782,6 @@ fn serve_accepts_fetch_config() {
         "3",
         "--fetch-queue-size",
         "0",
-        "--fetch-retained-transcript-capacity",
-        "0",
-        "--fetch-replay-max-in-flight",
-        "2",
         "--fetch-config",
         "/tmp/fetch-config.json",
     ])
@@ -1412,15 +790,11 @@ fn serve_accepts_fetch_config() {
         Commands::Serve {
             fetch_max_in_flight,
             fetch_queue_size,
-            fetch_retained_transcript_capacity,
-            fetch_replay_max_in_flight,
             fetch_config_file,
             ..
         } => {
             assert_eq!(fetch_max_in_flight, 3);
             assert_eq!(fetch_queue_size, 0);
-            assert_eq!(fetch_retained_transcript_capacity, 0);
-            assert_eq!(fetch_replay_max_in_flight, 2);
             assert_eq!(
                 fetch_config_file.as_deref(),
                 Some(std::path::Path::new("/tmp/fetch-config.json"))
@@ -1437,68 +811,6 @@ fn serve_rejects_zero_fetch_concurrency() {
         Cli::try_parse_from(["hellas", "serve", "--fetch-replay-max-in-flight", "0",]).is_err()
     );
     assert!(Cli::try_parse_from(["hellas", "serve", "--fetch-max-in-flight", "0"]).is_err());
-}
-
-#[cfg(feature = "node")]
-#[test]
-fn serve_uses_bounded_fetch_defaults() {
-    let cli = Cli::try_parse_from(["hellas", "serve"]).unwrap();
-    let Commands::Serve {
-        fetch_retained_transcript_capacity,
-        #[cfg(feature = "evaluate")]
-        evaluate_retained_execution_capacity,
-        fetch_replay_max_in_flight,
-        ..
-    } = cli.command
-    else {
-        panic!("expected serve command");
-    };
-    assert_eq!(
-        fetch_retained_transcript_capacity,
-        hellas_rpc::DEFAULT_FETCH_RETAINED_TRANSCRIPT_CAPACITY
-    );
-    #[cfg(feature = "evaluate")]
-    assert_eq!(
-        evaluate_retained_execution_capacity,
-        hellas_executor::DEFAULT_EVALUATE_RETAINED_EXECUTION_CAPACITY
-    );
-    assert_eq!(
-        fetch_replay_max_in_flight,
-        hellas_rpc::DEFAULT_FETCH_REPLAY_MAX_IN_FLIGHT
-    );
-}
-
-#[cfg(all(feature = "node", feature = "evaluate"))]
-#[test]
-fn serve_accepts_and_defaults_evaluate_retention_capacity() {
-    let configured = Cli::try_parse_from([
-        "hellas",
-        "serve",
-        "--evaluate-retained-execution-capacity",
-        "0",
-    ])
-    .unwrap();
-    let Commands::Serve {
-        evaluate_retained_execution_capacity,
-        ..
-    } = configured.command
-    else {
-        panic!("expected serve command");
-    };
-    assert_eq!(evaluate_retained_execution_capacity, 0);
-
-    let defaulted = Cli::try_parse_from(["hellas", "serve"]).unwrap();
-    let Commands::Serve {
-        evaluate_retained_execution_capacity,
-        ..
-    } = defaulted.command
-    else {
-        panic!("expected serve command");
-    };
-    assert_eq!(
-        evaluate_retained_execution_capacity,
-        hellas_executor::DEFAULT_EVALUATE_RETAINED_EXECUTION_CAPACITY
-    );
 }
 
 #[test]
@@ -1582,4 +894,52 @@ fn proxy_cache_needs_no_causal_lm_files() {
             ..
         }
     ));
+}
+
+#[cfg(feature = "gateway")]
+#[test]
+fn unpaid_gateway_routes_are_explicitly_unsupported_until_grants() {
+    assert!(
+        gateway_trust(&["--responses-backend", "proxy"])
+            .unwrap()
+            .is_none()
+    );
+    for args in [
+        vec![],
+        vec![
+            "--responses-backend",
+            "fetch",
+            "--responses-fetch-execution-environment",
+            "openai-responses",
+        ],
+    ] {
+        let error = gateway_trust(&args).unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<hellas_client::ClientError>(),
+            Some(hellas_client::ClientError::OwnerGrantRequired)
+        ));
+    }
+}
+
+#[test]
+fn retired_commands_are_not_exposed() {
+    for command in ["llm", "fetch", "artifact", "output-cache"] {
+        assert!(Cli::try_parse_from(["hellas", command]).is_err());
+    }
+}
+
+#[cfg(feature = "node")]
+#[test]
+fn serve_uses_bounded_fetch_defaults() {
+    let cli = Cli::try_parse_from(["hellas", "serve"]).unwrap();
+    let Commands::Serve {
+        fetch_max_in_flight,
+        fetch_queue_size,
+        ..
+    } = cli.command
+    else {
+        panic!("serve");
+    };
+    assert_eq!(fetch_max_in_flight, hellas_rpc::DEFAULT_FETCH_MAX_IN_FLIGHT);
+    assert_eq!(fetch_queue_size, hellas_rpc::DEFAULT_FETCH_QUEUE_CAPACITY);
 }

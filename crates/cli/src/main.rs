@@ -118,33 +118,15 @@ impl From<GatewayResponsesBackend> for hellas_gateway::ResponsesBackend {
     }
 }
 
-/// The trust anchor this gateway's remote routes are built from, or
-/// `None` for a gateway that has none to build.
-///
-/// Every non-local Hellas route dials either a direct node or discovery, and
-/// Fetch always dials remotely. Their trust anchor is required before the
-/// gateway binds; local Hellas execution and a proxy-only gateway need none.
+/// Unfunded execution routes await grants; proxy mode has no Hellas peer.
 #[cfg(feature = "gateway")]
 fn gateway_provider_trust(
-    local: bool,
     responses_backend: GatewayResponsesBackend,
-    expected_genesis: Option<hellas_rpc::ContentId>,
-    assurance: hellas_rpc::Assurance,
-    apple_app_attest_app_id: Option<String>,
-    apple_app_attest_cdhashes: Vec<[u8; 32]>,
 ) -> anyhow::Result<Option<hellas_client::ProviderTrustAnchor>> {
-    let dials_provider = (responses_backend == GatewayResponsesBackend::Hellas && !local)
-        || responses_backend == GatewayResponsesBackend::Fetch;
-    if !dials_provider && expected_genesis.is_none() {
-        return Ok(None);
+    if responses_backend != GatewayResponsesBackend::Proxy {
+        return Err(hellas_client::ClientError::OwnerGrantRequired.into());
     }
-    identity::provider_trust(
-        expected_genesis,
-        assurance,
-        apple_app_attest_app_id,
-        apple_app_attest_cdhashes,
-    )
-    .map(Some)
+    Ok(None)
 }
 
 /// Caller-selected trust policy for commands that execute on a remote provider.
@@ -254,9 +236,6 @@ struct Cli {
     /// Hellas content store state (default: HELLAS_STORE_DIR or ~/.hellas/store)
     #[arg(long, global = true)]
     store_dir: Option<PathBuf>,
-    /// Serve local control RPC on an owner-only Unix socket (gateway/serve)
-    #[arg(long, global = true)]
-    control_socket: Option<PathBuf>,
     /// Path to the versioned local identity for commands that use one
     /// (default: $HOME/.hellas/identity).
     #[arg(long = "identity", global = true)]
@@ -332,23 +311,12 @@ enum Commands {
     #[cfg(feature = "node")]
     /// Run the RPC server
     Serve {
-        /// Iroh peers allowed to administer this node, including reading/exporting
-        /// all cached transcripts and clearing them. Omitted means no remote admin.
-        #[arg(long = "admin-peer")]
-        admin_peers: Vec<iroh::EndpointId>,
-        /// Restrict every inbound Hellas RPC connection to this owner identity.
-        #[arg(long)]
-        owner: Option<EndpointId>,
         /// Assurance offered by this provider.
         #[arg(long, default_value = "producer-signed", value_parser = parse_assurance)]
         assurance: hellas_rpc::Assurance,
         /// Port to listen on. Omit it to let the OS select an available port.
         #[arg(long)]
         port: Option<u16>,
-        /// Evaluate policy: 'none' (default), 'any', or
-        /// 'only(EXECUTION_ENVIRONMENT_ID_GLOB,...)'.
-        #[arg(long = "execute-policy", default_value = "none")]
-        execute_policy: hellas_rpc::policy::ExecutePolicy,
         /// Maximum number of queued executions waiting behind the active worker
         #[arg(
             long = "queue-size",
@@ -365,8 +333,7 @@ enum Commands {
         #[cfg(feature = "evaluate")]
         #[arg(long = "content-root", value_name = "DIR")]
         content_roots: Vec<PathBuf>,
-        /// Fast-resume index for local content (default: under the artifact
-        /// store directory).
+        /// Fast-resume index for local content (default: ~/.hellas/content-index.bin).
         #[cfg(feature = "evaluate")]
         #[arg(long = "content-index", value_name = "FILE")]
         content_index: Option<PathBuf>,
@@ -399,18 +366,6 @@ enum Commands {
         #[cfg(feature = "evaluate")]
         #[arg(long = "gpu-execution-timeout-secs", default_value_t = hellas_executor::DEFAULT_GPU_EXECUTION_TIMEOUT_SECS, value_parser = parse_positive_u64)]
         gpu_execution_timeout_secs: u64,
-        /// Maximum distinct retained Evaluate executions. Zero disables new
-        /// retained completions. The value is persisted per artifact-store
-        /// root; stop every sharing process before changing it.
-        #[cfg(feature = "evaluate")]
-        #[arg(
-            long = "evaluate-retained-execution-capacity",
-            default_value_t = hellas_executor::DEFAULT_EVALUATE_RETAINED_EXECUTION_CAPACITY
-        )]
-        evaluate_retained_execution_capacity: usize,
-        /// Persistent canonical artifact blob store path (default: $HOME/.hellas/artifacts)
-        #[arg(long = "artifact-store-path")]
-        artifact_store_path: Option<PathBuf>,
         /// Paid-work configuration. Its presence serves WorkSetup and Work;
         /// Work remains retryably not ready until the configured state mounts.
         #[arg(long = "work-config")]
@@ -442,22 +397,6 @@ enum Commands {
             default_value_t = hellas_rpc::DEFAULT_FETCH_QUEUE_CAPACITY
         )]
         fetch_queue_size: usize,
-        /// Maximum distinct retained Fetch inputs across completed transcripts
-        /// and indeterminate running markers. Zero disables new retention. The
-        /// value is persisted per store root; stop every process sharing that
-        /// root before changing it or removing its capacity metadata.
-        #[arg(
-            long = "fetch-retained-transcript-capacity",
-            default_value_t = hellas_rpc::DEFAULT_FETCH_RETAINED_TRANSCRIPT_CAPACITY
-        )]
-        fetch_retained_transcript_capacity: usize,
-        /// Maximum retained Fetch replays with a live, not-yet-drained consumer.
-        #[arg(
-            long = "fetch-replay-max-in-flight",
-            default_value_t = hellas_rpc::DEFAULT_FETCH_REPLAY_MAX_IN_FLIGHT,
-            value_parser = parse_positive_usize
-        )]
-        fetch_replay_max_in_flight: usize,
     },
     #[cfg(feature = "gateway")]
     /// Run HTTP gateway exposing OpenAI/Anthropic/plain APIs over Hellas network
@@ -471,7 +410,7 @@ enum Commands {
         feature = "evaluate",
         command(group(
             clap::ArgGroup::new("causal_lm_local_mode")
-                .args(["local", "verify_local"])
+                .args(["local"])
         ))
     )]
     #[cfg_attr(
@@ -542,7 +481,7 @@ enum Commands {
         #[cfg_attr(all(feature = "cloud", unix), arg(requires = "remote_target"))]
         #[cfg_attr(not(all(feature = "cloud", unix)), arg(requires = "node_id"))]
         node_addrs: Vec<SocketAddr>,
-        /// Run locally with Catena instead of the Hellas network
+        /// Select an owner machine; requires an owner grant
         #[cfg(feature = "evaluate")]
         #[arg(
             long = "local",
@@ -551,26 +490,6 @@ enum Commands {
             requires = "causal_lm_local_content"
         )]
         local: bool,
-        /// Run remotely and verify that the response matches local Catena execution
-        #[cfg(feature = "evaluate")]
-        #[arg(
-            long = "verify-local",
-            default_value_t = false,
-            conflicts_with_all = ["local", "verify"],
-            requires = "causal_lm_local_content"
-        )]
-        verify_local: bool,
-        /// Verify the primary remote node against a second remote node
-        #[cfg_attr(
-            feature = "evaluate",
-            arg(
-                long = "verify",
-                conflicts_with_all = ["local", "verify_local"],
-                requires = "node_id"
-            )
-        )]
-        #[cfg_attr(not(feature = "evaluate"), arg(long = "verify", requires = "node_id"))]
-        verify: Option<EndpointId>,
         /// Maximum number of queued local executions when `--local` is set
         #[cfg(feature = "evaluate")]
         #[arg(
@@ -629,8 +548,6 @@ enum Commands {
         #[arg(last = true, allow_hyphen_values = true, requires = "wrap")]
         wrap_args: Vec<String>,
     },
-    /// Inspect and prune inference recordings
-    OutputCache(commands::output_cache::OutputCacheArgs),
     /// Query a remote node via RPC
     Rpc {
         /// Node ID to check
@@ -638,11 +555,6 @@ enum Commands {
         /// Direct UDP address hint for the target node. Repeat or use commas.
         #[arg(long = "node-addr", value_delimiter = ',')]
         node_addrs: Vec<SocketAddr>,
-    },
-    /// Fetch canonical artifact bytes from a node
-    Artifact {
-        #[command(subcommand)]
-        command: commands::artifact::ArtifactCommand,
     },
     /// Inspect or run the durable paid-work client path.
     #[cfg(feature = "node")]
@@ -665,127 +577,6 @@ enum Commands {
     Chain {
         #[command(subcommand)]
         command: commands::chain::ChainCommand,
-    },
-    #[cfg(feature = "llm")]
-    /// Run token-native Catena inference remotely, or locally when built with `evaluate`
-    #[cfg_attr(
-        feature = "evaluate",
-        command(group(
-            clap::ArgGroup::new("causal_lm_local_mode").args(["local", "verify_local"])
-        ))
-    )]
-    #[cfg_attr(
-        feature = "evaluate",
-        command(group(
-            clap::ArgGroup::new("causal_lm_local_content")
-                .args(["content_paths", "content_roots"])
-                .multiple(true)
-        ))
-    )]
-    #[cfg_attr(all(feature = "cloud", unix), command(group(
-        clap::ArgGroup::new("remote_target").args(["node_id", "machine"])
-    )))]
-    Llm {
-        /// Select any owned cloud or bare-metal machine from this identity's inventory.
-        #[cfg(all(feature = "cloud", unix))]
-        #[arg(long, conflicts_with_all = ["node_id", "provider_genesis", "apple_app_attest_app_id", "apple_app_attest_cdhashes"])]
-        #[cfg_attr(feature = "evaluate", arg(conflicts_with_all = ["local", "verify_local"]))]
-        machine: Option<String>,
-        #[command(flatten)]
-        remote_trust: RemoteTrustArgs,
-        #[command(flatten)]
-        causal_lm: CausalLmArgs,
-        /// Node ID to run on remotely (omit to auto-discover)
-        node_id: Option<EndpointId>,
-        /// Direct UDP address hint for the target node. Repeat or use commas.
-        #[arg(long = "node-addr", value_delimiter = ',')]
-        #[cfg_attr(all(feature = "cloud", unix), arg(requires = "remote_target"))]
-        #[cfg_attr(not(all(feature = "cloud", unix)), arg(requires = "node_id"))]
-        node_addrs: Vec<SocketAddr>,
-        /// Prompt to send (required)
-        #[arg(short = 'p', long = "prompt")]
-        prompt: String,
-        /// Publish prompt- and token-bearing artifacts through Courtesy.
-        #[arg(long = "retain", action = clap::ArgAction::SetTrue)]
-        retain: bool,
-        /// Maximum number of new tokens to generate
-        #[arg(
-            long = "max-new-tokens",
-            default_value_t = 16,
-            value_parser = clap::value_parser!(u32).range(1..)
-        )]
-        max_new_tokens: u32,
-        /// Max execution retries on failure (discovery path only)
-        #[arg(long = "retries", default_value_t = 2)]
-        retries: usize,
-        /// Run locally with Catena instead of the Hellas network
-        #[cfg(feature = "evaluate")]
-        #[arg(
-            long = "local",
-            default_value_t = false,
-            conflicts_with_all = ["verify_local", "node_id", "node_addrs"],
-            requires = "causal_lm_local_content"
-        )]
-        local: bool,
-        /// Run remotely and locally, then verify that both outputs match
-        #[cfg(feature = "evaluate")]
-        #[arg(
-            long = "verify-local",
-            default_value_t = false,
-            conflicts_with = "local",
-            requires = "causal_lm_local_content"
-        )]
-        verify_local: bool,
-    },
-    /// Run a signed, manifest-pinned Fetch request
-    ///
-    /// The selected Fetch contract strictly structures the upstream request
-    /// and destructures its adversarial response into signed output. A
-    /// platform-backed assurance authenticates the app; producer-signed does not.
-    #[cfg_attr(all(feature = "cloud", unix), command(group(
-        clap::ArgGroup::new("remote_target").args(["node_id", "machine"])
-    )))]
-    Fetch {
-        /// Select any owned cloud or bare-metal machine from this identity's inventory.
-        #[cfg(all(feature = "cloud", unix))]
-        #[arg(long, conflicts_with_all = ["node_id", "provider_genesis", "apple_app_attest_app_id", "apple_app_attest_cdhashes"])]
-        machine: Option<String>,
-        #[command(flatten)]
-        remote_trust: RemoteTrustArgs,
-        /// Node ID to run on remotely (omit to auto-discover)
-        node_id: Option<EndpointId>,
-        /// Direct UDP address hint for the target node. Repeat or use commas.
-        #[arg(long = "node-addr", value_delimiter = ',')]
-        #[cfg_attr(all(feature = "cloud", unix), arg(requires = "remote_target"))]
-        #[cfg_attr(not(all(feature = "cloud", unix)), arg(requires = "node_id"))]
-        node_addrs: Vec<SocketAddr>,
-        /// Fetch service label. The protocol records it but does not interpret it.
-        #[arg(long)]
-        service: String,
-        /// Fetch method label. The protocol records it but does not interpret it.
-        #[arg(long)]
-        method: String,
-        /// Built-in Fetch environment alias (`codex-responses` or
-        /// `openai-responses`) or exact ProgramManifest ContentId. This pins
-        /// the exact request structuring and response destructuring contract.
-        #[arg(long = "execution-environment", value_parser = parse_fetch_environment)]
-        execution_environment: hellas_rpc::ContentId,
-        /// Exact UTF-8 JSON request input signed by this caller.
-        #[arg(
-            long,
-            conflicts_with = "payload_file",
-            required_unless_present = "payload_file"
-        )]
-        payload: Option<String>,
-        /// Read exact UTF-8 JSON request input from a file.
-        #[arg(long = "payload-file")]
-        payload_file: Option<PathBuf>,
-        /// Max execution retries on failure (discovery path only)
-        #[arg(long = "retries", default_value_t = 2)]
-        retries: usize,
-        /// Publish the signed input/output transcript through Courtesy.
-        #[arg(long = "retain", action = clap::ArgAction::SetTrue)]
-        retain: bool,
     },
     /// Inspect the local identity file
     Identity {
@@ -856,9 +647,6 @@ enum Commands {
 impl Commands {
     fn owned_machine(&self) -> Option<&str> {
         match self {
-            Self::Fetch { machine, .. } => machine.as_deref(),
-            #[cfg(feature = "llm")]
-            Self::Llm { machine, .. } => machine.as_deref(),
             #[cfg(feature = "gateway")]
             Self::Gateway { machine, .. } => machine.as_deref(),
             _ => None,
@@ -872,7 +660,6 @@ fn validate_identity_options(
     software_root: bool,
 ) -> Result<(), String> {
     let identity_free = match command {
-        Commands::OutputCache(args) if args.node_id.is_none() => Some("output-cache"),
         Commands::Store { .. } => Some("store"),
         Commands::Environment { .. } => Some("environment"),
         #[cfg(feature = "node")]
@@ -899,7 +686,6 @@ fn validate_identity_options(
     }
 
     let reads_existing_identity = match command {
-        Commands::OutputCache(args) => args.node_id.is_some(),
         #[cfg(all(feature = "cloud", unix))]
         command if command.owned_machine().is_some() => true,
         #[cfg(all(feature = "cloud", unix))]
@@ -1046,16 +832,6 @@ async fn async_main() {
     // effect; in particular, validator config generation runs in a pure Nix
     // build where there is deliberately no writable home directory.
     let command = match cli.command {
-        Commands::OutputCache(args) => {
-            let result =
-                commands::output_cache::run(args, cli.store_dir, cli.identity.as_deref()).await;
-            tracer_provider.shutdown();
-            if let Err(error) = result {
-                eprintln!("error: {error:#}");
-                std::process::exit(1);
-            }
-            return;
-        }
         #[cfg(all(feature = "cloud", unix))]
         command @ (Commands::Cloud(_) | Commands::Machines(_) | Commands::Control(_)) => {
             let result = cloud::run(command, cli.identity.as_deref()).await;
@@ -1116,7 +892,7 @@ async fn async_main() {
         && let Err(error) = validate_serve_assurance(
             cli.software_root,
             *assurance,
-            Some(local_identity.genesis.statement.root_kind),
+            Some(local_identity.enrollment.genesis.statement.root_kind),
         )
     {
         eprintln!("error: {error}");
@@ -1126,11 +902,8 @@ async fn async_main() {
     let result = match command {
         #[cfg(feature = "node")]
         Commands::Serve {
-            owner,
             assurance,
-            admin_peers,
             port,
-            execute_policy,
             queue_size,
             #[cfg(feature = "evaluate")]
             content_paths,
@@ -1152,9 +925,6 @@ async fn async_main() {
             gpu_compile_timeout_secs,
             #[cfg(feature = "evaluate")]
             gpu_execution_timeout_secs,
-            #[cfg(feature = "evaluate")]
-            evaluate_retained_execution_capacity,
-            artifact_store_path,
             work_config_file,
             metrics_port,
             graffiti,
@@ -1162,8 +932,6 @@ async fn async_main() {
             check_config: _,
             fetch_max_in_flight,
             fetch_queue_size,
-            fetch_retained_transcript_capacity,
-            fetch_replay_max_in_flight,
         } => {
             // Loaded before anything binds: a work configuration that
             // will not load is a node that would advertise two paid
@@ -1192,20 +960,8 @@ async fn async_main() {
                         )
                         .map_err(anyhow::Error::msg)?
                         .with_backend(gpu_backend);
-                        let cache_options = commands::output_cache::options(
-                            cli.output_cache,
-                            cli.store_dir.clone(),
-                        )?;
-                        let _control = commands::local_control::serve(
-                            cli.control_socket.as_deref(),
-                            &cache_options,
-                        )?;
                         commands::serve::run(commands::serve::ServeOptions {
-                            admin_peers,
-                            output_cache: cache_options,
-                            owner,
                             port,
-                            execute_policy,
                             queue_size,
                             #[cfg(feature = "evaluate")]
                             content_paths,
@@ -1219,21 +975,15 @@ async fn async_main() {
                             }),
                             #[cfg(feature = "evaluate")]
                             gpu_config,
-                            #[cfg(feature = "evaluate")]
-                            evaluate_retained_execution_capacity,
-                            artifact_store_path,
-                            work_config,
+                                            work_config,
                             metrics_port,
                             graffiti,
                             fetch_config_file,
                             fetch_max_in_flight,
                             fetch_queue_size,
-                            fetch_retained_transcript_capacity,
-                            fetch_replay_max_in_flight,
                             secret_key,
                             producer_key: local_identity.producer_key,
                             settlement_key,
-                            provider_genesis: local_identity.enrollment.canonical_bytes(),
                             open_identity,
                             assurance,
                         })
@@ -1272,7 +1022,6 @@ async fn async_main() {
                 .await
             }.await
         },
-        Commands::OutputCache(..) => unreachable!("cache commands handled before identity load"),
         #[cfg(feature = "gateway")]
         Commands::Gateway {
             http_fetch_config,
@@ -1294,10 +1043,7 @@ async fn async_main() {
             #[cfg(feature = "evaluate")]
             local,
             #[cfg(feature = "evaluate")]
-            verify_local,
-            verify,
-            #[cfg(feature = "evaluate")]
-            queue_size,
+            queue_size: _,
             retries,
             default_max_tokens,
             metrics_port,
@@ -1312,27 +1058,28 @@ async fn async_main() {
             wrap_args,
         } => {
             async {
+                #[cfg(feature = "evaluate")]
+                if local {
+                    return Err(hellas_client::ClientError::OwnerGrantRequired.into());
+                }
                 let output_cache = cli.output_cache;
                 let cache_options =
-                    commands::output_cache::options(output_cache, cli.store_dir.clone())?;
-                let _control =
-                    commands::local_control::serve(cli.control_socket.as_deref(), &cache_options)?;
+                    commands::gateway_cache::options(output_cache, cli.store_dir.clone())?;
                 let (
                     loaded_environment,
                     model_name,
                     tokenizer,
                     stop_token_ids,
-                    local_content_store,
                 ) = if let Some(CausalLmArgs {
                     environment,
                     manifest_id,
                     model,
                     #[cfg(feature = "evaluate")]
-                    content_paths,
+                    content_paths: _,
                     #[cfg(feature = "evaluate")]
-                    content_roots,
+                    content_roots: _,
                     #[cfg(feature = "evaluate")]
-                    content_index,
+                    content_index: _,
                     tokenizer,
                     stop_token_ids,
                 }) = causal_lm
@@ -1342,42 +1089,15 @@ async fn async_main() {
                     let model_name = model.unwrap_or_else(|| {
                         loaded_environment.execution().manifest_id().to_string()
                     });
-                    #[cfg(feature = "evaluate")]
-                    let local_content_store =
-                        if output_cache == hellas_rpc::cache::CachePolicy::ReplayOnly {
-                            None
-                        } else {
-                            commands::llm::local_content_store(
-                                local || verify_local,
-                                &environment,
-                                &loaded_environment,
-                                content_paths,
-                                content_roots,
-                                content_index.or_else(|| {
-                                    cli.store_dir
-                                        .as_deref()
-                                        .map(hellas_store::state::records_path_at)
-                                }),
-                            )?
-                        };
-                    #[cfg(not(feature = "evaluate"))]
-                    let local_content_store = ();
                     (
                         Some(loaded_environment.into_execution()),
                         model_name,
                         Some(tokenizer),
                         stop_token_ids,
-                        local_content_store,
                     )
                 } else {
-                    #[cfg(feature = "evaluate")]
-                    let local_content_store = None;
-                    #[cfg(not(feature = "evaluate"))]
-                    let local_content_store = ();
-                    (None, String::new(), None, Vec::new(), local_content_store)
+                    (None, String::new(), None, Vec::new())
                 };
-                #[cfg(not(feature = "evaluate"))]
-                let () = local_content_store;
                 #[cfg(all(feature = "cloud", unix))]
                 anyhow::ensure!(
                     machine.is_none() || responses_backend != GatewayResponsesBackend::Proxy,
@@ -1392,19 +1112,18 @@ async fn async_main() {
                 )
                 .await?;
                 let assurance = remote_trust.assurance;
-                #[cfg(not(feature = "evaluate"))]
+                #[cfg(all(feature = "node", not(feature = "evaluate")))]
                 let local = false;
                 #[cfg(feature = "node")]
                 let paid_work = if let Some(path) = paid_work_config.as_ref()
                     && output_cache != hellas_rpc::cache::CachePolicy::ReplayOnly
                 {
                     anyhow::ensure!(
-                        !local && verify.is_none() && node_id.is_none()
+                        !local && node_id.is_none()
                             && responses_backend == GatewayResponsesBackend::Hellas,
-                        "--paid-work-config requires remote Hellas execution without --local, --verify, --node-id, or a Responses override",
+                        "--paid-work-config requires remote Hellas execution without --local, --node-id, or a Responses override",
                     );
                     #[cfg(feature = "evaluate")]
-                    anyhow::ensure!(!verify_local, "--paid-work-config cannot use --verify-local");
                     anyhow::ensure!(http_fetch_config.is_some() || assurance == hellas_rpc::Assurance::ProducerSigned,
                         "token-native paid work uses producer-signed assurance");
                     anyhow::ensure!(
@@ -1429,14 +1148,7 @@ async fn async_main() {
                 {
                     None
                 } else {
-                    gateway_provider_trust(
-                        local,
-                        responses_backend,
-                        remote_trust.provider_genesis,
-                        assurance,
-                        remote_trust.apple_app_attest_app_id,
-                        remote_trust.apple_app_attest_cdhashes,
-                    )?
+                    gateway_provider_trust(responses_backend)?
                 };
                 let archive = hellas_gateway::ArchiveOptions {
                     directory: archive_dir.map(Ok).unwrap_or_else(identity::default_gateway_archive_path)?,
@@ -1464,19 +1176,10 @@ async fn async_main() {
                     port,
                     node_id,
                     node_addrs,
-                    #[cfg(feature = "evaluate")]
-                    local,
-                    #[cfg(feature = "evaluate")]
-                    verify_local,
-                    verify,
-                    #[cfg(feature = "evaluate")]
-                    queue_size,
                     retries,
                     default_max_tokens,
                     model_name,
                     causal_lm: loaded_environment,
-                    #[cfg(feature = "evaluate")]
-                    local_content_store,
                     tokenizer,
                     stop_token_ids,
                     metrics_port,
@@ -1490,8 +1193,6 @@ async fn async_main() {
                         .unwrap_or_default(),
                     provider_trust,
                     producer_key: local_identity.producer_key,
-                    #[cfg(feature = "evaluate")]
-                    provider_genesis: local_identity.enrollment.canonical_bytes(),
                     assurance,
                     secret_key,
                     wrap,
@@ -1505,7 +1206,6 @@ async fn async_main() {
             node_id,
             node_addrs,
         } => commands::rpc::run(node_id, node_addrs, secret_key).await,
-        Commands::Artifact { command } => commands::artifact::run(command, secret_key).await,
         #[cfg(feature = "node")]
         Commands::PaidWork { command } => {
             commands::paid_work::run(
@@ -1525,155 +1225,6 @@ async fn async_main() {
         }
         Commands::Environment { .. } => {
             unreachable!("environment commands handled before identity load")
-        }
-        #[cfg(feature = "llm")]
-        Commands::Llm {
-            #[cfg(all(feature = "cloud", unix))]
-            machine,
-            remote_trust,
-            causal_lm,
-            node_id,
-            node_addrs,
-            prompt,
-            retain,
-            max_new_tokens,
-            retries,
-            #[cfg(feature = "evaluate")]
-            local,
-            #[cfg(feature = "evaluate")]
-            verify_local,
-        } => {
-            async {
-                let CausalLmArgs {
-                    environment,
-                    manifest_id,
-                    model,
-                    #[cfg(feature = "evaluate")]
-                    content_paths,
-                    #[cfg(feature = "evaluate")]
-                    content_roots,
-                    #[cfg(feature = "evaluate")]
-                    content_index,
-                    tokenizer,
-                    stop_token_ids,
-                } = causal_lm;
-                let loaded_environment =
-                    commands::llm::load_environment(&environment, manifest_id)?;
-                let model_name = model
-                    .unwrap_or_else(|| loaded_environment.execution().manifest_id().to_string());
-                #[cfg(feature = "evaluate")]
-                let local_content_store =
-                    if cli.output_cache == hellas_rpc::cache::CachePolicy::ReplayOnly {
-                        None
-                    } else {
-                        commands::llm::local_content_store(
-                            local || verify_local,
-                            &environment,
-                            &loaded_environment,
-                            content_paths,
-                            content_roots,
-                            content_index.or_else(|| {
-                                cli.store_dir
-                                    .as_deref()
-                                    .map(hellas_store::state::records_path_at)
-                            }),
-                        )?
-                    };
-                #[cfg(all(feature = "cloud", unix))]
-                let (node_id, remote_trust) = cloud::machine_route(
-                    machine.as_deref(), &secret_key, node_id, remote_trust,
-                ).await?;
-                commands::llm::run(
-                    commands::llm::ExecuteOptions {
-                        output_cache: commands::output_cache::options(
-                            cli.output_cache,
-                            cli.store_dir,
-                        )?,
-                        node_id,
-                        node_addrs,
-                        model_name,
-                        causal_lm: loaded_environment.into_execution(),
-                        #[cfg(feature = "evaluate")]
-                        local_content_store,
-                        tokenizer,
-                        stop_token_ids,
-                        prompt,
-                        retain,
-                        max_new_tokens,
-                        retries,
-                        #[cfg(feature = "evaluate")]
-                        local,
-                        #[cfg(feature = "evaluate")]
-                        verify_local,
-                        producer_key: local_identity.producer_key,
-                        #[cfg(feature = "evaluate")]
-                        provider_genesis: local_identity.enrollment.canonical_bytes(),
-                        expected_provider_genesis: remote_trust.provider_genesis,
-                        apple_app_attest_app_id: remote_trust.apple_app_attest_app_id,
-                        apple_app_attest_cdhashes: remote_trust.apple_app_attest_cdhashes,
-                        assurance: remote_trust.assurance,
-                    },
-                    secret_key,
-                )
-                .await
-            }
-            .await
-        }
-        Commands::Fetch {
-            #[cfg(all(feature = "cloud", unix))]
-            machine,
-            remote_trust,
-            node_id,
-            node_addrs,
-            service,
-            method,
-            execution_environment,
-            payload,
-            payload_file,
-            retries,
-            retain,
-        } => {
-            let payload = match (payload, payload_file) {
-                (Some(payload), None) => Ok(payload.into_bytes()),
-                (None, Some(path)) => commands::fetch::load_payload_file(&path),
-                (None, None) => unreachable!("clap requires --payload or --payload-file"),
-                (Some(_), Some(_)) => unreachable!("clap rejects both payload sources"),
-            };
-            match payload {
-                Ok(payload) => {
-                    async {
-                        #[cfg(all(feature = "cloud", unix))]
-                        let (node_id, remote_trust) = cloud::machine_route(
-                            machine.as_deref(), &secret_key, node_id, remote_trust,
-                        ).await?;
-                        commands::fetch::run(
-                            commands::fetch::ExecuteOptions {
-                                output_cache: commands::output_cache::options(
-                                    cli.output_cache,
-                                    cli.store_dir,
-                                )?,
-                                node_id,
-                                node_addrs,
-                                service,
-                                method,
-                                execution_environment,
-                                payload,
-                                retries,
-                                retain,
-                                producer_key: local_identity.producer_key,
-                                expected_provider_genesis: remote_trust.provider_genesis,
-                                apple_app_attest_app_id: remote_trust.apple_app_attest_app_id,
-                                apple_app_attest_cdhashes: remote_trust.apple_app_attest_cdhashes,
-                                assurance: remote_trust.assurance,
-                            },
-                            secret_key,
-                        )
-                        .await
-                    }
-                    .await
-                }
-                Err(err) => Err(err),
-            }
         }
         Commands::Identity { command } => match command {
             IdentityCommand::Init => Ok(()),

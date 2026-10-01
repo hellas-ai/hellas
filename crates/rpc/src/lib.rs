@@ -45,6 +45,8 @@ pub mod call;
 pub mod edge_index;
 #[cfg(feature = "evaluate")]
 pub mod evaluate;
+#[cfg(feature = "execute")]
+pub mod execution_event;
 #[cfg(feature = "fetch")]
 pub mod fetch;
 #[cfg(feature = "fetch")]
@@ -56,13 +58,10 @@ pub mod open;
 pub mod output;
 /// Peer registry, admission, and connection directory module.
 pub mod peers;
-/// Execution authorization policy module.
-#[cfg(feature = "execute")]
-pub mod policy;
 pub mod protocol;
-#[cfg(feature = "execute")]
-pub mod run_ticket;
 pub mod serve;
+#[cfg(feature = "execute")]
+pub mod signature_wire;
 #[cfg(feature = "execute")]
 pub mod stream;
 pub mod telemetry;
@@ -84,10 +83,10 @@ pub use protocol::{
     ContentId, ContentRef, DagCborDecodeError, DagCborDecoder, DagCborEncodeError, DagCborEncoder,
     Digest, Evaluate, EvaluateRequest, EventCommitment, FETCH_EVALUATOR, FetchEnvironment,
     InputCommitment, InputEventBody, InputEventBodyParts, InputEventEnvelope,
-    InputTranscriptBuilder, JobTerms, JsonBytes, MAX_APPLICATION_ID_BYTES,
-    MAX_CAUSAL_LM_ENVIRONMENT_BYTES, MAX_CAUSAL_LM_STATIC_BYTES, OPEN_EXPORTER_LEN, OPEN_NONCE_LEN,
-    OPEN_PROOF_DOMAIN, OPEN_PROVIDER_ROLE, OPENAI_RESPONSES_ADAPTOR, OPENAI_RESPONSES_ENDPOINT,
-    Operation, OutputEventBody, OutputEventBodyParts, OutputEventEnvelope, OutputTranscriptBuilder,
+    InputTranscriptBuilder, JsonBytes, MAX_APPLICATION_ID_BYTES, MAX_CAUSAL_LM_ENVIRONMENT_BYTES,
+    MAX_CAUSAL_LM_STATIC_BYTES, OPEN_EXPORTER_LEN, OPEN_NONCE_LEN, OPEN_PROOF_DOMAIN,
+    OPEN_PROVIDER_ROLE, OPENAI_RESPONSES_ADAPTOR, OPENAI_RESPONSES_ENDPOINT, Operation,
+    OutputEventBody, OutputEventBodyParts, OutputEventEnvelope, OutputTranscriptBuilder,
     PlatformCredential, PlatformEnrollment, ProducerId, ProducerSigningKey, ProgramManifest,
     ProviderEnrollmentBundle, ProviderGenesisDecodeError, ProviderGenesisStatement, PublicKey,
     RequestCommitment, Retention, RootKind, RootProof, SchemeId, Signature, SignatureError,
@@ -101,7 +100,7 @@ pub use protocol::{commitment, digest, retention, signature, tags, value};
 /// Protobuf-generated message types plus per-service typed client traits,
 /// method markers, and server dispatchers. The bare `pb` module is
 /// doc-hidden; use the per-service re-exports under
-/// `pb::{courtesy, swarm, execute, fetch, evaluate}` or the marker and
+/// `pb::{swarm, execute, fetch, evaluate}` or the marker and
 /// handler modules under `pb::services::*`.
 #[doc(hidden)]
 pub mod pb;
@@ -157,13 +156,3 @@ pub const DEFAULT_FETCH_MAX_IN_FLIGHT: usize = 16;
 /// Default bound on Fetch executions waiting behind active provider streams.
 #[cfg(feature = "execute")]
 pub const DEFAULT_FETCH_QUEUE_CAPACITY: usize = 64;
-
-/// Default maximum number of distinct retained Fetch transcripts, including
-/// both completed transcripts and indeterminate running markers.
-#[cfg(feature = "execute")]
-pub const DEFAULT_FETCH_RETAINED_TRANSCRIPT_CAPACITY: usize = 1024;
-
-/// Default maximum number of retained Fetch transcripts being replayed to
-/// consumers at once.
-#[cfg(feature = "execute")]
-pub const DEFAULT_FETCH_REPLAY_MAX_IN_FLIGHT: usize = 16;

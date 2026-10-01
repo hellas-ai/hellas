@@ -30,7 +30,6 @@ use hellas_rpc::protocol::work::{
 };
 use hellas_rpc::protocol::work_bundle::WorkChannelSetupBundleV1;
 use hellas_rpc::protocol::work_setup::ProviderChannelPolicy;
-use hellas_rpc::services::execute::ExecuteClientImpl;
 use hellas_rpc::services::work::WorkClientImpl;
 use hellas_rpc::services::work_setup::WorkSetupClientImpl;
 use hellas_rpc::{
@@ -314,202 +313,6 @@ async fn one_slow_rpc_does_not_serialize_its_connection() {
         .expect("the serve loop exits cleanly");
     client.close().await;
     server.close().await;
-}
-
-#[tokio::test]
-async fn remote_cache_cli_uses_the_nodes_existing_dispatch_and_admin_grant() {
-    use clap::Parser;
-    use hellas_rpc::cache::{
-        CacheKey, CacheKind, CacheOptions, CachePolicy, CacheStore, MemoryCacheStore,
-    };
-
-    let temporary = temp();
-    let identity_path = temporary.path().join("admin.identity");
-    let admin = crate::identity::load_or_create(Some(&identity_path)).unwrap();
-    let server = Endpoint::builder(presets::Minimal)
-        .alpns(vec![CacheControl::ALPN.as_bytes().to_vec()])
-        .bind_addr("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap())
-        .unwrap()
-        .bind()
-        .await
-        .unwrap();
-    let directory = Arc::new(PeerDirectory::with_config(
-        PeerId::from_bytes(*server.id().as_bytes()),
-        hellas_rpc::peer_directory_config(),
-    ));
-    let store = Arc::new(MemoryCacheStore::default());
-    store
-        .insert(&CacheKey::hash(CacheKind::Proxy, &[b"cli"]), b"output", 0)
-        .unwrap();
-    for granted in [false, true] {
-        let mut execution = test_remote_execution();
-        execution.control = CacheController::new(&CacheOptions {
-            policy: CachePolicy::Record,
-            store: Some(store.clone()),
-        });
-        if granted {
-            execution
-                .admin_policy
-                .peers
-                .push(PeerIdentity(*admin.transport_key.public().as_bytes()));
-        }
-        let handler = NodeHandlerImpl::new(
-            server.id(),
-            "admin-test".into(),
-            Vec::new(),
-            directory.clone(),
-        );
-        let manager = directory.manager();
-        let accepting = server.clone();
-        let task = tokio::spawn(async move {
-            let connection = accepting.accept().await.unwrap().await.unwrap();
-            serve_connection(
-                connection.alpn().to_vec(),
-                connection,
-                execution,
-                handler,
-                manager,
-                None,
-                None,
-            )
-            .await
-        });
-        let cli = crate::Cli::try_parse_from([
-            "hellas",
-            "--identity",
-            identity_path.to_str().unwrap(),
-            "output-cache",
-            "--node-id",
-            &server.id().to_string(),
-            "--node-addr",
-            &server.bound_sockets()[0].to_string(),
-            "clear",
-        ])
-        .unwrap();
-        let crate::Commands::OutputCache(args) = cli.command else {
-            panic!()
-        };
-        let result = tokio::time::timeout(
-            Duration::from_secs(10),
-            crate::commands::output_cache::run(args, None, cli.identity.as_deref()),
-        )
-        .await
-        .unwrap();
-        if granted {
-            result.unwrap();
-            assert!(store.list().unwrap().is_empty());
-        } else {
-            assert!(
-                result
-                    .unwrap_err()
-                    .to_string()
-                    .contains("administrative access")
-            );
-            assert_eq!(store.list().unwrap().len(), 1);
-        }
-        task.abort();
-    }
-    server.close().await;
-}
-
-#[tokio::test]
-async fn production_fetch_alpn_dispatches_run_ticket_on_its_connection() {
-    let alpn = <Fetch as ServiceMarker>::ALPN.as_bytes();
-    assert!(served_alpns(false).contains(&alpn.to_vec()));
-    let server = Endpoint::builder(presets::Minimal)
-        .secret_key(SecretKey::from_bytes(&[0x65; 32]))
-        .alpns(vec![alpn.to_vec()])
-        .bind_addr(
-            "127.0.0.1:0"
-                .parse::<std::net::SocketAddr>()
-                .expect("a loopback socket"),
-        )
-        .expect("the server has a valid bind address")
-        .bind()
-        .await
-        .expect("the server binds");
-    let target = EndpointAddr::from_parts(
-        server.id(),
-        server.bound_sockets().into_iter().map(TransportAddr::Ip),
-    );
-    let client = Endpoint::builder(presets::Minimal)
-        .secret_key(SecretKey::from_bytes(&[0x66; 32]))
-        .bind_addr(
-            "127.0.0.1:0"
-                .parse::<std::net::SocketAddr>()
-                .expect("a loopback socket"),
-        )
-        .expect("the client has a valid bind address")
-        .bind()
-        .await
-        .expect("the client binds");
-
-    let local_peer = PeerId::from_bytes(*server.id().as_bytes());
-    let directory = Arc::new(PeerDirectory::with_config(
-        local_peer,
-        hellas_rpc::peer_directory_config(),
-    ));
-    let node_handler = NodeHandlerImpl::new(
-        server.id(),
-        "fetch-dispatch-test".to_string(),
-        Vec::new(),
-        directory.clone(),
-    );
-    let accepting_server = server.clone();
-    let serving = tokio::spawn(async move {
-        let incoming = accepting_server
-            .accept()
-            .await
-            .expect("the server receives the Fetch dial");
-        let connection = incoming
-            .accept()
-            .expect("the server accepts the Fetch dial")
-            .await
-            .expect("the Fetch handshake completes");
-        serve_connection(
-            connection.alpn().to_vec(),
-            connection,
-            test_remote_execution(),
-            node_handler,
-            directory.manager(),
-            None,
-            None,
-        )
-        .await
-    });
-
-    let connection = client
-        .connect(target, alpn)
-        .await
-        .expect("the client dials the advertised Fetch ALPN");
-    let closing = connection.clone();
-    let mut response = match ExecuteClientImpl::new(IrohTransport::new(connection))
-        .run_ticket(hellas_rpc::pb::execute::RunTicketRequest::default())
-        .await
-    {
-        Ok(response) => response,
-        Err(error) => panic!("RunTicket method did not reach its server stream: {error}"),
-    };
-    let error = match response.next().await {
-        Some(Err(error)) => error,
-        Some(Ok(_)) => panic!("an empty ticket cannot produce work events"),
-        None => match response.finish() {
-            Ok(_) => panic!("an empty ticket must end with an error trailer"),
-            Err(error) => error,
-        },
-    };
-    assert_ne!(
-        error.code(),
-        hellas_wire::WireCode::Unimplemented,
-        "Fetch ALPN must route RunTicket to Execute, not its Fetch fallback",
-    );
-    closing.close(0_u32.into(), b"test complete");
-    let _ = tokio::time::timeout(Duration::from_secs(5), serving)
-        .await
-        .expect("the Fetch serve loop observes connection close")
-        .expect("the Fetch server task does not panic");
-    server.close().await;
-    client.close().await;
 }
 
 async fn exchange_routed_setup(
@@ -1189,18 +992,7 @@ fn test_remote_execution() -> RemoteExecutionServices {
     let identity_path = directory.path().join("identity");
     let identity = crate::identity::load_or_create(Some(&identity_path))
         .expect("the test remote-execution identity is created");
-    let executor = Executor::spawn_with_producer_key(
-        ExecutePolicy::Deny,
-        hellas_rpc::DEFAULT_EXECUTION_QUEUE_CAPACITY,
-        identity.producer_key.clone(),
-        identity.enrollment.canonical_bytes(),
-        Assurance::ProducerSigned,
-    )
-    .expect("the test remote-execution actor starts");
     RemoteExecutionServices {
-        control: CacheController::new(&Default::default()),
-        admin_policy: AdminPolicy::default(),
-        executor,
         open_identity: identity.open_identity(),
     }
 }
@@ -3600,7 +3392,7 @@ async fn the_clock_serves_work_from_the_channel_it_was_handed() {
 }
 
 /// Discovery must resume the obligation already recorded by an Accepted
-/// journal; no client retries a request and no transient Courtesy state is
+/// journal; no client retries a request and no transient executor state is
 /// present after this simulated process restart.
 #[test]
 fn the_clock_resumes_an_accepted_job_after_restart() {

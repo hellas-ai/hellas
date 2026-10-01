@@ -33,25 +33,6 @@ fn token_artifact_heap_accounting_uses_owned_capacities() {
     assert!(policy.stop_token_ids.capacity() > policy.stop_token_ids.len());
 }
 
-#[cfg(feature = "courtesy")]
-#[test]
-fn maximum_token_artifact_fits_one_courtesy_wire_frame() {
-    use crate::pb::courtesy::GetArtifactResponse;
-    use hellas_wire::frame::MAX_FRAME_BYTES;
-    use prost::Message as _;
-
-    let count = usize::try_from(super::MAX_RETRIEVABLE_TOKEN_IDS).unwrap();
-    let canonical_artifact =
-        TokenIds::from_u32s(std::iter::repeat_n(u32::MAX, count)).canonical_bytes();
-    let response = GetArtifactResponse { canonical_artifact };
-    let protobuf_body = response.encode_to_vec();
-
-    // One byte is reserved for the wire frame kind in addition to the
-    // protobuf body emitted by unary dispatch.
-    assert_eq!(protobuf_body.len(), response.encoded_len());
-    assert!(protobuf_body.len() < MAX_FRAME_BYTES);
-}
-
 /// Golden bytes, captured from this schema's previous home in
 /// `hellas-executor`, decoded field by field.
 ///

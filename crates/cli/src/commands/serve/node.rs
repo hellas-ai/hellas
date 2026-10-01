@@ -8,7 +8,6 @@
 //! owned by the service-discovery path and is not started from this
 //! bootstrap.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::Mutex;
@@ -18,17 +17,10 @@ use anyhow::Context;
 #[cfg(test)]
 use hellas_chain::FinalizedWorkView;
 #[cfg(feature = "evaluate")]
-use hellas_executor::ArtifactStoreConfig;
-#[cfg(feature = "evaluate")]
 use hellas_executor::GpuConfig;
-use hellas_executor::{
-    CourtesyServer, ExecuteServer, Executor, ExecutorMetrics, ExecutorSpawnConfig,
-    FetchAccessPolicy, FetchQuotaStoreBackend, FetchRouteRegistry, FetchServer,
-    FetchTranscriptStoreBackend,
-};
+use hellas_executor::{Executor, ExecutorMetrics, ExecutorSpawnConfig, FetchRouteRegistry};
 #[cfg(test)]
 use hellas_kernel::{EdgeId, NetworkId, Secp256k1Signer, Secp256k1Verifier};
-use hellas_rpc::cache::control::CacheController;
 use hellas_rpc::open::OpenDispatcher;
 #[cfg(test)]
 use hellas_rpc::pb::work::{
@@ -39,12 +31,7 @@ use hellas_rpc::pb::work::{
 };
 use hellas_rpc::peers::PeerId;
 use hellas_rpc::peers::{PeerDirectory, PeerManager};
-use hellas_rpc::policy::ExecutePolicy;
-use hellas_rpc::serve::{AccountingDispatcher, AdminPolicy, Authorized, MethodDispatcher};
-use hellas_rpc::services::cache_control::{CacheControl, CacheControlServer};
-use hellas_rpc::services::courtesy::{Courtesy, Open as CourtesyOpen};
-use hellas_rpc::services::execute::RunTicket;
-use hellas_rpc::services::fetch::{Fetch, Open as FetchOpen};
+use hellas_rpc::serve::AccountingDispatcher;
 use hellas_rpc::services::node::{Node, NodeServer};
 use hellas_rpc::services::work::{Work, WorkServer};
 use hellas_rpc::services::work_setup::{WorkSetup, WorkSetupServer};
@@ -143,85 +130,45 @@ impl NodeHandle {
 }
 
 pub(super) struct NodeConfig {
-    pub(super) admin_peers: Vec<EndpointId>,
-    pub(super) output_cache: hellas_rpc::cache::CacheOptions,
-    pub(super) owner: Option<EndpointId>,
     pub(super) port: Option<u16>,
-    pub(super) execute_policy: ExecutePolicy,
     pub(super) queue_size: usize,
     #[cfg(feature = "evaluate")]
     pub(super) content_store: hellas_store::ContentStore,
     pub(super) build: String,
     pub(super) graffiti: Vec<u8>,
-    pub(super) fetch_access_policy: FetchAccessPolicy,
-    pub(super) artifact_store_path: PathBuf,
     pub(super) fetch_routes: FetchRouteRegistry,
     pub(super) fetch_max_in_flight: usize,
     pub(super) fetch_queue_size: usize,
-    pub(super) fetch_retained_transcript_capacity: usize,
-    pub(super) fetch_replay_max_in_flight: usize,
     /// What the clock over this node's paid-work journals is built
     /// from, or `None` when no work configuration was loaded. Its
     /// presence is still what advertises the two work ALPNs.
     pub(super) work: Option<WorkRunnerConfig>,
     pub(super) secret_key: SecretKey,
     pub(super) producer_key: ProducerSigningKey,
-    pub(super) provider_genesis: Vec<u8>,
     pub(super) open_identity: Arc<OpenIdentity>,
     pub(super) assurance: Assurance,
     pub(super) metrics: Arc<ExecutorMetrics>,
-    #[cfg(feature = "evaluate")]
-    pub(super) artifact_store: ArtifactStoreConfig,
     #[cfg(feature = "evaluate")]
     pub(super) gpu_config: GpuConfig,
 }
 
 #[derive(Clone)]
 struct RemoteExecutionServices {
-    control: CacheController,
-    admin_policy: AdminPolicy,
-    executor: hellas_executor::ExecutorHandle,
     open_identity: Arc<OpenIdentity>,
 }
 
 pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle> {
-    let control = CacheController::new(&config.output_cache);
-    let admin_policy = AdminPolicy {
-        local_owner: false,
-        peers: config
-            .admin_peers
-            .iter()
-            .chain(config.owner.iter())
-            .map(|peer| hellas_wire::PeerIdentity(*peer.as_bytes()))
-            .collect(),
-    };
-    let fetch_store = FetchTranscriptStoreBackend::fs_with_capacity(
-        config.artifact_store_path.join("fetch-transcripts"),
-        config.fetch_retained_transcript_capacity,
-    );
-    let fetch_access_policy = config
-        .fetch_access_policy
-        .with_store(FetchQuotaStoreBackend::fs(
-            config.artifact_store_path.join("fetch-quota"),
-        ));
     let mut executor = ExecutorSpawnConfig::fetch_only(
         Arc::new(config.producer_key),
-        Arc::new(config.provider_genesis),
         config.assurance,
         config.fetch_routes,
     );
-    executor.output_cache = config.output_cache;
-    executor.execute_policy = config.execute_policy;
     executor.queue_capacity = config.queue_size;
     executor.metrics = config.metrics.clone();
-    executor.fetch_access_policy = fetch_access_policy;
     executor.fetch_max_in_flight = config.fetch_max_in_flight;
     executor.fetch_queue_capacity = config.fetch_queue_size;
-    executor.fetch_replay_max_in_flight = config.fetch_replay_max_in_flight;
-    executor.fetch_store = fetch_store;
     #[cfg(feature = "evaluate")]
     {
-        executor.artifact_store = config.artifact_store;
         executor.content_store = config.content_store;
         executor.gpu_config = config.gpu_config;
     }
@@ -229,10 +176,7 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
         .await
         .context("failed to spawn executor")?;
     let advertised_alpns = served_alpns(config.work.is_some());
-    let mut alpns = advertised_alpns.clone();
-    if !admin_policy.peers.is_empty() {
-        alpns.push(CacheControl::ALPN.as_bytes().to_vec());
-    }
+    let alpns = advertised_alpns.clone();
     let mut builder = Endpoint::builder(presets::N0)
         .secret_key(config.secret_key)
         .alpns(alpns.clone());
@@ -281,9 +225,6 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
     // handle live in every remote-execution handler and, when paid work is
     // configured, in its mount as well.
     let remote_execution = RemoteExecutionServices {
-        control,
-        admin_policy,
-        executor: handle.clone(),
         open_identity: config.open_identity,
     };
     let work_mount: MountedWork = MountedWork::with_backend(handle);
@@ -310,7 +251,6 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
 
     // -- Accept loop: one task per inbound Connection; per-Connection
     //    dispatch routed by ALPN to the matching service handler.
-    let owner = config.owner;
     let accept_endpoint = endpoint.clone();
     let accept_task = tokio::spawn(async move {
         let connection_slots = Arc::new(Semaphore::new(MAX_ACTIVE_RPC_CONNECTIONS));
@@ -351,10 +291,6 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
                         return;
                     }
                 };
-                if owner.is_some_and(|owner| owner != conn.remote_id()) {
-                    conn.close(0u32.into(), b"unauthorized");
-                    return;
-                }
                 let alpn = conn.alpn().to_vec();
                 debug!(
                     alpn = %String::from_utf8_lossy(&alpn),
@@ -401,40 +337,7 @@ async fn serve_connection(
     let context = transport.context();
 
     // Account for inbound requests and refresh last_seen_ms in the shared registry.
-    if alpn == CacheControl::ALPN.as_bytes() {
-        serve_loop(
-            transport,
-            Authorized {
-                service: CacheControlServer(remote_execution.control),
-                policy: remote_execution.admin_policy,
-            },
-        )
-        .await
-    } else if alpn == <Courtesy as ServiceMarker>::ALPN.as_bytes() {
-        let server = AccountingDispatcher::new(
-            OpenDispatcher::<_, _, CourtesyOpen>::new(
-                MethodDispatcher::<_, _, RunTicket>::new(
-                    ExecuteServer(remote_execution.executor.clone()),
-                    CourtesyServer(remote_execution.executor.clone()),
-                ),
-                remote_execution.open_identity.clone(),
-            ),
-            manager,
-        );
-        serve_loop(transport, server).await
-    } else if alpn == <Fetch as ServiceMarker>::ALPN.as_bytes() {
-        let server = AccountingDispatcher::new(
-            OpenDispatcher::<_, _, FetchOpen>::new(
-                MethodDispatcher::<_, _, RunTicket>::new(
-                    ExecuteServer(remote_execution.executor.clone()),
-                    FetchServer(remote_execution.executor.clone()),
-                ),
-                remote_execution.open_identity.clone(),
-            ),
-            manager,
-        );
-        serve_loop(transport, server).await
-    } else if alpn == <Node as ServiceMarker>::ALPN.as_bytes() {
+    if alpn == <Node as ServiceMarker>::ALPN.as_bytes() {
         let server = AccountingDispatcher::new(NodeServer(node_handler), manager);
         serve_loop(transport, server).await
     } else if let Some(setup) =

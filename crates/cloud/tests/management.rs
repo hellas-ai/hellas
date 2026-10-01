@@ -15,6 +15,82 @@ use tokio::{
     net::UnixStream,
 };
 
+// Existing inventories stay readable during the owner-grant cutover. Seed the
+// persisted pre-upgrade record; new preparation must be refused in M1.
+fn existing_machine(
+    root: &std::path::Path,
+    key: &iroh::SecretKey,
+    address: Option<std::net::SocketAddr>,
+) -> hellas_cloud::config::Credentials {
+    use hellas_cloud::config::{Credentials, save_private};
+    let mut credentials = Credentials::generate();
+    credentials.owner = Some(key.public().to_string());
+    save_private(
+        &root.join(key.public().to_string()).join("metal.json"),
+        &json!({
+            "name": "metal", "owner": key.public().to_string(),
+            "source": {"kind":"bare-metal", "credentials":credentials, "admin_addr":address},
+            "enrollment":null, "last_seen_unix":null, "running":null,
+        }),
+        true,
+    )
+    .unwrap();
+    credentials
+}
+
+#[tokio::test]
+async fn owner_provisioning_fails_before_receipts_bootstrap_or_provider_access() {
+    use hellas_cloud::{
+        agent::OwnerGrantRequired,
+        config::{Credentials, ProviderConfig, Spec, Trust},
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let key = iroh::SecretKey::generate();
+    let service = Service::new(key.clone(), dir.path()).unwrap();
+    let bootstrap = dir.path().join("bootstrap.json");
+    let error = service
+        .execute(Request::Prepare {
+            name: "blocked".into(),
+            bootstrap_file: bootstrap.clone(),
+            admin_addr: None,
+            serve_args: vec![],
+        })
+        .await
+        .unwrap_err();
+    assert!(error.is::<OwnerGrantRequired>());
+    let spec = Spec {
+        name: "blocked".into(),
+        image: format!("registry/image@sha256:{}", "a".repeat(64)),
+        provider: ProviderConfig::Docker { gpus: false },
+        trust: Trust::Token,
+        serve_args: vec![],
+    };
+    let receipt = dir.path().join("receipt.json");
+    assert!(
+        service
+            .create(spec.clone(), Some(receipt.clone()))
+            .await
+            .unwrap_err()
+            .is::<OwnerGrantRequired>()
+    );
+    let mut credentials = Credentials::generate();
+    credentials.owner = Some(key.public().to_string());
+    assert!(
+        hellas_cloud::deployment::create_with_credentials(spec, &receipt, credentials)
+            .await
+            .unwrap_err()
+            .is::<OwnerGrantRequired>()
+    );
+    assert!(!bootstrap.exists());
+    assert!(!receipt.exists());
+    assert_eq!(
+        std::fs::read_dir(dir.path().join(key.public().to_string()))
+            .unwrap()
+            .count(),
+        0
+    );
+}
+
 #[tokio::test]
 async fn inventory_is_scoped_to_identity_and_never_returns_bootstrap_secrets() {
     let dir = tempfile::tempdir().unwrap();
@@ -22,14 +98,9 @@ async fn inventory_is_scoped_to_identity_and_never_returns_bootstrap_secrets() {
     let a = Service::new(key.clone(), dir.path()).unwrap();
     let b = Service::new(iroh::SecretKey::generate(), dir.path()).unwrap();
     let bootstrap = dir.path().join("bootstrap.json");
-    a.execute(Request::Prepare {
-        name: "metal".into(),
-        bootstrap_file: bootstrap.clone(),
-        admin_addr: None,
-        serve_args: vec![],
-    })
-    .await
-    .unwrap();
+    let credentials = existing_machine(dir.path(), &key, None);
+    hellas_cloud::config::save_private(&bootstrap, &credentials.env_for_args(&[]).unwrap(), true)
+        .unwrap();
     let env: serde_json::Value = read_json(&bootstrap).unwrap();
     assert_eq!(env["HELLAS_REMOTE_OWNER"], key.public().to_string());
     assert_eq!(std::fs::metadata(&bootstrap).unwrap().mode() & 0o777, 0o600);
@@ -80,6 +151,7 @@ async fn rpc_handles_real_frames_and_shares_the_cli_service() {
     let dir = tempfile::tempdir().unwrap();
     let key = iroh::SecretKey::generate();
     let service = Service::new(key.clone(), &dir.path().join("inventory")).unwrap();
+    existing_machine(&dir.path().join("inventory"), &key, None);
     let socket = dir.path().join("rpc/control.sock");
     let server_socket = socket.clone();
     let (stop, stopped) = tokio::sync::oneshot::channel();
@@ -107,7 +179,8 @@ async fn rpc_handles_real_frames_and_shares_the_cli_service() {
         },
     )
     .await
-    .unwrap();
+    .unwrap_err();
+    assert!(!bootstrap.exists());
     let inventory = internal_rpc::call(&socket, Request::List).await.unwrap();
     assert_eq!(inventory["owner"], key.public().to_string());
     assert_eq!(inventory["machines"][0]["name"], "metal");
@@ -199,7 +272,7 @@ async fn enrollment_requires_owner_confirmation_and_cannot_be_silently_replaced(
     let dir = tempfile::tempdir().unwrap();
     let key = iroh::SecretKey::generate();
     let owner = key.public().to_string();
-    let service = Service::new(key, dir.path()).unwrap();
+    let service = Service::new(key.clone(), dir.path()).unwrap();
     let credentials = Credentials::generate();
     let endpoint = Endpoint::builder(presets::N0)
         .secret_key(credentials.secret_key().unwrap())
@@ -215,16 +288,7 @@ async fn enrollment_requires_owner_confirmation_and_cannot_be_silently_replaced(
         .into_iter()
         .find(|addr| addr.is_ipv4())
         .unwrap();
-    let bootstrap = dir.path().join("bootstrap.json");
-    service
-        .execute(Request::Prepare {
-            name: "metal".into(),
-            bootstrap_file: bootstrap,
-            admin_addr: Some(address),
-            serve_args: vec![],
-        })
-        .await
-        .unwrap();
+    existing_machine(dir.path(), &key, Some(address));
     // Replace only the test server bootstrap key so this local mock is the pinned agent.
     let record = dir.path().join(&owner).join("metal.json");
     let mut state: serde_json::Value = read_json(&record).unwrap();

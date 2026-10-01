@@ -24,21 +24,15 @@ pub(super) async fn run(command: Commands, identity_path: Option<&Path>) -> Resu
     }
 }
 
+#[cfg(feature = "gateway")]
 pub(super) async fn machine_route(
     machine: Option<&str>,
-    key: &iroh::SecretKey,
+    _key: &iroh::SecretKey,
     node_id: Option<iroh::EndpointId>,
-    mut trust: super::RemoteTrustArgs,
+    trust: super::RemoteTrustArgs,
 ) -> Result<(Option<iroh::EndpointId>, super::RemoteTrustArgs)> {
-    let Some(machine) = machine else {
-        return Ok((node_id, trust));
-    };
-    anyhow::ensure!(
-        trust.assurance == hellas_rpc::Assurance::ProducerSigned,
-        "owned machine currently supports producer-signed assurance only"
-    );
-    let enrollment = Service::open(key.clone())?.resolve(machine).await?;
-    trust.provider_genesis =
-        Some(super::parse_content_id_hex(&enrollment.enrollment_id).map_err(anyhow::Error::msg)?);
-    Ok((Some(enrollment.node_id.parse()?), trust))
+    if machine.is_some() {
+        return Err(hellas_client::ClientError::OwnerGrantRequired.into());
+    }
+    Ok((node_id, trust))
 }
