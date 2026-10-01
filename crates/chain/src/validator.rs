@@ -364,6 +364,7 @@ fn generate_network(args: GenerateNetworkArgs) -> Result<(), ValidatorError> {
             listen_port: start_port + index as u16,
             metrics_port: Some(metrics_base_port + index as u16),
             light_client_bind: None,
+            chain_sync_bind: None,
             relay_urls: relay_urls.clone(),
             genesis: genesis.clone(),
             peers,
@@ -501,6 +502,7 @@ fn setup(args: SetupArgs) -> Result<(), ValidatorError> {
         listen_port: start_port + validator as u16,
         metrics_port: Some(metrics_port.unwrap_or(9090 + validator as u16)),
         light_client_bind,
+        chain_sync_bind: None,
         relay_urls,
         genesis,
         peers,
@@ -1108,6 +1110,7 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
             chain_indexer.clone(),
             activity_tx.clone(),
             iroh::SecretKey::from_bytes(&peer_key),
+            validator_config.chain_sync_bind,
             databases.clone(),
             crate::ConsensusVerifier::new(&consensus_info).expect("provisioned consensus identity"),
         ));

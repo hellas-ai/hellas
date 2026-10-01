@@ -22,6 +22,7 @@ type OriginResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 pub struct OriginOptions {
     pub rpc: Vec<String>,
+    pub peers: Vec<iroh::EndpointAddr>,
     pub trust: TrustDocument,
     /// Exact independently provisioned genesis JSON bytes; None uses the embedded devnet.
     pub genesis_json: Option<Vec<u8>>,
@@ -92,7 +93,7 @@ pub fn run(options: OriginOptions) -> OriginResult<()> {
                 genesis_payload: commonware_cryptography::Digestible::digest(&genesis_block),
                 storage_dir: options.storage_dir.clone(),
                 validators: options.rpc,
-                peers: Vec::new(),
+                peers: options.peers,
                 archive_blocks: options.archive_blocks,
             },
             options.trust,

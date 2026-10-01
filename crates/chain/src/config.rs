@@ -137,6 +137,9 @@ pub struct ValidatorConfig {
     /// address is the operator's to ask for.
     #[serde(default)]
     pub light_client_bind: Option<SocketAddr>,
+    /// Optional fixed UDP address for the validator's ChainSync endpoint.
+    #[serde(default)]
+    pub chain_sync_bind: Option<SocketAddr>,
     #[serde(default)]
     pub relay_urls: Vec<String>,
     pub genesis: Genesis,

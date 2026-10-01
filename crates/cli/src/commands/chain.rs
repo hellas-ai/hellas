@@ -191,9 +191,12 @@ pub enum QueryCommand {
 pub enum IndexerCommand {
     /// Serve verified proofs from a full node on a loopback listener
     Serve {
-        /// Initial validator or relay WebSocket source; repeat for multiple seeds
+        /// Validator transaction ingress URL; repeat for multiple validators
         #[arg(long)]
         rpc: Vec<String>,
+        /// ChainSync peer as ENDPOINT_ID@IP:PORT; repeat for multiple peers
+        #[arg(long = "peer", value_parser = parse_chain_peer)]
+        peers: Vec<iroh::EndpointAddr>,
         /// Authenticated trust document, provisioned independently of the RPC origin
         #[arg(long)]
         trust: PathBuf,
@@ -729,6 +732,7 @@ async fn run_indexer(command: IndexerCommand) -> CliResult {
     match command {
         IndexerCommand::Serve {
             rpc,
+            peers,
             trust,
             genesis,
             storage_dir,
@@ -741,6 +745,7 @@ async fn run_indexer(command: IndexerCommand) -> CliResult {
             tokio::task::spawn_blocking(move || {
                 hellas_chain::indexer_api::run(hellas_chain::indexer_api::OriginOptions {
                     rpc,
+                    peers,
                     trust,
                     genesis_json,
                     storage_dir,
@@ -754,6 +759,18 @@ async fn run_indexer(command: IndexerCommand) -> CliResult {
         }
     }
     Ok(())
+}
+
+#[cfg(feature = "indexer")]
+fn parse_chain_peer(raw: &str) -> Result<iroh::EndpointAddr, String> {
+    let (id, address) = raw.split_once('@').ok_or("expected ENDPOINT_ID@IP:PORT")?;
+    let id = id
+        .parse()
+        .map_err(|error| format!("invalid peer ID: {error}"))?;
+    let address = address
+        .parse()
+        .map_err(|error| format!("invalid peer address: {error}"))?;
+    Ok(iroh::EndpointAddr::new(id).with_ip_addr(address))
 }
 
 #[cfg(feature = "validator")]

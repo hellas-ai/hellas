@@ -506,18 +506,20 @@ pub(crate) async fn serve_validator_archive(
     indexer: ChainIndexer,
     activity: tokio::sync::broadcast::Sender<crate::ConsensusActivity>,
     key: iroh::SecretKey,
+    bind: Option<std::net::SocketAddr>,
     database: UtxoDatabase<runtime::Context>,
     verifier: ConsensusVerifier,
 ) -> Result<(), Error> {
-    let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+    let mut builder = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
         .secret_key(key)
         .alpns(vec![
             ChainSync::ALPN.as_bytes().to_vec(),
             Node::ALPN.as_bytes().to_vec(),
-        ])
-        .bind()
-        .await
-        .map_err(storage)?;
+        ]);
+    if let Some(bind) = bind {
+        builder = builder.bind_addr(bind).map_err(storage)?;
+    }
+    let endpoint = builder.bind().await.map_err(storage)?;
     tracing::info!(chain_peer = %endpoint.id(), "serving finalized chain over iroh");
     serve_validator_endpoint(indexer, activity, endpoint, database, verifier).await;
     Ok(())

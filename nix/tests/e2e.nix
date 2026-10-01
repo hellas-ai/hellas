@@ -218,16 +218,18 @@ let
           "${homePrefix}/follower-home ${homePrefix}/follower-store"
       )
       machine.succeed(
+          "printf 'chain_sync_bind = \"127.0.0.1:31248\"\\n' > ${homePrefix}/validator.toml; "
           f"HOME=${homePrefix}/validator-home {cli} chain validator config "
           "-n 1 --seed ${toString validatorSeed} --start-port ${toString startPort} "
           "--light-client-bind 127.0.0.1:${toString chainRpcPort} "
           "--metrics-port ${toString metricsPort} ${allocationArgs} "
-          "> ${homePrefix}/validator.toml"
+          ">> ${homePrefix}/validator.toml"
       )
       machine.succeed(
           f"{cli} chain validator check-config --config ${homePrefix}/validator.toml | grep -Fx ok"
       )
       config = tomllib.loads(machine.succeed("cat ${homePrefix}/validator.toml"))
+      peer_id = config["genesis"]["validators"][0]["public_key"]
       genesis = shlex.quote(json.dumps(config["genesis"]))
       machine.succeed(f"printf %s {genesis} > ${homePrefix}/genesis.json")
       machine.succeed(
@@ -247,6 +249,7 @@ let
       machine.succeed(
           f"HOME=${homePrefix}/follower-home OTEL_SERVICE_NAME=hellas-test-indexer RUST_LOG=info {cli} chain indexer serve "
           f"--rpc {rpc} --storage-dir ${homePrefix}/follower-store "
+          f"--peer {peer_id}@127.0.0.1:31248 "
           "--partition-prefix ${followerPartitionPrefix} "
           "--trust ${homePrefix}/trust.json --genesis ${homePrefix}/genesis.json "
           "--listen 127.0.0.1:31247 "
