@@ -690,6 +690,7 @@ impl EvaluateEngine {
         let stat_prompt = invocation.input_ids.len() as u64;
         let (sender, receiver) = mpsc::channel(PER_EXECUTION_CHANNEL_CAPACITY);
         let execute_job = ExecuteJob {
+            deadline: None,
             cache_recording: self
                 .output_cache
                 .recording()
@@ -1332,6 +1333,7 @@ pub(crate) mod environment_admission_tests {
         } = evaluate_job(engine, fixture, index);
         let (sender, _receiver) = mpsc::channel(1);
         ExecuteJob {
+            deadline: None,
             cache_recording: None,
             output_cache: Default::default(),
             span: tracing::Span::none(),

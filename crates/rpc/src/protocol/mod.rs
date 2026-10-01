@@ -39,8 +39,8 @@ pub use fetch_environment::{
 };
 pub use identity::{
     AppleAppAttestEnrollment, Decoder as DagCborDecoder, PlatformCredential, PlatformEnrollment,
-    ProviderEnrollmentBundle, ProviderGenesisDecodeError, ProviderGenesisStatement,
-    ProviderIdentityV1, RootKind, RootProof, SignedProviderGenesis,
+    ProviderEnrollmentBundle, ProviderGenesisDecodeError, ProviderGenesisStatement, RootKind,
+    RootProof, SignedProviderGenesis,
 };
 pub use job::{APPLE_APP_ATTEST, JobTerms};
 pub use manifest::{Application, ApplicationError, MAX_APPLICATION_ID_BYTES, ProgramManifest};
@@ -57,8 +57,7 @@ pub use stream::{
     InputEventEnvelope, InputTranscriptBuilder, OutputEventBody, OutputEventBodyParts,
     OutputEventEnvelope, OutputTranscriptBuilder, SignedInputEvent, SignedOutputEvent, StreamId,
     StreamVerifyError, input_genesis, output_genesis, verify_input_event_envelopes,
-    verify_input_transcript, verify_output_event_continuation, verify_output_event_envelopes,
-    verify_output_transcript,
+    verify_output_event_continuation, verify_output_event_envelopes,
 };
 pub use value::{
     DagCborDecodeError, DagCborEncodeError, DagCborEncoder, JsonBytes, canonical_dag_cbor,

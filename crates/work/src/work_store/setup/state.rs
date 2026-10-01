@@ -434,12 +434,33 @@ impl SetupState {
     pub(super) fn apply(&mut self, record: &SetupRecord) -> Result<Applied, SetupStateError> {
         if let Some(end) = self.end {
             // Completion is idempotent, so a retried completion is not
-            // an error; anything else after an end is.
-            if matches!(
-                (end, record),
-                (SetupEnd::Complete, SetupRecord::Complete { .. })
-            ) {
-                return Ok(Applied::Redundant);
+            // an error — but only the *same* completion is a retry. One
+            // naming another origin is this caller's finalized read
+            // disagreeing with the journal's, and an `Ok` would say the
+            // block it computed is durable when the journal holds a
+            // different one. Every other retried record here is compared
+            // against what it repeats; this one is too.
+            if let (
+                SetupEnd::Complete,
+                SetupRecord::Complete {
+                    payment_edge,
+                    origin_height,
+                    origin_payload,
+                    origin_parent,
+                },
+            ) = (end, record)
+            {
+                let same = self.origin.as_ref().is_some_and(|origin| {
+                    origin.payment_edge == *payment_edge
+                        && origin.height == *origin_height
+                        && origin.payload == *origin_payload
+                        && origin.parent == *origin_parent
+                });
+                return if same {
+                    Ok(Applied::Redundant)
+                } else {
+                    Err(SetupStateError::Ended(end))
+                };
             }
             if matches!(record, SetupRecord::Ended { outcome } if *outcome == end) {
                 return Ok(Applied::Redundant);

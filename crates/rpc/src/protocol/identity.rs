@@ -133,14 +133,6 @@ pub struct ProviderEnrollmentBundle {
     pub platform: PlatformEnrollment,
 }
 
-/// A provider's genesis plus the content ids of everything it has
-/// rotated through since.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ProviderIdentityV1 {
-    pub genesis: SignedProviderGenesis,
-    history: Vec<ContentId>,
-}
-
 impl ProviderGenesisStatement {
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut e = DagCborEncoder::new();
@@ -186,27 +178,6 @@ impl ProviderEnrollmentBundle {
             ));
         }
         Ok(bundle)
-    }
-}
-
-impl ProviderIdentityV1 {
-    pub fn new(genesis: SignedProviderGenesis) -> Self {
-        Self {
-            genesis,
-            history: Vec::new(),
-        }
-    }
-
-    pub fn canonical_bytes(&self) -> Vec<u8> {
-        let mut e = DagCborEncoder::new();
-        e.array(3);
-        e.str("hellas.provider.identity.v1");
-        encode_signed(&mut e, &self.genesis);
-        e.array(self.history.len() as u64);
-        for id in &self.history {
-            e.bytes(id.as_bytes());
-        }
-        e.into_bytes()
     }
 }
 

@@ -1771,9 +1771,12 @@ fn each_graph_binding_is_checked_on_its_own() {
 /// Each bound of the resource envelope refuses on its own.
 ///
 /// Every case here recomputes the bundle digest and leaves the rest of
-/// the graph intact, so the named bound is the only thing that can
+/// the graph intact, so the named rule is the only thing that can
 /// refuse it: deleting any one of them makes exactly one of these
-/// assertions return `Ok`.
+/// assertions return `Ok`. The two `max_new_tokens` rules are not the
+/// envelope loop's own, though: both live in `matches_generation_policy`,
+/// which the graph check runs before the envelope loop, and deleting
+/// them there is what these two assertions catch.
 #[test]
 fn each_envelope_bound_is_checked_on_its_own() {
     let channel = channel();
@@ -1833,7 +1836,8 @@ fn each_envelope_bound_is_checked_on_its_own() {
     );
 
     // A request authorized to generate nothing. Zero is inside every
-    // bound above it, so nothing but its own rule refuses it.
+    // bound above it; the refusal is `matches_generation_policy`'s,
+    // reached by the graph check before the envelope loop runs.
     let silent = TextPolicy::from_u32_stop_tokens(0, [2, 1]);
     let (silent_bundle, silent_auth) = bundle_with_policy(&channel, &silent);
     let admits_silence = PaidExecutionPolicyV1 {

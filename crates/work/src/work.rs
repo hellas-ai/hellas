@@ -2012,27 +2012,6 @@ where
     }
 }
 
-/// Dispatch workflow with the post-boundary cursor rule: the endpoint is
-/// released while finalized blocks are fetched, caught up contiguously, and
-/// only then reacquired for `JobRunning`.
-pub async fn run_accepted_work_after_catch_up<S, B>(
-    service: &WorkService,
-    source: &S,
-    ready: &ReadyChannel,
-    backend: &B,
-    work_id: Digest,
-) -> Result<RunOutcome, RunError>
-where
-    S: FinalizedBlocks + ?Sized,
-    B: PaidWorkBackend + Sync,
-{
-    service
-        .catch_up_job(source, work_id)
-        .await
-        .map_err(|error| RunError::CatchUp(error.to_string()))?;
-    run_accepted_work(service, ready, backend, work_id).await
-}
-
 // ── Delivering the answer ─────────────────────────────────────────────
 
 /// One whole delivery: the signed result and the transcript it
@@ -2727,30 +2706,6 @@ impl WorkService {
     // here; the claim is that *this service* hands out no submittable
     // answer, only a driver that offers one and then records what
     // became of it.
-
-    /// Workflow phase boundary for provider acceptance: catch up with short
-    /// borrows, reacquire by this channel service, then let the durable
-    /// acceptance transition compare against that same cursor.
-    pub async fn accept_after_catch_up<S: FinalizedBlocks + ?Sized>(
-        &self,
-        source: &S,
-        request: &AcceptWorkRequest,
-    ) -> Result<AcceptWorkResponse, CatchUpError> {
-        if let Some(response) = self.precheck_acceptance(request) {
-            return Ok(response);
-        }
-        let work_id = {
-            let endpoint = self.endpoint().map_err(|_| CatchUpError::Busy)?;
-            let channel = endpoint.state().channel();
-            PaidJobAuthorizationV1::decode(&request.authorization)
-                .ok()
-                .map(|authorization| work_id(channel, &authorization))
-        };
-        if let Some(work_id) = work_id {
-            self.catch_up_job(source, work_id).await?;
-        }
-        Ok(self.accept(request))
-    }
 
     /// Answers an authenticated proposal from retained state alone, when
     /// possible, without signing, writing the journal, or requiring readiness.

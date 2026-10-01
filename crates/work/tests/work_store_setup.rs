@@ -1618,6 +1618,69 @@ fn completion_records_the_channels_origin_and_is_terminal() {
     );
 }
 
+/// A retried completion is the retry it is only when it names the same
+/// origin. One naming another block is a caller whose finalized read
+/// disagrees with the journal's — refused as the end it follows, not
+/// absorbed as a duplicate.
+#[test]
+fn a_different_completion_after_the_end_is_not_a_retry() {
+    let dir = temp();
+    let verifier = Secp256k1Verifier::new();
+    let mut journal = completed_store(dir.path());
+    let complete = SetupRecord::Complete {
+        payment_edge: payment_edge(),
+        origin_height: 44,
+        origin_payload: [0x01; 32],
+        origin_parent: [0x02; 32],
+    };
+    if let Err(error) = journal.commit(complete.clone(), &verifier) {
+        panic!("completion commits: {error}");
+    }
+
+    // The same record again is the retry: nothing is appended.
+    let before = journal.len();
+    if let Err(error) = journal.commit(complete, &verifier) {
+        panic!("an idempotent completion commits: {error}");
+    }
+    assert_eq!(journal.len(), before);
+
+    // Each field independently changes the completed origin.
+    for (payment_edge, origin_height, origin_payload, origin_parent) in [
+        (EdgeId::from_bytes([0x55; 32]), 44, [0x01; 32], [0x02; 32]),
+        (payment_edge(), 45, [0x01; 32], [0x02; 32]),
+        (payment_edge(), 44, [0x03; 32], [0x02; 32]),
+        (payment_edge(), 44, [0x01; 32], [0x04; 32]),
+    ] {
+        let error = journal
+            .commit(
+                SetupRecord::Complete {
+                    payment_edge,
+                    origin_height,
+                    origin_payload,
+                    origin_parent,
+                },
+                &verifier,
+            )
+            .expect_err("a different origin is not the completion already recorded");
+        assert!(
+            matches!(
+                error,
+                WorkStoreError::Setup(SetupStateError::Ended(SetupEnd::Complete))
+            ),
+            "unexpected error: {error}"
+        );
+        assert_eq!(journal.len(), before, "nothing was written for it");
+    }
+    let origin = journal
+        .state()
+        .origin()
+        .expect("the recorded origin stands");
+    assert_eq!(origin.payment_edge, payment_edge());
+    assert_eq!(origin.height, 44);
+    assert_eq!(origin.payload, [0x01; 32]);
+    assert_eq!(origin.parent, [0x02; 32]);
+}
+
 /// An ended setup stays ended across a restart, and never resubmits.
 #[test]
 fn an_aborted_setup_does_not_come_back() {

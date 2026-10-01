@@ -193,16 +193,13 @@ impl<'a> EvaluateOutputTranscriptBuilder<'a> {
         key: &'a ProducerSigningKey,
         events: Vec<OutputEventEnvelope>,
     ) -> Result<Self, EvaluateProtocolError> {
-        let public_key = key.public_key();
         if events.is_empty() {
             return Ok(Self::new(input, assurance, key));
         }
         let scheme = scheme_id(Operation::Evaluate, assurance);
-        verify_output_event_envelopes(scheme, input, &public_key, &events)?;
+        // The inner builder verifies every envelope against `key`; on its
+        // error this prefix, computed over not-yet-verified events, is dropped.
         let next_position = verify_token_prefix(&events)?;
-        if *events[0].event().public_key() != public_key {
-            return Err(EvaluateProtocolError::ProducerKeyMismatch);
-        }
         Ok(Self {
             inner: OutputTranscriptBuilder::resume_verified(
                 scheme,
@@ -378,8 +375,6 @@ pub enum EvaluateProtocolError {
         expected: &'static str,
         actual: String,
     },
-    #[error("evaluate output transcript producer key does not match signing key")]
-    ProducerKeyMismatch,
     #[error("evaluate output position exceeded u64 range")]
     PositionOverflow,
     #[error("evaluate usage output units do not match final position")]

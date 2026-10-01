@@ -756,30 +756,6 @@ where
     .await
 }
 
-/// Server-side unary dispatch with a raw request-body limit checked before
-/// prost decoding.
-pub async fn dispatch_unary_bounded<T, M, F, Fut, RespOrTrailer>(
-    inbound: hellas_wire::transport::Inbound<T::Stream>,
-    max_request_bytes: usize,
-    handler: F,
-) -> Result<(), TransportError>
-where
-    T: StreamTransport,
-    M: MethodMarker,
-    M::Request: Message + Default,
-    M::Response: Message,
-    F: FnOnce(M::Request) -> Fut + Send,
-    Fut: std::future::Future<Output = Result<RespOrTrailer, WireStatus>> + Send,
-    RespOrTrailer: Into<WithTrailer<M::Response>>,
-{
-    dispatch_unary_with_context_and_limit::<T, M, _, _, _>(
-        inbound,
-        Some(max_request_bytes),
-        |request, _context| handler(request),
-    )
-    .await
-}
-
 /// General submission route with its own 48 waiting permits and transport
 /// context. Its permit pool is disjoint from `SubmitWorkResponse`.
 pub async fn dispatch_general_submit_bounded<T, M, F, Fut, RespOrTrailer>(
@@ -1684,10 +1660,10 @@ mod streaming_call_tests {
             );
             expected.push("INTERNAL");
             let (inbound, _) = route_inbound(Some(Bytes::from_static(&[0; 2])), false, None);
-            dispatch_unary_bounded::<MockTransport, MockMethod, _, _, BytesMsg>(
+            dispatch_unary_with_context_and_limit::<MockTransport, MockMethod, _, _, BytesMsg>(
                 inbound,
-                1,
-                |_| async { panic!("oversized request reached handler") },
+                Some(1),
+                |_, _| async { panic!("oversized request reached handler") },
             )
             .await
             .unwrap();

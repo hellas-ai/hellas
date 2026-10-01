@@ -37,7 +37,7 @@ async-stream = "0.3"
 axum = "0.8"
 base64 = "0.22"
 bytes = "1"
-catena-lang = { git = "https://github.com/hellas-ai/catena-lang", rev = "dbd750cf5b4c36fa99222612848651a2575faa31", default-features = false }
+catena-lang = { git = "https://github.com/georgewhewell/catena-lang", rev = "4d90b4b0b53f68352ff2890203d4de00e1214f93", default-features = false }
 cc = "1"
 ciborium = "0.2"
 commonware-actor = { git = "https://github.com/georgewhewell/commonware-monorepo", rev = "4da2958e095dbff2236091e7294f6890806dc800" }

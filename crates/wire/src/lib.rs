@@ -37,7 +37,7 @@ pub use crate::error::TransportError;
 pub use crate::frame::{
     CreditFrame, EndFrame, Frame, FrameError, FrameKind, OpenFrame, ResetFrame,
 };
-pub use crate::latency::{EwmaLatency, LatencyEstimator};
+pub use crate::latency::EwmaLatency;
 pub use crate::metadata::{Metadata, MetadataValue, Trailer};
 pub use crate::schema::{
     FieldSchema, METHOD_DOMAIN, MessageSchema, MethodSchema, PrimKind, SERVICE_DOMAIN,

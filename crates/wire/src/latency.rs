@@ -33,18 +33,3 @@ impl EwmaLatency {
         self.est_ms
     }
 }
-
-pub trait LatencyEstimator: Send + Sync + 'static {
-    fn record(&mut self, sample_ms: f64);
-    fn get(&self) -> Option<f64>;
-}
-
-impl LatencyEstimator for EwmaLatency {
-    fn record(&mut self, sample_ms: f64) {
-        EwmaLatency::record(self, sample_ms);
-    }
-
-    fn get(&self) -> Option<f64> {
-        EwmaLatency::get(self)
-    }
-}

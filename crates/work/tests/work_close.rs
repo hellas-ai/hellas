@@ -1406,6 +1406,69 @@ async fn a_catch_up_reads_every_block_between() {
     assert_eq!(provider.state().cursor(), before);
 }
 
+/// The client watcher reads the same way: every block, and what it
+/// carried. A close settling this channel's payment edge is durable
+/// before the cursor says its block was read — and a re-run over the
+/// same history writes nothing.
+#[tokio::test]
+async fn a_client_catch_up_reads_every_block_and_what_it_carried() {
+    let client_root = temp();
+    let ready = ready();
+    let client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR);
+    let Ok(mut client) = ClientEndpoint::new(ready.clone(), client_store, client()) else {
+        panic!("the client endpoint binds");
+    };
+
+    let settled = CURSOR + 2;
+    let provider_payout = 7_u64;
+    let close = hellas_kernel::Tx::close(
+        payment_edge(),
+        hellas_kernel::Proof::adjudicated(hellas_kernel::PaymentContestCommitment::from_bytes(
+            [0x03; 32],
+        )),
+        List::take(
+            [Payout::new(provider().party_key(), provider_payout); MAX_EDGE_OUTPUTS],
+            1,
+        ),
+    );
+    let chain = Chain {
+        blocks: ((CURSOR + 1)..=(CURSOR + 4))
+            .map(|height| {
+                let txs = if height == settled {
+                    vec![close.clone()]
+                } else {
+                    Vec::new()
+                };
+                block(height, txs)
+            })
+            .collect(),
+        withheld: None,
+    };
+
+    match client.catch_up(&chain).await {
+        Ok(reached) => assert_eq!(reached, CURSOR + 4),
+        Err(error) => panic!("the client watcher catches up: {error}"),
+    }
+    assert_eq!(
+        client.state().close_settled(),
+        Some(CloseSettlement {
+            height: settled,
+            payload: payload_at(settled),
+            provider_payout,
+        }),
+        "the settlement two heights back is on the disk",
+    );
+    assert_eq!(client.state().cursor().0, CURSOR + 4);
+
+    // Run again with nothing new: a caught-up watcher writes nothing.
+    let before = client.state().cursor();
+    match client.catch_up(&chain).await {
+        Ok(reached) => assert_eq!(reached, CURSOR + 4),
+        Err(error) => panic!("a caught-up client is idle: {error}"),
+    }
+    assert_eq!(client.state().cursor(), before);
+}
+
 /// A duty found at the front of a restart backlog is surfaced before the
 /// watcher asks for the next finalized block.
 ///

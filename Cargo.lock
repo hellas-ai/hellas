@@ -655,7 +655,7 @@ dependencies = [
 [[package]]
 name = "catena-lang"
 version = "0.1.0"
-source = "git+https://github.com/hellas-ai/catena-lang?rev=dbd750cf5b4c36fa99222612848651a2575faa31#dbd750cf5b4c36fa99222612848651a2575faa31"
+source = "git+https://github.com/georgewhewell/catena-lang?rev=4d90b4b0b53f68352ff2890203d4de00e1214f93#4d90b4b0b53f68352ff2890203d4de00e1214f93"
 dependencies = [
  "anyhow",
  "clap",
@@ -2870,7 +2870,6 @@ dependencies = [
  "commonware-runtime",
  "futures-core",
  "futures-util",
- "hellas-chain",
  "hellas-kernel",
  "hellas-private",
  "hellas-rpc",
