@@ -176,6 +176,8 @@ impl Cli {
         command
             .arg("--identity")
             .arg(&self.identity)
+            .arg("--store-dir")
+            .arg(self.root.join("store"))
             .args(args)
             .env("HELLAS_GRANT_DATA_DIR", self.root.join("grants"))
             .env("HELLAS_STORE_DIR", self.root.join("store"))
@@ -585,6 +587,8 @@ async fn managed_owner_bootstrap_standing_fetch_and_restart_preserve_allowances(
                 "serve".into(),
             ],
             serve_args: vec![
+                "--store-dir".into(),
+                data.join("store").to_string_lossy().into_owned(),
                 "--port".into(),
                 work_address.port().to_string(),
                 "--no-discovery".into(),

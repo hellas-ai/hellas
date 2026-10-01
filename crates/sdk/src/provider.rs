@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use hellas_attestation::RootProver;
 use hellas_executor::{Executor, ExecutorSpawnConfig, FetchRoute, FetchRouteRegistry};
-#[cfg(any(test, feature = "grant-provider"))]
+#[cfg(feature = "grant-provider")]
 use hellas_executor::{FetchRouteEntry, FetchRoutePolicy};
 use hellas_rpc::open::OpenDispatcher;
 use hellas_rpc::pb::execute::{OpenRequest, OpenResponse, open_response};
