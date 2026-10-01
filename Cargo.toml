@@ -5,6 +5,7 @@ members = [
     "crates/chain",
     "crates/cli",
     "crates/client",
+    "crates/cloud",
     "crates/executor",
     "crates/gateway",
     "crates/genesis",
@@ -59,6 +60,7 @@ hellas-adaptors = { path = "crates/adaptors", default-features = false }
 hellas-attestation = { path = "crates/attestation", default-features = false }
 hellas-chain = { path = "crates/chain", default-features = false }
 hellas-client = { path = "crates/client", default-features = false }
+hellas-cloud = { path = "crates/cloud", default-features = false }
 hellas-executor = { path = "crates/executor", default-features = false }
 hellas-gateway = { path = "crates/gateway", default-features = false }
 hellas-genesis = { path = "crates/genesis", default-features = false }

@@ -189,6 +189,7 @@ let
             "chain"
             "gateway"
           ]
+          ++ lib.optional pkgSpec.pkgs.stdenv.hostPlatform.isUnix "cloud"
           ++ lib.optionals (crossSystem == null) [ "node" ]
           ++ lib.optional otel "otel";
         }
@@ -203,6 +204,22 @@ let
         }
       ) { };
     }
+    // lib.optionalAttrs (crossSystem == null) {
+      agent = pkgSpec.mkHellasPackage {
+        pname = "hellas-agent";
+        cargoBuildFlags = [
+          "-p"
+          "hellas-cloud"
+          "--bin"
+          "hellas-agent"
+        ];
+        cargoTestFlags = [
+          "-p"
+          "hellas-cloud"
+        ];
+        meta.mainProgram = "hellas-agent";
+      };
+    }
     # Do not advertise the safe local GPU runtime on platforms where the
     # packaged provider toolchain is not yet supported.
     //
@@ -214,7 +231,11 @@ let
             }:
             pkgSpec.mkHellasPackage {
               buildNoDefaultFeatures = true;
-              buildFeatures = [ "evaluate" ] ++ lib.optional otel "otel";
+              buildFeatures = [
+                "evaluate"
+                "cloud"
+              ]
+              ++ lib.optional otel "otel";
             }
           ) { };
         };
@@ -266,15 +287,25 @@ let
       nativePkg.commonArgs
       // {
         pname = "hellas-rpc-wasm";
-        cargoBuildFlags = [
-          "-p"
-          "hellas-rpc"
-        ];
-        CARGO_BUILD_TARGET = "wasm32-unknown-unknown";
-        # wasm tests need wasm-bindgen-test infra (deferred). buildRustPackage's
-        # canExecute heuristic doesn't see our CARGO_BUILD_TARGET override, so
-        # without this it'd try to invoke `cargo test` against wasm and fail.
+        # cargoBuildHook passes the native --target explicitly, which overrides
+        # CARGO_BUILD_TARGET. Select the wasm target in the actual command.
+        buildPhase = ''
+          runHook preBuild
+          cargo build --offline --release --target wasm32-unknown-unknown -p hellas-rpc --jobs "$NIX_BUILD_CORES"
+          runHook postBuild
+        '';
+        # Wasm tests need a wasm test runtime.
         doCheck = false;
+        dontStrip = true;
+        separateDebugInfo = false;
+        # The default Cargo install hook installs executables, not this rlib.
+        installPhase = ''
+          runHook preInstall
+          install -Dm644 target/wasm32-unknown-unknown/release/libhellas_rpc.rlib "$out/lib/libhellas_rpc.rlib"
+          mkdir -p "$out/lib/deps"
+          cp target/wasm32-unknown-unknown/release/deps/*.rlib "$out/lib/deps/"
+          runHook postInstall
+        '';
       }
     );
 
@@ -286,16 +317,19 @@ let
           rustToolchain
           ;
         inherit (nativePackages) cli;
+        revision = self.rev or self.dirtyRev or "unknown";
       };
       dockerCuda = import ./docker.nix {
         inherit pkgs rustToolchain;
         cli = nativePackages.cli-catena;
         backend = "cuda";
+        revision = self.rev or self.dirtyRev or "unknown";
       };
       dockerHip = import ./docker.nix {
         inherit pkgs rustToolchain;
         cli = nativePackages.cli-catena;
         backend = "hip";
+        revision = self.rev or self.dirtyRev or "unknown";
       };
 
       nixosTests = lib.optionalAttrs isX86_64Linux (
@@ -310,10 +344,32 @@ let
     {
       packages = {
         docker = docker.image;
+        docker-cloud =
+          (import ./docker.nix {
+            inherit pkgs rustToolchain;
+            inherit (nativePackages) cli agent;
+            revision = self.rev or self.dirtyRev or "unknown";
+          }).image;
       }
       // lib.optionalAttrs isX86_64Linux {
         docker-cuda = dockerCuda.image;
         docker-hip = dockerHip.image;
+        docker-cloud-cuda =
+          (import ./docker.nix {
+            inherit pkgs rustToolchain;
+            cli = nativePackages.cli-catena;
+            inherit (nativePackages) agent;
+            backend = "cuda";
+            revision = self.rev or self.dirtyRev or "unknown";
+          }).image;
+        docker-cloud-hip =
+          (import ./docker.nix {
+            inherit pkgs rustToolchain;
+            cli = nativePackages.cli-catena;
+            inherit (nativePackages) agent;
+            backend = "hip";
+            revision = self.rev or self.dirtyRev or "unknown";
+          }).image;
       };
 
       apps = {
