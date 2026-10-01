@@ -39,7 +39,7 @@ mod tests {
 
     #[test]
     fn hardening_disables_core_dumps() {
-        harden_provider_process().expect("provider hardening should succeed");
+        disable_core_dumps().expect("disabling core dumps should succeed");
 
         let mut limit = MaybeUninit::<libc::rlimit>::uninit();
         // SAFETY: `limit` points to writable storage for one `rlimit` value.
