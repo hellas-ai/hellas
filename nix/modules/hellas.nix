@@ -602,14 +602,16 @@ rec {
         description = "Fallback max output tokens when a request omits a limit.";
       };
       causalLmEnvironment = mkOption {
-        type = types.strMatching "/.*";
+        type = types.nullOr (types.strMatching "/.*");
+        default = null;
         example = "/srv/hellas/environments/smollm2.environment";
         description = ''
           Canonical causal-LM environment file passed as --environment. Its
           exact bytes determine the manifest sent to providers. This is
           operator-managed runtime data, not a Nix-store artifact.
           responsesBackend changes only /v1/responses; the gateway's other
-          routes continue to use this environment.
+          routes continue to use this environment. Omit this and tokenizer
+          for a proxy-only gateway; native inference requires both.
         '';
       };
       model = mkOption {
@@ -646,12 +648,14 @@ rec {
         '';
       };
       tokenizer = mkOption {
-        type = types.strMatching "/.*";
+        type = types.nullOr (types.strMatching "/.*");
+        default = null;
         example = "/srv/hellas-presentation/smollm2-tokenizer.json";
         description = ''
           Application-selected tokenizer JSON. This presentation input is
           independent of the Catena execution environment and is not covered by
-          the Hellas execution guarantee.
+          the Hellas execution guarantee. Set it together with
+          causalLmEnvironment; omit both for a proxy-only gateway.
         '';
       };
       chatTemplate = mkOption {
@@ -866,12 +870,8 @@ rec {
       cdhash
     ]) gateway.appleAppAttestCdhashes
     ++ optArg "--apple-app-attest-app-id" gateway.appleAppAttestAppId
-    ++ [
-      "--environment"
-      gateway.causalLmEnvironment
-      "--tokenizer"
-      gateway.tokenizer
-    ]
+    ++ optArg "--environment" gateway.causalLmEnvironment
+    ++ optArg "--tokenizer" gateway.tokenizer
     ++ optArg "--model" gateway.model
     ++ optArg "--paid-work-config" gateway.paidWorkConfig
     ++ lib.optional gateway.allowRemote "--allow-remote"

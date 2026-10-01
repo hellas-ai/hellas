@@ -55,6 +55,11 @@ let
     lib.findFirst (
       assertion: lib.hasInfix "services.hellas.gateway.provider is required" assertion.message
     ) (throw "missing gateway provider assertion") evaluation.config.assertions;
+  gatewayModelAssertion =
+    evaluation:
+    lib.findFirst (
+      assertion: lib.hasInfix "gateway.causalLmEnvironment and tokenizer" assertion.message
+    ) (throw "missing gateway model assertion") evaluation.config.assertions;
   runtimeStoreAssertion =
     evaluation:
     lib.findFirst (
@@ -334,7 +339,23 @@ let
       };
     };
   discoveryGateway = evalGateway { };
-  proxyOnlyGateway = evalGateway { responsesBackend = "proxy"; };
+  proxyOnlyGateway = evalGateway {
+    responsesBackend = "proxy";
+    causalLmEnvironment = null;
+    tokenizer = null;
+  };
+  nativeGatewayWithoutModel = evalGateway {
+    causalLmEnvironment = null;
+    tokenizer = null;
+  };
+  localProxyWithoutModel = evalGateway {
+    responsesBackend = "proxy";
+    local = true;
+    causalLmEnvironment = null;
+    tokenizer = null;
+  };
+  gatewayWithoutEnvironment = evalGateway { causalLmEnvironment = null; };
+  gatewayWithoutTokenizer = evalGateway { tokenizer = null; };
   storePathGateway = evalGateway {
     responsesBackend = "proxy";
     environmentFile = "${builtins.storeDir}/secret.env";
@@ -862,6 +883,16 @@ in
     assert !homeManagerNixPathEnvironmentFile.success;
     assert !(providerAssertion discoveryGateway).assertion;
     assert (providerAssertion proxyOnlyGateway).assertion;
+    assert (gatewayModelAssertion proxyOnlyGateway).assertion;
+    assert (gatewayModelAssertion discoveryGateway).assertion;
+    assert !(gatewayModelAssertion nativeGatewayWithoutModel).assertion;
+    assert !(gatewayModelAssertion localProxyWithoutModel).assertion;
+    assert !(gatewayModelAssertion gatewayWithoutEnvironment).assertion;
+    assert !(gatewayModelAssertion gatewayWithoutTokenizer).assertion;
+    assert
+      !(lib.hasInfix "--environment" proxyOnlyGateway.config.systemd.services.hellas-gateway.serviceConfig.ExecStart);
+    assert
+      !(lib.hasInfix "--tokenizer" proxyOnlyGateway.config.systemd.services.hellas-gateway.serviceConfig.ExecStart);
     assert (providerAssertion localProxyGateway).assertion;
     pkgs.runCommand "hellas-provider-content-index-module-eval" { } ''
       umask 077
