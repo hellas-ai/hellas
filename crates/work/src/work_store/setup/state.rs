@@ -12,8 +12,7 @@ impl SetupState {
             close_descriptor: None,
             unresolved_bond_open: false,
             unresolved_payment_open: false,
-            history_cursor: None,
-            history: Vec::new(),
+            scan_cursor: None,
             bond_finalized: false,
             payment_finalized: false,
             bond_closed: false,
@@ -24,26 +23,8 @@ impl SetupState {
         }
     }
 
-    /// Reads a checkpoint and reruns every rule replay would have run to
-    /// reach it.
-    ///
-    /// Three things, and they are the same three a record-at-a-time
-    /// replay does. The journal this checkpoint was found in must be
-    /// this network's, this bond's and this role's, so a successor
-    /// carrying another handshake's state is refused rather than
-    /// adopted. Every signature the retained revision carries is
-    /// verified again, by [`check_signatures`] — the function replay
-    /// and commit both use. And [`Self::revalidate`] re-derives from the
-    /// retained history exactly what [`Self::apply_history_batch`]
-    /// derived when the blocks arrived, refusing a checkpoint whose
-    /// stored answers are not the ones its own contents give.
-    ///
-    /// # Errors
-    ///
-    /// [`SetupStateError::WrongChannel`] and
-    /// [`SetupStateError::WrongRole`] when it is another journal's
-    /// state, whatever the signature check refuses, and whatever
-    /// [`Self::revalidate`] refuses.
+    /// Reopens a checkpoint under its journal identity, checking the retained
+    /// signed bundle and the cursor/outcome invariants.
     pub(super) fn from_checkpoint<V: SigVerifier>(
         bytes: &[u8],
         network: NetworkId,
@@ -68,22 +49,7 @@ impl SetupState {
         Ok(state)
     }
 
-    /// Refuses a checkpoint whose stored fields are not the ones its own
-    /// contents produce.
-    ///
-    /// The stage rules first: a revision is over this journal's network
-    /// and bond, an executable revision has its close descriptor and an
-    /// inexecutable one does not, the descriptor describes the revision
-    /// beside it, and neither exists before the scan floor that had to
-    /// precede it.
-    ///
-    /// Then the history. Everything the retained blocks decided —
-    /// where the cursor is, whether each edge is finalized, whether each
-    /// is closed — is derived again by feeding those blocks back through
-    /// [`Self::apply_history_batch`], which is the same function that
-    /// derived them the first time and the same function that refuses a
-    /// gap. A checkpoint that stored a different answer than its own
-    /// blocks give is refused here rather than replayed as fact.
+    /// Checks signed-handshake structure and the compact finalized outcomes.
     fn revalidate(&self) -> Result<(), SetupStateError> {
         if let Some(bundle) = &self.bundle {
             if bundle.network() != self.network {
@@ -94,7 +60,7 @@ impl SetupState {
             }
             let executable = matches!(
                 (self.role, bundle.revision()),
-                (Role::Client, 2) | (Role::Provider, 3)
+                (Role::Client, 2 | 3) | (Role::Provider, 3)
             );
             match (&self.close_descriptor, executable) {
                 (Some(descriptor), true) => describes_bundle(bundle, descriptor)?,
@@ -112,27 +78,33 @@ impl SetupState {
             return Err(SetupStateError::DescriptorMismatch);
         }
 
-        let mut rebuilt = Self::new(self.network, self.bond_edge, self.role);
-        rebuilt.bundle.clone_from(&self.bundle);
-        rebuilt.bundle_bytes.clone_from(&self.bundle_bytes);
-        rebuilt.scan_armed = self.scan_armed;
-        rebuilt.history_cursor = self.scan_armed;
-        for blocks in self.history.chunks(256) {
-            rebuilt.apply_history_batch(&SetupHistoryBatch {
-                blocks: blocks.to_vec(),
-            })?;
+        match (self.scan_armed, self.scan_cursor) {
+            (None, None) if !self.bond_finalized && !self.payment_finalized => {}
+            (Some(floor), Some(cursor))
+                if cursor.height >= floor.height
+                    && (cursor.height != floor.height || cursor.payload == floor.payload) => {}
+            _ => return Err(SetupStateError::Malformed),
         }
-        let derived = |state: &Self| {
-            (
-                state.history_cursor,
-                state.bond_finalized,
-                state.payment_finalized,
-                state.bond_closed,
-                state.payment_closed,
-            )
-        };
-        if derived(&rebuilt) != derived(self) {
+        if (self.bond_closed && (!self.bond_finalized || self.role != Role::Provider))
+            || (self.payment_closed && !self.payment_finalized)
+            || (self.payment_finalized != self.origin.is_some())
+            || (self.role == Role::Client
+                && (self.unresolved_bond_open
+                    || self.unresolved_payment_open
+                    || self.bond_timeout_submitted))
+        {
             return Err(SetupStateError::Malformed);
+        }
+        if let Some(origin) = self.origin {
+            let floor = self.scan_armed.ok_or(SetupStateError::Malformed)?;
+            let cursor = self.scan_cursor.ok_or(SetupStateError::Malformed)?;
+            if Some(origin.payment_edge) != self.payment_edge()
+                || origin.height <= floor.height
+                || (self.end != Some(SetupEnd::Complete) && origin.height > cursor.height)
+                || (origin.height == cursor.height && origin.payload != cursor.payload)
+            {
+                return Err(SetupStateError::Malformed);
+            }
         }
         Ok(())
     }
@@ -211,14 +183,8 @@ impl SetupState {
 
     /// Returns the last contiguous finalized setup header held.
     #[must_use]
-    pub const fn history_cursor(&self) -> Option<SetupScan> {
-        self.history_cursor
-    }
-
-    /// Returns retained relevant history for mounting a channel watcher.
-    #[must_use]
-    pub fn history(&self) -> &[SetupHistoryBlock] {
-        &self.history
+    pub const fn scan_cursor(&self) -> Option<SetupScan> {
+        self.scan_cursor
     }
 
     /// Returns whether finalized history proves that a once-funded payment
@@ -494,14 +460,14 @@ impl SetupState {
                     });
                 }
                 self.scan_armed = Some(scan);
-                self.history_cursor = Some(scan);
+                self.scan_cursor = Some(scan);
                 Ok(Applied::Changed)
             }
             SetupRecord::ArmedBundle {
                 bundle,
                 close_descriptor,
             } => self.apply_armed_bundle(bundle, close_descriptor),
-            SetupRecord::SetupHistoryBatch(batch) => self.apply_history_batch(batch),
+            SetupRecord::Observed(observed) => self.apply_observation(observed),
             SetupRecord::BondTimeoutSubmitted => {
                 self.require_provider("bond Timeout submission")?;
                 self.require_executable("bond Timeout submission")?;
@@ -548,12 +514,17 @@ impl SetupState {
                         retained,
                     });
                 }
-                self.origin = Some(SetupOrigin {
+                let origin = SetupOrigin {
                     payment_edge: *payment_edge,
                     height: *origin_height,
                     payload: *origin_payload,
                     parent: *origin_parent,
-                });
+                };
+                if self.origin.is_some_and(|retained| retained != origin) {
+                    return Err(SetupStateError::Malformed);
+                }
+                self.payment_finalized = true;
+                self.origin = Some(origin);
                 self.end = Some(SetupEnd::Complete);
                 Ok(Applied::Changed)
             }
@@ -662,94 +633,107 @@ impl SetupState {
         Ok(Applied::Changed)
     }
 
-    fn apply_history_batch(
-        &mut self,
-        batch: &SetupHistoryBatch,
-    ) -> Result<Applied, SetupStateError> {
-        if batch.blocks.is_empty() || batch.blocks.len() > 256 {
+    /// Summarizes up to 256 contiguous, executed finalized blocks. The caller
+    /// obtains these from `FinalizedBlocks`; no peer-supplied transaction is
+    /// accepted as an observation without that verified source boundary.
+    pub fn observe(
+        &self,
+        blocks: &[crate::work_close::FinalizedWork],
+    ) -> Result<SetupObservation, SetupStateError> {
+        if blocks.is_empty() || blocks.len() > 256 {
             return Err(SetupStateError::Malformed);
         }
-        let Some(mut held) = self.history_cursor else {
-            return Err(SetupStateError::WrongStage {
-                step: "recording history before arming its scan floor",
-                revision: self.revision(),
-            });
-        };
-        if batch
-            .blocks
-            .last()
-            .is_some_and(|last| last.height <= held.height)
-        {
-            return Ok(Applied::Redundant);
-        }
-        let payment_edge = self.payment_edge().ok_or(SetupStateError::WrongStage {
-            step: "recording history before the payment edge is named",
+        let from = self.scan_cursor.ok_or(SetupStateError::WrongStage {
+            step: "observing before arming the scan floor",
             revision: self.revision(),
         })?;
-        for block in &batch.blocks {
-            if block.height != held.height.saturating_add(1) || block.parent != held.payload {
+        let payment_edge = self.payment_edge().ok_or(SetupStateError::WrongStage {
+            step: "observing before the payment edge is named",
+            revision: self.revision(),
+        })?;
+        let mut observed = SetupObservation {
+            from,
+            through: from,
+            bond_finalized: self.bond_finalized,
+            payment_finalized: self.payment_finalized,
+            bond_closed: self.bond_closed,
+            payment_closed: self.payment_closed,
+            origin: self.origin,
+        };
+        for block in blocks {
+            if Some(block.height) != observed.through.height.checked_add(1)
+                || block.parent != observed.through.payload
+            {
                 return Err(SetupStateError::Malformed);
             }
             for tx in &block.txs {
-                // Named before the filter below, so a client batch
-                // carrying the one transaction the filter drops is
-                // refused as the role error it is rather than as
-                // malformed bytes.
-                if self.role == Role::Client
-                    && matches!(tx, Tx::Close { input, .. } if *input == self.bond_edge)
-                {
-                    return Err(SetupStateError::WrongRole {
-                        step: "recording bond Close evidence",
-                    });
-                }
-                if !touches_setup(tx, self.role, self.bond_edge, payment_edge) {
-                    return Err(SetupStateError::Malformed);
-                }
                 match tx {
                     Tx::Open { funding, terms, .. } => {
                         let edge = Tx::edge_id_of(funding, terms);
                         if edge == self.bond_edge {
-                            self.bond_finalized = true;
-                            self.bond_closed = false;
-                            self.unresolved_bond_open = false;
+                            observed.bond_finalized = true;
                         } else if edge == payment_edge {
-                            self.payment_finalized = true;
-                            self.payment_closed = false;
-                            self.unresolved_payment_open = false;
-                            if self.origin.is_none() {
-                                self.origin = Some(SetupOrigin {
-                                    payment_edge,
-                                    height: block.height,
-                                    payload: block.payload,
-                                    parent: block.parent,
-                                });
-                            }
+                            observed.payment_finalized = true;
+                            observed.origin.get_or_insert(SetupOrigin {
+                                payment_edge,
+                                height: block.height,
+                                payload: block.payload,
+                                parent: block.parent,
+                            });
                         }
                     }
-                    Tx::Close { input, .. } if *input == self.bond_edge => {
-                        self.bond_closed = true;
+                    Tx::Close { input, .. }
+                        if *input == self.bond_edge && self.role == Role::Provider =>
+                    {
+                        observed.bond_finalized = true;
+                        observed.bond_closed = true;
                     }
                     Tx::Close { input, .. } if *input == payment_edge => {
-                        self.payment_closed = true;
+                        observed.payment_closed = true;
                     }
                     _ => {}
                 }
             }
-            held = SetupScan {
+            observed.through = SetupScan {
                 height: block.height,
                 payload: block.payload,
             };
         }
-        self.history_cursor = Some(held);
-        if self.unresolved_bond_open && held.height > self.open_horizon(true).unwrap_or(u64::MAX) {
+        Ok(observed)
+    }
+
+    fn apply_observation(
+        &mut self,
+        observed: &SetupObservation,
+    ) -> Result<Applied, SetupStateError> {
+        if self.scan_cursor != Some(observed.from)
+            || observed.through.height <= observed.from.height
+            || observed.through.height - observed.from.height > 256
+            || (self.bond_finalized && !observed.bond_finalized)
+            || (self.payment_finalized && !observed.payment_finalized)
+            || (self.bond_closed && !observed.bond_closed)
+            || (self.payment_closed && !observed.payment_closed)
+            || (self.origin.is_some() && self.origin != observed.origin)
+        {
+            return Err(SetupStateError::Malformed);
+        }
+        self.scan_cursor = Some(observed.through);
+        self.bond_finalized = observed.bond_finalized;
+        self.payment_finalized = observed.payment_finalized;
+        self.bond_closed = observed.bond_closed;
+        self.payment_closed = observed.payment_closed;
+        self.origin = observed.origin;
+        if self.bond_finalized
+            || observed.through.height > self.open_horizon(true).unwrap_or(u64::MAX)
+        {
             self.unresolved_bond_open = false;
         }
-        if self.unresolved_payment_open
-            && held.height > self.open_horizon(false).unwrap_or(u64::MAX)
+        if self.payment_finalized
+            || observed.through.height > self.open_horizon(false).unwrap_or(u64::MAX)
         {
             self.unresolved_payment_open = false;
         }
-        self.history.extend(batch.blocks.iter().cloned());
+        self.revalidate()?;
         Ok(Applied::Changed)
     }
 
@@ -803,33 +787,4 @@ fn funding_live(tx: &Tx, live: &BTreeSet<CoinId>) -> bool {
         .iter()
         .chain(funding.taker().iter())
         .all(|coin| live.contains(coin))
-}
-
-/// Whether this transaction belongs in `role`'s history of this setup.
-///
-/// Role-aware in one place, and it is the bond's Close: §7 gives bond
-/// Timeout and bond Close evidence to the provider alone, and either
-/// role may record payment history. A bond Timeout is permissionless, so
-/// a client's contiguous history *will* cross one — and a batch is
-/// applied whole, so a client that carried that Close would have every
-/// batch containing it refused and its cursor stuck below the block it
-/// landed in, for good. The header stays and the transaction does not:
-/// contiguity is what the cursor is, and the Close is evidence the
-/// client is not the one to record.
-pub(crate) fn touches_setup(tx: &Tx, role: Role, bond_edge: EdgeId, payment_edge: EdgeId) -> bool {
-    match tx {
-        Tx::Open { funding, terms, .. } => {
-            let edge = Tx::edge_id_of(funding, terms);
-            edge == bond_edge || edge == payment_edge
-        }
-        Tx::Close { input, .. } => {
-            *input == payment_edge || (*input == bond_edge && role == Role::Provider)
-        }
-        Tx::Move { action } => match action {
-            hellas_kernel::Move::StartPaymentClose(start) => start.payment_edge() == payment_edge,
-            hellas_kernel::Move::RespondPaymentClose(response) => {
-                response.payment_edge() == payment_edge
-            }
-        },
-    }
 }

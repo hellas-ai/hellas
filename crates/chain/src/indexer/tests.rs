@@ -60,7 +60,7 @@ async fn setup(
         page_cache_count: 8,
         ..Config::default()
     };
-    let (indexer, handle) = spawn_follower_indexer(
+    let (indexer, handle) = spawn_archive(
         context.child("indexer"),
         &format!("indexer-{seed}"),
         config,
@@ -203,5 +203,40 @@ fn block_round_must_match_finalization_round() {
             indexer.ingest_finalized(block, finalization).await,
             Err(IngestError::RoundMismatch)
         ));
+    });
+}
+
+#[cfg(feature = "full-node")]
+#[test]
+fn pruning_reclaims_old_marshal_sections() {
+    deterministic::Runner::default().start(|context| async move {
+        let (indexer, _handle, fixture, mut parent) = setup(context, 97989).await;
+        for height in 1..=260 {
+            let next = block(&parent, fixture.leaders[0].clone(), height, 1);
+            indexer
+                .ingest_finalized(next.clone(), finalization(&fixture, &next))
+                .await
+                .unwrap();
+            parent = next;
+        }
+        indexer.prune_before(259);
+        // This bypasses the public retention floor: the backing archive itself
+        // must have removed the first section, not merely hidden its entries.
+        assert!(indexer.marshal.get_block(Height::new(1)).await.is_none());
+        assert!(indexer.marshal.get_block(Height::new(260)).await.is_some());
+        assert!(
+            indexer
+                .get_finalized_block(FinalizedBlockQuery::Height(258))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            indexer
+                .get_finalized_block(FinalizedBlockQuery::Height(259))
+                .await
+                .unwrap()
+                .is_some()
+        );
     });
 }

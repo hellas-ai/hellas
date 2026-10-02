@@ -10,7 +10,7 @@ use crate::{
             legacy_address, run_qmdb,
         },
     },
-    indexer::spawn_follower_indexer,
+    indexer::spawn_archive,
     owner_index::ApplyOutcome,
 };
 use commonware_cryptography::Digestible as _;
@@ -211,7 +211,7 @@ async fn response_fixture_with_contests(
     let contest = index_block(&floor, contest_root, transactions);
 
     let consensus = consensus_fixture(95);
-    let (chain_indexer, handle) = spawn_follower_indexer(
+    let (chain_indexer, handle) = spawn_archive(
         runtime,
         partition,
         Config {
@@ -341,7 +341,7 @@ fn round7_general_ids_cannot_block_response() {
         .await
         .expect("response route is independent of general identities");
         assert_eq!(response.outcome, ProtoOutcome::Enqueued as i32);
-        let mempool = fixture.client.mempool.inner.lock().await;
+        let mempool = fixture.client.mempool().inner.lock().await;
         assert_eq!(mempool.general.len(), 1);
         assert_eq!(mempool.responses.len(), 1);
     });
@@ -369,7 +369,7 @@ fn round3_certificate_only_response_is_rejected_and_one_slot_per_finalized_conte
         assert!(
             fixture
                 .client
-                .mempool
+                .mempool()
                 .inner
                 .lock()
                 .await
@@ -388,7 +388,7 @@ fn round3_certificate_only_response_is_rejected_and_one_slot_per_finalized_conte
         assert!(
             fixture
                 .client
-                .mempool
+                .mempool()
                 .inner
                 .lock()
                 .await
@@ -420,7 +420,7 @@ fn round3_certificate_only_response_is_rejected_and_one_slot_per_finalized_conte
                 .expect("occupied contest admission"),
             SubmitTxOutcome::Full,
         );
-        let mempool = fixture.client.mempool.inner.lock().await;
+        let mempool = fixture.client.mempool().inner.lock().await;
         assert_eq!(mempool.responses.len(), 1);
         assert_eq!(
             payment_close_response(&mempool.responses.values().next().unwrap().transaction),
@@ -489,7 +489,7 @@ fn resident_invalidated_by_finality_is_dropped_before_full() {
                 .expect("fresh finalized contest is admitted"),
             SubmitTxOutcome::Enqueued,
         );
-        let mempool = fixture.client.mempool.inner.lock().await;
+        let mempool = fixture.client.mempool().inner.lock().await;
         assert_eq!(
             mempool.responses.len(),
             1,
@@ -510,13 +510,20 @@ fn invalid_incoming_response_does_not_sweep_residents() {
         let fixture = response_fixture(runtime, "response_auth_before_sweep").await;
         let resident = MempoolEntry::new(response_transaction(fixture.bad_action));
         let resident_digest = resident.digest;
-        fixture.client.mempool.inner.lock().await.responses.insert(
-            (
-                fixture.bad_action.payment_edge(),
-                fixture.bad_action.start_id(),
-            ),
-            resident,
-        );
+        fixture
+            .client
+            .mempool()
+            .inner
+            .lock()
+            .await
+            .responses
+            .insert(
+                (
+                    fixture.bad_action.payment_edge(),
+                    fixture.bad_action.start_id(),
+                ),
+                resident,
+            );
 
         assert_eq!(
             fixture
@@ -526,7 +533,7 @@ fn invalid_incoming_response_does_not_sweep_residents() {
                 .expect("bad action is an admission outcome"),
             SubmitTxOutcome::ValidationRejected,
         );
-        let mempool = fixture.client.mempool.inner.lock().await;
+        let mempool = fixture.client.mempool().inner.lock().await;
         assert_eq!(mempool.responses.len(), 1);
         assert_eq!(
             mempool.responses.values().next().map(|entry| entry.digest),
@@ -561,7 +568,7 @@ fn full_response_mempool_reuses_slot_invalidated_by_finality() {
             );
         }
         assert_eq!(
-            fixture.client.mempool.inner.lock().await.responses.len(),
+            fixture.client.mempool().inner.lock().await.responses.len(),
             RESPONSE_MEMPOOL_CAPACITY,
         );
 
@@ -590,7 +597,7 @@ fn full_response_mempool_reuses_slot_invalidated_by_finality() {
             SubmitTxOutcome::Enqueued,
             "the finalized-invalid resident is swept before the capacity decision",
         );
-        let mempool = fixture.client.mempool.inner.lock().await;
+        let mempool = fixture.client.mempool().inner.lock().await;
         assert_eq!(mempool.responses.len(), RESPONSE_MEMPOOL_CAPACITY);
         assert!(
             mempool
@@ -614,7 +621,7 @@ async fn finalized_payload_indexer(
         page_cache_count: 8,
         ..Config::default()
     };
-    let (indexer, handle) = spawn_follower_indexer(
+    let (indexer, handle) = spawn_archive(
         context,
         "rpc_finalized_floor",
         config,
@@ -773,7 +780,7 @@ fn work_channel_snapshot_reads_every_object_at_one_finalized_block() {
         let open_block = index_block(&floor_block, open_root, transactions);
 
         let fixture = consensus_fixture(93);
-        let (chain_indexer, _handle) = spawn_follower_indexer(
+        let (chain_indexer, _handle) = spawn_archive(
             indexer_context,
             "rpc_work_snapshot",
             Config {
@@ -861,80 +868,6 @@ fn work_channel_snapshot_reads_every_object_at_one_finalized_block() {
             snapshot.live_funding_of(&[spent_by_bond].into_iter().collect()),
             None,
         );
-
-        // The same answer, through the wire, byte for byte. The
-        // response carries canonical kernel objects, so what comes
-        // back is the object consensus stored and not a re-spelling
-        // of its fields — and a re-spelling is exactly what the
-        // equality below would not catch if the wire carried one.
-        let encoded = crate::server::work_channel_snapshot_response(Some(snapshot.clone()));
-        assert_eq!(
-            crate::client::work_channel_snapshot_from_proto(query.clone(), encoded.clone(), None)
-                .expect("the wire carries a decodable snapshot"),
-            Some(snapshot.clone()),
-        );
-
-        // One lease slot dropped. Reading its absence as an empty
-        // slot would report a live lease as absent, so the count is
-        // exact rather than padded.
-        let mut short = encoded.clone();
-        short.lease_slots.truncate(1);
-        assert!(matches!(
-            crate::client::work_channel_snapshot_from_proto(query.clone(), short, None),
-            Err(QueryError::Remote(_)),
-        ));
-
-        // One lease slot's bytes truncated. A chunk that does not
-        // decode is not an empty slot either.
-        let mut corrupt = encoded.clone();
-        if let Some(slot) = corrupt.lease_slots.first_mut()
-            && let Some(chunk) = slot.chunk.as_mut()
-        {
-            chunk.pop();
-        }
-        assert!(matches!(
-            crate::client::work_channel_snapshot_from_proto(query.clone(), corrupt, None),
-            Err(QueryError::Remote(_)),
-        ));
-
-        // The pending-close slot message dropped. An empty slot is a
-        // permission — it is what says no contest is open and new
-        // work may be admitted — so an omitted field must not be
-        // read as one.
-        let mut silent = encoded.clone();
-        silent.pending_slot = None;
-        assert!(matches!(
-            crate::client::work_channel_snapshot_from_proto(query.clone(), silent, None),
-            Err(QueryError::Remote(_)),
-        ));
-
-        // A coin reported live that the query never named. Nothing
-        // in an unrequested coin id could have been checked, and a
-        // decision would read it as this transaction's funding, so
-        // the reply is refused rather than trimmed.
-        let mut invented = encoded.clone();
-        invented.live_funding.push(
-            CoinId::from_bytes([0xc0; CoinId::LENGTH])
-                .to_bytes()
-                .to_vec(),
-        );
-        assert!(matches!(
-            crate::client::work_channel_snapshot_from_proto(query.clone(), invented, None),
-            Err(QueryError::Remote(_)),
-        ));
-
-        // A coin the query named and the reply leaves out is not
-        // refused: that omission is exactly how a spent coin is
-        // reported, and refusing it would make every real
-        // preflight failure unreadable.
-        let mut spent = encoded;
-        spent.live_funding.clear();
-        let Ok(Some(reported)) =
-            crate::client::work_channel_snapshot_from_proto(query.clone(), spent, None)
-        else {
-            panic!("an empty live set is an answer");
-        };
-        assert!(reported.live_funding().is_empty());
 
         // An index one block behind the database it is reporting
         // for. Its cursor block is finalized and its finalization

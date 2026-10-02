@@ -1,8 +1,8 @@
 use super::*;
 use crate::{Mempool, OwnerCoins, light_client::QueryError};
 use bytes::Bytes;
-use hellas_kernel::Encode as _;
 use hellas_kernel::test_support::valid_open_tx;
+use hellas_kernel::{EdgeId, Encode as _};
 use hellas_rpc::pb::services::light_client::LightClientClientImpl;
 use hellas_wire::DefaultClock;
 use hellas_wire::mux::{MessagePipe, MuxConfig, MuxTransport, Role as MuxRole};
@@ -31,18 +31,8 @@ struct MempoolClient {
     mempool: Mempool,
     edge_result: Option<Result<Option<EdgeLookup>, QueryError>>,
     owner_edges_result: Option<Result<Option<OwnerEdges>, QueryError>>,
-    snapshot_result: Option<WorkChannelSnapshot>,
     response_blocker: Option<Arc<ResponseBlocker>>,
     forced_submit_outcome: Arc<std::sync::Mutex<Option<SubmitTxOutcome>>>,
-}
-
-impl FinalizedWorkView for MempoolClient {
-    async fn work_channel_snapshot(
-        &self,
-        _query: WorkChannelQuery,
-    ) -> Result<Option<WorkChannelSnapshot>, QueryError> {
-        Ok(self.snapshot_result.clone())
-    }
 }
 
 impl LightClientApi for MempoolClient {
@@ -192,47 +182,6 @@ fn synthetic_response_request() -> SubmitWorkResponseRequest {
     let written = response.write_to(&mut bytes);
     bytes.truncate(written);
     SubmitWorkResponseRequest { response: bytes }
-}
-
-/// The endpoint's two boundary answers: an argument that is not an
-/// edge id, and a node with no finalized state to answer from.
-///
-/// Absence is reported as an absent snapshot rather than an empty
-/// one, because an empty snapshot would read as "this channel does
-/// not exist" — a different fact, and the one that would let an
-/// endpoint conclude a live lease was gone.
-#[tokio::test]
-async fn work_channel_snapshot_endpoint_separates_a_bad_argument_from_no_state() {
-    let rpc = LightClientRpc::new(MempoolClient::default(), broadcast::channel(4).0);
-    let ok = EdgeId::from_bytes([0x11; EdgeId::LENGTH])
-        .to_bytes()
-        .to_vec();
-
-    let short = LightClientHandler::get_work_channel_snapshot(
-        &rpc,
-        pb::GetWorkChannelSnapshotRequest {
-            bond_edge: ok[..EdgeId::LENGTH - 1].to_vec(),
-            payment_edge: ok.clone(),
-            funding_coins: Vec::new(),
-        },
-    )
-    .await
-    .expect_err("a 31-byte edge id is not an edge id");
-    assert_eq!(short.code(), WireCode::InvalidArgument);
-
-    let absent = LightClientHandler::get_work_channel_snapshot(
-        &rpc,
-        pb::GetWorkChannelSnapshotRequest {
-            bond_edge: ok.clone(),
-            payment_edge: ok,
-            funding_coins: Vec::new(),
-        },
-    )
-    .await
-    .expect("an absent snapshot is an answer");
-    assert!(absent.snapshot.is_none());
-    assert!(absent.lease_slots.is_empty());
-    assert!(absent.pending_slot.is_none());
 }
 
 #[tokio::test]

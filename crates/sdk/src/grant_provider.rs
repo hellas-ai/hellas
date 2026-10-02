@@ -130,7 +130,10 @@ enum DesiredGrants {
         owner: Option<Box<GrantDef>>,
         revise: bool,
     },
-    Contacts(BTreeMap<GrantId, GrantDef>),
+    Contacts {
+        owner: Box<Principal>,
+        grants: BTreeMap<GrantId, GrantDef>,
+    },
 }
 
 impl GrantProviderPlan {
@@ -191,10 +194,16 @@ impl GrantProviderPlan {
         options: &GrantProviderOptions,
         directory: &Path,
         provider: ProviderEnrollmentBundle,
+        owner: Principal,
         routes: &FetchRouteRegistry,
         concurrent: usize,
     ) -> Result<Self, GrantProviderError> {
         provider.check_grant_provider()?;
+        if owner.transport() != provider.grant_transport()?
+            || owner.producer() != provider.grant_producer()?
+        {
+            return Err(GrantError::Audience.into());
+        }
         ProviderResources::Fetch(routes).validate(&options.policies)?;
         let concurrent = u16::try_from(concurrent)
             .ok()
@@ -241,7 +250,10 @@ impl GrantProviderPlan {
                 limits: vec![],
                 concurrency: concurrent.get(),
             },
-            desired: DesiredGrants::Contacts(desired),
+            desired: DesiredGrants::Contacts {
+                owner: Box::new(owner),
+                grants: desired,
+            },
         })
     }
 
@@ -249,7 +261,11 @@ impl GrantProviderPlan {
         let now = wall_clock();
         let mut store = GrantStore::open(&self.directory, grant_network(), self.provider, now)?;
         let changes = match self.desired {
-            DesiredGrants::Contacts(desired) => contact_changes(&store, desired)?,
+            DesiredGrants::Contacts { owner, grants } => {
+                let changes = contact_changes(&store, grants)?;
+                store.bind_owner(*owner, now)?;
+                changes
+            }
             DesiredGrants::Managed { owner, revise } => owner_changes(&store, owner, revise)?,
         };
         match self.machine {

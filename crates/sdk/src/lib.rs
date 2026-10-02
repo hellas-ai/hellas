@@ -5,6 +5,8 @@
 //! crates without making a CLI binary their library boundary.
 
 pub use hellas_attestation::{AttestationError, Attester, Binding, RootProver};
+#[cfg(any(feature = "paid-client", feature = "paid-provider"))]
+pub use hellas_chain::node::{Config as ChainNodeConfig, FullNode};
 pub use hellas_rpc as rpc;
 pub use hellas_wire as wire;
 
@@ -35,6 +37,8 @@ pub use hellas_kernel as kernel;
 pub use hellas_providers::{
     HttpProviderConfig, OpenAiResponsesFetchProvider, ResponsesFetchAdaptorFactory,
 };
+#[cfg(feature = "paid-provider")]
+pub use provider::PaidProviderOptions;
 #[cfg(any(feature = "paid-provider", feature = "grant-provider"))]
 pub use provider::{FetchProviderOptions, ProviderError, ProviderHandle, start_fetch_provider};
 #[cfg(feature = "grant-provider")]

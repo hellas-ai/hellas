@@ -44,6 +44,7 @@ pub struct ServeOptions {
     /// fan-out, the journal root, and the policies it would mount a
     /// channel with.
     pub work_config: Option<WorkConfig>,
+    pub chain_node: super::chain_node::ChainNodeArgs,
     pub metrics_port: Option<u16>,
     pub graffiti: String,
     pub fetch_config_file: Option<PathBuf>,
@@ -142,18 +143,19 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
             settlement_party = %hex::encode(options.settlement_key.party_key().to_bytes()),
             "loaded the paid-work configuration; paid admission is on",
         );
-        work_runner = Some(node::WorkRunnerConfig {
-            network: work.chain.network,
-            genesis_payload_digest: work.chain.genesis_payload_digest,
-            threshold_identity: work.chain.threshold_identity.clone(),
-            journal_root: work.journal_root.clone(),
-            routes: work.routes.clone(),
-            validators: work.validators.clone(),
-            poll: work.poll,
-            max_observation_age: work.max_observation_age,
-            settlement_key: options.settlement_key.clone(),
-            policy: work.provider_policy(),
-        });
+        let chain = options.chain_node.start(work).await?;
+        work_runner = Some((
+            node::WorkRunnerConfig {
+                network: work.chain.network,
+                journal_root: work.journal_root.clone(),
+                routes: work.routes.clone(),
+                poll: work.poll,
+                max_observation_age: work.max_observation_age,
+                settlement_key: options.settlement_key.clone(),
+                policy: work.provider_policy(),
+            },
+            chain,
+        ));
     }
 
     let build = option_env!("GIT_REV").unwrap_or("unknown").to_string();

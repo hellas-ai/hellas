@@ -375,6 +375,8 @@ mod outcome_code {
 /// One durable step of a channel's life.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ChannelRecord {
+    /// The origin block's own close transactions are durable.
+    OriginObserved,
     /// Client-side exchange state, fsynced before a retry leaves or a known
     /// refusal permits another nonce. This never releases funding obligations.
     ProposalExchange {
@@ -551,6 +553,7 @@ pub enum ChannelRecord {
 }
 
 mod tag {
+    pub(super) const ORIGIN_OBSERVED: u8 = 13;
     pub(super) const PROPOSAL_EXCHANGE: u8 = 12;
     pub(super) const CURSOR: u8 = 0;
     pub(super) const PROPOSED: u8 = 1;
@@ -699,6 +702,7 @@ pub struct PaymentState {
     channel: PaidChannel,
     settlement: WorkPaymentSettlement,
     cursor: (u64, [u8; 32]),
+    origin_observed: bool,
     close_prepared: Option<PaymentCloseStart>,
     close_opened: Option<OpenContest>,
     close_responded: Option<RespondedContest>,

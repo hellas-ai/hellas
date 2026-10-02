@@ -349,6 +349,11 @@ fn default_hellas_path(file: &str, flag: &str) -> anyhow::Result<PathBuf> {
     Ok(PathBuf::from(home).join(IDENTITY_DIR).join(file))
 }
 
+#[cfg(feature = "node")]
+pub(crate) fn default_chain_path(network: &str) -> anyhow::Result<PathBuf> {
+    Ok(default_hellas_path("chain", "--chain-store-dir")?.join(network))
+}
+
 fn create_root(_installation_nonce: [u8; 32]) -> anyhow::Result<PlatformRoot> {
     Ok(PlatformRoot::Software(ProducerSigningKey::generate()))
 }

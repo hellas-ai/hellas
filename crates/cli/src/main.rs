@@ -86,7 +86,7 @@ fn load_command_identity(
     let owned_machine = false;
     let grant_identity = matches!(command, Commands::Contact { .. } | Commands::Offer { .. });
     #[cfg(feature = "node")]
-    let grant_identity = grant_identity || matches!(command, Commands::Grant(_));
+    let grant_identity = grant_identity || matches!(command, Commands::Admin(_));
     #[cfg(feature = "gateway")]
     let grant_identity =
         grant_identity || matches!(command, Commands::Gateway { offer: Some(_), .. });
@@ -237,14 +237,6 @@ struct CausalLmArgs {
 #[command(version)]
 #[command(about = "Hellas node CLI")]
 struct Cli {
-    /// Inference reuse policy shared by execution commands. In record mode,
-    /// a cache write failure fails the request, even if inference succeeded.
-    #[arg(long, global = true, default_value = "off")]
-    output_cache: hellas_rpc::cache::CachePolicy,
-
-    /// Hellas content store state (default: HELLAS_STORE_DIR or ~/.hellas/store)
-    #[arg(long, global = true)]
-    store_dir: Option<PathBuf>,
     /// Path to the versioned local identity for commands that use one
     /// (default: $HOME/.hellas/identity).
     #[arg(long = "identity", global = true)]
@@ -314,9 +306,6 @@ enum Commands {
     #[cfg(all(feature = "cloud", unix))]
     /// Discover and administer machines owned by the selected Hellas identity.
     Machines(hellas_cloud::machines::MachinesArgs),
-    #[cfg(all(feature = "cloud", unix))]
-    /// Internal management RPC for local applications.
-    Control(hellas_cloud::machines::ControlArgs),
     /// Share this identity's verified public enrollment.
     Contact {
         #[command(subcommand)]
@@ -327,12 +316,16 @@ enum Commands {
         #[command(subcommand)]
         command: commands::contributions::OfferCommand,
     },
-    #[cfg(feature = "node")]
-    /// Administer provider grants over local owner control.
-    Grant(commands::contributions::grants::GrantArgs),
+    #[cfg(any(feature = "node", all(feature = "cloud", unix)))]
+    /// Administer this node and its users.
+    Admin(commands::admin::AdminArgs),
     #[cfg(feature = "node")]
     /// Run the RPC server
     Serve {
+        /// Content store state used by local execution (default: HELLAS_STORE_DIR or ~/.hellas/store).
+        #[cfg(feature = "evaluate")]
+        #[arg(long)]
+        store_dir: Option<PathBuf>,
         /// Assurance offered by this provider.
         #[arg(long, default_value = "producer-signed", value_parser = parse_assurance)]
         assurance: hellas_rpc::Assurance,
@@ -395,6 +388,8 @@ enum Commands {
         /// Work remains retryably not ready until the configured state mounts.
         #[arg(long = "work-config")]
         work_config_file: Option<PathBuf>,
+        #[command(flatten)]
+        chain_node: commands::chain_node::ChainNodeArgs,
         /// Grant resources and machine safety limits; no chain configuration is needed.
         #[arg(long = "grant-config")]
         grant_config_file: Option<PathBuf>,
@@ -469,6 +464,12 @@ enum Commands {
     )))]
     #[cfg_attr(all(feature = "cloud", unix), command(mut_arg("environment", |arg| arg.required_unless_present_any(["responses_backend", "http_fetch_config", "offer", "machine"]))))]
     Gateway {
+        /// Inference reuse policy; record mode fails requests if cache writes fail.
+        #[arg(long, default_value = "off")]
+        output_cache: hellas_rpc::cache::CachePolicy,
+        /// Content and output cache state (default: HELLAS_STORE_DIR or ~/.hellas/store).
+        #[arg(long)]
+        store_dir: Option<PathBuf>,
         /// Use a private Offer previously verified by `offer import`.
         #[arg(long, value_name = "ALIAS", conflicts_with_all = ["node_id", "node_addrs", "provider_genesis", "responses_backend", "http_fetch_config"])]
         #[cfg_attr(feature = "node", arg(conflicts_with = "paid_work_config"))]
@@ -493,6 +494,9 @@ enum Commands {
         #[cfg(feature = "node")]
         #[arg(long = "paid-work-config", value_name = "FILE")]
         paid_work_config: Option<PathBuf>,
+        #[cfg(feature = "node")]
+        #[command(flatten)]
+        chain_node: commands::chain_node::ChainNodeArgs,
         /// Load a private bearer credential file, creating it when absent.
         #[arg(long = "bearer-token-file", value_name = "FILE")]
         bearer_token_file: Option<PathBuf>,
@@ -522,7 +526,7 @@ enum Commands {
         #[arg(long)]
         node_id: Option<EndpointId>,
         /// Direct UDP address hint for the target node. Repeat or use commas.
-        #[arg(long = "node-addr", value_delimiter = ',')]
+        #[arg(long = "address", value_delimiter = ',')]
         #[cfg_attr(all(feature = "cloud", unix), arg(requires = "remote_target"))]
         #[cfg_attr(not(all(feature = "cloud", unix)), arg(requires = "node_id"))]
         node_addrs: Vec<SocketAddr>,
@@ -598,7 +602,7 @@ enum Commands {
         /// Node ID to check
         node_id: EndpointId,
         /// Direct UDP address hint for the target node. Repeat or use commas.
-        #[arg(long = "node-addr", value_delimiter = ',')]
+        #[arg(long = "address", value_delimiter = ',')]
         node_addrs: Vec<SocketAddr>,
     },
     /// Inspect or run the durable paid-work client path.
@@ -609,6 +613,9 @@ enum Commands {
     },
     /// Inspect and fill the content store
     Store {
+        /// Content store state (default: HELLAS_STORE_DIR or ~/.hellas/store).
+        #[arg(long, global = true)]
+        store_dir: Option<PathBuf>,
         #[command(subcommand)]
         command: commands::store::StoreCommand,
     },
@@ -649,6 +656,8 @@ enum Commands {
     /// it. A root may hold several offers only when their configured routes,
     /// bonds, and every staked coin are pairwise disjoint.
     Provision {
+        #[command(flatten)]
+        chain_node: commands::chain_node::ChainNodeArgs,
         /// The paid-work configuration this offer is made under
         #[arg(long = "work-config")]
         work_config: PathBuf,
@@ -734,12 +743,12 @@ fn validate_identity_options(
         #[cfg(all(feature = "cloud", unix))]
         command if command.owned_machine().is_some() => true,
         #[cfg(all(feature = "cloud", unix))]
-        Commands::Cloud(_) | Commands::Machines(_) | Commands::Control(_) => true,
+        Commands::Cloud(_) | Commands::Machines(_) => true,
         Commands::Contact { .. } | Commands::Offer { .. } => true,
         #[cfg(feature = "gateway")]
         Commands::Gateway { offer: Some(_), .. } => true,
-        #[cfg(feature = "node")]
-        Commands::Grant(_) => true,
+        #[cfg(any(feature = "node", all(feature = "cloud", unix)))]
+        Commands::Admin(_) => true,
         Commands::Identity {
             command: IdentityCommand::ShowNodeId | IdentityCommand::ShowEnrollmentId,
         }
@@ -887,7 +896,10 @@ async fn async_main() {
     // build where there is deliberately no writable home directory.
     let command = match cli.command {
         #[cfg(all(feature = "cloud", unix))]
-        command @ (Commands::Cloud(_) | Commands::Machines(_) | Commands::Control(_)) => {
+        command @ Commands::Admin(commands::admin::AdminArgs {
+            command: commands::admin::AdminCommand::Serve { .. },
+            ..
+        }) => {
             let result = cloud::run(command, cli.identity.as_deref()).await;
             tracer_provider.shutdown();
             if let Err(err) = result {
@@ -896,8 +908,18 @@ async fn async_main() {
             }
             return;
         }
-        Commands::Store { command } => {
-            let result = commands::store::run(command, cli.store_dir).await;
+        #[cfg(all(feature = "cloud", unix))]
+        command @ (Commands::Cloud(_) | Commands::Machines(_)) => {
+            let result = cloud::run(command, cli.identity.as_deref()).await;
+            tracer_provider.shutdown();
+            if let Err(err) = result {
+                eprintln!("error: {err:#}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        Commands::Store { command, store_dir } => {
+            let result = commands::store::run(command, store_dir).await;
             tracer_provider.shutdown();
             if let Err(err) = result {
                 eprintln!("error: {err:#}");
@@ -957,10 +979,14 @@ async fn async_main() {
         Commands::Contact { command } => commands::contributions::contact(command, &local_identity),
         Commands::Offer { command } => commands::contributions::offer(command, &local_identity),
         #[cfg(feature = "node")]
-        Commands::Grant(args) => commands::contributions::grants::run(args, &local_identity).await,
+        Commands::Admin(args) => commands::admin::users::run(args, &local_identity).await,
+        #[cfg(all(feature = "cloud", unix, not(feature = "node")))]
+        Commands::Admin(_) => unreachable!("admin serve returned above"),
 
         #[cfg(feature = "node")]
         Commands::Serve {
+            #[cfg(feature = "evaluate")]
+            store_dir,
             assurance,
             port,
             no_discovery,
@@ -986,6 +1012,7 @@ async fn async_main() {
             #[cfg(feature = "evaluate")]
             gpu_execution_timeout_secs,
             work_config_file,
+            chain_node,
             grant_config_file,
             init_owner,
             owner_enrollment,
@@ -1049,13 +1076,14 @@ async fn async_main() {
                             content_roots,
                             #[cfg(feature = "evaluate")]
                             content_index: content_index.or_else(|| {
-                                cli.store_dir
+                                store_dir
                                     .as_deref()
                                     .map(hellas_store::state::records_path_at)
                             }),
                             #[cfg(feature = "evaluate")]
                             gpu_config,
                             work_config,
+                            chain_node,
                             grants,
                             metrics_port,
                             graffiti,
@@ -1076,6 +1104,7 @@ async fn async_main() {
         }
         #[cfg(feature = "node")]
         Commands::Provision {
+            chain_node,
             work_config,
             client,
             stake_coin,
@@ -1101,12 +1130,14 @@ async fn async_main() {
                     bond_timeout,
                     timeout_payout,
                     max_job_price,
-                }, print_bond_only)
+                }, print_bond_only, chain_node)
                 .await
             }.await
         },
         #[cfg(feature = "gateway")]
         Commands::Gateway {
+            output_cache,
+            store_dir,
             offer,
             grant_policy,
             http_fetch_config,
@@ -1114,6 +1145,8 @@ async fn async_main() {
             zdr,
             #[cfg(feature = "node")]
             paid_work_config,
+            #[cfg(feature = "node")]
+            chain_node,
             bearer_token_file,
             allow_remote,
             chat_template,
@@ -1147,12 +1180,11 @@ async fn async_main() {
                 let local_content = causal_lm.as_ref().map(|args| commands::grant_gateway::local::LocalContent {
                     paths: std::iter::once(args.environment.clone()).chain(args.content_paths.iter().cloned()).collect(),
                     roots: args.content_roots.clone(),
-                    index: args.content_index.clone().or_else(|| cli.store_dir.as_deref().map(hellas_store::state::records_path_at)),
+                    index: args.content_index.clone().or_else(|| store_dir.as_deref().map(hellas_store::state::records_path_at)),
                     queue_size,
                 });
-                let output_cache = cli.output_cache;
                 let cache_options =
-                    commands::gateway_cache::options(output_cache, cli.store_dir.clone())?;
+                    commands::gateway_cache::options(output_cache, store_dir.clone())?;
                 let (
                     loaded_environment,
                     model_name,
@@ -1195,6 +1227,8 @@ async fn async_main() {
                 #[cfg(all(feature = "node", not(feature = "evaluate")))]
                 let local = false;
                 #[cfg(feature = "node")]
+                let mut chain_shutdown = None;
+                #[cfg(feature = "node")]
                 let paid_work = if let Some(path) = paid_work_config.as_ref()
                     && output_cache != hellas_rpc::cache::CachePolicy::ReplayOnly
                 {
@@ -1212,10 +1246,14 @@ async fn async_main() {
                             && remote_trust.apple_app_attest_cdhashes.is_empty(),
                         "set provider enrollment and Apple trust pins in --paid-work-config",
                     );
+                    let options = hellas_sdk::paid_gateway::load_pool_options(path, assurance)?;
+                    let node = chain_node.start(&options.providers.first().ok_or_else(|| anyhow::anyhow!("paid pool has no providers"))?.config).await?;
+                    chain_shutdown = Some(node.clone());
                     Some(
                         hellas_sdk::paid_gateway::PaidGateway::open(
-                            hellas_sdk::paid_gateway::load_pool_options(path, assurance)?,
+                            options,
                             hellas_sdk::ClientIdentity::from_secret_bytes(secret_key.to_bytes(), local_identity.producer_key.to_secret_bytes())?,
+                            node,
                         ).await? as std::sync::Arc<dyn hellas_gateway::WorkExecutionBackend>
                     )
                 } else {
@@ -1325,7 +1363,14 @@ async fn async_main() {
                 })
                 .await.map_err(anyhow::Error::from)
                 }.await;
-                if let Some(backend) = shutdown { backend.drain().await?; }
+                let mut result = result;
+                if let Some(backend) = shutdown {
+                    result = result.and(backend.drain().await.map_err(anyhow::Error::from));
+                }
+                #[cfg(feature = "node")]
+                if let Some(node) = chain_shutdown {
+                    result = result.and(node.shutdown().await.map_err(anyhow::Error::from));
+                }
                 result
             }
             .await
@@ -1348,7 +1393,7 @@ async fn async_main() {
         Commands::Chain { .. } => unreachable!("chain commands handled before identity load"),
         Commands::Store { .. } => unreachable!("store commands handled before identity load"),
         #[cfg(all(feature = "cloud", unix))]
-        Commands::Cloud(_) | Commands::Machines(_) | Commands::Control(_) => {
+        Commands::Cloud(_) | Commands::Machines(_) => {
             unreachable!("management commands handled before identity load")
         }
         Commands::Environment { .. } => {

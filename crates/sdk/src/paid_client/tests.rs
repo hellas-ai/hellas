@@ -22,6 +22,7 @@ async fn insufficient_collateral_is_rejected_before_network_or_journal_creation(
         config: WorkConfig {
             payment_policy: payment_policy(),
             chain: crate::work_config::ChainCrossCheck {
+                genesis: None,
                 network: policy.network,
                 genesis_payload_digest: [0; 32].into(),
                 threshold_identity: Vec::new(),
@@ -57,12 +58,7 @@ async fn insufficient_collateral_is_rejected_before_network_or_journal_creation(
         payment_blocks: 600,
         timeout: Duration::from_secs(30),
     };
-    let result = PaidWorkSession::open(
-        args,
-        endpoint.clone(),
-        Secp256k1Signer::from_secret_scalar([1; 32]).unwrap(),
-    )
-    .await;
+    let result = args.validate();
     assert!(matches!(
         result,
         Err(PaidClientError::WorkSetup(

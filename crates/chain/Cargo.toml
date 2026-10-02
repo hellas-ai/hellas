@@ -65,9 +65,17 @@ block-view = [
     "dep:commonware-storage",
     "dep:commonware-utils",
 ]
+full-node = [
+    "indexer",
+    "server",
+    "hellas-wire/iroh",
+    "hellas-rpc/swarm",
+    "dep:iroh",
+    "hellas-kernel/webauthn",
+]
 indexer-api = [
     "proof-verify",
-    "indexer",
+    "full-node",
     "dep:axum",
     "axum/ws",
     "dep:redb",
@@ -124,7 +132,7 @@ server = [
     "tokio-stream/sync",
 ]
 validator = [
-    "indexer",
+    "full-node",
     "server",
     "dep:axum",
     "dep:commonware-broadcast",
@@ -170,6 +178,7 @@ hellas-rpc = { workspace = true, optional = true, features = ["chain"] }
 hellas-wire = { workspace = true, optional = true }
 hellas-work = { workspace = true, optional = true }
 hex = { workspace = true, optional = true }
+iroh = { workspace = true, optional = true, features = ["tls-ring"] }
 p256 = { workspace = true, optional = true }
 prometheus-client = { workspace = true, optional = true }
 prost = { version = "0.14", default-features = false, features = [

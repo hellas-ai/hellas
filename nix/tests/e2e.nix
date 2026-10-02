@@ -169,10 +169,13 @@ let
       ) allocations;
     in
     ''
+      import shlex
       import time
+      import tomllib
 
       cli = "${validatorPackage}/bin/hellas-cli"
       rpc = "ws://127.0.0.1:${toString chainRpcPort}"
+      follower_api = "http://127.0.0.1:31247/api/v1/blocks"
       home = "HOME=${homePrefix}/client-home OTEL_SERVICE_NAME=hellas-test-client"
       validator_log = "${validatorLog}"
       follower_log = "${followerLog}"
@@ -193,29 +196,19 @@ let
           return fields
 
       def follower_height():
-          output = machine.succeed(f"cat {follower_log} || true")
-          heights = []
-          for line in output.splitlines():
-              parts = line.split()
-              if len(parts) == 3 and parts[0] == "height" and parts[2] in ["Applied", "Duplicate"]:
-                  heights.append(int(parts[1]))
-          return max(heights) if heights else 0
+          status, output = machine.execute(f"curl -fsS --max-time 5 {follower_api}/latest")
+          return int(json.loads(output)["height"]) if status == 0 else 0
 
-      def follower_activity_events():
-          output = machine.succeed(f"cat {follower_log} || true")
-          return sum(1 for line in output.splitlines() if line.startswith("activity finalization "))
-
-      def wait_for_follower_stream_ready():
+      def wait_for_follower_ready():
           deadline = time.time() + 60
           while time.time() < deadline:
-              output = machine.succeed(f"cat {follower_log} || true")
-              if "activity stream subscribed" in output:
+              if follower_height() > 0:
                   return
               time.sleep(1)
           follower = machine.succeed(f"cat {follower_log} || true")
           validator = machine.succeed(f"cat {validator_log} || true")
           raise Exception(
-              f"follower did not subscribe to activity stream\n"
+              f"follower did not publish an executed block\n"
               f"follower:\n{follower}\nvalidator:\n{validator}"
           )
 
@@ -225,14 +218,23 @@ let
           "${homePrefix}/follower-home ${homePrefix}/follower-store"
       )
       machine.succeed(
+          "printf 'chain_sync_bind = \"127.0.0.1:31248\"\\n' > ${homePrefix}/validator.toml; "
           f"HOME=${homePrefix}/validator-home {cli} chain validator config "
           "-n 1 --seed ${toString validatorSeed} --start-port ${toString startPort} "
           "--light-client-bind 127.0.0.1:${toString chainRpcPort} "
           "--metrics-port ${toString metricsPort} ${allocationArgs} "
-          "> ${homePrefix}/validator.toml"
+          ">> ${homePrefix}/validator.toml"
       )
       machine.succeed(
           f"{cli} chain validator check-config --config ${homePrefix}/validator.toml | grep -Fx ok"
+      )
+      config = tomllib.loads(machine.succeed("cat ${homePrefix}/validator.toml"))
+      peer_id = config["genesis"]["validators"][0]["public_key"]
+      genesis = shlex.quote(json.dumps(config["genesis"]))
+      machine.succeed(f"printf %s {genesis} > ${homePrefix}/genesis.json")
+      machine.succeed(
+          f"{cli} chain validator export-trust --config ${homePrefix}/validator.toml "
+          "--genesis ${homePrefix}/genesis.json > ${homePrefix}/trust.json"
       )
       machine.succeed(
           f"HOME=${homePrefix}/validator-home OTEL_SERVICE_NAME=hellas-test-validator RUST_LOG=info {cli} chain validator run "
@@ -245,16 +247,19 @@ let
           print(machine.succeed(f"cat {validator_log} || true"))
           raise
       machine.succeed(
-          f"HOME=${homePrefix}/follower-home OTEL_SERVICE_NAME=hellas-test-indexer RUST_LOG=info {cli} chain indexer follow "
+          f"HOME=${homePrefix}/follower-home OTEL_SERVICE_NAME=hellas-test-indexer RUST_LOG=info {cli} chain indexer serve "
           f"--rpc {rpc} --storage-dir ${homePrefix}/follower-store "
+          f"--peer {peer_id}@127.0.0.1:31248 "
           "--partition-prefix ${followerPartitionPrefix} "
+          "--trust ${homePrefix}/trust.json --genesis ${homePrefix}/genesis.json "
+          "--listen 127.0.0.1:31247 "
           f"> {follower_log} 2>&1 & echo $! > ${homePrefix}/follower.pid"
       )
       machine.wait_until_succeeds(
           f"{home} {cli} chain query --rpc {rpc} latest-block "
           f"> ${homePrefix}/latest.log && grep -Eq '^height [1-9][0-9]*$' ${homePrefix}/latest.log"
       )
-      wait_for_follower_stream_ready()
+      wait_for_follower_ready()
     '';
 in
 {
@@ -486,27 +491,30 @@ in
       }}
       owner = "${chainOwner}"
 
-      def wait_for_follower_stream(baseline, baseline_events):
+      def wait_for_follower_advance(baseline):
           deadline = time.time() + 60
           while time.time() < deadline:
               remote = int(latest_block()["height"])
               local = follower_height()
-              events = follower_activity_events()
-              if remote > baseline and local > baseline and events > baseline_events:
+              if remote > baseline and local > baseline:
                   return local
               time.sleep(1)
           follower = machine.succeed(f"cat {follower_log} || true")
           validator = machine.succeed(f"cat {validator_log} || true")
-          raise Exception(f"follower did not advance past {baseline}: remote={remote} local={local} events={events}\nfollower:\n{follower}\nvalidator:\n{validator}")
+          raise Exception(f"follower did not advance past {baseline}: remote={remote} local={local}\nfollower:\n{follower}\nvalidator:\n{validator}")
 
       baseline = follower_height()
-      baseline_events = follower_activity_events()
-      advanced = wait_for_follower_stream(baseline, baseline_events)
+      advanced = wait_for_follower_advance(baseline)
       print(f"follower advanced from {baseline} to {advanced}")
 
       latest = latest_block()
       height = int(latest["height"])
       payload = latest["payload"]
+
+      machine.wait_until_succeeds(f"curl -fsS {follower_api}/{height} > /tmp/follower-block.json", timeout=60)
+      local_block = json.loads(machine.succeed("cat /tmp/follower-block.json"))
+      assert int(local_block["height"]) == height, local_block
+      assert local_block["payload"] == payload, local_block
 
       by_height = machine.succeed(f"{home} {cli} chain query --rpc {rpc} finalized-block --height {height}")
       assert f"height {height}" in by_height.splitlines(), by_height
@@ -655,22 +663,15 @@ in
                   f"procs:\n{procs}\nfollower:\n{follower}\ndmesg:\n{dmesg}\nvalidator:\n{validator}"
               ) from err
 
-      def follower_progress():
-          return follower_height(), follower_activity_events()
-
       def wait_follower(baseline):
           def check():
               height = follower_height()
-              events = follower_activity_events()
-              return True if height > baseline[0] and events > baseline[1] else None
+              return True if height > baseline else None
 
           try:
               wait_progress(
                   check,
-                  lambda: (
-                      f"follower did not advance after transition from height "
-                      f"{baseline[0]} and {baseline[1]} activity events"
-                  ),
+                  lambda: f"follower did not advance after transition from height {baseline}",
               )
           except Exception as err:
               # Keep `err`: it says whether the follower stalled or the hard
@@ -698,7 +699,7 @@ in
       maker_genesis = wait_coin(maker, 100)
       taker_genesis = wait_coin(taker, 100)
       height = int(latest_block()["height"])
-      baseline = follower_progress()
+      baseline = follower_height()
       opened = machine.succeed(
           f"{home} {cli} chain open --rpc {rpc} "
           "--maker-key /tmp/chain-settlement/maker.key --maker-auth webauthn "
@@ -714,7 +715,7 @@ in
       assert f"maker {maker}" in edge_state.splitlines(), edge_state
       assert f"taker {taker}" in edge_state.splitlines(), edge_state
 
-      baseline = follower_progress()
+      baseline = follower_height()
       machine.succeed(
           f"{home} {cli} chain close --rpc {rpc} --edge-id {edge_a} --kind mutual "
           f"--payout {maker}:80 --payout {taker}:70 --payout {native}:50 "
@@ -729,7 +730,7 @@ in
 
       # Scenario B: the untagged k1 payout funds an all-native edge and close.
       height = int(latest_block()["height"])
-      baseline = follower_progress()
+      baseline = follower_height()
       opened = machine.succeed(
           f"{home} {cli} chain open --rpc {rpc} "
           "--maker-key /tmp/chain-settlement/native.key --maker-auth native "
@@ -741,7 +742,7 @@ in
       wait_edge(edge_b, True)
       wait_follower(baseline)
 
-      baseline = follower_progress()
+      baseline = follower_height()
       machine.succeed(
           f"{home} {cli} chain close --rpc {rpc} --edge-id {edge_b} --kind mutual "
           f"--payout {native}:50 "
@@ -755,7 +756,7 @@ in
       # Scenario C: canonical Terms are persisted at Open and revealed at timeout.
       height = int(latest_block()["height"])
       timeout = height + 2000
-      baseline = follower_progress()
+      baseline = follower_height()
       opened = machine.succeed(
           f"{home} {cli} chain open --rpc {rpc} "
           "--maker-key /tmp/chain-settlement/maker.key --maker-auth webauthn "
@@ -769,7 +770,7 @@ in
       while int(latest_block()["height"]) < timeout:
           time.sleep(1)
 
-      baseline = follower_progress()
+      baseline = follower_height()
       machine.succeed(
           f"{home} {cli} chain close --rpc {rpc} --edge-id {edge_c} --kind timeout "
           f"--payout {maker}:80 --terms-file /tmp/chain-settlement/timeout.terms"

@@ -302,7 +302,7 @@ async fn machine_owner_evaluate_discovers_generation_and_settles_exact_tokens() 
             "gateway",
             "--machine",
             "native",
-            "--node-addr",
+            "--address",
             &address.to_string(),
             "--environment",
             string(&environment_file),

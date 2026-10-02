@@ -151,13 +151,12 @@ async fn failed_writer_waits_for_physical_completion_before_returning_the_error(
                 }));
                 assert!(panic.is_err());
             } else {
-                // Enter the state left by a durable completion error while
-                // another execution still owns its capacity.
-                service
-                    .inner
-                    .lock()
-                    .unwrap()
-                    .fail(JournalError::Io(std::io::Error::other("fsync fixture failure")).into());
+                // An administrative write can fail while another execution
+                // still owns capacity. Its typed failure must survive drain.
+                let failure = service.administer::<()>(|_, _| {
+                    Err(JournalError::Io(std::io::Error::other("fsync fixture failure")).into())
+                });
+                assert!(matches!(failure, Err(GrantStoreError::Completion(_))));
             }
             let mut draining = std::pin::pin!(service.drain());
             assert!(futures::poll!(&mut draining).is_pending());

@@ -33,8 +33,8 @@ use hellas_work::work_store::journal::{Journal, JournalError, JournalId, Journal
 use hellas_work::work_store::setup::setup_key;
 use hellas_work::work_store::{
     DiscoveredSetup, ObservedSetup, Role, SetupAbort, SetupDecision, SetupDiscoveryError, SetupEnd,
-    SetupFault, SetupHistoryBatch, SetupHistoryBlock, SetupRecord, SetupScan, SetupState,
-    SetupStateError, SetupStore, WorkStoreError, discover_setups,
+    SetupFault, SetupRecord, SetupScan, SetupState, SetupStateError, SetupStore, WorkStoreError,
+    discover_setups,
 };
 
 #[path = "support/basic.rs"]
@@ -1795,54 +1795,54 @@ fn the_record_codec_is_exact() {
     assert_eq!(origin_payload, [0x01; 32]);
     assert_eq!(origin_parent, [0x02; 32]);
 
-    let history = SetupRecord::SetupHistoryBatch(SetupHistoryBatch {
-        blocks: vec![SetupHistoryBlock {
-            height: scan().height + 1,
-            parent: scan().payload,
-            payload: [0x48; 32],
-            txs: vec![
-                completed(countersigned(proposed()))
-                    .payment_open()
-                    .expect("an executable payment Open"),
-            ],
-        }],
-    });
+    let dir = temp();
+    let fixture = completed_store(dir.path());
+    let history = SetupRecord::Observed(
+        fixture
+            .state()
+            .observe(&[FinalizedWork {
+                height: scan().height + 1,
+                parent: scan().payload,
+                payload: [0x48; 32],
+                txs: vec![
+                    completed(countersigned(proposed()))
+                        .payment_open()
+                        .expect("an executable payment Open"),
+                ],
+            }])
+            .expect("contiguous finalized observation"),
+    );
     assert_eq!(SetupRecord::decode(&history.encode()), Ok(history));
 }
 
 #[test]
 fn setup_history_replay_checks_first_and_internal_links_atomically() {
     let dir = temp();
-    let verifier = Secp256k1Verifier::new();
-    let mut journal = completed_store(dir.path());
+    let journal = completed_store(dir.path());
     let before = journal.len();
-    let error = journal
-        .commit(
-            SetupRecord::SetupHistoryBatch(SetupHistoryBatch {
-                blocks: vec![
-                    SetupHistoryBlock {
-                        height: scan().height + 1,
-                        parent: [0xff; 32],
-                        payload: [0x48; 32],
-                        txs: Vec::new(),
-                    },
-                    SetupHistoryBlock {
-                        height: scan().height + 2,
-                        parent: [0xee; 32],
-                        payload: [0x49; 32],
-                        txs: Vec::new(),
-                    },
-                ],
-            }),
-            &verifier,
-        )
-        .expect_err("a batch not extending ScanArmed is refused as one transition");
-    assert!(matches!(
-        error,
-        WorkStoreError::Setup(SetupStateError::Malformed)
-    ));
+    for broken in [0, 1] {
+        let mut blocks = vec![
+            FinalizedWork {
+                height: scan().height + 1,
+                parent: scan().payload,
+                payload: [0x48; 32],
+                txs: Vec::new(),
+            },
+            FinalizedWork {
+                height: scan().height + 2,
+                parent: [0x48; 32],
+                payload: [0x49; 32],
+                txs: Vec::new(),
+            },
+        ];
+        blocks[broken].parent = [0xff; 32];
+        assert_eq!(
+            journal.state().observe(&blocks),
+            Err(SetupStateError::Malformed)
+        );
+    }
     assert_eq!(journal.len(), before);
-    assert_eq!(journal.state().history_cursor(), Some(scan()));
+    assert_eq!(journal.state().scan_cursor(), Some(scan()));
 }
 
 /// Every signature-bearing setup export leaves enough state to recover the
@@ -1953,22 +1953,25 @@ fn round6_submitted_open_delays_end() {
         .bond_open()
         .expect("the retained submitted Open");
     if let Err(error) = journal.commit(
-        SetupRecord::SetupHistoryBatch(SetupHistoryBatch {
-            blocks: vec![
-                SetupHistoryBlock {
-                    height: scan().height + 1,
-                    parent: scan().payload,
-                    payload: [0x48; 32],
-                    txs: Vec::new(),
-                },
-                SetupHistoryBlock {
-                    height: scan().height + 2,
-                    parent: [0x48; 32],
-                    payload: [0x49; 32],
-                    txs: vec![bond_open],
-                },
-            ],
-        }),
+        SetupRecord::Observed(
+            journal
+                .state()
+                .observe(&[
+                    FinalizedWork {
+                        height: scan().height + 1,
+                        parent: scan().payload,
+                        payload: [0x48; 32],
+                        txs: Vec::new(),
+                    },
+                    FinalizedWork {
+                        height: scan().height + 2,
+                        parent: [0x48; 32],
+                        payload: [0x49; 32],
+                        txs: vec![bond_open],
+                    },
+                ])
+                .expect("contiguous finalized observation"),
+        ),
         &verifier,
     ) {
         panic!("contiguous history finalizes the retained Open: {error}");
@@ -2036,22 +2039,25 @@ fn a_finalized_bond_timeout_reclaims_the_stake_cleanly() {
     let bond_close = Tx::timeout_close(bond_edge(), &Terms::work_stake_bond(bond_terms()))
         .expect("the bond has a deterministic timeout close");
     if let Err(error) = journal.commit(
-        SetupRecord::SetupHistoryBatch(SetupHistoryBatch {
-            blocks: vec![
-                SetupHistoryBlock {
-                    height: scan().height + 1,
-                    parent: scan().payload,
-                    payload: [0x51; 32],
-                    txs: vec![bond_open],
-                },
-                SetupHistoryBlock {
-                    height: scan().height + 2,
-                    parent: [0x51; 32],
-                    payload: [0x52; 32],
-                    txs: vec![bond_close],
-                },
-            ],
-        }),
+        SetupRecord::Observed(
+            journal
+                .state()
+                .observe(&[
+                    FinalizedWork {
+                        height: scan().height + 1,
+                        parent: scan().payload,
+                        payload: [0x51; 32],
+                        txs: vec![bond_open],
+                    },
+                    FinalizedWork {
+                        height: scan().height + 2,
+                        parent: [0x51; 32],
+                        payload: [0x52; 32],
+                        txs: vec![bond_close],
+                    },
+                ])
+                .expect("contiguous finalized observation"),
+        ),
         &verifier,
     ) {
         panic!("history finalizes the bond and its timeout close: {error}");
@@ -2134,7 +2140,11 @@ async fn setup_completes_without_waiting_for_a_quiet_chain() {
     .expect("a moving tip does not postpone the setup decision");
     assert!(matches!(advance.progress, SetupProgress::Complete(_)));
     assert!(advance.mounted.is_some());
-    assert!(blocks.reads.load(Ordering::SeqCst) > 1);
+    assert_eq!(
+        blocks.reads.load(Ordering::SeqCst),
+        1,
+        "the origin is retained by the one finalized scan"
+    );
 }
 
 /// A completed setup hands back the channel it mounted, opened at the
@@ -2260,6 +2270,7 @@ async fn a_restart_over_a_completed_setup_hands_back_the_same_channel() {
     let mut restarted = store(dir.path(), Role::Provider);
     assert_eq!(restarted.state().end(), Some(SetupEnd::Complete));
     let before = view.reads();
+    let blocks = Blocks { blocks: Vec::new() }; // The origin has been pruned.
     let advance = match advance_setup(&view, &blocks, &NoSink, &mut restarted, &verifier).await {
         Ok(advance) => advance,
         Err(error) => panic!("the restart answers from the journal: {error}"),
@@ -2782,24 +2793,17 @@ async fn a_client_history_crosses_a_permissionless_bond_timeout() {
 
     let advance = advance_setup(&view, &blocks, &NoSink, &mut journal, &verifier).await;
     assert_eq!(
-        journal.state().history_cursor().map(|scan| scan.height),
+        journal.state().scan_cursor().map(|scan| scan.height),
         Some(scan().height + 2),
         "the cursor moved past the block the bond died in",
     );
-    let crossed = journal
-        .state()
-        .history()
-        .iter()
-        .find(|block| block.height == scan().height + 2)
-        .expect("that block's header is retained");
     assert_eq!(
-        crossed.parent, origin_payload,
-        "the header is what keeps the history one chain",
+        journal.state().scan_cursor().map(|scan| scan.payload),
+        Some(timeout_payload)
     );
     assert!(
-        crossed.txs.is_empty(),
-        "and a client records no bond Close evidence: {:?}",
-        crossed.txs,
+        !journal.state().close_only_recovery(),
+        "client does not record the provider's bond reclaim"
     );
 
     // The client is not stuck: the surviving payment edge mounts, and
@@ -3234,14 +3238,17 @@ fn in_flight_store(root: &std::path::Path) -> SetupStore {
         SetupRecord::BondSubmitted,
         SetupRecord::PaymentSubmitted,
         SetupRecord::BondTimeoutSubmitted,
-        SetupRecord::SetupHistoryBatch(SetupHistoryBatch {
-            blocks: vec![SetupHistoryBlock {
-                height: scan().height + 1,
-                parent: scan().payload,
-                payload: [0x48; 32],
-                txs: Vec::new(),
-            }],
-        }),
+        SetupRecord::Observed(
+            store
+                .state()
+                .observe(&[FinalizedWork {
+                    height: scan().height + 1,
+                    parent: scan().payload,
+                    payload: [0x48; 32],
+                    txs: Vec::new(),
+                }])
+                .expect("contiguous finalized observation"),
+        ),
     ] {
         if let Err(error) = store.commit(record, &verifier) {
             panic!("the in-flight fixture commits: {error}");
@@ -3270,19 +3277,19 @@ fn settled_store(root: &std::path::Path) -> SetupStore {
     };
     let close_of = |edge: EdgeId| Tx::close(edge, Proof::timeout(bond.clone()), outputs.clone());
     let blocks = vec![
-        SetupHistoryBlock {
+        FinalizedWork {
             height: scan().height + 1,
             parent: scan().payload,
             payload: [0x48; 32],
             txs: vec![bond_open],
         },
-        SetupHistoryBlock {
+        FinalizedWork {
             height: scan().height + 2,
             parent: [0x48; 32],
             payload: [0x49; 32],
             txs: vec![payment_open],
         },
-        SetupHistoryBlock {
+        FinalizedWork {
             height: scan().height + 3,
             parent: [0x49; 32],
             payload: [0x4a; 32],
@@ -3290,7 +3297,12 @@ fn settled_store(root: &std::path::Path) -> SetupStore {
         },
     ];
     for record in [
-        SetupRecord::SetupHistoryBatch(SetupHistoryBatch { blocks }),
+        SetupRecord::Observed(
+            store
+                .state()
+                .observe(&blocks)
+                .expect("contiguous finalized observation"),
+        ),
         SetupRecord::Ended {
             outcome: SetupEnd::Aborted(SetupAbort::BondReclaimed),
         },
@@ -3389,14 +3401,12 @@ fn a_checkpoint_replays_to_what_the_frames_replayed_to() {
     assert_eq!(in_flight.revision(), Some(3));
     assert!(in_flight.close_descriptor().is_some());
     assert!(in_flight.scan_armed().is_some());
-    assert_eq!(in_flight.history().len(), 1);
-    assert_ne!(in_flight.history_cursor(), in_flight.scan_armed());
+    assert_ne!(in_flight.scan_cursor(), in_flight.scan_armed());
     assert_eq!(in_flight.end(), None);
 
     let settled = temp();
     let settled = settled_store(settled.path());
     let settled = settled.state();
-    assert_eq!(settled.history().len(), 3);
     assert!(settled.origin().is_some());
     assert!(settled.close_only_recovery());
     assert!(!settled.submitted_open_unresolved());
@@ -3607,4 +3617,91 @@ fn payment_policy() -> hellas_rpc::protocol::work::JobPaymentPolicyV2 {
         delivery_margin_blocks: 2,
         oracle_grace_blocks: 6,
     }
+}
+
+#[test]
+fn finalized_observations_keep_setup_checkpoints_bounded_and_refuse_stale_replay() {
+    let dir = temp();
+    let verifier = Secp256k1Verifier::new();
+    let mut journal = completed_store(dir.path());
+    let initial_size = journal.state().checkpoint().len();
+    for _ in 0..20 {
+        let mut cursor = journal.state().scan_cursor().unwrap();
+        let blocks: Vec<_> = (0..256)
+            .map(|_| {
+                let height = cursor.height + 1;
+                let mut payload = [0; 32];
+                payload[..8].copy_from_slice(&height.to_be_bytes());
+                let block = FinalizedWork {
+                    height,
+                    parent: cursor.payload,
+                    payload,
+                    txs: vec![],
+                };
+                cursor = SetupScan { height, payload };
+                block
+            })
+            .collect();
+        let observed = journal.state().observe(&blocks).unwrap();
+        let record = SetupRecord::Observed(observed);
+        assert!(record.encode().len() < 256);
+        journal.commit(record.clone(), &verifier).unwrap();
+        let before = journal.state().clone();
+        assert!(journal.commit(record, &verifier).is_err());
+        assert_eq!(journal.state(), &before);
+        assert_eq!(journal.state().checkpoint().len(), initial_size);
+    }
+    let expected = journal.state().clone();
+    journal.rotate().unwrap();
+    drop(journal);
+    assert_eq!(store(dir.path(), Role::Provider).state(), &expected);
+}
+
+#[tokio::test]
+async fn a_terminal_decision_waits_for_the_block_explaining_spent_funding() {
+    struct Spent;
+    impl SetupView for Spent {
+        async fn finalized_setup(
+            &self,
+            _: SetupQuery,
+        ) -> Result<Option<FinalizedSetup>, BlockSourceError> {
+            Ok(Some(FinalizedSetup {
+                height: scan().height + 1,
+                bond: None,
+                payment: None,
+                lease: LeaseSlots::Absent,
+                live_funding: without(BOND_COIN),
+            }))
+        }
+    }
+    let directory = temp();
+    let mut journal = completed_store(directory.path());
+    let verifier = Secp256k1Verifier::new();
+    let advance = advance_setup(
+        &Spent,
+        &Blocks { blocks: vec![] },
+        &NoSink,
+        &mut journal,
+        &verifier,
+    )
+    .await
+    .unwrap();
+    assert_eq!(advance.progress, SetupProgress::AwaitingFinalizedState);
+    assert_eq!(journal.state().end(), None);
+    // Once the matching height was scanned, an unexplained spend is terminal.
+    let blocks = Blocks {
+        blocks: vec![FinalizedWork {
+            height: scan().height + 1,
+            parent: scan().payload,
+            payload: [0xce; 32],
+            txs: vec![],
+        }],
+    };
+    let advance = advance_setup(&Spent, &blocks, &NoSink, &mut journal, &verifier)
+        .await
+        .unwrap();
+    assert_eq!(
+        advance.progress,
+        SetupProgress::Faulted(SetupFault::BondFundingSpent)
+    );
 }

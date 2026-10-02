@@ -86,6 +86,7 @@ pub(super) struct NodeHandle {
     endpoint: Endpoint,
     discovery: Option<DiscoveryAdvertiser>,
     work: Option<WorkWatcher>,
+    chain: Option<hellas_sdk::FullNode>,
 }
 
 impl NodeHandle {
@@ -120,6 +121,9 @@ impl NodeHandle {
             discovery.shutdown().await;
         }
         self.endpoint.close().await;
+        if let Some(chain) = self.chain.take() {
+            result = result.and(chain.shutdown().await.map_err(anyhow::Error::from));
+        }
         result
     }
 }
@@ -145,7 +149,7 @@ pub(super) struct NodeConfig {
     /// What the clock over this node's paid-work journals is built
     /// from, or `None` when no work configuration was loaded. Its
     /// presence is still what advertises the two work ALPNs.
-    pub(super) work: Option<WorkRunnerConfig>,
+    pub(super) work: Option<(WorkRunnerConfig, hellas_sdk::FullNode)>,
     pub(super) secret_key: SecretKey,
     pub(super) producer_key: ProducerSigningKey,
     pub(super) open_identity: Arc<OpenIdentity>,
@@ -161,7 +165,7 @@ struct RemoteExecutionServices {
 }
 
 pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle> {
-    if let Some(work) = &config.work {
+    if let Some((work, _)) = &config.work {
         work.validate()?;
     }
     if let Some(grants) = &config.grants {
@@ -214,9 +218,13 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
     let advertised_alpns = served_alpns(config.work.is_some(), prepared_grants.is_some());
     let work_mount = MountedWork::with_backend(handle.clone());
     let setup_mount = MountedSetup::default();
+    let chain = config.work.as_ref().map(|(_, chain)| chain.clone());
     let runner = config
         .work
-        .map(|work| WorkRunner::discover(work, work_mount.clone(), setup_mount.clone()))
+        .map(|(work, chain)| {
+            WorkRunner::discover(work, work_mount.clone(), setup_mount.clone())
+                .map(|runner| runner.on_node(chain))
+        })
         .transpose()?;
     let alpns = advertised_alpns.clone();
     let mut builder = Endpoint::builder(presets::N0)
@@ -254,8 +262,13 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
     //    and graffiti so introspection (`hellas rpc`) returns real data.
     //    `NodeHandlerImpl: Clone` (its fields are Arc/Copy), so we
     //    clone per-connection rather than wrap in Arc<dyn>.
-    let node_handler =
+    let mut node_handler =
         NodeHandlerImpl::new(node_id, config.build, config.graffiti, directory.clone());
+    node_handler.service_alpns = advertised_alpns
+        .iter()
+        .map(|alpn| String::from_utf8(alpn.clone()).expect("service ALPN is ASCII"))
+        .collect();
+    node_handler.chain = chain.clone();
 
     // -- The clock. Spawned only when a work configuration was loaded,
     //    and given the same mount slot the accept loop reads: the runner
@@ -267,7 +280,7 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
     let remote_execution = RemoteExecutionServices {
         open_identity: config.open_identity,
     };
-    let (grants, control) = if let Some((grant_config, store)) = prepared_grants {
+    let (grants, control, admin) = if let Some((grant_config, store)) = prepared_grants {
         let service = hellas_work::grant_service::GrantService::new(
             store,
             signer,
@@ -291,11 +304,11 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
         );
         let control = hellas_sdk::local::LocalControlServer::bind(
             &grant_config.control_socket,
-            admin.dispatcher(),
+            admin.clone().dispatcher(),
         )?;
-        (Some(service), Some(control))
+        (Some(service), Some(control), Some(admin))
     } else {
-        (None, None)
+        (None, None, None)
     };
     let discovery = config
         .discovery
@@ -353,6 +366,7 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
             let execution_for_conn = remote_execution.clone();
             let work_for_conn = serves_work.clone();
             let setup_for_conn = serves_setup.clone();
+            let admin_for_conn = admin.clone();
             connections.spawn(async move {
                 let _connection_slot = connection_slot;
                 let conn = match tokio::time::timeout(RPC_HANDSHAKE_TIMEOUT, accepting).await {
@@ -379,6 +393,7 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
                     manager_for_conn,
                     setup_for_conn,
                     work_for_conn,
+                    admin_for_conn,
                 )
                 .await
                 {
@@ -389,6 +404,7 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
     });
 
     Ok(NodeHandle {
+        chain,
         router,
         _control: control,
         node_id,
@@ -401,6 +417,7 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
 
 /// Per-connection serve: each inbound substream is dispatched to the
 /// service selected by the connection's negotiated ALPN.
+#[allow(clippy::too_many_arguments)]
 async fn serve_connection(
     alpn: Vec<u8>,
     conn: Connection,
@@ -409,12 +426,21 @@ async fn serve_connection(
     manager: PeerManager,
     setup: Option<MountedSetup>,
     work: Option<WorkRouter>,
+    admin: Option<hellas_sdk::grant_admin::GrantAdmin>,
 ) -> anyhow::Result<()> {
     let transport = Arc::new(IrohTransport::new(conn));
 
     // Account for inbound requests and refresh last_seen_ms in the shared registry.
     if alpn == <Node as ServiceMarker>::ALPN.as_bytes() {
         let server = AccountingDispatcher::new(NodeServer(node_handler), manager);
+        serve_loop(transport, server).await
+    } else if alpn == hellas_rpc::services::chain_sync::ChainSync::ALPN.as_bytes()
+        && let Some(chain) = node_handler.chain
+    {
+        let server = AccountingDispatcher::new(
+            hellas_rpc::services::chain_sync::ChainSyncServer(chain),
+            manager,
+        );
         serve_loop(transport, server).await
     } else if let Some(setup) =
         setup.filter(|_| alpn == <WorkSetup as ServiceMarker>::ALPN.as_bytes())
@@ -436,6 +462,10 @@ async fn serve_connection(
             manager,
         );
         serve_loop(transport, server).await
+    } else if let Some(admin) =
+        admin.filter(|_| alpn == hellas_rpc::services::host_control::HostControl::ALPN.as_bytes())
+    {
+        serve_loop(transport, admin.dispatcher()).await
     } else {
         warn!("Unknown ALPN: {:?}", String::from_utf8_lossy(&alpn));
         Ok(())

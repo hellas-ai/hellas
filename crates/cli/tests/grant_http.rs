@@ -253,13 +253,15 @@ impl Process {
 fn string(path: &Path) -> &str {
     path.to_str().unwrap()
 }
-async fn grant(provider: &Cli, socket: &Path, args: &[&str]) -> Value {
-    let mut command = vec!["grant", "--control-socket", string(socket)];
+async fn admin(provider: &Cli, socket: &Path, args: &[&str]) -> Value {
+    let mut command = vec!["admin", "users", "--control-socket", string(socket)];
     command.extend_from_slice(args);
     serde_json::from_str(&provider.run(&command).await).unwrap()
 }
 async fn used(provider: &Cli, socket: &Path, id: &str) -> u64 {
-    let status = grant(provider, socket, &["usage", id]).await;
+    let user = admin(provider, socket, &["show", id]).await;
+    let grant = user["grants"][0]["grant_id"].as_str().unwrap();
+    let status = admin(provider, socket, &["show", id, "--grant", grant]).await;
     let node = status["nodes"]
         .as_array()
         .unwrap()
@@ -331,13 +333,12 @@ async fn contact_grant_offer_gateway_uses_private_ca_and_durable_allowances() {
     );
     node.wait_for("RPC server running.").await;
     let offer = root.join("offer");
-    let created = grant(
+    let created = admin(
         &provider,
         &socket,
         &[
-            "create",
-            "--to",
-            "client",
+            "add",
+            string(&contact),
             "--policy",
             "glm",
             "--limit",
@@ -345,12 +346,47 @@ async fn contact_grant_offer_gateway_uses_private_ca_and_durable_allowances() {
             "--allow-account-backed",
             "--max-job",
             "5s",
-            "--offer-out",
-            string(&offer),
         ],
     )
     .await;
-    let id = created["grant_id"].as_str().unwrap();
+    let id = created["user"].as_str().unwrap();
+    admin(&provider, &socket, &["offer", id, "--out", string(&offer)]).await;
+    let grantee = hellas_rpc::protocol::work_grant::records::Principal::decode(
+        &std::fs::read(&contact).unwrap(),
+    )
+    .unwrap();
+    let issued = hellas_rpc::protocol::work_grant::records::SignedOffer::decode(
+        &std::fs::read(&offer).unwrap(),
+        grantee.id(),
+        hellas_rpc::protocol::work_grant::UnixMillis(0),
+    )
+    .unwrap();
+    let direct = &issued.offer().addresses[0];
+    let provider_contact = root.join("provider-contact");
+    provider
+        .run(&["contact", "export", "--out", string(&provider_contact)])
+        .await;
+    let remote = [
+        "admin",
+        "--contact",
+        string(&provider_contact),
+        "--address",
+        direct,
+        "users",
+        "list",
+    ];
+    assert!(
+        !client.output(&remote).await.status.success(),
+        "work alone grants no admin access"
+    );
+    admin(&provider, &socket, &["update", id, "--admin"]).await;
+    let listed: Value = serde_json::from_str(&client.run(&remote).await).unwrap();
+    assert_eq!(listed.as_array().unwrap().len(), 2);
+    admin(&provider, &socket, &["update", id, "--no-admin"]).await;
+    assert!(
+        !client.output(&remote).await.status.success(),
+        "demotion takes effect on remote requests"
+    );
     client
         .run(&["offer", "import", string(&offer), "--name", "lan"])
         .await;
@@ -425,11 +461,11 @@ async fn contact_grant_offer_gateway_uses_private_ca_and_durable_allowances() {
         post(&http, &url, json!({"messages":[]})).await.status(),
         429
     );
-    grant(
+    admin(
         &provider,
         &socket,
         &[
-            "revise",
+            "update",
             id,
             "--policy",
             "glm",
@@ -453,23 +489,31 @@ async fn contact_grant_offer_gateway_uses_private_ca_and_durable_allowances() {
         post(&http, &url, json!({"messages":[]})).await.status(),
         403
     );
-    grant(&provider, &socket, &["repair-resource", "glm"]).await;
+    provider
+        .run(&[
+            "admin",
+            "repair-resource",
+            "glm",
+            "--control-socket",
+            string(&socket),
+        ])
+        .await;
     https.missing_usage.store(false, Ordering::SeqCst);
-    grant(&provider, &socket, &["pause", id]).await;
+    admin(&provider, &socket, &["update", id, "--pause"]).await;
     assert_eq!(
         post(&http, &url, json!({"messages":[]})).await.status(),
         403
     );
-    grant(&provider, &socket, &["resume", id]).await;
+    admin(&provider, &socket, &["update", id, "--resume"]).await;
     let response = post(&http, &url, json!({"messages":[]})).await;
     assert_eq!(response.status(), 200);
     response.bytes().await.unwrap();
     assert_eq!(used(&provider, &socket, id).await, 40);
-    grant(
+    admin(
         &provider,
         &socket,
         &[
-            "revise",
+            "update",
             id,
             "--policy",
             "glm",
@@ -488,7 +532,7 @@ async fn contact_grant_offer_gateway_uses_private_ca_and_durable_allowances() {
         post(&http, &url, json!({"messages":[]})).await.status(),
         403
     );
-    grant(&provider, &socket, &["revoke", id]).await;
+    admin(&provider, &socket, &["remove", id]).await;
     assert_eq!(
         post(&http, &url, json!({"messages":[]})).await.status(),
         403
@@ -631,7 +675,7 @@ async fn managed_owner_bootstrap_standing_fetch_and_restart_preserve_allowances(
             "gateway",
             "--machine",
             "worker",
-            "--node-addr",
+            "--address",
             &work_address.to_string(),
             "--port",
             "0",
@@ -665,7 +709,7 @@ async fn managed_owner_bootstrap_standing_fetch_and_restart_preserve_allowances(
             "gateway",
             "--machine",
             "worker",
-            "--node-addr",
+            "--address",
             &work_address.to_string(),
             "--port",
             "0",

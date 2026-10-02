@@ -191,15 +191,9 @@ mod id_pins {
     #[cfg(feature = "chain")]
     #[test]
     fn chain_ids_are_stable() {
-        use super::services::light_client::{
-            GetStateRoot, GetWorkChannelSnapshot, LightClient, SubmitWorkResponse,
-        };
-        assert_eq!(<LightClient as ServiceMarker>::SERVICE_ID, 0x74f1_0f92);
+        use super::services::light_client::{GetStateRoot, LightClient, SubmitWorkResponse};
+        assert_eq!(<LightClient as ServiceMarker>::SERVICE_ID, 0x29ad8d1a);
         assert_eq!(<GetStateRoot as MethodMarker>::METHOD_ID, 0xb484a429);
-        assert_eq!(
-            <GetWorkChannelSnapshot as MethodMarker>::METHOD_ID,
-            0xadea_9964
-        );
         assert_eq!(<SubmitWorkResponse as MethodMarker>::METHOD_ID, 0x78ea_f3a0);
     }
 }

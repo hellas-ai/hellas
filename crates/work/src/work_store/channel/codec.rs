@@ -48,6 +48,7 @@ impl ChannelRecord {
     pub(super) fn encode_for_storage(&self, metadata_only: bool) -> Vec<u8> {
         let mut out = Vec::new();
         match self {
+            Self::OriginObserved => out.push(tag::ORIGIN_OBSERVED),
             Self::ProposalExchange { work_id, pending } => {
                 out.push(tag::PROPOSAL_EXCHANGE);
                 out.extend_from_slice(work_id.as_bytes());
@@ -176,6 +177,7 @@ impl ChannelRecord {
                 work_id: digest(&mut cursor)?,
                 pending: crate::work_store::take_bool(&mut cursor, ChannelStateError::Malformed)?,
             },
+            tag::ORIGIN_OBSERVED => Self::OriginObserved,
             tag::CURSOR => Self::CursorAdvanced {
                 height: cursor.u64().ok_or(ChannelStateError::Malformed)?,
                 parent: cursor.array::<32>().ok_or(ChannelStateError::Malformed)?,
@@ -434,6 +436,7 @@ impl Channel<PaymentFunding> {
                     channel,
                     settlement,
                     cursor,
+                    origin_observed,
                     close_prepared,
                     close_opened,
                     close_responded,
@@ -497,6 +500,7 @@ impl Channel<PaymentFunding> {
             put_outcome(&mut out, outcome);
         }
         put_u64(&mut out, *proposal_nonce_high_water);
+        out.push(u8::from(*origin_observed));
         put_u64(&mut out, cursor.0);
         out.extend_from_slice(&cursor.1);
         put_u64(&mut out, indeterminate.len() as u64);
@@ -604,6 +608,8 @@ impl Channel<PaymentFunding> {
             }
         }
         let proposal_nonce_high_water = cursor.u64().ok_or(ChannelStateError::Malformed)?;
+        let origin_observed =
+            crate::work_store::take_bool(&mut cursor, ChannelStateError::Malformed)?;
         let finalized_cursor = (
             cursor.u64().ok_or(ChannelStateError::Malformed)?,
             cursor.array::<32>().ok_or(ChannelStateError::Malformed)?,
@@ -661,6 +667,7 @@ impl Channel<PaymentFunding> {
                 channel,
                 settlement,
                 cursor: finalized_cursor,
+                origin_observed,
                 close_prepared,
                 close_opened,
                 close_responded,

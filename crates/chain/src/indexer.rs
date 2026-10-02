@@ -1,130 +1,145 @@
+#[cfg(any(test, feature = "full-node"))]
+mod retention;
 #[cfg(feature = "indexer-api")]
-mod trusted_epochs;
-use crate::domain::{PublicKey, Scheme};
+pub(crate) mod trusted_epochs;
+#[cfg(any(test, feature = "indexer-api"))]
+use crate::ConsensusVerifier;
+#[cfg(test)]
+use crate::domain::PublicKey;
 use crate::{
     app::{HellasBlock, MarshalMailbox},
-    config::Config,
-    consensus::{ConsensusVerificationError, ConsensusVerifier, Finalization},
+    consensus::ConsensusVerificationError,
     light_client::{FinalizedBlock, FinalizedBlockQuery, LatestBlock, QueryError},
 };
+#[cfg(any(test, feature = "full-node"))]
+use crate::{config::Config, consensus::Finalization, domain::Scheme};
+#[cfg(test)]
 use commonware_actor::Feedback;
-use commonware_codec::{DecodeExt, Encode};
+#[cfg(test)]
+use commonware_codec::DecodeExt;
+use commonware_codec::Encode;
 use commonware_consensus::{
-    Block as _, CertifiableBlock, Heightable, Reporter,
-    marshal::{
-        self, Identifier as MarshalIdentifier, Start, Update,
-        core::Actor as MarshalActor,
-        resolver::handler::{self, Annotation, Key as ResolverKey},
-        standard::Standard,
-    },
-    simplex::types::Activity,
-    types::{FixedEpocher, Height, ViewDelta},
+    Block as _, CertifiableBlock, Heightable, marshal::Identifier as MarshalIdentifier,
+    types::Height,
 };
-use commonware_cryptography::{
-    Digestible, certificate::ConstantProvider, certificate::Verifier as _, sha256::Digest,
+#[cfg(any(test, feature = "full-node"))]
+use commonware_consensus::{
+    marshal::{self, Start, core::Actor as MarshalActor, standard::Standard},
+    types::ViewDelta,
 };
-use commonware_resolver::{Fetch, Resolver, TargetedResolver};
-use commonware_runtime::{BufferPooler, Clock, Handle, Metrics, Spawner, Storage, tokio};
-use commonware_storage::archive::immutable;
-use commonware_utils::{Acknowledgement, NZU64, sync::AsyncMutex, vec::NonEmptyVec};
+use commonware_cryptography::{Digestible, sha256::Digest};
+#[cfg(any(test, feature = "full-node"))]
+use commonware_runtime::{BufferPooler, Clock, Handle, Metrics, Spawner, Storage};
+#[cfg(any(test, feature = "full-node"))]
+use commonware_utils::NZU64;
+#[cfg(test)]
+use commonware_utils::sync::AsyncMutex;
+#[cfg(any(test, feature = "full-node"))]
 use rand_core::CryptoRng;
-use std::{marker::PhantomData, num::NonZeroU64, num::NonZeroUsize, sync::Arc};
+#[cfg(any(test, feature = "full-node"))]
+use std::{num::NonZeroUsize, sync::Arc};
 use thiserror::Error;
-#[cfg(feature = "indexer-api")]
+#[cfg(all(test, feature = "indexer-api"))]
 use trusted_epochs::TrustedEpochs;
 
-pub type FinalizationStore<E = tokio::Context> = immutable::Archive<E, Digest, Finalization>;
-pub type BlockStore<E = tokio::Context> = immutable::Archive<E, Digest, HellasBlock>;
+#[cfg(any(test, feature = "full-node"))]
+pub(crate) type Archive<E, V> = retention::Retained<
+    commonware_storage::archive::prunable::Archive<
+        commonware_storage::translator::EightCap,
+        E,
+        Digest,
+        V,
+    >,
+>;
+#[cfg(any(test, feature = "full-node"))]
+pub(crate) type ArchiveActor<E, P, H> = MarshalActor<
+    E,
+    Standard<HellasBlock>,
+    P,
+    Archive<E, Finalization>,
+    Archive<E, HellasBlock>,
+    H,
+    commonware_parallel::Sequential,
+>;
 
-pub async fn init_finalization_store<E>(
+/// All roles open exactly these stores with the same codec and partition names.
+#[cfg(any(test, feature = "full-node"))]
+pub(crate) async fn init<E, P, H>(
     context: E,
     partition_prefix: &str,
     config: &Config,
-) -> FinalizationStore<E>
+    start: Start<Scheme, Digest, HellasBlock>,
+    provider: P,
+    epocher: H,
+) -> (ArchiveActor<E, P, H>, ChainIndexer, Option<Height>)
 where
-    E: BufferPooler + Clock + Metrics + Storage,
+    E: BufferPooler + Clock + Metrics + Spawner + Storage + CryptoRng,
+    P: commonware_cryptography::certificate::Provider<
+            Scope = commonware_consensus::types::Epoch,
+            Scheme = Scheme,
+        >,
+    H: commonware_consensus::types::Epocher,
 {
-    let page_cache = config.page_cache(&context);
-    immutable::Archive::init(
-        context,
-        immutable::Config {
-            metadata_partition: format!("{partition_prefix}-finalizations-by-height-metadata"),
-            freezer_table_partition: format!(
-                "{partition_prefix}-finalizations-by-height-freezer-table"
-            ),
-            freezer_table_initial_size: 64,
-            freezer_table_resize_frequency: 10,
-            freezer_table_resize_chunk_size: 10,
-            freezer_key_partition: format!(
-                "{partition_prefix}-finalizations-by-height-freezer-key"
-            ),
-            freezer_key_page_cache: page_cache,
-            freezer_value_partition: format!(
-                "{partition_prefix}-finalizations-by-height-freezer-value"
-            ),
-            freezer_value_target_size: 65536,
-            freezer_value_compression: None,
-            ordinal_partition: format!("{partition_prefix}-finalizations-by-height-ordinal"),
-            items_per_section: NZU64!(256),
-            codec_config: Scheme::certificate_codec_config_unbounded(),
+    let floor = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let certificates = retention::open::<_, Finalization>(
+        context.child("finalizations_by_height"),
+        format!("{partition_prefix}-certificates"),
+        config,
+        (),
+        floor.clone(),
+    )
+    .await;
+    let blocks = retention::open::<_, HellasBlock>(
+        context.child("finalized_blocks"),
+        format!("{partition_prefix}-blocks"),
+        config,
+        (),
+        floor.clone(),
+    )
+    .await;
+    let (actor, marshal, processed) = MarshalActor::init(
+        context.child("marshal"),
+        certificates,
+        blocks,
+        marshal::Config {
+            provider,
+            epocher,
+            start,
+            partition_prefix: partition_prefix.to_owned(),
+            mailbox_size: NonZeroUsize::new(config.mailbox_size).unwrap_or(NonZeroUsize::MIN),
+            view_retention_timeout: ViewDelta::new(config.activity_timeout),
+            prunable_items_per_section: NZU64!(256),
+            page_cache: config.page_cache(&context),
             replay_buffer: NonZeroUsize::new(config.replay_buffer).unwrap_or(NonZeroUsize::MIN),
-            freezer_key_write_buffer: NonZeroUsize::new(config.write_buffer)
-                .unwrap_or(NonZeroUsize::MIN),
-            freezer_value_write_buffer: NonZeroUsize::new(config.write_buffer)
-                .unwrap_or(NonZeroUsize::MIN),
-            ordinal_write_buffer: NonZeroUsize::new(config.write_buffer)
-                .unwrap_or(NonZeroUsize::MIN),
+            key_write_buffer: NonZeroUsize::new(config.write_buffer).unwrap_or(NonZeroUsize::MIN),
+            value_write_buffer: NonZeroUsize::new(config.write_buffer).unwrap_or(NonZeroUsize::MIN),
+            block_codec_config: (),
+            max_repair: NonZeroUsize::new(config.max_repair).unwrap_or(NonZeroUsize::MIN),
+            max_pending_acks: NonZeroUsize::MIN,
+            strategy: commonware_parallel::Sequential,
         },
     )
-    .await
-    .expect("failed to initialize finalizations archive")
-}
-
-pub async fn init_block_store<E>(
-    context: E,
-    partition_prefix: &str,
-    config: &Config,
-) -> BlockStore<E>
-where
-    E: BufferPooler + Clock + Metrics + Storage,
-{
-    let page_cache = config.page_cache(&context);
-    immutable::Archive::init(
-        context,
-        immutable::Config {
-            metadata_partition: format!("{partition_prefix}-finalized-blocks-metadata"),
-            freezer_table_partition: format!("{partition_prefix}-finalized-blocks-freezer-table"),
-            freezer_table_initial_size: 64,
-            freezer_table_resize_frequency: 10,
-            freezer_table_resize_chunk_size: 10,
-            freezer_key_partition: format!("{partition_prefix}-finalized-blocks-freezer-key"),
-            freezer_key_page_cache: page_cache,
-            freezer_value_partition: format!("{partition_prefix}-finalized-blocks-freezer-value"),
-            freezer_value_target_size: 65536,
-            freezer_value_compression: None,
-            ordinal_partition: format!("{partition_prefix}-finalized-blocks-ordinal"),
-            items_per_section: NZU64!(256),
-            codec_config: (),
-            replay_buffer: NonZeroUsize::new(config.replay_buffer).unwrap_or(NonZeroUsize::MIN),
-            freezer_key_write_buffer: NonZeroUsize::new(config.write_buffer)
-                .unwrap_or(NonZeroUsize::MIN),
-            freezer_value_write_buffer: NonZeroUsize::new(config.write_buffer)
-                .unwrap_or(NonZeroUsize::MIN),
-            ordinal_write_buffer: NonZeroUsize::new(config.write_buffer)
-                .unwrap_or(NonZeroUsize::MIN),
-        },
-    )
-    .await
-    .expect("failed to initialize finalized blocks archive")
+    .await;
+    let mut indexer = ChainIndexer::new(marshal);
+    indexer.storage_floor = floor;
+    (actor, indexer, processed)
 }
 
 #[derive(Clone)]
 pub struct ChainIndexer {
-    marshal: MarshalMailbox,
+    pub(crate) marshal: MarshalMailbox,
+    #[cfg(test)]
     verifier: Option<ConsensusVerifier>,
-    #[cfg(feature = "indexer-api")]
+    #[cfg(all(test, feature = "indexer-api"))]
     schedule: Option<TrustedEpochs>,
+    #[cfg(test)]
     ingest_lock: Arc<AsyncMutex<()>>,
+    #[cfg(test)]
+    fixture_source: FixtureSource,
+    #[cfg(feature = "full-node")]
+    retained_from: Arc<std::sync::atomic::AtomicU64>,
+    #[cfg(any(test, feature = "full-node"))]
+    storage_floor: Arc<std::sync::atomic::AtomicU64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,37 +179,50 @@ pub enum IngestError {
 }
 
 impl ChainIndexer {
+    #[cfg(all(test, feature = "full-node"))]
+    pub(crate) fn prune_before(&self, height: u64) {
+        self.retain_from(height, height);
+    }
+
+    #[cfg(feature = "full-node")]
+    pub(crate) fn retain_from(&self, public_floor: u64, recovery_floor: u64) {
+        self.retained_from
+            .fetch_max(public_floor, std::sync::atomic::Ordering::AcqRel);
+        self.storage_floor
+            .fetch_max(recovery_floor, std::sync::atomic::Ordering::AcqRel);
+        self.marshal.prune(Height::new(recovery_floor));
+    }
+
     pub fn new(marshal: MarshalMailbox) -> Self {
         Self {
             marshal,
+            #[cfg(test)]
             verifier: None,
-            #[cfg(feature = "indexer-api")]
+            #[cfg(all(test, feature = "indexer-api"))]
             schedule: None,
+            #[cfg(test)]
             ingest_lock: Arc::new(AsyncMutex::new(())),
+            #[cfg(test)]
+            fixture_source: FixtureSource::default(),
+            #[cfg(feature = "full-node")]
+            retained_from: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(any(test, feature = "full-node"))]
+            storage_floor: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
-    pub fn with_consensus_info(
-        mut self,
-        info: &crate::ConsensusInfo,
-    ) -> Result<Self, ConsensusVerificationError> {
-        self.verifier = Some(ConsensusVerifier::new(info)?);
-        Ok(self)
-    }
-
+    #[cfg(test)]
     pub fn with_verifier(mut self, verifier: ConsensusVerifier) -> Self {
         self.verifier = Some(verifier);
         self
     }
 
+    #[cfg(test)]
     pub fn decode_block(bytes: &[u8]) -> Result<HellasBlock, IngestError> {
         HellasBlock::decode(bytes).map_err(|_| IngestError::InvalidBlock)
     }
 
-    pub fn decode_finalization(bytes: &[u8]) -> Result<Finalization, IngestError> {
-        ConsensusVerifier::decode_finalization(bytes).map_err(IngestError::from)
-    }
-
+    #[cfg(test)]
     pub async fn ingest_finalized(
         &self,
         block: HellasBlock,
@@ -210,6 +238,7 @@ impl ChainIndexer {
         .await
     }
 
+    #[cfg(test)]
     pub async fn ingest_finalized_proof(
         &self,
         block: HellasBlock,
@@ -222,6 +251,7 @@ impl ChainIndexer {
         .await
     }
 
+    #[cfg(test)]
     async fn ingest_proven_blocks(
         &self,
         block: HellasBlock,
@@ -263,6 +293,18 @@ impl ChainIndexer {
             .map_err(|_| IngestError::RoundMismatch)?;
         let terminal_height = terminal.height();
         let terminal_payload = terminal.digest();
+        {
+            let mut values = self.fixture_source.0.lock().unwrap();
+            values.insert(
+                ResolverKey::Finalized {
+                    height: terminal_height,
+                },
+                (proof.certificate.clone(), terminal.clone()).encode(),
+            );
+            for candidate in std::iter::once(&block).chain(&proof.descendants) {
+                values.insert(ResolverKey::Block(candidate.digest()), candidate.encode());
+            }
+        }
         let mut pending = Vec::new();
         let mut expected_parent = None;
         for candidate in std::iter::once(block).chain(proof.descendants) {
@@ -392,6 +434,14 @@ impl ChainIndexer {
         height: Height,
         payload: Digest,
     ) -> Result<Option<FinalizedBlock>, QueryError> {
+        #[cfg(feature = "full-node")]
+        if height.get()
+            < self
+                .retained_from
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Ok(None);
+        }
         let Some(block) = self.marshal.get_block(height).await else {
             return Err(QueryError::StateUnavailable(format!(
                 "finalized block is missing at height {}",
@@ -449,7 +499,8 @@ impl ChainIndexer {
     }
 }
 
-pub async fn spawn_follower_indexer<E>(
+#[cfg(test)]
+pub async fn spawn_archive<E>(
     context: E,
     partition_prefix: &str,
     config: Config,
@@ -461,7 +512,7 @@ where
 {
     let provider = ConstantProvider::new(verifier.scheme().clone());
     let epocher = FixedEpocher::new(NonZeroU64::new(u64::MAX).unwrap());
-    spawn_follower_with_provider(
+    spawn_archive_with_provider(
         context,
         partition_prefix,
         config,
@@ -473,8 +524,8 @@ where
     .await
 }
 
-#[cfg(feature = "indexer-api")]
-pub async fn spawn_trusted_follower_indexer<E>(
+#[cfg(all(test, feature = "indexer-api"))]
+pub async fn spawn_trusted_archive<E>(
     context: E,
     partition_prefix: &str,
     config: Config,
@@ -484,7 +535,7 @@ pub async fn spawn_trusted_follower_indexer<E>(
 where
     E: BufferPooler + Clock + Metrics + Spawner + Storage + CryptoRng,
 {
-    spawn_trusted_follower_indexer_with_genesis(
+    spawn_trusted_archive_with_genesis(
         context,
         partition_prefix,
         config,
@@ -496,8 +547,8 @@ where
 }
 
 /// Initialize a follower using an independently provisioned genesis document and trust schedule.
-#[cfg(feature = "indexer-api")]
-pub async fn spawn_trusted_follower_indexer_with_genesis<E>(
+#[cfg(all(test, feature = "indexer-api"))]
+pub async fn spawn_trusted_archive_with_genesis<E>(
     context: E,
     partition_prefix: &str,
     config: Config,
@@ -512,7 +563,7 @@ where
     let verifier = schedule
         .verifier(Height::zero(), commonware_consensus::types::Epoch::zero())?
         .clone();
-    let (mut indexer, handle) = spawn_follower_with_provider(
+    let (mut indexer, handle) = spawn_archive_with_provider(
         context,
         partition_prefix,
         config,
@@ -526,7 +577,8 @@ where
     Ok((indexer, handle))
 }
 
-async fn spawn_follower_with_provider<E, P, H>(
+#[cfg(test)]
+async fn spawn_archive_with_provider<E, P, H>(
     context: E,
     partition_prefix: &str,
     config: Config,
@@ -543,43 +595,26 @@ where
         >,
     H: commonware_consensus::types::Epocher,
 {
-    let finalizations_by_height = init_finalization_store(
-        context.child("finalizations_by_height"),
+    let (actor, indexer, _) = init(
+        context.child("archive"),
         partition_prefix,
         &config,
-    )
-    .await;
-    let finalized_blocks =
-        init_block_store(context.child("finalized_blocks"), partition_prefix, &config).await;
-    let mailbox_size = NonZeroUsize::new(config.mailbox_size).unwrap_or(NonZeroUsize::MIN);
-    let marshal_config = marshal::Config {
+        Start::Genesis(genesis_block),
         provider,
         epocher,
-        start: Start::Genesis(genesis_block),
-        partition_prefix: partition_prefix.to_string(),
-        mailbox_size,
-        view_retention_timeout: ViewDelta::new(config.activity_timeout),
-        prunable_items_per_section: NZU64!(256),
-        page_cache: config.page_cache(&context),
-        replay_buffer: NonZeroUsize::new(config.replay_buffer).unwrap_or(NonZeroUsize::MIN),
-        key_write_buffer: NonZeroUsize::new(config.write_buffer).unwrap_or(NonZeroUsize::MIN),
-        value_write_buffer: NonZeroUsize::new(config.write_buffer).unwrap_or(NonZeroUsize::MIN),
-        block_codec_config: (),
-        max_repair: NonZeroUsize::new(config.max_repair).unwrap_or(NonZeroUsize::MIN),
-        max_pending_acks: NonZeroUsize::MIN,
-        strategy: commonware_parallel::Sequential,
-    };
-    let (actor, marshal, _) = MarshalActor::<_, Standard<HellasBlock>, _, _, _, _, _>::init(
-        context.child("marshal"),
-        finalizations_by_height,
-        finalized_blocks,
-        marshal_config,
     )
     .await;
+    let mailbox_size = NonZeroUsize::new(config.mailbox_size).unwrap_or(NonZeroUsize::MIN);
     let (resolver_rx, handler) = handler::init(context.child("marshal_resolver"), mailbox_size);
-    let resolver = NoopResolver::<PublicKey, Digest>::new(handler);
+    let resolver = commonware_resolver::opaque::init::<_, _, _, PublicKey>(
+        context.child("fixture_resolver"),
+        indexer.fixture_source.clone(),
+        handler,
+        mailbox_size,
+        std::time::Duration::from_secs(1),
+    );
     let handle = actor.start_unbuffered(AutoAckApplication, (resolver_rx, resolver));
-    Ok((ChainIndexer::new(marshal).with_verifier(verifier), handle))
+    Ok((indexer.with_verifier(verifier), handle))
 }
 
 fn finalized_block(block: HellasBlock, finalization: Vec<u8>) -> FinalizedBlock {
@@ -594,9 +629,11 @@ fn finalized_block(block: HellasBlock, finalization: Vec<u8>) -> FinalizedBlock 
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy)]
 struct AutoAckApplication;
 
+#[cfg(test)]
 impl Reporter for AutoAckApplication {
     type Activity = Update<HellasBlock>;
 
@@ -608,79 +645,37 @@ impl Reporter for AutoAckApplication {
     }
 }
 
-#[derive(Clone)]
-struct NoopResolver<P, D>
-where
-    D: commonware_cryptography::Digest,
-{
-    _handler: handler::Handler<D>,
-    _public_key: PhantomData<fn() -> P>,
-}
-
-impl<P, D> NoopResolver<P, D>
-where
-    D: commonware_cryptography::Digest,
-{
-    const fn new(handler: handler::Handler<D>) -> Self {
-        Self {
-            _handler: handler,
-            _public_key: PhantomData,
-        }
-    }
-}
-
-impl<P, D> Resolver for NoopResolver<P, D>
-where
-    P: commonware_cryptography::PublicKey,
-    D: commonware_cryptography::Digest,
-{
-    type Key = ResolverKey<D>;
-    type Subscriber = Annotation;
-
-    fn fetch<F>(&mut self, _key: F) -> Feedback
-    where
-        F: Into<Fetch<Self::Key, Self::Subscriber>> + Send,
-    {
-        Feedback::Ok
-    }
-
-    fn fetch_all<F>(&mut self, _keys: Vec<F>) -> Feedback
-    where
-        F: Into<Fetch<Self::Key, Self::Subscriber>> + Send,
-    {
-        Feedback::Ok
-    }
-
-    fn retain(
-        &mut self,
-        _predicate: impl Fn(&Self::Key, &Self::Subscriber) -> bool + Send + 'static,
-    ) -> Feedback {
-        Feedback::Ok
-    }
-}
-
-impl<P, D> TargetedResolver for NoopResolver<P, D>
-where
-    P: commonware_cryptography::PublicKey,
-    D: commonware_cryptography::Digest,
-{
-    type PublicKey = P;
-
-    fn fetch_targeted(
-        &mut self,
-        _fetch: impl Into<Fetch<Self::Key, Self::Subscriber>> + Send,
-        _targets: NonEmptyVec<Self::PublicKey>,
-    ) -> Feedback {
-        Feedback::Ok
-    }
-
-    fn fetch_all_targeted<F>(&mut self, _keys: Vec<(F, NonEmptyVec<Self::PublicKey>)>) -> Feedback
-    where
-        F: Into<Fetch<Self::Key, Self::Subscriber>> + Send,
-    {
-        Feedback::Ok
+// Test producers expose their certified blocks through an in-memory source.
+#[cfg(test)]
+#[derive(Clone, Default)]
+struct FixtureSource(
+    Arc<std::sync::Mutex<std::collections::BTreeMap<ResolverKey<Digest>, bytes::Bytes>>>,
+);
+#[cfg(test)]
+impl commonware_resolver::opaque::Fetcher for FixtureSource {
+    type Key = ResolverKey<Digest>;
+    type Value = bytes::Bytes;
+    async fn fetch(&self, key: Self::Key) -> Option<Self::Value> {
+        self.0.lock().unwrap().get(&key).cloned()
     }
 }
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+use commonware_consensus::{
+    Reporter,
+    marshal::{
+        Update,
+        resolver::handler::{self, Key as ResolverKey},
+    },
+    simplex::types::Activity,
+    types::FixedEpocher,
+};
+#[cfg(test)]
+use commonware_cryptography::certificate::ConstantProvider;
+#[cfg(test)]
+use commonware_utils::Acknowledgement;
+#[cfg(test)]
+use std::num::NonZeroU64;

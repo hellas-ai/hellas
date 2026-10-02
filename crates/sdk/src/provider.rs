@@ -84,6 +84,23 @@ pub struct OpenAiProviderOptions<R> {
     pub fetch_queue_capacity: usize,
 }
 
+/// Paid policy and its process-owned executing chain node.
+#[cfg(feature = "paid-provider")]
+pub struct PaidProviderOptions {
+    config: crate::work_config::WorkConfig,
+    node: crate::FullNode,
+}
+#[cfg(feature = "paid-provider")]
+impl PaidProviderOptions {
+    pub fn new(
+        config: crate::work_config::WorkConfig,
+        node: crate::FullNode,
+    ) -> Result<Self, crate::work_config::WorkConfigError> {
+        config.check_node(&node)?;
+        Ok(Self { config, node })
+    }
+}
+
 /// An attested Fetch provider with an operator-supplied route registry.
 pub struct FetchProviderOptions<R> {
     pub port: Option<u16>,
@@ -97,7 +114,7 @@ pub struct FetchProviderOptions<R> {
     pub fetch_max_in_flight: usize,
     pub fetch_queue_capacity: usize,
     #[cfg(feature = "paid-provider")]
-    pub paid_work: Option<crate::work_config::WorkConfig>,
+    pub paid_work: Option<PaidProviderOptions>,
 }
 
 #[cfg(feature = "paid-provider")]
@@ -240,7 +257,8 @@ where
         return Err(ProviderError::FundingRequired);
     }
     #[cfg(feature = "paid-provider")]
-    if let Some(config) = &options.paid_work {
+    if let Some(paid) = &options.paid_work {
+        let config = &paid.config;
         use hellas_rpc::protocol::{
             work_fetch::FetchRoutePolicy as PaidRoute, work_profile::WorkPolicy,
         };
@@ -291,15 +309,29 @@ where
                 grants,
                 &options.state_directory,
                 options.enrollment.clone(),
+                hellas_rpc::protocol::work_grant::records::Principal::verify(
+                    options.enrollment.clone(),
+                )
+                .or_else(|_| {
+                    options
+                        .identity
+                        .contact_enrollment(options.identity.caller_key())
+                        .map_err(|_| {
+                            hellas_rpc::protocol::work_grant::records::GrantError::Signature
+                        })
+                        .and_then(hellas_rpc::protocol::work_grant::records::Principal::verify)
+                })?,
                 &options.routes,
                 options.fetch_max_in_flight,
             )
         })
         .transpose()?;
     #[cfg(feature = "paid-provider")]
+    let chain = options.paid_work.as_ref().map(|paid| paid.node.clone());
+    #[cfg(feature = "paid-provider")]
     let work_config = options
         .paid_work
-        .map(|config| {
+        .map(|PaidProviderOptions { config, node }| {
             let policy = config.provider_policy();
             let settlement_key = hellas_kernel::Secp256k1Signer::from_secret_scalar(
                 options.identity.caller_secret_bytes(),
@@ -307,18 +339,15 @@ where
             .map_err(|_| ProviderError::SettlementKey)?;
             let runner_config = crate::paid_provider::WorkRunnerConfig {
                 network: config.chain.network,
-                genesis_payload_digest: config.chain.genesis_payload_digest,
-                threshold_identity: config.chain.threshold_identity,
                 journal_root: config.journal_root,
                 routes: config.routes,
-                validators: config.validators,
                 poll: config.poll,
                 max_observation_age: config.max_observation_age,
                 settlement_key,
                 policy,
             };
             runner_config.validate()?;
-            Ok::<_, ProviderError>(runner_config)
+            Ok::<_, ProviderError>((runner_config, node))
         })
         .transpose()?;
     let producer_key = Arc::new(options.identity.caller_key().clone());
@@ -338,12 +367,13 @@ where
     let setup_mount = crate::paid_provider::MountedSetup::default();
     #[cfg(feature = "paid-provider")]
     let runner = work_config
-        .map(|config| {
+        .map(|(config, node)| {
             crate::paid_provider::WorkRunner::discover(
                 config,
                 work_mount.clone(),
                 setup_mount.clone(),
             )
+            .map(|runner| runner.on_node(node))
         })
         .transpose()?;
     let open = ProviderOpen {
@@ -359,13 +389,32 @@ where
                 .to_vec(),
         );
     }
+    #[cfg(feature = "paid-provider")]
+    if chain.is_some() {
+        alpns.push(
+            hellas_rpc::services::chain_sync::ChainSync::ALPN
+                .as_bytes()
+                .to_vec(),
+        );
+        alpns.push(hellas_rpc::services::node::Node::ALPN.as_bytes().to_vec());
+    }
     let mut builder = Endpoint::builder(presets::N0)
         .secret_key(options.identity.transport_key())
-        .alpns(alpns);
+        .alpns(alpns.clone());
     if let Some(port) = options.port {
         builder = builder.bind_addr(std::net::SocketAddr::from(([0, 0, 0, 0], port)))?;
     }
     let endpoint = builder.bind().await?;
+    #[cfg(feature = "paid-provider")]
+    let discovery = chain.as_ref().map(|node| {
+        node.discovery(
+            endpoint.id(),
+            alpns
+                .iter()
+                .map(|alpn| String::from_utf8(alpn.clone()).expect("service ALPN is ASCII"))
+                .collect(),
+        )
+    });
     #[cfg(feature = "grant-provider")]
     let grants = grant_store
         .map(|store| {
@@ -435,7 +484,8 @@ where
             };
             let work_router = work_router.clone();
             #[cfg(feature = "paid-provider")]
-            let setup_mount = setup_mount.clone();
+            let (setup_mount, chain, discovery) =
+                (setup_mount.clone(), chain.clone(), discovery.clone());
             let open = open.clone();
             connections.spawn(async move {
                 let _slot = slot;
@@ -452,6 +502,20 @@ where
                 };
                 let alpn = connection.alpn().to_vec();
                 let transport = Arc::new(IrohTransport::new(connection));
+                #[cfg(feature = "paid-provider")]
+                if alpn == hellas_rpc::services::chain_sync::ChainSync::ALPN.as_bytes()
+                    && let Some(chain) = chain
+                {
+                    chain.serve_chain(transport).await;
+                    return;
+                }
+                #[cfg(feature = "paid-provider")]
+                if alpn == hellas_rpc::services::node::Node::ALPN.as_bytes()
+                    && let Some(discovery) = discovery
+                {
+                    serve(transport, hellas_rpc::services::node::NodeServer(discovery)).await;
+                    return;
+                }
                 if alpn == hellas_rpc::services::work::Work::ALPN.as_bytes() {
                     let server = OpenDispatcher::<_, _, hellas_rpc::services::work::Open>::new(
                         hellas_rpc::services::work::WorkServer(work_router),

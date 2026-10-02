@@ -2,16 +2,12 @@ use crate::domain::{
     Coin, Digest, Encode, ObjectId, SettlementKey, Transaction,
     WebAuthnSignature as DomainWebAuthnSignature,
 };
-use crate::work_view::{FinalizedWorkView, WorkChannelQuery, WorkChannelSnapshot};
 use crate::{
     ConsensusInfo, ConsensusVerifier, EdgeLookup, EdgeRecord, EdgeState, FinalizedBlock,
     FinalizedBlockQuery, LatestBlock, LightClient, OwnerCoins, OwnerEdges, QueryError,
 };
 use commonware_cryptography::{Hasher, Sha256};
-use hellas_kernel::{
-    BOND_LEASE_CHUNKS, Decode as _, Edge, Encode as _, Move as KernelMove, RegistryChunk,
-    Tx as KernelTx,
-};
+use hellas_kernel::{Decode as _, Encode as _, Move as KernelMove, Tx as KernelTx};
 use hellas_rpc::{
     SubmitTxOutcome as DomainSubmitTxOutcome,
     call::StreamingCall,
@@ -27,18 +23,6 @@ use std::collections::BTreeSet;
 pub struct RemoteLightClient {
     client: LightClientClientImpl<MuxTransport>,
     verifier: Option<ConsensusVerifier>,
-}
-
-/// Wire-backed light client whose finalized snapshots are always verified.
-///
-/// Unlike [`RemoteLightClient`], this type has no unverified state. It is the
-/// client for a caller whose decisions require an authenticated finalized
-/// history, while callers that deliberately trust their endpoint can keep
-/// using [`RemoteLightClient`] unchanged.
-#[derive(Clone)]
-pub struct VerifiedRemoteLightClient {
-    client: LightClientClientImpl<MuxTransport>,
-    verifier: ConsensusVerifier,
 }
 
 impl RemoteLightClient {
@@ -83,25 +67,6 @@ impl RemoteLightClient {
     }
 }
 
-impl VerifiedRemoteLightClient {
-    /// Build a client that requires `verifier` for every finalized snapshot.
-    pub fn new(transport: MuxTransport, verifier: ConsensusVerifier) -> Self {
-        Self {
-            client: LightClientClientImpl::new(transport),
-            verifier,
-        }
-    }
-
-    /// Connect to a WebSocket endpoint with a required consensus verifier.
-    pub async fn connect(
-        addr: impl Into<String>,
-        verifier: ConsensusVerifier,
-    ) -> Result<Self, QueryError> {
-        let addr = addr.into();
-        Ok(Self::new(connect_transport(&addr).await?, verifier))
-    }
-}
-
 async fn connect_transport(addr: &str) -> Result<MuxTransport, QueryError> {
     #[cfg(target_family = "wasm")]
     {
@@ -124,16 +89,7 @@ async fn connect_transport(addr: &str) -> Result<MuxTransport, QueryError> {
     }
 }
 
-/// The shared wire operations of the optional and required-verifier clients.
-///
-/// Keeping this private leaves the public distinction structural: only the
-/// two client types above can select whether snapshot verification exists.
-trait RemoteClientState: Clone + Send + Sync + 'static {
-    fn rpc_client(&self) -> &LightClientClientImpl<MuxTransport>;
-    fn consensus_verifier(&self) -> Option<&ConsensusVerifier>;
-}
-
-impl RemoteClientState for RemoteLightClient {
+impl RemoteLightClient {
     fn rpc_client(&self) -> &LightClientClientImpl<MuxTransport> {
         &self.client
     }
@@ -143,20 +99,7 @@ impl RemoteClientState for RemoteLightClient {
     }
 }
 
-impl RemoteClientState for VerifiedRemoteLightClient {
-    fn rpc_client(&self) -> &LightClientClientImpl<MuxTransport> {
-        &self.client
-    }
-
-    fn consensus_verifier(&self) -> Option<&ConsensusVerifier> {
-        Some(&self.verifier)
-    }
-}
-
-impl<C> LightClient for C
-where
-    C: RemoteClientState,
-{
+impl LightClient for RemoteLightClient {
     fn get_state_root(&self) -> impl Future<Output = Result<Option<Digest>, QueryError>> + Send {
         let client = self.rpc_client().clone();
         async move {
@@ -490,128 +433,6 @@ fn owner_edges_from_proto(
     Ok(Some(OwnerEdges { snapshot, edges }))
 }
 
-impl<C> FinalizedWorkView for C
-where
-    C: RemoteClientState,
-{
-    fn work_channel_snapshot(
-        &self,
-        query: WorkChannelQuery,
-    ) -> impl Future<Output = Result<Option<WorkChannelSnapshot>, QueryError>> + Send {
-        let client = self.rpc_client().clone();
-        let verifier = self.consensus_verifier().cloned();
-        async move {
-            let response = client
-                .get_work_channel_snapshot(GetWorkChannelSnapshotRequest {
-                    bond_edge: query.bond_edge.to_bytes().to_vec(),
-                    payment_edge: query.payment_edge.to_bytes().to_vec(),
-                    funding_coins: query
-                        .funding
-                        .iter()
-                        .map(|coin| coin.to_bytes().to_vec())
-                        .collect(),
-                })
-                .await
-                .map_err(QueryError::from)?;
-            work_channel_snapshot_from_proto(query, response, verifier.as_ref())
-        }
-    }
-}
-
-/// Reads one channel snapshot off the wire.
-///
-/// The chunk count is checked exactly rather than padded or truncated: a
-/// reply carrying one lease slot is not a lease half-read, it is a peer
-/// answering a question this build did not ask, and treating its missing
-/// slot as empty would read a live lease as absent.
-///
-/// The pending-close slot is required for the same reason, and it is the
-/// half that matters more: an empty slot is a *permission* — it is what
-/// says no contest is open and new work may be admitted. A reply that
-/// omitted the field entirely would read as that permission. The server
-/// always sends the message, present or empty, so a missing one is a
-/// peer this build does not agree with.
-///
-/// The live-funding list is checked against the coins the query named,
-/// for the same class of reason and in the opposite direction: a coin
-/// reported live that was never asked about is a peer answering some
-/// other transaction's preflight, and there is nothing in an
-/// unrequested coin id that this build could have checked. A coin the
-/// query named and the reply omits is *not* refused — that is exactly
-/// how a spent coin is reported.
-pub(crate) fn work_channel_snapshot_from_proto(
-    query: WorkChannelQuery,
-    response: GetWorkChannelSnapshotResponse,
-    verifier: Option<&ConsensusVerifier>,
-) -> Result<Option<WorkChannelSnapshot>, QueryError> {
-    let Some(snapshot) = response.snapshot else {
-        return Ok(None);
-    };
-    let block = verified_latest_block_from_proto(snapshot, verifier)?;
-
-    let slots = response.lease_slots.len();
-    let expected = usize::from(BOND_LEASE_CHUNKS);
-    if slots != expected {
-        return Err(QueryError::Remote(format!(
-            "work channel snapshot carried {slots} lease slots, expected {expected}"
-        )));
-    }
-    let mut lease_slots = [None, None];
-    for (slot, wire) in lease_slots.iter_mut().zip(response.lease_slots) {
-        *slot = registry_chunk_from_wire(wire.chunk, "lease slot")?;
-    }
-    let Some(pending) = response.pending_slot else {
-        return Err(QueryError::Remote(
-            "work channel snapshot carried no pending-close slot".to_string(),
-        ));
-    };
-    let pending_slot = registry_chunk_from_wire(pending.chunk, "pending-close slot")?;
-
-    let mut live_funding = std::collections::BTreeSet::new();
-    for bytes in response.live_funding {
-        let coin = hellas_kernel::CoinId::decode_exact(&bytes)
-            .map_err(|_| QueryError::Remote("live funding was not a coin id".to_string()))?;
-        if !query.funding.contains(&coin) {
-            return Err(QueryError::Remote(
-                "work channel snapshot reported a live coin the query did not name".to_string(),
-            ));
-        }
-        live_funding.insert(coin);
-    }
-
-    Ok(Some(WorkChannelSnapshot::new(
-        query,
-        block,
-        edge_from_wire(response.bond_edge, "bond edge")?,
-        edge_from_wire(response.payment_edge, "payment edge")?,
-        lease_slots,
-        pending_slot,
-        live_funding,
-    )))
-}
-
-fn edge_from_wire(bytes: Option<Vec<u8>>, field: &'static str) -> Result<Option<Edge>, QueryError> {
-    bytes
-        .map(|bytes| {
-            Edge::decode_exact(&bytes)
-                .map_err(|_| QueryError::Remote(format!("{field} was not a canonical kernel edge")))
-        })
-        .transpose()
-}
-
-fn registry_chunk_from_wire(
-    bytes: Option<Vec<u8>>,
-    field: &'static str,
-) -> Result<Option<RegistryChunk>, QueryError> {
-    bytes
-        .map(|bytes| {
-            RegistryChunk::decode_exact(&bytes).map_err(|_| {
-                QueryError::Remote(format!("{field} was not a canonical registry chunk"))
-            })
-        })
-        .transpose()
-}
-
 fn digest_from_wire(bytes: Vec<u8>, field: &'static str) -> Result<Digest, QueryError> {
     let actual = bytes.len();
     let raw: [u8; 32] = bytes.try_into().map_err(|_| {
@@ -664,7 +485,7 @@ fn verified_latest_block_from_proto(
     Ok(latest)
 }
 
-fn verified_finalized_block_from_proto(
+pub(crate) fn verified_finalized_block_from_proto(
     block: hellas_rpc::pb::chain::FinalizedBlock,
     verifier: Option<&ConsensusVerifier>,
 ) -> Result<FinalizedBlock, QueryError> {
@@ -685,7 +506,9 @@ fn verified_finalized_block_from_proto(
     })
 }
 
-fn finalized_block_query_to_proto(query: FinalizedBlockQuery) -> GetFinalizedBlockRequest {
+pub(crate) fn finalized_block_query_to_proto(
+    query: FinalizedBlockQuery,
+) -> GetFinalizedBlockRequest {
     let query = match query {
         FinalizedBlockQuery::Latest => None,
         FinalizedBlockQuery::Height(height) => {

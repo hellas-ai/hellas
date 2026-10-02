@@ -185,6 +185,7 @@ pub struct PaidGateway {
     providers: Vec<Arc<Provider>>,
     next: AtomicUsize,
     endpoint: Endpoint,
+    node: crate::FullNode,
     settlement_key: Secp256k1Signer,
     producer_key: hellas_rpc::ProducerSigningKey,
     admission: Arc<Semaphore>,
@@ -197,8 +198,12 @@ impl PaidGateway {
     pub async fn open(
         options: PaidGatewayOptions,
         identity: crate::ClientIdentity,
+        node: crate::FullNode,
     ) -> Result<Arc<Self>> {
         options.validate()?;
+        for provider in &options.providers {
+            provider.config.check_node(&node)?;
+        }
         let settlement_key = Secp256k1Signer::from_secret_scalar(identity.caller_secret_bytes())
             .map_err(|_| PoolError::Invalid("settlement identity is not secp256k1"))?;
         let providers = options
@@ -222,6 +227,7 @@ impl PaidGateway {
             // One transport identity has one relay registration, shared by every
             // provider and request for the lifetime of this gateway.
             endpoint: bind_paid_endpoint(identity.transport_key()).await?,
+            node,
             settlement_key,
             producer_key: identity.caller_key().clone(),
             tasks: crate::gateway_work::WorkTasks::default(),
@@ -305,6 +311,7 @@ impl PaidGateway {
             return Err(hellas_gateway::WorkGatewayBusy.into());
         }
         let endpoint = self.endpoint.clone();
+        let node = self.node.clone();
         let settlement_key = self.settlement_key.clone();
         let (sender, receiver) = mpsc::channel::<BufferedEvent<E>>(OUTPUT_BUFFER_EVENTS);
         let (overflow, overflow_receiver) = watch::channel(false);
@@ -383,7 +390,7 @@ impl PaidGateway {
                     if session.is_none() {
                         match connect_before_deadline(
                             &sender, streamed, deadline, PROVIDER_CONNECTION_TIMEOUT,
-                            async { PaidWorkSession::open(provider.args.clone(), endpoint.clone(), settlement_key.clone()).await.map_err(PoolError::from) },
+                            async { PaidWorkSession::open(provider.args.clone(), endpoint.clone(), settlement_key.clone(), node.clone()).await.map_err(PoolError::from) },
                         ).await
                         {
                             Ok(opened) => {
@@ -856,7 +863,8 @@ mod tests {
 
     #[tokio::test]
     async fn paid_responses_backend_uses_its_manifest_and_refuses_route_mismatch_before_funding() {
-        let fixture = crate::test_support::PaidFixture::new();
+        let mut fixture = crate::test_support::PaidFixture::new();
+        let node = fixture.node().await;
         let options = pool_options(&fixture);
         let identity = crate::ClientIdentity::from_secret_bytes([1; 32], [1; 32]).unwrap();
         let provider = options.providers[0].provider;
@@ -883,7 +891,9 @@ mod tests {
             input.execution_environment,
             hellas_rpc::FetchEnvironment::OpenAiResponses.manifest_id()
         );
-        let gateway = PaidGateway::open(options, identity).await.unwrap();
+        let gateway = PaidGateway::open(options, identity, node.clone())
+            .await
+            .unwrap();
         drop(
             gateway
                 .fetch(request("responses"))
@@ -892,6 +902,7 @@ mod tests {
         assert!(gateway.fetch(request("another-route")).is_err());
         gateway.drain().await.unwrap();
         assert!(!fixture.root.path().join("client").exists());
+        node.shutdown().await.unwrap();
     }
 
     #[test]
@@ -923,13 +934,15 @@ mod tests {
 
     #[tokio::test]
     async fn shared_pool_rejects_reused_funding_before_opening_or_writing() {
-        let fixture = crate::test_support::PaidFixture::new();
+        let mut fixture = crate::test_support::PaidFixture::new();
+        let node = fixture.node().await;
         let mut options = pool_options(&fixture);
         let mut second = options.providers[0].clone();
         second.provider = iroh::SecretKey::from_bytes(&[4; 32]).public();
         second.journal_root = fixture.root.path().join("other");
         options.providers.push(second);
-        let result = PaidGateway::open(options, crate::ClientIdentity::generate()).await;
+        let result =
+            PaidGateway::open(options, crate::ClientIdentity::generate(), node.clone()).await;
         assert!(matches!(
             result,
             Err(PoolError::Invalid(
@@ -938,6 +951,7 @@ mod tests {
         ));
         assert!(!fixture.root.path().join("client").exists());
         assert!(!fixture.root.path().join("other").exists());
+        node.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -1067,8 +1081,11 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_rejects_admitted_work_not_yet_registered() {
+        let mut fixture = crate::test_support::PaidFixture::new();
+        let node = fixture.node().await;
         let gateway = PaidGateway {
             providers: Vec::new(),
+            node: node.clone(),
             next: AtomicUsize::new(0),
             endpoint: Endpoint::builder(iroh::endpoint::presets::Minimal)
                 .bind()
@@ -1089,6 +1106,7 @@ mod tests {
             PoolError::Busy(_)
         ));
         assert_eq!(gateway.admission.available_permits(), 1);
+        node.shutdown().await.unwrap();
     }
 
     #[test]

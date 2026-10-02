@@ -20,8 +20,8 @@ pub use channel::{
 pub use journal::{JournalError, Role};
 pub use setup::{
     DiscoveredSetup, ObservedSetup, SetupAbort, SetupDecision, SetupDiscovery, SetupDiscoveryError,
-    SetupEnd, SetupFault, SetupHistoryBatch, SetupHistoryBlock, SetupOrigin, SetupRecord,
-    SetupScan, SetupState, SetupStateError, SetupStore, UnidentifiedSetup, discover_setups,
+    SetupEnd, SetupFault, SetupObservation, SetupOrigin, SetupRecord, SetupScan, SetupState,
+    SetupStateError, SetupStore, UnidentifiedSetup, discover_setups,
 };
 
 /// Why a durable step could not be taken.

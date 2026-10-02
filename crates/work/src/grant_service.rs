@@ -208,6 +208,11 @@ impl GrantService {
         {
             return Err(GrantError::Signature.into());
         }
+        if !store.state().users().any(|user| {
+            user.permissions == hellas_rpc::protocol::work_grant::admin::UserPermissions::Owner
+        }) {
+            return Err(GrantError::Unauthorized.into());
+        }
         let backend = Arc::new(backend);
         let capacity = backend.clone();
         let run = Arc::new(move |input, policy: GrantPolicy, admission, progress| {
@@ -271,7 +276,23 @@ impl GrantService {
             .map_err(|_| GrantStoreError::WriterPoisoned)?;
         held.status.check()?;
         let now = (self.clock)().max(held.store.state().now());
-        let result = op(&mut held.store, now);
+        let result = op(&mut held.store, now).map_err(|error| {
+            // A failed write/sync leaves permission durability uncertain. Keep
+            // the writer failed until replay while retaining the I/O cause.
+            if matches!(
+                &error,
+                GrantStoreError::Journal(
+                    crate::work_store::journal::JournalError::Io(_)
+                        | crate::work_store::journal::JournalError::Poisoned
+                )
+            ) {
+                let source = Arc::new(error);
+                held.status = ServiceStatus::Failed(source.clone());
+                GrantStoreError::Completion(source)
+            } else {
+                error
+            }
+        });
         drop(held);
         self.changed.notify_waiters();
         result
@@ -292,6 +313,9 @@ impl GrantService {
                 .inner
                 .lock()
                 .map_err(|_| refused(GrantRefusalCode::StorageUnavailable))?;
+            if held.status.check().is_err() {
+                return Err(refused(GrantRefusalCode::StorageUnavailable));
+            }
             if !request.route.as_ref().is_some_and(|r| {
                 r.selects_grant(query.locator.channel(held.store.state().network()))
             }) {
@@ -748,6 +772,14 @@ impl GrantService {
             .live
             .get(&id)
             .ok_or_else(|| refused(GrantRefusalCode::OutputUnavailable))?;
+        if held
+            .store
+            .state()
+            .grant(live.authorization.grant_id)
+            .is_none_or(|g| g.state == GrantState::Revoked)
+        {
+            return Err(refused(GrantRefusalCode::Revoked));
+        }
         if let LivePhase::Refused(code) = live.phase {
             return Err(held
                 .store

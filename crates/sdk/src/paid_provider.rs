@@ -2,18 +2,16 @@
 use crate::work_config::WorkRoutes;
 use crate::work_router::{UnmountedWork, not_ready};
 use futures::future::BoxFuture;
-use hellas_chain::client::VerifiedRemoteLightClient;
 use hellas_chain::work_blocks::advance_paid_work_clock;
-use hellas_chain::{
-    ConsensusInfo, ConsensusVerifier, FinalizedWorkView, WorkBlocks, WorkChannelQuery,
-};
+use hellas_chain::{FinalizedWorkView, WorkBlocks, WorkChannelQuery};
+use hellas_chain::{node::FullNode, rpc::LocalLightClient};
 use hellas_kernel::{EdgeId, NetworkId, Secp256k1Signer, Secp256k1Verifier};
 use hellas_rpc::call::WithTrailer;
 use hellas_rpc::pb::work::{
     AcceptWorkRequest, AcceptWorkResponse, AdmitCertificateRequest, AdmitCertificateResponse,
     DeliverResultRequest, DeliverResultResponse, ExchangeSetupRequest, ExchangeSetupResponse,
     FundingKind, GetStandingRequest, GetStandingResponse, WorkRefusalCode, WorkRefused, WorkRoute,
-    accept_work_response, get_standing_response,
+    accept_work_response, exchange_setup_response, get_standing_response,
 };
 use hellas_rpc::peers::PeerId;
 use hellas_rpc::protocol::Digest;
@@ -58,12 +56,6 @@ pub enum PaidProviderError {
     NoBackend,
     #[error("observer age must exceed a positive polling interval")]
     InvalidObservationPolicy,
-    #[error("the paid-work clock requires at least one validator")]
-    NoValidators,
-    #[error("validator has no finalized block 1 for genesis authentication")]
-    MissingGenesis,
-    #[error("validator genesis does not match the configured payload digest")]
-    GenesisMismatch,
     #[error(transparent)]
     BlockSource(#[from] hellas_work::work_close::BlockSourceError),
     #[error(transparent)]
@@ -74,8 +66,6 @@ pub enum PaidProviderError {
     Query(#[from] hellas_chain::QueryError),
     #[error(transparent)]
     CatchUp(#[from] hellas_work::work_close::CatchUpError),
-    #[error(transparent)]
-    Consensus(#[from] hellas_chain::ConsensusVerificationError),
     #[error("cannot discover work journals under {}: {source}", path.display())]
     Discover {
         path: PathBuf,
@@ -83,21 +73,15 @@ pub enum PaidProviderError {
     },
 }
 
-pub type ProductionWorkSource = WorkBlocks<VerifiedRemoteLightClient>;
+pub type ProductionWorkSource = WorkBlocks<LocalLightClient>;
 /// Validated configuration for driving provider journals.
 pub struct WorkRunnerConfig {
     /// The network the journals are keyed and the signatures bound to.
     pub network: NetworkId,
-    /// The parent payload digest authenticated by finalized block 1.
-    pub genesis_payload_digest: Digest,
-    /// The threshold identity finalized blocks must authenticate under.
-    pub threshold_identity: Vec<u8>,
     /// The configured root the setup journals live under.
     pub journal_root: PathBuf,
     /// Bilateral routes from authenticated peers to owned journals.
     pub routes: WorkRoutes,
-    /// The validator RPCs a read and a submission go to.
-    pub validators: Vec<String>,
     /// How often the clock ticks.
     pub poll: Duration,
     /// Bounds observer stalls and the age of local admission evidence.
@@ -108,25 +92,28 @@ pub struct WorkRunnerConfig {
     pub policy: ProviderChannelPolicy,
 }
 
-impl WorkRunnerConfig {
-    /// Validate observation policy and chain identity before startup performs I/O.
-    pub fn validate(&self) -> Result<(), PaidProviderError> {
-        self.consensus_verifier().map(|_| ())
+#[derive(Clone, Default)]
+struct AdmissionNode(Arc<std::sync::OnceLock<FullNode>>);
+impl AdmissionNode {
+    fn ready(&self) -> bool {
+        self.0.get().is_none_or(|node| node.view().is_ok())
     }
+}
+impl std::fmt::Debug for AdmissionNode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdmissionNode")
+            .field("ready", &self.ready())
+            .finish()
+    }
+}
 
-    fn consensus_verifier(&self) -> Result<ConsensusVerifier, PaidProviderError> {
+impl WorkRunnerConfig {
+    /// Validate observation policy before startup performs I/O.
+    pub fn validate(&self) -> Result<(), PaidProviderError> {
         if self.poll.is_zero() || self.max_observation_age <= self.poll {
             return Err(PaidProviderError::InvalidObservationPolicy);
         }
-        if self.validators.is_empty() {
-            return Err(PaidProviderError::NoValidators);
-        }
-        let consensus_verifier = ConsensusVerifier::new(&ConsensusInfo {
-            validators: self.validators.clone(),
-            threshold_identity: self.threshold_identity.clone(),
-            network_id: self.network.as_str().to_owned(),
-        })?;
-        Ok(consensus_verifier)
+        Ok(())
     }
 }
 
@@ -136,7 +123,7 @@ pub struct WorkWatcher {
     task: tokio::task::JoinHandle<Result<(), MountError>>,
 }
 impl WorkWatcher {
-    pub fn spawn(runner: WorkRunner) -> Self {
+    pub fn spawn(runner: NodeWorkRunner) -> Self {
         let (stop, stopped) = oneshot::channel();
         Self {
             stop: Some(stop),
@@ -197,6 +184,7 @@ type MountedChannels = BTreeMap<Digest, (PeerId, MountedWorkService)>;
 pub struct MountedWork {
     mounted: Arc<Mutex<MountedChannels>>,
     driver: Option<AcceptedWorkDriver>,
+    node: AdmissionNode,
 }
 
 impl Default for MountedWork {
@@ -204,6 +192,7 @@ impl Default for MountedWork {
         Self {
             mounted: Arc::new(Mutex::new(BTreeMap::new())),
             driver: None,
+            node: AdmissionNode::default(),
         }
     }
 }
@@ -268,11 +257,12 @@ impl AcceptedWorkDriver {
     }
 }
 
-/// A peer's local paid channel. Validator connections belong to the observer.
+/// A peer's local paid channel, gated by the shared executing node.
 #[derive(Clone)]
 pub struct MountedWorkService {
     service: WorkService,
     driver: Option<AcceptedWorkDriver>,
+    node: AdmissionNode,
 }
 
 impl WorkHandler for MountedWorkService {
@@ -291,6 +281,11 @@ impl WorkHandler for MountedWorkService {
         request: AcceptWorkRequest,
         _context: TransportContext,
     ) -> Result<impl Into<WithTrailer<AcceptWorkResponse>> + Send, WireStatus> {
+        if !self.node.ready() {
+            return Ok(AcceptWorkResponse {
+                outcome: Some(accept_work_response::Outcome::Refused(not_ready())),
+            });
+        }
         if let Some(response) = self.service.precheck_acceptance(&request) {
             return Ok(response);
         }
@@ -371,6 +366,7 @@ impl MountedWork {
         Self {
             mounted: Arc::new(Mutex::new(BTreeMap::new())),
             driver: Some(AcceptedWorkDriver::new(backend)),
+            node: AdmissionNode::default(),
         }
     }
 
@@ -386,6 +382,7 @@ impl MountedWork {
             MountedWorkService {
                 service: service.clone(),
                 driver: self.driver.clone(),
+                node: self.node.clone(),
             },
         ));
         Ok(())
@@ -446,7 +443,10 @@ impl MountedWork {
 
 /// Setups indexed by authenticated peer. Serving and driving share each journal.
 #[derive(Clone, Debug, Default)]
-pub struct MountedSetup(Arc<Mutex<BTreeMap<(PeerId, EdgeId), SetupService>>>);
+pub struct MountedSetup(
+    Arc<Mutex<BTreeMap<(PeerId, EdgeId), SetupService>>>,
+    AdmissionNode,
+);
 
 impl MountedSetup {
     /// Mounts a distinct bond under its authenticated transport peer.
@@ -510,6 +510,13 @@ impl WorkSetupHandler for MountedSetup {
         request: ExchangeSetupRequest,
         context: TransportContext,
     ) -> Result<impl Into<WithTrailer<ExchangeSetupResponse>> + Send, WireStatus> {
+        if !self.1.ready() {
+            return Ok(Into::<WithTrailer<ExchangeSetupResponse>>::into(
+                ExchangeSetupResponse {
+                    outcome: Some(exchange_setup_response::Outcome::Refused(not_ready())),
+                },
+            ));
+        }
         let bond = <[u8; 32]>::try_from(request.bond_edge.as_slice())
             .map(EdgeId::from_bytes)
             .map_err(|_| {
@@ -620,6 +627,7 @@ struct DrivenChannel {
     descriptor: Option<WorkChannelDescriptor>,
     max_observation_age: Duration,
     driver: Option<AcceptedWorkDriver>,
+    node: AdmissionNode,
 }
 
 impl DrivenChannel {
@@ -671,6 +679,9 @@ impl DrivenChannel {
     /// Resumes accepted work after a fresh readiness check. The durable `JobRunning`
     /// record admits one invocation even when a live request races this clock tick.
     fn resume_accepted(&self) -> Result<bool, PaidProviderError> {
+        if !self.node.ready() {
+            return Ok(false);
+        }
         let Some(work_id) = self.accepted_work_id()? else {
             return Ok(false);
         };
@@ -815,6 +826,7 @@ impl SetupClock {
                     None => warn!(bond, "channel is driven without a peer route"),
                 }
                 self.driven = Driven::Channel(Box::new(DrivenChannel {
+                    node: mount.node.clone(),
                     service,
                     descriptor,
                     max_observation_age: self.max_observation_age,
@@ -840,9 +852,6 @@ pub struct WorkRunner {
     work_mount: MountedWork,
     setup_mount: MountedSetup,
     poll: Duration,
-    validators: Vec<String>,
-    consensus_verifier: ConsensusVerifier,
-    genesis_payload_digest: Digest,
 }
 
 impl WorkRunner {
@@ -866,7 +875,7 @@ impl WorkRunner {
         work_mount: MountedWork,
         setup_mount: MountedSetup,
     ) -> Result<Self, PaidProviderError> {
-        let consensus_verifier = config.consensus_verifier()?;
+        config.validate()?;
         let settlement_verifier = Secp256k1Verifier::new();
         let found = discover_setups(&config.journal_root, config.network).map_err(|source| {
             PaidProviderError::Discover {
@@ -944,9 +953,6 @@ impl WorkRunner {
             work_mount,
             setup_mount,
             poll: config.poll,
-            validators: config.validators,
-            consensus_verifier,
-            genesis_payload_digest: config.genesis_payload_digest,
         })
     }
 
@@ -965,11 +971,25 @@ impl WorkRunner {
         answered
     }
 
-    /// Ticks each journal once per period and redials after a source failure.
+    /// Drives constructed local views, without constructing a chain node.
     pub async fn run_over<S, D, F>(
+        self,
+        stop: oneshot::Receiver<()>,
+        source: D,
+    ) -> Result<(), MountError>
+    where
+        S: SetupView + FinalizedBlocks + FinalizedWorkView + TxSink + Sync,
+        D: Fn() -> F,
+        F: core::future::Future<Output = Option<S>>,
+    {
+        self.run_observing(stop, source, None).await
+    }
+
+    async fn run_observing<S, D, F>(
         mut self,
         mut stop: oneshot::Receiver<()>,
         dial: D,
+        finalized: Option<tokio::sync::watch::Receiver<u64>>,
     ) -> Result<(), MountError>
     where
         S: SetupView + FinalizedBlocks + FinalizedWorkView + TxSink + Sync,
@@ -980,8 +1000,8 @@ impl WorkRunner {
             info!("no provider setup journal under the work root; the clock has nothing to drive");
             return self.unmount_all();
         }
-        // Each channel owns its observer loop. A slow source or a large restart
-        // backlog on one channel cannot stop another channel's close response.
+        // Each channel consumes the same local finalization stream. Independent
+        // journal scheduling keeps a slow close submission from blocking another.
         {
             use futures::{StreamExt as _, stream::FuturesUnordered};
             let signer = &self.signer;
@@ -989,11 +1009,13 @@ impl WorkRunner {
             let setup_mount = &self.setup_mount;
             let dial = &dial;
             let poll = self.poll;
+            let finalized = &finalized;
             let mut observers = self
                 .clocks
                 .iter_mut()
                 .map(|clock| async move {
                     let mut chain = None;
+                    let mut finalized = finalized.clone();
                     loop {
                         let budget = clock.max_observation_age;
                         if chain.is_none() {
@@ -1018,7 +1040,14 @@ impl WorkRunner {
                         if matches!(clock.driven, Driven::Done) {
                             break;
                         }
-                        tokio::time::sleep(poll).await;
+                        if let Some(progress) = &mut finalized {
+                            tokio::select! {
+                                changed = progress.changed() => if changed.is_err() { break; },
+                                _ = tokio::time::sleep(poll) => {},
+                            }
+                        } else {
+                            tokio::time::sleep(poll).await;
+                        }
                     }
                 })
                 .collect::<FuturesUnordered<_>>();
@@ -1035,6 +1064,12 @@ impl WorkRunner {
     }
 }
 
+/// A provider clock bound to the process's single executing node.
+pub struct NodeWorkRunner {
+    runner: WorkRunner,
+    node: FullNode,
+}
+
 impl WorkRunner {
     fn unmount_all(&self) -> Result<(), MountError> {
         let work = self.work_mount.clear_all();
@@ -1042,112 +1077,41 @@ impl WorkRunner {
         work.and(setup)
     }
 
-    /// Ticks until told to stop, over the validators the configuration
-    /// names.
+    pub fn on_node(self, node: FullNode) -> NodeWorkRunner {
+        self.work_mount
+            .node
+            .0
+            .set(node.clone())
+            .unwrap_or_else(|_| panic!("work mount already has a chain node"));
+        self.setup_mount
+            .1
+            .0
+            .set(node.clone())
+            .unwrap_or_else(|_| panic!("setup mount already has a chain node"));
+        NodeWorkRunner { runner: self, node }
+    }
+}
+
+impl NodeWorkRunner {
     pub async fn run(self, stop: oneshot::Receiver<()>) -> Result<(), MountError> {
-        let validators = self.validators.clone();
-        let verifier = self.consensus_verifier.clone();
-        let genesis = self.genesis_payload_digest;
-        let next = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        self.run_over(stop, move || {
-            let validators = validators.clone();
-            let verifier = verifier.clone();
-            let next = next.clone();
-            async move { connect_chain(&validators, verifier, genesis, &next).await }
-        })
-        .await
+        let finalized = self.node.finalized();
+        let node = self.node;
+        self.runner
+            .run_observing(
+                stop,
+                move || {
+                    let node = node.clone();
+                    async move { node.view().ok().map(|view| WorkBlocks::new(view.client())) }
+                },
+                Some(finalized),
+            )
+            .await
     }
-}
-
-/// Rotates the first candidate on reconnect, per runner. Chain reads and
-/// submissions use the selected verified connection.
-async fn connect_chain(
-    validators: &[String],
-    verifier: ConsensusVerifier,
-    genesis: Digest,
-    next: &std::sync::atomic::AtomicUsize,
-) -> Option<ProductionWorkSource> {
-    if validators.is_empty() {
-        return None;
-    }
-    let start = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % validators.len();
-    for url in validators.iter().cycle().skip(start).take(validators.len()) {
-        match VerifiedRemoteLightClient::connect(url.clone(), verifier.clone()).await {
-            Ok(client) => {
-                let source = WorkBlocks::new(client);
-                if let Err(error) = authenticate_genesis(&source, genesis).await {
-                    warn!(validator = %url, %error, "validator failed genesis authentication");
-                    continue;
-                }
-                info!(validator = %url, "the paid-work clock reads and submits here");
-                return Some(source);
-            }
-            Err(error) => warn!(validator = %url, %error, "a configured validator did not answer"),
-        }
-    }
-    None
-}
-
-async fn authenticate_genesis(
-    source: &impl FinalizedBlocks,
-    expected: Digest,
-) -> Result<(), PaidProviderError> {
-    let first = source
-        .block_at(1)
-        .await?
-        .ok_or(PaidProviderError::MissingGenesis)?;
-    if &first.parent != expected.as_bytes() {
-        return Err(PaidProviderError::GenesisMismatch);
-    }
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hellas_work::work_close::{BlockSourceError, FinalizedWork};
-
-    struct Source(Result<Option<FinalizedWork>, BlockSourceError>);
-
-    impl FinalizedBlocks for Source {
-        async fn latest_height(&self) -> Result<Option<u64>, BlockSourceError> {
-            panic!("genesis authentication must request block 1 directly")
-        }
-
-        async fn block_at(&self, height: u64) -> Result<Option<FinalizedWork>, BlockSourceError> {
-            assert_eq!(height, 1);
-            self.0.clone()
-        }
-    }
-
-    #[tokio::test]
-    async fn validator_connection_requires_the_configured_genesis() {
-        let block = FinalizedWork {
-            height: 1,
-            parent: [7; 32],
-            payload: [8; 32],
-            txs: Vec::new(),
-        };
-        authenticate_genesis(&Source(Ok(Some(block.clone()))), [7; 32].into())
-            .await
-            .unwrap();
-        assert!(matches!(
-            authenticate_genesis(&Source(Ok(Some(block))), [9; 32].into()).await,
-            Err(PaidProviderError::GenesisMismatch)
-        ));
-        assert!(matches!(
-            authenticate_genesis(&Source(Ok(None)), [7; 32].into()).await,
-            Err(PaidProviderError::MissingGenesis)
-        ));
-        assert!(matches!(
-            authenticate_genesis(
-                &Source(Err(BlockSourceError::new("offline"))),
-                [7; 32].into()
-            )
-            .await,
-            Err(PaidProviderError::BlockSource(_))
-        ));
-    }
 
     #[test]
     fn poisoned_mounts_are_errors_and_shutdown_still_releases_channels() {
@@ -1196,18 +1160,15 @@ mod tests {
     }
 
     #[test]
-    fn missing_validators_are_rejected_before_discovering_journals() {
+    fn invalid_observation_policy_is_rejected_before_discovering_journals() {
         let fixture = crate::test_support::PaidFixture::new();
         let config = &fixture.config;
         let runner = WorkRunner::discover(
             WorkRunnerConfig {
                 network: config.chain.network,
-                genesis_payload_digest: config.chain.genesis_payload_digest,
-                threshold_identity: config.chain.threshold_identity.clone(),
                 journal_root: config.journal_root.clone(),
                 routes: config.routes.clone(),
-                validators: Vec::new(),
-                poll: config.poll,
+                poll: Duration::ZERO,
                 max_observation_age: config.max_observation_age,
                 settlement_key: crate::test_support::signer(2),
                 policy: config.provider_policy(),
@@ -1215,7 +1176,10 @@ mod tests {
             MountedWork::default(),
             MountedSetup::default(),
         );
-        assert!(matches!(runner, Err(PaidProviderError::NoValidators)));
+        assert!(matches!(
+            runner,
+            Err(PaidProviderError::InvalidObservationPolicy)
+        ));
         assert!(!config.journal_root.exists());
     }
 }

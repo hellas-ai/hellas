@@ -217,7 +217,7 @@ fn descendant_finality_uses_the_certified_height_trust_and_checks_each_epoch() {
         let blocks = blocks.clone();
         let encoded = bundle.finalization.clone();
         deterministic::Runner::default().start(|context| async move {
-            let (indexer, _task) = crate::indexer::spawn_trusted_follower_indexer(
+            let (indexer, _task) = crate::indexer::spawn_trusted_archive(
                 context,
                 "ancestry-epoch-transition",
                 crate::config::Config::default(),
@@ -252,7 +252,7 @@ fn descendant_finality_persists_every_ancestor_before_advancing_follower() {
     use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
     deterministic::Runner::default().start(|context| async move {
         let (verifier, blocks, certificate, _) = fixture();
-        let (source, _source_task) = crate::spawn_follower_indexer(
+        let (source, _source_task) = crate::spawn_archive(
             context.child("source"),
             "descendant-source",
             crate::config::Config::default(),
@@ -269,7 +269,7 @@ fn descendant_finality_persists_every_ancestor_before_advancing_follower() {
             .await
             .unwrap();
         assert_eq!(source.get_latest_block().await.unwrap().unwrap().height, 3);
-        let (replica, _replica_task) = crate::spawn_follower_indexer(
+        let (replica, _replica_task) = crate::spawn_archive(
             context.child("replica"),
             "descendant-replica",
             crate::config::Config::default(),
@@ -298,14 +298,14 @@ fn descendant_finality_persists_every_ancestor_before_advancing_follower() {
             .unwrap()
             .unwrap();
         assert_eq!(answer.snapshot.finalization, encoded);
-        crate::follower::ingest_finalized_block(
-            &replica,
-            answer,
-            1,
-            &crate::follower::FollowerStatusSink::quiet(),
-        )
-        .await
-        .unwrap();
+        crate::FinalizedBlockView::decode(&answer).unwrap();
+        replica
+            .ingest_finalized_proof(
+                crate::ChainIndexer::decode_block(&answer.block).unwrap(),
+                &answer.snapshot.finalization,
+            )
+            .await
+            .unwrap();
         assert_eq!(replica.get_latest_block().await.unwrap().unwrap().height, 3);
         for block in &blocks[1..] {
             let answer = replica

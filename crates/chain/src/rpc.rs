@@ -1,30 +1,37 @@
 //! Local implementation of the light-client query interface.
 
-use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
+#[cfg(feature = "validator")]
+use crate::app::{Mempool, MempoolEntry, RESPONSE_MEMPOOL_CAPACITY};
+#[cfg(all(test, feature = "validator"))]
+use crate::owner_index::OwnerIndexError;
+use std::collections::BTreeSet;
+#[cfg(feature = "validator")]
+use std::collections::{BTreeMap, btree_map::Entry};
 
 use crate::domain::{
     Coin, Object, ObjectId, ObjectKind, SettlementKey, Transaction, coin_object_id, edge_object_id,
     registry_chunk_object_id,
 };
 use crate::{
-    app::{Mempool, MempoolEntry, RESPONSE_MEMPOOL_CAPACITY},
     execution::store::UtxoDatabase,
     indexer::ChainIndexer,
     light_client::{
         ConsensusInfo, EdgeLookup, EdgeRecord, EdgeState, FinalizedBlock, FinalizedBlockQuery,
         LatestBlock, LightClient, OwnerCoins, OwnerEdges, QueryError,
     },
-    owner_index::{OwnerIndex, OwnerIndexError},
+    owner_index::OwnerIndex,
     work_view::{FinalizedWorkView, WorkChannelQuery, WorkChannelSnapshot},
 };
 use commonware_cryptography::sha256::Digest;
+#[cfg(feature = "validator")]
 use hellas_kernel::{
     Batch as KernelBatch, BlockHash, BlockHeight, Coin as KernelCoin, CoinId,
-    Context as KernelContext, Edge, EdgeId, InsertError, KernelResult, NetworkId,
-    PaymentCloseResponse, RegistryChunk, RegistryChunkId, bond_lease_slots, check_response,
-    pending_payment_close_slot,
+    Context as KernelContext, Edge, EdgeId, InsertError, KernelResult, PaymentCloseResponse,
+    RegistryChunk, RegistryChunkId, check_response,
 };
+use hellas_kernel::{NetworkId, bond_lease_slots, pending_payment_close_slot};
 use hellas_rpc::SubmitTxOutcome;
+#[cfg(feature = "validator")]
 use hellas_rpc::observe::{LEVEL, TARGET, Timing};
 
 /// In-process [`LightClient`] backed by the local application handle.
@@ -32,12 +39,27 @@ use hellas_rpc::observe::{LEVEL, TARGET, Timing};
 pub struct LocalLightClient {
     databases: UtxoDatabase<commonware_runtime::tokio::Context>,
     owner_index: OwnerIndex,
-    mempool: Mempool,
+    ingress: TransactionIngress,
+    #[cfg(feature = "full-node")]
+    readiness: Option<std::sync::Arc<crate::node::Readiness>>,
     chain_indexer: ChainIndexer,
     consensus_info: ConsensusInfo,
+    #[cfg(feature = "full-node")]
+    history: Option<crate::node::replication::Network>,
+    #[cfg(feature = "full-node")]
+    runtime: Option<std::sync::Arc<crate::node::RuntimeGuard>>,
+}
+
+#[derive(Clone)]
+enum TransactionIngress {
+    #[cfg(feature = "validator")]
+    Mempool(Mempool),
+    #[cfg(feature = "full-node")]
+    Validators(std::sync::Arc<[String]>),
 }
 
 impl LocalLightClient {
+    #[cfg(feature = "validator")]
     pub fn new(
         databases: UtxoDatabase<commonware_runtime::tokio::Context>,
         owner_index: OwnerIndex,
@@ -48,15 +70,72 @@ impl LocalLightClient {
         Self {
             databases,
             owner_index,
-            mempool,
+            ingress: TransactionIngress::Mempool(mempool),
+            #[cfg(feature = "full-node")]
+            readiness: None,
             chain_indexer,
             consensus_info,
+            #[cfg(feature = "full-node")]
+            runtime: None,
+            #[cfg(feature = "full-node")]
+            history: None,
         }
     }
 
+    #[cfg(feature = "full-node")]
+    pub(crate) fn full_node(
+        databases: UtxoDatabase<commonware_runtime::tokio::Context>,
+        owner_index: OwnerIndex,
+        chain_indexer: ChainIndexer,
+        consensus_info: ConsensusInfo,
+        validators: Vec<String>,
+        readiness: std::sync::Arc<crate::node::Readiness>,
+    ) -> Self {
+        Self {
+            databases,
+            owner_index,
+            chain_indexer,
+            consensus_info,
+            ingress: TransactionIngress::Validators(validators.into()),
+            readiness: Some(readiness),
+            runtime: None,
+            #[cfg(feature = "full-node")]
+            history: None,
+        }
+    }
+
+    #[cfg(feature = "full-node")]
+    pub(crate) fn retain_node(
+        mut self,
+        runtime: std::sync::Arc<crate::node::RuntimeGuard>,
+        history: crate::node::replication::Network,
+    ) -> Self {
+        self.runtime = Some(runtime);
+        self.history = Some(history);
+        self
+    }
+
+    fn require_ready(&self) -> Result<(), QueryError> {
+        #[cfg(feature = "full-node")]
+        if let Some(readiness) = &self.readiness {
+            readiness.check()?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "validator")]
+    fn mempool(&self) -> &Mempool {
+        match &self.ingress {
+            TransactionIngress::Mempool(pool) => pool,
+            #[cfg(feature = "full-node")]
+            TransactionIngress::Validators(_) => unreachable!("full nodes forward submissions"),
+        }
+    }
+
+    #[cfg(feature = "validator")]
     async fn submit_general(&self, tx: Transaction) -> SubmitTxOutcome {
         let entry = MempoolEntry::new(tx);
-        let mut mempool = self.mempool.inner.lock().await;
+        let mut mempool = self.mempool().inner.lock().await;
         if mempool
             .general
             .iter()
@@ -71,6 +150,7 @@ impl LocalLightClient {
         SubmitTxOutcome::Enqueued
     }
 
+    #[cfg(feature = "validator")]
     async fn submit_response(
         &self,
         response: PaymentCloseResponse,
@@ -186,7 +266,7 @@ impl LocalLightClient {
 
         // Serialize the sweep and insertion only after the newcomer has
         // authenticated. Residents are still judged against the same reader.
-        let mut mempool = self.mempool.inner.lock().await;
+        let mut mempool = self.mempool().inner.lock().await;
         let residents: Vec<PaymentCloseResponse> = mempool
             .responses
             .values()
@@ -258,6 +338,7 @@ impl LocalLightClient {
     }
 }
 
+#[cfg(feature = "validator")]
 fn payment_close_response(transaction: &Transaction) -> Option<&PaymentCloseResponse> {
     let Transaction::Kernel(hellas_kernel::Tx::Move {
         action: hellas_kernel::Move::RespondPaymentClose(response),
@@ -268,12 +349,14 @@ fn payment_close_response(transaction: &Transaction) -> Option<&PaymentCloseResp
     Some(response)
 }
 
+#[cfg(feature = "validator")]
 #[derive(Default)]
 struct ResponseAdmissionBatch {
     edges: BTreeMap<EdgeId, Edge>,
     registry: BTreeMap<RegistryChunkId, RegistryChunk>,
 }
 
+#[cfg(feature = "validator")]
 impl KernelBatch for ResponseAdmissionBatch {
     fn coin(&self, _id: CoinId) -> Option<KernelCoin> {
         None
@@ -309,6 +392,7 @@ impl KernelBatch for ResponseAdmissionBatch {
     fn commit(self) {}
 }
 
+#[cfg(all(test, feature = "validator"))]
 fn owner_lookup_error(error: OwnerIndexError) -> QueryError {
     match error {
         OwnerIndexError::WrongObjectKind {
@@ -381,6 +465,7 @@ async fn get_edge_at(
     Ok(Some(EdgeLookup { state_root, edge }))
 }
 
+#[cfg(all(test, feature = "validator"))]
 async fn get_coin_at(
     owner_index: &OwnerIndex,
     chain_indexer: &ChainIndexer,
@@ -530,6 +615,7 @@ impl FinalizedWorkView for LocalLightClient {
         &self,
         query: WorkChannelQuery,
     ) -> Result<Option<WorkChannelSnapshot>, QueryError> {
+        self.require_ready()?;
         // The registry slots are keyed by network, so a node whose
         // genesis names an id the kernel cannot carry cannot derive
         // them. Answering with slots derived from some other id would
@@ -553,6 +639,7 @@ impl FinalizedWorkView for LocalLightClient {
 
 impl LightClient for LocalLightClient {
     async fn get_state_root(&self) -> Result<Option<Digest>, QueryError> {
+        self.require_ready()?;
         Ok(Some(self.databases.read().await.root()))
     }
 
@@ -568,7 +655,28 @@ impl LightClient for LocalLightClient {
         payload: Digest,
         object_id: ObjectId,
     ) -> Result<Option<Coin>, QueryError> {
-        get_coin_at(&self.owner_index, &self.chain_indexer, payload, object_id).await
+        self.require_ready()?;
+        let floor = finalized_floor_height(&self.chain_indexer, payload).await?;
+        let reader = self.databases.read().await;
+        let cursor = self.owner_index.cursor();
+        require_finalized_floor(floor, cursor.height)?;
+        if reader.root() != cursor.state_root {
+            return Err(QueryError::StateUnavailable(
+                "finalized state is being published".into(),
+            ));
+        }
+        match reader
+            .get(&object_id)
+            .await
+            .map_err(|e| QueryError::StateUnavailable(format!("{e:?}")))?
+        {
+            Some(Object::Coin(coin)) => Ok(Some(coin)),
+            None => Ok(None),
+            Some(object) => Err(QueryError::WrongObjectKind {
+                expected: ObjectKind::Coin,
+                actual: object.kind(),
+            }),
+        }
     }
 
     async fn get_edge(
@@ -576,6 +684,7 @@ impl LightClient for LocalLightClient {
         payload: Digest,
         object_id: ObjectId,
     ) -> Result<Option<EdgeLookup>, QueryError> {
+        self.require_ready()?;
         get_edge_at(
             &self.databases,
             &self.owner_index,
@@ -587,10 +696,15 @@ impl LightClient for LocalLightClient {
     }
 
     async fn get_finalization(&self, payload: Digest) -> Result<Option<Vec<u8>>, QueryError> {
+        #[cfg(feature = "full-node")]
+        if let Some(readiness) = &self.readiness {
+            readiness.running()?;
+        }
         self.chain_indexer.get_finalization(payload).await
     }
 
     async fn get_latest_block(&self) -> Result<Option<LatestBlock>, QueryError> {
+        self.require_ready()?;
         self.chain_indexer.get_latest_block().await
     }
 
@@ -598,23 +712,80 @@ impl LightClient for LocalLightClient {
         &self,
         query: FinalizedBlockQuery,
     ) -> Result<Option<FinalizedBlock>, QueryError> {
-        self.chain_indexer.get_finalized_block(query).await
+        #[cfg(feature = "full-node")]
+        if let Some(readiness) = &self.readiness {
+            readiness.running()?;
+        }
+        let block = self.chain_indexer.get_finalized_block(query).await?;
+        #[cfg(feature = "full-node")]
+        if block.is_none()
+            && let FinalizedBlockQuery::Height(height) = query
+            && let Some(history) = &self.history
+        {
+            if height > self.owner_index.cursor().height {
+                return Err(QueryError::StateUnavailable(
+                    "requested block is not locally executed".into(),
+                ));
+            }
+            return history
+                .fetch(FinalizedBlockQuery::Height(height))
+                .await
+                .ok_or_else(|| {
+                    QueryError::StateUnavailable(
+                        "no peer retains the required finalized block".into(),
+                    )
+                })
+                .map(Some);
+        }
+        Ok(block)
     }
 
-    async fn submit_tx(&self, tx: Transaction) -> Result<SubmitTxOutcome, QueryError> {
-        if crate::light_client::canonical_submission_size(&tx)
-            > crate::MAX_CANONICAL_TRANSACTION_BYTES
-        {
-            return Err(QueryError::InvalidTransaction(format!(
-                "canonical transaction exceeds {} bytes",
-                crate::MAX_CANONICAL_TRANSACTION_BYTES,
-            )));
-        }
-        if let Some(response) = payment_close_response(&tx).copied() {
-            self.submit_response(response).await
-        } else {
-            Ok(self.submit_general(tx).await)
-        }
+    fn submit_tx(
+        &self,
+        tx: Transaction,
+    ) -> impl std::future::Future<Output = Result<SubmitTxOutcome, QueryError>> + Send {
+        // Keep transport establishment and validator execution frames off the
+        // caller's stack; setup and close drivers compose this future deeply.
+        Box::pin(async move {
+            if crate::light_client::canonical_submission_size(&tx)
+                > crate::MAX_CANONICAL_TRANSACTION_BYTES
+            {
+                return Err(QueryError::InvalidTransaction(format!(
+                    "canonical transaction exceeds {} bytes",
+                    crate::MAX_CANONICAL_TRANSACTION_BYTES,
+                )));
+            }
+            match &self.ingress {
+                #[cfg(feature = "validator")]
+                TransactionIngress::Mempool(_) => {
+                    if let Some(response) = payment_close_response(&tx).copied() {
+                        self.submit_response(response).await
+                    } else {
+                        Ok(self.submit_general(tx).await)
+                    }
+                }
+                #[cfg(feature = "full-node")]
+                TransactionIngress::Validators(validators) => {
+                    let mut error = QueryError::Connect("no validator seed is reachable".into());
+                    for address in validators.iter() {
+                        let result =
+                            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                                crate::client::RemoteLightClient::connect(address.clone())
+                                    .await?
+                                    .submit_tx(tx.clone())
+                                    .await
+                            })
+                            .await;
+                        match result {
+                            Ok(Ok(outcome)) => return Ok(outcome),
+                            Ok(Err(failure)) => error = failure,
+                            Err(_) => {}
+                        }
+                    }
+                    Err(error)
+                }
+            }
+        })
     }
 
     async fn get_validators(&self) -> Result<Vec<String>, QueryError> {
@@ -629,23 +800,16 @@ impl LightClient for LocalLightClient {
         &self,
         owner: SettlementKey,
     ) -> Result<Option<OwnerCoins>, QueryError> {
-        let (cursor, coins) = self.owner_index.get_coins_by_owner_snapshot(&owner);
-        if cursor.height == 0 {
-            return Ok(None);
-        }
-        let Some(finalization) = self.chain_indexer.get_finalization(cursor.payload).await? else {
-            return Err(QueryError::StateUnavailable(
-                "owner index cursor finalization is unavailable".to_string(),
-            ));
-        };
-        Ok(Some(OwnerCoins {
-            snapshot: LatestBlock {
-                height: cursor.height,
-                payload: cursor.payload,
-                state_root: cursor.state_root,
-                finalization,
-            },
-            coins,
+        let (snapshot, holdings) = self.owner_objects(owner).await?;
+        Ok(snapshot.map(|snapshot| OwnerCoins {
+            snapshot,
+            coins: holdings
+                .into_iter()
+                .filter_map(|(id, object)| match object {
+                    Object::Coin(coin) => Some((id, coin.value)),
+                    _ => None,
+                })
+                .collect(),
         }))
     }
 
@@ -653,33 +817,83 @@ impl LightClient for LocalLightClient {
         &self,
         owner: SettlementKey,
     ) -> Result<Option<OwnerEdges>, QueryError> {
-        let (cursor, edges) = self.owner_index.get_edges_by_owner_snapshot(&owner);
-        if cursor.height == 0 {
-            return Ok(None);
-        }
-        let Some(finalization) = self.chain_indexer.get_finalization(cursor.payload).await? else {
-            return Err(QueryError::StateUnavailable(
-                "owner index cursor finalization is unavailable".to_string(),
-            ));
-        };
-        Ok(Some(OwnerEdges {
-            snapshot: LatestBlock {
-                height: cursor.height,
-                payload: cursor.payload,
-                state_root: cursor.state_root,
-                finalization,
-            },
-            edges: edges
+        let (snapshot, holdings) = self.owner_objects(owner).await?;
+        Ok(snapshot.map(|snapshot| OwnerEdges {
+            snapshot,
+            edges: holdings
                 .into_iter()
-                .map(|(object_id, edge)| EdgeRecord {
-                    object_id,
-                    maker: edge.maker,
-                    taker: edge.taker,
+                .filter_map(|(object_id, object)| match object {
+                    Object::Edge(edge) => Some(EdgeRecord {
+                        object_id,
+                        maker: edge.parties().maker().into(),
+                        taker: edge.parties().taker().into(),
+                    }),
+                    _ => None,
                 })
                 .collect(),
         }))
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "validator"))]
 mod tests;
+
+impl LocalLightClient {
+    async fn owner_objects(
+        &self,
+        owner: SettlementKey,
+    ) -> Result<(Option<LatestBlock>, Vec<(ObjectId, Object)>), QueryError> {
+        self.require_ready()?;
+        let reader = self.databases.read().await;
+        let cursor = self.owner_index.cursor();
+        if cursor.height == 0 {
+            return Ok((None, vec![]));
+        }
+        if reader.root() != cursor.state_root {
+            return Err(QueryError::StateUnavailable(
+                "finalized state is being published".into(),
+            ));
+        }
+        let finalization = self
+            .chain_indexer
+            .get_finalization(cursor.payload)
+            .await?
+            .ok_or_else(|| QueryError::StateUnavailable("finalization is unavailable".into()))?;
+        let mut objects = Vec::new();
+        let mut offset = 0;
+        loop {
+            let page = crate::execution::owner_tree::prove_stored_owner_page(
+                &reader,
+                owner,
+                offset,
+                crate::owner_proof::OWNER_PAGE_LIMIT,
+            )
+            .await
+            .map_err(|e| QueryError::StateUnavailable(e.to_string()))?;
+            for holding in &page.holdings {
+                let id = Digest::from(holding.object_id);
+                let object = reader
+                    .get(&id)
+                    .await
+                    .map_err(|e| QueryError::StateUnavailable(format!("{e:?}")))?
+                    .ok_or_else(|| {
+                        QueryError::StateUnavailable("owner holding has no object".into())
+                    })?;
+                objects.push((id, object));
+            }
+            if page.holdings.len() < crate::owner_proof::OWNER_PAGE_LIMIT as usize {
+                break;
+            }
+            offset += page.holdings.len() as u64;
+        }
+        Ok((
+            Some(LatestBlock {
+                height: cursor.height,
+                payload: cursor.payload,
+                state_root: cursor.state_root,
+                finalization,
+            }),
+            objects,
+        ))
+    }
+}

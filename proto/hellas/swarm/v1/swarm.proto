@@ -23,6 +23,8 @@ message GetNodeInfoResponse {
   string os = 5;
   // Operator-chosen tag, exactly 16 bytes. Self-reported; treat as untrusted.
   bytes graffiti = 6;
+  // Service ALPNs served by this endpoint. Self-reported; verify on connection.
+  repeated string service_alpns = 7;
 }
 
 message GetKnownPeersRequest {

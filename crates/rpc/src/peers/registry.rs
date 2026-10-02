@@ -116,6 +116,9 @@ pub enum PeerEvent {
         label: String,
     },
     Forgotten,
+    Blocked {
+        until_ms: u64,
+    },
 }
 
 /// Coarse change summary returned from registry mutations.
@@ -221,6 +224,8 @@ pub struct PeerEntry {
     pub rtt: EwmaLatency,
     pub success_count: u64,
     pub in_flight: usize,
+    /// Invalid authenticated deliveries quarantine this peer until this monotonic deadline.
+    pub blocked_until_ms: u64,
     /// Set by `PeerEvent::Forgotten` when the peer still has outstanding
     /// permits. The entry is excluded from public queries (`get`, `iter`,
     /// `with_service`) but stays in the underlying map so the `release`
@@ -245,6 +250,7 @@ impl PeerEntry {
             },
             success_count: 0,
             in_flight: 0,
+            blocked_until_ms: 0,
             tombstoned: false,
             bucket: TokenBucket::new(now_ms, bucket_capacity),
         }
@@ -579,6 +585,9 @@ impl PeerRegistry {
             PeerEvent::LabelSet { label } => {
                 entry.label = Some(truncate_string(label, max_label_len));
             }
+            PeerEvent::Blocked { until_ms } => {
+                entry.blocked_until_ms = entry.blocked_until_ms.max(until_ms);
+            }
             PeerEvent::Forgotten => unreachable!("forgotten events are handled before insert"),
         }
 
@@ -616,6 +625,13 @@ impl PeerRegistry {
                 max_peers: self.config.max_peers,
             });
         };
+
+        if entry.blocked_until_ms > now_ms {
+            return Err(AcquireDenied::RateLimited {
+                peer,
+                retry_after_ms: Some(entry.blocked_until_ms - now_ms),
+            });
+        }
 
         if entry.in_flight >= self.config.max_in_flight_per_peer {
             return Err(AcquireDenied::InFlightPeer {
@@ -708,7 +724,7 @@ impl PeerRegistry {
         }
 
         let evicted = if self.peers.len() >= self.config.max_peers {
-            let Some(evicted) = self.eviction_candidate() else {
+            let Some(evicted) = self.eviction_candidate(now_ms) else {
                 return Err(());
             };
             self.peers.remove(&evicted);
@@ -729,10 +745,10 @@ impl PeerRegistry {
         Ok((true, evicted))
     }
 
-    fn eviction_candidate(&self) -> Option<PeerId> {
+    fn eviction_candidate(&self, now_ms: u64) -> Option<PeerId> {
         self.peers
             .iter()
-            .filter(|(_, peer)| peer.in_flight == 0)
+            .filter(|(_, peer)| peer.in_flight == 0 && peer.blocked_until_ms <= now_ms)
             .min_by_key(|(_, peer)| peer.eviction_key())
             .map(|(id, _)| *id)
     }

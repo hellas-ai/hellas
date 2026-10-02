@@ -66,6 +66,9 @@ impl GrantStore {
         }
         let mut store = Self { journal, state };
         let now = now.max(store.state.now());
+        if let Ok(owner) = Principal::verify(provider) {
+            store.bind_owner(owner, now)?;
+        }
         // Never rerun after opening. This also makes reopening idempotent if a
         // process crashed while recording recovery itself.
         let pending: Vec<_> = store
@@ -504,7 +507,7 @@ impl GrantStore {
         self.journal.rotate(&encode(&self.state.snapshot())?)?;
         Ok(())
     }
-    fn commit(
+    pub(super) fn commit(
         &mut self,
         now: UnixMillis,
         change: Change,

@@ -17,7 +17,7 @@ use hellas_rpc::pb::swarm::{
 };
 use hellas_rpc::peers::{PeerDirectory, PeerId};
 use hellas_rpc::services::node::NodeHandler;
-use hellas_wire::{WireCode, WireStatus};
+use hellas_wire::{ServiceMarker, WireCode, WireStatus};
 use iroh::EndpointId;
 
 #[derive(Clone)]
@@ -29,6 +29,8 @@ pub struct NodeHandlerImpl {
     pub os: Arc<str>,
     pub graffiti: Arc<[u8]>,
     pub directory: Arc<PeerDirectory>,
+    pub service_alpns: Vec<String>,
+    pub chain: Option<hellas_sdk::FullNode>,
 }
 
 impl NodeHandlerImpl {
@@ -50,6 +52,8 @@ impl NodeHandlerImpl {
             )),
             graffiti: Arc::from(graffiti),
             directory,
+            service_alpns: vec![hellas_rpc::services::node::Node::ALPN.into()],
+            chain: None,
         }
     }
 }
@@ -67,6 +71,7 @@ impl NodeHandler for NodeHandlerImpl {
             build: self.build.as_ref().to_string(),
             os: self.os.as_ref().to_string(),
             graffiti: self.graffiti.as_ref().to_vec(),
+            service_alpns: self.service_alpns.clone(),
         }))
     }
 
@@ -78,6 +83,17 @@ impl NodeHandler for NodeHandlerImpl {
         // disclosure policy remains the gate for anonymous requesters.
         let requester = PeerId::default();
         const DISCLOSURE_LIMIT: usize = 64;
+        if request.service_alpn == hellas_rpc::services::chain_sync::ChainSync::ALPN
+            && let Some(chain) = &self.chain
+        {
+            return Ok(WithTrailer::new(GetKnownPeersResponse {
+                peer_ids: chain
+                    .peer_ids()
+                    .iter()
+                    .map(|id| id.as_bytes().to_vec())
+                    .collect(),
+            }));
+        }
         let peers = self
             .directory
             .known_peers(requester, &request.service_alpn, DISCLOSURE_LIMIT)
