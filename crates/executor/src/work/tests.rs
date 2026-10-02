@@ -68,9 +68,11 @@ fn outcome_items(events: Vec<Result<WorkEvent, hellas_wire::WireStatus>>) -> Exe
         }
     }
     drop(sender);
+    let (complete, completion) = tokio::sync::oneshot::channel();
+    complete.send(()).unwrap();
     ExecuteOutcome {
         events: receiver,
-        completion: None,
+        completion,
     }
 }
 
@@ -243,7 +245,7 @@ async fn consumer_failure_waits_for_physical_worker_completion() {
         "fixture stream failure",
     ))]);
     let (complete, completion) = tokio::sync::oneshot::channel();
-    outcome.completion = Some(completion);
+    outcome.completion = completion;
     let mut task = tokio::spawn(super::drain_until_terminated(outcome, None));
     assert!(
         tokio::time::timeout(std::time::Duration::from_millis(10), &mut task)
@@ -252,4 +254,15 @@ async fn consumer_failure_waits_for_physical_worker_completion() {
     );
     drop(complete);
     assert!(task.await.unwrap().is_err());
+}
+
+#[tokio::test]
+async fn a_terminal_transcript_still_requires_worker_completion() {
+    let expected = transcript();
+    let mut execution = outcome(vec![chunk(), finished(&expected)]);
+    execution.completion = tokio::sync::oneshot::channel().1;
+    assert!(matches!(
+        super::drain_until_terminated(execution, None).await,
+        Err(ExecutorError::Completion(_))
+    ));
 }

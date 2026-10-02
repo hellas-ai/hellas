@@ -455,6 +455,13 @@ impl CountingBackend {
 }
 
 impl WorkBackend for CountingBackend {
+    fn try_admit(
+        &self,
+        domain: hellas_work::work::admission::CapacityDomain,
+    ) -> Result<hellas_work::work::admission::WorkPermit, hellas_work::work::BackendFault> {
+        Err(hellas_work::work::admission::AdmissionError::Unsupported(domain).into())
+    }
+
     fn evaluate(
         &self,
         input: PreparedEvaluateInput,
@@ -472,7 +479,12 @@ impl WorkBackend for CountingBackend {
                 &[&ANSWER[..2], &ANSWER[2..]],
                 &producer(byte),
             )),
-            Answer::Fault(reason) => Err(BackendFault::new(reason)),
+            Answer::Fault(reason) => {
+                #[derive(Debug, thiserror::Error)]
+                #[error("{0}")]
+                struct InjectedFault(&'static str);
+                Err(BackendFault::caused_by(InjectedFault(reason)))
+            }
         };
         async move { produced }
     }

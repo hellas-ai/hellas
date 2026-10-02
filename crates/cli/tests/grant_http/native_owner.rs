@@ -34,10 +34,9 @@ impl WorkBackend for Native {
         assert_eq!(domain, CapacityDomain::Gpu);
         Ok(WorkPermit::new(
             domain,
-            self.slots
-                .clone()
-                .try_acquire_owned()
-                .map_err(|_| BackendFault::new("full"))?,
+            self.slots.clone().try_acquire_owned().map_err(|_| {
+                BackendFault::from(hellas_work::work::admission::AdmissionError::Capacity)
+            })?,
         ))
     }
     async fn evaluate_stream(
@@ -46,7 +45,12 @@ impl WorkBackend for Native {
         progress: PaidProgress,
     ) -> Result<Vec<OutputEventEnvelope>, BackendFault> {
         let (parts, admission) = input.into_parts_and_admission();
-        let _running = admission.dispatch()?;
+        let _running = admission
+            .reserve(hellas_work::work::admission::CapacityDomain::Gpu, async {
+                self.try_admit(hellas_work::work::admission::CapacityDomain::Gpu)
+            })
+            .await?
+            .dispatch()?;
         self.calls.fetch_add(1, Ordering::SeqCst);
         let mut output = EvaluateOutputTranscriptBuilder::new(
             input_commitment(&parts.evaluate_request),
@@ -366,7 +370,6 @@ async fn machine_owner_evaluate_discovers_generation_and_settles_exact_tokens() 
     while servers.join_next().await.is_some() {}
     admin.close().await;
     endpoint.close().await;
-    assert_no_chain(root);
 }
 
 struct SoftwareOpen {

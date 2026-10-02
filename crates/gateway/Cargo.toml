@@ -23,7 +23,6 @@ evaluate = [
 ]
 
 [dependencies]
-anyhow = { workspace = true }
 async-stream = { workspace = true }
 axum = { workspace = true }
 base64.workspace = true
@@ -52,6 +51,7 @@ tokio.workspace = true
 tower = { version = "0.5", default-features = false, features = ["util"] }
 tracing.workspace = true
 tracing-opentelemetry = { workspace = true, optional = true }
+url = "2"
 zstd = "0.13"
 
 [dev-dependencies]

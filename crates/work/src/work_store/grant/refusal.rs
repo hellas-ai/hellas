@@ -36,7 +36,10 @@ impl From<&GrantStoreError> for WorkRefused {
     fn from(error: &GrantStoreError) -> Self {
         use GrantRefusalCode as C;
         let code = match error {
-            GrantStoreError::Journal(_) | GrantStoreError::Unavailable => C::StorageUnavailable,
+            GrantStoreError::Journal(_)
+            | GrantStoreError::WriterPoisoned
+            | GrantStoreError::Completion(_)
+            | GrantStoreError::Task(_) => C::StorageUnavailable,
             GrantStoreError::Grant(error) => match error {
                 GrantError::Unauthorized | GrantError::Signature | GrantError::Audience => {
                     C::Unauthorized

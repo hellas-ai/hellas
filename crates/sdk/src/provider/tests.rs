@@ -95,7 +95,7 @@ async fn provider_advertises_only_work_protocols() {
             connection.close(0u32.into(), b"tested");
         }
         client.close().await;
-        provider.shutdown().await;
+        provider.shutdown().await.unwrap();
     })
     .await
     .expect("paid provider protocol negotiation completes");

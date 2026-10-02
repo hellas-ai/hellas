@@ -11,6 +11,16 @@ use hellas_rpc::{
 pub type PaidProgress = Arc<dyn Fn(OutputEventEnvelope) -> Result<(), BackendFault> + Send + Sync>;
 pub type PaidResultStream = BoxStream<'static, Result<WorkStreamEvent, WireStatus>>;
 
+#[derive(Debug, thiserror::Error)]
+pub enum ProgressError {
+    #[error("channel has no execution policy")]
+    NoPolicy,
+    #[error("live result exceeds its authorized spool")]
+    SpoolBound,
+    #[error("progress state lock is poisoned")]
+    Poisoned,
+}
+
 #[derive(Debug, Default)]
 pub(super) struct Progress {
     events: Vec<OutputEventEnvelope>,
@@ -144,10 +154,10 @@ impl WorkService {
     ) -> Result<(), BackendFault> {
         let policy = self
             .endpoint()
-            .map_err(|error| BackendFault::new(error.to_string()))?
+            .map_err(BackendFault::caused_by)?
             .ready
             .as_ref()
-            .ok_or_else(|| BackendFault::new("channel has no execution policy"))?
+            .ok_or_else(|| BackendFault::caused_by(ProgressError::NoPolicy))?
             .work_policy()
             .clone();
         let limit = match &policy {
@@ -156,16 +166,17 @@ impl WorkService {
                 .min(MAX_FETCH_TRANSCRIPT_BYTES as u64),
             WorkPolicy::Evaluate(_) => policy.max_spool_bytes(),
         };
-        let mut jobs = self.progress.lock().expect("paid progress poisoned");
+        let mut jobs = self
+            .progress
+            .lock()
+            .map_err(|_| BackendFault::caused_by(ProgressError::Poisoned))?;
         let progress = jobs.entry(work_id).or_default();
         // Signed prefixes are bounded by the same spool as final delivery.
         let fetch = matches!(policy, WorkPolicy::Fetch { .. });
         let bytes = spool_charge(&event, fetch);
         let retained = progress.bytes.saturating_add(bytes);
         if retained as u64 > limit {
-            return Err(BackendFault::new(
-                "live result exceeds its authorized spool",
-            ));
+            return Err(BackendFault::caused_by(ProgressError::SpoolBound));
         }
         progress.bytes = retained;
         progress.events.push(event);

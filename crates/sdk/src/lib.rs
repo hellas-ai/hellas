@@ -19,12 +19,10 @@ pub use hellas_client as client;
 pub use iroh;
 #[cfg(feature = "client")]
 mod remote;
-#[cfg(all(feature = "gateway", not(feature = "grant-gateway")))]
+#[cfg(feature = "gateway")]
 pub use hellas_gateway as gateway;
-#[cfg(feature = "grant-gateway")]
-pub mod gateway;
 #[cfg(feature = "grant-provider")]
-mod grant_provider;
+pub mod grant_provider;
 #[cfg(any(feature = "paid-provider", feature = "grant-provider"))]
 mod provider;
 #[cfg(feature = "grant-provider")]
@@ -54,15 +52,17 @@ pub mod local {
 
 #[cfg(feature = "paid-provider")]
 pub mod paid_provider;
-#[cfg(feature = "work")]
+#[cfg(feature = "paid-work")]
 pub mod work_config;
+#[cfg(any(feature = "paid-provider", feature = "grant-provider"))]
+pub mod work_router;
 
 #[cfg(feature = "paid-client")]
 pub mod paid_client;
 #[cfg(any(feature = "paid-client", feature = "grant-client"))]
 mod work_link;
 
-#[cfg(feature = "work")]
+#[cfg(feature = "paid-work")]
 pub mod work_provision;
 
 #[cfg(all(test, any(feature = "paid-client", feature = "paid-provider")))]
@@ -73,10 +73,6 @@ pub mod paid_gateway;
 
 #[cfg(feature = "grant-client")]
 pub mod grant_client;
-#[cfg(any(feature = "grant-client", feature = "paid-client"))]
-pub mod work_session;
-#[cfg(any(feature = "grant-client", feature = "paid-client"))]
-pub use work_session::WorkSession;
 
 #[cfg(feature = "grant-admin")]
 pub mod grant_admin;
@@ -87,3 +83,18 @@ pub mod grant_config;
 mod gateway_work;
 #[cfg(feature = "grant-gateway")]
 pub mod grant_gateway;
+
+#[cfg(feature = "work")]
+mod resource_config;
+#[cfg(feature = "work")]
+pub use resource_config::ResourceConfigError;
+
+#[cfg(all(
+    test,
+    any(
+        feature = "paid-client",
+        feature = "grant-admin",
+        feature = "grant-provider"
+    )
+))]
+mod test_identity;

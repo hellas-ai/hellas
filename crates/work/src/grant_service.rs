@@ -7,20 +7,38 @@ use crate::work::{
 };
 use crate::work_store::{
     JobPhase,
-    grant::{refusal::refused, *},
+    grant::{
+        GrantConnection, GrantOutcome, GrantStore, GrantStoreError, GrantTerminal, SignedResult,
+        refusal::refused,
+    },
 };
-use futures::future::BoxFuture;
-use hellas_rpc::pb::work::*;
+use futures::{FutureExt, future::BoxFuture};
+use hellas_rpc::pb::work::{
+    AcceptWorkRequest, AcceptWorkResponse, AdmitCertificateRequest, AdmitCertificateResponse,
+    DeliverResultRequest, DeliverResultResponse, GetStandingRequest, GetStandingResponse,
+    GrantRefusalCode, GrantTerminalMetadata, GrantTerminalState, WorkAccepted, WorkDelivered,
+    WorkRefused, WorkRoute, WorkStreamEvent, WorkStreamTerminal, accept_work_response,
+    admit_certificate_response, deliver_result_response, get_standing_response, work_stream_event,
+};
 use hellas_rpc::protocol::work::{
     PrivateRecord, bound_delivery_request_digest, bound_result_digest, encode_transcript,
 };
-use hellas_rpc::protocol::work_grant::{budget::*, records::*, standing::*, *};
+use hellas_rpc::protocol::work_grant::{
+    ChannelId, GrantId, GrantJobAuthorizationV1, Revision, UnixMillis,
+    budget::Usage,
+    grant_work_id,
+    records::{GrantDef, GrantError, GrantKind, GrantPolicy, GrantState},
+    standing::{StandingLocator, StandingQuery},
+};
 use hellas_rpc::protocol::work_profile::{PreparedWorkInput, WorkContext};
 use hellas_rpc::{Digest, OutputEventEnvelope, ProducerSigningKey, PublicKey, Signature};
 use hellas_wire::{TransportContext, WireStatus};
 use std::{
     collections::BTreeMap,
+    future::Future,
+    pin::Pin,
     sync::{Arc, Mutex},
+    task::Poll,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::Notify;
@@ -52,14 +70,15 @@ pub struct GrantService {
     admit: Arc<Admit>,
     run: Arc<Run>,
     changed: Arc<Notify>,
+    draining: Arc<tokio::sync::Mutex<()>>,
     clock: GrantClock,
     addresses: Arc<Vec<String>>,
 }
 struct Runtime {
     store: GrantStore,
     live: BTreeMap<Digest, Live>,
-    stopping: bool,
-    failed: bool,
+    status: ServiceStatus,
+    tasks: BTreeMap<Digest, tokio::task::JoinHandle<()>>,
 }
 struct Live {
     authorization: GrantJobAuthorizationV1,
@@ -67,11 +86,106 @@ struct Live {
     events: Vec<OutputEventEnvelope>,
     bytes: usize,
     reserved_ram: usize,
-    active: bool,
-    started: Option<Instant>,
-    result: Option<SignedResult>,
-    refusal: Option<GrantRefusalCode>,
+    phase: LivePhase,
 }
+enum ServiceStatus {
+    Serving,
+    Draining,
+    Stopped,
+    Failed(Arc<GrantStoreError>),
+}
+impl ServiceStatus {
+    fn check(&self) -> Result<(), GrantStoreError> {
+        match self {
+            Self::Failed(source) => Err(GrantStoreError::Completion(source.clone())),
+            _ => Ok(()),
+        }
+    }
+}
+impl Runtime {
+    fn fail(&mut self, error: GrantStoreError) {
+        if !matches!(self.status, ServiceStatus::Failed(_)) {
+            self.status = ServiceStatus::Failed(Arc::new(error));
+        }
+    }
+    fn reap(&mut self) {
+        let mut failure = None;
+        self.tasks.retain(|_, task| {
+            if !task.is_finished() {
+                return true;
+            }
+            match task.now_or_never() {
+                Some(Ok(())) => false,
+                Some(Err(error)) => {
+                    failure = Some(error);
+                    false
+                }
+                None => true,
+            }
+        });
+        if let Some(error) = failure {
+            self.fail(error.into());
+        }
+    }
+}
+enum LivePhase {
+    Queued,
+    Running { started: Instant },
+    Finished(SignedResult),
+    Refused(GrantRefusalCode),
+}
+impl LivePhase {
+    fn active(&self) -> bool {
+        matches!(self, Self::Queued | Self::Running { .. })
+    }
+    fn started(&self) -> Option<Instant> {
+        match self {
+            Self::Running { started } => Some(*started),
+            _ => None,
+        }
+    }
+    fn result(&self) -> Option<&SignedResult> {
+        match self {
+            Self::Finished(result) => Some(result),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+enum ExecutionError {
+    #[error("grant input does not match its execution policy")]
+    Profile,
+    #[error("grant is no longer dispatchable")]
+    NotDispatchable,
+    #[error("grant input is missing")]
+    MissingInput,
+    #[error("backend ran without dispatch admission")]
+    NotDispatched,
+    #[error("grant output exceeds its resource bound")]
+    OutputBound,
+    #[error("grant execution deadline passed")]
+    Deadline,
+    #[error("grant backend panicked; sensitive details suppressed")]
+    Panicked,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum CompletionError {
+    #[error(transparent)]
+    Backend(#[from] BackendFault),
+    #[error("backend transcript differs from the streamed prefix")]
+    Prefix,
+    #[error("backend transcript exceeds the signed spool bound")]
+    Spool,
+    #[error(transparent)]
+    Grant(#[from] GrantError),
+    #[error(transparent)]
+    Transcript(#[from] hellas_rpc::protocol::work::PaidWorkError),
+    #[error(transparent)]
+    Signature(#[from] hellas_rpc::protocol::signature::SignatureError),
+}
+
 pub fn wall_clock() -> UnixMillis {
     UnixMillis(
         SystemTime::now()
@@ -104,9 +218,7 @@ impl GrantService {
                         backend
                             .evaluate_stream(
                                 PreparedEvaluateInput::admitted(
-                                    input
-                                        .parts()
-                                        .map_err(|e| BackendFault::new(e.to_string()))?,
+                                    input.parts().map_err(BackendFault::caused_by)?,
                                     admission,
                                 ),
                                 progress,
@@ -120,9 +232,7 @@ impl GrantService {
                         backend
                             .fetch_stream(
                                 PreparedFetchInput::admitted(
-                                    input
-                                        .parts()
-                                        .map_err(|e| BackendFault::new(e.to_string()))?,
+                                    input.parts().map_err(BackendFault::caused_by)?,
                                     policy,
                                     admission,
                                 ),
@@ -130,7 +240,7 @@ impl GrantService {
                             )
                             .await
                     }
-                    _ => Err(BackendFault::new("grant profile mismatch")),
+                    _ => Err(BackendFault::caused_by(ExecutionError::Profile)),
                 }
             }) as BoxFuture<'static, _>
         });
@@ -138,13 +248,14 @@ impl GrantService {
             inner: Arc::new(Mutex::new(Runtime {
                 store,
                 live: BTreeMap::new(),
-                stopping: false,
-                failed: false,
+                status: ServiceStatus::Serving,
+                tasks: BTreeMap::new(),
             })),
             signer,
             admit: Arc::new(move |domain| capacity.try_admit(domain)),
             run,
             changed: Arc::new(Notify::new()),
+            draining: Arc::new(tokio::sync::Mutex::new(())),
             clock,
             addresses: Arc::new(addresses),
         })
@@ -154,10 +265,11 @@ impl GrantService {
         &self,
         op: impl FnOnce(&mut GrantStore, UnixMillis) -> Result<T, GrantStoreError>,
     ) -> Result<T, GrantStoreError> {
-        let mut held = self.inner.lock().map_err(|_| GrantStoreError::Malformed)?;
-        if held.failed {
-            return Err(GrantStoreError::Unavailable);
-        }
+        let mut held = self
+            .inner
+            .lock()
+            .map_err(|_| GrantStoreError::WriterPoisoned)?;
+        held.status.check()?;
         let now = (self.clock)().max(held.store.state().now());
         let result = op(&mut held.store, now);
         drop(held);
@@ -236,6 +348,7 @@ impl GrantService {
             request.route.as_ref(),
             connection.peer,
         )?;
+        held.reap();
         let now = (self.clock)().max(held.store.state().now());
         let id = grant_work_id(held.store.state().network(), &a);
         if let Some(signature) = held
@@ -245,14 +358,12 @@ impl GrantService {
         {
             return Ok(accepted(id, signature));
         }
-        if held.failed {
-            return Err(refused(GrantRefusalCode::StorageUnavailable));
-        }
-        if held.stopping {
+        held.status.check().map_err(|e| WorkRefused::from(&e))?;
+        if !matches!(held.status, ServiceStatus::Serving) {
             return Err(refused(GrantRefusalCode::QueueCapacity));
         }
         held.live
-            .retain(|_, l| l.active || l.authorization.delivery_deadline_ms >= now);
+            .retain(|_, l| l.phase.active() || l.authorization.delivery_deadline_ms >= now);
         let policy = held
             .store
             .state()
@@ -297,13 +408,6 @@ impl GrantService {
             .store
             .accept(a, client_signature, &input, &self.signer, now)
             .map_err(|e| WorkRefused::from(&e))?;
-        let class = held
-            .store
-            .state()
-            .grant(a.grant_id)
-            .expect("accepted grant")
-            .kind
-            .class();
         held.live.insert(
             id,
             Live {
@@ -312,23 +416,19 @@ impl GrantService {
                 events: vec![],
                 bytes: 0,
                 reserved_ram: reserve,
-                active: true,
-                started: None,
-                result: None,
-                refusal: None,
+                phase: LivePhase::Queued,
             },
         );
-        drop(held);
         let service = self.clone();
         let admission = WorkAdmission::grant(
             permit,
-            class,
             deadline,
             Box::new(move || {
                 let mut held = service
                     .inner
                     .lock()
-                    .map_err(|_| BackendFault::new("grant writer unavailable"))?;
+                    .map_err(|_| BackendFault::caused_by(GrantStoreError::WriterPoisoned))?;
+                held.status.check().map_err(BackendFault::caused_by)?;
                 // Unlike idempotent journal replay, an invocation must consume the
                 // Accepted phase exactly once before any backend preparation.
                 let job = held
@@ -337,58 +437,65 @@ impl GrantService {
                     .channel(a.channel_id)
                     .and_then(|c| c.job_book().job_by_id(id));
                 if job.is_none_or(|j| j.phase() != JobPhase::Accepted) {
-                    return Err(BackendFault::new("grant is no longer dispatchable"));
+                    return Err(BackendFault::caused_by(ExecutionError::NotDispatchable));
                 }
                 let started = Instant::now();
                 held.store
                     .dispatch(a.channel_id, id, (service.clock)())
-                    .map_err(|e| BackendFault::new(e.to_string()))?;
+                    .map_err(BackendFault::caused_by)?;
                 held.live
                     .get_mut(&id)
-                    .ok_or_else(|| BackendFault::new("grant input missing"))?
-                    .started = Some(started);
+                    .ok_or_else(|| BackendFault::caused_by(ExecutionError::MissingInput))?
+                    .phase = LivePhase::Running { started };
                 Ok(())
             }),
         );
         let service = self.clone();
         let progress_service = self.clone();
         let progress = Arc::new(move |event| progress_service.progress(id, event));
-        tokio::spawn(async move {
-            let output = (service.run)(input.clone(), policy, admission, progress).await;
+        let task = tokio::spawn(async move {
+            let execution =
+                async { (service.run)(input.clone(), policy, admission, progress).await };
+            let output = std::panic::AssertUnwindSafe(execution)
+                .catch_unwind()
+                .await
+                .unwrap_or_else(|_| Err(BackendFault::caused_by(ExecutionError::Panicked)));
             if let Err(error) = service.finish(id, &input, output) {
                 tracing::error!(?id, %error, "grant completion could not be made durable");
                 if let Ok(mut held) = service.inner.lock() {
-                    held.failed = true;
+                    held.fail(error);
                     if let Some(live) = held.live.get_mut(&id) {
-                        live.active = false;
+                        live.phase = LivePhase::Refused(GrantRefusalCode::StorageUnavailable);
                     }
                 }
             }
             service.changed.notify_waiters();
         });
+        held.tasks.insert(id, task);
+        drop(held);
         Ok(accepted(id, signature))
     }
     fn progress(&self, id: Digest, event: OutputEventEnvelope) -> Result<(), BackendFault> {
         let mut held = self
             .inner
             .lock()
-            .map_err(|_| BackendFault::new("grant writer unavailable"))?;
+            .map_err(|_| BackendFault::caused_by(GrantStoreError::WriterPoisoned))?;
         let live = held
             .live
             .get_mut(&id)
-            .ok_or_else(|| BackendFault::new("grant input missing"))?;
-        if live.started.is_none() {
-            return Err(BackendFault::new("backend ran without dispatch admission"));
+            .ok_or_else(|| BackendFault::caused_by(ExecutionError::MissingInput))?;
+        if !matches!(live.phase, LivePhase::Running { .. }) {
+            return Err(BackendFault::caused_by(ExecutionError::NotDispatched));
         }
         let charge = event_ram(&event);
         let next = live.bytes.saturating_add(charge);
         if next as u64 > live.policy.work.max_spool_bytes()
             || charge as u64 > live.policy.work.max_encoded_result_frame() as u64
-            || (self.clock)() > live.authorization.terminal_deadline_ms
         {
-            return Err(BackendFault::new(
-                "grant output exceeds its resource or time bound",
-            ));
+            return Err(BackendFault::caused_by(ExecutionError::OutputBound));
+        }
+        if (self.clock)() > live.authorization.terminal_deadline_ms {
+            return Err(BackendFault::caused_by(ExecutionError::Deadline));
         }
         live.bytes = next;
         live.events.push(event);
@@ -402,7 +509,10 @@ impl GrantService {
         input: &PreparedWorkInput,
         output: Result<Vec<OutputEventEnvelope>, BackendFault>,
     ) -> Result<(), GrantStoreError> {
-        let mut held = self.inner.lock().map_err(|_| GrantStoreError::Malformed)?;
+        let mut held = self
+            .inner
+            .lock()
+            .map_err(|_| GrantStoreError::WriterPoisoned)?;
         let live = held.live.get(&id).ok_or(GrantError::Unauthorized)?;
         let a = live.authorization;
         let now = (self.clock)().max(held.store.state().now());
@@ -419,44 +529,22 @@ impl GrantService {
         let verified = if phase
             .is_some_and(|p| matches!(p, JobPhase::Running | JobPhase::Streaming))
         {
-            output
-                .ok()
-                .filter(|events| events.starts_with(&live.events))
-                .filter(|events| {
-                    transcript_ram(events) as u64 <= live.policy.work.max_spool_bytes()
-                })
-                .filter(|events| {
-                    encode_transcript(events)
-                        .is_ok_and(|bytes| bytes.len() as u64 <= live.policy.work.max_spool_bytes())
-                })
-                .and_then(|events| {
-                    let def = held.store.state().grant(a.grant_id)?;
-                    let context = WorkContext {
-                        network: held.store.state().network(),
-                        channel: a.channel_id.0,
-                        client: def.kind.principal().producer(),
-                        provider: held.store.state().provider().grant_producer().ok()?,
-                    };
-                    let result = live
-                        .policy
-                        .work
-                        .bound_terminal_result(&context, id, &(&a).into(), input, &events)
-                        .ok()?;
-                    let signature = self
-                        .signer
-                        .sign_digest(bound_result_digest(
-                            context.network,
-                            context.channel,
-                            &result,
-                        ))
-                        .ok()?;
-                    Some((events, SignedResult { result, signature }))
-                })
+            match self.verify_completion(&held, live, id, input, output) {
+                Ok(completion) => Some(completion),
+                Err(error) => {
+                    tracing::warn!(?id, %error, "grant execution did not produce a verified result");
+                    None
+                }
+            }
         } else {
             None
         };
         let usage = verified.as_ref().map_or(Usage::Unknown, |(events, _)| {
-            accounting::usage(&live.policy, events, live.started.map(|s| s.elapsed()))
+            accounting::usage(
+                &live.policy,
+                events,
+                live.phase.started().map(|s| s.elapsed()),
+            )
         });
         // Late output cannot satisfy the execution deadline, but verified usage
         // still settles at its observed value and must not fault a healthy route.
@@ -476,17 +564,17 @@ impl GrantService {
             )?;
         }
         let live = held.live.get_mut(&id).ok_or(GrantError::Unauthorized)?;
-        live.active = false;
         if let Some((events, signed)) = completion {
             live.bytes = transcript_ram(&events);
             live.events = events;
-            live.result = Some(signed);
+            live.phase = LivePhase::Finished(signed);
         } else {
-            live.refusal = Some(if phase == Some(JobPhase::Accepted) || phase.is_none() {
-                GrantRefusalCode::Released
-            } else {
-                GrantRefusalCode::Indeterminate
-            });
+            live.phase =
+                LivePhase::Refused(if phase == Some(JobPhase::Accepted) || phase.is_none() {
+                    GrantRefusalCode::Released
+                } else {
+                    GrantRefusalCode::Indeterminate
+                });
         }
         // Terminal output is immutable. Keep its actual retained charge, not
         // the worst-case spool reservation, through the delivery window.
@@ -502,6 +590,47 @@ impl GrantService {
             .saturating_add(live.bytes);
         Ok(())
     }
+    fn verify_completion(
+        &self,
+        held: &Runtime,
+        live: &Live,
+        id: Digest,
+        input: &PreparedWorkInput,
+        output: Result<Vec<OutputEventEnvelope>, BackendFault>,
+    ) -> Result<(Vec<OutputEventEnvelope>, SignedResult), CompletionError> {
+        let events = output?;
+        if !events.starts_with(&live.events) {
+            return Err(CompletionError::Prefix);
+        }
+        let maximum = live.policy.work.max_spool_bytes();
+        if transcript_ram(&events) as u64 > maximum
+            || encode_transcript(&events)?.len() as u64 > maximum
+        {
+            return Err(CompletionError::Spool);
+        }
+        let a = &live.authorization;
+        let def = held
+            .store
+            .state()
+            .grant(a.grant_id)
+            .ok_or(GrantError::Unauthorized)?;
+        let context = WorkContext {
+            network: held.store.state().network(),
+            channel: a.channel_id.0,
+            client: def.kind.principal().producer(),
+            provider: held.store.state().provider().grant_producer()?,
+        };
+        let result =
+            live.policy
+                .work
+                .bound_terminal_result(&context, id, &a.into(), input, &events)?;
+        let signature = self.signer.sign_digest(bound_result_digest(
+            context.network,
+            context.channel,
+            &result,
+        ))?;
+        Ok((events, SignedResult { result, signature }))
+    }
     fn authorize_delivery(
         &self,
         request: &DeliverResultRequest,
@@ -514,9 +643,7 @@ impl GrantService {
             .inner
             .lock()
             .map_err(|_| refused(GrantRefusalCode::StorageUnavailable))?;
-        if held.failed {
-            return Err(refused(GrantRefusalCode::StorageUnavailable));
-        }
+        held.status.check().map_err(|e| WorkRefused::from(&e))?;
         let channel = ChannelId(digest(
             &request
                 .route
@@ -613,9 +740,7 @@ impl GrantService {
             .inner
             .lock()
             .map_err(|_| refused(GrantRefusalCode::StorageUnavailable))?;
-        if held.failed {
-            return Err(refused(GrantRefusalCode::StorageUnavailable));
-        }
+        held.status.check().map_err(|e| WorkRefused::from(&e))?;
         if (self.clock)().max(held.store.state().now()) > deadline {
             return Err(refused(GrantRefusalCode::Expired));
         }
@@ -623,7 +748,7 @@ impl GrantService {
             .live
             .get(&id)
             .ok_or_else(|| refused(GrantRefusalCode::OutputUnavailable))?;
-        if let Some(code) = live.refusal {
+        if let LivePhase::Refused(code) = live.phase {
             return Err(held
                 .store
                 .state()
@@ -635,7 +760,7 @@ impl GrantService {
         let end = live
             .events
             .len()
-            .saturating_sub(usize::from(live.result.is_some()));
+            .saturating_sub(usize::from(live.phase.result().is_some()));
         for event in live
             .events
             .get(position..end)
@@ -647,7 +772,7 @@ impl GrantService {
                 outcome: Some(work_stream_event::Outcome::Prefix(prefix)),
             });
         }
-        if let Some(signed) = &live.result {
+        if let Some(signed) = live.phase.result() {
             let last = live
                 .events
                 .last()
@@ -661,49 +786,78 @@ impl GrantService {
                 })),
             });
         }
-        Ok((events, live.result.is_some()))
+        Ok((events, live.phase.result().is_some()))
+    }
+    // A poisoned writer cannot be used again, but its task handles still own
+    // physical invocations and must be joined during shutdown.
+    fn lock_for_shutdown(&self) -> std::sync::MutexGuard<'_, Runtime> {
+        match self.inner.lock() {
+            Ok(held) => held,
+            Err(poisoned) => {
+                let mut held = poisoned.into_inner();
+                held.fail(GrantStoreError::WriterPoisoned);
+                held
+            }
+        }
     }
     /// Cancel queued grants, then keep execution owners alive until physical
     /// completion. No endpoint or journal is dropped ahead of these duties.
     pub async fn drain(&self) -> Result<(), GrantStoreError> {
+        let _draining = self.draining.lock().await;
         {
-            let mut held = self.inner.lock().map_err(|_| GrantStoreError::Malformed)?;
-            if held.failed {
-                return Err(GrantStoreError::Unavailable);
+            let mut held = self.lock_for_shutdown();
+            held.reap();
+            if matches!(held.status, ServiceStatus::Serving) {
+                held.status = ServiceStatus::Draining;
             }
-            held.stopping = true;
-            let accepted: Vec<_> = held
-                .live
-                .iter()
-                .filter_map(|(id, live)| {
-                    held.store
-                        .state()
-                        .channel(live.authorization.channel_id)?
-                        .job_book()
-                        .job_by_id(*id)
-                        .filter(|j| j.phase() == JobPhase::Accepted)
-                        .map(|_| (live.authorization.channel_id, *id))
-                })
-                .collect();
-            for (channel, id) in accepted {
-                held.store.release(channel, id, (self.clock)())?;
-            }
-        }
-        loop {
-            let changed = self.changed.notified();
-            tokio::pin!(changed);
-            changed.as_mut().enable();
-            {
-                let held = self.inner.lock().map_err(|_| GrantStoreError::Malformed)?;
-                if held.failed {
-                    return Err(GrantStoreError::Unavailable);
-                }
-                if !held.live.values().any(|l| l.active) {
-                    return Ok(());
+            if held.status.check().is_ok() {
+                let accepted: Vec<_> = held
+                    .live
+                    .iter()
+                    .filter_map(|(id, live)| {
+                        held.store
+                            .state()
+                            .channel(live.authorization.channel_id)?
+                            .job_book()
+                            .job_by_id(*id)
+                            .filter(|job| job.phase() == JobPhase::Accepted)
+                            .map(|_| (live.authorization.channel_id, *id))
+                    })
+                    .collect();
+                for (channel, id) in accepted {
+                    if let Err(error) = held.store.release(channel, id, (self.clock)()) {
+                        held.fail(error);
+                        break;
+                    }
                 }
             }
-            changed.await;
         }
+        // Keep handles in the service while joining so cancelling drain never
+        // detaches an execution from a later shutdown attempt.
+        futures::future::poll_fn(|cx| {
+            let mut held = self.lock_for_shutdown();
+            let mut failure = None;
+            held.tasks.retain(|_, task| match Pin::new(task).poll(cx) {
+                Poll::Ready(Ok(())) => false,
+                Poll::Ready(Err(error)) => {
+                    failure = Some(error);
+                    false
+                }
+                Poll::Pending => true,
+            });
+            if let Some(error) = failure {
+                held.fail(error.into());
+            }
+            if !held.tasks.is_empty() {
+                return Poll::Pending;
+            }
+            let result = held.status.check();
+            if result.is_ok() {
+                held.status = ServiceStatus::Stopped;
+            }
+            Poll::Ready(result)
+        })
+        .await
     }
 }
 fn terminal_refusal(id: Digest, terminal: &GrantTerminal) -> WorkRefused {
@@ -886,3 +1040,6 @@ impl hellas_rpc::services::work::WorkHandler for GrantService {
         })
     }
 }
+
+#[cfg(test)]
+mod tests;

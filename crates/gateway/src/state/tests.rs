@@ -130,8 +130,8 @@ async fn paid_generation_records_after_payment_and_replays_without_a_backend() {
             }))
         }
 
-        fn drain(&self) -> futures::future::BoxFuture<'_, ()> {
-            Box::pin(async {})
+        fn drain(&self) -> futures::future::BoxFuture<'_, Result<(), crate::WorkShutdownError>> {
+            Box::pin(async { Ok(()) })
         }
     }
 
@@ -229,8 +229,8 @@ async fn paid_capacity_is_a_retryable_error_and_uses_the_pool_deadline() {
         {
             Err(crate::WorkGatewayBusy.into())
         }
-        fn drain(&self) -> futures::future::BoxFuture<'_, ()> {
-            Box::pin(async {})
+        fn drain(&self) -> futures::future::BoxFuture<'_, Result<(), crate::WorkShutdownError>> {
+            Box::pin(async { Ok(()) })
         }
     }
     let tokenizer = tempfile::NamedTempFile::new().unwrap();

@@ -8,7 +8,14 @@ use std::{
 };
 #[derive(Clone)]
 struct NoBackend;
-impl WorkBackend for NoBackend {}
+impl WorkBackend for NoBackend {
+    fn try_admit(
+        &self,
+        domain: hellas_work::work::admission::CapacityDomain,
+    ) -> Result<hellas_work::work::admission::WorkPermit, hellas_work::work::BackendFault> {
+        Err(hellas_work::work::admission::AdmissionError::Unsupported(domain).into())
+    }
+}
 fn service(store: GrantStore) -> GrantService {
     GrantService::new(
         store,

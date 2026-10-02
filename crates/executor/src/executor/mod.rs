@@ -21,12 +21,13 @@ pub(crate) type ExecuteEventReceiver = mpsc::Receiver<Result<WorkEvent, WireStat
 #[derive(Debug)]
 pub struct ExecuteOutcome {
     pub events: ExecuteEventReceiver,
-    pub(crate) completion: Option<oneshot::Receiver<()>>,
+    pub(crate) completion: oneshot::Receiver<()>,
 }
 pub(crate) enum ExecutorOwedRequest {
     RunPaidFetch {
         span: tracing::Span,
-        input: Box<hellas_work::work::PreparedFetchInput>,
+        input:
+            Box<hellas_work::work::PreparedFetchInput<hellas_work::work::admission::AdmittedWork>>,
         progress: Option<hellas_work::work::PaidProgress>,
         reply: oneshot::Sender<Result<Vec<hellas_rpc::OutputEventEnvelope>, ExecutorError>>,
     },
@@ -37,7 +38,9 @@ pub(crate) enum ExecutorOwedRequest {
     /// this message was sent.
     RunPaidEvaluate {
         span: tracing::Span,
-        input: Box<hellas_work::work::PreparedEvaluateInput>,
+        input: Box<
+            hellas_work::work::PreparedEvaluateInput<hellas_work::work::admission::AdmittedWork>,
+        >,
         reply: oneshot::Sender<Result<ExecuteOutcome, ExecutorError>>,
     },
 }

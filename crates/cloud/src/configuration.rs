@@ -5,9 +5,48 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+pub type Result<T> = std::result::Result<T, ConfigurationError>;
+
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigurationError {
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+    #[error("fetch configuration requires routes; legacy callers are unsupported")]
+    FetchRoutes,
+    #[error(
+        "grant configuration requires resources and machine_limits; journal and socket paths are managed"
+    )]
+    GrantResources,
+    #[error("invalid or reserved credential environment variable")]
+    Environment,
+    #[error("credential file name must be a simple filename")]
+    Filename,
+    #[error("worker configuration exceeds 48 KiB")]
+    SizeBound,
+    #[error("fetch config references a missing credential file")]
+    MissingFile,
+    #[error("worker filesystem does not preserve credential directory ownership")]
+    DirectoryOwner,
+    #[error("worker filesystem does not preserve private credential directory permissions")]
+    DirectoryPermissions,
+    #[error("could not create worker configuration directory")]
+    CreateDirectory(#[source] std::io::Error),
+    #[error("could not write private worker credential file")]
+    WriteCredentials(#[source] crate::config::ConfigError),
+    #[error("could not write private worker fetch configuration")]
+    WriteFetch(#[source] crate::config::ConfigError),
+    #[error("could not write private worker grant configuration")]
+    WriteGrants(#[source] crate::config::ConfigError),
+    #[error("could not open worker credential directory")]
+    OpenDirectory(#[source] std::io::Error),
+    #[error("could not inspect worker credential directory")]
+    InspectDirectory(#[source] std::io::Error),
+    #[error("could not restrict worker credential directory permissions")]
+    RestrictDirectory(#[source] std::io::Error),
+}
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -84,8 +123,7 @@ mod tests {
 #[serde(deny_unknown_fields)]
 pub(crate) struct InstalledConfiguration {
     pub fetch_config: PathBuf,
-    #[serde(default)]
-    pub grant_config: Option<PathBuf>,
+    pub grant_config: PathBuf,
     pub env: BTreeMap<String, String>,
 }
 
@@ -97,86 +135,83 @@ impl fmt::Debug for Configuration {
 
 impl Configuration {
     pub fn validate(&self) -> Result<()> {
-        ensure!(
-            self.fetch_config.is_object()
-                && self.fetch_config.get("routes").is_some_and(Value::is_array)
-                && self.fetch_config.get("callers").is_none(),
-            "fetch configuration requires routes; legacy callers are unsupported"
-        );
-        ensure!(
-            self.grant_config.is_object()
-                && self
-                    .grant_config
-                    .get("resources")
-                    .is_some_and(Value::is_array)
-                && self
-                    .grant_config
-                    .get("machine_limits")
-                    .is_some_and(Value::is_array)
-                && self.grant_config.get("journal_root").is_none()
-                && self.grant_config.get("control_socket").is_none(),
-            "grant configuration requires resources and machine_limits; journal and socket paths are managed"
-        );
+        if !(self.fetch_config.is_object()
+            && self.fetch_config.get("routes").is_some_and(Value::is_array)
+            && self.fetch_config.get("callers").is_none())
+        {
+            return Err(ConfigurationError::FetchRoutes);
+        }
+        if !(self.grant_config.is_object()
+            && self
+                .grant_config
+                .get("resources")
+                .is_some_and(Value::is_array)
+            && self
+                .grant_config
+                .get("machine_limits")
+                .is_some_and(Value::is_array)
+            && self.grant_config.get("journal_root").is_none()
+            && self.grant_config.get("control_socket").is_none())
+        {
+            return Err(ConfigurationError::GrantResources);
+        }
         for (name, value) in &self.env {
-            ensure!(
-                !name.is_empty()
-                    && name.len() <= 128
-                    && name
-                        .bytes()
-                        .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
-                    && !name.as_bytes()[0].is_ascii_digit()
-                    && !["HOME", "PATH", "TMPDIR", "TMP", "TEMP"].contains(&name.as_str())
-                    && !["HELLAS_", "LD_", "DYLD_", "RUST_", "SSL_", "NIX_"]
-                        .iter()
-                        .any(|p| name.starts_with(p))
-                    && !value.contains('\0'),
-                "invalid or reserved credential environment variable"
-            );
+            if name.is_empty()
+                || name.len() > 128
+                || !name
+                    .bytes()
+                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+                || name.as_bytes()[0].is_ascii_digit()
+                || ["HOME", "PATH", "TMPDIR", "TMP", "TEMP"].contains(&name.as_str())
+                || ["HELLAS_", "LD_", "DYLD_", "RUST_", "SSL_", "NIX_"]
+                    .iter()
+                    .any(|p| name.starts_with(p))
+                || value.contains('\0')
+            {
+                return Err(ConfigurationError::Environment);
+            }
         }
         for name in self.files.keys() {
-            ensure!(
-                !name.is_empty()
-                    && name.len() <= 128
-                    && !name.starts_with('.')
-                    && name
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)),
-                "credential file name must be a simple filename"
-            );
+            if name.is_empty()
+                || name.len() > 128
+                || name.starts_with('.')
+                || !name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+            {
+                return Err(ConfigurationError::Filename);
+            }
         }
-        ensure!(
-            serde_json::to_vec(self)?.len() <= 48 * 1024,
-            "worker configuration exceeds 48 KiB"
-        );
+        if serde_json::to_vec(self)?.len() > 48 * 1024 {
+            return Err(ConfigurationError::SizeBound);
+        }
         Ok(())
     }
 
     pub(crate) fn stage(
         &self,
         parent: &Path,
-    ) -> Result<(tempfile::TempDir, InstalledConfiguration), &'static str> {
-        self.validate()
-            .map_err(|_| "invalid worker configuration")?;
+    ) -> Result<(tempfile::TempDir, InstalledConfiguration)> {
+        self.validate()?;
         let stage = tempfile::Builder::new()
             .prefix(".worker-config-")
             .tempdir_in(parent)
-            .map_err(|_| "could not create worker configuration directory")?;
+            .map_err(ConfigurationError::CreateDirectory)?;
         restrict_staging_directory(stage.path())?;
         let files = stage.path().join("files");
-        std::fs::create_dir(&files).map_err(|_| "could not create worker credential directory")?;
+        std::fs::create_dir(&files).map_err(ConfigurationError::CreateDirectory)?;
         restrict_staging_directory(&files)?;
         for (name, value) in &self.files {
             crate::config::save_private(&files.join(name), value, true)
-                .map_err(|_| "could not write private worker credential file")?;
+                .map_err(ConfigurationError::WriteCredentials)?;
         }
         fn resolve(value: &mut Value, files: &Path, names: &BTreeMap<String, Value>) -> Result<()> {
             match value {
                 Value::String(text) if text.starts_with("@files/") => {
                     let name = text.strip_prefix("@files/").unwrap();
-                    ensure!(
-                        names.contains_key(name),
-                        "fetch config references a missing credential file"
-                    );
+                    if !names.contains_key(name) {
+                        return Err(ConfigurationError::MissingFile);
+                    }
                     *text = files.join(name).to_string_lossy().into_owned();
                 }
                 Value::Array(values) => {
@@ -194,24 +229,22 @@ impl Configuration {
             Ok(())
         }
         let mut fetch_config = self.fetch_config.clone();
-        resolve(&mut fetch_config, &files, &self.files)
-            .map_err(|_| "fetch config references a missing credential file")?;
+        resolve(&mut fetch_config, &files, &self.files)?;
         let path = stage.path().join("fetch.json");
         crate::config::save_private(&path, &fetch_config, true)
-            .map_err(|_| "could not write private worker fetch configuration")?;
+            .map_err(ConfigurationError::WriteFetch)?;
         let mut grant_config = self.grant_config.clone();
         grant_config["journal_root"] = serde_json::json!(parent.join("grants"));
         grant_config["control_socket"] = serde_json::json!(parent.join("control.sock"));
-        resolve(&mut grant_config, &files, &self.files)
-            .map_err(|_| "grant config references a missing credential file")?;
+        resolve(&mut grant_config, &files, &self.files)?;
         let grant_path = stage.path().join("grant.json");
         crate::config::save_private(&grant_path, &grant_config, true)
-            .map_err(|_| "could not write private worker grant configuration")?;
+            .map_err(ConfigurationError::WriteGrants)?;
         Ok((
             stage,
             InstalledConfiguration {
                 fetch_config: path,
-                grant_config: Some(grant_path),
+                grant_config: grant_path,
                 env: self.env.clone(),
             },
         ))
@@ -220,31 +253,31 @@ impl Configuration {
 
 // Only for fresh, empty staging directories. Some provider filesystems ignore
 // mkdir's mode but support chmod. Verify the result before writing any secrets.
-fn restrict_staging_directory(path: &Path) -> Result<(), &'static str> {
+fn restrict_staging_directory(path: &Path) -> Result<()> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
     let directory = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(path)
-        .map_err(|_| "could not open worker credential directory")?;
+        .map_err(ConfigurationError::OpenDirectory)?;
     let metadata = directory
         .metadata()
-        .map_err(|_| "could not inspect worker credential directory")?;
+        .map_err(ConfigurationError::InspectDirectory)?;
     if metadata.uid() != unsafe { libc::geteuid() } {
-        return Err("worker filesystem does not preserve credential directory ownership");
+        return Err(ConfigurationError::DirectoryOwner);
     }
     directory
         .set_permissions(std::fs::Permissions::from_mode(0o700))
-        .map_err(|_| "could not restrict worker credential directory permissions")?;
+        .map_err(ConfigurationError::RestrictDirectory)?;
     if directory
         .metadata()
-        .map_err(|_| "could not inspect worker credential directory")?
+        .map_err(ConfigurationError::InspectDirectory)?
         .permissions()
         .mode()
         & 0o777
         != 0o700
     {
-        return Err("worker filesystem does not preserve private credential directory permissions");
+        return Err(ConfigurationError::DirectoryPermissions);
     }
     Ok(())
 }

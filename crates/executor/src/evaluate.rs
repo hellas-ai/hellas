@@ -44,7 +44,7 @@ enum WorkerState {
 
 enum PendingExecution {
     Prepared {
-        input: hellas_work::work::PreparedEvaluateInput,
+        input: hellas_work::work::PreparedEvaluateInput<hellas_work::work::admission::AdmittedWork>,
         complete: tokio::sync::oneshot::Sender<()>,
         sender:
             mpsc::Sender<Result<hellas_rpc::execution_event::WorkEvent, hellas_wire::WireStatus>>,
@@ -251,8 +251,8 @@ impl EvaluateEngine {
             invocation,
             sender,
             result,
-            running: _running,
-            complete: _complete,
+            running,
+            complete,
         } = completion;
 
         match &self.worker_state {
@@ -326,10 +326,12 @@ impl EvaluateEngine {
         // wedge environment admission or every later execution behind an
         // awaited send into its already-full per-run channel.
         let _ = sender.try_send(Ok(termination.into_event()));
+        drop(running);
+        let _ = complete.send(());
     }
     pub(crate) async fn start_prepared_input(
         &mut self,
-        input: hellas_work::work::PreparedEvaluateInput,
+        input: hellas_work::work::PreparedEvaluateInput<hellas_work::work::admission::AdmittedWork>,
     ) -> Result<ExecuteOutcome, ExecutorError> {
         let (sender, events) = mpsc::channel(PER_EXECUTION_CHANNEL_CAPACITY);
         let (complete, completion) = tokio::sync::oneshot::channel();
@@ -340,10 +342,7 @@ impl EvaluateEngine {
                 complete,
             });
         self.dispatch_next_execution();
-        Ok(ExecuteOutcome {
-            events,
-            completion: Some(completion),
-        })
+        Ok(ExecuteOutcome { events, completion })
     }
 
     pub(crate) fn has_queue_capacity(&self) -> bool {
@@ -402,22 +401,18 @@ impl EvaluateEngine {
     }
     fn prepare_for_dispatch(
         &mut self,
-        input: hellas_work::work::PreparedEvaluateInput,
+        input: hellas_work::work::PreparedEvaluateInput<hellas_work::work::admission::AdmittedWork>,
         sender: mpsc::Sender<
             Result<hellas_rpc::execution_event::WorkEvent, hellas_wire::WireStatus>,
         >,
         complete: tokio::sync::oneshot::Sender<()>,
     ) -> Result<ExecuteJob, ExecutorError> {
         let (parts, admission) = input.into_parts_and_admission();
-        let running = admission
-            .dispatch()
-            .map_err(|e| ExecutorError::PolicyDenied(e.to_string()))?;
+        let running = admission.dispatch().map_err(ExecutorError::Backend)?;
         let (manifest, resolved) = resolve_prepared_paid_input(parts)?;
         let source = self.get_or_bind_environment(&manifest.canonical_bytes())?;
         let job = self.admit_resolved_job(resolved, source)?;
-        running
-            .check_deadline()
-            .map_err(|e| ExecutorError::PolicyDenied(e.to_string()))?;
+        running.check_deadline().map_err(ExecutorError::Backend)?;
         let prompt = job.invocation.input_ids.len() as u64;
         self.metrics
             .record_execution_started("evaluate", "causal-lm", prompt, prompt);
@@ -430,8 +425,8 @@ impl EvaluateEngine {
             accepted_at: Instant::now(),
             sender,
             producer_key: self.provider.producer_key.clone(),
-            running: Some(running),
-            complete: Some(complete),
+            running,
+            complete,
         })
     }
     #[cfg(test)]
@@ -442,6 +437,16 @@ impl EvaluateEngine {
     ) -> Result<ExecuteOutcome, ExecutorError> {
         let stat_prompt = job.invocation.input_ids.len() as u64;
         let (sender, events) = mpsc::channel(PER_EXECUTION_CHANNEL_CAPACITY);
+        let (complete, completion) = tokio::sync::oneshot::channel();
+        let permit = hellas_work::work::admission::WorkPermit::new(
+            hellas_work::work::admission::CapacityDomain::Gpu,
+            Arc::new(tokio::sync::Semaphore::new(1))
+                .try_acquire_owned()
+                .unwrap(),
+        );
+        let running = hellas_work::work::admission::AdmittedWork::payment(permit)
+            .dispatch()
+            .unwrap();
         let job = ExecuteJob {
             span: tracing::Span::current(),
             execution_id,
@@ -451,8 +456,8 @@ impl EvaluateEngine {
             accepted_at: Instant::now(),
             sender,
             producer_key: self.provider.producer_key.clone(),
-            running: None,
-            complete: None,
+            running,
+            complete,
         };
         if !self.pending_owed_executions.is_empty() {
             self.pending_owed_executions
@@ -469,10 +474,7 @@ impl EvaluateEngine {
         }
         self.metrics
             .record_execution_started("evaluate", "causal-lm", stat_prompt, stat_prompt);
-        Ok(ExecuteOutcome {
-            events,
-            completion: None,
-        })
+        Ok(ExecuteOutcome { events, completion })
     }
 }
 fn evaluate_stop_reason(stop_reason: StopReason) -> (EvaluateStopReason, Option<u32>) {

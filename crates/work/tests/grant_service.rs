@@ -51,10 +51,9 @@ impl WorkBackend for Backend {
     fn try_admit(&self, domain: CapacityDomain) -> Result<WorkPermit, BackendFault> {
         Ok(WorkPermit::new(
             domain,
-            self.slots
-                .clone()
-                .try_acquire_owned()
-                .map_err(|_| BackendFault::new("full"))?,
+            self.slots.clone().try_acquire_owned().map_err(|_| {
+                BackendFault::from(hellas_work::work::admission::AdmissionError::Capacity)
+            })?,
         ))
     }
     async fn fetch_stream(
@@ -66,7 +65,12 @@ impl WorkBackend for Backend {
         if let Some(queued) = &self.queued {
             queued.notified().await;
         }
-        let _running = admission.dispatch()?;
+        let _running = admission
+            .reserve(hellas_work::work::admission::CapacityDomain::Fetch, async {
+                self.try_admit(hellas_work::work::admission::CapacityDomain::Fetch)
+            })
+            .await?
+            .dispatch()?;
         self.calls.fetch_add(1, Ordering::SeqCst);
         let request =
             hellas_rpc::fetch::verify_input_events(&parts.fetch_input_transcript).unwrap();

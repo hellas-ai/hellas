@@ -1,4 +1,3 @@
-use anyhow::{Context, bail};
 use hellas_executor::{
     FetchProvider, FetchProviderError, FetchProviderFuture, FetchProviderResponse,
     PreparedFetchRequest,
@@ -12,6 +11,16 @@ use super::responses_fetch::{execute_responses_request, responses_http_client};
 #[error("OpenAI API key is empty")]
 pub struct EmptyOpenAiKey;
 
+#[derive(Debug, thiserror::Error)]
+pub enum OpenAiConfigError {
+    #[error("environment variable {variable} is not set")]
+    Missing { variable: String },
+    #[error("environment variable {variable} is not valid Unicode")]
+    Encoding { variable: String },
+    #[error("environment variable {variable} is empty")]
+    Empty { variable: String },
+}
+
 #[derive(Clone)]
 pub struct OpenAiResponsesFetchProvider {
     client: reqwest::Client,
@@ -20,14 +29,18 @@ pub struct OpenAiResponsesFetchProvider {
 }
 
 impl OpenAiResponsesFetchProvider {
-    pub fn new(api_key_env: &str) -> anyhow::Result<Self> {
-        let bearer_token = std::env::var(api_key_env)
-            .with_context(|| format!("environment variable {api_key_env} is not set"))?;
-        let bearer_token = bearer_token.trim().to_string();
-        if bearer_token.is_empty() {
-            bail!("environment variable {api_key_env} is empty");
-        }
-        Ok(Self::with_bearer(bearer_token)?)
+    pub fn new(api_key_env: &str) -> Result<Self, OpenAiConfigError> {
+        let bearer = std::env::var(api_key_env).map_err(|error| match error {
+            std::env::VarError::NotPresent => OpenAiConfigError::Missing {
+                variable: api_key_env.into(),
+            },
+            std::env::VarError::NotUnicode(_) => OpenAiConfigError::Encoding {
+                variable: api_key_env.into(),
+            },
+        })?;
+        Self::with_bearer(bearer).map_err(|_| OpenAiConfigError::Empty {
+            variable: api_key_env.into(),
+        })
     }
 
     /// Construct from a secret supplied by an embedding host without routing

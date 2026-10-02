@@ -51,9 +51,10 @@ async fn http_uses_the_paid_backend_and_waits_for_its_payment_completion() {
                 yield OutputEvent::Finished { stop_reason: StopReason::EndOfText, usage: None };
             }))
         }
-        fn drain(&self) -> futures::future::BoxFuture<'_, ()> {
+        fn drain(&self) -> futures::future::BoxFuture<'_, Result<(), crate::WorkShutdownError>> {
             Box::pin(async {
                 self.drained.store(true, Ordering::Relaxed);
+                Ok(())
             })
         }
     }

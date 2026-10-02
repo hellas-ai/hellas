@@ -6,7 +6,6 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result, bail, ensure};
 use iroh::{Endpoint, endpoint::presets};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
@@ -20,6 +19,83 @@ use crate::{
     config::{Credentials, Enrollment, validate_hex},
     wire::{ALPN, MAX_MESSAGE, Operation, Request, Response},
 };
+
+pub type Result<T> = std::result::Result<T, AgentError>;
+
+#[derive(Debug, thiserror::Error)]
+pub enum AgentError {
+    #[error(transparent)]
+    Config(#[from] crate::config::ConfigError),
+    #[error(transparent)]
+    Configuration(#[from] crate::configuration::ConfigurationError),
+    #[error(transparent)]
+    Directory(#[from] crate::management::DirectoryError),
+    #[error(transparent)]
+    ManagedGrant(#[from] crate::managed_grants::ManagedGrantError),
+    #[error(transparent)]
+    Download(#[from] DownloadError),
+    #[error(transparent)]
+    Grant(#[from] hellas_rpc::protocol::work_grant::records::GrantError),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Timeout(#[from] tokio::time::error::Elapsed),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    Utf8(#[from] std::string::FromUtf8Error),
+    #[error(transparent)]
+    Key(#[from] iroh::KeyParsingError),
+    #[error(transparent)]
+    Bind(#[from] iroh::endpoint::BindError),
+    #[error(transparent)]
+    BindAddress(#[from] iroh::endpoint::InvalidSocketAddr),
+    #[error(transparent)]
+    Connecting(#[from] iroh::endpoint::ConnectingError),
+    #[error(transparent)]
+    Connection(#[from] iroh::endpoint::ConnectionError),
+    #[error(transparent)]
+    Write(#[from] iroh::endpoint::WriteError),
+    #[error(transparent)]
+    Read(#[from] iroh::endpoint::ReadToEndError),
+    #[error(transparent)]
+    Closed(#[from] iroh::endpoint::ClosedStream),
+    #[error("Hellas exited before grant provider became ready")]
+    EarlyExit,
+    #[error("worker enrollment exceeds its bound")]
+    EnrollmentBound,
+    #[error("worker enrollment export failed")]
+    EnrollmentExport,
+    #[error("machine owner changed; refusing startup")]
+    OwnerChanged,
+    #[error("empty Hellas launcher")]
+    EmptyLauncher,
+    #[error("enrollment stdout missing")]
+    EnrollmentStdout,
+    #[error("managed configuration conflicts with a launch-time fetch config")]
+    LaunchConfiguration,
+    #[error("worker rejected resource configuration")]
+    ConfigurationRejected,
+    #[error("start Hellas")]
+    Spawn(#[source] std::io::Error),
+    #[error("grant provider readiness timed out")]
+    ReadinessTimeout(#[source] tokio::time::error::Elapsed),
+    #[error("worker enrollment export timed out")]
+    EnrollmentTimeout(#[source] tokio::time::error::Elapsed),
+    #[error("download already in progress")]
+    DownloadBusy(#[source] tokio::sync::TryAcquireError),
+    #[error("worker configuration validator timed out")]
+    ValidatorTimeout(#[source] tokio::time::error::Elapsed),
+    #[error("could not run worker configuration validator")]
+    ValidatorSpawn(#[source] std::io::Error),
+    #[error("Hellas identity {operation} failed")]
+    IdentityCommand { operation: String },
+    #[error("worker configuration failed and rollback failed: {rollback}")]
+    Rollback {
+        source: Box<AgentError>,
+        rollback: Box<AgentError>,
+    },
+}
 
 pub struct AgentOptions {
     pub credentials: Credentials,
@@ -52,7 +128,7 @@ impl Process {
         let (program, args) = self
             .launcher
             .split_first()
-            .context("empty Hellas launcher")?;
+            .ok_or(AgentError::EmptyLauncher)?;
         let mut command = Command::new(program);
         command
             .args(args)
@@ -75,7 +151,7 @@ impl Process {
         command.arg("--grant-config").arg(
             self.configuration
                 .as_ref()
-                .and_then(|c| c.grant_config.as_ref())
+                .map(|c| &c.grant_config)
                 .unwrap_or(&self.bootstrap_grants),
         );
         if let Some(configuration) = &self.configuration {
@@ -86,13 +162,12 @@ impl Process {
         }
         #[cfg(unix)]
         command.process_group(0);
-        self.child = Some(command.spawn().context("start Hellas")?);
+        self.child = Some(command.spawn().map_err(AgentError::Spawn)?);
         let ready = tokio::time::timeout(Duration::from_secs(120), async {
             loop {
-                ensure!(
-                    self.running()?,
-                    "Hellas exited before grant provider became ready"
-                );
+                if !self.running()? {
+                    return Err(AgentError::EarlyExit);
+                }
                 if crate::managed_grants::ready(&self.configuration_dir.join("control.sock"))
                     .await
                     .is_ok()
@@ -103,7 +178,7 @@ impl Process {
             }
         })
         .await
-        .context("grant provider readiness timed out")
+        .map_err(AgentError::ReadinessTimeout)
         .and_then(|result| result);
         if ready.is_err() {
             self.stop().await?;
@@ -128,15 +203,17 @@ impl Process {
             }
             #[cfg(not(unix))]
             child.start_kill()?;
-            if tokio::time::timeout(Duration::from_secs(10), child.wait())
-                .await
-                .is_err()
-            {
-                #[cfg(unix)]
-                unsafe {
-                    libc::kill(-(id as i32), libc::SIGKILL);
+            match tokio::time::timeout(Duration::from_secs(10), child.wait()).await {
+                Ok(result) => {
+                    result?;
                 }
-                child.kill().await?;
+                Err(_) => {
+                    #[cfg(unix)]
+                    unsafe {
+                        libc::kill(-(id as i32), libc::SIGKILL);
+                    }
+                    child.kill().await?;
+                }
             }
         }
         Ok(())
@@ -145,27 +222,25 @@ impl Process {
     async fn configure(
         &mut self,
         configuration: crate::configuration::Configuration,
-    ) -> Result<(), &'static str> {
-        configuration
-            .validate()
-            .map_err(|_| "invalid worker configuration")?;
+    ) -> Result<()> {
+        configuration.validate()?;
         if self
             .args
             .iter()
             .any(|arg| arg.split('=').next() == Some("--fetch-config"))
         {
-            return Err("managed configuration conflicts with a launch-time fetch config");
+            return Err(AgentError::LaunchConfiguration);
         }
         let (candidate, installed) = configuration.stage(&self.configuration_dir)?;
-        // The worker's own CLI validates the exact config and credentials before
-        // disrupting the running process. Validation output can contain secrets.
+        // The worker validates the exact files before disrupting the current process.
+        // Its output can contain credentials and must not cross the admin boundary.
         let checked = tokio::time::timeout(
             Duration::from_secs(30),
             Command::new(&self.cli)
                 .args(["serve", "--check-config", "--fetch-config"])
                 .arg(&installed.fetch_config)
                 .arg("--grant-config")
-                .arg(installed.grant_config.as_ref().expect("staged grants"))
+                .arg(&installed.grant_config)
                 .envs(&configuration.env)
                 .env_remove("HELLAS_REMOTE_KEY")
                 .env_remove("HELLAS_REMOTE_TOKEN")
@@ -179,43 +254,41 @@ impl Process {
                 .status(),
         )
         .await
-        .map_err(|_| "worker configuration validator timed out")?
-        .map_err(|_| "could not run worker configuration validator")?;
+        .map_err(AgentError::ValidatorTimeout)?
+        .map_err(AgentError::ValidatorSpawn)?;
         if !checked.success() {
-            return Err("worker rejected resource configuration");
+            return Err(AgentError::ConfigurationRejected);
         }
         let path = self.configuration_dir.join("configuration.json");
-        self.stop()
-            .await
-            .map_err(|_| "could not stop worker for configuration")?;
+        self.stop().await?;
         let previous = self.configuration.replace(installed);
-        let applied = self
-            .start()
-            .await
-            .map_err(|_| "could not start configured worker")
-            .and_then(|()| {
-                crate::config::save_private(&path, self.configuration.as_ref().unwrap(), false)
-                    .map_err(|_| "could not persist worker configuration")
-            });
-        if let Err(error) = applied {
-            self.stop()
-                .await
-                .map_err(|_| "could not stop worker during configuration rollback")?;
-            self.configuration = previous;
-            if let Some(previous) = &self.configuration {
-                crate::config::save_private(&path, previous, false)
-                    .map_err(|_| "could not restore previous worker configuration")?;
-            } else {
-                match std::fs::remove_file(&path) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(_) => return Err("could not remove failed worker configuration"),
+        let applied = self.start().await.and_then(|()| {
+            crate::config::save_private(&path, self.configuration.as_ref().unwrap(), false)
+                .map_err(AgentError::from)
+        });
+        if let Err(source) = applied {
+            let rollback: Result<()> = async {
+                self.stop().await?;
+                self.configuration = previous;
+                if let Some(previous) = &self.configuration {
+                    crate::config::save_private(&path, previous, false)?;
+                } else {
+                    match std::fs::remove_file(&path) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error.into()),
+                    }
                 }
+                self.start().await
             }
-            self.start()
-                .await
-                .map_err(|_| "could not restart worker after configuration rollback")?;
-            return Err(error);
+            .await;
+            return Err(match rollback {
+                Ok(()) => source,
+                Err(rollback) => AgentError::Rollback {
+                    source: Box::new(source),
+                    rollback: Box::new(rollback),
+                },
+            });
         }
         let _ = candidate.keep();
         if let Some(previous) = previous
@@ -257,22 +330,20 @@ async fn export_enrollment(
         child
             .stdout
             .take()
-            .context("enrollment stdout missing")?
+            .ok_or(AgentError::EnrollmentStdout)?
             .take((MAX_PRINCIPAL_BYTES + 1) as u64)
             .read_to_end(&mut bytes)
             .await?;
-        ensure!(
-            bytes.len() <= MAX_PRINCIPAL_BYTES,
-            "worker enrollment exceeds its bound"
-        );
-        ensure!(
-            child.wait().await?.success(),
-            "worker enrollment export failed"
-        );
+        if bytes.len() > MAX_PRINCIPAL_BYTES {
+            return Err(AgentError::EnrollmentBound);
+        }
+        if !child.wait().await?.success() {
+            return Err(AgentError::EnrollmentExport);
+        }
         Ok(Principal::decode(&bytes)?)
     })
     .await
-    .context("worker enrollment export timed out")?
+    .map_err(AgentError::EnrollmentTimeout)?
 }
 
 async fn identity_command(cli: &Path, identity: &Path, operation: &str) -> Result<String> {
@@ -294,10 +365,11 @@ async fn identity_command(cli: &Path, identity: &Path, operation: &str) -> Resul
             .output(),
     )
     .await??;
-    ensure!(
-        output.status.success(),
-        "Hellas identity {operation} failed"
-    );
+    if !output.status.success() {
+        return Err(AgentError::IdentityCommand {
+            operation: operation.to_owned(),
+        });
+    }
     Ok(String::from_utf8(output.stdout)?.trim().to_owned())
 }
 
@@ -338,13 +410,7 @@ impl State {
                 }
                 Operation::Configure { configuration } => {
                     let mut process = self.process.lock().await;
-                    // Only static stage labels cross this boundary, never the
-                    // validator's output or errors containing credential paths.
-                    if let Err(message) = process.configure(configuration).await {
-                        return Ok(Response::Error {
-                            message: message.into(),
-                        });
-                    }
+                    process.configure(configuration).await?;
                     Ok(Response::Status {
                         enrollment: self.enrollment.clone(),
                         owner: self.owner.map(|owner| owner.to_string()),
@@ -355,7 +421,7 @@ impl State {
                     let _permit = self
                         .downloads
                         .try_acquire()
-                        .context("download already in progress")?;
+                        .map_err(AgentError::DownloadBusy)?;
                     fetch_content(&self.content, &url, &sha256, bytes).await?;
                     Ok(Response::Fetched { sha256, bytes })
                 }
@@ -392,10 +458,9 @@ pub async fn run_until(
     let _lease = crate::config::lock_state(&binding)?;
     if binding.exists() {
         let saved: Option<String> = crate::config::read_json(&binding)?;
-        ensure!(
-            saved == options.credentials.owner,
-            "machine owner changed; refusing startup"
-        );
+        if saved != options.credentials.owner {
+            return Err(AgentError::OwnerChanged);
+        }
     } else {
         crate::config::save_private(&binding, &options.credentials.owner, true)?;
     }
@@ -506,25 +571,63 @@ async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
-pub fn validate_download(url: &str, sha256: &str, bytes: u64) -> Result<reqwest::Url> {
+#[derive(Debug, thiserror::Error)]
+pub enum DownloadError {
+    #[error(transparent)]
+    Config(#[from] crate::config::ConfigError),
+    #[error(transparent)]
+    Url(#[from] url::ParseError),
+    #[error(transparent)]
+    Http(#[from] reqwest::Error),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error("expected size must be 1 byte..1 TiB")]
+    SizeBound,
+    #[error("content URL must be HTTPS without userinfo or fragment")]
+    UrlPolicy,
+    #[error("download requires HTTP 200; redirects are refused")]
+    HttpStatus,
+    #[error("content length mismatch")]
+    Length,
+    #[error("download exceeds declared size")]
+    Exceeded,
+    #[error("download length or digest mismatch")]
+    Integrity,
+    #[error("content root needs a parent")]
+    RootParent,
+    #[error("size overflow")]
+    Overflow,
+    #[error("content already exists; no existing content was replaced")]
+    AlreadyExists,
+}
+
+pub fn validate_download(
+    url: &str,
+    sha256: &str,
+    bytes: u64,
+) -> std::result::Result<reqwest::Url, DownloadError> {
     validate_hex(sha256)?;
-    ensure!(
-        bytes > 0 && bytes <= 1024 * 1024 * 1024 * 1024,
-        "expected size must be 1 byte..1 TiB"
-    );
+    if bytes == 0 || bytes > 1024 * 1024 * 1024 * 1024 {
+        return Err(DownloadError::SizeBound);
+    }
     let url = reqwest::Url::parse(url)?;
-    ensure!(
-        url.scheme() == "https"
-            && url.host_str().is_some()
-            && url.username().is_empty()
-            && url.password().is_none()
-            && url.fragment().is_none(),
-        "content URL must be HTTPS without userinfo or fragment"
-    );
+    if !(url.scheme() == "https"
+        && url.host_str().is_some()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.fragment().is_none())
+    {
+        return Err(DownloadError::UrlPolicy);
+    }
     Ok(url)
 }
 
-pub async fn fetch_content(root: &Path, url: &str, sha256: &str, bytes: u64) -> Result<()> {
+pub async fn fetch_content(
+    root: &Path,
+    url: &str,
+    sha256: &str,
+    bytes: u64,
+) -> std::result::Result<(), DownloadError> {
     let url = validate_download(url, sha256, bytes)?;
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -540,33 +643,34 @@ async fn receive_content(
     mut response: reqwest::Response,
     sha256: &str,
     bytes: u64,
-) -> Result<()> {
-    ensure!(
-        response.status() == reqwest::StatusCode::OK,
-        "download requires HTTP 200; redirects are refused"
-    );
-    if let Some(length) = response.content_length() {
-        ensure!(length == bytes, "content length mismatch");
+) -> std::result::Result<(), DownloadError> {
+    if response.status() != reqwest::StatusCode::OK {
+        return Err(DownloadError::HttpStatus);
+    }
+    if let Some(length) = response.content_length()
+        && (length != bytes)
+    {
+        return Err(DownloadError::Length);
     }
     // Stage outside the indexed content tree. Cancellation/errors remove the temp
     // file; only an exact length+digest match becomes visible to Hellas.
-    let temp =
-        tempfile::NamedTempFile::new_in(root.parent().context("content root needs a parent")?)?;
+    let temp = tempfile::NamedTempFile::new_in(root.parent().ok_or(DownloadError::RootParent)?)?;
     let mut file = tokio::fs::File::from_std(temp.reopen()?);
     let mut hash = Sha256::new();
     let mut received = 0u64;
     while let Some(chunk) = response.chunk().await? {
         received = received
             .checked_add(chunk.len() as u64)
-            .context("size overflow")?;
-        ensure!(received <= bytes, "download exceeds declared size");
+            .ok_or(DownloadError::Overflow)?;
+        if received > bytes {
+            return Err(DownloadError::Exceeded);
+        }
         hash.update(&chunk);
         file.write_all(&chunk).await?;
     }
-    ensure!(
-        received == bytes && hex::encode(hash.finalize()) == sha256,
-        "download length or digest mismatch"
-    );
+    if received != bytes || hex::encode(hash.finalize()) != sha256 {
+        return Err(DownloadError::Integrity);
+    }
     file.sync_all().await?;
     drop(file);
     let destination = root.join(sha256);
@@ -576,7 +680,7 @@ async fn receive_content(
             Ok(())
         }
         Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
-            bail!("content already exists; no existing content was replaced")
+            Err(DownloadError::AlreadyExists)
         }
         Err(error) => Err(error.error.into()),
     }

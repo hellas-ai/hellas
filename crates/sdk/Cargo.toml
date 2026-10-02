@@ -36,9 +36,10 @@ grant-client = [
     "hellas-client/work",
     "dep:async-stream",
     "dep:prost",
+    "dep:rand",
 ]
-paid-client = ["work", "client", "dep:async-stream", "hellas-client/work"]
-paid-provider = ["work", "provider"]
+paid-client = ["paid-work", "client", "dep:async-stream", "hellas-client/work"]
+paid-provider = ["paid-work", "provider"]
 grant-provider = ["work", "provider"]
 grant-gateway = ["grant-client", "gateway", "dep:rand"]
 paid-gateway = ["paid-client", "gateway", "dep:rand"]
@@ -48,9 +49,6 @@ work = [
     "hellas-wire/iroh",
     "dep:tokio",
     "dep:tracing",
-    "dep:hellas-chain",
-    "hellas-chain/client",
-    "hellas-chain/work-watcher",
     "dep:hellas-kernel",
     "hellas-kernel/secp256k1",
     "dep:hellas-work",
@@ -60,6 +58,14 @@ work = [
     "dep:serde",
     "dep:serde_json",
     "dep:hex",
+]
+
+# Payment observation and settlement require verified chain access.
+paid-work = [
+    "work",
+    "dep:hellas-chain",
+    "hellas-chain/client",
+    "hellas-chain/work-watcher",
     "dep:url",
 ]
 

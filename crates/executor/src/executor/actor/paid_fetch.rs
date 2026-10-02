@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use hellas_rpc::OutputEventEnvelope;
-use hellas_work::work::PreparedFetchInput;
+use hellas_work::work::{PreparedFetchInput, admission::AdmittedWork};
 use tokio::sync::{mpsc, oneshot};
 use tracing::Instrument as _;
 
@@ -15,7 +15,7 @@ use crate::fetch_policy::FetchRoute;
 use crate::fetch_provider::FetchCall;
 
 pub(super) struct PendingPaidFetch {
-    input: PreparedFetchInput,
+    input: PreparedFetchInput<AdmittedWork>,
     progress: Option<hellas_work::work::PaidProgress>,
     reply: oneshot::Sender<Result<Vec<OutputEventEnvelope>, ExecutorError>>,
     span: tracing::Span,
@@ -30,7 +30,7 @@ impl Executor {
     /// handling remain live while the upstream is busy.
     pub(super) fn start_paid_fetch(
         &mut self,
-        input: PreparedFetchInput,
+        input: PreparedFetchInput<AdmittedWork>,
         progress: Option<hellas_work::work::PaidProgress>,
         reply: oneshot::Sender<Result<Vec<OutputEventEnvelope>, ExecutorError>>,
         span: tracing::Span,
@@ -460,6 +460,12 @@ mod tests {
         input: PreparedFetchInput,
         progress: Option<PaidProgress>,
     ) -> Result<Vec<OutputEventEnvelope>, ExecutorError> {
+        let input = input
+            .reserve(
+                handle
+                    .reserve_payment_capacity(hellas_work::work::admission::CapacityDomain::Fetch),
+            )
+            .await?;
         let (reply, receive) = oneshot::channel();
         handle
             .owed_tx
@@ -712,36 +718,44 @@ mod tests {
                 1,
             )
             .await;
-            let request = |reply| crate::executor::ExecutorOwedRequest::RunPaidFetch {
+            let capacity = handle.fetch_capacity.available_permits();
+            let request = async |reply| crate::executor::ExecutorOwedRequest::RunPaidFetch {
                 span: tracing::Span::none(),
-                input: Box::new(prepared_input(input_events(
-                    Retention::Ephemeral,
-                    Assurance::ProducerSigned,
-                ))),
+                input: Box::new(
+                    prepared_input(input_events(
+                        Retention::Ephemeral,
+                        Assurance::ProducerSigned,
+                    ))
+                    .reserve(handle.reserve_payment_capacity(
+                        hellas_work::work::admission::CapacityDomain::Fetch,
+                    ))
+                    .await
+                    .unwrap(),
+                ),
                 progress: None,
                 reply,
             };
             let (reply, first) = oneshot::channel();
-            handle.owed_tx.send(request(reply)).await.unwrap();
+            handle.owed_tx.send(request(reply).await).await.unwrap();
             while provider.started() == 0 {
                 tokio::task::yield_now().await;
             }
             let mut pending = Vec::new();
-            // One bounded actor FIFO plus its bounded ingress mailbox.
-            for _ in 0..2 * super::super::EXECUTOR_OWED_MAILBOX_CAPACITY {
+            // Every running or queued invocation owns one shared capacity permit.
+            for _ in 1..capacity {
                 let (reply, result) = oneshot::channel();
-                handle.owed_tx.send(request(reply)).await.unwrap();
+                handle.owed_tx.send(request(reply).await).await.unwrap();
                 pending.push(result);
             }
             let (reply, last) = oneshot::channel();
-            let blocked = handle.owed_tx.send(request(reply));
+            let blocked = async { handle.owed_tx.send(request(reply).await).await };
             tokio::pin!(blocked);
             assert!(
                 timeout(Duration::from_millis(50), &mut blocked)
                     .await
                     .is_err()
             );
-            assert_eq!(handle.owed_tx.capacity(), 0);
+            assert_eq!(handle.fetch_capacity.available_permits(), 0);
             assert_eq!(provider.started(), 1);
             // An abandoned waiter cannot discard an already owed invocation.
             drop(pending.pop().unwrap());
@@ -752,10 +766,7 @@ mod tests {
                 result.await.unwrap().unwrap();
             }
             last.await.unwrap().unwrap();
-            assert_eq!(
-                provider.started(),
-                2 + 2 * super::super::EXECUTOR_OWED_MAILBOX_CAPACITY
-            );
+            assert_eq!(provider.started(), capacity + 1);
         })
         .await
         .expect("queue drains once the upstream is available");

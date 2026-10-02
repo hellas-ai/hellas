@@ -94,6 +94,7 @@ async fn main() -> Result<()> {
         no_relay,
     })
     .await
+    .map_err(anyhow::Error::from)
 }
 
 #[cfg(not(unix))]

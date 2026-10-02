@@ -31,6 +31,7 @@ node = [
     "hellas-sdk/grant-client",
     "hellas-sdk/grant-admin",
     "hellas-sdk/paid-provider",
+    "hellas-sdk/grant-provider",
     "chain",
     "dep:async-stream",
     "dep:axum",
@@ -151,7 +152,7 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 ciborium.workspace = true
-hellas-chain = { workspace = true, features = ["client", "construction-audit"] }
+hellas-chain = { workspace = true, features = ["client"] }
 p256.workspace = true
 rcgen = "0.14"
 reqwest = { workspace = true, features = ["json"] }

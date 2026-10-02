@@ -1,6 +1,5 @@
 use std::process::Stdio;
 
-use anyhow::Context;
 use tokio::process::{Child, Command};
 
 #[cfg(target_os = "linux")]
@@ -30,7 +29,7 @@ pub fn spawn(
     args: &[String],
     base_url: &str,
     credential: &str,
-) -> anyhow::Result<Child> {
+) -> crate::GatewayResult<Child> {
     let mut command = Command::new(cmd);
     command
         .args(args)
@@ -67,5 +66,8 @@ pub fn spawn(
 
     command
         .spawn()
-        .with_context(|| format!("failed to spawn `{cmd}`"))
+        .map_err(|source| crate::GatewayError::Spawn {
+            command: cmd.into(),
+            source,
+        })
 }

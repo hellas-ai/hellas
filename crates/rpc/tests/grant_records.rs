@@ -134,7 +134,6 @@ fn enrollment_proof_and_private_offer_audience_are_not_advisory() {
         kind: GrantKind::Principal(client.clone()),
         policies: vec![policy],
         limits: vec![],
-        weight: NonZeroU16::new(1).unwrap(),
         max_job_millis: NonZeroU64::new(10000).unwrap(),
         max_in_flight: NonZeroU16::new(2).unwrap(),
         expires: None,

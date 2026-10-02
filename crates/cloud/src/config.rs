@@ -1,7 +1,77 @@
 use std::{collections::BTreeMap, fs, path::Path};
 
-use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
+
+pub type Result<T> = std::result::Result<T, ConfigError>;
+
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    #[error(transparent)]
+    Account(#[from] crate::accounts::AccountError),
+    #[error(transparent)]
+    ProviderId(#[from] crate::provider::InvalidProviderId),
+    #[error(transparent)]
+    Grant(#[from] hellas_rpc::protocol::work_grant::records::GrantError),
+    #[error(transparent)]
+    Key(#[from] iroh::KeyParsingError),
+    #[error(transparent)]
+    Hex(#[from] hex::FromHexError),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+    #[error("read {}", path.display())]
+    Read {
+        path: std::path::PathBuf,
+        source: std::io::Error,
+    },
+    #[error("invalid JSON file {}", path.display())]
+    JsonFile {
+        path: std::path::PathBuf,
+        source: serde_json::Error,
+    },
+    #[error("another command is using deployment receipt {}", path.display())]
+    Lock {
+        path: std::path::PathBuf,
+        source: std::fs::TryLockError,
+    },
+    #[error("reserved serve argument: {0}")]
+    ReservedServeArgument(String),
+    #[error(
+        "measured-boot requires a platform verifier and channel binding; no adapter implements it yet"
+    )]
+    MeasuredBoot,
+    #[error("name must contain 1..48 ASCII letters, digits, or hyphens")]
+    Name,
+    #[error("invalid image repository")]
+    Repository,
+    #[error("Runpod requires a GPU type and positive disk/volume sizes")]
+    RunpodResources,
+    #[error("Vast requires a positive offer ID and disk size")]
+    VastResources,
+    #[error("NUL in serve argument")]
+    ServeNul,
+    #[error("expected 64 lowercase hex digits")]
+    HexFormat,
+    #[error("owner enrollment exceeds its bound")]
+    OwnerBound,
+    #[error("owner enrollment does not match the authenticated owner transport")]
+    OwnerMismatch,
+    #[error("owner enrollment required for worker bootstrap")]
+    OwnerRequired,
+    #[error("worker enrollment exceeds its bound")]
+    EnrollmentBound,
+    #[error("worker enrollment ID mismatch")]
+    EnrollmentId,
+    #[error("worker transport differs from its enrollment")]
+    EnrollmentTransport,
+    #[error("image must be pinned as repository@sha256:<64 lowercase hex digits>")]
+    ImagePin,
+    #[error("owner enrollment has no transport binding")]
+    OwnerBinding,
+    #[error("worker enrollment bundle unavailable; upgrade the managed worker")]
+    EnrollmentUnavailable,
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -58,19 +128,18 @@ pub enum Trust {
 
 impl Spec {
     pub fn validate(&self) -> Result<()> {
-        ensure!(
-            self.trust == Trust::Token,
-            "measured-boot requires a platform verifier and channel binding; no adapter implements it yet"
-        );
-        ensure!(
-            !self.name.is_empty()
-                && self.name.len() <= 48
-                && self
-                    .name
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'-'),
-            "name must contain 1..48 ASCII letters, digits, or hyphens"
-        );
+        if self.trust != Trust::Token {
+            return Err(ConfigError::MeasuredBoot);
+        }
+        if self.name.is_empty()
+            || self.name.len() > 48
+            || !self
+                .name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
+            return Err(ConfigError::Name);
+        }
         let unresolved_template = self.image.is_empty()
             && matches!(
                 &self.provider,
@@ -89,15 +158,15 @@ impl Spec {
             let (repo, digest) = self
                 .image
                 .rsplit_once("@sha256:")
-                .context("image must be pinned as repository@sha256:<64 lowercase hex digits>")?;
-            ensure!(
-                !repo.is_empty()
-                    && !repo.starts_with('-')
-                    && repo
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b"/._:-".contains(&b)),
-                "invalid image repository"
-            );
+                .ok_or(ConfigError::ImagePin)?;
+            if repo.is_empty()
+                || repo.starts_with('-')
+                || !repo
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"/._:-".contains(&b))
+            {
+                return Err(ConfigError::Repository);
+            }
             validate_hex(digest)?;
         }
         validate_serve_args(&self.serve_args)?;
@@ -116,16 +185,15 @@ impl Spec {
                 if let Some(id) = template_id {
                     crate::provider::validate_id(id)?;
                 }
-                ensure!(
-                    !gpu_type.trim().is_empty()
-                        && (unresolved_template || (*disk_gb > 0 && *volume_gb > 0)),
-                    "Runpod requires a GPU type and positive disk/volume sizes"
-                );
+                if gpu_type.trim().is_empty()
+                    || (!unresolved_template && (*disk_gb == 0 || *volume_gb == 0))
+                {
+                    return Err(ConfigError::RunpodResources);
+                }
             }
-            ProviderConfig::Vast { offer_id, disk_gb } => ensure!(
-                *offer_id > 0 && *disk_gb > 0,
-                "Vast requires a positive offer ID and disk size"
-            ),
+            ProviderConfig::Vast { offer_id, disk_gb } if (*offer_id == 0 || *disk_gb == 0) => {
+                return Err(ConfigError::VastResources);
+            }
             _ => {}
         }
         Ok(())
@@ -133,43 +201,42 @@ impl Spec {
 }
 
 pub fn validate_serve_args(args: &[String]) -> Result<()> {
-    ensure!(
-        args.iter().all(|v| !v.contains('\0')),
-        "NUL in serve argument"
-    );
+    if args.iter().any(|v| v.contains('\0')) {
+        return Err(ConfigError::ServeNul);
+    }
     for arg in args {
         let key = arg.split('=').next().unwrap_or(arg);
-        ensure!(
-            ![
-                "--identity",
-                "--owner",
-                "--owner-enrollment",
-                "--init-owner",
-                "--grant-config",
-                "--software-root",
-                "--assurance",
-                "--artifact-store-path",
-                "--help",
-                "-h",
-                "--version",
-                "--check-config",
-                "-V"
-            ]
-            .contains(&key),
-            "reserved serve argument: {key}"
-        );
+        if [
+            "--identity",
+            "--owner",
+            "--owner-enrollment",
+            "--init-owner",
+            "--grant-config",
+            "--software-root",
+            "--assurance",
+            "--artifact-store-path",
+            "--help",
+            "-h",
+            "--version",
+            "--check-config",
+            "-V",
+        ]
+        .contains(&key)
+        {
+            return Err(ConfigError::ReservedServeArgument(key.into()));
+        }
     }
     Ok(())
 }
 
 pub fn validate_hex(value: &str) -> Result<()> {
-    ensure!(
-        value.len() == 64
-            && value
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
-        "expected 64 lowercase hex digits"
-    );
+    if !(value.len() == 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+    {
+        return Err(ConfigError::HexFormat);
+    }
     Ok(())
 }
 
@@ -204,28 +271,25 @@ impl Credentials {
         let Some(bundle) = &self.owner_enrollment else {
             return Ok(None);
         };
-        ensure!(
-            bundle.len() <= MAX_PRINCIPAL_BYTES * 2,
-            "owner enrollment exceeds its bound"
-        );
+        if bundle.len() > MAX_PRINCIPAL_BYTES * 2 {
+            return Err(ConfigError::OwnerBound);
+        }
         let principal = Principal::decode(&hex::decode(bundle)?)?;
         let owner = self
             .owner
             .as_deref()
-            .context("owner enrollment has no transport binding")?
+            .ok_or(ConfigError::OwnerBinding)?
             .parse::<iroh::EndpointId>()?;
-        ensure!(
-            principal.transport() == *owner.as_bytes(),
-            "owner enrollment does not match the authenticated owner transport"
-        );
+        if principal.transport() != *owner.as_bytes() {
+            return Err(ConfigError::OwnerMismatch);
+        }
         Ok(Some(principal))
     }
 
     pub fn require_owner_enrollment(&self) -> Result<()> {
-        ensure!(
-            self.owner.is_none() || self.owner_principal()?.is_some(),
-            "owner enrollment required for worker bootstrap"
-        );
+        if self.owner.is_some() && self.owner_principal()?.is_none() {
+            return Err(ConfigError::OwnerRequired);
+        }
         Ok(())
     }
 
@@ -292,20 +356,17 @@ impl Enrollment {
         let bundle = self
             .bundle
             .as_deref()
-            .context("worker enrollment bundle unavailable; upgrade the managed worker")?;
-        ensure!(
-            bundle.len() <= MAX_PRINCIPAL_BYTES * 2,
-            "worker enrollment exceeds its bound"
-        );
+            .ok_or(ConfigError::EnrollmentUnavailable)?;
+        if bundle.len() > MAX_PRINCIPAL_BYTES * 2 {
+            return Err(ConfigError::EnrollmentBound);
+        }
         let principal = Principal::decode(&hex::decode(bundle)?)?;
-        ensure!(
-            principal.id().0.to_string() == self.enrollment_id,
-            "worker enrollment ID mismatch"
-        );
-        ensure!(
-            principal.transport() == *self.node_id.parse::<iroh::EndpointId>()?.as_bytes(),
-            "worker transport differs from its enrollment"
-        );
+        if principal.id().0.to_string() != self.enrollment_id {
+            return Err(ConfigError::EnrollmentId);
+        }
+        if principal.transport() != *self.node_id.parse::<iroh::EndpointId>()?.as_bytes() {
+            return Err(ConfigError::EnrollmentTransport);
+        }
         Ok(principal)
     }
 }
@@ -322,8 +383,14 @@ pub struct Deployment {
 }
 
 pub fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
-    serde_json::from_slice(&fs::read(path).with_context(|| format!("read {}", path.display()))?)
-        .context("invalid JSON file")
+    let bytes = fs::read(path).map_err(|source| ConfigError::Read {
+        path: path.into(),
+        source,
+    })?;
+    serde_json::from_slice(&bytes).map_err(|source| ConfigError::JsonFile {
+        path: path.into(),
+        source,
+    })
 }
 
 /// Serialize operations on a receipt, including the API call between reads and
@@ -342,8 +409,10 @@ pub fn lock_state(path: &Path) -> Result<fs::File> {
         .create(true)
         .truncate(false)
         .open(name)?;
-    file.try_lock()
-        .context("another command is using this deployment receipt")?;
+    file.try_lock().map_err(|source| ConfigError::Lock {
+        path: path.into(),
+        source,
+    })?;
     Ok(file)
 }
 

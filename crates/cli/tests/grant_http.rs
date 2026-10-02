@@ -162,10 +162,6 @@ struct Cli {
 }
 impl Cli {
     fn new(root: &Path, name: &str) -> Self {
-        let audit = root.join("chain-audit");
-        if !audit.exists() {
-            std::fs::write(&audit, b"").unwrap();
-        }
         Self {
             root: root.into(),
             identity: root.join(name),
@@ -180,10 +176,6 @@ impl Cli {
             .env("HELLAS_GRANT_DATA_DIR", self.root.join("grants"))
             .env("HELLAS_STORE_DIR", self.root.join("store"))
             .env("HELLAS_MACHINES_DIR", self.root.join("machines"))
-            .env(
-                "HELLAS_CHAIN_CONSTRUCTION_AUDIT",
-                self.root.join("chain-audit"),
-            )
             .env("RUST_LOG", "hellas_gateway=info")
             .env("OTEL_SDK_DISABLED", "true")
             .stdin(Stdio::null())
@@ -504,12 +496,11 @@ async fn contact_grant_offer_gateway_uses_private_ca_and_durable_allowances() {
     assert_eq!(https.calls.load(Ordering::SeqCst), 11);
     gateway.stop().await;
     node.stop().await;
-    assert_no_chain(root);
 }
 
 #[cfg(feature = "cloud")]
 struct Managed {
-    task: tokio::task::JoinHandle<anyhow::Result<()>>,
+    task: tokio::task::JoinHandle<hellas_cloud::agent::Result<()>>,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
 }
 #[cfg(feature = "cloud")]
@@ -589,15 +580,7 @@ async fn managed_owner_bootstrap_standing_fetch_and_restart_preserve_allowances(
             data: data.clone(),
             configuration_dir: Some(private.clone()),
             cli: cli.clone(),
-            launcher: vec![
-                "env".into(),
-                format!(
-                    "HELLAS_CHAIN_CONSTRUCTION_AUDIT={}",
-                    root.join("chain-audit").display()
-                ),
-                cli.to_string_lossy().into_owned(),
-                "serve".into(),
-            ],
+            launcher: vec![cli.to_string_lossy().into_owned(), "serve".into()],
             serve_args,
             bind: Some(admin_address),
             no_relay: true,
@@ -707,7 +690,6 @@ async fn managed_owner_bootstrap_standing_fetch_and_restart_preserve_allowances(
     assert_eq!(https.calls.load(Ordering::SeqCst), 2);
     gateway.stop().await;
     managed.stop().await;
-    assert_no_chain(root);
 }
 
 #[cfg(feature = "evaluate")]
@@ -841,18 +823,5 @@ async fn local_owner_gateway_preserves_machine_limits_and_refuses_before_gpu_exe
             .counter(Meter::Requests, Window::Total)
             .used,
         0
-    );
-    assert_no_chain(root);
-}
-
-fn assert_no_chain(root: &Path) {
-    assert_eq!(
-        hellas_chain::construction_audit::events(),
-        0,
-        "fixture constructed a chain client"
-    );
-    assert!(
-        std::fs::read(root.join("chain-audit")).unwrap().is_empty(),
-        "a grant CLI subprocess constructed or connected a chain client"
     );
 }

@@ -391,6 +391,13 @@ impl AnsweringBackend {
 }
 
 impl WorkBackend for AnsweringBackend {
+    fn try_admit(
+        &self,
+        domain: hellas_work::work::admission::CapacityDomain,
+    ) -> Result<hellas_work::work::admission::WorkPermit, hellas_work::work::BackendFault> {
+        Err(hellas_work::work::admission::AdmissionError::Unsupported(domain).into())
+    }
+
     fn evaluate(
         &self,
         input: PreparedEvaluateInput,
@@ -719,11 +726,22 @@ async fn a_job_with_no_result_releases_nothing_yet() {
 async fn a_failed_job_returns_its_terminal_after_authentication() {
     struct FailingBackend;
     impl WorkBackend for FailingBackend {
+        fn try_admit(
+            &self,
+            domain: hellas_work::work::admission::CapacityDomain,
+        ) -> Result<hellas_work::work::admission::WorkPermit, hellas_work::work::BackendFault>
+        {
+            Err(hellas_work::work::admission::AdmissionError::Unsupported(domain).into())
+        }
+
         async fn evaluate(
             &self,
             _input: PreparedEvaluateInput,
         ) -> Result<Vec<OutputEventEnvelope>, BackendFault> {
-            Err(BackendFault::new("fixture content is unavailable"))
+            Err(BackendFault::caused_by(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "fixture content is unavailable",
+            )))
         }
     }
 
@@ -1472,6 +1490,14 @@ async fn live_prefix_precedes_terminal_and_reserves_delivery_credit() {
         release: Arc<tokio::sync::Notify>,
     }
     impl WorkBackend for PausedBackend {
+        fn try_admit(
+            &self,
+            domain: hellas_work::work::admission::CapacityDomain,
+        ) -> Result<hellas_work::work::admission::WorkPermit, hellas_work::work::BackendFault>
+        {
+            Err(hellas_work::work::admission::AdmissionError::Unsupported(domain).into())
+        }
+
         async fn evaluate(
             &self,
             input: PreparedEvaluateInput,

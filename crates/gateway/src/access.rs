@@ -39,8 +39,7 @@ pub(crate) struct Bearer {
 }
 
 impl Bearer {
-    pub(crate) fn load_or_create(path: &std::path::Path) -> anyhow::Result<Self> {
-        use anyhow::Context as _;
+    pub(crate) fn load_or_create(path: &std::path::Path) -> crate::GatewayResult<Self> {
         let file = hellas_private::open_nofollow(path);
         let mut file = match file {
             Ok(file) => file,
@@ -49,34 +48,36 @@ impl Bearer {
                 bearer.write_private(path)?;
                 return Ok(bearer);
             }
-            Err(error) => return Err(error).context("failed to open gateway credential"),
+            Err(source) => {
+                return Err(crate::GatewayError::Credential {
+                    operation: "open",
+                    path: path.into(),
+                    source,
+                });
+            }
         };
-        anyhow::ensure!(
-            hellas_private::is_private(&file)?,
-            "gateway credential must be a private regular file owned by the gateway user"
-        );
+        if !(hellas_private::is_private(&file)?) {
+            return Err(crate::GatewayConfigError::CredentialPermissions.into());
+        }
         let mut bytes = Vec::new();
         std::io::Read::read_to_end(&mut std::io::Read::take(&mut file, 128), &mut bytes)?;
         let text = std::str::from_utf8(&bytes)?.trim();
-        anyhow::ensure!(
-            text.len() == TOKEN_HEX_LEN,
-            "invalid gateway credential length"
-        );
+        if text.len() != TOKEN_HEX_LEN {
+            return Err(crate::GatewayConfigError::CredentialLength.into());
+        }
         let mut token = [0u8; TOKEN_BYTES];
         for (index, byte) in token.iter_mut().enumerate() {
             let hi = hex_digit(text.as_bytes()[index * 2]);
             let lo = hex_digit(text.as_bytes()[index * 2 + 1]);
-            anyhow::ensure!(
-                hi < 16 && lo < 16,
-                "gateway credential must be lowercase hex"
-            );
+            if !(hi < 16 && lo < 16) {
+                return Err(crate::GatewayConfigError::CredentialEncoding.into());
+            }
             *byte = ((hi << 4) | lo) as u8;
         }
         Ok(Self { token })
     }
 
-    pub(crate) fn write_private(&self, path: &std::path::Path) -> anyhow::Result<()> {
-        use anyhow::Context as _;
+    pub(crate) fn write_private(&self, path: &std::path::Path) -> crate::GatewayResult<()> {
         // Private from creation (0600 / an owner-only protected DACL), so the
         // secret never sits in a readable file; the rename atomically replaces
         // the destination without following an existing symlink.
@@ -85,7 +86,11 @@ impl Bearer {
             ".tmp",
             format!("{}\n", self.child_credential()).as_bytes(),
         )
-        .context("failed to publish gateway credential file")
+        .map_err(|source| crate::GatewayError::Credential {
+            operation: "publish",
+            path: path.into(),
+            source,
+        })
     }
 
     /// Draw a fresh credential; callers may persist it for managed clients.
@@ -294,20 +299,24 @@ pub(crate) async fn bind_addr(
     host: &str,
     port: u16,
     allow_remote: bool,
-) -> anyhow::Result<SocketAddr> {
+) -> crate::GatewayResult<SocketAddr> {
     let resolved: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
         .await
-        .map_err(|err| {
-            anyhow::anyhow!("failed to resolve gateway bind address `{host}:{port}`: {err}")
+        .map_err(|source| crate::GatewayError::Resolve {
+            host: host.into(),
+            port,
+            source,
         })?
         .collect();
     let Some(first) = resolved.first().copied() else {
-        anyhow::bail!("gateway bind address `{host}:{port}` resolved to no address");
+        return Err(crate::GatewayError::NoAddress {
+            host: host.into(),
+            port,
+        });
     };
-    anyhow::ensure!(
-        allow_remote || resolved.iter().all(|addr| addr.ip().is_loopback()),
-        "non-loopback gateway binding requires --allow-remote and --bearer-token-file"
-    );
+    if !(allow_remote || resolved.iter().all(|addr| addr.ip().is_loopback())) {
+        return Err(crate::GatewayConfigError::RemoteBinding.into());
+    }
     Ok(first)
 }
 

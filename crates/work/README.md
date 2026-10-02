@@ -141,15 +141,32 @@ rejects a weaker output scheme.
 - `paid_client::PaidWorkSession` owns one funded channel. It authenticates the
   provider, resumes journaled jobs, verifies results, pays, and closes. The CLI
   and paid gateway use this same session. `run_paid_work` wraps one complete job.
+- `grant_client::GrantSession` owns a private grant channel and its proposal
+  journal. Both session types use `WorkLink` for authenticated transport and the
+  common Work policy and transcript verification code. Grant Responses startup
+  lives in `grant_gateway::responses`; `gateway` always names `hellas-gateway`.
 - `PreparedPaidWorkInput` and `WorkPolicy` select Evaluate or Fetch. Each
   profile validates its own canonical input, bounds and terminal result; the
   payment lifecycle does not interpret HTTP or model output.
 - `FetchProviderOptions` and `start_fetch_provider` take an operator's route
   registry, enrollment and root prover. The host owns its identity and credentials;
-  the SDK supplies the shared provider routing and finalized-chain clock.
+  the SDK validates resources before opening journals and builds a `WorkRouter`
+  for grants, payment channels, or both. `GrantProviderPlan` is also used by CLI
+  servers and local owner execution. Only payment channels start a chain observer.
 - `HttpFetchRequest` and `HttpFetchResponse` express HTTPS semantics. The Fetch
   backend executes an admitted request; canonical transcript verification checks
   its result under the assurance requested by the caller.
+
+Grant-only SDK features (`grant-client`, `grant-provider`, `grant-gateway`, and
+`grant-admin`) do not depend on `hellas-chain`. Payment features add chain access
+through `paid-work`; each public feature is tested independently in CI.
+
+Both funding paths reserve a `WorkPermit` before entering the executor queue.
+`AdmittedWork` carries that permit into `RunningWork`, which owns it until the
+physical invocation ends. Grant acceptance reserves capacity before co-signing;
+payment obligations wait for capacity. Grant execution and gateway tasks are
+joined at shutdown, including after a journal failure. Provider and gateway
+shutdown return errors after cleanup, so callers must handle the result.
 
 A session serializes its jobs. After cancellation, recover the journal before
 admitting another job. Evaluate supports authenticated incremental token delivery;
@@ -171,3 +188,7 @@ not contact a paid upstream or enroll a real Apple device.
 Work uses journal format 7 and close descriptor v3. Each request selects its
 funding kind and channel ID; setup requests select their bond. One peer may own
 several bonds.
+
+The grant definition format no longer includes scheduling `weight`. Offers and
+journals written with that field are incompatible with this format; retain those
+journals for explicit migration instead of deleting them or resetting allowances.

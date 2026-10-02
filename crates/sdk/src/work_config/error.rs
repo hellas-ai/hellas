@@ -1,4 +1,4 @@
-use super::{ContentId, EdgeId, Key};
+use super::{EdgeId, Key};
 use std::path::PathBuf;
 
 /// Configuration errors retain the field, route or file that failed.
@@ -53,24 +53,8 @@ pub enum WorkConfigError {
     DuplicateValidator(String),
     #[error("validators must name exactly {expected} validator URLs, found {actual}")]
     ValidatorCount { expected: usize, actual: usize },
-    #[error("{field} is not a ContentId: {source}")]
-    ContentId {
-        field: &'static str,
-        source: <ContentId as std::str::FromStr>::Err,
-    },
     #[error(transparent)]
-    Fetch(#[from] hellas_rpc::fetch::FetchProtocolError),
+    Resource(#[from] crate::ResourceConfigError),
     #[error("paid execution policy is not usable: {0}")]
     Policy(#[from] hellas_rpc::protocol::work::PaidWorkError),
-    #[error("{field} is not hexadecimal: {source}")]
-    Hex {
-        field: &'static str,
-        source: hex::FromHexError,
-    },
-    #[error("{field} must be {expected} bytes, found {actual}")]
-    Length {
-        field: &'static str,
-        expected: usize,
-        actual: usize,
-    },
 }
