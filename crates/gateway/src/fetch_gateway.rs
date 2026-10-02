@@ -19,7 +19,7 @@ pub struct FetchGatewayOptions {
     pub work: Arc<dyn WorkExecutionBackend>,
 }
 
-pub async fn start_fetch(options: FetchGatewayOptions) -> anyhow::Result<GatewayHandle> {
+pub async fn start_fetch(options: FetchGatewayOptions) -> crate::GatewayResult<GatewayHandle> {
     let work = options.work.clone();
     let result = async {
         let listener = super::bind_gateway(&options.host, options.port, false).await?;
@@ -39,7 +39,7 @@ pub async fn start_fetch(options: FetchGatewayOptions) -> anyhow::Result<Gateway
     }
     .await;
     if result.is_err() {
-        work.drain().await;
+        return super::finish_cleanup(result, work.drain().await);
     }
     result
 }

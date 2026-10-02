@@ -1,11 +1,78 @@
 use std::{collections::BTreeMap, time::Duration};
 
-use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use tokio::{io::AsyncWriteExt, process::Command};
 
 use crate::config::{Credentials, ProviderConfig, Spec};
+
+pub type Result<T> = std::result::Result<T, ProviderError>;
+
+#[derive(Debug, thiserror::Error)]
+pub enum ProviderError {
+    #[error(transparent)]
+    Config(#[from] crate::config::ConfigError),
+    #[error("{0}")]
+    Account(#[from] crate::accounts::AccountError),
+    #[error(transparent)]
+    Id(#[from] InvalidProviderId),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Timeout(#[from] tokio::time::error::Elapsed),
+    #[error(transparent)]
+    Http(#[from] reqwest::Error),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    Utf8(#[from] std::string::FromUtf8Error),
+    #[error("docker operation failed (details suppressed to avoid leaking bootstrap credentials)")]
+    DockerFailed,
+    #[error("listing is not implemented for this provider")]
+    ListingUnsupported,
+    #[error("provider response too large")]
+    ResponseBound,
+    #[error("provider refused operation; inspect provider console")]
+    Refused,
+    #[error("invalid bootstrap environment")]
+    BootstrapEnvironment,
+    #[error("Runpod did not retain the requested template attribution")]
+    TemplateAttribution,
+    #[error("Runpod image differs from the resolved template; template may have changed")]
+    TemplateChanged,
+    #[error("unexpected Runpod template")]
+    TemplateIdentity,
+    #[error("Hellas requires a Pod template")]
+    ServerlessTemplate,
+    #[error("template must mount persistent worker data at /var/lib/hellas")]
+    TemplateMount,
+    #[error("template image changed from the requested digest")]
+    RequestedImageChanged,
+    #[error("invalid pod list")]
+    PodList,
+    #[error("Runpod creation requires a template")]
+    MissingTemplate,
+    #[error("missing pod ID; reconcile by name in provider console")]
+    MissingPodId,
+    #[error("missing instance ID; reconcile by name in provider console")]
+    MissingInstanceId,
+    #[error("template has no image")]
+    TemplateImageMissing,
+    #[error("invalid template container disk size")]
+    TemplateDisk,
+    #[error("invalid template volume size")]
+    TemplateVolume,
+    #[error("provider/spec mismatch")]
+    SpecMismatch,
+    #[error("template resolution requires Runpod")]
+    TemplateRequiresRunpod,
+    #[error("start docker")]
+    DockerSpawn(#[source] std::io::Error),
+    #[error("provider request failed; reconcile resource by name before retrying allocation")]
+    Request(#[source] reqwest::Error),
+    #[error("provider returned HTTP {0}; response body withheld (may contain credentials)")]
+    HttpStatus(reqwest::StatusCode),
+}
 
 /// Providers own allocation only; administration and Hellas routing are shared.
 /// An additional backend implements these methods and adds one config variant.
@@ -15,7 +82,7 @@ pub trait Provider: Send + Sync {
     fn plan(&self, spec: &Spec) -> Result<Value>;
     /// Resolve provider metadata before saving the pending allocation receipt.
     async fn prepare(&self, spec: &mut Spec) -> Result<()> {
-        spec.validate()
+        spec.validate().map_err(ProviderError::from)
     }
     async fn create(&self, spec: &Spec, credentials: &Credentials) -> Result<String>;
     /// Check the allocated resource after its ID is safely recorded.
@@ -48,15 +115,14 @@ async fn docker(args: &[&str], input: Option<&[u8]>) -> Result<String> {
     if input.is_some() {
         command.stdin(std::process::Stdio::piped());
     }
-    let mut child = command.spawn().context("start docker")?;
+    let mut child = command.spawn().map_err(ProviderError::DockerSpawn)?;
     if let Some(bytes) = input {
         child.stdin.take().unwrap().write_all(bytes).await?;
     }
     let output = tokio::time::timeout(Duration::from_secs(600), child.wait_with_output()).await??;
-    ensure!(
-        output.status.success(),
-        "docker operation failed (details suppressed to avoid leaking bootstrap credentials)"
-    );
+    if !output.status.success() {
+        return Err(ProviderError::DockerFailed);
+    }
     Ok(String::from_utf8(output.stdout)?.trim().to_owned())
 }
 
@@ -157,12 +223,11 @@ impl Cloud {
     }
 
     pub async fn list(&self) -> Result<Value> {
-        ensure!(
-            matches!(self.kind, CloudKind::Runpod),
-            "listing is not implemented for this provider"
-        );
+        if !matches!(self.kind, CloudKind::Runpod) {
+            return Err(ProviderError::ListingUnsupported);
+        }
         let value = self.request(reqwest::Method::GET, "/pods", None).await?;
-        let pods = value.as_array().context("invalid pod list")?;
+        let pods = value.as_array().ok_or(ProviderError::PodList)?;
         Ok(Value::Array(pods.iter().map(runpod_summary).collect()))
     }
 
@@ -173,10 +238,8 @@ impl Cloud {
         body: Option<Value>,
     ) -> Result<Value> {
         let key = self.credential.token().await.map_err(|error| {
-            if matches!(self.kind, CloudKind::Runpod)
-                && error.is::<crate::accounts::MissingCredential>()
-            {
-                error.context(crate::accounts::RunpodAccountRequired)
+            if matches!(self.kind, CloudKind::Runpod) {
+                error.for_runpod()
             } else {
                 error
             }
@@ -189,30 +252,25 @@ impl Cloud {
             request = request.json(&body);
         }
         // Do not retry allocation: a lost response can hide a billable resource.
-        let mut response = request.send().await.context(
-            "provider request failed; reconcile resource by name before retrying allocation",
-        )?;
+        let mut response = request.send().await.map_err(ProviderError::Request)?;
         let status = response.status();
-        ensure!(
-            status.is_success(),
-            "provider returned HTTP {status}; response body withheld (may contain credentials)"
-        );
+        if !status.is_success() {
+            return Err(ProviderError::HttpStatus(status));
+        }
         let mut bytes = Vec::new();
         while let Some(chunk) = response.chunk().await? {
-            ensure!(
-                bytes.len() + chunk.len() <= 1024 * 1024,
-                "provider response too large"
-            );
+            if bytes.len() + chunk.len() > 1024 * 1024 {
+                return Err(ProviderError::ResponseBound);
+            }
             bytes.extend_from_slice(&chunk);
         }
         if bytes.is_empty() {
             return Ok(Value::Null);
         }
-        let value: Value = serde_json::from_slice(&bytes).context("invalid provider JSON")?;
-        ensure!(
-            value.get("success") != Some(&Value::Bool(false)),
-            "provider refused operation; inspect provider console"
-        );
+        let value: Value = serde_json::from_slice(&bytes)?;
+        if value.get("success") == Some(&Value::Bool(false)) {
+            return Err(ProviderError::Refused);
+        }
         Ok(value)
     }
 
@@ -230,7 +288,7 @@ impl Cloud {
             ) => {
                 let template_id = template_id
                     .as_deref()
-                    .context("Runpod creation requires a template")?;
+                    .ok_or(ProviderError::MissingTemplate)?;
                 validate_id(template_id)?;
                 // Inherit image, disks, registry auth, ports and startup settings.
                 // Cloning a template into an ad-hoc image request loses attribution.
@@ -243,20 +301,19 @@ impl Cloud {
             }
             (CloudKind::Vast, ProviderConfig::Vast { disk_gb, .. }) => {
                 // Values are generated hex only, never arbitrary shell fragments.
-                ensure!(
-                    env.iter().all(
-                        |(k, v)| k.bytes().all(|b| b.is_ascii_uppercase() || b == b'_')
-                            && v.bytes().all(|b| b.is_ascii_hexdigit())
-                    ),
-                    "invalid bootstrap environment"
-                );
+                if !(env.iter().all(|(k, v)| {
+                    k.bytes().all(|b| b.is_ascii_uppercase() || b == b'_')
+                        && v.bytes().all(|b| b.is_ascii_hexdigit())
+                })) {
+                    return Err(ProviderError::BootstrapEnvironment);
+                }
                 Ok(
                     json!({"label":spec.name, "image":spec.image, "disk":disk_gb,
                     "runtype":"args", "args":[], "target_state":"running", "cancel_unavail":true,
                     "env":env.into_iter().map(|(k,v)|format!("-e {k}={v}")).collect::<Vec<_>>().join(" ")}),
                 )
             }
-            _ => bail!("provider/spec mismatch"),
+            _ => Err(ProviderError::SpecMismatch),
         }
     }
 }
@@ -271,14 +328,14 @@ impl Provider for Cloud {
         if let ProviderConfig::Runpod { template_id, .. } = &spec.provider {
             let id = template_id
                 .as_deref()
-                .context("Runpod creation requires a template")?;
+                .ok_or(ProviderError::MissingTemplate)?;
             validate_id(id)?;
             let template = self
                 .request(reqwest::Method::GET, &format!("/templates/{id}"), None)
                 .await?;
             resolve_runpod_template(spec, &template)?;
         }
-        spec.validate()
+        spec.validate().map_err(ProviderError::from)
     }
 
     async fn verify(&self, spec: &Spec, id: &str) -> Result<()> {
@@ -288,14 +345,12 @@ impl Provider for Cloud {
         } = &spec.provider
         {
             let pod = self.inspect(id).await?;
-            ensure!(
-                pod["template_id"].as_str() == Some(template_id),
-                "Runpod did not retain the requested template attribution"
-            );
-            ensure!(
-                pod["image"].as_str() == Some(&spec.image),
-                "Runpod image differs from the resolved template; template may have changed"
-            );
+            if pod["template_id"].as_str() != Some(template_id) {
+                return Err(ProviderError::TemplateAttribution);
+            }
+            if pod["image"].as_str() != Some(&spec.image) {
+                return Err(ProviderError::TemplateChanged);
+            }
         }
         Ok(())
     }
@@ -307,17 +362,17 @@ impl Provider for Cloud {
             ProviderConfig::Vast { offer_id, .. } => {
                 (reqwest::Method::PUT, format!("/asks/{offer_id}/"))
             }
-            _ => bail!("provider/spec mismatch"),
+            _ => return Err(ProviderError::SpecMismatch),
         };
         let response = self.request(method, &path, Some(body)).await?;
         let id = match self.kind {
             CloudKind::Runpod => response["id"]
                 .as_str()
-                .context("missing pod ID; reconcile by name in provider console")?
+                .ok_or(ProviderError::MissingPodId)?
                 .to_owned(),
             CloudKind::Vast => response["new_contract"]
                 .as_u64()
-                .context("missing instance ID; reconcile by name in provider console")?
+                .ok_or(ProviderError::MissingInstanceId)?
                 .to_string(),
         };
         validate_id(&id)?;
@@ -359,38 +414,34 @@ fn resolve_runpod_template(spec: &mut Spec, template: &Value) -> Result<()> {
         ..
     } = &mut spec.provider
     else {
-        bail!("template resolution requires Runpod");
+        return Err(ProviderError::TemplateRequiresRunpod);
     };
-    ensure!(
-        template["id"].as_str() == template_id.as_deref(),
-        "unexpected Runpod template"
-    );
-    ensure!(
-        template["isServerless"] != true,
-        "Hellas requires a Pod template"
-    );
-    ensure!(
-        template["volumeMountPath"] == "/var/lib/hellas",
-        "template must mount persistent worker data at /var/lib/hellas"
-    );
+    if template["id"].as_str() != template_id.as_deref() {
+        return Err(ProviderError::TemplateIdentity);
+    }
+    if template["isServerless"] == true {
+        return Err(ProviderError::ServerlessTemplate);
+    }
+    if template["volumeMountPath"] != "/var/lib/hellas" {
+        return Err(ProviderError::TemplateMount);
+    }
     let image = template["imageName"]
         .as_str()
-        .context("template has no image")?;
-    ensure!(
-        spec.image.is_empty() || spec.image == image,
-        "template image changed from the requested digest"
-    );
+        .ok_or(ProviderError::TemplateImageMissing)?;
+    if !spec.image.is_empty() && spec.image != image {
+        return Err(ProviderError::RequestedImageChanged);
+    }
     spec.image = image.to_owned();
     *disk_gb = template["containerDiskInGb"]
         .as_u64()
         .and_then(|v| u32::try_from(v).ok())
-        .context("invalid template container disk size")?;
+        .ok_or(ProviderError::TemplateDisk)?;
     *volume_gb = template["volumeInGb"]
         .as_u64()
         .and_then(|v| u32::try_from(v).ok())
-        .context("invalid template volume size")?;
+        .ok_or(ProviderError::TemplateVolume)?;
     // Only non-secret deployment metadata is copied into the receipt.
-    spec.validate()
+    spec.validate().map_err(ProviderError::from)
 }
 
 /// Provider responses also contain environment secrets: project an allowlist.
@@ -403,13 +454,17 @@ fn runpod_summary(value: &Value) -> Value {
         "disk_gb":value["containerDiskInGb"], "volume_gb":value["volumeInGb"]})
 }
 
-pub fn validate_id(id: &str) -> Result<()> {
-    ensure!(
-        !id.is_empty()
-            && id.len() <= 128
-            && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'),
-        "invalid provider resource ID"
-    );
+#[derive(Debug, thiserror::Error)]
+#[error("invalid provider resource ID")]
+pub struct InvalidProviderId;
+
+pub fn validate_id(id: &str) -> std::result::Result<(), InvalidProviderId> {
+    if id.is_empty()
+        || id.len() > 128
+        || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    {
+        return Err(InvalidProviderId);
+    }
     Ok(())
 }
 

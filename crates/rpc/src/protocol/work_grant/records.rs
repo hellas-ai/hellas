@@ -179,21 +179,10 @@ pub enum GrantKind {
     Owner(Principal),
     Principal(Principal),
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum GrantClass {
-    Interactive,
-    Granted,
-}
 impl GrantKind {
     pub fn principal(&self) -> &Principal {
         match self {
             Self::Owner(p) | Self::Principal(p) => p,
-        }
-    }
-    pub fn class(&self) -> GrantClass {
-        match self {
-            Self::Owner(_) => GrantClass::Interactive,
-            Self::Principal(_) => GrantClass::Granted,
         }
     }
 }
@@ -273,7 +262,6 @@ pub struct GrantDef {
     pub kind: GrantKind,
     pub policies: Vec<GrantPolicy>,
     pub limits: Vec<Limit>,
-    pub weight: NonZeroU16,
     pub max_job_millis: NonZeroU64,
     pub max_in_flight: NonZeroU16,
     pub expires: Option<UnixMillis>,

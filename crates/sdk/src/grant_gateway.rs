@@ -1,9 +1,10 @@
 //! One private grant channel behind the same gateway execution interface as a
 //! paid pool. HTTP disconnects never abandon an already signed proposal.
-use crate::{
-    grant_client::*,
-    work_session::{GrantFunding, WorkSession},
+use crate::grant_client::{
+    GrantClientError, GrantSession, GrantSessionOptions, GrantTransport, GrantWorkResult,
 };
+
+pub mod responses;
 use futures::future::BoxFuture;
 use hellas_gateway::{
     ExecutionEvent, WorkExecutionBackend, WorkExecutionRequest, WorkFetchRequest, WorkGatewayBusy,
@@ -19,7 +20,7 @@ use hellas_rpc::{
     },
 };
 use std::{
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::{Duration, Instant},
 };
 use tokio::sync::{Mutex as AsyncMutex, Semaphore};
@@ -87,7 +88,7 @@ fn client_error(e: GrantClientError) -> WorkGatewayError {
     }
 }
 pub struct GrantGateway {
-    session: Arc<AsyncMutex<WorkSession<GrantFunding>>>,
+    session: Arc<AsyncMutex<GrantSession>>,
     offer: SignedOffer,
     policy: Option<String>,
     provider: iroh::EndpointId,
@@ -96,7 +97,7 @@ pub struct GrantGateway {
     assurance: hellas_rpc::Assurance,
     endpoint: Option<iroh::Endpoint>,
     admission: Arc<Semaphore>,
-    tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    tasks: crate::gateway_work::WorkTasks,
 }
 impl GrantGateway {
     /// The gateway owns the endpoint lifecycle when given a remote transport.
@@ -121,7 +122,7 @@ impl GrantGateway {
             GrantTransport::Remote(endpoint) => Some(endpoint.clone()),
             GrantTransport::Local(_) => None,
         };
-        let mut session = WorkSession::<GrantFunding>::open(options, transport)
+        let mut session = GrantSession::open(options, transport)
             .await
             .map_err(client_error)?;
         // Recover the single unresolved acceptance before admitting fresh work.
@@ -163,7 +164,7 @@ impl GrantGateway {
             assurance,
             endpoint,
             admission: Arc::new(Semaphore::new(32)),
-            tasks: Mutex::new(vec![]),
+            tasks: crate::gateway_work::WorkTasks::default(),
         }))
     }
 
@@ -222,11 +223,9 @@ impl GrantGateway {
             .clone()
             .try_acquire_owned()
             .map_err(|_| WorkGatewayBusy)?;
-        let mut tasks = self.tasks.lock().expect("gateway tasks poisoned");
         if self.admission.is_closed() {
             return Err(WorkGatewayBusy.into());
         }
-        tasks.retain(|task| !task.is_finished());
         let session = self.session.clone();
         let selected = self.policy.clone();
         let assurance = self.assurance;
@@ -237,7 +236,7 @@ impl GrantGateway {
             tokio::sync::mpsc::channel(crate::gateway_work::OUTPUT_BUFFER_EVENTS);
         let (overflow, overflow_receiver) = tokio::sync::watch::channel(false);
         let budget = Arc::new(Semaphore::new(crate::gateway_work::OUTPUT_BUFFER_BYTES));
-        let task = tokio::spawn(async move {
+        self.tasks.spawn(async move {
             let _permit = permit;
             let result = async {
                 let mut session = tokio::time::timeout_at(deadline, session.lock())
@@ -280,8 +279,7 @@ impl GrantGateway {
             .await;
             let size = result.as_ref().map_or(1024, E::bytes);
             crate::gateway_work::emit(&sender, &overflow, &budget, result, size);
-        });
-        tasks.push(task);
+        })?;
         Ok(crate::gateway_work::response_stream(
             receiver,
             overflow_receiver,
@@ -467,24 +465,22 @@ impl WorkExecutionBackend for GrantGateway {
     fn timeout(&self) -> Duration {
         self.timeout
     }
-    fn drain(&self) -> BoxFuture<'_, ()> {
-        let tasks = {
-            let mut tasks = self.tasks.lock().expect("gateway tasks poisoned");
-            self.admission.close();
-            std::mem::take(&mut *tasks)
-        };
+    fn drain(&self) -> BoxFuture<'_, Result<(), hellas_gateway::WorkShutdownError>> {
+        self.admission.close();
+        self.tasks.close();
         Box::pin(async move {
-            for task in tasks {
-                if let Err(error) = task.await {
-                    tracing::error!(%error, "grant gateway task failed");
-                }
-            }
-            if let Err(error) = self.session.lock().await.shutdown().await {
-                tracing::error!(%error, "grant gateway retains unresolved acceptance for recovery");
-            }
+            let tasks = self.tasks.drain().await;
+            let session = self
+                .session
+                .lock()
+                .await
+                .shutdown()
+                .await
+                .map_err(|error| hellas_gateway::WorkShutdownError::Recovery(Arc::new(error)));
             if let Some(endpoint) = &self.endpoint {
                 endpoint.close().await;
             }
+            tasks.and(session)
         })
     }
 }

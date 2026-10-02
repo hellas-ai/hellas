@@ -1,5 +1,8 @@
-use super::*;
-use hellas_rpc::protocol::work_grant::admin::*;
+use super::{
+    GrantDef, GrantError, GrantId, GrantKind, GrantPolicy, GrantService, GrantState, GrantStore,
+    GrantStoreError, Revision, UnixMillis,
+};
+use hellas_rpc::protocol::work_grant::admin::{GrantCommand, GrantReply, GrantSummary, GrantTerms};
 use std::num::NonZeroU64;
 
 impl GrantService {
@@ -174,7 +177,6 @@ impl Definition for GrantTerms {
             state,
             policies,
             limits: self.limits,
-            weight: std::num::NonZeroU16::new(1).expect("one"),
             max_job_millis: self.max_job_millis,
             max_in_flight: self.max_in_flight,
             allow_account_backed: self.allow_account_backed,

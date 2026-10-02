@@ -188,10 +188,7 @@ impl InputIdentities {
 
 /// A funded client channel. Keep one session per journal and serialize its jobs.
 /// Cancellation retains recovery state; call `run(None, true, None)` to resume it.
-pub type PaidWorkSession =
-    crate::WorkSession<hellas_work::work_store::channel::funding::PaymentFunding>;
-
-pub struct PaymentSession {
+pub struct PaidWorkSession {
     args: PaidWorkOptions,
     descriptor: WorkChannelDescriptor,
     dialer: ProviderDialer,
@@ -200,7 +197,7 @@ pub struct PaymentSession {
     needs_recovery: bool,
 }
 
-impl Drop for PaymentSession {
+impl Drop for PaidWorkSession {
     fn drop(&mut self) {
         let _ = self.client.observer().suspend();
         if let Some(observer) = &self.observer {
@@ -283,7 +280,7 @@ fn check_payment_window(client: &ClientService, work_id: hellas_rpc::Digest) -> 
     })?
 }
 
-impl PaymentSession {
+impl PaidWorkSession {
     pub async fn open(
         args: PaidWorkOptions,
         endpoint: Endpoint,

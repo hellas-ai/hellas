@@ -29,7 +29,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore, mpsc, watch};
-use tokio::task::JoinHandle;
 use tracing::Instrument;
 
 // An OpenCode conversation has a substantial shared chat prefix. Smaller
@@ -189,7 +188,7 @@ pub struct PaidGateway {
     settlement_key: Secp256k1Signer,
     producer_key: hellas_rpc::ProducerSigningKey,
     admission: Arc<Semaphore>,
-    tasks: Mutex<Vec<JoinHandle<()>>>,
+    tasks: crate::gateway_work::WorkTasks,
 }
 
 impl PaidGateway {
@@ -225,7 +224,7 @@ impl PaidGateway {
             endpoint: bind_paid_endpoint(identity.transport_key()).await?,
             settlement_key,
             producer_key: identity.caller_key().clone(),
-            tasks: Mutex::new(Vec::new()),
+            tasks: crate::gateway_work::WorkTasks::default(),
         });
         // Restart recovery uses the retained input and certificate, never a new job.
         // Empty journal roots do not fund a channel until an HTTP request arrives.
@@ -302,9 +301,6 @@ impl PaidGateway {
         recovery_timeout: Option<Duration>,
         permit: Option<OwnedSemaphorePermit>,
     ) -> Result<BoxStream<'static, Result<E>>> {
-        // Admission can precede local request preparation. Serialize the final
-        // gate check and registration with drain's close-and-snapshot boundary.
-        let mut tasks = self.tasks.lock().expect("paid task list poisoned");
         if self.admission.is_closed() {
             return Err(hellas_gateway::WorkGatewayBusy.into());
         }
@@ -332,7 +328,7 @@ impl PaidGateway {
         // Queueing, recovery and fallback all consume the same request budget.
         let deadline = tokio::time::Instant::now() + timeout;
         let task_span = span.clone();
-        let task = tokio::spawn(async move {
+        self.tasks.spawn(async move {
             let _permit = permit;
             let token_sender = sender.clone();
             let token_overflow = overflow.clone();
@@ -340,7 +336,7 @@ impl PaidGateway {
             let streamed = prepared.is_some();
             let recovery = !streamed;
             let progress: hellas_work::work::PaidProgress = Arc::new(move |event| {
-                let event = E::prefix(event).map_err(|error| hellas_work::work::BackendFault::new(error.to_string()))?;
+                let event = E::prefix(event).map_err(hellas_work::work::BackendFault::caused_by)?;
                 emit(&token_sender, &token_overflow, &token_budget, Ok(event));
                 Ok(())
             });
@@ -509,9 +505,7 @@ impl PaidGateway {
                 },
                 Err(error) => { emit(&sender, &overflow, &output_budget, Err(error)); }
             }
-        }.instrument(span));
-        tasks.retain(|task| !task.is_finished());
-        tasks.push(task);
+        }.instrument(span))?;
         Ok(response_stream(receiver, overflow_receiver))
     }
 }
@@ -591,40 +585,18 @@ impl WorkExecutionBackend for PaidGateway {
         paid_stream(self.execute_tokens(request))
     }
 
-    fn drain(&self) -> BoxFuture<'_, ()> {
-        let tasks = {
-            let mut tasks = self.tasks.lock().expect("paid task list poisoned");
-            self.admission.close();
-            std::mem::take(&mut *tasks)
-        };
+    fn drain(&self) -> BoxFuture<'_, Result<(), hellas_gateway::WorkShutdownError>> {
+        self.admission.close();
+        self.tasks.close();
         Box::pin(async move {
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-            let mut interrupted = 0;
-            for mut task in tasks {
-                match tokio::time::timeout_at(deadline, &mut task).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => {
-                        tracing::error!(%error, "paid gateway task failed during shutdown")
-                    }
-                    Err(_) => {
-                        task.abort();
-                        let _ = task.await;
-                        interrupted += 1;
-                    }
-                }
-            }
-            if interrupted > 0 {
-                tracing::warn!(
-                    interrupted,
-                    "paid gateway shutdown deadline reached; retained work will recover on startup"
-                );
-            }
+            let tasks = self.tasks.drain().await;
             for provider in &self.providers {
-                if let Some(mut session) = provider.serial.lock().await.take() {
+                if let Some(session) = provider.serial.lock().await.as_mut() {
                     session.shutdown().await;
                 }
             }
             self.endpoint.close().await;
+            tasks
         })
     }
 }
@@ -918,7 +890,7 @@ mod tests {
                 .expect("Responses uses the shared paid backend"),
         );
         assert!(gateway.fetch(request("another-route")).is_err());
-        gateway.drain().await;
+        gateway.drain().await.unwrap();
         assert!(!fixture.root.path().join("client").exists());
     }
 
@@ -1105,18 +1077,17 @@ mod tests {
             settlement_key: Secp256k1Signer::from_secret_scalar([7; 32]).unwrap(),
             producer_key: hellas_rpc::ProducerSigningKey::from_secret_bytes([7; 32]).unwrap(),
             admission: Arc::new(Semaphore::new(1)),
-            tasks: Mutex::new(Vec::new()),
+            tasks: crate::gateway_work::WorkTasks::default(),
         };
         // Deterministically pause execute at the point after admission but
         // before preparation/routing has reached task registration.
         let permit = gateway.admission.clone().try_acquire_owned().unwrap();
-        gateway.drain().await;
+        gateway.drain().await.unwrap();
         let result = gateway.submit::<ExecutionEvent>(Vec::new(), None, None, None, Some(permit));
         assert!(matches!(
             result.err().expect("submission after drain"),
             PoolError::Busy(_)
         ));
-        assert!(gateway.tasks.lock().unwrap().is_empty());
         assert_eq!(gateway.admission.available_permits(), 1);
     }
 

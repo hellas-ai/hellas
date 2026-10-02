@@ -65,7 +65,7 @@ const MAX_BINDINGS: usize = 16_384;
 const SESSION_IDLE: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Debug, thiserror::Error)]
-pub(super) enum RoutingError {
+pub enum RoutingError {
     #[error("HTTP backend {backend} must name a provider from the paid pool")]
     AmbiguousProvider { backend: String },
     #[error(

@@ -3,6 +3,7 @@ pub(crate) mod affinity;
 mod config;
 mod observation;
 mod routing;
+pub use routing::RoutingError;
 
 pub use config::{HttpGatewayConfig, HttpRoute};
 #[cfg(test)]
@@ -63,16 +64,16 @@ pub struct HttpGatewayOptions {
 }
 
 /// Start without signal handlers. Failed startup drains any recovering paid jobs.
-pub async fn start_http(options: HttpGatewayOptions) -> anyhow::Result<GatewayHandle> {
+pub async fn start_http(options: HttpGatewayOptions) -> crate::GatewayResult<GatewayHandle> {
     let paid = options.paid.clone();
     let result = start(options).await;
     if result.is_err() {
-        paid.drain().await;
+        return super::finish_cleanup(result, paid.drain().await);
     }
     result
 }
 
-async fn start(options: HttpGatewayOptions) -> anyhow::Result<GatewayHandle> {
+async fn start(options: HttpGatewayOptions) -> crate::GatewayResult<GatewayHandle> {
     let config = options.config;
     config.validate()?;
     let paid = options.paid;

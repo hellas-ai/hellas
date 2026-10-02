@@ -23,63 +23,7 @@ pub mod work_config;
 pub use provision::{ProvisionOptions, run_provision};
 pub use work_config::{WorkConfig, load_work_config};
 
-pub struct GrantNodeConfig {
-    pub config: hellas_sdk::grant_config::GrantConfig,
-    pub provider: hellas_rpc::protocol::work_grant::records::Principal,
-    pub owner: Option<hellas_rpc::protocol::work_grant::records::Principal>,
-}
-
-pub(crate) fn prepare_grants(
-    grants: GrantNodeConfig,
-) -> anyhow::Result<(
-    hellas_sdk::grant_config::GrantConfig,
-    hellas_work::work_store::grant::GrantStore,
-)> {
-    let now = hellas_work::grant_service::wall_clock();
-    let mut store = hellas_work::work_store::grant::GrantStore::open(
-        &grants.config.journal_root,
-        hellas_rpc::protocol::work_grant::grant_network(),
-        grants.provider.bundle().clone(),
-        now,
-    )?;
-    if let Some(limits) = &grants.config.machine_limits {
-        store.configure_machine(limits.clone(), grants.config.max_in_flight, now)?;
-    } else if store
-        .state()
-        .ledger()
-        .node(hellas_rpc::protocol::work_grant::budget::BudgetNode::Machine)
-        .is_none()
-    {
-        store.configure_machine(vec![], grants.config.max_in_flight, now)?;
-    }
-    if let Some(owner) = grants.owner {
-        let id = store.initialize_owner(
-            owner,
-            grants.config.resources.clone(),
-            grants.config.max_job_millis,
-            now,
-        )?;
-        // Explicit resource configuration updates the owner's derived scope.
-        // Other grants retain their signed terms until local revision.
-        if grants.config.machine_limits.is_some() || !grants.config.resources.is_empty() {
-            let mut definition = store.state().grant(id).expect("initialized owner").clone();
-            if definition.state != hellas_rpc::protocol::work_grant::records::GrantState::Revoked
-                && (definition.policies != grants.config.resources
-                    || definition.max_job_millis != grants.config.max_job_millis)
-            {
-                definition.revision.0 = definition
-                    .revision
-                    .0
-                    .checked_add(1)
-                    .context("owner revision exhausted")?;
-                definition.policies = grants.config.resources.clone();
-                definition.max_job_millis = grants.config.max_job_millis;
-                store.define(definition, now)?;
-            }
-        }
-    }
-    Ok((grants.config, store))
-}
+pub use hellas_sdk::grant_provider::ManagedGrantOptions as GrantNodeConfig;
 
 pub struct ServeOptions {
     pub grants: Option<GrantNodeConfig>,
@@ -124,34 +68,21 @@ pub fn validate_grant_resources(
     config: &hellas_sdk::grant_config::GrantConfig,
     routes: &FetchRouteRegistry,
 ) -> CliResult<()> {
-    for resource in &config.resources {
-        use hellas_rpc::protocol::{work_fetch::FetchRoutePolicy, work_profile::WorkPolicy};
-        match &resource.work {
-            WorkPolicy::Evaluate(_) => {
-                #[cfg(not(feature = "evaluate"))]
-                anyhow::bail!("resource {} requires an Evaluate backend", resource.name);
-            }
-            WorkPolicy::Fetch {
-                policy,
-                route: FetchRoutePolicy::SealedRoute { service, method },
-            } => {
-                let entry = routes
-                    .entry(&hellas_executor::FetchRoute::new(service, method))
-                    .with_context(|| {
-                        format!("resource {} names an absent Fetch route", resource.name)
-                    })?;
-                anyhow::ensure!(
-                    entry.execution_environment() == policy.allowed_environment,
-                    "resource {} has the wrong Fetch environment",
-                    resource.name
-                );
-            }
-            WorkPolicy::Fetch { .. } => {
-                anyhow::bail!("grant resources require a named Fetch route")
-            }
-        }
-    }
+    provider_resources(routes).validate(&config.resources)?;
     Ok(())
+}
+
+fn provider_resources(
+    routes: &FetchRouteRegistry,
+) -> hellas_sdk::grant_provider::ProviderResources<'_> {
+    #[cfg(feature = "evaluate")]
+    {
+        hellas_sdk::grant_provider::ProviderResources::EvaluateAndFetch(routes)
+    }
+    #[cfg(not(feature = "evaluate"))]
+    {
+        hellas_sdk::grant_provider::ProviderResources::Fetch(routes)
+    }
 }
 
 pub fn validate_provider_config(

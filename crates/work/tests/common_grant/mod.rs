@@ -68,7 +68,6 @@ pub fn definition(id: GrantId, client: Principal) -> GrantDef {
             window: Window::Total,
             amount: 3,
         }],
-        weight: NonZeroU16::new(1).unwrap(),
         max_job_millis: NonZeroU64::new(10000).unwrap(),
         max_in_flight: NonZeroU16::new(2).unwrap(),
         expires: None,

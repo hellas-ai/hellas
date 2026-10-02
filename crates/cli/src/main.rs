@@ -1288,7 +1288,7 @@ async fn async_main() {
                         config,
                         paid: paid_work.ok_or_else(|| anyhow::anyhow!("HTTP proxy requires a Work backend"))?,
                         archive, bearer_token_file, allow_remote, host, port, wrap, wrap_args,
-                    }).await;
+                    }).await.map_err(anyhow::Error::from);
                 }
                 hellas_gateway::run(hellas_gateway::GatewayOptions {
                     archive,
@@ -1323,9 +1323,9 @@ async fn async_main() {
                     wrap,
                     wrap_args,
                 })
-                .await
+                .await.map_err(anyhow::Error::from)
                 }.await;
-                if let Some(backend) = shutdown { backend.drain().await; }
+                if let Some(backend) = shutdown { backend.drain().await?; }
                 result
             }
             .await

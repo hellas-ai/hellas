@@ -6,7 +6,6 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
@@ -15,6 +14,44 @@ use tokio::{
 };
 
 use crate::management::{Request, Service, private_directory};
+
+pub type Result<T> = std::result::Result<T, RpcError>;
+
+#[derive(Debug, thiserror::Error)]
+pub enum RpcError {
+    #[error(transparent)]
+    Config(#[from] crate::config::ConfigError),
+    #[error(transparent)]
+    Directory(#[from] crate::management::DirectoryError),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    Timeout(#[from] tokio::time::error::Elapsed),
+    #[error("unauthorized local user")]
+    Unauthorized,
+    #[error("invalid RPC frame")]
+    Frame,
+    #[error("RPC response too large")]
+    ResponseBound,
+    #[error("refusing to replace a non-socket path")]
+    NotSocket,
+    #[error("unexpected local server user")]
+    ServerUser,
+    #[error("RPC request too large")]
+    RequestBound,
+    #[error("invalid RPC response frame")]
+    ResponseFrame,
+    #[error("invalid RPC response")]
+    Response,
+    #[error("socket needs a private directory")]
+    SocketParent,
+    #[error("RPC result missing")]
+    MissingResult,
+    #[error("internal management RPC failed: {0}")]
+    Remote(String),
+}
 
 const MAX_FRAME: u64 = 1024 * 1024;
 
@@ -75,10 +112,12 @@ async fn dispatch(service: &Service, input: &[u8]) -> Option<Value> {
             Ok(request) => match service.execute(request).await {
                 Ok(result) => json!({"jsonrpc":"2.0", "id":id, "result":result}),
                 // This typed setup hint contains only public, static text.
-                Err(cause) if cause.is::<crate::accounts::RunpodAccountRequired>() => error(
+                Err(cause) if crate::accounts::AccountError::required(&cause).is_some() => error(
                     id,
                     -32000,
-                    &crate::accounts::RunpodAccountRequired.to_string(),
+                    &crate::accounts::AccountError::required(&cause)
+                        .expect("matched account error")
+                        .to_string(),
                 ),
                 // Provider errors and malformed credential commands must never leak secrets.
                 Err(_) => error(
@@ -93,10 +132,9 @@ async fn dispatch(service: &Service, input: &[u8]) -> Option<Value> {
 }
 
 async fn connection(service: Arc<Service>, stream: UnixStream) -> Result<()> {
-    ensure!(
-        stream.peer_cred()?.uid() == unsafe { libc::geteuid() },
-        "unauthorized local user"
-    );
+    if stream.peer_cred()?.uid() != unsafe { libc::geteuid() } {
+        return Err(RpcError::Unauthorized);
+    }
     let (read, mut write) = stream.into_split();
     let mut read = BufReader::new(read);
     loop {
@@ -111,13 +149,14 @@ async fn connection(service: Arc<Service>, stream: UnixStream) -> Result<()> {
         if size == 0 {
             break;
         }
-        ensure!(
-            size as u64 <= MAX_FRAME && frame.ends_with(b"\n"),
-            "invalid RPC frame"
-        );
+        if !(size as u64 <= MAX_FRAME && frame.ends_with(b"\n")) {
+            return Err(RpcError::Frame);
+        }
         if let Some(response) = dispatch(&service, &frame).await {
             let mut bytes = serde_json::to_vec(&response)?;
-            ensure!(bytes.len() as u64 <= MAX_FRAME, "RPC response too large");
+            if bytes.len() as u64 > MAX_FRAME {
+                return Err(RpcError::ResponseBound);
+            }
             bytes.push(b'\n');
             tokio::time::timeout(Duration::from_secs(30), write.write_all(&bytes)).await??;
         }
@@ -140,17 +179,12 @@ pub async fn serve_until(
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<()> {
     use std::os::unix::fs::{FileTypeExt, PermissionsExt};
-    private_directory(
-        socket
-            .parent()
-            .context("socket needs a private directory")?,
-    )?;
+    private_directory(socket.parent().ok_or(RpcError::SocketParent)?)?;
     let _lock = crate::config::lock_state(socket)?;
     if socket.try_exists()? {
-        ensure!(
-            std::fs::symlink_metadata(socket)?.file_type().is_socket(),
-            "refusing to replace a non-socket path"
-        );
+        if !std::fs::symlink_metadata(socket)?.file_type().is_socket() {
+            return Err(RpcError::NotSocket);
+        }
         std::fs::remove_file(socket)?;
     }
     let listener = UnixListener::bind(socket)?;
@@ -186,16 +220,17 @@ pub async fn serve_until(
 
 pub async fn call(socket: &Path, request: Request) -> Result<Value> {
     let stream = UnixStream::connect(socket).await?;
-    ensure!(
-        stream.peer_cred()?.uid() == unsafe { libc::geteuid() },
-        "unexpected local server user"
-    );
+    if stream.peer_cred()?.uid() != unsafe { libc::geteuid() } {
+        return Err(RpcError::ServerUser);
+    }
     let (read, mut write) = stream.into_split();
     let mut value = serde_json::to_value(request)?;
     value["jsonrpc"] = json!("2.0");
     value["id"] = json!(1);
     let mut bytes = serde_json::to_vec(&value)?;
-    ensure!(bytes.len() as u64 <= MAX_FRAME, "RPC request too large");
+    if bytes.len() as u64 > MAX_FRAME {
+        return Err(RpcError::RequestBound);
+    }
     bytes.push(b'\n');
     write.write_all(&bytes).await?;
     let mut response = Vec::new();
@@ -206,25 +241,23 @@ pub async fn call(socket: &Path, request: Request) -> Result<Value> {
             .read_until(b'\n', &mut response),
     )
     .await??;
-    ensure!(
-        response.len() as u64 <= MAX_FRAME && response.ends_with(b"\n"),
-        "invalid RPC response frame"
-    );
+    if !(response.len() as u64 <= MAX_FRAME && response.ends_with(b"\n")) {
+        return Err(RpcError::ResponseFrame);
+    }
     let response: Value = serde_json::from_slice(&response)?;
-    ensure!(
-        response["jsonrpc"] == "2.0" && response["id"] == 1,
-        "invalid RPC response"
-    );
+    if !(response["jsonrpc"] == "2.0" && response["id"] == 1) {
+        return Err(RpcError::Response);
+    }
     if response.get("error").is_some() {
-        anyhow::bail!(
-            "internal management RPC failed: {}",
+        return Err(RpcError::Remote(
             response["error"]["message"]
                 .as_str()
                 .unwrap_or("Management operation failed")
-        );
+                .to_owned(),
+        ));
     }
     response
         .get("result")
         .cloned()
-        .context("RPC result missing")
+        .ok_or(RpcError::MissingResult)
 }

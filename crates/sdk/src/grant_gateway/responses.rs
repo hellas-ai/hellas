@@ -4,13 +4,27 @@ use crate::{
     grant_client::{GrantSessionOptions, GrantTransport, PinnedOffer},
     grant_gateway::GrantGateway,
 };
-pub use hellas_gateway::*;
+use hellas_gateway::GatewayHandle;
 use hellas_rpc::protocol::{
     work_fetch::FetchRoutePolicy,
     work_grant::records::{GrantError, Principal},
     work_profile::WorkPolicy,
 };
 use std::{path::PathBuf, sync::Arc, time::Duration};
+
+#[derive(Debug, thiserror::Error)]
+pub enum FetchGatewayError {
+    #[error(transparent)]
+    Grant(#[from] GrantError),
+    #[error(transparent)]
+    Key(#[from] iroh::KeyParsingError),
+    #[error(transparent)]
+    Bind(#[from] iroh::endpoint::BindError),
+    #[error(transparent)]
+    Work(#[from] hellas_gateway::WorkGatewayError),
+    #[error(transparent)]
+    Gateway(#[from] hellas_gateway::GatewayError),
+}
 
 pub struct FetchGatewayOptions {
     pub host: String,
@@ -23,9 +37,7 @@ pub struct FetchGatewayOptions {
 }
 
 /// This constructor owns endpoint shutdown, including failed startup and drain.
-pub async fn start_fetch(
-    options: FetchGatewayOptions,
-) -> Result<GatewayHandle, Box<dyn std::error::Error + Send + Sync>> {
+pub async fn start_fetch(options: FetchGatewayOptions) -> Result<GatewayHandle, FetchGatewayError> {
     let grant = &options.offer.offer().grant;
     let client: Principal = grant.kind.principal().clone();
     if client.producer().to_bytes().as_slice() != options.identity.caller_key().public_key().bytes()

@@ -64,8 +64,12 @@ pub use store::GrantStore;
 
 #[derive(Debug, thiserror::Error)]
 pub enum GrantStoreError {
-    #[error("grant writer is unavailable after a failed durable completion")]
-    Unavailable,
+    #[error("grant writer lock was poisoned")]
+    WriterPoisoned,
+    #[error("grant completion failed: {0}")]
+    Completion(#[source] std::sync::Arc<GrantStoreError>),
+    #[error("grant execution task failed: {0}")]
+    Task(#[from] tokio::task::JoinError),
     #[error(transparent)]
     Journal(#[from] super::journal::JournalError),
     #[error(transparent)]

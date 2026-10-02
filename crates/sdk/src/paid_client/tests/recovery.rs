@@ -34,10 +34,9 @@ impl WorkBackend for Backend {
     ) -> Result<hellas_work::work::admission::WorkPermit, BackendFault> {
         Ok(hellas_work::work::admission::WorkPermit::new(
             domain,
-            self.1
-                .clone()
-                .try_acquire_owned()
-                .map_err(|_| BackendFault::new("full"))?,
+            self.1.clone().try_acquire_owned().map_err(|_| {
+                BackendFault::from(hellas_work::work::admission::AdmissionError::Capacity)
+            })?,
         ))
     }
     async fn fetch(
@@ -46,7 +45,12 @@ impl WorkBackend for Backend {
     ) -> Result<Vec<hellas_rpc::OutputEventEnvelope>, BackendFault> {
         self.0.fetch_add(1, Ordering::SeqCst);
         let (parts, admission) = input.into_parts_and_admission();
-        let _running = admission.dispatch()?;
+        let _running = admission
+            .reserve(hellas_work::work::admission::CapacityDomain::Fetch, async {
+                self.try_admit(hellas_work::work::admission::CapacityDomain::Fetch)
+            })
+            .await?
+            .dispatch()?;
         let request = verify_input_events(&parts.fetch_input_transcript).unwrap();
         let key = ProducerSigningKey::from_secret_bytes([2; 32]).unwrap();
         let mut output =
@@ -194,7 +198,7 @@ async fn restart_pays_delivered_fetch_once_and_skips_lost_payload_jobs() {
             let endpoint = bind_paid_endpoint(SecretKey::from_bytes(&[5; 32]))
                 .await
                 .unwrap();
-            let mut session = PaymentSession {
+            let mut session = PaidWorkSession {
                 args: PaidWorkOptions {
                     config: fixture.config.clone(),
                     journal_root: fixture.root.path().join("client"),

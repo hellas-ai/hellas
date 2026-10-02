@@ -1,7 +1,6 @@
 use super::proxy::ResponsesProxy;
 use super::{GatewayOptions, ResponsesBackend, json_error};
 use crate::execution::CausalLmExecutionEnvironment;
-use anyhow::Context;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use hellas_adaptors::ExecutionRequest as WireExecutionRequest;
@@ -53,21 +52,18 @@ pub(super) struct HttpError {
 }
 
 impl GatewayState {
-    pub(super) async fn from_options(options: &GatewayOptions) -> anyhow::Result<Self> {
+    pub(super) async fn from_options(options: &GatewayOptions) -> crate::GatewayResult<Self> {
         let output_cache = super::cache::OutputCache::open(&options.output_cache)?;
         let replay_only = options.output_cache.policy == super::cache::CachePolicy::ReplayOnly;
-        anyhow::ensure!(
-            options.default_max_tokens > 0,
-            "default maximum tokens must be greater than zero"
-        );
-        anyhow::ensure!(
-            options.causal_lm.is_some() == options.tokenizer.is_some(),
-            "causal-LM environment and tokenizer must be supplied together"
-        );
-        anyhow::ensure!(
-            options.responses_backend != ResponsesBackend::Hellas || options.causal_lm.is_some(),
-            "Hellas backend requires an environment and tokenizer"
-        );
+        if options.default_max_tokens == 0 {
+            return Err(crate::GatewayConfigError::MaxTokens.into());
+        }
+        if options.causal_lm.is_some() != options.tokenizer.is_some() {
+            return Err(crate::GatewayConfigError::TokenizerPair.into());
+        }
+        if !(options.responses_backend != ResponsesBackend::Hellas || options.causal_lm.is_some()) {
+            return Err(crate::GatewayConfigError::MissingEnvironment.into());
+        }
         let chat_template = options.chat_template;
         let presentation = if let Some(tokenizer) = options.tokenizer.clone() {
             Some(Arc::new(
@@ -76,7 +72,8 @@ impl GatewayState {
                         .map(|presentation| presentation.with_chat_template(chat_template))
                 })
                 .await
-                .context("tokenizer loader panicked")??,
+                .map_err(crate::GatewayError::Task)?
+                .map_err(|error| crate::GatewayError::Presentation(error.into()))?,
             ))
         } else {
             None

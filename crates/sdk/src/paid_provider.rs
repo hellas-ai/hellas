@@ -1,5 +1,6 @@
 //! Shared provider routing and finalized-chain clock for paid work.
 use crate::work_config::WorkRoutes;
+use crate::work_router::{UnmountedWork, not_ready};
 use futures::future::BoxFuture;
 use hellas_chain::client::VerifiedRemoteLightClient;
 use hellas_chain::work_blocks::advance_paid_work_clock;
@@ -8,7 +9,12 @@ use hellas_chain::{
 };
 use hellas_kernel::{EdgeId, NetworkId, Secp256k1Signer, Secp256k1Verifier};
 use hellas_rpc::call::WithTrailer;
-use hellas_rpc::pb::work::*;
+use hellas_rpc::pb::work::{
+    AcceptWorkRequest, AcceptWorkResponse, AdmitCertificateRequest, AdmitCertificateResponse,
+    DeliverResultRequest, DeliverResultResponse, ExchangeSetupRequest, ExchangeSetupResponse,
+    FundingKind, GetStandingRequest, GetStandingResponse, WorkRefusalCode, WorkRefused, WorkRoute,
+    accept_work_response, get_standing_response,
+};
 use hellas_rpc::peers::PeerId;
 use hellas_rpc::protocol::Digest;
 use hellas_rpc::protocol::work::{
@@ -38,6 +44,10 @@ use tracing::{Instrument as _, debug, info, warn};
 /// Provider observation and recovery failures preserve their typed causes.
 #[derive(Debug, thiserror::Error)]
 pub enum PaidProviderError {
+    #[error("paid-work observer task failed")]
+    Task(#[from] tokio::task::JoinError),
+    #[error(transparent)]
+    Mount(#[from] MountError),
     #[error("channel has no admission descriptor")]
     NoDescriptor,
     #[error("no finalized channel snapshot is available")]
@@ -74,82 +84,6 @@ pub enum PaidProviderError {
 }
 
 pub type ProductionWorkSource = WorkBlocks<VerifiedRemoteLightClient>;
-#[derive(Clone, Copy, Debug)]
-pub struct UnmountedWork;
-
-fn not_ready() -> WorkRefused {
-    WorkRefused {
-        grant: None,
-        code: WorkRefusalCode::NotReady as i32,
-        reason: "work state is not mounted".to_string(),
-    }
-}
-
-impl WorkSetupHandler for UnmountedWork {
-    async fn exchange_setup(
-        &self,
-        _request: ExchangeSetupRequest,
-        _context: TransportContext,
-    ) -> Result<impl Into<WithTrailer<ExchangeSetupResponse>> + Send, WireStatus> {
-        Ok(ExchangeSetupResponse {
-            outcome: Some(exchange_setup_response::Outcome::Refused(not_ready())),
-        })
-    }
-}
-
-impl WorkHandler for UnmountedWork {
-    async fn get_standing(
-        &self,
-        _request: GetStandingRequest,
-        _context: TransportContext,
-    ) -> Result<impl Into<WithTrailer<GetStandingResponse>> + Send, WireStatus> {
-        Ok(GetStandingResponse {
-            outcome: Some(get_standing_response::Outcome::Refused(not_ready())),
-        })
-    }
-
-    async fn accept_work(
-        &self,
-        _request: AcceptWorkRequest,
-        _context: TransportContext,
-    ) -> Result<impl Into<WithTrailer<AcceptWorkResponse>> + Send, WireStatus> {
-        Ok(AcceptWorkResponse {
-            outcome: Some(accept_work_response::Outcome::Refused(not_ready())),
-        })
-    }
-
-    async fn deliver_result(
-        &self,
-        _request: DeliverResultRequest,
-        _context: TransportContext,
-    ) -> Result<impl Into<WithTrailer<DeliverResultResponse>> + Send, WireStatus> {
-        Ok(DeliverResultResponse {
-            outcome: Some(deliver_result_response::Outcome::Refused(not_ready())),
-        })
-    }
-
-    async fn stream_result(
-        &self,
-        _request: DeliverResultRequest,
-        _context: TransportContext,
-    ) -> Result<hellas_work::work::PaidResultStream, WireStatus> {
-        Err(WireStatus::new(
-            hellas_wire::WireCode::Unavailable,
-            "paid work channel is not mounted",
-        ))
-    }
-
-    async fn admit_certificate(
-        &self,
-        _request: AdmitCertificateRequest,
-        _context: TransportContext,
-    ) -> Result<impl Into<WithTrailer<AdmitCertificateResponse>> + Send, WireStatus> {
-        Ok(AdmitCertificateResponse {
-            outcome: Some(admit_certificate_response::Outcome::Refused(not_ready())),
-        })
-    }
-}
-
 /// Validated configuration for driving provider journals.
 pub struct WorkRunnerConfig {
     /// The network the journals are keyed and the signatures bound to.
@@ -174,14 +108,94 @@ pub struct WorkRunnerConfig {
     pub policy: ProviderChannelPolicy,
 }
 
-type MountedChannels = BTreeMap<(FundingKind, Digest), (PeerId, MountedWorkService)>;
+impl WorkRunnerConfig {
+    /// Validate observation policy and chain identity before startup performs I/O.
+    pub fn validate(&self) -> Result<(), PaidProviderError> {
+        self.consensus_verifier().map(|_| ())
+    }
 
-/// Channels indexed by funding kind and channel identity, each bound to one peer. Handlers share the runner's state;
-/// mount locks are released before processing requests.
+    fn consensus_verifier(&self) -> Result<ConsensusVerifier, PaidProviderError> {
+        if self.poll.is_zero() || self.max_observation_age <= self.poll {
+            return Err(PaidProviderError::InvalidObservationPolicy);
+        }
+        if self.validators.is_empty() {
+            return Err(PaidProviderError::NoValidators);
+        }
+        let consensus_verifier = ConsensusVerifier::new(&ConsensusInfo {
+            validators: self.validators.clone(),
+            threshold_identity: self.threshold_identity.clone(),
+            network_id: self.network.as_str().to_owned(),
+        })?;
+        Ok(consensus_verifier)
+    }
+}
+
+/// Owns the observer through graceful shutdown, including cancellation of the caller.
+pub struct WorkWatcher {
+    stop: Option<oneshot::Sender<()>>,
+    task: tokio::task::JoinHandle<Result<(), MountError>>,
+}
+impl WorkWatcher {
+    pub fn spawn(runner: WorkRunner) -> Self {
+        let (stop, stopped) = oneshot::channel();
+        Self {
+            stop: Some(stop),
+            task: tokio::spawn(runner.run(stopped)),
+        }
+    }
+
+    pub async fn shutdown(&mut self) -> Result<(), PaidProviderError> {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        (&mut self.task).await??;
+        Ok(())
+    }
+}
+impl Drop for WorkWatcher {
+    fn drop(&mut self) {
+        self.stop.take();
+    }
+}
+
+/// Mount failures are distinct from a valid route with no matching channel.
+#[derive(Debug, thiserror::Error)]
+pub enum MountError {
+    #[error("payment mount lock is poisoned")]
+    Poisoned,
+    #[error("channel {0:?} is already mounted")]
+    DuplicateChannel(Digest),
+    #[error("setup for peer {peer:?} and bond {bond:?} is already mounted")]
+    DuplicateSetup { peer: PeerId, bond: EdgeId },
+    #[error("missing work route")]
+    MissingRoute,
+    #[error("invalid funding kind")]
+    FundingKind,
+    #[error("invalid channel identity")]
+    ChannelId,
+    #[error(transparent)]
+    Endpoint(#[from] hellas_work::work::EndpointError),
+}
+
+impl From<MountError> for WireStatus {
+    fn from(error: MountError) -> Self {
+        use hellas_wire::WireCode;
+        match error {
+            MountError::MissingRoute | MountError::FundingKind | MountError::ChannelId => {
+                Self::new(WireCode::InvalidArgument, error.to_string())
+            }
+            _ => Self::new(WireCode::Unavailable, "payment mounts are unavailable"),
+        }
+    }
+}
+
+type MountedChannels = BTreeMap<Digest, (PeerId, MountedWorkService)>;
+
+/// Payment channels indexed by channel identity and bound to an authenticated peer.
+/// The observer and request handlers share these mounts.
 #[derive(Clone)]
 pub struct MountedWork {
     mounted: Arc<Mutex<MountedChannels>>,
-    grants: Arc<Mutex<Option<hellas_work::grant_service::GrantService>>>,
     driver: Option<AcceptedWorkDriver>,
 }
 
@@ -189,7 +203,6 @@ impl Default for MountedWork {
     fn default() -> Self {
         Self {
             mounted: Arc::new(Mutex::new(BTreeMap::new())),
-            grants: Arc::new(Mutex::new(None)),
             driver: None,
         }
     }
@@ -351,61 +364,22 @@ impl WorkHandler for MountedWorkService {
 }
 
 impl MountedWork {
-    /// Grant authority has one provider-wide journal, so dynamic channels are
-    /// selected by that writer rather than separately mounted in the paid map.
-    pub fn mount_grants(&self, service: hellas_work::grant_service::GrantService) -> bool {
-        let Ok(mut held) = self.grants.lock() else {
-            return false;
-        };
-        if held.is_some() {
-            return false;
-        }
-        *held = Some(service);
-        true
-    }
-    pub fn grant_service(&self) -> Option<hellas_work::grant_service::GrantService> {
-        self.grants.lock().ok().and_then(|held| held.clone())
-    }
-    fn grant_handler(
-        &self,
-        route: Option<&WorkRoute>,
-    ) -> Option<hellas_work::grant_service::GrantService> {
-        if route?.funding_kind != FundingKind::Grant as i32 {
-            return None;
-        }
-        self.grant_service()
-    }
-    pub async fn drain_grants(
-        &self,
-    ) -> Result<(), hellas_work::work_store::grant::GrantStoreError> {
-        if let Some(service) = self.grant_service() {
-            service.drain().await?;
-        }
-        Ok(())
-    }
     pub fn with_backend<B>(backend: B) -> Self
     where
         B: WorkBackend + Send + Sync + 'static,
     {
         Self {
             mounted: Arc::new(Mutex::new(BTreeMap::new())),
-            grants: Arc::new(Mutex::new(None)),
             driver: Some(AcceptedWorkDriver::new(backend)),
         }
     }
 
     /// Mounts one channel; duplicate identities are refused without replacement.
-    pub fn mount(&self, peer: PeerId, service: &WorkService) -> bool {
-        let Ok(channel) = service.with_state(|state| state.channel().id()) else {
-            return false;
-        };
-        let Ok(mut held) = self.mounted.lock() else {
-            return false;
-        };
-        let std::collections::btree_map::Entry::Vacant(entry) =
-            held.entry((FundingKind::Payment, channel))
-        else {
-            return false;
+    pub fn mount(&self, peer: PeerId, service: &WorkService) -> Result<(), MountError> {
+        let channel = service.with_state(|state| state.channel().id())?;
+        let mut held = self.mounted.lock().map_err(|_| MountError::Poisoned)?;
+        let std::collections::btree_map::Entry::Vacant(entry) = held.entry(channel) else {
+            return Err(MountError::DuplicateChannel(channel));
         };
         entry.insert((
             peer,
@@ -414,7 +388,7 @@ impl MountedWork {
                 driver: self.driver.clone(),
             },
         ));
-        true
+        Ok(())
     }
 
     /// Resolves an explicit route, also checking the transport-vouched peer.
@@ -422,59 +396,51 @@ impl MountedWork {
         &self,
         context: &TransportContext,
         route: Option<&WorkRoute>,
-    ) -> Result<Option<MountedWorkService>, WireStatus> {
-        let route = route.ok_or_else(|| {
-            WireStatus::new(hellas_wire::WireCode::InvalidArgument, "missing work route")
-        })?;
-        let kind = FundingKind::try_from(route.funding_kind).map_err(|_| {
-            WireStatus::new(
-                hellas_wire::WireCode::InvalidArgument,
-                "unknown funding kind",
-            )
-        })?;
-        match kind {
-            FundingKind::Payment => {}
-            FundingKind::Grant => return Ok(None),
-            FundingKind::Unspecified => {
-                return Err(WireStatus::new(
-                    hellas_wire::WireCode::InvalidArgument,
-                    "missing funding kind",
-                ));
-            }
+    ) -> Result<Option<MountedWorkService>, MountError> {
+        let route = route.ok_or(MountError::MissingRoute)?;
+        match FundingKind::try_from(route.funding_kind) {
+            Ok(FundingKind::Payment) => {}
+            Ok(FundingKind::Grant) => return Ok(None),
+            _ => return Err(MountError::FundingKind),
         }
         let channel = <[u8; 32]>::try_from(route.channel_id.as_slice())
             .map(Digest::from_bytes)
-            .map_err(|_| {
-                WireStatus::new(hellas_wire::WireCode::InvalidArgument, "invalid channel id")
-            })?;
+            .map_err(|_| MountError::ChannelId)?;
         let Some(peer) = context
             .vouched_peer()
             .map(|peer| PeerId::from_bytes(peer.0))
         else {
             return Ok(None);
         };
-        Ok(self.mounted.lock().ok().and_then(|held| {
-            let (owner, mounted) = held.get(&(kind, channel))?;
-            (*owner == peer).then(|| mounted.clone())
-        }))
+        let held = self.mounted.lock().map_err(|_| MountError::Poisoned)?;
+        Ok(held
+            .get(&channel)
+            .and_then(|(owner, mounted)| (*owner == peer).then(|| mounted.clone())))
     }
 
     /// Returns a specific local payment service for journal inspection.
-    pub fn service(&self, context: &TransportContext, channel: Digest) -> Option<WorkService> {
-        self.handler(context, Some(&WorkRoute::payment(channel)))
-            .ok()
-            .flatten()
-            .map(|mounted| mounted.service)
+    pub fn service(
+        &self,
+        context: &TransportContext,
+        channel: Digest,
+    ) -> Result<Option<WorkService>, MountError> {
+        Ok(self
+            .handler(context, Some(&WorkRoute::payment(channel)))?
+            .map(|mounted| mounted.service))
     }
 
-    /// Unmounts all channels when the clock stops, releasing its journal handles.
-    pub fn clear_all(&self) {
-        if let Ok(mut held) = self.mounted.lock() {
-            for (_, channel) in held.values() {
-                let _ = channel.service.suspend();
-            }
-            held.clear();
+    /// Suspends and releases every channel, including after a poisoned mount lock.
+    pub fn clear_all(&self) -> Result<(), MountError> {
+        let (mut held, mut result) = match self.mounted.lock() {
+            Ok(held) => (held, Ok(())),
+            Err(error) => (error.into_inner(), Err(MountError::Poisoned)),
+        };
+        for (_, channel) in held.values() {
+            let suspended = channel.service.suspend().map_err(MountError::from);
+            result = result.and(suspended);
         }
+        held.clear();
+        result
     }
 }
 
@@ -484,33 +450,56 @@ pub struct MountedSetup(Arc<Mutex<BTreeMap<(PeerId, EdgeId), SetupService>>>);
 
 impl MountedSetup {
     /// Mounts a distinct bond under its authenticated transport peer.
-    pub fn mount(&self, peer: PeerId, bond_edge: EdgeId, service: &SetupService) -> bool {
-        let Ok(mut held) = self.0.lock() else {
-            return false;
-        };
-        let std::collections::btree_map::Entry::Vacant(entry) = held.entry((peer, bond_edge))
-        else {
-            return false;
+    pub fn mount(
+        &self,
+        peer: PeerId,
+        bond: EdgeId,
+        service: &SetupService,
+    ) -> Result<(), MountError> {
+        let mut held = self.0.lock().map_err(|_| MountError::Poisoned)?;
+        let std::collections::btree_map::Entry::Vacant(entry) = held.entry((peer, bond)) else {
+            return Err(MountError::DuplicateSetup { peer, bond });
         };
         entry.insert(service.clone());
-        true
+        Ok(())
     }
     /// Selects a setup using both the authenticated peer and explicit bond.
-    pub fn service(&self, context: &TransportContext, bond: EdgeId) -> Option<SetupService> {
-        let peer = context
+    pub fn service(
+        &self,
+        context: &TransportContext,
+        bond: EdgeId,
+    ) -> Result<Option<SetupService>, MountError> {
+        let Some(peer) = context
             .vouched_peer()
-            .map(|peer| PeerId::from_bytes(peer.0))?;
-        self.0.lock().ok()?.get(&(peer, bond)).cloned()
+            .map(|peer| PeerId::from_bytes(peer.0))
+        else {
+            return Ok(None);
+        };
+        Ok(self
+            .0
+            .lock()
+            .map_err(|_| MountError::Poisoned)?
+            .get(&(peer, bond))
+            .cloned())
     }
-    fn clear(&self, peer: PeerId, bond_edge: EdgeId) {
-        if let Ok(mut held) = self.0.lock() {
-            held.remove(&(peer, bond_edge));
-        }
+    fn clear(&self, peer: PeerId, bond: EdgeId) -> Result<(), MountError> {
+        self.0
+            .lock()
+            .map_err(|_| MountError::Poisoned)?
+            .remove(&(peer, bond));
+        Ok(())
     }
-    /// Stops serving all setups during runner shutdown.
-    pub fn clear_all(&self) {
-        if let Ok(mut held) = self.0.lock() {
-            held.clear();
+    /// Releases every setup, including after a poisoned mount lock.
+    pub fn clear_all(&self) -> Result<(), MountError> {
+        match self.0.lock() {
+            Ok(mut held) => {
+                held.clear();
+                Ok(())
+            }
+            Err(error) => {
+                error.into_inner().clear();
+                Err(MountError::Poisoned)
+            }
         }
     }
 }
@@ -526,7 +515,7 @@ impl WorkSetupHandler for MountedSetup {
             .map_err(|_| {
                 WireStatus::new(hellas_wire::WireCode::InvalidArgument, "invalid setup bond")
             })?;
-        match self.service(&context, bond) {
+        match self.service(&context, bond)? {
             Some(service) => Ok(Into::<WithTrailer<ExchangeSetupResponse>>::into(
                 service.exchange_setup(request, context).await?,
             )),
@@ -543,11 +532,9 @@ impl WorkHandler for MountedWork {
         request: GetStandingRequest,
         context: TransportContext,
     ) -> Result<impl Into<WithTrailer<GetStandingResponse>> + Send, WireStatus> {
-        Ok(match self.grant_handler(request.route.as_ref()) {
-            Some(service) => service.standing(&request, &context),
-            None => GetStandingResponse {
-                outcome: Some(get_standing_response::Outcome::Refused(not_ready())),
-            },
+        self.handler(&context, request.route.as_ref())?;
+        Ok(GetStandingResponse {
+            outcome: Some(get_standing_response::Outcome::Refused(not_ready())),
         })
     }
 
@@ -556,11 +543,6 @@ impl WorkHandler for MountedWork {
         request: AcceptWorkRequest,
         context: TransportContext,
     ) -> Result<impl Into<WithTrailer<AcceptWorkResponse>> + Send, WireStatus> {
-        if let Some(service) = self.grant_handler(request.route.as_ref()) {
-            return Ok(Into::<WithTrailer<AcceptWorkResponse>>::into(
-                service.accept_work(request, context).await?,
-            ));
-        }
         match self.handler(&context, request.route.as_ref())? {
             Some(service) => Ok(Into::<WithTrailer<AcceptWorkResponse>>::into(
                 service.accept_work(request, context).await?,
@@ -575,11 +557,6 @@ impl WorkHandler for MountedWork {
         request: DeliverResultRequest,
         context: TransportContext,
     ) -> Result<impl Into<WithTrailer<DeliverResultResponse>> + Send, WireStatus> {
-        if let Some(service) = self.grant_handler(request.route.as_ref()) {
-            return Ok(Into::<WithTrailer<DeliverResultResponse>>::into(
-                service.deliver_result(request, context).await?,
-            ));
-        }
         match self.handler(&context, request.route.as_ref())? {
             Some(service) => Ok(Into::<WithTrailer<DeliverResultResponse>>::into(
                 service.deliver_result(request, context).await?,
@@ -594,9 +571,6 @@ impl WorkHandler for MountedWork {
         request: DeliverResultRequest,
         context: TransportContext,
     ) -> Result<hellas_work::work::PaidResultStream, WireStatus> {
-        if let Some(service) = self.grant_handler(request.route.as_ref()) {
-            return service.stream_result(request, context).await;
-        }
         match self.handler(&context, request.route.as_ref())? {
             Some(service) => service.stream_result(request, context).await,
             None => UnmountedWork.stream_result(request, context).await,
@@ -607,11 +581,6 @@ impl WorkHandler for MountedWork {
         request: AdmitCertificateRequest,
         context: TransportContext,
     ) -> Result<impl Into<WithTrailer<AdmitCertificateResponse>> + Send, WireStatus> {
-        if let Some(service) = self.grant_handler(request.route.as_ref()) {
-            return Ok(Into::<WithTrailer<AdmitCertificateResponse>>::into(
-                service.admit_certificate(request, context).await?,
-            ));
-        }
         match self.handler(&context, request.route.as_ref())? {
             Some(service) => Ok(Into::<WithTrailer<AdmitCertificateResponse>>::into(
                 service.admit_certificate(request, context).await?,
@@ -754,8 +723,10 @@ impl SetupClock {
             match step {
                 Ok(SetupAdvance { progress, mounted }) => {
                     if let Some(store) = mounted {
-                        if let Some(peer) = self.route_peer {
-                            setup_mount.clear(peer, self.bond_edge);
+                        if let Some(peer) = self.route_peer
+                            && let Err(error) = setup_mount.clear(peer, self.bond_edge)
+                        {
+                            warn!(%error, "setup could not be unmounted");
                         }
                         self.take_mount(store, signer, &policy, work_mount);
                     } else if matches!(
@@ -832,19 +803,16 @@ impl SetupClock {
                     self.driven = Driven::Done;
                     return;
                 }
-                if self
-                    .route_peer
-                    .is_some_and(|peer| mount.mount(peer, &service))
-                {
-                    info!(
-                        bond,
-                        "this node now answers Work from the channel it mounted"
-                    );
-                } else {
-                    warn!(
-                        bond,
-                        "this channel has no unique peer route; it is driven and not served",
-                    );
+                match self.route_peer {
+                    Some(peer) => match mount.mount(peer, &service) {
+                        Ok(()) => {
+                            info!(bond, "this node now answers Work from its mounted channel")
+                        }
+                        Err(error) => {
+                            warn!(bond, %error, "channel is driven but could not be mounted")
+                        }
+                    },
+                    None => warn!(bond, "channel is driven without a peer route"),
                 }
                 self.driven = Driven::Channel(Box::new(DrivenChannel {
                     service,
@@ -898,17 +866,7 @@ impl WorkRunner {
         work_mount: MountedWork,
         setup_mount: MountedSetup,
     ) -> Result<Self, PaidProviderError> {
-        if config.poll.is_zero() || config.max_observation_age <= config.poll {
-            return Err(PaidProviderError::InvalidObservationPolicy);
-        }
-        if config.validators.is_empty() {
-            return Err(PaidProviderError::NoValidators);
-        }
-        let consensus_verifier = ConsensusVerifier::new(&ConsensusInfo {
-            validators: config.validators.clone(),
-            threshold_identity: config.threshold_identity,
-            network_id: config.network.as_str().to_owned(),
-        })?;
+        let consensus_verifier = config.consensus_verifier()?;
         let settlement_verifier = Secp256k1Verifier::new();
         let found = discover_setups(&config.journal_root, config.network).map_err(|source| {
             PaidProviderError::Discover {
@@ -962,13 +920,12 @@ impl WorkRunner {
                 PaymentAdmission::Admits(policy.clone()),
             ));
             if let Some(peer) = route_peer {
-                if setup_mount.mount(peer, setup.bond_edge, &service) {
-                    info!(
+                match setup_mount.mount(peer, setup.bond_edge, &service) {
+                    Ok(()) => info!(
                         bond,
                         "this node now answers WorkSetup from its driven setup"
-                    );
-                } else {
-                    warn!(bond, "this provider setup has an ambiguous peer route");
+                    ),
+                    Err(error) => warn!(bond, %error, "provider setup could not be mounted"),
                 }
             } else {
                 warn!(bond, "this provider setup has no configured peer route");
@@ -1009,7 +966,11 @@ impl WorkRunner {
     }
 
     /// Ticks each journal once per period and redials after a source failure.
-    pub async fn run_over<S, D, F>(mut self, mut stop: oneshot::Receiver<()>, dial: D)
+    pub async fn run_over<S, D, F>(
+        mut self,
+        mut stop: oneshot::Receiver<()>,
+        dial: D,
+    ) -> Result<(), MountError>
     where
         S: SetupView + FinalizedBlocks + FinalizedWorkView + TxSink + Sync,
         D: Fn() -> F,
@@ -1017,9 +978,7 @@ impl WorkRunner {
     {
         if self.clocks.is_empty() {
             info!("no provider setup journal under the work root; the clock has nothing to drive");
-            self.work_mount.clear_all();
-            self.setup_mount.clear_all();
-            return;
+            return self.unmount_all();
         }
         // Each channel owns its observer loop. A slow source or a large restart
         // backlog on one channel cannot stop another channel's close response.
@@ -1070,16 +1029,22 @@ impl WorkRunner {
                 }
             }
         }
-        self.work_mount.clear_all();
-        self.setup_mount.clear_all();
+        let result = self.unmount_all();
         info!("the paid-work clock stopped, and its journals are closed");
+        result
     }
 }
 
 impl WorkRunner {
+    fn unmount_all(&self) -> Result<(), MountError> {
+        let work = self.work_mount.clear_all();
+        let setup = self.setup_mount.clear_all();
+        work.and(setup)
+    }
+
     /// Ticks until told to stop, over the validators the configuration
     /// names.
-    pub async fn run(self, stop: oneshot::Receiver<()>) {
+    pub async fn run(self, stop: oneshot::Receiver<()>) -> Result<(), MountError> {
         let validators = self.validators.clone();
         let verifier = self.consensus_verifier.clone();
         let genesis = self.genesis_payload_digest;
@@ -1090,7 +1055,7 @@ impl WorkRunner {
             let next = next.clone();
             async move { connect_chain(&validators, verifier, genesis, &next).await }
         })
-        .await;
+        .await
     }
 }
 
@@ -1182,6 +1147,52 @@ mod tests {
             .await,
             Err(PaidProviderError::BlockSource(_))
         ));
+    }
+
+    #[test]
+    fn poisoned_mounts_are_errors_and_shutdown_still_releases_channels() {
+        use hellas_wire::{AuthLevel, PeerIdentity};
+        let fixture = crate::test_support::PaidFixture::new();
+        let service = fixture.provider();
+        let channel = fixture.descriptor.channel().id();
+        let peer = PeerId::from_bytes([1; 32]);
+        let context = TransportContext {
+            peer: Some(PeerIdentity(peer.into_bytes())),
+            auth_level: AuthLevel::Vouched,
+            ..TransportContext::default()
+        };
+        let mount = MountedWork::default();
+        mount.mount(peer, &service).unwrap();
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = mount.mounted.lock().unwrap();
+            panic!("inject a poisoned mount");
+        }));
+        assert!(poisoned.is_err());
+        assert!(matches!(
+            mount.service(&context, channel),
+            Err(MountError::Poisoned)
+        ));
+        assert!(matches!(
+            mount.mount(peer, &service),
+            Err(MountError::Poisoned)
+        ));
+        assert!(matches!(mount.clear_all(), Err(MountError::Poisoned)));
+        assert!(match mount.mounted.lock() {
+            Err(error) => error.into_inner().is_empty(),
+            Ok(_) => panic!("lock remains poisoned"),
+        });
+
+        let setups = MountedSetup::default();
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = setups.0.lock().unwrap();
+            panic!("inject a poisoned setup mount");
+        }));
+        assert!(poisoned.is_err());
+        assert!(matches!(
+            setups.service(&context, fixture.descriptor.bond_edge()),
+            Err(MountError::Poisoned)
+        ));
+        assert!(matches!(setups.clear_all(), Err(MountError::Poisoned)));
     }
 
     #[test]

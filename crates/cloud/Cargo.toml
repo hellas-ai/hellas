@@ -31,4 +31,6 @@ serde_json.workspace = true
 sha2.workspace = true
 subtle = "2"
 tempfile.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
+url = "2"

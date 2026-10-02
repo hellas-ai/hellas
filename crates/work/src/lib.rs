@@ -4,6 +4,9 @@
 //! This crate owns the endpoint workflow, durable journals, recovery, and
 //! settlement drivers used by both clients and providers.
 
+#[cfg(test)]
+extern crate self as hellas_work;
+
 pub mod grant_service;
 pub mod work;
 pub mod work_close;

@@ -1,6 +1,6 @@
 //! One proposal writer per grant channel. Bodies are never journaled; an
 //! uncertain acceptance survives restart and cannot be replaced by a new nonce.
-use super::*;
+use super::{Deserialize, GrantChannelState, GrantStoreError, Serialize, Signature, SignedResult};
 use crate::work_store::channel::funding::GrantFunding;
 use crate::work_store::journal::{Journal, JournalId, JournalKind, MAX_CHECKPOINT_BYTES};
 use crate::work_store::{Applied, JobBook, JobPhase, JobState, Role};
@@ -8,7 +8,10 @@ use hellas_kernel::NetworkId;
 use hellas_rpc::ProviderEnrollmentBundle;
 use hellas_rpc::protocol::value::{canonical_dag_cbor, decode_dag_cbor};
 use hellas_rpc::protocol::work::bound_result_digest;
-use hellas_rpc::protocol::work_grant::{records::*, *};
+use hellas_rpc::protocol::work_grant::{
+    GrantJobAuthorizationV1, Revision, UnixMillis, grant_channel_id, grant_work_id,
+    records::{GrantError, SignedOffer},
+};
 use hellas_rpc::protocol::work_profile::{PreparedWorkInput, WorkContext, WorkPolicy};
 use hellas_rpc::{Digest, OutputEventEnvelope, ProducerSigningKey, PublicKey};
 use std::path::Path;

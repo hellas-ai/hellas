@@ -4,6 +4,10 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum ExecutorError {
+    #[error(transparent)]
+    Backend(#[from] hellas_work::work::BackendFault),
+    #[error("worker exited without acknowledging completion")]
+    Completion(#[source] tokio::sync::oneshot::error::RecvError),
     #[error("executor channel closed")]
     ChannelClosed,
     #[error("{0}")]
@@ -30,7 +34,10 @@ impl From<ExecutorError> for WireStatus {
             | ExecutorError::TokenBytes(_) => WireCode::InvalidArgument,
             ExecutorError::PolicyDenied(_) => WireCode::PermissionDenied,
             ExecutorError::ContentNotFound(_) => WireCode::NotFound,
-            ExecutorError::ChannelClosed | ExecutorError::Execution(_) => WireCode::Internal,
+            ExecutorError::Completion(_)
+            | ExecutorError::Backend(_)
+            | ExecutorError::ChannelClosed
+            | ExecutorError::Execution(_) => WireCode::Internal,
         };
         WireStatus::new(code, err.to_string())
     }

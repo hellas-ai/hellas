@@ -6,18 +6,37 @@ use hellas_client::ProviderTrustAnchor;
 pub use hellas_client::{PinnedOffer, UnpinnedOffer};
 use hellas_kernel::NetworkId;
 use hellas_rpc::{
-    pb::work::*,
-    protocol::{
-        work::{PrivateRecord, *},
-        work_grant::{records::*, standing::*, *},
-        work_profile::*,
+    Digest, EventCommitment, InputCommitment, Operation, OutputEventEnvelope, ProducerSigningKey,
+    ProviderEnrollmentBundle, PublicKey, RequestCommitment, SchemeId, Signature, StreamId,
+    output_genesis,
+    pb::work::{
+        AcceptWorkRequest, AcceptWorkResponse, DeliverResultRequest, GetStandingRequest,
+        GetStandingResponse, GrantRefusalCode, GrantTerminalMetadata, GrantTerminalState,
+        WorkRefusalCode, WorkRefused, WorkRoute, WorkStreamEvent, accept_work_response,
+        get_standing_response, work_stream_event,
     },
-    *,
+    protocol::{
+        work::{
+            PaidJobResultV1, PrivateRecord, bound_delivery_request_digest, bound_result_digest,
+            decode_transcript, encode_transcript,
+        },
+        work_grant::{
+            ChannelId, GrantId, GrantJobAuthorizationV1, Revision, UnixMillis, grant_work_id,
+            records::{GrantError, Principal, SignedOffer},
+            standing::{Standing, StandingLocator},
+        },
+        work_profile::{PreparedWorkInput, WorkPolicy},
+    },
+    scheme_id, verify_output_event_continuation,
 };
 use hellas_wire::{
     AuthLevel, PeerIdentity, StreamTransport, TransportContext, iroh::IrohTransport,
 };
-use hellas_work::{grant_service::GrantService, work::PaidProgress, work_store::grant::*};
+use hellas_work::{
+    grant_service::GrantService,
+    work::PaidProgress,
+    work_store::grant::{GrantChannelState, GrantClientStore, GrantStoreError, SignedResult},
+};
 use iroh::{Endpoint, EndpointId};
 use std::{
     path::PathBuf,
@@ -31,10 +50,36 @@ pub enum GrantClientError {
     Grant(#[from] GrantError),
     #[error(transparent)]
     Store(#[from] GrantStoreError),
-    #[error("grant protocol: {0}")]
-    Protocol(String),
-    #[error("grant transport: {0}")]
-    Transport(String),
+    #[error("grant session is closed")]
+    Closed,
+    #[error(transparent)]
+    Protocol(#[from] GrantProtocolError),
+    #[error(transparent)]
+    Client(#[from] hellas_client::ClientError),
+    #[error(transparent)]
+    Wire(#[from] hellas_wire::WireStatus),
+    #[error(transparent)]
+    Address(#[from] std::net::AddrParseError),
+    #[error(transparent)]
+    Work(#[from] hellas_rpc::protocol::work::PaidWorkError),
+    #[error(transparent)]
+    Signature(#[from] hellas_rpc::protocol::signature::SignatureError),
+    #[error(transparent)]
+    Length(#[from] std::array::TryFromSliceError),
+    #[error(transparent)]
+    UnknownEnum(#[from] prost::UnknownEnumValue),
+    #[error(transparent)]
+    FetchPayload(#[from] hellas_rpc::fetch::FetchPayloadError),
+    #[error(transparent)]
+    Progress(#[from] hellas_work::work::BackendFault),
+    #[error(transparent)]
+    Canonical(#[from] hellas_rpc::protocol::value::CanonicalDecodeError),
+    #[error(transparent)]
+    TransportKey(#[from] iroh::KeyParsingError),
+    #[error(transparent)]
+    Stream(#[from] hellas_rpc::StreamVerifyError),
+    #[error(transparent)]
+    Evaluate(#[from] hellas_rpc::evaluate::EvaluateProtocolError),
     #[error("grant operation timed out; proposal recovery may be required")]
     Timeout,
     #[error("grant refused: {code:?} (current revision {current_revision})")]
@@ -49,14 +94,47 @@ pub enum GrantClientError {
     #[error("the acceptance deadline has not passed; lost request bodies cannot be retried yet")]
     RecoveryTooEarly,
 }
-type Result<T> = std::result::Result<T, GrantClientError>;
-fn protocol(error: impl std::fmt::Display) -> GrantClientError {
-    GrantClientError::Protocol(error.to_string())
-}
-fn transport(error: impl std::fmt::Display) -> GrantClientError {
-    GrantClientError::Transport(error.to_string())
+#[derive(Debug, thiserror::Error)]
+pub enum GrantProtocolError {
+    #[error("missing standing outcome")]
+    StandingOutcome,
+    #[error("pending proposal missing")]
+    PendingProposal,
+    #[error("acceptance changed work id")]
+    AcceptanceIdentity,
+    #[error("missing acceptance outcome")]
+    AcceptanceOutcome,
+    #[error("input assurance differs from the pinned provider policy")]
+    Assurance,
+    #[error("result frame exceeds signed bound")]
+    FrameBound,
+    #[error("expected one terminal envelope")]
+    TerminalCount,
+    #[error("terminal transcript exceeds signed spool bound")]
+    SpoolBound,
+    #[error("event after terminal")]
+    AfterTerminal,
+    #[error("unexpected grant stream event")]
+    StreamEvent,
+    #[error("stream ended without result")]
+    MissingResult,
+    #[error("grant refusal omitted typed details")]
+    RefusalDetails,
+    #[error("unspecified grant refusal")]
+    UnspecifiedRefusal,
+    #[error("terminal metadata outside delivery")]
+    UnexpectedTerminalMetadata,
+    #[error("incoherent grant terminal metadata")]
+    TerminalMetadata,
+    #[error("terminal metadata belongs to another job")]
+    TerminalIdentity,
+    #[error("wrong prefix event kind")]
+    PrefixKind,
+    #[error("output exceeds its signed resource bounds")]
+    OutputBound,
 }
 
+type Result<T> = std::result::Result<T, GrantClientError>;
 #[derive(Clone)]
 pub struct GrantTarget {
     pub network: NetworkId,
@@ -76,31 +154,45 @@ impl GrantTarget {
             addresses: offer
                 .addresses
                 .iter()
-                .map(|a| a.parse().map_err(protocol))
+                .map(|a| a.parse().map_err(GrantClientError::from))
                 .collect::<Result<_>>()?,
         })
     }
 }
 impl GrantTarget {
-    fn dialer(
+    fn resolve_transport(
         &self,
         transport: &GrantTransport,
         trust: &ProviderTrustAnchor,
-    ) -> Result<Option<WorkLink>> {
-        trust.verify_enrollment(&self.provider).map_err(protocol)?;
+        client: &Principal,
+    ) -> Result<SessionTransport> {
+        trust
+            .verify_enrollment(&self.provider)
+            .map_err(GrantClientError::from)?;
         self.provider.check_grant_provider()?;
         match transport {
-            GrantTransport::Local(_) => Ok(None),
+            GrantTransport::Local(service) => Ok(SessionTransport::Local {
+                service: service.clone(),
+                context: TransportContext {
+                    peer: Some(PeerIdentity(client.transport())),
+                    auth_level: AuthLevel::Vouched,
+                    // Local invocation has no TLS exporter; a fresh random
+                    // binding separates this trusted in-process session.
+                    open_exporter: Some(rand::random()),
+                    rtt_ms: None,
+                },
+            }),
             GrantTransport::Remote(endpoint) => {
                 let link = WorkLink::new(
-                    EndpointId::from_bytes(&self.provider.grant_transport()?).map_err(protocol)?,
+                    EndpointId::from_bytes(&self.provider.grant_transport()?)
+                        .map_err(GrantClientError::from)?,
                     self.addresses.clone(),
                     endpoint.clone(),
                     trust.clone(),
                 );
                 link.require_producer(self.provider.genesis.statement.producer_public_key)
-                    .map_err(protocol)?;
-                Ok(Some(link))
+                    .map_err(GrantClientError::from)?;
+                Ok(SessionTransport::Remote(Box::new(link)))
             }
         }
     }
@@ -119,29 +211,13 @@ impl GrantTarget {
         {
             return Err(GrantError::Audience.into());
         }
-        let dialer = self.dialer(transport, trust)?;
-        let link = GrantSession::dial(
-            self,
-            client,
-            timeout,
-            transport,
-            dialer.as_ref(),
-            local_exporter(signer)?,
-        )
-        .await?;
+        let transport = self.resolve_transport(transport, trust, client)?;
+        let link = transport.connect(timeout).await?;
         let standing = GrantSession::query_standing(self, client, signer, timeout, &link).await?;
         UnpinnedOffer::decode(&standing.offer.encode()?, client.id(), standing.now)
             .and_then(|offer| offer.pin(trust))
-            .map_err(protocol)
+            .map_err(GrantClientError::from)
     }
-}
-fn local_exporter(signer: &ProducerSigningKey) -> Result<[u8; 32]> {
-    let nonce = signer
-        .sign_digest(Digest::hash(
-            format!("{:?}-{}", Instant::now(), std::process::id()).as_bytes(),
-        ))
-        .map_err(protocol)?;
-    Ok(*Digest::hash(nonce.bytes()).as_bytes())
 }
 pub struct GrantSessionOptions {
     pub target: PinnedOffer,
@@ -153,6 +229,28 @@ pub struct GrantSessionOptions {
 pub enum GrantTransport {
     Remote(Endpoint),
     Local(GrantService),
+}
+enum SessionTransport {
+    Remote(Box<WorkLink>),
+    Local {
+        service: GrantService,
+        context: TransportContext,
+    },
+    Closed,
+}
+impl SessionTransport {
+    async fn connect(&self, timeout: Duration) -> Result<Link> {
+        match self {
+            Self::Remote(link) => Ok(Link::Remote(
+                tokio::time::timeout(timeout, link.work())
+                    .await
+                    .map_err(|_| GrantClientError::Timeout)?
+                    .map_err(GrantClientError::from)?,
+            )),
+            Self::Local { service, context } => Ok(Link::Local(service.clone(), context.clone())),
+            Self::Closed => Err(GrantClientError::Closed),
+        }
+    }
 }
 enum Link {
     Remote(IrohTransport),
@@ -173,7 +271,7 @@ impl Link {
             ))
             .get_standing(request)
             .await
-            .map_err(transport),
+            .map_err(GrantClientError::from),
             Self::Local(s, c) => Ok(s.standing(&request, c)),
         }
     }
@@ -184,7 +282,7 @@ impl Link {
             ))
             .accept_work(request)
             .await
-            .map_err(transport),
+            .map_err(GrantClientError::from),
             Self::Local(s, c) => Ok(s.accept(&request, c)),
         }
     }
@@ -199,15 +297,15 @@ impl Link {
                 )
                 .stream_result(request)
                 .await
-                .map_err(transport)?;
+                .map_err(GrantClientError::from)?;
                 Ok(Box::pin(async_stream::stream! {
-                    while let Some(event) = stream.next().await { yield event.map_err(transport); }
-                    if let Err(error) = stream.finish() { yield Err(transport(error)); }
+                    while let Some(event) = stream.next().await { yield event.map_err(GrantClientError::from); }
+                    if let Err(error) = stream.finish() { yield Err(GrantClientError::from(error)); }
                 }))
             }
             Self::Local(s, c) => Ok(Box::pin(
                 s.stream(request, c.clone())
-                    .map(|event| event.map_err(transport)),
+                    .map(|event| event.map_err(GrantClientError::from)),
             )),
         }
     }
@@ -226,10 +324,8 @@ pub enum Recovery {
 
 pub struct GrantSession {
     options: GrantSessionOptions,
-    transport: GrantTransport,
+    transport: SessionTransport,
     target: GrantTarget,
-    dialer: Option<WorkLink>,
-    local_exporter: [u8; 32],
     offer: SignedOffer,
     store: GrantClientStore,
     observed: UnixMillis,
@@ -250,17 +346,9 @@ impl GrantSession {
             return Err(GrantError::Audience.into());
         }
         let target = GrantTarget::from_offer(&options.target)?;
-        let dialer = target.dialer(&transport, options.target.trust())?;
-        let local_exporter = local_exporter(&options.signer)?;
-        let link = Self::dial(
-            &target,
-            &options.client,
-            options.timeout,
-            &transport,
-            dialer.as_ref(),
-            local_exporter,
-        )
-        .await?;
+        let transport =
+            target.resolve_transport(&transport, options.target.trust(), &options.client)?;
+        let link = transport.connect(options.timeout).await?;
         let standing = Self::query_standing(
             &target,
             &options.client,
@@ -288,8 +376,6 @@ impl GrantSession {
             options,
             transport,
             target,
-            dialer,
-            local_exporter,
             offer,
             store,
             observed: standing.now,
@@ -314,44 +400,8 @@ impl GrantSession {
         )
         .max(self.store.now())
     }
-    async fn dial(
-        _target: &GrantTarget,
-        client: &Principal,
-        timeout: Duration,
-        transport_kind: &GrantTransport,
-        dialer: Option<&WorkLink>,
-        exporter: [u8; 32],
-    ) -> Result<Link> {
-        match transport_kind {
-            GrantTransport::Remote(_) => {
-                let dialer = dialer.ok_or_else(|| protocol("missing remote Work link"))?;
-                let transport = tokio::time::timeout(timeout, dialer.work())
-                    .await
-                    .map_err(|_| GrantClientError::Timeout)?
-                    .map_err(transport)?;
-                Ok(Link::Remote(transport))
-            }
-            GrantTransport::Local(service) => Ok(Link::Local(
-                service.clone(),
-                TransportContext {
-                    peer: Some(PeerIdentity(client.transport())),
-                    auth_level: AuthLevel::Vouched,
-                    open_exporter: Some(exporter),
-                    rtt_ms: None,
-                },
-            )),
-        }
-    }
     async fn link(&self) -> Result<Link> {
-        Self::dial(
-            &self.target,
-            &self.options.client,
-            self.options.timeout,
-            &self.transport,
-            self.dialer.as_ref(),
-            self.local_exporter,
-        )
-        .await
+        self.transport.connect(self.options.timeout).await
     }
     async fn query_standing(
         target: &GrantTarget,
@@ -368,7 +418,7 @@ impl GrantSession {
         };
         let signature = signer
             .sign_digest(locator.digest(target.network, &link.exporter()?))
-            .map_err(protocol)?;
+            .map_err(GrantClientError::from)?;
         let request = GetStandingRequest {
             route: Some(WorkRoute::grant(locator.channel(target.network))),
             locator: locator.encode().to_vec(),
@@ -382,7 +432,7 @@ impl GrantSession {
             Some(get_standing_response::Outcome::Refused(refusal)) => {
                 return Err(refusal_error(&refusal, None)?);
             }
-            None => return Err(protocol("missing standing outcome")),
+            None => return Err(GrantProtocolError::StandingOutcome.into()),
         };
         // Fresh TLS-bound status supplies the provider's monotone clock. The
         // client does not extend a grant by substituting its own wall clock.
@@ -430,14 +480,14 @@ impl GrantSession {
             .store
             .book()
             .job_by_id(id)
-            .ok_or_else(|| protocol("pending proposal missing"))?;
+            .ok_or(GrantProtocolError::PendingProposal)?;
         let a = *job.authorization();
         let signature = job.client_signature();
         let prepared = self
             .pending_body
             .as_ref()
             .filter(|(work, _)| *work == id)
-            .map(|(_, body)| body.encode().map_err(protocol))
+            .map(|(_, body)| body.encode().map_err(GrantClientError::from))
             .transpose()?;
         let probe = prepared.is_none();
         if probe {
@@ -477,14 +527,14 @@ impl GrantSession {
         match response.outcome {
             Some(accept_work_response::Outcome::Accepted(accepted)) => {
                 if accepted.work_id != id.as_bytes() {
-                    return Err(protocol("acceptance changed work id"));
+                    return Err(GrantProtocolError::AcceptanceIdentity.into());
                 }
                 let signature = Signature::Secp256k1(
                     accepted
                         .provider_signature
                         .as_slice()
                         .try_into()
-                        .map_err(protocol)?,
+                        .map_err(GrantClientError::from)?,
                 );
                 self.store.accepted(id, signature, self.now())?;
                 self.pending_body = None;
@@ -512,7 +562,7 @@ impl GrantSession {
                 }
                 Err(error)
             }
-            None => Err(protocol("missing acceptance outcome")),
+            None => Err(GrantProtocolError::AcceptanceOutcome.into()),
         }
     }
     pub async fn run(
@@ -560,10 +610,10 @@ impl GrantSession {
         if self.store.book().pending_proposal().is_some() {
             return Err(GrantClientError::RecoveryRequired);
         }
-        if input.assurance().map_err(protocol)? != self.options.target.trust().required_assurance {
-            return Err(protocol(
-                "input assurance differs from the pinned provider policy",
-            ));
+        if input.assurance().map_err(GrantClientError::from)?
+            != self.options.target.trust().required_assurance
+        {
+            return Err(GrantProtocolError::Assurance.into());
         }
         self.refresh().await?;
         let policy = self
@@ -595,11 +645,14 @@ impl GrantSession {
             work_policy_digest: policy.work.digest(self.target.network, channel.0),
             prepared_input_digest: input
                 .bound_digest(self.target.network, channel.0)
-                .map_err(protocol)?,
+                .map_err(GrantClientError::from)?,
             proposal_nonce: self.store.next_nonce()?,
             acceptance_deadline_ms: UnixMillis(now.0 + (span / 2).min(30_000)),
             request_commitment: RequestCommitment::from_digest(
-                input.input_commitment().map_err(protocol)?.digest(),
+                input
+                    .input_commitment()
+                    .map_err(GrantClientError::from)?
+                    .digest(),
             ),
             environment_commitment: policy.work.allowed_environment(),
             terminal_deadline_ms: UnixMillis(terminal),
@@ -616,7 +669,7 @@ impl GrantSession {
             route: Some(WorkRoute::grant(channel)),
             authorization: a.encode(),
             client_signature: signature.bytes().to_vec(),
-            prepared_input: input.encode().map_err(protocol)?,
+            prepared_input: input.encode().map_err(GrantClientError::from)?,
         };
         let link = self.link().await?;
         let response = tokio::time::timeout(self.options.timeout, link.accept(request))
@@ -635,7 +688,7 @@ impl GrantSession {
                     id,
                     &link.exporter()?,
                 ))
-                .map_err(protocol)?
+                .map_err(GrantClientError::from)?
                 .bytes()
                 .to_vec(),
         };
@@ -649,7 +702,7 @@ impl GrantSession {
                 let event = event?;
                 use prost::Message;
                 if event.encoded_len() as u64 > u64::from(policy.work.max_encoded_result_frame()) {
-                    return Err(protocol("result frame exceeds signed bound"));
+                    return Err(GrantProtocolError::FrameBound.into());
                 }
                 match event.outcome {
                     Some(work_stream_event::Outcome::Prefix(bytes)) => {
@@ -657,11 +710,11 @@ impl GrantSession {
                             &bytes,
                             hellas_work::work_store::journal::MAX_RECORD_BYTES,
                         )
-                        .map_err(protocol)?
+                        .map_err(GrantClientError::from)?
                         {
                             prefixes.push(event.clone())?;
                             if let Some(progress) = &progress {
-                                progress(event).map_err(protocol)?;
+                                progress(event).map_err(GrantClientError::from)?;
                             }
                         }
                     }
@@ -670,38 +723,41 @@ impl GrantSession {
                             &terminal.terminal_transcript,
                             hellas_work::work_store::journal::MAX_RECORD_BYTES,
                         )
-                        .map_err(protocol)?;
+                        .map_err(GrantClientError::from)?;
                         if tail.len() != 1 {
-                            return Err(protocol("expected one terminal envelope"));
+                            return Err(GrantProtocolError::TerminalCount.into());
                         }
                         prefixes.events.extend(tail);
-                        if encode_transcript(&prefixes.events).map_err(protocol)?.len() as u64
+                        if encode_transcript(&prefixes.events)
+                            .map_err(GrantClientError::from)?
+                            .len() as u64
                             > policy.work.max_spool_bytes()
                         {
-                            return Err(protocol("terminal transcript exceeds signed spool bound"));
+                            return Err(GrantProtocolError::SpoolBound.into());
                         }
                         let signed = SignedResult {
-                            result: PaidJobResultV1::decode(&terminal.result).map_err(protocol)?,
+                            result: PaidJobResultV1::decode(&terminal.result)
+                                .map_err(GrantClientError::from)?,
                             signature: Signature::Secp256k1(
                                 terminal
                                     .provider_signature
                                     .as_slice()
                                     .try_into()
-                                    .map_err(protocol)?,
+                                    .map_err(GrantClientError::from)?,
                             ),
                         };
                         if stream.next().await.transpose()?.is_some() {
-                            return Err(protocol("event after terminal"));
+                            return Err(GrantProtocolError::AfterTerminal.into());
                         }
                         return Ok(signed);
                     }
                     Some(work_stream_event::Outcome::Refused(refusal)) => {
                         return Err(refusal_error(&refusal, Some((&self.target, channel, id)))?);
                     }
-                    _ => return Err(protocol("unexpected grant stream event")),
+                    _ => return Err(GrantProtocolError::StreamEvent.into()),
                 }
             }
-            Err(protocol("stream ended without result"))
+            Err(GrantProtocolError::MissingResult.into())
         })
         .await
         .map_err(|_| GrantClientError::Timeout)??;
@@ -725,12 +781,12 @@ impl GrantSession {
         } else {
             Ok(())
         };
-        let drained = if let GrantTransport::Local(service) = &self.transport {
+        let drained = if let SessionTransport::Local { service, .. } = &self.transport {
             service.drain().await.map_err(GrantClientError::from)
         } else {
             Ok(())
         };
-        self.dialer = None;
+        self.transport = SessionTransport::Closed;
         drained.and(recovered)
     }
 }
@@ -741,15 +797,15 @@ fn refusal_error(
     let detail = refusal
         .grant
         .as_ref()
-        .ok_or_else(|| protocol("grant refusal omitted typed details"))?;
-    let code = GrantRefusalCode::try_from(detail.code).map_err(protocol)?;
+        .ok_or(GrantProtocolError::RefusalDetails)?;
+    let code = GrantRefusalCode::try_from(detail.code).map_err(GrantClientError::from)?;
     if code == GrantRefusalCode::Unspecified {
-        return Err(protocol("unspecified grant refusal"));
+        return Err(GrantProtocolError::UnspecifiedRefusal.into());
     }
     if let Some(terminal) = &detail.terminal {
         let (target, channel, id) =
-            delivery.ok_or_else(|| protocol("terminal metadata outside delivery"))?;
-        let state = GrantTerminalState::try_from(terminal.state).map_err(protocol)?;
+            delivery.ok_or(GrantProtocolError::UnexpectedTerminalMetadata)?;
+        let state = GrantTerminalState::try_from(terminal.state).map_err(GrantClientError::from)?;
         let coherent = match state {
             GrantTerminalState::Finished => {
                 code == GrantRefusalCode::OutputUnavailable && !terminal.result.is_empty()
@@ -767,26 +823,27 @@ fn refusal_error(
             || terminal.work_id != id.as_bytes()
             || terminal.result.is_empty() != terminal.provider_signature.is_empty()
         {
-            return Err(protocol("incoherent grant terminal metadata"));
+            return Err(GrantProtocolError::TerminalMetadata.into());
         }
         if !terminal.result.is_empty() {
-            let result = PaidJobResultV1::decode(&terminal.result).map_err(protocol)?;
+            let result =
+                PaidJobResultV1::decode(&terminal.result).map_err(GrantClientError::from)?;
             if result.work_id != id {
-                return Err(protocol("terminal metadata belongs to another job"));
+                return Err(GrantProtocolError::TerminalIdentity.into());
             }
             let signature = Signature::Secp256k1(
                 terminal
                     .provider_signature
                     .as_slice()
                     .try_into()
-                    .map_err(protocol)?,
+                    .map_err(GrantClientError::from)?,
             );
             hellas_rpc::signature::verify_digest_signature(
                 &PublicKey::Secp256k1(target.provider.grant_producer()?.to_bytes()),
                 &signature,
                 bound_result_digest(target.network, channel.0, &result),
             )
-            .map_err(protocol)?;
+            .map_err(GrantClientError::from)?;
         }
     }
     Ok(GrantClientError::Refused {
@@ -823,7 +880,7 @@ impl Prefixes {
                 u64::from(
                     input
                         .parts()
-                        .map_err(protocol)?
+                        .map_err(GrantClientError::from)?
                         .text_policy
                         .max_new_tokens(),
                 ),
@@ -839,12 +896,15 @@ impl Prefixes {
             ),
             _ => return Err(GrantError::OutOfScope.into()),
         };
-        let commitment = input.input_commitment().map_err(protocol)?;
+        let commitment = input.input_commitment().map_err(GrantClientError::from)?;
         Ok(Self {
             events: vec![],
             input: commitment,
             key: PublicKey::Secp256k1(producer.to_bytes()),
-            scheme: scheme_id(operation, input.assurance().map_err(protocol)?),
+            scheme: scheme_id(
+                operation,
+                input.assurance().map_err(GrantClientError::from)?,
+            ),
             previous: output_genesis(commitment, StreamId::from_input_commitment(commitment)),
             kind,
             tokens: 0,
@@ -865,19 +925,20 @@ impl Prefixes {
             self.previous,
             &event,
         )
-        .map_err(protocol)?;
+        .map_err(GrantClientError::from)?;
         if event.event().body().kind() != self.kind {
-            return Err(protocol("wrong prefix event kind"));
+            return Err(GrantProtocolError::PrefixKind.into());
         }
         if self.kind == hellas_rpc::evaluate::TOKEN_DELTA_EVENT_KIND {
             self.tokens = self.tokens.saturating_add(
                 hellas_rpc::evaluate::decode_token_delta_payload(event.payload())
-                    .map_err(protocol)?
+                    .map_err(GrantClientError::from)?
                     .token_ids
                     .len() as u64,
             );
         } else {
-            hellas_rpc::fetch::decode_fetch_event_payload(event.payload()).map_err(protocol)?;
+            hellas_rpc::fetch::decode_fetch_event_payload(event.payload())
+                .map_err(GrantClientError::from)?;
         }
         self.bytes = self
             .bytes
@@ -888,7 +949,7 @@ impl Prefixes {
             || self.payload > self.max_payload
             || self.bytes as u64 > self.max_spool
         {
-            return Err(protocol("output exceeds its signed resource bounds"));
+            return Err(GrantProtocolError::OutputBound.into());
         }
         self.events.push(event);
         Ok(())

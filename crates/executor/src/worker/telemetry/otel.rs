@@ -199,6 +199,8 @@ fn metric_attributes() -> [KeyValue; 2] {
 // content, paths, IDs, or device diagnostics. "panic" is handled separately.
 fn error_type(error: &ExecutorError) -> &'static str {
     match error {
+        ExecutorError::Backend(_) => "backend",
+        ExecutorError::Completion(_) => "worker_completion",
         ExecutorError::ChannelClosed => "channel_closed",
         ExecutorError::ResourceExhausted(_) => "resource_exhausted",
         ExecutorError::InvalidInput(_)

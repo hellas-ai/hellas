@@ -28,10 +28,9 @@ impl WorkBackend for Backend {
     fn try_admit(&self, domain: CapacityDomain) -> Result<WorkPermit, BackendFault> {
         Ok(WorkPermit::new(
             domain,
-            self.slots
-                .clone()
-                .try_acquire_owned()
-                .map_err(|_| BackendFault::new("full"))?,
+            self.slots.clone().try_acquire_owned().map_err(|_| {
+                BackendFault::from(hellas_work::work::admission::AdmissionError::Capacity)
+            })?,
         ))
     }
     async fn fetch_stream(
@@ -40,7 +39,12 @@ impl WorkBackend for Backend {
         progress: PaidProgress,
     ) -> Result<Vec<OutputEventEnvelope>, BackendFault> {
         let (parts, admission) = input.into_parts_and_admission();
-        let _running = admission.dispatch()?;
+        let _running = admission
+            .reserve(hellas_work::work::admission::CapacityDomain::Fetch, async {
+                self.try_admit(hellas_work::work::admission::CapacityDomain::Fetch)
+            })
+            .await?
+            .dispatch()?;
         let request =
             hellas_rpc::fetch::verify_input_events(&parts.fetch_input_transcript).unwrap();
         let http =
@@ -239,7 +243,7 @@ async fn grant_stream_repairs_before_signing_and_drains_after_disconnect() {
     assert_eq!(fixture.used(), 0);
     drop(stream);
     fixture.backend.finish.add_permits(1);
-    fixture.gateway.drain().await;
+    fixture.gateway.drain().await.unwrap();
     assert_eq!(fixture.used(), 2);
     assert!(matches!(
         fixture.gateway.fetch(fixture.request(None)),
@@ -264,7 +268,7 @@ async fn over_cap_and_exhausted_allowance_do_not_execute() {
         Err(WorkGatewayError::Quota(_))
     ));
     assert_eq!(fixture.backend.calls.load(Ordering::SeqCst), 3);
-    fixture.gateway.drain().await;
+    fixture.gateway.drain().await.unwrap();
 }
 
 #[tokio::test]
@@ -279,7 +283,7 @@ async fn absent_usage_charges_reserve_and_quarantines() {
         Err(WorkGatewayError::Denied(_))
     ));
     assert_eq!(fixture.backend.calls.load(Ordering::SeqCst), 3);
-    fixture.gateway.drain().await;
+    fixture.gateway.drain().await.unwrap();
 }
 
 #[tokio::test]
@@ -308,6 +312,6 @@ async fn pause_revoke_and_expiry_refuse_without_execution() {
         );
         assert_eq!(fixture.backend.calls.load(Ordering::SeqCst), 0);
         assert_eq!(fixture.used(), 0);
-        fixture.gateway.drain().await;
+        fixture.gateway.drain().await.unwrap();
     }
 }

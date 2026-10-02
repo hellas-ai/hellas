@@ -28,7 +28,7 @@ pub(super) struct ResponsesProxy {
 }
 
 impl ResponsesProxy {
-    pub(super) fn new(endpoint: &str, api_key_env: &str) -> anyhow::Result<Self> {
+    pub(super) fn new(endpoint: &str, api_key_env: &str) -> crate::GatewayResult<Self> {
         let endpoint = Url::parse(endpoint)?;
         let bearer_token = std::env::var(api_key_env)
             .ok()

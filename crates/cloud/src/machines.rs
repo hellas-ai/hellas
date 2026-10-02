@@ -196,6 +196,8 @@ impl ControlArgs {
             service.owner(),
             socket.display()
         );
-        crate::internal_rpc::serve(service, &socket).await
+        crate::internal_rpc::serve(service, &socket)
+            .await
+            .map_err(anyhow::Error::from)
     }
 }
