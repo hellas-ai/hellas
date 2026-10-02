@@ -5,7 +5,7 @@ use super::*;
 #[derive(Debug)]
 pub struct ChannelStore {
     journal: Journal,
-    state: ChannelState,
+    state: Channel,
     torn_tail: bool,
     metadata_only: bool,
 }
@@ -100,25 +100,21 @@ impl ChannelStore {
             },
         )?;
         let mut state = match &replay.checkpoint {
-            Some(bytes) => ChannelState::from_checkpoint(
-                bytes,
-                channel,
-                settlement,
-                role,
-                verifier,
-                metadata_only,
-            )?,
-            None => ChannelState::new(channel, settlement, role, origin),
+            Some(bytes) => {
+                Channel::from_checkpoint(bytes, channel, settlement, role, verifier, metadata_only)?
+            }
+            None => Channel::new(channel, settlement, role, origin),
         };
         for bytes in &replay.records {
             let record = ChannelRecord::decode(bytes)?;
             state.apply(&record, verifier, metadata_only)?;
         }
-        state.indeterminate = state
+        state.book.indeterminate = state
+            .book
             .jobs
             .values()
             .filter(|job| matches!(job.phase, JobPhase::Running | JobPhase::Streaming))
-            .map(|job| (job.work_id, ()))
+            .map(|job| job.work_id)
             .collect();
         journal.observe_replay(replayed, replay.records.len());
         let store = Self {
@@ -144,7 +140,7 @@ impl ChannelStore {
 
     /// Returns what this endpoint durably knows.
     #[must_use]
-    pub const fn state(&self) -> &ChannelState {
+    pub const fn state(&self) -> &Channel {
         &self.state
     }
 
@@ -171,7 +167,7 @@ impl ChannelStore {
         &mut self,
         record: ChannelRecord,
         verifier: &V,
-    ) -> Result<&ChannelState, WorkStoreError> {
+    ) -> Result<&Channel, WorkStoreError> {
         // Applied to a copy first: a record the rules refuse must leave
         // neither the file nor the state touched. A cheap exact check
         // first: the stream replay path offers a redundant release per

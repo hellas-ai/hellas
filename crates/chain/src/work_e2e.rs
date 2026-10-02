@@ -113,7 +113,7 @@ use hellas_rpc::protocol::artifacts::{
     SourceRef, TextArtifact, TextExecution, TextExecutionId, TextPolicy, TokenIds, completed_text,
 };
 use hellas_rpc::protocol::work::{
-    JobDeadlines, PaidChannelPolicyV1, PaidExecutionPolicyV1, generation_policy_digest,
+    EvaluatePolicyV2, JobDeadlines, PaidChannelPolicyV1, generation_policy_digest,
     identity_source_digest, private_policy_commitment,
 };
 use hellas_rpc::protocol::work_setup::{
@@ -128,8 +128,8 @@ use hellas_rpc::{
 use hellas_wire::mux::{MessagePipe, MuxConfig, MuxTransport, Role as MuxRole};
 use hellas_wire::{DefaultClock, Dispatcher, StreamTransport as _, TransportContext};
 use hellas_work::work::{
-    BackendFault, ClientEndpoint, CloseEndpoint, JobProposal, PaidWorkBackend, PaymentError,
-    PreparedEvaluateInput, RunOutcome, WorkService, propose_work, run_accepted_work,
+    BackendFault, ClientEndpoint, CloseEndpoint, JobProposal, PaymentError, PreparedEvaluateInput,
+    RunOutcome, WorkBackend, WorkService, propose_work, run_accepted_work,
 };
 use hellas_work::work_close::{CloseProgress, TxSink, close_start};
 use hellas_work::work_handshake::{PaymentAdmission, SetupEndpoint, SetupService};
@@ -345,8 +345,8 @@ fn channel_policy() -> PaidChannelPolicyV1 {
     }
 }
 
-fn execution_policy() -> PaidExecutionPolicyV1 {
-    PaidExecutionPolicyV1 {
+fn work_policy() -> EvaluatePolicyV2 {
+    EvaluatePolicyV2 {
         allowed_environment: manifest().content_id(),
         generation_policy_digest: match generation_policy_digest(&text_policy().canonical_bytes()) {
             Ok(digest) => digest,
@@ -362,11 +362,7 @@ fn execution_policy() -> PaidExecutionPolicyV1 {
         max_stop_token_ids: 4,
         max_spool_bytes: 1_048_576,
         max_encoded_result_frame: 262_144,
-        max_encoded_quote_response: 1_048_576,
-        dispatch_margin_blocks: 4,
-        delivery_margin_blocks: 2,
-        oracle_grace_blocks: 6,
-        fixed_price: PRICE,
+        max_encoded_prepared_input: 1_048_576,
     }
 }
 
@@ -393,10 +389,11 @@ fn expected_values() -> EdgeValues {
 
 fn provider_policy() -> ProviderChannelPolicy {
     ProviderChannelPolicy {
+        payment_policy: payment_policy(),
         network: TEST_NETWORK,
         policy_salt: SALT,
         channel_policy: channel_policy(),
-        execution_policy: execution_policy().into(),
+        work_policy: work_policy().into(),
         expected_payment_values: expected_values(),
         min_omit_response_blocks: hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
     }
@@ -404,12 +401,13 @@ fn provider_policy() -> ProviderChannelPolicy {
 
 fn descriptor(allocations: &[(SettlementKey, u64)]) -> WorkChannelDescriptor {
     match WorkChannelDescriptor::open(WorkChannelConfig {
+        payment_policy: payment_policy(),
         network: TEST_NETWORK,
         payment_edge: payment_edge(allocations),
         payment_terms: payment_terms(allocations),
         policy_salt: SALT,
         channel_policy: channel_policy(),
-        execution_policy: execution_policy().into(),
+        work_policy: work_policy().into(),
         expected_payment_values: expected_values(),
     }) {
         Ok(descriptor) => descriptor,
@@ -749,10 +747,13 @@ fn scan_at(block: &HellasBlock) -> SetupScan {
 
 /// Offers one revision to the provider's service and returns the
 /// revision it answers with.
-async fn exchange(service: &SetupService, bundle: Vec<u8>) -> Vec<u8> {
+async fn exchange(service: &SetupService, bond: EdgeId, bundle: Vec<u8>) -> Vec<u8> {
     let answered = WorkSetupHandler::exchange_setup(
         service,
-        ExchangeSetupRequest { bundle },
+        ExchangeSetupRequest {
+            bond_edge: bond.as_bytes().to_vec(),
+            bundle,
+        },
         TransportContext::default(),
     )
     .await
@@ -801,7 +802,7 @@ async fn shake_hands(
         client(),
         PaymentAdmission::Proposes(Box::new(provider_policy())),
     );
-    let proposal = exchange(&service, Vec::new()).await;
+    let proposal = exchange(&service, bond_edge(allocations), Vec::new()).await;
     if let Err(error) = caller.import(&proposal) {
         panic!("the client imports the bond proposal: {error}");
     }
@@ -816,7 +817,7 @@ async fn shake_hands(
         .bundle_bytes()
         .map(<[u8]>::to_vec)
         .expect("the client holds revision 2");
-    let countersigned = exchange(&service, offered).await;
+    let countersigned = exchange(&service, bond_edge(allocations), offered).await;
     if let Err(error) = caller.import(&countersigned) {
         panic!("the client imports the countersigned payment: {error}");
     }
@@ -901,14 +902,14 @@ struct ProviderBackend {
     prompt: Vec<u32>,
 }
 
-impl PaidWorkBackend for ProviderBackend {
+impl WorkBackend for ProviderBackend {
     fn evaluate(
         &self,
         input: PreparedEvaluateInput,
     ) -> impl core::future::Future<Output = Result<Vec<OutputEventEnvelope>, BackendFault>> + Send
     {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        let answer = FixtureExecutor::run(&self.prompt, execution_policy().max_new_tokens);
+        let answer = FixtureExecutor::run(&self.prompt, work_policy().max_new_tokens);
         let prompt = self.prompt.clone();
         async move { Ok(transcript_for(input.evaluate_request(), &prompt, &answer)) }
     }
@@ -1762,4 +1763,13 @@ fn an_understated_close_is_answered_and_pays_the_certificate() {
         drop(opened);
         devnet.shutdown().await;
     });
+}
+
+fn payment_policy() -> hellas_rpc::protocol::work::JobPaymentPolicyV2 {
+    hellas_rpc::protocol::work::JobPaymentPolicyV2 {
+        fixed_price: PRICE,
+        dispatch_margin_blocks: 4,
+        delivery_margin_blocks: 2,
+        oracle_grace_blocks: 6,
+    }
 }

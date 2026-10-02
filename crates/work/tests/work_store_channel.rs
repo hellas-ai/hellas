@@ -21,7 +21,7 @@ use hellas_rpc::protocol::artifacts::{
     TextArtifact, TextExecution, TextPolicy, TokenIds,
 };
 use hellas_rpc::protocol::work::{
-    PaidChannel, PaidChannelPolicyV1, PaidJobAuthorizationV1, PaidJobResultV1, PaidWorkError,
+    PaidChannel, PaidChannelPolicyV1, PaidJobAuthorizationV2, PaidJobResultV1, PaidWorkError,
     PaymentBindingV1, PrivateRecord as _, decode_transcript, encode_transcript, next_payment,
     payment_binding_digest, prepared_input_digest, private_policy_commitment, result_digest,
     terminal_result, work_id,
@@ -30,6 +30,7 @@ use hellas_rpc::{
     Application, Assurance, CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR, ContentId, Evaluate,
     EvaluateRequest, OutputEventEnvelope, ProducerSigningKey, ProgramManifest, PublicKey,
 };
+use hellas_work::work_store::channel::funding::{Clock, FinalizedHeight};
 use hellas_work::work_store::journal::{Journal, JournalError, JournalId, JournalKind};
 use hellas_work::work_store::{
     ChannelRecord, ChannelStateError, ChannelStore, JobPhase, JobState, Role, SetupOrigin,
@@ -271,7 +272,7 @@ fn spool(transcript: &[OutputEventEnvelope]) -> Vec<u8> {
 
 /// Everything one job's records are built from, at one ledger position.
 struct Job {
-    authorization: PaidJobAuthorizationV1,
+    authorization: PaidJobAuthorizationV2,
     work_id: Digest,
     result: PaidJobResultV1,
     transcript: Vec<OutputEventEnvelope>,
@@ -305,15 +306,16 @@ fn job_at(channel: &PaidChannel, nonce: u64, credited: u64) -> Job {
     }
 }
 
-fn authorization_for(channel: &PaidChannel, nonce: u64) -> PaidJobAuthorizationV1 {
+fn authorization_for(channel: &PaidChannel, nonce: u64) -> PaidJobAuthorizationV2 {
     let terms = channel.payment_terms();
-    PaidJobAuthorizationV1 {
+    PaidJobAuthorizationV2 {
         channel_id: channel.id(),
         bond_edge: terms.bond_edge,
         bond_terms_hash: terms.bond_terms_hash(),
         payment_edge: channel.payment_edge(),
         payment_terms_hash: channel.payment_terms_hash(),
-        execution_policy_digest: Digest::from_bytes([0x31; 32]),
+        work_policy_digest: Digest::from_bytes([0x31; 32]),
+        payment_policy_digest: Digest::from_bytes([0xec; 32]),
         prepared_input_digest: match prepared_input_digest(channel, &bundle(nonce)) {
             Ok(digest) => digest,
             Err(error) => panic!("the fixture bundle hashes: {error}"),
@@ -882,9 +884,10 @@ fn round3_transition_consumes_post_boundary_cursor() {
             assert!(matches!(
                 accepted,
                 Err(WorkStoreError::Channel(ChannelStateError::AcceptanceLate {
-                    height: found,
+                    now,
                     deadline,
-                })) if found == height && deadline == job.authorization.acceptance_deadline
+                })) if now == FinalizedHeight(height).diagnostic()
+                    && deadline == FinalizedHeight(job.authorization.acceptance_deadline).diagnostic()
             ));
         }
     }
@@ -911,9 +914,10 @@ fn round3_transition_consumes_post_boundary_cursor() {
             assert!(matches!(
                 running,
                 Err(WorkStoreError::Channel(ChannelStateError::DispatchLate {
-                    height: found,
+                    now,
                     deadline,
-                })) if found == height && deadline == job.authorization.terminal_deadline
+                })) if now == FinalizedHeight(height).diagnostic()
+                    && deadline == FinalizedHeight(job.authorization.terminal_deadline).diagnostic()
             ));
         }
     }
@@ -3296,10 +3300,101 @@ fn write_file(path: &std::path::Path, bytes: &[u8]) {
     }
 }
 
+/// Reply uncertainty is independent of the retained signature. Rotation must
+/// preserve both a pending exchange and a refused, still half-signed job.
+#[test]
+fn proposal_ordering_survives_checkpoint_rotation() {
+    let dir = temp();
+    let verifier = Secp256k1Verifier::new();
+    let job = job_at(&channel(), 1, 0);
+    let mut store = open(dir.path(), Role::Client);
+    store.commit(job.proposed(), &verifier).unwrap();
+    for pending in [true, false, true] {
+        store
+            .commit(
+                ChannelRecord::ProposalExchange {
+                    work_id: job.work_id,
+                    pending,
+                },
+                &verifier,
+            )
+            .unwrap();
+        let expected = store.state().clone();
+        store.rotate().unwrap();
+        drop(store);
+        store = open(dir.path(), Role::Client);
+        assert_eq!(store.state(), &expected);
+        assert_eq!(
+            store.state().job_book().pending_proposal(),
+            pending.then_some(job.work_id)
+        );
+        assert_eq!(
+            store.state().job_by_id(job.work_id).unwrap().phase(),
+            JobPhase::HalfSigned
+        );
+        let another = job_at(&channel(), 2, 0);
+        if pending {
+            assert!(store.commit(another.proposed(), &verifier).is_err());
+            assert_eq!(store.state().proposal_nonce_high_water(), 1);
+        }
+    }
+}
+
+/// A valid journal frame cannot make an accepted, nonexistent, or provider job
+/// the client's pending proposal. Reopening revalidates the checkpoint itself.
+#[test]
+fn invalid_pending_proposals_are_rejected_at_checkpoint_replay() {
+    let verifier = Secp256k1Verifier::new();
+    for (role, accepted, unknown) in [
+        (Role::Client, true, false),
+        (Role::Client, false, true),
+        (Role::Provider, false, false),
+    ] {
+        let dir = temp();
+        let channel = channel();
+        let job = job_at(&channel, 1, 0);
+        let mut store = open(dir.path(), role);
+        store.commit(job.proposed(), &verifier).unwrap();
+        if accepted {
+            store.commit(job.accepted(), &verifier).unwrap();
+        }
+        let mut bytes = store.state().checkpoint();
+        let suffix = if store.state().job_book().pending_proposal().is_some() {
+            33
+        } else {
+            1
+        };
+        bytes.truncate(bytes.len() - suffix);
+        bytes.push(1);
+        bytes.extend_from_slice(if unknown {
+            &[0xff; 32]
+        } else {
+            job.work_id.as_bytes()
+        });
+        drop(store);
+        let path = only_journal(dir.path());
+        let (id, _) = Journal::inspect(&path).unwrap();
+        let (mut journal, _) = Journal::open(&path, id).unwrap();
+        journal.rotate(&bytes).unwrap();
+        drop(journal);
+        assert!(matches!(
+            ChannelStore::open(
+                dir.path(),
+                channel.clone(),
+                settlement(),
+                role,
+                origin_of(&channel),
+                &verifier
+            ),
+            Err(WorkStoreError::Channel(_))
+        ));
+    }
+}
+
 /// What a checkpoint replays to is exactly what the frames it replaced
 /// replayed to.
 ///
-/// The comparison is of the whole [`ChannelState`], not of the fields
+/// The comparison is of the whole [`Channel`], not of the fields
 /// this test happens to think of: a field added to that struct and left
 /// out of the checkpoint fails to compile, and a field added and encoded
 /// wrongly fails here, as long as one of the two fixtures reaches a

@@ -130,7 +130,7 @@ impl Executor {
             crate::FetchRouteEntry,
             crate::FetchAdaptorSession,
             hellas_rpc::fetch::FetchInput,
-            hellas_rpc::protocol::work_fetch::PaidFetchPolicyV1,
+            hellas_rpc::protocol::work_fetch::FetchPolicyV2,
         ),
         ExecutorError,
     > {
@@ -198,7 +198,7 @@ mod tests {
         verify_input_events, verify_output_events,
     };
     use hellas_rpc::output::{OutputEvent, StopReason, TextChannel};
-    use hellas_rpc::protocol::work_fetch::{PaidFetchPolicyV1, PreparedPaidFetchInputParts};
+    use hellas_rpc::protocol::work_fetch::{FetchPolicyV2, PreparedPaidFetchInputParts};
     use hellas_rpc::{
         Assurance, ContentId, Digest, FetchEnvironment, InputCommitment, InputEventEnvelope,
         ProducerSigningKey, Retention,
@@ -246,8 +246,8 @@ mod tests {
         .expect("test input transcript builds")
     }
 
-    fn policy() -> PaidFetchPolicyV1 {
-        PaidFetchPolicyV1 {
+    fn policy() -> FetchPolicyV2 {
+        FetchPolicyV2 {
             allowed_environment: environment().manifest_id(),
             route_commitment: Digest::from_bytes([3; 32]),
             max_request_body_bytes: 4096,
@@ -256,10 +256,6 @@ mod tests {
             max_spool_bytes: 65536,
             max_encoded_result_frame: 65536,
             max_encoded_prepared_input: 65536,
-            dispatch_margin_blocks: 4,
-            delivery_margin_blocks: 2,
-            oracle_grace_blocks: 6,
-            fixed_price: 7,
         }
     }
 

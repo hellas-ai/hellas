@@ -15,6 +15,7 @@
 //! [`XetFileHasher`]. Signatures accompany the bodies rather than changing
 //! their canonical encoding; changing a domain or encoding changes signatures.
 
+use super::work_profile::{JobInputBinding, WorkContext};
 use hellas_kernel::{
     BufferWriter, EarnedCertificate, EdgeId, Encode, Key, NetworkId, PayloadHash, Terms, TermsHash,
     WorkPaymentSettlement, WorkPaymentTerms,
@@ -48,11 +49,12 @@ const GENERATION_POLICY: &[u8] = b"hellas.work.generation-policy.v1";
 /// Commitment to the canonical identity-artifact body.
 const IDENTITY_SOURCE: &[u8] = b"hellas.work.identity-source.v1";
 /// Commitment to the per-channel execution policy.
-const EXECUTION_POLICY: &[u8] = b"hellas.work.execution-policy.v1";
+const EVALUATE_POLICY: &[u8] = b"hellas.work.evaluate-policy.v2";
 /// Commitment to the prepared input bundle.
 const PREPARED_INPUT: &[u8] = b"hellas.work.prepared-input.v1";
 /// The job authorization, whose digest is the `work_id`.
-const PAID_JOB_AUTHORIZE: &[u8] = b"hellas.work.paid-job-authorize.v1";
+const JOB_PAYMENT_POLICY: &[u8] = b"hellas.work.job-payment-policy.v2";
+const PAID_JOB_AUTHORIZE: &[u8] = b"hellas.work.paid-job-authorize.v2";
 /// The provider's signed result.
 const PAID_JOB_RESULT: &[u8] = b"hellas.work.paid-job-result.v1";
 /// The client's binding of one certificate to one job's result.
@@ -76,12 +78,15 @@ const FORMAT_VERSION: u8 = 1;
 /// policy record ([`super::work_fetch`]) takes its tag from this same
 /// registry, so two profiles can never assign one number.
 pub(crate) mod tag {
+    // Tags 1, 2 and 5 are reserved.
     pub(crate) const PAID_CHANNEL_POLICY: u8 = 0;
-    pub(crate) const PAID_EXECUTION_POLICY: u8 = 1;
-    pub(crate) const PAID_JOB_AUTHORIZATION: u8 = 2;
     pub(crate) const PAID_JOB_RESULT: u8 = 3;
     pub(crate) const PAYMENT_BINDING: u8 = 4;
-    pub(crate) const PAID_FETCH_POLICY: u8 = 5;
+    pub(crate) const EVALUATE_POLICY_V2: u8 = 6;
+    pub(crate) const FETCH_POLICY_V2: u8 = 7;
+    pub(crate) const JOB_PAYMENT_POLICY_V2: u8 = 8;
+    pub(crate) const PAID_JOB_AUTHORIZATION_V2: u8 = 9;
+    pub(crate) const GRANT_JOB_AUTHORIZATION_V1: u8 = 10;
 }
 
 /// Bytes the envelope occupies: `format_version:u8 || record_tag:u8`.
@@ -200,8 +205,8 @@ pub enum PaidWorkError {
 /// One fixed-width private record: an envelope and a body.
 ///
 /// The trait exists so the envelope, the exact-length rule, and the
-/// unknown-tag rejection are written once. Five copies of "check the
-/// version, check the tag, check the length" is five chances to write
+/// unknown-tag rejection are written once. Independent copies of "check the
+/// version, check the tag, check the length" are separate chances to write
 /// one of them differently.
 pub trait PrivateRecord: Sized {
     /// This record's tag byte.
@@ -263,7 +268,7 @@ pub trait PrivateRecord: Sized {
         // Unreachable while every `decode_body` reads exactly
         // `BODY_SIZE` bytes, which is what the length check above
         // already guaranteed it was handed. It is kept because that is a
-        // property of five separate implementations rather than of this
+        // property of separate implementations rather than of this
         // one: a field dropped from a `decode_body` whose `BODY_SIZE`
         // was left alone leaves bytes here, and this is the only place
         // that would notice. No test isolates it, and none claims to.
@@ -312,14 +317,9 @@ impl PrivateRecord for PaidChannelPolicyV1 {
     }
 }
 
-/// Everything about *how* a paid job may execute, fixed before it does.
-///
-/// One signed body carries the environment, the two content
-/// sub-commitments, the whole resource envelope, the timing margins, and
-/// the price. Every one of those is therefore something both parties
-/// authorized rather than a local convention one of them applied.
+/// Versioned funding-independent execution record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PaidExecutionPolicyV1 {
+pub struct EvaluatePolicyV2 {
     /// The one environment manifest this channel will run.
     pub allowed_environment: ContentId,
     /// Commitment to the canonical generation-policy body.
@@ -337,21 +337,13 @@ pub struct PaidExecutionPolicyV1 {
     /// Largest complete encoded result frame, transport framing
     /// included.
     pub max_encoded_result_frame: u32,
-    /// Largest complete encoded quote response, bundle included.
-    pub max_encoded_quote_response: u32,
-    /// Blocks allowed from acceptance to durable terminal readiness.
-    pub dispatch_margin_blocks: u64,
-    /// Blocks allowed to transfer the largest legal result.
-    pub delivery_margin_blocks: u64,
-    /// Blocks allowed for reexecution, invoicing, and admission.
-    pub oracle_grace_blocks: u64,
-    /// Price of one accepted terminal result.
-    pub fixed_price: u64,
+    /// Largest complete encoded prepared-input bundle.
+    pub max_encoded_prepared_input: u32,
 }
 
-impl PrivateRecord for PaidExecutionPolicyV1 {
-    const TAG: u8 = tag::PAID_EXECUTION_POLICY;
-    const BODY_SIZE: usize = 3 * 32 + 4 + 4 + 2 + 8 + 4 + 4 + 8 + 8 + 8 + 8;
+impl PrivateRecord for EvaluatePolicyV2 {
+    const TAG: u8 = tag::EVALUATE_POLICY_V2;
+    const BODY_SIZE: usize = 3 * 32 + 4 + 4 + 2 + 8 + 4 + 4;
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(self.allowed_environment.as_bytes());
@@ -362,11 +354,7 @@ impl PrivateRecord for PaidExecutionPolicyV1 {
         out.extend_from_slice(&self.max_stop_token_ids.to_be_bytes());
         put_u64(out, self.max_spool_bytes);
         put_u32(out, self.max_encoded_result_frame);
-        put_u32(out, self.max_encoded_quote_response);
-        put_u64(out, self.dispatch_margin_blocks);
-        put_u64(out, self.delivery_margin_blocks);
-        put_u64(out, self.oracle_grace_blocks);
-        put_u64(out, self.fixed_price);
+        put_u32(out, self.max_encoded_prepared_input);
     }
 
     fn decode_body(reader: &mut BodyReader<'_>) -> Result<Self, PaidWorkError> {
@@ -379,22 +367,14 @@ impl PrivateRecord for PaidExecutionPolicyV1 {
             max_stop_token_ids: reader.u16()?,
             max_spool_bytes: reader.u64()?,
             max_encoded_result_frame: reader.u32()?,
-            max_encoded_quote_response: reader.u32()?,
-            dispatch_margin_blocks: reader.u64()?,
-            delivery_margin_blocks: reader.u64()?,
-            oracle_grace_blocks: reader.u64()?,
-            fixed_price: reader.u64()?,
+            max_encoded_prepared_input: reader.u32()?,
         })
     }
 }
 
-/// One job, as both parties agreed to it before any work happened.
-///
-/// Its digest is the `work_id`. Both parties sign that digest, and every
-/// later record names it, so a result or a payment can be traced back
-/// to exactly one accepted job or to nothing at all.
+/// V2 payment authorization binds separate execution and payment policies.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PaidJobAuthorizationV1 {
+pub struct PaidJobAuthorizationV2 {
     /// Channel this job belongs to.
     pub channel_id: Digest,
     /// Bond edge insuring the channel.
@@ -406,7 +386,9 @@ pub struct PaidJobAuthorizationV1 {
     /// Commitment to that payment edge's terms.
     pub payment_terms_hash: TermsHash,
     /// Commitment to the execution policy in force.
-    pub execution_policy_digest: Digest,
+    pub work_policy_digest: Digest,
+    /// Commitment to the separate job payment policy.
+    pub payment_policy_digest: Digest,
     /// Commitment to the prepared input bundle.
     pub prepared_input_digest: Digest,
     /// Client-chosen nonce making this proposal unique.
@@ -434,9 +416,9 @@ pub struct PaidJobAuthorizationV1 {
     pub payment_deadline: u64,
 }
 
-impl PrivateRecord for PaidJobAuthorizationV1 {
-    const TAG: u8 = tag::PAID_JOB_AUTHORIZATION;
-    const BODY_SIZE: usize = 9 * 32 + 5 * 8;
+impl PrivateRecord for PaidJobAuthorizationV2 {
+    const TAG: u8 = tag::PAID_JOB_AUTHORIZATION_V2;
+    const BODY_SIZE: usize = 10 * 32 + 5 * 8;
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(self.channel_id.as_bytes());
@@ -444,7 +426,8 @@ impl PrivateRecord for PaidJobAuthorizationV1 {
         out.extend_from_slice(self.bond_terms_hash.as_bytes());
         out.extend_from_slice(self.payment_edge.as_bytes());
         out.extend_from_slice(self.payment_terms_hash.as_bytes());
-        out.extend_from_slice(self.execution_policy_digest.as_bytes());
+        out.extend_from_slice(self.work_policy_digest.as_bytes());
+        out.extend_from_slice(self.payment_policy_digest.as_bytes());
         out.extend_from_slice(self.prepared_input_digest.as_bytes());
         put_u64(out, self.proposal_nonce);
         put_u64(out, self.acceptance_deadline);
@@ -462,7 +445,8 @@ impl PrivateRecord for PaidJobAuthorizationV1 {
             bond_terms_hash: TermsHash::from_bytes(reader.bytes32()?),
             payment_edge: EdgeId::from_bytes(reader.bytes32()?),
             payment_terms_hash: TermsHash::from_bytes(reader.bytes32()?),
-            execution_policy_digest: Digest::from_bytes(reader.bytes32()?),
+            work_policy_digest: Digest::from_bytes(reader.bytes32()?),
+            payment_policy_digest: Digest::from_bytes(reader.bytes32()?),
             prepared_input_digest: Digest::from_bytes(reader.bytes32()?),
             proposal_nonce: reader.u64()?,
             acceptance_deadline: reader.u64()?,
@@ -586,7 +570,7 @@ pub struct BodyReader<'a> {
 }
 
 impl BodyReader<'_> {
-    fn take<const N: usize>(&mut self) -> Result<[u8; N], PaidWorkError> {
+    pub(crate) fn take<const N: usize>(&mut self) -> Result<[u8; N], PaidWorkError> {
         let (head, rest) = self
             .bytes
             .split_at_checked(N)
@@ -688,28 +672,45 @@ const fn wider(a: usize, b: usize) -> usize {
     if a > b { a } else { b }
 }
 
-/// Widest of the five records, taken rather than named.
-const WIDEST_RECORD: usize = wider(
-    wider(
+/// Maximum over every current record, including the separately defined profiles.
+const WIDEST_RECORD: usize = {
+    let widths = [
         PaidChannelPolicyV1::ENCODED_SIZE,
-        PaidExecutionPolicyV1::ENCODED_SIZE,
-    ),
-    wider(
-        wider(
-            PaidJobAuthorizationV1::ENCODED_SIZE,
-            PaidJobResultV1::ENCODED_SIZE,
-        ),
+        EvaluatePolicyV2::ENCODED_SIZE,
+        super::work_fetch::FetchPolicyV2::ENCODED_SIZE,
+        JobPaymentPolicyV2::ENCODED_SIZE,
+        PaidJobAuthorizationV2::ENCODED_SIZE,
+        super::work_grant::GrantJobAuthorizationV1::ENCODED_SIZE,
+        PaidJobResultV1::ENCODED_SIZE,
         PaymentBindingV1::ENCODED_SIZE,
-    ),
-);
-/// Longest of the record domains, likewise taken rather than named.
-const LONGEST_DOMAIN: usize = wider(
-    wider(PAID_CHANNEL_POLICY.len(), EXECUTION_POLICY.len()),
-    wider(
-        wider(PAID_JOB_AUTHORIZE.len(), PAID_JOB_RESULT.len()),
-        PAYMENT_BINDING.len(),
-    ),
-);
+    ];
+    let mut max = 0;
+    let mut i = 0;
+    while i < widths.len() {
+        max = wider(max, widths[i]);
+        i += 1;
+    }
+    max
+};
+const LONGEST_DOMAIN: usize = {
+    let domains = [
+        PAID_CHANNEL_POLICY,
+        EVALUATE_POLICY,
+        JOB_PAYMENT_POLICY,
+        super::work_fetch::FETCH_POLICY,
+        super::work_grant::GRANT_JOB_AUTHORIZE,
+        PAID_JOB_AUTHORIZE,
+        PAID_JOB_RESULT,
+        PAYMENT_BINDING,
+    ];
+    let mut max = 0;
+    let mut i = 0;
+    while i < domains.len() {
+        max = wider(max, domains[i].len());
+        i += 1;
+    }
+    max
+};
 const ENCODED_NETWORK: usize = <NetworkId as Encode>::MAX_ENCODED_SIZE;
 
 /// Largest complete `XH` preimage this module can produce.
@@ -894,7 +895,7 @@ pub fn generation_policy_digest(
 /// The commitment is the canonical policy at the maximum permitted length;
 /// the job authorization separately commits to the exact requested length.
 pub fn matches_generation_policy(
-    policy: &PaidExecutionPolicyV1,
+    policy: &EvaluatePolicyV2,
     requested: &TextPolicy,
 ) -> Result<bool, PaidWorkError> {
     // Zero is not "no limit" here, whatever a quote parser elsewhere
@@ -953,16 +954,8 @@ pub(crate) fn length_prefix(bytes: &[u8], field: &'static str) -> Result<[u8; 4]
 }
 
 /// Returns the digest an authorization names as its execution policy.
-pub fn execution_policy_digest(channel: &PaidChannel, policy: &PaidExecutionPolicyV1) -> Digest {
-    let network_bytes = channel.network_bytes();
-    xh(
-        EXECUTION_POLICY,
-        &[
-            network_bytes.as_slice(),
-            channel.id.as_bytes(),
-            &policy.encode(),
-        ],
-    )
+pub fn work_policy_digest(channel: &PaidChannel, policy: &EvaluatePolicyV2) -> Digest {
+    evaluate_policy_v2_digest(channel.network(), channel.id(), policy)
 }
 
 /// Returns the digest an authorization names as its prepared input.
@@ -973,38 +966,48 @@ pub fn prepared_input_digest(
     channel: &PaidChannel,
     bundle: &PreparedPaidInputV1,
 ) -> Result<Digest, PaidWorkError> {
-    let network_bytes = channel.network_bytes();
+    bound_prepared_input_digest(channel.network(), channel.id(), bundle)
+}
+
+/// Funding-independent prepared-input commitment.
+pub fn bound_prepared_input_digest(
+    network: NetworkId,
+    channel: Digest,
+    bundle: &PreparedPaidInputV1,
+) -> Result<Digest, PaidWorkError> {
+    let network_bytes = EncodedNetwork::new(network);
     Ok(xfh(
         PREPARED_INPUT,
         &[
             network_bytes.as_slice(),
-            channel.id.as_bytes(),
+            channel.as_bytes(),
             &bundle.encode()?,
         ],
     ))
 }
 
 /// Returns the `work_id`: the digest both parties sign to accept a job.
-pub fn work_id(channel: &PaidChannel, authorization: &PaidJobAuthorizationV1) -> Digest {
-    let network_bytes = channel.network_bytes();
-    xh(
-        PAID_JOB_AUTHORIZE,
-        &[
-            network_bytes.as_slice(),
-            channel.id.as_bytes(),
-            &authorization.encode(),
-        ],
-    )
+pub fn work_id(channel: &PaidChannel, authorization: &PaidJobAuthorizationV2) -> Digest {
+    paid_work_v2_id(channel.network(), channel.id(), authorization)
 }
 
 /// Returns the digest the provider signs to deliver a result.
 pub fn result_digest(channel: &PaidChannel, result: &PaidJobResultV1) -> Digest {
-    let network_bytes = channel.network_bytes();
+    bound_result_digest(channel.network(), channel.id(), result)
+}
+
+/// The shared digest domain, bound to a funding-separated channel identity.
+pub fn bound_result_digest(
+    network: NetworkId,
+    channel: Digest,
+    result: &PaidJobResultV1,
+) -> Digest {
+    let network_bytes = EncodedNetwork::new(network);
     xh(
         PAID_JOB_RESULT,
         &[
             network_bytes.as_slice(),
-            channel.id.as_bytes(),
+            channel.as_bytes(),
             &result.encode(),
         ],
     )
@@ -1044,12 +1047,22 @@ pub fn delivery_request_digest(
     work_id: Digest,
     exporter: &[u8; 32],
 ) -> Digest {
-    let network_bytes = channel.network_bytes();
+    bound_delivery_request_digest(channel.network(), channel.id(), work_id, exporter)
+}
+
+/// The shared digest domain, bound to a funding-separated channel identity.
+pub fn bound_delivery_request_digest(
+    network: NetworkId,
+    channel: Digest,
+    work_id: Digest,
+    exporter: &[u8; 32],
+) -> Digest {
+    let network_bytes = EncodedNetwork::new(network);
     xh(
         DELIVERY_REQUEST,
         &[
             network_bytes.as_slice(),
-            channel.id.as_bytes(),
+            channel.as_bytes(),
             work_id.as_bytes(),
             exporter,
         ],
@@ -1135,9 +1148,8 @@ pub fn canonical_output_digest(
 /// no stop tokens is a channel whose jobs run to `max_new_tokens`, which
 /// is a usable channel. Zero reads there as the limit it is, not as an
 /// unset field.
-pub fn check_execution_policy(policy: &PaidExecutionPolicyV1) -> Result<(), PaidWorkError> {
+pub fn check_work_policy(policy: &EvaluatePolicyV2) -> Result<(), PaidWorkError> {
     for (field, value) in [
-        ("fixed_price", policy.fixed_price),
         ("max_prompt_tokens", u64::from(policy.max_prompt_tokens)),
         ("max_new_tokens", u64::from(policy.max_new_tokens)),
         ("max_spool_bytes", policy.max_spool_bytes),
@@ -1146,12 +1158,9 @@ pub fn check_execution_policy(policy: &PaidExecutionPolicyV1) -> Result<(), Paid
             u64::from(policy.max_encoded_result_frame),
         ),
         (
-            "max_encoded_quote_response",
-            u64::from(policy.max_encoded_quote_response),
+            "max_encoded_prepared_input",
+            u64::from(policy.max_encoded_prepared_input),
         ),
-        ("dispatch_margin_blocks", policy.dispatch_margin_blocks),
-        ("delivery_margin_blocks", policy.delivery_margin_blocks),
-        ("oracle_grace_blocks", policy.oracle_grace_blocks),
     ] {
         if value == 0 {
             return Err(PaidWorkError::PolicyZero { field });
@@ -1206,26 +1215,28 @@ pub struct JobDeadlines {
 /// length-prefix.
 pub fn propose_authorization(
     channel: &PaidChannel,
-    policy: &PaidExecutionPolicyV1,
+    policy: &EvaluatePolicyV2,
+    payment: &JobPaymentPolicyV2,
     bundle: &PreparedPaidInputV1,
     proposal_nonce: u64,
     deadlines: JobDeadlines,
-) -> Result<PaidJobAuthorizationV1, PaidWorkError> {
+) -> Result<PaidJobAuthorizationV2, PaidWorkError> {
     let terms = channel.payment_terms();
     let request = bundle.parts()?.evaluate_request;
-    Ok(PaidJobAuthorizationV1 {
+    Ok(PaidJobAuthorizationV2 {
         channel_id: channel.id(),
         bond_edge: terms.bond_edge,
         bond_terms_hash: terms.bond_terms_hash(),
         payment_edge: channel.payment_edge(),
         payment_terms_hash: channel.payment_terms_hash(),
-        execution_policy_digest: execution_policy_digest(channel, policy),
+        work_policy_digest: work_policy_digest(channel, policy),
+        payment_policy_digest: job_payment_policy_digest(channel.network(), channel.id(), payment),
         prepared_input_digest: prepared_input_digest(channel, bundle)?,
         proposal_nonce,
         acceptance_deadline: deadlines.acceptance,
         request_commitment: Evaluate::commit_request(&request),
         environment_commitment: request.execution_environment,
-        price: policy.fixed_price,
+        price: payment.fixed_price,
         terminal_deadline: deadlines.terminal,
         payment_deadline: deadlines.payment,
     })
@@ -1253,17 +1264,18 @@ pub const fn signing_hash(digest: Digest) -> PayloadHash {
 /// not already closed.
 pub fn check_authorization(
     channel: &PaidChannel,
-    authorization: &PaidJobAuthorizationV1,
-    policy: &PaidExecutionPolicyV1,
+    authorization: &PaidJobAuthorizationV2,
+    policy: &EvaluatePolicyV2,
+    payment: &JobPaymentPolicyV2,
     finalized_height: u64,
 ) -> Result<Digest, PaidWorkError> {
-    check_execution_policy(policy)?;
+    check_work_policy(policy)?;
     check_authorization_core(
         channel,
         authorization,
-        execution_policy_digest(channel, policy),
+        work_policy_digest(channel, policy),
         policy.allowed_environment,
-        policy.fixed_price,
+        payment,
         finalized_height,
     )
 }
@@ -1271,7 +1283,7 @@ pub fn check_authorization(
 /// The authorization arithmetic every paid-work profile shares.
 ///
 /// The profiles differ in what a policy *is* — the evaluate profile's is
-/// [`PaidExecutionPolicyV1`], the fetch profile's is in
+/// [`EvaluatePolicyV2`], the fetch profile's is in
 /// [`super::work_fetch`] — but not in what signing one *means*: the same
 /// channel fields, the same bond cover, the same credit-limit cover, the
 /// same deadline window. That part is written once here so the two
@@ -1280,12 +1292,13 @@ pub fn check_authorization(
 /// price; what this function supplies is everything else.
 pub(crate) fn check_authorization_core(
     channel: &PaidChannel,
-    authorization: &PaidJobAuthorizationV1,
+    authorization: &PaidJobAuthorizationV2,
     policy_digest: Digest,
     allowed_environment: ContentId,
-    fixed_price: u64,
+    payment: &JobPaymentPolicyV2,
     finalized_height: u64,
 ) -> Result<Digest, PaidWorkError> {
+    payment.check()?;
     let terms = channel.payment_terms();
     let expected = [
         (
@@ -1309,8 +1322,13 @@ pub(crate) fn check_authorization_core(
             authorization.payment_terms_hash.as_bytes() == channel.payment_terms_hash.as_bytes(),
         ),
         (
-            "execution_policy_digest",
-            authorization.execution_policy_digest.as_bytes() == policy_digest.as_bytes(),
+            "work_policy_digest",
+            authorization.work_policy_digest.as_bytes() == policy_digest.as_bytes(),
+        ),
+        (
+            "payment_policy_digest",
+            authorization.payment_policy_digest
+                == job_payment_policy_digest(channel.network(), channel.id(), payment),
         ),
         (
             "environment_commitment",
@@ -1330,7 +1348,7 @@ pub(crate) fn check_authorization_core(
             max_job_price,
         });
     }
-    if authorization.price != fixed_price {
+    if authorization.price != payment.fixed_price {
         return Err(PaidWorkError::Mismatch { field: "price" });
     }
 
@@ -1395,12 +1413,22 @@ pub(crate) fn check_authorization_core(
 /// inside. Signing the digest never substitutes for this.
 pub fn check_prepared_input(
     channel: &PaidChannel,
-    authorization: &PaidJobAuthorizationV1,
-    policy: &PaidExecutionPolicyV1,
+    authorization: &PaidJobAuthorizationV2,
+    policy: &EvaluatePolicyV2,
+    bundle: &PreparedPaidInputV1,
+) -> Result<(), PaidWorkError> {
+    check_bound_evaluate_input(&channel.into(), &authorization.into(), policy, bundle)
+}
+
+/// Applies the exact resource checks without requiring payment edges.
+pub fn check_bound_evaluate_input(
+    context: &WorkContext,
+    binding: &JobInputBinding,
+    policy: &EvaluatePolicyV2,
     bundle: &PreparedPaidInputV1,
 ) -> Result<(), PaidWorkError> {
     let encoded = bundle.encode()?;
-    let limit = u64::from(policy.max_encoded_quote_response);
+    let limit = u64::from(policy.max_encoded_prepared_input);
     let actual = u64::try_from(encoded.len()).map_err(|_| PaidWorkError::Overflow {
         field: "prepared input length",
     })?;
@@ -1411,8 +1439,8 @@ pub fn check_prepared_input(
             limit,
         });
     }
-    if prepared_input_digest(channel, bundle)?.as_bytes()
-        != authorization.prepared_input_digest.as_bytes()
+    if bound_prepared_input_digest(context.network, context.channel, bundle)?.as_bytes()
+        != binding.prepared_input_digest.as_bytes()
     {
         return Err(PaidWorkError::Mismatch {
             field: "prepared_input_digest",
@@ -1427,7 +1455,7 @@ pub fn check_prepared_input(
             field: "request assurance",
         });
     }
-    if request.runner_public_key != PublicKey::Secp256k1(channel.client_key().to_bytes()) {
+    if request.runner_public_key != PublicKey::Secp256k1(context.client.to_bytes()) {
         return Err(PaidWorkError::Mismatch {
             field: "runner_public_key",
         });
@@ -1465,13 +1493,11 @@ pub fn check_prepared_input(
         ),
         (
             "environment_commitment",
-            request.execution_environment.as_bytes()
-                == authorization.environment_commitment.as_bytes(),
+            request.execution_environment.as_bytes() == binding.environment_commitment.as_bytes(),
         ),
         (
             "request_commitment",
-            Evaluate::commit_request(request).as_bytes()
-                == authorization.request_commitment.as_bytes(),
+            Evaluate::commit_request(request).as_bytes() == binding.request_commitment.as_bytes(),
         ),
         (
             "text_execution id",
@@ -1556,10 +1582,25 @@ pub fn check_prepared_input(
 /// [`canonical_output_digest`] refuses about the terminal's own counts.
 pub fn terminal_result(
     channel: &PaidChannel,
-    authorization: &PaidJobAuthorizationV1,
+    authorization: &PaidJobAuthorizationV2,
     transcript: &[OutputEventEnvelope],
 ) -> Result<PaidJobResultV1, PaidWorkError> {
-    let input = InputCommitment::from_digest(authorization.request_commitment.digest());
+    bound_evaluate_terminal_result(
+        &channel.into(),
+        work_id(channel, authorization),
+        authorization.request_commitment,
+        transcript,
+    )
+}
+
+/// Verifies a native result under the common Work identity and signed request.
+pub fn bound_evaluate_terminal_result(
+    context: &WorkContext,
+    work_id: Digest,
+    request: RequestCommitment,
+    transcript: &[OutputEventEnvelope],
+) -> Result<PaidJobResultV1, PaidWorkError> {
+    let input = InputCommitment::from_digest(request.digest());
     let output = verify_output_events(input, Assurance::ProducerSigned, transcript)
         .map_err(|error| PaidWorkError::Transcript(error.to_string()))?;
 
@@ -1567,7 +1608,7 @@ pub fn terminal_result(
     // takes that key from the first event, so it cannot say whose key it
     // is. This is what says it is the provider's — the same compressed
     // secp256k1 point the payment terms name as a party.
-    if output.producer_key != PublicKey::Secp256k1(channel.provider_key().to_bytes()) {
+    if output.producer_key != PublicKey::Secp256k1(context.provider.to_bytes()) {
         return Err(PaidWorkError::Mismatch {
             field: "transcript producer key",
         });
@@ -1592,12 +1633,11 @@ pub fn terminal_result(
         .flat_map(|delta| delta.token_ids.iter().copied())
         .collect();
 
-    let work_id = work_id(channel, authorization);
     Ok(PaidJobResultV1 {
         work_id,
         terminal_transcript_commitment: terminal_event.event_commitment(),
         canonical_output_digest: canonical_output_digest(
-            channel.network(),
+            context.network,
             work_id,
             &output_token_ids,
             &output.terminal,
@@ -1708,7 +1748,7 @@ pub fn check_result(
 /// this edge can settle.
 pub fn next_payment(
     channel: &PaidChannel,
-    authorization: &PaidJobAuthorizationV1,
+    authorization: &PaidJobAuthorizationV2,
     result: &PaidJobResultV1,
     credited: u64,
     settlement: WorkPaymentSettlement,
@@ -1794,7 +1834,7 @@ impl CreditLedger {
     pub fn credit_payment(
         &mut self,
         channel: &PaidChannel,
-        authorization: &PaidJobAuthorizationV1,
+        authorization: &PaidJobAuthorizationV2,
         result: &PaidJobResultV1,
         binding: &PaymentBindingV1,
         certificate: &EarnedCertificate,
@@ -1851,4 +1891,124 @@ impl CreditLedger {
         self.credited_cumulative = expected_certificate.earned_cumulative();
         Ok(())
     }
+}
+
+/// The price and block margins of payment-funded execution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JobPaymentPolicyV2 {
+    /// Price of one accepted terminal result.
+    pub fixed_price: u64,
+    /// Acceptance-to-terminal budget in finalized blocks.
+    pub dispatch_margin_blocks: u64,
+    /// Result transfer budget in finalized blocks.
+    pub delivery_margin_blocks: u64,
+    /// Payment and admission budget in finalized blocks.
+    pub oracle_grace_blocks: u64,
+}
+impl PrivateRecord for JobPaymentPolicyV2 {
+    const TAG: u8 = tag::JOB_PAYMENT_POLICY_V2;
+    const BODY_SIZE: usize = 4 * 8;
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        put_u64(out, self.fixed_price);
+        put_u64(out, self.dispatch_margin_blocks);
+        put_u64(out, self.delivery_margin_blocks);
+        put_u64(out, self.oracle_grace_blocks);
+    }
+    fn decode_body(reader: &mut BodyReader<'_>) -> Result<Self, PaidWorkError> {
+        Ok(Self {
+            fixed_price: reader.u64()?,
+            dispatch_margin_blocks: reader.u64()?,
+            delivery_margin_blocks: reader.u64()?,
+            oracle_grace_blocks: reader.u64()?,
+        })
+    }
+}
+impl JobPaymentPolicyV2 {
+    /// Rejects free jobs and zero-length payment windows.
+    pub fn check(&self) -> Result<(), PaidWorkError> {
+        for (field, value) in [
+            ("fixed_price", self.fixed_price),
+            ("dispatch_margin_blocks", self.dispatch_margin_blocks),
+            ("delivery_margin_blocks", self.delivery_margin_blocks),
+            ("oracle_grace_blocks", self.oracle_grace_blocks),
+        ] {
+            if value == 0 {
+                return Err(PaidWorkError::PolicyZero { field });
+            }
+        }
+        Ok(())
+    }
+    /// The three positive block margins in dispatch/delivery/oracle order.
+    pub const fn margins(&self) -> (u64, u64, u64) {
+        (
+            self.dispatch_margin_blocks,
+            self.delivery_margin_blocks,
+            self.oracle_grace_blocks,
+        )
+    }
+}
+/// Network- and channel-bound Evaluate policy digest.
+pub fn evaluate_policy_v2_digest(
+    network: NetworkId,
+    channel: Digest,
+    policy: &EvaluatePolicyV2,
+) -> Digest {
+    versioned_record_digest(EVALUATE_POLICY, network, channel, &policy.encode())
+}
+/// Network- and channel-bound payment terms digest.
+pub fn job_payment_policy_digest(
+    network: NetworkId,
+    channel: Digest,
+    policy: &JobPaymentPolicyV2,
+) -> Digest {
+    versioned_record_digest(JOB_PAYMENT_POLICY, network, channel, &policy.encode())
+}
+
+/// Checks the payment terms retained for an accepted job, without reapplying
+/// its acceptance deadline during execution or delivery.
+pub fn check_payment_policy_binding(
+    channel: &PaidChannel,
+    authorization: &PaidJobAuthorizationV2,
+    payment: &JobPaymentPolicyV2,
+) -> Result<(), PaidWorkError> {
+    payment.check()?;
+    if authorization.payment_policy_digest
+        != job_payment_policy_digest(channel.network(), channel.id(), payment)
+    {
+        return Err(PaidWorkError::Mismatch {
+            field: "payment_policy_digest",
+        });
+    }
+    if authorization.price != payment.fixed_price {
+        return Err(PaidWorkError::Mismatch { field: "price" });
+    }
+    Ok(())
+}
+/// The V2 work id signed by both payment parties.
+pub fn paid_work_v2_id(
+    network: NetworkId,
+    channel: Digest,
+    authorization: &PaidJobAuthorizationV2,
+) -> Digest {
+    versioned_record_digest(
+        PAID_JOB_AUTHORIZE,
+        network,
+        channel,
+        &authorization.encode(),
+    )
+}
+pub(crate) fn versioned_record_digest(
+    domain: &[u8],
+    network: NetworkId,
+    channel: Digest,
+    bytes: &[u8],
+) -> Digest {
+    xh(
+        domain,
+        &[
+            EncodedNetwork::new(network).as_slice(),
+            channel.as_bytes(),
+            bytes,
+        ],
+    )
 }

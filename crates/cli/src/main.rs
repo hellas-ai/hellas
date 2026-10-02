@@ -1011,6 +1011,8 @@ async fn async_main() {
                     // settles as, taken from the identity loaded above
                     // and never made here.
                     settlement_key: identity::settlement_signer(&local_identity),
+                    provider: local_identity.enrollment.clone(),
+                    addresses: Vec::new(),
                     client: hellas_kernel::Key::from_bytes(commands::paid_work::fixed_hex("--client", &client)?),
                     stake_coins: stake_coin.iter().map(|coin| {
                         commands::paid_work::fixed_hex("--stake-coin", coin).map(hellas_kernel::CoinId::from_bytes)
@@ -1136,7 +1138,7 @@ async fn async_main() {
                         hellas_sdk::paid_gateway::PaidGateway::open(
                             hellas_sdk::paid_gateway::load_pool_options(path, assurance)?,
                             hellas_sdk::ClientIdentity::from_secret_bytes(secret_key.to_bytes(), local_identity.producer_key.to_secret_bytes())?,
-                        ).await? as std::sync::Arc<dyn hellas_gateway::PaidExecutionBackend>
+                        ).await? as std::sync::Arc<dyn hellas_gateway::WorkExecutionBackend>
                     )
                 } else {
                     None

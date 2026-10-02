@@ -1,6 +1,6 @@
 //! Generic RPC helpers used by codegen-emitted client trait impls.
 //!
-//! The codegen produces typed client traits like `ExecuteClient<T>` with one
+//! The codegen produces typed client traits like `WorkClient<T>` with one
 //! async method per RPC. Each method body delegates to one of the helpers
 //! below, parameterised by a `MethodMarker` so prost type info is at the
 //! type level — no string method names at call sites.

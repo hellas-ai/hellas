@@ -22,7 +22,7 @@ use hellas_rpc::pb::work::{
     exchange_setup_response::Outcome,
 };
 use hellas_rpc::protocol::work::{
-    PaidChannelPolicyV1, PaidExecutionPolicyV1, private_policy_commitment,
+    EvaluatePolicyV2, PaidChannelPolicyV1, private_policy_commitment,
 };
 use hellas_rpc::protocol::work_bundle::WorkChannelSetupBundleV1;
 use hellas_rpc::protocol::work_setup::ProviderChannelPolicy;
@@ -161,8 +161,8 @@ fn other_channel_policy() -> PaidChannelPolicyV1 {
     }
 }
 
-fn execution_policy() -> PaidExecutionPolicyV1 {
-    PaidExecutionPolicyV1 {
+fn work_policy() -> EvaluatePolicyV2 {
+    EvaluatePolicyV2 {
         allowed_environment: ContentId::from_bytes([0x31; 32]),
         generation_policy_digest: Digest::from_bytes([0x32; 32]),
         identity_source_digest: Digest::from_bytes([0x33; 32]),
@@ -171,21 +171,18 @@ fn execution_policy() -> PaidExecutionPolicyV1 {
         max_stop_token_ids: 4,
         max_spool_bytes: 1_048_576,
         max_encoded_result_frame: 262_144,
-        max_encoded_quote_response: 1_048_576,
-        dispatch_margin_blocks: 4,
-        delivery_margin_blocks: 2,
-        oracle_grace_blocks: 6,
-        fixed_price: 10,
+        max_encoded_prepared_input: 1_048_576,
     }
 }
 
 /// What this provider will countersign a payment over.
 fn provider_policy() -> ProviderChannelPolicy {
     ProviderChannelPolicy {
+        payment_policy: payment_policy(),
         network: network(),
         policy_salt: SALT,
         channel_policy: channel_policy(),
-        execution_policy: execution_policy().into(),
+        work_policy: work_policy().into(),
         expected_payment_values: EdgeValues::new(
             PAYMENT_VALUE,
             PAYMENT_RESERVE,
@@ -733,6 +730,7 @@ async fn a_replay_is_answered_the_same_and_writes_nothing() {
     // The client, having lost the answer, asks again with revision 3.
     let response = match WorkSetupClientImpl::new(dialer)
         .exchange_setup(ExchangeSetupRequest {
+            bond_edge: bond_edge().as_bytes().to_vec(),
             bundle: first.clone(),
         })
         .await
@@ -773,7 +771,10 @@ async fn a_provider_with_no_proposal_is_not_ready() {
     let serving = serve(listener, service);
 
     let response = match WorkSetupClientImpl::new(dialer)
-        .exchange_setup(ExchangeSetupRequest { bundle: Vec::new() })
+        .exchange_setup(ExchangeSetupRequest {
+            bond_edge: bond_edge().as_bytes().to_vec(),
+            bundle: Vec::new(),
+        })
         .await
     {
         Ok(response) => response,
@@ -827,7 +828,10 @@ async fn a_stranger_cannot_make_the_provider_countersign() {
     // hand and putting them on the wire.
     let forged = forged_revision_two();
     let response = match WorkSetupClientImpl::new(dialer)
-        .exchange_setup(ExchangeSetupRequest { bundle: forged })
+        .exchange_setup(ExchangeSetupRequest {
+            bond_edge: bond_edge().as_bytes().to_vec(),
+            bundle: forged,
+        })
         .await
     {
         Ok(response) => response,
@@ -898,7 +902,10 @@ async fn refused_by_a_proposing_provider(bundle: Vec<u8>) -> (ExchangeSetupRespo
     let serving = serve(listener, service.clone());
 
     let response = match WorkSetupClientImpl::new(dialer)
-        .exchange_setup(ExchangeSetupRequest { bundle })
+        .exchange_setup(ExchangeSetupRequest {
+            bond_edge: bond_edge().as_bytes().to_vec(),
+            bundle,
+        })
         .await
     {
         Ok(response) => response,
@@ -936,11 +943,12 @@ async fn refused_by_a_proposing_provider(bundle: Vec<u8>) -> (ExchangeSetupRespo
 fn the_wire_field_numbers_are_pinned() {
     assert_eq!(
         ExchangeSetupRequest {
+            bond_edge: vec![0xef; 32],
             bundle: vec![0xab, 0xcd],
         }
         .encode_to_vec(),
         // field 1, length-delimited: (1 << 3) | 2 == 0x0a
-        vec![0x0a, 0x02, 0xab, 0xcd],
+        [vec![0x0a, 0x02, 0xab, 0xcd, 0x12, 0x20], vec![0xef; 32]].concat(),
     );
     assert_eq!(
         SetupAdvanced {
@@ -1072,5 +1080,14 @@ fn revision_two_signed_by(
     ) {
         Ok(bundle) => bundle,
         Err(error) => panic!("the fixture payment proposes: {error}"),
+    }
+}
+
+fn payment_policy() -> hellas_rpc::protocol::work::JobPaymentPolicyV2 {
+    hellas_rpc::protocol::work::JobPaymentPolicyV2 {
+        fixed_price: 10,
+        dispatch_margin_blocks: 4,
+        delivery_margin_blocks: 2,
+        oracle_grace_blocks: 6,
     }
 }

@@ -18,7 +18,7 @@ use hellas_kernel::{
 };
 use hellas_rpc::pb::work::{ExchangeSetupRequest, exchange_setup_response::Outcome};
 use hellas_rpc::protocol::work::{
-    PaidChannelPolicyV1, PaidExecutionPolicyV1, private_policy_commitment,
+    EvaluatePolicyV2, PaidChannelPolicyV1, private_policy_commitment,
 };
 use hellas_rpc::protocol::work_bundle::WorkChannelSetupBundleV1;
 use hellas_rpc::protocol::work_setup::ProviderChannelPolicy;
@@ -134,8 +134,8 @@ fn channel_policy() -> PaidChannelPolicyV1 {
     }
 }
 
-fn execution_policy() -> PaidExecutionPolicyV1 {
-    PaidExecutionPolicyV1 {
+fn work_policy() -> EvaluatePolicyV2 {
+    EvaluatePolicyV2 {
         allowed_environment: ContentId::from_bytes([0x31; 32]),
         generation_policy_digest: Digest::from_bytes([0x32; 32]),
         identity_source_digest: Digest::from_bytes([0x33; 32]),
@@ -144,20 +144,17 @@ fn execution_policy() -> PaidExecutionPolicyV1 {
         max_stop_token_ids: 4,
         max_spool_bytes: 1_048_576,
         max_encoded_result_frame: 262_144,
-        max_encoded_quote_response: 1_048_576,
-        dispatch_margin_blocks: 4,
-        delivery_margin_blocks: 2,
-        oracle_grace_blocks: 6,
-        fixed_price: 10,
+        max_encoded_prepared_input: 1_048_576,
     }
 }
 
 fn provider_policy() -> ProviderChannelPolicy {
     ProviderChannelPolicy {
+        payment_policy: payment_policy(),
         network: network(),
         policy_salt: SALT,
         channel_policy: channel_policy(),
-        execution_policy: execution_policy().into(),
+        work_policy: work_policy().into(),
         expected_payment_values: EdgeValues::new(3_000, 200, Fees::ZERO),
         min_omit_response_blocks: hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
     }
@@ -2456,7 +2453,10 @@ impl SetupView for HeldChannel {
 async fn exchange(service: &SetupService, bundle: Vec<u8>) -> Vec<u8> {
     let answered = WorkSetupHandler::exchange_setup(
         service,
-        ExchangeSetupRequest { bundle },
+        ExchangeSetupRequest {
+            bond_edge: bond_edge().as_bytes().to_vec(),
+            bundle,
+        },
         hellas_wire::TransportContext::default(),
     )
     .await
@@ -3598,4 +3598,13 @@ fn a_predecessor_left_by_a_crash_is_not_discovered_twice() {
     };
     assert!(found.unidentified.is_empty(), "{:?}", found.unidentified);
     assert_eq!(found.setups.len(), 1, "one setup, not one per generation");
+}
+
+fn payment_policy() -> hellas_rpc::protocol::work::JobPaymentPolicyV2 {
+    hellas_rpc::protocol::work::JobPaymentPolicyV2 {
+        fixed_price: 10,
+        dispatch_margin_blocks: 4,
+        delivery_margin_blocks: 2,
+        oracle_grace_blocks: 6,
+    }
 }

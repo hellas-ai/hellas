@@ -38,7 +38,7 @@ use hellas_rpc::protocol::artifacts::{
     SourceRef, TextArtifact, TextExecution, TextExecutionId, TextPolicy, TokenIds, completed_text,
 };
 use hellas_rpc::protocol::work::{
-    JobDeadlines, PaidChannelPolicyV1, PaidExecutionPolicyV1, PaidJobAuthorizationV1,
+    EvaluatePolicyV2, JobDeadlines, PaidChannelPolicyV1, PaidJobAuthorizationV2,
     generation_policy_digest, identity_source_digest, private_policy_commitment,
     propose_authorization, signing_hash, work_id,
 };
@@ -53,8 +53,8 @@ use hellas_rpc::{
 use hellas_wire::mux::{MessagePipe, MuxConfig, MuxTransport, Role as MuxRole};
 use hellas_wire::{DefaultClock, Dispatcher, StreamTransport};
 use hellas_work::work::{
-    BackendFault, ClientEndpoint, PaidWorkBackend, PreparedEvaluateInput, ProviderEndpoint,
-    RunOutcome, WorkService, run_accepted_work,
+    BackendFault, ClientEndpoint, PreparedEvaluateInput, ProviderEndpoint, RunOutcome, WorkBackend,
+    WorkService, run_accepted_work,
 };
 use hellas_work::work_close::{BlockSourceError, FinalizedBlocks, FinalizedWork, observe};
 use hellas_work::work_store::{
@@ -154,8 +154,8 @@ fn payment_terms() -> WorkPaymentTerms {
     }
 }
 
-fn execution_policy() -> PaidExecutionPolicyV1 {
-    PaidExecutionPolicyV1 {
+fn work_policy() -> EvaluatePolicyV2 {
+    EvaluatePolicyV2 {
         allowed_environment: manifest().content_id(),
         generation_policy_digest: match generation_policy_digest(&text_policy().canonical_bytes()) {
             Ok(digest) => digest,
@@ -171,11 +171,7 @@ fn execution_policy() -> PaidExecutionPolicyV1 {
         max_stop_token_ids: 4,
         max_spool_bytes: 1_048_576,
         max_encoded_result_frame: 262_144,
-        max_encoded_quote_response: 1_048_576,
-        dispatch_margin_blocks: 4,
-        delivery_margin_blocks: 2,
-        oracle_grace_blocks: 6,
-        fixed_price: PRICE,
+        max_encoded_prepared_input: 1_048_576,
     }
 }
 
@@ -183,14 +179,15 @@ fn payment_values() -> EdgeValues {
     EdgeValues::new(PAYMENT_VALUE, PAYMENT_RESERVE, Fees::new(0, 0, 0, 0))
 }
 
-fn descriptor_with(policy: PaidExecutionPolicyV1) -> WorkChannelDescriptor {
+fn descriptor_with(policy: EvaluatePolicyV2) -> WorkChannelDescriptor {
     let config = WorkChannelConfig {
+        payment_policy: payment_policy(),
         network: network(),
         payment_edge: payment_edge(),
         payment_terms: payment_terms(),
         policy_salt: SALT,
         channel_policy: channel_policy(),
-        execution_policy: policy.into(),
+        work_policy: policy.into(),
         expected_payment_values: payment_values(),
     };
     match WorkChannelDescriptor::open(config) {
@@ -216,7 +213,7 @@ fn ready_of(descriptor: &WorkChannelDescriptor, height: u64) -> ReadyChannel {
 }
 
 fn ready() -> ReadyChannel {
-    ready_of(&descriptor_with(execution_policy()), CURSOR)
+    ready_of(&descriptor_with(work_policy()), CURSOR)
 }
 
 fn settlement() -> WorkPaymentSettlement {
@@ -357,10 +354,11 @@ fn bundle(nonce: u8) -> PreparedPaidInputV1 {
     )
 }
 
-fn authorization(policy: &PaidExecutionPolicyV1, nonce: u8) -> PaidJobAuthorizationV1 {
+fn authorization(policy: &EvaluatePolicyV2, nonce: u8) -> PaidJobAuthorizationV2 {
     match propose_authorization(
         ready_of(&descriptor_with(*policy), CURSOR).channel(),
         policy,
+        &payment_policy(),
         &bundle(nonce),
         u64::from(nonce),
         deadlines(),
@@ -375,10 +373,10 @@ fn authorization(policy: &PaidExecutionPolicyV1, nonce: u8) -> PaidJobAuthorizat
 /// The acceptance exchange has its own file; these tests are about what
 /// happens after both signatures exist.
 fn accept(
-    policy: &PaidExecutionPolicyV1,
+    policy: &EvaluatePolicyV2,
     stores: &mut [&mut ChannelStore],
     nonce: u8,
-) -> (Digest, PaidJobAuthorizationV1) {
+) -> (Digest, PaidJobAuthorizationV2) {
     let authorization = authorization(policy, nonce);
     let ready = ready_of(&descriptor_with(*policy), CURSOR);
     let id = work_id(ready.channel(), &authorization);
@@ -462,7 +460,7 @@ impl AnsweringBackend {
     }
 }
 
-impl PaidWorkBackend for AnsweringBackend {
+impl WorkBackend for AnsweringBackend {
     fn evaluate(
         &self,
         input: PreparedEvaluateInput,
@@ -690,7 +688,7 @@ async fn a_checked_answer_is_the_only_thing_that_reaches_the_matched_phase() {
     let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR);
     let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
     let (id, _) = accept(
-        &execution_policy(),
+        &work_policy(),
         &mut [&mut client_store, &mut provider_store],
         1,
     );
@@ -785,7 +783,7 @@ async fn a_checked_answer_becomes_a_payment_the_provider_admitted() {
     let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR);
     let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
     let (id, _) = accept(
-        &execution_policy(),
+        &work_policy(),
         &mut [&mut client_store, &mut provider_store],
         1,
     );
@@ -856,7 +854,7 @@ async fn an_authenticated_answer_is_paid_without_reexecution() {
     let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR);
     let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
     let (id, _) = accept(
-        &execution_policy(),
+        &work_policy(),
         &mut [&mut client_store, &mut provider_store],
         1,
     );
@@ -899,7 +897,7 @@ async fn ordinary_collection_refuses_a_stale_payment_boundary() {
     let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR);
     let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
     let (id, authorization) = accept(
-        &execution_policy(),
+        &work_policy(),
         &mut [&mut client_store, &mut provider_store],
         1,
     );
@@ -939,7 +937,7 @@ async fn a_payment_signed_before_a_crash_is_re_sent_after_it() {
     let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR);
     let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
     let (id, _) = accept(
-        &execution_policy(),
+        &work_policy(),
         &mut [&mut client_store, &mut provider_store],
         1,
     );
@@ -1017,7 +1015,7 @@ async fn a_refuted_answer_closes_the_job_and_is_not_paid_for() {
     let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR);
     let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
     let (id, _) = accept(
-        &execution_policy(),
+        &work_policy(),
         &mut [&mut client_store, &mut provider_store],
         1,
     );
@@ -1107,7 +1105,7 @@ async fn a_refutation_is_permanent_across_a_restart() {
     let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR);
     let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
     let (id, _) = accept(
-        &execution_policy(),
+        &work_policy(),
         &mut [&mut client_store, &mut provider_store],
         1,
     );
@@ -1199,7 +1197,7 @@ async fn an_engine_that_cannot_run_records_no_verdict() {
     let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR);
     let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
     let (id, _) = accept(
-        &execution_policy(),
+        &work_policy(),
         &mut [&mut client_store, &mut provider_store],
         1,
     );
@@ -1251,7 +1249,7 @@ async fn a_stalled_reproduction_refuses_to_pay_at_the_barrier() {
     let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR);
     let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
     let (id, authorization) = accept(
-        &execution_policy(),
+        &work_policy(),
         &mut [&mut client_store, &mut provider_store],
         1,
     );
@@ -1396,4 +1394,13 @@ fn lease_over(bond: EdgeId, payment: EdgeId) -> LeaseSlots {
         "the hand-written lease is readable, got {parsed:?}",
     );
     parsed
+}
+
+fn payment_policy() -> hellas_rpc::protocol::work::JobPaymentPolicyV2 {
+    hellas_rpc::protocol::work::JobPaymentPolicyV2 {
+        fixed_price: PRICE,
+        dispatch_margin_blocks: 4,
+        delivery_margin_blocks: 2,
+        oracle_grace_blocks: 6,
+    }
 }

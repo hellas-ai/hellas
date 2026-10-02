@@ -12,7 +12,8 @@ impl ChannelRecord {
     pub(super) const fn checkpoint_tail(&self) -> Option<usize> {
         match self {
             Self::JobProposed { .. } => Some(JOB_TAIL_BYTES),
-            Self::JobAccepted { .. }
+            Self::ProposalExchange { .. }
+            | Self::JobAccepted { .. }
             | Self::JobResult { .. }
             | Self::JobTerminated { .. }
             | Self::ClosePrepared { .. }
@@ -47,6 +48,11 @@ impl ChannelRecord {
     pub(super) fn encode_for_storage(&self, metadata_only: bool) -> Vec<u8> {
         let mut out = Vec::new();
         match self {
+            Self::ProposalExchange { work_id, pending } => {
+                out.push(tag::PROPOSAL_EXCHANGE);
+                out.extend_from_slice(work_id.as_bytes());
+                out.push(u8::from(*pending));
+            }
             Self::CursorAdvanced {
                 height,
                 parent,
@@ -166,6 +172,10 @@ impl ChannelRecord {
     pub fn decode(bytes: &[u8]) -> Result<Self, ChannelStateError> {
         let mut cursor = Cursor::new(bytes);
         let record = match cursor.byte().ok_or(ChannelStateError::Malformed)? {
+            tag::PROPOSAL_EXCHANGE => Self::ProposalExchange {
+                work_id: digest(&mut cursor)?,
+                pending: crate::work_store::take_bool(&mut cursor, ChannelStateError::Malformed)?,
+            },
             tag::CURSOR => Self::CursorAdvanced {
                 height: cursor.u64().ok_or(ChannelStateError::Malformed)?,
                 parent: cursor.array::<32>().ok_or(ChannelStateError::Malformed)?,
@@ -394,14 +404,14 @@ pub(super) fn decode_kernel<D: Decode>(bytes: &[u8]) -> Result<D, ChannelStateEr
     D::decode_exact(bytes).map_err(|_| ChannelStateError::Malformed)
 }
 
-impl ChannelState {
+impl Channel<PaymentFunding> {
     /// Returns this state's canonical bytes: the whole of what a
     /// successor generation replays from.
     ///
     /// Not a summary, and the destructuring below is what keeps it from
     /// becoming one. Every field of this struct is named here and named
     /// again in [`Self::decode_checkpoint`]'s literal, so a field added
-    /// to [`ChannelState`] and forgotten here does not compile: the
+    /// to [`Channel`] and forgotten here does not compile: the
     /// pattern is refused for the field it does not mention, and the
     /// literal for the field it cannot fill. The same holds one level
     /// down, for [`JobState`] and for [`JobTerminal`].
@@ -419,19 +429,26 @@ impl ChannelState {
 
     pub(super) fn checkpoint_for_storage(&self, metadata_only: bool) -> Vec<u8> {
         let Self {
-            channel,
-            settlement,
+            funding:
+                PaymentState {
+                    channel,
+                    settlement,
+                    cursor,
+                    close_prepared,
+                    close_opened,
+                    close_responded,
+                    close_settled,
+                },
             role,
             ledger,
-            jobs,
-            terminals,
-            proposal_nonce_high_water,
-            cursor,
-            indeterminate,
-            close_prepared,
-            close_opened,
-            close_responded,
-            close_settled,
+            book:
+                JobBook {
+                    pending_proposal,
+                    jobs,
+                    terminals,
+                    proposal_nonce_high_water,
+                    indeterminate,
+                },
         } = self;
 
         let mut out = Vec::new();
@@ -483,7 +500,7 @@ impl ChannelState {
         put_u64(&mut out, cursor.0);
         out.extend_from_slice(&cursor.1);
         put_u64(&mut out, indeterminate.len() as u64);
-        for work_id in indeterminate.keys() {
+        for work_id in indeterminate.iter() {
             out.extend_from_slice(work_id.as_bytes());
         }
         put_option(&mut out, close_prepared.as_ref(), |out, start| {
@@ -503,6 +520,9 @@ impl ChannelState {
             put_u64(out, settlement.height);
             out.extend_from_slice(&settlement.payload);
             put_u64(out, settlement.provider_payout);
+        });
+        put_option(&mut out, pending_proposal.as_ref(), |out, id| {
+            out.extend_from_slice(id.as_bytes())
         });
         out
     }
@@ -584,65 +604,77 @@ impl ChannelState {
             }
         }
         let proposal_nonce_high_water = cursor.u64().ok_or(ChannelStateError::Malformed)?;
+        let finalized_cursor = (
+            cursor.u64().ok_or(ChannelStateError::Malformed)?,
+            cursor.array::<32>().ok_or(ChannelStateError::Malformed)?,
+        );
+        let indeterminate = {
+            let count = cursor.u64().ok_or(ChannelStateError::Malformed)?;
+            let mut held = BTreeSet::new();
+            for _ in 0..count {
+                let work_id = digest(&mut cursor)?;
+                if !held.insert(work_id) {
+                    return Err(ChannelStateError::Malformed);
+                }
+            }
+            held
+        };
+        let close_prepared = take_option(&mut cursor, ChannelStateError::Malformed, |cursor| {
+            decode_kernel(take_bytes(cursor, ChannelStateError::Malformed)?)
+        })?;
+        let close_opened = take_option(&mut cursor, ChannelStateError::Malformed, |cursor| {
+            Ok(OpenContest {
+                start_id: StartId::from_bytes(
+                    cursor
+                        .array::<{ StartId::LENGTH }>()
+                        .ok_or(ChannelStateError::Malformed)?,
+                ),
+                opener: party(cursor.byte().ok_or(ChannelStateError::Malformed)?)?,
+                response_deadline: cursor.u64().ok_or(ChannelStateError::Malformed)?,
+                claimed: cursor.u64().ok_or(ChannelStateError::Malformed)?,
+            })
+        })?;
+        let close_responded = take_option(&mut cursor, ChannelStateError::Malformed, |cursor| {
+            Ok(RespondedContest {
+                start_id: StartId::from_bytes(
+                    cursor
+                        .array::<{ StartId::LENGTH }>()
+                        .ok_or(ChannelStateError::Malformed)?,
+                ),
+                response_digest: PayloadHash::from_bytes(
+                    cursor
+                        .array::<{ PayloadHash::LENGTH }>()
+                        .ok_or(ChannelStateError::Malformed)?,
+                ),
+            })
+        })?;
+        let close_settled = take_option(&mut cursor, ChannelStateError::Malformed, |cursor| {
+            Ok(CloseSettlement {
+                height: cursor.u64().ok_or(ChannelStateError::Malformed)?,
+                payload: cursor.array::<32>().ok_or(ChannelStateError::Malformed)?,
+                provider_payout: cursor.u64().ok_or(ChannelStateError::Malformed)?,
+            })
+        })?;
+        let pending_proposal = take_option(&mut cursor, ChannelStateError::Malformed, digest)?;
         let state = Self {
-            channel,
-            settlement,
+            funding: PaymentState {
+                channel,
+                settlement,
+                cursor: finalized_cursor,
+                close_prepared,
+                close_opened,
+                close_responded,
+                close_settled,
+            },
             role,
             ledger: CreditLedger::from_credited_cumulative(credited),
-            jobs,
-            terminals,
-            proposal_nonce_high_water,
-            cursor: (
-                cursor.u64().ok_or(ChannelStateError::Malformed)?,
-                cursor.array::<32>().ok_or(ChannelStateError::Malformed)?,
-            ),
-            indeterminate: {
-                let count = cursor.u64().ok_or(ChannelStateError::Malformed)?;
-                let mut held = BTreeMap::new();
-                for _ in 0..count {
-                    let work_id = digest(&mut cursor)?;
-                    if held.insert(work_id, ()).is_some() {
-                        return Err(ChannelStateError::Malformed);
-                    }
-                }
-                held
+            book: JobBook {
+                pending_proposal,
+                jobs,
+                terminals,
+                proposal_nonce_high_water,
+                indeterminate,
             },
-            close_prepared: take_option(&mut cursor, ChannelStateError::Malformed, |cursor| {
-                decode_kernel(take_bytes(cursor, ChannelStateError::Malformed)?)
-            })?,
-            close_opened: take_option(&mut cursor, ChannelStateError::Malformed, |cursor| {
-                Ok(OpenContest {
-                    start_id: StartId::from_bytes(
-                        cursor
-                            .array::<{ StartId::LENGTH }>()
-                            .ok_or(ChannelStateError::Malformed)?,
-                    ),
-                    opener: party(cursor.byte().ok_or(ChannelStateError::Malformed)?)?,
-                    response_deadline: cursor.u64().ok_or(ChannelStateError::Malformed)?,
-                    claimed: cursor.u64().ok_or(ChannelStateError::Malformed)?,
-                })
-            })?,
-            close_responded: take_option(&mut cursor, ChannelStateError::Malformed, |cursor| {
-                Ok(RespondedContest {
-                    start_id: StartId::from_bytes(
-                        cursor
-                            .array::<{ StartId::LENGTH }>()
-                            .ok_or(ChannelStateError::Malformed)?,
-                    ),
-                    response_digest: PayloadHash::from_bytes(
-                        cursor
-                            .array::<{ PayloadHash::LENGTH }>()
-                            .ok_or(ChannelStateError::Malformed)?,
-                    ),
-                })
-            })?,
-            close_settled: take_option(&mut cursor, ChannelStateError::Malformed, |cursor| {
-                Ok(CloseSettlement {
-                    height: cursor.u64().ok_or(ChannelStateError::Malformed)?,
-                    payload: cursor.array::<32>().ok_or(ChannelStateError::Malformed)?,
-                    provider_payout: cursor.u64().ok_or(ChannelStateError::Malformed)?,
-                })
-            })?,
         };
         if cursor.is_empty() {
             Ok(state)

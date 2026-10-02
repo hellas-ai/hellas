@@ -1,5 +1,7 @@
 use super::*;
 use crate::test_support::enrollment;
+#[cfg(feature = "paid-provider")]
+mod offer;
 mod recovery;
 use hellas_rpc::pb::execute::{OpenRequest, OpenResponse, open_response};
 use hellas_rpc::{Assurance, ProducerSigningKey, ProviderEnrollmentBundle, PublicKey};
@@ -18,6 +20,7 @@ async fn insufficient_collateral_is_rejected_before_network_or_journal_creation(
         .unwrap();
     let args = PaidWorkOptions {
         config: WorkConfig {
+            payment_policy: payment_policy(),
             chain: crate::work_config::ChainCrossCheck {
                 network: policy.network,
                 genesis_payload_digest: [0; 32].into(),
@@ -29,7 +32,7 @@ async fn insufficient_collateral_is_rejected_before_network_or_journal_creation(
             routes: Default::default(),
             policy_salt: policy.policy_salt,
             channel_policy: policy.channel_policy,
-            execution_policy: policy.execution_policy,
+            work_policy: policy.work_policy,
             poll: Duration::from_millis(200),
             max_observation_age: Duration::from_secs(5),
             expected_payment_values: hellas_kernel::EdgeValues::new(
@@ -42,7 +45,7 @@ async fn insufficient_collateral_is_rejected_before_network_or_journal_creation(
         journal_root: journal_root.clone(),
         provider: endpoint.id(),
         provider_addrs: Vec::new(),
-        provider_trust: None,
+        provider_trust: crate::test_support::provider_trust(endpoint.id()),
         bond: EdgeId::from_bytes([0; 32]),
         payment_funding: Funding::new(
             hellas_kernel::List::empty(hellas_kernel::CoinId::from_bytes([0; 32])),
@@ -165,7 +168,7 @@ async fn both_paid_connections_open_before_disclosure_and_refuse_wrong_assurance
             bind_paid_endpoint(SecretKey::from_bytes(&[5; 32]))
                 .await
                 .unwrap(),
-            Some(trust),
+            trust,
         );
         let setup = dialer.setup().await.expect("setup authenticates");
         let work = dialer.work().await.expect("work authenticates");
@@ -193,11 +196,11 @@ async fn both_paid_connections_open_before_disclosure_and_refuse_wrong_assurance
         assert!(
             error
                 .to_string()
-                .contains("differs from the payment channel")
+                .contains("differs from the pinned producer")
         );
         *dialer.producer.lock().unwrap() = None;
         setup.connection().close(0u32.into(), b"test reconnect");
-        dialer.trust.as_mut().unwrap().required_assurance = Assurance::AppleAppAttest;
+        dialer.trust.required_assurance = Assurance::AppleAppAttest;
         let error = dialer
             .setup()
             .await
@@ -245,10 +248,10 @@ fn recovery_skips_only_permanent_delivery_refusals() {
 fn fetch_request(
     assurance: Assurance,
     retention: hellas_rpc::Retention,
-) -> (ProviderChannelPolicy, PreparedPaidWorkInput, PublicKey) {
+) -> (ProviderChannelPolicy, PreparedWorkInput, PublicKey) {
     use hellas_rpc::protocol::work::PaidChannelPolicyV1;
     use hellas_rpc::protocol::work_fetch::{
-        FetchRoutePolicy, PaidFetchPolicyV1, PreparedPaidFetchInputV1, fetch_route_commitment,
+        FetchPolicyV2, FetchRoutePolicy, PreparedPaidFetchInputV1, fetch_route_commitment,
     };
     let environment = hellas_rpc::FetchEnvironment::OpenAiResponses;
     let caller = ProducerSigningKey::from_secret_bytes([7; 32]).unwrap();
@@ -267,14 +270,15 @@ fn fetch_request(
         .into();
     let route = FetchRoutePolicy::sealed_route("openai", "responses").unwrap();
     let policy = ProviderChannelPolicy {
+        payment_policy: payment_policy(),
         network: hellas_kernel::NetworkId::new("paid-client-test").unwrap(),
         policy_salt: [8; 32],
         channel_policy: PaidChannelPolicyV1 {
             compute_credit_limit: 40,
             delivery_credit_limit: 40,
         },
-        execution_policy: PaidWorkPolicy::Fetch {
-            policy: PaidFetchPolicyV1 {
+        work_policy: WorkPolicy::Fetch {
+            policy: FetchPolicyV2 {
                 allowed_environment: environment.manifest_id(),
                 route_commitment: fetch_route_commitment(&route.canonical_body_bytes()).unwrap(),
                 max_request_body_bytes: 4096,
@@ -283,10 +287,6 @@ fn fetch_request(
                 max_spool_bytes: 65536,
                 max_encoded_result_frame: 65536,
                 max_encoded_prepared_input: 65536,
-                dispatch_margin_blocks: 4,
-                delivery_margin_blocks: 2,
-                oracle_grace_blocks: 6,
-                fixed_price: 10,
             },
             route,
         },
@@ -304,39 +304,47 @@ fn fetch_request(
 fn fetch_preflight_requires_matching_trust_caller_and_ephemeral_retention() {
     use hellas_rpc::Retention;
     let (policy, prepared, caller) = fetch_request(Assurance::AppleAppAttest, Retention::Ephemeral);
-    let error = check_request(&policy, &prepared, None, caller).unwrap_err();
-    assert!(matches!(error, PaidClientError::InvalidOptions(_)));
     let mut trust = hellas_client::ProviderTrustAnchor {
         expected_genesis: hellas_rpc::ContentId::from_bytes([8; 32]),
         required_assurance: Assurance::ProducerSigned,
         apple_app_attest: None,
     };
     assert!(
-        check_request(&policy, &prepared, Some(&trust), caller)
+        check_request(&policy, &prepared, &trust, caller)
             .unwrap_err()
             .to_string()
             .contains("assurance differs")
     );
     trust.required_assurance = Assurance::AppleAppAttest;
     // Preflight checks the anchor selection; the live Open validates its proof.
-    check_request(&policy, &prepared, Some(&trust), caller).unwrap();
+    check_request(&policy, &prepared, &trust, caller).unwrap();
     let other = ProducerSigningKey::from_secret_bytes([9; 32])
         .unwrap()
         .public_key();
     assert!(
-        check_request(&policy, &prepared, Some(&trust), other)
+        check_request(&policy, &prepared, &trust, other)
             .unwrap_err()
             .to_string()
             .contains("Fetch caller")
     );
     let (policy, prepared, caller) = fetch_request(Assurance::ProducerSigned, Retention::Ephemeral);
-    check_request(&policy, &prepared, None, caller).unwrap();
+    trust.required_assurance = Assurance::ProducerSigned;
+    check_request(&policy, &prepared, &trust, caller).unwrap();
     assert_eq!(prepared.assurance().unwrap(), Assurance::ProducerSigned);
     let (policy, retained, caller) = fetch_request(Assurance::ProducerSigned, Retention::Retain);
     assert!(
-        check_request(&policy, &retained, None, caller)
+        check_request(&policy, &retained, &trust, caller)
             .unwrap_err()
             .to_string()
             .contains("ephemeral")
     );
+}
+
+fn payment_policy() -> hellas_rpc::protocol::work::JobPaymentPolicyV2 {
+    hellas_rpc::protocol::work::JobPaymentPolicyV2 {
+        fixed_price: 10,
+        dispatch_margin_blocks: 4,
+        delivery_margin_blocks: 2,
+        oracle_grace_blocks: 6,
+    }
 }

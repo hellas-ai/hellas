@@ -15,7 +15,7 @@ use hellas_kernel::{
     Terms, TermsHash, WorkPaymentTerms, WorkStakeBondTerms,
 };
 use hellas_rpc::protocol::work::{
-    PaidChannelPolicyV1, PaidExecutionPolicyV1, PaidWorkError, private_policy_commitment,
+    EvaluatePolicyV2, PaidChannelPolicyV1, PaidWorkError, private_policy_commitment,
 };
 use hellas_rpc::protocol::work_setup::{
     CloseDescriptor, LeaseState, ObservedChannel, PendingState, WorkChannelConfig,
@@ -87,8 +87,8 @@ fn payment_terms() -> WorkPaymentTerms {
     }
 }
 
-fn execution_policy() -> PaidExecutionPolicyV1 {
-    PaidExecutionPolicyV1 {
+fn work_policy() -> EvaluatePolicyV2 {
+    EvaluatePolicyV2 {
         allowed_environment: ContentId::from_bytes([0x31; 32]),
         generation_policy_digest: Digest::from_bytes([0x32; 32]),
         identity_source_digest: Digest::from_bytes([0x33; 32]),
@@ -97,11 +97,7 @@ fn execution_policy() -> PaidExecutionPolicyV1 {
         max_stop_token_ids: 4,
         max_spool_bytes: 1_048_576,
         max_encoded_result_frame: 262_144,
-        max_encoded_quote_response: 1_048_576,
-        dispatch_margin_blocks: 4,
-        delivery_margin_blocks: 2,
-        oracle_grace_blocks: 6,
-        fixed_price: 10,
+        max_encoded_prepared_input: 1_048_576,
     }
 }
 
@@ -111,12 +107,13 @@ fn payment_values() -> EdgeValues {
 
 fn config() -> WorkChannelConfig {
     WorkChannelConfig {
+        payment_policy: payment_policy(),
         network: network(),
         payment_edge: payment_edge(),
         payment_terms: payment_terms(),
         policy_salt: SALT,
         channel_policy: channel_policy(),
-        execution_policy: execution_policy().into(),
+        work_policy: work_policy().into(),
         expected_payment_values: payment_values(),
     }
 }
@@ -375,12 +372,7 @@ fn a_descriptor_opens_only_against_its_own_committed_policy() {
     );
 
     let mut zero_price = config();
-    let hellas_rpc::protocol::work_profile::PaidWorkPolicy::Evaluate(policy) =
-        &mut zero_price.execution_policy
-    else {
-        panic!("fixture uses Evaluate");
-    };
-    policy.fixed_price = 0;
+    zero_price.payment_policy.fixed_price = 0;
     assert_eq!(
         WorkChannelDescriptor::open(zero_price),
         Err(WorkSetupError::Record(PaidWorkError::PolicyZero {
@@ -676,7 +668,7 @@ fn signing_needs_a_caught_up_cursor_and_deadlines_the_margins_fit() {
         panic!("the fixture channel is ready");
     };
 
-    let policy = execution_policy();
+    let policy = payment_policy();
     let margins = policy.dispatch_margin_blocks + policy.delivery_margin_blocks;
     let terminal = height + margins;
     let payment_deadline = terminal + policy.oracle_grace_blocks;
@@ -756,7 +748,7 @@ fn signing_measures_the_margins_from_the_cursor_not_the_readiness_height() {
         panic!("the fixture channel is ready");
     };
 
-    let policy = execution_policy();
+    let policy = payment_policy();
     let margins = policy.dispatch_margin_blocks + policy.delivery_margin_blocks;
     let grace = policy.oracle_grace_blocks;
 
@@ -815,6 +807,15 @@ fn signing_measures_the_margins_from_the_cursor_not_the_readiness_height() {
 fn close_descriptor_round_trips_without_new_work_policy() {
     let armed = descriptor().close_descriptor();
     let bytes = armed.encode();
+    assert_eq!(bytes[0], 3);
+    for version in [1, 2] {
+        let mut legacy = bytes.clone();
+        legacy[0] = version;
+        assert_eq!(
+            CloseDescriptor::decode(&legacy),
+            Err(WorkSetupError::DescriptorMalformed)
+        );
+    }
     assert_eq!(CloseDescriptor::decode(&bytes), Ok(armed.clone()));
     assert_eq!(
         armed
@@ -839,4 +840,13 @@ fn close_descriptor_round_trips_without_new_work_policy() {
         CloseDescriptor::decode(&trailing),
         Err(WorkSetupError::DescriptorMalformed),
     );
+}
+
+fn payment_policy() -> hellas_rpc::protocol::work::JobPaymentPolicyV2 {
+    hellas_rpc::protocol::work::JobPaymentPolicyV2 {
+        fixed_price: 10,
+        dispatch_margin_blocks: 4,
+        delivery_margin_blocks: 2,
+        oracle_grace_blocks: 6,
+    }
 }

@@ -10,7 +10,7 @@ pub use apple::{
     AppleClaims, AppleCredential, AppleCredentialIdentity, ApplePolicy, AppleVerdict,
     AssertionCounterStore, RegisteredAppleCredential, apple_app_attest_root_ca, apple_app_id_hash,
     apple_client_data_hash, apple_credential_identity, appraise_apple, register_apple,
-    verify_apple, verify_apple_assertion,
+    verify_apple, verify_apple_assertion, verify_apple_provider_genesis,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

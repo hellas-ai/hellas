@@ -138,6 +138,9 @@ impl Inference {
     pub(crate) fn fail(&mut self, error: &BackendError) {
         self.finish(Some(match error {
             BackendError::Rejected(_) => "invalid_request",
+            BackendError::Denied(_) => "access_denied",
+            BackendError::Quota(_) => "quota_exhausted",
+            BackendError::Busy(_) => "busy",
             BackendError::Failed(_) => "backend_error",
         }));
         self.finish_reason("error");

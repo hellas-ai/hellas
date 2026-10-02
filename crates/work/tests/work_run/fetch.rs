@@ -7,9 +7,9 @@ use hellas_rpc::output::{OutputEvent, StopReason, TextChannel};
 use hellas_rpc::pb::work::WorkDelivered;
 use hellas_rpc::protocol::work::PrivateRecord as _;
 use hellas_rpc::protocol::work_fetch::{
-    FetchRoutePolicy, PaidFetchPolicyV1, PreparedPaidFetchInputV1, fetch_route_commitment,
+    FetchPolicyV2, FetchRoutePolicy, PreparedPaidFetchInputV1, fetch_route_commitment,
 };
-use hellas_rpc::protocol::work_profile::PaidWorkPolicy;
+use hellas_rpc::protocol::work_profile::WorkPolicy;
 use hellas_rpc::{FetchEnvironment, Retention};
 use hellas_work::work::{
     ClientEndpoint, DeliverError, EndpointError, JobProposal, PreparedFetchInput,
@@ -28,7 +28,7 @@ async fn fetch_streams_before_terminal_then_pays_once_with_metadata_only_journal
     use hellas_work::work::{PaidProgress, admit_payment, fetch_result_stream};
 
     struct PausedFetch(Arc<tokio::sync::Notify>);
-    impl PaidWorkBackend for PausedFetch {
+    impl WorkBackend for PausedFetch {
         async fn fetch_stream(
             &self,
             input: PreparedFetchInput,
@@ -110,10 +110,10 @@ async fn fetch_streams_before_terminal_then_pays_once_with_metadata_only_journal
     }
 }
 
-fn policy() -> PaidWorkPolicy {
+fn policy() -> WorkPolicy {
     let route = FetchRoutePolicy::sealed_route("openai", "responses").unwrap();
-    PaidWorkPolicy::Fetch {
-        policy: PaidFetchPolicyV1 {
+    WorkPolicy::Fetch {
+        policy: FetchPolicyV2 {
             allowed_environment: FetchEnvironment::OpenAiResponses.manifest_id(),
             route_commitment: fetch_route_commitment(&route.canonical_body_bytes()).unwrap(),
             max_request_body_bytes: 4096,
@@ -122,10 +122,6 @@ fn policy() -> PaidWorkPolicy {
             max_spool_bytes: 65536,
             max_encoded_result_frame: 65536,
             max_encoded_prepared_input: 65536,
-            dispatch_margin_blocks: 4,
-            delivery_margin_blocks: 2,
-            oracle_grace_blocks: 6,
-            fixed_price: PRICE,
         },
         route,
     }
@@ -143,7 +139,7 @@ async fn invalid_paid_authorizations_never_invoke_fetch() {
         let service = service(provider_dir.path());
         let mut client = client_endpoint(client_dir.path());
         let mut request = client.propose(&proposal()).unwrap();
-        let mut authorization = PaidJobAuthorizationV1::decode(&request.authorization).unwrap();
+        let mut authorization = PaidJobAuthorizationV2::decode(&request.authorization).unwrap();
         match invalid {
             "price" => authorization.price += 1,
             "deadline" => authorization.acceptance_deadline = CURSOR - 1,
@@ -230,7 +226,7 @@ async fn paid_fetch_larger_than_a_wire_frame_streams_and_pays_without_disk_paylo
     use hellas_wire::{Dispatcher, StreamTransport, mux::MuxTransport};
     use hellas_work::work::{admit_payment, fetch_result_stream};
     struct LargeFetch;
-    impl PaidWorkBackend for LargeFetch {
+    impl WorkBackend for LargeFetch {
         async fn fetch(
             &self,
             input: PreparedFetchInput,
@@ -266,7 +262,7 @@ async fn paid_fetch_larger_than_a_wire_frame_streams_and_pays_without_disk_paylo
         }
     }
     let mut profile = policy();
-    let PaidWorkPolicy::Fetch { policy, .. } = &mut profile else {
+    let WorkPolicy::Fetch { policy, .. } = &mut profile else {
         unreachable!()
     };
     policy.max_output_events = 512;
@@ -412,7 +408,7 @@ async fn streamed_fetch_cannot_pay_without_a_complete_authenticated_terminal() {
 #[derive(Default)]
 struct FetchBackend(AtomicUsize);
 
-impl PaidWorkBackend for FetchBackend {
+impl WorkBackend for FetchBackend {
     async fn fetch(
         &self,
         input: PreparedFetchInput,
@@ -567,10 +563,19 @@ fn fetch_refuses_payload_journals_and_retention_requests() {
     let provider_dir = temp();
     let channel = fetch_ready();
     let authorization = policy()
-        .propose(channel.channel(), &retained.prepared_input, 1, deadlines())
+        .propose(
+            channel.channel(),
+            channel.payment_policy(),
+            &retained.prepared_input,
+            1,
+            deadlines(),
+        )
         .unwrap();
     let id = work_id(channel.channel(), &authorization);
     let request = hellas_rpc::pb::work::AcceptWorkRequest {
+        route: Some(hellas_rpc::pb::work::WorkRoute::payment(
+            authorization.channel_id,
+        )),
         authorization: authorization.encode(),
         client_signature: super::client().sign(signing_hash(id)).as_bytes().to_vec(),
         prepared_input: retained.prepared_input.encode().unwrap(),
@@ -608,7 +613,7 @@ async fn fetch_output_limits_include_terminal_and_bad_results_are_never_payable(
         panic!("first Fetch dispatch");
     };
     let transcript = FetchBackend::default().fetch(*input).await.unwrap();
-    let PaidWorkPolicy::Fetch { mut policy, .. } = policy() else {
+    let WorkPolicy::Fetch { mut policy, .. } = policy() else {
         unreachable!()
     };
     policy.max_output_events = u32::try_from(transcript.len() - 1).unwrap();

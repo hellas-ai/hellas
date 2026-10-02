@@ -10,22 +10,22 @@ use hellas_rpc::protocol::work::PrivateRecord as _;
 use hellas_rpc::services::work::{Work, WorkServer};
 use hellas_wire::Dispatcher;
 use hellas_work::work::{
-    BackendFault, ObservationTime, PaidWorkBackend, PreparedFetchInput, run_accepted_work,
+    BackendFault, ObservationTime, PreparedFetchInput, WorkBackend, run_accepted_work,
 };
 use std::sync::atomic::AtomicUsize;
 
 const RESPONSE: &str = "sdk-private-response";
 
 #[derive(Default)]
-struct Backend(AtomicUsize);
-
-impl PaidWorkBackend for Backend {
+pub(super) struct Backend(AtomicUsize);
+impl WorkBackend for Backend {
     async fn fetch(
         &self,
         input: PreparedFetchInput,
     ) -> Result<Vec<hellas_rpc::OutputEventEnvelope>, BackendFault> {
         self.0.fetch_add(1, Ordering::SeqCst);
-        let request = verify_input_events(&input.into_parts().fetch_input_transcript).unwrap();
+        let parts = input.into_parts();
+        let request = verify_input_events(&parts.fetch_input_transcript).unwrap();
         let key = ProducerSigningKey::from_secret_bytes([2; 32]).unwrap();
         let mut output =
             FetchOutputTranscriptBuilder::new(request.input_commitment, request.assurance, &key);
@@ -172,13 +172,13 @@ async fn restart_pays_delivered_fetch_once_and_skips_lost_payload_jobs() {
             let endpoint = bind_paid_endpoint(SecretKey::from_bytes(&[5; 32]))
                 .await
                 .unwrap();
-            let mut session = PaidWorkSession {
+            let mut session = PaymentSession {
                 args: PaidWorkOptions {
                     config: fixture.config.clone(),
                     journal_root: fixture.root.path().join("client"),
                     provider: server.id(),
                     provider_addrs: server.bound_sockets(),
-                    provider_trust: Some(trust.clone()),
+                    provider_trust: trust.clone(),
                     bond: fixture.descriptor.bond_edge(),
                     payment_funding: Funding::new(
                         hellas_kernel::List::empty(hellas_kernel::CoinId::from_bytes([0; 32])),
@@ -195,7 +195,7 @@ async fn restart_pays_delivered_fetch_once_and_skips_lost_payload_jobs() {
                     server.id(),
                     server.bound_sockets(),
                     endpoint.clone(),
-                    Some(trust.clone()),
+                    trust.clone(),
                 ),
                 client,
                 observer: None,

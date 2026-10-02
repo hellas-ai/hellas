@@ -132,15 +132,14 @@ mod id_pins {
         use super::services::work::{
             AcceptWork, AdmitCertificate, DeliverResult, Open, StreamResult, Work,
         };
-        // Fetch's separate terminal frame extends WorkStreamEvent, deliberately
-        // changing StreamResult and its enclosing service. Other method IDs stay
-        // pinned: gateways and providers must upgrade together for this schema.
-        assert_eq!(<Work as ServiceMarker>::SERVICE_ID, 0x22b5_f1f8);
+        // Explicit funding/channel routes change every Work method except Open.
+        // Setup adds an explicit bond route. Both endpoints upgrade together.
+        assert_eq!(<Work as ServiceMarker>::SERVICE_ID, 0xb3aa_bcc3);
         assert_eq!(<Open as MethodMarker>::METHOD_ID, 0x93cb0b39);
-        assert_eq!(<AcceptWork as MethodMarker>::METHOD_ID, 0xe6a7_13c2);
-        assert_eq!(<DeliverResult as MethodMarker>::METHOD_ID, 0xf15a_a80e);
-        assert_eq!(<StreamResult as MethodMarker>::METHOD_ID, 0x76bf_afcf);
-        assert_eq!(<AdmitCertificate as MethodMarker>::METHOD_ID, 0x0ffb_b4f9);
+        assert_eq!(<AcceptWork as MethodMarker>::METHOD_ID, 0xbd9a_cfeb);
+        assert_eq!(<DeliverResult as MethodMarker>::METHOD_ID, 0x540b_be56);
+        assert_eq!(<StreamResult as MethodMarker>::METHOD_ID, 0xac7f_4c64);
+        assert_eq!(<AdmitCertificate as MethodMarker>::METHOD_ID, 0x1924_d98f);
     }
 
     /// The handshake carrier is its own service, so its ids are its own.
@@ -154,9 +153,9 @@ mod id_pins {
     #[test]
     fn work_setup_ids_are_stable() {
         use super::services::work_setup::{ExchangeSetup, Open, WorkSetup};
-        assert_eq!(<WorkSetup as ServiceMarker>::SERVICE_ID, 0x3ed2cd2f);
+        assert_eq!(<WorkSetup as ServiceMarker>::SERVICE_ID, 0xbc93_9b94);
         assert_eq!(<Open as MethodMarker>::METHOD_ID, 0xcbe4ebd5);
-        assert_eq!(<ExchangeSetup as MethodMarker>::METHOD_ID, 0x1cde_46e8);
+        assert_eq!(<ExchangeSetup as MethodMarker>::METHOD_ID, 0xe8cf_31dc);
     }
 
     #[cfg(feature = "chain")]

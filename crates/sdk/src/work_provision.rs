@@ -34,6 +34,8 @@ pub struct ProvisionOptions {
     /// The key this provider stakes and signs the bond with, read from
     /// the identity the operator already has and never made here.
     pub settlement_key: Secp256k1Signer,
+    pub provider: hellas_rpc::ProviderEnrollmentBundle,
+    pub addresses: Vec<String>,
     /// The client this bond names as taker.
     pub client: Key,
     /// The coins this provider stakes.
@@ -60,13 +62,14 @@ pub async fn provision_offer(options: ProvisionOptions) -> Result<Provisioned> {
 }
 
 /// One offer as the disk holds it, read back after it was written.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Provisioned {
     /// The bond this journal is keyed to, which is what discovery names
     /// it by.
     pub bond_edge: EdgeId,
     /// The floor its history starts above, as retained.
     pub floor: SetupScan,
+    pub offer: hellas_rpc::protocol::work_offer::SignedPaidOffer,
 }
 
 /// Deterministic inputs shared by bond preview and provisioning.
@@ -116,6 +119,8 @@ impl BondCandidate {
 struct Offer {
     candidate: BondCandidate,
     admission: PaymentAdmission,
+    provider: hellas_rpc::ProviderEnrollmentBundle,
+    addresses: Vec<String>,
 }
 
 impl Offer {
@@ -126,6 +131,22 @@ impl Offer {
         policy: ProviderChannelPolicy,
         candidate: BondCandidate,
     ) -> Result<Self> {
+        hellas_rpc::protocol::work_offer::check_provider(&options.provider)
+            .map_err(|_| hellas_rpc::protocol::work_offer::PaidOfferError::Provider)?;
+        if options.provider.genesis.statement.producer_public_key
+            != hellas_rpc::PublicKey::Secp256k1(options.settlement_key.party_key().to_bytes())
+        {
+            return Err(hellas_rpc::protocol::work_offer::PaidOfferError::Provider.into());
+        }
+        if options.addresses.len() > 16
+            || options
+                .addresses
+                .iter()
+                .any(|a| a.len() > 512 || a.parse::<std::net::SocketAddr>().is_err())
+            || options.provider.canonical_bytes().len() > 32 * 1024
+        {
+            return Err(hellas_rpc::protocol::work_offer::PaidOfferError::Malformed.into());
+        }
         let route = route_for_candidate(
             &options.work_config,
             candidate.bond_edge,
@@ -135,6 +156,8 @@ impl Offer {
         Ok(Self {
             candidate,
             admission: PaymentAdmission::Admits(Box::new(policy)),
+            provider: options.provider.clone(),
+            addresses: options.addresses.clone(),
         })
     }
 
@@ -154,6 +177,8 @@ impl Offer {
         let Self {
             candidate,
             admission,
+            provider,
+            addresses,
         } = self;
         let BondCandidate {
             network,
@@ -165,7 +190,7 @@ impl Offer {
         } = candidate;
         {
             let store = open_provider_journal(&journal_root, network, bond_edge)?;
-            let mut endpoint = SetupEndpoint::new(store, settlement_key, admission);
+            let mut endpoint = SetupEndpoint::new(store, settlement_key.clone(), admission);
             // Preserve the journal's immutable history floor on retry.
             if let Some(held) = endpoint.state().scan_armed() {
                 info!(
@@ -188,7 +213,22 @@ impl Offer {
                 floor: state.scan_armed().map(|scan| scan.height),
             });
         };
-        Ok(Provisioned { bond_edge, floor })
+        let offer = hellas_rpc::protocol::work_offer::SignedPaidOffer::sign(
+            hellas_rpc::protocol::work_offer::PaidOffer {
+                provider,
+                proposal: state
+                    .bundle()
+                    .cloned()
+                    .ok_or(ProvisionError::MissingProposal(bond_edge))?,
+                addresses,
+            },
+            &settlement_key,
+        )?;
+        Ok(Provisioned {
+            bond_edge,
+            floor,
+            offer,
+        })
     }
 }
 
@@ -261,12 +301,6 @@ fn refuse_offer_collisions(
             .bundle()
             .ok_or(ProvisionError::MissingProposal(held.bond_edge))?;
         check_client(route, held.bond_edge, bundle.bond_terms().parties.taker())?;
-        if route.peer == candidate.peer {
-            return Err(ProvisionError::PeerCollision {
-                peer: candidate.peer,
-                bond: held.bond_edge,
-            });
-        }
         // Revision-one funding is reserved even before an executable Open exists.
         let reserved = funding_coins(bundle.bond_funding());
         if let Some(coin) = candidate_coins.intersection(&reserved).next() {

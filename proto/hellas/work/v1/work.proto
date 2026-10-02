@@ -84,6 +84,8 @@ service WorkSetup {
 }
 
 message ExchangeSetupRequest {
+  // Required even when bundle is empty; checked against the selected journal.
+  bytes bond_edge = 2;
   // Canonical `WorkChannelSetupBundleV1` the caller has journaled, or
   // empty to ask for the provider's own proposal.
   //
@@ -91,15 +93,8 @@ message ExchangeSetupRequest {
   // zero bytes, so there is nothing an empty field could be confused
   // with.
   //
-  // Nothing else is carried, and nothing else is needed. The bundle
-  // names the network, both parties, and the bond edge this journal is
-  // keyed to, and every signature it carries is checked against the
-  // party its own terms name — so this request identifies itself and
-  // authorises itself out of the same bytes. There is no id here whose
-  // possession would grant anything: a caller replaying a captured
-  // revision gets back a revision the provider had already exported to
-  // the party that signed it, and cannot produce a revision that party
-  // did not sign.
+  // The selector only chooses a journal. Bundle terms and signatures must
+  // independently agree with that journal's authenticated bond and parties.
   bytes bundle = 1;
 }
 
@@ -117,8 +112,21 @@ message SetupAdvanced {
   bytes bundle = 1;
 }
 
+// A routing selector is never authority. The selected journal validates the
+// signed channel identity, client key and connection-bound delivery proof.
+enum FundingKind {
+  FUNDING_KIND_UNSPECIFIED = 0;
+  FUNDING_KIND_PAYMENT = 1;
+  FUNDING_KIND_GRANT = 2; // Reserved selector; this provider requires payment funding.
+}
+message WorkRoute {
+  FundingKind funding_kind = 1;
+  bytes channel_id = 2; // Exactly 32 bytes; required on every Work request.
+}
+
 message AcceptWorkRequest {
-  // Canonical `PaidJobAuthorizationV1`, envelope included.
+  WorkRoute route = 4;
+  // Canonical `PaidJobAuthorizationV2`, envelope included.
   bytes authorization = 1;
   // The client's compact secp256k1 signature over the work id: exactly
   // 64 bytes. The channel key is native by construction, so there is no
@@ -148,6 +156,7 @@ message WorkAccepted {
 }
 
 message DeliverResultRequest {
+  WorkRoute route = 3;
   // The accepted job's `work_id`: the authorization's own digest,
   // exactly 32 bytes. Several jobs may be in flight per channel, so
   // every follow-on message selects one explicitly.
@@ -190,6 +199,7 @@ message WorkDelivered {
 }
 
 message AdmitCertificateRequest {
+  WorkRoute route = 5;
   // The kernel's canonical `EarnedCertificate`: the scalar consensus
   // settles, in the encoding the chain reads.
   bytes certificate = 1;

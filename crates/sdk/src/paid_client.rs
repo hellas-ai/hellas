@@ -9,6 +9,7 @@ use tracing::Instrument as _;
 mod error;
 pub use error::PaidClientError;
 type Result<T, E = PaidClientError> = std::result::Result<T, E>;
+use crate::work_link::WorkLink as ProviderDialer;
 use hellas_chain::client::VerifiedRemoteLightClient;
 use hellas_chain::{
     ConsensusInfo, ConsensusVerifier, FinalizedWorkView as _, WorkBlocks, WorkChannelQuery,
@@ -22,9 +23,10 @@ use hellas_rpc::protocol::artifacts::{Canonical as _, PreparedPaidInputV1};
 use hellas_rpc::protocol::work::{
     JobDeadlines, generation_policy_digest, identity_source_digest, private_policy_commitment,
 };
-use hellas_rpc::protocol::work_profile::{PaidWorkPolicy, PreparedPaidWorkInput};
+use hellas_rpc::protocol::work_profile::{PreparedWorkInput, WorkPolicy};
 use hellas_rpc::protocol::work_setup::{ProviderChannelPolicy, WorkChannelDescriptor};
 use hellas_wire::ServiceMarker;
+#[cfg(test)]
 use hellas_wire::iroh::IrohTransport;
 use hellas_work::work::{
     ClientChannel as _, ClientEndpoint, ClientObserver, ClientService, JobProposal, fetch_result,
@@ -39,7 +41,7 @@ use hellas_work::work_open::{SetupAdvance, SetupProgress};
 use hellas_work::work_store::journal::MAX_RECORD_BYTES;
 use hellas_work::work_store::{Role, SetupScan, SetupStore};
 use iroh::endpoint::presets;
-use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey, TransportAddr};
+use iroh::{Endpoint, EndpointId, SecretKey};
 
 use crate::work_config::WorkConfig;
 
@@ -50,7 +52,7 @@ pub struct PaidWorkOptions {
     pub journal_root: PathBuf,
     pub provider: EndpointId,
     pub provider_addrs: Vec<SocketAddr>,
-    pub provider_trust: Option<hellas_client::ProviderTrustAnchor>,
+    pub provider_trust: hellas_client::ProviderTrustAnchor,
     pub bond: EdgeId,
     pub payment_funding: Funding,
     pub omission_bond: u64,
@@ -68,11 +70,11 @@ pub struct PaidWorkRun {
     pub journal_root: PathBuf,
     pub provider: EndpointId,
     pub provider_addrs: Vec<SocketAddr>,
-    pub provider_trust: Option<hellas_client::ProviderTrustAnchor>,
+    pub provider_trust: hellas_client::ProviderTrustAnchor,
     pub bond: EdgeId,
     pub payment_funding: Funding,
     pub omission_bond: u64,
-    pub prepared_input: PreparedPaidWorkInput,
+    pub prepared_input: PreparedWorkInput,
     pub acceptance_blocks: u64,
     pub terminal_blocks: u64,
     pub payment_blocks: u64,
@@ -133,7 +135,7 @@ pub async fn run_paid_work(
         check_request(
             &options.config.provider_policy(),
             &prepared_input,
-            options.provider_trust.as_ref(),
+            &options.provider_trust,
             hellas_rpc::PublicKey::Secp256k1(settlement_key.party_key().to_bytes()),
         )?;
         let endpoint = bind_paid_endpoint(transport_key).await?;
@@ -186,7 +188,10 @@ impl InputIdentities {
 
 /// A funded client channel. Keep one session per journal and serialize its jobs.
 /// Cancellation retains recovery state; call `run(None, true, None)` to resume it.
-pub struct PaidWorkSession {
+pub type PaidWorkSession =
+    crate::WorkSession<hellas_work::work_store::channel::funding::PaymentFunding>;
+
+pub struct PaymentSession {
     args: PaidWorkOptions,
     descriptor: WorkChannelDescriptor,
     dialer: ProviderDialer,
@@ -195,7 +200,7 @@ pub struct PaidWorkSession {
     needs_recovery: bool,
 }
 
-impl Drop for PaidWorkSession {
+impl Drop for PaymentSession {
     fn drop(&mut self) {
         let _ = self.client.observer().suspend();
         if let Some(observer) = &self.observer {
@@ -278,7 +283,7 @@ fn check_payment_window(client: &ClientService, work_id: hellas_rpc::Digest) -> 
     })?
 }
 
-impl PaidWorkSession {
+impl PaymentSession {
     pub async fn open(
         args: PaidWorkOptions,
         endpoint: Endpoint,
@@ -443,7 +448,7 @@ impl PaidWorkSession {
     /// Reads local journal state under a short lock.
     pub fn with_state<R>(
         &self,
-        read: impl FnOnce(&hellas_work::work_store::ChannelState) -> R,
+        read: impl FnOnce(&hellas_work::work_store::Channel) -> R,
     ) -> Result<R> {
         Ok(self.client.with_state(read)?)
     }
@@ -475,7 +480,7 @@ impl PaidWorkSession {
     /// performs recovery. Prefixes are authenticated before incremental delivery.
     pub async fn run(
         &mut self,
-        prepared: Option<PreparedPaidWorkInput>,
+        prepared: Option<PreparedWorkInput>,
         recover: bool,
         progress: Option<hellas_work::work::PaidProgress>,
     ) -> Result<Option<PaidWorkResult>> {
@@ -487,7 +492,7 @@ impl PaidWorkSession {
     /// A caller using cancellation must continue payment/recovery once it is set.
     pub async fn run_with_admission(
         &mut self,
-        prepared: Option<PreparedPaidWorkInput>,
+        prepared: Option<PreparedWorkInput>,
         recover: bool,
         progress: Option<hellas_work::work::PaidProgress>,
         proposed: Option<&AtomicBool>,
@@ -505,7 +510,7 @@ impl PaidWorkSession {
             check_request(
                 &config.provider_policy(),
                 prepared,
-                dialer.trust.as_ref(),
+                &dialer.trust,
                 hellas_rpc::PublicKey::Secp256k1(descriptor.channel().client_key().to_bytes()),
             )?;
         }
@@ -539,7 +544,7 @@ impl PaidWorkSession {
                 Replay(
                     hellas_rpc::protocol::Digest,
                     hellas_work::work_store::JobPhase,
-                    PreparedPaidWorkInput,
+                    PreparedWorkInput,
                 ),
             }
             let pending = client.with_state(|state| {
@@ -572,7 +577,7 @@ impl PaidWorkSession {
                                 RecoveredJob::Unrecoverable(job.work_id())
                             });
                         }
-                        PreparedPaidWorkInput::decode(job.prepared_input(), MAX_RECORD_BYTES)
+                        PreparedWorkInput::decode(job.prepared_input(), MAX_RECORD_BYTES)
                             .map(|input| RecoveredJob::Replay(job.work_id(), job.phase(), input))
                             .map_err(PaidClientError::from)
                     })
@@ -597,7 +602,7 @@ impl PaidWorkSession {
                 check_request(
                     &config.provider_policy(),
                     &pending,
-                    dialer.trust.as_ref(),
+                    &dialer.trust,
                     hellas_rpc::PublicKey::Secp256k1(descriptor.channel().client_key().to_bytes()),
                 )?;
                 let result = execute_paid_job(
@@ -734,7 +739,7 @@ enum JobLookup {
 #[allow(clippy::too_many_arguments)]
 async fn execute_paid_job(
     args: &PaidWorkOptions,
-    prepared: PreparedPaidWorkInput,
+    prepared: PreparedWorkInput,
     dialer: &ProviderDialer,
     client: &mut ClientService,
     ready: &hellas_rpc::protocol::work_setup::ReadyChannel,
@@ -821,9 +826,7 @@ async fn execute_paid_job(
             .ok_or(PaidClientError::MissingState(
                 "collected job disappeared from its journal",
             ))?
-    } else if progress.is_some()
-        || matches!(proposal.prepared_input, PreparedPaidWorkInput::Fetch(_))
-    {
+    } else if progress.is_some() || matches!(proposal.prepared_input, PreparedWorkInput::Fetch(_)) {
         let mut emitted = false;
         let delivery = loop {
             let result = hellas_work::work::fetch_result_stream(
@@ -872,7 +875,7 @@ async fn execute_paid_job(
     let credited = pay_for_result(dialer.work().await?, client, work_id).await?;
     Ok(PaidWorkResult {
         work_id,
-        job_price: ready.execution_policy().fixed_price(),
+        job_price: ready.payment_policy().fixed_price,
         credited_cumulative: credited,
         transcript,
         provider_key: hellas_rpc::PublicKey::Secp256k1(ready.channel().provider_key().to_bytes()),
@@ -881,31 +884,23 @@ async fn execute_paid_job(
     })
 }
 
-fn check_request(
+pub(crate) fn check_request(
     policy: &ProviderChannelPolicy,
-    prepared: &PreparedPaidWorkInput,
-    trust: Option<&hellas_client::ProviderTrustAnchor>,
+    prepared: &PreparedWorkInput,
+    trust: &hellas_client::ProviderTrustAnchor,
     caller: hellas_rpc::PublicKey,
 ) -> Result<()> {
     let assurance = prepared.assurance()?;
-    if trust
-        .as_ref()
-        .is_some_and(|trust| trust.required_assurance != assurance)
-    {
+    if trust.required_assurance != assurance {
         return Err(PaidClientError::InputMismatch(
             "assurance differs from provider trust",
         ));
     }
-    if assurance != hellas_rpc::Assurance::ProducerSigned && trust.is_none() {
-        return Err(PaidClientError::InvalidOptions(
-            "attested work requires a provider trust anchor",
-        ));
-    }
-    match (prepared, &policy.execution_policy) {
-        (PreparedPaidWorkInput::Evaluate(input), PaidWorkPolicy::Evaluate(_)) => {
+    match (prepared, &policy.work_policy) {
+        (PreparedWorkInput::Evaluate(input), WorkPolicy::Evaluate(_)) => {
             check_evaluate_input(policy, input)?;
         }
-        (PreparedPaidWorkInput::Fetch(input), PaidWorkPolicy::Fetch { policy, route }) => {
+        (PreparedWorkInput::Fetch(input), WorkPolicy::Fetch { policy, route }) => {
             let parts = input.parts()?;
             let request = hellas_rpc::fetch::verify_input_events(&parts.fetch_input_transcript)?;
             if request.caller_key != caller {
@@ -941,7 +936,7 @@ pub fn check_evaluate_input(
 ) -> Result<()> {
     let parts = prepared.parts()?;
     let input = InputIdentities::from_parts(&parts)?;
-    let PaidWorkPolicy::Evaluate(expected) = &policy.execution_policy else {
+    let WorkPolicy::Evaluate(expected) = &policy.work_policy else {
         return Err(PaidClientError::InputMismatch("expected Evaluate profile"));
     };
     if expected.allowed_environment != input.allowed_environment {
@@ -1089,100 +1084,6 @@ async fn exchange_setup(dialer: &ProviderDialer, setup: &mut SetupEndpoint) -> R
     let response = send_setup_exchange(dialer.setup().await?, request).await?;
     apply_setup_exchange(setup, response)?;
     Ok(())
-}
-
-struct ProviderDialer {
-    endpoint: Endpoint,
-    provider: EndpointAddr,
-    trust: Option<hellas_client::ProviderTrustAnchor>,
-    producer: std::sync::Mutex<Option<hellas_rpc::PublicKey>>,
-    // Open is authenticated once per exact connection and ALPN. Serialize dials
-    // so concurrent callers cannot reuse a connection before its proof passes.
-    setup_connection: tokio::sync::Mutex<Option<iroh::endpoint::Connection>>,
-    work_connection: tokio::sync::Mutex<Option<iroh::endpoint::Connection>>,
-}
-
-impl ProviderDialer {
-    fn new(
-        provider: EndpointId,
-        addresses: Vec<SocketAddr>,
-        endpoint: Endpoint,
-        trust: Option<hellas_client::ProviderTrustAnchor>,
-    ) -> Self {
-        Self {
-            trust,
-            producer: std::sync::Mutex::new(None),
-            setup_connection: tokio::sync::Mutex::new(None),
-            work_connection: tokio::sync::Mutex::new(None),
-            endpoint,
-            provider: EndpointAddr::from_parts(
-                provider,
-                addresses.into_iter().map(TransportAddr::Ip),
-            ),
-        }
-    }
-
-    fn require_producer(&self, key: hellas_rpc::PublicKey) -> Result<()> {
-        let mut expected = self
-            .producer
-            .lock()
-            .map_err(|_| PaidClientError::ProviderIdentityPoisoned)?;
-        if expected.as_ref().is_some_and(|old| *old != key) {
-            return Err(PaidClientError::ProviderIdentityChanged);
-        }
-        *expected = Some(key);
-        Ok(())
-    }
-
-    async fn setup(&self) -> Result<IrohTransport> {
-        self.connect(hellas_rpc::services::work_setup::WorkSetup::ALPN.as_bytes())
-            .await
-    }
-
-    async fn work(&self) -> Result<IrohTransport> {
-        self.connect(hellas_rpc::services::work::Work::ALPN.as_bytes())
-            .await
-    }
-
-    async fn connect(&self, alpn: &[u8]) -> Result<IrohTransport> {
-        let cache = if alpn == hellas_rpc::services::work::Work::ALPN.as_bytes() {
-            &self.work_connection
-        } else {
-            &self.setup_connection
-        };
-        let mut cached = cache.lock().await;
-        if let Some(connection) = cached.as_ref().filter(|c| c.close_reason().is_none()) {
-            return Ok(IrohTransport::new(connection.clone()));
-        }
-        // A failed authentication never enters the cache. Reconnects repeat Open
-        // and still have to match the producer pinned by the payment channel.
-        *cached = None;
-        let connection = self
-            .endpoint
-            .connect(self.provider.clone(), alpn)
-            .await
-            .map_err(|source| PaidClientError::Connect {
-                provider: self.provider.id,
-                source,
-            })?;
-        let transport = IrohTransport::new(connection);
-        if let Some(trust) = &self.trust {
-            let producer = if alpn == hellas_rpc::services::work::Work::ALPN.as_bytes() {
-                hellas_client::confidential_open::<hellas_rpc::services::work::Open>(
-                    &transport, trust,
-                )
-                .await?
-            } else {
-                hellas_client::confidential_open::<hellas_rpc::services::work_setup::Open>(
-                    &transport, trust,
-                )
-                .await?
-            };
-            self.require_producer(producer)?;
-        }
-        *cached = Some(transport.connection().clone());
-        Ok(transport)
-    }
 }
 
 async fn connect_chain(

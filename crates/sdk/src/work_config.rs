@@ -4,7 +4,7 @@
 //! digest detect configuration mismatches. Unknown fields are rejected. Call
 //! `validate_work_routes` before serving to check the configuration against journals.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -18,12 +18,12 @@ use hellas_rpc::ContentId;
 use hellas_rpc::peers::PeerId;
 use hellas_rpc::protocol::Digest;
 use hellas_rpc::protocol::work::{
-    PaidChannelPolicyV1, PaidExecutionPolicyV1, check_execution_policy,
+    EvaluatePolicyV2, JobPaymentPolicyV2, PaidChannelPolicyV1, check_work_policy,
 };
 use hellas_rpc::protocol::work_fetch::{
-    FetchRoutePolicy as PaidFetchRoutePolicy, PaidFetchPolicyV1, fetch_route_commitment,
+    FetchPolicyV2, FetchRoutePolicy as PaidFetchRoutePolicy, fetch_route_commitment,
 };
-use hellas_rpc::protocol::work_profile::PaidWorkPolicy;
+use hellas_rpc::protocol::work_profile::WorkPolicy;
 use hellas_rpc::protocol::work_setup::ProviderChannelPolicy;
 use hellas_work::work_store::{Role, SetupStore, discover_setups};
 use serde::Deserialize;
@@ -48,7 +48,9 @@ pub struct WorkConfig {
     /// The credit policy this provider will work under.
     pub channel_policy: PaidChannelPolicyV1,
     /// The execution policy this provider will run jobs under.
-    pub execution_policy: PaidWorkPolicy,
+    pub work_policy: WorkPolicy,
+    /// Required per-job payment price and block margins.
+    pub payment_policy: JobPaymentPolicyV2,
     /// How often the watcher asks the chain for the next block.
     pub poll: Duration,
     /// Maximum time without new verified finalized progress before admission stops.
@@ -74,46 +76,42 @@ pub struct WorkRoute {
     pub client: Key,
 }
 
-/// Routes indexed by authenticated peer, with duplicate peers and bonds rejected.
+/// Routes indexed by bond; one authenticated peer may own several distinct bonds.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct WorkRoutes {
-    by_peer: BTreeMap<PeerId, WorkRoute>,
+    by_bond: BTreeMap<EdgeId, WorkRoute>,
 }
 
 impl WorkRoutes {
-    /// Returns every configured route in peer order.
+    /// Returns every configured route in bond order.
     pub fn iter(&self) -> impl Iterator<Item = &WorkRoute> {
-        self.by_peer.values()
+        self.by_bond.values()
     }
 
     /// Returns how many bilateral routes were configured.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.by_peer.len()
+        self.by_bond.len()
     }
 
     /// Returns whether no bilateral route was configured.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.by_peer.is_empty()
+        self.by_bond.is_empty()
     }
 
     fn from_files(files: Vec<WorkRouteFile>) -> Result<Self> {
-        let mut by_peer = BTreeMap::new();
-        let mut bonds = BTreeSet::new();
+        let mut by_bond = BTreeMap::new();
         for file in files {
             let peer = PeerId::from_bytes(parse_fixed_hex("routes[].peer", &file.peer)?);
             let bond = EdgeId::from_bytes(parse_fixed_hex("routes[].bond", &file.bond)?);
             let client = Key::from_bytes(parse_fixed_hex("routes[].client", &file.client)?);
             let route = WorkRoute { peer, bond, client };
-            if by_peer.insert(peer, route).is_some() {
-                return Err(WorkConfigError::DuplicatePeer(peer));
-            }
-            if !bonds.insert(bond) {
+            if by_bond.insert(bond, route).is_some() {
                 return Err(WorkConfigError::DuplicateBond(bond));
             }
         }
-        Ok(Self { by_peer })
+        Ok(Self { by_bond })
     }
 }
 
@@ -125,7 +123,8 @@ impl WorkConfig {
             network: self.chain.network,
             policy_salt: self.policy_salt,
             channel_policy: self.channel_policy,
-            execution_policy: self.execution_policy.clone(),
+            work_policy: self.work_policy.clone(),
+            payment_policy: self.payment_policy,
             expected_payment_values: self.expected_payment_values,
             min_omit_response_blocks: self.min_omit_response_blocks,
         }
@@ -295,7 +294,8 @@ impl WorkConfigFile {
             routes,
             policy_salt: policies.0,
             channel_policy: policies.1,
-            execution_policy: policies.2,
+            work_policy: policies.2,
+            payment_policy: policies.3,
             poll: Duration::from_millis(self.poll_ms),
             max_observation_age: Duration::from_millis(self.max_observation_age_ms),
             expected_payment_values: self.expected_payment_values.into_values(),
@@ -377,13 +377,22 @@ impl JournalFile {
 struct PoliciesFile {
     policy_salt: String,
     channel: ChannelPolicyFile,
+    payment: PaymentPolicyFile,
     execution: Option<ExecutionPolicyFile>,
     fetch: Option<FetchPolicyFile>,
 }
 
 impl PoliciesFile {
-    fn into_policies(self) -> Result<([u8; 32], PaidChannelPolicyV1, PaidWorkPolicy)> {
+    fn into_policies(
+        self,
+    ) -> Result<(
+        [u8; 32],
+        PaidChannelPolicyV1,
+        WorkPolicy,
+        JobPaymentPolicyV2,
+    )> {
         let salt = parse_fixed_hex("policies.policy_salt", &self.policy_salt)?;
+        let payment = self.payment.into_policy()?;
         Ok((
             salt,
             PaidChannelPolicyV1 {
@@ -400,6 +409,7 @@ impl PoliciesFile {
                     });
                 }
             },
+            payment,
         ))
     }
 }
@@ -423,15 +433,11 @@ struct ExecutionPolicyFile {
     max_stop_token_ids: u16,
     max_spool_bytes: u64,
     max_encoded_result_frame: u32,
-    max_encoded_quote_response: u32,
-    dispatch_margin_blocks: u64,
-    delivery_margin_blocks: u64,
-    oracle_grace_blocks: u64,
-    fixed_price: u64,
+    max_encoded_prepared_input: u32,
 }
 
 impl ExecutionPolicyFile {
-    fn into_policy(self) -> Result<PaidExecutionPolicyV1> {
+    fn into_policy(self) -> Result<EvaluatePolicyV2> {
         let allowed_environment: ContentId =
             self.allowed_environment
                 .parse()
@@ -439,7 +445,7 @@ impl ExecutionPolicyFile {
                     field: "policies.execution.allowed_environment",
                     source,
                 })?;
-        let policy = PaidExecutionPolicyV1 {
+        let policy = EvaluatePolicyV2 {
             allowed_environment,
             generation_policy_digest: parse_digest(
                 "policies.execution.generation_policy_digest",
@@ -454,14 +460,10 @@ impl ExecutionPolicyFile {
             max_stop_token_ids: self.max_stop_token_ids,
             max_spool_bytes: self.max_spool_bytes,
             max_encoded_result_frame: self.max_encoded_result_frame,
-            max_encoded_quote_response: self.max_encoded_quote_response,
-            dispatch_margin_blocks: self.dispatch_margin_blocks,
-            delivery_margin_blocks: self.delivery_margin_blocks,
-            oracle_grace_blocks: self.oracle_grace_blocks,
-            fixed_price: self.fixed_price,
+            max_encoded_prepared_input: self.max_encoded_prepared_input,
         };
         // Validate with the protocol rules before any channel is proposed.
-        check_execution_policy(&policy)?;
+        check_work_policy(&policy)?;
         Ok(policy)
     }
 }
@@ -479,10 +481,6 @@ struct FetchPolicyFile {
     max_spool_bytes: u64,
     max_encoded_result_frame: u32,
     max_encoded_prepared_input: u32,
-    dispatch_margin_blocks: u64,
-    delivery_margin_blocks: u64,
-    oracle_grace_blocks: u64,
-    fixed_price: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -495,7 +493,7 @@ struct OpenFetchPolicyFile {
 }
 
 impl FetchPolicyFile {
-    fn into_policy(self) -> Result<PaidWorkPolicy> {
+    fn into_policy(self) -> Result<WorkPolicy> {
         let route = match (self.service, self.method, self.open_fetch) {
             (Some(service), Some(method), None) => {
                 PaidFetchRoutePolicy::sealed_route(service, method)?
@@ -510,7 +508,7 @@ impl FetchPolicyFile {
                 });
             }
         };
-        let policy = PaidFetchPolicyV1 {
+        let policy = FetchPolicyV2 {
             allowed_environment: self.allowed_environment.parse().map_err(|source| {
                 WorkConfigError::ContentId {
                     field: "policies.fetch.allowed_environment",
@@ -524,12 +522,8 @@ impl FetchPolicyFile {
             max_spool_bytes: self.max_spool_bytes,
             max_encoded_result_frame: self.max_encoded_result_frame,
             max_encoded_prepared_input: self.max_encoded_prepared_input,
-            dispatch_margin_blocks: self.dispatch_margin_blocks,
-            delivery_margin_blocks: self.delivery_margin_blocks,
-            oracle_grace_blocks: self.oracle_grace_blocks,
-            fixed_price: self.fixed_price,
         };
-        let profile = PaidWorkPolicy::Fetch { policy, route };
+        let profile = WorkPolicy::Fetch { policy, route };
         profile.check()?;
         Ok(profile)
     }
@@ -593,4 +587,26 @@ fn parse_fixed_hex<const N: usize>(field: &'static str, raw: &str) -> Result<[u8
 
 fn parse_digest(field: &'static str, raw: &str) -> Result<Digest> {
     Ok(Digest::from_bytes(parse_fixed_hex(field, raw)?))
+}
+
+/// Required payment fields; absent prices or margins are never defaulted.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PaymentPolicyFile {
+    fixed_price: u64,
+    dispatch_margin_blocks: u64,
+    delivery_margin_blocks: u64,
+    oracle_grace_blocks: u64,
+}
+impl PaymentPolicyFile {
+    fn into_policy(self) -> Result<JobPaymentPolicyV2> {
+        let policy = JobPaymentPolicyV2 {
+            fixed_price: self.fixed_price,
+            dispatch_margin_blocks: self.dispatch_margin_blocks,
+            delivery_margin_blocks: self.delivery_margin_blocks,
+            oracle_grace_blocks: self.oracle_grace_blocks,
+        };
+        policy.check()?;
+        Ok(policy)
+    }
 }

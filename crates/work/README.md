@@ -2,10 +2,10 @@
 
 Paid Fetch shares the existing channel authorization, execution gate, delivery,
 payment certificate, and settlement flow with Evaluate. A Fetch channel selects
-`PaidWorkPolicy::Fetch`; the policy commits to its route and manifest as well
-as its fixed price and input/output limits. Evaluate's canonical records and
-version-1 close descriptors remain unchanged. Fetch close descriptors use
-version 2.
+`WorkPolicy::Fetch`; the policy commits to its route, manifest and resource
+limits. Separate `JobPaymentPolicyV2` terms bind the price and block margins.
+Both profiles use version-3 close descriptors and journal format 7. Older
+journals are refused; close old devnet channels with the old binary first.
 
 ## Provider storage
 
@@ -45,7 +45,7 @@ Provider failure is not turned into a paid result. The client must not assume
 that retrying delivery after a provider restart can recover its response.
 
 The journal header distinguishes payload journals from metadata-only journals.
-Opening one as the other fails. This change does not migrate or erase old files.
+Opening one as the other fails.
 
 ## CLI
 
@@ -77,7 +77,14 @@ one is allowed):
   "max_output_bytes": 16384,
   "max_spool_bytes": 65536,
   "max_encoded_result_frame": 65536,
-  "max_encoded_prepared_input": 65536,
+  "max_encoded_prepared_input": 65536
+}
+```
+
+Both profiles require separate `policies.payment` terms:
+
+```json
+{
   "dispatch_margin_blocks": 4,
   "delivery_margin_blocks": 2,
   "oracle_grace_blocks": 6,
@@ -116,8 +123,11 @@ HTTP manifest. The paid policy's byte/frame limits must cover the encoded HTTP
 response as well as its envelopes (base64 expands binary bodies).
 
 Use `paid-work prepare-fetch --execution-environment http` for this request.
-Add `--assurance apple-app-attest` when targeting Gate. On `paid-work run`,
-provide `--provider-genesis`, `--apple-app-id` and `--apple-cd-hashes`. Each paid
+Every `paid-work run` requires `--provider-genesis`. Provisioned paid offers
+carry the provider enrollment and a settlement-key signature binding it to the
+bond proposal; the pool loader derives this pin directly from the offer. Add
+`--assurance apple-app-attest`, `--apple-app-id` and `--apple-cd-hashes` for
+attested Gate providers. Each paid
 Work and WorkSetup connection verifies a fresh Open proof before sending its
 request. The proof binds the TLS exporter, nonce, service ALPN, enrollment and
 producer key; the producer must also be the payment channel's provider.
@@ -131,7 +141,7 @@ rejects a weaker output scheme.
 - `paid_client::PaidWorkSession` owns one funded channel. It authenticates the
   provider, resumes journaled jobs, verifies results, pays, and closes. The CLI
   and paid gateway use this same session. `run_paid_work` wraps one complete job.
-- `PreparedPaidWorkInput` and `PaidWorkPolicy` select Evaluate or Fetch. Each
+- `PreparedPaidWorkInput` and `WorkPolicy` select Evaluate or Fetch. Each
   profile validates its own canonical input, bounds and terminal result; the
   payment lifecycle does not interpret HTTP or model output.
 - `FetchProviderOptions` and `start_fetch_provider` take an operator's route
@@ -151,13 +161,13 @@ verifies the key and transcript but does not attest the binary. These are the
 implemented assurance choices, checked explicitly before request disclosure and
 again during result verification.
 
-Adding Open changed the Work and WorkSetup service schema IDs. Existing paid
-method IDs and canonical payment encodings are unchanged; use matching updated
-client and provider builds.
-
 Tests inspect provider journal files after each commit and rotation, reopen
 them after simulated process loss, verify payment recovery without bodies,
 and cover both signed result schemes. Local TLS tests exercise roots, pins,
 wrong hostnames, redirects, address restrictions and response bounds. Portable
 App Attest tests cover connection/service binding and replay counters. They do
 not contact a paid upstream or enroll a real Apple device.
+
+Work uses journal format 7 and close descriptor v3. Each request selects its
+funding kind and channel ID; setup requests select their bond. One peer may own
+several bonds.

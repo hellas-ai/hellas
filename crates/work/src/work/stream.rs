@@ -148,18 +148,18 @@ impl WorkService {
             .ready
             .as_ref()
             .ok_or_else(|| BackendFault::new("channel has no execution policy"))?
-            .execution_policy()
+            .work_policy()
             .clone();
         let limit = match &policy {
-            PaidWorkPolicy::Fetch { .. } => policy
+            WorkPolicy::Fetch { .. } => policy
                 .max_spool_bytes()
                 .min(MAX_FETCH_TRANSCRIPT_BYTES as u64),
-            PaidWorkPolicy::Evaluate(_) => policy.max_spool_bytes(),
+            WorkPolicy::Evaluate(_) => policy.max_spool_bytes(),
         };
         let mut jobs = self.progress.lock().expect("paid progress poisoned");
         let progress = jobs.entry(work_id).or_default();
         // Signed prefixes are bounded by the same spool as final delivery.
-        let fetch = matches!(policy, PaidWorkPolicy::Fetch { .. });
+        let fetch = matches!(policy, WorkPolicy::Fetch { .. });
         let bytes = spool_charge(&event, fetch);
         let retained = progress.bytes.saturating_add(bytes);
         if retained as u64 > limit {
@@ -199,8 +199,8 @@ impl WorkService {
                 match reserved {
                     Ok(()) => {
                         let limits = service.endpoint().and_then(|endpoint| {
-                            let policy = endpoint.admitting()?.execution_policy();
-                            Ok((policy.max_encoded_result_frame(), matches!(policy, PaidWorkPolicy::Fetch { .. })))
+                            let policy = endpoint.admitting()?.work_policy();
+                            Ok((policy.max_encoded_result_frame(), matches!(policy, WorkPolicy::Fetch { .. })))
                         });
                         let (frame_limit, fetch) = match limits {
                             Ok(limits) => limits,
@@ -304,14 +304,14 @@ where
             .state()
             .job_by_id(work_id)
             .ok_or(DeliverError::NoSuchJob)?;
-        let prepared = PreparedPaidWorkInput::decode(job.prepared_input(), MAX_RECORD_BYTES)
+        let prepared = PreparedWorkInput::decode(job.prepared_input(), MAX_RECORD_BYTES)
             .map_err(PaidWorkError::from)?;
         Ok::<_, DeliverError>((request, prepared))
     })??;
     let input = prepared.input_commitment()?;
     let (operation, kind, max_tokens, max_events, max_bytes) =
-        match (&prepared, ready.execution_policy()) {
-            (PreparedPaidWorkInput::Evaluate(prepared), PaidWorkPolicy::Evaluate(_)) => (
+        match (&prepared, ready.work_policy()) {
+            (PreparedWorkInput::Evaluate(prepared), WorkPolicy::Evaluate(_)) => (
                 Operation::Evaluate,
                 hellas_rpc::evaluate::TOKEN_DELTA_EVENT_KIND,
                 u64::from(
@@ -324,7 +324,7 @@ where
                 u64::MAX,
                 u64::MAX,
             ),
-            (PreparedPaidWorkInput::Fetch(_), PaidWorkPolicy::Fetch { policy, .. }) => (
+            (PreparedWorkInput::Fetch(_), WorkPolicy::Fetch { policy, .. }) => (
                 Operation::Fetch,
                 hellas_rpc::fetch::OUTPUT_EVENT_KIND,
                 0,
@@ -344,11 +344,11 @@ where
     let mut retained_bytes = 0usize;
     let spool_limit = if operation == Operation::Fetch {
         ready
-            .execution_policy()
+            .work_policy()
             .max_spool_bytes()
             .min(MAX_FETCH_TRANSCRIPT_BYTES as u64)
     } else {
-        ready.execution_policy().max_spool_bytes()
+        ready.work_policy().max_spool_bytes()
     };
     let key = hellas_rpc::PublicKey::Secp256k1(ready.channel().provider_key().to_bytes());
     let scheme = scheme_id(operation, prepared.assurance()?);
@@ -359,7 +359,7 @@ where
         .await?;
     while let Some(event) = stream.next().await {
         let event = event?;
-        let frame_limit = ready.execution_policy().max_encoded_result_frame() as u64;
+        let frame_limit = ready.work_policy().max_encoded_result_frame() as u64;
         if operation == Operation::Fetch && event.encoded_len() as u64 > frame_limit {
             return Err(DeliverError::OverFrame {
                 actual: event.encoded_len() as u64,

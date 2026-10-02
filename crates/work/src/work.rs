@@ -4,7 +4,7 @@
 //! # What crosses the wire
 //!
 //! Canonical private records, and nothing else. `AcceptWorkRequest`
-//! carries the exact bytes of a [`PaidJobAuthorizationV1`] and a
+//! carries the exact bytes of a [`PaidJobAuthorizationV2`] and a
 //! [`hellas_rpc::protocol::artifacts::PreparedPaidInputV1`], not a protobuf transcription of their
 //! fields, because the two signatures on this exchange are over digests
 //! of those bytes. A protobuf spelling beside them would be a second
@@ -146,8 +146,8 @@ use crate::work_close::{
 use crate::work_store::channel::encode_kernel;
 use crate::work_store::journal::MAX_RECORD_BYTES;
 use crate::work_store::{
-    ChannelRecord, ChannelState, ChannelStateError, ChannelStore, JobPhase, JobState,
-    PaidCertificate, Role, TerminalOutcome, WorkStoreError, hex,
+    Channel, ChannelRecord, ChannelStateError, ChannelStore, JobPhase, JobState, PaidCertificate,
+    Role, TerminalOutcome, WorkStoreError, hex,
 };
 use hellas_rpc::observe::{LEVEL, TARGET, Timing};
 use hellas_rpc::pb::work::{
@@ -160,12 +160,12 @@ use hellas_rpc::pb::work::{
 use hellas_rpc::protocol::Digest;
 use hellas_rpc::protocol::artifacts::PreparedPaidInputParts;
 use hellas_rpc::protocol::work::{
-    JobDeadlines, PaidJobAuthorizationV1, PaidJobResultV1, PaidWorkError, PaymentBindingV1,
+    JobDeadlines, PaidJobAuthorizationV2, PaidJobResultV1, PaidWorkError, PaymentBindingV1,
     PrivateRecord as _, delivery_request_digest, encode_transcript, next_payment,
     payment_binding_digest, result_digest, signing_hash, work_id,
 };
-use hellas_rpc::protocol::work_fetch::{PaidFetchPolicyV1, PreparedPaidFetchInputParts};
-use hellas_rpc::protocol::work_profile::{PaidWorkPolicy, PreparedPaidWorkInput};
+use hellas_rpc::protocol::work_fetch::{FetchPolicyV2, PreparedPaidFetchInputParts};
+use hellas_rpc::protocol::work_profile::{PreparedWorkInput, WorkPolicy};
 use hellas_rpc::protocol::work_setup::{ObservedChannel, ReadyChannel, WorkSetupError};
 use hellas_rpc::services::work::{WorkClientImpl, WorkHandler};
 use hellas_rpc::{EvaluateRequest, OutputEventEnvelope, SubmitTxOutcome};
@@ -448,7 +448,7 @@ fn bind(
     role: Role,
 ) -> Result<(), EndpointError> {
     if role == Role::Provider
-        && matches!(ready.execution_policy(), PaidWorkPolicy::Fetch { .. })
+        && matches!(ready.work_policy(), WorkPolicy::Fetch { .. })
         && !store.metadata_only()
     {
         return Err(EndpointError::PayloadRetention);
@@ -592,7 +592,7 @@ impl CloseEndpoint {
 
     /// Returns what this endpoint durably knows.
     #[must_use]
-    pub const fn state(&self) -> &ChannelState {
+    pub const fn state(&self) -> &Channel {
         self.store.state()
     }
 }
@@ -668,7 +668,7 @@ impl ProviderEndpoint {
 
     /// Returns what this endpoint durably knows.
     #[must_use]
-    pub const fn state(&self) -> &ChannelState {
+    pub const fn state(&self) -> &Channel {
         self.close.state()
     }
 
@@ -701,8 +701,20 @@ impl ProviderEndpoint {
     fn authenticate_proposal(
         &self,
         request: &AcceptWorkRequest,
-    ) -> Result<(PaidJobAuthorizationV1, Sig, Digest), Refusal> {
-        let authorization = PaidJobAuthorizationV1::decode(&request.authorization)?;
+    ) -> Result<(PaidJobAuthorizationV2, Sig, Digest), Refusal> {
+        if !request
+            .route
+            .as_ref()
+            .is_some_and(|r| r.selects_payment(self.state().channel().id()))
+        {
+            return Err(Refusal::invalid(
+                "the route does not select this payment channel",
+            ));
+        }
+        let authorization = PaidJobAuthorizationV2::decode(&request.authorization)?;
+        if authorization.channel_id != self.state().channel().id() {
+            return Err(Refusal::invalid("the authorization names another channel"));
+        }
         let client_signature = signature(&request.client_signature)
             .ok_or_else(|| Refusal::invalid("the client signature is not 64 bytes"))?;
         let channel = self.state().channel();
@@ -721,7 +733,7 @@ impl ProviderEndpoint {
 
     fn prior_acceptance(
         &self,
-        authorization: &PaidJobAuthorizationV1,
+        authorization: &PaidJobAuthorizationV2,
         work_id: Digest,
     ) -> Result<Option<Sig>, Refusal> {
         // A question already answered is answered again, with the same
@@ -759,9 +771,14 @@ impl ProviderEndpoint {
             .map_err(|error| Refusal::new(endpoint_refusal(error), error.to_string()))?
             .clone();
         let (cursor_height, _) = self.state().cursor();
-        let policy = ready.execution_policy();
-        policy.check_authorization(ready.channel(), &authorization, cursor_height)?;
-        let bundle = PreparedPaidWorkInput::decode(&request.prepared_input, MAX_RECORD_BYTES)
+        let policy = ready.work_policy();
+        policy.check_authorization(
+            ready.channel(),
+            ready.payment_policy(),
+            &authorization,
+            cursor_height,
+        )?;
+        let bundle = PreparedWorkInput::decode(&request.prepared_input, MAX_RECORD_BYTES)
             .map_err(|error| Refusal::invalid(error.to_string()))?;
         policy.check_input(ready.channel(), &authorization, &bundle)?;
         ready.check_signable(
@@ -830,7 +847,7 @@ impl ProviderEndpoint {
     /// bundle the journal holds, never from a quote. That bundle is the one the
     /// authorization both parties signed commits to: its digest is checked
     /// before it is stored and again on every replay
-    /// (`ChannelState::apply_proposed`), so a bundle altered on disk fails when
+    /// (`Channel::apply_proposed`), so a bundle altered on disk fails when
     /// the journal is opened rather than producing a job nobody agreed to.
     ///
     /// # Errors
@@ -869,11 +886,18 @@ impl ProviderEndpoint {
         }
 
         bind(ready, &self.close.store, &self.close.signer, Role::Provider)?;
-        if ready.execution_policy() != self.admitting()?.execution_policy() {
+        if ready.work_policy() != self.admitting()?.work_policy()
+            || ready.payment_policy() != self.admitting()?.payment_policy()
+        {
             return Err(RunError::Policy);
         }
         let (cursor_height, _) = self.state().cursor();
         let authorization = *job.authorization();
+        hellas_rpc::protocol::work::check_payment_policy_binding(
+            ready.channel(),
+            &authorization,
+            ready.payment_policy(),
+        )?;
         // The same arithmetic the co-signature was made under, asked
         // again at the height dispatch is happening at. It is the same
         // question both times — can the measured dispatch and delivery
@@ -888,18 +912,18 @@ impl ProviderEndpoint {
         if job.prepared_input().is_empty() {
             return Ok(RunAdmission::Indeterminate);
         }
-        let bundle = PreparedPaidWorkInput::decode(job.prepared_input(), MAX_RECORD_BYTES)
+        let bundle = PreparedWorkInput::decode(job.prepared_input(), MAX_RECORD_BYTES)
             .map_err(PaidWorkError::from)?;
         ready
-            .execution_policy()
+            .work_policy()
             .check_input(ready.channel(), &authorization, &bundle)?;
-        let admission = match (bundle, ready.execution_policy()) {
-            (PreparedPaidWorkInput::Evaluate(bundle), PaidWorkPolicy::Evaluate(_)) => {
+        let admission = match (bundle, ready.work_policy()) {
+            (PreparedWorkInput::Evaluate(bundle), WorkPolicy::Evaluate(_)) => {
                 RunAdmission::Invoke(Box::new(PreparedEvaluateInput {
                     parts: bundle.parts().map_err(PaidWorkError::from)?,
                 }))
             }
-            (PreparedPaidWorkInput::Fetch(bundle), PaidWorkPolicy::Fetch { policy, .. }) => {
+            (PreparedWorkInput::Fetch(bundle), WorkPolicy::Fetch { policy, .. }) => {
                 RunAdmission::InvokeFetch(Box::new(PreparedFetchInput {
                     parts: bundle.parts().map_err(PaidWorkError::from)?,
                     policy: *policy,
@@ -941,7 +965,7 @@ impl ProviderEndpoint {
     ) -> Result<(PaidJobResultV1, Sig), RunError> {
         let job = self.state().job_by_id(work_id).ok_or(RunError::NoSuchJob)?;
         let authorization = *job.authorization();
-        let input = PreparedPaidWorkInput::decode(job.prepared_input(), MAX_RECORD_BYTES)
+        let input = PreparedWorkInput::decode(job.prepared_input(), MAX_RECORD_BYTES)
             .map_err(|e| RunError::Transcript(e.into()))?;
         let ready = self
             .ready
@@ -955,12 +979,12 @@ impl ProviderEndpoint {
         // payment still require a fresh observation.
         let channel = ready.channel();
         let result = ready
-            .execution_policy()
+            .work_policy()
             .terminal_result(channel, &authorization, &input, transcript)
             .map_err(RunError::Transcript)?;
         let spool = encode_transcript(transcript).map_err(RunError::Transcript)?;
         let spooled = u64::try_from(spool.len()).unwrap_or(u64::MAX);
-        let limit = ready.execution_policy().max_spool_bytes();
+        let limit = ready.work_policy().max_spool_bytes();
         if spooled > limit {
             return Err(RunError::Record(PaidWorkError::OverEnvelope {
                 field: "spooled transcript length",
@@ -985,7 +1009,7 @@ impl ProviderEndpoint {
             provider_signature: signature.as_bytes().to_vec(),
             transcript: spool.clone(),
         };
-        let frame = if matches!(ready.execution_policy(), PaidWorkPolicy::Fetch { .. }) {
+        let frame = if matches!(ready.work_policy(), WorkPolicy::Fetch { .. }) {
             if spool.len() > hellas_rpc::protocol::work_fetch::MAX_FETCH_TRANSCRIPT_BYTES {
                 return Err(RunError::Record(PaidWorkError::OverEnvelope {
                     field: "Fetch transcript",
@@ -996,7 +1020,7 @@ impl ProviderEndpoint {
             stream::fetch_frames(
                 &delivered,
                 transcript,
-                ready.execution_policy().max_encoded_result_frame(),
+                ready.work_policy().max_encoded_result_frame(),
             )
             .try_fold(0, |size, frame| {
                 Ok::<_, RunError>(size.max(frame?.encoded_len() as u64))
@@ -1004,7 +1028,7 @@ impl ProviderEndpoint {
         } else {
             delivered.encoded_len() as u64
         };
-        let frame_limit = u64::from(ready.execution_policy().max_encoded_result_frame())
+        let frame_limit = u64::from(ready.work_policy().max_encoded_result_frame())
             .min(hellas_wire::frame::MAX_FRAME_BYTES as u64);
         if frame > frame_limit {
             return Err(RunError::Record(PaidWorkError::OverEnvelope {
@@ -1081,6 +1105,13 @@ impl ProviderEndpoint {
         ready: Option<&ReadyChannel>,
         exporter: &[u8; 32],
     ) -> Result<Delivery, DeliverError> {
+        if !request
+            .route
+            .as_ref()
+            .is_some_and(|r| r.selects_payment(self.state().channel().id()))
+        {
+            return Err(DeliverError::Malformed("channel route"));
+        }
         let work_id = work_id_bytes(&request.work_id).ok_or(DeliverError::Malformed("work id"))?;
         let signature = signature(&request.client_signature)
             .ok_or(DeliverError::Malformed("client signature"))?;
@@ -1115,10 +1146,17 @@ impl ProviderEndpoint {
         if transcript.is_empty() {
             return Err(DeliverError::NoResult { phase: job.phase() });
         }
+        hellas_rpc::protocol::work::check_payment_policy_binding(
+            ready.channel(),
+            job.authorization(),
+            ready.payment_policy(),
+        )?;
         let terminal_deadline = job.authorization().terminal_deadline;
 
         bind(ready, &self.close.store, &self.close.signer, Role::Provider)?;
-        if ready.execution_policy() != admitted.execution_policy() {
+        if ready.work_policy() != admitted.work_policy()
+            || ready.payment_policy() != admitted.payment_policy()
+        {
             return Err(DeliverError::Policy);
         }
         let (cursor_height, _) = self.state().cursor();
@@ -1167,6 +1205,13 @@ impl ProviderEndpoint {
     /// binding and certificate against the ledger, and the phase this
     /// job is in.
     pub fn admit(&mut self, request: &AdmitCertificateRequest) -> Result<u64, PaymentError> {
+        if !request
+            .route
+            .as_ref()
+            .is_some_and(|r| r.selects_payment(self.state().channel().id()))
+        {
+            return Err(PaymentError::Malformed("channel route"));
+        }
         let certificate = earned_certificate(&request.certificate)
             .ok_or(PaymentError::Malformed("certificate"))?;
         let binding = PaymentBindingV1::decode(&request.binding)?;
@@ -1282,10 +1327,7 @@ impl CloseEndpoint {
     ///
     /// [`WorkStoreError`] when the block is not the contiguous next one,
     /// or a transition it carries is refused.
-    pub fn observe_finalized(
-        &mut self,
-        block: &FinalizedWork,
-    ) -> Result<&ChannelState, WorkStoreError> {
+    pub fn observe_finalized(&mut self, block: &FinalizedWork) -> Result<&Channel, WorkStoreError> {
         observe(&mut self.store, block, &Secp256k1Verifier::new())?;
         Ok(self.store.state())
     }
@@ -1417,7 +1459,7 @@ impl CloseEndpoint {
     /// when this endpoint owes no answer.
     ///
     /// Whether one is owed is
-    /// [`ChannelState::answerable_contest`]'s judgement and no second
+    /// [`Channel::answerable_contest`]'s judgement and no second
     /// spelling of it: the client is the opener, the response window is
     /// still open at the cursor, and this endpoint's certificate strictly
     /// exceeds the opener's claim. A contest failing any of those is not
@@ -1566,10 +1608,7 @@ impl ProviderEndpoint {
     /// # Errors
     ///
     /// Whatever [`CloseEndpoint::observe_finalized`] raises.
-    pub fn observe_finalized(
-        &mut self,
-        block: &FinalizedWork,
-    ) -> Result<&ChannelState, WorkStoreError> {
+    pub fn observe_finalized(&mut self, block: &FinalizedWork) -> Result<&Channel, WorkStoreError> {
         self.close.observe_finalized(block)
     }
 
@@ -1678,10 +1717,7 @@ impl ClientEndpoint {
     ///
     /// [`WorkStoreError`] when the block is not the contiguous next one,
     /// or a transition it carries is refused.
-    pub fn observe_finalized(
-        &mut self,
-        block: &FinalizedWork,
-    ) -> Result<&ChannelState, WorkStoreError> {
+    pub fn observe_finalized(&mut self, block: &FinalizedWork) -> Result<&Channel, WorkStoreError> {
         observe(&mut self.store, block, &Secp256k1Verifier::new())?;
         Ok(self.store.state())
     }
@@ -1757,18 +1793,18 @@ impl PreparedEvaluateInput {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PreparedFetchInput {
     parts: PreparedPaidFetchInputParts,
-    policy: PaidFetchPolicyV1,
+    policy: FetchPolicyV2,
 }
 
 impl PreparedFetchInput {
     /// Builds an admitted input from its verified parts and channel policy.
     #[must_use]
-    pub const fn new(parts: PreparedPaidFetchInputParts, policy: PaidFetchPolicyV1) -> Self {
+    pub const fn new(parts: PreparedPaidFetchInputParts, policy: FetchPolicyV2) -> Self {
         Self { parts, policy }
     }
 
     /// Returns the fixed output bounds the provider must enforce while running.
-    pub const fn policy(&self) -> &PaidFetchPolicyV1 {
+    pub const fn policy(&self) -> &FetchPolicyV2 {
         &self.policy
     }
 
@@ -1791,7 +1827,7 @@ impl PreparedFetchInput {
 /// Implementors must invoke once per call. That is not a property this
 /// trait can check, and it is not the one the gate rests on: the gate
 /// calls this at most once per `work_id` whatever the implementor does.
-pub trait PaidWorkBackend: Sync {
+pub trait WorkBackend: Sync {
     /// Runs an authorized Fetch without persisting request or response bodies.
     fn fetch(
         &self,
@@ -1976,7 +2012,7 @@ pub async fn run_accepted_work<B>(
     work_id: Digest,
 ) -> Result<RunOutcome, RunError>
 where
-    B: PaidWorkBackend + Sync,
+    B: WorkBackend + Sync,
 {
     let admission = service.begin_run(work_id, ready)?;
     let progress_service = service.clone();
@@ -2215,8 +2251,9 @@ fn earned_certificate(bytes: &[u8]) -> Option<EarnedCertificate> {
 }
 
 /// Returns the request that carries one retained payment.
-fn admit_request(payment: &PaidCertificate) -> AdmitCertificateRequest {
+fn admit_request(channel_id: Digest, payment: &PaidCertificate) -> AdmitCertificateRequest {
     AdmitCertificateRequest {
+        route: Some(hellas_rpc::pb::work::WorkRoute::payment(channel_id)),
         certificate: encode_kernel(&payment.certificate),
         binding: payment.binding.encode(),
         binding_signature: payment.binding_signature.as_bytes().to_vec(),
@@ -2598,7 +2635,7 @@ impl WorkService {
     /// # Errors
     ///
     /// [`EndpointError::Poisoned`], as [`Self::endpoint`] documents.
-    pub fn with_state<R>(&self, read: impl FnOnce(&ChannelState) -> R) -> Result<R, EndpointError> {
+    pub fn with_state<R>(&self, read: impl FnOnce(&Channel) -> R) -> Result<R, EndpointError> {
         Ok(read(self.endpoint()?.state()))
     }
 
@@ -2961,7 +2998,7 @@ fn work_id_bytes(bytes: &[u8]) -> Option<Digest> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JobProposal {
     /// The inputs the job runs on.
-    pub prepared_input: PreparedPaidWorkInput,
+    pub prepared_input: PreparedWorkInput,
     /// The three heights the job is bound by.
     pub deadlines: JobDeadlines,
 }
@@ -3056,7 +3093,7 @@ impl ClientEndpoint {
 
     /// Returns what this endpoint durably knows.
     #[must_use]
-    pub const fn state(&self) -> &ChannelState {
+    pub const fn state(&self) -> &Channel {
         self.store.state()
     }
 
@@ -3086,8 +3123,9 @@ impl ClientEndpoint {
         }
         let (cursor_height, _) = self.state().cursor();
         let ready = self.ready.as_ref().ok_or(EndpointError::NotAdmitting)?;
-        let policy = ready.execution_policy();
+        let policy = ready.work_policy();
 
+        let mut retry = None;
         for job in self
             .state()
             .jobs()
@@ -3096,6 +3134,7 @@ impl ClientEndpoint {
             let retained = *job.authorization();
             let rebuilt = policy.propose(
                 self.state().channel(),
+                ready.payment_policy(),
                 &proposal.prepared_input,
                 retained.proposal_nonce,
                 proposal.deadlines,
@@ -3103,24 +3142,42 @@ impl ClientEndpoint {
             if rebuilt != retained {
                 continue;
             }
-            return Ok(wire_request(
+            let request = wire_request(
                 &retained,
                 job.client_signature(),
                 job.prepared_input().to_vec(),
-            ));
+            );
+            let id = job.work_id();
+            retry = Some((id, request));
+            break;
         }
 
-        // Nonces form a durable high-water mark. A second job does not
-        // wait for the first, but no crash or reordered response can make
+        if let Some((id, request)) = retry {
+            self.mark_proposal_pending(id)?;
+            return Ok(request);
+        }
+
+        if self.state().job_book().pending_proposal().is_some() {
+            return Err(ProposeError::Conflict);
+        }
+
+        // Nonces form a durable high-water mark. Accepted executions overlap; acceptance proposals wait for a reply.
+        // No crash or reordered response can make
         // the sequence move backwards or reuse a number.
         let proposal_nonce = self.state().proposal_nonce_high_water().saturating_add(1);
         let authorization = policy.propose(
             self.state().channel(),
+            ready.payment_policy(),
             &proposal.prepared_input,
             proposal_nonce,
             proposal.deadlines,
         )?;
-        policy.check_authorization(self.state().channel(), &authorization, cursor_height)?;
+        policy.check_authorization(
+            self.state().channel(),
+            ready.payment_policy(),
+            &authorization,
+            cursor_height,
+        )?;
         policy.check_input(
             self.state().channel(),
             &authorization,
@@ -3155,7 +3212,7 @@ impl ClientEndpoint {
     /// # Errors
     /// Returns [`ProposeError::NoOpenJob`] for an unknown job and
     /// [`ProposeError::JobInFlight`] if the provider already co-signed it.
-    pub fn resume_proposal(&self, work_id: Digest) -> Result<AcceptWorkRequest, ProposeError> {
+    pub fn resume_proposal(&mut self, work_id: Digest) -> Result<AcceptWorkRequest, ProposeError> {
         let job = self
             .state()
             .job_by_id(work_id)
@@ -3163,11 +3220,32 @@ impl ClientEndpoint {
         if job.phase() != JobPhase::HalfSigned {
             return Err(ProposeError::JobInFlight { phase: job.phase() });
         }
-        Ok(wire_request(
+        let request = wire_request(
             job.authorization(),
             job.client_signature(),
             job.prepared_input().to_vec(),
-        ))
+        );
+        self.mark_proposal_pending(work_id)?;
+        Ok(request)
+    }
+
+    fn mark_proposal_pending(&mut self, work_id: Digest) -> Result<(), ProposeError> {
+        if self
+            .state()
+            .job_book()
+            .pending_proposal()
+            .is_some_and(|held| held != work_id)
+        {
+            return Err(ProposeError::Conflict);
+        }
+        self.store.commit(
+            ChannelRecord::ProposalExchange {
+                work_id,
+                pending: true,
+            },
+            &Secp256k1Verifier::new(),
+        )?;
+        Ok(())
     }
 
     /// Applies one provider answer, and returns the accepted `work_id`.
@@ -3193,14 +3271,35 @@ impl ClientEndpoint {
                     .ok_or(ProposeError::Malformed("provider signature"))?,
             ),
             Some(Outcome::Refused(refused)) => {
+                let refusal = WorkRefusal::from_code(refused.code)
+                    .ok_or(ProposeError::Malformed("refusal code"))?;
+                let work_id = self
+                    .state()
+                    .job_book()
+                    .pending_proposal()
+                    .ok_or(ProposeError::NoOpenJob)?;
+                self.store.commit(
+                    ChannelRecord::ProposalExchange {
+                        work_id,
+                        pending: false,
+                    },
+                    &Secp256k1Verifier::new(),
+                )?;
                 return Err(ProposeError::Refused {
-                    refusal: WorkRefusal::from_code(refused.code)
-                        .ok_or(ProposeError::Malformed("refusal code"))?,
+                    refusal,
                     reason: refused.reason.clone(),
                 });
             }
             None => return Err(ProposeError::Malformed("outcome")),
         };
+        if self
+            .state()
+            .job_book()
+            .pending_proposal()
+            .is_some_and(|pending| pending != work_id)
+        {
+            return Err(ProposeError::Conflict);
+        }
         self.state()
             .job_by_id(work_id)
             .ok_or(ProposeError::NoOpenJob)?;
@@ -3325,12 +3424,20 @@ impl ClientEndpoint {
             .ok_or(DeliverError::NoSuchJob)?;
 
         bind(ready, &self.store, &self.signer, Role::Client)?;
-        if ready.execution_policy()
+        hellas_rpc::protocol::work::check_payment_policy_binding(
+            ready.channel(),
+            self.state()
+                .job_by_id(work_id)
+                .ok_or(DeliverError::NoSuchJob)?
+                .authorization(),
+            ready.payment_policy(),
+        )?;
+        if ready.work_policy()
             != self
                 .ready
                 .as_ref()
                 .ok_or(EndpointError::NotAdmitting)?
-                .execution_policy()
+                .work_policy()
         {
             return Err(DeliverError::Policy);
         }
@@ -3340,16 +3447,16 @@ impl ClientEndpoint {
         // The bound is on the encoded message, which is what this
         // endpoint agreed to hold; the transport's own framing around
         // it is the transport's and is not measured here.
-        let limit = u64::from(ready.execution_policy().max_encoded_result_frame());
+        let limit = u64::from(ready.work_policy().max_encoded_result_frame());
         let actual = u64::try_from(delivered.encoded_len()).unwrap_or(u64::MAX);
         if !streamed && actual > limit {
             return Err(DeliverError::OverFrame { actual, limit });
         }
 
         let result = PaidJobResultV1::decode(&delivered.result)?;
-        if matches!(ready.execution_policy(), PaidWorkPolicy::Fetch { .. }) {
+        if matches!(ready.work_policy(), WorkPolicy::Fetch { .. }) {
             let actual = delivered.transcript.len() as u64;
-            let limit = ready.execution_policy().max_spool_bytes();
+            let limit = ready.work_policy().max_spool_bytes();
             if actual > limit {
                 return Err(PaidWorkError::OverEnvelope {
                     field: "spooled transcript length",
@@ -3367,7 +3474,7 @@ impl ClientEndpoint {
                 &delivered.transcript,
                 hellas_rpc::protocol::work_fetch::MAX_FETCH_TRANSCRIPT_BYTES,
             )?;
-            let input = PreparedPaidWorkInput::decode(
+            let input = PreparedWorkInput::decode(
                 self.state()
                     .job_by_id(work_id)
                     .ok_or(DeliverError::NoSuchJob)?
@@ -3375,7 +3482,7 @@ impl ClientEndpoint {
                 MAX_RECORD_BYTES,
             )
             .map_err(PaidWorkError::from)?;
-            let expected = ready.execution_policy().terminal_result(
+            let expected = ready.work_policy().terminal_result(
                 ready.channel(),
                 authorization,
                 &input,
@@ -3433,6 +3540,9 @@ impl ClientEndpoint {
             exporter,
         )));
         Ok(DeliverResultRequest {
+            route: Some(hellas_rpc::pb::work::WorkRoute::payment(
+                self.state().channel().id(),
+            )),
             work_id: work_id.as_bytes().to_vec(),
             client_signature: signature.as_bytes().to_vec(),
         })
@@ -3531,7 +3641,7 @@ impl ClientEndpoint {
     /// journal applies — including a payment signed past its deadline.
     pub fn pay(&mut self, work_id: Digest) -> Result<AdmitCertificateRequest, PaymentError> {
         if let Some(retained) = self.state().payment(work_id) {
-            return Ok(admit_request(&retained));
+            return Ok(admit_request(self.state().channel().id(), &retained));
         }
         if let Some(observation) = &self.observation {
             observation.check()?;
@@ -3573,6 +3683,9 @@ impl ClientEndpoint {
             &Secp256k1Verifier::new(),
         )?;
         Ok(AdmitCertificateRequest {
+            route: Some(hellas_rpc::pb::work::WorkRoute::payment(
+                self.state().channel().id(),
+            )),
             certificate: encode_kernel(&certificate),
             binding: binding.encode(),
             binding_signature: binding_signature.as_bytes().to_vec(),
@@ -3770,11 +3883,14 @@ fn acceptance_response(result: Result<(Digest, Sig), Refusal>) -> AcceptWorkResp
 }
 
 fn wire_request(
-    authorization: &PaidJobAuthorizationV1,
+    authorization: &PaidJobAuthorizationV2,
     client_signature: Sig,
     prepared_input: Vec<u8>,
 ) -> AcceptWorkRequest {
     AcceptWorkRequest {
+        route: Some(hellas_rpc::pb::work::WorkRoute::payment(
+            authorization.channel_id,
+        )),
         authorization: authorization.encode(),
         client_signature: client_signature.as_bytes().to_vec(),
         prepared_input,

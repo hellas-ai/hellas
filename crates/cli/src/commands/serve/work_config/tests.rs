@@ -3,7 +3,7 @@ use hellas_kernel::{EdgeValues, Fees, Key, NetworkId};
 use hellas_rpc::peers::PeerId;
 use hellas_rpc::protocol::Digest;
 use hellas_rpc::protocol::work::*;
-use hellas_rpc::protocol::work_profile::PaidWorkPolicy;
+use hellas_rpc::protocol::work_profile::WorkPolicy;
 use hellas_rpc::protocol::work_setup::ProviderChannelPolicy;
 use std::time::Duration;
 use std::{
@@ -16,27 +16,22 @@ type CliResult<T> = anyhow::Result<T>;
 fn fetch_policy_loads_and_cannot_be_combined_with_evaluate() {
     let mut value = config();
     value["policies"]["fetch"] = serde_json::json!({
-        "allowed_environment": hex32(0x11),
-        "service": "openai", "method": "responses",
-        "max_request_body_bytes": 4096, "max_output_events": 64,
-        "max_output_bytes": 16384, "max_spool_bytes": 65536,
-        "max_encoded_result_frame": 65536, "max_encoded_prepared_input": 65536,
-        "dispatch_margin_blocks": 4, "delivery_margin_blocks": 2,
-        "oracle_grace_blocks": 6, "fixed_price": 10,
-    });
+    "allowed_environment": hex32(0x11),
+    "service": "openai", "method": "responses",
+    "max_request_body_bytes": 4096, "max_output_events": 64,
+    "max_output_bytes": 16384, "max_spool_bytes": 65536,
+    "max_encoded_result_frame": 65536, "max_encoded_prepared_input": 65536,
+        });
     assert!(load(value.clone()).is_err());
     value["policies"]
         .as_object_mut()
         .unwrap()
         .remove("execution");
     let loaded = load(value.clone()).unwrap();
-    assert!(matches!(
-        loaded.execution_policy,
-        PaidWorkPolicy::Fetch { .. }
-    ));
+    assert!(matches!(loaded.work_policy, WorkPolicy::Fetch { .. }));
     assert_eq!(
-        PaidWorkPolicy::decode(&loaded.execution_policy.encode()).unwrap(),
-        loaded.execution_policy
+        WorkPolicy::decode(&loaded.work_policy.encode()).unwrap(),
+        loaded.work_policy
     );
     value["policies"].as_object_mut().unwrap().remove("fetch");
     assert!(load(value).is_err());
@@ -103,7 +98,9 @@ fn config() -> serde_json::Value {
                 "max_stop_token_ids": 4,
                 "max_spool_bytes": 1_048_576_u64,
                 "max_encoded_result_frame": 262_144,
-                "max_encoded_quote_response": 1_048_576_u64,
+                "max_encoded_prepared_input": 1_048_576_u64,
+            },
+            "payment": {
                 "dispatch_margin_blocks": 4,
                 "delivery_margin_blocks": 2,
                 "oracle_grace_blocks": 6,
@@ -171,10 +168,10 @@ fn a_work_config_round_trips_from_a_file() {
     assert_eq!(route.client, Key::from_bytes([0x02; Key::LENGTH]));
     assert_eq!(loaded.policy_salt, [0x5a; 32]);
     assert_eq!(loaded.channel_policy.compute_credit_limit, 40);
-    assert_eq!(loaded.execution_policy.fixed_price(), 10);
+    assert_eq!(loaded.payment_policy.fixed_price, 10);
     assert_eq!(
-        match loaded.execution_policy {
-            PaidWorkPolicy::Evaluate(policy) => policy.max_stop_token_ids,
+        match loaded.work_policy {
+            WorkPolicy::Evaluate(policy) => policy.max_stop_token_ids,
             _ => panic!("expected Evaluate policy"),
         },
         4
@@ -191,17 +188,10 @@ fn a_work_config_round_trips_from_a_file() {
 }
 
 #[test]
-fn two_routes_cannot_name_the_same_peer() {
-    let routes = serde_json::json!([route(0x31, 0x41, 0x02), route(0x31, 0x42, 0x03),]);
-    let error = format!(
-        "{:?}",
-        load(with(config(), "routes", routes))
-            .expect_err("one authenticated peer cannot resolve to two routes"),
-    );
-    assert!(
-        error.contains("names peer") && error.contains("twice"),
-        "unexpected error: {error}",
-    );
+fn two_routes_can_name_the_same_peer() {
+    let routes = serde_json::json!([route(0x31, 0x41, 0x02), route(0x31, 0x42, 0x03)]);
+    let loaded = load(with(config(), "routes", routes)).expect("distinct bonds under one peer");
+    assert_eq!(loaded.routes.len(), 2);
 }
 
 #[test]
@@ -233,7 +223,7 @@ fn a_missing_field_is_refused_by_name() {
         (&["chain"][..], "genesis_payload_digest"),
         (&["journal"][..], "root"),
         (&["policies"][..], "policy_salt"),
-        (&["policies", "execution"][..], "fixed_price"),
+        (&["policies", "payment"][..], "fixed_price"),
     ] {
         let error = format!(
             "{:?}",
@@ -373,20 +363,32 @@ fn validators_are_loaded_normalised() {
 /// unchecked moves the refusal to the first admission, with a
 /// counterparty already waiting.
 #[test]
-fn a_zero_execution_policy_field_is_refused() {
+fn a_zero_work_policy_field_is_refused() {
     for field in [
         "fixed_price",
         "max_prompt_tokens",
         "max_new_tokens",
         "max_spool_bytes",
         "max_encoded_result_frame",
-        "max_encoded_quote_response",
+        "max_encoded_prepared_input",
         "dispatch_margin_blocks",
         "delivery_margin_blocks",
         "oracle_grace_blocks",
     ] {
         let mut value = config();
-        value["policies"]["execution"][field] = serde_json::json!(0);
+        let kind = if [
+            "fixed_price",
+            "dispatch_margin_blocks",
+            "delivery_margin_blocks",
+            "oracle_grace_blocks",
+        ]
+        .contains(&field)
+        {
+            "payment"
+        } else {
+            "execution"
+        };
+        value["policies"][kind][field] = serde_json::json!(0);
         let Err(refusal) = load(value) else {
             panic!("a zero {field} loaded");
         };
@@ -403,8 +405,8 @@ fn a_zero_execution_policy_field_is_refused() {
     value["policies"]["execution"]["max_stop_token_ids"] = serde_json::json!(0);
     let loaded = load(value).expect("no stop tokens is a usable channel");
     assert_eq!(
-        match loaded.execution_policy {
-            PaidWorkPolicy::Evaluate(policy) => policy.max_stop_token_ids,
+        match loaded.work_policy {
+            WorkPolicy::Evaluate(policy) => policy.max_stop_token_ids,
             _ => panic!("expected Evaluate policy"),
         },
         0
@@ -671,7 +673,7 @@ fn a_configuration_makes_its_policy_field_for_field() {
     assert_eq!(policy.network, network());
     assert_eq!(policy.policy_salt, [0x5a; 32]);
     assert_eq!(policy.channel_policy.compute_credit_limit, 40);
-    assert_eq!(policy.execution_policy.fixed_price(), 10);
+    assert_eq!(policy.payment_policy.fixed_price, 10);
     assert_eq!(
         policy.expected_payment_values,
         EdgeValues::new(PAYMENT_VALUE, PAYMENT_RESERVE, Fees::new(0, 0, 0, 0)),

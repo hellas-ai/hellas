@@ -1,6 +1,6 @@
 use super::*;
 
-impl ChannelState {
+impl Channel<PaymentFunding> {
     fn check_result_payload(
         &self,
         job: &JobState,
@@ -20,16 +20,16 @@ impl ChannelState {
                 Err(ChannelStateError::Malformed)
             };
         }
-        let input = PreparedPaidWorkInput::decode(&job.prepared_input, MAX_RECORD_BYTES)
+        let input = PreparedWorkInput::decode(&job.prepared_input, MAX_RECORD_BYTES)
             .map_err(PaidWorkError::from)?;
         let budget = match &input {
-            PreparedPaidWorkInput::Fetch(_) => {
+            PreparedWorkInput::Fetch(_) => {
                 hellas_rpc::protocol::work_fetch::MAX_FETCH_TRANSCRIPT_BYTES
             }
-            PreparedPaidWorkInput::Evaluate(_) => MAX_RECORD_BYTES,
+            PreparedWorkInput::Evaluate(_) => MAX_RECORD_BYTES,
         };
         let events = decode_transcript(transcript, budget)?;
-        if input.terminal_result(&self.channel, &job.authorization, &events)? != *result {
+        if input.terminal_result(&self.funding.channel, &job.authorization, &events)? != *result {
             return Err(ChannelStateError::WrongChannel {
                 field: "result against its transcript",
             });
@@ -44,19 +44,18 @@ impl ChannelState {
         origin: SetupOrigin,
     ) -> Self {
         Self {
-            channel,
-            settlement,
+            funding: PaymentState {
+                channel,
+                settlement,
+                cursor: (origin.height, origin.payload),
+                close_prepared: None,
+                close_opened: None,
+                close_responded: None,
+                close_settled: None,
+            },
             role,
             ledger: CreditLedger::new(),
-            jobs: BTreeMap::new(),
-            terminals: BTreeMap::new(),
-            proposal_nonce_high_water: 0,
-            cursor: (origin.height, origin.payload),
-            indeterminate: BTreeMap::new(),
-            close_prepared: None,
-            close_opened: None,
-            close_responded: None,
-            close_settled: None,
+            book: JobBook::default(),
         }
     }
 
@@ -106,6 +105,7 @@ impl ChannelState {
         verifier: &V,
         metadata_only: bool,
     ) -> Result<(), ChannelStateError> {
+        self.book.revalidate_exchange(self.role)?;
         // The one number consensus sees, against the one terminal that
         // could have moved it. A ledger the terminal does not produce is
         // a channel that would credit a second payment.
@@ -114,8 +114,8 @@ impl ChannelState {
                 field: "credited cumulative against the terminal",
             });
         }
-        for job in self.jobs.values() {
-            if job.work_id != work_id(&self.channel, &job.authorization) {
+        for job in self.book.jobs.values() {
+            if job.work_id != work_id(&self.funding.channel, &job.authorization) {
                 return Err(ChannelStateError::WrongChannel { field: "work_id" });
             }
             self.check_authorization(&job.authorization, &job.prepared_input, metadata_only)?;
@@ -155,7 +155,7 @@ impl ChannelState {
                 if !verifier.verify_sig(
                     *provider_signature,
                     self.provider_key(),
-                    signing_hash(result_digest(&self.channel, result)),
+                    signing_hash(result_digest(&self.funding.channel, result)),
                 ) {
                     return Err(ChannelStateError::BadSignature {
                         slot: "result",
@@ -164,8 +164,8 @@ impl ChannelState {
                 }
             }
         }
-        for terminal in self.terminals.values() {
-            if self.jobs.contains_key(&terminal.work_id) {
+        for terminal in self.book.terminals.values() {
+            if self.book.jobs.contains_key(&terminal.work_id) {
                 return Err(ChannelStateError::Terminated {
                     step: "replaying a checkpoint with a job still open",
                     outcome: terminal.outcome.name(),
@@ -182,7 +182,7 @@ impl ChannelState {
                     (
                         "binding",
                         *binding_signature,
-                        signing_hash(payment_binding_digest(&self.channel, binding)),
+                        signing_hash(payment_binding_digest(&self.funding.channel, binding)),
                     ),
                     (
                         "certificate",
@@ -199,11 +199,12 @@ impl ChannelState {
                 }
             }
         }
-        if let Some(start) = &self.close_prepared {
+        if let Some(start) = &self.funding.close_prepared {
             self.check_close_start(start)?;
         }
-        if let Some(answer) = self.close_responded {
+        if let Some(answer) = self.funding.close_responded {
             let Some(contest) = self
+                .funding
                 .close_opened
                 .filter(|contest| contest.start_id == answer.start_id)
             else {
@@ -219,7 +220,7 @@ impl ChannelState {
             };
             if answer.response_digest
                 != crate::work_close::response_body_digest(
-                    &self.channel,
+                    &self.funding.channel,
                     contest.start_id,
                     &certificate,
                 )
@@ -235,7 +236,7 @@ impl ChannelState {
     /// Returns the channel every record here is bound to.
     #[must_use]
     pub const fn channel(&self) -> &PaidChannel {
-        &self.channel
+        &self.funding.channel
     }
 
     /// Returns what this endpoint has credited.
@@ -258,35 +259,35 @@ impl ChannelState {
     /// payments by a different number than this one.
     #[must_use]
     pub const fn settlement(&self) -> WorkPaymentSettlement {
-        self.settlement
+        self.funding.settlement
     }
 
     /// Returns one active job by its stable identifier.
     #[must_use]
     pub fn job_by_id(&self, work_id: Digest) -> Option<&JobState> {
-        self.jobs.get(&work_id)
+        self.book.jobs.get(&work_id)
     }
 
     /// Iterates all active jobs in deterministic work-id order.
     pub fn jobs(&self) -> impl ExactSizeIterator<Item = &JobState> {
-        self.jobs.values()
+        self.book.jobs.values()
     }
 
     /// Returns an archived terminal by work ID.
     #[must_use]
     pub fn terminal_by_id(&self, work_id: Digest) -> Option<&JobTerminal> {
-        self.terminals.get(&work_id)
+        self.book.terminals.get(&work_id)
     }
 
     /// Iterates the append-only terminal archive in deterministic order.
     pub fn terminals(&self) -> impl ExactSizeIterator<Item = &JobTerminal> {
-        self.terminals.values()
+        self.book.terminals.values()
     }
 
     /// Returns the largest proposal nonce ever admitted.
     #[must_use]
     pub const fn proposal_nonce_high_water(&self) -> u64 {
-        self.proposal_nonce_high_water
+        self.book.proposal_nonce_high_water
     }
 
     /// Returns the retained payment with the largest cumulative amount.
@@ -297,7 +298,8 @@ impl ChannelState {
     /// a second payment.
     #[must_use]
     pub fn last_payment(&self) -> Option<PaidCertificate> {
-        self.terminals
+        self.book
+            .terminals
             .values()
             .filter_map(Self::payment_from_terminal)
             .max_by_key(|payment| payment.certificate.earned_cumulative())
@@ -306,7 +308,8 @@ impl ChannelState {
     /// Returns the retained payment for one work ID.
     #[must_use]
     pub fn payment(&self, work_id: Digest) -> Option<PaidCertificate> {
-        self.terminals
+        self.book
+            .terminals
             .get(&work_id)
             .and_then(Self::payment_from_terminal)
     }
@@ -339,13 +342,13 @@ impl ChannelState {
     /// it holds.
     #[must_use]
     pub fn is_indeterminate(&self) -> bool {
-        !self.indeterminate.is_empty()
+        !self.book.indeterminate.is_empty()
     }
 
     /// Whether one active invocation was interrupted by a restart.
     #[must_use]
     pub fn job_is_indeterminate(&self, work_id: Digest) -> bool {
-        self.indeterminate.contains_key(&work_id)
+        self.book.indeterminate.contains(&work_id)
     }
 
     /// Returns the largest cumulative the paid certificate names.
@@ -378,7 +381,7 @@ impl ChannelState {
     /// an endpoint every deadline rule passes for.
     #[must_use]
     pub const fn cursor(&self) -> (u64, [u8; 32]) {
-        self.cursor
+        self.funding.cursor
     }
 
     /// Returns the close start this endpoint signed and retains.
@@ -390,7 +393,7 @@ impl ChannelState {
     /// pending close.
     #[must_use]
     pub const fn close_prepared(&self) -> Option<&PaymentCloseStart> {
-        self.close_prepared.as_ref()
+        self.funding.close_prepared.as_ref()
     }
 
     /// Returns the retained close start while `height` is still inside
@@ -403,7 +406,8 @@ impl ChannelState {
     /// start this channel is closing with.
     #[must_use]
     pub fn includable_close_start(&self, height: u64) -> Option<&PaymentCloseStart> {
-        self.close_prepared
+        self.funding
+            .close_prepared
             .as_ref()
             .filter(|start| height <= start.valid_through_height())
     }
@@ -412,7 +416,7 @@ impl ChannelState {
     /// and the party that opened it.
     #[must_use]
     pub const fn close_opened(&self) -> Option<(StartId, Party)> {
-        match self.close_opened {
+        match self.funding.close_opened {
             Some(contest) => Some((contest.start_id, contest.opener)),
             None => None,
         }
@@ -429,7 +433,7 @@ impl ChannelState {
     /// owed.
     #[must_use]
     pub const fn close_responded(&self) -> Option<RespondedContest> {
-        self.close_responded
+        self.funding.close_responded
     }
 
     /// Returns the contest this endpoint owes an answer to, with the
@@ -456,11 +460,11 @@ impl ChannelState {
     /// answer derives the same one.
     #[must_use]
     pub fn answerable_contest(&self) -> Option<(OpenContest, (EarnedCertificate, Sig))> {
-        if self.role != Role::Provider || self.close_settled.is_some() {
+        if self.role != Role::Provider || self.funding.close_settled.is_some() {
             return None;
         }
-        let contest = self.close_opened?;
-        if contest.opener != Party::Maker || self.cursor.0 >= contest.response_deadline {
+        let contest = self.funding.close_opened?;
+        if contest.opener != Party::Maker || self.funding.cursor.0 >= contest.response_deadline {
             return None;
         }
         let certificate = self
@@ -472,7 +476,7 @@ impl ChannelState {
     /// Returns the finalized close of this channel's payment edge.
     #[must_use]
     pub const fn close_settled(&self) -> Option<CloseSettlement> {
-        self.close_settled
+        self.funding.close_settled
     }
 
     /// Returns the largest certificate held, with the client signature
@@ -506,9 +510,9 @@ impl ChannelState {
     /// could no longer do.
     #[must_use]
     pub fn is_closing(&self) -> bool {
-        self.close_opened.is_some()
-            || self.close_settled.is_some()
-            || self.includable_close_start(self.cursor.0).is_some()
+        self.funding.close_opened.is_some()
+            || self.funding.close_settled.is_some()
+            || self.includable_close_start(self.funding.cursor.0).is_some()
     }
 
     fn refuse_if_closing(&self, step: &'static str) -> Result<(), ChannelStateError> {
@@ -519,15 +523,15 @@ impl ChannelState {
     }
 
     const fn client_key(&self) -> Key {
-        self.channel.client_key()
+        self.funding.channel.client_key()
     }
 
     const fn provider_key(&self) -> Key {
-        self.channel.provider_key()
+        self.funding.channel.provider_key()
     }
 
     const fn network(&self) -> NetworkId {
-        self.channel.network()
+        self.funding.channel.network()
     }
 
     fn require_role(&self, step: &'static str, role: Role) -> Result<(), ChannelStateError> {
@@ -541,39 +545,6 @@ impl ChannelState {
                     Role::Provider => "provider",
                 },
             })
-        }
-    }
-
-    fn open_job(&self, work_id: Digest, step: &'static str) -> Result<JobState, ChannelStateError> {
-        if let Some(job) = self.jobs.get(&work_id) {
-            return Ok(job.clone());
-        }
-        // A late reply to a finished job is refused as terminated rather
-        // than as a phase error: the job is not merely absent, it is over
-        // for good, and no step reopens it.
-        if let Some(terminal) = self.terminals.get(&work_id) {
-            return Err(ChannelStateError::Terminated {
-                step,
-                outcome: terminal.outcome.name(),
-            });
-        }
-        Err(ChannelStateError::WrongPhase {
-            step,
-            phase: "none",
-        })
-    }
-
-    fn refuse_if_terminated(
-        &self,
-        work_id: Digest,
-        step: &'static str,
-    ) -> Result<(), ChannelStateError> {
-        match self.terminals.get(&work_id) {
-            Some(terminal) => Err(ChannelStateError::Terminated {
-                step,
-                outcome: terminal.outcome.name(),
-            }),
-            None => Ok(()),
         }
     }
 
@@ -591,6 +562,7 @@ impl ChannelState {
             ChannelRecord::PlaintextReleased { work_id } => {
                 self.role == Role::Provider
                     && self
+                        .book
                         .jobs
                         .get(work_id)
                         .is_some_and(|job| job.phase.delivered())
@@ -611,6 +583,10 @@ impl ChannelState {
         metadata_only: bool,
     ) -> Result<Applied, ChannelStateError> {
         match record {
+            ChannelRecord::ProposalExchange { work_id, pending } => {
+                self.require_role("recording proposal exchange", Role::Client)?;
+                self.book.proposal_exchange(*work_id, *pending)
+            }
             ChannelRecord::CursorAdvanced {
                 height,
                 parent,
@@ -697,7 +673,7 @@ impl ChannelState {
         match self.reading(height, parent, payload)? {
             Applied::Redundant => Ok(Applied::Redundant),
             Applied::Changed => {
-                self.cursor = (height, *payload);
+                self.funding.cursor = (height, *payload);
                 Ok(Applied::Changed)
             }
         }
@@ -728,7 +704,7 @@ impl ChannelState {
         parent: &[u8; 32],
         payload: &[u8; 32],
     ) -> Result<Applied, ChannelStateError> {
-        let (held_height, held_payload) = self.cursor;
+        let (held_height, held_payload) = self.funding.cursor;
         if (height, *payload) == (held_height, held_payload) {
             return Ok(Applied::Redundant);
         }
@@ -761,15 +737,15 @@ impl ChannelState {
         &mut self,
         start: &PaymentCloseStart,
     ) -> Result<Applied, ChannelStateError> {
-        if self.close_prepared.as_ref() == Some(start) {
+        if self.funding.close_prepared.as_ref() == Some(start) {
             return Ok(Applied::Redundant);
         }
-        if self.close_opened.is_some() || self.close_settled.is_some() {
+        if self.funding.close_opened.is_some() || self.funding.close_settled.is_some() {
             return Err(ChannelStateError::Closing {
                 step: "signing a close start",
             });
         }
-        if let Some(job) = self.jobs.values().next() {
+        if let Some(job) = self.book.jobs.values().next() {
             return Err(ChannelStateError::WrongPhase {
                 step: "signing a close start",
                 phase: job.phase.name(),
@@ -780,13 +756,13 @@ impl ChannelState {
         // provider, so a journal signing in the other role would be
         // building a close for the other party.
         self.check_close_start(start)?;
-        let (cursor_height, _) = self.cursor;
+        let (cursor_height, _) = self.funding.cursor;
         if self.includable_close_start(cursor_height).is_some() {
             return Err(ChannelStateError::Conflict {
                 what: "a close start that can still be included",
             });
         }
-        self.close_prepared = Some(start.clone());
+        self.funding.close_prepared = Some(start.clone());
         Ok(Applied::Changed)
     }
 
@@ -807,21 +783,21 @@ impl ChannelState {
     /// makes that the only order a journal can be written or replayed
     /// in.
     fn apply_close_opened(&mut self, contest: OpenContest) -> Result<Applied, ChannelStateError> {
-        if self.close_opened == Some(contest) {
+        if self.funding.close_opened == Some(contest) {
             return Ok(Applied::Redundant);
         }
-        if self.close_settled.is_some() {
+        if self.funding.close_settled.is_some() {
             return Err(ChannelStateError::Closing {
                 step: "opening a close contest",
             });
         }
-        if self.close_opened.is_some() {
+        if self.funding.close_opened.is_some() {
             return Err(ChannelStateError::Conflict {
                 what: "this edge's close contest",
             });
         }
         self.refuse_open_job("opening a close contest")?;
-        self.close_opened = Some(contest);
+        self.funding.close_opened = Some(contest);
         Ok(Applied::Changed)
     }
 
@@ -848,16 +824,16 @@ impl ChannelState {
         &mut self,
         answer: RespondedContest,
     ) -> Result<Applied, ChannelStateError> {
-        if self.close_responded == Some(answer) {
+        if self.funding.close_responded == Some(answer) {
             return Ok(Applied::Redundant);
         }
-        if self.close_responded.is_some() {
+        if self.funding.close_responded.is_some() {
             return Err(ChannelStateError::Conflict {
                 what: "this contest's answer",
             });
         }
         self.require_role("answering a close contest", Role::Provider)?;
-        if self.close_settled.is_some() {
+        if self.funding.close_settled.is_some() {
             return Err(ChannelStateError::Closing {
                 step: "answering a close contest",
             });
@@ -875,7 +851,7 @@ impl ChannelState {
         }
         if answer.response_digest
             != crate::work_close::response_body_digest(
-                &self.channel,
+                &self.funding.channel,
                 answer.start_id,
                 &certificate.0,
             )
@@ -884,7 +860,7 @@ impl ChannelState {
                 field: "close response digest",
             });
         }
-        self.close_responded = Some(answer);
+        self.funding.close_responded = Some(answer);
         Ok(Applied::Changed)
     }
 
@@ -898,21 +874,21 @@ impl ChannelState {
         &mut self,
         settlement: CloseSettlement,
     ) -> Result<Applied, ChannelStateError> {
-        if self.close_settled == Some(settlement) {
+        if self.funding.close_settled == Some(settlement) {
             return Ok(Applied::Redundant);
         }
-        if self.close_settled.is_some() {
+        if self.funding.close_settled.is_some() {
             return Err(ChannelStateError::Conflict {
                 what: "this edge's close",
             });
         }
         self.refuse_open_job("closing the payment edge")?;
-        self.close_settled = Some(settlement);
+        self.funding.close_settled = Some(settlement);
         Ok(Applied::Changed)
     }
 
     fn refuse_open_job(&self, step: &'static str) -> Result<(), ChannelStateError> {
-        match self.jobs.values().next() {
+        match self.book.jobs.values().next() {
             Some(job) => Err(ChannelStateError::WrongPhase {
                 step,
                 phase: job.phase.name(),
@@ -932,23 +908,23 @@ impl ChannelState {
     /// spell them differently.
     fn check_authorization(
         &self,
-        authorization: &PaidJobAuthorizationV1,
+        authorization: &PaidJobAuthorizationV2,
         prepared_input: &[u8],
         metadata_only: bool,
     ) -> Result<(), ChannelStateError> {
-        let terms = self.channel.payment_terms();
+        let terms = self.funding.channel.payment_terms();
         for (field, holds) in [
             (
                 "channel_id",
-                authorization.channel_id.as_bytes() == self.channel.id().as_bytes(),
+                authorization.channel_id.as_bytes() == self.funding.channel.id().as_bytes(),
             ),
             (
                 "payment_edge",
-                authorization.payment_edge == self.channel.payment_edge(),
+                authorization.payment_edge == self.funding.channel.payment_edge(),
             ),
             (
                 "payment_terms_hash",
-                authorization.payment_terms_hash == self.channel.payment_terms_hash(),
+                authorization.payment_terms_hash == self.funding.channel.payment_terms_hash(),
             ),
             ("bond_edge", authorization.bond_edge == terms.bond_edge),
             (
@@ -971,9 +947,9 @@ impl ChannelState {
                 Err(ChannelStateError::Malformed)
             };
         }
-        let bundle = PreparedPaidWorkInput::decode(prepared_input, MAX_RECORD_BYTES)
+        let bundle = PreparedWorkInput::decode(prepared_input, MAX_RECORD_BYTES)
             .map_err(PaidWorkError::from)?;
-        if bundle.digest(&self.channel)?.as_bytes()
+        if bundle.digest(&self.funding.channel)?.as_bytes()
             != authorization.prepared_input_digest.as_bytes()
         {
             return Err(ChannelStateError::Record(PaidWorkError::Mismatch {
@@ -995,11 +971,11 @@ impl ChannelState {
         for (field, holds) in [
             (
                 "close start payment_edge",
-                start.payment_edge() == self.channel.payment_edge(),
+                start.payment_edge() == self.funding.channel.payment_edge(),
             ),
             (
                 "close start payment_terms_hash",
-                start.terms().hash() == self.channel.payment_terms_hash(),
+                start.terms().hash() == self.funding.channel.payment_terms_hash(),
             ),
             (
                 "close start opener_role",
@@ -1023,14 +999,14 @@ impl ChannelState {
 
     fn apply_proposed<V: SigVerifier>(
         &mut self,
-        authorization: &PaidJobAuthorizationV1,
+        authorization: &PaidJobAuthorizationV2,
         client_signature: Sig,
         prepared_input: &[u8],
         verifier: &V,
         metadata_only: bool,
     ) -> Result<Applied, ChannelStateError> {
-        let work_id = work_id(&self.channel, authorization);
-        if let Some(job) = self.jobs.get(&work_id) {
+        let work_id = work_id(&self.funding.channel, authorization);
+        if let Some(job) = self.book.jobs.get(&work_id) {
             if job.authorization == *authorization
                 && job.client_signature == client_signature
                 && job.prepared_input == prepared_input
@@ -1042,14 +1018,14 @@ impl ChannelState {
                 phase: job.phase.name(),
             });
         }
-        self.refuse_if_terminated(work_id, "proposing a job")?;
+        self.book.refuse_if_terminated(work_id, "proposing a job")?;
         // A closing channel takes no new work. The close is built from
         // what is held now, so a job admitted after it would be a job
         // whose payment no close could carry.
         self.refuse_if_closing("proposing a job")?;
 
         self.check_authorization(authorization, prepared_input, metadata_only)?;
-        if authorization.proposal_nonce <= self.proposal_nonce_high_water {
+        if authorization.proposal_nonce <= self.book.proposal_nonce_high_water {
             return Err(ChannelStateError::WrongChannel {
                 field: "proposal_nonce",
             });
@@ -1063,15 +1039,12 @@ impl ChannelState {
 
         // Compute credit is the provider's exposure and only the
         // provider's: the client is the party that would default on it.
-        // The provider checks the one job's price against its limit
-        // before it co-signs; there is no cross-job total to accumulate,
-        // because there is no second job.
+        // Every active job contributes to the reserved total before co-signing.
         if self.role == Role::Provider {
             self.check_compute_limit(authorization.price)?;
         }
 
-        self.jobs.insert(
-            work_id,
+        self.book.propose(
             JobState {
                 authorization: *authorization,
                 work_id,
@@ -1082,9 +1055,8 @@ impl ChannelState {
                 result: None,
                 transcript: Vec::new(),
             },
-        );
-        self.proposal_nonce_high_water = authorization.proposal_nonce;
-        Ok(Applied::Changed)
+            self.role,
+        )
     }
 
     fn apply_accepted<V: SigVerifier>(
@@ -1093,7 +1065,7 @@ impl ChannelState {
         provider_signature: Sig,
         verifier: &V,
     ) -> Result<Applied, ChannelStateError> {
-        let mut job = self.open_job(work_id, "co-signing a job")?;
+        let job = self.book.open_job(work_id, "co-signing a job")?;
         if job.provider_signature == Some(provider_signature) {
             return Ok(Applied::Redundant);
         }
@@ -1103,14 +1075,14 @@ impl ChannelState {
                 phase: job.phase.name(),
             });
         }
-        let (height, _) = self.cursor;
+        let (height, _) = self.funding.cursor;
         // The provider must journal its signature before the deadline. The
         // client may recover that already released signature after a lost
         // response; recording evidence does not authorize new provider work.
         if self.role == Role::Provider && height > job.authorization.acceptance_deadline {
             return Err(ChannelStateError::AcceptanceLate {
-                height,
-                deadline: job.authorization.acceptance_deadline,
+                now: FinalizedHeight(height).diagnostic(),
+                deadline: FinalizedHeight(job.authorization.acceptance_deadline).diagnostic(),
             });
         }
         if !verifier.verify_sig(
@@ -1123,35 +1095,18 @@ impl ChannelState {
                 party: "the provider",
             });
         }
-        job.provider_signature = Some(provider_signature);
-        job.phase = JobPhase::Accepted;
-        self.jobs.insert(work_id, job);
-        Ok(Applied::Changed)
+        self.book.accept(
+            work_id,
+            provider_signature,
+            FinalizedHeight(height),
+            self.role,
+        )
     }
 
     fn apply_running(&mut self, work_id: Digest) -> Result<Applied, ChannelStateError> {
         self.require_role("a running marker", Role::Provider)?;
-        let mut job = self.open_job(work_id, "a running marker")?;
-        match job.phase {
-            JobPhase::Running | JobPhase::Streaming => return Ok(Applied::Redundant),
-            JobPhase::Accepted => {}
-            phase => {
-                return Err(ChannelStateError::WrongPhase {
-                    step: "a running marker",
-                    phase: phase.name(),
-                });
-            }
-        }
-        let (height, _) = self.cursor;
-        if height > job.authorization.terminal_deadline {
-            return Err(ChannelStateError::DispatchLate {
-                height,
-                deadline: job.authorization.terminal_deadline,
-            });
-        }
-        job.phase = JobPhase::Running;
-        self.jobs.insert(work_id, job);
-        Ok(Applied::Changed)
+        self.book
+            .run(work_id, FinalizedHeight(self.funding.cursor.0))
     }
 
     /// Records the provider's signed result and the transcript it
@@ -1178,7 +1133,7 @@ impl ChannelState {
         verifier: &V,
         metadata_only: bool,
     ) -> Result<Applied, ChannelStateError> {
-        let mut job = self.open_job(work_id, "recording a result")?;
+        let job = self.book.open_job(work_id, "recording a result")?;
         if let Some((held, signature)) = &job.result {
             if held == result && *signature == provider_signature && job.transcript == transcript {
                 return Ok(Applied::Redundant);
@@ -1190,7 +1145,7 @@ impl ChannelState {
         // A running marker proves only that the backend may have been
         // invoked. If this process did not make that invocation, no
         // result it could produce now is evidence about it.
-        if self.indeterminate.contains_key(&work_id) {
+        if self.book.indeterminate.contains(&work_id) {
             return Err(ChannelStateError::Indeterminate);
         }
         // The provider may only record a result for an invocation it
@@ -1222,7 +1177,7 @@ impl ChannelState {
         // anyway would make it a result the ending ledger charges this
         // client for. Late compute is the provider's own loss, and this
         // is where that is decided.
-        let (height, _) = self.cursor;
+        let (height, _) = self.funding.cursor;
         if height > job.authorization.terminal_deadline {
             return Err(ChannelStateError::ReceiptLate {
                 height,
@@ -1234,22 +1189,15 @@ impl ChannelState {
         if !verifier.verify_sig(
             provider_signature,
             self.provider_key(),
-            signing_hash(result_digest(&self.channel, result)),
+            signing_hash(result_digest(&self.funding.channel, result)),
         ) {
             return Err(ChannelStateError::BadSignature {
                 slot: "result",
                 party: "the provider",
             });
         }
-        job.result = Some((*result, provider_signature));
-        job.transcript = transcript.to_vec();
-        job.phase = if job.phase == JobPhase::Streaming {
-            JobPhase::Delivered
-        } else {
-            JobPhase::Ready
-        };
-        self.jobs.insert(work_id, job);
-        Ok(Applied::Changed)
+        self.book
+            .record_result(work_id, *result, provider_signature, transcript.to_vec())
     }
 
     /// Records that this client's own re-execution reproduced the answer
@@ -1264,25 +1212,12 @@ impl ChannelState {
     /// decided at different heights.
     fn apply_matched(&mut self, work_id: Digest) -> Result<Applied, ChannelStateError> {
         self.require_role("recording a reproduction match", Role::Client)?;
-        let mut job = self.open_job(work_id, "recording a reproduction match")?;
-        match job.phase {
-            JobPhase::Matched => return Ok(Applied::Redundant),
-            JobPhase::Ready => {}
-            phase => {
-                return Err(ChannelStateError::WrongPhase {
-                    step: "recording a reproduction match",
-                    phase: phase.name(),
-                });
-            }
-        }
-        job.phase = JobPhase::Matched;
-        self.jobs.insert(work_id, job);
-        Ok(Applied::Changed)
+        self.book.mark_matched(work_id)
     }
 
     fn apply_plaintext(&mut self, work_id: Digest) -> Result<Applied, ChannelStateError> {
         self.require_role("releasing plaintext", Role::Provider)?;
-        let mut job = self.open_job(work_id, "releasing plaintext")?;
+        let job = self.book.open_job(work_id, "releasing plaintext")?;
         if job.phase.delivered() {
             return Ok(Applied::Redundant);
         }
@@ -1293,13 +1228,7 @@ impl ChannelState {
             });
         }
         self.check_delivery_limit(job.authorization.price)?;
-        job.phase = if job.phase == JobPhase::Running {
-            JobPhase::Streaming
-        } else {
-            JobPhase::Delivered
-        };
-        self.jobs.insert(work_id, job);
-        Ok(Applied::Changed)
+        self.book.release(work_id)
     }
 
     /// Records the permanent terminal for the named job.
@@ -1321,7 +1250,7 @@ impl ChannelState {
         // re-committing the same outcome must be the retry it is rather
         // than a second job's terminal or a step a closed job cannot
         // take. Answered before the open-job rule below for that reason.
-        if let Some(held) = self.terminals.get(&work_id) {
+        if let Some(held) = self.book.terminals.get(&work_id) {
             if held.outcome == *outcome {
                 return Ok(Applied::Redundant);
             }
@@ -1330,13 +1259,14 @@ impl ChannelState {
                 outcome: held.outcome.name(),
             });
         }
-        if matches!(outcome, TerminalOutcome::Certified { .. }) && !self.jobs.contains_key(&work_id)
+        if matches!(outcome, TerminalOutcome::Certified { .. })
+            && !self.book.jobs.contains_key(&work_id)
         {
             return Err(ChannelStateError::WrongChannel {
                 field: "binding work_id",
             });
         }
-        let job = self.open_job(work_id, "terminating the job")?;
+        let job = self.book.open_job(work_id, "terminating the job")?;
         match outcome {
             TerminalOutcome::Certified {
                 certificate,
@@ -1371,12 +1301,12 @@ impl ChannelState {
                 // The refuted digest is this job's own signed result's,
                 // not a number the record chose: a refutation is a
                 // statement about the result the delivery recorded.
-                if named.as_bytes() != result_digest(&self.channel, result).as_bytes() {
+                if named.as_bytes() != result_digest(&self.funding.channel, result).as_bytes() {
                     return Err(ChannelStateError::WrongChannel {
                         field: "refuted result_digest",
                     });
                 }
-                self.rest_at(JobTerminal {
+                self.book.rest_at(JobTerminal {
                     work_id: job.work_id,
                     phase: job.phase,
                     outcome: TerminalOutcome::Refuted {
@@ -1389,7 +1319,7 @@ impl ChannelState {
             TerminalOutcome::Expired { .. }
             | TerminalOutcome::Failed { .. }
             | TerminalOutcome::Indeterminate => {
-                self.rest_at(JobTerminal {
+                self.book.rest_at(JobTerminal {
                     work_id: job.work_id,
                     phase: job.phase,
                     outcome: outcome.clone(),
@@ -1442,7 +1372,7 @@ impl ChannelState {
         // is the only step left, and whichever terminal reaches the disk
         // first is the one that happened.
         if self.role == Role::Client {
-            let (height, _) = self.cursor;
+            let (height, _) = self.funding.cursor;
             if height > job.authorization.payment_deadline {
                 return Err(ChannelStateError::PaymentLate {
                     height,
@@ -1454,7 +1384,7 @@ impl ChannelState {
             (
                 "binding",
                 binding_signature,
-                signing_hash(payment_binding_digest(&self.channel, binding)),
+                signing_hash(payment_binding_digest(&self.funding.channel, binding)),
             ),
             (
                 "certificate",
@@ -1474,15 +1404,15 @@ impl ChannelState {
         // consensus sees. It runs here, on commit and on replay both,
         // over the job this journal itself recorded.
         self.ledger.credit_payment(
-            &self.channel,
+            &self.funding.channel,
             &job.authorization,
             &result,
             binding,
             certificate,
-            self.settlement,
+            self.funding.settlement,
         )?;
 
-        self.rest_at(JobTerminal {
+        self.book.rest_at(JobTerminal {
             work_id: job.work_id,
             phase: job.phase,
             outcome: TerminalOutcome::Certified {
@@ -1495,21 +1425,11 @@ impl ChannelState {
         Ok(Applied::Changed)
     }
 
-    /// Installs this channel's one permanent terminal and closes the job.
-    fn rest_at(&mut self, terminal: JobTerminal) {
-        let work_id = terminal.work_id;
-        self.jobs.remove(&work_id);
-        self.indeterminate.remove(&work_id);
-        self.terminals.insert(work_id, terminal);
-    }
-
-    /// Checks the one job's price against the compute limit.
-    ///
-    /// There is no cross-job total to accumulate: the channel admits one
-    /// job, so a price that fits the limit is the whole of what fits.
+    /// Reserves this job's price against the channel's outstanding compute credit.
     fn check_compute_limit(&self, price: u64) -> Result<(), ChannelStateError> {
-        let limit = self.channel.channel_policy().compute_credit_limit;
+        let limit = self.funding.channel.channel_policy().compute_credit_limit;
         let reserved = self
+            .book
             .jobs
             .values()
             .map(|job| job.authorization.price)
@@ -1528,8 +1448,9 @@ impl ChannelState {
 
     /// Checks the one job's price against the delivery limit.
     fn check_delivery_limit(&self, price: u64) -> Result<(), ChannelStateError> {
-        let limit = self.channel.channel_policy().delivery_credit_limit;
+        let limit = self.funding.channel.channel_policy().delivery_credit_limit;
         let reserved = self
+            .book
             .jobs
             .values()
             .filter(|job| job.phase.delivered())

@@ -178,7 +178,13 @@ fn apple_open_response_for_alpn(
         installation_nonce: [4; 32],
     };
     let genesis = SignedProviderGenesis {
-        root_proof: RootProof::AppleAppAttest(Vec::new()),
+        root_proof: RootProof::AppleAppAttest(apple_assertion(
+            &signing_key,
+            apple_app_id_hash("TESTTEAM.example.app"),
+            cd_hash,
+            1,
+            &hellas_attestation::apple_client_data_hash(&statement.canonical_bytes()),
+        )),
         statement,
     };
     let bundle = ProviderEnrollmentBundle {
@@ -303,7 +309,7 @@ fn apple_open_rejects_genesis_key_that_differs_from_registered_credential() {
     assert!(
         error
             .to_string()
-            .contains("does not match its chain-verified credential")
+            .contains("root assertion or credential is invalid")
     );
 }
 

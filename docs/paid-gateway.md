@@ -11,10 +11,6 @@ config must select the HTTP Fetch manifest and a matching Fetch route policy;
 see [HTTP routing](http-gateway.md). The HTTP router chooses the provider and
 account, so this path never falls back to a different provider or funding source.
 
-Paid Fetch extends the Work/WorkSetup service descriptors and the StreamResult
-response schema. Upgrade gateways and providers together: older peers reject
-the changed wire IDs. The on-chain payment certificate format is unchanged.
-
 The pool file uses the provider's existing `--work-config` policy and chain
 configuration:
 
@@ -25,6 +21,7 @@ configuration:
       "work_config": "/srv/hellas/provider-a-work.json",
       "journal_root": "/var/lib/hellas-gateway/provider-a",
       "provider": "PROVIDER_ENDPOINT_ID",
+      "provider_genesis": "PROVIDER_ENROLLMENT_CONTENT_ID",
       "provider_addrs": ["192.0.2.10:31145"],
       "bond": "PROVIDER_BOND_EDGE_HEX",
       "payment_coins": ["CLIENT_PAYMENT_COIN_HEX"],
@@ -39,11 +36,24 @@ configuration:
 }
 ```
 
-For `--assurance apple-app-attest`, each pool entry also needs
-`provider_genesis` (hex enrollment ContentId), `apple_app_id`, and
-`apple_cd_hashes` (an array of hex 32-byte hashes). Setup and work connections
-verify this anchor before disclosing requests. Producer-signed entries may also
-pin `provider_genesis`; their funded bond fixes the settlement identity in all cases.
+Every pool entry requires `provider_genesis`: either the enrollment ContentId
+or the signed offer object emitted by `hellas-cli provision`. The offer includes
+the provider enrollment, signed bond proposal and address hints. Its settlement
+key signs the entire offer and must equal the enrollment's producer. Import
+checks the configured network, bond and transport identity, then derives the
+pin. Empty `provider_addrs` uses the signed offer's address hints.
+
+For `--assurance apple-app-attest`, each entry also needs an independently
+trusted `apple_app_id` and `apple_cd_hashes` (hex 32-byte hashes). The offer cannot
+supply its own allowed software. Every Work and WorkSetup connection performs
+Open before disclosing requests, for both producer-signed and App Attest policy.
+
+Bond or chain discovery distributes this same signed offer as an off-chain
+artifact. The consumer compares its network and bond to the discovered record;
+the signed proposal and enclosing settlement signature bind the enrollment to
+that bond's maker. Endpoint advertisements alone never establish an enrollment
+pin. Chain validation and finalized funding checks still occur during setup.
+No enrollment data is added to on-chain transactions.
 
 Provision provider bonds with `hellas-cli provision`; coin
 values and policy terms must agree with the provider work config. Payment coins
@@ -55,8 +65,9 @@ The provider's route table must authorize the gateway transport and settlement
 identities. All participants must use the same compatible chain revision.
 
 Pass the environment, tokenizer, model label, `--default-max-tokens`, and
-`--stop-token` options as for an ordinary gateway. A paid execution policy fixes
-the environment, maximum output tokens, stop IDs, and price per job. Requests
+`--stop-token` options as for an ordinary gateway. The work policy fixes
+the environment, maximum output tokens and stop IDs; separate payment terms
+fix the price per job. Requests
 may request a shorter output within the configured ceiling. Model presentation
 lives in the shared `hellas-presentation` adapter, usable by clients and the
 gateway. Select `--chat-template qwen3` for chat messages and function tools;
@@ -232,7 +243,7 @@ routes, archive policy, listener authentication and optional process wrapping;
 they have no model, tokenizer, inference cache or Evaluate settings. Shutting
 down the returned handle drains accepted paid work. Failed startup also drains
 recovery tasks. A host using the pool without a gateway must call its
-`PaidExecutionBackend::drain` method when shutting down.
+`WorkExecutionBackend::drain` method when shutting down.
 
 `paid-client` enables sessions without the executor or upstream-provider
 crates. `paid-provider` enables the provider runner and provisioning. Both

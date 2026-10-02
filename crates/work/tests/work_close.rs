@@ -37,7 +37,7 @@ use hellas_rpc::protocol::artifacts::{
     SourceRef, TextArtifact, TextExecution, TextPolicy, TokenIds,
 };
 use hellas_rpc::protocol::work::{
-    JobDeadlines, PaidChannelPolicyV1, PaidExecutionPolicyV1, PaidJobAuthorizationV1,
+    EvaluatePolicyV2, JobDeadlines, PaidChannelPolicyV1, PaidJobAuthorizationV2,
     PrivateRecord as _, generation_policy_digest, identity_source_digest,
     private_policy_commitment, propose_authorization, signing_hash, work_id,
 };
@@ -53,8 +53,8 @@ use hellas_rpc::{
 use hellas_wire::mux::MuxTransport;
 use hellas_wire::{Dispatcher, StreamTransport};
 use hellas_work::work::{
-    BackendFault, ClientEndpoint, CloseEndpoint, PaidWorkBackend, PaymentError,
-    PreparedEvaluateInput, ProviderEndpoint, RunOutcome, WorkService, admit_payment, fetch_result,
+    BackendFault, ClientEndpoint, CloseEndpoint, PaymentError, PreparedEvaluateInput,
+    ProviderEndpoint, RunOutcome, WorkBackend, WorkService, admit_payment, fetch_result,
     run_accepted_work,
 };
 use hellas_work::work_close::{
@@ -139,8 +139,8 @@ fn payment_terms() -> WorkPaymentTerms {
 }
 
 /// The execution policy every job here runs under.
-fn execution_policy() -> PaidExecutionPolicyV1 {
-    PaidExecutionPolicyV1 {
+fn work_policy() -> EvaluatePolicyV2 {
+    EvaluatePolicyV2 {
         allowed_environment: manifest().content_id(),
         generation_policy_digest: match generation_policy_digest(&text_policy().canonical_bytes()) {
             Ok(digest) => digest,
@@ -156,11 +156,7 @@ fn execution_policy() -> PaidExecutionPolicyV1 {
         max_stop_token_ids: 4,
         max_spool_bytes: 1_048_576,
         max_encoded_result_frame: WIDE_FRAME,
-        max_encoded_quote_response: 1_048_576,
-        dispatch_margin_blocks: 4,
-        delivery_margin_blocks: 2,
-        oracle_grace_blocks: 6,
-        fixed_price: PRICE,
+        max_encoded_prepared_input: 1_048_576,
     }
 }
 
@@ -170,12 +166,13 @@ fn payment_values() -> EdgeValues {
 
 fn descriptor() -> WorkChannelDescriptor {
     let config = WorkChannelConfig {
+        payment_policy: payment_policy(),
         network: network(),
         payment_edge: payment_edge(),
         payment_terms: payment_terms(),
         policy_salt: SALT,
         channel_policy: channel_policy(),
-        execution_policy: execution_policy().into(),
+        work_policy: work_policy().into(),
         expected_payment_values: payment_values(),
     };
     match WorkChannelDescriptor::open(config) {
@@ -297,10 +294,11 @@ fn bundle(nonce: u8) -> PreparedPaidInputV1 {
     )
 }
 
-fn authorization() -> PaidJobAuthorizationV1 {
+fn authorization() -> PaidJobAuthorizationV2 {
     match propose_authorization(
         ready().channel(),
-        &execution_policy(),
+        &work_policy(),
+        &payment_policy(),
         &bundle(NONCE),
         u64::from(NONCE),
         deadlines(),
@@ -386,7 +384,7 @@ impl AnsweringBackend {
     }
 }
 
-impl PaidWorkBackend for AnsweringBackend {
+impl WorkBackend for AnsweringBackend {
     fn evaluate(
         &self,
         input: PreparedEvaluateInput,
@@ -621,7 +619,8 @@ fn observe_one(service: &WorkService, applied: &FinalizedWork) -> Result<(), Cat
 fn signed_request(nonce: u8, proposal_nonce: u64) -> AcceptWorkRequest {
     let authorization = match propose_authorization(
         ready().channel(),
-        &execution_policy(),
+        &work_policy(),
+        &payment_policy(),
         &bundle(nonce),
         proposal_nonce,
         deadlines(),
@@ -633,6 +632,9 @@ fn signed_request(nonce: u8, proposal_nonce: u64) -> AcceptWorkRequest {
         panic!("the fixture bundle encodes");
     };
     AcceptWorkRequest {
+        route: Some(hellas_rpc::pb::work::WorkRoute::payment(
+            authorization.channel_id,
+        )),
         authorization: authorization.encode(),
         client_signature: client()
             .sign(signing_hash(work_id(ready().channel(), &authorization)))
@@ -4099,4 +4101,13 @@ async fn an_answer_that_is_built_is_sampled_and_one_that_is_refused_is_not() {
         1,
         "an answer that was not built is not an answer that took any time",
     );
+}
+
+fn payment_policy() -> hellas_rpc::protocol::work::JobPaymentPolicyV2 {
+    hellas_rpc::protocol::work::JobPaymentPolicyV2 {
+        fixed_price: PRICE,
+        dispatch_margin_blocks: 4,
+        delivery_margin_blocks: 2,
+        oracle_grace_blocks: 6,
+    }
 }

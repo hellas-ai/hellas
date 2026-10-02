@@ -2,7 +2,7 @@
 
 use crate::paid_client::{
     PaidClientError, PaidWorkOptions, PaidWorkResult, PaidWorkSession, bind_paid_endpoint,
-    check_evaluate_input,
+    check_evaluate_input, check_request,
 };
 use hellas_kernel::Secp256k1Signer;
 use hellas_rpc::protocol::artifacts::PreparedPaidInputV1;
@@ -20,15 +20,10 @@ type Result<T, E = PoolError> = std::result::Result<T, E>;
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use hellas_gateway::{
-    ExecutionEvent, Outcome, PaidExecutionBackend, PaidExecutionRequest, PaidFetchRequest,
-    StopReason,
+    ExecutionEvent, Outcome, WorkExecutionBackend, WorkExecutionRequest, WorkFetchRequest,
 };
 use hellas_rpc::output::OutputEvent as FetchEvent;
-use hellas_rpc::protocol::artifacts::{
-    BoundTermId, InputAddressed as _, OutputAddressed as _, SourceRef, TextArtifact, TextExecution,
-    TextPolicy, TokenIds,
-};
-use hellas_rpc::protocol::work_profile::{PaidWorkPolicy, PreparedPaidWorkInput};
+use hellas_rpc::protocol::work_profile::{PreparedWorkInput, WorkPolicy};
 use iroh::Endpoint;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -49,11 +44,10 @@ const PROVIDER_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 const RECOVERY_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
 // Bound queueing for Evaluate routes that can try another funded provider.
 const CHANNEL_QUEUE_BUDGET: Duration = Duration::from_secs(1);
-// Bound HTTP delivery independently of the authenticated transcript spool.
-const OUTPUT_BUFFER_BYTES: usize = 2 * MAX_RECORD_BYTES;
-const OUTPUT_EVENT_OVERHEAD: usize = 1024;
-const OUTPUT_BUFFER_EVENTS: usize = OUTPUT_BUFFER_BYTES / OUTPUT_EVENT_OVERHEAD;
-type BufferedEvent<E = ExecutionEvent> = (Result<E>, OwnedSemaphorePermit);
+#[cfg(test)]
+use crate::gateway_work::OUTPUT_EVENT_OVERHEAD;
+use crate::gateway_work::{OUTPUT_BUFFER_BYTES, OUTPUT_BUFFER_EVENTS};
+type BufferedEvent<E = ExecutionEvent> = crate::gateway_work::BufferedEvent<E, PoolError>;
 
 trait GatewayEvent: Send + 'static {
     fn prefix(event: hellas_rpc::OutputEventEnvelope) -> Result<Self>
@@ -69,7 +63,6 @@ trait GatewayEvent: Send + 'static {
 struct Provider {
     args: PaidWorkOptions,
     policy: ProviderChannelPolicy,
-    assurance: hellas_rpc::Assurance,
     /// A setup/channel journal has a single owner even with concurrent HTTP calls.
     serial: AsyncMutex<Option<PaidWorkSession>>,
     pending: AtomicUsize,
@@ -215,12 +208,6 @@ impl PaidGateway {
             .map(|args| {
                 Arc::new(Provider {
                     policy: args.config.provider_policy(),
-                    assurance: args
-                        .provider_trust
-                        .as_ref()
-                        .map_or(hellas_rpc::Assurance::ProducerSigned, |trust| {
-                            trust.required_assurance
-                        }),
                     args,
                     serial: AsyncMutex::new(None),
                     pending: AtomicUsize::new(0),
@@ -265,13 +252,13 @@ impl PaidGateway {
 impl PaidGateway {
     fn execute_tokens(
         &self,
-        request: PaidExecutionRequest,
+        request: WorkExecutionRequest,
     ) -> Result<BoxStream<'static, Result<ExecutionEvent>>> {
         let permit = self
             .admission
             .clone()
             .try_acquire_owned()
-            .map_err(|_| hellas_gateway::PaidGatewayBusy)?;
+            .map_err(|_| hellas_gateway::WorkGatewayBusy)?;
         let input_ids = request.input_ids.clone();
         let cache_update = CacheUpdate::from_request(&request.environment, &input_ids);
         let prepared = prepare_request(request, &self.settlement_key)?;
@@ -310,7 +297,7 @@ impl PaidGateway {
     fn submit<E: GatewayEvent>(
         &self,
         candidates: Vec<(Arc<Provider>, Route)>,
-        prepared: Option<PreparedPaidWorkInput>,
+        prepared: Option<PreparedWorkInput>,
         cache_update: Option<CacheUpdate>,
         recovery_timeout: Option<Duration>,
         permit: Option<OwnedSemaphorePermit>,
@@ -319,7 +306,7 @@ impl PaidGateway {
         // gate check and registration with drain's close-and-snapshot boundary.
         let mut tasks = self.tasks.lock().expect("paid task list poisoned");
         if self.admission.is_closed() {
-            return Err(hellas_gateway::PaidGatewayBusy.into());
+            return Err(hellas_gateway::WorkGatewayBusy.into());
         }
         let endpoint = self.endpoint.clone();
         let settlement_key = self.settlement_key.clone();
@@ -358,7 +345,7 @@ impl PaidGateway {
                 Ok(())
             });
             let result = async {
-                let prepared_bytes = prepared.as_ref().map(PreparedPaidWorkInput::encode).transpose()?;
+                let prepared_bytes = prepared.as_ref().map(PreparedWorkInput::encode).transpose()?;
                 let mut provider_errors = Vec::new();
                 for (provider, route) in candidates {
                     let _occupied = occupied.take().or_else(|| {
@@ -368,7 +355,7 @@ impl PaidGateway {
                     task_span.record("hellas.route.cache_affinity_tokens", route.cache_affinity_tokens);
                     task_span.record("hellas.route.pending", route.pending);
                     // Serialize jobs on one funded channel; its observer runs independently.
-                    let mut session = if recovery || matches!(prepared, Some(PreparedPaidWorkInput::Fetch(_))) {
+                    let mut session = if recovery || matches!(prepared, Some(PreparedWorkInput::Fetch(_))) {
                         before_proposal(
                             &sender, streamed, deadline,
                             |_| provider.serial.lock().instrument(hellas_rpc::request_span!(target: "hellas_request", "paid.queue")),
@@ -543,42 +530,33 @@ fn has_retained_setup(options: &PaidWorkOptions) -> Result<bool> {
         }))
 }
 
-impl PaidExecutionBackend for PaidGateway {
+impl WorkExecutionBackend for PaidGateway {
     fn fetch_providers(&self) -> Vec<EndpointId> {
-        self.providers.iter().filter(|provider| matches!(provider.policy.execution_policy,
-            PaidWorkPolicy::Fetch { policy, .. } if policy.allowed_environment == hellas_rpc::FetchEnvironment::Http.manifest_id()))
+        self.providers.iter().filter(|provider| matches!(provider.policy.work_policy,
+            WorkPolicy::Fetch { policy, .. } if policy.allowed_environment == hellas_rpc::FetchEnvironment::Http.manifest_id()))
             .map(|provider| provider.args.provider).collect()
     }
 
     fn fetch(
         &self,
-        request: PaidFetchRequest,
-    ) -> Result<hellas_gateway::PaidFetchStream, hellas_gateway::PaidGatewayError> {
-        use hellas_gateway::PaidGatewayError;
-        let provider = self.providers.iter().find(|provider| provider.args.provider == request.provider
-            && matches!(provider.policy.execution_policy, PaidWorkPolicy::Fetch { policy, .. }
-                if policy.allowed_environment == hellas_rpc::FetchEnvironment::Http.manifest_id()))
-            .ok_or(PaidGatewayError::Provider(request.provider))?;
+        request: WorkFetchRequest,
+    ) -> Result<hellas_gateway::WorkFetchStream, hellas_gateway::WorkGatewayError> {
+        use hellas_gateway::WorkGatewayError;
+        let provider = self
+            .providers
+            .iter()
+            .find(|provider| {
+                provider.args.provider == request.provider
+                    && matches!(provider.policy.work_policy, WorkPolicy::Fetch { .. })
+            })
+            .ok_or(WorkGatewayError::Provider(request.provider))?;
         let permit = self
             .admission
             .clone()
             .try_acquire_owned()
-            .map_err(|_| hellas_gateway::PaidGatewayBusy)?;
+            .map_err(|_| hellas_gateway::WorkGatewayBusy)?;
         let submit = || -> Result<_> {
-            let environment = hellas_rpc::FetchEnvironment::Http;
-            let input = hellas_rpc::fetch::build_input_events_with_retention(
-                &request.service,
-                &request.method,
-                &request.body,
-                environment.manifest_id(),
-                provider.assurance,
-                &self.producer_key,
-                hellas_rpc::Retention::Ephemeral,
-            )?;
-            let prepared = hellas_rpc::protocol::work_fetch::PreparedPaidFetchInputV1::new(
-                &input,
-                &environment.manifest(),
-            )?;
+            let prepared = prepare_fetch(&provider.args, &request, &self.producer_key)?;
             let route = Route {
                 available: provider.available(),
                 cache_affinity_tokens: 0,
@@ -588,7 +566,7 @@ impl PaidExecutionBackend for PaidGateway {
             // provider, including on failure before acceptance.
             self.submit::<FetchEvent>(
                 vec![(provider.clone(), route)],
-                Some(prepared.into()),
+                Some(prepared),
                 None,
                 None,
                 Some(permit),
@@ -607,8 +585,8 @@ impl PaidExecutionBackend for PaidGateway {
 
     fn execute(
         &self,
-        request: PaidExecutionRequest,
-    ) -> Result<hellas_gateway::PaidOutputStream<ExecutionEvent>, hellas_gateway::PaidGatewayError>
+        request: WorkExecutionRequest,
+    ) -> Result<hellas_gateway::WorkOutputStream<ExecutionEvent>, hellas_gateway::WorkGatewayError>
     {
         paid_stream(self.execute_tokens(request))
     }
@@ -653,12 +631,12 @@ impl PaidExecutionBackend for PaidGateway {
 
 fn paid_stream<E: Send + 'static>(
     stream: Result<BoxStream<'static, Result<E>>>,
-) -> Result<hellas_gateway::PaidOutputStream<E>, hellas_gateway::PaidGatewayError> {
+) -> Result<hellas_gateway::WorkOutputStream<E>, hellas_gateway::WorkGatewayError> {
     use futures::StreamExt as _;
-    fn convert(error: PoolError) -> hellas_gateway::PaidGatewayError {
+    fn convert(error: PoolError) -> hellas_gateway::WorkGatewayError {
         match error {
             PoolError::Busy(busy) => busy.into(),
-            error => hellas_gateway::PaidGatewayError::Payment(Box::new(error)),
+            error => hellas_gateway::WorkGatewayError::Execution(Box::new(error)),
         }
     }
     Ok(Box::pin(
@@ -672,54 +650,18 @@ fn emit<E: GatewayEvent>(
     budget: &Arc<Semaphore>,
     event: Result<E>,
 ) {
-    if *overflow.borrow() || sender.is_closed() {
-        return;
-    }
     let bytes = match &event {
         Ok(event) => event.bytes(),
         Err(error) => error.to_string().len(),
-    }
-    .saturating_add(OUTPUT_EVENT_OVERHEAD);
-    let permits = u32::try_from(bytes)
-        .ok()
-        .and_then(|bytes| budget.clone().try_acquire_many_owned(bytes).ok());
-    let Some(permits) = permits else {
-        overflow.send_replace(true);
-        return;
     };
-    if matches!(
-        sender.try_send((event, permits)),
-        Err(mpsc::error::TrySendError::Full(_))
-    ) {
-        overflow.send_replace(true);
-    }
+    crate::gateway_work::emit(sender, overflow, budget, event, bytes);
 }
 
 fn response_stream<E: Send + 'static>(
-    mut receiver: mpsc::Receiver<BufferedEvent<E>>,
-    mut overflow: watch::Receiver<bool>,
+    receiver: mpsc::Receiver<BufferedEvent<E>>,
+    overflow: watch::Receiver<bool>,
 ) -> BoxStream<'static, Result<E>> {
-    Box::pin(async_stream::try_stream! {
-        loop {
-            let full = *overflow.borrow();
-            if full {
-                receiver.close();
-                Err(PoolError::SlowConsumer)?;
-            }
-            let event = tokio::select! {
-                biased;
-                _ = overflow.changed(), if overflow.has_changed().is_ok() => continue,
-                event = receiver.recv() => event,
-            };
-            match event {
-                Some((event, permit)) => {
-                    drop(permit);
-                    yield event?;
-                },
-                None => return,
-            }
-        }
-    })
+    crate::gateway_work::response_stream(receiver, overflow, || PoolError::SlowConsumer)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -778,41 +720,51 @@ async fn before_proposal<T, F: std::future::Future<Output = T>, E>(
     result.map_err(|_| RequestStopped::Deadline.into())
 }
 
+fn prepare_fetch(
+    options: &PaidWorkOptions,
+    request: &WorkFetchRequest,
+    signer: &hellas_rpc::ProducerSigningKey,
+) -> Result<PreparedWorkInput> {
+    use hellas_rpc::FetchEnvironment;
+    let environment = [
+        FetchEnvironment::Http,
+        FetchEnvironment::OpenAiResponses,
+        FetchEnvironment::CodexResponses,
+    ]
+    .into_iter()
+    .find(|env| env.manifest_id() == options.config.work_policy.allowed_environment())
+    .ok_or(PoolError::NoMatchingPolicy)?;
+    let input = hellas_rpc::fetch::build_input_events_with_retention(
+        &request.service,
+        &request.method,
+        &request.body,
+        environment.manifest_id(),
+        options.provider_trust.required_assurance,
+        signer,
+        hellas_rpc::Retention::Ephemeral,
+    )?;
+    let prepared = hellas_rpc::protocol::work_fetch::PreparedPaidFetchInputV1::new(
+        &input,
+        &environment.manifest(),
+    )?
+    .into();
+    check_request(
+        &options.config.provider_policy(),
+        &prepared,
+        &options.provider_trust,
+        signer.public_key(),
+    )?;
+    Ok(prepared)
+}
+
 fn prepare_request(
-    request: PaidExecutionRequest,
+    request: WorkExecutionRequest,
     signer: &Secp256k1Signer,
 ) -> Result<PreparedPaidInputV1> {
-    if request.max_new_tokens == 0 {
-        return Err(PoolError::Invalid(
-            "max_new_tokens must be greater than zero",
-        ));
-    }
-    let manifest = request.environment.manifest();
-    hellas_client::execution::validate_causal_lm_invocation(
-        &request.environment,
-        &request.input_ids,
-        request.max_new_tokens,
-        &request.stop_token_ids,
-    )?;
-    let tokens = TokenIds::from_u32s(request.input_ids);
-    let policy = TextPolicy::from_u32_stop_tokens(request.max_new_tokens, request.stop_token_ids);
-    let identity = TextArtifact::identity(BoundTermId::from_digest(manifest.content_id().digest()));
-    let execution = TextExecution::new(
-        SourceRef::output(identity.output_id()),
-        tokens.output_id(),
-        policy.output_id(),
-    );
-    let evaluate = hellas_rpc::EvaluateRequest {
-        text_execution: execution.input_id().digest(),
-        runner_public_key: hellas_rpc::PublicKey::Secp256k1(signer.party_key().to_bytes()),
-        execution_environment: manifest.content_id(),
-        nonce: rand::random(),
-        assurance: hellas_rpc::Assurance::ProducerSigned,
-        retain: true,
-    };
-    Ok(PreparedPaidInputV1::new(
-        &evaluate, &manifest, &execution, &tokens, &policy, &identity,
-    ))
+    Ok(crate::gateway_work::prepare_evaluate(
+        request,
+        hellas_rpc::PublicKey::Secp256k1(signer.party_key().to_bytes()),
+    )?)
 }
 
 fn output_events(output: PaidWorkResult) -> Result<Vec<ExecutionEvent>> {
@@ -831,21 +783,7 @@ fn output_events(output: PaidWorkResult) -> Result<Vec<ExecutionEvent>> {
             tokens: delta.token_bytes(),
         });
     }
-    let terminal = verified.terminal;
-    let stop_reason =
-        if terminal.stop_reason == hellas_rpc::evaluate::EvaluateStopReason::STOP_TOKEN {
-            StopReason::StopToken(terminal.matched_stop_token_id.ok_or(
-                PoolError::MissingOutput("signed stop-token result omitted its token ID"),
-            )?)
-        } else {
-            StopReason::MaxNewTokens
-        };
-    result.push(ExecutionEvent::Done(Outcome::Completed {
-        total_tokens: terminal.usage.billable_units()?,
-        stop_reason,
-        text_artifact: terminal.text_artifact,
-        output_events: events,
-    }));
+    result.push(crate::gateway_work::evaluate_terminal(events)?);
     tracing::info!(
         work_id = %hex::encode(output.work_id.as_bytes()),
         job_price = output.job_price,
@@ -927,7 +865,9 @@ mod tests {
                 journal_root: fixture.root.path().join("client"),
                 provider: iroh::SecretKey::from_bytes(&[3; 32]).public(),
                 provider_addrs: Vec::new(),
-                provider_trust: None,
+                provider_trust: crate::test_support::provider_trust(
+                    iroh::SecretKey::from_bytes(&[3; 32]).public(),
+                ),
                 bond: fixture.descriptor.bond_edge(),
                 payment_funding: Funding::new(
                     List::take([CoinId::from_bytes([1; 32]); 4], 1),
@@ -940,6 +880,46 @@ mod tests {
                 timeout: Duration::from_secs(30),
             }],
         }
+    }
+
+    #[tokio::test]
+    async fn paid_responses_backend_uses_its_manifest_and_refuses_route_mismatch_before_funding() {
+        let fixture = crate::test_support::PaidFixture::new();
+        let options = pool_options(&fixture);
+        let identity = crate::ClientIdentity::from_secret_bytes([1; 32], [1; 32]).unwrap();
+        let provider = options.providers[0].provider;
+        let request = |method: &str| WorkFetchRequest {
+            provider,
+            service: "openai".into(),
+            method: method.into(),
+            body: crate::test_support::BODY.to_vec(),
+        };
+        let prepared = prepare_fetch(
+            &options.providers[0],
+            &request("responses"),
+            identity.caller_key(),
+        )
+        .unwrap();
+        let PreparedWorkInput::Fetch(prepared) = prepared else {
+            panic!("Fetch input")
+        };
+        let input = hellas_rpc::fetch::verify_input_events(
+            &prepared.parts().unwrap().fetch_input_transcript,
+        )
+        .unwrap();
+        assert_eq!(
+            input.execution_environment,
+            hellas_rpc::FetchEnvironment::OpenAiResponses.manifest_id()
+        );
+        let gateway = PaidGateway::open(options, identity).await.unwrap();
+        drop(
+            gateway
+                .fetch(request("responses"))
+                .expect("Responses uses the shared paid backend"),
+        );
+        assert!(gateway.fetch(request("another-route")).is_err());
+        gateway.drain().await;
+        assert!(!fixture.root.path().join("client").exists());
     }
 
     #[test]
