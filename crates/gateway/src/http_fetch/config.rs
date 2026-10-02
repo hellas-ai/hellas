@@ -1,5 +1,4 @@
 use super::{connection_headers, hop_header};
-use anyhow::ensure;
 use axum::{body::Bytes, http::HeaderMap};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use hellas_rpc::http_fetch::{HttpFetchRequest, HttpTls, HttpTrustRoots};
@@ -61,65 +60,66 @@ pub(super) fn public_tls() -> HttpTls {
 }
 
 impl HttpGatewayConfig {
-    pub(super) fn validate(&self) -> anyhow::Result<()> {
-        ensure!(
-            self.routes.is_empty() != self.backends.is_empty(),
-            "configure either HTTP backends or opaque routes"
-        );
-        ensure!(
-            self.max_in_flight > 0 && self.max_in_flight <= 1024,
-            "invalid HTTP concurrency limit"
-        );
+    pub(super) fn validate(&self) -> crate::GatewayResult<()> {
+        if self.routes.is_empty() == self.backends.is_empty() {
+            return Err(crate::GatewayConfigError::RouteMode.into());
+        }
+        if !(self.max_in_flight > 0 && self.max_in_flight <= 1024) {
+            return Err(crate::GatewayConfigError::HttpConcurrency.into());
+        }
         if !self.routes.is_empty() {
             return validate_routes(&self.routes);
         }
-        ensure!(self.backends.len() <= 256, "too many HTTP backends");
+        if self.backends.len() > 256 {
+            return Err(crate::GatewayConfigError::BackendCount.into());
+        }
         for (name, backend) in &self.backends {
-            ensure!(!name.is_empty() && name.len() <= 64, "invalid backend name");
-            ensure!(
-                !backend.models.is_empty()
-                    && backend.models.len() <= 256
-                    && backend
-                        .models
-                        .iter()
-                        .all(|m| !m.is_empty() && m.len() <= 256),
-                "backend needs explicit model names"
-            );
-            ensure!(
-                backend
-                    .max_in_flight
-                    .is_none_or(|n| (1..=1024).contains(&n)),
-                "invalid backend concurrency limit"
-            );
-            ensure!(
-                backend.routes.iter().all(|r| r.credential.is_none()),
-                "set the credential on the backend, not its routes"
-            );
+            if name.is_empty() || name.len() > 64 {
+                return Err(crate::GatewayConfigError::BackendName.into());
+            }
+            if !(!backend.models.is_empty()
+                && backend.models.len() <= 256
+                && backend
+                    .models
+                    .iter()
+                    .all(|m| !m.is_empty() && m.len() <= 256))
+            {
+                return Err(crate::GatewayConfigError::ModelNames.into());
+            }
+            if !(backend
+                .max_in_flight
+                .is_none_or(|n| (1..=1024).contains(&n)))
+            {
+                return Err(crate::GatewayConfigError::BackendConcurrency.into());
+            }
+            if !(backend.routes.iter().all(|r| r.credential.is_none())) {
+                return Err(crate::GatewayConfigError::BackendCredential.into());
+            }
             validate_routes(&backend.routes)?;
         }
         Ok(())
     }
 }
 
-fn validate_routes(routes: &[HttpRoute]) -> anyhow::Result<()> {
-    ensure!(!routes.is_empty(), "HTTP backend needs at least one route");
+fn validate_routes(routes: &[HttpRoute]) -> crate::GatewayResult<()> {
+    if routes.is_empty() {
+        return Err(crate::GatewayConfigError::EmptyRoutes.into());
+    }
     let mut paths = std::collections::BTreeSet::new();
     for route in routes {
-        ensure!(
-            route.path.starts_with('/') && !route.path.contains(['?', '#', '{', '}']),
-            "HTTP routes must be exact paths"
-        );
-        ensure!(
-            paths.insert((&route.path, &route.method)),
-            "duplicate HTTP route"
-        );
-        ensure!(
-            route.headers.iter().all(|(name, _)| !matches!(
-                name.as_str(),
-                "authorization" | "x-api-key" | "cookie"
-            )),
-            "use a provider credential alias for authentication"
-        );
+        if !route.path.starts_with('/') || route.path.contains(['?', '#', '{', '}']) {
+            return Err(crate::GatewayConfigError::RoutePath.into());
+        }
+        if !(paths.insert((&route.path, &route.method))) {
+            return Err(crate::GatewayConfigError::DuplicateRoute.into());
+        }
+        if !(route
+            .headers
+            .iter()
+            .all(|(name, _)| !matches!(name.as_str(), "authorization" | "x-api-key" | "cookie")))
+        {
+            return Err(crate::GatewayConfigError::CredentialAlias.into());
+        }
         route.request(Bytes::new(), &HeaderMap::new())?.validate()?;
     }
     Ok(())
@@ -144,7 +144,7 @@ impl HttpRoute {
         &self,
         body: Bytes,
         incoming: &HeaderMap,
-    ) -> anyhow::Result<HttpFetchRequest> {
+    ) -> crate::GatewayResult<HttpFetchRequest> {
         let mut headers = self.headers.clone();
         // Connection values are ASCII by contract; a non-UTF-8 value still
         // names its tokens, so parse lossily rather than silently keeping

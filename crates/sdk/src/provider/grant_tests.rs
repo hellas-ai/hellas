@@ -1,8 +1,8 @@
 use super::*;
 use crate::{
     GrantProviderOptions,
-    gateway::{FetchGatewayOptions, start_fetch},
     grant_client::UnpinnedOffer,
+    grant_gateway::responses::{FetchGatewayOptions, start_fetch},
 };
 use hellas_executor::{FetchProvider, FetchProviderFuture, PreparedFetchRequest};
 use hellas_rpc::{
@@ -282,12 +282,12 @@ async fn contact_offer_open_tls_responses_gateway_and_revocation_preserve_quota(
         );
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         gateway.shutdown().await.unwrap();
-        provider.shutdown().await;
+        provider.shutdown().await.unwrap();
         let revoked = start_fetch_provider(options(vec![])).await.unwrap();
         assert!(revoked.offers().unwrap().is_empty());
         revoked
-            .grants
-            .as_ref()
+            .router
+            .grant_service()
             .unwrap()
             .administer(|store, _| {
                 assert_eq!(
@@ -307,10 +307,12 @@ async fn contact_offer_open_tls_responses_gateway_and_revocation_preserve_quota(
                 Ok(())
             })
             .unwrap();
-        revoked.shutdown().await;
+        revoked.shutdown().await.unwrap();
         assert!(matches!(
             start_fetch_provider(options(vec![client])).await,
-            Err(ProviderError::RevokedContact)
+            Err(ProviderError::GrantConfig(
+                crate::grant_provider::GrantProviderError::RevokedContact
+            ))
         ));
         tls.abort();
     })

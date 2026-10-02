@@ -237,8 +237,8 @@ pub(crate) enum EnqueueError {
 }
 
 pub(crate) struct ExecuteJob {
-    pub complete: Option<tokio::sync::oneshot::Sender<()>>,
-    pub running: Option<hellas_work::work::admission::RunningWork>,
+    pub complete: tokio::sync::oneshot::Sender<()>,
+    pub running: hellas_work::work::admission::RunningWork,
     pub span: tracing::Span,
     pub execution_id: String,
     pub evaluate_request: EvaluateRequest,
@@ -250,8 +250,8 @@ pub(crate) struct ExecuteJob {
 }
 
 pub(crate) struct WorkerCompletion {
-    pub running: Option<hellas_work::work::admission::RunningWork>,
-    pub complete: Option<tokio::sync::oneshot::Sender<()>>,
+    pub running: hellas_work::work::admission::RunningWork,
+    pub complete: tokio::sync::oneshot::Sender<()>,
     pub execution_id: String,
     pub evaluate_request: EvaluateRequest,
     pub invocation: Invocation,
@@ -334,8 +334,7 @@ fn worker_loop(
     let metrics = InferenceMetrics::new();
     while let Ok(WorkerCommand::Execute(job)) = rx.recv() {
         let mut job = *job;
-        let running = job.running.take();
-        let complete = job.complete.take();
+        let deadline = job.running.deadline();
         let execution_id = job.execution_id.clone();
         let execution_environment = job.evaluate_request.execution_environment;
         let sender = job.sender.clone();
@@ -368,13 +367,7 @@ fn worker_loop(
             let span = telemetry.span().clone();
             let _entered = span.enter();
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                run_job(
-                    job,
-                    on_progress,
-                    &mut runtime,
-                    &mut telemetry,
-                    running.as_ref(),
-                )
+                run_job(&mut job, on_progress, &mut runtime, &mut telemetry)
             })) {
                 Ok(Ok((stop_reason, output_tokens))) => {
                     telemetry.succeeded(stop_reason, output_tokens.len());
@@ -404,7 +397,7 @@ fn worker_loop(
             }
         };
 
-        let termination = match running.as_ref().and_then(|admission| admission.deadline()) {
+        let termination = match deadline {
             Some(deadline) => catena_lang::safe_runtime::with_job_deadline(deadline, execute),
             None => execute(),
         };
@@ -416,25 +409,25 @@ fn worker_loop(
                 invocation,
                 sender,
                 result: termination,
-                running,
-                complete,
+                running: job.running,
+                complete: job.complete,
             },
         )));
     }
 }
 
 fn run_job(
-    job: ExecuteJob,
+    job: &mut ExecuteJob,
     mut on_progress: impl FnMut(u32) -> Result<(), crate::ExecutorError>,
     runtime: &mut ModelRuntime,
     telemetry: &mut InferenceTelemetry,
-    running: Option<&hellas_work::work::admission::RunningWork>,
 ) -> Result<(StopReason, Vec<u32>), crate::ExecutorError> {
     let ExecuteJob {
         execution_id,
         source,
         invocation,
         accepted_at,
+        running,
         ..
     } = job;
 
@@ -447,21 +440,20 @@ fn run_job(
     );
 
     let check_deadline = || {
-        running.as_ref().map_or(Ok(()), |r| {
-            r.check_deadline()
-                .map_err(|e| crate::ExecutorError::Execution(e.to_string()))
-        })
+        running
+            .check_deadline()
+            .map_err(crate::ExecutorError::Backend)
     };
     check_deadline()?;
-    runtime.validate_generation_resources(&source, &invocation)?;
-    let input_ids = Zeroizing::new(invocation.input_ids);
+    runtime.validate_generation_resources(source, invocation)?;
+    let input_ids = Zeroizing::new(std::mem::take(&mut invocation.input_ids));
     let emit = |token| {
         check_deadline()?;
         telemetry.token_generated();
         on_progress(token)?;
         Ok(GenerationControl::Continue)
     };
-    let model = runtime.model(&source)?;
+    let model = runtime.model(source)?;
     check_deadline()?;
     let schedule = source.environment().generation_schedule();
     let result = model.generate_tokens_streaming_with_options(

@@ -126,8 +126,8 @@ pub use client_channel::{ClientChannel, ClientDriver, ClientObserver, ClientServ
 
 pub mod admission;
 mod stream;
-use admission::{CapacityDomain, WorkAdmission, WorkPermit};
-pub use stream::{PaidProgress, PaidResultStream, fetch_result_stream};
+use admission::{AdmissionError, AdmittedWork, CapacityDomain, WorkAdmission, WorkPermit};
+pub use stream::{PaidProgress, PaidResultStream, ProgressError, fetch_result_stream};
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -1742,21 +1742,20 @@ impl ClientEndpoint {
 
 // ── Running an accepted job ───────────────────────────────────────────
 
-/// Why the local execution backend produced no transcript.
-///
-/// Opaque on purpose. What the gate does about it — release the job and
-/// charge the client nothing — is the same for every fault a backend can
-/// have, so distinguishing them here would be a distinction nothing
-/// reads.
-#[derive(Clone, Debug, thiserror::Error)]
+/// A backend failure preserves its cause for the operator. Wire adapters decide
+/// which details can be disclosed to the caller.
+#[derive(Debug, thiserror::Error)]
 #[error("the execution backend failed: {0}")]
-pub struct BackendFault(String);
+pub struct BackendFault(#[source] Box<dyn std::error::Error + Send + Sync>);
 
 impl BackendFault {
-    /// Records one backend fault, by its operator-facing text.
-    #[must_use]
-    pub fn new(reason: impl Into<String>) -> Self {
-        Self(reason.into())
+    pub fn caused_by(error: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self(Box::new(error))
+    }
+}
+impl From<AdmissionError> for BackendFault {
+    fn from(error: AdmissionError) -> Self {
+        Self::caused_by(error)
     }
 }
 
@@ -1768,22 +1767,31 @@ impl BackendFault {
 /// transient executor state. Environment bytes remain content-store data below
 /// the manifest root and do not cross this seam.
 #[derive(Debug)]
-pub struct PreparedEvaluateInput {
+pub struct PreparedEvaluateInput<A = WorkAdmission> {
     parts: PreparedPaidInputParts,
-    admission: WorkAdmission,
+    admission: A,
 }
 
 impl PreparedEvaluateInput {
     pub(crate) fn admitted(parts: PreparedPaidInputParts, admission: WorkAdmission) -> Self {
         Self { parts, admission }
     }
-    pub fn admission(&self) -> &WorkAdmission {
+    pub async fn reserve(
+        self,
+        payment: impl core::future::Future<Output = Result<WorkPermit, BackendFault>>,
+    ) -> Result<PreparedEvaluateInput<AdmittedWork>, BackendFault> {
+        let admission = self.admission.reserve(CapacityDomain::Gpu, payment).await?;
+        Ok(PreparedEvaluateInput {
+            parts: self.parts,
+            admission,
+        })
+    }
+}
+impl<A> PreparedEvaluateInput<A> {
+    pub fn admission(&self) -> &A {
         &self.admission
     }
-    pub fn admission_mut(&mut self) -> &mut WorkAdmission {
-        &mut self.admission
-    }
-    pub fn into_parts_and_admission(self) -> (PreparedPaidInputParts, WorkAdmission) {
+    pub fn into_parts_and_admission(self) -> (PreparedPaidInputParts, A) {
         (self.parts, self.admission)
     }
     /// Returns the Evaluate request rebuilt from the journal.
@@ -1808,10 +1816,10 @@ impl PreparedEvaluateInput {
 /// A paid Fetch input admitted under a channel policy. It is held only in
 /// memory on the provider, even while the job's accounting state is durable.
 #[derive(Debug)]
-pub struct PreparedFetchInput {
+pub struct PreparedFetchInput<A = WorkAdmission> {
     parts: PreparedPaidFetchInputParts,
     policy: FetchPolicyV2,
-    admission: WorkAdmission,
+    admission: A,
 }
 
 impl PreparedFetchInput {
@@ -1835,16 +1843,28 @@ impl PreparedFetchInput {
             admission,
         }
     }
-    pub fn admission(&self) -> &WorkAdmission {
+    pub async fn reserve(
+        self,
+        payment: impl core::future::Future<Output = Result<WorkPermit, BackendFault>>,
+    ) -> Result<PreparedFetchInput<AdmittedWork>, BackendFault> {
+        let admission = self
+            .admission
+            .reserve(CapacityDomain::Fetch, payment)
+            .await?;
+        Ok(PreparedFetchInput {
+            parts: self.parts,
+            policy: self.policy,
+            admission,
+        })
+    }
+}
+impl<A> PreparedFetchInput<A> {
+    pub fn admission(&self) -> &A {
         &self.admission
     }
-    pub fn admission_mut(&mut self) -> &mut WorkAdmission {
-        &mut self.admission
-    }
-    pub fn into_parts_and_admission(self) -> (PreparedPaidFetchInputParts, WorkAdmission) {
+    pub fn into_parts_and_admission(self) -> (PreparedPaidFetchInputParts, A) {
         (self.parts, self.admission)
     }
-
     /// Returns the fixed output bounds the provider must enforce while running.
     pub const fn policy(&self) -> &FetchPolicyV2 {
         &self.policy
@@ -1871,17 +1891,14 @@ impl PreparedFetchInput {
 /// calls this at most once per `work_id` whatever the implementor does.
 pub trait WorkBackend: Sync {
     /// A grant must reserve bounded executor capacity before co-signature.
-    /// Backends without an explicit admission implementation refuse grants.
-    fn try_admit(&self, _domain: CapacityDomain) -> Result<WorkPermit, BackendFault> {
-        Err(BackendFault::new("grant executor capacity is unavailable"))
-    }
+    fn try_admit(&self, domain: CapacityDomain) -> Result<WorkPermit, BackendFault>;
     /// Runs an authorized Fetch without persisting request or response bodies.
     fn fetch(
         &self,
         _input: PreparedFetchInput,
     ) -> impl core::future::Future<Output = Result<Vec<OutputEventEnvelope>, BackendFault>> + Send
     {
-        async { Err(BackendFault::new("paid fetch backend is unavailable")) }
+        async { Err(AdmissionError::Unsupported(CapacityDomain::Fetch).into()) }
     }
 
     /// Runs once, exposing signed Fetch prefixes before terminal delivery.
@@ -1907,7 +1924,7 @@ pub trait WorkBackend: Sync {
         _input: PreparedEvaluateInput,
     ) -> impl core::future::Future<Output = Result<Vec<OutputEventEnvelope>, BackendFault>> + Send
     {
-        async { Err(BackendFault::new("paid evaluate backend is unavailable")) }
+        async { Err(AdmissionError::Unsupported(CapacityDomain::Gpu).into()) }
     }
 
     /// Run once, exposing authenticated token prefixes while retaining the

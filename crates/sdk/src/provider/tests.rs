@@ -98,7 +98,7 @@ async fn paid_provider_advertises_work_and_chain_services() {
             connection.close(0u32.into(), b"tested");
         }
         client.close().await;
-        provider.shutdown().await;
+        provider.shutdown().await.unwrap();
         node.shutdown().await.unwrap();
     })
     .await

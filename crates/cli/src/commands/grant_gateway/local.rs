@@ -75,20 +75,24 @@ pub async fn open(
         .index
         .map(Ok)
         .unwrap_or_else(crate::identity::default_content_index_path)?;
-    let content_store =
-        crate::commands::environment::index_content(&content.paths, &content.roots, &index)?;
     let mut config = GrantConfig::unconfigured(&root);
     // Preserve the existing machine allowance while explicitly selecting the
     // local owner's current environment. Opening the same provider twice fails
     // on the common journal lease, including a simultaneous `serve` process.
     config.resources = vec![policy(environment, stops)?];
     config.max_job_millis = std::num::NonZeroU64::new(90_000).expect("positive");
-    let (_, store) =
-        crate::commands::serve::prepare_grants(crate::commands::serve::GrantNodeConfig {
+    let routes = FetchRouteRegistry::default();
+    let plan = hellas_sdk::grant_provider::GrantProviderPlan::managed(
+        &hellas_sdk::grant_provider::ManagedGrantOptions {
             config,
             provider: principal.clone(),
             owner: Some(principal.clone()),
-        })?;
+        },
+        hellas_sdk::grant_provider::ProviderResources::EvaluateAndFetch(&routes),
+    )?;
+    let content_store =
+        crate::commands::environment::index_content(&content.paths, &content.roots, &index)?;
+
     let signer = Arc::new(identity.producer_key.clone());
     let mut executor = ExecutorSpawnConfig::fetch_only(
         signer.clone(),
@@ -100,6 +104,7 @@ pub async fn open(
     let backend = Executor::spawn_configured(executor)
         .await
         .context("start local Work executor")?;
+    let store = plan.open()?;
     let service = hellas_work::grant_service::GrantService::new(
         store,
         signer.clone(),

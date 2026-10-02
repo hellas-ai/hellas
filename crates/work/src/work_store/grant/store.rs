@@ -1,7 +1,10 @@
 //! The single durable writer for provider grant authority. Every exported
 //! acceptance is backed by one fsynced frame covering its entire budget path.
 use super::state::{Change, Frame, Snapshot, State};
-use super::*;
+use super::{
+    ChannelId, GrantConnection, GrantId, GrantJobAuthorizationV1, GrantOutcome, GrantStoreError,
+    Principal, Serialize, SignedResult, ledger,
+};
 use crate::work_store::journal::{
     Journal, JournalId, JournalKind, MAX_CHECKPOINT_BYTES, MAX_RECORD_BYTES,
 };
@@ -9,8 +12,15 @@ use crate::work_store::{Applied, JobPhase, Role};
 use hellas_kernel::NetworkId;
 use hellas_rpc::ProviderEnrollmentBundle;
 use hellas_rpc::protocol::value::{canonical_dag_cbor, decode_dag_cbor};
-use hellas_rpc::protocol::work_grant::standing::*;
-use hellas_rpc::protocol::work_grant::{budget::*, records::*, *};
+use hellas_rpc::protocol::work_grant::standing::{
+    CounterAllowance, NodeAllowance, Standing, StandingQuery,
+};
+use hellas_rpc::protocol::work_grant::{
+    Revision, UnixMillis,
+    budget::{BudgetNode, Charge, Limit, Meter, Usage, Window},
+    grant_work_id, owner_grant_id,
+    records::{GrantDef, GrantError, GrantKind, GrantPolicy, GrantState, Offer, SignedOffer},
+};
 use hellas_rpc::protocol::work_profile::{PreparedWorkInput, WorkContext, WorkPolicy};
 use hellas_rpc::{Digest, ProducerSigningKey, PublicKey, Signature};
 use std::path::Path;
@@ -287,7 +297,6 @@ impl GrantStore {
                 kind: GrantKind::Owner(owner),
                 policies,
                 limits: vec![],
-                weight: std::num::NonZeroU16::new(1).expect("one"),
                 max_job_millis,
                 max_in_flight: std::num::NonZeroU16::new(256).expect("positive"),
                 expires: None,

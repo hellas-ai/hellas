@@ -27,8 +27,6 @@ pub struct RemoteLightClient {
 
 impl RemoteLightClient {
     pub fn new(transport: MuxTransport) -> Self {
-        #[cfg(feature = "construction-audit")]
-        crate::construction_audit::record();
         Self {
             client: LightClientClientImpl::new(transport),
             verifier: None,
@@ -70,8 +68,6 @@ impl RemoteLightClient {
 }
 
 async fn connect_transport(addr: &str) -> Result<MuxTransport, QueryError> {
-    #[cfg(feature = "construction-audit")]
-    crate::construction_audit::record();
     #[cfg(target_family = "wasm")]
     {
         hellas_wire::ws::wasm::connect(addr)

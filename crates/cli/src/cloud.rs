@@ -40,7 +40,9 @@ pub(super) async fn run(command: Commands, identity_path: Option<&Path>) -> Resu
                 service.owner(),
                 socket.display()
             );
-            hellas_cloud::internal_rpc::serve(service, &socket).await
+            hellas_cloud::internal_rpc::serve(service, &socket)
+                .await
+                .map_err(anyhow::Error::from)
         }
         _ => unreachable!("only management commands reach this adapter"),
     }

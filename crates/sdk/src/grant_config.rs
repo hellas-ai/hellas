@@ -1,6 +1,6 @@
 //! Local resource configuration shares exactly the paid WorkPolicy parser.
 //! Grants and their counters remain runtime state in the provider journal.
-use crate::work_config::{ExecutionPolicyFile, FetchPolicyFile, WorkConfigError};
+use crate::resource_config::{ExecutionPolicyFile, FetchPolicyFile, ResourceConfigError};
 use hellas_rpc::protocol::work_grant::{
     budget::Limit,
     records::{GrantError, GrantPolicy},
@@ -19,7 +19,7 @@ pub enum GrantConfigError {
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error(transparent)]
-    Policy(#[from] WorkConfigError),
+    Policy(#[from] ResourceConfigError),
     #[error(transparent)]
     Grant(#[from] GrantError),
 }

@@ -1,6 +1,5 @@
-use super::super::prepare_grants;
 use futures::StreamExt;
-use hellas_sdk::paid_provider::UnmountedWork;
+use hellas_sdk::work_router::UnmountedWork;
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -517,6 +516,7 @@ async fn two_vouched_peers_receive_their_distinct_configured_offers() {
     assert!(
         setup_mount
             .service(&TransportContext::default(), first.bond_edge())
+            .unwrap()
             .is_none(),
         "an absent identity has no route",
     );
@@ -529,6 +529,7 @@ async fn two_vouched_peers_receive_their_distinct_configured_offers() {
                 },
                 first.bond_edge()
             )
+            .unwrap()
             .is_none(),
         "an unvouched identity has no route",
     );
@@ -538,19 +539,24 @@ async fn two_vouched_peers_receive_their_distinct_configured_offers() {
                 &vouched_context(PeerId::from_bytes([0xff; 32])),
                 first.bond_edge()
             )
+            .unwrap()
             .is_none(),
         "an unknown vouched peer has no route",
     );
     let exact_first = setup_mount
         .service(&vouched_context(first_peer), first.bond_edge())
+        .unwrap()
         .expect("the first route owns one exact setup service");
     assert!(
-        !setup_mount.mount(first_peer, first.bond_edge(), &exact_first),
+        setup_mount
+            .mount(first_peer, first.bond_edge(), &exact_first)
+            .is_err(),
         "a duplicate mount is refused without replacing the original",
     );
     assert!(
         setup_mount
             .service(&vouched_context(first_peer), first.bond_edge())
+            .unwrap()
             .is_some(),
         "the original mount remains usable",
     );
@@ -636,6 +642,7 @@ async fn completion_clears_and_mounts_only_the_completing_route() {
                 &vouched_context(first_route_peer()),
                 OfferFixture::first().bond_edge()
             )
+            .unwrap()
             .is_none(),
         "the completing setup route is cleared",
     );
@@ -684,6 +691,7 @@ async fn completion_clears_and_mounts_only_the_completing_route() {
             &vouched_context(second_route_peer()),
             OfferFixture::second().bond_edge(),
         )
+        .unwrap()
         .expect("B's setup route remains mounted");
     let response: WithTrailer<ExchangeSetupResponse> = second_setup
         .exchange_setup(
@@ -752,6 +760,7 @@ async fn requests_use_local_observation_and_one_contested_route_does_not_disable
             &vouched_context(first_route_peer()),
             OfferFixture::first().descriptor().channel().id(),
         )
+        .unwrap()
         .unwrap();
     let checkpoint = service.with_state(Channel::checkpoint).unwrap();
     // Block the observer's read, not a request. Existing local evidence still
@@ -1508,6 +1517,13 @@ struct AnsweringPaidBackend {
 }
 
 impl WorkBackend for AnsweringPaidBackend {
+    fn try_admit(
+        &self,
+        domain: hellas_work::work::admission::CapacityDomain,
+    ) -> Result<hellas_work::work::admission::WorkPermit, hellas_work::work::BackendFault> {
+        Err(hellas_work::work::admission::AdmissionError::Unsupported(domain).into())
+    }
+
     async fn evaluate(
         &self,
         input: PreparedEvaluateInput,
@@ -1550,6 +1566,13 @@ impl BlockingPaidBackend {
 }
 
 impl WorkBackend for BlockingPaidBackend {
+    fn try_admit(
+        &self,
+        domain: hellas_work::work::admission::CapacityDomain,
+    ) -> Result<hellas_work::work::admission::WorkPermit, hellas_work::work::BackendFault> {
+        Err(hellas_work::work::admission::AdmissionError::Unsupported(domain).into())
+    }
+
     async fn evaluate_stream(
         &self,
         input: PreparedEvaluateInput,
@@ -1570,7 +1593,7 @@ impl WorkBackend for BlockingPaidBackend {
         self.entered.add_permits(1);
         match self.release.acquire().await {
             Ok(permit) => permit.forget(),
-            Err(error) => return Err(BackendFault::new(error.to_string())),
+            Err(error) => return Err(BackendFault::caused_by(error)),
         }
         Ok(answer_transcript())
     }
@@ -2965,7 +2988,7 @@ impl RunningPaidNode {
                         node_handler,
                         manager,
                         Some(setup),
-                        Some(work),
+                        Some(WorkRouter::Payment(work)),
                         None,
                     )
                     .await
@@ -2983,7 +3006,8 @@ impl RunningPaidNode {
                     let source = source.clone();
                     async move { Some(source) }
                 })
-                .await;
+                .await
+                .unwrap();
         });
 
         Self {
@@ -3133,6 +3157,7 @@ impl RunningPaidNode {
                 if self
                     .work_mount
                     .service(&self.context(), descriptor().channel().id())
+                    .unwrap()
                     .is_some()
                 {
                     break;
@@ -3145,6 +3170,7 @@ impl RunningPaidNode {
         assert!(
             self.setup_mount
                 .service(&self.context(), bond_edge())
+                .unwrap()
                 .is_none(),
             "the matching setup is cleared when its channel mounts",
         );
@@ -3156,6 +3182,7 @@ impl RunningPaidNode {
                 let cursor = self
                     .work_mount
                     .service(&self.context(), descriptor().channel().id())
+                    .unwrap()
                     .and_then(|service| service.with_state(|state| state.cursor().0).ok());
                 if cursor.is_some_and(|cursor| cursor >= height) {
                     break;
@@ -3194,6 +3221,7 @@ async fn run_advertised_paid_exchange(
     assert!(
         node.setup_mount
             .service(&node.context(), bond_edge())
+            .unwrap()
             .is_some(),
         "the runner mounts the exact setup it drives before the first dial",
     );
@@ -3246,6 +3274,7 @@ async fn run_advertised_paid_exchange(
             if node
                 .work_mount
                 .service(&node.context(), descriptor().channel().id())
+                .unwrap()
                 .is_some_and(|service| service.readiness().is_ok())
             {
                 break;
@@ -3343,6 +3372,7 @@ async fn a_restart_with_an_open_contest_is_answered_on_the_clock() {
                 &vouched_context(default_route_peer()),
                 descriptor().channel().id()
             )
+            .unwrap()
             .is_none(),
         "nothing is mounted before the first tick",
     );
@@ -3351,10 +3381,13 @@ async fn a_restart_with_an_open_contest_is_answered_on_the_clock() {
     assert!(runner.tick(&chain).await, "the fixture chain answers");
 
     assert_eq!(responded(&chain), start_id);
-    let Some(service) = mount.service(
-        &vouched_context(default_route_peer()),
-        descriptor().channel().id(),
-    ) else {
+    let Some(service) = mount
+        .service(
+            &vouched_context(default_route_peer()),
+            descriptor().channel().id(),
+        )
+        .unwrap()
+    else {
         panic!("the tick that answered the contest mounted its channel")
     };
     let cursor = match service.with_state(|state| state.cursor().0) {
@@ -3392,10 +3425,13 @@ async fn the_paid_work_clock_submits_adjudication_when_consensus_makes_it_due_an
         0,
         "an unresponded contest below its deadline is not final",
     );
-    let Some(service) = mount.service(
-        &vouched_context(default_route_peer()),
-        descriptor().channel().id(),
-    ) else {
+    let Some(service) = mount
+        .service(
+            &vouched_context(default_route_peer()),
+            descriptor().channel().id(),
+        )
+        .unwrap()
+    else {
         panic!("the first tick mounts the contested channel")
     };
     assert_eq!(
@@ -3491,10 +3527,13 @@ async fn the_clock_serves_work_from_the_channel_it_was_handed() {
 
     assert!(runner.tick(&chain).await, "the fixture chain answers");
 
-    let Some(service) = mount.service(
-        &vouched_context(default_route_peer()),
-        descriptor().channel().id(),
-    ) else {
+    let Some(service) = mount
+        .service(
+            &vouched_context(default_route_peer()),
+            descriptor().channel().id(),
+        )
+        .unwrap()
+    else {
         panic!("the driver handed back a channel and the runner published it")
     };
     let edge = match service.with_state(|state| state.channel().payment_edge()) {
@@ -3568,6 +3607,7 @@ fn the_clock_resumes_an_accepted_job_after_restart() {
                         &vouched_context(default_route_peer()),
                         descriptor().channel().id(),
                     )
+                    .unwrap()
                     .and_then(|service| {
                         service
                             .with_state(|state| {
@@ -3607,6 +3647,7 @@ fn the_clock_resumes_an_accepted_job_after_restart() {
                 &vouched_context(default_route_peer()),
                 descriptor().channel().id(),
             )
+            .unwrap()
             .unwrap();
         tokio::spawn(async move {
             std::future::pending::<()>().await;
@@ -3833,7 +3874,8 @@ async fn a_clean_shutdown_leaves_a_replayable_journal() {
                     let chain = chain.clone();
                     async move { Some(chain) }
                 })
-                .await;
+                .await
+                .unwrap();
         })
     };
 
@@ -3862,6 +3904,7 @@ async fn a_clean_shutdown_leaves_a_replayable_journal() {
                 &vouched_context(default_route_peer()),
                 descriptor().channel().id()
             )
+            .unwrap()
             .is_none(),
         "a stopped clock serves no channel",
     );
@@ -3924,7 +3967,8 @@ async fn a_blocked_channel_observer_does_not_stop_other_channels_or_shutdown() {
                 let source = source.clone();
                 async move { Some(source) }
             })
-            .await;
+            .await
+            .unwrap();
     });
     tokio::time::timeout(TEST_TIMEOUT, entered.acquire())
         .await
@@ -3938,6 +3982,7 @@ async fn a_blocked_channel_observer_does_not_stop_other_channels_or_shutdown() {
                     &vouched_context(second_route_peer()),
                     OfferFixture::second().descriptor().channel().id(),
                 )
+                .unwrap()
                 .is_some_and(|service| service.readiness().is_ok())
             {
                 break;
@@ -3958,6 +4003,7 @@ async fn a_blocked_channel_observer_does_not_stop_other_channels_or_shutdown() {
             &vouched_context(second_route_peer()),
             OfferFixture::second().descriptor().channel().id(),
         )
+        .unwrap()
         .unwrap();
     stop.send(()).unwrap();
     tokio::time::timeout(TEST_TIMEOUT, observing)
@@ -3974,6 +4020,7 @@ async fn a_blocked_channel_observer_does_not_stop_other_channels_or_shutdown() {
                 &vouched_context(second_route_peer()),
                 OfferFixture::second().descriptor().channel().id()
             )
+            .unwrap()
             .is_none()
     );
 }
@@ -4011,18 +4058,23 @@ async fn one_peer_routes_distinct_channels_without_crossing_journals() {
             &vouched_context(first_route_peer()),
             first.descriptor().channel().id(),
         )
+        .unwrap()
         .unwrap();
     let b = original
         .service(
             &vouched_context(second_route_peer()),
             second.descriptor().channel().id(),
         )
+        .unwrap()
         .unwrap();
     let mounted = MountedWork::default();
     let peer = first_route_peer();
-    assert!(mounted.mount(peer, &a));
-    assert!(mounted.mount(peer, &b));
-    assert!(!mounted.mount(peer, &a));
+    mounted.mount(peer, &a).unwrap();
+    mounted.mount(peer, &b).unwrap();
+    assert!(matches!(
+        mounted.mount(peer, &a),
+        Err(hellas_sdk::paid_provider::MountError::DuplicateChannel(_))
+    ));
     for offer in [first, second] {
         let response = accept_mounted_route(&mounted, peer, offer.signed_accept_request()).await;
         assert!(matches!(
@@ -4111,12 +4163,20 @@ fn owner_bootstrap_and_explicit_resource_revision_preserve_machine_limits() {
     let root = temp();
     let identity = crate::identity::load_or_create(Some(&root.path().join("identity"))).unwrap();
     let provider = Principal::verify(identity.enrollment).unwrap();
+    let prepare_grants = |options: super::super::GrantNodeConfig| {
+        use hellas_sdk::grant_provider::{GrantProviderPlan, ProviderResources};
+        GrantProviderPlan::managed(
+            &options,
+            ProviderResources::EvaluateAndFetch(&FetchRouteRegistry::default()),
+        )?
+        .open()
+    };
     let config = || super::super::GrantNodeConfig {
         config: GrantConfig::unconfigured(root.path()),
         provider: provider.clone(),
         owner: Some(provider.clone()),
     };
-    let (_, mut store) = prepare_grants(config()).unwrap();
+    let mut store = prepare_grants(config()).unwrap();
     let id = owner_grant_id(
         store.state().network(),
         provider.bundle().content_id(),
@@ -4132,7 +4192,7 @@ fn owner_bootstrap_and_explicit_resource_revision_preserve_machine_limits() {
         .configure_machine(vec![limit], 2, hellas_work::grant_service::wall_clock())
         .unwrap();
     drop(store);
-    let (_, store) = prepare_grants(config()).unwrap();
+    let store = prepare_grants(config()).unwrap();
     let machine = store.state().ledger().node(BudgetNode::Machine).unwrap();
     assert_eq!(machine.limits(), &[limit]);
     assert_eq!(machine.concurrent(), 2);
@@ -4145,11 +4205,11 @@ fn owner_bootstrap_and_explicit_resource_revision_preserve_machine_limits() {
         work: work_policy().into(),
         https: None,
     }];
-    let (_, store) = prepare_grants(explicit).unwrap();
+    let store = prepare_grants(explicit).unwrap();
     assert_eq!(store.state().grant(id).unwrap().revision, Revision(2));
     assert_eq!(store.state().grant(id).unwrap().policies.len(), 1);
     drop(store);
-    let (_, store) = prepare_grants(config()).unwrap();
+    let store = prepare_grants(config()).unwrap();
     assert_eq!(store.state().grant(id).unwrap().revision, Revision(2));
     assert_eq!(store.state().grant(id).unwrap().policies.len(), 1);
 }
@@ -4174,10 +4234,9 @@ async fn grant_and_paid_work_share_a_peer_but_never_a_journal() {
         fn try_admit(&self, domain: CapacityDomain) -> Result<WorkPermit, BackendFault> {
             Ok(WorkPermit::new(
                 domain,
-                self.slots
-                    .clone()
-                    .try_acquire_owned()
-                    .map_err(|_| BackendFault::new("full"))?,
+                self.slots.clone().try_acquire_owned().map_err(|_| {
+                    BackendFault::from(hellas_work::work::admission::AdmissionError::Capacity)
+                })?,
             ))
         }
         async fn evaluate(
@@ -4185,7 +4244,12 @@ async fn grant_and_paid_work_share_a_peer_but_never_a_journal() {
             input: PreparedEvaluateInput,
         ) -> Result<Vec<OutputEventEnvelope>, BackendFault> {
             let (_, admission) = input.into_parts_and_admission();
-            let _running = admission.dispatch()?;
+            let _running = admission
+                .reserve(hellas_work::work::admission::CapacityDomain::Gpu, async {
+                    self.try_admit(hellas_work::work::admission::CapacityDomain::Gpu)
+                })
+                .await?
+                .dispatch()?;
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(answer_transcript())
         }
@@ -4226,6 +4290,7 @@ async fn grant_and_paid_work_share_a_peer_but_never_a_journal() {
     let peer = default_route_peer();
     let paid = mounted
         .service(&vouched_context(peer), descriptor().channel().id())
+        .unwrap()
         .unwrap();
     let grantee_key = ProducerSigningKey::from_secret_bytes([0x21; 32]).unwrap();
     let provider_key = provider_producer();
@@ -4264,7 +4329,6 @@ async fn grant_and_paid_work_share_a_peer_but_never_a_journal() {
                     https: None,
                 }],
                 limits: vec![],
-                weight: std::num::NonZeroU16::new(1).unwrap(),
                 max_job_millis: std::num::NonZeroU64::new(10_000).unwrap(),
                 max_in_flight: std::num::NonZeroU16::new(1).unwrap(),
                 expires: None,
@@ -4312,7 +4376,10 @@ async fn grant_and_paid_work_share_a_peer_but_never_a_journal() {
         Arc::new(move || now),
     )
     .unwrap();
-    assert!(mounted.mount_grants(service.clone()));
+    let router = WorkRouter::Both {
+        payment: mounted.clone(),
+        grants: service.clone(),
+    };
     let response = accept_mounted_route(&mounted, peer, signed_accept_request()).await;
     assert!(matches!(
         response.outcome,
@@ -4331,7 +4398,7 @@ async fn grant_and_paid_work_share_a_peer_but_never_a_journal() {
     let before_paid = paid.with_state(Channel::checkpoint).unwrap();
     let mut context = vouched_context(peer);
     context.open_exporter = Some([7; 32]);
-    let response: WithTrailer<AcceptWorkResponse> = mounted
+    let response: WithTrailer<AcceptWorkResponse> = router
         .accept_work(request.clone(), context.clone())
         .await
         .unwrap()
@@ -4376,11 +4443,11 @@ async fn grant_and_paid_work_share_a_peer_but_never_a_journal() {
         })
         .unwrap();
     assert_eq!(before_grant, 1);
-    let mut crossed = request;
+    let mut crossed = request.clone();
     crossed.route = Some(hellas_rpc::pb::work::WorkRoute::payment(
         descriptor().channel().id(),
     ));
-    let response: WithTrailer<AcceptWorkResponse> = mounted
+    let response: WithTrailer<AcceptWorkResponse> = router
         .accept_work(crossed, context.clone())
         .await
         .unwrap()
@@ -4391,7 +4458,7 @@ async fn grant_and_paid_work_share_a_peer_but_never_a_journal() {
     ));
     let mut crossed = signed_accept_request();
     crossed.route = Some(hellas_rpc::pb::work::WorkRoute::grant(channel));
-    let response: WithTrailer<AcceptWorkResponse> = mounted
+    let response: WithTrailer<AcceptWorkResponse> = router
         .accept_work(crossed, context.clone())
         .await
         .unwrap()
@@ -4416,15 +4483,23 @@ async fn grant_and_paid_work_share_a_peer_but_never_a_journal() {
             Ok(())
         })
         .unwrap();
-    mounted.clear_all();
+    mounted.clear_all().unwrap();
     assert!(
         mounted
             .service(&context, descriptor().channel().id())
+            .unwrap()
             .is_none()
     );
-    assert!(
-        mounted.grant_service().is_some(),
-        "paid observer failure cannot unmount grant authority"
+    let expected: WithTrailer<AcceptWorkResponse> = service
+        .accept_work(request.clone(), context.clone())
+        .await
+        .unwrap()
+        .into();
+    let actual: WithTrailer<AcceptWorkResponse> =
+        router.accept_work(request, context).await.unwrap().into();
+    assert_eq!(
+        actual.response, expected.response,
+        "stopping the payment observer preserves grant routing"
     );
     service.drain().await.unwrap();
 }

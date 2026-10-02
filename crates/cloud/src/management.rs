@@ -4,7 +4,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context, Result, bail, ensure};
 use iroh::SecretKey;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -16,6 +15,80 @@ use crate::{
     },
     wire::{self, Operation, Response},
 };
+
+pub type Result<T> = std::result::Result<T, ManagementError>;
+
+#[derive(Debug, thiserror::Error)]
+pub enum ManagementError {
+    #[error(transparent)]
+    Config(#[from] crate::config::ConfigError),
+    #[error("{0}")]
+    Account(#[from] crate::accounts::AccountError),
+    #[error(transparent)]
+    Provider(#[from] crate::provider::ProviderError),
+    #[error(transparent)]
+    Deployment(#[from] crate::deployment::DeploymentError),
+    #[error(transparent)]
+    Admin(#[from] crate::wire::AdminError),
+    #[error(transparent)]
+    Directory(#[from] DirectoryError),
+    #[error(transparent)]
+    Configuration(#[from] crate::configuration::ConfigurationError),
+    #[error(transparent)]
+    Download(#[from] crate::agent::DownloadError),
+    #[error(transparent)]
+    Grant(#[from] hellas_rpc::protocol::work_grant::records::GrantError),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    Clock(#[from] std::time::SystemTimeError),
+    #[error("owner enrollment transport mismatch")]
+    EnrollmentTransport,
+    #[error("machine belongs to another identity")]
+    MachineOwner,
+    #[error("machine was destroyed")]
+    Destroyed,
+    #[error("machine is not bound to this identity")]
+    OwnerBinding,
+    #[error("receipt owner mismatch")]
+    ReceiptOwner,
+    #[error("machine name already exists")]
+    NameExists,
+    #[error("receipt already exists; allocation was not attempted")]
+    ReceiptExists,
+    #[error("agent did not confirm the owner binding; upgrade the companion image")]
+    OwnerUnconfirmed,
+    #[error("machine enrollment changed; refusing to replace its trust anchor")]
+    EnrollmentChanged,
+    #[error("Hellas is not running; check the image supports owner grant funding")]
+    OwnerProviderUnavailable,
+    #[error("machine is not running")]
+    NotRunning,
+    #[error("HOME is unset")]
+    MissingHome,
+    #[error("owner enrollment required for provisioning")]
+    EnrollmentRequired,
+    #[error("invalid machine filename")]
+    Filename,
+    #[error("machine has not enrolled")]
+    NotEnrolled,
+    #[error("bare-metal hosts cannot be destroyed through a cloud adapter")]
+    BareMetalDestroy,
+    #[error("create requires --state")]
+    StateRequired,
+    #[error("receipt belongs to another identity")]
+    ReceiptIdentity,
+    #[error("receipt belongs to another cloud provider; refusing termination")]
+    ReceiptProvider,
+    #[error("--account does not match receipt; refusing termination")]
+    ReceiptAccount,
+    #[error("destroy requires a pod ID or --state")]
+    ResourceRequired,
+    #[error("remote agent: {0}")]
+    Remote(String),
+}
 
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "method", content = "params", deny_unknown_fields)]
@@ -99,7 +172,7 @@ impl Service {
     pub fn open(key: SecretKey) -> Result<Self> {
         let base = match std::env::var_os("HELLAS_MACHINES_DIR") {
             Some(path) => PathBuf::from(path),
-            None => PathBuf::from(std::env::var_os("HOME").context("HOME is unset")?)
+            None => PathBuf::from(std::env::var_os("HOME").ok_or(ManagementError::MissingHome)?)
                 .join(".hellas/machines"),
         };
         Self::new(key, &base)
@@ -111,10 +184,9 @@ impl Service {
         bundle: hellas_rpc::ProviderEnrollmentBundle,
     ) -> Result<Self> {
         let principal = hellas_rpc::protocol::work_grant::records::Principal::verify(bundle)?;
-        ensure!(
-            principal.transport() == *self.key.public().as_bytes(),
-            "owner enrollment transport mismatch"
-        );
+        if principal.transport() != *self.key.public().as_bytes() {
+            return Err(ManagementError::EnrollmentTransport);
+        }
         self.enrollment = Some(principal);
         Ok(self)
     }
@@ -123,7 +195,7 @@ impl Service {
         Ok(hex::encode(
             self.enrollment
                 .as_ref()
-                .context("owner enrollment required for provisioning")?
+                .ok_or(ManagementError::EnrollmentRequired)?
                 .bundle()
                 .canonical_bytes(),
         ))
@@ -140,10 +212,9 @@ impl Service {
 
     fn load(&self, name: &str) -> Result<Machine> {
         let machine: Machine = read_json(&self.path(name)?)?;
-        ensure!(
-            machine.name == name && machine.owner == self.owner(),
-            "machine belongs to another identity"
-        );
+        if !(machine.name == name && machine.owner == self.owner()) {
+            return Err(ManagementError::MachineOwner);
+        }
         Ok(machine)
     }
 
@@ -151,7 +222,9 @@ impl Service {
         let (credentials, address) = match &machine.source {
             Source::Cloud { receipt } => {
                 let state: Deployment = read_json(receipt)?;
-                ensure!(!state.destroyed, "machine was destroyed");
+                if state.destroyed {
+                    return Err(ManagementError::Destroyed);
+                }
                 (state.credentials, None)
             }
             Source::BareMetal {
@@ -159,10 +232,9 @@ impl Service {
                 admin_addr,
             } => (credentials.clone(), *admin_addr),
         };
-        ensure!(
-            credentials.owner.as_deref() == Some(&self.owner()),
-            "machine is not bound to this identity"
-        );
+        if credentials.owner.as_deref() != Some(&self.owner()) {
+            return Err(ManagementError::OwnerBinding);
+        }
         credentials.secret_key()?;
         Ok((credentials, address))
     }
@@ -171,10 +243,9 @@ impl Service {
         let (location, lifecycle) = match &machine.source {
             Source::Cloud { receipt } if receipt.exists() => {
                 let state: Deployment = read_json(receipt)?;
-                ensure!(
-                    state.credentials.owner.as_deref() == Some(&self.owner()),
-                    "receipt owner mismatch"
-                );
+                if state.credentials.owner.as_deref() != Some(&self.owner()) {
+                    return Err(ManagementError::ReceiptOwner);
+                }
                 (
                     json!({"provider":state.spec.provider, "resource_id":state.resource_id}),
                     if state.destroyed {
@@ -203,7 +274,7 @@ impl Service {
             if path.extension().is_some_and(|ext| ext == "json") {
                 names.push(
                     path.file_stem()
-                        .context("invalid machine filename")?
+                        .ok_or(ManagementError::Filename)?
                         .to_string_lossy()
                         .into_owned(),
                 );
@@ -222,17 +293,18 @@ impl Service {
         spec.validate()?;
         let _lock = lock_state(&self.root.join("inventory"))?;
         let path = self.path(&spec.name)?;
-        ensure!(!path.exists(), "machine name already exists");
+        if path.exists() {
+            return Err(ManagementError::NameExists);
+        }
         let receipt = receipt.unwrap_or_else(|| {
             self.root
                 .join("receipts")
                 .join(format!("{}.json", spec.name))
         });
         let receipt = std::path::absolute(receipt)?;
-        ensure!(
-            !receipt.exists(),
-            "receipt already exists; allocation was not attempted"
-        );
+        if receipt.exists() {
+            return Err(ManagementError::ReceiptExists);
+        }
         let mut credentials = Credentials::generate();
         credentials.owner = Some(self.owner());
         credentials.owner_enrollment = Some(bundle);
@@ -267,7 +339,9 @@ impl Service {
         let bundle = self.owner_bundle()?;
         let _lock = lock_state(&self.root.join("inventory"))?;
         let path = self.path(&name)?;
-        ensure!(!path.exists(), "machine name already exists");
+        if path.exists() {
+            return Err(ManagementError::NameExists);
+        }
         validate_serve_args(&serve_args)?;
         let mut credentials = Credentials::generate();
         credentials.owner = Some(self.owner());
@@ -297,29 +371,27 @@ impl Service {
         let (credentials, address) = self.credentials(&machine)?;
         let response = wire::call_as(&credentials, address, operation, Some(&self.key)).await?;
         match &response {
-            Response::Error { message } => bail!("{message}"),
+            Response::Error { message } => return Err(ManagementError::Remote(message.clone())),
             Response::Status {
                 enrollment,
                 owner,
                 running,
             } => {
-                ensure!(
-                    *owner == credentials.owner,
-                    "agent did not confirm the owner binding; upgrade the companion image"
-                );
+                if *owner != credentials.owner {
+                    return Err(ManagementError::OwnerUnconfirmed);
+                }
                 enrollment.validate()?;
                 if let Some(expected) = &machine.enrollment {
-                    ensure!(
-                        expected.node_id == enrollment.node_id
-                            && expected.enrollment_id == enrollment.enrollment_id
-                            && (expected.bundle.is_none() || expected.bundle == enrollment.bundle),
-                        "machine enrollment changed; refusing to replace its trust anchor"
-                    );
+                    if !(expected.node_id == enrollment.node_id
+                        && expected.enrollment_id == enrollment.enrollment_id
+                        && (expected.bundle.is_none() || expected.bundle == enrollment.bundle))
+                    {
+                        return Err(ManagementError::EnrollmentChanged);
+                    }
                 } else {
-                    ensure!(
-                        *running,
-                        "Hellas is not running; check the image supports owner grant funding"
-                    );
+                    if !*running {
+                        return Err(ManagementError::OwnerProviderUnavailable);
+                    }
                 }
                 machine.enrollment = Some(enrollment.clone());
                 machine.running = Some(*running);
@@ -338,10 +410,12 @@ impl Service {
     /// Live owner authentication plus a stable, enrolled execution route.
     pub async fn resolve(&self, name: &str) -> Result<Enrollment> {
         let response = self.admin(name, Operation::Status).await?;
-        ensure!(response["running"] == true, "machine is not running");
+        if response["running"] != true {
+            return Err(ManagementError::NotRunning);
+        }
         self.load(name)?
             .enrollment
-            .context("machine has not enrolled")
+            .ok_or(ManagementError::NotEnrolled)
     }
 
     pub async fn execute(&self, request: Request) -> Result<Value> {
@@ -388,7 +462,7 @@ impl Service {
                 let machine = self.load(&name)?;
                 self.credentials(&machine)?;
                 let Source::Cloud { receipt } = machine.source else {
-                    bail!("bare-metal hosts cannot be destroyed through a cloud adapter")
+                    return Err(ManagementError::BareMetalDestroy);
                 };
                 let id = crate::deployment::destroy(&receipt, None, None).await?;
                 Ok(json!({"id":id,"destroyed":true}))
@@ -398,19 +472,27 @@ impl Service {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum DirectoryError {
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error("management directory must be owned by this user with mode 0700")]
+    Permissions,
+}
+
 /// Refuse an existing shared or foreign directory instead of silently changing it.
-pub(crate) fn private_directory(path: &Path) -> Result<()> {
+pub(crate) fn private_directory(path: &Path) -> std::result::Result<(), DirectoryError> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true).mode(0o700);
     builder.create(path)?;
     let meta = std::fs::symlink_metadata(path)?;
-    ensure!(
-        meta.is_dir()
-            && !meta.file_type().is_symlink()
-            && meta.uid() == unsafe { libc::geteuid() }
-            && meta.permissions().mode() & 0o077 == 0,
-        "management directory must be owned by this user with mode 0700"
-    );
+    if !(meta.is_dir()
+        && !meta.file_type().is_symlink()
+        && meta.uid() == unsafe { libc::geteuid() }
+        && meta.permissions().mode() & 0o077 == 0)
+    {
+        return Err(DirectoryError::Permissions);
+    }
     Ok(())
 }

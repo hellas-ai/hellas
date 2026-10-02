@@ -71,8 +71,6 @@ impl FullNode {
     }
     async fn start_inner(config: Config, indexing: Indexing) -> Result<Self, Error> {
         config.info()?;
-        #[cfg(feature = "construction-audit")]
-        crate::construction_audit::record();
         let (started, ready) = oneshot::channel();
         let (stop, mut stopped) = oneshot::channel();
         let retained_config = config.clone();

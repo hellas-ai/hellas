@@ -29,6 +29,14 @@ async fn fetch_streams_before_terminal_then_pays_once_with_metadata_only_journal
 
     struct PausedFetch(Arc<tokio::sync::Notify>);
     impl WorkBackend for PausedFetch {
+        fn try_admit(
+            &self,
+            domain: hellas_work::work::admission::CapacityDomain,
+        ) -> Result<hellas_work::work::admission::WorkPermit, hellas_work::work::BackendFault>
+        {
+            Err(hellas_work::work::admission::AdmissionError::Unsupported(domain).into())
+        }
+
         async fn fetch_stream(
             &self,
             input: PreparedFetchInput,
@@ -227,6 +235,14 @@ async fn paid_fetch_larger_than_a_wire_frame_streams_and_pays_without_disk_paylo
     use hellas_work::work::{admit_payment, fetch_result_stream};
     struct LargeFetch;
     impl WorkBackend for LargeFetch {
+        fn try_admit(
+            &self,
+            domain: hellas_work::work::admission::CapacityDomain,
+        ) -> Result<hellas_work::work::admission::WorkPermit, hellas_work::work::BackendFault>
+        {
+            Err(hellas_work::work::admission::AdmissionError::Unsupported(domain).into())
+        }
+
         async fn fetch(
             &self,
             input: PreparedFetchInput,
@@ -409,6 +425,13 @@ async fn streamed_fetch_cannot_pay_without_a_complete_authenticated_terminal() {
 struct FetchBackend(AtomicUsize);
 
 impl WorkBackend for FetchBackend {
+    fn try_admit(
+        &self,
+        domain: hellas_work::work::admission::CapacityDomain,
+    ) -> Result<hellas_work::work::admission::WorkPermit, hellas_work::work::BackendFault> {
+        Err(hellas_work::work::admission::AdmissionError::Unsupported(domain).into())
+    }
+
     async fn fetch(
         &self,
         input: PreparedFetchInput,

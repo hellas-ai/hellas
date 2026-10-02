@@ -55,16 +55,19 @@ use hellas_work::work_open::SetupView;
 #[cfg(test)]
 use hellas_work::work_store::{ChannelStore, JobPhase, Role, SetupStore};
 use iroh::{Endpoint, EndpointId, SecretKey, endpoint::Connection, endpoint::presets};
-use tokio::sync::{Semaphore, mpsc, oneshot};
+#[cfg(test)]
+use tokio::sync::oneshot;
+use tokio::sync::{Semaphore, mpsc};
 use tokio::task::{JoinHandle, JoinSet};
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use super::node_handler::NodeHandlerImpl;
 use crate::commands::discovery::{DiscoveryAdvertiser, served_alpns, start_server_advertising};
 use crate::identity::OpenIdentity;
+use hellas_sdk::work_router::WorkRouter;
 
 pub(super) use hellas_sdk::paid_provider::{
-    MountedSetup, MountedWork, WorkRunner, WorkRunnerConfig,
+    MountedSetup, MountedWork, WorkRunner, WorkRunnerConfig, WorkWatcher,
 };
 
 /// Keep peer-controlled transport state finite. A connection can multiplex
@@ -76,29 +79,14 @@ const RPC_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const RPC_CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub(super) struct NodeHandle {
-    grants: Option<hellas_work::grant_service::GrantService>,
+    router: Option<WorkRouter>,
     _control: Option<hellas_sdk::local::LocalControlServer>,
     node_id: EndpointId,
-    accept_task: Option<JoinHandle<()>>,
+    accept_task: JoinHandle<()>,
     endpoint: Endpoint,
     discovery: Option<DiscoveryAdvertiser>,
     work: Option<WorkWatcher>,
     chain: Option<hellas_sdk::FullNode>,
-}
-
-/// The clock over this node's paid-work journals, and the way to stop
-/// it.
-///
-/// Stopped rather than aborted: every journal this task holds is closed
-/// when the task returns, and a shutdown that aborted it would drop
-/// those files at whatever point the runtime chose. Nothing here is
-/// racing a torn write — a journal append is synchronous and fsynced
-/// inside its own borrow, and there is no await inside one — but a
-/// runner told to stop between two steps is what leaves the operator a
-/// process that owns nothing.
-struct WorkWatcher {
-    stop: oneshot::Sender<()>,
-    task: JoinHandle<()>,
 }
 
 impl NodeHandle {
@@ -112,30 +100,37 @@ impl NodeHandle {
     }
 
     pub(super) async fn shutdown(mut self) -> anyhow::Result<()> {
-        if let Some(grants) = &self.grants {
-            grants.drain().await?;
+        self.accept_task.abort();
+        let mut result = match (&mut self.accept_task).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.is_cancelled() => Ok(()),
+            Err(error) => Err(anyhow::Error::from(error)),
+        };
+        if let Some(grants) = self.router.as_ref().and_then(WorkRouter::grant_service) {
+            result = result.and(grants.drain().await.map_err(anyhow::Error::from));
         }
 
         // The clock first, and joined rather than aborted: its journals
         // are released when its task returns, and a node that closed its
         // endpoint while a step was still writing would be a node whose
         // files outlive it.
-        if let Some(watcher) = self.work.take() {
-            let _ = watcher.stop.send(());
-            let _ = watcher.task.await;
-        }
-        if let Some(handle) = self.accept_task.take() {
-            handle.abort();
-            let _ = handle.await;
+        if let Some(watcher) = &mut self.work {
+            result = result.and(watcher.shutdown().await.map_err(anyhow::Error::from));
         }
         if let Some(discovery) = self.discovery.take() {
             discovery.shutdown().await;
         }
         self.endpoint.close().await;
         if let Some(chain) = self.chain.take() {
-            chain.shutdown().await?;
+            result = result.and(chain.shutdown().await.map_err(anyhow::Error::from));
         }
-        Ok(())
+        result
+    }
+}
+
+impl Drop for NodeHandle {
+    fn drop(&mut self) {
+        self.accept_task.abort();
     }
 }
 
@@ -170,14 +165,35 @@ struct RemoteExecutionServices {
 }
 
 pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle> {
+    if let Some((work, _)) = &config.work {
+        work.validate()?;
+    }
     if let Some(grants) = &config.grants {
         anyhow::ensure!(
             grants.provider.transport() == *config.secret_key.public().as_bytes(),
             "grant provider transport differs from node identity"
         );
-        super::validate_grant_resources(&grants.config, &config.fetch_routes)?;
+        anyhow::ensure!(
+            grants
+                .provider
+                .bundle()
+                .genesis
+                .statement
+                .producer_public_key
+                == config.producer_key.public_key(),
+            "grant provider signer differs from node identity"
+        );
     }
-    let prepared_grants = config.grants.map(super::prepare_grants).transpose()?;
+    let grant_plans = config
+        .grants
+        .map(|grants| {
+            let plan = hellas_sdk::grant_provider::GrantProviderPlan::managed(
+                &grants,
+                super::provider_resources(&config.fetch_routes),
+            )?;
+            Ok::<_, hellas_sdk::grant_provider::GrantProviderError>((grants.config, plan))
+        })
+        .transpose()?;
 
     let signer = Arc::new(config.producer_key);
     let mut executor =
@@ -194,7 +210,22 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
     let handle = Executor::spawn_configured(executor)
         .await
         .context("failed to spawn executor")?;
+    let prepared_grants = grant_plans
+        .map(|(config, plan)| {
+            Ok::<_, hellas_sdk::grant_provider::GrantProviderError>((config, plan.open()?))
+        })
+        .transpose()?;
     let advertised_alpns = served_alpns(config.work.is_some(), prepared_grants.is_some());
+    let work_mount = MountedWork::with_backend(handle.clone());
+    let setup_mount = MountedSetup::default();
+    let chain = config.work.as_ref().map(|(_, chain)| chain.clone());
+    let runner = config
+        .work
+        .map(|(work, chain)| {
+            WorkRunner::discover(work, work_mount.clone(), setup_mount.clone())
+                .map(|runner| runner.on_node(chain))
+        })
+        .transpose()?;
     let alpns = advertised_alpns.clone();
     let mut builder = Endpoint::builder(presets::N0)
         .secret_key(config.secret_key)
@@ -237,7 +268,7 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
         .iter()
         .map(|alpn| String::from_utf8(alpn.clone()).expect("service ALPN is ASCII"))
         .collect();
-    node_handler.chain = config.work.as_ref().map(|(_, chain)| chain.clone());
+    node_handler.chain = chain.clone();
 
     // -- The clock. Spawned only when a work configuration was loaded,
     //    and given the same mount slot the accept loop reads: the runner
@@ -249,7 +280,6 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
     let remote_execution = RemoteExecutionServices {
         open_identity: config.open_identity,
     };
-    let work_mount: MountedWork = MountedWork::with_backend(handle.clone());
     let (grants, control, admin) = if let Some((grant_config, store)) = prepared_grants {
         let service = hellas_work::grant_service::GrantService::new(
             store,
@@ -276,10 +306,6 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
             &grant_config.control_socket,
             admin.clone().dispatcher(),
         )?;
-        anyhow::ensure!(
-            work_mount.mount_grants(service.clone()),
-            "grant mount is unavailable"
-        );
         (Some(service), Some(control), Some(admin))
     } else {
         (None, None, None)
@@ -289,38 +315,37 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
         .then(|| start_server_advertising(&endpoint, &advertised_alpns))
         .transpose()
         .context("failed to start service discovery advertising")?;
-    let setup_mount = MountedSetup::default();
-    let chain = config.work.as_ref().map(|(_, chain)| chain.clone());
-    let work = config.work.map(|(work, chain)| {
-        let poll = work.poll;
-        let runner = WorkRunner::discover(work, work_mount.clone(), setup_mount.clone())
-            .map(|runner| runner.on_node(chain));
-        let (stop, stopped) = oneshot::channel();
-        let task = tokio::spawn(async move {
-            match runner {
-                Ok(runner) => runner.run(stopped).await,
-                // §4's rule, at the one place it could still refuse to
-                // start: a root that cannot be enumerated is an operator
-                // error, and a node that exited over it would be a node
-                // answering no contest at all.
-                Err(error) => warn!(%error, "the paid-work journals could not be enumerated"),
-            }
-        });
-        info!(poll_ms = poll.as_millis(), "the paid-work clock is running");
-        WorkWatcher { stop, task }
-    });
-    let serves_work = (work.is_some() || grants.is_some()).then(|| work_mount.clone());
+    let work = runner.map(WorkWatcher::spawn);
+    let serves_work = match (work.is_some(), grants.as_ref()) {
+        (true, Some(grants)) => Some(WorkRouter::Both {
+            payment: work_mount,
+            grants: grants.clone(),
+        }),
+        (true, None) => Some(WorkRouter::Payment(work_mount)),
+        (false, Some(grants)) => Some(WorkRouter::Grants(grants.clone())),
+        (false, None) => None,
+    };
     let serves_setup = work.is_some().then(|| setup_mount.clone());
 
     // -- Accept loop: one task per inbound Connection; per-Connection
     //    dispatch routed by ALPN to the matching service handler.
+    let router = serves_work.clone();
     let accept_endpoint = endpoint.clone();
     let accept_task = tokio::spawn(async move {
         let connection_slots = Arc::new(Semaphore::new(MAX_ACTIVE_RPC_CONNECTIONS));
+        let mut connections = JoinSet::new();
         loop {
-            let incoming = match accept_endpoint.accept().await {
-                Some(inc) => inc,
-                None => break, // endpoint closed
+            let incoming = tokio::select! {
+                completed = connections.join_next(), if !connections.is_empty() => {
+                    if let Some(Err(error)) = completed {
+                        warn!(%error, "node connection task failed");
+                    }
+                    continue;
+                }
+                incoming = accept_endpoint.accept() => incoming,
+            };
+            let Some(incoming) = incoming else {
+                break;
             };
             // Stop accepting before peer-controlled connection tasks can grow
             // without bound. The endpoint's own finite backlog applies
@@ -342,7 +367,7 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
             let work_for_conn = serves_work.clone();
             let setup_for_conn = serves_setup.clone();
             let admin_for_conn = admin.clone();
-            tokio::spawn(async move {
+            connections.spawn(async move {
                 let _connection_slot = connection_slot;
                 let conn = match tokio::time::timeout(RPC_HANDSHAKE_TIMEOUT, accepting).await {
                     Ok(Ok(c)) => c,
@@ -380,10 +405,10 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
 
     Ok(NodeHandle {
         chain,
-        grants,
+        router,
         _control: control,
         node_id,
-        accept_task: Some(accept_task),
+        accept_task,
         endpoint,
         discovery,
         work,
@@ -400,7 +425,7 @@ async fn serve_connection(
     node_handler: NodeHandlerImpl,
     manager: PeerManager,
     setup: Option<MountedSetup>,
-    work: Option<MountedWork>,
+    work: Option<WorkRouter>,
     admin: Option<hellas_sdk::grant_admin::GrantAdmin>,
 ) -> anyhow::Result<()> {
     let transport = Arc::new(IrohTransport::new(conn));

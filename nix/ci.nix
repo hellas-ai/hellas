@@ -151,12 +151,24 @@ let
       mkCargo "check-http-fetch"
         "cargo test -p hellas-gateway -p hellas-providers -p hellas-private -p hellas-store"
         (cargoEnv rustToolchain);
-    # Exercise the production provider loop and paid session recovery; their
-    # feature is absent from the SDK's default tests.
-    sdk-paid-work =
-      mkCargo "check-sdk-paid-work"
-        "cargo test -p hellas-sdk --features paid-client,paid-provider,paid-gateway && cargo clippy -p hellas-sdk --features paid-client,paid-provider,paid-gateway --all-targets -- -D warnings && cargo clippy -p hellas-sdk --no-default-features --features paid-client --all-targets -- -D warnings && cargo clippy -p hellas-sdk --no-default-features --features paid-provider --all-targets -- -D warnings && cargo clippy -p hellas-sdk --no-default-features --features paid-gateway --all-targets -- -D warnings"
-        (cargoEnv rustToolchain);
+    # Exercise both fundings together and independently. Grant-only applications
+    # must work without compiling the chain client or payment observer.
+    sdk-paid-work = mkCargo "check-sdk-paid-work" ''
+      sdk_features=paid-client,paid-provider,paid-gateway,grant-client,grant-provider,grant-gateway,grant-admin
+      cargo test -p hellas-sdk --features "$sdk_features"
+      cargo clippy -p hellas-sdk --features "$sdk_features" --all-targets -- -D warnings
+      grant_features=grant-client,grant-provider,grant-gateway,grant-admin
+      cargo test -p hellas-sdk --no-default-features --features "$grant_features"
+      grant_dependencies=$(cargo tree -p hellas-sdk --no-default-features --features "$grant_features" --edges normal)
+      if [[ "$grant_dependencies" == *hellas-chain* ]]; then
+        echo "grant-only SDK unexpectedly depends on hellas-chain" >&2
+        exit 1
+      fi
+      for sdk_feature in paid-client paid-provider paid-gateway grant-client grant-provider grant-gateway grant-admin; do
+        cargo test -p hellas-sdk --no-default-features --features "$sdk_feature"
+        cargo clippy -p hellas-sdk --no-default-features --features "$sdk_feature" --all-targets -- -D warnings
+      done
+    '' (cargoEnv rustToolchain);
     # The chain service's wire-id pins compile only under `chain`, which
     # `work` does not pull in. `check-validator` links hellas-rpc with
     # that feature but runs hellas-chain's tests, not hellas-rpc's, so

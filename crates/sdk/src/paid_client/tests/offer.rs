@@ -50,10 +50,12 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
         trust.verify_enrollment(&imported.offer().provider).unwrap();
         let mount =
             crate::paid_provider::MountedWork::with_backend(super::recovery::Backend::default());
-        assert!(mount.mount(
-            hellas_rpc::peers::PeerId::from_bytes(*client_endpoint.id().as_bytes()),
-            &service
-        ));
+        mount
+            .mount(
+                hellas_rpc::peers::PeerId::from_bytes(*client_endpoint.id().as_bytes()),
+                &service,
+            )
+            .unwrap();
         use crate::grant_client::tests::{definition, network, principal};
         use crate::grant_client::{GrantSessionOptions, GrantTransport, UnpinnedOffer};
         use hellas_rpc::protocol::work_grant::{
@@ -79,7 +81,10 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
             Arc::new(hellas_work::grant_service::wall_clock),
         )
         .unwrap();
-        assert!(mount.mount_grants(grants.clone()));
+        let mount = crate::work_router::WorkRouter::Both {
+            payment: mount,
+            grants: grants.clone(),
+        };
         let offer = SignedOffer::sign(
             Offer {
                 network: network(),
@@ -150,7 +155,7 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
                 Duration::from_secs(60),
             )
             .unwrap();
-        let mut session = PaymentSession {
+        let mut session = PaidWorkSession {
             chain: SessionChain::Constructed,
             args: PaidWorkOptions {
                 config: fixture.config.clone(),
@@ -192,7 +197,7 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
                 .unwrap(),
             crate::test_support::PRICE
         );
-        let mut authorized = crate::WorkSession::<crate::work_session::GrantFunding>::open(
+        let mut authorized = crate::grant_client::GrantSession::open(
             GrantSessionOptions {
                 target: grant_target,
                 client: principal(1).0,

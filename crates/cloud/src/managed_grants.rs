@@ -1,9 +1,40 @@
 //! Bootstrap authority and anchor the private journal to the persistent identity.
-use anyhow::{Context, Result, ensure};
 use hellas_rpc::protocol::work_grant::{grant_network, records::Principal};
 use hellas_work::work_store::{grant::GrantStore, journal::journal_name_parts};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+
+pub type Result<T> = std::result::Result<T, ManagedGrantError>;
+
+#[derive(Debug, thiserror::Error)]
+pub enum ManagedGrantError {
+    #[error(transparent)]
+    Config(#[from] crate::config::ConfigError),
+    #[error(transparent)]
+    Store(#[from] hellas_work::work_store::grant::GrantStoreError),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Wire(#[from] hellas_wire::WireStatus),
+    #[error("grant journal binding changed; refusing startup")]
+    BindingChanged,
+    #[error("owner enrollment changed; refusing startup")]
+    OwnerChanged,
+    #[error("managed control path is not an owned socket")]
+    SocketOwned,
+    #[error("control socket changed during recovery")]
+    SocketChanged,
+    #[error("grant provider is not ready")]
+    NotReady,
+    #[error("grant journal missing; restore it or provision a new machine identity")]
+    MissingJournal,
+    #[error("managed control socket is already serving")]
+    SocketBusy,
+    #[error("socket parent missing")]
+    SocketParent,
+    #[error("provider status missing")]
+    ProviderMissing,
+}
 
 #[derive(Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -27,27 +58,35 @@ pub(crate) fn prepare(
     let anchor_path = data.join("grant-journal.json");
     if anchor_path.exists() {
         let saved: Anchor = crate::config::read_json(&anchor_path)?;
-        ensure!(
-            saved == anchor,
-            "grant journal binding changed; refusing startup"
-        );
-        ensure!(
-            std::fs::read_dir(&anchor.journal).is_ok_and(|entries| entries.flatten().any(|e| {
-                e.file_name()
-                    .to_str()
-                    .and_then(journal_name_parts)
-                    .is_some_and(|(stem, _)| stem == "grants")
-            })),
-            "grant journal missing; restore it or provision a new machine identity"
-        );
+        if saved != anchor {
+            return Err(ManagedGrantError::BindingChanged);
+        }
+        let entries = std::fs::read_dir(&anchor.journal).map_err(|source| {
+            if source.kind() == std::io::ErrorKind::NotFound {
+                ManagedGrantError::MissingJournal
+            } else {
+                ManagedGrantError::Io(source)
+            }
+        })?;
+        let mut found = false;
+        for entry in entries {
+            let entry = entry?;
+            found |= entry
+                .file_name()
+                .to_str()
+                .and_then(journal_name_parts)
+                .is_some_and(|(stem, _)| stem == "grants");
+        }
+        if !found {
+            return Err(ManagedGrantError::MissingJournal);
+        }
     }
     let owner_binding = data.join("owner-enrollment.json");
     if owner_binding.exists() {
         let saved: Option<Principal> = crate::config::read_json(&owner_binding)?;
-        ensure!(
-            saved.as_ref() == owner,
-            "owner enrollment changed; refusing startup"
-        );
+        if saved.as_ref() != owner {
+            return Err(ManagedGrantError::OwnerChanged);
+        }
     } else {
         crate::config::save_private(&owner_binding, &owner, true)?;
     }
@@ -66,7 +105,7 @@ pub(crate) fn prepare(
         .map(|p| {
             let path = private.join("owner.enrollment");
             hellas_private::write_atomically(&path, ".enrollment", &p.bundle().canonical_bytes())?;
-            Ok::<_, anyhow::Error>(path)
+            Ok::<_, ManagedGrantError>(path)
         })
         .transpose()?;
     let grant_config = private.join("bootstrap-grants.json");
@@ -97,22 +136,20 @@ pub(crate) fn reclaim_socket(path: &Path) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error.into()),
     };
-    ensure!(
-        metadata.file_type().is_socket() && metadata.uid() == unsafe { libc::geteuid() },
-        "managed control path is not an owned socket"
-    );
+    if !(metadata.file_type().is_socket() && metadata.uid() == unsafe { libc::geteuid() }) {
+        return Err(ManagedGrantError::SocketOwned);
+    }
     match UnixStream::connect(path) {
-        Ok(_) => anyhow::bail!("managed control socket is already serving"),
+        Ok(_) => return Err(ManagedGrantError::SocketBusy),
         Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {}
         Err(error) => return Err(error.into()),
     }
     let current = std::fs::symlink_metadata(path)?;
-    ensure!(
-        metadata.dev() == current.dev() && metadata.ino() == current.ino(),
-        "control socket changed during recovery"
-    );
+    if !(metadata.dev() == current.dev() && metadata.ino() == current.ino()) {
+        return Err(ManagedGrantError::SocketChanged);
+    }
     std::fs::remove_file(path)?;
-    hellas_private::sync_directory(path.parent().context("socket parent missing")?)?;
+    hellas_private::sync_directory(path.parent().ok_or(ManagedGrantError::SocketParent)?)?;
     Ok(())
 }
 
@@ -123,11 +160,14 @@ pub(crate) async fn ready(socket: &Path) -> Result<()> {
     let status = hellas_rpc::services::host_control::HostControlClientImpl::new(transport)
         .get_host_status(hellas_rpc::pb::host::GetHostStatusRequest {})
         .await?;
-    ensure!(
-        status.provider.context("provider status missing")?.state
-            == hellas_rpc::pb::host::RuntimeState::Running as i32,
-        "grant provider is not ready"
-    );
+    if status
+        .provider
+        .ok_or(ManagedGrantError::ProviderMissing)?
+        .state
+        != hellas_rpc::pb::host::RuntimeState::Running as i32
+    {
+        return Err(ManagedGrantError::NotReady);
+    }
     Ok(())
 }
 

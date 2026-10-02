@@ -120,3 +120,153 @@ pub fn response_stream<E: Send + 'static, X: Send + 'static>(
         }
     })
 }
+
+/// Owns accepted tasks until their futures physically terminate. Drain polls the
+/// handles in place so dropping a drain future cannot detach unfinished work.
+#[derive(Default)]
+pub(crate) struct WorkTasks {
+    state: std::sync::Mutex<TaskState>,
+    draining: tokio::sync::Mutex<()>,
+}
+#[derive(Default)]
+struct TaskState {
+    closed: bool,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+    failure: Option<Arc<tokio::task::JoinError>>,
+}
+impl TaskState {
+    fn poll(&mut self, cx: &mut std::task::Context<'_>, finished_only: bool) {
+        use std::{future::Future as _, pin::Pin, task::Poll};
+        let failure = &mut self.failure;
+        self.tasks.retain_mut(|task| {
+            if finished_only && !task.is_finished() {
+                return true;
+            }
+            match Pin::new(task).poll(cx) {
+                Poll::Pending => true,
+                Poll::Ready(Ok(())) => false,
+                Poll::Ready(Err(error)) => {
+                    failure.get_or_insert_with(|| Arc::new(error));
+                    false
+                }
+            }
+        });
+    }
+}
+impl WorkTasks {
+    pub fn spawn(
+        &self,
+        future: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> Result<(), hellas_gateway::WorkGatewayBusy> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| hellas_gateway::WorkGatewayBusy)?;
+        if state.closed {
+            return Err(hellas_gateway::WorkGatewayBusy);
+        }
+        let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+        state.poll(&mut cx, true);
+        state.tasks.push(tokio::spawn(future));
+        Ok(())
+    }
+
+    pub fn close(&self) {
+        match self.state.lock() {
+            Ok(mut state) => state.closed = true,
+            Err(error) => error.into_inner().closed = true,
+        }
+    }
+
+    pub async fn drain(&self) -> Result<(), hellas_gateway::WorkShutdownError> {
+        use hellas_gateway::WorkShutdownError;
+        self.close();
+        let _draining = self.draining.lock().await;
+        std::future::poll_fn(|cx| {
+            let (mut state, poisoned) = match self.state.lock() {
+                Ok(state) => (state, false),
+                Err(error) => (error.into_inner(), true),
+            };
+            state.poll(cx, false);
+            if !state.tasks.is_empty() {
+                return std::task::Poll::Pending;
+            }
+            std::task::Poll::Ready(if let Some(error) = &state.failure {
+                Err(WorkShutdownError::Task(error.clone()))
+            } else if poisoned {
+                Err(WorkShutdownError::Poisoned)
+            } else {
+                Ok(())
+            })
+        })
+        .await
+    }
+}
+
+#[cfg(test)]
+mod task_tests {
+    use super::WorkTasks;
+    use hellas_gateway::WorkShutdownError;
+    use tokio::sync::oneshot;
+
+    #[tokio::test]
+    async fn cancelled_drain_keeps_tasks_even_when_state_is_poisoned() {
+        for poison in [false, true] {
+            let tasks = WorkTasks::default();
+            let (release, released) = oneshot::channel();
+            let (finished, completed) = oneshot::channel();
+            tasks
+                .spawn(async move {
+                    released.await.unwrap();
+                    finished.send(()).unwrap();
+                })
+                .unwrap();
+            if poison {
+                assert!(
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let _state = tasks.state.lock().unwrap();
+                        panic!("inject poisoned task state");
+                    }))
+                    .is_err()
+                );
+            }
+            {
+                let mut first = std::pin::pin!(tasks.drain());
+                assert!(futures::poll!(&mut first).is_pending());
+            }
+            assert!(tasks.spawn(async {}).is_err());
+            let mut second = std::pin::pin!(tasks.drain());
+            assert!(futures::poll!(&mut second).is_pending());
+            release.send(()).unwrap();
+            let result = second.await;
+            completed.await.unwrap();
+            if poison {
+                assert!(matches!(result, Err(WorkShutdownError::Poisoned)));
+            } else {
+                result.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn task_panic_is_reported_after_other_work_finishes() {
+        let tasks = WorkTasks::default();
+        tasks
+            .spawn(async {
+                panic!("inject gateway task panic");
+            })
+            .unwrap();
+        let (release, released) = oneshot::channel();
+        tasks
+            .spawn(async {
+                released.await.unwrap();
+            })
+            .unwrap();
+        let mut draining = std::pin::pin!(tasks.drain());
+        assert!(futures::poll!(&mut draining).is_pending());
+        tokio::task::yield_now().await;
+        assert!(futures::poll!(&mut draining).is_pending());
+        release.send(()).unwrap();
+        assert!(matches!(draining.await, Err(WorkShutdownError::Task(error)) if error.is_panic()));
+    }
+}

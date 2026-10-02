@@ -1,10 +1,37 @@
 use std::{net::SocketAddr, time::Duration};
 
-use anyhow::{Result, ensure};
 use iroh::{Endpoint, EndpointAddr, endpoint::presets};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{Credentials, Enrollment};
+
+pub type Result<T> = std::result::Result<T, AdminError>;
+
+#[derive(Debug, thiserror::Error)]
+pub enum AdminError {
+    #[error(transparent)]
+    Config(#[from] crate::config::ConfigError),
+    #[error(transparent)]
+    Bind(#[from] iroh::endpoint::BindError),
+    #[error(transparent)]
+    Connect(#[from] iroh::endpoint::ConnectError),
+    #[error(transparent)]
+    Connection(#[from] iroh::endpoint::ConnectionError),
+    #[error(transparent)]
+    Write(#[from] iroh::endpoint::WriteError),
+    #[error(transparent)]
+    Read(#[from] iroh::endpoint::ReadToEndError),
+    #[error(transparent)]
+    Closed(#[from] iroh::endpoint::ClosedStream),
+    #[error(transparent)]
+    Timeout(#[from] tokio::time::error::Elapsed),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+    #[error("machine belongs to another identity; owner key required")]
+    OwnerKey,
+    #[error("request too large")]
+    RequestBound,
+}
 
 pub const ALPN: &[u8] = b"hellas-extras/admin/1";
 pub const MAX_MESSAGE: usize = 64 * 1024;
@@ -63,18 +90,17 @@ pub async fn call_as(
     operation: Operation,
     owner_key: Option<&iroh::SecretKey>,
 ) -> Result<Response> {
-    if let Some(owner) = &credentials.owner {
-        ensure!(
-            owner_key.is_some_and(|key| key.public().to_string() == *owner),
-            "machine belongs to another identity; owner key required"
-        );
+    if let Some(owner) = &credentials.owner
+        && owner_key.is_none_or(|key| key.public().to_string() != *owner)
+    {
+        return Err(AdminError::OwnerKey);
     }
     let mut builder = Endpoint::builder(presets::N0);
     if let Some(key) = owner_key {
         builder = builder.secret_key(key.clone());
     }
-    let endpoint = builder.bind().await?;
     let mut addr = EndpointAddr::from(credentials.secret_key()?.public());
+    let endpoint = builder.bind().await?;
     if let Some(address) = address {
         addr = addr.with_ip_addr(address);
     }
@@ -86,12 +112,14 @@ pub async fn call_as(
             token: credentials.token.clone(),
             operation,
         })?;
-        ensure!(request.len() <= MAX_MESSAGE, "request too large");
+        if request.len() > MAX_MESSAGE {
+            return Err(AdminError::RequestBound);
+        }
         send.write_all(&request).await?;
         send.finish()?;
         let response = serde_json::from_slice(&recv.read_to_end(MAX_MESSAGE).await?)?;
         connection.close(0u32.into(), b"done");
-        Ok::<_, anyhow::Error>(response)
+        Ok::<_, AdminError>(response)
     })
     .await;
     endpoint.close().await;

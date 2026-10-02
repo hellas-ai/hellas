@@ -485,7 +485,6 @@ fn apple_offer_pin_verifies_static_root_policy_then_open_and_result() {
                 kind: GrantKind::Owner(client.clone()),
                 policies: vec![],
                 limits: vec![],
-                weight: NonZeroU16::new(1).unwrap(),
                 max_job_millis: NonZeroU64::new(1000).unwrap(),
                 max_in_flight: NonZeroU16::new(1).unwrap(),
                 expires: None,

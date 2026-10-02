@@ -1,8 +1,12 @@
 //! Node control uses live journal permissions on every request. Mutations
 //! recheck authority inside the writer after decoding.
 use hellas_rpc::{
-    pb::host::*,
-    protocol::work_grant::{admin::*, records::GrantPolicy},
+    pb::host::{
+        GatewayAccess, GetGatewayAccessRequest, GetHostStatusRequest, GrantControlRequest,
+        GrantControlResponse, HostStatus, RuntimeState, ServiceStatus, SetGatewayStateRequest,
+        SetProviderStateRequest,
+    },
+    protocol::work_grant::{admin::GrantCommand, records::GrantPolicy},
     services::host_control::{HostControlHandler, HostControlServer},
 };
 use hellas_wire::{WireCode, WireStatus};
@@ -159,9 +163,10 @@ impl HostControlHandler for GrantAdmin {
     }
 }
 
-#[cfg(all(test, unix, feature = "paid-client"))]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use hellas_rpc::protocol::work_grant::admin::{GrantReply, UserCommand, UserPermissions};
     use hellas_rpc::protocol::work_grant::{UnixMillis, records::Principal};
     use hellas_wire::{
         AuthLevel, Dispatcher, StreamTransport, TransportContext,
@@ -170,13 +175,21 @@ mod tests {
     use hellas_work::{work::WorkBackend, work_store::grant::GrantStore};
     #[derive(Clone)]
     struct NoBackend;
-    impl WorkBackend for NoBackend {}
+    impl WorkBackend for NoBackend {
+        fn try_admit(
+            &self,
+            domain: hellas_work::work::admission::CapacityDomain,
+        ) -> Result<hellas_work::work::admission::WorkPermit, hellas_work::work::BackendFault>
+        {
+            Err(hellas_work::work::admission::AdmissionError::Unsupported(domain).into())
+        }
+    }
     #[tokio::test]
     async fn host_control_requires_local_owner_before_decoding_and_serves_real_unix() {
         let root = tempfile::tempdir().unwrap();
         hellas_private::restrict_directory(root.path()).unwrap();
         let (bundle, key) =
-            crate::test_support::enrollment(iroh::SecretKey::from_bytes(&[6; 32]).public());
+            crate::test_identity::enrollment(iroh::SecretKey::from_bytes(&[6; 32]).public());
         let principal = Principal::verify(bundle).unwrap();
         let mut store = GrantStore::open(
             &root.path().join("journal"),
@@ -253,9 +266,9 @@ mod tests {
     async fn revocation_is_checked_on_every_rpc_of_an_existing_connection() {
         let root = tempfile::tempdir().unwrap();
         let (bundle, key) =
-            crate::test_support::enrollment(iroh::SecretKey::from_bytes(&[6; 32]).public());
+            crate::test_identity::enrollment(iroh::SecretKey::from_bytes(&[6; 32]).public());
         let admin_principal = Principal::verify(
-            crate::test_support::enrollment(iroh::SecretKey::from_bytes(&[7; 32]).public()).0,
+            crate::test_identity::enrollment(iroh::SecretKey::from_bytes(&[7; 32]).public()).0,
         )
         .unwrap();
         let store = GrantStore::open(

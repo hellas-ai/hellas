@@ -150,7 +150,7 @@ pub fn client_journal_root(identity: &Principal) -> CliResult<PathBuf> {
     Ok(data_root(identity)?.join("channels"))
 }
 /// Saved Offer terms may have expired; only use this as a signed locator.
-/// WorkSession obtains fresh authenticated standing before proposing a job.
+/// GrantSession obtains fresh authenticated standing before proposing a job.
 #[cfg(feature = "gateway")]
 pub fn load_offer(identity: &Principal, name: &str) -> CliResult<SignedOffer> {
     let path = alias(&data_root(identity)?, "offers", name)?;

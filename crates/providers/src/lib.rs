@@ -12,6 +12,6 @@ pub use http::{
     HttpFetchAdaptorFactory, HttpFetchProvider, HttpProviderConfig, HttpSecret,
 };
 
-pub use openai::{EmptyOpenAiKey, OpenAiResponsesFetchProvider};
+pub use openai::{EmptyOpenAiKey, OpenAiConfigError, OpenAiResponsesFetchProvider};
 pub use responses_fetch::{execute_responses_request, responses_http_client};
 pub use responses_projector::ResponsesFetchAdaptorFactory;

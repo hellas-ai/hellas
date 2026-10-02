@@ -20,10 +20,9 @@ use hellas_rpc::{Assurance, FetchEnvironment, ProducerSigningKey, Retention};
 use hellas_work::work::{ClientEndpoint, JobProposal, ProviderEndpoint, WorkService};
 use hellas_work::work_store::{ChannelStore, Role, SetupOrigin};
 
-use hellas_rpc::{
-    Digest, PlatformCredential, PlatformEnrollment, ProviderEnrollmentBundle,
-    ProviderGenesisStatement, PublicKey, RootKind, RootProof, SignedProviderGenesis,
-};
+#[cfg(feature = "paid-client")]
+pub(crate) use crate::test_identity::enrollment;
+#[cfg(feature = "paid-client")]
 use iroh::EndpointId;
 
 pub(crate) const PRICE: u64 = 10;
@@ -306,32 +305,6 @@ fn edge(value: u64, reserve: u64, maker: Key, taker: Key, terms: TermsHash, allo
     bytes.extend_from_slice(terms.as_bytes());
     bytes.push(allowed);
     Edge::decode_exact(&bytes).unwrap()
-}
-
-pub(crate) fn enrollment(peer: EndpointId) -> (ProviderEnrollmentBundle, ProducerSigningKey) {
-    let root = ProducerSigningKey::from_secret_bytes([1; 32]).unwrap();
-    let producer = ProducerSigningKey::from_secret_bytes([2; 32]).unwrap();
-    let statement = ProviderGenesisStatement {
-        root_kind: RootKind::Software,
-        root_public_key: root.public_key(),
-        producer_public_key: producer.public_key(),
-        transport_public_key: PublicKey::Ed25519(*peer.as_bytes()),
-        platform_credential: PlatformCredential::Absent,
-        installation_nonce: [3; 32],
-    };
-    let proof = root
-        .sign_digest(Digest::hash(&statement.canonical_bytes()))
-        .unwrap();
-    (
-        ProviderEnrollmentBundle {
-            genesis: SignedProviderGenesis {
-                statement,
-                root_proof: RootProof::Software(proof),
-            },
-            platform: PlatformEnrollment::Absent,
-        },
-        producer,
-    )
 }
 
 fn payment_policy() -> hellas_rpc::protocol::work::JobPaymentPolicyV2 {

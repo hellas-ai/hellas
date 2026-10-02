@@ -20,7 +20,7 @@ pub(super) enum GenerationError {
     #[error("Inference error: {0}")]
     Execution(#[from] ClientError),
     #[error("Inference error: {0}")]
-    Decode(#[from] anyhow::Error),
+    Decode(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("execution stream ended without terminal outcome")]
     MissingTerminalOutcome,
 }
@@ -49,14 +49,14 @@ pub(super) fn generation_stream(
         while let Some(event) = inner.next().await {
             match event? {
                 crate::execution::ExecutionEvent::Chunk { tokens, .. } => {
-                    let delta = decoder.push_bytes(&tokens)?;
+                    let delta = decoder.push_bytes(&tokens).map_err(|error| GenerationError::Decode(error.into()))?;
                     if !delta.is_empty() {
                         yield GenerationEvent::Delta(delta);
                     }
                 }
                 crate::execution::ExecutionEvent::Done(outcome) => {
                     if matches!(outcome, Outcome::Completed { .. }) {
-                        let delta = decoder.finish()?;
+                        let delta = decoder.finish().map_err(|error| GenerationError::Decode(error.into()))?;
                         if !delta.is_empty() {
                             yield GenerationEvent::Delta(delta);
                         }

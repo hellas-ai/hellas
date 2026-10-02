@@ -6,6 +6,8 @@ mod anthropic;
 mod archive;
 mod backend;
 mod dispatch;
+mod error;
+pub use error::{GatewayConfigError, GatewayError, GatewayResult};
 mod http_fetch;
 mod metrics;
 mod openai;
@@ -16,7 +18,6 @@ mod responses;
 mod state;
 mod wrap;
 
-use anyhow::{Context, bail};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -41,7 +42,7 @@ pub use archive::ArchiveOptions;
 pub use execution::{
     CausalLmExecutionEnvironment, ExecutionEvent, Outcome, PreparedExecution, StopReason,
 };
-pub use http_fetch::{HttpGatewayConfig, HttpGatewayOptions, HttpRoute, start_http};
+pub use http_fetch::{HttpGatewayConfig, HttpGatewayOptions, HttpRoute, RoutingError, start_http};
 
 const DEFAULT_HTTP_PORT: u16 = 8080;
 
@@ -87,6 +88,16 @@ pub type WorkFetchStream = WorkOutputStream<hellas_rpc::output::OutputEvent>;
 #[error("Work gateway is busy; retry later")]
 pub struct WorkGatewayBusy;
 
+#[derive(Clone, Debug, thiserror::Error)]
+pub enum WorkShutdownError {
+    #[error("gateway task state is poisoned")]
+    Poisoned,
+    #[error("gateway task failed: {0}")]
+    Task(#[source] Arc<tokio::task::JoinError>),
+    #[error("gateway retains unresolved work for recovery: {0}")]
+    Recovery(#[source] Arc<dyn std::error::Error + Send + Sync>),
+}
+
 pub trait WorkExecutionBackend: Send + Sync {
     /// Providers configured for the HTTP Fetch manifest.
     fn fetch_providers(&self) -> Vec<EndpointId> {
@@ -114,7 +125,7 @@ pub trait WorkExecutionBackend: Send + Sync {
     ) -> Result<WorkOutputStream<ExecutionEvent>, WorkGatewayError>;
 
     /// Finish accepted work and its funding obligations during graceful shutdown.
-    fn drain(&self) -> futures::future::BoxFuture<'_, ()>;
+    fn drain(&self) -> futures::future::BoxFuture<'_, Result<(), WorkShutdownError>>;
 }
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -204,7 +215,7 @@ pub struct GatewayHandle {
     address: SocketAddr,
     bearer: String,
     shutdown: Arc<tokio::sync::Notify>,
-    task: tokio::task::JoinHandle<anyhow::Result<()>>,
+    task: tokio::task::JoinHandle<crate::GatewayResult<()>>,
 }
 
 impl GatewayHandle {
@@ -226,11 +237,9 @@ impl GatewayHandle {
         self.task.is_finished()
     }
 
-    pub async fn shutdown(mut self) -> anyhow::Result<()> {
+    pub async fn shutdown(mut self) -> crate::GatewayResult<()> {
         self.request_shutdown();
-        (&mut self.task)
-            .await
-            .context("gateway task failed to join")?
+        (&mut self.task).await.map_err(GatewayError::Task)?
     }
 }
 
@@ -241,18 +250,18 @@ impl Drop for GatewayHandle {
 }
 
 /// Start a gateway without installing process signal handlers.
-pub async fn start(options: GatewayOptions) -> anyhow::Result<GatewayHandle> {
+pub async fn start(options: GatewayOptions) -> crate::GatewayResult<GatewayHandle> {
     let paid_work = options.paid_work.clone();
     let result = start_gateway(options).await;
     if result.is_err()
         && let Some(backend) = paid_work
     {
-        backend.drain().await;
+        return finish_cleanup(result, backend.drain().await);
     }
     result
 }
 
-async fn start_gateway(options: GatewayOptions) -> anyhow::Result<GatewayHandle> {
+async fn start_gateway(options: GatewayOptions) -> crate::GatewayResult<GatewayHandle> {
     let listener = bind_gateway(
         &options.host,
         options.port,
@@ -328,10 +337,8 @@ async fn launch_gateway(
     wrap_command: Option<&str>,
     wrap_args: &[String],
     paid_work: Option<Arc<dyn WorkExecutionBackend>>,
-) -> anyhow::Result<GatewayHandle> {
-    let bound_addr = listener
-        .local_addr()
-        .context("listener has no local address")?;
+) -> crate::GatewayResult<GatewayHandle> {
+    let bound_addr = listener.local_addr()?;
     info!("gateway listening on {bound_addr}");
     bearer.announce();
 
@@ -371,20 +378,20 @@ async fn launch_gateway(
                         res = &mut server => {
                             // Gateway stopped or errored; kill_on_drop tears the
                             // wrapped child down too.
-                            res.context("gateway server failed")?;
+                            res?;
                         }
                         status = child.wait() => {
-                            let status = status.context("waiting on wrapped child failed")?;
+                            let status = status?;
                             task_shutdown.notify_one();
-                            server.await.context("gateway server failed")?;
+                            server.await?;
                             if !status.success() {
-                                bail!("wrapped command exited with status {status}");
+                                return Err(GatewayError::WrappedCommand(status));
                             }
                         }
                     }
                 }
                 None => {
-                    server.await.context("gateway server failed")?;
+                    server.await?;
                 }
             }
             Ok(())
@@ -401,44 +408,57 @@ async fn launch_gateway(
     })
 }
 
+fn finish_cleanup<T>(
+    result: GatewayResult<T>,
+    drained: Result<(), WorkShutdownError>,
+) -> GatewayResult<T> {
+    match (result, drained) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(error)) => Err(error.into()),
+        (Err(error), Ok(())) => Err(error),
+        (Err(primary), Err(cleanup)) => Err(GatewayError::Cleanup {
+            primary: Box::new(primary),
+            cleanup,
+        }),
+    }
+}
+
 // Keep cleanup outside the fallible server/child branch: a failed wrapper is
 // also a normal reason for its HTTP requests to have been disconnected.
 async fn finish_paid_work(
     paid_work: Option<Arc<dyn WorkExecutionBackend>>,
-    result: anyhow::Result<()>,
-) -> anyhow::Result<()> {
+    result: crate::GatewayResult<()>,
+) -> crate::GatewayResult<()> {
     if let Some(backend) = paid_work {
-        backend.drain().await;
+        return finish_cleanup(result, backend.drain().await);
     }
     result
 }
 
 /// CLI lifecycle wrapper around [`start`].
-pub async fn run(options: GatewayOptions) -> anyhow::Result<()> {
+pub async fn run(options: GatewayOptions) -> crate::GatewayResult<()> {
     wait_for_shutdown(start(options).await?).await
 }
 
 /// Run a paid HTTP gateway with process signal handling.
-pub async fn run_http(options: HttpGatewayOptions) -> anyhow::Result<()> {
+pub async fn run_http(options: HttpGatewayOptions) -> crate::GatewayResult<()> {
     wait_for_shutdown(start_http(options).await?).await
 }
 
-async fn wait_for_shutdown(mut handle: GatewayHandle) -> anyhow::Result<()> {
+async fn wait_for_shutdown(mut handle: GatewayHandle) -> crate::GatewayResult<()> {
     tokio::select! {
         signal = shutdown_signal() => {
-            signal?;
             handle.request_shutdown();
-            (&mut handle.task)
-                .await
-                .context("gateway task failed to join")?
+            let stopped = (&mut handle.task).await.map_err(GatewayError::Task)?;
+            signal.and(stopped)
         }
         result = &mut handle.task => {
-            result.context("gateway task failed to join")?
+            result.map_err(GatewayError::Task)?
         }
     }
 }
 
-async fn shutdown_signal() -> anyhow::Result<()> {
+async fn shutdown_signal() -> crate::GatewayResult<()> {
     #[cfg(unix)]
     {
         let mut terminate =
@@ -462,12 +482,15 @@ async fn bind_gateway(
     host: &str,
     port: Option<u16>,
     allow_remote: bool,
-) -> anyhow::Result<tokio::net::TcpListener> {
+) -> crate::GatewayResult<tokio::net::TcpListener> {
     if let Some(p) = port {
         let addr = access::bind_addr(host, p, allow_remote).await?;
         return tokio::net::TcpListener::bind(addr)
             .await
-            .with_context(|| format!("failed to bind gateway on {addr}"));
+            .map_err(|source| GatewayError::Bind {
+                address: addr,
+                source,
+            });
     }
     let preferred = access::bind_addr(host, DEFAULT_HTTP_PORT, allow_remote).await?;
     match tokio::net::TcpListener::bind(preferred).await {
@@ -477,9 +500,15 @@ async fn bind_gateway(
             info!("failed to bind {preferred}; attempting to bind {fallback}");
             tokio::net::TcpListener::bind(fallback)
                 .await
-                .with_context(|| format!("failed to bind gateway on {fallback}"))
+                .map_err(|source| GatewayError::Bind {
+                    address: fallback,
+                    source,
+                })
         }
-        Err(err) => Err(err).with_context(|| format!("failed to bind gateway on {preferred}")),
+        Err(err) => Err(GatewayError::Bind {
+            address: preferred,
+            source: err,
+        }),
     }
 }
 
@@ -540,7 +569,10 @@ mod paid_shutdown_tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    struct Backend(AtomicBool);
+    struct Backend {
+        drained: AtomicBool,
+        fail: bool,
+    }
     impl WorkExecutionBackend for Backend {
         fn execute(
             &self,
@@ -548,23 +580,53 @@ mod paid_shutdown_tests {
         ) -> Result<WorkOutputStream<ExecutionEvent>, WorkGatewayError> {
             unreachable!("shutdown does not submit new work")
         }
-        fn drain(&self) -> futures::future::BoxFuture<'_, ()> {
+        fn drain(&self) -> futures::future::BoxFuture<'_, Result<(), WorkShutdownError>> {
             Box::pin(async {
-                self.0.store(true, Ordering::Relaxed);
+                self.drained.store(true, Ordering::Relaxed);
+                if self.fail {
+                    Err(WorkShutdownError::Poisoned)
+                } else {
+                    Ok(())
+                }
             })
         }
     }
 
     #[tokio::test]
-    async fn failed_wrapped_process_still_drains_paid_work() {
-        let backend = Arc::new(Backend(AtomicBool::new(false)));
+    async fn failed_server_still_drains_paid_work() {
+        let backend = Arc::new(Backend {
+            drained: AtomicBool::new(false),
+            fail: false,
+        });
         let error = finish_paid_work(
             Some(backend.clone()),
-            Err(anyhow::anyhow!("wrapped command exited with status 1")),
+            Err(GatewayError::Io(std::io::Error::other("injected failure"))),
         )
         .await
         .unwrap_err();
-        assert!(backend.0.load(Ordering::Relaxed));
-        assert_eq!(error.to_string(), "wrapped command exited with status 1");
+        assert!(backend.drained.load(Ordering::Relaxed));
+        assert!(matches!(error, GatewayError::Io(_)));
+    }
+    #[tokio::test]
+    async fn cleanup_errors_reach_the_caller_and_preserve_the_primary_failure() {
+        let backend = Arc::new(Backend {
+            drained: AtomicBool::new(false),
+            fail: true,
+        });
+        let error = finish_paid_work(Some(backend.clone()), Ok(()))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            GatewayError::Shutdown(WorkShutdownError::Poisoned)
+        ));
+        let primary = GatewayError::Io(std::io::Error::other("injected server failure"));
+        let error = finish_paid_work(Some(backend.clone()), Err(primary))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, GatewayError::Cleanup { primary, cleanup: WorkShutdownError::Poisoned } if matches!(*primary, GatewayError::Io(_)))
+        );
+        assert!(backend.drained.load(Ordering::Relaxed));
     }
 }

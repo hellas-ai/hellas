@@ -1,7 +1,7 @@
 //! The command subtree embedded directly in the main Hellas CLI.
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 use crate::{
     config::{Deployment, ProviderConfig, Spec, Trust, read_json},
     deployment,
+    management::ManagementError,
     provider::{Cloud, Provider, validate_id},
 };
 
@@ -130,11 +131,14 @@ impl CloudArgs {
 }
 
 impl RunpodArgs {
-    pub async fn run(self) -> Result<Value> {
+    pub async fn run(self) -> crate::management::Result<Value> {
         self.run_managed(None).await
     }
 
-    pub async fn run_managed(self, service: Option<&crate::management::Service>) -> Result<Value> {
+    pub async fn run_managed(
+        self,
+        service: Option<&crate::management::Service>,
+    ) -> crate::management::Result<Value> {
         let mut account = self.account;
         let result = match self.command {
             RunpodCommand::List => Cloud::runpod(account.as_deref())?.list().await?,
@@ -172,7 +176,7 @@ impl RunpodArgs {
                 } else if let Some(service) = service {
                     service.create(spec, state).await?
                 } else {
-                    let state = state.context("create requires --state")?;
+                    let state = state.ok_or(ManagementError::StateRequired)?;
                     let id = deployment::create(spec, &state).await?;
                     json!({"id":id, "state":state})
                 }
@@ -182,20 +186,18 @@ impl RunpodArgs {
                 state: Some(path),
             } => {
                 let state: Deployment = read_json(&path)?;
-                if let Some(owner) = &state.credentials.owner {
-                    ensure!(
-                        service.is_some_and(|service| service.owner() == *owner),
-                        "receipt belongs to another identity"
-                    );
+                if let Some(owner) = &state.credentials.owner
+                    && service.is_none_or(|service| service.owner() != *owner)
+                {
+                    return Err(ManagementError::ReceiptIdentity);
                 }
                 let ProviderConfig::Runpod { account: saved, .. } = &state.spec.provider else {
-                    bail!("receipt belongs to another cloud provider; refusing termination");
+                    return Err(ManagementError::ReceiptProvider);
                 };
-                if let Some(selected) = &account {
-                    ensure!(
-                        saved.as_ref() == Some(selected),
-                        "--account does not match receipt; refusing termination"
-                    );
+                if let Some(selected) = &account
+                    && (saved.as_ref() != Some(selected))
+                {
+                    return Err(ManagementError::ReceiptAccount);
                 }
                 account = saved.clone();
                 let id = deployment::destroy(&path, Some(&state.spec.provider), pod_id.as_deref())
@@ -206,7 +208,7 @@ impl RunpodArgs {
                 pod_id,
                 state: None,
             } => {
-                let id = pod_id.context("destroy requires a pod ID or --state")?;
+                let id = pod_id.ok_or(ManagementError::ResourceRequired)?;
                 Cloud::runpod(account.as_deref())?.destroy(&id).await?;
                 json!({"id":id, "destroyed":true})
             }

@@ -25,6 +25,8 @@ const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15
 /// Startup errors, before a provider accepts requests.
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
+    #[error("provider task failed")]
+    Task(#[from] tokio::task::JoinError),
     #[error("provider requires a Work funding configuration")]
     FundingRequired,
     #[error("paid channel names an unavailable Fetch route or manifest")]
@@ -33,8 +35,9 @@ pub enum ProviderError {
     WrongPaidPolicy,
     #[error("provider enrollment does not match this identity")]
     Identity,
-    #[error("a revoked contact cannot be re-enabled; import a newly issued contact enrollment")]
-    RevokedContact,
+    #[cfg(feature = "grant-provider")]
+    #[error(transparent)]
+    GrantConfig(#[from] crate::grant_provider::GrantProviderError),
     #[error(transparent)]
     Grant(#[from] hellas_rpc::protocol::work_grant::records::GrantError),
     #[error(transparent)]
@@ -115,21 +118,10 @@ pub struct FetchProviderOptions<R> {
 }
 
 #[cfg(feature = "paid-provider")]
-struct WorkWatcher {
-    stop: Option<tokio::sync::oneshot::Sender<()>>,
-    task: tokio::task::JoinHandle<()>,
-}
-
-#[cfg(feature = "paid-provider")]
-impl Drop for WorkWatcher {
-    fn drop(&mut self) {
-        self.stop.take();
-    }
-}
+use crate::paid_provider::WorkWatcher;
 
 pub struct ProviderHandle {
-    #[cfg(feature = "grant-provider")]
-    grants: Option<hellas_work::grant_service::GrantService>,
+    router: crate::work_router::WorkRouter,
     endpoint: Endpoint,
     accept_task: tokio::task::JoinHandle<()>,
     #[cfg(feature = "paid-provider")]
@@ -150,8 +142,11 @@ impl ProviderHandle {
     pub fn offers(
         &self,
     ) -> Result<Vec<hellas_rpc::protocol::work_grant::records::SignedOffer>, ProviderError> {
-        use hellas_rpc::protocol::work_grant::{admin::*, records::*};
-        let Some(service) = &self.grants else {
+        use hellas_rpc::protocol::work_grant::{
+            admin::{GrantCommand, GrantReply},
+            records::GrantState,
+        };
+        let Some(service) = self.router.grant_service() else {
             return Ok(vec![]);
         };
         let ids = service.administer(|store, _| {
@@ -176,33 +171,31 @@ impl ProviderHandle {
             .collect()
     }
 
-    pub async fn shutdown(mut self) {
+    /// Stop ingress, join accepted work and close the endpoint before returning errors.
+    pub async fn shutdown(mut self) -> Result<(), ProviderError> {
         self.accept_task.abort();
-        let _ = (&mut self.accept_task).await;
-        #[cfg(feature = "grant-provider")]
-        if let Some(grants) = &self.grants
-            && let Err(error) = grants.drain().await
-        {
-            tracing::error!(%error, "grant provider drain failed");
+        let mut result = match (&mut self.accept_task).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.is_cancelled() => Ok(()),
+            Err(error) => Err(ProviderError::Task(error)),
+        };
+        if let Some(grants) = self.router.grant_service() {
+            let drained = grants.drain().await.map_err(ProviderError::from);
+            result = result.and(drained);
         }
         #[cfg(feature = "paid-provider")]
-        if let Some(mut work) = self.work.take() {
-            if let Some(stop) = work.stop.take() {
-                let _ = stop.send(());
-            }
-            let _ = (&mut work.task).await;
+        if let Some(work) = &mut self.work {
+            let stopped = work.shutdown().await.map_err(ProviderError::from);
+            result = result.and(stopped);
         }
         self.endpoint.close().await;
+        result
     }
 }
 
 impl Drop for ProviderHandle {
     fn drop(&mut self) {
         self.accept_task.abort();
-        #[cfg(feature = "paid-provider")]
-        if let Some(work) = &mut self.work {
-            work.stop.take();
-        }
     }
 }
 
@@ -308,11 +301,11 @@ where
         hellas_rpc::RootKind::SecureEnclave => Assurance::AppleAppAttest,
     };
     #[cfg(feature = "grant-provider")]
-    let grant_store = options
+    let grant_plan = options
         .grants
         .as_ref()
         .map(|grants| {
-            crate::grant_provider::prepare(
+            crate::grant_provider::GrantProviderPlan::contacts(
                 grants,
                 &options.state_directory,
                 options.enrollment.clone(),
@@ -333,49 +326,56 @@ where
             )
         })
         .transpose()?;
+    #[cfg(feature = "paid-provider")]
+    let chain = options.paid_work.as_ref().map(|paid| paid.node.clone());
+    #[cfg(feature = "paid-provider")]
+    let work_config = options
+        .paid_work
+        .map(|PaidProviderOptions { config, node }| {
+            let policy = config.provider_policy();
+            let settlement_key = hellas_kernel::Secp256k1Signer::from_secret_scalar(
+                options.identity.caller_secret_bytes(),
+            )
+            .map_err(|_| ProviderError::SettlementKey)?;
+            let runner_config = crate::paid_provider::WorkRunnerConfig {
+                network: config.chain.network,
+                journal_root: config.journal_root,
+                routes: config.routes,
+                poll: config.poll,
+                max_observation_age: config.max_observation_age,
+                settlement_key,
+                policy,
+            };
+            runner_config.validate()?;
+            Ok::<_, ProviderError>((runner_config, node))
+        })
+        .transpose()?;
     let producer_key = Arc::new(options.identity.caller_key().clone());
     let mut executor_config =
         ExecutorSpawnConfig::fetch_only(producer_key.clone(), assurance, options.routes);
     executor_config.fetch_max_in_flight = options.fetch_max_in_flight;
     executor_config.fetch_queue_capacity = options.fetch_queue_capacity;
     let executor = Executor::spawn_configured(executor_config).await?;
+    #[cfg(feature = "grant-provider")]
+    let grant_store = grant_plan
+        .map(crate::grant_provider::GrantProviderPlan::open)
+        .transpose()?;
 
     #[cfg(feature = "paid-provider")]
     let work_mount = crate::paid_provider::MountedWork::with_backend(executor.clone());
     #[cfg(feature = "paid-provider")]
     let setup_mount = crate::paid_provider::MountedSetup::default();
     #[cfg(feature = "paid-provider")]
-    let chain = options.paid_work.as_ref().map(|paid| paid.node.clone());
-    #[cfg(feature = "paid-provider")]
-    let work = if let Some(PaidProviderOptions { config, node }) = options.paid_work {
-        let policy = config.provider_policy();
-        let settlement_key = hellas_kernel::Secp256k1Signer::from_secret_scalar(
-            options.identity.caller_secret_bytes(),
-        )
-        .map_err(|_| ProviderError::SettlementKey)?;
-        let runner = crate::paid_provider::WorkRunner::discover(
-            crate::paid_provider::WorkRunnerConfig {
-                network: config.chain.network,
-
-                journal_root: config.journal_root,
-                routes: config.routes,
-
-                poll: config.poll,
-                max_observation_age: config.max_observation_age,
-                settlement_key,
-                policy,
-            },
-            work_mount.clone(),
-            setup_mount.clone(),
-        )?;
-        let (stop, stopped) = tokio::sync::oneshot::channel();
-        Some(WorkWatcher {
-            stop: Some(stop),
-            task: tokio::spawn(runner.on_node(node).run(stopped)),
+    let runner = work_config
+        .map(|(config, node)| {
+            crate::paid_provider::WorkRunner::discover(
+                config,
+                work_mount.clone(),
+                setup_mount.clone(),
+            )
+            .map(|runner| runner.on_node(node))
         })
-    } else {
-        None
-    };
+        .transpose()?;
     let open = ProviderOpen {
         signer: producer_key.clone(),
         root: options.root,
@@ -431,12 +431,29 @@ where
             )
         })
         .transpose()?;
+    use crate::work_router::WorkRouter;
     #[cfg(all(feature = "paid-provider", feature = "grant-provider"))]
-    if let Some(grants) = &grants {
-        assert!(work_mount.mount_grants(grants.clone()));
-    }
+    let work_router = match (has_paid_work, grants.as_ref()) {
+        (true, Some(grants)) => WorkRouter::Both {
+            payment: work_mount,
+            grants: grants.clone(),
+        },
+        (true, None) => WorkRouter::Payment(work_mount),
+        (false, Some(grants)) => WorkRouter::Grants(grants.clone()),
+        (false, None) => return Err(ProviderError::FundingRequired),
+    };
+    #[cfg(all(feature = "paid-provider", not(feature = "grant-provider")))]
+    let work_router = WorkRouter::Payment(work_mount);
     #[cfg(all(feature = "grant-provider", not(feature = "paid-provider")))]
-    let grant_mount = grants.clone();
+    let work_router = WorkRouter::Grants(
+        grants
+            .as_ref()
+            .ok_or(ProviderError::FundingRequired)?
+            .clone(),
+    );
+    #[cfg(feature = "paid-provider")]
+    let work = runner.map(WorkWatcher::spawn);
+    let router = work_router.clone();
     let accept_endpoint = endpoint.clone();
     let accept_task = tokio::spawn(async move {
         let slots = Arc::new(tokio::sync::Semaphore::new(MAX_ACTIVE_CONNECTIONS));
@@ -465,15 +482,10 @@ where
                     continue;
                 }
             };
+            let work_router = work_router.clone();
             #[cfg(feature = "paid-provider")]
-            let (work_mount, setup_mount, chain, discovery) = (
-                work_mount.clone(),
-                setup_mount.clone(),
-                chain.clone(),
-                discovery.clone(),
-            );
-            #[cfg(all(feature = "grant-provider", not(feature = "paid-provider")))]
-            let grant_mount = grant_mount.clone();
+            let (setup_mount, chain, discovery) =
+                (setup_mount.clone(), chain.clone(), discovery.clone());
             let open = open.clone();
             connections.spawn(async move {
                 let _slot = slot;
@@ -504,24 +516,14 @@ where
                     serve(transport, hellas_rpc::services::node::NodeServer(discovery)).await;
                     return;
                 }
-                #[cfg(feature = "paid-provider")]
                 if alpn == hellas_rpc::services::work::Work::ALPN.as_bytes() {
                     let server = OpenDispatcher::<_, _, hellas_rpc::services::work::Open>::new(
-                        hellas_rpc::services::work::WorkServer(work_mount),
+                        hellas_rpc::services::work::WorkServer(work_router),
                         open,
                     );
                     serve(transport, server).await;
+                    #[cfg(feature = "paid-provider")]
                     return;
-                }
-                #[cfg(all(feature = "grant-provider", not(feature = "paid-provider")))]
-                if alpn == hellas_rpc::services::work::Work::ALPN.as_bytes()
-                    && let Some(service) = grant_mount
-                {
-                    let server = OpenDispatcher::<_, _, hellas_rpc::services::work::Open>::new(
-                        hellas_rpc::services::work::WorkServer(service),
-                        open,
-                    );
-                    serve(transport, server).await;
                 }
                 #[cfg(feature = "paid-provider")]
                 if has_paid_work
@@ -538,8 +540,7 @@ where
         }
     });
     Ok(ProviderHandle {
-        #[cfg(feature = "grant-provider")]
-        grants,
+        router,
         endpoint,
         accept_task,
         #[cfg(feature = "paid-provider")]
