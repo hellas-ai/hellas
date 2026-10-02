@@ -32,6 +32,13 @@ fn session() -> hellas_wire::TransportContext {
 }
 
 pub fn transport_pair() -> (MuxTransport, MuxTransport) {
+    transport_pair_with_context(session(), session())
+}
+
+pub fn transport_pair_with_context(
+    client_context: hellas_wire::TransportContext,
+    server_context: hellas_wire::TransportContext,
+) -> (MuxTransport, MuxTransport) {
     let (to_server, server_inbox) = mpsc::unbounded_channel();
     let (to_client, client_inbox) = mpsc::unbounded_channel();
     let client = MuxTransport::spawn::<8, _, _>(
@@ -42,7 +49,7 @@ pub fn transport_pair() -> (MuxTransport, MuxTransport) {
             out: to_server,
             inbox: client_inbox,
         },
-        session(),
+        client_context,
     );
     let server = MuxTransport::spawn::<8, _, _>(
         MuxRole::Server,
@@ -52,7 +59,7 @@ pub fn transport_pair() -> (MuxTransport, MuxTransport) {
             out: to_client,
             inbox: server_inbox,
         },
-        session(),
+        server_context,
     );
     (client, server)
 }

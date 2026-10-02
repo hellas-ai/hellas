@@ -4,6 +4,7 @@
 //! This crate owns the endpoint workflow, durable journals, recovery, and
 //! settlement drivers used by both clients and providers.
 
+pub mod grant_service;
 pub mod work;
 pub mod work_close;
 pub mod work_handshake;

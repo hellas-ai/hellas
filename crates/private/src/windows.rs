@@ -206,7 +206,7 @@ impl OwnerOnly {
         })
     }
 
-    /// For `CreateFileW`, `CreateNamedPipeW` and friends; valid while `self`
+    /// For Windows file and pipe creation; valid while `self`
     /// lives.
     pub fn security_attributes(&self) -> *mut SECURITY_ATTRIBUTES {
         (&raw const *self.attributes).cast_mut()

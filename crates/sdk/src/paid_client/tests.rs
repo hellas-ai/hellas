@@ -1,6 +1,6 @@
 use super::*;
 use crate::test_support::enrollment;
-#[cfg(feature = "paid-provider")]
+#[cfg(all(feature = "paid-provider", feature = "grant-client"))]
 mod offer;
 mod recovery;
 use hellas_rpc::pb::execute::{OpenRequest, OpenResponse, open_response};

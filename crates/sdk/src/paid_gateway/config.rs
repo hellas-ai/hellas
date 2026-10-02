@@ -171,8 +171,11 @@ fn trust(
             let offer = signed.offer();
             if offer.proposal.network() != config.chain.network
                 || offer.proposal.bond_edge().to_bytes() != fixed::<32>("bond", &p.bond)?
-                || offer.provider.genesis.statement.transport_public_key
-                    != hellas_rpc::PublicKey::Ed25519(*p.provider.as_bytes())
+                || offer
+                    .provider
+                    .grant_transport()
+                    .map_err(|_| PoolError::Invalid("paid offer transport"))?
+                    != *p.provider.as_bytes()
             {
                 return Err(PoolError::Invalid(
                     "paid offer differs from the configured network, bond or provider",

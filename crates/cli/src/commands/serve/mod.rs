@@ -14,8 +14,6 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use tokio::time::{Duration, timeout};
-
 mod codex_provider;
 mod node;
 mod node_handler;
@@ -25,8 +23,68 @@ pub mod work_config;
 pub use provision::{ProvisionOptions, run_provision};
 pub use work_config::{WorkConfig, load_work_config};
 
+pub struct GrantNodeConfig {
+    pub config: hellas_sdk::grant_config::GrantConfig,
+    pub provider: hellas_rpc::protocol::work_grant::records::Principal,
+    pub owner: Option<hellas_rpc::protocol::work_grant::records::Principal>,
+}
+
+pub(crate) fn prepare_grants(
+    grants: GrantNodeConfig,
+) -> anyhow::Result<(
+    hellas_sdk::grant_config::GrantConfig,
+    hellas_work::work_store::grant::GrantStore,
+)> {
+    let now = hellas_work::grant_service::wall_clock();
+    let mut store = hellas_work::work_store::grant::GrantStore::open(
+        &grants.config.journal_root,
+        hellas_rpc::protocol::work_grant::grant_network(),
+        grants.provider.bundle().clone(),
+        now,
+    )?;
+    if let Some(limits) = &grants.config.machine_limits {
+        store.configure_machine(limits.clone(), grants.config.max_in_flight, now)?;
+    } else if store
+        .state()
+        .ledger()
+        .node(hellas_rpc::protocol::work_grant::budget::BudgetNode::Machine)
+        .is_none()
+    {
+        store.configure_machine(vec![], grants.config.max_in_flight, now)?;
+    }
+    if let Some(owner) = grants.owner {
+        let id = store.initialize_owner(
+            owner,
+            grants.config.resources.clone(),
+            grants.config.max_job_millis,
+            now,
+        )?;
+        // Explicit resource configuration updates the owner's derived scope.
+        // Other grants retain their signed terms until local revision.
+        if grants.config.machine_limits.is_some() || !grants.config.resources.is_empty() {
+            let mut definition = store.state().grant(id).expect("initialized owner").clone();
+            if definition.state != hellas_rpc::protocol::work_grant::records::GrantState::Revoked
+                && (definition.policies != grants.config.resources
+                    || definition.max_job_millis != grants.config.max_job_millis)
+            {
+                definition.revision.0 = definition
+                    .revision
+                    .0
+                    .checked_add(1)
+                    .context("owner revision exhausted")?;
+                definition.policies = grants.config.resources.clone();
+                definition.max_job_millis = grants.config.max_job_millis;
+                store.define(definition, now)?;
+            }
+        }
+    }
+    Ok((grants.config, store))
+}
+
 pub struct ServeOptions {
+    pub grants: Option<GrantNodeConfig>,
     pub port: Option<u16>,
+    pub discovery: bool,
     pub queue_size: usize,
     #[cfg(feature = "evaluate")]
     pub content_paths: Vec<PathBuf>,
@@ -60,6 +118,59 @@ pub struct ServeOptions {
     pub settlement_key: Secp256k1Signer,
     pub open_identity: Arc<crate::identity::OpenIdentity>,
     pub assurance: Assurance,
+}
+
+pub fn validate_grant_resources(
+    config: &hellas_sdk::grant_config::GrantConfig,
+    routes: &FetchRouteRegistry,
+) -> CliResult<()> {
+    for resource in &config.resources {
+        use hellas_rpc::protocol::{work_fetch::FetchRoutePolicy, work_profile::WorkPolicy};
+        match &resource.work {
+            WorkPolicy::Evaluate(_) => {
+                #[cfg(not(feature = "evaluate"))]
+                anyhow::bail!("resource {} requires an Evaluate backend", resource.name);
+            }
+            WorkPolicy::Fetch {
+                policy,
+                route: FetchRoutePolicy::SealedRoute { service, method },
+            } => {
+                let entry = routes
+                    .entry(&hellas_executor::FetchRoute::new(service, method))
+                    .with_context(|| {
+                        format!("resource {} names an absent Fetch route", resource.name)
+                    })?;
+                anyhow::ensure!(
+                    entry.execution_environment() == policy.allowed_environment,
+                    "resource {} has the wrong Fetch environment",
+                    resource.name
+                );
+            }
+            WorkPolicy::Fetch { .. } => {
+                anyhow::bail!("grant resources require a named Fetch route")
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_provider_config(
+    fetch: Option<&std::path::Path>,
+    grant: Option<&std::path::Path>,
+) -> CliResult<()> {
+    anyhow::ensure!(
+        fetch.is_some() || grant.is_some(),
+        "--check-config requires --fetch-config or --grant-config"
+    );
+    let routes = fetch
+        .map(load_fetch_config)
+        .transpose()?
+        .unwrap_or_default();
+    if let Some(path) = grant {
+        let config = hellas_sdk::grant_config::GrantConfig::load(path, &std::env::current_dir()?)?;
+        validate_grant_resources(&config, &routes)?;
+    }
+    Ok(())
 }
 
 pub async fn run(options: ServeOptions) -> CliResult<()> {
@@ -133,8 +244,11 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
     // counter handles into a registry just adds a scrape view on the same
     // underlying state.
     let metrics = Arc::new(ExecutorMetrics::default());
+    // Install signal handlers before publishing a ready local control socket.
+    let shutdown = shutdown_signal().context("failed to listen for shutdown signal")?;
     let node = node::spawn_node(node::NodeConfig {
         port: options.port,
+        discovery: options.discovery,
         queue_size: options.queue_size,
         #[cfg(feature = "evaluate")]
         content_store,
@@ -146,6 +260,7 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
         fetch_max_in_flight: options.fetch_max_in_flight,
         fetch_queue_size: options.fetch_queue_size,
         work: work_runner,
+        grants: options.grants,
         secret_key: options.secret_key,
         producer_key: options.producer_key,
         open_identity: options.open_identity,
@@ -172,40 +287,33 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
     eprintln!("Explorer:     {add_url}");
 
     println!("RPC server running. Press Ctrl+C to stop.");
-    wait_for_shutdown_signal()
-        .await
-        .context("failed to listen for shutdown signal")?;
+    shutdown.await?;
 
     println!("Shutting down...");
     // Return failures through the CLI so its telemetry guard still flushes.
-    timeout(Duration::from_secs(5), node.shutdown())
+    node.shutdown()
         .await
-        .context("RPC server graceful shutdown timed out")?
-        .context("failed to shut down RPC server")?;
+        .context("failed to drain and shut down RPC server")?;
 
     Ok(())
 }
 
-async fn wait_for_shutdown_signal() -> std::io::Result<()> {
+fn shutdown_signal() -> std::io::Result<impl std::future::Future<Output = std::io::Result<()>>> {
     #[cfg(unix)]
     {
         let mut terminate =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-        tokio::select! {
-            result = tokio::signal::ctrl_c() => result,
-            _ = terminate.recv() => Ok(()),
-        }
+        let mut interrupt =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+        Ok(async move {
+            tokio::select! {
+                _ = interrupt.recv() => Ok(()),
+                _ = terminate.recv() => Ok(()),
+            }
+        })
     }
     #[cfg(not(unix))]
-    tokio::signal::ctrl_c().await
-}
-
-/// Load the unified fetch configuration: the route table (sealed destinations,
-/// credentials, capabilities) and the caller access policy, cross-validated so
-/// a caller grant naming an undefined route is a load error rather than a
-/// silent dead entry.
-pub(crate) fn validate_fetch_config(path: &std::path::Path) -> CliResult<()> {
-    load_fetch_config(path).map(|_| ())
+    Ok(tokio::signal::ctrl_c())
 }
 
 fn load_fetch_config(path: &std::path::Path) -> CliResult<FetchRouteRegistry> {

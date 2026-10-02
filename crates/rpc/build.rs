@@ -88,6 +88,8 @@ fn regenerate() {
     //    is rendered by this script, so no prost service_generator is
     //    installed and prost skips `service` blocks entirely.
     let mut config = prost_build::Config::new();
+    // Rare recovered-status detail should not enlarge every Work refusal.
+    config.boxed(".hellas.work.v1.GrantRefusal.terminal");
     // NB: prost's `bytes(["."])` (decode `bytes` fields as `bytes::Bytes`
     // for zero-copy) is disabled because current call sites produce `Vec<u8>`.
     config.out_dir(&out_dir);

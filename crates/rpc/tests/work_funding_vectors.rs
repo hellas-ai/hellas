@@ -222,7 +222,7 @@ fn grant_channel_separates_every_identity_and_generation() {
     let derive = |network, p, g, c, generation| {
         grant_channel_id(
             network,
-            PrincipalId(ContentId::from_bytes([p; 32])),
+            ContentId::from_bytes([p; 32]),
             GrantId([g; 16]),
             PrincipalId(ContentId::from_bytes([c; 32])),
             generation,

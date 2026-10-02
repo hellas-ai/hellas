@@ -267,6 +267,7 @@ impl WorkService {
                     Err(error) => {
                         let refusal = Refusal::from(error);
                         yield Ok(WorkStreamEvent { outcome: Some(work_stream_event::Outcome::Refused(WorkRefused {
+                            grant: None,
                             code: refusal.code.code() as i32, reason: refusal.reason,
                         })) });
                         return;

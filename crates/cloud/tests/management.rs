@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+mod common;
+
 use hellas_cloud::{
     config::read_json,
     internal_rpc,
@@ -15,8 +17,7 @@ use tokio::{
     net::UnixStream,
 };
 
-// Existing inventories stay readable during the owner-grant cutover. Seed the
-// persisted pre-upgrade record; new preparation must be refused in M1.
+// Seed an existing inventory without reaching a cloud provider.
 fn existing_machine(
     root: &std::path::Path,
     key: &iroh::SecretKey,
@@ -25,6 +26,7 @@ fn existing_machine(
     use hellas_cloud::config::{Credentials, save_private};
     let mut credentials = Credentials::generate();
     credentials.owner = Some(key.public().to_string());
+    credentials.owner_enrollment = Some(hex::encode(common::bundle(key).canonical_bytes()));
     save_private(
         &root.join(key.public().to_string()).join("metal.json"),
         &json!({
@@ -39,11 +41,8 @@ fn existing_machine(
 }
 
 #[tokio::test]
-async fn owner_provisioning_fails_before_receipts_bootstrap_or_provider_access() {
-    use hellas_cloud::{
-        agent::OwnerGrantRequired,
-        config::{Credentials, ProviderConfig, Spec, Trust},
-    };
+async fn missing_enrollment_fails_before_receipts_bootstrap_or_provider_access() {
+    use hellas_cloud::config::{Credentials, ProviderConfig, Spec, Trust};
     let dir = tempfile::tempdir().unwrap();
     let key = iroh::SecretKey::generate();
     let service = Service::new(key.clone(), dir.path()).unwrap();
@@ -57,7 +56,7 @@ async fn owner_provisioning_fails_before_receipts_bootstrap_or_provider_access()
         })
         .await
         .unwrap_err();
-    assert!(error.is::<OwnerGrantRequired>());
+    assert!(error.to_string().contains("owner enrollment required"));
     let spec = Spec {
         name: "blocked".into(),
         image: format!("registry/image@sha256:{}", "a".repeat(64)),
@@ -71,7 +70,8 @@ async fn owner_provisioning_fails_before_receipts_bootstrap_or_provider_access()
             .create(spec.clone(), Some(receipt.clone()))
             .await
             .unwrap_err()
-            .is::<OwnerGrantRequired>()
+            .to_string()
+            .contains("owner enrollment required")
     );
     let mut credentials = Credentials::generate();
     credentials.owner = Some(key.public().to_string());
@@ -79,7 +79,8 @@ async fn owner_provisioning_fails_before_receipts_bootstrap_or_provider_access()
         hellas_cloud::deployment::create_with_credentials(spec, &receipt, credentials)
             .await
             .unwrap_err()
-            .is::<OwnerGrantRequired>()
+            .to_string()
+            .contains("owner enrollment required")
     );
     assert!(!bootstrap.exists());
     assert!(!receipt.exists());
@@ -297,10 +298,12 @@ async fn enrollment_requires_owner_confirmation_and_cannot_be_silently_replaced(
     let first = Enrollment {
         node_id: iroh::SecretKey::generate().public().to_string(),
         enrollment_id: "a".repeat(64),
+        bundle: None,
     };
     let changed = Enrollment {
         node_id: iroh::SecretKey::generate().public().to_string(),
         enrollment_id: "b".repeat(64),
+        bundle: None,
     };
     let expected = first.clone();
     let task = tokio::spawn(async move {
@@ -353,4 +356,38 @@ async fn enrollment_requires_owner_confirmation_and_cannot_be_silently_replaced(
         expected.node_id
     );
     task.await.unwrap();
+}
+
+#[tokio::test]
+async fn enrolled_owner_prepares_verified_bootstrap_and_rejects_another_transport() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = iroh::SecretKey::generate();
+    let bundle = common::bundle(&key);
+    let service = Service::new(key.clone(), dir.path())
+        .unwrap()
+        .with_owner_enrollment(bundle.clone())
+        .unwrap();
+    let bootstrap = dir.path().join("bootstrap.json");
+    service
+        .execute(Request::Prepare {
+            name: "worker".into(),
+            bootstrap_file: bootstrap.clone(),
+            admin_addr: None,
+            serve_args: vec![],
+        })
+        .await
+        .unwrap();
+    let env: std::collections::BTreeMap<String, String> = read_json(&bootstrap).unwrap();
+    let principal = hellas_rpc::protocol::work_grant::records::Principal::decode(
+        &hex::decode(&env["HELLAS_REMOTE_OWNER_ENROLLMENT"]).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(principal.bundle(), &bundle);
+    assert_eq!(principal.transport(), *key.public().as_bytes());
+    assert!(
+        Service::new(iroh::SecretKey::generate(), dir.path())
+            .unwrap()
+            .with_owner_enrollment(bundle)
+            .is_err()
+    );
 }

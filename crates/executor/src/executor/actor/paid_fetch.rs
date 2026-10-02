@@ -44,7 +44,16 @@ impl Executor {
             });
             return;
         }
-        let prepared = self.prepare_paid_fetch(input);
+        let policy = *input.policy();
+        let (parts, admission) = input.into_parts_and_admission();
+        let running = match admission.dispatch() {
+            Ok(running) => running,
+            Err(error) => {
+                let _ = reply.send(Err(ExecutorError::PolicyDenied(error.to_string())));
+                return;
+            }
+        };
+        let prepared = self.prepare_paid_fetch(parts, policy);
         let (entry, session, request, policy) = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
@@ -56,6 +65,7 @@ impl Executor {
         let completion = self.completion_tx.clone();
         let key = Arc::clone(&self.provider.producer_key);
         let task = async move {
+            let _running = running;
             let (sender, mut receiver) =
                 mpsc::channel(super::execution::PER_EXECUTION_CHANNEL_CAPACITY);
             let run = super::execution::run_fetch_provider(
@@ -88,7 +98,23 @@ impl Executor {
                 }
                 Ok::<_, ExecutorError>(())
             };
-            let (result, drained) = tokio::join!(run, drain);
+            let deadline = _running.deadline_with(std::time::Duration::from_secs(90));
+            let joined =
+                tokio::time::timeout_at(deadline.into(), async { tokio::join!(run, drain) }).await;
+            let (result, drained) = match joined {
+                Ok(result) => result,
+                Err(_) => {
+                    let _ = completion
+                        .send(ExecutorCompletion::PaidFetch {
+                            reply,
+                            result: Err(ExecutorError::Execution(
+                                "Fetch execution deadline passed".into(),
+                            )),
+                        })
+                        .await;
+                    return;
+                }
+            };
             let result = drained.and_then(|()| {
                 result
                     .map_err(|failure| {
@@ -124,7 +150,8 @@ impl Executor {
 
     fn prepare_paid_fetch(
         &self,
-        input: PreparedFetchInput,
+        parts: hellas_rpc::protocol::work_fetch::PreparedPaidFetchInputParts,
+        policy: hellas_rpc::protocol::work_fetch::FetchPolicyV2,
     ) -> Result<
         (
             crate::FetchRouteEntry,
@@ -134,8 +161,6 @@ impl Executor {
         ),
         ExecutorError,
     > {
-        let policy = *input.policy();
-        let parts = input.into_parts();
         let request = hellas_rpc::fetch::verify_input_events(&parts.fetch_input_transcript)
             .map_err(|_| ExecutorError::InvalidInput("invalid paid fetch input".into()))?;
         if request.retention != hellas_rpc::Retention::Ephemeral
@@ -176,7 +201,12 @@ impl Executor {
 
     pub(super) fn dispatch_paid_fetches(&mut self) {
         while self.active_fetches < self.fetch_max_in_flight {
-            let Some(pending) = self.pending_paid_fetches.pop_front() else {
+            let next = self
+                .pending_paid_fetches
+                .iter()
+                .position(|p| p.input.admission().is_owed())
+                .unwrap_or(0);
+            let Some(pending) = self.pending_paid_fetches.remove(next) else {
                 break;
             };
             // The durable invocation is owed even if its original waiter left.
@@ -682,13 +712,12 @@ mod tests {
                 1,
             )
             .await;
-            let input = prepared_input(input_events(
-                Retention::Ephemeral,
-                Assurance::ProducerSigned,
-            ));
             let request = |reply| crate::executor::ExecutorOwedRequest::RunPaidFetch {
                 span: tracing::Span::none(),
-                input: Box::new(input.clone()),
+                input: Box::new(prepared_input(input_events(
+                    Retention::Ephemeral,
+                    Assurance::ProducerSigned,
+                ))),
                 progress: None,
                 reply,
             };

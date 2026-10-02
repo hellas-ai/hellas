@@ -12,19 +12,41 @@ use hellas_wire::Dispatcher;
 use hellas_work::work::{
     BackendFault, ObservationTime, PreparedFetchInput, WorkBackend, run_accepted_work,
 };
+use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
 const RESPONSE: &str = "sdk-private-response";
 
-#[derive(Default)]
-pub(super) struct Backend(AtomicUsize);
+pub(super) struct Backend(AtomicUsize, Arc<tokio::sync::Semaphore>);
+impl Default for Backend {
+    fn default() -> Self {
+        Self(
+            AtomicUsize::new(0),
+            Arc::new(tokio::sync::Semaphore::new(2)),
+        )
+    }
+}
+
 impl WorkBackend for Backend {
+    fn try_admit(
+        &self,
+        domain: hellas_work::work::admission::CapacityDomain,
+    ) -> Result<hellas_work::work::admission::WorkPermit, BackendFault> {
+        Ok(hellas_work::work::admission::WorkPermit::new(
+            domain,
+            self.1
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| BackendFault::new("full"))?,
+        ))
+    }
     async fn fetch(
         &self,
         input: PreparedFetchInput,
     ) -> Result<Vec<hellas_rpc::OutputEventEnvelope>, BackendFault> {
         self.0.fetch_add(1, Ordering::SeqCst);
-        let parts = input.into_parts();
+        let (parts, admission) = input.into_parts_and_admission();
+        let _running = admission.dispatch()?;
         let request = verify_input_events(&parts.fetch_input_transcript).unwrap();
         let key = ProducerSigningKey::from_secret_bytes([2; 32]).unwrap();
         let mut output =

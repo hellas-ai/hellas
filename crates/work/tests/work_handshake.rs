@@ -969,6 +969,7 @@ fn the_wire_field_numbers_are_pinned() {
     assert_eq!(
         ExchangeSetupResponse {
             outcome: Some(Outcome::Refused(WorkRefused {
+                grant: None,
                 code: WorkRefusalCode::NotReady as i32,
                 reason: String::new(),
             })),

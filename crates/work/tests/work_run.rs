@@ -822,10 +822,12 @@ fn a_job_this_process_is_running_is_not_started_again() {
     assert_eq!(input.evaluate_request(), &evaluate_request(1));
     assert_eq!(input.program_manifest(), manifest().canonical_bytes());
 
-    assert_eq!(
-        expect_admission(endpoint.begin_run(id, &ready())),
-        RunAdmission::Running,
-        "the second call finds the marker the first wrote",
+    assert!(
+        matches!(
+            expect_admission(endpoint.begin_run(id, &ready())),
+            RunAdmission::Running
+        ),
+        "the second call finds the marker the first wrote"
     );
 }
 

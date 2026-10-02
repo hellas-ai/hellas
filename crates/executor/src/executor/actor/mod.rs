@@ -67,6 +67,22 @@ impl Executor {
             ));
         }
         let (owed_tx, owed_rx) = mpsc::channel(EXECUTOR_OWED_MAILBOX_CAPACITY);
+        let permits =
+            |active: usize, queue: usize| -> Result<Arc<tokio::sync::Semaphore>, ExecutorError> {
+                let total = active
+                    .checked_add(queue)
+                    .filter(|n| *n <= tokio::sync::Semaphore::MAX_PERMITS)
+                    .ok_or_else(|| {
+                        ExecutorError::ResourceExhausted("executor capacity overflow".into())
+                    })?;
+                Ok(Arc::new(tokio::sync::Semaphore::new(total)))
+            };
+        let fetch_capacity = permits(config.fetch_max_in_flight, config.fetch_queue_capacity)?;
+        let gpu_capacity = if cfg!(feature = "evaluate") {
+            Some(permits(1, config.queue_capacity)?)
+        } else {
+            None
+        };
         let capacity = config.fetch_max_in_flight.checked_add(1).ok_or_else(|| {
             ExecutorError::ResourceExhausted("completion capacity overflow".into())
         })?;
@@ -98,7 +114,11 @@ impl Executor {
             evaluate,
         };
         tokio::spawn(executor.run());
-        Ok(ExecutorHandle { owed_tx })
+        Ok(ExecutorHandle {
+            owed_tx,
+            fetch_capacity,
+            gpu_capacity,
+        })
     }
     async fn run(mut self) {
         let mut ingress_open = true;

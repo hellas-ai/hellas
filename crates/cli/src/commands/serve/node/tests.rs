@@ -1,3 +1,4 @@
+use super::super::prepare_grants;
 use futures::StreamExt;
 use hellas_sdk::paid_provider::UnmountedWork;
 use std::collections::BTreeSet;
@@ -50,6 +51,9 @@ use tokio::sync::{Notify, Semaphore};
 
 use super::super::work_config::{WorkRoutes, load_work_config};
 use super::*;
+
+// Bound hangs without making journal I/O and scheduling part of the assertion.
+const TEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn assert_retryable_not_ready(refusal: WorkRefused) {
     assert_eq!(refusal.code, WorkRefusalCode::NotReady as i32);
@@ -289,7 +293,7 @@ async fn one_slow_rpc_does_not_serialize_its_connection() {
             })
             .await
     });
-    tokio::time::timeout(Duration::from_secs(2), first_entered.notified())
+    tokio::time::timeout(TEST_TIMEOUT, first_entered.notified())
         .await
         .expect("the first handler starts");
 
@@ -302,7 +306,7 @@ async fn one_slow_rpc_does_not_serialize_its_connection() {
             })
             .await
     });
-    tokio::time::timeout(Duration::from_secs(2), second_entered.notified())
+    tokio::time::timeout(TEST_TIMEOUT, second_entered.notified())
         .await
         .expect("the second handler starts while the first is blocked");
     release_first.notify_one();
@@ -316,7 +320,7 @@ async fn one_slow_rpc_does_not_serialize_its_connection() {
         .expect("the second RPC succeeds");
 
     connection.close(0_u32.into(), b"concurrency test complete");
-    tokio::time::timeout(Duration::from_secs(5), serving)
+    tokio::time::timeout(TEST_TIMEOUT, serving)
         .await
         .expect("the server observes connection close")
         .expect("the server task does not panic")
@@ -445,7 +449,7 @@ async fn two_vouched_peers_receive_their_distinct_configured_offers() {
             ]),
             validators: vec!["ws://unused.invalid".to_owned()],
             poll: Duration::from_millis(1),
-            max_observation_age: Duration::from_secs(5),
+            max_observation_age: TEST_TIMEOUT,
             settlement_key: provider(),
             policy: provider_policy(),
         },
@@ -582,7 +586,7 @@ fn discover_two_route_runner(
             ]),
             validators: vec!["ws://unused.invalid".to_owned()],
             poll: Duration::from_millis(1),
-            max_observation_age: Duration::from_secs(5),
+            max_observation_age: TEST_TIMEOUT,
             settlement_key: provider(),
             policy: provider_policy(),
         },
@@ -755,12 +759,16 @@ async fn requests_use_local_observation_and_one_contested_route_does_not_disable
     // permits replies, and those replies cannot initiate validator I/O.
     let entered = Arc::new(Semaphore::new(0));
     let release = Arc::new(Semaphore::new(0));
-    source.0.lock().unwrap().next_read = Some((entered.clone(), release.clone()));
+    source.0.lock().unwrap().next_read = Some(BlockedRead {
+        bond: first.bond_edge(),
+        entered: entered.clone(),
+        release: release.clone(),
+    });
     let observer_source = source.clone();
     let observing = tokio::spawn(async move { runner.tick(&observer_source).await });
     entered.acquire().await.unwrap().forget();
     let repeated = tokio::time::timeout(
-        Duration::from_secs(1),
+        TEST_TIMEOUT,
         accept_mounted_route(&work_mount, first_route_peer(), first_request.clone()),
     )
     .await
@@ -787,7 +795,7 @@ async fn requests_use_local_observation_and_one_contested_route_does_not_disable
         prepared_input: first_request.prepared_input.clone(),
     };
     let response = tokio::time::timeout(
-        Duration::from_secs(1),
+        TEST_TIMEOUT,
         accept_mounted_route(&work_mount, first_route_peer(), expired),
     )
     .await
@@ -1983,9 +1991,15 @@ impl TxSink for TestChain {
 #[derive(Clone)]
 struct RoutedChain(Arc<Mutex<RoutedChainState>>);
 
+struct BlockedRead {
+    bond: EdgeId,
+    entered: Arc<Semaphore>,
+    release: Arc<Semaphore>,
+}
+
 struct RoutedChainState {
     snapshot_reads: usize,
-    next_read: Option<(Arc<Semaphore>, Arc<Semaphore>)>,
+    next_read: Option<BlockedRead>,
     completed_setups: Vec<EdgeId>,
     snapshots: Vec<WorkChannelSnapshot>,
     submitted: Vec<Tx>,
@@ -2065,9 +2079,20 @@ impl FinalizedWorkView for RoutedChain {
         let gate = {
             let mut state = self.0.lock().unwrap();
             state.snapshot_reads += 1;
-            state.next_read.take()
+            if state
+                .next_read
+                .as_ref()
+                .is_some_and(|gate| gate.bond == query.bond_edge)
+            {
+                state.next_read.take()
+            } else {
+                None
+            }
         };
-        if let Some((entered, release)) = gate {
+        if let Some(BlockedRead {
+            entered, release, ..
+        }) = gate
+        {
             entered.add_permits(1);
             release.acquire().await.unwrap().forget();
         }
@@ -2339,7 +2364,7 @@ fn runner(root: &Path, policy: ProviderChannelPolicy, mount: &MountedWork) -> Wo
             routes: configured_routes(&[(default_route_peer(), bond_edge(), client().party_key())]),
             validators: vec!["ws://unused.invalid".to_owned()],
             poll: Duration::from_millis(1),
-            max_observation_age: Duration::from_secs(5),
+            max_observation_age: TEST_TIMEOUT,
             settlement_key: provider(),
             policy,
         },
@@ -2832,7 +2857,7 @@ impl RunningPaidNode {
                 routes: configured_routes(&[(peer, bond_edge(), client().party_key())]),
                 validators: vec!["ws://unused.invalid".to_owned()],
                 poll: Duration::from_millis(1),
-                max_observation_age: Duration::from_secs(5),
+                max_observation_age: TEST_TIMEOUT,
                 settlement_key: provider(),
                 policy,
             },
@@ -2843,7 +2868,7 @@ impl RunningPaidNode {
             Err(error) => panic!("the node discovers its provider offer: {error}"),
         };
 
-        let alpns = served_alpns(true);
+        let alpns = served_alpns(true, false);
         assert!(
             alpns.contains(&<WorkSetup as ServiceMarker>::ALPN.as_bytes().to_vec())
                 && alpns.contains(&<Work as ServiceMarker>::ALPN.as_bytes().to_vec()),
@@ -2960,7 +2985,7 @@ impl RunningPaidNode {
 
     async fn connect(&self, alpn: &[u8]) -> (IrohTransport, Connection) {
         let connecting = self.client.connect(self.target.clone(), alpn);
-        let connection = match tokio::time::timeout(Duration::from_secs(5), connecting).await {
+        let connection = match tokio::time::timeout(TEST_TIMEOUT, connecting).await {
             Ok(Ok(connection)) => connection,
             Ok(Err(error)) => panic!("the advertised ALPN is dialable: {error}"),
             Err(_) => panic!("the advertised ALPN dial timed out"),
@@ -3028,7 +3053,7 @@ impl RunningPaidNode {
     /// Polls through the wire's retryable `NotReady` until the detached
     /// invocation has made its signed terminal durable.
     async fn wait_for_result(&self, work_id: Digest) -> Vec<OutputEventEnvelope> {
-        let delivered = tokio::time::timeout(Duration::from_secs(5), async {
+        let delivered = tokio::time::timeout(TEST_TIMEOUT, async {
             loop {
                 let response = self.deliver_result(work_id).await;
                 match response.outcome {
@@ -3082,7 +3107,7 @@ impl RunningPaidNode {
     }
 
     async fn wait_for_mount(&self) {
-        let mounted = tokio::time::timeout(Duration::from_secs(5), async {
+        let mounted = tokio::time::timeout(TEST_TIMEOUT, async {
             loop {
                 if self
                     .work_mount
@@ -3105,7 +3130,7 @@ impl RunningPaidNode {
     }
 
     async fn wait_for_cursor(&self, height: u64) {
-        let caught_up = tokio::time::timeout(Duration::from_secs(5), async {
+        let caught_up = tokio::time::timeout(TEST_TIMEOUT, async {
             loop {
                 let cursor = self
                     .work_mount
@@ -3195,7 +3220,7 @@ async fn run_advertised_paid_exchange(
 
     // The observer must publish readiness before the first request. Request
     // handling itself has no validator connection and cannot refresh it.
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(TEST_TIMEOUT, async {
         loop {
             if node
                 .work_mount
@@ -3251,7 +3276,7 @@ async fn run_advertised_paid_exchange(
 /// production runner finalizes and mounts it, and a valid paid proposal
 /// reaches that exact service. A second independent offer opens a
 /// contest after mount and proves readiness is re-read per request.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn paid_setup_and_accept_reach_the_mounted_services_over_the_advertised_alpns() {
     let fixture = temp();
     let policy = provider_policy();
@@ -3515,7 +3540,7 @@ fn the_clock_resumes_an_accepted_job_after_restart() {
 
         assert!(runner.tick(&chain).await, "the recovery read answers");
 
-        let finished = tokio::time::timeout(Duration::from_secs(5), async {
+        let finished = tokio::time::timeout(TEST_TIMEOUT, async {
             loop {
                 let phase = mount
                     .service(
@@ -3603,7 +3628,7 @@ fn the_clock_resumes_an_accepted_job_after_restart() {
             .unwrap()
             .expect("restarted channel is mounted");
         let response: WithTrailer<DeliverResultResponse> = tokio::time::timeout(
-            Duration::from_secs(5),
+            TEST_TIMEOUT,
             handler.deliver_result(request.clone(), context.clone()),
         )
         .await
@@ -3635,7 +3660,7 @@ fn the_clock_resumes_an_accepted_job_after_restart() {
     });
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn open_result_stream_stops_when_a_contest_finalizes() {
     let dir = temp();
     write_setup_journal(dir.path());
@@ -3670,7 +3695,7 @@ async fn open_result_stream_stops_when_a_contest_finalizes() {
         .unwrap()
         .unwrap();
     let mut stream = handler.stream_result(request, context).await.unwrap();
-    let first = tokio::time::timeout(Duration::from_secs(5), stream.next())
+    let first = tokio::time::timeout(TEST_TIMEOUT, stream.next())
         .await
         .unwrap()
         .unwrap()
@@ -3683,7 +3708,7 @@ async fn open_result_stream_stops_when_a_contest_finalizes() {
     chain.set_snapshot(ready_channel_snapshot(ORIGIN, Some(pending_contest(false))));
     assert!(runner.tick(&chain).await);
     backend.finish();
-    let next = tokio::time::timeout(Duration::from_secs(5), stream.next())
+    let next = tokio::time::timeout(TEST_TIMEOUT, stream.next())
         .await
         .unwrap()
         .expect("the open stream terminates with a refusal");
@@ -3705,7 +3730,7 @@ async fn open_result_stream_stops_when_a_contest_finalizes() {
 /// that held the endpoint across the source's wait. It would not
 /// compile in a spawned task if it held a `MutexGuard`, and it
 /// would deadlock here if it held anything else.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_clock_does_not_starve_the_request_path() {
     let dir = temp();
     write_setup_journal(dir.path());
@@ -3735,7 +3760,7 @@ async fn the_clock_does_not_starve_the_request_path() {
     ) else {
         panic!("the channel is mounted before the chain is read")
     };
-    let answered = tokio::time::timeout(Duration::from_secs(5), async move {
+    let answered = tokio::time::timeout(TEST_TIMEOUT, async move {
         let response = dispatch
             .accept_work(signed_accept_request(), TransportContext::default())
             .await?;
@@ -3755,7 +3780,7 @@ async fn the_clock_does_not_starve_the_request_path() {
         Ok(Err(error)) => panic!("the request path is reachable: {error}"),
         Err(_) => panic!("an inbound request waited on the clock's chain read"),
     }
-    let entered = tokio::time::timeout(Duration::from_secs(5), backend.wait_for_call()).await;
+    let entered = tokio::time::timeout(TEST_TIMEOUT, backend.wait_for_call()).await;
     assert!(
         entered.is_ok(),
         "the accepted job reaches its executor without joining the close clock",
@@ -3863,7 +3888,11 @@ async fn a_blocked_channel_observer_does_not_stop_other_channels_or_shutdown() {
     );
     let entered = Arc::new(Semaphore::new(0));
     let release = Arc::new(Semaphore::new(0));
-    source.0.lock().unwrap().next_read = Some((entered.clone(), release));
+    source.0.lock().unwrap().next_read = Some(BlockedRead {
+        bond: first.bond_edge(),
+        entered: entered.clone(),
+        release,
+    });
     let mount = MountedWork::default();
     let setups = MountedSetup::default();
     let runner = discover_two_route_runner(dir.path(), &mount, &setups);
@@ -3876,12 +3905,12 @@ async fn a_blocked_channel_observer_does_not_stop_other_channels_or_shutdown() {
             })
             .await;
     });
-    tokio::time::timeout(Duration::from_secs(2), entered.acquire())
+    tokio::time::timeout(TEST_TIMEOUT, entered.acquire())
         .await
         .unwrap()
         .unwrap()
         .forget();
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(TEST_TIMEOUT, async {
         loop {
             if mount
                 .service(
@@ -3910,7 +3939,7 @@ async fn a_blocked_channel_observer_does_not_stop_other_channels_or_shutdown() {
         )
         .unwrap();
     stop.send(()).unwrap();
-    tokio::time::timeout(Duration::from_secs(2), observing)
+    tokio::time::timeout(TEST_TIMEOUT, observing)
         .await
         .expect("shutdown cancels the blocked read")
         .unwrap();
@@ -4026,11 +4055,14 @@ async fn one_peer_routes_distinct_channels_without_crossing_journals() {
         response.response.outcome,
         Some(admit_certificate_response::Outcome::Refused(_))
     ));
-    for kind in [
-        FundingKind::Grant as i32,
-        FundingKind::Unspecified as i32,
-        99,
-    ] {
+    let mut unmounted_grant = first.signed_accept_request();
+    unmounted_grant.route.as_mut().unwrap().funding_kind = FundingKind::Grant as i32;
+    let response = accept_mounted_route(&mounted, peer, unmounted_grant).await;
+    assert!(
+        matches!(response.outcome, Some(accept_work_response::Outcome::Refused(refusal))
+        if refusal.code == WorkRefusalCode::NotReady as i32)
+    );
+    for kind in [FundingKind::Unspecified as i32, 99] {
         let mut request = first.signed_accept_request();
         request.route.as_mut().unwrap().funding_kind = kind;
         assert!(mounted.accept_work(request, context.clone()).await.is_err());
@@ -4049,4 +4081,329 @@ async fn one_peer_routes_distinct_channels_without_crossing_journals() {
     );
     assert_eq!(a.with_state(Channel::checkpoint).unwrap(), before_a);
     assert_eq!(b.with_state(Channel::checkpoint).unwrap(), before_b);
+}
+
+#[test]
+fn owner_bootstrap_and_explicit_resource_revision_preserve_machine_limits() {
+    use hellas_rpc::protocol::work_grant::{budget::*, records::*, *};
+    use hellas_sdk::grant_config::GrantConfig;
+    let root = temp();
+    let identity = crate::identity::load_or_create(Some(&root.path().join("identity"))).unwrap();
+    let provider = Principal::verify(identity.enrollment).unwrap();
+    let config = || super::super::GrantNodeConfig {
+        config: GrantConfig::unconfigured(root.path()),
+        provider: provider.clone(),
+        owner: Some(provider.clone()),
+    };
+    let (_, mut store) = prepare_grants(config()).unwrap();
+    let id = owner_grant_id(
+        store.state().network(),
+        provider.bundle().content_id(),
+        provider.id(),
+    );
+    assert!(store.state().grant(id).unwrap().policies.is_empty());
+    let limit = Limit {
+        meter: Meter::Requests,
+        window: Window::Day,
+        amount: 7,
+    };
+    store
+        .configure_machine(vec![limit], 2, hellas_work::grant_service::wall_clock())
+        .unwrap();
+    drop(store);
+    let (_, store) = prepare_grants(config()).unwrap();
+    let machine = store.state().ledger().node(BudgetNode::Machine).unwrap();
+    assert_eq!(machine.limits(), &[limit]);
+    assert_eq!(machine.concurrent(), 2);
+    drop(store);
+    let mut explicit = config();
+    explicit.config.machine_limits = Some(vec![limit]);
+    explicit.config.max_in_flight = 2;
+    explicit.config.resources = vec![GrantPolicy {
+        name: "evaluate".into(),
+        work: work_policy().into(),
+        https: None,
+    }];
+    let (_, store) = prepare_grants(explicit).unwrap();
+    assert_eq!(store.state().grant(id).unwrap().revision, Revision(2));
+    assert_eq!(store.state().grant(id).unwrap().policies.len(), 1);
+    drop(store);
+    let (_, store) = prepare_grants(config()).unwrap();
+    assert_eq!(store.state().grant(id).unwrap().revision, Revision(2));
+    assert_eq!(store.state().grant(id).unwrap().policies.len(), 1);
+}
+
+#[tokio::test]
+async fn grant_and_paid_work_share_a_peer_but_never_a_journal() {
+    use hellas_rpc::protocol::{
+        work_grant::{self as grant, budget::*, records::*},
+        work_profile::PreparedWorkInput,
+    };
+    use hellas_work::{
+        grant_service::GrantService,
+        work::admission::{CapacityDomain, WorkPermit},
+        work_store::grant::GrantStore,
+    };
+    #[derive(Clone)]
+    struct Backend {
+        calls: Arc<AtomicUsize>,
+        slots: Arc<Semaphore>,
+    }
+    impl WorkBackend for Backend {
+        fn try_admit(&self, domain: CapacityDomain) -> Result<WorkPermit, BackendFault> {
+            Ok(WorkPermit::new(
+                domain,
+                self.slots
+                    .clone()
+                    .try_acquire_owned()
+                    .map_err(|_| BackendFault::new("full"))?,
+            ))
+        }
+        async fn evaluate(
+            &self,
+            input: PreparedEvaluateInput,
+        ) -> Result<Vec<OutputEventEnvelope>, BackendFault> {
+            let (_, admission) = input.into_parts_and_admission();
+            let _running = admission.dispatch()?;
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(answer_transcript())
+        }
+    }
+    fn principal(key: &ProducerSigningKey, transport: PeerId) -> Principal {
+        let statement = hellas_rpc::ProviderGenesisStatement {
+            root_kind: hellas_rpc::RootKind::Software,
+            root_public_key: key.public_key(),
+            producer_public_key: key.public_key(),
+            transport_public_key: PublicKey::Ed25519(transport.into_bytes()),
+            platform_credential: hellas_rpc::PlatformCredential::Absent,
+            installation_nonce: [7; 32],
+        };
+        let proof = key
+            .sign_digest(Digest::hash(&statement.canonical_bytes()))
+            .unwrap();
+        Principal::verify(hellas_rpc::ProviderEnrollmentBundle {
+            genesis: hellas_rpc::SignedProviderGenesis {
+                statement,
+                root_proof: hellas_rpc::RootProof::Software(proof),
+            },
+            platform: hellas_rpc::PlatformEnrollment::Absent,
+        })
+        .unwrap()
+    }
+    let root = temp();
+    write_setup_journal(root.path());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let backend = Backend {
+        calls: calls.clone(),
+        slots: Arc::new(Semaphore::new(2)),
+    };
+    let mounted = MountedWork::with_backend(backend.clone());
+    let mut observer = runner(root.path(), provider_policy(), &mounted);
+    let chain = TestChain::new();
+    chain.set_snapshot(ready_channel_snapshot(ORIGIN, None));
+    assert!(observer.tick(&chain).await);
+    let peer = default_route_peer();
+    let paid = mounted
+        .service(&vouched_context(peer), descriptor().channel().id())
+        .unwrap();
+    let grantee_key = ProducerSigningKey::from_secret_bytes([0x21; 32]).unwrap();
+    let provider_key = provider_producer();
+    let network = grant::grant_network();
+    let now = grant::UnixMillis(1_000_000);
+    let mut store = GrantStore::open(
+        &root.path().join("grants"),
+        network,
+        principal(&provider_key, PeerId::from_bytes([0x22; 32]))
+            .bundle()
+            .clone(),
+        now,
+    )
+    .unwrap();
+    store
+        .configure_machine(
+            vec![Limit {
+                meter: Meter::Requests,
+                window: Window::Total,
+                amount: 3,
+            }],
+            2,
+            now,
+        )
+        .unwrap();
+    let id = grant::GrantId([99; 16]);
+    store
+        .define(
+            GrantDef {
+                id,
+                revision: grant::Revision(1),
+                kind: GrantKind::Principal(principal(&grantee_key, peer)),
+                policies: vec![GrantPolicy {
+                    name: "native".into(),
+                    work: work_policy().into(),
+                    https: None,
+                }],
+                limits: vec![],
+                weight: std::num::NonZeroU16::new(1).unwrap(),
+                max_job_millis: std::num::NonZeroU64::new(10_000).unwrap(),
+                max_in_flight: std::num::NonZeroU16::new(1).unwrap(),
+                expires: None,
+                state: GrantState::Active,
+                allow_account_backed: false,
+            },
+            now,
+        )
+        .unwrap();
+    let channel = store.state().channel_id(id).unwrap();
+    let input = PreparedWorkInput::Evaluate(bundle());
+    let auth = grant::GrantJobAuthorizationV1 {
+        channel_id: channel,
+        grant_id: id,
+        grant_revision: grant::Revision(1),
+        catalogue_revision: grant::Revision(0),
+        work_policy_digest: store.state().grant(id).unwrap().policies[0]
+            .work
+            .digest(network, channel.0),
+        prepared_input_digest: input.bound_digest(network, channel.0).unwrap(),
+        proposal_nonce: 1,
+        acceptance_deadline_ms: grant::UnixMillis(now.0 + 1000),
+        terminal_deadline_ms: grant::UnixMillis(now.0 + 5000),
+        delivery_deadline_ms: grant::UnixMillis(now.0 + 10000),
+        request_commitment: hellas_rpc::RequestCommitment::from_digest(
+            input.input_commitment().unwrap().digest(),
+        ),
+        environment_commitment: work_policy().allowed_environment,
+    };
+    let request = AcceptWorkRequest {
+        route: Some(hellas_rpc::pb::work::WorkRoute::grant(channel)),
+        authorization: auth.encode(),
+        client_signature: grantee_key
+            .sign_digest(grant::grant_work_id(network, &auth))
+            .unwrap()
+            .bytes()
+            .to_vec(),
+        prepared_input: input.encode().unwrap(),
+    };
+    let service = GrantService::new(
+        store,
+        Arc::new(provider_key),
+        backend,
+        vec![],
+        Arc::new(move || now),
+    )
+    .unwrap();
+    assert!(mounted.mount_grants(service.clone()));
+    let response = accept_mounted_route(&mounted, peer, signed_accept_request()).await;
+    assert!(matches!(
+        response.outcome,
+        Some(accept_work_response::Outcome::Accepted(_))
+    ));
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        while !paid
+            .with_state(|state| state.jobs().any(|job| job.phase() == JobPhase::Ready))
+            .unwrap()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let before_paid = paid.with_state(Channel::checkpoint).unwrap();
+    let mut context = vouched_context(peer);
+    context.open_exporter = Some([7; 32]);
+    let response: WithTrailer<AcceptWorkResponse> = mounted
+        .accept_work(request.clone(), context.clone())
+        .await
+        .unwrap()
+        .into();
+    assert!(matches!(
+        response.response.outcome,
+        Some(accept_work_response::Outcome::Accepted(_))
+    ));
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        loop {
+            if service
+                .administer(|store, _| {
+                    Ok(store
+                        .state()
+                        .channel(channel)
+                        .unwrap()
+                        .job_book()
+                        .jobs()
+                        .next()
+                        .is_none())
+                })
+                .unwrap()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(paid.with_state(Channel::checkpoint).unwrap(), before_paid);
+    let before_grant = service
+        .administer(|store, _| {
+            Ok(store
+                .state()
+                .ledger()
+                .node(BudgetNode::Machine)
+                .unwrap()
+                .counter(Meter::Requests, Window::Total)
+                .used)
+        })
+        .unwrap();
+    assert_eq!(before_grant, 1);
+    let mut crossed = request;
+    crossed.route = Some(hellas_rpc::pb::work::WorkRoute::payment(
+        descriptor().channel().id(),
+    ));
+    let response: WithTrailer<AcceptWorkResponse> = mounted
+        .accept_work(crossed, context.clone())
+        .await
+        .unwrap()
+        .into();
+    assert!(matches!(
+        response.response.outcome,
+        Some(accept_work_response::Outcome::Refused(_))
+    ));
+    let mut crossed = signed_accept_request();
+    crossed.route = Some(hellas_rpc::pb::work::WorkRoute::grant(channel));
+    let response: WithTrailer<AcceptWorkResponse> = mounted
+        .accept_work(crossed, context.clone())
+        .await
+        .unwrap()
+        .into();
+    assert!(matches!(
+        response.response.outcome,
+        Some(accept_work_response::Outcome::Refused(_))
+    ));
+    assert_eq!(paid.with_state(Channel::checkpoint).unwrap(), before_paid);
+    service
+        .administer(|store, _| {
+            assert_eq!(
+                store
+                    .state()
+                    .ledger()
+                    .node(BudgetNode::Machine)
+                    .unwrap()
+                    .counter(Meter::Requests, Window::Total)
+                    .used,
+                before_grant
+            );
+            Ok(())
+        })
+        .unwrap();
+    mounted.clear_all();
+    assert!(
+        mounted
+            .service(&context, descriptor().channel().id())
+            .is_none()
+    );
+    assert!(
+        mounted.grant_service().is_some(),
+        "paid observer failure cannot unmount grant authority"
+    );
+    service.drain().await.unwrap();
 }

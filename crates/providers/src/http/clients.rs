@@ -68,30 +68,6 @@ impl Clients {
         Ok(client)
     }
 
-    // The fixture's CA acts as a provider-installed public root. Production
-    // callers still cannot combine their own trust anchors with credentials.
-    #[cfg(test)]
-    pub(super) fn trust_fixture(
-        &self,
-        request: &HttpFetchRequest,
-        url: &Url,
-        mut addresses: Vec<SocketAddr>,
-    ) {
-        let client = self.get(request, url, addresses.clone()).unwrap();
-        addresses.sort_unstable();
-        addresses.dedup();
-        let key = Key {
-            origin: url.origin().ascii_serialization(),
-            addresses,
-            tls: HttpTls {
-                roots: hellas_rpc::http_fetch::HttpTrustRoots::WebPki,
-                spki_sha256: request.tls.spki_sha256.clone(),
-            },
-            credential: request.credential.clone(),
-        };
-        self.0.lock().unwrap().push_back((key, client));
-    }
-
     fn cached(entries: &mut VecDeque<(Key, Client)>, key: &Key) -> Option<Client> {
         let index = entries.iter().position(|(existing, _)| existing == key)?;
         let entry = entries.remove(index).unwrap();

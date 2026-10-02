@@ -51,6 +51,8 @@ pub mod execution_event;
 pub mod fetch;
 #[cfg(feature = "fetch")]
 pub mod http_fetch;
+#[cfg(feature = "fetch")]
+pub mod http_usage;
 pub mod observe;
 #[cfg(feature = "execute")]
 pub mod open;

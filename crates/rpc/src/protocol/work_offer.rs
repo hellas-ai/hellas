@@ -3,6 +3,7 @@ use super::{
     value::{canonical_dag_cbor, decode_canonical_dag_cbor},
     work::xfh,
     work_bundle::WorkChannelSetupBundleV1,
+    work_grant::records::{MAX_OFFER_BYTES, provider_bytes},
 };
 use crate::{Digest, ProviderEnrollmentBundle, PublicKey, Signature};
 use hellas_kernel::{PayloadHash, Secp256k1Signer, Secp256k1Verifier};
@@ -44,7 +45,9 @@ impl PaidOffer {
         {
             return Err(PaidOfferError::Malformed);
         }
-        check_provider(&self.provider)?;
+        self.provider
+            .check_grant_provider()
+            .map_err(|_| PaidOfferError::Provider)?;
         if self.provider.genesis.statement.producer_public_key
             != PublicKey::Secp256k1(self.proposal.bond_terms().parties.maker().to_bytes())
         {
@@ -128,39 +131,5 @@ mod setup_bytes {
     ) -> Result<WorkChannelSetupBundleV1, D::Error> {
         WorkChannelSetupBundleV1::decode(&serde_bytes::ByteBuf::deserialize(d)?)
             .map_err(D::Error::custom)
-    }
-}
-
-const MAX_OFFER_BYTES: usize = 256 * 1024;
-const MAX_PROVIDER_BYTES: usize = 32 * 1024;
-pub fn check_provider(provider: &ProviderEnrollmentBundle) -> Result<(), PaidOfferError> {
-    if provider.canonical_bytes().len() > MAX_PROVIDER_BYTES {
-        return Err(PaidOfferError::Size);
-    }
-    let (PublicKey::Secp256k1(key), PublicKey::Ed25519(_)) = (
-        provider.genesis.statement.producer_public_key,
-        provider.genesis.statement.transport_public_key,
-    ) else {
-        return Err(PaidOfferError::Provider);
-    };
-    k256::ecdsa::VerifyingKey::from_sec1_bytes(&key).map_err(|_| PaidOfferError::Provider)?;
-    Ok(())
-}
-mod provider_bytes {
-    use super::*;
-    pub fn serialize<S: Serializer>(p: &ProviderEnrollmentBundle, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_bytes(&p.canonical_bytes())
-    }
-    pub fn deserialize<'de, D: Deserializer<'de>>(
-        d: D,
-    ) -> Result<ProviderEnrollmentBundle, D::Error> {
-        let bytes = serde_bytes::ByteBuf::deserialize(d)?;
-        if bytes.len() > MAX_PROVIDER_BYTES {
-            return Err(D::Error::custom(PaidOfferError::Size));
-        }
-        let provider =
-            ProviderEnrollmentBundle::from_canonical_bytes(&bytes).map_err(D::Error::custom)?;
-        check_provider(&provider).map_err(D::Error::custom)?;
-        Ok(provider)
     }
 }

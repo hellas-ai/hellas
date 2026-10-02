@@ -19,10 +19,16 @@ pub use hellas_client as client;
 pub use iroh;
 #[cfg(feature = "client")]
 mod remote;
-#[cfg(feature = "gateway")]
+#[cfg(all(feature = "gateway", not(feature = "grant-gateway")))]
 pub use hellas_gateway as gateway;
-#[cfg(feature = "paid-provider")]
+#[cfg(feature = "grant-gateway")]
+pub mod gateway;
+#[cfg(feature = "grant-provider")]
+mod grant_provider;
+#[cfg(any(feature = "paid-provider", feature = "grant-provider"))]
 mod provider;
+#[cfg(feature = "grant-provider")]
+pub use grant_provider::{GrantProviderOptions, responses_policy};
 #[cfg(feature = "provider")]
 pub use hellas_executor::{FetchRoute, FetchRouteEntry, FetchRoutePolicy, FetchRouteRegistry};
 #[cfg(feature = "work")]
@@ -31,11 +37,10 @@ pub use hellas_kernel as kernel;
 pub use hellas_providers::{
     HttpProviderConfig, OpenAiResponsesFetchProvider, ResponsesFetchAdaptorFactory,
 };
-#[cfg(feature = "paid-provider")]
-pub use provider::{
-    FetchProviderOptions, OpenAiProviderOptions, ProviderError, ProviderHandle,
-    start_fetch_provider, start_openai_provider,
-};
+#[cfg(any(feature = "paid-provider", feature = "grant-provider"))]
+pub use provider::{FetchProviderOptions, ProviderError, ProviderHandle, start_fetch_provider};
+#[cfg(feature = "grant-provider")]
+pub use provider::{OpenAiProviderOptions, start_openai_provider};
 #[cfg(feature = "client")]
 pub use remote::ClientIdentity;
 
@@ -54,6 +59,8 @@ pub mod work_config;
 
 #[cfg(feature = "paid-client")]
 pub mod paid_client;
+#[cfg(any(feature = "paid-client", feature = "grant-client"))]
+mod work_link;
 
 #[cfg(feature = "work")]
 pub mod work_provision;
@@ -64,11 +71,19 @@ mod test_support;
 #[cfg(feature = "paid-gateway")]
 pub mod paid_gateway;
 
-#[cfg(feature = "paid-client")]
-mod work_link;
-#[cfg(feature = "paid-client")]
+#[cfg(feature = "grant-client")]
+pub mod grant_client;
+#[cfg(any(feature = "grant-client", feature = "paid-client"))]
 pub mod work_session;
-#[cfg(feature = "paid-client")]
+#[cfg(any(feature = "grant-client", feature = "paid-client"))]
 pub use work_session::WorkSession;
-#[cfg(feature = "paid-gateway")]
+
+#[cfg(feature = "grant-admin")]
+pub mod grant_admin;
+#[cfg(feature = "work")]
+pub mod grant_config;
+
+#[cfg(any(feature = "paid-gateway", feature = "grant-gateway"))]
 mod gateway_work;
+#[cfg(feature = "grant-gateway")]
+pub mod grant_gateway;

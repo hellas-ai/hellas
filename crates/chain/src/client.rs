@@ -43,6 +43,8 @@ pub struct VerifiedRemoteLightClient {
 
 impl RemoteLightClient {
     pub fn new(transport: MuxTransport) -> Self {
+        #[cfg(feature = "construction-audit")]
+        crate::construction_audit::record();
         Self {
             client: LightClientClientImpl::new(transport),
             verifier: None,
@@ -86,6 +88,8 @@ impl RemoteLightClient {
 impl VerifiedRemoteLightClient {
     /// Build a client that requires `verifier` for every finalized snapshot.
     pub fn new(transport: MuxTransport, verifier: ConsensusVerifier) -> Self {
+        #[cfg(feature = "construction-audit")]
+        crate::construction_audit::record();
         Self {
             client: LightClientClientImpl::new(transport),
             verifier,
@@ -103,6 +107,8 @@ impl VerifiedRemoteLightClient {
 }
 
 async fn connect_transport(addr: &str) -> Result<MuxTransport, QueryError> {
+    #[cfg(feature = "construction-audit")]
+    crate::construction_audit::record();
     #[cfg(target_family = "wasm")]
     {
         hellas_wire::ws::wasm::connect(addr)

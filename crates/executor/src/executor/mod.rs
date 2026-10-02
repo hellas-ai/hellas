@@ -21,6 +21,7 @@ pub(crate) type ExecuteEventReceiver = mpsc::Receiver<Result<WorkEvent, WireStat
 #[derive(Debug)]
 pub struct ExecuteOutcome {
     pub events: ExecuteEventReceiver,
+    pub(crate) completion: Option<oneshot::Receiver<()>>,
 }
 pub(crate) enum ExecutorOwedRequest {
     RunPaidFetch {
@@ -59,4 +60,6 @@ pub(crate) struct FetchProviderFailure {
 #[derive(Clone)]
 pub struct ExecutorHandle {
     pub(super) owed_tx: mpsc::Sender<ExecutorOwedRequest>,
+    pub(crate) fetch_capacity: Arc<tokio::sync::Semaphore>,
+    pub(crate) gpu_capacity: Option<Arc<tokio::sync::Semaphore>>,
 }

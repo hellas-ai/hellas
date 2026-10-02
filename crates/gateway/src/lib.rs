@@ -41,7 +41,7 @@ pub use archive::ArchiveOptions;
 pub use execution::{
     CausalLmExecutionEnvironment, ExecutionEvent, Outcome, PreparedExecution, StopReason,
 };
-pub use http_fetch::{HttpGatewayConfig, HttpGatewayOptions, start_http};
+pub use http_fetch::{HttpGatewayConfig, HttpGatewayOptions, HttpRoute, start_http};
 
 const DEFAULT_HTTP_PORT: u16 = 8080;
 

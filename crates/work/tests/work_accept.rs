@@ -1193,6 +1193,7 @@ fn a_known_refusal_releases_only_the_proposal_slot_durably() {
     let id = endpoint.state().job_book().pending_proposal().unwrap();
     let refused = AcceptWorkResponse {
         outcome: Some(Outcome::Refused(WorkRefused {
+            grant: None,
             code: WorkRefusalCode::NotReady as i32,
             reason: String::new(),
         })),
@@ -1282,6 +1283,7 @@ fn a_refusal_is_read_back_as_the_refusal_it_names() {
     };
     let response = AcceptWorkResponse {
         outcome: Some(Outcome::Refused(WorkRefused {
+            grant: None,
             code: WorkRefusalCode::Declined as i32,
             reason: "no".into(),
         })),
@@ -1318,6 +1320,7 @@ fn every_wire_code_reads_back_as_the_refusal_it_names() {
         };
         let response = AcceptWorkResponse {
             outcome: Some(Outcome::Refused(WorkRefused {
+                grant: None,
                 code: code as i32,
                 reason: "no".into(),
             })),
@@ -1343,6 +1346,7 @@ fn a_response_this_service_does_not_define_is_malformed() {
             "unspecified refusal",
             AcceptWorkResponse {
                 outcome: Some(Outcome::Refused(WorkRefused {
+                    grant: None,
                     code: WorkRefusalCode::Unspecified as i32,
                     reason: String::new(),
                 })),
@@ -1352,6 +1356,7 @@ fn a_response_this_service_does_not_define_is_malformed() {
             "unassigned refusal",
             AcceptWorkResponse {
                 outcome: Some(Outcome::Refused(WorkRefused {
+                    grant: None,
                     code: 99,
                     reason: String::new(),
                 })),

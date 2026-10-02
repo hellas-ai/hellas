@@ -143,6 +143,9 @@ pub fn validate_serve_args(args: &[String]) -> Result<()> {
             ![
                 "--identity",
                 "--owner",
+                "--owner-enrollment",
+                "--init-owner",
+                "--grant-config",
                 "--software-root",
                 "--assurance",
                 "--artifact-store-path",
@@ -179,6 +182,9 @@ pub struct Credentials {
     /// Public transport identity allowed to administer and use this machine.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<String>,
+    /// Canonical public owner enrollment, hex encoded for bootstrap transports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_enrollment: Option<String>,
 }
 
 impl Credentials {
@@ -187,7 +193,40 @@ impl Credentials {
             admin_secret: hex::encode(iroh::SecretKey::generate().to_bytes()),
             token: hex::encode(iroh::SecretKey::generate().to_bytes()),
             owner: None,
+            owner_enrollment: None,
         }
+    }
+
+    pub fn owner_principal(
+        &self,
+    ) -> Result<Option<hellas_rpc::protocol::work_grant::records::Principal>> {
+        use hellas_rpc::protocol::work_grant::records::{MAX_PRINCIPAL_BYTES, Principal};
+        let Some(bundle) = &self.owner_enrollment else {
+            return Ok(None);
+        };
+        ensure!(
+            bundle.len() <= MAX_PRINCIPAL_BYTES * 2,
+            "owner enrollment exceeds its bound"
+        );
+        let principal = Principal::decode(&hex::decode(bundle)?)?;
+        let owner = self
+            .owner
+            .as_deref()
+            .context("owner enrollment has no transport binding")?
+            .parse::<iroh::EndpointId>()?;
+        ensure!(
+            principal.transport() == *owner.as_bytes(),
+            "owner enrollment does not match the authenticated owner transport"
+        );
+        Ok(Some(principal))
+    }
+
+    pub fn require_owner_enrollment(&self) -> Result<()> {
+        ensure!(
+            self.owner.is_none() || self.owner_principal()?.is_some(),
+            "owner enrollment required for worker bootstrap"
+        );
+        Ok(())
     }
 
     pub fn secret_key(&self) -> Result<iroh::SecretKey> {
@@ -195,6 +234,7 @@ impl Credentials {
             validate_hex(owner)?;
             owner.parse::<iroh::EndpointId>()?;
         }
+        self.owner_principal()?;
         validate_hex(&self.admin_secret)?;
         validate_hex(&self.token)?;
         Ok(iroh::SecretKey::from_bytes(
@@ -208,6 +248,7 @@ impl Credentials {
 
     pub fn env_for_args(&self, args: &[String]) -> Result<BTreeMap<String, String>> {
         self.secret_key()?;
+        self.require_owner_enrollment()?;
         let mut env = BTreeMap::from([
             ("HELLAS_REMOTE_KEY".into(), self.admin_secret.clone()),
             ("HELLAS_REMOTE_TOKEN".into(), self.token.clone()),
@@ -220,6 +261,9 @@ impl Credentials {
         if let Some(owner) = &self.owner {
             env.insert("HELLAS_REMOTE_OWNER".into(), owner.clone());
         }
+        if let Some(bundle) = &self.owner_enrollment {
+            env.insert("HELLAS_REMOTE_OWNER_ENROLLMENT".into(), bundle.clone());
+        }
         Ok(env)
     }
 }
@@ -229,12 +273,40 @@ impl Credentials {
 pub struct Enrollment {
     pub node_id: String,
     pub enrollment_id: String,
+    /// Absent only in legacy inventory records. Such a record cannot open an owner grant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle: Option<String>,
 }
 
 impl Enrollment {
     pub fn validate(&self) -> Result<()> {
         self.node_id.parse::<iroh::EndpointId>()?;
-        validate_hex(&self.enrollment_id)
+        validate_hex(&self.enrollment_id)?;
+        if self.bundle.is_some() {
+            self.principal()?;
+        }
+        Ok(())
+    }
+    pub fn principal(&self) -> Result<hellas_rpc::protocol::work_grant::records::Principal> {
+        use hellas_rpc::protocol::work_grant::records::{MAX_PRINCIPAL_BYTES, Principal};
+        let bundle = self
+            .bundle
+            .as_deref()
+            .context("worker enrollment bundle unavailable; upgrade the managed worker")?;
+        ensure!(
+            bundle.len() <= MAX_PRINCIPAL_BYTES * 2,
+            "worker enrollment exceeds its bound"
+        );
+        let principal = Principal::decode(&hex::decode(bundle)?)?;
+        ensure!(
+            principal.id().0.to_string() == self.enrollment_id,
+            "worker enrollment ID mismatch"
+        );
+        ensure!(
+            principal.transport() == *self.node_id.parse::<iroh::EndpointId>()?.as_bytes(),
+            "worker transport differs from its enrollment"
+        );
+        Ok(principal)
     }
 }
 

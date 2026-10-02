@@ -130,16 +130,17 @@ mod id_pins {
     #[test]
     fn work_ids_are_stable() {
         use super::services::work::{
-            AcceptWork, AdmitCertificate, DeliverResult, Open, StreamResult, Work,
+            AcceptWork, AdmitCertificate, DeliverResult, GetStanding, Open, StreamResult, Work,
         };
-        // Explicit funding/channel routes change every Work method except Open.
-        // Setup adds an explicit bond route. Both endpoints upgrade together.
-        assert_eq!(<Work as ServiceMarker>::SERVICE_ID, 0xb3aa_bcc3);
+        // Standing, typed grant refusals and recovered terminal metadata rotate
+        // Work deliberately. The shared carrier rotates WorkSetup; Open stays fixed.
+        assert_eq!(<Work as ServiceMarker>::SERVICE_ID, 0x51bc406a);
         assert_eq!(<Open as MethodMarker>::METHOD_ID, 0x93cb0b39);
-        assert_eq!(<AcceptWork as MethodMarker>::METHOD_ID, 0xbd9a_cfeb);
-        assert_eq!(<DeliverResult as MethodMarker>::METHOD_ID, 0x540b_be56);
-        assert_eq!(<StreamResult as MethodMarker>::METHOD_ID, 0xac7f_4c64);
-        assert_eq!(<AdmitCertificate as MethodMarker>::METHOD_ID, 0x1924_d98f);
+        assert_eq!(<AcceptWork as MethodMarker>::METHOD_ID, 0x5188734e);
+        assert_eq!(<GetStanding as MethodMarker>::METHOD_ID, 0x2d80e5f9);
+        assert_eq!(<DeliverResult as MethodMarker>::METHOD_ID, 0x74bb099b);
+        assert_eq!(<StreamResult as MethodMarker>::METHOD_ID, 0xb2043ac5);
+        assert_eq!(<AdmitCertificate as MethodMarker>::METHOD_ID, 0x07db8b8e);
     }
 
     /// The handshake carrier is its own service, so its ids are its own.
@@ -153,9 +154,17 @@ mod id_pins {
     #[test]
     fn work_setup_ids_are_stable() {
         use super::services::work_setup::{ExchangeSetup, Open, WorkSetup};
-        assert_eq!(<WorkSetup as ServiceMarker>::SERVICE_ID, 0xbc93_9b94);
+        assert_eq!(<WorkSetup as ServiceMarker>::SERVICE_ID, 0xdfbb90af);
         assert_eq!(<Open as MethodMarker>::METHOD_ID, 0xcbe4ebd5);
-        assert_eq!(<ExchangeSetup as MethodMarker>::METHOD_ID, 0xe8cf_31dc);
+        assert_eq!(<ExchangeSetup as MethodMarker>::METHOD_ID, 0x14d05693);
+    }
+
+    #[cfg(feature = "host-control")]
+    #[test]
+    fn local_grant_control_ids_are_stable() {
+        use super::services::host_control::{GrantControl, HostControl};
+        assert_eq!(<HostControl as ServiceMarker>::SERVICE_ID, 0x570c_0c0d);
+        assert_eq!(<GrantControl as MethodMarker>::METHOD_ID, 0xc0e0_b21c);
     }
 
     #[cfg(feature = "chain")]

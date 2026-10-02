@@ -237,7 +237,8 @@ pub(crate) enum EnqueueError {
 }
 
 pub(crate) struct ExecuteJob {
-    pub deadline: Option<Instant>,
+    pub complete: Option<tokio::sync::oneshot::Sender<()>>,
+    pub running: Option<hellas_work::work::admission::RunningWork>,
     pub span: tracing::Span,
     pub execution_id: String,
     pub evaluate_request: EvaluateRequest,
@@ -249,6 +250,8 @@ pub(crate) struct ExecuteJob {
 }
 
 pub(crate) struct WorkerCompletion {
+    pub running: Option<hellas_work::work::admission::RunningWork>,
+    pub complete: Option<tokio::sync::oneshot::Sender<()>>,
     pub execution_id: String,
     pub evaluate_request: EvaluateRequest,
     pub invocation: Invocation,
@@ -326,12 +329,13 @@ fn worker_loop(
     config: GpuConfig,
 ) {
     // Starting the executor does not touch a GPU. Catena is created lazily
-    // only after an authorized paid job reaches this dedicated thread.
+    // only after an admitted Work job reaches this dedicated thread.
     let mut runtime = ModelRuntime::new(config);
     let metrics = InferenceMetrics::new();
     while let Ok(WorkerCommand::Execute(job)) = rx.recv() {
-        let job = *job;
-        let deadline = job.deadline;
+        let mut job = *job;
+        let running = job.running.take();
+        let complete = job.complete.take();
         let execution_id = job.execution_id.clone();
         let execution_environment = job.evaluate_request.execution_environment;
         let sender = job.sender.clone();
@@ -354,6 +358,7 @@ fn worker_loop(
                 &mut output_builder,
                 &mut output_events,
             );
+
             let mut telemetry = metrics.start(
                 &job.span,
                 job.accepted_at,
@@ -363,7 +368,13 @@ fn worker_loop(
             let span = telemetry.span().clone();
             let _entered = span.enter();
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                run_job(job, on_progress, &mut runtime, &mut telemetry)
+                run_job(
+                    job,
+                    on_progress,
+                    &mut runtime,
+                    &mut telemetry,
+                    running.as_ref(),
+                )
             })) {
                 Ok(Ok((stop_reason, output_tokens))) => {
                     telemetry.succeeded(stop_reason, output_tokens.len());
@@ -393,7 +404,7 @@ fn worker_loop(
             }
         };
 
-        let termination = match deadline {
+        let termination = match running.as_ref().and_then(|admission| admission.deadline()) {
             Some(deadline) => catena_lang::safe_runtime::with_job_deadline(deadline, execute),
             None => execute(),
         };
@@ -405,6 +416,8 @@ fn worker_loop(
                 invocation,
                 sender,
                 result: termination,
+                running,
+                complete,
             },
         )));
     }
@@ -415,6 +428,7 @@ fn run_job(
     mut on_progress: impl FnMut(u32) -> Result<(), crate::ExecutorError>,
     runtime: &mut ModelRuntime,
     telemetry: &mut InferenceTelemetry,
+    running: Option<&hellas_work::work::admission::RunningWork>,
 ) -> Result<(StopReason, Vec<u32>), crate::ExecutorError> {
     let ExecuteJob {
         execution_id,
@@ -432,14 +446,23 @@ fn run_job(
         "GPU worker starting causal-LM execution"
     );
 
+    let check_deadline = || {
+        running.as_ref().map_or(Ok(()), |r| {
+            r.check_deadline()
+                .map_err(|e| crate::ExecutorError::Execution(e.to_string()))
+        })
+    };
+    check_deadline()?;
     runtime.validate_generation_resources(&source, &invocation)?;
     let input_ids = Zeroizing::new(invocation.input_ids);
     let emit = |token| {
+        check_deadline()?;
         telemetry.token_generated();
         on_progress(token)?;
         Ok(GenerationControl::Continue)
     };
     let model = runtime.model(&source)?;
+    check_deadline()?;
     let schedule = source.environment().generation_schedule();
     let result = model.generate_tokens_streaming_with_options(
         input_ids.as_slice(),

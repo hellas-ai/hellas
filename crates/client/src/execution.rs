@@ -193,11 +193,38 @@ pub fn validate_causal_lm_invocation(
     let total_tokens = u64::try_from(prompt.len())
         .unwrap_or(u64::MAX)
         .saturating_add(u64::from(max_new_tokens));
-    if total_tokens > environment.maximum_capacity() {
+    let capacity = environment.generation_schedule().fixed_capacity;
+    if total_tokens > capacity {
         return Err(ClientError::protocol(format!(
-            "Evaluate prompt plus max_new_tokens is {total_tokens} tokens, but the environment capacity is {}",
-            environment.maximum_capacity()
+            "Evaluate prompt plus max_new_tokens is {total_tokens} tokens, but the committed generation capacity is {capacity}"
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod generation_capacity_tests {
+    #[test]
+    fn invocation_is_bounded_by_the_committed_schedule() {
+        let environment = hellas_rpc::CausalLmEnvironment::new(
+            hellas_rpc::ContentRef::new(hellas_rpc::ContentId::from_bytes([8; 32]), 1024),
+            "model",
+            vec![],
+            vec![],
+            vec![],
+            256,
+            4096,
+            hellas_rpc::CausalLmGenerationSchedule {
+                fixed_capacity: 1024,
+                prefill_chunk_tokens: 64,
+            },
+        )
+        .unwrap();
+        assert!(
+            super::validate_causal_lm_invocation(&environment, &vec![1; 1000], 24, &[]).is_ok()
+        );
+        assert!(
+            super::validate_causal_lm_invocation(&environment, &vec![1; 1000], 25, &[]).is_err()
+        );
+    }
 }

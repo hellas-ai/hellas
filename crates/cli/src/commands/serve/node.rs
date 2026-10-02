@@ -76,6 +76,8 @@ const RPC_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const RPC_CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub(super) struct NodeHandle {
+    grants: Option<hellas_work::grant_service::GrantService>,
+    _control: Option<hellas_sdk::local::LocalControlServer>,
     node_id: EndpointId,
     accept_task: Option<JoinHandle<()>>,
     endpoint: Endpoint,
@@ -109,6 +111,10 @@ impl NodeHandle {
     }
 
     pub(super) async fn shutdown(mut self) -> anyhow::Result<()> {
+        if let Some(grants) = &self.grants {
+            grants.drain().await?;
+        }
+
         // The clock first, and joined rather than aborted: its journals
         // are released when its task returns, and a node that closed its
         // endpoint while a step was still writing would be a node whose
@@ -130,7 +136,9 @@ impl NodeHandle {
 }
 
 pub(super) struct NodeConfig {
+    pub(super) grants: Option<super::GrantNodeConfig>,
     pub(super) port: Option<u16>,
+    pub(super) discovery: bool,
     pub(super) queue_size: usize,
     #[cfg(feature = "evaluate")]
     pub(super) content_store: hellas_store::ContentStore,
@@ -158,11 +166,18 @@ struct RemoteExecutionServices {
 }
 
 pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle> {
-    let mut executor = ExecutorSpawnConfig::fetch_only(
-        Arc::new(config.producer_key),
-        config.assurance,
-        config.fetch_routes,
-    );
+    if let Some(grants) = &config.grants {
+        anyhow::ensure!(
+            grants.provider.transport() == *config.secret_key.public().as_bytes(),
+            "grant provider transport differs from node identity"
+        );
+        super::validate_grant_resources(&grants.config, &config.fetch_routes)?;
+    }
+    let prepared_grants = config.grants.map(super::prepare_grants).transpose()?;
+
+    let signer = Arc::new(config.producer_key);
+    let mut executor =
+        ExecutorSpawnConfig::fetch_only(signer.clone(), config.assurance, config.fetch_routes);
     executor.queue_capacity = config.queue_size;
     executor.metrics = config.metrics.clone();
     executor.fetch_max_in_flight = config.fetch_max_in_flight;
@@ -175,7 +190,7 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
     let handle = Executor::spawn_configured(executor)
         .await
         .context("failed to spawn executor")?;
-    let advertised_alpns = served_alpns(config.work.is_some());
+    let advertised_alpns = served_alpns(config.work.is_some(), prepared_grants.is_some());
     let alpns = advertised_alpns.clone();
     let mut builder = Endpoint::builder(presets::N0)
         .secret_key(config.secret_key)
@@ -190,8 +205,6 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
         .await
         .context("failed to bind iroh endpoint")?;
     let node_id = endpoint.id();
-    let discovery = start_server_advertising(&endpoint, &advertised_alpns)
-        .context("failed to start service discovery advertising")?;
 
     // -- Construct a shared peer directory.
     //
@@ -227,7 +240,46 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
     let remote_execution = RemoteExecutionServices {
         open_identity: config.open_identity,
     };
-    let work_mount: MountedWork = MountedWork::with_backend(handle);
+    let work_mount: MountedWork = MountedWork::with_backend(handle.clone());
+    let (grants, control) = if let Some((grant_config, store)) = prepared_grants {
+        let service = hellas_work::grant_service::GrantService::new(
+            store,
+            signer,
+            handle,
+            endpoint
+                .addr()
+                .ip_addrs()
+                .map(ToString::to_string)
+                .collect(),
+            Arc::new(hellas_work::grant_service::wall_clock),
+        )?;
+        let parent = grant_config
+            .control_socket
+            .parent()
+            .context("grant control socket needs a parent")?;
+        hellas_private::create_dir_all_durable(parent)?;
+        let admin = hellas_sdk::grant_admin::GrantAdmin::new(
+            service.clone(),
+            grant_config.resources,
+            grant_config.max_job_millis,
+        );
+        let control = hellas_sdk::local::LocalControlServer::bind(
+            &grant_config.control_socket,
+            admin.dispatcher(),
+        )?;
+        anyhow::ensure!(
+            work_mount.mount_grants(service.clone()),
+            "grant mount is unavailable"
+        );
+        (Some(service), Some(control))
+    } else {
+        (None, None)
+    };
+    let discovery = config
+        .discovery
+        .then(|| start_server_advertising(&endpoint, &advertised_alpns))
+        .transpose()
+        .context("failed to start service discovery advertising")?;
     let setup_mount = MountedSetup::default();
     let work = config.work.map(|work| {
         let poll = work.poll;
@@ -246,7 +298,7 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
         info!(poll_ms = poll.as_millis(), "the paid-work clock is running");
         WorkWatcher { stop, task }
     });
-    let serves_work = work.is_some().then(|| work_mount.clone());
+    let serves_work = (work.is_some() || grants.is_some()).then(|| work_mount.clone());
     let serves_setup = work.is_some().then(|| setup_mount.clone());
 
     // -- Accept loop: one task per inbound Connection; per-Connection
@@ -314,10 +366,12 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
     });
 
     Ok(NodeHandle {
+        grants,
+        _control: control,
         node_id,
         accept_task: Some(accept_task),
         endpoint,
-        discovery: Some(discovery),
+        discovery,
         work,
     })
 }

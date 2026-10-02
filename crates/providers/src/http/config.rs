@@ -28,6 +28,9 @@ pub struct HttpCredentialConfig {
     pub allowed_origins: Vec<String>,
     pub allowed_paths: Vec<String>,
     pub allowed_methods: Vec<String>,
+    /// Defaults to public WebPKI. Private roots must be explicitly operator-owned.
+    #[serde(default)]
+    pub trust_roots: Option<hellas_rpc::http_fetch::HttpTrustRoots>,
     pub header_name: String,
     pub secret_env: Option<String>,
     /// A private JSON credential file maintained by the account's login tool.
@@ -225,6 +228,9 @@ impl HttpProviderConfig {
                     allowed_origins: config.allowed_origins,
                     allowed_paths: config.allowed_paths,
                     allowed_methods: config.allowed_methods,
+                    trust_roots: config
+                        .trust_roots
+                        .unwrap_or(hellas_rpc::http_fetch::HttpTrustRoots::WebPki),
                     header_name: config.header_name,
                     header_value,
                 },

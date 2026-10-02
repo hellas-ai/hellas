@@ -81,6 +81,7 @@ enum Source {
 pub struct Service {
     key: SecretKey,
     root: PathBuf,
+    enrollment: Option<hellas_rpc::protocol::work_grant::records::Principal>,
 }
 
 impl Service {
@@ -88,7 +89,11 @@ impl Service {
     pub fn new(key: SecretKey, base: &Path) -> Result<Self> {
         let root = base.join(key.public().to_string());
         private_directory(&root)?;
-        Ok(Self { key, root })
+        Ok(Self {
+            key,
+            root,
+            enrollment: None,
+        })
     }
 
     pub fn open(key: SecretKey) -> Result<Self> {
@@ -98,6 +103,30 @@ impl Service {
                 .join(".hellas/machines"),
         };
         Self::new(key, &base)
+    }
+
+    /// Attach the enrolled authority whose transport key authenticated management.
+    pub fn with_owner_enrollment(
+        mut self,
+        bundle: hellas_rpc::ProviderEnrollmentBundle,
+    ) -> Result<Self> {
+        let principal = hellas_rpc::protocol::work_grant::records::Principal::verify(bundle)?;
+        ensure!(
+            principal.transport() == *self.key.public().as_bytes(),
+            "owner enrollment transport mismatch"
+        );
+        self.enrollment = Some(principal);
+        Ok(self)
+    }
+
+    fn owner_bundle(&self) -> Result<String> {
+        Ok(hex::encode(
+            self.enrollment
+                .as_ref()
+                .context("owner enrollment required for provisioning")?
+                .bundle()
+                .canonical_bytes(),
+        ))
     }
 
     pub fn owner(&self) -> String {
@@ -189,7 +218,7 @@ impl Service {
     }
 
     pub async fn create(&self, spec: Spec, receipt: Option<PathBuf>) -> Result<Value> {
-        crate::agent::check_owner_execution(Some(&self.owner()))?;
+        let bundle = self.owner_bundle()?;
         spec.validate()?;
         let _lock = lock_state(&self.root.join("inventory"))?;
         let path = self.path(&spec.name)?;
@@ -206,6 +235,7 @@ impl Service {
         );
         let mut credentials = Credentials::generate();
         credentials.owner = Some(self.owner());
+        credentials.owner_enrollment = Some(bundle);
         let machine = Machine {
             name: spec.name.clone(),
             owner: self.owner(),
@@ -234,13 +264,14 @@ impl Service {
         admin_addr: Option<SocketAddr>,
         serve_args: Vec<String>,
     ) -> Result<Value> {
-        crate::agent::check_owner_execution(Some(&self.owner()))?;
+        let bundle = self.owner_bundle()?;
         let _lock = lock_state(&self.root.join("inventory"))?;
         let path = self.path(&name)?;
         ensure!(!path.exists(), "machine name already exists");
         validate_serve_args(&serve_args)?;
         let mut credentials = Credentials::generate();
         credentials.owner = Some(self.owner());
+        credentials.owner_enrollment = Some(bundle);
         // JSON avoids executable shell snippets; install this private file on the host.
         let bootstrap = credentials.env_for_args(&serve_args)?;
         save_private(&bootstrap_file, &bootstrap, true)?;
@@ -279,7 +310,9 @@ impl Service {
                 enrollment.validate()?;
                 if let Some(expected) = &machine.enrollment {
                     ensure!(
-                        expected == enrollment,
+                        expected.node_id == enrollment.node_id
+                            && expected.enrollment_id == enrollment.enrollment_id
+                            && (expected.bundle.is_none() || expected.bundle == enrollment.bundle),
                         "machine enrollment changed; refusing to replace its trust anchor"
                     );
                 } else {
@@ -287,8 +320,8 @@ impl Service {
                         *running,
                         "Hellas is not running; check the image supports owner grant funding"
                     );
-                    machine.enrollment = Some(enrollment.clone());
                 }
+                machine.enrollment = Some(enrollment.clone());
                 machine.running = Some(*running);
                 machine.last_seen_unix = Some(
                     std::time::SystemTime::now()

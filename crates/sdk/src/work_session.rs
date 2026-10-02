@@ -1,6 +1,6 @@
 //! Funding selects the durable session implementation at compile time.
 use hellas_work::work_store::channel::funding::Funding;
-pub use hellas_work::work_store::channel::funding::PaymentFunding;
+pub use hellas_work::work_store::channel::funding::{GrantFunding, PaymentFunding};
 use std::ops::{Deref, DerefMut};
 
 pub trait SessionFunding: Funding {
@@ -36,6 +36,21 @@ impl WorkSession<PaymentFunding> {
     ) -> Result<Self, crate::paid_client::PaidClientError> {
         Ok(Self {
             inner: crate::paid_client::PaymentSession::open(options, endpoint, signer).await?,
+        })
+    }
+}
+#[cfg(feature = "grant-client")]
+impl SessionFunding for GrantFunding {
+    type Session = crate::grant_client::GrantSession;
+}
+#[cfg(feature = "grant-client")]
+impl WorkSession<GrantFunding> {
+    pub async fn open(
+        options: crate::grant_client::GrantSessionOptions,
+        transport: crate::grant_client::GrantTransport,
+    ) -> Result<Self, crate::grant_client::GrantClientError> {
+        Ok(Self {
+            inner: crate::grant_client::GrantSession::open(options, transport).await?,
         })
     }
 }

@@ -45,6 +45,12 @@ pub struct HttpRoute {
     pub tls: HttpTls,
     #[serde(default)]
     pub headers: Vec<(String, String)>,
+    #[serde(default = "default_response_bytes")]
+    pub max_response_bytes: u32,
+}
+
+fn default_response_bytes() -> u32 {
+    hellas_rpc::http_fetch::MAX_HTTP_RESPONSE_BYTES
 }
 
 pub(super) fn public_tls() -> HttpTls {
@@ -183,7 +189,7 @@ impl HttpRoute {
             body_base64: STANDARD.encode(body),
             tls: self.tls.clone(),
             credential: self.credential.clone(),
-            max_response_bytes: hellas_rpc::http_fetch::MAX_HTTP_RESPONSE_BYTES,
+            max_response_bytes: self.max_response_bytes,
         })
     }
 }

@@ -10,7 +10,7 @@ use super::work::{
 use super::work_fetch::{self, FetchPolicyV2, FetchRoutePolicy, PreparedPaidFetchInputV1};
 use crate::{ContentId, Digest, OutputEventEnvelope};
 
-/// Identity bindings independent of the payment obligations. This contains no
+/// Identity bindings shared by paid and granted execution. This contains no
 /// financial edge, credit, clock or settlement constructor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WorkContext {
@@ -46,6 +46,16 @@ impl From<&PaidJobAuthorizationV2> for JobInputBinding {
         }
     }
 }
+impl From<&super::work_grant::GrantJobAuthorizationV1> for JobInputBinding {
+    fn from(auth: &super::work_grant::GrantJobAuthorizationV1) -> Self {
+        Self {
+            prepared_input_digest: auth.prepared_input_digest,
+            request_commitment: auth.request_commitment,
+            environment_commitment: auth.environment_commitment,
+        }
+    }
+}
+
 /// The execution contract fixed when a channel is mounted.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WorkPolicy {
@@ -421,6 +431,19 @@ impl PreparedWorkInput {
 }
 
 impl crate::pb::work::WorkRoute {
+    /// Selects a grant channel; authority still requires its pinned principal.
+    pub fn grant(channel: super::work_grant::ChannelId) -> Self {
+        Self {
+            funding_kind: crate::pb::work::FundingKind::Grant as i32,
+            channel_id: channel.0.as_bytes().to_vec(),
+        }
+    }
+
+    pub fn selects_grant(&self, channel: super::work_grant::ChannelId) -> bool {
+        self.funding_kind == crate::pb::work::FundingKind::Grant as i32
+            && self.channel_id == channel.0.as_bytes()
+    }
+
     /// Selects a payment-funded channel without granting authority to use it.
     pub fn payment(channel_id: Digest) -> Self {
         Self {

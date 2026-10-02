@@ -9,6 +9,11 @@ pub mod configuration;
 pub mod deployment;
 pub mod internal_rpc;
 pub mod machines;
+mod managed_grants;
 pub mod management;
 pub mod provider;
 pub mod wire;
+
+#[cfg(test)]
+#[path = "../tests/common/mod.rs"]
+mod test_support;

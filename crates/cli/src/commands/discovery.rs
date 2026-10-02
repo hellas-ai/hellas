@@ -33,13 +33,16 @@ impl DiscoveryAdvertiser {
     }
 }
 
-pub(crate) fn served_alpns(work_configured: bool) -> Vec<Vec<u8>> {
+pub(crate) fn served_alpns(work_configured: bool, grants_configured: bool) -> Vec<Vec<u8>> {
     let mut alpns = vec![Node::ALPN.as_bytes().to_vec()];
     if work_configured {
         alpns.extend([
             WorkSetup::ALPN.as_bytes().to_vec(),
             Work::ALPN.as_bytes().to_vec(),
         ]);
+    }
+    if grants_configured && !work_configured {
+        alpns.push(Work::ALPN.as_bytes().to_vec());
     }
     alpns
 }
@@ -83,9 +86,14 @@ mod tests {
     use super::*;
     #[test]
     fn work_is_the_only_execution_protocol_advertised() {
-        assert_eq!(served_alpns(false), [Node::ALPN.as_bytes()]);
+        assert_eq!(served_alpns(false, false), [Node::ALPN.as_bytes()]);
         assert_eq!(
-            served_alpns(true),
+            served_alpns(false, true),
+            [Node::ALPN.as_bytes(), Work::ALPN.as_bytes()]
+        );
+        assert_eq!(served_alpns(true, true), served_alpns(true, false));
+        assert_eq!(
+            served_alpns(true, false),
             [
                 Node::ALPN.as_bytes(),
                 WorkSetup::ALPN.as_bytes(),

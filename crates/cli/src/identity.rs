@@ -1,5 +1,5 @@
 use anyhow::{Context, bail};
-#[cfg(any(feature = "node", test))]
+#[cfg(any(feature = "node", feature = "gateway", test))]
 use hellas_attestation::{AssertionCounterStore, AttestationError};
 use hellas_rpc::signature::verify_digest_signature;
 use hellas_rpc::{
@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 const IDENTITY_DIR: &str = ".hellas";
 const IDENTITY_FILE: &str = "identity";
-#[cfg(any(feature = "node", test))]
+#[cfg(any(feature = "node", feature = "gateway", test))]
 const APPLE_OPEN_COUNTER_STORE_DIR: &str = "apple-app-attest-open-counters";
 #[cfg(feature = "evaluate")]
 const CONTENT_INDEX_FILE: &str = "content-index.bin";
@@ -33,13 +33,13 @@ const VERSION: u8 = 3;
 const IDENTITY_TAG: &str = "hellas.provider.identity.persistence.v3";
 
 /// Filesystem-backed assertion-counter high-water marks, keyed by public key.
-#[cfg(any(feature = "node", test))]
+#[cfg(any(feature = "node", feature = "gateway", test))]
 #[derive(Clone, Debug)]
 struct FilesystemAssertionCounterStore {
     directory: PathBuf,
 }
 
-#[cfg(any(feature = "node", test))]
+#[cfg(any(feature = "node", feature = "gateway", test))]
 impl FilesystemAssertionCounterStore {
     fn new(directory: impl Into<PathBuf>) -> Self {
         Self {
@@ -68,7 +68,7 @@ impl FilesystemAssertionCounterStore {
     }
 }
 
-#[cfg(any(feature = "node", test))]
+#[cfg(any(feature = "node", feature = "gateway", test))]
 impl AssertionCounterStore for FilesystemAssertionCounterStore {
     fn advance(&self, public_key: &[u8; 33], counter: u32) -> Result<(), AttestationError> {
         create_dir_restricted(&self.directory).map_err(|_| AttestationError::State)?;
@@ -291,6 +291,10 @@ pub(crate) fn load_existing(path: Option<&Path>) -> anyhow::Result<LocalIdentity
     decode(&path, &bytes)
 }
 
+pub(crate) fn default_grant_data_path() -> anyhow::Result<PathBuf> {
+    default_hellas_path("grants", "HELLAS_GRANT_DATA_DIR")
+}
+
 fn default_path() -> anyhow::Result<PathBuf> {
     default_hellas_path(IDENTITY_FILE, "--identity")
 }
@@ -305,7 +309,7 @@ pub(crate) fn default_content_index_path() -> anyhow::Result<PathBuf> {
     default_hellas_path(CONTENT_INDEX_FILE, "--content-index")
 }
 
-#[cfg(any(feature = "node", test))]
+#[cfg(any(feature = "node", feature = "gateway", test))]
 pub(crate) fn provider_trust(
     expected_genesis: Option<hellas_rpc::ContentId>,
     required_assurance: hellas_rpc::Assurance,

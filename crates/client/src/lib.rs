@@ -11,8 +11,12 @@ pub mod execution;
 mod fetch;
 #[cfg(feature = "iroh")]
 pub mod iroh;
+#[cfg(all(feature = "iroh", feature = "work"))]
+mod offer;
 #[cfg(feature = "work")]
 pub mod work;
+#[cfg(all(feature = "iroh", feature = "work"))]
+pub use offer::{PinnedOffer, UnpinnedOffer};
 
 pub use error::{ClientError, ClientResult};
 #[cfg(feature = "evaluate")]

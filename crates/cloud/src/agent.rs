@@ -39,31 +39,16 @@ struct Process {
     launcher: Vec<String>,
     args: Vec<String>,
     identity: PathBuf,
-    owner: Option<String>,
+    owner_enrollment: Option<PathBuf>,
+    bootstrap_grants: PathBuf,
     cli: PathBuf,
     configuration: Option<crate::configuration::InstalledConfiguration>,
     configuration_dir: PathBuf,
 }
 
-#[derive(Debug)]
-pub struct OwnerGrantRequired;
-impl std::fmt::Display for OwnerGrantRequired {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("owner execution requires a grant")
-    }
-}
-impl std::error::Error for OwnerGrantRequired {}
-
-pub(crate) fn check_owner_execution(owner: Option<&str>) -> Result<()> {
-    if owner.is_some() {
-        return Err(OwnerGrantRequired.into());
-    }
-    Ok(())
-}
-
 impl Process {
-    fn start(&mut self) -> Result<()> {
-        check_owner_execution(self.owner.as_deref())?;
+    async fn start(&mut self) -> Result<()> {
+        crate::managed_grants::reclaim_socket(&self.configuration_dir.join("control.sock"))?;
         let (program, args) = self
             .launcher
             .split_first()
@@ -79,10 +64,20 @@ impl Process {
             .env_remove("HELLAS_REMOTE_TOKEN")
             .env_remove("HELLAS_REMOTE_ARGS")
             .env_remove("HELLAS_REMOTE_OWNER")
+            .env_remove("HELLAS_REMOTE_OWNER_ENROLLMENT")
             .stdin(Stdio::null())
             .stdout(Stdio::from(std::io::stderr()))
             .stderr(Stdio::inherit())
             .kill_on_drop(true);
+        if let Some(owner) = &self.owner_enrollment {
+            command.arg("--owner-enrollment").arg(owner);
+        }
+        command.arg("--grant-config").arg(
+            self.configuration
+                .as_ref()
+                .and_then(|c| c.grant_config.as_ref())
+                .unwrap_or(&self.bootstrap_grants),
+        );
         if let Some(configuration) = &self.configuration {
             command
                 .arg("--fetch-config")
@@ -92,7 +87,28 @@ impl Process {
         #[cfg(unix)]
         command.process_group(0);
         self.child = Some(command.spawn().context("start Hellas")?);
-        Ok(())
+        let ready = tokio::time::timeout(Duration::from_secs(120), async {
+            loop {
+                ensure!(
+                    self.running()?,
+                    "Hellas exited before grant provider became ready"
+                );
+                if crate::managed_grants::ready(&self.configuration_dir.join("control.sock"))
+                    .await
+                    .is_ok()
+                {
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .context("grant provider readiness timed out")
+        .and_then(|result| result);
+        if ready.is_err() {
+            self.stop().await?;
+        }
+        ready
     }
 
     fn running(&mut self) -> Result<bool> {
@@ -148,11 +164,14 @@ impl Process {
             Command::new(&self.cli)
                 .args(["serve", "--check-config", "--fetch-config"])
                 .arg(&installed.fetch_config)
+                .arg("--grant-config")
+                .arg(installed.grant_config.as_ref().expect("staged grants"))
                 .envs(&configuration.env)
                 .env_remove("HELLAS_REMOTE_KEY")
                 .env_remove("HELLAS_REMOTE_TOKEN")
                 .env_remove("HELLAS_REMOTE_ARGS")
                 .env_remove("HELLAS_REMOTE_OWNER")
+                .env_remove("HELLAS_REMOTE_OWNER_ENROLLMENT")
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -163,7 +182,7 @@ impl Process {
         .map_err(|_| "worker configuration validator timed out")?
         .map_err(|_| "could not run worker configuration validator")?;
         if !checked.success() {
-            return Err("worker rejected fetch configuration");
+            return Err("worker rejected resource configuration");
         }
         let path = self.configuration_dir.join("configuration.json");
         self.stop()
@@ -172,6 +191,7 @@ impl Process {
         let previous = self.configuration.replace(installed);
         let applied = self
             .start()
+            .await
             .map_err(|_| "could not start configured worker")
             .and_then(|()| {
                 crate::config::save_private(&path, self.configuration.as_ref().unwrap(), false)
@@ -193,6 +213,7 @@ impl Process {
                 }
             }
             self.start()
+                .await
                 .map_err(|_| "could not restart worker after configuration rollback")?;
             return Err(error);
         }
@@ -210,6 +231,50 @@ impl Process {
     }
 }
 
+async fn export_enrollment(
+    cli: &Path,
+    identity: &Path,
+) -> Result<hellas_rpc::protocol::work_grant::records::Principal> {
+    use hellas_rpc::protocol::work_grant::records::{MAX_PRINCIPAL_BYTES, Principal};
+    use tokio::io::AsyncReadExt;
+    let mut command = Command::new(cli);
+    command
+        .arg("--identity")
+        .arg(identity)
+        .args(["contact", "export"])
+        .env_remove("HELLAS_REMOTE_KEY")
+        .env_remove("HELLAS_REMOTE_TOKEN")
+        .env_remove("HELLAS_REMOTE_ARGS")
+        .env_remove("HELLAS_REMOTE_OWNER")
+        .env_remove("HELLAS_REMOTE_OWNER_ENROLLMENT")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let mut child = command.spawn()?;
+        let mut bytes = Vec::new();
+        child
+            .stdout
+            .take()
+            .context("enrollment stdout missing")?
+            .take((MAX_PRINCIPAL_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .await?;
+        ensure!(
+            bytes.len() <= MAX_PRINCIPAL_BYTES,
+            "worker enrollment exceeds its bound"
+        );
+        ensure!(
+            child.wait().await?.success(),
+            "worker enrollment export failed"
+        );
+        Ok(Principal::decode(&bytes)?)
+    })
+    .await
+    .context("worker enrollment export timed out")?
+}
+
 async fn identity_command(cli: &Path, identity: &Path, operation: &str) -> Result<String> {
     let mut command = Command::new(cli);
     command.arg("--identity").arg(identity);
@@ -224,6 +289,7 @@ async fn identity_command(cli: &Path, identity: &Path, operation: &str) -> Resul
             .env_remove("HELLAS_REMOTE_TOKEN")
             .env_remove("HELLAS_REMOTE_ARGS")
             .env_remove("HELLAS_REMOTE_OWNER")
+            .env_remove("HELLAS_REMOTE_OWNER_ENROLLMENT")
             .kill_on_drop(true)
             .output(),
     )
@@ -263,7 +329,7 @@ impl State {
                 Operation::Restart => {
                     let mut process = self.process.lock().await;
                     process.stop().await?;
-                    process.start()?;
+                    process.start().await?;
                     Ok(Response::Status {
                         enrollment: self.enrollment.clone(),
                         owner: self.owner.map(|owner| owner.to_string()),
@@ -309,7 +375,17 @@ impl State {
 }
 
 pub async fn run(options: AgentOptions) -> Result<()> {
+    run_until(options, shutdown_signal()).await
+}
+
+pub async fn run_until(
+    options: AgentOptions,
+    shutdown: impl std::future::Future<Output = ()>,
+) -> Result<()> {
     let secret = options.credentials.secret_key()?;
+    options.credentials.require_owner_enrollment()?;
+    crate::config::validate_serve_args(&options.serve_args)?;
+    let owner = options.credentials.owner_principal()?;
     tokio::fs::create_dir_all(&options.data).await?;
     // Refuse silent reassignment, including a restart that omits the owner.
     let binding = options.data.join("owner.json");
@@ -329,20 +405,23 @@ pub async fn run(options: AgentOptions) -> Result<()> {
     let configuration_dir = options
         .configuration_dir
         .unwrap_or_else(|| options.data.clone());
-    if configuration_dir != options.data {
-        crate::management::private_directory(&configuration_dir)?;
-    }
+    crate::management::private_directory(&configuration_dir)?;
+    let configuration_dir = configuration_dir.canonicalize()?;
     let configuration_path = configuration_dir.join("configuration.json");
     let configuration: Option<crate::configuration::InstalledConfiguration> = configuration_path
         .exists()
         .then(|| crate::config::read_json(&configuration_path))
         .transpose()?;
     identity_command(&options.cli, &identity, "init").await?;
+    let bundle = export_enrollment(&options.cli, &identity).await?;
     let enrollment = Enrollment {
+        bundle: Some(hex::encode(bundle.bundle().canonical_bytes())),
         node_id: identity_command(&options.cli, &identity, "show-node-id").await?,
         enrollment_id: identity_command(&options.cli, &identity, "show-enrollment-id").await?,
     };
     enrollment.validate()?;
+    let (owner_enrollment, bootstrap_grants) =
+        crate::managed_grants::prepare(&options.data, &configuration_dir, bundle, owner.as_ref())?;
     let mut builder = Endpoint::builder(presets::N0)
         .secret_key(secret)
         .alpns(vec![ALPN.to_vec()]);
@@ -358,12 +437,13 @@ pub async fn run(options: AgentOptions) -> Result<()> {
         launcher: options.launcher,
         args: options.serve_args,
         identity,
-        owner: options.credentials.owner.clone(),
+        owner_enrollment,
+        bootstrap_grants,
         cli: options.cli,
         configuration,
         configuration_dir,
     };
-    process.start()?;
+    process.start().await?;
     let state = Arc::new(State {
         token: options.credentials.token,
         owner: options
@@ -379,7 +459,6 @@ pub async fn run(options: AgentOptions) -> Result<()> {
     eprintln!("admin node: {}", endpoint.id());
     let slots = Arc::new(Semaphore::new(16));
     let mut tasks = tokio::task::JoinSet::new();
-    let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
     loop {
         tokio::select! {
@@ -507,23 +586,6 @@ async fn receive_content(
 mod tests {
     use super::*;
     use tokio::io::AsyncReadExt;
-
-    #[test]
-    fn owner_process_cannot_launch_before_grant_funding() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut process = Process {
-            child: None,
-            launcher: vec!["must-not-launch".into()],
-            args: vec![],
-            identity: dir.path().join("identity"),
-            owner: Some("owner".into()),
-            cli: dir.path().join("cli"),
-            configuration: None,
-            configuration_dir: dir.path().to_owned(),
-        };
-        assert!(process.start().unwrap_err().is::<OwnerGrantRequired>());
-        assert!(process.child.is_none());
-    }
 
     async fn response(body: &'static [u8]) -> reqwest::Response {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

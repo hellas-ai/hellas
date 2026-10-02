@@ -86,24 +86,16 @@ fn http_gateway_requires_a_paid_pool_instead_of_an_owned_machine() {
 }
 
 #[cfg(feature = "gateway")]
-#[tokio::test]
-async fn machine_route_returns_a_typed_unsupported_error() {
-    let error = crate::cloud::machine_route(
-        Some("metal"),
-        &iroh::SecretKey::from_bytes(&[1; 32]),
-        None,
-        RemoteTrustArgs {
-            provider_genesis: None,
-            assurance: hellas_rpc::Assurance::ProducerSigned,
-            apple_app_attest_app_id: None,
-            apple_app_attest_cdhashes: vec![],
-        },
-    )
-    .await
-    .err()
-    .expect("unsupported");
-    assert!(matches!(
-        error.downcast_ref::<hellas_client::ClientError>(),
-        Some(hellas_client::ClientError::OwnerGrantRequired)
-    ));
+#[test]
+fn machine_gateway_can_discover_http_resources_without_an_environment() {
+    let cli = Cli::try_parse_from([
+        "hellas",
+        "gateway",
+        "--machine",
+        "metal",
+        "--grant-policy",
+        "glm",
+    ])
+    .unwrap();
+    assert_eq!(cli.command.owned_machine(), Some("metal"));
 }

@@ -1,5 +1,7 @@
-use serde_json::Value;
-use std::{io::Write, time::Instant};
+use hellas_rpc::http_usage::UsageDecoder;
+use std::time::Instant;
+#[cfg(test)]
+use {hellas_rpc::http_usage::Usage, std::io::Write};
 
 #[derive(Clone)]
 pub(super) struct Metrics {
@@ -53,8 +55,7 @@ pub(super) struct Observation {
     status: u16,
     bytes: u64,
     first_byte: Option<f64>,
-    usage: Usage,
-    compressed_usage: Option<flate2::write::GzDecoder<Usage>>,
+    usage: UsageDecoder,
     #[cfg(feature = "otel")]
     backend: Option<String>,
     #[cfg(feature = "otel")]
@@ -89,8 +90,7 @@ impl Observation {
             status: 0,
             bytes: 0,
             first_byte: None,
-            usage: Usage::default(),
-            compressed_usage: None,
+            usage: UsageDecoder::default(),
             #[cfg(feature = "otel")]
             backend: None,
             #[cfg(feature = "otel")]
@@ -110,7 +110,9 @@ impl Observation {
         }
     }
     pub(super) fn bind_response(&mut self, binding: Option<super::routing::ResponseBinding>) {
-        self.usage.binding = binding;
+        self.usage.observe(binding.map(|binding| {
+            std::sync::Arc::new(move |value: &serde_json::Value| binding.observe(value)) as _
+        }));
     }
     pub(super) fn model(&mut self, model: Option<&str>) {
         if let Some(model) = model {
@@ -126,40 +128,17 @@ impl Observation {
         self.span.record("http.response.status_code", status);
     }
     pub(super) fn content(&mut self, value: Option<&str>, encoding: Option<&str>) {
-        self.usage.sse =
-            value.is_some_and(|value| value.split(';').next() == Some("text/event-stream"));
-        match encoding.map(str::trim) {
-            None | Some("") => {}
-            Some(value) if value.eq_ignore_ascii_case("identity") => {}
-            Some(value) if value.eq_ignore_ascii_case("gzip") => {
-                self.compressed_usage = Some(flate2::write::GzDecoder::new(std::mem::take(
-                    &mut self.usage,
-                )));
-            }
-            Some(_) => self.usage.overflow = true,
-        }
+        self.usage.content(value, encoding);
     }
+
     pub(super) fn chunk(&mut self, bytes: &[u8]) {
         if self.first_byte.is_none() {
             self.first_byte = Some(self.started.elapsed().as_secs_f64());
         }
         self.bytes += bytes.len() as u64;
-        if let Some(decoder) = self.compressed_usage.as_mut() {
-            if decoder.write_all(bytes).is_err() {
-                self.compressed_usage = None;
-                self.usage.overflow = true;
-            }
-        } else {
-            self.usage.push(bytes);
-        }
+        self.usage.push(bytes);
     }
     pub(super) fn complete(&mut self) {
-        if let Some(decoder) = self.compressed_usage.take() {
-            self.usage = decoder.finish().unwrap_or_else(|_| Usage {
-                overflow: true,
-                ..Default::default()
-            });
-        }
         self.usage.finish();
         self.complete = true;
     }
@@ -167,11 +146,7 @@ impl Observation {
 
 impl Drop for Observation {
     fn drop(&mut self) {
-        let usage = self
-            .compressed_usage
-            .as_ref()
-            .map(|decoder| decoder.get_ref())
-            .unwrap_or(&self.usage);
+        let usage = &self.usage;
         self.span.record("http.response.body.size", self.bytes);
         self.span.record("hellas.response.complete", self.complete);
         if let Some(ttfb) = self.first_byte {
@@ -237,119 +212,6 @@ impl Drop for Observation {
                 }
             }
         }
-    }
-}
-
-/// Observe standard usage fields without reserializing or delaying the wire body.
-#[derive(Default)]
-struct Usage {
-    binding: Option<super::routing::ResponseBinding>,
-    sse: bool,
-    pending: Vec<u8>,
-    input: Option<u64>,
-    output: Option<u64>,
-    cached: Option<u64>,
-    cache_write: Option<u64>,
-    overflow: bool,
-    decoded_bytes: usize,
-}
-
-impl std::io::Write for Usage {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        // Observation must not allow compressed data to consume unbounded CPU
-        // or memory. Stopping this sink never changes the response sent onward.
-        self.decoded_bytes = self.decoded_bytes.saturating_add(bytes.len());
-        if self.overflow || self.decoded_bytes > 32 * 1024 * 1024 {
-            return Err(std::io::Error::other("usage observation limit"));
-        }
-        self.push(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl Usage {
-    fn push(&mut self, bytes: &[u8]) {
-        if self.overflow {
-            return;
-        }
-        self.pending.extend_from_slice(bytes);
-        // Some Responses endpoints omit Content-Type. Detect their SSE prelude
-        // after enough bytes have arrived, without changing the forwarded body.
-        self.sse |= self.pending.starts_with(b"event:")
-            || self.pending.starts_with(b"data:")
-            || self.pending.starts_with(b":");
-        while self.sse
-            && let Some(end) = self.pending.iter().position(|byte| *byte == b'\n')
-        {
-            let line: Vec<_> = self.pending.drain(..=end).collect();
-            if let Some(data) = line.strip_prefix(b"data:") {
-                self.parse(data);
-            }
-        }
-        if self.pending.len() > 512 * 1024 {
-            *self = Self {
-                overflow: true,
-                ..Default::default()
-            };
-        }
-    }
-    fn finish(&mut self) {
-        let pending = std::mem::take(&mut self.pending);
-        self.parse(pending.strip_prefix(b"data:").unwrap_or(&pending));
-    }
-    fn parse(&mut self, bytes: &[u8]) {
-        let Ok(value) = serde_json::from_slice::<Value>(bytes) else {
-            return;
-        };
-        if let Some(binding) = &self.binding {
-            binding.observe(&value);
-        }
-        let Some(usage) = value
-            .get("usage")
-            .or_else(|| value.pointer("/message/usage"))
-            .or_else(|| value.pointer("/response/usage"))
-        else {
-            return;
-        };
-        fn update(target: &mut Option<u64>, value: Option<u64>) {
-            if let Some(value) = value {
-                *target = Some(target.unwrap_or_default().max(value));
-            }
-        }
-        update(
-            &mut self.input,
-            usage
-                .get("prompt_tokens")
-                .or_else(|| usage.get("input_tokens"))
-                .and_then(Value::as_u64),
-        );
-        update(
-            &mut self.output,
-            usage
-                .get("completion_tokens")
-                .or_else(|| usage.get("output_tokens"))
-                .and_then(Value::as_u64),
-        );
-        update(
-            &mut self.cached,
-            usage
-                .get("cache_read_input_tokens")
-                .or_else(|| usage.pointer("/prompt_tokens_details/cached_tokens"))
-                .or_else(|| usage.pointer("/input_tokens_details/cached_tokens"))
-                .and_then(Value::as_u64),
-        );
-        update(
-            &mut self.cache_write,
-            usage
-                .get("cache_creation_input_tokens")
-                .or_else(|| usage.pointer("/input_tokens_details/cache_write_tokens"))
-                .or_else(|| usage.pointer("/prompt_tokens_details/cache_write_tokens"))
-                .and_then(Value::as_u64),
-        );
     }
 }
 
@@ -425,10 +287,8 @@ mod tests {
     fn usage_survives_arbitrary_sse_boundaries_and_cumulative_updates() {
         let wire = b"event: message_start\r\ndata: {\"message\":{\"usage\":{\"input_tokens\":11,\"output_tokens\":1,\"cache_read_input_tokens\":7,\"cache_creation_input_tokens\":13}}}\r\n\r\ndata: {\"usage\":{\"output_tokens\":5}}\n\ndata: {\"usage\":{\"output_tokens\":5}}\n\ndata: [DONE]\n\n";
         for size in 1..=wire.len() {
-            let mut usage = Usage {
-                sse: true,
-                ..Default::default()
-            };
+            let mut usage = Usage::default();
+            usage.sse = true;
             for chunk in wire.chunks(size) {
                 usage.push(chunk);
             }

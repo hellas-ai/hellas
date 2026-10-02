@@ -1,6 +1,7 @@
 use super::*;
 use bytes::Bytes;
 use futures::StreamExt as _;
+use hellas_executor::{FetchRouteEntry, FetchRoutePolicy};
 use hellas_rpc::pb::work::{DeliverResultRequest, WorkStreamEvent};
 use hellas_rpc::services::work::StreamResult;
 use hellas_wire::mux::{MessagePipe, MuxConfig, MuxTransport, Role};
@@ -59,6 +60,8 @@ async fn provider_advertises_only_work_protocols() {
             fetch_max_in_flight: 1,
             fetch_queue_capacity: 1,
             paid_work: Some(fixture.config),
+            #[cfg(feature = "grant-provider")]
+            grants: None,
         })
         .await
         .unwrap();

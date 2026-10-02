@@ -30,7 +30,7 @@ pub async fn run_provision(options: ProvisionOptions, print_bond_only: bool) -> 
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
-            "provider": hex::encode(made.offer.offer().provider.genesis.statement.transport_public_key.bytes()),
+            "provider": made.offer.offer().provider.grant_transport().map(hex::encode)?,
             "provider_genesis": made.offer,
             "bond": hex::encode(made.bond_edge.to_bytes()),
         }))?

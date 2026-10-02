@@ -131,7 +131,9 @@ impl Offer {
         policy: ProviderChannelPolicy,
         candidate: BondCandidate,
     ) -> Result<Self> {
-        hellas_rpc::protocol::work_offer::check_provider(&options.provider)
+        options
+            .provider
+            .check_grant_provider()
             .map_err(|_| hellas_rpc::protocol::work_offer::PaidOfferError::Provider)?;
         if options.provider.genesis.statement.producer_public_key
             != hellas_rpc::PublicKey::Secp256k1(options.settlement_key.party_key().to_bytes())

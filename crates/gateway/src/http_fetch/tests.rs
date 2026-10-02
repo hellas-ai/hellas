@@ -132,6 +132,7 @@ async fn http_uses_the_paid_backend_and_waits_for_its_payment_completion() {
 #[test]
 fn forward_only_protocol_headers_and_keep_retry_and_quota_metadata() {
     let route = HttpRoute {
+        max_response_bytes: hellas_rpc::http_fetch::MAX_HTTP_RESPONSE_BYTES,
         path: "/v1/messages".into(),
         method: "POST".into(),
         url: "https://api.example.com/v1/messages".into(),
@@ -204,6 +205,7 @@ fn credentials_and_hop_headers_cannot_be_configured_as_static_headers() {
             max_in_flight: 2,
             backends: BTreeMap::new(),
             routes: vec![HttpRoute {
+                max_response_bytes: hellas_rpc::http_fetch::MAX_HTTP_RESPONSE_BYTES,
                 path: "/v1/messages".into(),
                 method: "POST".into(),
                 url: "https://example.com/v1/messages".into(),
