@@ -43,12 +43,14 @@ pub enum ProvisionError {
         path: PathBuf,
         source: hellas_work::work_store::SetupDiscoveryError,
     },
-    #[error("no configured validator answered with a finalized block to floor this offer at")]
+    #[error("the local node is not ready with a finalized block to floor this offer at")]
     NoFinalizedBlock,
     #[error(transparent)]
     Setup(#[from] hellas_work::work_handshake::SetupExchangeError),
     #[error(transparent)]
-    Consensus(#[from] hellas_chain::ConsensusVerificationError),
+    Query(#[from] hellas_chain::QueryError),
+    #[error(transparent)]
+    Config(#[from] crate::work_config::WorkConfigError),
     #[error(transparent)]
     BlockSource(#[from] hellas_work::work_close::BlockSourceError),
 }

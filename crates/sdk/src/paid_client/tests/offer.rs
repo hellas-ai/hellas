@@ -151,6 +151,7 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
             )
             .unwrap();
         let mut session = PaymentSession {
+            chain: SessionChain::Constructed,
             args: PaidWorkOptions {
                 config: fixture.config.clone(),
                 journal_root: fixture.root.path().join("client"),

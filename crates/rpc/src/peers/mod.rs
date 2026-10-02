@@ -29,7 +29,7 @@ mod manager;
 mod registry;
 mod security;
 
-pub use admission::{AcquireDenied, TokenBucket};
+pub use admission::{AcquireDenied, RequestKind, TokenBucket};
 pub use directory::{PeerDirectory, PeerDirectoryConfig, ServiceAlias};
 pub use id::PeerId;
 pub use manager::{

@@ -3,14 +3,13 @@ use crate::domain::{
     Address, Coin, DecodeExt, Digest, MAX_MERGE_INPUTS, ObjectId, SettlementKey, Transaction,
     UserPublicKey, UserSignature, WebAuthnSignature,
 };
-use crate::work_view::{FinalizedWorkView, WorkChannelQuery, WorkChannelSnapshot};
 use crate::{
     ConsensusActivity, ConsensusInfo, EdgeLookup, EdgeState, FinalizedBlock, FinalizedBlockQuery,
     LatestBlock, LightClient as LightClientApi, MAX_CANONICAL_TRANSACTION_BYTES, OwnerEdges,
     ProposalInfo,
 };
 use futures_util::{Stream, StreamExt as _};
-use hellas_kernel::{Decode as _, EdgeId, Move as KernelMove, Tx as KernelTx};
+use hellas_kernel::{Decode as _, Move as KernelMove, Tx as KernelTx};
 use hellas_rpc::pb::{
     chain::{
         self as pb, ActivityEvent, CoinEntry, EdgeEntry, EdgeState as ProtoEdgeState,
@@ -18,10 +17,10 @@ use hellas_rpc::pb::{
         GetCoinResponse, GetCoinsByOwnerResponse, GetConsensusInfoResponse, GetEdgeResponse,
         GetEdgesByOwnerResponse, GetFinalizationResponse, GetFinalizedBlockResponse,
         GetLatestBlockResponse, GetProofResponse, GetRelayInfoResponse, GetStateRootResponse,
-        GetValidatorsResponse, GetWorkChannelSnapshotResponse, KernelFees, MergeCoinTx,
-        NotarizationEvent, NotarizeEvent, NullificationEvent, NullifyEvent, RegistrySlot,
-        SubmitTxOutcome as ProtoSubmitTxOutcome, SubmitTxResponse, SubmitWorkResponseRequest,
-        TransferTx, WebAuthnSignature as ProtoWebAuthnSignature, activity_event, submit_tx_request,
+        GetValidatorsResponse, KernelFees, MergeCoinTx, NotarizationEvent, NotarizeEvent,
+        NullificationEvent, NullifyEvent, SubmitTxOutcome as ProtoSubmitTxOutcome,
+        SubmitTxResponse, SubmitWorkResponseRequest, TransferTx,
+        WebAuthnSignature as ProtoWebAuthnSignature, activity_event, submit_tx_request,
     },
     services::light_client::{LightClientHandler, LightClientServer},
 };
@@ -140,7 +139,7 @@ pub async fn spawn_light_client_server<T>(
     state: LightClientRpcState,
 ) -> io::Result<JoinHandle<()>>
 where
-    T: LightClientApi + FinalizedWorkView,
+    T: LightClientApi,
 {
     let listener = TcpListener::bind(addr).await?;
     Ok(tokio::spawn(async move {
@@ -169,7 +168,7 @@ async fn serve_connection<T>(
     service: LightClientRpc<T>,
 ) -> Result<(), LightClientServerError>
 where
-    T: LightClientApi + FinalizedWorkView,
+    T: LightClientApi,
 {
     let ws = accept_async(stream).await?;
     let transport = hellas_wire::ws::accept_upgraded(ws, None);
@@ -189,7 +188,7 @@ where
     T::Stream: 'static,
     <T::Stream as hellas_wire::Stream>::RecvHalf: 'static,
     <T::Stream as hellas_wire::Stream>::SendHalf: 'static,
-    C: LightClientApi + FinalizedWorkView,
+    C: LightClientApi,
 {
     // Unbounded on purpose: this service exposes long-lived server-streaming
     // calls (activity subscriptions), and an in-flight cap counts open
@@ -209,7 +208,7 @@ where
 #[allow(refining_impl_trait)]
 impl<T> LightClientHandler for LightClientRpc<T>
 where
-    T: LightClientApi + FinalizedWorkView,
+    T: LightClientApi,
 {
     fn get_state_root(
         &self,
@@ -271,42 +270,12 @@ where
         }
     }
 
-    fn get_work_channel_snapshot(
-        &self,
-        request: pb::GetWorkChannelSnapshotRequest,
-    ) -> impl Future<Output = Result<GetWorkChannelSnapshotResponse, WireStatus>> + Send {
-        let client = self.client.clone();
-        async move {
-            let mut funding = std::collections::BTreeSet::new();
-            for bytes in request.funding_coins {
-                funding.insert(coin_id_from_bytes(bytes, "funding_coins")?);
-            }
-            let query = WorkChannelQuery {
-                bond_edge: edge_id_from_bytes(request.bond_edge, "bond_edge")?,
-                payment_edge: edge_id_from_bytes(request.payment_edge, "payment_edge")?,
-                funding,
-            };
-            let snapshot = client
-                .work_channel_snapshot(query)
-                .await
-                .map_err(WireStatus::from)?;
-            Ok(work_channel_snapshot_response(snapshot))
-        }
-    }
-
     fn get_finalization(
         &self,
         request: pb::GetFinalizationRequest,
     ) -> impl Future<Output = Result<GetFinalizationResponse, WireStatus>> + Send {
         let client = self.client.clone();
-        async move {
-            let payload = digest_from_bytes(request.payload, "payload")?;
-            let certificate = client
-                .get_finalization(payload)
-                .await
-                .map_err(WireStatus::from)?;
-            Ok(GetFinalizationResponse { certificate })
-        }
+        async move { read_finalization(request, |payload| client.get_finalization(payload)).await }
     }
 
     fn get_latest_block(
@@ -325,14 +294,7 @@ where
         request: pb::GetFinalizedBlockRequest,
     ) -> impl Future<Output = Result<GetFinalizedBlockResponse, WireStatus>> + Send {
         let client = self.client.clone();
-        async move {
-            let query = finalized_block_query_from_proto(request)?;
-            let block = client
-                .get_finalized_block(query)
-                .await
-                .map_err(WireStatus::from)?;
-            Ok(finalized_block_response(block))
-        }
+        async move { read_finalized_block(request, |query| client.get_finalized_block(query)).await }
     }
 
     fn submit_tx(
@@ -694,78 +656,6 @@ fn edge_response(lookup: Option<EdgeLookup>) -> GetEdgeResponse {
     }
 }
 
-pub(crate) fn work_channel_snapshot_response(
-    snapshot: Option<WorkChannelSnapshot>,
-) -> GetWorkChannelSnapshotResponse {
-    match snapshot {
-        Some(snapshot) => GetWorkChannelSnapshotResponse {
-            snapshot: Some(latest_block_to_proto(snapshot.block().clone())),
-            bond_edge: snapshot.bond().map(kernel_bytes),
-            payment_edge: snapshot.payment().map(kernel_bytes),
-            lease_slots: snapshot
-                .lease_slots()
-                .iter()
-                .map(|slot| RegistrySlot {
-                    chunk: slot.as_ref().map(kernel_bytes),
-                })
-                .collect(),
-            pending_slot: Some(RegistrySlot {
-                chunk: snapshot.pending_slot().as_ref().map(kernel_bytes),
-            }),
-            live_funding: snapshot
-                .live_funding()
-                .iter()
-                .map(|coin| coin.to_bytes().to_vec())
-                .collect(),
-        },
-        None => GetWorkChannelSnapshotResponse {
-            snapshot: None,
-            bond_edge: None,
-            payment_edge: None,
-            lease_slots: Vec::new(),
-            pending_slot: None,
-            live_funding: Vec::new(),
-        },
-    }
-}
-
-/// Returns one kernel object's canonical bytes.
-///
-/// The wire carries exactly what consensus stored rather than a
-/// re-spelling of its fields, so a caller decodes the object with the
-/// kernel's own decoder and there is no second definition of an edge on
-/// this path.
-fn kernel_bytes<E: hellas_kernel::Encode>(value: &E) -> Vec<u8> {
-    let mut buf = vec![0_u8; value.encoded_size()];
-    let written = value.write_to(&mut buf);
-    buf.truncate(written);
-    buf
-}
-
-fn coin_id_from_bytes(
-    bytes: Vec<u8>,
-    field: &'static str,
-) -> Result<hellas_kernel::CoinId, WireStatus> {
-    hellas_kernel::CoinId::decode_exact(&bytes).map_err(|_| {
-        WireStatus::new(
-            WireCode::InvalidArgument,
-            format!(
-                "{field} was not {} canonical bytes",
-                hellas_kernel::CoinId::LENGTH
-            ),
-        )
-    })
-}
-
-fn edge_id_from_bytes(bytes: Vec<u8>, field: &'static str) -> Result<EdgeId, WireStatus> {
-    EdgeId::decode_exact(&bytes).map_err(|_| {
-        WireStatus::new(
-            WireCode::InvalidArgument,
-            format!("{field} was not {} canonical bytes", EdgeId::LENGTH),
-        )
-    })
-}
-
 fn edge_state_to_proto(edge: EdgeState) -> ProtoEdgeState {
     ProtoEdgeState {
         value: edge.value,
@@ -810,7 +700,7 @@ fn latest_block_response(latest: Option<LatestBlock>) -> GetLatestBlockResponse 
     }
 }
 
-fn finalized_block_query_from_proto(
+pub(crate) fn finalized_block_query_from_proto(
     request: pb::GetFinalizedBlockRequest,
 ) -> Result<FinalizedBlockQuery, WireStatus> {
     match request.query {
@@ -824,7 +714,7 @@ fn finalized_block_query_from_proto(
     }
 }
 
-fn finalized_block_response(block: Option<FinalizedBlock>) -> GetFinalizedBlockResponse {
+pub(crate) fn finalized_block_response(block: Option<FinalizedBlock>) -> GetFinalizedBlockResponse {
     GetFinalizedBlockResponse {
         block: block.map(finalized_block_to_proto),
     }
@@ -939,5 +829,31 @@ fn activity_to_proto(activity: ConsensusActivity) -> ActivityEvent {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "validator"))]
 mod tests;
+
+/// Shared finalized read semantics for LightClient and ChainSync.
+pub(crate) async fn read_finalized_block<F, R>(
+    request: pb::GetFinalizedBlockRequest,
+    read: F,
+) -> Result<GetFinalizedBlockResponse, WireStatus>
+where
+    F: FnOnce(FinalizedBlockQuery) -> R,
+    R: Future<Output = Result<Option<FinalizedBlock>, crate::QueryError>>,
+{
+    Ok(finalized_block_response(
+        read(finalized_block_query_from_proto(request)?).await?,
+    ))
+}
+pub(crate) async fn read_finalization<F, R>(
+    request: pb::GetFinalizationRequest,
+    read: F,
+) -> Result<GetFinalizationResponse, WireStatus>
+where
+    F: FnOnce(Digest) -> R,
+    R: Future<Output = Result<Option<Vec<u8>>, crate::QueryError>>,
+{
+    Ok(GetFinalizationResponse {
+        certificate: read(digest_from_bytes(request.payload, "payload")?).await?,
+    })
+}

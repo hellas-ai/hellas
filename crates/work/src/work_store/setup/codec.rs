@@ -53,12 +53,17 @@ impl SetupRecord {
                 out.extend_from_slice(bundle);
                 out.extend_from_slice(&close_descriptor.encode());
             }
-            Self::SetupHistoryBatch(batch) => {
-                out.push(tag::SETUP_HISTORY_BATCH);
-                out.extend_from_slice(&(batch.blocks.len() as u16).to_be_bytes());
-                for block in &batch.blocks {
-                    put_block(&mut out, block);
-                }
+            Self::Observed(observed) => {
+                out.push(tag::OBSERVED);
+                put_scan(&mut out, &observed.from);
+                put_scan(&mut out, &observed.through);
+                out.extend_from_slice(&[
+                    u8::from(observed.bond_finalized),
+                    u8::from(observed.payment_finalized),
+                    u8::from(observed.bond_closed),
+                    u8::from(observed.payment_closed),
+                ]);
+                put_option(&mut out, observed.origin.as_ref(), put_origin);
             }
             Self::BondTimeoutSubmitted => out.push(tag::BOND_TIMEOUT_SUBMITTED),
             Self::BondSubmitted => out.push(tag::BOND_SUBMITTED),
@@ -113,16 +118,15 @@ impl SetupRecord {
                     close_descriptor: Box::new(close_descriptor),
                 }
             }
-            tag::SETUP_HISTORY_BATCH => {
-                let count = usize::from(u16::from_be_bytes(
-                    cursor.array::<2>().ok_or(SetupStateError::Malformed)?,
-                ));
-                let mut blocks = Vec::with_capacity(count);
-                for _ in 0..count {
-                    blocks.push(take_block(&mut cursor)?);
-                }
-                Self::SetupHistoryBatch(SetupHistoryBatch { blocks })
-            }
+            tag::OBSERVED => Self::Observed(SetupObservation {
+                from: take_scan(&mut cursor)?,
+                through: take_scan(&mut cursor)?,
+                bond_finalized: take_bool(&mut cursor, SetupStateError::Malformed)?,
+                payment_finalized: take_bool(&mut cursor, SetupStateError::Malformed)?,
+                bond_closed: take_bool(&mut cursor, SetupStateError::Malformed)?,
+                payment_closed: take_bool(&mut cursor, SetupStateError::Malformed)?,
+                origin: take_option(&mut cursor, SetupStateError::Malformed, take_origin)?,
+            }),
             tag::BOND_TIMEOUT_SUBMITTED => Self::BondTimeoutSubmitted,
             tag::BOND_SUBMITTED => Self::BondSubmitted,
             tag::PAYMENT_SUBMITTED => Self::PaymentSubmitted,
@@ -148,50 +152,18 @@ impl SetupRecord {
     }
 }
 
-/// Writes one finalized header and the transactions in it.
-///
-/// One spelling, because a record and a checkpoint hold the same blocks:
-/// a second encoder for the checkpoint's copy would be a second answer
-/// to what a retained block is.
-pub(super) fn put_block(out: &mut Vec<u8>, block: &SetupHistoryBlock) {
-    put_u64(out, block.height);
-    out.extend_from_slice(&block.parent);
-    out.extend_from_slice(&block.payload);
-    out.extend_from_slice(&(block.txs.len() as u16).to_be_bytes());
-    for tx in &block.txs {
-        let mut bytes = vec![0_u8; Tx::MAX_ENCODED_SIZE];
-        let written = tx.write_to(&mut bytes);
-        out.extend_from_slice(&(written as u32).to_be_bytes());
-        out.extend_from_slice(&bytes[..written]);
-    }
+fn put_origin(out: &mut Vec<u8>, origin: &SetupOrigin) {
+    out.extend_from_slice(&origin.payment_edge.to_bytes());
+    put_u64(out, origin.height);
+    out.extend_from_slice(&origin.payload);
+    out.extend_from_slice(&origin.parent);
 }
-
-/// Reads back exactly what [`put_block`] wrote.
-pub(super) fn take_block(cursor: &mut Cursor<'_>) -> Result<SetupHistoryBlock, SetupStateError> {
-    let height = cursor.u64().ok_or(SetupStateError::Malformed)?;
-    let parent = cursor.array::<32>().ok_or(SetupStateError::Malformed)?;
-    let payload = cursor.array::<32>().ok_or(SetupStateError::Malformed)?;
-    let tx_count = usize::from(u16::from_be_bytes(
-        cursor.array::<2>().ok_or(SetupStateError::Malformed)?,
-    ));
-    let mut txs = Vec::with_capacity(tx_count);
-    for _ in 0..tx_count {
-        let len = usize::try_from(u32::from_be_bytes(
-            cursor.array::<4>().ok_or(SetupStateError::Malformed)?,
-        ))
-        .map_err(|_| SetupStateError::Malformed)?;
-        let bytes = cursor.take(len).ok_or(SetupStateError::Malformed)?;
-        let (tx, consumed) = Tx::decode(bytes).map_err(|_| SetupStateError::Malformed)?;
-        if consumed != len {
-            return Err(SetupStateError::Malformed);
-        }
-        txs.push(tx);
-    }
-    Ok(SetupHistoryBlock {
-        height,
-        parent,
-        payload,
-        txs,
+fn take_origin(cursor: &mut Cursor<'_>) -> Result<SetupOrigin, SetupStateError> {
+    Ok(SetupOrigin {
+        payment_edge: EdgeId::from_bytes(cursor.array::<32>().ok_or(SetupStateError::Malformed)?),
+        height: cursor.u64().ok_or(SetupStateError::Malformed)?,
+        payload: cursor.array::<32>().ok_or(SetupStateError::Malformed)?,
+        parent: cursor.array::<32>().ok_or(SetupStateError::Malformed)?,
     })
 }
 
@@ -246,24 +218,8 @@ pub(super) fn describes_bundle(
 }
 
 impl SetupState {
-    /// Returns this state's canonical bytes: the whole of what a
-    /// successor generation replays from.
-    ///
-    /// Not a summary, and the destructuring below is what keeps it from
-    /// becoming one. Every field of this struct is named here and named
-    /// again in [`Self::decode_checkpoint`]'s literal, so a field added
-    /// to [`SetupState`] and forgotten here does not compile: the
-    /// pattern is refused for the field it does not mention, and the
-    /// literal for the field it cannot fill. A checkpoint that quietly
-    /// dropped a field a duty reads would be replay that is wrong and
-    /// says nothing, which is the one failure rotation must not add.
-    ///
-    /// The bundle is written as its exact retained bytes and read back
-    /// by decoding them, rather than as two copies of one revision that
-    /// could disagree. Everything the retained history decided is
-    /// written *and* re-derived on the way in — see [`Self::revalidate`]
-    /// — so the derived half of this encoding is checked rather than
-    /// believed.
+    /// Encodes the signed handshake, observation cursor and outcomes. Its
+    /// size is independent of chain length; blocks live in the node archive.
     #[must_use]
     pub fn checkpoint(&self) -> Vec<u8> {
         let Self {
@@ -276,8 +232,7 @@ impl SetupState {
             close_descriptor,
             unresolved_bond_open,
             unresolved_payment_open,
-            history_cursor,
-            history,
+            scan_cursor,
             bond_finalized,
             payment_finalized,
             bond_closed,
@@ -303,22 +258,13 @@ impl SetupState {
         });
         out.push(u8::from(*unresolved_bond_open));
         out.push(u8::from(*unresolved_payment_open));
-        put_option(&mut out, history_cursor.as_ref(), put_scan);
-        out.extend_from_slice(&(history.len() as u32).to_be_bytes());
-        for block in history {
-            put_block(&mut out, block);
-        }
+        put_option(&mut out, scan_cursor.as_ref(), put_scan);
         out.push(u8::from(*bond_finalized));
         out.push(u8::from(*payment_finalized));
         out.push(u8::from(*bond_closed));
         out.push(u8::from(*payment_closed));
         out.push(u8::from(*bond_timeout_submitted));
-        put_option(&mut out, origin.as_ref(), |out, origin| {
-            out.extend_from_slice(&origin.payment_edge.to_bytes());
-            put_u64(out, origin.height);
-            out.extend_from_slice(&origin.payload);
-            out.extend_from_slice(&origin.parent);
-        });
+        put_option(&mut out, origin.as_ref(), put_origin);
         put_option(&mut out, end.as_ref(), |out, end| {
             out.push(end_to_code(*end));
         });
@@ -362,15 +308,7 @@ impl SetupState {
         })?;
         let unresolved_bond_open = take_bool(&mut cursor, SetupStateError::Malformed)?;
         let unresolved_payment_open = take_bool(&mut cursor, SetupStateError::Malformed)?;
-        let history_cursor = take_option(&mut cursor, SetupStateError::Malformed, take_scan)?;
-        let block_count = usize::try_from(u32::from_be_bytes(
-            cursor.array::<4>().ok_or(SetupStateError::Malformed)?,
-        ))
-        .map_err(|_| SetupStateError::Malformed)?;
-        let mut history = Vec::new();
-        for _ in 0..block_count {
-            history.push(take_block(&mut cursor)?);
-        }
+        let scan_cursor = take_option(&mut cursor, SetupStateError::Malformed, take_scan)?;
         let state = Self {
             network,
             bond_edge,
@@ -381,23 +319,13 @@ impl SetupState {
             close_descriptor,
             unresolved_bond_open,
             unresolved_payment_open,
-            history_cursor,
-            history,
+            scan_cursor,
             bond_finalized: take_bool(&mut cursor, SetupStateError::Malformed)?,
             payment_finalized: take_bool(&mut cursor, SetupStateError::Malformed)?,
             bond_closed: take_bool(&mut cursor, SetupStateError::Malformed)?,
             payment_closed: take_bool(&mut cursor, SetupStateError::Malformed)?,
             bond_timeout_submitted: take_bool(&mut cursor, SetupStateError::Malformed)?,
-            origin: take_option(&mut cursor, SetupStateError::Malformed, |cursor| {
-                Ok(SetupOrigin {
-                    payment_edge: EdgeId::from_bytes(
-                        cursor.array::<32>().ok_or(SetupStateError::Malformed)?,
-                    ),
-                    height: cursor.u64().ok_or(SetupStateError::Malformed)?,
-                    payload: cursor.array::<32>().ok_or(SetupStateError::Malformed)?,
-                    parent: cursor.array::<32>().ok_or(SetupStateError::Malformed)?,
-                })
-            })?,
+            origin: take_option(&mut cursor, SetupStateError::Malformed, take_origin)?,
             end: take_option(&mut cursor, SetupStateError::Malformed, |cursor| {
                 end_from_code(cursor.byte().ok_or(SetupStateError::Malformed)?)
                     .ok_or(SetupStateError::Malformed)

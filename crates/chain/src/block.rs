@@ -1,16 +1,4 @@
-//! The canonical finalized block, and the transactions it carries.
-//!
-//! Split out of the validator application because a paid endpoint needs
-//! to read a finalized block without becoming one. The alternatives were
-//! to enable an indexer inside every client and provider process, or to
-//! write a second decoder beside this one — and a second decoder that
-//! disagrees with the first is a client that believes a transaction was
-//! accepted when it was not.
-//!
-//! Only the codec is shared. `validate` is the proposer-side check and
-//! stays behind `validator`: a reader of already-finalized blocks has a
-//! quorum's signature over exactly these bytes and does not re-derive
-//! the context they were proposed in.
+//! The canonical block codec and validation used by the shared execution application.
 
 use crate::domain::{MAX_TXS_PER_BLOCK, PublicKey, Transaction};
 use bytes::{Buf, BufMut};
@@ -32,10 +20,10 @@ use commonware_storage::{mmr, qmdb::sync::Target};
 /// and a process that decodes blocks need not link a database to do it.
 pub type UtxoSyncTarget = Target<mmr::Family, Digest>;
 
-#[cfg(feature = "validator")]
+#[cfg(feature = "full-node")]
 pub(crate) const SYNCHRONY_BOUND: u64 = 5_000;
 
-#[cfg(feature = "validator")]
+#[cfg(feature = "full-node")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum ValidationError {
     #[error("context mismatch")]
@@ -135,7 +123,7 @@ impl HellasBlock {
     /// finalization certificate, checked by `ConsensusVerifier`, so the
     /// context/height/timestamp agreement is already settled by the
     /// quorum that signed them.
-    #[cfg(feature = "validator")]
+    #[cfg(feature = "full-node")]
     pub(crate) fn validate(
         &self,
         expected_context: &Context<Digest, PublicKey>,
@@ -261,8 +249,8 @@ impl Read for HellasBlock {
     }
 }
 
-// Exercises `validate`, which only exists on a `validator` build.
-#[cfg(all(test, feature = "validator"))]
+// Validation is shared by both execution roles.
+#[cfg(all(test, feature = "full-node"))]
 mod tests {
     use super::*;
     use commonware_cryptography::{Signer as _, ed25519};

@@ -166,6 +166,32 @@ impl PeerManager {
         )
     }
 
+    /// Quarantine a peer after a cryptographically invalid delivery. Fresh
+    /// discovery and late RPC completions do not lift this admission block.
+    pub fn block_peer(
+        &self,
+        peer: PeerId,
+        duration: Duration,
+    ) -> Result<PeerChange, PeerManagerError> {
+        self.apply(
+            peer,
+            PeerEvent::Blocked {
+                until_ms: self
+                    .now_ms()
+                    .saturating_add(u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)),
+            },
+        )
+    }
+
+    pub fn is_blocked(&self, peer: PeerId) -> bool {
+        self.with_registry(|registry| {
+            registry
+                .get(peer)
+                .is_some_and(|entry| entry.blocked_until_ms > self.now_ms())
+        })
+        .unwrap_or(true)
+    }
+
     pub fn acquire_rpc(
         &self,
         peer: PeerId,

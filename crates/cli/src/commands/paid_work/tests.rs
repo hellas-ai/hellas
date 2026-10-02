@@ -5,6 +5,7 @@ use hellas_rpc::peers::PeerId;
 #[test]
 fn relative_deadlines_are_ordered_from_the_current_cursor() {
     let args = RunArgs {
+        chain_node: Default::default(),
         provider_genesis: hellas_rpc::ContentId::from_bytes([1; 32]),
         apple_app_id: None,
         apple_cd_hashes: Vec::new(),
@@ -45,18 +46,6 @@ fn payment_coin_parser_refuses_the_fifth_coin() {
 fn fixed_hex_names_wrong_widths() {
     let error = fixed_hex::<32>("--bond", "00").unwrap_err().to_string();
     assert!(error.contains("1 bytes; expected 32"), "{error}");
-}
-
-#[test]
-fn genesis_check_compares_the_configured_digest_with_block_ones_parent() {
-    let configured = [0x31; 32];
-    assert!(check_genesis_payload(&configured, &configured).is_ok());
-
-    let observed_parent = [0x32; 32];
-    let error = check_genesis_payload(&configured, &observed_parent).unwrap_err();
-    assert!(matches!(error,
-        hellas_sdk::paid_client::PaidClientError::GenesisMismatch { expected, actual }
-            if expected == configured && actual == observed_parent));
 }
 
 #[test]

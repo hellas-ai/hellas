@@ -8,6 +8,8 @@ use std::time::Duration;
 pub mod admin;
 #[cfg(feature = "chain")]
 pub mod chain;
+#[cfg(feature = "node")]
+pub mod chain_node;
 pub(crate) mod codex_auth;
 pub mod contributions;
 #[cfg(feature = "node")]

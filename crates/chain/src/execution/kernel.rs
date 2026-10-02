@@ -5,13 +5,11 @@ use crate::domain::{
     merge_input_fault, output_object_id, registry_chunk_object_id,
 };
 use commonware_codec::Encode;
-#[cfg(any(feature = "validator", test))]
 use commonware_codec::EncodeSize;
 use commonware_cryptography::{Hasher, Sha256};
 use commonware_glue::stateful::db::DatabaseSet;
 use commonware_runtime::Spawner;
 use commonware_storage::Context as StorageContext;
-#[cfg(any(feature = "validator", test))]
 use hellas_kernel::InvalidProofReason;
 use hellas_kernel::{
     ApplyError, CloseKind, Coin as KernelCoin, CoinId, Context as KernelContext, EdgeId, Event,
@@ -51,6 +49,8 @@ pub enum ExecutionError {
     MergeOverflow,
     #[error("output object collision: {id:?}")]
     OutputCollision { id: ObjectId },
+    #[error("executed {0} root differs from the certified block")]
+    RootMismatch(&'static str),
     #[error("storage error: {0}")]
     Storage(String),
     #[error("kernel host/store contract failure: {error:?}")]
@@ -61,7 +61,6 @@ pub enum ExecutionError {
     EdgeLifetimeExceeded { blocks: u64, max: u64 },
 }
 
-#[cfg(any(feature = "validator", test))]
 impl ExecutionError {
     pub fn is_transient_for_mempool(&self) -> bool {
         matches!(
@@ -112,7 +111,6 @@ where
         .map_err(storage_err)
 }
 
-#[cfg(any(feature = "validator", test))]
 pub async fn execute_all<E>(
     context: KernelContext,
     verifier: &ChainVerifier,
@@ -133,7 +131,6 @@ where
     Ok(batches)
 }
 
-#[cfg(any(feature = "validator", test))]
 pub async fn execute_proposal<E>(
     context: KernelContext,
     verifier: &ChainVerifier,
@@ -185,7 +182,6 @@ where
     Ok((batches, included, retained))
 }
 
-#[cfg(any(feature = "validator", test))]
 fn response_contest_was_removed(transaction: &Transaction, error: &ExecutionError) -> bool {
     let Transaction::Kernel(KernelTx::Move {
         action: KernelMove::RespondPaymentClose(response),

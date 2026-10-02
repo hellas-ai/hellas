@@ -22,6 +22,7 @@ fn config_with_genesis(address: String) -> ValidatorConfig {
         listen_port: 0,
         metrics_port: None,
         light_client_bind: None,
+        chain_sync_bind: None,
         relay_urls: Vec::new(),
         genesis: Genesis {
             schema_version: crate::genesis::GENESIS_SCHEMA_VERSION,
@@ -49,6 +50,7 @@ fn an_omitted_light_client_bind_keeps_the_listener_off() {
     let loaded: ValidatorConfig =
         toml::from_str(&rendered).expect("load a config written before any bind was asked for");
     assert!(loaded.light_client_bind.is_none());
+    assert!(loaded.chain_sync_bind.is_none());
 }
 
 #[cfg(feature = "validator")]

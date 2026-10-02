@@ -1,7 +1,7 @@
 use crate::domain::{Object, ObjectId};
 use commonware_cryptography::{Sha256, sha256::Digest};
 use commonware_glue::stateful::db::ManagedDb;
-#[cfg(any(feature = "validator", feature = "indexer-api"))]
+#[cfg(any(feature = "validator", feature = "full-node"))]
 use commonware_glue::stateful::db::Shared;
 use commonware_parallel::Sequential;
 use commonware_runtime::{BufferPooler, Spawner, buffer::paged::CacheRef};
@@ -15,12 +15,8 @@ use commonware_storage::{
 use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};
 
 pub type UtxoDb<E> = AnyFixedDb<mmr::Family, E, ObjectId, Object, Sha256, EightCap, Sequential>;
-/// The `DatabaseSet` consensus hands to the application. `execution` is a
-/// private module and the crate root only re-exports `UtxoDb`, so this
-/// alias is crate-internal — and only the `validator` build executes
-/// transactions against it. An `indexer` build reads blocks, it does not
-/// replay them.
-#[cfg(any(feature = "validator", feature = "indexer-api"))]
+/// Shared authenticated state used by consensus and full-node execution.
+#[cfg(any(feature = "validator", feature = "full-node"))]
 pub type UtxoDatabase<E> = Shared<UtxoDb<E>>;
 pub type UtxoDbConfig = FixedConfig<EightCap, Sequential>;
 pub use crate::block::UtxoSyncTarget;

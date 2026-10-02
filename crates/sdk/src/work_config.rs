@@ -116,6 +116,71 @@ impl WorkRoutes {
 }
 
 impl WorkConfig {
+    /// Builds the process's shared executing node. The host owns its directory
+    /// and passes the same node handle to every paid client and provider.
+    #[cfg(any(feature = "paid-client", feature = "paid-provider"))]
+    pub fn node_config(
+        &self,
+        storage_dir: PathBuf,
+        archive_blocks: Option<std::num::NonZeroU64>,
+    ) -> Result<hellas_chain::node::Config> {
+        let genesis = match &self.chain.genesis {
+            Some(genesis) => genesis.clone(),
+            None => {
+                let network = hellas_chain::genesis::known_network(self.chain.network.as_str())
+                    .ok_or(WorkConfigError::Invalid {
+                        field: "chain.genesis",
+                        reason: "required for a network without a shipped genesis document",
+                    })?;
+                serde_json::from_str(network.json).map_err(|_| WorkConfigError::Invalid {
+                    field: "chain.genesis",
+                    reason: "shipped genesis document cannot be decoded",
+                })?
+            }
+        };
+        if genesis.network_id != self.chain.network.as_str() {
+            return Err(WorkConfigError::Invalid {
+                field: "chain.genesis.network_id",
+                reason: "must match chain.network_id",
+            });
+        }
+        Ok(hellas_chain::node::Config {
+            genesis,
+            threshold_identity: self.chain.threshold_identity.clone(),
+            genesis_payload: self
+                .chain
+                .genesis_payload_digest
+                .as_bytes()
+                .to_owned()
+                .into(),
+            storage_dir,
+            validators: self.validators.clone(),
+            peers: Vec::new(),
+            archive_blocks,
+        })
+    }
+
+    #[cfg(any(feature = "paid-client", feature = "paid-provider"))]
+    /// Refuses a paid configuration whose execution genesis or finality pins
+    /// differ from the process's shared node.
+    pub fn check_node(&self, node: &hellas_chain::node::FullNode) -> Result<()> {
+        let expected = self.node_config(
+            node.config().storage_dir.clone(),
+            node.config().archive_blocks,
+        )?;
+        let actual = node.config();
+        if expected.genesis != actual.genesis
+            || expected.threshold_identity != actual.threshold_identity
+            || expected.genesis_payload != actual.genesis_payload
+        {
+            return Err(WorkConfigError::Invalid {
+                field: "chain",
+                reason: "paid configuration differs from the process's chain node",
+            });
+        }
+        Ok(())
+    }
+
     /// Builds the policy used by both provisioning and channel admission.
     #[must_use]
     pub fn provider_policy(&self) -> ProviderChannelPolicy {
@@ -140,6 +205,8 @@ pub struct ChainCrossCheck {
     pub genesis_payload_digest: Digest,
     /// The threshold identity finalized blocks are verified under.
     pub threshold_identity: Vec<u8>,
+    /// Execution inputs for a custom network. Shipped networks may omit this.
+    pub genesis: Option<hellas_chain::genesis::Genesis>,
 }
 
 /// Loads configuration, checks chain identity and policy bounds, and normalizes
@@ -288,6 +355,7 @@ impl WorkConfigFile {
                     &self.chain.genesis_payload_digest,
                 )?,
                 threshold_identity,
+                genesis: self.chain.genesis,
             },
             validators,
             journal_root,
@@ -352,6 +420,8 @@ struct ChainFile {
     network_id: String,
     genesis_payload_digest: String,
     threshold_identity: String,
+    #[serde(default)]
+    genesis: Option<hellas_chain::genesis::Genesis>,
 }
 
 #[derive(Debug, Deserialize)]

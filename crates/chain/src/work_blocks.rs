@@ -367,7 +367,7 @@ mod tests {
         consensus_fixture, finalization, index_block, index_genesis, run_qmdb,
     };
     use crate::execution::{ChainVerifier, execute_all};
-    use crate::indexer::spawn_follower_indexer;
+    use crate::indexer::spawn_archive;
     use crate::light_client::ConsensusInfo;
     use crate::owner_index::{ApplyOutcome, OwnerIndex};
     use crate::rpc::LocalLightClient;
@@ -547,7 +547,7 @@ mod tests {
             ];
             let genesis = index_genesis();
             let fixture = consensus_fixture(97);
-            let (indexer, task) = spawn_follower_indexer(
+            let (indexer, task) = spawn_archive(
                 indexer_context,
                 name,
                 Config {

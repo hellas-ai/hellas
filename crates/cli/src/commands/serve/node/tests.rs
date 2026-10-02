@@ -441,14 +441,13 @@ async fn two_vouched_peers_receive_their_distinct_configured_offers() {
     let runner = WorkRunner::discover(
         WorkRunnerConfig {
             network: network(),
-            genesis_payload_digest: [0; 32].into(),
-            threshold_identity: threshold_identity(),
+
             journal_root: dir.path().to_path_buf(),
             routes: configured_routes(&[
                 (first_peer, first.bond_edge(), first.client().party_key()),
                 (second_peer, second.bond_edge(), second.client().party_key()),
             ]),
-            validators: vec!["ws://unused.invalid".to_owned()],
+
             poll: Duration::from_millis(1),
             max_observation_age: TEST_TIMEOUT,
             settlement_key: provider(),
@@ -570,8 +569,7 @@ fn discover_two_route_runner(
     match WorkRunner::discover(
         WorkRunnerConfig {
             network: network(),
-            genesis_payload_digest: [0; 32].into(),
-            threshold_identity: threshold_identity(),
+
             journal_root: root.to_path_buf(),
             routes: configured_routes(&[
                 (
@@ -585,7 +583,7 @@ fn discover_two_route_runner(
                     second.client().party_key(),
                 ),
             ]),
-            validators: vec!["ws://unused.invalid".to_owned()],
+
             poll: Duration::from_millis(1),
             max_observation_age: TEST_TIMEOUT,
             settlement_key: provider(),
@@ -1970,8 +1968,13 @@ impl FinalizedBlocks for TestChain {
         Ok(Some(ORIGIN))
     }
 
-    async fn block_at(&self, _height: u64) -> Result<Option<FinalizedWork>, BlockSourceError> {
-        Ok(None)
+    async fn block_at(&self, height: u64) -> Result<Option<FinalizedWork>, BlockSourceError> {
+        Ok((height == ORIGIN).then(|| FinalizedWork {
+            height,
+            parent: payload_at(height - 1),
+            payload: payload_at(height),
+            txs: vec![completed(countersigned(proposed())).payment_open().unwrap()],
+        }))
     }
 }
 
@@ -2121,8 +2124,26 @@ impl FinalizedBlocks for RoutedChain {
         Ok(Some(ORIGIN))
     }
 
-    async fn block_at(&self, _height: u64) -> Result<Option<FinalizedWork>, BlockSourceError> {
-        Ok(None)
+    async fn block_at(&self, height: u64) -> Result<Option<FinalizedWork>, BlockSourceError> {
+        Ok((height == ORIGIN).then(|| {
+            let completed = &self.0.lock().unwrap().completed_setups;
+            let txs = [OfferFixture::first(), OfferFixture::second()]
+                .into_iter()
+                .filter(|route| completed.contains(&route.bond_edge()))
+                .map(|route| {
+                    route
+                        .completed(route.countersigned(route.proposed()))
+                        .payment_open()
+                        .unwrap()
+                })
+                .collect();
+            FinalizedWork {
+                height,
+                parent: payload_at(height - 1),
+                payload: payload_at(height),
+                txs,
+            }
+        }))
     }
 }
 
@@ -2359,11 +2380,10 @@ fn runner(root: &Path, policy: ProviderChannelPolicy, mount: &MountedWork) -> Wo
     match WorkRunner::discover(
         WorkRunnerConfig {
             network: network(),
-            genesis_payload_digest: [0; 32].into(),
-            threshold_identity: threshold_identity(),
+
             journal_root: root.to_path_buf(),
             routes: configured_routes(&[(default_route_peer(), bond_edge(), client().party_key())]),
-            validators: vec!["ws://unused.invalid".to_owned()],
+
             poll: Duration::from_millis(1),
             max_observation_age: TEST_TIMEOUT,
             settlement_key: provider(),
@@ -2852,11 +2872,10 @@ impl RunningPaidNode {
         let runner = match WorkRunner::discover(
             WorkRunnerConfig {
                 network: network(),
-                genesis_payload_digest: [0; 32].into(),
-                threshold_identity: threshold_identity(),
+
                 journal_root: root.to_path_buf(),
                 routes: configured_routes(&[(peer, bond_edge(), client().party_key())]),
-                validators: vec!["ws://unused.invalid".to_owned()],
+
                 poll: Duration::from_millis(1),
                 max_observation_age: TEST_TIMEOUT,
                 settlement_key: provider(),

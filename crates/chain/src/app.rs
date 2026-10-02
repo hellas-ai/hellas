@@ -1,66 +1,68 @@
 pub use crate::block::HellasBlock;
 
-#[cfg(feature = "validator")]
+#[cfg(feature = "full-node")]
 use crate::domain::Transaction;
 use crate::domain::{Activity, PublicKey, Scheme, SettlementKey};
-#[cfg(feature = "validator")]
+#[cfg(feature = "full-node")]
 use crate::domain::{KERNEL_FEES, MAX_BLOCK_TX_BYTES, MAX_TXS_PER_BLOCK};
 use crate::execution::store::empty_state;
-#[cfg(feature = "validator")]
+#[cfg(feature = "full-node")]
 use crate::execution::store::{UtxoDatabase, UtxoSyncTarget};
-#[cfg(feature = "validator")]
-use crate::execution::{ChainVerifier, execute_all, execute_proposal};
+#[cfg(feature = "full-node")]
+use crate::execution::{ChainVerifier, execute_proposal};
 use crate::light_client::{ConsensusActivity, ProposalInfo};
 use crate::owner_index::OwnerIndex;
 use commonware_actor::Feedback;
 use commonware_codec::Encode;
-#[cfg(feature = "validator")]
+#[cfg(feature = "full-node")]
 use commonware_codec::EncodeSize;
-#[cfg(feature = "validator")]
+#[cfg(feature = "indexer-api")]
+use commonware_consensus::Block as _;
+#[cfg(feature = "full-node")]
 use commonware_consensus::simplex::types::Context;
-#[cfg(feature = "validator")]
-use commonware_consensus::{Block as _, CertifiableBlock, Heightable, types::Height};
+#[cfg(feature = "full-node")]
+use commonware_consensus::{CertifiableBlock, Heightable, types::Height};
 use commonware_consensus::{
     Reporter,
     simplex::types::{Activity as SimplexActivity, Proposal},
 };
-#[cfg(feature = "validator")]
+#[cfg(feature = "full-node")]
 use commonware_cryptography::Digestible;
-#[cfg(feature = "validator")]
+#[cfg(feature = "full-node")]
 use commonware_cryptography::Hasher;
 use commonware_cryptography::sha256::Digest;
-#[cfg(feature = "validator")]
+#[cfg(feature = "full-node")]
 use commonware_cryptography::sha256::Sha256;
-#[cfg(feature = "validator")]
+#[cfg(feature = "full-node")]
 use commonware_glue::stateful::{
     Application as StatefulApplication, Proposed,
     db::{DatabaseSet, Merkleized as _, Unmerkleized as _},
 };
 use commonware_runtime::Spawner;
-#[cfg(feature = "validator")]
+#[cfg(feature = "full-node")]
 use commonware_runtime::telemetry::metrics::Registered;
 use commonware_storage::Context as StorageContext;
-#[cfg(feature = "validator")]
+#[cfg(feature = "full-node")]
 use commonware_storage::{mmr::Location, qmdb::sync::Target};
-#[cfg(feature = "validator")]
+#[cfg(feature = "full-node")]
 use commonware_utils::{SystemTimeExt, non_empty_range};
-#[cfg(feature = "validator")]
+#[cfg(feature = "full-node")]
 use futures::{Stream, StreamExt};
 use hellas_kernel::NetworkId;
 #[cfg(all(test, feature = "validator"))]
 use hellas_rpc::SubmitTxOutcome;
-#[cfg(feature = "validator")]
+#[cfg(feature = "full-node")]
 use prometheus_client::metrics::gauge::Gauge;
-#[cfg(feature = "validator")]
+#[cfg(feature = "full-node")]
 use rand::Rng;
-#[cfg(feature = "validator")]
+#[cfg(feature = "full-node")]
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-#[cfg(feature = "validator")]
+#[cfg(feature = "full-node")]
 use std::sync::Arc;
-#[cfg(feature = "validator")]
+#[cfg(feature = "full-node")]
 use tokio::sync::Mutex;
 use tokio::sync::broadcast;
-#[cfg(feature = "validator")]
+#[cfg(feature = "full-node")]
 use tracing::{error, info, warn};
 
 type MarshalVariant = commonware_consensus::marshal::standard::Standard<HellasBlock>;
@@ -81,25 +83,15 @@ impl Default for ApplicationConfig {
     }
 }
 
-// A mempool is a validator's, so all of it compiles for one.
-//
-// The two things that put a transaction in it are `rpc.rs`, the submit
-// path, and `server.rs`, the socket in front of that path; the one thing
-// that removes included transactions is `StatefulApplication::finalized`.
-// Invalid candidates are also pruned only against finalized state.
-// All three are `validator`. A follower forwards what it is handed
-// upstream through its light client and proposes no block, so on an
-// `indexer` build this held nothing and nobody read it — the same reason
-// `Application` above keeps no `network` and no height gauge there.
-
-/// Maximum number of general transactions resident in the mempool.
+#[cfg(feature = "full-node")]
 #[cfg(feature = "validator")]
 pub const GENERAL_MEMPOOL_CAPACITY: usize = 120;
 /// Maximum number of finalized-contest response slots resident at once.
+#[cfg(feature = "full-node")]
 #[cfg(feature = "validator")]
 pub const RESPONSE_MEMPOOL_CAPACITY: usize = 64;
 /// Canonical chain encoding of one `PaymentCloseResponse` transaction.
-#[cfg(feature = "validator")]
+#[cfg(feature = "full-node")]
 pub const RESPONSE_TRANSACTION_BYTES: usize = 274;
 /// Mempool residents re-executed against committed state per finalized block.
 ///
@@ -111,18 +103,19 @@ pub const RESPONSE_TRANSACTION_BYTES: usize = 274;
 /// blocks. Pruning is an optimisation and nothing depends on it happening in
 /// the same block that invalidated a transaction: `propose` re-checks every
 /// candidate it picks up.
-#[cfg(feature = "validator")]
+#[cfg(feature = "full-node")]
 pub const RECONCILED_PER_BLOCK: usize = 32;
 
-#[cfg(feature = "validator")]
+#[cfg(feature = "full-node")]
 #[derive(Clone)]
 pub(crate) struct MempoolEntry {
     pub(crate) digest: Digest,
     pub(crate) transaction: Transaction,
 }
 
-#[cfg(feature = "validator")]
+#[cfg(feature = "full-node")]
 impl MempoolEntry {
+    #[cfg(feature = "validator")]
     pub(crate) fn new(transaction: Transaction) -> Self {
         let digest = Sha256::hash(&transaction.encode());
         Self {
@@ -132,25 +125,25 @@ impl MempoolEntry {
     }
 }
 
-#[cfg(feature = "validator")]
+#[cfg(feature = "full-node")]
 pub(crate) type ResponseSlot = (hellas_kernel::EdgeId, hellas_kernel::StartId);
 
-#[cfg(feature = "validator")]
+#[cfg(feature = "full-node")]
 #[derive(Default)]
 pub(crate) struct MempoolState {
     pub(crate) general: VecDeque<MempoolEntry>,
     pub(crate) responses: BTreeMap<ResponseSlot, MempoolEntry>,
 }
 
-#[cfg(feature = "validator")]
+#[cfg(feature = "full-node")]
 #[derive(Clone, Default)]
 pub struct Mempool {
     pub(crate) inner: Arc<Mutex<MempoolState>>,
 }
 
-#[cfg(feature = "validator")]
+#[cfg(feature = "full-node")]
 impl Mempool {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "validator"))]
     pub(crate) async fn test_submit(&self, tx: Transaction) -> SubmitTxOutcome {
         let entry = MempoolEntry::new(tx);
         let mut mempool = self.inner.lock().await;
@@ -168,7 +161,7 @@ impl Mempool {
         SubmitTxOutcome::Enqueued
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "validator"))]
     pub(crate) async fn test_transactions(&self) -> Vec<Transaction> {
         let mempool = self.inner.lock().await;
         mempool
@@ -202,7 +195,7 @@ impl Mempool {
     }
 }
 
-#[cfg(feature = "validator")]
+#[cfg(feature = "full-node")]
 pub(crate) fn response_slot(transaction: &Transaction) -> Option<ResponseSlot> {
     let Transaction::Kernel(hellas_kernel::Tx::Move {
         action: hellas_kernel::Move::RespondPaymentClose(response),
@@ -215,34 +208,28 @@ pub(crate) fn response_slot(transaction: &Transaction) -> Option<ResponseSlot> {
 
 #[derive(Clone)]
 pub struct Application {
-    /// The network this node validates. Every kernel context it builds
-    /// names it, so every authorization it accepts was made for it.
-    ///
-    /// Only a validator builds kernel contexts. An `indexer` build keeps
-    /// no copy: it passes `network` straight to `OwnerIndex::new` and
-    /// never executes a transaction itself.
-    #[cfg(feature = "validator")]
+    #[cfg(feature = "full-node")]
     network: NetworkId,
     genesis: HellasBlock,
-    /// Read by `execute_proposal`/`execute_all`, which are `validator`-only.
-    #[cfg(feature = "validator")]
+    /// Allocations used when proposing or executing the first block.
+    #[cfg(feature = "full-node")]
     genesis_allocations: Arc<Vec<(SettlementKey, u64)>>,
-    /// Set by `StatefulApplication::finalized`. Only a validator runs
-    /// consensus, so on an `indexer` build the gauge would sit at zero
-    /// forever and misreport the follower's height; better absent.
-    #[cfg(feature = "validator")]
+    #[cfg(feature = "full-node")]
     finalized_height: Registered<Gauge>,
     owner_index: OwnerIndex,
-    #[cfg(feature = "validator")]
+    #[cfg(feature = "full-node")]
     verifier: Arc<ChainVerifier>,
-    #[cfg(feature = "validator")]
-    mempool: Mempool,
+    #[cfg(feature = "full-node")]
+    pub(crate) mempool: Option<Mempool>,
+    #[cfg(feature = "full-node")]
+    pub(crate) publication: Option<crate::execution::pipeline::Publication>,
 }
 
 impl Application {
+    #[cfg(feature = "full-node")]
     #[cfg(feature = "validator")]
-    pub(crate) fn mempool(&self) -> Mempool {
-        self.mempool.clone()
+    pub(crate) fn mempool(&mut self) -> Mempool {
+        self.mempool.get_or_insert_with(Mempool::default).clone()
     }
 
     pub fn genesis_block(&self) -> HellasBlock {
@@ -264,7 +251,7 @@ impl Application {
     where
         E: StorageContext + Spawner,
     {
-        #[cfg(feature = "validator")]
+        #[cfg(feature = "full-node")]
         let finalized_height = context.register(
             "finalized_height",
             "Highest finalized block height",
@@ -280,23 +267,25 @@ impl Application {
         let genesis = HellasBlock::genesis(genesis_leader, state_root, sync_target);
         let owner_index = OwnerIndex::new(network, &genesis, genesis_allocations.clone());
         Self {
-            #[cfg(feature = "validator")]
+            #[cfg(feature = "full-node")]
             network,
             genesis,
-            #[cfg(feature = "validator")]
+            #[cfg(feature = "full-node")]
             genesis_allocations: Arc::new(genesis_allocations),
-            #[cfg(feature = "validator")]
+            #[cfg(feature = "full-node")]
             finalized_height,
             owner_index,
-            #[cfg(feature = "validator")]
+            #[cfg(feature = "full-node")]
             verifier: Arc::new(ChainVerifier::new()),
-            #[cfg(feature = "validator")]
-            mempool: Mempool::default(),
+            #[cfg(feature = "full-node")]
+            mempool: None,
+            #[cfg(feature = "full-node")]
+            publication: None,
         }
     }
 }
 
-#[cfg(feature = "validator")]
+#[cfg(feature = "full-node")]
 fn sync_target_from_merkleized<E>(
     merkleized: &<UtxoDatabase<E> as DatabaseSet<E>>::Merkleized,
 ) -> UtxoSyncTarget
@@ -310,7 +299,7 @@ where
     }
 }
 
-#[cfg(feature = "validator")]
+#[cfg(feature = "full-node")]
 fn kernel_context(
     network: NetworkId,
     height: Height,
@@ -324,7 +313,7 @@ fn kernel_context(
     )
 }
 
-#[cfg(feature = "validator")]
+#[cfg(feature = "full-node")]
 impl<E> StatefulApplication<E> for Application
 where
     E: Rng + Spawner + StorageContext + Send + Sync + 'static,
@@ -333,7 +322,7 @@ where
     type Context = Context<Digest, PublicKey>;
     type Block = HellasBlock;
     type Databases = UtxoDatabase<E>;
-    type InputProvider = Mempool;
+    type InputProvider = Option<Mempool>;
 
     fn sync_targets(block: &Self::Block) -> <Self::Databases as DatabaseSet<E>>::SyncTargets {
         block.sync_target()
@@ -353,7 +342,7 @@ where
         let (runtime, consensus_context) = context;
         let mut ancestry = Box::pin(ancestry);
         let parent = ancestry.next().await?;
-        let snapshot = input.snapshot().await;
+        let snapshot = input.as_ref()?.snapshot().await;
         // A proposed block is not a commitment. Keep resident transactions
         // until finality, but do not execute them twice in one ancestry.
         let finalized_height = self.owner_index.cursor().height;
@@ -466,40 +455,16 @@ where
             return None;
         }
 
-        let batches = execute_all(
-            // `previous_hash` is currently inert in kernel apply. Source it
-            // from the block field so verify and certified replay cannot
-            // diverge when the kernel begins consuming it.
-            kernel_context(self.network, block.height(), block.parent()),
-            self.verifier.as_ref(),
-            block.txs(),
+        crate::execution::finalized::execute(
+            &block,
+            self.network,
             &self.genesis_allocations,
+            self.verifier.as_ref(),
             batches,
         )
         .await
-        .map_err(|err| {
-            warn!(?err, payload = ?block.digest(), "block execution failed");
-            err
-        })
-        .ok()?;
-        let owner_root = crate::execution::owner_tree::root(&batches).await.ok()?;
-        if owner_root != block.owner_root() {
-            return None;
-        }
-        let merkleized = batches.merkleize().await.expect("UTXO merkleize failed");
-        let computed_sync_target = sync_target_from_merkleized(&merkleized);
-        if merkleized.root() != block.state_root() || computed_sync_target != block.sync_target() {
-            warn!(
-                payload = ?block.digest(),
-                claimed_state_root = ?block.state_root(),
-                computed_state_root = ?merkleized.root(),
-                claimed_sync_target = ?block.sync_target(),
-                computed_sync_target = ?computed_sync_target,
-                "block root mismatch"
-            );
-            return None;
-        }
-        Some(merkleized)
+        .map_err(|error| warn!(%error, payload = ?block.digest(), "block execution failed"))
+        .ok()
     }
 
     async fn apply(
@@ -508,30 +473,35 @@ where
         block: &Self::Block,
         batches: <Self::Databases as DatabaseSet<E>>::Unmerkleized,
     ) -> <Self::Databases as DatabaseSet<E>>::Merkleized {
-        let batches = execute_all(
-            kernel_context(self.network, block.height(), block.parent()),
-            self.verifier.as_ref(),
-            block.txs(),
+        #[cfg(feature = "indexer-api")]
+        if let Some(index) = self.publication.as_ref().and_then(|p| p.index.as_ref()) {
+            let (batches, changes) = crate::execution::execute_all_observed(
+                kernel_context(self.network, block.height(), block.parent()),
+                self.verifier.as_ref(),
+                block.txs(),
+                &self.genesis_allocations,
+                batches,
+            )
+            .await
+            .expect("certified block must execute");
+            let executed = crate::execution::finalized::check(block, batches)
+                .await
+                .expect("certified block must reproduce its roots");
+            index
+                .prepare(block, changes)
+                .await
+                .expect("certified index intent must persist");
+            return executed;
+        }
+        crate::execution::finalized::execute(
+            block,
+            self.network,
             &self.genesis_allocations,
+            self.verifier.as_ref(),
             batches,
         )
         .await
-        .expect("replay of certified block failed");
-        let owner_root = crate::execution::owner_tree::root(&batches)
-            .await
-            .expect("owner commitment must replay");
-        assert_eq!(
-            owner_root,
-            block.owner_root(),
-            "certified owner commitment must replay"
-        );
-        let merkleized = batches.merkleize().await.expect("UTXO merkleize failed");
-        assert_eq!(merkleized.root(), block.state_root());
-        assert_eq!(
-            sync_target_from_merkleized(&merkleized),
-            block.sync_target()
-        );
-        merkleized
+        .expect("certified block execution must reproduce its roots")
     }
 
     async fn finalized(
@@ -540,12 +510,26 @@ where
         block: &Self::Block,
         databases: &Self::Databases,
     ) {
+        if databases.read().await.root() != block.state_root() {
+            return;
+        }
+        assert_eq!(
+            crate::execution::owner_tree::stored_root(&*databases.read().await)
+                .await
+                .expect("durable owner root"),
+            block.owner_root(),
+            "certified owner root differs from durable state"
+        );
         self.finalized_height
             .set(i64::try_from(block.height().get()).unwrap_or(i64::MAX));
-        self.owner_index
-            .apply_finalized(block)
-            .expect("finalized block indexing failed");
-        self.mempool
+        if let Some(publication) = &self.publication {
+            publication.finalized(block, databases).await;
+        }
+        self.owner_index.publish_cursor(block);
+        let Some(mempool) = &self.mempool else {
+            return;
+        };
+        mempool
             .remove(
                 &block
                     .txs()
@@ -562,7 +546,7 @@ where
             && databases.read().await.root() == block.state_root()
         {
             let mut rejected = BTreeSet::new();
-            let candidates = self.mempool.snapshot().await;
+            let candidates = mempool.snapshot().await;
             // Admission caps how many transactions the pool holds, not how
             // often each is re-examined. Reconciling the whole pool here
             // would make every validator pay one full kernel execution per
@@ -612,7 +596,7 @@ where
                     rejected.insert(digest);
                 }
             }
-            self.mempool.remove(&rejected).await;
+            mempool.remove(&rejected).await;
         }
         info!(
             name: "app.finalized",
@@ -740,7 +724,7 @@ mod tests {
                 .apply_finalized(parent)
                 .expect("finalized test parent");
         }
-        let mut mempool = Mempool::default();
+        let mempool = Mempool::default();
         for tx in candidates {
             mempool.test_submit(tx).await;
         }
@@ -749,7 +733,7 @@ mod tests {
                 (runtime.child(label), next_consensus_context(parent)),
                 stream::iter([Arc::new(parent.clone())]),
                 database.new_batches().await,
-                &mut mempool,
+                &mut Some(mempool.clone()),
             )
             .await
             .expect("application proposal");
@@ -818,18 +802,18 @@ mod tests {
             let database =
                 <UtxoDatabase<_> as DatabaseSet<_>>::init(database_context, config).await;
             let genesis = app.genesis_block();
-            let mut mempool = app.mempool();
+            let mempool = app.mempool();
             let transaction = Transaction::Kernel(fixture.open.clone());
             let bad_auth = Transaction::Kernel(fixture.bad_auth_open().expect("invalid signature"));
             // An empty finalized block from another proposer must prune bad
             // signatures without consuming this node's valid pending Open.
-            let mut empty_pool = Mempool::default();
+            let empty_pool = Mempool::default();
             let empty = app
                 .propose(
                     (runtime.child("empty"), next_consensus_context(&genesis)),
                     stream::iter([Arc::new(genesis.clone())]),
                     database.new_batches().await,
-                    &mut empty_pool,
+                    &mut Some(empty_pool.clone()),
                 )
                 .await
                 .expect("empty block");
@@ -858,7 +842,7 @@ mod tests {
                         (runtime.child(label), next_consensus_context(&genesis)),
                         stream::iter([Arc::new(genesis.clone())]),
                         database.new_batches().await,
-                        &mut mempool,
+                        &mut Some(mempool.clone()),
                     )
                     .await
                     .expect("proposal");
@@ -876,7 +860,7 @@ mod tests {
                     ),
                     stream::iter([Arc::new(genesis.clone())]),
                     database.new_batches().await,
-                    &mut mempool,
+                    &mut Some(mempool.clone()),
                 )
                 .await
                 .expect("proposal to finalize");
@@ -889,7 +873,7 @@ mod tests {
                     (runtime.child("descendant"), next_consensus_context(&block)),
                     stream::iter([Arc::new(block.clone()), Arc::new(genesis)]),
                     database.new_batches().await,
-                    &mut mempool,
+                    &mut Some(mempool.clone()),
                 )
                 .await
                 .expect("descendant proposal");
@@ -1031,7 +1015,7 @@ mod tests {
             // A valid signature can fail only because a speculative branch
             // reached its expiry. Abandoning that branch must allow retry on
             // the shorter finalized ancestry, where it is still valid.
-            let mut branch_pool = Mempool::default();
+            let branch_pool = Mempool::default();
             branch_pool
                 .test_submit(Transaction::Kernel(fixture.mutual_close.clone()))
                 .await;
@@ -1046,7 +1030,7 @@ mod tests {
                         Arc::new(open_block.clone()),
                     ]),
                     UtxoDatabase::<tokio::Context>::fork_batches(&empty_height_two.merkleized),
-                    &mut branch_pool,
+                    &mut Some(branch_pool.clone()),
                 )
                 .await
                 .expect("expired speculative proposal");
@@ -1060,7 +1044,7 @@ mod tests {
                     ),
                     stream::iter([Arc::new(open_block.clone())]),
                     database.new_batches().await,
-                    &mut branch_pool,
+                    &mut Some(branch_pool.clone()),
                 )
                 .await
                 .expect("retry on finalized parent");

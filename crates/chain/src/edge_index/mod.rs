@@ -11,9 +11,9 @@ mod store;
 #[cfg(feature = "indexer-api")]
 pub use native::{EdgeIndex, EdgeIndexError};
 
-#[cfg(feature = "indexer-api")]
+#[cfg(all(test, feature = "indexer-api"))]
 mod replay;
-#[cfg(feature = "indexer-api")]
+#[cfg(all(test, feature = "indexer-api"))]
 pub(crate) use replay::Replay;
 
 #[cfg(feature = "indexer-api")]
@@ -26,3 +26,8 @@ pub(crate) use replay::tests::{Harness as ReplayHarness, basic as replay_basic};
 
 #[cfg(feature = "indexer-api")]
 mod execution;
+
+#[cfg(feature = "indexer-api")]
+mod publication;
+#[cfg(feature = "indexer-api")]
+pub(crate) use publication::Publication;

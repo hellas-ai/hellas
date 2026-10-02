@@ -643,6 +643,7 @@ fn provision_accepts_the_terms_of_one_bond() {
             timeout_payout,
             max_job_price,
             print_bond_only,
+            ..
         } => {
             assert_eq!(work_config, PathBuf::from("/tmp/work.json"));
             assert_eq!(client, "02aa");

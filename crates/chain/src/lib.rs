@@ -23,8 +23,6 @@ mod execution;
 pub mod faucet;
 #[cfg(feature = "client-core")]
 pub mod finality_proof;
-#[cfg(feature = "indexer")]
-pub mod follower;
 #[cfg(feature = "indexer-api")]
 pub(crate) mod http_api;
 #[cfg(feature = "indexer-api")]
@@ -43,11 +41,13 @@ pub use hellas_genesis as genesis;
 pub mod indexer;
 #[cfg(any(feature = "client-core", feature = "server"))]
 pub mod light_client;
+#[cfg(feature = "full-node")]
+pub mod node;
 #[cfg(any(feature = "indexer", feature = "validator"))]
 pub mod owner_index;
 #[cfg(feature = "validator")]
 pub mod relay;
-#[cfg(feature = "validator")]
+#[cfg(any(feature = "validator", feature = "full-node"))]
 pub mod rpc;
 #[cfg(feature = "server")]
 pub mod server;
@@ -67,7 +67,7 @@ pub const CONSENSUS_NAMESPACE: &[u8] = b"hellas";
 #[cfg(any(feature = "indexer", feature = "validator"))]
 pub use app::{ActivityReporter, Application, ApplicationConfig};
 /// The mempool and its bounds, which only a validator has: nothing on a
-/// follower build puts a transaction into one or takes one out.
+/// full-node build puts a transaction into one or takes one out.
 #[cfg(feature = "validator")]
 pub use app::{GENERAL_MEMPOOL_CAPACITY, Mempool};
 #[cfg(feature = "client-core")]
@@ -78,7 +78,7 @@ pub use block_view::{BlockViewError, FinalizedBlockView};
 pub use consensus::{ConsensusVerificationError, ConsensusVerifier, Finalization};
 #[cfg(any(feature = "indexer", feature = "validator"))]
 pub use execution::store::{UtxoDb, utxo_db_config};
-#[cfg(feature = "validator")]
+#[cfg(feature = "full-node")]
 pub use execution::{ChainVerifier, ExecutionError};
 #[cfg(any(feature = "client-core", feature = "server"))]
 pub use hellas_rpc::{
@@ -86,10 +86,7 @@ pub use hellas_rpc::{
     MAX_SUBMIT_WORK_RESPONSE_PROTO_BYTES, SubmitTxOutcome,
 };
 #[cfg(any(feature = "indexer", feature = "validator"))]
-pub use indexer::{
-    BlockStore, ChainIndexer, FinalizationStore, IngestError, IngestOutcome, init_block_store,
-    init_finalization_store, spawn_follower_indexer,
-};
+pub use indexer::{ChainIndexer, IngestError, IngestOutcome};
 #[cfg(any(feature = "client-core", feature = "server"))]
 pub use light_client::{
     ConsensusActivity, ConsensusInfo, EdgeLookup, EdgeRecord, EdgeState, FinalizedBlock,
@@ -142,3 +139,6 @@ mod genesis_reexport {
         assert_eq!(crate::genesis::GENESIS_SCHEMA_VERSION, 1);
     }
 }
+
+#[cfg(all(test, feature = "indexer"))]
+pub(crate) use indexer::spawn_archive;

@@ -1,10 +1,7 @@
-//! Loopback-only HTTP proof origin backed by the native Commonware follower archive.
+//! Loopback read API over one full node and its atomic EdgeIndex publication.
 use crate::{
-    Application, ApplicationConfig, ChainIndexer, ConsensusInfo, FinalizedBlockQuery,
-    LightClient as _,
-    config::Config,
+    ChainIndexer, ConsensusInfo, FinalizedBlockQuery,
     domain::{Digest, PublicKey},
-    follower::{FollowerStatusSink, ingest_finalized_block},
     proof_verify::{PROOF_SCHEMA_VERSION, ProofBundle, ProofQuery, ProofVerifier},
 };
 use axum::{
@@ -17,28 +14,22 @@ use axum::{
 use commonware_codec::DecodeExt as _;
 use commonware_runtime::{Runner as _, Supervisor as _, tokio};
 use commonware_utils::ordered::Set;
-use futures_util::{Stream, StreamExt as _, stream};
 use hellas_genesis::{Genesis, HELLAS_DEVNET_1_JSON, TrustDocument};
 use serde::Deserialize;
-use std::{
-    future::Future,
-    net::SocketAddr,
-    path::PathBuf,
-    sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 type OriginResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 pub struct OriginOptions {
-    pub rpc: String,
+    pub rpc: Vec<String>,
+    pub peers: Vec<iroh::EndpointAddr>,
     pub trust: TrustDocument,
     /// Exact independently provisioned genesis JSON bytes; None uses the embedded devnet.
     pub genesis_json: Option<Vec<u8>>,
     pub storage_dir: PathBuf,
     pub partition_prefix: String,
     pub listen: SocketAddr,
-    pub status: FollowerStatusSink,
+    pub archive_blocks: Option<std::num::NonZeroU64>,
 }
 
 pub(crate) fn genesis_leader(genesis: &Genesis) -> OriginResult<PublicKey> {
@@ -87,73 +78,43 @@ pub fn run(options: OriginOptions) -> OriginResult<()> {
             threshold_identity: hex::decode(&options.trust.epochs[0].threshold_identity)?,
         };
         let leader = genesis_leader(&genesis)?;
-        let allocations = genesis
-            .allocations
-            .iter()
-            .map(|entry| {
-                Ok((
-                    crate::config::parse_genesis_settlement_key(&entry.address)?,
-                    entry.balance,
-                ))
-            })
-            .collect::<Result<Vec<_>, crate::config::ConfigError>>()?;
-        let application = Application::new(
-            context.child("app"),
-            crate::domain::network_id(&genesis)?,
-            leader,
-            allocations.clone(),
-            &format!("{}-genesis", options.partition_prefix),
-            ApplicationConfig::default(),
+        let (root, target) = crate::execution::store::empty_state(
+            context.child("genesis"),
+            "indexer-genesis",
+            4096,
+            128,
         )
         .await;
-        let (indexer, _marshal) = crate::indexer::spawn_trusted_follower_indexer_with_genesis(
-            context.child("indexer"),
-            &options.partition_prefix,
-            Config::default(),
-            options.trust.clone(),
-            &genesis_json,
-            application.genesis_block(),
+        let genesis_block = crate::HellasBlock::genesis(leader, root, target);
+        let node = crate::node::FullNode::start_indexed(
+            crate::node::Config {
+                genesis: genesis.clone(),
+                threshold_identity: info.threshold_identity,
+                genesis_payload: commonware_cryptography::Digestible::digest(&genesis_block),
+                storage_dir: options.storage_dir.clone(),
+                validators: options.rpc,
+                peers: options.peers,
+                archive_blocks: options.archive_blocks,
+            },
+            options.trust,
+            genesis_json,
+            options.partition_prefix,
         )
         .await?;
-        let edge_scope = crate::edge_index::query::cursor_scope(
-            &genesis.network_id,
-            &options.trust.genesis_sha256,
-            verifier.trust_sha256(),
-        );
-        let edge_index = crate::edge_index::EdgeIndex::open(
-            &options.storage_dir.join(format!(
-                "{}-edge-index-v{}-{edge_scope}.redb",
-                options.partition_prefix,
-                crate::edge_index::SCHEMA_VERSION
-            )),
-            genesis.network_id.clone(),
-            options.trust.genesis_sha256.clone(),
-            verifier.trust_sha256().into(),
-        )?;
-        let replay = crate::edge_index::Replay::new(
-            context.child("edge_replay"),
-            &options.partition_prefix,
-            edge_index.clone(),
-            crate::domain::network_id(&genesis)?,
-            allocations,
-            application.genesis_block(),
-            &verifier,
-        )
-        .await?;
+        let indexer = node.archive();
+        let edge_index = node.index().ok_or("node did not open its read index")?;
         let state = OriginState {
             edge_index,
-            replay: Arc::new(::tokio::sync::Mutex::new(replay)),
+            owner_proofs: OwnerProofSource::Node(node.clone()),
             indexer: indexer.clone(),
             verifier,
             network_id: info.network_id.clone(),
         };
         let app = router(state.clone());
         let listener = ::tokio::net::TcpListener::bind(options.listen).await?;
-        ::tokio::select! {
-            result = index_transactions(state.clone()) => result,
-            result = axum::serve(listener,app) => result.map_err(Into::into),
-            result = follow_trusted(state,options.rpc,options.status) => result,
-        }
+        let result = axum::serve(listener, app).await.map_err(Into::into);
+        node.shutdown().await?;
+        result
     })
 }
 
@@ -163,9 +124,35 @@ struct OriginState {
     indexer: ChainIndexer,
     verifier: Arc<ProofVerifier>,
     network_id: String,
-    // This is the only finalized materializer. Its lock spans QMDB finalize,
-    // EdgeIndex publication and all current owner-proof reads.
-    replay: Arc<::tokio::sync::Mutex<crate::edge_index::Replay<tokio::Context>>>,
+    owner_proofs: OwnerProofSource,
+}
+
+#[derive(Clone)]
+enum OwnerProofSource {
+    Node(crate::node::FullNode),
+    #[cfg(test)]
+    Constructed(Arc<::tokio::sync::Mutex<crate::edge_index::Replay<tokio::Context>>>),
+}
+impl OwnerProofSource {
+    async fn owner_proof(
+        &self,
+        owner: crate::domain::SettlementKey,
+        offset: u64,
+        limit: u32,
+        payload: Option<&str>,
+    ) -> OriginResult<Option<crate::proof_verify::VerifiedAddress>> {
+        match self {
+            Self::Node(node) => Ok(node.owner_proof(owner, offset, limit, payload).await?),
+            #[cfg(test)]
+            Self::Constructed(replay) => {
+                replay
+                    .lock()
+                    .await
+                    .owner_proof(owner, offset, limit, payload)
+                    .await
+            }
+        }
+    }
 }
 
 fn router(state: OriginState) -> Router {
@@ -375,9 +362,7 @@ async fn address(
         return failure(&headers, StatusCode::BAD_REQUEST, "invalid payload");
     }
     let verified = match state
-        .replay
-        .lock()
-        .await
+        .owner_proofs
         .owner_proof(owner, query.offset, query.limit, query.payload.as_deref())
         .await
     {
@@ -515,83 +500,17 @@ pub(crate) fn default_proof_accept(mut headers: HeaderMap, uri: &axum::http::Uri
 use crate::http_api::{failure, representation, respond};
 
 fn proof_bundle(state: &OriginState, finalized: crate::FinalizedBlock) -> ProofBundle {
-    let epoch = crate::finality_proof::FinalityProof::decode(&finalized.snapshot.finalization)
-        .map_or(u64::MAX, |proof| proof.certificate_epoch());
-    ProofBundle {
-        schema_version: PROOF_SCHEMA_VERSION,
-        network_id: state.network_id.clone(),
-        trust_sha256: state.verifier.trust_sha256().into(),
-        height: finalized.snapshot.height,
-        payload: hex::encode(finalized.snapshot.payload),
-        state_root: hex::encode(finalized.snapshot.state_root),
-        finalization: finalized.snapshot.finalization,
-        canonical_block: finalized.block,
-        observed_at_ms: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
-        epoch,
-    }
+    state.verifier.bundle(finalized)
 }
-mod follower;
-#[cfg(test)]
-use follower::{FINALIZED_FETCH_WINDOW, ordered_fetches};
-use follower::{follow_trusted, index_transactions};
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
     use crate::execution::test_support::finalization;
     use commonware_cryptography::Digestible as _;
     use hellas_genesis::HELLAS_DEVNET_1_ID;
-    use std::collections::BTreeMap;
     use tower::ServiceExt as _;
-
-    #[test]
-    fn fetch_window_is_bounded_and_orders_responses_before_missing_or_failed_heights() {
-        use ::tokio::sync::oneshot;
-        use futures_util::FutureExt as _;
-        use std::{cell::Cell, rc::Rc};
-
-        // Height three completes first, then a hole/error at two, then one.
-        // Neither the hole nor the later block may bypass the first response.
-        for stopped in [Ok(None), Err("upstream disconnected")] {
-            futures::executor::block_on(async {
-                let mut senders = BTreeMap::new();
-                let mut receivers = BTreeMap::new();
-                for height in 1..=FINALIZED_FETCH_WINDOW as u64 + 1 {
-                    let (send, receive) = oneshot::channel::<Result<Option<u64>, &str>>();
-                    senders.insert(height, send);
-                    receivers.insert(height, receive);
-                }
-                let started = Rc::new(Cell::new(0));
-                let count = started.clone();
-                let fetched = ordered_fetches(1, move |height| {
-                    count.set(count.get() + 1);
-                    let receive = receivers.remove(&height);
-                    async move {
-                        match receive {
-                            Some(receive) => receive.await.unwrap(),
-                            None => std::future::pending().await,
-                        }
-                    }
-                });
-                let mut fetched = Box::pin(fetched);
-                assert!(fetched.next().now_or_never().is_none());
-                assert_eq!(started.get(), FINALIZED_FETCH_WINDOW);
-                senders.remove(&3).unwrap().send(Ok(Some(3))).unwrap();
-                senders.remove(&2).unwrap().send(stopped).unwrap();
-                assert!(fetched.next().now_or_never().is_none());
-                assert_eq!(started.get(), FINALIZED_FETCH_WINDOW);
-                senders.remove(&1).unwrap().send(Ok(Some(1))).unwrap();
-                assert_eq!(fetched.next().await, Some((1, Ok(Some(1)))));
-                assert_eq!(fetched.next().await, Some((2, stopped)));
-                // The production consumer stops on this response and drops all
-                // later work, retrying from its last contiguous committed height.
-                drop(fetched);
-                assert!(senders.values().all(oneshot::Sender::is_closed));
-            });
-        }
-    }
 
     #[test]
     fn representation_respects_qualities_aliases_and_exclusions() {
@@ -637,7 +556,7 @@ mod tests {
                 "origin-empty",
             )
             .await;
-            let (indexer, _handle) = crate::spawn_follower_indexer(
+            let (indexer, _handle) = crate::spawn_archive(
                 context.child("follower"),
                 "origin-empty-test",
                 Config::default(),
@@ -649,7 +568,9 @@ mod tests {
             let app = router(OriginState {
                 edge_index: h.index,
                 indexer,
-                replay: Arc::new(::tokio::sync::Mutex::new(h.replay)),
+                owner_proofs: OwnerProofSource::Constructed(Arc::new(::tokio::sync::Mutex::new(
+                    h.replay,
+                ))),
                 verifier: Arc::new(h.verifier),
                 network_id: HELLAS_DEVNET_1_ID.into(),
             });
@@ -734,7 +655,7 @@ mod tests {
                 1
             );
             let latest = h.append(Vec::new()).await;
-            let (indexer, _handle) = crate::spawn_follower_indexer(
+            let (indexer, _handle) = crate::spawn_archive(
                 context.child("follower"),
                 "origin-test",
                 Config::default(),
@@ -759,7 +680,9 @@ mod tests {
             let state = OriginState {
                 edge_index: h.index.clone(),
                 indexer,
-                replay: Arc::new(::tokio::sync::Mutex::new(h.replay)),
+                owner_proofs: OwnerProofSource::Constructed(Arc::new(::tokio::sync::Mutex::new(
+                    h.replay,
+                ))),
                 verifier: verifier.clone(),
                 network_id: HELLAS_DEVNET_1_ID.into(),
             };
@@ -937,7 +860,7 @@ mod tests {
                 "origin-empty",
             )
             .await;
-            let (indexer, _handle) = crate::spawn_follower_indexer(
+            let (indexer, _handle) = crate::spawn_archive(
                 context.child("follower"),
                 "origin-empty-test",
                 Config::default(),
@@ -949,7 +872,9 @@ mod tests {
             let app = router(OriginState {
                 edge_index: h.index,
                 indexer,
-                replay: Arc::new(::tokio::sync::Mutex::new(h.replay)),
+                owner_proofs: OwnerProofSource::Constructed(Arc::new(::tokio::sync::Mutex::new(
+                    h.replay,
+                ))),
                 verifier: Arc::new(h.verifier),
                 network_id: HELLAS_DEVNET_1_ID.into(),
             });
@@ -988,7 +913,7 @@ mod tests {
                 "origin-empty",
             )
             .await;
-            let (indexer, _handle) = crate::spawn_follower_indexer(
+            let (indexer, _handle) = crate::spawn_archive(
                 context.child("follower"),
                 "origin-empty-test",
                 Config::default(),
@@ -1000,7 +925,9 @@ mod tests {
             let app = router(OriginState {
                 edge_index: h.index,
                 indexer,
-                replay: Arc::new(::tokio::sync::Mutex::new(h.replay)),
+                owner_proofs: OwnerProofSource::Constructed(Arc::new(::tokio::sync::Mutex::new(
+                    h.replay,
+                ))),
                 verifier: Arc::new(h.verifier),
                 network_id: HELLAS_DEVNET_1_ID.into(),
             });

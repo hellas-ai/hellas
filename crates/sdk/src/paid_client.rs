@@ -10,10 +10,8 @@ mod error;
 pub use error::PaidClientError;
 type Result<T, E = PaidClientError> = std::result::Result<T, E>;
 use crate::work_link::WorkLink as ProviderDialer;
-use hellas_chain::client::VerifiedRemoteLightClient;
-use hellas_chain::{
-    ConsensusInfo, ConsensusVerifier, FinalizedWorkView as _, WorkBlocks, WorkChannelQuery,
-};
+use hellas_chain::{FinalizedWorkView as _, WorkBlocks, WorkChannelQuery};
+use hellas_chain::{node::FullNode, rpc::LocalLightClient};
 use hellas_client::work::payment::pay_for_result;
 use hellas_kernel::{
     EdgeId, Funding, MAX_START_VALIDITY_BLOCKS, Secp256k1Signer, Secp256k1Verifier,
@@ -64,6 +62,33 @@ pub struct PaidWorkOptions {
     pub timeout: Duration,
 }
 
+impl PaidWorkOptions {
+    /// Reject impossible deadlines and collateral before starting a node or signing.
+    pub fn validate(&self) -> Result<()> {
+        if !(self.acceptance_blocks > 0 && self.terminal_blocks > 0 && self.payment_blocks > 0) {
+            return Err(PaidClientError::InvalidOptions(
+                "deadline spans must be positive",
+            ));
+        }
+        if self.timeout.is_zero() {
+            return Err(PaidClientError::InvalidOptions("timeout must be positive"));
+        }
+
+        let config = &self.config;
+        // Reject impossible funding before signing either setup transaction.
+        let settlement = hellas_kernel::work_payment_settlement(
+            config.expected_payment_values,
+            self.omission_bond,
+        )
+        .ok_or(hellas_rpc::protocol::work_setup::WorkSetupError::Unsettleable)?;
+        hellas_rpc::protocol::work_setup::check_collateral(
+            self.omission_bond,
+            settlement.capacity(),
+        )?;
+        Ok(())
+    }
+}
+
 /// Convenience options for one complete paid job.
 pub struct PaidWorkRun {
     pub config: WorkConfig,
@@ -97,6 +122,7 @@ pub async fn run_paid_work(
     args: PaidWorkRun,
     transport_key: SecretKey,
     settlement_key: Secp256k1Signer,
+    node: FullNode,
 ) -> Result<PaidWorkResult> {
     if args.timeout.is_zero() {
         return Err(PaidClientError::InvalidOptions("timeout must be positive"));
@@ -139,7 +165,8 @@ pub async fn run_paid_work(
             hellas_rpc::PublicKey::Secp256k1(settlement_key.party_key().to_bytes()),
         )?;
         let endpoint = bind_paid_endpoint(transport_key).await?;
-        let mut session = PaidWorkSession::open(options, endpoint.clone(), settlement_key).await?;
+        let mut session =
+            PaidWorkSession::open(options, endpoint.clone(), settlement_key, node).await?;
         let mut result = session
             .run(Some(prepared_input), false, None)
             .await?
@@ -198,6 +225,25 @@ pub struct PaymentSession {
     client: ClientService,
     observer: Option<tokio::task::JoinHandle<()>>,
     needs_recovery: bool,
+    chain: SessionChain,
+}
+
+enum SessionChain {
+    Node(FullNode),
+    #[cfg(test)]
+    Constructed,
+}
+impl SessionChain {
+    fn ready(&self) -> Result<()> {
+        match self {
+            Self::Node(node) => {
+                node.view()?;
+            }
+            #[cfg(test)]
+            Self::Constructed => {}
+        }
+        Ok(())
+    }
 }
 
 impl Drop for PaymentSession {
@@ -213,10 +259,11 @@ fn spawn_observer(
     client: ClientObserver,
     descriptor: WorkChannelDescriptor,
     config: WorkConfig,
-    mut chain: WorkBlocks<VerifiedRemoteLightClient>,
-    mut next_validator: usize,
+    chain: WorkBlocks<LocalLightClient>,
+    node: FullNode,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let mut finalized = node.finalized();
         loop {
             if client
                 .with_state(|state| state.close_settled().is_some())
@@ -250,22 +297,11 @@ fn spawn_observer(
             if let Err(error) = result {
                 let _ = client.suspend();
                 tracing::debug!(%error, "paid client observation unavailable");
-                // Redial a bounded connection attempt; close duties remain armed.
-                if !matches!(
-                    error,
-                    PaidClientError::WorkSetup(_) | PaidClientError::Endpoint(_)
-                ) && let Ok(Ok(replacement)) =
-                    tokio::time::timeout(config.max_observation_age, async {
-                        let replacement = connect_chain(&config, &mut next_validator).await?;
-                        check_genesis(&config, &replacement).await?;
-                        Ok::<_, PaidClientError>(replacement)
-                    })
-                    .await
-                {
-                    chain = replacement;
-                }
             }
-            tokio::time::sleep(config.poll).await;
+            tokio::select! {
+                changed = finalized.changed() => if changed.is_err() { break; },
+                _ = tokio::time::sleep(config.poll) => {},
+            }
         }
     })
 }
@@ -288,33 +324,20 @@ impl PaymentSession {
         args: PaidWorkOptions,
         endpoint: Endpoint,
         settlement_key: Secp256k1Signer,
+        node: FullNode,
     ) -> Result<Self> {
-        if !(args.acceptance_blocks > 0 && args.terminal_blocks > 0 && args.payment_blocks > 0) {
-            return Err(PaidClientError::InvalidOptions(
-                "deadline spans must be positive",
-            ));
-        }
-        if args.timeout.is_zero() {
-            return Err(PaidClientError::InvalidOptions("timeout must be positive"));
-        }
-
+        args.validate()?;
         let config = &args.config;
-        // Reject impossible funding before signing either setup transaction.
-        let settlement = hellas_kernel::work_payment_settlement(
-            config.expected_payment_values,
-            args.omission_bond,
-        )
-        .ok_or(hellas_rpc::protocol::work_setup::WorkSetupError::Unsettleable)?;
-        hellas_rpc::protocol::work_setup::check_collateral(
-            args.omission_bond,
-            settlement.capacity(),
-        )?;
         let policy = config.provider_policy();
         let bond = args.bond;
         let payment_funding = args.payment_funding.clone();
-        let mut next_validator = 0;
-        let chain = connect_chain(config, &mut next_validator).await?;
-        check_genesis(config, &chain).await?;
+        config.check_node(&node)?;
+        let view = tokio::time::timeout(args.timeout, node.wait_ready())
+            .await
+            .map_err(|_| PaidClientError::Timeout {
+                stage: "chain synchronization",
+            })??;
+        let chain = WorkBlocks::new(view.client());
 
         std::fs::create_dir_all(&args.journal_root).map_err(|source| {
             PaidClientError::JournalDirectory {
@@ -399,7 +422,7 @@ impl PaymentSession {
             descriptor.clone(),
             config.clone(),
             chain,
-            next_validator,
+            node.clone(),
         );
 
         let session = Self {
@@ -409,6 +432,7 @@ impl PaymentSession {
             client,
             observer: Some(observer),
             needs_recovery: true,
+            chain: SessionChain::Node(node),
         };
         if initially_ready {
             // A long restart catch-up may outlive the first observation. Wait
@@ -530,6 +554,7 @@ impl PaymentSession {
                 Err(hellas_work::work::EndpointError::NotAdmitting.into())
             };
         }
+        self.chain.ready()?;
         let ready = client.readiness()?;
         if recover && *needs_recovery {
             enum RecoveredJob {
@@ -644,6 +669,7 @@ impl PaymentSession {
         }
         let result = match prepared {
             Some(prepared) => {
+                self.chain.ready()?;
                 let ready = client.readiness()?;
                 Some(
                     execute_paid_job(
@@ -974,7 +1000,7 @@ fn payment_terms(
 async fn drive_setup(
     setup: &SetupService,
     policy: &ProviderChannelPolicy,
-    chain: &WorkBlocks<VerifiedRemoteLightClient>,
+    chain: &WorkBlocks<LocalLightClient>,
     poll: Duration,
 ) -> Result<(hellas_work::work_store::ChannelStore, WorkChannelDescriptor)> {
     loop {
@@ -996,7 +1022,7 @@ async fn drive_setup(
 
 async fn ready_channel(
     descriptor: &WorkChannelDescriptor,
-    chain: &WorkBlocks<VerifiedRemoteLightClient>,
+    chain: &WorkBlocks<LocalLightClient>,
 ) -> Result<hellas_rpc::protocol::work_setup::ReadyChannel> {
     let query = WorkChannelQuery {
         bond_edge: descriptor.bond_edge(),
@@ -1086,72 +1112,18 @@ async fn exchange_setup(dialer: &ProviderDialer, setup: &mut SetupEndpoint) -> R
     Ok(())
 }
 
-async fn connect_chain(
-    config: &WorkConfig,
-    next_validator: &mut usize,
-) -> Result<WorkBlocks<VerifiedRemoteLightClient>> {
-    let verifier = ConsensusVerifier::new(&ConsensusInfo {
-        validators: config.validators.clone(),
-        threshold_identity: config.chain.threshold_identity.clone(),
-        network_id: config.chain.network.as_str().to_owned(),
-    })?;
-    // A peer can accept connections while lacking a historical certificate.
-    // Reconnects must make progress through the configured alternatives.
-    let start = *next_validator;
-    let mut failures = Vec::new();
-    for url in config
-        .validators
-        .iter()
-        .cycle()
-        .skip(start)
-        .take(config.validators.len())
-    {
-        *next_validator = (*next_validator + 1) % config.validators.len();
-        match VerifiedRemoteLightClient::connect(url.clone(), verifier.clone()).await {
-            Ok(client) => return Ok(WorkBlocks::new(client)),
-            Err(error) => failures.push((url.clone(), error)),
-        }
-    }
-    Err(PaidClientError::ValidatorsUnavailable(failures))
-}
-
-async fn check_genesis(
-    config: &WorkConfig,
-    chain: &WorkBlocks<VerifiedRemoteLightClient>,
-) -> Result<()> {
-    let first = chain
-        .block_at(1)
-        .await?
-        .ok_or(PaidClientError::MissingState(
-            "finalized block 1 for genesis authentication",
-        ))?;
-    check_genesis_payload(
-        config.chain.genesis_payload_digest.as_bytes(),
-        &first.parent,
-    )
-}
-pub fn check_genesis_payload(expected: &[u8; 32], actual: &[u8; 32]) -> Result<()> {
-    if actual != expected {
-        return Err(PaidClientError::GenesisMismatch {
-            expected: *expected,
-            actual: *actual,
-        });
-    }
-    Ok(())
-}
-
-async fn finalized_floor(chain: &WorkBlocks<VerifiedRemoteLightClient>) -> Result<SetupScan> {
+async fn finalized_floor(chain: &WorkBlocks<LocalLightClient>) -> Result<SetupScan> {
     let height = chain
         .latest_height()
         .await?
         .ok_or(PaidClientError::MissingState(
-            "configured validator has finalized no blocks",
+            "local node has executed no finalized blocks",
         ))?;
     let block = chain
         .block_at(height)
         .await?
         .ok_or(PaidClientError::MissingState(
-            "configured validator did not return its finalized tip",
+            "local archive did not return its finalized tip",
         ))?;
     Ok(SetupScan {
         height,

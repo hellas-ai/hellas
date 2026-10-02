@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use hellas_kernel::{CoinId, Decode, Edge, EdgeId, Encode, LeaseSlots, NetworkId, SigVerifier, Tx};
+use hellas_kernel::{CoinId, Edge, EdgeId, LeaseSlots, NetworkId, SigVerifier, Tx};
 use hellas_xet::XetFileHasher;
 
 use crate::work_store::journal::{
@@ -26,7 +26,6 @@ mod state;
 mod store;
 
 use codec::describes_bundle;
-pub(crate) use state::touches_setup;
 use store::check_bundle_signatures;
 pub use store::{
     DiscoveredSetup, SetupDiscovery, SetupDiscoveryError, SetupStore, UnidentifiedSetup,
@@ -210,21 +209,17 @@ pub struct SetupScan {
     pub payload: [u8; 32],
 }
 
-/// One finalized header and the accepted kernel transactions in it which
-/// touch this setup's named edges.
+/// A bounded observation of finalized blocks. Only `SetupState::observe` can
+/// construct it; journals retain the cursor and outcomes, never transactions.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SetupHistoryBlock {
-    pub height: u64,
-    pub parent: [u8; 32],
-    pub payload: [u8; 32],
-    pub txs: Vec<Tx>,
-}
-
-/// One bounded atomic setup-history transition.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SetupHistoryBatch {
-    /// Between one and 256 contiguous finalized blocks.
-    pub blocks: Vec<SetupHistoryBlock>,
+pub struct SetupObservation {
+    from: SetupScan,
+    through: SetupScan,
+    bond_finalized: bool,
+    payment_finalized: bool,
+    bond_closed: bool,
+    payment_closed: bool,
+    origin: Option<SetupOrigin>,
 }
 
 /// One durable step of the handshake.
@@ -256,8 +251,8 @@ pub enum SetupRecord {
         /// The admitted descriptor recovered without operator configuration.
         close_descriptor: Box<CloseDescriptor>,
     },
-    /// A bounded contiguous finalized-history transition.
-    SetupHistoryBatch(SetupHistoryBatch),
+    /// The cursor and outcomes of a contiguous finalized scan.
+    Observed(SetupObservation),
     /// The provider is about to submit the deterministic bond Timeout.
     BondTimeoutSubmitted,
     /// The retained bond Open is about to be broadcast.
@@ -291,7 +286,7 @@ mod tag {
     pub(super) const ENDED: u8 = 4;
     pub(super) const SCAN_ARMED: u8 = 5;
     pub(super) const ARMED_BUNDLE: u8 = 6;
-    pub(super) const SETUP_HISTORY_BATCH: u8 = 7;
+    pub(super) const OBSERVED: u8 = 7;
     pub(super) const BOND_TIMEOUT_SUBMITTED: u8 = 8;
 }
 
@@ -358,8 +353,7 @@ pub struct SetupState {
     close_descriptor: Option<CloseDescriptor>,
     unresolved_bond_open: bool,
     unresolved_payment_open: bool,
-    history_cursor: Option<SetupScan>,
-    history: Vec<SetupHistoryBlock>,
+    scan_cursor: Option<SetupScan>,
     bond_finalized: bool,
     payment_finalized: bool,
     bond_closed: bool,

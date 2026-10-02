@@ -37,8 +37,14 @@ grant-client = [
     "dep:async-stream",
     "dep:prost",
 ]
-paid-client = ["work", "client", "dep:async-stream", "hellas-client/work"]
-paid-provider = ["work", "provider"]
+paid-client = [
+    "work",
+    "client",
+    "dep:async-stream",
+    "hellas-client/work",
+    "hellas-chain/full-node",
+]
+paid-provider = ["work", "provider", "hellas-chain/full-node"]
 grant-provider = ["work", "provider"]
 grant-gateway = ["grant-client", "gateway", "dep:rand"]
 paid-gateway = ["paid-client", "gateway", "dep:rand"]
@@ -93,6 +99,9 @@ url = { version = "2", optional = true }
 [dev-dependencies]
 base64.workspace = true
 bytes.workspace = true
+commonware-codec.workspace = true
+commonware-cryptography.workspace = true
+commonware-runtime.workspace = true
 rcgen = "0.14"
 reqwest = { workspace = true, features = ["json"] }
 rustls = { version = "0.23", default-features = false, features = [

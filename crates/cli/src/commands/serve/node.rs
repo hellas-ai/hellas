@@ -83,6 +83,7 @@ pub(super) struct NodeHandle {
     endpoint: Endpoint,
     discovery: Option<DiscoveryAdvertiser>,
     work: Option<WorkWatcher>,
+    chain: Option<hellas_sdk::FullNode>,
 }
 
 /// The clock over this node's paid-work journals, and the way to stop
@@ -131,6 +132,9 @@ impl NodeHandle {
             discovery.shutdown().await;
         }
         self.endpoint.close().await;
+        if let Some(chain) = self.chain.take() {
+            chain.shutdown().await?;
+        }
         Ok(())
     }
 }
@@ -150,7 +154,7 @@ pub(super) struct NodeConfig {
     /// What the clock over this node's paid-work journals is built
     /// from, or `None` when no work configuration was loaded. Its
     /// presence is still what advertises the two work ALPNs.
-    pub(super) work: Option<WorkRunnerConfig>,
+    pub(super) work: Option<(WorkRunnerConfig, hellas_sdk::FullNode)>,
     pub(super) secret_key: SecretKey,
     pub(super) producer_key: ProducerSigningKey,
     pub(super) open_identity: Arc<OpenIdentity>,
@@ -227,8 +231,13 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
     //    and graffiti so introspection (`hellas rpc`) returns real data.
     //    `NodeHandlerImpl: Clone` (its fields are Arc/Copy), so we
     //    clone per-connection rather than wrap in Arc<dyn>.
-    let node_handler =
+    let mut node_handler =
         NodeHandlerImpl::new(node_id, config.build, config.graffiti, directory.clone());
+    node_handler.service_alpns = advertised_alpns
+        .iter()
+        .map(|alpn| String::from_utf8(alpn.clone()).expect("service ALPN is ASCII"))
+        .collect();
+    node_handler.chain = config.work.as_ref().map(|(_, chain)| chain.clone());
 
     // -- The clock. Spawned only when a work configuration was loaded,
     //    and given the same mount slot the accept loop reads: the runner
@@ -281,9 +290,11 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
         .transpose()
         .context("failed to start service discovery advertising")?;
     let setup_mount = MountedSetup::default();
-    let work = config.work.map(|work| {
+    let chain = config.work.as_ref().map(|(_, chain)| chain.clone());
+    let work = config.work.map(|(work, chain)| {
         let poll = work.poll;
-        let runner = WorkRunner::discover(work, work_mount.clone(), setup_mount.clone());
+        let runner = WorkRunner::discover(work, work_mount.clone(), setup_mount.clone())
+            .map(|runner| runner.on_node(chain));
         let (stop, stopped) = oneshot::channel();
         let task = tokio::spawn(async move {
             match runner {
@@ -368,6 +379,7 @@ pub(super) async fn spawn_node(config: NodeConfig) -> anyhow::Result<NodeHandle>
     });
 
     Ok(NodeHandle {
+        chain,
         grants,
         _control: control,
         node_id,
@@ -396,6 +408,14 @@ async fn serve_connection(
     // Account for inbound requests and refresh last_seen_ms in the shared registry.
     if alpn == <Node as ServiceMarker>::ALPN.as_bytes() {
         let server = AccountingDispatcher::new(NodeServer(node_handler), manager);
+        serve_loop(transport, server).await
+    } else if alpn == hellas_rpc::services::chain_sync::ChainSync::ALPN.as_bytes()
+        && let Some(chain) = node_handler.chain
+    {
+        let server = AccountingDispatcher::new(
+            hellas_rpc::services::chain_sync::ChainSyncServer(chain),
+            manager,
+        );
         serve_loop(transport, server).await
     } else if let Some(setup) =
         setup.filter(|_| alpn == <WorkSetup as ServiceMarker>::ALPN.as_bytes())

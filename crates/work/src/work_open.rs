@@ -1,83 +1,10 @@
 //! Posting the two Opens: the driver that turns a completed handshake
 //! into a channel on chain.
 //!
-//! # What was missing
-//!
-//! [`SetupState::decide`] is §6's five-way recovery machine and it has
-//! been complete for a while. What it never had was anything to drive
-//! it: something that reads one coherent finalized state, asks it what
-//! to do, records that step before taking it, and reads the blocks back
-//! to find out whether it landed. [`advance_setup`] is that, and it adds
-//! no decision of its own — every branch below is a `SetupDecision`, and
-//! the two it does not act on say so.
-//!
-//! # Durable before broadcast
-//!
-//! The same rule [`crate::work_close`] obeys for a close, in the same
-//! order: the marker is committed and fsynced, and only then is the
-//! transaction handed to a sink. A crash between the two leaves a
-//! journal that says the bond was submitted when it may not have been,
-//! and that is the safe half — the next run re-decides from the chain,
-//! sees no bond, and submits the *retained* bytes again. A resubmission
-//! is the same Open and not a second one: `apply_open` refuses it twice
-//! over, once because the funding coins the first one consumed are gone
-//! and once with `ApplyError::EdgeExists` for the edge already there.
-//!
-//! The other order is the one that cannot be recovered from: broadcast
-//! first, crash, and the journal has no record that a transaction
-//! carrying this provider's signature is in flight.
-//!
-//! # Where the channel begins
-//!
-//! [`SetupRecord::Complete`] carries the block the payment Open landed
-//! in — its height, its payload, and its parent's payload, which is the
-//! cursor a channel watcher starts from. None of those three can be
-//! derived from the objects: a live edge says the Open was accepted, not
-//! where. So [`advance_setup`] reads finalized blocks until it finds the
-//! one whose accepted transactions contain an Open deriving this payment
-//! edge.
-//!
-//! The scan starts at the successor of the journal's immutable
-//! [`SetupRecord::ScanArmed`] floor. Its first parent must be the armed
-//! payload and every later parent must be the preceding payload. Submission
-//! markers are deliberately absent from this calculation: who happened to
-//! submit an Open cannot move the observation floor past an authorization a
-//! counterparty may already have put on chain.
-//!
-//! # Who mounts
-//!
-//! Every step that opens the channel journal hands it back in
-//! [`SetupAdvance::mounted`]. There are three: the completion, the
-//! close-only mount, and the completed-journal shortcut — which matters
-//! because it is the only branch a restarted process reaches a finished
-//! setup by, and a caller that had to mount for itself there would have
-//! to mount for itself after every restart.
-//!
-//! A caller receives its channel; it never builds a second one. The
-//! alternative is re-deriving the settlement from the armed descriptor
-//! and re-running this replay outside the library — and the two
-//! spellings come apart at exactly the places that matter. The
-//! settlement comes from the coherent live edge rather than from what
-//! configuration expected, and the origin block's own post-Open moves
-//! are replayed because the mount's cursor already sits on that block.
-//! Neither is visible from the descriptor alone.
-//!
-//! # What it does not do
-//!
-//! It does not take an unleased bond's Timeout back.
-//! [`SetupDecision::TimeoutBond`] is returned to the caller as
-//! [`SetupProgress::TimeoutBond`] and nothing here submits it: the
-//! journal has no record with which to mark that submission, and this
-//! module submits nothing it cannot write down first. Nothing else in
-//! this workspace submits one either — `Tx::timeout_close` has no caller
-//! outside tests — so a provider whose setup ends there gets its stake
-//! back only by an operator building and sending that transaction.
-//!
-//! It does not exchange revisions with the peer. That is
-//! [`crate::work_handshake::send_setup_exchange`], bracketed by its
-//! prepare/apply helpers, and a caller runs the two in the obvious order:
-//! exchange until the bundle is complete, then drive until the journals
-//! record it.
+//! Signed revisions and submission markers are durable before export or
+//! broadcast. Finalized blocks come from the process's local chain node;
+//! setup journals retain only their cursor and handshake outcomes. Mounting
+//! replays the channel's close effects from that same local block interface.
 
 use std::collections::BTreeSet;
 
@@ -87,11 +14,9 @@ use hellas_kernel::{CoinId, Edge, EdgeId, LeaseSlots, SigVerifier, Tx};
 use crate::work_close::{
     BlockSourceError, FinalizedBlocks, FinalizedWork, TxSink, apply_finalized_txs, observe,
 };
-use crate::work_store::setup::touches_setup;
 use crate::work_store::{
-    ChannelStore, ObservedSetup, SetupAbort, SetupDecision, SetupEnd, SetupFault,
-    SetupHistoryBatch, SetupHistoryBlock, SetupOrigin, SetupRecord, SetupScan, SetupState,
-    SetupStore, WorkStoreError,
+    ChannelRecord, ChannelStore, ObservedSetup, SetupAbort, SetupDecision, SetupEnd, SetupFault,
+    SetupOrigin, SetupRecord, SetupState, SetupStore, WorkStoreError,
 };
 
 /// Which channel a setup read answers for, and which coins it must
@@ -450,15 +375,16 @@ where
         let Some(finalized) = view.finalized_setup(query).await? else {
             return Ok(SetupAdvance::bare(SetupProgress::AwaitingFinalizedState));
         };
-        return channel.try_with_store(|store| {
+        let advance = channel.try_with_store(|store| {
             Ok(SetupAdvance {
                 progress: SetupProgress::Complete(origin),
                 mounted: Some(mount(store, verifier, origin, finalized.payment.as_ref())?),
             })
-        });
+        })?;
+        return finish_mount(blocks, channel, advance, verifier).await;
     }
 
-    if let Some((through, tip)) = fetch_history_batch(blocks, channel, verifier).await?
+    if let Some((through, tip)) = scan_finalized(blocks, channel, verifier).await?
         && through < tip
     {
         return Ok(SetupAdvance::bare(SetupProgress::HistoryAdvanced {
@@ -487,12 +413,11 @@ where
     // nothing here has a clock, and a handshake still arriving is the
     // caller's to come back to.
     const REREADS: usize = 2;
-    let (payment_edge, finalized, decision) = 'reread: {
+    let (finalized, decision) = 'reread: {
         for _ in 0..REREADS {
             let Some(asked) = channel.with_store(|store| query_of(store.state()))? else {
                 return Ok(SetupAdvance::bare(SetupProgress::AwaitingCounterparty));
             };
-            let payment_edge = asked.payment_edge;
             let Some(finalized) = view.finalized_setup(asked.clone()).await? else {
                 return Ok(SetupAdvance::bare(SetupProgress::AwaitingFinalizedState));
             };
@@ -516,13 +441,31 @@ where
                     return mount_close_only(store, verifier, finalized.payment.as_ref())
                         .map(|advance| Reread::Mounted(Box::new(advance)));
                 }
-                Ok(Reread::Decided(store.state().decide(&finalized.observed())))
+                let decision = store.state().decide(&finalized.observed());
+                // A newer snapshot can show spent funding before the scan has
+                // recorded the Open or Close that explains it. Terminal
+                // decisions require that evidence; submissions remain live
+                // even while new blocks keep arriving.
+                if matches!(decision, SetupDecision::Abort(_) | SetupDecision::Fault(_))
+                    && store
+                        .state()
+                        .scan_cursor()
+                        .is_none_or(|scan| scan.height < finalized.height)
+                {
+                    return Ok(Reread::Behind);
+                }
+                Ok(Reread::Decided(decision))
             })? {
                 Reread::Moved => continue,
-                Reread::Mounted(advance) => return Ok(*advance),
+                Reread::Behind => {
+                    return Ok(SetupAdvance::bare(SetupProgress::AwaitingFinalizedState));
+                }
+                Reread::Mounted(advance) => {
+                    return finish_mount(blocks, channel, *advance, verifier).await;
+                }
                 Reread::Decided(decision) => decision,
             };
-            break 'reread (payment_edge, finalized, decision);
+            break 'reread (finalized, decision);
         }
         // Every pass found the question moved. Nothing was decided, and
         // the caller asks again rather than this step deciding from the
@@ -533,11 +476,12 @@ where
         SetupDecision::SubmitBond => submit(channel, sink, verifier, SetupStep::Bond).await,
         SetupDecision::SubmitPayment => submit(channel, sink, verifier, SetupStep::Payment).await,
         SetupDecision::Complete => {
-            let scan = channel
-                .with_store(|store| store.state().scan_armed())?
-                .ok_or(SetupDriveError::ScanNotArmed)?;
-            let origin = find_origin(blocks, payment_edge, scan).await?;
-            channel.try_with_store(|store| {
+            let Some(origin) = channel.with_store(|store| store.state().origin())? else {
+                // The coherent state may advance during the read. Observe its
+                // Open on the next scan before making completion durable.
+                return Ok(SetupAdvance::bare(SetupProgress::AwaitingFinalizedState));
+            };
+            let advance = channel.try_with_store(|store| {
                 store.commit(
                     SetupRecord::Complete {
                         payment_edge: origin.payment_edge,
@@ -557,10 +501,15 @@ where
                     progress: SetupProgress::Complete(origin),
                     mounted: Some(mount(store, verifier, origin, finalized.payment.as_ref())?),
                 })
-            })
+            })?;
+            finish_mount(blocks, channel, advance, verifier).await
         }
-        SetupDecision::CloseOnly => channel
-            .try_with_store(|store| mount_close_only(store, verifier, finalized.payment.as_ref())),
+        SetupDecision::CloseOnly => {
+            let advance = channel.try_with_store(|store| {
+                mount_close_only(store, verifier, finalized.payment.as_ref())
+            })?;
+            finish_mount(blocks, channel, advance, verifier).await
+        }
         SetupDecision::Abort(abort) => {
             channel.try_with_store(|store| {
                 store.commit(
@@ -617,6 +566,8 @@ where
 /// whether a finalized answer may be used at all and the step that uses
 /// it cannot be two borrows.
 enum Reread {
+    /// The state read is newer than the contiguous evidence for a terminal decision.
+    Behind,
     /// The query moved while its own answer was in flight. The answer is
     /// about a funding set this setup no longer asks about, so it is
     /// discarded rather than decided from.
@@ -629,7 +580,7 @@ enum Reread {
     Decided(SetupDecision),
 }
 
-async fn fetch_history_batch<C, B, V>(
+async fn scan_finalized<C, B, V>(
     blocks: &B,
     channel: &mut C,
     verifier: &V,
@@ -640,7 +591,7 @@ where
     V: SigVerifier,
 {
     let scan = channel
-        .with_store(|store| store.state().history_cursor())?
+        .with_store(|store| store.state().scan_cursor())?
         .ok_or(SetupDriveError::ScanNotArmed)?;
     let Some(tip) = blocks.latest_height().await? else {
         return Ok(None);
@@ -648,16 +599,6 @@ where
     if scan.height >= tip {
         return Ok(None);
     }
-    let (bond_edge, payment_edge, role) = channel.try_with_store(|store| {
-        Ok((
-            store.state().bond_edge(),
-            store
-                .state()
-                .payment_edge()
-                .ok_or(SetupDriveError::CloseNotArmed)?,
-            store.role(),
-        ))
-    })?;
     let through = tip.min(scan.height.saturating_add(256));
     let mut history = Vec::with_capacity((through - scan.height) as usize);
     // Fetch concurrently, but retain height order for the journal's existing
@@ -667,23 +608,14 @@ where
         .buffered(16);
     futures::pin_mut!(pending);
     while let Some(block) = pending.next().await {
-        let block = block?;
-        history.push(SetupHistoryBlock {
-            height: block.height,
-            parent: block.parent,
-            payload: block.payload,
-            txs: block
-                .txs
-                .into_iter()
-                .filter(|tx| touches_setup(tx, role, bond_edge, payment_edge))
-                .collect(),
-        });
+        history.push(block?);
     }
     channel.try_with_store(|store| {
-        store.commit(
-            SetupRecord::SetupHistoryBatch(SetupHistoryBatch { blocks: history }),
-            verifier,
-        )?;
+        let observed = store
+            .state()
+            .observe(&history)
+            .map_err(WorkStoreError::from)?;
+        store.commit(SetupRecord::Observed(observed), verifier)?;
         Ok(())
     })?;
     Ok(Some((through, tip)))
@@ -713,7 +645,7 @@ fn mount_close_only<V: SigVerifier>(
         .origin()
         .ok_or(SetupDriveError::OriginNotFound {
             floor: store.state().scan_armed().map_or(0, |scan| scan.height),
-            tip: store.state().history_cursor().map_or(0, |scan| scan.height),
+            tip: store.state().scan_cursor().map_or(0, |scan| scan.height),
             edge: payment_edge,
         })?;
     let channel = mount(store, verifier, origin, payment)?;
@@ -724,13 +656,7 @@ fn mount_close_only<V: SigVerifier>(
     })
 }
 
-/// Opens this setup's channel journal at the origin it recorded, and
-/// replays into it the finalized history the setup journal holds.
-///
-/// The one mount, for every branch that has one to make. What is decided
-/// here — the settlement, the origin block's own moves, and the rest of
-/// history — is decided once, and the caller receives the result rather
-/// than repeating it.
+/// Opens the exclusive channel journal under the synchronous setup borrow.
 fn mount<V: SigVerifier>(
     store: &SetupStore,
     verifier: &V,
@@ -755,7 +681,7 @@ fn mount<V: SigVerifier>(
         None => descriptor.expected_settlement().map_err(to_store)?,
         Some(payment) => descriptor.funded_settlement(payment).map_err(to_store)?,
     };
-    let mut channel = if matches!(
+    let channel = if matches!(
         descriptor.work_policy(),
         hellas_rpc::protocol::work_profile::WorkPolicy::Fetch { .. }
     ) {
@@ -777,41 +703,60 @@ fn mount<V: SigVerifier>(
             verifier,
         )?
     };
-    // The origin block carries the payment Open that established this
-    // channel, and the store opened with its cursor already on that block.
-    // A `StartPaymentClose` ordered after the Open in the very same block
-    // is a contest a client can raise the instant it opens, and `observe`
-    // would never see it: that block is not the cursor's next one, it is
-    // the cursor's own. So its post-Open moves are replayed directly —
-    // the Open matches no arm and is skipped, and any same-block contest
-    // is journaled exactly as a later one would be.
-    for block in store.state().history() {
-        if block.height == origin.height {
-            apply_finalized_txs(
-                &mut channel,
-                block.height,
-                block.payload,
-                &block.txs,
-                verifier,
-            )?;
-        }
-    }
-    for block in store.state().history() {
-        if block.height <= origin.height || block.height <= channel.state().cursor().0 {
-            continue;
-        }
-        observe(
-            &mut channel,
-            &FinalizedWork {
-                height: block.height,
-                parent: block.parent,
-                payload: block.payload,
-                txs: block.txs.clone(),
-            },
-            verifier,
-        )?;
-    }
     Ok(channel)
+}
+
+/// Replays outside the setup borrow. The origin marker is written after its
+/// effects; a crash replays those idempotent effects before advancing again.
+async fn finish_mount<C, B, V>(
+    blocks: &B,
+    setup: &mut C,
+    mut advance: SetupAdvance,
+    verifier: &V,
+) -> Result<SetupAdvance, SetupDriveError>
+where
+    C: SetupChannel,
+    B: FinalizedBlocks + ?Sized,
+    V: SigVerifier,
+{
+    let (origin, through) = setup.try_with_store(|store| {
+        Ok((
+            store
+                .state()
+                .origin()
+                .ok_or(SetupDriveError::CloseNotArmed)?,
+            store
+                .state()
+                .scan_cursor()
+                .ok_or(SetupDriveError::ScanNotArmed)?
+                .height,
+        ))
+    })?;
+    let channel = advance
+        .mounted
+        .as_mut()
+        .ok_or(SetupDriveError::CloseNotArmed)?;
+    if !channel.state().origin_observed() {
+        let block = history_block(blocks, origin.height).await?;
+        if block.payload != origin.payload
+            || block.parent != origin.parent
+            || !block.txs.iter().any(|tx| opens(tx, origin.payment_edge))
+        {
+            return Err(SetupDriveError::OriginNotContiguous {
+                height: origin.height,
+            });
+        }
+        apply_finalized_txs(channel, block.height, block.payload, &block.txs, verifier)?;
+        channel.commit(ChannelRecord::OriginObserved, verifier)?;
+    }
+    for height in channel.state().cursor().0.saturating_add(1)..=through {
+        let block = history_block(blocks, height).await?;
+        observe(channel, &block, verifier)?;
+    }
+    if let SetupProgress::CloseOnly { settled, .. } = &mut advance.progress {
+        *settled = channel.state().close_settled().is_some();
+    }
+    Ok(advance)
 }
 
 /// Returns what to read for this setup, once it names a payment edge.
@@ -862,51 +807,6 @@ where
         step,
         outcome,
     }))
-}
-
-/// Finds the finalized block whose accepted transactions opened
-/// `payment_edge`.
-///
-/// The match is on the edge id the kernel derives from an Open's own
-/// funding and terms, not on the retained bytes: the edge is what the
-/// snapshot established is live, and it is what the journal's completion
-/// record is keyed to.
-async fn find_origin<B>(
-    blocks: &B,
-    payment_edge: EdgeId,
-    scan: SetupScan,
-) -> Result<SetupOrigin, SetupDriveError>
-where
-    B: FinalizedBlocks + ?Sized,
-{
-    let tip = blocks.latest_height().await?.unwrap_or(0);
-    let floor = scan.height;
-    let mut expected_parent = scan.payload;
-    let pending = stream::iter(floor.saturating_add(1)..=tip)
-        .map(|height| history_block(blocks, height))
-        .buffered(16);
-    futures::pin_mut!(pending);
-    while let Some(block) = pending.next().await {
-        let block = block?;
-        let height = block.height;
-        if block.parent != expected_parent {
-            return Err(SetupDriveError::OriginNotContiguous { height });
-        }
-        if block.txs.iter().any(|tx| opens(tx, payment_edge)) {
-            return Ok(SetupOrigin {
-                payment_edge,
-                height: block.height,
-                payload: block.payload,
-                parent: block.parent,
-            });
-        }
-        expected_parent = block.payload;
-    }
-    Err(SetupDriveError::OriginNotFound {
-        floor,
-        tip,
-        edge: payment_edge,
-    })
 }
 
 /// Returns whether this transaction is the Open that produces `edge`.
