@@ -34,6 +34,7 @@ const ACL: &[u8] = &[
     0x63, 0x30, 0x05, 0xa6, 0x03, 0x02, 0x01, 0x01,
 ];
 const PRODUCTION_AAGUID: &[u8; 16] = b"appattest\0\0\0\0\0\0\0";
+const AUTH_DATA_FLAGS: u8 = 0xc0;
 const APP_ATTEST_ROOT_CA_BASE64: &str = "MIICITCCAaegAwIBAgIQC/O+DvHN0uD7jG5yH2IXmDAKBggqhkjOPQQDAzBSMSYwJAYDVQQDDB1BcHBsZSBBcHAgQXR0ZXN0YXRpb24gUm9vdCBDQTETMBEGA1UECgwKQXBwbGUgSW5jLjETMBEGA1UECAwKQ2FsaWZvcm5pYTAeFw0yMDAzMTgxODMyNTNaFw00NTAzMTUwMDAwMDBaMFIxJjAkBgNVBAMMHUFwcGxlIEFwcCBBdHRlc3RhdGlvbiBSb290IENBMRMwEQYDVQQKDApBcHBsZSBJbmMuMRMwEQYDVQQIDApDYWxpZm9ybmlhMHYwEAYHKoZIzj0CAQYFK4EEACIDYgAERTHhmLW07ATaFQIEVwTtT4dyctdhNbJhFs/Ii2FdCgAHGbpphY3+d8qjuDngIN3WVhQUBHAoMeQ/cLiP1sOUtgjqK9auYen1mMEvRq9Sk3Jm5X8U62H+xTD3FE9TgS41o0IwQDAPBgNVHRMBAf8EBTADAQH/MB0GA1UdDgQWBBSskRBTM72+aEH/pwyp5frq5eWKoTAOBgNVHQ8BAf8EBAMCAQYwCgYIKoZIzj0EAwMDaAAwZQIwQgFGnByvsiVbpTKwSga0kP0e8EeDS4+sQmTvb7vn53O5+FRXgeLhpJ06ysC5PrOyAjEAp5U4xDgEgllF7En3VcE3iexZZtKeYnpqtijVoyFraWVIyd/dganmrduC1bmTBGwD";
 
 /// Apple's pinned App Attestation Root CA in DER form.
@@ -318,7 +319,7 @@ fn attestation_auth_data(
 ) -> Result<AttestationAuth<'_>, AttestationError> {
     if data.len() < 55
         || data[..32] != rp_id_hash
-        || !valid_auth_flags(data[32])
+        || data[32] != AUTH_DATA_FLAGS
         || data[33..37] != [0; 4]
     {
         return Err(AttestationError::Credential);
@@ -343,7 +344,7 @@ fn attestation_auth_data(
 }
 
 fn assertion_auth_data(data: &[u8]) -> Result<AppleClaims, AttestationError> {
-    if data.len() < 37 || !valid_auth_flags(data[32]) {
+    if data.len() < 37 || data[32] != AUTH_DATA_FLAGS {
         return Err(AttestationError::Binding);
     }
     let cd_hash = apple_cd_hash(&data[37..], "Apple authenticator extensions")?;
@@ -351,11 +352,6 @@ fn assertion_auth_data(data: &[u8]) -> Result<AppleClaims, AttestationError> {
         cd_hash,
         counter: u32::from_be_bytes(data[33..37].try_into().unwrap()),
     })
-}
-
-fn valid_auth_flags(flags: u8) -> bool {
-    // Current macOS evidence sets the extensions bit; early seeds omitted it.
-    matches!(flags, 0x40 | 0xc0)
 }
 
 fn apple_cd_hash(bytes: &[u8], name: &'static str) -> Result<[u8; 32], AttestationError> {
