@@ -1526,3 +1526,116 @@ fn native_edge_index_cold_open_serves_current_owners_without_archive_replay() {
         assert_eq!(pinned.block().bundle().payload, latest.payload);
     });
 }
+
+#[test]
+fn indexed_owner_proof_spans_the_database_publication_boundary() {
+    run_qmdb(|runtime| async move {
+        let signer = Secp256k1Signer::from_secret_scalar([19; 32]).unwrap();
+        let owner = SettlementKey::from(signer.party_key());
+        let mut h = Harness::new(
+            runtime.child("harness"),
+            vec![(owner, 100)],
+            "owner-publication",
+        )
+        .await;
+        let (archive, handle) = crate::spawn_archive(
+            runtime.child("archive"),
+            "owner-publication-archive",
+            crate::config::Config::default(),
+            h.committee.verifier.clone(),
+            h.replay.genesis.clone(),
+        )
+        .await
+        .unwrap();
+        let publication = crate::edge_index::Publication {
+            index: h.index.clone(),
+            verifier: std::sync::Arc::new(
+                ProofVerifier::with_genesis(h.trust.clone(), &h.genesis_json).unwrap(),
+            ),
+            archive,
+        };
+        let previous = h.append(Vec::new()).await;
+        let (block, proof, _) = h.candidate(Vec::new()).await;
+        let (batch, changes) = execute_all_observed(
+            hellas_kernel::Context::with_fees(
+                h.network,
+                BlockHeight::new(proof.height),
+                hellas_kernel::BlockHash::from_bytes(h.head.digest().0),
+                domain::KERNEL_FEES,
+            ),
+            &ChainVerifier::new(),
+            block.txs(),
+            &h.allocations,
+            h.replay.database.new_batches().await,
+        )
+        .await
+        .unwrap();
+        let batch = batch.merkleize().await.unwrap();
+        assert_ne!(previous.state_root, proof.state_root);
+        assert_eq!(hex::encode(batch.root()), proof.state_root);
+        h.index.store.prepare(proof.clone(), changes).unwrap();
+        let before = publication
+            .owner_proof(&h.replay.database, owner, 0, 64, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(before.block().bundle().payload, previous.payload);
+
+        // Stop exactly after the QMDB commit, before publishing EdgeIndex.
+        h.replay.database.finalize(batch).await;
+        let during = publication
+            .owner_proof(&h.replay.database, owner, 0, 64, Some(&proof.payload))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(during.block().bundle().payload, proof.payload);
+        h.verifier
+            .verify_address(during.bundle().clone(), owner, 0, 64)
+            .unwrap();
+        assert_eq!(
+            h.index.store.latest().unwrap().unwrap().payload,
+            previous.payload
+        );
+        assert!(
+            publication
+                .owner_proof(&h.replay.database, owner, 0, 64, Some(&previous.payload))
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // A matching root alone must not turn corrupted evidence into a proof.
+        let mut corrupt = proof.clone();
+        corrupt.state_root = "ff".repeat(32);
+        h.index.store.prepare(corrupt, Vec::new()).unwrap();
+        assert!(
+            publication
+                .owner_proof(&h.replay.database, owner, 0, 64, None)
+                .await
+                .is_err()
+        );
+        let mut corrupt = proof.clone();
+        corrupt.finalization[0] ^= 1;
+        h.index.store.prepare(corrupt, Vec::new()).unwrap();
+        assert!(
+            publication
+                .owner_proof(&h.replay.database, owner, 0, 64, None)
+                .await
+                .is_err()
+        );
+        h.index.store.prepare(proof.clone(), Vec::new()).unwrap();
+        publication
+            .finalized(&block, &h.replay.database)
+            .await
+            .unwrap();
+        let after = publication
+            .owner_proof(&h.replay.database, owner, 0, 64, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.page(), during.page());
+        assert_eq!(after.block().bundle().payload, proof.payload);
+        handle.abort();
+        let _ = handle.await;
+    });
+}
