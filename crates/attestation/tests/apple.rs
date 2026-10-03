@@ -31,22 +31,56 @@ struct Fixture {
 }
 
 fn fixture() -> Fixture {
-    fn field(name: &str) -> &'static str {
-        include_str!("fixtures/real-app-attest.json")
-            .lines()
+    fixture_from_json(include_str!("fixtures/real-app-attest.json"))
+}
+
+fn fixture_from_json(json: &'static str) -> Fixture {
+    let field = |name: &str| {
+        json.lines()
             .find_map(|line| {
                 let (key, value) = line.trim().split_once(" : ")?;
                 (key.trim_matches('"') == name)
                     .then(|| value.trim_end_matches(',').trim_matches('"'))
             })
             .unwrap()
-    }
+    };
     Fixture {
         attestation_object_base64: field("attestationObjectBase64"),
         attestation_client_data_hash_hex: field("attestationClientDataHashHex"),
         assertion_object_base64: field("assertionObjectBase64"),
         assertion_client_data_hash_hex: field("assertionClientDataHashHex"),
     }
+}
+
+#[test]
+fn real_sdk27_evidence_verifies_with_the_extensions_flag() {
+    let fixture = fixture_from_json(include_str!("fixtures/real-app-attest-sdk27.json"));
+    let credential = fixture_credential(&fixture);
+    let identity = apple_credential_identity(&credential.attestation).unwrap();
+    let policy = ApplePolicy {
+        expected_rp_id_hash: apple_app_id_hash(APP_ID),
+        allowed_cd_hashes: vec![decode_hex_32(
+            "363140c091e0fa85feeeb4ce515eddcae8cf6db45b93b2ca722391a3a64c1006",
+        )],
+    };
+    let registered = register_apple(
+        &credential,
+        policy.expected_rp_id_hash,
+        apple_app_attest_root_ca(),
+        AnchorTime(1_790_996_283),
+    )
+    .unwrap();
+    assert_eq!(identity.public_key, registered.public_key);
+    assert_eq!(identity.cd_hash, policy.allowed_cd_hashes[0]);
+    let claims = verify_apple_assertion(
+        &decode_base64(fixture.assertion_object_base64),
+        &decode_hex_32(fixture.assertion_client_data_hash_hex),
+        &registered,
+        &policy,
+    )
+    .unwrap();
+    assert_eq!(claims.cd_hash, identity.cd_hash);
+    assert_eq!(claims.counter, 1);
 }
 
 fn decode_base64(value: &str) -> Vec<u8> {
@@ -282,16 +316,18 @@ fn rejects_signed_assertion_that_omits_cd_hash_evidence() {
         expected_rp_id_hash: rp_id_hash,
         allowed_cd_hashes: vec![[1; 32]],
     };
-    let mut authenticator_data = Vec::new();
-    authenticator_data.extend_from_slice(&rp_id_hash);
-    authenticator_data.push(0x40);
-    authenticator_data.extend_from_slice(&1_u32.to_be_bytes());
-    let assertion = signed_assertion(&signing_key, authenticator_data, &client_data_hash);
+    for flags in [0x40, 0xc0] {
+        let mut authenticator_data = Vec::new();
+        authenticator_data.extend_from_slice(&rp_id_hash);
+        authenticator_data.push(flags);
+        authenticator_data.extend_from_slice(&1_u32.to_be_bytes());
+        let assertion = signed_assertion(&signing_key, authenticator_data, &client_data_hash);
 
-    assert_eq!(
-        verify_apple_assertion(&assertion, &client_data_hash, &registered, &policy),
-        Err(AttestationError::AppleCdHashMissing)
-    );
+        assert_eq!(
+            verify_apple_assertion(&assertion, &client_data_hash, &registered, &policy),
+            Err(AttestationError::AppleCdHashMissing)
+        );
+    }
 }
 
 #[test]

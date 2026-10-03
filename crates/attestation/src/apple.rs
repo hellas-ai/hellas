@@ -316,7 +316,11 @@ fn attestation_auth_data(
     data: &[u8],
     rp_id_hash: [u8; 32],
 ) -> Result<AttestationAuth<'_>, AttestationError> {
-    if data.len() < 55 || data[..32] != rp_id_hash || data[32] != 0x40 || data[33..37] != [0; 4] {
+    if data.len() < 55
+        || data[..32] != rp_id_hash
+        || !valid_auth_flags(data[32])
+        || data[33..37] != [0; 4]
+    {
         return Err(AttestationError::Credential);
     }
     if data[37..53] != *PRODUCTION_AAGUID {
@@ -339,7 +343,7 @@ fn attestation_auth_data(
 }
 
 fn assertion_auth_data(data: &[u8]) -> Result<AppleClaims, AttestationError> {
-    if data.len() < 37 || data[32] != 0x40 {
+    if data.len() < 37 || !valid_auth_flags(data[32]) {
         return Err(AttestationError::Binding);
     }
     let cd_hash = apple_cd_hash(&data[37..], "Apple authenticator extensions")?;
@@ -347,6 +351,11 @@ fn assertion_auth_data(data: &[u8]) -> Result<AppleClaims, AttestationError> {
         cd_hash,
         counter: u32::from_be_bytes(data[33..37].try_into().unwrap()),
     })
+}
+
+fn valid_auth_flags(flags: u8) -> bool {
+    // Current macOS evidence sets the extensions bit; early seeds omitted it.
+    matches!(flags, 0x40 | 0xc0)
 }
 
 fn apple_cd_hash(bytes: &[u8], name: &'static str) -> Result<[u8; 32], AttestationError> {
