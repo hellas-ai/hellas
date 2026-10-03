@@ -77,14 +77,18 @@ async fn tls_fixture() -> (
 ) {
     use rcgen::*;
     let mut params = CertificateParams::default();
+    params
+        .distinguished_name
+        .push(DnType::CommonName, "Hellas test CA");
     params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
     let ca = CertifiedIssuer::self_signed(params, KeyPair::generate().unwrap()).unwrap();
     let key = KeyPair::generate().unwrap();
-    let leaf = CertificateParams::new(vec!["localhost".into()])
-        .unwrap()
-        .signed_by(&key, &ca)
-        .unwrap();
+    let mut params = CertificateParams::new(vec!["localhost".into()]).unwrap();
+    params
+        .distinguished_name
+        .push(DnType::CommonName, "localhost");
+    let leaf = params.signed_by(&key, &ca).unwrap();
     let config = rustls::ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
