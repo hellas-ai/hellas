@@ -67,6 +67,9 @@ pub(super) enum SnapshotError {
     Unavailable,
 }
 #[derive(Debug, thiserror::Error)]
+#[error("executed state matches neither the published checkpoint nor its intent")]
+pub(super) struct StateCheckpointMismatch;
+#[derive(Debug, thiserror::Error)]
 pub(super) enum ScanLimit {
     #[error("query deadline exceeded")]
     Deadline,
@@ -142,6 +145,35 @@ impl IndexStore {
         let read = self.db.begin_read()?;
         let table = read.open_table(META)?;
         table.get("intent")?.map(|v| decode(v.value())).transpose()
+    }
+    /// Select certified evidence for the QMDB read guard held by the caller.
+    /// Its commit can precede index publication, so include the prepared intent
+    /// in the same read transaction as the published checkpoint.
+    pub fn proof_for_state_root(&self, root: Digest) -> Result<Option<ProofBundle>> {
+        let read = self.db.begin_read()?;
+        let table = read.open_table(META)?;
+        let latest: Option<u64> = table
+            .get("latest")?
+            .map(|v| decode(v.value()))
+            .transpose()?;
+        let latest = latest
+            .map(|height| read_proof(&read.open_table(PROOFS)?, height))
+            .transpose()?;
+        let root = hex::encode(root);
+        if latest.as_ref().is_some_and(|p| p.state_root == root) {
+            return Ok(latest);
+        }
+        let intent: Option<Intent> = table
+            .get("intent")?
+            .map(|v| decode(v.value()))
+            .transpose()?;
+        if let Some(intent) = intent.filter(|i| i.proof.state_root == root) {
+            return Ok(Some(intent.proof));
+        }
+        if latest.is_none() {
+            return Ok(None);
+        }
+        Err(StateCheckpointMismatch.into())
     }
     pub fn prepare(
         &self,

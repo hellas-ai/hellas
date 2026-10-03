@@ -97,7 +97,7 @@ impl Publication {
         payload: Option<&str>,
     ) -> Result<Option<VerifiedAddress>> {
         let reader = database.read().await;
-        let Some(proof) = self.index.store.latest()? else {
+        let Some(proof) = self.index.store.proof_for_state_root(reader.root())? else {
             return Ok(None);
         };
         if payload.is_some_and(|p| p != proof.payload) {
@@ -112,7 +112,7 @@ impl Publication {
             || crate::execution::owner_tree::stored_root(&reader).await?
                 != verified.view().owner_root()
         {
-            return Err("index publication is catching up with executed state".into());
+            return Err("owner proof checkpoint differs from executed state".into());
         }
         let page =
             crate::execution::owner_tree::prove_stored_owner_page(&reader, owner, offset, limit)

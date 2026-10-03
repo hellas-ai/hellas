@@ -385,7 +385,8 @@ async fn address(
         {
             return failure(&headers, StatusCode::BAD_REQUEST, "invalid owner page");
         }
-        Err(_) => {
+        Err(error) => {
+            tracing::warn!(%error, "durable owner proof failed verification");
             return failure(
                 &headers,
                 StatusCode::BAD_GATEWAY,
