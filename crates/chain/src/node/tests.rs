@@ -926,17 +926,27 @@ fn full_node_and_validator_execution_roles_share_the_same_directory() {
                 let archive = archive.start_unbuffered(mailbox.clone(), (receiver, resolver));
                 let execution = execution.start();
                 let database = mailbox.subscribe_databases().await;
-                assert_eq!(
-                    pipeline::restore(
-                        &indexer,
-                        &database,
-                        &owner,
-                        startup.into_iter().chain(processed).max()
-                    )
-                    .await
-                    .unwrap(),
-                    1
-                );
+                // Database attachment precedes replay of blocks whose execution
+                // was committed before shutdown but not yet acknowledged.
+                let restored = tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        let height = pipeline::restore(
+                            &indexer,
+                            &database,
+                            &owner,
+                            startup.into_iter().chain(processed).max(),
+                        )
+                        .await
+                        .unwrap();
+                        if height > 0 {
+                            break height;
+                        }
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert_eq!(restored, 1);
                 assert_eq!(database.read().await.root(), first.snapshot.state_root);
                 let client = LocalLightClient::new(
                     database.clone(),
@@ -986,13 +996,12 @@ fn full_node_and_validator_execution_roles_share_the_same_directory() {
         .unwrap();
         let node = FullNode::start(fixture.config.clone()).await.unwrap();
         node.0.core.observe(&second).unwrap();
+        let view = tokio::time::timeout(Duration::from_secs(10), node.wait_ready())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
-            node.view()
-                .unwrap()
-                .client()
-                .get_state_root()
-                .await
-                .unwrap(),
+            view.client().get_state_root().await.unwrap(),
             Some(second.snapshot.state_root)
         );
         node.0.core.apply(fixture.next().await).await.unwrap();
