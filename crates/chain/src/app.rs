@@ -522,10 +522,11 @@ where
         );
         self.finalized_height
             .set(i64::try_from(block.height().get()).unwrap_or(i64::MAX));
+        // Readers woken by publication must see this block's owner cursor.
+        self.owner_index.publish_cursor(block);
         if let Some(publication) = &self.publication {
             publication.finalized(block, databases).await;
         }
-        self.owner_index.publish_cursor(block);
         let Some(mempool) = &self.mempool else {
             return;
         };
@@ -779,6 +780,96 @@ mod tests {
             hellas_kernel::BlockHash::from_bytes(parent.0)
         );
         assert_eq!(context.fees(), KERNEL_FEES);
+    }
+
+    #[test]
+    fn finalized_notification_observes_the_published_owner_cursor() {
+        use std::{
+            future::Future as _,
+            sync::Mutex,
+            task::{Context as TaskContext, Wake, Waker},
+        };
+
+        struct ObserveCursor {
+            owner: OwnerIndex,
+            observed: Mutex<Option<crate::owner_index::OwnerCursor>>,
+        }
+        impl Wake for ObserveCursor {
+            fn wake(self: Arc<Self>) {
+                *self.observed.lock().unwrap() = Some(self.owner.cursor());
+            }
+        }
+
+        run_qmdb(|runtime| async move {
+            let fixture = kernel_fixture(100).unwrap();
+            let mut app = Application::new(
+                runtime.child("app"),
+                crate::domain::TEST_NETWORK,
+                validator_key(0).public_key(),
+                fixture.allocations,
+                "publication_app",
+                ApplicationConfig::default(),
+            )
+            .await;
+            let database = <UtxoDatabase<_> as DatabaseSet<_>>::init(
+                runtime.child("database"),
+                utxo_db_config(&runtime, "publication_db", 1024, 8),
+            )
+            .await;
+            let genesis = app.genesis_block();
+            let (archive, task) = crate::indexer::spawn_archive(
+                runtime.child("archive"),
+                "publication_archive",
+                crate::config::Config::default(),
+                crate::execution::test_support::consensus_fixture(97521).verifier,
+                genesis.clone(),
+            )
+            .await
+            .unwrap();
+            let (progress, mut receiver) = ::tokio::sync::watch::channel(0);
+            app.publication = Some(crate::execution::pipeline::Publication {
+                archive,
+                retention: None,
+                readiness: Arc::default(),
+                progress,
+                #[cfg(feature = "indexer-api")]
+                index: None,
+            });
+            let (Proposed { block, merkleized }, _) =
+                propose_from(&mut app, &runtime, &database, &genesis, vec![], "proposal").await;
+            database.finalize(merkleized).await;
+
+            // Inspect the cursor synchronously when publication wakes a reader;
+            // checking after finalized() returns would miss the race.
+            let observer = Arc::new(ObserveCursor {
+                owner: app.owner_index(),
+                observed: Mutex::new(None),
+            });
+            let waker = Waker::from(observer.clone());
+            let mut changed = std::pin::pin!(receiver.changed());
+            assert!(
+                changed
+                    .as_mut()
+                    .poll(&mut TaskContext::from_waker(&waker))
+                    .is_pending()
+            );
+            app.finalized(
+                (runtime.child("finalized"), block.context()),
+                &block,
+                &database,
+            )
+            .await;
+            task.abort();
+            let _ = task.await;
+            assert_eq!(
+                *observer.observed.lock().unwrap(),
+                Some(crate::owner_index::OwnerCursor {
+                    height: block.height().get(),
+                    payload: block.digest(),
+                    state_root: block.state_root(),
+                }),
+            );
+        });
     }
 
     #[test]
