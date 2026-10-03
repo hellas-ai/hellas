@@ -109,7 +109,7 @@ fn apple_assertion(
 
     let mut authenticator_data = Vec::new();
     authenticator_data.extend_from_slice(&rp_id_hash);
-    authenticator_data.push(0x40);
+    authenticator_data.push(0xc0);
     authenticator_data.extend_from_slice(&counter.to_be_bytes());
     authenticator_data.extend_from_slice(&extension_bytes);
     let digest = Sha256::digest([authenticator_data.as_slice(), client_data_hash].concat());
@@ -264,12 +264,11 @@ fn apple_enrollment_is_registered_once_per_trust_anchor() {
         "../../../attestation/tests/fixtures/real-app-attest.json"
     ))
     .unwrap();
-    let artifacts = &fixture["artifacts"];
     let attestation_object = STANDARD
-        .decode(artifacts["attestationObjectBase64"].as_str().unwrap())
+        .decode(fixture["attestationObjectBase64"].as_str().unwrap())
         .unwrap();
     let client_data_hash: [u8; 32] =
-        hex::decode(artifacts["attestationClientDataHashHex"].as_str().unwrap())
+        hex::decode(fixture["attestationClientDataHashHex"].as_str().unwrap())
             .unwrap()
             .try_into()
             .unwrap();
@@ -278,7 +277,7 @@ fn apple_enrollment_is_registered_once_per_trust_anchor() {
     let enrollment = AppleAppAttestEnrollment {
         attestation_object,
         client_data_hash,
-        validation_time: 1_784_384_387,
+        validation_time: 1_790_996_283,
     };
 
     let first = apple.registered_credential(&enrollment).unwrap();
