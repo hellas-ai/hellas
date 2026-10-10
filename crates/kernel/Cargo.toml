@@ -21,7 +21,7 @@ webauthn = ["dep:p256", "dep:sha2"]
 
 [dependencies]
 hellas-xet = { workspace = true }
-k256 = { version = "0.13", default-features = false, features = [
+k256 = { version = "0.14", default-features = false, features = [
     "ecdsa",
 ], optional = true }
 p256 = { workspace = true, optional = true }
@@ -41,7 +41,7 @@ proptest-state-machine = "0.8"
 # Reference libsecp256k1 (C) kept for tests/examples only: signing with
 # the independent Bitcoin implementation and verifying with the k256
 # production path cross-validates that the two agree byte-for-byte.
-secp256k1 = { version = "0.31", features = ["alloc"] }
+secp256k1 = { version = "0.33", features = ["alloc"] }
 serde = { workspace = true }
 stateright = "0.31"
 
