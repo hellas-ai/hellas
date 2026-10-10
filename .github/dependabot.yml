@@ -1,0 +1,23 @@
+version: 2
+updates:
+  # The root workspace includes every Rust crate and shares one Cargo.lock.
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      # Dependabot's "daily" interval skips weekends.
+      interval: "cron"
+      cronjob: "0 6 * * *"
+      timezone: "Europe/Zurich"
+    groups:
+      rust-dependencies:
+        patterns:
+          - "*"
+
+  # Keep flake input updates in separate PRs. Explicit flake.nix pins stay fixed.
+  - package-ecosystem: "nix"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "sunday"
+      time: "03:00"
+      timezone: "Europe/Zurich"
