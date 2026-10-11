@@ -1,6 +1,6 @@
 use k256::ecdsa::signature::hazmat::{PrehashSigner as _, PrehashVerifier as _};
 use k256::ecdsa::{Signature as K256Signature, SigningKey};
-use p256::ecdsa::signature::hazmat::PrehashVerifier as _;
+use k256::elliptic_curve::Generate as _;
 use serde::de::Error as DeError;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
@@ -215,7 +215,7 @@ pub struct ProducerSigningKey {
 
 impl ProducerSigningKey {
     pub fn generate() -> Self {
-        let inner = SigningKey::random(&mut k256::elliptic_curve::rand_core::OsRng);
+        let inner = SigningKey::generate();
         Self { inner }
     }
 
@@ -230,7 +230,7 @@ impl ProducerSigningKey {
     }
 
     pub fn public_key(&self) -> PublicKey {
-        let point = self.inner.verifying_key().to_encoded_point(true);
+        let point = self.inner.verifying_key().to_sec1_point(true);
         PublicKey::Secp256k1(
             point
                 .as_bytes()
@@ -245,7 +245,7 @@ impl ProducerSigningKey {
 
     pub fn sign_digest(&self, digest: Digest) -> Result<Signature, SignatureError> {
         let signature: K256Signature = self.inner.sign_prehash(digest.as_bytes())?;
-        let signature = signature.normalize_s().unwrap_or(signature);
+        let signature = signature.normalize_s();
         Ok(Signature::Secp256k1(signature.to_bytes().into()))
     }
 
@@ -264,7 +264,7 @@ pub fn verify_digest_signature(
         (PublicKey::Secp256k1(key), Signature::Secp256k1(signature)) => {
             let key = k256::ecdsa::VerifyingKey::from_sec1_bytes(key)?;
             let signature = K256Signature::from_slice(signature)?;
-            if signature.normalize_s().is_some() {
+            if signature.normalize_s() != signature {
                 return Err(SignatureError::HighS);
             }
             key.verify_prehash(digest.as_bytes(), &signature)?;
@@ -334,7 +334,6 @@ impl From<k256::elliptic_curve::Error> for SignatureError {
 mod tests {
     use super::*;
     use ed25519_dalek::Signer;
-    use p256::ecdsa::signature::hazmat::PrehashSigner as _;
 
     #[test]
     fn all_schemes_verify_protocol_digest() {

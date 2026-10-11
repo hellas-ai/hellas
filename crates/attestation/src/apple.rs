@@ -132,9 +132,8 @@ pub fn register_apple(
     let leaf = verify_chain(&object.statement.certificates, root, anchor)?;
     let auth = attestation_auth_data(&object.auth_data, expected_rp_id_hash)?;
     let extensions = leaf
-        .tbs_certificate
-        .extensions
-        .as_ref()
+        .tbs_certificate()
+        .extensions()
         .ok_or(AttestationError::Credential)?;
     let extension = |oid: &str| {
         extensions
@@ -201,8 +200,8 @@ fn public_key(
     credential_id: &[u8],
 ) -> Result<[u8; 33], AttestationError> {
     let public_key = certificate
-        .tbs_certificate
-        .subject_public_key_info
+        .tbs_certificate()
+        .subject_public_key_info()
         .subject_public_key
         .as_bytes()
         .ok_or(AttestationError::Credential)?;
@@ -293,9 +292,8 @@ fn verify_chain(
     .map_err(|_| AttestationError::Credential)?;
     let leaf = Certificate::from_der(&certificates[0]).map_err(|_| AttestationError::Credential)?;
     let eku = leaf
-        .tbs_certificate
-        .extensions
-        .as_ref()
+        .tbs_certificate()
+        .extensions()
         .and_then(|extensions| {
             extensions
                 .iter()

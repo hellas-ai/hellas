@@ -743,7 +743,7 @@ fn prepared_fetch_input_mutations_reject() {
         .expect("lengths are still well formed")
         .parts()
         .expect_err("a noncanonical transcript must not parse");
-    assert!(err.to_string().contains("canonical"), "{err}");
+    assert!(err.to_string().contains("NonMinimal"), "{err}");
 
     // MUTATION: a noncanonical manifest body — trailing garbage inside
     // the second segment.

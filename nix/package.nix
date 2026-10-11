@@ -82,11 +82,13 @@ let
     NIX_SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
     buildInputs = workspaceBuildInputs;
     nativeBuildInputs = workspaceNativeBuildInputs;
-    # noq-udp 1.1.0 assumes cmsghdr has its timestamp payload's alignment.
+    # noq-udp assumes cmsghdr has its timestamp payload's alignment.
     # On musl that panics on the first received UDP packet. Keep the backport
     # limited to musl packages until the upstream fix is released.
     postPatch = lib.optionalString pkgs.stdenv.hostPlatform.isMusl ''
-      patch -d "$cargoDepsCopy/noq-udp-1.1.0" -p1 < ${./noq-udp-musl.patch}
+      for crate in "$cargoDepsCopy"/noq-udp-*; do
+        patch -d "$crate" -p1 < ${./noq-udp-musl.patch}
+      done
     '';
     # CLI unit tests do not exercise UDP receive. Run the cloud crate's real
     # iroh enrollment test wherever this builder can execute the musl target.

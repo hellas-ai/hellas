@@ -7,7 +7,7 @@ use crate::{
     ProducerSigningKey, PublicKey, Retention, StreamVerifyError, scheme_id,
     verify_input_event_envelopes, verify_output_event_envelopes,
 };
-use k256::elliptic_curve::rand_core::{OsRng, RngCore};
+use k256::elliptic_curve::Generate as _;
 
 const INPUT_CANONICALIZATION: &[u8] = b"hellas.fetch.input.v3";
 const OUTPUT_CANONICALIZATION: &[u8] = b"hellas.fetch.output.v2";
@@ -115,8 +115,7 @@ pub fn build_input_events_with_retention(
         key,
         input_canonicalization(),
     );
-    let mut nonce = [0; 32];
-    OsRng.fill_bytes(&mut nonce);
+    let nonce = <[u8; 32]>::generate();
     builder.push("assurance", vec![assurance.to_byte()])?;
     builder.push(
         "execution.environment",
@@ -873,9 +872,6 @@ mod payload_tests {
         })
         .unwrap();
         let noncanonical = overlong_tuple_header(&canonical);
-        let _: (String, FetchEventPayload) = serde_ipld_dagcbor::from_slice(&noncanonical)
-            .expect("the permissive decoder accepts the equivalent tuple header");
-
         assert!(matches!(
             decode_fetch_event_payload(&noncanonical),
             Err(FetchPayloadError::Decode(_))
@@ -890,9 +886,6 @@ mod payload_tests {
         })
         .unwrap();
         let noncanonical = overlong_tuple_header(&canonical);
-        let _: (String, FetchTerminalPayload) = serde_ipld_dagcbor::from_slice(&noncanonical)
-            .expect("the permissive decoder accepts the equivalent tuple header");
-
         assert!(matches!(
             decode_fetch_terminal_payload(&noncanonical),
             Err(FetchPayloadError::Decode(_))

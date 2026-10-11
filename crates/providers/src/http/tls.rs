@@ -64,8 +64,8 @@ impl ServerCertVerifier for PinnedVerifier {
                 rustls::Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
             })?;
             let spki = cert
-                .tbs_certificate
-                .subject_public_key_info
+                .tbs_certificate()
+                .subject_public_key_info()
                 .to_der()
                 .map_err(|_| {
                     rustls::Error::InvalidCertificate(rustls::CertificateError::BadEncoding)

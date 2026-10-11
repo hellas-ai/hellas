@@ -71,7 +71,7 @@ impl Secp256k1Signer {
     pub fn from_secret_scalar(secret_scalar: [u8; 32]) -> Result<Self, Secp256k1SignerError> {
         let signing_key = SigningKey::from_bytes(&FieldBytes::from(secret_scalar))
             .map_err(|_| Secp256k1SignerError::InvalidSecretScalar)?;
-        let encoded = signing_key.verifying_key().to_encoded_point(true);
+        let encoded = signing_key.verifying_key().to_sec1_point(true);
         let party_key = Key::from_bytes(
             encoded
                 .as_bytes()
@@ -112,7 +112,7 @@ impl Secp256k1Signer {
             .signing_key
             .sign_prehash(&hash.to_bytes())
             .expect("deterministic secp256k1 signature over a 32-byte prehash");
-        let signature = signature.normalize_s().unwrap_or(signature);
+        let signature = signature.normalize_s();
         Sig::from_bytes(signature.to_bytes().into())
     }
 }
@@ -147,7 +147,7 @@ impl SigVerifier for Secp256k1Verifier {
         };
         // Reject malleable high-`S` witnesses: only the low-`S` normal
         // form this crate signs is admissible.
-        if signature.normalize_s().is_some() {
+        if signature.normalize_s() != signature {
             return false;
         }
         pk.verify_prehash(&hash.to_bytes(), &signature).is_ok()
