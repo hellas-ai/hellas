@@ -60,7 +60,7 @@ hellas-xet = { workspace = true, features = ["chunking"] }
 # Optional transport deps
 iroh = { workspace = true, optional = true }
 iroh-mdns-address-lookup = { workspace = true, optional = true }
-mainline = { version = "7", optional = true }
+mainline = { version = "8", optional = true }
 n0-future = { version = "0.3", default-features = false, optional = true }
 
 # Xtensa (esp32-s3) lacks native 64-bit atomics; portable-atomic

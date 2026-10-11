@@ -186,7 +186,7 @@ prost = { version = "0.14", default-features = false, features = [
 ], optional = true }
 rand = { workspace = true, optional = true }
 rand_core = { workspace = true, optional = true }
-redb = { version = "3", optional = true }
+redb = { version = "4", optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
