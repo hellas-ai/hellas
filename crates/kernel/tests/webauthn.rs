@@ -173,19 +173,17 @@ fn webauthn_open_rejects_assertion_from_wrong_party_key() {
 #[test]
 fn bundled_verifier_accepts_passkey_open_and_mutual_close() {
     use hellas_kernel::{CloseKind, Proof, Secp256k1Verifier};
-    use secp256k1::{Message, Secp256k1, SecretKey};
+    use secp256k1::{Message, SecretKey, ecdsa};
 
     fn secp_keypair(seed: u8) -> (SecretKey, Key) {
-        let secp = Secp256k1::new();
-        let secret = SecretKey::from_byte_array([seed; 32]).expect("non-zero seed");
-        let public = secret.public_key(&secp);
+        let secret = SecretKey::from_secret_bytes([seed; 32]).expect("non-zero seed");
+        let public = secret.public_key();
         (secret, Key::from_bytes(public.serialize()))
     }
 
     fn secp_sign(secret: &SecretKey, hash: PayloadHash) -> Auth {
-        let secp = Secp256k1::new();
         let message = Message::from_digest(hash.to_bytes());
-        let signature = secp.sign_ecdsa(message, secret);
+        let signature = ecdsa::sign(message, secret);
         Auth::native(Sig::from_bytes(signature.serialize_compact()))
     }
 

@@ -51,8 +51,8 @@ async fn server_fixture(
     let parsed = x509_cert::Certificate::from_der(cert.as_ref()).unwrap();
     let pin = Sha256::digest(
         parsed
-            .tbs_certificate
-            .subject_public_key_info
+            .tbs_certificate()
+            .subject_public_key_info()
             .to_der()
             .unwrap(),
     )

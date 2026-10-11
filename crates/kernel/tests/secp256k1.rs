@@ -19,10 +19,10 @@ mod support;
 
 use hellas_kernel::{
     ApplyError, Auth, BlockHash, BlockHeight, CloseKind, CoinId, Context, Funding, Genesis,
-    InvalidProofReason, Key, List, MAX_EDGE_OUTPUTS, Parties, Payout, Proof, ProtocolCode,
-    Secp256k1Verifier, Sig, State, Terms, Tx,
+    InvalidProofReason, Key, List, MAX_EDGE_OUTPUTS, Parties, PayloadHash, Payout, Proof,
+    ProtocolCode, Secp256k1Signer, Secp256k1Verifier, Sig, SigVerifier, State, Terms, Tx,
 };
-use secp256k1::{Message, Secp256k1, SecretKey};
+use secp256k1::{Message, SecretKey, ecdsa};
 use support::{FixedStore, list};
 
 const TIMEOUT: BlockHeight = BlockHeight::new(2);
@@ -33,22 +33,58 @@ const CONTEXT: Context = Context::new(
 );
 
 fn keypair(seed: u8) -> (SecretKey, Key) {
-    let secp = Secp256k1::new();
-    let secret = SecretKey::from_byte_array([seed; 32]).expect("non-zero seed");
-    let public = secret.public_key(&secp);
+    let secret = SecretKey::from_secret_bytes([seed; 32]).expect("non-zero seed");
+    let public = secret.public_key();
     (secret, Key::from_bytes(public.serialize()))
 }
 
 /// Real ECDSA authorization from `secret` over `hash`.
 fn sign(secret: &SecretKey, hash: hellas_kernel::PayloadHash) -> Auth {
-    let secp = Secp256k1::new();
     let message = Message::from_digest(hash.to_bytes());
-    let signature = secp.sign_ecdsa(message, secret);
+    let signature = ecdsa::sign(message, secret);
     Auth::native(Sig::from_bytes(signature.serialize_compact()))
 }
 
 fn payouts(maker: Key, taker: Key) -> List<Payout, MAX_EDGE_OUTPUTS> {
     support::payouts(&[(maker, 7), (taker, 8)])
+}
+
+#[test]
+fn native_signer_matches_libsecp256k1() {
+    let verifier = Secp256k1Verifier::new();
+    for seed in 1..=8 {
+        let signer = Secp256k1Signer::from_secret_scalar([seed; 32]).unwrap();
+        let (secret, public) = keypair(seed);
+        let hash = PayloadHash::from_bytes([seed + 8; PayloadHash::LENGTH]);
+        let reference = ecdsa::sign(Message::from_digest(hash.to_bytes()), &secret);
+        let signature = signer.sign(hash);
+
+        assert_eq!(signer.party_key(), public);
+        assert_eq!(signature.as_bytes(), &reference.serialize_compact());
+        assert!(verifier.verify_sig(signature, public, hash));
+    }
+}
+
+#[test]
+fn high_s_counterpart_of_valid_signature_is_rejected() {
+    let (secret, public) = keypair(1);
+    let hash = PayloadHash::from_bytes([9; PayloadHash::LENGTH]);
+    let reference = ecdsa::sign(Message::from_digest(hash.to_bytes()), &secret);
+    let low = k256::ecdsa::Signature::from_slice(&reference.serialize_compact()).unwrap();
+    let high = k256::ecdsa::Signature::from_scalars(low.r().to_bytes(), (-low.s()).to_bytes())
+        .expect("negating the non-zero S scalar creates a valid signature");
+    let high_bytes: [u8; Sig::LENGTH] = high.to_bytes().into();
+
+    // The reference implementation confirms this is the high-S counterpart of
+    // the same valid signature, rather than an invalid or unrelated witness.
+    let mut normalized = secp256k1::ecdsa::Signature::from_compact(&high_bytes).unwrap();
+    normalized.normalize_s();
+    assert_eq!(normalized, reference);
+    assert_ne!(high_bytes, reference.serialize_compact());
+
+    let verifier = Secp256k1Verifier::new();
+    assert!(verifier.verify_sig(Sig::from_bytes(reference.serialize_compact()), public, hash));
+    assert!(!verifier.verify_sig(Sig::from_bytes(high_bytes), public, hash));
 }
 
 #[test]

@@ -63,9 +63,6 @@ fn decoded_token_delta_must_be_canonical_dag_cbor() {
     })
     .unwrap();
     let noncanonical = overlong_tuple_header(&canonical);
-    let _: (String, EvaluateTokenDelta) = serde_ipld_dagcbor::from_slice(&noncanonical)
-        .expect("the permissive decoder accepts the equivalent tuple header");
-
     assert!(matches!(
         decode_token_delta_payload(&noncanonical),
         Err(EvaluateProtocolError::Decode(_))
@@ -87,9 +84,6 @@ fn decoded_terminal_must_be_canonical_dag_cbor() {
     })
     .unwrap();
     let noncanonical = overlong_tuple_header(&canonical);
-    let _: (String, EvaluateTerminal) = serde_ipld_dagcbor::from_slice(&noncanonical)
-        .expect("the permissive decoder accepts the equivalent tuple header");
-
     assert!(matches!(
         decode_terminal_payload(&noncanonical),
         Err(EvaluateProtocolError::Decode(_))

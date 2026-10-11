@@ -79,12 +79,12 @@ iroh = { version = "1", default-features = false }
 iroh-mdns-address-lookup = "0.6"
 k256 = { version = "0.14", features = ["ecdsa"] }
 opentelemetry = "0.33"
-opentelemetry-otlp = { version = "0.32", default-features = false, features = [
+opentelemetry-otlp = { version = "0.33", default-features = false, features = [
     "http-proto",
     "trace",
     "metrics",
     "reqwest-blocking-client",
-    "reqwest-rustls-webpki-roots",
+    "reqwest-rustls",
 ] }
 opentelemetry_sdk = { version = "0.33", features = ["rt-tokio"] }
 p256 = { version = "0.14", default-features = false, features = ["ecdsa"] }

@@ -16,7 +16,7 @@ pub(crate) const NETWORK: NetworkId = match NetworkId::new("hellas-example-1") {
     Some(network) => network,
     None => panic!("literal is a legal network id"),
 };
-use secp256k1::{Message, Secp256k1, SecretKey};
+use secp256k1::{Message, SecretKey, ecdsa};
 
 #[derive(Debug, Default)]
 pub(crate) struct MemStore {
@@ -157,16 +157,14 @@ where
 }
 
 pub(crate) fn secp_keypair(seed: u8) -> (SecretKey, Key) {
-    let secp = Secp256k1::new();
-    let secret = SecretKey::from_byte_array([seed; 32]).expect("non-zero seed");
-    let public = secret.public_key(&secp);
+    let secret = SecretKey::from_secret_bytes([seed; 32]).expect("non-zero seed");
+    let public = secret.public_key();
     (secret, Key::from_bytes(public.serialize()))
 }
 
 pub(crate) fn secp_sign(secret: &SecretKey, hash: PayloadHash) -> Sig {
-    let secp = Secp256k1::new();
     let message = Message::from_digest(hash.to_bytes());
-    let signature = secp.sign_ecdsa(message, secret);
+    let signature = ecdsa::sign(message, secret);
     Sig::from_bytes(signature.serialize_compact())
 }
 

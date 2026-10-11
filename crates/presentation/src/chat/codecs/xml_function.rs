@@ -142,7 +142,7 @@ fn rejects_parameter(
     descendants: &str,
 ) -> bool {
     use jsonschema::error::ValidationErrorKind;
-    match &error.kind {
+    match error.kind() {
         ValidationErrorKind::AnyOf { context } | ValidationErrorKind::OneOfNotValid { context } => {
             context.iter().all(|branch| {
                 branch
@@ -151,7 +151,7 @@ fn rejects_parameter(
             })
         }
         _ => {
-            let path = error.instance_path.as_str();
+            let path = error.instance_path().as_str();
             path.is_empty() || path == pointer || path.starts_with(descendants)
         }
     }

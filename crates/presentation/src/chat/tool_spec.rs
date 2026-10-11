@@ -40,7 +40,7 @@ impl ToolDirectory {
                 validator
                     .iter_errors(args)
                     .map(|error| SchemaError {
-                        path: error.instance_path.to_string(),
+                        path: error.instance_path().to_string(),
                         message: error.to_string(),
                     })
                     .collect()
