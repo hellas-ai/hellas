@@ -90,7 +90,7 @@ let
     [sources]
     allow-git = ["https://github.com/georgewhewell/commonware-monorepo", "https://github.com/georgewhewell/catena-lang"]
   '';
-  denyCommand = "cargo deny check --config ${denyConfig}";
+  denyCommand = "cargo deny --config ${denyConfig} check";
 
   kernel = import ./kernel.nix {
     inherit
