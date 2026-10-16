@@ -1075,6 +1075,14 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
         let marshal_handle = marshal_actor.start(stateful_mailbox.clone(), buffer, resolver);
         let stateful_handle = stateful_actor.start();
 
+        // Start networking before waiting on the application databases. Marshal
+        // startup may look up a finalized-but-unstored block in the broadcast
+        // buffer, whose engine first subscribes to the peer set; state sync
+        // fetches from peers. Both are served only by a running network, so
+        // waiting first is a circular wait. Inbound consensus traffic is
+        // dropped by p2p while Simplex is not yet started.
+        let network_handle = network.start();
+
         let databases = stateful_mailbox.subscribe_databases().await;
         crate::execution::pipeline::restore(
             &chain_indexer,
@@ -1087,11 +1095,10 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
         let startup_root = databases.read().await.root();
         info!(?startup_root, "application startup barrier passed");
 
-        // Simplex can immediately ask Marshal for its proposal parent. That
-        // lookup uses the broadcast buffer, whose peer subscription is served
-        // only after the network starts below. If it overtakes Stateful's
-        // startup block lookup, startup waits in a circle. Start consensus only
-        // once the application database handoff is complete.
+        // Simplex can immediately ask Marshal for its proposal parent. If that
+        // overtakes Stateful's startup block lookup, startup waits in a circle.
+        // Start consensus only once the application database handoff is
+        // complete.
         let engine_handle = simplex_engine.start(vote, certificate, consensus_resolver);
 
         let light_client = LocalLightClient::new(
@@ -1172,9 +1179,6 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
                 })
             })
             .collect();
-
-        // Start networking only after the app + consensus engine are initialized.
-        let network_handle = network.start();
 
         let signal_waiter = wait_for_shutdown_signal()
             .map(ShutdownTrigger::Signal)
