@@ -194,6 +194,12 @@ let
       basePort = 31246;
       openFirewall = true;
     };
+    chainSync = {
+      enable = true;
+      bindAddress = "10.100.0.10";
+      basePort = 31346;
+      openFirewall = true;
+    };
   };
   loopbackValidators = evalValidators {
     nodes = 1;
@@ -231,6 +237,20 @@ let
     nodes = 1;
     seed = 7;
     lightClientRpc.openFirewall = true;
+  };
+  overflowingChainSync = evalValidators {
+    nodes = 2;
+    nodeOffset = 1;
+    seed = 7;
+    chainSync = {
+      enable = true;
+      basePort = 65535;
+    };
+  };
+  unopenedChainSync = evalValidators {
+    nodes = 1;
+    seed = 7;
+    chainSync.openFirewall = true;
   };
   validatorAssertion =
     message: evaluation:
@@ -995,6 +1015,15 @@ in
     assert
       !(validatorAssertion "requires generated validator configs" unconfiguredRuntimeRpc).assertion;
     assert !(validatorAssertion "openFirewall requires" unopenedValidatorRpc).assertion;
+    assert
+      paidWorkValidators.config.networking.firewall.interfaces.wg0.allowedUDPPorts == [
+        31348
+        31349
+        31350
+      ];
+    assert validatorsWithoutRpc.config.networking.firewall.interfaces.wg0.allowedUDPPorts == [ ];
+    assert !(validatorAssertion "chainSync port range exceeds 65535" overflowingChainSync).assertion;
+    assert !(validatorAssertion "chainSync.openFirewall requires" unopenedChainSync).assertion;
     assert lib.hasSuffix "chain validator run --config ${validatorConfig2}"
       paidWorkValidatorServices."hellas-validator-devnet-node2".serviceConfig.ExecStart;
     pkgs.runCommand "hellas-validator-module-eval" { } ''
@@ -1024,15 +1053,20 @@ in
       ${pkgs.gnugrep}/bin/grep -Fx -- '--validator=2' "$config2"
       ${pkgs.gnugrep}/bin/grep -Fx -- '--metrics-port=9092' "$config2"
       ${pkgs.gnugrep}/bin/grep -Fx -- '--light-client-bind=0.0.0.0:31248' "$config2"
+      ${pkgs.gnugrep}/bin/grep -Fx -- '--chain-sync-bind=10.100.0.10:31348' "$config2"
 
       ${pkgs.gnugrep}/bin/grep -Fx -- '--validator=3' "$config3"
       ${pkgs.gnugrep}/bin/grep -Fx -- '--light-client-bind=0.0.0.0:31249' "$config3"
+      ${pkgs.gnugrep}/bin/grep -Fx -- '--chain-sync-bind=10.100.0.10:31349' "$config3"
 
       ${pkgs.gnugrep}/bin/grep -Fx -- '--validator=4' "$config4"
       ${pkgs.gnugrep}/bin/grep -Fx -- '--light-client-bind=0.0.0.0:31250' "$config4"
+      ${pkgs.gnugrep}/bin/grep -Fx -- '--chain-sync-bind=10.100.0.10:31350' "$config4"
 
       ${pkgs.gnugrep}/bin/grep -Fx -- '--light-client-bind=127.0.0.1:31246' "$loopback_config"
       ! ${pkgs.gnugrep}/bin/grep -F -- '--light-client-bind' "$disabled_config"
+      ! ${pkgs.gnugrep}/bin/grep -F -- '--chain-sync-bind' "$disabled_config"
+      ! ${pkgs.gnugrep}/bin/grep -F -- '--chain-sync-bind' "$loopback_config"
 
       touch "$out"
     '';

@@ -285,6 +285,9 @@ pub enum ValidatorCommand {
         /// Direct light-client RPC bind address
         #[arg(long)]
         light_client_bind: Option<std::net::SocketAddr>,
+        /// ChainSync (Iroh) bind address for full nodes and indexers
+        #[arg(long)]
+        chain_sync_bind: Option<std::net::SocketAddr>,
         /// Canonical genesis JSON; validator identities must match --seed
         #[arg(long)]
         genesis: Option<PathBuf>,
@@ -811,6 +814,7 @@ async fn run_validator(command: ValidatorCommand) -> CliResult {
             relay_urls,
             metrics_port,
             light_client_bind,
+            chain_sync_bind,
             genesis,
             genesis_allocations,
         } => hellas_chain::validator::Command::Config {
@@ -822,6 +826,7 @@ async fn run_validator(command: ValidatorCommand) -> CliResult {
             relay_urls,
             metrics_port,
             light_client_bind,
+            chain_sync_bind,
             genesis,
             genesis_allocations,
         },

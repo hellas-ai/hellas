@@ -137,6 +137,7 @@ pub enum Command {
         relay_urls: Vec<String>,
         metrics_port: Option<u16>,
         light_client_bind: Option<SocketAddr>,
+        chain_sync_bind: Option<SocketAddr>,
         genesis: Option<PathBuf>,
         genesis_allocations: Vec<String>,
     },
@@ -188,6 +189,7 @@ pub fn run_command(command: Command) -> Result<(), ValidatorError> {
             relay_urls,
             metrics_port,
             light_client_bind,
+            chain_sync_bind,
             genesis,
             genesis_allocations,
         } => setup(SetupArgs {
@@ -199,6 +201,7 @@ pub fn run_command(command: Command) -> Result<(), ValidatorError> {
             relay_urls,
             metrics_port,
             light_client_bind,
+            chain_sync_bind,
             genesis,
             genesis_allocations,
         }),
@@ -216,6 +219,7 @@ struct SetupArgs {
     relay_urls: Vec<String>,
     metrics_port: Option<u16>,
     light_client_bind: Option<SocketAddr>,
+    chain_sync_bind: Option<SocketAddr>,
     genesis: Option<PathBuf>,
     genesis_allocations: Vec<String>,
 }
@@ -393,6 +397,7 @@ fn setup(args: SetupArgs) -> Result<(), ValidatorError> {
         relay_urls,
         metrics_port,
         light_client_bind,
+        chain_sync_bind,
         genesis,
         genesis_allocations,
     } = args;
@@ -502,7 +507,7 @@ fn setup(args: SetupArgs) -> Result<(), ValidatorError> {
         listen_port: start_port + validator as u16,
         metrics_port: Some(metrics_port.unwrap_or(9090 + validator as u16)),
         light_client_bind,
-        chain_sync_bind: None,
+        chain_sync_bind,
         relay_urls,
         genesis,
         peers,
