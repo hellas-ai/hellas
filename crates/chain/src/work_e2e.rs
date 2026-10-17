@@ -390,7 +390,9 @@ struct Devnet {
 
 impl Devnet {
     async fn start(runtime: commonware_runtime::tokio::Context, name: &str) -> Self {
-        let fixture = consensus_fixture_of(101, VALIDATORS);
+        // Full nodes use live peer discovery; each devnet needs its own committee
+        // so concurrent tests cannot accept one another's certified blocks.
+        let fixture = consensus_fixture_of(rand::random(), VALIDATORS);
         let document = genesis_document(&fixture);
         // The document is the network's identity, so the id everything
         // below signs under is read back out of it rather than assumed.
