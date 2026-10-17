@@ -30,13 +30,13 @@ let
 
   localPorts = validator: basePort: genList (i: basePort + validator.nodeOffset + i) validator.nodes;
 
-  lightClientBind =
-    validator: index:
+  bindFor =
+    listener: index:
     let
-      address = validator.lightClientRpc.bindAddress;
+      address = listener.bindAddress;
       host = if lib.hasInfix ":" address then "[${address}]" else address;
     in
-    "${host}:${toString (validator.lightClientRpc.basePort + index)}";
+    "${host}:${toString (listener.basePort + index)}";
 
   mkOtelEnv =
     validator:
@@ -65,7 +65,8 @@ let
           "--genesis-allocation ${escapeShellArg "${allocation.address}:${toString allocation.balance}"}"
         ) validator.genesisAllocations
       );
-      lightClientFlag = optionalString validator.lightClientRpc.enable "--light-client-bind ${escapeShellArg (lightClientBind validator index)}";
+      lightClientFlag = optionalString validator.lightClientRpc.enable "--light-client-bind ${escapeShellArg (bindFor validator.lightClientRpc index)}";
+      chainSyncFlag = optionalString validator.chainSync.enable "--chain-sync-bind ${escapeShellArg (bindFor validator.chainSync index)}";
     in
     pkgs.runCommand "hellas-validator-${toString index}.toml" { } ''
       ${cli} chain validator config \
@@ -77,6 +78,7 @@ let
         ${relayFlags} \
         --metrics-port ${toString (validator.metricsBasePort + index)} \
         ${lightClientFlag} \
+        ${chainSyncFlag} \
         ${genesisFlag} \
         ${allocationFlags} \
         > "$out"
@@ -150,6 +152,32 @@ let
               defaults off; enable it only for validators serving workers
               over the private deployment network.
             '';
+          };
+        };
+        chainSync = {
+          enable = mkEnableOption "a fixed ChainSync (Iroh) listener for every validator";
+          bindAddress = mkOption {
+            type = types.strMatching "[0-9A-Fa-f:.]+";
+            default = "127.0.0.1";
+            example = "10.100.0.10";
+            description = ''
+              Numeric IPv4 or IPv6 address, without brackets, on which each
+              validator serves ChainSync to full nodes and indexers. Peers
+              dial it as validator-public-key@address:port.
+            '';
+          };
+          basePort = mkOption {
+            type = types.port;
+            default = 31346;
+            description = ''
+              Base ChainSync UDP port. Validator index N listens on
+              basePort + N, so nodeOffset remains stable across machines.
+            '';
+          };
+          openFirewall = mkOption {
+            type = types.bool;
+            default = false;
+            description = "Open the generated ChainSync UDP ports on the wg0 firewall interface.";
           };
         };
         seed = mkOption {
@@ -294,7 +322,30 @@ in
           assertion = validator.lightClientRpc.enable || !validator.lightClientRpc.openFirewall;
           message = "services.hellas-chain-validators.${name}.lightClientRpc.openFirewall requires lightClientRpc.enable.";
         }
+        {
+          assertion = validator.runtimeConfigFiles == [ ] || !validator.chainSync.enable;
+          message = "services.hellas-chain-validators.${name}.chainSync.enable requires generated validator configs.";
+        }
+        {
+          assertion =
+            !validator.chainSync.enable
+            || validator.chainSync.basePort + validator.nodeOffset + validator.nodes - 1 <= 65535;
+          message = "services.hellas-chain-validators.${name}.chainSync port range exceeds 65535.";
+        }
+        {
+          assertion = validator.chainSync.enable || !validator.chainSync.openFirewall;
+          message = "services.hellas-chain-validators.${name}.chainSync.openFirewall requires chainSync.enable.";
+        }
       ]) enabledValidators
+    );
+
+    networking.firewall.interfaces.wg0.allowedUDPPorts = concatLists (
+      mapAttrsToList (
+        _: validator:
+        lib.optionals (validator.chainSync.enable && validator.chainSync.openFirewall) (
+          localPorts validator validator.chainSync.basePort
+        )
+      ) enabledValidators
     );
 
     networking.firewall.interfaces.wg0.allowedTCPPorts = concatLists (
