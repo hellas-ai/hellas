@@ -539,6 +539,39 @@ impl HostControlHandler for ControlSession {
             .await
             .map_err(node_error)
     }
+
+    async fn bind_provider(
+        &self,
+        request: BindProviderRequest,
+    ) -> Result<BindProviderResponse, WireStatus> {
+        use hellas_work::model::grant::records::{GrantError, MAX_PRINCIPAL_BYTES};
+        let caller = self.caller().await?;
+        if request.enrollment.len() > MAX_PRINCIPAL_BYTES {
+            return Err(invalid());
+        }
+        let provider =
+            hellas_rpc::ProviderEnrollmentBundle::from_canonical_bytes(&request.enrollment)
+                .map_err(|_| invalid())?;
+        let genesis = self
+            .node
+            .bind_provider(caller, grant_id(&request.authorization)?, provider)
+            .await
+            .map_err(|error| match error {
+                NodeStoreError::Grant(
+                    GrantError::Malformed
+                    | GrantError::UnsupportedKey
+                    | GrantError::UnsupportedRoot
+                    | GrantError::Signature,
+                ) => invalid(),
+                NodeStoreError::ProviderBound => {
+                    WireStatus::new(WireCode::FailedPrecondition, "provider already bound")
+                }
+                error => node_error(error),
+            })?;
+        Ok(BindProviderResponse {
+            provider_genesis: genesis.as_bytes().to_vec(),
+        })
+    }
 }
 
 impl ControlSession {
@@ -551,7 +584,12 @@ impl ControlSession {
             authority: status.authority.0.as_bytes().to_vec(),
             authority_revision: status.authority_revision.0,
             generation: status.generation,
-            provider_configured: status.provider_configured,
+            provider_configured: status.provider.is_some(),
+            identity: status
+                .provider
+                .as_ref()
+                .map(host::identity_status)
+                .transpose()?,
             machine: status.machine.map(capacity).transpose()?,
             ..Default::default()
         };

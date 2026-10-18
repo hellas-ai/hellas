@@ -64,6 +64,7 @@ pub(super) enum Change {
     },
     Authority(AdministrationRecord),
     Recover(hellas_auth::authority::RecoveryCommand),
+    BindProvider(super::BindRecord),
     Machine {
         limits: Vec<Limit>,
         concurrent: u16,
@@ -316,6 +317,22 @@ impl State {
                 self.last_administration = Some(record.clone());
             }
             Change::Recover(command) => self.authority.recover(command, now)?,
+            Change::BindProvider(record) => {
+                if record.caller.at() != now {
+                    return Err(NodeStoreError::Malformed);
+                }
+                if self.provider.is_some() {
+                    return Err(NodeStoreError::ProviderBound);
+                }
+                self.authority.authorize_recorded(
+                    &record.caller,
+                    record.authorization,
+                    &crate::operations::Operation::named(crate::node::HOST_PROVIDER_BIND)?
+                        .permission(self.authority.authority(), None)?,
+                )?;
+                check_grant_provider(&record.provider)?;
+                self.provider = Some(record.provider.clone());
+            }
             Change::Work(record) => {
                 if record.caller.at() != now || !record.mutation.valid_capacity() {
                     return Err(NodeStoreError::Malformed);

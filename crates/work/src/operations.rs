@@ -27,6 +27,7 @@ pub struct Operation {
 pub const OPERATIONS: &[Operation] = &[
     Operation::new(node::HOST_STATUS, Scope::Host, Mount::Host),
     Operation::new(node::HOST_PROVIDER_CONFIGURE, Scope::Host, Mount::Host),
+    Operation::new(node::HOST_PROVIDER_BIND, Scope::Host, Mount::Host),
     Operation::new(node::HOST_GATEWAY_CONFIGURE, Scope::Host, Mount::Host),
     Operation::new(node::HOST_GATEWAY_ACCESS, Scope::Host, Mount::Host),
     Operation::new(node::GATEWAY_INVOKE, Scope::Host, Mount::Host),

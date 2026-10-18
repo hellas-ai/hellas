@@ -47,6 +47,11 @@ fn scope(actor: Actor) -> GrantSpec {
                 hellas_work::node::HOST_GATEWAY_ACCESS,
                 host_resource(authority),
             ),
+            (
+                hellas_work::node::HOST_PROVIDER_BIND,
+                host_resource(authority),
+            ),
+            (hellas_work::node::GATEWAY_INVOKE, host_resource(authority)),
             (WORK_CAPACITY_CONFIGURE, machine_resource(authority)),
         ],
         (UnixMillis(1000), UnixMillis(1_000_000)),

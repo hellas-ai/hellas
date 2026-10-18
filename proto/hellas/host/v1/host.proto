@@ -15,6 +15,9 @@ service HostControl {
   rpc SetProviderState(SetProviderStateRequest) returns (HostStatus);
   rpc SetGatewayState(SetGatewayStateRequest) returns (HostStatus);
   rpc GetGatewayAccess(GetGatewayAccessRequest) returns (GatewayAccess);
+  // One-time binding of the provider enrollment for an authority bootstrapped
+  // without one. Rebinding the bound enrollment succeeds; any other is refused.
+  rpc BindProvider(BindProviderRequest) returns (BindProviderResponse);
 }
 
 message GetHostStatusRequest { bytes authorization = 1; }
@@ -44,6 +47,16 @@ message SetGatewayStateRequest {
 }
 
 message GetGatewayAccessRequest { bytes authorization = 1; }
+
+message BindProviderRequest {
+  bytes authorization = 1;
+  // Canonical ProviderEnrollmentBundle bytes.
+  bytes enrollment = 2;
+}
+message BindProviderResponse {
+  // Content ID of the bound enrollment, as pinned by requester trust policies.
+  bytes provider_genesis = 1;
+}
 
 enum RuntimeState {
   // An omitted state means stopped; preserve the host protocol's zero value.

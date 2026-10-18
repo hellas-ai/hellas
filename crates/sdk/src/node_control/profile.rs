@@ -6,7 +6,7 @@ use super::HostControl;
 use hellas_auth::authority::{AuthorityId, CredentialId, CredentialSecret, GrantId};
 use hellas_wire::ServiceMarker;
 use rustls::{ClientConfig, RootCertStore, ServerConfig, pki_types::*};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{
     io::{self, Write},
     path::{Path, PathBuf},
@@ -16,7 +16,7 @@ use zeroize::Zeroizing;
 
 const MAX_FILE: u64 = 64 * 1024;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ProfileFile {
     authority: AuthorityId,
@@ -25,7 +25,7 @@ struct ProfileFile {
     local: Option<LocalTrust>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct LocalTrust {
     certificate: PathBuf,
@@ -119,22 +119,66 @@ pub fn read_credential(path: &Path) -> io::Result<CredentialSecret> {
 /// Publish a durably issued secret once. Never overwrite another application's
 /// credential; a failed publication does not undo the committed node transition.
 pub fn save_credential(
-    mut file: tempfile::NamedTempFile,
+    file: tempfile::NamedTempFile,
     path: &Path,
     credential: &CredentialSecret,
 ) -> io::Result<()> {
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
+    let mut bytes = Zeroizing::new(Vec::with_capacity(48));
+    bytes.extend_from_slice(&credential.id().0);
+    bytes.extend_from_slice(credential.expose_secret());
+    publish_private(file, path, &bytes)
+}
+
+/// Durably publish secret-bearing bytes through a private temporary file
+/// beside `path`. An existing file is never replaced.
+pub fn publish_private(
+    mut file: tempfile::NamedTempFile,
+    path: &Path,
+    bytes: &[u8],
+) -> io::Result<()> {
     if !hellas_private::is_private(file.as_file())? {
-        return Err(invalid("credential output must be private"));
+        return Err(invalid("secret output must be private"));
     }
-    file.write_all(&credential.id().0)?;
-    file.write_all(credential.expose_secret())?;
+    file.write_all(bytes)?;
     file.as_file().sync_all()?;
     file.persist_noclobber(path).map_err(|e| e.error)?;
-    hellas_private::sync_directory(parent)
+    hellas_private::sync_directory(parent(path))
+}
+
+/// Write a remote-only profile and its credential into a new or empty private
+/// directory, returning the profile path. Nothing existing is overwritten.
+pub fn install_remote(
+    directory: &Path,
+    authority: AuthorityId,
+    authorization: GrantId,
+    credential: &CredentialSecret,
+) -> io::Result<PathBuf> {
+    hellas_private::create_dir_all_durable(directory)?;
+    if std::fs::read_dir(directory)?.next().is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "profile directory is not empty",
+        ));
+    }
+    hellas_private::restrict_directory(directory)?;
+    let temporary = || hellas_private::private_tempfile(directory, ".profile-", ".writing");
+    save_credential(temporary()?, &directory.join("credential"), credential)?;
+    let profile = serde_json::to_vec(&ProfileFile {
+        authority,
+        authorization,
+        credential: "credential".into(),
+        local: None,
+    })
+    .map_err(io::Error::other)?;
+    let path = directory.join("profile.json");
+    publish_private(temporary()?, &path, &profile)?;
+    Ok(path)
+}
+
+pub(crate) fn parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
 }
 
 fn invalid(message: &'static str) -> io::Error {
@@ -150,9 +194,29 @@ pub struct GatewayProfile {
     pub authority: AuthorityId,
     pub authorization: GrantId,
     pub credential: PathBuf,
+    /// Optional local HostControl on this writer, so credentials can be issued
+    /// and revoked while the gateway runs. Omit it to serve no administration.
+    pub control: Option<GatewayControl>,
 }
+
+/// Private socket and independently provisioned TLS identity for local control.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayControl {
+    pub socket: PathBuf,
+    pub certificate: PathBuf,
+    pub private_key: PathBuf,
+}
+
+/// HTTP admission and, when configured, the control listener sharing its writer.
+/// Shut the listener down after the gateway stops.
+pub struct GatewayHost {
+    pub access: hellas_gateway::GatewayAccess,
+    pub control: Option<hellas_wire::local::LocalControlServer>,
+}
+
 impl GatewayProfile {
-    pub async fn load(path: &Path) -> hellas_gateway::GatewayResult<hellas_gateway::GatewayAccess> {
+    pub async fn load(path: &Path) -> hellas_gateway::GatewayResult<GatewayHost> {
         let profile: Self = serde_json::from_slice(&read_private(path)?)
             .map_err(|_| invalid("invalid gateway profile"))?;
         let parent = path
@@ -172,11 +236,22 @@ impl GatewayProfile {
             store,
             Arc::new(|| hellas_auth::authority::UnixMillis::now().unwrap_or_default()),
         );
-        hellas_gateway::GatewayAccess::new(
-            node,
+        let access = hellas_gateway::GatewayAccess::new(
+            node.clone(),
             profile.authorization,
             read_credential(&parent.join(profile.credential))?,
         )
-        .await
+        .await?;
+        let control = profile
+            .control
+            .map(|control| {
+                let tls = server_identity(
+                    &parent.join(control.certificate),
+                    &parent.join(control.private_key),
+                )?;
+                super::NodeControl::new(node).bind_local(parent.join(control.socket), tls)
+            })
+            .transpose()?;
+        Ok(GatewayHost { access, control })
     }
 }

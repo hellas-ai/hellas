@@ -10,6 +10,7 @@ use hellas_work::model::{
     grant::records::{GrantError, GrantPolicy},
     profile::WorkPolicy,
 };
+use std::sync::Arc;
 
 #[derive(Debug, thiserror::Error)]
 pub enum FetchGatewayError {
@@ -96,4 +97,18 @@ pub async fn start_fetch(
     })
     .await
     .map_err(Into::into)
+}
+
+impl FetchGatewayOptions {
+    /// The host supplies the access it validated; `self.access` is replaced.
+    pub fn into_factory(self, key: iroh::SecretKey) -> crate::node_control::host::GatewayFactory {
+        Arc::new(move |access| {
+            let (mut options, key) = (self.clone(), key.clone());
+            options.access = access;
+            Box::pin(async move {
+                let transport = GrantTransport::remote(key).await?;
+                Ok(start_fetch(options, transport).await?)
+            })
+        })
+    }
 }

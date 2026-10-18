@@ -55,6 +55,12 @@ pub enum AdminCommand {
         #[arg(long)]
         limits: PathBuf,
     },
+    /// Bind the provider enrollment of an authority bootstrapped without one.
+    BindProvider {
+        /// Canonical provider enrollment bytes.
+        #[arg(long)]
+        enrollment: PathBuf,
+    },
     /// Apply a typed JSON authority GrantCommand, including its explicit authorization.
     Grant { command: PathBuf },
     /// Issue an application credential, bounded by a JSON GrantSpec.
@@ -78,6 +84,24 @@ pub enum AdminCommand {
         /// Export one selected offer in the format accepted by `offer import`.
         #[arg(long)]
         offer_out: Option<PathBuf>,
+    },
+    /// Export one allowance's offer with a new contact credential as an access bundle.
+    ExportBundle {
+        /// Allowance whose offer the contact imports.
+        #[arg(long)]
+        allowance: String,
+        /// The contact's Auth grant for work.execute on that allowance.
+        #[arg(long)]
+        grant_id: String,
+        /// JSON GrantSpec bounding the contact's credential.
+        #[arg(long)]
+        credential_scope: PathBuf,
+        /// Provider display name shown to the contact.
+        #[arg(long)]
+        label: Option<String>,
+        /// New private output file; the secret is never printed.
+        #[arg(long)]
+        out: PathBuf,
     },
     /// Initialize an empty node store and issue the first application credential.
     Bootstrap {

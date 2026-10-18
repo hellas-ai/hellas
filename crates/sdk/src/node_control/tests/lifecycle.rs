@@ -16,7 +16,9 @@ struct Harness {
 }
 impl Harness {
     async fn new() -> Self {
-        let f = fixture().await;
+        Self::with(fixture().await).await
+    }
+    async fn with(f: Fixture) -> Self {
         let (tls, client_tls) = tls_configs();
         let socket = f.directory.path().join("host.sock");
         let forbidden_journal = f.directory.path().join("unused-provider-directory");
@@ -74,7 +76,6 @@ impl Harness {
             })
         };
         let host = HostHandle::start(HostOptions {
-            identity: Some(enrollment),
             control: Some((
                 f.node.clone(),
                 crate::ProviderControl {
@@ -163,6 +164,102 @@ fn access_request() -> GetGatewayAccessRequest {
     GetGatewayAccessRequest {
         authorization: ROOT_GRANT.0.to_vec(),
     }
+}
+
+async fn unbound_fixture() -> Fixture {
+    let directory = tempfile::tempdir().unwrap();
+    let (store, secret) = NodeStore::bootstrap(
+        directory.path(),
+        hellas_work::test_support::network(),
+        ROOT_GRANT,
+        scope(ROOT),
+        scope(ROOT),
+        None,
+        UnixMillis(1000),
+    )
+    .await
+    .unwrap();
+    let node = NodeCoordinator::new(store, Arc::new(|| UnixMillis(1000)));
+    Fixture {
+        service: NodeControl::new(node.clone()),
+        directory,
+        node,
+        secret,
+    }
+}
+fn bind_request(enrollment: Vec<u8>) -> BindProviderRequest {
+    BindProviderRequest {
+        authorization: ROOT_GRANT.0.to_vec(),
+        enrollment,
+    }
+}
+
+#[tokio::test]
+async fn an_unbound_host_serves_control_and_starts_its_provider_once_bound() {
+    let h = Harness::with(unbound_fixture().await).await;
+    let owner = h.owner().await;
+    let status = h.status().await;
+    assert!(!status.provider_configured && status.identity.is_none());
+    let provider = status.provider.unwrap();
+    assert_eq!(provider.state, RuntimeState::Stopped as i32);
+    assert_eq!(provider.detail, "provider is not bound");
+    let refused = owner
+        .set_provider_state(provider_state(true))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        (refused.code(), refused.message()),
+        (WireCode::FailedPrecondition, "provider is not bound")
+    );
+    let enrollment = crate::test_support::provider_enrollment();
+    let gateway = h
+        .connect(&h.credential(hellas_work::node::GATEWAY_INVOKE).await)
+        .await;
+    assert_eq!(
+        gateway
+            .bind_provider(bind_request(enrollment.canonical_bytes()))
+            .await
+            .unwrap_err()
+            .code(),
+        WireCode::PermissionDenied
+    );
+    let mut forged = enrollment.clone();
+    forged.genesis.statement.installation_nonce = [9; 32];
+    assert_eq!(
+        owner
+            .bind_provider(bind_request(forged.canonical_bytes()))
+            .await
+            .unwrap_err()
+            .code(),
+        WireCode::InvalidArgument
+    );
+    let bound = owner
+        .bind_provider(bind_request(enrollment.canonical_bytes()))
+        .await
+        .unwrap();
+    assert_eq!(bound.provider_genesis, enrollment.content_id().as_bytes());
+    let other = hellas_work::test_support::software_enrollment(3, [3; 32]);
+    let refused = owner
+        .bind_provider(bind_request(other.canonical_bytes()))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        (refused.code(), refused.message()),
+        (WireCode::FailedPrecondition, "provider already bound")
+    );
+    let status = h.status().await;
+    assert!(status.provider_configured);
+    assert_eq!(
+        status.identity.unwrap().attestation,
+        AttestationState::Software as i32
+    );
+    h.release.add_permits(1);
+    let status = within(owner.set_provider_state(provider_state(true)))
+        .await
+        .unwrap();
+    assert_eq!(status.provider.unwrap().state, RuntimeState::Running as i32);
+    drop(owner);
+    h.host.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -411,21 +508,41 @@ async fn gateway_host(
     world: &crate::test_support::Host,
 ) -> (HostHandle, Client, Client, crate::test_support::RemoteHost) {
     let remote = world.remote().await;
-    let (tls, client_tls) = tls_configs();
-    let socket = world.root.path().join("gateway.sock");
     let options = world.responses_options(remote.addresses()).await;
+    let (host, client, observer) = controlled_host(
+        world.world.service.node(),
+        world.world.secret(ROOT),
+        world.root.path(),
+        None,
+        Some((
+            options.access.clone(),
+            options.into_factory(SecretKey::from_bytes(&[3; 32])),
+        )),
+    )
+    .await;
+    (host, client, observer, remote)
+}
+
+async fn controlled_host(
+    node: NodeCoordinator,
+    secret: &CredentialSecret,
+    directory: &std::path::Path,
+    provider: Option<host::ProviderFactory>,
+    gateway: Option<(hellas_gateway::GatewayAccess, host::GatewayFactory)>,
+) -> (HostHandle, Client, Client) {
+    let (tls, client_tls) = tls_configs();
+    let socket = directory.join("control.sock");
     let host = HostHandle::start(HostOptions {
-        identity: Some(crate::test_support::provider_enrollment()),
         control: Some((
-            world.world.service.node(),
+            node,
             crate::ProviderControl {
                 socket: socket.clone(),
                 tls,
                 remote: RemoteControlAdmission::default(),
             },
         )),
-        provider: None,
-        gateway: Some((options, SecretKey::from_bytes(&[3; 32]))),
+        provider,
+        gateway,
     })
     .await
     .unwrap();
@@ -435,7 +552,7 @@ async fn gateway_host(
             client_tls.clone(),
             "localhost".try_into().unwrap(),
             authority(),
-            world.world.secret(ROOT),
+            secret,
             &ROOT.key(),
         )
         .await
@@ -447,13 +564,91 @@ async fn gateway_host(
             client_tls,
             "localhost".try_into().unwrap(),
             authority(),
-            world.world.secret(ROOT),
+            secret,
             &ROOT.key(),
         )
         .await
         .unwrap(),
     );
-    (host, client, observer, remote)
+    (host, client, observer)
+}
+
+#[tokio::test]
+async fn set_gateway_state_starts_the_gateway_chosen_at_run_time() {
+    let world = crate::test_support::Host::builder().build().await;
+    let remote = world.remote().await;
+    let options = world.responses_options(remote.addresses()).await;
+    let access = options.access.clone();
+    let chosen = options.into_factory(SecretKey::from_bytes(&[3; 32]));
+    let starts = Arc::new(AtomicUsize::new(0));
+    let factory: host::GatewayFactory = {
+        let (node, starts) = (world.world.service.node(), starts.clone());
+        Arc::new(move |access: hellas_gateway::GatewayAccess| {
+            assert!(access.shares_writer(&node));
+            starts.fetch_add(1, Ordering::SeqCst);
+            chosen(access)
+        })
+    };
+    let (host, client, _observer) = controlled_host(
+        world.world.service.node(),
+        world.world.secret(ROOT),
+        world.root.path(),
+        None,
+        Some((access, factory)),
+    )
+    .await;
+    assert_eq!(starts.load(Ordering::SeqCst), 0);
+    let status = client.set_gateway_state(gateway_state(true)).await.unwrap();
+    assert_eq!(status.gateway.unwrap().state, RuntimeState::Running as i32);
+    assert_eq!(starts.load(Ordering::SeqCst), 1);
+    client.get_gateway_access(access_request()).await.unwrap();
+    host.shutdown().await.unwrap();
+    remote.shutdown().await;
+}
+
+#[tokio::test]
+async fn failed_provider_start_reports_its_error() {
+    let f = fixture().await;
+    let factory: host::ProviderFactory = Arc::new(|_| {
+        Box::pin(async {
+            let panicked = tokio::spawn(async { panic!("model weights are missing") })
+                .await
+                .unwrap_err();
+            Err(crate::ProviderError::from(panicked).into())
+        })
+    });
+    let (host, client, _observer) = controlled_host(
+        f.node.clone(),
+        &f.secret,
+        f.directory.path(),
+        Some(factory),
+        None,
+    )
+    .await;
+    assert_eq!(
+        client
+            .set_provider_state(provider_state(true))
+            .await
+            .unwrap_err()
+            .code(),
+        WireCode::Unavailable
+    );
+    let provider = client
+        .get_host_status(read_request(ROOT_GRANT))
+        .await
+        .unwrap()
+        .provider
+        .unwrap();
+    assert_eq!(provider.state, RuntimeState::Failed as i32);
+    assert!(
+        provider.detail.starts_with("provider task failed: task ")
+            && provider
+                .detail
+                .ends_with("panicked with message \"model weights are missing\""),
+        "{}",
+        provider.detail
+    );
+    host.shutdown().await.unwrap();
 }
 
 #[tokio::test]

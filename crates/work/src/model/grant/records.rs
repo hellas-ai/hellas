@@ -79,6 +79,37 @@ pub fn verify_contact(provider: &ProviderEnrollmentBundle) -> Result<(), GrantEr
     )
     .map_err(|_| GrantError::Signature)
 }
+/// A node binding its own provider has no independent pins, so an App Attest
+/// credential is registered against its own RP-ID hash and CDHash at the
+/// enrollment's validation time. Requesters still pin both before trusting it.
+pub fn verify_provider(provider: &ProviderEnrollmentBundle) -> Result<(), GrantError> {
+    use hellas_attestation::{AnchorTime, AppleCredential, ApplePolicy};
+    let PlatformEnrollment::AppleAppAttest(enrollment) = &provider.platform else {
+        return verify_contact(provider);
+    };
+    check_grant_provider(provider)?;
+    let identity = hellas_attestation::apple_credential_identity(&enrollment.attestation_object)
+        .map_err(|_| GrantError::Signature)?;
+    let credential = hellas_attestation::register_apple(
+        &AppleCredential {
+            attestation: enrollment.attestation_object.clone(),
+            client_data_hash: enrollment.client_data_hash,
+        },
+        identity.rp_id_hash,
+        hellas_attestation::apple_app_attest_root_ca(),
+        AnchorTime(enrollment.validation_time),
+    )
+    .map_err(|_| GrantError::Signature)?;
+    hellas_attestation::verify_apple_provider_genesis(
+        &provider.genesis,
+        &credential,
+        &ApplePolicy {
+            expected_rp_id_hash: identity.rp_id_hash,
+            allowed_cd_hashes: vec![identity.cd_hash],
+        },
+    )
+    .map_err(|_| GrantError::Signature)
+}
 pub fn principal_id(provider: &ProviderEnrollmentBundle) -> Result<PrincipalId, GrantError> {
     PrincipalId::from_public_key(provider.genesis.statement.producer_public_key)
         .map_err(|_| GrantError::UnsupportedKey)

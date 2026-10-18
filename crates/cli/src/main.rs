@@ -1062,7 +1062,7 @@ async fn async_main() {
                     anyhow::ensure!(paid_work_config.is_none() && loaded_environment.is_none(), "Responses grants require their own Fetch gateway");
                     anyhow::ensure!(output_cache == hellas_rpc::cache::CachePolicy::Off, "Responses grants require --output-cache off");
                     anyhow::ensure!(metrics_port.is_none(), "Responses Fetch does not support --metrics-port");
-                    let access = hellas_sdk::node_control::profile::GatewayProfile::load(
+                    let hellas_sdk::node_control::profile::GatewayHost { access, control } = hellas_sdk::node_control::profile::GatewayProfile::load(
                         gateway_profile.as_deref().ok_or_else(|| anyhow::anyhow!("--gateway-profile is required to serve HTTP"))?
                     ).await?;
                     let (session, transport) = grant_source.ok_or_else(|| anyhow::anyhow!("Responses grants require a transport"))?;
@@ -1077,7 +1077,11 @@ async fn async_main() {
                             request_overrides: responses_fetch_request_overrides.unwrap_or_default(),
                         }, transport
                     ).await?;
-                    return hellas_gateway::wait_for_shutdown(gateway).await.map_err(anyhow::Error::from);
+                    let result = hellas_gateway::wait_for_shutdown(gateway).await.map_err(anyhow::Error::from);
+                    return match control {
+                        Some(control) => result.and(control.shutdown().await.map_err(anyhow::Error::from)),
+                        None => result,
+                    };
                 }
                 let mut chain_shutdown = None;
                 let paid_work = if let Some(path) = paid_work_config.as_ref()
@@ -1128,9 +1132,10 @@ async fn async_main() {
                 } else if loaded_environment.is_none() {
                     grant_gateway.as_ref().map(|gateway| gateway.http_config()).transpose()?
                 } else { None };
-                let gateway_access = hellas_sdk::node_control::profile::GatewayProfile::load(
+                let hellas_sdk::node_control::profile::GatewayHost { access: gateway_access, control } = hellas_sdk::node_control::profile::GatewayProfile::load(
                     gateway_profile.as_deref().ok_or_else(|| anyhow::anyhow!("--gateway-profile is required to serve HTTP"))?
                 ).await?;
+                let served = async {
                 if let Some(config) = http_config {
                     anyhow::ensure!(output_cache == hellas_rpc::cache::CachePolicy::Off,
                         "HTTP routes archive exchanges; inference replay must be off");
@@ -1175,6 +1180,11 @@ async fn async_main() {
                     wrap_args,
                 })
                 .await.map_err(anyhow::Error::from)
+                }.await;
+                match control {
+                    Some(control) => served.and(control.shutdown().await.map_err(anyhow::Error::from)),
+                    None => served,
+                }
                 }.await;
                 let mut result = result;
                 if let Some(backend) = shutdown {

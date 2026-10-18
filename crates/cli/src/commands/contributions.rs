@@ -35,6 +35,14 @@ pub enum OfferCommand {
         #[arg(long)]
         replace: bool,
     },
+    /// Import an access bundle: save its offer and install its Work profile.
+    ImportBundle {
+        file: PathBuf,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        replace: bool,
+    },
 }
 pub fn principal(identity: &crate::identity::LocalIdentity) -> CliResult<PrincipalId> {
     Ok(PrincipalId::from_public_key(
@@ -117,6 +125,7 @@ pub fn contact(
 }
 pub fn offer(command: OfferCommand, identity: &crate::identity::LocalIdentity) -> CliResult<()> {
     let identity = principal(identity)?;
+    let root = data_root(&identity)?;
     match command {
         OfferCommand::Import {
             file,
@@ -125,33 +134,56 @@ pub fn offer(command: OfferCommand, identity: &crate::identity::LocalIdentity) -
         } => {
             let bytes = read_bounded_regular_file(&file, "offer", MAX_OFFER_BYTES)?;
             let imported = SignedOffer::decode(&bytes, UnixMillis(0))?;
-            let path = alias(&data_root(&identity)?, "offers", &name)?;
-            if path.exists() && !replace {
-                let previous = SignedOffer::decode(
-                    &read_bounded_regular_file(&path, "offer", MAX_OFFER_BYTES)?,
-                    UnixMillis(0),
-                )?;
-                let new = imported.offer();
-                let old = previous.offer();
-                ensure!(
-                    new.provider == old.provider
-                        && new.grant.id == old.grant.id
-                        && new.network == old.network,
-                    "offer alias already names another grant; use --replace explicitly"
-                );
-                ensure!(
-                    new.grant.revision >= old.grant.revision
-                        && new.generation >= old.generation
-                        && new.sequence >= old.sequence
-                        && new.valid_until >= old.valid_until,
-                    "offer import would roll back saved standing"
-                );
-            }
+            let path = alias(&root, "offers", &name)?;
+            check_offer_alias(&path, &imported, replace)?;
             save(&path, &bytes)?;
             println!("{}", hex::encode(imported.offer().grant.id.0));
             offer_fingerprints(&imported)?;
         }
+        OfferCommand::ImportBundle {
+            file,
+            name,
+            replace,
+        } => {
+            let bundle = hellas_sdk::access_bundle::AccessBundle::load(&file, &identity)?;
+            let path = alias(&root, "offers", &name)?;
+            check_offer_alias(&path, &bundle.offer, replace)?;
+            let profile = bundle.install_profile(&alias(&root, "accesses", &name)?)?;
+            save(&path, &bundle.offer.encode()?)?;
+            println!(
+                "{}",
+                serde_json::json!({
+                    "grant": hex::encode(bundle.offer.offer().grant.id.0),
+                    "work_profile": profile,
+                })
+            );
+            offer_fingerprints(&bundle.offer)?;
+        }
     }
+    Ok(())
+}
+
+fn check_offer_alias(path: &Path, imported: &SignedOffer, replace: bool) -> CliResult<()> {
+    if !path.exists() || replace {
+        return Ok(());
+    }
+    let previous = SignedOffer::decode(
+        &read_bounded_regular_file(path, "offer", MAX_OFFER_BYTES)?,
+        UnixMillis(0),
+    )?;
+    let new = imported.offer();
+    let old = previous.offer();
+    ensure!(
+        new.provider == old.provider && new.grant.id == old.grant.id && new.network == old.network,
+        "offer alias already names another grant; use --replace explicitly"
+    );
+    ensure!(
+        new.grant.revision >= old.grant.revision
+            && new.generation >= old.generation
+            && new.sequence >= old.sequence
+            && new.valid_until >= old.valid_until,
+        "offer import would roll back saved standing"
+    );
     Ok(())
 }
 

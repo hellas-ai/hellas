@@ -62,7 +62,8 @@ impl From<&NodeStoreError> for WorkRefused {
             },
             NodeStoreError::AlreadyInitialized
             | NodeStoreError::MissingProvider
-            | NodeStoreError::MissingMachine => C::Malformed,
+            | NodeStoreError::MissingMachine
+            | NodeStoreError::ProviderBound => C::Malformed,
             NodeStoreError::Grant(error) => match error {
                 GrantError::Unauthorized | GrantError::Signature | GrantError::Audience => {
                     C::Unauthorized

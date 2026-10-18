@@ -8,6 +8,7 @@ use std::num::NonZeroU16;
 
 pub const HOST_STATUS: &str = "host.status";
 pub const HOST_PROVIDER_CONFIGURE: &str = "host.provider.configure";
+pub const HOST_PROVIDER_BIND: &str = "host.provider.bind";
 pub const HOST_GATEWAY_CONFIGURE: &str = "host.gateway.configure";
 pub const HOST_GATEWAY_ACCESS: &str = "host.gateway.access";
 pub const GATEWAY_INVOKE: &str = "gateway.invoke";
@@ -41,7 +42,8 @@ pub struct NodeStatus {
     pub authority: AuthorityId,
     pub authority_revision: Revision,
     pub generation: u64,
-    pub provider_configured: bool,
+    /// The current binding; None until a provider is bootstrapped or bound.
+    pub provider: Option<hellas_rpc::ProviderEnrollmentBundle>,
     pub machine: Option<MachineCapacity>,
 }
 
@@ -72,6 +74,39 @@ impl NodeCoordinator {
             }
             Ok(())
         })
+        .await
+    }
+
+    /// Bind the provider of an authority bootstrapped without one. The root proof
+    /// is verified offline; an identical retry succeeds without a new record.
+    pub async fn bind_provider(
+        &self,
+        caller: &AuthenticatedCaller,
+        authorization: GrantId,
+        provider: hellas_rpc::ProviderEnrollmentBundle,
+    ) -> Result<hellas_rpc::ContentId, NodeStoreError> {
+        let _changed = ChangeNotification(self.changed.clone());
+        self.checked(
+            caller,
+            authorization,
+            HOST_PROVIDER_BIND,
+            async |store, now| {
+                let authority = store.state().authority();
+                authority.authorize_caller(
+                    caller,
+                    authorization,
+                    &Operation::named(HOST_PROVIDER_BIND)?
+                        .permission(authority.authority(), None)?,
+                    now,
+                )?;
+                crate::model::grant::records::verify_provider(&provider)?;
+                let genesis = provider.content_id();
+                store
+                    .bind_provider(caller, authorization, provider, now)
+                    .await?;
+                Ok(genesis)
+            },
+        )
         .await
     }
 
@@ -112,7 +147,7 @@ impl NodeCoordinator {
                 authority: authority.authority(),
                 authority_revision: authority.revision(),
                 generation: authority.generation(),
-                provider_configured: state.provider().is_ok(),
+                provider: state.provider().ok().cloned(),
                 machine: state.machine_capacity()?,
             }))
         })

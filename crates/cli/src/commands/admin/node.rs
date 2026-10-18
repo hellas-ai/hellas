@@ -5,18 +5,19 @@ use crate::{
 };
 use anyhow::{Context, Result, ensure};
 use hellas_auth::authority::{
-    AdministrationCommand, AdministrationRecord, CredentialCommand, CredentialId, GrantCommand,
-    GrantId, GrantSpec, Revision,
+    AdministrationCommand, AdministrationRecord, CredentialCommand, CredentialId, CredentialSecret,
+    GrantCommand, GrantId, GrantSpec, Revision,
 };
 use hellas_rpc::{
     pb::host::{
-        GetHostStatusRequest, GrantControlRequest, IssueCredentialRequest, RevokeCredentialRequest,
-        SetMachineCapacityRequest, WorkControlRequest,
+        BindProviderRequest, GetHostStatusRequest, GrantControlRequest, IssueCredentialRequest,
+        RevokeCredentialRequest, SetMachineCapacityRequest, WorkControlRequest,
     },
     protocol::value::{canonical_dag_cbor, decode_dag_cbor},
     services::host_control::HostControlClientImpl,
 };
 use hellas_sdk::{
+    access_bundle::{AccessBundle, MAX_LABEL_BYTES},
     node_control::{self, profile},
     work::work_store::grant::NodeStore,
 };
@@ -155,6 +156,21 @@ where
                 serde_json::json!({"revision": result.revision, "max_in_flight": result.max_in_flight})
             );
         }
+        AdminCommand::BindProvider { enrollment } => {
+            let response = client
+                .bind_provider(BindProviderRequest {
+                    authorization: authorization.0.to_vec(),
+                    enrollment: hellas_private::read_bounded_regular_file(
+                        &enrollment,
+                        hellas_work::model::grant::records::MAX_PRINCIPAL_BYTES,
+                    )?,
+                })
+                .await?;
+            println!(
+                "{}",
+                serde_json::json!({"provider_genesis": hex::encode(response.provider_genesis)})
+            );
+        }
         AdminCommand::Grant { command } => {
             let value: GrantCommand = read(&command)?;
             let response = client
@@ -171,33 +187,7 @@ where
         } => {
             let scope: GrantSpec = read(&scope)?;
             let output = credential_output(&credential_out)?;
-            let response = client
-                .issue_credential(IssueCredentialRequest {
-                    authorization: authorization.0.to_vec(),
-                    scope: canonical_dag_cbor(&scope)?,
-                })
-                .await?;
-            ensure!(
-                response.record.len() <= MAX_ADMIN_BYTES,
-                "credential reply exceeds limit"
-            );
-            let record: AdministrationRecord = decode_dag_cbor(&response.record)?;
-            let secret = response.credential()?;
-            let AdministrationCommand::Credential(CredentialCommand::Issue {
-                authorization: returned_authorization,
-                credential,
-            }) = record.command()
-            else {
-                anyhow::bail!("invalid credential issuance reply");
-            };
-            ensure!(
-                *returned_authorization == authorization
-                    && credential.id() == secret.id()
-                    && credential.scope() == &scope
-                    && credential.revision() == Revision(1)
-                    && !credential.revoked(),
-                "credential issuance reply differs from request"
-            );
+            let secret = issue(&client, authorization, &scope).await?;
             let id = hex::encode(secret.id().0);
             profile::save_credential(output, &credential_out, &secret).with_context(|| {
                 format!(
@@ -207,8 +197,66 @@ where
             println!(
                 "{}",
                 serde_json::json!({
-                    "credential_id": id, "revision": credential.revision().0,
+                    "credential_id": id, "revision": 1,
                     "credential_file": credential_out,
+                    "subject": hex::encode(scope.subject.as_bytes()),
+                    "subject_fingerprint": scope.subject.fingerprint(),
+                    "authority": hex::encode(scope.authority.0.as_bytes()),
+                })
+            );
+        }
+        AdminCommand::ExportBundle {
+            allowance,
+            grant_id,
+            credential_scope,
+            label,
+            out,
+        } => {
+            ensure!(!out.try_exists()?, "bundle output already exists");
+            ensure!(
+                label
+                    .as_ref()
+                    .is_none_or(|label| label.len() <= MAX_LABEL_BYTES),
+                "label exceeds {MAX_LABEL_BYTES} bytes"
+            );
+            let allowance: GrantId = allowance
+                .parse()
+                .context("allowance must be 16 bytes of hex")?;
+            let grant: GrantId = grant_id
+                .parse()
+                .context("grant ID must be 16 bytes of hex")?;
+            let scope: GrantSpec = read(&credential_scope)?;
+            let offers = WorkControlCommand::Offers {
+                id: Some(allowance),
+            };
+            let WorkControlReply::Offers(offers) = work(&client, authorization, &offers).await?
+            else {
+                anyhow::bail!("offer reply required")
+            };
+            let Ok([offer]) = <[_; 1]>::try_from(offers) else {
+                anyhow::bail!("one active offer required")
+            };
+            let credential = issue(&client, authorization, &scope).await?;
+            let id = hex::encode(credential.id().0);
+            let bundle = AccessBundle {
+                offer,
+                authority: scope.authority,
+                authorization: grant,
+                subject: scope.subject,
+                credential,
+                expires: scope.expires,
+                label,
+            };
+            bundle.save(&out).with_context(|| {
+                format!(
+                    "credential {id} was issued but the bundle could not be saved; revoke it before retrying"
+                )
+            })?;
+            offer_fingerprints(&bundle.offer)?;
+            println!(
+                "{}",
+                serde_json::json!({
+                    "credential_id": id, "revision": 1, "bundle_file": out,
                     "subject": hex::encode(scope.subject.as_bytes()),
                     "subject_fingerprint": scope.subject.fingerprint(),
                     "authority": hex::encode(scope.authority.0.as_bytes()),
@@ -242,17 +290,7 @@ where
                 offer_out.is_none() || matches!(value, WorkControlCommand::Offers { id: Some(_) }),
                 "--offer-out requires Offers with one explicit allowance ID"
             );
-            let response = client
-                .work_control(WorkControlRequest {
-                    authorization: authorization.0.to_vec(),
-                    command: canonical_dag_cbor(&value)?,
-                })
-                .await?;
-            ensure!(
-                response.reply.len() <= MAX_ADMIN_BYTES,
-                "Work reply exceeds limit"
-            );
-            let reply: WorkControlReply = decode_dag_cbor(&response.reply)?;
+            let reply = work(&client, authorization, &value).await?;
             if let Some(path) = offer_out {
                 let WorkControlReply::Offers(offers) = &reply else {
                     anyhow::bail!("offer reply required")
@@ -268,6 +306,68 @@ where
         _ => anyhow::bail!("this command requires its offline or management entrypoint"),
     }
     Ok(())
+}
+
+/// Issue a credential and check the durable record matches the request.
+async fn issue<T>(
+    client: &HostControlClientImpl<T>,
+    authorization: GrantId,
+    scope: &GrantSpec,
+) -> Result<CredentialSecret>
+where
+    T: StreamTransport + Send + Sync,
+    T::Stream: Send + 'static,
+{
+    let response = client
+        .issue_credential(IssueCredentialRequest {
+            authorization: authorization.0.to_vec(),
+            scope: canonical_dag_cbor(scope)?,
+        })
+        .await?;
+    ensure!(
+        response.record.len() <= MAX_ADMIN_BYTES,
+        "credential reply exceeds limit"
+    );
+    let record: AdministrationRecord = decode_dag_cbor(&response.record)?;
+    let secret = response.credential()?;
+    let AdministrationCommand::Credential(CredentialCommand::Issue {
+        authorization: returned_authorization,
+        credential,
+    }) = record.command()
+    else {
+        anyhow::bail!("invalid credential issuance reply");
+    };
+    ensure!(
+        *returned_authorization == authorization
+            && credential.id() == secret.id()
+            && credential.scope() == scope
+            && credential.revision() == Revision(1)
+            && !credential.revoked(),
+        "credential issuance reply differs from request"
+    );
+    Ok(secret)
+}
+
+async fn work<T>(
+    client: &HostControlClientImpl<T>,
+    authorization: GrantId,
+    command: &WorkControlCommand,
+) -> Result<WorkControlReply>
+where
+    T: StreamTransport + Send + Sync,
+    T::Stream: Send + 'static,
+{
+    let response = client
+        .work_control(WorkControlRequest {
+            authorization: authorization.0.to_vec(),
+            command: canonical_dag_cbor(command)?,
+        })
+        .await?;
+    ensure!(
+        response.reply.len() <= MAX_ADMIN_BYTES,
+        "Work reply exceeds limit"
+    );
+    Ok(decode_dag_cbor(&response.reply)?)
 }
 
 async fn offline(command: AdminCommand, identity: &LocalIdentity) -> Result<()> {

@@ -7,9 +7,9 @@ use hellas_auth::{Digest, ProducerSigningKey, Signature};
 use std::sync::Arc;
 mod host;
 pub use host::{
-    GATEWAY_INVOKE, HOST_GATEWAY_ACCESS, HOST_GATEWAY_CONFIGURE, HOST_PROVIDER_CONFIGURE,
-    HOST_STATUS, MachineCapacity, NodeStatus, WORK_CAPACITY_CONFIGURE, host_resource,
-    machine_resource,
+    GATEWAY_INVOKE, HOST_GATEWAY_ACCESS, HOST_GATEWAY_CONFIGURE, HOST_PROVIDER_BIND,
+    HOST_PROVIDER_CONFIGURE, HOST_STATUS, MachineCapacity, NodeStatus, WORK_CAPACITY_CONFIGURE,
+    host_resource, machine_resource,
 };
 
 /// Cloneable service handle, not caller authority. No method exposes a mutable
@@ -43,6 +43,14 @@ impl NodeCoordinator {
     /// independently open the same authority journal.
     pub fn shares_writer(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.store, &other.store)
+    }
+
+    /// The bound provider enrollment, if any; it changes only through binding.
+    pub async fn provider(
+        &self,
+    ) -> Result<Option<hellas_rpc::ProviderEnrollmentBundle>, NodeStoreError> {
+        let (store, _) = self.lock().await?;
+        Ok(store.state().provider().ok().cloned())
     }
 
     /// Validate a host's configured enrollment before attaching a service.

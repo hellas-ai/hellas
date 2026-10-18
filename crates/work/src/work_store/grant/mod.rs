@@ -8,11 +8,11 @@ mod codec;
 mod delivery;
 mod execution;
 pub mod refusal;
+pub(crate) use administration::{BindRecord, WorkMutation, WorkRecord};
 pub use administration::{
     WORK_ALLOWANCE_CONFIGURE, WORK_ALLOWANCE_READ, WORK_BUDGET_CONFIGURE, WORK_GENERATION_RESET,
     WORK_OFFER_EXPORT, WORK_RESOURCE_CONFIGURE, WORK_RESOURCE_REPAIR,
 };
-pub(crate) use administration::{WorkMutation, WorkRecord};
 pub use client::GrantClientStore;
 pub mod ledger;
 use super::channel::funding::JobOutcome;
@@ -77,6 +77,8 @@ pub enum NodeStoreError {
     MissingProvider,
     #[error("node has no configured Work machine capacity")]
     MissingMachine,
+    #[error("provider already bound")]
+    ProviderBound,
     #[error(transparent)]
     Authority(#[from] hellas_auth::authority::AuthorityError),
     #[error(transparent)]
@@ -114,6 +116,7 @@ pub enum NodeStoreErrorKind {
     AlreadyInitialized,
     MissingProvider,
     MissingMachine,
+    ProviderBound,
     Authority,
     Io,
     WriterPoisoned,
@@ -135,6 +138,7 @@ impl NodeStoreError {
             Self::AlreadyInitialized => NodeStoreErrorKind::AlreadyInitialized,
             Self::MissingProvider => NodeStoreErrorKind::MissingProvider,
             Self::MissingMachine => NodeStoreErrorKind::MissingMachine,
+            Self::ProviderBound => NodeStoreErrorKind::ProviderBound,
             Self::Authority(_) => NodeStoreErrorKind::Authority,
             Self::Io(_) => NodeStoreErrorKind::Io,
             Self::WriterPoisoned => NodeStoreErrorKind::WriterPoisoned,

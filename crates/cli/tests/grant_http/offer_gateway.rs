@@ -476,3 +476,179 @@ async fn approved_offer_streams_from_the_private_ca_upstream() {
     gateway.process.stop().await;
     host.stop().await;
 }
+
+/// Bootstrap an HTTP authority administered by the client identity, with the
+/// gateway's own credential issued through the checked writer before startup.
+async fn controlled_gateway_profile(root: &Path) -> (PathBuf, PathBuf) {
+    use hellas_auth::{Digest, authority::*};
+    let contact = decode_contact(&std::fs::read(root.join("contact")).unwrap()).unwrap();
+    let subject =
+        PrincipalId::from_public_key(contact.genesis.statement.producer_public_key).unwrap();
+    let authority = AuthorityId(Digest::hash(b"CLI controlled HTTP authority"));
+    let now = UnixMillis::now().unwrap_or_default();
+    let validity = (now, UnixMillis(now.0 + 600_000));
+    let permission = hellas_work::operations::Operation::named(hellas_work::node::GATEWAY_INVOKE)
+        .unwrap()
+        .permission(authority, None)
+        .unwrap();
+    let administrator = common_node::admin_spec(
+        authority,
+        subject,
+        &[(hellas_work::node::GATEWAY_INVOKE, permission.resource)],
+        validity,
+        (600_000, 0),
+        &[],
+    );
+    let scope = GrantSpec {
+        authority,
+        subject,
+        permissions: [permission].into(),
+        issuance: None,
+        delegation_depth: 0,
+        not_before: validity.0,
+        expires: validity.1,
+    };
+    let journal = root.join("controlled-authority");
+    let (store, admin_secret) = hellas_work::work_store::grant::NodeStore::bootstrap(
+        &journal,
+        hellas_work::model::grant::grant_network(),
+        GrantId([0; 16]),
+        administrator.clone(),
+        administrator,
+        None,
+        now,
+    )
+    .await
+    .unwrap();
+    let coordinator = hellas_work::node::NodeCoordinator::new(
+        store,
+        Arc::new(|| UnixMillis::now().unwrap_or_default()),
+    );
+    let caller = coordinator.authenticate(&admin_secret).await.unwrap();
+    let (_, own) = coordinator
+        .issue_credential(&caller, GrantId([0; 16]), scope.clone())
+        .await
+        .unwrap();
+    drop(coordinator);
+    let own_path = root.join("controlled-gateway.credential");
+    hellas_sdk::node_control::profile::save_credential(
+        hellas_private::private_tempfile(root, ".app-", ".issuing").unwrap(),
+        &own_path,
+        &own,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("agent-scope.json"),
+        serde_json::to_vec(&scope).unwrap(),
+    )
+    .unwrap();
+    let control = root.join("gateway-control");
+    hellas_private::create_dir_all_durable(&control).unwrap();
+    hellas_private::restrict_directory(&control).unwrap();
+    let (certificate, key) = control_tls(&control);
+    let gateway = root.join("controlled-gateway-profile.json");
+    hellas_private::write_atomically(&gateway, ".writing", &serde_json::to_vec(&json!({
+        "journal": journal, "authority": authority, "authorization": GrantId([0; 16]),
+        "credential": own_path,
+        "control": {"socket": control.join("control.sock"), "certificate": certificate, "private_key": key},
+    })).unwrap()).unwrap();
+    let admin = profile(
+        &control,
+        "admin",
+        authority,
+        GrantId([0; 16]),
+        &admin_secret,
+    );
+    (gateway, admin)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gateway_control_issues_and_revokes_live_credentials() {
+    let host = OfferHost::start().await;
+    let root = host.root();
+    let trust_root = host.approve_trust().await;
+    let (gateway_profile, admin) = controlled_gateway_profile(root).await;
+    let socket = root.join("gateway-control/control.sock");
+    let mut process = host.client.spawn(
+        &[
+            "gateway",
+            "--offer",
+            "lan",
+            "--trust-store",
+            string(&trust_root),
+            "--trust-policy",
+            "lan",
+            "--work-profile",
+            string(&host.work_profile),
+            "--port",
+            "0",
+            "--gateway-profile",
+            string(&gateway_profile),
+            "--zdr",
+        ],
+        "controlled-gateway.log",
+    );
+    let address = process.wait_for("gateway listening on ").await;
+    let url = format!("http://{address}/v1/chat/completions");
+    let issue = async |name: &str| {
+        let out = root.join(format!("{name}.credential"));
+        let issued: Value = serde_json::from_str(
+            &host
+                .client
+                .run(&[
+                    "admin",
+                    "--profile",
+                    string(&admin),
+                    "--control-socket",
+                    string(&socket),
+                    "issue-credential",
+                    "--scope",
+                    string(&root.join("agent-scope.json")),
+                    "--credential-out",
+                    string(&out),
+                ])
+                .await,
+        )
+        .unwrap();
+        let bytes = std::fs::read(&out).unwrap();
+        (
+            issued["credential_id"].as_str().unwrap().to_owned(),
+            hex::encode(bytes),
+        )
+    };
+    let (first_id, first) = issue("agent-a").await;
+    let (_, second) = issue("agent-b").await;
+    let status = async |token: Option<&str>| {
+        let client = reqwest::Client::new();
+        let mut request = client.post(&url).json(&json!({"messages": []}));
+        if let Some(token) = token {
+            request = request.bearer_auth(token);
+        }
+        request.send().await.unwrap().status()
+    };
+    assert_eq!(status(None).await, reqwest::StatusCode::UNAUTHORIZED);
+    assert_eq!(status(Some(&first)).await, reqwest::StatusCode::OK);
+    assert_eq!(status(Some(&second)).await, reqwest::StatusCode::OK);
+    host.client
+        .run(&[
+            "admin",
+            "--profile",
+            string(&admin),
+            "--control-socket",
+            string(&socket),
+            "revoke-credential",
+            "--credential-id",
+            &first_id,
+            "--expected-revision",
+            "1",
+        ])
+        .await;
+    assert_eq!(
+        status(Some(&first)).await,
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(status(Some(&second)).await, reqwest::StatusCode::OK);
+    process.stop().await;
+    assert!(!socket.exists());
+    host.stop().await;
+}

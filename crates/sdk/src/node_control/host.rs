@@ -1,11 +1,13 @@
 //! Host-owned lifecycle. Authority checks enqueue commands; this supervisor owns
 //! completion and drain even after the requesting control connection disappears.
 use super::*;
-use crate::{ProviderControl, ProviderError, ProviderHandle, grant_gateway::responses};
+use crate::{ProviderControl, ProviderError, ProviderHandle};
 use futures::future::BoxFuture;
 use hellas_work::model::grant::records::grant_transport;
 use std::sync::Mutex;
 use tokio::sync::{mpsc, oneshot, watch};
+
+const PROVIDER_NOT_BOUND: &str = "provider is not bound";
 
 pub type ProviderFactory = Arc<
     dyn Fn(
@@ -16,11 +18,22 @@ pub type ProviderFactory = Arc<
         + Sync,
 >;
 
+/// Starts the gateway with the access the host validated at startup.
+pub type GatewayFactory = Arc<
+    dyn Fn(
+            hellas_gateway::GatewayAccess,
+        ) -> BoxFuture<
+            'static,
+            Result<hellas_gateway::GatewayHandle, Box<dyn std::error::Error + Send + Sync>>,
+        > + Send
+        + Sync,
+>;
+
+/// The provider identity is the authority's binding, read from the store.
 pub struct HostOptions {
-    pub identity: Option<hellas_rpc::ProviderEnrollmentBundle>,
     pub control: Option<(NodeCoordinator, ProviderControl)>,
     pub provider: Option<ProviderFactory>,
-    pub gateway: Option<(responses::FetchGatewayOptions, iroh::SecretKey)>,
+    pub gateway: Option<(hellas_gateway::GatewayAccess, GatewayFactory)>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -47,32 +60,28 @@ pub struct HostHandle {
 }
 impl HostHandle {
     /// Both services begin stopped. Startup neither creates authority nor grants.
+    /// An authority without a provider binding still serves control; provider
+    /// start is refused until the binding exists.
     pub async fn start(options: HostOptions) -> Result<Self, HostError> {
-        if let Some((node, _)) = &options.control
-            && options.provider.is_some()
-        {
-            node.check_provider(options.identity.as_ref().ok_or(HostError::Composition)?)
-                .await?;
-        }
-        if let Some((gateway, _)) = &options.gateway {
+        if let Some((access, _)) = &options.gateway {
             if !options
                 .control
                 .as_ref()
-                .is_some_and(|(node, _)| gateway.access.shares_writer(node))
+                .is_some_and(|(node, _)| access.shares_writer(node))
             {
                 return Err(HostError::Composition);
             }
-            gateway.access.validate().await?;
+            access.validate().await?;
         }
-        let identity = options.identity.as_ref().map(identity_status).transpose()?;
         let state = Arc::new(Mutex::new(State {
-            identity,
             provider: None,
             gateway: None,
             work: None,
             provider_state: RuntimeState::Stopped,
             gateway_state: RuntimeState::Stopped,
-            access: options.gateway.as_ref().map(|(g, _)| g.access.clone()),
+            provider_failure: None,
+            gateway_failure: None,
+            access: options.gateway.as_ref().map(|(access, _)| access.clone()),
         }));
         let (commands, receiver) = mpsc::channel(8);
         let runtime = Runtime {
@@ -104,7 +113,7 @@ impl HostHandle {
             stopped,
             control,
             options.provider,
-            options.gateway,
+            options.gateway.map(|(_, factory)| factory),
         ));
         Ok(Self {
             runtime,
@@ -165,10 +174,8 @@ impl HostHandle {
         } else {
             None
         };
-        let identity = Some(provider.open_identity.enrollment.clone());
         let host = Self::start(HostOptions {
             control,
-            identity,
             gateway: None,
             provider: Some(Arc::new(move |control| {
                 let mut provider = provider.clone();
@@ -223,12 +230,14 @@ pub(super) struct Runtime {
     endpoint: watch::Sender<Option<iroh::Endpoint>>,
 }
 struct State {
-    identity: Option<IdentityStatus>,
     provider: Option<ProviderHandle>,
     gateway: Option<hellas_gateway::GatewayHandle>,
     work: Option<hellas_work::grant_service::WorkAdministration>,
     provider_state: RuntimeState,
     gateway_state: RuntimeState,
+    /// Why the last start failed, reported to operators while Failed.
+    provider_failure: Option<String>,
+    gateway_failure: Option<String>,
     access: Option<hellas_gateway::GatewayAccess>,
 }
 #[derive(Clone, Copy)]
@@ -276,15 +285,19 @@ impl Runtime {
     }
     pub(super) fn decorate(&self, status: &mut HostStatus) -> Result<(), WireStatus> {
         self.with(|state| {
-            status.identity = state.identity.clone();
             status.provider = self.has_provider.then(|| {
-                service_status(
+                let mut service = service_status(
                     state.provider_state,
                     state
                         .provider
                         .as_ref()
                         .is_some_and(ProviderHandle::is_finished),
-                )
+                    state.provider_failure.as_deref(),
+                );
+                if !status.provider_configured {
+                    service.detail = PROVIDER_NOT_BOUND.into();
+                }
+                service
             });
             status.gateway = self.has_gateway.then(|| {
                 service_status(
@@ -293,6 +306,7 @@ impl Runtime {
                         .gateway
                         .as_ref()
                         .is_some_and(hellas_gateway::GatewayHandle::is_finished),
+                    state.gateway_failure.as_deref(),
                 )
             });
             status.endpoint = state
@@ -331,6 +345,7 @@ impl Runtime {
                 let handle = self
                     .with(|state| {
                         state.provider_state = RuntimeState::Stopping;
+                        state.provider_failure = None;
                         state.provider.take()
                     })
                     .map_err(ProviderError::from)?;
@@ -352,6 +367,7 @@ impl Runtime {
                 let handle = self
                     .with(|state| {
                         state.gateway_state = RuntimeState::Stopping;
+                        state.gateway_failure = None;
                         state.gateway.take()
                     })
                     .map_err(ProviderError::from)?;
@@ -376,7 +392,7 @@ impl Runtime {
         command: &Command,
         control: &Option<NodeControl>,
         provider: &Option<ProviderFactory>,
-        gateway: &Option<(responses::FetchGatewayOptions, iroh::SecretKey)>,
+        gateway: &Option<GatewayFactory>,
     ) -> Result<(), WireStatus> {
         if !command.enabled {
             return self.stop(command.service).await.map_err(|_| unavailable());
@@ -401,6 +417,19 @@ impl Runtime {
         match command.service {
             Service::Provider => {
                 let factory = provider.as_ref().ok_or_else(unsupported)?;
+                if let Some(control) = control
+                    && control
+                        .node
+                        .provider()
+                        .await
+                        .map_err(|_| unavailable())?
+                        .is_none()
+                {
+                    return Err(WireStatus::new(
+                        WireCode::FailedPrecondition,
+                        PROVIDER_NOT_BOUND,
+                    ));
+                }
                 self.with(|state| state.provider_state = RuntimeState::Starting)?;
                 match factory(control.clone()).await {
                     Ok(handle) => {
@@ -412,7 +441,10 @@ impl Runtime {
                             _ => false,
                         } {
                             let _ = handle.shutdown().await;
-                            self.with(|state| state.provider_state = RuntimeState::Failed)?;
+                            self.with(|state| {
+                                state.provider_state = RuntimeState::Failed;
+                                state.provider_failure = Some(HostError::Composition.to_string());
+                            })?;
                             return Err(unavailable());
                         }
                         self.with(|state| {
@@ -422,31 +454,31 @@ impl Runtime {
                             state.provider_state = RuntimeState::Running;
                         })
                     }
-                    Err(_) => {
-                        self.with(|state| state.provider_state = RuntimeState::Failed)?;
+                    Err(error) => {
+                        self.with(|state| {
+                            state.provider_state = RuntimeState::Failed;
+                            state.provider_failure = Some(failure_detail(&*error));
+                        })?;
                         Err(unavailable())
                     }
                 }
             }
             Service::Gateway => {
-                let (options, key) = gateway.as_ref().ok_or_else(unsupported)?.clone();
-                self.with(|state| state.gateway_state = RuntimeState::Starting)?;
-                match async {
-                    let transport = crate::grant_client::GrantTransport::remote(key)
-                        .await
-                        .map_err(|_| unavailable())?;
-                    responses::start_fetch(options, transport)
-                        .await
-                        .map_err(|_| unavailable())
-                }
-                .await
-                {
+                let factory = gateway.as_ref().ok_or_else(unsupported)?;
+                let access = self.with(|state| {
+                    state.gateway_state = RuntimeState::Starting;
+                    state.access.clone()
+                })?;
+                match factory(access.ok_or_else(unsupported)?).await {
                     Ok(handle) => self.with(|state| {
                         state.gateway = Some(handle);
                         state.gateway_state = RuntimeState::Running;
                     }),
-                    Err(_) => {
-                        self.with(|state| state.gateway_state = RuntimeState::Failed)?;
+                    Err(error) => {
+                        self.with(|state| {
+                            state.gateway_state = RuntimeState::Failed;
+                            state.gateway_failure = Some(failure_detail(&*error));
+                        })?;
                         Err(unavailable())
                     }
                 }
@@ -461,7 +493,7 @@ async fn run(
     mut stopped: watch::Receiver<bool>,
     control: Option<NodeControl>,
     provider: Option<ProviderFactory>,
-    gateway: Option<(responses::FetchGatewayOptions, iroh::SecretKey)>,
+    gateway: Option<GatewayFactory>,
 ) -> Result<(), HostError> {
     loop {
         let command = tokio::select! {
@@ -477,7 +509,7 @@ async fn run(
     let provider = runtime.stop(Service::Provider).await;
     gateway.and(provider)
 }
-fn service_status(state: RuntimeState, finished: bool) -> ServiceStatus {
+fn service_status(state: RuntimeState, finished: bool, failure: Option<&str>) -> ServiceStatus {
     let state = if state == RuntimeState::Running && finished {
         RuntimeState::Failed
     } else {
@@ -486,18 +518,33 @@ fn service_status(state: RuntimeState, finished: bool) -> ServiceStatus {
     ServiceStatus {
         state: state as i32,
         detail: if state == RuntimeState::Failed {
-            "service stopped with an error".into()
+            failure.unwrap_or("service stopped with an error").into()
         } else {
             String::new()
         },
     }
 }
-fn identity_status(
+/// The `{:#}` chain an operator would see in a CLI, bounded so one verbose
+/// error cannot push HostStatus past the control frame limit.
+fn failure_detail(error: &(dyn std::error::Error + 'static)) -> String {
+    const MAX_DETAIL_BYTES: usize = 1024;
+    let mut detail = error.to_string();
+    let mut source = error.source();
+    while let Some(error) = source {
+        detail.push_str(": ");
+        detail.push_str(&error.to_string());
+        source = error.source();
+    }
+    detail.truncate(detail.floor_char_boundary(MAX_DETAIL_BYTES));
+    detail
+}
+pub(super) fn identity_status(
     enrollment: &hellas_rpc::ProviderEnrollmentBundle,
-) -> Result<IdentityStatus, HostError> {
-    let node =
-        iroh::EndpointId::from_bytes(&grant_transport(enrollment).map_err(ProviderError::from)?)
-            .map_err(|_| HostError::Composition)?;
+) -> Result<IdentityStatus, WireStatus> {
+    let node = grant_transport(enrollment)
+        .ok()
+        .and_then(|key| iroh::EndpointId::from_bytes(&key).ok())
+        .ok_or_else(unavailable)?;
     Ok(IdentityStatus {
         producer_id: hex::encode(
             hellas_auth::ProducerId::from_public_key(

@@ -63,7 +63,39 @@ pub(crate) struct WorkRecord {
     pub authorization: Authorization,
     pub mutation: WorkMutation,
 }
+/// The one-time provider binding, journaled with its recorded authority check.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BindRecord {
+    pub caller: CallerRecord,
+    pub authorization: Authorization,
+    #[serde(with = "crate::model::grant::records::provider_bytes")]
+    pub provider: hellas_rpc::ProviderEnrollmentBundle,
+}
 impl NodeStore {
+    /// Callers verify the root proof first. Rebinding the bound enrollment is a
+    /// no-op so a lost reply can be retried; any other enrollment is refused.
+    pub(crate) async fn bind_provider(
+        &mut self,
+        caller: &AuthenticatedCaller,
+        authorization: Authorization,
+        provider: hellas_rpc::ProviderEnrollmentBundle,
+        now: UnixMillis,
+    ) -> Result<(), NodeStoreError> {
+        self.check_authority()?;
+        match &self.state().provider {
+            Some(bound) if *bound == provider => return Ok(()),
+            Some(_) => return Err(NodeStoreError::ProviderBound),
+            None => {}
+        }
+        let record = BindRecord {
+            caller: self.state().authority().record_caller(caller, now)?,
+            authorization,
+            provider,
+        };
+        self.commit(now, Change::BindProvider(record), true).await
+    }
+
     // The entry point checks before inspecting command data; commit rechecks the
     // recorded mutation against the same operation table before appending it.
     pub(crate) async fn commit_work(

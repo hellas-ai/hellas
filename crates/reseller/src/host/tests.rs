@@ -365,7 +365,6 @@ impl ResellerBuilder {
             client_identity.transport_key(),
             root.path(),
             admin.node(),
-            &provider_bundle,
             &secret,
         )
         .await;
@@ -520,7 +519,6 @@ async fn host_control_starts_the_openai_reseller_factory() {
     let (host, control) = controlled_host(
         fixture.root.path(),
         node,
-        &fixture.enrollment,
         &secret,
         Some(fixture.options().into_factory()),
         None,
@@ -574,10 +572,12 @@ type TestControl =
 async fn controlled_host(
     root: &std::path::Path,
     node: hellas_work::node::NodeCoordinator,
-    enrollment: &ProviderEnrollmentBundle,
     secret: &hellas_auth::authority::CredentialSecret,
     provider: Option<hellas_sdk::node_control::host::ProviderFactory>,
-    gateway: Option<(FetchGatewayOptions, iroh::SecretKey)>,
+    gateway: Option<(
+        hellas_sdk::gateway::GatewayAccess,
+        hellas_sdk::node_control::host::GatewayFactory,
+    )>,
 ) -> (hellas_sdk::node_control::host::HostHandle, TestControl) {
     use hellas_sdk::wire::ServiceMarker;
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
@@ -608,7 +608,6 @@ async fn controlled_host(
     let socket = root.join("control/host.socket");
     let host = hellas_sdk::node_control::host::HostHandle::start(
         hellas_sdk::node_control::host::HostOptions {
-            identity: Some(enrollment.clone()),
             provider,
             gateway,
             control: Some((
@@ -645,11 +644,16 @@ async fn controlled_gateway(
     key: iroh::SecretKey,
     root: &std::path::Path,
     node: hellas_work::node::NodeCoordinator,
-    enrollment: &ProviderEnrollmentBundle,
     secret: &hellas_auth::authority::CredentialSecret,
 ) -> ControlledGateway {
-    let (host, control) =
-        controlled_host(root, node, enrollment, secret, None, Some((gateway, key))).await;
+    let (host, control) = controlled_host(
+        root,
+        node,
+        secret,
+        None,
+        Some((gateway.access.clone(), gateway.into_factory(key))),
+    )
+    .await;
     let status = control
         .set_gateway_state(hellas_rpc::pb::host::SetGatewayStateRequest {
             enabled: true,

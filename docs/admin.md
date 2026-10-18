@@ -13,6 +13,7 @@ hellas-cli --identity operator.identity admin --profile operator.json set-capaci
 hellas-cli --identity operator.identity admin --profile operator.json grant change.json
 hellas-cli --identity operator.identity admin --profile operator.json issue-credential --scope friend-scope.json --credential-out friend.credential
 hellas-cli --identity operator.identity admin --profile operator.json revoke-credential --credential-id ID --expected-revision 1
+hellas-cli --identity operator.identity admin --profile operator.json bind-provider --enrollment provider.enrollment
 hellas-cli --identity operator.identity admin --profile operator.json work allowance.json
 hellas-cli --identity operator.identity admin --profile operator.json work export.json --offer-out friend.offer
 hellas-cli --identity operator.identity admin --profile remote.json --contact node.contact --address 192.0.2.10:9000 status
@@ -54,6 +55,18 @@ not change the subject or reset accounting. A lost reply can follow a durable is
 do not retry issuance automatically. If local file publication fails after receipt,
 the CLI reports the issued ID so it can be revoked before retrying.
 
+`bind-provider` requires `host.provider.bind` on the host resource. It binds the
+provider enrollment of an authority bootstrapped without one, such as an embedded
+host that initialized before its provider enrolled. The node verifies the canonical
+enrollment offline: a software root signature, or an App Attest credential
+registered against its own RP-ID hash and CDHash at the enrollment's validation
+time. This is not requester trust; callers still pin the genesis and Apple policy
+independently. The binding is journaled and survives restart and offline recovery.
+Repeating it with the identical enrollment succeeds, so a lost reply can be retried.
+Any other enrollment is refused with `FailedPrecondition` (`provider already bound`),
+and a malformed or unverifiable one with `InvalidArgument`. There is no unbind. The
+command prints the bound enrollment's content ID.
+
 `work` accepts [WorkControlCommand](../crates/work/src/model/grant/admin.rs) JSON. It selects resources from
 the daemon's validated catalogue and uses the profile's authorization grant.
 These operations require distinct rights on this authority's Work machine resource:
@@ -69,6 +82,7 @@ table below is checked against the implementation by the Work tests.
 | --- | --- | --- |
 | `host.status` | Host | Host |
 | `host.provider.configure` | Host | Host |
+| `host.provider.bind` | Host | Host |
 | `host.gateway.configure` | Host | Host |
 | `host.gateway.access` | Host | Host |
 | `gateway.invoke` | Host | Host |
@@ -250,6 +264,35 @@ secrets. `credential_claimed` is an unverified locator; only `verified=true` sup
 an actor validated by this node. A revoked credential or wrong session binding cannot
 attribute a request to that actor.
 
+## Access bundles
+
+An access bundle gives one contact what they need to use an allowance: its signed
+offer, the authority ID, the contact's Auth grant ID, the credential subject, the
+credential ID and secret, the expiry and an optional provider label of at most 64
+bytes. It contains no provider trust; the contact still approves a trust policy
+with `hellas-cli trust` before running work.
+
+```sh
+hellas-cli --identity operator.identity admin --profile operator.json export-bundle --allowance ALLOWANCE --grant-id GRANT --credential-scope friend-scope.json --label "Alice's node" --out friend.access
+hellas-cli --identity friend.identity offer import-bundle friend.access --name alice
+```
+
+`export-bundle` exports the allowance's offer (`work.offer.export`), then issues a
+credential bounded by the scope exactly as `issue-credential` does. `--grant-id`
+names the contact's existing grant for `work.execute` on that allowance; it is not
+the allowance ID. The bundle is canonical DAG-CBOR tagged `hellas.access-bundle.v1`,
+at most 257 KiB, and is written as a new private file that never replaces an
+existing one. If writing fails after issuance, the command reports the credential
+ID so it can be revoked. The secret is never printed.
+
+`offer import-bundle` accepts the received bundle file as it is; delete it after
+importing, since it holds the credential. It refuses a bundle whose subject is not the importing identity and
+verifies the offer's provider signature. It saves the offer under `--name`, as
+`offer import` does, and installs a remote-only Work profile (`profile.json` and a
+private `credential`) under `accesses/NAME` in this identity's data directory,
+refusing a non-empty directory. It prints the grant ID and the profile path; use
+that path as `--work-profile` together with `--offer NAME`.
+
 ## Explicit offline initialization and recovery
 
 Stop the daemon before initializing or recovering its exclusively locked journal.
@@ -361,8 +404,13 @@ if the requesting RPC disappears; revocation does not undo an already accepted
 command. Replies recheck current rights. A full eight-command queue refuses
 further commands, and service errors require an explicit subsequent request.
 
-`GetHostStatus` reports the configured identity, provider/gateway states and the
-running provider endpoint. Stop drains accepted Work; local control and its writer
+A host can start on an authority with no bound provider. It serves control,
+grants and credentials; its provider status reads `provider is not bound`, and
+`SetProviderState` refuses to start the provider with `FailedPrecondition` until
+`bind-provider` succeeds. No restart is needed after binding.
+
+`GetHostStatus` reports the bound provider's identity, provider/gateway states and
+the running provider endpoint. Stop drains accepted Work; local control and its writer
 remain alive. Work administration remains available after the provider stops.
 Full host shutdown joins its local listener and both services.
 `GetGatewayAccess` separately requires `host.gateway.access`; it returns an address
@@ -394,6 +442,10 @@ A standalone gateway requires `--gateway-profile FILE`, a private JSON file with
 an explicitly bootstrapped local NodeStore; `authority` and `authorization` are its
 Auth AuthorityId and selected GrantId in their usual JSON forms. `credential` names
 the private 48-byte credential file written by `issue-credential` or bootstrap.
+An optional `control` object with `socket`, `certificate` and `private_key` serves
+local HostControl on that writer. Credential issuance and revocation then work while
+the gateway runs, using the same `admin --profile ... --control-socket` commands
+and checks as a daemon. Omit it to serve no administration.
 Relative paths are resolved from the profile directory. The journal has one writer;
 an embedded gateway receives its host's existing NodeCoordinator instead of opening
 that journal again. Missing, mismatched or corrupt state fails startup.

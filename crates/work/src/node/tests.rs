@@ -272,6 +272,8 @@ fn host_scope(actor: Actor) -> GrantSpec {
     let mut spec = scope(actor);
     for (op, resource) in [
         (HOST_STATUS, host_resource(spec.authority)),
+        (HOST_PROVIDER_BIND, host_resource(spec.authority)),
+        (GATEWAY_INVOKE, host_resource(spec.authority)),
         (WORK_CAPACITY_CONFIGURE, machine_resource(spec.authority)),
     ] {
         let operation = OperationId::new(op).unwrap();
@@ -320,7 +322,7 @@ async fn an_unmounted_machine_cannot_receive_capacity_commands() {
     let (node, secret) = fixture(directory.path(), host_scope(ROOT)).await;
     let root = node.authenticate(&secret).await.unwrap();
     let status = node.status(&root, ids::ROOT_GRANT).await.unwrap();
-    assert!(!status.provider_configured);
+    assert_eq!(status.provider, None);
     assert_eq!(status.machine, None);
     assert_err!(
         node.set_machine_capacity(&root, ids::ROOT_GRANT, Revision(0), 1, vec![])
@@ -329,6 +331,86 @@ async fn an_unmounted_machine_cannot_receive_capacity_commands() {
     );
     assert_err!(
         node.issue_credential(&root, ids::ROOT_GRANT, host_scope(OPERATOR))
+            .await,
+        NodeStoreError::Authority(AuthorityError::Denied)
+    );
+}
+
+#[tokio::test]
+async fn an_owner_binds_one_verified_provider_and_may_retry_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let (node, secret) = fixture(directory.path(), host_scope(ROOT)).await;
+    let root = node.authenticate(&secret).await.unwrap();
+    let provider = common::software_enrollment(2, [2; 32]);
+    let (gateway, _) = application(
+        &node,
+        &root,
+        ids::OPERATOR_GRANT,
+        OPERATOR,
+        &[GATEWAY_INVOKE],
+    )
+    .await;
+    assert_err!(
+        node.bind_provider(&gateway, ids::OPERATOR_GRANT, provider.clone())
+            .await,
+        NodeStoreError::Authority(AuthorityError::Denied)
+    );
+    let mut forged = provider.clone();
+    forged.genesis.statement.installation_nonce = [9; 32];
+    assert_err!(
+        node.bind_provider(&root, ids::ROOT_GRANT, forged).await,
+        NodeStoreError::Grant(crate::model::grant::records::GrantError::Signature)
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            node.bind_provider(&root, ids::ROOT_GRANT, provider.clone())
+                .await
+                .unwrap(),
+            provider.content_id()
+        );
+    }
+    assert_err!(
+        node.bind_provider(
+            &root,
+            ids::ROOT_GRANT,
+            common::software_enrollment(3, [3; 32])
+        )
+        .await,
+        NodeStoreError::ProviderBound
+    );
+    node.check_provider(&provider).await.unwrap();
+    drop((node, root, gateway));
+    let reopened = NodeStore::open(directory.path(), network(), None, UnixMillis(10))
+        .await
+        .unwrap();
+    assert_eq!(reopened.state().provider().unwrap(), &provider);
+}
+
+#[tokio::test]
+async fn an_execution_credential_cannot_bind_a_provider() {
+    let directory = tempfile::tempdir().unwrap();
+    let authority = common::authority();
+    let world = common::Node::bootstrap(directory.path())
+        .with_allowance(common::Allowance::responses(ids::ALLOWANCE, FRIEND))
+        .with_grant(
+            ids::FRIEND_GRANT,
+            common::Rights::new(authority, FRIEND)
+                .allow(
+                    crate::grant_service::WORK_EXECUTE,
+                    crate::grant_service::allowance_resource(authority, ids::ALLOWANCE),
+                )
+                .valid_until(UnixMillis(100_000))
+                .build(),
+        )
+        .build()
+        .await
+        .serve(common::common_node::NoBackend);
+    let caller = world.caller(FRIEND).await;
+    assert_err!(
+        world
+            .service
+            .node()
+            .bind_provider(&caller, ids::FRIEND_GRANT, common::provider_enrollment())
             .await,
         NodeStoreError::Authority(AuthorityError::Denied)
     );
