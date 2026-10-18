@@ -390,6 +390,14 @@ impl Journal {
         Ok(())
     }
 
+    /// Closes the database and ends ownership, so the host can reopen and
+    /// replay it. Every later call is refused like a poisoned handle.
+    pub(crate) async fn close(&mut self) {
+        if let Some(connection) = self.connection.take() {
+            let _ = connection.close().await;
+        }
+    }
+
     /// Returns whether this generation has reached the hard limit less the
     /// duty reserve. Past it the journal still takes records — that is what
     /// the reserve is — but new work admitted past it runs out of room in
@@ -441,6 +449,15 @@ impl Journal {
         transaction.commit().await?;
         (self.generation, self.records, self.bytes) = (generation, 0, checkpoint.len() as u64);
         self.poisoned = false;
+        // `secure_delete` zeroes the database pages, but the WAL still holds the
+        // frames the deleted records were written in until it is truncated. The
+        // rotation is already committed, so a failure here is reported, not fatal.
+        if let Err(error) = sqlx::raw_sql("PRAGMA wal_checkpoint(TRUNCATE)")
+            .execute(&mut *connection)
+            .await
+        {
+            tracing::warn!(target: TARGET, kind = ?self.id.kind, %error, "journal WAL was not truncated after rotation");
+        }
         if let Some(ms) = rotation.ms() {
             tracing::event!(
                 name: "rotation_tail_ms", target: TARGET, LEVEL,

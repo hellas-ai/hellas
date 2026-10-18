@@ -345,8 +345,7 @@ Embedding hosts now use `hellas_reseller::start_openai_provider` for the OpenAI
 Responses adapter. Its explicit account/resource configuration uses SDK's same
 checked service; no resources or allowances are created at startup. The core CLI's
 `openai-responses` serving destination is removed. Ordinary Fetch clients and gateways
-continue to consume the protocol independently of this hosting library. The reseller
-binary and remaining vendor-host moves are still part of the plan.
+continue to consume the protocol independently of this hosting library.
 
 OpenAI grant resources require a `responses` block, also supplied by the reseller host
 options. For example, this resource fragment permits text requests for one exact model:

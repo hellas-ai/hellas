@@ -183,3 +183,23 @@ async fn an_oversized_record_does_not_poison_the_journal() {
     journal.append(b"one record").await.unwrap();
     assert_eq!(journal.len(), 1);
 }
+
+#[tokio::test]
+async fn a_rotation_leaves_no_deleted_record_on_disk() {
+    const SENTINEL: &[u8] = b"rotated-away-payload-sentinel";
+    let dir = tempfile::tempdir().unwrap();
+    let (mut journal, _) = Journal::open_latest(dir.path(), "duty", id())
+        .await
+        .unwrap();
+    journal.append(&SENTINEL.repeat(64)).await.unwrap();
+    journal.rotate(b"checkpoint").await.unwrap();
+    let path = Journal::path(dir.path(), "duty");
+    for file in [path.clone(), path.with_extension("sqlite-wal")] {
+        let bytes = std::fs::read(&file).unwrap_or_default();
+        assert!(
+            !bytes.windows(SENTINEL.len()).any(|w| w == SENTINEL),
+            "{} still holds a rotated record",
+            file.display()
+        );
+    }
+}

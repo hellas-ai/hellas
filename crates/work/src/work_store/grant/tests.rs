@@ -211,6 +211,56 @@ async fn client_pending_proposal_survives_restart_and_never_journals_bodies() {
     assert_eq!(client.next_nonce().unwrap(), 2);
 }
 #[tokio::test]
+async fn client_replays_its_journal_after_a_cancelled_append() {
+    use hellas_work::work_store::grant::{GrantChannelState, GrantClientStore};
+    let dir = tempfile::tempdir().unwrap();
+    let (mut provider, application) = setup(&dir.path().join("provider")).await;
+    let offer = standing(&mut provider).await.offer;
+    let (a, sig, input) = proposal(&provider, 1);
+    let channel = GrantChannelState {
+        id: a.channel_id,
+        grant: a.grant_id,
+        generation: 0,
+        client: principal(1).0,
+    };
+    let mut client = GrantClientStore::open(
+        &dir.path().join("client"),
+        network(),
+        crate::test_support::software_enrollment(2, [2; 32]),
+        channel,
+        UnixMillis(1_000),
+    )
+    .await
+    .unwrap();
+    client
+        .propose(&offer, a, &input, &principal(1).1, UnixMillis(1_000))
+        .await
+        .unwrap();
+    let work = grant_work_id(network(), &a);
+    let accepted = provider
+        .accept(
+            (&application, JOURNAL_AUTHORIZATION),
+            a,
+            sig,
+            &input,
+            &principal(2).1,
+            UnixMillis(1_000),
+        )
+        .await
+        .unwrap();
+    // A gateway deadline drops the session future while the append is in flight.
+    {
+        let mut cancelled = std::pin::pin!(client.accepted(work, accepted, UnixMillis(1_000)));
+        assert!(futures::poll!(&mut cancelled).is_pending());
+    }
+    client
+        .accepted(work, accepted, UnixMillis(1_000))
+        .await
+        .unwrap();
+    assert_eq!(client.book().pending_proposal(), None);
+    assert_eq!(client.next_nonce().unwrap(), 2);
+}
+#[tokio::test]
 async fn client_refusal_cannot_clear_an_unanswered_proposal() {
     use hellas_work::work_store::grant::{GrantChannelState, GrantClientStore};
     let dir = tempfile::tempdir().unwrap();

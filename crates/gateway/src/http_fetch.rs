@@ -243,13 +243,20 @@ async fn handle(State(state): State<Arc<HttpState>>, request: Request) -> Respon
             observed.status(status.as_u16());
             return attributed(error(status, message), &backend.name);
         }
-        Err(_) => {
-            observed.status(502);
+        Err(failure) => {
+            tracing::warn!(backend = %backend.name, error = %chain(&failure), "HTTP Fetch failed");
+            let (status, message) = match failure {
+                HttpOpenError::Paid(super::WorkGatewayError::Timeout(_)) => {
+                    (StatusCode::GATEWAY_TIMEOUT, "authenticated Fetch timed out")
+                }
+                HttpOpenError::Paid(super::WorkGatewayError::Unreachable(_)) => {
+                    (StatusCode::BAD_GATEWAY, "provider is unreachable")
+                }
+                _ => (StatusCode::BAD_GATEWAY, "authenticated Fetch failed"),
+            };
+            observed.status(status.as_u16());
             state.routing.transport_failed(selected.backend);
-            return attributed(
-                error(StatusCode::BAD_GATEWAY, "authenticated Fetch failed"),
-                &backend.name,
-            );
+            return attributed(error(status, message), &backend.name);
         }
     };
     observed.status(status);
@@ -292,11 +299,15 @@ async fn handle(State(state): State<Arc<HttpState>>, request: Request) -> Respon
         *response.headers_mut() = std::mem::take(&mut headers);
         return attributed(response, &backend.name);
     }
+    let name = backend.name.clone();
     let stream = async_stream::try_stream! {
         let _permit = permit;
         let mut size = 0usize;
         while let Some(event) = events.next().instrument(observed.span.clone()).await {
-            let event = event.map_err(|_| std::io::Error::other("Fetch stream verification failed"))?;
+            let event = event.map_err(|failure| {
+                tracing::warn!(backend = %name, error = %chain(&failure), "HTTP Fetch stream failed");
+                std::io::Error::other("Fetch stream verification failed")
+            })?;
             match event {
                 OutputEvent::Adaptor(AdaptorEvent::Http(HttpResponseEvent::Body { base64 })) => {
                     let bytes = hellas_rpc::http_fetch::decode_base64(&base64)
@@ -395,4 +406,19 @@ fn connection_headers<'a>(headers: impl Iterator<Item = (&'a str, &'a str)>) -> 
         .flat_map(|(_, value)| value.split(','))
         .map(|name| name.trim().to_ascii_lowercase())
         .collect()
+}
+
+/// Error messages and their causes, without repeating causes already quoted.
+fn chain(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let cause_text = cause.to_string();
+        if !text.ends_with(&cause_text) {
+            text.push_str(": ");
+            text.push_str(&cause_text);
+        }
+        source = cause.source();
+    }
+    text
 }

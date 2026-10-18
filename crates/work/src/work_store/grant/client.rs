@@ -9,7 +9,7 @@ use crate::model::grant::{
 use crate::model::profile::{PreparedWorkInput, WorkContext, WorkPolicy};
 use crate::model::work::bound_result_digest;
 use crate::work_store::channel::funding::GrantFunding;
-use crate::work_store::journal::{Journal, JournalId, JournalKind, MAX_CHECKPOINT_BYTES};
+use crate::work_store::journal::{Journal, JournalId, JournalKind, MAX_CHECKPOINT_BYTES, Replay};
 use crate::work_store::{Applied, JobBook, JobPhase, JobState, Role};
 use hellas_auth::authority::UnixMillis;
 use hellas_auth::{Digest, ProducerSigningKey, PublicKey};
@@ -17,13 +17,15 @@ use hellas_kernel::NetworkId;
 use hellas_rpc::OutputEventEnvelope;
 use hellas_rpc::ProviderEnrollmentBundle;
 use hellas_rpc::protocol::value::{decode_canonical_bounded, encode_bounded};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const NAMESPACE: &str = "hellas.work.grant-client.v1";
 const MAX_JOBS: usize = 256;
+const JOURNAL_STEM: &str = "grant-client";
 
 pub struct GrantClientStore {
     journal: Journal,
+    directory: PathBuf,
     context: WorkContext,
     channel: GrantChannelState,
     provider: ProviderEnrollmentBundle,
@@ -103,31 +105,45 @@ impl GrantClientStore {
             client: hellas_kernel::Key::from_bytes(*channel.client.as_bytes()),
             provider: grant_producer(&provider)?,
         };
-        let id = JournalId {
-            kind: JournalKind::Grant,
-            role: Role::Client,
-            key: *channel.id.0.as_bytes(),
-        };
-        let (journal, replay) = Journal::open_latest(directory, "grant-client", id).await?;
+        let (journal, replay) =
+            Journal::open_latest(directory, JOURNAL_STEM, journal_id(&channel)).await?;
         let mut store = Self {
             journal,
+            directory: directory.into(),
             context,
             channel,
             provider,
             state: ClientState::default(),
         };
-        if let Some(bytes) = replay.checkpoint {
-            let snapshot: Snapshot = decode(&bytes)?;
-            store.state = store.restore(snapshot)?;
-        }
-        for bytes in replay.records {
-            let frame: Frame = decode(&bytes)?;
-            let mut candidate = store.state.clone();
-            store.apply(&mut candidate, &frame)?;
-            store.state = candidate;
-        }
+        store.state = store.replay(replay)?;
         store.tick(now).await?;
         Ok(store)
+    }
+    fn replay(&self, replay: Replay) -> Result<ClientState, NodeStoreError> {
+        let mut state = match replay.checkpoint {
+            Some(bytes) => self.restore(decode(&bytes)?)?,
+            None => ClientState::default(),
+        };
+        for bytes in replay.records {
+            let frame: Frame = decode(&bytes)?;
+            let mut candidate = state.clone();
+            self.apply(&mut candidate, &frame)?;
+            state = candidate;
+        }
+        Ok(state)
+    }
+    /// A failed or cancelled append leaves its outcome unknown. Replay what
+    /// committed instead of refusing every later transition until restart.
+    async fn reopen_if_poisoned(&mut self) -> Result<(), NodeStoreError> {
+        if self.journal.check_authority().is_ok() {
+            return Ok(());
+        }
+        self.journal.close().await;
+        let (journal, replay) =
+            Journal::open_latest(&self.directory, JOURNAL_STEM, journal_id(&self.channel)).await?;
+        self.state = self.replay(replay)?;
+        self.journal = journal;
+        Ok(())
     }
     pub fn context(&self) -> WorkContext {
         self.context
@@ -394,6 +410,7 @@ impl GrantClientStore {
         change: Change,
         new: bool,
     ) -> Result<(), NodeStoreError> {
+        self.reopen_if_poisoned().await?;
         let frame = Frame {
             namespace: NAMESPACE.into(),
             now: now.max(self.now()),
@@ -497,6 +514,13 @@ impl GrantClientStore {
         state.book.pending_proposal = snapshot.pending;
         state.book.revalidate_exchange(Role::Client)?;
         Ok(state)
+    }
+}
+fn journal_id(channel: &GrantChannelState) -> JournalId {
+    JournalId {
+        kind: JournalKind::Grant,
+        role: Role::Client,
+        key: *channel.id.0.as_bytes(),
     }
 }
 fn verify(

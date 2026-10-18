@@ -42,6 +42,9 @@ pub enum GrantGatewayError {
 fn error(e: impl std::error::Error + Send + Sync + 'static) -> WorkGatewayError {
     WorkGatewayError::Execution(Box::new(e))
 }
+fn queue_timeout() -> WorkGatewayError {
+    WorkGatewayError::Timeout(Box::new(GrantGatewayError::QueueTimeout))
+}
 fn rejected(e: impl std::error::Error + Send + Sync + 'static) -> WorkGatewayError {
     WorkGatewayError::Rejected(Box::new(e))
 }
@@ -68,6 +71,22 @@ fn client_error(e: GrantClientError) -> WorkGatewayError {
         .and_then(|r| C::try_from(r.code).ok()),
         _ => None,
     };
+    if matches!(e, GrantClientError::Timeout) {
+        return WorkGatewayError::Timeout(Box::new(e));
+    }
+    let unreachable = match &e {
+        GrantClientError::Wire(status)
+        | GrantClientError::Client(hellas_client::ClientError::Wire { source: status, .. }) => {
+            status.code() == hellas_wire::WireCode::Unavailable
+        }
+        GrantClientError::Client(hellas_client::ClientError::Source { source, .. }) => {
+            source.is::<iroh::endpoint::ConnectError>()
+        }
+        _ => false,
+    };
+    if unreachable {
+        return WorkGatewayError::Unreachable(Box::new(e));
+    }
     match code {
         Some(C::Budget) => WorkGatewayError::Quota(Box::new(e)),
         Some(C::Concurrency | C::QueueCapacity | C::StateCapacity) => WorkGatewayBusy.into(),
@@ -253,7 +272,7 @@ impl GrantGateway {
             let result = async {
                 let mut session = tokio::time::timeout_at(deadline, session.lock())
                     .await
-                    .map_err(|_| error(GrantGatewayError::QueueTimeout))?;
+                    .map_err(|_| queue_timeout())?;
                 if sender.is_closed() || admission.is_closed() {
                     return Err(WorkGatewayBusy.into());
                 }
@@ -262,7 +281,7 @@ impl GrantGateway {
                     session.refresh().await
                 })
                 .await
-                .map_err(|_| error(GrantGatewayError::QueueTimeout))?
+                .map_err(|_| queue_timeout())?
                 .map_err(client_error)?;
                 let (name, input) = prepare(
                     request,

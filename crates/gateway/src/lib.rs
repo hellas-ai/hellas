@@ -77,6 +77,10 @@ pub enum WorkGatewayError {
     Provider(EndpointId),
     #[error(transparent)]
     Busy(#[from] WorkGatewayBusy),
+    #[error("provider is unreachable: {0}")]
+    Unreachable(#[source] Box<dyn std::error::Error + Send + Sync>),
+    #[error("Work deadline passed: {0}")]
+    Timeout(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("Work execution failed: {0}")]
     Execution(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
