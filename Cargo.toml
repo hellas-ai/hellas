@@ -14,6 +14,7 @@ members = [
     "crates/presentation",
     "crates/private",
     "crates/providers",
+    "crates/reseller",
     "crates/rpc",
     "crates/sdk",
     "crates/store",
@@ -70,6 +71,7 @@ hellas-kernel = { path = "crates/kernel", default-features = false }
 hellas-presentation = { path = "crates/presentation", default-features = false }
 hellas-private = { path = "crates/private" }
 hellas-providers = { path = "crates/providers", default-features = false }
+hellas-reseller = { path = "crates/reseller", default-features = false }
 hellas-rpc = { path = "crates/rpc", default-features = false }
 hellas-sdk = { path = "crates/sdk", default-features = false }
 hellas-store = { path = "crates/store", default-features = false }

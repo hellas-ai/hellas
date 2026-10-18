@@ -2999,6 +2999,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "hellas-reseller"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "futures",
+ "hellas-adaptors",
+ "hellas-attestation",
+ "hellas-auth",
+ "hellas-executor",
+ "hellas-kernel",
+ "hellas-providers",
+ "hellas-rpc",
+ "hellas-sdk",
+ "hellas-work",
+ "iroh",
+ "rcgen",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "hellas-rpc"
 version = "0.1.0"
 dependencies = [

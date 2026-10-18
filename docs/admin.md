@@ -298,10 +298,15 @@ The SDK Fetch provider follows the same sequence: initialize offline, start, the
 use its checked administration service. Its options describe available policies and
 maximum job duration; there is no contact list that silently grants execution.
 
-The core CLI's `openai-responses` serving destination is removed.
+Embedding hosts now use `hellas_reseller::start_openai_provider` for the OpenAI
+Responses adapter. Its explicit account/resource configuration uses SDK's same
+checked service; no resources or allowances are created at startup. The core CLI's
+`openai-responses` serving destination is removed. Ordinary Fetch clients and gateways
+continue to consume the protocol independently of this hosting library. The reseller
+binary and remaining vendor-host moves are still part of the plan.
 
-OpenAI grant resources require a `responses` block. For example, this resource
-fragment permits text requests for one exact model:
+OpenAI grant resources require a `responses` block, also supplied by the reseller host
+options. For example, this resource fragment permits text requests for one exact model:
 
 ```json
 {"responses":{"model":"configured-model","max_output_tokens":1024,"settings":{}}}
@@ -342,7 +347,9 @@ serve provider/gateway lifecycle and gateway credential retrieval.
 
 `sdk::node_control::host::HostHandle::start` owns an existing `NodeCoordinator`,
 an authenticated local control listener and a bounded lifecycle supervisor. Both
-services begin stopped. Providers prepare the shared SDK provider options
+services begin stopped. Supply `OpenAiProviderOptions::into_factory()` from the
+core reseller crate for Gate's vendor relay, preserving its injected App Attest
+prover and enrollment. Other providers prepare the shared SDK provider options
 and select `on_host(control)` before startup. That attaches the existing writer;
 it cannot open a second journal. Responses gateway options must use the same
 writer and the SDK `responses::start_fetch` composition.
