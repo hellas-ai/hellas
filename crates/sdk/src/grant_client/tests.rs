@@ -10,6 +10,7 @@ use hellas_work::test_support::{WAIT, assert_err, definition, network, policy};
 use hellas_work::work_store::grant::NodeStore;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::Semaphore;
+mod connections;
 
 pub use hellas_work::test_support::principal;
 pub fn provider_enrollment(seed: u8) -> ProviderEnrollmentBundle {
@@ -105,6 +106,7 @@ struct Fixture {
     root: tempfile::TempDir,
     service: GrantService,
     application: Arc<ClientProfile>,
+    administrator: hellas_auth::authority::CredentialSecret,
     clock: TestClock,
     calls: Arc<AtomicUsize>,
 }
@@ -134,6 +136,7 @@ impl Fixture {
             root,
             service,
             application,
+            administrator: secret,
             clock,
             calls,
         }

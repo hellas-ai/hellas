@@ -855,3 +855,6 @@ fn offer_gateway_accepts_independent_apple_trust_policy() {
         );
     }
 }
+
+#[cfg(feature = "evaluate")]
+mod evaluate;

@@ -252,3 +252,6 @@ fn lock(file: File, path: &Path) -> Result<IdentityLock, NodeStoreError> {
         Err(TryLockError::Error(error)) => Err(error.into()),
     }
 }
+
+#[cfg(test)]
+mod tests;

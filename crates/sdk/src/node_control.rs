@@ -627,3 +627,6 @@ fn unsupported() -> WireStatus {
         "operation is not mounted on this node",
     )
 }
+
+#[cfg(test)]
+mod tests;

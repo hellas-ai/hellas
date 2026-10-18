@@ -1,3 +1,4 @@
+mod control;
 use super::*;
 
 fn write_config(dir: &tempfile::TempDir, config: serde_json::Value) -> PathBuf {

@@ -1,6 +1,8 @@
 use super::*;
 use hellas_auth::assert_err;
 
+mod ownership;
+
 const fn id() -> JournalId {
     JournalId {
         kind: JournalKind::Setup,

@@ -163,3 +163,6 @@ impl From<hellas_rpc::protocol::value::BoundedCborError> for NodeStoreError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

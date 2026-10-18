@@ -322,3 +322,6 @@ fn configured_resource<'a>(
         .find(|p| p.name == name)
         .ok_or(GrantError::OutOfScope)
 }
+
+#[cfg(test)]
+mod tests;

@@ -151,3 +151,6 @@ fn decoder<'a>(
     input.expect_str(schema)?;
     Ok(input)
 }
+
+#[cfg(test)]
+mod tests;

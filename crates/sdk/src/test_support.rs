@@ -1,6 +1,6 @@
 //! A funded, metadata-only Fetch channel for SDK boundary tests.
 // Client and provider feature suites use different parts of this fixture.
-pub(crate) use crate::provider::tests::host::{Host, RemoteHost};
+pub(crate) use crate::provider::tests::host::{Host, RemoteHost, provider_enrollment};
 use crate::work_config::{ChainCrossCheck, WorkConfig};
 use hellas_auth::ProducerSigningKey;
 use hellas_kernel::{

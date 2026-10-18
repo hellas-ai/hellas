@@ -148,3 +148,6 @@ impl AdmissionRecord {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests;

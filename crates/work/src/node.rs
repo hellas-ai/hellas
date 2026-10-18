@@ -278,3 +278,6 @@ impl NodeCoordinator {
         .await
     }
 }
+
+#[cfg(test)]
+mod tests;

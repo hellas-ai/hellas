@@ -1,0 +1,460 @@
+use super::super::*;
+use crate::commands::admin::{AdminArgs, AdminCommand, OfflineArgs, run};
+use crate::identity::LocalIdentity;
+use hellas_auth::{Digest, authority as auth};
+use hellas_rpc::Assurance;
+use hellas_sdk::{grant_config::GrantConfig, node_control};
+use hellas_work::{
+    node::{HOST_STATUS, WORK_CAPACITY_CONFIGURE, host_resource, machine_resource},
+    test_support::{WAIT, common_node, ids},
+};
+use std::path::Path;
+const ROOT_GRANT: auth::GrantId = ids::ROOT_GRANT;
+const READER_GRANT: auth::GrantId = ids::FRIEND_GRANT;
+type Control =
+    hellas_rpc::services::host_control::HostControlClientImpl<hellas_sdk::wire::mux::MuxTransport>;
+
+struct Daemon {
+    root: tempfile::TempDir,
+    identity: LocalIdentity,
+    provider_identity: LocalIdentity,
+    wrong_identity: LocalIdentity,
+    scope: auth::GrantSpec,
+    scope_file: PathBuf,
+    credential_file: PathBuf,
+    profile_path: PathBuf,
+    socket: PathBuf,
+    journal: PathBuf,
+    handle: Option<node_control::host::HostHandle>,
+}
+fn offline_args(command: AdminCommand) -> AdminArgs {
+    AdminArgs {
+        profile: None,
+        control_socket: None,
+        node_contact: None,
+        addresses: vec![],
+        command,
+    }
+}
+impl Daemon {
+    async fn start() -> Self {
+        // Keep Unix socket paths below the platform length limit.
+        let scratch = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/t");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let root = tempfile::Builder::new()
+            .prefix("ctl-")
+            .tempdir_in(scratch.canonicalize().unwrap())
+            .unwrap();
+        hellas_private::restrict_directory(root.path()).unwrap();
+        let identity =
+            crate::identity::load_or_create(Some(&root.path().join("identity"))).unwrap();
+        let provider_identity =
+            crate::identity::load_or_create(Some(&root.path().join("provider-identity"))).unwrap();
+        let wrong_identity =
+            crate::identity::load_or_create(Some(&root.path().join("other-identity"))).unwrap();
+        let authority = auth::AuthorityId(Digest::hash(b"daemon control fixture"));
+        let root_grant = ROOT_GRANT;
+        let now = hellas_auth::authority::UnixMillis::now().unwrap_or_default();
+        let scope = common_node::admin_spec(
+            authority,
+            auth::PrincipalId::from_public_key(identity.producer_key.public_key()).unwrap(),
+            &[
+                (HOST_STATUS, host_resource(authority)),
+                (WORK_CAPACITY_CONFIGURE, machine_resource(authority)),
+            ],
+            (now, auth::UnixMillis(now.0 + 3_600_000)),
+            (3_600_000, 8),
+            &[],
+        );
+        let mut grant_config = GrantConfig::unconfigured(&root.path().canonicalize().unwrap());
+        grant_config.remote_control = node_control::RemoteControlAdmission::new(vec![
+            identity.transport_key.public(),
+            wrong_identity.transport_key.public(),
+        ])
+        .unwrap();
+        let scope_file = root.path().join("scope.json");
+        let credential_file = root.path().join("app.credential");
+        hellas_private::write_atomically(
+            &scope_file,
+            ".writing",
+            &serde_json::to_vec(&scope).unwrap(),
+        )
+        .unwrap();
+        let offline = || OfflineArgs {
+            journal: grant_config.journal_root.clone(),
+            administrator: scope_file.clone(),
+            credential_scope: scope_file.clone(),
+            credential_out: credential_file.clone(),
+        };
+        run(
+            offline_args(AdminCommand::Bootstrap {
+                root_grant: hex::encode(root_grant.0),
+                state: offline(),
+            }),
+            &provider_identity,
+        )
+        .await
+        .unwrap();
+        let tls = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        hellas_private::write_atomically(
+            &grant_config.control_certificate,
+            ".writing",
+            tls.cert.der(),
+        )
+        .unwrap();
+        hellas_private::write_atomically(
+            &grant_config.control_private_key,
+            ".writing",
+            &tls.signing_key.serialize_der(),
+        )
+        .unwrap();
+        let profile_path = root.path().join("control-profile.json");
+        let profile_json = serde_json::json!({
+            "authority": authority, "authorization": root_grant,
+            "credential": "app.credential",
+            "local": {"certificate": "control.cert.der", "server_name": "localhost"},
+        });
+        hellas_private::write_atomically(
+            &profile_path,
+            ".writing",
+            &serde_json::to_vec(&profile_json).unwrap(),
+        )
+        .unwrap();
+        let socket = grant_config.control_socket.clone();
+        let journal = grant_config.journal_root.clone();
+        let mut executor = ExecutorSpawnConfig::fetch_only(
+            Arc::new(provider_identity.producer_key.clone()),
+            Assurance::ProducerSigned,
+            FetchRouteRegistry::default(),
+        );
+        executor.queue_capacity = 4;
+        executor.fetch_max_in_flight = 1;
+        executor.fetch_queue_capacity = 1;
+        let daemon = hellas_sdk::node_control::host::HostHandle::serve(
+            hellas_sdk::ProviderOptions {
+                executor,
+                grants: None,
+                discovery: false,
+                port: Some(0),
+                build: "control-test".into(),
+                graffiti: vec![],
+                work: None,
+                secret_key: provider_identity.transport_key.clone(),
+                open_identity: provider_identity.open_identity(),
+            },
+            Some(grant_config),
+        )
+        .await
+        .unwrap();
+        Self {
+            root,
+            identity,
+            provider_identity,
+            wrong_identity,
+            scope,
+            scope_file,
+            credential_file,
+            profile_path,
+            socket,
+            journal,
+            handle: Some(daemon),
+        }
+    }
+    fn local(&self, command: AdminCommand) -> AdminArgs {
+        AdminArgs {
+            profile: Some(self.profile_path.clone()),
+            control_socket: Some(self.socket.clone()),
+            ..offline_args(command)
+        }
+    }
+    fn remote(&self, profile: PathBuf, command: AdminCommand) -> AdminArgs {
+        let contact = self.root.path().join("node.contact");
+        std::fs::write(
+            &contact,
+            self.provider_identity.enrollment.canonical_bytes(),
+        )
+        .unwrap();
+        AdminArgs {
+            profile: Some(profile),
+            node_contact: Some(contact),
+            addresses: self
+                .handle
+                .as_ref()
+                .unwrap()
+                .provider_endpoint()
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .bound_sockets(),
+            ..offline_args(command)
+        }
+    }
+    async fn client(&self) -> Control {
+        let profile = node_control::profile::ClientProfile::load(&self.profile_path).unwrap();
+        let (tls, name) = profile.local.unwrap();
+        node_control::connect_local(
+            &self.socket,
+            tls,
+            name,
+            profile.authority,
+            &profile.credential,
+            &self.identity.producer_key,
+        )
+        .await
+        .unwrap()
+    }
+    fn reader_scope(&self) -> PathBuf {
+        let mut scope = self.scope.clone();
+        scope.subject =
+            auth::PrincipalId::from_public_key(self.wrong_identity.producer_key.public_key())
+                .unwrap();
+        scope.issuance = None;
+        scope
+            .permissions
+            .retain(|p| p.operation.as_str() == HOST_STATUS);
+        let path = self.root.path().join("reader-scope.json");
+        std::fs::write(&path, serde_json::to_vec(&scope).unwrap()).unwrap();
+        path
+    }
+    fn issue_reader_command(&self) -> AdminCommand {
+        AdminCommand::IssueCredential {
+            scope: self.reader_scope(),
+            credential_out: self.root.path().join("reader.credential"),
+        }
+    }
+    async fn issue_reader(&self) -> Reader {
+        let scope = serde_json::from_slice(&std::fs::read(self.reader_scope()).unwrap()).unwrap();
+        let change = self.root.path().join("issue.json");
+        std::fs::write(
+            &change,
+            serde_json::to_vec(&auth::GrantCommand::Issue {
+                authorization: ROOT_GRANT,
+                id: READER_GRANT,
+                spec: scope,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        run(
+            self.local(AdminCommand::Grant { command: change }),
+            &self.identity,
+        )
+        .await
+        .unwrap();
+        run(
+            self.remote(self.profile_path.clone(), self.issue_reader_command()),
+            &self.identity,
+        )
+        .await
+        .unwrap();
+        let credential_path = self.root.path().join("reader.credential");
+        let credential = node_control::profile::read_credential(&credential_path).unwrap();
+        let profile = self.root.path().join("reader-profile.json");
+        hellas_private::write_atomically(&profile, ".writing", &serde_json::to_vec(&serde_json::json!({
+            "authority": self.scope.authority, "authorization": READER_GRANT, "credential": credential_path,
+        })).unwrap()).unwrap();
+        Reader {
+            credential_path,
+            credential,
+            profile,
+        }
+    }
+    async fn stop(&mut self) {
+        assert!(self.socket.exists());
+        tokio::time::timeout(WAIT, self.handle.take().unwrap().shutdown())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!self.socket.exists(), "shutdown removes the control socket");
+    }
+    async fn store(&self) -> hellas_work::work_store::grant::NodeStore {
+        hellas_work::work_store::grant::NodeStore::open(
+            &self.journal,
+            hellas_work::model::grant::grant_network(),
+            Some(self.provider_identity.enrollment.clone()),
+            auth::UnixMillis::now().unwrap_or_default(),
+        )
+        .await
+        .unwrap()
+    }
+}
+struct Reader {
+    credential_path: PathBuf,
+    credential: auth::CredentialSecret,
+    profile: PathBuf,
+}
+fn status_request() -> hellas_rpc::pb::host::GetHostStatusRequest {
+    hellas_rpc::pb::host::GetHostStatusRequest {
+        authorization: ROOT_GRANT.0.to_vec(),
+    }
+}
+fn assert_permission_denied(error: anyhow::Error) {
+    assert_eq!(
+        error
+            .downcast_ref::<hellas_sdk::wire::WireStatus>()
+            .expect("wire refusal")
+            .code,
+        hellas_sdk::wire::WireCode::PermissionDenied,
+        "{error:#}"
+    );
+}
+
+#[tokio::test]
+async fn online_admin_requires_an_explicit_profile() {
+    let mut daemon = Daemon::start().await;
+    let error = run(offline_args(AdminCommand::Status), &daemon.identity)
+        .await
+        .unwrap_err();
+    assert_eq!(error.to_string(), "--profile is required");
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn local_capacity_command_reaches_the_running_host() {
+    let mut daemon = Daemon::start().await;
+    let limits = daemon.root.path().join("machine-limits.json");
+    let budget = vec![hellas_work::model::grant::budget::Limit {
+        meter: hellas_work::model::grant::budget::Meter::Requests,
+        window: hellas_work::model::grant::budget::Window::Total,
+        amount: 7,
+    }];
+    std::fs::write(&limits, serde_json::to_vec(&budget).unwrap()).unwrap();
+    let client = daemon.client().await;
+    let before = client.get_host_status(status_request()).await.unwrap();
+    assert!(before.machine.is_none());
+    run(
+        daemon.local(AdminCommand::SetCapacity {
+            limits,
+            expected_revision: 0,
+            max_in_flight: 3,
+        }),
+        &daemon.identity,
+    )
+    .await
+    .unwrap();
+    let machine = client
+        .get_host_status(status_request())
+        .await
+        .unwrap()
+        .machine
+        .unwrap();
+    assert_eq!(machine.max_in_flight, 3);
+    assert_eq!(
+        hellas_rpc::protocol::value::decode_dag_cbor::<
+            Vec<hellas_work::model::grant::budget::Limit>,
+        >(&machine.limits)
+        .unwrap(),
+        budget
+    );
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn local_profile_requires_its_own_identity() {
+    let mut daemon = Daemon::start().await;
+    assert_permission_denied(
+        run(daemon.local(AdminCommand::Status), &daemon.wrong_identity)
+            .await
+            .unwrap_err(),
+    );
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn existing_credential_output_refuses_before_issuing_again() {
+    let mut daemon = Daemon::start().await;
+    let reader = daemon.issue_reader().await;
+    let client = daemon.client().await;
+    let original = std::fs::read(&reader.credential_path).unwrap();
+    let before = client
+        .get_host_status(status_request())
+        .await
+        .unwrap()
+        .authority_revision;
+    let error = run(
+        daemon.local(daemon.issue_reader_command()),
+        &daemon.identity,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.to_string(), "credential output already exists");
+    assert_eq!(std::fs::read(&reader.credential_path).unwrap(), original);
+    assert_eq!(
+        client
+            .get_host_status(status_request())
+            .await
+            .unwrap()
+            .authority_revision,
+        before
+    );
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn issued_credential_is_private_and_revocation_reaches_remote_authentication() {
+    let mut daemon = Daemon::start().await;
+    let reader = daemon.issue_reader().await;
+    assert!(
+        hellas_private::is_private(&std::fs::File::open(&reader.credential_path).unwrap()).unwrap()
+    );
+    run(
+        daemon.remote(reader.profile.clone(), AdminCommand::Status),
+        &daemon.wrong_identity,
+    )
+    .await
+    .unwrap();
+    run(
+        daemon.local(AdminCommand::RevokeCredential {
+            credential_id: reader.credential.id().to_string(),
+            expected_revision: 1,
+        }),
+        &daemon.identity,
+    )
+    .await
+    .unwrap();
+    assert_permission_denied(
+        run(
+            daemon.remote(reader.profile, AdminCommand::Status),
+            &daemon.wrong_identity,
+        )
+        .await
+        .unwrap_err(),
+    );
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn offline_recovery_publishes_a_usable_replacement_credential() {
+    let mut daemon = Daemon::start().await;
+    daemon.stop().await;
+    let store = daemon.store().await;
+    let expected_revision = store.state().authority().revision().0;
+    drop(store);
+    let recovered_path = daemon.root.path().join("recovered.credential");
+    run(
+        offline_args(AdminCommand::Recover {
+            expected_revision,
+            state: OfflineArgs {
+                journal: daemon.journal.clone(),
+                administrator: daemon.scope_file.clone(),
+                credential_scope: daemon.scope_file.clone(),
+                credential_out: recovered_path.clone(),
+            },
+        }),
+        &daemon.identity,
+    )
+    .await
+    .unwrap();
+    let store = daemon.store().await;
+    let authority = store.state().authority();
+    let original = node_control::profile::read_credential(&daemon.credential_file).unwrap();
+    hellas_auth::assert_err!(
+        authority.authenticate(&original, auth::UnixMillis::now().unwrap_or_default()),
+        auth::AuthorityError::Credential
+    );
+    let replacement = node_control::profile::read_credential(&recovered_path).unwrap();
+    let caller = authority
+        .authenticate(&replacement, auth::UnixMillis::now().unwrap_or_default())
+        .unwrap();
+    assert_eq!(caller.subject(), daemon.scope.subject);
+}

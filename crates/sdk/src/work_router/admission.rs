@@ -104,3 +104,6 @@ pub(super) fn capacity() -> WireStatus {
         "Work connection admission is at capacity",
     )
 }
+
+#[cfg(test)]
+mod tests;

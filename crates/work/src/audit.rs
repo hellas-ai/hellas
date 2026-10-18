@@ -136,3 +136,6 @@ impl Drop for Decision {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

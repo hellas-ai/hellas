@@ -140,3 +140,6 @@ pub(crate) fn validate_scope(state: &State, scope: &GrantSpec) -> Result<(), Aut
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;

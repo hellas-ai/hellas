@@ -24,6 +24,8 @@ use hellas_rpc::ProviderEnrollmentBundle;
 use hellas_rpc::protocol::value::{decode_canonical_bounded, encode_bounded};
 use std::path::Path;
 mod bootstrap;
+#[cfg(test)]
+mod tests;
 
 // Includes a maximum-depth dispatch audit record and terminal/accounting growth.
 pub(super) const TERMINAL_HEADROOM: usize = 5120;
