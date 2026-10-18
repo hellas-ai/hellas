@@ -1,5 +1,6 @@
 use super::*;
-use hellas_rpc::{Assurance, Digest};
+use hellas_auth::Digest;
+use hellas_rpc::Assurance;
 
 #[test]
 fn gpu_configuration_is_bounded() {

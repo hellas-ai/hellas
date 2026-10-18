@@ -1,330 +1,262 @@
 use super::*;
-use axum::Router;
-use axum::routing::get;
-use std::sync::Mutex;
+use axum::{Router, routing::get};
+use hellas_auth::{Digest, authority::*};
+use hellas_work::{
+    node::{GATEWAY_INVOKE, host_resource},
+    test_support::{Rights, TestClock, actors::ROOT, assert_err, common_node, ids::ROOT_GRANT},
+    work_store::grant::NodeStore,
+};
 use tower::ServiceExt;
 
-/// A bearer with a known token, so tests can present the right one.
-fn fixed_bearer() -> (Arc<Bearer>, String) {
-    let mut token = [0u8; TOKEN_BYTES];
-    for (index, byte) in token.iter_mut().enumerate() {
-        *byte = index as u8;
-    }
-    let hex = encode_hex(&token);
-    (Arc::new(Bearer { token }), hex)
-}
+const HTTP_ACCESS: GrantId = GrantId([104; 16]);
 
-fn guarded_router(bearer: Arc<Bearer>) -> Router {
+pub(crate) struct Fixture {
+    pub(crate) root: tempfile::TempDir,
+    pub(crate) access: GatewayAccess,
+    admin: CredentialSecret,
+    clock: TestClock,
+    grant_revision: Revision,
+}
+impl Fixture {
+    pub(crate) async fn new() -> Self {
+        let root = tempfile::tempdir().unwrap();
+        let authority = AuthorityId(Digest::hash(b"HTTP gateway authority"));
+        let subject = ROOT.principal();
+        let now = UnixMillis(1000);
+        let administrator = common_node::admin_spec(
+            authority,
+            subject,
+            &[(GATEWAY_INVOKE, host_resource(authority))],
+            (now, UnixMillis(100_000)),
+            (99_000, 0),
+            &[],
+        );
+        let (store, admin) = NodeStore::bootstrap(
+            root.path(),
+            hellas_work::model::grant::grant_network(),
+            ROOT_GRANT,
+            administrator.clone(),
+            administrator,
+            None,
+            now,
+        )
+        .await
+        .unwrap();
+        let clock = TestClock::new(now);
+        let node = NodeCoordinator::new(store, clock.source());
+        let caller = node.authenticate(&admin).await.unwrap();
+        let scope = Rights::new(authority, ROOT)
+            .allow(GATEWAY_INVOKE, host_resource(authority))
+            .valid_from(now)
+            .valid_until(UnixMillis(90_000))
+            .build();
+        let issued = node
+            .grant(
+                &caller,
+                GrantCommand::Issue {
+                    authorization: ROOT_GRANT,
+                    id: HTTP_ACCESS,
+                    spec: scope.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        let (_, credential) = node
+            .issue_credential(&caller, ROOT_GRANT, scope)
+            .await
+            .unwrap();
+        let access = GatewayAccess::new(node, HTTP_ACCESS, credential)
+            .await
+            .unwrap();
+        Self {
+            root,
+            access,
+            admin,
+            clock,
+            grant_revision: issued.revision(),
+        }
+    }
+}
+fn router(access: GatewayAccess) -> Router {
     Router::new()
-        .route("/v1/chat/completions", get(|| async { "reached" }))
-        .layer(BearerLayer::new(bearer))
+        .route(
+            "/invoke",
+            get(|headers: HeaderMap| async move {
+                assert!(!headers.contains_key(header::AUTHORIZATION));
+                "reached"
+            }),
+        )
+        .layer(BearerLayer::new(access))
 }
-
-async fn status_of(router: &Router, request: Request<Body>) -> StatusCode {
-    router.clone().oneshot(request).await.unwrap().status()
-}
-
-fn get_request(uri: &str) -> axum::http::request::Builder {
-    Request::builder().method("GET").uri(uri)
-}
-
-#[tokio::test]
-async fn missing_header_is_refused() {
-    let (bearer, _) = fixed_bearer();
-    let router = guarded_router(bearer);
-    let request = get_request("/v1/chat/completions")
-        .body(Body::empty())
-        .unwrap();
-    assert_eq!(status_of(&router, request).await, StatusCode::UNAUTHORIZED);
-}
-
-#[tokio::test]
-async fn wrong_value_is_refused() {
-    let (bearer, hex) = fixed_bearer();
-    let router = guarded_router(bearer);
-    // Same length, one nibble different.
-    let mut wrong = hex.clone();
-    wrong.replace_range(0..1, "f");
-    assert_eq!(wrong.len(), hex.len());
-    let request = get_request("/v1/chat/completions")
-        .header(header::AUTHORIZATION, format!("Bearer {wrong}"))
-        .body(Body::empty())
-        .unwrap();
-    assert_eq!(status_of(&router, request).await, StatusCode::UNAUTHORIZED);
-}
-
-#[tokio::test]
-async fn wrong_length_is_refused() {
-    let (bearer, hex) = fixed_bearer();
-    let router = guarded_router(bearer);
-    for credential in [
-        String::new(),
-        hex[..TOKEN_HEX_LEN - 1].to_string(),
-        format!("{hex}0"),
-        hex.repeat(3),
-    ] {
-        let request = get_request("/v1/chat/completions")
-            .header(header::AUTHORIZATION, format!("Bearer {credential}"))
-            .body(Body::empty())
-            .unwrap();
-        assert_eq!(
-            status_of(&router, request).await,
-            StatusCode::UNAUTHORIZED,
-            "a {}-character credential was accepted",
-            credential.len()
-        );
+async fn status(router: &Router, token: Option<&str>) -> StatusCode {
+    let mut request = Request::builder().uri("/invoke");
+    if let Some(token) = token {
+        request = request.header(header::AUTHORIZATION, token);
     }
+    router
+        .clone()
+        .oneshot(request.body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+        .status()
 }
-
 #[tokio::test]
-async fn right_token_in_a_query_parameter_is_refused() {
-    let (bearer, hex) = fixed_bearer();
-    let router = guarded_router(bearer);
-    for uri in [
-        format!("/v1/chat/completions?access_token={hex}"),
-        format!("/v1/chat/completions?authorization=Bearer%20{hex}"),
-    ] {
-        let request = get_request(&uri).body(Body::empty()).unwrap();
-        assert_eq!(
-            status_of(&router, request).await,
-            StatusCode::UNAUTHORIZED,
-            "a credential in the query string was accepted: {uri}"
-        );
-    }
-}
-
-#[tokio::test]
-async fn right_token_in_another_header_is_refused() {
-    let (bearer, hex) = fixed_bearer();
-    let router = guarded_router(bearer);
-    for name in ["x-api-key", "x-hellas-authorization", "proxy-authorization"] {
-        let request = get_request("/v1/chat/completions")
-            .header(name, format!("Bearer {hex}"))
-            .body(Body::empty())
-            .unwrap();
-        assert_eq!(
-            status_of(&router, request).await,
-            StatusCode::UNAUTHORIZED,
-            "a credential in `{name}` was accepted"
-        );
-    }
-    // And a cookie carrying it is no better.
-    let request = get_request("/v1/chat/completions")
-        .header(header::COOKIE, format!("authorization=Bearer {hex}"))
-        .body(Body::empty())
-        .unwrap();
-    assert_eq!(status_of(&router, request).await, StatusCode::UNAUTHORIZED);
-}
-
-#[tokio::test]
-async fn correct_authorization_bearer_is_accepted() {
-    let (bearer, hex) = fixed_bearer();
-    let router = guarded_router(bearer);
+async fn bearer_schemes_are_case_insensitive() {
+    let fixture = Fixture::new().await;
+    let app = router(fixture.access.clone());
     for scheme in ["Bearer", "bearer", "BEARER"] {
-        let request = get_request("/v1/chat/completions")
-            .header(header::AUTHORIZATION, format!("{scheme} {hex}"))
-            .body(Body::empty())
-            .unwrap();
         assert_eq!(
-            status_of(&router, request).await,
-            StatusCode::OK,
-            "`{scheme}` with the run's credential was refused"
+            status(&app, Some(&format!("{scheme} {}", fixture.access.bearer()))).await,
+            StatusCode::OK
         );
     }
 }
-
-/// The clause is about work, and work is what this asserts: every
-/// input length costs the same number of digit steps. This is a
-/// shape assertion, not a timing measurement — a wall-clock test
-/// would be flaky — but it is the shape the clause is about, because
-/// an early `len() !=` return is precisely what would make the counts
-/// differ.
-#[test]
-fn compare_does_not_short_circuit_on_length() {
-    let (bearer, hex) = fixed_bearer();
-    let mut counts = Vec::new();
-    for credential in [
+#[tokio::test]
+async fn malformed_bearers_are_unauthorized() {
+    let fixture = Fixture::new().await;
+    let app = router(fixture.access.clone());
+    assert_eq!(status(&app, None).await, StatusCode::UNAUTHORIZED);
+    for value in [
         String::new(),
-        "0".to_string(),
-        hex[..TOKEN_HEX_LEN - 1].to_string(),
-        hex.clone(),
-        format!("{hex}{hex}"),
-        "z".repeat(4096),
+        "ff".repeat(48),
+        format!("{}0", fixture.access.bearer()),
+        "z".repeat(96),
     ] {
-        DIGIT_STEPS.set(0);
-        let _ = bearer.accepts(credential.as_bytes());
-        counts.push(DIGIT_STEPS.get());
+        assert_eq!(
+            status(&app, Some(&format!("Bearer {value}"))).await,
+            StatusCode::UNAUTHORIZED
+        );
     }
-    assert!(
-        counts.iter().all(|count| *count == TOKEN_HEX_LEN),
-        "digit steps varied with the credential's length: {counts:?}"
+}
+#[tokio::test]
+async fn legacy_sixty_four_character_tokens_are_unauthorized() {
+    let fixture = Fixture::new().await;
+    assert_eq!(
+        status(
+            &router(fixture.access),
+            Some(&format!("Bearer {}", "11".repeat(32)))
+        )
+        .await,
+        StatusCode::UNAUTHORIZED
     );
 }
-
-/// Records everything any `tracing` subscriber would be handed, so
-/// the "never logged" clause is asserted rather than merely intended.
-#[derive(Clone, Default)]
-struct Recorder {
-    lines: Arc<Mutex<Vec<String>>>,
-}
-
-struct Collect(String);
-
-impl tracing::field::Visit for Collect {
-    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn fmt::Debug) {
-        use fmt::Write;
-        let _ = write!(self.0, "{}={value:?} ", field.name());
-    }
-}
-
-impl Recorder {
-    fn push(&self, metadata: &tracing::Metadata<'_>, collected: Collect) {
-        self.lines.lock().unwrap().push(format!(
-            "{} {} {}",
-            metadata.target(),
-            metadata.name(),
-            collected.0
-        ));
-    }
-
-    fn captured(&self) -> Vec<String> {
-        self.lines.lock().unwrap().clone()
-    }
-}
-
-impl tracing::Subscriber for Recorder {
-    fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
-        true
-    }
-
-    /// `sometimes`, not the default `always`/`never`, because the
-    /// interest cache is global while this subscriber is only the
-    /// default on one thread. Cached as `never` by a sibling test
-    /// running without a subscriber, the callsite would go quiet and
-    /// this test would pass over a credential it never saw.
-    fn register_callsite(
-        &self,
-        _metadata: &'static tracing::Metadata<'static>,
-    ) -> tracing::subscriber::Interest {
-        tracing::subscriber::Interest::sometimes()
-    }
-
-    fn new_span(&self, span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-        let mut collected = Collect(String::new());
-        span.record(&mut collected);
-        self.push(span.metadata(), collected);
-        tracing::span::Id::from_u64(1)
-    }
-
-    fn record(&self, _span: &tracing::span::Id, values: &tracing::span::Record<'_>) {
-        let mut collected = Collect(String::new());
-        values.record(&mut collected);
-        self.lines.lock().unwrap().push(collected.0);
-    }
-
-    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
-
-    fn event(&self, event: &tracing::Event<'_>) {
-        let mut collected = Collect(String::new());
-        event.record(&mut collected);
-        self.push(event.metadata(), collected);
-    }
-
-    fn enter(&self, _span: &tracing::span::Id) {}
-
-    fn exit(&self, _span: &tracing::span::Id) {}
-}
-
 #[tokio::test]
-async fn credential_reaches_no_trace_no_error_body_and_no_debug() {
-    let (bearer, hex) = fixed_bearer();
-
-    // `{:?}` is the way a secret usually escapes: a struct holding it
-    // is logged whole. This one cannot be.
-    assert_eq!(format!("{bearer:?}"), "Bearer(redacted)");
-    assert!(!format!("{bearer:?}").contains(&hex));
-
-    let recorder = Recorder::default();
-    let guard = tracing::subscriber::set_default(recorder.clone());
-    // Drop whatever interest a sibling test's no-op subscriber cached,
-    // so these callsites are re-asked and reach the recorder.
-    tracing::callsite::rebuild_interest_cache();
-    let router = guarded_router(bearer.clone());
-
-    // Every path: accepted, refused for each reason, and the
-    // announcement (which finds no tty under `cargo test`).
-    let mut bodies = Vec::new();
-    let requests = vec![
-        get_request("/v1/chat/completions")
-            .body(Body::empty())
-            .unwrap(),
-        get_request("/v1/chat/completions")
-            .header(header::AUTHORIZATION, format!("Bearer {hex}"))
-            .body(Body::empty())
-            .unwrap(),
-        get_request("/v1/chat/completions")
-            .header(header::AUTHORIZATION, format!("Bearer {hex}extra"))
-            .body(Body::empty())
-            .unwrap(),
-        get_request("/v1/chat/completions")
-            .header(header::AUTHORIZATION, "Bearer deadbeef")
-            .body(Body::empty())
-            .unwrap(),
-        get_request(&format!("/v1/chat/completions?access_token={hex}"))
-            .body(Body::empty())
-            .unwrap(),
-        get_request("/v1/chat/completions")
-            .header("x-api-key", format!("Bearer {hex}"))
-            .body(Body::empty())
-            .unwrap(),
-    ];
-    for request in requests {
-        let response = router.clone().oneshot(request).await.unwrap();
-        let headers = format!("{:?}", response.headers());
-        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+async fn query_tokens_do_not_authenticate() {
+    let fixture = Fixture::new().await;
+    let request = Request::builder()
+        .uri(format!("/invoke?access_token={}", fixture.access.bearer()))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        router(fixture.access)
+            .oneshot(request)
             .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+}
+#[tokio::test]
+async fn alternate_headers_do_not_authenticate() {
+    let fixture = Fixture::new().await;
+    let app = router(fixture.access.clone());
+    for name in ["x-api-key", "cookie", "proxy-authorization"] {
+        let request = Request::builder()
+            .uri("/invoke")
+            .header(name, format!("Bearer {}", fixture.access.bearer()))
+            .body(Body::empty())
             .unwrap();
-        bodies.push(headers);
-        bodies.push(String::from_utf8_lossy(&body).into_owned());
-    }
-    bearer.announce();
-    drop(guard);
-
-    for line in recorder.captured() {
-        assert!(
-            !line.contains(&hex),
-            "the run's credential reached a trace event: {line}"
-        );
-    }
-    for body in bodies {
-        assert!(
-            !body.contains(&hex),
-            "the run's credential was echoed back to the caller: {body}"
+        assert_eq!(
+            app.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
         );
     }
 }
-
 #[tokio::test]
-async fn loopback_is_decided_by_parsing_not_by_spelling() {
-    // `127.0.0.2` is loopback and is not the string `127.0.0.1`, so
-    // only a parsed check accepts it.
-    for host in ["127.0.0.1", "127.0.0.2", "::1"] {
-        let addr = bind_addr(host, 0, false)
+async fn repeated_authorization_headers_are_unauthorized() {
+    let fixture = Fixture::new().await;
+    let token = format!("Bearer {}", fixture.access.bearer());
+    let request = Request::builder()
+        .uri("/invoke")
+        .header(header::AUTHORIZATION, &token)
+        .header(header::AUTHORIZATION, &token)
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        router(fixture.access)
+            .oneshot(request)
             .await
-            .unwrap_or_else(|err| panic!("`{host}` should be loopback: {err}"));
-        assert!(addr.ip().is_loopback());
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+}
+#[tokio::test]
+async fn gateway_access_debug_redacts_credentials() {
+    let fixture = Fixture::new().await;
+    assert_eq!(format!("{:?}", fixture.access), "GatewayAccess(redacted)");
+}
+#[tokio::test]
+async fn http_admission_consults_current_authority() {
+    enum Change {
+        Credential,
+        Grant,
+        Expiry,
     }
+    for revoke in [Change::Credential, Change::Grant, Change::Expiry] {
+        let fixture = Fixture::new().await;
+        let node = &fixture.access.node;
+        let caller = node.authenticate(&fixture.admin).await.unwrap();
+        let app = router(fixture.access.clone());
+        let token = format!("Bearer {}", fixture.access.bearer());
+        assert_eq!(status(&app, Some(&token)).await, StatusCode::OK);
+        match revoke {
+            Change::Credential => {
+                node.revoke_credential(
+                    &caller,
+                    ROOT_GRANT,
+                    fixture.access.credential.id(),
+                    Revision(1),
+                )
+                .await
+                .unwrap();
+            }
+            Change::Grant => {
+                node.grant(
+                    &caller,
+                    GrantCommand::Revoke {
+                        authorization: ROOT_GRANT,
+                        id: HTTP_ACCESS,
+                        expected: fixture.grant_revision,
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            Change::Expiry => {
+                fixture.clock.set(UnixMillis(90_000));
+            }
+        }
+        assert_eq!(status(&app, Some(&token)).await, StatusCode::UNAUTHORIZED);
+    }
+}
+#[tokio::test]
+async fn listening_remotely_requires_explicit_opt_in() {
+    bind_addr("127.0.0.1", 0, false).await.unwrap();
+    assert_err!(
+        bind_addr("0.0.0.0", 0, false).await,
+        crate::GatewayError::Config(crate::GatewayConfigError::RemoteBinding)
+    );
+    bind_addr("0.0.0.0", 0, true).await.unwrap();
 }
 
 #[tokio::test]
-async fn explicitly_configured_network_bind_is_resolved() {
-    let addr = bind_addr("192.0.2.1", 8080, true).await.unwrap();
-    assert_eq!(addr, "192.0.2.1:8080".parse().unwrap());
-}
-
-#[tokio::test]
-async fn non_loopback_requires_explicit_remote_access() {
-    for host in ["0.0.0.0", "192.0.2.1", "::"] {
-        assert!(bind_addr(host, 8080, false).await.is_err());
-    }
+async fn administrator_credentials_cannot_be_exposed_as_http_bearers() {
+    let fixture = Fixture::new().await;
+    let node = &fixture.access.node;
+    let caller = node.authenticate(&fixture.admin).await.unwrap();
+    assert_err!(
+        node.authorize_gateway(&caller, ROOT_GRANT).await,
+        hellas_work::work_store::grant::NodeStoreError::Authority(AuthorityError::Denied)
+    );
 }

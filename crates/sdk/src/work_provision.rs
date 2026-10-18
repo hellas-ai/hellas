@@ -6,20 +6,20 @@
 //! journal to verify durability before returning. Unanswered offers reserve their
 //! staked coins as soon as revision one is signed.
 
+use hellas_work::model::grant::records::check_grant_provider;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 mod error;
 pub use error::ProvisionError;
 type Result<T, E = ProvisionError> = std::result::Result<T, E>;
-#[cfg(any(feature = "paid-client", feature = "paid-provider"))]
 use hellas_chain::WorkBlocks;
 use hellas_chain::domain::MAX_EDGE_LIFETIME_BLOCKS;
 use hellas_kernel::{
     BlockHeight, CoinId, EdgeId, Funding, Key, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, NetworkId,
     Parties, Payout, Secp256k1Signer, Secp256k1Verifier, Terms, Tx, WorkStakeBondTerms,
 };
-use hellas_rpc::protocol::work_setup::ProviderChannelPolicy;
+use hellas_work::model::setup::ProviderChannelPolicy;
 use hellas_work::work_close::FinalizedBlocks;
 use hellas_work::work_handshake::{PaymentAdmission, SetupEndpoint};
 use hellas_work::work_store::{Role, SetupScan, SetupStore, discover_setups};
@@ -55,21 +55,20 @@ pub fn preview_bond(options: &ProvisionOptions) -> Result<EdgeId> {
 }
 
 /// Sign and journal an offer under an existing provider identity.
-#[cfg(any(feature = "paid-client", feature = "paid-provider"))]
 pub async fn provision_offer(
     options: ProvisionOptions,
     node: &hellas_chain::node::FullNode,
 ) -> Result<Provisioned> {
     options.work_config.check_node(node)?;
     let candidate = BondCandidate::plan(&options)?;
-    let offer = Offer::plan(&options, options.work_config.provider_policy(), candidate)?;
+    let offer = Offer::plan(&options, options.work_config.provider_policy(), candidate).await?;
     let view = tokio::time::timeout(std::time::Duration::from_secs(30), node.wait_ready())
         .await
         .map_err(|_| ProvisionError::NoFinalizedBlock)??;
     let floor = floor_of(&WorkBlocks::new(view.client()))
         .await?
         .ok_or(ProvisionError::NoFinalizedBlock)?;
-    offer.journal(floor)
+    offer.journal(floor).await
 }
 
 /// One offer as the disk holds it, read back after it was written.
@@ -80,7 +79,7 @@ pub struct Provisioned {
     pub bond_edge: EdgeId,
     /// The floor its history starts above, as retained.
     pub floor: SetupScan,
-    pub offer: hellas_rpc::protocol::work_offer::SignedPaidOffer,
+    pub offer: hellas_work::model::offer::SignedPaidOffer,
 }
 
 /// Deterministic inputs shared by bond preview and provisioning.
@@ -137,19 +136,17 @@ struct Offer {
 impl Offer {
     /// Reads the operator's answers, and refuses everything refusable
     /// without a chain.
-    fn plan(
+    async fn plan(
         options: &ProvisionOptions,
         policy: ProviderChannelPolicy,
         candidate: BondCandidate,
     ) -> Result<Self> {
-        options
-            .provider
-            .check_grant_provider()
-            .map_err(|_| hellas_rpc::protocol::work_offer::PaidOfferError::Provider)?;
+        check_grant_provider(&options.provider)
+            .map_err(|_| hellas_work::model::offer::PaidOfferError::Provider)?;
         if options.provider.genesis.statement.producer_public_key
-            != hellas_rpc::PublicKey::Secp256k1(options.settlement_key.party_key().to_bytes())
+            != hellas_auth::PublicKey::Secp256k1(options.settlement_key.party_key().to_bytes())
         {
-            return Err(hellas_rpc::protocol::work_offer::PaidOfferError::Provider.into());
+            return Err(hellas_work::model::offer::PaidOfferError::Provider.into());
         }
         if options.addresses.len() > 16
             || options
@@ -158,14 +155,14 @@ impl Offer {
                 .any(|a| a.len() > 512 || a.parse::<std::net::SocketAddr>().is_err())
             || options.provider.canonical_bytes().len() > 32 * 1024
         {
-            return Err(hellas_rpc::protocol::work_offer::PaidOfferError::Malformed.into());
+            return Err(hellas_work::model::offer::PaidOfferError::Malformed.into());
         }
         let route = route_for_candidate(
             &options.work_config,
             candidate.bond_edge,
             &candidate.bond_terms,
         )?;
-        refuse_offer_collisions(&options.work_config, route, &candidate.bond_funding)?;
+        refuse_offer_collisions(&options.work_config, route, &candidate.bond_funding).await?;
         Ok(Self {
             candidate,
             admission: PaymentAdmission::Admits(Box::new(policy)),
@@ -176,7 +173,7 @@ impl Offer {
 
     /// Journals revision 1, and returns only once a fresh open of the
     /// journal replays it.
-    fn journal(self, floor: SetupScan) -> Result<Provisioned> {
+    async fn journal(self, floor: SetupScan) -> Result<Provisioned> {
         let timeout = self.candidate.bond_terms.timeout.get();
         if timeout <= floor.height {
             return Err(ProvisionError::ExpiredBond {
@@ -202,7 +199,7 @@ impl Offer {
             settlement_key,
         } = candidate;
         {
-            let store = open_provider_journal(&journal_root, network, bond_edge)?;
+            let store = open_provider_journal(&journal_root, network, bond_edge).await?;
             let mut endpoint = SetupEndpoint::new(store, settlement_key.clone(), admission);
             // Preserve the journal's immutable history floor on retry.
             if let Some(held) = endpoint.state().scan_armed() {
@@ -211,13 +208,15 @@ impl Offer {
                     "this journal already holds its history floor, and a floor does not move",
                 );
             } else {
-                endpoint.arm_scan(floor)?;
+                endpoint.arm_scan(floor).await?;
             }
-            endpoint.propose_bond(network, bond_funding, bond_terms)?;
+            endpoint
+                .propose_bond(network, bond_funding, bond_terms)
+                .await?;
         }
 
         // Reopen with the same replay and signature checks used at startup.
-        let reopened = open_provider_journal(&journal_root, network, bond_edge)?;
+        let reopened = open_provider_journal(&journal_root, network, bond_edge).await?;
         let state = reopened.state();
         let (Some(1), Some(floor)) = (state.revision(), state.scan_armed()) else {
             return Err(ProvisionError::JournalReplay {
@@ -226,8 +225,8 @@ impl Offer {
                 floor: state.scan_armed().map(|scan| scan.height),
             });
         };
-        let offer = hellas_rpc::protocol::work_offer::SignedPaidOffer::sign(
-            hellas_rpc::protocol::work_offer::PaidOffer {
+        let offer = hellas_work::model::offer::SignedPaidOffer::sign(
+            hellas_work::model::offer::PaidOffer {
                 provider,
                 proposal: state
                     .bundle()
@@ -245,7 +244,11 @@ impl Offer {
     }
 }
 
-fn open_provider_journal(root: &Path, network: NetworkId, bond_edge: EdgeId) -> Result<SetupStore> {
+async fn open_provider_journal(
+    root: &Path,
+    network: NetworkId,
+    bond_edge: EdgeId,
+) -> Result<SetupStore> {
     SetupStore::open(
         root,
         network,
@@ -253,6 +256,7 @@ fn open_provider_journal(root: &Path, network: NetworkId, bond_edge: EdgeId) -> 
         Role::Provider,
         &Secp256k1Verifier::new(),
     )
+    .await
     .map_err(|source| ProvisionError::Journal {
         root: root.into(),
         source,
@@ -276,17 +280,19 @@ fn route_for_candidate<'config>(
 
 /// Checks route, bond and coin reservations before opening the candidate journal.
 /// Unidentified or unreadable existing journals prevent provisioning.
-fn refuse_offer_collisions(
+async fn refuse_offer_collisions(
     config: &WorkConfig,
     candidate: &WorkRoute,
     candidate_funding: &Funding,
 ) -> Result<()> {
     let root = &config.journal_root;
     let network = config.chain.network;
-    let found = discover_setups(root, network).map_err(|source| ProvisionError::Journal {
-        root: root.clone(),
-        source,
-    })?;
+    let found = discover_setups(root, network)
+        .await
+        .map_err(|source| ProvisionError::Journal {
+            root: root.clone(),
+            source,
+        })?;
     if let Some(unnamed) = found.unidentified.into_iter().next() {
         return Err(ProvisionError::Unidentified {
             path: unnamed.path,
@@ -308,7 +314,7 @@ fn refuse_offer_collisions(
             .iter()
             .find(|route| route.bond == held.bond_edge)
             .ok_or(ProvisionError::MissingRoute(held.bond_edge))?;
-        let store = open_provider_journal(root, network, held.bond_edge)?;
+        let store = open_provider_journal(root, network, held.bond_edge).await?;
         let bundle = store
             .state()
             .bundle()
@@ -376,12 +382,7 @@ fn staked(ids: &[CoinId]) -> Result<List<CoinId, MAX_PARTY_INPUTS>> {
             return Err(ProvisionError::DuplicateCoin(*coin));
         }
     }
-    let slots = std::array::from_fn(|i| {
-        ids.get(i)
-            .copied()
-            .unwrap_or(CoinId::from_bytes([0; CoinId::LENGTH]))
-    });
-    Ok(List::take(slots, ids.len()))
+    crate::work_config::coin_list(ids).ok_or(ProvisionError::StakeCount(ids.len()))
 }
 
 #[cfg(test)]

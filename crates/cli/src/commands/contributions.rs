@@ -1,7 +1,9 @@
-//! Contacts and private Offers are scoped to the current enrolled identity.
+//! Contacts and private Offers are scoped to the current portable identity.
 use super::{CliResult, read_bounded_regular_file};
-use anyhow::{Context, ensure};
-use hellas_rpc::protocol::work_grant::{UnixMillis, records::*};
+use anyhow::ensure;
+use hellas_auth::authority::{PrincipalId, UnixMillis};
+use hellas_work::model::grant::records::*;
+use hellas_work::model::grant::records::{decode_contact, principal_id, verify_contact};
 use std::{
     io::Write,
     path::{Path, PathBuf},
@@ -25,7 +27,7 @@ pub enum ContactCommand {
 }
 #[derive(clap::Subcommand)]
 pub enum OfferCommand {
-    /// Verify the provider signature and require this identity as the audience.
+    /// Verify the provider signature and save the Work terms.
     Import {
         file: PathBuf,
         #[arg(long)]
@@ -34,16 +36,17 @@ pub enum OfferCommand {
         replace: bool,
     },
 }
-pub fn principal(identity: &crate::identity::LocalIdentity) -> CliResult<Principal> {
-    Principal::verify(identity.enrollment.clone())
-        .context("identity cannot participate in grant Work")
+pub fn principal(identity: &crate::identity::LocalIdentity) -> CliResult<PrincipalId> {
+    Ok(PrincipalId::from_public_key(
+        identity.producer_key.public_key(),
+    )?)
 }
-pub(crate) fn data_root(identity: &Principal) -> CliResult<PathBuf> {
+pub(crate) fn data_root(identity: &PrincipalId) -> CliResult<PathBuf> {
     let base = match std::env::var_os("HELLAS_GRANT_DATA_DIR") {
         Some(path) => PathBuf::from(path),
         None => crate::identity::default_grant_data_path()?,
     };
-    Ok(base.join(identity.id().0.to_string()))
+    Ok(base.join(hex::encode(identity.as_bytes())))
 }
 fn alias(root: &Path, kind: &str, name: &str) -> CliResult<PathBuf> {
     ensure!(
@@ -70,15 +73,18 @@ pub fn contact(
     command: ContactCommand,
     identity: &crate::identity::LocalIdentity,
 ) -> CliResult<()> {
+    let enrollment = &identity.enrollment;
+    verify_contact(enrollment)?;
     let identity = principal(identity)?;
     match command {
         ContactCommand::Export { out } => {
-            let bytes = identity.bundle().canonical_bytes();
+            let bytes = enrollment.canonical_bytes();
             if let Some(path) = out {
                 save(&path, &bytes)?;
             } else {
                 std::io::stdout().lock().write_all(&bytes)?;
             }
+            eprintln!("Identity fingerprint: {}", identity.fingerprint());
         }
         ContactCommand::Import {
             file,
@@ -86,10 +92,10 @@ pub fn contact(
             replace,
         } => {
             let bytes = read_bounded_regular_file(&file, "contact", MAX_PRINCIPAL_BYTES)?;
-            let imported = Principal::decode(&bytes)?;
+            let imported = decode_contact(&bytes)?;
             let path = alias(&data_root(&identity)?, "contacts", &name)?;
             if path.exists() && !replace {
-                let previous = Principal::decode(&read_bounded_regular_file(
+                let previous = decode_contact(&read_bounded_regular_file(
                     &path,
                     "contact",
                     MAX_PRINCIPAL_BYTES,
@@ -100,7 +106,11 @@ pub fn contact(
                 );
             }
             save(&path, &bytes)?;
-            println!("{}", imported.id().0);
+            println!("{}", hex::encode(principal_id(&imported)?.as_bytes()));
+            eprintln!(
+                "Identity fingerprint: {}",
+                principal_id(&imported)?.fingerprint()
+            );
         }
     }
     Ok(())
@@ -114,12 +124,11 @@ pub fn offer(command: OfferCommand, identity: &crate::identity::LocalIdentity) -
             replace,
         } => {
             let bytes = read_bounded_regular_file(&file, "offer", MAX_OFFER_BYTES)?;
-            let imported = SignedOffer::decode(&bytes, identity.id(), UnixMillis(0))?;
+            let imported = SignedOffer::decode(&bytes, UnixMillis(0))?;
             let path = alias(&data_root(&identity)?, "offers", &name)?;
             if path.exists() && !replace {
                 let previous = SignedOffer::decode(
                     &read_bounded_regular_file(&path, "offer", MAX_OFFER_BYTES)?,
-                    identity.id(),
                     UnixMillis(0),
                 )?;
                 let new = imported.offer();
@@ -140,23 +149,29 @@ pub fn offer(command: OfferCommand, identity: &crate::identity::LocalIdentity) -
             }
             save(&path, &bytes)?;
             println!("{}", hex::encode(imported.offer().grant.id.0));
+            offer_fingerprints(&imported)?;
         }
     }
     Ok(())
 }
 
-#[cfg(feature = "gateway")]
-pub fn client_journal_root(identity: &Principal) -> CliResult<PathBuf> {
+pub(super) fn offer_fingerprints(offer: &SignedOffer) -> CliResult<()> {
+    let provider = hellas_auth::authority::PrincipalId::from_public_key(
+        offer.offer().provider.genesis.statement.producer_public_key,
+    )?;
+    eprintln!("Provider fingerprint: {}", provider.fingerprint(),);
+    Ok(())
+}
+
+pub fn client_journal_root(identity: &PrincipalId) -> CliResult<PathBuf> {
     Ok(data_root(identity)?.join("channels"))
 }
 /// Saved Offer terms may have expired; only use this as a signed locator.
 /// GrantSession obtains fresh authenticated standing before proposing a job.
-#[cfg(feature = "gateway")]
-pub fn load_offer(identity: &Principal, name: &str) -> CliResult<SignedOffer> {
+pub fn load_offer(identity: &PrincipalId, name: &str) -> CliResult<SignedOffer> {
     let path = alias(&data_root(identity)?, "offers", name)?;
     Ok(SignedOffer::decode(
         &read_bounded_regular_file(&path, "offer", MAX_OFFER_BYTES)?,
-        identity.id(),
         UnixMillis(0),
     )?)
 }
@@ -185,9 +200,23 @@ mod tests {
         )
         .unwrap();
         let bytes = std::fs::read(&out).unwrap();
+        assert_eq!(decode_contact(&bytes).unwrap(), identity.enrollment);
+        let mut device = identity.enrollment.clone();
+        device.genesis.statement.transport_public_key = hellas_auth::PublicKey::Ed25519([37; 32]);
+        // The test identity's software root is separate from its producer, so use
+        // that producer as this second device's explicit software root too.
+        device.genesis.statement.root_public_key = identity.producer_key.public_key();
+        device.genesis.root_proof = hellas_rpc::RootProof::Software(
+            identity
+                .producer_key
+                .sign_digest(hellas_auth::Digest::hash(
+                    &device.genesis.statement.canonical_bytes(),
+                ))
+                .unwrap(),
+        );
         assert_eq!(
-            Principal::decode(&bytes).unwrap(),
-            principal(&identity).unwrap()
+            data_root(&principal_id(&device).unwrap()).unwrap(),
+            data_root(&principal(&identity).unwrap()).unwrap()
         );
         #[cfg(unix)]
         {

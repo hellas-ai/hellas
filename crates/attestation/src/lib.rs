@@ -2,8 +2,9 @@
 mod apple;
 use std::future::Future;
 
+use hellas_auth::Digest;
 use hellas_rpc::pb::execute::AssuranceEvidence;
-use hellas_rpc::{DagCborEncoder, Digest, EventCommitment};
+use hellas_rpc::{DagCborEncoder, EventCommitment};
 
 #[cfg(feature = "apple-app-attest")]
 pub use apple::{
@@ -55,8 +56,25 @@ pub trait RootProver {
 
     fn prove_open_binding(
         &self,
-        binding: hellas_rpc::Digest,
+        binding: hellas_auth::Digest,
     ) -> impl Future<Output = Result<hellas_rpc::RootProof, AttestationError>> + Send;
+}
+
+impl RootProver for hellas_auth::ProducerSigningKey {
+    async fn prove_statement(
+        &self,
+        statement: &[u8],
+    ) -> Result<hellas_rpc::RootProof, AttestationError> {
+        self.prove_open_binding(Digest::hash(statement)).await
+    }
+    async fn prove_open_binding(
+        &self,
+        binding: Digest,
+    ) -> Result<hellas_rpc::RootProof, AttestationError> {
+        self.sign_digest(binding)
+            .map(hellas_rpc::RootProof::Software)
+            .map_err(|_| AttestationError::Signature)
+    }
 }
 
 #[derive(Clone)]

@@ -29,6 +29,7 @@ base64.workspace = true
 flate2 = "1"
 futures = { workspace = true }
 hellas-adaptors.workspace = true
+hellas-auth.workspace = true
 hellas-client = { workspace = true, features = ["iroh", "evaluate"] }
 hellas-executor = { workspace = true, optional = true }
 hellas-presentation.workspace = true
@@ -36,6 +37,7 @@ hellas-private.workspace = true
 hellas-rpc = { workspace = true, features = ["fetch"] }
 hellas-store = { workspace = true, optional = true }
 hellas-wire = { workspace = true, features = ["iroh"] }
+hellas-work.workspace = true
 httpdate = "1"
 iroh.workspace = true
 libc = "0.2"
@@ -57,5 +59,6 @@ zstd = "0.14"
 [dev-dependencies]
 hellas-rpc = { workspace = true, features = ["host-control"] }
 hellas-wire = { workspace = true, features = ["unix"] }
+hellas-work = { workspace = true, features = ["test-support"] }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 tempfile = "3"

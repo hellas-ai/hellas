@@ -57,9 +57,9 @@ let
     ) (builtins.dirOf (normalizeRuntimePath gateway.contentIndex))
     ++ map normalizeRuntimePath gateway.paidWorkJournalRoots
     ++ lib.optional (
-      gateway.bearerTokenFile != null
-      && outsideManagedRoots gatewayManagedWritableRoots gateway.bearerTokenFile
-    ) (builtins.dirOf (normalizeRuntimePath gateway.bearerTokenFile))
+      gateway.authorityJournal != null
+      && outsideManagedRoots gatewayManagedWritableRoots gateway.authorityJournal
+    ) (normalizeRuntimePath gateway.authorityJournal)
   );
   providerWritablePathsAreDisjoint = lib.all (
     writable: lib.all (content: !pathsOverlap writable content) providerContentPaths
@@ -133,8 +133,11 @@ let
     ++ lib.optional (gateway.contentIndex != null) gateway.contentIndex
     ++ lib.optional (gateway.environmentFile != null) gateway.environmentFile
     ++ lib.optional (gateway.paidWorkConfig != null) gateway.paidWorkConfig
-    ++ lib.optional (gateway.bearerTokenFile != null) gateway.bearerTokenFile
+    ++ lib.optional (gateway.trustStore != null) gateway.trustStore
+    ++ lib.optional (gateway.workProfile != null) gateway.workProfile
+    ++ lib.optional (gateway.gatewayProfile != null) gateway.gatewayProfile
     ++ gateway.paidWorkJournalRoots
+    ++ lib.optional (gateway.authorityJournal != null) gateway.authorityJournal
   );
   gpuDeviceAccess = {
     # DynamicUser does not inherit an interactive user's device groups.
@@ -268,6 +271,10 @@ in
   config = mkIf (cfg.enable || gateway.enable) {
     assertions = [
       {
+        assertion = !gateway.enable || gateway.gatewayProfile != null;
+        message = "services.hellas.gateway requires gatewayProfile for its provisioned HTTP authority.";
+      }
+      {
         assertion = pkgs.stdenv.hostPlatform.isLinux;
         message = "services.hellas is only supported on Linux.";
       }
@@ -329,8 +336,8 @@ in
         message = "services.hellas.gateway.causalLmEnvironment and tokenizer must be set together and are required for native inference.";
       }
       {
-        assertion = gateway.nodeAddrs == [ ] || gateway.nodeId != null;
-        message = "services.hellas.gateway.nodeAddrs requires services.hellas.gateway.nodeId.";
+        assertion = gateway.nodeAddrs == [ ] || gateway.nodeId != null || gateway.machine != null;
+        message = "services.hellas.gateway.nodeAddrs requires nodeId or machine.";
       }
       {
         assertion = !gateway.local || (gateway.nodeId == null && gateway.nodeAddrs == [ ]);
@@ -351,7 +358,8 @@ in
       {
         assertion =
           !gateway.enable
-          || gateway.provider != null
+          || gateway.offer != null
+          || gateway.machine != null
           || gateway.paidWorkConfig != null
           || gateway.local
           || (
@@ -360,7 +368,7 @@ in
             && gateway.nodeId == null
 
           );
-        message = "services.hellas.gateway.provider is required by remote execution pending grant funding; a paid gateway uses its paidWorkConfig channel identities.";
+        message = "services.hellas.gateway execution requires an offer, machine, local allowance or paidWorkConfig.";
       }
       {
         assertion =
@@ -369,7 +377,10 @@ in
             !gateway.local
 
             && gateway.nodeId == null
-            && gateway.provider == null
+            && gateway.offer == null
+            && gateway.machine == null
+            && gateway.trustStore == null
+            && gateway.trustPolicy == null
             && gateway.responsesBackend == "hellas"
             && gateway.assurance == "producer-signed"
           );
@@ -381,14 +392,29 @@ in
         message = "services.hellas.gateway.responsesFetchExecutionEnvironment is required when responsesBackend = \"fetch\".";
       }
       {
-        assertion =
-          !gateway.enable || (gateway.appleAppAttestAppId == null) == (gateway.appleAppAttestCdhashes == [ ]);
-        message = "services.hellas.gateway.appleAppAttestAppId and appleAppAttestCdhashes must be configured together.";
+        assertion = !gateway.enable || (gateway.trustStore == null) == (gateway.trustPolicy == null);
+        message = "services.hellas.gateway.trustStore and trustPolicy must be configured together.";
       }
       {
         assertion =
-          !gateway.enable || gateway.assurance != "apple-app-attest" || gateway.appleAppAttestAppId != null;
-        message = "services.hellas.gateway apple-app-attest assurance requires appleAppAttestAppId and appleAppAttestCdhashes.";
+          !gateway.enable
+          || !(gateway.local || gateway.offer != null || gateway.machine != null)
+          || (gateway.trustPolicy != null && gateway.workProfile != null);
+        message = "services.hellas.gateway grant execution requires trustPolicy and workProfile.";
+      }
+      {
+        assertion = !gateway.enable || !gateway.local || gateway.localGrant != null;
+        message = "services.hellas.gateway local execution requires localGrant.";
+      }
+      {
+        assertion =
+          lib.count (target: target) [
+            gateway.local
+            (gateway.offer != null)
+            (gateway.machine != null)
+            (gateway.paidWorkConfig != null)
+          ] <= 1;
+        message = "services.hellas.gateway must select only one funding target.";
       }
     ];
 

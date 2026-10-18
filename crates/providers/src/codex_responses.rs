@@ -30,7 +30,34 @@ const MAX_PROMPT_CACHE_KEY_BYTES: usize = 1_024;
 const MAX_CLIENT_METADATA_ENTRIES: usize = 64;
 const MAX_CLIENT_METADATA_KEY_BYTES: usize = 128;
 const MAX_CLIENT_METADATA_VALUE_BYTES: usize = 2_048;
-const MAX_FAILURE_EXCERPT_CHARS: usize = 512;
+
+pub const CODEX_RESPONSES_ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/responses";
+
+pub fn codex_responses_contract()
+-> Result<hellas_rpc::FetchContract, hellas_rpc::protocol::value::CanonicalDecodeError> {
+    hellas_rpc::FetchContract::new(
+        "codex-responses-0.0.2",
+        hellas_rpc::FetchSchema::ResponsesItemsV1,
+        "codex-responses-driver-0.0.2",
+        hellas_rpc::FetchEgress::FixedHttps(CODEX_RESPONSES_ENDPOINT.into()),
+    )
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct CodexResponsesAdaptorFactory(hellas_rpc::ContentId);
+impl CodexResponsesAdaptorFactory {
+    pub fn new() -> Result<Self, hellas_rpc::protocol::value::CanonicalDecodeError> {
+        Ok(Self(codex_responses_contract()?.manifest_id()))
+    }
+}
+impl hellas_executor::FetchAdaptorFactory for CodexResponsesAdaptorFactory {
+    fn execution_environment(&self) -> hellas_rpc::ContentId {
+        self.0
+    }
+    fn create(&self, request: &FetchCall) -> Result<FetchAdaptorSession, FetchAdaptorError> {
+        create_session(request)
+    }
+}
 
 pub(super) fn create_session(
     request: &FetchCall,
@@ -60,21 +87,17 @@ struct PreparedCodexRequest {
 fn prepare_request(request: &FetchCall) -> Result<PreparedCodexRequest, FetchAdaptorError> {
     let body = request.body.as_bytes();
     if body.len() > MAX_FETCH_REQUEST_BODY_BYTES {
-        return Err(failed(format!(
-            "signed Codex request exceeds the {MAX_FETCH_REQUEST_BODY_BYTES}-byte limit"
-        )));
+        return Err(failed("signed Codex request exceeds the byte limit"));
     }
 
-    let mut trusted: CodexRequest = serde_json::from_slice(body)
-        .map_err(|error| failed(format!("invalid sealed Codex request: {error}")))?;
+    let mut trusted: CodexRequest =
+        serde_json::from_slice(body).map_err(|_| failed("invalid sealed Codex request"))?;
     let contract = trusted.validate_and_rebuild()?;
     let model = trusted.model.clone();
-    let rebuilt = serde_json::to_vec(&trusted)
-        .map_err(|error| failed(format!("failed to rebuild Codex request: {error}")))?;
+    let rebuilt =
+        serde_json::to_vec(&trusted).map_err(|_| failed("failed to rebuild Codex request"))?;
     if rebuilt.len() > MAX_FETCH_REQUEST_BODY_BYTES {
-        return Err(failed(format!(
-            "rebuilt Codex request exceeds the {MAX_FETCH_REQUEST_BODY_BYTES}-byte limit"
-        )));
+        return Err(failed("rebuilt Codex request exceeds the byte limit"));
     }
     Ok(PreparedCodexRequest {
         body: JsonBytes::new(rebuilt),
@@ -125,7 +148,11 @@ struct CodexRequest {
 
 impl CodexRequest {
     fn validate_and_rebuild(&mut self) -> Result<ProjectionContract, FetchAdaptorError> {
-        nonempty_bounded("model", &self.model, MAX_MODEL_BYTES)?;
+        nonempty_bounded(
+            "model has invalid byte length",
+            &self.model,
+            MAX_MODEL_BYTES,
+        )?;
         if self.store {
             return Err(failed("sealed Codex Fetch requires store=false"));
         }
@@ -138,11 +165,19 @@ impl CodexRequest {
             ));
         }
         if let Some(key) = &self.prompt_cache_key {
-            nonempty_bounded("prompt_cache_key", key, MAX_PROMPT_CACHE_KEY_BYTES)?;
+            nonempty_bounded(
+                "prompt_cache_key has invalid byte length",
+                key,
+                MAX_PROMPT_CACHE_KEY_BYTES,
+            )?;
         }
         if let Some(format) = self.text.as_ref().and_then(|text| text.format.as_ref()) {
-            nonempty_bounded("text format name", &format.name, MAX_NAME_BYTES)?;
-            require_object("text format schema", &format.schema)?;
+            nonempty_bounded(
+                "text format name has invalid byte length",
+                &format.name,
+                MAX_NAME_BYTES,
+            )?;
+            require_object("text format schema must be an object", &format.schema)?;
         }
         validate_client_metadata(self.client_metadata.as_ref())?;
         // Client metadata is local trace material (and commonly contains local
@@ -165,16 +200,16 @@ impl CodexRequest {
                     ..
                 } => {
                     validate_tool_name(name)?;
-                    require_object("function parameters", parameters)?;
+                    require_object("function parameters must be an object", parameters)?;
                     if let Some(schema) = output_schema {
-                        require_object("function output_schema", schema)?;
+                        require_object("function output_schema must be an object", schema)?;
                     }
                     if functions.contains(name)
                         || customs.contains(name)
                         || deferred_functions.contains(name)
                         || deferred_customs.contains(name)
                     {
-                        return Err(failed(format!("duplicate Codex tool name `{name}`")));
+                        return Err(failed("duplicate Codex tool name"));
                     }
                     if defer_loading.unwrap_or(false) {
                         deferred_functions.insert(name.clone());
@@ -196,7 +231,7 @@ impl CodexRequest {
                         || deferred_functions.contains(name)
                         || deferred_customs.contains(name)
                     {
-                        return Err(failed(format!("duplicate Codex tool name `{name}`")));
+                        return Err(failed("duplicate Codex tool name"));
                     }
                     if defer_loading.unwrap_or(false) {
                         deferred_customs.insert(name.clone());
@@ -215,7 +250,7 @@ impl CodexRequest {
                             "tool_search must be a single client-executed declaration",
                         ));
                     }
-                    require_object("tool_search parameters", parameters)?;
+                    require_object("tool_search parameters must be an object", parameters)?;
                     has_tool_search = true;
                     rebuilt_tools.push(tool);
                 }
@@ -684,7 +719,7 @@ impl CodexResponseWireItem {
                 arguments,
                 ..
             } => {
-                nonempty_bounded("call_id", &call_id, MAX_NAME_BYTES)?;
+                nonempty_bounded("call_id has invalid byte length", &call_id, MAX_NAME_BYTES)?;
                 validate_tool_name(&name)?;
                 validate_json_arguments(&arguments)?;
                 CodexResponseItem::FunctionCall {
@@ -701,7 +736,7 @@ impl CodexResponseWireItem {
                 name,
                 input,
             } => {
-                nonempty_bounded("call_id", &call_id, MAX_NAME_BYTES)?;
+                nonempty_bounded("call_id has invalid byte length", &call_id, MAX_NAME_BYTES)?;
                 validate_tool_name(&name)?;
                 CodexResponseItem::CustomToolCall {
                     id: validate_optional_id(id)?,
@@ -718,7 +753,7 @@ impl CodexResponseWireItem {
                 execution,
                 arguments,
             } => {
-                nonempty_bounded("call_id", &call_id, MAX_NAME_BYTES)?;
+                nonempty_bounded("call_id has invalid byte length", &call_id, MAX_NAME_BYTES)?;
                 if execution != "client" || arguments.query.is_empty() {
                     return Err(failed("malformed provider tool_search call"));
                 }
@@ -862,7 +897,11 @@ fn validate_input_history(
     let mut outputs = BTreeSet::new();
     for item in input {
         if let Some(id) = item.id() {
-            nonempty_bounded("history item id", id, MAX_NAME_BYTES)?;
+            nonempty_bounded(
+                "history item id has invalid byte length",
+                id,
+                MAX_NAME_BYTES,
+            )?;
         }
         match item {
             CodexInputItem::Message {
@@ -872,7 +911,7 @@ fn validate_input_history(
                 ..
             } => {
                 if !matches!(role.as_str(), "developer" | "system" | "user" | "assistant") {
-                    return Err(failed(format!("unsupported Codex message role `{role}`")));
+                    return Err(failed("unsupported Codex message role"));
                 }
                 if content.is_empty() {
                     return Err(failed("Codex message content must not be empty"));
@@ -965,21 +1004,25 @@ fn validate_input_history(
                             ..
                         } => {
                             validate_tool_name(name)?;
-                            require_object("discovered function parameters", parameters)?;
+                            require_object(
+                                "discovered function parameters must be an object",
+                                parameters,
+                            )?;
                             if let Some(schema) = output_schema {
-                                require_object("discovered function output_schema", schema)?;
+                                require_object(
+                                    "discovered function output_schema must be an object",
+                                    schema,
+                                )?;
                             }
                             if contract.customs.contains(name)
                                 || contract.deferred_customs.contains(name)
                             {
-                                return Err(failed(format!(
-                                    "tool_search changed `{name}` from custom to function"
-                                )));
+                                return Err(failed("tool_search changed from custom to function"));
                             }
                             if !contract.deferred_functions.remove(name) {
-                                return Err(failed(format!(
-                                    "tool_search discovered undeclared or already callable function `{name}`"
-                                )));
+                                return Err(failed(
+                                    "tool_search discovered undeclared or already callable function",
+                                ));
                             }
                             contract.functions.insert(name.clone());
                         }
@@ -989,14 +1032,12 @@ fn validate_input_history(
                             if contract.functions.contains(name)
                                 || contract.deferred_functions.contains(name)
                             {
-                                return Err(failed(format!(
-                                    "tool_search changed `{name}` from function to custom"
-                                )));
+                                return Err(failed("tool_search changed from function to custom"));
                             }
                             if !contract.deferred_customs.remove(name) {
-                                return Err(failed(format!(
-                                    "tool_search discovered undeclared or already callable custom `{name}`"
-                                )));
+                                return Err(failed(
+                                    "tool_search discovered undeclared or already callable custom",
+                                ));
                             }
                             contract.customs.insert(name.clone());
                         }
@@ -1014,9 +1055,9 @@ fn insert_history_call<'a>(
     kind: CallKind,
     name: Option<&'a str>,
 ) -> Result<(), FetchAdaptorError> {
-    nonempty_bounded("call_id", call_id, MAX_NAME_BYTES)?;
+    nonempty_bounded("call_id has invalid byte length", call_id, MAX_NAME_BYTES)?;
     if calls.insert(call_id, (kind, name)).is_some() {
-        return Err(failed(format!("duplicate history call_id `{call_id}`")));
+        return Err(failed("duplicate history call_id"));
     }
     Ok(())
 }
@@ -1029,15 +1070,13 @@ fn validate_history_output(
     name: Option<&str>,
 ) -> Result<(), FetchAdaptorError> {
     let Some((expected_kind, expected_name)) = calls.get(call_id) else {
-        return Err(failed(format!(
-            "output references unknown call_id `{call_id}`"
-        )));
+        return Err(failed("output references unknown call_id"));
     };
     if *expected_kind != kind || name.is_some_and(|name| Some(name) != *expected_name) {
-        return Err(failed(format!("output contradicts call_id `{call_id}`")));
+        return Err(failed("output contradicts call_id"));
     }
     if !outputs.insert(call_id.to_string()) {
-        return Err(failed(format!("duplicate output for call_id `{call_id}`")));
+        return Err(failed("duplicate output for call_id"));
     }
     Ok(())
 }
@@ -1052,7 +1091,11 @@ fn validate_client_metadata(
         return Err(failed("too many Codex client_metadata entries"));
     }
     for (key, value) in metadata {
-        nonempty_bounded("client_metadata key", key, MAX_CLIENT_METADATA_KEY_BYTES)?;
+        nonempty_bounded(
+            "client_metadata key has invalid byte length",
+            key,
+            MAX_CLIENT_METADATA_KEY_BYTES,
+        )?;
         if value.len() > MAX_CLIENT_METADATA_VALUE_BYTES {
             return Err(failed("Codex client_metadata value is too large"));
         }
@@ -1061,28 +1104,30 @@ fn validate_client_metadata(
 }
 
 fn validate_tool_name(name: &str) -> Result<(), FetchAdaptorError> {
-    nonempty_bounded("tool name", name, MAX_NAME_BYTES)
+    nonempty_bounded("tool name has invalid byte length", name, MAX_NAME_BYTES)
 }
 
 fn validate_json_arguments(arguments: &str) -> Result<(), FetchAdaptorError> {
     serde_json::from_str::<JsonValue>(arguments)
         .map(|_| ())
-        .map_err(|error| failed(format!("function arguments are not valid JSON: {error}")))
+        .map_err(|_| failed("function arguments are not valid JSON"))
 }
 
-fn require_object(label: &str, value: &JsonValue) -> Result<(), FetchAdaptorError> {
+fn require_object(label: &'static str, value: &JsonValue) -> Result<(), FetchAdaptorError> {
     if value.is_object() {
         Ok(())
     } else {
-        Err(failed(format!("{label} must be an object")))
+        Err(failed(label))
     }
 }
 
-fn nonempty_bounded(label: &str, value: &str, maximum: usize) -> Result<(), FetchAdaptorError> {
+fn nonempty_bounded(
+    label: &'static str,
+    value: &str,
+    maximum: usize,
+) -> Result<(), FetchAdaptorError> {
     if value.is_empty() || value.len() > maximum {
-        Err(failed(format!(
-            "{label} must contain 1..={maximum} UTF-8 bytes"
-        )))
+        Err(failed(label))
     } else {
         Ok(())
     }
@@ -1100,9 +1145,7 @@ fn validate_declared_call(
             CallKind::ToolSearch => contract.has_tool_search,
         };
     if !declared {
-        return Err(failed(format!(
-            "provider emitted unauthorized tool call `{name}`"
-        )));
+        return Err(failed("provider emitted unauthorized tool call"));
     }
     Ok(())
 }
@@ -1137,7 +1180,7 @@ impl From<CodexMessagePhaseWire> for CodexMessagePhase {
 
 fn validate_optional_id(id: Option<String>) -> Result<Option<String>, FetchAdaptorError> {
     if let Some(id) = &id {
-        nonempty_bounded("output item id", id, MAX_NAME_BYTES)?;
+        nonempty_bounded("output item id has invalid byte length", id, MAX_NAME_BYTES)?;
     }
     Ok(id)
 }
@@ -1243,7 +1286,7 @@ impl CodexProjector {
             WireEventData::Json(value) => Ok(value),
             WireEventData::Bytes(bytes) => serde_json::from_slice(&bytes),
         }
-        .map_err(|error| failed(format!("invalid Codex SSE JSON: {error}")))?;
+        .map_err(|_| failed("invalid Codex SSE JSON"))?;
         let mut object = data
             .as_object()
             .cloned()
@@ -1301,9 +1344,7 @@ impl CodexProjector {
             "response.failed" => Err(provider_failure(event_payload(object)?)),
             "response.incomplete" => Err(failed("Codex upstream returned an incomplete response")),
             "error" => Err(provider_error(event_payload(object)?)),
-            other => Err(failed(format!(
-                "unsupported sealed Codex SSE event `{other}`"
-            ))),
+            _ => Err(failed("unsupported sealed Codex SSE event")),
         }
     }
 
@@ -1318,10 +1359,7 @@ impl CodexProjector {
                 .as_u64()
                 .ok_or_else(|| failed("Codex sequence_number must be an integer"))?;
             if sequence != self.next_sequence {
-                return Err(failed(format!(
-                    "Codex sequence_number {sequence} is not expected {}",
-                    self.next_sequence
-                )));
+                return Err(failed("Codex sequence_number is not expected"));
             }
             self.next_sequence = sequence
                 .checked_add(1)
@@ -1394,7 +1432,7 @@ impl CodexProjector {
             if let Some(id) = item.id()
                 && self.done_item_ids.contains(id)
             {
-                return Err(failed(format!("duplicate Codex output item id `{id}`")));
+                return Err(failed("duplicate Codex output item id"));
             }
             let mut matches = self
                 .pending_items
@@ -1486,7 +1524,7 @@ impl CodexProjector {
             // An added item reserves a call ID only until its matching done
             // event commits it. A standalone done item commits it directly.
             if !self.seen_call_ids.insert(call_id.to_string()) {
-                return Err(failed(format!("duplicate provider call_id `{call_id}`")));
+                return Err(failed("duplicate provider call_id"));
             }
             self.completed_calls = self
                 .completed_calls
@@ -1503,7 +1541,7 @@ impl CodexProjector {
                 .iter()
                 .any(|pending| pending.item.call_id() == Some(call_id))
         {
-            return Err(failed(format!("duplicate provider call_id `{call_id}`")));
+            return Err(failed("duplicate provider call_id"));
         }
         Ok(())
     }
@@ -1792,12 +1830,20 @@ impl CodexProjector {
         if !permits_call_kind(&self.contract, CallKind::Custom) {
             return Err(failed("unauthorized custom tool delta"));
         }
-        nonempty_bounded("custom tool item_id", &payload.item_id, MAX_NAME_BYTES)?;
+        nonempty_bounded(
+            "custom tool item_id has invalid byte length",
+            &payload.item_id,
+            MAX_NAME_BYTES,
+        )?;
         let call_id = payload
             .call_id
             .as_deref()
             .ok_or_else(|| failed("custom tool delta requires call_id for exact correlation"))?;
-        nonempty_bounded("custom tool call_id", call_id, MAX_NAME_BYTES)?;
+        nonempty_bounded(
+            "custom tool call_id has invalid byte length",
+            call_id,
+            MAX_NAME_BYTES,
+        )?;
         self.pending_call(&payload.item_id, CallKind::Custom, call_id, None)?;
         self.deltas
             .custom_inputs
@@ -1818,9 +1864,17 @@ impl CodexProjector {
         if !permits_call_kind(&self.contract, CallKind::Custom) {
             return Err(failed("unauthorized custom tool completion"));
         }
-        nonempty_bounded("custom tool item_id", &payload.item_id, MAX_NAME_BYTES)?;
+        nonempty_bounded(
+            "custom tool item_id has invalid byte length",
+            &payload.item_id,
+            MAX_NAME_BYTES,
+        )?;
         if let Some(call_id) = payload.call_id.as_deref() {
-            nonempty_bounded("custom tool call_id", call_id, MAX_NAME_BYTES)?;
+            nonempty_bounded(
+                "custom tool call_id has invalid byte length",
+                call_id,
+                MAX_NAME_BYTES,
+            )?;
             self.pending_call(&payload.item_id, CallKind::Custom, call_id, None)?;
         } else {
             self.pending_call_by_item(&payload.item_id, CallKind::Custom, None)?;
@@ -1844,7 +1898,11 @@ impl CodexProjector {
         if !permits_call_kind(&self.contract, CallKind::Function) {
             return Err(failed("unauthorized function argument delta"));
         }
-        nonempty_bounded("function item_id", &payload.item_id, MAX_NAME_BYTES)?;
+        nonempty_bounded(
+            "function item_id has invalid byte length",
+            &payload.item_id,
+            MAX_NAME_BYTES,
+        )?;
         self.pending_call(&payload.item_id, CallKind::Function, "", None)?;
         self.deltas
             .function_arguments
@@ -1861,7 +1919,11 @@ impl CodexProjector {
         if !permits_call_kind(&self.contract, CallKind::Function) {
             return Err(failed("unauthorized function argument completion"));
         }
-        nonempty_bounded("function item_id", &payload.item_id, MAX_NAME_BYTES)?;
+        nonempty_bounded(
+            "function item_id has invalid byte length",
+            &payload.item_id,
+            MAX_NAME_BYTES,
+        )?;
         self.pending_call_by_item(
             &payload.item_id,
             CallKind::Function,
@@ -2046,7 +2108,11 @@ impl CodexProjector {
         let Some(model) = model else {
             return Ok(());
         };
-        nonempty_bounded("effective server model", &model, MAX_MODEL_BYTES)?;
+        nonempty_bounded(
+            "effective server model has invalid byte length",
+            &model,
+            MAX_MODEL_BYTES,
+        )?;
         if self
             .server_model
             .as_deref()
@@ -2078,7 +2144,7 @@ impl FetchProjector for CodexProjector {
         if self.terminal.is_some() && !bytes.is_empty() {
             return Err(failed("Codex stream contained bytes after completion"));
         }
-        let frames = push_sse(&mut self.decoder, bytes, "Codex").map_err(failed)?;
+        let frames = push_sse(&mut self.decoder, bytes)?;
         let events = self.decode_frames(frames)?;
         if self.terminal.is_some() && !self.decoder.pending_bytes().is_empty() {
             return Err(failed("Codex stream contained bytes after completion"));
@@ -2120,7 +2186,7 @@ fn event_payload<T: DeserializeOwned>(
     object: JsonMap<String, JsonValue>,
 ) -> Result<T, FetchAdaptorError> {
     serde_json::from_value(JsonValue::Object(object))
-        .map_err(|error| failed(format!("malformed Codex SSE event: {error}")))
+        .map_err(|_| failed("malformed Codex SSE event"))
 }
 
 fn item_key(item: &CodexResponseItem) -> Option<String> {
@@ -2301,19 +2367,21 @@ fn validate_lifecycle_identity(
     expected_status: &str,
     expected_id: Option<&str>,
 ) -> Result<LifecycleIdentity, FetchAdaptorError> {
-    let id = optional_present_string(id, "response.id")?;
+    let id = optional_present_string(id, "present response.id must be a string")?;
     if let Some(id) = &id {
-        nonempty_bounded("response.id", id, MAX_NAME_BYTES)?;
+        nonempty_bounded("response.id has invalid byte length", id, MAX_NAME_BYTES)?;
     }
     if expected_id.is_some() && id.as_deref().is_some_and(|id| Some(id) != expected_id) {
         return Err(failed("Codex response id changed"));
     }
-    if let Some(object) = optional_present_string(object, "response.object")?
+    if let Some(object) =
+        optional_present_string(object, "present response.object must be a string")?
         && object != "response"
     {
         return Err(failed("present response.object must equal response"));
     }
-    if let Some(status) = optional_present_string(status, "response.status")?
+    if let Some(status) =
+        optional_present_string(status, "present response.status must be a string")?
         && status != expected_status
     {
         return Err(failed("present response.status is contradictory"));
@@ -2321,23 +2389,27 @@ fn validate_lifecycle_identity(
     if created_at.is_some_and(|value| value.as_i64().is_none() && value.as_u64().is_none()) {
         return Err(failed("present response.created_at must be an integer"));
     }
-    let model = optional_present_string(model, "response.model")?;
+    let model = optional_present_string(model, "present response.model must be a string")?;
     if let Some(model) = &model {
-        nonempty_bounded("response.model", model, MAX_MODEL_BYTES)?;
+        nonempty_bounded(
+            "response.model has invalid byte length",
+            model,
+            MAX_MODEL_BYTES,
+        )?;
     }
     Ok(LifecycleIdentity { id, model })
 }
 
 fn optional_present_string(
     value: Option<JsonValue>,
-    field: &str,
+    reason: &'static str,
 ) -> Result<Option<String>, FetchAdaptorError> {
     value
         .map(|value| {
             value
                 .as_str()
                 .map(str::to_owned)
-                .ok_or_else(|| failed(format!("present {field} must be a string")))
+                .ok_or_else(|| failed(reason))
         })
         .transpose()
 }
@@ -2611,7 +2683,11 @@ impl CompletedResponse {
             .as_str()
             .ok_or_else(|| failed("completed response.id must be a non-empty string"))?
             .to_string();
-        nonempty_bounded("completed response.id", &id, MAX_NAME_BYTES)?;
+        nonempty_bounded(
+            "completed response.id has invalid byte length",
+            &id,
+            MAX_NAME_BYTES,
+        )?;
         if expected_id.is_some_and(|expected| expected != id) {
             return Err(failed(
                 "completed response.id contradicted response.created",
@@ -2680,8 +2756,8 @@ struct OutputTokenDetailsWire {
 }
 
 fn parse_codex_usage(value: JsonValue) -> Result<CodexUsage, FetchAdaptorError> {
-    let usage: UsageWire = serde_json::from_value(value)
-        .map_err(|error| failed(format!("malformed Codex terminal usage: {error}")))?;
+    let usage: UsageWire =
+        serde_json::from_value(value).map_err(|_| failed("malformed Codex terminal usage"))?;
     if usage.input_tokens.checked_add(usage.output_tokens) != Some(usage.total_tokens) {
         return Err(failed(
             "Codex usage total_tokens contradicted input + output",
@@ -2720,8 +2796,8 @@ fn parse_usage_metadata(value: JsonValue) -> Result<CodexUsageMetadata, FetchAda
     struct Wire {
         amount: Option<String>,
     }
-    let wire: Wire = serde_json::from_value(value)
-        .map_err(|error| failed(format!("malformed Codex usage_metadata: {error}")))?;
+    let wire: Wire =
+        serde_json::from_value(value).map_err(|_| failed("malformed Codex usage_metadata"))?;
     if wire
         .amount
         .as_ref()
@@ -2737,13 +2813,15 @@ fn parse_usage_metadata(value: JsonValue) -> Result<CodexUsageMetadata, FetchAda
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FailurePayload {
-    response: FailureResponse,
+    #[serde(rename = "response")]
+    _response: FailureResponse,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FailureResponse {
-    error: FailureDetail,
+    #[serde(rename = "error")]
+    _error: FailureDetail,
     #[serde(default, rename = "id")]
     _id: Option<JsonValue>,
     #[serde(default, rename = "object")]
@@ -2761,79 +2839,41 @@ struct FailureResponse {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FailureDetail {
-    #[serde(default)]
-    code: Option<String>,
-    #[serde(default)]
-    message: Option<String>,
+    #[serde(default, rename = "code")]
+    _code: Option<String>,
+    #[serde(default, rename = "message")]
+    _message: Option<String>,
     #[serde(default, rename = "type")]
     _kind: Option<String>,
     #[serde(default, rename = "param")]
     _param: Option<String>,
 }
 
-fn provider_failure(payload: FailurePayload) -> FetchAdaptorError {
-    let code = payload.response.error.code.as_deref().unwrap_or("unknown");
-    let message = payload.response.error.message.as_deref().unwrap_or("");
-    failed(format!(
-        "Codex upstream failed ({}){}",
-        sanitize_excerpt(code, 64),
-        failure_suffix(message)
-    ))
+fn provider_failure(_: FailurePayload) -> FetchAdaptorError {
+    failed("Codex upstream failed")
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ErrorPayload {
-    #[serde(default)]
-    code: Option<String>,
-    #[serde(default)]
-    message: Option<String>,
+    #[serde(default, rename = "code")]
+    _code: Option<String>,
+    #[serde(default, rename = "message")]
+    _message: Option<String>,
     #[serde(default, rename = "param")]
     _param: Option<String>,
 }
 
-fn provider_error(payload: ErrorPayload) -> FetchAdaptorError {
-    let code = payload.code.as_deref().unwrap_or("unknown");
-    let message = payload.message.as_deref().unwrap_or("");
-    failed(format!(
-        "Codex upstream error ({}){}",
-        sanitize_excerpt(code, 64),
-        failure_suffix(message)
-    ))
+fn provider_error(_: ErrorPayload) -> FetchAdaptorError {
+    failed("Codex upstream error")
 }
 
-fn failure_suffix(message: &str) -> String {
-    let excerpt = sanitize_excerpt(message, MAX_FAILURE_EXCERPT_CHARS);
-    if excerpt.is_empty() {
-        String::new()
-    } else {
-        format!(": {excerpt}")
-    }
+fn payload_error(_: impl std::fmt::Display) -> FetchAdaptorError {
+    failed("Codex fetch payload encoding failed")
 }
 
-fn sanitize_excerpt(value: &str, maximum_chars: usize) -> String {
-    value
-        .chars()
-        .take(maximum_chars)
-        .map(|character| {
-            if character.is_control() {
-                ' '
-            } else {
-                character
-            }
-        })
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn payload_error(error: impl std::fmt::Display) -> FetchAdaptorError {
-    failed(format!("Codex fetch payload encoding failed: {error}"))
-}
-
-fn failed(message: impl Into<String>) -> FetchAdaptorError {
-    FetchAdaptorError::failed(message.into())
+fn failed(message: &'static str) -> FetchAdaptorError {
+    FetchAdaptorError::failed(message)
 }
 
 #[cfg(test)]

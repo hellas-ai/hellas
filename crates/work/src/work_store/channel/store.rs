@@ -6,7 +6,6 @@ use super::*;
 pub struct ChannelStore {
     journal: Journal,
     state: Channel,
-    torn_tail: bool,
     metadata_only: bool,
 }
 
@@ -39,7 +38,7 @@ impl ChannelStore {
     /// another journal, and [`WorkStoreError::Channel`] when the origin
     /// is another channel's or a replayed record does not obey the
     /// transition rules.
-    pub fn open<V: SigVerifier>(
+    pub async fn open<V: SigVerifier>(
         root: &Path,
         channel: PaidChannel,
         settlement: WorkPaymentSettlement,
@@ -47,7 +46,7 @@ impl ChannelStore {
         origin: SetupOrigin,
         verifier: &V,
     ) -> Result<Self, WorkStoreError> {
-        Self::open_inner(root, channel, settlement, role, origin, verifier, false)
+        Self::open_inner(root, channel, settlement, role, origin, verifier, false).await
     }
 
     /// Opens a journal that stores accounting evidence only.
@@ -57,7 +56,7 @@ impl ChannelStore {
     /// restart an accepted request cannot run and a completed response cannot
     /// be replayed; a signed payment for an already delivered result can still
     /// be credited. Existing payload-bearing journals are refused.
-    pub fn open_metadata_only<V: SigVerifier>(
+    pub async fn open_metadata_only<V: SigVerifier>(
         root: &Path,
         channel: PaidChannel,
         settlement: WorkPaymentSettlement,
@@ -65,10 +64,10 @@ impl ChannelStore {
         origin: SetupOrigin,
         verifier: &V,
     ) -> Result<Self, WorkStoreError> {
-        Self::open_inner(root, channel, settlement, role, origin, verifier, true)
+        Self::open_inner(root, channel, settlement, role, origin, verifier, true).await
     }
 
-    fn open_inner<V: SigVerifier>(
+    async fn open_inner<V: SigVerifier>(
         root: &Path,
         channel: PaidChannel,
         settlement: WorkPaymentSettlement,
@@ -87,7 +86,7 @@ impl ChannelStore {
         let replayed = hellas_rpc::observe::Timing::start();
         let (journal, replay) = Journal::open_latest(
             root,
-            &format!("channel-{}", hex(&key)),
+            &format!("channel-{}", hex(key)),
             JournalId {
                 kind: if metadata_only {
                     JournalKind::MetadataChannel
@@ -96,9 +95,9 @@ impl ChannelStore {
                 },
                 role,
                 key,
-                generation: 0,
             },
-        )?;
+        )
+        .await?;
         let mut state = match &replay.checkpoint {
             Some(bytes) => {
                 Channel::from_checkpoint(bytes, channel, settlement, role, verifier, metadata_only)?
@@ -120,22 +119,9 @@ impl ChannelStore {
         let store = Self {
             journal,
             state,
-            torn_tail: replay.truncated_tail,
             metadata_only,
         };
         Ok(store)
-    }
-
-    /// Returns whether opening removed an interrupted write.
-    ///
-    /// True says the last thing this endpoint tried to record did not
-    /// finish reaching the disk, and the state above is the state
-    /// before it. Nothing was acknowledged, so nothing here is wrong —
-    /// but a clean shutdown does not produce it, and an operator who
-    /// sees it has been told the truth about a crash.
-    #[must_use]
-    pub const fn recovered_torn_tail(&self) -> bool {
-        self.torn_tail
     }
 
     /// Returns what this endpoint durably knows.
@@ -163,7 +149,7 @@ impl ChannelStore {
     /// [`WorkStoreError::Channel`] when the step is not one this state
     /// may take — checked before anything is written — and
     /// [`WorkStoreError::Journal`] when an append or its sync fails.
-    pub fn commit<V: SigVerifier>(
+    pub async fn commit<V: SigVerifier>(
         &mut self,
         record: ChannelRecord,
         verifier: &V,
@@ -197,9 +183,10 @@ impl ChannelStore {
                     return Err(JournalError::CheckpointTooLarge { len }.into());
                 }
             }
-            self.rotate_if_full(record.is_new_work())?;
+            self.rotate_if_full(record.is_new_work()).await?;
             self.journal
-                .append(&record.encode_for_storage(self.metadata_only))?;
+                .append(&record.encode_for_storage(self.metadata_only))
+                .await?;
             self.state = next;
         }
         Ok(&self.state)
@@ -218,9 +205,10 @@ impl ChannelStore {
     ///
     /// [`WorkStoreError::Journal`] when the checkpoint does not fit one
     /// frame or an install step fails.
-    pub fn rotate(&mut self) -> Result<(), WorkStoreError> {
+    pub async fn rotate(&mut self) -> Result<(), WorkStoreError> {
         self.journal
-            .rotate(&self.state.checkpoint_for_storage(self.metadata_only))?;
+            .rotate(&self.state.checkpoint_for_storage(self.metadata_only))
+            .await?;
         Ok(())
     }
 
@@ -228,17 +216,17 @@ impl ChannelStore {
     ///
     /// New work stops when a rotation cannot complete, because admitting
     /// it would be promising a duty this journal has no room to finish.
-    /// A duty already exported does not stop: the reserve above the soft
-    /// limit is exactly the room the cursor advances, the close and the
-    /// answer finish in, and it is [`Journal::append`] that refuses when
-    /// even that is gone.
-    fn rotate_if_full(&mut self, new_work: bool) -> Result<(), WorkStoreError> {
+    /// A duty already exported can use the reserve after a rotation refused
+    /// before writing. [`Journal::append`] still refuses after a failed write,
+    /// until replay, or once the generation's reserve is exhausted.
+    async fn rotate_if_full(&mut self, new_work: bool) -> Result<(), WorkStoreError> {
         if !self.journal.at_soft_limit() {
             return Ok(());
         }
         match self
             .journal
             .rotate(&self.state.checkpoint_for_storage(self.metadata_only))
+            .await
         {
             Ok(()) => Ok(()),
             Err(error) if new_work => Err(error.into()),

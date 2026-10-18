@@ -1,41 +1,43 @@
 //! Private grant sessions. The only clock is provider standing; no chain,
 //! payment handshake, collateral, certificate or settlement is constructed.
+use crate::node_control::profile::ClientProfile;
 use crate::work_link::WorkLink;
 use futures::{StreamExt, stream::BoxStream};
+use hellas_auth::{
+    Digest, ProducerSigningKey, PublicKey, Signature,
+    authority::{GrantId, PrincipalId, UnixMillis},
+};
 use hellas_client::ProviderTrustAnchor;
 pub use hellas_client::{PinnedOffer, UnpinnedOffer};
 use hellas_kernel::NetworkId;
 use hellas_rpc::{
-    Digest, EventCommitment, InputCommitment, Operation, OutputEventEnvelope, ProducerSigningKey,
-    ProviderEnrollmentBundle, PublicKey, RequestCommitment, SchemeId, Signature, StreamId,
-    output_genesis,
+    EventCommitment, InputCommitment, Operation, OutputEventEnvelope, ProviderEnrollmentBundle,
+    RequestCommitment, SchemeId, StreamId, output_genesis,
     pb::work::{
         AcceptWorkRequest, AcceptWorkResponse, DeliverResultRequest, GetStandingRequest,
         GetStandingResponse, GrantRefusalCode, GrantTerminalMetadata, GrantTerminalState,
         WorkRefusalCode, WorkRefused, WorkRoute, WorkStreamEvent, accept_work_response,
         get_standing_response, work_stream_event,
     },
-    protocol::{
-        work::{
-            PaidJobResultV1, PrivateRecord, bound_delivery_request_digest, bound_result_digest,
-            decode_transcript, encode_transcript,
-        },
-        work_grant::{
-            ChannelId, GrantId, GrantJobAuthorizationV1, Revision, UnixMillis, grant_work_id,
-            records::{GrantError, Principal, SignedOffer},
-            standing::{Standing, StandingLocator},
-        },
-        work_profile::{PreparedWorkInput, WorkPolicy},
-    },
     scheme_id, verify_output_event_continuation,
 };
-use hellas_wire::{
-    AuthLevel, PeerIdentity, StreamTransport, TransportContext, iroh::IrohTransport,
+use hellas_wire::iroh::IrohTransport;
+use hellas_work::model::grant::records::{check_grant_provider, grant_producer, grant_transport};
+use hellas_work::model::{
+    grant::{
+        ChannelId, GrantJobAuthorizationV1, grant_work_id,
+        records::{GrantError, SignedOffer},
+        standing::{Standing, StandingLocator},
+    },
+    profile::{PreparedWorkInput, WorkPolicy},
+    work::{
+        PaidJobResultV1, PrivateRecord, bound_result_digest, decode_transcript, encode_transcript,
+    },
 };
 use hellas_work::{
-    grant_service::GrantService,
+    grant_service::{GrantService, GrantWork},
     work::PaidProgress,
-    work_store::grant::{GrantChannelState, GrantClientStore, GrantStoreError, SignedResult},
+    work_store::grant::{GrantChannelState, GrantClientStore, NodeStoreError, SignedResult},
 };
 use iroh::{Endpoint, EndpointId};
 use std::{
@@ -49,7 +51,7 @@ pub enum GrantClientError {
     #[error(transparent)]
     Grant(#[from] GrantError),
     #[error(transparent)]
-    Store(#[from] GrantStoreError),
+    Store(#[from] NodeStoreError),
     #[error("grant session is closed")]
     Closed,
     #[error(transparent)]
@@ -61,9 +63,9 @@ pub enum GrantClientError {
     #[error(transparent)]
     Address(#[from] std::net::AddrParseError),
     #[error(transparent)]
-    Work(#[from] hellas_rpc::protocol::work::PaidWorkError),
+    Work(#[from] hellas_work::model::work::PaidWorkError),
     #[error(transparent)]
-    Signature(#[from] hellas_rpc::protocol::signature::SignatureError),
+    Signature(#[from] hellas_auth::signature::SignatureError),
     #[error(transparent)]
     Length(#[from] std::array::TryFromSliceError),
     #[error(transparent)]
@@ -164,65 +166,60 @@ impl GrantTarget {
         &self,
         transport: &GrantTransport,
         trust: &ProviderTrustAnchor,
-        client: &Principal,
+        application: &Arc<ClientProfile>,
+        signer: &Arc<ProducerSigningKey>,
     ) -> Result<SessionTransport> {
         trust
             .verify_enrollment(&self.provider)
             .map_err(GrantClientError::from)?;
-        self.provider.check_grant_provider()?;
+        check_grant_provider(&self.provider)?;
         match transport {
             GrantTransport::Local(service) => Ok(SessionTransport::Local {
                 service: service.clone(),
-                context: TransportContext {
-                    peer: Some(PeerIdentity(client.transport())),
-                    auth_level: AuthLevel::Vouched,
-                    // Local invocation has no TLS exporter; a fresh random
-                    // binding separates this trusted in-process session.
-                    open_exporter: Some(rand::random()),
-                    rtt_ms: None,
-                },
+                application: application.clone(),
+                signer: signer.clone(),
             }),
             GrantTransport::Remote(endpoint) => {
                 let link = WorkLink::new(
-                    EndpointId::from_bytes(&self.provider.grant_transport()?)
+                    EndpointId::from_bytes(&grant_transport(&self.provider)?)
                         .map_err(GrantClientError::from)?,
                     self.addresses.clone(),
                     endpoint.clone(),
                     trust.clone(),
-                );
+                )
+                .with_application(application.clone(), signer.clone());
                 link.require_producer(self.provider.genesis.statement.producer_public_key)
                     .map_err(GrantClientError::from)?;
                 Ok(SessionTransport::Remote(Box::new(link)))
             }
         }
     }
-    /// Read-only owner bootstrap from an already management-pinned enrollment.
+    /// Discover an allowance using an explicit application and pinned enrollment.
     /// Open authenticates the provider before the stable locator is disclosed.
     pub async fn discover(
         &self,
-        client: &Principal,
         signer: &ProducerSigningKey,
         transport: &GrantTransport,
         trust: &ProviderTrustAnchor,
+        application: &Arc<ClientProfile>,
         timeout: Duration,
     ) -> Result<PinnedOffer> {
-        if signer.public_key() != PublicKey::Secp256k1(client.producer().to_bytes())
-            || matches!(transport, GrantTransport::Remote(e) if e.id().as_bytes() != &client.transport())
-        {
-            return Err(GrantError::Audience.into());
-        }
-        let transport = self.resolve_transport(transport, trust, client)?;
+        let client = PrincipalId::from_public_key(signer.public_key())
+            .map_err(|_| GrantError::UnsupportedKey)?;
+        let transport =
+            self.resolve_transport(transport, trust, application, &Arc::new(signer.clone()))?;
         let link = transport.connect(timeout).await?;
-        let standing = GrantSession::query_standing(self, client, signer, timeout, &link).await?;
-        UnpinnedOffer::decode(&standing.offer.encode()?, client.id(), standing.now)
+        let standing = GrantSession::query_standing(self, client, timeout, &link).await?;
+        UnpinnedOffer::decode(&standing.offer.encode()?, standing.now)
             .and_then(|offer| offer.pin(trust))
             .map_err(GrantClientError::from)
     }
 }
+#[derive(Clone)]
 pub struct GrantSessionOptions {
     pub target: PinnedOffer,
-    pub client: Principal,
     pub signer: Arc<ProducerSigningKey>,
+    pub application: Arc<ClientProfile>,
     pub journal_root: PathBuf,
     pub timeout: Duration,
 }
@@ -230,11 +227,25 @@ pub enum GrantTransport {
     Remote(Endpoint),
     Local(GrantService),
 }
+impl GrantTransport {
+    pub async fn remote(
+        key: iroh::SecretKey,
+    ) -> std::result::Result<Self, iroh::endpoint::BindError> {
+        Ok(Self::Remote(
+            Endpoint::builder(iroh::endpoint::presets::N0)
+                .secret_key(key)
+                .bind()
+                .await?,
+        ))
+    }
+}
+
 enum SessionTransport {
     Remote(Box<WorkLink>),
     Local {
         service: GrantService,
-        context: TransportContext,
+        application: Arc<ClientProfile>,
+        signer: Arc<ProducerSigningKey>,
     },
     Closed,
 }
@@ -247,23 +258,31 @@ impl SessionTransport {
                     .map_err(|_| GrantClientError::Timeout)?
                     .map_err(GrantClientError::from)?,
             )),
-            Self::Local { service, context } => Ok(Link::Local(service.clone(), context.clone())),
+            Self::Local {
+                service,
+                application,
+                signer,
+            } => {
+                let caller = service
+                    .node()
+                    .authenticate_signed(&application.credential, signer)
+                    .await?;
+                if caller.authority() != application.authority {
+                    return Err(GrantError::Audience.into());
+                }
+                Ok(Link::Local(
+                    service.for_caller(caller, application.authorization),
+                ))
+            }
             Self::Closed => Err(GrantClientError::Closed),
         }
     }
 }
 enum Link {
     Remote(IrohTransport),
-    Local(GrantService, TransportContext),
+    Local(GrantWork),
 }
 impl Link {
-    fn exporter(&self) -> Result<[u8; 32]> {
-        let exporter = match self {
-            Self::Remote(t) => t.context().open_exporter,
-            Self::Local(_, c) => c.open_exporter,
-        };
-        exporter.ok_or(GrantError::Unauthorized.into())
-    }
     async fn standing(&self, request: GetStandingRequest) -> Result<GetStandingResponse> {
         match self {
             Self::Remote(t) => hellas_rpc::services::work::WorkClientImpl::new(IrohTransport::new(
@@ -272,7 +291,7 @@ impl Link {
             .get_standing(request)
             .await
             .map_err(GrantClientError::from),
-            Self::Local(s, c) => Ok(s.standing(&request, c)),
+            Self::Local(s) => Ok(s.standing(&request).await),
         }
     }
     async fn accept(&self, request: AcceptWorkRequest) -> Result<AcceptWorkResponse> {
@@ -283,7 +302,7 @@ impl Link {
             .accept_work(request)
             .await
             .map_err(GrantClientError::from),
-            Self::Local(s, c) => Ok(s.accept(&request, c)),
+            Self::Local(s) => Ok(s.accept(&request).await),
         }
     }
     async fn stream(
@@ -303,8 +322,8 @@ impl Link {
                     if let Err(error) = stream.finish() { yield Err(GrantClientError::from(error)); }
                 }))
             }
-            Self::Local(s, c) => Ok(Box::pin(
-                s.stream(request, c.clone())
+            Self::Local(s) => Ok(Box::pin(
+                s.stream(request)
                     .map(|event| event.map_err(GrantClientError::from)),
             )),
         }
@@ -334,31 +353,22 @@ pub struct GrantSession {
 }
 impl GrantSession {
     pub async fn open(options: GrantSessionOptions, transport: GrantTransport) -> Result<Self> {
-        if options.timeout.is_zero()
-            || options.signer.public_key()
-                != PublicKey::Secp256k1(options.client.producer().to_bytes())
-        {
+        if options.timeout.is_zero() {
             return Err(GrantError::Signature.into());
         }
-        if let GrantTransport::Remote(endpoint) = &transport
-            && endpoint.id().as_bytes() != &options.client.transport()
-        {
-            return Err(GrantError::Audience.into());
-        }
+        let client = PrincipalId::from_public_key(options.signer.public_key())
+            .map_err(|_| GrantError::UnsupportedKey)?;
         let target = GrantTarget::from_offer(&options.target)?;
-        let transport =
-            target.resolve_transport(&transport, options.target.trust(), &options.client)?;
-        let link = transport.connect(options.timeout).await?;
-        let standing = Self::query_standing(
-            &target,
-            &options.client,
+        let transport = target.resolve_transport(
+            &transport,
+            options.target.trust(),
+            &options.application,
             &options.signer,
-            options.timeout,
-            &link,
-        )
-        .await?;
+        )?;
+        let link = transport.connect(options.timeout).await?;
+        let standing = Self::query_standing(&target, client, options.timeout, &link).await?;
         let offer = standing.offer;
-        let channel = offer.offer().channel();
+        let channel = offer.offer().channel(client);
         let path = options.journal_root.join(hex::encode(channel.0.as_bytes()));
         let store = GrantClientStore::open(
             &path,
@@ -368,10 +378,11 @@ impl GrantSession {
                 id: channel,
                 grant: target.grant,
                 generation: offer.offer().generation,
-                client: options.client.clone(),
+                client,
             },
             standing.now,
-        )?;
+        )
+        .await?;
         Ok(Self {
             options,
             transport,
@@ -405,24 +416,19 @@ impl GrantSession {
     }
     async fn query_standing(
         target: &GrantTarget,
-        client: &Principal,
-        signer: &ProducerSigningKey,
+        client: PrincipalId,
         timeout: Duration,
         link: &Link,
     ) -> Result<Standing> {
         let locator = StandingLocator {
             provider: target.provider.content_id(),
             grant: target.grant,
-            client: client.id(),
+            client,
             generation: target.generation,
         };
-        let signature = signer
-            .sign_digest(locator.digest(target.network, &link.exporter()?))
-            .map_err(GrantClientError::from)?;
         let request = GetStandingRequest {
-            route: Some(WorkRoute::grant(locator.channel(target.network))),
+            route: Some(WorkRoute::grant(locator.channel(target.network).0)),
             locator: locator.encode().to_vec(),
-            client_signature: signature.bytes().to_vec(),
         };
         let response = tokio::time::timeout(timeout, link.standing(request))
             .await
@@ -436,7 +442,7 @@ impl GrantSession {
         };
         // Fresh TLS-bound status supplies the provider's monotone clock. The
         // client does not extend a grant by substituting its own wall clock.
-        let standing = Standing::decode(&bytes, client.id(), UnixMillis(0))?;
+        let standing = Standing::decode(&bytes, UnixMillis(0))?;
         let offer = standing.offer.offer();
         if offer.provider != target.provider
             || offer.network != target.network
@@ -452,13 +458,12 @@ impl GrantSession {
         let link = self.link().await?;
         let standing = Self::query_standing(
             &self.target,
-            &self.options.client,
-            &self.options.signer,
+            self.store.channel().client,
             self.options.timeout,
             &link,
         )
         .await?;
-        if standing.offer.offer().channel() != self.store.channel().id {
+        if standing.offer.offer().channel(self.store.channel().client) != self.store.channel().id {
             return Err(GrantError::Generation.into());
         }
         if standing.offer.offer().grant.revision < self.offer.offer().grant.revision {
@@ -467,7 +472,7 @@ impl GrantSession {
         self.observed = standing.now.max(self.store.now());
         self.observed_at = Instant::now();
         self.offer = standing.offer.clone();
-        self.store.tick(self.now())?;
+        self.store.tick(self.now()).await?;
         Ok(standing)
     }
     /// Resolve only the existing proposal, without executing a replacement.
@@ -497,7 +502,7 @@ impl GrantSession {
             }
         }
         let request = AcceptWorkRequest {
-            route: Some(WorkRoute::grant(a.channel_id)),
+            route: Some(WorkRoute::grant(a.channel_id.0)),
             authorization: a.encode(),
             client_signature: signature.bytes().to_vec(),
             prepared_input: prepared.unwrap_or_default(),
@@ -506,7 +511,7 @@ impl GrantSession {
         let response = tokio::time::timeout(self.options.timeout, link.accept(request))
             .await
             .map_err(|_| GrantClientError::Timeout)??;
-        match self.apply_acceptance(id, response, probe) {
+        match self.apply_acceptance(id, response, probe).await {
             Ok(()) => Ok(Recovery::Accepted(id)),
             Err(error @ GrantClientError::Refused { .. }) => {
                 if self.store.book().pending_proposal().is_none() {
@@ -518,7 +523,7 @@ impl GrantSession {
             Err(error) => Err(error),
         }
     }
-    fn apply_acceptance(
+    async fn apply_acceptance(
         &mut self,
         id: Digest,
         response: AcceptWorkResponse,
@@ -536,7 +541,7 @@ impl GrantSession {
                         .try_into()
                         .map_err(GrantClientError::from)?,
                 );
-                self.store.accepted(id, signature, self.now())?;
+                self.store.accepted(id, signature, self.now()).await?;
                 self.pending_body = None;
                 Ok(())
             }
@@ -557,7 +562,7 @@ impl GrantSession {
                         }
                     );
                 if conclusive && !malformed_probe {
-                    self.store.refused(id, self.now())?;
+                    self.store.refused(id, self.now()).await?;
                     self.pending_body = None;
                 }
                 Err(error)
@@ -625,6 +630,10 @@ impl GrantSession {
             .find(|p| p.name == policy_name)
             .ok_or(GrantError::OutOfScope)?
             .clone();
+        self.options
+            .target
+            .trust()
+            .verify_environment(policy.work.allowed_environment())?;
         let now = self.now();
         let span = self.offer.offer().grant.max_job_millis.get().min(
             deadline
@@ -639,9 +648,12 @@ impl GrantSession {
         let terminal = now.0.checked_add(span).ok_or(GrantError::Malformed)?;
         let a = GrantJobAuthorizationV1 {
             channel_id: channel,
+            generation: self.store.channel().generation,
             grant_id: self.target.grant,
             grant_revision: self.offer.offer().grant.revision,
-            catalogue_revision: Revision(0),
+            resource_id: policy.resource,
+            resource_revision: policy.revision,
+            pricing_revision: policy.pricing.revision,
             work_policy_digest: policy.work.digest(self.target.network, channel.0),
             prepared_input_digest: input
                 .bound_digest(self.target.network, channel.0)
@@ -662,11 +674,12 @@ impl GrantSession {
         };
         let signature = self
             .store
-            .propose(&self.offer, a, &input, &self.options.signer, now)?;
+            .propose(&self.offer, a, &input, &self.options.signer, now)
+            .await?;
         let id = grant_work_id(self.target.network, &a);
         self.pending_body = Some((id, input.clone()));
         let request = AcceptWorkRequest {
-            route: Some(WorkRoute::grant(channel)),
+            route: Some(WorkRoute::grant(channel.0)),
             authorization: a.encode(),
             client_signature: signature.bytes().to_vec(),
             prepared_input: input.encode().map_err(GrantClientError::from)?,
@@ -675,28 +688,17 @@ impl GrantSession {
         let response = tokio::time::timeout(self.options.timeout, link.accept(request))
             .await
             .map_err(|_| GrantClientError::Timeout)??;
-        self.apply_acceptance(id, response, false)?;
+        self.apply_acceptance(id, response, false).await?;
         let delivery = DeliverResultRequest {
-            route: Some(WorkRoute::grant(channel)),
+            route: Some(WorkRoute::grant(channel.0)),
             work_id: id.as_bytes().to_vec(),
-            client_signature: self
-                .options
-                .signer
-                .sign_digest(bound_delivery_request_digest(
-                    self.target.network,
-                    channel.0,
-                    id,
-                    &link.exporter()?,
-                ))
-                .map_err(GrantClientError::from)?
-                .bytes()
-                .to_vec(),
+            client_signature: Vec::new(),
         };
         let mut stream = tokio::time::timeout(self.options.timeout, link.stream(delivery))
             .await
             .map_err(|_| GrantClientError::Timeout)??;
         let mut prefixes =
-            Prefixes::new(&policy.work, &input, self.target.provider.grant_producer()?)?;
+            Prefixes::new(&policy.work, &input, grant_producer(&self.target.provider)?)?;
         let signed = tokio::time::timeout(self.options.timeout, async {
             while let Some(event) = stream.next().await {
                 let event = event?;
@@ -761,14 +763,16 @@ impl GrantSession {
         })
         .await
         .map_err(|_| GrantClientError::Timeout)??;
-        self.store.complete(
-            id,
-            &policy.work,
-            &input,
-            &prefixes.events,
-            signed.clone(),
-            self.now(),
-        )?;
+        self.store
+            .complete(
+                id,
+                &policy.work,
+                &input,
+                &prefixes.events,
+                signed.clone(),
+                self.now(),
+            )
+            .await?;
         Ok(GrantWorkResult {
             work_id: id,
             result: signed.result,
@@ -838,8 +842,8 @@ fn refusal_error(
                     .try_into()
                     .map_err(GrantClientError::from)?,
             );
-            hellas_rpc::signature::verify_digest_signature(
-                &PublicKey::Secp256k1(target.provider.grant_producer()?.to_bytes()),
+            hellas_auth::signature::verify_digest_signature(
+                &PublicKey::Secp256k1(grant_producer(&target.provider)?.to_bytes()),
                 &signature,
                 bound_result_digest(target.network, channel.0, &result),
             )

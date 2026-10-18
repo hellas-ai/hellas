@@ -115,6 +115,7 @@ let
       cargo-machete
       cargo-udeps
       skopeo
+      sqlx-cli
     ])
     ++ cargoToolPackages
     ++ commonToolPackages;
@@ -184,14 +185,8 @@ let
         }:
         pkgSpec.mkHellasPackage {
           buildNoDefaultFeatures = true;
-          # Full network surface, but no local Catena runtime.
-          buildFeatures = [
-            "chain"
-            "gateway"
-          ]
-          ++ lib.optional pkgSpec.pkgs.stdenv.hostPlatform.isUnix "cloud"
-          ++ lib.optionals (crossSystem == null) [ "node" ]
-          ++ lib.optional otel "otel";
+          # Client, gateway and daemon share one native composition.
+          buildFeatures = lib.optional otel "otel";
         }
       ) { };
       cli-validator = lib.makeOverridable (
@@ -231,11 +226,7 @@ let
             }:
             pkgSpec.mkHellasPackage {
               buildNoDefaultFeatures = true;
-              buildFeatures = [
-                "evaluate"
-                "cloud"
-              ]
-              ++ lib.optional otel "otel";
+              buildFeatures = [ "evaluate" ] ++ lib.optional otel "otel";
             }
           ) { };
         };

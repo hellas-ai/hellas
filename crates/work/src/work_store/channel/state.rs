@@ -23,9 +23,7 @@ impl Channel<PaymentFunding> {
         let input = PreparedWorkInput::decode(&job.prepared_input, MAX_RECORD_BYTES)
             .map_err(PaidWorkError::from)?;
         let budget = match &input {
-            PreparedWorkInput::Fetch(_) => {
-                hellas_rpc::protocol::work_fetch::MAX_FETCH_TRANSCRIPT_BYTES
-            }
+            PreparedWorkInput::Fetch(_) => crate::model::fetch::MAX_FETCH_TRANSCRIPT_BYTES,
             PreparedWorkInput::Evaluate(_) => MAX_RECORD_BYTES,
         };
         let events = decode_transcript(transcript, budget)?;
@@ -88,7 +86,7 @@ impl Channel<PaymentFunding> {
     /// the client's authorization, the provider's co-signature, the
     /// provider's result, and the client's binding and certificate. The
     /// result is rebuilt from the transcript beside it by
-    /// [`hellas_rpc::protocol::work::terminal_result`], exactly as a record replay rebuilds it. The
+    /// [`crate::model::work::terminal_result`], exactly as a record replay rebuilds it. The
     /// inputs are hashed against the digest the authorization commits
     /// to. The retained close start is checked against this channel and
     /// this role, and the fixed answer is re-derived from the contest
@@ -1127,7 +1125,7 @@ impl Channel<PaymentFunding> {
     /// summarises.
     ///
     /// The rule that makes this more than a signature check is the
-    /// reproduction below: [`hellas_rpc::protocol::work::terminal_result`] is handed the stored
+    /// reproduction below: [`crate::model::work::terminal_result`] is handed the stored
     /// events and this job's own authorization, and what it builds must
     /// be the result byte for byte. That establishes, on commit and on
     /// every replay, that the events are one verified signed chain for

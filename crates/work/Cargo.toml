@@ -7,25 +7,37 @@ license.workspace = true
 repository.workspace = true
 documentation.workspace = true
 
+[features]
+test-support = ["dep:bytes", "hellas-auth/test-support", "hellas-wire/mux"]
+
 [dependencies]
 async-stream.workspace = true
 base64.workspace = true
+brotli = "9"
+bytes = { workspace = true, optional = true }
+flate2 = "1"
 futures.workspace = true
+hellas-auth.workspace = true
 hellas-kernel = { workspace = true, features = ["secp256k1"] }
 hellas-private.workspace = true
-hellas-rpc = { workspace = true, features = ["work"] }
+hellas-rpc = { workspace = true, features = ["evaluate", "fetch", "work"] }
 hellas-wire.workspace = true
 hellas-xet.workspace = true
+hex.workspace = true
+k256.workspace = true
 prost = { version = "0.14", default-features = false, features = ["derive"] }
 serde.workspace = true
 serde_bytes.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+url = "2"
 
 [dev-dependencies]
 bytes.workspace = true
 hellas-wire = { workspace = true, features = ["mux"] }
+hellas-work = { workspace = true, features = ["test-support"] }
 proptest = "1.11"
-serde_json.workspace = true
 tempfile.workspace = true

@@ -1,3 +1,4 @@
+use hellas_work::model::grant::records::decode_contact;
 use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
@@ -35,7 +36,7 @@ pub enum AgentError {
     #[error(transparent)]
     Download(#[from] DownloadError),
     #[error(transparent)]
-    Grant(#[from] hellas_rpc::protocol::work_grant::records::GrantError),
+    Grant(#[from] hellas_work::model::grant::records::GrantError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
@@ -115,8 +116,7 @@ struct Process {
     launcher: Vec<String>,
     args: Vec<String>,
     identity: PathBuf,
-    owner_enrollment: Option<PathBuf>,
-    bootstrap_grants: PathBuf,
+    default_grant_config: PathBuf,
     cli: PathBuf,
     configuration: Option<crate::configuration::InstalledConfiguration>,
     configuration_dir: PathBuf,
@@ -145,14 +145,11 @@ impl Process {
             .stdout(Stdio::from(std::io::stderr()))
             .stderr(Stdio::inherit())
             .kill_on_drop(true);
-        if let Some(owner) = &self.owner_enrollment {
-            command.arg("--owner-enrollment").arg(owner);
-        }
         command.arg("--grant-config").arg(
             self.configuration
                 .as_ref()
                 .map(|c| &c.grant_config)
-                .unwrap_or(&self.bootstrap_grants),
+                .unwrap_or(&self.default_grant_config),
         );
         if let Some(configuration) = &self.configuration {
             command
@@ -168,7 +165,7 @@ impl Process {
                 if !self.running()? {
                     return Err(AgentError::EarlyExit);
                 }
-                if crate::managed_grants::ready(&self.configuration_dir.join("control.sock"))
+                if crate::managed_grants::ready(&self.cli, &self.identity, &self.configuration_dir)
                     .await
                     .is_ok()
                 {
@@ -307,8 +304,8 @@ impl Process {
 async fn export_enrollment(
     cli: &Path,
     identity: &Path,
-) -> Result<hellas_rpc::protocol::work_grant::records::Principal> {
-    use hellas_rpc::protocol::work_grant::records::{MAX_PRINCIPAL_BYTES, Principal};
+) -> Result<hellas_rpc::ProviderEnrollmentBundle> {
+    use hellas_work::model::grant::records::MAX_PRINCIPAL_BYTES;
     use tokio::io::AsyncReadExt;
     let mut command = Command::new(cli);
     command
@@ -340,7 +337,7 @@ async fn export_enrollment(
         if !child.wait().await?.success() {
             return Err(AgentError::EnrollmentExport);
         }
-        Ok(Principal::decode(&bytes)?)
+        Ok(decode_contact(&bytes)?)
     })
     .await
     .map_err(AgentError::EnrollmentTimeout)?
@@ -480,13 +477,14 @@ pub async fn run_until(
     identity_command(&options.cli, &identity, "init").await?;
     let bundle = export_enrollment(&options.cli, &identity).await?;
     let enrollment = Enrollment {
-        bundle: Some(hex::encode(bundle.bundle().canonical_bytes())),
+        bundle: Some(hex::encode(bundle.canonical_bytes())),
         node_id: identity_command(&options.cli, &identity, "show-node-id").await?,
         enrollment_id: identity_command(&options.cli, &identity, "show-enrollment-id").await?,
     };
     enrollment.validate()?;
-    let (owner_enrollment, bootstrap_grants) =
-        crate::managed_grants::prepare(&options.data, &configuration_dir, bundle, owner.as_ref())?;
+    let default_grant_config =
+        crate::managed_grants::prepare(&options.data, &configuration_dir, bundle, owner.as_ref())
+            .await?;
     let mut builder = Endpoint::builder(presets::N0)
         .secret_key(secret)
         .alpns(vec![ALPN.to_vec()]);
@@ -502,8 +500,7 @@ pub async fn run_until(
         launcher: options.launcher,
         args: options.serve_args,
         identity,
-        owner_enrollment,
-        bootstrap_grants,
+        default_grant_config,
         cli: options.cli,
         configuration,
         configuration_dir,
@@ -654,7 +651,11 @@ async fn receive_content(
     }
     // Stage outside the indexed content tree. Cancellation/errors remove the temp
     // file; only an exact length+digest match becomes visible to Hellas.
-    let temp = tempfile::NamedTempFile::new_in(root.parent().ok_or(DownloadError::RootParent)?)?;
+    let temp = hellas_private::private_tempfile(
+        root.parent().ok_or(DownloadError::RootParent)?,
+        ".content-",
+        ".tmp",
+    )?;
     let mut file = tokio::fs::File::from_std(temp.reopen()?);
     let mut hash = Sha256::new();
     let mut received = 0u64;
@@ -676,7 +677,7 @@ async fn receive_content(
     let destination = root.join(sha256);
     match temp.persist_noclobber(&destination) {
         Ok(_) => {
-            std::fs::File::open(root)?.sync_all()?;
+            hellas_private::sync_directory(root)?;
             Ok(())
         }
         Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {

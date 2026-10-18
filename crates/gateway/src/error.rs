@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, path::PathBuf, process::ExitStatus};
+use std::{net::SocketAddr, process::ExitStatus};
 
 pub type GatewayResult<T> = Result<T, GatewayError>;
 
@@ -18,6 +18,8 @@ pub enum GatewayError {
         primary: Box<GatewayError>,
         cleanup: crate::WorkShutdownError,
     },
+    #[error(transparent)]
+    Authority(#[from] hellas_work::work_store::grant::NodeStoreError),
     #[error("gateway task failed")]
     Task(#[from] tokio::task::JoinError),
     #[error("gateway I/O failed")]
@@ -35,12 +37,6 @@ pub enum GatewayError {
     },
     #[error("gateway bind address {host}:{port} resolved to no address")]
     NoAddress { host: String, port: u16 },
-    #[error("failed to {operation} gateway credential at {}", path.display())]
-    Credential {
-        operation: &'static str,
-        path: PathBuf,
-        source: std::io::Error,
-    },
     #[error("failed to spawn {command}")]
     Spawn {
         command: String,
@@ -92,12 +88,6 @@ pub enum GatewayConfigError {
     TokenizerPair,
     #[error("Hellas backend requires an environment and tokenizer")]
     MissingEnvironment,
-    #[error("gateway credential must be a private regular file owned by the gateway user")]
-    CredentialPermissions,
-    #[error("invalid gateway credential length")]
-    CredentialLength,
-    #[error("gateway credential must be lowercase hex")]
-    CredentialEncoding,
-    #[error("non-loopback gateway binding requires --allow-remote and --bearer-token-file")]
+    #[error("non-loopback gateway binding requires --allow-remote")]
     RemoteBinding,
 }

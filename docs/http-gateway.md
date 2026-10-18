@@ -100,9 +100,10 @@ provider. Private destinations also require its explicit egress opt-in.
 hellas-cli --identity ./gateway.identity gateway \
   --http-fetch-config ./http-gateway.json \
   --paid-work-config /srv/hellas/paid-pool.json \
-  --port 8080 --bearer-token-file ./gateway.bearer
+  --port 8080 --gateway-profile ./gateway-profile.json
 ```
 
+Provision the [HTTP authority profile](admin.md#http-gateway-authority) before startup.
 The client signs the request and verifies each response chunk before forwarding
 it. Provider-owned credentials require public WebPKI roots. The gateway asks the
 provider for ephemeral retention and disables inference replay. Its own archive
@@ -110,7 +111,7 @@ policy is independent of provider retention and upstream `store` fields.
 
 For Kimi Code, set `KIMI_MODEL_NAME` to an available model and use `--wrap kimi`;
 the wrapper supplies `KIMI_MODEL_BASE_URL` and `KIMI_MODEL_API_KEY`. A separately
-launched client can use the same variables and the private gateway bearer file.
+launched client can use the same variables and the credential from its provisioned HTTP authority.
 Choose a context size that fits the byte limits below.
 
 ## Model selection and session affinity
@@ -197,8 +198,27 @@ smaller Fetch envelope limit are archived with their 413 response.
 These switches govern this gateway's application writes. They do not establish
 OS swap/dump protection, a remote provider's host policy, upstream retention,
 or the coding client's own session-log policy. Software identities do not
-attest those properties. The embedded Responses-only `start_fetch` API is unsupported until grant
-funding is implemented.
+attest those properties.
+
+## Responses grants
+
+After importing an Offer and approving its provider trust policy, a sealed
+stateless Responses resource uses the same SDK `grant_gateway::responses::start_fetch`
+composition as an embedded host:
+
+```sh
+hellas-cli gateway --offer ALIAS --grant-policy responses \
+  --trust-store ./trust --trust-policy PROVIDER \
+  --work-profile ./work-profile.json --gateway-profile ./gateway-profile.json \
+  --port 8080 --zdr
+```
+
+The Work profile authorizes the provider allowance; the gateway profile admits
+local HTTP callers. Requests use `/v1/responses`, authenticated by the scoped
+HTTP credential. The Offer determines the sealed route and environment. Ambiguous
+Offers require `--grant-policy`; inference caching and `--metrics-port` are
+unsupported. Archive/ZDR, `--allow-remote`, request overrides and `--wrap` use the
+shared gateway behavior. Shutdown drains accepted Work and closes its endpoint.
 
 ## Limits and telemetry
 

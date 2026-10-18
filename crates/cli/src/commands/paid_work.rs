@@ -12,12 +12,12 @@ use hellas_chain::{
     ConsensusInfo, ConsensusVerifier, FinalizedBlockQuery, FinalizedBlockView, LightClient as _,
 };
 use hellas_kernel::{CoinId, EdgeId, Funding, List, MAX_PARTY_INPUTS, Secp256k1Signer};
-use hellas_rpc::protocol::artifacts::PreparedPaidInputV1;
+use hellas_sdk::paid_client::{InputIdentities, PaidWorkOptions, PaidWorkRun, run_paid_work};
+use hellas_work::model::fetch::PreparedPaidFetchInputV1;
+use hellas_work::model::prepared_input::PreparedPaidInputV1;
+use hellas_work::model::profile::PreparedWorkInput;
 #[cfg(test)]
-use hellas_rpc::protocol::work::{JobDeadlines, private_policy_commitment};
-use hellas_rpc::protocol::work_fetch::PreparedPaidFetchInputV1;
-use hellas_rpc::protocol::work_profile::PreparedWorkInput;
-use hellas_sdk::paid_client::{InputIdentities, PaidWorkSession, bind_paid_endpoint};
+use hellas_work::model::work::{JobDeadlines, private_policy_commitment};
 use hellas_work::work_store::journal::MAX_RECORD_BYTES;
 use iroh::{EndpointId, SecretKey};
 use std::net::SocketAddr;
@@ -33,7 +33,6 @@ pub enum PaidWorkCommand {
     /// Build a signed ephemeral Fetch input for a paid channel.
     PrepareFetch(PrepareFetchArgs),
     /// Build canonical paid input from a causal-LM environment and prompt.
-    #[cfg(feature = "llm")]
     PrepareInput(PrepareInputArgs),
     /// Print the identities a prepared input requires in a provider policy.
     InspectInput(InspectInputArgs),
@@ -49,9 +48,9 @@ pub struct PrepareFetchArgs {
     service: String,
     #[arg(long)]
     method: String,
-    /// The trusted transformation to execute.
-    #[arg(long, value_parser = ["openai-responses", "codex-responses", "http"])]
-    execution_environment: String,
+    /// JSON descriptor of the approved Fetch execution contract.
+    #[arg(long, value_name = "FILE")]
+    contract: PathBuf,
     /// Assurance authenticated before the paid request is disclosed.
     #[arg(long, default_value = "producer-signed", value_parser = ["producer-signed", "apple-app-attest"])]
     assurance: String,
@@ -63,7 +62,6 @@ pub struct PrepareFetchArgs {
     out: PathBuf,
 }
 
-#[cfg(feature = "llm")]
 #[derive(Debug, Args)]
 pub struct PrepareInputArgs {
     /// Canonical causal-LM environment file (for example smollm2.environment).
@@ -109,13 +107,12 @@ pub struct InspectChainArgs {
 pub struct RunArgs {
     #[command(flatten)]
     chain_node: super::chain_node::ChainNodeArgs,
-    /// Provider enrollment content ID from the paid offer.
+    /// Caller-owned private trust directory.
     #[arg(long)]
-    provider_genesis: hellas_rpc::ContentId,
+    trust_store: PathBuf,
+    /// Previously approved local policy ID.
     #[arg(long)]
-    apple_app_id: Option<String>,
-    #[arg(long, value_delimiter = ',', value_parser = crate::parse_hex_array::<32>)]
-    apple_cd_hashes: Vec<[u8; 32]>,
+    trust_policy: String,
     /// Provider work configuration, including chain identity and policy.
     #[arg(long = "work-config", value_name = "FILE")]
     work_config: PathBuf,
@@ -178,11 +175,10 @@ pub async fn run(
     command: PaidWorkCommand,
     transport_key: SecretKey,
     settlement_key: Secp256k1Signer,
-    producer_key: hellas_rpc::ProducerSigningKey,
+    producer_key: hellas_auth::ProducerSigningKey,
 ) -> CliResult<()> {
     match command {
         PaidWorkCommand::PrepareFetch(args) => prepare_fetch(args, &producer_key),
-        #[cfg(feature = "llm")]
         PaidWorkCommand::PrepareInput(args) => prepare_input(args, &transport_key, &settlement_key),
         PaidWorkCommand::InspectInput(args) => {
             inspect_input(&args.prepared_input, &transport_key, &settlement_key)
@@ -208,19 +204,19 @@ pub async fn run(
     }
 }
 
-fn prepare_fetch(args: PrepareFetchArgs, key: &hellas_rpc::ProducerSigningKey) -> CliResult<()> {
-    let environment = match args.execution_environment.as_str() {
-        "openai-responses" => hellas_rpc::FetchEnvironment::OpenAiResponses,
-        "codex-responses" => hellas_rpc::FetchEnvironment::CodexResponses,
-        "http" => hellas_rpc::FetchEnvironment::Http,
-        _ => bail!("unsupported fetch environment"),
-    };
+fn prepare_fetch(args: PrepareFetchArgs, key: &hellas_auth::ProducerSigningKey) -> CliResult<()> {
+    let bytes = super::read_bounded_regular_file(
+        &args.contract,
+        "--contract",
+        hellas_rpc::protocol::fetch_contract::MAX_FETCH_CONTRACT_BYTES,
+    )?;
+    let environment: hellas_rpc::FetchContract = serde_json::from_slice(&bytes)?;
     let payload = super::read_bounded_regular_file(
         &args.payload_file,
         "--payload-file",
         hellas_rpc::fetch::MAX_FETCH_REQUEST_BODY_BYTES,
     )?;
-    if environment == hellas_rpc::FetchEnvironment::Http {
+    if environment.schema() == hellas_rpc::FetchSchema::HttpV1 {
         hellas_rpc::http_fetch::HttpFetchRequest::decode(&payload)?;
     }
     let assurance = match args.assurance.as_str() {
@@ -237,7 +233,7 @@ fn prepare_fetch(args: PrepareFetchArgs, key: &hellas_rpc::ProducerSigningKey) -
         key,
         hellas_rpc::Retention::Ephemeral,
     )?;
-    let prepared = PreparedPaidFetchInputV1::new(&events, &environment.manifest())?;
+    let prepared = PreparedPaidFetchInputV1::new(&events, &environment)?;
     write_private(&args.out, &prepared.encode()?)?;
     println!("prepared_input: {}", args.out.display());
     println!("allowed_environment: {}", environment.manifest_id());
@@ -245,21 +241,11 @@ fn prepare_fetch(args: PrepareFetchArgs, key: &hellas_rpc::ProducerSigningKey) -
     Ok(())
 }
 
-#[cfg(feature = "llm")]
 fn prepare_input(
     args: PrepareInputArgs,
     transport_key: &SecretKey,
     settlement_key: &Secp256k1Signer,
 ) -> CliResult<()> {
-    use hellas_rpc::protocol::artifacts::{
-        BoundTermId, InputAddressed as _, OutputAddressed as _, SourceRef, TextArtifact,
-        TextExecution, TextPolicy, TokenIds,
-    };
-
-    anyhow::ensure!(
-        args.max_new_tokens > 0,
-        "--max-new-tokens must be greater than zero"
-    );
     let environment_bytes = super::read_bounded_regular_file(
         &args.environment,
         "causal-LM environment",
@@ -272,33 +258,16 @@ fn prepare_input(
                 args.environment.display(),
             )
         })?;
-    let manifest = environment.manifest();
     let presentation = hellas_presentation::TextPresentation::load(&args.tokenizer)?;
-    let prompt_tokens = TokenIds::from_u32s(presentation.encode(&args.prompt)?);
-    let text_policy = TextPolicy::from_u32_stop_tokens(args.max_new_tokens, args.stop_token_ids);
-    let identity_artifact =
-        TextArtifact::identity(BoundTermId::from_digest(manifest.content_id().digest()));
-    let text_execution = TextExecution::new(
-        SourceRef::output(identity_artifact.output_id()),
-        prompt_tokens.output_id(),
-        text_policy.output_id(),
-    );
-    let evaluate_request = hellas_rpc::EvaluateRequest {
-        text_execution: text_execution.input_id().digest(),
-        runner_public_key: hellas_rpc::PublicKey::Secp256k1(settlement_key.party_key().to_bytes()),
-        execution_environment: manifest.content_id(),
-        nonce: rand::random(),
-        assurance: hellas_rpc::Assurance::ProducerSigned,
-        retain: true,
-    };
-    let prepared = PreparedPaidInputV1::new(
-        &evaluate_request,
-        &manifest,
-        &text_execution,
-        &prompt_tokens,
-        &text_policy,
-        &identity_artifact,
-    );
+    let prepared = hellas_sdk::prepare_evaluate(
+        hellas_sdk::gateway::WorkExecutionRequest {
+            environment,
+            input_ids: presentation.encode(&args.prompt)?,
+            max_new_tokens: args.max_new_tokens,
+            stop_token_ids: args.stop_token_ids,
+        },
+        hellas_auth::PublicKey::Secp256k1(settlement_key.party_key().to_bytes()),
+    )?;
     write_private(&args.out, &prepared.encode()?)?;
     println!("prepared_input: {}", args.out.display());
     println!("prepared_input_bytes: {}", prepared.encode()?.len());
@@ -418,52 +387,36 @@ async fn inspect_chain(validators: &[String]) -> CliResult<()> {
     Ok(())
 }
 
-fn paid_provider_trust(
-    args: &RunArgs,
-    assurance: hellas_rpc::Assurance,
-) -> CliResult<hellas_client::ProviderTrustAnchor> {
-    crate::identity::provider_trust(
-        Some(args.provider_genesis),
-        assurance,
-        args.apple_app_id.clone(),
-        args.apple_cd_hashes.clone(),
-    )
-}
-
-async fn open_paid_channel(
-    args: &RunArgs,
-    endpoint: iroh::Endpoint,
-    settlement_key: Secp256k1Signer,
-    assurance: hellas_rpc::Assurance,
-    node: hellas_sdk::FullNode,
-) -> CliResult<PaidWorkSession> {
+fn paid_options(args: &RunArgs, assurance: hellas_rpc::Assurance) -> CliResult<PaidWorkOptions> {
     anyhow::ensure!(
         !args.payment_coins.is_empty(),
         "at least one --payment-coin is required"
     );
-    let provider_trust = paid_provider_trust(args, assurance)?;
     let config = load_work_config(&args.work_config)?;
-    PaidWorkSession::open(
-        hellas_sdk::paid_client::PaidWorkOptions {
-            config,
-            journal_root: args.journal_root.clone(),
-            provider: args.provider,
-            provider_addrs: args.provider_addrs.clone(),
-            provider_trust,
-            bond: edge_id("--bond", &args.bond)?,
-            payment_funding: Funding::new(coins(&args.payment_coins)?, empty_coins()),
-            omission_bond: args.omission_bond,
-            acceptance_blocks: args.acceptance_blocks,
-            terminal_blocks: args.terminal_blocks,
-            payment_blocks: args.payment_blocks,
-            timeout: Duration::from_secs(args.timeout_secs),
-        },
-        endpoint,
-        settlement_key,
-        node,
-    )
-    .await
-    .map_err(Into::into)
+    let provider_trust = hellas_sdk::trust_policy::TrustPolicyStore::new(&args.trust_store)
+        .resolve_environment(
+            &args.trust_policy,
+            assurance,
+            config.work_policy.allowed_environment(),
+            crate::identity::assertion_counters()?,
+        )?;
+    Ok(PaidWorkOptions {
+        config,
+        journal_root: args.journal_root.clone(),
+        provider: args.provider,
+        provider_addrs: args.provider_addrs.clone(),
+        provider_trust,
+        bond: edge_id("--bond", &args.bond)?,
+        payment_funding: Funding::new(
+            coins(&args.payment_coins)?,
+            List::empty(CoinId::from_bytes([0; CoinId::LENGTH])),
+        ),
+        omission_bond: args.omission_bond,
+        acceptance_blocks: args.acceptance_blocks,
+        terminal_blocks: args.terminal_blocks,
+        payment_blocks: args.payment_blocks,
+        timeout: Duration::from_secs(args.timeout_secs),
+    })
 }
 
 async fn run_one(
@@ -473,31 +426,23 @@ async fn run_one(
     node: hellas_sdk::FullNode,
 ) -> CliResult<()> {
     let prepared = read_prepared_work_input(&args.prepared_input)?;
-    let endpoint = bind_paid_endpoint(transport_key).await?;
-    let mut channel = open_paid_channel(
-        &args,
-        endpoint.clone(),
+    let result = run_paid_work(
+        PaidWorkRun {
+            options: paid_options(&args, prepared.assurance()?)?,
+            prepared_input: prepared,
+            settle: args.settle,
+        },
+        transport_key,
         settlement_key,
-        prepared.assurance()?,
         node,
     )
     .await?;
-    println!(
-        "bond_edge: {}",
-        hex::encode(channel.descriptor().bond_edge().to_bytes())
-    );
+    println!("bond_edge: {}", hex::encode(result.bond_edge.to_bytes()));
     println!(
         "payment_edge: {}",
-        hex::encode(channel.descriptor().channel().payment_edge().to_bytes())
+        hex::encode(result.payment_edge.to_bytes())
     );
-    println!(
-        "channel_id: {}",
-        hex::encode(channel.descriptor().channel().id().as_bytes())
-    );
-    let result = channel
-        .run(Some(prepared), false, None)
-        .await?
-        .context("paid execution returned no result")?;
+    println!("channel_id: {}", hex::encode(result.channel_id.as_bytes()));
     println!("work_id: {}", hex::encode(result.work_id.as_bytes()));
     println!("job_price: {}", result.job_price);
     println!("credited_cumulative: {}", result.credited_cumulative);
@@ -506,12 +451,11 @@ async fn run_one(
         write_private(output, &result.transcript)?;
     }
     println!("result_bytes: {}", result.transcript.len());
-    if args.settle {
-        println!("settled_provider_payout: {}", channel.settle().await?);
+    if let Some(payout) = result.settled_provider_payout {
+        println!("settled_provider_payout: {payout}");
     }
     println!("settled: {}", args.settle);
     println!("client_journals: {}", args.journal_root.display());
-    endpoint.close().await;
     Ok(())
 }
 
@@ -553,26 +497,17 @@ fn coins(values: &[String]) -> CliResult<List<CoinId, MAX_PARTY_INPUTS>> {
         .iter()
         .map(|value| fixed_hex("--payment-coin", value).map(CoinId::from_bytes))
         .collect::<CliResult<Vec<_>>>()?;
-    let slots: [CoinId; MAX_PARTY_INPUTS] = std::array::from_fn(|index| {
-        ids.get(index)
-            .copied()
-            .unwrap_or_else(|| CoinId::from_bytes([0; CoinId::LENGTH]))
-    });
-    List::new(slots, ids.len()).context("too many --payment-coin values")
-}
-
-fn empty_coins() -> List<CoinId, MAX_PARTY_INPUTS> {
-    List::take(
-        [CoinId::from_bytes([0; CoinId::LENGTH]); MAX_PARTY_INPUTS],
-        0,
-    )
+    hellas_sdk::work_config::coin_list(&ids).context("too many --payment-coin values")
 }
 
 pub(crate) fn fixed_hex<const N: usize>(flag: &str, value: &str) -> CliResult<[u8; N]> {
-    let bytes = hex::decode(value).with_context(|| format!("{flag} is not hex"))?;
-    bytes
-        .try_into()
-        .map_err(|bytes: Vec<u8>| anyhow::anyhow!("{flag} is {} bytes; expected {N}", bytes.len()))
+    hellas_auth::hex::parse(value).with_context(|| {
+        if value.len() != N * 2 {
+            format!("{flag} has {} bytes; expected {N}", value.len() / 2)
+        } else {
+            format!("{flag} must be hexadecimal")
+        }
+    })
 }
 
 #[cfg(test)]

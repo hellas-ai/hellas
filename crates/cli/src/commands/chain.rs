@@ -708,12 +708,7 @@ fn parse_edge_id(raw: &str) -> CliResult<EdgeId> {
 }
 
 fn parse_hex_32(raw: &str, field: &'static str) -> CliResult<[u8; 32]> {
-    let bytes =
-        hex::decode(raw).map_err(|error| anyhow::anyhow!("bad hex for {field}: {error}"))?;
-    let actual = bytes.len();
-    bytes
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("{field} must be 32 bytes, got {actual}"))
+    hellas_auth::hex::parse(raw).with_context(|| format!("{field} must be 32 bytes of hex"))
 }
 
 fn write_terms(path: &std::path::Path, terms: &Terms) -> CliResult {

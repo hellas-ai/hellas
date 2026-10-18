@@ -574,3 +574,77 @@ mod tests {
         );
     }
 }
+
+/// A cursor over one record's canonical bytes.
+#[derive(Debug)]
+pub struct Cursor<'a> {
+    bytes: &'a [u8],
+}
+
+impl<'a> Cursor<'a> {
+    /// Starts a cursor at the beginning of `bytes`.
+    #[must_use]
+    pub const fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes }
+    }
+
+    /// Returns whether every byte has been read.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    /// Takes one byte.
+    pub fn byte(&mut self) -> Option<u8> {
+        let (head, rest) = self.bytes.split_first()?;
+        self.bytes = rest;
+        Some(*head)
+    }
+
+    /// Takes exactly `len` bytes.
+    pub fn take(&mut self, len: usize) -> Option<&'a [u8]> {
+        let (head, rest) = self.bytes.split_at_checked(len)?;
+        self.bytes = rest;
+        Some(head)
+    }
+
+    /// Takes a fixed-width array.
+    pub fn array<const N: usize>(&mut self) -> Option<[u8; N]> {
+        let head = self.take(N)?;
+        let mut out = [0_u8; N];
+        out.copy_from_slice(head);
+        Some(out)
+    }
+
+    /// Takes one big-endian `u64`.
+    pub fn u64(&mut self) -> Option<u64> {
+        self.array::<8>().map(u64::from_be_bytes)
+    }
+
+    /// Takes every remaining byte.
+    ///
+    /// Only legal as a record's last field, where "the rest" and "a
+    /// length-prefixed body" are the same bytes and the prefix would be
+    /// a second, disagreeable spelling of the record's own length.
+    pub const fn rest(&mut self) -> &'a [u8] {
+        let all = self.bytes;
+        self.bytes = &[];
+        all
+    }
+}
+
+impl Cursor<'_> {
+    /// Reads one kernel value and advances by its decoded size.
+    pub fn field<T: Decode>(&mut self) -> Option<T> {
+        let (value, consumed) = T::decode(self.bytes).ok()?;
+        self.bytes = self.bytes.get(consumed..)?;
+        Some(value)
+    }
+
+    /// Reads the length-prefixed network name used in Work records.
+    pub fn network(&mut self) -> Option<crate::NetworkId> {
+        let len = usize::from(self.byte()?);
+        let name = core::str::from_utf8(self.take(len)?).ok()?;
+        crate::NetworkId::new(name)
+    }
+}

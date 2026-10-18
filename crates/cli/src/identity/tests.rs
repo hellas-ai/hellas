@@ -1,6 +1,5 @@
 use super::*;
-use hellas_rpc::Signature;
-use std::env;
+use hellas_auth::Signature;
 
 #[test]
 fn creates_and_reloads_one_identity() {
@@ -133,19 +132,6 @@ fn creates_parent_directory() {
 }
 
 #[test]
-fn default_path_uses_home() {
-    let dir = tempfile::tempdir().unwrap();
-    unsafe { env::set_var("HOME", dir.path()) };
-    assert_eq!(default_path().unwrap(), dir.path().join(".hellas/identity"));
-    #[cfg(feature = "evaluate")]
-    assert_eq!(
-        default_content_index_path().unwrap(),
-        dir.path().join(".hellas/content-index.bin")
-    );
-    unsafe { env::remove_var("HOME") };
-}
-
-#[test]
 fn concurrent_creation_converges() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("identity");
@@ -165,78 +151,4 @@ fn concurrent_creation_converges() {
         .map(|handle| handle.join().unwrap())
         .collect();
     assert!(keys.iter().all(|key| key == &keys[0]));
-}
-
-#[test]
-fn assertion_counter_partial_temp_write_leaves_old_value_intact() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = FilesystemAssertionCounterStore::new(dir.path());
-    let public_key = [7; 33];
-    store.advance(&public_key, 2).unwrap();
-
-    let mut interrupted = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
-    interrupted.write_all(&[0, 0]).unwrap();
-    interrupted.flush().unwrap();
-    let (interrupted, _) = interrupted.keep().unwrap();
-    drop(interrupted);
-
-    assert_eq!(
-        fs::read(store.counter_path(&public_key)).unwrap(),
-        2_u32.to_be_bytes()
-    );
-    assert_eq!(
-        store.advance(&public_key, 1),
-        Err(AttestationError::Counter)
-    );
-    store.advance(&public_key, 3).unwrap();
-}
-
-#[test]
-fn assertion_counter_corruption_fails_closed() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = FilesystemAssertionCounterStore::new(dir.path());
-    let public_key = [8; 33];
-    fs::write(store.counter_path(&public_key), [0, 1]).unwrap();
-
-    assert_eq!(store.advance(&public_key, 3), Err(AttestationError::State));
-}
-
-#[test]
-fn provider_trust_requires_complete_apple_policy_and_threads_assurance() {
-    let expected = Some(hellas_rpc::ContentId::from_bytes([9; 32]));
-    let producer = provider_trust(
-        expected,
-        hellas_rpc::Assurance::ProducerSigned,
-        None,
-        vec![],
-    )
-    .unwrap();
-    assert_eq!(
-        producer.required_assurance,
-        hellas_rpc::Assurance::ProducerSigned
-    );
-    assert!(producer.apple_app_attest.is_none());
-
-    assert!(
-        provider_trust(
-            expected,
-            hellas_rpc::Assurance::AppleAppAttest,
-            None,
-            vec![[1; 32]],
-        )
-        .unwrap_err()
-        .to_string()
-        .contains("--apple-app-attest-app-id")
-    );
-    assert!(
-        provider_trust(
-            expected,
-            hellas_rpc::Assurance::AppleAppAttest,
-            Some("TEAM.example.app".to_owned()),
-            vec![],
-        )
-        .unwrap_err()
-        .to_string()
-        .contains("--apple-app-attest-cdhashes")
-    );
 }

@@ -2,6 +2,13 @@
 use super::types::*;
 use hellas_kernel::{self as kernel, Decode, Encode, TermsProfile};
 
+pub(super) fn encode_kernel<E: Encode>(value: &E) -> Vec<u8> {
+    let mut bytes = vec![0; value.encoded_size()];
+    let written = value.write_to(&mut bytes);
+    bytes.truncate(written);
+    bytes
+}
+
 /// Verify each evidence block once and retain its decoded transactions for the
 /// projection checks. Discovery and current objects remain indexer-reported.
 pub fn verify_metadata(
@@ -205,7 +212,7 @@ mod tests {
             public.terms,
             Some(TermsKind::Basic(BasicTerms { protocol: 7, .. }))
         ));
-        let mut bytes = canonical_bytes(&terms);
+        let mut bytes = encode_kernel(&terms);
         bytes[2] = 255;
         assert!(decode_canonical::<kernel::Terms>(&bytes).is_err());
     }
@@ -273,13 +280,11 @@ mod tests {
 }
 
 fn digest(value: &str) -> Result<crate::domain::Digest, ProjectionError> {
-    validate_id(value).map_err(|e| ProjectionError::Malformed(e.into()))?;
-    let bytes: [u8; 32] = hex::decode(value)
-        .map_err(|e| ProjectionError::Malformed(e.to_string()))?
-        .try_into()
-        .map_err(|_| ProjectionError::Binding)?;
-    Ok(crate::domain::Digest::from(bytes))
+    parse_id(value)
+        .map(crate::domain::Digest::from)
+        .map_err(|e| ProjectionError::Malformed(e.into()))
 }
+
 fn referenced_transaction<'a>(
     reference: &TransactionRef,
     blocks: &'a [crate::proof_verify::VerifiedBlock],
@@ -363,7 +368,7 @@ pub fn check_detail(
                         hex::encode(kernel::Tx::edge_id_of(funding, terms).as_bytes())
                             == *payment_id
                             && hex::encode(payment.bond_edge.as_bytes()) == edge_id
-                            && canonical_bytes(&kernel::Terms::work_stake_bond(
+                            && encode_kernel(&kernel::Terms::work_stake_bond(
                                 payment.bond_terms.clone(),
                             )) == opening.canonical_terms
                     })
@@ -424,14 +429,11 @@ pub fn check_detail(
     Ok(())
 }
 fn edge_id(value: &str) -> Result<kernel::EdgeId, ProjectionError> {
-    validate_id(value).map_err(|e| ProjectionError::Malformed(e.into()))?;
-    Ok(kernel::EdgeId::from_bytes(
-        hex::decode(value)
-            .map_err(|e| ProjectionError::Malformed(e.to_string()))?
-            .try_into()
-            .map_err(|_| ProjectionError::Binding)?,
-    ))
+    parse_id(value)
+        .map(kernel::EdgeId::from_bytes)
+        .map_err(|e| ProjectionError::Malformed(e.into()))
 }
+
 /// Checks ordered raw objects and parser answers from a single claimed snapshot.
 pub fn check_work_channel(
     detail: &WorkChannelDetail,
@@ -457,7 +459,7 @@ pub fn check_work_channel(
     };
     if payment.bond_edge != bond_id
         || bond_summary.payment_edge_id.as_deref() != Some(payment_summary.edge_id.as_str())
-        || canonical_bytes(&kernel::Terms::work_stake_bond(payment.bond_terms.clone()))
+        || encode_kernel(&kernel::Terms::work_stake_bond(payment.bond_terms.clone()))
             != bond_opening.canonical_terms
         || detail.admission != admission_at(height, &terms)
     {
@@ -531,15 +533,10 @@ pub enum ProjectionError {
     #[error("edge ID does not match its retained opening")]
     Binding,
 }
-pub(crate) fn canonical_bytes<T: Encode>(value: &T) -> Vec<u8> {
-    let mut bytes = vec![0; value.encoded_size()];
-    value.write_to(&mut bytes);
-    bytes
-}
 pub(crate) fn decode_canonical<T: Decode + Encode>(bytes: &[u8]) -> Result<T, ProjectionError> {
     let (value, consumed) =
         T::decode(bytes).map_err(|e| ProjectionError::Malformed(format!("{e:?}")))?;
-    if consumed != bytes.len() || canonical_bytes(&value) != bytes {
+    if consumed != bytes.len() || encode_kernel(&value) != bytes {
         return Err(ProjectionError::Malformed(
             "noncanonical or trailing bytes".into(),
         ));
@@ -584,7 +581,7 @@ pub(crate) fn object_answer(edge: Option<&kernel::Edge>) -> ObjectAnswer {
     ObjectAnswer {
         answer: Some(match edge {
             Some(edge) => ObjectState::Present(PresentEdge {
-                canonical: canonical_bytes(edge),
+                canonical: encode_kernel(edge),
                 decoded: Some(edge_projection(edge)),
                 provenance: "indexer-reported".into(),
             }),
@@ -632,7 +629,7 @@ pub(crate) fn public_terms(terms: &kernel::Terms) -> Result<PublicTerms, Project
         TermsProfile::WorkStakeBond(bond) => TermsKind::WorkStakeBond(bond_terms(bond)),
         TermsProfile::WorkPayment(payment) => TermsKind::WorkPayment(WorkPaymentTerms {
             bond_edge_id: hex::encode(payment.bond_edge.as_bytes()),
-            canonical_bond_terms: canonical_bytes(&kernel::Terms::work_stake_bond(
+            canonical_bond_terms: encode_kernel(&kernel::Terms::work_stake_bond(
                 payment.bond_terms.clone(),
             )),
             bond_terms: Some(bond_terms(&payment.bond_terms)),
@@ -714,7 +711,7 @@ pub(crate) fn opening_projection(
             .iter()
             .map(|id| hex::encode(id.as_bytes()))
             .collect(),
-        canonical_terms: canonical_bytes(terms),
+        canonical_terms: encode_kernel(terms),
         terms: Some(public_terms(terms)?),
     })
 }

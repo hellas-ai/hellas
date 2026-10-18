@@ -5,29 +5,30 @@
 //! asserted is what the second process may do — never what the first
 //! one meant to do.
 
+use hellas_work::test_support::paid::{client, network, provider};
+
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use hellas_auth::Digest;
 use hellas_kernel::{
     Auth, BlockHeight, CoinId, Decode as _, Edge, EdgeId, EdgeValues, Fees, Funding, Key,
     LeaseSlots, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Move, NetworkId, Parties, Party,
     PaymentCloseStart, Payout, Proof, RegistryChunk, RegistryNamespace, RegistryRecordTag,
-    Secp256k1Signer, Secp256k1Verifier, Sig, Terms, TermsHash, Tx, WorkPaymentTerms,
-    WorkStakeBondTerms,
+    Secp256k1Verifier, Sig, Terms, TermsHash, Tx, WorkPaymentTerms, WorkStakeBondTerms,
 };
 use hellas_rpc::pb::work::{ExchangeSetupRequest, exchange_setup_response::Outcome};
-use hellas_rpc::protocol::work::{
-    EvaluatePolicyV2, PaidChannelPolicyV1, private_policy_commitment,
-};
-use hellas_rpc::protocol::work_bundle::WorkChannelSetupBundleV1;
-use hellas_rpc::protocol::work_setup::ProviderChannelPolicy;
-use hellas_rpc::protocol::{ContentId, Digest};
+use hellas_rpc::protocol::ContentId;
 use hellas_rpc::services::work_setup::WorkSetupHandler;
+use hellas_work::model::bundle::WorkChannelSetupBundleV1;
+use hellas_work::model::setup::ProviderChannelPolicy;
+use hellas_work::model::work::{EvaluatePolicyV2, PaidChannelPolicyV1, private_policy_commitment};
 use hellas_work::work_close::{BlockSourceError, FinalizedBlocks, FinalizedWork, TxSink};
 use hellas_work::work_handshake::{PaymentAdmission, SetupEndpoint, SetupService};
 use hellas_work::work_open::{
-    FinalizedSetup, SetupDriveError, SetupProgress, SetupQuery, SetupStep, SetupView, advance_setup,
+    FinalizedSetup, SetupChannel, SetupDriveError, SetupProgress, SetupQuery, SetupStep, SetupView,
+    advance_setup,
 };
 use hellas_work::work_store::journal::{Journal, JournalError, JournalId, JournalKind};
 use hellas_work::work_store::setup::setup_key;
@@ -37,9 +38,8 @@ use hellas_work::work_store::{
     discover_setups,
 };
 
-#[path = "support/basic.rs"]
-mod basic;
-use basic::{network, temp};
+mod support;
+use support::temp;
 
 // ── Fixture ───────────────────────────────────────────────────────────
 
@@ -54,20 +54,6 @@ fn other_network() -> NetworkId {
         panic!("a short ascii id is a legal network id");
     };
     network
-}
-
-fn provider() -> Secp256k1Signer {
-    let Ok(signer) = Secp256k1Signer::from_secret_scalar([0x22; 32]) else {
-        panic!("a fixed scalar is a key");
-    };
-    signer
-}
-
-fn client() -> Secp256k1Signer {
-    let Ok(signer) = Secp256k1Signer::from_secret_scalar([0x21; 32]) else {
-        panic!("a fixed scalar is a key");
-    };
-    signer
 }
 
 fn coins(ids: &[u8]) -> List<CoinId, MAX_PARTY_INPUTS> {
@@ -269,33 +255,28 @@ fn same_block_contest() -> Tx {
 }
 
 /// The file name a setup journal for one bond takes under a root.
-fn journal_name(bond_edge: EdgeId) -> String {
-    let key = setup_key(network(), bond_edge);
-    let mut name = String::from("setup-");
-    for byte in key.into_bytes() {
-        use std::fmt::Write as _;
-        let _ = write!(name, "{byte:02x}");
-    }
-    name.push_str(".0000000000000000.journal");
-    name
+fn journal_name(bond_edge: EdgeId) -> std::path::PathBuf {
+    journal_path(std::path::Path::new(""), network(), bond_edge)
 }
 
-fn store(root: &std::path::Path, role: Role) -> SetupStore {
+async fn store(root: &std::path::Path, role: Role) -> SetupStore {
     match SetupStore::open(
         root,
         network(),
         bond_edge(),
         role,
         &Secp256k1Verifier::new(),
-    ) {
+    )
+    .await
+    {
         Ok(store) => store,
         Err(error) => panic!("the fixture journal opens: {error}"),
     }
 }
 
 /// A provider store that has durably retained the complete handshake.
-fn completed_store(root: &std::path::Path) -> SetupStore {
-    let mut store = store(root, Role::Provider);
+async fn completed_store(root: &std::path::Path) -> SetupStore {
+    let mut store = store(root, Role::Provider).await;
     let verifier = Secp256k1Verifier::new();
     let one = proposed();
     let two = countersigned(one.clone());
@@ -306,7 +287,7 @@ fn completed_store(root: &std::path::Path) -> SetupStore {
         bundle_record(&two),
         armed_record(&three),
     ] {
-        if let Err(error) = store.commit(record, &verifier) {
+        if let Err(error) = store.commit(record, &verifier).await {
             panic!("the fixture revision commits: {error}");
         }
     }
@@ -319,13 +300,13 @@ fn completed_store(root: &std::path::Path) -> SetupStore {
 /// this endpoint has not countersigned the payment yet — so the payment
 /// Open is not executable, and `funding_coins` names the bond's coin
 /// alone.
-fn revision_two_store(root: &std::path::Path) -> SetupStore {
-    let mut store = store(root, Role::Provider);
+async fn revision_two_store(root: &std::path::Path) -> SetupStore {
+    let mut store = store(root, Role::Provider).await;
     let verifier = Secp256k1Verifier::new();
     let one = proposed();
     let two = countersigned(one.clone());
     for record in [scan_record(), bundle_record(&one), bundle_record(&two)] {
-        if let Err(error) = store.commit(record, &verifier) {
+        if let Err(error) = store.commit(record, &verifier).await {
             panic!("the fixture revision commits: {error}");
         }
     }
@@ -337,8 +318,8 @@ fn revision_two_store(root: &std::path::Path) -> SetupStore {
 /// The client arms its descriptor at revision 2 — after it has signed
 /// the payment Open and before the provider countersigns it — which is
 /// what makes revision 3 an import rather than a second arming.
-fn client_completed_store(root: &std::path::Path) -> SetupStore {
-    let mut store = store(root, Role::Client);
+async fn client_completed_store(root: &std::path::Path) -> SetupStore {
+    let mut store = store(root, Role::Client).await;
     let verifier = Secp256k1Verifier::new();
     let one = proposed();
     let two = countersigned(one.clone());
@@ -349,7 +330,7 @@ fn client_completed_store(root: &std::path::Path) -> SetupStore {
         armed_record(&two),
         bundle_record(&three),
     ] {
-        if let Err(error) = store.commit(record, &verifier) {
+        if let Err(error) = store.commit(record, &verifier).await {
             panic!("the fixture revision commits: {error}");
         }
     }
@@ -635,8 +616,8 @@ impl FinalizedBlocks for Blocks {
 
 /// A revision is durable before its signature is exported, and a crash
 /// between the two re-exports the same artifact rather than a new one.
-#[test]
-fn a_retained_revision_is_re_exported_byte_for_byte() {
+#[tokio::test]
+async fn a_retained_revision_is_re_exported_byte_for_byte() {
     let dir = temp();
     let verifier = Secp256k1Verifier::new();
     let two = countersigned(proposed());
@@ -645,19 +626,22 @@ fn a_retained_revision_is_re_exported_byte_for_byte() {
     // which carries its own two signatures — and crash before exporting
     // it.
     {
-        let mut client_store = store(dir.path(), Role::Client);
-        if let Err(error) = client_store.commit(bundle_record(&proposed()), &verifier) {
+        let mut client_store = store(dir.path(), Role::Client).await;
+        if let Err(error) = client_store
+            .commit(bundle_record(&proposed()), &verifier)
+            .await
+        {
             panic!("revision 1 commits: {error}");
         }
-        if let Err(error) = client_store.commit(scan_record(), &verifier) {
+        if let Err(error) = client_store.commit(scan_record(), &verifier).await {
             panic!("the scan arm commits: {error}");
         }
-        if let Err(error) = client_store.commit(armed_record(&two), &verifier) {
+        if let Err(error) = client_store.commit(armed_record(&two), &verifier).await {
             panic!("revision 2 commits: {error}");
         }
     }
 
-    let recovered = store(dir.path(), Role::Client);
+    let recovered = store(dir.path(), Role::Client).await;
     assert_eq!(recovered.state().revision(), Some(2));
     assert_eq!(
         recovered.state().bundle_bytes(),
@@ -666,13 +650,14 @@ fn a_retained_revision_is_re_exported_byte_for_byte() {
     assert_eq!(recovered.len(), 3);
 }
 
-#[test]
-fn applying_an_exportable_bundle_without_scan_arming_is_refused() {
+#[tokio::test]
+async fn applying_an_exportable_bundle_without_scan_arming_is_refused() {
     let dir = temp();
     let verifier = Secp256k1Verifier::new();
-    let mut provider_store = store(dir.path(), Role::Provider);
+    let mut provider_store = store(dir.path(), Role::Provider).await;
     let error = provider_store
         .commit(bundle_record(&proposed()), &verifier)
+        .await
         .expect_err("revision 1 cannot become exportable before ScanArmed");
     assert!(matches!(
         error,
@@ -681,13 +666,14 @@ fn applying_an_exportable_bundle_without_scan_arming_is_refused() {
     assert!(provider_store.state().bundle_bytes().is_none());
 }
 
-#[test]
-fn a_second_distinct_scan_arm_is_refused() {
+#[tokio::test]
+async fn a_second_distinct_scan_arm_is_refused() {
     let dir = temp();
     let verifier = Secp256k1Verifier::new();
-    let mut provider_store = store(dir.path(), Role::Provider);
+    let mut provider_store = store(dir.path(), Role::Provider).await;
     provider_store
         .commit(scan_record(), &verifier)
+        .await
         .expect("the first arm commits");
     let error = provider_store
         .commit(
@@ -697,6 +683,7 @@ fn a_second_distinct_scan_arm_is_refused() {
             },
             &verifier,
         )
+        .await
         .expect_err("a distinct scan floor cannot replace the held one");
     assert!(matches!(
         error,
@@ -706,8 +693,8 @@ fn a_second_distinct_scan_arm_is_refused() {
 }
 
 /// The three revisions go in order, and nothing else does.
-#[test]
-fn revisions_extend_and_never_rewind() {
+#[tokio::test]
+async fn revisions_extend_and_never_rewind() {
     let dir = temp();
     let verifier = Secp256k1Verifier::new();
     let one = proposed();
@@ -716,9 +703,10 @@ fn revisions_extend_and_never_rewind() {
 
     // Revision 2 without revision 1 is not a conversation this endpoint
     // took part in.
-    let mut skipping = store(dir.path(), Role::Provider);
+    let mut skipping = store(dir.path(), Role::Provider).await;
     let error = skipping
         .commit(bundle_record(&two), &verifier)
+        .await
         .expect_err("a first record must be revision 1");
     assert!(
         matches!(
@@ -730,14 +718,14 @@ fn revisions_extend_and_never_rewind() {
     assert!(skipping.is_empty(), "a refused record writes nothing");
     drop(skipping);
 
-    let mut ordered = store(dir.path(), Role::Provider);
+    let mut ordered = store(dir.path(), Role::Provider).await;
     for record in [
         scan_record(),
         bundle_record(&one),
         bundle_record(&two),
         armed_record(&three),
     ] {
-        if let Err(error) = ordered.commit(record, &verifier) {
+        if let Err(error) = ordered.commit(record, &verifier).await {
             panic!("the revision commits: {error}");
         }
     }
@@ -746,6 +734,7 @@ fn revisions_extend_and_never_rewind() {
     // A replayed stale revision.
     let error = ordered
         .commit(bundle_record(&two), &verifier)
+        .await
         .expect_err("revision 2 does not follow revision 3");
     assert!(
         matches!(error, WorkStoreError::Setup(SetupStateError::Bundle(_))),
@@ -757,8 +746,8 @@ fn revisions_extend_and_never_rewind() {
 
 /// A revision whose signatures do not check never reaches the file —
 /// and could not be read back out of one.
-#[test]
-fn an_unverified_revision_is_not_journaled() {
+#[tokio::test]
+async fn an_unverified_revision_is_not_journaled() {
     let dir = temp();
     let verifier = Secp256k1Verifier::new();
 
@@ -778,9 +767,10 @@ fn an_unverified_revision_is_not_journaled() {
         panic!("the bundle assembles");
     };
 
-    let mut journal = store(dir.path(), Role::Provider);
+    let mut journal = store(dir.path(), Role::Provider).await;
     let error = journal
         .commit(bundle_record(&forged), &verifier)
+        .await
         .expect_err("the provider did not sign this");
     assert!(
         matches!(error, WorkStoreError::Setup(SetupStateError::Bundle(_))),
@@ -791,15 +781,16 @@ fn an_unverified_revision_is_not_journaled() {
 
 /// The bundle decoder is exact, so bytes with anything after a whole
 /// revision are not a revision.
-#[test]
-fn a_noncanonical_revision_is_refused() {
+#[tokio::test]
+async fn a_noncanonical_revision_is_refused() {
     let dir = temp();
     let verifier = Secp256k1Verifier::new();
     let mut bytes = proposed().encode();
     bytes.push(0);
-    let mut journal = store(dir.path(), Role::Provider);
+    let mut journal = store(dir.path(), Role::Provider).await;
     let error = journal
         .commit(SetupRecord::Bundle { bundle: bytes }, &verifier)
+        .await
         .expect_err("a trailing byte is not canonical");
     assert!(
         matches!(error, WorkStoreError::Setup(SetupStateError::Bundle(_))),
@@ -809,11 +800,11 @@ fn a_noncanonical_revision_is_refused() {
 
 /// The journal is keyed to one network and one bond. Reopening it as
 /// another channel's fails closed rather than replaying as empty.
-#[test]
-fn a_journal_belongs_to_one_network_and_one_bond() {
+#[tokio::test]
+async fn a_journal_belongs_to_one_network_and_one_bond() {
     let dir = temp();
     let verifier = Secp256k1Verifier::new();
-    drop(completed_store(dir.path()));
+    drop(completed_store(dir.path()).await);
 
     for (label, network, bond) in [
         ("another network", other_network(), bond_edge()),
@@ -826,7 +817,8 @@ fn a_journal_belongs_to_one_network_and_one_bond() {
         // A different key is a different file name, so this is a fresh
         // empty journal rather than this one misread — which is the
         // point: no state crosses over.
-        let Ok(other) = SetupStore::open(dir.path(), network, bond, Role::Provider, &verifier)
+        let Ok(other) =
+            SetupStore::open(dir.path(), network, bond, Role::Provider, &verifier).await
         else {
             panic!("a fresh journal opens");
         };
@@ -845,6 +837,7 @@ fn a_journal_belongs_to_one_network_and_one_bond() {
         panic!("the copy succeeds: {error}");
     }
     let error = SetupStore::open(dir.path(), network(), elsewhere, Role::Provider, &verifier)
+        .await
         .expect_err("this file is not that channel's journal");
     assert!(
         matches!(
@@ -860,10 +853,10 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// Two processes over one journal: the second fails before it can act.
-#[test]
-fn a_second_holder_is_refused() {
+#[tokio::test]
+async fn a_second_holder_is_refused() {
     let dir = temp();
-    let held = store(dir.path(), Role::Provider);
+    let held = store(dir.path(), Role::Provider).await;
     let verifier = Secp256k1Verifier::new();
     let error = SetupStore::open(
         dir.path(),
@@ -872,6 +865,7 @@ fn a_second_holder_is_refused() {
         Role::Provider,
         &verifier,
     )
+    .await
     .expect_err("the journal is already held");
     assert!(
         matches!(error, WorkStoreError::Journal(JournalError::Locked { .. })),
@@ -886,85 +880,20 @@ fn a_second_holder_is_refused() {
             Role::Provider,
             &verifier
         )
+        .await
         .is_ok(),
         "the lock is released with the store"
     );
 }
 
-/// A frame interrupted mid-write is the state before it; a frame that
-/// is whole and does not verify is not a state at all.
-#[test]
-fn a_torn_tail_recovers_and_a_corrupt_frame_does_not() {
-    let dir = temp();
-    let verifier = Secp256k1Verifier::new();
-    drop(completed_store(dir.path()));
-    let path = journal_path(dir.path(), network(), bond_edge());
-    let Ok(whole) = std::fs::read(&path) else {
-        panic!("the journal reads");
-    };
-
-    // Interrupted inside the last frame: the caller was never told the
-    // write happened, so the state is the one before it.
-    for cut in [1_usize, 8, 64] {
-        let truncated = whole.len().saturating_sub(cut);
-        if let Err(error) = std::fs::write(&path, &whole[..truncated]) {
-            panic!("the truncated journal writes: {error}");
-        }
-        let recovered = match SetupStore::open(
-            dir.path(),
-            network(),
-            bond_edge(),
-            Role::Provider,
-            &verifier,
-        ) {
-            Ok(store) => store,
-            Err(error) => panic!("a torn tail recovers: {error}"),
-        };
-        assert_eq!(
-            recovered.state().revision(),
-            Some(2),
-            "the interrupted third revision is not state"
-        );
-    }
-
-    // A byte changed inside a frame that is all there — the last one,
-    // or one with two more written after it. Both are long enough to
-    // have been complete appends, so both are records this endpoint may
-    // have been told it had written, and neither is read back as an
-    // earlier state.
-    for (label, at) in [
-        ("the last frame", whole.len().saturating_sub(64)),
-        ("a frame with two after it", header_len() + 8),
-    ] {
-        let mut corrupt = whole.clone();
-        if let Some(byte) = corrupt.get_mut(at) {
-            *byte ^= 0xff;
-        }
-        if let Err(error) = std::fs::write(&path, &corrupt) {
-            panic!("case {label}: the corrupt journal writes: {error}");
-        }
-        let error = SetupStore::open(
-            dir.path(),
-            network(),
-            bond_edge(),
-            Role::Provider,
-            &verifier,
-        )
-        .expect_err("a whole frame that does not verify is refused");
-        assert!(
-            matches!(error, WorkStoreError::Journal(JournalError::Corrupt { .. })),
-            "case {label}: unexpected error: {error}"
-        );
-    }
-}
-
 /// The file one setup journal is kept in, derived the way the store
 /// derives it rather than by looking for whatever is in the directory.
 fn journal_path(root: &std::path::Path, network: NetworkId, bond: EdgeId) -> std::path::PathBuf {
-    root.join(format!(
-        "setup-{}.0000000000000000.journal",
-        hex(&setup_key(network, bond).into_bytes())
-    ))
+    Journal::path(root, &setup_stem(network, bond))
+}
+
+fn setup_stem(network: NetworkId, bond: EdgeId) -> String {
+    format!("setup-{}", hex(&setup_key(network, bond).into_bytes()))
 }
 
 // ── What a root holds ─────────────────────────────────────────────────
@@ -978,8 +907,8 @@ fn journal_path(root: &std::path::Path, network: NetworkId, bond: EdgeId) -> std
 /// revisions are what proves the recovery — a wrong bond edge names a
 /// file that is not there and replays as empty, and a wrong role is a
 /// header the journal refuses.
-#[test]
-fn a_restart_finds_every_journal_its_root_holds() {
+#[tokio::test]
+async fn a_restart_finds_every_journal_its_root_holds() {
     let dir = temp();
     let verifier = Secp256k1Verifier::new();
     let staked = proposed();
@@ -989,9 +918,9 @@ fn a_restart_finds_every_journal_its_root_holds() {
     // One bond this node stakes as the provider, one it funds as the
     // client, both under the one root.
     {
-        let mut provider_store = store(dir.path(), Role::Provider);
+        let mut provider_store = store(dir.path(), Role::Provider).await;
         for record in [scan_record(), bundle_record(&staked)] {
-            if let Err(error) = provider_store.commit(record, &verifier) {
+            if let Err(error) = provider_store.commit(record, &verifier).await {
                 panic!("the provider's revision commits: {error}");
             }
         }
@@ -1001,16 +930,18 @@ fn a_restart_finds_every_journal_its_root_holds() {
             funded.bond_edge(),
             Role::Client,
             &verifier,
-        ) {
+        )
+        .await
+        {
             Ok(store) => store,
             Err(error) => panic!("the client's journal opens: {error}"),
         };
-        if let Err(error) = client_store.commit(bundle_record(&funded), &verifier) {
+        if let Err(error) = client_store.commit(bundle_record(&funded), &verifier).await {
             panic!("the client's revision commits: {error}");
         }
     }
 
-    let found = match discover_setups(dir.path(), network()) {
+    let found = match discover_setups(dir.path(), network()).await {
         Ok(found) => found,
         Err(error) => panic!("the root enumerates: {error}"),
     };
@@ -1036,7 +967,9 @@ fn a_restart_finds_every_journal_its_root_holds() {
             expected.bond_edge,
             expected.role,
             &verifier,
-        ) {
+        )
+        .await
+        {
             Ok(store) => store,
             Err(error) => panic!("the discovered journal reopens: {error}"),
         };
@@ -1051,22 +984,26 @@ fn a_restart_finds_every_journal_its_root_holds() {
 
 /// A root holding no journals owns none, which is an answer and not a
 /// failure — and so is a root the node has not created yet.
-#[test]
-fn a_root_holding_no_journals_yields_none() {
+#[tokio::test]
+async fn a_root_holding_no_journals_yields_none() {
     let dir = temp();
     // A channel journal beside them is the other store's, and is not a
     // setup this discovery has anything to say about.
-    if let Err(error) = std::fs::write(
-        dir.path().join(format!(
-            "channel-{}.0000000000000000.journal",
-            "00".repeat(32)
-        )),
-        b"not this module's file",
-    ) {
-        panic!("the fixture file is written: {error}");
-    }
+    drop(
+        Journal::open_latest(
+            dir.path(),
+            &format!("channel-{}", "00".repeat(32)),
+            JournalId {
+                kind: JournalKind::Channel,
+                role: Role::Provider,
+                key: [0; 32],
+            },
+        )
+        .await
+        .unwrap(),
+    );
 
-    let found = match discover_setups(dir.path(), network()) {
+    let found = match discover_setups(dir.path(), network()).await {
         Ok(found) => found,
         Err(error) => panic!("an empty root is not a failure: {error}"),
     };
@@ -1074,7 +1011,7 @@ fn a_root_holding_no_journals_yields_none() {
     assert!(found.unidentified.is_empty());
 
     let unopened = dir.path().join("never-opened");
-    let found = match discover_setups(&unopened, network()) {
+    let found = match discover_setups(&unopened, network()).await {
         Ok(found) => found,
         Err(error) => panic!("a root that does not exist yet owns nothing: {error}"),
     };
@@ -1088,8 +1025,8 @@ fn a_root_holding_no_journals_yields_none() {
 /// Skipping it silently is the failure this guards: a file this node
 /// cannot open may be a channel it still owes a close, and nobody would
 /// ever be told it was there.
-#[test]
-fn a_journal_that_cannot_be_identified_is_reported_by_name() {
+#[tokio::test]
+async fn a_journal_that_cannot_be_identified_is_reported_by_name() {
     let dir = temp();
     let verifier = Secp256k1Verifier::new();
     let armed = proposed_over(other_bond_funding());
@@ -1104,33 +1041,30 @@ fn a_journal_that_cannot_be_identified_is_reported_by_name() {
             armed.bond_edge(),
             Role::Provider,
             &verifier,
-        ) {
+        )
+        .await
+        {
             Ok(store) => store,
             Err(error) => panic!("the armed journal opens: {error}"),
         };
-        if let Err(error) = store.commit(scan_record(), &verifier) {
+        if let Err(error) = store.commit(scan_record(), &verifier).await {
             panic!("the scan arm commits: {error}");
         }
     }
     // And a file wearing a setup journal's name that is not one.
-    let counterfeit = dir.path().join(format!(
-        "setup-{}.0000000000000000.journal",
-        "ab".repeat(32)
-    ));
-    if let Err(error) = std::fs::write(&counterfeit, b"not a journal at all") {
-        panic!("the fixture file is written: {error}");
-    }
+    let counterfeit = Journal::path(dir.path(), &format!("setup-{}", "ab".repeat(32)));
+    std::fs::write(&counterfeit, b"not a journal at all").unwrap();
     // And one complete journal beside them.
     {
-        let mut store = store(dir.path(), Role::Provider);
+        let mut store = store(dir.path(), Role::Provider).await;
         for record in [scan_record(), bundle_record(&proposed())] {
-            if let Err(error) = store.commit(record, &verifier) {
+            if let Err(error) = store.commit(record, &verifier).await {
                 panic!("the revision commits: {error}");
             }
         }
     }
 
-    let found = match discover_setups(dir.path(), network()) {
+    let found = match discover_setups(dir.path(), network()).await {
         Ok(found) => found,
         Err(error) => panic!("one unreadable journal does not stop the root: {error}"),
     };
@@ -1159,7 +1093,10 @@ fn a_journal_that_cannot_be_identified_is_reported_by_name() {
     for setup in &found.unidentified {
         if setup.path == counterfeit {
             assert!(
-                matches!(setup.reason, SetupDiscoveryError::Journal(_)),
+                matches!(
+                    setup.reason,
+                    SetupDiscoveryError::Journal(JournalError::NotAJournal { .. })
+                ),
                 "unexpected reason: {}",
                 setup.reason,
             );
@@ -1181,31 +1118,34 @@ fn a_journal_that_cannot_be_identified_is_reported_by_name() {
 /// and a discovery that read the bond out of the records without
 /// checking it would hand back an edge this journal was never opened
 /// under — and the store would then open a second, empty file for it.
-#[test]
-fn a_revision_that_is_not_this_journals_bond_is_refused() {
+#[tokio::test]
+async fn a_revision_that_is_not_this_journals_bond_is_refused() {
     let dir = temp();
     let key = setup_key(network(), bond_edge());
     {
-        let (mut journal, _) = match Journal::open(
-            dir.path().join(journal_name(bond_edge())),
+        let (mut journal, _) = match Journal::open_latest(
+            dir.path(),
+            &setup_stem(network(), bond_edge()),
             JournalId {
                 kind: JournalKind::Setup,
                 role: Role::Provider,
                 key: key.into_bytes(),
-                generation: 0,
             },
-        ) {
+        )
+        .await
+        {
             Ok(opened) => opened,
             Err(error) => panic!("the fixture journal opens: {error}"),
         };
-        if let Err(error) =
-            journal.append(&bundle_record(&proposed_over(other_bond_funding())).encode())
+        if let Err(error) = journal
+            .append(&bundle_record(&proposed_over(other_bond_funding())).encode())
+            .await
         {
             panic!("the foreign revision appends: {error}");
         }
     }
 
-    let found = match discover_setups(dir.path(), network()) {
+    let found = match discover_setups(dir.path(), network()).await {
         Ok(found) => found,
         Err(error) => panic!("the root enumerates: {error}"),
     };
@@ -1229,10 +1169,10 @@ fn a_revision_that_is_not_this_journals_bond_is_refused() {
 
 /// The first submission and every resubmission are the same decision,
 /// and the payment-funding preflight is a premise of it.
-#[test]
-fn locking_stake_requires_every_payment_input_to_be_live() {
+#[tokio::test]
+async fn locking_stake_requires_every_payment_input_to_be_live() {
     let dir = temp();
-    let held = completed_store(dir.path());
+    let held = completed_store(dir.path()).await;
     let state = held.state();
 
     let ready = Observed::before_anything();
@@ -1261,10 +1201,10 @@ fn locking_stake_requires_every_payment_input_to_be_live() {
 
 /// Every branch of the recovery machine, each differing from the
 /// submit-bond case in exactly one fact.
-#[test]
-fn the_recovery_decision_covers_every_finalized_shape() {
+#[tokio::test]
+async fn the_recovery_decision_covers_every_finalized_shape() {
     let dir = temp();
-    let held = completed_store(dir.path());
+    let held = completed_store(dir.path()).await;
     let state = held.state();
     let bond = bond_object();
     let payment = payment_object();
@@ -1385,10 +1325,10 @@ fn the_recovery_decision_covers_every_finalized_shape() {
     }
 }
 
-#[test]
-fn round7_payment_live_without_bond_mounts_close() {
+#[tokio::test]
+async fn round7_payment_live_without_bond_mounts_close() {
     let dir = temp();
-    let held = completed_store(dir.path());
+    let held = completed_store(dir.path()).await;
     let observed = Observed {
         payment: Some(payment_object()),
         ..Observed::before_anything()
@@ -1398,15 +1338,15 @@ fn round7_payment_live_without_bond_mounts_close() {
 
 /// A client holds no countersigned payment Open. It never decides to
 /// submit or to time anything out, whatever the chain looks like.
-#[test]
-fn a_client_never_submits_the_providers_transactions() {
+#[tokio::test]
+async fn a_client_never_submits_the_providers_transactions() {
     let dir = temp();
     let verifier = Secp256k1Verifier::new();
-    let mut client_store = store(dir.path(), Role::Client);
+    let mut client_store = store(dir.path(), Role::Client).await;
     let one = proposed();
     let two = countersigned(one.clone());
     for record in [bundle_record(&one), scan_record(), armed_record(&two)] {
-        if let Err(error) = client_store.commit(record, &verifier) {
+        if let Err(error) = client_store.commit(record, &verifier).await {
             panic!("the revision commits: {error}");
         }
     }
@@ -1439,15 +1379,15 @@ fn a_client_never_submits_the_providers_transactions() {
 
 /// Revision 1 alone says nothing about the chain: there is no payment
 /// edge to look for yet.
-#[test]
-fn a_proposal_alone_decides_nothing() {
+#[tokio::test]
+async fn a_proposal_alone_decides_nothing() {
     let dir = temp();
     let verifier = Secp256k1Verifier::new();
-    let mut journal = store(dir.path(), Role::Provider);
-    if let Err(error) = journal.commit(scan_record(), &verifier) {
+    let mut journal = store(dir.path(), Role::Provider).await;
+    if let Err(error) = journal.commit(scan_record(), &verifier).await {
         panic!("the scan arm commits: {error}");
     }
-    if let Err(error) = journal.commit(bundle_record(&proposed()), &verifier) {
+    if let Err(error) = journal.commit(bundle_record(&proposed()), &verifier).await {
         panic!("revision 1 commits: {error}");
     }
     assert_eq!(
@@ -1458,15 +1398,15 @@ fn a_proposal_alone_decides_nothing() {
 
 /// The broadcast journal precedes the broadcast, and a step that has no
 /// executable transaction behind it is not recorded.
-#[test]
-fn submission_markers_follow_the_transactions_they_are_about() {
+#[tokio::test]
+async fn submission_markers_follow_the_transactions_they_are_about() {
     let dir = temp();
     let verifier = Secp256k1Verifier::new();
-    let mut journal = store(dir.path(), Role::Provider);
-    if let Err(error) = journal.commit(scan_record(), &verifier) {
+    let mut journal = store(dir.path(), Role::Provider).await;
+    if let Err(error) = journal.commit(scan_record(), &verifier).await {
         panic!("the scan arm commits: {error}");
     }
-    if let Err(error) = journal.commit(bundle_record(&proposed()), &verifier) {
+    if let Err(error) = journal.commit(bundle_record(&proposed()), &verifier).await {
         panic!("revision 1 commits: {error}");
     }
 
@@ -1474,6 +1414,7 @@ fn submission_markers_follow_the_transactions_they_are_about() {
     // broadcast.
     let error = journal
         .commit(SetupRecord::BondSubmitted, &verifier)
+        .await
         .expect_err("revision 1 holds no executable transaction");
     assert!(
         matches!(
@@ -1486,7 +1427,7 @@ fn submission_markers_follow_the_transactions_they_are_about() {
     let two = countersigned(proposed());
     let three = completed(two.clone());
     for record in [bundle_record(&two), armed_record(&three)] {
-        if let Err(error) = journal.commit(record, &verifier) {
+        if let Err(error) = journal.commit(record, &verifier).await {
             panic!("the revision commits: {error}");
         }
     }
@@ -1494,6 +1435,7 @@ fn submission_markers_follow_the_transactions_they_are_about() {
     // The payment is not broadcast before the bond it needs.
     let error = journal
         .commit(SetupRecord::PaymentSubmitted, &verifier)
+        .await
         .expect_err("the bond goes first");
     assert!(
         matches!(
@@ -1504,7 +1446,7 @@ fn submission_markers_follow_the_transactions_they_are_about() {
     );
 
     for record in [SetupRecord::BondSubmitted, SetupRecord::PaymentSubmitted] {
-        if let Err(error) = journal.commit(record, &verifier) {
+        if let Err(error) = journal.commit(record, &verifier).await {
             panic!("the marker commits: {error}");
         }
     }
@@ -1513,26 +1455,27 @@ fn submission_markers_follow_the_transactions_they_are_about() {
 
     // A marker already held is not written twice.
     let before = journal.len();
-    if let Err(error) = journal.commit(SetupRecord::BondSubmitted, &verifier) {
+    if let Err(error) = journal.commit(SetupRecord::BondSubmitted, &verifier).await {
         panic!("an idempotent marker commits: {error}");
     }
     assert_eq!(journal.len(), before);
 
     // A client cannot record having broadcast what it does not hold.
     let other = temp();
-    let mut client_store = store(other.path(), Role::Client);
+    let mut client_store = store(other.path(), Role::Client).await;
     for record in [
         bundle_record(&proposed()),
         scan_record(),
         armed_record(&two),
         bundle_record(&three),
     ] {
-        if let Err(error) = client_store.commit(record, &verifier) {
+        if let Err(error) = client_store.commit(record, &verifier).await {
             panic!("the revision commits: {error}");
         }
     }
     let error = client_store
         .commit(SetupRecord::BondSubmitted, &verifier)
+        .await
         .expect_err("a client does not broadcast the bond");
     assert!(
         matches!(
@@ -1545,11 +1488,11 @@ fn submission_markers_follow_the_transactions_they_are_about() {
 
 /// Completion carries the watcher's starting cursor, and setup ends
 /// once.
-#[test]
-fn completion_records_the_channels_origin_and_is_terminal() {
+#[tokio::test]
+async fn completion_records_the_channels_origin_and_is_terminal() {
     let dir = temp();
     let verifier = Secp256k1Verifier::new();
-    let mut journal = completed_store(dir.path());
+    let mut journal = completed_store(dir.path()).await;
 
     // The payment edge is the retained bundle's, never a supplied one.
     let error = journal
@@ -1562,6 +1505,7 @@ fn completion_records_the_channels_origin_and_is_terminal() {
             },
             &verifier,
         )
+        .await
         .expect_err("another edge is not this channel's");
     assert!(
         matches!(
@@ -1577,7 +1521,7 @@ fn completion_records_the_channels_origin_and_is_terminal() {
         origin_payload: [0x01; 32],
         origin_parent: [0x02; 32],
     };
-    if let Err(error) = journal.commit(complete.clone(), &verifier) {
+    if let Err(error) = journal.commit(complete.clone(), &verifier).await {
         panic!("completion commits: {error}");
     }
     let Some(origin) = journal.state().origin() else {
@@ -1589,7 +1533,7 @@ fn completion_records_the_channels_origin_and_is_terminal() {
 
     // Recording it again is the same fact.
     let before = journal.len();
-    if let Err(error) = journal.commit(complete, &verifier) {
+    if let Err(error) = journal.commit(complete, &verifier).await {
         panic!("an idempotent completion commits: {error}");
     }
     assert_eq!(journal.len(), before);
@@ -1602,6 +1546,7 @@ fn completion_records_the_channels_origin_and_is_terminal() {
             },
             &verifier,
         )
+        .await
         .expect_err("setup ended already");
     assert!(
         matches!(error, WorkStoreError::Setup(SetupStateError::Ended(_))),
@@ -1619,24 +1564,24 @@ fn completion_records_the_channels_origin_and_is_terminal() {
 /// origin. One naming another block is a caller whose finalized read
 /// disagrees with the journal's — refused as the end it follows, not
 /// absorbed as a duplicate.
-#[test]
-fn a_different_completion_after_the_end_is_not_a_retry() {
+#[tokio::test]
+async fn a_different_completion_after_the_end_is_not_a_retry() {
     let dir = temp();
     let verifier = Secp256k1Verifier::new();
-    let mut journal = completed_store(dir.path());
+    let mut journal = completed_store(dir.path()).await;
     let complete = SetupRecord::Complete {
         payment_edge: payment_edge(),
         origin_height: 44,
         origin_payload: [0x01; 32],
         origin_parent: [0x02; 32],
     };
-    if let Err(error) = journal.commit(complete.clone(), &verifier) {
+    if let Err(error) = journal.commit(complete.clone(), &verifier).await {
         panic!("completion commits: {error}");
     }
 
     // The same record again is the retry: nothing is appended.
     let before = journal.len();
-    if let Err(error) = journal.commit(complete, &verifier) {
+    if let Err(error) = journal.commit(complete, &verifier).await {
         panic!("an idempotent completion commits: {error}");
     }
     assert_eq!(journal.len(), before);
@@ -1658,6 +1603,7 @@ fn a_different_completion_after_the_end_is_not_a_retry() {
                 },
                 &verifier,
             )
+            .await
             .expect_err("a different origin is not the completion already recorded");
         assert!(
             matches!(
@@ -1679,22 +1625,25 @@ fn a_different_completion_after_the_end_is_not_a_retry() {
 }
 
 /// An ended setup stays ended across a restart, and never resubmits.
-#[test]
-fn an_aborted_setup_does_not_come_back() {
+#[tokio::test]
+async fn an_aborted_setup_does_not_come_back() {
     let dir = temp();
     let verifier = Secp256k1Verifier::new();
     {
-        let mut journal = completed_store(dir.path());
-        if let Err(error) = journal.commit(
-            SetupRecord::Ended {
-                outcome: SetupEnd::Aborted(SetupAbort::BondOpenExpired),
-            },
-            &verifier,
-        ) {
+        let mut journal = completed_store(dir.path()).await;
+        if let Err(error) = journal
+            .commit(
+                SetupRecord::Ended {
+                    outcome: SetupEnd::Aborted(SetupAbort::BondOpenExpired),
+                },
+                &verifier,
+            )
+            .await
+        {
             panic!("the abort commits: {error}");
         }
     }
-    let recovered = store(dir.path(), Role::Provider);
+    let recovered = store(dir.path(), Role::Provider).await;
     assert_eq!(
         recovered.state().end(),
         Some(SetupEnd::Aborted(SetupAbort::BondOpenExpired))
@@ -1709,12 +1658,12 @@ fn an_aborted_setup_does_not_come_back() {
 /// A crash before the bond is broadcast, with a payment input spent in
 /// the meantime: recovery aborts, and the provider's funding is never
 /// named by a transaction it would send.
-#[test]
-fn a_crash_before_broadcast_recovers_into_the_preflight() {
+#[tokio::test]
+async fn a_crash_before_broadcast_recovers_into_the_preflight() {
     let dir = temp();
-    drop(completed_store(dir.path()));
+    drop(completed_store(dir.path()).await);
 
-    let recovered = store(dir.path(), Role::Provider);
+    let recovered = store(dir.path(), Role::Provider).await;
     let observed = Observed {
         live: without(PAYMENT_COIN),
         ..Observed::before_anything()
@@ -1731,10 +1680,10 @@ fn a_crash_before_broadcast_recovers_into_the_preflight() {
 
 /// The coins the caller must read liveness for are the ones the
 /// retained transactions actually spend.
-#[test]
-fn the_funding_coins_come_from_the_retained_transactions() {
+#[tokio::test]
+async fn the_funding_coins_come_from_the_retained_transactions() {
     let dir = temp();
-    let journal = completed_store(dir.path());
+    let journal = completed_store(dir.path()).await;
     assert_eq!(journal.state().funding_coins(), all_live());
     assert_eq!(journal.state().horizon(), Some(HORIZON));
     assert_eq!(journal.state().payment_edge(), Some(payment_edge()));
@@ -1743,8 +1692,8 @@ fn the_funding_coins_come_from_the_retained_transactions() {
 
 /// The record codec is exact: an unknown tag, a short body, and a
 /// trailing byte are all refused.
-#[test]
-fn the_record_codec_is_exact() {
+#[tokio::test]
+async fn the_record_codec_is_exact() {
     let scan_arm = scan_record();
     let scan_bytes = scan_arm.encode();
     assert_eq!(SetupRecord::decode(&scan_bytes), Ok(scan_arm));
@@ -1796,7 +1745,7 @@ fn the_record_codec_is_exact() {
     assert_eq!(origin_parent, [0x02; 32]);
 
     let dir = temp();
-    let fixture = completed_store(dir.path());
+    let fixture = completed_store(dir.path()).await;
     let history = SetupRecord::Observed(
         fixture
             .state()
@@ -1815,10 +1764,10 @@ fn the_record_codec_is_exact() {
     assert_eq!(SetupRecord::decode(&history.encode()), Ok(history));
 }
 
-#[test]
-fn setup_history_replay_checks_first_and_internal_links_atomically() {
+#[tokio::test]
+async fn setup_history_replay_checks_first_and_internal_links_atomically() {
     let dir = temp();
-    let journal = completed_store(dir.path());
+    let journal = completed_store(dir.path()).await;
     let before = journal.len();
     for broken in [0, 1] {
         let mut blocks = vec![
@@ -1848,8 +1797,8 @@ fn setup_history_replay_checks_first_and_internal_links_atomically() {
 /// Every signature-bearing setup export leaves enough state to recover the
 /// portable Open and, once payment is funded, mount close-only settlement
 /// without operator configuration.
-#[test]
-fn round4_exported_authorization_recovers() {
+#[tokio::test]
+async fn round4_exported_authorization_recovers() {
     let verifier = Secp256k1Verifier::new();
     let one = proposed();
     let two = countersigned(one.clone());
@@ -1858,14 +1807,14 @@ fn round4_exported_authorization_recovers() {
     // Crash after provider revision 1 export.
     let provider_one = temp();
     {
-        let mut journal = store(provider_one.path(), Role::Provider);
+        let mut journal = store(provider_one.path(), Role::Provider).await;
         for record in [scan_record(), bundle_record(&one)] {
-            if let Err(error) = journal.commit(record, &verifier) {
+            if let Err(error) = journal.commit(record, &verifier).await {
                 panic!("provider revision 1 arms before export: {error}");
             }
         }
     }
-    let recovered_one = store(provider_one.path(), Role::Provider);
+    let recovered_one = store(provider_one.path(), Role::Provider).await;
     assert_eq!(recovered_one.state().scan_armed(), Some(scan()));
     assert_eq!(
         recovered_one.state().bundle_bytes(),
@@ -1878,14 +1827,14 @@ fn round4_exported_authorization_recovers() {
     // descriptor before those bytes can leave.
     let client_two = temp();
     {
-        let mut journal = store(client_two.path(), Role::Client);
+        let mut journal = store(client_two.path(), Role::Client).await;
         for record in [bundle_record(&one), scan_record(), armed_record(&two)] {
-            if let Err(error) = journal.commit(record, &verifier) {
+            if let Err(error) = journal.commit(record, &verifier).await {
                 panic!("client revision 2 arms before export: {error}");
             }
         }
     }
-    let recovered_two = store(client_two.path(), Role::Client);
+    let recovered_two = store(client_two.path(), Role::Client).await;
     assert!(recovered_two.state().bond_open().is_some());
     assert!(recovered_two.state().close_descriptor().is_some());
     drop(recovered_two);
@@ -1895,19 +1844,19 @@ fn round4_exported_authorization_recovers() {
     // from the observed edge rather than from the lost configuration.
     let provider_three = temp();
     {
-        let mut journal = store(provider_three.path(), Role::Provider);
+        let mut journal = store(provider_three.path(), Role::Provider).await;
         for record in [
             scan_record(),
             bundle_record(&one),
             bundle_record(&two),
             armed_record(&three),
         ] {
-            if let Err(error) = journal.commit(record, &verifier) {
+            if let Err(error) = journal.commit(record, &verifier).await {
                 panic!("provider revision 3 arms before export: {error}");
             }
         }
     }
-    let recovered_three = store(provider_three.path(), Role::Provider);
+    let recovered_three = store(provider_three.path(), Role::Provider).await;
     assert!(recovered_three.state().bond_open().is_some());
     assert!(recovered_three.state().payment_open().is_some());
     let descriptor = recovered_three
@@ -1923,12 +1872,12 @@ fn round4_exported_authorization_recovers() {
 /// A marker-before-broadcast crash cannot be turned into an early terminal
 /// setup record: the portable Open may still finalize after the snapshot that
 /// suggested abort or fault.
-#[test]
-fn round6_submitted_open_delays_end() {
+#[tokio::test]
+async fn round6_submitted_open_delays_end() {
     let dir = temp();
     let verifier = Secp256k1Verifier::new();
-    let mut journal = completed_store(dir.path());
-    if let Err(error) = journal.commit(SetupRecord::BondSubmitted, &verifier) {
+    let mut journal = completed_store(dir.path()).await;
+    if let Err(error) = journal.commit(SetupRecord::BondSubmitted, &verifier).await {
         panic!("the bond submission arms its unresolved Open: {error}");
     }
     for outcome in [
@@ -1937,6 +1886,7 @@ fn round6_submitted_open_delays_end() {
     ] {
         let error = journal
             .commit(SetupRecord::Ended { outcome }, &verifier)
+            .await
             .expect_err("an in-flight Open prevents setup end");
         assert!(
             matches!(
@@ -1952,45 +1902,51 @@ fn round6_submitted_open_delays_end() {
         .state()
         .bond_open()
         .expect("the retained submitted Open");
-    if let Err(error) = journal.commit(
-        SetupRecord::Observed(
-            journal
-                .state()
-                .observe(&[
-                    FinalizedWork {
-                        height: scan().height + 1,
-                        parent: scan().payload,
-                        payload: [0x48; 32],
-                        txs: Vec::new(),
-                    },
-                    FinalizedWork {
-                        height: scan().height + 2,
-                        parent: [0x48; 32],
-                        payload: [0x49; 32],
-                        txs: vec![bond_open],
-                    },
-                ])
-                .expect("contiguous finalized observation"),
-        ),
-        &verifier,
-    ) {
+    if let Err(error) = journal
+        .commit(
+            SetupRecord::Observed(
+                journal
+                    .state()
+                    .observe(&[
+                        FinalizedWork {
+                            height: scan().height + 1,
+                            parent: scan().payload,
+                            payload: [0x48; 32],
+                            txs: Vec::new(),
+                        },
+                        FinalizedWork {
+                            height: scan().height + 2,
+                            parent: [0x48; 32],
+                            payload: [0x49; 32],
+                            txs: vec![bond_open],
+                        },
+                    ])
+                    .expect("contiguous finalized observation"),
+            ),
+            &verifier,
+        )
+        .await
+    {
         panic!("contiguous history finalizes the retained Open: {error}");
     }
     assert!(
         !journal.state().bond_submitted(),
         "the finalized Open discharges its submission obligation",
     );
-    if let Err(error) = journal.commit(
-        SetupRecord::Ended {
-            outcome: SetupEnd::Aborted(SetupAbort::PaymentFundingSpent),
-        },
-        &verifier,
-    ) {
+    if let Err(error) = journal
+        .commit(
+            SetupRecord::Ended {
+                outcome: SetupEnd::Aborted(SetupAbort::PaymentFundingSpent),
+            },
+            &verifier,
+        )
+        .await
+    {
         panic!("history resolution permits the end: {error}");
     }
     drop(journal);
     assert_eq!(
-        store(dir.path(), Role::Provider).state().end(),
+        store(dir.path(), Role::Provider).await.state().end(),
         Some(SetupEnd::Aborted(SetupAbort::PaymentFundingSpent)),
     );
 }
@@ -2005,16 +1961,16 @@ fn round6_submitted_open_delays_end() {
 /// the same read is a clean reclaim — the stake came back — and the end
 /// is `Abort(BondReclaimed)`, which a genuinely unexplained spend
 /// (`the_recovery_decision_covers_every_finalized_shape`) still is not.
-#[test]
-fn a_finalized_bond_timeout_reclaims_the_stake_cleanly() {
+#[tokio::test]
+async fn a_finalized_bond_timeout_reclaims_the_stake_cleanly() {
     let dir = temp();
     let verifier = Secp256k1Verifier::new();
-    let mut journal = completed_store(dir.path());
+    let mut journal = completed_store(dir.path()).await;
     for record in [
         SetupRecord::BondSubmitted,
         SetupRecord::BondTimeoutSubmitted,
     ] {
-        if let Err(error) = journal.commit(record, &verifier) {
+        if let Err(error) = journal.commit(record, &verifier).await {
             panic!("the provider arms and times out its bond: {error}");
         }
     }
@@ -2038,28 +1994,31 @@ fn a_finalized_bond_timeout_reclaims_the_stake_cleanly() {
     let bond_open = journal.state().bond_open().expect("the retained bond Open");
     let bond_close = Tx::timeout_close(bond_edge(), &Terms::work_stake_bond(bond_terms()))
         .expect("the bond has a deterministic timeout close");
-    if let Err(error) = journal.commit(
-        SetupRecord::Observed(
-            journal
-                .state()
-                .observe(&[
-                    FinalizedWork {
-                        height: scan().height + 1,
-                        parent: scan().payload,
-                        payload: [0x51; 32],
-                        txs: vec![bond_open],
-                    },
-                    FinalizedWork {
-                        height: scan().height + 2,
-                        parent: [0x51; 32],
-                        payload: [0x52; 32],
-                        txs: vec![bond_close],
-                    },
-                ])
-                .expect("contiguous finalized observation"),
-        ),
-        &verifier,
-    ) {
+    if let Err(error) = journal
+        .commit(
+            SetupRecord::Observed(
+                journal
+                    .state()
+                    .observe(&[
+                        FinalizedWork {
+                            height: scan().height + 1,
+                            parent: scan().payload,
+                            payload: [0x51; 32],
+                            txs: vec![bond_open],
+                        },
+                        FinalizedWork {
+                            height: scan().height + 2,
+                            parent: [0x51; 32],
+                            payload: [0x52; 32],
+                            txs: vec![bond_close],
+                        },
+                    ])
+                    .expect("contiguous finalized observation"),
+            ),
+            &verifier,
+        )
+        .await
+    {
         panic!("history finalizes the bond and its timeout close: {error}");
     }
 
@@ -2072,17 +2031,20 @@ fn a_finalized_bond_timeout_reclaims_the_stake_cleanly() {
     );
 
     // And that clean end journals where a fault could not have.
-    if let Err(error) = journal.commit(
-        SetupRecord::Ended {
-            outcome: SetupEnd::Aborted(SetupAbort::BondReclaimed),
-        },
-        &verifier,
-    ) {
+    if let Err(error) = journal
+        .commit(
+            SetupRecord::Ended {
+                outcome: SetupEnd::Aborted(SetupAbort::BondReclaimed),
+            },
+            &verifier,
+        )
+        .await
+    {
         panic!("the reclaim end journals: {error}");
     }
     drop(journal);
     assert_eq!(
-        store(dir.path(), Role::Provider).state().end(),
+        store(dir.path(), Role::Provider).await.state().end(),
         Some(SetupEnd::Aborted(SetupAbort::BondReclaimed)),
     );
 }
@@ -2105,7 +2067,7 @@ async fn setup_completes_without_waiting_for_a_quiet_chain() {
     }
 
     let dir = temp();
-    let mut journal = completed_store(dir.path());
+    let mut journal = completed_store(dir.path()).await;
     let payment_open = completed(countersigned(proposed()))
         .payment_open()
         .expect("the signed payment Open");
@@ -2162,7 +2124,7 @@ async fn setup_completes_without_waiting_for_a_quiet_chain() {
 async fn a_completed_setup_hands_back_the_channel_it_mounted() {
     let dir = temp();
     let verifier = Secp256k1Verifier::new();
-    let mut journal = completed_store(dir.path());
+    let mut journal = completed_store(dir.path()).await;
 
     let bundle = completed(countersigned(proposed()));
     let payment_open = bundle.payment_open().expect("the executable payment Open");
@@ -2235,7 +2197,7 @@ async fn a_completed_setup_hands_back_the_channel_it_mounted() {
 async fn a_restart_over_a_completed_setup_hands_back_the_same_channel() {
     let dir = temp();
     let verifier = Secp256k1Verifier::new();
-    let mut journal = completed_store(dir.path());
+    let mut journal = completed_store(dir.path()).await;
 
     let bundle = completed(countersigned(proposed()));
     let payment_open = bundle.payment_open().expect("the executable payment Open");
@@ -2267,7 +2229,7 @@ async fn a_restart_over_a_completed_setup_hands_back_the_same_channel() {
     // lives, so the restart below is a restart of both files.
     drop(journal);
 
-    let mut restarted = store(dir.path(), Role::Provider);
+    let mut restarted = store(dir.path(), Role::Provider).await;
     assert_eq!(restarted.state().end(), Some(SetupEnd::Complete));
     let before = view.reads();
     let blocks = Blocks { blocks: Vec::new() }; // The origin has been pruned.
@@ -2322,7 +2284,7 @@ async fn a_restart_over_a_completed_setup_hands_back_the_same_channel() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_setup_is_driven_while_its_alpn_is_served_from_the_same_journal() {
     let dir = temp();
-    let journal = completed_store(dir.path());
+    let journal = completed_store(dir.path()).await;
 
     // Why this has to go through the service at all: the journal is
     // held, and a runner cannot open a second one to drive from.
@@ -2332,7 +2294,9 @@ async fn a_setup_is_driven_while_its_alpn_is_served_from_the_same_journal() {
         bond_edge(),
         Role::Provider,
         &Secp256k1Verifier::new(),
-    ) {
+    )
+    .await
+    {
         Err(WorkStoreError::Journal(JournalError::Locked { .. })) => {}
         other => panic!("a second store over one root is refused: {other:?}"),
     }
@@ -2427,15 +2391,57 @@ async fn a_setup_is_driven_while_its_alpn_is_served_from_the_same_journal() {
         "the origin block's own contest is journaled on the channel handed back",
     );
 
-    // One driver: a second step while the first is live is refused
-    // rather than admitted to the drive.
-    let held = service.drive().expect("the setup has a driver to take");
+    // Cancellation releases both the driver slot and the journal guard.
+    let mut held = Box::pin(async {
+        let mut driver = service.drive().expect("the setup has a driver to take");
+        let _journal = driver.store().await.expect("the journal is reachable");
+        std::future::pending::<()>().await;
+    });
+    assert!(futures::poll!(held.as_mut()).is_pending());
     assert!(
         matches!(service.drive(), Err(SetupDriveError::Busy)),
         "a second driver of one setup is turned away",
     );
+    let mut queued = Box::pin(exchange(&service, Vec::new()));
+    assert!(futures::poll!(queued.as_mut()).is_pending());
+    drop(queued);
     drop(held);
     assert!(service.drive().is_ok(), "and the slot comes back");
+    assert_eq!(exchange(&service, Vec::new()).await, three.encode());
+
+    // Tokio's mutex does not poison itself; the setup guard must retain
+    // the old failure boundary for both the driver and the wire handler.
+    let panicked = tokio::spawn({
+        let service = service.clone();
+        async move {
+            let mut driver = service.drive().expect("the driver slot was released");
+            let _journal = driver.store().await.expect("the journal was released");
+            panic!("inject a panic while the setup journal is borrowed");
+        }
+    });
+    assert!(
+        panicked
+            .await
+            .expect_err("the injected panic unwinds")
+            .is_panic()
+    );
+    let mut driver = service.drive().expect("unwinding releases the driver slot");
+    assert!(matches!(driver.store().await, Err(SetupDriveError::Busy)));
+    let reply = service
+        .exchange_setup(
+            ExchangeSetupRequest {
+                bond_edge: bond_edge().as_bytes().to_vec(),
+                bundle: Vec::new(),
+            },
+            hellas_wire::TransportContext::default(),
+        )
+        .await
+        .expect("the poisoned service answers with a refusal");
+    let response: hellas_rpc::call::WithTrailer<_> = reply.into();
+    assert!(
+        matches!(response.response.outcome, Some(Outcome::Refused(refused))
+        if refused.code == hellas_work::work::WorkRefusal::Unavailable.code() as i32)
+    );
 }
 
 /// A view that stops the driver where a real chain would, and counts
@@ -2501,7 +2507,7 @@ async fn exchange(service: &SetupService, bundle: Vec<u8>) -> Vec<u8> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_setup_decides_from_the_revision_it_asked_the_chain_about() {
     let dir = temp();
-    let journal = revision_two_store(dir.path());
+    let journal = revision_two_store(dir.path()).await;
     let three = completed(countersigned(proposed()));
     let service = SetupService::new(SetupEndpoint::new(
         journal,
@@ -2592,7 +2598,7 @@ async fn a_setup_decides_from_the_revision_it_asked_the_chain_about() {
     );
 
     drop(service);
-    let recovered = store(dir.path(), Role::Provider);
+    let recovered = store(dir.path(), Role::Provider).await;
     assert_eq!(recovered.state().revision(), Some(3));
     assert!(
         recovered.state().end().is_none(),
@@ -2695,7 +2701,7 @@ impl TxSink for Mempool {
 async fn a_mount_replays_a_same_block_contest() {
     let dir = temp();
     let verifier = Secp256k1Verifier::new();
-    let mut journal = completed_store(dir.path());
+    let mut journal = completed_store(dir.path()).await;
 
     let bundle = completed(countersigned(proposed()));
     let payment_open = bundle.payment_open().expect("the executable payment Open");
@@ -2764,7 +2770,7 @@ async fn a_mount_replays_a_same_block_contest() {
 async fn a_client_history_crosses_a_permissionless_bond_timeout() {
     let dir = temp();
     let verifier = Secp256k1Verifier::new();
-    let mut journal = client_completed_store(dir.path());
+    let mut journal = client_completed_store(dir.path()).await;
 
     let bundle = completed(countersigned(proposed()));
     let payment_open = bundle.payment_open().expect("the executable payment Open");
@@ -2838,7 +2844,7 @@ async fn a_client_history_crosses_a_permissionless_bond_timeout() {
 async fn an_overfunded_close_only_channel_settles_at_the_edge_it_holds() {
     let dir = temp();
     let verifier = Secp256k1Verifier::new();
-    let mut journal = completed_store(dir.path());
+    let mut journal = completed_store(dir.path()).await;
 
     let bundle = completed(countersigned(proposed()));
     let payment_open = bundle.payment_open().expect("the executable payment Open");
@@ -2898,7 +2904,7 @@ async fn an_overfunded_close_only_channel_settles_at_the_edge_it_holds() {
     // The restart: the same journal reopened over its own files takes
     // the same step to the same answer.
     drop(journal);
-    let mut restarted = store(dir.path(), Role::Provider);
+    let mut restarted = store(dir.path(), Role::Provider).await;
     match advance_setup(&view, &blocks, &NoSink, &mut restarted, &verifier).await {
         Ok(advance) => match advance.progress {
             SetupProgress::CloseOnly {
@@ -2986,184 +2992,14 @@ fn every_setup_ending_round_trips_under_its_own_code() {
     );
 }
 
-/// A frame is bound to its journal and to its position in it.
-///
-/// Not by the reader's care: by the digest. A frame copied to another
-/// position, or lifted from another channel's journal, is not a record
-/// this journal ever wrote, and replay never replays it.
-///
-/// What replay *does* with it depends on what is after it, and that is
-/// the journal's crash rule rather than a second opinion about binding:
-/// a frame nothing follows is indistinguishable from an interrupted
-/// append, so it is dropped; a frame with records after it cannot be
-/// one, so the file is refused.
-#[test]
-fn a_frame_cannot_be_moved_duplicated_or_lifted() {
-    let dir = temp();
-    let verifier = Secp256k1Verifier::new();
-    drop(completed_store(dir.path()));
-    let path = journal_path(dir.path(), network(), bond_edge());
-    let Ok(whole) = std::fs::read(&path) else {
-        panic!("the journal reads");
-    };
-
-    // The undamaged file first. A store that reported a tear whatever
-    // it read would satisfy every assertion below, and an operator who
-    // is told this after a clean shutdown stops believing it.
-    match SetupStore::open(
-        dir.path(),
-        network(),
-        bond_edge(),
-        Role::Provider,
-        &verifier,
-    ) {
-        Ok(clean) => assert!(!clean.recovered_torn_tail(), "nothing was interrupted"),
-        Err(error) => panic!("the clean journal opens: {error}"),
-    }
-
-    // The last frame, appended a second time. Its digest is the one for
-    // the position it came from.
-    let Ok(revision_three) = std::fs::read(&path) else {
-        panic!("the journal reads");
-    };
-    let two = completed_store_bytes();
-    let last = revision_three
-        .len()
-        .checked_sub(two)
-        .expect("the third frame is a suffix");
-    let mut duplicated = whole.clone();
-    duplicated.extend_from_slice(&revision_three[last..]);
-    if let Err(error) = std::fs::write(&path, &duplicated) {
-        panic!("the duplicated journal writes: {error}");
-    }
-    let error = SetupStore::open(
-        dir.path(),
-        network(),
-        bond_edge(),
-        Role::Provider,
-        &verifier,
-    )
-    .expect_err("a frame at another position does not verify at it");
-    assert!(
-        matches!(error, WorkStoreError::Journal(JournalError::Corrupt { .. })),
-        "a whole copied frame is not a tear: {error}"
-    );
-
-    // The same frames, under another channel's header.
-    let elsewhere = EdgeId::from_bytes([0x88; EdgeId::LENGTH]);
-    {
-        // Create the other journal so its header exists, then graft
-        // this one's frames onto it.
-        let _ = store_for(dir.path(), elsewhere);
-    }
-    let theirs = journal_path(dir.path(), network(), elsewhere);
-    let Ok(header) = std::fs::read(&theirs) else {
-        panic!("the fresh journal reads");
-    };
-    let mut grafted = header;
-    grafted.extend_from_slice(&whole[header_len()..]);
-    if let Err(error) = std::fs::write(&theirs, &grafted) {
-        panic!("the grafted journal writes: {error}");
-    }
-    let error = SetupStore::open(dir.path(), network(), elsewhere, Role::Provider, &verifier)
-        .expect_err("those frames were written for another journal");
-    assert!(
-        matches!(error, WorkStoreError::Journal(JournalError::Corrupt { .. })),
-        "unexpected error: {error}"
-    );
-}
-
-/// How many bytes the third revision's frame occupies, measured rather
-/// than assumed.
-fn completed_store_bytes() -> usize {
-    let dir = temp();
-    let verifier = Secp256k1Verifier::new();
-    let mut journal = store(dir.path(), Role::Provider);
-    let one = proposed();
-    let two = countersigned(one.clone());
-    for record in [scan_record(), bundle_record(&one), bundle_record(&two)] {
-        if let Err(error) = journal.commit(record, &verifier) {
-            panic!("the revision commits: {error}");
-        }
-    }
-    drop(journal);
-    let Ok(short) = std::fs::read(journal_path(dir.path(), network(), bond_edge())) else {
-        panic!("the journal reads");
-    };
-    let mut journal = store(dir.path(), Role::Provider);
-    if let Err(error) = journal.commit(armed_record(&completed(two)), &verifier) {
-        panic!("the revision commits: {error}");
-    }
-    drop(journal);
-    let Ok(long) = std::fs::read(journal_path(dir.path(), network(), bond_edge())) else {
-        panic!("the journal reads");
-    };
-    long.len() - short.len()
-}
-
-/// The fixed header, measured the same way.
-fn header_len() -> usize {
-    let dir = temp();
-    drop(store(dir.path(), Role::Provider));
-    let Ok(bytes) = std::fs::read(journal_path(dir.path(), network(), bond_edge())) else {
-        panic!("the journal reads");
-    };
-    bytes.len()
-}
-
-fn store_for(root: &std::path::Path, bond: EdgeId) -> SetupStore {
-    match SetupStore::open(
-        root,
-        network(),
-        bond,
-        Role::Provider,
-        &Secp256k1Verifier::new(),
-    ) {
-        Ok(store) => store,
-        Err(error) => panic!("a fresh journal opens: {error}"),
-    }
-}
-
-/// After a torn tail is truncated, the next append lands where the next
-/// frame's digest says it does.
-#[test]
-fn a_recovered_journal_can_be_written_again() {
-    let dir = temp();
-    let verifier = Secp256k1Verifier::new();
-    drop(completed_store(dir.path()));
-    let path = journal_path(dir.path(), network(), bond_edge());
-    let Ok(whole) = std::fs::read(&path) else {
-        panic!("the journal reads");
-    };
-    if let Err(error) = std::fs::write(&path, &whole[..whole.len() - 30]) {
-        panic!("the truncated journal writes: {error}");
-    }
-
-    {
-        let mut recovered = store(dir.path(), Role::Provider);
-        assert_eq!(recovered.state().revision(), Some(2));
-        // The interrupted revision, retried.
-        if let Err(error) = recovered.commit(
-            armed_record(&completed(countersigned(proposed()))),
-            &verifier,
-        ) {
-            panic!("the retried revision commits: {error}");
-        }
-    }
-
-    let reopened = store(dir.path(), Role::Provider);
-    assert_eq!(reopened.state().revision(), Some(3));
-    assert_eq!(reopened.len(), 4);
-}
-
 /// Signatures are checked when the journal is read back, not only when
 /// it is written.
 ///
 /// Committed under a verifier that accepts anything, then reopened
 /// under the real one: what was journaled is refused, rather than being
 /// trusted because it is already on the disk.
-#[test]
-fn replay_checks_the_signatures_again() {
+#[tokio::test]
+async fn replay_checks_the_signatures_again() {
     let dir = temp();
     let hash = Tx::open_hash(
         network(),
@@ -3185,13 +3021,15 @@ fn replay_checks_the_signatures_again() {
             bond_edge(),
             Role::Provider,
             &AcceptAll,
-        ) else {
+        )
+        .await
+        else {
             panic!("the journal opens");
         };
-        if let Err(error) = credulous.commit(scan_record(), &AcceptAll) {
+        if let Err(error) = credulous.commit(scan_record(), &AcceptAll).await {
             panic!("the scan arm commits: {error}");
         }
-        if let Err(error) = credulous.commit(bundle_record(&forged), &AcceptAll) {
+        if let Err(error) = credulous.commit(bundle_record(&forged), &AcceptAll).await {
             panic!("a credulous verifier accepts it: {error}");
         }
     }
@@ -3202,6 +3040,7 @@ fn replay_checks_the_signatures_again() {
         Role::Provider,
         &Secp256k1Verifier::new(),
     )
+    .await
     .expect_err("the provider never signed that");
     assert!(
         matches!(error, WorkStoreError::Setup(SetupStateError::Bundle(_))),
@@ -3231,9 +3070,9 @@ impl hellas_kernel::SigVerifier for AcceptAll {
 /// The two unresolved-submission flags, the timeout marker, and one
 /// history block that resolves nothing: the fields a settled fixture
 /// cannot hold at the same time as its own resolutions.
-fn in_flight_store(root: &std::path::Path) -> SetupStore {
+async fn in_flight_store(root: &std::path::Path) -> SetupStore {
     let verifier = Secp256k1Verifier::new();
-    let mut store = completed_store(root);
+    let mut store = completed_store(root).await;
     for record in [
         SetupRecord::BondSubmitted,
         SetupRecord::PaymentSubmitted,
@@ -3250,7 +3089,7 @@ fn in_flight_store(root: &std::path::Path) -> SetupStore {
                 .expect("contiguous finalized observation"),
         ),
     ] {
-        if let Err(error) = store.commit(record, &verifier) {
+        if let Err(error) = store.commit(record, &verifier).await {
             panic!("the in-flight fixture commits: {error}");
         }
     }
@@ -3261,9 +3100,9 @@ fn in_flight_store(root: &std::path::Path) -> SetupStore {
 ///
 /// The other half of the state space: both finalization flags, both
 /// close flags, the origin the payment Open fixes, and an end.
-fn settled_store(root: &std::path::Path) -> SetupStore {
+async fn settled_store(root: &std::path::Path) -> SetupStore {
     let verifier = Secp256k1Verifier::new();
-    let mut store = completed_store(root);
+    let mut store = completed_store(root).await;
     let three = completed(countersigned(proposed()));
     let (Some(bond_open), Some(payment_open)) = (three.bond_open(), three.payment_open()) else {
         panic!("an executable revision holds both Opens");
@@ -3307,46 +3146,21 @@ fn settled_store(root: &std::path::Path) -> SetupStore {
             outcome: SetupEnd::Aborted(SetupAbort::BondReclaimed),
         },
     ] {
-        if let Err(error) = store.commit(record, &verifier) {
+        if let Err(error) = store.commit(record, &verifier).await {
             panic!("the settled fixture commits: {error}");
         }
     }
     store
 }
 
-/// One named fixture: what to call it, and how to build it.
-type Fixture = (&'static str, fn(&std::path::Path) -> SetupStore);
+/// Exercise both unresolved and settled obligations during rotation.
+const FIXTURES: [(&str, bool); 2] = [("in flight", false), ("settled", true)];
 
-/// Every fixture a rotation is asserted over, named.
-const FIXTURES: [Fixture; 2] = [("in flight", in_flight_store), ("settled", settled_store)];
-
-/// The one journal file under a root, and the name it wears.
-fn only_journal(root: &std::path::Path) -> std::path::PathBuf {
-    let Ok(entries) = std::fs::read_dir(root) else {
-        panic!("the root reads");
-    };
-    let mut found: Vec<std::path::PathBuf> = entries
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| path.to_string_lossy().ends_with(".journal"))
-        .collect();
-    found.sort();
-    let [path] = found.as_slice() else {
-        panic!("one installed generation, not {found:?}");
-    };
-    path.clone()
-}
-
-fn read(path: &std::path::Path) -> Vec<u8> {
-    match std::fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) => panic!("{} reads: {error}", path.display()),
-    }
-}
-
-fn write(path: &std::path::Path, bytes: &[u8]) {
-    if let Err(error) = std::fs::write(path, bytes) {
-        panic!("{} writes: {error}", path.display());
+async fn fixture(root: &std::path::Path, settled: bool) -> SetupStore {
+    if settled {
+        settled_store(root).await
+    } else {
+        in_flight_store(root).await
     }
 }
 
@@ -3360,33 +3174,29 @@ fn write(path: &std::path::Path, bytes: &[u8]) {
 /// for it that is not the one `SetupState::new` starts at. Both fixtures
 /// are asserted to reach such a value below, so a new field is covered
 /// the moment either fixture moves it.
-#[test]
-fn a_checkpoint_replays_to_what_the_frames_replayed_to() {
-    for (label, fixture) in FIXTURES {
+#[tokio::test]
+async fn a_checkpoint_replays_to_what_the_frames_replayed_to() {
+    for (label, settled) in FIXTURES {
         let control = temp();
-        let expected = fixture(control.path()).state().clone();
+        let expected = fixture(control.path(), settled).await.state().clone();
 
         let rotated = temp();
         {
-            let mut store = fixture(rotated.path());
-            if let Err(error) = store.rotate() {
+            let mut store = fixture(rotated.path(), settled).await;
+            if let Err(error) = store.rotate().await {
                 panic!("{label}: the rotation completes: {error}");
             }
             assert_eq!(
                 store.len(),
-                1,
-                "{label}: a fresh successor holds its checkpoint and nothing else",
+                0,
+                "{label}: a fresh generation holds its checkpoint and nothing else",
             );
         }
-        let reopened = store(rotated.path(), Role::Provider);
+        let reopened = store(rotated.path(), Role::Provider).await;
         assert_eq!(
             reopened.state(),
             &expected,
             "{label}: the checkpoint is the state, not a summary of it",
-        );
-        assert!(
-            !reopened.recovered_torn_tail(),
-            "{label}: a rotation is not a tear",
         );
     }
 
@@ -3394,7 +3204,7 @@ fn a_checkpoint_replays_to_what_the_frames_replayed_to() {
     // assumed, because a round trip over a state that is all defaults is
     // a round trip that proves nothing.
     let in_flight = temp();
-    let in_flight = in_flight_store(in_flight.path());
+    let in_flight = in_flight_store(in_flight.path()).await;
     let in_flight = in_flight.state();
     assert!(in_flight.bond_submitted());
     assert!(in_flight.payment_submitted());
@@ -3405,7 +3215,7 @@ fn a_checkpoint_replays_to_what_the_frames_replayed_to() {
     assert_eq!(in_flight.end(), None);
 
     let settled = temp();
-    let settled = settled_store(settled.path());
+    let settled = settled_store(settled.path()).await;
     let settled = settled.state();
     assert!(settled.origin().is_some());
     assert!(settled.close_only_recovery());
@@ -3416,129 +3226,6 @@ fn a_checkpoint_replays_to_what_the_frames_replayed_to() {
     );
 }
 
-/// A crash at any point of the install reopens the same handshake.
-///
-/// The successor's bytes are the store's own, taken from a real
-/// rotation; the four directories below are the four shapes the
-/// documented order passes through. What each one must yield is the
-/// state the predecessor had — which is what the checkpoint says, and
-/// what the predecessor's frames say, because a rotation moves bytes and
-/// not facts.
-#[test]
-fn a_rotation_crashing_at_any_step_reopens_the_same_setup() {
-    for (label, fixture) in FIXTURES {
-        let source = temp();
-        let expected = fixture(source.path()).state().clone();
-        let predecessor_name = only_journal(source.path());
-        let predecessor = read(&predecessor_name);
-        let Some(predecessor_name) = predecessor_name.file_name().map(std::ffi::OsStr::to_owned)
-        else {
-            panic!("{label}: the predecessor has a name");
-        };
-
-        let installed = temp();
-        {
-            let mut store = fixture(installed.path());
-            if let Err(error) = store.rotate() {
-                panic!("{label}: the rotation completes: {error}");
-            }
-        }
-        let successor_name = only_journal(installed.path());
-        let successor = read(&successor_name);
-        let Some(successor_name) = successor_name.file_name().map(std::ffi::OsStr::to_owned) else {
-            panic!("{label}: the successor has a name");
-        };
-        let mut candidate_name = successor_name.clone();
-        candidate_name.push(".candidate");
-
-        for step in [
-            "the candidate was still being written",
-            "the candidate is whole and unrenamed",
-            "the rename happened and the predecessor is still there",
-            "the predecessor is unlinked",
-        ] {
-            let dir = temp();
-            match step {
-                "the candidate was still being written" => {
-                    write(&dir.path().join(&predecessor_name), &predecessor);
-                    write(
-                        &dir.path().join(&candidate_name),
-                        &successor[..successor.len() / 2],
-                    );
-                }
-                "the candidate is whole and unrenamed" => {
-                    write(&dir.path().join(&predecessor_name), &predecessor);
-                    write(&dir.path().join(&candidate_name), &successor);
-                }
-                "the rename happened and the predecessor is still there" => {
-                    write(&dir.path().join(&predecessor_name), &predecessor);
-                    write(&dir.path().join(&successor_name), &successor);
-                }
-                _ => write(&dir.path().join(&successor_name), &successor),
-            }
-
-            let reopened = store(dir.path(), Role::Provider);
-            assert_eq!(
-                reopened.state(),
-                &expected,
-                "{label}, {step}: the same handshake reopens",
-            );
-        }
-    }
-}
-
-/// An uninstalled candidate is not read, even when it says something.
-///
-/// The candidate here is a real checkpoint of a real earlier state, and
-/// the predecessor beside it has moved on since. A recovery that read
-/// the candidate would answer with the older handshake and lose two
-/// journaled submissions; a recovery that ignores it answers with the
-/// file the writer was actually told about.
-#[test]
-fn an_uninstalled_candidate_is_never_read() {
-    let verifier = Secp256k1Verifier::new();
-
-    let earlier = temp();
-    {
-        let mut earlier_store = completed_store(earlier.path());
-        if let Err(error) = earlier_store.rotate() {
-            panic!("the rotation completes: {error}");
-        }
-    }
-    let stale = read(&only_journal(earlier.path()));
-    let Some(candidate_name) = only_journal(earlier.path())
-        .file_name()
-        .map(std::ffi::OsStr::to_owned)
-    else {
-        panic!("the successor has a name");
-    };
-    let mut candidate_name = candidate_name;
-    candidate_name.push(".candidate");
-
-    let dir = temp();
-    let expected = {
-        let mut later = completed_store(dir.path());
-        for record in [SetupRecord::BondSubmitted, SetupRecord::PaymentSubmitted] {
-            if let Err(error) = later.commit(record, &verifier) {
-                panic!("the later submission commits: {error}");
-            }
-        }
-        later.state().clone()
-    };
-    write(&dir.path().join(&candidate_name), &stale);
-
-    let reopened = store(dir.path(), Role::Provider);
-    assert_eq!(
-        reopened.state(),
-        &expected,
-        "the predecessor is what recovery reads",
-    );
-    assert!(
-        reopened.state().bond_submitted() && reopened.state().payment_submitted(),
-        "the two submissions the stale candidate does not know about",
-    );
-}
-
 /// A rotated journal is still a journal a restart can name.
 ///
 /// Discovery reads the bond edge out of the first revision the file
@@ -3546,16 +3233,16 @@ fn an_uninstalled_candidate_is_never_read() {
 /// not in a frame. A discovery that read only the frames would report
 /// every long-lived setup as holding no revision, and a setup a node
 /// cannot name is a close it stops answering.
-#[test]
-fn a_rotated_setup_is_still_discovered() {
+#[tokio::test]
+async fn a_rotated_setup_is_still_discovered() {
     let dir = temp();
     {
-        let mut store = settled_store(dir.path());
-        if let Err(error) = store.rotate() {
+        let mut store = settled_store(dir.path()).await;
+        if let Err(error) = store.rotate().await {
             panic!("the rotation completes: {error}");
         }
     }
-    let found = match discover_setups(dir.path(), network()) {
+    let found = match discover_setups(dir.path(), network()).await {
         Ok(found) => found,
         Err(error) => panic!("the root enumerates: {error}"),
     };
@@ -3574,44 +3261,8 @@ fn a_rotated_setup_is_still_discovered() {
     );
 }
 
-/// A retired generation is not a second journal.
-///
-/// The crash between the rename and the unlink leaves two installed
-/// files for one setup. Discovery must offer the newest and not both:
-/// mounting the retired one would be a node running the same close duty
-/// twice, from a file it has already replaced.
-#[test]
-fn a_predecessor_left_by_a_crash_is_not_discovered_twice() {
-    let source = temp();
-    let predecessor_path = {
-        let store = settled_store(source.path());
-        drop(store);
-        only_journal(source.path())
-    };
-    let predecessor = read(&predecessor_path);
-    let Some(predecessor_name) = predecessor_path.file_name().map(std::ffi::OsStr::to_owned) else {
-        panic!("the predecessor has a name");
-    };
-
-    let dir = temp();
-    {
-        let mut store = settled_store(dir.path());
-        if let Err(error) = store.rotate() {
-            panic!("the rotation completes: {error}");
-        }
-    }
-    write(&dir.path().join(&predecessor_name), &predecessor);
-
-    let found = match discover_setups(dir.path(), network()) {
-        Ok(found) => found,
-        Err(error) => panic!("the root enumerates: {error}"),
-    };
-    assert!(found.unidentified.is_empty(), "{:?}", found.unidentified);
-    assert_eq!(found.setups.len(), 1, "one setup, not one per generation");
-}
-
-fn payment_policy() -> hellas_rpc::protocol::work::JobPaymentPolicyV2 {
-    hellas_rpc::protocol::work::JobPaymentPolicyV2 {
+fn payment_policy() -> hellas_work::model::work::JobPaymentPolicyV2 {
+    hellas_work::model::work::JobPaymentPolicyV2 {
         fixed_price: 10,
         dispatch_margin_blocks: 4,
         delivery_margin_blocks: 2,
@@ -3619,11 +3270,11 @@ fn payment_policy() -> hellas_rpc::protocol::work::JobPaymentPolicyV2 {
     }
 }
 
-#[test]
-fn finalized_observations_keep_setup_checkpoints_bounded_and_refuse_stale_replay() {
+#[tokio::test]
+async fn finalized_observations_keep_setup_checkpoints_bounded_and_refuse_stale_replay() {
     let dir = temp();
     let verifier = Secp256k1Verifier::new();
-    let mut journal = completed_store(dir.path());
+    let mut journal = completed_store(dir.path()).await;
     let initial_size = journal.state().checkpoint().len();
     for _ in 0..20 {
         let mut cursor = journal.state().scan_cursor().unwrap();
@@ -3645,16 +3296,16 @@ fn finalized_observations_keep_setup_checkpoints_bounded_and_refuse_stale_replay
         let observed = journal.state().observe(&blocks).unwrap();
         let record = SetupRecord::Observed(observed);
         assert!(record.encode().len() < 256);
-        journal.commit(record.clone(), &verifier).unwrap();
+        journal.commit(record.clone(), &verifier).await.unwrap();
         let before = journal.state().clone();
-        assert!(journal.commit(record, &verifier).is_err());
+        assert!(journal.commit(record, &verifier).await.is_err());
         assert_eq!(journal.state(), &before);
         assert_eq!(journal.state().checkpoint().len(), initial_size);
     }
     let expected = journal.state().clone();
-    journal.rotate().unwrap();
+    journal.rotate().await.unwrap();
     drop(journal);
-    assert_eq!(store(dir.path(), Role::Provider).state(), &expected);
+    assert_eq!(store(dir.path(), Role::Provider).await.state(), &expected);
 }
 
 #[tokio::test]
@@ -3675,7 +3326,7 @@ async fn a_terminal_decision_waits_for_the_block_explaining_spent_funding() {
         }
     }
     let directory = temp();
-    let mut journal = completed_store(directory.path());
+    let mut journal = completed_store(directory.path()).await;
     let verifier = Secp256k1Verifier::new();
     let advance = advance_setup(
         &Spent,

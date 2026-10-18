@@ -16,6 +16,7 @@ use crate::{
 use commonware_codec::{DecodeExt as _, Encode as _};
 use commonware_consensus::CertifiableBlock as _;
 use commonware_cryptography::{Hasher as _, Sha256};
+use hellas_auth::authority::UnixMillis;
 use hellas_genesis::{HELLAS_DEVNET_1_JSON, TrustDocument};
 use serde::{Deserialize, Serialize};
 
@@ -119,9 +120,7 @@ impl ProofVerifier {
             state_root: hex::encode(finalized.snapshot.state_root),
             finalization: finalized.snapshot.finalization,
             canonical_block: finalized.block,
-            observed_at_ms: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
+            observed_at_ms: UnixMillis::now().unwrap_or_default().0,
             epoch,
         }
     }
@@ -217,18 +216,9 @@ pub fn transaction_digest(tx: &crate::domain::Transaction) -> Digest {
 }
 
 fn parse_digest(value: &str) -> Result<Digest, VerificationError> {
-    if value.len() != 64
-        || !value
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    {
-        return Err(VerificationError::Digest);
-    }
-    let bytes: [u8; 32] = hex::decode(value)
-        .map_err(|_| VerificationError::Digest)?
-        .try_into()
-        .map_err(|_| VerificationError::Digest)?;
-    Ok(Digest::from(bytes))
+    hellas_auth::hex::parse_lower(value)
+        .map(Digest::from)
+        .map_err(|_| VerificationError::Digest)
 }
 
 /// Cannot be constructed without certificate, canonical-block, epoch, and route verification.

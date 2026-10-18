@@ -1267,7 +1267,7 @@ fn an_endpoint_built_close_settles_on_a_real_chain() {
         adjudicated_payouts, parse_pending_close, pending_payment_close_slot,
         work_payment_settlement,
     };
-    use hellas_rpc::protocol::work::{PaidChannel, PaidChannelPolicyV1, private_policy_commitment};
+    use hellas_work::model::work::{PaidChannel, PaidChannelPolicyV1, private_policy_commitment};
     use hellas_work::work_close::{adjudicated_close, close_start, start_body_digest};
 
     const FUNDING: u64 = 100;
@@ -1490,7 +1490,7 @@ fn an_endpoint_built_response_forfeits_the_understaters_bond() {
         adjudicated_payouts, parse_pending_close, pending_payment_close_slot,
         work_payment_settlement,
     };
-    use hellas_rpc::protocol::work::{PaidChannel, PaidChannelPolicyV1, private_policy_commitment};
+    use hellas_work::model::work::{PaidChannel, PaidChannelPolicyV1, private_policy_commitment};
     use hellas_work::work_close::{adjudicated_close, close_response, close_start};
 
     const FUNDING: u64 = 100;

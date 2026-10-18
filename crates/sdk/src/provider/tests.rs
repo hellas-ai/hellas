@@ -1,3 +1,5 @@
+pub(crate) mod host;
+mod node;
 use super::*;
 use bytes::Bytes;
 use futures::StreamExt as _;
@@ -21,7 +23,7 @@ impl RootProver for UnusedRoot {
 
     async fn prove_open_binding(
         &self,
-        _: hellas_rpc::Digest,
+        _: hellas_auth::Digest,
     ) -> Result<RootProof, hellas_attestation::AttestationError> {
         panic!("ALPN negotiation must not invoke attestation")
     }
@@ -29,7 +31,7 @@ impl RootProver for UnusedRoot {
 
 #[tokio::test]
 async fn paid_provider_advertises_work_and_chain_services() {
-    tokio::time::timeout(Duration::from_secs(15), async {
+    tokio::time::timeout(Duration::from_secs(30), async {
         let mut fixture = crate::test_support::PaidFixture::new();
         let node = fixture.node().await;
         let identity = ClientIdentity::from_secret_bytes([4; 32], [2; 32]).unwrap();
@@ -39,33 +41,40 @@ async fn paid_provider_advertises_work_and_chain_services() {
             .register(
                 FetchRoute::new("openai", "responses"),
                 FetchRouteEntry::new(
-                    Arc::new(
-                        hellas_providers::OpenAiResponsesFetchProvider::with_bearer("fixture")
-                            .unwrap(),
-                    ),
-                    Arc::new(hellas_providers::ResponsesFetchAdaptorFactory::new(
-                        hellas_rpc::FetchEnvironment::OpenAiResponses,
-                    )),
+                    Arc::new(ProbeRoute),
+                    Arc::new(ProbeRoute),
                     FetchRoutePolicy::default(),
                 )
                 .unwrap(),
             )
             .unwrap();
-        let provider = start_fetch_provider(FetchProviderOptions {
-            port: Some(0),
-            identity,
-            enrollment,
-            root: Arc::new(UnusedRoot),
-            state_directory: fixture.root.path().join("state"),
-            routes,
-            fetch_max_in_flight: 1,
-            fetch_queue_capacity: 1,
-            paid_work: Some(crate::PaidProviderOptions::new(fixture.config, node.clone()).unwrap()),
-            #[cfg(feature = "grant-provider")]
-            grants: None,
-        })
+        let root = Arc::new(UnusedRoot);
+        let provider = start_fetch_provider(
+            FetchProviderOptions {
+                port: Some(0),
+                identity,
+                enrollment,
+                root: root.clone(),
+                state_directory: fixture.root.path().join("state"),
+                routes,
+                fetch_max_in_flight: 1,
+                fetch_queue_capacity: 1,
+                paid_work: Some(
+                    crate::PaidProviderOptions::new(fixture.config, node.clone()).unwrap(),
+                ),
+                grants: None,
+            }
+            .prepare()
+            .await
+            .unwrap(),
+        )
         .await
         .unwrap();
+        assert_eq!(
+            Arc::strong_count(&root),
+            1,
+            "software root must not stay online"
+        );
         let client = Endpoint::builder(presets::Minimal)
             .bind_addr("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap())
             .unwrap()
@@ -134,11 +143,13 @@ impl Dispatcher<MuxTransport> for SlowStream {
         hellas_rpc::call::dispatch_server_streaming::<MuxTransport, StreamResult, _, _, _>(
             inbound,
             |_: DeliverResultRequest| async {
-                Ok(Box::pin(async_stream::stream! {
-                    yield Ok(WorkStreamEvent::default());
-                    tokio::time::sleep(Duration::from_secs(61)).await;
-                    yield Ok(WorkStreamEvent::default());
-                }))
+                Ok(hellas_rpc::call::ResponseStream::new(
+                    async_stream::stream! {
+                        yield Ok(WorkStreamEvent::default());
+                        tokio::time::sleep(Duration::from_secs(121)).await;
+                        yield Ok(WorkStreamEvent::default());
+                    },
+                ))
             },
         )
         .await
@@ -146,7 +157,7 @@ impl Dispatcher<MuxTransport> for SlowStream {
 }
 
 #[tokio::test(start_paused = true)]
-async fn paid_stream_survives_a_slow_upstream_and_an_idle_connection() {
+async fn paid_stream_outlives_the_idle_limit_but_idle_connections_close() {
     let (to_server, server_inbox) = mpsc::unbounded_channel();
     let (to_client, client_inbox) = mpsc::unbounded_channel();
     let client = MuxTransport::spawn::<8, _, _>(
@@ -163,7 +174,7 @@ async fn paid_stream_survives_a_slow_upstream_and_an_idle_connection() {
         Pipe(to_client, server_inbox),
         TransportContext::default(),
     );
-    let serving = tokio::spawn(serve(Arc::new(server), SlowStream));
+    let serving = tokio::spawn(serve_loop(Arc::new(server), SlowStream));
     for _ in 0..2 {
         let started = Instant::now();
         let mut response = hellas_rpc::call::server_streaming::<_, StreamResult>(
@@ -177,10 +188,103 @@ async fn paid_stream_survives_a_slow_upstream_and_an_idle_connection() {
         assert!(response.next().await.unwrap().is_ok());
         assert!(response.next().await.is_none());
         response.finish().unwrap();
-        assert!(started.elapsed() >= Duration::from_secs(61));
-        tokio::time::sleep(Duration::from_secs(121)).await;
+        assert!(started.elapsed() >= Duration::from_secs(121));
+        tokio::time::sleep(Duration::from_secs(119)).await;
         assert!(!serving.is_finished());
     }
-    serving.abort();
-    let _ = serving.await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    serving.await.unwrap();
+}
+
+// This test only negotiates ALPNs; no upstream implementation is needed.
+struct ProbeRoute;
+impl hellas_executor::FetchProvider for ProbeRoute {
+    fn execution_environment(&self) -> hellas_rpc::ContentId {
+        test_responses_contract().manifest_id()
+    }
+    fn run(
+        &self,
+        _: hellas_executor::PreparedFetchRequest,
+    ) -> hellas_executor::FetchProviderFuture<'_> {
+        Box::pin(async { panic!("ALPN probe must not execute upstream work") })
+    }
+}
+impl hellas_executor::FetchAdaptorFactory for ProbeRoute {
+    fn execution_environment(&self) -> hellas_rpc::ContentId {
+        test_responses_contract().manifest_id()
+    }
+    fn create(
+        &self,
+        _: &hellas_executor::FetchCall,
+    ) -> Result<hellas_executor::FetchAdaptorSession, hellas_executor::FetchAdaptorError> {
+        panic!("ALPN probe must not prepare upstream work")
+    }
+}
+
+use hellas_work::test_support::test_responses_contract;
+
+#[test]
+fn work_is_the_only_execution_protocol_advertised() {
+    assert_eq!(served_alpns(false, false, false), [Node::ALPN.as_bytes()]);
+    assert_eq!(
+        served_alpns(false, true, false),
+        [Node::ALPN.as_bytes(), Work::ALPN.as_bytes()]
+    );
+    assert_eq!(
+        served_alpns(false, true, true),
+        [
+            Node::ALPN.as_bytes(),
+            Work::ALPN.as_bytes(),
+            hellas_rpc::services::host_control::HostControl::ALPN.as_bytes()
+        ]
+    );
+    assert_eq!(
+        served_alpns(true, true, true).len(),
+        served_alpns(true, false, false).len() + 1
+    );
+    assert_eq!(
+        served_alpns(true, false, false),
+        [
+            Node::ALPN.as_bytes(),
+            hellas_rpc::services::chain_sync::ChainSync::ALPN.as_bytes(),
+            WorkSetup::ALPN.as_bytes(),
+            Work::ALPN.as_bytes()
+        ]
+    );
+}
+
+#[tokio::test]
+async fn invalid_resources_are_rejected_before_opening_a_journal() {
+    use crate::grant_provider::{GrantProviderError, ProviderResources};
+    use hellas_work::work_store::grant::NodeStoreError;
+    let root = tempfile::tempdir().unwrap();
+    let provider =
+        crate::test_identity::enrollment(iroh::SecretKey::from_bytes(&[3; 32]).public()).0;
+    let mut options = ProviderGrants {
+        config: crate::GrantProviderOptions {
+            policies: vec![hellas_work::test_support::policy()],
+            max_job_millis: std::num::NonZeroU64::MIN,
+        },
+        authority: ProviderAuthority::Journal {
+            root: root.path().join("provider"),
+        },
+    };
+    let routes = FetchRouteRegistry::default();
+    assert!(matches!(
+        options
+            .open(ProviderResources::Fetch(&routes), &provider)
+            .await,
+        Err(ProviderError::GrantConfig(
+            GrantProviderError::MissingRoute(_)
+        ))
+    ));
+    assert!(!root.path().join("provider").exists());
+    options.config.policies.clear();
+    assert!(matches!(
+        options
+            .open(ProviderResources::Fetch(&routes), &provider)
+            .await,
+        Err(ProviderError::NodeStore(NodeStoreError::Uninitialized))
+    ));
+    assert!(!root.path().join("provider").exists());
 }

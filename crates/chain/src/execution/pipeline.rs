@@ -114,12 +114,7 @@ impl Publication {
 /// All execution roles share the directory lock and provisioned chain identity.
 pub(crate) fn lock(directory: &std::path::Path) -> std::io::Result<std::fs::File> {
     std::fs::create_dir_all(directory)?;
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(directory.join("node.lock"))?;
+    let file = hellas_private::open_lock_beside(&directory.join("node"))?;
     file.try_lock().map_err(std::io::Error::other)?;
     Ok(file)
 }
@@ -129,7 +124,7 @@ pub(crate) fn pin(
     threshold: &[u8],
     payload: crate::domain::Digest,
 ) -> std::io::Result<()> {
-    use std::io::{Error, ErrorKind, Write};
+    use std::io::{Error, ErrorKind};
     let identity = serde_json::to_vec(&(genesis, threshold, hex::encode(payload)))?;
     let path = directory.join("chain-identity.json");
     match std::fs::read(&path) {
@@ -139,15 +134,7 @@ pub(crate) fn pin(
             "state directory belongs to another chain",
         )),
         Err(e) if e.kind() == ErrorKind::NotFound => {
-            let mut file = std::fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(path)?;
-            file.write_all(&identity)?;
-            file.sync_all()?;
-            #[cfg(unix)]
-            std::fs::File::open(directory)?.sync_all()?;
-            Ok(())
+            hellas_private::write_atomically(&path, ".tmp", &identity)
         }
         Err(e) => Err(e),
     }

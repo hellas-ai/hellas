@@ -39,6 +39,7 @@ impl core::fmt::Display for SubmitTxOutcome {
     }
 }
 
+pub mod authentication;
 pub mod cache;
 pub mod call;
 #[cfg(feature = "chain")]
@@ -51,16 +52,13 @@ pub mod execution_event;
 pub mod fetch;
 #[cfg(feature = "fetch")]
 pub mod http_fetch;
-#[cfg(feature = "fetch")]
-pub mod http_usage;
 pub mod observe;
 #[cfg(feature = "execute")]
 pub mod open;
 #[cfg(feature = "fetch")]
 pub mod output;
-pub use hellas_wire::peers;
+use hellas_wire::peers;
 pub mod protocol;
-pub use hellas_wire::serve;
 #[cfg(feature = "execute")]
 pub mod signature_wire;
 #[cfg(feature = "execute")]
@@ -79,24 +77,23 @@ pub use tokens::{
 
 pub use protocol::{
     APPLE_APP_ATTEST, AppleAppAttestEnrollment, Application, ApplicationError, Assurance,
-    CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR, CODEX_RESPONSES_ADAPTOR, CODEX_RESPONSES_ENDPOINT,
-    CanonicalizationId, CausalLmEnvironment, CausalLmEnvironmentError, CausalLmGenerationSchedule,
-    ContentId, ContentRef, DagCborDecodeError, DagCborDecoder, DagCborEncodeError, DagCborEncoder,
-    Digest, Evaluate, EvaluateRequest, EventCommitment, FETCH_EVALUATOR, FetchEnvironment,
+    CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR, CanonicalizationId, CausalLmEnvironment,
+    CausalLmEnvironmentError, CausalLmGenerationSchedule, ContentId, ContentRef,
+    DagCborDecodeError, DagCborDecoder, DagCborEncodeError, DagCborEncoder, Evaluate,
+    EvaluateRequest, EventCommitment, FETCH_EVALUATOR, FetchContract, FetchEgress, FetchSchema,
     InputCommitment, InputEventBody, InputEventBodyParts, InputEventEnvelope,
     InputTranscriptBuilder, JsonBytes, MAX_APPLICATION_ID_BYTES, MAX_CAUSAL_LM_ENVIRONMENT_BYTES,
     MAX_CAUSAL_LM_STATIC_BYTES, OPEN_EXPORTER_LEN, OPEN_NONCE_LEN, OPEN_PROOF_DOMAIN,
-    OPEN_PROVIDER_ROLE, OPENAI_RESPONSES_ADAPTOR, OPENAI_RESPONSES_ENDPOINT, Operation,
-    OutputEventBody, OutputEventBodyParts, OutputEventEnvelope, OutputTranscriptBuilder,
-    PlatformCredential, PlatformEnrollment, ProducerId, ProducerSigningKey, ProgramManifest,
-    ProviderEnrollmentBundle, ProviderGenesisDecodeError, ProviderGenesisStatement, PublicKey,
-    RequestCommitment, Retention, RootKind, RootProof, SchemeId, Signature, SignatureError,
-    SignatureKind, SignedInputEvent, SignedOutputEvent, SignedProviderGenesis, StaticSlice,
-    StreamId, StreamVerifyError, canonical_dag_cbor, decode_dag_cbor, hash_tuple, input_genesis,
-    open_proof_binding, output_genesis, scheme_id, verify_input_event_envelopes,
-    verify_output_event_continuation, verify_output_event_envelopes,
+    OPEN_PROVIDER_ROLE, Operation, OutputEventBody, OutputEventBodyParts, OutputEventEnvelope,
+    OutputTranscriptBuilder, PlatformCredential, PlatformEnrollment, ProgramManifest,
+    ProviderEnrollmentBundle, ProviderGenesisDecodeError, ProviderGenesisStatement,
+    RequestCommitment, Retention, RootKind, RootProof, SchemeId, SignedInputEvent,
+    SignedOutputEvent, SignedProviderGenesis, StaticSlice, StreamId, StreamVerifyError,
+    canonical_dag_cbor, decode_dag_cbor, input_genesis, open_proof_binding, output_genesis,
+    scheme_id, verify_input_event_envelopes, verify_output_event_continuation,
+    verify_output_event_envelopes,
 };
-pub use protocol::{commitment, digest, retention, signature, tags, value};
+pub use protocol::{commitment, digest, retention, tags, value};
 
 /// Protobuf-generated message types plus per-service typed client traits,
 /// method markers, and server dispatchers. The bare `pb` module is

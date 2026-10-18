@@ -37,7 +37,7 @@
 //! Two things, both on this channel's own payment edge. An accepted
 //! [`Move::StartPaymentClose`](hellas_kernel::Move::StartPaymentClose) means a contest is live, and the height
 //! that accepted it is the only place the contest's identifier can come
-//! from — the kernel derives [`StartId`](hellas_kernel::StartId) from the start
+//! from — the kernel derives [`StartId`] from the start
 //! digest *and*
 //! the inclusion height, so no retained signature determines it. An
 //! accepted [`Tx::Close`] means the edge is gone, and what it paid is
@@ -76,13 +76,14 @@ use hellas_kernel::{
     PaymentCloseStart, Payout, PendingPaymentClose, Proof, Secp256k1Signer, Sig, SigVerifier,
     StartId, Terms, Tx, WorkPaymentSettlement, adjudicated_payouts, no_earned_digest,
 };
+use hex::encode as hex;
 
+use crate::model::work::PaidChannel;
 use crate::work::{EndpointError, Handoff};
 use crate::work_store::{
-    Applied, ChannelRecord, ChannelStore, JobPhase, Role, TerminalOutcome, WorkStoreError, hex,
+    Applied, ChannelRecord, ChannelStore, JobPhase, Role, TerminalOutcome, WorkStoreError,
 };
 use hellas_rpc::observe::{LEVEL, TARGET, Timing};
-use hellas_rpc::protocol::work::PaidChannel;
 
 /// One finalized block, as a watcher must see it.
 ///
@@ -439,8 +440,8 @@ pub fn close_response(
             name: "response_build_ms",
             target: TARGET,
             LEVEL,
-            edge = %hex(&channel.payment_edge().to_bytes()),
-            start_id = %hex(&start_id.to_bytes()),
+            edge = %hex(channel.payment_edge().to_bytes()),
+            start_id = %hex(start_id.to_bytes()),
             ms,
         );
     }
@@ -561,7 +562,7 @@ where
 /// facts: a forged or merely out-of-order `h + 2` would otherwise end a
 /// job, record a contest, and only then be refused by the cursor.
 ///
-/// A block this journal has already read is [`Applied::Redundant`] and
+/// A block this journal has already read is `Applied::Redundant` and
 /// returns here, having written nothing. Everything it meant is already
 /// on the disk.
 ///
@@ -580,7 +581,7 @@ where
 /// before anything is written — and when a record is refused or cannot
 /// be made durable. The cursor is the last thing written, so a refusal
 /// anywhere leaves this endpoint still behind this block.
-pub fn observe<V: SigVerifier>(
+pub async fn observe<V: SigVerifier>(
     store: &mut ChannelStore,
     block: &FinalizedWork,
     verifier: &V,
@@ -593,19 +594,23 @@ pub fn observe<V: SigVerifier>(
         return Ok(());
     }
     for (work_id, outcome) in expiry_at(store.state(), block.height, block.payload) {
-        store.commit(ChannelRecord::JobTerminated { work_id, outcome }, verifier)?;
+        store
+            .commit(ChannelRecord::JobTerminated { work_id, outcome }, verifier)
+            .await?;
     }
 
-    apply_finalized_txs(store, block.height, block.payload, &block.txs, verifier)?;
+    apply_finalized_txs(store, block.height, block.payload, &block.txs, verifier).await?;
 
-    store.commit(
-        ChannelRecord::CursorAdvanced {
-            height: block.height,
-            parent: block.parent,
-            payload: block.payload,
-        },
-        verifier,
-    )?;
+    store
+        .commit(
+            ChannelRecord::CursorAdvanced {
+                height: block.height,
+                parent: block.parent,
+                payload: block.payload,
+            },
+            verifier,
+        )
+        .await?;
     Ok(())
 }
 
@@ -620,7 +625,7 @@ pub fn observe<V: SigVerifier>(
 /// the Open in it is still a contest this endpoint must see. Both go
 /// through here, so a same-block contest is recognised exactly as a
 /// later-block one is. The Open itself matches neither arm and is ignored.
-pub(crate) fn apply_finalized_txs<V: SigVerifier>(
+pub(crate) async fn apply_finalized_txs<V: SigVerifier>(
     store: &mut ChannelStore,
     height: u64,
     payload: [u8; 32],
@@ -646,17 +651,19 @@ pub(crate) fn apply_finalized_txs<V: SigVerifier>(
                     .map(|job| (job.work_id(), job.authorization().payment_deadline))
                     .collect();
                 for (work_id, deadline) in open {
-                    store.commit(
-                        ChannelRecord::JobTerminated {
-                            work_id,
-                            outcome: TerminalOutcome::Expired {
-                                deadline,
-                                height,
-                                payload,
+                    store
+                        .commit(
+                            ChannelRecord::JobTerminated {
+                                work_id,
+                                outcome: TerminalOutcome::Expired {
+                                    deadline,
+                                    height,
+                                    payload,
+                                },
                             },
-                        },
-                        verifier,
-                    )?;
+                            verifier,
+                        )
+                        .await?;
                 }
                 // The window and the claimed floor are fixed by the block
                 // that accepted this start, exactly as the kernel fixed
@@ -671,18 +678,20 @@ pub(crate) fn apply_finalized_txs<V: SigVerifier>(
                 let claimed = start
                     .certificate()
                     .map_or(0, |(certificate, _)| certificate.earned_cumulative());
-                store.commit(
-                    ChannelRecord::CloseOpened {
-                        start_id: hellas_kernel::start_id(
-                            start_body_digest(&channel, start),
-                            height,
-                        ),
-                        opener: start.opener_role(),
-                        response_deadline,
-                        claimed,
-                    },
-                    verifier,
-                )?;
+                store
+                    .commit(
+                        ChannelRecord::CloseOpened {
+                            start_id: hellas_kernel::start_id(
+                                start_body_digest(&channel, start),
+                                height,
+                            ),
+                            opener: start.opener_role(),
+                            response_deadline,
+                            claimed,
+                        },
+                        verifier,
+                    )
+                    .await?;
             }
             Tx::Close { input, outputs, .. } if *input == edge => {
                 let provider_payout = outputs
@@ -696,26 +705,30 @@ pub(crate) fn apply_finalized_txs<V: SigVerifier>(
                     .map(|job| (job.work_id(), job.authorization().payment_deadline))
                     .collect();
                 for (work_id, deadline) in open {
-                    store.commit(
-                        ChannelRecord::JobTerminated {
-                            work_id,
-                            outcome: TerminalOutcome::Expired {
-                                deadline,
-                                height,
-                                payload,
+                    store
+                        .commit(
+                            ChannelRecord::JobTerminated {
+                                work_id,
+                                outcome: TerminalOutcome::Expired {
+                                    deadline,
+                                    height,
+                                    payload,
+                                },
                             },
+                            verifier,
+                        )
+                        .await?;
+                }
+                store
+                    .commit(
+                        ChannelRecord::CloseSettled {
+                            height,
+                            payload,
+                            provider_payout,
                         },
                         verifier,
-                    )?;
-                }
-                store.commit(
-                    ChannelRecord::CloseSettled {
-                        height,
-                        payload,
-                        provider_payout,
-                    },
-                    verifier,
-                )?;
+                    )
+                    .await?;
             }
             _ => {}
         }
@@ -747,7 +760,7 @@ fn expiry_at(
     state: &crate::work_store::Channel,
     height: u64,
     payload: [u8; 32],
-) -> Vec<(hellas_rpc::protocol::Digest, TerminalOutcome)> {
+) -> Vec<(hellas_auth::Digest, TerminalOutcome)> {
     if state.role() != Role::Provider {
         return Vec::new();
     }
@@ -835,20 +848,21 @@ where
     T: TxSink + ?Sized,
     V: SigVerifier,
 {
-    let handoff = channel.handoff()?;
+    let handoff = channel.handoff().await?;
     let height = catch_up_until_duty(source, channel, verifier, handoff).await?;
-    let step = channel.with_store(|store| {
+    let step = 'borrow: {
+        let store = channel.store().await?;
         let state = store.state();
         if let Some(settled) = state.close_settled() {
-            return CloseStep::Reached(CloseProgress::Settled {
+            break 'borrow CloseStep::Reached(CloseProgress::Settled {
                 provider_payout: settled.provider_payout,
             });
         }
         if let Some((start_id, _)) = state.close_opened() {
-            return CloseStep::Reached(CloseProgress::Opened { start_id });
+            break 'borrow CloseStep::Reached(CloseProgress::Opened { start_id });
         }
         let Some(start) = state.includable_close_start(height) else {
-            return CloseStep::Reached(CloseProgress::Nothing);
+            break 'borrow CloseStep::Reached(CloseProgress::Nothing);
         };
         CloseStep::Start {
             valid_through: start.valid_through_height(),
@@ -856,16 +870,16 @@ where
                 start.clone(),
             ))),
         }
-    })?;
+    };
     match step {
         // The answer, in the order a crash has to survive: the record
         // is fixed under one borrow, the bytes are offered while
         // nothing is borrowed, and what the sink did is recorded under
         // another. Nothing waits on a sink holding this journal.
         CloseStep::Reached(CloseProgress::Opened { start_id }) => {
-            if let Some(response) = channel.fix_answer(start_id)? {
+            if let Some(response) = channel.fix_answer(start_id).await? {
                 let outcome = sink.submit(response).await?;
-                channel.record_handoff(start_id, outcome)?;
+                channel.record_handoff(start_id, outcome).await?;
             }
             Ok(CloseProgress::Opened { start_id })
         }
@@ -899,70 +913,62 @@ enum CloseStep {
 /// Where a close step reaches one channel's journal, and the answer it
 /// may owe.
 ///
-/// Every method here is synchronous, which is the whole content of the
-/// trait: a close waits on a source and on a sink, and neither wait may
-/// happen while this journal is borrowed. An endpoint that owns its
-/// store lends it directly; a service that keeps one behind a lock takes
-/// that lock for exactly as long as the step runs and hands back what
-/// the step produced. The sequence itself — read to the duty, fix the
-/// answer, offer it, record the hand-off — is [`advance_close`]'s and is
-/// written once for both.
-pub trait CloseChannel {
-    /// Lends this channel's journal for exactly as long as `step` runs.
+/// Journal borrows may span storage I/O, but must end before chain or sink
+/// waits. The sequence — read to the duty, fix the answer, offer it, record
+/// the handoff — remains shared by owned endpoints and service drivers.
+pub trait CloseChannel: Send {
+    /// Borrows the journal until the returned guard is dropped.
     ///
     /// # Errors
     ///
-    /// [`CatchUpError::Busy`] when this journal cannot be reached at
-    /// all, which is the only thing an implementation may decide here.
-    fn with_store<R>(
+    /// [`CatchUpError::Busy`] when the journal cannot be reached.
+    fn store(
         &mut self,
-        step: impl FnOnce(&mut ChannelStore) -> R,
-    ) -> Result<R, CatchUpError>;
+    ) -> impl core::future::Future<
+        Output = Result<impl core::ops::DerefMut<Target = ChannelStore> + Send, CatchUpError>,
+    > + Send;
 
-    /// What this channel's last send got back.
-    ///
-    /// Defaulted to none held, which is the whole of a client's answer:
-    /// only a certificate's beneficiary may spend it, so a client never
-    /// holds an answer back and never has one a sink took.
+    /// What the last answer submission got back. Clients hold no answer.
     ///
     /// # Errors
-    ///
-    /// [`CatchUpError::Busy`] when this journal cannot be reached.
-    fn handoff(&mut self) -> Result<Option<(StartId, Handoff)>, CatchUpError> {
-        Ok(None)
+    /// [`CatchUpError::Busy`] when the channel cannot be reached.
+    fn handoff(
+        &mut self,
+    ) -> impl core::future::Future<Output = Result<Option<(StartId, Handoff)>, CatchUpError>> + Send
+    {
+        core::future::ready(Ok(None))
     }
 
-    /// Fixes this channel's answer to `start_id` on the disk and returns
-    /// the transaction carrying it, or `None` when no answer is owed.
+    /// Durably fixes an answer before returning its transaction, if one is owed.
     ///
     /// # Errors
-    ///
-    /// [`CatchUpError::Busy`] when this journal cannot be reached, and
-    /// [`CatchUpError::Store`] when it refuses the answer.
-    fn fix_answer(&mut self, _start_id: StartId) -> Result<Option<Tx>, CatchUpError> {
-        Ok(None)
+    /// [`CatchUpError::Busy`] when the channel cannot be reached, or
+    /// [`CatchUpError::Store`] when the journal refuses the answer.
+    fn fix_answer(
+        &mut self,
+        _start_id: StartId,
+    ) -> impl core::future::Future<Output = Result<Option<Tx>, CatchUpError>> + Send {
+        core::future::ready(Ok(None))
     }
 
-    /// Records what a sink did with the answer to `start_id`.
+    /// Records what the sink did with the answer.
     ///
     /// # Errors
-    ///
-    /// [`CatchUpError::Busy`] when this journal cannot be reached.
+    /// [`CatchUpError::Busy`] when the channel cannot be reached.
     fn record_handoff(
         &mut self,
         _start_id: StartId,
         _outcome: hellas_rpc::SubmitTxOutcome,
-    ) -> Result<(), CatchUpError> {
-        Ok(())
+    ) -> impl core::future::Future<Output = Result<(), CatchUpError>> + Send {
+        core::future::ready(Ok(()))
     }
 }
 
 impl CloseChannel for ChannelStore {
-    fn with_store<R>(
+    async fn store(
         &mut self,
-        step: impl FnOnce(&mut ChannelStore) -> R,
-    ) -> Result<R, CatchUpError> {
-        Ok(step(self))
+    ) -> Result<impl core::ops::DerefMut<Target = Self> + Send, CatchUpError> {
+        Ok(self)
     }
 }
 
@@ -1000,36 +1006,34 @@ where
     V: SigVerifier,
 {
     let mut suppressed = handoff.map(|(start_id, _)| start_id);
-    if let Some(height) = channel.with_store(|store| {
+    {
+        let store = channel.store().await?;
         let state = store.state();
-        close_duty_present(state, suppressed).then_some(state.cursor().0)
-    })? {
-        return Ok(height);
+        if close_duty_present(state, suppressed) {
+            return Ok(state.cursor().0);
+        }
     }
     let Some(latest) = fresh_tip(source).await? else {
-        return channel.with_store(|store| store.state().cursor().0);
+        return Ok(channel.store().await?.state().cursor().0);
     };
-    let mut next = channel
-        .with_store(|store| store.state().cursor().0)?
-        .saturating_add(1);
+    let mut next = channel.store().await?.state().cursor().0.saturating_add(1);
     while next <= latest {
         let block = one_block_fetch(source, next)
             .await?
             .ok_or(CatchUpError::Missing { height: next })?;
-        channel.with_store(|store| observe(store, &block, verifier))??;
+        let mut store = channel.store().await?;
+        observe(&mut store, &block, verifier).await?;
         if handoff.is_some_and(|(_, state)| state == Handoff::Offered) {
             // The one block a still-owed answer paid for is spent.
             suppressed = None;
         }
-        if let Some(height) = channel.with_store(|store| {
-            let state = store.state();
-            close_duty_present(state, suppressed).then_some(state.cursor().0)
-        })? {
-            return Ok(height);
+        let state = store.state();
+        if close_duty_present(state, suppressed) {
+            return Ok(state.cursor().0);
         }
         next = next.saturating_add(1);
     }
-    channel.with_store(|store| store.state().cursor().0)
+    Ok(channel.store().await?.state().cursor().0)
 }
 
 /// Whether this journal holds a close duty its caller must service
@@ -1102,7 +1106,7 @@ where
     futures::pin_mut!(pending);
     while let Some(block) = pending.next().await {
         let block = block?;
-        observe(store, &block, verifier)?;
+        observe(store, &block, verifier).await?;
     }
     Ok(store.state().cursor().0)
 }

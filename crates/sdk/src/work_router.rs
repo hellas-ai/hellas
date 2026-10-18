@@ -1,85 +1,68 @@
 //! Routes authenticated Work requests to the configured funding authority.
-#[cfg(feature = "paid-provider")]
+use hellas_rpc::pb::work::Refusable;
+
 use crate::paid_provider::{MountedWork, MountedWorkService};
-use hellas_rpc::call::WithTrailer;
+use hellas_rpc::call::{WithTrailer, with_trailer as wt};
 use hellas_rpc::pb::work::{
     AcceptWorkRequest, AcceptWorkResponse, AdmitCertificateRequest, AdmitCertificateResponse,
     DeliverResultRequest, DeliverResultResponse, ExchangeSetupRequest, ExchangeSetupResponse,
     FundingKind, GetStandingRequest, GetStandingResponse, WorkRefusalCode, WorkRefused, WorkRoute,
-    accept_work_response, admit_certificate_response, deliver_result_response,
-    exchange_setup_response, get_standing_response,
 };
 use hellas_rpc::services::work::WorkHandler;
 use hellas_rpc::services::work_setup::WorkSetupHandler;
 use hellas_wire::{TransportContext, WireCode, WireStatus};
-use hellas_work::grant_service::GrantService;
+use hellas_work::grant_service::{GrantService, GrantWork};
+use std::sync::Arc;
+use tokio::sync::Semaphore;
+mod admission;
+mod connection;
+use connection::ConnectionWork;
+pub use connection::WorkConnection;
+pub(crate) use connection::connect_work;
 
-/// Funding is fixed before serving. Grant authority owns a provider-wide journal;
-/// payment channels are mounted by their finalized-chain observer.
+/// Hosts select available fundings before serving. Each connection then proves
+/// and retains exactly one funding mode before ordinary Work RPC is exposed.
 #[derive(Clone)]
-pub enum WorkRouter {
-    Grants(GrantService),
-    #[cfg(feature = "paid-provider")]
-    Payment(MountedWork),
-    #[cfg(feature = "paid-provider")]
-    Both {
-        payment: MountedWork,
-        grants: GrantService,
-    },
+pub struct WorkRouter {
+    grants: Option<GrantService>,
+    payment: Option<MountedWork>,
+    slots: Arc<Semaphore>,
+    pending: Arc<Semaphore>,
+    public: Arc<Semaphore>,
+    unverified: admission::UnverifiedAdmission,
+}
+impl WorkRouter {
+    pub fn grants(grants: GrantService) -> Self {
+        Self::new(Some(grants), None)
+    }
+    pub fn payment(payment: MountedWork) -> Self {
+        Self::new(None, Some(payment))
+    }
+    pub fn both(payment: MountedWork, grants: GrantService) -> Self {
+        Self::new(Some(grants), Some(payment))
+    }
+    fn new(grants: Option<GrantService>, payment: Option<MountedWork>) -> Self {
+        let public_slots = if grants.is_some() { 64 } else { 128 };
+        Self {
+            grants,
+            payment,
+            slots: Arc::new(Semaphore::new(128)),
+            pending: Arc::new(Semaphore::new(16)),
+            // Public payment-mode selection proves no application identity.
+            // It cannot consume the capacity reserved for authenticated grants.
+            public: Arc::new(Semaphore::new(public_slots)),
+            unverified: Default::default(),
+        }
+    }
+    pub fn grant_service(&self) -> Option<&GrantService> {
+        self.grants.as_ref()
+    }
 }
 
 enum Handler<'a> {
-    Grants(&'a GrantService),
-    #[cfg(feature = "paid-provider")]
+    Grants(&'a GrantWork),
     Payment(MountedWorkService),
     Unavailable,
-}
-
-impl WorkRouter {
-    /// The grant authority selected at construction, if this router serves grants.
-    pub fn grant_service(&self) -> Option<&GrantService> {
-        match self {
-            Self::Grants(grants) => Some(grants),
-            #[cfg(feature = "paid-provider")]
-            Self::Both { grants, .. } => Some(grants),
-            #[cfg(feature = "paid-provider")]
-            Self::Payment(_) => None,
-        }
-    }
-
-    fn handler<'a>(
-        &'a self,
-        context: &TransportContext,
-        route: Option<&WorkRoute>,
-    ) -> Result<Handler<'a>, WireStatus> {
-        let route = route
-            .ok_or_else(|| WireStatus::new(WireCode::InvalidArgument, "missing work route"))?;
-        match FundingKind::try_from(route.funding_kind) {
-            Ok(FundingKind::Grant) => Ok(match self {
-                Self::Grants(grants) => Handler::Grants(grants),
-                #[cfg(feature = "paid-provider")]
-                Self::Both { grants, .. } => Handler::Grants(grants),
-                #[cfg(feature = "paid-provider")]
-                Self::Payment(_) => Handler::Unavailable,
-            }),
-            Ok(FundingKind::Payment) => {
-                #[cfg(feature = "paid-provider")]
-                if let Self::Payment(payment) | Self::Both { payment, .. } = self {
-                    return Ok(match payment.handler(context, Some(route))? {
-                        Some(service) => Handler::Payment(service),
-                        None => Handler::Unavailable,
-                    });
-                }
-                #[cfg(not(feature = "paid-provider"))]
-                let _ = context;
-                Ok(Handler::Unavailable)
-            }
-            _ => Err(WireStatus::new(
-                WireCode::InvalidArgument,
-                "invalid funding kind",
-            )),
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -99,9 +82,7 @@ impl WorkSetupHandler for UnmountedWork {
         _request: ExchangeSetupRequest,
         _context: TransportContext,
     ) -> Result<impl Into<WithTrailer<ExchangeSetupResponse>> + Send, WireStatus> {
-        Ok(ExchangeSetupResponse {
-            outcome: Some(exchange_setup_response::Outcome::Refused(not_ready())),
-        })
+        Ok(ExchangeSetupResponse::refused(not_ready()))
     }
 }
 
@@ -111,9 +92,7 @@ impl WorkHandler for UnmountedWork {
         _request: GetStandingRequest,
         _context: TransportContext,
     ) -> Result<impl Into<WithTrailer<GetStandingResponse>> + Send, WireStatus> {
-        Ok(GetStandingResponse {
-            outcome: Some(get_standing_response::Outcome::Refused(not_ready())),
-        })
+        Ok(GetStandingResponse::refused(not_ready()))
     }
 
     async fn accept_work(
@@ -121,9 +100,7 @@ impl WorkHandler for UnmountedWork {
         _request: AcceptWorkRequest,
         _context: TransportContext,
     ) -> Result<impl Into<WithTrailer<AcceptWorkResponse>> + Send, WireStatus> {
-        Ok(AcceptWorkResponse {
-            outcome: Some(accept_work_response::Outcome::Refused(not_ready())),
-        })
+        Ok(AcceptWorkResponse::refused(not_ready()))
     }
 
     async fn deliver_result(
@@ -131,9 +108,7 @@ impl WorkHandler for UnmountedWork {
         _request: DeliverResultRequest,
         _context: TransportContext,
     ) -> Result<impl Into<WithTrailer<DeliverResultResponse>> + Send, WireStatus> {
-        Ok(DeliverResultResponse {
-            outcome: Some(deliver_result_response::Outcome::Refused(not_ready())),
-        })
+        Ok(DeliverResultResponse::refused(not_ready()))
     }
 
     async fn stream_result(
@@ -152,29 +127,20 @@ impl WorkHandler for UnmountedWork {
         _request: AdmitCertificateRequest,
         _context: TransportContext,
     ) -> Result<impl Into<WithTrailer<AdmitCertificateResponse>> + Send, WireStatus> {
-        Ok(AdmitCertificateResponse {
-            outcome: Some(admit_certificate_response::Outcome::Refused(not_ready())),
-        })
+        Ok(AdmitCertificateResponse::refused(not_ready()))
     }
 }
 
-impl WorkHandler for WorkRouter {
+impl WorkHandler for ConnectionWork {
     async fn get_standing(
         &self,
         request: GetStandingRequest,
         context: TransportContext,
     ) -> Result<impl Into<WithTrailer<GetStandingResponse>> + Send, WireStatus> {
         match self.handler(&context, request.route.as_ref())? {
-            Handler::Grants(service) => Ok(Into::<WithTrailer<GetStandingResponse>>::into(
-                service.get_standing(request, context).await?,
-            )),
-            #[cfg(feature = "paid-provider")]
-            Handler::Payment(service) => Ok(Into::<WithTrailer<GetStandingResponse>>::into(
-                service.get_standing(request, context).await?,
-            )),
-            Handler::Unavailable => Ok(Into::<WithTrailer<GetStandingResponse>>::into(
-                UnmountedWork.get_standing(request, context).await?,
-            )),
+            Handler::Grants(service) => wt(service.get_standing(request, context)).await,
+            Handler::Payment(service) => wt(service.get_standing(request, context)).await,
+            Handler::Unavailable => wt(UnmountedWork.get_standing(request, context)).await,
         }
     }
     async fn accept_work(
@@ -183,16 +149,9 @@ impl WorkHandler for WorkRouter {
         context: TransportContext,
     ) -> Result<impl Into<WithTrailer<AcceptWorkResponse>> + Send, WireStatus> {
         match self.handler(&context, request.route.as_ref())? {
-            Handler::Grants(service) => Ok(Into::<WithTrailer<AcceptWorkResponse>>::into(
-                service.accept_work(request, context).await?,
-            )),
-            #[cfg(feature = "paid-provider")]
-            Handler::Payment(service) => Ok(Into::<WithTrailer<AcceptWorkResponse>>::into(
-                service.accept_work(request, context).await?,
-            )),
-            Handler::Unavailable => Ok(Into::<WithTrailer<AcceptWorkResponse>>::into(
-                UnmountedWork.accept_work(request, context).await?,
-            )),
+            Handler::Grants(service) => wt(service.accept_work(request, context)).await,
+            Handler::Payment(service) => wt(service.accept_work(request, context)).await,
+            Handler::Unavailable => wt(UnmountedWork.accept_work(request, context)).await,
         }
     }
     async fn deliver_result(
@@ -201,16 +160,9 @@ impl WorkHandler for WorkRouter {
         context: TransportContext,
     ) -> Result<impl Into<WithTrailer<DeliverResultResponse>> + Send, WireStatus> {
         match self.handler(&context, request.route.as_ref())? {
-            Handler::Grants(service) => Ok(Into::<WithTrailer<DeliverResultResponse>>::into(
-                service.deliver_result(request, context).await?,
-            )),
-            #[cfg(feature = "paid-provider")]
-            Handler::Payment(service) => Ok(Into::<WithTrailer<DeliverResultResponse>>::into(
-                service.deliver_result(request, context).await?,
-            )),
-            Handler::Unavailable => Ok(Into::<WithTrailer<DeliverResultResponse>>::into(
-                UnmountedWork.deliver_result(request, context).await?,
-            )),
+            Handler::Grants(service) => wt(service.deliver_result(request, context)).await,
+            Handler::Payment(service) => wt(service.deliver_result(request, context)).await,
+            Handler::Unavailable => wt(UnmountedWork.deliver_result(request, context)).await,
         }
     }
     async fn admit_certificate(
@@ -219,16 +171,9 @@ impl WorkHandler for WorkRouter {
         context: TransportContext,
     ) -> Result<impl Into<WithTrailer<AdmitCertificateResponse>> + Send, WireStatus> {
         match self.handler(&context, request.route.as_ref())? {
-            Handler::Grants(service) => Ok(Into::<WithTrailer<AdmitCertificateResponse>>::into(
-                service.admit_certificate(request, context).await?,
-            )),
-            #[cfg(feature = "paid-provider")]
-            Handler::Payment(service) => Ok(Into::<WithTrailer<AdmitCertificateResponse>>::into(
-                service.admit_certificate(request, context).await?,
-            )),
-            Handler::Unavailable => Ok(Into::<WithTrailer<AdmitCertificateResponse>>::into(
-                UnmountedWork.admit_certificate(request, context).await?,
-            )),
+            Handler::Grants(service) => wt(service.admit_certificate(request, context)).await,
+            Handler::Payment(service) => wt(service.admit_certificate(request, context)).await,
+            Handler::Unavailable => wt(UnmountedWork.admit_certificate(request, context)).await,
         }
     }
     async fn stream_result(
@@ -238,7 +183,6 @@ impl WorkHandler for WorkRouter {
     ) -> Result<hellas_work::work::PaidResultStream, WireStatus> {
         match self.handler(&context, request.route.as_ref())? {
             Handler::Grants(service) => service.stream_result(request, context).await,
-            #[cfg(feature = "paid-provider")]
             Handler::Payment(service) => service.stream_result(request, context).await,
             Handler::Unavailable => UnmountedWork.stream_result(request, context).await,
         }

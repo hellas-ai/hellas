@@ -6,11 +6,17 @@ use serde_json::json;
 fn configuration_bounds_credentials_and_withholds_debug_contents() {
     let mut config = Configuration {
         fetch_config: json!({"routes": []}),
-        grant_config: json!({"resources":[],"machine_limits":[]}),
+        grant_config: json!({"resources":[]}),
         env: [("UPSTREAM_API_KEY".into(), "test-private-value".into())].into(),
         files: Default::default(),
     };
     config.validate().unwrap();
+    for field in ["machine_limits", "max_in_flight"] {
+        config.grant_config[field] = json!([]);
+        assert!(config.validate().is_err());
+        config.grant_config.as_object_mut().unwrap().remove(field);
+    }
+
     assert!(!format!("{config:?}").contains("test-private-value"));
     for name in [
         "",

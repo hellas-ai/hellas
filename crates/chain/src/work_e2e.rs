@@ -19,6 +19,7 @@ use commonware_glue::stateful::db::{DatabaseSet, Merkleized as _, Unmerkleized a
 use commonware_runtime::{Handle, Supervisor as _};
 use commonware_storage::{mmr::Location, qmdb::sync::Target};
 use commonware_utils::non_empty_range;
+use hellas_auth::{ProducerSigningKey, PublicKey as RpcPublicKey};
 use hellas_client::work::payment::pay_for_result;
 use hellas_client::work::reproduce::{
     ReproduceFault, Reproduced, Reproducer, plan as reproduction_plan,
@@ -37,24 +38,25 @@ use hellas_rpc::evaluate::{
 };
 use hellas_rpc::pb::work::{ExchangeSetupRequest, exchange_setup_response::Outcome};
 use hellas_rpc::protocol::artifacts::{
-    BoundTermId, Canonical as _, InputAddressed as _, OutputAddressed as _, PreparedPaidInputV1,
-    SourceRef, TextArtifact, TextExecution, TextExecutionId, TextPolicy, TokenIds, completed_text,
-};
-use hellas_rpc::protocol::work::{
-    EvaluatePolicyV2, JobDeadlines, PaidChannelPolicyV1, generation_policy_digest,
-    identity_source_digest, private_policy_commitment,
-};
-use hellas_rpc::protocol::work_setup::{
-    ProviderChannelPolicy, ReadyChannel, WorkChannelConfig, WorkChannelDescriptor,
+    BoundTermId, Canonical as _, InputAddressed as _, OutputAddressed as _, SourceRef,
+    TextArtifact, TextExecution, TextExecutionId, TextPolicy, TokenIds, completed_text,
 };
 use hellas_rpc::services::work::WorkServer;
 use hellas_rpc::services::work_setup::WorkSetupHandler;
 use hellas_rpc::{
     Application, Assurance, CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR, ContentId, EvaluateRequest,
-    OutputEventEnvelope, ProducerSigningKey, ProgramManifest, PublicKey as RpcPublicKey,
+    OutputEventEnvelope, ProgramManifest,
 };
 use hellas_wire::mux::{MessagePipe, MuxConfig, MuxTransport, Role as MuxRole};
 use hellas_wire::{DefaultClock, Dispatcher, StreamTransport as _, TransportContext};
+use hellas_work::model::prepared_input::PreparedPaidInputV1;
+use hellas_work::model::setup::{
+    ProviderChannelPolicy, ReadyChannel, WorkChannelConfig, WorkChannelDescriptor,
+};
+use hellas_work::model::work::{
+    EvaluatePolicyV2, JobDeadlines, PaidChannelPolicyV1, generation_policy_digest,
+    identity_source_digest, private_policy_commitment,
+};
 use hellas_work::work::{
     BackendFault, ClientEndpoint, CloseEndpoint, JobProposal, PaymentError, PreparedEvaluateInput,
     RunOutcome, WorkBackend, WorkService, propose_work, run_accepted_work,
@@ -817,8 +819,8 @@ impl Devnet {
 
 // ── The handshake, and the setup drive ────────────────────────────────
 
-fn open_setup(root: &std::path::Path, bond: EdgeId, role: Role) -> SetupStore {
-    match SetupStore::open(root, TEST_NETWORK, bond, role, &Secp256k1Verifier::new()) {
+async fn open_setup(root: &std::path::Path, bond: EdgeId, role: Role) -> SetupStore {
+    match SetupStore::open(root, TEST_NETWORK, bond, role, &Secp256k1Verifier::new()).await {
         Ok(store) => store,
         Err(error) => panic!("the setup journal opens: {error}"),
     }
@@ -872,29 +874,38 @@ async fn shake_hands(
 ) -> Handshake {
     let bond = bond_edge(allocations);
     let mut proposer = SetupEndpoint::new(
-        open_setup(provider_root, bond, Role::Provider),
+        open_setup(provider_root, bond, Role::Provider).await,
         provider(),
         PaymentAdmission::Admits(Box::new(provider_policy())),
     );
-    proposer.arm_scan(scan).expect("the provider arms its scan");
-    if let Err(error) = proposer.propose_bond(TEST_NETWORK, bond_funding(allocations), bond_terms())
+    proposer
+        .arm_scan(scan)
+        .await
+        .expect("the provider arms its scan");
+    if let Err(error) = proposer
+        .propose_bond(TEST_NETWORK, bond_funding(allocations), bond_terms())
+        .await
     {
         panic!("the provider proposes its bond: {error}");
     }
     let service = SetupService::new(proposer);
 
     let mut caller = SetupEndpoint::new(
-        open_setup(client_root, bond, Role::Client),
+        open_setup(client_root, bond, Role::Client).await,
         client(),
         PaymentAdmission::Proposes(Box::new(provider_policy())),
     );
     let proposal = exchange(&service, bond_edge(allocations), Vec::new()).await;
-    if let Err(error) = caller.import(&proposal) {
+    if let Err(error) = caller.import(&proposal).await {
         panic!("the client imports the bond proposal: {error}");
     }
-    caller.arm_scan(scan).expect("the client arms its scan");
-    if let Err(error) =
-        caller.propose_payment(payment_funding(allocations), payment_terms(allocations))
+    caller
+        .arm_scan(scan)
+        .await
+        .expect("the client arms its scan");
+    if let Err(error) = caller
+        .propose_payment(payment_funding(allocations), payment_terms(allocations))
+        .await
     {
         panic!("the client proposes its payment: {error}");
     }
@@ -904,7 +915,7 @@ async fn shake_hands(
         .map(<[u8]>::to_vec)
         .expect("the client holds revision 2");
     let countersigned = exchange(&service, bond_edge(allocations), offered).await;
-    if let Err(error) = caller.import(&countersigned) {
+    if let Err(error) = caller.import(&countersigned).await {
         panic!("the client imports the countersigned payment: {error}");
     }
     assert_eq!(
@@ -1289,7 +1300,7 @@ async fn open_channel(
     // The client reaches the same origin from its own journal, reading a
     // different validator. The journal is reopened from the disk, so
     // nothing this process held in memory carries the client's half.
-    let mut client_setup = open_setup(client_root, bond_edge(&allocations), Role::Client);
+    let mut client_setup = open_setup(client_root, bond_edge(&allocations), Role::Client).await;
     let client_advance = client_step(&mut client_setup, &client_blocks).await;
     assert_eq!(client_advance.progress, SetupProgress::Complete(origin));
     let Some(client_store) = client_advance.mounted else {
@@ -1339,7 +1350,7 @@ async fn open_channel(
         Err(error) => panic!("the mounted channel is this node's to close: {error}"),
     };
     let service = WorkService::close_only(close);
-    if let Err(error) = service.admit_new_work(ready.clone()) {
+    if let Err(error) = service.admit_new_work(ready.clone()).await {
         panic!("the ready channel admits work: {error}");
     }
     let client_endpoint = match ClientEndpoint::new(client_ready, client_store, client()) {
@@ -1406,7 +1417,7 @@ async fn run_one_paid_job(devnet: &Devnet, opened: &mut Opened) -> u64 {
     // second verdict on the same job, and that is
     // `crates/client/tests/work.rs`'s. Here the two are one call, and
     // the assertion is that the payment comes after it.
-    let too_early = opened.client.pay(work_id);
+    let too_early = opened.client.pay(work_id).await;
     assert!(
         matches!(too_early, Err(PaymentError::NotPayable { .. })),
         "a job the client has not collected and checked is not payable: {too_early:?}",
@@ -1449,6 +1460,7 @@ async fn run_one_paid_job(devnet: &Devnet, opened: &mut Opened) -> u64 {
         opened
             .service
             .with_state(|state| state.max_executable_certificate())
+            .await
             .expect("the endpoint is reachable"),
         PRICE,
         "the provider holds a certificate for exactly the job price",
@@ -1605,6 +1617,7 @@ fn one_paid_job_earns_the_price_and_returns_the_stake_separately() {
         opened
             .service
             .prepare_close()
+            .await
             .expect("the provider prepares the close its certificate spends");
         drive_close_onto_chain(&mut devnet, &opened.service).await;
         let deadline = match devnet.snapshot(PROVIDER_NODE, &allocations).await.pending() {
@@ -1857,8 +1870,8 @@ fn an_understated_close_is_answered_and_pays_the_certificate() {
     });
 }
 
-fn payment_policy() -> hellas_rpc::protocol::work::JobPaymentPolicyV2 {
-    hellas_rpc::protocol::work::JobPaymentPolicyV2 {
+fn payment_policy() -> hellas_work::model::work::JobPaymentPolicyV2 {
+    hellas_work::model::work::JobPaymentPolicyV2 {
         fixed_price: PRICE,
         dispatch_margin_blocks: 4,
         delivery_margin_blocks: 2,

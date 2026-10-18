@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE journal SET checkpoint = ?, generation = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "43624ce2fe3841ad161d6c0eee160a2e93040fc38cf65782e372b1acb6f42489"
+}

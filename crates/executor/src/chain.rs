@@ -4,8 +4,8 @@
 //! party key IS its RPC producer identity, one secp256k1 scalar read
 //! through two primitive crates.
 
+use hellas_auth::ProducerSigningKey;
 use hellas_kernel::Secp256k1Signer;
-use hellas_rpc::ProducerSigningKey;
 
 /// Kernel signer sharing the producer identity's secp256k1 scalar: the
 /// provider's on-chain party key IS its RPC identity.
@@ -23,7 +23,7 @@ pub fn kernel_signer(producer: &ProducerSigningKey) -> Secp256k1Signer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hellas_rpc::PublicKey;
+    use hellas_auth::PublicKey;
 
     #[test]
     fn kernel_signer_shares_the_producer_identity() {

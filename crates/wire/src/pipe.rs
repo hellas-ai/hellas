@@ -1,5 +1,4 @@
-//! Owner-authenticated named-pipe carrier: the Windows counterpart of
-//! [`crate::unix`], for the same RPC dispatchers.
+//! Private named-pipe carrier, the Windows counterpart of the Unix listener.
 //!
 //! Unix proves the peer with a 0700 directory, a 0600 socket and the peer's
 //! uid. A pipe name is global, so here both ends authenticate each other:
@@ -9,8 +8,12 @@
 //!   before us), and rejects remote clients;
 //! - the server admits a client only if its process runs as this user;
 //! - the client talks only to a server whose process runs as this user.
+//!
+//! These OS checks limit admission. The host still authenticates the application.
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 use std::ffi::OsString;
+use std::future::Future;
 use std::io;
 use std::os::windows::ffi::OsStrExt as _;
 use std::os::windows::io::AsRawHandle as _;
@@ -18,13 +21,16 @@ use std::path::Path;
 use std::time::Duration;
 
 use hellas_private::windows::{OwnerOnly, process_is_current_user};
-use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeServer, ServerOptions};
+use tokio::net::windows::named_pipe::{
+    ClientOptions, NamedPipeClient, NamedPipeServer, ServerOptions,
+};
+use tokio::sync::oneshot;
 use windows_sys::Win32::Foundation::{ERROR_PIPE_BUSY, HANDLE};
 use windows_sys::Win32::System::Pipes::{GetNamedPipeClientProcessId, GetNamedPipeServerProcessId};
 
-use crate::local::{serve_accepted, transport};
+use crate::TransportContext;
+use crate::local::{ListenerTask, serve_accepted, transport};
 use crate::mux::{MuxTransport, Role};
-use crate::{Dispatcher, TransportContext};
 
 /// How long a client waits for a free server instance.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -37,11 +43,11 @@ const PIPE_PREFIX: &str = r"\\.\pipe\";
 /// paths never share one. Windows paths are case-insensitive and accept
 /// either separator, so ASCII case and `/` are normalised first; the whole
 /// normalised path is hashed, never a lossy rendering of it.
-pub fn pipe_name(path: &Path) -> OsString {
+pub fn pipe_name(path: &Path) -> io::Result<OsString> {
     if path.as_os_str().to_string_lossy().starts_with(PIPE_PREFIX) {
-        return path.as_os_str().to_owned();
+        return Ok(path.as_os_str().to_owned());
     }
-    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let absolute = std::path::absolute(path)?;
     let mut hasher = blake3::Hasher::new();
     for unit in absolute.as_os_str().encode_wide() {
         let unit = match unit {
@@ -51,7 +57,7 @@ pub fn pipe_name(path: &Path) -> OsString {
         };
         hasher.update(&unit.to_le_bytes());
     }
-    format!("{PIPE_PREFIX}hellas-{}", hasher.finalize().to_hex()).into()
+    Ok(format!("{PIPE_PREFIX}hellas-{}", hasher.finalize().to_hex()).into())
 }
 
 /// Fails unless the process behind `pid` runs as this user.
@@ -79,7 +85,16 @@ fn process_id(
 }
 
 pub async fn connect(path: impl AsRef<Path>) -> io::Result<MuxTransport> {
-    let name = pipe_name(path.as_ref());
+    transport(
+        connect_stream(path).await?,
+        Role::Client,
+        TransportContext::default(),
+    )
+}
+
+/// Open an OS-admitted stream; the caller still authenticates the application.
+pub async fn connect_stream(path: impl AsRef<Path>) -> io::Result<NamedPipeClient> {
+    let name = pipe_name(path.as_ref())?;
     let deadline = tokio::time::Instant::now() + CONNECT_TIMEOUT;
     let client = loop {
         match ClientOptions::new().open(&name) {
@@ -100,20 +115,21 @@ pub async fn connect(path: impl AsRef<Path>) -> io::Result<MuxTransport> {
         ),
         "server",
     )?;
-    transport(client, Role::Client, TransportContext::default())
+    Ok(client)
 }
 
 /// Dropping this handle closes the listener and its connections.
 pub struct LocalControlServer {
-    task: tokio::task::JoinHandle<()>,
+    task: ListenerTask,
 }
 
 impl LocalControlServer {
-    pub fn bind<D>(path: impl AsRef<Path>, dispatcher: D) -> io::Result<Self>
+    pub fn bind<H, F>(path: impl AsRef<Path>, handler: H) -> io::Result<Self>
     where
-        D: Dispatcher<MuxTransport> + Send + Sync + 'static,
+        H: Fn(NamedPipeServer) -> F + Send + 'static,
+        F: Future<Output = ()> + Send + 'static,
     {
-        let name = pipe_name(path.as_ref());
+        let name = pipe_name(path.as_ref())?;
         let security = OwnerOnly::new(false)?;
         let create = move |first: bool| -> io::Result<NamedPipeServer> {
             // SAFETY: the attributes point into `security`, which the closure
@@ -130,6 +146,7 @@ impl LocalControlServer {
         };
         // Created here, not in the task, so a squatted name fails `bind`.
         let mut listening = create(true)?;
+        let (stop, stopped) = oneshot::channel();
         let task = tokio::spawn(serve_accepted(
             async move || {
                 listening.connect().await?;
@@ -141,15 +158,31 @@ impl LocalControlServer {
                 );
                 Ok(same_user(peer, "client").is_ok().then_some(client))
             },
-            dispatcher,
+            handler,
+            stopped,
         ));
-        Ok(Self { task })
+        Ok(Self {
+            task: ListenerTask {
+                stop: Some(stop),
+                task,
+            },
+        })
     }
-}
 
-impl Drop for LocalControlServer {
-    fn drop(&mut self) {
-        self.task.abort();
+    /// Stop admission and cancel and join every connection before returning.
+    pub async fn shutdown(mut self) -> io::Result<()> {
+        self.task.shutdown().await
+    }
+
+    /// Wait for listener failure or completion. Cancellation leaves the listener running.
+    pub async fn wait(&mut self) -> io::Result<()> {
+        self.task.wait().await
+    }
+
+    /// Stop admission and finish every accepted handler. Hosts must bound their
+    /// own request/idle lifetime; unlike shutdown, this does not cancel work.
+    pub async fn drain(mut self) -> io::Result<()> {
+        self.task.drain().await
     }
 }
 
@@ -161,32 +194,41 @@ mod tests {
     fn distinct_paths_never_share_a_pipe() {
         // A lossy rendering (separators -> '-') made these collide.
         assert_ne!(
-            pipe_name(Path::new(r"C:\Users\me\a\b")),
-            pipe_name(Path::new(r"C:\Users\me\a-b"))
+            pipe_name(Path::new(r"C:\Users\me\a\b")).unwrap(),
+            pipe_name(Path::new(r"C:\Users\me\a-b")).unwrap()
         );
         assert_ne!(
-            pipe_name(Path::new(r"C:\x:y")),
-            pipe_name(Path::new(r"C:\x-y"))
+            pipe_name(Path::new(r"C:\x:y")).unwrap(),
+            pipe_name(Path::new(r"C:\x-y")).unwrap()
         );
     }
 
     #[test]
     fn one_path_spelled_differently_is_one_pipe() {
-        let canonical = pipe_name(Path::new(r"C:\Users\Me\gate.sock"));
-        assert_eq!(canonical, pipe_name(Path::new(r"c:\users\me\GATE.SOCK")));
-        assert_eq!(canonical, pipe_name(Path::new("C:/Users/Me/gate.sock")));
+        let canonical = pipe_name(Path::new(r"C:\Users\Me\gate.sock")).unwrap();
+        assert_eq!(
+            canonical,
+            pipe_name(Path::new(r"c:\users\me\GATE.SOCK")).unwrap()
+        );
+        assert_eq!(
+            canonical,
+            pipe_name(Path::new("C:/Users/Me/gate.sock")).unwrap()
+        );
         let relative = Path::new("relative.sock");
         assert_eq!(
-            pipe_name(relative),
-            pipe_name(&std::env::current_dir().unwrap().join(relative))
+            pipe_name(relative).unwrap(),
+            pipe_name(&std::env::current_dir().unwrap().join(relative)).unwrap()
         );
     }
 
     #[test]
     fn an_explicit_pipe_name_is_used_verbatim() {
         let explicit = Path::new(r"\\.\pipe\custom");
-        assert_eq!(pipe_name(explicit), explicit.as_os_str());
-        let name = pipe_name(Path::new(r"C:\a")).into_string().unwrap();
+        assert_eq!(pipe_name(explicit).unwrap(), explicit.as_os_str());
+        let name = pipe_name(Path::new(r"C:\a"))
+            .unwrap()
+            .into_string()
+            .unwrap();
         assert!(name.starts_with(r"\\.\pipe\hellas-") && name.len() < 256);
     }
 }

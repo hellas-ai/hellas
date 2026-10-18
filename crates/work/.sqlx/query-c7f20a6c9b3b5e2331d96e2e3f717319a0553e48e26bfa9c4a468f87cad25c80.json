@@ -1,0 +1,74 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT key, kind, role, generation, checkpoint FROM journal",
+  "describe": {
+    "columns": [
+      {
+        "name": "key",
+        "ordinal": 0,
+        "type_info": "Blob",
+        "origin": {
+          "Table": {
+            "table": "journal",
+            "name": "key"
+          }
+        }
+      },
+      {
+        "name": "kind",
+        "ordinal": 1,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "journal",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "name": "role",
+        "ordinal": 2,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "journal",
+            "name": "role"
+          }
+        }
+      },
+      {
+        "name": "generation",
+        "ordinal": 3,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "journal",
+            "name": "generation"
+          }
+        }
+      },
+      {
+        "name": "checkpoint",
+        "ordinal": 4,
+        "type_info": "Blob",
+        "origin": {
+          "Table": {
+            "table": "journal",
+            "name": "checkpoint"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "c7f20a6c9b3b5e2331d96e2e3f717319a0553e48e26bfa9c4a468f87cad25c80"
+}

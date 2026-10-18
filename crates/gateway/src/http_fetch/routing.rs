@@ -3,11 +3,12 @@ use super::{
     config::{HttpBackend, HttpGatewayConfig, HttpRoute},
 };
 use axum::http::{HeaderMap, StatusCode};
+use hellas_auth::authority::UnixMillis;
 use hellas_rpc::ContentId;
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex, Weak},
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant, UNIX_EPOCH},
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -288,7 +289,7 @@ impl Routing {
     fn key(&self, domain: &str, parts: &[&str]) -> ContentId {
         let mut fields: Vec<&[u8]> = vec![&self.salt];
         fields.extend(parts.iter().map(|s| s.as_bytes()));
-        ContentId::from_slice(hellas_rpc::hash_tuple(domain, &fields).as_bytes()).unwrap()
+        ContentId::from_bytes(*hellas_auth::hash_tuple(domain, &fields).as_bytes())
     }
 
     pub fn select(
@@ -499,9 +500,11 @@ pub(super) fn retry_delay(headers: &HeaderMap) -> Duration {
                 .ok()
                 .map(Duration::from_secs)
                 .or_else(|| {
-                    httpdate::parse_http_date(value)
-                        .ok()
-                        .map(|date| date.duration_since(SystemTime::now()).unwrap_or_default())
+                    httpdate::parse_http_date(value).ok().map(|date| {
+                        let now = UNIX_EPOCH
+                            + Duration::from_millis(UnixMillis::now().unwrap_or_default().0);
+                        date.duration_since(now).unwrap_or_default()
+                    })
                 })
         })
         .unwrap_or(Duration::from_secs(1))

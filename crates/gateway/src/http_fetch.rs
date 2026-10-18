@@ -57,7 +57,7 @@ pub struct HttpGatewayOptions {
     pub archive: super::ArchiveOptions,
     pub host: String,
     pub port: Option<u16>,
-    pub bearer_token_file: Option<std::path::PathBuf>,
+    pub access: super::GatewayAccess,
     pub allow_remote: bool,
     pub wrap: Option<String>,
     pub wrap_args: Vec<String>,
@@ -87,10 +87,8 @@ async fn start(options: HttpGatewayOptions) -> crate::GatewayResult<GatewayHandl
         routing,
         metrics: observation::Metrics::new(),
     });
-    let bearer = Arc::new(match &options.bearer_token_file {
-        Some(path) => access::Bearer::load_or_create(path)?,
-        None => access::Bearer::generate(),
-    });
+    let bearer = options.access.clone();
+    bearer.validate().await?;
     let mut app = Router::new();
     let paths: std::collections::BTreeSet<_> = state
         .routing
@@ -112,12 +110,7 @@ async fn start(options: HttpGatewayOptions) -> crate::GatewayResult<GatewayHandl
         hellas_rpc::telemetry::http::trace_request,
     ));
     let app = app.layer(access::BearerLayer::new(bearer.clone()));
-    let listener = super::bind_gateway(
-        &options.host,
-        options.port,
-        options.allow_remote && options.bearer_token_file.is_some(),
-    )
-    .await?;
+    let listener = super::bind_gateway(&options.host, options.port, options.allow_remote).await?;
     super::launch_gateway(
         app,
         listener,

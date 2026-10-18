@@ -108,13 +108,23 @@ let
     HTTPServer(("127.0.0.1", 18080), Handler).serve_forever()
   '';
 
-  # The gateway's routes require this run's credential, which it draws at
-  # startup, keeps in memory, and hands out in exactly one other place:
-  # the environment of a command it wraps. So the caller that exercises
-  # them is a wrapped child. It waits for the upstream mock, writes what
-  # the gateway answered into the unit's state directory — the private
-  # /tmp of a DynamicUser unit is not the test's /tmp — and then stays up,
-  # so the unit and its port remain observable for the rest of the test.
+  # Public fixture policy only; the private HTTP credential is created by an
+  # explicit offline bootstrap in the test unit before its listener starts.
+  gatewayAuthority = builtins.fromJSON (builtins.readFile ./gateway-authority.json);
+  gatewayBootstrap = pkgs.writeShellScript "gateway-authority-fixture" ''
+    set -eu
+    umask 077
+    ${package}/bin/hellas-cli --identity ./bootstrap.identity --software-root identity init
+    ${package}/bin/hellas-cli --identity ./bootstrap.identity admin bootstrap \
+      --root-grant 00000000000000000000000000000000 --journal ./http-authority \
+      --administrator ${pkgs.writeText "gateway-admin.json" (builtins.toJSON gatewayAuthority.administrator)} \
+      --credential-scope ${pkgs.writeText "gateway-scope.json" (builtins.toJSON gatewayAuthority.scope)} \
+      --credential-out ./http.credential
+    cp ${pkgs.writeText "gateway-profile.json" (builtins.toJSON gatewayAuthority.profile)} ./gateway-profile.json
+  '';
+
+  # The wrapped child receives the scoped credential, writes its results into
+  # the unit's state directory and stays alive while the test inspects the unit.
   gatewayProbe = pkgs.writeShellScript "gateway-proxy-probe" ''
     set -eu
     until ${pkgs.curl}/bin/curl -sS -o /dev/null -X POST \
@@ -412,6 +422,7 @@ in
         (mkBaseNode package)
         {
           environment.systemPackages = [ pkgs.python3 ];
+          systemd.services.hellas-gateway.serviceConfig.ExecStartPre = [ gatewayBootstrap ];
           services.hellas = {
             inherit package;
             environment.OPENAI_API_KEY = "proxy-secret";
@@ -419,6 +430,8 @@ in
             gateway = {
               enable = true;
               port = gatewayPort;
+              gatewayProfile = "/var/lib/hellas-gateway/gateway-profile.json";
+              identityPath = "/var/lib/hellas-gateway/bootstrap.identity";
               responsesBackend = "proxy";
               responsesProxyUrl = "http://127.0.0.1:18080/v1/responses";
               responsesProxyApiKeyEnv = "OPENAI_API_KEY";
@@ -462,7 +475,7 @@ in
       # before the proxy is asked for anything.
       refused = gateway.succeed("curl -sS -X POST -H 'content-type: application/json' -d '{\"model\":\"llama-local\",\"input\":\"hello\"}' http://127.0.0.1:${toString gatewayPort}/v1/responses")
       print(refused)
-      assert "per-run credential" in refused
+      assert "current gateway credential" in refused
       assert "proxied-ok" not in refused
     '';
   };

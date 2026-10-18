@@ -1,4 +1,5 @@
 use super::*;
+use crate::model::work::encode_kernel;
 
 impl ChannelRecord {
     /// What this step must leave room for in one checkpoint, when
@@ -323,7 +324,7 @@ pub(super) fn take_outcome(cursor: &mut Cursor<'_>) -> Result<TerminalOutcome, C
     })
 }
 
-pub(super) fn private_record<R: hellas_rpc::protocol::work::PrivateRecord>(
+pub(super) fn private_record<R: crate::model::work::PrivateRecord>(
     cursor: &mut Cursor<'_>,
 ) -> Result<R, ChannelStateError> {
     let bytes = cursor
@@ -389,19 +390,6 @@ pub(super) fn certificate(cursor: &mut Cursor<'_>) -> Result<EarnedCertificate, 
     }
 }
 
-/// Returns the kernel's own canonical encoding of a kernel value.
-///
-/// The journal holds these bytes and the wire carries them, and both
-/// take them from here: the signature beside a certificate is over the
-/// digest of this encoding, so a second speller of it would be a second
-/// definition of what was signed.
-pub(crate) fn encode_kernel<E: Encode>(value: &E) -> Vec<u8> {
-    let mut buf = vec![0_u8; value.encoded_size()];
-    let written = value.write_to(&mut buf);
-    buf.truncate(written);
-    buf
-}
-
 pub(super) fn decode_kernel<D: Decode>(bytes: &[u8]) -> Result<D, ChannelStateError> {
     D::decode_exact(bytes).map_err(|_| ChannelStateError::Malformed)
 }
@@ -412,7 +400,7 @@ impl Channel<PaymentFunding> {
     ///
     /// Not a summary, and the destructuring below is what keeps it from
     /// becoming one. Every field of this struct is named here and named
-    /// again in [`Self::decode_checkpoint`]'s literal, so a field added
+    /// again in `decode_checkpoint`'s literal, so a field added
     /// to [`Channel`] and forgotten here does not compile: the
     /// pattern is refused for the field it does not mention, and the
     /// literal for the field it cannot fill. The same holds one level

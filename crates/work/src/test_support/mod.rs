@@ -1,0 +1,422 @@
+use crate::model::{
+    fetch::*,
+    grant::{budget::*, records::*, *},
+    profile::*,
+};
+use crate::work_store::grant::NodeStore;
+use hellas_auth::authority::{GrantId, PrincipalId, Revision, UnixMillis};
+use hellas_auth::{Digest, ProducerSigningKey, PublicKey, Signature};
+use hellas_kernel::NetworkId;
+use hellas_rpc::*;
+use std::num::NonZeroU64;
+pub fn budget() -> BudgetNode {
+    BudgetNode::Subject {
+        pool: common_node::POOL,
+        subject: principal(1).0,
+    }
+}
+/// Authenticate another subject's credential as a session does, with its identity key.
+pub fn signed_caller(
+    authority: &hellas_auth::authority::AuthorityState,
+    secret: &hellas_auth::authority::CredentialSecret,
+    identity: &ProducerSigningKey,
+    now: UnixMillis,
+) -> hellas_auth::authority::AuthenticatedCaller {
+    let binding = hellas_auth::Digest::hash(b"test session");
+    let pending = authority.begin_authentication(binding, now).unwrap();
+    let signature = pending
+        .challenge()
+        .sign(authority.authority(), binding, secret.id(), identity)
+        .unwrap();
+    pending
+        .complete(authority, binding, secret, &signature, now)
+        .unwrap()
+        .into_caller()
+}
+pub fn network() -> NetworkId {
+    NetworkId::new("grants-fixture").unwrap()
+}
+pub fn principal(seed: u8) -> (PrincipalId, ProducerSigningKey) {
+    let key = ProducerSigningKey::from_secret_bytes([seed; 32]).unwrap();
+    (PrincipalId::from_public_key(key.public_key()).unwrap(), key)
+}
+
+pub fn software_enrollment(seed: u8, transport: [u8; 32]) -> ProviderEnrollmentBundle {
+    let key = ProducerSigningKey::from_secret_bytes([seed; 32]).unwrap();
+    enrollment(&key, &key, transport, [seed; 32])
+}
+
+/// Keep root, producer, transport and installation identities independent in fixtures.
+pub fn enrollment(
+    root: &ProducerSigningKey,
+    producer: &ProducerSigningKey,
+    transport: [u8; 32],
+    nonce: [u8; 32],
+) -> ProviderEnrollmentBundle {
+    let statement = ProviderGenesisStatement {
+        root_kind: RootKind::Software,
+        root_public_key: root.public_key(),
+        producer_public_key: producer.public_key(),
+        transport_public_key: PublicKey::Ed25519(transport),
+        platform_credential: PlatformCredential::Absent,
+        installation_nonce: nonce,
+    };
+    let proof = root
+        .sign_digest(Digest::hash(&statement.canonical_bytes()))
+        .unwrap();
+    ProviderEnrollmentBundle {
+        genesis: SignedProviderGenesis {
+            statement,
+            root_proof: RootProof::Software(proof),
+        },
+        platform: PlatformEnrollment::Absent,
+    }
+}
+pub fn policy() -> GrantPolicy {
+    let route = FetchRoutePolicy::sealed_route("openai", "responses").unwrap();
+    GrantPolicy {
+        resource: hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test resource")),
+        account: hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test account")),
+        revision: hellas_auth::authority::Revision(1),
+        name: "responses".into(),
+        work: WorkPolicy::Fetch {
+            contract: test_responses_contract(),
+            policy: FetchPolicyV2 {
+                allowed_environment: test_responses_contract().manifest_id(),
+                route_commitment: fetch_route_commitment(&route.canonical_body_bytes()).unwrap(),
+                max_request_body_bytes: 4096,
+                max_output_events: 64,
+                max_output_bytes: 1_048_576,
+                max_spool_bytes: 65_536,
+                max_encoded_result_frame: 262_144,
+                max_encoded_prepared_input: 1_048_576,
+            },
+            route,
+        },
+        https: None,
+        pricing: crate::model::grant::pricing::Pricing {
+            revision: hellas_auth::authority::Revision(1),
+            rates: None,
+        },
+        responses: Some(crate::model::grant::responses::ResponsesResource {
+            model: "fixture".into(),
+            max_output_tokens: 8,
+            settings: Default::default(),
+        }),
+    }
+}
+pub fn definition(id: GrantId, client: PrincipalId) -> GrantDef {
+    GrantDef {
+        id,
+        revision: Revision(1),
+        policies: vec![policy()],
+        budget: BudgetNode::Subject {
+            pool: common_node::POOL,
+            subject: client,
+        },
+        max_job_millis: NonZeroU64::new(10000).unwrap(),
+        enabled: true,
+        allow_account_backed: true,
+    }
+}
+
+pub fn chat_resource(origin: &str, max_output_tokens: u64) -> resource::HttpsResource {
+    resource::HttpsResource {
+        origin: origin.into(),
+        paths: vec!["/v1/chat/completions".into()],
+        methods: vec!["POST".into()],
+        credential: None,
+        tls: hellas_rpc::http_fetch::HttpTls {
+            roots: hellas_rpc::http_fetch::HttpTrustRoots::WebPki,
+            spki_sha256: vec![],
+        },
+        accounting: resource::AccountingProfile::OpenaiChat,
+        max_output_tokens,
+        max_response_bytes: 4096,
+    }
+}
+
+pub fn use_https(policy: &mut GrantPolicy, resource: resource::HttpsResource) {
+    if let WorkPolicy::Fetch {
+        policy, contract, ..
+    } = &mut policy.work
+    {
+        *contract = hellas_rpc::FetchContract::http().unwrap();
+        policy.allowed_environment = contract.manifest_id();
+    }
+    policy.responses = None;
+    policy.https = Some(resource);
+}
+pub const JOURNAL_AUTHORIZATION: hellas_auth::authority::GrantId = GrantId([237; 16]);
+pub async fn setup(
+    path: &std::path::Path,
+) -> (NodeStore, hellas_auth::authority::AuthenticatedCaller) {
+    let (mut store, secret) = setup_with_credential(path).await;
+    let application = execution_caller(&mut store, &secret, GrantId([0; 16])).await;
+    (store, application)
+}
+pub async fn execution_caller(
+    store: &mut NodeStore,
+    secret: &hellas_auth::authority::CredentialSecret,
+    root: GrantId,
+) -> hellas_auth::authority::AuthenticatedCaller {
+    let credential = execution_credential(store, secret, root).await;
+    let now = store.state().now();
+    signed_caller(store.state().authority(), &credential, &principal(1).1, now)
+}
+/// Issue principal 1's execution grant and app credential.
+pub async fn execution_credential(
+    store: &mut NodeStore,
+    secret: &hellas_auth::authority::CredentialSecret,
+    root: GrantId,
+) -> hellas_auth::authority::CredentialSecret {
+    use hellas_auth::authority as auth;
+    let now = store.state().now();
+    let administrator = store.state().authority().authenticate(secret, now).unwrap();
+    let mut scope = store
+        .state()
+        .authority()
+        .grant(root)
+        .unwrap()
+        .spec()
+        .clone();
+    scope.subject = principal(1).0;
+    scope.permissions = [auth::Permission {
+        operation: auth::OperationId::new(crate::grant_service::WORK_EXECUTE).unwrap(),
+        resource: crate::grant_service::allowance_resource(scope.authority, GrantId([1; 16])),
+    }]
+    .into();
+    scope.issuance = None;
+    scope.delegation_depth = 1;
+    let [secret] = credentials::issue(
+        credentials::Issuer::Store(store, now),
+        &administrator,
+        root,
+        Some(JOURNAL_AUTHORIZATION),
+        scope,
+    )
+    .await;
+    secret
+}
+pub async fn setup_with_credential(
+    path: &std::path::Path,
+) -> (NodeStore, hellas_auth::authority::CredentialSecret) {
+    let (store, secret) = common_node::bootstrap_node_with_credential(
+        path,
+        network(),
+        Some(crate::test_support::software_enrollment(2, [2; 32])),
+        UnixMillis(1000),
+    )
+    .await
+    .unwrap();
+    let requests = |amount| {
+        vec![Limit {
+            meter: Meter::Requests,
+            window: Window::Total,
+            amount,
+        }]
+    };
+    let store = common_node::provision(
+        path,
+        store,
+        &secret,
+        principal(2).1,
+        (4, requests(4)),
+        definition(GrantId([1; 16]), principal(1).0),
+        (requests(3), 2),
+    )
+    .await;
+    (store, secret)
+}
+pub fn proposal(
+    store: &NodeStore,
+    nonce: u64,
+) -> (GrantJobAuthorizationV1, Signature, PreparedWorkInput) {
+    proposal_for(store, GrantId([1; 16]), nonce, principal(1).1)
+}
+pub fn proposal_for(
+    store: &NodeStore,
+    id: GrantId,
+    nonce: u64,
+    key: ProducerSigningKey,
+) -> (GrantJobAuthorizationV1, Signature, PreparedWorkInput) {
+    let def = store.state().grant(id).unwrap();
+    let client = PrincipalId::from_public_key(key.public_key()).unwrap();
+    let channel = store.state().channel_id(id, client).unwrap();
+    let environment = if def.policies[0].https.is_some() {
+        hellas_rpc::FetchContract::http().unwrap()
+    } else {
+        test_responses_contract()
+    };
+    let body = if let Some(resource) = &def.policies[0].https {
+        serde_json::to_vec(&hellas_rpc::http_fetch::HttpFetchRequest {
+            url: format!("{}{}", resource.origin, resource.paths[0]),
+            method: "POST".into(),
+            headers: vec![],
+            body_base64: "eyJtYXhfdG9rZW5zIjo4fQ==".into(),
+            tls: resource.tls.clone(),
+            credential: resource.credential.clone(),
+            max_response_bytes: resource.max_response_bytes,
+        })
+        .unwrap()
+    } else {
+        br#"{"model":"fixture","input":"never-journal-this-body","max_output_tokens":8}"#.to_vec()
+    };
+    let events = hellas_rpc::fetch::build_input_events_with_retention(
+        "openai",
+        "responses",
+        &body,
+        environment.manifest_id(),
+        Assurance::ProducerSigned,
+        &key,
+        Retention::Ephemeral,
+    )
+    .unwrap();
+    let input: PreparedWorkInput = PreparedPaidFetchInputV1::new(&events, &environment)
+        .unwrap()
+        .into();
+    let a = GrantJobAuthorizationV1 {
+        channel_id: channel,
+        generation: store.state().generation(id).unwrap(),
+        grant_id: id,
+        grant_revision: def.revision,
+        resource_id: def.policies[0].resource,
+        resource_revision: def.policies[0].revision,
+        pricing_revision: def.policies[0].pricing.revision,
+        work_policy_digest: def.policies[0].work.digest(network(), channel.0),
+        prepared_input_digest: input.bound_digest(network(), channel.0).unwrap(),
+        proposal_nonce: nonce,
+        acceptance_deadline_ms: UnixMillis(2_000),
+        request_commitment: RequestCommitment::from_digest(
+            input.input_commitment().unwrap().digest(),
+        ),
+        environment_commitment: environment.manifest_id(),
+        terminal_deadline_ms: UnixMillis(4_000),
+        delivery_deadline_ms: UnixMillis(5_000),
+    };
+    (
+        a,
+        key.sign_digest(grant_work_id(network(), &a)).unwrap(),
+        input,
+    )
+}
+
+pub mod common_node;
+
+/// Every file under `root`, so a privacy scan also reads a database's
+/// `-wal` and `-shm` companions.
+pub fn all_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut paths = Vec::new();
+    for entry in std::fs::read_dir(root).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            paths.extend(all_files(&path));
+        } else {
+            paths.push(path);
+        }
+    }
+    paths
+}
+
+pub fn test_responses_contract() -> hellas_rpc::FetchContract {
+    hellas_rpc::FetchContract::new(
+        "openai-responses-0.0.2",
+        hellas_rpc::FetchSchema::StatelessResponsesV1,
+        "openai-responses-driver-0.0.1",
+        hellas_rpc::FetchEgress::FixedHttps("https://api.openai.com/v1/responses".into()),
+    )
+    .unwrap()
+}
+
+pub mod backend;
+pub mod credentials;
+pub mod transport;
+
+/// Raw store operations used by accounting tests; preserve the caller and simulated time.
+pub async fn accept(
+    store: &mut NodeStore,
+    caller: &hellas_auth::authority::AuthenticatedCaller,
+    request: (GrantJobAuthorizationV1, Signature, &PreparedWorkInput),
+    now: u64,
+) -> Result<Signature, crate::work_store::grant::NodeStoreError> {
+    store
+        .accept(
+            (caller, JOURNAL_AUTHORIZATION),
+            request.0,
+            request.1,
+            request.2,
+            &principal(2).1,
+            UnixMillis(now),
+        )
+        .await
+}
+pub async fn dispatch(
+    store: &mut NodeStore,
+    caller: &hellas_auth::authority::AuthenticatedCaller,
+    job: (ChannelId, Digest),
+    now: u64,
+) -> Result<(), crate::work_store::grant::NodeStoreError> {
+    store
+        .dispatch(
+            (caller, JOURNAL_AUTHORIZATION),
+            job.0,
+            job.1,
+            UnixMillis(now),
+        )
+        .await
+}
+pub async fn finish(
+    store: &mut NodeStore,
+    job: (ChannelId, Digest),
+    outcome: crate::work_store::grant::GrantOutcome,
+    usage: Usage,
+    now: u64,
+) -> Result<(), crate::work_store::grant::NodeStoreError> {
+    store
+        .finish(job.0, job.1, outcome, None, usage, UnixMillis(now))
+        .await
+}
+pub fn used(store: &NodeStore, node: BudgetNode, meter: Meter) -> u64 {
+    store
+        .state()
+        .ledger()
+        .node(node)
+        .unwrap()
+        .counter(meter, Window::Total)
+        .used
+}
+pub async fn reopen(
+    path: &std::path::Path,
+    now: u64,
+) -> Result<NodeStore, crate::work_store::grant::NodeStoreError> {
+    NodeStore::open(
+        path,
+        network(),
+        Some(crate::test_support::software_enrollment(2, [2; 32])),
+        UnixMillis(now),
+    )
+    .await
+}
+
+pub use hellas_auth::{
+    assert_err,
+    test_support::{Actor, Rights, actors},
+};
+pub mod ids {
+    pub use hellas_auth::test_support::ids::*;
+    pub const ALLOWANCE: hellas_auth::authority::GrantId =
+        hellas_auth::authority::GrantId([100; 16]);
+    pub const LAPTOP_ALLOWANCE: hellas_auth::authority::GrantId =
+        hellas_auth::authority::GrantId([101; 16]);
+    pub const NEW_ALLOWANCE: hellas_auth::authority::GrantId =
+        hellas_auth::authority::GrantId([102; 16]);
+}
+mod node;
+pub use node::{
+    Allowance, Capacity, Node, Proposal, TestClock, TestNode, TestService, WAIT, authority,
+    provider_enrollment, within,
+};
+
+pub mod evaluate;
+
+pub mod paid;

@@ -22,3 +22,4 @@ windows-sys = { version = "0.61", features = [
 
 [dependencies]
 tempfile.workspace = true
+zeroize = "1.9"

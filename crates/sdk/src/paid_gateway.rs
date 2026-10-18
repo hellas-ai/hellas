@@ -5,8 +5,8 @@ use crate::paid_client::{
     check_evaluate_input, check_request,
 };
 use hellas_kernel::Secp256k1Signer;
-use hellas_rpc::protocol::artifacts::PreparedPaidInputV1;
-use hellas_rpc::protocol::work_setup::ProviderChannelPolicy;
+use hellas_work::model::prepared_input::PreparedPaidInputV1;
+use hellas_work::model::setup::ProviderChannelPolicy;
 use hellas_work::work_store::journal::MAX_RECORD_BYTES;
 use iroh::EndpointId;
 use std::sync::atomic::AtomicBool;
@@ -23,7 +23,7 @@ use hellas_gateway::{
     ExecutionEvent, Outcome, WorkExecutionBackend, WorkExecutionRequest, WorkFetchRequest,
 };
 use hellas_rpc::output::OutputEvent as FetchEvent;
-use hellas_rpc::protocol::work_profile::{PreparedWorkInput, WorkPolicy};
+use hellas_work::model::profile::{PreparedWorkInput, WorkPolicy};
 use iroh::Endpoint;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -187,7 +187,7 @@ pub struct PaidGateway {
     endpoint: Endpoint,
     node: crate::FullNode,
     settlement_key: Secp256k1Signer,
-    producer_key: hellas_rpc::ProducerSigningKey,
+    producer_key: hellas_auth::ProducerSigningKey,
     admission: Arc<Semaphore>,
     tasks: crate::gateway_work::WorkTasks,
 }
@@ -378,7 +378,7 @@ impl PaidGateway {
                             }
                         }
                     };
-                    if prepared.is_none() && !has_retained_setup(&provider.args)? {
+                    if prepared.is_none() && !has_retained_setup(&provider.args).await? {
                         continue;
                     }
                     // Recheck after queueing, including restored channels whose
@@ -441,8 +441,8 @@ impl PaidGateway {
                     // ClientEndpoint journals the proposal nonce before releasing
                     // its signature. Recovery and a failed dial need not propose
                     // this request; a lost acceptance response does advance it.
-                    let proposal_nonce = session.with_state(|state| state.proposal_nonce_high_water())?;
-                    let already_proposed = session.with_state(|state| prepared_bytes.as_ref().is_some_and(|input| state.jobs().any(|job| job.prepared_input() == input)))?;
+                    let proposal_nonce = session.with_state(|state| state.proposal_nonce_high_water()).await?;
+                    let already_proposed = session.with_state(|state| prepared_bytes.as_ref().is_some_and(|input| state.jobs().any(|job| job.prepared_input() == input))).await?;
                     let request_session = &mut *session;
                     let input = prepared.clone();
                     let on_progress = streamed.then(|| progress.clone());
@@ -457,7 +457,7 @@ impl PaidGateway {
                         .map(Option::unwrap_or_default);
                     if let Err(error) = &result {
                         if !recovery && matches!(error, PoolError::Stopped(_))
-                            && session.with_state(|state| state.proposal_nonce_high_water())? == proposal_nonce
+                            && session.with_state(|state| state.proposal_nonce_high_water()).await? == proposal_nonce
                         {
                             return result;
                         }
@@ -474,7 +474,7 @@ impl PaidGateway {
                             PoolError::Client(PaidClientError::Propose(hellas_work::work::ProposeError::Store(_))),
                         );
                         if !already_proposed && !uncertain_append
-                            && session.with_state(|state| state.proposal_nonce_high_water())? == proposal_nonce
+                            && session.with_state(|state| state.proposal_nonce_high_water()).await? == proposal_nonce
                         {
                             provider.connection_failed();
                             tracing::debug!(provider = %provider.args.provider, error = %format!("{error:#}"),
@@ -517,11 +517,12 @@ impl PaidGateway {
     }
 }
 
-fn has_retained_setup(options: &PaidWorkOptions) -> Result<bool> {
+async fn has_retained_setup(options: &PaidWorkOptions) -> Result<bool> {
     let found = hellas_work::work_store::discover_setups(
         &options.journal_root,
         options.config.chain.network,
-    )?;
+    )
+    .await?;
     // Counter files and other metadata alone must never trigger channel funding.
     // Unidentified setup journals still go through ordinary recovery and fail
     // closed; discovery is only a prefilter, not a signature check.
@@ -533,8 +534,8 @@ fn has_retained_setup(options: &PaidWorkOptions) -> Result<bool> {
 
 impl WorkExecutionBackend for PaidGateway {
     fn fetch_providers(&self) -> Vec<EndpointId> {
-        self.providers.iter().filter(|provider| matches!(provider.policy.work_policy,
-            WorkPolicy::Fetch { policy, .. } if policy.allowed_environment == hellas_rpc::FetchEnvironment::Http.manifest_id()))
+        self.providers.iter().filter(|provider| matches!(&provider.policy.work_policy,
+            WorkPolicy::Fetch { contract, .. } if contract.schema() == hellas_rpc::FetchSchema::HttpV1))
             .map(|provider| provider.args.provider).collect()
     }
 
@@ -702,31 +703,23 @@ async fn before_proposal<T, F: std::future::Future<Output = T>, E>(
 fn prepare_fetch(
     options: &PaidWorkOptions,
     request: &WorkFetchRequest,
-    signer: &hellas_rpc::ProducerSigningKey,
+    signer: &hellas_auth::ProducerSigningKey,
 ) -> Result<PreparedWorkInput> {
-    use hellas_rpc::FetchEnvironment;
-    let environment = [
-        FetchEnvironment::Http,
-        FetchEnvironment::OpenAiResponses,
-        FetchEnvironment::CodexResponses,
-    ]
-    .into_iter()
-    .find(|env| env.manifest_id() == options.config.work_policy.allowed_environment())
-    .ok_or(PoolError::NoMatchingPolicy)?;
+    let WorkPolicy::Fetch { contract, .. } = &options.config.work_policy else {
+        return Err(PoolError::NoMatchingPolicy);
+    };
+    options.config.work_policy.check()?;
     let input = hellas_rpc::fetch::build_input_events_with_retention(
         &request.service,
         &request.method,
         &request.body,
-        environment.manifest_id(),
+        contract.manifest_id(),
         options.provider_trust.required_assurance,
         signer,
         hellas_rpc::Retention::Ephemeral,
     )?;
-    let prepared = hellas_rpc::protocol::work_fetch::PreparedPaidFetchInputV1::new(
-        &input,
-        &environment.manifest(),
-    )?
-    .into();
+    let prepared =
+        hellas_work::model::fetch::PreparedPaidFetchInputV1::new(&input, contract)?.into();
     check_request(
         &options.config.provider_policy(),
         &prepared,
@@ -742,13 +735,12 @@ fn prepare_request(
 ) -> Result<PreparedPaidInputV1> {
     Ok(crate::gateway_work::prepare_evaluate(
         request,
-        hellas_rpc::PublicKey::Secp256k1(signer.party_key().to_bytes()),
+        hellas_auth::PublicKey::Secp256k1(signer.party_key().to_bytes()),
     )?)
 }
 
 fn output_events(output: PaidWorkResult) -> Result<Vec<ExecutionEvent>> {
-    let events =
-        hellas_rpc::protocol::work::decode_transcript(&output.transcript, MAX_RECORD_BYTES)?;
+    let events = hellas_work::model::work::decode_transcript(&output.transcript, MAX_RECORD_BYTES)?;
     let verified = hellas_rpc::evaluate::verify_output_events_for_producer(
         output.input,
         hellas_rpc::Assurance::ProducerSigned,
@@ -806,9 +798,9 @@ impl GatewayEvent for FetchEvent {
         )?)
     }
     fn completed(output: PaidWorkResult) -> Result<Vec<Self>> {
-        let events = hellas_rpc::protocol::work::decode_transcript(
+        let events = hellas_work::model::work::decode_transcript(
             &output.transcript,
-            hellas_rpc::protocol::work_fetch::MAX_FETCH_TRANSCRIPT_BYTES,
+            hellas_work::model::fetch::MAX_FETCH_TRANSCRIPT_BYTES,
         )?;
         let terminal = events
             .last()
@@ -829,6 +821,9 @@ impl GatewayEvent for FetchEvent {
         serde_json::to_vec(self).map_or(MAX_RECORD_BYTES, |bytes| bytes.len())
     }
 }
+
+#[cfg(test)]
+use hellas_work::test_support::test_responses_contract;
 
 #[cfg(test)]
 mod tests {
@@ -889,7 +884,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             input.execution_environment,
-            hellas_rpc::FetchEnvironment::OpenAiResponses.manifest_id()
+            test_responses_contract().manifest_id()
         );
         let gateway = PaidGateway::open(options, identity, node.clone())
             .await
@@ -906,11 +901,55 @@ mod tests {
     }
 
     #[test]
-    fn counter_files_do_not_trigger_funding_but_incomplete_setup_recovers() {
+    fn supported_contract_is_prepared_without_vendor_dispatch_and_stale_terms_deny() {
+        let fixture = crate::test_support::PaidFixture::new();
+        let mut options = pool_options(&fixture);
+        let contract = hellas_rpc::FetchContract::new(
+            "independent-responses-1",
+            hellas_rpc::FetchSchema::StatelessResponsesV1,
+            "independent-driver-1",
+            hellas_rpc::FetchEgress::FixedHttps("https://example.com/responses".into()),
+        )
+        .unwrap();
+        let WorkPolicy::Fetch {
+            contract: selected,
+            policy,
+            ..
+        } = &mut options.providers[0].config.work_policy
+        else {
+            panic!("Fetch fixture")
+        };
+        *selected = contract.clone();
+        policy.allowed_environment = contract.manifest_id();
+        let identity = crate::ClientIdentity::from_secret_bytes([1; 32], [1; 32]).unwrap();
+        let request = WorkFetchRequest {
+            provider: options.providers[0].provider,
+            service: "openai".into(),
+            method: "responses".into(),
+            body: crate::test_support::BODY.to_vec(),
+        };
+        assert!(prepare_fetch(&options.providers[0], &request, identity.caller_key()).is_err());
+        options.providers[0].provider_trust.allowed_environments = vec![contract.manifest_id()];
+        let prepared =
+            prepare_fetch(&options.providers[0], &request, identity.caller_key()).unwrap();
+        let PreparedWorkInput::Fetch(prepared) = prepared else {
+            panic!("Fetch input")
+        };
+        assert_eq!(prepared.parts().unwrap().contract, contract);
+        let WorkPolicy::Fetch { policy, .. } = &mut options.providers[0].config.work_policy else {
+            panic!("Fetch fixture")
+        };
+        policy.allowed_environment = hellas_rpc::ContentId::from_bytes([99; 32]);
+        assert!(prepare_fetch(&options.providers[0], &request, identity.caller_key()).is_err());
+        assert!(!fixture.root.path().join("client").exists());
+    }
+
+    #[tokio::test]
+    async fn counter_files_do_not_trigger_funding_but_incomplete_setup_recovers() {
         let fixture = crate::test_support::PaidFixture::new();
         let options = pool_options(&fixture);
         let provider = &options.providers[0];
-        assert!(!has_retained_setup(provider).unwrap());
+        assert!(!has_retained_setup(provider).await.unwrap());
         std::fs::create_dir_all(provider.journal_root.join("apple-counters")).unwrap();
         std::fs::write(
             provider
@@ -919,7 +958,7 @@ mod tests {
             [1],
         )
         .unwrap();
-        assert!(!has_retained_setup(provider).unwrap());
+        assert!(!has_retained_setup(provider).await.unwrap());
         let store = hellas_work::work_store::SetupStore::open(
             &provider.journal_root,
             provider.config.chain.network,
@@ -927,9 +966,10 @@ mod tests {
             hellas_work::work_store::Role::Client,
             &hellas_kernel::Secp256k1Verifier::new(),
         )
+        .await
         .unwrap();
         drop(store);
-        assert!(has_retained_setup(provider).unwrap());
+        assert!(has_retained_setup(provider).await.unwrap());
     }
 
     #[tokio::test]
@@ -1092,7 +1132,7 @@ mod tests {
                 .await
                 .unwrap(),
             settlement_key: Secp256k1Signer::from_secret_scalar([7; 32]).unwrap(),
-            producer_key: hellas_rpc::ProducerSigningKey::from_secret_bytes([7; 32]).unwrap(),
+            producer_key: hellas_auth::ProducerSigningKey::from_secret_bytes([7; 32]).unwrap(),
             admission: Arc::new(Semaphore::new(1)),
             tasks: crate::gateway_work::WorkTasks::default(),
         };

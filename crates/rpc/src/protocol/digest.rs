@@ -4,7 +4,7 @@ use std::str::FromStr;
 
 use hellas_xet::XetHashError;
 
-pub use hellas_auth::{Digest, hash_tuple};
+use hellas_auth::Digest;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -55,6 +55,7 @@ impl fmt::Display for ContentId {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hellas_auth::hash_tuple;
 
     #[test]
     fn hash_tuple_is_length_delimited() {
@@ -78,5 +79,18 @@ mod tests {
         assert_eq!(bytes, [&[0x58, 0x20][..], &[7; 32][..]].concat());
         let decoded: Digest = serde_ipld_dagcbor::from_slice(&bytes).unwrap();
         assert_eq!(decoded, digest);
+        let array = serde_ipld_dagcbor::to_vec(&[7u8; 32]).unwrap();
+        assert!(serde_ipld_dagcbor::from_slice::<Digest>(&array).is_err());
+        for length in [31, 32, 33] {
+            let sequence = serde::de::value::SeqDeserializer::<_, serde::de::value::Error>::new(
+                std::iter::repeat_n(7u8, length),
+            );
+            let decoded = Digest::deserialize(sequence);
+            if length == 32 {
+                assert_eq!(decoded.unwrap(), digest);
+            } else {
+                assert!(decoded.is_err());
+            }
+        }
     }
 }

@@ -1,4 +1,8 @@
-use std::{fs::OpenOptions, io, path::Path};
+use std::{
+    fs::OpenOptions,
+    io::{self, Read as _},
+    path::Path,
+};
 
 /// Opens a local regular file without first opening a FIFO or device for I/O.
 ///
@@ -18,6 +22,37 @@ pub fn open_regular_file(path: &Path) -> io::Result<std::fs::File> {
     open_regular_file_impl(path)
 }
 
+/// Open a regular configuration file while refusing a final symlink/reparse
+/// point. Unlike `open_nofollow`, a FIFO cannot block this operation. Linux
+/// retains the descriptor-first type check used by `open_regular_file`.
+pub fn open_regular_file_nofollow(path: &Path) -> io::Result<std::fs::File> {
+    #[cfg(target_os = "linux")]
+    {
+        let handle = open_path_handle_flags(path, libc::O_NOFOLLOW)?;
+        reopen_regular_path_handle(path, &handle)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        if !std::fs::symlink_metadata(path)?.is_file() {
+            return Err(not_a_regular_file(path));
+        }
+        #[cfg(unix)]
+        let file = {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+                .open(path)?
+        };
+        #[cfg(not(unix))]
+        let file = crate::open_nofollow(path)?;
+        if !file.metadata()?.is_file() {
+            return Err(not_a_regular_file(path));
+        }
+        Ok(file)
+    }
+}
+
 fn not_a_regular_file(path: &Path) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
@@ -34,6 +69,11 @@ fn open_regular_file_impl(path: &Path) -> io::Result<std::fs::File> {
 /// Acquires an inode reference without invoking the target's file operations.
 #[cfg(target_os = "linux")]
 fn open_path_handle(path: &Path) -> io::Result<std::fs::File> {
+    open_path_handle_flags(path, 0)
+}
+
+#[cfg(target_os = "linux")]
+fn open_path_handle_flags(path: &Path, extra_flags: i32) -> io::Result<std::fs::File> {
     use std::ffi::CString;
     use std::os::fd::FromRawFd as _;
     use std::os::unix::ffi::OsStrExt as _;
@@ -45,7 +85,7 @@ fn open_path_handle(path: &Path) -> io::Result<std::fs::File> {
     loop {
         // SAFETY: path is NUL-terminated and live for the call. These flags
         // do not create a file, so open needs no variadic mode argument.
-        let fd = unsafe { libc::open(path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+        let fd = unsafe { libc::open(path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC | extra_flags) };
         if fd >= 0 {
             // SAFETY: open returned a new descriptor, owned only here.
             return Ok(unsafe { std::fs::File::from_raw_fd(fd) });
@@ -157,27 +197,69 @@ fn open_regular_file_impl(path: &Path) -> io::Result<std::fs::File> {
     Ok(file)
 }
 
-/// Read a regular file with a one-byte sentinel so concurrent growth cannot
-/// turn a bounded configuration read into an unbounded allocation.
+/// Read at most `maximum` bytes and require EOF, including after concurrent growth.
+pub fn read_bounded(reader: impl io::Read, maximum: usize) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    read_bounded_into(reader, maximum, &mut bytes)?;
+    Ok(bytes)
+}
+
+fn read_bounded_into(
+    mut reader: impl io::Read,
+    maximum: usize,
+    bytes: &mut Vec<u8>,
+) -> io::Result<()> {
+    reader.by_ref().take(maximum as u64).read_to_end(bytes)?;
+    // Keep one spare byte in the private buffer, and probe EOF separately so
+    // filling it cannot reallocate and leave a previous secret allocation behind.
+    let mut extra = zeroize::Zeroizing::new(Vec::with_capacity(2));
+    reader.take(1).read_to_end(&mut extra)?;
+    if !extra.is_empty() {
+        return Err(too_large());
+    }
+    Ok(())
+}
+fn too_large() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, ReadLimit)
+}
+
+#[derive(Debug)]
+pub struct ReadLimit;
+impl std::fmt::Display for ReadLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("file exceeds byte limit")
+    }
+}
+impl std::error::Error for ReadLimit {}
+
+/// The caller selects whether to follow a link when opening the regular file.
+/// Secret bytes are cleared on errors as well as when the returned buffer drops.
+pub fn read_private_bounded(
+    file: std::fs::File,
+    maximum: usize,
+) -> io::Result<zeroize::Zeroizing<Vec<u8>>> {
+    if !crate::is_private(&file)? {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "file must be private",
+        ));
+    }
+    if file.metadata()?.len() > maximum as u64 {
+        return Err(too_large());
+    }
+    let capacity = maximum.checked_add(1).ok_or_else(too_large)?;
+    let mut bytes = zeroize::Zeroizing::new(Vec::with_capacity(capacity));
+    read_bounded_into(file, maximum, &mut bytes)?;
+    Ok(bytes)
+}
+
+/// Open and bound a regular file; path replacements cannot substitute a FIFO.
 pub fn read_bounded_regular_file(path: &Path, maximum: usize) -> io::Result<Vec<u8>> {
-    use io::Read as _;
     let file = open_regular_file(path)?;
     if file.metadata()?.len() > maximum as u64 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "file exceeds byte limit",
-        ));
+        return Err(too_large());
     }
-    let mut bytes = Vec::new();
-    file.take((maximum as u64).saturating_add(1))
-        .read_to_end(&mut bytes)?;
-    if bytes.len() > maximum {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "file exceeds byte limit",
-        ));
-    }
-    Ok(bytes)
+    read_bounded(file, maximum)
 }
 
 #[cfg(test)]

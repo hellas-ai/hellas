@@ -1,14 +1,12 @@
 use super::*;
+use hellas_auth::{ProducerSigningKey, Signature};
 use hellas_rpc::evaluate::{
     EvaluateOutputTranscriptBuilder, EvaluateProtocolError, EvaluateStopReason, EvaluateTerminal,
     EvaluateUsage, encode_terminal_payload, input_commitment,
 };
 use hellas_rpc::execution_event::{WorkChunk, WorkEvent, WorkFailed, WorkFinished, work_event};
 use hellas_rpc::stream::output_event_to_pb;
-use hellas_rpc::{
-    ContentId, EvaluateRequest, OutputTranscriptBuilder, ProducerSigningKey, Signature,
-    SignedOutputEvent,
-};
+use hellas_rpc::{ContentId, EvaluateRequest, OutputTranscriptBuilder, SignedOutputEvent};
 
 const TEST_ASSURANCE: Assurance = Assurance::ProducerSigned;
 

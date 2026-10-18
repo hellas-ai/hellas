@@ -307,6 +307,7 @@ fn round7_general_ids_cannot_block_response() {
                 request.clone(),
                 TransportContext {
                     peer: Some(PeerIdentity(bytes)),
+                    auth_level: hellas_wire::AuthLevel::Vouched,
                     ..TransportContext::default()
                 },
             )
@@ -322,6 +323,7 @@ fn round7_general_ids_cannot_block_response() {
             request,
             TransportContext {
                 peer: Some(PeerIdentity([0xff; 32])),
+                auth_level: hellas_wire::AuthLevel::Vouched,
                 ..TransportContext::default()
             },
         )
@@ -337,6 +339,7 @@ fn round7_general_ids_cannot_block_response() {
             SubmitWorkResponseRequest {
                 response: response_bytes,
             },
+            TransportContext::default(),
         )
         .await
         .expect("response route is independent of general identities");

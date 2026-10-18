@@ -99,7 +99,9 @@ async fn remote_context_and_detached_job_share_trace_and_stream_lifetime() {
                     )
                     .await
                     .unwrap();
-                    Ok(futures_util::stream::iter([Ok(result)]))
+                    Ok(call::ResponseStream::new(futures_util::stream::iter([Ok(
+                        result,
+                    )])))
                 },
             )
             .await

@@ -1,8 +1,10 @@
 use super::*;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use hellas_auth::authority::{GrantId, Revision, UnixMillis};
+use hellas_auth::{Digest, ProducerSigningKey};
 use hellas_rpc::{
-    Digest, ProducerSigningKey, ProviderEnrollmentBundle, ProviderGenesisStatement, RootProof,
-    SignedProviderGenesis, pb::execute::open_response, signature_wire::signature_to_pb,
+    ProviderEnrollmentBundle, ProviderGenesisStatement, RootProof, SignedProviderGenesis,
+    pb::execute::open_response, signature_wire::signature_to_pb,
 };
 use p256::ecdsa::{
     Signature as P256Signature, SigningKey as P256SigningKey, signature::Signer as _,
@@ -51,6 +53,7 @@ fn signed_open_response(
     let signature = producer.sign_digest(binding).unwrap();
     (
         ProviderTrustAnchor {
+            allowed_environments: vec![],
             expected_genesis,
             required_assurance: Assurance::ProducerSigned,
             apple_app_attest: None,
@@ -207,6 +210,7 @@ fn apple_open_response_for_alpn(
     });
     (
         ProviderTrustAnchor {
+            allowed_environments: vec![],
             expected_genesis,
             required_assurance: Assurance::AppleAppAttest,
             apple_app_attest: Some(apple),
@@ -457,23 +461,55 @@ fn paid_services_app_attest_binds_the_exact_connection_and_service() {
 #[test]
 fn apple_offer_pin_verifies_static_root_policy_then_open_and_result() {
     use crate::{FetchChunkVerifier, ProducerTrust, UnpinnedOffer};
-    use hellas_rpc::protocol::work_grant::{records::*, *};
-    use std::num::{NonZeroU16, NonZeroU64};
+    use hellas_work::model::grant::{records::*, *};
+    use std::num::NonZeroU64;
     let counters = Arc::new(TestCounterStore::default());
     let (trust, response, public_key) =
         apple_open_response(&[5; 32], &[6; 32], 2, counters.clone());
     let bundle =
         ProviderEnrollmentBundle::from_canonical_bytes(&response.provider_genesis).unwrap();
     assert!(
-        Principal::verify(bundle.clone()).is_err(),
+        verify_contact(&bundle).is_err(),
         "platform roots remain provider-only"
     );
     let (_, software) = signed_open_response(&[5; 32], &[6; 32]);
-    let client = Principal::verify(
-        ProviderEnrollmentBundle::from_canonical_bytes(&software.provider_genesis).unwrap(),
-    )
-    .unwrap();
+    let client = principal_id(&decode_contact(&software.provider_genesis).unwrap()).unwrap();
     let producer = ProducerSigningKey::from_secret_bytes([2; 32]).unwrap();
+    let route =
+        hellas_work::model::fetch::FetchRoutePolicy::sealed_route("openai", "responses").unwrap();
+    let policy = GrantPolicy {
+        resource: hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test resource")),
+        account: hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test account")),
+        revision: hellas_auth::authority::Revision(1),
+        name: "responses".into(),
+        https: None,
+        pricing: hellas_work::model::grant::pricing::Pricing {
+            revision: hellas_auth::authority::Revision(1),
+            rates: None,
+        },
+        responses: Some(hellas_work::model::grant::responses::ResponsesResource {
+            model: "fixture".into(),
+            max_output_tokens: 8,
+            settings: Default::default(),
+        }),
+        work: hellas_work::model::profile::WorkPolicy::Fetch {
+            contract: test_responses_contract(),
+            policy: hellas_work::model::fetch::FetchPolicyV2 {
+                allowed_environment: test_responses_contract().manifest_id(),
+                route_commitment: hellas_work::model::fetch::fetch_route_commitment(
+                    &route.canonical_body_bytes(),
+                )
+                .unwrap(),
+                max_request_body_bytes: 4096,
+                max_output_events: 64,
+                max_output_bytes: 65536,
+                max_spool_bytes: 131072,
+                max_encoded_result_frame: 131072,
+                max_encoded_prepared_input: 65536,
+            },
+            route,
+        },
+    };
     let offer = SignedOffer::sign(
         Offer {
             network: grant_network(),
@@ -481,13 +517,13 @@ fn apple_offer_pin_verifies_static_root_policy_then_open_and_result() {
             grant: GrantDef {
                 id: GrantId([1; 16]),
                 revision: Revision(1),
-                kind: GrantKind::Owner(client.clone()),
-                policies: vec![],
-                limits: vec![],
+                policies: vec![policy],
+                budget: budget::BudgetNode::Subject {
+                    pool: budget::PoolId([1; 16]),
+                    subject: client,
+                },
                 max_job_millis: NonZeroU64::new(1000).unwrap(),
-                max_in_flight: NonZeroU16::new(1).unwrap(),
-                expires: None,
-                state: GrantState::Active,
+                enabled: true,
                 allow_account_backed: true,
             },
             generation: 0,
@@ -498,8 +534,7 @@ fn apple_offer_pin_verifies_static_root_policy_then_open_and_result() {
         &producer,
     )
     .unwrap();
-    let import =
-        || UnpinnedOffer::decode(&offer.encode().unwrap(), client.id(), UnixMillis(1000)).unwrap();
+    let import = || UnpinnedOffer::decode(&offer.encode().unwrap(), UnixMillis(1000)).unwrap();
     let pinned = import().pin(&trust).unwrap();
     import().pin(&trust).unwrap();
     assert!(
@@ -551,3 +586,5 @@ fn apple_offer_pin_verifies_static_root_policy_then_open_and_result() {
         verify_open_response(&trust, &[5; 32], &[6; 32], ALPN, ENROLLED_PEER, response).is_err()
     );
 }
+
+use hellas_work::test_support::test_responses_contract;

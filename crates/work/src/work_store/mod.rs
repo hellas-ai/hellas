@@ -10,7 +10,7 @@ pub mod grant;
 pub mod journal;
 pub mod setup;
 
-mod cursor;
+use hellas_kernel::Cursor;
 
 pub use channel::{
     Channel, ChannelRecord, ChannelStateError, ChannelStore, CloseSettlement, FinalizedHeight,
@@ -69,9 +69,9 @@ pub(crate) fn put_option<T>(
 
 /// Reads back exactly what [`put_option`] wrote.
 pub(crate) fn take_option<T, E>(
-    cursor: &mut cursor::Cursor<'_>,
+    cursor: &mut Cursor<'_>,
     malformed: E,
-    body: impl FnOnce(&mut cursor::Cursor<'_>) -> Result<T, E>,
+    body: impl FnOnce(&mut Cursor<'_>) -> Result<T, E>,
 ) -> Result<Option<T>, E> {
     match cursor.byte() {
         Some(0) => Ok(None),
@@ -87,10 +87,7 @@ pub(crate) fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
 }
 
 /// Reads back exactly what [`put_bytes`] wrote.
-pub(crate) fn take_bytes<'a, E>(
-    cursor: &mut cursor::Cursor<'a>,
-    malformed: E,
-) -> Result<&'a [u8], E> {
+pub(crate) fn take_bytes<'a, E>(cursor: &mut Cursor<'a>, malformed: E) -> Result<&'a [u8], E> {
     let Some(len) = cursor.u64().and_then(|len| usize::try_from(len).ok()) else {
         return Err(malformed);
     };
@@ -98,25 +95,10 @@ pub(crate) fn take_bytes<'a, E>(
 }
 
 /// Reads one byte that may only be a boolean.
-pub(crate) fn take_bool<E>(cursor: &mut cursor::Cursor<'_>, malformed: E) -> Result<bool, E> {
+pub(crate) fn take_bool<E>(cursor: &mut Cursor<'_>, malformed: E) -> Result<bool, E> {
     match cursor.byte() {
         Some(0) => Ok(false),
         Some(1) => Ok(true),
         _ => Err(malformed),
     }
-}
-
-/// Renders a journal key as the lowercase hex a file is named with.
-///
-/// One spelling for both journals: a key rendered two ways is two
-/// file names for one journal, and the second one is a store with no
-/// history in it.
-pub(crate) fn hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(char::from(HEX[usize::from(byte >> 4)]));
-        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    out
 }

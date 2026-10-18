@@ -1,74 +1,60 @@
-//! The single durable writer for provider grant authority. Every exported
+//! Node authority and Work accounting share one durable writer. Every exported
 //! acceptance is backed by one fsynced frame covering its entire budget path.
 use super::state::{Change, Frame, Snapshot, State};
 use super::{
-    ChannelId, GrantConnection, GrantId, GrantJobAuthorizationV1, GrantOutcome, GrantStoreError,
-    Principal, Serialize, SignedResult, ledger,
+    ChannelId, GrantId, GrantJobAuthorizationV1, GrantOutcome, NodeStoreError, Serialize,
+    SignedResult, ledger,
 };
+use crate::model::grant::records::grant_producer;
+use crate::model::grant::standing::{CounterAllowance, NodeAllowance, Standing, StandingLocator};
+use crate::model::grant::{
+    budget::{BudgetNode, Charge, Meter, Usage, Window},
+    grant_work_id,
+    records::{GrantError, Offer, SignedOffer},
+};
+use crate::model::profile::{PreparedWorkInput, WorkContext, WorkPolicy};
 use crate::work_store::journal::{
     Journal, JournalId, JournalKind, MAX_CHECKPOINT_BYTES, MAX_RECORD_BYTES,
 };
 use crate::work_store::{Applied, JobPhase, Role};
+use hellas_auth::authority::{Revision, UnixMillis};
+use hellas_auth::{Digest, ProducerSigningKey, PublicKey, Signature};
 use hellas_kernel::NetworkId;
 use hellas_rpc::ProviderEnrollmentBundle;
-use hellas_rpc::protocol::value::{canonical_dag_cbor, decode_dag_cbor};
-use hellas_rpc::protocol::work_grant::standing::{
-    CounterAllowance, NodeAllowance, Standing, StandingQuery,
-};
-use hellas_rpc::protocol::work_grant::{
-    Revision, UnixMillis,
-    budget::{BudgetNode, Charge, Limit, Meter, Usage, Window},
-    grant_work_id, owner_grant_id,
-    records::{GrantDef, GrantError, GrantKind, GrantPolicy, GrantState, Offer, SignedOffer},
-};
-use hellas_rpc::protocol::work_profile::{PreparedWorkInput, WorkContext, WorkPolicy};
-use hellas_rpc::{Digest, ProducerSigningKey, PublicKey, Signature};
+use hellas_rpc::protocol::value::{decode_canonical_bounded, encode_bounded};
 use std::path::Path;
+mod bootstrap;
 
-const TERMINAL_HEADROOM: usize = 1024;
-const MAX_OPEN_JOBS: usize = 256;
+// Includes a maximum-depth dispatch audit record and terminal/accounting growth.
+pub(super) const TERMINAL_HEADROOM: usize = 5120;
+pub(crate) const MAX_OPEN_JOBS: usize = ledger::MAX_CONCURRENT as usize;
 // Every admitted job can still require Dispatch + Terminal, plus the frame
 // crossing the soft boundary. These metadata records fit the common byte tail.
 const DUTY_FRAMES: u64 = 2 * MAX_OPEN_JOBS as u64 + 1;
 /// Both profiles deliberately keep bodies outside this store.
-pub struct GrantStore {
+pub struct NodeStore {
+    clock: super::clock::ClockBound,
+    _identity_lock: bootstrap::IdentityLock,
     journal: Journal,
-    state: State,
+    pub(super) state: State,
+    pub(super) executions: std::collections::BTreeMap<Digest, super::execution::ActiveExecution>,
+    pub(super) deliveries: Vec<std::sync::Weak<crate::grant_service::Delivery>>,
 }
-impl GrantStore {
-    pub fn open(
+impl NodeStore {
+    pub async fn open(
         directory: &Path,
         network: NetworkId,
-        provider: ProviderEnrollmentBundle,
+        provider: Option<ProviderEnrollmentBundle>,
         now: UnixMillis,
-    ) -> Result<Self, GrantStoreError> {
-        provider.check_grant_provider()?;
-        let key = hellas_rpc::protocol::digest::hash_tuple(
-            "hellas.work.grant-journal-key.v1",
-            &[network.as_bytes(), provider.content_id().as_bytes()],
-        );
-        let id = JournalId {
-            kind: JournalKind::Grant,
-            role: Role::Provider,
-            key: *key.as_bytes(),
-            generation: 0,
-        };
-        let (journal, replay) = Journal::open_latest(directory, "grants", id)?;
-        let mut state = match replay.checkpoint {
-            Some(bytes) => State::restore(decode::<Snapshot>(&bytes)?)?,
-            None => State::empty(network, provider.clone()),
-        };
-        if state.network() != network || state.provider() != &provider {
-            return Err(GrantStoreError::Malformed);
+    ) -> Result<Self, NodeStoreError> {
+        let mut store = Self::open_initialized(directory, network).await?;
+        if provider
+            .as_ref()
+            .is_some_and(|expected| store.state.provider.as_ref() != Some(expected))
+        {
+            return Err(GrantError::Audience.into());
         }
-        for bytes in replay.records {
-            state.apply(&decode::<Frame>(&bytes)?)?;
-        }
-        let mut store = Self { journal, state };
         let now = now.max(store.state.now());
-        if let Ok(owner) = Principal::verify(provider) {
-            store.bind_owner(owner, now)?;
-        }
         // Never rerun after opening. This also makes reopening idempotent if a
         // process crashed while recording recovery itself.
         let pending: Vec<_> = store
@@ -87,76 +73,80 @@ impl GrantStore {
             } else {
                 GrantOutcome::Indeterminate
             };
-            store.commit(
-                now,
-                Change::Terminal {
-                    channel,
-                    work,
-                    outcome,
-                    result: None,
-                    usage: None,
-                },
-                false,
-            )?;
+            store
+                .commit(
+                    now,
+                    Change::Terminal {
+                        channel,
+                        work,
+                        outcome,
+                        result: None,
+                        usage: None,
+                    },
+                    false,
+                )
+                .await?;
         }
-        store.tick(now)?;
+        store.tick(now).await?;
         Ok(store)
     }
     pub fn state(&self) -> &State {
         &self.state
     }
+    pub(crate) fn time(&self, now: UnixMillis) -> Result<UnixMillis, NodeStoreError> {
+        let now = now.max(self.state.now());
+        self.clock.check(now)?;
+        Ok(now)
+    }
+    pub(crate) fn check_authority(&self) -> Result<(), NodeStoreError> {
+        self.journal.check_authority()?;
+        Ok(())
+    }
+    pub(crate) async fn administer_authority(
+        &mut self,
+        caller: &hellas_auth::authority::AuthenticatedCaller,
+        command: hellas_auth::authority::AdministrationCommand,
+        now: UnixMillis,
+    ) -> Result<hellas_auth::authority::AdministrationRecord, NodeStoreError> {
+        self.check_authority()?;
+        let record = self
+            .state
+            .authority
+            .record_administration(caller, command, now)?;
+        self.commit(now, Change::Authority(record.clone()), true)
+            .await?;
+        Ok(record)
+    }
     /// Authenticated discovery accepts an existing stale generation without
     /// mutating grant terms, channel identity, allowance or nonce high-water.
-    pub fn standing(
-        &mut self,
-        query: StandingQuery,
-        connection: GrantConnection,
+    pub(crate) fn standing(
+        &self,
+        locator: StandingLocator,
         signer: &ProducerSigningKey,
         addresses: Vec<String>,
         now: UnixMillis,
-    ) -> Result<Standing, GrantStoreError> {
-        let locator = query.locator;
-        let def = self
-            .state
-            .grant(locator.grant)
-            .ok_or(GrantError::Unauthorized)?;
-        let principal = def.kind.principal();
-        if locator.provider != self.state.provider.content_id()
-            || locator.client != principal.id()
-            || connection.peer != principal.transport()
+    ) -> Result<Standing, NodeStoreError> {
+        if locator.provider != self.state.provider()?.content_id()
             || self
                 .state
-                .channel(locator.channel(self.state.network))
-                .is_none()
+                .generation(locator.grant)
+                .is_none_or(|g| locator.generation > g)
         {
             return Err(GrantError::Unauthorized.into());
         }
-        hellas_rpc::signature::verify_digest_signature(
-            &PublicKey::Secp256k1(principal.producer().to_bytes()),
-            &query.signature,
-            locator.digest(self.state.network, &connection.exporter),
-        )
-        .map_err(|_| GrantError::Unauthorized)?;
-        self.tick(now)?;
-        let def = self
-            .state
-            .grant(locator.grant)
-            .ok_or(GrantError::Unauthorized)?;
-        let offer = self.offer(locator.grant, signer, addresses)?;
-        let nodes = self.allowances(locator.grant, matches!(def.kind, GrantKind::Owner(_)))?;
-        Ok(Standing {
-            offer,
-            now: self.state.now(),
-            nodes,
-        })
+        let now = self.time(now)?;
+        let offer = self.offer(locator.grant, signer, addresses, now)?;
+        let nodes = self.allowances(locator.grant, false, now)?;
+        Ok(Standing { offer, now, nodes })
     }
-    /// Private projection for authenticated standing or local owner control.
+    /// Private projection for authenticated standing or checked Work administration.
     pub(crate) fn offer(
         &self,
         grant: GrantId,
         signer: &ProducerSigningKey,
         addresses: Vec<String>,
-    ) -> Result<SignedOffer, GrantStoreError> {
+        now: UnixMillis,
+    ) -> Result<SignedOffer, NodeStoreError> {
         let def = self.state.grant(grant).ok_or(GrantError::Unauthorized)?;
         let generation = self
             .state
@@ -165,11 +155,11 @@ impl GrantStore {
         let offer = SignedOffer::sign(
             Offer {
                 network: self.state.network,
-                provider: self.state.provider.clone(),
+                provider: self.state.provider()?.clone(),
                 grant: def.clone(),
                 generation,
                 sequence: def.revision.0,
-                valid_until: UnixMillis(self.state.now().0.saturating_add(300_000)),
+                valid_until: UnixMillis(now.max(self.state.now()).0.saturating_add(300_000)),
                 addresses,
             },
             signer,
@@ -179,165 +169,111 @@ impl GrantStore {
     pub(crate) fn allowances(
         &self,
         grant: GrantId,
-        include_machine: bool,
-    ) -> Result<Vec<NodeAllowance>, GrantStoreError> {
+        include_ancestors: bool,
+        now: UnixMillis,
+    ) -> Result<Vec<NodeAllowance>, NodeStoreError> {
         let def = self.state.grant(grant).ok_or(GrantError::Unauthorized)?;
-        let mut visible = vec![BudgetNode::Grant(def.id)];
-        if include_machine {
-            visible.push(BudgetNode::Machine);
-        }
-        let mut nodes = Vec::with_capacity(visible.len());
-        for id in visible {
-            let ledger = self.state.ledger();
-            let node = ledger.node(id).ok_or(ledger::LedgerError::UnknownNode)?;
-            let ancestors = match id {
-                BudgetNode::Machine => vec![id],
-                _ => vec![id, BudgetNode::Machine],
-            };
-            let active = |id| {
-                ledger.active_count(id)
-                    + self.state.recovery_holds(
-                        match id {
-                            BudgetNode::Machine => None,
-                            BudgetNode::Grant(grant) => Some(grant),
-                        },
-                        self.state.now(),
-                    )
-            };
-            let mut counters = Vec::with_capacity(16);
-            for meter in Meter::ALL {
-                for window in Window::ALL {
-                    let counter = node.counter(meter, window);
-                    let limit = node
-                        .limits()
-                        .iter()
-                        .find(|l| l.meter == meter && l.window == window)
-                        .map(|l| l.amount);
-                    let remaining = ancestors
-                        .iter()
-                        .filter_map(|id| {
-                            let limit = ledger
-                                .node(*id)?
-                                .limits()
-                                .iter()
-                                .find(|l| l.meter == meter && l.window == window)?;
-                            ledger.remaining(*id, *limit)
-                        })
-                        .min();
-                    counters.push(CounterAllowance {
-                        meter,
-                        window,
-                        window_id: counter.window_id,
-                        used: counter.used,
-                        reserved: ledger.reserved(id, meter),
-                        limit,
-                        remaining,
-                    });
-                }
-            }
-            let concurrent_remaining = ancestors
-                .iter()
-                .filter_map(|id| {
-                    ledger
-                        .node(*id)
-                        .map(|n| usize::from(n.concurrent()).saturating_sub(active(*id)))
-                })
-                .min()
-                .unwrap_or(0) as u16;
-            nodes.push(NodeAllowance {
-                node: id,
-                concurrent_limit: node.concurrent(),
-                active: active(id) as u16,
-                concurrent_remaining,
-                counters,
-            });
-        }
-        Ok(nodes)
+        let visible = if include_ancestors {
+            self.state.ledger().path(def.budget)?
+        } else {
+            vec![def.budget]
+        };
+        visible
+            .into_iter()
+            .map(|id| self.allowance(id, now))
+            .collect()
     }
-    pub fn tick(&mut self, now: UnixMillis) -> Result<(), GrantStoreError> {
+    pub(crate) fn allowance(
+        &self,
+        id: BudgetNode,
+        now: UnixMillis,
+    ) -> Result<NodeAllowance, NodeStoreError> {
+        let now = now.max(self.state.now());
+        let ledger = self.state.ledger();
+        let node = ledger.node(id).ok_or(ledger::LedgerError::UnknownNode)?;
+        let ancestors = ledger.path(id)?;
+        let mut concurrent_remaining = node.concurrent();
+        for ancestor in &ancestors {
+            let capacity = ledger
+                .node(*ancestor)
+                .ok_or(ledger::LedgerError::UnknownNode)?
+                .concurrent();
+            let active =
+                ledger.active_count(*ancestor) + self.state.recovery_holds(*ancestor, now)?;
+            concurrent_remaining =
+                concurrent_remaining.min(usize::from(capacity).saturating_sub(active) as u16);
+        }
+        let mut counters = Vec::with_capacity(Meter::ALL.len() * Window::ALL.len());
+        for meter in Meter::ALL {
+            for window in Window::ALL {
+                let counter = node.counter_at(meter, window, now);
+                let limit = node
+                    .limits()
+                    .iter()
+                    .find(|l| l.meter == meter && l.window == window)
+                    .map(|l| l.amount);
+                let remaining = ancestors
+                    .iter()
+                    .filter_map(|id| {
+                        let limit = ledger
+                            .node(*id)?
+                            .limits()
+                            .iter()
+                            .find(|l| l.meter == meter && l.window == window)?;
+                        ledger.remaining_at(*id, *limit, now)
+                    })
+                    .min();
+                counters.push(CounterAllowance {
+                    meter,
+                    window,
+                    window_id: counter.window_id,
+                    used: counter.used,
+                    reserved: ledger.reserved(id, meter),
+                    limit,
+                    remaining,
+                });
+            }
+        }
+        Ok(NodeAllowance {
+            node: id,
+            concurrent_limit: node.concurrent(),
+            active: (ledger.active_count(id) + self.state.recovery_holds(id, now)?) as u16,
+            concurrent_remaining,
+            counters,
+        })
+    }
+    pub(crate) async fn tick(&mut self, now: UnixMillis) -> Result<(), NodeStoreError> {
         if now > self.state.now() {
-            // Dispatch/Terminal already persist their own clock cursor. Queries
-            // must not spend the emergency tail reserved for those obligations.
-            self.commit(now, Change::Clock, true)?;
+            // Startup and admission clock writes must not spend the emergency
+            // tail reserved for dispatch and terminal obligations.
+            self.commit(now, Change::Clock, true).await?;
         }
         Ok(())
-    }
-    pub fn configure_machine(
-        &mut self,
-        limits: Vec<Limit>,
-        concurrent: u16,
-        now: UnixMillis,
-    ) -> Result<(), GrantStoreError> {
-        self.commit(now, Change::Machine { limits, concurrent }, true)
-    }
-    pub fn define(&mut self, definition: GrantDef, now: UnixMillis) -> Result<(), GrantStoreError> {
-        self.commit(now, Change::Define(definition), true)
-    }
-    /// Bootstrap is idempotent even after revision/revocation; it cannot replace
-    /// a standing owner grant or reset its counters.
-    pub fn initialize_owner(
-        &mut self,
-        owner: Principal,
-        policies: Vec<GrantPolicy>,
-        max_job_millis: std::num::NonZeroU64,
-        now: UnixMillis,
-    ) -> Result<GrantId, GrantStoreError> {
-        let id = owner_grant_id(
-            self.state.network(),
-            self.state.provider().content_id(),
-            owner.id(),
-        );
-        if self.state.grant(id).is_some() {
-            return Ok(id);
-        }
-        self.define(
-            GrantDef {
-                id,
-                revision: Revision(1),
-                kind: GrantKind::Owner(owner),
-                policies,
-                limits: vec![],
-                max_job_millis,
-                max_in_flight: std::num::NonZeroU16::new(256).expect("positive"),
-                expires: None,
-                state: GrantState::Active,
-                allow_account_backed: true,
-            },
-            now,
-        )?;
-        Ok(id)
-    }
-    pub fn bump_generation(
-        &mut self,
-        grant: GrantId,
-        now: UnixMillis,
-    ) -> Result<u64, GrantStoreError> {
-        let generation = self
-            .state
-            .generation(grant)
-            .and_then(|n| n.checked_add(1))
-            .ok_or(GrantError::Generation)?;
-        self.commit(now, Change::Generation { grant, generation }, true)?;
-        Ok(generation)
     }
     /// Verifies the signed request and exact current policy before committing
     /// Accepted plus ancestor reserves. Duplicate retries return the original
     /// signature without extending deadlines or reserving again.
-    pub fn accept(
+    pub(crate) async fn accept(
         &mut self,
+        application: (&hellas_auth::authority::AuthenticatedCaller, GrantId),
         a: GrantJobAuthorizationV1,
         client_signature: Signature,
         input: &PreparedWorkInput,
         signer: &ProducerSigningKey,
         now: UnixMillis,
-    ) -> Result<Signature, GrantStoreError> {
+    ) -> Result<Signature, NodeStoreError> {
         let now = now.max(self.state.now());
+        self.check_authority()?;
+        let execution = super::ExecutionRecord::capture(&self.state, application, a.grant_id, now)?;
         if signer.public_key()
-            != PublicKey::Secp256k1(self.state.provider().grant_producer()?.to_bytes())
+            != PublicKey::Secp256k1(grant_producer(self.state.provider()?)?.to_bytes())
         {
             return Err(GrantError::Signature.into());
         }
-        if let Some(signature) = self.precheck_acceptance(&a, &client_signature, now)? {
+        if let Some(signature) = self
+            .precheck_acceptance(&a, execution.caller().actor(), &client_signature, now)
+            .await?
+        {
             return Ok(signature);
         }
         let id = grant_work_id(self.state.network(), &a);
@@ -348,20 +284,10 @@ impl GrantStore {
         let context = WorkContext {
             network: self.state.network(),
             channel: a.channel_id.0,
-            client: def.kind.principal().producer(),
-            provider: self.state.provider().grant_producer()?,
+            client: hellas_kernel::Key::from_bytes(*execution.caller().actor().as_bytes()),
+            provider: grant_producer(self.state.provider()?)?,
         };
-        hellas_rpc::signature::verify_digest_signature(
-            &PublicKey::Secp256k1(context.client.to_bytes()),
-            &client_signature,
-            id,
-        )
-        .map_err(|_| GrantError::Signature)?;
-        let policy = def
-            .policies
-            .iter()
-            .find(|p| p.work.digest(context.network, context.channel) == a.work_policy_digest)
-            .ok_or(GrantError::OutOfScope)?;
+        let policy = self.state.policy_for(&a)?;
         policy
             .work
             .check_bound_input(&context, &(&a).into(), input)?;
@@ -381,11 +307,16 @@ impl GrantStore {
                 charge.set(Meter::DeviceMillis, def.max_job_millis.get());
             }
             (WorkPolicy::Fetch { .. }, PreparedWorkInput::Fetch(bundle)) => {
+                let parts = bundle.parts().map_err(|_| GrantError::Malformed)?;
+                let input = hellas_rpc::fetch::verify_input_events(&parts.fetch_input_transcript)
+                    .map_err(|_| GrantError::Malformed)?;
+                if let Some(resource) = &policy.responses {
+                    charge.set(
+                        Meter::OutputTokens,
+                        resource.matches(input.body.as_bytes())?,
+                    );
+                }
                 if let Some(resource) = &policy.https {
-                    let parts = bundle.parts().map_err(|_| GrantError::Malformed)?;
-                    let input =
-                        hellas_rpc::fetch::verify_input_events(&parts.fetch_input_transcript)
-                            .map_err(|_| GrantError::Malformed)?;
                     let request =
                         hellas_rpc::http_fetch::HttpFetchRequest::decode(input.body.as_bytes())
                             .map_err(|_| GrantError::Malformed)?;
@@ -394,6 +325,10 @@ impl GrantStore {
             }
             _ => return Err(GrantError::OutOfScope.into()),
         }
+        let charge = policy
+            .pricing
+            .reserve(charge)
+            .map_err(|_| GrantError::Limits)?;
         let provider_signature = signer.sign_digest(id).map_err(|_| GrantError::Signature)?;
         self.commit(
             now,
@@ -402,62 +337,86 @@ impl GrantStore {
                 client_signature,
                 provider_signature,
                 charge,
+                execution,
             },
             true,
-        )?;
+        )
+        .await?;
         Ok(provider_signature)
     }
     /// Probe an uncertain proposal without its body. Authenticate first; known
     /// work returns its original co-signature before current admission checks.
     /// An unknown expired proposal is conclusively refused before input decode.
-    pub fn precheck_acceptance(
+    pub(crate) async fn precheck_acceptance(
         &mut self,
         a: &GrantJobAuthorizationV1,
+        client: hellas_auth::authority::PrincipalId,
         client_signature: &Signature,
         now: UnixMillis,
-    ) -> Result<Option<Signature>, GrantStoreError> {
+    ) -> Result<Option<Signature>, NodeStoreError> {
         let id = grant_work_id(self.state.network(), a);
-        let channel = self
-            .state
-            .channel(a.channel_id)
-            .ok_or(GrantError::Unauthorized)?;
-        if channel.funding.grant != a.grant_id {
-            return Err(GrantError::Unauthorized.into());
-        }
-        hellas_rpc::signature::verify_digest_signature(
-            &PublicKey::Secp256k1(channel.funding.client.producer().to_bytes()),
-            client_signature,
-            id,
-        )
-        .map_err(|_| GrantError::Signature)?;
-        if let Some(job) = channel.job_book().job_by_id(id) {
-            if job.authorization() == a && job.client_signature() == *client_signature {
-                return Ok(Some(
-                    job.provider_signature().ok_or(GrantStoreError::Malformed)?,
-                ));
+        self.state.check_channel(a, client)?;
+        hellas_auth::signature::verify_digest_signature(&client.public_key(), client_signature, id)
+            .map_err(|_| GrantError::Signature)?;
+        if let Some(channel) = self.state.channel(a.channel_id) {
+            if let Some(job) = channel.job_book().job_by_id(id) {
+                if job.authorization() == a && job.client_signature() == *client_signature {
+                    return Ok(Some(
+                        job.provider_signature().ok_or(NodeStoreError::Malformed)?,
+                    ));
+                }
+                return Err(GrantError::Signature.into());
             }
-            return Err(GrantError::Signature.into());
-        }
-        if let Some(t) = channel.job_book().terminal_by_id(id) {
-            if t.outcome.authorization == *a && t.outcome.client_signature == *client_signature {
-                return Ok(Some(t.outcome.provider_signature));
+            if let Some(t) = channel.job_book().terminal_by_id(id) {
+                if t.outcome.authorization == *a && t.outcome.client_signature == *client_signature
+                {
+                    return Ok(Some(t.outcome.provider_signature));
+                }
+                return Err(GrantError::Signature.into());
             }
-            return Err(GrantError::Signature.into());
         }
         let now = now.max(self.state.now());
-        self.tick(now)?;
-        self.state.check_authority(a, now)?;
+        self.tick(now).await?;
+        self.state.check_terms(a, client, now)?;
         Ok(None)
     }
-    pub fn dispatch(
+    pub(crate) async fn dispatch(
         &mut self,
+        application: (&hellas_auth::authority::AuthenticatedCaller, GrantId),
         channel: ChannelId,
         work: Digest,
         now: UnixMillis,
-    ) -> Result<(), GrantStoreError> {
-        self.commit(now, Change::Dispatched { channel, work }, false)
+    ) -> Result<(), NodeStoreError> {
+        self.check_authority()?;
+        let now = now.max(self.state.now());
+        let allowance = self
+            .state
+            .channel_binding(channel)
+            .ok_or(GrantError::Unauthorized)?
+            .grant;
+        let execution = super::ExecutionRecord::capture(&self.state, application, allowance, now)?;
+        let admission = self
+            .state
+            .admission(channel, work)
+            .ok_or(NodeStoreError::Malformed)?;
+        if !admission.accepted.same_application(&execution) {
+            return Err(GrantError::Unauthorized.into());
+        }
+        if admission.dispatched.is_some() {
+            return Ok(());
+        }
+        self.commit(
+            now,
+            Change::Dispatched {
+                channel,
+                work,
+                execution,
+            },
+            false,
+        )
+        .await
     }
-    pub fn finish(
+    pub(crate) async fn finish(
         &mut self,
         channel: ChannelId,
         work: Digest,
@@ -465,7 +424,7 @@ impl GrantStore {
         result: Option<SignedResult>,
         usage: Usage,
         now: UnixMillis,
-    ) -> Result<(), GrantStoreError> {
+    ) -> Result<(), NodeStoreError> {
         self.commit(
             now,
             Change::Terminal {
@@ -480,13 +439,14 @@ impl GrantStore {
             },
             false,
         )
+        .await
     }
-    pub fn release(
+    pub(crate) async fn release(
         &mut self,
         channel: ChannelId,
         work: Digest,
         now: UnixMillis,
-    ) -> Result<(), GrantStoreError> {
+    ) -> Result<(), NodeStoreError> {
         self.commit(
             now,
             Change::Terminal {
@@ -498,25 +458,35 @@ impl GrantStore {
             },
             false,
         )
+        .await
     }
-    /// Local administration must explicitly authorize this repair operation.
-    pub fn repair_resource(&mut self, id: Digest, now: UnixMillis) -> Result<(), GrantStoreError> {
-        self.commit(now, Change::RepairResource(id), true)
-    }
-    pub fn rotate(&mut self) -> Result<(), GrantStoreError> {
-        self.journal.rotate(&encode(&self.state.snapshot())?)?;
+    pub(crate) async fn rotate(&mut self) -> Result<(), NodeStoreError> {
+        let mut cancellation = self.cancel_on_failure();
+        self.journal
+            .rotate(&encode(&self.state.snapshot()?)?)
+            .await?;
+        cancellation.0.clear();
         Ok(())
     }
-    pub(super) fn commit(
+    pub(super) async fn commit(
         &mut self,
         now: UnixMillis,
         change: Change,
         new_obligation: bool,
-    ) -> Result<(), GrantStoreError> {
+    ) -> Result<(), NodeStoreError> {
+        self.commit_changes(now, vec![change], new_obligation).await
+    }
+    pub(super) async fn commit_changes(
+        &mut self,
+        now: UnixMillis,
+        changes: Vec<Change>,
+        new_obligation: bool,
+    ) -> Result<(), NodeStoreError> {
+        let now = self.time(now)?;
         let frame = Frame {
-            namespace: "hellas.work.grant-journal.v1".into(),
-            now: now.max(self.state.now()),
-            change,
+            namespace: "hellas.node.journal.v1".into(),
+            now,
+            changes,
         };
         let mut candidate = self.state.clone();
         if candidate.apply(&frame)? == Applied::Redundant {
@@ -525,7 +495,7 @@ impl GrantStore {
         // Terminal pruning is reproducible from the frame cursor. Nonce high
         // water and old generations remain, so pruning cannot permit replay.
         candidate.prune();
-        let checkpoint = encode(&candidate.snapshot())?;
+        let checkpoint = encode(&candidate.snapshot()?)?;
         let open = candidate
             .channels
             .values()
@@ -534,21 +504,31 @@ impl GrantStore {
         if open > MAX_OPEN_JOBS
             || checkpoint
                 .len()
+                .saturating_add(candidate.ledger.clock_headroom())
                 .saturating_add(open.saturating_mul(TERMINAL_HEADROOM))
                 > MAX_CHECKPOINT_BYTES
         {
             return Err(GrantError::StateCapacity.into());
         }
+        // Observe elapsed deadlines against the old state before an extension
+        // can make it current again. A new grant cannot revive an old response
+        // or execution whose authority already expired.
+        self.refresh_executions(frame.now);
+        self.refresh_deliveries(frame.now);
+        let mut cancellation = self.cancel_on_failure();
         if self.journal.at_soft_limit_with_frames(DUTY_FRAMES) {
-            let result = self.rotate();
+            let result = self.rotate().await;
             if new_obligation {
                 result?;
             }
-            // A duty may use the reserved tail if rotation fails. Append errors
-            // still poison the journal, and no candidate is published then.
+            // A rotation refused before writing leaves the reserved tail usable.
+            // A failed write poisons the journal, so append still refuses that case.
         }
-        self.journal.append(&encode(&frame)?)?;
+        self.journal.append(&encode(&frame)?).await?;
         self.state = candidate;
+        self.refresh_executions(frame.now);
+        self.refresh_deliveries(frame.now);
+        cancellation.0.clear();
         Ok(())
     }
 }
@@ -560,6 +540,17 @@ impl State {
                 .terminals
                 .retain(|_, t| t.outcome.authorization.delivery_deadline_ms >= now);
         }
+        let retained: std::collections::BTreeSet<_> = self
+            .channels
+            .values()
+            .flat_map(|c| {
+                c.book
+                    .jobs()
+                    .map(|j| j.work_id())
+                    .chain(c.book.terminals().map(|t| t.work_id))
+            })
+            .collect();
+        self.admissions.retain(|id, _| retained.contains(id));
         let live: std::collections::BTreeSet<_> = self
             .channels
             .values()
@@ -578,20 +569,9 @@ impl State {
         self.history.retain(|key, _| live.contains(key));
     }
 }
-fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, GrantStoreError> {
-    let bytes = canonical_dag_cbor(value).map_err(|_| GrantStoreError::Malformed)?;
-    if bytes.len() > MAX_RECORD_BYTES {
-        return Err(GrantError::StateCapacity.into());
-    }
-    Ok(bytes)
+fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, NodeStoreError> {
+    encode_bounded(value, MAX_RECORD_BYTES).map_err(Into::into)
 }
-fn decode<T: serde::de::DeserializeOwned + Serialize>(bytes: &[u8]) -> Result<T, GrantStoreError> {
-    if bytes.len() > MAX_RECORD_BYTES {
-        return Err(GrantStoreError::Malformed);
-    }
-    let value: T = decode_dag_cbor(bytes).map_err(|_| GrantStoreError::Malformed)?;
-    if encode(&value)? != bytes {
-        return Err(GrantStoreError::Malformed);
-    }
-    Ok(value)
+fn decode<T: serde::de::DeserializeOwned + Serialize>(bytes: &[u8]) -> Result<T, NodeStoreError> {
+    decode_canonical_bounded(bytes, MAX_RECORD_BYTES).map_err(Into::into)
 }

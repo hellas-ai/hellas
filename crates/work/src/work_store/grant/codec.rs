@@ -1,6 +1,35 @@
 //! Canonical field adapters; journal records contain commitments, never bodies.
-use hellas_rpc::protocol::work::PrivateRecord;
+use crate::model::grant::records::check_grant_provider;
+use crate::model::work::PrivateRecord;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
+pub(super) mod optional_provider {
+    use super::*;
+    use hellas_rpc::ProviderEnrollmentBundle;
+    pub fn serialize<S: Serializer>(
+        value: &Option<ProviderEnrollmentBundle>,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        value
+            .as_ref()
+            .map(|p| serde_bytes::ByteBuf::from(p.canonical_bytes()))
+            .serialize(s)
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<Option<ProviderEnrollmentBundle>, D::Error> {
+        Option::<serde_bytes::ByteBuf>::deserialize(d)?
+            .map(|bytes| {
+                if bytes.len() > crate::model::grant::records::MAX_PRINCIPAL_BYTES {
+                    return Err(D::Error::custom("provider enrollment is too large"));
+                }
+                let provider = ProviderEnrollmentBundle::from_canonical_bytes(&bytes)
+                    .map_err(D::Error::custom)?;
+                check_grant_provider(&provider).map_err(D::Error::custom)?;
+                Ok(provider)
+            })
+            .transpose()
+    }
+}
 pub(super) mod record {
     use super::*;
     pub fn serialize<T: PrivateRecord, S: Serializer>(value: &T, s: S) -> Result<S::Ok, S::Error> {

@@ -29,23 +29,15 @@ otel = ["dep:opentelemetry", "dep:tracing-opentelemetry"]
 # `execute` gates the shared identity and signed-transcript vocabulary.
 execute = []
 evaluate = ["execute"]
-fetch = ["execute", "dep:serde_json", "dep:flate2", "dep:brotli"]
+fetch = ["execute", "dep:serde_json"]
 chain = ["dep:base64ct", "dep:hellas-kernel"]
 swarm = []
 # Host administration. Explicitly mounted behind admin authorization, not
 # included in the ordinary peer-service discovery catalogue.
 host-control = []
 all-protocols = ["swarm", "execute", "evaluate", "fetch", "chain"]
-# Paid private work: the canonical authorization, result, invoice, and
-# allocation records. Gated because it is the only protocol module that
-# needs the consensus kernel's types — the certificate, the network id,
-# and the edge/terms commitments — and a wasm or fetch-only client has no
-# use for them. The alternative was restating those kernel types here,
-# which is how two definitions of a signed digest start. Both paid
-# profiles are pulled forward: `evaluate` for the causal-LM profile and
-# `fetch` for the sealed-fetch profile (`protocol::work_fetch`), whose
-# records commit to signed fetch transcripts.
-work = ["dep:hellas-kernel", "evaluate", "fetch", "hellas-kernel/secp256k1"]
+# Generated Work and WorkSetup messages use the shared execution vocabulary.
+work = ["execute"]
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.4", features = ["wasm_js"] }
@@ -54,9 +46,7 @@ getrandom = { version = "0.4", features = ["wasm_js"] }
 axum = { workspace = true, optional = true }
 base64.workspace = true
 base64ct = { version = "1", optional = true, features = ["alloc"] }
-brotli = { version = "9", optional = true }
 bytes = { workspace = true }
-flate2 = { version = "1", optional = true }
 futures-core = { workspace = true }
 futures-util = { version = "0.3", default-features = false }
 hellas-auth.workspace = true
@@ -79,6 +69,7 @@ tracing = { workspace = true }
 tracing-opentelemetry = { workspace = true, optional = true }
 url = "2"
 web-time = { workspace = true }
+zeroize = "1.9"
 
 [build-dependencies]
 hellas-wire = { workspace = true, default-features = false }
@@ -91,13 +82,7 @@ quote = "1"
 syn = { version = "3", features = ["full"] }
 
 [dev-dependencies]
-# Real settlement signatures in the paid-work vectors: the kernel's own
-# secp256k1 signer, not a placeholder that proves nothing about the keys
-# a channel actually settles with.
-hellas-kernel = { workspace = true, features = ["secp256k1"] }
-# The paid-work acceptance test runs over a real multiplexed transport
-# rather than a handler call: framing, method routing, and trailers are
-# where a wire-shaped mistake actually shows up.
+hellas-auth = { workspace = true, features = ["test-support"] }
 hellas-wire = { workspace = true, features = ["mux"] }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 tempfile = { workspace = true }

@@ -15,6 +15,7 @@ path = "src/bin/agent.rs"
 anyhow.workspace = true
 async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
+hellas-auth.workspace = true
 hellas-private.workspace = true
 hellas-rpc = { workspace = true, default-features = false, features = [
     "work",
@@ -34,3 +35,7 @@ tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 url = "2"
+
+[dev-dependencies]
+hellas-kernel.workspace = true
+hellas-work = { workspace = true, features = ["test-support"] }

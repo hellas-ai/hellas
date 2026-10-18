@@ -213,7 +213,7 @@ mod webauthn;
 mod work;
 
 pub use block::Block;
-pub use canonical::{BufferWriter, Decode, DecodeError, Encode, Writer};
+pub use canonical::{BufferWriter, Cursor, Decode, DecodeError, Encode, Writer};
 pub use consts::{
     MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS, MAX_FREEZE_AUTH_BLOCKS, MAX_OMIT_RESPONSE_BLOCKS,
     MAX_PARTY_INPUTS, MAX_REGISTRY_CHUNKS, MAX_REGISTRY_MUTATIONS, MAX_START_VALIDITY_BLOCKS,

@@ -456,10 +456,7 @@ impl hellas_rpc::services::chain_sync::ChainSyncHandler for CorruptSource {
         &self,
         _: hellas_rpc::pb::chain::GetLatestBlockRequest,
     ) -> Result<
-        futures_util::stream::BoxStream<
-            'static,
-            Result<hellas_rpc::pb::chain::GetFinalizedBlockResponse, hellas_wire::WireStatus>,
-        >,
+        hellas_rpc::call::ResponseStream<hellas_rpc::pb::chain::GetFinalizedBlockResponse>,
         hellas_wire::WireStatus,
     > {
         if let Some((node, false)) = &self.1 {
@@ -469,13 +466,15 @@ impl hellas_rpc::services::chain_sync::ChainSyncHandler for CorruptSource {
             )
             .await;
         }
-        Ok(Box::pin(futures_util::stream::pending()))
+        Ok(hellas_rpc::call::ResponseStream::new(
+            futures_util::stream::pending(),
+        ))
     }
 }
 
 #[test]
 fn corrupt_peer_is_dropped_and_marked_failed_in_the_registry() {
-    use hellas_rpc::peers::{PeerId, ServiceStatus};
+    use hellas_wire::peers::{PeerId, ServiceStatus};
     run_qmdb(|runtime| async move {
         let directory = tempfile::tempdir().unwrap();
         let mut fixture = Fixture::new(runtime, directory.path()).await;

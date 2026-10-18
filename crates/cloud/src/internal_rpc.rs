@@ -9,8 +9,7 @@ use std::{
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    net::{UnixListener, UnixStream},
-    sync::Semaphore,
+    net::UnixStream,
 };
 
 use crate::management::{Request, Service, private_directory};
@@ -29,8 +28,6 @@ pub enum RpcError {
     Json(#[from] serde_json::Error),
     #[error(transparent)]
     Timeout(#[from] tokio::time::error::Elapsed),
-    #[error("unauthorized local user")]
-    Unauthorized,
     #[error("invalid RPC frame")]
     Frame,
     #[error("RPC response too large")]
@@ -132,9 +129,6 @@ async fn dispatch(service: &Service, input: &[u8]) -> Option<Value> {
 }
 
 async fn connection(service: Arc<Service>, stream: UnixStream) -> Result<()> {
-    if stream.peer_cred()?.uid() != unsafe { libc::geteuid() } {
-        return Err(RpcError::Unauthorized);
-    }
     let (read, mut write) = stream.into_split();
     let mut read = BufReader::new(read);
     loop {
@@ -178,7 +172,7 @@ pub async fn serve_until(
     socket: &Path,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<()> {
-    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+    use std::os::unix::fs::FileTypeExt;
     private_directory(socket.parent().ok_or(RpcError::SocketParent)?)?;
     let _lock = crate::config::lock_state(socket)?;
     if socket.try_exists()? {
@@ -187,34 +181,21 @@ pub async fn serve_until(
         }
         std::fs::remove_file(socket)?;
     }
-    let listener = UnixListener::bind(socket)?;
-    std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))?;
-    struct Cleanup(PathBuf);
-    impl Drop for Cleanup {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
-        }
-    }
-    let _cleanup = Cleanup(socket.to_owned());
     let service = Arc::new(service);
-    let slots = Arc::new(Semaphore::new(16));
-    let mut tasks = tokio::task::JoinSet::new();
-    tokio::pin!(shutdown);
-    loop {
-        tokio::select! {
-            _ = &mut shutdown => break,
-            Some(_) = tasks.join_next(), if !tasks.is_empty() => {},
-            incoming = listener.accept() => {
-                let (stream, _) = incoming?;
-                let Ok(permit) = slots.clone().try_acquire_owned() else { continue; };
-                let service = service.clone();
-                tasks.spawn(async move { let _permit = permit; let _ = connection(service, stream).await; });
-            }
+    let mut listener = hellas_wire::local::LocalControlServer::bind(socket, move |stream| {
+        let service = service.clone();
+        async move {
+            let _ = connection(service, stream).await;
+        }
+    })?;
+    tokio::select! {
+        result = listener.wait() => result?,
+        _ = shutdown => {
+            // Finish allocations whose receipts preceded their cloud API calls.
+            // The connection handler bounds idle readers to thirty seconds.
+            listener.drain().await?;
         }
     }
-    // Finish in-flight allocations so disconnect/shutdown doesn't abandon a create response.
-    // Idle readers time out after 30 seconds; receipts precede all cloud API calls.
-    while tasks.join_next().await.is_some() {}
     Ok(())
 }
 

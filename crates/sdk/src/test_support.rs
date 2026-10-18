@@ -1,32 +1,49 @@
 //! A funded, metadata-only Fetch channel for SDK boundary tests.
 // Client and provider feature suites use different parts of this fixture.
-#![allow(dead_code)]
+pub(crate) use crate::provider::tests::host::{Host, RemoteHost};
 use crate::work_config::{ChainCrossCheck, WorkConfig};
+use hellas_auth::ProducerSigningKey;
 use hellas_kernel::{
     BlockHeight, Decode as _, Edge, EdgeId, EdgeValues, Fees, Key, LeaseSlots, List,
     MAX_EDGE_OUTPUTS, NetworkId, Parties, Payout, PendingSlot, RegistryChunk, RegistryNamespace,
     RegistryRecordTag, Secp256k1Signer, Secp256k1Verifier, Terms, TermsHash, WorkPaymentTerms,
     WorkStakeBondTerms, work_payment_settlement,
 };
-use hellas_rpc::protocol::work::{JobDeadlines, PaidChannelPolicyV1, private_policy_commitment};
-use hellas_rpc::protocol::work_fetch::{
+use hellas_rpc::{Assurance, Retention};
+use hellas_work::model::fetch::{
     FetchPolicyV2, FetchRoutePolicy, PreparedPaidFetchInputV1, fetch_route_commitment,
 };
-use hellas_rpc::protocol::work_profile::WorkPolicy;
-use hellas_rpc::protocol::work_setup::{
+use hellas_work::model::profile::WorkPolicy;
+use hellas_work::model::setup::{
     ObservedChannel, ReadyChannel, WorkChannelConfig, WorkChannelDescriptor, payment_terms_hash,
 };
-use hellas_rpc::{Assurance, FetchEnvironment, ProducerSigningKey, Retention};
+use hellas_work::model::work::{JobDeadlines, PaidChannelPolicyV1, private_policy_commitment};
 use hellas_work::work::{ClientEndpoint, JobProposal, ProviderEndpoint, WorkService};
 use hellas_work::work_store::{ChannelStore, Role, SetupOrigin};
 
-#[cfg(feature = "paid-client")]
 pub(crate) use crate::test_identity::enrollment;
-#[cfg(feature = "paid-client")]
 use iroh::EndpointId;
 
 pub(crate) const PRICE: u64 = 10;
-pub(crate) const BODY: &[u8] = br#"{"input":"sdk-private-request"}"#;
+
+pub(crate) async fn application_profile(
+    node: &hellas_work::node::NodeCoordinator,
+    administrator: &hellas_auth::authority::CredentialSecret,
+    subject: hellas_auth::authority::PrincipalId,
+    allowance: hellas_auth::authority::GrantId,
+) -> std::sync::Arc<crate::node_control::profile::ClientProfile> {
+    let credential =
+        crate::test_node::execution_credential(node, administrator, subject, allowance).await;
+    let caller = node.authenticate(administrator).await.unwrap();
+    std::sync::Arc::new(crate::node_control::profile::ClientProfile {
+        authority: caller.authority(),
+        authorization: crate::test_node::EXECUTION_AUTHORIZATION,
+        credential,
+        local: None,
+    })
+}
+pub(crate) const BODY: &[u8] =
+    br#"{"model":"fixture","input":"sdk-private-request","max_output_tokens":8}"#;
 const HORIZON: u64 = 500;
 const OMISSION_BOND: u64 = 601;
 
@@ -35,7 +52,7 @@ pub(crate) struct PaidFixture {
     pub ready: ReadyChannel,
     pub descriptor: WorkChannelDescriptor,
     pub config: WorkConfig,
-    pub proposal: hellas_rpc::protocol::work_bundle::WorkChannelSetupBundleV1,
+    pub proposal: hellas_work::model::bundle::WorkChannelSetupBundleV1,
 }
 
 pub(crate) fn signer(byte: u8) -> Secp256k1Signer {
@@ -106,8 +123,9 @@ impl PaidFixture {
         };
         let route = FetchRoutePolicy::sealed_route("openai", "responses").unwrap();
         let work_policy = WorkPolicy::Fetch {
+            contract: test_responses_contract(),
             policy: FetchPolicyV2 {
-                allowed_environment: FetchEnvironment::OpenAiResponses.manifest_id(),
+                allowed_environment: test_responses_contract().manifest_id(),
                 route_commitment: fetch_route_commitment(&route.canonical_body_bytes()).unwrap(),
                 max_request_body_bytes: 4096,
                 max_output_events: 64,
@@ -139,7 +157,7 @@ impl PaidFixture {
             &funding,
             &Terms::work_stake_bond(bond_terms.clone()),
         );
-        let proposal = hellas_rpc::protocol::work_bundle::WorkChannelSetupBundleV1::propose_bond(
+        let proposal = hellas_work::model::bundle::WorkChannelSetupBundleV1::propose_bond(
             network,
             funding,
             bond_terms.clone(),
@@ -230,7 +248,7 @@ impl PaidFixture {
         }
     }
 
-    pub fn store(&self, role: Role) -> ChannelStore {
+    pub async fn store(&self, role: Role) -> ChannelStore {
         let name = if role == Role::Client {
             "client"
         } else {
@@ -249,17 +267,27 @@ impl PaidFixture {
             },
             &Secp256k1Verifier::new(),
         )
+        .await
         .unwrap()
     }
 
-    pub fn client(&self) -> ClientEndpoint {
-        ClientEndpoint::new(self.ready.clone(), self.store(Role::Client), signer(1)).unwrap()
+    pub async fn client(&self) -> ClientEndpoint {
+        ClientEndpoint::new(
+            self.ready.clone(),
+            self.store(Role::Client).await,
+            signer(1),
+        )
+        .unwrap()
     }
 
-    pub fn provider(&self) -> WorkService {
+    pub async fn provider(&self) -> WorkService {
         WorkService::new(
-            ProviderEndpoint::new(self.ready.clone(), self.store(Role::Provider), signer(2))
-                .unwrap(),
+            ProviderEndpoint::new(
+                self.ready.clone(),
+                self.store(Role::Provider).await,
+                signer(2),
+            )
+            .unwrap(),
         )
     }
 
@@ -268,19 +296,16 @@ impl PaidFixture {
             "openai",
             "responses",
             BODY,
-            FetchEnvironment::OpenAiResponses.manifest_id(),
+            test_responses_contract().manifest_id(),
             Assurance::ProducerSigned,
             &ProducerSigningKey::from_secret_bytes([1; 32]).unwrap(),
             Retention::Ephemeral,
         )
         .unwrap();
         JobProposal {
-            prepared_input: PreparedPaidFetchInputV1::new(
-                &events,
-                &FetchEnvironment::OpenAiResponses.manifest(),
-            )
-            .unwrap()
-            .into(),
+            prepared_input: PreparedPaidFetchInputV1::new(&events, &test_responses_contract())
+                .unwrap()
+                .into(),
             deadlines: JobDeadlines {
                 acceptance: 50,
                 terminal: 100,
@@ -307,8 +332,8 @@ fn edge(value: u64, reserve: u64, maker: Key, taker: Key, terms: TermsHash, allo
     Edge::decode_exact(&bytes).unwrap()
 }
 
-fn payment_policy() -> hellas_rpc::protocol::work::JobPaymentPolicyV2 {
-    hellas_rpc::protocol::work::JobPaymentPolicyV2 {
+fn payment_policy() -> hellas_work::model::work::JobPaymentPolicyV2 {
+    hellas_work::model::work::JobPaymentPolicyV2 {
         fixed_price: PRICE,
         dispatch_margin_blocks: 4,
         delivery_margin_blocks: 2,
@@ -316,11 +341,13 @@ fn payment_policy() -> hellas_rpc::protocol::work::JobPaymentPolicyV2 {
     }
 }
 
-#[cfg(feature = "paid-client")]
 pub(crate) fn provider_trust(peer: EndpointId) -> hellas_client::ProviderTrustAnchor {
     hellas_client::ProviderTrustAnchor {
+        allowed_environments: vec![test_responses_contract().manifest_id()],
         expected_genesis: enrollment(peer).0.content_id(),
         required_assurance: Assurance::ProducerSigned,
         apple_app_attest: None,
     }
 }
+
+use hellas_work::test_support::test_responses_contract;

@@ -11,6 +11,7 @@ use catena_lang::safe_gpu::{
     Asset, AssetOwner, MAX_RESIDENT_ASSET_BYTES, MAX_RESIDENT_ASSETS, Program, Session,
     SessionTimeouts,
 };
+use hellas_auth::ProducerSigningKey;
 use hellas_rpc::evaluate::{EvaluateOutputTranscriptBuilder, input_commitment};
 use hellas_rpc::execution_event::{
     WorkChunk as PbChunk, WorkEvent as PbWorkEvent, work_event::Kind as PbEvent,
@@ -19,7 +20,7 @@ use hellas_rpc::protocol::artifacts::MAX_RETRIEVABLE_TOKEN_IDS;
 use hellas_rpc::stream::output_event_to_pb;
 use hellas_rpc::{
     CausalLmEnvironment, ContentId, ContentRef, EvaluateRequest, MAX_CAUSAL_LM_STATIC_BYTES,
-    OutputEventEnvelope, ProducerSigningKey,
+    OutputEventEnvelope,
 };
 use hellas_wire::WireStatus;
 use tokio::sync::mpsc as tokio_mpsc;
@@ -439,22 +440,22 @@ fn run_job(
         "GPU worker starting causal-LM execution"
     );
 
-    let check_deadline = || {
+    let check_active = || {
         running
-            .check_deadline()
+            .check_active()
             .map_err(crate::ExecutorError::Backend)
     };
-    check_deadline()?;
+    check_active()?;
     runtime.validate_generation_resources(source, invocation)?;
     let input_ids = Zeroizing::new(std::mem::take(&mut invocation.input_ids));
     let emit = |token| {
-        check_deadline()?;
+        check_active()?;
         telemetry.token_generated();
         on_progress(token)?;
         Ok(GenerationControl::Continue)
     };
     let model = runtime.model(source)?;
-    check_deadline()?;
+    check_active()?;
     let schedule = source.environment().generation_schedule();
     let result = model.generate_tokens_streaming_with_options(
         input_ids.as_slice(),

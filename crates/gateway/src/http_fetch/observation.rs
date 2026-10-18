@@ -1,7 +1,9 @@
-use hellas_rpc::http_usage::UsageDecoder;
-use std::time::Instant;
 #[cfg(test)]
-use {hellas_rpc::http_usage::Usage, std::io::Write};
+use hellas_work::model::http_usage::Usage;
+use hellas_work::model::http_usage::UsageDecoder;
+#[cfg(test)]
+use std::io::Write;
+use std::time::Instant;
 
 #[derive(Clone)]
 pub(super) struct Metrics {

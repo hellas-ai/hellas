@@ -21,7 +21,7 @@ async fn test_endpoint(app: Router, path: &str) -> Url {
 
 async fn execute_test_request(endpoint: Url) -> Result<FetchProviderResponse, FetchProviderError> {
     execute_responses_request(
-        &responses_http_client(),
+        &responses_http_client(Default::default()).unwrap(),
         endpoint,
         "secret",
         br#"{"model":"m","input":"hi","stream":true}"#.to_vec(),

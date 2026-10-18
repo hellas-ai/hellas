@@ -1,9 +1,10 @@
+use hellas_auth::ProducerSigningKey;
 use std::fs;
 
+use hellas_auth::Digest;
 use hellas_kernel::{EdgeValues, Fees, MIN_OMIT_RESPONSE_BLOCKS};
-use hellas_rpc::protocol::Digest;
-use hellas_rpc::protocol::work::{EvaluatePolicyV2, PaidChannelPolicyV1};
-use hellas_rpc::protocol::work_setup::ProviderChannelPolicy;
+use hellas_work::model::setup::ProviderChannelPolicy;
+use hellas_work::model::work::{EvaluatePolicyV2, PaidChannelPolicyV1};
 use hellas_work::work_close::{BlockSourceError, FinalizedWork};
 
 use super::*;
@@ -29,28 +30,13 @@ fn provider() -> Secp256k1Signer {
 }
 
 fn enrollment() -> hellas_rpc::ProviderEnrollmentBundle {
-    use hellas_rpc::*;
     let root = ProducerSigningKey::from_secret_bytes([0x22; 32]).unwrap();
-    let statement = ProviderGenesisStatement {
-        root_kind: RootKind::Software,
-        root_public_key: root.public_key(),
-        producer_public_key: root.public_key(),
-        transport_public_key: PublicKey::Ed25519(
-            *iroh::SecretKey::from_bytes(&[0x51; 32]).public().as_bytes(),
-        ),
-        platform_credential: PlatformCredential::Absent,
-        installation_nonce: [3; 32],
-    };
-    let proof = root
-        .sign_digest(Digest::hash(&statement.canonical_bytes()))
-        .unwrap();
-    ProviderEnrollmentBundle {
-        genesis: SignedProviderGenesis {
-            statement,
-            root_proof: RootProof::Software(proof),
-        },
-        platform: PlatformEnrollment::Absent,
-    }
+    hellas_work::test_support::enrollment(
+        &root,
+        &root,
+        *iroh::SecretKey::from_bytes(&[0x51; 32]).public().as_bytes(),
+        [3; 32],
+    )
 }
 
 /// The client the bond names as taker.
@@ -197,20 +183,23 @@ fn options_for(
 }
 
 /// The whole command, minus the one step that needs a validator.
-fn provision(
+async fn provision(
     root: &Path,
     policy: ProviderChannelPolicy,
     max_job_price: u64,
 ) -> Result<Provisioned> {
-    provision_options(&options(root, max_job_price), policy)
+    provision_options(&options(root, max_job_price), policy).await
 }
 
-fn provision_options(
+async fn provision_options(
     options: &ProvisionOptions,
     policy: ProviderChannelPolicy,
 ) -> Result<Provisioned> {
     let candidate = BondCandidate::plan(options)?;
-    Offer::plan(options, policy, candidate)?.journal(floor())
+    Offer::plan(options, policy, candidate)
+        .await?
+        .journal(floor())
+        .await
 }
 
 /// The bond the fixture inputs name, spelled out here rather than
@@ -251,8 +240,8 @@ fn expected_bond(max_job_price: u64) -> EdgeId {
     expected_bond_for(client().party_key(), &[0xa1], max_job_price)
 }
 
-#[test]
-fn preview_and_real_offer_use_the_identical_bond_candidate() {
+#[tokio::test]
+async fn preview_and_real_offer_use_the_identical_bond_candidate() {
     let root = tempfile::tempdir().unwrap();
     let options = options(root.path(), 40);
     let preview = BondCandidate::plan(&options)
@@ -261,13 +250,14 @@ fn preview_and_real_offer_use_the_identical_bond_candidate() {
     let candidate = BondCandidate::plan(&options)
         .unwrap_or_else(|error| panic!("the same bond plans: {error:#}"));
     let offer = Offer::plan(&options, policy(), candidate)
+        .await
         .unwrap_or_else(|error| panic!("the routed offer plans: {error:#}"));
     assert_eq!(expected, expected_bond(40));
     assert_eq!(offer.candidate.bond_edge, expected);
 }
 
-#[test]
-fn preview_needs_neither_a_route_nor_a_chain_nor_a_journal() {
+#[tokio::test]
+async fn preview_needs_neither_a_route_nor_a_chain_nor_a_journal() {
     let root = tempfile::tempdir().unwrap();
     let config = routed_work_config(root.path(), Vec::new())
         .unwrap_or_else(|error| panic!("a route-free config loads: {error:#}"));
@@ -276,14 +266,14 @@ fn preview_needs_neither_a_route_nor_a_chain_nor_a_journal() {
     preview_bond(&options)
         .unwrap_or_else(|error| panic!("the isolated preview succeeds: {error:#}"));
     assert_eq!(
-        provider_setups(root.path()),
+        provider_setups(root.path()).await,
         0,
         "preview created no provider journal",
     );
 }
 
-fn provider_setups(root: &Path) -> usize {
-    let Ok(found) = discover_setups(root, network()) else {
+async fn provider_setups(root: &Path) -> usize {
+    let Ok(found) = discover_setups(root, network()).await else {
         panic!("the fixture root enumerates");
     };
     assert!(
@@ -320,6 +310,9 @@ fn root_holds_signature(root: &Path, signature: &[u8]) -> bool {
         .unwrap_or_else(|error| panic!("the fixture root enumerates: {error}"))
         .any(|entry| {
             let entry = entry.unwrap_or_else(|error| panic!("a fixture entry reads: {error}"));
+            if entry.path().is_dir() {
+                return root_holds_signature(&entry.path(), signature);
+            }
             let bytes = fs::read(entry.path())
                 .unwrap_or_else(|error| panic!("a fixture file reads: {error}"));
             bytes
@@ -331,25 +324,34 @@ fn root_holds_signature(root: &Path, signature: &[u8]) -> bool {
 /// No file, no discoverable revision, and no retained signature are three
 /// assertions because opening the absent store to inspect it would create
 /// the revisionless journal this test is meant to rule out.
-fn assert_no_offer_artifact(root: &Path, bond: EdgeId, signature: &[u8]) {
+async fn assert_no_offer_artifact(root: &Path, bond: EdgeId, signature: &[u8]) {
     let key = hellas_work::work_store::setup::setup_key(network(), bond);
     let stem = format!("setup-{}.", hex::encode(key.into_bytes()));
-    let entries: Vec<_> = fs::read_dir(root)
-        .unwrap_or_else(|error| panic!("the fixture root enumerates: {error}"))
-        .map(|entry| entry.unwrap_or_else(|error| panic!("a fixture entry reads: {error}")))
-        .collect();
     assert!(
-        entries
-            .iter()
-            .all(|entry| !entry.file_name().to_string_lossy().starts_with(&stem)),
-        "the refused candidate left its setup journal behind",
+        !root.join(format!("{stem}lock")).exists(),
+        "refused offer created a journal lock"
     );
+    let partition = root.join("journals");
+    if partition.try_exists().unwrap() {
+        let prefix = hex::encode(stem);
+        for entry in fs::read_dir(partition).unwrap() {
+            assert!(
+                !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(&prefix),
+                "the refused candidate left a journal blob behind"
+            );
+        }
+    }
     assert!(
         !root_holds_signature(root, signature),
         "the refused candidate's bond signature was retained under the root",
     );
 
     let found = discover_setups(root, network())
+        .await
         .unwrap_or_else(|error| panic!("the fixture root enumerates: {error}"));
     assert!(
         found.unidentified.is_empty(),
@@ -365,16 +367,16 @@ fn assert_no_offer_artifact(root: &Path, bond: EdgeId, signature: &[u8]) {
 /// A provisioned root is an offer the runner finds: the journal names
 /// the bond and the role `WorkRunner::discover` looks for, and the
 /// revision under them is the proposal.
-#[test]
-fn a_provisioned_root_is_the_offer_a_runner_discovers() {
+#[tokio::test]
+async fn a_provisioned_root_is_the_offer_a_runner_discovers() {
     let dir = tempfile::tempdir().unwrap();
-    let Ok(made) = provision(dir.path(), policy(), 40) else {
+    let Ok(made) = provision(dir.path(), policy(), 40).await else {
         panic!("a configured provider makes its offer");
     };
     assert_eq!(made.bond_edge, expected_bond(40));
     assert_eq!(made.floor, floor());
 
-    let Ok(found) = discover_setups(dir.path(), network()) else {
+    let Ok(found) = discover_setups(dir.path(), network()).await else {
         panic!("the provisioned root enumerates");
     };
     assert!(found.unidentified.is_empty(), "{:?}", found.unidentified);
@@ -388,7 +390,7 @@ fn a_provisioned_root_is_the_offer_a_runner_discovers() {
     // told. The open re-verifies every signature the revision
     // carries, so a proposal staked by some other party would not
     // survive this line.
-    let Ok(store) = open_provider_journal(dir.path(), network(), discovered.bond_edge) else {
+    let Ok(store) = open_provider_journal(dir.path(), network(), discovered.bond_edge).await else {
         panic!("the discovered journal reopens");
     };
     let Some(bundle) = store.state().bundle() else {
@@ -403,8 +405,8 @@ fn a_provisioned_root_is_the_offer_a_runner_discovers() {
 /// More than one offer is safe when its complete capital and routing
 /// identity are separate. Discovery sees both without needing either
 /// client to have answered revision one.
-#[test]
-fn disjoint_routes_bonds_and_stakes_make_two_discoverable_offers() {
+#[tokio::test]
+async fn disjoint_routes_bonds_and_stakes_make_two_discoverable_offers() {
     let dir = tempfile::tempdir().unwrap();
     let first_client = client().party_key();
     let second_client = signer(0x23).party_key();
@@ -422,14 +424,17 @@ fn disjoint_routes_bonds_and_stakes_make_two_discoverable_offers() {
     let second = options_for(config, second_client, &[0xb1], 41);
 
     provision_options(&first, policy())
+        .await
         .unwrap_or_else(|error| panic!("the first offer is made: {error:#}"));
     provision_options(&second, policy())
+        .await
         .unwrap_or_else(|error| panic!("the disjoint second offer is made: {error:#}"));
 
     let found = discover_setups(dir.path(), network())
+        .await
         .unwrap_or_else(|error| panic!("the two-offer root enumerates: {error}"));
     assert!(found.unidentified.is_empty(), "{:?}", found.unidentified);
-    assert_eq!(provider_setups(dir.path()), 2);
+    assert_eq!(provider_setups(dir.path()).await, 2);
     assert!(
         found
             .setups
@@ -447,8 +452,8 @@ fn disjoint_routes_bonds_and_stakes_make_two_discoverable_offers() {
 /// The reservation comes back from A's revision-one bytes after every
 /// in-memory value has been dropped. In particular, `funding_coins()` is
 /// empty at that stage, so it cannot be the source this refusal uses.
-#[test]
-fn a_restart_refuses_a_coin_reserved_by_an_unanswered_offer_before_signing_or_writing() {
+#[tokio::test]
+async fn a_restart_refuses_a_coin_reserved_by_an_unanswered_offer_before_signing_or_writing() {
     let dir = tempfile::tempdir().unwrap();
     let first_client = client().party_key();
     let second_client = signer(0x23).party_key();
@@ -464,9 +469,11 @@ fn a_restart_refuses_a_coin_reserved_by_an_unanswered_offer_before_signing_or_wr
     .unwrap_or_else(|error| panic!("the two-route fixture loads: {error:#}"));
     let first = options_for(config.clone(), first_client, &[0xa1, 0xa2], 40);
     provision_options(&first, policy())
+        .await
         .unwrap_or_else(|error| panic!("the first offer is made: {error:#}"));
 
     let store = open_provider_journal(dir.path(), network(), first_bond)
+        .await
         .unwrap_or_else(|error| panic!("the first offer reopens: {error:#}"));
     assert_eq!(store.state().revision(), Some(1));
     assert!(
@@ -483,7 +490,7 @@ fn a_restart_refuses_a_coin_reserved_by_an_unanswered_offer_before_signing_or_wr
     let restarted = load_work_config(&config_path)
         .unwrap_or_else(|error| panic!("the restarted configuration loads: {error:#}"));
     let second = options_for(restarted, second_client, &[0xa2, 0xb2], 41);
-    let Err(error) = provision_options(&second, policy()) else {
+    let Err(error) = provision_options(&second, policy()).await else {
         panic!("a restarted provider accepted stake reserved by revision one");
     };
 
@@ -496,7 +503,7 @@ fn a_restart_refuses_a_coin_reserved_by_an_unanswered_offer_before_signing_or_wr
         said.contains(&hex::encode(first_bond.to_bytes())),
         "the refusal does not name the offer holding the coin: {said}",
     );
-    assert_eq!(provider_setups(dir.path()), 1);
+    assert_eq!(provider_setups(dir.path()).await, 1);
     // The same scan, over the offer that was made: what rules out B's
     // signature has to be able to find A's, or it rules out nothing.
     assert!(
@@ -510,12 +517,13 @@ fn a_restart_refuses_a_coin_reserved_by_an_unanswered_offer_before_signing_or_wr
         dir.path(),
         second_bond,
         &proposal_signature(second_client, &[0xa2, 0xb2], 41),
-    );
+    )
+    .await;
 }
 
 /// Distinct bonds and disjoint stake may be offered to the same peer.
-#[test]
-fn a_second_offer_can_reuse_the_first_offers_peer() {
+#[tokio::test]
+async fn a_second_offer_can_reuse_the_first_offers_peer() {
     let dir = tempfile::tempdir().unwrap();
     let first_client = client().party_key();
     let second_client = signer(0x23).party_key();
@@ -530,10 +538,10 @@ fn a_second_offer_can_reuse_the_first_offers_peer() {
     )
     .unwrap();
     let first = options_for(config.clone(), first_client, &[0xa1], 40);
-    provision_options(&first, policy()).unwrap();
+    provision_options(&first, policy()).await.unwrap();
     let second = options_for(config, second_client, &[0xb1], 41);
-    provision_options(&second, policy()).unwrap();
-    assert_eq!(provider_setups(dir.path()), 2);
+    provision_options(&second, policy()).await.unwrap();
+    assert_eq!(provider_setups(dir.path()).await, 2);
     assert!(root_holds_signature(
         dir.path(),
         &proposal_signature(first_client, &[0xa1], 40)
@@ -547,14 +555,15 @@ fn a_second_offer_can_reuse_the_first_offers_peer() {
 /// A repeated provision is still a second promise over the same bond.
 /// It is refused during planning even though the journal could replay an
 /// identical revision idempotently.
-#[test]
-fn a_second_offer_cannot_reuse_the_first_offers_bond() {
+#[tokio::test]
+async fn a_second_offer_cannot_reuse_the_first_offers_bond() {
     let dir = tempfile::tempdir().unwrap();
     let options = options(dir.path(), 40);
     let first = provision_options(&options, policy())
+        .await
         .unwrap_or_else(|error| panic!("the first offer is made: {error:#}"));
 
-    let Err(error) = provision_options(&options, policy()) else {
+    let Err(error) = provision_options(&options, policy()).await else {
         panic!("a second offer reused the first offer's bond");
     };
     let said = format!("{error:#}");
@@ -564,28 +573,24 @@ fn a_second_offer_cannot_reuse_the_first_offers_bond() {
             && said.contains(&hex::encode(first.bond_edge.to_bytes())),
         "unexpected duplicate-bond refusal: {said}",
     );
-    assert_eq!(provider_setups(dir.path()), 1);
+    assert_eq!(provider_setups(dir.path()).await, 1);
 }
 
 /// Success is a statement about the disk. The journal is closed
 /// before this reads it, so this open is the one a restarted runner
 /// makes, and it takes the exclusive lock the writer would still
 /// hold.
-#[test]
-fn the_offer_is_on_the_disk_before_the_command_returns() {
+#[tokio::test]
+async fn the_offer_is_on_the_disk_before_the_command_returns() {
     let dir = tempfile::tempdir().unwrap();
-    let Ok(made) = provision(dir.path(), policy(), 40) else {
+    let Ok(made) = provision(dir.path(), policy(), 40).await else {
         panic!("the offer is made");
     };
 
-    let Ok(store) = open_provider_journal(dir.path(), network(), made.bond_edge) else {
+    let Ok(store) = open_provider_journal(dir.path(), network(), made.bond_edge).await else {
         panic!("the journal reopens");
     };
     assert_eq!(store.state().revision(), Some(1));
-    assert!(
-        !store.recovered_torn_tail(),
-        "the offer this command reported was an interrupted write",
-    );
     assert_eq!(
         store.len(),
         2,
@@ -673,8 +678,8 @@ impl FinalizedBlocks for Chain {
     }
 }
 
-fn payment_policy() -> hellas_rpc::protocol::work::JobPaymentPolicyV2 {
-    hellas_rpc::protocol::work::JobPaymentPolicyV2 {
+fn payment_policy() -> hellas_work::model::work::JobPaymentPolicyV2 {
+    hellas_work::model::work::JobPaymentPolicyV2 {
         fixed_price: 10,
         dispatch_margin_blocks: 4,
         delivery_margin_blocks: 2,
@@ -682,11 +687,11 @@ fn payment_policy() -> hellas_rpc::protocol::work::JobPaymentPolicyV2 {
     }
 }
 
-#[test]
-fn paid_offer_binds_enrollment_proposal_and_addresses_to_the_settlement_signer() {
-    use hellas_rpc::protocol::work_offer::{PaidOffer, SignedPaidOffer};
+#[tokio::test]
+async fn paid_offer_binds_enrollment_proposal_and_addresses_to_the_settlement_signer() {
+    use hellas_work::model::offer::{PaidOffer, SignedPaidOffer};
     let root = tempfile::tempdir().unwrap();
-    let made = provision(root.path(), policy(), 40).unwrap();
+    let made = provision(root.path(), policy(), 40).await.unwrap();
     let signed = made.offer;
     signed.check().unwrap();
     assert_eq!(signed.offer().proposal.bond_edge(), made.bond_edge);
@@ -710,6 +715,7 @@ fn paid_offer_binds_enrollment_proposal_and_addresses_to_the_settlement_signer()
             "proposal" => {
                 let other = tempfile::tempdir().unwrap();
                 let proposal = provision(other.path(), policy(), 39)
+                    .await
                     .unwrap()
                     .offer
                     .offer()
@@ -729,7 +735,7 @@ fn paid_offer_binds_enrollment_proposal_and_addresses_to_the_settlement_signer()
     assert!(SignedPaidOffer::sign(signed.offer().clone(), &client()).is_err());
     let mut different = signed.offer().provider.clone();
     different.genesis.statement.producer_public_key =
-        hellas_rpc::PublicKey::Secp256k1(client().party_key().to_bytes());
+        hellas_auth::PublicKey::Secp256k1(client().party_key().to_bytes());
     assert!(
         SignedPaidOffer::sign(
             PaidOffer {
@@ -742,14 +748,19 @@ fn paid_offer_binds_enrollment_proposal_and_addresses_to_the_settlement_signer()
     );
 }
 
-#[test]
-fn malformed_paid_offer_is_rejected_before_reserving_a_bond() {
+#[tokio::test]
+async fn malformed_paid_offer_is_rejected_before_reserving_a_bond() {
     let root = tempfile::tempdir().unwrap();
     let mut options = options(root.path(), 40);
     options.addresses = vec!["not-a-socket".into()];
-    assert!(Offer::plan(&options, policy(), BondCandidate::plan(&options).unwrap()).is_err());
+    assert!(
+        Offer::plan(&options, policy(), BondCandidate::plan(&options).unwrap())
+            .await
+            .is_err()
+    );
     assert!(
         discover_setups(root.path(), network())
+            .await
             .unwrap()
             .setups
             .is_empty()

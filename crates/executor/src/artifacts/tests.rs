@@ -3,8 +3,8 @@ use hellas_rpc::{
     ContentId,
     protocol::artifacts::{BoundTermId, TextExecution, TextPolicy},
 };
-fn runner_public_key() -> hellas_rpc::PublicKey {
-    hellas_rpc::ProducerSigningKey::from_secret_bytes([8; 32])
+fn runner_public_key() -> hellas_auth::PublicKey {
+    hellas_auth::ProducerSigningKey::from_secret_bytes([8; 32])
         .expect("valid test key")
         .public_key()
 }

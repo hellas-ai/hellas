@@ -10,6 +10,7 @@ otel = ["hellas-rpc?/otel"]
 # Chain/light-client domain vocabulary: addresses, transactions,
 # WebAuthn signature policy, and challenge derivation (`domain` module).
 domain = [
+    "dep:hellas-auth",
     "dep:base64ct",
     "dep:bs58",
     "dep:bytes",
@@ -101,6 +102,7 @@ indexer = [
     "dep:dirs",
     "dep:futures",
     "dep:futures-util",
+    "dep:hellas-private",
     "dep:hex",
     "dep:p256",
     "dep:prometheus-client",
@@ -172,8 +174,10 @@ futures = { workspace = true, optional = true }
 futures-util = { version = "0.3", optional = true, default-features = false, features = [
     "sink",
 ] }
+hellas-auth = { workspace = true, optional = true }
 hellas-genesis = { workspace = true, optional = true }
 hellas-kernel = { workspace = true, optional = true, default-features = false }
+hellas-private = { workspace = true, optional = true }
 hellas-rpc = { workspace = true, optional = true, features = ["chain"] }
 hellas-wire = { workspace = true, optional = true }
 hellas-work = { workspace = true, optional = true }
@@ -207,6 +211,7 @@ url = { version = "2", optional = true }
 commonware-consensus = { workspace = true, features = ["mocks"] }
 commonware-cryptography = { workspace = true, features = ["mocks"] }
 ed25519-dalek.workspace = true
+hellas-auth.workspace = true
 # The end-to-end money test signs a payment only after the client's own
 # re-execution reproduced the provider's answer, and that gate — the
 # `Reproducer` seam and the matched/refuted journal transition around it

@@ -90,6 +90,8 @@ fn regenerate() {
     let mut config = prost_build::Config::new();
     // Rare recovered-status detail should not enlarge every Work refusal.
     config.boxed(".hellas.work.v1.GrantRefusal.terminal");
+    // The handwritten Debug implementation omits issued application secrets.
+    config.skip_debug([".hellas.host.v1.IssueCredentialResponse"]);
     // NB: prost's `bytes(["."])` (decode `bytes` fields as `bytes::Bytes`
     // for zero-copy) is disabled because current call sites produce `Vec<u8>`.
     config.out_dir(&out_dir);
@@ -762,7 +764,9 @@ fn handler_signature(m: &MethodPlan) -> TokenStream {
         Shape::BidiStreaming => boxed_stream(request),
         _ => quote! { #request },
     };
-    let context = if m.connection_bound || (m.bounded_submit_tx && m.shape == Shape::Unary) {
+    let context = if m.connection_bound
+        || ((m.bounded_submit_tx || m.bounded_work_response) && m.shape == Shape::Unary)
+    {
         quote! { , context: ::hellas_wire::TransportContext }
     } else {
         quote! {}
@@ -772,7 +776,7 @@ fn handler_signature(m: &MethodPlan) -> TokenStream {
     // handlers return their response stream.
     let output = match m.shape {
         Shape::Unary => quote! { impl Into<crate::call::WithTrailer<#response>> + Send },
-        _ => boxed_stream(response),
+        _ => quote! { crate::call::ResponseStream<#response> },
     };
     // Every service carries the confidential-Open handshake method, named
     // `open` in each package. A dispatcher that never mounted an OpenHandler
@@ -907,9 +911,9 @@ fn dispatch_arm(m: &MethodPlan) -> TokenStream {
                     inbound,
                     &self.1,
                     crate::MAX_SUBMIT_WORK_RESPONSE_PROTO_BYTES,
-                    |req| {
+                    |req, context| {
                         let h = &self.0;
-                        async move { h.#fn_name(req).await }
+                        async move { h.#fn_name(req, context).await }
                     },
                 )
                 .await

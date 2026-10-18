@@ -2,6 +2,7 @@
 extern crate tracing;
 
 mod access;
+pub use access::GatewayAccess;
 mod anthropic;
 mod archive;
 mod backend;
@@ -24,8 +25,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
 use futures::Stream;
+use hellas_auth::ProducerSigningKey;
+use hellas_auth::authority::UnixMillis;
 use hellas_client::{cache, execution};
-use hellas_rpc::ProducerSigningKey;
 use iroh::{EndpointId, SecretKey};
 use serde::Serialize;
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
@@ -34,7 +36,6 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use self::state::GatewayState;
 
@@ -153,9 +154,9 @@ pub struct GatewayOptions {
     pub archive: ArchiveOptions,
     pub output_cache: cache::CacheOptions,
     pub paid_work: Option<Arc<dyn WorkExecutionBackend>>,
-    /// Load or create a stable bearer credential in a private file.
-    pub bearer_token_file: Option<PathBuf>,
-    /// Permit a non-loopback listener, with a persistent bearer credential.
+    /// Provisioned Auth credential and the host authority that admits HTTP requests.
+    pub access: GatewayAccess,
+    /// Permit a non-loopback listener.
     pub allow_remote: bool,
     pub host: String,
     pub port: Option<u16>,
@@ -214,7 +215,8 @@ pub enum ResponsesBackend {
 pub struct GatewayHandle {
     address: SocketAddr,
     bearer: String,
-    shutdown: Arc<tokio::sync::Notify>,
+    shutdown: tokio::sync::watch::Sender<bool>,
+    metrics: Option<tokio::task::JoinHandle<()>>,
     task: tokio::task::JoinHandle<crate::GatewayResult<()>>,
 }
 
@@ -223,14 +225,14 @@ impl GatewayHandle {
         self.address
     }
 
-    /// Return the ephemeral credential for an explicit local UI/control
+    /// Return the provisioned credential for an explicit local UI/control
     /// surface. The value is never included in `Debug` or logs.
     pub fn bearer(&self) -> &str {
         &self.bearer
     }
 
     pub fn request_shutdown(&self) {
-        self.shutdown.notify_one();
+        self.shutdown.send_replace(true);
     }
 
     pub fn is_finished(&self) -> bool {
@@ -239,13 +241,21 @@ impl GatewayHandle {
 
     pub async fn shutdown(mut self) -> crate::GatewayResult<()> {
         self.request_shutdown();
-        (&mut self.task).await.map_err(GatewayError::Task)?
+        let result = (&mut self.task)
+            .await
+            .map_err(GatewayError::Task)
+            .and_then(|result| result);
+        let metrics = match self.metrics.take() {
+            Some(metrics) => metrics.await.map_err(GatewayError::Task),
+            None => Ok(()),
+        };
+        result.and(metrics)
     }
 }
 
 impl Drop for GatewayHandle {
     fn drop(&mut self) {
-        self.shutdown.notify_one();
+        self.shutdown.send_replace(true);
     }
 }
 
@@ -262,12 +272,7 @@ pub async fn start(options: GatewayOptions) -> crate::GatewayResult<GatewayHandl
 }
 
 async fn start_gateway(options: GatewayOptions) -> crate::GatewayResult<GatewayHandle> {
-    let listener = bind_gateway(
-        &options.host,
-        options.port,
-        options.allow_remote && options.bearer_token_file.is_some(),
-    )
-    .await?;
+    let listener = bind_gateway(&options.host, options.port, options.allow_remote).await?;
     let state = Arc::new(GatewayState::from_options(&options).await?);
     let archive_policy = archive::Policy::new(
         options.archive.clone(),
@@ -276,13 +281,11 @@ async fn start_gateway(options: GatewayOptions) -> crate::GatewayResult<GatewayH
     archive_policy.prepare();
 
     // Every route below reaches an executor, so every route below is
-    // behind this run's credential. The layer goes on last, which in axum
+    // behind the provisioned Auth credential. The layer goes on last, which in axum
     // puts it outermost: a request without the credential is answered
     // before a handler, the provenance layer, or the executor sees it.
-    let bearer = Arc::new(match options.bearer_token_file.as_ref() {
-        Some(path) => access::Bearer::load_or_create(path)?,
-        None => access::Bearer::generate(),
-    });
+    let bearer = options.access.clone();
+    bearer.validate().await?;
     let app = Router::new()
         .route("/v1/chat/completions", post(openai::handle))
         .route("/v1/responses", post(responses::handle))
@@ -300,16 +303,6 @@ async fn start_gateway(options: GatewayOptions) -> crate::GatewayResult<GatewayH
     ));
     let app = app.layer(access::BearerLayer::new(bearer.clone()));
 
-    if let Some(metrics_port) = options.metrics_port {
-        let registry = Arc::new(prometheus_client::registry::Registry::default());
-        let bundle = crate::metrics::MetricsBundle::new(registry);
-        crate::metrics::spawn_metrics_server(
-            metrics_port,
-            bundle,
-            access::BearerLayer::new(bearer.clone()),
-        );
-    }
-
     info!("timeout: {}s", state.inference_timeout.as_secs());
     if let Some(causal_lm) = state.causal_lm.as_ref() {
         info!(
@@ -319,21 +312,33 @@ async fn start_gateway(options: GatewayOptions) -> crate::GatewayResult<GatewayH
         );
     }
 
-    launch_gateway(
+    let mut gateway = launch_gateway(
         app,
         listener,
-        bearer,
+        bearer.clone(),
         options.wrap.as_deref(),
         &options.wrap_args,
         options.paid_work.clone(),
     )
-    .await
+    .await?;
+    if let Some(metrics_port) = options.metrics_port {
+        let registry = Arc::new(prometheus_client::registry::Registry::default());
+        let bundle = crate::metrics::MetricsBundle::new(registry);
+        gateway.metrics = Some(crate::metrics::spawn_metrics_server(
+            metrics_port,
+            bundle,
+            access::BearerLayer::new(bearer),
+            gateway.shutdown.subscribe(),
+        ));
+    }
+
+    Ok(gateway)
 }
 
 async fn launch_gateway(
     app: Router,
     listener: tokio::net::TcpListener,
-    bearer: Arc<access::Bearer>,
+    bearer: GatewayAccess,
     wrap_command: Option<&str>,
     wrap_args: &[String],
     paid_work: Option<Arc<dyn WorkExecutionBackend>>,
@@ -345,26 +350,20 @@ async fn launch_gateway(
     let wrap_child = if let Some(command) = wrap_command {
         let base = format!("http://{bound_addr}");
         info!("wrapping `{command}` with gateway base {base}");
-        Some(wrap::spawn(
-            command,
-            wrap_args,
-            &base,
-            &bearer.child_credential(),
-        )?)
+        Some(wrap::spawn(command, wrap_args, &base, &bearer.bearer())?)
     } else {
         None
     };
 
-    let bearer_value = bearer.child_credential();
-    let shutdown = Arc::new(tokio::sync::Notify::new());
-    let server_shutdown = shutdown.clone();
+    let bearer_value = bearer.bearer();
+    let (shutdown, mut server_shutdown) = tokio::sync::watch::channel(false);
     let server = std::future::IntoFuture::into_future(
         axum::serve(
             listener,
             app.into_make_service_with_connect_info::<ConnectionId>(),
         )
         .with_graceful_shutdown(async move {
-            server_shutdown.notified().await;
+            let _ = server_shutdown.wait_for(|stopped| *stopped).await;
         }),
     );
 
@@ -382,7 +381,7 @@ async fn launch_gateway(
                         }
                         status = child.wait() => {
                             let status = status?;
-                            task_shutdown.notify_one();
+                            task_shutdown.send_replace(true);
                             server.await?;
                             if !status.success() {
                                 return Err(GatewayError::WrappedCommand(status));
@@ -404,6 +403,7 @@ async fn launch_gateway(
         address: bound_addr,
         bearer: bearer_value,
         shutdown,
+        metrics: None,
         task,
     })
 }
@@ -445,16 +445,22 @@ pub async fn run_http(options: HttpGatewayOptions) -> crate::GatewayResult<()> {
     wait_for_shutdown(start_http(options).await?).await
 }
 
-async fn wait_for_shutdown(mut handle: GatewayHandle) -> crate::GatewayResult<()> {
-    tokio::select! {
+/// Wait for a process signal or wrapped child, then join every gateway listener.
+pub async fn wait_for_shutdown(mut handle: GatewayHandle) -> crate::GatewayResult<()> {
+    let result = tokio::select! {
         signal = shutdown_signal() => {
             handle.request_shutdown();
-            let stopped = (&mut handle.task).await.map_err(GatewayError::Task)?;
+            let stopped = (&mut handle.task).await.map_err(GatewayError::Task).and_then(|result| result);
             signal.and(stopped)
         }
         result = &mut handle.task => {
-            result.map_err(GatewayError::Task)?
+            result.map_err(GatewayError::Task).and_then(|result| result)
         }
+    };
+    handle.request_shutdown();
+    match handle.metrics.take() {
+        Some(metrics) => result.and(metrics.await.map_err(GatewayError::Task)),
+        None => result,
     }
 }
 
@@ -549,10 +555,7 @@ fn next_id(prefix: &str) -> String {
 }
 
 fn now_unix() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs() as i64)
-        .unwrap_or(0)
+    (UnixMillis::now().unwrap_or_default().0 / 1_000) as i64
 }
 
 /// How many seconds remain until `deadline`, clamped to at least one

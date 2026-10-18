@@ -3,21 +3,20 @@
 use crate::grant_client::{
     GrantClientError, GrantSession, GrantSessionOptions, GrantTransport, GrantWorkResult,
 };
+use hellas_work::model::grant::records::{grant_producer, grant_transport};
 
 pub mod responses;
 use futures::future::BoxFuture;
+use hellas_auth::ProducerSigningKey;
 use hellas_gateway::{
     ExecutionEvent, WorkExecutionBackend, WorkExecutionRequest, WorkFetchRequest, WorkGatewayBusy,
     WorkGatewayError, WorkOutputStream,
 };
-use hellas_rpc::{
-    ProducerSigningKey,
-    output::OutputEvent,
-    protocol::{
-        work_fetch::{FetchRoutePolicy, PreparedPaidFetchInputV1},
-        work_grant::records::SignedOffer,
-        work_profile::{PreparedWorkInput, WorkPolicy},
-    },
+use hellas_rpc::output::OutputEvent;
+use hellas_work::model::{
+    fetch::{FetchRoutePolicy, PreparedPaidFetchInputV1},
+    grant::records::SignedOffer,
+    profile::{PreparedWorkInput, WorkPolicy},
 };
 use std::{
     sync::Arc,
@@ -50,11 +49,20 @@ fn client_error(e: GrantClientError) -> WorkGatewayError {
     use hellas_rpc::pb::work::{GrantRefusalCode as C, WorkRefused};
     let code = match &e {
         GrantClientError::Refused { code, .. } => Some(*code),
+        GrantClientError::Wire(status)
+        | GrantClientError::Client(hellas_client::ClientError::Wire { source: status, .. })
+            if matches!(
+                status.code(),
+                hellas_wire::WireCode::PermissionDenied | hellas_wire::WireCode::Unauthenticated
+            ) =>
+        {
+            Some(C::Unauthorized)
+        }
         GrantClientError::Store(store) => WorkRefused::from(store)
             .grant
             .and_then(|r| C::try_from(r.code).ok()),
         GrantClientError::Grant(grant) => WorkRefused::from(
-            &hellas_work::work_store::grant::GrantStoreError::Grant(grant.clone()),
+            &hellas_work::work_store::grant::NodeStoreError::Grant(grant.clone()),
         )
         .grant
         .and_then(|r| C::try_from(r.code).ok()),
@@ -110,21 +118,22 @@ impl GrantGateway {
         let signer = options.signer.clone();
         let timeout = options.timeout;
         let provider = iroh::EndpointId::from_bytes(
-            &options
-                .target
-                .offer()
-                .provider
-                .grant_transport()
-                .map_err(error)?,
+            &grant_transport(&options.target.offer().provider).map_err(error)?,
         )
         .map_err(|_| error(GrantGatewayError::Transport))?;
         let endpoint = match &transport {
             GrantTransport::Remote(endpoint) => Some(endpoint.clone()),
             GrantTransport::Local(_) => None,
         };
-        let mut session = GrantSession::open(options, transport)
-            .await
-            .map_err(client_error)?;
+        let mut session = match GrantSession::open(options, transport).await {
+            Ok(session) => session,
+            Err(error) => {
+                if let Some(endpoint) = endpoint {
+                    endpoint.close().await;
+                }
+                return Err(client_error(error));
+            }
+        };
         // Recover the single unresolved acceptance before admitting fresh work.
         // Lost bodies can only be resolved after their signed acceptance window.
         let deadline = Instant::now() + timeout;
@@ -187,7 +196,10 @@ impl GrantGateway {
         else {
             return Err(rejected(GrantGatewayError::NoMatchingPolicy));
         };
-        let template = policy.https.as_ref().expect("filtered HTTPS resource");
+        let template = policy
+            .https
+            .as_ref()
+            .ok_or_else(|| rejected(GrantGatewayError::NoMatchingPolicy))?;
         Ok(hellas_gateway::HttpGatewayConfig {
             service: service.clone(),
             method: method.clone(),
@@ -311,21 +323,20 @@ fn prepare(
             if candidates.next().is_some() {
                 return Err(rejected(GrantGatewayError::AmbiguousPolicy));
             }
-            let (body, manifest) = if let Some(https) = &policy.https {
+            let WorkPolicy::Fetch { contract, .. } = &policy.work else {
+                return Err(rejected(GrantGatewayError::NoMatchingPolicy));
+            };
+            let body = if let Some(https) = &policy.https {
                 let mut http = hellas_rpc::http_fetch::HttpFetchRequest::decode(&request.body)
                     .map_err(rejected)?;
                 https.prepare(&mut http).map_err(rejected)?;
-                (
-                    serde_json::to_vec(&http).map_err(error)?,
-                    hellas_rpc::FetchEnvironment::Http.manifest(),
-                )
-            } else if policy.work.allowed_environment()
-                == hellas_rpc::FetchEnvironment::OpenAiResponses.manifest_id()
-            {
-                (
-                    request.body,
-                    hellas_rpc::FetchEnvironment::OpenAiResponses.manifest(),
-                )
+                serde_json::to_vec(&http).map_err(error)?
+            } else if matches!(
+                contract.schema(),
+                hellas_rpc::FetchSchema::StatelessResponsesV1
+                    | hellas_rpc::FetchSchema::ResponsesItemsV1
+            ) {
+                request.body
             } else {
                 return Err(rejected(GrantGatewayError::NoMatchingPolicy));
             };
@@ -341,25 +352,27 @@ fn prepare(
             .map_err(error)?;
             return Ok((
                 policy.name.clone(),
-                PreparedPaidFetchInputV1::new(&events, &manifest)
+                PreparedPaidFetchInputV1::new(&events, contract)
                     .map_err(error)?
                     .into(),
             ));
         }
     };
     let standing = offer.offer();
-    let channel = hellas_rpc::protocol::work_grant::grant_channel_id(
+    let client =
+        hellas_auth::authority::PrincipalId::from_public_key(signer.public_key()).map_err(error)?;
+    let channel = hellas_work::model::grant::grant_channel_id(
         standing.network,
         standing.provider.content_id(),
         standing.grant.id,
-        standing.grant.kind.principal().id(),
+        client,
         standing.generation,
     );
-    let context = hellas_rpc::protocol::work_profile::WorkContext {
+    let context = hellas_work::model::profile::WorkContext {
         network: standing.network,
         channel: channel.0,
-        client: standing.grant.kind.principal().producer(),
-        provider: standing.provider.grant_producer().map_err(error)?,
+        client: hellas_kernel::Key::from_bytes(*client.as_bytes()),
+        provider: grant_producer(&standing.provider).map_err(error)?,
     };
     let prepared_input_digest = input
         .bound_digest(context.network, context.channel)
@@ -368,7 +381,7 @@ fn prepare(
         input.input_commitment().map_err(error)?.digest(),
     );
     let mut candidates = standing.grant.policies.iter().filter(|p| {
-        let binding = hellas_rpc::protocol::work_profile::JobInputBinding {
+        let binding = hellas_work::model::profile::JobInputBinding {
             prepared_input_digest,
             request_commitment,
             environment_commitment: p.work.allowed_environment(),

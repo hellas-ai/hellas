@@ -5,6 +5,11 @@ use std::str;
 pub type DagCborEncodeError = serde_ipld_dagcbor::EncodeError<std::collections::TryReserveError>;
 pub type DagCborDecodeError = serde_ipld_dagcbor::DecodeError<std::convert::Infallible>;
 
+pub fn all_distinct<T: Ord>(values: impl IntoIterator<Item = T>) -> bool {
+    let mut seen = std::collections::BTreeSet::new();
+    values.into_iter().all(|value| seen.insert(value))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, serde::Deserialize)]
 pub struct JsonBytes(#[serde(with = "serde_bytes")] pub Vec<u8>);
 
@@ -36,6 +41,52 @@ pub fn decode_dag_cbor<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, DagCborDe
     serde_ipld_dagcbor::from_slice(bytes)
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum BoundedCborError {
+    #[error("DAG-CBOR input exceeds its limit")]
+    InputLimit,
+    #[error("encoded DAG-CBOR exceeds its limit")]
+    OutputLimit,
+    #[error(transparent)]
+    Invalid(#[from] CanonicalDecodeError),
+}
+
+pub fn encode_bounded<T: Serialize>(
+    value: &T,
+    maximum: usize,
+) -> Result<Vec<u8>, BoundedCborError> {
+    let bytes = canonical_dag_cbor(value).map_err(|error| {
+        CanonicalDecodeError::new(format!("could not canonicalize decoded DAG-CBOR: {error}"))
+    })?;
+    if bytes.len() > maximum {
+        return Err(BoundedCborError::OutputLimit);
+    }
+    Ok(bytes)
+}
+
+/// Bound the input before invoking its deserializer, including for noncanonical protocols.
+pub fn decode_bounded<T: DeserializeOwned>(
+    bytes: &[u8],
+    maximum: usize,
+) -> Result<T, BoundedCborError> {
+    if bytes.len() > maximum {
+        return Err(BoundedCborError::InputLimit);
+    }
+    decode_dag_cbor(bytes)
+        .map_err(|error| CanonicalDecodeError::new(format!("invalid DAG-CBOR: {error}")).into())
+}
+
+pub fn decode_canonical_bounded<T: DeserializeOwned + Serialize>(
+    bytes: &[u8],
+    maximum: usize,
+) -> Result<T, BoundedCborError> {
+    let value = decode_bounded(bytes, maximum)?;
+    if encode_bounded(&value, maximum)? != bytes {
+        return Err(CanonicalDecodeError::new("DAG-CBOR body is not canonically encoded").into());
+    }
+    Ok(value)
+}
+
 /// Decode a value only when `bytes` are its one canonical DAG-CBOR spelling.
 ///
 /// `serde_ipld_dagcbor` accepts some semantically equivalent CBOR encodings on
@@ -43,22 +94,14 @@ pub fn decode_dag_cbor<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, DagCborDe
 /// signed protocol body whose canonicalization identifier promises exact
 /// bytes. Decode and re-encode before exposing the value so a verifier cannot
 /// accept a spelling that another implementation rejects.
-#[cfg(any(feature = "evaluate", feature = "fetch"))]
-pub(crate) fn decode_canonical_dag_cbor<T>(bytes: &[u8]) -> Result<T, CanonicalDecodeError>
+pub fn decode_canonical_dag_cbor<T>(bytes: &[u8]) -> Result<T, CanonicalDecodeError>
 where
     T: DeserializeOwned + Serialize,
 {
-    let value = serde_ipld_dagcbor::from_slice(bytes)
-        .map_err(|error| CanonicalDecodeError::new(format!("invalid DAG-CBOR: {error}")))?;
-    let canonical = canonical_dag_cbor(&value).map_err(|error| {
-        CanonicalDecodeError::new(format!("could not canonicalize decoded DAG-CBOR: {error}"))
-    })?;
-    if canonical != bytes {
-        return Err(CanonicalDecodeError::new(
-            "DAG-CBOR body is not canonically encoded",
-        ));
-    }
-    Ok(value)
+    decode_canonical_bounded(bytes, usize::MAX).map_err(|error| match error {
+        BoundedCborError::Invalid(error) => error,
+        error => CanonicalDecodeError::new(error.to_string()),
+    })
 }
 
 /// Minimal strict DAG-CBOR encoder for commitment blobs whose byte layout is

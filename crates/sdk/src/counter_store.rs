@@ -1,6 +1,6 @@
 use std::fs;
-use std::io::{ErrorKind, Write};
-use std::path::{Path, PathBuf};
+use std::io::ErrorKind;
+use std::path::PathBuf;
 
 use hellas_attestation::{AssertionCounterStore, AttestationError};
 
@@ -20,24 +20,19 @@ impl FilesystemAssertionCounterStore {
 
     fn path(&self, public_key: &[u8; 33], suffix: &str) -> PathBuf {
         self.directory
-            .join(format!("{}{suffix}", encode_hex(public_key)))
+            .join(format!("{}{suffix}", hex::encode(public_key)))
     }
 }
 
 impl AssertionCounterStore for FilesystemAssertionCounterStore {
     fn advance(&self, public_key: &[u8; 33], counter: u32) -> Result<(), AttestationError> {
-        create_private_directory(&self.directory).map_err(|_| AttestationError::State)?;
-        let lock = fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(self.path(public_key, ".lock"))
+        hellas_private::create_dir_all_durable(&self.directory)
             .map_err(|_| AttestationError::State)?;
-        fs::File::lock(&lock).map_err(|_| AttestationError::State)?;
-
+        hellas_private::restrict_directory(&self.directory).map_err(|_| AttestationError::State)?;
         let path = self.path(public_key, ".counter");
-        let previous = match fs::read(&path) {
+        let lock = hellas_private::open_lock_beside(&path).map_err(|_| AttestationError::State)?;
+        fs::File::lock(&lock).map_err(|_| AttestationError::State)?;
+        let previous = match hellas_private::read_bounded_regular_file(&path, 4) {
             Ok(stored) => match stored.as_slice() {
                 [a, b, c, d] => u32::from_be_bytes([*a, *b, *c, *d]),
                 _ => return Err(AttestationError::State),
@@ -49,50 +44,9 @@ impl AssertionCounterStore for FilesystemAssertionCounterStore {
             return Err(AttestationError::Counter);
         }
 
-        let mut temporary = tempfile::NamedTempFile::new_in(&self.directory)
-            .map_err(|_| AttestationError::State)?;
-        #[cfg(unix)]
-        temporary
-            .as_file()
-            .set_permissions({
-                use std::os::unix::fs::PermissionsExt;
-                fs::Permissions::from_mode(0o600)
-            })
-            .map_err(|_| AttestationError::State)?;
-        temporary
-            .write_all(&counter.to_be_bytes())
-            .and_then(|()| temporary.flush())
-            .and_then(|()| temporary.as_file().sync_all())
-            .map_err(|_| AttestationError::State)?;
-        temporary
-            .persist(&path)
-            .map_err(|_| AttestationError::State)?;
-        #[cfg(unix)]
-        fs::File::open(&self.directory)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|_| AttestationError::State)?;
-        Ok(())
+        hellas_private::write_atomically(&path, ".writing", &counter.to_be_bytes())
+            .map_err(|_| AttestationError::State)
     }
-}
-
-fn create_private_directory(path: &Path) -> std::io::Result<()> {
-    fs::create_dir_all(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-    }
-    Ok(())
-}
-
-fn encode_hex(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push(DIGITS[(byte >> 4) as usize] as char);
-        output.push(DIGITS[(byte & 0x0f) as usize] as char);
-    }
-    output
 }
 
 #[cfg(test)]
@@ -113,5 +67,13 @@ mod tests {
         let reopened = FilesystemAssertionCounterStore::new(directory.path().join("counters"));
         assert_eq!(reopened.advance(&key, 2), Err(AttestationError::Counter));
         reopened.advance(&key, 3).unwrap();
+    }
+    #[test]
+    fn corruption_fails_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let counters = FilesystemAssertionCounterStore::new(directory.path());
+        let key = [8; 33];
+        fs::write(counters.path(&key, ".counter"), [0, 1]).unwrap();
+        assert_eq!(counters.advance(&key, 3), Err(AttestationError::State));
     }
 }

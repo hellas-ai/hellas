@@ -1,3 +1,4 @@
+use hellas_work::model::grant::records::{decode_contact, grant_transport};
 use std::{collections::BTreeMap, fs, path::Path};
 
 use serde::{Deserialize, Serialize};
@@ -11,7 +12,7 @@ pub enum ConfigError {
     #[error(transparent)]
     ProviderId(#[from] crate::provider::InvalidProviderId),
     #[error(transparent)]
-    Grant(#[from] hellas_rpc::protocol::work_grant::records::GrantError),
+    Grant(#[from] hellas_work::model::grant::records::GrantError),
     #[error(transparent)]
     Key(#[from] iroh::KeyParsingError),
     #[error(transparent)]
@@ -209,8 +210,6 @@ pub fn validate_serve_args(args: &[String]) -> Result<()> {
         if [
             "--identity",
             "--owner",
-            "--owner-enrollment",
-            "--init-owner",
             "--grant-config",
             "--software-root",
             "--assurance",
@@ -264,23 +263,21 @@ impl Credentials {
         }
     }
 
-    pub fn owner_principal(
-        &self,
-    ) -> Result<Option<hellas_rpc::protocol::work_grant::records::Principal>> {
-        use hellas_rpc::protocol::work_grant::records::{MAX_PRINCIPAL_BYTES, Principal};
+    pub fn owner_principal(&self) -> Result<Option<hellas_rpc::ProviderEnrollmentBundle>> {
+        use hellas_work::model::grant::records::MAX_PRINCIPAL_BYTES;
         let Some(bundle) = &self.owner_enrollment else {
             return Ok(None);
         };
         if bundle.len() > MAX_PRINCIPAL_BYTES * 2 {
             return Err(ConfigError::OwnerBound);
         }
-        let principal = Principal::decode(&hex::decode(bundle)?)?;
+        let principal = decode_contact(&hex::decode(bundle)?)?;
         let owner = self
             .owner
             .as_deref()
             .ok_or(ConfigError::OwnerBinding)?
             .parse::<iroh::EndpointId>()?;
-        if principal.transport() != *owner.as_bytes() {
+        if grant_transport(&principal)? != *owner.as_bytes() {
             return Err(ConfigError::OwnerMismatch);
         }
         Ok(Some(principal))
@@ -351,8 +348,8 @@ impl Enrollment {
         }
         Ok(())
     }
-    pub fn principal(&self) -> Result<hellas_rpc::protocol::work_grant::records::Principal> {
-        use hellas_rpc::protocol::work_grant::records::{MAX_PRINCIPAL_BYTES, Principal};
+    pub fn principal(&self) -> Result<hellas_rpc::ProviderEnrollmentBundle> {
+        use hellas_work::model::grant::records::MAX_PRINCIPAL_BYTES;
         let bundle = self
             .bundle
             .as_deref()
@@ -360,11 +357,11 @@ impl Enrollment {
         if bundle.len() > MAX_PRINCIPAL_BYTES * 2 {
             return Err(ConfigError::EnrollmentBound);
         }
-        let principal = Principal::decode(&hex::decode(bundle)?)?;
-        if principal.id().0.to_string() != self.enrollment_id {
+        let principal = decode_contact(&hex::decode(bundle)?)?;
+        if principal.content_id().to_string() != self.enrollment_id {
             return Err(ConfigError::EnrollmentId);
         }
-        if principal.transport() != *self.node_id.parse::<iroh::EndpointId>()?.as_bytes() {
+        if grant_transport(&principal)? != *self.node_id.parse::<iroh::EndpointId>()?.as_bytes() {
             return Err(ConfigError::EnrollmentTransport);
         }
         Ok(principal)
@@ -401,14 +398,7 @@ pub fn lock_state(path: &Path) -> Result<fs::File> {
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
     fs::create_dir_all(parent)?;
-    let mut name = path.as_os_str().to_owned();
-    name.push(".lock");
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(name)?;
+    let file = hellas_private::open_lock_beside(path)?;
     file.try_lock().map_err(|source| ConfigError::Lock {
         path: path.into(),
         source,

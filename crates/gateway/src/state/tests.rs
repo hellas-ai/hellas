@@ -42,49 +42,55 @@ fn test_environment() -> CausalLmExecutionEnvironment {
 }
 
 /// A gateway pointed at one node, which callers then vary.
-fn options(provider_trust: Option<ProviderTrustAnchor>) -> GatewayOptions {
-    GatewayOptions {
-        archive: super::super::ArchiveOptions {
-            directory: "unused-test-archive".into(),
-            zdr: true,
+async fn options(
+    provider_trust: Option<ProviderTrustAnchor>,
+) -> (tempfile::TempDir, GatewayOptions) {
+    let fixture = crate::access::tests::Fixture::new().await;
+    (
+        fixture.root,
+        GatewayOptions {
+            archive: super::super::ArchiveOptions {
+                directory: "unused-test-archive".into(),
+                zdr: true,
+            },
+            output_cache: Default::default(),
+            paid_work: None,
+            access: fixture.access,
+            allow_remote: false,
+            host: "127.0.0.1".to_string(),
+            port: None,
+            node_id: Some(endpoint(1)),
+            node_addrs: Vec::new(),
+            retries: 2,
+            default_max_tokens: 128,
+            model_name: "smollm2-135m".to_string(),
+            causal_lm: Some(test_environment()),
+            tokenizer: Some("tokenizer.json".into()),
+            chat_template: None,
+            stop_token_ids: Vec::new(),
+            metrics_port: None,
+            responses_backend: ResponsesBackend::Hellas,
+            responses_proxy_url: String::new(),
+            responses_proxy_api_key_env: String::new(),
+            responses_fetch_route_service: String::new(),
+            responses_fetch_route_method: String::new(),
+            responses_fetch_execution_environment: None,
+            responses_fetch_request_overrides: Default::default(),
+            provider_trust,
+            producer_key: hellas_auth::ProducerSigningKey::from_secret_bytes([3; 32])
+                .expect("valid test key"),
+            assurance: hellas_rpc::Assurance::ProducerSigned,
+            secret_key: iroh::SecretKey::from([5; 32]),
+            wrap: None,
+            wrap_args: Vec::new(),
         },
-        output_cache: Default::default(),
-        paid_work: None,
-        bearer_token_file: None,
-        allow_remote: false,
-        host: "127.0.0.1".to_string(),
-        port: None,
-        node_id: Some(endpoint(1)),
-        node_addrs: Vec::new(),
-        retries: 2,
-        default_max_tokens: 128,
-        model_name: "smollm2-135m".to_string(),
-        causal_lm: Some(test_environment()),
-        tokenizer: Some("tokenizer.json".into()),
-        chat_template: None,
-        stop_token_ids: Vec::new(),
-        metrics_port: None,
-        responses_backend: ResponsesBackend::Hellas,
-        responses_proxy_url: String::new(),
-        responses_proxy_api_key_env: String::new(),
-        responses_fetch_route_service: String::new(),
-        responses_fetch_route_method: String::new(),
-        responses_fetch_execution_environment: None,
-        responses_fetch_request_overrides: Default::default(),
-        provider_trust,
-        producer_key: hellas_rpc::ProducerSigningKey::from_secret_bytes([3; 32])
-            .expect("valid test key"),
-        assurance: hellas_rpc::Assurance::ProducerSigned,
-        secret_key: iroh::SecretKey::from([5; 32]),
-        wrap: None,
-        wrap_args: Vec::new(),
-    }
+    )
 }
 
 #[cfg(unix)]
 #[tokio::test]
 async fn proxy_without_causal_lm_does_not_bind_remote_transport() {
-    let mut options = options(None);
+    let (_root, mut options) = options(None).await;
     options.causal_lm = None;
     options.tokenizer = None;
     options.responses_backend = ResponsesBackend::Proxy;
@@ -124,7 +130,7 @@ async fn paid_generation_records_after_payment_and_replays_without_a_backend() {
                 yield ExecutionEvent::Done(Outcome::Completed {
                     total_tokens: 2,
                     stop_reason: StopReason::MaxNewTokens,
-                    text_artifact: hellas_rpc::Digest::from_bytes([7; 32]),
+                    text_artifact: hellas_auth::Digest::from_bytes([7; 32]),
                     output_events: Vec::new(),
                 });
             }))
@@ -144,7 +150,7 @@ async fn paid_generation_records_after_payment_and_replays_without_a_backend() {
     let calls = Arc::new(AtomicUsize::new(0));
     let payment_ack = Arc::new(tokio::sync::Notify::new());
     let store = Arc::new(MemoryCacheStore::default());
-    let mut options = options(None);
+    let (_root, mut options) = options(None).await;
     options.tokenizer = Some(tokenizer.path().into());
     options.paid_work = Some(Arc::new(Paid {
         calls: calls.clone(),
@@ -238,7 +244,7 @@ async fn paid_capacity_is_a_retryable_error_and_uses_the_pool_deadline() {
         tokenizer.path(),
         br#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"hello":0,"<unk>":1},"unk_token":"<unk>"}}"#,
     ).unwrap();
-    let mut options = options(None);
+    let (_root, mut options) = options(None).await;
     options.tokenizer = Some(tokenizer.path().into());
     options.paid_work = Some(Arc::new(Busy));
     let state = GatewayState::from_options(&options).await.unwrap();

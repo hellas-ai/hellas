@@ -3,11 +3,12 @@ use thiserror::Error;
 
 use crate::protocol::value::{CanonicalDecodeError, decode_canonical_dag_cbor};
 use crate::{
-    Assurance, CanonicalizationId, Digest, Evaluate, EvaluateRequest, InputCommitment, Operation,
-    OutputEventEnvelope, OutputTranscriptBuilder, ProducerSigningKey, PublicKey, StreamVerifyError,
-    encode_token_ids, scheme_id, verify_output_event_envelopes,
+    Assurance, CanonicalizationId, Evaluate, EvaluateRequest, InputCommitment, Operation,
+    OutputEventEnvelope, OutputTranscriptBuilder, StreamVerifyError, encode_token_ids, scheme_id,
+    verify_output_event_envelopes,
 };
 use crate::{DagCborEncodeError, canonical_dag_cbor};
+use hellas_auth::{Digest, ProducerSigningKey, PublicKey};
 
 const OUTPUT_CANONICALIZATION: &[u8] = b"hellas.evaluate.output.v4";
 pub const TOKEN_DELTA_EVENT_KIND: &str = "evaluate.token_delta.v4";
@@ -153,7 +154,7 @@ fn validate_terminal(terminal: &EvaluateTerminal) -> Result<(), EvaluateProtocol
     Ok(())
 }
 
-pub(crate) fn validate_terminal_stop_witness(
+pub fn validate_terminal_stop_witness(
     terminal: &EvaluateTerminal,
 ) -> Result<(), EvaluateProtocolError> {
     EvaluateStopReason::from_u8(terminal.stop_reason.as_u8())?;

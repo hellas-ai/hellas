@@ -14,10 +14,10 @@ pub type Result<T> = std::result::Result<T, ConfigurationError>;
 pub enum ConfigurationError {
     #[error(transparent)]
     Json(#[from] serde_json::Error),
-    #[error("fetch configuration requires routes; legacy callers are unsupported")]
+    #[error("fetch configuration requires routes and cannot assign caller permissions")]
     FetchRoutes,
     #[error(
-        "grant configuration requires resources and machine_limits; journal and socket paths are managed"
+        "grant configuration requires resources; permissions, budgets and state paths cannot be assigned here"
     )]
     GrantResources,
     #[error("invalid or reserved credential environment variable")]
@@ -28,8 +28,6 @@ pub enum ConfigurationError {
     SizeBound,
     #[error("fetch config references a missing credential file")]
     MissingFile,
-    #[error("worker filesystem does not preserve credential directory ownership")]
-    DirectoryOwner,
     #[error("worker filesystem does not preserve private credential directory permissions")]
     DirectoryPermissions,
     #[error("could not create worker configuration directory")]
@@ -53,7 +51,7 @@ pub enum ConfigurationError {
 pub struct Configuration {
     /// The CLI's Fetch routes. Authority comes exclusively from Work grants.
     pub fetch_config: Value,
-    /// Complete Work resources and machine limits; journal/socket paths are managed.
+    /// Available Work resources; permissions and budgets require node administration.
     pub grant_config: Value,
     /// Provider-local credential environment, never returned by status or inventory.
     #[serde(default)]
@@ -90,7 +88,7 @@ mod tests {
         let parent = tempfile::tempdir().unwrap();
         let mut configuration = Configuration {
             fetch_config: json!({"routes":[{"auth_path":"@files/auth.json"}]}),
-            grant_config: json!({"resources":[],"machine_limits":[]}),
+            grant_config: json!({"resources":[]}),
             env: BTreeMap::new(),
             files: [("auth.json".into(), json!({"token":"fixture"}))].into(),
         };
@@ -146,12 +144,12 @@ impl Configuration {
                 .grant_config
                 .get("resources")
                 .is_some_and(Value::is_array)
-            && self
-                .grant_config
-                .get("machine_limits")
-                .is_some_and(Value::is_array)
+            && self.grant_config.get("machine_limits").is_none()
+            && self.grant_config.get("max_in_flight").is_none()
             && self.grant_config.get("journal_root").is_none()
-            && self.grant_config.get("control_socket").is_none())
+            && self.grant_config.get("control_socket").is_none()
+            && self.grant_config.get("control_certificate").is_none()
+            && self.grant_config.get("control_private_key").is_none())
         {
             return Err(ConfigurationError::GrantResources);
         }
@@ -236,6 +234,8 @@ impl Configuration {
         let mut grant_config = self.grant_config.clone();
         grant_config["journal_root"] = serde_json::json!(parent.join("grants"));
         grant_config["control_socket"] = serde_json::json!(parent.join("control.sock"));
+        grant_config["control_certificate"] = serde_json::json!(parent.join("control.cert.der"));
+        grant_config["control_private_key"] = serde_json::json!(parent.join("control.key.der"));
         resolve(&mut grant_config, &files, &self.files)?;
         let grant_path = stage.path().join("grant.json");
         crate::config::save_private(&grant_path, &grant_config, true)
@@ -254,18 +254,9 @@ impl Configuration {
 // Only for fresh, empty staging directories. Some provider filesystems ignore
 // mkdir's mode but support chmod. Verify the result before writing any secrets.
 fn restrict_staging_directory(path: &Path) -> Result<()> {
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-    let directory = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)
+    use std::os::unix::fs::PermissionsExt;
+    let directory = hellas_private::unix::open_owned_directory(path)
         .map_err(ConfigurationError::OpenDirectory)?;
-    let metadata = directory
-        .metadata()
-        .map_err(ConfigurationError::InspectDirectory)?;
-    if metadata.uid() != unsafe { libc::geteuid() } {
-        return Err(ConfigurationError::DirectoryOwner);
-    }
     directory
         .set_permissions(std::fs::Permissions::from_mode(0o700))
         .map_err(ConfigurationError::RestrictDirectory)?;

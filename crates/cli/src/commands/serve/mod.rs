@@ -1,12 +1,12 @@
 use crate::commands::CliResult;
 use anyhow::{Context, bail};
-#[cfg(feature = "evaluate")]
-use hellas_executor::GpuConfig;
+use hellas_auth::ProducerSigningKey;
 use hellas_executor::{
-    ExecutorMetrics, FetchRoute, FetchRouteEntry, FetchRoutePolicy, FetchRouteRegistry,
+    ExecutorMetrics, ExecutorSpawnConfig, FetchRoute, FetchRouteEntry, FetchRoutePolicy,
+    FetchRouteRegistry,
 };
 use hellas_kernel::Secp256k1Signer;
-use hellas_rpc::{Assurance, FetchEnvironment, ProducerSigningKey};
+use hellas_rpc::Assurance;
 use iroh::SecretKey;
 use serde::Deserialize;
 use std::collections::BTreeSet;
@@ -15,29 +15,19 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 mod codex_provider;
-mod node;
-mod node_handler;
 pub mod provision;
 pub mod work_config;
 
 pub use provision::{ProvisionOptions, run_provision};
 pub use work_config::{WorkConfig, load_work_config};
 
-pub use hellas_sdk::grant_provider::ManagedGrantOptions as GrantNodeConfig;
-
 pub struct ServeOptions {
-    pub grants: Option<GrantNodeConfig>,
+    pub grants: Option<hellas_sdk::grant_config::GrantConfig>,
     pub port: Option<u16>,
     pub discovery: bool,
     pub queue_size: usize,
     #[cfg(feature = "evaluate")]
-    pub content_paths: Vec<PathBuf>,
-    #[cfg(feature = "evaluate")]
-    pub content_roots: Vec<PathBuf>,
-    #[cfg(feature = "evaluate")]
-    pub content_index: Option<PathBuf>,
-    #[cfg(feature = "evaluate")]
-    pub gpu_config: GpuConfig,
+    pub evaluation: crate::evaluate::ServeArgs,
     /// The loaded paid-work configuration, not the path it came from.
     /// Its presence is still what serves the two work ALPNs; what is new
     /// is that the node holds the chain cross-check, the validator
@@ -61,7 +51,7 @@ pub struct ServeOptions {
     /// paid-work configuration still had nothing to sign a settlement
     /// with.
     pub settlement_key: Secp256k1Signer,
-    pub open_identity: Arc<crate::identity::OpenIdentity>,
+    pub open_identity: Arc<hellas_sdk::ProviderOpen<hellas_auth::ProducerSigningKey>>,
     pub assurance: Assurance,
 }
 
@@ -106,18 +96,28 @@ pub fn validate_provider_config(
 }
 
 pub async fn run(options: ServeOptions) -> CliResult<()> {
+    let fetch_routes = match options.fetch_config_file.as_deref() {
+        // The config file is the single source of fetch truth: routes,
+        // capabilities, cross-validated at load. No file
+        // means this node serves no Fetch routes. Work authorizes every execution.
+        Some(path) => load_fetch_config(path)?,
+        None => FetchRouteRegistry::default(),
+    };
+    // Counters live in the executor and are mutated inline; cloning the
+    // counter handles into a registry just adds a scrape view on the same
+    // underlying state.
+    let metrics = Arc::new(ExecutorMetrics::default());
+    let mut executor = ExecutorSpawnConfig::fetch_only(
+        Arc::new(options.producer_key),
+        options.assurance,
+        fetch_routes,
+    );
+    executor.queue_capacity = options.queue_size;
+    executor.metrics = metrics.clone();
+    executor.fetch_max_in_flight = options.fetch_max_in_flight;
+    executor.fetch_queue_capacity = options.fetch_queue_size;
     #[cfg(feature = "evaluate")]
-    let content_index = options
-        .content_index
-        .clone()
-        .map(Ok)
-        .unwrap_or_else(crate::identity::default_content_index_path)?;
-    #[cfg(feature = "evaluate")]
-    let content_store = crate::commands::environment::index_content(
-        &options.content_paths,
-        &options.content_roots,
-        &content_index,
-    )?;
+    options.evaluation.configure(&mut executor)?;
 
     // What the operator configured, said back once. A node with a
     // paid-work configuration serves its journals, answers every
@@ -129,7 +129,7 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
         // of them before the endpoint binds or advertises WorkSetup. This is
         // intentionally later than parsing: provisioning shares the parser
         // and is the command that may create the journal named here.
-        work_config::validate_work_routes(work)?;
+        work_config::validate_work_routes(work).await?;
         info!(
             network = %work.chain.network,
             validators = work.validators.len(),
@@ -145,7 +145,7 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
         );
         let chain = options.chain_node.start(work).await?;
         work_runner = Some((
-            node::WorkRunnerConfig {
+            hellas_sdk::paid_provider::WorkRunnerConfig {
                 network: work.chain.network,
                 journal_root: work.journal_root.clone(),
                 routes: work.routes.clone(),
@@ -166,40 +166,24 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
         buf[..len].copy_from_slice(&src[..len]);
         buf.to_vec()
     };
-    let fetch_routes = match options.fetch_config_file.as_deref() {
-        // The config file is the single source of fetch truth: routes,
-        // capabilities, cross-validated at load. No file
-        // means this node serves no Fetch routes. Work authorizes every execution.
-        Some(path) => load_fetch_config(path)?,
-        None => FetchRouteRegistry::default(),
-    };
-    // Counters live in the executor and are mutated inline; cloning the
-    // counter handles into a registry just adds a scrape view on the same
-    // underlying state.
-    let metrics = Arc::new(ExecutorMetrics::default());
     // Install signal handlers before publishing a ready local control socket.
     let shutdown = shutdown_signal().context("failed to listen for shutdown signal")?;
-    let node = node::spawn_node(node::NodeConfig {
-        port: options.port,
-        discovery: options.discovery,
-        queue_size: options.queue_size,
-        #[cfg(feature = "evaluate")]
-        content_store,
-        #[cfg(feature = "evaluate")]
-        gpu_config: options.gpu_config,
-        build,
-        graffiti,
-        fetch_routes,
-        fetch_max_in_flight: options.fetch_max_in_flight,
-        fetch_queue_size: options.fetch_queue_size,
-        work: work_runner,
-        grants: options.grants,
-        secret_key: options.secret_key,
-        producer_key: options.producer_key,
-        open_identity: options.open_identity,
-        assurance: options.assurance,
-        metrics: metrics.clone(),
-    })
+    let chain = work_runner.as_ref().map(|(_, chain)| chain.clone());
+    let node_id = options.secret_key.public();
+    let node = hellas_sdk::node_control::host::HostHandle::serve(
+        hellas_sdk::ProviderOptions {
+            port: options.port,
+            executor,
+            build,
+            graffiti,
+            work: work_runner,
+            grants: None,
+            discovery: options.discovery,
+            secret_key: options.secret_key,
+            open_identity: options.open_identity,
+        },
+        options.grants,
+    )
     .await
     .context("failed to start node server")?;
 
@@ -208,11 +192,10 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
         metrics.register_with(&mut registry);
         let bundle = crate::metrics::MetricsBundle::new(Arc::new(registry));
         #[cfg(feature = "otel")]
-        let bundle = bundle.with_iroh(node.iroh_metrics());
+        let bundle = bundle.with_iroh(node.provider_endpoint());
         crate::metrics::spawn_metrics_server(metrics_port, bundle);
     }
 
-    let node_id = node.node_id();
     let add_url = format!("https://explorer.hellas.ai/executors/add/{node_id}");
 
     eprintln!("Node ID:      {node_id}");
@@ -224,9 +207,11 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
 
     println!("Shutting down...");
     // Return failures through the CLI so its telemetry guard still flushes.
-    node.shutdown()
-        .await
-        .context("failed to drain and shut down RPC server")?;
+    let mut result = node.shutdown().await.map_err(anyhow::Error::from);
+    if let Some(chain) = chain {
+        result = result.and(chain.shutdown().await.map_err(anyhow::Error::from));
+    }
+    result.context("failed to drain and shut down RPC server")?;
 
     Ok(())
 }
@@ -308,39 +293,17 @@ enum FetchDestination {
         #[serde(default)]
         auth_path: Option<PathBuf>,
     },
-    /// Official OpenAI Responses, authenticated by an API key held in a local
-    /// environment variable.
-    OpenaiResponses {
-        #[serde(default = "default_openai_api_key_env")]
-        api_key_env: String,
-    },
-}
-
-fn default_openai_api_key_env() -> String {
-    "OPENAI_API_KEY".to_string()
 }
 
 impl FetchDestination {
     fn into_entry(self, capabilities: FetchRoutePolicy) -> CliResult<FetchRouteEntry> {
-        let (environment, provider): (FetchEnvironment, Arc<dyn hellas_executor::FetchProvider>) =
-            match self {
-                Self::Http { config } => return Ok(config.into_entry(capabilities)?),
-                Self::CodexResponses { auth_path } => (
-                    FetchEnvironment::CodexResponses,
-                    Arc::new(codex_provider::CodexResponsesFetchProvider::new(
-                        auth_path.as_deref(),
-                    )?),
-                ),
-                Self::OpenaiResponses { api_key_env } => (
-                    FetchEnvironment::OpenAiResponses,
-                    Arc::new(hellas_providers::OpenAiResponsesFetchProvider::new(
-                        &api_key_env,
-                    )?),
-                ),
-            };
-        let adaptor_factory = Arc::new(hellas_providers::ResponsesFetchAdaptorFactory::new(
-            environment,
-        ));
+        let provider: Arc<dyn hellas_executor::FetchProvider> = match self {
+            Self::Http { config } => return Ok(config.into_entry(capabilities)?),
+            Self::CodexResponses { auth_path } => Arc::new(
+                codex_provider::CodexResponsesFetchProvider::new(auth_path.as_deref())?,
+            ),
+        };
+        let adaptor_factory = Arc::new(hellas_providers::CodexResponsesAdaptorFactory::new()?);
         Ok(FetchRouteEntry::new(
             provider,
             adaptor_factory,

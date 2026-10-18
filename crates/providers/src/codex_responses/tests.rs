@@ -1,6 +1,7 @@
 use super::*;
+use hellas_auth::Digest;
+use hellas_rpc::InputCommitment;
 use hellas_rpc::fetch::{decode_fetch_event_payload, decode_fetch_terminal_payload};
-use hellas_rpc::{Digest, InputCommitment};
 use serde_json::json;
 
 fn call(value: JsonValue) -> FetchCall {
@@ -768,23 +769,23 @@ fn excluded_codex_extensions_and_malformed_identities_fail_closed() {
             .err()
             .expect("safety_buffering request must be rejected")
             .to_string()
-            .contains("safety_buffering")
+            .contains("invalid sealed Codex request")
     );
 
     let cases = [
         (
-            "present field must not be null",
+            "malformed Codex SSE event",
             json!({"type":"response.created","response":{"id":null}}),
         ),
         (
-            "safety_buffering",
+            "malformed Codex SSE event",
             json!({
                 "type":"response.output_item.done","safety_buffering":false,
                 "item":{"type":"message","role":"assistant","content":[]}
             }),
         ),
         (
-            "namespace",
+            "malformed Codex SSE event",
             json!({
                 "type":"response.output_item.done",
                 "item":{
@@ -794,7 +795,7 @@ fn excluded_codex_extensions_and_malformed_identities_fail_closed() {
             }),
         ),
         (
-            "internal_chat_message_metadata_passthrough",
+            "malformed Codex SSE event",
             json!({
                 "type":"response.output_item.done",
                 "item":{
@@ -825,4 +826,51 @@ fn excluded_codex_extensions_and_malformed_identities_fail_closed() {
             "unexpected error for {label}: {error}"
         );
     }
+}
+
+#[test]
+fn upstream_and_decoder_errors_exclude_private_content() {
+    let canary = "PRIVATE_PROMPT_CREDENTIAL_CANARY";
+    let mut unknown_field = json!({"type":"response.created", "response":{"id":"r"}});
+    unknown_field[canary] = json!(1);
+    let events = [
+        (
+            json!({"type":"error", "code":canary, "message":canary}),
+            "Codex upstream error",
+        ),
+        (
+            json!({"type":"response.failed", "response":{"error":{"code":canary,"message":canary}}}),
+            "Codex upstream failed",
+        ),
+        (json!({"type":canary}), "unsupported sealed Codex SSE event"),
+        (unknown_field, "malformed Codex SSE event"),
+    ];
+    for (event, reason) in events {
+        let mut session = create_session(&call(request(Vec::new()))).unwrap();
+        let error = session
+            .projector
+            .project(&sse(&[
+                json!({"type":"response.created", "response":{"id":"r"}}),
+                event,
+            ]))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains(reason),
+            "wrong failure stage: {error}"
+        );
+        assert!(
+            !error.to_string().contains(canary),
+            "private data entered a Fetch error: {error}"
+        );
+    }
+    let mut input = request(Vec::new());
+    input[canary] = json!(true);
+    let error = match create_session(&call(input)) {
+        Ok(_) => panic!("unknown request field accepted"),
+        Err(error) => error,
+    };
+    assert!(
+        !error.to_string().contains(canary),
+        "request data entered a Fetch error: {error}"
+    );
 }

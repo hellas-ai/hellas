@@ -37,6 +37,7 @@ hellas-adaptors = { workspace = true, optional = true }
 hellas-attestation = { workspace = true, features = [
     "apple-app-attest",
 ], optional = true }
+hellas-auth.workspace = true
 # The re-execution names the network its outcome is bound to, and that
 # type is the consensus kernel's. `work` is the only feature that reaches
 # it.
@@ -62,6 +63,7 @@ hellas-kernel = { workspace = true, features = ["secp256k1"] }
 # handler call: framing, method routing, and trailers are where a
 # wire-shaped mistake actually shows up.
 hellas-wire = { workspace = true, features = ["mux"] }
+hellas-work = { workspace = true, features = ["test-support"] }
 hex.workspace = true
 p256.workspace = true
 serde_bytes.workspace = true

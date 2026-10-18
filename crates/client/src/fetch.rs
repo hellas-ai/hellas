@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use hellas_auth::PublicKey;
 use hellas_rpc::execution_event::{WorkEvent, WorkFinished, work_event};
 #[cfg(test)]
 use hellas_rpc::fetch::verify_output_events;
@@ -12,8 +13,8 @@ use hellas_rpc::output::OutputEvent;
 use hellas_rpc::pb::fetch::FetchRequest;
 use hellas_rpc::stream::{input_event_from_pb, output_event_from_pb};
 use hellas_rpc::{
-    Assurance, EventCommitment, InputCommitment, Operation, OutputEventEnvelope, PublicKey,
-    StreamId, output_genesis, scheme_id, verify_output_event_continuation,
+    Assurance, EventCommitment, InputCommitment, Operation, OutputEventEnvelope, StreamId,
+    output_genesis, scheme_id, verify_output_event_continuation,
 };
 
 use crate::{ClientError, ClientResult};

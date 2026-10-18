@@ -345,12 +345,7 @@ fn generate_network(args: GenerateNetworkArgs) -> Result<(), ValidatorError> {
     std::fs::write(output_dir.join("genesis.json"), genesis_json)?;
     if let Some(treasury_key) = treasury_key {
         let path = output_dir.join("treasury.key");
-        std::fs::write(&path, treasury_key.to_bytes())?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-        }
+        hellas_private::write_atomically(&path, ".tmp", &treasury_key.to_bytes())?;
     }
 
     for (index, my_key) in keys.iter().enumerate() {
@@ -388,12 +383,7 @@ fn generate_network(args: GenerateNetworkArgs) -> Result<(), ValidatorError> {
         };
         let rendered = toml::to_string_pretty(&config)?;
         let path = output_dir.join(format!("validator-{index}.toml"));
-        std::fs::write(&path, rendered)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-        }
+        hellas_private::write_atomically(&path, ".tmp", rendered.as_bytes())?;
     }
 
     println!("{}", output_dir.join("genesis.json").display());
@@ -574,6 +564,10 @@ mod genesis_allocation_tests {
             output_dir: output_dir.clone(),
         })
         .unwrap();
+        for name in ["treasury.key", "validator-0.toml"] {
+            let file = hellas_private::open_nofollow(&output_dir.join(name)).unwrap();
+            assert!(hellas_private::is_private(&file).unwrap(), "{name}");
+        }
         let config: ValidatorConfig =
             toml::from_str(&std::fs::read_to_string(output_dir.join("validator-0.toml")).unwrap())
                 .unwrap();

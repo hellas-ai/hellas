@@ -1,4 +1,6 @@
 //! Identity-scoped management shared by the CLI and internal RPC.
+use hellas_auth::authority::UnixMillis;
+use hellas_work::model::grant::records::{grant_transport, verify_contact};
 use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
@@ -37,7 +39,7 @@ pub enum ManagementError {
     #[error(transparent)]
     Download(#[from] crate::agent::DownloadError),
     #[error(transparent)]
-    Grant(#[from] hellas_rpc::protocol::work_grant::records::GrantError),
+    Grant(#[from] hellas_work::model::grant::records::GrantError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
@@ -154,7 +156,7 @@ enum Source {
 pub struct Service {
     key: SecretKey,
     root: PathBuf,
-    enrollment: Option<hellas_rpc::protocol::work_grant::records::Principal>,
+    enrollment: Option<hellas_rpc::ProviderEnrollmentBundle>,
 }
 
 impl Service {
@@ -183,8 +185,9 @@ impl Service {
         mut self,
         bundle: hellas_rpc::ProviderEnrollmentBundle,
     ) -> Result<Self> {
-        let principal = hellas_rpc::protocol::work_grant::records::Principal::verify(bundle)?;
-        if principal.transport() != *self.key.public().as_bytes() {
+        verify_contact(&bundle)?;
+        let principal = bundle;
+        if grant_transport(&principal)? != *self.key.public().as_bytes() {
             return Err(ManagementError::EnrollmentTransport);
         }
         self.enrollment = Some(principal);
@@ -196,7 +199,6 @@ impl Service {
             self.enrollment
                 .as_ref()
                 .ok_or(ManagementError::EnrollmentRequired)?
-                .bundle()
                 .canonical_bytes(),
         ))
     }
@@ -395,11 +397,7 @@ impl Service {
                 }
                 machine.enrollment = Some(enrollment.clone());
                 machine.running = Some(*running);
-                machine.last_seen_unix = Some(
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)?
-                        .as_secs(),
-                );
+                machine.last_seen_unix = Some(UnixMillis::now()?.0 / 1_000);
                 save_private(&path, &machine, false)?;
             }
             _ => {}
@@ -482,16 +480,10 @@ pub enum DirectoryError {
 
 /// Refuse an existing shared or foreign directory instead of silently changing it.
 pub(crate) fn private_directory(path: &Path) -> std::result::Result<(), DirectoryError> {
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
-    let mut builder = std::fs::DirBuilder::new();
-    builder.recursive(true).mode(0o700);
-    builder.create(path)?;
-    let meta = std::fs::symlink_metadata(path)?;
-    if !(meta.is_dir()
-        && !meta.file_type().is_symlink()
-        && meta.uid() == unsafe { libc::geteuid() }
-        && meta.permissions().mode() & 0o077 == 0)
-    {
+    use std::os::unix::fs::PermissionsExt;
+    hellas_private::create_dir_all_durable(path)?;
+    let directory = hellas_private::unix::open_owned_directory(path)?;
+    if directory.metadata()?.permissions().mode() & 0o077 != 0 {
         return Err(DirectoryError::Permissions);
     }
     Ok(())

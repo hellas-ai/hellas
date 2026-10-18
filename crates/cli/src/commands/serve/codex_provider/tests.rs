@@ -78,7 +78,7 @@ fn request(body: &[u8]) -> PreparedFetchRequest {
         "codex",
         "responses",
         JsonBytes::new(body.to_vec()),
-        hellas_rpc::InputCommitment::from_digest(hellas_rpc::Digest::from_bytes([7; 32])),
+        hellas_rpc::InputCommitment::from_digest(hellas_auth::Digest::from_bytes([7; 32])),
     );
     PreparedFetchRequest::new(&call, call.body.clone())
 }
@@ -161,4 +161,48 @@ fn production_endpoint_is_the_manifest_endpoint() {
 fn non_expiring_token() -> String {
     let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"exp":4102444800}"#);
     format!("header.{payload}.signature")
+}
+
+use hellas_providers::test_support as interception;
+
+#[tokio::test]
+async fn codex_requests_and_refresh_reject_operator_interception() {
+    interception::rejects_operator_interception(
+        concat!(
+            module_path!(),
+            "::codex_requests_and_refresh_reject_operator_interception"
+        )
+        .trim_start_matches("hellas_cli::"),
+        2,
+        |url| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let auth = CodexAuthStore::with_token_url(dir.path().join("auth.json"), url.clone());
+            auth.save(&crate::commands::codex_auth::CodexAuthState::new(
+                crate::commands::codex_auth::test_tokens_with_account_id(
+                    &non_expiring_token(),
+                    "PRIVATE_REFRESH_CANARY",
+                    "PRIVATE_ACCOUNT_CANARY",
+                ),
+                None,
+            ))
+            .unwrap();
+            let provider = CodexResponsesFetchProvider::with_store(url, auth.clone());
+            let response = provider.run(request(b"PRIVATE_PROMPT_CANARY")).await;
+            let rejected = response.is_err();
+            drop(response);
+            // Force a separate refresh through the actual store/client path.
+            auth.save(&crate::commands::codex_auth::CodexAuthState::new(
+                crate::commands::codex_auth::test_tokens_with_account_id(
+                    "expired",
+                    "PRIVATE_REFRESH_CANARY",
+                    "PRIVATE_ACCOUNT_CANARY",
+                ),
+                None,
+            ))
+            .unwrap();
+            let refreshed = auth.access_token().await;
+            rejected && refreshed.is_err()
+        },
+    )
+    .await;
 }

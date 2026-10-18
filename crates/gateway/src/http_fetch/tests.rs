@@ -73,6 +73,7 @@ async fn http_uses_the_paid_backend_and_waits_for_its_payment_completion() {
             }]
         })).unwrap();
         let archive = tempfile::tempdir().unwrap();
+        let fixture = crate::access::tests::Fixture::new().await;
         let handle = start_http(HttpGatewayOptions {
             config,
             paid: paid.clone(),
@@ -82,7 +83,7 @@ async fn http_uses_the_paid_backend_and_waits_for_its_payment_completion() {
             },
             host: "127.0.0.1".into(),
             port: Some(0),
-            bearer_token_file: None,
+            access: fixture.access,
             allow_remote: false,
             wrap: None,
             wrap_args: Vec::new(),
@@ -199,7 +200,11 @@ fn retry_after_supports_dates_and_has_a_nonzero_fallback() {
 
 #[test]
 fn credentials_and_hop_headers_cannot_be_configured_as_static_headers() {
-    for name in ["authorization", "x-api-key", "cookie", "host", "connection"] {
+    for name in hellas_rpc::http_fetch::CREDENTIAL_HEADERS
+        .iter()
+        .copied()
+        .chain(["host", "connection"])
+    {
         let config = HttpGatewayConfig {
             service: "http".into(),
             method: "request".into(),

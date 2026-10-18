@@ -22,18 +22,19 @@ Attestation only works on a genuine, locked-down Apple machine.
    interface and the portable verifier.
 3. **Publish the offer.** Paid offers carry the enrollment and signed bond
    proposal, bound together by the provider's settlement key. Grant Offers
-   carry the enrollment with the grant. A requester derives the bundle's pin
-   from the verified offer and selects Apple app policy independently.
+   carry the enrollment with the grant. Paid clients compare the offered bundle
+   with independently approved enrollment and Apple software pins.
 4. **Serve with Apple assurance:** start the sealed-Fetch provider from Gate.
    The command-line node intentionally no longer owns DeviceCheck enrollment
    or native proof production.
 
 ## Requester
 
-Use the paid HTTPS Fetch gateway. Configure each pool entry's mandatory
-`provider_genesis` with the signed paid offer or an independently obtained
-ContentId pin. Select `apple_app_id` and `apple_cd_hashes` from trusted release
-metadata. See the
+Use the paid HTTPS Fetch gateway. Each pool entry selects a named `trust_policy`
+from the caller's native private `trust_store`. Approve the enrollment, Apple app ID,
+CDHashes and exact manifest IDs through the separate `hellas-cli trust ... approve`
+operation using independently reviewed release metadata. Offers cannot replace these
+pins. See the
 [paid gateway guide](../../../docs/paid-gateway.md) for funding and pool fields,
 and [HTTP routing](../../../docs/http-gateway.md) for exact route configuration.
 

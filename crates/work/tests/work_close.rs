@@ -16,42 +16,31 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use support::temp;
 
+use hellas_auth::Digest;
 use hellas_kernel::{
-    BlockHeight, Decode as _, Edge, EdgeId, EdgeValues, Fees, Key, LeaseSlots, List,
-    MAX_EDGE_OUTPUTS, Parties, Party, PaymentCloseStart, Payout, PendingSlot, RegistryChunk,
-    RegistryNamespace, RegistryRecordTag, Secp256k1Verifier, Terms, TermsHash,
-    WorkPaymentSettlement, WorkPaymentTerms, WorkStakeBondTerms, work_payment_settlement,
+    Edge, EdgeId, LeaseSlots, List, MAX_EDGE_OUTPUTS, Party, PaymentCloseStart, Payout,
+    PendingSlot, RegistryChunk, RegistryNamespace, RegistryRecordTag, Secp256k1Verifier, Terms,
 };
-use hellas_rpc::evaluate::{
-    EvaluateOutputTranscriptBuilder, EvaluateStopReason, EvaluateTerminal, EvaluateUsage,
-    input_commitment,
-};
+use hellas_rpc::OutputEventEnvelope;
 use hellas_rpc::observe::Samples;
 use hellas_rpc::pb::work::{
     AcceptWorkRequest, WorkRefusalCode, accept_work_response::Outcome as AcceptOutcome,
 };
-use hellas_rpc::protocol::Digest;
-use hellas_rpc::protocol::artifacts::{
-    BoundTermId, Canonical as _, InputAddressed as _, OutputAddressed as _, PreparedPaidInputV1,
-    SourceRef, TextArtifact, TextExecution, TextPolicy, TokenIds,
-};
-use hellas_rpc::protocol::work::{
-    EvaluatePolicyV2, JobDeadlines, PaidChannelPolicyV1, PaidJobAuthorizationV2,
-    PrivateRecord as _, generation_policy_digest, identity_source_digest,
-    private_policy_commitment, propose_authorization, signing_hash, work_id,
-};
-use hellas_rpc::protocol::work_setup::{
-    ObservedChannel, ReadyChannel, WorkChannelConfig, WorkChannelDescriptor, WorkSetupError,
-    payment_terms_hash,
-};
 use hellas_rpc::services::work::{WorkClientImpl, WorkServer};
-use hellas_rpc::{
-    Application, Assurance, CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR, ContentId, EvaluateRequest,
-    OutputEventEnvelope, ProducerSigningKey, ProgramManifest, PublicKey,
-};
 use hellas_wire::mux::MuxTransport;
 use hellas_wire::{Dispatcher, StreamTransport};
+use hellas_work::model::setup::{ObservedChannel, ReadyChannel, WorkSetupError};
+use hellas_work::model::work::{
+    PaidJobAuthorizationV2, PrivateRecord as _, propose_authorization, signing_hash, work_id,
+};
+use hellas_work::test_support::paid::{
+    CURSOR, HORIZON, OMISSION_BOND, PRICE, SALT, advance, bond_edge, bond_object, bundle,
+    channel_policy, client, commit, deadlines, descriptor, lease_over, network, origin, payload_at,
+    payment_edge, payment_object, payment_policy, payment_terms, provider, settlement, signer,
+    store_at, transcript_for, work_policy,
+};
 use hellas_work::work::{
     BackendFault, ClientEndpoint, CloseEndpoint, PaymentError, PreparedEvaluateInput,
     ProviderEndpoint, RunOutcome, WorkBackend, WorkService, admit_payment, fetch_result,
@@ -62,124 +51,15 @@ use hellas_work::work_close::{
     close_start, response_body_digest, start_body_digest,
 };
 use hellas_work::work_store::{
-    ChannelRecord, ChannelStore, CloseSettlement, JobPhase, JobState, Role, SetupOrigin,
-    TerminalOutcome,
+    ChannelRecord, ChannelStore, CloseSettlement, JobPhase, JobState, Role, TerminalOutcome,
 };
 
 mod support;
-use support::{
-    advance, bond_edge, client, network, payload_at, payment_edge, provider, signer, temp,
-};
 
 /// The one proposal nonce every job in this file carries.
 const NONCE: u8 = 1;
 
 // ── Fixture ───────────────────────────────────────────────────────────
-
-const HORIZON: u64 = 500;
-const PRICE: u64 = 10;
-const CREDIT_LIMIT: u64 = 40;
-/// One over half the funding, so the bond exceeds the capacity it
-/// leaves behind at zero fees.
-const OMISSION_BOND: u64 = 601;
-const PAYMENT_VALUE: u64 = 1_000;
-const PAYMENT_RESERVE: u64 = 200;
-const STAKE: u64 = 64;
-const SALT: [u8; 32] = [0x5a; 32];
-/// The finalized block both endpoints have processed through.
-const CURSOR: u64 = 10;
-/// The prompt this fixture's bundle carries, in tokens.
-const PROMPT_TOKENS: u64 = 4;
-/// A frame bound no legal delivery here comes close to.
-const WIDE_FRAME: u32 = 262_144;
-
-const fn deadlines() -> JobDeadlines {
-    JobDeadlines {
-        acceptance: 50,
-        terminal: 100,
-        payment: 200,
-    }
-}
-
-fn provider_producer() -> ProducerSigningKey {
-    match ProducerSigningKey::from_secret_bytes([0x22; 32]) {
-        Ok(key) => key,
-        Err(error) => panic!("a fixed scalar is a producer key: {error}"),
-    }
-}
-
-fn channel_policy() -> PaidChannelPolicyV1 {
-    PaidChannelPolicyV1 {
-        compute_credit_limit: CREDIT_LIMIT,
-        delivery_credit_limit: CREDIT_LIMIT,
-    }
-}
-
-fn bond_terms() -> WorkStakeBondTerms {
-    WorkStakeBondTerms {
-        parties: Parties::new(provider().party_key(), client().party_key()),
-        timeout: BlockHeight::new(HORIZON),
-        timeout_outputs: List::take(
-            [Payout::new(provider().party_key(), STAKE); MAX_EDGE_OUTPUTS],
-            1,
-        ),
-        max_job_price: 40,
-    }
-}
-
-fn payment_terms() -> WorkPaymentTerms {
-    WorkPaymentTerms {
-        bond_edge: bond_edge(),
-        bond_terms: bond_terms(),
-        private_policy_commitment: private_policy_commitment(network(), &SALT, &channel_policy()),
-        omit_response_blocks: hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
-        start_validity_blocks: 8,
-        omission_bond: OMISSION_BOND,
-    }
-}
-
-/// The execution policy every job here runs under.
-fn work_policy() -> EvaluatePolicyV2 {
-    EvaluatePolicyV2 {
-        allowed_environment: manifest().content_id(),
-        generation_policy_digest: match generation_policy_digest(&text_policy().canonical_bytes()) {
-            Ok(digest) => digest,
-            Err(error) => panic!("the fixture policy hashes: {error}"),
-        },
-        identity_source_digest: match identity_source_digest(&identity_artifact().canonical_bytes())
-        {
-            Ok(digest) => digest,
-            Err(error) => panic!("the fixture identity hashes: {error}"),
-        },
-        max_prompt_tokens: 512,
-        max_new_tokens: 128,
-        max_stop_token_ids: 4,
-        max_spool_bytes: 1_048_576,
-        max_encoded_result_frame: WIDE_FRAME,
-        max_encoded_prepared_input: 1_048_576,
-    }
-}
-
-fn payment_values() -> EdgeValues {
-    EdgeValues::new(PAYMENT_VALUE, PAYMENT_RESERVE, Fees::new(0, 0, 0, 0))
-}
-
-fn descriptor() -> WorkChannelDescriptor {
-    let config = WorkChannelConfig {
-        payment_policy: payment_policy(),
-        network: network(),
-        payment_edge: payment_edge(),
-        payment_terms: payment_terms(),
-        policy_salt: SALT,
-        channel_policy: channel_policy(),
-        work_policy: work_policy().into(),
-        expected_payment_values: payment_values(),
-    };
-    match WorkChannelDescriptor::open(config) {
-        Ok(descriptor) => descriptor,
-        Err(error) => panic!("the fixture channel opens: {error}"),
-    }
-}
 
 /// The channel, ready at the height both endpoints have processed
 /// through.
@@ -199,100 +79,7 @@ fn ready() -> ReadyChannel {
     }
 }
 
-fn settlement() -> WorkPaymentSettlement {
-    let Some(settlement) = work_payment_settlement(payment_values(), OMISSION_BOND) else {
-        panic!("a funded edge prices both exits");
-    };
-    settlement
-}
-
-fn store_at(root: &std::path::Path, ready: &ReadyChannel, role: Role, height: u64) -> ChannelStore {
-    let mut store = match ChannelStore::open(
-        root,
-        ready.channel().clone(),
-        settlement(),
-        role,
-        origin(),
-        &Secp256k1Verifier::new(),
-    ) {
-        Ok(store) => store,
-        Err(error) => panic!("the fixture store opens: {error}"),
-    };
-    advance(&mut store, height);
-    store
-}
-
-/// The fixture channel starts at the synthetic chain genesis.
-fn origin() -> SetupOrigin {
-    SetupOrigin {
-        payment_edge: payment_edge(),
-        height: 0,
-        payload: payload_at(0),
-        parent: [0_u8; 32],
-    }
-}
-
-/// Runs the production watcher over one empty finalized block per
-/// height, up through `height`.
-///
-/// The same call the settlement loop makes, so a fixture cursor is a
-/// cursor this endpoint could have reached.
-fn commit(store: &mut ChannelStore, record: ChannelRecord) {
-    if let Err(error) = store.commit(record, &Secp256k1Verifier::new()) {
-        panic!("the fixture record commits: {error}");
-    }
-}
-
 // ── The prepared inputs a job executes from ───────────────────────────
-
-fn manifest() -> ProgramManifest {
-    ProgramManifest::new(
-        Application::new(CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR).unwrap(),
-        ContentId::from_bytes([0x16; 32]),
-    )
-}
-
-fn prompt_tokens() -> TokenIds {
-    TokenIds::from([9, 8, 7, 6])
-}
-
-fn text_policy() -> TextPolicy {
-    TextPolicy::from_u32_stop_tokens(64, [2, 1])
-}
-
-fn identity_artifact() -> TextArtifact {
-    TextArtifact::identity(BoundTermId::from_digest(manifest().content_id().digest()))
-}
-
-fn text_execution() -> TextExecution {
-    TextExecution::new(
-        SourceRef::output(identity_artifact().output_id()),
-        prompt_tokens().output_id(),
-        text_policy().output_id(),
-    )
-}
-
-fn evaluate_request(nonce: u8) -> EvaluateRequest {
-    EvaluateRequest {
-        text_execution: text_execution().input_id().digest(),
-        runner_public_key: PublicKey::Secp256k1(client().party_key().to_bytes()),
-        execution_environment: manifest().content_id(),
-        nonce: [nonce; 32],
-        assurance: Assurance::ProducerSigned,
-        retain: true,
-    }
-}
-
-fn bundle(nonce: u8) -> PreparedPaidInputV1 {
-    PreparedPaidInputV1::new(
-        &evaluate_request(nonce),
-        &manifest(),
-        &text_execution(),
-        &prompt_tokens(),
-        &text_policy(),
-        &identity_artifact(),
-    )
-}
 
 fn authorization() -> PaidJobAuthorizationV2 {
     match propose_authorization(
@@ -312,7 +99,7 @@ fn authorization() -> PaidJobAuthorizationV2 {
 ///
 /// The acceptance exchange has its own file; these tests are about what
 /// happens after both signatures exist.
-fn accept(stores: &mut [&mut ChannelStore]) -> Digest {
+async fn accept(stores: &mut [&mut ChannelStore]) -> Digest {
     let authorization = authorization();
     let ready = ready();
     let id = work_id(ready.channel(), &authorization);
@@ -327,14 +114,16 @@ fn accept(stores: &mut [&mut ChannelStore]) -> Digest {
                 client_signature: client().sign(signing_hash(id)),
                 prepared_input: prepared_input.clone(),
             },
-        );
+        )
+        .await;
         commit(
             store,
             ChannelRecord::JobAccepted {
                 work_id: id,
                 provider_signature: provider().sign(signing_hash(id)),
             },
-        );
+        )
+        .await;
     }
     id
 }
@@ -342,34 +131,6 @@ fn accept(stores: &mut [&mut ChannelStore]) -> Digest {
 // ── Transcripts and the backend that produces them ────────────────────
 
 const ANSWER: [u32; 5] = [101, 102, 103, 104, 105];
-
-fn transcript_for(request: &EvaluateRequest, answer: &[u32]) -> Vec<OutputEventEnvelope> {
-    let key = provider_producer();
-    let mut builder =
-        EvaluateOutputTranscriptBuilder::new(input_commitment(request), request.assurance, &key);
-    if let Err(error) = builder.push_token_delta(answer.to_vec()) {
-        panic!("a non-empty delta pushes: {error}");
-    }
-    let usage = EvaluateUsage {
-        input_units: PROMPT_TOKENS,
-        output_units: answer.len() as u64,
-    };
-    let billable_units = match usage.billable_units() {
-        Ok(units) => units,
-        Err(error) => panic!("the fixture usage sums: {error}"),
-    };
-    match builder.finish(EvaluateTerminal {
-        final_position: answer.len() as u64,
-        stop_reason: EvaluateStopReason::STOP_TOKEN,
-        matched_stop_token_id: Some(1),
-        text_artifact: Digest::from_bytes([0x77; 32]),
-        usage,
-        billable_units,
-    }) {
-        Ok(events) => events,
-        Err(error) => panic!("the fixture transcript finishes: {error}"),
-    }
-}
 
 /// A backend that counts its calls and signs the fixture answer.
 struct AnsweringBackend {
@@ -415,8 +176,7 @@ async fn run_to_result(service: &WorkService, ready: &ReadyChannel, id: Digest) 
 
 // ── Transport plumbing ────────────────────────────────────────────────
 
-#[path = "support/transport.rs"]
-mod transport;
+use hellas_work::test_support::transport;
 use transport::transport_pair;
 
 /// Stops one serving task and waits for it to be gone.
@@ -440,85 +200,6 @@ fn serve(transport: MuxTransport, service: WorkService) -> tokio::task::JoinHand
 
 // ── Canonical chain objects, spelled out ──────────────────────────────
 
-const FORMAT_VERSION: u8 = 1;
-const TAG_BLOCK_HEIGHT: u8 = 1;
-const TAG_FEES: u8 = 2;
-const TAG_PARTIES: u8 = 3;
-const TAG_EDGE: u8 = 5;
-const TAG_BOND_LEASE: u8 = 31;
-/// `Freeze | Adjudicated`: close-kind tags 3 and 4.
-const WORK_PAYMENT_CLOSES: u8 = 0b0001_1000;
-/// `Timeout` alone: close-kind tag 1.
-const WORK_STAKE_CLOSES: u8 = 0b0000_0010;
-
-struct EdgeBytes {
-    value: u64,
-    reserve: u64,
-    maker: Key,
-    taker: Key,
-    terms: TermsHash,
-    allowed: u8,
-}
-
-impl EdgeBytes {
-    fn build(&self) -> Edge {
-        let mut out = vec![FORMAT_VERSION, TAG_EDGE];
-        out.extend_from_slice(&self.value.to_be_bytes());
-        out.extend_from_slice(&self.reserve.to_be_bytes());
-        out.extend_from_slice(&[FORMAT_VERSION, TAG_FEES]);
-        for _ in 0..4 {
-            out.extend_from_slice(&0_u64.to_be_bytes());
-        }
-        out.extend_from_slice(&[FORMAT_VERSION, TAG_BLOCK_HEIGHT]);
-        out.extend_from_slice(&HORIZON.to_be_bytes());
-        out.extend_from_slice(&[FORMAT_VERSION, TAG_PARTIES]);
-        out.extend_from_slice(&self.maker.to_bytes());
-        out.extend_from_slice(&self.taker.to_bytes());
-        out.extend_from_slice(self.terms.as_bytes());
-        out.push(self.allowed);
-        match Edge::decode_exact(&out) {
-            Ok(edge) => edge,
-            Err(error) => panic!("the hand-written edge is canonical: {error:?}"),
-        }
-    }
-}
-
-fn lease_over(bond: EdgeId, payment: EdgeId) -> LeaseSlots {
-    support::lease_over(
-        bond,
-        payment,
-        payment_terms_hash(payment_terms()).as_bytes(),
-        &payment_terms().private_policy_commitment,
-        HORIZON,
-        FORMAT_VERSION,
-        TAG_BOND_LEASE,
-    )
-}
-
-fn bond_object() -> Edge {
-    EdgeBytes {
-        value: STAKE,
-        reserve: 0,
-        maker: provider().party_key(),
-        taker: client().party_key(),
-        terms: Terms::work_stake_bond(bond_terms()).hash(),
-        allowed: WORK_STAKE_CLOSES,
-    }
-    .build()
-}
-
-fn payment_object() -> Edge {
-    EdgeBytes {
-        value: PAYMENT_VALUE,
-        reserve: PAYMENT_RESERVE,
-        maker: client().party_key(),
-        taker: provider().party_key(),
-        terms: payment_terms_hash(payment_terms()),
-        allowed: WORK_PAYMENT_CLOSES,
-    }
-    .build()
-}
-
 // ── The state this phase begins from ──────────────────────────────────
 
 /// One job, accepted, computed, delivered and independently checked.
@@ -539,9 +220,9 @@ async fn checked_job() -> Checked {
     let client_root = temp();
     let provider_root = temp();
     let ready = ready();
-    let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR);
-    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
-    let id = accept(&mut [&mut client_store, &mut provider_store]);
+    let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR).await;
+    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR).await;
+    let id = accept(&mut [&mut client_store, &mut provider_store]).await;
 
     let Ok(provider_endpoint) = ProviderEndpoint::new(ready.clone(), provider_store, provider())
     else {
@@ -563,7 +244,7 @@ async fn checked_job() -> Checked {
     // The oracle is `hellas-client`'s; what this file needs is the
     // durable verdict it records, which is the only phase an honest
     // client's journal signs a certificate from.
-    if let Err(error) = client.matched(id) {
+    if let Err(error) = client.matched(id).await {
         panic!("the fixture verdict records: {error}");
     }
     Checked {
@@ -615,9 +296,9 @@ async fn paid_job() -> Checked {
 /// this reads like the old one-block call and is not one: a loop over it
 /// stops where a loop inside the service stops, because the rule is the
 /// driver's and not the loop's.
-fn observe_one(service: &WorkService, applied: &FinalizedWork) -> Result<(), CatchUpError> {
+async fn observe_one(service: &WorkService, applied: &FinalizedWork) -> Result<(), CatchUpError> {
     match service.drive() {
-        Ok(mut driver) => driver.observe_finalized(applied),
+        Ok(mut driver) => driver.observe_finalized(applied).await,
         Err(_) => Err(CatchUpError::Busy),
     }
 }
@@ -753,11 +434,12 @@ async fn a_paid_job_closes_at_exactly_what_it_earned() {
         let Ok(held) = fixture
             .service
             .with_state(|state| state.max_executable_certificate())
+            .await
         else {
             panic!("the endpoint is reachable");
         };
         assert_eq!(held, PRICE);
-        match fixture.service.prepare_close() {
+        match fixture.service.prepare_close().await {
             Ok(start) => start,
             Err(error) => panic!("a paid channel closes: {error}"),
         }
@@ -794,10 +476,11 @@ async fn a_paid_job_closes_at_exactly_what_it_earned() {
         let Ok(before) = fixture
             .service
             .with_state(|state| state.close_prepared().cloned())
+            .await
         else {
             panic!("the endpoint is reachable");
         };
-        (fixture.service.prepare_close(), before)
+        (fixture.service.prepare_close().await, before)
     };
     match again {
         Ok(again) => assert_eq!(Some(&again), before.as_ref()),
@@ -815,12 +498,13 @@ async fn a_paid_job_closes_at_exactly_what_it_earned() {
                 hellas_kernel::Move::StartPaymentClose(start.clone()),
             )],
         );
-        if let Err(error) = observe_one(&fixture.service, &accepted) {
+        if let Err(error) = observe_one(&fixture.service, &accepted).await {
             panic!("the block applies: {error}");
         }
         let Ok((opened, cursor)) = fixture
             .service
             .with_state(|state| (state.close_opened(), state.cursor()))
+            .await
         else {
             panic!("the endpoint is reachable");
         };
@@ -847,7 +531,7 @@ async fn a_paid_job_closes_at_exactly_what_it_earned() {
             lease: lease_over(bond_edge(), payment_edge()),
             pending: pending_slot(&record),
         };
-        match fixture.service.adjudicated_close(&observed) {
+        match fixture.service.adjudicated_close(&observed).await {
             Ok(close) => close,
             Err(error) => panic!("a spent window closes: {error}"),
         }
@@ -884,7 +568,7 @@ async fn a_close_is_built_at_the_deadline_and_not_before_it() {
     let payment_edge_object = payment_object();
 
     let provider = &fixture.service;
-    let Ok(start) = provider.prepare_close() else {
+    let Ok(start) = provider.prepare_close().await else {
         panic!("a paid channel closes");
     };
     let id = contest_id(&ready, &start, inclusion);
@@ -896,7 +580,9 @@ async fn a_close_is_built_at_the_deadline_and_not_before_it() {
                 hellas_kernel::Move::StartPaymentClose(start),
             )],
         ),
-    ) {
+    )
+    .await
+    {
         panic!("the block applies: {error}");
     }
 
@@ -910,7 +596,7 @@ async fn a_close_is_built_at_the_deadline_and_not_before_it() {
             lease: lease_over(bond_edge(), payment_edge()),
             pending: pending_slot(&record),
         };
-        let built = provider.adjudicated_close(&observed);
+        let built = provider.adjudicated_close(&observed).await;
         if closable {
             if let Err(error) = built {
                 panic!("a close at {height} is admissible: {error}");
@@ -946,7 +632,7 @@ async fn a_close_settles_the_contest_this_endpoint_started() {
     let payment_edge_object = payment_object();
 
     let provider = &fixture.service;
-    let Ok(start) = provider.prepare_close() else {
+    let Ok(start) = provider.prepare_close().await else {
         panic!("a paid channel closes");
     };
     let id = contest_id(&ready, &start, inclusion);
@@ -963,7 +649,7 @@ async fn a_close_settles_the_contest_this_endpoint_started() {
     };
     assert!(
         matches!(
-            provider.adjudicated_close(&observed),
+            provider.adjudicated_close(&observed).await,
             Err(CloseError::NoContest)
         ),
         "an unread block is not a contest this endpoint holds",
@@ -977,10 +663,12 @@ async fn a_close_settles_the_contest_this_endpoint_started() {
                 hellas_kernel::Move::StartPaymentClose(start),
             )],
         ),
-    ) {
+    )
+    .await
+    {
         panic!("the block applies: {error}");
     }
-    if let Err(error) = provider.adjudicated_close(&observed) {
+    if let Err(error) = provider.adjudicated_close(&observed).await {
         panic!("the read contest closes: {error}");
     }
 
@@ -991,7 +679,7 @@ async fn a_close_settles_the_contest_this_endpoint_started() {
     };
     assert!(
         matches!(
-            provider.adjudicated_close(&absent),
+            provider.adjudicated_close(&absent).await,
             Err(CloseError::NoContest)
         ),
         "an empty slot is no contest",
@@ -1010,7 +698,7 @@ async fn a_close_settles_the_contest_this_endpoint_started() {
     };
     assert!(
         matches!(
-            provider.adjudicated_close(&other),
+            provider.adjudicated_close(&other).await,
             Err(CloseError::OtherContest)
         ),
         "another contest is not this endpoint's to settle",
@@ -1034,17 +722,17 @@ async fn a_close_settles_the_contest_this_endpoint_started() {
 async fn a_start_that_can_no_longer_land_is_replaced_and_one_that_can_is_not() {
     let fixture = paid_job().await;
     let provider = &fixture.service;
-    let Ok(first) = provider.prepare_close() else {
+    let Ok(first) = provider.prepare_close().await else {
         panic!("a paid channel closes");
     };
     let through = first.valid_through_height();
 
     // Every block up to the last one that could have included it.
     for height in (CURSOR + 1)..=through {
-        if let Err(error) = observe_one(provider, &block(height, Vec::new())) {
+        if let Err(error) = observe_one(provider, &block(height, Vec::new())).await {
             panic!("the block at {height} applies: {error}");
         }
-        match provider.prepare_close() {
+        match provider.prepare_close().await {
             Ok(again) => assert_eq!(
                 again, first,
                 "a start that can still be included at {height} is the one that is offered",
@@ -1054,10 +742,10 @@ async fn a_start_that_can_no_longer_land_is_replaced_and_one_that_can_is_not() {
     }
 
     // One block further, and the old signature can never be included.
-    if let Err(error) = observe_one(provider, &block(through + 1, Vec::new())) {
+    if let Err(error) = observe_one(provider, &block(through + 1, Vec::new())).await {
         panic!("the block applies: {error}");
     }
-    let Ok(replacement) = provider.prepare_close() else {
+    let Ok(replacement) = provider.prepare_close().await else {
         panic!("a spent start is replaced");
     };
     assert_ne!(replacement, first);
@@ -1065,6 +753,7 @@ async fn a_start_that_can_no_longer_land_is_replaced_and_one_that_can_is_not() {
     assert_eq!(
         provider
             .with_state(|state| state.close_prepared().cloned())
+            .await
             .ok(),
         Some(Some(replacement)),
         "and the disk holds the one that can land",
@@ -1086,7 +775,7 @@ async fn settlement_is_the_block_that_closed_the_edge() {
     let ready = fixture.ready.clone();
     let inclusion = CURSOR + 1;
     let provider = &fixture.service;
-    let Ok(start) = provider.prepare_close() else {
+    let Ok(start) = provider.prepare_close().await else {
         panic!("a paid channel closes");
     };
     let id = contest_id(&ready, &start, inclusion);
@@ -1098,7 +787,9 @@ async fn settlement_is_the_block_that_closed_the_edge() {
                 hellas_kernel::Move::StartPaymentClose(start),
             )],
         ),
-    ) {
+    )
+    .await
+    {
         panic!("the block applies: {error}");
     }
 
@@ -1113,20 +804,23 @@ async fn settlement_is_the_block_that_closed_the_edge() {
         lease: lease_over(bond_edge(), payment_edge()),
         pending: pending_slot(&record),
     };
-    let Ok(close) = provider.adjudicated_close(&observed) else {
+    let Ok(close) = provider.adjudicated_close(&observed).await else {
         panic!("a spent window closes");
     };
 
     for height in (inclusion + 1)..deadline {
-        if let Err(error) = observe_one(provider, &block(height, Vec::new())) {
+        if let Err(error) = observe_one(provider, &block(height, Vec::new())).await {
             panic!("the block at {height} applies: {error}");
         }
     }
-    if let Err(error) = observe_one(provider, &block(deadline, vec![close])) {
+    if let Err(error) = observe_one(provider, &block(deadline, vec![close])).await {
         panic!("the closing block applies: {error}");
     }
     assert_eq!(
-        provider.with_state(|state| state.close_settled()).ok(),
+        provider
+            .with_state(|state| state.close_settled())
+            .await
+            .ok(),
         Some(Some(CloseSettlement {
             height: deadline,
             payload: payload_at(deadline),
@@ -1153,7 +847,7 @@ async fn a_blocks_transactions_are_applied_in_consensus_order() {
     let ready = fixture.ready.clone();
     let inclusion = CURSOR + 1;
     let provider = &fixture.service;
-    let Ok(start) = provider.prepare_close() else {
+    let Ok(start) = provider.prepare_close().await else {
         panic!("a paid channel closes");
     };
     let id = contest_id(&ready, &start, inclusion);
@@ -1169,7 +863,7 @@ async fn a_blocks_transactions_are_applied_in_consensus_order() {
     // two together is the kernel's question; what is varied here is
     // only the order the watcher reads them in.
     let close = {
-        if let Err(error) = observe_one(provider, &block(inclusion, vec![start_tx.clone()])) {
+        if let Err(error) = observe_one(provider, &block(inclusion, vec![start_tx.clone()])).await {
             panic!("the block applies: {error}");
         }
         let observed = ObservedChannel {
@@ -1179,7 +873,7 @@ async fn a_blocks_transactions_are_applied_in_consensus_order() {
             lease: lease_over(bond_edge(), payment_edge()),
             pending: pending_slot(&record),
         };
-        match provider.adjudicated_close(&observed) {
+        match provider.adjudicated_close(&observed).await {
             Ok(close) => close,
             Err(error) => panic!("a spent window closes: {error}"),
         }
@@ -1189,21 +883,26 @@ async fn a_blocks_transactions_are_applied_in_consensus_order() {
     // A second provider, in the same state, that has read nothing.
     {
         let provider = &ordered.service;
-        if let Err(error) = provider.prepare_close() {
+        if let Err(error) = provider.prepare_close().await {
             panic!("a paid channel closes: {error}");
         }
         if let Err(error) = observe_one(
             provider,
             &block(inclusion, vec![start_tx.clone(), close.clone()]),
-        ) {
+        )
+        .await
+        {
             panic!("the block in consensus order applies: {error}");
         }
-        let Ok((opened, payout)) = provider.with_state(|state| {
-            (
-                state.close_opened(),
-                state.close_settled().map(|settled| settled.provider_payout),
-            )
-        }) else {
+        let Ok((opened, payout)) = provider
+            .with_state(|state| {
+                (
+                    state.close_opened(),
+                    state.close_settled().map(|settled| settled.provider_payout),
+                )
+            })
+            .await
+        else {
             panic!("the endpoint is reachable");
         };
         assert_eq!(opened, Some((id, Party::Taker)));
@@ -1212,16 +911,16 @@ async fn a_blocks_transactions_are_applied_in_consensus_order() {
 
     {
         let provider = &reversed.service;
-        if let Err(error) = provider.prepare_close() {
+        if let Err(error) = provider.prepare_close().await {
             panic!("a paid channel closes: {error}");
         }
-        let applied = observe_one(provider, &block(inclusion, vec![close, start_tx]));
+        let applied = observe_one(provider, &block(inclusion, vec![close, start_tx])).await;
         assert!(
             applied.is_err(),
             "a close before the start it answers is not a history this journal takes",
         );
         assert_eq!(
-            provider.with_state(|state| state.cursor()).ok(),
+            provider.with_state(|state| state.cursor()).await.ok(),
             Some((CURSOR, payload_at(CURSOR))),
             "and the cursor stays behind the block it could not apply",
         );
@@ -1244,7 +943,7 @@ struct Watcher {
     _provider_root: tempfile::TempDir,
 }
 
-fn restarted(fixture: Checked) -> Watcher {
+async fn restarted(fixture: Checked) -> Watcher {
     let Checked {
         client_root,
         provider_root,
@@ -1255,7 +954,7 @@ fn restarted(fixture: Checked) -> Watcher {
     } = fixture;
     drop(service);
     drop(client);
-    let store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
+    let store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR).await;
     match ProviderEndpoint::new(ready, store, provider()) {
         Ok(provider) => Watcher {
             provider,
@@ -1342,9 +1041,9 @@ impl FinalizedBlocks for CountingChain {
 async fn a_catch_up_reads_every_block_between() {
     let fixture = paid_job().await;
     let ready = fixture.ready.clone();
-    let mut watcher = restarted(fixture);
+    let mut watcher = restarted(fixture).await;
     let provider = &mut watcher.provider;
-    let Ok(start) = provider.prepare_close() else {
+    let Ok(start) = provider.prepare_close().await else {
         panic!("a paid channel closes");
     };
     let inclusion = CURSOR + 3;
@@ -1423,7 +1122,7 @@ async fn a_catch_up_reads_every_block_between() {
 async fn a_client_catch_up_reads_every_block_and_what_it_carried() {
     let client_root = temp();
     let ready = ready();
-    let client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR);
+    let client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR).await;
     let Ok(mut client) = ClientEndpoint::new(ready.clone(), client_store, client()) else {
         panic!("the client endpoint binds");
     };
@@ -1492,7 +1191,7 @@ async fn catch_up_services_a_new_close_duty_before_the_next_block() {
     let understated = close_start(ready.channel(), Party::Maker, CURSOR, None, &client())
         .expect("a client opens a close");
     let expected = contest_id(&ready, &understated, inclusion);
-    let mut watcher = restarted(fixture);
+    let mut watcher = restarted(fixture).await;
     let chain = CountingChain::over(vec![
         block(
             inclusion,
@@ -1543,7 +1242,7 @@ async fn restart_services_the_response_before_its_deadline() {
     // the store is dropped and reopened. The response window and the
     // claimed floor must survive that reopen, or the reopened provider
     // could not decide either.
-    let watcher = restarted(fixture);
+    let watcher = restarted(fixture).await;
     let Watcher {
         provider: mut endpoint,
         _provider_root,
@@ -1556,6 +1255,7 @@ async fn restart_services_the_response_before_its_deadline() {
                 hellas_kernel::Move::StartPaymentClose(understated),
             )],
         ))
+        .await
         .expect("the contest finalizes and journals CloseOpened");
     assert_eq!(
         endpoint.state().close_opened(),
@@ -1563,7 +1263,7 @@ async fn restart_services_the_response_before_its_deadline() {
     );
     drop(endpoint);
 
-    let store = store_at(_provider_root.path(), &ready, Role::Provider, CURSOR);
+    let store = store_at(_provider_root.path(), &ready, Role::Provider, CURSOR).await;
     let mut provider = ProviderEndpoint::new(ready.clone(), store, provider())
         .expect("the reopened provider binds");
     assert_eq!(
@@ -1633,7 +1333,7 @@ async fn a_serviced_contest_advances_the_cursor_and_settles() {
     let start_tx =
         hellas_kernel::Tx::move_action(hellas_kernel::Move::StartPaymentClose(understated.clone()));
 
-    let mut watcher = restarted(fixture);
+    let mut watcher = restarted(fixture).await;
     let sink = Mempool::default();
 
     // Tick one: the contest is read, the answer is journaled, and the
@@ -1747,7 +1447,7 @@ async fn a_refused_hand_off_leaves_a_retryable_answer_on_the_disk() {
         withheld: None,
     };
 
-    let watcher = restarted(fixture);
+    let watcher = restarted(fixture).await;
     let Watcher {
         provider: mut endpoint,
         _provider_root,
@@ -1763,11 +1463,11 @@ async fn a_refused_hand_off_leaves_a_retryable_answer_on_the_disk() {
         "the sink refused, and the step says so: {failed:?}",
     );
     drop(endpoint);
-    let written = journal_bytes(_provider_root.path());
+    let written = journal_records(_provider_root.path()).await;
 
     // The crash: the state the retry runs against is replayed from the
     // file, and it holds the answer the refused hand-off never sent.
-    let store = store_at(_provider_root.path(), &ready, Role::Provider, CURSOR);
+    let store = store_at(_provider_root.path(), &ready, Role::Provider, CURSOR).await;
     let mut endpoint = match ProviderEndpoint::new(ready.clone(), store, provider()) {
         Ok(endpoint) => endpoint,
         Err(error) => panic!("the reopened provider binds: {error}"),
@@ -1803,7 +1503,7 @@ async fn a_refused_hand_off_leaves_a_retryable_answer_on_the_disk() {
     );
     drop(endpoint);
     assert_eq!(
-        journal_bytes(_provider_root.path()),
+        journal_records(_provider_root.path()).await,
         written,
         "the retry appended nothing the refused hand-off had not already written",
     );
@@ -1846,7 +1546,7 @@ async fn a_crashed_answer_is_offered_before_any_successor_block() {
         provider: mut dying,
         _provider_root,
         _client_root,
-    } = restarted(fixture);
+    } = restarted(fixture).await;
     let refusing = Mempool {
         refuse: true,
         ..Mempool::default()
@@ -1862,7 +1562,7 @@ async fn a_crashed_answer_is_offered_before_any_successor_block() {
     drop(dying);
 
     // The restart, against a backlog that runs past the deadline.
-    let store = store_at(_provider_root.path(), &ready, Role::Provider, CURSOR);
+    let store = store_at(_provider_root.path(), &ready, Role::Provider, CURSOR).await;
     let mut provider = match ProviderEndpoint::new(ready.clone(), store, provider()) {
         Ok(provider) => provider,
         Err(error) => panic!("the reopened provider binds: {error}"),
@@ -1931,7 +1631,7 @@ async fn an_unenqueued_answer_is_sent_again_and_an_enqueued_one_is_not() {
         ],
         withheld: None,
     };
-    let mut watcher = restarted(fixture);
+    let mut watcher = restarted(fixture).await;
 
     // Two passes against a mempool with no room. Each is a send, because
     // neither was an enqueue.
@@ -2007,7 +1707,7 @@ async fn an_unenqueued_answer_outlives_a_backlog_past_the_deadline() {
             .collect(),
         withheld: None,
     };
-    let mut watcher = restarted(fixture);
+    let mut watcher = restarted(fixture).await;
 
     // Tick one: the scan stops on the contest, and the mempool has no
     // room for the answer.
@@ -2102,8 +1802,8 @@ async fn an_unenqueued_answer_outlives_a_backlog_past_the_deadline() {
 async fn a_contest_this_provider_opened_does_not_pin_the_cursor() {
     let fixture = paid_job().await;
     let ready = fixture.ready.clone();
-    let mut watcher = restarted(fixture);
-    let start = match watcher.provider.prepare_close() {
+    let mut watcher = restarted(fixture).await;
+    let start = match watcher.provider.prepare_close().await {
         Ok(start) => start,
         Err(error) => panic!("a paid channel closes: {error}"),
     };
@@ -2158,7 +1858,7 @@ async fn a_contest_this_provider_opened_does_not_pin_the_cursor() {
 async fn a_client_watcher_does_not_stop_on_a_contest() {
     let mut fixture = paid_job().await;
     let ready = fixture.ready.clone();
-    let start = match fixture.client.prepare_close() {
+    let start = match fixture.client.prepare_close().await {
         Ok(start) => start,
         Err(error) => panic!("a client closes its own channel: {error}"),
     };
@@ -2211,7 +1911,7 @@ async fn a_client_watcher_does_not_stop_on_a_contest() {
 async fn a_provider_with_nothing_to_add_does_not_pin_the_cursor() {
     let mut fixture = paid_job().await;
     let ready = fixture.ready.clone();
-    let start = match fixture.client.prepare_close() {
+    let start = match fixture.client.prepare_close().await {
         Ok(start) => start,
         Err(error) => panic!("a client closes at what it signed for: {error}"),
     };
@@ -2225,7 +1925,7 @@ async fn a_provider_with_nothing_to_add_does_not_pin_the_cursor() {
     let inclusion = CURSOR + 1;
     let expected = contest_id(&ready, &start, inclusion);
     let start_tx = hellas_kernel::Tx::move_action(hellas_kernel::Move::StartPaymentClose(start));
-    let mut watcher = restarted(fixture);
+    let mut watcher = restarted(fixture).await;
     let sink = Mempool::default();
 
     let opening = Chain {
@@ -2279,25 +1979,22 @@ fn adjudicated(ready: &ReadyChannel, payout: u64) -> hellas_kernel::Tx {
     )
 }
 
-/// Bytes the one channel journal under `root` holds.
+/// Records the one channel journal under `root` holds.
 ///
-/// A record the state already holds is never appended, so the file is
+/// A record the state already holds is never appended, so the journal is
 /// where a second write would have to show up — and the only place it
 /// could be counted from.
-fn journal_bytes(root: &std::path::Path) -> u64 {
-    let Ok(entries) = std::fs::read_dir(root) else {
+async fn journal_records(root: &std::path::Path) -> usize {
+    use hellas_work::work_store::journal::Journal;
+    let Ok(stems) = Journal::stems(root) else {
         panic!("the journal directory reads");
     };
-    let Some(path) = entries
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .find(|path| path.to_string_lossy().contains("channel-"))
-    else {
+    let Some(stem) = stems.iter().find(|stem| stem.starts_with("channel-")) else {
         panic!("the channel journal exists");
     };
-    match std::fs::metadata(&path) {
-        Ok(meta) => meta.len(),
-        Err(error) => panic!("the journal is measurable: {error}"),
+    match Journal::inspect(root, stem).await {
+        Ok((_, replay)) => replay.records.len(),
+        Err(error) => panic!("the journal is readable: {error}"),
     }
 }
 
@@ -2310,7 +2007,7 @@ fn journal_bytes(root: &std::path::Path) -> u64 {
 #[tokio::test]
 async fn a_withheld_block_leaves_the_cursor_behind() {
     let fixture = paid_job().await;
-    let mut watcher = restarted(fixture);
+    let mut watcher = restarted(fixture).await;
     let provider = &mut watcher.provider;
     let chain = Chain {
         blocks: ((CURSOR + 1)..=(CURSOR + 5))
@@ -2347,6 +2044,7 @@ async fn the_watcher_ends_a_job_its_payment_deadline_has_passed() {
     assert_eq!(
         provider
             .with_state(|state| state.jobs().next().map(JobState::phase))
+            .await
             .expect("the endpoint is reachable"),
         Some(JobPhase::Delivered),
     );
@@ -2354,28 +2052,30 @@ async fn the_watcher_ends_a_job_its_payment_deadline_has_passed() {
     // A closing provider with a delivered, unpaid job is refused: what
     // the client owes has not been decided yet.
     assert!(
-        provider.prepare_close().is_err(),
+        provider.prepare_close().await.is_err(),
         "a channel with an open job does not close",
     );
 
     for height in (CURSOR + 1)..=payment_deadline {
-        if let Err(error) = observe_one(provider, &block(height, Vec::new())) {
+        if let Err(error) = observe_one(provider, &block(height, Vec::new())).await {
             panic!("the block at {height} applies: {error}");
         }
     }
     assert!(
         provider
             .with_state(|state| state.jobs().next().is_some())
+            .await
             .expect("the endpoint is reachable"),
         "the deadline itself is still inside the window the client signed",
     );
 
-    if let Err(error) = observe_one(provider, &block(payment_deadline + 1, Vec::new())) {
+    if let Err(error) = observe_one(provider, &block(payment_deadline + 1, Vec::new())).await {
         panic!("the block past the deadline applies: {error}");
     }
     assert!(
         provider
             .with_state(|state| state.jobs().next().is_none())
+            .await
             .expect("the endpoint is reachable"),
         "the job is over",
     );
@@ -2385,13 +2085,14 @@ async fn the_watcher_ends_a_job_its_payment_deadline_has_passed() {
                 state.terminals().next().map(|terminal| &terminal.outcome),
                 Some(TerminalOutcome::Expired { .. }),
             ))
+            .await
             .expect("the endpoint is reachable"),
         "a delivered, unpaid job rests at an expired terminal the provider bears",
     );
 
     // The next blocks change nothing: the terminal is permanent.
     for height in (payment_deadline + 2)..=(payment_deadline + 4) {
-        if let Err(error) = observe_one(provider, &block(height, Vec::new())) {
+        if let Err(error) = observe_one(provider, &block(height, Vec::new())).await {
             panic!("the block at {height} applies: {error}");
         }
     }
@@ -2401,13 +2102,14 @@ async fn the_watcher_ends_a_job_its_payment_deadline_has_passed() {
                 state.terminals().next().map(|terminal| &terminal.outcome),
                 Some(TerminalOutcome::Expired { .. }),
             ))
+            .await
             .expect("the endpoint is reachable"),
         "the expired terminal is permanent",
     );
 
     // And now the channel can be closed, at nothing: the client never
     // signed a certificate, so there is none to carry.
-    match provider.prepare_close() {
+    match provider.prepare_close().await {
         Ok(start) => assert!(
             start.certificate().is_none(),
             "an unpaid channel claims nothing",
@@ -2419,10 +2121,10 @@ async fn the_watcher_ends_a_job_its_payment_deadline_has_passed() {
 // ── The signed window ─────────────────────────────────────────────────
 
 /// The same channel under another start-validity span.
-fn channel_with_span(span: u64) -> hellas_rpc::protocol::work::PaidChannel {
+fn channel_with_span(span: u64) -> hellas_work::model::work::PaidChannel {
     let mut terms = payment_terms();
     terms.start_validity_blocks = span;
-    match hellas_rpc::protocol::work::PaidChannel::new(
+    match hellas_work::model::work::PaidChannel::new(
         network(),
         payment_edge(),
         terms,
@@ -2530,13 +2232,13 @@ async fn a_start_signed_before_a_crash_is_the_start_that_is_resubmitted() {
     let fixture = paid_job().await;
     let signed = {
         let provider = &fixture.service;
-        match provider.prepare_close() {
+        match provider.prepare_close().await {
             Ok(start) => start,
             Err(error) => panic!("a paid channel closes: {error}"),
         }
     };
 
-    let mut watcher = restarted(fixture);
+    let mut watcher = restarted(fixture).await;
     assert_eq!(
         watcher.provider.state().close_prepared(),
         Some(&signed),
@@ -2549,10 +2251,11 @@ async fn a_start_signed_before_a_crash_is_the_start_that_is_resubmitted() {
     if let Err(error) = watcher
         .provider
         .observe_finalized(&block(CURSOR + 1, Vec::new()))
+        .await
     {
         panic!("the block applies: {error}");
     }
-    match watcher.provider.prepare_close() {
+    match watcher.provider.prepare_close().await {
         Ok(again) => assert_eq!(
             again, signed,
             "the retained start is resubmitted, not replaced by a fresh one",
@@ -2600,14 +2303,17 @@ async fn the_provider_answers_an_understated_contest_exactly_once() {
     };
     let id = contest_id(&ready, &understated, inclusion);
 
-    let mut watcher = restarted(fixture);
+    let mut watcher = restarted(fixture).await;
     let provider = &mut watcher.provider;
-    if let Err(error) = provider.observe_finalized(&block(
-        inclusion,
-        vec![hellas_kernel::Tx::move_action(
-            hellas_kernel::Move::StartPaymentClose(understated),
-        )],
-    )) {
+    if let Err(error) = provider
+        .observe_finalized(&block(
+            inclusion,
+            vec![hellas_kernel::Tx::move_action(
+                hellas_kernel::Move::StartPaymentClose(understated),
+            )],
+        ))
+        .await
+    {
         panic!("the block applies: {error}");
     }
     assert_eq!(provider.state().close_opened(), Some((id, Party::Maker)));
@@ -2624,7 +2330,10 @@ async fn the_provider_answers_an_understated_contest_exactly_once() {
 
     // One block before the deadline, the answer is the client's own
     // larger certificate.
-    let answered = match provider.respond_to_close(&read_at(deadline - 1, &open)) {
+    let answered = match provider
+        .respond_to_close(&read_at(deadline - 1, &open))
+        .await
+    {
         Ok(answer) => answer,
         Err(error) => panic!("an understated contest is answered: {error}"),
     };
@@ -2657,7 +2366,7 @@ async fn the_provider_answers_an_understated_contest_exactly_once() {
     // At the deadline the kernel calls it late, and so does this.
     assert!(
         matches!(
-            provider.respond_to_close(&read_at(deadline, &open)),
+            provider.respond_to_close(&read_at(deadline, &open)).await,
             Err(CloseError::ResponseWindowClosed { height, deadline: owed })
                 if height == deadline && owed == deadline
         ),
@@ -2671,7 +2380,9 @@ async fn the_provider_answers_an_understated_contest_exactly_once() {
     settled.penalty_due = true;
     assert!(
         matches!(
-            provider.respond_to_close(&read_at(deadline - 1, &settled)),
+            provider
+                .respond_to_close(&read_at(deadline - 1, &settled))
+                .await,
             Err(CloseError::AlreadyResponded)
         ),
         "there is one answer",
@@ -2682,7 +2393,7 @@ async fn the_provider_answers_an_understated_contest_exactly_once() {
     let level = Contest::opened(id, deadline, PRICE);
     assert!(
         matches!(
-            provider.respond_to_close(&read_at(deadline - 1, &level)),
+            provider.respond_to_close(&read_at(deadline - 1, &level)).await,
             Err(CloseError::NothingToAdd { held, settled }) if held == PRICE && settled == PRICE
         ),
         "an equal high-water has no legal answer",
@@ -2692,7 +2403,9 @@ async fn the_provider_answers_an_understated_contest_exactly_once() {
     let elsewhere = Contest::opened(hellas_kernel::StartId::from_bytes([0x77; 32]), deadline, 0);
     assert!(
         matches!(
-            provider.respond_to_close(&read_at(deadline - 1, &elsewhere)),
+            provider
+                .respond_to_close(&read_at(deadline - 1, &elsewhere))
+                .await,
             Err(CloseError::OtherContest)
         ),
         "another contest is not this endpoint's to answer",
@@ -2735,14 +2448,14 @@ async fn a_loop_of_one_block_calls_cannot_step_past_a_duty() {
     let inclusion = CURSOR + 1;
     let (opened, deadline) = understated_contest(&fixture.ready, inclusion);
     let provider = &fixture.service;
-    if let Err(error) = observe_one(provider, &opened) {
+    if let Err(error) = observe_one(provider, &opened).await {
         panic!("the block that opens the contest applies: {error}");
     }
 
     // One block at a time, the way a caller holding a loop drives, all
     // the way past the deadline it would otherwise cross.
     for height in (inclusion + 1)..=(deadline + 1) {
-        let stepped = observe_one(provider, &block(height, Vec::new()));
+        let stepped = observe_one(provider, &block(height, Vec::new())).await;
         assert!(
             matches!(stepped, Err(CatchUpError::CloseDuty { height: at }) if at == inclusion),
             "block {height} was stepped past the duty: {stepped:?}",
@@ -2751,6 +2464,7 @@ async fn a_loop_of_one_block_calls_cannot_step_past_a_duty() {
     assert_eq!(
         provider
             .with_state(|state| state.cursor().0)
+            .await
             .expect("the endpoint is reachable"),
         inclusion,
         "the cursor is still on the block that opened the contest",
@@ -2758,6 +2472,7 @@ async fn a_loop_of_one_block_calls_cannot_step_past_a_duty() {
     assert!(
         provider
             .with_state(|state| state.answerable_contest().is_some())
+            .await
             .expect("the endpoint is reachable"),
         "and the answer is still owed rather than late",
     );
@@ -2794,6 +2509,7 @@ async fn a_backlog_stops_on_the_block_that_opened_the_contest() {
         fixture
             .service
             .with_state(|state| state.cursor().0)
+            .await
             .expect("the endpoint is reachable"),
         inclusion,
     );
@@ -2801,6 +2517,7 @@ async fn a_backlog_stops_on_the_block_that_opened_the_contest() {
         fixture
             .service
             .with_state(|state| state.answerable_contest().is_some())
+            .await
             .expect("the endpoint is reachable"),
         "and the duty is owed inside its window, not past it",
     );
@@ -2846,6 +2563,7 @@ async fn a_driven_close_duty_is_discharged_and_the_cursor_passes() {
         fixture
             .service
             .with_state(|state| state.cursor().0)
+            .await
             .expect("the endpoint is reachable"),
         inclusion,
         "the read stopped on the contest to service it",
@@ -2867,6 +2585,7 @@ async fn a_driven_close_duty_is_discharged_and_the_cursor_passes() {
     let responded = fixture
         .service
         .with_state(|state| state.close_responded())
+        .await
         .expect("the endpoint is reachable")
         .expect("the serviced duty is on the disk");
     assert_eq!(
@@ -2887,6 +2606,7 @@ async fn a_driven_close_duty_is_discharged_and_the_cursor_passes() {
         fixture
             .service
             .with_state(|state| state.answerable_contest().is_some())
+            .await
             .expect("the endpoint is reachable"),
         "and the contest is still answerable on the disk, so it is the \
          hand-off that let the cursor through and not a record saying done",
@@ -2936,6 +2656,7 @@ async fn a_refused_hand_off_leaves_the_duty_owed_short_of_the_deadline() {
         let cursor = fixture
             .service
             .with_state(|state| state.cursor().0)
+            .await
             .expect("the endpoint is reachable");
         assert!(
             matches!(caught, Err(CatchUpError::CloseDuty { height }) if height == cursor),
@@ -2949,6 +2670,7 @@ async fn a_refused_hand_off_leaves_the_duty_owed_short_of_the_deadline() {
             fixture
                 .service
                 .with_state(|state| state.answerable_contest().is_some())
+                .await
                 .expect("the endpoint is reachable"),
             "{name}: and the answer is still owed rather than late",
         );
@@ -2962,9 +2684,9 @@ async fn ready_job() -> Checked {
     let client_root = temp();
     let provider_root = temp();
     let ready = ready();
-    let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR);
-    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
-    let id = accept(&mut [&mut client_store, &mut provider_store]);
+    let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR).await;
+    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR).await;
+    let id = accept(&mut [&mut client_store, &mut provider_store]).await;
     let Ok(provider_endpoint) = ProviderEndpoint::new(ready.clone(), provider_store, provider())
     else {
         panic!("the provider endpoint binds");
@@ -3017,11 +2739,12 @@ async fn a_finalized_close_start_takes_the_answer_off_the_wire() {
         assert_eq!(
             provider
                 .with_state(|state| state.jobs().next().map(JobState::phase))
+                .await
                 .expect("the endpoint is reachable"),
             Some(JobPhase::Ready),
             "the answer exists and has not left",
         );
-        if let Err(error) = observe_one(provider, &block(inclusion, vec![start_tx])) {
+        if let Err(error) = observe_one(provider, &block(inclusion, vec![start_tx])).await {
             panic!("the block applies: {error}");
         }
         let (opened, open_job, expired) = provider
@@ -3035,6 +2758,7 @@ async fn a_finalized_close_start_takes_the_answer_off_the_wire() {
                     ),
                 )
             })
+            .await
             .expect("the endpoint is reachable");
         assert_eq!(opened, Some((contest, Party::Maker)));
         assert!(
@@ -3065,7 +2789,7 @@ async fn a_finalized_close_start_takes_the_answer_off_the_wire() {
     // has reached its permanent terminal.
     let response = {
         let provider = &fixture.service;
-        provider.accept(&signed_request(NONCE, 1))
+        provider.accept(&signed_request(NONCE, 1)).await
     };
     let Some(AcceptOutcome::Refused(refused)) = response.outcome else {
         panic!("a terminated channel takes no work: {response:?}");
@@ -3088,6 +2812,7 @@ async fn a_block_out_of_order_writes_nothing_before_it_is_refused() {
     let provider = &fixture.service;
     let before = provider
         .with_state(|state| state.clone())
+        .await
         .expect("the endpoint is reachable");
 
     let Ok(understated) = close_start(ready.channel(), Party::Maker, CURSOR, None, &client())
@@ -3100,7 +2825,7 @@ async fn a_block_out_of_order_writes_nothing_before_it_is_refused() {
     // transition `observe` has would fire if it ran at all.
     let skipped = CURSOR + 2;
     assert!(skipped > deadlines().payment || CURSOR + 2 == skipped);
-    let applied = observe_one(provider, &block(skipped, vec![start_tx]));
+    let applied = observe_one(provider, &block(skipped, vec![start_tx])).await;
     assert!(
         matches!(
             applied,
@@ -3115,6 +2840,7 @@ async fn a_block_out_of_order_writes_nothing_before_it_is_refused() {
     assert_eq!(
         provider
             .with_state(|state| state.clone())
+            .await
             .expect("the endpoint is reachable"),
         before,
         "and nothing the block claimed reached the disk",
@@ -3137,7 +2863,7 @@ async fn a_first_catch_up_cannot_skip_the_channels_own_history() {
     let ready = ready();
     // A store that has read nothing since the channel opened, which is
     // what a provider coming up for the first time has.
-    let store = store_at(root.path(), &ready, Role::Provider, 0);
+    let store = store_at(root.path(), &ready, Role::Provider, 0).await;
     assert_eq!(store.state().cursor(), (0, payload_at(0)));
     let Ok(mut provider) = ProviderEndpoint::new(ready.clone(), store, provider()) else {
         panic!("the provider endpoint binds");
@@ -3178,7 +2904,7 @@ async fn a_first_catch_up_cannot_skip_the_channels_own_history() {
     );
 
     // And the channel it found closed admits no work.
-    let response = provider.accept(&signed_request(NONCE, 1));
+    let response = provider.accept(&signed_request(NONCE, 1)).await;
     let Some(AcceptOutcome::Refused(refused)) = response.outcome else {
         panic!("a settled edge takes no work: {response:?}");
     };
@@ -3247,9 +2973,9 @@ impl hellas_work::work_close::TxSink for Mempool {
 async fn a_retained_start_is_resubmitted_until_a_block_carries_it() {
     let fixture = paid_job().await;
     let ready = fixture.ready.clone();
-    let mut watcher = restarted(fixture);
+    let mut watcher = restarted(fixture).await;
     let provider = &mut watcher.provider;
-    let Ok(start) = provider.prepare_close() else {
+    let Ok(start) = provider.prepare_close().await else {
         panic!("a paid channel closes");
     };
     let start_tx =
@@ -3318,9 +3044,9 @@ async fn a_retained_start_is_resubmitted_until_a_block_carries_it() {
 #[tokio::test]
 async fn a_start_that_never_landed_reopens_the_channel() {
     let fixture = paid_job().await;
-    let mut watcher = restarted(fixture);
+    let mut watcher = restarted(fixture).await;
     let provider = &mut watcher.provider;
-    let Ok(start) = provider.prepare_close() else {
+    let Ok(start) = provider.prepare_close().await else {
         panic!("a paid channel closes");
     };
     assert!(provider.state().is_closing(), "the window is open");
@@ -3357,7 +3083,7 @@ async fn a_start_that_never_landed_reopens_the_channel() {
 
     // And so it may sign a fresh close: the one thing it needed was no
     // longer forbidden.
-    if let Err(error) = provider.prepare_close() {
+    if let Err(error) = provider.prepare_close().await {
         panic!("a channel not shut for good may still close: {error}");
     }
 }
@@ -3370,7 +3096,7 @@ async fn a_start_that_never_landed_reopens_the_channel() {
 #[tokio::test]
 async fn a_client_closes_the_channel_its_provider_stopped_answering() {
     let mut fixture = paid_job().await;
-    let start = match fixture.client.prepare_close() {
+    let start = match fixture.client.prepare_close().await {
         Ok(start) => start,
         Err(error) => panic!("a client closes its own channel: {error}"),
     };
@@ -3387,7 +3113,7 @@ async fn a_client_closes_the_channel_its_provider_stopped_answering() {
     );
 
     // Retained, and offered again rather than signed twice.
-    match fixture.client.prepare_close() {
+    match fixture.client.prepare_close().await {
         Ok(again) => assert_eq!(again, start),
         Err(error) => panic!("the retained start is offered again: {error}"),
     }
@@ -3436,7 +3162,7 @@ async fn each_deadline_ends_its_own_job() {
     {
         let root = temp();
         let ready = ready();
-        let mut store = store_at(root.path(), &ready, Role::Provider, CURSOR);
+        let mut store = store_at(root.path(), &ready, Role::Provider, CURSOR).await;
         let authorization = authorization();
         let Ok(prepared_input) = bundle(NONCE).encode() else {
             panic!("the fixture bundle encodes");
@@ -3449,13 +3175,14 @@ async fn each_deadline_ends_its_own_job() {
                     .sign(signing_hash(work_id(ready.channel(), &authorization))),
                 prepared_input,
             },
-        );
+        )
+        .await;
         let Ok(mut provider) = ProviderEndpoint::new(ready, store, provider()) else {
             panic!("the provider endpoint binds");
         };
 
         for height in (CURSOR + 1)..=deadlines().acceptance {
-            if let Err(error) = provider.observe_finalized(&block(height, Vec::new())) {
+            if let Err(error) = provider.observe_finalized(&block(height, Vec::new())).await {
                 panic!("the block at {height} applies: {error}");
             }
         }
@@ -3463,8 +3190,9 @@ async fn each_deadline_ends_its_own_job() {
             provider.state().jobs().next().is_some(),
             "the deadline itself is still a height the co-signature may be made at",
         );
-        if let Err(error) =
-            provider.observe_finalized(&block(deadlines().acceptance + 1, Vec::new()))
+        if let Err(error) = provider
+            .observe_finalized(&block(deadlines().acceptance + 1, Vec::new()))
+            .await
         {
             panic!("the block past acceptance applies: {error}");
         }
@@ -3490,13 +3218,13 @@ async fn each_deadline_ends_its_own_job() {
     {
         let root = temp();
         let ready = ready();
-        let mut store = store_at(root.path(), &ready, Role::Provider, CURSOR);
-        let _ = accept(&mut [&mut store]);
+        let mut store = store_at(root.path(), &ready, Role::Provider, CURSOR).await;
+        let _ = accept(&mut [&mut store]).await;
         let Ok(mut provider) = ProviderEndpoint::new(ready, store, provider()) else {
             panic!("the provider endpoint binds");
         };
         for height in (CURSOR + 1)..=deadlines().terminal {
-            if let Err(error) = provider.observe_finalized(&block(height, Vec::new())) {
+            if let Err(error) = provider.observe_finalized(&block(height, Vec::new())).await {
                 panic!("the block at {height} applies: {error}");
             }
         }
@@ -3504,7 +3232,9 @@ async fn each_deadline_ends_its_own_job() {
             provider.state().jobs().next().is_some(),
             "a result at the deadline itself is still owed and still payable",
         );
-        if let Err(error) = provider.observe_finalized(&block(deadlines().terminal + 1, Vec::new()))
+        if let Err(error) = provider
+            .observe_finalized(&block(deadlines().terminal + 1, Vec::new()))
+            .await
         {
             panic!("the block past the terminal deadline applies: {error}");
         }
@@ -3538,7 +3268,7 @@ async fn a_local_ending_is_the_providers_own_failed_terminal() {
     let fixture = checked_job().await;
     let id = fixture.id;
     let provider = &fixture.service;
-    if let Err(error) = provider.end_run(id) {
+    if let Err(error) = provider.end_run(id).await {
         panic!("the local ending records: {error}");
     }
     let (open_job, failed) = provider
@@ -3551,6 +3281,7 @@ async fn a_local_ending_is_the_providers_own_failed_terminal() {
                 ),
             )
         })
+        .await
         .expect("the endpoint is reachable");
     assert!(!open_job, "the job is over");
     assert!(
@@ -3576,7 +3307,7 @@ async fn a_local_ending_is_the_providers_own_failed_terminal() {
 /// and the funded edge, which is exactly what `work_open::mount` hands a
 /// close-only channel. Nothing here calls `check_ready`, and on these
 /// channels nothing could.
-fn close_only_store(root: &std::path::Path, height: u64) -> ChannelStore {
+async fn close_only_store(root: &std::path::Path, height: u64) -> ChannelStore {
     let mut store = match ChannelStore::open(
         root,
         descriptor().channel().clone(),
@@ -3584,11 +3315,13 @@ fn close_only_store(root: &std::path::Path, height: u64) -> ChannelStore {
         Role::Provider,
         origin(),
         &Secp256k1Verifier::new(),
-    ) {
+    )
+    .await
+    {
         Ok(store) => store,
         Err(error) => panic!("the close-only store opens: {error}"),
     };
-    advance(&mut store, height);
+    advance(&mut store, height).await;
     store
 }
 
@@ -3600,7 +3333,7 @@ struct CloseWatcher {
     _provider_root: tempfile::TempDir,
 }
 
-fn close_only_restart(fixture: Checked, height: u64) -> CloseWatcher {
+async fn close_only_restart(fixture: Checked, height: u64) -> CloseWatcher {
     let Checked {
         client_root,
         provider_root,
@@ -3610,7 +3343,7 @@ fn close_only_restart(fixture: Checked, height: u64) -> CloseWatcher {
     } = fixture;
     drop(service);
     drop(client);
-    let store = close_only_store(provider_root.path(), height);
+    let store = close_only_store(provider_root.path(), height).await;
     match CloseEndpoint::new(store, provider()) {
         Ok(provider) => CloseWatcher {
             provider,
@@ -3641,9 +3374,10 @@ fn observed<'a>(
 }
 
 /// What this service answers the proposal with.
-fn proposal_refusal(service: &WorkService, proposal_nonce: u64) -> i32 {
+async fn proposal_refusal(service: &WorkService, proposal_nonce: u64) -> i32 {
     match service
         .accept(&signed_request(NONCE, proposal_nonce))
+        .await
         .outcome
     {
         Some(AcceptOutcome::Refused(refused)) => refused.code,
@@ -3699,7 +3433,7 @@ async fn a_contested_channel_mounts_a_close_capable_service() {
         other => panic!("an open contest admits no new work: {other:?}"),
     }
 
-    let watcher = close_only_restart(fixture, CURSOR);
+    let watcher = close_only_restart(fixture, CURSOR).await;
     let service = WorkService::close_only(watcher.provider);
     let chain = Chain {
         blocks: vec![block(
@@ -3729,6 +3463,7 @@ async fn a_contested_channel_mounts_a_close_capable_service() {
 
     let responded = service
         .with_state(|state| state.close_responded())
+        .await
         .expect("the endpoint is reachable")
         .expect("the serviced duty is on the disk");
     assert_eq!(responded.start_id, expected);
@@ -3738,12 +3473,12 @@ async fn a_contested_channel_mounts_a_close_capable_service() {
         "the journaled digest is the one the submitted answer was signed over",
     );
     assert_eq!(
-        proposal_refusal(&service, 1),
+        proposal_refusal(&service, 1).await,
         WorkRefusalCode::Conflict as i32,
         "retrying the certified job returns its permanent terminal before readiness",
     );
     assert_eq!(
-        proposal_refusal(&service, 2),
+        proposal_refusal(&service, 2).await,
         WorkRefusalCode::NotReady as i32,
         "and it admits no new work while it has no readiness decision",
     );
@@ -3764,10 +3499,11 @@ async fn a_close_only_mount_without_a_bond_closes_its_payment_edge() {
         other => panic!("a channel whose bond is gone admits no new work: {other:?}"),
     }
 
-    let mut watcher = close_only_restart(fixture, CURSOR);
+    let mut watcher = close_only_restart(fixture, CURSOR).await;
     let start = watcher
         .provider
         .prepare_close()
+        .await
         .expect("a paid channel closes without a readiness decision");
     assert_eq!(
         start
@@ -3827,11 +3563,12 @@ async fn a_channel_past_its_horizon_still_closes() {
         other => panic!("a channel at its horizon admits no new work: {other:?}"),
     }
 
-    let mut watcher = close_only_restart(fixture, HORIZON);
+    let mut watcher = close_only_restart(fixture, HORIZON).await;
     assert_eq!(watcher.provider.state().cursor().0, HORIZON);
     watcher
         .provider
         .prepare_close()
+        .await
         .expect("a channel past its horizon still closes");
 
     let sink = Mempool::default();
@@ -3861,33 +3598,36 @@ async fn a_channel_past_its_horizon_still_closes() {
 #[tokio::test]
 async fn a_close_only_service_admits_work_only_once_a_readiness_arrives() {
     let root = temp();
-    let endpoint = CloseEndpoint::new(close_only_store(root.path(), CURSOR), provider())
+    let endpoint = CloseEndpoint::new(close_only_store(root.path(), CURSOR).await, provider())
         .expect("the close half binds without a readiness");
     let service = WorkService::close_only(endpoint);
 
     assert_eq!(
-        proposal_refusal(&service, 1),
+        proposal_refusal(&service, 1).await,
         WorkRefusalCode::NotReady as i32,
         "a channel with no readiness decision admits no work",
     );
     assert!(
         service
             .with_state(|state| state.jobs().next().is_none())
+            .await
             .expect("the endpoint is reachable"),
         "and the refused proposal reserved nothing",
     );
 
     service
         .admit_new_work(ready())
+        .await
         .expect("a fresh readiness for this journal's own channel is taken");
 
-    match service.accept(&signed_request(NONCE, 1)).outcome {
+    match service.accept(&signed_request(NONCE, 1)).await.outcome {
         Some(AcceptOutcome::Accepted(_)) => {}
         other => panic!("the same proposal is now co-signed: {other:?}"),
     }
     assert!(
         service
             .with_state(|state| state.jobs().next().is_some())
+            .await
             .expect("the endpoint is reachable"),
         "and the accepted job is on the disk",
     );
@@ -3910,11 +3650,14 @@ async fn a_close_step_samples_its_tip_its_blocks_and_its_prepared_fsync() {
     use tracing::instrument::WithSubscriber as _;
 
     let fixture = paid_job().await;
-    let mut watcher = restarted(fixture);
+    let mut watcher = restarted(fixture).await;
     let provider = &mut watcher.provider;
     let samples = std::sync::Arc::new(Samples::new());
 
-    let Ok(start) = tracing::subscriber::with_default(samples.clone(), || provider.prepare_close())
+    let Ok(start) = provider
+        .prepare_close()
+        .with_subscriber(samples.clone())
+        .await
     else {
         panic!("a paid channel closes");
     };
@@ -3936,7 +3679,10 @@ async fn a_close_step_samples_its_tip_its_blocks_and_its_prepared_fsync() {
     // Called again the retained start is handed back, and nothing
     // reaches the disk — so there is no second sample of a fsync that
     // did not happen.
-    let _ = tracing::subscriber::with_default(samples.clone(), || provider.prepare_close());
+    let _ = provider
+        .prepare_close()
+        .with_subscriber(samples.clone())
+        .await;
     assert_eq!(
         samples.of("close_prepared_fsync_ms").len(),
         1,
@@ -3994,9 +3740,10 @@ async fn a_close_step_samples_its_tip_its_blocks_and_its_prepared_fsync() {
 /// the sample and no threshold is.
 #[tokio::test]
 async fn a_restart_samples_the_replay_it_ran() {
+    use tracing::instrument::WithSubscriber as _;
     let fixture = paid_job().await;
     let samples = std::sync::Arc::new(Samples::new());
-    let watcher = tracing::subscriber::with_default(samples.clone(), || restarted(fixture));
+    let watcher = restarted(fixture).with_subscriber(samples.clone()).await;
 
     let replays = samples.of("restart_replay_ms_at_cap");
     assert_eq!(replays.len(), 1, "one journal reopened, one replay sampled");
@@ -4032,6 +3779,7 @@ async fn a_restart_samples_the_replay_it_ran() {
 /// nothing.
 #[tokio::test]
 async fn an_answer_that_is_built_is_sampled_and_one_that_is_refused_is_not() {
+    use tracing::instrument::WithSubscriber as _;
     let fixture = paid_job().await;
     let ready = fixture.ready.clone();
     let inclusion = CURSOR + 1;
@@ -4049,14 +3797,17 @@ async fn an_answer_that_is_built_is_sampled_and_one_that_is_refused_is_not() {
     };
     let id = contest_id(&ready, &understated, inclusion);
 
-    let mut watcher = restarted(fixture);
+    let mut watcher = restarted(fixture).await;
     let provider = &mut watcher.provider;
-    if let Err(error) = provider.observe_finalized(&block(
-        inclusion,
-        vec![hellas_kernel::Tx::move_action(
-            hellas_kernel::Move::StartPaymentClose(understated),
-        )],
-    )) {
+    if let Err(error) = provider
+        .observe_finalized(&block(
+            inclusion,
+            vec![hellas_kernel::Tx::move_action(
+                hellas_kernel::Move::StartPaymentClose(understated),
+            )],
+        ))
+        .await
+    {
         panic!("the block applies: {error}");
     }
 
@@ -4071,9 +3822,11 @@ async fn an_answer_that_is_built_is_sampled_and_one_that_is_refused_is_not() {
     };
 
     let samples = std::sync::Arc::new(Samples::new());
-    if let Err(error) = tracing::subscriber::with_default(samples.clone(), || {
-        provider.respond_to_close(&read_at(deadline - 1, &open))
-    }) {
+    if let Err(error) = provider
+        .respond_to_close(&read_at(deadline - 1, &open))
+        .with_subscriber(samples.clone())
+        .await
+    {
         panic!("an understated contest is answered: {error}");
     }
     let built = samples.of("response_build_ms");
@@ -4096,9 +3849,10 @@ async fn an_answer_that_is_built_is_sampled_and_one_that_is_refused_is_not() {
     settled.final_cumulative = PRICE;
     settled.responded = true;
     settled.penalty_due = true;
-    let refused = tracing::subscriber::with_default(samples.clone(), || {
-        provider.respond_to_close(&read_at(deadline - 1, &settled))
-    });
+    let refused = provider
+        .respond_to_close(&read_at(deadline - 1, &settled))
+        .with_subscriber(samples.clone())
+        .await;
     assert!(
         matches!(refused, Err(CloseError::AlreadyResponded)),
         "there is one answer: {refused:?}",
@@ -4108,13 +3862,4 @@ async fn an_answer_that_is_built_is_sampled_and_one_that_is_refused_is_not() {
         1,
         "an answer that was not built is not an answer that took any time",
     );
-}
-
-fn payment_policy() -> hellas_rpc::protocol::work::JobPaymentPolicyV2 {
-    hellas_rpc::protocol::work::JobPaymentPolicyV2 {
-        fixed_price: PRICE,
-        dispatch_margin_blocks: 4,
-        delivery_margin_blocks: 2,
-        oracle_grace_blocks: 6,
-    }
 }

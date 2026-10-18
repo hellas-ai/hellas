@@ -12,15 +12,16 @@ pub(crate) fn decoded_body<'a>(
     body: &'a [u8],
 ) -> Result<Cow<'a, [u8]>, &'static str> {
     let decode = |reader: &mut dyn Read| -> Result<Vec<u8>, &'static str> {
-        let mut output = Vec::new();
-        reader
-            .take(8 * 1024 * 1024 + 1)
-            .read_to_end(&mut output)
-            .map_err(|_| "invalid compressed request body")?;
-        if output.len() > 8 * 1024 * 1024 {
-            return Err("decoded request body exceeds limit");
-        }
-        Ok(output)
+        hellas_private::read_bounded(reader, 8 * 1024 * 1024).map_err(|error| {
+            if error
+                .get_ref()
+                .is_some_and(|error| error.is::<hellas_private::ReadLimit>())
+            {
+                "decoded request body exceeds limit"
+            } else {
+                "invalid compressed request body"
+            }
+        })
     };
     let encoding = headers
         .get("content-encoding")

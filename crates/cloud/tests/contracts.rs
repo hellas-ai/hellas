@@ -1,7 +1,5 @@
 #![cfg(unix)]
 
-mod common;
-
 use hellas_cloud::{
     agent::validate_download,
     config::*,
@@ -61,7 +59,10 @@ fn runpod_preserves_entrypoint_and_mounts_persistent_identity() {
     let mut credentials = Credentials::generate();
     let owner = iroh::SecretKey::generate();
     credentials.owner = Some(owner.public().to_string());
-    credentials.owner_enrollment = Some(hex::encode(common::bundle(&owner).canonical_bytes()));
+    credentials.owner_enrollment = Some(hex::encode(
+        hellas_work::test_support::software_enrollment(7, *owner.public().as_bytes())
+            .canonical_bytes(),
+    ));
     let body = provider
         .create_body(&spec, credentials.env(&spec).unwrap())
         .unwrap();

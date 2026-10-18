@@ -1,8 +1,9 @@
 //! Canonical key/signature conversion at the protobuf boundary.
+use crate::Assurance;
 use crate::pb::execute::{
     PublicKey as PbPublicKey, Signature as PbSignature, public_key, signature,
 };
-use crate::{Assurance, PublicKey, Signature};
+use hellas_auth::{PublicKey, Signature};
 pub fn public_key_to_pb(key: &PublicKey) -> PbPublicKey {
     let kind = match key {
         PublicKey::Secp256k1(bytes) => public_key::Kind::Secp256k1(bytes.to_vec()),

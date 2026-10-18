@@ -40,9 +40,9 @@ pub enum PaidClientError {
     #[error(transparent)]
     Canonical(#[from] hellas_rpc::protocol::value::CanonicalDecodeError),
     #[error(transparent)]
-    Work(#[from] hellas_rpc::protocol::work::PaidWorkError),
+    Work(#[from] hellas_work::model::work::PaidWorkError),
     #[error(transparent)]
-    WorkSetup(#[from] hellas_rpc::protocol::work_setup::WorkSetupError),
+    WorkSetup(#[from] hellas_work::model::setup::WorkSetupError),
     #[error(transparent)]
     Store(#[from] hellas_work::work_store::WorkStoreError),
     #[error(transparent)]

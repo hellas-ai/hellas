@@ -1,12 +1,11 @@
 #![cfg(unix)]
 
-mod common;
-
 use hellas_cloud::{
     config::read_json,
     internal_rpc,
     management::{Request, Service},
 };
+use hellas_work::model::grant::records::{decode_contact, grant_transport};
 use serde_json::json;
 use std::{
     os::unix::fs::{MetadataExt, PermissionsExt},
@@ -26,7 +25,10 @@ fn existing_machine(
     use hellas_cloud::config::{Credentials, save_private};
     let mut credentials = Credentials::generate();
     credentials.owner = Some(key.public().to_string());
-    credentials.owner_enrollment = Some(hex::encode(common::bundle(key).canonical_bytes()));
+    credentials.owner_enrollment = Some(hex::encode(
+        hellas_work::test_support::software_enrollment(7, *key.public().as_bytes())
+            .canonical_bytes(),
+    ));
     save_private(
         &root.join(key.public().to_string()).join("metal.json"),
         &json!({
@@ -362,7 +364,7 @@ async fn enrollment_requires_owner_confirmation_and_cannot_be_silently_replaced(
 async fn enrolled_owner_prepares_verified_bootstrap_and_rejects_another_transport() {
     let dir = tempfile::tempdir().unwrap();
     let key = iroh::SecretKey::generate();
-    let bundle = common::bundle(&key);
+    let bundle = hellas_work::test_support::software_enrollment(7, *key.public().as_bytes());
     let service = Service::new(key.clone(), dir.path())
         .unwrap()
         .with_owner_enrollment(bundle.clone())
@@ -378,12 +380,13 @@ async fn enrolled_owner_prepares_verified_bootstrap_and_rejects_another_transpor
         .await
         .unwrap();
     let env: std::collections::BTreeMap<String, String> = read_json(&bootstrap).unwrap();
-    let principal = hellas_rpc::protocol::work_grant::records::Principal::decode(
-        &hex::decode(&env["HELLAS_REMOTE_OWNER_ENROLLMENT"]).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(principal.bundle(), &bundle);
-    assert_eq!(principal.transport(), *key.public().as_bytes());
+    let principal =
+        decode_contact(&hex::decode(&env["HELLAS_REMOTE_OWNER_ENROLLMENT"]).unwrap()).unwrap();
+    assert_eq!(principal, bundle);
+    assert_eq!(
+        grant_transport(&principal).unwrap(),
+        *key.public().as_bytes()
+    );
     assert!(
         Service::new(iroh::SecretKey::generate(), dir.path())
             .unwrap()

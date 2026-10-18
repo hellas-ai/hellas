@@ -3,12 +3,13 @@ use crate::executor::{FetchProviderFailure, FetchProviderRun};
 use crate::fetch_projection::{FetchProjector, ProjectedFetch};
 use crate::fetch_provider::{FetchProvider, FetchProviderError, PreparedFetchRequest};
 use futures_util::StreamExt;
+use hellas_auth::ProducerSigningKey;
+use hellas_rpc::InputCommitment;
 use hellas_rpc::execution_event::{WorkChunk, WorkEvent, work_event};
 use hellas_rpc::fetch::{
     FetchOutputTranscriptBuilder, MAX_FETCH_OUTPUT_EVENTS, MAX_FETCH_OUTPUT_PAYLOAD_BYTES,
 };
 use hellas_rpc::stream::output_event_to_pb;
-use hellas_rpc::{InputCommitment, ProducerSigningKey};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 pub(super) const PER_EXECUTION_CHANNEL_CAPACITY: usize = 64;

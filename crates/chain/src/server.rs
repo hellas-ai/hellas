@@ -8,7 +8,8 @@ use crate::{
     LatestBlock, LightClient as LightClientApi, MAX_CANONICAL_TRANSACTION_BYTES, OwnerEdges,
     ProposalInfo,
 };
-use futures_util::{Stream, StreamExt as _};
+use futures_util::StreamExt as _;
+use hellas_auth::authority::UnixMillis;
 use hellas_kernel::{Decode as _, Move as KernelMove, Tx as KernelTx};
 use hellas_rpc::pb::{
     chain::{
@@ -30,14 +31,7 @@ use hellas_rpc::{
 };
 use hellas_wire::{PeerIdentity, StreamTransport, TransportContext, WireCode, WireStatus};
 use p256::ecdsa::Signature as P256Signature;
-use std::{
-    collections::HashMap,
-    io,
-    net::SocketAddr,
-    pin::Pin,
-    sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{collections::HashMap, io, net::SocketAddr, sync::Arc};
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::broadcast,
@@ -47,8 +41,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_tungstenite::accept_async;
 use tracing::{info, warn};
 
-type ActivityStream =
-    Pin<Box<dyn Stream<Item = Result<ActivityEvent, WireStatus>> + Send + 'static>>;
+type ActivityStream = hellas_rpc::call::ResponseStream<ActivityEvent>;
 pub type LightClientServerError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 #[derive(Clone)]
@@ -66,7 +59,8 @@ pub struct LightClientRpc<T> {
 pub struct LightClientRpcState {
     response_route: Arc<WorkResponseRoute>,
     general_route: Arc<GeneralSubmitRoute>,
-    general_sources: Arc<tokio::sync::Mutex<GeneralSourceTable>>,
+    general_sources: Arc<tokio::sync::Mutex<SubmissionSourceTable>>,
+    response_sources: Arc<tokio::sync::Mutex<SubmissionSourceTable>>,
 }
 
 impl Default for LightClientRpcState {
@@ -74,21 +68,46 @@ impl Default for LightClientRpcState {
         Self {
             response_route: Arc::new(WorkResponseRoute::default()),
             general_route: Arc::new(GeneralSubmitRoute::default()),
-            general_sources: Arc::new(tokio::sync::Mutex::new(GeneralSourceTable::default())),
+            general_sources: Arc::new(tokio::sync::Mutex::new(SubmissionSourceTable::default())),
+            response_sources: Arc::new(tokio::sync::Mutex::new(SubmissionSourceTable::default())),
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-enum GeneralSourceKey {
+enum SubmissionSourceKey {
     Anonymous,
     Peer(PeerIdentity),
 }
 
 #[derive(Default)]
-struct GeneralSourceTable {
+struct SubmissionSourceTable {
     height: Option<u64>,
-    attempts: HashMap<GeneralSourceKey, u8>,
+    attempts: HashMap<SubmissionSourceKey, u8>,
+}
+
+impl SubmissionSourceTable {
+    fn consume(&mut self, context: &TransportContext, height: u64) -> bool {
+        if self.height.is_none_or(|observed| height > observed) {
+            self.height = Some(height);
+            self.attempts.clear();
+        }
+        let key = context
+            .vouched_peer()
+            .map_or(SubmissionSourceKey::Anonymous, SubmissionSourceKey::Peer);
+        if let Some(attempts) = self.attempts.get_mut(&key) {
+            if *attempts >= 8 {
+                return false;
+            }
+            *attempts += 1;
+            return true;
+        }
+        if self.attempts.len() >= 256 {
+            return false;
+        }
+        self.attempts.insert(key, 1);
+        true
+    }
 }
 
 impl<T> LightClientRpc<T> {
@@ -106,29 +125,6 @@ impl<T> LightClientRpc<T> {
             activity_tx,
             state,
         }
-    }
-
-    async fn consume_general_attempt(&self, context: &TransportContext, height: u64) -> bool {
-        let mut table = self.state.general_sources.lock().await;
-        if table.height != Some(height) {
-            table.height = Some(height);
-            table.attempts.clear();
-        }
-        let key = context
-            .peer
-            .map_or(GeneralSourceKey::Anonymous, GeneralSourceKey::Peer);
-        if let Some(attempts) = table.attempts.get_mut(&key) {
-            if *attempts >= 8 {
-                return false;
-            }
-            *attempts += 1;
-            return true;
-        }
-        if table.attempts.len() >= 256 {
-            return false;
-        }
-        table.attempts.insert(key, 1);
-        true
     }
 }
 
@@ -325,7 +321,13 @@ where
                 .await
                 .map_err(WireStatus::from)?
                 .map_or(0, |latest| latest.height);
-            if !self.consume_general_attempt(&context, height).await {
+            if !self
+                .state
+                .general_sources
+                .lock()
+                .await
+                .consume(&context, height)
+            {
                 return Ok(SubmitTxResponse {
                     outcome: ProtoSubmitTxOutcome::Full as i32,
                 });
@@ -340,6 +342,7 @@ where
     fn submit_work_response(
         &self,
         request: SubmitWorkResponseRequest,
+        context: TransportContext,
     ) -> impl Future<Output = Result<SubmitTxResponse, WireStatus>> + Send {
         let client = self.client.clone();
         async move {
@@ -350,6 +353,22 @@ where
                         "response must be one canonical PaymentCloseResponse",
                     )
                 })?;
+            let height = client
+                .get_latest_block()
+                .await
+                .map_err(WireStatus::from)?
+                .map_or(0, |latest| latest.height);
+            if !self
+                .state
+                .response_sources
+                .lock()
+                .await
+                .consume(&context, height)
+            {
+                return Ok(SubmitTxResponse {
+                    outcome: ProtoSubmitTxOutcome::Full as i32,
+                });
+            }
             let tx = Transaction::Kernel(KernelTx::move_action(KernelMove::RespondPaymentClose(
                 response,
             )));
@@ -382,7 +401,7 @@ where
                     }
                 }
             });
-            Ok(Box::pin(stream) as ActivityStream)
+            Ok(ActivityStream::new(stream))
         }
     }
 
@@ -761,11 +780,7 @@ fn activity_is_requested(urgent_events: &[i32], activity: &ConsensusActivity) ->
 }
 
 fn unix_time_ms() -> u64 {
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    u64::try_from(millis).unwrap_or(u64::MAX)
+    UnixMillis::now().unwrap_or_default().0
 }
 
 fn activity_to_proto(activity: ConsensusActivity) -> ActivityEvent {

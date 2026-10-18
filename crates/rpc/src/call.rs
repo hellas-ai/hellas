@@ -591,10 +591,26 @@ impl<Q, R: Message + Default> futures_core::Stream for BidiStreamingCall<Q, R> {
 
 /// A successful unary response plus any trailer metadata the handler
 /// wants to emit (commitments, OTel span context, ...).
-#[derive(Debug)]
 pub struct WithTrailer<R> {
     pub response: R,
     pub metadata: hellas_wire::Metadata,
+    authority: Option<hellas_wire::WriteAuthority>,
+}
+
+impl<R: std::fmt::Debug> std::fmt::Debug for WithTrailer<R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WithTrailer")
+            .field("response", &self.response)
+            .field("metadata", &self.metadata)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Forward a unary handler without losing either its response or trailer.
+pub async fn with_trailer<R, T: Into<WithTrailer<R>>>(
+    call: impl std::future::Future<Output = Result<T, WireStatus>>,
+) -> Result<WithTrailer<R>, WireStatus> {
+    call.await.map(Into::into)
 }
 
 impl<R> WithTrailer<R> {
@@ -602,11 +618,50 @@ impl<R> WithTrailer<R> {
         Self {
             response,
             metadata: hellas_wire::Metadata::new(),
+            authority: None,
         }
     }
 
     pub fn with_metadata(response: R, metadata: hellas_wire::Metadata) -> Self {
-        Self { response, metadata }
+        Self {
+            response,
+            metadata,
+            authority: None,
+        }
+    }
+
+    /// Protect both the encoded body and terminal metadata at the carrier.
+    pub fn with_write_authority(mut self, authority: hellas_wire::WriteAuthority) -> Self {
+        self.authority = Some(authority);
+        self
+    }
+}
+
+/// Server responses retain their carrier authorization through RPC dispatch.
+/// Dispatch installs it before polling or encoding responses. Direct stream
+/// consumers remain responsible for their own delivery boundary.
+pub struct ResponseStream<R> {
+    inner: Pin<Box<dyn futures_core::Stream<Item = Result<R, WireStatus>> + Send>>,
+    authority: Option<hellas_wire::WriteAuthority>,
+}
+impl<R> ResponseStream<R> {
+    pub fn new(
+        stream: impl futures_core::Stream<Item = Result<R, WireStatus>> + Send + 'static,
+    ) -> Self {
+        Self {
+            inner: Box::pin(stream),
+            authority: None,
+        }
+    }
+    pub fn with_write_authority(mut self, authority: hellas_wire::WriteAuthority) -> Self {
+        self.authority = Some(authority);
+        self
+    }
+}
+impl<R> futures_core::Stream for ResponseStream<R> {
+    type Item = Result<R, WireStatus>;
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.get_mut().inner.as_mut().poll_next(cx)
     }
 }
 
@@ -830,7 +885,7 @@ where
     M: MethodMarker,
     M::Request: Message + Default,
     M::Response: Message,
-    F: FnOnce(M::Request) -> Fut + Send,
+    F: FnOnce(M::Request, hellas_wire::TransportContext) -> Fut + Send,
     Fut: std::future::Future<Output = Result<RespOrTrailer, WireStatus>> + Send,
     RespOrTrailer: Into<WithTrailer<M::Response>>,
 {
@@ -882,7 +937,7 @@ where
             let _worker = route.workers.acquire().await;
             let request = M::Request::decode(&req_bytes[..])
                 .map_err(|error| TransportError::Protocol(format!("prost decode: {error}")))?;
-            let handled = handler(request).await;
+            let handled = handler(request, inbound.context).await;
             if let Some(ms) = worked.ms() {
                 tracing::event!(
                     name: "response_worker_ms",
@@ -956,7 +1011,15 @@ async fn write_unary_response<S: SendHalf, R: Message>(
     call: &CallSpan,
 ) -> Result<(), TransportError> {
     let trailer = match result {
-        Ok(WithTrailer { response, metadata }) => {
+        Ok(WithTrailer {
+            response,
+            metadata,
+            authority,
+        }) => {
+            if let Some(authority) = authority {
+                send.set_write_authority(authority)
+                    .map_err(|error| TransportError::Io(format!("response authority: {error}")))?;
+            }
             let mut buf = BytesMut::with_capacity(response.encoded_len());
             response
                 .encode(&mut buf)
@@ -976,9 +1039,13 @@ async fn write_unary_response<S: SendHalf, R: Message>(
 
 async fn write_streaming_response<S: SendHalf, R: Message>(
     send: &mut S,
-    mut responses: impl futures_util::Stream<Item = Result<R, WireStatus>> + Unpin,
+    mut responses: ResponseStream<R>,
     call: &CallSpan,
 ) -> Result<(), TransportError> {
+    if let Some(authority) = responses.authority.take() {
+        send.set_write_authority(authority)
+            .map_err(|error| TransportError::Io(format!("response authority: {error}")))?;
+    }
     loop {
         let next = match futures_util::future::select(
             Box::pin(responses.next()),
@@ -1121,7 +1188,7 @@ where
     M::Response: Message + Send + 'static,
     F: FnOnce(M::Request) -> Fut + Send,
     Fut: std::future::Future<Output = Result<S, WireStatus>> + Send,
-    S: futures_util::Stream<Item = Result<M::Response, WireStatus>> + Send + Unpin,
+    S: Into<ResponseStream<M::Response>> + Send,
 {
     let span = crate::telemetry::server_span::<M>(&inbound.headers);
     let call = CallSpan::new(span.clone());
@@ -1149,7 +1216,7 @@ where
                 }
             };
 
-            write_streaming_response(&mut send, stream, &operation).await
+            write_streaming_response(&mut send, stream.into(), &operation).await
         },
         span,
     )
@@ -1174,7 +1241,7 @@ where
     M::Response: Message + Send + 'static,
     F: FnOnce(RequestStream<M::Request>) -> Fut + Send,
     Fut: std::future::Future<Output = Result<S, WireStatus>> + Send,
-    S: futures_util::Stream<Item = Result<M::Response, WireStatus>> + Send + Unpin,
+    S: Into<ResponseStream<M::Response>> + Send,
     <T::Stream as WireStream>::RecvHalf: Unpin + Send + 'static,
     <<T::Stream as WireStream>::RecvHalf as RecvHalf>::Error:
         std::error::Error + Send + Sync + 'static,
@@ -1193,7 +1260,7 @@ where
                 }
             };
 
-            write_streaming_response(&mut send, stream, &operation).await
+            write_streaming_response(&mut send, stream.into(), &operation).await
         },
         span,
     )
@@ -1307,7 +1374,7 @@ mod streaming_call_tests {
             std::time::Duration::from_secs(1),
             write_streaming_response(
                 &mut send,
-                futures_util::stream::pending::<Result<U32Msg, WireStatus>>(),
+                ResponseStream::new(futures_util::stream::pending::<Result<U32Msg, WireStatus>>()),
                 &call,
             ),
         )
@@ -1415,6 +1482,55 @@ mod streaming_call_tests {
 
         fn reset(&mut self, code: WireCode) {
             *self.state.reset.lock().unwrap() = Some(code);
+        }
+    }
+
+    #[tokio::test]
+    async fn protected_responses_refuse_unsupported_senders_without_sending_or_polling() {
+        struct Authority;
+        impl hellas_wire::WriteAuthorization for Authority {
+            fn poll_write(
+                &mut self,
+                _: &mut Context<'_>,
+                _: &mut dyn FnMut(&mut Context<'_>) -> Poll<std::io::Result<usize>>,
+            ) -> Poll<std::io::Result<usize>> {
+                panic!("unsupported sender cannot install authority");
+            }
+        }
+        for streaming in [false, true] {
+            let state = MockSendState::default();
+            let mut send = MockSend {
+                state: state.clone(),
+            };
+            let call = CallSpan::new(tracing::Span::none());
+            let authority = hellas_wire::WriteAuthority::new(Authority);
+            let result = if streaming {
+                let stream = futures_util::stream::poll_fn(
+                    |_| -> Poll<Option<Result<U32Msg, WireStatus>>> {
+                        panic!("unsupported sender cannot poll protected responses");
+                    },
+                );
+                write_streaming_response(
+                    &mut send,
+                    ResponseStream::new(stream).with_write_authority(authority),
+                    &call,
+                )
+                .await
+            } else {
+                write_unary_response(
+                    &mut send,
+                    Ok(WithTrailer::new(U32Msg { x: 7 }).with_write_authority(authority)),
+                    &call,
+                )
+                .await
+            };
+            assert!(result.is_err());
+            assert!(state.bodies.lock().unwrap().is_empty());
+            assert!(state.close.lock().unwrap().is_none());
+            assert_eq!(
+                *state.reset.lock().unwrap(),
+                Some(WireCode::PermissionDenied)
+            );
         }
     }
 
@@ -1730,7 +1846,7 @@ mod streaming_call_tests {
                 inbound,
                 &route,
                 1,
-                |_| async { panic!("full route ran handler") },
+                |_, _| async { panic!("full route ran handler") },
             )
             .await
             .unwrap();
@@ -1826,7 +1942,7 @@ mod streaming_call_tests {
                         inbound,
                         &work,
                         1024,
-                        |request| async { Ok(request) },
+                        |request, _| async { Ok(request) },
                     )
                     .await
                 } else {
@@ -2028,7 +2144,7 @@ mod streaming_call_tests {
                     inbound,
                     &route,
                     65_536,
-                    |_| async { Ok(BytesMsg::default()) },
+                    |_, _| async { Ok(BytesMsg::default()) },
                 )
                 .await
             }));
@@ -2043,7 +2159,7 @@ mod streaming_call_tests {
             overflow,
             &route,
             65_536,
-            |_| async { Ok(BytesMsg::default()) },
+            |_, _| async { Ok(BytesMsg::default()) },
         )
         .await
         .expect("saturation is returned as a wire trailer");
@@ -2077,7 +2193,7 @@ mod streaming_call_tests {
             inbound,
             &route,
             65_536,
-            move |_| async move {
+            move |_, _| async move {
                 called.fetch_add(1, Ordering::SeqCst);
                 Ok(BytesMsg::default())
             },
@@ -2103,7 +2219,7 @@ mod streaming_call_tests {
             overflow,
             &route,
             65_536,
-            |_| async { Ok(BytesMsg::default()) },
+            |_, _| async { Ok(BytesMsg::default()) },
         )
         .await
         .expect("raw overflow is a wire rejection, not a decode error");
@@ -2143,7 +2259,7 @@ mod streaming_call_tests {
                     inbound,
                     &route,
                     65_536,
-                    move |_| async move {
+                    move |_, _| async move {
                         entered.fetch_add(1, Ordering::SeqCst);
                         notify.notify_waiters();
                         release.acquire().await.unwrap().forget();
@@ -2194,7 +2310,7 @@ mod streaming_call_tests {
             inbound,
             &response_route,
             65_536,
-            |_| async { Ok(BytesMsg::default()) },
+            |_, _| async { Ok(BytesMsg::default()) },
         )
         .with_subscriber(samples.clone())
         .await
@@ -2235,7 +2351,7 @@ mod streaming_call_tests {
             inbound,
             &full_response,
             65_536,
-            |_| async { Ok(BytesMsg::default()) },
+            |_, _| async { Ok(BytesMsg::default()) },
         )
         .with_subscriber(samples.clone())
         .await

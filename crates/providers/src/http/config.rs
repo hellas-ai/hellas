@@ -1,15 +1,11 @@
 //! Operator-owned account aliases reference environment variables or private
 //! credential files; route configuration contains no secret values.
 use super::{HttpCredential, HttpEgressPolicy, HttpFetchProvider};
+use hellas_auth::authority::UnixMillis;
 use hellas_executor::{FetchProviderError, FetchRouteEntry, FetchRoutePolicy};
 use serde::Deserialize;
 use std::collections::BTreeMap;
-use std::{
-    io::Read,
-    path::PathBuf,
-    sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{io::Read, path::PathBuf, sync::Arc, time::Duration};
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -58,12 +54,7 @@ impl CredentialRefresh {
             .and_then(serde_json::Value::as_f64)
             .filter(|value| value.is_finite())
             .ok_or_else(|| super::fault("credential expiry unavailable"))?;
-        Ok(expiry
-            <= SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs_f64()
-                + 30.)
+        Ok(expiry <= (UnixMillis::now().unwrap_or_default().0 as f64 / 1_000.) + 30.)
     }
     async fn run(&self) -> Result<(), FetchProviderError> {
         use tracing::Instrument;
@@ -245,7 +236,10 @@ impl HttpProviderConfig {
         )?;
         FetchRouteEntry::new(
             std::sync::Arc::new(provider),
-            std::sync::Arc::new(super::HttpFetchAdaptorFactory),
+            std::sync::Arc::new(
+                super::HttpFetchAdaptorFactory::new()
+                    .map_err(|_| super::fault("invalid HTTP execution contract"))?,
+            ),
             capabilities,
         )
         .map_err(|_| super::fault("invalid HTTP Fetch route"))

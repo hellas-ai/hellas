@@ -19,7 +19,7 @@
 //! scratch and returns it. That digest binds the whole answer — the
 //! output token ids in position order, the final position, the stop
 //! reason and matched stop-token witness, the output text artifact, and the usage counts
-//! (`hellas_rpc::protocol::work::canonical_output_digest`) — so
+//! (`hellas_work::model::work::canonical_output_digest`) — so
 //! reproducing it reproduces all of them. Every part of it except the
 //! tokens, stop reason, and matched stop-token witness is *derived* here from the job's own
 //! inputs, through the same [`completed_text`] the provider's artifact
@@ -50,13 +50,15 @@
 //! recalling one. No result protocol can; the sole proposal nonce bounds
 //! the damage to the one job the client actually asked for.
 
+use hellas_auth::Digest;
 use hellas_kernel::NetworkId;
+use hellas_rpc::ContentId;
 use hellas_rpc::evaluate::{EvaluateStopReason, EvaluateTerminal, EvaluateUsage};
 use hellas_rpc::protocol::artifacts::{
-    OutputAddressed as _, PreparedPaidInputV1, TextArtifact, TextExecutionId, completed_text,
+    OutputAddressed as _, TextArtifact, TextExecutionId, completed_text,
 };
-use hellas_rpc::protocol::work::{PaidJobResultV1, canonical_output_digest};
-use hellas_rpc::{ContentId, Digest};
+use hellas_work::model::prepared_input::PreparedPaidInputV1;
+use hellas_work::model::work::{PaidJobResultV1, canonical_output_digest};
 
 /// Why a result could not be reproduced at all.
 ///

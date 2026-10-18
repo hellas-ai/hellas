@@ -95,7 +95,7 @@ async fn test_endpoint(app: Router, path: &str) -> Url {
 
 async fn execute_test_request(endpoint: Url) -> Result<FetchProviderResponse, FetchProviderError> {
     execute_responses_request(
-        &responses_http_client(),
+        &responses_http_client(Default::default()).unwrap(),
         endpoint,
         "secret",
         br#"{"model":"m","input":"hi","stream":true}"#.to_vec(),
@@ -207,7 +207,8 @@ async fn stalled_sse_body_hits_the_idle_deadline() {
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    let response = responses_http_client()
+    let response = responses_http_client(Default::default())
+        .unwrap()
         .post(format!("http://{addr}/stalled"))
         .send()
         .await

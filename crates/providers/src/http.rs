@@ -11,7 +11,7 @@ use hellas_executor::{
 };
 use hellas_rpc::http_fetch::{HttpFetchRequest, check_headers};
 use hellas_rpc::output::{AdaptorEvent, HttpResponseEvent, OutputEvent, StopReason};
-use hellas_rpc::{ContentId, FetchEnvironment};
+use hellas_rpc::{ContentId, FetchContract};
 use reqwest::{
     Url,
     header::{HeaderName, HeaderValue},
@@ -25,7 +25,7 @@ use std::{
 use tracing::Instrument;
 mod clients;
 mod config;
-mod tls;
+pub(crate) mod tls;
 pub use config::{CredentialRefresh, HttpCredentialConfig, HttpProviderConfig, HttpSecret};
 
 const CHUNK_BYTES: usize = 16 * 1024;
@@ -64,6 +64,7 @@ impl std::fmt::Debug for HttpCredential {
 
 #[derive(Clone, Debug)]
 pub struct HttpFetchProvider {
+    environment: ContentId,
     policy: HttpEgressPolicy,
     credentials: Arc<BTreeMap<String, HttpCredential>>,
     clients: Arc<clients::Clients>,
@@ -142,6 +143,9 @@ impl HttpFetchProvider {
             }
         }
         Ok(Self {
+            environment: FetchContract::http()
+                .map_err(|_| fault("invalid HTTP execution contract"))?
+                .manifest_id(),
             policy,
             credentials: Arc::new(credentials),
             clients: Arc::new(clients::Clients::default()),
@@ -332,7 +336,7 @@ impl HttpFetchProvider {
 
 impl FetchProvider for HttpFetchProvider {
     fn execution_environment(&self) -> ContentId {
-        FetchEnvironment::Http.manifest_id()
+        self.environment
     }
     fn run(&self, request: PreparedFetchRequest) -> FetchProviderFuture<'_> {
         Box::pin(self.execute(request))
@@ -368,11 +372,20 @@ fn public_address(ip: IpAddr) -> bool {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct HttpFetchAdaptorFactory;
+#[derive(Clone, Copy, Debug)]
+pub struct HttpFetchAdaptorFactory(ContentId);
+impl HttpFetchAdaptorFactory {
+    pub fn new() -> Result<Self, FetchAdaptorError> {
+        Ok(Self(
+            FetchContract::http()
+                .map_err(|_| FetchAdaptorError::failed("invalid HTTP execution contract"))?
+                .manifest_id(),
+        ))
+    }
+}
 impl FetchAdaptorFactory for HttpFetchAdaptorFactory {
     fn execution_environment(&self) -> ContentId {
-        FetchEnvironment::Http.manifest_id()
+        self.0
     }
     fn create(&self, call: &FetchCall) -> Result<FetchAdaptorSession, FetchAdaptorError> {
         HttpFetchRequest::decode(call.body.as_bytes())

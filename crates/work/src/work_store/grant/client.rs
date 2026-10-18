@@ -1,19 +1,22 @@
 //! One proposal writer per grant channel. Bodies are never journaled; an
 //! uncertain acceptance survives restart and cannot be replaced by a new nonce.
-use super::{Deserialize, GrantChannelState, GrantStoreError, Serialize, Signature, SignedResult};
+use super::{Deserialize, GrantChannelState, NodeStoreError, Serialize, Signature, SignedResult};
+use crate::model::grant::records::{check_grant_provider, grant_producer};
+use crate::model::grant::{
+    GrantJobAuthorizationV1, grant_channel_id, grant_work_id,
+    records::{GrantError, SignedOffer},
+};
+use crate::model::profile::{PreparedWorkInput, WorkContext, WorkPolicy};
+use crate::model::work::bound_result_digest;
 use crate::work_store::channel::funding::GrantFunding;
 use crate::work_store::journal::{Journal, JournalId, JournalKind, MAX_CHECKPOINT_BYTES};
 use crate::work_store::{Applied, JobBook, JobPhase, JobState, Role};
+use hellas_auth::authority::UnixMillis;
+use hellas_auth::{Digest, ProducerSigningKey, PublicKey};
 use hellas_kernel::NetworkId;
+use hellas_rpc::OutputEventEnvelope;
 use hellas_rpc::ProviderEnrollmentBundle;
-use hellas_rpc::protocol::value::{canonical_dag_cbor, decode_dag_cbor};
-use hellas_rpc::protocol::work::bound_result_digest;
-use hellas_rpc::protocol::work_grant::{
-    GrantJobAuthorizationV1, Revision, UnixMillis, grant_channel_id, grant_work_id,
-    records::{GrantError, SignedOffer},
-};
-use hellas_rpc::protocol::work_profile::{PreparedWorkInput, WorkContext, WorkPolicy};
-use hellas_rpc::{Digest, OutputEventEnvelope, ProducerSigningKey, PublicKey};
+use hellas_rpc::protocol::value::{decode_canonical_bounded, encode_bounded};
 use std::path::Path;
 
 const NAMESPACE: &str = "hellas.work.grant-client.v1";
@@ -75,20 +78,20 @@ struct StoredJob {
     result: Option<SignedResult>,
 }
 impl GrantClientStore {
-    pub fn open(
+    pub async fn open(
         directory: &Path,
         network: NetworkId,
         provider: ProviderEnrollmentBundle,
         channel: GrantChannelState,
         now: UnixMillis,
-    ) -> Result<Self, GrantStoreError> {
-        provider.check_grant_provider()?;
+    ) -> Result<Self, NodeStoreError> {
+        check_grant_provider(&provider)?;
         if channel.id
             != grant_channel_id(
                 network,
                 provider.content_id(),
                 channel.grant,
-                channel.client.id(),
+                channel.client,
                 channel.generation,
             )
         {
@@ -97,16 +100,15 @@ impl GrantClientStore {
         let context = WorkContext {
             network,
             channel: channel.id.0,
-            client: channel.client.producer(),
-            provider: provider.grant_producer()?,
+            client: hellas_kernel::Key::from_bytes(*channel.client.as_bytes()),
+            provider: grant_producer(&provider)?,
         };
         let id = JournalId {
             kind: JournalKind::Grant,
             role: Role::Client,
             key: *channel.id.0.as_bytes(),
-            generation: 0,
         };
-        let (journal, replay) = Journal::open_latest(directory, "grant-client", id)?;
+        let (journal, replay) = Journal::open_latest(directory, "grant-client", id).await?;
         let mut store = Self {
             journal,
             context,
@@ -124,7 +126,7 @@ impl GrantClientStore {
             store.apply(&mut candidate, &frame)?;
             store.state = candidate;
         }
-        store.tick(now)?;
+        store.tick(now).await?;
         Ok(store)
     }
     pub fn context(&self) -> WorkContext {
@@ -139,7 +141,7 @@ impl GrantClientStore {
     pub fn now(&self) -> UnixMillis {
         self.state.now
     }
-    pub fn next_nonce(&self) -> Result<u64, GrantStoreError> {
+    pub fn next_nonce(&self) -> Result<u64, NodeStoreError> {
         if self.book().pending_proposal().is_some() {
             return Err(crate::work_store::ChannelStateError::Conflict {
                 what: "unanswered proposal",
@@ -153,27 +155,28 @@ impl GrantClientStore {
     }
     /// Validates the current private Offer and the exact input before the
     /// signature becomes durable. Retrying uses `resume`, never this method.
-    pub fn propose(
+    pub async fn propose(
         &mut self,
         offer: &SignedOffer,
         authorization: GrantJobAuthorizationV1,
         input: &PreparedWorkInput,
         signer: &ProducerSigningKey,
         now: UnixMillis,
-    ) -> Result<Signature, GrantStoreError> {
+    ) -> Result<Signature, NodeStoreError> {
         let now = now.max(self.now());
-        let verified = SignedOffer::decode(&offer.encode()?, self.channel.client.id(), now)?;
+        let verified = SignedOffer::decode(&offer.encode()?, now)?;
         let offer = verified.offer();
         let a = &authorization;
         if offer.network != self.context.network
             || offer.provider != self.provider
-            || offer.channel() != self.channel.id
+            || offer.channel(self.channel.client) != self.channel.id
             || offer.grant.id != a.grant_id
             || offer.grant.revision != a.grant_revision
+            || offer.generation != a.generation
         {
             return Err(GrantError::Audience.into());
         }
-        offer.grant.admits(now)?;
+        offer.grant.admit()?;
         if now > a.acceptance_deadline_ms
             || a.terminal_deadline_ms.0.saturating_sub(now.0) > offer.grant.max_job_millis.get()
         {
@@ -187,19 +190,29 @@ impl GrantClientStore {
             .policies
             .iter()
             .find(|p| {
-                p.work.digest(self.context.network, self.context.channel) == a.work_policy_digest
+                p.resource == a.resource_id
+                    && p.revision == a.resource_revision
+                    && p.pricing.revision == a.pricing_revision
+                    && p.work.digest(self.context.network, self.context.channel)
+                        == a.work_policy_digest
             })
             .ok_or(GrantError::OutOfScope)?;
         policy
             .work
             .check_bound_input(&self.context, &a.into(), input)?;
-        if let (Some(resource), PreparedWorkInput::Fetch(bundle)) = (&policy.https, input) {
+        if let PreparedWorkInput::Fetch(bundle) = input {
             let parts = bundle.parts().map_err(|_| GrantError::Malformed)?;
             let input = hellas_rpc::fetch::verify_input_events(&parts.fetch_input_transcript)
                 .map_err(|_| GrantError::Malformed)?;
-            let request = hellas_rpc::http_fetch::HttpFetchRequest::decode(input.body.as_bytes())
-                .map_err(|_| GrantError::Malformed)?;
-            resource.matches(&request)?;
+            if let Some(resource) = &policy.https {
+                let request =
+                    hellas_rpc::http_fetch::HttpFetchRequest::decode(input.body.as_bytes())
+                        .map_err(|_| GrantError::Malformed)?;
+                resource.matches(&request)?;
+            }
+            if let Some(resource) = &policy.responses {
+                resource.matches(input.body.as_bytes())?;
+            }
         }
         if signer.public_key() != PublicKey::Secp256k1(self.context.client.to_bytes()) {
             return Err(GrantError::Signature.into());
@@ -214,13 +227,14 @@ impl GrantClientStore {
                 signature,
             },
             true,
-        )?;
+        )
+        .await?;
         Ok(signature)
     }
     /// An uncertain response remains pending, including after restart. A body
     /// lost at restart can only be probed after the signed acceptance deadline;
     /// the provider then returns its old co-signature or a conclusive refusal.
-    pub fn resume(&mut self, work: Digest, now: UnixMillis) -> Result<(), GrantStoreError> {
+    pub async fn resume(&mut self, work: Digest, now: UnixMillis) -> Result<(), NodeStoreError> {
         self.commit(
             now,
             Change::Exchange {
@@ -229,10 +243,11 @@ impl GrantClientStore {
             },
             true,
         )
+        .await
     }
     /// Call only for a decoded, authenticated refusal. A timeout or transport
     /// error is not a refusal and must leave the pending proposal intact.
-    pub fn refused(&mut self, work: Digest, now: UnixMillis) -> Result<(), GrantStoreError> {
+    pub async fn refused(&mut self, work: Digest, now: UnixMillis) -> Result<(), NodeStoreError> {
         self.commit(
             now,
             Change::Exchange {
@@ -241,17 +256,19 @@ impl GrantClientStore {
             },
             false,
         )
+        .await
     }
-    pub fn accepted(
+    pub async fn accepted(
         &mut self,
         work: Digest,
         signature: Signature,
         now: UnixMillis,
-    ) -> Result<(), GrantStoreError> {
+    ) -> Result<(), NodeStoreError> {
         self.commit(now, Change::Accepted { work, signature }, false)
+            .await
     }
     /// Verifies the signed transcript live, then persists only its bound result.
-    pub fn complete(
+    pub async fn complete(
         &mut self,
         work: Digest,
         policy: &WorkPolicy,
@@ -259,7 +276,7 @@ impl GrantClientStore {
         events: &[OutputEventEnvelope],
         signed: SignedResult,
         now: UnixMillis,
-    ) -> Result<(), GrantStoreError> {
+    ) -> Result<(), NodeStoreError> {
         let job = self
             .book()
             .job_by_id(work)
@@ -272,26 +289,31 @@ impl GrantClientStore {
             return Err(GrantError::OutOfScope.into());
         }
         self.commit(now, Change::Result { work, signed }, false)
+            .await
     }
-    pub fn tick(&mut self, now: UnixMillis) -> Result<(), GrantStoreError> {
+    pub async fn tick(&mut self, now: UnixMillis) -> Result<(), NodeStoreError> {
         if now > self.now() {
-            self.commit(now, Change::Clock, false)?;
+            self.commit(now, Change::Clock, false).await?;
         }
         Ok(())
     }
-    pub fn rotate(&mut self) -> Result<(), GrantStoreError> {
-        self.journal.rotate(&encode(&self.snapshot(&self.state))?)?;
+    pub async fn rotate(&mut self) -> Result<(), NodeStoreError> {
+        self.journal
+            .rotate(&encode(&self.snapshot(&self.state))?)
+            .await?;
         Ok(())
     }
     fn check_job(
         &self,
         a: &GrantJobAuthorizationV1,
         signature: &Signature,
-    ) -> Result<Digest, GrantStoreError> {
+    ) -> Result<Digest, NodeStoreError> {
         if a.channel_id != self.channel.id
+            || a.generation != self.channel.generation
             || a.grant_id != self.channel.grant
             || a.grant_revision.0 == 0
-            || a.catalogue_revision != Revision(0)
+            || a.resource_revision.0 == 0
+            || a.pricing_revision.0 == 0
             || a.proposal_nonce == 0
             || a.acceptance_deadline_ms >= a.terminal_deadline_ms
             || a.terminal_deadline_ms >= a.delivery_deadline_ms
@@ -303,9 +325,9 @@ impl GrantClientStore {
         verify(self.context.client, signature, id)?;
         Ok(id)
     }
-    fn apply(&self, state: &mut ClientState, frame: &Frame) -> Result<Applied, GrantStoreError> {
+    fn apply(&self, state: &mut ClientState, frame: &Frame) -> Result<Applied, NodeStoreError> {
         if frame.namespace != NAMESPACE || frame.now < state.now {
-            return Err(GrantStoreError::Malformed);
+            return Err(NodeStoreError::Malformed);
         }
         state.now = frame.now;
         let changed = match &frame.change {
@@ -366,12 +388,12 @@ impl GrantClientStore {
         });
         Ok(changed)
     }
-    fn commit(
+    async fn commit(
         &mut self,
         now: UnixMillis,
         change: Change,
         new: bool,
-    ) -> Result<(), GrantStoreError> {
+    ) -> Result<(), NodeStoreError> {
         let frame = Frame {
             namespace: NAMESPACE.into(),
             now: now.max(self.now()),
@@ -390,12 +412,12 @@ impl GrantClientStore {
             return Err(GrantError::StateCapacity.into());
         }
         if self.journal.at_soft_limit() {
-            let rotated = self.rotate();
+            let rotated = self.rotate().await;
             if new {
                 rotated?;
             }
         }
-        self.journal.append(&encode(&frame)?)?;
+        self.journal.append(&encode(&frame)?).await?;
         self.state = candidate;
         Ok(())
     }
@@ -420,9 +442,9 @@ impl GrantClientStore {
                 .collect(),
         }
     }
-    fn restore(&self, snapshot: Snapshot) -> Result<ClientState, GrantStoreError> {
+    fn restore(&self, snapshot: Snapshot) -> Result<ClientState, NodeStoreError> {
         if snapshot.namespace != NAMESPACE || snapshot.jobs.len() > MAX_JOBS {
-            return Err(GrantStoreError::Malformed);
+            return Err(NodeStoreError::Malformed);
         }
         let mut state = ClientState {
             now: snapshot.now,
@@ -435,14 +457,14 @@ impl GrantClientStore {
                 || !nonces.insert(j.authorization.proposal_nonce)
                 || state.book.jobs.contains_key(&id)
             {
-                return Err(GrantStoreError::Malformed);
+                return Err(NodeStoreError::Malformed);
             }
             if let Some(signature) = j.provider_signature {
                 verify(self.context.provider, &signature, id)?;
             }
             if let Some(signed) = &j.result {
                 if j.provider_signature.is_none() || signed.result.work_id != id {
-                    return Err(GrantStoreError::Malformed);
+                    return Err(NodeStoreError::Malformed);
                 }
                 verify(
                     self.context.provider,
@@ -481,25 +503,45 @@ fn verify(
     key: hellas_kernel::Key,
     signature: &Signature,
     digest: Digest,
-) -> Result<(), GrantStoreError> {
-    hellas_rpc::signature::verify_digest_signature(
+) -> Result<(), NodeStoreError> {
+    hellas_auth::signature::verify_digest_signature(
         &PublicKey::Secp256k1(key.to_bytes()),
         signature,
         digest,
     )
     .map_err(|_| GrantError::Signature.into())
 }
-fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, GrantStoreError> {
-    let bytes = canonical_dag_cbor(value).map_err(|_| GrantStoreError::Malformed)?;
-    if bytes.len() > MAX_CHECKPOINT_BYTES {
-        return Err(GrantError::StateCapacity.into());
-    }
-    Ok(bytes)
+fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, NodeStoreError> {
+    encode_bounded(value, MAX_CHECKPOINT_BYTES).map_err(Into::into)
 }
-fn decode<T: serde::de::DeserializeOwned + Serialize>(bytes: &[u8]) -> Result<T, GrantStoreError> {
-    let value = decode_dag_cbor(bytes).map_err(|_| GrantStoreError::Malformed)?;
-    if encode(&value)? != bytes {
-        return Err(GrantStoreError::Malformed);
+fn decode<T: serde::de::DeserializeOwned + Serialize>(bytes: &[u8]) -> Result<T, NodeStoreError> {
+    decode_canonical_bounded(bytes, MAX_CHECKPOINT_BYTES).map_err(Into::into)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static DECODED: AtomicBool = AtomicBool::new(false);
+    #[derive(Serialize)]
+    struct Probe;
+    impl<'de> serde::Deserialize<'de> for Probe {
+        fn deserialize<D: serde::Deserializer<'de>>(_: D) -> Result<Self, D::Error> {
+            DECODED.store(true, Ordering::SeqCst);
+            Err(serde::de::Error::custom("decoder probe"))
+        }
     }
-    Ok(value)
+
+    #[test]
+    fn oversized_client_records_are_refused_before_deserialization() {
+        for (length, called) in [
+            (MAX_CHECKPOINT_BYTES + 1, false),
+            (MAX_CHECKPOINT_BYTES, true),
+        ] {
+            DECODED.store(false, Ordering::SeqCst);
+            assert!(decode::<Probe>(&vec![0; length]).is_err());
+            assert_eq!(DECODED.load(Ordering::SeqCst), called, "{length}");
+        }
+    }
 }

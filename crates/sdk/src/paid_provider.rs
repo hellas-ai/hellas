@@ -1,29 +1,29 @@
 //! Shared provider routing and finalized-chain clock for paid work.
+use hellas_rpc::pb::work::Refusable;
+
 use crate::work_config::WorkRoutes;
 use crate::work_router::{UnmountedWork, not_ready};
 use futures::future::BoxFuture;
+use hellas_auth::Digest;
 use hellas_chain::work_blocks::advance_paid_work_clock;
 use hellas_chain::{FinalizedWorkView, WorkBlocks, WorkChannelQuery};
 use hellas_chain::{node::FullNode, rpc::LocalLightClient};
 use hellas_kernel::{EdgeId, NetworkId, Secp256k1Signer, Secp256k1Verifier};
-use hellas_rpc::call::WithTrailer;
+use hellas_rpc::call::{WithTrailer, with_trailer as wt};
 use hellas_rpc::pb::work::{
     AcceptWorkRequest, AcceptWorkResponse, AdmitCertificateRequest, AdmitCertificateResponse,
     DeliverResultRequest, DeliverResultResponse, ExchangeSetupRequest, ExchangeSetupResponse,
     FundingKind, GetStandingRequest, GetStandingResponse, WorkRefusalCode, WorkRefused, WorkRoute,
-    accept_work_response, exchange_setup_response, get_standing_response,
-};
-use hellas_rpc::peers::PeerId;
-use hellas_rpc::protocol::Digest;
-use hellas_rpc::protocol::work::{
-    PaidJobAuthorizationV2, PrivateRecord as _, work_id as accepted_work_id,
-};
-use hellas_rpc::protocol::work_setup::{
-    ProviderChannelPolicy, ReadyChannel, WorkChannelDescriptor,
+    accept_work_response,
 };
 use hellas_rpc::services::work::WorkHandler;
 use hellas_rpc::services::work_setup::WorkSetupHandler;
+use hellas_wire::peers::PeerId;
 use hellas_wire::{TransportContext, WireStatus};
+use hellas_work::model::setup::{ProviderChannelPolicy, ReadyChannel, WorkChannelDescriptor};
+use hellas_work::model::work::{
+    PaidJobAuthorizationV2, PrivateRecord as _, work_id as accepted_work_id,
+};
 use hellas_work::work::{
     CloseEndpoint, RunError, RunOutcome, WorkBackend, WorkService, run_accepted_work,
 };
@@ -61,7 +61,7 @@ pub enum PaidProviderError {
     #[error(transparent)]
     Endpoint(#[from] hellas_work::work::EndpointError),
     #[error(transparent)]
-    Setup(#[from] hellas_rpc::protocol::work_setup::WorkSetupError),
+    Setup(#[from] hellas_work::model::setup::WorkSetupError),
     #[error(transparent)]
     Query(#[from] hellas_chain::QueryError),
     #[error(transparent)]
@@ -75,6 +75,7 @@ pub enum PaidProviderError {
 
 pub type ProductionWorkSource = WorkBlocks<LocalLightClient>;
 /// Validated configuration for driving provider journals.
+#[derive(Clone)]
 pub struct WorkRunnerConfig {
     /// The network the journals are keyed and the signatures bound to.
     pub network: NetworkId,
@@ -183,6 +184,7 @@ type MountedChannels = BTreeMap<Digest, (PeerId, MountedWorkService)>;
 #[derive(Clone)]
 pub struct MountedWork {
     mounted: Arc<Mutex<MountedChannels>>,
+    changes: Arc<tokio::sync::Mutex<()>>,
     driver: Option<AcceptedWorkDriver>,
     node: AdmissionNode,
 }
@@ -191,6 +193,7 @@ impl Default for MountedWork {
     fn default() -> Self {
         Self {
             mounted: Arc::new(Mutex::new(BTreeMap::new())),
+            changes: Arc::new(tokio::sync::Mutex::new(())),
             driver: None,
             node: AdmissionNode::default(),
         }
@@ -271,9 +274,7 @@ impl WorkHandler for MountedWorkService {
         _request: GetStandingRequest,
         _context: TransportContext,
     ) -> Result<impl Into<WithTrailer<GetStandingResponse>> + Send, WireStatus> {
-        Ok(GetStandingResponse {
-            outcome: Some(get_standing_response::Outcome::Refused(not_ready())),
-        })
+        Ok(GetStandingResponse::refused(not_ready()))
     }
 
     async fn accept_work(
@@ -282,24 +283,20 @@ impl WorkHandler for MountedWorkService {
         _context: TransportContext,
     ) -> Result<impl Into<WithTrailer<AcceptWorkResponse>> + Send, WireStatus> {
         if !self.node.ready() {
-            return Ok(AcceptWorkResponse {
-                outcome: Some(accept_work_response::Outcome::Refused(not_ready())),
-            });
+            return Ok(AcceptWorkResponse::refused(not_ready()));
         }
-        if let Some(response) = self.service.precheck_acceptance(&request) {
+        if let Some(response) = self.service.precheck_acceptance(&request).await {
             return Ok(response);
         }
-        let ready = match self.service.readiness() {
+        let ready = match self.service.readiness().await {
             Ok(ready) => ready,
             Err(error) => {
                 debug!(%error, "channel observer is not ready for acceptance");
-                return Ok(AcceptWorkResponse {
-                    outcome: Some(accept_work_response::Outcome::Refused(WorkRefused {
-                        grant: None,
-                        code: WorkRefusalCode::NotReady as i32,
-                        reason: error.to_string(),
-                    })),
-                });
+                return Ok(AcceptWorkResponse::refused(WorkRefused {
+                    grant: None,
+                    code: WorkRefusalCode::NotReady as i32,
+                    reason: error.to_string(),
+                }));
             }
         };
         // Derive the id from the request while the accepted response
@@ -313,9 +310,10 @@ impl WorkHandler for MountedWorkService {
                     .ok()
                     .map(|authorization| accepted_work_id(state.channel(), &authorization))
             })
+            .await
             .ok()
             .flatten();
-        let response = self.service.accept(&request);
+        let response = self.service.accept(&request).await;
         if matches!(
             response.outcome.as_ref(),
             Some(accept_work_response::Outcome::Accepted(_))
@@ -365,14 +363,16 @@ impl MountedWork {
     {
         Self {
             mounted: Arc::new(Mutex::new(BTreeMap::new())),
+            changes: Arc::new(tokio::sync::Mutex::new(())),
             driver: Some(AcceptedWorkDriver::new(backend)),
             node: AdmissionNode::default(),
         }
     }
 
     /// Mounts one channel; duplicate identities are refused without replacement.
-    pub fn mount(&self, peer: PeerId, service: &WorkService) -> Result<(), MountError> {
-        let channel = service.with_state(|state| state.channel().id())?;
+    pub async fn mount(&self, peer: PeerId, service: &WorkService) -> Result<(), MountError> {
+        let _changes = self.changes.lock().await;
+        let channel = service.with_state(|state| state.channel().id()).await?;
         let mut held = self.mounted.lock().map_err(|_| MountError::Poisoned)?;
         let std::collections::btree_map::Entry::Vacant(entry) = held.entry(channel) else {
             return Err(MountError::DuplicateChannel(channel));
@@ -426,16 +426,33 @@ impl MountedWork {
             .map(|mounted| mounted.service))
     }
 
-    /// Suspends and releases every channel, including after a poisoned mount lock.
-    pub fn clear_all(&self) -> Result<(), MountError> {
-        let (mut held, mut result) = match self.mounted.lock() {
-            Ok(held) => (held, Ok(())),
-            Err(error) => (error.into_inner(), Err(MountError::Poisoned)),
+    /// Suspends every channel before releasing its mount. Cancellation retains
+    /// the mounts so shutdown can resume; namespace changes serialize with draining.
+    pub async fn clear_all(&self) -> Result<(), MountError> {
+        let _changes = self.changes.lock().await;
+        let (channels, mut result) = {
+            let (held, result) = match self.mounted.lock() {
+                Ok(held) => (held, Ok(())),
+                Err(error) => (error.into_inner(), Err(MountError::Poisoned)),
+            };
+            (
+                held.values()
+                    .map(|(_, channel)| channel.service.clone())
+                    .collect::<Vec<_>>(),
+                result,
+            )
         };
-        for (_, channel) in held.values() {
-            let suspended = channel.service.suspend().map_err(MountError::from);
+        for service in channels {
+            let suspended = service.suspend().await.map_err(MountError::from);
             result = result.and(suspended);
         }
+        let mut held = match self.mounted.lock() {
+            Ok(held) => held,
+            Err(error) => {
+                result = Err(MountError::Poisoned);
+                error.into_inner()
+            }
+        };
         held.clear();
         result
     }
@@ -511,11 +528,7 @@ impl WorkSetupHandler for MountedSetup {
         context: TransportContext,
     ) -> Result<impl Into<WithTrailer<ExchangeSetupResponse>> + Send, WireStatus> {
         if !self.1.ready() {
-            return Ok(Into::<WithTrailer<ExchangeSetupResponse>>::into(
-                ExchangeSetupResponse {
-                    outcome: Some(exchange_setup_response::Outcome::Refused(not_ready())),
-                },
-            ));
+            return Ok(ExchangeSetupResponse::refused(not_ready()).into());
         }
         let bond = <[u8; 32]>::try_from(request.bond_edge.as_slice())
             .map(EdgeId::from_bytes)
@@ -523,12 +536,8 @@ impl WorkSetupHandler for MountedSetup {
                 WireStatus::new(hellas_wire::WireCode::InvalidArgument, "invalid setup bond")
             })?;
         match self.service(&context, bond)? {
-            Some(service) => Ok(Into::<WithTrailer<ExchangeSetupResponse>>::into(
-                service.exchange_setup(request, context).await?,
-            )),
-            None => Ok(Into::<WithTrailer<ExchangeSetupResponse>>::into(
-                UnmountedWork.exchange_setup(request, context).await?,
-            )),
+            Some(service) => wt(service.exchange_setup(request, context)).await,
+            None => wt(UnmountedWork.exchange_setup(request, context)).await,
         }
     }
 }
@@ -540,9 +549,7 @@ impl WorkHandler for MountedWork {
         context: TransportContext,
     ) -> Result<impl Into<WithTrailer<GetStandingResponse>> + Send, WireStatus> {
         self.handler(&context, request.route.as_ref())?;
-        Ok(GetStandingResponse {
-            outcome: Some(get_standing_response::Outcome::Refused(not_ready())),
-        })
+        Ok(GetStandingResponse::refused(not_ready()))
     }
 
     async fn accept_work(
@@ -551,12 +558,8 @@ impl WorkHandler for MountedWork {
         context: TransportContext,
     ) -> Result<impl Into<WithTrailer<AcceptWorkResponse>> + Send, WireStatus> {
         match self.handler(&context, request.route.as_ref())? {
-            Some(service) => Ok(Into::<WithTrailer<AcceptWorkResponse>>::into(
-                service.accept_work(request, context).await?,
-            )),
-            None => Ok(Into::<WithTrailer<AcceptWorkResponse>>::into(
-                UnmountedWork.accept_work(request, context).await?,
-            )),
+            Some(service) => wt(service.accept_work(request, context)).await,
+            None => wt(UnmountedWork.accept_work(request, context)).await,
         }
     }
     async fn deliver_result(
@@ -565,12 +568,8 @@ impl WorkHandler for MountedWork {
         context: TransportContext,
     ) -> Result<impl Into<WithTrailer<DeliverResultResponse>> + Send, WireStatus> {
         match self.handler(&context, request.route.as_ref())? {
-            Some(service) => Ok(Into::<WithTrailer<DeliverResultResponse>>::into(
-                service.deliver_result(request, context).await?,
-            )),
-            None => Ok(Into::<WithTrailer<DeliverResultResponse>>::into(
-                UnmountedWork.deliver_result(request, context).await?,
-            )),
+            Some(service) => wt(service.deliver_result(request, context)).await,
+            None => wt(UnmountedWork.deliver_result(request, context)).await,
         }
     }
     async fn stream_result(
@@ -589,12 +588,8 @@ impl WorkHandler for MountedWork {
         context: TransportContext,
     ) -> Result<impl Into<WithTrailer<AdmitCertificateResponse>> + Send, WireStatus> {
         match self.handler(&context, request.route.as_ref())? {
-            Some(service) => Ok(Into::<WithTrailer<AdmitCertificateResponse>>::into(
-                service.admit_certificate(request, context).await?,
-            )),
-            None => Ok(Into::<WithTrailer<AdmitCertificateResponse>>::into(
-                UnmountedWork.admit_certificate(request, context).await?,
-            )),
+            Some(service) => wt(service.admit_certificate(request, context)).await,
+            None => wt(UnmountedWork.admit_certificate(request, context)).await,
         }
     }
 }
@@ -654,7 +649,7 @@ impl DrivenChannel {
             return Err(PaidProviderError::WrongSnapshot);
         }
         let ready = descriptor.check_ready(&snapshot.observed_channel())?;
-        let cursor = self.service.with_state(|state| state.cursor().0)?;
+        let cursor = self.service.with_state(|state| state.cursor().0).await?;
         if ready.check_caught_up(cursor).is_err() {
             self.service
                 .drive()?
@@ -662,31 +657,33 @@ impl DrivenChannel {
                 .await?;
         }
         self.service
-            .observe_ready(ready, started, self.max_observation_age)?;
+            .observe_ready(ready, started, self.max_observation_age)
+            .await?;
         Ok(())
     }
 
-    fn accepted_work_id(&self) -> Result<Option<Digest>, PaidProviderError> {
+    async fn accepted_work_id(&self) -> Result<Option<Digest>, PaidProviderError> {
         self.service
             .with_state(|state| {
                 let mut jobs = state.jobs();
                 let job = jobs.next()?;
                 (jobs.next().is_none() && job.phase() == JobPhase::Accepted).then(|| job.work_id())
             })
+            .await
             .map_err(PaidProviderError::from)
     }
 
     /// Resumes accepted work after a fresh readiness check. The durable `JobRunning`
     /// record admits one invocation even when a live request races this clock tick.
-    fn resume_accepted(&self) -> Result<bool, PaidProviderError> {
+    async fn resume_accepted(&self) -> Result<bool, PaidProviderError> {
         if !self.node.ready() {
             return Ok(false);
         }
-        let Some(work_id) = self.accepted_work_id()? else {
+        let Some(work_id) = self.accepted_work_id().await? else {
             return Ok(false);
         };
         let driver = self.driver.as_ref().ok_or(PaidProviderError::NoBackend)?;
-        let ready = self.service.readiness()?;
+        let ready = self.service.readiness().await?;
         driver.spawn(self.service.clone(), ready, work_id);
         Ok(true)
     }
@@ -739,7 +736,7 @@ impl SetupClock {
                         {
                             warn!(%error, "setup could not be unmounted");
                         }
-                        self.take_mount(store, signer, &policy, work_mount);
+                        self.take_mount(store, signer, &policy, work_mount).await;
                     } else if matches!(
                         progress,
                         SetupProgress::Aborted(_) | SetupProgress::Faulted(_)
@@ -764,13 +761,13 @@ impl SetupClock {
                     progress.snapshot
                 }
                 Err(error) => {
-                    let _ = channel.service.suspend();
+                    let _ = channel.service.suspend().await;
                     warn!(bond, %error, "this channel's close did not advance");
                     return !error.source_failed();
                 }
             };
             if let Err(error) = channel.refresh(source, started, snapshot).await {
-                let _ = channel.service.suspend();
+                let _ = channel.service.suspend().await;
                 debug!(bond, %error, "channel observation did not renew admission");
                 answered &= !matches!(
                     error,
@@ -779,7 +776,7 @@ impl SetupClock {
                             hellas_work::work_close::CatchUpError::Source(_)
                         )
                 );
-            } else if let Err(error) = channel.resume_accepted() {
+            } else if let Err(error) = channel.resume_accepted().await {
                 warn!(bond, %error, "an accepted paid job did not resume");
             }
         }
@@ -787,7 +784,7 @@ impl SetupClock {
     }
 
     /// Transfers the mounted store returned by setup, preserving its exclusive lock.
-    fn take_mount(
+    async fn take_mount(
         &mut self,
         store: ChannelStore,
         signer: &Secp256k1Signer,
@@ -809,13 +806,13 @@ impl SetupClock {
         match CloseEndpoint::new(store, signer.clone()) {
             Ok(close) => {
                 let service = WorkService::close_only(close);
-                if let Err(error) = service.require_observer() {
+                if let Err(error) = service.require_observer().await {
                     warn!(bond, %error, "channel observer could not be installed");
                     self.driven = Driven::Done;
                     return;
                 }
                 match self.route_peer {
-                    Some(peer) => match mount.mount(peer, &service) {
+                    Some(peer) => match mount.mount(peer, &service).await {
                         Ok(()) => {
                             info!(bond, "this node now answers Work from its mounted channel")
                         }
@@ -870,19 +867,19 @@ impl WorkRunner {
     /// Discovers provider journals and mounts configured routes. Unrouted journals
     /// are still driven through close. Unreadable journals are logged; failure to
     /// enumerate the root is returned to the caller.
-    pub fn discover(
+    pub async fn discover(
         config: WorkRunnerConfig,
         work_mount: MountedWork,
         setup_mount: MountedSetup,
     ) -> Result<Self, PaidProviderError> {
         config.validate()?;
         let settlement_verifier = Secp256k1Verifier::new();
-        let found = discover_setups(&config.journal_root, config.network).map_err(|source| {
-            PaidProviderError::Discover {
+        let found = discover_setups(&config.journal_root, config.network)
+            .await
+            .map_err(|source| PaidProviderError::Discover {
                 path: config.journal_root.clone(),
                 source,
-            }
-        })?;
+            })?;
         for unnamed in &found.unidentified {
             warn!(
                 path = %unnamed.path.display(),
@@ -915,7 +912,9 @@ impl WorkRunner {
                 setup.bond_edge,
                 setup.role,
                 &settlement_verifier,
-            ) {
+            )
+            .await
+            {
                 Ok(store) => store,
                 Err(error) => {
                     warn!(bond, %error, "a discovered setup journal did not open");
@@ -998,7 +997,7 @@ impl WorkRunner {
     {
         if self.clocks.is_empty() {
             info!("no provider setup journal under the work root; the clock has nothing to drive");
-            return self.unmount_all();
+            return self.unmount_all().await;
         }
         // Each channel consumes the same local finalization stream. Independent
         // journal scheduling keeps a slow close submission from blocking another.
@@ -1031,7 +1030,7 @@ impl WorkRunner {
                                 Ok(true) => {}
                                 Ok(false) | Err(_) => {
                                     if let Driven::Channel(channel) = &clock.driven {
-                                        let _ = channel.service.suspend();
+                                        let _ = channel.service.suspend().await;
                                     }
                                     chain = None;
                                 }
@@ -1058,7 +1057,7 @@ impl WorkRunner {
                 }
             }
         }
-        let result = self.unmount_all();
+        let result = self.unmount_all().await;
         info!("the paid-work clock stopped, and its journals are closed");
         result
     }
@@ -1071,8 +1070,8 @@ pub struct NodeWorkRunner {
 }
 
 impl WorkRunner {
-    fn unmount_all(&self) -> Result<(), MountError> {
-        let work = self.work_mount.clear_all();
+    async fn unmount_all(&self) -> Result<(), MountError> {
+        let work = self.work_mount.clear_all().await;
         let setup = self.setup_mount.clear_all();
         work.and(setup)
     }
@@ -1113,11 +1112,11 @@ impl NodeWorkRunner {
 mod tests {
     use super::*;
 
-    #[test]
-    fn poisoned_mounts_are_errors_and_shutdown_still_releases_channels() {
+    #[tokio::test]
+    async fn poisoned_mounts_are_errors_and_shutdown_still_releases_channels() {
         use hellas_wire::{AuthLevel, PeerIdentity};
         let fixture = crate::test_support::PaidFixture::new();
-        let service = fixture.provider();
+        let service = fixture.provider().await;
         let channel = fixture.descriptor.channel().id();
         let peer = PeerId::from_bytes([1; 32]);
         let context = TransportContext {
@@ -1126,7 +1125,17 @@ mod tests {
             ..TransportContext::default()
         };
         let mount = MountedWork::default();
-        mount.mount(peer, &service).unwrap();
+        mount.mount(peer, &service).await.unwrap();
+        // Cancellation while suspension waits must retain the registered channel.
+        use hellas_work::work_close::CloseChannel as _;
+        let mut driver = service.drive().unwrap();
+        let held = driver.store().await.unwrap();
+        let mut clearing = Box::pin(mount.clear_all());
+        assert!(futures::poll!(clearing.as_mut()).is_pending());
+        drop(clearing);
+        assert!(mount.service(&context, channel).unwrap().is_some());
+        drop(held);
+        drop(driver);
         let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _guard = mount.mounted.lock().unwrap();
             panic!("inject a poisoned mount");
@@ -1137,10 +1146,10 @@ mod tests {
             Err(MountError::Poisoned)
         ));
         assert!(matches!(
-            mount.mount(peer, &service),
+            mount.mount(peer, &service).await,
             Err(MountError::Poisoned)
         ));
-        assert!(matches!(mount.clear_all(), Err(MountError::Poisoned)));
+        assert!(matches!(mount.clear_all().await, Err(MountError::Poisoned)));
         assert!(match mount.mounted.lock() {
             Err(error) => error.into_inner().is_empty(),
             Ok(_) => panic!("lock remains poisoned"),
@@ -1159,8 +1168,8 @@ mod tests {
         assert!(matches!(setups.clear_all(), Err(MountError::Poisoned)));
     }
 
-    #[test]
-    fn invalid_observation_policy_is_rejected_before_discovering_journals() {
+    #[tokio::test]
+    async fn invalid_observation_policy_is_rejected_before_discovering_journals() {
         let fixture = crate::test_support::PaidFixture::new();
         let config = &fixture.config;
         let runner = WorkRunner::discover(
@@ -1177,7 +1186,7 @@ mod tests {
             MountedSetup::default(),
         );
         assert!(matches!(
-            runner,
+            runner.await,
             Err(PaidProviderError::InvalidObservationPolicy)
         ));
         assert!(!config.journal_root.exists());

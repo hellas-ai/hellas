@@ -2,9 +2,10 @@
 use futures::stream::BoxStream;
 use hellas_gateway::{ExecutionEvent, Outcome, StopReason, WorkExecutionRequest, WorkGatewayError};
 use hellas_rpc::protocol::artifacts::{
-    BoundTermId, InputAddressed as _, OutputAddressed as _, PreparedPaidInputV1, SourceRef,
-    TextArtifact, TextExecution, TextPolicy, TokenIds,
+    BoundTermId, InputAddressed as _, OutputAddressed as _, SourceRef, TextArtifact, TextExecution,
+    TextPolicy, TokenIds,
 };
+use hellas_work::model::prepared_input::PreparedPaidInputV1;
 use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 
@@ -18,7 +19,7 @@ fn error(e: impl std::error::Error + Send + Sync + 'static) -> WorkGatewayError 
 
 pub fn prepare_evaluate(
     request: WorkExecutionRequest,
-    runner: hellas_rpc::PublicKey,
+    runner: hellas_auth::PublicKey,
 ) -> Result<PreparedPaidInputV1, WorkGatewayError> {
     hellas_client::execution::validate_causal_lm_invocation(
         &request.environment,

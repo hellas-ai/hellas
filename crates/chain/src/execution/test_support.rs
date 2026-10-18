@@ -112,7 +112,9 @@ where
 {
     let directory = tempfile::tempdir().expect("QMDB tempdir");
     let config = tokio::Config::new().with_storage_directory(directory.path());
-    tokio::Runner::new(config).start(test)
+    // Own the composed fixture on the heap before the runtime wraps/polls it.
+    // Real-chain scenarios otherwise exhaust libtest's default debug stack.
+    tokio::Runner::new(config).start(|context| Box::pin(test(context)))
 }
 
 pub(crate) fn validator_key(seed: u64) -> PrivateKey {

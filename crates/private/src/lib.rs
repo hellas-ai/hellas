@@ -9,7 +9,10 @@
 //! object regardless of what it says.
 
 mod regular;
-pub use regular::{open_regular_file, read_bounded_regular_file};
+pub use regular::{
+    ReadLimit, open_regular_file, open_regular_file_nofollow, read_bounded,
+    read_bounded_regular_file, read_private_bounded,
+};
 
 use std::fs::File;
 use std::io::{self, Write as _};
@@ -18,7 +21,7 @@ use std::path::Path;
 use tempfile::NamedTempFile;
 
 #[cfg(unix)]
-mod unix;
+pub mod unix;
 #[cfg(unix)]
 use unix as imp;
 
@@ -117,6 +120,21 @@ pub fn private_tempfile(directory: &Path, prefix: &str, suffix: &str) -> io::Res
         .prefix(prefix)
         .suffix(suffix)
         .make_in(directory, imp::create_private_new)
+}
+
+/// Opens the stable advisory-lock file formed by appending `.lock` to `path`.
+/// The caller chooses blocking, nonblocking or deadline-based lock acquisition.
+/// New lock files are private; existing files must be regular and not symlinks.
+pub fn open_lock_beside(path: &Path) -> io::Result<File> {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".lock");
+    let path = Path::new(&name);
+    match imp::create_private_new(path) {
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            open_regular_file_nofollow(path)
+        }
+        result => result,
+    }
 }
 
 /// Atomically replaces `path` with `bytes`, privately and durably: through a

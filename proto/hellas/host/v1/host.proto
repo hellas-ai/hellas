@@ -5,25 +5,45 @@ package hellas.host.v1;
 // Administrative lifecycle control. Hosts must authorize each connection before
 // dispatch, regardless of whether the carrier is local or remote.
 service HostControl {
-  // Journal owner or admin; versioned canonical node permission records.
+  // Canonical Auth GrantCommand; the authenticated connection supplies the actor.
   rpc GrantControl(GrantControlRequest) returns (GrantControlResponse);
+  rpc IssueCredential(IssueCredentialRequest) returns (IssueCredentialResponse);
+  rpc RevokeCredential(RevokeCredentialRequest) returns (RevokeCredentialResponse);
+  rpc WorkControl(WorkControlRequest) returns (WorkControlResponse);
   rpc GetHostStatus(GetHostStatusRequest) returns (HostStatus);
+  rpc SetMachineCapacity(SetMachineCapacityRequest) returns (MachineCapacity);
   rpc SetProviderState(SetProviderStateRequest) returns (HostStatus);
   rpc SetGatewayState(SetGatewayStateRequest) returns (HostStatus);
   rpc GetGatewayAccess(GetGatewayAccessRequest) returns (GatewayAccess);
 }
 
-message GetHostStatusRequest {}
+message GetHostStatusRequest { bytes authorization = 1; }
+
+message SetMachineCapacityRequest {
+  bytes authorization = 1;
+  uint64 expected_revision = 2;
+  uint32 max_in_flight = 3;
+  // Canonical DAG-CBOR array of Work Limit values. An encoded empty array clears limits.
+  bytes limits = 4;
+}
+
+message MachineCapacity {
+  uint64 revision = 1;
+  uint32 max_in_flight = 2;
+  bytes limits = 3;
+}
 
 message SetProviderStateRequest {
   bool enabled = 1;
+  bytes authorization = 2;
 }
 
 message SetGatewayStateRequest {
   bool enabled = 1;
+  bytes authorization = 2;
 }
 
-message GetGatewayAccessRequest {}
+message GetGatewayAccessRequest { bytes authorization = 1; }
 
 enum RuntimeState {
   // An omitted state means stopped; preserve the host protocol's zero value.
@@ -65,6 +85,11 @@ message HostStatus {
   ServiceStatus provider = 3;
   ServiceStatus gateway = 4;
   string endpoint = 5;
+  bytes authority = 6;
+  uint64 authority_revision = 7;
+  uint64 generation = 8;
+  bool provider_configured = 9;
+  MachineCapacity machine = 10;
 }
 
 message GatewayAccess {
@@ -74,3 +99,30 @@ message GatewayAccess {
 
 message GrantControlRequest { bytes command = 1; }
 message GrantControlResponse { bytes reply = 1; }
+
+message IssueCredentialRequest {
+  bytes authorization = 1;
+  // Canonical Auth GrantSpec; the server generates the credential and its verifier.
+  bytes scope = 2;
+}
+
+// Secret material: send only over authenticated, encrypted HostControl.
+message IssueCredentialResponse {
+  // Canonical durable AdministrationRecord, never an authentication input.
+  bytes record = 1;
+  bytes credential_id = 2;
+  bytes secret = 3;
+}
+
+message RevokeCredentialRequest {
+  bytes authorization = 1;
+  bytes credential_id = 2;
+  uint64 expected_revision = 3;
+}
+message RevokeCredentialResponse { bytes record = 1; }
+
+message WorkControlRequest {
+  bytes authorization = 1;
+  bytes command = 2;
+}
+message WorkControlResponse { bytes reply = 1; }

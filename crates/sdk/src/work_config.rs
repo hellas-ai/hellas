@@ -14,14 +14,14 @@ type Result<T> = std::result::Result<T, WorkConfigError>;
 use crate::resource_config::{
     ExecutionPolicyFile, FetchPolicyFile, parse_digest, parse_fixed_hex, parse_hex,
 };
+use hellas_auth::Digest;
 use hellas_kernel::{
     EdgeId, EdgeValues, Fees, Key, MIN_OMIT_RESPONSE_BLOCKS, NetworkId, Secp256k1Verifier,
 };
-use hellas_rpc::peers::PeerId;
-use hellas_rpc::protocol::Digest;
-use hellas_rpc::protocol::work::{JobPaymentPolicyV2, PaidChannelPolicyV1};
-use hellas_rpc::protocol::work_profile::WorkPolicy;
-use hellas_rpc::protocol::work_setup::ProviderChannelPolicy;
+use hellas_wire::peers::PeerId;
+use hellas_work::model::profile::WorkPolicy;
+use hellas_work::model::setup::ProviderChannelPolicy;
+use hellas_work::model::work::{JobPaymentPolicyV2, PaidChannelPolicyV1};
 use hellas_work::work_store::{Role, SetupStore, discover_setups};
 use serde::Deserialize;
 
@@ -115,7 +115,6 @@ impl WorkRoutes {
 impl WorkConfig {
     /// Builds the process's shared executing node. The host owns its directory
     /// and passes the same node handle to every paid client and provider.
-    #[cfg(any(feature = "paid-client", feature = "paid-provider"))]
     pub fn node_config(
         &self,
         storage_dir: PathBuf,
@@ -157,7 +156,6 @@ impl WorkConfig {
         })
     }
 
-    #[cfg(any(feature = "paid-client", feature = "paid-provider"))]
     /// Refuses a paid configuration whose execution genesis or finality pins
     /// differ from the process's shared node.
     pub fn check_node(&self, node: &hellas_chain::node::FullNode) -> Result<()> {
@@ -230,16 +228,16 @@ pub fn load_work_config(path: &Path) -> Result<WorkConfig> {
 
 /// Checks each route against a provider journal under the configured root,
 /// including its bond and client key. Run after provisioning and before serving.
-pub fn validate_work_routes(config: &WorkConfig) -> Result<()> {
+pub async fn validate_work_routes(config: &WorkConfig) -> Result<()> {
     if config.routes.is_empty() {
         return Ok(());
     }
-    let found = discover_setups(&config.journal_root, config.chain.network).map_err(|source| {
-        WorkConfigError::Journal {
+    let found = discover_setups(&config.journal_root, config.chain.network)
+        .await
+        .map_err(|source| WorkConfigError::Journal {
             root: config.journal_root.clone(),
             source,
-        }
-    })?;
+        })?;
     for route in config.routes.iter() {
         if !found
             .setups
@@ -258,6 +256,7 @@ pub fn validate_work_routes(config: &WorkConfig) -> Result<()> {
             Role::Provider,
             &Secp256k1Verifier::new(),
         )
+        .await
         .map_err(|source| WorkConfigError::Journal {
             root: config.journal_root.clone(),
             source,
@@ -541,4 +540,19 @@ impl PaymentPolicyFile {
         policy.check()?;
         Ok(policy)
     }
+}
+
+/// Packs typed funding coins without imposing a provider/client funding policy.
+/// Callers retain their nonempty and duplicate-coin checks.
+pub fn coin_list(
+    ids: &[hellas_kernel::CoinId],
+) -> Option<hellas_kernel::List<hellas_kernel::CoinId, { hellas_kernel::MAX_PARTY_INPUTS }>> {
+    let slots = std::array::from_fn(|i| {
+        ids.get(i)
+            .copied()
+            .unwrap_or(hellas_kernel::CoinId::from_bytes(
+                [0; hellas_kernel::CoinId::LENGTH],
+            ))
+    });
+    hellas_kernel::List::new(slots, ids.len())
 }

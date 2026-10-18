@@ -2,6 +2,7 @@
 use super::super::CliResult;
 pub use hellas_sdk::work_provision::ProvisionOptions;
 use hellas_sdk::work_provision::{preview_bond, provision_offer};
+use hellas_work::model::grant::records::grant_transport;
 
 pub async fn run_provision(
     options: ProvisionOptions,
@@ -37,8 +38,8 @@ pub async fn run_provision(
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
-            "provider": made.offer.offer().provider.grant_transport().map(hex::encode)?,
-            "provider_genesis": made.offer,
+            "provider": grant_transport(&made.offer.offer().provider).map(hex::encode)?,
+            "offer": made.offer,
             "bond": hex::encode(made.bond_edge.to_bytes()),
         }))?
     );

@@ -1,4 +1,5 @@
-use hellas_rpc::ProducerSigningKey;
+use hellas_auth::ProducerSigningKey;
+use hellas_auth::{Digest, PublicKey};
 use iroh::{EndpointId, SecretKey};
 /// Stable native caller identity. Hosts decide where these secret bytes are
 /// persisted (for example, Gate uses its private application directory or the

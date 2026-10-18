@@ -1,10 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::protocol::value::{CanonicalDecodeError, CanonicalDecoder};
-use crate::{
-    Assurance, ContentId, DagCborEncoder, Digest, PublicKey, RequestCommitment, Retention,
-    SignatureKind,
-};
+use crate::{Assurance, ContentId, DagCborEncoder, RequestCommitment, Retention};
+use hellas_auth::{Digest, PublicKey, SignatureKind};
 
 /// Schema tag of the request commitment preimage. One constant, so the
 /// encoder and the decoder below cannot disagree about which array they
@@ -32,7 +30,7 @@ impl EvaluateRequest {
 /// Returns the canonical DAG-CBOR array [`Evaluate::commit_request`] hashes.
 ///
 /// Exposed as bytes because a second protocol — the paid-work bundle in
-/// [`crate::protocol::artifacts::PreparedPaidInputV1`] — must carry the
+/// `hellas_work::model::prepared_input::PreparedPaidInputV1` — must carry the
 /// exact preimage of the request commitment, not a second spelling of the
 /// same fields. There is one encoder and one field order; a caller that
 /// re-derived these bytes could disagree with the commitment they claim
@@ -138,7 +136,7 @@ impl Evaluate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ProducerSigningKey;
+    use hellas_auth::ProducerSigningKey;
 
     fn key(byte: u8) -> PublicKey {
         ProducerSigningKey::from_secret_bytes([byte; 32])

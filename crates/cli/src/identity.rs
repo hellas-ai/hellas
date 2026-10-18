@@ -1,22 +1,13 @@
 use anyhow::{Context, bail};
-#[cfg(any(feature = "node", feature = "gateway", test))]
-use hellas_attestation::{AssertionCounterStore, AttestationError};
-use hellas_rpc::signature::verify_digest_signature;
+use hellas_attestation::AssertionCounterStore;
+use hellas_auth::signature::verify_digest_signature;
+use hellas_auth::{Digest, ProducerSigningKey, PublicKey};
 use hellas_rpc::{
-    DagCborDecoder, Digest, PlatformCredential, ProducerSigningKey, ProviderGenesisStatement,
-    PublicKey, RootKind, RootProof, SignedProviderGenesis,
-};
-#[cfg(feature = "node")]
-use hellas_rpc::{
-    OPEN_NONCE_LEN,
-    open::OpenHandler,
-    open_proof_binding,
-    pb::execute::{OpenRequest, OpenResponse, open_response},
-    signature_wire::signature_to_pb,
+    DagCborDecoder, PlatformCredential, ProviderGenesisStatement, RootKind, RootProof,
+    SignedProviderGenesis,
 };
 use hellas_rpc::{PlatformEnrollment, ProviderEnrollmentBundle};
-#[cfg(feature = "node")]
-use hellas_wire::{TransportContext, WireCode, WireStatus};
+use hellas_sdk::{FilesystemAssertionCounterStore, ProviderOpen};
 use iroh::SecretKey;
 use std::fs;
 use std::io::{ErrorKind, Write};
@@ -25,99 +16,11 @@ use std::sync::Arc;
 
 const IDENTITY_DIR: &str = ".hellas";
 const IDENTITY_FILE: &str = "identity";
-#[cfg(any(feature = "node", feature = "gateway", test))]
 const APPLE_OPEN_COUNTER_STORE_DIR: &str = "apple-app-attest-open-counters";
 #[cfg(feature = "evaluate")]
 const CONTENT_INDEX_FILE: &str = "content-index.bin";
 const VERSION: u8 = 3;
 const IDENTITY_TAG: &str = "hellas.provider.identity.persistence.v3";
-
-/// Filesystem-backed assertion-counter high-water marks, keyed by public key.
-#[cfg(any(feature = "node", feature = "gateway", test))]
-#[derive(Clone, Debug)]
-struct FilesystemAssertionCounterStore {
-    directory: PathBuf,
-}
-
-#[cfg(any(feature = "node", feature = "gateway", test))]
-impl FilesystemAssertionCounterStore {
-    fn new(directory: impl Into<PathBuf>) -> Self {
-        Self {
-            directory: directory.into(),
-        }
-    }
-
-    fn counter_path(&self, public_key: &[u8; 33]) -> PathBuf {
-        self.directory
-            .join(format!("{}.counter", Self::key_name(public_key)))
-    }
-
-    fn lock_path(&self, public_key: &[u8; 33]) -> PathBuf {
-        self.directory
-            .join(format!("{}.counter.lock", Self::key_name(public_key)))
-    }
-
-    fn key_name(public_key: &[u8; 33]) -> String {
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-        let mut name = String::with_capacity(public_key.len() * 2);
-        for byte in public_key {
-            name.push(HEX[(byte >> 4) as usize] as char);
-            name.push(HEX[(byte & 0xf) as usize] as char);
-        }
-        name
-    }
-}
-
-#[cfg(any(feature = "node", feature = "gateway", test))]
-impl AssertionCounterStore for FilesystemAssertionCounterStore {
-    fn advance(&self, public_key: &[u8; 33], counter: u32) -> Result<(), AttestationError> {
-        create_dir_restricted(&self.directory).map_err(|_| AttestationError::State)?;
-        let lock = fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(self.lock_path(public_key))
-            .map_err(|_| AttestationError::State)?;
-        fs::File::lock(&lock).map_err(|_| AttestationError::State)?;
-
-        let counter_path = self.counter_path(public_key);
-        let previous = match fs::read(&counter_path) {
-            Ok(stored) => match stored.as_slice() {
-                [a, b, c, d] => u32::from_be_bytes([*a, *b, *c, *d]),
-                _ => return Err(AttestationError::State),
-            },
-            Err(error) if error.kind() == ErrorKind::NotFound => 0,
-            Err(_) => return Err(AttestationError::State),
-        };
-        if counter <= previous {
-            return Err(AttestationError::Counter);
-        }
-
-        let mut temp = tempfile::NamedTempFile::new_in(&self.directory)
-            .map_err(|_| AttestationError::State)?;
-        #[cfg(unix)]
-        temp.as_file()
-            .set_permissions({
-                use std::os::unix::fs::PermissionsExt;
-                fs::Permissions::from_mode(0o600)
-            })
-            .map_err(|_| AttestationError::State)?;
-        temp.write_all(&counter.to_be_bytes())
-            .map_err(|_| AttestationError::State)?;
-        temp.flush().map_err(|_| AttestationError::State)?;
-        temp.as_file()
-            .sync_all()
-            .map_err(|_| AttestationError::State)?;
-        temp.persist(&counter_path)
-            .map_err(|_| AttestationError::State)?;
-        #[cfg(unix)]
-        fs::File::open(&self.directory)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|_| AttestationError::State)?;
-        Ok(())
-    }
-}
 
 pub(crate) struct LocalIdentity {
     pub(crate) transport_key: SecretKey,
@@ -125,20 +28,7 @@ pub(crate) struct LocalIdentity {
     #[cfg(test)]
     pub(crate) genesis: SignedProviderGenesis,
     pub(crate) enrollment: ProviderEnrollmentBundle,
-    #[cfg(feature = "node")]
-    open_identity: Arc<OpenIdentity>,
-}
-
-#[cfg(feature = "node")]
-pub(crate) struct OpenIdentity {
-    signer: OpenSigner,
-    enrollment: ProviderEnrollmentBundle,
-}
-
-#[cfg(feature = "node")]
-#[derive(Clone)]
-enum OpenSigner {
-    Software(ProducerSigningKey),
+    open_identity: Arc<ProviderOpen<ProducerSigningKey>>,
 }
 
 struct StoredIdentity {
@@ -167,91 +57,21 @@ impl PlatformRoot {
     }
 }
 
-#[cfg(feature = "node")]
-impl OpenIdentity {
-    async fn proof(&self, binding: Digest) -> Result<RootProof, WireStatus> {
-        match &self.signer {
-            // Software enrollment authenticates the producer key once; the
-            // producer then proves each live transport binding.
-            OpenSigner::Software(key) => {
-                key.sign_digest(binding)
-                    .map(RootProof::Software)
-                    .map_err(|error| {
-                        tracing::warn!(%error, "confidential open proof generation failed");
-                        WireStatus::internal("confidential open proof generation failed")
-                    })
-            }
-        }
-    }
-}
-
-#[cfg(feature = "node")]
-impl OpenHandler for OpenIdentity {
-    async fn open(
-        &self,
-        request: OpenRequest,
-        context: TransportContext,
-        alpn: &'static [u8],
-    ) -> Result<OpenResponse, WireStatus> {
-        let nonce: [u8; OPEN_NONCE_LEN] = request.nonce.try_into().map_err(|bytes: Vec<u8>| {
-            WireStatus::new(
-                WireCode::InvalidArgument,
-                format!(
-                    "confidential open nonce must be {OPEN_NONCE_LEN} bytes, got {}",
-                    bytes.len()
-                ),
-            )
-        })?;
-        let exporter = context.open_exporter.ok_or_else(|| {
-            WireStatus::new(
-                WireCode::FailedPrecondition,
-                "transport does not expose a confidential-open exporter",
-            )
-        })?;
-        let binding = open_proof_binding(
-            &exporter,
-            &nonce,
-            &self.enrollment.genesis.statement.producer_public_key,
-            self.enrollment.content_id(),
-            alpn,
-        );
-        let proof = match self.proof(binding).await? {
-            RootProof::Software(signature) => {
-                open_response::Proof::ProducerSignature(signature_to_pb(&signature))
-            }
-            RootProof::AppleAppAttest(assertion) => {
-                open_response::Proof::AppleAppAttestAssertion(assertion)
-            }
-        };
-        Ok(OpenResponse {
-            provider_genesis: self.enrollment.canonical_bytes(),
-            proof: Some(proof),
-        })
-    }
-}
-
-#[cfg(feature = "node")]
 impl LocalIdentity {
-    pub(crate) fn open_identity(&self) -> Arc<OpenIdentity> {
+    pub(crate) fn open_identity(&self) -> Arc<ProviderOpen<ProducerSigningKey>> {
         self.open_identity.clone()
     }
 }
 
-#[cfg(feature = "node")]
 fn build_open_identity(
-    root: &Arc<PlatformRoot>,
     producer_key: &ProducerSigningKey,
     enrollment: &ProviderEnrollmentBundle,
-) -> Arc<OpenIdentity> {
-    let signer = match root.as_ref() {
-        // The enrollment root authenticates the producer once. It is not an
-        // online software key and must not survive identity materialization.
-        PlatformRoot::Software(_) => OpenSigner::Software(producer_key.clone()),
-    };
-    Arc::new(OpenIdentity {
-        signer,
-        enrollment: enrollment.clone(),
-    })
+) -> anyhow::Result<Arc<ProviderOpen<ProducerSigningKey>>> {
+    Ok(Arc::new(ProviderOpen::new(
+        Arc::new(producer_key.clone()),
+        enrollment.clone(),
+        None,
+    )?))
 }
 
 pub(crate) fn load_or_create(path: Option<&Path>) -> anyhow::Result<LocalIdentity> {
@@ -276,7 +96,6 @@ pub(crate) fn load_or_create(path: Option<&Path>) -> anyhow::Result<LocalIdentit
 /// init` is where an operator's settlement key comes from, and there is
 /// nothing here that could invent one — a party nobody has funded stakes
 /// no bond and settles no channel.
-#[cfg(feature = "node")]
 pub(crate) fn settlement_signer(identity: &LocalIdentity) -> hellas_kernel::Secp256k1Signer {
     hellas_executor::kernel_signer(&identity.producer_key)
 }
@@ -299,7 +118,6 @@ fn default_path() -> anyhow::Result<PathBuf> {
     default_hellas_path(IDENTITY_FILE, "--identity")
 }
 
-#[cfg(feature = "gateway")]
 pub(crate) fn default_gateway_archive_path() -> anyhow::Result<PathBuf> {
     default_hellas_path("gateway-archive", "--archive-dir")
 }
@@ -309,37 +127,13 @@ pub(crate) fn default_content_index_path() -> anyhow::Result<PathBuf> {
     default_hellas_path(CONTENT_INDEX_FILE, "--content-index")
 }
 
-#[cfg(any(feature = "node", feature = "gateway", test))]
-pub(crate) fn provider_trust(
-    expected_genesis: Option<hellas_rpc::ContentId>,
-    required_assurance: hellas_rpc::Assurance,
-    app_id: Option<String>,
-    allowed_cd_hashes: Vec<[u8; 32]>,
-) -> anyhow::Result<hellas_client::ProviderTrustAnchor> {
-    let expected_genesis =
-        expected_genesis.context("remote execution requires --provider <content-id>")?;
-    let apple_app_attest = match (app_id, allowed_cd_hashes.is_empty()) {
-        (None, true) if required_assurance == hellas_rpc::Assurance::ProducerSigned => None,
-        (Some(app_id), false) => Some(hellas_client::AppleAppAttestTrust::new(
-            app_id,
-            allowed_cd_hashes,
-            Arc::new(FilesystemAssertionCounterStore::new(default_hellas_path(
-                APPLE_OPEN_COUNTER_STORE_DIR,
-                "--apple-app-attest-cdhashes",
-            )?)),
-        )),
-        (None, _) => {
-            bail!("Apple App Attest trust requires --apple-app-attest-app-id <team-id.bundle-id>")
-        }
-        (Some(_), true) => {
-            bail!("Apple App Attest trust requires --apple-app-attest-cdhashes <hex>")
-        }
-    };
-    Ok(hellas_client::ProviderTrustAnchor {
-        expected_genesis,
-        required_assurance,
-        apple_app_attest,
-    })
+pub(crate) fn assertion_counters() -> anyhow::Result<Arc<dyn AssertionCounterStore + Send + Sync>> {
+    Ok(Arc::new(FilesystemAssertionCounterStore::new(
+        default_hellas_path(
+            APPLE_OPEN_COUNTER_STORE_DIR,
+            "caller assertion-counter directory",
+        )?,
+    )))
 }
 
 fn default_hellas_path(file: &str, flag: &str) -> anyhow::Result<PathBuf> {
@@ -349,7 +143,6 @@ fn default_hellas_path(file: &str, flag: &str) -> anyhow::Result<PathBuf> {
     Ok(PathBuf::from(home).join(IDENTITY_DIR).join(file))
 }
 
-#[cfg(feature = "node")]
 pub(crate) fn default_chain_path(network: &str) -> anyhow::Result<PathBuf> {
     Ok(default_hellas_path("chain", "--chain-store-dir")?.join(network))
 }
@@ -379,15 +172,13 @@ fn create(path: &Path) -> anyhow::Result<LocalIdentity> {
         transport_key: transport_key.to_bytes(),
         enrollment: enrollment.clone(),
     };
-    #[cfg(feature = "node")]
-    let open_identity = build_open_identity(&root, &producer_key, &enrollment);
+    let open_identity = build_open_identity(&producer_key, &enrollment)?;
     let identity = LocalIdentity {
         transport_key,
         producer_key,
         #[cfg(test)]
         genesis,
         enrollment,
-        #[cfg(feature = "node")]
         open_identity,
     };
     if !persist(path, &stored)? {
@@ -420,7 +211,6 @@ fn materialize(stored: &StoredIdentity) -> anyhow::Result<LocalIdentity> {
         &transport_key,
         stored.enrollment.genesis.statement.installation_nonce,
     );
-    #[cfg_attr(not(any(feature = "node", test)), allow(unused_variables))]
     let root_proof = match (root.as_ref(), &stored.enrollment.genesis.root_proof) {
         (PlatformRoot::Software(_), RootProof::Software(signature)) => {
             verify_digest_signature(
@@ -433,10 +223,6 @@ fn materialize(stored: &StoredIdentity) -> anyhow::Result<LocalIdentity> {
         }
         (PlatformRoot::Software(_), _) => bail!("software root requires a software root proof"),
     };
-    #[cfg_attr(
-        not(any(feature = "node", feature = "evaluate", test)),
-        allow(unused_variables)
-    )]
     let genesis = SignedProviderGenesis {
         statement,
         root_proof,
@@ -445,15 +231,13 @@ fn materialize(stored: &StoredIdentity) -> anyhow::Result<LocalIdentity> {
     if enrollment != stored.enrollment {
         bail!("stored provider enrollment does not match the persisted keys");
     }
-    #[cfg(feature = "node")]
-    let open_identity = build_open_identity(&root, &producer_key, &enrollment);
+    let open_identity = build_open_identity(&producer_key, &enrollment)?;
     Ok(LocalIdentity {
         transport_key,
         producer_key,
         #[cfg(test)]
         genesis,
         enrollment,
-        #[cfg(feature = "node")]
         open_identity,
     })
 }
@@ -567,42 +351,21 @@ fn persist(path: &Path, stored: &StoredIdentity) -> anyhow::Result<bool> {
     let dir = path
         .parent()
         .context("identity path has no parent directory")?;
-    create_dir_restricted(dir)
+    hellas_private::create_dir_all_durable(dir)
         .with_context(|| format!("failed to create identity directory {}", dir.display()))?;
-    let mut temp = tempfile::NamedTempFile::new_in(dir)
+    let mut temp = hellas_private::private_tempfile(dir, ".identity-", ".tmp")
         .with_context(|| format!("failed to create temporary identity in {}", dir.display()))?;
-    #[cfg(unix)]
-    temp.as_file().set_permissions({
-        use std::os::unix::fs::PermissionsExt;
-        fs::Permissions::from_mode(0o600)
-    })?;
     temp.write_all(&stored.canonical_bytes())?;
     temp.flush()?;
     temp.as_file().sync_all()?;
     match temp.persist_noclobber(path) {
         Ok(_) => {
-            #[cfg(unix)]
-            fs::File::open(dir)?.sync_all()?;
+            hellas_private::sync_directory(dir)?;
             Ok(true)
         }
         Err(_error) if path.exists() => Ok(false),
         Err(error) => Err(error.error)
             .with_context(|| format!("failed to persist identity file {}", path.display())),
-    }
-}
-
-fn create_dir_restricted(path: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(path)
-    }
-    #[cfg(not(unix))]
-    {
-        fs::create_dir_all(path)
     }
 }
 

@@ -298,27 +298,7 @@ fn decode_hex_32(label: &'static str, value: &str) -> Option<[u8; 32]> {
         );
         return None;
     }
-    let mut out = [0_u8; 32];
-    let bytes = value.as_bytes();
-    for (idx, byte) in out.iter_mut().enumerate() {
-        let Some(hi) = hex_nibble(bytes[idx * 2]) else {
-            warn!(label, "invalid provenance commitment hex");
-            return None;
-        };
-        let Some(lo) = hex_nibble(bytes[idx * 2 + 1]) else {
-            warn!(label, "invalid provenance commitment hex");
-            return None;
-        };
-        *byte = (hi << 4) | lo;
-    }
-    Some(out)
-}
-
-fn hex_nibble(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
+    hellas_auth::hex::parse(value)
+        .map_err(|_| warn!(label, "invalid provenance commitment hex"))
+        .ok()
 }

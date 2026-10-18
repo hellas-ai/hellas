@@ -1,10 +1,10 @@
 use super::*;
 use crate::test_support::enrollment;
-#[cfg(all(feature = "paid-provider", feature = "grant-client"))]
 mod offer;
 mod recovery;
+use hellas_auth::{ProducerSigningKey, PublicKey};
 use hellas_rpc::pb::execute::{OpenRequest, OpenResponse, open_response};
-use hellas_rpc::{Assurance, ProducerSigningKey, ProviderEnrollmentBundle, PublicKey};
+use hellas_rpc::{Assurance, ProviderEnrollmentBundle};
 use hellas_wire::{MethodMarker, StreamTransport, WireStatus};
 
 #[tokio::test]
@@ -62,7 +62,7 @@ async fn insufficient_collateral_is_rejected_before_network_or_journal_creation(
     assert!(matches!(
         result,
         Err(PaidClientError::WorkSetup(
-            hellas_rpc::protocol::work_setup::WorkSetupError::Undercollateralised {
+            hellas_work::model::setup::WorkSetupError::Undercollateralised {
                 bond: 51,
                 capacity: 949,
             }
@@ -105,6 +105,16 @@ async fn serve_open<M>(
     )
     .await
     .unwrap();
+    if M::Service::ALPN == hellas_rpc::services::work::Work::ALPN {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let Ok((mut send, mut recv)) = transport.connection().accept_bi().await else {
+            return;
+        };
+        assert_eq!(recv.read_u8().await.unwrap(), 1);
+        assert_eq!(recv.read(&mut [0]).await.unwrap(), None);
+        send.write_all(&[1]).await.unwrap();
+        send.shutdown().await.unwrap();
+    }
 }
 
 #[tokio::test]
@@ -125,6 +135,7 @@ async fn both_paid_connections_open_before_disclosure_and_refuse_wrong_assurance
             .unwrap();
         let (bundle, key) = enrollment(server.id());
         let trust = hellas_client::ProviderTrustAnchor {
+            allowed_environments: vec![],
             expected_genesis: bundle.content_id(),
             required_assurance: Assurance::ProducerSigned,
             apple_app_attest: None,
@@ -245,11 +256,11 @@ fn fetch_request(
     assurance: Assurance,
     retention: hellas_rpc::Retention,
 ) -> (ProviderChannelPolicy, PreparedWorkInput, PublicKey) {
-    use hellas_rpc::protocol::work::PaidChannelPolicyV1;
-    use hellas_rpc::protocol::work_fetch::{
+    use hellas_work::model::fetch::{
         FetchPolicyV2, FetchRoutePolicy, PreparedPaidFetchInputV1, fetch_route_commitment,
     };
-    let environment = hellas_rpc::FetchEnvironment::OpenAiResponses;
+    use hellas_work::model::work::PaidChannelPolicyV1;
+    let environment = test_responses_contract();
     let caller = ProducerSigningKey::from_secret_bytes([7; 32]).unwrap();
     let events = hellas_rpc::fetch::build_input_events_with_retention(
         "openai",
@@ -261,7 +272,7 @@ fn fetch_request(
         retention,
     )
     .unwrap();
-    let prepared = PreparedPaidFetchInputV1::new(&events, &environment.manifest())
+    let prepared = PreparedPaidFetchInputV1::new(&events, &environment)
         .unwrap()
         .into();
     let route = FetchRoutePolicy::sealed_route("openai", "responses").unwrap();
@@ -274,6 +285,7 @@ fn fetch_request(
             delivery_credit_limit: 40,
         },
         work_policy: WorkPolicy::Fetch {
+            contract: environment.clone(),
             policy: FetchPolicyV2 {
                 allowed_environment: environment.manifest_id(),
                 route_commitment: fetch_route_commitment(&route.canonical_body_bytes()).unwrap(),
@@ -301,6 +313,7 @@ fn fetch_preflight_requires_matching_trust_caller_and_ephemeral_retention() {
     use hellas_rpc::Retention;
     let (policy, prepared, caller) = fetch_request(Assurance::AppleAppAttest, Retention::Ephemeral);
     let mut trust = hellas_client::ProviderTrustAnchor {
+        allowed_environments: vec![policy.work_policy.allowed_environment()],
         expected_genesis: hellas_rpc::ContentId::from_bytes([8; 32]),
         required_assurance: Assurance::ProducerSigned,
         apple_app_attest: None,
@@ -336,11 +349,13 @@ fn fetch_preflight_requires_matching_trust_caller_and_ephemeral_retention() {
     );
 }
 
-fn payment_policy() -> hellas_rpc::protocol::work::JobPaymentPolicyV2 {
-    hellas_rpc::protocol::work::JobPaymentPolicyV2 {
+fn payment_policy() -> hellas_work::model::work::JobPaymentPolicyV2 {
+    hellas_work::model::work::JobPaymentPolicyV2 {
         fixed_price: 10,
         dispatch_margin_blocks: 4,
         delivery_margin_blocks: 2,
         oracle_grace_blocks: 6,
     }
 }
+
+use hellas_work::test_support::test_responses_contract;

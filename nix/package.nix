@@ -77,6 +77,9 @@ let
     inherit stdenv;
     auditable = false;
     RUST_MIN_STACK = "16777216";
+    # sqlx's query macros check against the committed `.sqlx` metadata, so a
+    # build never needs a live database.
+    SQLX_OFFLINE = "true";
     GIT_REV = builtins.substring 0 12 rev;
     SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
     NIX_SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";

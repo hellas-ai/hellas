@@ -4,6 +4,7 @@
 //! report durations and identifying fields; they do not drive protocol
 //! decisions. [`Samples`] retains individual observations for inspection.
 
+use hellas_auth::authority::UnixMillis;
 use web_time::Instant;
 
 /// Tracing target shared by all timing events.
@@ -146,11 +147,7 @@ impl tracing::Subscriber for Samples {
 /// also a legible complaint about the machine that produced it.
 #[must_use]
 pub fn unix_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |since| {
-            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
-        })
+    UnixMillis::now().unwrap_or_default().0
 }
 
 /// Keeps timing callsites conditionally enabled across thread-local collectors.

@@ -5,6 +5,7 @@ use crate::genesis::Genesis;
 use crate::{LightClient, LightClientRpc, LightClientRpcState, serve_light_client_transport};
 use commonware_codec::Encode;
 use commonware_cryptography::Signer;
+use hellas_auth::authority::UnixMillis;
 use hellas_wire::PeerIdentity;
 use hellas_wire::relay_auth::{
     NETWORK_HEADER, NONCE_BYTES, NONCE_HEADER, RelayAdmission, RelayAdmissionError,
@@ -115,12 +116,10 @@ pub async fn serve_light_client_relay<C>(
 where
     C: LightClient,
 {
-    let timestamp_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| RelayConnectError::Clock)?
-        .as_millis()
-        .try_into()
-        .map_err(|_| RelayConnectError::Clock)?;
+    let timestamp_ms = UnixMillis::now().map_err(|_| RelayConnectError::Clock)?.0;
+    if timestamp_ms == u64::MAX {
+        return Err(RelayConnectError::Clock);
+    }
     let nonce = rand::random();
     let request =
         authenticated_relay_request(relay_origin, genesis, private_key, timestamp_ms, nonce)?;

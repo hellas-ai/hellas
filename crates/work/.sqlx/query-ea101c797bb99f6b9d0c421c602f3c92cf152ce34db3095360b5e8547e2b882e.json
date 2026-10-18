@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO journal (key, kind, role, generation) VALUES (?, ?, ?, 0)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "ea101c797bb99f6b9d0c421c602f3c92cf152ce34db3095360b5e8547e2b882e"
+}

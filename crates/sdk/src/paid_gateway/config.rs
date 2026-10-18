@@ -1,7 +1,9 @@
 use super::{PaidWorkOptions, PoolError, Result};
+use crate::trust_policy::TrustPolicyStore;
 use crate::work_config::load_work_config;
 use hellas_kernel::{CoinId, EdgeId, Funding, List, MAX_PARTY_INPUTS};
-use hellas_rpc::{Assurance, ContentId};
+use hellas_rpc::Assurance;
+use hellas_work::model::grant::records::grant_transport;
 use iroh::EndpointId;
 use serde::Deserialize;
 use std::{
@@ -77,7 +79,7 @@ impl PaidGatewayOptions {
 }
 
 /// Load the operator JSON format used by both CLI and native hosts. File paths
-/// must be absolute; Apple counter state lives beside the channel journals.
+/// must be absolute; existing assertion counters stay beside each channel journal.
 pub fn load_pool_options(path: &Path, assurance: Assurance) -> Result<PaidGatewayOptions> {
     let bytes = hellas_private::read_bounded_regular_file(
         path,
@@ -91,6 +93,10 @@ pub fn load_pool_options(path: &Path, assurance: Assurance) -> Result<PaidGatewa
         path: path.into(),
         source,
     })?;
+    if !file.trust_store.is_absolute() {
+        return Err(PoolError::Invalid("trust_store must be absolute"));
+    }
+    let trust_store = TrustPolicyStore::new(file.trust_store);
     let providers = file
         .providers
         .into_iter()
@@ -106,17 +112,11 @@ pub fn load_pool_options(path: &Path, assurance: Assurance) -> Result<PaidGatewa
                 .iter()
                 .map(|value| fixed("payment_coins", value).map(CoinId::from_bytes))
                 .collect::<Result<Vec<_>>>()?;
-            let slots = std::array::from_fn(|i| {
-                coins
-                    .get(i)
-                    .copied()
-                    .unwrap_or(CoinId::from_bytes([0; CoinId::LENGTH]))
-            });
             let config = load_work_config(&p.work_config)?;
-            let provider_trust = trust(&p, assurance, &config)?;
+            let provider_trust = trust(&p, assurance, &config, &trust_store)?;
             let provider_addrs = if p.provider_addrs.is_empty() {
-                match &p.provider_genesis {
-                    EnrollmentSource::Offer(signed) => signed
+                match &p.offer {
+                    Some(signed) => signed
                         .offer()
                         .addresses
                         .iter()
@@ -125,7 +125,7 @@ pub fn load_pool_options(path: &Path, assurance: Assurance) -> Result<PaidGatewa
                                 .map_err(|_| PoolError::Invalid("paid offer address"))
                         })
                         .collect::<Result<_>>()?,
-                    EnrollmentSource::Pin(_) => vec![],
+                    None => vec![],
                 }
             } else {
                 p.provider_addrs
@@ -138,7 +138,8 @@ pub fn load_pool_options(path: &Path, assurance: Assurance) -> Result<PaidGatewa
                 provider_trust,
                 bond: EdgeId::from_bytes(fixed("bond", &p.bond)?),
                 payment_funding: Funding::new(
-                    List::take(slots, coins.len()),
+                    crate::work_config::coin_list(&coins)
+                        .ok_or(PoolError::Invalid("payment_coins must name 1 to 4 coins"))?,
                     List::empty(CoinId::from_bytes([0; CoinId::LENGTH])),
                 ),
                 omission_bond: p.omission_bond,
@@ -161,89 +162,46 @@ fn trust(
     p: &ProviderFile,
     assurance: Assurance,
     config: &crate::work_config::WorkConfig,
+    store: &TrustPolicyStore,
 ) -> Result<hellas_client::ProviderTrustAnchor> {
-    let expected_genesis = match &p.provider_genesis {
-        EnrollmentSource::Pin(pin) => *pin,
-        EnrollmentSource::Offer(signed) => {
-            signed
-                .check()
-                .map_err(|_| PoolError::Invalid("paid offer signature or bond is invalid"))?;
-            let offer = signed.offer();
-            if offer.proposal.network() != config.chain.network
-                || offer.proposal.bond_edge().to_bytes() != fixed::<32>("bond", &p.bond)?
-                || offer
-                    .provider
-                    .grant_transport()
-                    .map_err(|_| PoolError::Invalid("paid offer transport"))?
-                    != *p.provider.as_bytes()
-            {
-                return Err(PoolError::Invalid(
-                    "paid offer differs from the configured network, bond or provider",
-                ));
-            }
-            offer.provider.content_id()
-        }
-    };
-    let apple_app_attest = if p.apple_app_id.is_none()
-        && p.apple_cd_hashes.is_empty()
-        && assurance == Assurance::ProducerSigned
-    {
-        None
-    } else {
-        #[cfg(feature = "apple-verifier")]
-        {
-            let app_id = p
-                .apple_app_id
-                .clone()
-                .filter(|v| !v.is_empty())
-                .ok_or(PoolError::Invalid("Apple trust requires apple_app_id"))?;
-            if p.apple_cd_hashes.is_empty() {
-                return Err(PoolError::Invalid("Apple trust requires apple_cd_hashes"));
-            }
-            Some(hellas_client::AppleAppAttestTrust::new(
-                app_id,
-                p.apple_cd_hashes
-                    .iter()
-                    .map(|v| fixed("apple_cd_hashes", v))
-                    .collect::<Result<_>>()?,
-                std::sync::Arc::new(crate::FilesystemAssertionCounterStore::new(
-                    p.journal_root.join("apple-counters"),
-                )),
-            ))
-        }
-        #[cfg(not(feature = "apple-verifier"))]
+    let trust = store.resolve_environment(
+        &p.trust_policy,
+        assurance,
+        config.work_policy.allowed_environment(),
+        std::sync::Arc::new(crate::FilesystemAssertionCounterStore::new(
+            p.journal_root.join("apple-counters"),
+        )),
+    )?;
+    if let Some(signed) = &p.offer {
+        signed
+            .check()
+            .map_err(|_| PoolError::Invalid("paid offer signature or bond is invalid"))?;
+        let offer = signed.offer();
+        if offer.proposal.network() != config.chain.network
+            || offer.proposal.bond_edge().to_bytes() != fixed::<32>("bond", &p.bond)?
+            || grant_transport(&offer.provider)
+                .map_err(|_| PoolError::Invalid("paid offer transport"))?
+                != *p.provider.as_bytes()
         {
             return Err(PoolError::Invalid(
-                "Apple trust requires the SDK apple-verifier feature",
+                "paid offer differs from the configured network, bond or provider",
             ));
         }
-    };
-    let trust = hellas_client::ProviderTrustAnchor {
-        expected_genesis,
-        required_assurance: assurance,
-        apple_app_attest,
-    };
-    if let EnrollmentSource::Offer(signed) = &p.provider_genesis {
-        trust
-            .verify_enrollment(&signed.offer().provider)
-            .map_err(|_| {
-                PoolError::Invalid(
-                    "paid offer enrollment does not satisfy the provider trust policy",
-                )
-            })?;
+        trust.verify_enrollment(&offer.provider).map_err(|_| {
+            PoolError::Invalid("paid offer enrollment does not satisfy the provider trust policy")
+        })?;
     }
     Ok(trust)
 }
 
 fn fixed<const N: usize>(field: &'static str, value: &str) -> Result<[u8; N]> {
-    let mut bytes = [0; N];
-    hex::decode_to_slice(value, &mut bytes).map_err(|source| PoolError::Hex { field, source })?;
-    Ok(bytes)
+    hellas_auth::hex::parse(value).map_err(|source| PoolError::Hex { field, source })
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PoolFile {
+    trust_store: PathBuf,
     providers: Vec<ProviderFile>,
     #[serde(default = "acceptance_blocks")]
     acceptance_blocks: u64,
@@ -283,29 +241,19 @@ struct ProviderFile {
     bond: String,
     payment_coins: Vec<String>,
     omission_bond: u64,
-    provider_genesis: EnrollmentSource,
-    apple_app_id: Option<String>,
-    #[serde(default)]
-    apple_cd_hashes: Vec<String>,
-}
-
-/// The field is mandatory: either an independently obtained pin or the signed
-/// enrollment-bearing offer exported by provider provisioning.
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum EnrollmentSource {
-    Pin(ContentId),
-    Offer(Box<hellas_rpc::protocol::work_offer::SignedPaidOffer>),
+    trust_policy: String,
+    offer: Option<Box<hellas_work::model::offer::SignedPaidOffer>>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::{PaidFixture, enrollment, signer};
-    use hellas_rpc::protocol::work_offer::{PaidOffer, SignedPaidOffer};
+    use hellas_work::model::offer::{PaidOffer, SignedPaidOffer};
 
     #[test]
-    fn imported_offer_derives_the_pin_and_checks_network_bond_transport_and_assurance() {
+    fn imported_offer_requires_independent_approval_and_checks_network_bond_transport_and_assurance()
+     {
         let fixture = PaidFixture::new();
         let peer = iroh::SecretKey::from_bytes(&[4; 32]).public();
         let provider = enrollment(peer).0;
@@ -321,19 +269,36 @@ mod tests {
         let value = serde_json::json!({
             "work_config": "/config/work.json", "journal_root": "/state/client", "provider": peer,
             "bond": hex::encode(fixture.proposal.bond_edge().to_bytes()), "payment_coins": [hex::encode([1; 32])],
-            "omission_bond": 601, "provider_genesis": signed,
+            "omission_bond": 601, "offer": signed, "trust_policy": "provider",
         });
         let entry: ProviderFile = serde_json::from_value(value.clone()).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let store = TrustPolicyStore::new(directory.path());
+        assert!(trust(&entry, Assurance::ProducerSigned, &fixture.config, &store).is_err());
+        let mut policy = crate::trust_policy::TrustPolicy {
+            provider_genesis: hellas_rpc::ContentId::from_bytes([0; 32]),
+            assurance: Assurance::ProducerSigned,
+            environments: vec![fixture.config.work_policy.allowed_environment()],
+            apple: None,
+        };
+        store
+            .approve("provider", 0, policy.clone(), "independent pin".into())
+            .unwrap();
+        assert!(trust(&entry, Assurance::ProducerSigned, &fixture.config, &store).is_err());
+        policy.provider_genesis = provider.content_id();
+        store
+            .approve("provider", 1, policy, "reviewed provider pin".into())
+            .unwrap();
         assert_eq!(
-            trust(&entry, Assurance::ProducerSigned, &fixture.config)
+            trust(&entry, Assurance::ProducerSigned, &fixture.config, &store)
                 .unwrap()
                 .expected_genesis,
             provider.content_id()
         );
-        assert!(trust(&entry, Assurance::AppleAppAttest, &fixture.config).is_err());
+        assert!(trust(&entry, Assurance::AppleAppAttest, &fixture.config, &store).is_err());
         let mut other_network = fixture.config.clone();
         other_network.chain.network = hellas_kernel::NetworkId::new("other-network").unwrap();
-        assert!(trust(&entry, Assurance::ProducerSigned, &other_network).is_err());
+        assert!(trust(&entry, Assurance::ProducerSigned, &other_network, &store).is_err());
         for (field, replacement) in [
             ("bond", serde_json::json!(hex::encode([7; 32]))),
             (
@@ -345,12 +310,12 @@ mod tests {
             altered[field] = replacement;
             let entry = serde_json::from_value(altered).unwrap();
             assert!(
-                trust(&entry, Assurance::ProducerSigned, &fixture.config).is_err(),
+                trust(&entry, Assurance::ProducerSigned, &fixture.config, &store).is_err(),
                 "{field}"
             );
         }
         let mut no_pin = value;
-        no_pin.as_object_mut().unwrap().remove("provider_genesis");
+        no_pin.as_object_mut().unwrap().remove("trust_policy");
         assert!(serde_json::from_value::<ProviderFile>(no_pin).is_err());
     }
 }

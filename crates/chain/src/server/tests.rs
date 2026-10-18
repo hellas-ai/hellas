@@ -6,7 +6,7 @@ use hellas_kernel::{EdgeId, Encode as _};
 use hellas_rpc::pb::services::light_client::LightClientClientImpl;
 use hellas_wire::DefaultClock;
 use hellas_wire::mux::{MessagePipe, MuxConfig, MuxTransport, Role as MuxRole};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::{Notify, Semaphore, mpsc};
 
@@ -29,6 +29,7 @@ impl Default for ResponseBlocker {
 #[derive(Clone, Default)]
 struct MempoolClient {
     mempool: Mempool,
+    height: Arc<AtomicU64>,
     edge_result: Option<Result<Option<EdgeLookup>, QueryError>>,
     owner_edges_result: Option<Result<Option<OwnerEdges>, QueryError>>,
     response_blocker: Option<Arc<ResponseBlocker>>,
@@ -65,7 +66,13 @@ impl LightClientApi for MempoolClient {
     }
 
     async fn get_latest_block(&self) -> Result<Option<LatestBlock>, QueryError> {
-        Ok(None)
+        let height = self.height.load(Ordering::SeqCst);
+        Ok((height != 0).then(|| LatestBlock {
+            height,
+            payload: Digest::from([0; 32]),
+            state_root: Digest::from([0; 32]),
+            finalization: vec![],
+        }))
     }
 
     async fn get_finalized_block(
@@ -139,6 +146,10 @@ impl MessagePipe for Pipe {
 }
 
 fn transport_pair() -> (MuxTransport, MuxTransport) {
+    transport_pair_with_context(TransportContext::default())
+}
+
+fn transport_pair_with_context(context: TransportContext) -> (MuxTransport, MuxTransport) {
     let (to_server, server_inbox) = mpsc::unbounded_channel();
     let (to_client, client_inbox) = mpsc::unbounded_channel();
     let client = MuxTransport::spawn::<64, _, _>(
@@ -159,7 +170,7 @@ fn transport_pair() -> (MuxTransport, MuxTransport) {
             out: to_client,
             inbox: server_inbox,
         },
-        TransportContext::default(),
+        context,
     );
     (client, server)
 }
@@ -295,7 +306,7 @@ async fn bound_and_relay_transports_answer_from_one_node_state() {
     let (relay_transport, node_transport) = transport_pair();
     let relay_server = tokio::spawn(serve_light_client_transport(
         node_transport,
-        LightClientRpc::with_state(client, activity_tx, state),
+        LightClientRpc::with_state(client.clone(), activity_tx.clone(), state.clone()),
     ));
     let wire_a = LightClientClientImpl::new(bound_transport);
     let wire_b = LightClientClientImpl::new(relay_transport);
@@ -365,8 +376,25 @@ async fn bound_and_relay_transports_answer_from_one_node_state() {
         .expect("the shared anonymous budget returns an outcome");
     assert_eq!(ninth.outcome, ProtoSubmitTxOutcome::Full as i32);
 
+    let exhausted = wire_b
+        .submit_work_response(response_request.clone())
+        .await
+        .unwrap();
+    assert_eq!(exhausted.outcome, ProtoSubmitTxOutcome::Full as i32);
+    // A distinct vouched source still reaches validation. This traverses the
+    // generated response dispatcher, so dropping its context would fail here.
+    let (peer_transport, node_transport) = transport_pair_with_context(TransportContext {
+        peer: Some(PeerIdentity([42; 32])),
+        auth_level: hellas_wire::AuthLevel::Vouched,
+        ..TransportContext::default()
+    });
+    let peer_server = tokio::spawn(serve_light_client_transport(
+        node_transport,
+        LightClientRpc::with_state(client, activity_tx, state),
+    ));
+    let wire_peer = LightClientClientImpl::new(peer_transport);
     *forced_submit_outcome.lock().unwrap() = Some(SubmitTxOutcome::ValidationRejected);
-    let rejected = wire_b
+    let rejected = wire_peer
         .submit_work_response(response_request)
         .await
         .expect("validation rejection survives the response wire route");
@@ -378,6 +406,111 @@ async fn bound_and_relay_transports_answer_from_one_node_state() {
 
     bound_server.abort();
     relay_server.abort();
+    peer_server.abort();
+}
+
+#[tokio::test]
+async fn response_attempts_share_verified_sources_and_reset_only_at_a_new_height() {
+    let client = MempoolClient::default();
+    *client.forced_submit_outcome.lock().unwrap() = Some(SubmitTxOutcome::ValidationRejected);
+    let height = client.height.clone();
+    let (activity, _) = broadcast::channel(1);
+    let rpc = LightClientRpc::new(client, activity);
+    let other_connection = rpc.clone();
+    let request = synthetic_response_request();
+    let peer = |id: u16, authenticated: bool| {
+        let mut key = [0; 32];
+        key[..2].copy_from_slice(&id.to_be_bytes());
+        TransportContext {
+            peer: Some(PeerIdentity(key)),
+            auth_level: if authenticated {
+                hellas_wire::AuthLevel::Vouched
+            } else {
+                hellas_wire::AuthLevel::None
+            },
+            ..TransportContext::default()
+        }
+    };
+    // Claimed IDs cannot manufacture distinct sources, and rejected validation
+    // still consumes an attempt. Clones/connections share the same source state.
+    for index in 0..9 {
+        let response = LightClientHandler::submit_work_response(
+            if index % 2 == 0 {
+                &rpc
+            } else {
+                &other_connection
+            },
+            request.clone(),
+            peer(index, false),
+        )
+        .await
+        .unwrap();
+        let expected = if index < 8 {
+            ProtoSubmitTxOutcome::ValidationRejected
+        } else {
+            ProtoSubmitTxOutcome::Full
+        };
+        assert_eq!(response.outcome, expected as i32);
+    }
+    // Anonymous exhaustion does not charge a vouched identity. The full bounded
+    // source table refuses newcomers without evicting a source's prior usage.
+    for id in 0..255 {
+        let response =
+            LightClientHandler::submit_work_response(&rpc, request.clone(), peer(id, true))
+                .await
+                .unwrap();
+        assert_eq!(
+            response.outcome,
+            ProtoSubmitTxOutcome::ValidationRejected as i32
+        );
+    }
+    let refused = LightClientHandler::submit_work_response(&rpc, request.clone(), peer(255, true))
+        .await
+        .unwrap();
+    assert_eq!(refused.outcome, ProtoSubmitTxOutcome::Full as i32);
+    for index in 1..9 {
+        let response = LightClientHandler::submit_work_response(
+            &other_connection,
+            request.clone(),
+            peer(0, true),
+        )
+        .await
+        .unwrap();
+        let expected = if index < 8 {
+            ProtoSubmitTxOutcome::ValidationRejected
+        } else {
+            ProtoSubmitTxOutcome::Full
+        };
+        assert_eq!(response.outcome, expected as i32);
+    }
+    height.store(1, Ordering::SeqCst);
+    for _ in 0..8 {
+        let response =
+            LightClientHandler::submit_work_response(&rpc, request.clone(), peer(255, true))
+                .await
+                .unwrap();
+        assert_eq!(
+            response.outcome,
+            ProtoSubmitTxOutcome::ValidationRejected as i32
+        );
+    }
+    height.store(0, Ordering::SeqCst);
+    let refused = LightClientHandler::submit_work_response(
+        &other_connection,
+        request.clone(),
+        peer(255, true),
+    )
+    .await
+    .unwrap();
+    assert_eq!(refused.outcome, ProtoSubmitTxOutcome::Full as i32);
+    height.store(2, Ordering::SeqCst);
+    let response = LightClientHandler::submit_work_response(&rpc, request, peer(255, true))
+        .await
+        .unwrap();
+    assert_eq!(
+        response.outcome,
+        ProtoSubmitTxOutcome::ValidationRejected as i32
+    );
 }
 
 #[cfg(feature = "client")]

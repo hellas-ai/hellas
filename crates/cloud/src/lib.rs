@@ -15,5 +15,4 @@ pub mod provider;
 pub mod wire;
 
 #[cfg(test)]
-#[path = "../tests/common/mod.rs"]
-mod test_support;
+use hellas_work::test_support::common_node as test_node;

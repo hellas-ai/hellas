@@ -1,8 +1,8 @@
 //! Structured grant refusals. Diagnostics never select client recovery policy.
-use super::{GrantStoreError, ledger::LedgerError};
+use super::{NodeStoreError, ledger::LedgerError};
+use crate::model::grant::{records::GrantError, resource::TemplateError};
 use crate::work_store::ChannelStateError;
 use hellas_rpc::pb::work::{GrantRefusal, GrantRefusalCode, WorkRefusalCode, WorkRefused};
-use hellas_rpc::protocol::work_grant::{records::GrantError, resource::TemplateError};
 
 pub fn refused(code: GrantRefusalCode) -> WorkRefused {
     let outer = match code {
@@ -32,21 +32,43 @@ pub fn refused(code: GrantRefusalCode) -> WorkRefused {
         }),
     }
 }
-impl From<&GrantStoreError> for WorkRefused {
-    fn from(error: &GrantStoreError) -> Self {
+impl From<NodeStoreError> for WorkRefused {
+    fn from(error: NodeStoreError) -> Self {
+        Self::from(&error)
+    }
+}
+
+impl From<&NodeStoreError> for WorkRefused {
+    fn from(error: &NodeStoreError) -> Self {
         use GrantRefusalCode as C;
         let code = match error {
-            GrantStoreError::Journal(_)
-            | GrantStoreError::WriterPoisoned
-            | GrantStoreError::Completion(_)
-            | GrantStoreError::Task(_) => C::StorageUnavailable,
-            GrantStoreError::Grant(error) => match error {
+            NodeStoreError::Io(_)
+            | NodeStoreError::Uninitialized
+            | NodeStoreError::Journal(_)
+            | NodeStoreError::ClockJump
+            | NodeStoreError::WriterPoisoned
+            | NodeStoreError::Completion(_)
+            | NodeStoreError::Task(_) => C::StorageUnavailable,
+            NodeStoreError::Authority(error) => match error {
+                hellas_auth::authority::AuthorityError::Denied
+                | hellas_auth::authority::AuthorityError::Credential
+                | hellas_auth::authority::AuthorityError::Audience
+                | hellas_auth::authority::AuthorityError::Missing => C::Unauthorized,
+                hellas_auth::authority::AuthorityError::Revoked => C::Revoked,
+                hellas_auth::authority::AuthorityError::Expired => C::Expired,
+                hellas_auth::authority::AuthorityError::Revision => C::StaleRevision,
+                hellas_auth::authority::AuthorityError::Capacity => C::StateCapacity,
+                _ => C::Malformed,
+            },
+            NodeStoreError::AlreadyInitialized
+            | NodeStoreError::MissingProvider
+            | NodeStoreError::MissingMachine => C::Malformed,
+            NodeStoreError::Grant(error) => match error {
                 GrantError::Unauthorized | GrantError::Signature | GrantError::Audience => {
                     C::Unauthorized
                 }
                 GrantError::Expired => C::Expired,
                 GrantError::Paused => C::Paused,
-                GrantError::Revoked => C::Revoked,
                 GrantError::Revision(_) => C::StaleRevision,
                 GrantError::OutOfScope | GrantError::AccountBacked => C::OutOfScope,
                 GrantError::StateCapacity => C::StateCapacity,
@@ -57,12 +79,15 @@ impl From<&GrantStoreError> for WorkRefused {
                 | GrantError::UnsupportedRoot
                 | GrantError::Limits => C::Malformed,
             },
-            GrantStoreError::Ledger(error) => match error {
+            NodeStoreError::Ledger(error) => match error {
                 LedgerError::OverBudget { .. } => C::Budget,
                 LedgerError::Concurrent(_) => C::Concurrency,
+                LedgerError::Revision => C::StaleRevision,
+                LedgerError::Capacity => C::StateCapacity,
                 _ => C::Malformed,
             },
-            GrantStoreError::Resource(error) => match error {
+            NodeStoreError::Resource(error) => match error {
+                TemplateError::Model | TemplateError::Settings => C::OutOfScope,
                 TemplateError::Origin => C::Origin,
                 TemplateError::PathMethod => C::PathMethod,
                 TemplateError::Tls => C::Tls,
@@ -73,22 +98,24 @@ impl From<&GrantStoreError> for WorkRefused {
                 TemplateError::ResponseCap => C::ResponseCap,
                 TemplateError::Malformed => C::Malformed,
             },
-            GrantStoreError::Channel(
+            NodeStoreError::Channel(
                 ChannelStateError::AcceptanceLate { .. } | ChannelStateError::DispatchLate { .. },
             ) => C::Expired,
-            GrantStoreError::Channel(ChannelStateError::Indeterminate) => C::Indeterminate,
-            GrantStoreError::Channel(_)
-            | GrantStoreError::Input(_)
-            | GrantStoreError::Malformed => C::Malformed,
+            NodeStoreError::Channel(ChannelStateError::Indeterminate) => C::Indeterminate,
+            NodeStoreError::Channel(_) | NodeStoreError::Input(_) | NodeStoreError::Malformed => {
+                C::Malformed
+            }
         };
-        let mut refusal = refused(code);
-        if let GrantStoreError::Grant(GrantError::Revision(revision)) = error {
-            refusal
-                .grant
-                .as_mut()
-                .expect("grant refusal")
-                .current_revision = revision.0;
+        WorkRefused {
+            grant: Some(GrantRefusal {
+                code: code as i32,
+                current_revision: match error {
+                    NodeStoreError::Grant(GrantError::Revision(revision)) => revision.0,
+                    _ => 0,
+                },
+                terminal: None,
+            }),
+            ..refused(code)
         }
-        refusal
     }
 }

@@ -15,16 +15,6 @@ impl MetricsBundle {
     }
 }
 
-/// Where `/metrics` is served, given the operator's `--metrics-port`.
-///
-/// `None` in, `None` out: metrics is off unless a port is named, and
-/// `--metrics-port` has no default. When it is named the address is
-/// loopback — [`Ipv4Addr::LOCALHOST`] is a parsed value, not a spelling,
-/// and there is no host to configure, so there is nothing to resolve.
-pub(crate) fn metrics_binding(metrics_port: Option<u16>) -> Option<SocketAddr> {
-    metrics_port.map(|port| SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
-}
-
 /// The metrics endpoint, behind the same credential as the routes that
 /// reach the executor — the very same [`BearerLayer`] value, cloned, not
 /// a second check that has to be kept in step with the first.
@@ -47,10 +37,13 @@ fn metrics_router(bundle: Arc<MetricsBundle>, auth: BearerLayer) -> axum::Router
         .layer(auth)
 }
 
-pub(crate) fn spawn_metrics_server(port: u16, bundle: MetricsBundle, auth: BearerLayer) {
-    let Some(addr) = metrics_binding(Some(port)) else {
-        return;
-    };
+pub(crate) fn spawn_metrics_server(
+    port: u16,
+    bundle: MetricsBundle,
+    auth: BearerLayer,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
     let bundle = Arc::new(bundle);
 
     tokio::spawn(async move {
@@ -66,10 +59,15 @@ pub(crate) fn spawn_metrics_server(port: u16, bundle: MetricsBundle, auth: Beare
 
         info!("prometheus metrics server listening on http://{addr}/metrics");
 
-        if let Err(err) = axum::serve(listener, app).await {
+        if let Err(err) = axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = shutdown.wait_for(|stopped| *stopped).await;
+            })
+            .await
+        {
             eprintln!("warning: metrics server failed: {err}");
         }
-    });
+    })
 }
 
 fn encode_metrics(bundle: &MetricsBundle) -> Result<String, std::fmt::Error> {
@@ -81,21 +79,34 @@ fn encode_metrics(bundle: &MetricsBundle) -> Result<String, std::fmt::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::access::Bearer;
     use axum::body::Body;
     use axum::http::{Request, StatusCode, header};
     use tower::ServiceExt;
 
-    #[test]
-    fn metrics_is_off_unless_a_port_is_named() {
-        assert!(metrics_binding(None).is_none());
-    }
-
-    #[test]
-    fn enabled_metrics_binds_loopback() {
-        let addr = metrics_binding(Some(9090)).expect("a named port is served");
-        assert!(addr.ip().is_loopback());
-        assert_eq!(addr.port(), 9090);
+    #[tokio::test]
+    async fn metrics_shutdown_releases_the_gateway_authority_writer() {
+        let fixture = crate::access::tests::Fixture::new().await;
+        let (shutdown, stopped) = tokio::sync::watch::channel(false);
+        let task = spawn_metrics_server(
+            0,
+            MetricsBundle::new(Arc::new(Registry::default())),
+            BearerLayer::new(fixture.access.clone()),
+            stopped,
+        );
+        shutdown.send_replace(true);
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(fixture.access);
+        hellas_work::work_store::grant::NodeStore::open(
+            fixture.root.path(),
+            hellas_work::model::grant::grant_network(),
+            None,
+            hellas_auth::authority::UnixMillis(1001),
+        )
+        .await
+        .unwrap();
     }
 
     /// The metrics endpoint refuses everything the executor-reaching
@@ -103,8 +114,9 @@ mod tests {
     /// router — not a second implementation.
     #[tokio::test]
     async fn enabled_metrics_requires_the_same_credential() {
-        let bearer = Arc::new(Bearer::generate());
-        let credential = bearer.child_credential();
+        let fixture = crate::access::tests::Fixture::new().await;
+        let bearer = fixture.access;
+        let credential = bearer.bearer();
         let registry = Arc::new(Registry::default());
         let router = metrics_router(
             Arc::new(MetricsBundle::new(registry)),

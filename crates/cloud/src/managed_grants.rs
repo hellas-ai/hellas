@@ -1,6 +1,7 @@
-//! Bootstrap authority and anchor the private journal to the persistent identity.
-use hellas_rpc::protocol::work_grant::{grant_network, records::Principal};
-use hellas_work::work_store::{grant::GrantStore, journal::journal_name_parts};
+//! Anchor an explicitly initialized private journal to the persistent identity.
+use hellas_rpc::ProviderEnrollmentBundle;
+use hellas_work::model::grant::grant_network;
+use hellas_work::work_store::{grant::NodeStore, journal::Journal};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -11,11 +12,9 @@ pub enum ManagedGrantError {
     #[error(transparent)]
     Config(#[from] crate::config::ConfigError),
     #[error(transparent)]
-    Store(#[from] hellas_work::work_store::grant::GrantStoreError),
+    Store(#[from] hellas_work::work_store::grant::NodeStoreError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
-    #[error(transparent)]
-    Wire(#[from] hellas_wire::WireStatus),
     #[error("grant journal binding changed; refusing startup")]
     BindingChanged,
     #[error("owner enrollment changed; refusing startup")]
@@ -32,8 +31,6 @@ pub enum ManagedGrantError {
     SocketBusy,
     #[error("socket parent missing")]
     SocketParent,
-    #[error("provider status missing")]
-    ProviderMissing,
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Eq)]
@@ -43,16 +40,16 @@ struct Anchor {
     journal: PathBuf,
 }
 
-pub(crate) fn prepare(
+pub(crate) async fn prepare(
     data: &Path,
     private: &Path,
-    provider: Principal,
-    owner: Option<&Principal>,
-) -> Result<(Option<PathBuf>, PathBuf)> {
+    provider: ProviderEnrollmentBundle,
+    owner: Option<&ProviderEnrollmentBundle>,
+) -> Result<PathBuf> {
     // A separate private container filesystem may disappear while the mounted
     // identity survives. Never interpret that loss as a fresh allowance.
     let anchor = Anchor {
-        provider: provider.id().0.to_string(),
+        provider: provider.content_id().to_string(),
         journal: private.join("grants"),
     };
     let anchor_path = data.join("grant-journal.json");
@@ -61,67 +58,53 @@ pub(crate) fn prepare(
         if saved != anchor {
             return Err(ManagedGrantError::BindingChanged);
         }
-        let entries = std::fs::read_dir(&anchor.journal).map_err(|source| {
-            if source.kind() == std::io::ErrorKind::NotFound {
-                ManagedGrantError::MissingJournal
-            } else {
-                ManagedGrantError::Io(source)
-            }
-        })?;
-        let mut found = false;
-        for entry in entries {
-            let entry = entry?;
-            found |= entry
-                .file_name()
-                .to_str()
-                .and_then(journal_name_parts)
-                .is_some_and(|(stem, _)| stem == "grants");
-        }
-        if !found {
+        let stems = Journal::stems(&anchor.journal)
+            .map_err(hellas_work::work_store::grant::NodeStoreError::from)?;
+        if !stems.iter().any(|stem| stem == "grants") {
             return Err(ManagedGrantError::MissingJournal);
         }
     }
     let owner_binding = data.join("owner-enrollment.json");
     if owner_binding.exists() {
-        let saved: Option<Principal> = crate::config::read_json(&owner_binding)?;
-        if saved.as_ref() != owner {
+        let saved: Option<Vec<u8>> = crate::config::read_json(&owner_binding)?;
+        if saved != owner.map(|bundle| bundle.canonical_bytes()) {
             return Err(ManagedGrantError::OwnerChanged);
         }
     } else {
-        crate::config::save_private(&owner_binding, &owner, true)?;
+        crate::config::save_private(
+            &owner_binding,
+            &owner.map(|bundle| bundle.canonical_bytes()),
+            true,
+        )?;
     }
-    // Establish a durable journal before the anchor or the worker exists. Open
-    // also validates/replays it and conservatively settles interrupted jobs.
-    drop(GrantStore::open(
-        &anchor.journal,
-        grant_network(),
-        provider.bundle().clone(),
-        hellas_work::grant_service::wall_clock(),
-    )?);
+    // Validate/replay initialized authority before starting the worker, and
+    // conservatively settle interrupted jobs. Open never bootstraps authority.
+    drop(
+        NodeStore::open(
+            &anchor.journal,
+            grant_network(),
+            Some(provider.clone()),
+            hellas_auth::authority::UnixMillis::now().unwrap_or_default(),
+        )
+        .await?,
+    );
     if !anchor_path.exists() {
         crate::config::save_private(&anchor_path, &anchor, true)?;
     }
-    let owner_path = owner
-        .map(|p| {
-            let path = private.join("owner.enrollment");
-            hellas_private::write_atomically(&path, ".enrollment", &p.bundle().canonical_bytes())?;
-            Ok::<_, ManagedGrantError>(path)
-        })
-        .transpose()?;
-    let grant_config = private.join("bootstrap-grants.json");
+    let grant_config = private.join("default-resources.json");
     crate::config::save_private(
         &grant_config,
         &serde_json::json!({
             "journal_root": anchor.journal,
             "control_socket": private.join("control.sock"),
-            "machine_limits": null,
-            "max_in_flight": 256,
+            "control_certificate": private.join("control.cert.der"),
+            "control_private_key": private.join("control.key.der"),
             "max_job_millis": 1_800_000,
             "resources": [],
         }),
         false,
     )?;
-    Ok((owner_path, grant_config))
+    Ok(grant_config)
 }
 
 /// The agent holds the machine lease and has reaped its previous worker. A
@@ -153,19 +136,25 @@ pub(crate) fn reclaim_socket(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// An actual HostControl response confirms resource validation and journal open
-/// completed. This socket is owner-only and never exposed by the cloud protocol.
-pub(crate) async fn ready(socket: &Path) -> Result<()> {
-    let transport = hellas_wire::local::connect(socket).await?;
-    let status = hellas_rpc::services::host_control::HostControlClientImpl::new(transport)
-        .get_host_status(hellas_rpc::pb::host::GetHostStatusRequest {})
+/// Readiness uses the same explicit application profile and checked CLI path as
+/// other callers. Socket ownership alone cannot read private node status.
+pub(crate) async fn ready(cli: &Path, identity: &Path, directory: &Path) -> Result<()> {
+    let status = tokio::process::Command::new(cli)
+        .arg("--identity")
+        .arg(identity)
+        .arg("admin")
+        .arg("--profile")
+        .arg(directory.join("control-profile.json"))
+        .arg("--control-socket")
+        .arg(directory.join("control.sock"))
+        .arg("status")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .status()
         .await?;
-    if status
-        .provider
-        .ok_or(ManagedGrantError::ProviderMissing)?
-        .state
-        != hellas_rpc::pb::host::RuntimeState::Running as i32
-    {
+    if !status.success() {
         return Err(ManagedGrantError::NotReady);
     }
     Ok(())
@@ -174,8 +163,11 @@ pub(crate) async fn ready(socket: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn principal() -> Principal {
-        Principal::verify(crate::test_support::bundle(&iroh::SecretKey::generate())).unwrap()
+    fn principal() -> ProviderEnrollmentBundle {
+        hellas_work::test_support::software_enrollment(
+            7,
+            *iroh::SecretKey::generate().public().as_bytes(),
+        )
     }
     #[test]
     fn socket_recovery_preserves_live_listeners_and_unrelated_files() {
@@ -200,8 +192,8 @@ mod tests {
         assert!(reclaim_socket(&socket).is_err());
         assert_eq!(std::fs::read(&socket).unwrap(), b"keep");
     }
-    #[test]
-    fn restart_pins_authority_and_missing_or_moved_journal_is_refused() {
+    #[tokio::test]
+    async fn restart_pins_authority_and_missing_or_moved_journal_is_refused() {
         let root = tempfile::tempdir().unwrap();
         let data = root.path().join("data");
         let private = root.path().join("private");
@@ -209,16 +201,54 @@ mod tests {
         crate::management::private_directory(&private).unwrap();
         let provider = principal();
         let owner = principal();
-        prepare(&data, &private, provider.clone(), Some(&owner)).unwrap();
-        prepare(&data, &private, provider.clone(), Some(&owner)).unwrap();
-        assert!(prepare(&data, &private, provider.clone(), Some(&principal())).is_err());
-        assert!(prepare(&data, &private, provider.clone(), None).is_err());
-        assert!(prepare(&data, &private, principal(), Some(&owner)).is_err());
+        assert!(matches!(
+            prepare(&data, &private, provider.clone(), Some(&owner)).await,
+            Err(ManagedGrantError::Store(
+                hellas_work::work_store::grant::NodeStoreError::Uninitialized
+            ))
+        ));
+        drop(
+            crate::test_node::bootstrap_node(
+                &private.join("grants"),
+                grant_network(),
+                Some(provider.clone()),
+                hellas_auth::authority::UnixMillis::now().unwrap_or_default(),
+            )
+            .await
+            .unwrap(),
+        );
+        prepare(&data, &private, provider.clone(), Some(&owner))
+            .await
+            .unwrap();
+        prepare(&data, &private, provider.clone(), Some(&owner))
+            .await
+            .unwrap();
+        assert!(
+            prepare(&data, &private, provider.clone(), Some(&principal()))
+                .await
+                .is_err()
+        );
+        assert!(
+            prepare(&data, &private, provider.clone(), None)
+                .await
+                .is_err()
+        );
+        assert!(
+            prepare(&data, &private, principal(), Some(&owner))
+                .await
+                .is_err()
+        );
         let moved = root.path().join("moved");
         std::fs::rename(&private, &moved).unwrap();
-        assert!(prepare(&data, &moved, provider.clone(), Some(&owner)).is_err());
+        assert!(
+            prepare(&data, &moved, provider.clone(), Some(&owner))
+                .await
+                .is_err()
+        );
         crate::management::private_directory(&private).unwrap();
-        let error = prepare(&data, &private, provider, Some(&owner)).unwrap_err();
+        let error = prepare(&data, &private, provider, Some(&owner))
+            .await
+            .unwrap_err();
         assert!(error.to_string().contains("grant journal missing"));
         assert!(!private.join("grants").exists());
     }

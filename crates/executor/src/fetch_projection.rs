@@ -70,13 +70,14 @@ pub trait FetchAdaptorFactory: Send + Sync + 'static {
 
 /// Request construction or response projection failed inside the selected
 /// trusted adaptor. Routing happens before the adaptor is created, so there is
-/// no "not my route" rejection variant.
+/// no "not my route" rejection variant. Diagnostics may reach operator logs, so
+/// they must be static reasons, never request/upstream bytes or decoder excerpts.
 #[derive(Debug, Error)]
 #[error("fetch adaptor failed: {0}")]
-pub struct FetchAdaptorError(String);
+pub struct FetchAdaptorError(&'static str);
 
 impl FetchAdaptorError {
-    pub fn failed(message: impl Into<String>) -> Self {
-        Self(message.into())
+    pub fn failed(message: &'static str) -> Self {
+        Self(message)
     }
 }

@@ -1,12 +1,13 @@
 use super::*;
 
+use hellas_auth::{Digest, ProducerSigningKey};
 use hellas_rpc::evaluate::{
     EvaluateOutputTranscriptBuilder, EvaluateStopReason, EvaluateTerminal, EvaluateUsage,
     input_commitment,
 };
 use hellas_rpc::execution_event::{WorkChunk, WorkEvent, WorkFailed, WorkFinished, work_event};
 use hellas_rpc::stream::output_event_to_pb;
-use hellas_rpc::{Assurance, ContentId, Digest, EvaluateRequest, ProducerSigningKey, Retention};
+use hellas_rpc::{Assurance, ContentId, EvaluateRequest, Retention};
 use tokio::sync::mpsc;
 
 use crate::executor::ExecuteOutcome;

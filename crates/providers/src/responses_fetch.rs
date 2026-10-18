@@ -2,7 +2,7 @@ use futures::StreamExt;
 use hellas_adaptors::MAX_SSE_RESPONSE_BYTES;
 use hellas_executor::{FetchProviderError, FetchProviderResponse, FetchProviderResponseHead};
 use reqwest::Url;
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap};
 use std::time::Duration;
 use tracing::Instrument;
 
@@ -16,15 +16,24 @@ pub(crate) mod telemetry;
 /// as activity and reset it. Unsuccessful response bodies are never read or logged.
 const FETCH_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
-/// HTTP client for attested Fetch egress. Redirects are disabled because the
-/// exact HTTPS destination is part of the quoted Fetch environment.
-pub fn responses_http_client() -> reqwest::Client {
+/// HTTP client for the compiled Responses egress contract. Its roots are bundled;
+/// operator proxy, CA and key-log configuration cannot change the private route.
+pub fn responses_http_client(headers: HeaderMap) -> Result<reqwest::Client, FetchProviderError> {
+    let tls = crate::http::tls::config(&hellas_rpc::http_fetch::HttpTls {
+        roots: hellas_rpc::http_fetch::HttpTrustRoots::WebPki,
+        spki_sha256: Vec::new(),
+    })
+    .map_err(FetchProviderError::failed)?;
     reqwest::Client::builder()
+        .default_headers(headers)
+        .no_proxy()
+        .retry(reqwest::retry::never())
+        .tls_backend_preconfigured(tls)
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(20 * 60))
         .redirect(reqwest::redirect::Policy::none())
         .build()
-        .expect("Fetch HTTP client configuration is valid")
+        .map_err(|_| FetchProviderError::failed("Responses HTTP client initialization failed"))
 }
 
 pub async fn execute_responses_request(

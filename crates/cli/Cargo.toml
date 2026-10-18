@@ -7,78 +7,31 @@ license.workspace = true
 repository.workspace = true
 documentation.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+hellas-cloud.workspace = true
+libc = "0.2"
+
 [features]
 default = []
 
-# Remote machine management; credentials stay with the operator identity.
-cloud = ["dep:hellas-cloud"]
-
-# Enables Apple App Attest verification for clients. Native enrollment and
-# proof production belong to the signed host application (Gate), not the CLI.
-apple-app-attest = []
-
-# The node serves paid work, and paid work is a chain: the work config's
-# threshold identity is decoded by consensus's own constructor, and the
-# settlement watcher reads finalized blocks. So `node` reaches
-# `hellas-chain` through the feature graph rather than through a second
-# dependency. `work-watcher` is the adapter that pairs a light client
-# with the block source, the sink and the finalized read a paid endpoint
-# is driven from; without it the runner has a chain and no way to ask it
-# anything.
-node = [
-    "dep:hellas-sdk",
-    "hellas-sdk/paid-client",
-    "hellas-sdk/grant-client",
-    "hellas-sdk/grant-admin",
-    "hellas-sdk/paid-provider",
-    "hellas-sdk/grant-provider",
-    "chain",
-    "dep:async-stream",
-    "dep:axum",
-    "dep:hellas-executor",
-    "dep:prometheus-client",
-    "dep:qrcode",
-    "hellas-chain/work-watcher",
-    "hellas-client/work",
-    "dep:hellas-work",
-]
-# Token-native remote execution and its local text-presentation boundary.
-# This deliberately does not pull Catena into a client that only dials a node.
-llm = ["hellas-client/evaluate", "dep:hellas-presentation"]
-# HTTP gateway front-end (OpenAI/Anthropic/plain APIs).
-gateway = [
-    "llm",
-    "dep:hellas-gateway",
-    "hellas-sdk/grant-gateway",
-    "hellas-sdk?/paid-gateway",
-]
+# Local model execution additionally compiles Catena and the native evaluator.
 evaluate = [
-    "node",
-    "gateway",
     "dep:catena-lang",
     "dep:commonware-runtime",
     "hellas-gateway/evaluate",
     "hellas-executor/evaluate",
-    "dep:hellas-presentation",
 ]
-chain = [
-    "dep:hellas-chain",
-    "dep:hellas-kernel",
-    "hellas-chain/client",
-    "hellas-kernel/secp256k1",
-    "hellas-kernel/webauthn",
-]
-indexer = ["chain", "hellas-chain/indexer-api"]
+indexer = ["hellas-chain/indexer-api"]
 validator = ["indexer", "hellas-chain/validator"]
 
 # Hellas OTLP export and iroh metrics exposure are opt-in. Dependencies can
 # still compile telemetry: Commonware has its own SDK, and mDNS enables iroh
 # default features (including metrics collection).
 otel = [
-    "hellas-chain?/otel",
+    "hellas-chain/otel",
     "hellas-rpc/otel",
-    "hellas-executor?/otel",
-    "hellas-gateway?/otel",
+    "hellas-executor/otel",
+    "hellas-gateway/otel",
     "hellas-providers/otel",
     "dep:opentelemetry",
     "dep:opentelemetry_sdk",
@@ -88,13 +41,10 @@ otel = [
     "iroh/metrics",
 ]
 
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
-
 [dependencies]
 anyhow = { workspace = true }
-async-stream = { workspace = true, optional = true }
-axum = { workspace = true, optional = true }
+async-stream = { workspace = true }
+axum = { workspace = true }
 base64.workspace = true
 catena-lang = { workspace = true, optional = true }
 clap = { version = "4", features = ["derive"] }
@@ -102,13 +52,19 @@ commonware-runtime = { workspace = true, optional = true }
 futures = { workspace = true }
 hellas-adaptors.workspace = true
 hellas-attestation = { workspace = true, features = ["apple-app-attest"] }
-hellas-chain = { workspace = true, default-features = false, optional = true }
-hellas-client = { workspace = true, features = ["iroh"] }
-hellas-cloud = { workspace = true, optional = true }
-hellas-executor = { workspace = true, default-features = false, optional = true }
-hellas-gateway = { workspace = true, optional = true }
-hellas-kernel = { workspace = true, default-features = false, optional = true }
-hellas-presentation = { workspace = true, optional = true }
+hellas-auth.workspace = true
+hellas-chain = { workspace = true, default-features = false, features = [
+    "client",
+    "work-watcher",
+] }
+hellas-client = { workspace = true, features = ["iroh", "work", "evaluate"] }
+hellas-executor = { workspace = true, default-features = false }
+hellas-gateway.workspace = true
+hellas-kernel = { workspace = true, default-features = false, features = [
+    "secp256k1",
+    "webauthn",
+] }
+hellas-presentation = { workspace = true }
 hellas-private.workspace = true
 hellas-providers.workspace = true
 hellas-rpc = { workspace = true, default-features = false, features = [
@@ -116,7 +72,7 @@ hellas-rpc = { workspace = true, default-features = false, features = [
     "work",
     "host-control",
 ] }
-hellas-sdk = { workspace = true, default-features = false, optional = true }
+hellas-sdk = { workspace = true, default-features = false }
 hellas-store = { workspace = true }
 hellas-wire = { workspace = true, features = [
     "unix",
@@ -124,19 +80,18 @@ hellas-wire = { workspace = true, features = [
     "discovery-dht",
     "discovery-mdns",
 ] }
-hellas-work = { workspace = true, optional = true }
+hellas-work = { workspace = true }
 hellas-xet = { workspace = true }
 hex.workspace = true
 iroh = { workspace = true, features = ["tls-ring"] }
-iroh-mdns-address-lookup = { workspace = true }
 iroh-metrics = { version = "1", default-features = false, features = [
     "metrics",
 ], optional = true }
 opentelemetry = { workspace = true, optional = true }
 opentelemetry-otlp = { workspace = true, optional = true }
 opentelemetry_sdk = { workspace = true, optional = true }
-prometheus-client = { workspace = true, optional = true }
-qrcode = { version = "0.14", default-features = false, optional = true }
+prometheus-client = { workspace = true }
+qrcode = { version = "0.14", default-features = false }
 rand.workspace = true
 reqwest.workspace = true
 serde.workspace = true
@@ -153,6 +108,8 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 ciborium.workspace = true
 hellas-chain = { workspace = true, features = ["client"] }
+hellas-providers = { workspace = true, features = ["test-support"] }
+hellas-work = { workspace = true, features = ["test-support"] }
 p256.workspace = true
 rcgen = "0.14"
 reqwest = { workspace = true, features = ["json"] }

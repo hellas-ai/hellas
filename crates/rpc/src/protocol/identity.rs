@@ -46,7 +46,8 @@
 //! shared word "genesis" in the type names below is a statement about
 //! their shape, not a connection between them.
 
-use crate::{ContentId, DagCborEncoder, PublicKey, Signature, SignatureKind};
+use crate::{ContentId, DagCborEncoder};
+use hellas_auth::{PublicKey, Signature, SignatureKind};
 
 /// The kind of hardware root vouching for a provider installation.
 ///
@@ -529,7 +530,7 @@ impl<'a> Decoder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Digest, ProducerSigningKey};
+    use hellas_auth::{Digest, ProducerSigningKey};
 
     fn genesis() -> SignedProviderGenesis {
         let root = ProducerSigningKey::from_secret_bytes([1; 32]).unwrap();

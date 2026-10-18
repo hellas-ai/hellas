@@ -3,15 +3,17 @@
 
 mod codex_responses;
 mod http;
-mod openai;
 mod responses_fetch;
-mod responses_projector;
-mod stream;
+pub mod stream;
 pub use http::{
     CredentialRefresh, HttpCredential, HttpCredentialConfig, HttpEgressPolicy,
     HttpFetchAdaptorFactory, HttpFetchProvider, HttpProviderConfig, HttpSecret,
 };
 
-pub use openai::{EmptyOpenAiKey, OpenAiConfigError, OpenAiResponsesFetchProvider};
+pub use codex_responses::{
+    CODEX_RESPONSES_ENDPOINT, CodexResponsesAdaptorFactory, codex_responses_contract,
+};
 pub use responses_fetch::{execute_responses_request, responses_http_client};
-pub use responses_projector::ResponsesFetchAdaptorFactory;
+
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;

@@ -4,12 +4,14 @@ use super::{ExecutorCompletion, ExecutorHandle, ExecutorOwedRequest, ProviderCon
 #[cfg(feature = "evaluate")]
 use crate::evaluate::{EvaluateEngine, EvaluateEngineConfig};
 use crate::{ExecutorError, ExecutorMetrics, FetchRouteRegistry};
-use hellas_rpc::{Assurance, ProducerSigningKey};
+use hellas_auth::ProducerSigningKey;
+use hellas_rpc::Assurance;
 use std::{collections::VecDeque, sync::Arc};
 use tokio::sync::mpsc;
 
 pub(super) const EXECUTOR_OWED_MAILBOX_CAPACITY: usize = 64;
 
+#[derive(Clone)]
 pub struct ExecutorSpawnConfig {
     pub queue_capacity: usize,
     pub metrics: Arc<ExecutorMetrics>,
@@ -24,6 +26,10 @@ pub struct ExecutorSpawnConfig {
     pub gpu_config: crate::GpuConfig,
 }
 impl ExecutorSpawnConfig {
+    pub fn supports_evaluate(&self) -> bool {
+        cfg!(feature = "evaluate")
+    }
+
     pub fn fetch_only(
         producer_key: Arc<ProducerSigningKey>,
         assurance: Assurance,
@@ -123,9 +129,6 @@ impl Executor {
     async fn run(mut self) {
         let mut ingress_open = true;
         loop {
-            self.dispatch_paid_fetches();
-            #[cfg(feature = "evaluate")]
-            self.evaluate.dispatch_next_execution();
             let can_receive = self.active_fetches < self.fetch_max_in_flight
                 || self.pending_paid_fetches.len() < self.fetch_queue_capacity;
             #[cfg(feature = "evaluate")]
@@ -136,6 +139,11 @@ impl Executor {
             if !ingress_open && !active && self.pending_paid_fetches.is_empty() {
                 break;
             }
+            #[cfg(feature = "evaluate")]
+            let evaluate_dispatch =
+                std::future::poll_fn(|cx| self.evaluate.poll_dispatch_execution(cx));
+            #[cfg(not(feature = "evaluate"))]
+            let evaluate_dispatch = std::future::pending::<()>();
             tokio::select! {
                 biased;
                 Some(completion) = self.completion_rx.recv() => match completion {
@@ -146,8 +154,12 @@ impl Executor {
                     #[cfg(feature = "evaluate")]
                     ExecutorCompletion::EvaluateFinished(completion) => self.evaluate.on_completion(*completion).await,
                 },
+                (pending, result) = std::future::poll_fn(|cx| paid_fetch::poll_dispatch(&mut self.pending_paid_fetches, cx)), if self.active_fetches < self.fetch_max_in_flight => {
+                    self.start_paid_fetch(pending, result);
+                },
+                () = evaluate_dispatch => {},
                 request = self.owed_rx.recv(), if ingress_open && can_receive => match request {
-                    Some(ExecutorOwedRequest::RunPaidFetch { span, input, progress, reply }) => self.start_paid_fetch(*input, progress, reply, span),
+                    Some(ExecutorOwedRequest::RunPaidFetch { span, input, progress, reply }) => self.queue_paid_fetch(*input, progress, reply, span),
                     Some(ExecutorOwedRequest::RunPaidEvaluate { span, input, reply }) => {
                         #[cfg(feature = "evaluate")]
                         {

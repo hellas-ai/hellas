@@ -135,16 +135,14 @@ impl EdgeIndexMetadata {
         Ok(())
     }
 }
-pub fn validate_id(id: &str) -> Result<(), &'static str> {
-    if id.len() != 64
-        || !id
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    {
-        return Err("expected canonical lowercase 32-byte hex identifier");
-    }
-    Ok(())
+pub fn parse_id(id: &str) -> Result<[u8; 32], &'static str> {
+    hellas_auth::hex::parse_lower(id)
+        .map_err(|_| "expected canonical lowercase 32-byte hex identifier")
 }
+pub fn validate_id(id: &str) -> Result<(), &'static str> {
+    parse_id(id).map(|_| ())
+}
+
 pub fn validate_limit(limit: Option<u32>) -> Result<u32, &'static str> {
     let limit = limit.unwrap_or(32);
     if !(1..=64).contains(&limit) {

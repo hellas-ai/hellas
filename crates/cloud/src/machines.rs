@@ -80,13 +80,10 @@ impl MachinesArgs {
                 env,
                 files,
             } => {
-                let metadata = std::fs::metadata(&fetch_config)?;
-                anyhow::ensure!(
-                    metadata.is_file() && metadata.len() <= 48 * 1024,
-                    "fetch configuration must be a regular file of at most 48 KiB"
-                );
-                let fetch_config = serde_json::from_slice(&std::fs::read(fetch_config)?)
-                    .map_err(|_| anyhow::anyhow!("invalid fetch configuration JSON"))?;
+                let fetch_config = serde_json::from_slice(
+                    &hellas_private::read_bounded_regular_file(&fetch_config, 48 * 1024)?,
+                )
+                .map_err(|_| anyhow::anyhow!("invalid fetch configuration JSON"))?;
                 let grant_config = serde_json::from_slice(
                     &hellas_private::read_bounded_regular_file(&grant_config, 48 * 1024)?,
                 )
@@ -106,13 +103,12 @@ impl MachinesArgs {
                         let (name, path) = argument
                             .split_once('=')
                             .ok_or_else(|| anyhow::anyhow!("--file requires NAME=PATH"))?;
-                        let metadata = std::fs::metadata(path)?;
-                        anyhow::ensure!(
-                            metadata.is_file() && metadata.len() <= 48 * 1024,
-                            "credential file must be a regular file of at most 48 KiB"
-                        );
                         let value =
-                            serde_json::from_slice(&std::fs::read(path)?).map_err(|_| {
+                            serde_json::from_slice(&hellas_private::read_bounded_regular_file(
+                                std::path::Path::new(path),
+                                48 * 1024,
+                            )?)
+                            .map_err(|_| {
                                 anyhow::anyhow!("invalid credential JSON; contents withheld")
                             })?;
                         Ok((name.to_owned(), value))

@@ -17,15 +17,16 @@ use hellas_kernel::{
     EdgeId, Funding, MAX_START_VALIDITY_BLOCKS, Secp256k1Signer, Secp256k1Verifier,
     WorkPaymentTerms,
 };
-use hellas_rpc::protocol::artifacts::{Canonical as _, PreparedPaidInputV1};
-use hellas_rpc::protocol::work::{
-    JobDeadlines, generation_policy_digest, identity_source_digest, private_policy_commitment,
-};
-use hellas_rpc::protocol::work_profile::{PreparedWorkInput, WorkPolicy};
-use hellas_rpc::protocol::work_setup::{ProviderChannelPolicy, WorkChannelDescriptor};
+use hellas_rpc::protocol::artifacts::Canonical as _;
 use hellas_wire::ServiceMarker;
 #[cfg(test)]
 use hellas_wire::iroh::IrohTransport;
+use hellas_work::model::prepared_input::PreparedPaidInputV1;
+use hellas_work::model::profile::{PreparedWorkInput, WorkPolicy};
+use hellas_work::model::setup::{ProviderChannelPolicy, WorkChannelDescriptor};
+use hellas_work::model::work::{
+    JobDeadlines, generation_policy_digest, identity_source_digest, private_policy_commitment,
+};
 use hellas_work::work::{
     ClientChannel as _, ClientEndpoint, ClientObserver, ClientService, JobProposal, fetch_result,
     propose_work, resume_work_proposal,
@@ -65,6 +66,8 @@ pub struct PaidWorkOptions {
 impl PaidWorkOptions {
     /// Reject impossible deadlines and collateral before starting a node or signing.
     pub fn validate(&self) -> Result<()> {
+        self.provider_trust
+            .verify_environment(self.config.work_policy.allowed_environment())?;
         if !(self.acceptance_blocks > 0 && self.terminal_blocks > 0 && self.payment_blocks > 0) {
             return Err(PaidClientError::InvalidOptions(
                 "deadline spans must be positive",
@@ -80,39 +83,28 @@ impl PaidWorkOptions {
             config.expected_payment_values,
             self.omission_bond,
         )
-        .ok_or(hellas_rpc::protocol::work_setup::WorkSetupError::Unsettleable)?;
-        hellas_rpc::protocol::work_setup::check_collateral(
-            self.omission_bond,
-            settlement.capacity(),
-        )?;
+        .ok_or(hellas_work::model::setup::WorkSetupError::Unsettleable)?;
+        hellas_work::model::setup::check_collateral(self.omission_bond, settlement.capacity())?;
         Ok(())
     }
 }
 
 /// Convenience options for one complete paid job.
 pub struct PaidWorkRun {
-    pub config: WorkConfig,
-    pub journal_root: PathBuf,
-    pub provider: EndpointId,
-    pub provider_addrs: Vec<SocketAddr>,
-    pub provider_trust: hellas_client::ProviderTrustAnchor,
-    pub bond: EdgeId,
-    pub payment_funding: Funding,
-    pub omission_bond: u64,
+    pub options: PaidWorkOptions,
     pub prepared_input: PreparedWorkInput,
-    pub acceptance_blocks: u64,
-    pub terminal_blocks: u64,
-    pub payment_blocks: u64,
-    pub timeout: Duration,
     pub settle: bool,
 }
 
 pub struct PaidWorkResult {
+    pub bond_edge: EdgeId,
+    pub payment_edge: EdgeId,
+    pub channel_id: hellas_auth::Digest,
     pub transcript: Vec<u8>,
-    pub work_id: hellas_rpc::Digest,
+    pub work_id: hellas_auth::Digest,
     pub credited_cumulative: u64,
     pub job_price: u64,
-    pub provider_key: hellas_rpc::PublicKey,
+    pub provider_key: hellas_auth::PublicKey,
     pub input: hellas_rpc::InputCommitment,
     pub settled_provider_payout: Option<u64>,
 }
@@ -124,45 +116,20 @@ pub async fn run_paid_work(
     settlement_key: Secp256k1Signer,
     node: FullNode,
 ) -> Result<PaidWorkResult> {
-    if args.timeout.is_zero() {
+    if args.options.timeout.is_zero() {
         return Err(PaidClientError::InvalidOptions("timeout must be positive"));
     }
-    tokio::time::timeout(args.timeout, async move {
+    tokio::time::timeout(args.options.timeout, async move {
         let PaidWorkRun {
-            config,
-            journal_root,
-            provider,
-            provider_addrs,
-            provider_trust,
-            bond,
-            payment_funding,
-            omission_bond,
+            options,
             prepared_input,
-            acceptance_blocks,
-            terminal_blocks,
-            payment_blocks,
-            timeout,
             settle,
         } = args;
-        let options = PaidWorkOptions {
-            config,
-            journal_root,
-            provider,
-            provider_addrs,
-            provider_trust,
-            bond,
-            payment_funding,
-            omission_bond,
-            acceptance_blocks,
-            terminal_blocks,
-            payment_blocks,
-            timeout,
-        };
         check_request(
             &options.config.provider_policy(),
             &prepared_input,
             &options.provider_trust,
-            hellas_rpc::PublicKey::Secp256k1(settlement_key.party_key().to_bytes()),
+            hellas_auth::PublicKey::Secp256k1(settlement_key.party_key().to_bytes()),
         )?;
         let endpoint = bind_paid_endpoint(transport_key).await?;
         let mut session =
@@ -186,8 +153,8 @@ pub async fn run_paid_work(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct InputIdentities {
     pub allowed_environment: hellas_rpc::ContentId,
-    pub generation_policy_digest: hellas_rpc::Digest,
-    pub identity_source_digest: hellas_rpc::Digest,
+    pub generation_policy_digest: hellas_auth::Digest,
+    pub identity_source_digest: hellas_auth::Digest,
 }
 
 impl InputIdentities {
@@ -196,7 +163,9 @@ impl InputIdentities {
         Self::from_parts(&parts)
     }
 
-    fn from_parts(parts: &hellas_rpc::protocol::artifacts::PreparedPaidInputParts) -> Result<Self> {
+    fn from_parts(
+        parts: &hellas_work::model::prepared_input::PreparedPaidInputParts,
+    ) -> Result<Self> {
         let allowed_environment = parts.manifest.content_id();
         if parts.evaluate_request.execution_environment != allowed_environment {
             return Err(PaidClientError::InputMismatch("environment manifest"));
@@ -245,7 +214,7 @@ impl SessionChain {
 
 impl Drop for PaidWorkSession {
     fn drop(&mut self) {
-        let _ = self.client.observer().suspend();
+        // Dropping the sole client owner removes payment authority; stop its observer.
         if let Some(observer) = &self.observer {
             observer.abort();
         }
@@ -264,6 +233,7 @@ fn spawn_observer(
         loop {
             if client
                 .with_state(|state| state.close_settled().is_some())
+                .await
                 .unwrap_or(false)
             {
                 break;
@@ -277,12 +247,14 @@ fn spawn_observer(
                     driver.advance_close(&chain, &chain).await?;
                     let ready = ready_channel(&descriptor, &chain).await?;
                     if ready
-                        .check_caught_up(client.with_state(|state| state.cursor().0)?)
+                        .check_caught_up(client.with_state(|state| state.cursor().0).await?)
                         .is_err()
                     {
                         driver.catch_up_to(&chain, ready.finalized_height()).await?;
                     }
-                    client.observe_ready(ready, started, config.max_observation_age)?;
+                    client
+                        .observe_ready(ready, started, config.max_observation_age)
+                        .await?;
                     Ok::<_, PaidClientError>(())
                 }
                 .instrument(span),
@@ -292,7 +264,7 @@ fn spawn_observer(
                 stage: "channel observer",
             }));
             if let Err(error) = result {
-                let _ = client.suspend();
+                let _ = client.suspend().await;
                 tracing::debug!(%error, "paid client observation unavailable");
             }
             tokio::select! {
@@ -303,17 +275,19 @@ fn spawn_observer(
     })
 }
 
-fn check_payment_window(client: &ClientService, work_id: hellas_rpc::Digest) -> Result<()> {
-    client.with_state(|state| {
-        let job = state
-            .job_by_id(work_id)
-            .ok_or(PaidClientError::MissingState("accepted job disappeared"))?;
-        if state.cursor().0 > job.authorization().payment_deadline {
-            Err(PaidClientError::PaymentExpired)
-        } else {
-            Ok(())
-        }
-    })?
+async fn check_payment_window(client: &ClientService, work_id: hellas_auth::Digest) -> Result<()> {
+    client
+        .with_state(|state| {
+            let job = state
+                .job_by_id(work_id)
+                .ok_or(PaidClientError::MissingState("accepted job disappeared"))?;
+            if state.cursor().0 > job.authorization().payment_deadline {
+                Err(PaidClientError::PaymentExpired)
+            } else {
+                Ok(())
+            }
+        })
+        .await?
 }
 
 impl PaidWorkSession {
@@ -348,7 +322,8 @@ impl PaidWorkSession {
             bond,
             Role::Client,
             &Secp256k1Verifier::new(),
-        )?;
+        )
+        .await?;
         let mut setup = SetupEndpoint::new(
             store,
             settlement_key.clone(),
@@ -377,15 +352,15 @@ impl PaidWorkSession {
         if bundle.bond_terms().parties.taker() != settlement_key.party_key() {
             return Err(PaidClientError::InputMismatch("client settlement identity"));
         }
-        dialer.require_producer(hellas_rpc::PublicKey::Secp256k1(
+        dialer.require_producer(hellas_auth::PublicKey::Secp256k1(
             bundle.bond_terms().parties.maker().to_bytes(),
         ))?;
         if setup.state().scan_armed().is_none() {
-            setup.arm_scan(finalized_floor(&chain).await?)?;
+            setup.arm_scan(finalized_floor(&chain).await?).await?;
         }
         if setup.state().revision() == Some(1) {
             let terms = payment_terms(config, &policy, &bundle, args.omission_bond);
-            setup.propose_payment(payment_funding, terms)?;
+            setup.propose_payment(payment_funding, terms).await?;
         }
         if setup.state().revision() == Some(2) {
             exchange_setup(&dialer, &mut setup).await?;
@@ -412,7 +387,8 @@ impl PaidWorkSession {
         if let Some(ready) = ready {
             client
                 .observer()
-                .observe_ready(ready, started, config.max_observation_age)?;
+                .observe_ready(ready, started, config.max_observation_age)
+                .await?;
         }
         let observer = spawn_observer(
             client.observer(),
@@ -436,8 +412,11 @@ impl PaidWorkSession {
             // during channel opening; requests never perform this catch-up.
             // The session already owns the task, so cancellation aborts it.
             tokio::time::timeout(session.args.timeout, async {
-                while session.client.readiness().is_err()
-                    && !session.client.with_state(|state| state.is_closing())?
+                while session.client.readiness().await.is_err()
+                    && !session
+                        .client
+                        .with_state(|state| state.is_closing())
+                        .await?
                 {
                     tokio::time::sleep(session.args.config.poll).await;
                 }
@@ -454,11 +433,13 @@ impl PaidWorkSession {
     /// Stops observation and joins the task before releasing the journal.
     /// Call after draining jobs; retained accounting is recovered on restart.
     pub async fn shutdown(&mut self) {
-        let _ = self.client.observer().suspend();
-        if let Some(observer) = self.observer.take() {
+        if let Some(observer) = &mut self.observer {
             observer.abort();
             let _ = observer.await;
         }
+        self.observer = None;
+        // The observer can no longer renew readiness after suspension.
+        let _ = self.client.observer().suspend().await;
     }
 
     /// Identifies the funded channel and its admitted execution policy.
@@ -467,11 +448,11 @@ impl PaidWorkSession {
     }
 
     /// Reads local journal state under a short lock.
-    pub fn with_state<R>(
+    pub async fn with_state<R>(
         &self,
         read: impl FnOnce(&hellas_work::work_store::Channel) -> R,
     ) -> Result<R> {
-        Ok(self.client.with_state(read)?)
+        Ok(self.client.with_state(read).await?)
     }
 
     /// True after reopening a journal or an interrupted request.
@@ -484,11 +465,15 @@ impl PaidWorkSession {
     /// unreachable this waits as long as the process runs. Callers that need
     /// a bound should wrap it in one.
     pub async fn settle(&mut self) -> Result<u64> {
-        if !self.client.with_state(|state| state.is_closing())? {
-            self.client.with_client(|client| client.prepare_close())??;
+        if !self.client.with_state(|state| state.is_closing()).await? {
+            self.client.client().await?.prepare_close().await?;
         }
         loop {
-            if let Some(settlement) = self.client.with_state(|state| state.close_settled())? {
+            if let Some(settlement) = self
+                .client
+                .with_state(|state| state.close_settled())
+                .await?
+            {
                 return Ok(settlement.provider_payout);
             }
             tokio::time::sleep(self.args.config.poll).await;
@@ -532,19 +517,20 @@ impl PaidWorkSession {
                 &config.provider_policy(),
                 prepared,
                 &dialer.trust,
-                hellas_rpc::PublicKey::Secp256k1(descriptor.channel().client_key().to_bytes()),
+                hellas_auth::PublicKey::Secp256k1(descriptor.channel().client_key().to_bytes()),
             )?;
         }
         if recover
             && *needs_recovery
-            && let Some(work_id) =
-                client.with_state(|state| state.last_payment().map(|payment| payment.work_id))?
+            && let Some(work_id) = client
+                .with_state(|state| state.last_payment().map(|payment| payment.work_id))
+                .await?
         {
             // A lost acknowledgement never requires fresh admission: these
             // exact certificate bytes are already durable on the client.
             pay_for_result(dialer.work().await?, client, work_id).await?;
         }
-        if client.with_state(|state| state.is_closing())? {
+        if client.with_state(|state| state.is_closing()).await? {
             return if prepared.is_none() {
                 Ok(None)
             } else {
@@ -552,59 +538,63 @@ impl PaidWorkSession {
             };
         }
         self.chain.ready()?;
-        let ready = client.readiness()?;
+        let ready = client.readiness().await?;
         if recover && *needs_recovery {
             enum RecoveredJob {
                 /// The result was delivered, verified and committed before the
                 /// restart; only its payment is outstanding, and settling it
                 /// needs none of the payload a Fetch journal strips.
-                Delivered(hellas_rpc::protocol::Digest),
+                Delivered(hellas_auth::Digest),
                 /// No payload and no result: the job can neither execute nor
                 /// settle. Its evidence is retained until the payment deadline
                 /// filters it out, without blocking every later request.
-                Unrecoverable(hellas_rpc::protocol::Digest),
+                Unrecoverable(hellas_auth::Digest),
                 Replay(
-                    hellas_rpc::protocol::Digest,
+                    hellas_auth::Digest,
                     hellas_work::work_store::JobPhase,
                     PreparedWorkInput,
                 ),
             }
-            let pending = client.with_state(|state| {
-                state
-                    .jobs()
-                    .filter(|job| {
-                        // The journal forbids signing payment after this height.
-                        // Keep the evidence, but do not let an unpayable old job
-                        // prevent this channel from serving a new request. Retained
-                        // certificates are re-sent separately above.
-                        let payable = job.authorization().payment_deadline >= state.cursor().0;
-                        if !payable {
-                            tracing::info!(
-                                work_id = %hex::encode(job.work_id().as_bytes()),
-                                payment_deadline = job.authorization().payment_deadline,
-                                "retaining expired unpaid job without retrying execution",
-                            );
-                        }
-                        payable
-                    })
-                    .map(|job| {
-                        // Fetch journals retain accounting only. A restart cannot
-                        // reconstruct a lost request or authorize another
-                        // execution, but an already delivered result still
-                        // settles: signing payment needs no payload.
-                        if job.prepared_input().is_empty() {
-                            return Ok(if job.result().is_some() {
-                                RecoveredJob::Delivered(job.work_id())
-                            } else {
-                                RecoveredJob::Unrecoverable(job.work_id())
-                            });
-                        }
-                        PreparedWorkInput::decode(job.prepared_input(), MAX_RECORD_BYTES)
-                            .map(|input| RecoveredJob::Replay(job.work_id(), job.phase(), input))
-                            .map_err(PaidClientError::from)
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-            })??;
+            let pending = client
+                .with_state(|state| {
+                    state
+                        .jobs()
+                        .filter(|job| {
+                            // The journal forbids signing payment after this height.
+                            // Keep the evidence, but do not let an unpayable old job
+                            // prevent this channel from serving a new request. Retained
+                            // certificates are re-sent separately above.
+                            let payable = job.authorization().payment_deadline >= state.cursor().0;
+                            if !payable {
+                                tracing::info!(
+                                    work_id = %hex::encode(job.work_id().as_bytes()),
+                                    payment_deadline = job.authorization().payment_deadline,
+                                    "retaining expired unpaid job without retrying execution",
+                                );
+                            }
+                            payable
+                        })
+                        .map(|job| {
+                            // Fetch journals retain accounting only. A restart cannot
+                            // reconstruct a lost request or authorize another
+                            // execution, but an already delivered result still
+                            // settles: signing payment needs no payload.
+                            if job.prepared_input().is_empty() {
+                                return Ok(if job.result().is_some() {
+                                    RecoveredJob::Delivered(job.work_id())
+                                } else {
+                                    RecoveredJob::Unrecoverable(job.work_id())
+                                });
+                            }
+                            PreparedWorkInput::decode(job.prepared_input(), MAX_RECORD_BYTES)
+                                .map(|input| {
+                                    RecoveredJob::Replay(job.work_id(), job.phase(), input)
+                                })
+                                .map_err(PaidClientError::from)
+                        })
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .await??;
             for recovered in pending {
                 let (work_id, phase, pending) = match recovered {
                     RecoveredJob::Delivered(work_id) => {
@@ -625,7 +615,7 @@ impl PaidWorkSession {
                     &config.provider_policy(),
                     &pending,
                     &dialer.trust,
-                    hellas_rpc::PublicKey::Secp256k1(descriptor.channel().client_key().to_bytes()),
+                    hellas_auth::PublicKey::Secp256k1(descriptor.channel().client_key().to_bytes()),
                 )?;
                 let result = execute_paid_job(
                     args,
@@ -667,7 +657,7 @@ impl PaidWorkSession {
         let result = match prepared {
             Some(prepared) => {
                 self.chain.ready()?;
-                let ready = client.readiness()?;
+                let ready = client.readiness().await?;
                 Some(
                     execute_paid_job(
                         args,
@@ -716,11 +706,11 @@ async fn propose_when_ready(
     dialer: &ProviderDialer,
     client: &mut ClientService,
     proposal: &JobProposal,
-    retained: Option<hellas_rpc::Digest>,
+    retained: Option<hellas_auth::Digest>,
     poll: Duration,
     timeout: Duration,
     proposed: Option<&AtomicBool>,
-) -> Result<hellas_rpc::Digest> {
+) -> Result<hellas_auth::Digest> {
     let deadline = Instant::now() + timeout;
     let mut delay = poll.max(Duration::from_secs(1));
     loop {
@@ -754,7 +744,7 @@ async fn propose_when_ready(
 }
 
 enum JobLookup {
-    Retained(hellas_rpc::Digest),
+    Retained(hellas_auth::Digest),
     PreparedInput,
     New,
 }
@@ -765,7 +755,7 @@ async fn execute_paid_job(
     prepared: PreparedWorkInput,
     dialer: &ProviderDialer,
     client: &mut ClientService,
-    ready: &hellas_rpc::protocol::work_setup::ReadyChannel,
+    ready: &hellas_work::model::setup::ReadyChannel,
     poll: Duration,
     progress: Option<&hellas_work::work::PaidProgress>,
     lookup: JobLookup,
@@ -773,7 +763,7 @@ async fn execute_paid_job(
 ) -> Result<PaidWorkResult> {
     let readiness_timeout = args.timeout;
     let prepared_bytes = prepared.encode()?;
-    let current = client.with_state(|state| state.cursor().0)?;
+    let current = client.with_state(|state| state.cursor().0).await?;
     let deadlines = deadlines(
         current,
         args.acceptance_blocks,
@@ -784,22 +774,24 @@ async fn execute_paid_job(
         prepared_input: prepared,
         deadlines,
     };
-    let existing = client.with_state(|state| {
-        state
-            .jobs()
-            .filter(|job| match &lookup {
-                JobLookup::Retained(work_id) => job.work_id() == *work_id,
-                JobLookup::New => false,
-                JobLookup::PreparedInput => {
-                    job.prepared_input() == prepared_bytes.as_slice()
-                        && job.authorization().payment_deadline >= current
-                        && (job.phase() != hellas_work::work_store::JobPhase::HalfSigned
-                            || job.authorization().acceptance_deadline >= current)
-                }
-            })
-            .map(|job| (job.work_id(), job.phase(), *job.authorization()))
-            .collect::<Vec<_>>()
-    })?;
+    let existing = client
+        .with_state(|state| {
+            state
+                .jobs()
+                .filter(|job| match &lookup {
+                    JobLookup::Retained(work_id) => job.work_id() == *work_id,
+                    JobLookup::New => false,
+                    JobLookup::PreparedInput => {
+                        job.prepared_input() == prepared_bytes.as_slice()
+                            && job.authorization().payment_deadline >= current
+                            && (job.phase() != hellas_work::work_store::JobPhase::HalfSigned
+                                || job.authorization().acceptance_deadline >= current)
+                    }
+                })
+                .map(|job| (job.work_id(), job.phase(), *job.authorization()))
+                .collect::<Vec<_>>()
+        })
+        .await?;
     if existing.len() > 1 {
         return Err(PaidClientError::AmbiguousRecovery);
     }
@@ -845,7 +837,8 @@ async fn execute_paid_job(
                 state
                     .job_by_id(work_id)
                     .map(|job| job.transcript().to_vec())
-            })?
+            })
+            .await?
             .ok_or(PaidClientError::MissingState(
                 "collected job disappeared from its journal",
             ))?
@@ -863,7 +856,7 @@ async fn execute_paid_job(
                     if let Some(progress) = progress {
                         emitted = true;
                         progress(event.clone()).map_err(|error| {
-                            hellas_rpc::protocol::work::PaidWorkError::Transcript(error.to_string())
+                            hellas_work::model::work::PaidWorkError::Transcript(error.to_string())
                         })?;
                     }
                     Ok(())
@@ -886,22 +879,25 @@ async fn execute_paid_job(
             if emitted || !retryable {
                 return Err(error.into());
             }
-            check_payment_window(client, work_id)?;
+            check_payment_window(client, work_id).await?;
             tracing::debug!(%error, %work_id, "waiting for paid result stream readiness");
             tokio::time::sleep(poll.max(Duration::from_secs(1))).await;
         };
-        check_payment_window(client, work_id)?;
+        check_payment_window(client, work_id).await?;
         delivery.transcript
     } else {
         collect_until_ready(dialer, client, ready, work_id, poll).await?
     };
     let credited = pay_for_result(dialer.work().await?, client, work_id).await?;
     Ok(PaidWorkResult {
+        bond_edge: args.bond,
+        payment_edge: ready.channel().payment_edge(),
+        channel_id: ready.channel().id(),
         work_id,
         job_price: ready.payment_policy().fixed_price,
         credited_cumulative: credited,
         transcript,
-        provider_key: hellas_rpc::PublicKey::Secp256k1(ready.channel().provider_key().to_bytes()),
+        provider_key: hellas_auth::PublicKey::Secp256k1(ready.channel().provider_key().to_bytes()),
         input: proposal.prepared_input.input_commitment()?,
         settled_provider_payout: None,
     })
@@ -911,8 +907,9 @@ pub(crate) fn check_request(
     policy: &ProviderChannelPolicy,
     prepared: &PreparedWorkInput,
     trust: &hellas_client::ProviderTrustAnchor,
-    caller: hellas_rpc::PublicKey,
+    caller: hellas_auth::PublicKey,
 ) -> Result<()> {
+    trust.verify_environment(policy.work_policy.allowed_environment())?;
     let assurance = prepared.assurance()?;
     if trust.required_assurance != assurance {
         return Err(PaidClientError::InputMismatch(
@@ -923,8 +920,18 @@ pub(crate) fn check_request(
         (PreparedWorkInput::Evaluate(input), WorkPolicy::Evaluate(_)) => {
             check_evaluate_input(policy, input)?;
         }
-        (PreparedWorkInput::Fetch(input), WorkPolicy::Fetch { policy, route }) => {
+        (
+            PreparedWorkInput::Fetch(input),
+            WorkPolicy::Fetch {
+                policy,
+                route,
+                contract,
+            },
+        ) => {
             let parts = input.parts()?;
+            if parts.contract != *contract || policy.allowed_environment != contract.manifest_id() {
+                return Err(PaidClientError::InputMismatch("Fetch contract"));
+            }
             let request = hellas_rpc::fetch::verify_input_events(&parts.fetch_input_transcript)?;
             if request.caller_key != caller {
                 return Err(PaidClientError::InputMismatch("Fetch caller"));
@@ -939,10 +946,8 @@ pub(crate) fn check_request(
                     "Fetch retention must be ephemeral",
                 ));
             }
-            if let hellas_rpc::protocol::work_fetch::FetchRoutePolicy::SealedRoute {
-                service,
-                method,
-            } = route
+            if let hellas_work::model::fetch::FetchRoutePolicy::SealedRoute { service, method } =
+                route
                 && (&request.service != service || &request.method != method)
             {
                 return Err(PaidClientError::InputMismatch("Fetch route"));
@@ -965,7 +970,7 @@ pub fn check_evaluate_input(
     if expected.allowed_environment != input.allowed_environment {
         return Err(PaidClientError::InputMismatch("Evaluate environment"));
     }
-    if !(hellas_rpc::protocol::work::matches_generation_policy(expected, &parts.text_policy)?) {
+    if !(hellas_work::model::work::matches_generation_policy(expected, &parts.text_policy)?) {
         return Err(PaidClientError::InputMismatch("generation policy"));
     }
     if expected.identity_source_digest != input.identity_source_digest {
@@ -977,7 +982,7 @@ pub fn check_evaluate_input(
 fn payment_terms(
     config: &WorkConfig,
     policy: &ProviderChannelPolicy,
-    bundle: &hellas_rpc::protocol::work_bundle::WorkChannelSetupBundleV1,
+    bundle: &hellas_work::model::bundle::WorkChannelSetupBundleV1,
     omission_bond: u64,
 ) -> WorkPaymentTerms {
     WorkPaymentTerms {
@@ -1020,7 +1025,7 @@ async fn drive_setup(
 async fn ready_channel(
     descriptor: &WorkChannelDescriptor,
     chain: &WorkBlocks<LocalLightClient>,
-) -> Result<hellas_rpc::protocol::work_setup::ReadyChannel> {
+) -> Result<hellas_work::model::setup::ReadyChannel> {
     let query = WorkChannelQuery {
         bond_edge: descriptor.bond_edge(),
         payment_edge: descriptor.channel().payment_edge(),
@@ -1041,20 +1046,20 @@ async fn ready_channel(
 async fn collect_until_ready(
     dialer: &ProviderDialer,
     client: &mut ClientService,
-    ready: &hellas_rpc::protocol::work_setup::ReadyChannel,
-    work_id: hellas_rpc::Digest,
+    ready: &hellas_work::model::setup::ReadyChannel,
+    work_id: hellas_auth::Digest,
     poll: Duration,
 ) -> Result<Vec<u8>> {
     loop {
         match fetch_result(dialer.work().await?, client, ready, work_id).await {
             Ok(delivery) => {
-                check_payment_window(client, work_id)?;
+                check_payment_window(client, work_id).await?;
                 return Ok(delivery.transcript);
             }
             Err(hellas_work::work::DeliverError::Refused { refusal, reason })
                 if refusal.is_retryable() =>
             {
-                check_payment_window(client, work_id)?;
+                check_payment_window(client, work_id).await?;
                 tracing::debug!(%reason, "waiting for paid result");
                 tokio::time::sleep(poll.max(Duration::from_secs(1))).await;
             }
@@ -1105,7 +1110,7 @@ pub async fn bind_paid_endpoint(secret_key: SecretKey) -> Result<Endpoint> {
 async fn exchange_setup(dialer: &ProviderDialer, setup: &mut SetupEndpoint) -> Result<()> {
     let request = prepare_setup_exchange(setup);
     let response = send_setup_exchange(dialer.setup().await?, request).await?;
-    apply_setup_exchange(setup, response)?;
+    apply_setup_exchange(setup, response).await?;
     Ok(())
 }
 

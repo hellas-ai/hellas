@@ -4,31 +4,17 @@ pub mod artifacts;
 pub mod causal_lm;
 pub mod commitment;
 pub mod digest;
-pub mod fetch_environment;
+pub mod fetch_contract;
+pub use fetch_contract::{FETCH_EVALUATOR, FetchContract, FetchEgress, FetchSchema};
 pub mod identity;
 pub mod job;
 pub mod manifest;
 pub mod open;
 pub mod retention;
 pub mod schemes;
-pub use hellas_auth::signature;
 pub mod stream;
 pub mod tags;
 pub mod value;
-#[cfg(feature = "work")]
-pub mod work;
-#[cfg(feature = "work")]
-pub mod work_bundle;
-#[cfg(feature = "work")]
-pub mod work_fetch;
-#[cfg(feature = "work")]
-pub mod work_grant;
-#[cfg(feature = "work")]
-pub mod work_offer;
-#[cfg(feature = "work")]
-pub mod work_profile;
-#[cfg(feature = "work")]
-pub mod work_setup;
 
 pub use causal_lm::{
     CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR, CausalLmEnvironment, CausalLmEnvironmentError,
@@ -36,11 +22,7 @@ pub use causal_lm::{
     MAX_CAUSAL_LM_STATIC_BYTES, StaticSlice,
 };
 pub use commitment::{Assurance, Operation, RequestCommitment, SchemeId, scheme_id};
-pub use digest::{ContentId, Digest, hash_tuple};
-pub use fetch_environment::{
-    CODEX_RESPONSES_ADAPTOR, CODEX_RESPONSES_ENDPOINT, FETCH_EVALUATOR, FetchEnvironment,
-    OPENAI_RESPONSES_ADAPTOR, OPENAI_RESPONSES_ENDPOINT,
-};
+pub use digest::ContentId;
 pub use identity::{
     AppleAppAttestEnrollment, Decoder as DagCborDecoder, PlatformCredential, PlatformEnrollment,
     ProviderEnrollmentBundle, ProviderGenesisDecodeError, ProviderGenesisStatement, RootKind,
@@ -53,9 +35,6 @@ pub use open::{
 };
 pub use retention::Retention;
 pub use schemes::evaluate::{Evaluate, EvaluateRequest};
-pub use signature::{
-    ProducerId, ProducerSigningKey, PublicKey, Signature, SignatureError, SignatureKind,
-};
 pub use stream::{
     CanonicalizationId, EventCommitment, InputCommitment, InputEventBody, InputEventBodyParts,
     InputEventEnvelope, InputTranscriptBuilder, OutputEventBody, OutputEventBodyParts,
