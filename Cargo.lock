@@ -2579,6 +2579,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "hellas-auth"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "getrandom 0.4.3",
+ "hellas-xet",
+ "hex",
+ "k256",
+ "p256",
+ "serde",
+ "serde_bytes",
+ "serde_ipld_dagcbor",
+ "subtle",
+ "thiserror 2.0.21",
+ "zeroize",
+]
+
+[[package]]
 name = "hellas-chain"
 version = "0.1.0"
 dependencies = [
@@ -2911,11 +2929,11 @@ dependencies = [
  "base64ct",
  "brotli",
  "bytes",
- "ed25519-dalek",
  "flate2",
  "futures-core",
  "futures-util",
  "getrandom 0.4.3",
+ "hellas-auth",
  "hellas-kernel",
  "hellas-wire",
  "hellas-xet",
@@ -2924,7 +2942,6 @@ dependencies = [
  "n0-future",
  "opentelemetry",
  "opentelemetry_sdk",
- "p256",
  "prettyplease 0.3.0",
  "proc-macro2",
  "prost",
@@ -2936,7 +2953,6 @@ dependencies = [
  "serde_bytes",
  "serde_ipld_dagcbor",
  "serde_json",
- "smol_str 0.3.6",
  "syn 3.0.9",
  "tempfile",
  "thiserror 2.0.21",

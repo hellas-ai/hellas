@@ -1,0 +1,30 @@
+[package]
+name = "hellas-auth"
+description = "Transport-independent identity and service authority for Hellas"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation.workspace = true
+
+[features]
+test-support = []
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.4", features = ["wasm_js"] }
+
+[dependencies]
+ed25519-dalek.workspace = true
+getrandom = "0.4"
+hellas-xet = { workspace = true, features = ["chunking", "serde"] }
+hex.workspace = true
+k256 = { workspace = true, features = ["getrandom"] }
+p256.workspace = true
+serde.workspace = true
+serde_bytes.workspace = true
+subtle = "2.6"
+thiserror.workspace = true
+zeroize = "1.9"
+
+[dev-dependencies]
+serde_ipld_dagcbor.workspace = true

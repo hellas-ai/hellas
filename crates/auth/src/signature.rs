@@ -1,6 +1,7 @@
 use k256::ecdsa::signature::hazmat::{PrehashSigner as _, PrehashVerifier as _};
 use k256::ecdsa::{Signature as K256Signature, SigningKey};
 use k256::elliptic_curve::Generate as _;
+use k256::elliptic_curve::group::GroupEncoding as _;
 use serde::de::Error as DeError;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
@@ -230,13 +231,7 @@ impl ProducerSigningKey {
     }
 
     pub fn public_key(&self) -> PublicKey {
-        let point = self.inner.verifying_key().to_sec1_point(true);
-        PublicKey::Secp256k1(
-            point
-                .as_bytes()
-                .try_into()
-                .expect("compressed secp256k1 public key is 33 bytes"),
-        )
+        PublicKey::Secp256k1(self.inner.verifying_key().as_affine().to_bytes().into())
     }
 
     pub fn producer_id(&self) -> ProducerId {

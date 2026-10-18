@@ -2,10 +2,9 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
 
-use crate::tags;
 use hellas_xet::XetHashError;
 
-pub use hellas_xet::XetHash as Digest;
+pub use hellas_auth::{Digest, hash_tuple};
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -51,19 +50,6 @@ impl fmt::Display for ContentId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(formatter)
     }
-}
-
-pub fn hash_tuple(tag: &str, fields: &[&[u8]]) -> Digest {
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(tags::HASH_TUPLE_V2.as_bytes());
-    bytes.extend_from_slice(&(tag.len() as u32).to_be_bytes());
-    bytes.extend_from_slice(tag.as_bytes());
-    bytes.extend_from_slice(&(fields.len() as u32).to_be_bytes());
-    for field in fields {
-        bytes.extend_from_slice(&(field.len() as u64).to_be_bytes());
-        bytes.extend_from_slice(field);
-    }
-    Digest::hash(&bytes)
 }
 
 #[cfg(test)]
