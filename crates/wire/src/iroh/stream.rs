@@ -92,7 +92,8 @@ impl IrohStream {
         write_varint(frame_bytes.len() as u64, &mut len_buf);
         let result = match self.send.as_mut() {
             Some(send) => {
-                write_frame_with_timeout(send, &len_buf, frame_bytes, self.write_timeout).await
+                write_frame_with_timeout(send, &len_buf, frame_bytes, self.write_timeout, None)
+                    .await
             }
             None => Err(std::io::Error::other("send half closed")),
         };
@@ -130,6 +131,7 @@ impl crate::transport::Stream for IrohStream {
                 send: Some(send),
                 reset_flag: flag,
                 write_timeout: self.write_timeout,
+                authority: None,
             },
             IrohRecvHalf {
                 recv: Some(recv),
@@ -157,6 +159,7 @@ pub struct IrohSendHalf {
     send: Option<SendStream>,
     reset_flag: Arc<AtomicBool>,
     write_timeout: Duration,
+    authority: Option<crate::WriteAuthority>,
 }
 
 impl IrohSendHalf {
@@ -167,7 +170,14 @@ impl IrohSendHalf {
         write_varint(frame_bytes.len() as u64, &mut len_buf);
         let result = match self.send.as_mut() {
             Some(send) => {
-                write_frame_with_timeout(send, &len_buf, &frame_bytes, write_timeout).await
+                write_frame_with_timeout(
+                    send,
+                    &len_buf,
+                    &frame_bytes,
+                    write_timeout,
+                    self.authority.as_ref(),
+                )
+                .await
             }
             None => Err(std::io::Error::other("send half closed")),
         };
@@ -207,6 +217,17 @@ impl Drop for IrohSendHalf {
 
 impl crate::transport::SendHalf for IrohSendHalf {
     type Error = std::io::Error;
+
+    fn set_write_authority(&mut self, authority: crate::WriteAuthority) -> std::io::Result<()> {
+        if self.authority.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "write authority already installed",
+            ));
+        }
+        self.authority = Some(authority);
+        Ok(())
+    }
 
     async fn stopped(&mut self) {
         if let Some(send) = self.send.as_mut() {
@@ -445,6 +466,7 @@ async fn write_frame_with_timeout(
     length: &[u8],
     frame: &[u8],
     timeout: Duration,
+    authority: Option<&crate::WriteAuthority>,
 ) -> std::io::Result<()> {
     if frame.len() > MAX_FRAME_BYTES {
         return Err(std::io::Error::new(
@@ -456,12 +478,19 @@ async fn write_frame_with_timeout(
         ));
     }
     let write = async {
-        send.write_all(length).await?;
-        send.write_all(frame).await
+        if let Some(authority) = authority {
+            authority.write_all(send, length).await?;
+            authority.write_all(send, frame).await
+        } else {
+            send.write_all(length)
+                .await
+                .map_err(std::io::Error::other)?;
+            send.write_all(frame).await.map_err(std::io::Error::other)
+        }
     };
     match n0_future::time::timeout(timeout, write).await {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(error)) => Err(std::io::Error::other(error)),
+        Ok(Err(error)) => Err(error),
         Err(_) => Err(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
             "iroh frame write timed out",

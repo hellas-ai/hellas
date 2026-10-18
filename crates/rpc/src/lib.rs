@@ -58,10 +58,9 @@ pub mod observe;
 pub mod open;
 #[cfg(feature = "fetch")]
 pub mod output;
-/// Peer registry, admission, and connection directory module.
-pub mod peers;
+pub use hellas_wire::peers;
 pub mod protocol;
-pub mod serve;
+pub use hellas_wire::serve;
 #[cfg(feature = "execute")]
 pub mod signature_wire;
 #[cfg(feature = "execute")]

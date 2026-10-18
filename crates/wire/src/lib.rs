@@ -6,10 +6,17 @@ pub mod error;
 pub mod frame;
 pub mod latency;
 pub mod metadata;
+/// Peer registry, admission and connection accounting.
+pub mod peers;
 pub mod relay_auth;
 pub mod schema;
+pub mod serve;
 pub mod status;
+#[cfg(all(feature = "tls", not(target_family = "wasm")))]
+pub mod tls;
 pub mod transport;
+pub mod write_authority;
+pub use write_authority::{WriteAuthority, WriteAuthorization};
 
 #[cfg(all(feature = "mux", not(target_family = "wasm")))]
 pub mod framed;

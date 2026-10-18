@@ -5,8 +5,8 @@
 //! and observations in, and the registry returns deterministic state changes and
 //! admission decisions.
 //!
-//! Most application code should use [`PeerManager`] instead of calling
-//! [`PeerRegistry::apply`] directly. The intended layering is:
+//! Most application code should use [`PeerManager`](crate::peers::PeerManager) instead of calling
+//! [`PeerRegistry::apply`](crate::peers::PeerRegistry::apply) directly. The intended layering is:
 //!
 //! - a transport/discovery driver owns discovery streams and records facts here
 //!   before notifying application code;
@@ -42,17 +42,17 @@ pub use registry::{
 pub use security::{AuthLevel, TransportSecurity};
 
 // The codegen-emitted service and method markers implement
-// `hellas_wire::ServiceMarker` and `MethodMarker` directly. The peer
+// `crate::ServiceMarker` and `MethodMarker` directly. The peer
 // registry consumes those traits — no separate `RpcService` /
 // `RpcMethod` here.
-pub use hellas_wire::{MethodMarker as RpcMethod, ServiceMarker as RpcService};
+pub use crate::{MethodMarker as RpcMethod, ServiceMarker as RpcService};
 
 /// Fake service/method markers for tests, standing in for the codegen
 /// markers the peer engine consumes at runtime. Kept here so the three
 /// test modules share one definition instead of each re-declaring it.
 #[cfg(test)]
 pub(crate) mod test_markers {
-    use hellas_wire::{MethodMarker, ServiceMarker};
+    use crate::{MethodMarker, ServiceMarker};
 
     pub struct TestService;
     impl ServiceMarker for TestService {

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use hellas_wire::latency::EwmaLatency;
+use crate::latency::EwmaLatency;
 
 use super::RpcService;
 use super::admission::{AcquireDenied, Outcome, Permit, RequestKind, TokenBucket};
@@ -60,7 +60,7 @@ impl PeerRegistryConfig {
     }
 
     /// Combinations that would make the registry behave nonsensically.
-    /// Distinct from [`Self::normalized`], which silently clamps NaN /
+    /// Distinct from internal normalization, which silently clamps NaN /
     /// negative inputs into sane defaults — `validate` rejects internally
     /// consistent but operationally broken combinations the caller must
     /// fix at the config layer.

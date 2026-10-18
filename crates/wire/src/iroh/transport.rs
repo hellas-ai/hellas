@@ -13,8 +13,7 @@ use crate::transport::{AuthLevel, Inbound, PeerIdentity, StreamTransport, Transp
 
 use super::stream::{IrohStream, STREAM_ERROR_CODE};
 
-pub const OPEN_EXPORTER_LABEL: &[u8] = b"hellas/attest/open/v1";
-pub const OPEN_EXPORTER_LEN: usize = 32;
+pub use crate::transport::{OPEN_EXPORTER_LABEL, OPEN_EXPORTER_LEN};
 
 // These are phase deadlines, not RPC deadlines. In particular, no timer runs
 // while an accepted request is executing or between response-stream items.
@@ -803,6 +802,56 @@ mod timeout_tests {
 
         client.close().await;
         server.close().await;
+    }
+
+    #[tokio::test]
+    async fn write_authority_revocation_resets_blocked_body_and_terminal_metadata() {
+        use crate::write_authority::tests::Gate;
+        for terminal in [false, true] {
+            let (client, server, client_connection, server_connection) = connected_pair().await;
+            let transport = IrohTransport::new(server_connection);
+            let (_client_send, mut client_recv) =
+                raw_stream(&client_connection, &framed(open_frame(9))).await;
+            let inbound = transport.accept().await.unwrap().unwrap();
+            let (mut send, _recv) = inbound.stream.split();
+            let gate = Gate::default();
+            send.set_write_authority(gate.authority()).unwrap();
+            assert!(
+                send.set_write_authority(Gate::default().authority())
+                    .is_err()
+            );
+            if terminal {
+                gate.revoke();
+            }
+            let mut write = Box::pin(async {
+                if terminal {
+                    send.close_send(Some(crate::Trailer::from_status(
+                        crate::WireCode::Ok,
+                        "private terminal metadata",
+                    )))
+                    .await
+                } else {
+                    send.send_body(Bytes::from(vec![42; 2 * 1024 * 1024])).await
+                }
+            });
+            if !terminal {
+                assert!(poll!(write.as_mut()).is_pending());
+                gate.revoke();
+            }
+            let error = tokio::time::timeout(OUTER_TIMEOUT, write)
+                .await
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+            assert!(
+                tokio::time::timeout(OUTER_TIMEOUT, client_recv.read_to_end(4 * 1024 * 1024))
+                    .await
+                    .unwrap()
+                    .is_err()
+            );
+            client.close().await;
+            server.close().await;
+        }
     }
 
     #[tokio::test]

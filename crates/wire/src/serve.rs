@@ -9,8 +9,8 @@
 //! [`AccountingDispatcher`] records inbound requests and refreshes
 //! `last_seen_ms` in the shared peer registry.
 
-use hellas_wire::Dispatcher;
-use hellas_wire::transport::{Inbound, StreamTransport};
+use crate::Dispatcher;
+use crate::transport::{Inbound, StreamTransport};
 
 use crate::peers::{PeerId, PeerManager};
 
