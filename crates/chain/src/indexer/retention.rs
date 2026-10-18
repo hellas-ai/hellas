@@ -42,7 +42,11 @@ where
             codec_config,
             items_per_section: NZU64!(256),
             replay_buffer: NonZeroUsize::new(config.replay_buffer).unwrap_or(NonZeroUsize::MIN),
-            key_write_buffer: NonZeroUsize::new(config.write_buffer).unwrap_or(NonZeroUsize::MIN),
+            // Each section's index journal stays open for the archive's lifetime, and its
+            // write tip pins up to key_write_buffer bytes; index entries never need more
+            // than one page.
+            key_write_buffer: NonZeroUsize::new(usize::from(config.page_cache_size))
+                .unwrap_or(NonZeroUsize::MIN),
             value_write_buffer: NonZeroUsize::new(config.write_buffer).unwrap_or(NonZeroUsize::MIN),
         },
     )
