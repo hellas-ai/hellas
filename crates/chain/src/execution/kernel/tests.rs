@@ -511,7 +511,7 @@ fn basic_opens_are_bounded_by_the_lifetime_cap() {
             ))
         };
         let over = 1 + crate::domain::MAX_EDGE_LIFETIME_BLOCKS + 1;
-        let (batches, error) = apply_transaction(
+        let (batches, error) = *apply_transaction(
             batches,
             context(1),
             &ChainVerifier::new(),
@@ -531,7 +531,7 @@ fn basic_opens_are_bounded_by_the_lifetime_cap() {
         // In-cap, the gate falls through to ordinary kernel
         // validation — proof the cap is what refused the first one.
         let (_batches, error) =
-            apply_transaction(batches, context(1), &ChainVerifier::new(), &basic_open(50))
+            *apply_transaction(batches, context(1), &ChainVerifier::new(), &basic_open(50))
                 .await
                 .err()
                 .expect("kernel still validates admitted opens");
@@ -594,7 +594,7 @@ fn the_native_work_profiles_reach_the_kernel_ungated() {
         // the stake it commits — which is proof the gate is no
         // longer what stops it.
         let (batches, error) =
-            apply_transaction(batches, context(1), &ChainVerifier::new(), &work_bond)
+            *apply_transaction(batches, context(1), &ChainVerifier::new(), &work_bond)
                 .await
                 .err()
                 .expect("work bond open refused");
@@ -612,7 +612,7 @@ fn the_native_work_profiles_reach_the_kernel_ungated() {
         // check runs before the bond is loaded, which is why this
         // names a capacity failure and not a missing bond.
         let (_batches, error) =
-            apply_transaction(batches, context(1), &ChainVerifier::new(), &work_payment)
+            *apply_transaction(batches, context(1), &ChainVerifier::new(), &work_payment)
                 .await
                 .err()
                 .expect("unfunded work payment open refused");
@@ -718,10 +718,11 @@ fn a_payment_open_naming_an_absent_bond_is_retained_not_settled() {
         )
         .await
         .expect("genesis seed");
-        let (batches, error) = apply_transaction(batches, context(1), &ChainVerifier::new(), &open)
-            .await
-            .err()
-            .expect("a payment open without its bond is refused");
+        let (batches, error) =
+            *apply_transaction(batches, context(1), &ChainVerifier::new(), &open)
+                .await
+                .err()
+                .expect("a payment open without its bond is refused");
         assert_eq!(
             error,
             ExecutionError::ObjectNotFound {
@@ -1049,7 +1050,7 @@ fn a_work_payment_channel_settles_end_to_end_through_consensus() {
         // because the provider's window has not run out. That guard
         // is the exact complement of the response's, so admitting
         // this would admit a close and an answer at one height.
-        let (probe, error) = apply_transaction(probe, context(2), &verifier, &early_close)
+        let (probe, error) = *apply_transaction(probe, context(2), &verifier, &early_close)
             .await
             .err()
             .expect("an adjudicated close inside the response window is refused");
@@ -1066,7 +1067,7 @@ fn a_work_payment_channel_settles_end_to_end_through_consensus() {
         // Only the certificate's beneficiary may answer. A client
         // "response" is the client raising its own claim, which its
         // start already let it do.
-        let (probe, error) = apply_transaction(
+        let (probe, error) = *apply_transaction(
             probe,
             context(2),
             &verifier,
@@ -1089,7 +1090,7 @@ fn a_work_payment_channel_settles_end_to_end_through_consensus() {
         // The deadline is exclusive, so this is the first height at
         // which the answer is late — and, by the complement above,
         // the first height at which the close is not early.
-        let (probe, error) = apply_transaction(
+        let (probe, error) = *apply_transaction(
             probe,
             context(2 + WINDOW),
             &verifier,
@@ -1150,7 +1151,7 @@ fn a_work_payment_channel_settles_end_to_end_through_consensus() {
         // answer landed, and the close it would have settled is
         // gone. Refusing it is the whole reason an adjudicated close
         // carries a seal the chain could have recomputed itself.
-        let (probe, error) = apply_transaction(
+        let (probe, error) = *apply_transaction(
             database.new_batches().await,
             context(3),
             &verifier,
@@ -1744,7 +1745,7 @@ fn open_edge_id_collision_with_coin_is_wrong_kind_drop_and_preserves_state() {
         });
         let batches = batches.write(collision_id, Some(collision));
         let verifier = ChainVerifier::new();
-        let (batches, error) = apply_transaction(
+        let (batches, error) = *apply_transaction(
             batches,
             context(1),
             &verifier,
@@ -1815,7 +1816,7 @@ fn open_edge_id_collision_with_edge_is_edge_exists_drop_and_preserves_state() {
         let collision = Object::Edge(crate::domain::test_edge());
         let batches = batches.write(collision_id, Some(collision));
         let verifier = ChainVerifier::new();
-        let (batches, error) = apply_transaction(
+        let (batches, error) = *apply_transaction(
             batches,
             context(1),
             &verifier,

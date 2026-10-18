@@ -138,19 +138,20 @@ pub async fn write_owned<E>(
     batch: Batch<E>,
     id: ObjectId,
     value: Option<Object>,
-) -> Result<Batch<E>, (Batch<E>, ExecutionError)>
+) -> Result<Batch<E>, Box<(Batch<E>, ExecutionError)>>
 where
     E: StorageContext + Spawner + Send + Sync + 'static,
 {
     let old = match batch.get(&id).await {
         Ok(old) => old,
-        Err(error) => return Err((batch, ExecutionError::Storage(format!("{error:?}")))),
+        Err(error) => return Err((batch, ExecutionError::Storage(format!("{error:?}"))).into()),
     };
     if matches!(old, Some(Object::OwnerData(_))) || matches!(value, Some(Object::OwnerData(_))) {
         return Err((
             batch,
             ExecutionError::Storage("object namespace collides with owner metadata".into()),
-        ));
+        )
+            .into());
     }
     let mut store = BatchStore { batch: Some(batch) };
     for (owner, _, _) in ownership(old) {
@@ -158,7 +159,8 @@ where
             return Err((
                 store.batch.take().unwrap(),
                 ExecutionError::Storage(error.to_string()),
-            ));
+            )
+                .into());
         }
     }
     for (owner, kind, balance) in ownership(value) {
@@ -166,7 +168,8 @@ where
             return Err((
                 store.batch.take().unwrap(),
                 ExecutionError::Storage(error.to_string()),
-            ));
+            )
+                .into());
         }
     }
     Ok(store.batch.take().unwrap().write(id, value))
@@ -230,6 +233,7 @@ mod tests {
                 Some(Object::Coin(Coin { owner, value: 321 })),
             )
             .await
+            .map_err(|failure| *failure)
             {
                 Ok(batch) => batch,
                 Err((_, error)) => panic!("write owner fixture: {error:?}"),

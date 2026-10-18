@@ -175,7 +175,7 @@ fn remote_trust_flags_are_rejected_by_irrelevant_commands() {
         &["hellas", "identity", "init"],
     ];
     for command in commands {
-        for flag in TEST_REMOTE_TRUST_ARGS.chunks_exact(2) {
+        for flag in TEST_REMOTE_TRUST_ARGS.as_chunks::<2>().0 {
             assert!(
                 Cli::try_parse_from(command.iter().copied().chain(flag.iter().copied())).is_err(),
                 "{} accepted {}",
@@ -198,7 +198,7 @@ fn serve_accepts_only_its_command_local_assurance() {
         }
     ));
 
-    for flag in TEST_REMOTE_TRUST_ARGS.chunks_exact(2) {
+    for flag in TEST_REMOTE_TRUST_ARGS.as_chunks::<2>().0 {
         if flag[0] == "--assurance" {
             continue;
         }

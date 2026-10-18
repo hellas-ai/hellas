@@ -125,7 +125,7 @@ where
     for tx in txs {
         let next = apply_transaction(batches, context, verifier, tx)
             .await
-            .map_err(|(_, err)| err)?;
+            .map_err(|failure| failure.1)?;
         batches = next;
     }
     Ok(batches)
@@ -157,7 +157,10 @@ where
             break;
         }
 
-        match apply_transaction(batches, context, verifier, &tx).await {
+        match apply_transaction(batches, context, verifier, &tx)
+            .await
+            .map_err(|failure| *failure)
+        {
             Ok(next) => {
                 batches = next;
                 included_bytes = next_bytes;
@@ -237,7 +240,7 @@ where
     for (id, coin) in genesis_coins(genesis_allocations) {
         batches = super::owner_tree::write_owned(batches, id, Some(Object::Coin(coin)))
             .await
-            .map_err(|(_, error)| error)?;
+            .map_err(|failure| failure.1)?;
         if let Some(changes) = changes.as_deref_mut() {
             changes.push((id, Some(Object::Coin(coin))));
         }
@@ -250,7 +253,7 @@ async fn apply_transaction<E>(
     context: KernelContext,
     verifier: &ChainVerifier,
     tx: &Transaction,
-) -> Result<Batch<E>, (Batch<E>, ExecutionError)>
+) -> Result<Batch<E>, Box<(Batch<E>, ExecutionError)>>
 where
     E: StorageContext + Spawner + Send + Sync + 'static,
 {
@@ -263,21 +266,21 @@ where
         } => {
             let object = match batches.get(input).await.map_err(storage_err) {
                 Ok(object) => object,
-                Err(err) => return Err((batches, err)),
+                Err(err) => return Err((batches, err).into()),
             };
             let coin = match require_coin(*input, object) {
                 Ok(coin) => coin,
-                Err(err) => return Err((batches, err)),
+                Err(err) => return Err((batches, err).into()),
             };
             let owner = match legacy_owner_address(coin.owner) {
                 Ok(owner) => owner,
-                Err(err) => return Err((batches, err)),
+                Err(err) => return Err((batches, err).into()),
             };
             if !tx.verify_signature(context.network(), &owner) {
-                return Err((batches, ExecutionError::InvalidSignature));
+                return Err((batches, ExecutionError::InvalidSignature).into());
             }
             if *amount == 0 {
-                return Err((batches, ExecutionError::ZeroAmount));
+                return Err((batches, ExecutionError::ZeroAmount).into());
             }
             if *amount > coin.value {
                 return Err((
@@ -286,7 +289,8 @@ where
                         available: coin.value,
                         requested: *amount,
                     },
-                ));
+                )
+                    .into());
             }
 
             let tx_digest = Sha256::hash(&tx.encode());
@@ -297,9 +301,10 @@ where
                     return Err((
                         batches,
                         ExecutionError::OutputCollision { id: recipient_id },
-                    ));
+                    )
+                        .into());
                 }
-                Err(err) => return Err((batches, err)),
+                Err(err) => return Err((batches, err).into()),
             }
 
             let change_value = coin.value - amount;
@@ -310,11 +315,11 @@ where
                 } else {
                     match object_exists(&batches, &id).await {
                         Ok(exists) => exists,
-                        Err(err) => return Err((batches, err)),
+                        Err(err) => return Err((batches, err).into()),
                     }
                 };
                 if exists {
-                    return Err((batches, ExecutionError::OutputCollision { id }));
+                    return Err((batches, ExecutionError::OutputCollision { id }).into());
                 }
                 Some(id)
             } else {
@@ -354,7 +359,8 @@ where
                         MergeInputFault::Duplicate(id) => ExecutionError::DuplicateInput { id },
                         MergeInputFault::NonCanonical => ExecutionError::NonCanonicalMergeInputs,
                     },
-                ));
+                )
+                    .into());
             }
 
             let mut owner: Option<SettlementKey> = None;
@@ -362,33 +368,33 @@ where
             for input in inputs {
                 let object = match batches.get(input).await.map_err(storage_err) {
                     Ok(object) => object,
-                    Err(err) => return Err((batches, err)),
+                    Err(err) => return Err((batches, err).into()),
                 };
                 let coin = match require_coin(*input, object) {
                     Ok(coin) => coin,
-                    Err(err) => return Err((batches, err)),
+                    Err(err) => return Err((batches, err).into()),
                 };
                 if let Some(expected_owner) = owner.as_ref() {
                     if &coin.owner != expected_owner {
-                        return Err((batches, ExecutionError::MergeOwnerMismatch));
+                        return Err((batches, ExecutionError::MergeOwnerMismatch).into());
                     }
                 } else {
                     owner = Some(coin.owner);
                 }
                 total = match total.checked_add(coin.value) {
                     Some(total) => total,
-                    None => return Err((batches, ExecutionError::MergeOverflow)),
+                    None => return Err((batches, ExecutionError::MergeOverflow).into()),
                 };
             }
             let Some(owner) = owner else {
-                return Err((batches, ExecutionError::MergeOwnerMismatch));
+                return Err((batches, ExecutionError::MergeOwnerMismatch).into());
             };
             let address = match legacy_owner_address(owner) {
                 Ok(address) => address,
-                Err(err) => return Err((batches, err)),
+                Err(err) => return Err((batches, err).into()),
             };
             if !tx.verify_signature(context.network(), &address) {
-                return Err((batches, ExecutionError::InvalidSignature));
+                return Err((batches, ExecutionError::InvalidSignature).into());
             }
 
             let tx_digest = Sha256::hash(&tx.encode());
@@ -396,9 +402,9 @@ where
             match object_exists(&batches, &output_id).await {
                 Ok(false) => {}
                 Ok(true) => {
-                    return Err((batches, ExecutionError::OutputCollision { id: output_id }));
+                    return Err((batches, ExecutionError::OutputCollision { id: output_id }).into());
                 }
-                Err(err) => return Err((batches, err)),
+                Err(err) => return Err((batches, err).into()),
             }
 
             for input in inputs {
@@ -651,6 +657,7 @@ where
                 }
                 batches = match super::owner_tree::write_owned(batches, coin_object_id(*id), None)
                     .await
+                    .map_err(|failure| *failure)
                 {
                     Ok(next) => next,
                     Err((next, error)) => return (next, Some(error)),
@@ -670,6 +677,7 @@ where
                 Some(Object::Edge(edge)),
             )
             .await
+            .map_err(|failure| *failure)
             {
                 Ok(next) => next,
                 Err((next, error)) => return (next, Some(error)),
@@ -684,11 +692,13 @@ where
                     }),
                 );
             }
-            batches =
-                match super::owner_tree::write_owned(batches, edge_object_id(*input), None).await {
-                    Ok(next) => next,
-                    Err((next, error)) => return (next, Some(error)),
-                };
+            batches = match super::owner_tree::write_owned(batches, edge_object_id(*input), None)
+                .await
+                .map_err(|failure| *failure)
+            {
+                Ok(next) => next,
+                Err((next, error)) => return (next, Some(error)),
+            };
             for id in outputs {
                 let Some(coin) = working.coin(*id) else {
                     return (
@@ -704,6 +714,7 @@ where
                     Some(Object::Coin(Coin::from(coin))),
                 )
                 .await
+                .map_err(|failure| *failure)
                 {
                     Ok(next) => next,
                     Err((next, error)) => return (next, Some(error)),
@@ -794,7 +805,7 @@ async fn apply_kernel_transaction<E>(
     context: KernelContext,
     verifier: &ChainVerifier,
     tx: &KernelTx,
-) -> Result<Batch<E>, (Batch<E>, ExecutionError)>
+) -> Result<Batch<E>, Box<(Batch<E>, ExecutionError)>>
 where
     E: StorageContext + Spawner + Send + Sync + 'static,
 {
@@ -807,23 +818,23 @@ async fn apply_kernel_transaction_observed<E>(
     verifier: &ChainVerifier,
     tx: &KernelTx,
     changes: Option<&mut Vec<(ObjectId, Option<Object>)>>,
-) -> Result<Batch<E>, (Batch<E>, ExecutionError)>
+) -> Result<Batch<E>, Box<(Batch<E>, ExecutionError)>>
 where
     E: StorageContext + Spawner + Send + Sync + 'static,
 {
     if let Err(err) = check_open(context, tx) {
-        return Err((batches, err));
+        return Err((batches, err).into());
     }
     let working = match load_kernel_slots(&batches, context, tx).await {
         Ok(working) => working,
-        Err(err) => return Err((batches, err)),
+        Err(err) => return Err((batches, err).into()),
     };
     let mut state = State::new(working);
     let outcome = match state.apply(context, verifier, tx) {
         Ok(outcome) => outcome,
         Err(source) => {
             let err = classify_kernel_error(state.store(), source);
-            return Err((batches, err));
+            return Err((batches, err).into());
         }
     };
     let working = state.into_store();
@@ -835,11 +846,11 @@ where
         None => (batches, None),
     };
     if let Some(error) = replay_error {
-        return Err((batches, error));
+        return Err((batches, error).into());
     }
     let (batches, replay_error) = replay_kernel_registry(batches, &working, outcome.registry());
     match replay_error {
-        Some(error) => Err((batches, error)),
+        Some(error) => Err((batches, error).into()),
         None => {
             if let Some(changes) = changes {
                 if let Some(event) = outcome.public_event() {
@@ -901,11 +912,11 @@ where
                 Some(&mut changes),
             )
             .await
-            .map_err(|(_, error)| error)?;
+            .map_err(|failure| failure.1)?;
         } else {
             batches = apply_transaction(batches, context, verifier, tx)
                 .await
-                .map_err(|(_, error)| error)?;
+                .map_err(|failure| failure.1)?;
             let digest = Sha256::hash(&tx.encode());
             let mut ids = vec![output_object_id(&digest, 0)];
             match tx {

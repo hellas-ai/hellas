@@ -2748,7 +2748,7 @@ fn channel_key_bytes(path: &std::path::Path) -> [u8; 32] {
     };
     let mut key = [0_u8; 32];
     assert_eq!(hex.len(), 2 * key.len(), "the name carries a 32-byte key");
-    for (byte, pair) in key.iter_mut().zip(hex.as_bytes().chunks_exact(2)) {
+    for (byte, pair) in key.iter_mut().zip(hex.as_bytes().as_chunks::<2>().0) {
         let Ok(text) = std::str::from_utf8(pair) else {
             panic!("hex is ascii");
         };
