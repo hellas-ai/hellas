@@ -31,6 +31,7 @@ discovery-mdns = [
 ]
 # Mux is shared infrastructure for transports without native substreams.
 mux = []
+tls = ["dep:rustls", "dep:tokio-rustls"]
 ws = ["mux", "dep:tokio-tungstenite"]
 # Local native transport: a Unix socket, or an owner-authenticated named pipe
 # on Windows. `mux` keeps the RPC framing and service dispatch identical to
@@ -74,11 +75,15 @@ postcard = { version = "1", default-features = false, features = [
 ], optional = true }
 rustls = { version = "0.23", default-features = false, features = [
     "ring",
+    "std",
 ], optional = true }
 serde = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
 smol_str = { workspace = true }
 thiserror = { workspace = true }
+tokio-rustls = { version = "0.26", default-features = false, features = [
+    "ring",
+], optional = true }
 tokio-stream = { workspace = true, optional = true }
 tokio-tungstenite = { workspace = true, optional = true }
 tracing = { workspace = true }

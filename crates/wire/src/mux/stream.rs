@@ -63,6 +63,7 @@ impl crate::transport::Stream for MuxStream {
             MuxSendHalf {
                 key: self.key,
                 cmd_tx: self.cmd_tx.clone(),
+                authority: None,
             },
             MuxRecvHalf {
                 key: self.key,
@@ -86,10 +87,22 @@ impl crate::transport::Stream for MuxStream {
 pub struct MuxSendHalf {
     key: StreamKey,
     cmd_tx: mpsc::UnboundedSender<Command>,
+    authority: Option<crate::WriteAuthority>,
 }
 
 impl crate::transport::SendHalf for MuxSendHalf {
     type Error = MuxStreamError;
+
+    fn set_write_authority(&mut self, authority: crate::WriteAuthority) -> std::io::Result<()> {
+        if self.authority.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "write authority already installed",
+            ));
+        }
+        self.authority = Some(authority);
+        Ok(())
+    }
 
     async fn send_body(&mut self, payload: Bytes) -> Result<(), Self::Error> {
         let (tx, rx) = oneshot::channel();
@@ -98,6 +111,7 @@ impl crate::transport::SendHalf for MuxSendHalf {
                 key: self.key,
                 payload,
                 reply: tx,
+                authority: self.authority.clone(),
             })
             .map_err(|_| MuxStreamError::Closed)?;
         rx.await
@@ -112,6 +126,7 @@ impl crate::transport::SendHalf for MuxSendHalf {
                 key: self.key,
                 trailer,
                 reply: tx,
+                authority: self.authority.clone(),
             })
             .map_err(|_| MuxStreamError::Closed)?;
         rx.await

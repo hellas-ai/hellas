@@ -3049,6 +3049,7 @@ dependencies = [
  "smol_str 0.3.6",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tokio-tungstenite 0.30.0",
  "tracing",

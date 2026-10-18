@@ -103,6 +103,7 @@ async fn a_finished_stream_s_reset_cannot_cancel_the_slot_s_next_tenant() {
         inbound_tx,
         slot_to_chans: Default::default(),
         pending_sends: Default::default(),
+        authorities: Default::default(),
         context: TransportContext::default(),
     };
 
@@ -119,6 +120,7 @@ async fn a_finished_stream_s_reset_cannot_cancel_the_slot_s_next_tenant() {
     let (reply, _replied) = oneshot::channel();
     driver
         .handle_command(Command::CloseSend {
+            authority: None,
             key: StreamKey::new(0, 1),
             trailer: None,
             reply,
@@ -188,6 +190,7 @@ async fn blocked_send_resumes_when_peer_credit_arrives() {
         inbound_tx,
         slot_to_chans: Default::default(),
         pending_sends: Default::default(),
+        authorities: Default::default(),
         context: TransportContext::default(),
     };
 

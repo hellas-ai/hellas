@@ -73,6 +73,27 @@ where
         Ok(())
     }
 
+    async fn send_message_authorized(
+        &mut self,
+        bytes: Bytes,
+        authority: &crate::WriteAuthority,
+    ) -> std::io::Result<()> {
+        use futures::Sink;
+        use std::{pin::Pin, task::Poll};
+        futures::future::poll_fn(|cx| {
+            authority.poll_write(cx, &mut |cx| {
+                std::task::ready!(Pin::new(&mut self.ws).poll_ready(cx))
+                    .map_err(std::io::Error::other)?;
+                Pin::new(&mut self.ws)
+                    .start_send(Message::Binary(bytes.clone()))
+                    .map_err(std::io::Error::other)?;
+                Poll::Ready(Ok(bytes.len()))
+            })
+        })
+        .await?;
+        self.ws.flush().await.map_err(std::io::Error::other)
+    }
+
     async fn recv_message(&mut self) -> Result<Option<Bytes>, Self::RecvError> {
         while let Some(msg) = self.ws.next().await {
             match msg? {
@@ -185,6 +206,35 @@ const _: fn() = || {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn write_authority_is_checked_before_handing_a_message_to_websocket() {
+        use super::*;
+        use crate::write_authority::tests::Gate;
+        use tokio_tungstenite::tungstenite::protocol::Role;
+        let (local, remote) = tokio::io::duplex(512);
+        let mut pipe =
+            WsPipe::new(WebSocketStream::from_raw_socket(local, Role::Server, None).await);
+        let mut peer = WebSocketStream::from_raw_socket(remote, Role::Client, None).await;
+        let gate = Gate::default();
+        let authority = gate.authority();
+        pipe.send_message_authorized(Bytes::from_static(b"accepted"), &authority)
+            .await
+            .unwrap();
+        assert_eq!(
+            peer.next().await.unwrap().unwrap(),
+            Message::Binary(Bytes::from_static(b"accepted"))
+        );
+        gate.revoke();
+        assert_eq!(
+            pipe.send_message_authorized(Bytes::from_static(b"unsent secret"), &authority)
+                .await
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        drop(pipe);
+        assert!(!matches!(peer.next().await, Some(Ok(Message::Binary(_)))));
+    }
     use super::*;
     use crate::{Metadata, StreamTransport};
     use tokio::net::TcpListener;

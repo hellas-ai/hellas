@@ -53,6 +53,17 @@ pub fn decode_keyed_frame(buf: &[u8]) -> Result<KeyedFrame, FrameError> {
     })
 }
 
+/// Inspect a frame produced by this mux without copying its protected body.
+pub(super) fn keyed_frame_header(buf: &[u8]) -> Option<(StreamKey, crate::FrameKind)> {
+    let [a, b, c, d, kind, ..] = buf else {
+        return None;
+    };
+    Some((
+        StreamKey::new(u16::from_be_bytes([*a, *b]), u16::from_be_bytes([*c, *d])),
+        crate::FrameKind::from_u8(*kind)?,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
