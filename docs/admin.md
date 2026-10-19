@@ -1,22 +1,39 @@
 # Node administration
 
-Node administration requires a portable identity, a scoped application credential,
-and explicit operation grants. The same HostControl service checks local TLS and
-remote QUIC calls. Socket ownership only limits admission. It grants no application
-rights. The node writer rechecks current credentials and grants before each effect.
+A principal is a person or bot, identified by one P-256 passkey. A node holds
+only machine keys: an iroh transport key for QUIC and a secp256k1 node key. The
+CLI acts for the principal of a software passkey file given with `--passkey`
+(32 raw bytes or 64 hex digits); `--identity` names the node's own keys.
 
-Online commands take a private `--profile` file:
+Node administration requires a scoped application credential and explicit
+operation grants. A credential is issued to a principal and held by a device: it
+records the node key of the device that holds it. Each session proves the
+credential's secret plus one of two keys over a digest bound to the live
+connection:
+
+- a **passkey session**: the subject's passkey asserts the digest;
+- a **daily session**: the holder's node key signs it.
+
+Step-up operations require a passkey session and refuse a daily one: issuing or
+revoking credentials, issuing grants that name another principal or carry
+administrative rights, and binding a provider. The same HostControl service
+checks local TLS and remote QUIC calls. Socket ownership only limits admission.
+It grants no application rights. The node writer rechecks current credentials and
+grants before each effect.
+
+Online commands take a private `--profile` file. With `--passkey` the session is a
+passkey session; without it, the node key of `--identity` opens a daily session:
 
 ```sh
-hellas-cli --identity operator.identity admin --profile operator.json status
-hellas-cli --identity operator.identity admin --profile operator.json set-capacity --expected-revision 1 --max-in-flight 4 --limits machine-limits.json
-hellas-cli --identity operator.identity admin --profile operator.json grant change.json
-hellas-cli --identity operator.identity admin --profile operator.json issue-credential --scope friend-scope.json --credential-out friend.credential
-hellas-cli --identity operator.identity admin --profile operator.json revoke-credential --credential-id ID --expected-revision 1
-hellas-cli --identity operator.identity admin --profile operator.json bind-provider --enrollment provider.enrollment
-hellas-cli --identity operator.identity admin --profile operator.json work allowance.json
-hellas-cli --identity operator.identity admin --profile operator.json work export.json --offer-out friend.offer
-hellas-cli --identity operator.identity admin --profile remote.json --contact node.contact --address 192.0.2.10:9000 status
+hellas-cli --identity node.identity admin --profile operator.json status
+hellas-cli --identity node.identity admin --profile operator.json set-capacity --expected-revision 1 --max-in-flight 4 --limits machine-limits.json
+hellas-cli --identity node.identity --passkey operator.passkey admin --profile operator.json grant change.json
+hellas-cli --identity node.identity --passkey operator.passkey admin --profile operator.json issue-credential --scope friend-scope.json --holder friend-holder.json --credential-out friend.credential
+hellas-cli --identity node.identity --passkey operator.passkey admin --profile operator.json revoke-credential --credential-id ID --expected-revision 1
+hellas-cli --identity node.identity --passkey operator.passkey admin --profile operator.json bind-provider --enrollment provider.enrollment
+hellas-cli --identity node.identity admin --profile operator.json work allowance.json
+hellas-cli --identity node.identity admin --profile operator.json work export.json --offer-out friend.offer
+hellas-cli --identity laptop.identity admin --profile remote.json --node node.enrollment --address 192.0.2.10:9000 status
 ```
 
 `status` requires `host.status` on this authority's host resource. `set-capacity`
@@ -29,7 +46,7 @@ provider whose machine has not been configured. `status` includes the current li
 `grant` accepts the
 Auth crate's `GrantCommand` JSON, including its explicit authorization grant and
 any required revision. Grant issuance and credential scope both bound the action;
-there is no blanket admin boolean. Identity possession alone is insufficient.
+there is no blanket admin boolean. Possessing a passkey alone is insufficient.
 Each command prints its record; the record's `caller.before` revision plus one is
 the new revision of the grant it changed, and revisions are never reused. Only node grants issue or revise grants; delegated rights cascade with their
 parent instead. An administrator cannot assign itself administrative rights, and its
@@ -38,14 +55,18 @@ only through offline recovery. Revoked and expired grants are reclaimed when the
 table is full.
 
 `issue-credential` takes an Auth `GrantSpec` scope, bounded by the issuer's explicit
-credential-issuance ceiling. It creates no grant: the recipient also needs current
+credential-issuance ceiling, and a `--holder` file: the JSON `CredentialHolder` of
+the device that will hold it. `hellas-cli --identity node.identity identity
+show-holder` prints that device's holder, `{"Node":[1,[...]]}`, its node key with
+the secp256k1 curve tag. Issuing creates no grant: the recipient also needs current
 grants for the requested operations. The node commits the verifier and audit before
 returning the secret once over the authenticated connection. The CLI writes a private
 credential file without overwriting an existing file and prints its ID, revision,
 path, authority ID, subject key and subject fingerprint. Transfer that file securely
-to its subject; RPC use also requires the subject's identity key. Only a credential
-issued to its issuer's own subject
-authenticates by its secret alone. The server does not retain a recoverable copy of the secret.
+to the holding device; a session also requires the subject's passkey or that
+device's node key. The holder `"Bearer"` issues a `gateway.invoke`-only credential
+for local HTTP clients: its secret alone authenticates it, and it opens no session.
+The server does not retain a recoverable copy of the secret.
 
 `revoke-credential` requires the separate credential-revocation permission and the
 credential's current revision (one for a newly issued credential). Revocation applies
@@ -101,7 +122,7 @@ Configure machine capacity first, then explicit account, pool and subject budget
 with `ConfigureBudget`. Its [BudgetDef](../crates/work/src/model/grant/budget.rs)
 names a node, its parent, the new revision, limits and maximum concurrent jobs.
 An account is an Auth resource ID and has the machine as parent. A pool has a stable
-16-byte ID and an account parent. A subject node is the pair `(pool, identity key)`;
+16-byte ID and an account parent. A subject node is the pair `(pool, principal)`;
 its parent is that pool or another subject in the same pool. At most eight subject
 levels are permitted. Parentage is immutable, and revisions start at one and increase
 by exactly one. Configuration returns the changed node and revision; `InspectBudget`
@@ -196,27 +217,33 @@ resource repair require their own expected versions, so retrying an old request
 cannot silently reset another generation or clear newer faults. Mutations return
 the changed versions; private usage is returned only by authorized inspection.
 `Offers` with one explicit allowance ID can write `--offer-out` for `offer import`.
-Contact export and import print the identity fingerprint to stderr; offer export and
-import print the provider fingerprint. Each fingerprint has 12 base32
-characters in three groups, derived from a hash of the complete identity key. Compare
-them with the other person over an independent channel before using the imported
-record. The credential subject fingerprint matches that subject's contact fingerprint.
-These displays do not approve provider trust; the full keys remain authoritative.
-Work terms confer no authorization, and Work administration
-cannot issue Auth grants or credentials without their separate permissions.
-Allowances require explicit policies and an existing subject budget. Auth may authorize
-other callers to use that sponsored budget. Standing returns only that budget's counters
-and the minimum remaining allowance across ancestors; ancestor usage requires checked
-inspection. Offers have no recipient and confer no permission. Channels are created on
-first accepted work and bind the authenticated actor; standing and delivery require the
-same actor, including after Auth grant revisions.
-Work audience IDs are the same validated identity keys used
-by Auth. Provider trust still pins the provider enrollment. CLI contact/offer state
-is stored under the hex-encoded identity key, and old enrollment-hash directories
-are not imported or migrated. Application sessions and configured shared budgets are
-implemented, including durable resource/account binding, signed Responses model/settings
-limits and operator-rated money budgets. Other schema profiles and vendor-derived
-percentage allowances remain part of the execution cutover described in the plan.
+Offer export and import print the provider's enrollment content ID to stderr.
+
+A contact is a person. `contact export --display-name NAME` signs a contact card
+with `--passkey`: the principal's passkey public key and display name, with the
+passkey's assertion over both. `contact import CARD --name ALIAS` verifies the card
+and saves it under the importing principal; it prints the card's principal, display
+name and fingerprint. The exporter sees the same fingerprint on stderr. A
+fingerprint has 12 base32 characters in three groups, derived from a hash of the
+complete curve-tagged key. Compare it with the other person over an independent
+channel before granting the imported principal. The credential subject fingerprint
+matches that subject's contact card. These displays do not approve provider trust;
+the full keys remain authoritative.
+
+Work terms confer no authorization, and Work administration cannot issue Auth grants
+or credentials without their separate permissions. Allowances require explicit
+policies and an existing subject budget. Auth may authorize other callers to use that
+sponsored budget. Standing returns only that budget's counters and the minimum
+remaining allowance across ancestors; ancestor usage requires checked inspection.
+Offers have no recipient and confer no permission. A channel serves one principal on
+one device: it is keyed by the principal and the node key its credential is bound
+to, so two devices of one principal never share a channel or its job nonces. Each
+device signs its jobs with its node key. Channels are created on first accepted work;
+standing and delivery require the same principal and device, including after Auth
+grant revisions. A bearer credential has no channel. Work audience IDs are the same
+validated principals used by Auth. Provider trust still pins the provider enrollment.
+CLI contact, offer and access state is stored per principal, under
+`p256-<compressed key>` in the grant data directory.
 
 The profile has these fields. Unknown fields are refused.
 
@@ -231,24 +258,26 @@ Paths in a profile resolve relative to that profile. A credential file contains 
 16-byte ID followed by its 32-byte secret. Profiles, credentials, certificates and
 private keys must be regular private files. Files are bounded to 64 KiB; credentials
 must be exactly 48 bytes. Provision trust independently: a local profile pins the
-server certificate, and a remote command uses a verified node contact to pin its
-transport key. The expected authority always comes from the profile. The client
-never learns trust or permission from the server's authentication challenge.
+server certificate, and a remote command pins the node's transport key with `--node`,
+that node's enrollment (`identity export-enrollment`), verified out of band. The
+expected authority always comes from the profile. The client never learns trust or
+permission from the server's authentication challenge.
 
-The default local path is this identity's `control.sock`; use `--control-socket`
-when administering a different local daemon. The directory must be private (0700
-on Unix); the listener creates a 0600 socket and checks peer ownership. Both
-carriers require the application credential and an identity signature bound to the
-live connection. Revocation applies to an existing authenticated connection too.
+The default local path is the `--passkey` principal's `control.sock`; use
+`--control-socket` when administering a different local daemon or without a passkey.
+The directory must be private (0700 on Unix); the listener creates a 0600 socket and
+checks peer ownership. Both carriers require the application credential and a
+passkey or node-key proof bound to the live connection. Revocation applies to an
+existing authenticated connection too.
 
 Remote control is off by default. To enable it, set `remote_control_peers` in the
 grant configuration to the operator-approved client endpoint keys (at most 128
-distinct iroh endpoint IDs). The client uses its existing identity's transport key;
-compare that key with its contact record out of band. Admission is checked during
-the QUIC handshake and again before application authentication. An admitted endpoint
-still needs its application credential, identity signature and operation grant.
-Unlisted peers cannot enroll through this listener. Use local control when the CLI
-and the running node share the same transport identity.
+distinct iroh endpoint IDs). The client uses its node's transport key
+(`identity show-node-id`); compare it out of band. Admission is checked during the
+QUIC handshake and again before application authentication. An admitted endpoint
+still needs its application credential, session proof and operation grant. Unlisted
+peers cannot enroll through this listener. Use local control when the CLI and the
+running node share the same transport identity.
 
 Local and remote control each have 16 connection slots. Authentication must finish
 within five seconds; authenticated sessions close after 30 seconds without another
@@ -266,41 +295,51 @@ attribute a request to that actor.
 
 ## Access bundles
 
-An access bundle gives one contact what they need to use an allowance: its signed
-offer, the authority ID, the contact's Auth grant ID, the credential subject, the
-credential ID and secret, the expiry and an optional provider label of at most 64
-bytes. It contains no provider trust; the contact still approves a trust policy
-with `hellas-cli trust` before running work.
+An access bundle shares allowances with one contact device: one signed offer per
+allowance, the authority ID, the contact's Auth grant ID, the credential subject,
+the node key of the contact's device, the credential ID and secret, the expiry and
+an optional provider label of at most 64 bytes. It contains no provider trust; the
+contact still approves a trust policy with `hellas-cli trust` before running work.
 
 ```sh
-hellas-cli --identity operator.identity admin --profile operator.json export-bundle --allowance ALLOWANCE --grant-id GRANT --credential-scope friend-scope.json --label "Alice's node" --out friend.access
-hellas-cli --identity friend.identity offer import-bundle friend.access --name alice
+hellas-cli --identity node.identity --passkey operator.passkey admin --profile operator.json export-bundle --allowance ALLOWANCE_A --allowance ALLOWANCE_B --grant-id GRANT --credential-scope friend-scope.json --holder friend-holder.json --label "Alice's node" --out friend.access
+hellas-cli --identity friend.identity --passkey friend.passkey offer import-bundle friend.access --name alice
 ```
 
-`export-bundle` exports the allowance's offer (`work.offer.export`), then issues a
-credential bounded by the scope exactly as `issue-credential` does. `--grant-id`
-names the contact's existing grant for `work.execute` on that allowance; it is not
-the allowance ID. The bundle is canonical DAG-CBOR tagged `hellas.access-bundle.v1`,
-at most 257 KiB, and is written as a new private file that never replaces an
-existing one. If writing fails after issuance, the command reports the credential
-ID so it can be revoked. The secret is never printed.
+`export-bundle` takes `--allowance` once per shared allowance, at most 16. The
+credential scope must grant `work.execute` on each of them; `--grant-id` names the
+contact's existing grant with those permissions, not an allowance ID. It exports
+each allowance's offer (`work.offer.export`), then issues one credential bounded by
+the scope, held by the contact device named by `--holder`, exactly as
+`issue-credential` does. The bundle is canonical DAG-CBOR tagged
+`hellas.access-bundle.v2`. Its subject and holder carry their curve tags. It is
+written as a new private file that never replaces an existing one. If writing fails
+after issuance, the command reports the credential ID so it can be revoked. The
+secret is never printed.
 
 `offer import-bundle` accepts the received bundle file as it is; delete it after
-importing, since it holds the credential. It refuses a bundle whose subject is not the importing identity and
-verifies the offer's provider signature. It saves the offer under `--name`, as
-`offer import` does, and installs a remote-only Work profile (`profile.json` and a
-private `credential`) under `accesses/NAME` in this identity's data directory,
-refusing a non-empty directory. It prints the grant ID and the profile path; use
-that path as `--work-profile` together with `--offer NAME`.
+importing, since it holds the credential. It refuses a bundle whose subject is not
+the `--passkey` principal or whose holder is not this device's node key, and verifies
+each offer's provider signature. It saves each offer as `NAME.POLICY`, after the
+offer's first policy, as `offer import` does, and installs one remote-only Work
+profile (`profile.json` and a private `credential`) under `accesses/NAME` in the
+principal's data directory, refusing a non-empty directory. It prints each saved
+offer name with its grant ID, and the profile path; use that path as
+`--work-profile` together with `--offer NAME.POLICY`.
 
 ## Explicit offline initialization and recovery
 
 Stop the daemon before initializing or recovering its exclusively locked journal.
 Prepare `administrator.json` and `application-scope.json` as Auth `GrantSpec`
-values: the authority, identity subject, exact operation/resource pairs, validity,
-delegation depth and issuance ceiling. The application scope cannot exceed the
-administrator's rights. Initialization requires an empty journal and a new output
-file; ordinary daemon startup never creates authority or issues credentials.
+values: the authority, the administrator principal as subject, exact
+operation/resource pairs, validity, delegation depth and issuance ceiling. The
+application scope cannot exceed the administrator's rights. `--holder` names the
+device that will hold the initial credential. The administrator's `--passkey` must
+be given: it asserts the ownership digest, which commits to the root grant or
+expected revision, both specs and the holder, so nobody can initialize or recover an
+authority administered by someone else's passkey. Initialization requires an empty
+journal and a new output file; ordinary daemon startup never creates authority or
+issues credentials.
 
 Verify system UTC before starting the node. While running, the node refuses authority
 times more than one minute ahead of startup UTC plus monotonic elapsed time, so a
@@ -310,9 +349,14 @@ Work inspection and standing queries calculate current windows without writing c
 ticks. Existing spending and reservations are preserved.
 
 ```sh
-hellas-cli --identity node.identity admin bootstrap --journal state/provider --root-grant 01010101010101010101010101010101 --administrator administrator.json --credential-scope application-scope.json --credential-out operator.credential
-hellas-cli --identity node.identity admin recover --journal state/provider --expected-revision REVISION --administrator administrator.json --credential-scope application-scope.json --credential-out recovered.credential
+hellas-cli --identity node.identity --passkey operator.passkey admin bootstrap --journal state/provider --root-grant 01010101010101010101010101010101 --administrator administrator.json --credential-scope application-scope.json --holder holder.json --credential-out operator.credential
+hellas-cli --identity node.identity --passkey operator.passkey admin recover --journal state/provider --expected-revision REVISION --administrator administrator.json --credential-scope application-scope.json --holder holder.json --credential-out recovered.credential
 ```
+
+Bootstrap can also issue a bearer for an HTTP gateway: `--bearer-scope` names its
+`gateway.invoke` GrantSpec and `--bearer-out` a new private file. The
+administrator's passkey session on the new authority issues it, after the initial
+credential, as a separate credential.
 
 The credential output is private and published without overwriting an existing file,
 only after the authority commit is durable. If publication fails, the command reports
@@ -378,7 +422,18 @@ configured allowance with a `local` policy. It never creates an owner grant or
 changes the selected allowance's policy while opening the gateway.
 
 Cloud readiness uses `control-profile.json` in its private configuration directory
-through this same CLI path; that profile must also be explicitly provisioned.
+through this same CLI path; that profile must also be explicitly provisioned. Its
+credential is held by the worker's own node key, which opens a daily session.
+
+An owned machine belongs to a principal. `machines prepare` and cloud creation, run
+with `--passkey` and the operator's node identity, write a bootstrap naming the owner
+principal (`HELLAS_REMOTE_OWNER`) and the node key that administers it
+(`HELLAS_REMOTE_OWNER_NODE`). Each administration request carries the machine's
+secret and that node key's signature over a digest bound to its QUIC connection; the
+agent refuses any other node and refuses a restart that changes either binding. The
+owner's machine inventory is kept per principal. `gateway --machine` resolves the
+machine through this channel and opens the owner allowance of the `--passkey`
+principal on it.
 
 The daemon serves status, machine capacity, authority grants, credential
 issuance/revocation and Work allowance administration. Composed SDK hosts also
@@ -430,9 +485,10 @@ Approved manifest IDs remain attached to the client session. Refreshed standing 
 change a resource's current policy, but every new job must still use an approved
 execution manifest before its proposal or payload is sent. Review and approve a new
 contract explicitly, then restart the gateway to use the updated caller policy.
-Nix gateway services use `trustStore`, `trustPolicy` and `workProfile`, plus `offer`,
-`machine` or `local`/`localGrant`. Provision these private files for the service user
-before startup; Nix declarations do not approve trust or create grants.
+Nix gateway services use `trustStore`, `trustPolicy`, `workProfile` and the
+principal's `passkey` file, plus `offer`, `machine` or `local`/`localGrant`.
+Provision these private files for the service user before startup; Nix declarations
+do not approve trust or create grants.
 
 ## HTTP gateway authority
 
@@ -440,7 +496,8 @@ A standalone gateway requires `--gateway-profile FILE`, a private JSON file with
 `journal`, `authority`, `authorization`, and `credential` fields. `journal` names
 an explicitly bootstrapped local NodeStore; `authority` and `authorization` are its
 Auth AuthorityId and selected GrantId in their usual JSON forms. `credential` names
-the private 48-byte credential file written by `issue-credential` or bootstrap.
+the private 48-byte bearer credential file written by `issue-credential --holder`
+with the `"Bearer"` holder, or by bootstrap's `--bearer-out`.
 An optional `control` object with `socket`, `certificate` and `private_key` serves
 local HostControl on that writer. Credential issuance and revocation then work while
 the gateway runs, using the same `admin --profile ... --control-socket` commands
@@ -450,9 +507,10 @@ an embedded gateway receives its host's existing NodeCoordinator instead of open
 that journal again. Missing, mismatched or corrupt state fails startup.
 
 Provision a grant for `gateway.invoke` on the authority's host resource. Issue a
-credential to the issuer's own subject, scoped only to that permission, with no
-issuance ceiling or delegation. The selected grant must name the same subject and
-remain current. Administrator credentials are rejected as HTTP credentials.
+bearer credential scoped only to that permission, with no issuance ceiling or
+delegation. The selected grant must name the same subject and remain current.
+Device-held and administrator credentials are rejected as HTTP credentials; the
+bootstrap credential is never the bearer.
 Existing offline bootstrap and checked `issue-credential` commands own provisioning;
 starting a listener does not create authority or credentials.
 
