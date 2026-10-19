@@ -5,8 +5,9 @@ use crate::{
 };
 use anyhow::{Context, Result, ensure};
 use hellas_auth::authority::{
-    AdministrationCommand, AdministrationRecord, CredentialCommand, CredentialId, CredentialSecret,
-    GrantCommand, GrantId, GrantSpec, Revision,
+    AdministrationCommand, AdministrationRecord, CredentialCommand, CredentialHolder, CredentialId,
+    CredentialSecret, GrantCommand, GrantId, GrantSpec, Ownership, Revision,
+    ownership_digest,
 };
 use hellas_rpc::{
     pb::host::{
@@ -19,7 +20,10 @@ use hellas_rpc::{
 use hellas_sdk::{
     access_bundle::{AccessBundle, MAX_LABEL_BYTES},
     node_control::{self, profile},
-    work::work_store::grant::NodeStore,
+    work::{
+        node::{SessionKey, passkey_assertion},
+        work_store::grant::{NodeStore, OwnerApproval},
+    },
 };
 use hellas_wire::{ServiceMarker, StreamTransport};
 use hellas_work::model::grant::admin::{MAX_ADMIN_BYTES, WorkControlCommand, WorkControlReply};
@@ -33,6 +37,11 @@ fn read<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
 }
 
 pub async fn run(args: AdminArgs, identity: &LocalIdentity) -> Result<()> {
+    let passkey = args
+        .passkey
+        .as_deref()
+        .map(crate::commands::chain::passkey)
+        .transpose()?;
     match &args.command {
         AdminCommand::Bootstrap { .. } | AdminCommand::Recover { .. } => {
             ensure!(
@@ -42,10 +51,15 @@ pub async fn run(args: AdminArgs, identity: &LocalIdentity) -> Result<()> {
                     && args.addresses.is_empty(),
                 "offline initialization does not connect to a daemon"
             );
-            return offline(args.command, identity).await;
+            let passkey = passkey.context("offline initialization requires --passkey")?;
+            return offline(args.command, identity, &passkey).await;
         }
         _ => {}
     }
+    let key = passkey.as_ref().map_or(
+        SessionKey::Node(&identity.producer_key),
+        SessionKey::Passkey,
+    );
     let profile =
         profile::ClientProfile::load(args.profile.as_deref().context("--profile is required")?)?;
     if let Some(contact) = args.node_contact {
@@ -73,13 +87,9 @@ pub async fn run(args: AdminArgs, identity: &LocalIdentity) -> Result<()> {
                 ),
             )
             .await??;
-            let client = node_control::connect_iroh(
-                connection,
-                profile.authority,
-                &profile.credential,
-                &identity.producer_key,
-            )
-            .await?;
+            let client =
+                node_control::connect_iroh(connection, profile.authority, &profile.credential, key)
+                    .await?;
             command(args.command, client, profile.authorization).await
         }
         .await;
@@ -99,7 +109,7 @@ pub async fn run(args: AdminArgs, identity: &LocalIdentity) -> Result<()> {
             server_name,
             profile.authority,
             &profile.credential,
-            &identity.producer_key,
+            key,
         )
         .await?;
         command(args.command, client, profile.authorization).await
@@ -183,11 +193,13 @@ where
         }
         AdminCommand::IssueCredential {
             scope,
+            holder,
             credential_out,
         } => {
             let scope: GrantSpec = read(&scope)?;
+            let holder: CredentialHolder = read(&holder)?;
             let output = credential_output(&credential_out)?;
-            let secret = issue(&client, authorization, &scope).await?;
+            let secret = issue(&client, authorization, &scope, holder).await?;
             let id = hex::encode(secret.id().0);
             profile::save_credential(output, &credential_out, &secret).with_context(|| {
                 format!(
@@ -209,6 +221,7 @@ where
             allowance,
             grant_id,
             credential_scope,
+            holder,
             label,
             out,
         } => {
@@ -226,6 +239,7 @@ where
                 .parse()
                 .context("grant ID must be 16 bytes of hex")?;
             let scope: GrantSpec = read(&credential_scope)?;
+            let holder: CredentialHolder = read(&holder)?;
             let offers = WorkControlCommand::Offers {
                 id: Some(allowance),
             };
@@ -236,7 +250,7 @@ where
             let Ok([offer]) = <[_; 1]>::try_from(offers) else {
                 anyhow::bail!("one active offer required")
             };
-            let credential = issue(&client, authorization, &scope).await?;
+            let credential = issue(&client, authorization, &scope, holder).await?;
             let id = hex::encode(credential.id().0);
             let bundle = AccessBundle {
                 offer,
@@ -313,6 +327,7 @@ async fn issue<T>(
     client: &HostControlClientImpl<T>,
     authorization: GrantId,
     scope: &GrantSpec,
+    holder: CredentialHolder,
 ) -> Result<CredentialSecret>
 where
     T: StreamTransport + Send + Sync,
@@ -322,6 +337,7 @@ where
         .issue_credential(IssueCredentialRequest {
             authorization: authorization.0.to_vec(),
             scope: canonical_dag_cbor(scope)?,
+            holder: canonical_dag_cbor(&holder)?,
         })
         .await?;
     ensure!(
@@ -341,6 +357,7 @@ where
         *returned_authorization == authorization
             && credential.id() == secret.id()
             && credential.scope() == scope
+            && credential.holder() == holder
             && credential.revision() == Revision(1)
             && !credential.revoked(),
         "credential issuance reply differs from request"
@@ -370,7 +387,11 @@ where
     Ok(decode_dag_cbor(&response.reply)?)
 }
 
-async fn offline(command: AdminCommand, identity: &LocalIdentity) -> Result<()> {
+async fn offline(
+    command: AdminCommand,
+    identity: &LocalIdentity,
+    passkey: &hellas_kernel::SoftPasskey,
+) -> Result<()> {
     let (state, root, revision) = match command {
         AdminCommand::Bootstrap { root_grant, state } => {
             let id: GrantId = root_grant
@@ -388,23 +409,38 @@ async fn offline(command: AdminCommand, identity: &LocalIdentity) -> Result<()> 
         journal,
         administrator,
         credential_scope,
+        holder,
         credential_out,
     } = state;
     let administrator: GrantSpec = read(&administrator)?;
     let scope: GrantSpec = read(&credential_scope)?;
+    let CredentialHolder::Node(holder) = read(&holder)? else {
+        anyhow::bail!("the initial credential must be held by a device");
+    };
     let subject = scope.subject;
     let authority = scope.authority;
     let output = credential_output(&credential_out)?;
     let now = hellas_auth::authority::UnixMillis::now().unwrap_or_default();
     let network = hellas_work::model::grant::grant_network();
+    let approve = |ownership| -> Result<OwnerApproval> {
+        let digest = ownership_digest(ownership, &administrator, &scope, holder);
+        let envelope = passkey
+            .sign(hellas_kernel::PayloadHash::from_bytes(*digest.as_bytes()))
+            .map_err(|error| anyhow::anyhow!("passkey signing failed: {error:?}"))?;
+        Ok(OwnerApproval {
+            administrator: administrator.clone(),
+            credential: scope.clone(),
+            holder,
+            assertion: passkey_assertion(&envelope)?,
+        })
+    };
     let secret = match (root, revision) {
         (Some(root), None) => {
             let (store, secret) = NodeStore::bootstrap(
                 &journal,
                 network,
                 root,
-                administrator,
-                scope,
+                approve(Ownership::Bootstrap { root })?,
                 Some(identity.enrollment.clone()),
                 now,
             )
@@ -412,10 +448,16 @@ async fn offline(command: AdminCommand, identity: &LocalIdentity) -> Result<()> 
             drop(store);
             secret
         }
-        (None, Some(revision)) => {
-            NodeStore::recover_offline(&journal, network, revision, administrator, scope, now)
-                .await?
-                .1
+        (None, Some(expected)) => {
+            NodeStore::recover_offline(
+                &journal,
+                network,
+                expected,
+                approve(Ownership::Recover { expected })?,
+                now,
+            )
+            .await?
+            .1
         }
         _ => anyhow::bail!("invalid offline operation"),
     };

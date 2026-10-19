@@ -21,6 +21,12 @@ pub struct AdminArgs {
         requires = "node_contact"
     )]
     pub addresses: Vec<std::net::SocketAddr>,
+    /// The administrator's software passkey: a file of 32 raw bytes or 64 hex
+    /// digits. With it the session is a passkey session, which step-up
+    /// operations require; without it this identity's node key proves a daily
+    /// session. Offline initialization and recovery require it.
+    #[arg(long, global = true)]
+    pub passkey: Option<PathBuf>,
     #[command(subcommand)]
     pub command: AdminCommand,
 }
@@ -36,6 +42,10 @@ pub struct OfflineArgs {
     /// JSON GrantSpec bounding the initial application credential.
     #[arg(long)]
     pub credential_scope: PathBuf,
+    /// JSON CredentialHolder naming the node key of the device that will
+    /// hold the initial credential.
+    #[arg(long)]
+    pub holder: PathBuf,
     /// New private credential file, published only after durable initialization.
     #[arg(long)]
     pub credential_out: PathBuf,
@@ -67,6 +77,9 @@ pub enum AdminCommand {
     IssueCredential {
         #[arg(long)]
         scope: PathBuf,
+        /// JSON CredentialHolder: the holding device's node key, or a bearer.
+        #[arg(long)]
+        holder: PathBuf,
         /// New private output file; the secret is never printed.
         #[arg(long)]
         credential_out: PathBuf,
@@ -96,6 +109,9 @@ pub enum AdminCommand {
         /// JSON GrantSpec bounding the contact's credential.
         #[arg(long)]
         credential_scope: PathBuf,
+        /// JSON CredentialHolder naming the contact device's node key.
+        #[arg(long)]
+        holder: PathBuf,
         /// Provider display name shown to the contact.
         #[arg(long)]
         label: Option<String>,

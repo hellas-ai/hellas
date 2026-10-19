@@ -12,6 +12,7 @@ use hellas_kernel::{
     Terms, Tx,
 };
 
+pub(crate) use self::signer::passkey;
 use self::signer::{AuthScheme, DevSigner};
 use crate::commands::CliResult;
 
@@ -925,6 +926,12 @@ mod signer {
     pub(crate) enum DevSigner {
         Webauthn(SoftPasskey),
         Native(Secp256k1Signer),
+    }
+
+    /// Loads a software passkey from a 32-byte P-256 scalar file.
+    pub(crate) fn passkey(path: &Path) -> Result<SoftPasskey> {
+        SoftPasskey::from_secret_scalar(read_scalar(path)?)
+            .map_err(|_| anyhow!("P-256 key file contains an invalid secret scalar"))
     }
 
     impl DevSigner {

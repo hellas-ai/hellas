@@ -73,6 +73,7 @@ pub async fn prepare(
         addresses: vec![],
     }
     .discover(
+        principal,
         &signer,
         &transport,
         &trust,
@@ -83,6 +84,7 @@ pub async fn prepare(
     Ok((
         GrantSessionOptions {
             target,
+            principal,
             signer,
             application,
             journal_root: crate::commands::contributions::client_journal_root(&principal)?,

@@ -3,7 +3,7 @@ use super::{CliResult, read_bounded_regular_file};
 use anyhow::ensure;
 use hellas_auth::authority::{PrincipalId, UnixMillis};
 use hellas_work::model::grant::records::*;
-use hellas_work::model::grant::records::{decode_contact, principal_id, verify_contact};
+use hellas_work::model::grant::records::{decode_contact, verify_contact};
 use std::{
     io::Write,
     path::{Path, PathBuf},
@@ -114,11 +114,7 @@ pub fn contact(
                 );
             }
             save(&path, &bytes)?;
-            println!("{}", hex::encode(principal_id(&imported)?.as_bytes()));
-            eprintln!(
-                "Identity fingerprint: {}",
-                principal_id(&imported)?.fingerprint()
-            );
+            println!("{}", hex::encode(imported.content_id().as_bytes()));
         }
     }
     Ok(())
@@ -233,23 +229,6 @@ mod tests {
         .unwrap();
         let bytes = std::fs::read(&out).unwrap();
         assert_eq!(decode_contact(&bytes).unwrap(), identity.enrollment);
-        let mut device = identity.enrollment.clone();
-        device.genesis.statement.transport_public_key = hellas_auth::PublicKey::Ed25519([37; 32]);
-        // The test identity's software root is separate from its producer, so use
-        // that producer as this second device's explicit software root too.
-        device.genesis.statement.root_public_key = identity.producer_key.public_key();
-        device.genesis.root_proof = hellas_rpc::RootProof::Software(
-            identity
-                .producer_key
-                .sign_digest(hellas_auth::Digest::hash(
-                    &device.genesis.statement.canonical_bytes(),
-                ))
-                .unwrap(),
-        );
-        assert_eq!(
-            data_root(&principal_id(&device).unwrap()).unwrap(),
-            data_root(&principal(&identity).unwrap()).unwrap()
-        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

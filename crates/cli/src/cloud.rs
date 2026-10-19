@@ -74,6 +74,7 @@ pub(super) async fn machine_target(
         .await?;
     let result = target
         .discover(
+            owner,
             &identity.producer_key,
             &hellas_sdk::grant_client::GrantTransport::Remote(endpoint.clone()),
             trust,

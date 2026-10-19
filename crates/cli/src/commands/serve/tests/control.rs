@@ -14,9 +14,32 @@ const READER_GRANT: auth::GrantId = ids::FRIEND_GRANT;
 type Control =
     hellas_rpc::services::host_control::HostControlClientImpl<hellas_sdk::wire::mux::MuxTransport>;
 
+/// A software passkey file and the principal it controls.
+fn passkey(root: &Path, name: &str, scalar: u8) -> (PathBuf, auth::PrincipalId) {
+    let path = root.join(name);
+    hellas_private::write_atomically(&path, ".writing", &[scalar; 32]).unwrap();
+    let passkey = hellas_kernel::SoftPasskey::from_secret_scalar([scalar; 32]).unwrap();
+    let principal = auth::PrincipalId::from_public_key(hellas_auth::PublicKey::P256(
+        passkey.party_key().to_bytes(),
+    ))
+    .unwrap();
+    (path, principal)
+}
+/// A JSON CredentialHolder naming `identity`'s node key.
+fn holder(root: &Path, name: &str, identity: &LocalIdentity) -> PathBuf {
+    let path = root.join(name);
+    let holder = auth::CredentialHolder::Node(
+        auth::NodeKey::from_public_key(identity.producer_key.public_key()).unwrap(),
+    );
+    std::fs::write(&path, serde_json::to_vec(&holder).unwrap()).unwrap();
+    path
+}
+
 struct Daemon {
     root: tempfile::TempDir,
     identity: LocalIdentity,
+    passkey: PathBuf,
+    admin_holder: PathBuf,
     provider_identity: LocalIdentity,
     wrong_identity: LocalIdentity,
     scope: auth::GrantSpec,
@@ -27,12 +50,13 @@ struct Daemon {
     journal: PathBuf,
     handle: Option<node_control::host::HostHandle>,
 }
-fn offline_args(command: AdminCommand) -> AdminArgs {
+fn offline_args(command: AdminCommand, passkey: Option<&Path>) -> AdminArgs {
     AdminArgs {
         profile: None,
         control_socket: None,
         node_contact: None,
         addresses: vec![],
+        passkey: passkey.map(Path::to_owned),
         command,
     }
 }
@@ -55,9 +79,11 @@ impl Daemon {
         let authority = auth::AuthorityId(Digest::hash(b"daemon control fixture"));
         let root_grant = ROOT_GRANT;
         let now = hellas_auth::authority::UnixMillis::now().unwrap_or_default();
+        let (passkey, owner) = self::passkey(root.path(), "admin.passkey", 0x31);
+        let admin_holder = holder(root.path(), "admin-holder.json", &identity);
         let scope = common_node::admin_spec(
             authority,
-            auth::PrincipalId::from_public_key(identity.producer_key.public_key()).unwrap(),
+            owner,
             &[
                 (HOST_STATUS, host_resource(authority)),
                 (WORK_CAPACITY_CONFIGURE, machine_resource(authority)),
@@ -84,13 +110,17 @@ impl Daemon {
             journal: grant_config.journal_root.clone(),
             administrator: scope_file.clone(),
             credential_scope: scope_file.clone(),
+            holder: admin_holder.clone(),
             credential_out: credential_file.clone(),
         };
         run(
-            offline_args(AdminCommand::Bootstrap {
-                root_grant: hex::encode(root_grant.0),
-                state: offline(),
-            }),
+            offline_args(
+                AdminCommand::Bootstrap {
+                    root_grant: hex::encode(root_grant.0),
+                    state: offline(),
+                },
+                Some(&passkey),
+            ),
             &provider_identity,
         )
         .await
@@ -149,6 +179,8 @@ impl Daemon {
         Self {
             root,
             identity,
+            passkey,
+            admin_holder,
             provider_identity,
             wrong_identity,
             scope,
@@ -160,14 +192,27 @@ impl Daemon {
             handle: Some(daemon),
         }
     }
+    /// The administrator's passkey session over the local socket.
     fn local(&self, command: AdminCommand) -> AdminArgs {
         AdminArgs {
             profile: Some(self.profile_path.clone()),
             control_socket: Some(self.socket.clone()),
-            ..offline_args(command)
+            ..offline_args(command, Some(&self.passkey))
         }
     }
-    fn remote(&self, profile: PathBuf, command: AdminCommand) -> AdminArgs {
+    /// A daily session over the local socket, by whichever identity runs it.
+    fn local_daily(&self, command: AdminCommand) -> AdminArgs {
+        AdminArgs {
+            passkey: None,
+            ..self.local(command)
+        }
+    }
+    fn remote(
+        &self,
+        profile: PathBuf,
+        command: AdminCommand,
+        passkey: Option<&Path>,
+    ) -> AdminArgs {
         let contact = self.root.path().join("node.contact");
         std::fs::write(
             &contact,
@@ -186,7 +231,7 @@ impl Daemon {
                 .as_ref()
                 .unwrap()
                 .bound_sockets(),
-            ..offline_args(command)
+            ..offline_args(command, passkey)
         }
     }
     async fn client(&self) -> Control {
@@ -198,16 +243,14 @@ impl Daemon {
             name,
             profile.authority,
             &profile.credential,
-            &self.identity.producer_key,
+            hellas_sdk::work::node::SessionKey::Node(&self.identity.producer_key),
         )
         .await
         .unwrap()
     }
     fn reader_scope(&self) -> PathBuf {
         let mut scope = self.scope.clone();
-        scope.subject =
-            auth::PrincipalId::from_public_key(self.wrong_identity.producer_key.public_key())
-                .unwrap();
+        scope.subject = passkey(self.root.path(), "reader.passkey", 0x32).1;
         scope.issuance = None;
         scope
             .permissions
@@ -219,6 +262,7 @@ impl Daemon {
     fn issue_reader_command(&self) -> AdminCommand {
         AdminCommand::IssueCredential {
             scope: self.reader_scope(),
+            holder: holder(self.root.path(), "reader-holder.json", &self.wrong_identity),
             credential_out: self.root.path().join("reader.credential"),
         }
     }
@@ -242,7 +286,11 @@ impl Daemon {
         .await
         .unwrap();
         run(
-            self.remote(self.profile_path.clone(), self.issue_reader_command()),
+            self.remote(
+                self.profile_path.clone(),
+                self.issue_reader_command(),
+                Some(&self.passkey),
+            ),
             &self.identity,
         )
         .await
@@ -302,7 +350,7 @@ fn assert_permission_denied(error: anyhow::Error) {
 #[tokio::test]
 async fn online_admin_requires_an_explicit_profile() {
     let mut daemon = Daemon::start().await;
-    let error = run(offline_args(AdminCommand::Status), &daemon.identity)
+    let error = run(offline_args(AdminCommand::Status, None), &daemon.identity)
         .await
         .unwrap_err();
     assert_eq!(error.to_string(), "--profile is required");
@@ -352,11 +400,15 @@ async fn local_capacity_command_reaches_the_running_host() {
 #[tokio::test]
 async fn local_profile_requires_its_own_identity() {
     let mut daemon = Daemon::start().await;
+    // A daily session needs the node key the credential is bound to.
     assert_permission_denied(
-        run(daemon.local(AdminCommand::Status), &daemon.wrong_identity)
+        run(daemon.local_daily(AdminCommand::Status), &daemon.wrong_identity)
             .await
             .unwrap_err(),
     );
+    run(daemon.local_daily(AdminCommand::Status), &daemon.identity)
+        .await
+        .unwrap();
     daemon.stop().await;
 }
 
@@ -398,7 +450,7 @@ async fn issued_credential_is_private_and_revocation_reaches_remote_authenticati
         hellas_private::is_private(&std::fs::File::open(&reader.credential_path).unwrap()).unwrap()
     );
     run(
-        daemon.remote(reader.profile.clone(), AdminCommand::Status),
+        daemon.remote(reader.profile.clone(), AdminCommand::Status, None),
         &daemon.wrong_identity,
     )
     .await
@@ -414,7 +466,7 @@ async fn issued_credential_is_private_and_revocation_reaches_remote_authenticati
     .unwrap();
     assert_permission_denied(
         run(
-            daemon.remote(reader.profile, AdminCommand::Status),
+            daemon.remote(reader.profile, AdminCommand::Status, None),
             &daemon.wrong_identity,
         )
         .await
@@ -432,29 +484,41 @@ async fn offline_recovery_publishes_a_usable_replacement_credential() {
     drop(store);
     let recovered_path = daemon.root.path().join("recovered.credential");
     run(
-        offline_args(AdminCommand::Recover {
-            expected_revision,
-            state: OfflineArgs {
-                journal: daemon.journal.clone(),
-                administrator: daemon.scope_file.clone(),
-                credential_scope: daemon.scope_file.clone(),
-                credential_out: recovered_path.clone(),
+        offline_args(
+            AdminCommand::Recover {
+                expected_revision,
+                state: OfflineArgs {
+                    journal: daemon.journal.clone(),
+                    administrator: daemon.scope_file.clone(),
+                    credential_scope: daemon.scope_file.clone(),
+                    holder: daemon.admin_holder.clone(),
+                    credential_out: recovered_path.clone(),
+                },
             },
-        }),
+            Some(&daemon.passkey),
+        ),
         &daemon.identity,
     )
     .await
     .unwrap();
     let store = daemon.store().await;
     let authority = store.state().authority();
+    let daily = |secret: &auth::CredentialSecret| {
+        let now = auth::UnixMillis::now().unwrap_or_default();
+        let binding = Digest::hash(b"recovery check");
+        let pending = authority.begin_authentication(binding, now)?;
+        let proof = pending.challenge().sign_daily(
+            authority.authority(),
+            binding,
+            secret.id(),
+            &daemon.identity.producer_key,
+        )?;
+        pending
+            .complete(authority, binding, secret, &proof, now)
+            .map(auth::AuthenticatedSession::into_caller)
+    };
     let original = node_control::profile::read_credential(&daemon.credential_file).unwrap();
-    hellas_auth::assert_err!(
-        authority.authenticate(&original, auth::UnixMillis::now().unwrap_or_default()),
-        auth::AuthorityError::Credential
-    );
+    hellas_auth::assert_err!(daily(&original), auth::AuthorityError::Credential);
     let replacement = node_control::profile::read_credential(&recovered_path).unwrap();
-    let caller = authority
-        .authenticate(&replacement, auth::UnixMillis::now().unwrap_or_default())
-        .unwrap();
-    assert_eq!(caller.subject(), daemon.scope.subject);
+    assert_eq!(daily(&replacement).unwrap().subject(), daemon.scope.subject);
 }

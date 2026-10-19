@@ -14,6 +14,7 @@ pub fn session(
     let client = super::contributions::principal(identity)?;
     Ok(GrantSessionOptions {
         target,
+        principal: client,
         signer: Arc::new(identity.producer_key.clone()),
         application,
         journal_root: super::contributions::client_journal_root(&client)?,
