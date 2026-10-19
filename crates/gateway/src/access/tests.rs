@@ -263,3 +263,76 @@ async fn administrator_credentials_cannot_be_exposed_as_http_bearers() {
         hellas_work::work_store::grant::NodeStoreError::Authority(AuthorityError::Denied)
     );
 }
+
+#[tokio::test]
+async fn each_principal_is_admitted_under_its_own_grant() {
+    use hellas_work::test_support::actors::{FRIEND, STRANGER};
+    let fixture = Fixture::new().await;
+    let node = &fixture.access.node;
+    let caller = hellas_work::test_support::session(node, &fixture.admin).await;
+    let authority = caller.authority();
+    let scope = |actor| {
+        Rights::new(authority, actor)
+            .allow(GATEWAY_INVOKE, host_resource(authority))
+            .valid_from(UnixMillis(1000))
+            .valid_until(UnixMillis(90_000))
+            .build()
+    };
+    let bearer = async |actor| {
+        let (_, credential) = node
+            .issue_credential(&caller, ROOT_GRANT, scope(actor), CredentialHolder::Bearer)
+            .await
+            .unwrap();
+        format!(
+            "Bearer {}{}",
+            credential.id(),
+            hellas_rpc::provenance::encode_hex(credential.expose_secret())
+        )
+    };
+    let friend_grant = GrantId([105; 16]);
+    let issued = node
+        .grant(
+            &caller,
+            GrantCommand::Issue {
+                authorization: ROOT_GRANT,
+                id: friend_grant,
+                spec: scope(FRIEND),
+            },
+        )
+        .await
+        .unwrap();
+    let app = router(fixture.access.clone());
+    let friend = bearer(FRIEND).await;
+    // A bearer whose subject holds no gateway.invoke grant is refused.
+    let stranger = bearer(STRANGER).await;
+    assert_eq!(status(&app, Some(&friend)).await, StatusCode::OK);
+    assert_eq!(
+        status(&app, Some(&stranger)).await,
+        StatusCode::UNAUTHORIZED
+    );
+    // A device-held credential never authenticates by its secret.
+    let (_, held) = node
+        .issue_credential(&caller, ROOT_GRANT, scope(FRIEND), FRIEND.holder())
+        .await
+        .unwrap();
+    let held = format!(
+        "Bearer {}{}",
+        held.id(),
+        hellas_rpc::provenance::encode_hex(held.expose_secret())
+    );
+    assert_eq!(status(&app, Some(&held)).await, StatusCode::UNAUTHORIZED);
+    node.grant(
+        &caller,
+        GrantCommand::Revoke {
+            authorization: ROOT_GRANT,
+            id: friend_grant,
+            expected: issued.revision(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(status(&app, Some(&friend)).await, StatusCode::UNAUTHORIZED);
+    // The gateway's own bearer is unaffected.
+    let own = format!("Bearer {}", fixture.access.bearer());
+    assert_eq!(status(&app, Some(&own)).await, StatusCode::OK);
+}

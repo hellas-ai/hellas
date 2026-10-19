@@ -249,6 +249,24 @@ impl AuthorityState {
             .collect())
     }
 
+    /// The first live grant to `actor` whose only permission is `permission`.
+    pub fn grant_for(
+        &self,
+        actor: PrincipalId,
+        permission: &Permission,
+        now: UnixMillis,
+    ) -> Option<GrantId> {
+        self.grants
+            .iter()
+            .filter(|(_, grant)| {
+                grant.spec.subject == actor
+                    && grant.spec.permissions.len() == 1
+                    && grant.spec.permissions.contains(permission)
+            })
+            .map(|(id, _)| *id)
+            .find(|id| self.live_lineage(*id, now).is_ok())
+    }
+
     pub fn issue(
         &mut self,
         actor: PrincipalId,

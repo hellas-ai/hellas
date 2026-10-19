@@ -77,6 +77,26 @@ impl NodeCoordinator {
         .await
     }
 
+    /// HTTP admission of a bearer credential under its own subject's current
+    /// grant of `gateway.invoke` alone, so several principals can share one
+    /// gateway. An administrative grant never admits HTTP requests.
+    pub async fn authorize_gateway_bearer(
+        &self,
+        caller: &AuthenticatedCaller,
+    ) -> Result<GrantId, NodeStoreError> {
+        let grant = {
+            let (store, now) = self.lock().await?;
+            let authority = store.state().authority();
+            let permission =
+                Operation::named(GATEWAY_INVOKE)?.permission(authority.authority(), None)?;
+            authority
+                .grant_for(caller.subject(), &permission, now)
+                .ok_or(AuthorityError::Denied)?
+        };
+        self.authorize_gateway(caller, grant).await?;
+        Ok(grant)
+    }
+
     /// Bind the provider of an authority bootstrapped without one. The root proof
     /// is verified offline; an identical retry succeeds without a new record.
     /// Binding a provider is a step-up operation: only a passkey session may.

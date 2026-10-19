@@ -13,8 +13,10 @@ use std::{
 };
 use tower::{Layer, Service};
 
-/// A provisioned bearer credential scoped to gateway.invoke. The host owns
-/// the authority writer; starting a listener never creates grants or credentials.
+/// A provisioned bearer credential scoped to gateway.invoke, authorized by
+/// `authorization`. HTTP requests present any bearer whose subject holds a
+/// current gateway.invoke grant on this authority. The host owns the authority
+/// writer; starting a listener never creates grants or credentials.
 #[derive(Clone)]
 pub struct GatewayAccess {
     node: NodeCoordinator,
@@ -40,8 +42,11 @@ impl GatewayAccess {
         self.node.shares_writer(node)
     }
 
+    /// The gateway's own credential, under its configured grant.
     pub async fn validate(&self) -> crate::GatewayResult<()> {
-        self.authenticate(&self.credential)
+        let caller = self.node.authenticate(&self.credential).await?;
+        self.node
+            .authorize_gateway(&caller, self.authorization)
             .await
             .map_err(Into::into)
     }
@@ -51,9 +56,7 @@ impl GatewayAccess {
         credential: &CredentialSecret,
     ) -> Result<(), hellas_work::work_store::grant::NodeStoreError> {
         let caller = self.node.authenticate(credential).await?;
-        self.node
-            .authorize_gateway(&caller, self.authorization)
-            .await
+        self.node.authorize_gateway_bearer(&caller).await.map(drop)
     }
 
     /// Secret material for an explicitly authorized control response or child.
