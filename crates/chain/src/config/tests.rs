@@ -23,6 +23,7 @@ fn config_with_genesis(address: String) -> ValidatorConfig {
         metrics_port: None,
         light_client_bind: None,
         chain_sync_bind: None,
+        archive_blocks: None,
         relay_urls: Vec::new(),
         genesis: Genesis {
             schema_version: crate::genesis::GENESIS_SCHEMA_VERSION,

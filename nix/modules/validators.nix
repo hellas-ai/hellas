@@ -67,6 +67,9 @@ let
       );
       lightClientFlag = optionalString validator.lightClientRpc.enable "--light-client-bind ${escapeShellArg (bindFor validator.lightClientRpc index)}";
       chainSyncFlag = optionalString validator.chainSync.enable "--chain-sync-bind ${escapeShellArg (bindFor validator.chainSync index)}";
+      archiveFlag = optionalString (
+        validator.archiveBlocks != null
+      ) "--archive-blocks ${toString validator.archiveBlocks}";
     in
     pkgs.runCommand "hellas-validator-${toString index}.toml" { } ''
       ${cli} chain validator config \
@@ -79,6 +82,7 @@ let
         --metrics-port ${toString (validator.metricsBasePort + index)} \
         ${lightClientFlag} \
         ${chainSyncFlag} \
+        ${archiveFlag} \
         ${genesisFlag} \
         ${allocationFlags} \
         > "$out"
@@ -179,6 +183,17 @@ let
             default = false;
             description = "Open the generated ChainSync UDP ports on the wg0 firewall interface.";
           };
+        };
+        archiveBlocks = mkOption {
+          type = types.nullOr types.ints.positive;
+          default = null;
+          example = 1500000;
+          description = ''
+            Finalized blocks each validator's block and certificate archives
+            retain. Null keeps the complete archive, whose memory, open files
+            and disk grow with every block; full history then has to come
+            from an indexer that keeps its own archive.
+          '';
         };
         seed = mkOption {
           type = types.nullOr types.ints.unsigned;

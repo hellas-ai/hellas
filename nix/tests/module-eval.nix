@@ -200,6 +200,7 @@ let
       basePort = 31346;
       openFirewall = true;
     };
+    archiveBlocks = 1500000;
   };
   loopbackValidators = evalValidators {
     nodes = 1;
@@ -1054,6 +1055,7 @@ in
       ${pkgs.gnugrep}/bin/grep -Fx -- '--metrics-port=9092' "$config2"
       ${pkgs.gnugrep}/bin/grep -Fx -- '--light-client-bind=0.0.0.0:31248' "$config2"
       ${pkgs.gnugrep}/bin/grep -Fx -- '--chain-sync-bind=10.100.0.10:31348' "$config2"
+      ${pkgs.gnugrep}/bin/grep -Fx -- '--archive-blocks=1500000' "$config2"
 
       ${pkgs.gnugrep}/bin/grep -Fx -- '--validator=3' "$config3"
       ${pkgs.gnugrep}/bin/grep -Fx -- '--light-client-bind=0.0.0.0:31249' "$config3"
@@ -1067,6 +1069,7 @@ in
       ! ${pkgs.gnugrep}/bin/grep -F -- '--light-client-bind' "$disabled_config"
       ! ${pkgs.gnugrep}/bin/grep -F -- '--chain-sync-bind' "$disabled_config"
       ! ${pkgs.gnugrep}/bin/grep -F -- '--chain-sync-bind' "$loopback_config"
+      ! ${pkgs.gnugrep}/bin/grep -F -- '--archive-blocks' "$disabled_config"
 
       touch "$out"
     '';

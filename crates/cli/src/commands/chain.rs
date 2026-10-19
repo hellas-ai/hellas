@@ -288,6 +288,9 @@ pub enum ValidatorCommand {
         /// ChainSync (Iroh) bind address for full nodes and indexers
         #[arg(long)]
         chain_sync_bind: Option<std::net::SocketAddr>,
+        /// Retain only the last N finalized blocks; the default keeps the complete archive
+        #[arg(long)]
+        archive_blocks: Option<std::num::NonZeroU64>,
         /// Canonical genesis JSON; validator identities must match --seed
         #[arg(long)]
         genesis: Option<PathBuf>,
@@ -815,6 +818,7 @@ async fn run_validator(command: ValidatorCommand) -> CliResult {
             metrics_port,
             light_client_bind,
             chain_sync_bind,
+            archive_blocks,
             genesis,
             genesis_allocations,
         } => hellas_chain::validator::Command::Config {
@@ -827,6 +831,7 @@ async fn run_validator(command: ValidatorCommand) -> CliResult {
             metrics_port,
             light_client_bind,
             chain_sync_bind,
+            archive_blocks,
             genesis,
             genesis_allocations,
         },
