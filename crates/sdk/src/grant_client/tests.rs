@@ -144,6 +144,7 @@ impl Fixture {
     fn options(&self) -> GrantSessionOptions {
         GrantSessionOptions {
             target: pinned_offer(definition(GrantId([1; 16]), principal(1).0), vec![]),
+            principal: principal(1).0,
             signer: Arc::new(principal(1).1),
             application: self.application.clone(),
             journal_root: self.root.path().join("client"),
@@ -257,7 +258,10 @@ async fn lost_acceptance_recovers_from_metadata_without_replaying_input() {
             let caller = f
                 .service
                 .node()
-                .authenticate_signed(&f.application.credential, &principal(1).1)
+                .authenticate_session(
+                    &f.application.credential,
+                    hellas_work::node::SessionKey::Node(&principal(1).1),
+                )
                 .await
                 .unwrap();
             let response = f

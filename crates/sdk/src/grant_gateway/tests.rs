@@ -163,7 +163,7 @@ impl Fixture {
         )
         .unwrap()
         .execute(
-            &self.host.world.caller(ROOT).await,
+            &self.host.world.administrator(ROOT).await,
             ids::ROOT_GRANT,
             command,
         )
@@ -394,7 +394,7 @@ async fn revoked_credentials_close_cached_sessions_before_refusing_reconnection(
     // Opening the grant gateway already authenticated and cached its Work session.
     let node = fixture.host.world.service.node();
     node.revoke_credential(
-        &fixture.host.world.caller(ROOT).await,
+        &fixture.host.world.administrator(ROOT).await,
         ids::ROOT_GRANT,
         fixture.host.application.credential.id(),
         hellas_auth::authority::Revision(1),

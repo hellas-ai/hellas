@@ -42,9 +42,9 @@ async fn local_tls_requires_pinned_application_authentication() {
             authority()
         };
         let identity = if matches!(bad, Attack::Identity) {
-            OPERATOR.key()
+            OPERATOR.passkey()
         } else {
-            ROOT.key()
+            ROOT.passkey()
         };
         hellas_work::test_support::assert_err!(connect_local(
                 &socket,
@@ -52,7 +52,7 @@ async fn local_tls_requires_pinned_application_authentication() {
                 "localhost".try_into().unwrap(),
                 expected,
                 &f.secret,
-                &identity,
+                hellas_work::node::SessionKey::Passkey(&identity),
             )
             .await, status if status.code() == WireCode::PermissionDenied);
         listener.shutdown().await.unwrap();
@@ -74,16 +74,21 @@ async fn local_control_matches_remote_authority_decisions() {
         "localhost".try_into().unwrap(),
         authority(),
         &f.secret,
-        &ROOT.key(),
+        hellas_work::node::SessionKey::Passkey(&ROOT.passkey()),
     )
     .await
     .unwrap();
     let (_ce, _se, cc, sc) = pair().await;
     let closer = cc.clone();
     let remote_task = serve(&f.service, sc);
-    let remote = connect_iroh(cc, authority(), &f.secret, &ROOT.key())
-        .await
-        .unwrap();
+    let remote = connect_iroh(
+        cc,
+        authority(),
+        &f.secret,
+        hellas_work::node::SessionKey::Passkey(&ROOT.passkey()),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         local
             .get_host_status(read_request(ROOT_GRANT))
@@ -138,6 +143,7 @@ async fn local_control_matches_remote_authority_decisions() {
         .issue_credential(IssueCredentialRequest {
             authorization: ROOT_GRANT.0.to_vec(),
             scope: canonical_dag_cbor(&spec).unwrap(),
+            holder: canonical_dag_cbor(&OPERATOR.holder()).unwrap(),
         })
         .await
         .unwrap();
@@ -145,7 +151,10 @@ async fn local_control_matches_remote_authority_decisions() {
     f.node
         .status(
             &f.node
-                .authenticate_signed(&secret, &OPERATOR.key())
+                .authenticate_session(
+                    &secret,
+                    hellas_work::node::SessionKey::Node(&OPERATOR.node_key()),
+                )
                 .await
                 .unwrap(),
             GrantId([2; 16]),
@@ -245,9 +254,14 @@ async fn local_listener_bounds_authentication_and_joins_connections_without_remo
     let (_ce, _se, cc, sc) = pair().await;
     let remote_task = serve(&f.service, sc);
     let closer = cc.clone();
-    let remote = connect_iroh(cc, authority(), &f.secret, &ROOT.key())
-        .await
-        .unwrap();
+    let remote = connect_iroh(
+        cc,
+        authority(),
+        &f.secret,
+        hellas_work::node::SessionKey::Passkey(&ROOT.passkey()),
+    )
+    .await
+    .unwrap();
     remote
         .get_host_status(read_request(ROOT_GRANT))
         .await
@@ -266,7 +280,7 @@ async fn local_listener_bounds_authentication_and_joins_connections_without_remo
         "localhost".try_into().unwrap(),
         authority(),
         &f.secret,
-        &ROOT.key(),
+        hellas_work::node::SessionKey::Passkey(&ROOT.passkey()),
     )
     .await
     .unwrap();

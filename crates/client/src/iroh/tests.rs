@@ -472,8 +472,7 @@ fn apple_offer_pin_verifies_static_root_policy_then_open_and_result() {
         verify_contact(&bundle).is_err(),
         "platform roots remain provider-only"
     );
-    let (_, software) = signed_open_response(&[5; 32], &[6; 32]);
-    let client = principal_id(&decode_contact(&software.provider_genesis).unwrap()).unwrap();
+    let client = hellas_work::test_support::principal(1).0;
     let producer = ProducerSigningKey::from_secret_bytes([2; 32]).unwrap();
     let route =
         hellas_work::model::fetch::FetchRoutePolicy::sealed_route("openai", "responses").unwrap();

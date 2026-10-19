@@ -2,7 +2,7 @@
 //! exposing RPC dispatch; every effect still checks current node authority.
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
-use hellas_auth::{Digest, ProducerSigningKey, authority::*};
+use hellas_auth::{Digest, authority::*};
 use hellas_rpc::{
     authentication::session_binding,
     pb::host::*,
@@ -14,7 +14,10 @@ use hellas_rpc::{
 use hellas_wire::{
     Dispatcher, ServiceMarker, StreamTransport, WireCode, WireStatus, iroh::IrohTransport,
 };
-use hellas_work::{node::NodeCoordinator, work_store::grant::NodeStoreError};
+use hellas_work::{
+    node::{NodeCoordinator, SessionKey},
+    work_store::grant::NodeStoreError,
+};
 use iroh::endpoint::Connection;
 use std::{sync::Arc, time::Duration};
 use tokio::{sync::Semaphore, time::Instant};
@@ -196,13 +199,13 @@ pub async fn connect_local(
     server: hellas_wire::tls::ServerName<'static>,
     authority: AuthorityId,
     credential: &CredentialSecret,
-    identity: &ProducerSigningKey,
+    key: SessionKey<'_>,
 ) -> Result<HostControlClientImpl<hellas_wire::mux::MuxTransport>, WireStatus> {
     tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
         let stream = hellas_wire::local::connect_stream(path)
             .await
             .map_err(|_| unavailable())?;
-        connect_tls(stream, config, server, authority, credential, identity).await
+        connect_tls(stream, config, server, authority, credential, key).await
     })
     .await
     .map_err(|_| denied())?
@@ -216,7 +219,7 @@ pub async fn connect_iroh(
     connection: Connection,
     authority: AuthorityId,
     credential: &CredentialSecret,
-    identity: &ProducerSigningKey,
+    key: SessionKey<'_>,
 ) -> Result<HostControlClientImpl<IrohTransport>, WireStatus> {
     let mut close = CloseConnection(Some(connection.clone()));
     let transport = checked_transport(connection)?;
@@ -231,7 +234,7 @@ pub async fn connect_iroh(
             authority,
             binding,
             credential,
-            identity,
+            key,
             &mut recv,
             &mut send,
             handshake::Framing::Substream,
@@ -252,7 +255,7 @@ pub async fn connect_tls<S>(
     server: hellas_wire::tls::ServerName<'static>,
     authority: AuthorityId,
     credential: &CredentialSecret,
-    identity: &ProducerSigningKey,
+    key: SessionKey<'_>,
 ) -> Result<HostControlClientImpl<hellas_wire::mux::MuxTransport>, WireStatus>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -269,7 +272,7 @@ where
             authority,
             binding,
             credential,
-            identity,
+            key,
             &mut recv,
             &mut send,
             handshake::Framing::ByteStream,
@@ -450,9 +453,10 @@ impl HostControlHandler for ControlSession {
     ) -> Result<IssueCredentialResponse, WireStatus> {
         let caller = self.caller().await?;
         let scope = decode_bounded(&request.scope, MAX_COMMAND_BYTES).map_err(|_| invalid())?;
+        let holder = decode_bounded(&request.holder, MAX_COMMAND_BYTES).map_err(|_| invalid())?;
         let (record, secret) = self
             .node
-            .issue_credential(caller, grant_id(&request.authorization)?, scope)
+            .issue_credential(caller, grant_id(&request.authorization)?, scope, holder)
             .await
             .map_err(node_error)?;
         Ok(IssueCredentialResponse {

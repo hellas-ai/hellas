@@ -5,7 +5,7 @@ use crate::work_link::WorkLink;
 use futures::{StreamExt, stream::BoxStream};
 use hellas_auth::{
     Digest, ProducerSigningKey, PublicKey, Signature,
-    authority::{GrantId, PrincipalId, UnixMillis},
+    authority::{GrantId, NodeKey, PrincipalId, UnixMillis},
 };
 use hellas_client::ProviderTrustAnchor;
 pub use hellas_client::{PinnedOffer, UnpinnedOffer};
@@ -196,16 +196,17 @@ impl GrantTarget {
     }
     /// Discover an allowance using an explicit application and pinned enrollment.
     /// Open authenticates the provider before the stable locator is disclosed.
+    /// `client` is the principal the application credential acts for; `signer`
+    /// is the node key that credential is bound to.
     pub async fn discover(
         &self,
+        client: PrincipalId,
         signer: &ProducerSigningKey,
         transport: &GrantTransport,
         trust: &ProviderTrustAnchor,
         application: &Arc<ClientProfile>,
         timeout: Duration,
     ) -> Result<PinnedOffer> {
-        let client = PrincipalId::from_public_key(signer.public_key())
-            .map_err(|_| GrantError::UnsupportedKey)?;
         let transport =
             self.resolve_transport(transport, trust, application, &Arc::new(signer.clone()))?;
         let link = transport.connect(timeout, timeout).await?;
@@ -218,6 +219,9 @@ impl GrantTarget {
 #[derive(Clone)]
 pub struct GrantSessionOptions {
     pub target: PinnedOffer,
+    /// The principal the application credential acts for.
+    pub principal: PrincipalId,
+    /// The node key the application credential is bound to; it signs every job.
     pub signer: Arc<ProducerSigningKey>,
     pub application: Arc<ClientProfile>,
     pub journal_root: PathBuf,
@@ -269,7 +273,10 @@ impl SessionTransport {
             } => {
                 let caller = service
                     .node()
-                    .authenticate_signed(&application.credential, signer)
+                    .authenticate_session(
+                        &application.credential,
+                        hellas_work::node::SessionKey::Node(signer),
+                    )
                     .await?;
                 if caller.authority() != application.authority {
                     return Err(GrantError::Audience.into());
@@ -368,7 +375,8 @@ impl GrantSession {
         if options.timeout.is_zero() {
             return Err(GrantError::Signature.into());
         }
-        let client = PrincipalId::from_public_key(options.signer.public_key())
+        let client = options.principal;
+        let signer = NodeKey::from_public_key(options.signer.public_key())
             .map_err(|_| GrantError::UnsupportedKey)?;
         let target = GrantTarget::from_offer(&options.target)?;
         let transport = target.resolve_transport(
@@ -392,6 +400,7 @@ impl GrantSession {
                 generation: offer.offer().generation,
                 client,
             },
+            signer,
             standing.now,
         )
         .await?;

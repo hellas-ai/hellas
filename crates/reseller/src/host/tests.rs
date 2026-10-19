@@ -186,10 +186,14 @@ impl ResellerBuilder {
     async fn start(self) -> Reseller {
         let root = tempfile::tempdir().unwrap();
         let provider_identity =
-            ClientIdentity::from_secret_bytes(PROVIDER.key().to_secret_bytes(), [5; 32]).unwrap();
-        let provider_bundle = provider_identity.contact_enrollment(&ROOT.key()).unwrap();
+            ClientIdentity::from_secret_bytes([5; 32], PROVIDER.node_key().to_secret_bytes())
+                .unwrap();
+        let provider_bundle = provider_identity
+            .contact_enrollment(&ROOT.node_key())
+            .unwrap();
         let client_identity =
-            ClientIdentity::from_secret_bytes(FRIEND.key().to_secret_bytes(), [3; 32]).unwrap();
+            ClientIdentity::from_secret_bytes([3; 32], FRIEND.node_key().to_secret_bytes())
+                .unwrap();
         let upstream = tls_fixture(self.upstream).await;
         let options = || {
             let mut routes = FetchRouteRegistry::new();
@@ -271,13 +275,9 @@ impl ResellerBuilder {
         let provider = start_fetch_provider(options().prepare().await.unwrap())
             .await
             .unwrap();
-        let caller = provider
-            .administration()
-            .unwrap()
-            .node()
-            .authenticate(&secret)
-            .await
-            .unwrap();
+        let caller =
+            hellas_work::test_support::session(&provider.administration().unwrap().node(), &secret)
+                .await;
         let authorization = ROOT_GRANT;
         let admin = provider.administration().unwrap();
         let WorkControlReply::Offers(mut offers) = provider
@@ -331,7 +331,12 @@ impl ResellerBuilder {
                 expires: UnixMillis(UnixMillis::now().unwrap_or_default().0 + 60_000),
             };
             let (_, credential) = node
-                .issue_credential(&caller, authorization, scope)
+                .issue_credential(
+                    &caller,
+                    authorization,
+                    scope,
+                    hellas_auth::authority::CredentialHolder::Bearer,
+                )
                 .await
                 .unwrap();
             hellas_sdk::gateway::GatewayAccess::new(node, authorization, credential)
@@ -356,6 +361,7 @@ impl ResellerBuilder {
                         pinned.offer().grant.max_job_millis.get(),
                     ),
                     target: pinned,
+                    principal: hellas_work::test_support::subject_of(client_identity.caller_key()),
                     signer: Arc::new(client_identity.caller_key().clone()),
                     application: application.clone(),
                     journal_root: root.path().join("client"),
@@ -386,7 +392,7 @@ impl Reseller {
     }
     async fn revoke_application(&self) {
         let node = self.provider.administration().unwrap().node();
-        let caller = node.authenticate(&self.administrator).await.unwrap();
+        let caller = hellas_work::test_support::session(&node, &self.administrator).await;
         node.revoke_credential(
             &caller,
             ROOT_GRANT,
@@ -454,8 +460,9 @@ impl OpenAiFixture {
     fn new() -> Self {
         let root = tempfile::tempdir().unwrap();
         let identity =
-            ClientIdentity::from_secret_bytes(PROVIDER.key().to_secret_bytes(), [5; 32]).unwrap();
-        let enrollment = identity.contact_enrollment(&ROOT.key()).unwrap();
+            ClientIdentity::from_secret_bytes([5; 32], PROVIDER.node_key().to_secret_bytes())
+                .unwrap();
+        let enrollment = identity.contact_enrollment(&ROOT.node_key()).unwrap();
         Self {
             root,
             identity,
@@ -604,7 +611,9 @@ async fn controlled_host(
             .to_vec(),
     ];
     trust.alpn_protocols = tls.alpn_protocols.clone();
-    let authority = node.authenticate(secret).await.unwrap().authority();
+    let authority = hellas_work::test_support::session(&node, secret)
+        .await
+        .authority();
     let socket = root.join("control/host.socket");
     let host = hellas_sdk::node_control::host::HostHandle::start(
         hellas_sdk::node_control::host::HostOptions {
@@ -628,7 +637,7 @@ async fn controlled_host(
         "localhost".try_into().unwrap(),
         authority,
         secret,
-        &ROOT.key(),
+        hellas_work::node::SessionKey::Passkey(&ROOT.passkey()),
     )
     .await
     .unwrap();

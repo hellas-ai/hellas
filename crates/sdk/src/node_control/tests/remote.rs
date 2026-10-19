@@ -14,9 +14,14 @@ impl Remote {
         let (client_endpoint, server_endpoint, outgoing, incoming) = pair().await;
         let closer = outgoing.clone();
         let task = serve(&fixture.service, incoming);
-        let client = connect_iroh(outgoing, authority(), &fixture.secret, &ROOT.key())
-            .await
-            .unwrap();
+        let client = connect_iroh(
+            outgoing,
+            authority(),
+            &fixture.secret,
+            hellas_work::node::SessionKey::Passkey(&ROOT.passkey()),
+        )
+        .await
+        .unwrap();
         Self {
             fixture,
             client,
@@ -29,12 +34,7 @@ impl Remote {
         self.fixture
             .node
             .status(
-                &self
-                    .fixture
-                    .node
-                    .authenticate(&self.fixture.secret)
-                    .await
-                    .unwrap(),
+                &hellas_work::test_support::session(&self.fixture.node, &self.fixture.secret).await,
                 ROOT_GRANT,
             )
             .await
@@ -109,6 +109,7 @@ async fn credential_scope_frames_are_bounded_before_decoding() {
                 .issue_credential(IssueCredentialRequest {
                     authorization: ROOT_GRANT.0.to_vec(),
                     scope,
+                    holder: canonical_dag_cbor(&OPERATOR.holder()).unwrap(),
                 })
                 .await
                 .unwrap_err()
@@ -128,6 +129,7 @@ async fn issued_credentials_round_trip_with_a_redacted_reply() {
         .issue_credential(IssueCredentialRequest {
             authorization: ROOT_GRANT.0.to_vec(),
             scope: canonical_dag_cbor(&scope).unwrap(),
+            holder: canonical_dag_cbor(&OPERATOR.holder()).unwrap(),
         })
         .await
         .unwrap();
@@ -135,7 +137,10 @@ async fn issued_credentials_round_trip_with_a_redacted_reply() {
     let caller = remote
         .fixture
         .node
-        .authenticate_signed(&credential, &OPERATOR.key())
+        .authenticate_session(
+            &credential,
+            hellas_work::node::SessionKey::Node(&OPERATOR.node_key()),
+        )
         .await
         .unwrap();
     assert_eq!(caller.subject(), OPERATOR.principal());

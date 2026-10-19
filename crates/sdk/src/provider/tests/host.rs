@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 pub(crate) fn provider_enrollment() -> hellas_rpc::ProviderEnrollmentBundle {
     work::enrollment(
-        &PROVIDER.key(),
-        &PROVIDER.key(),
+        &PROVIDER.node_key(),
+        &PROVIDER.node_key(),
         *iroh::SecretKey::from_bytes(&[5; 32]).public().as_bytes(),
         [5; 32],
     )
@@ -36,7 +36,7 @@ impl Host {
             allowance: Allowance::responses(ids::ALLOWANCE, FRIEND),
             capacity: Capacity::new(4),
             backend: FakeProvider {
-                signer: Arc::new(PROVIDER.key()),
+                signer: Arc::new(PROVIDER.node_key()),
                 finish: work::backend::Completion::Immediate,
                 ..Default::default()
             },
@@ -54,7 +54,7 @@ impl Host {
                 valid_until: UnixMillis(u64::MAX),
                 addresses,
             },
-            &PROVIDER.key(),
+            &PROVIDER.node_key(),
         )
         .unwrap();
         let target = UnpinnedOffer::decode(&signed.encode().unwrap(), self.world.clock.now())
@@ -73,7 +73,8 @@ impl Host {
             .unwrap();
         GrantSessionOptions {
             target,
-            signer: Arc::new(FRIEND.key()),
+            principal: FRIEND.principal(),
+            signer: Arc::new(FRIEND.node_key()),
             application: self.application.clone(),
             journal_root: self.root.path().join("client"),
             // A job deadline below the grant limit leaves room for the client
@@ -83,21 +84,32 @@ impl Host {
     }
     pub async fn gateway_access(&self) -> hellas_gateway::GatewayAccess {
         let node = self.world.service.node();
-        let [secret] = credentials::issue(
+        let admin = self.world.administrator(ROOT).await;
+        let scope = Rights::new(authority(), ROOT)
+            .allow(
+                hellas_work::node::GATEWAY_INVOKE,
+                hellas_work::node::host_resource(authority()),
+            )
+            .valid_from(self.world.clock.now())
+            .valid_until(UnixMillis(u64::MAX))
+            .build();
+        let [] = credentials::issue(
             credentials::Issuer::Node(&node),
-            &self.world.caller(ROOT).await,
+            &admin,
             ids::ROOT_GRANT,
             Some(GATEWAY_ACCESS),
-            Rights::new(authority(), ROOT)
-                .allow(
-                    hellas_work::node::GATEWAY_INVOKE,
-                    hellas_work::node::host_resource(authority()),
-                )
-                .valid_from(self.world.clock.now())
-                .valid_until(UnixMillis(u64::MAX))
-                .build(),
+            scope.clone(),
         )
         .await;
+        let (_, secret) = node
+            .issue_credential(
+                &admin,
+                ids::ROOT_GRANT,
+                scope,
+                hellas_auth::authority::CredentialHolder::Bearer,
+            )
+            .await
+            .unwrap();
         hellas_gateway::GatewayAccess::new(node, GATEWAY_ACCESS, secret)
             .await
             .unwrap()
@@ -145,7 +157,10 @@ impl Host {
                     if let Ok(server) = router
                         .accept_iroh(
                             &transport,
-                            crate::test_identity::OpenProof(provider_enrollment(), PROVIDER.key()),
+                            crate::test_identity::OpenProof(
+                                provider_enrollment(),
+                                PROVIDER.node_key(),
+                            ),
                         )
                         .await
                     {
@@ -168,7 +183,7 @@ impl HostBuilder {
         self
     }
     pub fn with_backend(mut self, mut backend: FakeProvider) -> Self {
-        backend.signer = Arc::new(PROVIDER.key());
+        backend.signer = Arc::new(PROVIDER.node_key());
         self.backend = backend;
         self
     }

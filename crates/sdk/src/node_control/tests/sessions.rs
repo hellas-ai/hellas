@@ -13,7 +13,7 @@ struct Reader {
 impl Reader {
     async fn new() -> Self {
         let fixture = fixture().await;
-        let root = fixture.node.authenticate(&fixture.secret).await.unwrap();
+        let root = hellas_work::test_support::session(&fixture.node, &fixture.secret).await;
         let mut rights = scope(OPERATOR);
         rights.issuance = None;
         rights
@@ -42,9 +42,14 @@ impl Reader {
         let (ce, se, outgoing, incoming) = pair().await;
         let closer = outgoing.clone();
         let task = serve(&fixture.service, incoming);
-        let client = connect_iroh(outgoing, authority(), &credential, &OPERATOR.key())
-            .await
-            .unwrap();
+        let client = connect_iroh(
+            outgoing,
+            authority(),
+            &credential,
+            hellas_work::node::SessionKey::Passkey(&OPERATOR.passkey()),
+        )
+        .await
+        .unwrap();
         client
             .get_host_status(read_request(ids::OPERATOR_GRANT))
             .await
@@ -70,12 +75,8 @@ impl Reader {
 #[tokio::test]
 async fn a_live_connection_rechecks_its_selected_grant() {
     let reader = Reader::new().await;
-    let root = reader
-        .fixture
-        .node
-        .authenticate(&reader.fixture.secret)
-        .await
-        .unwrap();
+    let root =
+        hellas_work::test_support::session(&reader.fixture.node, &reader.fixture.secret).await;
     reader
         .fixture
         .node
@@ -111,9 +112,14 @@ async fn a_live_connection_rechecks_its_credential_before_decoding_rpc() {
     let (_ce, _se, outgoing, incoming) = pair().await;
     let admin_task = serve(&reader.fixture.service, incoming);
     let closer = outgoing.clone();
-    let admin = connect_iroh(outgoing, authority(), &reader.fixture.secret, &ROOT.key())
-        .await
-        .unwrap();
+    let admin = connect_iroh(
+        outgoing,
+        authority(),
+        &reader.fixture.secret,
+        hellas_work::node::SessionKey::Passkey(&ROOT.passkey()),
+    )
+    .await
+    .unwrap();
     let revoked = admin
         .revoke_credential(RevokeCredentialRequest {
             authorization: ROOT_GRANT.0.to_vec(),

@@ -34,7 +34,7 @@ pub(crate) async fn application_profile(
 ) -> std::sync::Arc<crate::node_control::profile::ClientProfile> {
     let credential =
         crate::test_node::execution_credential(node, administrator, subject, allowance).await;
-    let caller = node.authenticate(administrator).await.unwrap();
+    let caller = hellas_work::test_support::session(node, administrator).await;
     std::sync::Arc::new(crate::node_control::profile::ClientProfile {
         authority: caller.authority(),
         authorization: crate::test_node::EXECUTION_AUTHORIZATION,

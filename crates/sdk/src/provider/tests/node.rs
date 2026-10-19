@@ -4201,7 +4201,7 @@ async fn provider_startup_preserves_explicit_allowances_and_machine_limits() {
     let id = GrantId([8; 16]);
     let definition = common_node::allowance(
         id,
-        principal_id(&provider).unwrap(),
+        hellas_work::test_support::actors::ROOT.principal(),
         vec![GrantPolicy {
             resource: hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(
                 b"test resource",
@@ -4248,7 +4248,7 @@ async fn provider_startup_preserves_explicit_allowances_and_machine_limits() {
             .open(ProviderResources::EvaluateAndFetch(&routes), &provider)
             .await
             .unwrap();
-        let caller = node.authenticate(&secret).await.unwrap();
+        let caller = hellas_work::test_support::session(&node, &secret).await;
         let status = node.status(&caller, GrantId([0; 16])).await.unwrap();
         let machine = status.machine.unwrap();
         assert_eq!(machine.max_in_flight.get(), 2);
@@ -4350,7 +4350,8 @@ async fn grant_and_paid_work_share_a_peer_but_never_a_journal() {
         .service(&vouched_context(peer), descriptor().channel().id())
         .unwrap()
         .unwrap();
-    let grantee_key = ProducerSigningKey::from_secret_bytes([0x21; 32]).unwrap();
+    // The paid fixture's runner key doubles as this grant client's node key.
+    let (grantee, grantee_key) = hellas_work::test_support::principal(0x21);
     let provider_key = provider_producer();
     let network = grant::grant_network();
     let now = hellas_auth::authority::UnixMillis(1_000_000);
@@ -4383,8 +4384,7 @@ async fn grant_and_paid_work_share_a_peer_but_never_a_journal() {
         }],
         budget: BudgetNode::Subject {
             pool: common_node::POOL,
-            subject: hellas_auth::authority::PrincipalId::from_public_key(grantee_key.public_key())
-                .unwrap(),
+            subject: grantee,
         },
         max_job_millis: std::num::NonZeroU64::new(10_000).unwrap(),
         enabled: true,
@@ -4407,13 +4407,7 @@ async fn grant_and_paid_work_share_a_peer_but_never_a_journal() {
         (vec![], 1),
     )
     .await;
-    let channel = store
-        .state()
-        .channel_id(
-            id,
-            hellas_auth::authority::PrincipalId::from_public_key(grantee_key.public_key()).unwrap(),
-        )
-        .unwrap();
+    let channel = store.state().channel_id(id, grantee).unwrap();
     let input = PreparedWorkInput::Evaluate(bundle());
     let auth = grant::GrantJobAuthorizationV1 {
         channel_id: channel,

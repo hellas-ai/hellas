@@ -44,7 +44,7 @@ async fn handshake_hook_rejects_unlisted_endpoints_before_control_admission() {
                     client_connection.unwrap(),
                     authority(),
                     &f.secret,
-                    &OPERATOR.key()
+                    hellas_work::node::SessionKey::Passkey(&OPERATOR.passkey())
                 )
                 .await, status if status.code() == WireCode::PermissionDenied);
             rejected(task).await;
@@ -88,7 +88,7 @@ async fn idle_sessions_release_control_capacity() {
         "localhost".try_into().unwrap(),
         authority(),
         &f.secret,
-        &ROOT.key(),
+        hellas_work::node::SessionKey::Passkey(&ROOT.passkey()),
     )
     .await
     .unwrap();

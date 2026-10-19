@@ -17,11 +17,11 @@ async fn authentication_rejects_prefix_only_oversize_replay_and_trailing_data_an
     let task = serve(&f.service, sc);
     let (mut send, _recv, first) = hello(&cc).await;
     let signature = first
-        .sign(
+        .sign_daily(
             authority(),
             binding(&IrohTransport::new(cc.clone())).unwrap(),
             f.secret.id(),
-            &ROOT.key(),
+            &ROOT.node_key(),
         )
         .unwrap();
     let replay = encode_response(&f.secret, &signature).unwrap();
@@ -35,11 +35,11 @@ async fn authentication_rejects_prefix_only_oversize_replay_and_trailing_data_an
         let task = serve(&f.service, sc);
         let (mut send, _recv, challenge) = hello(&cc).await;
         let signature = challenge
-            .sign(
+            .sign_daily(
                 authority(),
                 binding(&IrohTransport::new(cc.clone())).unwrap(),
                 f.secret.id(),
-                &ROOT.key(),
+                &ROOT.node_key(),
             )
             .unwrap();
         let current = encode_response(&f.secret, &signature).unwrap();
@@ -73,7 +73,7 @@ async fn authentication_rejects_prefix_only_oversize_replay_and_trailing_data_an
         .unwrap();
     let (_ce, _se, cc, sc) = pair().await;
     let task = serve(&f.service, sc);
-    hellas_work::test_support::assert_err!(connect_iroh(cc, authority(), &f.secret, &ROOT.key())
+    hellas_work::test_support::assert_err!(connect_iroh(cc, authority(), &f.secret, hellas_work::node::SessionKey::Passkey(&ROOT.passkey()))
             .await, status if status.code() == WireCode::PermissionDenied);
     assert_eq!(
         task.await.unwrap().unwrap_err().code,

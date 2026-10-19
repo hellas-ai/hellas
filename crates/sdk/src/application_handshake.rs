@@ -1,12 +1,15 @@
 //! One bounded exchange before ordinary RPC framing. Lengths are checked before
 //! reading any body byte. Owned authentication buffers clear themselves on drop.
-use hellas_auth::{Digest, ProducerSigningKey, authority::*};
+use hellas_auth::{Digest, authority::*};
 use hellas_rpc::authentication::{
     MAX_AUTHENTICATION_MESSAGE_BYTES, decode_challenge, decode_response, encode_challenge,
     encode_response,
 };
 use hellas_wire::{WireCode, WireStatus};
-use hellas_work::{node::NodeCoordinator, work_store::grant::NodeStoreError};
+use hellas_work::{
+    node::{NodeCoordinator, SessionKey},
+    work_store::grant::NodeStoreError,
+};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::Instant;
@@ -49,9 +52,9 @@ pub(super) async fn accept<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     if matches!(framing, Framing::Substream) {
         eof(recv).await?;
     }
-    let (secret, signature) = decode_response(&bytes).map_err(|_| denied())?;
+    let (secret, proof) = decode_response(&bytes).map_err(|_| denied())?;
     let session = node
-        .complete_authentication(pending, binding, &secret, &signature)
+        .complete_authentication(pending, binding, &secret, &proof)
         .await
         .map_err(node_error)?;
     let lifetime = session
@@ -83,7 +86,7 @@ pub(super) async fn connect<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     authority: AuthorityId,
     binding: Digest,
     credential: &CredentialSecret,
-    identity: &ProducerSigningKey,
+    key: SessionKey<'_>,
     recv: &mut R,
     send: &mut W,
     framing: Framing,
@@ -96,15 +99,15 @@ pub(super) async fn connect<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     send.flush().await.map_err(|_| denied())?;
     let bytes = read_message(recv).await?;
     let challenge = decode_challenge(&bytes).map_err(|_| denied())?;
-    let signature = challenge
-        .sign(authority, binding, credential.id(), identity)
+    let proof = key
+        .prove(&challenge, authority, binding, credential.id())
         .map_err(|_| denied())?;
     let lifetime = challenge
         .session_expires
         .0
         .checked_sub(challenge.issued_at.0)
         .ok_or_else(denied)?;
-    let response = encode_response(credential, &signature).map_err(|_| denied())?;
+    let response = encode_response(credential, &proof).map_err(|_| denied())?;
     send_message(send, &response).await?;
     if matches!(framing, Framing::Substream) {
         send.shutdown().await.map_err(|_| denied())?;

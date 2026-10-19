@@ -35,8 +35,11 @@ impl Fixture {
             root.path(),
             hellas_work::model::grant::grant_network(),
             ROOT_GRANT,
-            administrator.clone(),
-            administrator,
+            hellas_work::test_support::common_node::approval_for(
+                hellas_auth::authority::Ownership::Bootstrap { root: ROOT_GRANT },
+                administrator.clone(),
+                administrator,
+            ),
             None,
             now,
         )
@@ -44,7 +47,7 @@ impl Fixture {
         .unwrap();
         let clock = TestClock::new(now);
         let node = NodeCoordinator::new(store, clock.source());
-        let caller = node.authenticate(&admin).await.unwrap();
+        let caller = hellas_work::test_support::session(&node, &admin).await;
         let scope = Rights::new(authority, ROOT)
             .allow(GATEWAY_INVOKE, host_resource(authority))
             .valid_from(now)
@@ -62,7 +65,7 @@ impl Fixture {
             .await
             .unwrap();
         let (_, credential) = node
-            .issue_credential(&caller, ROOT_GRANT, scope)
+            .issue_credential(&caller, ROOT_GRANT, scope, CredentialHolder::Bearer)
             .await
             .unwrap();
         let access = GatewayAccess::new(node, HTTP_ACCESS, credential)
@@ -206,7 +209,7 @@ async fn http_admission_consults_current_authority() {
     for revoke in [Change::Credential, Change::Grant, Change::Expiry] {
         let fixture = Fixture::new().await;
         let node = &fixture.access.node;
-        let caller = node.authenticate(&fixture.admin).await.unwrap();
+        let caller = hellas_work::test_support::session(node, &fixture.admin).await;
         let app = router(fixture.access.clone());
         let token = format!("Bearer {}", fixture.access.bearer());
         assert_eq!(status(&app, Some(&token)).await, StatusCode::OK);
@@ -254,7 +257,7 @@ async fn listening_remotely_requires_explicit_opt_in() {
 async fn administrator_credentials_cannot_be_exposed_as_http_bearers() {
     let fixture = Fixture::new().await;
     let node = &fixture.access.node;
-    let caller = node.authenticate(&fixture.admin).await.unwrap();
+    let caller = hellas_work::test_support::session(node, &fixture.admin).await;
     assert_err!(
         node.authorize_gateway(&caller, ROOT_GRANT).await,
         hellas_work::work_store::grant::NodeStoreError::Authority(AuthorityError::Denied)

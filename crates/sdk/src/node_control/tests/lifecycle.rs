@@ -50,9 +50,14 @@ impl Harness {
                     Ok(crate::start_fetch_provider(
                         crate::FetchProviderOptions {
                             port: Some(0),
-                            identity: crate::ClientIdentity::from_secret_bytes([5; 32], [5; 32])?,
+                            identity: crate::ClientIdentity::from_secret_bytes(
+                                [5; 32],
+                                hellas_work::test_support::actors::PROVIDER
+                                    .node_key()
+                                    .to_secret_bytes(),
+                            )?,
                             enrollment,
-                            root: Arc::new(hellas_work::test_support::actors::PROVIDER.key()),
+                            root: Arc::new(hellas_work::test_support::actors::PROVIDER.node_key()),
                             state_directory: forbidden_journal,
                             grants: Some(crate::GrantProviderOptions {
                                 policies: vec![],
@@ -108,7 +113,7 @@ impl Harness {
                 "localhost".try_into().unwrap(),
                 authority(),
                 credential,
-                &ROOT.key(),
+                hellas_work::node::SessionKey::Passkey(&ROOT.passkey()),
             )
             .await
             .unwrap(),
@@ -118,12 +123,8 @@ impl Harness {
         self.connect(&self.fixture.secret).await
     }
     async fn credential(&self, operation: &str) -> CredentialSecret {
-        let admin = self
-            .fixture
-            .node
-            .authenticate(&self.fixture.secret)
-            .await
-            .unwrap();
+        let admin =
+            hellas_work::test_support::session(&self.fixture.node, &self.fixture.secret).await;
         let mut scope = scope(ROOT);
         scope
             .permissions
@@ -132,7 +133,12 @@ impl Harness {
         scope.delegation_depth = 0;
         self.fixture
             .node
-            .issue_credential(&admin, ROOT_GRANT, scope)
+            .issue_credential(
+                &admin,
+                ROOT_GRANT,
+                scope.clone(),
+                hellas_work::test_support::holder(scope.subject),
+            )
             .await
             .unwrap()
             .1
@@ -172,8 +178,11 @@ async fn unbound_fixture() -> Fixture {
         directory.path(),
         hellas_work::test_support::network(),
         ROOT_GRANT,
-        scope(ROOT),
-        scope(ROOT),
+        hellas_work::test_support::common_node::approval_for(
+            hellas_auth::authority::Ownership::Bootstrap { root: ROOT_GRANT },
+            scope(ROOT),
+            scope(ROOT),
+        ),
         None,
         UnixMillis(1000),
     )
@@ -330,7 +339,7 @@ async fn standalone_node_control_reports_unmounted_lifecycle() {
         "localhost".try_into().unwrap(),
         authority(),
         &f.secret,
-        &ROOT.key(),
+        hellas_work::node::SessionKey::Passkey(&ROOT.passkey()),
     )
     .await
     .unwrap();
@@ -423,12 +432,7 @@ async fn accepted_start_survives_requester_cancellation() {
     within(h.starting.notified()).await;
     request.abort();
     assert!(request.await.unwrap_err().is_cancelled());
-    let admin = h
-        .fixture
-        .node
-        .authenticate(&h.fixture.secret)
-        .await
-        .unwrap();
+    let admin = hellas_work::test_support::session(&h.fixture.node, &h.fixture.secret).await;
     h.fixture
         .node
         .revoke_credential(&admin, ROOT_GRANT, credential.id(), Revision(1))
@@ -553,7 +557,7 @@ async fn controlled_host(
             "localhost".try_into().unwrap(),
             authority(),
             secret,
-            &ROOT.key(),
+            hellas_work::node::SessionKey::Passkey(&ROOT.passkey()),
         )
         .await
         .unwrap(),
@@ -565,7 +569,7 @@ async fn controlled_host(
             "localhost".try_into().unwrap(),
             authority(),
             secret,
-            &ROOT.key(),
+            hellas_work::node::SessionKey::Passkey(&ROOT.passkey()),
         )
         .await
         .unwrap(),

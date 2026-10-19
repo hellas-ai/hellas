@@ -13,7 +13,7 @@ use std::{
 };
 use tower::{Layer, Service};
 
-/// A provisioned self-issued credential scoped to gateway.invoke. The host owns
+/// A provisioned bearer credential scoped to gateway.invoke. The host owns
 /// the authority writer; starting a listener never creates grants or credentials.
 #[derive(Clone)]
 pub struct GatewayAccess {

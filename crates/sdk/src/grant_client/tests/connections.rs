@@ -235,12 +235,14 @@ async fn work_rejects_wrong_application_identity_audience_and_grant_binding() {
                         } else {
                             &f.application.credential
                         },
-                        &if attack == ApplicationAttack::Identity {
-                            hellas_work::test_support::actors::STRANGER
-                        } else {
-                            hellas_work::test_support::actors::ROOT
-                        }
-                        .key(),
+                        hellas_work::node::SessionKey::Node(
+                            &if attack == ApplicationAttack::Identity {
+                                hellas_work::test_support::actors::STRANGER
+                            } else {
+                                hellas_work::test_support::actors::ROOT
+                            }
+                            .node_key(),
+                        ),
                         &mut recv,
                         &mut send,
                         crate::application_handshake::Framing::Substream,
@@ -333,7 +335,7 @@ async fn revoked_credentials_are_rejected_before_work_body_decoding() {
     let pair = Pair::new().await;
     let server = pair.admit(&router, Some(&f.application)).await;
     let node = f.service.node();
-    let caller = node.authenticate(&f.administrator).await.unwrap();
+    let caller = hellas_work::test_support::session(&node, &f.administrator).await;
     node.revoke_credential(
         &caller,
         GrantId([0; 16]),

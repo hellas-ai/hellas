@@ -229,6 +229,7 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
         let mut authorized = crate::grant_client::GrantSession::open(
             GrantSessionOptions {
                 target: grant_target,
+                principal: principal(1).0,
                 signer: Arc::new(principal(1).1),
                 application,
                 journal_root: fixture.root.path().join("grant-client"),
