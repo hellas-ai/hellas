@@ -7,23 +7,21 @@ license.workspace = true
 [features]
 default = []
 otel = ["hellas-rpc?/otel"]
-# Chain/light-client domain vocabulary: addresses, transactions,
-# WebAuthn signature policy, and challenge derivation (`domain` module).
+# Chain/light-client domain vocabulary: addresses, transactions, and
+# WebAuthn challenge derivation (`domain` module).
 domain = [
     "dep:hellas-auth",
-    "dep:base64ct",
     "dep:bs58",
     "dep:bytes",
     "dep:commonware-codec",
     "dep:commonware-cryptography",
     "dep:hellas-genesis",
     "dep:hellas-kernel",
+    "dep:hellas-webauthn",
     "dep:p256",
     "dep:serde",
     "dep:serde_json",
-    "dep:sha2",
     "dep:thiserror",
-    "dep:url",
     "hellas-kernel/secp256k1",
 ]
 # Consensus wiring aliases in the domain module (threshold scheme types).
@@ -83,7 +81,14 @@ indexer-api = [
     "hellas-kernel/webauthn",
     "hellas-rpc/http-tracing",
 ]
-proof-verify = ["block-view", "dep:serde", "dep:hex", "dep:prost"]
+proof-verify = [
+    "block-view",
+    "dep:base64ct",
+    "dep:serde",
+    "dep:hex",
+    "dep:prost",
+    "dep:url",
+]
 indexer = [
     "block-view",
     "client",
@@ -140,6 +145,7 @@ validator = [
     "dep:commonware-broadcast",
     "dep:rand_core",
     "dep:toml",
+    "dep:url",
     "hellas-kernel/secp256k1",
     "hellas-kernel/webauthn",
 ]
@@ -179,6 +185,7 @@ hellas-genesis = { workspace = true, optional = true }
 hellas-kernel = { workspace = true, optional = true, default-features = false }
 hellas-private = { workspace = true, optional = true }
 hellas-rpc = { workspace = true, optional = true, features = ["chain"] }
+hellas-webauthn = { workspace = true, optional = true, features = ["der"] }
 hellas-wire = { workspace = true, optional = true }
 hellas-work = { workspace = true, optional = true }
 hex = { workspace = true, optional = true }
@@ -193,7 +200,6 @@ rand_core = { workspace = true, optional = true }
 redb = { version = "4", optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
-sha2 = { workspace = true, optional = true }
 thiserror = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true, features = [
     "net",
@@ -230,6 +236,7 @@ hellas-rpc = { workspace = true, features = ["work"] }
 # only needs it behind the `work-watcher` feature.
 hellas-work.workspace = true
 serde = { workspace = true, features = ["derive"] }
+sha2.workspace = true
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt"] }
 tower = { version = "0.5", features = ["util"] }

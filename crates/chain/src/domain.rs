@@ -1,14 +1,8 @@
 //! Domain types used by the Hellas chain and light-client API.
 //!
-//! # `WebAuthn` policy divergence
-//!
-//! [`Transaction::verify_signature`] enforces a browser-shaped policy:
-//! UP *and* UV flags, an HTTPS origin allowlist, and `rpIdHash` binding.
-//! The kernel's open-authorization verifier (`hellas-kernel`, feature
-//! `webauthn`) is deliberately looser — UP *or* UV, origin ignored — and
-//! treats `WebAuthn` as a portable P-256 transaction-signing envelope.
-//! They are different products; do not wire one where the other is
-//! expected.
+//! [`Transaction::verify_signature`] verifies through `hellas-webauthn`, the
+//! policy every Hellas verifier shares; this module only builds the
+//! challenges a transfer or merge signs.
 
 /// Digest used by chain-facing APIs.
 pub use commonware_cryptography::sha256::Digest;
@@ -18,7 +12,6 @@ pub use commonware_codec::DecodeExt;
 /// Encoding helper for domain types.
 pub use commonware_codec::Encode;
 
-use base64ct::{Base64UrlUnpadded, Encoding};
 use bytes::BytesMut;
 use commonware_codec::{
     EncodeSize, Error as CodecError, FixedSize, RangeCfg, Read, ReadExt, Write,
@@ -30,10 +23,8 @@ use hellas_kernel::{
     Coin as KernelCoin, Decode as KernelDecode, Edge as KernelEdge, Encode as KernelEncode, Fees,
     Key as KernelKey, NetworkId, RegistryChunk as KernelRegistryChunk, Tx as KernelTx,
 };
-use p256::ecdsa::signature::Verifier as _;
-use serde_json::Value as JsonValue;
+#[cfg(test)]
 use sha2::{Digest as _, Sha256 as Sha2};
-use url::Url;
 
 /// Validator public key.
 pub type PublicKey = ed25519::PublicKey;
@@ -370,24 +361,8 @@ pub type Context = commonware_consensus::simplex::types::Context<Digest, PublicK
 #[cfg(feature = "domain-consensus")]
 pub type Activity = commonware_consensus::simplex::types::Activity<Scheme, Digest>;
 
-/// `WebAuthn` policy version.
+/// Version byte every chain `WebAuthn` challenge starts with, after the domain.
 pub const WEBAUTHN_POLICY_VERSION: u8 = 1;
-/// Whether `WebAuthn` user presence is required.
-pub const WEBAUTHN_REQUIRE_UP: bool = true;
-/// Whether `WebAuthn` user verification is required.
-pub const WEBAUTHN_REQUIRE_UV: bool = true;
-/// Whether cross-origin assertions are rejected.
-pub const WEBAUTHN_REQUIRE_CROSS_ORIGIN_FALSE: bool = true;
-/// Whether HTTPS origins are required.
-pub const WEBAUTHN_REQUIRE_HTTPS_ORIGIN: bool = true;
-/// Whether HTTP localhost origins are allowed.
-pub const WEBAUTHN_ALLOW_HTTP_LOCALHOST_ORIGIN: bool = true;
-/// Whether attested credential data is allowed.
-pub const WEBAUTHN_ALLOW_ATTESTED_CREDENTIAL_DATA: bool = false;
-/// Whether `WebAuthn` extensions are allowed.
-pub const WEBAUTHN_ALLOW_EXTENSIONS: bool = false;
-/// Required `WebAuthn` client data type.
-pub const WEBAUTHN_TYPE_GET: &str = "webauthn.get";
 
 /// Domain separator for `WebAuthn` challenges.
 pub const CHALLENGE_DOMAIN: &[u8] = b"hellas-webauthn-challenge-v1";
@@ -545,6 +520,7 @@ pub fn merge_challenge(network: NetworkId, sorted_inputs: &[ObjectId]) -> Digest
     Sha256::hash(&buf)
 }
 
+#[cfg(test)]
 fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
     let mut hasher = Sha2::new();
     hasher.update(bytes);
@@ -565,41 +541,6 @@ fn secp256r1_key_from_material(material: &[u8]) -> p256::ecdsa::SigningKey {
         }
         salt = salt.wrapping_add(1);
     }
-}
-
-fn localhost_host(host: &str) -> bool {
-    host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1"
-}
-
-fn origin_is_allowed(url: &Url) -> bool {
-    let scheme = url.scheme();
-    (scheme == "https")
-        || (WEBAUTHN_ALLOW_HTTP_LOCALHOST_ORIGIN
-            && scheme == "http"
-            && url.host_str().is_some_and(localhost_host))
-}
-
-fn lower_host_hash(host: &str) -> Option<[u8; 32]> {
-    const MAX_RP_ID_LEN: usize = 253;
-
-    if host.is_empty() || host.len() > MAX_RP_ID_LEN {
-        return None;
-    }
-    let mut lower = [0_u8; MAX_RP_ID_LEN];
-    for (dst, src) in lower.iter_mut().zip(host.bytes()) {
-        *dst = src.to_ascii_lowercase();
-    }
-    Some(sha256_bytes(&lower[..host.len()]))
-}
-
-/// Returns the SHA-256 RP ID hash for a permitted `WebAuthn` origin.
-#[must_use]
-pub fn rp_id_hash_from_origin(origin: &str) -> Option<[u8; 32]> {
-    let url = Url::parse(origin).ok()?;
-    if WEBAUTHN_REQUIRE_HTTPS_ORIGIN && !origin_is_allowed(&url) {
-        return None;
-    }
-    lower_host_hash(url.host_str()?)
 }
 
 // --- Stored objects (gated) ---
@@ -864,9 +805,8 @@ impl WebAuthnSignature {
         authenticator_data: &[u8],
         client_data_json: &[u8],
     ) -> Option<Self> {
-        let signature = p256::ecdsa::Signature::from_der(signature_der).ok()?;
-        let signature = signature.normalize_s();
-        let signature = UserSignature::decode(signature.to_bytes().as_ref()).ok()?;
+        let signature = hellas_webauthn::signature_from_der(signature_der).ok()?;
+        let signature = UserSignature::decode(signature.as_slice()).ok()?;
         Self::new(signature, authenticator_data, client_data_json)
     }
 }
@@ -972,82 +912,30 @@ pub(crate) fn merge_input_fault(inputs: &[ObjectId]) -> Option<MergeInputFault> 
     })
 }
 
-fn client_data_rp_hash(bytes: &[u8], expected_challenge: &[u8]) -> Option<[u8; 32]> {
-    let json: JsonValue = serde_json::from_slice(bytes).ok()?;
-    let obj = json.as_object()?;
-    let ty = obj.get("type")?.as_str()?;
-    let challenge = obj.get("challenge")?.as_str()?;
-    let origin = obj.get("origin")?.as_str()?;
-    let cross_origin = obj
-        .get("crossOrigin")
-        .and_then(JsonValue::as_bool)
-        .unwrap_or(false);
-    if ty != WEBAUTHN_TYPE_GET {
-        return None;
-    }
-    if WEBAUTHN_REQUIRE_CROSS_ORIGIN_FALSE && cross_origin {
-        return None;
-    }
-    let mut decoded_challenge = [0_u8; 32];
-    let Ok(decoded_challenge) = Base64UrlUnpadded::decode(challenge, &mut decoded_challenge) else {
-        return None;
-    };
-    if decoded_challenge != expected_challenge {
-        return None;
-    }
-    rp_id_hash_from_origin(origin)
-}
-
 fn verify_webauthn_signature(
-    expected_challenge: &[u8],
+    expected_challenge: &Digest,
     signature: &WebAuthnSignature,
     owner: &UserPublicKey,
 ) -> bool {
-    const FLAG_UP: u8 = 0x01;
-    const FLAG_UV: u8 = 0x04;
-    const FLAG_AT: u8 = 0x40;
-    const FLAG_ED: u8 = 0x80;
-
-    let authenticator_data = signature.authenticator_data.as_slice();
-    let client_data_json = signature.client_data_json.as_slice();
-    if authenticator_data.len() < MIN_AUTHENTICATOR_DATA_LEN || client_data_json.is_empty() {
-        return false;
-    }
-
-    let Some(rp_hash) = client_data_rp_hash(client_data_json, expected_challenge) else {
+    let Ok(key) = hellas_webauthn::PublicKey::from_sec1(owner.as_ref()) else {
         return false;
     };
-    if authenticator_data[..32] != rp_hash {
-        return false;
-    }
-
-    let flags = authenticator_data[32];
-    if WEBAUTHN_REQUIRE_UP && (flags & FLAG_UP) == 0 {
-        return false;
-    }
-    if WEBAUTHN_REQUIRE_UV && (flags & FLAG_UV) == 0 {
-        return false;
-    }
-    if !WEBAUTHN_ALLOW_ATTESTED_CREDENTIAL_DATA && (flags & FLAG_AT) != 0 {
-        return false;
-    }
-    if !WEBAUTHN_ALLOW_EXTENSIONS && (flags & FLAG_ED) != 0 {
-        return false;
-    }
-
-    let client_hash = sha256_bytes(client_data_json);
-    let mut msg = [0_u8; MAX_AUTHENTICATOR_DATA_LEN + 32];
-    let msg_len = authenticator_data.len() + client_hash.len();
-    msg[..authenticator_data.len()].copy_from_slice(authenticator_data);
-    msg[authenticator_data.len()..msg_len].copy_from_slice(&client_hash);
-
-    let Ok(verifying_key) = p256::ecdsa::VerifyingKey::from_sec1_bytes(owner.as_ref()) else {
+    let Ok(compact) = signature.signature.as_ref().try_into() else {
         return false;
     };
-    let Ok(sig) = p256::ecdsa::Signature::from_slice(signature.signature.as_ref()) else {
+    let Ok(challenge) = expected_challenge.as_ref().try_into() else {
         return false;
     };
-    verifying_key.verify(&msg[..msg_len], &sig).is_ok()
+    hellas_webauthn::verify(
+        &hellas_webauthn::Assertion {
+            signature: compact,
+            authenticator_data: signature.authenticator_data.as_slice(),
+            client_data_json: signature.client_data_json.as_slice(),
+        },
+        &key,
+        challenge,
+    )
+    .is_ok()
 }
 
 impl Transaction {
@@ -1071,11 +959,11 @@ impl Transaction {
                 signature,
             } => {
                 let expected = transfer_challenge(network, input, recipient, *amount);
-                verify_webauthn_signature(expected.as_ref(), signature, owner.public_key())
+                verify_webauthn_signature(&expected, signature, owner.public_key())
             }
             Self::MergeCoin { inputs, signature } => {
                 let expected = merge_challenge(network, inputs.as_slice());
-                verify_webauthn_signature(expected.as_ref(), signature, owner.public_key())
+                verify_webauthn_signature(&expected, signature, owner.public_key())
             }
             Self::Kernel(_) => false,
         }
@@ -1250,8 +1138,13 @@ pub fn addr_from_signing_key(key: &p256::ecdsa::SigningKey) -> Address {
     Address::from(UserPublicKey::from(key.verifying_key().to_owned()))
 }
 
+/// The origin the mock signer claims. The verifier ignores it; the mock
+/// keeps emitting it, with its RP ID hash, so the golden encodings below
+/// still show a browser-shaped assertion.
 #[cfg(test)]
 const MOCK_WEBAUTHN_ORIGIN: &str = "https://wallet.hellas.ai";
+#[cfg(test)]
+const MOCK_WEBAUTHN_RP_ID: &str = "wallet.hellas.ai";
 
 #[cfg(test)]
 fn push_bytes(dst: &mut [u8], len: &mut usize, bytes: &[u8]) -> Option<()> {
@@ -1265,44 +1158,39 @@ fn push_bytes(dst: &mut [u8], len: &mut usize, bytes: &[u8]) -> Option<()> {
 }
 
 #[cfg(test)]
-fn client_data_json_for_origin(challenge: &Digest, origin: &str) -> Option<ClientDataJson> {
-    let mut challenge_buf = [0_u8; 43];
-    let challenge_b64 = Base64UrlUnpadded::encode(challenge.as_ref(), &mut challenge_buf).ok()?;
+fn mock_client_data_json(challenge: &Digest) -> Option<ClientDataJson> {
+    let challenge = hellas_webauthn::encode_challenge(challenge.as_ref().try_into().ok()?);
     let mut json = [0_u8; MAX_CLIENT_DATA_JSON_LEN];
     let mut len = 0;
-    push_bytes(&mut json, &mut len, br#"{"type":""#)?;
-    push_bytes(&mut json, &mut len, WEBAUTHN_TYPE_GET.as_bytes())?;
-    push_bytes(&mut json, &mut len, br#"","challenge":""#)?;
-    push_bytes(&mut json, &mut len, challenge_b64.as_bytes())?;
+    push_bytes(
+        &mut json,
+        &mut len,
+        br#"{"type":"webauthn.get","challenge":""#,
+    )?;
+    push_bytes(&mut json, &mut len, &challenge)?;
     push_bytes(&mut json, &mut len, br#"","origin":""#)?;
-    push_bytes(&mut json, &mut len, origin.as_bytes())?;
+    push_bytes(&mut json, &mut len, MOCK_WEBAUTHN_ORIGIN.as_bytes())?;
     push_bytes(&mut json, &mut len, br#"","crossOrigin":false}"#)?;
     byte_list_from_slice(&json[..len])
 }
 
 #[cfg(test)]
-/// Creates a deterministic `WebAuthn` signature for tests using `origin`.
+/// Creates a deterministic `WebAuthn` signature for tests.
 #[must_use]
-pub fn mock_webauthn_sign_with_origin(
+pub fn mock_webauthn_sign(
     key: &p256::ecdsa::SigningKey,
     challenge: &Digest,
-    origin: &str,
 ) -> Option<WebAuthnSignature> {
-    use p256::ecdsa::signature::Signer as _;
+    use p256::ecdsa::signature::hazmat::PrehashSigner as _;
 
-    let rp_id_hash = rp_id_hash_from_origin(origin)?;
-    let client_data_json = client_data_json_for_origin(challenge, origin)?;
+    let client_data_json = mock_client_data_json(challenge)?;
 
     let mut authenticator_data = [0_u8; MIN_AUTHENTICATOR_DATA_LEN];
-    authenticator_data[..32].copy_from_slice(&rp_id_hash);
-    authenticator_data[32] = 0x05; // UP | UV
+    authenticator_data[..32].copy_from_slice(&sha256_bytes(MOCK_WEBAUTHN_RP_ID.as_bytes()));
+    authenticator_data[32] = hellas_webauthn::FLAG_UP | hellas_webauthn::FLAG_UV;
 
-    let client_hash = sha256_bytes(client_data_json.as_slice());
-    let mut msg = [0_u8; MIN_AUTHENTICATOR_DATA_LEN + 32];
-    msg[..authenticator_data.len()].copy_from_slice(&authenticator_data);
-    msg[authenticator_data.len()..].copy_from_slice(&client_hash);
-
-    let signed: p256::ecdsa::Signature = key.sign(&msg);
+    let digest = hellas_webauthn::signed_digest(&authenticator_data, client_data_json.as_slice());
+    let signed: p256::ecdsa::Signature = key.sign_prehash(&digest).ok()?;
     let normalized = signed.normalize_s();
     let Ok(signature) = UserSignature::decode(normalized.to_bytes().as_ref()) else {
         return None;
@@ -1313,16 +1201,6 @@ pub fn mock_webauthn_sign_with_origin(
         authenticator_data: byte_list_from_slice(&authenticator_data)?,
         client_data_json,
     })
-}
-
-#[cfg(test)]
-/// Creates a deterministic `WebAuthn` signature for tests.
-#[must_use]
-pub fn mock_webauthn_sign(
-    key: &p256::ecdsa::SigningKey,
-    challenge: &Digest,
-) -> Option<WebAuthnSignature> {
-    mock_webauthn_sign_with_origin(key, challenge, MOCK_WEBAUTHN_ORIGIN)
 }
 
 #[cfg(test)]
@@ -1746,25 +1624,6 @@ mod tests {
         let wrong = addr_from_signing_key(&secp256r1_key_from_seed(2));
         let (_, tx) = sample_transfer(&key);
         assert!(!tx.verify_signature(TEST_NETWORK, &wrong));
-    }
-
-    #[test]
-    fn signature_verification_fails_with_wrong_origin() {
-        let key = secp256r1_key_from_seed(1);
-        let (sender, mut tx) = sample_transfer(&key);
-        let Transaction::Transfer {
-            input,
-            recipient,
-            amount,
-            signature,
-        } = &mut tx
-        else {
-            panic!("expected transfer")
-        };
-        let challenge = transfer_challenge(TEST_NETWORK, input, recipient, *amount);
-        signature.client_data_json =
-            client_data_json_for_origin(&challenge, "https://evil.example").expect("client data");
-        assert!(!tx.verify_signature(TEST_NETWORK, &sender));
     }
 
     /// The funded accounts in the shipped genesis documents are

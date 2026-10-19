@@ -30,7 +30,6 @@ use hellas_rpc::{
     call::{GeneralSubmitRoute, WorkResponseRoute},
 };
 use hellas_wire::{PeerIdentity, StreamTransport, TransportContext, WireCode, WireStatus};
-use p256::ecdsa::Signature as P256Signature;
 use std::{collections::HashMap, io, net::SocketAddr, sync::Arc};
 use tokio::{
     net::{TcpListener, TcpStream},
@@ -535,14 +534,13 @@ fn settlement_key_from_bytes(
 }
 
 fn user_signature_from_der(bytes: &[u8]) -> Result<UserSignature, WireStatus> {
-    let signature = P256Signature::from_der(bytes).map_err(|_| {
+    let signature = hellas_webauthn::signature_from_der(bytes).map_err(|_| {
         WireStatus::new(
             WireCode::InvalidArgument,
             "signature must be valid DER-encoded P-256 ECDSA",
         )
     })?;
-    let normalized = signature.normalize_s();
-    UserSignature::decode(normalized.to_bytes().as_ref()).map_err(|_| {
+    UserSignature::decode(signature.as_slice()).map_err(|_| {
         WireStatus::new(
             WireCode::InvalidArgument,
             "signature must be a valid low-S P-256 signature",
