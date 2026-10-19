@@ -51,6 +51,7 @@ futures-core = { workspace = true }
 futures-util = { version = "0.3", default-features = false }
 hellas-auth.workspace = true
 hellas-kernel = { workspace = true, optional = true }
+hellas-webauthn.workspace = true
 hellas-wire = { workspace = true }
 hellas-xet = { workspace = true, features = ["chunking", "serde"] }
 http-body = { version = "1", optional = true }

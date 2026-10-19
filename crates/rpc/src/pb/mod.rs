@@ -230,13 +230,13 @@ mod id_pins {
             RevokeCredential, SetGatewayState, SetProviderState, WorkControl,
         };
         // Lifecycle requests carry their selected Auth authorization grant.
-        assert_eq!(<HostControl as ServiceMarker>::SERVICE_ID, 0xb85b_3317);
+        assert_eq!(<HostControl as ServiceMarker>::SERVICE_ID, 0xa78d_3168);
         assert_eq!(<SetProviderState as MethodMarker>::METHOD_ID, 0xab3a_b173);
         assert_eq!(<SetGatewayState as MethodMarker>::METHOD_ID, 0xa909_3160);
         assert_eq!(<GetGatewayAccess as MethodMarker>::METHOD_ID, 0xce7f_5d32);
         assert_eq!(<GrantControl as MethodMarker>::METHOD_ID, 0xc0e0_b21c);
         assert_eq!(<WorkControl as MethodMarker>::METHOD_ID, 0x995d_0334);
-        assert_eq!(<IssueCredential as MethodMarker>::METHOD_ID, 0xe2d6_a55b);
+        assert_eq!(<IssueCredential as MethodMarker>::METHOD_ID, 0xad8c_229b);
         assert_eq!(<RevokeCredential as MethodMarker>::METHOD_ID, 0xe7b1_8b70);
         assert_eq!(<BindProvider as MethodMarker>::METHOD_ID, 0xcb33_75a9);
     }

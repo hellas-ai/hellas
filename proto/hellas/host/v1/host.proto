@@ -117,6 +117,9 @@ message IssueCredentialRequest {
   bytes authorization = 1;
   // Canonical Auth GrantSpec; the server generates the credential and its verifier.
   bytes scope = 2;
+  // Canonical Auth CredentialHolder: the node key of the device that will hold
+  // the credential, or a gateway.invoke-only bearer for local HTTP clients.
+  bytes holder = 3;
 }
 
 // Secret material: send only over authenticated, encrypted HostControl.

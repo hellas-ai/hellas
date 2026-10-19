@@ -5,17 +5,22 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 use hellas_auth::authority::{
-    AuthorityId, CredentialId, CredentialSecret, SessionChallenge, UnixMillis,
+    AuthorityId, CredentialId, CredentialSecret, PasskeyAssertion, SessionChallenge, SessionProof,
+    UnixMillis,
 };
-use hellas_auth::{Digest, Signature, hash_tuple};
+use hellas_auth::{Digest, hash_tuple};
 use hellas_wire::TransportContext;
 use zeroize::Zeroizing;
 
 use crate::protocol::value::{CanonicalDecodeError, CanonicalDecoder, DagCborEncoder};
 
-pub const MAX_AUTHENTICATION_MESSAGE_BYTES: usize = 256;
+/// A response carries at most one `WebAuthn` assertion; everything else fits in
+/// the remaining fixed allowance.
+pub const MAX_AUTHENTICATION_MESSAGE_BYTES: usize = 256 + hellas_webauthn::MAX_DATA_LEN;
 const CHALLENGE: &str = "hellas.auth.session.challenge.v1";
-const RESPONSE: &str = "hellas.auth.session.response.v1";
+const RESPONSE: &str = "hellas.auth.session.response.v2";
+const PROOF_PASSKEY: u64 = 1;
+const PROOF_DAILY: u64 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum AuthenticationWireError {
@@ -88,22 +93,38 @@ pub fn decode_challenge(bytes: &[u8]) -> Result<SessionChallenge, Authentication
     Ok(challenge)
 }
 
+/// `[schema, credential id, proof, secret]`, where `proof` is
+/// `[1, signature, authenticatorData, clientDataJSON]` for a passkey session or
+/// `[2, signature]` for a daily one.
 pub fn encode_response(
     credential: &CredentialSecret,
-    signature: &Signature,
+    proof: &SessionProof,
 ) -> Result<Zeroizing<Vec<u8>>, AuthenticationWireError> {
-    let Signature::Secp256k1(signature) = signature else {
-        return Err(AuthenticationWireError::Encoding);
-    };
     let mut out = DagCborEncoder::new();
     out.array(4);
     out.str(RESPONSE);
     out.bytes(&credential.id().0);
-    out.bytes(signature);
+    match proof {
+        SessionProof::Passkey(assertion) => {
+            out.array(4);
+            out.u64(PROOF_PASSKEY);
+            out.bytes(assertion.signature());
+            out.bytes(assertion.authenticator_data());
+            out.bytes(assertion.client_data_json());
+        }
+        SessionProof::Daily(signature) => {
+            out.array(2);
+            out.u64(PROOF_DAILY);
+            out.bytes(signature);
+        }
+    }
     out.bytes(&[0; 32]);
     // Finish allocation before inserting the secret, so encoder reallocations
     // never release a plaintext copy. The returned buffer clears itself on drop.
     let mut bytes = Zeroizing::new(out.into_bytes());
+    if bytes.len() > MAX_AUTHENTICATION_MESSAGE_BYTES {
+        return Err(AuthenticationWireError::Bounds);
+    }
     let offset = bytes
         .len()
         .checked_sub(32)
@@ -117,16 +138,26 @@ pub fn encode_response(
 
 pub fn decode_response(
     bytes: &[u8],
-) -> Result<(CredentialSecret, Signature), AuthenticationWireError> {
+) -> Result<(CredentialSecret, SessionProof), AuthenticationWireError> {
     let mut input = decoder(bytes, RESPONSE, 4)?;
     let id = input
         .bytes()?
         .try_into()
         .map_err(|_| AuthenticationWireError::Encoding)?;
-    let signature = input
-        .bytes()?
-        .try_into()
-        .map_err(|_| AuthenticationWireError::Encoding)?;
+    let fields = input.array_len()?;
+    let proof = match (fields, input.u64()?) {
+        (4, PROOF_PASSKEY) => {
+            let signature = signature(&mut input)?;
+            let authenticator_data = input.bytes()?.to_vec();
+            let client_data_json = input.bytes()?.to_vec();
+            SessionProof::Passkey(
+                PasskeyAssertion::new(signature, authenticator_data, client_data_json)
+                    .map_err(|_| AuthenticationWireError::Encoding)?,
+            )
+        }
+        (2, PROOF_DAILY) => SessionProof::Daily(signature(&mut input)?),
+        _ => return Err(AuthenticationWireError::Encoding),
+    };
     let secret: &[u8; 32] = input
         .bytes()?
         .try_into()
@@ -134,8 +165,15 @@ pub fn decode_response(
     input.finish()?;
     Ok((
         CredentialSecret::from_parts(CredentialId(id), *secret),
-        Signature::Secp256k1(signature),
+        proof,
     ))
+}
+
+fn signature(input: &mut CanonicalDecoder<'_>) -> Result<[u8; 64], AuthenticationWireError> {
+    input
+        .bytes()?
+        .try_into()
+        .map_err(|_| AuthenticationWireError::Encoding)
 }
 
 fn decoder<'a>(
