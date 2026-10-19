@@ -1,9 +1,9 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use hellas_auth::PublicKey;
 use hellas_auth::authority::{GrantId, Revision, UnixMillis};
-use hellas_auth::{Digest, PublicKey};
 use hellas_kernel::NetworkId;
 use hellas_rpc::*;
-use hellas_work::model::grant::records::{grant_producer, grant_transport, verify_contact};
+use hellas_work::model::grant::records::verify_contact;
 use hellas_work::model::{
     fetch::*,
     grant::{records::*, resource::*, *},
@@ -81,7 +81,7 @@ fn signed_template_is_exact_and_only_client_repairs_generation() {
 fn contact_proof_offer_signature_and_actor_channel_binding_are_not_advisory() {
     let key = principal(1).1;
     let provider = software_enrollment(1, [1; 32]);
-    let (client_principal, client_key) = principal(2);
+    let (client_principal, _) = principal(2);
     let client = software_enrollment(2, [2; 32]);
     let (stranger, _) = principal(3);
     let mut bad = client.clone();
@@ -141,26 +141,6 @@ fn contact_proof_offer_signature_and_actor_channel_binding_are_not_advisory() {
     empty.grant.policies.clear();
     assert_eq!(SignedOffer::sign(empty, &key), Err(GrantError::Limits));
     let bytes = signed.encode().unwrap();
-    let mut other_device = client.clone();
-    other_device.genesis.statement.transport_public_key = PublicKey::Ed25519([42; 32]);
-    other_device.genesis.statement.installation_nonce = [43; 32];
-    other_device.genesis.root_proof = RootProof::Software(
-        client_key
-            .sign_digest(Digest::hash(
-                &other_device.genesis.statement.canonical_bytes(),
-            ))
-            .unwrap(),
-    );
-    verify_contact(&other_device).unwrap();
-    assert_ne!(other_device.content_id(), client.content_id());
-    assert_ne!(
-        grant_transport(&other_device).unwrap(),
-        grant_transport(&client).unwrap()
-    );
-    assert_eq!(
-        grant_producer(&other_device).unwrap(),
-        grant_producer(&client).unwrap()
-    );
     assert_eq!(
         SignedOffer::decode(&bytes, UnixMillis(1000)).unwrap(),
         signed

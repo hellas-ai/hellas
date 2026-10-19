@@ -262,7 +262,7 @@ reuse. Worker spans report that observed reuse as
 
 The CLI and native hosts use `hellas_sdk::paid_gateway::PaidGateway`. Load
 the same pool file with `load_pool_options(path, assurance)`,
-and pass the resulting typed `PaidGatewayOptions` and a `ClientIdentity` to
+and pass the resulting typed `PaidGatewayOptions` and a `NodeIdentity` to
 `PaidGateway::open`. Applications can also construct the options directly from
 `PaidWorkOptions`; the pool validates duplicate providers, journals and funding
 before opening any connections. It owns recovery, admission, per-channel

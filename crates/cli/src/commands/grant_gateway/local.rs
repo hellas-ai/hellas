@@ -45,7 +45,7 @@ pub async fn prepare(
     let content_store =
         crate::commands::environment::index_content(&content.paths, &content.roots, &index)?;
 
-    let signer = Arc::new(identity.producer_key.clone());
+    let signer = Arc::new(identity.node_key.clone());
     let mut executor = ExecutorSpawnConfig::fetch_only(
         signer.clone(),
         Assurance::ProducerSigned,

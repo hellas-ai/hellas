@@ -176,9 +176,12 @@ fn principal_of(passkey: &hellas_kernel::SoftPasskey) -> PrincipalId {
     PrincipalId::from_public_key(PublicKey::P256(passkey.party_key().to_bytes())).unwrap()
 }
 
+/// A provider's self-attested enrollment whose node key is `[seed; 32]`, the
+/// node key of `principal(seed)`'s device. Its software root has its own key.
 pub fn software_enrollment(seed: u8, transport: [u8; 32]) -> ProviderEnrollmentBundle {
+    let root = ProducerSigningKey::from_secret_bytes([0xc0 | seed; 32]).unwrap();
     let key = ProducerSigningKey::from_secret_bytes([seed; 32]).unwrap();
-    enrollment(&key, &key, transport, [seed; 32])
+    enrollment(&root, &key, transport, [seed; 32])
 }
 
 /// Keep root, producer, transport and installation identities independent in fixtures.

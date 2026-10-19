@@ -197,15 +197,15 @@ impl PaidGateway {
     /// by CLI and embedding applications. Call `drain` during host shutdown.
     pub async fn open(
         options: PaidGatewayOptions,
-        identity: crate::ClientIdentity,
+        identity: crate::NodeIdentity,
         node: crate::FullNode,
     ) -> Result<Arc<Self>> {
         options.validate()?;
         for provider in &options.providers {
             provider.config.check_node(&node)?;
         }
-        let settlement_key = Secp256k1Signer::from_secret_scalar(identity.caller_secret_bytes())
-            .map_err(|_| PoolError::Invalid("settlement identity is not secp256k1"))?;
+        let settlement_key = Secp256k1Signer::from_secret_scalar(identity.node_secret_bytes())
+            .map_err(|_| PoolError::Invalid("node key is not a secp256k1 channel signer"))?;
         let providers = options
             .providers
             .into_iter()
@@ -229,7 +229,7 @@ impl PaidGateway {
             endpoint: bind_paid_endpoint(identity.transport_key()).await?,
             node,
             settlement_key,
-            producer_key: identity.caller_key().clone(),
+            producer_key: identity.node_key().clone(),
             tasks: crate::gateway_work::WorkTasks::default(),
         });
         // Restart recovery uses the retained input and certificate, never a new job.
@@ -861,7 +861,7 @@ mod tests {
         let mut fixture = crate::test_support::PaidFixture::new();
         let node = fixture.node().await;
         let options = pool_options(&fixture);
-        let identity = crate::ClientIdentity::from_secret_bytes([1; 32], [1; 32]).unwrap();
+        let identity = crate::NodeIdentity::from_secret_bytes([0x31; 32], [0x32; 32]).unwrap();
         let provider = options.providers[0].provider;
         let request = |method: &str| WorkFetchRequest {
             provider,
@@ -872,7 +872,7 @@ mod tests {
         let prepared = prepare_fetch(
             &options.providers[0],
             &request("responses"),
-            identity.caller_key(),
+            identity.node_key(),
         )
         .unwrap();
         let PreparedWorkInput::Fetch(prepared) = prepared else {
@@ -921,17 +921,16 @@ mod tests {
         };
         *selected = contract.clone();
         policy.allowed_environment = contract.manifest_id();
-        let identity = crate::ClientIdentity::from_secret_bytes([1; 32], [1; 32]).unwrap();
+        let identity = crate::NodeIdentity::from_secret_bytes([0x31; 32], [0x32; 32]).unwrap();
         let request = WorkFetchRequest {
             provider: options.providers[0].provider,
             service: "openai".into(),
             method: "responses".into(),
             body: crate::test_support::BODY.to_vec(),
         };
-        assert!(prepare_fetch(&options.providers[0], &request, identity.caller_key()).is_err());
+        assert!(prepare_fetch(&options.providers[0], &request, identity.node_key()).is_err());
         options.providers[0].provider_trust.allowed_environments = vec![contract.manifest_id()];
-        let prepared =
-            prepare_fetch(&options.providers[0], &request, identity.caller_key()).unwrap();
+        let prepared = prepare_fetch(&options.providers[0], &request, identity.node_key()).unwrap();
         let PreparedWorkInput::Fetch(prepared) = prepared else {
             panic!("Fetch input")
         };
@@ -940,7 +939,7 @@ mod tests {
             panic!("Fetch fixture")
         };
         policy.allowed_environment = hellas_rpc::ContentId::from_bytes([99; 32]);
-        assert!(prepare_fetch(&options.providers[0], &request, identity.caller_key()).is_err());
+        assert!(prepare_fetch(&options.providers[0], &request, identity.node_key()).is_err());
         assert!(!fixture.root.path().join("client").exists());
     }
 
@@ -982,7 +981,7 @@ mod tests {
         second.journal_root = fixture.root.path().join("other");
         options.providers.push(second);
         let result =
-            PaidGateway::open(options, crate::ClientIdentity::generate(), node.clone()).await;
+            PaidGateway::open(options, crate::NodeIdentity::generate(), node.clone()).await;
         assert!(matches!(
             result,
             Err(PoolError::Invalid(

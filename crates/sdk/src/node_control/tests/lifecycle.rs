@@ -50,7 +50,7 @@ impl Harness {
                     Ok(crate::start_fetch_provider(
                         crate::FetchProviderOptions {
                             port: Some(0),
-                            identity: crate::ClientIdentity::from_secret_bytes(
+                            identity: crate::NodeIdentity::from_secret_bytes(
                                 [5; 32],
                                 hellas_work::test_support::actors::PROVIDER
                                     .node_key()

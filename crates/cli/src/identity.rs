@@ -24,7 +24,7 @@ const IDENTITY_TAG: &str = "hellas.provider.identity.persistence.v3";
 
 pub(crate) struct LocalIdentity {
     pub(crate) transport_key: SecretKey,
-    pub(crate) producer_key: ProducerSigningKey,
+    pub(crate) node_key: ProducerSigningKey,
     #[cfg(test)]
     pub(crate) genesis: SignedProviderGenesis,
     pub(crate) enrollment: ProviderEnrollmentBundle,
@@ -34,7 +34,7 @@ pub(crate) struct LocalIdentity {
 struct StoredIdentity {
     version: u8,
     root: StoredRoot,
-    producer_key: [u8; 32],
+    node_key: [u8; 32],
     transport_key: [u8; 32],
     enrollment: ProviderEnrollmentBundle,
 }
@@ -64,11 +64,11 @@ impl LocalIdentity {
 }
 
 fn build_open_identity(
-    producer_key: &ProducerSigningKey,
+    node_key: &ProducerSigningKey,
     enrollment: &ProviderEnrollmentBundle,
 ) -> anyhow::Result<Arc<ProviderOpen<ProducerSigningKey>>> {
     Ok(Arc::new(ProviderOpen::new(
-        Arc::new(producer_key.clone()),
+        Arc::new(node_key.clone()),
         enrollment.clone(),
         None,
     )?))
@@ -88,16 +88,13 @@ pub(crate) fn load_or_create(path: Option<&Path>) -> anyhow::Result<LocalIdentit
     }
 }
 
-/// The key this identity settles a paid channel with.
-///
-/// Not a second key and not a new one: the provider's on-chain party key
-/// *is* its producer identity, one secp256k1 scalar read through two
-/// primitive crates ([`hellas_executor::kernel_signer`]). So `identity
-/// init` is where an operator's settlement key comes from, and there is
-/// nothing here that could invent one — a party nobody has funded stakes
-/// no bond and settles no channel.
-pub(crate) fn settlement_signer(identity: &LocalIdentity) -> hellas_kernel::Secp256k1Signer {
-    hellas_executor::kernel_signer(&identity.producer_key)
+/// The node key as the kernel signer of this node's channel moves: one
+/// machine key signs its transcripts and its channels.
+pub(crate) fn settlement_signer(
+    identity: &LocalIdentity,
+) -> anyhow::Result<hellas_kernel::Secp256k1Signer> {
+    hellas_kernel::Secp256k1Signer::from_secret_scalar(identity.node_key.to_secret_bytes())
+        .map_err(|_| anyhow::anyhow!("the node key is not a valid secp256k1 scalar"))
 }
 
 pub(crate) fn load_existing(path: Option<&Path>) -> anyhow::Result<LocalIdentity> {
@@ -152,11 +149,11 @@ fn create_root(_installation_nonce: [u8; 32]) -> anyhow::Result<PlatformRoot> {
 }
 
 fn create(path: &Path) -> anyhow::Result<LocalIdentity> {
-    let producer_key = ProducerSigningKey::generate();
+    let node_key = ProducerSigningKey::generate();
     let transport_key = SecretKey::generate();
     let installation_nonce = rand::random();
     let root = Arc::new(create_root(installation_nonce)?);
-    let statement = statement(&root, &producer_key, &transport_key, installation_nonce);
+    let statement = statement(&root, &node_key, &transport_key, installation_nonce);
     let genesis = SignedProviderGenesis {
         root_proof: root.prove(&statement.canonical_bytes())?,
         statement,
@@ -168,14 +165,14 @@ fn create(path: &Path) -> anyhow::Result<LocalIdentity> {
     let stored = StoredIdentity {
         version: VERSION,
         root: stored_root,
-        producer_key: producer_key.to_secret_bytes(),
+        node_key: node_key.to_secret_bytes(),
         transport_key: transport_key.to_bytes(),
         enrollment: enrollment.clone(),
     };
-    let open_identity = build_open_identity(&producer_key, &enrollment)?;
+    let open_identity = build_open_identity(&node_key, &enrollment)?;
     let identity = LocalIdentity {
         transport_key,
-        producer_key,
+        node_key,
         #[cfg(test)]
         genesis,
         enrollment,
@@ -186,7 +183,7 @@ fn create(path: &Path) -> anyhow::Result<LocalIdentity> {
     }
     info!(
         node_id = %identity.transport_key.public(),
-        producer_id = ?identity.producer_key.producer_id(),
+        producer_id = ?identity.node_key.producer_id(),
         path = %path.display(),
         "created provider identity"
     );
@@ -202,12 +199,12 @@ fn materialize(stored: &StoredIdentity) -> anyhow::Result<LocalIdentity> {
             ProducerSigningKey::from_secret_bytes(*secret).context("invalid software root key")?,
         ),
     });
-    let producer_key = ProducerSigningKey::from_secret_bytes(stored.producer_key)
-        .context("invalid producer key")?;
+    let node_key =
+        ProducerSigningKey::from_secret_bytes(stored.node_key).context("invalid node key")?;
     let transport_key = SecretKey::from(stored.transport_key);
     let statement = statement(
         &root,
-        &producer_key,
+        &node_key,
         &transport_key,
         stored.enrollment.genesis.statement.installation_nonce,
     );
@@ -231,10 +228,10 @@ fn materialize(stored: &StoredIdentity) -> anyhow::Result<LocalIdentity> {
     if enrollment != stored.enrollment {
         bail!("stored provider enrollment does not match the persisted keys");
     }
-    let open_identity = build_open_identity(&producer_key, &enrollment)?;
+    let open_identity = build_open_identity(&node_key, &enrollment)?;
     Ok(LocalIdentity {
         transport_key,
-        producer_key,
+        node_key,
         #[cfg(test)]
         genesis,
         enrollment,
@@ -288,7 +285,7 @@ impl StoredIdentity {
                 encoder.bytes(secret);
             }
         }
-        encoder.bytes(&self.producer_key);
+        encoder.bytes(&self.node_key);
         encoder.bytes(&self.transport_key);
         encoder.bytes(&self.enrollment.canonical_bytes());
         encoder.into_bytes()
@@ -309,7 +306,7 @@ impl StoredIdentity {
             1 => bail!("Apple App Attest identity is not supported on this platform"),
             value => bail!("unknown identity root kind {value}"),
         };
-        let producer_key = decoder.fixed_bytes("producer key")?;
+        let node_key = decoder.fixed_bytes("node key")?;
         let transport_key = decoder.fixed_bytes("transport key")?;
         let enrollment =
             ProviderEnrollmentBundle::from_canonical_bytes(decoder.bytes("provider enrollment")?)
@@ -318,7 +315,7 @@ impl StoredIdentity {
         let stored = Self {
             version,
             root,
-            producer_key,
+            node_key,
             transport_key,
             enrollment,
         };
@@ -340,7 +337,7 @@ fn decode(path: &Path, bytes: &[u8]) -> anyhow::Result<LocalIdentity> {
         .with_context(|| format!("invalid identity file {}", path.display()))?;
     info!(
         node_id = %identity.transport_key.public(),
-        producer_id = ?identity.producer_key.producer_id(),
+        producer_id = ?identity.node_key.producer_id(),
         path = %path.display(),
         "loaded provider identity"
     );

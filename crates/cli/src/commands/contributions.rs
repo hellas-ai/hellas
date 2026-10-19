@@ -46,7 +46,7 @@ pub enum OfferCommand {
 }
 pub fn principal(identity: &crate::identity::LocalIdentity) -> CliResult<PrincipalId> {
     Ok(PrincipalId::from_public_key(
-        identity.producer_key.public_key(),
+        identity.node_key.public_key(),
     )?)
 }
 pub(crate) fn data_root(identity: &PrincipalId) -> CliResult<PathBuf> {

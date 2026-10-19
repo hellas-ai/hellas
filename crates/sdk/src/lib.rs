@@ -32,7 +32,7 @@ pub use provider::{
     FetchProviderOptions, ProviderAuthority, ProviderControl, ProviderError, ProviderGrants,
     ProviderHandle, ProviderOpen, ProviderOptions, start_fetch_provider,
 };
-pub use remote::ClientIdentity;
+pub use remote::NodeIdentity;
 
 pub mod local {
     pub use hellas_wire::local::{LOCAL_MUX_SLOTS, LocalControlServer, connect, transport};

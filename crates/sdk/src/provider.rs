@@ -16,7 +16,7 @@ use hellas_wire::{
 };
 use iroh::{Endpoint, EndpointId, endpoint::presets};
 
-use crate::ClientIdentity;
+use crate::NodeIdentity;
 
 /// Startup errors, before a provider accepts requests.
 #[derive(Debug, thiserror::Error)]
@@ -79,7 +79,7 @@ impl PaidProviderOptions {
 /// An attested Fetch provider with an operator-supplied route registry.
 pub struct FetchProviderOptions<R> {
     pub port: Option<u16>,
-    pub identity: ClientIdentity,
+    pub identity: NodeIdentity,
     pub enrollment: ProviderEnrollmentBundle,
     pub root: Arc<R>,
     pub state_directory: PathBuf,
@@ -144,7 +144,7 @@ impl<R> FetchProviderOptions<R> {
             .map(|PaidProviderOptions { config, node }| {
                 let policy = config.provider_policy();
                 let settlement_key = hellas_kernel::Secp256k1Signer::from_secret_scalar(
-                    options.identity.caller_secret_bytes(),
+                    options.identity.node_secret_bytes(),
                 )
                 .map_err(|_| ProviderError::SettlementKey)?;
                 let runner_config = crate::paid_provider::WorkRunnerConfig {
@@ -160,7 +160,7 @@ impl<R> FetchProviderOptions<R> {
                 Ok::<_, ProviderError>((runner_config, node))
             })
             .transpose()?;
-        let producer_key = Arc::new(options.identity.caller_key().clone());
+        let producer_key = Arc::new(options.identity.node_key().clone());
         let mut executor_config =
             ExecutorSpawnConfig::fetch_only(producer_key.clone(), assurance, options.routes);
         executor_config.fetch_max_in_flight = options.fetch_max_in_flight;

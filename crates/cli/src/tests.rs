@@ -583,12 +583,15 @@ fn serving_paid_work_loads_a_stored_settlement_identity() {
     let loaded = load_command_identity(&paid.command, Some(&path))
         .expect("the stored identity is what paid work settles with");
     assert_eq!(
-        identity::settlement_signer(&loaded).party_key(),
-        identity::settlement_signer(&created).party_key(),
+        identity::settlement_signer(&loaded).unwrap().party_key(),
+        identity::settlement_signer(&created).unwrap().party_key(),
     );
     assert_eq!(
-        &identity::settlement_signer(&loaded).party_key().to_bytes()[..],
-        loaded.producer_key.public_key().bytes(),
+        &identity::settlement_signer(&loaded)
+            .unwrap()
+            .party_key()
+            .to_bytes()[..],
+        loaded.node_key.public_key().bytes(),
         "the settlement party is the producer identity, not a second key",
     );
 }

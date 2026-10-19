@@ -34,7 +34,7 @@ async fn paid_provider_advertises_work_and_chain_services() {
     tokio::time::timeout(Duration::from_secs(30), async {
         let mut fixture = crate::test_support::PaidFixture::new();
         let node = fixture.node().await;
-        let identity = ClientIdentity::from_secret_bytes([4; 32], [2; 32]).unwrap();
+        let identity = NodeIdentity::from_secret_bytes([4; 32], [2; 32]).unwrap();
         let (enrollment, _) = crate::test_support::enrollment(identity.transport_key().public());
         let mut routes = FetchRouteRegistry::new();
         routes

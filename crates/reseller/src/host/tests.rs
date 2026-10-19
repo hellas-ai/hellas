@@ -186,14 +186,11 @@ impl ResellerBuilder {
     async fn start(self) -> Reseller {
         let root = tempfile::tempdir().unwrap();
         let provider_identity =
-            ClientIdentity::from_secret_bytes([5; 32], PROVIDER.node_key().to_secret_bytes())
+            NodeIdentity::from_secret_bytes([5; 32], PROVIDER.node_key().to_secret_bytes())
                 .unwrap();
-        let provider_bundle = provider_identity
-            .contact_enrollment(&ROOT.node_key())
-            .unwrap();
+        let provider_bundle = software_enrollment(&provider_identity);
         let client_identity =
-            ClientIdentity::from_secret_bytes([3; 32], FRIEND.node_key().to_secret_bytes())
-                .unwrap();
+            NodeIdentity::from_secret_bytes([3; 32], FRIEND.node_key().to_secret_bytes()).unwrap();
         let upstream = tls_fixture(self.upstream).await;
         let options = || {
             let mut routes = FetchRouteRegistry::new();
@@ -361,8 +358,8 @@ impl ResellerBuilder {
                         pinned.offer().grant.max_job_millis.get(),
                     ),
                     target: pinned,
-                    principal: hellas_work::test_support::subject_of(client_identity.caller_key()),
-                    signer: Arc::new(client_identity.caller_key().clone()),
+                    principal: hellas_work::test_support::subject_of(client_identity.node_key()),
+                    signer: Arc::new(client_identity.node_key().clone()),
                     application: application.clone(),
                     journal_root: root.path().join("client"),
                 },
@@ -451,18 +448,29 @@ async fn credential_revocation_closes_the_real_upstream_tls_body() {
     fixture.shutdown().await;
 }
 
+/// The provider's self-attested enrollment: a software root, distinct from
+/// its node and transport keys, endorses both.
+fn software_enrollment(identity: &NodeIdentity) -> ProviderEnrollmentBundle {
+    hellas_work::test_support::enrollment(
+        &hellas_auth::ProducerSigningKey::from_secret_bytes([0x55; 32]).unwrap(),
+        identity.node_key(),
+        *identity.node_id().as_bytes(),
+        [0x56; 32],
+    )
+}
+
 struct OpenAiFixture {
     root: tempfile::TempDir,
-    identity: ClientIdentity,
+    identity: NodeIdentity,
     enrollment: ProviderEnrollmentBundle,
 }
 impl OpenAiFixture {
     fn new() -> Self {
         let root = tempfile::tempdir().unwrap();
         let identity =
-            ClientIdentity::from_secret_bytes([5; 32], PROVIDER.node_key().to_secret_bytes())
+            NodeIdentity::from_secret_bytes([5; 32], PROVIDER.node_key().to_secret_bytes())
                 .unwrap();
-        let enrollment = identity.contact_enrollment(&ROOT.node_key()).unwrap();
+        let enrollment = software_enrollment(&identity);
         Self {
             root,
             identity,

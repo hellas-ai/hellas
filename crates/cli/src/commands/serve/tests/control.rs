@@ -29,7 +29,7 @@ fn passkey(root: &Path, name: &str, scalar: u8) -> (PathBuf, auth::PrincipalId) 
 fn holder(root: &Path, name: &str, identity: &LocalIdentity) -> PathBuf {
     let path = root.join(name);
     let holder = auth::CredentialHolder::Node(
-        auth::NodeKey::from_public_key(identity.producer_key.public_key()).unwrap(),
+        auth::NodeKey::from_public_key(identity.node_key.public_key()).unwrap(),
     );
     std::fs::write(&path, serde_json::to_vec(&holder).unwrap()).unwrap();
     path
@@ -153,7 +153,7 @@ impl Daemon {
         let socket = grant_config.control_socket.clone();
         let journal = grant_config.journal_root.clone();
         let mut executor = ExecutorSpawnConfig::fetch_only(
-            Arc::new(provider_identity.producer_key.clone()),
+            Arc::new(provider_identity.node_key.clone()),
             Assurance::ProducerSigned,
             FetchRouteRegistry::default(),
         );
@@ -238,7 +238,7 @@ impl Daemon {
             name,
             profile.authority,
             &profile.credential,
-            hellas_sdk::work::node::SessionKey::Node(&self.identity.producer_key),
+            hellas_sdk::work::node::SessionKey::Node(&self.identity.node_key),
         )
         .await
         .unwrap()
@@ -509,7 +509,7 @@ async fn offline_recovery_publishes_a_usable_replacement_credential() {
             authority.authority(),
             binding,
             secret.id(),
-            &daemon.identity.producer_key,
+            &daemon.identity.node_key,
         )?;
         pending
             .complete(authority, binding, secret, &proof, now)

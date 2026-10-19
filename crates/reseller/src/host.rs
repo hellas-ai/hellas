@@ -1,8 +1,8 @@
 //! Vendor composition uses SDK's checked Fetch service and its existing authority store.
 use hellas_rpc::ProviderEnrollmentBundle;
 use hellas_sdk::{
-    ClientIdentity, FetchProviderOptions, FetchRoute, FetchRouteEntry, FetchRoutePolicy,
-    FetchRouteRegistry, GrantProviderOptions, ProviderError, ProviderHandle, RootProver,
+    FetchProviderOptions, FetchRoute, FetchRouteEntry, FetchRoutePolicy, FetchRouteRegistry,
+    GrantProviderOptions, NodeIdentity, ProviderError, ProviderHandle, RootProver,
     start_fetch_provider,
 };
 use std::{path::PathBuf, sync::Arc};
@@ -23,7 +23,7 @@ pub enum OpenAiProviderError {
 
 pub struct OpenAiProviderOptions<R> {
     pub port: Option<u16>,
-    pub identity: ClientIdentity,
+    pub identity: NodeIdentity,
     pub enrollment: ProviderEnrollmentBundle,
     pub root: Arc<R>,
     pub state_directory: PathBuf,

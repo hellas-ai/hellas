@@ -784,7 +784,7 @@ async fn a_restarted_node_rebuilds_its_endpoint_from_the_root_and_the_identity()
     let identity_path = dir.path().join("identity");
     let identity = crate::identity::load_or_create(Some(&identity_path))
         .expect("the operator's identity is created once");
-    let settlement = crate::identity::settlement_signer(&identity);
+    let settlement = crate::identity::settlement_signer(&identity).unwrap();
     let terms = bond_terms_staked_by(&settlement);
     let bond_edge = Tx::edge_id_of(&bond_funding(), &Terms::work_stake_bond(terms.clone()));
 
@@ -839,7 +839,7 @@ async fn a_restarted_node_rebuilds_its_endpoint_from_the_root_and_the_identity()
     assert_eq!(store.state().revision(), Some(1));
     let mut endpoint = SetupEndpoint::new(
         store,
-        crate::identity::settlement_signer(&identity),
+        crate::identity::settlement_signer(&identity).unwrap(),
         admission.clone(),
     );
 

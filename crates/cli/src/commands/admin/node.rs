@@ -55,10 +55,9 @@ pub async fn run(args: AdminArgs, identity: &LocalIdentity) -> Result<()> {
         }
         _ => {}
     }
-    let key = passkey.as_ref().map_or(
-        SessionKey::Node(&identity.producer_key),
-        SessionKey::Passkey,
-    );
+    let key = passkey
+        .as_ref()
+        .map_or(SessionKey::Node(&identity.node_key), SessionKey::Passkey);
     let profile =
         profile::ClientProfile::load(args.profile.as_deref().context("--profile is required")?)?;
     if let Some(contact) = args.node_contact {

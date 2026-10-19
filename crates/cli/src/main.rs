@@ -732,7 +732,7 @@ async fn async_main() {
     } = &cli.command
     {
         let result = identity::load_existing(cli.identity.as_deref())
-            .and_then(|identity| commands::identity::show_producer_key(&identity.producer_key));
+            .and_then(|identity| commands::identity::show_producer_key(&identity.node_key));
         tracer_provider.shutdown();
         if let Err(err) = result {
             eprintln!("error: {err:#}");
@@ -883,7 +883,7 @@ async fn async_main() {
                         // The key every settlement this node signs is signed
                         // with, taken from the identity loaded above and
                         // never made here.
-                        let settlement_key = identity::settlement_signer(&local_identity);
+                        let settlement_key = identity::settlement_signer(&local_identity)?;
                         let open_identity = local_identity.open_identity();
                         let grants = if let Some(path) = grant_config_file.as_deref() {
                             anyhow::ensure!(assurance == hellas_rpc::Assurance::ProducerSigned, "grants require producer-signed assurance");
@@ -908,7 +908,7 @@ async fn async_main() {
                             fetch_max_in_flight,
                             fetch_queue_size,
                             secret_key,
-                            producer_key: local_identity.producer_key,
+                            producer_key: local_identity.node_key,
                             settlement_key,
                             open_identity,
                             assurance,
@@ -936,7 +936,7 @@ async fn async_main() {
                     // The bond is staked by the party this node already
                     // settles as, taken from the identity loaded above
                     // and never made here.
-                    settlement_key: identity::settlement_signer(&local_identity),
+                    settlement_key: identity::settlement_signer(&local_identity)?,
                     provider: local_identity.enrollment.clone(),
                     addresses: Vec::new(),
                     client: hellas_kernel::Key::from_bytes(commands::paid_work::fixed_hex("--client", &client)?),
@@ -1100,7 +1100,7 @@ async fn async_main() {
                     Some(
                         hellas_sdk::paid_gateway::PaidGateway::open(
                             options,
-                            hellas_sdk::ClientIdentity::from_secret_bytes(secret_key.to_bytes(), local_identity.producer_key.to_secret_bytes())?,
+                            hellas_sdk::NodeIdentity::from_secret_bytes(secret_key.to_bytes(), local_identity.node_key.to_secret_bytes())?,
                             node,
                         ).await? as std::sync::Arc<dyn hellas_gateway::WorkExecutionBackend>
                     )
@@ -1173,7 +1173,7 @@ async fn async_main() {
                     responses_fetch_request_overrides: responses_fetch_request_overrides
                         .unwrap_or_default(),
                     provider_trust,
-                    producer_key: local_identity.producer_key,
+                    producer_key: local_identity.node_key,
                     assurance,
                     secret_key,
                     wrap,
@@ -1201,15 +1201,18 @@ async fn async_main() {
             node_id,
             node_addrs,
         } => commands::rpc::run(node_id, node_addrs, secret_key).await,
-        Commands::PaidWork { command } => {
-            commands::paid_work::run(
-                command,
-                secret_key,
-                identity::settlement_signer(&local_identity),
-                local_identity.producer_key.clone(),
-            )
-            .await
-        }
+        Commands::PaidWork { command } => match identity::settlement_signer(&local_identity) {
+            Ok(settlement_key) => {
+                commands::paid_work::run(
+                    command,
+                    secret_key,
+                    settlement_key,
+                    local_identity.node_key.clone(),
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        },
         Commands::Trust(args) => commands::trust::run(args),
         Commands::Chain { .. } => unreachable!("chain commands handled before identity load"),
         Commands::Store { .. } => unreachable!("store commands handled before identity load"),

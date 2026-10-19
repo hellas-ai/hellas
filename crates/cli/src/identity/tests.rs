@@ -16,10 +16,7 @@ fn creates_and_reloads_one_identity() {
         first.transport_key.to_bytes(),
         second.transport_key.to_bytes()
     );
-    assert_eq!(
-        first.producer_key.producer_id(),
-        second.producer_key.producer_id()
-    );
+    assert_eq!(first.node_key.producer_id(), second.node_key.producer_id());
     assert_eq!(first.genesis, second.genesis);
     assert_eq!(first.enrollment, second.enrollment);
     assert_eq!(first.enrollment.genesis, first.genesis);
@@ -31,7 +28,7 @@ fn creates_and_reloads_one_identity() {
     );
     assert_eq!(
         first.genesis.statement.producer_public_key,
-        first.producer_key.public_key()
+        first.node_key.public_key()
     );
     let other = load_or_create(Some(&dir.path().join("other"))).unwrap();
     assert_ne!(
@@ -89,15 +86,15 @@ fn identity_canonical_decode_contract() {
     trailing.push(0);
     assert!(StoredIdentity::from_canonical_bytes(&trailing).is_err());
 
-    let mut encoded_producer_key = vec![0x58, 0x20];
-    encoded_producer_key.extend_from_slice(&stored.producer_key);
-    let producer_key_start = persisted
-        .windows(encoded_producer_key.len())
-        .position(|window| window == encoded_producer_key)
+    let mut encoded_node_key = vec![0x58, 0x20];
+    encoded_node_key.extend_from_slice(&stored.node_key);
+    let node_key_start = persisted
+        .windows(encoded_node_key.len())
+        .position(|window| window == encoded_node_key)
         .unwrap();
     let mut wrong_length = persisted.clone();
-    wrong_length[producer_key_start + 1] = 31;
-    wrong_length.remove(producer_key_start + 33);
+    wrong_length[node_key_start + 1] = 31;
+    wrong_length.remove(node_key_start + 33);
     assert!(StoredIdentity::from_canonical_bytes(&wrong_length).is_err());
 
     assert_eq!(persisted[0], 0x86);
