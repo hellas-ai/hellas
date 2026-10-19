@@ -510,11 +510,11 @@ Provision a grant for `gateway.invoke` on the authority's host resource. Issue a
 bearer credential scoped only to that permission, with no issuance ceiling or
 delegation. The selected grant must name the same subject and remain current.
 Device-held and administrator credentials are rejected as HTTP credentials; the
-bootstrap credential is never the bearer. The profile's `authorization` names the gateway's own
-bearer grant. An HTTP request may present any bearer whose subject holds a current
-grant of `gateway.invoke` alone on this authority, so each principal using the
-gateway has its own grant and credential; administrative grants never admit HTTP
-requests.
+bootstrap credential is never the bearer. The profile's `authorization` names the grant that
+authorizes the gateway's own bearer. An HTTP request may present a bearer that grant
+authorizes, or one whose subject holds its own current grant of `gateway.invoke`
+alone on this authority, so each principal using the gateway can have its own grant
+and credential.
 Existing offline bootstrap and checked `issue-credential` commands own provisioning;
 starting a listener does not create authority or credentials.
 

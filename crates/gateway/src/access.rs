@@ -14,8 +14,8 @@ use std::{
 use tower::{Layer, Service};
 
 /// A provisioned bearer credential scoped to gateway.invoke, authorized by
-/// `authorization`. HTTP requests present any bearer whose subject holds a
-/// current gateway.invoke grant on this authority. The host owns the authority
+/// `authorization`. HTTP requests present a bearer authorized by that grant,
+/// or one whose subject holds its own current grant of gateway.invoke alone. The host owns the authority
 /// writer; starting a listener never creates grants or credentials.
 #[derive(Clone)]
 pub struct GatewayAccess {
@@ -56,6 +56,14 @@ impl GatewayAccess {
         credential: &CredentialSecret,
     ) -> Result<(), hellas_work::work_store::grant::NodeStoreError> {
         let caller = self.node.authenticate(credential).await?;
+        if self
+            .node
+            .authorize_gateway(&caller, self.authorization)
+            .await
+            .is_ok()
+        {
+            return Ok(());
+        }
         self.node.authorize_gateway_bearer(&caller).await.map(drop)
     }
 
