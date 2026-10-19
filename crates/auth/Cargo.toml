@@ -16,6 +16,7 @@ getrandom = { version = "0.4", features = ["wasm_js"] }
 [dependencies]
 ed25519-dalek.workspace = true
 getrandom = "0.4"
+hellas-webauthn.workspace = true
 hellas-xet = { workspace = true, features = ["chunking", "serde"] }
 hex.workspace = true
 k256 = { workspace = true, features = ["getrandom"] }
