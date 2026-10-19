@@ -133,7 +133,7 @@ then pass `--paid-work-config POOL` together with `--environment` and
 
 It binds loopback by default; non-loopback listening requires `--allow-remote`.
 Every gateway requires a private `--gateway-profile FILE` selecting a provisioned
-local Auth authority and a self-issued credential scoped to `gateway.invoke`.
+local Auth authority and a bearer credential scoped to `gateway.invoke`.
 See [HTTP authority provisioning](docs/admin.md#http-gateway-authority). The causal-LM backend accepts plain text at
 `/v1/completions` and `/v1/responses`. Set `--chat-template` to enable the shared
 model adapter for chat, reasoning and tool calls supported by that model.

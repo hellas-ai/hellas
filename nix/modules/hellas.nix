@@ -559,7 +559,7 @@ rec {
         type = types.nullOr runtimePath;
         default = null;
         example = "/var/lib/hellas-gateway/gateway-profile.json";
-        description = "Private runtime profile selecting an explicitly provisioned HTTP authority, grant and self-issued gateway.invoke credential. Startup never issues credentials.";
+        description = "Private runtime profile selecting an explicitly provisioned HTTP authority, grant and gateway.invoke bearer credential. Startup never issues credentials.";
       };
       authorityJournal = mkOption {
         type = types.nullOr runtimePath;
