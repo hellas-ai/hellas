@@ -1,5 +1,5 @@
 use super::*;
-use hellas_work::model::grant::records::{decode_contact, grant_transport, principal_id};
+use hellas_work::model::grant::records::{decode_enrollment, grant_transport, principal_id};
 
 struct OfferHost {
     directory: tempfile::TempDir,
@@ -34,7 +34,7 @@ impl OfferHost {
         }
         let exported = provider.output(&["contact", "export"]).await;
         assert!(exported.status.success());
-        let provider_principal = decode_contact(&exported.stdout).unwrap();
+        let provider_principal = decode_enrollment(&exported.stdout).unwrap();
         let (store, app_secret) = common_node::bootstrap_node_with_credential(
             &root
                 .join("grants")
@@ -66,7 +66,7 @@ impl OfferHost {
             .output(&["contact", "import", string(&contact), "--name", "client"])
             .await;
         assert!(imported_contact.status.success());
-        let grantee = decode_contact(&std::fs::read(&contact).unwrap()).unwrap();
+        let grantee = decode_enrollment(&std::fs::read(&contact).unwrap()).unwrap();
         reader.subject = hellas_auth::authority::PrincipalId::from_public_key(
             grantee.genesis.statement.producer_public_key,
         )
@@ -481,7 +481,7 @@ async fn approved_offer_streams_from_the_private_ca_upstream() {
 /// gateway's own credential issued through the checked writer before startup.
 async fn controlled_gateway_profile(root: &Path) -> (PathBuf, PathBuf) {
     use hellas_auth::{Digest, authority::*};
-    let contact = decode_contact(&std::fs::read(root.join("contact")).unwrap()).unwrap();
+    let contact = decode_enrollment(&std::fs::read(root.join("contact")).unwrap()).unwrap();
     let subject =
         PrincipalId::from_public_key(contact.genesis.statement.producer_public_key).unwrap();
     let authority = AuthorityId(Digest::hash(b"CLI controlled HTTP authority"));

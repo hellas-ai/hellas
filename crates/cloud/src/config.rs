@@ -1,4 +1,4 @@
-use hellas_work::model::grant::records::{decode_contact, grant_transport};
+use hellas_work::model::grant::records::{decode_enrollment, grant_transport};
 use std::{collections::BTreeMap, fs, path::Path};
 
 use serde::{Deserialize, Serialize};
@@ -264,14 +264,14 @@ impl Credentials {
     }
 
     pub fn owner_principal(&self) -> Result<Option<hellas_rpc::ProviderEnrollmentBundle>> {
-        use hellas_work::model::grant::records::MAX_PRINCIPAL_BYTES;
+        use hellas_work::model::grant::records::MAX_ENROLLMENT_BYTES;
         let Some(bundle) = &self.owner_enrollment else {
             return Ok(None);
         };
-        if bundle.len() > MAX_PRINCIPAL_BYTES * 2 {
+        if bundle.len() > MAX_ENROLLMENT_BYTES * 2 {
             return Err(ConfigError::OwnerBound);
         }
-        let principal = decode_contact(&hex::decode(bundle)?)?;
+        let principal = decode_enrollment(&hex::decode(bundle)?)?;
         let owner = self
             .owner
             .as_deref()
@@ -349,15 +349,15 @@ impl Enrollment {
         Ok(())
     }
     pub fn principal(&self) -> Result<hellas_rpc::ProviderEnrollmentBundle> {
-        use hellas_work::model::grant::records::MAX_PRINCIPAL_BYTES;
+        use hellas_work::model::grant::records::MAX_ENROLLMENT_BYTES;
         let bundle = self
             .bundle
             .as_deref()
             .ok_or(ConfigError::EnrollmentUnavailable)?;
-        if bundle.len() > MAX_PRINCIPAL_BYTES * 2 {
+        if bundle.len() > MAX_ENROLLMENT_BYTES * 2 {
             return Err(ConfigError::EnrollmentBound);
         }
-        let principal = decode_contact(&hex::decode(bundle)?)?;
+        let principal = decode_enrollment(&hex::decode(bundle)?)?;
         if principal.content_id().to_string() != self.enrollment_id {
             return Err(ConfigError::EnrollmentId);
         }

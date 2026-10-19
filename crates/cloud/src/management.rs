@@ -1,6 +1,6 @@
 //! Identity-scoped management shared by the CLI and internal RPC.
 use hellas_auth::authority::UnixMillis;
-use hellas_work::model::grant::records::{grant_transport, verify_contact};
+use hellas_work::model::grant::records::{grant_transport, verify_software_enrollment};
 use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
@@ -185,7 +185,7 @@ impl Service {
         mut self,
         bundle: hellas_rpc::ProviderEnrollmentBundle,
     ) -> Result<Self> {
-        verify_contact(&bundle)?;
+        verify_software_enrollment(&bundle)?;
         let principal = bundle;
         if grant_transport(&principal)? != *self.key.public().as_bytes() {
             return Err(ManagementError::EnrollmentTransport);

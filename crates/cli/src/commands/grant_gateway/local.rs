@@ -17,10 +17,10 @@ pub struct LocalContent {
 pub async fn prepare(
     content: LocalContent,
     identity: &LocalIdentity,
+    principal: hellas_auth::authority::PrincipalId,
     application: Arc<hellas_sdk::node_control::profile::ClientProfile>,
     trust: hellas_client::ProviderTrustAnchor,
 ) -> CliResult<(GrantSessionOptions, GrantTransport)> {
-    let principal = crate::commands::contributions::principal(identity)?;
     let root = crate::commands::contributions::data_root(&principal)?;
     let index = content
         .index

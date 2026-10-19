@@ -12,7 +12,7 @@ use hellas_rpc::{
     *,
 };
 use hellas_wire::{Dispatcher, ServiceMarker, StreamTransport, iroh::IrohTransport};
-use hellas_work::model::grant::records::{decode_contact, principal_id};
+use hellas_work::model::grant::records::{decode_enrollment, principal_id};
 use hellas_work::model::{
     grant::{budget::*, grant_network, records::*},
     work::{EvaluatePolicyV2, generation_policy_digest, identity_source_digest},
@@ -104,7 +104,7 @@ impl NativeOwner {
         owner.run(&["--software-root", "identity", "init"]).await;
         let export = owner.output(&["contact", "export"]).await;
         assert!(export.status.success());
-        let owner_principal = decode_contact(&export.stdout).unwrap();
+        let owner_principal = decode_enrollment(&export.stdout).unwrap();
         let (admin_address, credentials) = prepare_machine(&owner, "native").await;
         let transport = iroh::SecretKey::generate();
         let signer = Arc::new(ProducerSigningKey::from_secret_bytes([42; 32]).unwrap());

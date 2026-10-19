@@ -13,10 +13,23 @@ pub fn show_enrollment_id(enrollment: &ProviderEnrollmentBundle) -> CliResult<()
     Ok(())
 }
 
-pub fn show_producer_key(key: &ProducerSigningKey) -> CliResult<()> {
-    let public_key = key.public_key();
-    println!("signature_kind: secp256k1");
-    println!("public_key: {}", hex::encode(public_key.bytes()));
-    println!("producer_id: {}", hex::encode(key.producer_id().as_bytes()));
+/// The holder a credential for this node names: its node key, curve-tagged.
+pub fn show_holder(key: &ProducerSigningKey) -> CliResult<()> {
+    let holder = hellas_auth::authority::CredentialHolder::Node(
+        hellas_auth::authority::NodeKey::from_public_key(key.public_key())?,
+    );
+    println!("{}", serde_json::to_string(&holder)?);
+    Ok(())
+}
+
+pub fn export_enrollment(
+    enrollment: &ProviderEnrollmentBundle,
+    out: Option<&std::path::Path>,
+) -> CliResult<()> {
+    let bytes = enrollment.canonical_bytes();
+    match out {
+        Some(path) => super::contributions::save(path, &bytes)?,
+        None => std::io::Write::write_all(&mut std::io::stdout().lock(), &bytes)?,
+    }
     Ok(())
 }

@@ -5,7 +5,7 @@ use hellas_cloud::{
     internal_rpc,
     management::{Request, Service},
 };
-use hellas_work::model::grant::records::{decode_contact, grant_transport};
+use hellas_work::model::grant::records::{decode_enrollment, grant_transport};
 use serde_json::json;
 use std::{
     os::unix::fs::{MetadataExt, PermissionsExt},
@@ -381,7 +381,7 @@ async fn enrolled_owner_prepares_verified_bootstrap_and_rejects_another_transpor
         .unwrap();
     let env: std::collections::BTreeMap<String, String> = read_json(&bootstrap).unwrap();
     let principal =
-        decode_contact(&hex::decode(&env["HELLAS_REMOTE_OWNER_ENROLLMENT"]).unwrap()).unwrap();
+        decode_enrollment(&hex::decode(&env["HELLAS_REMOTE_OWNER_ENROLLMENT"]).unwrap()).unwrap();
     assert_eq!(principal, bundle);
     assert_eq!(
         grant_transport(&principal).unwrap(),

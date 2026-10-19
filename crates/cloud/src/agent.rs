@@ -1,4 +1,4 @@
-use hellas_work::model::grant::records::decode_contact;
+use hellas_work::model::grant::records::decode_enrollment;
 use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
@@ -305,13 +305,13 @@ async fn export_enrollment(
     cli: &Path,
     identity: &Path,
 ) -> Result<hellas_rpc::ProviderEnrollmentBundle> {
-    use hellas_work::model::grant::records::MAX_PRINCIPAL_BYTES;
+    use hellas_work::model::grant::records::MAX_ENROLLMENT_BYTES;
     use tokio::io::AsyncReadExt;
     let mut command = Command::new(cli);
     command
         .arg("--identity")
         .arg(identity)
-        .args(["contact", "export"])
+        .args(["identity", "export-enrollment"])
         .env_remove("HELLAS_REMOTE_KEY")
         .env_remove("HELLAS_REMOTE_TOKEN")
         .env_remove("HELLAS_REMOTE_ARGS")
@@ -328,16 +328,16 @@ async fn export_enrollment(
             .stdout
             .take()
             .ok_or(AgentError::EnrollmentStdout)?
-            .take((MAX_PRINCIPAL_BYTES + 1) as u64)
+            .take((MAX_ENROLLMENT_BYTES + 1) as u64)
             .read_to_end(&mut bytes)
             .await?;
-        if bytes.len() > MAX_PRINCIPAL_BYTES {
+        if bytes.len() > MAX_ENROLLMENT_BYTES {
             return Err(AgentError::EnrollmentBound);
         }
         if !child.wait().await?.success() {
             return Err(AgentError::EnrollmentExport);
         }
-        Ok(decode_contact(&bytes)?)
+        Ok(decode_enrollment(&bytes)?)
     })
     .await
     .map_err(AgentError::EnrollmentTimeout)?

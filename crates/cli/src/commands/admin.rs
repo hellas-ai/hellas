@@ -9,24 +9,19 @@ pub struct AdminArgs {
     #[arg(long, global = true)]
     pub profile: Option<PathBuf>,
     /// Local node socket; defaults to this identity's control.sock.
-    #[arg(long, global = true, conflicts_with_all = ["node_contact", "addresses"])]
+    #[arg(long, global = true, conflicts_with_all = ["node_enrollment", "addresses"])]
     pub control_socket: Option<PathBuf>,
-    /// Independently verified contact pinning the remote node's transport key.
-    #[arg(long = "contact", global = true)]
-    pub node_contact: Option<PathBuf>,
+    /// The remote node's enrollment, verified out of band; it pins the node's
+    /// transport key.
+    #[arg(long = "node", global = true)]
+    pub node_enrollment: Option<PathBuf>,
     #[arg(
         long = "address",
         global = true,
         value_delimiter = ',',
-        requires = "node_contact"
+        requires = "node_enrollment"
     )]
     pub addresses: Vec<std::net::SocketAddr>,
-    /// The administrator's software passkey: a file of 32 raw bytes or 64 hex
-    /// digits. With it the session is a passkey session, which step-up
-    /// operations require; without it this identity's node key proves a daily
-    /// session. Offline initialization and recovery require it.
-    #[arg(long, global = true)]
-    pub passkey: Option<PathBuf>,
     #[command(subcommand)]
     pub command: AdminCommand,
 }

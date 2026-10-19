@@ -9,9 +9,9 @@ use std::{sync::Arc, time::Duration};
 pub fn session(
     target: PinnedOffer,
     identity: &LocalIdentity,
+    client: hellas_auth::authority::PrincipalId,
     application: Arc<hellas_sdk::node_control::profile::ClientProfile>,
 ) -> CliResult<GrantSessionOptions> {
-    let client = super::contributions::principal(identity)?;
     Ok(GrantSessionOptions {
         target,
         principal: client,

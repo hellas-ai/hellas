@@ -74,10 +74,7 @@ fn load_command_identity(
     let owned_machine = false;
     let grant_identity = matches!(
         command,
-        Commands::Contact { .. }
-            | Commands::Offer { .. }
-            | Commands::Admin(_)
-            | Commands::Gateway { offer: Some(_), .. }
+        Commands::Admin(_) | Commands::Gateway { offer: Some(_), .. }
     );
     #[cfg(feature = "evaluate")]
     let grant_identity = grant_identity
@@ -88,7 +85,10 @@ fn load_command_identity(
         || matches!(
             command,
             Commands::Identity {
-                command: IdentityCommand::ShowNodeId | IdentityCommand::ShowEnrollmentId,
+                command: IdentityCommand::ShowNodeId
+                    | IdentityCommand::ShowEnrollmentId
+                    | IdentityCommand::ShowHolder
+                    | IdentityCommand::ExportEnrollment { .. },
             }
         );
     if read_only {
@@ -207,6 +207,12 @@ struct Cli {
     #[arg(long = "software-root", global = true)]
     software_root: bool,
 
+    /// The software passkey of the principal this command acts for: a file of
+    /// 32 raw bytes or 64 hex digits. Contacts, offers, grant data, gateway
+    /// allowances, owned machines and passkey administration sessions use it.
+    #[arg(long, global = true)]
+    passkey: Option<PathBuf>,
+
     /// Also append tracing output to this file.
     #[arg(long = "log-file", global = true)]
     log_file: Option<PathBuf>,
@@ -223,12 +229,14 @@ enum IdentityCommand {
     ShowNodeId,
     /// Print the ContentId of the canonical enrollment bundle
     ShowEnrollmentId,
-}
-
-#[derive(Subcommand)]
-enum ProducerKeyCommand {
-    /// Print the producer public key and derived producer id
-    Show,
+    /// Print the JSON CredentialHolder naming this node's key, for issuing a
+    /// credential this node will hold
+    ShowHolder,
+    /// Write this node's canonical enrollment, which operators pin to reach it
+    ExportEnrollment {
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -269,12 +277,12 @@ enum Commands {
     #[cfg(unix)]
     /// Discover and administer machines owned by the selected Hellas identity.
     Machines(hellas_cloud::machines::MachinesArgs),
-    /// Share this identity's verified public enrollment.
+    /// Introduce the principal with a signed contact card, or save a friend's.
     Contact {
         #[command(subcommand)]
         command: commands::contributions::ContactCommand,
     },
-    /// Import a private provider Offer addressed to this identity.
+    /// Import a private provider Offer addressed to this principal.
     Offer {
         #[command(subcommand)]
         command: commands::contributions::OfferCommand,
@@ -511,11 +519,6 @@ enum Commands {
         #[command(subcommand)]
         command: IdentityCommand,
     },
-    /// Inspect the local producer signing key
-    ProducerKey {
-        #[command(subcommand)]
-        command: ProducerKeyCommand,
-    },
     /// Manage Codex OAuth credentials
     CodexAuth {
         #[command(subcommand)]
@@ -589,6 +592,8 @@ fn validate_identity_options(
 ) -> Result<(), String> {
     let identity_free = match command {
         Commands::Trust(_) => Some("trust"),
+        Commands::Contact { .. } => Some("contact"),
+        Commands::Offer { .. } => Some("offer"),
         Commands::Store { .. } => Some("store"),
         Commands::Environment { .. } => Some("environment"),
         Commands::Serve {
@@ -617,13 +622,15 @@ fn validate_identity_options(
         command if command.owned_machine().is_some() => true,
         #[cfg(unix)]
         Commands::Cloud(_) | Commands::Machines(_) => true,
-        Commands::Contact { .. } | Commands::Offer { .. } => true,
         Commands::Gateway { offer: Some(_), .. } => true,
         Commands::Admin(_) => true,
         Commands::Identity {
-            command: IdentityCommand::ShowNodeId | IdentityCommand::ShowEnrollmentId,
-        }
-        | Commands::ProducerKey { .. } => true,
+            command:
+                IdentityCommand::ShowNodeId
+                | IdentityCommand::ShowEnrollmentId
+                | IdentityCommand::ShowHolder
+                | IdentityCommand::ExportEnrollment { .. },
+        } => true,
         Commands::Serve {
             work_config_file: Some(_),
             ..
@@ -727,20 +734,6 @@ async fn async_main() {
         return;
     }
 
-    if let Commands::ProducerKey {
-        command: ProducerKeyCommand::Show,
-    } = &cli.command
-    {
-        let result = identity::load_existing(cli.identity.as_deref())
-            .and_then(|identity| commands::identity::show_producer_key(&identity.node_key));
-        tracer_provider.shutdown();
-        if let Err(err) = result {
-            eprintln!("error: {err:#}");
-            std::process::exit(1);
-        }
-        return;
-    }
-
     if let Commands::CodexAuth { command } = &cli.command {
         let result = match command {
             CodexAuthCommand::Login { auth_path } => {
@@ -792,6 +785,28 @@ async fn async_main() {
             }
             return;
         }
+        command @ (Commands::Contact { .. } | Commands::Offer { .. }) => {
+            let result = cli
+                .passkey
+                .as_deref()
+                .map(commands::chain::passkey)
+                .transpose()
+                .and_then(|passkey| match command {
+                    Commands::Contact { command } => {
+                        commands::contributions::contact(command, passkey.as_ref())
+                    }
+                    Commands::Offer { command } => {
+                        commands::contributions::offer(command, passkey.as_ref())
+                    }
+                    _ => Ok(()),
+                });
+            tracer_provider.shutdown();
+            if let Err(err) = result {
+                eprintln!("error: {err:#}");
+                std::process::exit(1);
+            }
+            return;
+        }
         Commands::Store { command, store_dir } => {
             let result = commands::store::run(command, store_dir).await;
             tracer_provider.shutdown();
@@ -836,6 +851,19 @@ async fn async_main() {
         }
     };
     let secret_key = local_identity.transport_key.clone();
+    let passkey = match cli
+        .passkey
+        .as_deref()
+        .map(commands::chain::passkey)
+        .transpose()
+    {
+        Ok(passkey) => passkey,
+        Err(err) => {
+            eprintln!("error: {err:#}");
+            std::process::exit(1);
+        }
+    };
+    let passkey = passkey.as_ref();
     if let Commands::Serve { assurance, .. } = &command
         && let Err(error) = validate_serve_assurance(
             cli.software_root,
@@ -848,9 +876,10 @@ async fn async_main() {
     }
 
     let result = match command {
-        Commands::Contact { command } => commands::contributions::contact(command, &local_identity),
-        Commands::Offer { command } => commands::contributions::offer(command, &local_identity),
-        Commands::Admin(args) => commands::admin::run(args, &local_identity).await,
+        Commands::Contact { .. } | Commands::Offer { .. } => {
+            unreachable!("contact and offer commands handled before identity load")
+        }
+        Commands::Admin(args) => commands::admin::run(args, &local_identity, passkey).await,
 
         Commands::Serve {
             #[cfg(feature = "evaluate")]
@@ -887,8 +916,8 @@ async fn async_main() {
                         let open_identity = local_identity.open_identity();
                         let grants = if let Some(path) = grant_config_file.as_deref() {
                             anyhow::ensure!(assurance == hellas_rpc::Assurance::ProducerSigned, "grants require producer-signed assurance");
-                            let provider = commands::contributions::principal(&local_identity)?;
-                            let root = commands::contributions::data_root(&provider)?;
+                            let owner = commands::contributions::require_principal(passkey)?;
+                            let root = commands::contributions::data_root(&owner)?;
                             let config = hellas_sdk::grant_config::GrantConfig::load(path, &root)?;
                             Some(config)
                         } else { None };
@@ -1029,7 +1058,7 @@ async fn async_main() {
                     .transpose()?.map(std::sync::Arc::new);
                 let work_application = || application.clone().ok_or_else(|| anyhow::anyhow!("--work-profile is required for grant Work"));
                 let grant_target = if let Some(name) = offer.as_deref() {
-                    let client = commands::contributions::principal(&local_identity)?;
+                    let client = commands::contributions::require_principal(passkey)?;
                     let offer = commands::contributions::load_offer(&client, name)?;
                     Some(hellas_sdk::grant_client::UnpinnedOffer::decode(
                         &offer.encode()?,  hellas_auth::authority::UnixMillis(0),
@@ -1038,12 +1067,12 @@ async fn async_main() {
                 #[cfg(unix)]
                 let grant_target = if let Some(name) = machine.as_deref()
                     && output_cache != hellas_rpc::cache::CachePolicy::ReplayOnly {
-                    Some(cloud::machine_target(name, &local_identity, node_addrs.clone(), &work_application()?, &remote_trust.load()?).await?)
+                    Some(cloud::machine_target(name, &local_identity, commands::contributions::require_principal(passkey)?, node_addrs.clone(), &work_application()?, &remote_trust.load()?).await?)
                 } else { grant_target };
                 let grant_source = if let Some(target) = grant_target
                     && output_cache != hellas_rpc::cache::CachePolicy::ReplayOnly {
                     anyhow::ensure!(assurance == target.trust().required_assurance, "requested assurance differs from the pinned grant provider");
-                    Some((commands::grant_gateway::session(target, &local_identity, work_application()?)?,
+                    Some((commands::grant_gateway::session(target, &local_identity, commands::contributions::require_principal(passkey)?, work_application()?)?,
                         hellas_sdk::grant_client::GrantTransport::remote(secret_key.clone()).await?))
                 } else { None };
                 #[cfg(feature = "evaluate")]
@@ -1053,7 +1082,7 @@ async fn async_main() {
                     anyhow::ensure!(assurance == hellas_rpc::Assurance::ProducerSigned, "local Work requires producer-signed assurance");
                     (Some(commands::grant_gateway::local::prepare(
                         local_content.ok_or_else(|| anyhow::anyhow!("--local requires indexed content"))?,
-                        &local_identity, work_application()?, remote_trust.load()?,
+                        &local_identity, commands::contributions::require_principal(passkey)?, work_application()?, remote_trust.load()?,
                     ).await?), Some("local".into()))
                 } else { (grant_source, grant_policy) };
                 if let Some((session, _)) = grant_source.as_ref()
@@ -1229,8 +1258,11 @@ async fn async_main() {
             IdentityCommand::ShowEnrollmentId => {
                 commands::identity::show_enrollment_id(&local_identity.enrollment)
             }
+            IdentityCommand::ShowHolder => commands::identity::show_holder(&local_identity.node_key),
+            IdentityCommand::ExportEnrollment { out } => {
+                commands::identity::export_enrollment(&local_identity.enrollment, out.as_deref())
+            }
         },
-        Commands::ProducerKey { .. } => unreachable!("producer-key handled before identity load"),
         Commands::CodexAuth { .. } => unreachable!("codex-auth handled before identity load"),
         Commands::Monitor {
             timeout_secs,

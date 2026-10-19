@@ -26,7 +26,7 @@ use hellas_sdk::{
 };
 use hellas_wire::{ServiceMarker, StreamTransport};
 use hellas_work::model::grant::admin::{MAX_ADMIN_BYTES, WorkControlCommand, WorkControlReply};
-use hellas_work::model::grant::records::{decode_contact, grant_transport};
+use hellas_work::model::grant::records::{decode_enrollment, grant_transport};
 use std::{path::Path, time::Duration};
 
 fn read<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
@@ -35,35 +35,35 @@ fn read<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     )?)
 }
 
-pub async fn run(args: AdminArgs, identity: &LocalIdentity) -> Result<()> {
-    let passkey = args
-        .passkey
-        .as_deref()
-        .map(crate::commands::chain::passkey)
-        .transpose()?;
+/// With the principal's `passkey` the session is a passkey session, which
+/// step-up operations require; without it this node's key proves a daily
+/// session. Offline initialization and recovery require the passkey.
+pub async fn run(
+    args: AdminArgs,
+    identity: &LocalIdentity,
+    passkey: Option<&hellas_kernel::SoftPasskey>,
+) -> Result<()> {
     match &args.command {
         AdminCommand::Bootstrap { .. } | AdminCommand::Recover { .. } => {
             ensure!(
                 args.profile.is_none()
                     && args.control_socket.is_none()
-                    && args.node_contact.is_none()
+                    && args.node_enrollment.is_none()
                     && args.addresses.is_empty(),
                 "offline initialization does not connect to a daemon"
             );
             let passkey = passkey.context("offline initialization requires --passkey")?;
-            return offline(args.command, identity, &passkey).await;
+            return offline(args.command, identity, passkey).await;
         }
         _ => {}
     }
-    let key = passkey
-        .as_ref()
-        .map_or(SessionKey::Node(&identity.node_key), SessionKey::Passkey);
+    let key = passkey.map_or(SessionKey::Node(&identity.node_key), SessionKey::Passkey);
     let profile =
         profile::ClientProfile::load(args.profile.as_deref().context("--profile is required")?)?;
-    if let Some(contact) = args.node_contact {
-        let provider = decode_contact(&hellas_private::read_bounded_regular_file(
-            &contact,
-            hellas_work::model::grant::records::MAX_PRINCIPAL_BYTES,
+    if let Some(node) = args.node_enrollment {
+        let provider = decode_enrollment(&hellas_private::read_bounded_regular_file(
+            &node,
+            hellas_work::model::grant::records::MAX_ENROLLMENT_BYTES,
         )?)?;
         // The application identity is proved inside the authenticated session.
         // A stable endpoint key permits explicit remote ingress admission; use
@@ -99,7 +99,10 @@ pub async fn run(args: AdminArgs, identity: &LocalIdentity) -> Result<()> {
             .context("profile requires local server trust")?;
         let socket = match args.control_socket {
             Some(path) => path,
-            None => data_root(&principal(identity)?)?.join("control.sock"),
+            None => data_root(&principal(passkey.context(
+                "the default control socket is the principal's; pass --passkey or --control-socket",
+            )?)?)?
+            .join("control.sock"),
         };
         let client = node_control::connect_local(
             &socket,
@@ -170,7 +173,7 @@ where
                     authorization: authorization.0.to_vec(),
                     enrollment: hellas_private::read_bounded_regular_file(
                         &enrollment,
-                        hellas_work::model::grant::records::MAX_PRINCIPAL_BYTES,
+                        hellas_work::model::grant::records::MAX_ENROLLMENT_BYTES,
                     )?,
                 })
                 .await?;

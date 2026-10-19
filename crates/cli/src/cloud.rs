@@ -20,7 +20,7 @@ pub(super) async fn run(command: Commands, identity_path: Option<&Path>) -> Resu
         Commands::Machines(args) => args.run(service.context("owner identity required")?).await,
         Commands::Admin(args) => {
             anyhow::ensure!(
-                args.node_contact.is_none()
+                args.node_enrollment.is_none()
                     && args.control_socket.is_none()
                     && args.addresses.is_empty()
                     && args.profile.is_none(),
@@ -50,6 +50,7 @@ pub(super) async fn run(command: Commands, identity_path: Option<&Path>) -> Resu
 pub(super) async fn machine_target(
     name: &str,
     identity: &identity::LocalIdentity,
+    owner: hellas_auth::authority::PrincipalId,
     addresses: Vec<std::net::SocketAddr>,
     application: &std::sync::Arc<hellas_sdk::node_control::profile::ClientProfile>,
     trust: &hellas_client::ProviderTrustAnchor,
@@ -59,7 +60,6 @@ pub(super) async fn machine_target(
         .resolve(name)
         .await?;
     let provider = enrollment.principal()?;
-    let owner = crate::commands::contributions::principal(identity)?;
     let network = grant_network();
     let target = hellas_sdk::grant_client::GrantTarget {
         grant: owner_grant_id(network, provider.content_id(), owner),

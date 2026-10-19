@@ -1,5 +1,5 @@
 use super::*;
-use hellas_work::model::grant::records::{decode_contact, principal_id};
+use hellas_work::model::grant::records::{decode_enrollment, principal_id};
 
 struct Managed {
     task: tokio::task::JoinHandle<hellas_cloud::agent::Result<()>>,
@@ -53,7 +53,7 @@ impl ManagedWorker {
         worker.run(&["--software-root", "identity", "init"]).await;
         let exported = worker.output(&["contact", "export"]).await;
         assert!(exported.status.success());
-        let provider = decode_contact(&exported.stdout).unwrap();
+        let provider = decode_enrollment(&exported.stdout).unwrap();
         use hellas_auth::authority as auth;
         let authority = auth::AuthorityId(hellas_auth::Digest::hash(b"managed control fixture"));
         let root_grant = auth::GrantId([1; 16]);
@@ -196,7 +196,7 @@ impl ManagedWorker {
             ])
             .await;
         let exported = owner.output(&["contact", "export"]).await;
-        let principal = decode_contact(&exported.stdout).unwrap();
+        let principal = decode_enrollment(&exported.stdout).unwrap();
         let work_subject = principal_id(&principal).unwrap();
         let work_allowance = hellas_work::model::grant::owner_grant_id(
             hellas_work::model::grant::grant_network(),

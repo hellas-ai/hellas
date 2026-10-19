@@ -19,7 +19,7 @@ pub(super) mod optional_provider {
     ) -> Result<Option<ProviderEnrollmentBundle>, D::Error> {
         Option::<serde_bytes::ByteBuf>::deserialize(d)?
             .map(|bytes| {
-                if bytes.len() > crate::model::grant::records::MAX_PRINCIPAL_BYTES {
+                if bytes.len() > crate::model::grant::records::MAX_ENROLLMENT_BYTES {
                     return Err(D::Error::custom("provider enrollment is too large"));
                 }
                 let provider = ProviderEnrollmentBundle::from_canonical_bytes(&bytes)

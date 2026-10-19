@@ -1,5 +1,5 @@
 use super::super::*;
-use crate::commands::admin::{AdminArgs, AdminCommand, OfflineArgs, run};
+use crate::commands::admin::{AdminArgs, AdminCommand, OfflineArgs};
 use crate::identity::LocalIdentity;
 use hellas_auth::{Digest, authority as auth};
 use hellas_rpc::Assurance;
@@ -50,15 +50,29 @@ struct Daemon {
     journal: PathBuf,
     handle: Option<node_control::host::HostHandle>,
 }
-fn offline_args(command: AdminCommand, passkey: Option<&Path>) -> AdminArgs {
-    AdminArgs {
-        profile: None,
-        control_socket: None,
-        node_contact: None,
-        addresses: vec![],
-        passkey: passkey.map(Path::to_owned),
-        command,
-    }
+/// One admin invocation: its arguments and the global `--passkey` file.
+struct Invocation(AdminArgs, Option<PathBuf>);
+async fn run(
+    Invocation(args, passkey): Invocation,
+    identity: &LocalIdentity,
+) -> anyhow::Result<()> {
+    let passkey = passkey
+        .as_deref()
+        .map(crate::commands::chain::passkey)
+        .transpose()?;
+    crate::commands::admin::run(args, identity, passkey.as_ref()).await
+}
+fn offline_args(command: AdminCommand, passkey: Option<&Path>) -> Invocation {
+    Invocation(
+        AdminArgs {
+            profile: None,
+            control_socket: None,
+            node_enrollment: None,
+            addresses: vec![],
+            command,
+        },
+        passkey.map(Path::to_owned),
+    )
 }
 impl Daemon {
     async fn start() -> Self {
@@ -193,41 +207,51 @@ impl Daemon {
         }
     }
     /// The administrator's passkey session over the local socket.
-    fn local(&self, command: AdminCommand) -> AdminArgs {
-        AdminArgs {
-            profile: Some(self.profile_path.clone()),
-            control_socket: Some(self.socket.clone()),
-            ..offline_args(command, Some(&self.passkey))
-        }
+    fn local(&self, command: AdminCommand) -> Invocation {
+        let Invocation(args, passkey) = offline_args(command, Some(&self.passkey));
+        Invocation(
+            AdminArgs {
+                profile: Some(self.profile_path.clone()),
+                control_socket: Some(self.socket.clone()),
+                ..args
+            },
+            passkey,
+        )
     }
     /// A daily session over the local socket, by whichever identity runs it.
-    fn local_daily(&self, command: AdminCommand) -> AdminArgs {
-        AdminArgs {
-            passkey: None,
-            ..self.local(command)
-        }
+    fn local_daily(&self, command: AdminCommand) -> Invocation {
+        Invocation(self.local(command).0, None)
     }
-    fn remote(&self, profile: PathBuf, command: AdminCommand, passkey: Option<&Path>) -> AdminArgs {
-        let contact = self.root.path().join("node.contact");
+    fn remote(
+        &self,
+        profile: PathBuf,
+        command: AdminCommand,
+        passkey: Option<&Path>,
+    ) -> Invocation {
+        let contact = self.root.path().join("node.enrollment");
         std::fs::write(
             &contact,
             self.provider_identity.enrollment.canonical_bytes(),
         )
         .unwrap();
-        AdminArgs {
-            profile: Some(profile),
-            node_contact: Some(contact),
-            addresses: self
-                .handle
-                .as_ref()
-                .unwrap()
-                .provider_endpoint()
-                .borrow()
-                .as_ref()
-                .unwrap()
-                .bound_sockets(),
-            ..offline_args(command, passkey)
-        }
+        let Invocation(args, passkey) = offline_args(command, passkey);
+        Invocation(
+            AdminArgs {
+                profile: Some(profile),
+                node_enrollment: Some(contact),
+                addresses: self
+                    .handle
+                    .as_ref()
+                    .unwrap()
+                    .provider_endpoint()
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .bound_sockets(),
+                ..args
+            },
+            passkey,
+        )
     }
     async fn client(&self) -> Control {
         let profile = node_control::profile::ClientProfile::load(&self.profile_path).unwrap();

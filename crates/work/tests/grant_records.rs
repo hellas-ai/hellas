@@ -3,7 +3,7 @@ use hellas_auth::PublicKey;
 use hellas_auth::authority::{GrantId, Revision, UnixMillis};
 use hellas_kernel::NetworkId;
 use hellas_rpc::*;
-use hellas_work::model::grant::records::verify_contact;
+use hellas_work::model::grant::records::verify_software_enrollment;
 use hellas_work::model::{
     fetch::*,
     grant::{records::*, resource::*, *},
@@ -86,7 +86,10 @@ fn contact_proof_offer_signature_and_actor_channel_binding_are_not_advisory() {
     let (stranger, _) = principal(3);
     let mut bad = client.clone();
     bad.genesis.statement.transport_public_key = PublicKey::Ed25519([9; 32]);
-    assert!(matches!(verify_contact(&bad), Err(GrantError::Signature)));
+    assert!(matches!(
+        verify_software_enrollment(&bad),
+        Err(GrantError::Signature)
+    ));
     let network = NetworkId::new("grant-fixture").unwrap();
     let route = FetchRoutePolicy::sealed_route("http", "request").unwrap();
     let policy = GrantPolicy {
@@ -261,13 +264,13 @@ fn contacts_explicitly_refuse_unsupported_roots_and_keys() {
     let mut unsupported = valid.clone();
     unsupported.genesis.statement.root_kind = RootKind::SecureEnclave;
     assert!(matches!(
-        verify_contact(&unsupported),
+        verify_software_enrollment(&unsupported),
         Err(GrantError::UnsupportedRoot)
     ));
     let mut unsupported = valid.clone();
     unsupported.genesis.root_proof = RootProof::AppleAppAttest(vec![]);
     assert!(matches!(
-        verify_contact(&unsupported),
+        verify_software_enrollment(&unsupported),
         Err(GrantError::UnsupportedRoot)
     ));
     for producer in [true, false] {
@@ -279,7 +282,7 @@ fn contacts_explicitly_refuse_unsupported_roots_and_keys() {
                 valid.genesis.statement.producer_public_key;
         }
         assert!(matches!(
-            verify_contact(&unsupported),
+            verify_software_enrollment(&unsupported),
             Err(GrantError::UnsupportedKey)
         ));
     }

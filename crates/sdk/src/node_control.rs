@@ -548,9 +548,9 @@ impl HostControlHandler for ControlSession {
         &self,
         request: BindProviderRequest,
     ) -> Result<BindProviderResponse, WireStatus> {
-        use hellas_work::model::grant::records::{GrantError, MAX_PRINCIPAL_BYTES};
+        use hellas_work::model::grant::records::{GrantError, MAX_ENROLLMENT_BYTES};
         let caller = self.caller().await?;
-        if request.enrollment.len() > MAX_PRINCIPAL_BYTES {
+        if request.enrollment.len() > MAX_ENROLLMENT_BYTES {
             return Err(invalid());
         }
         let provider =

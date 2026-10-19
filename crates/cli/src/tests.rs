@@ -259,8 +259,8 @@ fn admin_target_is_shared_and_requires_an_identity_pin() {
     for operation in [vec!["status"], vec!["grant", "change.json"]] {
         for before in [true, false] {
             let target = [
-                "--contact",
-                "node.contact",
+                "--node",
+                "node.enrollment",
                 "--address",
                 "127.0.0.1:9000,[::1]:9000",
             ];
@@ -275,12 +275,12 @@ fn admin_target_is_shared_and_requires_an_identity_pin() {
             let Commands::Admin(args) = Cli::try_parse_from(argv).unwrap().command else {
                 panic!("admin");
             };
-            assert_eq!(args.node_contact, Some(PathBuf::from("node.contact")));
+            assert_eq!(args.node_enrollment, Some(PathBuf::from("node.enrollment")));
             assert_eq!(args.addresses.len(), 2);
         }
         for invalid in [
             vec!["--address", "127.0.0.1:9000"],
-            vec!["--contact", "node.contact", "--control-socket", "node.sock"],
+            vec!["--node", "node.enrollment", "--control-socket", "node.sock"],
             vec!["--store-dir", "store"],
             vec!["--output-cache", "off"],
         ] {
@@ -381,25 +381,26 @@ fn gateway_fetch_backend_accepts_exact_contract_id() {
 }
 
 #[test]
-fn producer_key_show_accepts_global_identity_path() {
+fn identity_show_holder_accepts_global_identity_path() {
     let cli = Cli::try_parse_from([
         "hellas",
         "--identity",
         "/tmp/hellas-identity",
-        "producer-key",
-        "show",
+        "identity",
+        "show-holder",
     ])
     .unwrap();
     assert_eq!(
         cli.identity.as_deref(),
         Some(std::path::Path::new("/tmp/hellas-identity"))
     );
-    match cli.command {
-        Commands::ProducerKey {
-            command: ProducerKeyCommand::Show,
-        } => {}
-        _ => panic!("expected producer-key show command"),
-    }
+    assert!(matches!(
+        cli.command,
+        Commands::Identity {
+            command: IdentityCommand::ShowHolder
+        }
+    ));
+    assert!(Cli::try_parse_from(["hellas", "producer-key", "show"]).is_err());
 }
 
 #[test]

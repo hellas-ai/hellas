@@ -469,7 +469,7 @@ fn apple_offer_pin_verifies_static_root_policy_then_open_and_result() {
     let bundle =
         ProviderEnrollmentBundle::from_canonical_bytes(&response.provider_genesis).unwrap();
     assert!(
-        verify_contact(&bundle).is_err(),
+        verify_software_enrollment(&bundle).is_err(),
         "platform roots remain provider-only"
     );
     let client = hellas_work::test_support::principal(1).0;

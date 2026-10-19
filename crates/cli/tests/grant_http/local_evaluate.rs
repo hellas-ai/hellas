@@ -1,5 +1,5 @@
 use super::*;
-use hellas_work::model::grant::records::{decode_contact, principal_id};
+use hellas_work::model::grant::records::{decode_enrollment, principal_id};
 
 struct LocalGateway {
     _root: tempfile::TempDir,
@@ -17,7 +17,7 @@ impl LocalGateway {
         owner.run(&["--software-root", "identity", "init"]).await;
         let export = owner.output(&["contact", "export"]).await;
         assert!(export.status.success());
-        let principal = decode_contact(&export.stdout).unwrap();
+        let principal = decode_enrollment(&export.stdout).unwrap();
         let journal = root
             .join("grants")
             .join(hex::encode(principal_id(&principal).unwrap().as_bytes()))

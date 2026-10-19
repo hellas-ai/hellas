@@ -1,5 +1,5 @@
 use super::*;
-use hellas_work::model::grant::records::{decode_contact, principal_id};
+use hellas_work::model::grant::records::{decode_enrollment, principal_id};
 
 #[tokio::test]
 async fn contact_import_reports_the_exported_identity() {
@@ -25,7 +25,7 @@ async fn contact_import_reports_the_exported_identity() {
         "{}",
         String::from_utf8_lossy(&imported.stderr)
     );
-    let enrollment = decode_contact(&std::fs::read(contact).unwrap()).unwrap();
+    let enrollment = decode_enrollment(&std::fs::read(contact).unwrap()).unwrap();
     let fingerprint = format!(
         "Identity fingerprint: {}",
         principal_id(&enrollment).unwrap().fingerprint()

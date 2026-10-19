@@ -2,6 +2,7 @@
 //! revalidates enrollment; no discovery record confers grant authority.
 use super::{budget::*, *};
 use crate::model::profile::WorkPolicy;
+use hellas_auth::authority::ContactCard;
 use hellas_auth::{ProducerSigningKey, PublicKey, Signature};
 use hellas_kernel::{Key, NetworkId};
 use hellas_rpc::protocol::value::{BoundedCborError, canonical_dag_cbor, decode_canonical_bounded};
@@ -13,7 +14,8 @@ use std::num::NonZeroU64;
 
 pub const MAX_WORK_POLICIES: usize = 16;
 pub const MAX_OFFER_BYTES: usize = 256 * 1024;
-pub const MAX_PRINCIPAL_BYTES: usize = 32 * 1024;
+pub const MAX_ENROLLMENT_BYTES: usize = 32 * 1024;
+pub const MAX_CONTACT_CARD_BYTES: usize = 4 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum GrantError {
@@ -49,18 +51,19 @@ pub enum GrantError {
     Quarantined,
 }
 
-/// Contact imports require a software-root signature; this is enrollment
-/// validation, not Work authorization or a second principal type.
-pub fn decode_contact(bytes: &[u8]) -> Result<ProviderEnrollmentBundle, GrantError> {
-    if bytes.len() > MAX_PRINCIPAL_BYTES {
+/// A node's self-attested enrollment, as an operator pins it to reach that
+/// node: a software root signs its node and transport keys. This is machine
+/// identity, never a principal and never Work authorization.
+pub fn decode_enrollment(bytes: &[u8]) -> Result<ProviderEnrollmentBundle, GrantError> {
+    if bytes.len() > MAX_ENROLLMENT_BYTES {
         return Err(GrantError::Malformed);
     }
     let bundle =
         ProviderEnrollmentBundle::from_canonical_bytes(bytes).map_err(|_| GrantError::Malformed)?;
-    verify_contact(&bundle)?;
+    verify_software_enrollment(&bundle)?;
     Ok(bundle)
 }
-pub fn verify_contact(provider: &ProviderEnrollmentBundle) -> Result<(), GrantError> {
+pub fn verify_software_enrollment(provider: &ProviderEnrollmentBundle) -> Result<(), GrantError> {
     check_grant_provider(provider)?;
     let statement = &provider.genesis.statement;
     let RootProof::Software(signature) = &provider.genesis.root_proof else {
@@ -79,13 +82,25 @@ pub fn verify_contact(provider: &ProviderEnrollmentBundle) -> Result<(), GrantEr
     )
     .map_err(|_| GrantError::Signature)
 }
+/// Canonical, bounded contact card bytes.
+pub fn encode_contact_card(card: &ContactCard) -> Result<Vec<u8>, GrantError> {
+    let bytes = canonical_dag_cbor(card).map_err(|_| GrantError::Malformed)?;
+    if bytes.len() > MAX_CONTACT_CARD_BYTES {
+        return Err(GrantError::Malformed);
+    }
+    Ok(bytes)
+}
+/// A canonical card whose passkey assertion verifies.
+pub fn decode_contact_card(bytes: &[u8]) -> Result<ContactCard, GrantError> {
+    decode_canonical_bounded(bytes, MAX_CONTACT_CARD_BYTES).map_err(|_| GrantError::Malformed)
+}
 /// A node binding its own provider has no independent pins, so an App Attest
 /// credential is registered against its own RP-ID hash and CDHash at the
 /// enrollment's validation time. Requesters still pin both before trusting it.
 pub fn verify_provider(provider: &ProviderEnrollmentBundle) -> Result<(), GrantError> {
     use hellas_attestation::{AnchorTime, AppleCredential, ApplePolicy};
     let PlatformEnrollment::AppleAppAttest(enrollment) = &provider.platform else {
-        return verify_contact(provider);
+        return verify_software_enrollment(provider);
     };
     check_grant_provider(provider)?;
     let identity = hellas_attestation::apple_credential_identity(&enrollment.attestation_object)
@@ -125,7 +140,7 @@ pub fn grant_transport(provider: &ProviderEnrollmentBundle) -> Result<[u8; 32], 
 }
 /// Checks enrollment bounds and key shapes; callers separately verify root trust.
 pub fn check_grant_provider(provider: &ProviderEnrollmentBundle) -> Result<(), GrantError> {
-    if provider.canonical_bytes().len() > MAX_PRINCIPAL_BYTES {
+    if provider.canonical_bytes().len() > MAX_ENROLLMENT_BYTES {
         return Err(GrantError::Malformed);
     }
     grant_producer(provider)?;
@@ -143,7 +158,7 @@ pub mod provider_bytes {
         d: D,
     ) -> Result<ProviderEnrollmentBundle, D::Error> {
         let bytes = serde_bytes::ByteBuf::deserialize(d)?;
-        if bytes.len() > MAX_PRINCIPAL_BYTES {
+        if bytes.len() > MAX_ENROLLMENT_BYTES {
             return Err(D::Error::custom(GrantError::Malformed));
         }
         let provider =
