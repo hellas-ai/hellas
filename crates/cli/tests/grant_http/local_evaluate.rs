@@ -1,5 +1,5 @@
 use super::*;
-use hellas_work::model::grant::records::{decode_enrollment, principal_id};
+use hellas_work::model::grant::records::decode_enrollment;
 
 struct LocalGateway {
     _root: tempfile::TempDir,
@@ -13,31 +13,28 @@ impl LocalGateway {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
         hellas_private::restrict_directory(root).unwrap();
-        let owner = Cli::new(root, "owner");
+        let owner = Cli::new(root, "owner", AGENT_PASSKEY);
         owner.run(&["--software-root", "identity", "init"]).await;
-        let export = owner.output(&["contact", "export"]).await;
+        let export = owner.output(&["identity", "export-enrollment"]).await;
         assert!(export.status.success());
-        let principal = decode_enrollment(&export.stdout).unwrap();
+        let enrollment = decode_enrollment(&export.stdout).unwrap();
+        let principal = owner.principal();
         let journal = root
             .join("grants")
-            .join(hex::encode(principal_id(&principal).unwrap().as_bytes()))
+            .join(format!("p256-{}", hex::encode(principal.as_bytes())))
             .join("provider");
         let now = hellas_auth::authority::UnixMillis::now().unwrap_or_default();
         let (store, secret) = common_node::bootstrap_node_with_credential(
             &journal,
             grant_network(),
-            Some(principal.clone()),
+            Some(enrollment.clone()),
             now,
         )
         .await
         .unwrap();
         let (environment, policy, environment_file, tokenizer) =
             super::native_owner::native_model(root, "local", 1023, 1023);
-        let allowance = owner_grant_id(
-            grant_network(),
-            principal.content_id(),
-            principal_id(&principal).unwrap(),
-        );
+        let allowance = owner_grant_id(grant_network(), enrollment.content_id(), principal);
         // Read only this freshly generated fixture identity to provision its native service.
         let identity_bytes = std::fs::read(&owner.identity).unwrap();
         let mut decoder = hellas_rpc::DagCborDecoder::new(&identity_bytes);
@@ -50,7 +47,7 @@ impl LocalGateway {
         assert_eq!(decoder.u64("root kind").unwrap(), 0);
         let _: [u8; 32] = decoder.fixed_bytes("root key").unwrap();
         let signer = hellas_auth::ProducerSigningKey::from_secret_bytes(
-            decoder.fixed_bytes("producer key").unwrap(),
+            decoder.fixed_bytes("node key").unwrap(),
         )
         .unwrap();
         let store = common_node::provision(
@@ -66,7 +63,7 @@ impl LocalGateway {
                     amount: 0,
                 }],
             ),
-            common_node::allowance(allowance, principal_id(&principal).unwrap(), vec![policy]),
+            common_node::allowance(allowance, principal, vec![policy]),
             (vec![], 256),
         )
         .await;
@@ -74,21 +71,19 @@ impl LocalGateway {
             store,
             Arc::new(|| hellas_auth::authority::UnixMillis::now().unwrap_or_default()),
         );
-        let credential = common_node::execution_credential(
-            &node,
-            &secret,
-            principal_id(&principal).unwrap(),
-            allowance,
-        )
-        .await;
-        let authority = node.authenticate(&credential).await.unwrap().authority();
+        // The local gateway signs its jobs with this node's own key.
+        let credential =
+            execution_credential(&node, &secret, principal, allowance, owner.holder().await).await;
+        let authority = hellas_work::test_support::session(&node, &secret)
+            .await
+            .authority();
         let work_profile = work_profile(root, authority, &credential);
         drop(node);
         let (gateway_profile, gateway_token) = gateway_profile(root).await;
         let trust_root = approve(
             root,
             "local",
-            principal.content_id(),
+            enrollment.content_id(),
             vec![environment.manifest().content_id()],
         );
         let mut gateway = owner.spawn(

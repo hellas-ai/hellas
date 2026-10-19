@@ -124,21 +124,61 @@ impl Https {
         }
     }
 }
+/// Software passkeys of fixture actors, so in-process fixtures can approve and
+/// open sessions for the same principals the CLI acts for. `ROOT` is the
+/// administrator the `common_node` bootstrap names.
+const ROOT_PASSKEY: [u8; 32] = [0x11; 32];
+const FRIEND_PASSKEY: [u8; 32] = [0x13; 32];
+const AGENT_PASSKEY: [u8; 32] = [0x14; 32];
+const STRANGER_PASSKEY: [u8; 32] = [0x16; 32];
+
+/// One CLI user: a node identity, acting for the principal of its own
+/// software passkey file.
 struct Cli {
     root: PathBuf,
     identity: PathBuf,
+    passkey: PathBuf,
 }
 impl Cli {
-    fn new(root: &Path, name: &str) -> Self {
+    fn new(root: &Path, name: &str, passkey: [u8; 32]) -> Self {
+        let path = root.join(format!("{name}.passkey"));
+        std::fs::write(&path, hex::encode(passkey)).unwrap();
         Self {
             root: root.into(),
             identity: root.join(name),
+            passkey: path,
         }
+    }
+    fn principal(&self) -> hellas_auth::authority::PrincipalId {
+        let scalar: [u8; 32] = hex::decode(std::fs::read(&self.passkey).unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let passkey = hellas_kernel::SoftPasskey::from_secret_scalar(scalar).unwrap();
+        hellas_auth::authority::PrincipalId::from_public_key(hellas_auth::PublicKey::P256(
+            passkey.party_key().to_bytes(),
+        ))
+        .unwrap()
+    }
+    /// The holder naming this CLI's node key, as `identity show-holder` prints it.
+    async fn holder(&self) -> hellas_auth::authority::CredentialHolder {
+        serde_json::from_str(&self.run(&["identity", "show-holder"]).await).unwrap()
+    }
+    async fn holder_file(&self) -> PathBuf {
+        let path = self.root.join(format!(
+            "{}-holder.json",
+            self.identity.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::write(&path, self.run(&["identity", "show-holder"]).await).unwrap();
+        path
     }
     fn command(&self, args: &[&str]) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_hellas-cli"));
-        if args.first() != Some(&"trust") {
+        if !matches!(args.first(), Some(&"trust" | &"contact" | &"offer")) {
             command.arg("--identity").arg(&self.identity);
+        }
+        if args.first() != Some(&"trust") {
+            command.arg("--passkey").arg(&self.passkey);
         }
         command
             .args(args)
@@ -325,6 +365,7 @@ async fn issue_work_profile(
     socket: &Path,
     root: &Path,
     subject: hellas_auth::authority::PrincipalId,
+    holder: &Path,
     allowance: GrantId,
 ) -> PathBuf {
     use hellas_auth::authority as auth;
@@ -373,6 +414,8 @@ async fn issue_work_profile(
             "issue-credential",
             "--scope",
             string(&scope),
+            "--holder",
+            string(holder),
             "--credential-out",
             string(&output),
         ])
@@ -390,10 +433,53 @@ async fn issue_work_profile(
         &hellas_sdk::node_control::profile::read_credential(&output).unwrap(),
     )
 }
+/// A Work credential for `subject` on `allowance`, held by `holder`, issued
+/// through the checked node API by the passkey session of `administrator`'s
+/// subject.
+async fn execution_credential(
+    node: &hellas_work::node::NodeCoordinator,
+    administrator: &hellas_auth::authority::CredentialSecret,
+    subject: hellas_auth::authority::PrincipalId,
+    allowance: GrantId,
+    holder: hellas_auth::authority::CredentialHolder,
+) -> hellas_auth::authority::CredentialSecret {
+    use hellas_auth::authority as auth;
+    let caller = hellas_work::test_support::session(node, administrator).await;
+    let root = GrantId([0; 16]);
+    let scope = auth::GrantSpec {
+        authority: caller.authority(),
+        subject,
+        permissions: [auth::Permission {
+            operation: auth::OperationId::new(hellas_work::grant_service::WORK_EXECUTE).unwrap(),
+            resource: hellas_work::grant_service::allowance_resource(caller.authority(), allowance),
+        }]
+        .into(),
+        not_before: auth::UnixMillis(1000),
+        expires: auth::UnixMillis(u64::MAX),
+        delegation_depth: 0,
+        issuance: None,
+    };
+    node.grant(
+        &caller,
+        auth::GrantCommand::Issue {
+            authorization: root,
+            id: common_node::EXECUTION_AUTHORIZATION,
+            spec: scope.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    node.issue_credential(&caller, root, scope, holder)
+        .await
+        .unwrap()
+        .1
+}
+/// An HTTP authority whose administrator issues the gateway a separate
+/// bearer credential; the bootstrap credential is never the bearer.
 async fn gateway_profile(root: &Path) -> (PathBuf, String) {
     use hellas_auth::{Digest, authority::*};
     let authority = AuthorityId(Digest::hash(b"CLI HTTP authority"));
-    let subject = hellas_work::test_support::principal(1).0;
+    let subject = hellas_work::test_support::actors::OPERATOR.principal();
     let now = UnixMillis::now().unwrap_or_default();
     let permission = hellas_work::operations::Operation::named(hellas_work::node::GATEWAY_INVOKE)
         .unwrap()
@@ -417,25 +503,34 @@ async fn gateway_profile(root: &Path) -> (PathBuf, String) {
         expires: UnixMillis(now.0 + 600_000),
     };
     let journal = root.join("gateway-authority");
-    let (store, credential) = hellas_work::work_store::grant::NodeStore::bootstrap(
+    let root_grant = GrantId([0; 16]);
+    let (store, admin) = hellas_work::work_store::grant::NodeStore::bootstrap(
         &journal,
         hellas_work::model::grant::grant_network(),
-        GrantId([0; 16]),
-        administrator,
-        scope,
+        root_grant,
+        common_node::approval(Ownership::Bootstrap { root: root_grant }, administrator),
         None,
         now,
     )
     .await
     .unwrap();
-    drop(store);
+    let node = hellas_work::node::NodeCoordinator::new(
+        store,
+        Arc::new(|| UnixMillis::now().unwrap_or_default()),
+    );
+    let caller = hellas_work::test_support::session(&node, &admin).await;
+    let (_, credential) = node
+        .issue_credential(&caller, root_grant, scope, CredentialHolder::Bearer)
+        .await
+        .unwrap();
+    drop(node);
     let mut bytes = credential.id().0.to_vec();
     bytes.extend_from_slice(credential.expose_secret());
     let credential_path = root.join("gateway.credential");
     hellas_private::write_atomically(&credential_path, ".writing", &bytes).unwrap();
     let profile = root.join("gateway-profile.json");
     hellas_private::write_atomically(&profile,".writing",&serde_json::to_vec(&json!({
-        "journal":journal,"authority":authority,"authorization":GrantId([0;16]),"credential":credential_path
+        "journal":journal,"authority":authority,"authorization":root_grant,"credential":credential_path
     })).unwrap()).unwrap();
     (profile, hex::encode(bytes))
 }
@@ -499,7 +594,7 @@ async fn prepare_machine(
         admin_secret: settings["HELLAS_REMOTE_KEY"].clone(),
         token: settings["HELLAS_REMOTE_TOKEN"].clone(),
         owner: Some(settings["HELLAS_REMOTE_OWNER"].clone()),
-        owner_enrollment: Some(settings["HELLAS_REMOTE_OWNER_ENROLLMENT"].clone()),
+        owner_node: Some(settings["HELLAS_REMOTE_OWNER_NODE"].clone()),
     };
     (admin_address, credentials)
 }

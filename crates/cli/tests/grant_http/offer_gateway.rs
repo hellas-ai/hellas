@@ -1,5 +1,6 @@
 use super::*;
-use hellas_work::model::grant::records::{decode_enrollment, grant_transport, principal_id};
+use hellas_work::model::grant::records::decode_enrollment;
+use hellas_work::test_support::actors::{FRIEND, ROOT};
 
 struct OfferHost {
     directory: tempfile::TempDir,
@@ -10,7 +11,7 @@ struct OfferHost {
     socket: PathBuf,
     provider_profile: PathBuf,
     client_profile: PathBuf,
-    provider_principal: hellas_rpc::ProviderEnrollmentBundle,
+    provider_enrollment: hellas_rpc::ProviderEnrollmentBundle,
     reader: hellas_auth::authority::GrantSpec,
     reader_grant: GrantId,
     root_grant: GrantId,
@@ -27,23 +28,26 @@ impl OfferHost {
         let root = directory.path();
         hellas_private::restrict_directory(root).unwrap();
         let https = Https::start(Some("Bearer fixture-key")).await;
-        let provider = Cli::new(root, "provider");
-        let client = Cli::new(root, "client");
+        let provider = Cli::new(root, "provider", ROOT_PASSKEY);
+        let client = Cli::new(root, "client", FRIEND_PASSKEY);
+        assert_eq!(provider.principal(), ROOT.principal());
+        assert_eq!(client.principal(), FRIEND.principal());
         for cli in [&provider, &client] {
             cli.run(&["--software-root", "identity", "init"]).await;
         }
-        let exported = provider.output(&["contact", "export"]).await;
+        let exported = provider.output(&["identity", "export-enrollment"]).await;
         assert!(exported.status.success());
-        let provider_principal = decode_enrollment(&exported.stdout).unwrap();
+        let provider_enrollment = decode_enrollment(&exported.stdout).unwrap();
         let (store, app_secret) = common_node::bootstrap_node_with_credential(
             &root
                 .join("grants")
-                .join(hex::encode(
-                    principal_id(&provider_principal).unwrap().as_bytes(),
+                .join(format!(
+                    "p256-{}",
+                    hex::encode(provider.principal().as_bytes())
                 ))
                 .join("provider"),
             hellas_work::model::grant::grant_network(),
-            Some(provider_principal.clone()),
+            Some(provider_enrollment.clone()),
             hellas_auth::authority::UnixMillis::now().unwrap_or_default(),
         )
         .await
@@ -58,19 +62,25 @@ impl OfferHost {
             .spec()
             .clone();
         let contact = root.join("contact");
-        let exported_contact = client
-            .output(&["contact", "export", "--out", string(&contact)])
+        client
+            .run(&[
+                "contact",
+                "export",
+                "--display-name",
+                "Client",
+                "--out",
+                string(&contact),
+            ])
             .await;
-        assert!(exported_contact.status.success());
-        let imported_contact = provider
-            .output(&["contact", "import", string(&contact), "--name", "client"])
+        provider
+            .run(&["contact", "import", string(&contact), "--name", "client"])
             .await;
-        assert!(imported_contact.status.success());
-        let grantee = decode_enrollment(&std::fs::read(&contact).unwrap()).unwrap();
-        reader.subject = hellas_auth::authority::PrincipalId::from_public_key(
-            grantee.genesis.statement.producer_public_key,
+        let grantee = hellas_work::model::grant::records::decode_contact_card(
+            &std::fs::read(&contact).unwrap(),
         )
-        .unwrap();
+        .unwrap()
+        .principal();
+        reader.subject = grantee;
         reader.permissions = [hellas_auth::authority::Permission {
             operation: hellas_auth::authority::OperationId::new(
                 hellas_work::work_store::grant::WORK_ALLOWANCE_READ,
@@ -85,9 +95,9 @@ impl OfferHost {
             store,
             Arc::new(|| hellas_auth::authority::UnixMillis::now().unwrap_or_default()),
         );
-        let caller = coordinator.authenticate(&app_secret).await.unwrap();
+        let caller = hellas_work::test_support::session(&coordinator, &app_secret).await;
         let (_, client_secret) = coordinator
-            .issue_credential(&caller, root_grant, reader.clone())
+            .issue_credential(&caller, root_grant, reader.clone(), client.holder().await)
             .await
             .unwrap();
         drop(coordinator);
@@ -105,7 +115,7 @@ impl OfferHost {
             "credentials":{"glm-account":{"allowed_origins":[https.origin],"allowed_paths":["/v1/chat/completions"],"allowed_methods":["POST"],
             "trust_roots":{"mode":"certificates","der_base64":[https.root_der]},"header_name":"authorization","secret_file":secret,"secret_field":"access_token","prefix":"Bearer "}}
         }}}]}).to_string()).unwrap();
-        std::fs::write(&resources,json!({"remote_control_peers":[iroh::EndpointId::from_bytes(&grant_transport(&grantee).unwrap()).unwrap().to_string()],"control_socket":socket,"control_certificate":control_certificate,"control_private_key":control_private_key,"max_job_millis":10000,"resources":[{"resource":hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test resource")),"account":hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test account")),"revision":1,"pricing":{"revision":1,"rates":null},"name":"glm","fetch":{ "contract":hellas_rpc::FetchContract::http().unwrap(),
+        std::fs::write(&resources,json!({"remote_control_peers":[client.run(&["identity", "show-node-id"]).await.trim()],"control_socket":socket,"control_certificate":control_certificate,"control_private_key":control_private_key,"max_job_millis":10000,"resources":[{"resource":hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test resource")),"account":hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test account")),"revision":1,"pricing":{"revision":1,"rates":null},"name":"glm","fetch":{ "contract":hellas_rpc::FetchContract::http().unwrap(),
             "allowed_environment":hellas_rpc::FetchContract::http().unwrap().manifest_id().to_string(),"service":"http","method":"request","max_request_body_bytes":65536,"max_output_events":256,"max_output_bytes":65536,"max_spool_bytes":262144,"max_encoded_result_frame":262144,"max_encoded_prepared_input":262144},
             "https":{"origin":https.origin,"paths":["/v1/chat/completions"],"methods":["POST"],"credential":"glm-account","tls":{"roots":{"mode":"certificates","der_base64":[https.root_der]},"spki_sha256":[]},"accounting":"openai-chat","max_output_tokens":8,"max_response_bytes":65536}}]}).to_string()).unwrap();
         let mut node = provider.spawn(
@@ -142,7 +152,7 @@ impl OfferHost {
         let id = GrantId([9; 16]);
         for definition in common_node::budgets(
             common_node::POOL,
-            principal_id(&grantee).unwrap(),
+            grantee,
             vec![Limit {
                 meter: Meter::OutputTokens,
                 window: Window::Total,
@@ -174,7 +184,7 @@ impl OfferHost {
             &socket,
             WorkControlCommand::Create {
                 id,
-                terms: terms(principal_id(&grantee).unwrap()),
+                terms: terms(grantee),
             },
         )
         .await;
@@ -203,7 +213,8 @@ impl OfferHost {
             &provider_profile,
             &socket,
             root,
-            principal_id(&grantee).unwrap(),
+            grantee,
+            &client.holder_file().await,
             id,
         )
         .await;
@@ -224,7 +235,7 @@ impl OfferHost {
             socket,
             provider_profile,
             client_profile,
-            provider_principal,
+            provider_enrollment,
             reader,
             reader_grant,
             root_grant,
@@ -322,10 +333,8 @@ struct Gateway {
 async fn offer_import_reports_the_exported_provider_identity() {
     let host = OfferHost::start().await;
     let fingerprint = format!(
-        "Provider fingerprint: {}",
-        principal_id(&host.provider_principal)
-            .unwrap()
-            .fingerprint()
+        "Provider enrollment: {}",
+        host.provider_enrollment.content_id()
     );
     assert!(String::from_utf8_lossy(&host.exported_offer.stderr).contains(&fingerprint));
     assert!(String::from_utf8_lossy(&host.imported_offer.stderr).contains(&fingerprint));
@@ -334,8 +343,7 @@ async fn offer_import_reports_the_exported_provider_identity() {
         hex::encode(host.id.0)
     );
     // Import is a public description, independent of execution authority.
-    let stranger = Cli::new(host.root(), "stranger");
-    stranger.run(&["--software-root", "identity", "init"]).await;
+    let stranger = Cli::new(host.root(), "stranger", STRANGER_PASSKEY);
     stranger
         .run(&[
             "offer",
@@ -365,9 +373,14 @@ async fn remote_admin_uses_the_explicit_reader_profile() {
     } = &host;
     let root = host.root();
     let direct = &signed_offer.offer().addresses[0];
-    let provider_contact = root.join("provider-contact");
+    let provider_node = root.join("provider-enrollment");
     provider
-        .run(&["contact", "export", "--out", string(&provider_contact)])
+        .run(&[
+            "identity",
+            "export-enrollment",
+            "--out",
+            string(&provider_node),
+        ])
         .await;
     let list = root.join("list-work.json");
     std::fs::write(
@@ -379,8 +392,8 @@ async fn remote_admin_uses_the_explicit_reader_profile() {
         "admin",
         "--profile",
         string(client_profile),
-        "--contact",
-        string(&provider_contact),
+        "--node",
+        string(&provider_node),
         "--address",
         direct,
         "work",
@@ -477,13 +490,12 @@ async fn approved_offer_streams_from_the_private_ca_upstream() {
     host.stop().await;
 }
 
-/// Bootstrap an HTTP authority administered by the client identity, with the
-/// gateway's own credential issued through the checked writer before startup.
+/// Bootstrap an HTTP authority administered by the client's principal, with
+/// the gateway's own bearer credential issued through the checked writer
+/// before startup.
 async fn controlled_gateway_profile(root: &Path) -> (PathBuf, PathBuf) {
     use hellas_auth::{Digest, authority::*};
-    let contact = decode_enrollment(&std::fs::read(root.join("contact")).unwrap()).unwrap();
-    let subject =
-        PrincipalId::from_public_key(contact.genesis.statement.producer_public_key).unwrap();
+    let subject = FRIEND.principal();
     let authority = AuthorityId(Digest::hash(b"CLI controlled HTTP authority"));
     let now = UnixMillis::now().unwrap_or_default();
     let validity = (now, UnixMillis(now.0 + 600_000));
@@ -509,12 +521,12 @@ async fn controlled_gateway_profile(root: &Path) -> (PathBuf, PathBuf) {
         expires: validity.1,
     };
     let journal = root.join("controlled-authority");
+    let root_grant = GrantId([0; 16]);
     let (store, admin_secret) = hellas_work::work_store::grant::NodeStore::bootstrap(
         &journal,
         hellas_work::model::grant::grant_network(),
-        GrantId([0; 16]),
-        administrator.clone(),
-        administrator,
+        root_grant,
+        common_node::approval(Ownership::Bootstrap { root: root_grant }, administrator),
         None,
         now,
     )
@@ -524,9 +536,9 @@ async fn controlled_gateway_profile(root: &Path) -> (PathBuf, PathBuf) {
         store,
         Arc::new(|| UnixMillis::now().unwrap_or_default()),
     );
-    let caller = coordinator.authenticate(&admin_secret).await.unwrap();
+    let caller = hellas_work::test_support::session(&coordinator, &admin_secret).await;
     let (_, own) = coordinator
-        .issue_credential(&caller, GrantId([0; 16]), scope.clone())
+        .issue_credential(&caller, root_grant, scope.clone(), CredentialHolder::Bearer)
         .await
         .unwrap();
     drop(coordinator);
@@ -540,6 +552,11 @@ async fn controlled_gateway_profile(root: &Path) -> (PathBuf, PathBuf) {
     std::fs::write(
         root.join("agent-scope.json"),
         serde_json::to_vec(&scope).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("bearer.json"),
+        serde_json::to_vec(&CredentialHolder::Bearer).unwrap(),
     )
     .unwrap();
     let control = root.join("gateway-control");
@@ -604,6 +621,8 @@ async fn gateway_control_issues_and_revokes_live_credentials() {
                     "issue-credential",
                     "--scope",
                     string(&root.join("agent-scope.json")),
+                    "--holder",
+                    string(&root.join("bearer.json")),
                     "--credential-out",
                     string(&out),
                 ])

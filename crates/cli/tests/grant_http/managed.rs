@@ -1,5 +1,5 @@
 use super::*;
-use hellas_work::model::grant::records::{decode_enrollment, principal_id};
+use hellas_work::model::grant::records::decode_enrollment;
 
 struct Managed {
     task: tokio::task::JoinHandle<hellas_cloud::agent::Result<()>>,
@@ -38,7 +38,7 @@ impl ManagedWorker {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
         hellas_private::restrict_directory(root).unwrap();
-        let owner = Cli::new(root, "owner");
+        let owner = Cli::new(root, "owner", AGENT_PASSKEY);
         owner.run(&["--software-root", "identity", "init"]).await;
         let (admin_address, credentials) = prepare_machine(&owner, "worker").await;
         let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -49,9 +49,10 @@ impl ManagedWorker {
         // Ordinary agent startup opens existing authority; provision the fixture offline.
         hellas_private::create_dir_all_durable(&data).unwrap();
         hellas_private::create_dir_all_durable(&private).unwrap();
-        let worker = Cli::new(&data, "identity");
+        // The worker's operator administers it with its own passkey.
+        let worker = Cli::new(&data, "identity", ROOT_PASSKEY);
         worker.run(&["--software-root", "identity", "init"]).await;
-        let exported = worker.output(&["contact", "export"]).await;
+        let exported = worker.output(&["identity", "export-enrollment"]).await;
         assert!(exported.status.success());
         let provider = decode_enrollment(&exported.stdout).unwrap();
         use hellas_auth::authority as auth;
@@ -73,8 +74,7 @@ impl ManagedWorker {
         .collect();
         let administrator = common_node::admin_spec(
             authority,
-            auth::PrincipalId::from_public_key(provider.genesis.statement.producer_public_key)
-                .unwrap(),
+            worker.principal(),
             &extra,
             (now, auth::UnixMillis(now.0 + 3_600_000)),
             (3_600_000, 8),
@@ -91,8 +91,10 @@ impl ManagedWorker {
             &private.join("grants"),
             hellas_work::model::grant::grant_network(),
             root_grant,
-            administrator.clone(),
-            administrator,
+            common_node::approval(
+                auth::Ownership::Bootstrap { root: root_grant },
+                administrator,
+            ),
             Some(provider.clone()),
             now,
         )
@@ -103,9 +105,11 @@ impl ManagedWorker {
             store,
             Arc::new(|| hellas_auth::authority::UnixMillis::now().unwrap_or_default()),
         );
-        let caller = node.authenticate(&secret).await.unwrap();
+        // The agent's readiness check opens a daily session with the worker's
+        // own node key, so the control credential is held by that node.
+        let caller = hellas_work::test_support::session(&node, &secret).await;
         let (_, secret) = node
-            .issue_credential(&caller, root_grant, application)
+            .issue_credential(&caller, root_grant, application, worker.holder().await)
             .await
             .unwrap();
         drop(node);
@@ -195,9 +199,7 @@ impl ManagedWorker {
                 string(&limits),
             ])
             .await;
-        let exported = owner.output(&["contact", "export"]).await;
-        let principal = decode_enrollment(&exported.stdout).unwrap();
-        let work_subject = principal_id(&principal).unwrap();
+        let work_subject = owner.principal();
         let work_allowance = hellas_work::model::grant::owner_grant_id(
             hellas_work::model::grant::grant_network(),
             provider.content_id(),
@@ -246,6 +248,7 @@ impl ManagedWorker {
             &control,
             root,
             work_subject,
+            &owner.holder_file().await,
             work_allowance,
         )
         .await;

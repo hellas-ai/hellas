@@ -12,7 +12,6 @@ use hellas_rpc::{
     *,
 };
 use hellas_wire::{Dispatcher, ServiceMarker, StreamTransport, iroh::IrohTransport};
-use hellas_work::model::grant::records::{decode_enrollment, principal_id};
 use hellas_work::model::{
     grant::{budget::*, grant_network, records::*},
     work::{EvaluatePolicyV2, generation_policy_digest, identity_source_digest},
@@ -100,16 +99,15 @@ impl NativeOwner {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
         hellas_private::restrict_directory(root).unwrap();
-        let owner = Cli::new(root, "owner");
+        let owner = Cli::new(root, "owner", AGENT_PASSKEY);
         owner.run(&["--software-root", "identity", "init"]).await;
-        let export = owner.output(&["contact", "export"]).await;
-        assert!(export.status.success());
-        let owner_principal = decode_enrollment(&export.stdout).unwrap();
+        let owner_principal = owner.principal();
+        let owner_holder = owner.holder().await;
         let (admin_address, credentials) = prepare_machine(&owner, "native").await;
         let transport = iroh::SecretKey::generate();
         let signer = Arc::new(ProducerSigningKey::from_secret_bytes([42; 32]).unwrap());
         let provider = hellas_work::test_support::enrollment(
-            &signer,
+            &ProducerSigningKey::from_secret_bytes([41; 32]).unwrap(),
             &signer,
             *transport.public().as_bytes(),
             [42; 32],
@@ -138,7 +136,7 @@ impl NativeOwner {
         let enrollment = Enrollment {
             node_id: endpoint.id().to_string(),
             enrollment_id: provider.content_id().to_string(),
-            bundle: Some(hex::encode(provider.canonical_bytes())),
+            bundle: hex::encode(provider.canonical_bytes()),
         };
         let mut servers = tokio::task::JoinSet::new();
         let admin_server = admin.clone();
@@ -149,7 +147,18 @@ impl NativeOwner {
                 let request: wire::Request =
                     serde_json::from_slice(&recv.read_to_end(wire::MAX_MESSAGE).await.unwrap())
                         .unwrap();
-                assert_eq!(Some(connection.remote_id().to_string()), credentials.owner);
+                // The owner's node key proves this exact connection.
+                let (_, node) = credentials.owner().unwrap().unwrap();
+                let proof: [u8; 64] = hex::decode(request.proof.as_deref().unwrap())
+                    .unwrap()
+                    .try_into()
+                    .unwrap();
+                hellas_auth::signature::verify_digest_signature(
+                    &node.public_key(),
+                    &hellas_auth::Signature::Secp256k1(proof),
+                    wire::session_digest(&connection).unwrap(),
+                )
+                .unwrap();
                 assert_eq!(request.token, credentials.token);
                 assert!(matches!(request.operation, wire::Operation::Status));
                 send.write_all(
@@ -179,13 +188,10 @@ impl NativeOwner {
         let owner_id = hellas_work::model::grant::owner_grant_id(
             grant_network(),
             provider.content_id(),
-            principal_id(&owner_principal).unwrap(),
+            owner_principal,
         );
-        let mut definition = common_node::allowance(
-            owner_id,
-            principal_id(&owner_principal).unwrap(),
-            vec![policy.clone()],
-        );
+        let mut definition =
+            common_node::allowance(owner_id, owner_principal, vec![policy.clone()]);
         definition.max_job_millis = std::num::NonZeroU64::new(10_000).unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
         let service = GrantService::new(
@@ -212,27 +218,20 @@ impl NativeOwner {
             )
             .await;
         work_admin
-            .budgets(
-                common_node::POOL,
-                principal_id(&owner_principal).unwrap(),
-                vec![],
-                256,
-            )
+            .budgets(common_node::POOL, owner_principal, vec![], 256)
             .await;
         work_admin.create(definition).await;
-        let credential = common_node::execution_credential(
+        // The owner's gateway signs its jobs with its own node key.
+        let credential = execution_credential(
             &service.node(),
             &secret,
-            principal_id(&owner_principal).unwrap(),
+            owner_principal,
             owner_id,
+            owner_holder,
         )
         .await;
-        // The owner's identity key lives in its CLI profile; the bearer admin names the authority.
-        let authority = service
-            .node()
-            .authenticate(&secret)
+        let authority = hellas_work::test_support::session(&service.node(), &secret)
             .await
-            .unwrap()
             .authority();
         let work_profile = work_profile(root, authority, &credential);
         work_admin
