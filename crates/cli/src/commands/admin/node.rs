@@ -6,8 +6,7 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use hellas_auth::authority::{
     AdministrationCommand, AdministrationRecord, CredentialCommand, CredentialHolder, CredentialId,
-    CredentialSecret, GrantCommand, GrantId, GrantSpec, Ownership, Revision,
-    ownership_digest,
+    CredentialSecret, GrantCommand, GrantId, GrantSpec, Ownership, Revision, ownership_digest,
 };
 use hellas_rpc::{
     pb::host::{

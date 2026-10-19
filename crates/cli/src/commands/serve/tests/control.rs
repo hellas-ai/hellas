@@ -207,12 +207,7 @@ impl Daemon {
             ..self.local(command)
         }
     }
-    fn remote(
-        &self,
-        profile: PathBuf,
-        command: AdminCommand,
-        passkey: Option<&Path>,
-    ) -> AdminArgs {
+    fn remote(&self, profile: PathBuf, command: AdminCommand, passkey: Option<&Path>) -> AdminArgs {
         let contact = self.root.path().join("node.contact");
         std::fs::write(
             &contact,
@@ -402,9 +397,12 @@ async fn local_profile_requires_its_own_identity() {
     let mut daemon = Daemon::start().await;
     // A daily session needs the node key the credential is bound to.
     assert_permission_denied(
-        run(daemon.local_daily(AdminCommand::Status), &daemon.wrong_identity)
-            .await
-            .unwrap_err(),
+        run(
+            daemon.local_daily(AdminCommand::Status),
+            &daemon.wrong_identity,
+        )
+        .await
+        .unwrap_err(),
     );
     run(daemon.local_daily(AdminCommand::Status), &daemon.identity)
         .await
