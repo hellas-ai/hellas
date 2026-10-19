@@ -67,6 +67,7 @@ impl Decision {
                     AuthorityError::Audience => "authority_mismatch",
                     AuthorityError::Denied => "permission_denied",
                     AuthorityError::Credential => "credential_invalid",
+                    AuthorityError::StepUp => "passkey_required",
                     AuthorityError::Missing => "grant_missing",
                     AuthorityError::Revoked => "grant_revoked",
                     AuthorityError::Expired => "expired",

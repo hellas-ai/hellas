@@ -101,7 +101,10 @@ async fn checked_services_audit_reads_and_final_refusals_without_request_content
     )
     .await;
     let caller = node
-        .authenticate_signed(&credential, &common::principal(1).1)
+        .authenticate_session(
+            &credential,
+            crate::node::SessionKey::Node(&common::principal(1).1),
+        )
         .await
         .unwrap();
     let before = node.status(&admin.caller, root).await.unwrap();
@@ -206,15 +209,15 @@ async fn unverified_foreign_revoked_and_wrongly_bound_evidence_cannot_name_an_ac
         .unwrap()
         .revision();
     let node = NodeCoordinator::new(store, Arc::new(|| UnixMillis(1000)));
-    let caller = node.authenticate(&secret).await.unwrap();
+    let caller = crate::test_support::session(&node, &secret).await;
     let foreign_directory = tempfile::tempdir().unwrap();
     let (foreign, foreign_secret) = common::setup_with_credential(foreign_directory.path()).await;
     // Same authority ID and subject, but minted by a different writer and verifier set.
-    let foreign_caller = foreign
-        .state()
-        .authority()
-        .authenticate(&foreign_secret, UnixMillis(1000))
-        .unwrap();
+    let foreign_caller = crate::test_support::passkey_caller(
+        foreign.state().authority(),
+        &foreign_secret,
+        UnixMillis(1000),
+    );
     assert_eq!(caller.subject(), foreign_caller.subject());
     assert_err!(
         node.status(&foreign_caller, root).await,
@@ -231,11 +234,11 @@ async fn unverified_foreign_revoked_and_wrongly_bound_evidence_cannot_name_an_ac
     let pending = node.begin_authentication(binding).await.unwrap();
     let signature = pending
         .challenge()
-        .sign(
+        .sign_daily(
             pending.challenge().authority,
             binding,
             secret.id(),
-            &common::principal(2).1,
+            &hellas_auth::test_support::actors::ROOT.node_key(),
         )
         .unwrap();
     let session = node
@@ -258,7 +261,7 @@ async fn unverified_foreign_revoked_and_wrongly_bound_evidence_cannot_name_an_ac
         crate::work_store::grant::NodeStoreError::Authority(AuthorityError::Credential)
     );
     assert_err!(
-        node.authenticate(&secret).await,
+        crate::test_support::try_session(&node, &secret).await,
         crate::work_store::grant::NodeStoreError::Authority(AuthorityError::Credential)
     );
     assert_err!(
@@ -267,7 +270,7 @@ async fn unverified_foreign_revoked_and_wrongly_bound_evidence_cannot_name_an_ac
     );
     for action in [
         crate::node::HOST_STATUS,
-        "credential.authenticate",
+        "session.authenticate",
         "session.validate",
     ] {
         let event = events.last(action, "denied");

@@ -1,8 +1,8 @@
 //! Native initialization marker and exclusive ownership across journal rotation.
 use super::*;
 use hellas_auth::authority::{
-    AuthorityId, AuthorityState, Credential, CredentialSecret, GrantId, GrantSpec, RecoveryCommand,
-    RecoveryRecord,
+    AuthorityId, AuthorityState, Credential, CredentialHolder, CredentialSecret, GrantId,
+    GrantSpec, NodeKey, PasskeyAssertion, RecoveryCommand, RecoveryRecord,
 };
 use serde::Deserialize;
 use std::fs::{File, TryLockError};
@@ -29,6 +29,17 @@ struct Marker {
     authority: AuthorityId,
 }
 
+/// The administration an offline bootstrap or recovery installs, approved by
+/// the administrator's passkey: `assertion` signs `ownership_digest` over the
+/// administrator grant, the initial credential's scope and the node key that
+/// will hold the credential.
+pub struct OwnerApproval {
+    pub administrator: GrantSpec,
+    pub credential: GrantSpec,
+    pub holder: NodeKey,
+    pub assertion: PasskeyAssertion,
+}
+
 impl NodeStore {
     /// Replace lost administration with the daemon stopped. Opening the private
     /// identity marker acquires the same exclusive lock held by the running host.
@@ -41,8 +52,7 @@ impl NodeStore {
         directory: &Path,
         network: NetworkId,
         expected: Revision,
-        administrator: GrantSpec,
-        credential_scope: GrantSpec,
+        approval: OwnerApproval,
         now: UnixMillis,
     ) -> Result<(RecoveryRecord, CredentialSecret), NodeStoreError> {
         let mut store = Self::open_initialized(directory, network).await?;
@@ -52,7 +62,11 @@ impl NodeStore {
             .generation()
             .checked_add(1)
             .ok_or(hellas_auth::authority::AuthorityError::Capacity)?;
-        let (credential, secret) = Credential::prepare(credential_scope, generation)?;
+        let (credential, secret) = Credential::prepare(
+            approval.credential,
+            CredentialHolder::Node(approval.holder),
+            generation,
+        )?;
         let revoke = store
             .state
             .authority
@@ -69,9 +83,10 @@ impl NodeStore {
                 now,
                 Change::Recover(RecoveryCommand {
                     expected,
-                    administrator,
+                    administrator: approval.administrator,
                     credential,
                     revoke,
+                    owner: approval.assertion,
                 }),
                 true,
             )
@@ -93,15 +108,24 @@ impl NodeStore {
         directory: &Path,
         network: NetworkId,
         root_grant: GrantId,
-        administrator: GrantSpec,
-        credential_scope: GrantSpec,
+        approval: OwnerApproval,
         provider: Option<ProviderEnrollmentBundle>,
         now: UnixMillis,
     ) -> Result<(Self, CredentialSecret), NodeStoreError> {
         let clock = super::super::clock::ClockBound::new();
         clock.check(now)?;
-        let (credential, secret) = Credential::prepare(credential_scope, 1)?;
-        let authority = AuthorityState::bootstrap(root_grant, administrator, credential, now)?;
+        let (credential, secret) = Credential::prepare(
+            approval.credential,
+            CredentialHolder::Node(approval.holder),
+            1,
+        )?;
+        let authority = AuthorityState::bootstrap(
+            root_grant,
+            approval.administrator,
+            credential,
+            &approval.assertion,
+            now,
+        )?;
         let state = State::initialized(network, authority, provider.clone())?;
         let marker = Marker {
             namespace: "hellas.node.identity.v1".into(),
@@ -109,7 +133,7 @@ impl NodeStore {
             authority: state.authority.authority(),
         };
         let frame = Frame {
-            namespace: "hellas.node.journal.v1".into(),
+            namespace: "hellas.node.journal.v2".into(),
             now,
             changes: vec![Change::Initialize {
                 authority: state.authority.snapshot(),
@@ -190,7 +214,7 @@ impl NodeStore {
             None => {
                 let bytes = records.next().ok_or(NodeStoreError::Uninitialized)?;
                 let mut frame: Frame = decode(&bytes)?;
-                if frame.namespace != "hellas.node.journal.v1" || frame.changes.len() != 1 {
+                if frame.namespace != "hellas.node.journal.v2" || frame.changes.len() != 1 {
                     return Err(NodeStoreError::Malformed);
                 }
                 let Some(Change::Initialize {

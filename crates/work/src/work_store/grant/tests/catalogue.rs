@@ -21,6 +21,7 @@ async fn signed_model_and_settings_limits_reject_before_client_signing_and_provi
             generation: 0,
             client: principal(1).0,
         },
+        crate::test_support::node_key(1),
         now,
     )
     .await

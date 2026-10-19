@@ -19,7 +19,7 @@ flate2 = "1"
 futures.workspace = true
 hellas-attestation = { workspace = true, features = ["apple-app-attest"] }
 hellas-auth.workspace = true
-hellas-kernel = { workspace = true, features = ["secp256k1"] }
+hellas-kernel = { workspace = true, features = ["secp256k1", "webauthn"] }
 hellas-private.workspace = true
 hellas-rpc = { workspace = true, features = ["evaluate", "fetch", "work"] }
 hellas-wire.workspace = true

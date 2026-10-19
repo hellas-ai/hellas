@@ -61,11 +61,8 @@ async fn the_authority_clock_floor_survives_reopening_at_an_older_time() {
         ),
         auth::AuthorityError::Expired
     );
-    let caller = store
-        .state()
-        .authority()
-        .authenticate(&secret, UnixMillis(6))
-        .unwrap();
+    let caller =
+        crate::test_support::passkey_caller(store.state().authority(), &secret, UnixMillis(6));
     assert_err!(
         store
             .administer_authority(
@@ -106,8 +103,13 @@ async fn bootstrap(path: &Path) -> (NodeStore, CredentialSecret) {
         path,
         network(),
         ids::ROOT_GRANT,
-        admin(),
-        admin(),
+        crate::test_support::common_node::approval_for(
+            auth::Ownership::Bootstrap {
+                root: ids::ROOT_GRANT,
+            },
+            admin(),
+            admin(),
+        ),
         None,
         UnixMillis(1),
     )
@@ -144,7 +146,7 @@ fn authority_change(
     command: auth::GrantCommand,
     now: UnixMillis,
 ) -> Change {
-    let caller = authority.authenticate(secret, now).unwrap();
+    let caller = crate::test_support::passkey_caller(authority, secret, now);
     let record = authority
         .record_administration(&caller, auth::AdministrationCommand::Grant(command), now)
         .unwrap();
@@ -182,8 +184,13 @@ async fn bootstrap_refuses_a_foreign_credential_subject_atomically() {
             directory.path(),
             network(),
             ids::ROOT_GRANT,
-            admin(),
-            scope,
+            crate::test_support::common_node::approval_for(
+                auth::Ownership::Bootstrap {
+                    root: ids::ROOT_GRANT
+                },
+                admin(),
+                scope
+            ),
             None,
             UnixMillis(1)
         )
@@ -197,11 +204,8 @@ async fn bootstrap_refuses_a_foreign_credential_subject_atomically() {
 async fn a_providerless_authority_survives_reopen() {
     let directory = tempfile::tempdir().unwrap();
     let (store, secret) = bootstrap(directory.path()).await;
-    let caller = store
-        .state()
-        .authority()
-        .authenticate(&secret, UnixMillis(1))
-        .unwrap();
+    let caller =
+        crate::test_support::passkey_caller(store.state().authority(), &secret, UnixMillis(1));
     assert_eq!(store.state().authority().authority(), admin().authority);
     assert_err!(store.state().provider(), NodeStoreError::MissingProvider);
     drop(store);
@@ -209,11 +213,7 @@ async fn a_providerless_authority_survives_reopen() {
         .await
         .unwrap();
     assert_eq!(reopened.state().authority().revision(), Revision(1));
-    reopened
-        .state()
-        .authority()
-        .authenticate(&secret, UnixMillis(2))
-        .unwrap();
+    crate::test_support::passkey_caller(reopened.state().authority(), &secret, UnixMillis(2));
     reopened
         .state()
         .authority()
@@ -238,8 +238,13 @@ async fn an_existing_authority_cannot_be_bootstrapped_again() {
             directory.path(),
             network(),
             ids::ROOT_GRANT,
-            admin(),
-            admin(),
+            crate::test_support::common_node::approval_for(
+                auth::Ownership::Bootstrap {
+                    root: ids::ROOT_GRANT
+                },
+                admin(),
+                admin()
+            ),
             None,
             UnixMillis(2)
         )
@@ -297,7 +302,16 @@ async fn an_initialization_frame_cannot_reset_existing_state() {
         authority: AuthorityState::bootstrap(
             ids::ROOT_GRANT,
             admin(),
-            Credential::prepare(admin(), 1).unwrap().0,
+            Credential::prepare(admin(), ROOT.holder(), 1).unwrap().0,
+            &hellas_auth::test_support::approve(
+                ROOT,
+                auth::Ownership::Bootstrap {
+                    root: ids::ROOT_GRANT,
+                },
+                &admin(),
+                &admin(),
+                ROOT.holder(),
+            ),
             UnixMillis(2),
         )
         .unwrap()
@@ -381,8 +395,13 @@ async fn damaged_initialization_never_opens_as_empty() {
                 directory.path(),
                 network(),
                 ids::ROOT_GRANT,
-                admin(),
-                admin(),
+                crate::test_support::common_node::approval_for(
+                    auth::Ownership::Bootstrap {
+                        root: ids::ROOT_GRANT
+                    },
+                    admin(),
+                    admin()
+                ),
                 None,
                 UnixMillis(2)
             )
@@ -405,8 +424,11 @@ async fn offline_recovery_requires_initialized_exclusive_state_and_expected_revi
             directory.path(),
             network(),
             expected,
-            replacement.clone(),
-            replacement.clone(),
+            crate::test_support::common_node::approval_for(
+                auth::Ownership::Recover { expected },
+                replacement.clone(),
+                replacement.clone(),
+            ),
             UnixMillis(2),
         )
         .await
@@ -461,8 +483,13 @@ async fn service_and_mixed_administration_are_revoked_while_execution_and_accoun
         directory.path(),
         network(),
         ids::ROOT_GRANT,
-        initial.clone(),
-        initial,
+        crate::test_support::common_node::approval_for(
+            auth::Ownership::Bootstrap {
+                root: ids::ROOT_GRANT,
+            },
+            initial.clone(),
+            initial,
+        ),
         None,
         UnixMillis(1),
     )
@@ -501,8 +528,13 @@ async fn service_and_mixed_administration_are_revoked_while_execution_and_accoun
         directory.path(),
         network(),
         before.authority().revision(),
-        replacement.clone(),
-        replacement,
+        crate::test_support::common_node::approval_for(
+            auth::Ownership::Recover {
+                expected: before.authority().revision(),
+            },
+            replacement.clone(),
+            replacement,
+        ),
         UnixMillis(2),
     )
     .await
@@ -541,8 +573,13 @@ async fn offline_recovery_changes_the_authority_once_and_journals_no_secret() {
         directory.path(),
         network(),
         ids::ROOT_GRANT,
-        admin(),
-        admin(),
+        crate::test_support::common_node::approval_for(
+            auth::Ownership::Bootstrap {
+                root: ids::ROOT_GRANT,
+            },
+            admin(),
+            admin(),
+        ),
         None,
         UnixMillis(1),
     )
@@ -571,8 +608,13 @@ async fn offline_recovery_changes_the_authority_once_and_journals_no_secret() {
         directory.path(),
         network(),
         before.authority().revision(),
-        replacement.clone(),
-        replacement,
+        crate::test_support::common_node::approval_for(
+            auth::Ownership::Recover {
+                expected: before.authority().revision(),
+            },
+            replacement.clone(),
+            replacement,
+        ),
         UnixMillis(3),
     )
     .await
@@ -582,12 +624,11 @@ async fn offline_recovery_changes_the_authority_once_and_journals_no_secret() {
         .unwrap();
     let authority = store.state().authority();
     assert_eq!(
-        authority.authenticate(&original, UnixMillis(3)).map(|_| ()),
+        crate::test_support::try_passkey_caller(authority, &original, UnixMillis(3)).map(|_| ()),
         Err(auth::AuthorityError::Credential)
     );
     assert_eq!(
-        authority
-            .authenticate(&replacement_secret, UnixMillis(3))
+        crate::test_support::try_passkey_caller(authority, &replacement_secret, UnixMillis(3))
             .map(|_| ()),
         Ok(())
     );

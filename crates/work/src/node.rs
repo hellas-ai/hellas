@@ -3,7 +3,8 @@ use crate::endpoint_lock::{EndpointGuard, EndpointLock};
 use crate::operations::validate_scope;
 use crate::work_store::grant::{NodeStore, NodeStoreError};
 use hellas_auth::authority::*;
-use hellas_auth::{Digest, ProducerSigningKey, Signature};
+use hellas_auth::{Digest, ProducerSigningKey};
+use hellas_kernel::{PayloadHash, SoftPasskey, WebAuthnAssertion};
 use std::sync::Arc;
 mod host;
 pub use host::{
@@ -11,6 +12,47 @@ pub use host::{
     HOST_PROVIDER_CONFIGURE, HOST_STATUS, MachineCapacity, NodeStatus, WORK_CAPACITY_CONFIGURE,
     host_resource, machine_resource,
 };
+
+/// The key a client proves an authority session with.
+#[derive(Clone, Copy)]
+pub enum SessionKey<'a> {
+    /// The credential subject's passkey: a passkey session, as step-up needs.
+    Passkey(&'a SoftPasskey),
+    /// The node key the credential is bound to: a daily session.
+    Node(&'a ProducerSigningKey),
+}
+
+impl SessionKey<'_> {
+    /// Answer `challenge` for `credential`, after checking it names the
+    /// expected authority and this connection's binding.
+    pub fn prove(
+        self,
+        challenge: &SessionChallenge,
+        authority: AuthorityId,
+        binding: Digest,
+        credential: CredentialId,
+    ) -> Result<SessionProof, AuthorityError> {
+        match self {
+            Self::Node(key) => challenge.sign_daily(authority, binding, credential, key),
+            Self::Passkey(passkey) => {
+                let digest = challenge.proof_digest(authority, binding, credential)?;
+                let envelope = passkey
+                    .sign(PayloadHash::from_bytes(*digest.as_bytes()))
+                    .map_err(|_| AuthorityError::Credential)?;
+                passkey_assertion(&envelope).map(SessionProof::Passkey)
+            }
+        }
+    }
+}
+
+/// A kernel-envelope assertion, as a software passkey produces it.
+pub fn passkey_assertion(envelope: &WebAuthnAssertion) -> Result<PasskeyAssertion, AuthorityError> {
+    let mut signature = [0; 64];
+    let (r, s) = signature.split_at_mut(32);
+    r.copy_from_slice(envelope.r());
+    s.copy_from_slice(envelope.s());
+    PasskeyAssertion::from_envelope(signature, envelope.webauthn_data().as_slice())
+}
 
 /// Cloneable service handle, not caller authority. No method exposes a mutable
 /// store or accepts a caller identity/record in place of verified evidence.
@@ -104,7 +146,7 @@ impl NodeCoordinator {
         decision.finish(result)
     }
 
-    /// Secret-only authentication; only self-issued bearer credentials qualify.
+    /// Secret-only authentication; only `gateway.invoke` bearer credentials qualify.
     pub async fn authenticate(
         &self,
         secret: &CredentialSecret,
@@ -123,22 +165,19 @@ impl NodeCoordinator {
         decision.finish(result)
     }
 
-    /// In-process authentication that proves the subject's identity key, exactly
-    /// as a remote session does, for credentials issued by another principal.
-    pub async fn authenticate_signed(
+    /// In-process authentication with exactly the proof a remote session needs.
+    pub async fn authenticate_session(
         &self,
         secret: &CredentialSecret,
-        identity: &ProducerSigningKey,
+        key: SessionKey<'_>,
     ) -> Result<AuthenticatedCaller, NodeStoreError> {
         // No transport exists to bind; the challenge nonce keeps each proof fresh.
         let binding = Digest::hash(b"hellas.auth.in-process.v1");
         let pending = self.begin_authentication(binding).await?;
         let authority = pending.challenge().authority;
-        let signature = pending
-            .challenge()
-            .sign(authority, binding, secret.id(), identity)?;
+        let proof = key.prove(pending.challenge(), authority, binding, secret.id())?;
         Ok(self
-            .complete_authentication(pending, binding, secret, &signature)
+            .complete_authentication(pending, binding, secret, &proof)
             .await?
             .into_caller())
     }
@@ -160,7 +199,7 @@ impl NodeCoordinator {
         pending: PendingAuthentication,
         binding: Digest,
         secret: &CredentialSecret,
-        signature: &Signature,
+        proof: &SessionProof,
     ) -> Result<AuthenticatedSession, NodeStoreError> {
         let mut decision =
             crate::audit::Decision::new("session.authenticate", None, Some(secret.id()));
@@ -168,7 +207,7 @@ impl NodeCoordinator {
             let (store, now) = self.lock().await?;
             let authority = store.state().authority();
             decision.observe(authority, None, now);
-            let session = pending.complete(authority, binding, secret, signature, now)?;
+            let session = pending.complete(authority, binding, secret, proof, now)?;
             decision.observe(
                 authority,
                 session.authenticate(authority, binding, now).ok(),
@@ -231,6 +270,7 @@ impl NodeCoordinator {
         caller: &AuthenticatedCaller,
         authorization: GrantId,
         scope: GrantSpec,
+        holder: CredentialHolder,
     ) -> Result<(AdministrationRecord, CredentialSecret), NodeStoreError> {
         let _changed = ChangeNotification(self.changed.clone());
         self.checked(
@@ -240,7 +280,7 @@ impl NodeCoordinator {
             async |store, now| {
                 validate_scope(store.state(), &scope)?;
                 let (credential, secret) =
-                    Credential::prepare(scope, store.state().authority().generation())?;
+                    Credential::prepare(scope, holder, store.state().authority().generation())?;
                 let record = store
                     .administer_authority(
                         caller,

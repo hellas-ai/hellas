@@ -1,5 +1,5 @@
 //! Explicit test worlds, provisioned through the same checked APIs as a host.
-use super::{common_node, credentials, enrollment, network, signed_caller};
+use super::{common_node, credentials, enrollment, network};
 use crate::model::grant::{budget::*, records::*};
 use crate::model::work::PrivateRecord;
 use crate::work_store::grant::{NodeStore, State};
@@ -47,7 +47,7 @@ impl Default for TestClock {
 }
 
 pub fn provider_enrollment() -> hellas_rpc::ProviderEnrollmentBundle {
-    enrollment(&PROVIDER.key(), &PROVIDER.key(), [5; 32], [5; 32])
+    enrollment(&PROVIDER.node_key(), &PROVIDER.node_key(), [5; 32], [5; 32])
 }
 
 pub fn authority() -> AuthorityId {
@@ -158,8 +158,12 @@ impl Node {
             &self.path,
             self.network,
             ids::ROOT_GRANT,
-            root.clone(),
-            root,
+            common_node::approval(
+                Ownership::Bootstrap {
+                    root: ids::ROOT_GRANT,
+                },
+                root,
+            ),
             Some(provider.clone()),
             self.clock.now(),
         )
@@ -177,7 +181,7 @@ impl Node {
             });
         let service = crate::grant_service::GrantService::new(
             store,
-            Arc::new(PROVIDER.key()),
+            Arc::new(PROVIDER.node_key()),
             common_node::NoBackend,
             vec![],
             self.clock.source(),
@@ -248,13 +252,13 @@ impl Proposal {
         now: UnixMillis,
     ) -> Self {
         let (mut authorization, _, input) =
-            super::proposal_for(store, allowance, nonce, actor.key());
+            super::proposal_for(store, allowance, nonce, actor.node_key());
         let now = now.0;
         authorization.acceptance_deadline_ms = UnixMillis(now.checked_add(1000).unwrap());
         authorization.terminal_deadline_ms = UnixMillis(now.checked_add(3000).unwrap());
         authorization.delivery_deadline_ms = UnixMillis(now.checked_add(4000).unwrap());
         let signature = actor
-            .key()
+            .node_key()
             .sign_digest(crate::model::grant::grant_work_id(
                 network(),
                 &authorization,
@@ -288,7 +292,7 @@ impl TestNode {
     ) -> TestService {
         let service = crate::grant_service::GrantService::new(
             self.store,
-            Arc::new(PROVIDER.key()),
+            Arc::new(PROVIDER.node_key()),
             backend,
             vec![],
             self.clock.source(),
@@ -313,10 +317,9 @@ impl TestNode {
             .1
     }
     pub fn caller(&self, actor: Actor) -> AuthenticatedCaller {
-        signed_caller(
+        super::passkey_caller(
             self.store.state().authority(),
             self.secret(actor),
-            &actor.key(),
             self.clock.now(),
         )
     }
@@ -343,7 +346,7 @@ impl TestNode {
                 request.authorization,
                 request.signature,
                 &request.input,
-                &PROVIDER.key(),
+                &PROVIDER.node_key(),
                 self.clock.now(),
             )
             .await
@@ -414,12 +417,20 @@ impl TestService {
             .expect("actor is provisioned")
             .1
     }
+    /// A daily session by the actor's device, as work execution uses.
     pub async fn caller(&self, actor: Actor) -> AuthenticatedCaller {
         self.service
             .node()
-            .authenticate_signed(self.secret(actor), &actor.key())
+            .authenticate_session(
+                self.secret(actor),
+                crate::node::SessionKey::Node(&actor.node_key()),
+            )
             .await
             .unwrap()
+    }
+    /// A passkey session by the actor, as step-up administration requires.
+    pub async fn administrator(&self, actor: Actor) -> AuthenticatedCaller {
+        super::session(&self.service.node(), self.secret(actor)).await
     }
     pub async fn snapshot(&self) -> State {
         self.service.node().writer().await.unwrap().state().clone()

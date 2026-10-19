@@ -11,7 +11,7 @@ use crate::model::work::bound_result_digest;
 use crate::work_store::channel::funding::GrantFunding;
 use crate::work_store::journal::{Journal, JournalId, JournalKind, MAX_CHECKPOINT_BYTES, Replay};
 use crate::work_store::{Applied, JobBook, JobPhase, JobState, Role};
-use hellas_auth::authority::UnixMillis;
+use hellas_auth::authority::{NodeKey, UnixMillis};
 use hellas_auth::{Digest, ProducerSigningKey, PublicKey};
 use hellas_kernel::NetworkId;
 use hellas_rpc::OutputEventEnvelope;
@@ -19,7 +19,7 @@ use hellas_rpc::ProviderEnrollmentBundle;
 use hellas_rpc::protocol::value::{decode_canonical_bounded, encode_bounded};
 use std::path::{Path, PathBuf};
 
-const NAMESPACE: &str = "hellas.work.grant-client.v1";
+const NAMESPACE: &str = "hellas.work.grant-client.v2";
 const MAX_JOBS: usize = 256;
 const JOURNAL_STEM: &str = "grant-client";
 
@@ -80,11 +80,14 @@ struct StoredJob {
     result: Option<SignedResult>,
 }
 impl GrantClientStore {
+    /// `signer` is the node key this client's credential is bound to; it signs
+    /// every proposal on behalf of the channel's principal.
     pub async fn open(
         directory: &Path,
         network: NetworkId,
         provider: ProviderEnrollmentBundle,
         channel: GrantChannelState,
+        signer: NodeKey,
         now: UnixMillis,
     ) -> Result<Self, NodeStoreError> {
         check_grant_provider(&provider)?;
@@ -102,7 +105,7 @@ impl GrantClientStore {
         let context = WorkContext {
             network,
             channel: channel.id.0,
-            client: hellas_kernel::Key::from_bytes(*channel.client.as_bytes()),
+            client: hellas_kernel::Key::from_bytes(*signer.as_bytes()),
             provider: grant_producer(&provider)?,
         };
         let (journal, replay) =

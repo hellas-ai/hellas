@@ -15,30 +15,157 @@ pub fn budget() -> BudgetNode {
         subject: principal(1).0,
     }
 }
-/// Authenticate another subject's credential as a session does, with its identity key.
+/// Authenticate a credential with a daily session by its bound node key.
 pub fn signed_caller(
     authority: &hellas_auth::authority::AuthorityState,
     secret: &hellas_auth::authority::CredentialSecret,
-    identity: &ProducerSigningKey,
+    node_key: &ProducerSigningKey,
     now: UnixMillis,
 ) -> hellas_auth::authority::AuthenticatedCaller {
     let binding = hellas_auth::Digest::hash(b"test session");
     let pending = authority.begin_authentication(binding, now).unwrap();
-    let signature = pending
+    let proof = pending
         .challenge()
-        .sign(authority.authority(), binding, secret.id(), identity)
+        .sign_daily(authority.authority(), binding, secret.id(), node_key)
         .unwrap();
     pending
-        .complete(authority, binding, secret, &signature, now)
+        .complete(authority, binding, secret, &proof, now)
         .unwrap()
         .into_caller()
+}
+/// Authenticate a credential with a passkey session by its subject.
+pub fn passkey_caller(
+    authority: &hellas_auth::authority::AuthorityState,
+    secret: &hellas_auth::authority::CredentialSecret,
+    now: UnixMillis,
+) -> hellas_auth::authority::AuthenticatedCaller {
+    try_passkey_caller(authority, secret, now).unwrap()
+}
+pub fn try_passkey_caller(
+    authority: &hellas_auth::authority::AuthorityState,
+    secret: &hellas_auth::authority::CredentialSecret,
+    now: UnixMillis,
+) -> Result<hellas_auth::authority::AuthenticatedCaller, hellas_auth::authority::AuthorityError> {
+    let subject = authority
+        .credential(secret.id())
+        .ok_or(hellas_auth::authority::AuthorityError::Credential)?
+        .scope()
+        .subject;
+    let binding = hellas_auth::Digest::hash(b"test session");
+    let pending = authority.begin_authentication(binding, now)?;
+    let proof = crate::node::SessionKey::Passkey(&passkey_of(subject)).prove(
+        pending.challenge(),
+        authority.authority(),
+        binding,
+        secret.id(),
+    )?;
+    Ok(pending
+        .complete(authority, binding, secret, &proof, now)?
+        .into_caller())
+}
+/// A passkey session for `secret` through the checked node API, as its subject.
+pub async fn session(
+    node: &crate::node::NodeCoordinator,
+    secret: &hellas_auth::authority::CredentialSecret,
+) -> hellas_auth::authority::AuthenticatedCaller {
+    try_session(node, secret).await.unwrap()
+}
+pub async fn try_session(
+    node: &crate::node::NodeCoordinator,
+    secret: &hellas_auth::authority::CredentialSecret,
+) -> Result<hellas_auth::authority::AuthenticatedCaller, crate::work_store::grant::NodeStoreError> {
+    let subject = node
+        .writer()
+        .await?
+        .state()
+        .authority()
+        .credential(secret.id())
+        .ok_or(hellas_auth::authority::AuthorityError::Credential)?
+        .scope()
+        .subject;
+    node.authenticate_session(
+        secret,
+        crate::node::SessionKey::Passkey(&passkey_of(subject)),
+    )
+    .await
 }
 pub fn network() -> NetworkId {
     NetworkId::new("grants-fixture").unwrap()
 }
+/// A fixture principal and the node key of its device. The passkey seed is
+/// disjoint from the node key seed, which also serves provider producer keys.
 pub fn principal(seed: u8) -> (PrincipalId, ProducerSigningKey) {
-    let key = ProducerSigningKey::from_secret_bytes([seed; 32]).unwrap();
-    (PrincipalId::from_public_key(key.public_key()).unwrap(), key)
+    let principal =
+        PrincipalId::from_public_key(PublicKey::P256(passkey(seed).party_key().to_bytes()))
+            .unwrap();
+    (
+        principal,
+        ProducerSigningKey::from_secret_bytes([seed; 32]).unwrap(),
+    )
+}
+/// The node key of `principal(seed)`'s device.
+pub fn node_key(seed: u8) -> hellas_auth::authority::NodeKey {
+    hellas_auth::authority::NodeKey::from_public_key(principal(seed).1.public_key()).unwrap()
+}
+pub fn passkey(seed: u8) -> hellas_kernel::SoftPasskey {
+    hellas_kernel::SoftPasskey::from_secret_scalar([0x80 | seed; 32]).unwrap()
+}
+/// Disjoint from the actors' node key seeds (0x61..=0x69).
+const SEEDS: std::ops::RangeInclusive<u8> = 1..=0x5f;
+const ACTORS: [hellas_auth::test_support::Actor; 9] = {
+    use hellas_auth::test_support::actors::*;
+    [
+        ROOT,
+        OPERATOR,
+        FRIEND,
+        AGENT,
+        PROVIDER,
+        STRANGER,
+        RECOVERY_OWNER,
+        SUCCESSOR,
+        ATTACKER,
+    ]
+};
+/// The passkey of a fixture subject: an auth actor or a `principal(seed)`.
+pub fn passkey_of(subject: PrincipalId) -> hellas_kernel::SoftPasskey {
+    ACTORS
+        .into_iter()
+        .find(|actor| actor.principal() == subject)
+        .map(|actor| actor.passkey())
+        .or_else(|| SEEDS.map(passkey).find(|p| principal_of(p) == subject))
+        .expect("subject is a fixture principal")
+}
+/// The node key of a fixture subject's device.
+pub fn device(subject: PrincipalId) -> ProducerSigningKey {
+    ACTORS
+        .into_iter()
+        .find(|actor| actor.principal() == subject)
+        .map(|actor| actor.node_key())
+        .or_else(|| SEEDS.map(principal).find(|p| p.0 == subject).map(|p| p.1))
+        .expect("subject is a fixture principal")
+}
+/// The fixture subject whose device holds `key`.
+pub fn subject_of(key: &ProducerSigningKey) -> PrincipalId {
+    ACTORS
+        .into_iter()
+        .find(|actor| actor.node_key().public_key() == key.public_key())
+        .map(|actor| actor.principal())
+        .or_else(|| {
+            SEEDS
+                .map(principal)
+                .find(|p| p.1.public_key() == key.public_key())
+                .map(|p| p.0)
+        })
+        .expect("key is a fixture device")
+}
+/// Credentials in fixtures are held by their subject's own device.
+pub fn holder(subject: PrincipalId) -> hellas_auth::authority::CredentialHolder {
+    hellas_auth::authority::CredentialHolder::Node(
+        hellas_auth::authority::NodeKey::from_public_key(device(subject).public_key()).unwrap(),
+    )
+}
+fn principal_of(passkey: &hellas_kernel::SoftPasskey) -> PrincipalId {
+    PrincipalId::from_public_key(PublicKey::P256(passkey.party_key().to_bytes())).unwrap()
 }
 
 pub fn software_enrollment(seed: u8, transport: [u8; 32]) -> ProviderEnrollmentBundle {
@@ -172,7 +299,7 @@ pub async fn execution_credential(
 ) -> hellas_auth::authority::CredentialSecret {
     use hellas_auth::authority as auth;
     let now = store.state().now();
-    let administrator = store.state().authority().authenticate(secret, now).unwrap();
+    let administrator = passkey_caller(store.state().authority(), secret, now);
     let mut scope = store
         .state()
         .authority()
@@ -241,7 +368,7 @@ pub fn proposal_for(
     key: ProducerSigningKey,
 ) -> (GrantJobAuthorizationV1, Signature, PreparedWorkInput) {
     let def = store.state().grant(id).unwrap();
-    let client = PrincipalId::from_public_key(key.public_key()).unwrap();
+    let client = subject_of(&key);
     let channel = store.state().channel_id(id, client).unwrap();
     let environment = if def.policies[0].https.is_some() {
         hellas_rpc::FetchContract::http().unwrap()

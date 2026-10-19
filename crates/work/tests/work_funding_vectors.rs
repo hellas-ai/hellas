@@ -1,6 +1,6 @@
 //! Fixed V2 encodings assembled field-by-field before caller migration.
+use hellas_auth::Digest;
 use hellas_auth::authority::{GrantId, PrincipalId, ResourceId, Revision, UnixMillis};
-use hellas_auth::{Digest, ProducerSigningKey};
 use hellas_kernel::{EdgeId, NetworkId, TermsHash};
 use hellas_rpc::{ContentId, RequestCommitment};
 use hellas_work::model::fetch::{FetchPolicyV2, fetch_policy_v2_digest};
@@ -221,6 +221,11 @@ fn independent_preimages_match_the_versioned_digest_domains() {
         assert_eq!(hex(actual.as_bytes()), golden);
     }
 }
+fn principal(seed: u8) -> PrincipalId {
+    let passkey = hellas_kernel::SoftPasskey::from_secret_scalar([seed; 32]).unwrap();
+    PrincipalId::from_public_key(hellas_auth::PublicKey::P256(passkey.party_key().to_bytes()))
+        .unwrap()
+}
 #[test]
 fn grant_channel_separates_every_identity_and_generation() {
     let derive = |network, p, g, c, generation| {
@@ -228,12 +233,7 @@ fn grant_channel_separates_every_identity_and_generation() {
             network,
             ContentId::from_bytes([p; 32]),
             GrantId([g; 16]),
-            PrincipalId::from_public_key(
-                ProducerSigningKey::from_secret_bytes([c; 32])
-                    .unwrap()
-                    .public_key(),
-            )
-            .unwrap(),
+            principal(c),
             generation,
         )
     };
@@ -247,18 +247,14 @@ fn grant_channel_separates_every_identity_and_generation() {
     ] {
         assert_ne!(other, expected);
     }
-    let mut preimage = b"hellas.work.grant-channel.v2\x0afunding-v2".to_vec();
+    let mut preimage = b"hellas.work.grant-channel.v3\x0afunding-v2".to_vec();
     preimage.extend_from_slice(&[1; 32]);
     preimage.extend_from_slice(&[2; 16]);
-    preimage.extend_from_slice(
-        PrincipalId::from_public_key(
-            ProducerSigningKey::from_secret_bytes([3; 32])
-                .unwrap()
-                .public_key(),
-        )
-        .unwrap()
-        .as_bytes(),
+    assert_eq!(
+        principal(3).public_key().kind(),
+        hellas_auth::SignatureKind::P256
     );
+    preimage.extend_from_slice(principal(3).as_bytes());
     preimage.extend_from_slice(&4u64.to_be_bytes());
     assert_eq!(
         expected.0.as_bytes(),
@@ -266,7 +262,7 @@ fn grant_channel_separates_every_identity_and_generation() {
     );
     assert_eq!(
         hex(expected.0.as_bytes()),
-        "cccf0eef96be48073a8009c742e63ec8dd32e2abaa860f95a7c60d7599766285"
+        "e557831d165d6a31a5870578dca0a60aa9491b1df317720ece024f16d98cf806"
     );
 }
 #[test]

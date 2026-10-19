@@ -106,7 +106,7 @@ impl PrivateRecord for GrantJobAuthorizationV1 {
         })
     }
 }
-const GRANT_CHANNEL: &[u8] = b"hellas.work.grant-channel.v2";
+const GRANT_CHANNEL: &[u8] = b"hellas.work.grant-channel.v3";
 pub(crate) const GRANT_JOB_AUTHORIZE: &[u8] = b"hellas.work.grant-job-authorize.v1";
 /// Derives a channel without consuming funds or creating a grant.
 pub fn grant_channel_id(
@@ -151,7 +151,7 @@ const _: () = assert!(
 /// Stable identity: recreating owner configuration never recreates allowance.
 pub fn owner_grant_id(network: NetworkId, provider: ContentId, owner: PrincipalId) -> GrantId {
     let digest = xh(
-        b"hellas.work.owner-grant.v2",
+        b"hellas.work.owner-grant.v3",
         &[
             EncodedNetwork::new(network).as_slice(),
             provider.as_bytes(),

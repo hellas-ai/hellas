@@ -66,7 +66,7 @@ impl Household {
         let laptop = signed_caller(
             node.store.state().authority(),
             &credential,
-            &FRIEND.key(),
+            &FRIEND.node_key(),
             now,
         );
         let desktop = node.caller(FRIEND);
@@ -91,7 +91,7 @@ async fn submit(
             request.authorization,
             request.signature,
             &request.input,
-            &PROVIDER.key(),
+            &PROVIDER.node_key(),
             node.clock.now(),
         )
         .await
@@ -288,7 +288,7 @@ async fn creating_an_allowance_cannot_hide_spending_by_the_same_subject() {
     house.desktop = signed_caller(
         house.node.store.state().authority(),
         &credential,
-        &FRIEND.key(),
+        &FRIEND.node_key(),
         now,
     );
     let request = house.node.proposal(FRIEND, ids::NEW_ALLOWANCE, 1);

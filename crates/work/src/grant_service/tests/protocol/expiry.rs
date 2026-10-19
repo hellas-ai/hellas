@@ -33,7 +33,7 @@ async fn authority_expiry_wakes_delivery_and_rejects_buffered_output() {
             let (work_service, _) =
                 common_node::execution(&service, &secret, &principal(1).1, GrantId([1; 16])).await;
             let node = service.node();
-            let admin = node.authenticate(&secret).await.unwrap();
+            let admin = crate::test_support::session(&node, &secret).await;
             let mut scope = snapshot(&service)
                 .await
                 .authority()
@@ -45,13 +45,21 @@ async fn authority_expiry_wakes_delivery_and_rejects_buffered_output() {
             let work_service = match expires {
                 AccessTarget::Credential => {
                     let (_, credential) = node
-                        .issue_credential(&admin, GrantId([0; 16]), scope)
+                        .issue_credential(
+                            &admin,
+                            GrantId([0; 16]),
+                            scope,
+                            crate::test_support::holder(principal(1).0),
+                        )
                         .await
                         .unwrap();
                     service.for_caller(
-                        node.authenticate_signed(&credential, &principal(1).1)
-                            .await
-                            .unwrap(),
+                        node.authenticate_session(
+                            &credential,
+                            crate::node::SessionKey::Node(&principal(1).1),
+                        )
+                        .await
+                        .unwrap(),
                         common_node::EXECUTION_AUTHORIZATION,
                     )
                 }

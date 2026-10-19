@@ -130,8 +130,9 @@ message WorkRoute {
 
 message GetStandingRequest {
   WorkRoute route = 1;
-  // Fixed 89-byte StandingLocator: provider enrollment ContentId, GrantId, client
-  // PrincipalId, last-known generation. Channel is derived, never allocated.
+  // Fixed 90-byte StandingLocator: provider enrollment ContentId, GrantId, client
+  // PrincipalId (curve tag, compressed P-256 key), last-known generation.
+  // Channel is derived, never allocated.
   bytes locator = 2;
 }
 message GetStandingResponse {

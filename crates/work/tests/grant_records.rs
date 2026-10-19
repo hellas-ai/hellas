@@ -3,9 +3,7 @@ use hellas_auth::authority::{GrantId, Revision, UnixMillis};
 use hellas_auth::{Digest, PublicKey};
 use hellas_kernel::NetworkId;
 use hellas_rpc::*;
-use hellas_work::model::grant::records::{
-    decode_contact, grant_producer, grant_transport, principal_id, verify_contact,
-};
+use hellas_work::model::grant::records::{grant_producer, grant_transport, verify_contact};
 use hellas_work::model::{
     fetch::*,
     grant::{records::*, resource::*, *},
@@ -83,7 +81,7 @@ fn signed_template_is_exact_and_only_client_repairs_generation() {
 fn contact_proof_offer_signature_and_actor_channel_binding_are_not_advisory() {
     let key = principal(1).1;
     let provider = software_enrollment(1, [1; 32]);
-    let client_key = principal(2).1;
+    let (client_principal, client_key) = principal(2);
     let client = software_enrollment(2, [2; 32]);
     let (stranger, _) = principal(3);
     let mut bad = client.clone();
@@ -123,7 +121,7 @@ fn contact_proof_offer_signature_and_actor_channel_binding_are_not_advisory() {
         policies: vec![policy],
         budget: budget::BudgetNode::Subject {
             pool: budget::PoolId([1; 16]),
-            subject: principal_id(&client).unwrap(),
+            subject: client_principal,
         },
         max_job_millis: NonZeroU64::new(10000).unwrap(),
         enabled: true,
@@ -160,32 +158,20 @@ fn contact_proof_offer_signature_and_actor_channel_binding_are_not_advisory() {
         grant_transport(&client).unwrap()
     );
     assert_eq!(
-        principal_id(&other_device).unwrap(),
-        principal_id(&client).unwrap()
-    );
-    assert_eq!(
         grant_producer(&other_device).unwrap(),
         grant_producer(&client).unwrap()
-    );
-    assert_eq!(
-        principal_id(&other_device).unwrap(),
-        hellas_auth::authority::PrincipalId::from_public_key(client_key.public_key()).unwrap()
-    );
-    assert_eq!(
-        principal_id(&decode_contact(&other_device.canonical_bytes()).unwrap()).unwrap(),
-        principal_id(&client).unwrap()
     );
     assert_eq!(
         SignedOffer::decode(&bytes, UnixMillis(1000)).unwrap(),
         signed
     );
     assert_eq!(
-        signed.offer().channel(principal_id(&client).unwrap()),
+        signed.offer().channel(client_principal),
         grant_channel_id(
             network,
             provider.content_id(),
             GrantId([7; 16]),
-            principal_id(&other_device).unwrap(),
+            client_principal,
             0
         )
     );
@@ -193,20 +179,29 @@ fn contact_proof_offer_signature_and_actor_channel_binding_are_not_advisory() {
     let locator = standing::StandingLocator {
         provider: provider.content_id(),
         grant: GrantId([7; 16]),
-        client: principal_id(&client).unwrap(),
+        client: client_principal,
         generation: 9,
     };
     let encoded = locator.encode();
+    // The principal travels with its P-256 curve tag.
+    assert_eq!(encoded[48], hellas_auth::SignatureKind::P256.to_byte());
+    assert_eq!(encoded[49..82], client_principal.as_bytes()[..]);
     assert_eq!(
         standing::StandingLocator::decode(&encoded).unwrap(),
         locator
     );
-    assert!(standing::StandingLocator::decode(&encoded[..88]).is_err());
+    assert!(standing::StandingLocator::decode(&encoded[..89]).is_err());
     let mut invalid = encoded.to_vec();
     invalid.push(0);
     assert!(standing::StandingLocator::decode(&invalid).is_err());
     let mut invalid = encoded;
-    invalid[48..81].fill(0);
+    invalid[48] = hellas_auth::SignatureKind::Secp256k1.to_byte();
+    assert_eq!(
+        standing::StandingLocator::decode(&invalid),
+        Err(GrantError::UnsupportedKey)
+    );
+    let mut invalid = encoded;
+    invalid[49..82].fill(0);
     assert_eq!(
         standing::StandingLocator::decode(&invalid),
         Err(GrantError::UnsupportedKey)
@@ -217,39 +212,23 @@ fn contact_proof_offer_signature_and_actor_channel_binding_are_not_advisory() {
     );
     assert_ne!(
         signed.offer().channel(stranger),
-        signed.offer().channel(principal_id(&client).unwrap())
+        signed.offer().channel(client_principal)
     );
     assert_eq!(
         SignedOffer::decode(&bytes, UnixMillis(2000)),
         Err(GrantError::Expired)
     );
-    let owner = owner_grant_id(
-        network,
-        provider.content_id(),
-        principal_id(&client).unwrap(),
-    );
-    assert_eq!(
-        owner,
-        owner_grant_id(
-            network,
-            provider.content_id(),
-            principal_id(&other_device).unwrap()
-        )
-    );
+    let owner = owner_grant_id(network, provider.content_id(), client_principal);
     assert_ne!(
         owner,
-        owner_grant_id(
-            network,
-            client.content_id(),
-            principal_id(&provider).unwrap()
-        )
+        owner_grant_id(network, client.content_id(), principal(1).0)
     );
     assert_ne!(
         owner,
         owner_grant_id(
             NetworkId::new("different").unwrap(),
             provider.content_id(),
-            principal_id(&client).unwrap()
+            client_principal
         )
     );
 }

@@ -29,7 +29,7 @@ pub(super) async fn another_application(
     secret: &hellas_auth::authority::CredentialSecret,
 ) -> hellas_work::grant_service::GrantWork {
     let node = service.node();
-    let admin = node.authenticate(secret).await.unwrap();
+    let admin = crate::test_support::session(&node, secret).await;
     let scope = snapshot(service)
         .await
         .authority()
@@ -38,11 +38,16 @@ pub(super) async fn another_application(
         .spec()
         .clone();
     let (_, credential) = node
-        .issue_credential(&admin, GrantId([0; 16]), scope)
+        .issue_credential(
+            &admin,
+            GrantId([0; 16]),
+            scope,
+            crate::test_support::holder(principal(1).0),
+        )
         .await
         .unwrap();
     service.for_caller(
-        node.authenticate_signed(&credential, &principal(1).1)
+        node.authenticate_session(&credential, crate::node::SessionKey::Node(&principal(1).1))
             .await
             .unwrap(),
         common_node::EXECUTION_AUTHORIZATION,

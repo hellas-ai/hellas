@@ -87,7 +87,7 @@ pub(super) async fn applications(
     secret: &auth::CredentialSecret,
 ) -> [auth::AuthenticatedCaller; 2] {
     let now = UnixMillis(1000);
-    let administrator = store.state().authority().authenticate(secret, now).unwrap();
+    let administrator = crate::test_support::passkey_caller(store.state().authority(), secret, now);
     let mut scope = store
         .state()
         .authority()
@@ -189,7 +189,10 @@ impl DeepBudget {
         for definition in common_node::budgets(common_node::POOL, ROOT.principal(), vec![], 256) {
             ledger.configure_budget(definition).unwrap();
         }
-        let mut leaf = budget();
+        let mut leaf = BudgetNode::Subject {
+            pool: common_node::POOL,
+            subject: ROOT.principal(),
+        };
         for actor in [
             OPERATOR,
             FRIEND,

@@ -66,7 +66,7 @@ impl Evaluate {
         );
         let request = EvaluateRequest {
             text_execution: execution.input_id().digest(),
-            runner_public_key: actor.key().public_key(),
+            runner_public_key: actor.node_key().public_key(),
             execution_environment: self.manifest.content_id(),
             nonce: [0; 32],
             assurance: Assurance::ProducerSigned,
@@ -108,7 +108,7 @@ impl Evaluate {
             delivery_deadline_ms: UnixMillis(now + 4000),
         };
         let signature = actor
-            .key()
+            .node_key()
             .sign_digest(grant_work_id(network(), &authorization))
             .unwrap();
         Proposal {

@@ -104,7 +104,7 @@ impl Case {
                     &serde_json::to_vec(&http).unwrap(),
                     contract.manifest_id(),
                     Assurance::ProducerSigned,
-                    &signer.key(),
+                    &signer.node_key(),
                     Retention::Ephemeral,
                 )
                 .unwrap();
@@ -121,10 +121,10 @@ impl Case {
             }
             _ => {}
         }
-        request.signature = signer.key().sign_digest(request.work()).unwrap();
+        request.signature = signer.node_key().sign_digest(request.work()).unwrap();
         let revision = node.store.state().grant(ids::ALLOWANCE).unwrap().revision;
         let backend = Backend {
-            signer: Arc::new(PROVIDER.key()),
+            signer: Arc::new(PROVIDER.node_key()),
             ..Backend::default()
         };
         let world = node.serve(backend.clone());

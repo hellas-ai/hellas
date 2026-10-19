@@ -80,11 +80,8 @@ async fn execution_audit_retains_the_lineage_at_each_effect() {
     let dir = tempfile::tempdir().unwrap();
     let (mut store, secret) = setup_with_credential(dir.path()).await;
     let application = execution_caller(&mut store, &secret, ROOT).await;
-    let administrator = store
-        .state()
-        .authority()
-        .authenticate(&secret, UnixMillis(1000))
-        .unwrap();
+    let administrator =
+        crate::test_support::passkey_caller(store.state().authority(), &secret, UnixMillis(1000));
     let parent = store
         .state()
         .authority()
@@ -217,11 +214,8 @@ async fn another_application_can_reconcile_but_cannot_replace_or_dispatch_the_ad
     let dir = tempfile::tempdir().unwrap();
     let (mut store, secret) = setup_with_credential(dir.path()).await;
     let first = execution_caller(&mut store, &secret, ROOT).await;
-    let administrator = store
-        .state()
-        .authority()
-        .authenticate(&secret, UnixMillis(1000))
-        .unwrap();
+    let administrator =
+        crate::test_support::passkey_caller(store.state().authority(), &secret, UnixMillis(1000));
     let scope = store
         .state()
         .authority()
@@ -279,7 +273,7 @@ async fn another_application_can_reconcile_but_cannot_replace_or_dispatch_the_ad
     ] {
         assert_err!(
             before.clone().apply(&Frame {
-                namespace: "hellas.node.journal.v1".into(),
+                namespace: "hellas.node.journal.v2".into(),
                 now: UnixMillis(1000),
                 changes: vec![change]
             }),
@@ -357,7 +351,7 @@ impl Accepted {
     }
     fn frame(&self, execution: ExecutionRecord) -> Frame {
         Frame {
-            namespace: "hellas.node.journal.v1".into(),
+            namespace: "hellas.node.journal.v2".into(),
             now: self.node.clock.now(),
             changes: vec![Change::Accepted {
                 authorization: self.request.authorization,

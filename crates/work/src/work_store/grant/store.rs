@@ -5,7 +5,7 @@ use super::{
     ChannelId, GrantId, GrantJobAuthorizationV1, GrantOutcome, NodeStoreError, Serialize,
     SignedResult, ledger,
 };
-use crate::model::grant::records::grant_producer;
+use crate::model::grant::records::{grant_producer, job_signer};
 use crate::model::grant::standing::{CounterAllowance, NodeAllowance, Standing, StandingLocator};
 use crate::model::grant::{
     budget::{BudgetNode, Charge, Meter, Usage, Window},
@@ -24,6 +24,7 @@ use hellas_rpc::ProviderEnrollmentBundle;
 use hellas_rpc::protocol::value::{decode_canonical_bounded, encode_bounded};
 use std::path::Path;
 mod bootstrap;
+pub use bootstrap::OwnerApproval;
 #[cfg(test)]
 mod tests;
 
@@ -272,8 +273,14 @@ impl NodeStore {
         {
             return Err(GrantError::Signature.into());
         }
+        let job_signer = job_signer(execution.caller().holder())?;
         if let Some(signature) = self
-            .precheck_acceptance(&a, execution.caller().actor(), &client_signature, now)
+            .precheck_acceptance(
+                &a,
+                (execution.caller().actor(), job_signer),
+                &client_signature,
+                now,
+            )
             .await?
         {
             return Ok(signature);
@@ -286,7 +293,7 @@ impl NodeStore {
         let context = WorkContext {
             network: self.state.network(),
             channel: a.channel_id.0,
-            client: hellas_kernel::Key::from_bytes(*execution.caller().actor().as_bytes()),
+            client: job_signer,
             provider: grant_producer(self.state.provider()?)?,
         };
         let policy = self.state.policy_for(&a)?;
@@ -349,17 +356,23 @@ impl NodeStore {
     /// Probe an uncertain proposal without its body. Authenticate first; known
     /// work returns its original co-signature before current admission checks.
     /// An unknown expired proposal is conclusively refused before input decode.
+    /// `client` is the channel's principal and the node key its credential binds.
     pub(crate) async fn precheck_acceptance(
         &mut self,
         a: &GrantJobAuthorizationV1,
-        client: hellas_auth::authority::PrincipalId,
+        client: (hellas_auth::authority::PrincipalId, hellas_kernel::Key),
         client_signature: &Signature,
         now: UnixMillis,
     ) -> Result<Option<Signature>, NodeStoreError> {
+        let (principal, signer) = client;
         let id = grant_work_id(self.state.network(), a);
-        self.state.check_channel(a, client)?;
-        hellas_auth::signature::verify_digest_signature(&client.public_key(), client_signature, id)
-            .map_err(|_| GrantError::Signature)?;
+        self.state.check_channel(a, principal)?;
+        hellas_auth::signature::verify_digest_signature(
+            &PublicKey::Secp256k1(signer.to_bytes()),
+            client_signature,
+            id,
+        )
+        .map_err(|_| GrantError::Signature)?;
         if let Some(channel) = self.state.channel(a.channel_id) {
             if let Some(job) = channel.job_book().job_by_id(id) {
                 if job.authorization() == a && job.client_signature() == *client_signature {
@@ -379,7 +392,7 @@ impl NodeStore {
         }
         let now = now.max(self.state.now());
         self.tick(now).await?;
-        self.state.check_terms(a, client, now)?;
+        self.state.check_terms(a, principal, now)?;
         Ok(None)
     }
     pub(crate) async fn dispatch(
@@ -486,7 +499,7 @@ impl NodeStore {
     ) -> Result<(), NodeStoreError> {
         let now = self.time(now)?;
         let frame = Frame {
-            namespace: "hellas.node.journal.v1".into(),
+            namespace: "hellas.node.journal.v2".into(),
             now,
             changes,
         };

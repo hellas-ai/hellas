@@ -65,7 +65,7 @@ async fn queries_project_current_windows_without_persisting_time_or_usage() {
         clock.source(),
     )
     .unwrap();
-    let admin = common_node::WorkAdmin::new(service.clone(), &secret, vec![policy()]).await;
+    let mut admin = common_node::WorkAdmin::new(service.clone(), &secret, vec![policy()]).await;
     let before = snapshot(&service).await;
     let journal_files = || {
         let mut files: Vec<_> = crate::test_support::all_files(&root.path().join("journals"))
@@ -96,6 +96,8 @@ async fn queries_project_current_windows_without_persisting_time_or_usage() {
     );
     let now = UnixMillis(3_600_000);
     clock.set(now);
+    // An hour outlives the administrator's passkey session.
+    admin.caller = crate::test_support::session(&service.node(), &secret).await;
     for command in [
         WorkControlCommand::List,
         WorkControlCommand::Catalogue,

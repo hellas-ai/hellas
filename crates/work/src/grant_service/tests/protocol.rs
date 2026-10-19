@@ -104,7 +104,7 @@ async fn set_execution_expiry(
     expires: UnixMillis,
 ) {
     let node = service.node();
-    let admin = node.authenticate(secret).await.unwrap();
+    let admin = crate::test_support::session(&node, secret).await;
     service
         .administer(async |store, now| {
             let id = common_node::EXECUTION_AUTHORIZATION;
@@ -144,7 +144,7 @@ async fn revoke_access(
     target: AccessTarget,
 ) {
     let node = service.node();
-    let admin = node.authenticate(administrator).await.unwrap();
+    let admin = crate::test_support::session(&node, administrator).await;
     match target {
         AccessTarget::Credential => {
             node.revoke_credential(&admin, GrantId([0; 16]), credential.id(), Revision(1))

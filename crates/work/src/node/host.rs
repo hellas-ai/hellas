@@ -11,7 +11,7 @@ pub const HOST_PROVIDER_CONFIGURE: &str = "host.provider.configure";
 pub const HOST_PROVIDER_BIND: &str = "host.provider.bind";
 pub const HOST_GATEWAY_CONFIGURE: &str = "host.gateway.configure";
 pub const HOST_GATEWAY_ACCESS: &str = "host.gateway.access";
-pub const GATEWAY_INVOKE: &str = "gateway.invoke";
+pub use hellas_auth::authority::GATEWAY_INVOKE;
 pub const WORK_CAPACITY_CONFIGURE: &str = "work.capacity.configure";
 
 pub fn host_resource(authority: AuthorityId) -> ResourceId {
@@ -48,7 +48,7 @@ pub struct NodeStatus {
 }
 
 impl NodeCoordinator {
-    /// HTTP admission accepts only a self-issued credential restricted to this
+    /// HTTP admission accepts only a bearer credential restricted to this
     /// operation. An administrator credential must never become an HTTP bearer.
     pub async fn authorize_gateway(
         &self,
@@ -79,6 +79,7 @@ impl NodeCoordinator {
 
     /// Bind the provider of an authority bootstrapped without one. The root proof
     /// is verified offline; an identical retry succeeds without a new record.
+    /// Binding a provider is a step-up operation: only a passkey session may.
     pub async fn bind_provider(
         &self,
         caller: &AuthenticatedCaller,

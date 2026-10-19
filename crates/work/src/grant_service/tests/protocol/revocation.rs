@@ -12,7 +12,7 @@ async fn revoked_queued_grant_never_dispatches_and_wrong_application_never_reser
         };
         let (service, work_service, _credential) = service(store, backend.clone(), &secret).await;
         let wrong = service.for_caller(
-            service.node().authenticate(&secret).await.unwrap(),
+            crate::test_support::session(&service.node(), &secret).await,
             common_node::EXECUTION_AUTHORIZATION,
         );
         assert_eq!(
@@ -59,7 +59,7 @@ async fn committed_revocation_cancels_execution_but_retains_physical_ownership_a
             .reserved();
         if target == AccessTarget::Grant {
             let node = service.node();
-            let admin = node.authenticate(&secret).await.unwrap();
+            let admin = crate::test_support::session(&node, &secret).await;
             let mut scope = snapshot(&service)
                 .await
                 .authority()
@@ -188,7 +188,7 @@ fn interrupted_authority_append_cancels_execution_and_recovery_keeps_the_charge(
                 .bind_delivery(&work.access, &delivery::delivery_request(&a, id))
                 .await
                 .unwrap();
-            let admin = node.authenticate(&secret).await.unwrap();
+            let admin = crate::test_support::session(&node, &secret).await;
             let (entered, started) = tokio::sync::oneshot::channel();
             let (release, blocked) = std::sync::mpsc::channel();
             let blocker = tokio::task::spawn_blocking(move || {

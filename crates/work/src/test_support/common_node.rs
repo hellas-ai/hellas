@@ -1,9 +1,9 @@
 //! Fresh test stores use explicit offline initialization. Reopens must use `open`.
 use crate::model::grant::budget::{BudgetDef, BudgetNode, Limit, PoolId};
-use crate::model::grant::records::grant_producer;
-use crate::work_store::grant::{NodeStore, NodeStoreError};
+use crate::work_store::grant::{NodeStore, NodeStoreError, OwnerApproval};
+use hellas_auth::Digest;
 use hellas_auth::authority as auth;
-use hellas_auth::{Digest, PublicKey};
+use hellas_auth::test_support::actors::ROOT;
 use hellas_kernel::NetworkId;
 use hellas_rpc::ProviderEnrollmentBundle;
 
@@ -63,24 +63,46 @@ pub async fn bootstrap_node_with_credential(
         .collect();
     let administrator = admin_spec(
         authority,
-        auth::PrincipalId::from_public_key(PublicKey::Secp256k1(
-            grant_producer(&provider)?.to_bytes(),
-        ))?,
+        ROOT.principal(),
         &extra,
         (now, auth::UnixMillis(u64::MAX)),
         (u64::MAX, auth::MAX_DELEGATION_DEPTH),
         &[crate::grant_service::WORK_EXECUTE],
     );
+    let root = auth::GrantId([0; 16]);
     NodeStore::bootstrap(
         path,
         network,
-        auth::GrantId([0; 16]),
-        administrator.clone(),
-        administrator,
+        root,
+        approval(auth::Ownership::Bootstrap { root }, administrator),
         Some(provider),
         now,
     )
     .await
+}
+
+/// The administrator's own approval, holding the initial credential (of the
+/// same scope) on the administrator's device.
+pub fn approval(ownership: auth::Ownership, administrator: auth::GrantSpec) -> OwnerApproval {
+    approval_for(ownership, administrator.clone(), administrator)
+}
+pub fn approval_for(
+    ownership: auth::Ownership,
+    administrator: auth::GrantSpec,
+    credential: auth::GrantSpec,
+) -> OwnerApproval {
+    let holder =
+        auth::NodeKey::from_public_key(super::device(administrator.subject).public_key()).unwrap();
+    let digest = auth::ownership_digest(ownership, &administrator, &credential, holder);
+    OwnerApproval {
+        assertion: hellas_auth::test_support::assertion(
+            &super::passkey_of(administrator.subject),
+            digest,
+        ),
+        administrator,
+        credential,
+        holder,
+    }
 }
 
 pub const EXECUTION_AUTHORIZATION: auth::GrantId = auth::GrantId([238; 16]);
@@ -93,10 +115,10 @@ pub async fn execution(
     allowance: auth::GrantId,
 ) -> (crate::grant_service::GrantWork, auth::CredentialSecret) {
     let node = service.node();
-    let subject = auth::PrincipalId::from_public_key(identity.public_key()).unwrap();
+    let subject = super::subject_of(identity);
     let credential = execution_credential(&node, administrator, subject, allowance).await;
     let caller = node
-        .authenticate_signed(&credential, identity)
+        .authenticate_session(&credential, crate::node::SessionKey::Node(identity))
         .await
         .unwrap();
     (
@@ -111,7 +133,7 @@ pub async fn execution_credential(
     subject: auth::PrincipalId,
     allowance: auth::GrantId,
 ) -> auth::CredentialSecret {
-    let admin = node.authenticate(administrator).await.unwrap();
+    let admin = super::session(node, administrator).await;
     let root = auth::GrantId([0; 16]);
     let authority = node.status(&admin, root).await.unwrap().authority;
     let scope = auth::GrantSpec {
@@ -234,7 +256,7 @@ impl WorkAdmin {
             .state()
             .authority()
             .root_grant();
-        let caller = node.authenticate(secret).await.unwrap();
+        let caller = super::session(&node, secret).await;
         Self {
             root,
             service: crate::grant_service::WorkAdministration::new(

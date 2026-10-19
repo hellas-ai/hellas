@@ -16,7 +16,7 @@ async fn revise_and_restore(
     remove_right: bool,
 ) {
     use hellas_auth::authority::{AdministrationCommand, GrantCommand, OperationId, Permission};
-    let admin = service.node().authenticate(secret).await.unwrap();
+    let admin = crate::test_support::session(&service.node(), secret).await;
     // Keep the writer across both distinct commits. Delivery can never observe
     // the intermediate state by polling; the writer must invalidate it itself.
     service
@@ -147,7 +147,7 @@ async fn response_registry_is_bounded_and_does_not_retain_abandoned_responses() 
     backend.finish.release();
     within(service.drain()).await.unwrap();
     let node = service.node();
-    let admin = node.authenticate(&secret).await.unwrap();
+    let admin = crate::test_support::session(&node, &secret).await;
     let mut scope = snapshot(&service)
         .await
         .authority()
@@ -157,11 +157,16 @@ async fn response_registry_is_bounded_and_does_not_retain_abandoned_responses() 
         .clone();
     scope.expires = UnixMillis(1100);
     let (_, short) = node
-        .issue_credential(&admin, GrantId([0; 16]), scope)
+        .issue_credential(
+            &admin,
+            GrantId([0; 16]),
+            scope,
+            crate::test_support::holder(principal(1).0),
+        )
         .await
         .unwrap();
     let expiring = service.for_caller(
-        node.authenticate_signed(&short, &principal(1).1)
+        node.authenticate_session(&short, crate::node::SessionKey::Node(&principal(1).1))
             .await
             .unwrap(),
         common_node::EXECUTION_AUTHORIZATION,
@@ -365,7 +370,10 @@ async fn rpc_revocation_blocks_encoded_unary_stream_body_and_end_at_the_carrier(
                     .unwrap();
                     let caller = service
                         .node()
-                        .authenticate_signed(&credential, &principal(1).1)
+                        .authenticate_session(
+                            &credential,
+                            crate::node::SessionKey::Node(&principal(1).1),
+                        )
                         .await
                         .unwrap();
                     let work = service.for_caller(caller, common_node::EXECUTION_AUTHORIZATION);

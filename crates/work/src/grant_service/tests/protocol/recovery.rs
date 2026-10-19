@@ -81,8 +81,12 @@ async fn recovered_delivery_returns_durable_status_and_signed_metadata_without_r
                     &WorkContext {
                         network: network(),
                         channel: a.channel_id.0,
-                        client: hellas_kernel::Key::from_bytes(*principal(1).0.as_bytes()),
-                        provider: hellas_kernel::Key::from_bytes(*principal(2).0.as_bytes()),
+                        client: hellas_kernel::Key::from_bytes(
+                            *crate::test_support::node_key(1).as_bytes(),
+                        ),
+                        provider: hellas_kernel::Key::from_bytes(
+                            *crate::test_support::node_key(2).as_bytes(),
+                        ),
                     },
                     work,
                     &(&a).into(),

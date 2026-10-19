@@ -10,11 +10,7 @@ async fn sponsored_terms_bind_each_channel_to_its_authenticated_actor_across_rev
     let other_grant = GrantId([239; 16]);
     let now = UnixMillis(1000);
     let first = execution_caller(&mut store, &secret, root).await;
-    let admin = store
-        .state()
-        .authority()
-        .authenticate(&secret, now)
-        .unwrap();
+    let admin = crate::test_support::passkey_caller(store.state().authority(), &secret, now);
     let mut scope = store
         .state()
         .authority()

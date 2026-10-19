@@ -20,8 +20,12 @@ async fn fixture(path: &std::path::Path, admin: GrantSpec) -> (NodeCoordinator, 
         path,
         network(),
         ids::ROOT_GRANT,
-        admin.clone(),
-        admin,
+        crate::test_support::common_node::approval(
+            Ownership::Bootstrap {
+                root: ids::ROOT_GRANT,
+            },
+            admin,
+        ),
         None,
         UnixMillis(1),
     )
@@ -44,19 +48,23 @@ fn issue(authorization: GrantId, id: GrantId, actor: Actor) -> GrantCommand {
 async fn checked_administration_persists_caller_audit_and_rechecks_sessions_after_revocation() {
     let directory = tempfile::tempdir().unwrap();
     let (node, root_secret) = fixture(directory.path(), scope(ROOT)).await;
-    let root = node.authenticate(&root_secret).await.unwrap();
+    let root = crate::test_support::session(&node, &root_secret).await;
     let (_, secret) = node
-        .issue_credential(&root, ids::ROOT_GRANT, scope(OPERATOR))
+        .issue_credential(&root, ids::ROOT_GRANT, scope(OPERATOR), OPERATOR.holder())
         .await
         .unwrap();
     let binding = Digest::hash(b"test connection");
     let pending = node.begin_authentication(binding).await.unwrap();
-    let signature = pending
-        .challenge()
-        .sign(scope(ROOT).authority, binding, secret.id(), &OPERATOR.key())
+    let proof = SessionKey::Passkey(&OPERATOR.passkey())
+        .prove(
+            pending.challenge(),
+            scope(ROOT).authority,
+            binding,
+            secret.id(),
+        )
         .unwrap();
     let session = node
-        .complete_authentication(pending, binding, &secret, &signature)
+        .complete_authentication(pending, binding, &secret, &proof)
         .await
         .unwrap();
     let caller = node.session_caller(&session, binding).await.unwrap();
@@ -103,10 +111,7 @@ async fn checked_administration_persists_caller_audit_and_rechecks_sessions_afte
     assert!(store.state().authority().grant(ids::FRIEND_GRANT).is_some());
     assert!(store.state().authority().grant(ids::AGENT_GRANT).is_none());
     assert_err!(
-        store
-            .state()
-            .authority()
-            .authenticate(&secret, UnixMillis(11)),
+        crate::test_support::try_passkey_caller(store.state().authority(), &secret, UnixMillis(11)),
         AuthorityError::Credential
     );
 }
@@ -122,7 +127,7 @@ async fn unmounted_operations_cannot_be_issued() {
         .operations
         .insert(OperationId::new("host.reboot").unwrap());
     let (node, secret) = fixture(directory.path(), admin).await;
-    let caller = node.authenticate(&secret).await.unwrap();
+    let caller = crate::test_support::session(&node, &secret).await;
     let before = node.store.lock().await.unwrap().state().clone();
     let mut unmounted = scope(OPERATOR);
     unmounted.issuance = None;
@@ -180,7 +185,7 @@ fn cancelled_native_append_refuses_authentication_and_administration_until_reope
                     .configure_machine(vec![], 4, UnixMillis(10))
                     .await
                     .unwrap();
-                let caller = node.authenticate(&secret).await.unwrap();
+                let caller = crate::test_support::session(&node, &secret).await;
                 let before = node.store.lock().await.unwrap().state().clone();
                 let (entered, started) = tokio::sync::oneshot::channel();
                 let (release, blocked) = std::sync::mpsc::channel();
@@ -202,16 +207,21 @@ fn cancelled_native_append_refuses_authentication_and_administration_until_reope
                             .await
                             .map(|_| ())
                         } else {
-                            node.issue_credential(&caller, ids::ROOT_GRANT, scope(OPERATOR))
-                                .await
-                                .map(|_| ())
+                            node.issue_credential(
+                                &caller,
+                                ids::ROOT_GRANT,
+                                scope(OPERATOR),
+                                OPERATOR.holder(),
+                            )
+                            .await
+                            .map(|_| ())
                         }
                     });
                     assert!(futures::poll!(&mut issue).is_pending());
                 }
                 assert_eq!(node.store.lock().await.unwrap().state(), &before);
                 assert_err!(
-                    node.authenticate(&secret).await,
+                    crate::test_support::try_session(&node, &secret).await,
                     NodeStoreError::Journal(crate::work_store::journal::JournalError::Poisoned)
                 );
                 assert_err!(
@@ -243,11 +253,11 @@ fn cancelled_native_append_refuses_authentication_and_administration_until_reope
                 let reopened = NodeStore::open(directory.path(), network(), None, UnixMillis(11))
                     .await
                     .unwrap();
-                reopened
-                    .state()
-                    .authority()
-                    .authenticate(&secret, UnixMillis(11))
-                    .unwrap();
+                crate::test_support::passkey_caller(
+                    reopened.state().authority(),
+                    &secret,
+                    UnixMillis(11),
+                );
                 // The cancelled call returned no secret. Startup may recover its full,
                 // unacknowledged record; neither outcome authorizes a blind retry.
                 assert!([1, 2].contains(&reopened.state().authority().credentials().count()));
@@ -308,11 +318,14 @@ async fn application(
     .await
     .unwrap();
     let (_, secret) = node
-        .issue_credential(root, ids::ROOT_GRANT, spec)
+        .issue_credential(root, ids::ROOT_GRANT, spec, actor.holder())
         .await
         .unwrap();
-    let identity = actor.key();
-    let caller = node.authenticate_signed(&secret, &identity).await.unwrap();
+    let identity = actor.node_key();
+    let caller = node
+        .authenticate_session(&secret, crate::node::SessionKey::Node(&identity))
+        .await
+        .unwrap();
     (caller, secret)
 }
 
@@ -320,7 +333,7 @@ async fn application(
 async fn an_unmounted_machine_cannot_receive_capacity_commands() {
     let directory = tempfile::tempdir().unwrap();
     let (node, secret) = fixture(directory.path(), host_scope(ROOT)).await;
-    let root = node.authenticate(&secret).await.unwrap();
+    let root = crate::test_support::session(&node, &secret).await;
     let status = node.status(&root, ids::ROOT_GRANT).await.unwrap();
     assert_eq!(status.provider, None);
     assert_eq!(status.machine, None);
@@ -330,8 +343,13 @@ async fn an_unmounted_machine_cannot_receive_capacity_commands() {
         NodeStoreError::MissingMachine
     );
     assert_err!(
-        node.issue_credential(&root, ids::ROOT_GRANT, host_scope(OPERATOR))
-            .await,
+        node.issue_credential(
+            &root,
+            ids::ROOT_GRANT,
+            host_scope(OPERATOR),
+            OPERATOR.holder()
+        )
+        .await,
         NodeStoreError::Authority(AuthorityError::Denied)
     );
 }
@@ -340,7 +358,7 @@ async fn an_unmounted_machine_cannot_receive_capacity_commands() {
 async fn an_owner_binds_one_verified_provider_and_may_retry_it() {
     let directory = tempfile::tempdir().unwrap();
     let (node, secret) = fixture(directory.path(), host_scope(ROOT)).await;
-    let root = node.authenticate(&secret).await.unwrap();
+    let root = crate::test_support::session(&node, &secret).await;
     let provider = common::software_enrollment(2, [2; 32]);
     let (gateway, _) = application(
         &node,
@@ -354,6 +372,16 @@ async fn an_owner_binds_one_verified_provider_and_may_retry_it() {
         node.bind_provider(&gateway, ids::OPERATOR_GRANT, provider.clone())
             .await,
         NodeStoreError::Authority(AuthorityError::Denied)
+    );
+    // Binding a provider is step-up: the owner's daily session cannot.
+    let daily = node
+        .authenticate_session(&secret, SessionKey::Node(&ROOT.node_key()))
+        .await
+        .unwrap();
+    assert_err!(
+        node.bind_provider(&daily, ids::ROOT_GRANT, provider.clone())
+            .await,
+        NodeStoreError::Authority(AuthorityError::StepUp)
     );
     let mut forged = provider.clone();
     forged.genesis.statement.installation_nonce = [9; 32];
@@ -427,7 +455,7 @@ async fn host_reads_require_their_own_operation() {
         .configure_machine(vec![], 4, UnixMillis(10))
         .await
         .unwrap();
-    let root = node.authenticate(&secret).await.unwrap();
+    let root = crate::test_support::session(&node, &secret).await;
     let (reader, _) =
         application(&node, &root, ids::OPERATOR_GRANT, OPERATOR, &[HOST_STATUS]).await;
     let (writer, _) = application(
@@ -455,7 +483,7 @@ async fn host_reads_require_their_own_operation() {
 async fn host_operations_require_their_named_resource() {
     let directory = tempfile::tempdir().unwrap();
     let (node, secret) = fixture(directory.path(), host_scope(ROOT)).await;
-    let root = node.authenticate(&secret).await.unwrap();
+    let root = crate::test_support::session(&node, &secret).await;
     let mut wrong = host_scope(AGENT);
     wrong.issuance = None;
     wrong.permissions = [Permission {
@@ -492,8 +520,12 @@ async fn a_provider_can_initialize_its_machine_capacity() {
         directory.path(),
         common::network(),
         ids::ROOT_GRANT,
-        admin.clone(),
-        admin,
+        common::common_node::approval(
+            Ownership::Bootstrap {
+                root: ids::ROOT_GRANT,
+            },
+            admin,
+        ),
         Some(common::provider_enrollment()),
         UnixMillis(1000),
     )
@@ -505,7 +537,7 @@ async fn a_provider_can_initialize_its_machine_capacity() {
         amount: 4,
     }];
     let node = NodeCoordinator::new(store, Arc::new(|| UnixMillis(1000)));
-    let root = node.authenticate(&secret).await.unwrap();
+    let root = crate::test_support::session(&node, &secret).await;
     // A provider can grant the setting before its machine budget exists.
     let (writer, _) = application(
         &node,
@@ -540,7 +572,7 @@ async fn queued_setting_and_revocation_use_the_same_writer_order() {
         .configure_machine(vec![], 4, UnixMillis(10))
         .await
         .unwrap();
-    let root = node.authenticate(&secret).await.unwrap();
+    let root = crate::test_support::session(&node, &secret).await;
     let (writer, app_secret) = application(
         &node,
         &root,
@@ -698,7 +730,7 @@ async fn checked_capacity_changes_reach_work_admission() {
     let backend = common::backend::Backend {
         slots: Arc::new(tokio::sync::Semaphore::new(2)),
         finish: common::backend::Completion::Permits(finish.clone()),
-        signer: Arc::new(PROVIDER.key()),
+        signer: Arc::new(PROVIDER.node_key()),
         ..common::backend::Backend::default()
     };
     let world = common::Node::bootstrap(directory.path())

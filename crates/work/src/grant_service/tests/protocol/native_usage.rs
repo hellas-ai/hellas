@@ -33,7 +33,7 @@ impl NativeWork {
         let first = evaluate.proposal(&node, FRIEND, ids::ALLOWANCE, 1);
         let second = evaluate.proposal(&node, FRIEND, ids::ALLOWANCE, 2);
         let backend = Backend {
-            signer: Arc::new(PROVIDER.key()),
+            signer: Arc::new(PROVIDER.node_key()),
             ..Backend::default()
         };
         let world = node.serve(backend.clone());

@@ -35,7 +35,7 @@ async fn settle(node: &mut TestNode, nonce: u64, usage: Usage) {
     request.authorization.acceptance_deadline_ms = UnixMillis(now + 1000);
     request.authorization.terminal_deadline_ms = UnixMillis(now + 4000);
     request.authorization.delivery_deadline_ms = UnixMillis(now + 5000);
-    request.signature = FRIEND.key().sign_digest(request.work()).unwrap();
+    request.signature = FRIEND.node_key().sign_digest(request.work()).unwrap();
     node.accept(FRIEND, ids::FRIEND_GRANT, &request)
         .await
         .unwrap();

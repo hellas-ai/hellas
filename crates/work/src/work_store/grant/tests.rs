@@ -133,6 +133,7 @@ async fn client_pending_proposal_survives_restart_and_never_journals_bodies() {
         network(),
         crate::test_support::software_enrollment(2, [2; 32]),
         channel.clone(),
+        crate::test_support::node_key(1),
         UnixMillis(1_000),
     )
     .await
@@ -169,6 +170,7 @@ async fn client_pending_proposal_survives_restart_and_never_journals_bodies() {
         network(),
         crate::test_support::software_enrollment(2, [2; 32]),
         channel,
+        crate::test_support::node_key(1),
         UnixMillis(3_000),
     )
     .await
@@ -228,6 +230,7 @@ async fn client_replays_its_journal_after_a_cancelled_append() {
         network(),
         crate::test_support::software_enrollment(2, [2; 32]),
         channel,
+        crate::test_support::node_key(1),
         UnixMillis(1_000),
     )
     .await
@@ -279,6 +282,7 @@ async fn client_refusal_cannot_clear_an_unanswered_proposal() {
         network(),
         crate::test_support::software_enrollment(2, [2; 32]),
         channel.clone(),
+        crate::test_support::node_key(1),
         UnixMillis(1_000),
     )
     .await
@@ -299,6 +303,7 @@ async fn client_refusal_cannot_clear_an_unanswered_proposal() {
         network(),
         crate::test_support::software_enrollment(2, [2; 32]),
         channel,
+        crate::test_support::node_key(1),
         UnixMillis(1),
     )
     .await
@@ -332,7 +337,15 @@ async fn lost_body_probe_returns_the_old_cosignature_or_a_conclusive_expiry() {
             None
         };
         let reply = store
-            .precheck_acceptance(&a, principal(1).0, &signature, UnixMillis(2_001))
+            .precheck_acceptance(
+                &a,
+                (
+                    principal(1).0,
+                    hellas_kernel::Key::from_bytes(*crate::test_support::node_key(1).as_bytes()),
+                ),
+                &signature,
+                UnixMillis(2_001),
+            )
             .await;
         if accepted {
             assert_eq!(reply.unwrap(), old);
@@ -340,7 +353,17 @@ async fn lost_body_probe_returns_the_old_cosignature_or_a_conclusive_expiry() {
             assert_err!(reply, NodeStoreError::Grant(GrantError::Expired));
             assert_err!(
                 store
-                    .precheck_acceptance(&a, principal(1).0, &signature, UnixMillis(1))
+                    .precheck_acceptance(
+                        &a,
+                        (
+                            principal(1).0,
+                            hellas_kernel::Key::from_bytes(
+                                *crate::test_support::node_key(1).as_bytes()
+                            )
+                        ),
+                        &signature,
+                        UnixMillis(1)
+                    )
                     .await,
                 NodeStoreError::Grant(GrantError::Expired)
             );
@@ -775,16 +798,18 @@ async fn ownership_recovery_preserves_spent_usage_pending_jobs_and_nonce_history
         .unwrap()
         .spec()
         .clone();
-    replacement.subject =
-        hellas_auth::authority::PrincipalId::from_public_key(principal(3).1.public_key()).unwrap();
+    replacement.subject = principal(3).0;
     drop(store);
     let (_, before) = Journal::inspect(dir.path(), "grants").await.unwrap();
     let (receipt, _) = NodeStore::recover_offline(
         dir.path(),
         network(),
         expected,
-        replacement.clone(),
-        replacement,
+        crate::test_support::common_node::approval_for(
+            hellas_auth::authority::Ownership::Recover { expected },
+            replacement.clone(),
+            replacement,
+        ),
         UnixMillis(1000),
     )
     .await

@@ -7,7 +7,8 @@ pub enum Issuer<'a> {
     Node(&'a NodeCoordinator),
 }
 
-/// Issue an optional grant and independent credentials with exactly the supplied scope.
+/// Issue an optional grant and independent credentials with exactly the supplied
+/// scope, each held by the subject's own device.
 pub async fn issue<const N: usize>(
     mut issuer: Issuer<'_>,
     administrator: &AuthenticatedCaller,
@@ -41,9 +42,12 @@ pub async fn issue<const N: usize>(
     for _ in 0..N {
         let secret = match &mut issuer {
             Issuer::Store(store, now) => {
-                let (credential, secret) =
-                    Credential::prepare(scope.clone(), store.state().authority().generation())
-                        .unwrap();
+                let (credential, secret) = Credential::prepare(
+                    scope.clone(),
+                    super::holder(scope.subject),
+                    store.state().authority().generation(),
+                )
+                .unwrap();
                 store
                     .administer_authority(
                         administrator,
@@ -58,10 +62,15 @@ pub async fn issue<const N: usize>(
                 secret
             }
             Issuer::Node(node) => {
-                node.issue_credential(administrator, root, scope.clone())
-                    .await
-                    .unwrap()
-                    .1
+                node.issue_credential(
+                    administrator,
+                    root,
+                    scope.clone(),
+                    super::holder(scope.subject),
+                )
+                .await
+                .unwrap()
+                .1
             }
         };
         credentials.push(secret);

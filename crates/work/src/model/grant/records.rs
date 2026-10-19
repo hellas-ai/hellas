@@ -2,6 +2,7 @@
 //! revalidates enrollment; no discovery record confers grant authority.
 use super::{budget::*, *};
 use crate::model::profile::WorkPolicy;
+use hellas_auth::authority::CredentialHolder;
 use hellas_auth::{ProducerSigningKey, PublicKey, Signature};
 use hellas_kernel::{Key, NetworkId};
 use hellas_rpc::protocol::value::{BoundedCborError, canonical_dag_cbor, decode_canonical_bounded};
@@ -19,7 +20,7 @@ pub const MAX_PRINCIPAL_BYTES: usize = 32 * 1024;
 pub enum GrantError {
     #[error("malformed grant record")]
     Malformed,
-    #[error("grant principal requires a secp256k1 producer and Ed25519 transport")]
+    #[error("grant enrollment requires a secp256k1 producer and Ed25519 transport")]
     UnsupportedKey,
     #[error("grant enrollment requires a verifiable software root")]
     UnsupportedRoot,
@@ -110,9 +111,13 @@ pub fn verify_provider(provider: &ProviderEnrollmentBundle) -> Result<(), GrantE
     )
     .map_err(|_| GrantError::Signature)
 }
-pub fn principal_id(provider: &ProviderEnrollmentBundle) -> Result<PrincipalId, GrantError> {
-    PrincipalId::from_public_key(provider.genesis.statement.producer_public_key)
-        .map_err(|_| GrantError::UnsupportedKey)
+/// The key that signs a caller's per-job authorisations: the node key its
+/// credential is bound to. A bearer credential signs no work.
+pub fn job_signer(holder: CredentialHolder) -> Result<Key, GrantError> {
+    match holder {
+        CredentialHolder::Node(key) => Ok(Key::from_bytes(*key.as_bytes())),
+        CredentialHolder::Bearer => Err(GrantError::Signature),
+    }
 }
 pub fn grant_producer(provider: &ProviderEnrollmentBundle) -> Result<Key, GrantError> {
     let PublicKey::Secp256k1(bytes) = provider.genesis.statement.producer_public_key else {
@@ -367,7 +372,7 @@ impl Offer {
     }
     fn digest(&self) -> Result<Digest, GrantError> {
         let body = canonical_dag_cbor(self).map_err(|_| GrantError::Malformed)?;
-        Ok(crate::model::work::xfh(b"hellas.work.offer.v1", &[&body]))
+        Ok(crate::model::work::xfh(b"hellas.work.offer.v2", &[&body]))
     }
     pub fn channel(&self, client: PrincipalId) -> ChannelId {
         grant_channel_id(

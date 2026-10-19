@@ -3,7 +3,7 @@ use super::{
     ChannelId, Deserialize, GrantChannelState, GrantId, GrantJobAuthorizationV1, GrantOutcome,
     GrantTerminal, NodeStoreError, Serialize, Signature, SignedResult,
 };
-use crate::model::grant::records::{check_grant_provider, grant_producer};
+use crate::model::grant::records::{check_grant_provider, grant_producer, job_signer};
 use crate::model::grant::{
     budget::{BudgetDef, BudgetNode, Charge, Limit, Meter, Usage},
     grant_channel_id, grant_work_id,
@@ -134,6 +134,14 @@ impl State {
             return None;
         }
         self.admissions.get(&work)
+    }
+    /// The node key whose signature `work` was admitted under, as recorded.
+    fn admitted_signer(&self, work: Digest) -> Result<hellas_kernel::Key, NodeStoreError> {
+        let record = self
+            .admissions
+            .get(&work)
+            .ok_or(NodeStoreError::Malformed)?;
+        Ok(job_signer(record.accepted().caller().holder())?)
     }
     pub fn channel_binding(&self, id: ChannelId) -> Option<&GrantChannelState> {
         self.channels.get(&id.0).map(|c| &c.funding)
@@ -286,7 +294,7 @@ impl State {
         Ok(())
     }
     pub(super) fn apply(&mut self, frame: &Frame) -> Result<Applied, NodeStoreError> {
-        if frame.namespace != "hellas.node.journal.v1"
+        if frame.namespace != "hellas.node.journal.v2"
             || frame.now < self.now()
             || frame.changes.is_empty()
             || frame.changes.len() > 16
@@ -324,6 +332,7 @@ impl State {
                 if self.provider.is_some() {
                     return Err(NodeStoreError::ProviderBound);
                 }
+                record.caller.session().step_up()?;
                 self.authority.authorize_recorded(
                     &record.caller,
                     record.authorization,
@@ -533,12 +542,8 @@ impl State {
                 let client = execution.caller().actor();
                 self.check_terms(a, client, now)?;
                 self.mount(a.grant_id, client)?;
-                let channel = self
-                    .channels
-                    .get(&a.channel_id.0)
-                    .ok_or(GrantError::Unauthorized)?;
                 verify(
-                    hellas_kernel::Key::from_bytes(*channel.funding.client.as_bytes()),
+                    job_signer(execution.caller().holder())?,
                     *client_signature,
                     id,
                 )?;
@@ -884,7 +889,7 @@ struct StoredJob {
 impl State {
     pub(super) fn snapshot(&self) -> Result<Snapshot, NodeStoreError> {
         Ok(Snapshot {
-            namespace: "hellas.node.checkpoint.v1".into(),
+            namespace: "hellas.node.checkpoint.v2".into(),
             network: self.network,
             authority: self.authority.snapshot(),
             last_administration: self.last_administration.clone(),
@@ -934,7 +939,7 @@ impl State {
         })
     }
     pub(super) fn restore(s: Snapshot) -> Result<Self, NodeStoreError> {
-        if s.namespace != "hellas.node.checkpoint.v1"
+        if s.namespace != "hellas.node.checkpoint.v2"
             || s.grants.len() > MAX_ALLOWANCES
             || s.generations.len() != s.grants.len()
             || s.channels.len() > MAX_CHANNELS
@@ -1054,11 +1059,7 @@ impl State {
                 {
                     return Err(NodeStoreError::Malformed);
                 }
-                verify(
-                    hellas_kernel::Key::from_bytes(*c.identity.client.as_bytes()),
-                    j.client,
-                    work,
-                )?;
+                verify(state.admitted_signer(work)?, j.client, work)?;
                 verify(grant_producer(state.provider()?)?, j.provider, work)?;
                 let phase = JobPhase::from_code(j.phase)?;
                 if !matches!(
@@ -1097,7 +1098,7 @@ impl State {
                     return Err(NodeStoreError::Malformed);
                 }
                 verify(
-                    hellas_kernel::Key::from_bytes(*c.identity.client.as_bytes()),
+                    state.admitted_signer(work)?,
                     terminal.client_signature,
                     work,
                 )?;

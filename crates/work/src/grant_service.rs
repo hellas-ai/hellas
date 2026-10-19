@@ -1,6 +1,6 @@
 //! Grant funding on Work. One provider writer owns authority and accounting;
 //! bounded RAM owns bodies. Executor admission is reserved before co-signing.
-use crate::model::grant::records::grant_producer;
+use crate::model::grant::records::{grant_producer, job_signer};
 use crate::model::grant::{
     ChannelId, GrantJobAuthorizationV1,
     budget::Usage,
@@ -423,7 +423,11 @@ impl GrantService {
                 .reap();
             let now = self.node.observed_time(&store);
             let id = grant_work_id(store.state().network(), &a);
-            let client = access.caller(&store, now)?.subject();
+            let caller = access.caller(&store, now)?;
+            let client = (
+                caller.subject(),
+                job_signer(caller.holder()).map_err(NodeStoreError::from)?,
+            );
             if let Some(signature) = store
                 .precheck_acceptance(&a, client, &client_signature, now)
                 .await?
@@ -762,14 +766,14 @@ impl GrantService {
             return Err(CompletionError::Spool);
         }
         let a = &live.authorization;
-        let binding = store
+        let admission = store
             .state()
-            .channel_binding(a.channel_id)
+            .admission(a.channel_id, id)
             .ok_or(GrantError::Unauthorized)?;
         let context = WorkContext {
             network: store.state().network(),
             channel: a.channel_id.0,
-            client: hellas_kernel::Key::from_bytes(*binding.client.as_bytes()),
+            client: job_signer(admission.accepted().caller().holder())?,
             provider: grant_producer(
                 store
                     .state()

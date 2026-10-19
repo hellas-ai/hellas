@@ -51,6 +51,7 @@ impl From<&NodeStoreError> for WorkRefused {
             | NodeStoreError::Task(_) => C::StorageUnavailable,
             NodeStoreError::Authority(error) => match error {
                 hellas_auth::authority::AuthorityError::Denied
+                | hellas_auth::authority::AuthorityError::StepUp
                 | hellas_auth::authority::AuthorityError::Credential
                 | hellas_auth::authority::AuthorityError::Audience
                 | hellas_auth::authority::AuthorityError::Missing => C::Unauthorized,
