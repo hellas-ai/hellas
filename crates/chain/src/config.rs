@@ -15,7 +15,7 @@ use hellas_kernel::NetworkId;
 use serde::{Deserialize, Serialize};
 use std::{
     net::SocketAddr,
-    num::{NonZeroU16, NonZeroU32, NonZeroUsize},
+    num::{NonZeroU16, NonZeroU32, NonZeroU64, NonZeroUsize},
     path::PathBuf,
     time::Duration,
 };
@@ -140,6 +140,11 @@ pub struct ValidatorConfig {
     /// Optional fixed UDP address for the validator's ChainSync endpoint.
     #[serde(default)]
     pub chain_sync_bind: Option<SocketAddr>,
+    /// Finalized blocks the validator's block and certificate archives
+    /// retain. Absent keeps the complete archive, whose in-memory indexes,
+    /// open sections and disk grow with every block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_blocks: Option<NonZeroU64>,
     #[serde(default)]
     pub relay_urls: Vec<String>,
     pub genesis: Genesis,
