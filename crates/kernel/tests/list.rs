@@ -60,7 +60,7 @@ fn map_preserves_zero_length() {
     let mapped: List<u32, 4> = list.map(0, |x| x + 1);
 
     assert!(mapped.is_empty());
-    assert!(mapped.as_slice().is_empty());
+    assert_eq!(mapped.as_slice(), []);
 }
 
 #[test]
@@ -69,7 +69,7 @@ fn empty_constructor_yields_zero_length_list() {
 
     assert_eq!(list.len(), 0);
     assert!(list.is_empty());
-    assert!(list.as_slice().is_empty());
+    assert_eq!(list.as_slice(), []);
 }
 
 #[test]

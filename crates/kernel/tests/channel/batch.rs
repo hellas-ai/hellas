@@ -198,6 +198,6 @@ fn apply_iter_accepts_empty_batch() {
         panic!("empty batch rejected");
     };
 
-    assert!(observed.is_empty());
+    assert_eq!(observed, Vec::<usize>::new());
     assert_eq!(*state.store(), store_before);
 }

@@ -136,13 +136,13 @@ pub fn decode_pin(pin: &str) -> Result<[u8; 32], HttpRequestError> {
         return Err(HttpRequestError("SPKI pin must be 64 lowercase hex digits"));
     }
     let mut out = [0; 32];
-    for (i, pair) in pin.as_bytes().chunks_exact(2).enumerate() {
+    for (slot, &[hi, lo]) in out.iter_mut().zip(pin.as_bytes().as_chunks::<2>().0) {
         let digit = |b: u8| match b {
             b'0'..=b'9' => Ok(b - b'0'),
             b'a'..=b'f' => Ok(b - b'a' + 10),
             _ => Err(HttpRequestError("SPKI pin encoding")),
         };
-        out[i] = digit(pair[0])? * 16 + digit(pair[1])?;
+        *slot = digit(hi)? * 16 + digit(lo)?;
     }
     Ok(out)
 }

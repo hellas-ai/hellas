@@ -666,7 +666,7 @@ impl PermitPool {
 
     fn try_acquire(&self) -> Option<PoolPermit<'_>> {
         self.available
-            .fetch_update(
+            .try_update(
                 std::sync::atomic::Ordering::Acquire,
                 std::sync::atomic::Ordering::Relaxed,
                 |available| available.checked_sub(1),

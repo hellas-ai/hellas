@@ -58,37 +58,37 @@ name = "mixed_open_auth"
 required-features = ["secp256k1", "webauthn"]
 
 [lints.rust]
-elided-lifetimes-in-paths = "deny"
-missing-copy-implementations = "deny"
-missing-debug-implementations = "deny"
-missing-docs = "deny"
-rust-2018-idioms = "deny"
-unsafe-code = "forbid"
-unreachable-pub = "deny"
-unused-extern-crates = "deny"
-unused-must-use = "deny"
+elided_lifetimes_in_paths = "deny"
+missing_copy_implementations = "deny"
+missing_debug_implementations = "deny"
+missing_docs = "deny"
+rust_2018_idioms = "deny"
+unsafe_code = "forbid"
+unreachable_pub = "deny"
+unused_extern_crates = "deny"
+unused_must_use = "deny"
 warnings = "deny"
 
 [lints.clippy]
 all = { level = "deny", priority = -1 }
-alloc-instead-of-core = "deny"
-dbg-macro = "deny"
-disallowed-methods = "deny"
-disallowed-types = "deny"
-expect-used = "deny"
+alloc_instead_of_core = "deny"
+dbg_macro = "deny"
+disallowed_methods = "deny"
+disallowed_types = "deny"
+expect_used = "deny"
 # Panic-freedom lock: every index/slice in the transition core must be
 # `get`-based or carry a reviewed `#[allow]` stating why it cannot panic.
-indexing-slicing = "deny"
+indexing_slicing = "deny"
 nursery = { level = "deny", priority = -1 }
 pedantic = { level = "deny", priority = -1 }
-print-stderr = "deny"
-print-stdout = "deny"
-std-instead-of-alloc = "deny"
-std-instead-of-core = "deny"
+print_stderr = "deny"
+print_stdout = "deny"
+std_instead_of_alloc = "deny"
+std_instead_of_core = "deny"
 todo = "deny"
 unimplemented = "deny"
-unwrap-used = "deny"
+unwrap_used = "deny"
 
 [lints.rustdoc]
-bare-urls = "deny"
-broken-intra-doc-links = "deny"
+bare_urls = "deny"
+broken_intra_doc_links = "deny"
