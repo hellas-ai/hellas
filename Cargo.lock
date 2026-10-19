@@ -2928,6 +2928,7 @@ dependencies = [
  "allocation-counter",
  "criterion",
  "hellas-kernel",
+ "hellas-webauthn",
  "hellas-xet",
  "itf",
  "k256",
@@ -2936,7 +2937,6 @@ dependencies = [
  "proptest-state-machine",
  "secp256k1",
  "serde",
- "sha2 0.11.1",
  "stateright",
 ]
 
@@ -3132,6 +3132,14 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "ureq",
+]
+
+[[package]]
+name = "hellas-webauthn"
+version = "0.1.0"
+dependencies = [
+ "p256",
+ "sha2 0.11.1",
 ]
 
 [[package]]

@@ -17,15 +17,15 @@ default = []
 placeholders = []
 secp256k1 = ["dep:k256"]
 test-support = ["placeholders", "webauthn"]
-webauthn = ["dep:p256", "dep:sha2"]
+webauthn = ["dep:hellas-webauthn", "dep:p256"]
 
 [dependencies]
+hellas-webauthn = { workspace = true, optional = true }
 hellas-xet = { workspace = true }
 k256 = { version = "0.14", default-features = false, features = [
     "ecdsa",
 ], optional = true }
 p256 = { workspace = true, optional = true }
-sha2 = { workspace = true, optional = true }
 
 [dev-dependencies]
 

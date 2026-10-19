@@ -18,6 +18,7 @@ members = [
     "crates/rpc",
     "crates/sdk",
     "crates/store",
+    "crates/webauthn",
     "crates/wire",
     "crates/work",
     "crates/xet",
@@ -75,6 +76,7 @@ hellas-reseller = { path = "crates/reseller", default-features = false }
 hellas-rpc = { path = "crates/rpc", default-features = false }
 hellas-sdk = { path = "crates/sdk", default-features = false }
 hellas-store = { path = "crates/store", default-features = false }
+hellas-webauthn = { path = "crates/webauthn", default-features = false }
 hellas-wire = { path = "crates/wire", default-features = false }
 hellas-work = { path = "crates/work", default-features = false }
 hellas-xet = { path = "crates/xet", default-features = false }
