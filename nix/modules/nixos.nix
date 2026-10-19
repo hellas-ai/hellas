@@ -135,6 +135,7 @@ let
     ++ lib.optional (gateway.paidWorkConfig != null) gateway.paidWorkConfig
     ++ lib.optional (gateway.trustStore != null) gateway.trustStore
     ++ lib.optional (gateway.workProfile != null) gateway.workProfile
+    ++ lib.optional (gateway.passkey != null) gateway.passkey
     ++ lib.optional (gateway.gatewayProfile != null) gateway.gatewayProfile
     ++ gateway.paidWorkJournalRoots
     ++ lib.optional (gateway.authorityJournal != null) gateway.authorityJournal
@@ -399,8 +400,8 @@ in
         assertion =
           !gateway.enable
           || !(gateway.local || gateway.offer != null || gateway.machine != null)
-          || (gateway.trustPolicy != null && gateway.workProfile != null);
-        message = "services.hellas.gateway grant execution requires trustPolicy and workProfile.";
+          || (gateway.trustPolicy != null && gateway.workProfile != null && gateway.passkey != null);
+        message = "services.hellas.gateway grant execution requires trustPolicy, workProfile and passkey.";
       }
       {
         assertion = !gateway.enable || !gateway.local || gateway.localGrant != null;

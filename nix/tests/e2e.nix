@@ -108,18 +108,27 @@ let
     HTTPServer(("127.0.0.1", 18080), Handler).serve_forever()
   '';
 
-  # Public fixture policy only; the private HTTP credential is created by an
-  # explicit offline bootstrap in the test unit before its listener starts.
+  # Public fixture policy only. The operator's software passkey bootstraps the
+  # HTTP authority offline in the test unit before its listener starts: the
+  # gateway's node holds the administrator credential, and the administrator's
+  # passkey session issues the separate gateway.invoke bearer it serves.
   gatewayAuthority = builtins.fromJSON (builtins.readFile ./gateway-authority.json);
   gatewayBootstrap = pkgs.writeShellScript "gateway-authority-fixture" ''
     set -eu
     umask 077
+    printf '%s' ${gatewayAuthority.passkey} > ./operator.passkey
     ${package}/bin/hellas-cli --identity ./bootstrap.identity --software-root identity init
-    ${package}/bin/hellas-cli --identity ./bootstrap.identity admin bootstrap \
+    ${package}/bin/hellas-cli --identity ./bootstrap.identity identity show-holder > ./holder.json
+    ${package}/bin/hellas-cli --identity ./bootstrap.identity --passkey ./operator.passkey \
+      admin bootstrap \
       --root-grant 00000000000000000000000000000000 --journal ./http-authority \
       --administrator ${pkgs.writeText "gateway-admin.json" (builtins.toJSON gatewayAuthority.administrator)} \
-      --credential-scope ${pkgs.writeText "gateway-scope.json" (builtins.toJSON gatewayAuthority.scope)} \
-      --credential-out ./http.credential
+      --credential-scope ${pkgs.writeText "gateway-admin-scope.json" (builtins.toJSON gatewayAuthority.administrator)} \
+      --holder ./holder.json \
+      --credential-out ./admin.credential \
+      --bearer-scope ${pkgs.writeText "gateway-scope.json" (builtins.toJSON gatewayAuthority.scope)} \
+      --bearer-out ./http.credential
+    rm ./operator.passkey
     cp ${pkgs.writeText "gateway-profile.json" (builtins.toJSON gatewayAuthority.profile)} ./gateway-profile.json
   '';
 

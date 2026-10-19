@@ -654,6 +654,7 @@ let
             causalLmEnvironment = "/srv/hellas/smollm2.environment";
             tokenizer = "/srv/hellas/tokenizer.json";
             machine = "provider";
+            passkey = "/run/hellas/principal.passkey";
             workProfile = "/run/hellas/work-profile.json";
             queueSize = 0;
             defaultMaxTokens = 4294967295;
@@ -779,6 +780,9 @@ in
     assert lib.hasInfix "--gateway-profile /run/hellas/gateway-profile.json"
       gatewayService.serviceConfig.ExecStart;
     assert lib.elem "/run/hellas/gateway-profile.json" gatewayService.unitConfig.RequiresMountsFor;
+    assert lib.hasInfix "--passkey /run/hellas/principal.passkey"
+      gatewayService.serviceConfig.ExecStart;
+    assert lib.elem "/run/hellas/principal.passkey" gatewayService.unitConfig.RequiresMountsFor;
     assert lib.hasInfix "--queue-size 0" gatewayService.serviceConfig.ExecStart;
     assert lib.hasInfix "--default-max-tokens 4294967295" gatewayService.serviceConfig.ExecStart;
     assert lib.hasInfix "--stop-token 4294967295" gatewayService.serviceConfig.ExecStart;

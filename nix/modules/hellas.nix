@@ -246,6 +246,7 @@ rec {
     "--trust-policy"
     "--offer"
     "--machine"
+    "--passkey"
     "--work-profile"
     "--grant-policy"
     "--local-grant"
@@ -600,6 +601,11 @@ rec {
         default = null;
         description = "Owned machine alias whose allowance supplies execution.";
       };
+      passkey = mkOption {
+        type = types.nullOr runtimePath;
+        default = null;
+        description = "Private software passkey of the principal whose allowance local, offer or machine execution uses.";
+      };
       workProfile = mkOption {
         type = types.nullOr runtimePath;
         default = null;
@@ -896,6 +902,7 @@ rec {
     ++ optArg "--trust-policy" gateway.trustPolicy
     ++ optArg "--offer" gateway.offer
     ++ optArg "--machine" gateway.machine
+    ++ optArg "--passkey" gateway.passkey
     ++ optArg "--work-profile" gateway.workProfile
     ++ optArg "--grant-policy" gateway.grantPolicy
     ++ optArg "--local-grant" gateway.localGrant
