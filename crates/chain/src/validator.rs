@@ -138,6 +138,7 @@ pub enum Command {
         metrics_port: Option<u16>,
         light_client_bind: Option<SocketAddr>,
         chain_sync_bind: Option<SocketAddr>,
+        archive_blocks: Option<NonZeroU64>,
         genesis: Option<PathBuf>,
         genesis_allocations: Vec<String>,
     },
@@ -190,6 +191,7 @@ pub fn run_command(command: Command) -> Result<(), ValidatorError> {
             metrics_port,
             light_client_bind,
             chain_sync_bind,
+            archive_blocks,
             genesis,
             genesis_allocations,
         } => setup(SetupArgs {
@@ -202,6 +204,7 @@ pub fn run_command(command: Command) -> Result<(), ValidatorError> {
             metrics_port,
             light_client_bind,
             chain_sync_bind,
+            archive_blocks,
             genesis,
             genesis_allocations,
         }),
@@ -220,6 +223,7 @@ struct SetupArgs {
     metrics_port: Option<u16>,
     light_client_bind: Option<SocketAddr>,
     chain_sync_bind: Option<SocketAddr>,
+    archive_blocks: Option<NonZeroU64>,
     genesis: Option<PathBuf>,
     genesis_allocations: Vec<String>,
 }
@@ -369,6 +373,7 @@ fn generate_network(args: GenerateNetworkArgs) -> Result<(), ValidatorError> {
             metrics_port: Some(metrics_base_port + index as u16),
             light_client_bind: None,
             chain_sync_bind: None,
+            archive_blocks: None,
             relay_urls: relay_urls.clone(),
             genesis: genesis.clone(),
             peers,
@@ -398,6 +403,7 @@ fn setup(args: SetupArgs) -> Result<(), ValidatorError> {
         metrics_port,
         light_client_bind,
         chain_sync_bind,
+        archive_blocks,
         genesis,
         genesis_allocations,
     } = args;
@@ -508,6 +514,7 @@ fn setup(args: SetupArgs) -> Result<(), ValidatorError> {
         metrics_port: Some(metrics_port.unwrap_or(9090 + validator as u16)),
         light_client_bind,
         chain_sync_bind,
+        archive_blocks,
         relay_urls,
         genesis,
         peers,
@@ -981,6 +988,18 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
         )
         .await;
         let marshal_mailbox = chain_indexer.marshal.clone();
+        let archive_blocks = validator_config.archive_blocks;
+        if archive_blocks.is_some() {
+            let (progress, _) = ::tokio::sync::watch::channel(0);
+            application.publication = Some(crate::execution::pipeline::Publication {
+                archive: chain_indexer.clone(),
+                retention: archive_blocks,
+                readiness: std::sync::Arc::default(),
+                progress,
+                #[cfg(feature = "indexer-api")]
+                index: None,
+            });
+        }
 
         let broadcast_config = buffered::Config {
             public_key: me.clone(),
@@ -1037,7 +1056,7 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
             marshal_mailbox.clone(),
             plan,
             qmdb_sync_resolver.clone(),
-            None,
+            archive_blocks,
         );
 
         let deferred = Deferred::new(
@@ -1089,7 +1108,7 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
         let network_handle = network.start();
 
         let databases = stateful_mailbox.subscribe_databases().await;
-        crate::execution::pipeline::restore(
+        let restored = crate::execution::pipeline::restore(
             &chain_indexer,
             &databases,
             &owner_index,
@@ -1097,6 +1116,14 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
         )
         .await
         .expect("executed chain checkpoint");
+        if let Some(retain) = archive_blocks {
+            // Finalization only moves the floor forward; apply the window to
+            // whatever a previous run left behind before serving.
+            chain_indexer.retain_from(
+                restored.saturating_sub(retain.get() - 1),
+                restored.saturating_sub(retain.get().max(2) - 1),
+            );
+        }
         let startup_root = databases.read().await.root();
         info!(?startup_root, "application startup barrier passed");
 

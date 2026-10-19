@@ -189,6 +189,7 @@ fn genesis_allocations(genesis: Genesis) -> Vec<(SettlementKey, u64)> {
         metrics_port: None,
         light_client_bind: None,
         chain_sync_bind: None,
+        archive_blocks: None,
         relay_urls: Vec::new(),
         genesis,
         peers: Vec::new(),
