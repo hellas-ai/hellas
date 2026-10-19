@@ -11,7 +11,7 @@ pub mod manifest;
 pub mod open;
 pub mod retention;
 pub mod schemes;
-pub mod signature;
+pub use hellas_auth::signature;
 pub mod stream;
 pub mod tags;
 pub mod value;

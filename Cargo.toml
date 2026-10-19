@@ -2,6 +2,7 @@
 members = [
     "crates/adaptors",
     "crates/attestation",
+    "crates/auth",
     "crates/chain",
     "crates/cli",
     "crates/client",
@@ -58,6 +59,7 @@ futures = "0.3"
 futures-core = "0.3"
 hellas-adaptors = { path = "crates/adaptors", default-features = false }
 hellas-attestation = { path = "crates/attestation", default-features = false }
+hellas-auth = { path = "crates/auth", default-features = false }
 hellas-chain = { path = "crates/chain", default-features = false }
 hellas-client = { path = "crates/client", default-features = false }
 hellas-cloud = { path = "crates/cloud", default-features = false }
