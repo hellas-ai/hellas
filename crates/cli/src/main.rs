@@ -916,9 +916,12 @@ async fn async_main() {
                         let open_identity = local_identity.open_identity();
                         let grants = if let Some(path) = grant_config_file.as_deref() {
                             anyhow::ensure!(assurance == hellas_rpc::Assurance::ProducerSigned, "grants require producer-signed assurance");
-                            let owner = commands::contributions::require_principal(passkey)?;
-                            let root = commands::contributions::data_root(&owner)?;
-                            let config = hellas_sdk::grant_config::GrantConfig::load(path, &root)?;
+                            let root = passkey
+                                .map(commands::contributions::principal)
+                                .transpose()?
+                                .map(|owner| commands::contributions::data_root(&owner))
+                                .transpose()?;
+                            let config = hellas_sdk::grant_config::GrantConfig::load(path, root.as_deref())?;
                             Some(config)
                         } else { None };
 

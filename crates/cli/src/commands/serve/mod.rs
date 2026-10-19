@@ -89,7 +89,8 @@ pub fn validate_provider_config(
         .transpose()?
         .unwrap_or_default();
     if let Some(path) = grant {
-        let config = hellas_sdk::grant_config::GrantConfig::load(path, &std::env::current_dir()?)?;
+        let config =
+            hellas_sdk::grant_config::GrantConfig::load(path, Some(&std::env::current_dir()?))?;
         validate_grant_resources(&config, &routes)?;
     }
     Ok(())

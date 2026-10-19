@@ -212,6 +212,7 @@ pub fn validate_serve_args(args: &[String]) -> Result<()> {
             "--owner",
             "--grant-config",
             "--software-root",
+            "--passkey",
             "--assurance",
             "--artifact-store-path",
             "--help",

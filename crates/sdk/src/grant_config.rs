@@ -23,6 +23,8 @@ pub enum GrantConfigError {
     Policy(#[from] ResourceConfigError),
     #[error(transparent)]
     Grant(#[from] GrantError),
+    #[error("grant config must name {0} when no default data root applies")]
+    MissingPath(&'static str),
 }
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -72,24 +74,34 @@ impl GrantConfig {
         }
     }
 
-    pub fn load(path: &Path, default_root: &Path) -> Result<Self, GrantConfigError> {
+    /// Unnamed paths default under `default_root`; without one, the config
+    /// must name every path.
+    pub fn load(path: &Path, default_root: Option<&Path>) -> Result<Self, GrantConfigError> {
         let bytes = hellas_private::read_bounded_regular_file(path, 1 << 20)?;
         let file: ConfigFile = serde_json::from_slice(&bytes)?;
         let remote_control =
             crate::node_control::RemoteControlAdmission::new(file.remote_control_peers)
                 .map_err(|_| GrantError::Limits)?;
-        let journal_root = file
-            .journal_root
-            .unwrap_or_else(|| default_root.join("provider"));
-        let control_socket = file
-            .control_socket
-            .unwrap_or_else(|| default_root.join("control.sock"));
-        let control_certificate = file
-            .control_certificate
-            .unwrap_or_else(|| default_root.join("control.cert.der"));
-        let control_private_key = file
-            .control_private_key
-            .unwrap_or_else(|| default_root.join("control.key.der"));
+        let journal_root = match (file.journal_root, default_root) {
+            (Some(path), _) => path,
+            (None, Some(root)) => root.join("provider"),
+            (None, None) => return Err(GrantConfigError::MissingPath("journal_root")),
+        };
+        let control_socket = match (file.control_socket, default_root) {
+            (Some(path), _) => path,
+            (None, Some(root)) => root.join("control.sock"),
+            (None, None) => return Err(GrantConfigError::MissingPath("control_socket")),
+        };
+        let control_certificate = match (file.control_certificate, default_root) {
+            (Some(path), _) => path,
+            (None, Some(root)) => root.join("control.cert.der"),
+            (None, None) => return Err(GrantConfigError::MissingPath("control_certificate")),
+        };
+        let control_private_key = match (file.control_private_key, default_root) {
+            (Some(path), _) => path,
+            (None, Some(root)) => root.join("control.key.der"),
+            (None, None) => return Err(GrantConfigError::MissingPath("control_private_key")),
+        };
         if !journal_root.is_absolute()
             || !control_socket.is_absolute()
             || !control_certificate.is_absolute()
@@ -198,8 +210,27 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("resources.json");
         std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
-        let config = GrantConfig::load(&path, directory.path()).unwrap();
+        let config = GrantConfig::load(&path, Some(directory.path())).unwrap();
         assert!(config.remote_control.enabled());
+    }
+
+    #[test]
+    fn without_a_default_root_every_path_is_named() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("resources.json");
+        let named = |key: &str| directory.path().join(key);
+        let mut config = json!({"max_job_millis":10000,"resources":[],
+            "journal_root":named("journal"),"control_socket":named("control.sock"),
+            "control_certificate":named("control.cert.der")});
+        std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        assert_err!(
+            GrantConfig::load(&path, None),
+            GrantConfigError::MissingPath("control_private_key")
+        );
+        config["control_private_key"] = json!(named("control.key.der"));
+        std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let config = GrantConfig::load(&path, None).unwrap();
+        assert_eq!(config.control_private_key, named("control.key.der"));
     }
 
     #[test]
@@ -209,7 +240,7 @@ mod tests {
         let mut config = json!({"max_job_millis":10000,"resources":[]});
         let load = |value: &serde_json::Value| {
             std::fs::write(&path, serde_json::to_vec(value).unwrap()).unwrap();
-            GrantConfig::load(&path, directory.path())
+            GrantConfig::load(&path, Some(directory.path()))
         };
         assert!(!load(&config).unwrap().remote_control.enabled());
         let peer = iroh::SecretKey::from_bytes(&[1; 32]).public().to_string();
@@ -261,7 +292,7 @@ mod tests {
             }
         }]});
         std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
-        let parsed = GrantConfig::load(&path, directory.path()).unwrap();
+        let parsed = GrantConfig::load(&path, Some(directory.path())).unwrap();
         assert_eq!(parsed.resources, vec![expected]);
         assert!(!parsed.journal_root.exists());
         let mut missing = config.clone();
@@ -270,7 +301,7 @@ mod tests {
             .unwrap()
             .remove("pricing");
         std::fs::write(&path, serde_json::to_vec(&missing).unwrap()).unwrap();
-        assert_err!(GrantConfig::load(&path, directory.path()), GrantConfigError::Json(error) if error.classify() == serde_json::error::Category::Data);
+        assert_err!(GrantConfig::load(&path, Some(directory.path())), GrantConfigError::Json(error) if error.classify() == serde_json::error::Category::Data);
         for invalid in [
             json!(null),
             json!({"revision":0,"rates":[]}),
@@ -282,10 +313,10 @@ mod tests {
             changed["resources"][0]["pricing"] = invalid;
             std::fs::write(&path, serde_json::to_vec(&changed).unwrap()).unwrap();
             if malformed_json {
-                assert_err!(GrantConfig::load(&path, directory.path()), GrantConfigError::Json(error) if error.classify() == serde_json::error::Category::Data);
+                assert_err!(GrantConfig::load(&path, Some(directory.path())), GrantConfigError::Json(error) if error.classify() == serde_json::error::Category::Data);
             } else {
                 assert_err!(
-                    GrantConfig::load(&path, directory.path()),
+                    GrantConfig::load(&path, Some(directory.path())),
                     GrantConfigError::Grant(GrantError::Limits)
                 );
             }
@@ -302,7 +333,7 @@ mod tests {
             changed["resources"][0]["pricing"]["rates"] = json!(null);
             std::fs::write(&path, serde_json::to_vec(&changed).unwrap()).unwrap();
             assert_err!(
-                GrantConfig::load(&path, directory.path()),
+                GrantConfig::load(&path, Some(directory.path())),
                 GrantConfigError::Grant(GrantError::Malformed)
             );
         }
