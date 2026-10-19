@@ -335,6 +335,12 @@ let
     {
       packages = {
         docker = docker.image;
+        docker-otel =
+          (import ./docker.nix {
+            inherit pkgs rustToolchain;
+            cli = nativePackages.cli.override { otel = true; };
+            revision = self.rev or self.dirtyRev or "unknown";
+          }).image;
         docker-cloud =
           (import ./docker.nix {
             inherit pkgs rustToolchain;
