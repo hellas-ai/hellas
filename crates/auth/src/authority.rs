@@ -3,6 +3,7 @@
 //! A successful check against this value is not a reusable execution permit.
 
 mod administration;
+mod contact;
 mod credentials;
 mod ownership;
 mod passkey;
@@ -11,6 +12,7 @@ mod state;
 mod types;
 
 pub use administration::{AdministrationCommand, AdministrationRecord, CallerRecord};
+pub use contact::{ContactCard, MAX_CONTACT_NAME_BYTES};
 pub use credentials::{
     AuthenticatedCaller, Credential, CredentialCommand, CredentialHolder, CredentialId,
     CredentialSecret, SessionKind,

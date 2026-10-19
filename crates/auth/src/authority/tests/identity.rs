@@ -58,6 +58,76 @@ fn serialized_principals_carry_the_p256_curve_tag() {
     );
 }
 
+fn card(actor: Actor, name: &str) -> ContactCard {
+    ContactCard::new(
+        actor.principal(),
+        name.into(),
+        actor.assert(ContactCard::digest(actor.principal(), name)),
+    )
+    .unwrap()
+}
+
+#[test]
+fn a_contact_card_proves_its_passkey_over_key_and_name() {
+    let friend = card(FRIEND, "Friend");
+    assert_eq!(friend.principal(), FRIEND.principal());
+    assert_eq!(friend.name(), "Friend");
+    let bytes = serde_ipld_dagcbor::to_vec(&friend).unwrap();
+    assert_eq!(
+        serde_ipld_dagcbor::from_slice::<ContactCard>(&bytes).unwrap(),
+        friend
+    );
+    // The assertion binds the exact name and the exact key.
+    let renamed = FRIEND.assert(ContactCard::digest(FRIEND.principal(), "Friend"));
+    assert_eq!(
+        ContactCard::new(FRIEND.principal(), "Fiend".into(), renamed.clone()),
+        Err(AuthorityError::Credential)
+    );
+    assert_eq!(
+        ContactCard::new(STRANGER.principal(), "Friend".into(), renamed),
+        Err(AuthorityError::Credential)
+    );
+    // Someone else's passkey cannot introduce the friend.
+    assert_eq!(
+        ContactCard::new(
+            FRIEND.principal(),
+            "Friend".into(),
+            STRANGER.assert(ContactCard::digest(FRIEND.principal(), "Friend")),
+        ),
+        Err(AuthorityError::Credential)
+    );
+    for name in ["", "a\nb", &"x".repeat(MAX_CONTACT_NAME_BYTES + 1)] {
+        assert_eq!(
+            ContactCard::new(
+                FRIEND.principal(),
+                name.into(),
+                FRIEND.assert(ContactCard::digest(FRIEND.principal(), name)),
+            ),
+            Err(AuthorityError::Invalid)
+        );
+    }
+    // A decoded card is verified, not trusted.
+    let stranger = card(STRANGER, "Friend");
+    let mut forged = serde_ipld_dagcbor::to_vec(&friend).unwrap();
+    let key = FRIEND.principal();
+    let at = forged
+        .windows(33)
+        .position(|w| w == key.as_bytes())
+        .unwrap();
+    forged[at..at + 33].copy_from_slice(stranger.principal().as_bytes());
+    assert!(serde_ipld_dagcbor::from_slice::<ContactCard>(&forged).is_err());
+}
+
+#[test]
+fn contact_card_digest_commits_to_the_tagged_key_and_name() {
+    let key = FRIEND.principal().public_key();
+    assert_eq!(key.kind(), crate::SignatureKind::P256);
+    assert_eq!(
+        ContactCard::digest(FRIEND.principal(), "Friend"),
+        crate::hash_tuple("hellas.contact-card.v1", &[&[3], key.bytes(), b"Friend"],)
+    );
+}
+
 #[test]
 fn root_is_not_an_execution_bypass() {
     let s = state();
