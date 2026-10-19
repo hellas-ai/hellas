@@ -29,11 +29,14 @@ fn provider() -> Secp256k1Signer {
     signer(0x22)
 }
 
+/// The provider's enrollment: a software root of its own endorses the node
+/// key the provider stakes and settles with.
 fn enrollment() -> hellas_rpc::ProviderEnrollmentBundle {
-    let root = ProducerSigningKey::from_secret_bytes([0x22; 32]).unwrap();
+    let root = ProducerSigningKey::from_secret_bytes([0x23; 32]).unwrap();
+    let node = ProducerSigningKey::from_secret_bytes([0x22; 32]).unwrap();
     hellas_work::test_support::enrollment(
         &root,
-        &root,
+        &node,
         *iroh::SecretKey::from_bytes(&[0x51; 32]).public().as_bytes(),
         [3; 32],
     )
