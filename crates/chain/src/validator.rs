@@ -1269,9 +1269,7 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
         let qmdb_resolver_waiter = qmdb_resolver_handle
             .map(|_| ShutdownTrigger::EngineExited)
             .boxed();
-        let probe_waiter = probe_handle
-            .map(|_| ShutdownTrigger::EngineExited)
-            .boxed();
+        let probe_waiter = probe_handle.map(|_| ShutdownTrigger::EngineExited).boxed();
         let light_client_server_waiter = light_client_server_handle.map(|handle| {
             handle
                 .map(|_| ShutdownTrigger::LightClientServerExited)
