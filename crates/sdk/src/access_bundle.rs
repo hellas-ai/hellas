@@ -1,12 +1,14 @@
-//! A node owner's handoff of one grant to a contact: the signed Offer plus the
-//! Auth authorization and credential the contact connects with. It carries the
+//! A node owner's handoff of shared allowances to a contact: one signed Offer
+//! per allowance, plus the one Auth grant and credential the contact connects
+//! with. The grant holds a `work.execute` permission for each allowance and the
+//! credential is bound to the contact device's node key. It carries the
 //! credential secret, so files are private and published once. It carries no
 //! provider trust; the contact still approves a trust policy independently.
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 use crate::node_control::profile::{self, ClientProfile};
 use hellas_auth::authority::{
-    AuthorityId, CredentialId, CredentialSecret, GrantId, PrincipalId, UnixMillis,
+    AuthorityId, CredentialId, CredentialSecret, GrantId, NodeKey, PrincipalId, UnixMillis,
 };
 use hellas_rpc::protocol::value::{BoundedCborError, canonical_dag_cbor, decode_canonical_bounded};
 use hellas_work::model::grant::records::{GrantError, MAX_OFFER_BYTES, SignedOffer};
@@ -14,17 +16,22 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use zeroize::{Zeroize, Zeroizing};
 
-const TAG: &str = "hellas.access-bundle.v1";
-pub const MAX_ACCESS_BUNDLE_BYTES: usize = MAX_OFFER_BYTES + 1024;
+const TAG: &str = "hellas.access-bundle.v2";
+pub const MAX_BUNDLE_OFFERS: usize = 16;
+pub const MAX_ACCESS_BUNDLE_BYTES: usize = MAX_BUNDLE_OFFERS * MAX_OFFER_BYTES + 1024;
 pub const MAX_LABEL_BYTES: usize = 64;
 
 pub struct AccessBundle {
-    pub offer: SignedOffer,
+    /// One Offer per shared allowance, all from one provider on one network.
+    pub offers: Vec<SignedOffer>,
     pub authority: AuthorityId,
-    /// The contact's Auth `work.execute` grant, not the allowance ID.
+    /// The contact's Auth grant, with one `work.execute` permission per
+    /// allowance; not an allowance ID.
     pub authorization: GrantId,
-    /// The credential's subject: the contact's identity key.
+    /// The credential's subject: the contact's passkey principal.
     pub subject: PrincipalId,
+    /// The contact device's node key, which the credential is bound to.
+    pub holder: NodeKey,
     pub credential: CredentialSecret,
     /// Grant and credential expiry, for display only.
     pub expires: UnixMillis,
@@ -40,8 +47,10 @@ pub enum AccessBundleError {
     Malformed,
     #[error("access bundle offer is invalid: {0}")]
     Offer(#[source] GrantError),
-    #[error("access bundle is addressed to another identity")]
+    #[error("access bundle is addressed to another principal")]
     WrongSubject,
+    #[error("access bundle credential is bound to another device")]
+    WrongHolder,
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -50,11 +59,11 @@ pub enum AccessBundleError {
 #[serde(deny_unknown_fields)]
 struct Wire {
     tag: String,
-    #[serde(with = "serde_bytes")]
-    offer: Vec<u8>,
+    offers: Vec<serde_bytes::ByteBuf>,
     authority: AuthorityId,
     authorization: GrantId,
     subject: PrincipalId,
+    holder: NodeKey,
     credential_id: CredentialId,
     #[serde(with = "serde_bytes")]
     secret: Vec<u8>,
@@ -67,6 +76,24 @@ impl Drop for Wire {
     }
 }
 
+/// Between one and [`MAX_BUNDLE_OFFERS`] offers from one provider on one
+/// network, each for a distinct allowance.
+fn check_offers(offers: &[SignedOffer]) -> Result<(), AccessBundleError> {
+    let first = offers.first().ok_or(AccessBundleError::Malformed)?.offer();
+    let mut allowances = std::collections::BTreeSet::new();
+    if offers.len() > MAX_BUNDLE_OFFERS
+        || offers.iter().any(|offer| {
+            let offer = offer.offer();
+            offer.provider != first.provider
+                || offer.network != first.network
+                || !allowances.insert(offer.grant.id)
+        })
+    {
+        return Err(AccessBundleError::Malformed);
+    }
+    Ok(())
+}
+
 impl AccessBundle {
     /// Canonical DAG-CBOR; the same bytes are used for files.
     pub fn encode(&self) -> Result<Zeroizing<Vec<u8>>, AccessBundleError> {
@@ -77,12 +104,19 @@ impl AccessBundle {
         {
             return Err(AccessBundleError::Malformed);
         }
+        check_offers(&self.offers)?;
         let wire = Wire {
             tag: TAG.into(),
-            offer: self.offer.encode().map_err(AccessBundleError::Offer)?,
+            offers: self
+                .offers
+                .iter()
+                .map(|offer| offer.encode().map(serde_bytes::ByteBuf::from))
+                .collect::<Result<_, _>>()
+                .map_err(AccessBundleError::Offer)?,
             authority: self.authority,
             authorization: self.authorization,
             subject: self.subject,
+            holder: self.holder,
             credential_id: self.credential.id(),
             secret: self.credential.expose_secret().to_vec(),
             expires: self.expires,
@@ -96,9 +130,14 @@ impl AccessBundle {
         Ok(bytes)
     }
 
-    /// Bounded canonical decode. The Offer signature is verified, regardless of
-    /// its expiry, and a bundle for any other subject is refused.
-    pub fn decode(bytes: &[u8], expected_subject: &PrincipalId) -> Result<Self, AccessBundleError> {
+    /// Bounded canonical decode. Each Offer signature is verified, regardless
+    /// of its expiry, and a bundle for any other principal or device is
+    /// refused.
+    pub fn decode(
+        bytes: &[u8],
+        expected_subject: &PrincipalId,
+        expected_holder: &NodeKey,
+    ) -> Result<Self, AccessBundleError> {
         let mut wire: Wire = decode_canonical_bounded(bytes, MAX_ACCESS_BUNDLE_BYTES).map_err(
             |error| match error {
                 BoundedCborError::InputLimit => AccessBundleError::TooLarge,
@@ -122,12 +161,22 @@ impl AccessBundle {
         if wire.subject != *expected_subject {
             return Err(AccessBundleError::WrongSubject);
         }
+        if wire.holder != *expected_holder {
+            return Err(AccessBundleError::WrongHolder);
+        }
+        let offers = wire
+            .offers
+            .iter()
+            .map(|offer| SignedOffer::decode(offer, UnixMillis(0)))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(AccessBundleError::Offer)?;
+        check_offers(&offers)?;
         Ok(Self {
-            offer: SignedOffer::decode(&wire.offer, UnixMillis(0))
-                .map_err(AccessBundleError::Offer)?,
+            offers,
             authority: wire.authority,
             authorization: wire.authorization,
             subject: wire.subject,
+            holder: wire.holder,
             credential,
             expires: wire.expires,
             label: wire.label.take(),
@@ -144,7 +193,11 @@ impl AccessBundle {
     /// Read a bundle file within the decode bound. A received copy usually
     /// arrives with ordinary permissions, so they are not required here; the
     /// credential is stored privately by [`Self::install_profile`].
-    pub fn load(path: &Path, expected_subject: &PrincipalId) -> Result<Self, AccessBundleError> {
+    pub fn load(
+        path: &Path,
+        expected_subject: &PrincipalId,
+        expected_holder: &NodeKey,
+    ) -> Result<Self, AccessBundleError> {
         let bytes = hellas_private::read_bounded_regular_file(path, MAX_ACCESS_BUNDLE_BYTES)
             .map_err(|error| {
                 if error
@@ -156,7 +209,7 @@ impl AccessBundle {
                     error.into()
                 }
             })?;
-        Self::decode(&bytes, expected_subject)
+        Self::decode(&bytes, expected_subject, expected_holder)
     }
 
     /// Install the remote-only client profile and its private credential into a
@@ -170,10 +223,10 @@ impl AccessBundle {
         )?)
     }
 
-    /// The Offer to import and the remote-only profile it connects with.
-    pub fn into_parts(self) -> (SignedOffer, ClientProfile) {
+    /// The Offers to import and the remote-only profile they connect with.
+    pub fn into_parts(self) -> (Vec<SignedOffer>, ClientProfile) {
         (
-            self.offer,
+            self.offers,
             ClientProfile {
                 authority: self.authority,
                 authorization: self.authorization,

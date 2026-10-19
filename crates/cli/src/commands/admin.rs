@@ -93,12 +93,13 @@ pub enum AdminCommand {
         #[arg(long)]
         offer_out: Option<PathBuf>,
     },
-    /// Export one allowance's offer with a new contact credential as an access bundle.
+    /// Share allowances with a contact: their offers and one new credential,
+    /// bound to the contact's device, as an access bundle.
     ExportBundle {
-        /// Allowance whose offer the contact imports.
-        #[arg(long)]
-        allowance: String,
-        /// The contact's Auth grant for work.execute on that allowance.
+        /// An allowance whose offer the contact imports; repeat for each one.
+        #[arg(long = "allowance", required = true)]
+        allowances: Vec<String>,
+        /// The contact's Auth grant: work.execute on every shared allowance.
         #[arg(long)]
         grant_id: String,
         /// JSON GrantSpec bounding the contact's credential.

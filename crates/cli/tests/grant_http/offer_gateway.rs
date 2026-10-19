@@ -671,3 +671,169 @@ async fn gateway_control_issues_and_revokes_live_credentials() {
     assert!(!socket.exists());
     host.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_access_bundle_shares_allowances_with_one_contact_device() {
+    use hellas_auth::authority as auth;
+    let host = OfferHost::start().await;
+    let root = host.root();
+    let authority = hellas_sdk::node_control::profile::ClientProfile::load(&host.provider_profile)
+        .unwrap()
+        .authority;
+    let now = auth::UnixMillis::now().unwrap_or_default();
+    let scope = auth::GrantSpec {
+        authority,
+        subject: host.client.principal(),
+        permissions: [auth::Permission {
+            operation: auth::OperationId::new(hellas_work::grant_service::WORK_EXECUTE).unwrap(),
+            resource: hellas_work::grant_service::allowance_resource(authority, host.id),
+        }]
+        .into(),
+        not_before: now,
+        expires: auth::UnixMillis(now.0 + 600_000),
+        delegation_depth: 0,
+        issuance: None,
+    };
+    let shared = GrantId([5; 16]);
+    let grant = request_file(
+        root,
+        &auth::GrantCommand::Issue {
+            authorization: host.root_grant,
+            id: shared,
+            spec: scope.clone(),
+        },
+    );
+    host.provider
+        .run(&[
+            "admin",
+            "--profile",
+            string(&host.provider_profile),
+            "--control-socket",
+            string(&host.socket),
+            "grant",
+            string(&grant),
+        ])
+        .await;
+    let scope_file = root.join("bundle-scope.json");
+    std::fs::write(&scope_file, serde_json::to_vec(&scope).unwrap()).unwrap();
+    let bundle = root.join("client.access");
+    let export = |allowance: String, out: PathBuf, holder: PathBuf| {
+        let (provider, profile, socket, scope_file) = (
+            &host.provider,
+            host.provider_profile.clone(),
+            host.socket.clone(),
+            scope_file.clone(),
+        );
+        async move {
+            provider
+                .output(&[
+                    "admin",
+                    "--profile",
+                    string(&profile),
+                    "--control-socket",
+                    string(&socket),
+                    "export-bundle",
+                    "--allowance",
+                    &allowance,
+                    "--grant-id",
+                    &hex::encode(shared.0),
+                    "--credential-scope",
+                    string(&scope_file),
+                    "--holder",
+                    string(&holder),
+                    "--out",
+                    string(&out),
+                ])
+                .await
+        }
+    };
+    // A scope without work.execute on an allowance cannot share it.
+    let refused = export(
+        hex::encode([77; 16]),
+        root.join("refused.access"),
+        host.client.holder_file().await,
+    )
+    .await;
+    assert!(!refused.status.success());
+    assert!(!root.join("refused.access").exists());
+    let exported = export(
+        hex::encode(host.id.0),
+        bundle.clone(),
+        host.client.holder_file().await,
+    )
+    .await;
+    assert!(
+        exported.status.success(),
+        "{}",
+        String::from_utf8_lossy(&exported.stderr)
+    );
+    // Another device of the same principal cannot import the credential.
+    let other_device = Cli::new(root, "client-laptop", FRIEND_PASSKEY);
+    other_device
+        .run(&["--software-root", "identity", "init"])
+        .await;
+    let wrong = other_device
+        .output(&[
+            "offer",
+            "import-bundle",
+            string(&bundle),
+            "--name",
+            "shared",
+        ])
+        .await;
+    assert!(!wrong.status.success());
+    assert!(
+        String::from_utf8_lossy(&wrong.stderr).contains("bound to another device"),
+        "{}",
+        String::from_utf8_lossy(&wrong.stderr)
+    );
+    let imported: Value = serde_json::from_str(
+        &host
+            .client
+            .run(&[
+                "offer",
+                "import-bundle",
+                string(&bundle),
+                "--name",
+                "shared",
+            ])
+            .await,
+    )
+    .unwrap();
+    assert_eq!(imported["offers"][0]["name"], "shared.glm");
+    assert_eq!(imported["offers"][0]["grant"], hex::encode(host.id.0));
+    let profile = PathBuf::from(imported["work_profile"].as_str().unwrap());
+    let trust_root = host.approve_trust().await;
+    let (gateway_profile, token) = gateway_profile(root).await;
+    let mut gateway = host.client.spawn(
+        &[
+            "gateway",
+            "--offer",
+            "shared.glm",
+            "--trust-store",
+            string(&trust_root),
+            "--trust-policy",
+            "lan",
+            "--work-profile",
+            string(&profile),
+            "--port",
+            "0",
+            "--gateway-profile",
+            string(&gateway_profile),
+            "--archive-dir",
+            string(&root.join("bundle-archive")),
+            "--zdr",
+        ],
+        "bundle-gateway.log",
+    );
+    let address = gateway.wait_for("gateway listening on ").await;
+    let response = post(
+        &gateway_client(&token),
+        &format!("http://{address}/v1/chat/completions"),
+        json!({"messages":[]}),
+    )
+    .await;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    gateway.stop().await;
+    host.stop().await;
+}

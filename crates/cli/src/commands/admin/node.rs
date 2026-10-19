@@ -17,7 +17,7 @@ use hellas_rpc::{
     services::host_control::HostControlClientImpl,
 };
 use hellas_sdk::{
-    access_bundle::{AccessBundle, MAX_LABEL_BYTES},
+    access_bundle::{AccessBundle, MAX_BUNDLE_OFFERS, MAX_LABEL_BYTES},
     node_control::{self, profile},
     work::{
         node::{SessionKey, passkey_assertion},
@@ -219,7 +219,7 @@ where
             );
         }
         AdminCommand::ExportBundle {
-            allowance,
+            allowances,
             grant_id,
             credential_scope,
             holder,
@@ -233,31 +233,60 @@ where
                     .is_none_or(|label| label.len() <= MAX_LABEL_BYTES),
                 "label exceeds {MAX_LABEL_BYTES} bytes"
             );
-            let allowance: GrantId = allowance
-                .parse()
-                .context("allowance must be 16 bytes of hex")?;
+            ensure!(
+                allowances.len() <= MAX_BUNDLE_OFFERS,
+                "a bundle shares at most {MAX_BUNDLE_OFFERS} allowances"
+            );
             let grant: GrantId = grant_id
                 .parse()
                 .context("grant ID must be 16 bytes of hex")?;
             let scope: GrantSpec = read(&credential_scope)?;
-            let holder: CredentialHolder = read(&holder)?;
-            let offers = WorkControlCommand::Offers {
-                id: Some(allowance),
+            let CredentialHolder::Node(holder) = read(&holder)? else {
+                anyhow::bail!("a contact's credential is held by the contact's device");
             };
-            let WorkControlReply::Offers(offers) = work(&client, authorization, &offers).await?
-            else {
-                anyhow::bail!("offer reply required")
-            };
-            let Ok([offer]) = <[_; 1]>::try_from(offers) else {
-                anyhow::bail!("one active offer required")
-            };
-            let credential = issue(&client, authorization, &scope, holder).await?;
+            let mut offers = Vec::with_capacity(allowances.len());
+            for allowance in &allowances {
+                let allowance: GrantId = allowance
+                    .parse()
+                    .context("allowance must be 16 bytes of hex")?;
+                ensure!(
+                    scope.permissions.iter().any(|p| {
+                        p.operation.as_str() == hellas_work::grant_service::WORK_EXECUTE
+                            && p.resource
+                                == hellas_work::grant_service::allowance_resource(
+                                    scope.authority,
+                                    allowance,
+                                )
+                    }),
+                    "the credential scope must grant work.execute on allowance {allowance}"
+                );
+                let request = WorkControlCommand::Offers {
+                    id: Some(allowance),
+                };
+                let WorkControlReply::Offers(found) =
+                    work(&client, authorization, &request).await?
+                else {
+                    anyhow::bail!("offer reply required")
+                };
+                let Ok([offer]) = <[_; 1]>::try_from(found) else {
+                    anyhow::bail!("allowance {allowance} needs one active offer")
+                };
+                offers.push(offer);
+            }
+            let credential = issue(
+                &client,
+                authorization,
+                &scope,
+                CredentialHolder::Node(holder),
+            )
+            .await?;
             let id = hex::encode(credential.id().0);
             let bundle = AccessBundle {
-                offer,
+                offers,
                 authority: scope.authority,
                 authorization: grant,
                 subject: scope.subject,
+                holder,
                 credential,
                 expires: scope.expires,
                 label,
@@ -267,7 +296,9 @@ where
                     "credential {id} was issued but the bundle could not be saved; revoke it before retrying"
                 )
             })?;
-            offer_fingerprints(&bundle.offer)?;
+            for offer in &bundle.offers {
+                offer_fingerprints(offer)?;
+            }
             println!(
                 "{}",
                 serde_json::json!({
@@ -275,6 +306,7 @@ where
                     "subject": hex::encode(scope.subject.as_bytes()),
                     "subject_fingerprint": scope.subject.fingerprint(),
                     "authority": hex::encode(scope.authority.0.as_bytes()),
+                    "allowances": allowances,
                 })
             );
         }

@@ -174,7 +174,11 @@ impl Cli {
     }
     fn command(&self, args: &[&str]) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_hellas-cli"));
-        if !matches!(args.first(), Some(&"trust" | &"contact" | &"offer")) {
+        // These commands use no node identity and refuse `--identity`.
+        if !matches!(
+            args,
+            ["trust", ..] | ["contact", ..] | ["offer", "import", ..]
+        ) {
             command.arg("--identity").arg(&self.identity);
         }
         if args.first() != Some(&"trust") {

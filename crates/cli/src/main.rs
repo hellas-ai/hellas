@@ -74,7 +74,11 @@ fn load_command_identity(
     let owned_machine = false;
     let grant_identity = matches!(
         command,
-        Commands::Admin(_) | Commands::Gateway { offer: Some(_), .. }
+        Commands::Admin(_)
+            | Commands::Gateway { offer: Some(_), .. }
+            | Commands::Offer {
+                command: commands::contributions::OfferCommand::ImportBundle { .. },
+            }
     );
     #[cfg(feature = "evaluate")]
     let grant_identity = grant_identity
@@ -593,7 +597,9 @@ fn validate_identity_options(
     let identity_free = match command {
         Commands::Trust(_) => Some("trust"),
         Commands::Contact { .. } => Some("contact"),
-        Commands::Offer { .. } => Some("offer"),
+        Commands::Offer {
+            command: commands::contributions::OfferCommand::Import { .. },
+        } => Some("offer import"),
         Commands::Store { .. } => Some("store"),
         Commands::Environment { .. } => Some("environment"),
         Commands::Serve {
@@ -623,6 +629,9 @@ fn validate_identity_options(
         #[cfg(unix)]
         Commands::Cloud(_) | Commands::Machines(_) => true,
         Commands::Gateway { offer: Some(_), .. } => true,
+        Commands::Offer {
+            command: commands::contributions::OfferCommand::ImportBundle { .. },
+        } => true,
         Commands::Admin(_) => true,
         Commands::Identity {
             command:
@@ -785,7 +794,10 @@ async fn async_main() {
             }
             return;
         }
-        command @ (Commands::Contact { .. } | Commands::Offer { .. }) => {
+        command @ (Commands::Contact { .. }
+        | Commands::Offer {
+            command: commands::contributions::OfferCommand::Import { .. },
+        }) => {
             let result = cli
                 .passkey
                 .as_deref()
@@ -796,7 +808,7 @@ async fn async_main() {
                         commands::contributions::contact(command, passkey.as_ref())
                     }
                     Commands::Offer { command } => {
-                        commands::contributions::offer(command, passkey.as_ref())
+                        commands::contributions::offer(command, passkey.as_ref(), None)
                     }
                     _ => Ok(()),
                 });
@@ -876,8 +888,11 @@ async fn async_main() {
     }
 
     let result = match command {
-        Commands::Contact { .. } | Commands::Offer { .. } => {
-            unreachable!("contact and offer commands handled before identity load")
+        Commands::Offer { command } => {
+            commands::contributions::offer(command, passkey, Some(&local_identity.node_key))
+        }
+        Commands::Contact { .. } => {
+            unreachable!("contact commands handled before identity load")
         }
         Commands::Admin(args) => commands::admin::run(args, &local_identity, passkey).await,
 

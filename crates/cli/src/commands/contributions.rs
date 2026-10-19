@@ -38,7 +38,9 @@ pub enum OfferCommand {
         #[arg(long)]
         replace: bool,
     },
-    /// Import an access bundle: save its offer and install its Work profile.
+    /// Import an access bundle for this principal and device: install its Work
+    /// profile as `NAME` and save each offer as `NAME.POLICY`, after the
+    /// offer's first policy.
     ImportBundle {
         file: PathBuf,
         #[arg(long)]
@@ -150,7 +152,13 @@ pub fn contact(
     }
     Ok(())
 }
-pub fn offer(command: OfferCommand, passkey: Option<&hellas_kernel::SoftPasskey>) -> CliResult<()> {
+/// `identity_node` is this device's node key, which an access bundle's
+/// credential must be bound to; plain offer imports need none.
+pub fn offer(
+    command: OfferCommand,
+    passkey: Option<&hellas_kernel::SoftPasskey>,
+    identity_node: Option<&hellas_auth::ProducerSigningKey>,
+) -> CliResult<()> {
     let identity = require_principal(passkey)?;
     let root = data_root(&identity)?;
     match command {
@@ -172,19 +180,44 @@ pub fn offer(command: OfferCommand, passkey: Option<&hellas_kernel::SoftPasskey>
             name,
             replace,
         } => {
-            let bundle = hellas_sdk::access_bundle::AccessBundle::load(&file, &identity)?;
-            let path = alias(&root, "offers", &name)?;
-            check_offer_alias(&path, &bundle.offer, replace)?;
+            let node = hellas_auth::authority::NodeKey::from_public_key(
+                identity_node
+                    .ok_or_else(|| anyhow::anyhow!("an access bundle is bound to a device"))?
+                    .public_key(),
+            )?;
+            let bundle = hellas_sdk::access_bundle::AccessBundle::load(&file, &identity, &node)?;
+            let mut saved = Vec::with_capacity(bundle.offers.len());
+            for offer in &bundle.offers {
+                let policy = offer
+                    .offer()
+                    .grant
+                    .policies
+                    .first()
+                    .ok_or_else(|| anyhow::anyhow!("a shared offer names a policy"))?;
+                let label = format!("{name}.{}", policy.name);
+                let path = alias(&root, "offers", &label)?;
+                ensure!(
+                    !saved.iter().any(|(other, _, _)| *other == label),
+                    "two shared offers would both be saved as {label}"
+                );
+                check_offer_alias(&path, offer, replace)?;
+                saved.push((label, path, offer));
+            }
             let profile = bundle.install_profile(&alias(&root, "accesses", &name)?)?;
-            save(&path, &bundle.offer.encode()?)?;
+            for (_, path, offer) in &saved {
+                save(path, &offer.encode()?)?;
+                offer_fingerprints(offer)?;
+            }
             println!(
                 "{}",
                 serde_json::json!({
-                    "grant": hex::encode(bundle.offer.offer().grant.id.0),
+                    "offers": saved.iter().map(|(label, _, offer)| serde_json::json!({
+                        "name": label,
+                        "grant": hex::encode(offer.offer().grant.id.0),
+                    })).collect::<Vec<_>>(),
                     "work_profile": profile,
                 })
             );
-            offer_fingerprints(&bundle.offer)?;
         }
     }
     Ok(())
