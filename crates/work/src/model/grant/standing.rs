@@ -8,12 +8,13 @@ use serde::{Deserialize, Serialize};
 pub struct StandingLocator {
     pub provider: ContentId,
     pub grant: GrantId,
-    pub client: PrincipalId,
+    pub client: ChannelClient,
     pub generation: u64,
 }
 impl StandingLocator {
-    /// Provider, grant, tagged client principal and generation.
-    pub const SIZE: usize = 32 + 16 + 1 + 33 + 8;
+    /// Provider, grant, tagged client principal, tagged client node key and
+    /// generation.
+    pub const SIZE: usize = 32 + 16 + 1 + 33 + 1 + 33 + 8;
     pub fn channel(self, network: NetworkId) -> ChannelId {
         grant_channel_id(
             network,
@@ -24,20 +25,28 @@ impl StandingLocator {
         )
     }
     pub fn encode(self) -> [u8; Self::SIZE] {
-        let client = self.client.public_key();
+        let principal = self.client.principal.public_key();
+        let node = self.client.node.public_key();
         let mut bytes = [0; Self::SIZE];
         bytes[..32].copy_from_slice(self.provider.as_bytes());
         bytes[32..48].copy_from_slice(&self.grant.0);
-        bytes[48] = client.kind().to_byte();
-        bytes[49..82].copy_from_slice(client.bytes());
-        bytes[82..].copy_from_slice(&self.generation.to_be_bytes());
+        bytes[48] = principal.kind().to_byte();
+        bytes[49..82].copy_from_slice(principal.bytes());
+        bytes[82] = node.kind().to_byte();
+        bytes[83..116].copy_from_slice(node.bytes());
+        bytes[116..].copy_from_slice(&self.generation.to_be_bytes());
         bytes
     }
     pub fn decode(bytes: &[u8]) -> Result<Self, GrantError> {
         let bytes: &[u8; Self::SIZE] = bytes.try_into().map_err(|_| GrantError::Malformed)?;
-        if bytes[48] != hellas_auth::SignatureKind::P256.to_byte() {
+        if bytes[48] != hellas_auth::SignatureKind::P256.to_byte()
+            || bytes[82] != hellas_auth::SignatureKind::Secp256k1.to_byte()
+        {
             return Err(GrantError::UnsupportedKey);
         }
+        let key = |range: std::ops::Range<usize>| -> Result<[u8; 33], GrantError> {
+            bytes[range].try_into().map_err(|_| GrantError::Malformed)
+        };
         Ok(Self {
             provider: ContentId::from_bytes(
                 bytes[..32].try_into().map_err(|_| GrantError::Malformed)?,
@@ -47,14 +56,14 @@ impl StandingLocator {
                     .try_into()
                     .map_err(|_| GrantError::Malformed)?,
             ),
-            client: PrincipalId::from_public_key(hellas_auth::PublicKey::P256(
-                bytes[49..82]
-                    .try_into()
-                    .map_err(|_| GrantError::Malformed)?,
-            ))
-            .map_err(|_| GrantError::UnsupportedKey)?,
+            client: ChannelClient {
+                principal: PrincipalId::from_public_key(hellas_auth::PublicKey::P256(key(49..82)?))
+                    .map_err(|_| GrantError::UnsupportedKey)?,
+                node: NodeKey::from_public_key(hellas_auth::PublicKey::Secp256k1(key(83..116)?))
+                    .map_err(|_| GrantError::UnsupportedKey)?,
+            },
             generation: u64::from_be_bytes(
-                bytes[82..].try_into().map_err(|_| GrantError::Malformed)?,
+                bytes[116..].try_into().map_err(|_| GrantError::Malformed)?,
             ),
         })
     }

@@ -158,6 +158,14 @@ pub fn subject_of(key: &ProducerSigningKey) -> PrincipalId {
         })
         .expect("key is a fixture device")
 }
+/// The channel a fixture subject's own device opens.
+pub fn channel_client(subject: PrincipalId) -> ChannelClient {
+    ChannelClient {
+        principal: subject,
+        node: hellas_auth::authority::NodeKey::from_public_key(device(subject).public_key())
+            .unwrap(),
+    }
+}
 /// Credentials in fixtures are held by their subject's own device.
 pub fn holder(subject: PrincipalId) -> hellas_auth::authority::CredentialHolder {
     hellas_auth::authority::CredentialHolder::Node(
@@ -368,7 +376,7 @@ pub fn proposal_for(
     key: ProducerSigningKey,
 ) -> (GrantJobAuthorizationV1, Signature, PreparedWorkInput) {
     let def = store.state().grant(id).unwrap();
-    let client = subject_of(&key);
+    let client = channel_client(subject_of(&key));
     let channel = store.state().channel_id(id, client).unwrap();
     let environment = if def.policies[0].https.is_some() {
         hellas_rpc::FetchContract::http().unwrap()

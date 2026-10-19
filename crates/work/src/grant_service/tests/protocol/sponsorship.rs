@@ -107,11 +107,11 @@ async fn sponsored_terms_bind_each_channel_to_its_authenticated_actor_across_rev
     assert_eq!(used(&store, budget(), Meter::Requests), 2);
     assert_eq!(
         store.state().channel_binding(a.channel_id).unwrap().client,
-        principal(1).0
+        crate::test_support::channel_client(principal(1).0)
     );
     assert_eq!(
         store.state().channel_binding(b.channel_id).unwrap().client,
-        principal(3).0
+        crate::test_support::channel_client(principal(3).0)
     );
     let service = GrantService::new(
         store,
@@ -126,7 +126,7 @@ async fn sponsored_terms_bind_each_channel_to_its_authenticated_actor_across_rev
     let locator = StandingLocator {
         provider: crate::test_support::software_enrollment(2, [2; 32]).content_id(),
         grant: terms,
-        client: principal(1).0,
+        client: crate::test_support::channel_client(principal(1).0),
         generation: 0,
     };
     let response = rebound

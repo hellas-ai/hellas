@@ -84,7 +84,7 @@ impl Evaluate {
         let def = store.state().grant(allowance).unwrap();
         let channel = store
             .state()
-            .channel_id(allowance, actor.principal())
+            .channel_id(allowance, super::channel_client(actor.principal()))
             .unwrap();
         let policy = &def.policies[0];
         let now = node.clock.now().0;

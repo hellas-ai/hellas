@@ -25,7 +25,7 @@ use hellas_wire::iroh::IrohTransport;
 use hellas_work::model::grant::records::{check_grant_provider, grant_producer, grant_transport};
 use hellas_work::model::{
     grant::{
-        ChannelId, GrantJobAuthorizationV1, grant_work_id,
+        ChannelClient, ChannelId, GrantJobAuthorizationV1, grant_work_id,
         records::{GrantError, GrantPolicy, SignedOffer},
         standing::{Standing, StandingLocator},
     },
@@ -207,6 +207,11 @@ impl GrantTarget {
         application: &Arc<ClientProfile>,
         timeout: Duration,
     ) -> Result<PinnedOffer> {
+        let client = ChannelClient {
+            principal: client,
+            node: NodeKey::from_public_key(signer.public_key())
+                .map_err(|_| GrantError::UnsupportedKey)?,
+        };
         let transport =
             self.resolve_transport(transport, trust, application, &Arc::new(signer.clone()))?;
         let link = transport.connect(timeout, timeout).await?;
@@ -375,9 +380,11 @@ impl GrantSession {
         if options.timeout.is_zero() {
             return Err(GrantError::Signature.into());
         }
-        let client = options.principal;
-        let signer = NodeKey::from_public_key(options.signer.public_key())
-            .map_err(|_| GrantError::UnsupportedKey)?;
+        let client = ChannelClient {
+            principal: options.principal,
+            node: NodeKey::from_public_key(options.signer.public_key())
+                .map_err(|_| GrantError::UnsupportedKey)?,
+        };
         let target = GrantTarget::from_offer(&options.target)?;
         let transport = target.resolve_transport(
             &transport,
@@ -400,7 +407,6 @@ impl GrantSession {
                 generation: offer.offer().generation,
                 client,
             },
-            signer,
             standing.now,
         )
         .await?;
@@ -439,7 +445,7 @@ impl GrantSession {
     }
     async fn query_standing(
         target: &GrantTarget,
-        client: PrincipalId,
+        client: ChannelClient,
         timeout: Duration,
         link: &Link,
     ) -> Result<Standing> {

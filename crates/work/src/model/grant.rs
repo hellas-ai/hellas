@@ -3,7 +3,10 @@ use crate::model::work::{
     BodyReader, EncodedNetwork, PaidWorkError, PrivateRecord, tag, versioned_record_digest, xh,
 };
 use hellas_auth::Digest;
-use hellas_auth::authority::{GrantId, PrincipalId, ResourceId, Revision, UnixMillis};
+use hellas_auth::authority::{
+    AuthenticatedCaller, CallerRecord, CredentialHolder, GrantId, NodeKey, PrincipalId, ResourceId,
+    Revision, UnixMillis,
+};
 use hellas_kernel::{Encode, NetworkId};
 use hellas_rpc::{ContentId, RequestCommitment};
 use hellas_xet::MIN_CHUNK_SIZE;
@@ -106,23 +109,68 @@ impl PrivateRecord for GrantJobAuthorizationV1 {
         })
     }
 }
-const GRANT_CHANNEL: &[u8] = b"hellas.work.grant-channel.v3";
+const GRANT_CHANNEL: &[u8] = b"hellas.work.grant-channel.v4";
 pub(crate) const GRANT_JOB_AUTHORIZE: &[u8] = b"hellas.work.grant-job-authorize.v1";
-/// Derives a channel without consuming funds or creating a grant.
+
+/// The party a grant channel serves: a principal acting through one device.
+/// Each device has its own channel, so two nodes of one principal never share
+/// a channel or its nonce sequence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelClient {
+    pub principal: PrincipalId,
+    /// The node key the principal's credential is bound to; it signs every job.
+    pub node: NodeKey,
+}
+impl ChannelClient {
+    /// The channel client an authenticated caller acts as. A bearer credential
+    /// holds no node key and so has no channel.
+    pub fn of(caller: &AuthenticatedCaller) -> Result<Self, records::GrantError> {
+        match caller.holder() {
+            CredentialHolder::Node(node) => Ok(Self {
+                principal: caller.subject(),
+                node,
+            }),
+            CredentialHolder::Bearer => Err(records::GrantError::Unauthorized),
+        }
+    }
+    /// The channel client a journaled caller acted as.
+    pub fn recorded(caller: &CallerRecord) -> Result<Self, records::GrantError> {
+        match caller.holder() {
+            CredentialHolder::Node(node) => Ok(Self {
+                principal: caller.actor(),
+                node,
+            }),
+            CredentialHolder::Bearer => Err(records::GrantError::Unauthorized),
+        }
+    }
+    /// The node key as the kernel key the job signature verifies against.
+    pub fn signer(self) -> hellas_kernel::Key {
+        hellas_kernel::Key::from_bytes(*self.node.as_bytes())
+    }
+}
+
+/// Derives a channel without consuming funds or creating a grant. Both keys
+/// enter the preimage with their curve tags.
 pub fn grant_channel_id(
     network: NetworkId,
     provider: ContentId,
     grant: GrantId,
-    client: PrincipalId,
+    client: ChannelClient,
     generation: u64,
 ) -> ChannelId {
+    let principal = client.principal.public_key();
+    let node = client.node.public_key();
     ChannelId(xh(
         GRANT_CHANNEL,
         &[
             EncodedNetwork::new(network).as_slice(),
             provider.as_bytes(),
             &grant.0,
-            client.as_bytes(),
+            &[principal.kind().to_byte()],
+            principal.bytes(),
+            &[node.kind().to_byte()],
+            node.bytes(),
             &generation.to_be_bytes(),
         ],
     ))
@@ -144,7 +192,7 @@ const _: () = assert!(
         < MIN_CHUNK_SIZE
 );
 const _: () = assert!(
-    GRANT_CHANNEL.len() + <NetworkId as Encode>::MAX_ENCODED_SIZE + 32 + 16 + 33 + 8
+    GRANT_CHANNEL.len() + <NetworkId as Encode>::MAX_ENCODED_SIZE + 32 + 16 + 34 + 34 + 8
         < MIN_CHUNK_SIZE
 );
 

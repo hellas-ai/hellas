@@ -294,7 +294,10 @@ async fn another_application_can_reconcile_but_cannot_replace_or_dispatch_the_ad
         .unwrap();
     let other = store
         .state()
-        .channel_id(a.grant_id, principal(1).0)
+        .channel_id(
+            a.grant_id,
+            crate::test_support::channel_client(principal(1).0),
+        )
         .unwrap();
     assert!(store.state().admission(other, work).is_none());
     assert_err!(

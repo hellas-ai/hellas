@@ -4407,7 +4407,10 @@ async fn grant_and_paid_work_share_a_peer_but_never_a_journal() {
         (vec![], 1),
     )
     .await;
-    let channel = store.state().channel_id(id, grantee).unwrap();
+    let channel = store
+        .state()
+        .channel_id(id, hellas_work::test_support::channel_client(grantee))
+        .unwrap();
     let input = PreparedWorkInput::Evaluate(bundle());
     let auth = grant::GrantJobAuthorizationV1 {
         channel_id: channel,

@@ -71,7 +71,7 @@ impl Access {
             .channel_binding(channel)
             .ok_or(AuthorityError::Denied)?;
         let expires = self.authorize(store, binding.grant, now)?;
-        if binding.client != self.caller(store, now)?.subject() {
+        if Some(binding.client) != ChannelClient::of(self.caller(store, now)?).ok() {
             return Err(AuthorityError::Denied.into());
         }
         Ok(expires)

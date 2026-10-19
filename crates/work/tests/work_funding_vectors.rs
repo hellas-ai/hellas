@@ -1,6 +1,6 @@
 //! Fixed V2 encodings assembled field-by-field before caller migration.
 use hellas_auth::Digest;
-use hellas_auth::authority::{GrantId, PrincipalId, ResourceId, Revision, UnixMillis};
+use hellas_auth::authority::{GrantId, NodeKey, PrincipalId, ResourceId, Revision, UnixMillis};
 use hellas_kernel::{EdgeId, NetworkId, TermsHash};
 use hellas_rpc::{ContentId, RequestCommitment};
 use hellas_work::model::fetch::{FetchPolicyV2, fetch_policy_v2_digest};
@@ -226,43 +226,51 @@ fn principal(seed: u8) -> PrincipalId {
     PrincipalId::from_public_key(hellas_auth::PublicKey::P256(passkey.party_key().to_bytes()))
         .unwrap()
 }
+fn node(seed: u8) -> NodeKey {
+    let key = hellas_auth::ProducerSigningKey::from_secret_bytes([0x40 + seed; 32]).unwrap();
+    NodeKey::from_public_key(key.public_key()).unwrap()
+}
 #[test]
 fn grant_channel_separates_every_identity_and_generation() {
-    let derive = |network, p, g, c, generation| {
+    let derive = |network, p, g, c, n, generation| {
         grant_channel_id(
             network,
             ContentId::from_bytes([p; 32]),
             GrantId([g; 16]),
-            principal(c),
+            ChannelClient {
+                principal: principal(c),
+                node: node(n),
+            },
             generation,
         )
     };
-    let expected = derive(network(), 1, 2, 3, 4);
+    let expected = derive(network(), 1, 2, 3, 4, 5);
     for other in [
-        derive(NetworkId::new("other").unwrap(), 1, 2, 3, 4),
-        derive(network(), 2, 2, 3, 4),
-        derive(network(), 1, 3, 3, 4),
-        derive(network(), 1, 2, 4, 4),
-        derive(network(), 1, 2, 3, 5),
+        derive(NetworkId::new("other").unwrap(), 1, 2, 3, 4, 5),
+        derive(network(), 2, 2, 3, 4, 5),
+        derive(network(), 1, 3, 3, 4, 5),
+        derive(network(), 1, 2, 4, 4, 5),
+        // Two devices of one principal never share a channel.
+        derive(network(), 1, 2, 3, 5, 5),
+        derive(network(), 1, 2, 3, 4, 6),
     ] {
         assert_ne!(other, expected);
     }
-    let mut preimage = b"hellas.work.grant-channel.v3\x0afunding-v2".to_vec();
+    let mut preimage = b"hellas.work.grant-channel.v4\x0afunding-v2".to_vec();
     preimage.extend_from_slice(&[1; 32]);
     preimage.extend_from_slice(&[2; 16]);
-    assert_eq!(
-        principal(3).public_key().kind(),
-        hellas_auth::SignatureKind::P256
-    );
+    preimage.push(hellas_auth::SignatureKind::P256.to_byte());
     preimage.extend_from_slice(principal(3).as_bytes());
-    preimage.extend_from_slice(&4u64.to_be_bytes());
+    preimage.push(hellas_auth::SignatureKind::Secp256k1.to_byte());
+    preimage.extend_from_slice(node(4).as_bytes());
+    preimage.extend_from_slice(&5u64.to_be_bytes());
     assert_eq!(
         expected.0.as_bytes(),
         hellas_xet::XetHash::hash(&preimage).as_bytes()
     );
     assert_eq!(
         hex(expected.0.as_bytes()),
-        "e557831d165d6a31a5870578dca0a60aa9491b1df317720ece024f16d98cf806"
+        "eedd2dc11a1e59965735c9c52b7d67e65eec0b529feee3a49eb7b6dd09a777a8"
     );
 }
 #[test]

@@ -46,7 +46,7 @@ fn standing_query(store: &NodeStore) -> crate::model::grant::standing::StandingL
     StandingLocator {
         provider: store.state().provider().unwrap().content_id(),
         grant: GrantId([1; 16]),
-        client: principal(1).0,
+        client: crate::test_support::channel_client(principal(1).0),
         generation: 0,
     }
 }
@@ -91,8 +91,14 @@ async fn standing_discovers_a_stale_generation_without_resetting_usage() {
     let updated = standing(&mut store).await;
     assert_eq!(updated.offer.offer().generation, 1);
     assert_ne!(
-        updated.offer.offer().channel(principal(1).0),
-        original.offer.offer().channel(principal(1).0)
+        updated
+            .offer
+            .offer()
+            .channel(crate::test_support::channel_client(principal(1).0)),
+        original
+            .offer
+            .offer()
+            .channel(crate::test_support::channel_client(principal(1).0))
     );
     assert_eq!(updated.nodes, original.nodes);
     assert_err!(
@@ -125,7 +131,7 @@ async fn client_pending_proposal_survives_restart_and_never_journals_bodies() {
         id: a.channel_id,
         grant: a.grant_id,
         generation: 0,
-        client: principal(1).0,
+        client: crate::test_support::channel_client(principal(1).0),
     };
     let client_dir = dir.path().join("client");
     let mut client = GrantClientStore::open(
@@ -133,7 +139,6 @@ async fn client_pending_proposal_survives_restart_and_never_journals_bodies() {
         network(),
         crate::test_support::software_enrollment(2, [2; 32]),
         channel.clone(),
-        crate::test_support::node_key(1),
         UnixMillis(1_000),
     )
     .await
@@ -170,7 +175,6 @@ async fn client_pending_proposal_survives_restart_and_never_journals_bodies() {
         network(),
         crate::test_support::software_enrollment(2, [2; 32]),
         channel,
-        crate::test_support::node_key(1),
         UnixMillis(3_000),
     )
     .await
@@ -223,14 +227,13 @@ async fn client_replays_its_journal_after_a_cancelled_append() {
         id: a.channel_id,
         grant: a.grant_id,
         generation: 0,
-        client: principal(1).0,
+        client: crate::test_support::channel_client(principal(1).0),
     };
     let mut client = GrantClientStore::open(
         &dir.path().join("client"),
         network(),
         crate::test_support::software_enrollment(2, [2; 32]),
         channel,
-        crate::test_support::node_key(1),
         UnixMillis(1_000),
     )
     .await
@@ -274,7 +277,7 @@ async fn client_refusal_cannot_clear_an_unanswered_proposal() {
         id: a.channel_id,
         grant: a.grant_id,
         generation: 0,
-        client: principal(1).0,
+        client: crate::test_support::channel_client(principal(1).0),
     };
     let path = dir.path().join("client");
     let mut client = GrantClientStore::open(
@@ -282,7 +285,6 @@ async fn client_refusal_cannot_clear_an_unanswered_proposal() {
         network(),
         crate::test_support::software_enrollment(2, [2; 32]),
         channel.clone(),
-        crate::test_support::node_key(1),
         UnixMillis(1_000),
     )
     .await
@@ -303,7 +305,6 @@ async fn client_refusal_cannot_clear_an_unanswered_proposal() {
         network(),
         crate::test_support::software_enrollment(2, [2; 32]),
         channel,
-        crate::test_support::node_key(1),
         UnixMillis(1),
     )
     .await
@@ -339,10 +340,7 @@ async fn lost_body_probe_returns_the_old_cosignature_or_a_conclusive_expiry() {
         let reply = store
             .precheck_acceptance(
                 &a,
-                (
-                    principal(1).0,
-                    hellas_kernel::Key::from_bytes(*crate::test_support::node_key(1).as_bytes()),
-                ),
+                crate::test_support::channel_client(principal(1).0),
                 &signature,
                 UnixMillis(2_001),
             )
@@ -355,12 +353,7 @@ async fn lost_body_probe_returns_the_old_cosignature_or_a_conclusive_expiry() {
                 store
                     .precheck_acceptance(
                         &a,
-                        (
-                            principal(1).0,
-                            hellas_kernel::Key::from_bytes(
-                                *crate::test_support::node_key(1).as_bytes()
-                            )
-                        ),
+                        crate::test_support::channel_client(principal(1).0),
                         &signature,
                         UnixMillis(1)
                     )

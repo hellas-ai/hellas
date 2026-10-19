@@ -5,7 +5,7 @@ use super::{
     ChannelId, GrantId, GrantJobAuthorizationV1, GrantOutcome, NodeStoreError, Serialize,
     SignedResult, ledger,
 };
-use crate::model::grant::records::{grant_producer, job_signer};
+use crate::model::grant::records::grant_producer;
 use crate::model::grant::standing::{CounterAllowance, NodeAllowance, Standing, StandingLocator};
 use crate::model::grant::{
     budget::{BudgetNode, Charge, Meter, Usage, Window},
@@ -273,14 +273,9 @@ impl NodeStore {
         {
             return Err(GrantError::Signature.into());
         }
-        let job_signer = job_signer(execution.caller().holder())?;
+        let client = crate::model::grant::ChannelClient::recorded(execution.caller())?;
         if let Some(signature) = self
-            .precheck_acceptance(
-                &a,
-                (execution.caller().actor(), job_signer),
-                &client_signature,
-                now,
-            )
+            .precheck_acceptance(&a, client, &client_signature, now)
             .await?
         {
             return Ok(signature);
@@ -293,7 +288,7 @@ impl NodeStore {
         let context = WorkContext {
             network: self.state.network(),
             channel: a.channel_id.0,
-            client: job_signer,
+            client: client.signer(),
             provider: grant_producer(self.state.provider()?)?,
         };
         let policy = self.state.policy_for(&a)?;
@@ -360,15 +355,14 @@ impl NodeStore {
     pub(crate) async fn precheck_acceptance(
         &mut self,
         a: &GrantJobAuthorizationV1,
-        client: (hellas_auth::authority::PrincipalId, hellas_kernel::Key),
+        client: crate::model::grant::ChannelClient,
         client_signature: &Signature,
         now: UnixMillis,
     ) -> Result<Option<Signature>, NodeStoreError> {
-        let (principal, signer) = client;
         let id = grant_work_id(self.state.network(), a);
-        self.state.check_channel(a, principal)?;
+        self.state.check_channel(a, client)?;
         hellas_auth::signature::verify_digest_signature(
-            &PublicKey::Secp256k1(signer.to_bytes()),
+            &client.node.public_key(),
             client_signature,
             id,
         )
@@ -392,7 +386,7 @@ impl NodeStore {
         }
         let now = now.max(self.state.now());
         self.tick(now).await?;
-        self.state.check_terms(a, principal, now)?;
+        self.state.check_terms(a, client, now)?;
         Ok(None)
     }
     pub(crate) async fn dispatch(

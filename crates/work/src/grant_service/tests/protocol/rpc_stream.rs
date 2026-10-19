@@ -32,7 +32,7 @@ async fn portable_grant_rpc_streams_before_terminal_reserves_once_and_survives_r
     let locator = StandingLocator {
         provider: crate::test_support::software_enrollment(2, [2; 32]).content_id(),
         grant: a.grant_id,
-        client: principal(1).0,
+        client: crate::test_support::channel_client(principal(1).0),
         generation: 0,
     };
     let response = rpc

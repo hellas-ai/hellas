@@ -3,8 +3,9 @@ use super::{
     ChannelId, Deserialize, GrantChannelState, GrantId, GrantJobAuthorizationV1, GrantOutcome,
     GrantTerminal, NodeStoreError, Serialize, Signature, SignedResult,
 };
-use crate::model::grant::records::{check_grant_provider, grant_producer, job_signer};
+use crate::model::grant::records::{check_grant_provider, grant_producer};
 use crate::model::grant::{
+    ChannelClient,
     budget::{BudgetDef, BudgetNode, Charge, Limit, Meter, Usage},
     grant_channel_id, grant_work_id,
     records::{GrantDef, GrantError, GrantPolicy},
@@ -13,7 +14,7 @@ use crate::model::work::bound_result_digest;
 use crate::work_store::channel::funding::GrantFunding;
 use crate::work_store::{Applied, Channel, JobBook, JobPhase, JobState, JobTerminal, Role};
 use hellas_auth::authority::{AdministrationRecord, AuthoritySnapshot, AuthorityState};
-use hellas_auth::authority::{PrincipalId, ResourceId, Revision, UnixMillis};
+use hellas_auth::authority::{ResourceId, Revision, UnixMillis};
 use hellas_auth::{Digest, PublicKey};
 use hellas_kernel::NetworkId;
 use hellas_rpc::ProviderEnrollmentBundle;
@@ -141,7 +142,7 @@ impl State {
             .admissions
             .get(&work)
             .ok_or(NodeStoreError::Malformed)?;
-        Ok(job_signer(record.accepted().caller().holder())?)
+        Ok(ChannelClient::recorded(record.accepted().caller())?.signer())
     }
     pub fn channel_binding(&self, id: ChannelId) -> Option<&GrantChannelState> {
         self.channels.get(&id.0).map(|c| &c.funding)
@@ -152,7 +153,7 @@ impl State {
     pub fn generation(&self, grant: GrantId) -> Option<u64> {
         self.generations.get(&grant).copied()
     }
-    pub fn channel_id(&self, grant: GrantId, client: PrincipalId) -> Option<ChannelId> {
+    pub fn channel_id(&self, grant: GrantId, client: ChannelClient) -> Option<ChannelId> {
         Some(grant_channel_id(
             self.network,
             self.provider.as_ref()?.content_id(),
@@ -165,7 +166,7 @@ impl State {
     pub(super) fn check_channel(
         &self,
         a: &GrantJobAuthorizationV1,
-        client: PrincipalId,
+        client: ChannelClient,
     ) -> Result<(), NodeStoreError> {
         if a.channel_id
             != grant_channel_id(
@@ -262,7 +263,7 @@ impl State {
             catalogue: BTreeMap::new(),
         })
     }
-    fn mount(&mut self, grant: GrantId, client: PrincipalId) -> Result<(), NodeStoreError> {
+    fn mount(&mut self, grant: GrantId, client: ChannelClient) -> Result<(), NodeStoreError> {
         let generation = self.generation(grant).ok_or(GrantError::Unauthorized)?;
         let id = grant_channel_id(
             self.network,
@@ -539,14 +540,10 @@ impl State {
                     return Err(NodeStoreError::Malformed);
                 }
                 execution.replay(self, a.grant_id, now)?;
-                let client = execution.caller().actor();
+                let client = ChannelClient::recorded(execution.caller())?;
                 self.check_terms(a, client, now)?;
                 self.mount(a.grant_id, client)?;
-                verify(
-                    job_signer(execution.caller().holder())?,
-                    *client_signature,
-                    id,
-                )?;
+                verify(client.signer(), *client_signature, id)?;
                 verify(grant_producer(self.provider()?)?, *provider_signature, id)?;
                 if charge.get(Meter::Requests) != 1
                     || self
@@ -675,7 +672,7 @@ impl State {
     pub(super) fn check_terms(
         &self,
         a: &GrantJobAuthorizationV1,
-        client: PrincipalId,
+        client: ChannelClient,
         now: UnixMillis,
     ) -> Result<(), NodeStoreError> {
         self.check_channel(a, client)?;
@@ -1198,7 +1195,7 @@ impl State {
                     .admission(c.funding.id, work)
                     .ok_or(NodeStoreError::Malformed)?;
                 admission.validate_history(&state, a, dispatched)?;
-                if admission.accepted().caller().actor() != c.funding.client {
+                if ChannelClient::recorded(admission.accepted().caller())? != c.funding.client {
                     return Err(NodeStoreError::Malformed);
                 }
                 if active && state.ledger.reservation_bound(work) != Some(admission.reserved) {

@@ -1,8 +1,8 @@
 //! Grant funding on Work. One provider writer owns authority and accounting;
 //! bounded RAM owns bodies. Executor admission is reserved before co-signing.
-use crate::model::grant::records::{grant_producer, job_signer};
+use crate::model::grant::records::grant_producer;
 use crate::model::grant::{
-    ChannelId, GrantJobAuthorizationV1,
+    ChannelClient, ChannelId, GrantJobAuthorizationV1,
     budget::Usage,
     grant_work_id,
     records::{GrantError, GrantPolicy},
@@ -356,10 +356,8 @@ impl GrantService {
             let store = self.node.writer().await?;
             access.observe(&mut decision, &store, self.node.observed_time(&store));
             access.authorize(&store, locator.grant, self.node.observed_time(&store))?;
-            if locator.client
-                != access
-                    .caller(&store, self.node.observed_time(&store))?
-                    .subject()
+            if Some(locator.client)
+                != ChannelClient::of(access.caller(&store, self.node.observed_time(&store))?).ok()
             {
                 return Err(refused(GrantRefusalCode::Unauthorized));
             }
@@ -424,10 +422,7 @@ impl GrantService {
             let now = self.node.observed_time(&store);
             let id = grant_work_id(store.state().network(), &a);
             let caller = access.caller(&store, now)?;
-            let client = (
-                caller.subject(),
-                job_signer(caller.holder()).map_err(NodeStoreError::from)?,
-            );
+            let client = ChannelClient::of(caller).map_err(NodeStoreError::from)?;
             if let Some(signature) = store
                 .precheck_acceptance(&a, client, &client_signature, now)
                 .await?
@@ -773,7 +768,7 @@ impl GrantService {
         let context = WorkContext {
             network: store.state().network(),
             channel: a.channel_id.0,
-            client: job_signer(admission.accepted().caller().holder())?,
+            client: ChannelClient::recorded(admission.accepted().caller())?.signer(),
             provider: grant_producer(
                 store
                     .state()

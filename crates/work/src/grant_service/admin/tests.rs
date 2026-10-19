@@ -153,7 +153,7 @@ async fn queries_project_current_windows_without_persisting_time_or_usage() {
             let locator = StandingLocator {
                 provider: store.state().provider()?.content_id(),
                 grant: ALLOWANCE,
-                client: principal(1).0,
+                client: crate::test_support::channel_client(principal(1).0),
                 generation: 0,
             };
             store.standing(locator, &principal(2).1, vec![], now)

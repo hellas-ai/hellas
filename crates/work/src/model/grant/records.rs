@@ -2,7 +2,6 @@
 //! revalidates enrollment; no discovery record confers grant authority.
 use super::{budget::*, *};
 use crate::model::profile::WorkPolicy;
-use hellas_auth::authority::CredentialHolder;
 use hellas_auth::{ProducerSigningKey, PublicKey, Signature};
 use hellas_kernel::{Key, NetworkId};
 use hellas_rpc::protocol::value::{BoundedCborError, canonical_dag_cbor, decode_canonical_bounded};
@@ -110,14 +109,6 @@ pub fn verify_provider(provider: &ProviderEnrollmentBundle) -> Result<(), GrantE
         },
     )
     .map_err(|_| GrantError::Signature)
-}
-/// The key that signs a caller's per-job authorisations: the node key its
-/// credential is bound to. A bearer credential signs no work.
-pub fn job_signer(holder: CredentialHolder) -> Result<Key, GrantError> {
-    match holder {
-        CredentialHolder::Node(key) => Ok(Key::from_bytes(*key.as_bytes())),
-        CredentialHolder::Bearer => Err(GrantError::Signature),
-    }
 }
 pub fn grant_producer(provider: &ProviderEnrollmentBundle) -> Result<Key, GrantError> {
     let PublicKey::Secp256k1(bytes) = provider.genesis.statement.producer_public_key else {
@@ -374,7 +365,7 @@ impl Offer {
         let body = canonical_dag_cbor(self).map_err(|_| GrantError::Malformed)?;
         Ok(crate::model::work::xfh(b"hellas.work.offer.v2", &[&body]))
     }
-    pub fn channel(&self, client: PrincipalId) -> ChannelId {
+    pub fn channel(&self, client: ChannelClient) -> ChannelId {
         grant_channel_id(
             self.network,
             self.provider.content_id(),

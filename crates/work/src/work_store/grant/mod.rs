@@ -16,10 +16,10 @@ pub use administration::{
 pub use client::GrantClientStore;
 pub mod ledger;
 use super::channel::funding::JobOutcome;
-use crate::model::grant::{ChannelId, GrantJobAuthorizationV1};
+use crate::model::grant::{ChannelClient, ChannelId, GrantJobAuthorizationV1};
 use crate::model::work::PaidJobResultV1;
 use hellas_auth::Signature;
-use hellas_auth::authority::{GrantId, PrincipalId};
+use hellas_auth::authority::GrantId;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -27,7 +27,7 @@ pub struct GrantChannelState {
     pub id: ChannelId,
     pub grant: GrantId,
     pub generation: u64,
-    pub client: PrincipalId,
+    pub client: ChannelClient,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GrantOutcome {

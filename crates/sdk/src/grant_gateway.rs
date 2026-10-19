@@ -286,6 +286,7 @@ impl GrantGateway {
                 let (name, input) = prepare(
                     request,
                     session.offer(),
+                    session.store().channel(),
                     selected.as_deref(),
                     &signer,
                     assurance,
@@ -325,6 +326,7 @@ enum Request {
 fn prepare(
     request: Request,
     offer: &SignedOffer,
+    channel: &hellas_work::work_store::grant::GrantChannelState,
     selected: Option<&str>,
     signer: &ProducerSigningKey,
     assurance: hellas_rpc::Assurance,
@@ -378,19 +380,10 @@ fn prepare(
         }
     };
     let standing = offer.offer();
-    let client =
-        hellas_auth::authority::PrincipalId::from_public_key(signer.public_key()).map_err(error)?;
-    let channel = hellas_work::model::grant::grant_channel_id(
-        standing.network,
-        standing.provider.content_id(),
-        standing.grant.id,
-        client,
-        standing.generation,
-    );
     let context = hellas_work::model::profile::WorkContext {
         network: standing.network,
-        channel: channel.0,
-        client: hellas_kernel::Key::from_bytes(*client.as_bytes()),
+        channel: channel.id.0,
+        client: channel.client.signer(),
         provider: grant_producer(&standing.provider).map_err(error)?,
     };
     let prepared_input_digest = input

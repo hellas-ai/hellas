@@ -9,7 +9,7 @@ use hellas_work::model::{
     grant::{records::*, resource::*, *},
     profile::WorkPolicy,
 };
-use hellas_work::test_support::{principal, software_enrollment};
+use hellas_work::test_support::{channel_client, principal, software_enrollment};
 use std::num::NonZeroU64;
 fn resource() -> HttpsResource {
     HttpsResource {
@@ -165,13 +165,14 @@ fn contact_proof_offer_signature_and_actor_channel_binding_are_not_advisory() {
         SignedOffer::decode(&bytes, UnixMillis(1000)).unwrap(),
         signed
     );
+    let client_channel = channel_client(client_principal);
     assert_eq!(
-        signed.offer().channel(client_principal),
+        signed.offer().channel(client_channel),
         grant_channel_id(
             network,
             provider.content_id(),
             GrantId([7; 16]),
-            client_principal,
+            client_channel,
             0
         )
     );
@@ -179,18 +180,22 @@ fn contact_proof_offer_signature_and_actor_channel_binding_are_not_advisory() {
     let locator = standing::StandingLocator {
         provider: provider.content_id(),
         grant: GrantId([7; 16]),
-        client: client_principal,
+        client: client_channel,
         generation: 9,
     };
     let encoded = locator.encode();
-    // The principal travels with its P-256 curve tag.
+    // The principal and the node key travel with their curve tags.
+    assert_eq!(encoded.len(), 124);
     assert_eq!(encoded[48], hellas_auth::SignatureKind::P256.to_byte());
     assert_eq!(encoded[49..82], client_principal.as_bytes()[..]);
+    assert_eq!(encoded[82], hellas_auth::SignatureKind::Secp256k1.to_byte());
+    assert_eq!(encoded[83..116], client_channel.node.as_bytes()[..]);
+    assert_eq!(encoded[116..], 9u64.to_be_bytes());
     assert_eq!(
         standing::StandingLocator::decode(&encoded).unwrap(),
         locator
     );
-    assert!(standing::StandingLocator::decode(&encoded[..89]).is_err());
+    assert!(standing::StandingLocator::decode(&encoded[..123]).is_err());
     let mut invalid = encoded.to_vec();
     invalid.push(0);
     assert!(standing::StandingLocator::decode(&invalid).is_err());
@@ -206,13 +211,34 @@ fn contact_proof_offer_signature_and_actor_channel_binding_are_not_advisory() {
         standing::StandingLocator::decode(&invalid),
         Err(GrantError::UnsupportedKey)
     );
+    let mut invalid = encoded;
+    invalid[82] = hellas_auth::SignatureKind::P256.to_byte();
+    assert_eq!(
+        standing::StandingLocator::decode(&invalid),
+        Err(GrantError::UnsupportedKey)
+    );
+    let mut invalid = encoded;
+    invalid[83..116].fill(0);
+    assert_eq!(
+        standing::StandingLocator::decode(&invalid),
+        Err(GrantError::UnsupportedKey)
+    );
     assert_eq!(
         SignedOffer::decode(&bytes, UnixMillis(1000)).unwrap(),
         signed
     );
     assert_ne!(
-        signed.offer().channel(stranger),
-        signed.offer().channel(client_principal)
+        signed.offer().channel(channel_client(stranger)),
+        signed.offer().channel(client_channel)
+    );
+    // The same principal on another device opens another channel.
+    assert_ne!(
+        signed.offer().channel(ChannelClient {
+            principal: client_principal,
+            node: hellas_auth::authority::NodeKey::from_public_key(principal(4).1.public_key())
+                .unwrap(),
+        }),
+        signed.offer().channel(client_channel)
     );
     assert_eq!(
         SignedOffer::decode(&bytes, UnixMillis(2000)),
