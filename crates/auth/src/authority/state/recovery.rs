@@ -26,6 +26,14 @@ impl AuthorityState {
             generation,
             now,
         )?;
+        Self::check_owner(
+            Ownership::Recover {
+                expected: command.expected,
+            },
+            &command.administrator,
+            &command.credential,
+            &command.owner,
+        )?;
         if command.revoke.len() > MAX_GRANTS {
             return Err(AuthorityError::Capacity);
         }
@@ -72,9 +80,9 @@ impl AuthorityState {
         candidate.grants.insert(self.root_grant, root);
         candidate.generation = receipt.generation;
         candidate.credentials.clear();
-        let mut credential = command.credential.clone();
-        credential.bearer = true;
-        candidate.credentials.insert(credential.id, credential);
+        candidate
+            .credentials
+            .insert(command.credential.id, command.credential.clone());
         candidate.revision = receipt.revision;
         candidate.now = now;
         candidate.last_recovery = Some(receipt);

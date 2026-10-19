@@ -64,15 +64,22 @@ impl AuthorityState {
 
     /// Used only by the host's explicit offline initialization of an empty store.
     /// Ordinary startup must restore existing state, never call this on failure.
+    /// `owner` is the administrator's assertion over the bootstrap digest.
     pub fn bootstrap(
         id: GrantId,
         admin: GrantSpec,
-        mut credential: Credential,
+        credential: Credential,
+        owner: &PasskeyAssertion,
         now: UnixMillis,
     ) -> Result<Self, AuthorityError> {
         Self::validate_administrator(&admin, now)?;
         Self::validate_initial_credential(&admin, &credential, 1, now)?;
-        credential.bearer = true;
+        Self::check_owner(
+            Ownership::Bootstrap { root: id },
+            &admin,
+            &credential,
+            owner,
+        )?;
         Ok(Self {
             authority: admin.authority,
             revision: Revision(1),
@@ -95,6 +102,25 @@ impl AuthorityState {
             )]
             .into(),
         })
+    }
+
+    /// The administrator's passkey must approve the exact ownership change,
+    /// including the node key that will hold the initial credential.
+    fn check_owner(
+        ownership: Ownership,
+        admin: &GrantSpec,
+        credential: &Credential,
+        owner: &PasskeyAssertion,
+    ) -> Result<(), AuthorityError> {
+        let CredentialHolder::Node(holder) = credential.holder else {
+            return Err(AuthorityError::Invalid);
+        };
+        owner
+            .verify(
+                admin.subject,
+                ownership_digest(ownership, admin, &credential.scope, holder),
+            )
+            .map_err(|_| AuthorityError::Denied)
     }
 
     fn validate_administrator(admin: &GrantSpec, now: UnixMillis) -> Result<(), AuthorityError> {

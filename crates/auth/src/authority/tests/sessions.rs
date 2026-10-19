@@ -11,10 +11,9 @@ impl Connection {
         // Deliberately independent of the production session-limit constant.
         scope.expires = UnixMillis(1_800_000);
         scope.issuance.as_mut().unwrap().max_validity_ms = 1_800_000;
-        let (credential, secret) = Credential::prepare(scope.clone(), 1).unwrap();
+        let (credential, secret) = prepare(scope.clone(), 1);
         Self {
-            state: AuthorityState::bootstrap(ids::ROOT_GRANT, scope, credential, UnixMillis(0))
-                .unwrap(),
+            state: bootstrap(ids::ROOT_GRANT, scope, credential, UnixMillis(0)).unwrap(),
             secret,
         }
     }
@@ -23,24 +22,33 @@ impl Connection {
             .begin_authentication(binding(), UnixMillis(10))
             .unwrap()
     }
-    fn sign(&self, pending: &PendingAuthentication) -> crate::Signature {
+    fn sign(&self, pending: &PendingAuthentication) -> SessionProof {
         pending
             .challenge()
-            .sign(authority(), binding(), self.secret.id(), &ROOT.key())
+            .sign_daily(authority(), binding(), self.secret.id(), &ROOT.node_key())
             .unwrap()
+    }
+    fn passkey(&self, pending: &PendingAuthentication, actor: Actor) -> SessionProof {
+        SessionProof::Passkey(
+            actor.assert(
+                pending
+                    .challenge()
+                    .proof_digest(authority(), binding(), self.secret.id())
+                    .unwrap(),
+            ),
+        )
     }
     fn connect(&self) -> AuthenticatedSession {
         let pending = self.pending();
         let signature = self.sign(&pending);
-        pending
-            .complete(
-                &self.state,
-                binding(),
-                &self.secret,
-                &signature,
-                UnixMillis(11),
-            )
-            .unwrap()
+        self.complete(pending, &signature).unwrap()
+    }
+    fn complete(
+        &self,
+        pending: PendingAuthentication,
+        proof: &SessionProof,
+    ) -> Result<AuthenticatedSession, AuthorityError> {
+        pending.complete(&self.state, binding(), &self.secret, proof, UnixMillis(11))
     }
     fn recover(&mut self) {
         self.state
@@ -75,11 +83,11 @@ fn identity_proof_binds_every_challenge_field() {
         let mut challenge = *pending.challenge();
         change(&mut challenge);
         let signature = challenge
-            .sign(
+            .sign_daily(
                 challenge.authority,
                 challenge.binding,
                 connection.secret.id(),
-                &ROOT.key(),
+                &ROOT.node_key(),
             )
             .unwrap();
         assert_err!(
@@ -102,7 +110,7 @@ fn identity_proof_binds_the_selected_credential() {
     let pending = connection.pending();
     let signature = pending
         .challenge()
-        .sign(authority(), binding(), other.id(), &ROOT.key())
+        .sign_daily(authority(), binding(), other.id(), &ROOT.node_key())
         .unwrap();
     assert_err!(
         pending.complete(
@@ -122,11 +130,11 @@ fn identity_proof_requires_the_credential_subjects_key() {
     let pending = connection.pending();
     let signature = pending
         .challenge()
-        .sign(
+        .sign_daily(
             authority(),
             binding(),
             connection.secret.id(),
-            &STRANGER.key(),
+            &STRANGER.node_key(),
         )
         .unwrap();
     assert_err!(
@@ -146,8 +154,10 @@ fn a_valid_identity_signature_does_not_replace_the_credential_secret() {
     let connection = Connection::new();
     let pending = connection.pending();
     let signature = connection.sign(&pending);
-    let wrong =
-        CredentialSecret::from_parts(connection.secret.id(), STRANGER.key().to_secret_bytes());
+    let wrong = CredentialSecret::from_parts(
+        connection.secret.id(),
+        STRANGER.node_key().to_secret_bytes(),
+    );
     assert_err!(
         pending.complete(
             &connection.state,
@@ -169,9 +179,12 @@ fn clients_sign_only_the_expected_server_binding() {
         (authority(), other_binding()),
     ] {
         assert_err!(
-            pending
-                .challenge()
-                .sign(audience, transport, connection.secret.id(), &ROOT.key()),
+            pending.challenge().sign_daily(
+                audience,
+                transport,
+                connection.secret.id(),
+                &ROOT.node_key()
+            ),
             AuthorityError::Credential
         );
     }
@@ -335,4 +348,123 @@ fn recovery_invalidates_pending_authentication() {
         ),
         AuthorityError::Credential
     );
+}
+
+#[test]
+fn a_passkey_session_verifies_and_a_cross_connection_replay_fails() {
+    let connection = Connection::new();
+    let pending = connection.pending();
+    let proof = connection.passkey(&pending, ROOT);
+    let session = connection.complete(pending, &proof).unwrap();
+    let caller = session
+        .authenticate(&connection.state, binding(), UnixMillis(12))
+        .unwrap();
+    assert_eq!(caller.session(), SessionKind::Passkey);
+    // The same assertion answering a challenge on another connection.
+    let other = connection
+        .state
+        .begin_authentication(other_binding(), UnixMillis(10))
+        .unwrap();
+    assert_err!(
+        other.complete(
+            &connection.state,
+            other_binding(),
+            &connection.secret,
+            &proof,
+            UnixMillis(11)
+        ),
+        AuthorityError::Credential
+    );
+    // Only the credential subject's passkey answers.
+    let pending = connection.pending();
+    let stranger = connection.passkey(&pending, STRANGER);
+    assert_err!(
+        connection.complete(pending, &stranger),
+        AuthorityError::Credential
+    );
+}
+
+#[test]
+fn a_daily_session_verifies_only_with_the_bound_node_key() {
+    let mut connection = Connection::new();
+    let session = connection.connect();
+    assert_eq!(
+        session
+            .authenticate(&connection.state, binding(), UnixMillis(12))
+            .unwrap()
+            .session(),
+        SessionKind::Daily
+    );
+    // The same subject's credential held by another device.
+    let (credential, secret) =
+        Credential::prepare(spec(ROOT), FRIEND.holder(), connection.state.generation()).unwrap();
+    connection
+        .state
+        .apply_credential(
+            ROOT.principal(),
+            &CredentialCommand::Issue {
+                authorization: ids::ROOT_GRANT,
+                credential: Box::new(credential),
+            },
+            UnixMillis(2),
+        )
+        .unwrap();
+    connection.secret = secret;
+    for (key, accepted) in [(ROOT.node_key(), false), (FRIEND.node_key(), true)] {
+        let pending = connection.pending();
+        let proof = pending
+            .challenge()
+            .sign_daily(authority(), binding(), connection.secret.id(), &key)
+            .unwrap();
+        assert_eq!(connection.complete(pending, &proof).is_ok(), accepted);
+    }
+}
+
+#[test]
+fn a_step_up_operation_is_refused_on_a_daily_session() {
+    let connection = Connection::new();
+    let pending = connection.pending();
+    let proof = connection.passkey(&pending, ROOT);
+    let sessions = [
+        connection.complete(pending, &proof).unwrap(),
+        connection.connect(),
+    ];
+    let [passkey, daily] = sessions.each_ref().map(|s| {
+        s.authenticate(&connection.state, binding(), UnixMillis(12))
+            .unwrap()
+    });
+    let contact = AdministrationCommand::Grant(GrantCommand::Issue {
+        authorization: ids::ROOT_GRANT,
+        id: ids::FRIEND_GRANT,
+        spec: spec(FRIEND),
+    });
+    let credential = AdministrationCommand::Credential(CredentialCommand::Issue {
+        authorization: ids::ROOT_GRANT,
+        credential: Box::new(prepare(spec(FRIEND), 1).0),
+    });
+    for command in [contact, credential] {
+        assert_err!(
+            connection
+                .state
+                .record_administration(daily, command.clone(), UnixMillis(12)),
+            AuthorityError::StepUp
+        );
+        connection
+            .state
+            .record_administration(passkey, command, UnixMillis(12))
+            .unwrap();
+    }
+    // The principal's own execution grant is a daily operation.
+    connection
+        .state
+        .record_administration(
+            daily,
+            AdministrationCommand::Grant(GrantCommand::Issue {
+                authorization: ids::ROOT_GRANT,
+                id: ids::EXECUTION,
+                spec: spec(ROOT),
+            }),
+            UnixMillis(12),
+        )
+        .unwrap();
 }

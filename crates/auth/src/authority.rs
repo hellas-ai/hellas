@@ -4,17 +4,22 @@
 
 mod administration;
 mod credentials;
+mod ownership;
+mod passkey;
 mod sessions;
 mod state;
 mod types;
 
 pub use administration::{AdministrationCommand, AdministrationRecord, CallerRecord};
 pub use credentials::{
-    AuthenticatedCaller, Credential, CredentialCommand, CredentialId, CredentialSecret,
+    AuthenticatedCaller, Credential, CredentialCommand, CredentialHolder, CredentialId,
+    CredentialSecret, SessionKind,
 };
+pub use ownership::{Ownership, ownership_digest};
+pub use passkey::PasskeyAssertion;
 pub use sessions::{
     AuthenticatedSession, MAX_CHALLENGE_LIFETIME_MS, MAX_SESSION_LIFETIME_MS,
-    PendingAuthentication, SessionChallenge,
+    PendingAuthentication, SessionChallenge, SessionProof,
 };
 pub use state::{AuthoritySnapshot, AuthorityState};
 pub use types::*;
@@ -24,6 +29,8 @@ pub const GRANT_REVOKE: &str = "grant.revoke";
 pub const GRANT_ADMINISTER: &str = "grant.administer";
 pub const CREDENTIAL_ISSUE: &str = "credential.issue";
 pub const CREDENTIAL_REVOKE: &str = "credential.revoke";
+/// The one operation a bearer credential may carry: local HTTP gateway admission.
+pub const GATEWAY_INVOKE: &str = "gateway.invoke";
 pub const MAX_CREDENTIALS: usize = 256;
 pub const MAX_DELEGATION_DEPTH: u8 = 8;
 /// Unexpired, unrevoked descendants of one node grant, including future grants.
@@ -55,6 +62,8 @@ pub enum AuthorityError {
     Clock,
     #[error("credential authentication failed")]
     Credential,
+    #[error("operation requires a passkey session")]
+    StepUp,
     #[error("secure randomness is unavailable")]
     Entropy,
 }

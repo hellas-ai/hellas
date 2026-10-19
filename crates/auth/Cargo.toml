@@ -8,7 +8,8 @@ repository.workspace = true
 documentation.workspace = true
 
 [features]
-test-support = []
+# Actor fixtures sign as software passkeys, which only the kernel provides.
+test-support = ["dep:hellas-kernel"]
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.4", features = ["wasm_js"] }
@@ -16,6 +17,7 @@ getrandom = { version = "0.4", features = ["wasm_js"] }
 [dependencies]
 ed25519-dalek.workspace = true
 getrandom = "0.4"
+hellas-kernel = { workspace = true, optional = true, features = ["webauthn"] }
 hellas-webauthn.workspace = true
 hellas-xet = { workspace = true, features = ["chunking", "serde"] }
 hex.workspace = true
@@ -28,4 +30,5 @@ thiserror.workspace = true
 zeroize = "1.9"
 
 [dev-dependencies]
+hellas-kernel = { workspace = true, features = ["webauthn"] }
 serde_ipld_dagcbor.workspace = true

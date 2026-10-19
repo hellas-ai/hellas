@@ -1,6 +1,7 @@
 //! Portable actors and authority builders shared by test fixtures.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
-use crate::{ProducerSigningKey, authority as auth, authority::*};
+use crate::{Digest, ProducerSigningKey, PublicKey, authority as auth, authority::*};
+use hellas_kernel::{PayloadHash, SoftPasskey};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Actor {
@@ -27,8 +28,8 @@ pub mod actors {
     pub const ATTACKER: Actor = Actor::Attacker;
 }
 impl Actor {
-    pub fn key(self) -> ProducerSigningKey {
-        let seed = match self {
+    fn seed(self) -> u8 {
+        match self {
             Self::Root => 1,
             Self::Operator => 2,
             Self::Friend => 3,
@@ -38,15 +39,62 @@ impl Actor {
             Self::RecoveryOwner => 7,
             Self::Successor => 8,
             Self::Attacker => 9,
-        };
-        ProducerSigningKey::from_secret_bytes([seed; 32]).unwrap()
+        }
+    }
+    /// The actor's software passkey: its principal key.
+    pub fn passkey(self) -> SoftPasskey {
+        SoftPasskey::from_secret_scalar([0x10 + self.seed(); 32]).unwrap()
+    }
+    /// The actor's device key, from a seed disjoint from every passkey seed
+    /// and from the fixed scalars other fixtures use for their own roles.
+    pub fn node_key(self) -> ProducerSigningKey {
+        ProducerSigningKey::from_secret_bytes([0x60 + self.seed(); 32]).unwrap()
+    }
+    pub fn holder(self) -> CredentialHolder {
+        CredentialHolder::Node(NodeKey::from_public_key(self.node_key().public_key()).unwrap())
     }
     pub fn principal(self) -> PrincipalId {
         static PRINCIPALS: [std::sync::OnceLock<PrincipalId>; 9] =
             [const { std::sync::OnceLock::new() }; 9];
-        *PRINCIPALS[self as usize]
-            .get_or_init(|| PrincipalId::from_public_key(self.key().public_key()).unwrap())
+        *PRINCIPALS[self as usize].get_or_init(|| {
+            PrincipalId::from_public_key(PublicKey::P256(self.passkey().party_key().to_bytes()))
+                .unwrap()
+        })
     }
+    /// The actor's passkey assertion over `challenge`.
+    pub fn assert(self, challenge: Digest) -> PasskeyAssertion {
+        assertion(&self.passkey(), challenge)
+    }
+}
+
+/// `owner`'s approval of an ownership change for a credential `holder`.
+pub fn approve(
+    owner: Actor,
+    ownership: Ownership,
+    administrator: &GrantSpec,
+    credential: &GrantSpec,
+    holder: CredentialHolder,
+) -> PasskeyAssertion {
+    let CredentialHolder::Node(holder) = holder else {
+        panic!("initial credentials are device-held");
+    };
+    owner.assert(ownership_digest(
+        ownership,
+        administrator,
+        credential,
+        holder,
+    ))
+}
+
+/// A software passkey's assertion in the form authority proofs carry.
+pub fn assertion(passkey: &SoftPasskey, challenge: Digest) -> PasskeyAssertion {
+    let envelope = passkey
+        .sign(PayloadHash::from_bytes(*challenge.as_bytes()))
+        .unwrap();
+    let mut signature = [0; 64];
+    signature[..32].copy_from_slice(envelope.r());
+    signature[32..].copy_from_slice(envelope.s());
+    PasskeyAssertion::from_envelope(signature, envelope.webauthn_data().as_slice()).unwrap()
 }
 
 pub mod ids {

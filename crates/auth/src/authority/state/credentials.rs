@@ -9,22 +9,23 @@ impl AuthorityState {
         self.credentials.values()
     }
 
-    /// Secret-only authentication, accepted only for self-issued bearer credentials.
+    /// Secret-only authentication, accepted only for bearer credentials.
     pub fn authenticate(
         &self,
         secret: &CredentialSecret,
         now: UnixMillis,
     ) -> Result<AuthenticatedCaller, AuthorityError> {
-        if !self.live_credential(secret.id(), now)?.bearer {
+        if !self.live_credential(secret.id(), now)?.bearer() {
             return Err(AuthorityError::Credential);
         }
-        self.authenticate_secret(secret, now)
+        self.authenticate_secret(secret, SessionKind::Bearer, now)
     }
 
-    /// The session handshake adds the subject's identity signature to this check.
+    /// The session handshake adds a passkey or node-key proof to this check.
     pub(in crate::authority) fn authenticate_secret(
         &self,
         secret: &CredentialSecret,
+        session: SessionKind,
         now: UnixMillis,
     ) -> Result<AuthenticatedCaller, AuthorityError> {
         let credential = self.live_credential(secret.id(), now)?;
@@ -36,6 +37,8 @@ impl AuthorityState {
             authority: self.authority,
             subject: credential.scope.subject,
             credential: credential.id,
+            holder: credential.holder,
+            session,
             revision: credential.revision,
             generation: self.generation,
             authenticated_at: now,
@@ -74,7 +77,7 @@ impl AuthorityState {
                 credential,
             } => {
                 self.validate_credential(credential)?;
-                if credential.revoked || credential.revision != Revision(1) || credential.bearer {
+                if credential.revoked || credential.revision != Revision(1) {
                     return Err(AuthorityError::Invalid);
                 }
                 if self.credentials.contains_key(&credential.id) {
@@ -100,9 +103,8 @@ impl AuthorityState {
                 if self.credentials.len() >= MAX_CREDENTIALS {
                     self.credentials.retain(|_, c| !unusable(c));
                 }
-                let mut credential = credential.as_ref().clone();
-                credential.bearer = credential.scope.subject == actor;
-                self.credentials.insert(credential.id, credential);
+                self.credentials
+                    .insert(credential.id, credential.as_ref().clone());
             }
             CredentialCommand::Revoke {
                 authorization,
@@ -143,6 +145,7 @@ impl AuthorityState {
         let credential = self.live_credential(caller.credential, now)?;
         if caller.authority != self.authority
             || caller.subject != credential.scope.subject
+            || caller.holder != credential.holder
             || caller.generation != self.generation
             || caller.revision != credential.revision
             || now < caller.authenticated_at
@@ -186,6 +189,7 @@ impl AuthorityState {
         if credential.scope.authority != self.authority
             || credential.generation != self.generation
             || !credential.scope.validate()
+            || !credential.holder.admits(&credential.scope)
             || credential.revision.0 == 0
             || credential.revision > self.revision
         {
@@ -205,7 +209,7 @@ impl AuthorityState {
             || credential.generation != generation
             || credential.revision != Revision(1)
             || credential.revoked
-            || credential.bearer
+            || credential.bearer()
             || scope.authority != admin.authority
             || scope.subject != admin.subject
             || !scope.permissions.is_subset(&admin.permissions)

@@ -2,7 +2,8 @@ use super::*;
 
 fn enroll(s: &mut AuthorityState, scope: GrantSpec) -> AuthenticatedCaller {
     let secret = credentials::install(s, scope);
-    s.authenticate_secret(&secret, UnixMillis(3)).unwrap()
+    s.authenticate_secret(&secret, SessionKind::Passkey, UnixMillis(3))
+        .unwrap()
 }
 fn record(
     s: &AuthorityState,
@@ -99,7 +100,7 @@ fn credential_ceilings_bound_existing_grant_administration() {
 #[test]
 fn credential_ceilings_bound_credential_administration() {
     let mut w = RestrictedAdministrator::new();
-    let (outside, _) = Credential::prepare(w.outside, 1).unwrap();
+    let (outside, _) = prepare(w.outside, 1);
     let id = outside.id();
     let command = CredentialCommand::Issue {
         authorization: ids::ROOT_GRANT,

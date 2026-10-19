@@ -1,23 +1,21 @@
 use super::*;
 
 pub(super) fn command(s: &AuthorityState, owner: Actor) -> RecoveryCommand {
-    RecoveryCommand {
-        credential: Credential::prepare(administrator(owner), s.generation() + 1)
-            .unwrap()
-            .0,
-        expected: s.revision(),
-        administrator: administrator(owner),
-        revoke: Default::default(),
-    }
+    recovery(
+        s,
+        administrator(owner),
+        prepare(administrator(owner), s.generation() + 1).0,
+        Default::default(),
+    )
 }
 
 fn mixed_recovery_lineages() -> AuthorityState {
     let mut root = administrator(ROOT);
     root.delegation_depth = 1;
-    let mut s = AuthorityState::bootstrap(
+    let mut s = bootstrap(
         ids::ROOT_GRANT,
         root.clone(),
-        Credential::prepare(root, 1).unwrap().0,
+        prepare(root, 1).0,
         UnixMillis(0),
     )
     .unwrap();
@@ -287,4 +285,53 @@ fn recovery_receipts_survive_id_reclamation() {
         ),
         Err(AuthorityError::Revision),
     );
+}
+
+#[test]
+fn bootstrap_and_recovery_without_proof_of_possession_fail() {
+    let admin = administrator(ROOT);
+    let (credential, _) = prepare(admin.clone(), 1);
+    let CredentialHolder::Node(holder) = credential.holder() else {
+        unreachable!()
+    };
+    let approve = |root, holder| {
+        ownership_digest(
+            Ownership::Bootstrap { root },
+            &admin,
+            credential.scope(),
+            holder,
+        )
+    };
+    let other_holder = NodeKey::from_public_key(ATTACKER.node_key().public_key()).unwrap();
+    for owner in [
+        // Someone else's passkey over the exact terms.
+        ATTACKER.assert(approve(ids::ROOT_GRANT, holder)),
+        // The owner's passkey, approving another bootstrap.
+        ROOT.assert(approve(ids::OPERATOR_GRANT, holder)),
+        ROOT.assert(approve(ids::ROOT_GRANT, other_holder)),
+    ] {
+        assert_err!(
+            AuthorityState::bootstrap(
+                ids::ROOT_GRANT,
+                admin.clone(),
+                credential.clone(),
+                &owner,
+                UnixMillis(0)
+            ),
+            AuthorityError::Denied
+        );
+    }
+    let mut s = bootstrap(ids::ROOT_GRANT, admin, credential, UnixMillis(0)).unwrap();
+    let mut forged = command(&s, RECOVERY_OWNER);
+    forged.owner = ATTACKER.assert(ownership_digest(
+        Ownership::Recover {
+            expected: forged.expected,
+        },
+        &forged.administrator,
+        forged.credential.scope(),
+        holder,
+    ));
+    let before = s.clone();
+    assert_err!(s.recover(&forged, UnixMillis(1)), AuthorityError::Denied);
+    assert_eq!(s, before);
 }

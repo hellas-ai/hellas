@@ -27,6 +27,76 @@ fn permission(s: &str, resource: ResourceId) -> Permission {
     }
 }
 
+const ACTORS: [Actor; 9] = [
+    ROOT,
+    OPERATOR,
+    FRIEND,
+    AGENT,
+    PROVIDER,
+    STRANGER,
+    RECOVERY_OWNER,
+    SUCCESSOR,
+    ATTACKER,
+];
+
+fn actor(subject: PrincipalId) -> Actor {
+    ACTORS
+        .into_iter()
+        .find(|actor| actor.principal() == subject)
+        .unwrap()
+}
+
+/// A credential held by its own subject's device.
+fn prepare(scope: GrantSpec, generation: u64) -> (Credential, CredentialSecret) {
+    let holder = actor(scope.subject).holder();
+    Credential::prepare(scope, holder, generation).unwrap()
+}
+
+/// Bootstrap with the administrator's own proof of possession.
+fn bootstrap(
+    id: GrantId,
+    admin: GrantSpec,
+    credential: Credential,
+    now: UnixMillis,
+) -> Result<AuthorityState, AuthorityError> {
+    let CredentialHolder::Node(holder) = credential.holder() else {
+        return Err(AuthorityError::Invalid);
+    };
+    let owner = actor(admin.subject).assert(ownership_digest(
+        Ownership::Bootstrap { root: id },
+        &admin,
+        credential.scope(),
+        holder,
+    ));
+    AuthorityState::bootstrap(id, admin, credential, &owner, now)
+}
+
+/// Recovery approved by the new administrator's own passkey.
+fn recovery(
+    s: &AuthorityState,
+    administrator: GrantSpec,
+    credential: Credential,
+    revoke: std::collections::BTreeSet<GrantId>,
+) -> RecoveryCommand {
+    let CredentialHolder::Node(holder) = credential.holder() else {
+        panic!("recovery credentials are device-held");
+    };
+    let expected = s.revision();
+    let owner = actor(administrator.subject).assert(ownership_digest(
+        Ownership::Recover { expected },
+        &administrator,
+        credential.scope(),
+        holder,
+    ));
+    RecoveryCommand {
+        credential,
+        expected,
+        administrator,
+        revoke,
+        owner,
+    }
+}
+
 fn spec(subject: Actor) -> GrantSpec {
     Rights::new(authority(), subject)
         .allow("work.execute", resource(1))
@@ -54,6 +124,7 @@ fn administrator(subject: Actor) -> GrantSpec {
             CREDENTIAL_REVOKE,
             "work.execute",
             "host.status",
+            GATEWAY_INVOKE,
         ]
         .map(operation)
         .into(),
@@ -69,10 +140,10 @@ fn state() -> AuthorityState {
     root.expires = UnixMillis(1000);
     root.permissions
         .retain(|p| p.operation.as_str() != "work.execute");
-    AuthorityState::bootstrap(
+    bootstrap(
         ids::ROOT_GRANT,
         root.clone(),
-        Credential::prepare(root, 1).unwrap().0,
+        prepare(root, 1).0,
         UnixMillis(0),
     )
     .unwrap()

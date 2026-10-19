@@ -3,33 +3,42 @@ use crate::{Digest, PublicKey, hash_tuple};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use std::collections::BTreeSet;
 
-/// A validated identity key, independent of enrollment and transport keys.
+/// A principal: a person or bot, identified by one P-256 passkey (`WebAuthn`).
+/// Machine keys (node, transport, attestation) are never principals.
+///
+/// A compressed secp256k1 key is also 33 bytes, so every serialized principal
+/// carries the `PublicKey::P256` curve tag and never travels as raw bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PrincipalId([u8; 33]);
 
 impl PrincipalId {
     pub fn from_public_key(key: PublicKey) -> Result<Self, AuthorityError> {
-        let PublicKey::Secp256k1(bytes) = key else {
+        let PublicKey::P256(bytes) = key else {
             return Err(AuthorityError::Invalid);
         };
-        k256::ecdsa::VerifyingKey::from_sec1_bytes(&bytes).map_err(|_| AuthorityError::Invalid)?;
+        p256::ecdsa::VerifyingKey::from_sec1_bytes(&bytes).map_err(|_| AuthorityError::Invalid)?;
         Ok(Self(bytes))
     }
 
+    /// The compressed SEC1 P-256 point.
     pub const fn as_bytes(&self) -> &[u8; 33] {
         &self.0
     }
 
     pub const fn public_key(self) -> PublicKey {
-        PublicKey::Secp256k1(self.0)
+        PublicKey::P256(self.0)
     }
 
     /// A 60-bit display fingerprint for comparison over an independent channel.
-    /// Hash the complete identity key before shortening it: compressed key prefixes
+    /// Hash the complete tagged key before shortening it: compressed key prefixes
     /// are not uniform. This display value never replaces the full identity key.
     pub fn fingerprint(self) -> String {
         const BASE32: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
-        let digest = hash_tuple("hellas.principal.fingerprint.v1", &[&self.0]);
+        let key = self.public_key();
+        let digest = hash_tuple(
+            "hellas.principal.fingerprint.v2",
+            &[&[key.kind().to_byte()], key.bytes()],
+        );
         let prefix = digest
             .as_bytes()
             .iter()
@@ -49,14 +58,49 @@ impl PrincipalId {
 
 impl Serialize for PrincipalId {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_bytes(&self.0)
+        self.public_key().serialize(serializer)
     }
 }
 
 impl<'de> Deserialize<'de> for PrincipalId {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let bytes = serde_bytes::ByteBuf::deserialize(deserializer)?;
-        Self::try_from(bytes.as_ref()).map_err(D::Error::custom)
+        Self::from_public_key(PublicKey::deserialize(deserializer)?).map_err(D::Error::custom)
+    }
+}
+
+/// The secp256k1 key of the device that holds a credential. A node key signs
+/// daily sessions and per-job authorisations; it is never a principal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NodeKey([u8; 33]);
+
+impl NodeKey {
+    pub fn from_public_key(key: PublicKey) -> Result<Self, AuthorityError> {
+        let PublicKey::Secp256k1(bytes) = key else {
+            return Err(AuthorityError::Invalid);
+        };
+        k256::ecdsa::VerifyingKey::from_sec1_bytes(&bytes).map_err(|_| AuthorityError::Invalid)?;
+        Ok(Self(bytes))
+    }
+
+    /// The compressed SEC1 secp256k1 point.
+    pub const fn as_bytes(&self) -> &[u8; 33] {
+        &self.0
+    }
+
+    pub const fn public_key(self) -> PublicKey {
+        PublicKey::Secp256k1(self.0)
+    }
+}
+
+impl Serialize for NodeKey {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.public_key().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for NodeKey {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Self::from_public_key(PublicKey::deserialize(deserializer)?).map_err(D::Error::custom)
     }
 }
 
@@ -342,6 +386,7 @@ pub enum GrantCommand {
 /// Offline host operation, deliberately absent from the service command enum.
 /// `revoke` adds service-owned administrative grants to the mandatory authority
 /// administrators and bootstrap descendants revoked by the pure transition.
+/// `owner` is the new administrator's assertion over the recovery digest.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecoveryCommand {
@@ -349,6 +394,7 @@ pub struct RecoveryCommand {
     pub expected: Revision,
     pub administrator: GrantSpec,
     pub revoke: BTreeSet<GrantId>,
+    pub owner: PasskeyAssertion,
 }
 
 /// The latest durable ownership recovery receipt. Journal rotation retains this
@@ -424,10 +470,11 @@ impl std::fmt::Display for GrantId {
     }
 }
 
+/// Text and fixed-layout forms name the curve by context: a compressed P-256 point.
 impl TryFrom<&[u8]> for PrincipalId {
     type Error = AuthorityError;
     fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
-        Self::from_public_key(PublicKey::Secp256k1(
+        Self::from_public_key(PublicKey::P256(
             value.try_into().map_err(|_| AuthorityError::Invalid)?,
         ))
     }

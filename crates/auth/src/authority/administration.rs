@@ -32,6 +32,8 @@ pub struct CallerRecord {
     pub(super) actor: PrincipalId,
     pub(super) credential: CredentialId,
     pub(super) credential_revision: Revision,
+    pub(super) holder: CredentialHolder,
+    pub(super) session: SessionKind,
     pub(super) at: UnixMillis,
 }
 
@@ -53,6 +55,13 @@ impl CallerRecord {
     }
     pub const fn credential_revision(&self) -> Revision {
         self.credential_revision
+    }
+    /// The device the actor's credential is bound to, as recorded at the effect.
+    pub const fn holder(&self) -> CredentialHolder {
+        self.holder
+    }
+    pub const fn session(&self) -> SessionKind {
+        self.session
     }
     pub const fn at(&self) -> UnixMillis {
         self.at
