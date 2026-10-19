@@ -25,7 +25,11 @@ use commonware_consensus::{
 };
 use commonware_cryptography::bls12381::dkg::feldman_desmedt::deal;
 use commonware_cryptography::{Digestible as _, Signer, ed25519};
-use commonware_glue::stateful::{SyncPlan, db::p2p::standard as qmdb_resolver};
+use commonware_glue::stateful::{
+    SyncPlan,
+    db::p2p::standard as qmdb_resolver,
+    probe::{Config as ProbeConfig, Probe},
+};
 use commonware_p2p::{AddressableManager, authenticated::lookup};
 use commonware_parallel::Sequential;
 use commonware_runtime::{Metrics, Quota, Runner, Spawner, Supervisor as _, tokio};
@@ -49,6 +53,10 @@ use tracing::{info, warn};
 const NAMESPACE: &[u8] = b"hellas";
 const MAX_MESSAGE_SIZE: u32 = 1024 * 1024;
 const CHANNEL_BACKLOG: usize = 1024;
+/// How long a validator with empty state waits for peers to offer a floor.
+const PROBE_WAIT: Duration = Duration::from_secs(30);
+/// How long the floor probe waits for f + 1 replies before asking again.
+const PROBE_RETRY: Duration = Duration::from_secs(2);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn random_private_key() -> ed25519::PrivateKey {
@@ -911,6 +919,15 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
         let marshal_resolver_network = network.register(3, quota, CHANNEL_BACKLOG);
         let broadcast_blocks = network.register(4, quota, CHANNEL_BACKLOG);
         let qmdb_resolver_network = network.register(5, quota, CHANNEL_BACKLOG);
+        let probe_network = network.register(6, quota, CHANNEL_BACKLOG);
+
+        // Start networking as soon as every channel is registered. A validator
+        // with empty state must ask its peers for a state-sync floor before
+        // marshal can be built; marshal startup may also need the broadcast
+        // buffer, whose engine first subscribes to the peer set. Inbound
+        // traffic for consumers that have not started yet is dropped by p2p
+        // and retried by its sender.
+        let network_handle = network.start();
 
         // Publish process uptime as a prometheus gauge, updated every second.
         let uptime_gauge: Gauge<i64, AtomicI64> = Gauge::default();
@@ -964,7 +981,7 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
         )
         .expect("provisioned chain identity");
         let stateful_startup_context = context.child("stateful_startup");
-        let plan = SyncPlan::<_, Scheme, Standard<crate::HellasBlock>>::init(
+        let mut plan = SyncPlan::<_, Scheme, Standard<crate::HellasBlock>>::init(
             &stateful_startup_context,
             partition_prefix.clone(),
         )
@@ -972,6 +989,33 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
         let trust = crate::node::Trust::Genesis(std::sync::Arc::new(
             crate::ConsensusVerifier::new(&consensus_info).expect("provisioned consensus identity"),
         ));
+        let (probe, probe_mailbox) = Probe::new(ProbeConfig {
+            context: context.child("probe"),
+            // Sizing each sample's f + 1 needs the committee, which the
+            // certificate-only genesis trust does not carry.
+            provider: commonware_cryptography::certificate::ConstantProvider::new(scheme.clone()),
+            strategy: Sequential,
+            capacity: mailbox_size,
+            blocker: oracle.clone(),
+            minimum_epoch: Epoch::zero(),
+            retry_timeout: commonware_utils::NZDuration!(PROBE_RETRY),
+        });
+        let probe_handle = probe.start(probe_network);
+        // Peers may have pruned the blocks between genesis and their tip, so
+        // a validator that has never executed anything state-syncs from the
+        // highest finalization f + 1 peers vouch for. A whole network
+        // starting from genesis has no finalizations to offer; after the
+        // wait it replays from genesis as before.
+        if plan.may_state_sync() {
+            match ::tokio::time::timeout(PROBE_WAIT, probe_mailbox.subscribe()).await {
+                Ok(Ok(floor)) => {
+                    info!(round = ?floor.round(), "state syncing from a peer-certified floor");
+                    plan = plan.with_floor(floor);
+                }
+                Ok(Err(_)) => panic!("floor probe stopped"),
+                Err(_) => info!("no peer offered a finalization; starting from genesis"),
+            }
+        }
         crate::execution::pipeline::verify_floor(&plan, &trust)
             .expect("provisioned floor certificate");
         let startup = plan.sync_height();
@@ -1097,15 +1141,9 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
         let simplex_engine = simplex::Engine::new(context.child("simplex"), simplex_config);
 
         let marshal_handle = marshal_actor.start(stateful_mailbox.clone(), buffer, resolver);
+        // Serve peers' floor probes from this validator's marshal.
+        probe_mailbox.attach(marshal_mailbox.clone());
         let stateful_handle = stateful_actor.start();
-
-        // Start networking before waiting on the application databases. Marshal
-        // startup may look up a finalized-but-unstored block in the broadcast
-        // buffer, whose engine first subscribes to the peer set; state sync
-        // fetches from peers. Both are served only by a running network, so
-        // waiting first is a circular wait. Inbound consensus traffic is
-        // dropped by p2p while Simplex is not yet started.
-        let network_handle = network.start();
 
         let databases = stateful_mailbox.subscribe_databases().await;
         let restored = crate::execution::pipeline::restore(
@@ -1231,6 +1269,9 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
         let qmdb_resolver_waiter = qmdb_resolver_handle
             .map(|_| ShutdownTrigger::EngineExited)
             .boxed();
+        let probe_waiter = probe_handle
+            .map(|_| ShutdownTrigger::EngineExited)
+            .boxed();
         let light_client_server_waiter = light_client_server_handle.map(|handle| {
             handle
                 .map(|_| ShutdownTrigger::LightClientServerExited)
@@ -1244,6 +1285,7 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
             broadcast_waiter,
             stateful_waiter,
             qmdb_resolver_waiter,
+            probe_waiter,
             peer_service
                 .map(|_| ShutdownTrigger::ChainPeerServiceExited)
                 .boxed(),
