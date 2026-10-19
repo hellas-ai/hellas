@@ -56,13 +56,11 @@ fn runpod_preserves_entrypoint_and_mounts_persistent_identity() {
         container_registry_auth_id: Some("registry-credential-id".into()),
     });
     let provider = Cloud::new(CloudKind::Runpod).unwrap();
-    let mut credentials = Credentials::generate();
-    let owner = iroh::SecretKey::generate();
-    credentials.owner = Some(owner.public().to_string());
-    credentials.owner_enrollment = Some(hex::encode(
-        hellas_work::test_support::software_enrollment(7, *owner.public().as_bytes())
-            .canonical_bytes(),
-    ));
+    use hellas_work::test_support::actors::ROOT;
+    let credentials = Credentials::generate().owned_by(
+        ROOT.principal(),
+        hellas_auth::authority::NodeKey::from_public_key(ROOT.node_key().public_key()).unwrap(),
+    );
     let body = provider
         .create_body(&spec, credentials.env(&spec).unwrap())
         .unwrap();
@@ -84,6 +82,10 @@ fn runpod_preserves_entrypoint_and_mounts_persistent_identity() {
     assert_eq!(
         body["env"]["HELLAS_REMOTE_OWNER"],
         credentials.owner.unwrap()
+    );
+    assert_eq!(
+        body["env"]["HELLAS_REMOTE_OWNER_NODE"],
+        credentials.owner_node.unwrap()
     );
     assert!(body.get("dockerEntrypoint").is_none());
     assert!(body.get("dockerStartCmd").is_none());

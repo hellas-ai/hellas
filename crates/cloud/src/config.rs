@@ -1,3 +1,4 @@
+use hellas_auth::authority::{NodeKey, PrincipalId};
 use hellas_work::model::grant::records::{decode_enrollment, grant_transport};
 use std::{collections::BTreeMap, fs, path::Path};
 
@@ -54,12 +55,10 @@ pub enum ConfigError {
     ServeNul,
     #[error("expected 64 lowercase hex digits")]
     HexFormat,
-    #[error("owner enrollment exceeds its bound")]
-    OwnerBound,
-    #[error("owner enrollment does not match the authenticated owner transport")]
-    OwnerMismatch,
-    #[error("owner enrollment required for worker bootstrap")]
-    OwnerRequired,
+    #[error(
+        "a machine owner is a P-256 principal and the secp256k1 node key that administers it, both or neither"
+    )]
+    Owner,
     #[error("worker enrollment exceeds its bound")]
     EnrollmentBound,
     #[error("worker enrollment ID mismatch")]
@@ -68,10 +67,6 @@ pub enum ConfigError {
     EnrollmentTransport,
     #[error("image must be pinned as repository@sha256:<64 lowercase hex digits>")]
     ImagePin,
-    #[error("owner enrollment has no transport binding")]
-    OwnerBinding,
-    #[error("worker enrollment bundle unavailable; upgrade the managed worker")]
-    EnrollmentUnavailable,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -245,13 +240,16 @@ pub fn validate_hex(value: &str) -> Result<()> {
 #[serde(deny_unknown_fields)]
 pub struct Credentials {
     pub admin_secret: String,
+    /// The machine's administration secret. With an owner, a request also
+    /// proves the owner's node key over its connection.
     pub token: String,
-    /// Public transport identity allowed to administer and use this machine.
+    /// The principal that owns this machine: its compressed P-256 key, hex.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<String>,
-    /// Canonical public owner enrollment, hex encoded for bootstrap transports.
+    /// The owner's node key that administers this machine: its compressed
+    /// secp256k1 key, hex.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub owner_enrollment: Option<String>,
+    pub owner_node: Option<String>,
 }
 
 impl Credentials {
@@ -260,48 +258,44 @@ impl Credentials {
             admin_secret: hex::encode(iroh::SecretKey::generate().to_bytes()),
             token: hex::encode(iroh::SecretKey::generate().to_bytes()),
             owner: None,
-            owner_enrollment: None,
+            owner_node: None,
         }
     }
 
-    pub fn owner_principal(&self) -> Result<Option<hellas_rpc::ProviderEnrollmentBundle>> {
-        use hellas_work::model::grant::records::MAX_ENROLLMENT_BYTES;
-        let Some(bundle) = &self.owner_enrollment else {
-            return Ok(None);
+    /// Bind an owner: a principal and the node key that administers for it.
+    pub fn owned_by(mut self, owner: PrincipalId, node: NodeKey) -> Self {
+        self.owner = Some(hex::encode(owner.as_bytes()));
+        self.owner_node = Some(hex::encode(node.as_bytes()));
+        self
+    }
+
+    /// The owner principal and administering node key, both or neither.
+    pub fn owner(&self) -> Result<Option<(PrincipalId, NodeKey)>> {
+        let key = |value: &str| -> Result<[u8; 33]> {
+            hex::decode(value)?
+                .try_into()
+                .map_err(|_| ConfigError::Owner)
         };
-        if bundle.len() > MAX_ENROLLMENT_BYTES * 2 {
-            return Err(ConfigError::OwnerBound);
+        match (&self.owner, &self.owner_node) {
+            (None, None) => Ok(None),
+            (Some(owner), Some(node)) => Ok(Some((
+                PrincipalId::from_public_key(hellas_auth::PublicKey::P256(key(owner)?))
+                    .map_err(|_| ConfigError::Owner)?,
+                NodeKey::from_public_key(hellas_auth::PublicKey::Secp256k1(key(node)?))
+                    .map_err(|_| ConfigError::Owner)?,
+            ))),
+            _ => Err(ConfigError::Owner),
         }
-        let principal = decode_enrollment(&hex::decode(bundle)?)?;
-        let owner = self
-            .owner
-            .as_deref()
-            .ok_or(ConfigError::OwnerBinding)?
-            .parse::<iroh::EndpointId>()?;
-        if grant_transport(&principal)? != *owner.as_bytes() {
-            return Err(ConfigError::OwnerMismatch);
-        }
-        Ok(Some(principal))
-    }
-
-    pub fn require_owner_enrollment(&self) -> Result<()> {
-        if self.owner.is_some() && self.owner_principal()?.is_none() {
-            return Err(ConfigError::OwnerRequired);
-        }
-        Ok(())
     }
 
     pub fn secret_key(&self) -> Result<iroh::SecretKey> {
-        if let Some(owner) = &self.owner {
-            validate_hex(owner)?;
-            owner.parse::<iroh::EndpointId>()?;
-        }
-        self.owner_principal()?;
+        self.owner()?;
         validate_hex(&self.admin_secret)?;
         validate_hex(&self.token)?;
-        Ok(iroh::SecretKey::from_bytes(
-            &hex::decode(&self.admin_secret)?.try_into().unwrap(),
-        ))
+        let secret: [u8; 32] = hex::decode(&self.admin_secret)?
+            .try_into()
+            .map_err(|_| ConfigError::HexFormat)?;
+        Ok(iroh::SecretKey::from_bytes(&secret))
     }
 
     pub fn env(&self, spec: &Spec) -> Result<BTreeMap<String, String>> {
@@ -310,7 +304,6 @@ impl Credentials {
 
     pub fn env_for_args(&self, args: &[String]) -> Result<BTreeMap<String, String>> {
         self.secret_key()?;
-        self.require_owner_enrollment()?;
         let mut env = BTreeMap::from([
             ("HELLAS_REMOTE_KEY".into(), self.admin_secret.clone()),
             ("HELLAS_REMOTE_TOKEN".into(), self.token.clone()),
@@ -323,8 +316,8 @@ impl Credentials {
         if let Some(owner) = &self.owner {
             env.insert("HELLAS_REMOTE_OWNER".into(), owner.clone());
         }
-        if let Some(bundle) = &self.owner_enrollment {
-            env.insert("HELLAS_REMOTE_OWNER_ENROLLMENT".into(), bundle.clone());
+        if let Some(node) = &self.owner_node {
+            env.insert("HELLAS_REMOTE_OWNER_NODE".into(), node.clone());
         }
         Ok(env)
     }
@@ -335,37 +328,32 @@ impl Credentials {
 pub struct Enrollment {
     pub node_id: String,
     pub enrollment_id: String,
-    /// Absent only in legacy inventory records. Such a record cannot open an owner grant.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bundle: Option<String>,
+    /// The canonical enrollment, hex.
+    pub bundle: String,
 }
 
 impl Enrollment {
     pub fn validate(&self) -> Result<()> {
         self.node_id.parse::<iroh::EndpointId>()?;
         validate_hex(&self.enrollment_id)?;
-        if self.bundle.is_some() {
-            self.principal()?;
-        }
+        self.provider()?;
         Ok(())
     }
-    pub fn principal(&self) -> Result<hellas_rpc::ProviderEnrollmentBundle> {
+    /// The worker's verified provider enrollment: a machine, never a principal.
+    pub fn provider(&self) -> Result<hellas_rpc::ProviderEnrollmentBundle> {
         use hellas_work::model::grant::records::MAX_ENROLLMENT_BYTES;
-        let bundle = self
-            .bundle
-            .as_deref()
-            .ok_or(ConfigError::EnrollmentUnavailable)?;
+        let bundle = &self.bundle;
         if bundle.len() > MAX_ENROLLMENT_BYTES * 2 {
             return Err(ConfigError::EnrollmentBound);
         }
-        let principal = decode_enrollment(&hex::decode(bundle)?)?;
-        if principal.content_id().to_string() != self.enrollment_id {
+        let provider = decode_enrollment(&hex::decode(bundle)?)?;
+        if provider.content_id().to_string() != self.enrollment_id {
             return Err(ConfigError::EnrollmentId);
         }
-        if grant_transport(&principal)? != *self.node_id.parse::<iroh::EndpointId>()?.as_bytes() {
+        if grant_transport(&provider)? != *self.node_id.parse::<iroh::EndpointId>()?.as_bytes() {
             return Err(ConfigError::EnrollmentTransport);
         }
-        Ok(principal)
+        Ok(provider)
     }
 }
 

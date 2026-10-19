@@ -17,8 +17,6 @@ pub enum ManagedGrantError {
     Io(#[from] std::io::Error),
     #[error("grant journal binding changed; refusing startup")]
     BindingChanged,
-    #[error("owner enrollment changed; refusing startup")]
-    OwnerChanged,
     #[error("managed control path is not an owned socket")]
     SocketOwned,
     #[error("control socket changed during recovery")]
@@ -44,7 +42,6 @@ pub(crate) async fn prepare(
     data: &Path,
     private: &Path,
     provider: ProviderEnrollmentBundle,
-    owner: Option<&ProviderEnrollmentBundle>,
 ) -> Result<PathBuf> {
     // A separate private container filesystem may disappear while the mounted
     // identity survives. Never interpret that loss as a fresh allowance.
@@ -63,19 +60,6 @@ pub(crate) async fn prepare(
         if !stems.iter().any(|stem| stem == "grants") {
             return Err(ManagedGrantError::MissingJournal);
         }
-    }
-    let owner_binding = data.join("owner-enrollment.json");
-    if owner_binding.exists() {
-        let saved: Option<Vec<u8>> = crate::config::read_json(&owner_binding)?;
-        if saved != owner.map(|bundle| bundle.canonical_bytes()) {
-            return Err(ManagedGrantError::OwnerChanged);
-        }
-    } else {
-        crate::config::save_private(
-            &owner_binding,
-            &owner.map(|bundle| bundle.canonical_bytes()),
-            true,
-        )?;
     }
     // Validate/replay initialized authority before starting the worker, and
     // conservatively settle interrupted jobs. Open never bootstraps authority.
@@ -163,7 +147,7 @@ pub(crate) async fn ready(cli: &Path, identity: &Path, directory: &Path) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn principal() -> ProviderEnrollmentBundle {
+    fn enrollment() -> ProviderEnrollmentBundle {
         hellas_work::test_support::software_enrollment(
             7,
             *iroh::SecretKey::generate().public().as_bytes(),
@@ -199,10 +183,9 @@ mod tests {
         let private = root.path().join("private");
         crate::management::private_directory(&data).unwrap();
         crate::management::private_directory(&private).unwrap();
-        let provider = principal();
-        let owner = principal();
+        let provider = enrollment();
         assert!(matches!(
-            prepare(&data, &private, provider.clone(), Some(&owner)).await,
+            prepare(&data, &private, provider.clone()).await,
             Err(ManagedGrantError::Store(
                 hellas_work::work_store::grant::NodeStoreError::Uninitialized
             ))
@@ -217,38 +200,14 @@ mod tests {
             .await
             .unwrap(),
         );
-        prepare(&data, &private, provider.clone(), Some(&owner))
-            .await
-            .unwrap();
-        prepare(&data, &private, provider.clone(), Some(&owner))
-            .await
-            .unwrap();
-        assert!(
-            prepare(&data, &private, provider.clone(), Some(&principal()))
-                .await
-                .is_err()
-        );
-        assert!(
-            prepare(&data, &private, provider.clone(), None)
-                .await
-                .is_err()
-        );
-        assert!(
-            prepare(&data, &private, principal(), Some(&owner))
-                .await
-                .is_err()
-        );
+        prepare(&data, &private, provider.clone()).await.unwrap();
+        prepare(&data, &private, provider.clone()).await.unwrap();
+        assert!(prepare(&data, &private, enrollment()).await.is_err());
         let moved = root.path().join("moved");
         std::fs::rename(&private, &moved).unwrap();
-        assert!(
-            prepare(&data, &moved, provider.clone(), Some(&owner))
-                .await
-                .is_err()
-        );
+        assert!(prepare(&data, &moved, provider.clone()).await.is_err());
         crate::management::private_directory(&private).unwrap();
-        let error = prepare(&data, &private, provider, Some(&owner))
-            .await
-            .unwrap_err();
+        let error = prepare(&data, &private, provider).await.unwrap_err();
         assert!(error.to_string().contains("grant journal missing"));
         assert!(!private.join("grants").exists());
     }

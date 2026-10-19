@@ -767,7 +767,7 @@ async fn async_main() {
             command: commands::admin::AdminCommand::Serve { .. },
             ..
         }) => {
-            let result = cloud::run(command, cli.identity.as_deref()).await;
+            let result = cloud::run(command, cli.identity.as_deref(), cli.passkey.as_deref()).await;
             tracer_provider.shutdown();
             if let Err(err) = result {
                 eprintln!("error: {err:#}");
@@ -777,7 +777,7 @@ async fn async_main() {
         }
         #[cfg(unix)]
         command @ (Commands::Cloud(_) | Commands::Machines(_)) => {
-            let result = cloud::run(command, cli.identity.as_deref()).await;
+            let result = cloud::run(command, cli.identity.as_deref(), cli.passkey.as_deref()).await;
             tracer_provider.shutdown();
             if let Err(err) = result {
                 eprintln!("error: {err:#}");
@@ -1070,7 +1070,7 @@ async fn async_main() {
                 #[cfg(unix)]
                 let grant_target = if let Some(name) = machine.as_deref()
                     && output_cache != hellas_rpc::cache::CachePolicy::ReplayOnly {
-                    Some(cloud::machine_target(name, &local_identity, commands::contributions::require_principal(passkey)?, node_addrs.clone(), &work_application()?, &remote_trust.load()?).await?)
+                    Some(cloud::machine_target(name, &local_identity, passkey, node_addrs.clone(), &work_application()?, &remote_trust.load()?).await?)
                 } else { grant_target };
                 let grant_source = if let Some(target) = grant_target
                     && output_cache != hellas_rpc::cache::CachePolicy::ReplayOnly {

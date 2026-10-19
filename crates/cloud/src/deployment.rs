@@ -40,7 +40,6 @@ pub async fn create_with_credentials(
     state: &Path,
     credentials: Credentials,
 ) -> Result<String> {
-    credentials.require_owner_enrollment()?;
     credentials.secret_key()?;
     let _lock = lock_state(state)?;
     spec.validate()?;

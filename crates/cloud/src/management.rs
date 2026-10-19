@@ -1,12 +1,10 @@
 //! Identity-scoped management shared by the CLI and internal RPC.
 use hellas_auth::authority::UnixMillis;
-use hellas_work::model::grant::records::{grant_transport, verify_software_enrollment};
 use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
 };
 
-use iroh::SecretKey;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -15,7 +13,7 @@ use crate::{
         Credentials, Deployment, Enrollment, Spec, lock_state, read_json, save_private,
         validate_serve_args,
     },
-    wire::{self, Operation, Response},
+    wire::{self, Operation, Owner, Response},
 };
 
 pub type Result<T> = std::result::Result<T, ManagementError>;
@@ -46,8 +44,6 @@ pub enum ManagementError {
     Json(#[from] serde_json::Error),
     #[error(transparent)]
     Clock(#[from] std::time::SystemTimeError),
-    #[error("owner enrollment transport mismatch")]
-    EnrollmentTransport,
     #[error("machine belongs to another identity")]
     MachineOwner,
     #[error("machine was destroyed")]
@@ -70,8 +66,6 @@ pub enum ManagementError {
     NotRunning,
     #[error("HOME is unset")]
     MissingHome,
-    #[error("owner enrollment required for provisioning")]
-    EnrollmentRequired,
     #[error("invalid machine filename")]
     Filename,
     #[error("machine has not enrolled")]
@@ -154,57 +148,44 @@ enum Source {
 }
 
 pub struct Service {
-    key: SecretKey,
+    owner: Owner,
     root: PathBuf,
-    enrollment: Option<hellas_rpc::ProviderEnrollmentBundle>,
 }
 
 impl Service {
-    /// `base` is a trusted local state directory; each identity has its own inventory.
-    pub fn new(key: SecretKey, base: &Path) -> Result<Self> {
-        let root = base.join(key.public().to_string());
+    /// `base` is a trusted local state directory; each owner principal has its
+    /// own inventory, named by its curve and compressed key.
+    pub fn new(owner: Owner, base: &Path) -> Result<Self> {
+        let root = base.join(format!("p256-{}", hex::encode(owner.principal.as_bytes())));
         private_directory(&root)?;
-        Ok(Self {
-            key,
-            root,
-            enrollment: None,
-        })
+        Ok(Self { owner, root })
     }
 
-    pub fn open(key: SecretKey) -> Result<Self> {
+    pub fn open(owner: Owner) -> Result<Self> {
         let base = match std::env::var_os("HELLAS_MACHINES_DIR") {
             Some(path) => PathBuf::from(path),
             None => PathBuf::from(std::env::var_os("HOME").ok_or(ManagementError::MissingHome)?)
                 .join(".hellas/machines"),
         };
-        Self::new(key, &base)
+        Self::new(owner, &base)
     }
 
-    /// Attach the enrolled authority whose transport key authenticated management.
-    pub fn with_owner_enrollment(
-        mut self,
-        bundle: hellas_rpc::ProviderEnrollmentBundle,
-    ) -> Result<Self> {
-        verify_software_enrollment(&bundle)?;
-        let principal = bundle;
-        if grant_transport(&principal)? != *self.key.public().as_bytes() {
-            return Err(ManagementError::EnrollmentTransport);
-        }
-        self.enrollment = Some(principal);
-        Ok(self)
-    }
-
-    fn owner_bundle(&self) -> Result<String> {
-        Ok(hex::encode(
-            self.enrollment
-                .as_ref()
-                .ok_or(ManagementError::EnrollmentRequired)?
-                .canonical_bytes(),
-        ))
-    }
-
+    /// The owner principal, as machine records and agents name it.
     pub fn owner(&self) -> String {
-        self.key.public().to_string()
+        hex::encode(self.owner.principal.as_bytes())
+    }
+
+    pub fn principal(&self) -> hellas_auth::authority::PrincipalId {
+        self.owner.principal
+    }
+
+    fn credentials_for_owner(&self) -> Result<Credentials> {
+        Ok(Credentials::generate().owned_by(
+            self.owner.principal,
+            self.owner
+                .node_key()
+                .map_err(|_| crate::config::ConfigError::Owner)?,
+        ))
     }
 
     fn path(&self, name: &str) -> Result<PathBuf> {
@@ -291,7 +272,6 @@ impl Service {
     }
 
     pub async fn create(&self, spec: Spec, receipt: Option<PathBuf>) -> Result<Value> {
-        let bundle = self.owner_bundle()?;
         spec.validate()?;
         let _lock = lock_state(&self.root.join("inventory"))?;
         let path = self.path(&spec.name)?;
@@ -307,9 +287,7 @@ impl Service {
         if receipt.exists() {
             return Err(ManagementError::ReceiptExists);
         }
-        let mut credentials = Credentials::generate();
-        credentials.owner = Some(self.owner());
-        credentials.owner_enrollment = Some(bundle);
+        let credentials = self.credentials_for_owner()?;
         let machine = Machine {
             name: spec.name.clone(),
             owner: self.owner(),
@@ -338,16 +316,13 @@ impl Service {
         admin_addr: Option<SocketAddr>,
         serve_args: Vec<String>,
     ) -> Result<Value> {
-        let bundle = self.owner_bundle()?;
         let _lock = lock_state(&self.root.join("inventory"))?;
         let path = self.path(&name)?;
         if path.exists() {
             return Err(ManagementError::NameExists);
         }
         validate_serve_args(&serve_args)?;
-        let mut credentials = Credentials::generate();
-        credentials.owner = Some(self.owner());
-        credentials.owner_enrollment = Some(bundle);
+        let credentials = self.credentials_for_owner()?;
         // JSON avoids executable shell snippets; install this private file on the host.
         let bootstrap = credentials.env_for_args(&serve_args)?;
         save_private(&bootstrap_file, &bootstrap, true)?;
@@ -371,7 +346,7 @@ impl Service {
         let _lock = lock_state(&path)?;
         let mut machine = self.load(name)?;
         let (credentials, address) = self.credentials(&machine)?;
-        let response = wire::call_as(&credentials, address, operation, Some(&self.key)).await?;
+        let response = wire::call_as(&credentials, address, operation, Some(&self.owner)).await?;
         match &response {
             Response::Error { message } => return Err(ManagementError::Remote(message.clone())),
             Response::Status {
@@ -386,7 +361,7 @@ impl Service {
                 if let Some(expected) = &machine.enrollment {
                     if !(expected.node_id == enrollment.node_id
                         && expected.enrollment_id == enrollment.enrollment_id
-                        && (expected.bundle.is_none() || expected.bundle == enrollment.bundle))
+                        && expected.bundle == enrollment.bundle)
                     {
                         return Err(ManagementError::EnrollmentChanged);
                     }

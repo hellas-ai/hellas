@@ -1,17 +1,39 @@
 //! Thin adapter between the main CLI identity and the machine management library.
 use super::{Commands, identity};
 use anyhow::{Context, Result};
-use hellas_cloud::management::Service;
+use hellas_cloud::{management::Service, wire::Owner};
 use std::path::Path;
 
-pub(super) async fn run(command: Commands, identity_path: Option<&Path>) -> Result<()> {
+/// The owner as a machine administrator: the principal of `passkey`, and
+/// this node's keys to reach and administer its machines.
+pub(super) fn owner(
+    identity: &identity::LocalIdentity,
+    passkey: Option<&hellas_kernel::SoftPasskey>,
+) -> Result<Owner> {
+    Ok(Owner {
+        principal: crate::commands::contributions::require_principal(passkey)?,
+        transport: identity.transport_key.clone(),
+        node: identity.node_key.clone(),
+    })
+}
+
+pub(super) async fn run(
+    command: Commands,
+    identity_path: Option<&Path>,
+    passkey_path: Option<&Path>,
+) -> Result<()> {
     let needs_identity = match &command {
-        Commands::Cloud(args) => args.needs_identity() || identity_path.is_some(),
+        Commands::Cloud(args) => {
+            args.needs_identity() || identity_path.is_some() || passkey_path.is_some()
+        }
         _ => true,
     };
     let service = if needs_identity {
         let identity = identity::load_existing(identity_path)?;
-        Some(Service::open(identity.transport_key)?.with_owner_enrollment(identity.enrollment)?)
+        let passkey = passkey_path
+            .map(crate::commands::chain::passkey)
+            .transpose()?;
+        Some(Service::open(owner(&identity, passkey.as_ref())?)?)
     } else {
         None
     };
@@ -31,9 +53,9 @@ pub(super) async fn run(command: Commands, identity_path: Option<&Path>) -> Resu
                 _ => anyhow::bail!("management serve command required"),
             };
             let service = service.context("owner identity required")?;
-            let socket = socket
-                .map(Ok)
-                .unwrap_or_else(|| hellas_cloud::internal_rpc::default_socket(&service.owner()))?;
+            let socket = socket.map(Ok).unwrap_or_else(|| {
+                hellas_cloud::internal_rpc::default_socket(service.principal())
+            })?;
             eprintln!(
                 "management owner: {}\nmanagement socket: {}",
                 service.owner(),
@@ -50,19 +72,19 @@ pub(super) async fn run(command: Commands, identity_path: Option<&Path>) -> Resu
 pub(super) async fn machine_target(
     name: &str,
     identity: &identity::LocalIdentity,
-    owner: hellas_auth::authority::PrincipalId,
+    passkey: Option<&hellas_kernel::SoftPasskey>,
     addresses: Vec<std::net::SocketAddr>,
     application: &std::sync::Arc<hellas_sdk::node_control::profile::ClientProfile>,
     trust: &hellas_client::ProviderTrustAnchor,
 ) -> Result<hellas_sdk::grant_client::PinnedOffer> {
     use hellas_work::model::grant::{grant_network, owner_grant_id};
-    let enrollment = Service::open(identity.transport_key.clone())?
-        .resolve(name)
-        .await?;
-    let provider = enrollment.principal()?;
+    let owner = owner(identity, passkey)?;
+    let principal = owner.principal;
+    let enrollment = Service::open(owner)?.resolve(name).await?;
+    let provider = enrollment.provider()?;
     let network = grant_network();
     let target = hellas_sdk::grant_client::GrantTarget {
-        grant: owner_grant_id(network, provider.content_id(), owner),
+        grant: owner_grant_id(network, provider.content_id(), principal),
         network,
         provider: provider.clone(),
         generation: 0,
@@ -74,7 +96,7 @@ pub(super) async fn machine_target(
         .await?;
     let result = target
         .discover(
-            owner,
+            principal,
             &identity.node_key,
             &hellas_sdk::grant_client::GrantTransport::Remote(endpoint.clone()),
             trust,

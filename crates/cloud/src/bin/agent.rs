@@ -65,9 +65,8 @@ async fn main() -> Result<()> {
         admin_secret: setting("HELLAS_REMOTE_KEY").context("missing HELLAS_REMOTE_KEY")?,
         token: setting("HELLAS_REMOTE_TOKEN").context("missing HELLAS_REMOTE_TOKEN")?,
         owner: Some(setting("HELLAS_REMOTE_OWNER").context("missing HELLAS_REMOTE_OWNER")?),
-        owner_enrollment: Some(
-            setting("HELLAS_REMOTE_OWNER_ENROLLMENT")
-                .context("missing HELLAS_REMOTE_OWNER_ENROLLMENT")?,
+        owner_node: Some(
+            setting("HELLAS_REMOTE_OWNER_NODE").context("missing HELLAS_REMOTE_OWNER_NODE")?,
         ),
     };
     if let Some(args) = setting("HELLAS_REMOTE_ARGS") {

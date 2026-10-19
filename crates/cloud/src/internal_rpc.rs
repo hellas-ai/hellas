@@ -52,8 +52,8 @@ pub enum RpcError {
 
 const MAX_FRAME: u64 = 1024 * 1024;
 
-pub fn default_socket(owner: &str) -> Result<PathBuf> {
-    crate::config::validate_hex(owner)?;
+pub fn default_socket(owner: hellas_auth::authority::PrincipalId) -> Result<PathBuf> {
+    let owner = hex::encode(owner.as_bytes());
     let base = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);

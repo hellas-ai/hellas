@@ -20,6 +20,9 @@ use crate::{
     config::{Credentials, Enrollment, validate_hex},
     wire::{ALPN, MAX_MESSAGE, Operation, Request, Response},
 };
+use hellas_auth::Digest as SessionDigest;
+use hellas_auth::authority::{NodeKey, PrincipalId};
+use hellas_auth::signature::verify_digest_signature;
 
 pub type Result<T> = std::result::Result<T, AgentError>;
 
@@ -61,6 +64,8 @@ pub enum AgentError {
     Read(#[from] iroh::endpoint::ReadToEndError),
     #[error(transparent)]
     Closed(#[from] iroh::endpoint::ClosedStream),
+    #[error(transparent)]
+    Admin(#[from] crate::wire::AdminError),
     #[error("Hellas exited before grant provider became ready")]
     EarlyExit,
     #[error("worker enrollment exceeds its bound")]
@@ -140,7 +145,7 @@ impl Process {
             .env_remove("HELLAS_REMOTE_TOKEN")
             .env_remove("HELLAS_REMOTE_ARGS")
             .env_remove("HELLAS_REMOTE_OWNER")
-            .env_remove("HELLAS_REMOTE_OWNER_ENROLLMENT")
+            .env_remove("HELLAS_REMOTE_OWNER_NODE")
             .stdin(Stdio::null())
             .stdout(Stdio::from(std::io::stderr()))
             .stderr(Stdio::inherit())
@@ -243,7 +248,7 @@ impl Process {
                 .env_remove("HELLAS_REMOTE_TOKEN")
                 .env_remove("HELLAS_REMOTE_ARGS")
                 .env_remove("HELLAS_REMOTE_OWNER")
-                .env_remove("HELLAS_REMOTE_OWNER_ENROLLMENT")
+                .env_remove("HELLAS_REMOTE_OWNER_NODE")
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -316,7 +321,7 @@ async fn export_enrollment(
         .env_remove("HELLAS_REMOTE_TOKEN")
         .env_remove("HELLAS_REMOTE_ARGS")
         .env_remove("HELLAS_REMOTE_OWNER")
-        .env_remove("HELLAS_REMOTE_OWNER_ENROLLMENT")
+        .env_remove("HELLAS_REMOTE_OWNER_NODE")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -357,7 +362,7 @@ async fn identity_command(cli: &Path, identity: &Path, operation: &str) -> Resul
             .env_remove("HELLAS_REMOTE_TOKEN")
             .env_remove("HELLAS_REMOTE_ARGS")
             .env_remove("HELLAS_REMOTE_OWNER")
-            .env_remove("HELLAS_REMOTE_OWNER_ENROLLMENT")
+            .env_remove("HELLAS_REMOTE_OWNER_NODE")
             .kill_on_drop(true)
             .output(),
     )
@@ -372,7 +377,7 @@ async fn identity_command(cli: &Path, identity: &Path, operation: &str) -> Resul
 
 struct State {
     token: String,
-    owner: Option<iroh::EndpointId>,
+    owner: Option<(PrincipalId, NodeKey)>,
     enrollment: Enrollment,
     process: Mutex<Process>,
     downloads: Semaphore,
@@ -380,10 +385,36 @@ struct State {
 }
 
 impl State {
-    async fn dispatch(&self, peer: iroh::EndpointId, request: Request) -> Response {
-        if self.owner.is_some_and(|owner| owner != peer)
-            || !bool::from(self.token.as_bytes().ct_eq(request.token.as_bytes()))
-        {
+    /// The token, and with an owner bound, the owner node's proof over this
+    /// connection's `session`.
+    fn authorized(&self, session: SessionDigest, request: &Request) -> bool {
+        let token = bool::from(self.token.as_bytes().ct_eq(request.token.as_bytes()));
+        let owner = match self.owner {
+            None => true,
+            Some((_, node)) => request
+                .proof
+                .as_deref()
+                .and_then(|proof| hex::decode(proof).ok())
+                .and_then(|proof| <[u8; 64]>::try_from(proof).ok())
+                .is_some_and(|proof| {
+                    verify_digest_signature(
+                        &node.public_key(),
+                        &hellas_auth::Signature::Secp256k1(proof),
+                        session,
+                    )
+                    .is_ok()
+                }),
+        };
+        token && owner
+    }
+
+    fn owner(&self) -> Option<String> {
+        self.owner
+            .map(|(principal, _)| hex::encode(principal.as_bytes()))
+    }
+
+    async fn dispatch(&self, session: SessionDigest, request: Request) -> Response {
+        if !self.authorized(session, &request) {
             return Response::Error {
                 message: "unauthorized".into(),
             };
@@ -392,7 +423,7 @@ impl State {
             match request.operation {
                 Operation::Status => Ok(Response::Status {
                     enrollment: self.enrollment.clone(),
-                    owner: self.owner.map(|owner| owner.to_string()),
+                    owner: self.owner(),
                     running: self.process.lock().await.running()?,
                 }),
                 Operation::Restart => {
@@ -401,7 +432,7 @@ impl State {
                     process.start().await?;
                     Ok(Response::Status {
                         enrollment: self.enrollment.clone(),
-                        owner: self.owner.map(|owner| owner.to_string()),
+                        owner: self.owner(),
                         running: process.running()?,
                     })
                 }
@@ -410,7 +441,7 @@ impl State {
                     process.configure(configuration).await?;
                     Ok(Response::Status {
                         enrollment: self.enrollment.clone(),
-                        owner: self.owner.map(|owner| owner.to_string()),
+                        owner: self.owner(),
                         running: process.running()?,
                     })
                 }
@@ -446,20 +477,23 @@ pub async fn run_until(
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<()> {
     let secret = options.credentials.secret_key()?;
-    options.credentials.require_owner_enrollment()?;
     crate::config::validate_serve_args(&options.serve_args)?;
-    let owner = options.credentials.owner_principal()?;
+    let owner = options.credentials.owner()?;
+    let pinned = (
+        options.credentials.owner.clone(),
+        options.credentials.owner_node.clone(),
+    );
     tokio::fs::create_dir_all(&options.data).await?;
     // Refuse silent reassignment, including a restart that omits the owner.
     let binding = options.data.join("owner.json");
     let _lease = crate::config::lock_state(&binding)?;
     if binding.exists() {
-        let saved: Option<String> = crate::config::read_json(&binding)?;
-        if saved != options.credentials.owner {
+        let saved: (Option<String>, Option<String>) = crate::config::read_json(&binding)?;
+        if saved != pinned {
             return Err(AgentError::OwnerChanged);
         }
     } else {
-        crate::config::save_private(&binding, &options.credentials.owner, true)?;
+        crate::config::save_private(&binding, &pinned, true)?;
     }
     let content = options.data.join("content");
     tokio::fs::create_dir_all(&content).await?;
@@ -477,14 +511,13 @@ pub async fn run_until(
     identity_command(&options.cli, &identity, "init").await?;
     let bundle = export_enrollment(&options.cli, &identity).await?;
     let enrollment = Enrollment {
-        bundle: Some(hex::encode(bundle.canonical_bytes())),
+        bundle: hex::encode(bundle.canonical_bytes()),
         node_id: identity_command(&options.cli, &identity, "show-node-id").await?,
         enrollment_id: identity_command(&options.cli, &identity, "show-enrollment-id").await?,
     };
     enrollment.validate()?;
     let default_grant_config =
-        crate::managed_grants::prepare(&options.data, &configuration_dir, bundle, owner.as_ref())
-            .await?;
+        crate::managed_grants::prepare(&options.data, &configuration_dir, bundle).await?;
     let mut builder = Endpoint::builder(presets::N0)
         .secret_key(secret)
         .alpns(vec![ALPN.to_vec()]);
@@ -508,11 +541,7 @@ pub async fn run_until(
     process.start().await?;
     let state = Arc::new(State {
         token: options.credentials.token,
-        owner: options
-            .credentials
-            .owner
-            .map(|owner| owner.parse())
-            .transpose()?,
+        owner,
         enrollment,
         process: Mutex::new(process),
         content,
@@ -537,7 +566,8 @@ pub async fn run_until(
                         let (mut send, mut recv) = tokio::time::timeout(Duration::from_secs(10), connection.accept_bi()).await??;
                         let bytes = tokio::time::timeout(Duration::from_secs(10), recv.read_to_end(MAX_MESSAGE)).await??;
                         let request: Request = serde_json::from_slice(&bytes)?;
-                        let response = state.dispatch(connection.remote_id(), request).await;
+                        let session = crate::wire::session_digest(&connection)?;
+                        let response = state.dispatch(session, request).await;
                         send.write_all(&serde_json::to_vec(&response)?).await?;
                         send.finish()?;
                         // Keep the connection alive until the reply was consumed.
