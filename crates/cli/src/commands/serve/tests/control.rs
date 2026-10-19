@@ -132,6 +132,8 @@ impl Daemon {
                 AdminCommand::Bootstrap {
                     root_grant: hex::encode(root_grant.0),
                     state: offline(),
+                    bearer_scope: None,
+                    bearer_out: None,
                 },
                 Some(&passkey),
             ),
@@ -543,4 +545,91 @@ async fn offline_recovery_publishes_a_usable_replacement_credential() {
     hellas_auth::assert_err!(daily(&original), auth::AuthorityError::Credential);
     let replacement = node_control::profile::read_credential(&recovered_path).unwrap();
     assert_eq!(daily(&replacement).unwrap().subject(), daemon.scope.subject);
+}
+
+#[tokio::test]
+async fn offline_bootstrap_issues_a_separate_gateway_bearer() {
+    let root = tempfile::tempdir().unwrap();
+    let identity = crate::identity::load_or_create(Some(&root.path().join("identity"))).unwrap();
+    let (passkey_file, owner) = passkey(root.path(), "operator.passkey", 0x33);
+    let authority = auth::AuthorityId(Digest::hash(b"gateway bearer fixture"));
+    let now = auth::UnixMillis::now().unwrap_or_default();
+    let permission = hellas_work::operations::Operation::named(hellas_work::node::GATEWAY_INVOKE)
+        .unwrap()
+        .permission(authority, None)
+        .unwrap();
+    let administrator = common_node::admin_spec(
+        authority,
+        owner,
+        &[(hellas_work::node::GATEWAY_INVOKE, permission.resource)],
+        (now, auth::UnixMillis(now.0 + 3_600_000)),
+        (3_600_000, 0),
+        &[],
+    );
+    let bearer_scope = auth::GrantSpec {
+        authority,
+        subject: owner,
+        permissions: [permission].into(),
+        issuance: None,
+        delegation_depth: 0,
+        not_before: now,
+        expires: auth::UnixMillis(now.0 + 3_600_000),
+    };
+    let admin_file = root.path().join("admin.json");
+    std::fs::write(&admin_file, serde_json::to_vec(&administrator).unwrap()).unwrap();
+    let bearer_file = root.path().join("bearer-scope.json");
+    std::fs::write(&bearer_file, serde_json::to_vec(&bearer_scope).unwrap()).unwrap();
+    let journal = root.path().join("http-authority");
+    let (admin_out, bearer_out) = (
+        root.path().join("admin.credential"),
+        root.path().join("http.credential"),
+    );
+    run(
+        offline_args(
+            AdminCommand::Bootstrap {
+                root_grant: hex::encode([0; 16]),
+                state: OfflineArgs {
+                    journal: journal.clone(),
+                    administrator: admin_file.clone(),
+                    credential_scope: admin_file,
+                    holder: holder(root.path(), "holder.json", &identity),
+                    credential_out: admin_out.clone(),
+                },
+                bearer_scope: Some(bearer_file),
+                bearer_out: Some(bearer_out.clone()),
+            },
+            Some(&passkey_file),
+        ),
+        &identity,
+    )
+    .await
+    .unwrap();
+    let admin = node_control::profile::read_credential(&admin_out).unwrap();
+    let bearer = node_control::profile::read_credential(&bearer_out).unwrap();
+    assert_ne!(admin.id(), bearer.id());
+    let store = hellas_work::work_store::grant::NodeStore::open(
+        &journal,
+        hellas_work::model::grant::grant_network(),
+        None,
+        now,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        store
+            .state()
+            .authority()
+            .credential(bearer.id())
+            .unwrap()
+            .holder(),
+        auth::CredentialHolder::Bearer
+    );
+    let node = hellas_work::node::NodeCoordinator::new(store, Arc::new(move || now));
+    // The bearer authenticates by its secret alone, for gateway.invoke only;
+    // the device-held bootstrap credential does not.
+    let caller = node.authenticate(&bearer).await.unwrap();
+    node.authorize_gateway(&caller, auth::GrantId([0; 16]))
+        .await
+        .unwrap();
+    assert!(node.authenticate(&admin).await.is_err());
 }

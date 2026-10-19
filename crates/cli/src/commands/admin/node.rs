@@ -425,17 +425,28 @@ async fn offline(
     identity: &LocalIdentity,
     passkey: &hellas_kernel::SoftPasskey,
 ) -> Result<()> {
-    let (state, root, revision) = match command {
-        AdminCommand::Bootstrap { root_grant, state } => {
+    let (state, root, revision, bearer) = match command {
+        AdminCommand::Bootstrap {
+            root_grant,
+            state,
+            bearer_scope,
+            bearer_out,
+        } => {
             let id: GrantId = root_grant
                 .parse()
                 .context("root grant must be 16 bytes of hex")?;
-            (state, Some(id), None)
+            let bearer = match (bearer_scope, bearer_out) {
+                (Some(scope), Some(out)) => {
+                    Some((read::<GrantSpec>(&scope)?, credential_output(&out)?, out))
+                }
+                _ => None,
+            };
+            (state, Some(id), None, bearer)
         }
         AdminCommand::Recover {
             expected_revision,
             state,
-        } => (state, None, Some(Revision(expected_revision))),
+        } => (state, None, Some(Revision(expected_revision)), None),
         _ => anyhow::bail!("offline command required"),
     };
     let OfflineArgs {
@@ -478,7 +489,23 @@ async fn offline(
                 now,
             )
             .await?;
-            drop(store);
+            if let Some((scope, output, out)) = bearer {
+                let node = hellas_sdk::work::node::NodeCoordinator::new(
+                    store,
+                    std::sync::Arc::new(|| {
+                        hellas_auth::authority::UnixMillis::now().unwrap_or_default()
+                    }),
+                );
+                let caller = node
+                    .authenticate_session(&secret, SessionKey::Passkey(passkey))
+                    .await?;
+                let (_, bearer) = node
+                    .issue_credential(&caller, root, scope, CredentialHolder::Bearer)
+                    .await?;
+                profile::save_credential(output, &out, &bearer).context(
+                    "authority committed but bearer publication failed; revoke the bearer before retrying",
+                )?;
+            }
             secret
         }
         (None, Some(expected)) => {

@@ -121,6 +121,14 @@ pub enum AdminCommand {
         root_grant: String,
         #[command(flatten)]
         state: OfflineArgs,
+        /// JSON GrantSpec for a bearer credential (`gateway.invoke` only),
+        /// issued by the administrator's passkey session on the new
+        /// authority; local HTTP clients present it.
+        #[arg(long, requires = "bearer_out")]
+        bearer_scope: Option<PathBuf>,
+        /// New private file for that bearer credential.
+        #[arg(long, requires = "bearer_scope")]
+        bearer_out: Option<PathBuf>,
     },
     /// Replace lost administration offline; invalidate prior credentials and sessions.
     Recover {
