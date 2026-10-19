@@ -181,10 +181,9 @@ impl RunningWork {
     pub fn deadline(&self) -> Option<Instant> {
         self.deadline
     }
-    pub fn deadline_with(&self, maximum: std::time::Duration) -> Instant {
-        let provider = self.started + maximum;
-        self.deadline
-            .map_or(provider, |deadline| deadline.min(provider))
+    /// The signed grant deadline; work funded without one stops after `fallback`.
+    pub fn deadline_or(&self, fallback: std::time::Duration) -> Instant {
+        self.deadline.unwrap_or(self.started + fallback)
     }
     pub fn elapsed_millis(&self) -> u64 {
         self.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
@@ -298,6 +297,31 @@ mod tests {
             drop(running);
             assert_eq!(capacity.available_permits(), 1);
         }
+    }
+
+    #[tokio::test]
+    async fn signed_grant_deadlines_are_not_clamped_to_the_payment_fallback() {
+        let capacity = Arc::new(Semaphore::new(2));
+        let fallback = Duration::from_secs(90);
+        let signed = Instant::now() + Duration::from_secs(20 * 60);
+        let running = WorkAdmission::grant(
+            permit(&capacity, CapacityDomain::Fetch),
+            signed,
+            Cancellation::new(),
+            async { Ok(()) },
+        )
+        .reserve(CapacityDomain::Fetch, async { panic!("reserved twice") })
+        .await
+        .unwrap()
+        .dispatch()
+        .await
+        .unwrap();
+        assert_eq!(running.deadline_or(fallback), signed);
+        let paid = AdmittedWork::payment(permit(&capacity, CapacityDomain::Fetch))
+            .dispatch()
+            .await
+            .unwrap();
+        assert!(paid.deadline_or(fallback) <= Instant::now() + fallback);
     }
 
     #[tokio::test]

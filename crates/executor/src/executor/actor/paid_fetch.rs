@@ -136,7 +136,7 @@ impl Executor {
                 }
                 Ok::<_, ExecutorError>(())
             };
-            let deadline = _running.deadline_with(std::time::Duration::from_secs(90));
+            let deadline = _running.deadline_or(std::time::Duration::from_secs(90));
             let joined = tokio::select! {
                 biased;
                 () = _running.cancelled() => {

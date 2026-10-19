@@ -40,8 +40,19 @@ struct FixtureBuilder {
     completion: Completion,
     transport: TransportMode,
     inspect: Option<fn(&hellas_rpc::fetch::FetchInput)>,
+    paced_chunks: usize,
+    max_job_millis: Option<u64>,
 }
 impl FixtureBuilder {
+    /// Body chunks, and the usage chunk after them, each wait for `backend.pace`.
+    fn paced(mut self, chunks: usize) -> Self {
+        self.paced_chunks = chunks;
+        self
+    }
+    fn with_max_job_millis(mut self, millis: u64) -> Self {
+        self.max_job_millis = Some(millis);
+        self
+    }
     fn inspect_request(mut self, inspect: fn(&hellas_rpc::fetch::FetchInput)) -> Self {
         self.inspect = Some(inspect);
         self
@@ -72,19 +83,30 @@ impl FixtureBuilder {
         let resource = &mut allowance.definition.policies[0];
         resource.name = "chat".into();
         use_https(resource, template.clone());
+        let mut events = Reply::http(
+            200,
+            "text/event-stream",
+            match self.usage {
+                UsageReport::Reported => {
+                    "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2,\"total_tokens\":5}}\n\ndata: [DONE]\n\n"
+                }
+                UsageReport::Missing => "data: [DONE]\n\n",
+            },
+        );
+        if let Some(millis) = self.max_job_millis {
+            allowance.definition.max_job_millis = std::num::NonZeroU64::new(millis).unwrap();
+        }
+        let pace = (self.paced_chunks > 0).then(|| {
+            let chunk = Reply::http(200, "text/event-stream", "\n").remove(1);
+            let tail = events.split_off(1);
+            events.extend(std::iter::repeat_n(chunk, self.paced_chunks).chain(tail));
+            Completion::Permits(Arc::new(Semaphore::new(0)))
+        });
         let backend = Backend {
             slots: Arc::new(Semaphore::new(2)),
             finish: self.completion,
-            reply: Reply::events(Reply::http(
-                200,
-                "text/event-stream",
-                match self.usage {
-                    UsageReport::Reported => {
-                        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2,\"total_tokens\":5}}\n\ndata: [DONE]\n\n"
-                    }
-                    UsageReport::Missing => "data: [DONE]\n\n",
-                },
-            )),
+            pace,
+            reply: Reply::events(events),
             inspect: self.inspect,
             ..Backend::default()
         };
@@ -129,6 +151,8 @@ impl Fixture {
             completion: Completion::Immediate,
             transport: TransportMode::Local,
             inspect: None,
+            paced_chunks: 0,
+            max_job_millis: None,
         }
     }
     async fn command(&self, command: WorkControlCommand) -> WorkControlReply {
@@ -381,5 +405,99 @@ async fn revoked_credentials_close_cached_sessions_before_refusing_reconnection(
     assert_eq!(http.status().await, reqwest::StatusCode::FORBIDDEN);
     assert_eq!(fixture.host.backend.calls.load(Ordering::SeqCst), 0);
     http.server.shutdown().await.unwrap();
+    fixture.shutdown().await;
+}
+
+/// The 5 s session timeout bounds admission and each wait between chunks;
+/// a stream that keeps producing may run to the signed `max_job_millis`.
+#[tokio::test]
+async fn streams_outlast_the_admission_budget_while_they_progress() {
+    let chunks = 5;
+    let fixture = Fixture::builder()
+        .paced(chunks)
+        .with_max_job_millis(60_000)
+        .hold_completion()
+        .build()
+        .await;
+    let pace = fixture.host.backend.pace.clone().unwrap();
+    let mut stream = fixture.gateway.fetch(fixture.request(None)).unwrap();
+    assert!(matches!(
+        within(stream.next()).await.unwrap().unwrap(),
+        OutputEvent::Adaptor(AdaptorEvent::Http(HttpResponseEvent::Head { .. }))
+    ));
+    tokio::time::pause();
+    for _ in 0..chunks {
+        tokio::time::advance(std::time::Duration::from_secs(4)).await;
+        pace.release();
+        assert!(matches!(
+            stream.next().await.unwrap().unwrap(),
+            OutputEvent::Adaptor(AdaptorEvent::Http(HttpResponseEvent::Body { .. }))
+        ));
+    }
+    tokio::time::resume();
+    pace.release(); // The usage chunk.
+    fixture.host.backend.finish.release();
+    let mut terminal = false;
+    while let Some(event) = within(stream.next()).await {
+        terminal |= event.unwrap().terminal().is_some();
+    }
+    assert!(terminal);
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn idle_streams_are_cut_off_after_the_session_timeout() {
+    let fixture = Fixture::builder()
+        .paced(1)
+        .with_max_job_millis(60_000)
+        .hold_completion()
+        .build()
+        .await;
+    let mut stream = fixture.gateway.fetch(fixture.request(None)).unwrap();
+    within(stream.next()).await.unwrap().unwrap();
+    tokio::time::pause();
+    let started = tokio::time::Instant::now();
+    assert_err!(stream.next().await.unwrap(), WorkGatewayError::Timeout(_));
+    // The idle timer, not the 60 s job limit, ended the stream.
+    assert!(started.elapsed() < std::time::Duration::from_secs(60));
+    tokio::time::resume();
+    // Accepted work continues: release its chunk and usage chunk, then finish.
+    let pace = fixture.host.backend.pace.as_ref().unwrap();
+    pace.release();
+    pace.release();
+    fixture.host.backend.finish.release();
+    fixture.shutdown().await;
+}
+
+/// The host cancels work, and closes its connection, when the session that
+/// delivers it expires. A longer allowance is cut to what the session carries.
+#[tokio::test]
+async fn remote_jobs_end_before_the_session_that_delivers_them() {
+    let fixture = Fixture::builder()
+        .remote()
+        .with_max_job_millis(20 * 60_000)
+        .build()
+        .await;
+    fixture.result(None).await.unwrap();
+    let channel = fixture.gateway.session.lock().await.store().channel().id;
+    let state = fixture.host.world.snapshot().await;
+    let terminals: Vec<_> = state
+        .channel(channel)
+        .unwrap()
+        .job_book()
+        .terminals()
+        .collect();
+    let [terminal] = terminals[..] else {
+        panic!("one finished job")
+    };
+    let a = terminal.outcome.authorization;
+    // Signed 30 s before its acceptance deadline; one 5 s idle period is kept
+    // for the terminal state before the 15 min session ends.
+    let span = a.terminal_deadline_ms.0 - (a.acceptance_deadline_ms.0 - 30_000);
+    let carried = hellas_auth::authority::MAX_SESSION_LIFETIME_MS - 5_000;
+    assert!(
+        span <= carried && span > carried - 1_000,
+        "signed {span} ms"
+    );
     fixture.shutdown().await;
 }

@@ -219,10 +219,11 @@ impl ConnectionWork {
 }
 
 /// Called only after independently pinned confidential_open succeeded.
+/// Returns when a grant session expires; payment connections have none.
 pub(crate) async fn connect_work(
     transport: &IrohTransport,
     application: Option<(&ClientProfile, &ProducerSigningKey)>,
-) -> Result<(), WireStatus> {
+) -> Result<Option<tokio::time::Instant>, WireStatus> {
     tokio::time::timeout(TIMEOUT, async {
         let (mut send, mut recv) = transport
             .connection()
@@ -244,13 +245,14 @@ pub(crate) async fn connect_work(
                 handshake::Framing::Substream,
             )
             .await
+            .map(Some)
         } else {
             send.write_all(&[PAYMENT]).await.map_err(|_| denied())?;
             send.shutdown().await.map_err(|_| denied())?;
             if recv.read_u8().await.map_err(|_| denied())? != PAYMENT {
                 return Err(denied());
             }
-            eof(&mut recv).await
+            eof(&mut recv).await.map(|()| None)
         }
     })
     .await

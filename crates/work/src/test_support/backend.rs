@@ -99,6 +99,8 @@ pub struct Backend {
     pub queued: Option<Arc<Notify>>,
     pub started: Arc<Notify>,
     pub finish: Completion,
+    /// Released once before each prefix after the first.
+    pub pace: Option<Completion>,
     pub cancelled: Arc<Notify>,
     pub stop_on_cancel: bool,
     pub reply: Reply,
@@ -113,6 +115,7 @@ impl Default for Backend {
             queued: None,
             started: Arc::new(Notify::new()),
             finish: Completion::Notified(Arc::new(Notify::new())),
+            pace: None,
             cancelled: Arc::new(Notify::new()),
             stop_on_cancel: false,
             reply: Reply::text("private-grant-result", 1),
@@ -209,7 +212,12 @@ impl WorkBackend for Backend {
         let key = self.signer.clone();
         let mut output =
             FetchOutputTranscriptBuilder::new(request.input_commitment, request.assurance, &key);
-        for event in prefixes {
+        for (index, event) in prefixes.iter().enumerate() {
+            if index > 0
+                && let Some(pace) = &self.pace
+            {
+                pace.wait().await;
+            }
             progress(
                 output
                     .push_event(encode_fetch_event_payload(event).unwrap())

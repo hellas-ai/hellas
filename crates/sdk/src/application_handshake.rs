@@ -87,7 +87,10 @@ pub(super) async fn connect<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     recv: &mut R,
     send: &mut W,
     framing: Framing,
-) -> Result<(), WireStatus> {
+) -> Result<Instant, WireStatus> {
+    // The host starts its session clock after this byte arrives, so the
+    // returned instant never outlasts the session the host enforces.
+    let started = Instant::now();
     // QUIC does not expose an opened stream until its first byte is sent.
     send.write_all(&[VERSION]).await.map_err(|_| denied())?;
     send.flush().await.map_err(|_| denied())?;
@@ -96,6 +99,11 @@ pub(super) async fn connect<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     let signature = challenge
         .sign(authority, binding, credential.id(), identity)
         .map_err(|_| denied())?;
+    let lifetime = challenge
+        .session_expires
+        .0
+        .checked_sub(challenge.issued_at.0)
+        .ok_or_else(denied)?;
     let response = encode_response(credential, &signature).map_err(|_| denied())?;
     send_message(send, &response).await?;
     if matches!(framing, Framing::Substream) {
@@ -109,7 +117,9 @@ pub(super) async fn connect<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     if matches!(framing, Framing::Substream) {
         eof(recv).await?;
     }
-    Ok(())
+    started
+        .checked_add(Duration::from_millis(lifetime))
+        .ok_or_else(denied)
 }
 
 async fn send_message<W: AsyncWrite + Unpin>(send: &mut W, bytes: &[u8]) -> Result<(), WireStatus> {

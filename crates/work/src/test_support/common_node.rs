@@ -240,7 +240,8 @@ impl WorkAdmin {
             service: crate::grant_service::WorkAdministration::new(
                 service,
                 policies,
-                std::num::NonZeroU64::new(300_000).unwrap(),
+                // Longer than one Work session, as deployed allowances may be.
+                std::num::NonZeroU64::new(20 * 60_000).unwrap(),
             )
             .unwrap(),
             caller,
