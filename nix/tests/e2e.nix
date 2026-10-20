@@ -578,7 +578,8 @@ in
         followerLog = "/tmp/chain-settlement/follower.log";
         allocations = [
           "${chainSettlementMaker}:100"
-          "${chainSettlementTaker}:100"
+          "${chainSettlementTaker}:50"
+          "${chainSettlementNative}:50"
         ];
         validatorSeed = 17;
         startPort = 31300;
@@ -719,7 +720,8 @@ in
       )
       # Scenario A: two genesis P-256 owners open with WebAuthn and mutually close.
       maker_genesis = wait_coin(maker, 100)
-      taker_genesis = wait_coin(taker, 100)
+      taker_genesis = wait_coin(taker, 50)
+      native_coin = wait_coin(native, 50)
       height = int(latest_block()["height"])
       baseline = follower_height()
       opened = machine.succeed(
@@ -728,7 +730,7 @@ in
           "--taker-key /tmp/chain-settlement/taker.key --taker-auth webauthn "
           f"--maker-funding {maker_genesis} --taker-funding {taker_genesis} "
           f"--protocol 1 --timeout {height + 1000000} "
-          f"--timeout-payout {maker}:100 --timeout-payout {taker}:100"
+          f"--timeout-payout {maker}:100 --timeout-payout {taker}:50"
       )
       edge_a = parse_fields(opened)["edge_id"]
       wait_edge(edge_a, True)
@@ -737,10 +739,35 @@ in
       assert f"maker {maker}" in edge_state.splitlines(), edge_state
       assert f"taker {taker}" in edge_state.splitlines(), edge_state
 
+      # A close may pay only its committed owners. Keep this invalid request
+      # value-conserving so it exercises the third-owner restriction.
+      balances_before = {owner: coin_map(owner)[0] for owner in [maker, taker, native]}
+      refused = machine.succeed(
+          f"{home} {cli} chain close --rpc {rpc} --edge-id {edge_a} --kind mutual "
+          f"--payout {maker}:80 --payout {taker}:20 --payout {native}:50 "
+          "--maker-key /tmp/chain-settlement/maker.key --maker-auth webauthn "
+          "--taker-key /tmp/chain-settlement/taker.key --taker-auth webauthn"
+      )
+      assert "enqueued, pending inclusion" in refused.splitlines(), refused
+      refusal_height = int(latest_block()["height"])
+      wait_progress(
+          lambda: True if int(latest_block()["height"]) >= refusal_height + 3 else None,
+          lambda: "chain did not finalize three blocks after the third-owner close",
+      )
+      edge_after = parse_fields(edge_output(edge_a))
+      edge_before = parse_fields(edge_state)
+      # The snapshot root may advance; every exposed edge field must stay put.
+      edge_after.pop("state_root", None)
+      edge_before.pop("state_root", None)
+      assert edge_after == edge_before, (edge_before, edge_after)
+      for owner, before in balances_before.items():
+          after, output = coin_map(owner)
+          assert after == before, f"rejected close changed {owner}: {output}"
+
       baseline = follower_height()
       machine.succeed(
           f"{home} {cli} chain close --rpc {rpc} --edge-id {edge_a} --kind mutual "
-          f"--payout {maker}:80 --payout {taker}:70 --payout {native}:50 "
+          f"--payout {maker}:80 --payout {taker}:70 "
           "--maker-key /tmp/chain-settlement/maker.key --maker-auth webauthn "
           "--taker-key /tmp/chain-settlement/taker.key --taker-auth webauthn"
       )
@@ -748,9 +775,9 @@ in
       wait_follower(baseline)
       maker_coin = wait_coin(maker, 80)
       assert wait_coin(taker, 70)
-      native_coin = wait_coin(native, 50)
+      assert wait_coin(native, 50) == native_coin
 
-      # Scenario B: the untagged k1 payout funds an all-native edge and close.
+      # Scenario B: the native genesis coin funds an all-native edge and close.
       height = int(latest_block()["height"])
       baseline = follower_height()
       opened = machine.succeed(
