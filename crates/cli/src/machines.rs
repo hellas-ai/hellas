@@ -5,10 +5,10 @@ use std::path::PathBuf;
 #[derive(clap::Args)]
 pub struct MachinesArgs {
     #[arg(long, global = true)]
-    provider: String,
+    provider: Option<String>,
     /// Existing HTTP secret-source configuration: explicit env, file or refresh.
     #[arg(long, global = true)]
-    credential_source: PathBuf,
+    credential_source: Option<PathBuf>,
     #[arg(long, global = true)]
     provider_config: Option<PathBuf>,
     #[command(subcommand)]
@@ -21,13 +21,15 @@ enum MachineCommand {
     Destroy { id: String },
 }
 pub async fn run(args: MachinesArgs) -> Result<()> {
+    let provider_name = args.provider.context("--provider is required")?;
+    let source = args.credential_source.context("--credential-source is required")?;
     let credential = serde_json::from_slice(&hellas_private::read_bounded_regular_file(
-        &args.credential_source, 64 * 1024,
+        &source, 64 * 1024,
     )?).context("invalid provider credential source")?;
     let config = args.provider_config.map(|path| -> Result<serde_json::Value> {
         Ok(serde_json::from_slice(&hellas_private::read_bounded_regular_file(&path, 64 * 1024)?)?)
     }).transpose()?.unwrap_or_else(|| serde_json::json!({}));
-    let provider = hellas_cloud::open(&args.provider, credential, config)?;
+    let provider = hellas_cloud::open(&provider_name, credential, config)?;
     match args.command {
         MachineCommand::Create { spec } => {
             let spec = serde_json::from_slice(&hellas_private::read_bounded_regular_file(&spec, 64 * 1024)?)?;

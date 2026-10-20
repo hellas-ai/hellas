@@ -275,7 +275,7 @@ fn admin_target_is_shared_and_requires_an_identity_pin() {
             let Commands::Admin(args) = Cli::try_parse_from(argv).unwrap().command else {
                 panic!("admin");
             };
-            assert_eq!(args.node_enrollment, Some(PathBuf::from("node.enrollment")));
+            assert_eq!(args.node_enrollment.as_deref(), Some("node.enrollment"));
             assert_eq!(args.addresses.len(), 2);
         }
         for invalid in [

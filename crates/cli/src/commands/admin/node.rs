@@ -42,7 +42,6 @@ pub async fn inspect_offline(args: AdminArgs) -> Result<()> {
         ensure!(
             args.profile.is_none()
                 && args.control_socket.is_none()
-                && args.node_id.is_none()
                 && args.node_enrollment.is_none()
                 && args.addresses.is_empty(),
             "offline inspection does not connect to a daemon"
@@ -67,7 +66,7 @@ pub async fn run(
 ) -> Result<()> {
     if matches!(args.command, AdminCommand::BootstrapRemote { .. }) {
         ensure!(args.profile.is_none() && args.control_socket.is_none() && args.node_enrollment.is_none()
-            && args.node_id.is_none() && args.addresses.is_empty(), "bootstrap uses the invitation's pin and addresses");
+            && args.addresses.is_empty(), "bootstrap uses the invitation's pin and addresses");
         return bootstrap_remote(args.command, identity, passkey.context("bootstrap requires --passkey")?).await;
     }
     match &args.command {
@@ -75,9 +74,7 @@ pub async fn run(
             ensure!(
                 args.profile.is_none()
                     && args.control_socket.is_none()
-                    && args.node_id.is_none()
-                    && args.node_id.is_none()
-                && args.node_enrollment.is_none()
+                        && args.node_enrollment.is_none()
                     && args.addresses.is_empty(),
                 "offline initialization does not connect to a daemon"
             );
@@ -89,16 +86,12 @@ pub async fn run(
     let key = passkey.map_or(SessionKey::Node(&identity.node_key), SessionKey::Passkey);
     let profile =
         profile::ClientProfile::load(args.profile.as_deref().context("--profile is required")?)?;
-    let remote = match (args.node_id, args.node_enrollment) {
-        (Some(node), None) => Some(node),
-        (None, Some(path)) => {
-            let provider = decode_enrollment(&hellas_private::read_bounded_regular_file(
-                &path, hellas_work::model::grant::records::MAX_ENROLLMENT_BYTES)?)?;
-            Some(iroh::EndpointId::from_bytes(&grant_transport(&provider)?)?)
-        }
-        (None, None) => None,
-        _ => anyhow::bail!("select one remote pin"),
-    };
+    let remote = args.node_enrollment.map(|target| -> Result<iroh::EndpointId> {
+        if let Ok(pin) = target.parse() { return Ok(pin); }
+        let provider = decode_enrollment(&hellas_private::read_bounded_regular_file(
+            Path::new(&target), hellas_work::model::grant::records::MAX_ENROLLMENT_BYTES)?)?;
+        Ok(iroh::EndpointId::from_bytes(&grant_transport(&provider)?)?)
+    }).transpose()?;
     if let Some(node) = remote {
         // The application identity is proved inside the authenticated session.
         // A stable endpoint key permits explicit remote ingress admission; use
@@ -194,7 +187,7 @@ where
         AdminCommand::ConfigureProvider { command } => {
             let update: node_control::configuration::ProviderUpdate = read(&command)?;
             let status = client.configure_provider(hellas_rpc::pb::host::ConfigureProviderRequest {
-                authorization:authorization.0.to_vec(), update:canonical_dag_cbor(&update)?,
+                authorization:authorization.0.to_vec(), update:Some(update),
             }).await?;
             print_status(status)?;
         }
@@ -632,9 +625,7 @@ async fn bootstrap_remote(
 }
 
 fn print_status(status: hellas_rpc::pb::host::HostStatus) -> Result<()> {
-    let configuration = if status.provider_configuration.is_empty() { None } else {
-        Some(decode_dag_cbor::<node_control::configuration::ProviderMetadata>(&status.provider_configuration)?)
-    };
+    let configuration = status.provider_configuration;
             let machine = status.machine.map(|m| -> Result<_> {
                 let limits: Vec<hellas_work::model::grant::budget::Limit> = decode_dag_cbor(&m.limits)?;
                 Ok(serde_json::json!({"revision": m.revision, "max_in_flight": m.max_in_flight, "limits": limits}))

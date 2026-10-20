@@ -60,7 +60,7 @@ fn apply(path: &Path, update: ProviderUpdate) -> CliResult<Vec<u8>> {
     let old = hellas_private::read_bounded_regular_file(path, 64 * 1024)?;
     let mut file: FetchConfigFile = serde_json::from_slice(&old)?;
     anyhow::ensure!(file.revision == update.expected_revision, "stale provider configuration revision");
-    match update.change {
+    match update.change.context("configuration change is required")? {
         UpstreamChange::SetEndpoint(endpoint) => {
             anyhow::ensure!(!endpoint.service.is_empty() && !endpoint.method.is_empty() && !endpoint.allowed_hosts.is_empty(), "endpoint must name a route and hosts");
             let replacement = hellas_providers::HttpProviderConfig { allowed_hosts:endpoint.allowed_hosts,
@@ -75,11 +75,11 @@ fn apply(path: &Path, update: ProviderUpdate) -> CliResult<Vec<u8>> {
                     destination:FetchDestination::Http { config:replacement }, capabilities:Default::default() });
             }
         }
-        UpstreamChange::RemoveEndpoint { service, method } => {
+        UpstreamChange::RemoveEndpoint(UpstreamRoute { service, method }) => {
             let position = file.routes.iter().position(|r| r.service == service && r.method == method).context("unknown route")?;
             file.routes.remove(position);
         }
-        UpstreamChange::RemoveKey { service, method, key } => {
+        UpstreamChange::RemoveKey(UpstreamKeyId { service, method, key }) => {
             anyhow::ensure!(http(&mut file, &service, &method)?.credentials.remove(&key).is_some(), "unknown upstream key");
         }
         change @ (UpstreamChange::AddKey(_) | UpstreamChange::ReplaceKey(_)) => {
@@ -93,7 +93,10 @@ fn apply(path: &Path, update: ProviderUpdate) -> CliResult<Vec<u8>> {
                 let url = reqwest::Url::parse(origin)?;
                 anyhow::ensure!(url.scheme() == "https" && url.host_str().is_some_and(|host| config.allowed_hosts.iter().any(|allowed| allowed == host)), "key must use an existing endpoint host");
             }
-            let parent = path.parent().context("configuration needs a parent")?;
+            let key_root = key_directory(path)?;
+            hellas_private::create_dir_all_durable(&key_root)?;
+            hellas_private::restrict_directory(&key_root)?;
+            let parent = key_root.as_path();
             let temporary = hellas_private::private_tempfile(parent, ".upstream-key-", ".json")?;
             let secret = serde_json::to_vec(&serde_json::json!({"secret":key.secret}))?;
             use std::io::Write;
@@ -102,9 +105,10 @@ fn apply(path: &Path, update: ProviderUpdate) -> CliResult<Vec<u8>> {
             temporary.as_file().sync_all()?;
             let (_, secret_path) = temporary.keep()?;
             hellas_private::sync_directory(parent)?;
+            let trust_roots = config.credentials.get(&key.key).and_then(|old| old.trust_roots.clone());
             config.credentials.insert(key.key, hellas_providers::HttpCredentialConfig {
                 allowed_origins:key.allowed_origins, allowed_paths:key.allowed_paths,
-                allowed_methods:key.allowed_methods, trust_roots:None, header_name:key.header_name,
+                allowed_methods:key.allowed_methods, trust_roots, header_name:key.header_name,
                 source:hellas_providers::HttpSecretConfig { secret_env:None, secret_file:Some(secret_path),
                     secret_field:Some("secret".into()), refresh:None, prefix:key.prefix },
             });
@@ -134,7 +138,9 @@ fn clean_unused_keys(path: &Path) -> CliResult<()> {
             _ => vec![],
         }
     }).collect();
-    let parent = path.parent().context("configuration needs a parent")?;
+    let key_root = key_directory(path)?;
+    if !key_root.try_exists()? { return Ok(()); }
+    let parent = key_root.as_path();
     for entry in std::fs::read_dir(parent)? {
         let entry = entry?;
         if entry.file_name().as_encoded_bytes().starts_with(b".upstream-key-")
@@ -144,4 +150,48 @@ fn clean_unused_keys(path: &Path) -> CliResult<()> {
     }
     hellas_private::sync_directory(parent)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn endpoint() -> UpstreamChange {
+        UpstreamChange::SetEndpoint(UpstreamEndpoint { service:"api".into(), method:"fetch".into(),
+            allowed_hosts:vec!["example.com".into()], allow_private_addresses:false })
+    }
+    fn key(secret: &str) -> UpstreamKey {
+        UpstreamKey { service:"api".into(), method:"fetch".into(), key:"account".into(),
+            allowed_origins:vec!["https://example.com".into()], allowed_paths:vec!["/v1/responses".into()],
+            allowed_methods:vec!["POST".into()], header_name:"authorization".into(), prefix:"Bearer ".into(), secret:secret.into() }
+    }
+    #[test]
+    fn key_updates_are_add_only_or_replace_only_and_status_contains_no_secret() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("fetch.json");
+        hellas_private::write_atomically(&path, ".writing", br#"{"routes":[]}"#).unwrap();
+        apply(&path, ProviderUpdate { expected_revision:0, change:Some(endpoint()) }).unwrap();
+        apply(&path, ProviderUpdate { expected_revision:1, change:Some(UpstreamChange::AddKey(key("first-private-key"))) }).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert!(apply(&path, ProviderUpdate { expected_revision:2, change:Some(UpstreamChange::AddKey(key("replacement-through-add"))) }).is_err());
+        assert_eq!(before, std::fs::read(&path).unwrap());
+        let status = serde_json::to_string(&metadata(&read(&path).unwrap())).unwrap();
+        assert!(status.contains("account"));
+        assert!(!status.contains("private-key"));
+        assert!(!status.contains("secret_file"));
+        apply(&path, ProviderUpdate { expected_revision:2, change:Some(UpstreamChange::ReplaceKey(key("second-private-key"))) }).unwrap();
+        clean_unused_keys(&path).unwrap();
+        let files:Vec<_> = std::fs::read_dir(key_directory(&path).unwrap()).unwrap().map(|e| e.unwrap().path()).collect();
+        assert_eq!(files.len(), 1);
+        assert!(files.iter().all(|p| !String::from_utf8_lossy(&std::fs::read(p).unwrap()).contains("first-private-key")));
+        assert!(apply(&path, ProviderUpdate { expected_revision:2, change:Some(UpstreamChange::RemoveKey(UpstreamKeyId { service:"api".into(),method:"fetch".into(),key:"account".into() })) }).is_err());
+        apply(&path, ProviderUpdate { expected_revision:3, change:Some(UpstreamChange::RemoveKey(UpstreamKeyId { service:"api".into(),method:"fetch".into(),key:"account".into() })) }).unwrap();
+        clean_unused_keys(&path).unwrap();
+        assert_eq!(std::fs::read_dir(key_directory(&path).unwrap()).unwrap().count(), 0);
+    }
+}
+
+fn key_directory(path: &Path) -> CliResult<PathBuf> {
+    let mut name = path.file_name().context("configuration needs a file name")?.to_os_string();
+    name.push(".keys");
+    Ok(path.with_file_name(name))
 }

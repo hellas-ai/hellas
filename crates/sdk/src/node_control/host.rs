@@ -256,8 +256,7 @@ impl Runtime {
     }
     pub(super) fn decorate(&self, status: &mut HostStatus) -> Result<(), WireStatus> {
         self.with(|state| {
-            status.provider_configuration = state.configuration.as_ref()
-                .and_then(|metadata| canonical_dag_cbor(metadata).ok()).unwrap_or_default();
+            status.provider_configuration = state.configuration.clone();
             status.provider = self.has_provider.then(|| {
                 let mut service = service_status(
                     state.provider_state,

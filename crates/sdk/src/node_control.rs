@@ -527,10 +527,10 @@ impl HostControlHandler for ControlSession {
 
     async fn configure_provider(&self, request: ConfigureProviderRequest) -> Result<HostStatus, WireStatus> {
         let authorization = grant_id(&request.authorization)?;
-        let update: configuration::ProviderUpdate = decode_bounded(&request.update, MAX_COMMAND_BYTES).map_err(|_| invalid())?;
+        let update = request.update.filter(|update| update.change.is_some()).ok_or_else(invalid)?;
         let caller = self.caller().await?;
         let receiver = self.node.host_action(caller, authorization, hellas_work::node::HOST_PROVIDER_CONFIGURE, |_| {
-            if update.requires_passkey() { caller.session().step_up().map_err(|_| denied())?; }
+            if configuration::requires_passkey(&update) { caller.session().step_up().map_err(|_| denied())?; }
             self.host.as_ref().ok_or_else(unsupported)?.configure(update)
         }).await.map_err(node_error)??;
         receiver.await.map_err(|_| unavailable())??;

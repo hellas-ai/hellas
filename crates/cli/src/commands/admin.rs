@@ -4,7 +4,6 @@ mod node;
 pub use node::{inspect_offline, run};
 
 #[derive(clap::Args)]
-#[command(group(clap::ArgGroup::new("remote_node").args(["node_enrollment", "node_id"])))]
 pub struct AdminArgs {
     /// Private application credential and independently provisioned server trust.
     #[arg(long, global = true)]
@@ -12,18 +11,14 @@ pub struct AdminArgs {
     /// Local node socket; defaults to this identity's control.sock.
     #[arg(long, global = true, conflicts_with_all = ["node_enrollment", "addresses"])]
     pub control_socket: Option<PathBuf>,
-    /// The remote node's enrollment, verified out of band; it pins the node's
-    /// transport key.
+    /// The remote node's enrollment file or exact transport pin, verified out of band.
     #[arg(long = "node", global = true)]
-    pub node_enrollment: Option<PathBuf>,
-    /// Exact transport pin obtained through the authenticated machine console.
-    #[arg(long, global = true, conflicts_with_all = ["node_enrollment", "control_socket"])]
-    pub node_id: Option<iroh::EndpointId>,
+    pub node_enrollment: Option<String>,
     #[arg(
         long = "address",
         global = true,
         value_delimiter = ',',
-        requires = "remote_node"
+        requires = "node_enrollment"
     )]
     pub addresses: Vec<std::net::SocketAddr>,
     #[command(subcommand)]

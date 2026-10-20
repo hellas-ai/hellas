@@ -93,6 +93,10 @@ fn regenerate() {
     // The handwritten Debug implementation omits issued application secrets.
     // NB: prost's `bytes(["."])` (decode `bytes` fields as `bytes::Bytes`
     // for zero-copy) is disabled because current call sites produce `Vec<u8>`.
+    for name in ["ProviderUpdate", "UpstreamRoute", "UpstreamKeyId", "UpstreamEndpoint", "UpstreamKey", "ProviderMetadata", "EndpointMetadata"] {
+        config.type_attribute(format!(".hellas.host.v1.{name}"), "#[derive(serde::Serialize, serde::Deserialize)]");
+    }
+    config.skip_debug([".hellas.host.v1.UpstreamKey"]);
     config.out_dir(&out_dir);
     edge_index_codegen::configure(&mut config, &fds, &out_dir);
     config

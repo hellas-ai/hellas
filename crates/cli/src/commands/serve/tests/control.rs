@@ -68,7 +68,6 @@ fn offline_args(command: AdminCommand, passkey: Option<&Path>) -> Invocation {
             profile: None,
             control_socket: None,
             node_enrollment: None,
-            node_id: None,
             addresses: vec![],
             command,
         },
@@ -243,7 +242,7 @@ impl Daemon {
         Invocation(
             AdminArgs {
                 profile: Some(profile),
-                node_enrollment: Some(contact),
+                node_enrollment: Some(contact.to_str().unwrap().into()),
                 addresses: self
                     .handle
                     .as_ref()

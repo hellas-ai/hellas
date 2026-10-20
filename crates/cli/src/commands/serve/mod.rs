@@ -10,7 +10,6 @@ use hellas_rpc::Assurance;
 use iroh::SecretKey;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
-use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -236,7 +235,7 @@ fn shutdown_signal() -> std::io::Result<impl std::future::Future<Output = std::i
 }
 
 fn load_fetch_config(path: &std::path::Path) -> CliResult<FetchRouteRegistry> {
-    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let bytes = hellas_private::read_bounded_regular_file(path, 64 * 1024).with_context(|| format!("failed to read {}", path.display()))?;
     let file: FetchConfigFile = serde_json::from_slice(&bytes)
         .with_context(|| format!("failed to parse {}", path.display()))?;
 
