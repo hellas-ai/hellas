@@ -3,7 +3,8 @@ use crate::domain::{
     Coin, MAX_EDGE_LIFETIME_BLOCKS, Object, ObjectId, ObjectKind, SettlementKey, Transaction,
     coin_object_id, edge_object_id, genesis_object_id, registry_chunk_object_id,
 };
-use commonware_codec::EncodeSize;
+use commonware_codec::{Encode, EncodeSize};
+use commonware_cryptography::{Hasher as _, Sha256};
 use commonware_glue::stateful::db::DatabaseSet;
 use commonware_runtime::Spawner;
 use commonware_storage::Context as StorageContext;
@@ -129,7 +130,12 @@ where
                 let _ = next;
                 return Err(err);
             }
-            Err((next, _err)) => {
+            Err((next, err)) => {
+                warn!(
+                    txid = %Sha256::hash(&tx.encode()),
+                    error = ?err,
+                    "dropping rejected transaction from proposal"
+                );
                 batches = next;
             }
         }
