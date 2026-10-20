@@ -238,6 +238,27 @@ impl NodeCoordinator {
         decision.finish(result)
     }
 
+    /// Bounded, current administration metadata; never secret or verifier material.
+    pub async fn inspect(
+        &self,
+        caller: &AuthenticatedCaller,
+        authorization: GrantId,
+        query: InspectionQuery,
+    ) -> Result<AuthorityInspection, NodeStoreError> {
+        self.checked(
+            caller,
+            authorization,
+            "authority.inspect",
+            async |store, now| {
+                Ok(store
+                    .state()
+                    .authority()
+                    .inspect(caller, authorization, &query, now)?)
+            },
+        )
+        .await
+    }
+
     pub async fn grant(
         &self,
         caller: &AuthenticatedCaller,

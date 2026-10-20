@@ -644,3 +644,67 @@ async fn offline_recovery_changes_the_authority_once_and_journals_no_secret() {
         }
     }
 }
+
+#[tokio::test]
+async fn offline_inspection_holds_identity_lock_and_preserves_journal_bytes() {
+    let directory = tempfile::tempdir().unwrap();
+    let (store, secret) = bootstrap(directory.path()).await;
+    let query = auth::InspectionQuery::Credentials { after: None };
+    assert!(
+        NodeStore::inspect_offline(directory.path(), network(), &query)
+            .await
+            .is_err()
+    );
+    let expected_revision = store.state().authority().revision();
+    drop(store);
+    let path = directory.path().join("journals/grants.sqlite");
+    let before = std::fs::read(&path).unwrap();
+    let view = NodeStore::inspect_offline(directory.path(), network(), &query)
+        .await
+        .unwrap();
+    assert_eq!(view.revision, expected_revision);
+    let auth::InspectionRecords::Credentials { records, .. } = view.records else {
+        panic!("credentials")
+    };
+    assert!(records.iter().any(|c| c.id == secret.id()));
+    assert_eq!(std::fs::read(path).unwrap(), before);
+    // Opening the live store after inspection still sees the exact same revision.
+    let store = NodeStore::open_initialized(directory.path(), network())
+        .await
+        .unwrap();
+    assert_eq!(store.state().authority().revision(), expected_revision);
+}
+
+#[tokio::test]
+async fn offline_inspection_recovers_the_revision_after_a_lost_recovery_receipt() {
+    let directory = tempfile::tempdir().unwrap();
+    drop(bootstrap(directory.path()).await);
+    let query = auth::InspectionQuery::Credentials { after: None };
+    for generation in [2, 3] {
+        let before = NodeStore::inspect_offline(directory.path(), network(), &query)
+            .await
+            .unwrap();
+        let expected = before.revision;
+        // Lose both the committed receipt and its unpublished credential.
+        drop(
+            NodeStore::recover_offline(
+                directory.path(),
+                network(),
+                expected,
+                crate::test_support::common_node::approval_for(
+                    auth::Ownership::Recover { expected },
+                    admin(),
+                    admin(),
+                ),
+                UnixMillis(generation),
+            )
+            .await
+            .unwrap(),
+        );
+        let after = NodeStore::inspect_offline(directory.path(), network(), &query)
+            .await
+            .unwrap();
+        assert_eq!(after.generation, generation);
+        assert!(after.revision > expected);
+    }
+}

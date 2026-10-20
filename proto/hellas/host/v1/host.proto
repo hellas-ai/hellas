@@ -5,6 +5,7 @@ package hellas.host.v1;
 // Administrative lifecycle control. Hosts must authorize each connection before
 // dispatch, regardless of whether the carrier is local or remote.
 service HostControl {
+  rpc InspectAuthority(InspectAuthorityRequest) returns (InspectAuthorityResponse);
   // Canonical Auth GrantCommand; the authenticated connection supplies the actor.
   rpc GrantControl(GrantControlRequest) returns (GrantControlResponse);
   rpc IssueCredential(IssueCredentialRequest) returns (IssueCredentialResponse);
@@ -142,3 +143,13 @@ message WorkControlRequest {
   bytes command = 2;
 }
 message WorkControlResponse { bytes reply = 1; }
+
+message InspectAuthorityRequest {
+  bytes authorization = 1;
+  // Canonical bounded Auth InspectionQuery.
+  bytes query = 2;
+}
+message InspectAuthorityResponse {
+  // Canonical metadata-only AuthorityInspection. Never a credential verifier.
+  bytes reply = 1;
+}

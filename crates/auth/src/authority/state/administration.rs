@@ -195,7 +195,7 @@ impl AuthorityState {
         Ok(())
     }
 
-    pub(super) fn admin_scope(
+    pub(in crate::authority) fn admin_scope(
         &self,
         scope: &GrantSpec,
         operation: &str,

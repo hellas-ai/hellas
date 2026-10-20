@@ -526,3 +526,39 @@ cookies, duplicate authorization headers and old 64-character static tokens are
 refused. Every new HTTP request authenticates against current Auth state; revoking
 its credential or grant, or reaching expiry, refuses subsequent requests. Accepted
 Work keeps its separate application authority and recovery/settlement obligations.
+
+### Inspecting and reconciling administration
+
+`admin inspect QUERY.json` reads authority metadata through the selected profile.
+Queries are `{"Grants":{"after":null}}`, `{"Credentials":{"after":null}}`,
+`{"Grant":{"id":ID}}`, or `{"Credential":{"id":ID}}`. IDs use the same JSON
+representation as grant commands (16-byte arrays). A page contains at most eight
+records; pass its `next` ID as `after` for the next page. Stop when `next` is null.
+Every reply includes the authority revision, generation and root grant. If the
+revision changes between pages, restart enumeration before making decisions from
+that combined view.
+
+Both the selected live grant and the credential must carry `grant.administer`
+and an issuance ceiling covering each returned record. Enumeration omits records
+outside either ceiling; singular queries do not distinguish missing from hidden
+records. Revoked and expired records remain inspectable until normal capacity
+reclamation. Credential metadata contains its ID, scope, holder, generation,
+revision and revocation flag, never its secret or verifier.
+
+After a lost grant update reply, inspect that grant's revision before retrying.
+After a lost credential issuance reply, enumerate credentials and identify the
+issued scope and device holder before revoking an orphaned credential. Identical
+concurrent issuances cannot be distinguished by purpose: reconcile the matching
+credentials with their holders instead of guessing which one was delivered.
+
+With the daemon stopped, `admin inspect-offline --journal PATH QUERY.json` reads
+these same bounded views without an identity, credential or passkey. It takes the
+writer's exclusive identity lock and reads the existing journal without creating
+state, running startup recovery, changing clocks or migrating the database. Use
+its revision for `admin recover --expected-revision`, including after a recovery
+whose reply or credential file was lost. Successful bootstrap and recovery print
+the committed revision; credential publication failures report it too.
+
+An authorized stale revision returns `FailedPrecondition`, requiring inspection
+before retrying. Invalid authority records and invalid Work limits return
+`InvalidArgument`; authorization failures remain non-disclosing.

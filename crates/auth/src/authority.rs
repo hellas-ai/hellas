@@ -5,6 +5,7 @@
 mod administration;
 mod contact;
 mod credentials;
+mod inspection;
 mod ownership;
 mod passkey;
 mod sessions;
@@ -16,6 +17,10 @@ pub use contact::{ContactCard, MAX_CONTACT_NAME_BYTES};
 pub use credentials::{
     AuthenticatedCaller, Credential, CredentialCommand, CredentialHolder, CredentialId,
     CredentialSecret, SessionKind,
+};
+pub use inspection::{
+    AuthorityInspection, CredentialMetadata, INSPECTION_PAGE_SIZE, InspectionQuery,
+    InspectionRecords,
 };
 pub use ownership::{Ownership, ownership_digest};
 pub use passkey::PasskeyAssertion;

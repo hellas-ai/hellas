@@ -6,6 +6,7 @@ mod credentials;
 mod delegation;
 mod escalation;
 mod identity;
+mod inspection;
 mod lifecycle;
 mod recovery;
 mod sessions;

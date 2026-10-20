@@ -331,7 +331,7 @@ impl AuthorityState {
         now: UnixMillis,
     ) -> Result<(), AuthorityError> {
         self.check_spec(&spec, now)?;
-        let old = self.target(id, expected)?;
+        let old = self.grants.get(&id).ok_or(AuthorityError::Missing)?;
         self.administrator(actor, authorization, GRANT_ISSUE, &spec, now, true)?;
         self.check_self_assignment(actor, authorization, &spec)?;
         if old.spec.subject == actor {
@@ -345,6 +345,7 @@ impl AuthorityState {
                 return Err(AuthorityError::Denied);
             }
         }
+        self.target(id, expected)?;
         let updated = Grant {
             spec,
             revision: self.revision.next().ok_or(AuthorityError::Capacity)?,
@@ -362,7 +363,7 @@ impl AuthorityState {
         now: UnixMillis,
     ) -> Result<(), AuthorityError> {
         self.check_time(now)?;
-        let old = self.target(id, expected)?;
+        let old = self.grants.get(&id).ok_or(AuthorityError::Missing)?;
         self.live_lineage(authorization, now)?;
         let authorizer = &self.grants[&authorization].spec;
         let own_delegation = old.origin
@@ -376,6 +377,7 @@ impl AuthorityState {
         if !own_delegation {
             self.administrator(actor, authorization, GRANT_REVOKE, &old.spec, now, false)?;
         }
+        self.target(id, expected)?;
         let updated = Grant {
             revoked: true,
             revision: self.revision.next().ok_or(AuthorityError::Capacity)?,

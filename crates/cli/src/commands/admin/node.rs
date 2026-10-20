@@ -10,8 +10,9 @@ use hellas_auth::authority::{
 };
 use hellas_rpc::{
     pb::host::{
-        BindProviderRequest, GetHostStatusRequest, GrantControlRequest, IssueCredentialRequest,
-        RevokeCredentialRequest, SetMachineCapacityRequest, WorkControlRequest,
+        BindProviderRequest, GetHostStatusRequest, GrantControlRequest, InspectAuthorityRequest,
+        IssueCredentialRequest, RevokeCredentialRequest, SetMachineCapacityRequest,
+        WorkControlRequest,
     },
     protocol::value::{canonical_dag_cbor, decode_dag_cbor},
     services::host_control::HostControlClientImpl,
@@ -33,6 +34,26 @@ fn read<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     Ok(serde_json::from_slice(
         &hellas_private::read_bounded_regular_file(path, 64 * 1024)?,
     )?)
+}
+
+/// Offline inspection neither loads nor creates a machine identity or passkey.
+pub async fn inspect_offline(args: AdminArgs) -> Result<()> {
+    if let AdminCommand::InspectOffline { journal, command } = &args.command {
+        ensure!(
+            args.profile.is_none()
+                && args.control_socket.is_none()
+                && args.node_enrollment.is_none()
+                && args.addresses.is_empty(),
+            "offline inspection does not connect to a daemon"
+        );
+        let query: hellas_auth::authority::InspectionQuery = read(command)?;
+        let inspection =
+            NodeStore::inspect_offline(journal, hellas_work::model::grant::grant_network(), &query)
+                .await?;
+        println!("{}", serde_json::to_string(&inspection)?);
+        return Ok(());
+    }
+    anyhow::bail!("offline inspection command required")
 }
 
 /// With the principal's `passkey` the session is a passkey session, which
@@ -127,6 +148,22 @@ where
     T::Stream: Send + 'static,
 {
     match command {
+        AdminCommand::Inspect { command } => {
+            let query: hellas_auth::authority::InspectionQuery = read(&command)?;
+            let response = client
+                .inspect_authority(InspectAuthorityRequest {
+                    authorization: authorization.0.to_vec(),
+                    query: canonical_dag_cbor(&query)?,
+                })
+                .await?;
+            ensure!(
+                response.reply.len() <= MAX_ADMIN_BYTES,
+                "authority reply exceeds limit"
+            );
+            let inspection: hellas_auth::authority::AuthorityInspection =
+                decode_dag_cbor(&response.reply)?;
+            println!("{}", serde_json::to_string(&inspection)?);
+        }
         AdminCommand::Status => {
             let status = client
                 .get_host_status(GetHostStatusRequest {
@@ -478,7 +515,7 @@ async fn offline(
             assertion: passkey_assertion(&envelope)?,
         })
     };
-    let secret = match (root, revision) {
+    let (secret, revision) = match (root, revision) {
         (Some(root), None) => {
             let (store, secret) = NodeStore::bootstrap(
                 &journal,
@@ -489,6 +526,7 @@ async fn offline(
                 now,
             )
             .await?;
+            let mut revision = store.state().authority().revision();
             if let Some((scope, output, out)) = bearer {
                 let node = hellas_sdk::work::node::NodeCoordinator::new(
                     store,
@@ -499,34 +537,37 @@ async fn offline(
                 let caller = node
                     .authenticate_session(&secret, SessionKey::Passkey(passkey))
                     .await?;
-                let (_, bearer) = node
+                let (record, bearer) = node
                     .issue_credential(&caller, root, scope, CredentialHolder::Bearer)
                     .await?;
-                profile::save_credential(output, &out, &bearer).context(
-                    "authority committed but bearer publication failed; revoke the bearer before retrying",
-                )?;
+                revision = record.revision();
+                profile::save_credential(output, &out, &bearer).with_context(|| format!(
+                    "authority committed at revision {}; bearer {} publication failed; inspect-offline before retrying",
+                    revision.0, hex::encode(bearer.id().0),
+                ))?;
             }
-            secret
+            (secret, revision)
         }
         (None, Some(expected)) => {
-            NodeStore::recover_offline(
+            let (record, secret) = NodeStore::recover_offline(
                 &journal,
                 network,
                 expected,
                 approve(Ownership::Recover { expected })?,
                 now,
             )
-            .await?
-            .1
+            .await?;
+            (secret, record.revision)
         }
         _ => anyhow::bail!("invalid offline operation"),
     };
     profile::save_credential(output, &credential_out, &secret)
-        .context("authority committed but credential publication failed; use explicit offline recovery before retrying")?;
+        .with_context(|| format!("authority committed at revision {}; credential publication failed; inspect-offline before recovery", revision.0))?;
     println!(
         "{}",
         serde_json::json!({
             "credential_id": hex::encode(secret.id().0), "credential_file": credential_out,
+            "revision": revision.0,
             "subject": hex::encode(subject.as_bytes()), "subject_fingerprint": subject.fingerprint(),
             "authority": hex::encode(authority.0.as_bytes()),
         })

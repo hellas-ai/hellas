@@ -161,3 +161,132 @@ async fn issued_credentials_round_trip_with_a_redacted_reply() {
     );
     remote.shutdown().await;
 }
+
+#[tokio::test]
+async fn lost_credential_reply_is_reconciled_over_host_control() {
+    let remote = Remote::new().await;
+    // Discard the issuance response exactly as an application losing it would.
+    drop(
+        remote
+            .client
+            .issue_credential(IssueCredentialRequest {
+                authorization: ROOT_GRANT.0.to_vec(),
+                scope: canonical_dag_cbor(&reader_scope()).unwrap(),
+                holder: canonical_dag_cbor(&OPERATOR.holder()).unwrap(),
+            })
+            .await
+            .unwrap(),
+    );
+    let mut after = None;
+    let metadata = loop {
+        let response = remote
+            .client
+            .inspect_authority(InspectAuthorityRequest {
+                authorization: ROOT_GRANT.0.to_vec(),
+                query: canonical_dag_cbor(&InspectionQuery::Credentials { after }).unwrap(),
+            })
+            .await
+            .unwrap();
+        let inspection: AuthorityInspection = decode_dag_cbor(&response.reply).unwrap();
+        let InspectionRecords::Credentials { records, next } = inspection.records else {
+            panic!("credentials")
+        };
+        for metadata in &records {
+            let json = serde_json::to_value(metadata).unwrap();
+            let keys: std::collections::BTreeSet<_> = json
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            assert_eq!(
+                keys,
+                ["id", "scope", "holder", "generation", "revision", "revoked"].into()
+            );
+        }
+        if let Some(metadata) = records.into_iter().find(|c| c.scope == reader_scope()) {
+            break metadata;
+        }
+        after = Some(next.expect("issued credential must be discoverable"));
+    };
+    // A stale revision is actionable only after authorization has succeeded.
+    let request = |revision| RevokeCredentialRequest {
+        authorization: ROOT_GRANT.0.to_vec(),
+        credential_id: metadata.id.0.to_vec(),
+        expected_revision: revision,
+    };
+    assert_eq!(
+        remote
+            .client
+            .revoke_credential(request(999))
+            .await
+            .unwrap_err()
+            .code(),
+        WireCode::FailedPrecondition
+    );
+    remote
+        .client
+        .revoke_credential(request(metadata.revision.0))
+        .await
+        .unwrap();
+    let response = remote
+        .client
+        .inspect_authority(InspectAuthorityRequest {
+            authorization: ROOT_GRANT.0.to_vec(),
+            query: canonical_dag_cbor(&InspectionQuery::Credential { id: metadata.id }).unwrap(),
+        })
+        .await
+        .unwrap();
+    let inspection: AuthorityInspection = decode_dag_cbor(&response.reply).unwrap();
+    let InspectionRecords::Credentials { records, .. } = inspection.records else {
+        panic!("credentials")
+    };
+    assert!(records[0].revoked);
+    remote.shutdown().await;
+}
+
+#[test]
+fn maximal_credential_metadata_page_fits_the_bounded_wire_reply() {
+    let mut scope = reader_scope();
+    let operations: std::collections::BTreeSet<_> = (0..hellas_auth::authority::MAX_PERMISSIONS)
+        .map(|i| OperationId::new(format!("x{i:095}")).unwrap())
+        .collect();
+    let resources: std::collections::BTreeSet<_> = (0..hellas_auth::authority::MAX_PERMISSIONS)
+        .map(|i| ResourceId(Digest::hash(&i.to_be_bytes())))
+        .collect();
+    scope.permissions = operations
+        .iter()
+        .cloned()
+        .zip(resources.iter().copied())
+        .map(|(operation, resource)| Permission {
+            operation,
+            resource,
+        })
+        .collect();
+    scope.issuance = Some(IssuanceCeiling {
+        operations,
+        resources: CeilingResources::Named(resources),
+        max_validity_ms: 1_000_000,
+        max_delegation_depth: MAX_DELEGATION_DEPTH,
+    });
+    Credential::prepare(scope.clone(), OPERATOR.holder(), 1).unwrap();
+    let metadata = CredentialMetadata {
+        id: CredentialId([255; 16]),
+        scope,
+        holder: OPERATOR.holder(),
+        generation: u64::MAX,
+        revision: Revision(u64::MAX),
+        revoked: false,
+    };
+    let view = AuthorityInspection {
+        authority: authority(),
+        revision: Revision(u64::MAX),
+        generation: u64::MAX,
+        root_grant: ROOT_GRANT,
+        records: InspectionRecords::Credentials {
+            records: vec![metadata; INSPECTION_PAGE_SIZE],
+            next: Some(CredentialId([255; 16])),
+        },
+    };
+    encode_bounded(&view, hellas_work::model::grant::admin::MAX_ADMIN_BYTES).unwrap();
+}

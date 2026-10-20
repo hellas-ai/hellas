@@ -172,76 +172,31 @@ impl NodeStore {
         ))
     }
 
+    /// Read metadata with the daemon stopped, without recovery, clock ticks,
+    /// schema migration or journal writes. Uses the same identity lock as writers.
+    pub async fn inspect_offline(
+        directory: &Path,
+        network: NetworkId,
+        query: &hellas_auth::authority::InspectionQuery,
+    ) -> Result<hellas_auth::authority::AuthorityInspection, NodeStoreError> {
+        let (_identity_lock, marker) = read_marker(directory, network)?;
+        let (id, replay) = Journal::inspect(directory, "grants").await?;
+        if id != marker.journal_id() {
+            return Err(NodeStoreError::Malformed);
+        }
+        let state = restore_replay(replay, network, marker.authority)?;
+        Ok(state.authority.inspect_offline(query)?)
+    }
+
     pub(super) async fn open_initialized(
         directory: &Path,
         network: NetworkId,
     ) -> Result<Self, NodeStoreError> {
         let clock = super::super::clock::ClockBound::new();
-        let path = directory.join(MARKER);
-        let identity_lock = match hellas_private::open_regular_file(&path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Err(NodeStoreError::Uninitialized);
-            }
-            Err(error) => return Err(error.into()),
-        };
-        if !hellas_private::is_private(&identity_lock)?
-            || identity_lock.metadata()?.len() > MAX_MARKER_BYTES
-        {
-            return Err(NodeStoreError::Malformed);
-        }
-        let identity_lock = lock(identity_lock, &path)?;
-        let bytes = hellas_private::read_bounded(&identity_lock.0, MAX_MARKER_BYTES as usize)
-            .map_err(|error| {
-                if error
-                    .get_ref()
-                    .is_some_and(|error| error.is::<hellas_private::ReadLimit>())
-                {
-                    NodeStoreError::Malformed
-                } else {
-                    error.into()
-                }
-            })?;
-        let marker: Marker = decode(&bytes)?;
-        if marker.namespace != "hellas.node.identity.v1" || marker.network != network {
-            return Err(NodeStoreError::Malformed);
-        }
+        let (identity_lock, marker) = read_marker(directory, network)?;
         let (journal, replay) =
             Journal::open_existing(directory, "grants", marker.journal_id()).await?;
-        let mut records = replay.records.into_iter();
-        let mut state = match replay.checkpoint {
-            Some(bytes) => State::restore(decode::<Snapshot>(&bytes)?)?,
-            None => {
-                let bytes = records.next().ok_or(NodeStoreError::Uninitialized)?;
-                let mut frame: Frame = decode(&bytes)?;
-                if frame.namespace != "hellas.node.journal.v2" || frame.changes.len() != 1 {
-                    return Err(NodeStoreError::Malformed);
-                }
-                let Some(Change::Initialize {
-                    authority,
-                    provider,
-                }) = frame.changes.pop()
-                else {
-                    return Err(NodeStoreError::Malformed);
-                };
-                let authority = AuthorityState::restore(authority)?;
-                if authority.now() != frame.now
-                    || authority.revision() != Revision(1)
-                    || authority.generation() != 1
-                    || authority.grants().count() != 1
-                    || authority.credentials().count() != 1
-                {
-                    return Err(NodeStoreError::Malformed);
-                }
-                State::initialized(network, authority, provider)?
-            }
-        };
-        if state.network() != network || state.authority.authority() != marker.authority {
-            return Err(NodeStoreError::Malformed);
-        }
-        for bytes in records {
-            state.apply(&decode::<Frame>(&bytes)?)?;
-        }
+        let state = restore_replay(replay, network, marker.authority)?;
         Ok(Self {
             clock,
             _identity_lock: identity_lock,
@@ -251,6 +206,85 @@ impl NodeStore {
             deliveries: Default::default(),
         })
     }
+}
+
+fn read_marker(
+    directory: &Path,
+    network: NetworkId,
+) -> Result<(IdentityLock, Marker), NodeStoreError> {
+    let path = directory.join(MARKER);
+    let identity_lock = match hellas_private::open_regular_file(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(NodeStoreError::Uninitialized);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if !hellas_private::is_private(&identity_lock)?
+        || identity_lock.metadata()?.len() > MAX_MARKER_BYTES
+    {
+        return Err(NodeStoreError::Malformed);
+    }
+    let identity_lock = lock(identity_lock, &path)?;
+    let bytes = hellas_private::read_bounded(&identity_lock.0, MAX_MARKER_BYTES as usize).map_err(
+        |error| {
+            if error
+                .get_ref()
+                .is_some_and(|error| error.is::<hellas_private::ReadLimit>())
+            {
+                NodeStoreError::Malformed
+            } else {
+                error.into()
+            }
+        },
+    )?;
+    let marker: Marker = decode(&bytes)?;
+    if marker.namespace != "hellas.node.identity.v1" || marker.network != network {
+        return Err(NodeStoreError::Malformed);
+    }
+    Ok((identity_lock, marker))
+}
+
+fn restore_replay(
+    replay: crate::work_store::journal::Replay,
+    network: NetworkId,
+    authority_id: AuthorityId,
+) -> Result<State, NodeStoreError> {
+    let mut records = replay.records.into_iter();
+    let mut state = match replay.checkpoint {
+        Some(bytes) => State::restore(decode::<Snapshot>(&bytes)?)?,
+        None => {
+            let bytes = records.next().ok_or(NodeStoreError::Uninitialized)?;
+            let mut frame: Frame = decode(&bytes)?;
+            if frame.namespace != "hellas.node.journal.v2" || frame.changes.len() != 1 {
+                return Err(NodeStoreError::Malformed);
+            }
+            let Some(Change::Initialize {
+                authority,
+                provider,
+            }) = frame.changes.pop()
+            else {
+                return Err(NodeStoreError::Malformed);
+            };
+            let authority = AuthorityState::restore(authority)?;
+            if authority.now() != frame.now
+                || authority.revision() != Revision(1)
+                || authority.generation() != 1
+                || authority.grants().count() != 1
+                || authority.credentials().count() != 1
+            {
+                return Err(NodeStoreError::Malformed);
+            }
+            State::initialized(network, authority, provider)?
+        }
+    };
+    if state.network() != network || state.authority.authority() != authority_id {
+        return Err(NodeStoreError::Malformed);
+    }
+    for bytes in records {
+        state.apply(&decode::<Frame>(&bytes)?)?;
+    }
+    Ok(state)
 }
 
 impl Marker {

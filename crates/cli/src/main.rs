@@ -595,6 +595,10 @@ fn validate_identity_options(
     software_root: bool,
 ) -> Result<(), String> {
     let identity_free = match command {
+        Commands::Admin(commands::admin::AdminArgs {
+            command: commands::admin::AdminCommand::InspectOffline { .. },
+            ..
+        }) => Some("admin inspect-offline"),
         Commands::Trust(_) => Some("trust"),
         Commands::Contact { .. } => Some("contact"),
         Commands::Offer {
@@ -771,6 +775,20 @@ async fn async_main() {
     // effect; in particular, validator config generation runs in a pure Nix
     // build where there is deliberately no writable home directory.
     let command = match cli.command {
+        Commands::Admin(
+            args @ commands::admin::AdminArgs {
+                command: commands::admin::AdminCommand::InspectOffline { .. },
+                ..
+            },
+        ) => {
+            let result = commands::admin::inspect_offline(args).await;
+            tracer_provider.shutdown();
+            if let Err(err) = result {
+                eprintln!("error: {err:#}");
+                std::process::exit(1);
+            }
+            return;
+        }
         #[cfg(unix)]
         command @ Commands::Admin(commands::admin::AdminArgs {
             command: commands::admin::AdminCommand::Serve { .. },

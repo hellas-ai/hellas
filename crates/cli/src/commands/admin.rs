@@ -1,7 +1,7 @@
 //! Checked node administration. Online commands always use an explicit app profile.
 use std::path::PathBuf;
 mod node;
-pub use node::run;
+pub use node::{inspect_offline, run};
 
 #[derive(clap::Args)]
 pub struct AdminArgs {
@@ -48,6 +48,14 @@ pub struct OfflineArgs {
 
 #[derive(clap::Subcommand)]
 pub enum AdminCommand {
+    /// Inspect one record or one bounded metadata page using a JSON InspectionQuery.
+    Inspect { command: PathBuf },
+    /// Read administration metadata while the daemon is stopped. No passkey needed.
+    InspectOffline {
+        #[arg(long)]
+        journal: PathBuf,
+        command: PathBuf,
+    },
     /// Read private node status using the profile's selected grant.
     Status,
     /// Replace machine concurrency and budgets; revision zero initializes a provider.

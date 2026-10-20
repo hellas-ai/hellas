@@ -367,6 +367,25 @@ impl ControlSession {
 
 #[allow(refining_impl_trait)]
 impl HostControlHandler for ControlSession {
+    async fn inspect_authority(
+        &self,
+        request: InspectAuthorityRequest,
+    ) -> Result<InspectAuthorityResponse, WireStatus> {
+        let caller = self.caller().await?;
+        let query = decode_bounded(&request.query, MAX_COMMAND_BYTES).map_err(|_| invalid())?;
+        let reply = self
+            .node
+            .inspect(caller, grant_id(&request.authorization)?, query)
+            .await
+            .map_err(node_error)?;
+        Ok(InspectAuthorityResponse {
+            reply: encode_bounded(&reply, hellas_work::model::grant::admin::MAX_ADMIN_BYTES)
+                .map_err(|_| {
+                    WireStatus::new(WireCode::ResourceExhausted, "authority reply exceeds limit")
+                })?,
+        })
+    }
+
     async fn get_host_status(
         &self,
         request: GetHostStatusRequest,
@@ -645,7 +664,20 @@ fn grant_id(bytes: &[u8]) -> Result<GrantId, WireStatus> {
 }
 fn node_error(error: NodeStoreError) -> WireStatus {
     match error {
-        // Do not disclose another caller's target existence/revision through errors.
+        // Auth and Work check target authority before comparing revisions.
+        // Keep other target-dependent failures indistinguishable.
+        NodeStoreError::Authority(AuthorityError::Revision) => WireStatus::new(
+            WireCode::FailedPrecondition,
+            "stale revision; inspect current metadata before retrying",
+        ),
+        NodeStoreError::Authority(AuthorityError::Invalid) => invalid(),
+        NodeStoreError::Grant(hellas_work::model::grant::records::GrantError::Revision(_)) => {
+            WireStatus::new(
+                WireCode::FailedPrecondition,
+                "stale Work revision; inspect current metadata before retrying",
+            )
+        }
+        NodeStoreError::Grant(hellas_work::model::grant::records::GrantError::Limits) => invalid(),
         NodeStoreError::Authority(_) => denied(),
         NodeStoreError::MissingMachine => unsupported(),
         _ => unavailable(),

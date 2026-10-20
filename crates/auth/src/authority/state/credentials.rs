@@ -112,12 +112,6 @@ impl AuthorityState {
                 expected,
             } => {
                 let credential = self.credentials.get(id).ok_or(AuthorityError::Missing)?;
-                if credential.revision != *expected {
-                    return Err(AuthorityError::Revision);
-                }
-                if credential.revoked {
-                    return Err(AuthorityError::Revoked);
-                }
                 self.administrator(
                     actor,
                     *authorization,
@@ -126,6 +120,12 @@ impl AuthorityState {
                     now,
                     false,
                 )?;
+                if credential.revision != *expected {
+                    return Err(AuthorityError::Revision);
+                }
+                if credential.revoked {
+                    return Err(AuthorityError::Revoked);
+                }
                 let mut revoked = credential.clone();
                 revoked.revision = revoked.revision.next().ok_or(AuthorityError::Capacity)?;
                 revoked.revoked = true;
