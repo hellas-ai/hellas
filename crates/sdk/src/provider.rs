@@ -298,7 +298,7 @@ use hellas_wire::peers::{PeerDirectory, PeerId, PeerManager};
 use hellas_wire::serve::AccountingDispatcher;
 use iroh::endpoint::{Connection, Incoming};
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 use tracing::{debug, warn};
 mod discovery;
@@ -330,6 +330,7 @@ pub struct ProviderHandle {
     router: Option<WorkRouter>,
     discovery: Option<discovery::DiscoveryAdvertiser>,
     stop: Option<oneshot::Sender<()>>,
+    drained: Option<oneshot::Sender<()>>,
     alpns: Vec<Vec<u8>>,
     endpoint: Endpoint,
     owns_endpoint: bool,
@@ -379,11 +380,7 @@ impl ProviderHandle {
     /// Stop ingress, join accepted work and close the endpoint before returning errors.
     pub async fn shutdown(mut self) -> Result<(), ProviderError> {
         self.stop.take();
-        let mut result = match (&mut self.accept_task).await {
-            Ok(()) => Ok(()),
-            Err(error) if error.is_cancelled() => Ok(()),
-            Err(error) => Err(ProviderError::Task(error)),
-        };
+        let mut result = Ok(());
         if let Some(discovery) = self.discovery.take() {
             discovery.shutdown().await;
         }
@@ -395,6 +392,15 @@ impl ProviderHandle {
             let stopped = work.shutdown().await.map_err(ProviderError::from);
             result = result.and(stopped);
         }
+        // Work has reached its durable completion boundary. Stop accepting
+        // further substreams, then let already dispatched replies finish.
+        self.drained.take();
+        let joined = match (&mut self.accept_task).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.is_cancelled() => Ok(()),
+            Err(error) => Err(ProviderError::Task(error)),
+        };
+        result = result.and(joined);
         if self.owns_endpoint {
             self.endpoint.close().await;
         }
@@ -574,8 +580,10 @@ where
     let router = serves_work.clone();
     let accept_endpoint = endpoint.clone();
     let (stop, mut stopped) = oneshot::channel();
+    let (drained, drain_complete) = oneshot::channel();
     let accept_task = tokio::spawn(async move {
         let mut connections = JoinSet::new();
+        let (quiesce, quiesced) = watch::channel(false);
         let mut handshake_slots = crate::transport_admission::HandshakeSlots::new(
             MAX_RPC_HANDSHAKES,
             MAX_RPC_HANDSHAKES_PER_PEER,
@@ -621,6 +629,7 @@ where
             let work_for_conn = serves_work.clone();
             let setup_for_conn = serves_setup.clone();
             let admin_for_conn = admin.clone();
+            let mut stopping = quiesced.clone();
             connections.spawn(async move {
                 let conn = match incoming {
                     IncomingConnection::Host(connection) => connection,
@@ -628,12 +637,13 @@ where
                         let Ok(accepting) = (*incoming).accept() else {
                             return;
                         };
-                        let Ok(Ok(connection)) =
-                            tokio::time::timeout(RPC_HANDSHAKE_TIMEOUT, accepting).await
-                        else {
-                            return;
-                        };
-                        connection
+                        tokio::select! {
+                            _ = quiescing(&mut stopping) => return,
+                            result = tokio::time::timeout(RPC_HANDSHAKE_TIMEOUT, accepting) => {
+                                let Ok(Ok(connection)) = result else { return; };
+                                connection
+                            }
+                        }
                     }
                 };
                 drop(permits);
@@ -651,6 +661,7 @@ where
                     setup_for_conn,
                     work_for_conn,
                     admin_for_conn,
+                    stopping,
                 )
                 .await
                 {
@@ -658,7 +669,13 @@ where
                 }
             });
         }
-        connections.shutdown().await;
+        let _ = drain_complete.await;
+        quiesce.send_replace(true);
+        while let Some(result) = connections.join_next().await {
+            if let Err(error) = result {
+                warn!(%error, "node connection task failed while draining");
+            }
+        }
     });
 
     Ok(ProviderHandle {
@@ -668,6 +685,7 @@ where
         router,
         discovery,
         stop: Some(stop),
+        drained: Some(drained),
         accept_task,
         endpoint,
         owns_endpoint,
@@ -687,20 +705,22 @@ async fn serve_connection<R: RootProver + Send + Sync + 'static>(
     setup: Option<MountedSetup>,
     work: Option<WorkRouter>,
     admin: Option<crate::node_control::NodeControl>,
+    mut quiesce: watch::Receiver<bool>,
 ) -> Result<(), ProviderError> {
     if alpn == hellas_rpc::services::host_control::HostControl::ALPN.as_bytes() {
-        return admin
-            .ok_or_else(|| WireStatus::new(WireCode::Unavailable, "node control is unavailable"))?
-            .serve_iroh(conn)
-            .await
-            .map_err(ProviderError::from);
+        let admin = admin
+            .ok_or_else(|| WireStatus::new(WireCode::Unavailable, "node control is unavailable"))?;
+        return tokio::select! {
+            _ = quiescing(&mut quiesce) => Ok(()),
+            result = admin.serve_iroh(conn) => result.map_err(ProviderError::from),
+        };
     }
     let transport = Arc::new(IrohTransport::new(conn));
 
     // Account for inbound requests and refresh last_seen_ms in the shared registry.
     if alpn == <Node as ServiceMarker>::ALPN.as_bytes() {
         let server = AccountingDispatcher::new(NodeServer(node_handler), manager);
-        serve_loop(transport, server).await;
+        serve_loop(transport, server, quiesce).await;
         Ok(())
     } else if alpn == hellas_rpc::services::chain_sync::ChainSync::ALPN.as_bytes()
         && let Some(chain) = node_handler.chain
@@ -709,7 +729,7 @@ async fn serve_connection<R: RootProver + Send + Sync + 'static>(
             hellas_rpc::services::chain_sync::ChainSyncServer(chain),
             manager,
         );
-        serve_loop(transport, server).await;
+        serve_loop(transport, server, quiesce).await;
         Ok(())
     } else if let Some(setup) =
         setup.filter(|_| alpn == <WorkSetup as ServiceMarker>::ALPN.as_bytes())
@@ -721,14 +741,15 @@ async fn serve_connection<R: RootProver + Send + Sync + 'static>(
             ),
             manager,
         );
-        serve_loop(transport, server).await;
+        serve_loop(transport, server, quiesce).await;
         Ok(())
     } else if let Some(work) = work.filter(|_| alpn == <Work as ServiceMarker>::ALPN.as_bytes()) {
-        let server = AccountingDispatcher::new(
-            work.accept_iroh(&transport, open_identity.clone()).await?,
-            manager,
-        );
-        serve_loop(transport, server).await;
+        let connection = tokio::select! {
+            _ = quiescing(&mut quiesce) => return Ok(()),
+            connection = work.accept_iroh(&transport, open_identity.clone()) => connection?,
+        };
+        let server = AccountingDispatcher::new(connection, manager);
+        serve_loop(transport, server, quiesce).await;
         Ok(())
     } else {
         warn!("Unknown ALPN: {:?}", String::from_utf8_lossy(&alpn));
@@ -736,7 +757,13 @@ async fn serve_connection<R: RootProver + Send + Sync + 'static>(
     }
 }
 
-async fn serve_loop<T, S>(transport: Arc<T>, server: S)
+async fn quiescing(receiver: &mut watch::Receiver<bool>) {
+    if receiver.wait_for(|stop| *stop).await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
+async fn serve_loop<T, S>(transport: Arc<T>, server: S, mut quiesce: watch::Receiver<bool>)
 where
     T: StreamTransport + Send + Sync + 'static,
     S: Dispatcher<T> + Send + Sync + 'static,
@@ -766,24 +793,30 @@ where
     });
 
     let mut dispatches = JoinSet::new();
+    let mut draining = false;
     loop {
         if dispatches.len() >= MAX_RPC_IN_FLIGHT_PER_CONNECTION {
-            log_dispatch_result(dispatches.join_next().await);
+            tokio::select! {
+                _ = quiescing(&mut quiesce) => { draining = true; break; }
+                completed = dispatches.join_next() => log_dispatch_result(completed),
+            }
             continue;
         }
 
-        let next = if dispatches.is_empty() {
-            match tokio::time::timeout(RPC_CONNECTION_IDLE_TIMEOUT, inbound_rx.recv()).await {
-                Ok(next) => next,
-                Err(_) => break,
-            }
-        } else {
-            tokio::select! {
-                next = inbound_rx.recv() => next,
-                completed = dispatches.join_next() => {
-                    log_dispatch_result(completed);
-                    continue;
+        let idle = dispatches.is_empty();
+        let next = tokio::select! {
+            biased;
+            _ = quiescing(&mut quiesce) => { draining = true; break; }
+            next = async {
+                if idle {
+                    tokio::time::timeout(RPC_CONNECTION_IDLE_TIMEOUT, inbound_rx.recv()).await.unwrap_or(None)
+                } else {
+                    inbound_rx.recv().await
                 }
+            } => next,
+            completed = dispatches.join_next(), if !dispatches.is_empty() => {
+                log_dispatch_result(completed);
+                continue;
             }
         };
 
@@ -801,7 +834,13 @@ where
     }
 
     accepting.shutdown().await;
-    dispatches.shutdown().await;
+    if draining {
+        while let Some(result) = dispatches.join_next().await {
+            log_dispatch_result(Some(result));
+        }
+    } else {
+        dispatches.shutdown().await;
+    }
 }
 
 fn log_dispatch_result<E>(result: Option<Result<Result<(), E>, tokio::task::JoinError>>)

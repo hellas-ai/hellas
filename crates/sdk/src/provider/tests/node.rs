@@ -295,6 +295,7 @@ async fn one_slow_rpc_does_not_serialize_its_connection() {
         serve_loop(
             Arc::new(IrohTransport::new(connection)),
             WorkSetupServer(witness),
+            tokio::sync::watch::channel(false).1,
         )
         .await
     });
@@ -386,6 +387,7 @@ async fn exchange_routed_setup(
             Some(setup),
             None,
             None,
+            tokio::sync::watch::channel(false).1,
         )
         .await
         .expect("the routed setup connection is served");
@@ -2983,6 +2985,7 @@ impl RunningPaidNode {
                         Some(setup),
                         Some(WorkRouter::payment(work)),
                         None,
+                        tokio::sync::watch::channel(false).1,
                     )
                     .await
                     {

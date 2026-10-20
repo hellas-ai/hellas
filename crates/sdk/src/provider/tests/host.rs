@@ -164,7 +164,12 @@ impl Host {
                         )
                         .await
                     {
-                        super::super::serve_loop(transport, server).await;
+                        super::super::serve_loop(
+                            transport,
+                            server,
+                            tokio::sync::watch::channel(false).1,
+                        )
+                        .await;
                     }
                 });
             }

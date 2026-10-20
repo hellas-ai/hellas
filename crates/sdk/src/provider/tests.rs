@@ -157,8 +157,7 @@ impl Dispatcher<MuxTransport> for SlowStream {
     }
 }
 
-#[tokio::test(start_paused = true)]
-async fn paid_stream_outlives_the_idle_limit_but_idle_connections_close() {
+fn mux_pair() -> (MuxTransport, MuxTransport) {
     let (to_server, server_inbox) = mpsc::unbounded_channel();
     let (to_client, client_inbox) = mpsc::unbounded_channel();
     let client = MuxTransport::spawn::<8, _, _>(
@@ -175,7 +174,39 @@ async fn paid_stream_outlives_the_idle_limit_but_idle_connections_close() {
         Pipe(to_client, server_inbox),
         TransportContext::default(),
     );
-    let serving = tokio::spawn(serve_loop(Arc::new(server), SlowStream));
+    (client, server)
+}
+
+#[tokio::test(start_paused = true)]
+async fn quiescing_finishes_an_active_response_before_closing_the_session() {
+    let (client, server) = mux_pair();
+    let (stop, stopping) = tokio::sync::watch::channel(false);
+    let serving = tokio::spawn(serve_loop(Arc::new(server), SlowStream, stopping));
+    let mut response = hellas_rpc::call::server_streaming::<_, StreamResult>(
+        &client,
+        DeliverResultRequest::default(),
+        Metadata::new(),
+    )
+    .await
+    .unwrap();
+    assert!(response.next().await.unwrap().is_ok());
+    stop.send_replace(true);
+    tokio::task::yield_now().await;
+    assert!(!serving.is_finished(), "active delivery survives quiesce");
+    assert!(response.next().await.unwrap().is_ok());
+    assert!(response.next().await.is_none());
+    response.finish().unwrap();
+    serving.await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn paid_stream_outlives_the_idle_limit_but_idle_connections_close() {
+    let (client, server) = mux_pair();
+    let serving = tokio::spawn(serve_loop(
+        Arc::new(server),
+        SlowStream,
+        tokio::sync::watch::channel(false).1,
+    ));
     for _ in 0..2 {
         let started = Instant::now();
         let mut response = hellas_rpc::call::server_streaming::<_, StreamResult>(
