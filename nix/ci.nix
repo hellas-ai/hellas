@@ -91,6 +91,14 @@ let
           ++ lib.optionals isValidatorHost [ "validator" ]
         )
     )) (cargoEnv rustToolchain);
+    # Compile consumers without validator feature unification masking missing
+    # module gates or imports used only by the indexer API.
+    chain-features = mkCargo "check-chain-features" ''
+      cargo clippy -p hellas-chain --no-default-features --features client-core --all-targets -- -D warnings
+      cargo clippy -p hellas-chain --no-default-features --features proof-verify --all-targets -- -D warnings
+      cargo clippy -p hellas-chain --no-default-features --features full-node --all-targets -- -D warnings
+      cargo check -p hellas-sdk --all-features --all-targets
+    '' (cargoEnv rustToolchain);
     # Run command tests locally as well as in the release package builds.
     cli = mkCargo "check-cli" "cargo test -p hellas-cli" (cargoEnv rustToolchain);
     cloud = mkCargo "check-cloud" ''

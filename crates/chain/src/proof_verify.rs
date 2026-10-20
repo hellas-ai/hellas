@@ -16,6 +16,7 @@ use crate::{
 use commonware_codec::{DecodeExt as _, Encode as _};
 use commonware_consensus::CertifiableBlock as _;
 use commonware_cryptography::{Hasher as _, Sha256};
+#[cfg(feature = "indexer-api")]
 use hellas_auth::authority::UnixMillis;
 use hellas_genesis::{HELLAS_DEVNET_1_JSON, TrustDocument};
 use serde::{Deserialize, Serialize};
