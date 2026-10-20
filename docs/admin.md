@@ -425,30 +425,43 @@ Local evaluation uses `gateway --local --local-grant ID` to select an already
 configured allowance with a `local` policy. It never creates an owner grant or
 changes the selected allowance's policy while opening the gateway.
 
-Cloud readiness uses `control-profile.json` in its private configuration directory
-through this same CLI path; that profile must also be explicitly provisioned. Its
-credential is held by the worker's own node key, which opens a daily session.
+Provisioning uses the client-side `machines --provider NAME --credential-source FILE
+--provider-config FILE create --spec FILE` command, with matching `list` and
+`destroy ID` commands. The provider settings and credential-source formats are
+shown in [machine provider configuration](machine-provider-config.md). Provisioning
+passes no owner credential or transport secret to the provider.
 
-An owned machine belongs to a principal. `machines prepare` and cloud creation, run
-with `--passkey` and the operator's node identity, write a bootstrap naming the owner
-principal (`HELLAS_REMOTE_OWNER`) and the node key that administers it
-(`HELLAS_REMOTE_OWNER_NODE`). Each administration request carries the machine's
-secret and that node key's signature over a digest bound to its QUIC connection; the
-agent refuses any other node and refuses a restart that changes either binding. The
-owner's machine inventory is kept per principal. `gateway --machine` resolves the
-machine through this channel and opens the owner allowance of the `--passkey`
-principal on it.
+The ordinary node image runs `serve --await-owner STATE_DIRECTORY`. An unowned
+node prints a pairing document containing its public transport pin, direct
+addresses, expiry and a fresh random secret. Obtain that document through the
+provider's authenticated console/output and keep it private. Before ownership,
+only the bounded one-shot bootstrap exchange is available. Eight refused attempts
+invalidate the invitation; restarting generates a different secret.
 
-The daemon serves status, machine capacity, authority grants, credential
-issuance/revocation and Work allowance administration. Composed SDK hosts also
-serve provider/gateway lifecycle and gateway credential retrieval.
+The owner uses `admin bootstrap-remote --invitation FILE --root-grant ID
+--administrator FILE --credential-scope FILE --profile-out DIRECTORY` with their
+passkey. The CLI saves the prepared credential and pinned remote profile before
+sending the owner approval. A lost acknowledgement does not require issuing a
+second credential: use the saved profile to inspect the node. The authority store
+is published atomically and refuses another bootstrap after success.
+
+The normal host keeps that endpoint and authority alive across provider restarts.
+Use the saved `admin --profile DIRECTORY/profile.json` for status, capacity, authority and Work
+administration. `admin configure-provider FILE` applies a typed, revision-checked
+upstream mutation. Adding a new key requires a daily application session; replacing
+or removing a key and changing endpoints require a passkey session. Status exposes
+endpoint metadata and key names, never key material. Failed configuration/startup
+restores the prior configuration and keys and reports the provider as failed;
+`admin set-provider-state --enabled true` explicitly starts it again.
+
+Share execution through a signed allowance offer, import it, then select
+`gateway --offer ALIAS` with the caller's approved trust policy and Work profile.
 
 
 ## Embedded host lifecycle
 
 `sdk::node_control::host::HostHandle::start` owns an existing `NodeCoordinator`,
-an authenticated local control listener and a bounded lifecycle supervisor. Both
-services begin stopped. Supply `OpenAiProviderOptions::into_factory()` from the
+an authenticated local control listener and a bounded lifecycle supervisor. Provider startup is selected with `start_provider`; the gateway begins stopped. Supply `OpenAiProviderOptions::into_factory()` from the
 core reseller crate for Gate's vendor relay, preserving its injected App Attest
 prover and enrollment. Other providers prepare the shared SDK provider options
 and select `on_host(control)` before startup. That attaches the existing writer;
@@ -473,14 +486,16 @@ remain alive. Work administration remains available after the provider stops.
 Full host shutdown joins its local listener and both services.
 `GetGatewayAccess` separately requires `host.gateway.access`; it returns an address
 and the current scoped HTTP Auth credential only while the gateway is running.
-Remote control retains its explicit endpoint allowlist in addition to these rights.
+Remote control is disabled by default. Explicit credential-gated ingress permits
+application authentication from any transport key; a configured endpoint allowlist
+restricts it further. `--await-owner` opts into credential-gated ingress.
 A standalone `NodeControl` without a host supervisor leaves lifecycle operations
 unmounted; constructing the composed host supplies their implementation.
 
 
 Caller trust for paid and grant execution is configured separately with `hellas-cli trust`.
 `approve` requires a reviewed policy file, expected revision (zero for creation) and
-reason; `show` reports current pins and latest approval. Paid requests and grant gateways (`--offer`, `--machine` or `--local`) select
+reason; `show` reports current pins and latest approval. Paid requests and grant gateways (`--offer` or `--local`) select
 `--trust-store` and `--trust-policy`; imported offers cannot replace the approved pins.
 See [paid gateway trust configuration](paid-gateway.md) for the file format and
 replacement procedure. This does not grant provider administration rights.

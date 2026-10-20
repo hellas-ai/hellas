@@ -245,7 +245,6 @@ rec {
     "--trust-store"
     "--trust-policy"
     "--offer"
-    "--machine"
     "--passkey"
     "--work-profile"
     "--grant-policy"
@@ -596,15 +595,10 @@ rec {
         default = null;
         description = "Previously imported allowance offer alias.";
       };
-      machine = mkOption {
-        type = types.nullOr types.str;
-        default = null;
-        description = "Owned machine alias whose allowance supplies execution.";
-      };
       passkey = mkOption {
         type = types.nullOr runtimePath;
         default = null;
-        description = "Private software passkey of the principal whose allowance local, offer or machine execution uses.";
+        description = "Private software passkey of the principal whose allowance local or offer execution uses.";
       };
       workProfile = mkOption {
         type = types.nullOr runtimePath;
@@ -901,7 +895,6 @@ rec {
     ++ optArg "--trust-store" gateway.trustStore
     ++ optArg "--trust-policy" gateway.trustPolicy
     ++ optArg "--offer" gateway.offer
-    ++ optArg "--machine" gateway.machine
     ++ optArg "--passkey" gateway.passkey
     ++ optArg "--work-profile" gateway.workProfile
     ++ optArg "--grant-policy" gateway.grantPolicy

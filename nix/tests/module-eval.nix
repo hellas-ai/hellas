@@ -446,7 +446,7 @@ let
   };
   missingRequiredTrust = evalGateway {
     responsesBackend = "proxy";
-    machine = "provider";
+    offer = "provider";
   };
   oversizedGpuCapacity =
     builtins.tryEval
@@ -653,7 +653,7 @@ let
             gatewayProfile = "/run/hellas/gateway-profile.json";
             causalLmEnvironment = "/srv/hellas/smollm2.environment";
             tokenizer = "/srv/hellas/tokenizer.json";
-            machine = "provider";
+            offer = "provider";
             passkey = "/run/hellas/principal.passkey";
             workProfile = "/run/hellas/work-profile.json";
             queueSize = 0;

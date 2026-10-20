@@ -153,6 +153,18 @@ pub mod services {
 /// either the canonical encoding or the proto definition changed — both
 /// rotate the ID, and deployed nodes will refuse this build's calls on
 /// the affected methods. Update a pin only as a deliberate protocol break.
+
+#[cfg(feature = "host-control")]
+impl core::fmt::Debug for host::UpstreamKey {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("UpstreamKey")
+            .field("service", &self.service)
+            .field("method", &self.method)
+            .field("key", &self.key)
+            .finish_non_exhaustive()
+    }
+}
+
 #[cfg(test)]
 mod id_pins {
     #[allow(unused_imports)]
@@ -195,13 +207,14 @@ mod id_pins {
     #[test]
     fn host_control_ids_are_stable() {
         use super::services::host_control::{
-            BindProvider, GetGatewayAccess, GrantControl, HostControl, IssueCredential,
+            BindProvider, ConfigureProvider, GetGatewayAccess, GrantControl, HostControl, IssueCredential,
             RevokeCredential, SetGatewayState, SetProviderState, WorkControl,
         };
-        // Lifecycle requests carry their selected Auth authorization grant.
-        assert_eq!(<HostControl as ServiceMarker>::SERVICE_ID, 0x459f_a263);
-        assert_eq!(<SetProviderState as MethodMarker>::METHOD_ID, 0xab3a_b173);
-        assert_eq!(<SetGatewayState as MethodMarker>::METHOD_ID, 0xa909_3160);
+        // Typed provider configuration changes the HostControl service descriptor.
+        assert_eq!(<HostControl as ServiceMarker>::SERVICE_ID, 0x5169_5ede);
+        assert_eq!(<ConfigureProvider as MethodMarker>::METHOD_ID, 0x689e_9aaa);
+        assert_eq!(<SetProviderState as MethodMarker>::METHOD_ID, 0xd9b2_bce2);
+        assert_eq!(<SetGatewayState as MethodMarker>::METHOD_ID, 0x6c32_7cb7);
         assert_eq!(<GetGatewayAccess as MethodMarker>::METHOD_ID, 0xce7f_5d32);
         assert_eq!(<GrantControl as MethodMarker>::METHOD_ID, 0xc0e0_b21c);
         assert_eq!(<WorkControl as MethodMarker>::METHOD_ID, 0x995d_0334);
@@ -238,16 +251,5 @@ mod id_pins {
         assert_eq!(<LightClient as ServiceMarker>::SERVICE_ID, 0x8f06b6cc);
         assert_eq!(<GetStateRoot as MethodMarker>::METHOD_ID, 0xb484a429);
         assert_eq!(<SubmitWorkResponse as MethodMarker>::METHOD_ID, 0x78ea_f3a0);
-    }
-}
-
-#[cfg(feature = "host-control")]
-impl core::fmt::Debug for host::UpstreamKey {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("UpstreamKey")
-            .field("service", &self.service)
-            .field("method", &self.method)
-            .field("key", &self.key)
-            .finish_non_exhaustive()
     }
 }

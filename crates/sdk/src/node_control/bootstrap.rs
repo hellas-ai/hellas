@@ -232,6 +232,29 @@ mod tests {
         )
     }
     #[tokio::test]
+    async fn expired_invitation_cannot_initialize_or_send_approval() {
+        let directory = tempfile::tempdir().unwrap();
+        let (server, client) = endpoints().await;
+        let mut invitation = Invitation::create(&server, UnixMillis::now().unwrap()).unwrap();
+        invitation.expires = UnixMillis(0);
+        let (root, approval, _) = prepared();
+        assert!(
+            accept(
+                &server,
+                &invitation,
+                directory.path(),
+                hellas_work::test_support::network(),
+                None
+            )
+            .await
+            .is_err()
+        );
+        assert!(connect(&client, &invitation, root, approval).await.is_err());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+        client.close().await;
+        server.close().await;
+    }
+    #[tokio::test]
     async fn pairing_commits_the_saved_credential_and_cannot_be_replayed() {
         let directory = tempfile::tempdir().unwrap();
         let (server, client) = endpoints().await;
@@ -328,6 +351,20 @@ mod tests {
                 None
             ),
             async {
+                // Refuse an oversized declared length before allocating its body.
+                let oversized = client
+                    .connect(server.addr(), HostControl::ALPN.as_bytes())
+                    .await
+                    .unwrap();
+                let (mut send, mut recv) = oversized.open_bi().await.unwrap();
+                send.write_u8(VERSION).await.unwrap();
+                send.write_u32(u32::MAX).await.unwrap();
+                send.flush().await.unwrap();
+                assert!(
+                    hellas_work::test_support::within(recv.read_u8())
+                        .await
+                        .is_err()
+                );
                 let connection = client
                     .connect(server.addr(), HostControl::ALPN.as_bytes())
                     .await

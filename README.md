@@ -37,9 +37,8 @@ A platform-backed Assurance authenticates the Fetch application. The
 it does not authenticate a running binary. The sealed Responses adaptor sends
 `store=false` upstream and accepts text and client-executed function tools.
 
-Work is the only execution protocol. This milestone supports payment-funded
-channels. Owner and principal grants share the Work protocol, including
-`gateway --machine` and sealed Fetch. Delegated project tracks remain a later milestone. Ticket execution, shadow verification, public retained-artifact
+Work is the execution protocol for payment-funded channels and owner, principal
+and delegated grants, including `gateway --offer` and sealed Fetch. Ticket execution, shadow verification, public retained-artifact
 retrieval and CacheControl have been removed. Work-side local reproduction
 remains available. Accepted paid inputs and results remain in the channel's
 recovery/evidence journal, independently of gateway archive settings.

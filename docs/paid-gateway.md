@@ -71,7 +71,7 @@ records fail; startup never creates approval. Assertion counters persist indepen
 of policy replacement. Restart gateways to load a new approval; existing gateway
 instances retain their startup policy. `paid-work run` uses the same native store
 through required `--trust-store` and `--trust-policy` options. Grant gateways require
-the same selection with `--offer`, `--machine` or `--local`. Approved manifest IDs
+the same selection with `--offer` or `--local`. Approved manifest IDs
 remain in the client anchor and are checked for every new job, including refreshed
 grant policies. Paid options also check them before funding.
 

@@ -93,15 +93,15 @@ let
         patch -d "$crate" -p1 < ${./noq-udp-musl.patch}
       done
     '';
-    # CLI unit tests do not exercise UDP receive. Run the cloud crate's real
-    # iroh enrollment test wherever this builder can execute the musl target.
+    # Exercise real UDP bootstrap wherever this builder can execute the musl
+    # target; CLI parser and HTTP provider tests cannot detect this regression.
     postBuild =
       lib.optionalString
         (pkgs.stdenv.hostPlatform.isMusl && pkgs.stdenv.buildPlatform.canExecute pkgs.stdenv.hostPlatform)
         ''
           timeout 120 cargo test --offline --release --target ${targetTriple} \
-            -p hellas-cloud --test management \
-            enrollment_requires_owner_confirmation_and_cannot_be_silently_replaced -- --exact
+            -p hellas-sdk --features hellas-chain/validator \
+            node_control::bootstrap::tests::pairing_commits_the_saved_credential_and_cannot_be_replayed -- --exact
         '';
     checkInputs = with pkgs; [ cargo-outdated ];
     separateDebugInfo = true;

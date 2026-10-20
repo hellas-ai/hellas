@@ -337,8 +337,8 @@ in
         message = "services.hellas.gateway.causalLmEnvironment and tokenizer must be set together and are required for native inference.";
       }
       {
-        assertion = gateway.nodeAddrs == [ ] || gateway.nodeId != null || gateway.machine != null;
-        message = "services.hellas.gateway.nodeAddrs requires nodeId or machine.";
+        assertion = gateway.nodeAddrs == [ ] || gateway.nodeId != null;
+        message = "services.hellas.gateway.nodeAddrs requires nodeId.";
       }
       {
         assertion = !gateway.local || (gateway.nodeId == null && gateway.nodeAddrs == [ ]);
@@ -360,7 +360,7 @@ in
         assertion =
           !gateway.enable
           || gateway.offer != null
-          || gateway.machine != null
+
           || gateway.paidWorkConfig != null
           || gateway.local
           || (
@@ -369,7 +369,7 @@ in
             && gateway.nodeId == null
 
           );
-        message = "services.hellas.gateway execution requires an offer, machine, local allowance or paidWorkConfig.";
+        message = "services.hellas.gateway execution requires an offer, local allowance or paidWorkConfig.";
       }
       {
         assertion =
@@ -379,7 +379,6 @@ in
 
             && gateway.nodeId == null
             && gateway.offer == null
-            && gateway.machine == null
             && gateway.trustStore == null
             && gateway.trustPolicy == null
             && gateway.responsesBackend == "hellas"
@@ -399,7 +398,7 @@ in
       {
         assertion =
           !gateway.enable
-          || !(gateway.local || gateway.offer != null || gateway.machine != null)
+          || !(gateway.local || gateway.offer != null)
           || (gateway.trustPolicy != null && gateway.workProfile != null && gateway.passkey != null);
         message = "services.hellas.gateway grant execution requires trustPolicy, workProfile and passkey.";
       }
@@ -412,7 +411,6 @@ in
           lib.count (target: target) [
             gateway.local
             (gateway.offer != null)
-            (gateway.machine != null)
             (gateway.paidWorkConfig != null)
           ] <= 1;
         message = "services.hellas.gateway must select only one funding target.";

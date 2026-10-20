@@ -208,7 +208,7 @@ struct Cli {
 
     /// The software passkey of the principal this command acts for: a file of
     /// 32 raw bytes or 64 hex digits. Contacts, offers, grant data, gateway
-    /// allowances, owned machines and passkey administration sessions use it.
+    /// allowances and passkey administration sessions use it.
     #[arg(long, global = true)]
     passkey: Option<PathBuf>,
 
