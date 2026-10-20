@@ -16,8 +16,8 @@ use crate::{
     execution::store::UtxoDatabase,
     indexer::ChainIndexer,
     light_client::{
-        ConsensusInfo, EdgeLookup, EdgeRecord, EdgeState, FinalizedBlock, FinalizedBlockQuery,
-        LatestBlock, LightClient, OwnerCoins, OwnerEdges, QueryError,
+        CoinListing, ConsensusInfo, EdgeLookup, EdgeRecord, EdgeState, FinalizedBlock,
+        FinalizedBlockQuery, LatestBlock, LightClient, OwnerEdges, QueryError,
     },
     owner_index::OwnerIndex,
     work_view::{FinalizedWorkView, WorkChannelQuery, WorkChannelSnapshot},
@@ -799,14 +799,31 @@ impl LightClient for LocalLightClient {
     async fn get_coins_by_owner(
         &self,
         owner: SettlementKey,
-    ) -> Result<Option<OwnerCoins>, QueryError> {
+    ) -> Result<Option<CoinListing>, QueryError> {
         let (snapshot, holdings) = self.owner_objects(owner).await?;
-        Ok(snapshot.map(|snapshot| OwnerCoins {
+        Ok(snapshot.map(|snapshot| CoinListing {
             snapshot,
             coins: holdings
                 .into_iter()
                 .filter_map(|(id, object)| match object {
                     Object::Coin(coin) if coin.owner == owner => Some((id, coin.value)),
+                    _ => None,
+                })
+                .collect(),
+        }))
+    }
+
+    async fn get_coins_by_delegate(
+        &self,
+        delegate: SettlementKey,
+    ) -> Result<Option<CoinListing>, QueryError> {
+        let (snapshot, holdings) = self.owner_objects(delegate).await?;
+        Ok(snapshot.map(|snapshot| CoinListing {
+            snapshot,
+            coins: holdings
+                .into_iter()
+                .filter_map(|(id, object)| match object {
+                    Object::Coin(coin) if coin.delegate == Some(delegate) => Some((id, coin.value)),
                     _ => None,
                 })
                 .collect(),

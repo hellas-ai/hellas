@@ -1,7 +1,7 @@
 use super::*;
 use crate::domain::genesis_object_id;
 use crate::execution::test_support::{
-    index_block, index_genesis as genesis, kernel_fixture, owner_key as settlement, owner_signer,
+    index_block, index_genesis as genesis, kernel_fixture, owner_key as settlement, reshape,
     validator_key as key,
 };
 use commonware_consensus::types::{Epoch, Height, Round, View};
@@ -11,46 +11,12 @@ use commonware_storage::{merkle::Location, mmr};
 use commonware_utils::non_empty_range;
 use hellas_kernel::SoftPasskey;
 use hellas_kernel::{
-    Auth, CloseKind, CoinId, List, MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS, Parties, PartyAuth,
-    PartyKeys, Payout, Proof, ProtocolCode, Reshape, Terms, Tx,
+    Auth, CloseKind, List, MAX_EDGE_OUTPUTS, Parties, PartyAuth, PartyKeys, Payout, Proof,
+    ProtocolCode, Terms, Tx,
 };
 
 fn block(parent: &HellasBlock, txs: Vec<Transaction>) -> HellasBlock {
     index_block(parent, commonware_cryptography::sha256::Digest::EMPTY, txs)
-}
-
-/// An owner's reshape of `inputs` into `outputs`, signed by
-/// [`owner_signer`]`(owner)`, and the ids of the coins it issues.
-fn reshape(
-    owner: u8,
-    inputs: &[ObjectId],
-    outputs: &[(SettlementKey, Option<SettlementKey>, u64)],
-) -> (Transaction, Vec<ObjectId>) {
-    let mut input_ids = [CoinId::from_bytes([0; 32]); MAX_EDGE_INPUTS];
-    for (slot, id) in input_ids.iter_mut().zip(inputs) {
-        *slot = CoinId::from_bytes(id.0);
-    }
-    let inputs = List::take(input_ids, inputs.len());
-    let mut payouts = [Payout::default(); MAX_EDGE_OUTPUTS];
-    for (slot, (owner, delegate, value)) in payouts.iter_mut().zip(outputs) {
-        *slot = Payout::delegated(
-            owner.into_kernel(),
-            delegate.map(SettlementKey::into_kernel),
-            *value,
-        );
-    }
-    let outputs = List::take(payouts, outputs.len());
-    let hash = Reshape::payload_hash(crate::domain::TEST_NETWORK, &inputs, &outputs);
-    let ids = Reshape::output_ids(crate::domain::TEST_NETWORK, &inputs, &outputs)
-        .iter()
-        .copied()
-        .map(coin_object_id)
-        .collect();
-    let auth = Auth::native(owner_signer(owner).sign(hash));
-    (
-        Transaction::Kernel(Tx::Owner(Reshape::new(inputs, outputs, auth))),
-        ids,
-    )
 }
 
 /// Owner 1 pays 40 of its 100 to owner 2 and keeps 60.
@@ -229,7 +195,7 @@ fn indexes_a_delegating_reshape_with_its_delegate() {
         &[(settlement(1), Some(node), 70), (settlement(1), None, 30)],
     );
     assert_eq!(
-        indexer.apply_finalized(&block(&genesis, vec![tx])),
+        indexer.apply_finalized(&block(&genesis, vec![tx.clone()])),
         Ok(ApplyOutcome::Applied)
     );
     assert_eq!(
@@ -245,9 +211,22 @@ fn indexes_a_delegating_reshape_with_its_delegate() {
         Ok(Some(Coin::owned(settlement(1), 30)))
     );
     assert_eq!(indexer.get_coin(&genesis_object_id(0)), Ok(None));
-    // The node owns nothing: the coin is the owner's, and only its owner
-    // lists it.
+    // Delegated holdings are discoverable without increasing owned balance.
     assert!(indexer.get_coins_by_owner(&node).is_empty());
+    {
+        let state = indexer.inner.read().unwrap();
+        assert_eq!(
+            state.by_owner[&node],
+            BTreeMap::from([((HOLDING_DELEGATED, ids[0]), 0)])
+        );
+        assert_eq!(state.by_owner[&settlement(1)].len(), 2);
+    }
+    let previous = block(&genesis, vec![tx.clone()]);
+    let (sweep, _) = reshape(1, &[ids[0]], &[(settlement(1), None, 70)]);
+    indexer
+        .apply_finalized(&block(&previous, vec![sweep]))
+        .unwrap();
+    assert!(!indexer.inner.read().unwrap().by_owner.contains_key(&node));
 }
 
 #[test]

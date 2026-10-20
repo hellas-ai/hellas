@@ -309,3 +309,39 @@ pub(crate) fn kernel_fixture_at(
         taker_passkey,
     })
 }
+
+/// An owner's reshape of `inputs` into `outputs`, signed by
+/// [`owner_signer`]`(owner)`, and the ids of the coins it issues.
+pub(crate) fn reshape(
+    owner: u8,
+    inputs: &[ObjectId],
+    outputs: &[(SettlementKey, Option<SettlementKey>, u64)],
+) -> (Transaction, Vec<ObjectId>) {
+    let mut input_ids = [CoinId::from_bytes([0; 32]); hellas_kernel::MAX_EDGE_INPUTS];
+    for (slot, id) in input_ids.iter_mut().zip(inputs) {
+        *slot = CoinId::from_bytes(id.0);
+    }
+    let inputs = List::take(input_ids, inputs.len());
+    let mut payouts = [Payout::default(); MAX_EDGE_OUTPUTS];
+    for (slot, (owner, delegate, value)) in payouts.iter_mut().zip(outputs) {
+        *slot = Payout::delegated(
+            owner.into_kernel(),
+            delegate.map(SettlementKey::into_kernel),
+            *value,
+        );
+    }
+    let outputs = List::take(payouts, outputs.len());
+    let hash = hellas_kernel::Reshape::payload_hash(crate::domain::TEST_NETWORK, &inputs, &outputs);
+    let ids = hellas_kernel::Reshape::output_ids(crate::domain::TEST_NETWORK, &inputs, &outputs)
+        .iter()
+        .copied()
+        .map(crate::domain::coin_object_id)
+        .collect();
+    let auth = Auth::native(owner_signer(owner).sign(hash));
+    (
+        Transaction::Kernel(Tx::Owner(hellas_kernel::Reshape::new(
+            inputs, outputs, auth,
+        ))),
+        ids,
+    )
+}

@@ -107,7 +107,7 @@ pub enum FinalizedBlockQuery {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OwnerCoins {
+pub struct CoinListing {
     pub snapshot: LatestBlock,
     pub coins: Vec<(ObjectId, u64)>,
 }
@@ -274,7 +274,14 @@ pub trait LightClient: Clone + Send + Sync + 'static {
     fn get_coins_by_owner(
         &self,
         owner: SettlementKey,
-    ) -> impl Future<Output = Result<Option<OwnerCoins>, QueryError>> + Send;
+    ) -> impl Future<Output = Result<Option<CoinListing>, QueryError>> + Send;
+
+    /// Coins whose committed delegate is this node. Values are spendable funding,
+    /// not the node's owned balance.
+    fn get_coins_by_delegate(
+        &self,
+        delegate: SettlementKey,
+    ) -> impl Future<Output = Result<Option<CoinListing>, QueryError>> + Send;
 
     fn get_edges_by_owner(
         &self,

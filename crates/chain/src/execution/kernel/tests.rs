@@ -177,31 +177,6 @@ fn qmdb_genesis_open_mutual_close_lands_payouts_and_consumes_edge() {
     });
 }
 
-/// Owner 21 reshapes its genesis coin at allocation index 4 into 35 for
-/// owner 22, delegated to node key 23, and 55 back to itself.
-fn reshape_fixture() -> (Transaction, ObjectId, ObjectId) {
-    let inputs = hellas_kernel::List::take(
-        [CoinId::from_bytes(genesis_object_id(4).0); hellas_kernel::MAX_EDGE_INPUTS],
-        1,
-    );
-    let mut payouts = [hellas_kernel::Payout::default(); hellas_kernel::MAX_EDGE_OUTPUTS];
-    payouts[0] = hellas_kernel::Payout::delegated(
-        owner_key(22).into_kernel(),
-        Some(owner_key(23).into_kernel()),
-        35,
-    );
-    payouts[1] = hellas_kernel::Payout::new(owner_key(21).into_kernel(), 55);
-    let outputs = hellas_kernel::List::take(payouts, 2);
-    let hash = Reshape::payload_hash(crate::domain::TEST_NETWORK, &inputs, &outputs);
-    let ids = Reshape::output_ids(crate::domain::TEST_NETWORK, &inputs, &outputs);
-    let auth = hellas_kernel::Auth::native(owner_signer(21).sign(hash));
-    (
-        Transaction::Kernel(KernelTx::Owner(Reshape::new(inputs, outputs, auth))),
-        coin_object_id(ids.as_slice()[0]),
-        coin_object_id(ids.as_slice()[1]),
-    )
-}
-
 #[test]
 fn owner_index_matches_qmdb_across_reshape_and_channel_blocks() {
     run_qmdb(|runtime| async move {
@@ -212,7 +187,15 @@ fn owner_index_matches_qmdb_across_reshape_and_channel_blocks() {
         allocations.extend_from_slice(&timeout.allocations);
         allocations.push((owner_key(21), 90));
 
-        let (reshape, reshape_recipient, reshape_change) = reshape_fixture();
+        let (reshape, reshape_ids) = crate::execution::test_support::reshape(
+            21,
+            &[genesis_object_id(4)],
+            &[
+                (owner_key(21), Some(owner_key(23)), 35),
+                (owner_key(22), None, 55),
+            ],
+        );
+        let (reshape_recipient, reshape_change) = (reshape_ids[0], reshape_ids[1]);
         let mutual_edge_id = edge_object_id(mutual.edge);
         let timeout_edge_id = edge_object_id(timeout.edge);
         let mutual_payout_ids: Vec<_> = mutual

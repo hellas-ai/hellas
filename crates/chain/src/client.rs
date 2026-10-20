@@ -1,7 +1,7 @@
 use crate::domain::{Coin, Digest, ObjectId, SettlementKey, Transaction};
 use crate::{
-    ConsensusInfo, ConsensusVerifier, EdgeLookup, EdgeRecord, EdgeState, FinalizedBlock,
-    FinalizedBlockQuery, LatestBlock, LightClient, OwnerCoins, OwnerEdges, QueryError,
+    CoinListing, ConsensusInfo, ConsensusVerifier, EdgeLookup, EdgeRecord, EdgeState,
+    FinalizedBlock, FinalizedBlockQuery, LatestBlock, LightClient, OwnerEdges, QueryError,
 };
 use commonware_cryptography::{Hasher, Sha256};
 use hellas_kernel::{Decode as _, Encode as _, Move as KernelMove, Tx as KernelTx};
@@ -321,7 +321,7 @@ impl LightClient for RemoteLightClient {
     fn get_coins_by_owner(
         &self,
         owner: SettlementKey,
-    ) -> impl Future<Output = Result<Option<OwnerCoins>, QueryError>> + Send {
+    ) -> impl Future<Output = Result<Option<CoinListing>, QueryError>> + Send {
         let client = self.rpc_client().clone();
         let verifier = self.consensus_verifier().cloned();
         async move {
@@ -331,26 +331,24 @@ impl LightClient for RemoteLightClient {
                 })
                 .await
                 .map_err(QueryError::from)?;
-            let Some(snapshot) = resp.snapshot else {
-                if resp.coins.is_empty() {
-                    return Ok(None);
-                }
-                return Err(QueryError::Remote(
-                    "GetCoinsByOwnerResponse had coins without a snapshot".to_string(),
-                ));
-            };
-            let snapshot = verified_latest_block_from_proto(snapshot, verifier.as_ref())?;
-            let coins = resp
-                .coins
-                .into_iter()
-                .map(|entry| {
-                    let arr: [u8; 32] = entry.object_id.try_into().map_err(|_| {
-                        QueryError::Remote("object_id was not 32 bytes".to_string())
-                    })?;
-                    Ok((Digest::from(arr), entry.value))
+            coin_listing_from_proto(resp, verifier.as_ref())
+        }
+    }
+
+    fn get_coins_by_delegate(
+        &self,
+        delegate: SettlementKey,
+    ) -> impl Future<Output = Result<Option<CoinListing>, QueryError>> + Send {
+        let client = self.rpc_client().clone();
+        let verifier = self.consensus_verifier().cloned();
+        async move {
+            let resp = client
+                .get_coins_by_delegate(GetCoinsByDelegateRequest {
+                    delegate: delegate.to_bytes().to_vec(),
                 })
-                .collect::<Result<Vec<_>, QueryError>>()?;
-            Ok(Some(OwnerCoins { snapshot, coins }))
+                .await
+                .map_err(QueryError::from)?;
+            coin_listing_from_proto(resp, verifier.as_ref())
         }
     }
 
@@ -370,6 +368,33 @@ impl LightClient for RemoteLightClient {
             owner_edges_from_proto(owner, resp, verifier.as_ref())
         }
     }
+}
+
+fn coin_listing_from_proto(
+    resp: GetCoinsResponse,
+    verifier: Option<&ConsensusVerifier>,
+) -> Result<Option<CoinListing>, QueryError> {
+    let Some(snapshot) = resp.snapshot else {
+        if resp.coins.is_empty() {
+            return Ok(None);
+        }
+        return Err(QueryError::Remote(
+            "GetCoinsResponse had coins without a snapshot".to_string(),
+        ));
+    };
+    let snapshot = verified_latest_block_from_proto(snapshot, verifier)?;
+    let coins = resp
+        .coins
+        .into_iter()
+        .map(|entry| {
+            let arr: [u8; 32] = entry
+                .object_id
+                .try_into()
+                .map_err(|_| QueryError::Remote("object_id was not 32 bytes".to_string()))?;
+            Ok((Digest::from(arr), entry.value))
+        })
+        .collect::<Result<Vec<_>, QueryError>>()?;
+    Ok(Some(CoinListing { snapshot, coins }))
 }
 
 fn edge_lookup_from_proto(response: GetEdgeResponse) -> Result<Option<EdgeLookup>, QueryError> {

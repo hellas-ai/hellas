@@ -3,6 +3,7 @@ use crate::domain::{
     Coin, ObjectId, ObjectKind, SettlementKey, Transaction, coin_object_id, edge_object_id,
     genesis_object_id,
 };
+use crate::owner_proof::{HOLDING_COIN, HOLDING_DELEGATED};
 use commonware_consensus::{Block as _, Heightable};
 use commonware_cryptography::{Digestible, sha256::Digest};
 use hellas_kernel::{NetworkId, Parties};
@@ -10,6 +11,15 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{Arc, RwLock},
 };
+
+/// Coin holdings shared by the replay index and authenticated owner tree.
+pub(crate) fn coin_holdings(coin: Coin) -> impl Iterator<Item = (SettlementKey, u8, u64)> {
+    std::iter::once((coin.owner, HOLDING_COIN, coin.value)).chain(
+        coin.delegate
+            .filter(|delegate| *delegate != coin.owner)
+            .map(|delegate| (delegate, HOLDING_DELEGATED, 0)),
+    )
+}
 
 /// Every authority or destination key committed by an edge, once each.
 pub(crate) fn edge_keys(parties: Parties) -> BTreeSet<SettlementKey> {
@@ -150,7 +160,14 @@ impl OwnerIndex {
         let coins = state
             .by_owner
             .get(owner)
-            .map(|coins| coins.iter().map(|(id, value)| (*id, *value)).collect())
+            .map(|coins| {
+                coins
+                    .iter()
+                    .filter_map(|((kind, id), value)| {
+                        (*kind == HOLDING_COIN).then_some((*id, *value))
+                    })
+                    .collect()
+            })
             .unwrap_or_default();
         (state.cursor, coins)
     }
@@ -185,7 +202,7 @@ struct State {
     cursor: OwnerCursor,
     genesis_allocations: Vec<(SettlementKey, u64)>,
     coins: BTreeMap<ObjectId, Coin>,
-    by_owner: BTreeMap<SettlementKey, BTreeMap<ObjectId, u64>>,
+    by_owner: BTreeMap<SettlementKey, BTreeMap<(u8, ObjectId), u64>>,
     edges: BTreeMap<ObjectId, Parties>,
     edges_by_owner: BTreeMap<SettlementKey, BTreeSet<ObjectId>>,
 }
@@ -362,10 +379,12 @@ impl State {
         if self.kind_of(&id).is_some() {
             return Err(OwnerIndexError::OutputCollision { id });
         }
-        self.by_owner
-            .entry(coin.owner)
-            .or_default()
-            .insert(id, coin.value);
+        for (key, kind, balance) in coin_holdings(coin) {
+            self.by_owner
+                .entry(key)
+                .or_default()
+                .insert((kind, id), balance);
+        }
         self.coins.insert(id, coin);
         Ok(())
     }
@@ -375,16 +394,17 @@ impl State {
             .coins
             .remove(id)
             .ok_or(OwnerIndexError::ObjectNotFound { id: *id })?;
-        let remove_owner = {
-            let owned = self
+        for (key, kind, _) in coin_holdings(coin) {
+            let held = self
                 .by_owner
-                .get_mut(&coin.owner)
-                .expect("owner index missing active coin owner");
-            owned.remove(id);
-            owned.is_empty()
-        };
-        if remove_owner {
-            self.by_owner.remove(&coin.owner);
+                .get_mut(&key)
+                .ok_or(OwnerIndexError::ObjectNotFound { id: *id })?;
+            if held.remove(&(kind, *id)).is_none() {
+                return Err(OwnerIndexError::ObjectNotFound { id: *id });
+            }
+            if held.is_empty() {
+                self.by_owner.remove(&key);
+            }
         }
         Ok(coin)
     }

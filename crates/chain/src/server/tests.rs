@@ -1,6 +1,6 @@
 use super::*;
 use crate::domain::ObjectId;
-use crate::{Mempool, OwnerCoins, light_client::QueryError};
+use crate::{CoinListing, Mempool, light_client::QueryError};
 use bytes::Bytes;
 use hellas_kernel::test_support::valid_open_tx;
 use hellas_kernel::{EdgeId, Encode as _, PartyAuth};
@@ -108,7 +108,14 @@ impl LightClientApi for MempoolClient {
     async fn get_coins_by_owner(
         &self,
         _owner: SettlementKey,
-    ) -> Result<Option<OwnerCoins>, QueryError> {
+    ) -> Result<Option<CoinListing>, QueryError> {
+        panic!("unused test method")
+    }
+
+    async fn get_coins_by_delegate(
+        &self,
+        _delegate: SettlementKey,
+    ) -> Result<Option<CoinListing>, QueryError> {
         panic!("unused test method")
     }
 

@@ -36,7 +36,9 @@ service LightClient {
   rpc SubmitWorkResponse(SubmitWorkResponseRequest) returns (SubmitTxResponse);
   rpc SubscribeActivity(SubscribeActivityRequest) returns (stream ActivityEvent);
   rpc GetValidators(GetValidatorsRequest) returns (GetValidatorsResponse);
-  rpc GetCoinsByOwner(GetCoinsByOwnerRequest) returns (GetCoinsByOwnerResponse);
+  rpc GetCoinsByOwner(GetCoinsByOwnerRequest) returns (GetCoinsResponse);
+  // Coins delegated to this node, without counting them as its owned balance.
+  rpc GetCoinsByDelegate(GetCoinsByDelegateRequest) returns (GetCoinsResponse);
   rpc GetEdgesByOwner(GetEdgesByOwnerRequest) returns (GetEdgesByOwnerResponse);
   rpc GetRelayInfo(GetRelayInfoRequest) returns (GetRelayInfoResponse);
   rpc GetConsensusInfo(GetConsensusInfoRequest) returns (GetConsensusInfoResponse);
@@ -187,12 +189,16 @@ message GetCoinsByOwnerRequest {
   bytes owner = 1;
 }
 
+message GetCoinsByDelegateRequest {
+  bytes delegate = 1;
+}
+
 message CoinEntry {
   bytes object_id = 1;
   uint64 value = 2;
 }
 
-message GetCoinsByOwnerResponse {
+message GetCoinsResponse {
   FinalizedSnapshot snapshot = 1;
   repeated CoinEntry coins = 2;
 }

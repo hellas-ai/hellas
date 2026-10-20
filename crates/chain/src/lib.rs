@@ -84,8 +84,8 @@ pub use hellas_rpc::{
 pub use indexer::{ChainIndexer, IngestError, IngestOutcome};
 #[cfg(any(feature = "client-core", feature = "server"))]
 pub use light_client::{
-    ConsensusActivity, ConsensusInfo, EdgeLookup, EdgeRecord, EdgeState, FinalizedBlock,
-    FinalizedBlockQuery, LatestBlock, LightClient, OwnerCoins, OwnerEdges, ProposalInfo,
+    CoinListing, ConsensusActivity, ConsensusInfo, EdgeLookup, EdgeRecord, EdgeState,
+    FinalizedBlock, FinalizedBlockQuery, LatestBlock, LightClient, OwnerEdges, ProposalInfo,
     QueryError,
 };
 #[cfg(any(feature = "indexer", feature = "validator"))]

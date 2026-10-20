@@ -11,7 +11,7 @@ use hellas_rpc::pb::{
     chain::{
         self as pb, ActivityEvent, CoinEntry, EdgeEntry, EdgeState as ProtoEdgeState,
         FinalizationEvent, FinalizedBlock as ProtoFinalizedBlock, FinalizedSnapshot,
-        GetCoinResponse, GetCoinsByOwnerResponse, GetConsensusInfoResponse, GetEdgeResponse,
+        GetCoinResponse, GetCoinsResponse, GetConsensusInfoResponse, GetEdgeResponse,
         GetEdgesByOwnerResponse, GetFinalizationResponse, GetFinalizedBlockResponse,
         GetLatestBlockResponse, GetProofResponse, GetRelayInfoResponse, GetStateRootResponse,
         GetValidatorsResponse, KernelFees, NotarizationEvent, NotarizeEvent, NullificationEvent,
@@ -413,32 +413,30 @@ where
     fn get_coins_by_owner(
         &self,
         request: pb::GetCoinsByOwnerRequest,
-    ) -> impl Future<Output = Result<GetCoinsByOwnerResponse, WireStatus>> + Send {
+    ) -> impl Future<Output = Result<GetCoinsResponse, WireStatus>> + Send {
         let client = self.client.clone();
         async move {
             let owner = settlement_key_from_bytes(request.owner, "owner")?;
-            let response = match client
+            let response = client
                 .get_coins_by_owner(owner)
                 .await
-                .map_err(WireStatus::from)?
-            {
-                Some(owner_coins) => GetCoinsByOwnerResponse {
-                    snapshot: Some(latest_block_to_proto(owner_coins.snapshot)),
-                    coins: owner_coins
-                        .coins
-                        .into_iter()
-                        .map(|(object_id, value)| CoinEntry {
-                            object_id: object_id.to_vec(),
-                            value,
-                        })
-                        .collect(),
-                },
-                None => GetCoinsByOwnerResponse {
-                    snapshot: None,
-                    coins: Vec::new(),
-                },
-            };
-            Ok(response)
+                .map_err(WireStatus::from)?;
+            Ok(coin_listing_response(response))
+        }
+    }
+
+    fn get_coins_by_delegate(
+        &self,
+        request: pb::GetCoinsByDelegateRequest,
+    ) -> impl Future<Output = Result<GetCoinsResponse, WireStatus>> + Send {
+        let client = self.client.clone();
+        async move {
+            let delegate = settlement_key_from_bytes(request.delegate, "delegate")?;
+            let response = client
+                .get_coins_by_delegate(delegate)
+                .await
+                .map_err(WireStatus::from)?;
+            Ok(coin_listing_response(response))
         }
     }
 
@@ -784,4 +782,24 @@ where
     Ok(GetFinalizationResponse {
         certificate: read(digest_from_bytes(request.payload, "payload")?).await?,
     })
+}
+
+fn coin_listing_response(response: Option<crate::CoinListing>) -> GetCoinsResponse {
+    match response {
+        Some(listing) => GetCoinsResponse {
+            snapshot: Some(latest_block_to_proto(listing.snapshot)),
+            coins: listing
+                .coins
+                .into_iter()
+                .map(|(object_id, value)| CoinEntry {
+                    object_id: object_id.to_vec(),
+                    value,
+                })
+                .collect(),
+        },
+        None => GetCoinsResponse {
+            snapshot: None,
+            coins: Vec::new(),
+        },
+    }
 }

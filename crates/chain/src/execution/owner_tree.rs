@@ -7,8 +7,7 @@ use crate::owner_proof::OwnerPageProof;
 use crate::{
     domain::{Object, ObjectId, SettlementKey},
     owner_proof::{
-        HOLDING_COIN, HOLDING_DELEGATED, HOLDING_EDGE, OWNER_NODE_BYTES, OwnerProofError,
-        OwnerTreeStore, update_holding,
+        HOLDING_EDGE, OWNER_NODE_BYTES, OwnerProofError, OwnerTreeStore, update_holding,
     },
 };
 use commonware_glue::stateful::db::DatabaseSet;
@@ -132,15 +131,7 @@ impl<E: StorageContext + Spawner + Send + Sync + 'static> OwnerTreeStore for Bat
 /// committed in two roles is one entry.
 fn ownership(object: Option<Object>) -> Vec<(SettlementKey, u8, u64)> {
     match object {
-        Some(Object::Coin(coin)) => {
-            let mut entries = vec![(coin.owner, HOLDING_COIN, coin.value)];
-            if let Some(delegate) = coin.delegate
-                && delegate != coin.owner
-            {
-                entries.push((delegate, HOLDING_DELEGATED, 0));
-            }
-            entries
-        }
+        Some(Object::Coin(coin)) => crate::owner_index::coin_holdings(coin).collect(),
         Some(Object::Edge(edge)) => crate::owner_index::edge_keys(edge.parties())
             .into_iter()
             .map(|key| (key, HOLDING_EDGE, 0))
