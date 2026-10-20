@@ -1,32 +1,16 @@
 use super::*;
+use hellas_auth::authority as auth;
+use hellas_sdk::node_control::{bootstrap::Invitation, configuration::*};
 use hellas_work::model::grant::records::decode_enrollment;
-
-struct Managed {
-    task: tokio::task::JoinHandle<hellas_cloud::agent::Result<()>>,
-    stop: Option<tokio::sync::oneshot::Sender<()>>,
-}
-impl Drop for Managed {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-impl Managed {
-    async fn stop(&mut self) {
-        self.stop.take().unwrap().send(()).unwrap();
-        tokio::time::timeout(Duration::from_secs(15), &mut self.task)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-    }
-}
 
 struct ManagedWorker {
     root: tempfile::TempDir,
     owner: Cli,
-    managed: Managed,
+    node: Process,
     _upstream: Https,
-    work_address: std::net::SocketAddr,
+    pin: String,
+    address: String,
+    profile: PathBuf,
     work_profile: PathBuf,
     trust_root: PathBuf,
     gateway_profile: PathBuf,
@@ -34,229 +18,236 @@ struct ManagedWorker {
 }
 impl ManagedWorker {
     async fn start() -> Self {
-        use hellas_cloud::agent::{self, AgentOptions};
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
         hellas_private::restrict_directory(root).unwrap();
         let owner = Cli::new(root, "owner", AGENT_PASSKEY);
         owner.run(&["--software-root", "identity", "init"]).await;
-        let (admin_address, credentials) = prepare_machine(&owner, "worker").await;
-        let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let work_address = udp.local_addr().unwrap();
-        drop(udp);
-        let data = root.join("worker");
-        let private = root.join("private");
-        // Ordinary agent startup opens existing authority; provision the fixture offline.
-        hellas_private::create_dir_all_durable(&data).unwrap();
-        hellas_private::create_dir_all_durable(&private).unwrap();
-        // The worker's operator administers it with its own passkey.
-        let worker = Cli::new(&data, "identity", ROOT_PASSKEY);
+        let state = root.join("worker");
+        hellas_private::create_dir_all_durable(&state).unwrap();
+        let worker = Cli::new(&state, "identity", ROOT_PASSKEY);
         worker.run(&["--software-root", "identity", "init"]).await;
         let exported = worker.output(&["identity", "export-enrollment"]).await;
         assert!(exported.status.success());
         let provider = decode_enrollment(&exported.stdout).unwrap();
-        use hellas_auth::authority as auth;
-        let authority = auth::AuthorityId(hellas_auth::Digest::hash(b"managed control fixture"));
-        let root_grant = auth::GrantId([1; 16]);
-        let now = hellas_auth::authority::UnixMillis::now().unwrap_or_default();
-        let extra: Vec<_> = [
-            hellas_work::node::WORK_CAPACITY_CONFIGURE,
-            hellas_work::work_store::grant::WORK_ALLOWANCE_CONFIGURE,
-            hellas_work::work_store::grant::WORK_BUDGET_CONFIGURE,
-            hellas_work::work_store::grant::WORK_RESOURCE_CONFIGURE,
-        ]
-        .into_iter()
-        .map(|op| (op, hellas_work::node::machine_resource(authority)))
-        .chain([(
-            hellas_work::node::HOST_STATUS,
-            hellas_work::node::host_resource(authority),
-        )])
-        .collect();
+        let https = Https::start(None).await;
+        let resources = root.join("resources.json");
+        std::fs::write(&resources, json!({
+            "journal_root":state.join("provider"),"control_socket":state.join("control.sock"),
+            "control_certificate":state.join("control.cert.der"),"control_private_key":state.join("control.key.der"),
+            "max_job_millis":10000,"resources":[{
+                "resource":auth::ResourceId(hellas_auth::Digest::hash(b"test resource")),
+                "account":auth::ResourceId(hellas_auth::Digest::hash(b"test account")),"revision":1,
+                "pricing":{"revision":1,"rates":null},"name":"glm",
+                "fetch":{"contract":hellas_rpc::FetchContract::http().unwrap(),
+                    "allowed_environment":hellas_rpc::FetchContract::http().unwrap().manifest_id().to_string(),
+                    "service":"http","method":"request","max_request_body_bytes":65536,
+                    "max_output_events":256,"max_output_bytes":65536,"max_spool_bytes":262144,
+                    "max_encoded_result_frame":262144,"max_encoded_prepared_input":262144},
+                "https":{"origin":https.origin,"paths":["/v1/chat/completions"],"methods":["POST"],
+                    "credential":null,"tls":{"roots":{"mode":"certificates","der_base64":[https.root_der]},"spki_sha256":[]},
+                    "accounting":"openai-chat","max_output_tokens":8,"max_response_bytes":65536}
+            }]
+        }).to_string()).unwrap();
+        // The installed policy must name an available route at startup. Remote
+        // administration will enable private-address access before the first job.
+        std::fs::write(
+            state.join("fetch.json"),
+            json!({"revision":0,"routes":[{
+                "service":"http","method":"request","destination":{"type":"http",
+                "config":{"allowed_hosts":["localhost"],"allow_private_addresses":false}}
+            }]})
+            .to_string(),
+        )
+        .unwrap();
+        let mut node = worker.spawn(
+            &[
+                "serve",
+                "--await-owner",
+                string(&state),
+                "--grant-config",
+                string(&resources),
+                "--port",
+                "0",
+                "--no-discovery",
+            ],
+            "node.log",
+        );
+        let invitation = invitation(&mut node).await;
+        let pin = invitation.node.to_string();
+        let address = invitation
+            .addresses
+            .iter()
+            .find(|address| address.is_ipv4())
+            .unwrap()
+            .to_string();
+        let invitation_file = root.join("invitation.json");
+        std::fs::write(&invitation_file, serde_json::to_vec(&invitation).unwrap()).unwrap();
+        let authority = auth::AuthorityId(hellas_auth::Digest::hash(b"normal host fixture"));
+        let now = auth::UnixMillis::now().unwrap();
+        let extra: Vec<_> = hellas_work::operations::OPERATIONS
+            .iter()
+            .filter(|operation| {
+                !matches!(operation.scope, hellas_work::operations::Scope::Allowance)
+            })
+            .map(|operation| {
+                (
+                    operation.name,
+                    operation.permission(authority, None).unwrap().resource,
+                )
+            })
+            .collect();
         let administrator = common_node::admin_spec(
             authority,
-            worker.principal(),
+            owner.principal(),
             &extra,
             (now, auth::UnixMillis(now.0 + 3_600_000)),
             (3_600_000, 8),
             &[hellas_work::grant_service::WORK_EXECUTE],
         );
-        // Give the readiness application only status, even though the offline root
-        // can grant other authority rights. Both are explicit native transitions.
-        let mut application = administrator.clone();
-        application.issuance = None;
-        application
-            .permissions
-            .retain(|p| p.operation.as_str() == hellas_work::node::HOST_STATUS);
-        let (store, secret) = hellas_work::work_store::grant::NodeStore::bootstrap(
-            &private.join("grants"),
-            hellas_work::model::grant::grant_network(),
-            root_grant,
-            common_node::approval(
-                auth::Ownership::Bootstrap { root: root_grant },
-                administrator,
-            ),
-            Some(provider.clone()),
-            now,
+        let administrator_file = root.join("administrator.json");
+        let scope_file = root.join("scope.json");
+        std::fs::write(
+            &administrator_file,
+            serde_json::to_vec(&administrator).unwrap(),
         )
-        .await
         .unwrap();
-        let operator_profile = profile(&private, "operator", authority, root_grant, &secret);
-        let node = hellas_work::node::NodeCoordinator::new(
-            store,
-            Arc::new(|| hellas_auth::authority::UnixMillis::now().unwrap_or_default()),
-        );
-        // The agent's readiness check opens a daily session with the worker's
-        // own node key, so the control credential is held by that node.
-        let caller = hellas_work::test_support::session(&node, &secret).await;
-        let (_, secret) = hellas_work::test_support::credentials::issue_one(
-            &node,
-            &caller,
-            root_grant,
-            application,
-            worker.holder().await,
-        )
-        .await
-        .unwrap();
-        drop(node);
-        // The agent's readiness check reads this fixed profile name.
-        profile(&private, "control", authority, root_grant, &secret);
-        control_tls(&private);
-        let cli = PathBuf::from(env!("CARGO_BIN_EXE_hellas-cli"));
-        let mut serve_args = vec![
-            "--port".into(),
-            work_address.port().to_string(),
-            "--no-discovery".into(),
-        ];
-        if cfg!(feature = "evaluate") {
-            serve_args.extend([
-                "--store-dir".into(),
-                data.join("store").to_string_lossy().into_owned(),
-            ]);
-        }
-        let (stop, stopped) = tokio::sync::oneshot::channel();
-        let task = tokio::spawn(agent::run_until(
-            AgentOptions {
-                credentials,
-                data: data.clone(),
-                configuration_dir: Some(private.clone()),
-                cli: cli.clone(),
-                launcher: vec![cli.to_string_lossy().into_owned(), "serve".into()],
-                serve_args,
-                bind: Some(admin_address),
-                no_relay: true,
-            },
-            async {
-                let _ = stopped.await;
-            },
-        ));
-        let mut managed = Managed {
-            task,
-            stop: Some(stop),
-        };
-        let control = private.join("control.sock");
-        tokio::time::timeout(Duration::from_secs(30), async {
-            while !control.exists() {
-                if managed.task.is_finished() {
-                    panic!("agent failed: {:?}", (&mut managed.task).await);
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        })
-        .await
-        .unwrap();
-        let https = Https::start(None).await;
-        let fetch = root.join("managed-fetch.json");
-        let resources = root.join("managed-resources.json");
-        std::fs::write(&fetch, json!({"routes":[{"service":"http","method":"request","destination":{"type":"http","config":{"allowed_hosts":["localhost"],"allow_private_addresses":true}}}]}).to_string()).unwrap();
-        std::fs::write(&resources, json!({"max_job_millis":10000,"resources":[{"resource":hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test resource")),"account":hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test account")),"revision":1,"pricing":{"revision":1,"rates":null},"name":"glm","fetch":{ "contract":hellas_rpc::FetchContract::http().unwrap(),
-        "allowed_environment":hellas_rpc::FetchContract::http().unwrap().manifest_id().to_string(),"service":"http","method":"request","max_request_body_bytes":65536,"max_output_events":256,"max_output_bytes":65536,"max_spool_bytes":262144,"max_encoded_result_frame":262144,"max_encoded_prepared_input":262144},
-        "https":{"origin":https.origin,"paths":["/v1/chat/completions"],"methods":["POST"],"credential":null,"tls":{"roots":{"mode":"certificates","der_base64":[https.root_der]},"spki_sha256":[]},"accounting":"openai-chat","max_output_tokens":8,"max_response_bytes":65536}}]}).to_string()).unwrap();
-        owner
-            .run(&[
-                "machines",
-                "configure",
-                "worker",
-                "--fetch-config",
-                string(&fetch),
-                "--grant-config",
-                string(&resources),
+        let scope = administrator;
+        std::fs::write(&scope_file, serde_json::to_vec(&scope).unwrap()).unwrap();
+        let profile_dir = root.join("administration");
+        let bootstrap = owner
+            .output(&[
+                "admin",
+                "bootstrap-remote",
+                "--invitation",
+                string(&invitation_file),
+                "--root-grant",
+                &GrantId([0; 16]).to_string(),
+                "--administrator",
+                string(&administrator_file),
+                "--credential-scope",
+                string(&scope_file),
+                "--profile-out",
+                string(&profile_dir),
             ])
             .await;
-        let limits = root.join("machine-limits.json");
+        assert!(
+            bootstrap.status.success(),
+            "bootstrap failed: {}; node: {}",
+            String::from_utf8_lossy(&bootstrap.stderr),
+            std::fs::read_to_string(&node.log).unwrap()
+        );
+        let initialized: Value = serde_json::from_slice(&bootstrap.stdout).unwrap();
+        assert_eq!(initialized["node_id"], pin);
+        let profile = PathBuf::from(initialized["profile"].as_str().unwrap());
+        node.wait_for("RPC server running.").await;
+        let connection = ["--node", pin.as_str(), "--address", address.as_str()];
+        let base = ["admin", "--profile", string(&profile)];
+        let run = |tail: Vec<String>| {
+            let mut args: Vec<String> = base
+                .iter()
+                .chain(connection.iter())
+                .map(|s| (*s).into())
+                .collect();
+            args.extend(tail);
+            args
+        };
+        let update = ProviderUpdate {
+            expected_revision: 0,
+            change: Some(UpstreamChange::SetEndpoint(UpstreamEndpoint {
+                service: "http".into(),
+                method: "request".into(),
+                allowed_hosts: vec!["localhost".into()],
+                allow_private_addresses: true,
+            })),
+        };
+        let command = request_file(root, &update);
+        let args = run(vec!["configure-provider".into(), string(&command).into()]);
+        owner
+            .run(&args.iter().map(String::as_str).collect::<Vec<_>>())
+            .await;
+        let limits = root.join("limits.json");
         std::fs::write(
             &limits,
             br#"[{"meter":"OutputTokens","window":"Total","amount":10}]"#,
         )
         .unwrap();
-        worker
-            .run(&[
-                "admin",
-                "--profile",
-                string(&operator_profile),
-                "--control-socket",
-                string(&control),
-                "set-capacity",
-                "--expected-revision",
-                "0",
-                "--max-in-flight",
-                "2",
-                "--limits",
-                string(&limits),
-            ])
+        let args = run(vec![
+            "set-capacity".into(),
+            "--expected-revision".into(),
+            "0".into(),
+            "--max-in-flight".into(),
+            "2".into(),
+            "--limits".into(),
+            string(&limits).into(),
+        ]);
+        owner
+            .run(&args.iter().map(String::as_str).collect::<Vec<_>>())
             .await;
-        let work_subject = owner.principal();
-        let work_allowance = hellas_work::model::grant::owner_grant_id(
+        let subject = owner.principal();
+        let allowance = hellas_work::model::grant::owner_grant_id(
             hellas_work::model::grant::grant_network(),
             provider.content_id(),
-            work_subject,
+            subject,
         );
-        for definition in common_node::budgets(
+        let mut commands: Vec<_> = common_node::budgets(
             common_node::POOL,
-            work_subject,
+            subject,
             vec![Limit {
                 meter: Meter::OutputTokens,
                 window: Window::Total,
                 amount: 10,
             }],
             1,
-        ) {
-            admin(
-                &worker,
-                &operator_profile,
-                &control,
-                WorkControlCommand::ConfigureBudget { definition },
-            )
-            .await;
-        }
-        admin(
-            &worker,
-            &operator_profile,
-            &control,
+        )
+        .into_iter()
+        .map(|definition| WorkControlCommand::ConfigureBudget { definition })
+        .collect();
+        commands.extend([
             WorkControlCommand::ConfigureResource {
                 policy: "glm".into(),
             },
-        )
-        .await;
-        admin(
-            &worker,
-            &operator_profile,
-            &control,
             WorkControlCommand::Create {
-                id: work_allowance,
-                terms: terms(work_subject),
+                id: allowance,
+                terms: terms(subject),
             },
-        )
-        .await;
-        let work_profile = issue_work_profile(
-            &worker,
-            &operator_profile,
-            &control,
+        ]);
+        for command in commands {
+            let file = request_file(root, &command);
+            let args = run(vec!["work".into(), string(&file).into()]);
+            owner
+                .run(&args.iter().map(String::as_str).collect::<Vec<_>>())
+                .await;
+        }
+        let work_profile = issue_work_profile_at(
+            &owner,
+            &profile,
+            &connection,
             root,
-            work_subject,
+            subject,
             &owner.holder_file().await,
-            work_allowance,
+            allowance,
         )
         .await;
+        let offer = root.join("worker.offer");
+        let command = request_file(
+            root,
+            &WorkControlCommand::Offers {
+                id: Some(allowance),
+            },
+        );
+        let args = run(vec![
+            "work".into(),
+            string(&command).into(),
+            "--offer-out".into(),
+            string(&offer).into(),
+        ]);
+        owner
+            .run(&args.iter().map(String::as_str).collect::<Vec<_>>())
+            .await;
+        owner
+            .run(&["offer", "import", string(&offer), "--name", "worker"])
+            .await;
         let (gateway_profile, gateway_token) = gateway_profile(root).await;
         let trust_root = approve(
             root,
@@ -267,17 +258,29 @@ impl ManagedWorker {
         Self {
             root: directory,
             owner,
-            managed,
+            node,
             _upstream: https,
-            work_address,
+            pin,
+            address,
+            profile,
             work_profile,
             trust_root,
             gateway_profile,
             gateway_token,
         }
     }
-    async fn enrollment(&self) -> Value {
-        serde_json::from_str(&self.owner.run(&["machines", "resolve", "worker"]).await).unwrap()
+    async fn control(&self, command: &[&str]) -> Value {
+        let mut args = vec![
+            "admin",
+            "--node",
+            &self.pin,
+            "--address",
+            &self.address,
+            "--profile",
+            string(&self.profile),
+        ];
+        args.extend_from_slice(command);
+        serde_json::from_str(&self.owner.run(&args).await).unwrap()
     }
     async fn fetch(&self) {
         let mut gateway = self.owner.spawn(
@@ -287,12 +290,10 @@ impl ManagedWorker {
                 string(&self.trust_root),
                 "--trust-policy",
                 "worker",
-                "--machine",
+                "--offer",
                 "worker",
                 "--work-profile",
                 string(&self.work_profile),
-                "--address",
-                &self.work_address.to_string(),
                 "--port",
                 "0",
                 "--gateway-profile",
@@ -315,13 +316,121 @@ impl ManagedWorker {
         gateway.stop().await;
     }
 }
+
+async fn invitation(node: &mut Process) -> Invitation {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let log = std::fs::read_to_string(&node.log).unwrap();
+        if let Some(invitation) = log
+            .lines()
+            .find_map(|line| serde_json::from_str::<Invitation>(line).ok())
+        {
+            return invitation;
+        }
+        assert!(
+            node.child.try_wait().unwrap().is_none(),
+            "node exited: {log}"
+        );
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "pairing invitation missing: {log}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn managed_worker_reconnects_through_its_original_enrollment() {
+async fn normal_host_reconnects_through_its_original_enrollment() {
     let mut worker = ManagedWorker::start().await;
-    let before = worker.enrollment().await;
+    let before = worker.control(&["status"]).await;
+    assert_eq!(before["configuration"]["revision"], 1);
+    let stranger = Cli::new(worker.root.path(), "stranger", STRANGER_PASSKEY);
+    stranger.run(&["--software-root", "identity", "init"]).await;
+    let refused = stranger
+        .output(&[
+            "admin",
+            "--node",
+            &worker.pin,
+            "--address",
+            &worker.address,
+            "--profile",
+            string(&worker.profile),
+            "status",
+        ])
+        .await;
+    assert!(
+        !refused.status.success(),
+        "a foreign passkey must not use the owner's credential"
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stderr)
+            .to_lowercase()
+            .contains("denied"),
+        "the live server must refuse authentication: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
     worker.fetch().await;
-    worker.owner.run(&["machines", "restart", "worker"]).await;
-    assert_eq!(worker.enrollment().await, before);
+    worker
+        .control(&["set-provider-state", "--enabled", "false"])
+        .await;
+    worker
+        .control(&["set-provider-state", "--enabled", "true"])
+        .await;
+    let after = worker.control(&["status"]).await;
+    assert_eq!(after["endpoint"], before["endpoint"]);
+    assert_eq!(after["authority"], before["authority"]);
+    assert_eq!(after["configuration"], before["configuration"]);
     worker.fetch().await;
-    worker.managed.stop().await;
+    assert_eq!(worker._upstream.calls.load(Ordering::SeqCst), 2);
+    worker.node.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_configuration_restores_the_route_and_requires_explicit_restart() {
+    let mut worker = ManagedWorker::start().await;
+    worker.fetch().await;
+    let path = worker.root.path().join("worker/fetch.json");
+    let original = std::fs::read(&path).unwrap();
+    let command = request_file(
+        worker.root.path(),
+        &ProviderUpdate {
+            expected_revision: 1,
+            change: Some(UpstreamChange::RemoveEndpoint(UpstreamRoute {
+                service: "http".into(),
+                method: "request".into(),
+            })),
+        },
+    );
+    // Removing a route required by the installed Work policy passes parsing,
+    // then fails actual provider startup. It must not become durable config.
+    let refused = worker
+        .owner
+        .output(&[
+            "admin",
+            "--node",
+            &worker.pin,
+            "--address",
+            &worker.address,
+            "--profile",
+            string(&worker.profile),
+            "configure-provider",
+            string(&command),
+        ])
+        .await;
+    assert!(!refused.status.success());
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+    let failed = worker.control(&["status"]).await;
+    assert_eq!(
+        failed["provider_state"],
+        hellas_rpc::pb::host::RuntimeState::Failed as i32
+    );
+    assert_eq!(worker._upstream.calls.load(Ordering::SeqCst), 1);
+    worker
+        .control(&["set-provider-state", "--enabled", "true"])
+        .await;
+    let recovered = worker.control(&["status"]).await;
+    assert_eq!(recovered["configuration"]["revision"], 1);
+    worker.fetch().await;
+    assert_eq!(worker._upstream.calls.load(Ordering::SeqCst), 2);
+    worker.node.stop().await;
 }

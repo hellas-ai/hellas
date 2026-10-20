@@ -87,15 +87,10 @@ struct NativeOwner {
     calls: Arc<AtomicUsize>,
     service: GrantService,
     servers: tokio::task::JoinSet<()>,
-    admin: iroh::Endpoint,
     endpoint: iroh::Endpoint,
 }
 impl NativeOwner {
     async fn start() -> Self {
-        use hellas_cloud::{
-            config::Enrollment,
-            wire::{self, Response},
-        };
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
         hellas_private::restrict_directory(root).unwrap();
@@ -103,7 +98,6 @@ impl NativeOwner {
         owner.run(&["--software-root", "identity", "init"]).await;
         let owner_principal = owner.principal();
         let owner_holder = owner.holder().await;
-        let (admin_address, credentials) = prepare_machine(&owner, "native").await;
         let transport = iroh::SecretKey::generate();
         let signer = Arc::new(ProducerSigningKey::from_secret_bytes([42; 32]).unwrap());
         let provider = hellas_work::test_support::enrollment(
@@ -125,56 +119,7 @@ impl NativeOwner {
             .ip_addrs()
             .find(|addr| addr.is_ipv4())
             .unwrap();
-        let admin = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
-            .secret_key(credentials.secret_key().unwrap())
-            .alpns(vec![wire::ALPN.to_vec()])
-            .bind_addr(admin_address)
-            .unwrap()
-            .bind()
-            .await
-            .unwrap();
-        let enrollment = Enrollment {
-            node_id: endpoint.id().to_string(),
-            enrollment_id: provider.content_id().to_string(),
-            bundle: hex::encode(provider.canonical_bytes()),
-        };
         let mut servers = tokio::task::JoinSet::new();
-        let admin_server = admin.clone();
-        servers.spawn(async move {
-            while let Some(incoming) = admin_server.accept().await {
-                let connection = incoming.await.unwrap();
-                let (mut send, mut recv) = connection.accept_bi().await.unwrap();
-                let request: wire::Request =
-                    serde_json::from_slice(&recv.read_to_end(wire::MAX_MESSAGE).await.unwrap())
-                        .unwrap();
-                // The owner's node key proves this exact connection.
-                let (_, node) = credentials.owner().unwrap().unwrap();
-                let proof: [u8; 64] = hex::decode(request.proof.as_deref().unwrap())
-                    .unwrap()
-                    .try_into()
-                    .unwrap();
-                hellas_auth::signature::verify_digest_signature(
-                    &node.public_key(),
-                    &hellas_auth::Signature::Secp256k1(proof),
-                    wire::session_digest(&connection).unwrap(),
-                )
-                .unwrap();
-                assert_eq!(request.token, credentials.token);
-                assert!(matches!(request.operation, wire::Operation::Status));
-                send.write_all(
-                    &serde_json::to_vec(&Response::Status {
-                        enrollment: enrollment.clone(),
-                        owner: credentials.owner.clone(),
-                        running: true,
-                    })
-                    .unwrap(),
-                )
-                .await
-                .unwrap();
-                send.finish().unwrap();
-                connection.closed().await;
-            }
-        });
         let (environment, policy, environment_file, tokenizer) =
             native_model(root, "native", 128, 1);
         let (store, secret) = common_node::bootstrap_node_with_credential(
@@ -271,6 +216,21 @@ impl NativeOwner {
             }
         }
     });
+        let WorkControlReply::Offers(offers) = work_admin
+            .command(WorkControlCommand::Offers { id: Some(owner_id) })
+            .await
+            .unwrap()
+        else {
+            panic!("offer reply required")
+        };
+        let [offer] = offers.as_slice() else {
+            panic!("one signed offer required")
+        };
+        let offer_file = root.join("native.offer");
+        std::fs::write(&offer_file, offer.encode().unwrap()).unwrap();
+        owner
+            .run(&["offer", "import", string(&offer_file), "--name", "native"])
+            .await;
         let (gateway_profile, gateway_token) = gateway_profile(root).await;
         let trust_root = approve(
             root,
@@ -281,7 +241,7 @@ impl NativeOwner {
         let mut gateway = owner.spawn(
             &[
                 "gateway",
-                "--machine",
+                "--offer",
                 "native",
                 "--trust-store",
                 string(&trust_root),
@@ -289,8 +249,6 @@ impl NativeOwner {
                 "native",
                 "--work-profile",
                 string(&work_profile),
-                "--address",
-                &address.to_string(),
                 "--environment",
                 string(&environment_file),
                 "--tokenizer",
@@ -321,7 +279,6 @@ impl NativeOwner {
             calls,
             service,
             servers,
-            admin,
             endpoint,
         }
     }
@@ -329,12 +286,11 @@ impl NativeOwner {
         self.gateway.stop().await;
         self.service.drain().await.unwrap();
         self.servers.shutdown().await;
-        self.admin.close().await;
         self.endpoint.close().await;
     }
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn machine_owner_gateway_projects_signed_native_work() {
+async fn owner_offer_gateway_projects_signed_native_work() {
     let fixture = NativeOwner::start().await;
     let before = fixture.calls.load(Ordering::SeqCst);
     let response = post(

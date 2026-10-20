@@ -188,7 +188,6 @@ impl Cli {
             .args(args)
             .env("HELLAS_GRANT_DATA_DIR", self.root.join("grants"))
             .env("HELLAS_STORE_DIR", self.root.join("store"))
-            .env("HELLAS_MACHINES_DIR", self.root.join("machines"))
             .env("RUST_LOG", "hellas_gateway=info")
             .env("OTEL_SDK_DISABLED", "true")
             .stdin(Stdio::null())
@@ -372,6 +371,27 @@ async fn issue_work_profile(
     holder: &Path,
     allowance: GrantId,
 ) -> PathBuf {
+    issue_work_profile_at(
+        cli,
+        administrator,
+        &["--control-socket", string(socket)],
+        root,
+        subject,
+        holder,
+        allowance,
+    )
+    .await
+}
+
+async fn issue_work_profile_at(
+    cli: &Cli,
+    administrator: &Path,
+    connection: &[&str],
+    root: &Path,
+    subject: hellas_auth::authority::PrincipalId,
+    holder: &Path,
+    allowance: GrantId,
+) -> PathBuf {
     use hellas_auth::authority as auth;
     let profile = hellas_sdk::node_control::profile::ClientProfile::load(administrator).unwrap();
     let now = hellas_auth::authority::UnixMillis::now().unwrap_or_default();
@@ -396,34 +416,23 @@ async fn issue_work_profile(
             spec: scope.clone(),
         },
     );
-    cli.run(&[
-        "admin",
-        "--profile",
-        string(administrator),
-        "--control-socket",
-        string(socket),
-        "grant",
-        string(&command),
-    ])
-    .await;
+    let mut args = vec!["admin", "--profile", string(administrator)];
+    args.extend_from_slice(connection);
+    let mut grant_args = args.clone();
+    grant_args.extend(["grant", string(&command)]);
+    cli.run(&grant_args).await;
     let scope = request_file(root, &scope);
     let output = root.join("issued-work.credential");
-    let issued = cli
-        .run(&[
-            "admin",
-            "--profile",
-            string(administrator),
-            "--control-socket",
-            string(socket),
-            "issue-credential",
-            "--scope",
-            string(&scope),
-            "--holder",
-            string(holder),
-            "--credential-out",
-            string(&output),
-        ])
-        .await;
+    args.extend([
+        "issue-credential",
+        "--scope",
+        string(&scope),
+        "--holder",
+        string(holder),
+        "--credential-out",
+        string(&output),
+    ]);
+    let issued = cli.run(&args).await;
     let issued: Value = serde_json::from_str(&issued).unwrap();
     assert_eq!(issued["subject"], hex::encode(subject.as_bytes()));
     assert_eq!(issued["subject_fingerprint"], subject.fingerprint());
@@ -577,35 +586,6 @@ fn approve(
         )
         .unwrap();
     trust_root
-}
-async fn prepare_machine(
-    owner: &Cli,
-    name: &str,
-) -> (std::net::SocketAddr, hellas_cloud::config::Credentials) {
-    let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-    let admin_address = udp.local_addr().unwrap();
-    drop(udp);
-    let bootstrap = owner.root.join(format!("{name}-bootstrap.json"));
-    owner
-        .run(&[
-            "machines",
-            "prepare",
-            name,
-            "--bootstrap-file",
-            string(&bootstrap),
-            "--admin-addr",
-            &admin_address.to_string(),
-        ])
-        .await;
-    let settings: std::collections::BTreeMap<String, String> =
-        hellas_cloud::config::read_json(&bootstrap).unwrap();
-    let credentials = hellas_cloud::config::Credentials {
-        admin_secret: settings["HELLAS_REMOTE_KEY"].clone(),
-        token: settings["HELLAS_REMOTE_TOKEN"].clone(),
-        owner: Some(settings["HELLAS_REMOTE_OWNER"].clone()),
-        owner_node: Some(settings["HELLAS_REMOTE_OWNER_NODE"].clone()),
-    };
-    (admin_address, credentials)
 }
 async fn post(client: &reqwest::Client, url: &str, body: Value) -> reqwest::Response {
     client.post(url).json(&body).send().await.unwrap()
