@@ -470,7 +470,7 @@ async fn a_paid_job_closes_at_exactly_what_it_earned() {
         (certificate, signature),
         (
             &payment.certificate,
-            &PartyAuth::signer(payment.certificate_signature)
+            &PartyAuth::owner(payment.certificate_signature)
         ),
         "the close carries the client's own certificate, not a copy of the number",
     );
@@ -2143,6 +2143,81 @@ fn channel_with_span(span: u64) -> hellas_work::model::work::PaidChannel {
     }
 }
 
+#[test]
+fn close_witnesses_follow_the_actual_keys_for_sole_and_split_parties() {
+    use hellas_kernel::{Authority, EarnedCertificate, Parties, PartyKeys, StartId};
+    use hellas_work::work_close::close_response;
+    for split in [false, true] {
+        let client_owner = if split { signer(0x31) } else { client() };
+        let provider_owner = if split { signer(0x32) } else { provider() };
+        let mut terms = payment_terms();
+        terms.bond_terms.parties = Parties::new(
+            PartyKeys::new(
+                provider_owner.party_key(),
+                provider().party_key(),
+                split.then_some(provider().party_key()),
+            ),
+            PartyKeys::new(
+                client_owner.party_key(),
+                client().party_key(),
+                split.then_some(client().party_key()),
+            ),
+        );
+        let channel = hellas_work::model::work::PaidChannel::new(
+            network(),
+            payment_edge(),
+            terms,
+            &SALT,
+            channel_policy(),
+        )
+        .unwrap();
+        let certificate =
+            EarnedCertificate::new(payment_edge(), channel.payment_terms_hash(), PRICE);
+        let signed = (certificate, client().sign(certificate.digest(network())));
+        let expected = if split {
+            Authority::Signer
+        } else {
+            Authority::Owner
+        };
+        let start = close_start(&channel, Party::Maker, CURSOR, Some(signed), &client()).unwrap();
+        assert_eq!(start.action().authority(), expected);
+        assert_eq!(start.certificate().unwrap().1.authority(), expected);
+        assert!(hellas_kernel::verify_party(
+            &Secp256k1Verifier::new(),
+            start.action(),
+            channel.payment_terms().parties().maker(),
+            start_body_digest(&channel, &start)
+        ));
+        let owner_start = close_start(&channel, Party::Maker, CURSOR, None, &client_owner).unwrap();
+        assert_eq!(owner_start.action().authority(), Authority::Owner);
+        let response =
+            close_response(&channel, StartId::from_bytes([7; 32]), signed, &provider()).unwrap();
+        assert_eq!(response.action().authority(), expected);
+        assert_eq!(response.certificate_auth().authority(), expected);
+        let owner_response = close_response(
+            &channel,
+            StartId::from_bytes([7; 32]),
+            signed,
+            &provider_owner,
+        )
+        .unwrap();
+        assert_eq!(owner_response.action().authority(), Authority::Owner);
+        assert!(matches!(
+            close_start(&channel, Party::Maker, CURSOR, None, &signer(0x55)),
+            Err(CloseError::UnauthorizedSigner)
+        ));
+        assert!(matches!(
+            close_response(
+                &channel,
+                StartId::from_bytes([7; 32]),
+                signed,
+                &signer(0x55)
+            ),
+            Err(CloseError::UnauthorizedSigner)
+        ));
+    }
+}
+
 /// The signed window starts at the next block and is exactly as wide as
 /// the terms say, and at the ceiling it refuses rather than wraps.
 ///
@@ -3118,7 +3193,7 @@ async fn a_client_closes_the_channel_its_provider_stopped_answering() {
         start.certificate().cloned(),
         Some((
             payment.certificate,
-            PartyAuth::signer(payment.certificate_signature)
+            PartyAuth::owner(payment.certificate_signature)
         )),
     );
 

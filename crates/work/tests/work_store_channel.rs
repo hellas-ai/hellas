@@ -2852,9 +2852,10 @@ async fn closed_store(root: &std::path::Path) -> ChannelStore {
         (RECEIPT_HEIGHT + 1, RECEIPT_HEIGHT + 8),
         Some((
             job.certificate,
-            PartyAuth::signer(client().sign(job.certificate.digest(channel.network()))),
+            PartyAuth::owner(client().sign(job.certificate.digest(channel.network()))),
         )),
-        PartyAuth::signer(provider().sign(payload(job.work_id))),
+        // This reducer fixture retains a synthetic action signature; both parties are sole owners.
+        PartyAuth::owner(provider().sign(payload(job.work_id))),
     );
     let start_id = hellas_kernel::StartId::from_bytes([0x7c; 32]);
     commit_all(

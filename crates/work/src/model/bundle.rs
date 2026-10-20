@@ -147,7 +147,9 @@ pub struct WorkChannelSetupBundleV2 {
     network: NetworkId,
     bond_funding: Funding,
     bond_terms: WorkStakeBondTerms,
-    provider_bond_auth: PartyAuth,
+    // Store the initial witness on the heap like later-stage witnesses, so
+    // retained bundle copies do not inflate composed async poll frames.
+    provider_bond_auth: Box<PartyAuth>,
     stage: SetupStage,
 }
 
@@ -210,7 +212,7 @@ impl WorkChannelSetupBundleV2 {
             network,
             bond_funding,
             bond_terms,
-            provider_bond_auth,
+            provider_bond_auth: Box::new(provider_bond_auth),
             stage: SetupStage::BondProposed,
         })
     }
@@ -400,7 +402,7 @@ impl WorkChannelSetupBundleV2 {
         Some(Tx::open(
             self.bond_funding.clone(),
             Terms::work_stake_bond(self.bond_terms.clone()),
-            self.provider_bond_auth.clone(),
+            self.provider_bond_auth.as_ref().clone(),
             payment.client_bond_auth.clone(),
         ))
     }
@@ -535,7 +537,7 @@ impl WorkChannelSetupBundleV2 {
         push(&mut out, &self.network);
         push(&mut out, &self.bond_funding);
         push(&mut out, &Terms::work_stake_bond(self.bond_terms.clone()));
-        push(&mut out, &self.provider_bond_auth);
+        push(&mut out, self.provider_bond_auth.as_ref());
         if let Some(payment) = self.payment() {
             push(&mut out, &payment.client_bond_auth);
             push(&mut out, &payment.funding);

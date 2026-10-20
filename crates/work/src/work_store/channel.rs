@@ -703,7 +703,8 @@ pub struct PaymentState {
     settlement: WorkPaymentSettlement,
     cursor: (u64, [u8; 32]),
     origin_observed: bool,
-    close_prepared: Option<PaymentCloseStart>,
+    // Retain the large no-alloc kernel witness behind the journal state's heap boundary.
+    close_prepared: Option<Box<PaymentCloseStart>>,
     close_opened: Option<OpenContest>,
     close_responded: Option<RespondedContest>,
     close_settled: Option<CloseSettlement>,

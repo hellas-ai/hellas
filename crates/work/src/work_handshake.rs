@@ -95,12 +95,12 @@ use std::sync::Arc;
 use crate::endpoint_lock::{EndpointGuard, EndpointLock};
 
 use hellas_kernel::{
-    EdgeId, Funding, NetworkId, Secp256k1Signer, Secp256k1Verifier, Terms, Tx, WorkPaymentTerms,
-    WorkStakeBondTerms,
+    EdgeId, Funding, NetworkId, PartyAuth, PartyKeys, PayloadHash, Secp256k1Signer,
+    Secp256k1Verifier, Terms, Tx, WorkPaymentTerms, WorkStakeBondTerms,
 };
 use hellas_wire::{StreamTransport, TransportContext, WireStatus};
 
-use crate::model::bundle::WorkChannelSetupBundleV2;
+use crate::model::bundle::{SetupBundleError, WorkChannelSetupBundleV2};
 use crate::model::setup::{CloseDescriptor, ProviderChannelPolicy, WorkChannelDescriptor};
 use crate::work::{Refusal, WorkRefusal};
 use crate::work_close::{FinalizedBlocks, TxSink};
@@ -201,6 +201,24 @@ pub struct SetupEndpoint {
 }
 
 impl SetupEndpoint {
+    fn authorize(
+        &self,
+        party: PartyKeys,
+        hash: PayloadHash,
+        slot: &'static str,
+        party_name: &'static str,
+    ) -> Result<PartyAuth, SetupExchangeError> {
+        let authority = party.authority_of(self.signer.party_key()).ok_or_else(|| {
+            WorkStoreError::Setup(SetupStateError::Bundle(
+                SetupBundleError::BadAuthorization {
+                    slot,
+                    party: party_name,
+                },
+            ))
+        })?;
+        Ok(PartyAuth::new(authority, self.signer.sign(hash).into()))
+    }
+
     /// Takes one setup journal, the settlement key its revisions are
     /// signed with, and what this endpoint will countersign a payment
     /// over.
@@ -275,7 +293,12 @@ impl SetupEndpoint {
             &bond_funding,
             &Terms::work_stake_bond(bond_terms.clone()),
         );
-        let auth = hellas_kernel::PartyAuth::signer(self.signer.sign(hash));
+        let auth = self.authorize(
+            bond_terms.parties.maker(),
+            hash,
+            "bond open",
+            "the provider",
+        )?;
         let bundle =
             WorkChannelSetupBundleV2::propose_bond(network, bond_funding, bond_terms, auth)
                 .map_err(|error| WorkStoreError::Setup(SetupStateError::Bundle(error)))?;
@@ -321,13 +344,24 @@ impl SetupEndpoint {
             &payment_funding,
             &Terms::work_payment(payment_terms.clone()),
         );
-        let bond_auth = hellas_kernel::PartyAuth::signer(self.signer.sign(held.bond_open_hash()));
+        let bond_auth = self.authorize(
+            held.bond_terms().parties.taker(),
+            held.bond_open_hash(),
+            "bond open",
+            "the client",
+        )?;
+        let payment_auth = self.authorize(
+            payment_terms.parties().maker(),
+            payment_hash,
+            "payment open",
+            "the client",
+        )?;
         let bundle = held
             .countersign_bond_and_propose_payment(
                 bond_auth,
                 payment_funding,
                 payment_terms,
-                hellas_kernel::PartyAuth::signer(self.signer.sign(payment_hash)),
+                payment_auth,
             )
             .map_err(|error| WorkStoreError::Setup(SetupStateError::Bundle(error)))?;
         self.commit_armed(&bundle, descriptor).await
@@ -400,12 +434,16 @@ impl SetupEndpoint {
             // Before the signature, and that order is the whole of it: a
             // refusal here is a refusal this endpoint made with nothing
             // signed and nothing written.
+            let party = terms.parties().taker();
             let descriptor = self.admit(payment_edge, terms)?;
+            let auth = self
+                .authorize(party, hash, "payment open", "the provider")
+                .map_err(|error| Refusal::new(WorkRefusal::Invalid, error.to_string()))?;
             // `countersign_payment` refuses every stage but the second,
             // and the filter above is that stage. Mapped so the match
             // is total; no test reaches it, and none claims to.
             let next = bundle
-                .countersign_payment(hellas_kernel::PartyAuth::signer(self.signer.sign(hash)))
+                .countersign_payment(auth)
                 .map_err(|error| Refusal::new(WorkRefusal::Invalid, error.to_string()))?;
             self.commit_armed(&next, descriptor.close_descriptor())
                 .await

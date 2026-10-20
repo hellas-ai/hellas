@@ -190,7 +190,7 @@ fn completed(bundle: WorkChannelSetupBundleV2) -> WorkChannelSetupBundleV2 {
     let Some(hash) = bundle.payment_open_hash() else {
         panic!("a proposed payment has an open hash");
     };
-    match bundle.countersign_payment(hellas_kernel::PartyAuth::signer(Auth::native(
+    match bundle.countersign_payment(hellas_kernel::PartyAuth::owner(Auth::native(
         provider().sign(hash),
     ))) {
         Ok(bundle) => bundle,

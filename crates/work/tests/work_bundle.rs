@@ -386,6 +386,56 @@ fn a_coin_may_fund_only_one_input_of_the_setup() {
 #[test]
 fn each_signature_is_checked_against_its_own_party_and_hash() {
     let verifier = Secp256k1Verifier::new();
+    // Distinct owner/node keys make an authority label cryptographically meaningful.
+    let owner = client();
+    let node = provider();
+    let mut split_terms = bond_terms();
+    split_terms.parties = Parties::new(
+        PartyKeys::new(owner.party_key(), node.party_key(), Some(node.party_key())),
+        split_terms.parties.taker(),
+    );
+    split_terms.timeout_outputs = List::take(
+        [Payout::delegated(owner.party_key(), Some(node.party_key()), STAKE); MAX_EDGE_OUTPUTS],
+        1,
+    );
+    let split_hash = Tx::open_hash(
+        network(),
+        &bond_funding(),
+        &Terms::work_stake_bond(split_terms.clone()),
+    );
+    for auth in [
+        hellas_kernel::PartyAuth::owner(node.sign(split_hash)),
+        hellas_kernel::PartyAuth::signer(owner.sign(split_hash)),
+    ] {
+        let mislabeled = WorkChannelSetupBundleV2::propose_bond(
+            network(),
+            bond_funding(),
+            split_terms.clone(),
+            auth,
+        )
+        .unwrap();
+        assert_eq!(
+            mislabeled.check(&verifier),
+            Err(SetupBundleError::BadAuthorization {
+                slot: "bond open",
+                party: "the provider"
+            })
+        );
+    }
+    for auth in [
+        hellas_kernel::PartyAuth::owner(owner.sign(split_hash)),
+        hellas_kernel::PartyAuth::signer(node.sign(split_hash)),
+    ] {
+        WorkChannelSetupBundleV2::propose_bond(
+            network(),
+            bond_funding(),
+            split_terms.clone(),
+            auth,
+        )
+        .unwrap()
+        .check(&verifier)
+        .unwrap();
+    }
     let three = completed(countersigned(proposed()));
     let bond_hash = three.bond_open_hash();
     let Some(payment_hash) = three.payment_open_hash() else {

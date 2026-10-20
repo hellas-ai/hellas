@@ -1459,7 +1459,7 @@ impl CloseEndpoint {
     /// holds is not written twice — so a resubmission after a failed
     /// hand-off costs no fsync and sends the same bytes.
     async fn fix_close_answer(&mut self, start_id: StartId) -> Result<Option<Tx>, WorkStoreError> {
-        let Some((responded, response)) = self.close_duty(start_id) else {
+        let Some((responded, response)) = self.close_duty(start_id)? else {
             return Ok(None);
         };
         self.store
@@ -1514,23 +1514,30 @@ impl CloseEndpoint {
     /// own rule — one answer per contest — is what makes the second
     /// offer the first one rather than a new decision. What it will not
     /// do is offer them to a sink that already took them.
-    fn close_duty(&self, start_id: StartId) -> Option<(ChannelRecord, Tx)> {
+    fn close_duty(&self, start_id: StartId) -> Result<Option<(ChannelRecord, Tx)>, WorkStoreError> {
         if self.accepted_contest() == Some(start_id) {
-            return None;
+            return Ok(None);
         }
-        let (contest, certificate) = self.state().answerable_contest()?;
+        let Some((contest, certificate)) = self.state().answerable_contest() else {
+            return Ok(None);
+        };
         if contest.start_id != start_id {
-            return None;
+            return Ok(None);
         }
         let channel = self.state().channel();
-        let response = close_response(channel, start_id, certificate, &self.signer);
-        Some((
+        let response =
+            close_response(channel, start_id, certificate, &self.signer).map_err(|_| {
+                WorkStoreError::Channel(ChannelStateError::WrongChannel {
+                    field: "close response signer",
+                })
+            })?;
+        Ok(Some((
             ChannelRecord::CloseResponded {
                 start_id,
                 response_digest: response_body_digest(channel, start_id, &certificate.0),
             },
             Tx::move_action(Move::RespondPaymentClose(response)),
-        ))
+        )))
     }
 
     /// Builds the close that ends this endpoint's contest.
@@ -1627,7 +1634,7 @@ impl CloseEndpoint {
                 settled: record.final_cumulative(),
             })?;
         let channel = self.state().channel().clone();
-        let response = close_response(&channel, held, certificate, &self.signer);
+        let response = close_response(&channel, held, certificate, &self.signer)?;
         self.store
             .commit(
                 ChannelRecord::CloseResponded {

@@ -169,6 +169,19 @@ impl PartyKeys {
         }
     }
 
+    /// Returns the authority held by `key`, preferring Owner when both keys
+    /// are equal. A foreign key has no authority for this party.
+    #[must_use]
+    pub fn authority_of(self, key: Key) -> Option<Authority> {
+        if key == self.owner {
+            Some(Authority::Owner)
+        } else if key == self.signer {
+            Some(Authority::Signer)
+        } else {
+            None
+        }
+    }
+
     /// Returns the payout of `value` at this party's committed
     /// destination.
     ///
@@ -574,6 +587,22 @@ impl Genesis {
 )]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authority_follows_the_signing_key_and_prefers_owner_for_sole_parties() {
+        let owner = Key::from_bytes([1; Key::LENGTH]);
+        let signer = Key::from_bytes([2; Key::LENGTH]);
+        let foreign = Key::from_bytes([3; Key::LENGTH]);
+        let split = PartyKeys::new(owner, signer, Some(signer));
+        assert_eq!(split.authority_of(owner), Some(Authority::Owner));
+        assert_eq!(split.authority_of(signer), Some(Authority::Signer));
+        assert_eq!(split.authority_of(foreign), None);
+        assert_eq!(
+            PartyKeys::sole(owner).authority_of(owner),
+            Some(Authority::Owner)
+        );
+        assert_eq!(PartyKeys::sole(owner).authority_of(signer), None);
+    }
 
     fn assert_canonical_round_trip<T>(value: T, buf: &mut [u8])
     where

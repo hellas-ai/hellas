@@ -495,7 +495,7 @@ impl Channel<PaymentFunding> {
         for work_id in indeterminate.iter() {
             out.extend_from_slice(work_id.as_bytes());
         }
-        put_option(&mut out, close_prepared.as_ref(), |out, start| {
+        put_option(&mut out, close_prepared.as_deref(), |out, start| {
             put_bytes(out, &encode_kernel(start));
         });
         put_option(&mut out, close_opened.as_ref(), |out, contest| {
@@ -614,7 +614,7 @@ impl Channel<PaymentFunding> {
             held
         };
         let close_prepared = take_option(&mut cursor, ChannelStateError::Malformed, |cursor| {
-            decode_kernel(take_bytes(cursor, ChannelStateError::Malformed)?)
+            decode_kernel(take_bytes(cursor, ChannelStateError::Malformed)?).map(Box::new)
         })?;
         let close_opened = take_option(&mut cursor, ChannelStateError::Malformed, |cursor| {
             Ok(OpenContest {

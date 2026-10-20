@@ -1590,7 +1590,8 @@ fn an_endpoint_built_response_forfeits_the_understaters_bond() {
             opened.start_id(),
             (certificate, signature),
             &provider,
-        );
+        )
+        .unwrap();
         apply_and_finalize(
             &database,
             context(CURSOR + 2),

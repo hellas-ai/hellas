@@ -169,6 +169,9 @@ pub trait FinalizedBlocks {
 /// Why a close could not be built.
 #[derive(Debug, thiserror::Error)]
 pub enum CloseError {
+    /// The key cannot sign for the committed party.
+    #[error("the signing key has no authority for the close party")]
+    UnauthorizedSigner,
     /// The terms fix a zero-block start window, so no signature could
     /// ever be included.
     #[error("the payment terms admit no start validity window")]
@@ -336,8 +339,9 @@ pub fn start_body_digest(channel: &PaidChannel, start: &PaymentCloseStart) -> Pa
 /// # Errors
 ///
 /// [`CloseError::NoValidityWindow`] when the terms fix a zero-block
-/// window, and [`CloseError::WindowOverflow`] when either addition
-/// leaves the representable range.
+/// window, [`CloseError::WindowOverflow`] when either addition leaves the
+/// representable range, and [`CloseError::UnauthorizedSigner`] for a key that
+/// cannot act for the opener.
 pub fn close_start(
     channel: &PaidChannel,
     opener_role: Party,
@@ -345,6 +349,18 @@ pub fn close_start(
     certificate: Option<(EarnedCertificate, Sig)>,
     signer: &Secp256k1Signer,
 ) -> Result<PaymentCloseStart, CloseError> {
+    let parties = channel.payment_terms().parties();
+    let party = match opener_role {
+        Party::Maker => parties.maker(),
+        Party::Taker => parties.taker(),
+    };
+    let authority = party
+        .authority_of(signer.party_key())
+        .ok_or(CloseError::UnauthorizedSigner)?;
+    let certificate_authority = parties
+        .maker()
+        .authority_of(channel.client_key())
+        .ok_or(CloseError::UnauthorizedSigner)?;
     let span = channel.payment_terms().start_validity_blocks;
     if span == 0 {
         return Err(CloseError::NoValidityWindow);
@@ -365,8 +381,13 @@ pub fn close_start(
         Terms::work_payment(channel.payment_terms().clone()),
         opener_role,
         (valid_from, valid_through),
-        certificate.map(|(certificate, sig)| (certificate, PartyAuth::signer(sig))),
-        PartyAuth::signer(Sig::from_bytes([0_u8; Sig::LENGTH])),
+        certificate.map(|(certificate, sig)| {
+            (
+                certificate,
+                PartyAuth::new(certificate_authority, sig.into()),
+            )
+        }),
+        PartyAuth::new(authority, Sig::from_bytes([0_u8; Sig::LENGTH]).into()),
     );
     let action_sig = signer.sign(start_body_digest(channel, &unsigned));
     Ok(PaymentCloseStart::new(
@@ -375,7 +396,7 @@ pub fn close_start(
         opener_role,
         (valid_from, valid_through),
         unsigned.certificate().cloned(),
-        PartyAuth::signer(action_sig),
+        PartyAuth::new(authority, action_sig.into()),
     ))
 }
 
@@ -415,17 +436,29 @@ pub fn response_body_digest(
 /// is answered by. It says nothing about the duty being done: it is
 /// written before the send, so it stands over a consensus that may have
 /// received nothing at all.
-#[must_use]
+///
+/// # Errors
+///
+/// [`CloseError::UnauthorizedSigner`] if the signing key cannot act for the provider.
 pub fn close_response(
     channel: &PaidChannel,
     start_id: StartId,
     certificate: (EarnedCertificate, Sig),
     signer: &Secp256k1Signer,
-) -> PaymentCloseResponse {
+) -> Result<PaymentCloseResponse, CloseError> {
     // `response_build_ms`: the digest and the signature over it, which
     // is the whole of what building an answer costs. The journal record
     // that fixes it is not in here — §4 counts that separately, as one
     // of `Wresp`'s three fsyncs.
+    let parties = channel.payment_terms().parties();
+    let authority = parties
+        .taker()
+        .authority_of(signer.party_key())
+        .ok_or(CloseError::UnauthorizedSigner)?;
+    let certificate_authority = parties
+        .maker()
+        .authority_of(channel.client_key())
+        .ok_or(CloseError::UnauthorizedSigner)?;
     let built = Timing::start();
     let digest = response_body_digest(channel, start_id, &certificate.0);
     let (certificate, certificate_sig) = certificate;
@@ -433,8 +466,11 @@ pub fn close_response(
         channel.payment_edge(),
         start_id,
         Party::Taker,
-        (certificate, PartyAuth::signer(certificate_sig)),
-        PartyAuth::signer(signer.sign(digest)),
+        (
+            certificate,
+            PartyAuth::new(certificate_authority, certificate_sig.into()),
+        ),
+        PartyAuth::new(authority, signer.sign(digest).into()),
     );
     if let Some(ms) = built.ms() {
         tracing::event!(
@@ -446,7 +482,7 @@ pub fn close_response(
             ms,
         );
     }
-    response
+    Ok(response)
 }
 
 /// Builds the close that pays out whatever the contest ended on.

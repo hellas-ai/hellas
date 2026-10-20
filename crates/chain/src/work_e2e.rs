@@ -75,7 +75,7 @@ use crate::domain::{
 };
 use crate::execution::store::{UtxoDatabase, utxo_db_config};
 use crate::execution::test_support::{
-    ConsensusFixture, consensus_fixture_of, finalization, run_qmdb,
+    ConsensusFixture, consensus_fixture_of, finalization, reshape, run_qmdb,
 };
 use crate::execution::{ChainVerifier, execute_all};
 use crate::genesis::GENESIS_SCHEMA_VERSION;
@@ -215,34 +215,22 @@ fn genesis_coin(allocations: &[(SettlementKey, u64)], owner: SettlementKey) -> C
     CoinId::from_bytes(genesis_object_id(index).into())
 }
 
-fn delegate_tx(allocations: &[(SettlementKey, u64)], is_client: bool) -> KernelTx {
-    let (owner, node, value) = if is_client {
-        (signer(0x31), client(), CLIENT_FUNDING)
+fn delegated_funding(
+    allocations: &[(SettlementKey, u64)],
+    is_client: bool,
+) -> (crate::domain::Transaction, CoinId) {
+    let (seed, node, value) = if is_client {
+        (0x31, client(), CLIENT_FUNDING)
     } else {
-        (signer(0x32), provider(), PROVIDER_STAKE)
+        (0x32, provider(), PROVIDER_STAKE)
     };
-    let inputs = List::take(
-        [genesis_coin(allocations, owner.party_key().into()); hellas_kernel::MAX_EDGE_INPUTS],
-        1,
+    let owner = signer(seed).party_key().into();
+    let (tx, ids) = reshape(
+        seed,
+        &[coin_object_id(genesis_coin(allocations, owner))],
+        &[(owner, Some(node.party_key().into()), value)],
     );
-    let outputs = List::take(
-        [Payout::delegated(owner.party_key(), Some(node.party_key()), value); MAX_EDGE_OUTPUTS],
-        1,
-    );
-    let hash = hellas_kernel::Reshape::payload_hash(TEST_NETWORK, &inputs, &outputs);
-    KernelTx::Owner(hellas_kernel::Reshape::new(
-        inputs,
-        outputs,
-        hellas_kernel::Auth::native(owner.sign(hash)),
-    ))
-}
-
-fn delegated_coin(allocations: &[(SettlementKey, u64)], is_client: bool) -> CoinId {
-    let KernelTx::Owner(reshape) = delegate_tx(allocations, is_client) else {
-        unreachable!()
-    };
-    hellas_kernel::Reshape::output_ids(TEST_NETWORK, reshape.inputs(), reshape.outputs()).as_slice()
-        [0]
+    (tx, CoinId::from_bytes(ids[0].0))
 }
 
 // ── The channel both parties sign ─────────────────────────────────────
@@ -288,11 +276,14 @@ fn bond_terms() -> WorkStakeBondTerms {
 }
 
 fn bond_funding(allocations: &[(SettlementKey, u64)]) -> Funding {
-    Funding::new(one_coin(delegated_coin(allocations, false)), no_coins())
+    Funding::new(
+        one_coin(delegated_funding(allocations, false).1),
+        no_coins(),
+    )
 }
 
 fn payment_funding(allocations: &[(SettlementKey, u64)]) -> Funding {
-    Funding::new(one_coin(delegated_coin(allocations, true)), no_coins())
+    Funding::new(one_coin(delegated_funding(allocations, true).1), no_coins())
 }
 
 fn bond_edge(allocations: &[(SettlementKey, u64)]) -> EdgeId {
@@ -431,115 +422,121 @@ struct Devnet {
 }
 
 impl Devnet {
-    async fn start(runtime: commonware_runtime::tokio::Context, name: &str) -> Self {
-        // Full nodes use live peer discovery; each devnet needs its own committee
-        // so concurrent tests cannot accept one another's certified blocks.
-        let fixture = consensus_fixture_of(rand::random(), VALIDATORS);
-        let document = genesis_document(&fixture);
-        // The document is the network's identity, so the id everything
-        // below signs under is read back out of it rather than assumed.
-        let network = match crate::domain::network_id(&document) {
-            Ok(network) => network,
-            Err(error) => panic!("the genesis document names its network: {error}"),
-        };
-        assert_eq!(
-            network, TEST_NETWORK,
-            "every signature below is bound to the id the document declares",
-        );
-        let allocations = genesis_allocations(document.clone());
-        assert_eq!(
-            allocations.len(),
-            2,
-            "genesis funds exactly the two parties",
-        );
-        let consensus_info = ConsensusInfo {
-            validators: fixture
-                .leaders
-                .iter()
-                .map(|key| hex::encode(key.encode()))
-                .collect(),
-            threshold_identity: fixture.assembler.identity().encode().to_vec(),
-            network_id: TEST_NETWORK.as_str().to_string(),
-        };
-        assert_eq!(consensus_info.validators.len(), VALIDATORS as usize);
-
-        let (root, target) = crate::execution::store::empty_state(
-            runtime.child("genesis"),
-            &format!("{name}-genesis"),
-            1024,
-            8,
-        )
-        .await;
-        let genesis =
-            HellasBlock::genesis(fixture.leaders.iter().min().unwrap().clone(), root, target);
-        let mut nodes = Vec::new();
-        for (ordinal, label) in NODE_LABELS.iter().enumerate().take(VALIDATORS as usize) {
-            let partition = format!("{name}_{ordinal}");
-            let node_context = runtime.child(label);
-            let config = utxo_db_config(&node_context, &partition, 1024, 8);
-            let database =
-                <UtxoDatabase<_> as DatabaseSet<_>>::init(node_context.child("db"), config).await;
-            let (indexer, task) = spawn_archive(
-                node_context.child("indexer"),
-                &partition,
-                crate::config::Config {
-                    mailbox_size: 32,
-                    replay_buffer: 32,
-                    write_buffer: 32,
-                    page_cache_size: 1024,
-                    page_cache_count: 8,
-                    ..crate::config::Config::default()
-                },
-                fixture.verifier.clone(),
-                genesis.clone(),
-            )
-            .await
-            .expect("a follower indexer");
-            nodes.push(Node {
-                database,
-                index: OwnerIndex::new(TEST_NETWORK, &genesis, allocations.clone()),
-                indexer,
-                mempool: Mempool::default(),
-                task,
-            });
-        }
-
-        let storage = tempfile::tempdir().unwrap();
-        let mut full_nodes: Vec<crate::node::FullNode> = Vec::new();
-        let mut rpc = tokio::task::JoinSet::new();
-        let mut activity = Vec::new();
-        for (ordinal, node) in nodes.iter().take(2).enumerate() {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let address = format!("ws://{}", listener.local_addr().unwrap());
-            let validator = LocalLightClient::new(
-                node.database.clone(),
-                node.index.clone(),
-                node.mempool.clone(),
-                node.indexer.clone(),
-                consensus_info.clone(),
+    fn start(
+        runtime: commonware_runtime::tokio::Context,
+        name: &str,
+    ) -> impl std::future::Future<Output = Self> + '_ {
+        // Construct the network startup future outside the paid-job poll frame.
+        Box::pin(async move {
+            // Full nodes use live peer discovery; each devnet needs its own committee
+            // so concurrent tests cannot accept one another's certified blocks.
+            let fixture = consensus_fixture_of(rand::random(), VALIDATORS);
+            let document = genesis_document(&fixture);
+            // The document is the network's identity, so the id everything
+            // below signs under is read back out of it rather than assumed.
+            let network = match crate::domain::network_id(&document) {
+                Ok(network) => network,
+                Err(error) => panic!("the genesis document names its network: {error}"),
+            };
+            assert_eq!(
+                network, TEST_NETWORK,
+                "every signature below is bound to the id the document declares",
             );
-            let (events, _) = tokio::sync::broadcast::channel(128);
-            activity.push(events.clone());
-            use hellas_wire::ServiceMarker as _;
-            let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
-                .alpns(vec![
-                    hellas_rpc::services::chain_sync::ChainSync::ALPN
-                        .as_bytes()
-                        .to_vec(),
-                    hellas_rpc::services::node::Node::ALPN.as_bytes().to_vec(),
-                ])
-                .bind()
+            let allocations = genesis_allocations(document.clone());
+            assert_eq!(
+                allocations.len(),
+                2,
+                "genesis funds exactly the two parties",
+            );
+            let consensus_info = ConsensusInfo {
+                validators: fixture
+                    .leaders
+                    .iter()
+                    .map(|key| hex::encode(key.encode()))
+                    .collect(),
+                threshold_identity: fixture.assembler.identity().encode().to_vec(),
+                network_id: TEST_NETWORK.as_str().to_string(),
+            };
+            assert_eq!(consensus_info.validators.len(), VALIDATORS as usize);
+
+            let (root, target) = crate::execution::store::empty_state(
+                runtime.child("genesis"),
+                &format!("{name}-genesis"),
+                1024,
+                8,
+            )
+            .await;
+            let genesis =
+                HellasBlock::genesis(fixture.leaders.iter().min().unwrap().clone(), root, target);
+            let mut nodes = Vec::new();
+            for (ordinal, label) in NODE_LABELS.iter().enumerate().take(VALIDATORS as usize) {
+                let partition = format!("{name}_{ordinal}");
+                let node_context = runtime.child(label);
+                let config = utxo_db_config(&node_context, &partition, 1024, 8);
+                let database =
+                    <UtxoDatabase<_> as DatabaseSet<_>>::init(node_context.child("db"), config)
+                        .await;
+                let (indexer, task) = spawn_archive(
+                    node_context.child("indexer"),
+                    &partition,
+                    crate::config::Config {
+                        mailbox_size: 32,
+                        replay_buffer: 32,
+                        write_buffer: 32,
+                        page_cache_size: 1024,
+                        page_cache_count: 8,
+                        ..crate::config::Config::default()
+                    },
+                    fixture.verifier.clone(),
+                    genesis.clone(),
+                )
                 .await
-                .unwrap();
-            let seed = endpoint.addr();
-            rpc.spawn(crate::node::transport::serve_validator_endpoint(
-                node.indexer.clone(),
-                events.clone(),
-                endpoint,
-                node.database.clone(),
-                fixture.verifier.clone(),
-            ));
-            rpc.spawn(async move {
+                .expect("a follower indexer");
+                nodes.push(Node {
+                    database,
+                    index: OwnerIndex::new(TEST_NETWORK, &genesis, allocations.clone()),
+                    indexer,
+                    mempool: Mempool::default(),
+                    task,
+                });
+            }
+
+            let storage = tempfile::tempdir().unwrap();
+            let mut full_nodes: Vec<crate::node::FullNode> = Vec::new();
+            let mut rpc = tokio::task::JoinSet::new();
+            let mut activity = Vec::new();
+            for (ordinal, node) in nodes.iter().take(2).enumerate() {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = format!("ws://{}", listener.local_addr().unwrap());
+                let validator = LocalLightClient::new(
+                    node.database.clone(),
+                    node.index.clone(),
+                    node.mempool.clone(),
+                    node.indexer.clone(),
+                    consensus_info.clone(),
+                );
+                let (events, _) = tokio::sync::broadcast::channel(128);
+                activity.push(events.clone());
+                use hellas_wire::ServiceMarker as _;
+                let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+                    .alpns(vec![
+                        hellas_rpc::services::chain_sync::ChainSync::ALPN
+                            .as_bytes()
+                            .to_vec(),
+                        hellas_rpc::services::node::Node::ALPN.as_bytes().to_vec(),
+                    ])
+                    .bind()
+                    .await
+                    .unwrap();
+                let seed = endpoint.addr();
+                rpc.spawn(crate::node::transport::serve_validator_endpoint(
+                    node.indexer.clone(),
+                    events.clone(),
+                    endpoint,
+                    node.database.clone(),
+                    fixture.verifier.clone(),
+                ));
+                rpc.spawn(async move {
                 let service = crate::LightClientRpc::with_state(validator, events,
                     crate::LightClientRpcState::default());
                 let mut connections = tokio::task::JoinSet::new();
@@ -558,34 +555,35 @@ impl Devnet {
                     }
                 }
             });
-            let node = crate::node::FullNode::start(crate::node::Config {
-                genesis: document.clone(),
-                threshold_identity: consensus_info.threshold_identity.clone(),
-                genesis_payload: genesis.digest(),
-                storage_dir: storage.path().join(format!("party-{ordinal}")),
-                validators: vec![address],
-                peers: std::iter::once(seed)
-                    .chain(full_nodes.iter().map(|node| node.endpoint_addr()))
-                    .collect(),
-                archive_blocks: None,
-            })
-            .await
-            .unwrap();
-            full_nodes.push(node);
-        }
+                let node = crate::node::FullNode::start(crate::node::Config {
+                    genesis: document.clone(),
+                    threshold_identity: consensus_info.threshold_identity.clone(),
+                    genesis_payload: genesis.digest(),
+                    storage_dir: storage.path().join(format!("party-{ordinal}")),
+                    validators: vec![address],
+                    peers: std::iter::once(seed)
+                        .chain(full_nodes.iter().map(|node| node.endpoint_addr()))
+                        .collect(),
+                    archive_blocks: None,
+                })
+                .await
+                .unwrap();
+                full_nodes.push(node);
+            }
 
-        Self {
-            nodes,
-            fixture,
-            allocations,
-            full_nodes,
-            rpc,
-            activity,
-            _storage: storage,
-            head: genesis,
-            height: 0,
-            included: BTreeSet::new(),
-        }
+            Self {
+                nodes,
+                fixture,
+                allocations,
+                full_nodes,
+                rpc,
+                activity,
+                _storage: storage,
+                head: genesis,
+                height: 0,
+                included: BTreeSet::new(),
+            }
+        })
     }
 
     fn light_client(&self, node: usize) -> LocalLightClient {
@@ -1303,12 +1301,9 @@ async fn open_channel(
     );
 
     for is_client in [false, true] {
+        let crate::domain::Transaction::Kernel(tx) = delegated_funding(&allocations, is_client).0;
         assert_eq!(
-            devnet
-                .blocks(CLIENT_NODE)
-                .submit(delegate_tx(&allocations, is_client))
-                .await
-                .unwrap(),
+            devnet.blocks(CLIENT_NODE).submit(tx).await.unwrap(),
             crate::SubmitTxOutcome::Enqueued
         );
     }
@@ -1653,7 +1648,7 @@ fn one_paid_job_earns_the_price_and_returns_the_stake_separately() {
     run_qmdb(|runtime| async move {
         let provider_root = tempfile::tempdir().expect("a temp dir");
         let client_root = tempfile::tempdir().expect("a temp dir");
-        let mut devnet = Box::pin(Devnet::start(runtime, "work_e2e_paid")).await;
+        let mut devnet = Devnet::start(runtime, "work_e2e_paid").await;
         let allocations = devnet.allocations.clone();
 
         let mut opened = open_channel(&mut devnet, provider_root.path(), client_root.path()).await;
@@ -1809,7 +1804,7 @@ fn an_understated_close_is_answered_and_pays_the_certificate() {
     run_qmdb(|runtime| async move {
         let provider_root = tempfile::tempdir().expect("a temp dir");
         let client_root = tempfile::tempdir().expect("a temp dir");
-        let mut devnet = Box::pin(Devnet::start(runtime, "work_e2e_contest")).await;
+        let mut devnet = Devnet::start(runtime, "work_e2e_contest").await;
         let allocations = devnet.allocations.clone();
 
         let mut opened = open_channel(&mut devnet, provider_root.path(), client_root.path()).await;
