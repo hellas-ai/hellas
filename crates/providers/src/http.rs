@@ -26,7 +26,9 @@ use tracing::Instrument;
 mod clients;
 mod config;
 pub(crate) mod tls;
-pub use config::{CredentialRefresh, HttpCredentialConfig, HttpProviderConfig, HttpSecret};
+pub use config::{
+    CredentialRefresh, HttpCredentialConfig, HttpProviderConfig, HttpSecret, HttpSecretConfig,
+};
 
 const CHUNK_BYTES: usize = 16 * 1024;
 const IDLE: Duration = Duration::from_secs(90);

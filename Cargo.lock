@@ -2816,27 +2816,15 @@ dependencies = [
 name = "hellas-cloud"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "async-trait",
- "clap",
- "hellas-auth",
- "hellas-kernel",
  "hellas-private",
- "hellas-rpc",
- "hellas-wire",
- "hellas-work",
- "hex",
- "iroh",
- "libc",
+ "hellas-providers",
  "reqwest",
  "serde",
  "serde_json",
- "sha2 0.11.1",
- "subtle",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
- "url",
 ]
 
 [[package]]

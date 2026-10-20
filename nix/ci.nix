@@ -97,7 +97,6 @@ let
       cargo test -p hellas-cloud
       cargo test -p hellas-cli
       cargo build -p hellas-cli
-      cargo build -p hellas-cloud --bin hellas-agent
     '' (cargoEnv rustToolchain);
     # The kernel's whole suite, including `tests/itf.rs` — the Quint↔Rust
     # replay that the entire abstract-correspondence story rests on — and
@@ -284,7 +283,6 @@ let
   }
   // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
     docker = "docker";
-    docker-cloud = "docker-cloud";
   }
   # CUDA/HIP images run in the dedicated trusted-branch image job, which
   # streams archives for publishing without requiring a Docker daemon.

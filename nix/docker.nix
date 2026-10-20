@@ -3,7 +3,6 @@
   rustToolchain,
   cli,
   backend ? "network",
-  agent ? null,
   revision ? "unknown",
 }:
 let
@@ -22,28 +21,15 @@ let
         chmod 0555 "$out/bin/hellas-cli"
       '';
 
-  agentRuntime =
-    pkgs.runCommand "hellas-agent-runtime"
-      {
-        nativeBuildInputs = [ pkgs.removeReferencesTo ];
-      }
-      ''
-        mkdir -p "$out/bin"
-        cp "${agent}/bin/hellas-agent" "$out/bin/hellas-agent"
-        chmod u+w "$out/bin/hellas-agent"
-        remove-references-to -t ${rustToolchain} "$out/bin/hellas-agent"
-        chmod 0555 "$out/bin/hellas-agent"
-      '';
   originalEntrypoint = [
     (if cuda then "${entrypoint}" else "${runtime}/bin/hellas-cli")
     "serve"
+    "--await-owner"
   ]
   ++ pkgs.lib.optionals gpu [
     "--gpu-backend"
     backend
   ];
-  launcher = pkgs.writeText "hellas-${backend}-launcher.json" (builtins.toJSON originalEntrypoint);
-  imageTag = if agent == null then backend else "cloud-${backend}";
 
   gpu = backend != "network";
   cuda = backend == "cuda";
@@ -64,7 +50,7 @@ let
   );
   image = pkgs.dockerTools.streamLayeredImage {
     name = imageRepository;
-    tag = imageTag;
+    tag = backend;
     extraCommands = pkgs.lib.optionalString gpu ''
       mkdir -m 1777 -p tmp
     '';
@@ -81,24 +67,9 @@ let
       pkgs.binutils
       pkgs.bash
     ]
-    ++ pkgs.lib.optional cuda compiler
-    ++ pkgs.lib.optional (agent != null) agentRuntime;
+    ++ pkgs.lib.optional cuda compiler;
     config = {
-      Entrypoint =
-        if agent == null then
-          originalEntrypoint
-        else
-          [
-            "${agentRuntime}/bin/hellas-agent"
-            "--cli"
-            "${runtime}/bin/hellas-cli"
-            "--launcher"
-            "${launcher}"
-            # Provider volumes may ignore Unix permissions. Keep credentials on
-            # the container disk; identity/content still use the mounted volume.
-            "--configuration-dir"
-            "/var/lib/hellas-private"
-          ];
+      Entrypoint = originalEntrypoint;
       Labels = {
         "org.opencontainers.image.source" = "https://github.com/hellas-ai/hellas";
         "org.opencontainers.image.revision" = revision;
@@ -149,7 +120,7 @@ let
     name = "docker-push";
     runtimeInputs = [ pkgs.skopeo ];
     text = ''
-      ${image} | skopeo copy docker-archive:/dev/stdin "docker://${imageRepository}:${imageTag}" "$@"
+      ${image} | skopeo copy docker-archive:/dev/stdin "docker://${imageRepository}:${backend}" "$@"
     '';
   };
 in

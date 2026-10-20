@@ -199,22 +199,6 @@ let
         }
       ) { };
     }
-    // lib.optionalAttrs (crossSystem == null) {
-      agent = pkgSpec.mkHellasPackage {
-        pname = "hellas-agent";
-        cargoBuildFlags = [
-          "-p"
-          "hellas-cloud"
-          "--bin"
-          "hellas-agent"
-        ];
-        cargoTestFlags = [
-          "-p"
-          "hellas-cloud"
-        ];
-        meta.mainProgram = "hellas-agent";
-      };
-    }
     # Do not advertise the safe local GPU runtime on platforms where the
     # packaged provider toolchain is not yet supported.
     //
@@ -341,32 +325,10 @@ let
             cli = nativePackages.cli.override { otel = true; };
             revision = self.rev or self.dirtyRev or "unknown";
           }).image;
-        docker-cloud =
-          (import ./docker.nix {
-            inherit pkgs rustToolchain;
-            inherit (nativePackages) cli agent;
-            revision = self.rev or self.dirtyRev or "unknown";
-          }).image;
       }
       // lib.optionalAttrs isX86_64Linux {
         docker-cuda = dockerCuda.image;
         docker-hip = dockerHip.image;
-        docker-cloud-cuda =
-          (import ./docker.nix {
-            inherit pkgs rustToolchain;
-            cli = nativePackages.cli-catena;
-            inherit (nativePackages) agent;
-            backend = "cuda";
-            revision = self.rev or self.dirtyRev or "unknown";
-          }).image;
-        docker-cloud-hip =
-          (import ./docker.nix {
-            inherit pkgs rustToolchain;
-            cli = nativePackages.cli-catena;
-            inherit (nativePackages) agent;
-            backend = "hip";
-            revision = self.rev or self.dirtyRev or "unknown";
-          }).image;
       };
 
       apps = {
