@@ -42,9 +42,9 @@ type Outputs = List<Payout, MAX_EDGE_OUTPUTS>;
 ///
 /// Every input must exist and share one owner, `auth` must be that
 /// owner's over [`Reshape::payload_hash`], and the outputs must carry
-/// exactly the value the inputs held. Outputs may name any owner, but only outputs retained by the
-/// input owner may carry a delegate: paying a third party, or delegating to a node key, is the
-/// owner's decision and this is the one place it is made.
+/// exactly the value the inputs held. Outputs may name any owner, but only
+/// outputs retained by the input owner may carry a delegate. Paying a third
+/// party or delegating to a node key is the owner's decision, made here.
 #[derive(Debug, Clone, Eq, Hash, PartialEq)]
 pub struct Reshape {
     inputs: Inputs,

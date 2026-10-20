@@ -1077,6 +1077,19 @@ mod tests {
         }
     }
 
+    #[test]
+    fn timeout_price_covers_optional_owner_signature() {
+        let terms = work_bond_terms();
+        let owner = PartyAuth::owner(crate::Auth::native(crate::Sig::placeholder(
+            terms.parties().maker().owner(),
+            crate::PayloadHash::from_bytes([0; 32]),
+        )));
+        let unsigned = close_cost(1, &Proof::timeout(terms.clone(), None));
+        let signed = close_cost(1, &Proof::timeout(terms, Some(owner)));
+        assert_eq!(unsigned, signed);
+        assert_eq!(signed.proofs(), 1);
+    }
+
     /// Basic keeps the generic maximum. The two work profiles each
     /// reserve their own — the payment its fixed four-slot exits, the
     /// bond its lease-reading timeout.

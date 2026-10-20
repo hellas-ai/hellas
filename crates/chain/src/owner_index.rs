@@ -346,7 +346,7 @@ impl State {
                     .iter()
                     .zip(outputs)
                 {
-                    self.insert_coin(coin_object_id(*id), coin_of(*payout))?;
+                    self.insert_coin(coin_object_id(*id), Coin::from(payout.coin()))?;
                 }
                 Ok(())
             }
@@ -363,7 +363,7 @@ impl State {
                     reshape.outputs(),
                 );
                 for (id, payout) in ids.iter().zip(reshape.outputs()) {
-                    self.insert_coin(coin_object_id(*id), coin_of(*payout))?;
+                    self.insert_coin(coin_object_id(*id), Coin::from(payout.coin()))?;
                 }
                 Ok(())
             }
@@ -457,16 +457,6 @@ impl State {
             }
         }
         Ok(edge)
-    }
-}
-
-/// The coin a payout issues: a close carries the payout exactly as the
-/// kernel issues it, delegate included.
-fn coin_of(payout: hellas_kernel::Payout) -> Coin {
-    Coin {
-        owner: SettlementKey::from(payout.owner()),
-        delegate: payout.delegate().map(SettlementKey::from),
-        value: payout.value(),
     }
 }
 
