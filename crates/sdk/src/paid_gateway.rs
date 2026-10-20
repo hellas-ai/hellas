@@ -186,6 +186,7 @@ pub struct PaidGateway {
     next: AtomicUsize,
     endpoint: Endpoint,
     node: crate::FullNode,
+    authority: hellas_work::node::NodeCoordinator,
     settlement_key: Secp256k1Signer,
     producer_key: hellas_auth::ProducerSigningKey,
     admission: Arc<Semaphore>,
@@ -199,6 +200,7 @@ impl PaidGateway {
         options: PaidGatewayOptions,
         identity: crate::NodeIdentity,
         node: crate::FullNode,
+        authority: hellas_work::node::NodeCoordinator,
     ) -> Result<Arc<Self>> {
         options.validate()?;
         for provider in &options.providers {
@@ -228,6 +230,7 @@ impl PaidGateway {
             // provider and request for the lifetime of this gateway.
             endpoint: bind_paid_endpoint(identity.transport_key()).await?,
             node,
+            authority,
             settlement_key,
             producer_key: identity.node_key().clone(),
             tasks: crate::gateway_work::WorkTasks::default(),
@@ -312,6 +315,7 @@ impl PaidGateway {
         }
         let endpoint = self.endpoint.clone();
         let node = self.node.clone();
+        let authority = self.authority.clone();
         let settlement_key = self.settlement_key.clone();
         let (sender, receiver) = mpsc::channel::<BufferedEvent<E>>(OUTPUT_BUFFER_EVENTS);
         let (overflow, overflow_receiver) = watch::channel(false);
@@ -390,7 +394,7 @@ impl PaidGateway {
                     if session.is_none() {
                         match connect_before_deadline(
                             &sender, streamed, deadline, PROVIDER_CONNECTION_TIMEOUT,
-                            async { PaidWorkSession::open(provider.args.clone(), endpoint.clone(), settlement_key.clone(), node.clone()).await.map_err(PoolError::from) },
+                            async { PaidWorkSession::open(provider.args.clone(), endpoint.clone(), settlement_key.clone(), node.clone(), authority.clone()).await.map_err(PoolError::from) },
                         ).await
                         {
                             Ok(opened) => {
@@ -886,9 +890,18 @@ mod tests {
             input.execution_environment,
             test_responses_contract().manifest_id()
         );
-        let gateway = PaidGateway::open(options, identity, node.clone())
-            .await
-            .unwrap();
+        let gateway = PaidGateway::open(
+            options,
+            identity,
+            node.clone(),
+            crate::test_support::authority(
+                &fixture.root.path().join("authority"),
+                crate::test_support::enrollment(iroh::SecretKey::from_bytes(&[3; 32]).public()).0,
+            )
+            .await,
+        )
+        .await
+        .unwrap();
         drop(
             gateway
                 .fetch(request("responses"))
@@ -980,8 +993,17 @@ mod tests {
         second.provider = iroh::SecretKey::from_bytes(&[4; 32]).public();
         second.journal_root = fixture.root.path().join("other");
         options.providers.push(second);
-        let result =
-            PaidGateway::open(options, crate::NodeIdentity::generate(), node.clone()).await;
+        let result = PaidGateway::open(
+            options,
+            crate::NodeIdentity::generate(),
+            node.clone(),
+            crate::test_support::authority(
+                &fixture.root.path().join("authority"),
+                crate::test_support::enrollment(iroh::SecretKey::from_bytes(&[3; 32]).public()).0,
+            )
+            .await,
+        )
+        .await;
         assert!(matches!(
             result,
             Err(PoolError::Invalid(
@@ -1123,6 +1145,11 @@ mod tests {
         let mut fixture = crate::test_support::PaidFixture::new();
         let node = fixture.node().await;
         let gateway = PaidGateway {
+            authority: crate::test_support::authority(
+                &fixture.root.path().join("authority"),
+                crate::test_support::enrollment(iroh::SecretKey::from_bytes(&[3; 32]).public()).0,
+            )
+            .await,
             providers: Vec::new(),
             node: node.clone(),
             next: AtomicUsize::new(0),

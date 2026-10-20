@@ -24,6 +24,22 @@ use hellas_work::work_store::{ChannelStore, Role, SetupOrigin};
 pub(crate) use crate::test_identity::enrollment;
 use iroh::EndpointId;
 
+pub(crate) async fn authority(
+    root: &std::path::Path,
+    enrollment: hellas_rpc::ProviderEnrollmentBundle,
+) -> hellas_work::node::NodeCoordinator {
+    let now = hellas_auth::authority::UnixMillis(1);
+    let store = crate::test_node::bootstrap_node(
+        root,
+        hellas_work::model::grant::grant_network(),
+        Some(enrollment),
+        now,
+    )
+    .await
+    .unwrap();
+    hellas_work::node::NodeCoordinator::new(store, std::sync::Arc::new(move || now))
+}
+
 pub(crate) const PRICE: u64 = 10;
 
 pub(crate) async fn application_profile(

@@ -16,12 +16,10 @@ pub enum CoinOwnerError {
     Query(#[from] QueryError),
     #[error("the chain has no finalized snapshot")]
     NoSnapshot,
-    #[error("coin selection must contain 1 to {MAX_EDGE_INPUTS} inputs")]
+    #[error("coin selection must contain 1 to {MAX_EDGE_INPUTS} distinct inputs")]
     Inputs,
-    #[error("selected coin is absent: {0:?}")]
+    #[error("selected coin is absent from this owner's live coins: {0:?}")]
     Missing(CoinId),
-    #[error("selected coin belongs to another owner: {0:?}")]
-    Owner(CoinId),
     #[error("selected coin values overflow")]
     ValueOverflow,
     #[error("chain network does not match the requested signing network")]
@@ -50,28 +48,32 @@ impl OwnerReshape {
         selected: &[CoinId],
         delegate: Option<Key>,
     ) -> Result<Self, CoinOwnerError> {
-        if selected.is_empty() || selected.len() > MAX_EDGE_INPUTS {
+        if selected.is_empty()
+            || selected.len() > MAX_EDGE_INPUTS
+            || selected
+                .iter()
+                .enumerate()
+                .any(|(index, id)| selected[..index].contains(id))
+        {
             return Err(CoinOwnerError::Inputs);
         }
         if chain.get_consensus_info().await?.network_id != network.as_str() {
             return Err(CoinOwnerError::Network);
         }
-        let snapshot = chain
-            .get_latest_block()
+        let listing = chain
+            .get_coins_by_owner(owner.into())
             .await?
             .ok_or(CoinOwnerError::NoSnapshot)?;
         let mut value = 0_u64;
         let mut inputs = [CoinId::from_bytes([0; CoinId::LENGTH]); MAX_EDGE_INPUTS];
         for (slot, id) in inputs.iter_mut().zip(selected) {
-            let coin = chain
-                .get_coin(snapshot.payload, id.to_bytes().into())
-                .await?
+            let (_, coin_value) = listing
+                .coins
+                .iter()
+                .find(|(coin_id, _)| *coin_id == id.to_bytes().into())
                 .ok_or(CoinOwnerError::Missing(*id))?;
-            if coin.owner.into_kernel() != owner {
-                return Err(CoinOwnerError::Owner(*id));
-            }
             value = value
-                .checked_add(coin.value)
+                .checked_add(*coin_value)
                 .ok_or(CoinOwnerError::ValueOverflow)?;
             *slot = *id;
         }

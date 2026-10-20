@@ -4,6 +4,8 @@ use std::path::PathBuf;
 #[derive(Debug, thiserror::Error)]
 pub enum ProvisionError {
     #[error(transparent)]
+    Authority(#[from] hellas_work::work_store::grant::NodeStoreError),
+    #[error(transparent)]
     Offer(#[from] hellas_work::model::offer::PaidOfferError),
     #[error("bond timeout {timeout} must be after finalized height {height}")]
     ExpiredBond { timeout: u64, height: u64 },

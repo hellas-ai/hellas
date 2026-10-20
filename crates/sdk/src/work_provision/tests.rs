@@ -1,4 +1,5 @@
 use hellas_auth::ProducerSigningKey;
+use hellas_auth::test_support::actors::{FRIEND, ROOT};
 use std::fs;
 
 use hellas_auth::Digest;
@@ -174,7 +175,17 @@ fn options_for(
         settlement_key: provider(),
         provider: enrollment(),
         addresses: vec![],
-        client,
+        client: hellas_auth::authority::ContactCard::new(
+            FRIEND.principal(),
+            "client".into(),
+            FRIEND.assert(hellas_auth::authority::ContactCard::digest(
+                FRIEND.principal(),
+                "client",
+            )),
+        )
+        .unwrap(),
+        client_node: client,
+        redelegate_payout: true,
         stake_coins: stake_coins
             .iter()
             .map(|coin| CoinId::from_bytes([*coin; 32]))
@@ -198,7 +209,7 @@ async fn provision_options(
     options: &ProvisionOptions,
     policy: ProviderChannelPolicy,
 ) -> Result<Provisioned> {
-    let candidate = BondCandidate::plan(options)?;
+    let candidate = BondCandidate::plan(options, ROOT.principal())?;
     Offer::plan(options, policy, candidate)
         .await?
         .journal(floor())
@@ -223,12 +234,24 @@ fn bond_funding_for(stake_coins: &[u8]) -> Funding {
 fn bond_terms_for(client: Key, max_job_price: u64) -> WorkStakeBondTerms {
     WorkStakeBondTerms {
         parties: Parties::new(
-            PartyKeys::sole(provider().party_key()),
-            PartyKeys::sole(client),
+            PartyKeys::new(
+                Key::from_bytes(*ROOT.principal().as_bytes()),
+                provider().party_key(),
+                Some(provider().party_key()),
+            ),
+            PartyKeys::new(
+                Key::from_bytes(*FRIEND.principal().as_bytes()),
+                client,
+                Some(client),
+            ),
         ),
         timeout: BlockHeight::new(500),
         timeout_outputs: List::take(
-            [Payout::new(provider().party_key(), 64); MAX_EDGE_OUTPUTS],
+            [Payout::delegated(
+                Key::from_bytes(*ROOT.principal().as_bytes()),
+                Some(provider().party_key()),
+                64,
+            ); MAX_EDGE_OUTPUTS],
             1,
         ),
         max_job_price,
@@ -250,10 +273,10 @@ fn expected_bond(max_job_price: u64) -> EdgeId {
 async fn preview_and_real_offer_use_the_identical_bond_candidate() {
     let root = tempfile::tempdir().unwrap();
     let options = options(root.path(), 40);
-    let preview = BondCandidate::plan(&options)
+    let preview = BondCandidate::plan(&options, ROOT.principal())
         .unwrap_or_else(|error| panic!("the bond previews: {error:#}"));
     let expected = preview.bond_edge;
-    let candidate = BondCandidate::plan(&options)
+    let candidate = BondCandidate::plan(&options, ROOT.principal())
         .unwrap_or_else(|error| panic!("the same bond plans: {error:#}"));
     let offer = Offer::plan(&options, policy(), candidate)
         .await
@@ -263,19 +286,69 @@ async fn preview_and_real_offer_use_the_identical_bond_candidate() {
 }
 
 #[tokio::test]
-async fn preview_needs_neither_a_route_nor_a_chain_nor_a_journal() {
+async fn preview_uses_existing_authority_without_a_route_chain_or_paid_journal() {
     let root = tempfile::tempdir().unwrap();
     let config = routed_work_config(root.path(), Vec::new())
         .unwrap_or_else(|error| panic!("a route-free config loads: {error:#}"));
     let options = options_for(config, client().party_key(), &[0xa1], 40);
 
-    preview_bond(&options)
+    let authority_root = tempfile::tempdir().unwrap();
+    let authority = crate::test_support::authority(authority_root.path(), enrollment()).await;
+    preview_bond(&options, &authority)
+        .await
         .unwrap_or_else(|error| panic!("the isolated preview succeeds: {error:#}"));
     assert_eq!(
         provider_setups(root.path()).await,
         0,
         "preview created no provider journal",
     );
+    assert_eq!(authority.owner().await.unwrap(), ROOT.principal());
+    drop(authority);
+    let now = hellas_auth::authority::UnixMillis(2);
+    let grant_network = hellas_work::model::grant::grant_network();
+    let store = hellas_work::work_store::grant::NodeStore::open(
+        authority_root.path(),
+        grant_network,
+        None,
+        now,
+    )
+    .await
+    .unwrap();
+    let state = store.state().authority();
+    let expected = state.revision();
+    let mut replacement = state.grant(state.root_grant()).unwrap().spec().clone();
+    replacement.subject = FRIEND.principal();
+    drop(store);
+    hellas_work::work_store::grant::NodeStore::recover_offline(
+        authority_root.path(),
+        grant_network,
+        expected,
+        crate::test_node::approval_for(
+            hellas_auth::authority::Ownership::Recover { expected },
+            replacement.clone(),
+            replacement,
+        ),
+        now,
+    )
+    .await
+    .unwrap();
+    let store = hellas_work::work_store::grant::NodeStore::open(
+        authority_root.path(),
+        grant_network,
+        None,
+        now,
+    )
+    .await
+    .unwrap();
+    let recovered =
+        hellas_work::node::NodeCoordinator::new(store, std::sync::Arc::new(move || now));
+    assert_eq!(recovered.owner().await.unwrap(), FRIEND.principal());
+    let recovered_bond = preview_bond(&options, &recovered).await.unwrap();
+    let expected_recovered = BondCandidate::plan(&options, FRIEND.principal())
+        .unwrap()
+        .bond_edge;
+    assert_eq!(recovered_bond, expected_recovered);
+    assert_ne!(recovered_bond, expected_bond(40));
 }
 
 async fn provider_setups(root: &Path) -> usize {
@@ -614,7 +687,7 @@ fn a_stake_wider_than_an_open_is_refused_rather_than_truncated() {
         .map(|byte| CoinId::from_bytes([byte; 32]))
         .collect();
 
-    let Err(error) = BondCandidate::plan(&options) else {
+    let Err(error) = BondCandidate::plan(&options, ROOT.principal()) else {
         panic!("an open funded by five coins is not one this stake can be");
     };
     assert!(
@@ -760,9 +833,13 @@ async fn malformed_paid_offer_is_rejected_before_reserving_a_bond() {
     let mut options = options(root.path(), 40);
     options.addresses = vec!["not-a-socket".into()];
     assert!(
-        Offer::plan(&options, policy(), BondCandidate::plan(&options).unwrap())
-            .await
-            .is_err()
+        Offer::plan(
+            &options,
+            policy(),
+            BondCandidate::plan(&options, ROOT.principal()).unwrap()
+        )
+        .await
+        .is_err()
     );
     assert!(
         discover_setups(root.path(), network())
@@ -771,4 +848,28 @@ async fn malformed_paid_offer_is_rejected_before_reserving_a_bond() {
             .setups
             .is_empty()
     );
+}
+
+#[test]
+fn provider_can_lock_only_its_own_payout() {
+    let root = tempfile::tempdir().unwrap();
+    let config = routed_work_config(root.path(), Vec::new()).unwrap();
+    let mut options = options_for(config, client().party_key(), &[0xa1], 40);
+    let delegated = BondCandidate::plan(&options, ROOT.principal()).unwrap();
+    options.redelegate_payout = false;
+    let locked = BondCandidate::plan(&options, ROOT.principal()).unwrap();
+    assert_eq!(
+        delegated.bond_terms.parties.maker().payout_delegate(),
+        Some(provider().party_key())
+    );
+    assert_eq!(locked.bond_terms.parties.maker().payout_delegate(), None);
+    assert_eq!(
+        locked.bond_terms.parties.taker().payout_delegate(),
+        Some(client().party_key())
+    );
+    assert_eq!(
+        locked.bond_terms.timeout_outputs.as_slice()[0],
+        Payout::new(Key::from_bytes(*ROOT.principal().as_bytes()), 64)
+    );
+    assert_ne!(locked.bond_edge, delegated.bond_edge);
 }

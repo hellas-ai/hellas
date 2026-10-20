@@ -85,9 +85,38 @@ that bond's maker. Endpoint advertisements alone never establish an enrollment
 pin. Chain validation and finalized funding checks still occur during setup.
 No enrollment data is added to on-chain transactions.
 
-Provision provider bonds with `hellas-cli provision`; coin
-values and policy terms must agree with the provider work config. Payment coins
-must be owned by the gateway settlement identity and cannot fund two channels.
+Provision provider bonds with `hellas-cli provision --grant-config grant.json
+--client-contact client --client CLIENT_NODE_KEY`; coin values and policy terms
+must agree with the provider work config. The contact alias selects an already
+imported, signature-verified ContactCard in the current authority owner's contact
+directory. Its principal is the client coin owner; `--client` names the separate
+settlement node. The card proves the principal's signature, not that the principal
+controls the selected node. The client checks the bond against its own live
+authority owner and node before countersigning, and chain funding requires that
+owner's coins delegated to that node.
+
+Provider and gateway coin owners come from their current node authority roots.
+The gateway reuses the authority opened by its gateway profile. Standalone
+`provision` and `paid-work run` require `--grant-config` pointing to an explicitly
+bootstrapped authority journal; stop its running writer before opening it offline.
+Payment coins cannot fund two channels. Recovery changes the live owner used for
+new setup; it does not reinterpret existing signed bond terms.
+
+Owners delegate or reclaim coins through the existing global passkey:
+
+```sh
+hellas-cli --passkey owner.key chain delegate --rpc ws://127.0.0.1:8788 \
+  --network devnet --node NODE_SETTLEMENT_KEY --coin COIN_ID
+hellas-cli --passkey owner.key chain sweep --rpc ws://127.0.0.1:8788 \
+  --network devnet --coin COIN_ID
+```
+
+`--node` uses the chain's base58 settlement-key spelling; coin IDs are hex.
+Default payouts remain delegated to each party's node. A provider can choose
+`provision --lock-provider-payout` to return its payout to its owner without a
+delegate. The client accepts only its own default delegated payout. An owner-led
+contested exit locks that owner's refund while preserving the other party's payout
+delegation.
 The omission bond must exceed the remaining payment capacity: with 1,000 units
 and zero fees/reserve, a bond of 501 leaves 499 spendable units. The client checks
 this before signing setup terms or creating a journal.

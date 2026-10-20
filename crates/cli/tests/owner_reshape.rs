@@ -54,8 +54,9 @@ async fn coin(client: &RemoteLightClient, id: CoinId) -> hellas_chain::domain::C
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             if let Ok(Some(block)) = client.get_latest_block().await
-                && let Ok(Some(coin)) = client.get_coin(block.payload, id.to_bytes().into()).await {
-                    return coin;
+                && let Ok(Some(coin)) = client.get_coin(block.payload, id.to_bytes().into()).await
+            {
+                return coin;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -123,8 +124,9 @@ async fn owner_prepare_and_cli_delegate_sweep_execute_on_a_real_validator() {
     let client = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             if let Ok(client) = RemoteLightClient::connect(rpc.clone()).await
-                && let Ok(info) = client.get_consensus_info().await {
-                    break client.with_consensus_info(&info).unwrap();
+                && let Ok(info) = client.get_consensus_info().await
+            {
+                break client.with_consensus_info(&info).unwrap();
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -146,6 +148,23 @@ async fn owner_prepare_and_cli_delegate_sweep_execute_on_a_real_validator() {
     // path against finalized state; consensus executes the submitted reshapes.
     for owner in [passkey.party_key(), native.party_key()] {
         let id = owner_ids.iter().find(|(key, _)| *key == owner).unwrap().1;
+        for selected in [
+            vec![],
+            vec![id, id],
+            vec![id; hellas_kernel::MAX_EDGE_INPUTS + 1],
+        ] {
+            assert!(matches!(
+                OwnerReshape::prepare(&client, network, owner, &selected, None).await,
+                Err(hellas_sdk::coin_owner::CoinOwnerError::Inputs)
+            ));
+        }
+        let foreign = owner_ids.iter().find(|(key, _)| *key != owner).unwrap().1;
+        for absent in [foreign, CoinId::from_bytes([0xff; 32])] {
+            assert!(
+                matches!(OwnerReshape::prepare(&client, network, owner, &[absent], None).await,
+                Err(hellas_sdk::coin_owner::CoinOwnerError::Missing(actual)) if actual == absent)
+            );
+        }
         let plan = OwnerReshape::prepare(&client, network, owner, &[id], Some(node.party_key()))
             .await
             .unwrap();

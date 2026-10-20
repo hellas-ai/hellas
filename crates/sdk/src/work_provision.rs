@@ -36,8 +36,12 @@ pub struct ProvisionOptions {
     pub settlement_key: Secp256k1Signer,
     pub provider: hellas_rpc::ProviderEnrollmentBundle,
     pub addresses: Vec<String>,
-    /// The client this bond names as taker.
-    pub client: Key,
+    /// Existing verified contact selected by the provider for this client.
+    pub client: hellas_auth::authority::ContactCard,
+    /// The client's node signer. The contact alone does not prove this association.
+    pub client_node: Key,
+    /// Whether returned stake remains delegated to this provider node.
+    pub redelegate_payout: bool,
     /// The coins this provider stakes.
     pub stake_coins: Vec<CoinId>,
     /// Height the bond expires at, which is also the admission horizon of
@@ -50,17 +54,23 @@ pub struct ProvisionOptions {
 }
 
 /// Compute the bond before the operator adds its bilateral route.
-pub fn preview_bond(options: &ProvisionOptions) -> Result<EdgeId> {
-    Ok(BondCandidate::plan(options)?.bond_edge)
+pub async fn preview_bond(
+    options: &ProvisionOptions,
+    authority: &hellas_work::node::NodeCoordinator,
+) -> Result<EdgeId> {
+    authority.check_provider(&options.provider).await?;
+    Ok(BondCandidate::plan(options, authority.owner().await?)?.bond_edge)
 }
 
 /// Sign and journal an offer under an existing provider identity.
 pub async fn provision_offer(
     options: ProvisionOptions,
     node: &hellas_chain::node::FullNode,
+    authority: &hellas_work::node::NodeCoordinator,
 ) -> Result<Provisioned> {
     options.work_config.check_node(node)?;
-    let candidate = BondCandidate::plan(&options)?;
+    authority.check_provider(&options.provider).await?;
+    let candidate = BondCandidate::plan(&options, authority.owner().await?)?;
     let offer = Offer::plan(&options, options.work_config.provider_policy(), candidate).await?;
     let view = tokio::time::timeout(std::time::Duration::from_secs(30), node.wait_ready())
         .await
@@ -93,7 +103,10 @@ struct BondCandidate {
 }
 
 impl BondCandidate {
-    fn plan(options: &ProvisionOptions) -> Result<Self> {
+    fn plan(
+        options: &ProvisionOptions,
+        owner: hellas_auth::authority::PrincipalId,
+    ) -> Result<Self> {
         let network = options.work_config.chain.network;
         let journal_root = options.work_config.journal_root.clone();
         // Maker is the provider and taker is the client, which is what
@@ -101,10 +114,25 @@ impl BondCandidate {
         // whose staking party this key is not.
         let provider = options.settlement_key.party_key();
         let bond_terms = WorkStakeBondTerms {
-            parties: Parties::new(PartyKeys::sole(provider), PartyKeys::sole(options.client)),
+            parties: Parties::new(
+                PartyKeys::new(
+                    Key::from_bytes(*owner.as_bytes()),
+                    provider,
+                    options.redelegate_payout.then_some(provider),
+                ),
+                PartyKeys::new(
+                    Key::from_bytes(*options.client.principal().as_bytes()),
+                    options.client_node,
+                    Some(options.client_node),
+                ),
+            ),
             timeout: BlockHeight::new(options.bond_timeout),
             timeout_outputs: List::take(
-                [Payout::new(provider, options.timeout_payout); MAX_EDGE_OUTPUTS],
+                [Payout::delegated(
+                    Key::from_bytes(*owner.as_bytes()),
+                    options.redelegate_payout.then_some(provider),
+                    options.timeout_payout,
+                ); MAX_EDGE_OUTPUTS],
                 1,
             ),
             max_job_price: options.max_job_price,

@@ -87,6 +87,17 @@ impl NodeCoordinator {
         Arc::ptr_eq(&self.store, &other.store)
     }
 
+    /// The current owner's principal, read from this node's live authority.
+    /// Trusted local services use this handle rather than retaining bootstrap identity.
+    pub async fn owner(&self) -> Result<PrincipalId, NodeStoreError> {
+        let (store, _) = self.lock().await?;
+        let authority = store.state().authority();
+        authority
+            .grant(authority.root_grant())
+            .map(|grant| grant.spec().subject)
+            .ok_or(NodeStoreError::Malformed)
+    }
+
     /// The bound provider enrollment, if any; it changes only through binding.
     pub async fn provider(
         &self,

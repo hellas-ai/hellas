@@ -211,6 +211,8 @@ pub struct GatewayControl {
 /// HTTP admission and, when configured, the control listener sharing its writer.
 /// Shut the listener down after the gateway stops.
 pub struct GatewayHost {
+    /// The same live authority writer used by HTTP admission and HostControl.
+    pub node: hellas_work::node::NodeCoordinator,
     pub access: hellas_gateway::GatewayAccess,
     pub control: Option<hellas_wire::local::LocalControlServer>,
 }
@@ -249,9 +251,13 @@ impl GatewayProfile {
                     &parent.join(control.certificate),
                     &parent.join(control.private_key),
                 )?;
-                super::NodeControl::new(node).bind_local(parent.join(control.socket), tls)
+                super::NodeControl::new(node.clone()).bind_local(parent.join(control.socket), tls)
             })
             .transpose()?;
-        Ok(GatewayHost { access, control })
+        Ok(GatewayHost {
+            node,
+            access,
+            control,
+        })
     }
 }

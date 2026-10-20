@@ -89,6 +89,41 @@ impl PaidWorkOptions {
     }
 }
 
+async fn propose_client_payment(
+    setup: &mut SetupEndpoint,
+    authority: &hellas_work::node::NodeCoordinator,
+    signer: &Secp256k1Signer,
+    funding: Funding,
+    terms: WorkPaymentTerms,
+) -> Result<()> {
+    let bundle = setup
+        .state()
+        .bundle()
+        .ok_or(PaidClientError::MissingState("bond proposal"))?;
+    check_client_party(bundle, authority, signer).await?;
+    setup.propose_payment(funding, terms).await?;
+    Ok(())
+}
+
+async fn check_client_party(
+    bundle: &hellas_work::model::bundle::WorkChannelSetupBundleV2,
+    authority: &hellas_work::node::NodeCoordinator,
+    signer: &Secp256k1Signer,
+) -> Result<()> {
+    let party = bundle.bond_terms().parties.taker();
+    let owner = authority.owner().await?;
+    if party.owner().to_bytes() != *owner.as_bytes() {
+        return Err(PaidClientError::InputMismatch("client coin owner"));
+    }
+    if party.signer() != signer.party_key() {
+        return Err(PaidClientError::InputMismatch("client settlement identity"));
+    }
+    if party.payout_delegate() != Some(signer.party_key()) {
+        return Err(PaidClientError::InputMismatch("client payout delegation"));
+    }
+    Ok(())
+}
+
 /// Convenience options for one complete paid job.
 pub struct PaidWorkRun {
     pub options: PaidWorkOptions,
@@ -115,6 +150,7 @@ pub async fn run_paid_work(
     transport_key: SecretKey,
     settlement_key: Secp256k1Signer,
     node: FullNode,
+    authority: hellas_work::node::NodeCoordinator,
 ) -> Result<PaidWorkResult> {
     if args.options.timeout.is_zero() {
         return Err(PaidClientError::InvalidOptions("timeout must be positive"));
@@ -133,7 +169,8 @@ pub async fn run_paid_work(
         )?;
         let endpoint = bind_paid_endpoint(transport_key).await?;
         let mut session =
-            PaidWorkSession::open(options, endpoint.clone(), settlement_key, node).await?;
+            PaidWorkSession::open(options, endpoint.clone(), settlement_key, node, authority)
+                .await?;
         let mut result = session
             .run(Some(prepared_input), false, None)
             .await?
@@ -296,6 +333,7 @@ impl PaidWorkSession {
         endpoint: Endpoint,
         settlement_key: Secp256k1Signer,
         node: FullNode,
+        authority: hellas_work::node::NodeCoordinator,
     ) -> Result<Self> {
         args.validate()?;
         let config = &args.config;
@@ -349,9 +387,6 @@ impl PaidWorkSession {
         if bundle.bond_edge() != bond {
             return Err(PaidClientError::InputMismatch("bond edge"));
         }
-        if bundle.bond_terms().parties.taker().signer() != settlement_key.party_key() {
-            return Err(PaidClientError::InputMismatch("client settlement identity"));
-        }
         dialer.require_producer(hellas_auth::PublicKey::Secp256k1(
             bundle.bond_terms().parties.maker().signer().to_bytes(),
         ))?;
@@ -360,7 +395,16 @@ impl PaidWorkSession {
         }
         if setup.state().revision() == Some(1) {
             let terms = payment_terms(config, &policy, &bundle, args.omission_bond);
-            setup.propose_payment(payment_funding, terms).await?;
+            propose_client_payment(
+                &mut setup,
+                &authority,
+                &settlement_key,
+                payment_funding,
+                terms,
+            )
+            .await?;
+        } else {
+            check_client_party(&bundle, &authority, &settlement_key).await?;
         }
         if setup.state().revision() == Some(2) {
             exchange_setup(&dialer, &mut setup).await?;

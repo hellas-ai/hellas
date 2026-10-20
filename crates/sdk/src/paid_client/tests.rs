@@ -359,3 +359,106 @@ fn payment_policy() -> hellas_work::model::work::JobPaymentPolicyV2 {
 }
 
 use hellas_work::test_support::test_responses_contract;
+
+#[tokio::test]
+async fn client_checks_live_owner_and_own_payout_before_countersigning() {
+    use crate::test_support::{PaidFixture, signer};
+    use hellas_auth::test_support::actors::{FRIEND, ROOT};
+    use hellas_kernel::{Auth, Key, Parties, PartyAuth, PartyKeys, Terms, Tx};
+    use hellas_work::model::bundle::WorkChannelSetupBundleV2;
+    use hellas_work::work_store::SetupScan;
+
+    let root = tempfile::tempdir().unwrap();
+    let peer = SecretKey::from_bytes(&[71; 32]).public();
+    let authority =
+        crate::test_support::authority(&root.path().join("authority"), enrollment(peer).0).await;
+    let fixture = PaidFixture::new();
+    let client = signer(1);
+    let provider = signer(2);
+    for (name, owner, delegate, refusal) in [
+        (
+            "foreign-owner",
+            FRIEND.principal(),
+            Some(client.party_key()),
+            Some("client coin owner"),
+        ),
+        (
+            "provider-selected-lock",
+            ROOT.principal(),
+            None,
+            Some("client payout delegation"),
+        ),
+        (
+            "own-owner",
+            ROOT.principal(),
+            Some(client.party_key()),
+            None,
+        ),
+    ] {
+        let mut bond_terms = fixture.proposal.bond_terms().clone();
+        bond_terms.parties = Parties::new(
+            PartyKeys::sole(provider.party_key()),
+            PartyKeys::new(
+                Key::from_bytes(*owner.as_bytes()),
+                client.party_key(),
+                delegate,
+            ),
+        );
+        let funding = fixture.proposal.bond_funding().clone();
+        let hash = Tx::open_hash(
+            fixture.config.chain.network,
+            &funding,
+            &Terms::work_stake_bond(bond_terms.clone()),
+        );
+        let proposal = WorkChannelSetupBundleV2::propose_bond(
+            fixture.config.chain.network,
+            funding.clone(),
+            bond_terms,
+            PartyAuth::owner(Auth::native(provider.sign(hash))),
+        )
+        .unwrap();
+        let store = SetupStore::open(
+            &root.path().join(name),
+            fixture.config.chain.network,
+            proposal.bond_edge(),
+            Role::Client,
+            &Secp256k1Verifier::new(),
+        )
+        .await
+        .unwrap();
+        let policy = fixture.config.provider_policy();
+        let mut setup = SetupEndpoint::new(
+            store,
+            client.clone(),
+            PaymentAdmission::Proposes(Box::new(policy.clone())),
+        );
+        setup.import(&proposal.encode()).await.unwrap();
+        setup
+            .arm_scan(SetupScan {
+                height: 0,
+                payload: [0; 32],
+            })
+            .await
+            .unwrap();
+        let terms = payment_terms(&fixture.config, &policy, &proposal, 601);
+        let payment_funding = Funding::new(
+            hellas_kernel::List::take(
+                [hellas_kernel::CoinId::from_bytes([91; 32]); hellas_kernel::MAX_PARTY_INPUTS],
+                1,
+            ),
+            hellas_kernel::List::empty(hellas_kernel::CoinId::from_bytes([0; 32])),
+        );
+        let result =
+            propose_client_payment(&mut setup, &authority, &client, payment_funding, terms).await;
+        if let Some(reason) = refusal {
+            assert!(
+                matches!(result, Err(PaidClientError::InputMismatch(actual)) if actual == reason)
+            );
+            assert_eq!(setup.state().revision(), Some(1));
+            assert_eq!(setup.state().bundle().unwrap(), &proposal);
+        } else {
+            result.unwrap();
+            assert_eq!(setup.state().revision(), Some(2));
+        }
+    }
+}

@@ -5,6 +5,7 @@ use hellas_wire::peers::PeerId;
 #[test]
 fn relative_deadlines_are_ordered_from_the_current_cursor() {
     let args = RunArgs {
+        grant_config: "grant.json".into(),
         chain_node: Default::default(),
         trust_store: "trust".into(),
         trust_policy: "provider".into(),

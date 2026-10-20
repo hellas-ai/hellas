@@ -105,6 +105,9 @@ pub struct InspectChainArgs {
 
 #[derive(Clone, Debug, Args)]
 pub struct RunArgs {
+    /// Existing node grant configuration; its authority must already be bootstrapped.
+    #[arg(long = "grant-config")]
+    grant_config: PathBuf,
     #[command(flatten)]
     chain_node: super::chain_node::ChainNodeArgs,
     /// Caller-owned private trust directory.
@@ -176,6 +179,7 @@ pub async fn run(
     transport_key: SecretKey,
     settlement_key: Secp256k1Signer,
     producer_key: hellas_auth::ProducerSigningKey,
+    principal: Option<hellas_auth::authority::PrincipalId>,
 ) -> CliResult<()> {
     match command {
         PaidWorkCommand::PrepareFetch(args) => prepare_fetch(args, &producer_key),
@@ -189,12 +193,19 @@ pub async fn run(
                 args.timeout_secs > 0,
                 "--timeout-secs must be greater than zero"
             );
+            let authority = crate::identity::open_authority(&args.grant_config, principal).await?;
             let timeout = Duration::from_secs(args.timeout_secs);
             let config = load_work_config(&args.work_config)?;
             let node = args.chain_node.start(&config).await?;
             let result = tokio::time::timeout(
                 timeout,
-                run_one(*args, transport_key, settlement_key, node.clone()),
+                run_one(
+                    *args,
+                    transport_key,
+                    settlement_key,
+                    node.clone(),
+                    authority,
+                ),
             )
             .await
             .map_err(|_| anyhow::anyhow!("paid-work run exceeded its {timeout:?} limit"));
@@ -424,6 +435,7 @@ async fn run_one(
     transport_key: SecretKey,
     settlement_key: Secp256k1Signer,
     node: hellas_sdk::FullNode,
+    authority: hellas_work::node::NodeCoordinator,
 ) -> CliResult<()> {
     let prepared = read_prepared_work_input(&args.prepared_input)?;
     let result = run_paid_work(
@@ -435,6 +447,7 @@ async fn run_one(
         transport_key,
         settlement_key,
         node,
+        authority,
     )
     .await?;
     println!("bond_edge: {}", hex::encode(result.bond_edge.to_bytes()));

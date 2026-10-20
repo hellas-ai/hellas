@@ -526,9 +526,18 @@ enum Commands {
         /// The paid-work configuration this offer is made under
         #[arg(long = "work-config")]
         work_config: PathBuf,
-        /// The client this bond names as taker, hex-encoded
+        /// Existing node grant configuration; its authority must already be bootstrapped.
+        #[arg(long = "grant-config")]
+        grant_config: PathBuf,
+        /// Alias of an already imported, verified client contact.
+        #[arg(long)]
+        client_contact: String,
+        /// The client node signer this bond names as taker, hex-encoded.
         #[arg(long = "client")]
         client: String,
+        /// Return the provider's stake without delegating it back to this node.
+        #[arg(long)]
+        lock_provider_payout: bool,
         /// A coin this provider stakes, hex-encoded. Repeat it for each
         /// coin; the stake is the provider's alone, so none of these is
         /// the client's.
@@ -546,8 +555,8 @@ enum Commands {
         /// The largest job price this bond covers
         #[arg(long = "max-job-price")]
         max_job_price: u64,
-        /// Print the deterministic bond edge and exit before evidence,
-        /// routes, validators, or journals are opened.
+        /// Print the bond edge using the existing authority and contact,
+        /// before opening paid-work journals or connecting to validators.
         #[arg(long = "print-bond-only")]
         print_bond_only: bool,
     },
@@ -817,7 +826,7 @@ async fn async_main() {
 
     let command = match command {
         Commands::Chain { command } => {
-            let result = commands::chain::run(command).await;
+            let result = commands::chain::run(command, cli.passkey.as_deref()).await;
             tracer_provider.shutdown();
             if let Err(err) = result {
                 eprintln!("error: {err:#}");
@@ -964,7 +973,10 @@ async fn async_main() {
         Commands::Provision {
             chain_node,
             work_config,
+            grant_config,
+            client_contact,
             client,
+            lock_provider_payout,
             stake_coin,
             bond_timeout,
             timeout_payout,
@@ -973,6 +985,10 @@ async fn async_main() {
         } => match commands::serve::load_work_config(&work_config) {
             Err(error) => Err(error.into()),
             Ok(work_config) => async {
+                let authority = identity::open_authority(
+                    &grant_config, passkey.map(commands::contributions::principal).transpose()?,
+                ).await?;
+                let contact = commands::contributions::load_contact(authority.owner().await?, &client_contact)?;
                 commands::serve::run_provision(commands::serve::ProvisionOptions {
                     work_config,
                     // The bond is staked by the party this node already
@@ -981,14 +997,16 @@ async fn async_main() {
                     settlement_key: identity::settlement_signer(&local_identity)?,
                     provider: local_identity.enrollment.clone(),
                     addresses: Vec::new(),
-                    client: hellas_kernel::Key::from_bytes(commands::paid_work::fixed_hex("--client", &client)?),
+                    client: contact,
+                    client_node: hellas_kernel::Key::from_bytes(commands::paid_work::fixed_hex("--client", &client)?),
+                    redelegate_payout: !lock_provider_payout,
                     stake_coins: stake_coin.iter().map(|coin| {
                         commands::paid_work::fixed_hex("--stake-coin", coin).map(hellas_kernel::CoinId::from_bytes)
                     }).collect::<anyhow::Result<_>>()?,
                     bond_timeout,
                     timeout_payout,
                     max_job_price,
-                }, print_bond_only, chain_node)
+                }, print_bond_only, chain_node, authority)
                 .await
             }.await
         },
@@ -1092,7 +1110,7 @@ async fn async_main() {
                     anyhow::ensure!(paid_work_config.is_none() && loaded_environment.is_none(), "Responses grants require their own Fetch gateway");
                     anyhow::ensure!(output_cache == hellas_rpc::cache::CachePolicy::Off, "Responses grants require --output-cache off");
                     anyhow::ensure!(metrics_port.is_none(), "Responses Fetch does not support --metrics-port");
-                    let hellas_sdk::node_control::profile::GatewayHost { access, control } = hellas_sdk::node_control::profile::GatewayProfile::load(
+                    let hellas_sdk::node_control::profile::GatewayHost { access, control, .. } = hellas_sdk::node_control::profile::GatewayProfile::load(
                         gateway_profile.as_deref().ok_or_else(|| anyhow::anyhow!("--gateway-profile is required to serve HTTP"))?
                     ).await?;
                     let (session, transport) = grant_source.ok_or_else(|| anyhow::anyhow!("Responses grants require a transport"))?;
@@ -1113,6 +1131,9 @@ async fn async_main() {
                         None => result,
                     };
                 }
+                let hellas_sdk::node_control::profile::GatewayHost { access: gateway_access, control, node: authority } = hellas_sdk::node_control::profile::GatewayProfile::load(
+                    gateway_profile.as_deref().ok_or_else(|| anyhow::anyhow!("--gateway-profile is required to serve HTTP"))?
+                ).await?;
                 let mut chain_shutdown = None;
                 let paid_work = if let Some(path) = paid_work_config.as_ref()
                     && output_cache != hellas_rpc::cache::CachePolicy::ReplayOnly
@@ -1132,6 +1153,7 @@ async fn async_main() {
                             options,
                             hellas_sdk::NodeIdentity::from_secret_bytes(secret_key.to_bytes(), local_identity.node_key.to_secret_bytes())?,
                             node,
+                            authority,
                         ).await? as std::sync::Arc<dyn hellas_gateway::WorkExecutionBackend>
                     )
                 } else {
@@ -1162,9 +1184,6 @@ async fn async_main() {
                 } else if loaded_environment.is_none() {
                     grant_gateway.as_ref().map(|gateway| gateway.http_config()).transpose()?
                 } else { None };
-                let hellas_sdk::node_control::profile::GatewayHost { access: gateway_access, control } = hellas_sdk::node_control::profile::GatewayProfile::load(
-                    gateway_profile.as_deref().ok_or_else(|| anyhow::anyhow!("--gateway-profile is required to serve HTTP"))?
-                ).await?;
                 let served = async {
                 if let Some(config) = http_config {
                     anyhow::ensure!(output_cache == hellas_rpc::cache::CachePolicy::Off,
@@ -1232,15 +1251,16 @@ async fn async_main() {
             node_addrs,
         } => commands::rpc::run(node_id, node_addrs, secret_key).await,
         Commands::PaidWork { command } => match identity::settlement_signer(&local_identity) {
-            Ok(settlement_key) => {
+            Ok(settlement_key) => async {
                 commands::paid_work::run(
                     command,
                     secret_key,
                     settlement_key,
                     local_identity.node_key.clone(),
+                    passkey.map(commands::contributions::principal).transpose()?,
                 )
                 .await
-            }
+            }.await,
             Err(error) => Err(error),
         },
         Commands::Trust(args) => commands::trust::run(args),

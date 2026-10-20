@@ -8,17 +8,18 @@ pub async fn run_provision(
     options: ProvisionOptions,
     print_bond_only: bool,
     chain: super::super::chain_node::ChainNodeArgs,
+    authority: hellas_work::node::NodeCoordinator,
 ) -> CliResult<()> {
     if print_bond_only {
         println!(
             "bond_edge: {}",
-            hex::encode(preview_bond(&options)?.to_bytes())
+            hex::encode(preview_bond(&options, &authority).await?.to_bytes())
         );
         return Ok(());
     }
     let root = options.work_config.journal_root.clone();
     let node = chain.start(&options.work_config).await?;
-    let result = provision_offer(options, &node).await;
+    let result = provision_offer(options, &node, &authority).await;
     node.shutdown().await?;
     let made = result?;
     println!(
