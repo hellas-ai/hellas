@@ -49,10 +49,15 @@ async fn checked_administration_persists_caller_audit_and_rechecks_sessions_afte
     let directory = tempfile::tempdir().unwrap();
     let (node, root_secret) = fixture(directory.path(), scope(ROOT)).await;
     let root = crate::test_support::session(&node, &root_secret).await;
-    let (_, secret) = node
-        .issue_credential(&root, ids::ROOT_GRANT, scope(OPERATOR), OPERATOR.holder())
-        .await
-        .unwrap();
+    let (_, secret) = crate::test_support::credentials::issue_one(
+        &node,
+        &root,
+        ids::ROOT_GRANT,
+        scope(OPERATOR),
+        OPERATOR.holder(),
+    )
+    .await
+    .unwrap();
     let binding = Digest::hash(b"test connection");
     let pending = node.begin_authentication(binding).await.unwrap();
     let proof = SessionKey::Passkey(&OPERATOR.passkey())
@@ -187,6 +192,9 @@ fn cancelled_native_append_refuses_authentication_and_administration_until_reope
                     .unwrap();
                 let caller = crate::test_support::session(&node, &secret).await;
                 let before = node.store.lock().await.unwrap().state().clone();
+                let (prepared, retained) =
+                    Credential::prepare(scope(OPERATOR), OPERATOR.holder(), caller.generation())
+                        .unwrap();
                 let (entered, started) = tokio::sync::oneshot::channel();
                 let (release, blocked) = std::sync::mpsc::channel();
                 let blocker = tokio::task::spawn_blocking(move || {
@@ -207,14 +215,9 @@ fn cancelled_native_append_refuses_authentication_and_administration_until_reope
                             .await
                             .map(|_| ())
                         } else {
-                            node.issue_credential(
-                                &caller,
-                                ids::ROOT_GRANT,
-                                scope(OPERATOR),
-                                OPERATOR.holder(),
-                            )
-                            .await
-                            .map(|_| ())
+                            node.issue_credential(&caller, ids::ROOT_GRANT, prepared.clone())
+                                .await
+                                .map(|_| ())
                         }
                     });
                     assert!(futures::poll!(&mut issue).is_pending());
@@ -258,9 +261,17 @@ fn cancelled_native_append_refuses_authentication_and_administration_until_reope
                     &secret,
                     UnixMillis(11),
                 );
-                // The cancelled call returned no secret. Startup may recover its full,
-                // unacknowledged record; neither outcome authorizes a blind retry.
-                assert!([1, 2].contains(&reopened.state().authority().credentials().count()));
+                // The caller retains its exact ID and secret even if cancellation
+                // races the append. Reconcile that record, never guess by scope.
+                if let Some(installed) = reopened.state().authority().credential(retained.id()) {
+                    assert!(matches!(command, Command::Credential));
+                    assert_eq!(installed, &prepared);
+                    crate::test_support::passkey_caller(
+                        reopened.state().authority(),
+                        &retained,
+                        UnixMillis(11),
+                    );
+                }
                 assert!(
                     [2, 4].contains(
                         &reopened
@@ -317,10 +328,15 @@ async fn application(
     )
     .await
     .unwrap();
-    let (_, secret) = node
-        .issue_credential(root, ids::ROOT_GRANT, spec, actor.holder())
-        .await
-        .unwrap();
+    let (_, secret) = crate::test_support::credentials::issue_one(
+        node,
+        root,
+        ids::ROOT_GRANT,
+        spec,
+        actor.holder(),
+    )
+    .await
+    .unwrap();
     let identity = actor.node_key();
     let caller = node
         .authenticate_session(&secret, crate::node::SessionKey::Node(&identity))
@@ -343,7 +359,8 @@ async fn an_unmounted_machine_cannot_receive_capacity_commands() {
         NodeStoreError::MissingMachine
     );
     assert_err!(
-        node.issue_credential(
+        crate::test_support::credentials::issue_one(
+            &node,
             &root,
             ids::ROOT_GRANT,
             host_scope(OPERATOR),

@@ -101,15 +101,15 @@ impl Host {
             scope.clone(),
         )
         .await;
-        let (_, secret) = node
-            .issue_credential(
-                &admin,
-                ids::ROOT_GRANT,
-                scope,
-                hellas_auth::authority::CredentialHolder::Bearer,
-            )
-            .await
-            .unwrap();
+        let (_, secret) = hellas_work::test_support::credentials::issue_one(
+            &node,
+            &admin,
+            ids::ROOT_GRANT,
+            scope,
+            hellas_auth::authority::CredentialHolder::Bearer,
+        )
+        .await
+        .unwrap();
         hellas_gateway::GatewayAccess::new(node, GATEWAY_ACCESS, secret)
             .await
             .unwrap()

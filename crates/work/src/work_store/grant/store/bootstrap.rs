@@ -180,7 +180,8 @@ impl NodeStore {
         query: &hellas_auth::authority::InspectionQuery,
     ) -> Result<hellas_auth::authority::AuthorityInspection, NodeStoreError> {
         let (_identity_lock, marker) = read_marker(directory, network)?;
-        let (id, replay) = Journal::inspect(directory, "grants").await?;
+        let snapshot = inspection_snapshot(directory)?;
+        let (id, replay) = Journal::inspect(snapshot.path(), "grants").await?;
         if id != marker.journal_id() {
             return Err(NodeStoreError::Malformed);
         }
@@ -206,6 +207,44 @@ impl NodeStore {
             deliveries: Default::default(),
         })
     }
+}
+
+/// Called while the store's identity lock excludes every writer.
+fn inspection_snapshot(directory: &Path) -> Result<tempfile::TempDir, NodeStoreError> {
+    // A read-only SQLite connection may create shared-memory sidecars for a
+    // crash-left WAL. Replay a private copy under the identity lock so even
+    // that recovery leaves every source file unchanged.
+    let snapshot = tempfile::Builder::new()
+        .prefix(".inspection-")
+        .tempdir_in(directory)?;
+    hellas_private::restrict_directory(snapshot.path())?;
+    let source = Journal::path(directory, "grants");
+    let target = Journal::path(snapshot.path(), "grants");
+    let parent = target.parent().ok_or(NodeStoreError::Malformed)?;
+    hellas_private::create_dir_all_durable(parent)?;
+    hellas_private::restrict_directory(parent)?;
+    for (source, target) in [
+        (source.clone(), target.clone()),
+        (
+            source.with_extension("sqlite-wal"),
+            target.with_extension("sqlite-wal"),
+        ),
+    ] {
+        if source
+            .extension()
+            .is_some_and(|extension| extension == "sqlite-wal")
+            && !source.try_exists()?
+        {
+            continue;
+        }
+        let mut input = hellas_private::open_regular_file_nofollow(&source)?;
+        let mut output = hellas_private::private_tempfile(parent, ".copy-", ".sqlite")?;
+        std::io::copy(&mut input, &mut output)?;
+        output
+            .persist_noclobber(target)
+            .map_err(|error| error.error)?;
+    }
+    Ok(snapshot)
 }
 
 fn read_marker(

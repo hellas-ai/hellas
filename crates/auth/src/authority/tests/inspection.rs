@@ -53,6 +53,7 @@ fn lost_mutation_reply_can_be_reconciled_after_other_mutations() {
         panic!("grants")
     };
     assert_eq!(records[0].revision(), committed);
+    assert_eq!(records[0].spec(), &spec(FRIEND));
     s.record_administration(&caller, command(records[0].revision()), UnixMillis(3))
         .unwrap();
 }

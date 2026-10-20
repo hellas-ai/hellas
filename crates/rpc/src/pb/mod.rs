@@ -100,37 +100,6 @@ pub mod chain {
 #[cfg(feature = "host-control")]
 pub mod host {
     pub use crate::pb::hellas::host::v1::*;
-
-    impl std::fmt::Debug for IssueCredentialResponse {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.debug_struct("IssueCredentialResponse")
-                .field("credential_id", &self.credential_id)
-                .finish_non_exhaustive()
-        }
-    }
-
-    impl Drop for IssueCredentialResponse {
-        fn drop(&mut self) {
-            zeroize::Zeroize::zeroize(&mut self.secret);
-        }
-    }
-
-    impl IssueCredentialResponse {
-        /// Decode the bounded secret returned once by an authenticated node.
-        pub fn credential(
-            &self,
-        ) -> Result<
-            hellas_auth::authority::CredentialSecret,
-            crate::authentication::AuthenticationWireError,
-        > {
-            use crate::authentication::AuthenticationWireError::Encoding;
-            use hellas_auth::authority::{CredentialId, CredentialSecret};
-            Ok(CredentialSecret::from_parts(
-                CredentialId::try_from(self.credential_id.as_slice()).map_err(|_| Encoding)?,
-                self.secret.as_slice().try_into().map_err(|_| Encoding)?,
-            ))
-        }
-    }
 }
 
 #[cfg(feature = "work")]
@@ -230,13 +199,13 @@ mod id_pins {
             RevokeCredential, SetGatewayState, SetProviderState, WorkControl,
         };
         // Lifecycle requests carry their selected Auth authorization grant.
-        assert_eq!(<HostControl as ServiceMarker>::SERVICE_ID, 0xa78d_3168);
+        assert_eq!(<HostControl as ServiceMarker>::SERVICE_ID, 0x459f_a263);
         assert_eq!(<SetProviderState as MethodMarker>::METHOD_ID, 0xab3a_b173);
         assert_eq!(<SetGatewayState as MethodMarker>::METHOD_ID, 0xa909_3160);
         assert_eq!(<GetGatewayAccess as MethodMarker>::METHOD_ID, 0xce7f_5d32);
         assert_eq!(<GrantControl as MethodMarker>::METHOD_ID, 0xc0e0_b21c);
         assert_eq!(<WorkControl as MethodMarker>::METHOD_ID, 0x995d_0334);
-        assert_eq!(<IssueCredential as MethodMarker>::METHOD_ID, 0xad8c_229b);
+        assert_eq!(<IssueCredential as MethodMarker>::METHOD_ID, 0xf445_91c2);
         assert_eq!(<RevokeCredential as MethodMarker>::METHOD_ID, 0xe7b1_8b70);
         assert_eq!(<BindProvider as MethodMarker>::METHOD_ID, 0xcb33_75a9);
     }

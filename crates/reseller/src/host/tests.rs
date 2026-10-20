@@ -327,15 +327,15 @@ impl ResellerBuilder {
                 not_before: UnixMillis::now().unwrap_or_default(),
                 expires: UnixMillis(UnixMillis::now().unwrap_or_default().0 + 60_000),
             };
-            let (_, credential) = node
-                .issue_credential(
-                    &caller,
-                    authorization,
-                    scope,
-                    hellas_auth::authority::CredentialHolder::Bearer,
-                )
-                .await
-                .unwrap();
+            let (_, credential) = hellas_work::test_support::credentials::issue_one(
+                &node,
+                &caller,
+                authorization,
+                scope,
+                hellas_auth::authority::CredentialHolder::Bearer,
+            )
+            .await
+            .unwrap();
             hellas_sdk::gateway::GatewayAccess::new(node, authorization, credential)
                 .await
                 .unwrap()
@@ -639,7 +639,7 @@ async fn controlled_host(
     )
     .await
     .unwrap();
-    let control = hellas_sdk::node_control::connect_local(
+    let (control, _) = hellas_sdk::node_control::connect_local(
         socket,
         Arc::new(trust),
         "localhost".try_into().unwrap(),

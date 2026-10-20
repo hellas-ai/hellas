@@ -59,22 +59,26 @@ credential-issuance ceiling, and a `--holder` file: the JSON `CredentialHolder` 
 the device that will hold it. `hellas-cli --identity node.identity identity
 show-holder` prints that device's holder, `{"Node":[1,[...]]}`, its node key with
 the secp256k1 curve tag. Issuing creates no grant: the recipient also needs current
-grants for the requested operations. The node commits the verifier and audit before
-returning the secret once over the authenticated connection. The CLI writes a private
-credential file without overwriting an existing file and prints its ID, revision,
+grants for the requested operations. The client prepares the credential using the
+authenticated session generation and saves its secret in a new private file before
+submitting the verifier and ID. The secret never crosses the issuance RPC. After
+the node confirms the durable record, the CLI prints its ID, revision,
 path, authority ID, subject key and subject fingerprint. Transfer that file securely
 to the holding device; a session also requires the subject's passkey or that
 device's node key. The holder `"Bearer"` issues a `gateway.invoke`-only credential
 for local HTTP clients: its secret alone authenticates it, and it opens no session.
-The server does not retain a recoverable copy of the secret.
+The server stores only the verifier.
 
 `revoke-credential` requires the separate credential-revocation permission and the
 credential's current revision (one for a newly issued credential). Revocation applies
 to live sessions and survives restart. Rotate by issuing a replacement to the same
 subject, installing it, and explicitly revoking the previous credential. This does
 not change the subject or reset accounting. A lost reply can follow a durable issue;
-do not retry issuance automatically. If local file publication fails after receipt,
-the CLI reports the issued ID so it can be revoked before retrying.
+do not retry issuance automatically. A refused request or lost reply leaves the
+local file pending confirmation, not evidence of usable access. The error reports
+its exact ID and path. Inspect that ID and compare its scope, holder and generation
+with the intended credential before using it; no scope-matching guess is needed.
+If private file publication fails, no issuance request is sent.
 
 `bind-provider` requires `host.provider.bind` on the host resource. It binds the
 provider enrollment of an authority bootstrapped without one, such as an embedded
@@ -309,13 +313,13 @@ hellas-cli --identity friend.identity --passkey friend.passkey offer import-bund
 `export-bundle` takes `--allowance` once per shared allowance, at most 16. The
 credential scope must grant `work.execute` on each of them; `--grant-id` names the
 contact's existing grant with those permissions, not an allowance ID. It exports
-each allowance's offer (`work.offer.export`), then issues one credential bounded by
-the scope, held by the contact device named by `--holder`, exactly as
-`issue-credential` does. The bundle is canonical DAG-CBOR tagged
+each allowance's offer (`work.offer.export`), then prepares one credential bounded
+by the scope, held by the contact device named by `--holder`. It saves the bundle
+before submitting the verifier, exactly as `issue-credential` does. The bundle is canonical DAG-CBOR tagged
 `hellas.access-bundle.v2`. Its subject and holder carry their curve tags. It is
-written as a new private file that never replaces an existing one. If writing fails
-after issuance, the command reports the credential ID so it can be revoked. The
-secret is never printed.
+written as a new private file that never replaces an existing one. A failed or
+unconfirmed issuance leaves that bundle pending; inspect its reported credential
+ID before sharing it. The secret is never printed.
 
 `offer import-bundle` accepts the received bundle file as it is; delete it after
 importing, since it holds the credential. It refuses a bundle whose subject is not
@@ -545,16 +549,20 @@ records. Revoked and expired records remain inspectable until normal capacity
 reclamation. Credential metadata contains its ID, scope, holder, generation,
 revision and revocation flag, never its secret or verifier.
 
-After a lost grant update reply, inspect that grant's revision before retrying.
-After a lost credential issuance reply, enumerate credentials and identify the
-issued scope and device holder before revoking an orphaned credential. Identical
-concurrent issuances cannot be distinguished by purpose: reconcile the matching
-credentials with their holders instead of guessing which one was delivered.
+After a lost grant update reply, compare the inspected grant spec with the intended
+change as well as its revision before deciding to retry. After a lost credential
+issuance reply, use the singular `Credential` query with the retained 16-byte ID
+and compare the returned scope, holder, generation and revocation state with the
+intended issuance. The client retains the exact ID and secret before submission,
+so identical concurrent issuances remain distinguishable.
 
 With the daemon stopped, `admin inspect-offline --journal PATH QUERY.json` reads
 these same bounded views without an identity, credential or passkey. It takes the
-writer's exclusive identity lock and reads the existing journal without creating
-state, running startup recovery, changing clocks or migrating the database. Use
+writer's exclusive identity lock and replays a private temporary copy of the database
+and any crash-left WAL inside the data directory. The temporary copy is removed
+after inspection; the source database and sidecars remain unchanged. Inspection
+does not create authority state, run startup recovery, change clocks or migrate the
+database. Use
 its revision for `admin recover --expected-revision`, including after a recovery
 whose reply or credential file was lost. Successful bootstrap and recovery print
 the committed revision; credential publication failures report it too.

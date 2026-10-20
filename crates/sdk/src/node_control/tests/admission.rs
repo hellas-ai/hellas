@@ -82,7 +82,7 @@ async fn idle_sessions_release_control_capacity() {
     let (client, server) = tokio::io::duplex(8192);
     let service = f.service.clone();
     let task = tokio::spawn(async move { service.serve_tls(server, server_config).await });
-    let client = connect_tls(
+    let (client, _) = connect_tls(
         client,
         client_config,
         "localhost".try_into().unwrap(),

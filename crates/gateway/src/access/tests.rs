@@ -64,10 +64,15 @@ impl Fixture {
             )
             .await
             .unwrap();
-        let (_, credential) = node
-            .issue_credential(&caller, ROOT_GRANT, scope, CredentialHolder::Bearer)
-            .await
-            .unwrap();
+        let (_, credential) = hellas_work::test_support::credentials::issue_one(
+            &node,
+            &caller,
+            ROOT_GRANT,
+            scope,
+            CredentialHolder::Bearer,
+        )
+        .await
+        .unwrap();
         let access = GatewayAccess::new(node, HTTP_ACCESS, credential)
             .await
             .unwrap();
@@ -279,10 +284,15 @@ async fn each_principal_is_admitted_under_its_own_grant() {
             .build()
     };
     let bearer = async |actor| {
-        let (_, credential) = node
-            .issue_credential(&caller, ROOT_GRANT, scope(actor), CredentialHolder::Bearer)
-            .await
-            .unwrap();
+        let (_, credential) = hellas_work::test_support::credentials::issue_one(
+            node,
+            &caller,
+            ROOT_GRANT,
+            scope(actor),
+            CredentialHolder::Bearer,
+        )
+        .await
+        .unwrap();
         format!(
             "Bearer {}{}",
             credential.id(),
@@ -311,10 +321,15 @@ async fn each_principal_is_admitted_under_its_own_grant() {
         StatusCode::UNAUTHORIZED
     );
     // A device-held credential never authenticates by its secret.
-    let (_, held) = node
-        .issue_credential(&caller, ROOT_GRANT, scope(FRIEND), FRIEND.holder())
-        .await
-        .unwrap();
+    let (_, held) = hellas_work::test_support::credentials::issue_one(
+        node,
+        &caller,
+        ROOT_GRANT,
+        scope(FRIEND),
+        FRIEND.holder(),
+    )
+    .await
+    .unwrap();
     let held = format!(
         "Bearer {}{}",
         held.id(),

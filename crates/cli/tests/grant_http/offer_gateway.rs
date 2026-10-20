@@ -96,10 +96,15 @@ impl OfferHost {
             Arc::new(|| hellas_auth::authority::UnixMillis::now().unwrap_or_default()),
         );
         let caller = hellas_work::test_support::session(&coordinator, &app_secret).await;
-        let (_, client_secret) = coordinator
-            .issue_credential(&caller, root_grant, reader.clone(), client.holder().await)
-            .await
-            .unwrap();
+        let (_, client_secret) = hellas_work::test_support::credentials::issue_one(
+            &coordinator,
+            &caller,
+            root_grant,
+            reader.clone(),
+            client.holder().await,
+        )
+        .await
+        .unwrap();
         drop(coordinator);
         let provider_profile = profile(root, "control", authority, root_grant, &app_secret);
         let client_profile = profile(root, "reader", authority, reader_grant, &client_secret);
@@ -537,10 +542,15 @@ async fn controlled_gateway_profile(root: &Path) -> (PathBuf, PathBuf) {
         Arc::new(|| UnixMillis::now().unwrap_or_default()),
     );
     let caller = hellas_work::test_support::session(&coordinator, &admin_secret).await;
-    let (_, own) = coordinator
-        .issue_credential(&caller, root_grant, scope.clone(), CredentialHolder::Bearer)
-        .await
-        .unwrap();
+    let (_, own) = hellas_work::test_support::credentials::issue_one(
+        &coordinator,
+        &caller,
+        root_grant,
+        scope.clone(),
+        CredentialHolder::Bearer,
+    )
+    .await
+    .unwrap();
     drop(coordinator);
     let own_path = root.join("controlled-gateway.credential");
     hellas_sdk::node_control::profile::save_credential(

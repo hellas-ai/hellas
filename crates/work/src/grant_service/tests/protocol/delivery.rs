@@ -156,15 +156,15 @@ async fn response_registry_is_bounded_and_does_not_retain_abandoned_responses() 
         .spec()
         .clone();
     scope.expires = UnixMillis(1100);
-    let (_, short) = node
-        .issue_credential(
-            &admin,
-            GrantId([0; 16]),
-            scope,
-            crate::test_support::holder(principal(1).0),
-        )
-        .await
-        .unwrap();
+    let (_, short) = crate::test_support::credentials::issue_one(
+        &node,
+        &admin,
+        GrantId([0; 16]),
+        scope,
+        crate::test_support::holder(principal(1).0),
+    )
+    .await
+    .unwrap();
     let expiring = service.for_caller(
         node.authenticate_session(&short, crate::node::SessionKey::Node(&principal(1).1))
             .await

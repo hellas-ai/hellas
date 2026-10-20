@@ -5,8 +5,8 @@ use crate::{
 };
 use anyhow::{Context, Result, ensure};
 use hellas_auth::authority::{
-    AdministrationCommand, AdministrationRecord, CredentialCommand, CredentialHolder, CredentialId,
-    CredentialSecret, GrantCommand, GrantId, GrantSpec, Ownership, Revision, ownership_digest,
+    AdministrationCommand, AdministrationRecord, Credential, CredentialCommand, CredentialHolder,
+    CredentialId, GrantCommand, GrantId, GrantSpec, Ownership, Revision, ownership_digest,
 };
 use hellas_rpc::{
     pb::host::{
@@ -106,10 +106,16 @@ pub async fn run(
                 ),
             )
             .await??;
-            let client =
+            let (client, challenge) =
                 node_control::connect_iroh(connection, profile.authority, &profile.credential, key)
                     .await?;
-            command(args.command, client, profile.authorization).await
+            command(
+                args.command,
+                client,
+                profile.authorization,
+                challenge.generation,
+            )
+            .await
         }
         .await;
         endpoint.close().await;
@@ -125,7 +131,7 @@ pub async fn run(
             )?)?)?
             .join("control.sock"),
         };
-        let client = node_control::connect_local(
+        let (client, challenge) = node_control::connect_local(
             &socket,
             tls,
             server_name,
@@ -134,7 +140,13 @@ pub async fn run(
             key,
         )
         .await?;
-        command(args.command, client, profile.authorization).await
+        command(
+            args.command,
+            client,
+            profile.authorization,
+            challenge.generation,
+        )
+        .await
     }
 }
 
@@ -142,6 +154,7 @@ async fn command<T>(
     command: AdminCommand,
     client: HostControlClientImpl<T>,
     authorization: GrantId,
+    generation: u64,
 ) -> Result<()>
 where
     T: StreamTransport + Send + Sync,
@@ -236,18 +249,18 @@ where
         } => {
             let scope: GrantSpec = read(&scope)?;
             let holder: CredentialHolder = read(&holder)?;
+            let (credential, secret) = Credential::prepare(scope.clone(), holder, generation)?;
             let output = credential_output(&credential_out)?;
-            let secret = issue(&client, authorization, &scope, holder).await?;
-            let id = hex::encode(secret.id().0);
-            profile::save_credential(output, &credential_out, &secret).with_context(|| {
-                format!(
-                    "credential {id} was issued but could not be saved; revoke it before retrying"
-                )
-            })?;
+            let id = secret.id();
+            profile::save_credential(output, &credential_out, &secret)?;
+            issue(&client, authorization, &credential).await.with_context(|| format!(
+                "credential {id} is retained at {} pending confirmation; inspect Credential {{ id }} before using it or retrying issuance",
+                credential_out.display(),
+            ))?;
             println!(
                 "{}",
                 serde_json::json!({
-                    "credential_id": id, "revision": 1,
+                    "credential_id": id.to_string(), "revision": 1,
                     "credential_file": credential_out,
                     "subject": hex::encode(scope.subject.as_bytes()),
                     "subject_fingerprint": scope.subject.fingerprint(),
@@ -310,13 +323,8 @@ where
                 };
                 offers.push(offer);
             }
-            let credential = issue(
-                &client,
-                authorization,
-                &scope,
-                CredentialHolder::Node(holder),
-            )
-            .await?;
+            let (prepared, credential) =
+                Credential::prepare(scope.clone(), CredentialHolder::Node(holder), generation)?;
             let id = hex::encode(credential.id().0);
             let bundle = AccessBundle {
                 offers,
@@ -328,11 +336,11 @@ where
                 expires: scope.expires,
                 label,
             };
-            bundle.save(&out).with_context(|| {
-                format!(
-                    "credential {id} was issued but the bundle could not be saved; revoke it before retrying"
-                )
-            })?;
+            bundle.save(&out)?;
+            issue(&client, authorization, &prepared).await.with_context(|| format!(
+                "bundle credential {id} is retained at {} pending confirmation; inspect Credential {{ id }} before sharing it or retrying issuance",
+                out.display(),
+            ))?;
             for offer in &bundle.offers {
                 offer_fingerprints(offer)?;
             }
@@ -392,13 +400,12 @@ where
     Ok(())
 }
 
-/// Issue a credential and check the durable record matches the request.
+/// Submit only the retained credential's verifier and confirm the exact durable record.
 async fn issue<T>(
     client: &HostControlClientImpl<T>,
     authorization: GrantId,
-    scope: &GrantSpec,
-    holder: CredentialHolder,
-) -> Result<CredentialSecret>
+    prepared: &Credential,
+) -> Result<()>
 where
     T: StreamTransport + Send + Sync,
     T::Stream: Send + 'static,
@@ -406,8 +413,7 @@ where
     let response = client
         .issue_credential(IssueCredentialRequest {
             authorization: authorization.0.to_vec(),
-            scope: canonical_dag_cbor(scope)?,
-            holder: canonical_dag_cbor(&holder)?,
+            credential: canonical_dag_cbor(prepared)?,
         })
         .await?;
     ensure!(
@@ -415,7 +421,6 @@ where
         "credential reply exceeds limit"
     );
     let record: AdministrationRecord = decode_dag_cbor(&response.record)?;
-    let secret = response.credential()?;
     let AdministrationCommand::Credential(CredentialCommand::Issue {
         authorization: returned_authorization,
         credential,
@@ -424,15 +429,10 @@ where
         anyhow::bail!("invalid credential issuance reply");
     };
     ensure!(
-        *returned_authorization == authorization
-            && credential.id() == secret.id()
-            && credential.scope() == scope
-            && credential.holder() == holder
-            && credential.revision() == Revision(1)
-            && !credential.revoked(),
+        *returned_authorization == authorization && credential.as_ref() == prepared,
         "credential issuance reply differs from request"
     );
-    Ok(secret)
+    Ok(())
 }
 
 async fn work<T>(
@@ -537,14 +537,14 @@ async fn offline(
                 let caller = node
                     .authenticate_session(&secret, SessionKey::Passkey(passkey))
                     .await?;
-                let (record, bearer) = node
-                    .issue_credential(&caller, root, scope, CredentialHolder::Bearer)
-                    .await?;
-                revision = record.revision();
-                profile::save_credential(output, &out, &bearer).with_context(|| format!(
-                    "authority committed at revision {}; bearer {} publication failed; inspect-offline before retrying",
-                    revision.0, hex::encode(bearer.id().0),
+                let (credential, bearer) =
+                    Credential::prepare(scope, CredentialHolder::Bearer, caller.generation())?;
+                profile::save_credential(output, &out, &bearer)?;
+                let record = node.issue_credential(&caller, root, credential).await.with_context(|| format!(
+                    "bearer {} is retained at {} pending confirmation; inspect-offline before using it or retrying issuance",
+                    bearer.id(), out.display(),
                 ))?;
+                revision = record.revision();
             }
             (secret, revision)
         }

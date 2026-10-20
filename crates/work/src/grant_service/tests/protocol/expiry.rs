@@ -44,15 +44,15 @@ async fn authority_expiry_wakes_delivery_and_rejects_buffered_output() {
             scope.expires = UnixMillis(1100);
             let work_service = match expires {
                 AccessTarget::Credential => {
-                    let (_, credential) = node
-                        .issue_credential(
-                            &admin,
-                            GrantId([0; 16]),
-                            scope,
-                            crate::test_support::holder(principal(1).0),
-                        )
-                        .await
-                        .unwrap();
+                    let (_, credential) = crate::test_support::credentials::issue_one(
+                        &node,
+                        &admin,
+                        GrantId([0; 16]),
+                        scope,
+                        crate::test_support::holder(principal(1).0),
+                    )
+                    .await
+                    .unwrap();
                     service.for_caller(
                         node.authenticate_session(
                             &credential,

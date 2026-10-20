@@ -37,15 +37,15 @@ pub(super) async fn another_application(
         .unwrap()
         .spec()
         .clone();
-    let (_, credential) = node
-        .issue_credential(
-            &admin,
-            GrantId([0; 16]),
-            scope,
-            crate::test_support::holder(principal(1).0),
-        )
-        .await
-        .unwrap();
+    let (_, credential) = crate::test_support::credentials::issue_one(
+        &node,
+        &admin,
+        GrantId([0; 16]),
+        scope,
+        crate::test_support::holder(principal(1).0),
+    )
+    .await
+    .unwrap();
     service.for_caller(
         node.authenticate_session(&credential, crate::node::SessionKey::Node(&principal(1).1))
             .await

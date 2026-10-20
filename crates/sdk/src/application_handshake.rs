@@ -90,7 +90,7 @@ pub(super) async fn connect<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     recv: &mut R,
     send: &mut W,
     framing: Framing,
-) -> Result<Instant, WireStatus> {
+) -> Result<(Instant, SessionChallenge), WireStatus> {
     // The host starts its session clock after this byte arrives, so the
     // returned instant never outlasts the session the host enforces.
     let started = Instant::now();
@@ -120,9 +120,10 @@ pub(super) async fn connect<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     if matches!(framing, Framing::Substream) {
         eof(recv).await?;
     }
-    started
+    let deadline = started
         .checked_add(Duration::from_millis(lifetime))
-        .ok_or_else(denied)
+        .ok_or_else(denied)?;
+    Ok((deadline, challenge))
 }
 
 async fn send_message<W: AsyncWrite + Unpin>(send: &mut W, bytes: &[u8]) -> Result<(), WireStatus> {

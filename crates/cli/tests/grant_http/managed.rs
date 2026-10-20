@@ -108,10 +108,15 @@ impl ManagedWorker {
         // The agent's readiness check opens a daily session with the worker's
         // own node key, so the control credential is held by that node.
         let caller = hellas_work::test_support::session(&node, &secret).await;
-        let (_, secret) = node
-            .issue_credential(&caller, root_grant, application, worker.holder().await)
-            .await
-            .unwrap();
+        let (_, secret) = hellas_work::test_support::credentials::issue_one(
+            &node,
+            &caller,
+            root_grant,
+            application,
+            worker.holder().await,
+        )
+        .await
+        .unwrap();
         drop(node);
         // The agent's readiness check reads this fixed profile name.
         profile(&private, "control", authority, root_grant, &secret);

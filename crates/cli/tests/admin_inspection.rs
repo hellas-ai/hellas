@@ -34,6 +34,7 @@ async fn offline_inspection_needs_no_identity_and_refuses_a_running_writer() {
     );
     drop(world);
     let journal = hellas_work::work_store::journal::Journal::path(&root, "grants");
+    let sidecars_before = hellas_work::test_support::all_files(&root);
     let before = std::fs::read(&journal).unwrap();
     let output = invoke();
     assert!(
@@ -44,4 +45,5 @@ async fn offline_inspection_needs_no_identity_and_refuses_a_running_writer() {
     let view: AuthorityInspection = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(view.revision, expected);
     assert_eq!(std::fs::read(journal).unwrap(), before);
+    assert_eq!(hellas_work::test_support::all_files(&root), sidecars_before);
 }

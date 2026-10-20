@@ -268,6 +268,7 @@ impl Daemon {
         )
         .await
         .unwrap()
+        .0
     }
     fn reader_scope(&self) -> PathBuf {
         let mut scope = self.scope.clone();
@@ -463,6 +464,62 @@ async fn existing_credential_output_refuses_before_issuing_again() {
             .authority_revision,
         before
     );
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn refused_issuance_retains_an_exact_pending_credential_without_granting_access() {
+    let mut daemon = Daemon::start().await;
+    let command = daemon.issue_reader_command();
+    let AdminCommand::IssueCredential {
+        ref scope,
+        ref credential_out,
+        ..
+    } = command
+    else {
+        panic!("issue")
+    };
+    let output = credential_out.clone();
+    let mut invalid: auth::GrantSpec =
+        serde_json::from_slice(&std::fs::read(scope).unwrap()).unwrap();
+    invalid.permissions = [auth::Permission {
+        operation: auth::OperationId::new(hellas_work::node::HOST_STATUS).unwrap(),
+        resource: auth::ResourceId(hellas_auth::Digest::hash(b"another host")),
+    }]
+    .into();
+    std::fs::write(scope, serde_json::to_vec(&invalid).unwrap()).unwrap();
+    let client = daemon.client().await;
+    let before = client
+        .get_host_status(status_request())
+        .await
+        .unwrap()
+        .authority_revision;
+    let error = run(daemon.local(command), &daemon.identity)
+        .await
+        .unwrap_err();
+    let pending = node_control::profile::read_credential(&output).unwrap();
+    assert!(error.to_string().contains("pending confirmation"));
+    assert!(error.to_string().contains(&pending.id().to_string()));
+    assert_permission_denied(error);
+    assert_eq!(
+        client
+            .get_host_status(status_request())
+            .await
+            .unwrap()
+            .authority_revision,
+        before
+    );
+    let denied = client
+        .inspect_authority(hellas_rpc::pb::host::InspectAuthorityRequest {
+            authorization: ROOT_GRANT.0.to_vec(),
+            query: hellas_rpc::protocol::value::canonical_dag_cbor(
+                &auth::InspectionQuery::Credential { id: pending.id() },
+            )
+            .unwrap(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code(), hellas_sdk::wire::WireCode::PermissionDenied);
     daemon.stop().await;
 }
 

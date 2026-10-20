@@ -91,7 +91,6 @@ fn regenerate() {
     // Rare recovered-status detail should not enlarge every Work refusal.
     config.boxed(".hellas.work.v1.GrantRefusal.terminal");
     // The handwritten Debug implementation omits issued application secrets.
-    config.skip_debug([".hellas.host.v1.IssueCredentialResponse"]);
     // NB: prost's `bytes(["."])` (decode `bytes` fields as `bytes::Bytes`
     // for zero-copy) is disabled because current call sites produce `Vec<u8>`.
     config.out_dir(&out_dir);

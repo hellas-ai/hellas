@@ -285,24 +285,21 @@ impl NodeCoordinator {
         .await
     }
 
-    /// Secrets return only after the verifier and audit metadata are synced.
+    /// Commit a client-prepared verifier; the issuing client retains the secret.
     pub async fn issue_credential(
         &self,
         caller: &AuthenticatedCaller,
         authorization: GrantId,
-        scope: GrantSpec,
-        holder: CredentialHolder,
-    ) -> Result<(AdministrationRecord, CredentialSecret), NodeStoreError> {
+        credential: Credential,
+    ) -> Result<AdministrationRecord, NodeStoreError> {
         let _changed = ChangeNotification(self.changed.clone());
         self.checked(
             caller,
             authorization,
             CREDENTIAL_ISSUE,
             async |store, now| {
-                validate_scope(store.state(), &scope)?;
-                let (credential, secret) =
-                    Credential::prepare(scope, holder, store.state().authority().generation())?;
-                let record = store
+                validate_scope(store.state(), credential.scope())?;
+                store
                     .administer_authority(
                         caller,
                         AdministrationCommand::Credential(CredentialCommand::Issue {
@@ -311,8 +308,7 @@ impl NodeCoordinator {
                         }),
                         now,
                     )
-                    .await?;
-                Ok((record, secret))
+                    .await
             },
         )
         .await

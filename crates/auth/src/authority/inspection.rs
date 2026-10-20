@@ -76,7 +76,9 @@ impl AuthorityState {
         };
         self.authorize_caller(caller, authorization, &permission, now)
             .map_err(|_| AuthorityError::Denied)?;
-        let credential = self.check_caller(caller, now)?;
+        let credential = self
+            .credential(caller.credential())
+            .ok_or(AuthorityError::Denied)?;
         let grant = self.grant(authorization).ok_or(AuthorityError::Denied)?;
         self.inspect_visible(query, |target| {
             self.admin_scope(&credential.scope, GRANT_ADMINISTER, target, now, false)

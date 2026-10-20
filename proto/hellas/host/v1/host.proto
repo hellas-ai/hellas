@@ -116,19 +116,13 @@ message GrantControlResponse { bytes reply = 1; }
 
 message IssueCredentialRequest {
   bytes authorization = 1;
-  // Canonical Auth GrantSpec; the server generates the credential and its verifier.
-  bytes scope = 2;
-  // Canonical Auth CredentialHolder: the node key of the device that will hold
-  // the credential, or a gateway.invoke-only bearer for local HTTP clients.
-  bytes holder = 3;
+  // Canonical client-prepared Auth Credential (ID and verifier, never its secret).
+  bytes credential = 2;
 }
 
-// Secret material: send only over authenticated, encrypted HostControl.
 message IssueCredentialResponse {
   // Canonical durable AdministrationRecord, never an authentication input.
   bytes record = 1;
-  bytes credential_id = 2;
-  bytes secret = 3;
 }
 
 message RevokeCredentialRequest {

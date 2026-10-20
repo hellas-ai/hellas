@@ -473,7 +473,7 @@ async fn execution_credential(
     )
     .await
     .unwrap();
-    node.issue_credential(&caller, root, scope, holder)
+    hellas_work::test_support::credentials::issue_one(node, &caller, root, scope, holder)
         .await
         .unwrap()
         .1
@@ -523,10 +523,15 @@ async fn gateway_profile(root: &Path) -> (PathBuf, String) {
         Arc::new(|| UnixMillis::now().unwrap_or_default()),
     );
     let caller = hellas_work::test_support::session(&node, &admin).await;
-    let (_, credential) = node
-        .issue_credential(&caller, root_grant, scope, CredentialHolder::Bearer)
-        .await
-        .unwrap();
+    let (_, credential) = hellas_work::test_support::credentials::issue_one(
+        &node,
+        &caller,
+        root_grant,
+        scope,
+        CredentialHolder::Bearer,
+    )
+    .await
+    .unwrap();
     drop(node);
     let mut bytes = credential.id().0.to_vec();
     bytes.extend_from_slice(credential.expose_secret());

@@ -200,7 +200,13 @@ pub async fn connect_local(
     authority: AuthorityId,
     credential: &CredentialSecret,
     key: SessionKey<'_>,
-) -> Result<HostControlClientImpl<hellas_wire::mux::MuxTransport>, WireStatus> {
+) -> Result<
+    (
+        HostControlClientImpl<hellas_wire::mux::MuxTransport>,
+        SessionChallenge,
+    ),
+    WireStatus,
+> {
     tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
         let stream = hellas_wire::local::connect_stream(path)
             .await
@@ -220,11 +226,11 @@ pub async fn connect_iroh(
     authority: AuthorityId,
     credential: &CredentialSecret,
     key: SessionKey<'_>,
-) -> Result<HostControlClientImpl<IrohTransport>, WireStatus> {
+) -> Result<(HostControlClientImpl<IrohTransport>, SessionChallenge), WireStatus> {
     let mut close = CloseConnection(Some(connection.clone()));
     let transport = checked_transport(connection)?;
     let binding = binding(&transport)?;
-    tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
+    let (_, challenge) = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
         let (mut send, mut recv) = transport
             .connection()
             .open_bi()
@@ -244,7 +250,7 @@ pub async fn connect_iroh(
     .await
     .map_err(|_| denied())??;
     close.0 = None;
-    Ok(HostControlClientImpl::new(transport))
+    Ok((HostControlClientImpl::new(transport), challenge))
 }
 
 /// Connect local TLS before sending any application credential. The supplied trust
@@ -256,11 +262,17 @@ pub async fn connect_tls<S>(
     authority: AuthorityId,
     credential: &CredentialSecret,
     key: SessionKey<'_>,
-) -> Result<HostControlClientImpl<hellas_wire::mux::MuxTransport>, WireStatus>
+) -> Result<
+    (
+        HostControlClientImpl<hellas_wire::mux::MuxTransport>,
+        SessionChallenge,
+    ),
+    WireStatus,
+>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let (stream, context) = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
+    let (stream, context, challenge) = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
         let (stream, context) =
             hellas_wire::tls::connect(stream, config, server, HostControl::ALPN.as_bytes())
                 .await
@@ -268,7 +280,7 @@ where
         let binding =
             session_binding(&context, HostControl::ALPN.as_bytes()).map_err(|_| denied())?;
         let (mut recv, mut send) = tokio::io::split(stream);
-        handshake::connect(
+        let (_, challenge) = handshake::connect(
             authority,
             binding,
             credential,
@@ -278,13 +290,13 @@ where
             handshake::Framing::ByteStream,
         )
         .await?;
-        Ok::<_, WireStatus>((recv.unsplit(send), context))
+        Ok::<_, WireStatus>((recv.unsplit(send), context, challenge))
     })
     .await
     .map_err(|_| denied())??;
     let transport = hellas_wire::local::transport(stream, hellas_wire::mux::Role::Client, context)
         .map_err(|_| unavailable())?;
-    Ok(HostControlClientImpl::new(transport))
+    Ok((HostControlClientImpl::new(transport), challenge))
 }
 
 async fn serve<T>(
@@ -471,17 +483,15 @@ impl HostControlHandler for ControlSession {
         request: IssueCredentialRequest,
     ) -> Result<IssueCredentialResponse, WireStatus> {
         let caller = self.caller().await?;
-        let scope = decode_bounded(&request.scope, MAX_COMMAND_BYTES).map_err(|_| invalid())?;
-        let holder = decode_bounded(&request.holder, MAX_COMMAND_BYTES).map_err(|_| invalid())?;
-        let (record, secret) = self
+        let credential =
+            decode_bounded(&request.credential, MAX_COMMAND_BYTES).map_err(|_| invalid())?;
+        let record = self
             .node
-            .issue_credential(caller, grant_id(&request.authorization)?, scope, holder)
+            .issue_credential(caller, grant_id(&request.authorization)?, credential)
             .await
             .map_err(node_error)?;
         Ok(IssueCredentialResponse {
             record: canonical_dag_cbor(&record).map_err(|_| unavailable())?,
-            credential_id: secret.id().0.to_vec(),
-            secret: secret.expose_secret().to_vec(),
         })
     }
 

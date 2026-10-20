@@ -68,7 +68,7 @@ async fn local_control_matches_remote_authority_decisions() {
     let (server_config, client_config) = tls_configs();
     let socket = f.directory.path().join("control.sock");
     let listener = f.service.bind_local(&socket, server_config).unwrap();
-    let local = connect_local(
+    let (local, _) = connect_local(
         &socket,
         client_config,
         "localhost".try_into().unwrap(),
@@ -81,7 +81,7 @@ async fn local_control_matches_remote_authority_decisions() {
     let (_ce, _se, cc, sc) = pair().await;
     let closer = cc.clone();
     let remote_task = serve(&f.service, sc);
-    let remote = connect_iroh(
+    let (remote, _) = connect_iroh(
         cc,
         authority(),
         &f.secret,
@@ -139,15 +139,14 @@ async fn local_control_matches_remote_authority_decisions() {
         })
         .await
         .unwrap();
-    let response = local
+    let (prepared, secret) = Credential::prepare(spec, OPERATOR.holder(), 1).unwrap();
+    local
         .issue_credential(IssueCredentialRequest {
             authorization: ROOT_GRANT.0.to_vec(),
-            scope: canonical_dag_cbor(&spec).unwrap(),
-            holder: canonical_dag_cbor(&OPERATOR.holder()).unwrap(),
+            credential: canonical_dag_cbor(&prepared).unwrap(),
         })
         .await
         .unwrap();
-    let secret = response.credential().unwrap();
     f.node
         .status(
             &f.node
@@ -254,7 +253,7 @@ async fn local_listener_bounds_authentication_and_joins_connections_without_remo
     let (_ce, _se, cc, sc) = pair().await;
     let remote_task = serve(&f.service, sc);
     let closer = cc.clone();
-    let remote = connect_iroh(
+    let (remote, _) = connect_iroh(
         cc,
         authority(),
         &f.secret,
@@ -274,7 +273,7 @@ async fn local_listener_bounds_authentication_and_joins_connections_without_remo
         .unwrap();
     drop(pending.pop());
     wait_slots(1).await;
-    let local = connect_local(
+    let (local, _) = connect_local(
         &socket,
         client_config,
         "localhost".try_into().unwrap(),

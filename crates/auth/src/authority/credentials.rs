@@ -1,5 +1,5 @@
 //! Application credentials share the authority snapshot and revision. Only
-//! verifiers are persisted; hosts release a prepared secret after durable commit.
+//! verifiers are persisted; issuing clients retain the prepared secrets.
 use super::*;
 use crate::{Digest, hash_tuple};
 use serde::{Deserialize, Serialize};
@@ -100,9 +100,9 @@ pub struct Credential {
 }
 
 impl Credential {
-    /// Prepare new material without granting access. The host must include this
-    /// record in an authorized command or offline ownership transition, persist
-    /// it, and only then release the secret. A failed commit never releases it.
+    /// Prepare client-owned material without granting access. Retain the secret
+    /// before submitting this verifier in an authorized command or ownership
+    /// transition; only a durable commit makes the credential usable.
     pub fn prepare(
         scope: GrantSpec,
         holder: CredentialHolder,
@@ -227,6 +227,9 @@ impl AuthenticatedCaller {
     /// The device the credential is bound to; its node key signs per-job work.
     pub const fn holder(&self) -> CredentialHolder {
         self.holder
+    }
+    pub const fn generation(&self) -> u64 {
+        self.generation
     }
     pub const fn session(&self) -> SessionKind {
         self.session

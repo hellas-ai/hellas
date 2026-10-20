@@ -116,7 +116,8 @@ impl Harness {
                 hellas_work::node::SessionKey::Passkey(&ROOT.passkey()),
             )
             .await
-            .unwrap(),
+            .unwrap()
+            .0,
         )
     }
     async fn owner(&self) -> Client {
@@ -131,17 +132,16 @@ impl Harness {
             .retain(|p| p.operation.as_str() == operation);
         scope.issuance = None;
         scope.delegation_depth = 0;
-        self.fixture
-            .node
-            .issue_credential(
-                &admin,
-                ROOT_GRANT,
-                scope.clone(),
-                hellas_work::test_support::holder(scope.subject),
-            )
-            .await
-            .unwrap()
-            .1
+        hellas_work::test_support::credentials::issue_one(
+            &self.fixture.node,
+            &admin,
+            ROOT_GRANT,
+            scope.clone(),
+            hellas_work::test_support::holder(scope.subject),
+        )
+        .await
+        .unwrap()
+        .1
     }
     async fn status(&self) -> HostStatus {
         self.owner()
@@ -333,7 +333,7 @@ async fn standalone_node_control_reports_unmounted_lifecycle() {
     let (tls, client_tls) = tls_configs();
     let socket = f.directory.path().join("standalone.sock");
     let listener = f.service.bind_local(&socket, tls).unwrap();
-    let client = connect_local(
+    let (client, _) = connect_local(
         &socket,
         client_tls,
         "localhost".try_into().unwrap(),
@@ -560,7 +560,8 @@ async fn controlled_host(
             hellas_work::node::SessionKey::Passkey(&ROOT.passkey()),
         )
         .await
-        .unwrap(),
+        .unwrap()
+        .0,
     );
     let client = Arc::new(
         connect_local(
@@ -572,7 +573,8 @@ async fn controlled_host(
             hellas_work::node::SessionKey::Passkey(&ROOT.passkey()),
         )
         .await
-        .unwrap(),
+        .unwrap()
+        .0,
     );
     (host, client, observer)
 }

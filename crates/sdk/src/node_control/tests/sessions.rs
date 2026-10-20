@@ -42,7 +42,7 @@ impl Reader {
         let (ce, se, outgoing, incoming) = pair().await;
         let closer = outgoing.clone();
         let task = serve(&fixture.service, incoming);
-        let client = connect_iroh(
+        let (client, _) = connect_iroh(
             outgoing,
             authority(),
             &credential,
@@ -112,7 +112,7 @@ async fn a_live_connection_rechecks_its_credential_before_decoding_rpc() {
     let (_ce, _se, outgoing, incoming) = pair().await;
     let admin_task = serve(&reader.fixture.service, incoming);
     let closer = outgoing.clone();
-    let admin = connect_iroh(
+    let (admin, _) = connect_iroh(
         outgoing,
         authority(),
         &reader.fixture.secret,

@@ -657,8 +657,34 @@ async fn offline_inspection_holds_identity_lock_and_preserves_journal_bytes() {
     );
     let expected_revision = store.state().authority().revision();
     drop(store);
-    let path = directory.path().join("journals/grants.sqlite");
-    let before = std::fs::read(&path).unwrap();
+    // Inspect the actual copy helper while its private files still exist.
+    {
+        let (_lock, _) = read_marker(directory.path(), network()).unwrap();
+        let snapshot = inspection_snapshot(directory.path()).unwrap();
+        for path in crate::test_support::all_files(snapshot.path()) {
+            assert!(hellas_private::is_private(&std::fs::File::open(path).unwrap()).unwrap());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for path in [
+                snapshot.path().to_path_buf(),
+                snapshot.path().join("journals"),
+            ] {
+                assert_eq!(
+                    std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                    0o700
+                );
+            }
+            for path in crate::test_support::all_files(snapshot.path()) {
+                assert_eq!(
+                    std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+            }
+        }
+    }
+    let before = inspection_files(directory.path());
     let view = NodeStore::inspect_offline(directory.path(), network(), &query)
         .await
         .unwrap();
@@ -667,7 +693,7 @@ async fn offline_inspection_holds_identity_lock_and_preserves_journal_bytes() {
         panic!("credentials")
     };
     assert!(records.iter().any(|c| c.id == secret.id()));
-    assert_eq!(std::fs::read(path).unwrap(), before);
+    assert_eq!(inspection_files(directory.path()), before);
     // Opening the live store after inspection still sees the exact same revision.
     let store = NodeStore::open_initialized(directory.path(), network())
         .await
@@ -707,4 +733,91 @@ async fn offline_inspection_recovers_the_revision_after_a_lost_recovery_receipt(
         assert_eq!(after.generation, generation);
         assert!(after.revision > expected);
     }
+}
+
+fn inspection_files(directory: &Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    crate::test_support::all_files(directory)
+        .into_iter()
+        .map(|path| {
+            (
+                path.strip_prefix(directory).unwrap().to_path_buf(),
+                std::fs::read(path).unwrap(),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn offline_inspection_reads_a_crash_left_wal_without_creating_source_sidecars() {
+    let live = tempfile::tempdir().unwrap();
+    let (mut store, secret) = bootstrap(live.path()).await;
+    let database = live.path().join("journals/grants.sqlite");
+    let before_commit = std::fs::read(&database).unwrap();
+    let caller =
+        crate::test_support::passkey_caller(store.state().authority(), &secret, UnixMillis(2));
+    let mut intended = admin();
+    intended.subject = FRIEND.principal();
+    store
+        .administer_authority(
+            &caller,
+            auth::AdministrationCommand::Grant(auth::GrantCommand::Issue {
+                authorization: ids::ROOT_GRANT,
+                id: ids::FRIEND_GRANT,
+                spec: intended.clone(),
+            }),
+            UnixMillis(2),
+        )
+        .await
+        .unwrap();
+    // The newly committed grant is in WAL, not checkpointed into the database.
+    assert_eq!(std::fs::read(database).unwrap(), before_commit);
+    let crashed = tempfile::tempdir().unwrap();
+    // Snapshot an idle writer before SQLite can checkpoint on clean shutdown.
+    // This is the on-disk image of a process exiting without closing SQLite.
+    for relative in inspection_files(live.path()).keys() {
+        let target = crashed.path().join(relative);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::copy(live.path().join(relative), target).unwrap();
+    }
+    hellas_private::restrict_directory(crashed.path()).unwrap();
+    let wal = crashed.path().join("journals/grants.sqlite-wal");
+    assert!(std::fs::metadata(&wal).unwrap().len() > 32);
+    let shm = crashed.path().join("journals/grants.sqlite-shm");
+    if shm.exists() {
+        std::fs::remove_file(&shm).unwrap();
+    }
+    let before = inspection_files(crashed.path());
+    {
+        let (_lock, _) = read_marker(crashed.path(), network()).unwrap();
+        let snapshot = inspection_snapshot(crashed.path()).unwrap();
+        let copied_wal = snapshot.path().join("journals/grants.sqlite-wal");
+        let file = std::fs::File::open(&copied_wal).unwrap();
+        assert!(hellas_private::is_private(&file).unwrap());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        assert_eq!(
+            std::fs::read(copied_wal).unwrap(),
+            std::fs::read(&wal).unwrap()
+        );
+    }
+    let view = NodeStore::inspect_offline(
+        crashed.path(),
+        network(),
+        &auth::InspectionQuery::Grant {
+            id: ids::FRIEND_GRANT,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(view.revision, store.state().authority().revision());
+    let auth::InspectionRecords::Grants { records, .. } = view.records else {
+        panic!("grants")
+    };
+    assert_eq!(records[0].id(), ids::FRIEND_GRANT);
+    assert_eq!(records[0].spec(), &intended);
+    assert_eq!(inspection_files(crashed.path()), before);
+    assert!(!shm.exists());
 }

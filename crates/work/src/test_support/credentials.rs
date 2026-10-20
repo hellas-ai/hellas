@@ -62,7 +62,8 @@ pub async fn issue<const N: usize>(
                 secret
             }
             Issuer::Node(node) => {
-                node.issue_credential(
+                issue_one(
+                    node,
                     administrator,
                     root,
                     scope.clone(),
@@ -76,4 +77,19 @@ pub async fn issue<const N: usize>(
         credentials.push(secret);
     }
     credentials.try_into().unwrap()
+}
+
+/// Prepare on the issuing side, then submit only the verifier through the node API.
+pub async fn issue_one(
+    node: &NodeCoordinator,
+    caller: &AuthenticatedCaller,
+    authorization: GrantId,
+    scope: GrantSpec,
+    holder: CredentialHolder,
+) -> Result<(AdministrationRecord, CredentialSecret), crate::work_store::grant::NodeStoreError> {
+    let (credential, secret) = Credential::prepare(scope, holder, caller.generation())?;
+    let record = node
+        .issue_credential(caller, authorization, credential)
+        .await?;
+    Ok((record, secret))
 }

@@ -1,8 +1,9 @@
 use super::*;
-use hellas_work::test_support::{assert_err, within};
+use hellas_work::test_support::within;
 
 struct Remote {
     fixture: Fixture,
+    generation: u64,
     client: HostControlClientImpl<IrohTransport>,
     closer: Connection,
     task: tokio::task::JoinHandle<Result<(), WireStatus>>,
@@ -14,7 +15,7 @@ impl Remote {
         let (client_endpoint, server_endpoint, outgoing, incoming) = pair().await;
         let closer = outgoing.clone();
         let task = serve(&fixture.service, incoming);
-        let client = connect_iroh(
+        let (client, challenge) = connect_iroh(
             outgoing,
             authority(),
             &fixture.secret,
@@ -24,6 +25,7 @@ impl Remote {
         .unwrap();
         Self {
             fixture,
+            generation: challenge.generation,
             client,
             closer,
             task,
@@ -100,16 +102,15 @@ async fn omitted_capacity_limits_are_invalid_rpc_input() {
 }
 
 #[tokio::test]
-async fn credential_scope_frames_are_bounded_before_decoding() {
+async fn credential_frames_are_bounded_before_decoding() {
     let remote = Remote::new().await;
-    for scope in [vec![], vec![0; MAX_COMMAND_BYTES + 1]] {
+    for credential in [vec![], vec![0; MAX_COMMAND_BYTES + 1]] {
         assert_eq!(
             remote
                 .client
                 .issue_credential(IssueCredentialRequest {
                     authorization: ROOT_GRANT.0.to_vec(),
-                    scope,
-                    holder: canonical_dag_cbor(&OPERATOR.holder()).unwrap(),
+                    credential,
                 })
                 .await
                 .unwrap_err()
@@ -121,24 +122,33 @@ async fn credential_scope_frames_are_bounded_before_decoding() {
 }
 
 #[tokio::test]
-async fn issued_credentials_round_trip_with_a_redacted_reply() {
+async fn client_prepared_credentials_round_trip_without_transmitting_the_secret() {
+    use prost::Message;
     let remote = Remote::new().await;
-    let scope = reader_scope();
-    let mut reply = remote
-        .client
-        .issue_credential(IssueCredentialRequest {
-            authorization: ROOT_GRANT.0.to_vec(),
-            scope: canonical_dag_cbor(&scope).unwrap(),
-            holder: canonical_dag_cbor(&OPERATOR.holder()).unwrap(),
-        })
-        .await
-        .unwrap();
-    let credential = reply.credential().unwrap();
+    let (prepared, secret) =
+        Credential::prepare(reader_scope(), OPERATOR.holder(), remote.generation).unwrap();
+    let request = IssueCredentialRequest {
+        authorization: ROOT_GRANT.0.to_vec(),
+        credential: canonical_dag_cbor(&prepared).unwrap(),
+    };
+    let request_bytes = request.encode_to_vec();
+    assert!(
+        !request_bytes
+            .windows(32)
+            .any(|bytes| bytes == secret.expose_secret())
+    );
+    let reply = remote.client.issue_credential(request).await.unwrap();
+    assert!(
+        !reply
+            .encode_to_vec()
+            .windows(32)
+            .any(|bytes| bytes == secret.expose_secret())
+    );
     let caller = remote
         .fixture
         .node
         .authenticate_session(
-            &credential,
+            &secret,
             hellas_work::node::SessionKey::Node(&OPERATOR.node_key()),
         )
         .await
@@ -148,16 +158,9 @@ async fn issued_credentials_round_trip_with_a_redacted_reply() {
     assert_eq!(record.caller().actor(), ROOT.principal());
     assert_eq!(record.caller().credential(), remote.fixture.secret.id());
     assert!(
-        matches!(record.command(), AdministrationCommand::Credential(CredentialCommand::Issue { credential: installed, .. }) if installed.id() == credential.id() && installed.scope() == &scope)
-    );
-    let debug = format!("{reply:?}");
-    assert!(debug.contains("credential_id"));
-    assert!(!debug.contains("secret"));
-    assert!(!debug.contains(&format!("{:?}", reply.secret)));
-    reply.secret.push(0);
-    assert_err!(
-        reply.credential(),
-        hellas_rpc::authentication::AuthenticationWireError::Encoding
+        matches!(record.command(), AdministrationCommand::Credential(CredentialCommand::Issue {
+        authorization, credential,
+    }) if *authorization == ROOT_GRANT && credential.as_ref() == &prepared)
     );
     remote.shutdown().await;
 }
@@ -165,50 +168,65 @@ async fn issued_credentials_round_trip_with_a_redacted_reply() {
 #[tokio::test]
 async fn lost_credential_reply_is_reconciled_over_host_control() {
     let remote = Remote::new().await;
-    // Discard the issuance response exactly as an application losing it would.
-    drop(
-        remote
-            .client
-            .issue_credential(IssueCredentialRequest {
-                authorization: ROOT_GRANT.0.to_vec(),
-                scope: canonical_dag_cbor(&reader_scope()).unwrap(),
-                holder: canonical_dag_cbor(&OPERATOR.holder()).unwrap(),
-            })
-            .await
-            .unwrap(),
-    );
-    let mut after = None;
-    let metadata = loop {
-        let response = remote
-            .client
-            .inspect_authority(InspectAuthorityRequest {
-                authorization: ROOT_GRANT.0.to_vec(),
-                query: canonical_dag_cbor(&InspectionQuery::Credentials { after }).unwrap(),
-            })
-            .await
-            .unwrap();
-        let inspection: AuthorityInspection = decode_dag_cbor(&response.reply).unwrap();
-        let InspectionRecords::Credentials { records, next } = inspection.records else {
-            panic!("credentials")
-        };
-        for metadata in &records {
-            let json = serde_json::to_value(metadata).unwrap();
-            let keys: std::collections::BTreeSet<_> = json
-                .as_object()
-                .unwrap()
-                .keys()
-                .map(String::as_str)
-                .collect();
-            assert_eq!(
-                keys,
-                ["id", "scope", "holder", "generation", "revision", "revoked"].into()
-            );
-        }
-        if let Some(metadata) = records.into_iter().find(|c| c.scope == reader_scope()) {
-            break metadata;
-        }
-        after = Some(next.expect("issued credential must be discoverable"));
+    let (prepared, retained) =
+        Credential::prepare(reader_scope(), OPERATOR.holder(), remote.generation).unwrap();
+    // A concurrent issuance has the identical scope and holder: scope matching
+    // cannot identify which secret this client retained before submitting.
+    let (other, _) =
+        Credential::prepare(reader_scope(), OPERATOR.holder(), remote.generation).unwrap();
+    for credential in [&prepared, &other] {
+        drop(
+            remote
+                .client
+                .issue_credential(IssueCredentialRequest {
+                    authorization: ROOT_GRANT.0.to_vec(),
+                    credential: canonical_dag_cbor(credential).unwrap(),
+                })
+                .await
+                .unwrap(),
+        );
+    }
+    let response = remote
+        .client
+        .inspect_authority(InspectAuthorityRequest {
+            authorization: ROOT_GRANT.0.to_vec(),
+            query: canonical_dag_cbor(&InspectionQuery::Credential { id: retained.id() }).unwrap(),
+        })
+        .await
+        .unwrap();
+    let inspection: AuthorityInspection = decode_dag_cbor(&response.reply).unwrap();
+    let InspectionRecords::Credentials { records, next } = inspection.records else {
+        panic!("credentials")
     };
+    assert!(next.is_none());
+    let [metadata]: [_; 1] = records.try_into().unwrap();
+    assert_eq!(metadata.id, retained.id());
+    assert_ne!(metadata.id, other.id());
+    assert_eq!(&metadata.scope, prepared.scope());
+    assert_eq!(metadata.holder, prepared.holder());
+    assert_eq!(metadata.generation, remote.generation);
+    assert_eq!(metadata.revision, Revision(1));
+    assert!(!metadata.revoked);
+    let json = serde_json::to_value(&metadata).unwrap();
+    let keys: std::collections::BTreeSet<_> = json
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        keys,
+        ["id", "scope", "holder", "generation", "revision", "revoked"].into()
+    );
+    remote
+        .fixture
+        .node
+        .authenticate_session(
+            &retained,
+            hellas_work::node::SessionKey::Node(&OPERATOR.node_key()),
+        )
+        .await
+        .unwrap();
     // A stale revision is actionable only after authorization has succeeded.
     let request = |revision| RevokeCredentialRequest {
         authorization: ROOT_GRANT.0.to_vec(),
@@ -245,8 +263,7 @@ async fn lost_credential_reply_is_reconciled_over_host_control() {
     remote.shutdown().await;
 }
 
-#[test]
-fn maximal_credential_metadata_page_fits_the_bounded_wire_reply() {
+fn maximal_scope() -> GrantSpec {
     let mut scope = reader_scope();
     let operations: std::collections::BTreeSet<_> = (0..hellas_auth::authority::MAX_PERMISSIONS)
         .map(|i| OperationId::new(format!("x{i:095}")).unwrap())
@@ -269,7 +286,17 @@ fn maximal_credential_metadata_page_fits_the_bounded_wire_reply() {
         max_validity_ms: 1_000_000,
         max_delegation_depth: MAX_DELEGATION_DEPTH,
     });
+    scope.not_before = UnixMillis(u64::MAX - 1);
+    scope.expires = UnixMillis(u64::MAX);
+    scope.delegation_depth = MAX_DELEGATION_DEPTH;
+    scope.issuance.as_mut().unwrap().max_validity_ms = u64::MAX;
     Credential::prepare(scope.clone(), OPERATOR.holder(), 1).unwrap();
+    scope
+}
+
+#[test]
+fn maximal_credential_metadata_page_fits_the_bounded_wire_reply() {
+    let scope = maximal_scope();
     let metadata = CredentialMetadata {
         id: CredentialId([255; 16]),
         scope,
@@ -289,4 +316,33 @@ fn maximal_credential_metadata_page_fits_the_bounded_wire_reply() {
         },
     };
     encode_bounded(&view, hellas_work::model::grant::admin::MAX_ADMIN_BYTES).unwrap();
+}
+
+#[test]
+fn maximal_grant_pages_fit_the_bounded_wire_reply() {
+    for origin in [
+        GrantOrigin::Node {
+            issuer: OPERATOR.principal(),
+        },
+        GrantOrigin::Delegated {
+            parent: GrantId([255; 16]),
+        },
+    ] {
+        let grant: Grant = serde_json::from_value(serde_json::json!({
+            "id": GrantId([255; 16]), "revision": Revision(u64::MAX),
+            "spec": maximal_scope(), "origin": origin, "revoked": false,
+        }))
+        .unwrap();
+        let view = AuthorityInspection {
+            authority: authority(),
+            revision: Revision(u64::MAX),
+            generation: u64::MAX,
+            root_grant: ROOT_GRANT,
+            records: InspectionRecords::Grants {
+                records: vec![grant; INSPECTION_PAGE_SIZE],
+                next: Some(GrantId([255; 16])),
+            },
+        };
+        encode_bounded(&view, hellas_work::model::grant::admin::MAX_ADMIN_BYTES).unwrap();
+    }
 }

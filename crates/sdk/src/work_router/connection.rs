@@ -245,7 +245,7 @@ pub(crate) async fn connect_work(
                 handshake::Framing::Substream,
             )
             .await
-            .map(Some)
+            .map(|(deadline, _)| Some(deadline))
         } else {
             send.write_all(&[PAYMENT]).await.map_err(|_| denied())?;
             send.shutdown().await.map_err(|_| denied())?;
