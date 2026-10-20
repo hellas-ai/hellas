@@ -22,6 +22,7 @@ hellas-executor = { workspace = true, default-features = false }
 hellas-gateway = { workspace = true }
 hellas-kernel = { workspace = true, default-features = false, features = [
     "secp256k1",
+    "webauthn",
 ] }
 hellas-private = { workspace = true }
 hellas-providers = { workspace = true }

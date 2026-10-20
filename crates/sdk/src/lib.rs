@@ -15,6 +15,7 @@ use hellas_work::test_support::common_node as test_node;
 
 mod counter_store;
 pub use counter_store::FilesystemAssertionCounterStore;
+pub mod coin_owner;
 pub mod trust_policy;
 
 pub use hellas_client as client;
