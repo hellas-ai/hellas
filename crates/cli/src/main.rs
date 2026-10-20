@@ -1131,11 +1131,7 @@ async fn async_main() {
                         None => result,
                     };
                 }
-                let hellas_sdk::node_control::profile::GatewayHost { access: gateway_access, control, node: authority } = hellas_sdk::node_control::profile::GatewayProfile::load(
-                    gateway_profile.as_deref().ok_or_else(|| anyhow::anyhow!("--gateway-profile is required to serve HTTP"))?
-                ).await?;
-                let mut chain_shutdown = None;
-                let paid_work = if let Some(path) = paid_work_config.as_ref()
+                let paid_options = if let Some(path) = paid_work_config.as_ref()
                     && output_cache != hellas_rpc::cache::CachePolicy::ReplayOnly
                 {
                     anyhow::ensure!(
@@ -1145,7 +1141,13 @@ async fn async_main() {
                     );
                     anyhow::ensure!(http_fetch_config.is_some() || assurance == hellas_rpc::Assurance::ProducerSigned,
                         "token-native paid work uses producer-signed assurance");
-                    let options = hellas_sdk::paid_gateway::load_pool_options(path, assurance)?;
+                    Some(hellas_sdk::paid_gateway::load_pool_options(path, assurance)?)
+                } else { None };
+                let hellas_sdk::node_control::profile::GatewayHost { access: gateway_access, control, node: authority } = hellas_sdk::node_control::profile::GatewayProfile::load(
+                    gateway_profile.as_deref().ok_or_else(|| anyhow::anyhow!("--gateway-profile is required to serve HTTP"))?
+                ).await?;
+                let mut chain_shutdown = None;
+                let paid_work = if let Some(options) = paid_options {
                     let node = chain_node.start(&options.providers.first().ok_or_else(|| anyhow::anyhow!("paid pool has no providers"))?.config).await?;
                     chain_shutdown = Some(node.clone());
                     Some(
