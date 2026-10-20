@@ -94,9 +94,12 @@ impl<R: RootProver + Send + Sync + 'static> OpenAiProviderOptions<R> {
     /// owns the shared writer, control listener and serialized service lifetime.
     pub fn into_factory(self) -> hellas_sdk::node_control::host::ProviderFactory {
         let options = Arc::new(self);
-        Arc::new(move |host| {
+        Arc::new(move |host, update| {
             let options = options.clone();
-            Box::pin(async move { Ok(start_openai_provider(&options, host).await?) })
+            Box::pin(async move {
+                if update.is_some() { return Err("provider configuration is not mounted".into()); }
+                Ok(start_openai_provider(&options, host).await?)
+            })
         })
     }
 }

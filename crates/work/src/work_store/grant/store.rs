@@ -24,7 +24,7 @@ use hellas_rpc::ProviderEnrollmentBundle;
 use hellas_rpc::protocol::value::{decode_canonical_bounded, encode_bounded};
 use std::path::Path;
 mod bootstrap;
-pub use bootstrap::OwnerApproval;
+pub use bootstrap::{OwnerApproval, PreparedBootstrap};
 #[cfg(test)]
 mod tests;
 

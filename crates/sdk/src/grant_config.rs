@@ -48,6 +48,8 @@ struct ConfigFile {
     control_private_key: Option<PathBuf>,
     #[serde(default)]
     remote_control_peers: Vec<iroh::EndpointId>,
+    #[serde(default)]
+    remote_control: bool,
     max_job_millis: NonZeroU64,
     resources: Vec<ResourceFile>,
 }
@@ -79,9 +81,12 @@ impl GrantConfig {
     pub fn load(path: &Path, default_root: Option<&Path>) -> Result<Self, GrantConfigError> {
         let bytes = hellas_private::read_bounded_regular_file(path, 1 << 20)?;
         let file: ConfigFile = serde_json::from_slice(&bytes)?;
-        let remote_control =
+        let remote_control = if file.remote_control && file.remote_control_peers.is_empty() {
+            crate::node_control::RemoteControlAdmission::credential_gated()
+        } else {
             crate::node_control::RemoteControlAdmission::new(file.remote_control_peers)
-                .map_err(|_| GrantError::Limits)?;
+                .map_err(|_| GrantError::Limits)?
+        };
         let journal_root = match (file.journal_root, default_root) {
             (Some(path), _) => path,
             (None, Some(root)) => root.join("provider"),

@@ -25,6 +25,8 @@ use tokio::{sync::Semaphore, time::Instant};
 use crate::application_handshake as handshake;
 mod admission;
 pub mod host;
+pub mod bootstrap;
+pub mod configuration;
 pub use admission::RemoteControlAdmission;
 pub mod profile;
 const MAX_CONNECTIONS: usize = 16;
@@ -54,6 +56,10 @@ impl NodeControl {
             remote_slots: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
             remote_admission: RemoteControlAdmission::default(),
         }
+    }
+
+    pub(crate) fn provider_ingress(&self) -> Result<Option<(iroh::Endpoint, tokio::sync::mpsc::Receiver<Connection>)>, WireStatus> {
+        self.host.as_ref().map(host::Runtime::provider_ingress).transpose().map(Option::flatten)
     }
 
     pub(crate) fn node(&self) -> NodeCoordinator {
@@ -102,6 +108,7 @@ impl NodeControl {
     pub async fn serve_iroh(&self, connection: Connection) -> Result<(), WireStatus> {
         let _close = CloseConnection(Some(connection.clone()));
         if !self.remote_admission.allows(connection.remote_id()) {
+            tracing::warn!("remote control transport admission refused");
             return Err(denied());
         }
         let _slot = self.remote_slots.try_acquire().map_err(|_| {
@@ -127,7 +134,9 @@ impl NodeControl {
             Ok::<_, WireStatus>(authenticated)
         })
         .await
-        .map_err(|_| denied())??;
+        .map_err(|_| { tracing::warn!("remote control authentication timed out"); denied() })?
+        .map_err(|error| { tracing::warn!("remote control authentication refused"); error })?;
+        tracing::info!("remote control application session admitted");
         serve(
             transport,
             self.node.clone(),
@@ -516,6 +525,18 @@ impl HostControlHandler for ControlSession {
         })
     }
 
+    async fn configure_provider(&self, request: ConfigureProviderRequest) -> Result<HostStatus, WireStatus> {
+        let authorization = grant_id(&request.authorization)?;
+        let update: configuration::ProviderUpdate = decode_bounded(&request.update, MAX_COMMAND_BYTES).map_err(|_| invalid())?;
+        let caller = self.caller().await?;
+        let receiver = self.node.host_action(caller, authorization, hellas_work::node::HOST_PROVIDER_CONFIGURE, |_| {
+            if update.requires_passkey() { caller.session().step_up().map_err(|_| denied())?; }
+            self.host.as_ref().ok_or_else(unsupported)?.configure(update)
+        }).await.map_err(node_error)??;
+        receiver.await.map_err(|_| unavailable())??;
+        self.node.host_action(self.caller().await?, authorization, hellas_work::node::HOST_PROVIDER_CONFIGURE,
+            |status| self.status_reply(status)).await.map_err(node_error)?
+    }
     async fn set_provider_state(
         &self,
         request: SetProviderStateRequest,

@@ -13,6 +13,7 @@ libc = "0.2"
 
 [features]
 default = []
+test-support = ["hellas-cloud/test-support"]
 
 # Local model execution additionally compiles Catena and the native evaluator.
 evaluate = [
@@ -93,6 +94,7 @@ opentelemetry_sdk = { workspace = true, optional = true }
 prometheus-client = { workspace = true }
 qrcode = { version = "0.14", default-features = false }
 rand.workspace = true
+rcgen = "0.14"
 reqwest.workspace = true
 serde.workspace = true
 serde_ipld_dagcbor.workspace = true
@@ -111,7 +113,6 @@ hellas-chain = { workspace = true, features = ["client"] }
 hellas-providers = { workspace = true, features = ["test-support"] }
 hellas-work = { workspace = true, features = ["test-support"] }
 p256.workspace = true
-rcgen = "0.14"
 reqwest = { workspace = true, features = ["json"] }
 rustls = { version = "0.23", default-features = false, features = [
     "ring",

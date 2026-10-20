@@ -12,7 +12,10 @@ use std::{collections::BTreeSet, sync::Arc};
 /// unauthenticated enrollment listener. Install this hook on the hosting endpoint
 /// and pass the same value to `NodeControl::with_remote_admission`.
 #[derive(Clone, Debug, Default)]
-pub struct RemoteControlAdmission(Arc<BTreeSet<EndpointId>>);
+pub struct RemoteControlAdmission {
+    peers: Arc<BTreeSet<EndpointId>>,
+    public: bool,
+}
 
 impl RemoteControlAdmission {
     pub fn new(peers: Vec<EndpointId>) -> Result<Self, WireStatus> {
@@ -24,15 +27,21 @@ impl RemoteControlAdmission {
                 "remote control requires at most 128 distinct endpoint keys",
             ));
         }
-        Ok(Self(Arc::new(peers)))
+        Ok(Self { peers: Arc::new(peers), public: false })
+    }
+
+    /// Explicitly enable public transport ingress. Every peer must still prove
+    /// its application credential and holder before any operation is dispatched.
+    pub fn credential_gated() -> Self {
+        Self { peers: Arc::default(), public: true }
     }
 
     pub fn enabled(&self) -> bool {
-        !self.0.is_empty()
+        self.public || !self.peers.is_empty()
     }
 
     pub(super) fn allows(&self, peer: EndpointId) -> bool {
-        self.0.contains(&peer)
+        self.public || self.peers.contains(&peer)
     }
 }
 

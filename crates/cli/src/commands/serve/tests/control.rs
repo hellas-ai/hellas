@@ -68,6 +68,7 @@ fn offline_args(command: AdminCommand, passkey: Option<&Path>) -> Invocation {
             profile: None,
             control_socket: None,
             node_enrollment: None,
+            node_id: None,
             addresses: vec![],
             command,
         },
@@ -176,7 +177,7 @@ impl Daemon {
         executor.queue_capacity = 4;
         executor.fetch_max_in_flight = 1;
         executor.fetch_queue_capacity = 1;
-        let daemon = hellas_sdk::node_control::host::HostHandle::serve(
+        let daemon = super::super::configuration::start_host(
             hellas_sdk::ProviderOptions {
                 executor,
                 grants: None,
@@ -189,6 +190,8 @@ impl Daemon {
                 open_identity: provider_identity.open_identity(),
             },
             Some(grant_config),
+            None,
+            None,
         )
         .await
         .unwrap();

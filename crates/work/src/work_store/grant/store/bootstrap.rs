@@ -40,6 +40,16 @@ pub struct OwnerApproval {
     pub assertion: PasskeyAssertion,
 }
 
+/// Client-prepared verifier and the owner's approval of its scope. The client
+/// retains the secret before submitting this request, including after a lost reply.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreparedBootstrap {
+    pub administrator: GrantSpec,
+    pub credential: Credential,
+    pub assertion: PasskeyAssertion,
+}
+
 impl NodeStore {
     /// Replace lost administration with the daemon stopped. Opening the private
     /// identity marker acquires the same exclusive lock held by the running host.
@@ -112,17 +122,43 @@ impl NodeStore {
         provider: Option<ProviderEnrollmentBundle>,
         now: UnixMillis,
     ) -> Result<(Self, CredentialSecret), NodeStoreError> {
-        let clock = super::super::clock::ClockBound::new();
-        clock.check(now)?;
         let (credential, secret) = Credential::prepare(
             approval.credential,
             CredentialHolder::Node(approval.holder),
             1,
         )?;
+        let store = Self::bootstrap_prepared(
+            directory,
+            network,
+            root_grant,
+            PreparedBootstrap {
+                administrator: approval.administrator,
+                credential,
+                assertion: approval.assertion,
+            },
+            provider,
+            now,
+        )
+        .await?;
+        Ok((store, secret))
+    }
+
+    /// Publish the marker and initial journal together. Until the directory
+    /// rename commits, opening the destination cannot observe partial authority.
+    pub async fn bootstrap_prepared(
+        directory: &Path,
+        network: NetworkId,
+        root_grant: GrantId,
+        approval: PreparedBootstrap,
+        provider: Option<ProviderEnrollmentBundle>,
+        now: UnixMillis,
+    ) -> Result<Self, NodeStoreError> {
+        let clock = super::super::clock::ClockBound::new();
+        clock.check(now)?;
         let authority = AuthorityState::bootstrap(
             root_grant,
             approval.administrator,
-            credential,
+            approval.credential,
             &approval.assertion,
             now,
         )?;
@@ -141,35 +177,73 @@ impl NodeStore {
             }],
         };
         let bytes = encode(&frame)?;
-        hellas_private::create_dir_all_durable(directory)?;
-        if std::fs::read_dir(directory)?.next().is_some() {
-            return Err(NodeStoreError::AlreadyInitialized);
+        match std::fs::symlink_metadata(directory) {
+            Ok(metadata) => {
+                if !metadata.is_dir() || std::fs::read_dir(directory)?.next().is_some() {
+                    return Err(NodeStoreError::AlreadyInitialized);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
-        hellas_private::restrict_directory(directory)?;
+        let parent = directory.parent().ok_or(NodeStoreError::Malformed)?;
+        hellas_private::create_dir_all_durable(parent)?;
+        remove_abandoned_bootstrap_stages(parent)?;
+        let staging = tempfile::Builder::new()
+            .prefix(".bootstrap-")
+            .tempdir_in(parent)?;
+        hellas_private::restrict_directory(staging.path())?;
+        let marker_path = staging.path().join(MARKER);
         let (file, temporary) =
-            hellas_private::private_tempfile(directory, ".authority-", ".initializing")?
+            hellas_private::private_tempfile(staging.path(), ".authority-", ".initializing")?
                 .into_parts();
-        let mut identity_lock = lock(file, &directory.join(MARKER))?;
+        let mut identity_lock = lock(file, &marker_path)?;
+        // Publish the locked marker before sensitive writes. A cleanup can
+        // distinguish abandoned stages without racing a live initialization.
+        temporary
+            .persist_noclobber(&marker_path)
+            .map_err(|error| NodeStoreError::Io(error.error))?;
         identity_lock.0.write_all(&encode(&marker)?)?;
         identity_lock.0.sync_all()?;
-        temporary
-            .persist_noclobber(directory.join(MARKER))
-            .map_err(|error| NodeStoreError::Io(error.error))?;
-        hellas_private::sync_directory(directory)?;
         let (mut journal, _) =
-            Journal::open_latest(directory, "grants", marker.journal_id()).await?;
+            Journal::open_latest(staging.path(), "grants", marker.journal_id()).await?;
         journal.append(&bytes).await?;
-        Ok((
-            Self {
-                clock,
-                _identity_lock: identity_lock,
-                journal,
-                state,
-                executions: Default::default(),
-                deliveries: Default::default(),
-            },
-            secret,
-        ))
+        // Close SQLite before moving its directory: subsequent connections and
+        // WAL recovery must use the published path, never the temporary name.
+        journal.close().await;
+        drop(journal);
+        hellas_private::sync_directory(staging.path())?;
+        #[cfg(test)]
+        bootstrap_crash_point("staged");
+        // Windows cannot rename over even an empty directory. Removing only an
+        // empty destination is safe: no authority exists there, and a concurrent
+        // committed initialization makes remove_dir fail rather than replacing it.
+        match std::fs::remove_dir(directory) {
+            Ok(()) => {},
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+            Err(_) => return Err(NodeStoreError::AlreadyInitialized),
+        }
+        // The marker's exclusive lock stays held across publication.
+        std::fs::rename(staging.path(), directory).map_err(|error| {
+            if directory.join(MARKER).exists() {
+                NodeStoreError::AlreadyInitialized
+            } else {
+                NodeStoreError::Io(error)
+            }
+        })?;
+        hellas_private::sync_directory(parent)?;
+        #[cfg(test)]
+        bootstrap_crash_point("published");
+        let (journal, _) =
+            Journal::open_existing(directory, "grants", marker.journal_id()).await?;
+        Ok(Self {
+            clock,
+            _identity_lock: identity_lock,
+            journal,
+            state,
+            executions: Default::default(),
+            deliveries: Default::default(),
+        })
     }
 
     /// Read metadata with the daemon stopped, without recovery, clock ticks,
@@ -207,6 +281,29 @@ impl NodeStore {
             deliveries: Default::default(),
         })
     }
+}
+
+/// Only a stage with an existing, exclusively lockable marker is abandoned.
+/// Missing-marker debris is inert and left alone: it could be a live creator
+/// between mkdir and marker publication, and contains no authority journal.
+fn remove_abandoned_bootstrap_stages(parent: &Path) -> Result<(), NodeStoreError> {
+    for entry in std::fs::read_dir(parent)? {
+        let entry = entry?;
+        if !entry.file_name().as_encoded_bytes().starts_with(b".bootstrap-")
+            || !entry.file_type()?.is_dir()
+        {
+            continue;
+        }
+        let Ok(file) = hellas_private::open_regular_file_nofollow(&entry.path().join(MARKER)) else {
+            continue;
+        };
+        if !hellas_private::is_private(&file)? { continue; }
+        if file.try_lock().is_ok() {
+            let _lock = IdentityLock(file);
+            std::fs::remove_dir_all(entry.path())?;
+        }
+    }
+    Ok(())
 }
 
 /// Called while the store's identity lock excludes every writer.
@@ -365,3 +462,10 @@ fn lock(file: File, path: &Path) -> Result<IdentityLock, NodeStoreError> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+fn bootstrap_crash_point(phase: &str) {
+    if std::env::var("HELLAS_TEST_BOOTSTRAP_CRASH").ok().as_deref() == Some(phase) {
+        std::process::exit(73);
+    }
+}

@@ -93,7 +93,6 @@ pub(crate) struct GatewayArgs {
         conflicts_with_all = ["node_id", "node_addrs", "offer", "paid_work_config"],
         requires_all = ["causal_lm_local_content", "environment", "local_grant"]
     )]
-    #[cfg_attr(unix, arg(conflicts_with = "machine"))]
     pub(crate) local: bool,
     /// Existing local allowance ID; startup never creates or revises permissions.
     #[arg(long = "local-grant", requires = "local")]

@@ -13,6 +13,7 @@ service HostControl {
   rpc WorkControl(WorkControlRequest) returns (WorkControlResponse);
   rpc GetHostStatus(GetHostStatusRequest) returns (HostStatus);
   rpc SetMachineCapacity(SetMachineCapacityRequest) returns (MachineCapacity);
+  rpc ConfigureProvider(ConfigureProviderRequest) returns (HostStatus);
   rpc SetProviderState(SetProviderStateRequest) returns (HostStatus);
   rpc SetGatewayState(SetGatewayStateRequest) returns (HostStatus);
   rpc GetGatewayAccess(GetGatewayAccessRequest) returns (GatewayAccess);
@@ -104,6 +105,8 @@ message HostStatus {
   uint64 generation = 8;
   bool provider_configured = 9;
   MachineCapacity machine = 10;
+  // Canonical metadata only: revision, endpoints, and key names.
+  bytes provider_configuration = 11;
 }
 
 message GatewayAccess {
@@ -146,4 +149,10 @@ message InspectAuthorityRequest {
 message InspectAuthorityResponse {
   // Canonical metadata-only AuthorityInspection. Never a credential verifier.
   bytes reply = 1;
+}
+
+message ConfigureProviderRequest {
+  bytes authorization = 1;
+  // Canonical typed ProviderUpdate. Secret inputs are never returned in status.
+  bytes update = 2;
 }

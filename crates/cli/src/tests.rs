@@ -1,7 +1,7 @@
 use super::*;
 
 #[cfg(unix)]
-mod cloud;
+mod machines;
 
 const TEST_ENVIRONMENT: &str = "/path/to/model.environment";
 const TEST_MANIFEST_ID: &str = "4444444444444444444444444444444444444444444444444444444444444444";

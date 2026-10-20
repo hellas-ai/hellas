@@ -625,6 +625,8 @@ async fn controlled_host(
     let socket = root.join("control/host.socket");
     let host = hellas_sdk::node_control::host::HostHandle::start(
         hellas_sdk::node_control::host::HostOptions {
+            transport: None,
+            start_provider: false,
             provider,
             gateway,
             control: Some((

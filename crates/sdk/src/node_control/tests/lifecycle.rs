@@ -34,7 +34,7 @@ impl Harness {
                 enrollment.clone(),
                 forbidden_journal.clone(),
             );
-            Arc::new(move |control: Option<NodeControl>| {
+            Arc::new(move |control: Option<NodeControl>, update| {
                 let (starting, release, starts, enrollment, forbidden_journal) = (
                     starting.clone(),
                     release.clone(),
@@ -43,6 +43,7 @@ impl Harness {
                     forbidden_journal.clone(),
                 );
                 Box::pin(async move {
+                    if update.is_some() { return Err("configuration is not mounted".into()); }
                     if starts.fetch_add(1, Ordering::SeqCst) == 0 {
                         starting.notify_one();
                         release.acquire().await.unwrap().forget();
@@ -81,12 +82,15 @@ impl Harness {
             })
         };
         let host = HostHandle::start(HostOptions {
+            transport: Some(host::bind_transport(SecretKey::from_bytes(&[5; 32]), Some(0),
+                RemoteControlAdmission::credential_gated()).await.unwrap()),
+            start_provider: false,
             control: Some((
                 f.node.clone(),
                 crate::ProviderControl {
                     socket: socket.clone(),
                     tls,
-                    remote: RemoteControlAdmission::default(),
+                    remote: RemoteControlAdmission::credential_gated(),
                 },
             )),
             provider: Some(factory),
@@ -537,6 +541,8 @@ async fn controlled_host(
     let (tls, client_tls) = tls_configs();
     let socket = directory.join("control.sock");
     let host = HostHandle::start(HostOptions {
+            transport: None,
+            start_provider: false,
         control: Some((
             node,
             crate::ProviderControl {
@@ -615,7 +621,7 @@ async fn set_gateway_state_starts_the_gateway_chosen_at_run_time() {
 #[tokio::test]
 async fn failed_provider_start_reports_its_error() {
     let f = fixture().await;
-    let factory: host::ProviderFactory = Arc::new(|_| {
+    let factory: host::ProviderFactory = Arc::new(|_, _| {
         Box::pin(async {
             let panicked = tokio::spawn(async { panic!("model weights are missing") })
                 .await
@@ -745,4 +751,28 @@ async fn stopping_gateway_drains_in_flight_work() {
     assert_eq!(world.backend.calls.load(Ordering::SeqCst), 1);
     host.shutdown().await.unwrap();
     remote.shutdown().await;
+}
+
+#[tokio::test]
+async fn normal_remote_control_survives_provider_restarts_and_accepts_another_device_transport() {
+    let h = Harness::new().await;
+    h.release.add_permits(1);
+    let address = h.host.endpoint().unwrap().addr();
+    for key in [[91; 32], [92; 32]] {
+        let endpoint = Endpoint::builder(presets::Minimal).secret_key(SecretKey::from_bytes(&key))
+            .bind().await.unwrap();
+        let connection = endpoint.connect(address.clone(), HostControl::ALPN.as_bytes()).await.unwrap();
+        let (client, _) = connect_iroh(connection, authority(), &h.fixture.secret,
+            hellas_work::node::SessionKey::Passkey(&ROOT.passkey())).await.unwrap();
+        for enabled in [true, false, true] {
+            let status = client.set_provider_state(SetProviderStateRequest {
+                enabled, authorization: ROOT_GRANT.0.to_vec(),
+            }).await.unwrap();
+            assert_eq!(status.authority, authority().0.as_bytes());
+            assert_eq!(status.provider.unwrap().state, if enabled { RuntimeState::Running } else { RuntimeState::Stopped } as i32);
+            assert_eq!(status.endpoint, address.id.to_string());
+        }
+        endpoint.close().await;
+    }
+    h.host.shutdown().await.unwrap();
 }

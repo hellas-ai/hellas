@@ -1,0 +1,147 @@
+//! In-process configuration on the normal host's serialized provider lifecycle.
+use super::*;
+use hellas_sdk::node_control::{configuration::*, host::*};
+use std::path::Path;
+
+pub(super) async fn start_host<R: hellas_attestation::RootProver + Send + Sync + 'static>(
+    mut provider: hellas_sdk::ProviderOptions<R>,
+    grants: Option<hellas_sdk::grant_config::GrantConfig>,
+    path: Option<PathBuf>,
+    transport: Option<iroh::Endpoint>,
+) -> CliResult<HostHandle> {
+    let control = prepare_provider(&mut provider, grants).await?;
+    let transport = match (transport, &control) {
+        (Some(endpoint), _) => Some(endpoint),
+        (None, Some((_, config))) => Some(bind_transport(provider.secret_key.clone(), provider.port, config.remote.clone()).await?),
+        (None, None) => None,
+    };
+    let factory: ProviderFactory = Arc::new(move |control, update| {
+        let mut provider = provider.clone();
+        let path = path.clone();
+        Box::pin(async move {
+            if let Some(path) = &path { clean_unused_keys(path)?; }
+            let rollback = match update {
+                Some(update) => Some(apply(path.as_deref().ok_or("provider configuration is not mounted")?, update)?),
+                None => None,
+            };
+            let result = async {
+                let metadata = match &path {
+                    Some(path) => {
+                        provider.executor.fetch_routes = load_fetch_config(path)?;
+                        Some(metadata(&read(path)?))
+                    }
+                    None => None,
+                };
+                if let Some(control) = control { provider = provider.on_host(control)?; }
+                let handle = hellas_sdk::start_fetch_provider(provider).await?;
+                Ok::<_, anyhow::Error>(match metadata { Some(metadata) => handle.with_configuration(metadata), None => handle })
+            }.await;
+            if result.is_err() && let (Some(path), Some(bytes)) = (&path, rollback) {
+                hellas_private::write_atomically(path, ".rollback", &bytes)?;
+            }
+            if let Some(path) = &path { clean_unused_keys(path)?; }
+            result.map_err(Into::into)
+        })
+    });
+    Ok(HostHandle::start(HostOptions { transport, start_provider: true, control,
+        provider: Some(factory), gateway: None }).await?)
+}
+fn read(path: &Path) -> CliResult<FetchConfigFile> {
+    Ok(serde_json::from_slice(&hellas_private::read_bounded_regular_file(path, 64 * 1024)?)?)
+}
+fn metadata(config: &FetchConfigFile) -> ProviderMetadata {
+    ProviderMetadata { revision: config.revision, endpoints: config.routes.iter().filter_map(|route| {
+        let FetchDestination::Http { config } = &route.destination else { return None };
+        Some(EndpointMetadata { service:route.service.clone(), method:route.method.clone(),
+            allowed_hosts:config.allowed_hosts.clone(), keys:config.credentials.keys().cloned().collect() })
+    }).collect() }
+}
+fn apply(path: &Path, update: ProviderUpdate) -> CliResult<Vec<u8>> {
+    let old = hellas_private::read_bounded_regular_file(path, 64 * 1024)?;
+    let mut file: FetchConfigFile = serde_json::from_slice(&old)?;
+    anyhow::ensure!(file.revision == update.expected_revision, "stale provider configuration revision");
+    match update.change {
+        UpstreamChange::SetEndpoint(endpoint) => {
+            anyhow::ensure!(!endpoint.service.is_empty() && !endpoint.method.is_empty() && !endpoint.allowed_hosts.is_empty(), "endpoint must name a route and hosts");
+            let replacement = hellas_providers::HttpProviderConfig { allowed_hosts:endpoint.allowed_hosts,
+                allow_private_addresses:endpoint.allow_private_addresses, credentials:Default::default() };
+            if let Some(route) = file.routes.iter_mut().find(|route| route.service == endpoint.service && route.method == endpoint.method) {
+                let FetchDestination::Http { config } = &mut route.destination else { anyhow::bail!("route is not HTTP") };
+                config.allowed_hosts = replacement.allowed_hosts;
+                config.allow_private_addresses = replacement.allow_private_addresses;
+            } else {
+                anyhow::ensure!(file.routes.len() < 16, "too many upstream routes");
+                file.routes.push(FetchConfigRoute { service:endpoint.service, method:endpoint.method,
+                    destination:FetchDestination::Http { config:replacement }, capabilities:Default::default() });
+            }
+        }
+        UpstreamChange::RemoveEndpoint { service, method } => {
+            let position = file.routes.iter().position(|r| r.service == service && r.method == method).context("unknown route")?;
+            file.routes.remove(position);
+        }
+        UpstreamChange::RemoveKey { service, method, key } => {
+            anyhow::ensure!(http(&mut file, &service, &method)?.credentials.remove(&key).is_some(), "unknown upstream key");
+        }
+        change @ (UpstreamChange::AddKey(_) | UpstreamChange::ReplaceKey(_)) => {
+            let replace = matches!(change, UpstreamChange::ReplaceKey(_));
+            let (UpstreamChange::AddKey(key) | UpstreamChange::ReplaceKey(key)) = change else { anyhow::bail!("invalid key update") };
+            anyhow::ensure!(!key.key.is_empty() && key.key.len() <= 128 && !key.secret.is_empty() && key.secret.len() <= 16 * 1024, "invalid upstream key");
+            let config = http(&mut file, &key.service, &key.method)?;
+            anyhow::ensure!(config.credentials.contains_key(&key.key) == replace, "add requires a new key ID; replace requires an existing ID");
+            anyhow::ensure!(config.credentials.len() < 64 || replace, "too many upstream keys");
+            for origin in &key.allowed_origins {
+                let url = reqwest::Url::parse(origin)?;
+                anyhow::ensure!(url.scheme() == "https" && url.host_str().is_some_and(|host| config.allowed_hosts.iter().any(|allowed| allowed == host)), "key must use an existing endpoint host");
+            }
+            let parent = path.parent().context("configuration needs a parent")?;
+            let temporary = hellas_private::private_tempfile(parent, ".upstream-key-", ".json")?;
+            let secret = serde_json::to_vec(&serde_json::json!({"secret":key.secret}))?;
+            use std::io::Write;
+            let mut temporary = temporary;
+            temporary.write_all(&secret)?;
+            temporary.as_file().sync_all()?;
+            let (_, secret_path) = temporary.keep()?;
+            hellas_private::sync_directory(parent)?;
+            config.credentials.insert(key.key, hellas_providers::HttpCredentialConfig {
+                allowed_origins:key.allowed_origins, allowed_paths:key.allowed_paths,
+                allowed_methods:key.allowed_methods, trust_roots:None, header_name:key.header_name,
+                source:hellas_providers::HttpSecretConfig { secret_env:None, secret_file:Some(secret_path),
+                    secret_field:Some("secret".into()), refresh:None, prefix:key.prefix },
+            });
+        }
+    }
+    // Compile every route through the same parser/provider validation as startup.
+    for route in &file.routes { route.destination.clone().into_entry(route.capabilities.clone().into_policy()?)?; }
+    file.revision = file.revision.checked_add(1).context("configuration revision exhausted")?;
+    let bytes = serde_json::to_vec(&file)?;
+    anyhow::ensure!(bytes.len() <= 64 * 1024, "provider configuration exceeds limit");
+    hellas_private::write_atomically(path, ".configure", &bytes)?;
+    Ok(old)
+}
+fn http<'a>(file: &'a mut FetchConfigFile, service: &str, method: &str) -> CliResult<&'a mut hellas_providers::HttpProviderConfig> {
+    let route = file.routes.iter_mut().find(|route| route.service == service && route.method == method).context("unknown endpoint")?;
+    match &mut route.destination { FetchDestination::Http { config } => Ok(config), _ => anyhow::bail!("route is not HTTP") }
+}
+
+// Only files created by this configuration writer are collected. User-supplied
+// file/environment/refresh sources are never deleted or copied into status.
+fn clean_unused_keys(path: &Path) -> CliResult<()> {
+    let file = read(path)?;
+    let used: std::collections::BTreeSet<_> = file.routes.iter().flat_map(|route| {
+        match &route.destination {
+            FetchDestination::Http { config } => config.credentials.values()
+                .filter_map(|key| key.source.secret_file.as_ref()).collect::<Vec<_>>(),
+            _ => vec![],
+        }
+    }).collect();
+    let parent = path.parent().context("configuration needs a parent")?;
+    for entry in std::fs::read_dir(parent)? {
+        let entry = entry?;
+        if entry.file_name().as_encoded_bytes().starts_with(b".upstream-key-")
+            && entry.file_type()?.is_file() && !used.contains(&entry.path()) {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    hellas_private::sync_directory(parent)?;
+    Ok(())
+}

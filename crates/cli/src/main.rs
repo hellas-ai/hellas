@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 mod evaluate;
 
 #[cfg(unix)]
-mod cloud;
+mod machines;
 mod commands;
 mod identity;
 mod metrics;
@@ -68,10 +68,6 @@ fn load_command_identity(
                 ..
             }
     );
-    #[cfg(unix)]
-    let owned_machine = command.owned_machine().is_some();
-    #[cfg(not(unix))]
-    let owned_machine = false;
     let grant_identity = matches!(
         command,
         Commands::Admin(_)
@@ -84,7 +80,6 @@ fn load_command_identity(
     let grant_identity = grant_identity
         || matches!(command, Commands::Gateway { evaluation, .. } if evaluation.local);
     let read_only = grant_identity
-        || owned_machine
         || settles_paid_work
         || matches!(
             command,
@@ -276,11 +271,8 @@ enum Commands {
     /// Approve and inspect caller-owned provider trust policies.
     Trust(commands::trust::TrustArgs),
     #[cfg(unix)]
-    /// Provision and inspect remote Hellas workers.
-    Cloud(hellas_cloud::cloud::CloudArgs),
-    #[cfg(unix)]
-    /// Discover and administer machines owned by the selected Hellas identity.
-    Machines(hellas_cloud::machines::MachinesArgs),
+    /// Create, list and destroy machines through a configured provider.
+    Machines(machines::MachinesArgs),
     /// Introduce the principal with a signed contact card, or save a friend's.
     Contact {
         #[command(subcommand)]
@@ -322,6 +314,9 @@ enum Commands {
         /// Resources and listeners for an explicitly initialized authority store.
         #[arg(long = "grant-config")]
         grant_config_file: Option<PathBuf>,
+        /// Wait for one owner pairing if uninitialized; use this directory for node state.
+        #[arg(long, num_args = 0..=1, default_missing_value = ".")]
+        await_owner: Option<PathBuf>,
         /// Prometheus metrics port (e.g. 9090)
         #[arg(long = "metrics-port")]
         metrics_port: Option<u16>,
@@ -365,10 +360,6 @@ enum Commands {
             .requires("tokenizer")),
         mut_arg("tokenizer", |arg| arg.required(false).requires("environment"))
     )]
-    #[cfg_attr(unix, command(group(
-        clap::ArgGroup::new("remote_target").args(["node_id", "machine"])
-    )))]
-    #[cfg_attr(unix, command(mut_arg("environment", |arg| arg.required_unless_present_any(["responses_backend", "http_fetch_config", "offer", "machine"]))))]
     Gateway {
         /// Inference reuse policy; record mode fails requests if cache writes fail.
         #[arg(long, default_value = "off")]
@@ -379,7 +370,6 @@ enum Commands {
         /// Use a private Offer previously verified by `offer import`.
         #[arg(long, value_name = "ALIAS", conflicts_with_all = ["node_id", "node_addrs", "responses_backend", "http_fetch_config"])]
         #[arg(conflicts_with = "paid_work_config")]
-        #[cfg_attr(unix, arg(conflicts_with = "machine"))]
         offer: Option<String>,
         /// Select one resource when the Offer includes several matching policies.
         #[arg(long)]
@@ -389,7 +379,6 @@ enum Commands {
         work_profile: Option<PathBuf>,
         /// Serve exact HTTP routes through paid HTTPS Fetch.
         #[arg(long, value_name = "FILE", conflicts_with_all = ["responses_backend", "environment"])]
-        #[cfg_attr(unix, arg(conflicts_with = "machine"))]
         #[arg(requires = "paid_work_config")]
         http_fetch_config: Option<PathBuf>,
         /// Request/response archive directory (default: ~/.hellas/gateway-archive).
@@ -412,11 +401,6 @@ enum Commands {
         /// Explicit local text-chat template.
         #[arg(long = "chat-template", value_name = "TEMPLATE")]
         chat_template: Option<hellas_presentation::ChatTemplate>,
-        /// Select an owned machine from this identity's inventory.
-        #[cfg(unix)]
-        #[arg(long, conflicts_with = "node_id")]
-        #[arg(conflicts_with = "paid_work_config")]
-        machine: Option<String>,
         #[command(flatten)]
         remote_trust: RemoteTrustArgs,
         #[command(flatten)]
@@ -432,8 +416,7 @@ enum Commands {
         node_id: Option<EndpointId>,
         /// Direct UDP address hint for the target node. Repeat or use commas.
         #[arg(long = "address", value_delimiter = ',')]
-        #[cfg_attr(unix, arg(requires = "remote_target"))]
-        #[cfg_attr(not(unix), arg(requires = "node_id"))]
+        #[arg(requires = "node_id")]
         node_addrs: Vec<SocketAddr>,
         #[cfg(feature = "evaluate")]
         #[command(flatten)]
@@ -579,16 +562,6 @@ enum Commands {
     },
 }
 
-#[cfg(unix)]
-impl Commands {
-    fn owned_machine(&self) -> Option<&str> {
-        match self {
-            Self::Gateway { machine, .. } => machine.as_deref(),
-            _ => None,
-        }
-    }
-}
-
 fn validate_identity_options(
     command: &Commands,
     identity: Option<&Path>,
@@ -600,6 +573,8 @@ fn validate_identity_options(
             ..
         }) => Some("admin inspect-offline"),
         Commands::Trust(_) => Some("trust"),
+        #[cfg(unix)]
+        Commands::Machines(_) => Some("machines"),
         Commands::Contact { .. } => Some("contact"),
         Commands::Offer {
             command: commands::contributions::OfferCommand::Import { .. },
@@ -628,10 +603,6 @@ fn validate_identity_options(
     }
 
     let reads_existing_identity = match command {
-        #[cfg(unix)]
-        command if command.owned_machine().is_some() => true,
-        #[cfg(unix)]
-        Commands::Cloud(_) | Commands::Machines(_) => true,
         Commands::Gateway { offer: Some(_), .. } => true,
         Commands::Offer {
             command: commands::contributions::OfferCommand::ImportBundle { .. },
@@ -790,21 +761,8 @@ async fn async_main() {
             return;
         }
         #[cfg(unix)]
-        command @ Commands::Admin(commands::admin::AdminArgs {
-            command: commands::admin::AdminCommand::Serve { .. },
-            ..
-        }) => {
-            let result = cloud::run(command, cli.identity.as_deref(), cli.passkey.as_deref()).await;
-            tracer_provider.shutdown();
-            if let Err(err) = result {
-                eprintln!("error: {err:#}");
-                std::process::exit(1);
-            }
-            return;
-        }
-        #[cfg(unix)]
-        command @ (Commands::Cloud(_) | Commands::Machines(_)) => {
-            let result = cloud::run(command, cli.identity.as_deref(), cli.passkey.as_deref()).await;
+        Commands::Machines(args) => {
+            let result = machines::run(args).await;
             tracer_provider.shutdown();
             if let Err(err) = result {
                 eprintln!("error: {err:#}");
@@ -924,6 +882,7 @@ async fn async_main() {
             work_config_file,
             chain_node,
             grant_config_file,
+            await_owner,
             metrics_port,
             graffiti,
             fetch_config_file,
@@ -958,7 +917,26 @@ async fn async_main() {
                             Some(config)
                         } else { None };
 
+                        let (grants, transport) = match await_owner.as_deref() {
+                            Some(root) => {
+                                let (grants, transport) = commands::serve::bootstrap::prepare(root, &local_identity, port, grants).await?;
+                                (Some(grants), transport)
+                            }
+                            None => (grants, None),
+                        };
+                        let fetch_config_file = match (fetch_config_file, await_owner.as_deref()) {
+                            (Some(path), _) => Some(path),
+                            (None, Some(root)) => {
+                                let path = std::path::absolute(root)?.join("fetch.json");
+                                if !path.try_exists()? {
+                                    hellas_private::write_atomically(&path, ".initializing", br#"{"revision":0,"routes":[]}"#)?;
+                                }
+                                Some(path)
+                            }
+                            (None, None) => None,
+                        };
                         commands::serve::run(commands::serve::ServeOptions {
+                            transport,
                             port,
                             discovery: !no_discovery,
                             queue_size,
@@ -1029,8 +1007,6 @@ async fn async_main() {
             gateway_profile,
             allow_remote,
             chat_template,
-            #[cfg(unix)]
-            machine,
             remote_trust,
             causal_lm,
             host,
@@ -1084,11 +1060,6 @@ async fn async_main() {
                 } else {
                     (None, String::new(), None, Vec::new())
                 };
-                #[cfg(unix)]
-                anyhow::ensure!(
-                    machine.is_none() || responses_backend != GatewayResponsesBackend::Proxy,
-                    "--machine cannot be used with the external proxy backend"
-                );
                 let assurance = remote_trust.assurance;
                 let application = work_profile.as_deref().map(hellas_sdk::node_control::profile::ClientProfile::load)
                     .transpose()?.map(std::sync::Arc::new);
@@ -1100,11 +1071,6 @@ async fn async_main() {
                         &offer.encode()?,  hellas_auth::authority::UnixMillis(0),
                     )?.pin(&remote_trust.load()?)?)
                 } else { None };
-                #[cfg(unix)]
-                let grant_target = if let Some(name) = machine.as_deref()
-                    && output_cache != hellas_rpc::cache::CachePolicy::ReplayOnly {
-                    Some(cloud::machine_target(name, &local_identity, passkey, node_addrs.clone(), &work_application()?, &remote_trust.load()?).await?)
-                } else { grant_target };
                 let grant_source = if let Some(target) = grant_target
                     && output_cache != hellas_rpc::cache::CachePolicy::ReplayOnly {
                     anyhow::ensure!(assurance == target.trust().required_assurance, "requested assurance differs from the pinned grant provider");
@@ -1282,7 +1248,7 @@ async fn async_main() {
         Commands::Chain { .. } => unreachable!("chain commands handled before identity load"),
         Commands::Store { .. } => unreachable!("store commands handled before identity load"),
         #[cfg(unix)]
-        Commands::Cloud(_) | Commands::Machines(_) => {
+        Commands::Machines(_) => {
             unreachable!("management commands handled before identity load")
         }
         Commands::Environment { .. } => {

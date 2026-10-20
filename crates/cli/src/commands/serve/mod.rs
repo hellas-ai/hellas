@@ -8,13 +8,15 @@ use hellas_executor::{
 use hellas_kernel::Secp256k1Signer;
 use hellas_rpc::Assurance;
 use iroh::SecretKey;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 mod codex_provider;
+pub mod bootstrap;
+mod configuration;
 pub mod provision;
 pub mod work_config;
 
@@ -22,6 +24,7 @@ pub use provision::{ProvisionOptions, run_provision};
 pub use work_config::{WorkConfig, load_work_config};
 
 pub struct ServeOptions {
+    pub transport: Option<iroh::Endpoint>,
     pub grants: Option<hellas_sdk::grant_config::GrantConfig>,
     pub port: Option<u16>,
     pub discovery: bool,
@@ -171,8 +174,7 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
     let shutdown = shutdown_signal().context("failed to listen for shutdown signal")?;
     let chain = work_runner.as_ref().map(|(_, chain)| chain.clone());
     let node_id = options.secret_key.public();
-    let node = hellas_sdk::node_control::host::HostHandle::serve(
-        hellas_sdk::ProviderOptions {
+    let provider = hellas_sdk::ProviderOptions {
             port: options.port,
             executor,
             build,
@@ -182,11 +184,9 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
             discovery: options.discovery,
             secret_key: options.secret_key,
             open_identity: options.open_identity,
-        },
-        options.grants,
-    )
-    .await
-    .context("failed to start node server")?;
+        };
+    let node = configuration::start_host(provider, options.grants, options.fetch_config_file, options.transport)
+        .await.context("failed to start node server")?;
 
     if let Some(metrics_port) = options.metrics_port {
         let mut registry = prometheus_client::registry::Registry::default();
@@ -262,14 +262,16 @@ fn load_fetch_config(path: &std::path::Path) -> CliResult<FetchRouteRegistry> {
     Ok(registry)
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct FetchConfigFile {
+    #[serde(default)]
+    revision: u64,
     #[serde(default)]
     routes: Vec<FetchConfigRoute>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct FetchConfigRoute {
     service: String,
@@ -282,7 +284,7 @@ struct FetchConfigRoute {
     capabilities: FetchPolicyLimits,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
 enum FetchDestination {
     /// Caller-signed HTTPS URL and TLS settings with operator-owned account aliases.
@@ -313,7 +315,7 @@ impl FetchDestination {
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct FetchPolicyLimits {
     #[serde(default)]

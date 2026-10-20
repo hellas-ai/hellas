@@ -309,17 +309,25 @@ const MAX_RPC_IN_FLIGHT_PER_CONNECTION: usize = 16;
 const RPC_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const RPC_CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 pub struct ProviderHandle {
+    configuration: Option<crate::node_control::configuration::ProviderMetadata>,
     administration: Option<hellas_work::grant_service::WorkAdministration>,
     router: Option<WorkRouter>,
     discovery: Option<discovery::DiscoveryAdvertiser>,
     stop: Option<oneshot::Sender<()>>,
     alpns: Vec<Vec<u8>>,
     endpoint: Endpoint,
+    owns_endpoint: bool,
     accept_task: tokio::task::JoinHandle<()>,
     work: Option<WorkWatcher>,
 }
 
 impl ProviderHandle {
+    pub fn with_configuration(mut self, metadata: crate::node_control::configuration::ProviderMetadata) -> Self {
+        self.configuration = Some(metadata);
+        self
+    }
+    pub(crate) fn configuration(&self) -> Option<&crate::node_control::configuration::ProviderMetadata> { self.configuration.as_ref() }
+
     pub fn node_id(&self) -> EndpointId {
         self.endpoint.id()
     }
@@ -364,7 +372,7 @@ impl ProviderHandle {
             let stopped = work.shutdown().await.map_err(ProviderError::from);
             result = result.and(stopped);
         }
-        self.endpoint.close().await;
+        if self.owns_endpoint { self.endpoint.close().await; }
         result
     }
 }
@@ -457,14 +465,26 @@ where
         None => None,
     };
     let alpns = advertised_alpns.clone();
-    let mut builder = Endpoint::builder(presets::N0)
-        .secret_key(config.secret_key)
-        .hooks(remote_control.clone())
-        .alpns(alpns.clone());
-    if let Some(port) = config.port {
-        builder = builder.bind_addr(std::net::SocketAddr::from(([0, 0, 0, 0], port)))?;
-    }
-    let endpoint = builder.bind().await?;
+    let ingress = match prepared_grants.as_ref().map(|(grants, _)| &grants.authority) {
+        Some(ProviderAuthority::Host(control)) => control.provider_ingress()?,
+        _ => None,
+    };
+    let (endpoint, mut ingress, owns_endpoint) = match ingress {
+        Some((endpoint, receiver)) => {
+            if endpoint.id() != config.secret_key.public() { return Err(ProviderError::Identity); }
+            (endpoint, Some(receiver), false)
+        }
+        None => {
+            let mut builder = Endpoint::builder(presets::N0)
+                .secret_key(config.secret_key)
+                .hooks(remote_control.clone())
+                .alpns(alpns.clone());
+            if let Some(port) = config.port {
+                builder = builder.bind_addr(std::net::SocketAddr::from(([0, 0, 0, 0], port)))?;
+            }
+            (builder.bind().await?, None, true)
+        }
+    };
     let discovery = config
         .discovery
         .then(|| discovery::start_server_advertising(&endpoint, &advertised_alpns))
@@ -527,31 +547,34 @@ where
     let accept_task = tokio::spawn(async move {
         let mut connections = JoinSet::new();
         loop {
-            let incoming = tokio::select! {
+            let at_capacity = connections.len() >= MAX_ACTIVE_RPC_CONNECTIONS;
+            let next = async {
+                if let Some(receiver) = &mut ingress {
+                    receiver.recv().await
+                } else {
+                    loop {
+                        let incoming = accept_endpoint.accept().await?;
+                        if at_capacity { incoming.refuse(); continue; }
+                        let Ok(accepting) = incoming.accept() else { continue };
+                        if let Ok(Ok(connection)) = tokio::time::timeout(RPC_HANDSHAKE_TIMEOUT, accepting).await {
+                            return Some(connection);
+                        }
+                    }
+                }
+            };
+            let connection = tokio::select! {
                 biased;
                 _ = &mut stopped => break,
                 completed = connections.join_next(), if !connections.is_empty() => {
-                    if let Some(Err(error)) = completed {
-                        warn!(%error, "node connection task failed");
-                    }
+                    if let Some(Err(error)) = completed { warn!(%error, "node connection task failed"); }
                     continue;
                 }
-                incoming = accept_endpoint.accept() => incoming,
-            };
-            let Some(incoming) = incoming else {
-                break;
+                connection = next => match connection { Some(connection) => connection, None => break },
             };
             if connections.len() >= MAX_ACTIVE_RPC_CONNECTIONS {
-                incoming.refuse();
+                connection.close(503u32.into(), b"provider at capacity");
                 continue;
             }
-            let accepting = match incoming.accept() {
-                Ok(a) => a,
-                Err(e) => {
-                    warn!("incoming accept failed: {e}");
-                    continue;
-                }
-            };
             let node_handler_for_conn = node_handler.clone();
             let manager_for_conn = directory.manager();
             let execution_for_conn = open_identity.clone();
@@ -559,17 +582,7 @@ where
             let setup_for_conn = serves_setup.clone();
             let admin_for_conn = admin.clone();
             connections.spawn(async move {
-                let conn = match tokio::time::timeout(RPC_HANDSHAKE_TIMEOUT, accepting).await {
-                    Ok(Ok(c)) => c,
-                    Ok(Err(e)) => {
-                        warn!("connection handshake failed: {e}");
-                        return;
-                    }
-                    Err(_) => {
-                        warn!("connection handshake timed out");
-                        return;
-                    }
-                };
+                let conn = connection;
                 let alpn = conn.alpn().to_vec();
                 debug!(
                     alpn = %String::from_utf8_lossy(&alpn),
@@ -595,6 +608,7 @@ where
     });
 
     Ok(ProviderHandle {
+        configuration: None,
         administration,
         alpns: advertised_alpns,
         router,
@@ -602,6 +616,7 @@ where
         stop: Some(stop),
         accept_task,
         endpoint,
+        owns_endpoint,
         work,
     })
 }

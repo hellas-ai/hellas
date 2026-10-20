@@ -65,7 +65,7 @@ mod clock;
 mod state;
 mod store;
 pub use state::State;
-pub use store::{NodeStore, OwnerApproval};
+pub use store::{NodeStore, OwnerApproval, PreparedBootstrap};
 
 #[derive(Debug, thiserror::Error)]
 pub enum NodeStoreError {

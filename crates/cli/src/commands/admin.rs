@@ -4,6 +4,7 @@ mod node;
 pub use node::{inspect_offline, run};
 
 #[derive(clap::Args)]
+#[command(group(clap::ArgGroup::new("remote_node").args(["node_enrollment", "node_id"])))]
 pub struct AdminArgs {
     /// Private application credential and independently provisioned server trust.
     #[arg(long, global = true)]
@@ -15,11 +16,14 @@ pub struct AdminArgs {
     /// transport key.
     #[arg(long = "node", global = true)]
     pub node_enrollment: Option<PathBuf>,
+    /// Exact transport pin obtained through the authenticated machine console.
+    #[arg(long, global = true, conflicts_with_all = ["node_enrollment", "control_socket"])]
+    pub node_id: Option<iroh::EndpointId>,
     #[arg(
         long = "address",
         global = true,
         value_delimiter = ',',
-        requires = "node_enrollment"
+        requires = "remote_node"
     )]
     pub addresses: Vec<std::net::SocketAddr>,
     #[command(subcommand)]
@@ -58,6 +62,10 @@ pub enum AdminCommand {
     },
     /// Read private node status using the profile's selected grant.
     Status,
+    /// Apply a typed upstream update; endpoint changes and key replacement/removal require --passkey.
+    ConfigureProvider { command: PathBuf },
+    /// Start or stop the provider through the normal host lifecycle.
+    SetProviderState { #[arg(long, action = clap::ArgAction::Set)] enabled: bool },
     /// Replace machine concurrency and budgets; revision zero initializes a provider.
     SetCapacity {
         #[arg(long)]
@@ -138,17 +146,25 @@ pub enum AdminCommand {
         #[arg(long, requires = "bearer_scope")]
         bearer_out: Option<PathBuf>,
     },
+    /// Bootstrap a fresh node using the pairing document from its authenticated console.
+    BootstrapRemote {
+        #[arg(long)]
+        invitation: PathBuf,
+        #[arg(long)]
+        root_grant: String,
+        #[arg(long)]
+        administrator: PathBuf,
+        #[arg(long)]
+        credential_scope: PathBuf,
+        /// New private directory for the retained credential and remote profile.
+        #[arg(long)]
+        profile_out: PathBuf,
+    },
     /// Replace lost administration offline; invalidate prior credentials and sessions.
     Recover {
         #[arg(long)]
         expected_revision: u64,
         #[command(flatten)]
         state: OfflineArgs,
-    },
-    #[cfg(unix)]
-    /// Serve the machine management application endpoint.
-    Serve {
-        #[arg(long)]
-        socket: Option<PathBuf>,
     },
 }

@@ -12,6 +12,7 @@ const PROVIDER_NOT_BOUND: &str = "provider is not bound";
 pub type ProviderFactory = Arc<
     dyn Fn(
             Option<NodeControl>,
+            Option<super::configuration::ProviderUpdate>,
         )
             -> BoxFuture<'static, Result<ProviderHandle, Box<dyn std::error::Error + Send + Sync>>>
         + Send
@@ -31,6 +32,9 @@ pub type GatewayFactory = Arc<
 
 /// The provider identity is the authority's binding, read from the store.
 pub struct HostOptions {
+    /// The normal node transport belongs to the host, across provider restarts.
+    pub transport: Option<iroh::Endpoint>,
+    pub start_provider: bool,
     pub control: Option<(NodeCoordinator, ProviderControl)>,
     pub provider: Option<ProviderFactory>,
     pub gateway: Option<(hellas_gateway::GatewayAccess, GatewayFactory)>,
@@ -57,8 +61,11 @@ pub struct HostHandle {
     listener: Option<hellas_wire::local::LocalControlServer>,
     stop: watch::Sender<bool>,
     task: tokio::task::JoinHandle<Result<(), HostError>>,
+    transport: Option<(iroh::Endpoint, tokio::task::JoinHandle<()>)>,
 }
 impl HostHandle {
+    pub fn endpoint(&self) -> Option<&iroh::Endpoint> { self.runtime.transport.as_ref() }
+
     /// Both services begin stopped. Startup neither creates authority nor grants.
     /// An authority without a provider binding still serves control; provider
     /// start is refused until the binding exists.
@@ -73,7 +80,10 @@ impl HostHandle {
             }
             access.validate().await?;
         }
+        let transport = options.transport;
         let state = Arc::new(Mutex::new(State {
+            configuration: None,
+            ingress: None,
             provider: None,
             gateway: None,
             work: None,
@@ -86,6 +96,7 @@ impl HostHandle {
         let (commands, receiver) = mpsc::channel(8);
         let runtime = Runtime {
             commands,
+            transport: transport.clone(),
             state,
             has_provider: options.provider.is_some(),
             has_gateway: options.gateway.is_some(),
@@ -107,6 +118,10 @@ impl HostHandle {
             (None, None)
         };
         let (stop, stopped) = watch::channel(false);
+        let remote = transport.map(|endpoint| {
+            let task = tokio::spawn(accept(endpoint.clone(), control.clone(), runtime.clone(), stopped.clone()));
+            (endpoint, task)
+        });
         let task = tokio::spawn(run(
             runtime.clone(),
             receiver,
@@ -115,91 +130,24 @@ impl HostHandle {
             options.provider,
             options.gateway.map(|(_, factory)| factory),
         ));
-        Ok(Self {
+        let host = Self {
             runtime,
+            transport: remote,
             listener,
             stop,
             task,
-        })
+        };
+        if options.start_provider {
+            let result = host.runtime.enqueue(Service::Provider, true).map_err(ProviderError::from)?
+                .await.map_err(|_| ProviderError::from(unavailable()))?;
+            if let Err(error) = result { host.shutdown().await?; return Err(ProviderError::from(error).into()); }
+        }
+        Ok(host)
     }
 
     /// Current provider endpoint for host metrics; stopping publishes None.
     pub fn provider_endpoint(&self) -> watch::Receiver<Option<iroh::Endpoint>> {
         self.runtime.endpoint.subscribe()
-    }
-
-    /// Compose the daemon through the same supervisor used by embedded hosts.
-    /// Explicit process startup enables its provider; subsequent control is checked.
-    pub async fn serve<R: hellas_attestation::RootProver + Send + Sync + 'static>(
-        mut provider: crate::ProviderOptions<R>,
-        grants: Option<crate::grant_config::GrantConfig>,
-    ) -> Result<Self, HostError> {
-        if provider.grants.is_some() {
-            return Err(HostError::Composition);
-        }
-        let control = if let Some(config) = grants {
-            let tls = super::profile::server_identity(
-                &config.control_certificate,
-                &config.control_private_key,
-            )
-            .map_err(ProviderError::from)?;
-            let grants = crate::ProviderGrants {
-                config: crate::GrantProviderOptions {
-                    policies: config.resources,
-                    max_job_millis: config.max_job_millis,
-                },
-                authority: crate::ProviderAuthority::Journal {
-                    root: config.journal_root,
-                },
-            };
-            let resources = if provider.executor.supports_evaluate() {
-                crate::grant_provider::ProviderResources::EvaluateAndFetch(
-                    &provider.executor.fetch_routes,
-                )
-            } else {
-                crate::grant_provider::ProviderResources::Fetch(&provider.executor.fetch_routes)
-            };
-            let node = grants
-                .open(resources, &provider.open_identity.enrollment)
-                .await?;
-            provider.grants = Some(grants);
-            Some((
-                node,
-                ProviderControl {
-                    socket: config.control_socket,
-                    tls,
-                    remote: config.remote_control,
-                },
-            ))
-        } else {
-            None
-        };
-        let host = Self::start(HostOptions {
-            control,
-            gateway: None,
-            provider: Some(Arc::new(move |control| {
-                let mut provider = provider.clone();
-                Box::pin(async move {
-                    if let Some(control) = control {
-                        provider = provider.on_host(control)?;
-                    }
-                    Ok(crate::start_fetch_provider(provider).await?)
-                })
-            })),
-        })
-        .await?;
-        let result = async {
-            host.runtime
-                .enqueue(Service::Provider, true)?
-                .await
-                .map_err(|_| unavailable())?
-        }
-        .await;
-        if let Err(error) = result {
-            host.shutdown().await?;
-            return Err(ProviderError::from(error).into());
-        }
-        Ok(host)
     }
 
     pub async fn shutdown(mut self) -> Result<(), HostError> {
@@ -208,6 +156,10 @@ impl HostHandle {
             Some(listener) => listener.shutdown().await.map_err(HostError::from),
             None => Ok(()),
         };
+        if let Some((endpoint, task)) = self.transport.take() {
+            endpoint.close().await;
+            task.await?;
+        }
         let stopped = (&mut self.task)
             .await
             .map_err(HostError::from)
@@ -224,12 +176,15 @@ impl Drop for HostHandle {
 #[derive(Clone)]
 pub(super) struct Runtime {
     commands: mpsc::Sender<Command>,
+    transport: Option<iroh::Endpoint>,
     state: Arc<Mutex<State>>,
     has_provider: bool,
     has_gateway: bool,
     endpoint: watch::Sender<Option<iroh::Endpoint>>,
 }
 struct State {
+    configuration: Option<super::configuration::ProviderMetadata>,
+    ingress: Option<mpsc::Sender<iroh::endpoint::Connection>>,
     provider: Option<ProviderHandle>,
     gateway: Option<hellas_gateway::GatewayHandle>,
     work: Option<hellas_work::grant_service::WorkAdministration>,
@@ -248,9 +203,17 @@ pub(super) enum Service {
 struct Command {
     service: Service,
     enabled: bool,
+    update: Option<super::configuration::ProviderUpdate>,
     reply: oneshot::Sender<Result<(), WireStatus>>,
 }
 impl Runtime {
+    pub(crate) fn provider_ingress(&self) -> Result<Option<(iroh::Endpoint, mpsc::Receiver<iroh::endpoint::Connection>)>, WireStatus> {
+        let Some(endpoint) = &self.transport else { return Ok(None) };
+        let (sender, receiver) = mpsc::channel(128);
+        self.with(|state| state.ingress = Some(sender))?;
+        Ok(Some((endpoint.clone(), receiver)))
+    }
+
     fn with<T>(&self, f: impl FnOnce(&mut State) -> T) -> Result<T, WireStatus> {
         self.state
             .lock()
@@ -273,6 +236,7 @@ impl Runtime {
             .try_send(Command {
                 service,
                 enabled,
+                update: None,
                 reply,
             })
             .map_err(|error| match error {
@@ -283,8 +247,17 @@ impl Runtime {
             })?;
         Ok(receiver)
     }
+    pub(super) fn configure(&self, update: super::configuration::ProviderUpdate) -> Result<oneshot::Receiver<Result<(), WireStatus>>, WireStatus> {
+        if !self.has_provider { return Err(unsupported()); }
+        let (reply, receiver) = oneshot::channel();
+        self.commands.try_send(Command { service: Service::Provider, enabled: true, update: Some(update), reply })
+            .map_err(|_| WireStatus::new(WireCode::ResourceExhausted, "host command queue unavailable"))?;
+        Ok(receiver)
+    }
     pub(super) fn decorate(&self, status: &mut HostStatus) -> Result<(), WireStatus> {
         self.with(|state| {
+            status.provider_configuration = state.configuration.as_ref()
+                .and_then(|metadata| canonical_dag_cbor(metadata).ok()).unwrap_or_default();
             status.provider = self.has_provider.then(|| {
                 let mut service = service_status(
                     state.provider_state,
@@ -309,12 +282,12 @@ impl Runtime {
                     state.gateway_failure.as_deref(),
                 )
             });
-            status.endpoint = state
+            status.endpoint = self.transport.as_ref().map(|endpoint| endpoint.id().to_string()).unwrap_or_else(|| state
                 .provider
                 .as_ref()
                 .filter(|handle| !handle.is_finished())
                 .map(|handle| handle.node_id().to_string())
-                .unwrap_or_default();
+                .unwrap_or_default());
         })
     }
     pub(super) fn work(
@@ -346,6 +319,7 @@ impl Runtime {
                     .with(|state| {
                         state.provider_state = RuntimeState::Stopping;
                         state.provider_failure = None;
+                        state.ingress = None;
                         state.provider.take()
                     })
                     .map_err(ProviderError::from)?;
@@ -407,7 +381,7 @@ impl Runtime {
                 .as_ref()
                 .is_some_and(|handle| !handle.is_finished()),
         })?;
-        if running {
+        if running && command.update.is_none() {
             return Ok(());
         }
         // A failed service is drained before an explicit restart, never retried.
@@ -431,7 +405,7 @@ impl Runtime {
                     ));
                 }
                 self.with(|state| state.provider_state = RuntimeState::Starting)?;
-                match factory(control.clone()).await {
+                match factory(control.clone(), command.update.clone()).await {
                     Ok(handle) => {
                         if !match (control, handle.administration()) {
                             (Some(control), Some(admin)) => {
@@ -449,16 +423,27 @@ impl Runtime {
                         }
                         self.with(|state| {
                             self.endpoint.send_replace(Some(handle.endpoint().clone()));
+                            state.configuration = handle.configuration().cloned();
                             state.work = handle.administration().cloned();
                             state.provider = Some(handle);
                             state.provider_state = RuntimeState::Running;
                         })
                     }
                     Err(error) => {
-                        self.with(|state| {
-                            state.provider_state = RuntimeState::Failed;
-                            state.provider_failure = Some(failure_detail(&*error));
-                        })?;
+                        if command.update.is_some() && let Ok(handle) = factory(control.clone(), None).await {
+                            self.with(|state| {
+                                self.endpoint.send_replace(Some(handle.endpoint().clone()));
+                                state.configuration = handle.configuration().cloned();
+                                state.work = handle.administration().cloned();
+                                state.provider = Some(handle);
+                                state.provider_state = RuntimeState::Running;
+                            })?;
+                        } else {
+                            self.with(|state| {
+                                state.provider_state = RuntimeState::Failed;
+                                state.provider_failure = Some(failure_detail(&*error));
+                            })?;
+                        }
                         Err(unavailable())
                     }
                 }
@@ -505,6 +490,10 @@ async fn run(
         let _ = command.reply.send(result);
     }
     receiver.close();
+    while let Some(command) = receiver.recv().await {
+        let result = runtime.set(&command, &control, &provider, &gateway).await;
+        let _ = command.reply.send(result);
+    }
     let gateway = runtime.stop(Service::Gateway).await;
     let provider = runtime.stop(Service::Provider).await;
     gateway.and(provider)
@@ -560,4 +549,108 @@ pub(super) fn identity_status(
         } as i32,
         detail: String::new(),
     })
+}
+
+/// The host owns transport admission and dispatch, independently of services.
+async fn accept(
+    endpoint: iroh::Endpoint,
+    control: Option<NodeControl>,
+    runtime: Runtime,
+    mut stopped: watch::Receiver<bool>,
+) {
+    let mut tasks = tokio::task::JoinSet::new();
+    loop {
+        let incoming = tokio::select! {
+            biased;
+            _ = stopped.wait_for(|stop| *stop) => break,
+            _ = tasks.join_next(), if !tasks.is_empty() => continue,
+            incoming = endpoint.accept() => match incoming { Some(incoming) => incoming, None => break },
+        };
+        if tasks.len() >= 128 { incoming.refuse(); continue; }
+        let control = control.clone();
+        let runtime = runtime.clone();
+        tasks.spawn(async move {
+            let Ok(accepting) = incoming.accept() else { return };
+            let Ok(Ok(connection)) = tokio::time::timeout(HANDSHAKE_TIMEOUT, accepting).await else { return };
+            if connection.alpn() == HostControl::ALPN.as_bytes() {
+                if let Some(control) = control { let _ = control.serve_iroh(connection).await; }
+            } else {
+                let sender = runtime.with(|state| state.ingress.clone()).ok().flatten();
+                if sender.as_ref().is_none_or(|sender| sender.try_send(connection.clone()).is_err()) {
+                    connection.close(503u32.into(), b"provider unavailable");
+                }
+            }
+        });
+    }
+    tasks.shutdown().await;
+}
+
+/// Attach the normal provider to its existing authority before constructing the
+/// host factory. The factory receives that same writer on every restart.
+pub async fn prepare_provider<R: hellas_attestation::RootProver + Send + Sync + 'static>(
+    provider: &mut crate::ProviderOptions<R>,
+    grants: Option<crate::grant_config::GrantConfig>,
+) -> Result<Option<(NodeCoordinator, ProviderControl)>, HostError> {
+        if provider.grants.is_some() {
+            return Err(HostError::Composition);
+        }
+        let control = if let Some(config) = grants {
+            let tls = super::profile::server_identity(
+                &config.control_certificate,
+                &config.control_private_key,
+            )
+            .map_err(ProviderError::from)?;
+            let grants = crate::ProviderGrants {
+                config: crate::GrantProviderOptions {
+                    policies: config.resources,
+                    max_job_millis: config.max_job_millis,
+                },
+                authority: crate::ProviderAuthority::Journal {
+                    root: config.journal_root,
+                },
+            };
+            let resources = if provider.executor.supports_evaluate() {
+                crate::grant_provider::ProviderResources::EvaluateAndFetch(
+                    &provider.executor.fetch_routes,
+                )
+            } else {
+                crate::grant_provider::ProviderResources::Fetch(&provider.executor.fetch_routes)
+            };
+            let node = grants
+                .open(resources, &provider.open_identity.enrollment)
+                .await?;
+            provider.grants = Some(grants);
+            Some((
+                node,
+                ProviderControl {
+                    socket: config.control_socket,
+                    tls,
+                    remote: config.remote_control,
+                },
+            ))
+        } else {
+            None
+        };
+    Ok(control)
+}
+
+/// Bind the normal node transport once, before pairing or service startup.
+pub async fn bind_transport(
+    key: iroh::SecretKey,
+    port: Option<u16>,
+    admission: RemoteControlAdmission,
+) -> Result<iroh::Endpoint, HostError> {
+    let mut builder = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+        .secret_key(key).hooks(admission).alpns(vec![
+            hellas_rpc::services::node::Node::ALPN.as_bytes().to_vec(),
+            hellas_rpc::services::work::Work::ALPN.as_bytes().to_vec(),
+            hellas_rpc::services::work_setup::WorkSetup::ALPN.as_bytes().to_vec(),
+            hellas_rpc::services::chain_sync::ChainSync::ALPN.as_bytes().to_vec(),
+            HostControl::ALPN.as_bytes().to_vec(),
+        ]);
+    if let Some(port) = port {
+        builder = builder.bind_addr(std::net::SocketAddr::from(([0, 0, 0, 0], port)))
+            .map_err(ProviderError::from)?;
+    }
+    Ok(builder.bind().await.map_err(ProviderError::from)?)
 }
