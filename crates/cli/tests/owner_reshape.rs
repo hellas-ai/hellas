@@ -73,44 +73,43 @@ fn result_coin(output: Output) -> CoinId {
     CoinId::from_bytes(hex::decode(id).unwrap().try_into().unwrap())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn owner_prepare_and_cli_delegate_sweep_execute_on_a_real_validator() {
-    let home = tempfile::tempdir().unwrap();
-    let passkey = SoftPasskey::from_secret_scalar([21; 32]).unwrap();
-    let native = Secp256k1Signer::from_secret_scalar([22; 32]).unwrap();
-    let node = Secp256k1Signer::from_secret_scalar([23; 32]).unwrap();
-    let key_path = home.path().join("owner.key");
-    std::fs::write(&key_path, [21; 32]).unwrap();
+fn start_validator(
+    home: &Path,
+    committee_size: usize,
+    allocations: [String; 2],
+) -> (Validator, String, ValidatorConfig, PathBuf) {
     let rpc = format!("ws://127.0.0.1:{}", port());
-    let mut config_command = command(home.path());
+    let mut config_command = command(home);
     config_command.args([
         "chain",
         "validator",
         "config",
         "-n",
-        "1",
+        &committee_size.to_string(),
         "--seed",
         "719",
         "--start-port",
         &port().to_string(),
+        "--metrics-port",
+        &port().to_string(),
         "--light-client-bind",
         rpc.strip_prefix("ws://").unwrap(),
         "--genesis-allocation",
-        &format!("{}:1000", SettlementKey::from(passkey.party_key())),
+        &allocations[0],
         "--genesis-allocation",
-        &format!("{}:2000", SettlementKey::from(native.party_key())),
+        &allocations[1],
     ]);
     let config_output = output(config_command);
     let config: ValidatorConfig =
         toml::from_str(std::str::from_utf8(&config_output.stdout).unwrap()).unwrap();
-    let network = config.network_id().unwrap();
-    let config_path = home.path().join("validator.toml");
+    let config_path = home.join("validator.toml");
     std::fs::write(&config_path, &config_output.stdout).unwrap();
-    let genesis_path = home.path().join("genesis.json");
+    let genesis_path = home.join("genesis.json");
     std::fs::write(&genesis_path, serde_json::to_vec(&config.genesis).unwrap()).unwrap();
-    let log = home.path().join("validator.log");
-    let mut start = command(home.path());
+    let log = home.join("validator.log");
+    let mut start = command(home);
     start
+        .env("RUST_LOG", "info")
         .args(["chain", "validator", "run", "--config"])
         .arg(&config_path)
         .stdout(Stdio::from(std::fs::File::create(&log).unwrap()))
@@ -121,6 +120,27 @@ async fn owner_prepare_and_cli_delegate_sweep_execute_on_a_real_validator() {
         process: start.spawn().unwrap(),
         log,
     };
+    (validator, rpc, config, genesis_path)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn owner_prepare_and_cli_delegate_sweep_execute_on_a_real_validator() {
+    let home = tempfile::tempdir().unwrap();
+    let passkey = SoftPasskey::from_secret_scalar([21; 32]).unwrap();
+    let native = Secp256k1Signer::from_secret_scalar([22; 32]).unwrap();
+    let node = Secp256k1Signer::from_secret_scalar([23; 32]).unwrap();
+    let key_path = home.path().join("owner.key");
+    std::fs::write(&key_path, [21; 32]).unwrap();
+    let started = std::time::Instant::now();
+    let (validator, rpc, config, genesis_path) = start_validator(
+        home.path(),
+        1,
+        [
+            format!("{}:1000", SettlementKey::from(passkey.party_key())),
+            format!("{}:2000", SettlementKey::from(native.party_key())),
+        ],
+    );
+    let network = config.network_id().unwrap();
     let client = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             if let Ok(client) = RemoteLightClient::connect(rpc.clone()).await
@@ -138,6 +158,7 @@ async fn owner_prepare_and_cli_delegate_sweep_execute_on_a_real_validator() {
             std::fs::read_to_string(&validator.log).unwrap()
         )
     });
+    eprintln!("single-validator RPC ready after {:?}", started.elapsed());
     let mut owner_ids = Vec::new();
     for index in 0..2 {
         let id = CoinId::from_bytes(hellas_chain::domain::genesis_object_id(index).into());
@@ -233,4 +254,49 @@ async fn owner_prepare_and_cli_delegate_sweep_execute_on_a_real_validator() {
         assert_eq!(found.owner.into_kernel(), owner);
         assert_eq!(found.delegate, None);
     }
+}
+
+// A configured committee still probes even when none of its other validators
+// is running. This protects against using current connectivity as membership.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_multi_validator_committee_waits_for_a_peer_floor_before_rpc_startup() {
+    let home = tempfile::tempdir().unwrap();
+    let owner = Secp256k1Signer::from_secret_scalar([24; 32]).unwrap();
+    let other_owner = Secp256k1Signer::from_secret_scalar([25; 32]).unwrap();
+    let started = std::time::Instant::now();
+    let (mut validator, rpc, _, _) = start_validator(
+        home.path(),
+        4,
+        [
+            format!("{}:1000", SettlementKey::from(owner.party_key())),
+            format!("{}:2000", SettlementKey::from(other_owner.party_key())),
+        ],
+    );
+    let client = tokio::time::timeout(Duration::from_secs(45), async {
+        loop {
+            assert!(
+                validator.process.try_wait().unwrap().is_none(),
+                "validator exited: {}",
+                std::fs::read_to_string(&validator.log).unwrap()
+            );
+            if let Ok(client) = RemoteLightClient::connect(rpc.clone()).await
+                && let Ok(info) = client.get_consensus_info().await
+            {
+                assert_eq!(info.validators.len(), 4);
+                break client;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("RPC starts after the unchanged 30-second peer-floor wait");
+    // Allow startup work before the probe, never a shorter probe wait.
+    assert!(started.elapsed() >= Duration::from_secs(30));
+    assert!(
+        std::fs::read_to_string(&validator.log)
+            .unwrap()
+            .contains("no peer offered a finalization; starting from genesis")
+    );
+    eprintln!("four-validator RPC ready after {:?}", started.elapsed());
+    drop(client);
 }

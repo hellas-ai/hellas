@@ -998,7 +998,10 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
         // highest finalization f + 1 peers vouch for. A whole network
         // starting from genesis has no finalizations to offer; after the
         // wait it replays from genesis as before.
-        if plan.may_state_sync() {
+        // A fresh single-validator node has no other validator to offer
+        // a floor. Reachability must not bypass probing a larger committee.
+        let has_other_validator = scheme.participants().iter().any(|key| key != &me);
+        if plan.may_state_sync() && has_other_validator {
             match ::tokio::time::timeout(PROBE_WAIT, probe_mailbox.subscribe()).await {
                 Ok(Ok(floor)) => {
                     info!(round = ?floor.round(), "state syncing from a peer-certified floor");
