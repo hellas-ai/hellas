@@ -93,9 +93,20 @@ impl Provider for RunPod {
                     "interruptible": request.interruptible
                 })),
             )
-            .await?;
-        let id = field(&created, "id")?.to_owned();
-        validate_id(&id)?;
+            .await
+            .map_err(|source| Error::CreationUnconfirmed {
+                name: request.name.clone(),
+                source: Box::new(source),
+            })?;
+        let id = field(&created, "id")
+            .and_then(|id| {
+                validate_id(id)?;
+                Ok(id.to_owned())
+            })
+            .map_err(|source| Error::CreationUnconfirmed {
+                name: request.name.clone(),
+                source: Box::new(source),
+            })?;
         let live = self
             .request(Method::GET, &format!("/pods/{id}"), None)
             .await

@@ -17,8 +17,16 @@ pub enum Error {
     Invalid(&'static str),
     #[error("credential source unavailable")]
     Credential,
-    #[error("provider request failed; reconcile by machine name before retrying creation")]
+    #[error("provider request failed")]
     Request(#[source] reqwest::Error),
+    #[error(
+        "creation of machine {name} could not be confirmed; reconcile by name before retrying: {source}"
+    )]
+    CreationUnconfirmed {
+        name: String,
+        #[source]
+        source: Box<Self>,
+    },
     #[error("provider returned HTTP {0}; response body withheld")]
     HttpStatus(reqwest::StatusCode),
     #[error("provider response exceeds the size limit")]
