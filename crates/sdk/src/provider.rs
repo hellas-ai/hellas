@@ -296,7 +296,7 @@ use hellas_rpc::services::work::Work;
 use hellas_rpc::services::work_setup::{WorkSetup, WorkSetupServer};
 use hellas_wire::peers::{PeerDirectory, PeerId, PeerManager};
 use hellas_wire::serve::AccountingDispatcher;
-use iroh::endpoint::Connection;
+use iroh::endpoint::{Connection, Incoming};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
@@ -306,6 +306,22 @@ mod node;
 use node::NodeHandlerImpl;
 const MAX_ACTIVE_RPC_CONNECTIONS: usize = 128;
 const MAX_RPC_IN_FLIGHT_PER_CONNECTION: usize = 16;
+const MAX_RPC_HANDSHAKES: usize = 16;
+const MAX_RPC_HANDSHAKES_PER_PEER: usize = 2;
+
+enum IncomingConnection {
+    Standalone(Box<Incoming>),
+    Host(Connection),
+}
+impl IncomingConnection {
+    fn refuse(self) {
+        match self {
+            Self::Standalone(incoming) => (*incoming).refuse(),
+            Self::Host(connection) => connection.close(503u32.into(), b"provider at capacity"),
+        }
+    }
+}
+
 const RPC_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const RPC_CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 pub struct ProviderHandle {
@@ -560,42 +576,45 @@ where
     let (stop, mut stopped) = oneshot::channel();
     let accept_task = tokio::spawn(async move {
         let mut connections = JoinSet::new();
+        let mut handshake_slots = crate::transport_admission::HandshakeSlots::new(
+            MAX_RPC_HANDSHAKES,
+            MAX_RPC_HANDSHAKES_PER_PEER,
+        );
         loop {
-            let at_capacity = connections.len() >= MAX_ACTIVE_RPC_CONNECTIONS;
+            // Both waits are cancellation-safe. Once accepted, a connection's
+            // handshake belongs to its task, never to the next select iteration.
             let next = async {
                 if let Some(receiver) = &mut ingress {
-                    receiver.recv().await
+                    receiver.recv().await.map(IncomingConnection::Host)
                 } else {
-                    loop {
-                        let incoming = accept_endpoint.accept().await?;
-                        if at_capacity {
-                            incoming.refuse();
-                            continue;
-                        }
-                        let Ok(accepting) = incoming.accept() else {
-                            continue;
-                        };
-                        if let Ok(Ok(connection)) =
-                            tokio::time::timeout(RPC_HANDSHAKE_TIMEOUT, accepting).await
-                        {
-                            return Some(connection);
-                        }
-                    }
+                    accept_endpoint
+                        .accept()
+                        .await
+                        .map(|incoming| IncomingConnection::Standalone(Box::new(incoming)))
                 }
             };
-            let connection = tokio::select! {
+            let incoming = tokio::select! {
                 biased;
                 _ = &mut stopped => break,
                 completed = connections.join_next(), if !connections.is_empty() => {
                     if let Some(Err(error)) = completed { warn!(%error, "node connection task failed"); }
                     continue;
                 }
-                connection = next => match connection { Some(connection) => connection, None => break },
+                incoming = next => match incoming { Some(incoming) => incoming, None => break },
             };
             if connections.len() >= MAX_ACTIVE_RPC_CONNECTIONS {
-                connection.close(503u32.into(), b"provider at capacity");
+                incoming.refuse();
                 continue;
             }
+            let permits = if let IncomingConnection::Standalone(connection) = &incoming {
+                let Some(permits) = handshake_slots.try_acquire(&connection.remote_addr()) else {
+                    incoming.refuse();
+                    continue;
+                };
+                Some(permits)
+            } else {
+                None
+            };
             let node_handler_for_conn = node_handler.clone();
             let manager_for_conn = directory.manager();
             let execution_for_conn = open_identity.clone();
@@ -603,7 +622,21 @@ where
             let setup_for_conn = serves_setup.clone();
             let admin_for_conn = admin.clone();
             connections.spawn(async move {
-                let conn = connection;
+                let conn = match incoming {
+                    IncomingConnection::Host(connection) => connection,
+                    IncomingConnection::Standalone(incoming) => {
+                        let Ok(accepting) = (*incoming).accept() else {
+                            return;
+                        };
+                        let Ok(Ok(connection)) =
+                            tokio::time::timeout(RPC_HANDSHAKE_TIMEOUT, accepting).await
+                        else {
+                            return;
+                        };
+                        connection
+                    }
+                };
+                drop(permits);
                 let alpn = conn.alpn().to_vec();
                 debug!(
                     alpn = %String::from_utf8_lossy(&alpn),
