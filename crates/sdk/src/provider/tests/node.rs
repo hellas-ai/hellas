@@ -1698,7 +1698,7 @@ fn channel_snapshot(
 /// decode at the end proves this literal is its canonical shape.
 fn pending_contest(responded: bool) -> RegistryChunk {
     let mut value = Vec::with_capacity(PendingPaymentClose::ENCODED_SIZE);
-    value.extend_from_slice(&[1, 23, 3]); // envelope and work-close version
+    value.extend_from_slice(&[1, 23, 4]); // envelope and pending-close version
     value.extend_from_slice(payment_edge().as_bytes());
     value.push(Party::Maker.tag());
     value.extend_from_slice(&[0x7c; StartId::LENGTH]);
@@ -1713,7 +1713,7 @@ fn pending_contest(responded: bool) -> RegistryChunk {
     value.push(u8::from(responded));
     value.push(u8::from(responded));
     value.extend_from_slice(&OMISSION_BOND.to_be_bytes());
-    value.push(0); // owner_signed
+    value.extend_from_slice(&[0, 0]); // maker/taker owner_signed
     assert_eq!(value.len(), PendingPaymentClose::ENCODED_SIZE);
     let record = match PendingPaymentClose::decode_exact(&value) {
         Ok(record) => record,

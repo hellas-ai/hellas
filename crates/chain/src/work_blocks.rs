@@ -368,7 +368,7 @@ mod tests {
     use crate::domain::{KERNEL_FEES, SettlementKey, TEST_NETWORK, genesis_object_id};
     use crate::execution::store::{UtxoDatabase, utxo_db_config};
     use crate::execution::test_support::{
-        consensus_fixture, finalization, index_block, index_genesis, run_qmdb,
+        consensus_fixture, finalization, index_block, index_genesis, reshape, run_qmdb,
     };
     use crate::execution::{ChainVerifier, execute_all};
     use crate::indexer::spawn_archive;
@@ -418,14 +418,27 @@ mod tests {
         )
     }
 
-    /// The genesis coin allocated to the client, and the one allocated
-    /// to the provider. Allocation order fixes the two ids.
+    fn delegated_funding(is_client: bool) -> (Transaction, CoinId) {
+        let (seed, index, value) = if is_client {
+            (0x21, 0, FUNDING)
+        } else {
+            (0x22, 1, STAKE)
+        };
+        let owner = SettlementKey::from(signer(seed).party_key());
+        let (tx, ids) = reshape(
+            seed,
+            &[genesis_object_id(index)],
+            &[(owner, Some(owner), value)],
+        );
+        (tx, CoinId::from_bytes(ids[0].0))
+    }
+
     fn client_coin() -> CoinId {
-        CoinId::from_bytes(genesis_object_id(0).into())
+        delegated_funding(true).1
     }
 
     fn provider_coin() -> CoinId {
-        CoinId::from_bytes(genesis_object_id(1).into())
+        delegated_funding(false).1
     }
 
     fn bond_terms() -> WorkStakeBondTerms {
@@ -603,7 +616,13 @@ mod tests {
         /// one, executes it, finalizes it, and indexes it.
         async fn seal(&mut self) -> HellasBlock {
             let pending = self.mempool.test_transactions().await;
-            let fresh = pending[self.sealed..].to_vec();
+            let mut fresh = Vec::new();
+            if self.height == 0 {
+                // Owner setup precedes the node driver's submissions; preserve
+                // the mempool as the test's record of driver broadcasts only.
+                fresh.extend([delegated_funding(true).0, delegated_funding(false).0]);
+            }
+            fresh.extend_from_slice(&pending[self.sealed..]);
             self.sealed = pending.len();
             self.height += 1;
 
