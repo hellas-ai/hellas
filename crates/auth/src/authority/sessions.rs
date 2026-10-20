@@ -7,6 +7,17 @@ use crate::{
     Digest, ProducerSigningKey, Signature, hash_tuple, signature::verify_digest_signature,
 };
 
+/// What a client presents next to its credential secret.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SessionProof {
+    /// The subject's `WebAuthn` assertion over the proof digest: a passkey
+    /// session, which step-up operations require.
+    Passkey(PasskeyAssertion),
+    /// The credential's bound node key signs the proof digest (compact, low
+    /// `s`): a daily session.
+    Daily([u8; Signature::LEN]),
+}
+
 pub const MAX_CHALLENGE_LIFETIME_MS: u64 = 60_000;
 pub const MAX_SESSION_LIFETIME_MS: u64 = 15 * 60_000;
 
@@ -38,25 +49,37 @@ impl SessionChallenge {
         Ok(())
     }
 
-    /// Sign only after authenticating the expected server. `binding` must come
-    /// from this connection, never from the challenge or another peer's request.
-    /// A signature alone confers no grant or application credential rights.
-    pub fn sign(
+    /// The digest a client proves, released only after authenticating the
+    /// expected server. `binding` must come from this connection, never from the
+    /// challenge or another peer's request. A passkey signs it as its `WebAuthn`
+    /// challenge; a proof alone confers no grant or credential rights.
+    pub fn proof_digest(
         &self,
         authority: AuthorityId,
         binding: Digest,
         credential: CredentialId,
-        key: &ProducerSigningKey,
-    ) -> Result<Signature, AuthorityError> {
+    ) -> Result<Digest, AuthorityError> {
         // Time is the server's to enforce: a client whose clock trails the
         // server's must still be able to answer a fresh challenge.
         self.validate()?;
         if self.authority != authority || self.binding != binding {
             return Err(AuthorityError::Credential);
         }
-        let subject = PrincipalId::from_public_key(key.public_key())?;
-        key.sign_digest(self.digest(credential, subject))
-            .map_err(|_| AuthorityError::Credential)
+        Ok(self.digest(credential))
+    }
+
+    /// A daily proof by the node key the credential is bound to.
+    pub fn sign_daily(
+        &self,
+        authority: AuthorityId,
+        binding: Digest,
+        credential: CredentialId,
+        node_key: &ProducerSigningKey,
+    ) -> Result<SessionProof, AuthorityError> {
+        let signature = node_key
+            .sign_digest(self.proof_digest(authority, binding, credential)?)
+            .map_err(|_| AuthorityError::Credential)?;
+        Ok(SessionProof::Daily(*signature.bytes()))
     }
 
     fn check(
@@ -76,9 +99,11 @@ impl SessionChallenge {
         Ok(())
     }
 
-    fn digest(&self, credential: CredentialId, subject: PrincipalId) -> Digest {
+    /// Commits to the credential, which names both the subject whose passkey
+    /// may answer and the node key that may answer daily.
+    fn digest(&self, credential: CredentialId) -> Digest {
         hash_tuple(
-            "hellas.auth.session.proof.v1",
+            "hellas.auth.session.proof.v2",
             &[
                 self.authority.0.as_bytes(),
                 &self.generation.to_be_bytes(),
@@ -88,7 +113,6 @@ impl SessionChallenge {
                 &self.deadline.0.to_be_bytes(),
                 &self.session_expires.0.to_be_bytes(),
                 &credential.0,
-                subject.as_bytes(),
             ],
         )
     }
@@ -110,20 +134,31 @@ impl PendingAuthentication {
         authority: &AuthorityState,
         binding: Digest,
         credential: &CredentialSecret,
-        signature: &Signature,
+        proof: &SessionProof,
         now: UnixMillis,
     ) -> Result<AuthenticatedSession, AuthorityError> {
         self.challenge.check(authority.authority(), binding, now)?;
         if self.challenge.generation != authority.generation() {
             return Err(AuthorityError::Credential);
         }
-        let mut caller = authority.authenticate_secret(credential, now)?;
-        verify_digest_signature(
-            &caller.subject.public_key(),
-            signature,
-            self.challenge.digest(credential.id(), caller.subject),
-        )
-        .map_err(|_| AuthorityError::Credential)?;
+        let session = match proof {
+            SessionProof::Passkey(_) => SessionKind::Passkey,
+            SessionProof::Daily(_) => SessionKind::Daily,
+        };
+        let mut caller = authority.authenticate_secret(credential, session, now)?;
+        let CredentialHolder::Node(node_key) = caller.holder else {
+            return Err(AuthorityError::Credential);
+        };
+        let digest = self.challenge.digest(credential.id());
+        match proof {
+            SessionProof::Passkey(assertion) => assertion.verify(caller.subject, digest)?,
+            SessionProof::Daily(signature) => verify_digest_signature(
+                &node_key.public_key(),
+                &Signature::Secp256k1(*signature),
+                digest,
+            )
+            .map_err(|_| AuthorityError::Credential)?,
+        }
         caller.expires = caller.expires.min(self.challenge.session_expires);
         Ok(AuthenticatedSession { caller, binding })
     }

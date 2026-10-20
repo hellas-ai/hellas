@@ -6,7 +6,8 @@ use std::sync::{Arc, Mutex, Weak};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ContentId, Digest};
+use crate::ContentId;
+use hellas_auth::Digest;
 
 mod manage;
 pub use manage::{CacheFilter, CachePrune, CacheStats, Eviction};
@@ -209,22 +210,18 @@ impl CacheKey {
     /// may have side effects and must never be memoized implicitly.
     #[cfg(feature = "fetch")]
     pub fn fetch(
-        environment: ContentId,
+        contract: &crate::FetchContract,
         service: &str,
         method: &str,
         body: &[u8],
     ) -> CacheResult<Self> {
-        if ![
-            crate::FetchEnvironment::OpenAiResponses,
-            crate::FetchEnvironment::CodexResponses,
-        ]
-        .iter()
-        .any(|known| known.manifest_id() == environment)
-        {
-            return Err(
-                "output caching requires a built-in Responses inference environment".into(),
-            );
+        if !matches!(
+            contract.schema(),
+            crate::FetchSchema::StatelessResponsesV1 | crate::FetchSchema::ResponsesItemsV1
+        ) {
+            return Err("output caching requires a supported Responses inference contract".into());
         }
+        let environment = contract.manifest_id();
         Ok(Self::hash(
             CacheKind::Fetch,
             &[
@@ -241,12 +238,12 @@ impl CacheKey {
     #[cfg(feature = "fetch")]
     pub fn fetch_for_policy(
         policy: CachePolicy,
-        environment: ContentId,
+        contract: &crate::FetchContract,
         service: &str,
         method: &str,
         body: &[u8],
     ) -> CacheResult<Option<Self>> {
-        match Self::fetch(environment, service, method, body) {
+        match Self::fetch(contract, service, method, body) {
             Ok(key) => Ok(Some(key)),
             Err(_) if policy == CachePolicy::Record => Ok(None),
             Err(error) => Err(error),
@@ -254,7 +251,8 @@ impl CacheKey {
     }
 
     pub fn hash(kind: CacheKind, fields: &[&[u8]]) -> Self {
-        let identity = crate::hash_tuple(&format!("hellas.inference-cache.v1.{kind}"), fields);
+        let identity =
+            hellas_auth::hash_tuple(&format!("hellas.inference-cache.v1.{kind}"), fields);
         Self::new(kind, &identity.to_string()).expect("digest identity")
     }
 
@@ -441,8 +439,11 @@ mod tests {
             let key = CacheKey::hash(kind, &[b"request"]);
             assert_eq!(
                 key.identity,
-                crate::hash_tuple(&format!("hellas.inference-cache.v1.{name}"), &[b"request"])
-                    .to_string()
+                hellas_auth::hash_tuple(
+                    &format!("hellas.inference-cache.v1.{name}"),
+                    &[b"request"]
+                )
+                .to_string()
             );
             let legacy = serde_ipld_dagcbor::to_vec(&LegacyKey {
                 kind: name,

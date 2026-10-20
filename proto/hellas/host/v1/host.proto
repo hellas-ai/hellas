@@ -5,25 +5,60 @@ package hellas.host.v1;
 // Administrative lifecycle control. Hosts must authorize each connection before
 // dispatch, regardless of whether the carrier is local or remote.
 service HostControl {
-  // Journal owner or admin; versioned canonical node permission records.
+  rpc InspectAuthority(InspectAuthorityRequest) returns (InspectAuthorityResponse);
+  // Canonical Auth GrantCommand; the authenticated connection supplies the actor.
   rpc GrantControl(GrantControlRequest) returns (GrantControlResponse);
+  rpc IssueCredential(IssueCredentialRequest) returns (IssueCredentialResponse);
+  rpc RevokeCredential(RevokeCredentialRequest) returns (RevokeCredentialResponse);
+  rpc WorkControl(WorkControlRequest) returns (WorkControlResponse);
   rpc GetHostStatus(GetHostStatusRequest) returns (HostStatus);
+  rpc SetMachineCapacity(SetMachineCapacityRequest) returns (MachineCapacity);
+  rpc ConfigureProvider(ConfigureProviderRequest) returns (HostStatus);
   rpc SetProviderState(SetProviderStateRequest) returns (HostStatus);
   rpc SetGatewayState(SetGatewayStateRequest) returns (HostStatus);
   rpc GetGatewayAccess(GetGatewayAccessRequest) returns (GatewayAccess);
+  // One-time binding of the provider enrollment for an authority bootstrapped
+  // without one. Rebinding the bound enrollment succeeds; any other is refused.
+  rpc BindProvider(BindProviderRequest) returns (BindProviderResponse);
 }
 
-message GetHostStatusRequest {}
+message GetHostStatusRequest { bytes authorization = 1; }
+
+message SetMachineCapacityRequest {
+  bytes authorization = 1;
+  uint64 expected_revision = 2;
+  uint32 max_in_flight = 3;
+  // Canonical DAG-CBOR array of Work Limit values. An encoded empty array clears limits.
+  bytes limits = 4;
+}
+
+message MachineCapacity {
+  uint64 revision = 1;
+  uint32 max_in_flight = 2;
+  bytes limits = 3;
+}
 
 message SetProviderStateRequest {
   bool enabled = 1;
+  bytes authorization = 2;
 }
 
 message SetGatewayStateRequest {
   bool enabled = 1;
+  bytes authorization = 2;
 }
 
-message GetGatewayAccessRequest {}
+message GetGatewayAccessRequest { bytes authorization = 1; }
+
+message BindProviderRequest {
+  bytes authorization = 1;
+  // Canonical ProviderEnrollmentBundle bytes.
+  bytes enrollment = 2;
+}
+message BindProviderResponse {
+  // Content ID of the bound enrollment, as pinned by requester trust policies.
+  bytes provider_genesis = 1;
+}
 
 enum RuntimeState {
   // An omitted state means stopped; preserve the host protocol's zero value.
@@ -65,6 +100,13 @@ message HostStatus {
   ServiceStatus provider = 3;
   ServiceStatus gateway = 4;
   string endpoint = 5;
+  bytes authority = 6;
+  uint64 authority_revision = 7;
+  uint64 generation = 8;
+  bool provider_configured = 9;
+  MachineCapacity machine = 10;
+  // Canonical metadata only: revision, endpoints, and key names.
+  ProviderMetadata provider_configuration = 11;
 }
 
 message GatewayAccess {
@@ -74,3 +116,79 @@ message GatewayAccess {
 
 message GrantControlRequest { bytes command = 1; }
 message GrantControlResponse { bytes reply = 1; }
+
+message IssueCredentialRequest {
+  bytes authorization = 1;
+  // Canonical client-prepared Auth Credential (ID and verifier, never its secret).
+  bytes credential = 2;
+}
+
+message IssueCredentialResponse {
+  // Canonical durable AdministrationRecord, never an authentication input.
+  bytes record = 1;
+}
+
+message RevokeCredentialRequest {
+  bytes authorization = 1;
+  bytes credential_id = 2;
+  uint64 expected_revision = 3;
+}
+message RevokeCredentialResponse { bytes record = 1; }
+
+message WorkControlRequest {
+  bytes authorization = 1;
+  bytes command = 2;
+}
+message WorkControlResponse { bytes reply = 1; }
+
+message InspectAuthorityRequest {
+  bytes authorization = 1;
+  // Canonical bounded Auth InspectionQuery.
+  bytes query = 2;
+}
+message InspectAuthorityResponse {
+  // Canonical metadata-only AuthorityInspection. Never a credential verifier.
+  bytes reply = 1;
+}
+
+message ConfigureProviderRequest {
+  bytes authorization = 1;
+  ProviderUpdate update = 2;
+}
+
+message ProviderUpdate {
+  uint64 expected_revision = 1;
+  oneof change {
+    UpstreamEndpoint set_endpoint = 2;
+    UpstreamRoute remove_endpoint = 3;
+    UpstreamKey add_key = 4;
+    UpstreamKey replace_key = 5;
+    UpstreamKeyId remove_key = 6;
+  }
+}
+message UpstreamRoute { string service = 1; string method = 2; }
+message UpstreamKeyId { string service = 1; string method = 2; string key = 3; }
+message UpstreamEndpoint {
+  string service = 1;
+  string method = 2;
+  repeated string allowed_hosts = 3;
+  bool allow_private_addresses = 4;
+}
+message UpstreamKey {
+  string service = 1;
+  string method = 2;
+  string key = 3;
+  repeated string allowed_origins = 4;
+  repeated string allowed_paths = 5;
+  repeated string allowed_methods = 6;
+  string header_name = 7;
+  string prefix = 8;
+  string secret = 9;
+}
+message ProviderMetadata { uint64 revision = 1; repeated EndpointMetadata endpoints = 2; }
+message EndpointMetadata {
+  string service = 1;
+  string method = 2;
+  repeated string allowed_hosts = 3;
+  repeated string keys = 4;
+}

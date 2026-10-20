@@ -19,6 +19,8 @@ fn regular_open_is_safe_readable_seekable_and_close_on_exec() {
     std::fs::write(&target, content).expect("write target");
     let link = dir.join("snapshot");
     std::os::unix::fs::symlink(&target, &link).expect("symlink");
+    assert!(open_regular_file_nofollow(&target).is_ok());
+    assert!(open_regular_file_nofollow(&link).is_err());
 
     let mut file = open_regular_file(&link).expect("open regular symlink");
     let mut read = Vec::new();
@@ -62,6 +64,7 @@ fn regular_open_is_safe_readable_seekable_and_close_on_exec() {
     assert!(status.success(), "the fixture needs a fifo");
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
+        assert!(open_regular_file_nofollow(&fifo).is_err());
         let _ = sender.send(open_regular_file(&fifo));
     });
     let fifo_error = receiver
@@ -71,6 +74,7 @@ fn regular_open_is_safe_readable_seekable_and_close_on_exec() {
     assert_eq!(fifo_error.kind(), io::ErrorKind::InvalidInput);
 
     if Path::new("/dev/null").exists() {
+        assert!(open_regular_file_nofollow(Path::new("/dev/null")).is_err());
         let device_error = open_regular_file(Path::new("/dev/null"))
             .expect_err("a character device is not regular content");
         assert_eq!(device_error.kind(), io::ErrorKind::InvalidInput);
@@ -98,4 +102,26 @@ fn bounded_read_accepts_exact_limit_and_rejects_larger_file() {
         read_bounded_regular_file(&path, 3).unwrap_err().kind(),
         io::ErrorKind::InvalidData
     );
+}
+
+#[test]
+fn bounded_reader_distinguishes_overflow_from_a_decoder_failure_at_the_limit() {
+    struct BadEof(io::Cursor<&'static [u8]>);
+    impl io::Read for BadEof {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            if self.0.position() == self.0.get_ref().len() as u64 {
+                Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "missing trailer",
+                ))
+            } else {
+                io::Read::read(&mut self.0, output)
+            }
+        }
+    }
+    let overflow = read_bounded(b"12345".as_slice(), 4).unwrap_err();
+    assert!(overflow.get_ref().unwrap().is::<ReadLimit>());
+    let corrupt = read_bounded(BadEof(io::Cursor::new(b"1234")), 4).unwrap_err();
+    assert_eq!(corrupt.kind(), io::ErrorKind::UnexpectedEof);
+    assert!(!corrupt.get_ref().unwrap().is::<ReadLimit>());
 }

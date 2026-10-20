@@ -1,8 +1,8 @@
 //! Funding types bind a job's authorization, clock and terminal obligations.
 
 use super::{PaymentState, TerminalOutcome};
+use crate::model::work::{CreditLedger, PaidJobAuthorizationV2, PaidJobResultV1};
 use hellas_kernel::Sig;
-use hellas_rpc::protocol::work::{CreditLedger, PaidJobAuthorizationV2, PaidJobResultV1};
 use std::fmt::{self, Debug};
 
 mod sealed {
@@ -118,16 +118,16 @@ impl Funding for PaymentFunding {
     type Terminal = TerminalOutcome;
 }
 
-impl sealed::Clock for hellas_rpc::protocol::work_grant::UnixMillis {}
-impl Clock for hellas_rpc::protocol::work_grant::UnixMillis {
+impl sealed::Clock for hellas_auth::authority::UnixMillis {}
+impl Clock for hellas_auth::authority::UnixMillis {
     const UNIT: &'static str = "Unix milliseconds";
     fn value(self) -> u64 {
         self.0
     }
 }
-impl sealed::Authorization for hellas_rpc::protocol::work_grant::GrantJobAuthorizationV1 {}
-impl JobAuthorization for hellas_rpc::protocol::work_grant::GrantJobAuthorizationV1 {
-    type Clock = hellas_rpc::protocol::work_grant::UnixMillis;
+impl sealed::Authorization for crate::model::grant::GrantJobAuthorizationV1 {}
+impl JobAuthorization for crate::model::grant::GrantJobAuthorizationV1 {
+    type Clock = hellas_auth::authority::UnixMillis;
     fn proposal_nonce(&self) -> u64 {
         self.proposal_nonce
     }
@@ -143,12 +143,12 @@ impl JobAuthorization for hellas_rpc::protocol::work_grant::GrantJobAuthorizatio
 pub enum GrantFunding {}
 impl sealed::Funding for GrantFunding {}
 impl Funding for GrantFunding {
-    type Authorization = hellas_rpc::protocol::work_grant::GrantJobAuthorizationV1;
-    type Clock = hellas_rpc::protocol::work_grant::UnixMillis;
+    type Authorization = crate::model::grant::GrantJobAuthorizationV1;
+    type Clock = hellas_auth::authority::UnixMillis;
     type State = crate::work_store::grant::GrantChannelState;
     // Shared ancestor accounting is owned once by the provider journal.
     type Ledger = ();
     type Result = PaidJobResultV1;
-    type Signature = hellas_rpc::Signature;
+    type Signature = hellas_auth::Signature;
     type Terminal = crate::work_store::grant::GrantTerminal;
 }

@@ -1,0 +1,50 @@
+[package]
+name = "hellas-webauthn"
+description = "The one WebAuthn assertion verifier shared by the Hellas kernel, chain and auth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation.workspace = true
+
+[features]
+default = []
+# Parsing the DER signature a browser or platform authenticator returns.
+# Only signers need it; verifiers take the compact form.
+der = ["p256/pkcs8"]
+
+[dependencies]
+p256 = { workspace = true }
+sha2 = { workspace = true }
+
+[lints.rust]
+elided_lifetimes_in_paths = "deny"
+missing_copy_implementations = "deny"
+missing_debug_implementations = "deny"
+missing_docs = "deny"
+rust_2018_idioms = "deny"
+unsafe_code = "forbid"
+unreachable_pub = "deny"
+unused_extern_crates = "deny"
+unused_must_use = "deny"
+warnings = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+alloc_instead_of_core = "deny"
+dbg_macro = "deny"
+expect_used = "deny"
+indexing_slicing = "deny"
+nursery = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+print_stderr = "deny"
+print_stdout = "deny"
+std_instead_of_alloc = "deny"
+std_instead_of_core = "deny"
+todo = "deny"
+unimplemented = "deny"
+unwrap_used = "deny"
+
+[lints.rustdoc]
+bare_urls = "deny"
+broken_intra_doc_links = "deny"

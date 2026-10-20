@@ -5,14 +5,14 @@
 //! bilateral terms shape, and up to two chained edges.
 
 use super::{
-    CANARY_REGISTRY_SLOTS, FixedStore, canary_registry_slots, coin_id, list, open_tx,
-    placeholder_mutual, state,
+    CANARY_REGISTRY_SLOTS, FixedStore, canary_registry_slots, coin_id, list, placeholder_mutual,
+    state,
 };
 
 use hellas_kernel::{
     BlockHash, BlockHeight, CoinId, Context, Edge, EdgeId, Funding, Genesis, Key, List,
-    MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS, Parties, Payout, Proof, ProtocolCode, State, Terms, Tx,
-    View,
+    MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS, Parties, PartyKeys, Payout, Proof, ProtocolCode, State,
+    Terms, Tx, View,
 };
 
 pub(crate) const CONTEXT: Context = Context::new(
@@ -31,7 +31,7 @@ pub(crate) const TAKER: Key = Key::from_bytes([8; Key::LENGTH]);
 /// Third party owning nothing; the concrete realization of the model's
 /// `Adversary` party in rejected-open replay.
 pub(crate) const ADVERSARY: Key = Key::from_bytes([0xee; Key::LENGTH]);
-pub(crate) const PARTIES: Parties = Parties::new(MAKER, TAKER);
+pub(crate) const PARTIES: Parties = Parties::new(PartyKeys::sole(MAKER), PartyKeys::sole(TAKER));
 pub(crate) const PROTOCOL: ProtocolCode = ProtocolCode::new(1);
 pub(crate) const OTHER_PROTOCOL: ProtocolCode = ProtocolCode::new(2);
 pub(crate) const MAKER_ID: CoinId = coin_id(1);
@@ -112,12 +112,34 @@ pub(crate) fn genesis<const C: usize, const E: usize, const R: usize>(
 pub(crate) fn open(edge: EdgeKey) -> Tx {
     match edge {
         EdgeKey::First => open_case(OpenKey::Full),
-        EdgeKey::Second => open_tx(second_funding(), terms(), MAKER, TAKER),
+        EdgeKey::Second => super::open(
+            second_funding(),
+            terms(),
+            (
+                hellas_kernel::PartyKeys::sole(MAKER),
+                hellas_kernel::Authority::Owner,
+            ),
+            (
+                hellas_kernel::PartyKeys::sole(TAKER),
+                hellas_kernel::Authority::Owner,
+            ),
+        ),
     }
 }
 
 pub(crate) fn open_case(key: OpenKey) -> Tx {
-    open_tx(open_funding(key), open_terms(key), MAKER, TAKER)
+    super::open(
+        open_funding(key),
+        open_terms(key),
+        (
+            hellas_kernel::PartyKeys::sole(MAKER),
+            hellas_kernel::Authority::Owner,
+        ),
+        (
+            hellas_kernel::PartyKeys::sole(TAKER),
+            hellas_kernel::Authority::Owner,
+        ),
+    )
 }
 
 pub(crate) fn open_case_op(key: OpenKey) -> Tx {
@@ -168,7 +190,7 @@ pub(crate) fn output_ids(edge: EdgeKey) -> List<CoinId, MAX_EDGE_OUTPUTS> {
     Tx::close_output_ids(edge_id(edge), &payouts())
 }
 
-pub(crate) const fn edge_value(edge: Edge) -> u64 {
+pub(crate) const fn edge_value(edge: &Edge) -> u64 {
     edge.value()
 }
 
@@ -231,10 +253,10 @@ fn proof_for(edge: EdgeKey, proof: ProofKey, outputs: &List<Payout, MAX_EDGE_OUT
     let terms = terms();
     match proof {
         ProofKey::Mutual => placeholder_mutual(edge_id(edge), terms.hash(), outputs, MAKER, TAKER),
-        ProofKey::Timeout | ProofKey::EarlyTimeout => Proof::timeout(terms),
+        ProofKey::Timeout | ProofKey::EarlyTimeout => Proof::timeout(terms, None),
         // Submitting a Timeout proof whose terms don't match the edge's terms
         // commitment triggers `TermsMismatch` in the verifier.
-        ProofKey::WrongTerms => Proof::timeout(other_terms()),
+        ProofKey::WrongTerms => Proof::timeout(other_terms(), None),
     }
 }
 

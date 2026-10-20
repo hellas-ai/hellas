@@ -1,7 +1,7 @@
 use super::{connection_headers, hop_header};
 use axum::{body::Bytes, http::HeaderMap};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use hellas_rpc::http_fetch::{HttpFetchRequest, HttpTls, HttpTrustRoots};
+use hellas_rpc::http_fetch::{HttpFetchRequest, HttpTls, HttpTrustRoots, credential_header};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 
@@ -116,7 +116,7 @@ fn validate_routes(routes: &[HttpRoute]) -> crate::GatewayResult<()> {
         if !(route
             .headers
             .iter()
-            .all(|(name, _)| !matches!(name.as_str(), "authorization" | "x-api-key" | "cookie")))
+            .all(|(name, _)| !credential_header(name)))
         {
             return Err(crate::GatewayConfigError::CredentialAlias.into());
         }
@@ -161,17 +161,8 @@ impl HttpRoute {
             let name = name.as_str();
             if !hop_header(name)
                 && !connection.iter().any(|token| token == name)
-                && !matches!(
-                    name,
-                    "host"
-                        | "content-length"
-                        | "authorization"
-                        | "x-api-key"
-                        | "api-key"
-                        | "x-goog-api-key"
-                        | "cookie"
-                        | "forwarded"
-                )
+                && !credential_header(name)
+                && !matches!(name, "host" | "content-length" | "forwarded")
                 && !name.starts_with("x-hellas-")
                 && !name.starts_with("x-forwarded-")
                 && !self

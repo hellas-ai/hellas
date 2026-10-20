@@ -1,11 +1,11 @@
 use serde::{Deserialize, Serialize};
 
-use crate::signature::verify_digest_signature;
 #[cfg(test)]
 use crate::{Assurance, Operation, scheme_id};
-use crate::{
-    DagCborEncoder, Digest, ProducerId, ProducerSigningKey, PublicKey, SchemeId, Signature,
-    SignatureError, hash_tuple, tags,
+use crate::{DagCborEncoder, SchemeId, tags};
+use hellas_auth::signature::verify_digest_signature;
+use hellas_auth::{
+    Digest, ProducerId, ProducerSigningKey, PublicKey, Signature, SignatureError, hash_tuple,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

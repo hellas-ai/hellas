@@ -33,8 +33,8 @@
 mod support;
 
 use hellas_kernel::{
-    Auth, BlockHeight, CloseKind, Fees, Funding, Genesis, Parties, Proof, ProtocolCode,
-    Secp256k1Verifier, SoftPasskey, Terms, Tx,
+    Auth, BlockHeight, CloseKind, Fees, Funding, Genesis, Parties, PartyAuth, PartyKeys, Proof,
+    ProtocolCode, Secp256k1Verifier, SoftPasskey, Terms, Tx,
 };
 use support::{
     apply_one, coin_id, context, context_fee, empty_party, genesis, lifetime_fee, party_one,
@@ -58,7 +58,7 @@ fn main() {
     let timeout = BlockHeight::new(5);
     let terms = Terms::basic(
         PROTOCOL,
-        Parties::new(maker_key, taker_key),
+        Parties::new(PartyKeys::sole(maker_key), PartyKeys::sole(taker_key)),
         timeout,
         payouts2(maker_key, 31, taker_key, 16),
     );
@@ -72,8 +72,8 @@ fn main() {
     let open = Tx::open(
         funding,
         terms.clone(),
-        Auth::native(secp_sign(&maker_secret, open_hash)),
-        Auth::webauthn(taker_assertion),
+        PartyAuth::owner(Auth::native(secp_sign(&maker_secret, open_hash))),
+        PartyAuth::owner(Auth::webauthn(taker_assertion)),
     );
     let open_fee = context_fee(open_context, open.cost());
     let lifetime_fee = lifetime_fee(open_context, timeout);
@@ -116,8 +116,8 @@ fn main() {
     let close = Tx::close(
         edge_id,
         Proof::mutual(
-            Auth::native(secp_sign(&maker_secret, close_hash)),
-            Auth::webauthn(taker_close_assertion),
+            PartyAuth::owner(Auth::native(secp_sign(&maker_secret, close_hash))),
+            PartyAuth::owner(Auth::webauthn(taker_close_assertion)),
         ),
         mutual_outputs,
     );

@@ -96,16 +96,48 @@ pub mod chain {
     pub use crate::pb::hellas::chain::v1::*;
 }
 
-/// Re-exports of the local-only `hellas.host.v1` package.
+/// Re-exports of authenticated local and remote `hellas.host.v1` administration.
 #[cfg(feature = "host-control")]
 pub mod host {
     pub use crate::pb::hellas::host::v1::*;
 }
 
-/// Re-exports of `hellas.work.v1`.
+#[cfg(feature = "work")]
+mod work_refusal;
+
+/// Work messages and routing selectors.
 #[cfg(feature = "work")]
 pub mod work {
+    pub use super::work_refusal::Refusable;
     pub use crate::pb::hellas::work::v1::*;
+
+    impl WorkRoute {
+        /// Selects a grant channel; authority still requires its pinned principal.
+        pub fn grant(channel: hellas_auth::Digest) -> Self {
+            Self {
+                funding_kind: FundingKind::Grant as i32,
+                channel_id: channel.as_bytes().to_vec(),
+            }
+        }
+
+        pub fn selects_grant(&self, channel: hellas_auth::Digest) -> bool {
+            self.funding_kind == FundingKind::Grant as i32 && self.channel_id == channel.as_bytes()
+        }
+
+        /// Selects a payment-funded channel without granting authority to use it.
+        pub fn payment(channel_id: hellas_auth::Digest) -> Self {
+            Self {
+                funding_kind: FundingKind::Payment as i32,
+                channel_id: channel_id.as_bytes().to_vec(),
+            }
+        }
+
+        /// Checks the routing selector before any journal lookup or release.
+        pub fn selects_payment(&self, channel_id: hellas_auth::Digest) -> bool {
+            self.funding_kind == FundingKind::Payment as i32
+                && self.channel_id == channel_id.as_bytes()
+        }
+    }
 }
 
 /// Service / method markers, typed client traits, and server dispatchers.
@@ -114,6 +146,17 @@ pub mod work {
 #[allow(unused_imports, dead_code, clippy::all)]
 pub mod services {
     include!(concat!(env!("OUT_DIR"), "/hellas_rpc_services.rs"));
+}
+
+#[cfg(feature = "host-control")]
+impl core::fmt::Debug for host::UpstreamKey {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("UpstreamKey")
+            .field("service", &self.service)
+            .field("method", &self.method)
+            .field("key", &self.key)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Pinned wire IDs, end-to-end: proto file → descriptor walk → canonical
@@ -132,12 +175,12 @@ mod id_pins {
         use super::services::work::{
             AcceptWork, AdmitCertificate, DeliverResult, GetStanding, Open, StreamResult, Work,
         };
-        // Standing, typed grant refusals and recovered terminal metadata rotate
-        // Work deliberately. The shared carrier rotates WorkSetup; Open stays fixed.
-        assert_eq!(<Work as ServiceMarker>::SERVICE_ID, 0x51bc406a);
+        // Session-bound standing removes its redundant request signature,
+        // deliberately rotating GetStanding and Work. Open stays fixed.
+        assert_eq!(<Work as ServiceMarker>::SERVICE_ID, 0x584721e6);
         assert_eq!(<Open as MethodMarker>::METHOD_ID, 0x93cb0b39);
         assert_eq!(<AcceptWork as MethodMarker>::METHOD_ID, 0x5188734e);
-        assert_eq!(<GetStanding as MethodMarker>::METHOD_ID, 0x2d80e5f9);
+        assert_eq!(<GetStanding as MethodMarker>::METHOD_ID, 0x64b53882);
         assert_eq!(<DeliverResult as MethodMarker>::METHOD_ID, 0x74bb099b);
         assert_eq!(<StreamResult as MethodMarker>::METHOD_ID, 0xb2043ac5);
         assert_eq!(<AdmitCertificate as MethodMarker>::METHOD_ID, 0x07db8b8e);
@@ -161,10 +204,22 @@ mod id_pins {
 
     #[cfg(feature = "host-control")]
     #[test]
-    fn local_grant_control_ids_are_stable() {
-        use super::services::host_control::{GrantControl, HostControl};
-        assert_eq!(<HostControl as ServiceMarker>::SERVICE_ID, 0x570c_0c0d);
+    fn host_control_ids_are_stable() {
+        use super::services::host_control::{
+            BindProvider, ConfigureProvider, GetGatewayAccess, GrantControl, HostControl,
+            IssueCredential, RevokeCredential, SetGatewayState, SetProviderState, WorkControl,
+        };
+        // Typed provider configuration changes the HostControl service descriptor.
+        assert_eq!(<HostControl as ServiceMarker>::SERVICE_ID, 0x5169_5ede);
+        assert_eq!(<ConfigureProvider as MethodMarker>::METHOD_ID, 0x689e_9aaa);
+        assert_eq!(<SetProviderState as MethodMarker>::METHOD_ID, 0xd9b2_bce2);
+        assert_eq!(<SetGatewayState as MethodMarker>::METHOD_ID, 0x6c32_7cb7);
+        assert_eq!(<GetGatewayAccess as MethodMarker>::METHOD_ID, 0xce7f_5d32);
         assert_eq!(<GrantControl as MethodMarker>::METHOD_ID, 0xc0e0_b21c);
+        assert_eq!(<WorkControl as MethodMarker>::METHOD_ID, 0x995d_0334);
+        assert_eq!(<IssueCredential as MethodMarker>::METHOD_ID, 0xf445_91c2);
+        assert_eq!(<RevokeCredential as MethodMarker>::METHOD_ID, 0xe7b1_8b70);
+        assert_eq!(<BindProvider as MethodMarker>::METHOD_ID, 0xcb33_75a9);
     }
 
     #[cfg(feature = "chain")]
@@ -192,7 +247,7 @@ mod id_pins {
     #[test]
     fn chain_ids_are_stable() {
         use super::services::light_client::{GetStateRoot, LightClient, SubmitWorkResponse};
-        assert_eq!(<LightClient as ServiceMarker>::SERVICE_ID, 0x29ad8d1a);
+        assert_eq!(<LightClient as ServiceMarker>::SERVICE_ID, 0x8f06b6cc);
         assert_eq!(<GetStateRoot as MethodMarker>::METHOD_ID, 0xb484a429);
         assert_eq!(<SubmitWorkResponse as MethodMarker>::METHOD_ID, 0x78ea_f3a0);
     }

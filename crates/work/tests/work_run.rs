@@ -8,78 +8,43 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use support::temp;
 
-use hellas_kernel::{
-    BlockHeight, Decode as _, Edge, EdgeId, EdgeValues, Fees, Key, LeaseSlots, List,
-    MAX_EDGE_OUTPUTS, Parties, Payout, PendingSlot, Secp256k1Verifier, SigVerifier as _, Terms,
-    TermsHash, WorkPaymentSettlement, WorkPaymentTerms, WorkStakeBondTerms,
-    work_payment_settlement,
-};
+use hellas_auth::Digest;
+use hellas_auth::{ProducerSigningKey, PublicKey};
+use hellas_kernel::{PendingSlot, Secp256k1Verifier, SigVerifier as _};
 use hellas_rpc::evaluate::{
     EvaluateOutputTranscriptBuilder, EvaluateStopReason, EvaluateTerminal, EvaluateUsage,
     input_commitment,
 };
-use hellas_rpc::protocol::Digest;
-use hellas_rpc::protocol::artifacts::{
-    BoundTermId, Canonical as _, InputAddressed as _, OutputAddressed as _, PreparedPaidInputV1,
-    SourceRef, TextArtifact, TextExecution, TextPolicy, TokenIds,
+use hellas_rpc::{Assurance, EvaluateRequest, OutputEventEnvelope};
+use hellas_work::model::setup::{
+    ObservedChannel, ReadyChannel, WorkChannelDescriptor, WorkSetupError,
 };
-use hellas_rpc::protocol::work::{
-    EvaluatePolicyV2, JobDeadlines, PaidChannelPolicyV1, PaidJobAuthorizationV2, PaidWorkError,
-    canonical_output_digest, generation_policy_digest, identity_source_digest,
-    private_policy_commitment, propose_authorization, result_digest, signing_hash, terminal_result,
-    work_id,
+use hellas_work::model::work::{
+    EvaluatePolicyV2, PaidJobAuthorizationV2, PaidWorkError, canonical_output_digest,
+    propose_authorization, result_digest, signing_hash, terminal_result, work_id,
 };
-use hellas_rpc::protocol::work_setup::{
-    ObservedChannel, ReadyChannel, WorkChannelConfig, WorkChannelDescriptor, WorkSetupError,
-    payment_terms_hash,
-};
-use hellas_rpc::{
-    Application, Assurance, CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR, ContentId, EvaluateRequest,
-    OutputEventEnvelope, ProducerSigningKey, ProgramManifest, PublicKey,
+use hellas_work::test_support::paid::{
+    CURSOR, PRICE, PROMPT_TOKENS, advance, bond_edge, bond_object, bundle, bundle_bytes, client,
+    commit, deadlines, descriptor, descriptor_with, evaluate_request, lease_over, manifest,
+    network, origin, payment_edge, payment_object, payment_policy, provider, provider_producer,
+    settlement, work_policy,
 };
 use hellas_work::work::{
     BackendFault, PreparedEvaluateInput, ProviderEndpoint, RunAdmission, RunError, RunOutcome,
     WorkBackend, WorkService, run_accepted_work,
 };
 use hellas_work::work_store::{
-    ChannelRecord, ChannelStateError, ChannelStore, JobPhase, JobState, Role, SetupOrigin,
-    TerminalOutcome, WorkStoreError,
+    ChannelRecord, ChannelStateError, ChannelStore, JobPhase, JobState, Role, TerminalOutcome,
+    WorkStoreError,
 };
 
 #[path = "work_run/fetch.rs"]
 mod fetch;
 mod support;
-use support::{advance, bond_edge, client, network, payload_at, payment_edge, provider, temp};
 
 // ── Fixture ───────────────────────────────────────────────────────────
-
-const HORIZON: u64 = 500;
-const PRICE: u64 = 10;
-const CREDIT_LIMIT: u64 = 40;
-/// One over half the funding, so the bond exceeds the capacity it
-/// leaves behind at zero fees.
-const OMISSION_BOND: u64 = 601;
-const PAYMENT_VALUE: u64 = 1_000;
-const PAYMENT_RESERVE: u64 = 200;
-const STAKE: u64 = 64;
-const SALT: [u8; 32] = [0x5a; 32];
-/// The finalized block a job is accepted at.
-const CURSOR: u64 = 10;
-/// The prompt this fixture's bundle carries, in tokens.
-const PROMPT_TOKENS: u64 = 4;
-
-/// The three heights every job here is bound by.
-///
-/// `dispatch_margin_blocks + delivery_margin_blocks` is 6, so the last
-/// finalized height a dispatch may be marked at is `terminal - 6`.
-const fn deadlines() -> JobDeadlines {
-    JobDeadlines {
-        acceptance: 50,
-        terminal: 100,
-        payment: 200,
-    }
-}
 
 /// The last height at which the signed margins still fit before the
 /// terminal deadline.
@@ -92,96 +57,12 @@ fn producer(byte: u8) -> ProducerSigningKey {
     key
 }
 
-/// The provider's RPC producer identity: the same scalar its channel
-/// party key is.
-fn provider_producer() -> ProducerSigningKey {
-    producer(0x22)
-}
-
-fn channel_policy() -> PaidChannelPolicyV1 {
-    PaidChannelPolicyV1 {
-        compute_credit_limit: CREDIT_LIMIT,
-        delivery_credit_limit: CREDIT_LIMIT,
-    }
-}
-
-fn bond_terms() -> WorkStakeBondTerms {
-    WorkStakeBondTerms {
-        parties: Parties::new(provider().party_key(), client().party_key()),
-        timeout: BlockHeight::new(HORIZON),
-        timeout_outputs: List::take(
-            [Payout::new(provider().party_key(), STAKE); MAX_EDGE_OUTPUTS],
-            1,
-        ),
-        max_job_price: 40,
-    }
-}
-
-fn payment_terms() -> WorkPaymentTerms {
-    WorkPaymentTerms {
-        bond_edge: bond_edge(),
-        bond_terms: bond_terms(),
-        private_policy_commitment: private_policy_commitment(network(), &SALT, &channel_policy()),
-        omit_response_blocks: hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
-        start_validity_blocks: 8,
-        omission_bond: OMISSION_BOND,
-    }
-}
-
-fn work_policy() -> EvaluatePolicyV2 {
-    EvaluatePolicyV2 {
-        allowed_environment: manifest().content_id(),
-        generation_policy_digest: match generation_policy_digest(&text_policy().canonical_bytes()) {
-            Ok(digest) => digest,
-            Err(error) => panic!("the fixture policy hashes: {error}"),
-        },
-        identity_source_digest: match identity_source_digest(&identity_artifact().canonical_bytes())
-        {
-            Ok(digest) => digest,
-            Err(error) => panic!("the fixture identity hashes: {error}"),
-        },
-        max_prompt_tokens: 512,
-        max_new_tokens: 128,
-        max_stop_token_ids: 4,
-        max_spool_bytes: 1_048_576,
-        max_encoded_result_frame: 262_144,
-        max_encoded_prepared_input: 1_048_576,
-    }
-}
-
 /// A second policy, differing from the first in one resource limit.
 fn other_work_policy() -> EvaluatePolicyV2 {
     EvaluatePolicyV2 {
         max_prompt_tokens: work_policy().max_prompt_tokens + 1,
         ..work_policy()
     }
-}
-
-fn payment_values() -> EdgeValues {
-    EdgeValues::new(PAYMENT_VALUE, PAYMENT_RESERVE, Fees::new(0, 0, 0, 0))
-}
-
-fn descriptor_with(
-    policy: impl Into<hellas_rpc::protocol::work_profile::WorkPolicy>,
-) -> WorkChannelDescriptor {
-    let config = WorkChannelConfig {
-        payment_policy: payment_policy(),
-        network: network(),
-        payment_edge: payment_edge(),
-        payment_terms: payment_terms(),
-        policy_salt: SALT,
-        channel_policy: channel_policy(),
-        work_policy: policy.into(),
-        expected_payment_values: payment_values(),
-    };
-    match WorkChannelDescriptor::open(config) {
-        Ok(descriptor) => descriptor,
-        Err(error) => panic!("the fixture channel opens: {error}"),
-    }
-}
-
-fn descriptor() -> WorkChannelDescriptor {
-    descriptor_with(work_policy())
 }
 
 /// One readiness decision, taken at `height` against a healthy channel.
@@ -209,14 +90,7 @@ fn ready() -> ReadyChannel {
     ready_at(CURSOR)
 }
 
-fn settlement() -> WorkPaymentSettlement {
-    let Some(settlement) = work_payment_settlement(payment_values(), OMISSION_BOND) else {
-        panic!("a funded edge prices both exits");
-    };
-    settlement
-}
-
-fn store_at(root: &std::path::Path, height: u64) -> ChannelStore {
+async fn store_at(root: &std::path::Path, height: u64) -> ChannelStore {
     let mut store = match ChannelStore::open(
         root,
         ready().channel().clone(),
@@ -224,33 +98,14 @@ fn store_at(root: &std::path::Path, height: u64) -> ChannelStore {
         Role::Provider,
         origin(),
         &Secp256k1Verifier::new(),
-    ) {
+    )
+    .await
+    {
         Ok(store) => store,
         Err(error) => panic!("the fixture store opens: {error}"),
     };
-    advance(&mut store, height);
+    advance(&mut store, height).await;
     store
-}
-
-/// The fixture channel starts at the synthetic chain genesis.
-fn origin() -> SetupOrigin {
-    SetupOrigin {
-        payment_edge: payment_edge(),
-        height: 0,
-        payload: payload_at(0),
-        parent: [0_u8; 32],
-    }
-}
-
-/// Runs the production watcher over one empty finalized block per
-/// height, up through `height`.
-///
-/// The same call the settlement loop makes, so a fixture cursor is a
-/// cursor this endpoint could have reached.
-fn commit(store: &mut ChannelStore, record: ChannelRecord) {
-    if let Err(error) = store.commit(record, &Secp256k1Verifier::new()) {
-        panic!("the fixture record commits: {error}");
-    }
 }
 
 fn endpoint(store: ChannelStore) -> ProviderEndpoint {
@@ -265,64 +120,6 @@ fn serving(store: ChannelStore) -> WorkService {
 }
 
 // ── The prepared inputs a job executes from ───────────────────────────
-
-fn manifest() -> ProgramManifest {
-    ProgramManifest::new(
-        Application::new(CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR).unwrap(),
-        ContentId::from_bytes([0x16; 32]),
-    )
-}
-
-fn prompt_tokens() -> TokenIds {
-    TokenIds::from([9, 8, 7, 6])
-}
-
-fn text_policy() -> TextPolicy {
-    TextPolicy::from_u32_stop_tokens(64, [2, 1])
-}
-
-fn identity_artifact() -> TextArtifact {
-    TextArtifact::identity(BoundTermId::from_digest(manifest().content_id().digest()))
-}
-
-fn text_execution() -> TextExecution {
-    TextExecution::new(
-        SourceRef::output(identity_artifact().output_id()),
-        prompt_tokens().output_id(),
-        text_policy().output_id(),
-    )
-}
-
-/// One job's request. The nonce byte makes two proposals two different
-/// bundles, and therefore two different jobs.
-fn evaluate_request(nonce: u8) -> EvaluateRequest {
-    EvaluateRequest {
-        text_execution: text_execution().input_id().digest(),
-        runner_public_key: PublicKey::Secp256k1(client().party_key().to_bytes()),
-        execution_environment: manifest().content_id(),
-        nonce: [nonce; 32],
-        assurance: Assurance::ProducerSigned,
-        retain: true,
-    }
-}
-
-fn bundle(nonce: u8) -> PreparedPaidInputV1 {
-    PreparedPaidInputV1::new(
-        &evaluate_request(nonce),
-        &manifest(),
-        &text_execution(),
-        &prompt_tokens(),
-        &text_policy(),
-        &identity_artifact(),
-    )
-}
-
-fn bundle_bytes(nonce: u8) -> Vec<u8> {
-    match bundle(nonce).encode() {
-        Ok(bytes) => bytes,
-        Err(error) => panic!("the fixture bundle encodes: {error}"),
-    }
-}
 
 fn authorization(nonce: u8) -> PaidJobAuthorizationV2 {
     match propose_authorization(
@@ -343,7 +140,7 @@ fn authorization(nonce: u8) -> PaidJobAuthorizationV2 {
 /// The two records the acceptance exchange writes, written directly:
 /// these tests are about what happens *after* both signatures exist, and
 /// the exchange that produces them has its own file.
-fn accept(store: &mut ChannelStore, nonce: u8) -> Digest {
+async fn accept(store: &mut ChannelStore, nonce: u8) -> Digest {
     let authorization = authorization(nonce);
     let id = work_id(ready().channel(), &authorization);
     commit(
@@ -353,14 +150,16 @@ fn accept(store: &mut ChannelStore, nonce: u8) -> Digest {
             client_signature: client().sign(signing_hash(id)),
             prepared_input: bundle_bytes(nonce),
         },
-    );
+    )
+    .await;
     commit(
         store,
         ChannelRecord::JobAccepted {
             work_id: id,
             provider_signature: provider().sign(signing_hash(id)),
         },
-    );
+    )
+    .await;
     id
 }
 
@@ -492,8 +291,11 @@ impl WorkBackend for CountingBackend {
 
 // ── Reading answers ───────────────────────────────────────────────────
 
-fn phase_of(service: &WorkService) -> Option<JobPhase> {
-    match service.with_state(|state| state.jobs().next().map(JobState::phase)) {
+async fn phase_of(service: &WorkService) -> Option<JobPhase> {
+    match service
+        .with_state(|state| state.jobs().next().map(JobState::phase))
+        .await
+    {
         Ok(phase) => phase,
         Err(error) => panic!("the endpoint is reachable: {error}"),
     }
@@ -692,8 +494,8 @@ async fn one_accepted_job_reaches_the_backend_once() {
     let dir = temp();
     let backend = CountingBackend::new(Answer::Transcript);
     let id = {
-        let mut store = store_at(dir.path(), CURSOR);
-        let id = accept(&mut store, 1);
+        let mut store = store_at(dir.path(), CURSOR).await;
+        let id = accept(&mut store, 1).await;
         let service = serving(store);
 
         let outcome = run_accepted_work(&service, &ready(), &backend, id).await;
@@ -715,7 +517,7 @@ async fn one_accepted_job_reaches_the_backend_once() {
     };
 
     // The restart: a new process, a new endpoint, the same files.
-    let service = serving(store_at(dir.path(), CURSOR));
+    let service = serving(store_at(dir.path(), CURSOR).await);
     let recovered = expect_outcome(run_accepted_work(&service, &ready(), &backend, id).await);
     assert!(
         matches!(recovered, RunOutcome::Ready { .. }),
@@ -733,8 +535,8 @@ async fn one_accepted_job_reaches_the_backend_once() {
 async fn a_result_is_on_the_disk_before_its_signature_is_returned() {
     let dir = temp();
     let backend = CountingBackend::new(Answer::Transcript);
-    let mut store = store_at(dir.path(), CURSOR);
-    let id = accept(&mut store, 1);
+    let mut store = store_at(dir.path(), CURSOR).await;
+    let id = accept(&mut store, 1).await;
     let service = serving(store);
 
     let RunOutcome::Completed {
@@ -745,7 +547,7 @@ async fn a_result_is_on_the_disk_before_its_signature_is_returned() {
     };
     drop(service);
 
-    let recovered = store_at(dir.path(), CURSOR);
+    let recovered = store_at(dir.path(), CURSOR).await;
     let Some(job) = recovered.state().jobs().next() else {
         panic!("the job is still open");
     };
@@ -774,26 +576,26 @@ async fn a_marker_a_process_did_not_come_back_from_is_indeterminate() {
     let dir = temp();
     let backend = CountingBackend::new(Answer::Transcript);
     let id = {
-        let mut store = store_at(dir.path(), CURSOR);
-        let id = accept(&mut store, 1);
+        let mut store = store_at(dir.path(), CURSOR).await;
+        let id = accept(&mut store, 1).await;
         // Exactly the state `begin_run` leaves before it returns.
-        commit(&mut store, ChannelRecord::JobRunning { work_id: id });
+        commit(&mut store, ChannelRecord::JobRunning { work_id: id }).await;
         id
     };
 
-    let service = serving(store_at(dir.path(), CURSOR));
+    let service = serving(store_at(dir.path(), CURSOR).await);
     let outcome = expect_outcome(run_accepted_work(&service, &ready(), &backend, id).await);
     assert_eq!(outcome, RunOutcome::Indeterminate);
     assert_eq!(backend.calls(), 0, "recovery never invokes");
     assert_eq!(
-        phase_of(&service),
+        phase_of(&service).await,
         Some(JobPhase::Running),
         "and never ends"
     );
 
     // Nor may a result be recorded for it, however well formed.
     let transcript = answer_transcript(&evaluate_request(1));
-    let refused = service.record_result(id, &transcript);
+    let refused = service.record_result(id, &transcript).await;
     assert!(
         matches!(
             refused,
@@ -807,26 +609,27 @@ async fn a_marker_a_process_did_not_come_back_from_is_indeterminate() {
     // The control: the same transcript on a journal whose marker this
     // process wrote is recorded.
     let other = temp();
-    let mut store = store_at(other.path(), CURSOR);
-    let id = accept(&mut store, 1);
+    let mut store = store_at(other.path(), CURSOR).await;
+    let id = accept(&mut store, 1).await;
     let service = serving(store);
-    let RunAdmission::Invoke(_) = expect_admission(service.begin_run(id, &ready())) else {
+    let RunAdmission::Invoke(_) = expect_admission(service.begin_run(id, &ready()).await) else {
         panic!("an accepted job may run");
     };
-    if let Err(error) = service.record_result(id, &transcript) {
+    if let Err(error) = service.record_result(id, &transcript).await {
         panic!("this process's own invocation records: {error}");
     }
 }
 
 /// A second call while the first is running invokes nothing.
-#[test]
-fn a_job_this_process_is_running_is_not_started_again() {
+#[tokio::test]
+async fn a_job_this_process_is_running_is_not_started_again() {
     let dir = temp();
-    let mut store = store_at(dir.path(), CURSOR);
-    let id = accept(&mut store, 1);
+    let mut store = store_at(dir.path(), CURSOR).await;
+    let id = accept(&mut store, 1).await;
     let mut endpoint = endpoint(store);
 
-    let RunAdmission::Invoke(input) = expect_admission(endpoint.begin_run(id, &ready())) else {
+    let RunAdmission::Invoke(input) = expect_admission(endpoint.begin_run(id, &ready()).await)
+    else {
         panic!("the first call may invoke");
     };
     // Both bodies come out of the journal, not out of a quote: these are
@@ -836,7 +639,7 @@ fn a_job_this_process_is_running_is_not_started_again() {
 
     assert!(
         matches!(
-            expect_admission(endpoint.begin_run(id, &ready())),
+            expect_admission(endpoint.begin_run(id, &ready()).await),
             RunAdmission::Running
         ),
         "the second call finds the marker the first wrote"
@@ -853,11 +656,11 @@ fn a_job_this_process_is_running_is_not_started_again() {
 async fn a_restart_runs_the_job_that_was_accepted() {
     let dir = temp();
     let id = {
-        let mut store = store_at(dir.path(), CURSOR);
-        accept(&mut store, 1)
+        let mut store = store_at(dir.path(), CURSOR).await;
+        accept(&mut store, 1).await
     };
 
-    let service = serving(store_at(dir.path(), CURSOR));
+    let service = serving(store_at(dir.path(), CURSOR).await);
     let backend = CountingBackend::new(Answer::Transcript);
     let RunOutcome::Completed { result, .. } =
         expect_outcome(run_accepted_work(&service, &ready(), &backend, id).await)
@@ -883,9 +686,9 @@ async fn the_last_height_the_margins_fit_is_the_last_that_may_run() {
         // Acceptance happened at the earlier phase boundary. Only after
         // that durable signature exists does the watcher catch the journal
         // up to the dispatch boundary under test.
-        let mut store = store_at(dir.path(), CURSOR);
-        let id = accept(&mut store, 1);
-        advance(&mut store, height);
+        let mut store = store_at(dir.path(), CURSOR).await;
+        let id = accept(&mut store, 1).await;
+        advance(&mut store, height).await;
         let service = serving(store);
         let backend = CountingBackend::new(Answer::Transcript);
         let outcome = run_accepted_work(&service, &ready_at(height), &backend, id).await;
@@ -905,7 +708,7 @@ async fn the_last_height_the_margins_fit_is_the_last_that_may_run() {
         assert_eq!(terminal, deadlines().terminal);
         assert_eq!(backend.calls(), 0, "nothing was invoked");
         assert_eq!(
-            phase_of(&service),
+            phase_of(&service).await,
             Some(JobPhase::Accepted),
             "and nothing was marked",
         );
@@ -916,7 +719,7 @@ async fn the_last_height_the_margins_fit_is_the_last_that_may_run() {
 #[tokio::test]
 async fn a_job_that_was_never_co_signed_does_not_run() {
     let dir = temp();
-    let mut store = store_at(dir.path(), CURSOR);
+    let mut store = store_at(dir.path(), CURSOR).await;
     let authorization = authorization(1);
     let id = work_id(ready().channel(), &authorization);
     commit(
@@ -926,7 +729,8 @@ async fn a_job_that_was_never_co_signed_does_not_run() {
             client_signature: client().sign(signing_hash(id)),
             prepared_input: bundle_bytes(1),
         },
-    );
+    )
+    .await;
     let service = serving(store);
     let backend = CountingBackend::new(Answer::Transcript);
 
@@ -944,14 +748,15 @@ async fn a_job_that_was_never_co_signed_does_not_run() {
 
     // The control: the co-signature is the only thing missing.
     drop(service);
-    let mut store = store_at(dir.path(), CURSOR);
+    let mut store = store_at(dir.path(), CURSOR).await;
     commit(
         &mut store,
         ChannelRecord::JobAccepted {
             work_id: id,
             provider_signature: provider().sign(signing_hash(id)),
         },
-    );
+    )
+    .await;
     let service = serving(store);
     assert!(
         matches!(
@@ -966,8 +771,8 @@ async fn a_job_that_was_never_co_signed_does_not_run() {
 #[tokio::test]
 async fn a_run_named_for_another_job_finds_nothing() {
     let dir = temp();
-    let mut store = store_at(dir.path(), CURSOR);
-    let id = accept(&mut store, 1);
+    let mut store = store_at(dir.path(), CURSOR).await;
+    let id = accept(&mut store, 1).await;
     let service = serving(store);
     let backend = CountingBackend::new(Answer::Transcript);
 
@@ -983,17 +788,17 @@ async fn a_run_named_for_another_job_finds_nothing() {
 
 /// A readiness that is not this endpoint's own does not admit a
 /// dispatch.
-#[test]
-fn a_dispatch_is_decided_against_this_endpoints_own_channel() {
+#[tokio::test]
+async fn a_dispatch_is_decided_against_this_endpoints_own_channel() {
     let dir = temp();
-    let mut store = store_at(dir.path(), CURSOR);
-    let id = accept(&mut store, 1);
+    let mut store = store_at(dir.path(), CURSOR).await;
+    let id = accept(&mut store, 1).await;
     let mut endpoint = endpoint(store);
 
     // MUTATION: a readiness decided under another execution policy —
     // other measured margins, and therefore another dispatch gate.
     let other = ready_of(descriptor_with(other_work_policy()), CURSOR);
-    let refused = endpoint.begin_run(id, &other);
+    let refused = endpoint.begin_run(id, &other).await;
     assert!(
         matches!(refused, Err(RunError::Policy)),
         "unexpected answer: {refused:?}",
@@ -1002,7 +807,7 @@ fn a_dispatch_is_decided_against_this_endpoints_own_channel() {
     // The control: the endpoint's own readiness admits it.
     assert!(
         matches!(
-            expect_admission(endpoint.begin_run(id, &ready())),
+            expect_admission(endpoint.begin_run(id, &ready()).await),
             RunAdmission::Invoke(_)
         ),
         "this endpoint's own readiness admits the dispatch",
@@ -1015,8 +820,8 @@ fn a_dispatch_is_decided_against_this_endpoints_own_channel() {
 #[tokio::test]
 async fn a_backend_fault_is_not_the_clients_debt() {
     let dir = temp();
-    let mut store = store_at(dir.path(), CURSOR);
-    let id = accept(&mut store, 1);
+    let mut store = store_at(dir.path(), CURSOR).await;
+    let id = accept(&mut store, 1).await;
     let service = serving(store);
     let backend = CountingBackend::new(Answer::Fault("the weights did not load"));
 
@@ -1037,6 +842,7 @@ async fn a_backend_fault_is_not_the_clients_debt() {
                 ),
             )
         })
+        .await
         .expect("the endpoint is reachable");
     assert!(!open_job, "the job was ended");
     assert!(
@@ -1050,8 +856,8 @@ async fn a_backend_fault_is_not_the_clients_debt() {
 async fn a_backend_that_answers_the_wrong_question_signs_nothing() {
     for answer in [Answer::ForAnotherRequest(2), Answer::UnderAnotherKey(0x23)] {
         let dir = temp();
-        let mut store = store_at(dir.path(), CURSOR);
-        let id = accept(&mut store, 1);
+        let mut store = store_at(dir.path(), CURSOR).await;
+        let id = accept(&mut store, 1).await;
         let service = serving(store);
         let backend = CountingBackend::new(answer);
 
@@ -1065,13 +871,14 @@ async fn a_backend_that_answers_the_wrong_question_signs_nothing() {
         assert!(
             service
                 .with_state(|state| state.jobs().next().is_none())
+                .await
                 .expect("the endpoint is reachable"),
             "the job was ended",
         );
 
         // Nothing was signed: reopening finds no result on the disk.
         drop(service);
-        let recovered = store_at(dir.path(), CURSOR);
+        let recovered = store_at(dir.path(), CURSOR).await;
         assert!(recovered.state().jobs().next().is_none());
     }
 }
@@ -1093,91 +900,3 @@ fn expect_admission(admission: Result<RunAdmission, RunError>) -> RunAdmission {
 }
 
 // ── Canonical chain objects, spelled out ──────────────────────────────
-
-const FORMAT_VERSION: u8 = 1;
-const TAG_BLOCK_HEIGHT: u8 = 1;
-const TAG_FEES: u8 = 2;
-const TAG_PARTIES: u8 = 3;
-const TAG_EDGE: u8 = 5;
-const TAG_BOND_LEASE: u8 = 31;
-/// `Freeze | Adjudicated`: close-kind tags 3 and 4.
-const WORK_PAYMENT_CLOSES: u8 = 0b0001_1000;
-/// `Timeout` alone: close-kind tag 1.
-const WORK_STAKE_CLOSES: u8 = 0b0000_0010;
-
-struct EdgeBytes {
-    value: u64,
-    reserve: u64,
-    maker: Key,
-    taker: Key,
-    terms: TermsHash,
-    allowed: u8,
-}
-
-impl EdgeBytes {
-    fn build(&self) -> Edge {
-        let mut out = vec![FORMAT_VERSION, TAG_EDGE];
-        out.extend_from_slice(&self.value.to_be_bytes());
-        out.extend_from_slice(&self.reserve.to_be_bytes());
-        out.extend_from_slice(&[FORMAT_VERSION, TAG_FEES]);
-        for _ in 0..4 {
-            out.extend_from_slice(&0_u64.to_be_bytes());
-        }
-        out.extend_from_slice(&[FORMAT_VERSION, TAG_BLOCK_HEIGHT]);
-        out.extend_from_slice(&HORIZON.to_be_bytes());
-        out.extend_from_slice(&[FORMAT_VERSION, TAG_PARTIES]);
-        out.extend_from_slice(&self.maker.to_bytes());
-        out.extend_from_slice(&self.taker.to_bytes());
-        out.extend_from_slice(self.terms.as_bytes());
-        out.push(self.allowed);
-        match Edge::decode_exact(&out) {
-            Ok(edge) => edge,
-            Err(error) => panic!("the hand-written edge is canonical: {error:?}"),
-        }
-    }
-}
-
-fn lease_over(bond: EdgeId, payment: EdgeId) -> LeaseSlots {
-    support::lease_over(
-        bond,
-        payment,
-        payment_terms_hash(payment_terms()).as_bytes(),
-        &payment_terms().private_policy_commitment,
-        HORIZON,
-        FORMAT_VERSION,
-        TAG_BOND_LEASE,
-    )
-}
-
-fn bond_object() -> Edge {
-    EdgeBytes {
-        value: STAKE,
-        reserve: 0,
-        maker: provider().party_key(),
-        taker: client().party_key(),
-        terms: Terms::work_stake_bond(bond_terms()).hash(),
-        allowed: WORK_STAKE_CLOSES,
-    }
-    .build()
-}
-
-fn payment_object() -> Edge {
-    EdgeBytes {
-        value: PAYMENT_VALUE,
-        reserve: PAYMENT_RESERVE,
-        maker: client().party_key(),
-        taker: provider().party_key(),
-        terms: payment_terms_hash(payment_terms()),
-        allowed: WORK_PAYMENT_CLOSES,
-    }
-    .build()
-}
-
-fn payment_policy() -> hellas_rpc::protocol::work::JobPaymentPolicyV2 {
-    hellas_rpc::protocol::work::JobPaymentPolicyV2 {
-        fixed_price: PRICE,
-        dispatch_margin_blocks: 4,
-        delivery_margin_blocks: 2,
-        oracle_grace_blocks: 6,
-    }
-}

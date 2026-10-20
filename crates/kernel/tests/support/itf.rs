@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use itf::de::{As, Integer, Same};
 use serde::Deserialize;
 
-use hellas_kernel::{BlockHash, BlockHeight, Context, Parties, Proof, Terms, Tx};
+use hellas_kernel::{BlockHash, BlockHeight, Context, Parties, PartyKeys, Proof, Terms, Tx};
 
 use super::l1;
 
@@ -200,15 +200,21 @@ fn rejected_open_op(body: RejectedOpenBody) -> Tx {
     let taker_key = party_key(body.as_taker);
     let terms = Terms::basic(
         l1::PROTOCOL,
-        Parties::new(maker_key, taker_key),
+        Parties::new(PartyKeys::sole(maker_key), PartyKeys::sole(taker_key)),
         l1::TIMEOUT,
         l1::payouts_owned(maker_key, taker_key),
     );
-    super::open_tx(
+    super::open(
         l1::funding_for(edge_key(body.edge)),
         terms,
-        maker_key,
-        taker_key,
+        (
+            hellas_kernel::PartyKeys::sole(maker_key),
+            hellas_kernel::Authority::Owner,
+        ),
+        (
+            hellas_kernel::PartyKeys::sole(taker_key),
+            hellas_kernel::Authority::Owner,
+        ),
     )
 }
 
@@ -231,7 +237,7 @@ fn rejected_close_op(body: &CloseInputBody) -> Tx {
         ProofTag::Mutual => {
             super::placeholder_mutual(input, terms.hash(), &canonical, l1::MAKER, l1::TAKER)
         }
-        ProofTag::Timeout => Proof::timeout(terms),
+        ProofTag::Timeout => Proof::timeout(terms, None),
     };
     Tx::close(input, proof, outputs)
 }
@@ -251,7 +257,7 @@ pub(crate) fn close_op(body: &CloseInputBody) -> Tx {
         ProofTag::Mutual => {
             super::placeholder_mutual(input, terms.hash(), &outputs, l1::MAKER, l1::TAKER)
         }
-        ProofTag::Timeout => Proof::timeout(terms),
+        ProofTag::Timeout => Proof::timeout(terms, None),
     };
     Tx::close(input, proof, outputs)
 }

@@ -1,5 +1,5 @@
 use super::*;
-use crate::domain::{SettlementKey, addr_from_signing_key, secp256r1_key_from_seed};
+use crate::domain::SettlementKey;
 use hellas_kernel::Secp256k1Signer;
 
 fn secp256k1_key_from_scalar(scalar: u8) -> SettlementKey {
@@ -102,8 +102,7 @@ fn genesis_parser_rejects_bytes_valid_on_neither_curve() {
 
 #[test]
 fn genesis_parser_accepts_a_valid_p256_point() {
-    let address = addr_from_signing_key(&secp256r1_key_from_seed(7));
-    let key = SettlementKey::from(address);
+    let key = p256_key(7);
     assert_eq!(
         parse_genesis_settlement_key(&key.to_string()).expect("valid P-256 genesis owner"),
         key
@@ -123,7 +122,7 @@ fn genesis_parser_accepts_a_valid_secp256k1_point() {
 fn genesis_parser_accepts_secp256k1_scalar_3() {
     let key = secp256k1_key_from_scalar(3);
     assert!(
-        UserAddress::try_from(key).is_err(),
+        p256::PublicKey::from_sec1_bytes(key.as_bytes()).is_err(),
         "scalar 3 must remain the vector that a P-256-only parser rejects"
     );
     assert_eq!(
@@ -136,7 +135,7 @@ fn genesis_parser_accepts_secp256k1_scalar_3() {
 fn genesis_parser_accepts_secp256k1_scalar_4() {
     let key = secp256k1_key_from_scalar(4);
     assert!(
-        UserAddress::try_from(key).is_ok(),
+        p256::PublicKey::from_sec1_bytes(key.as_bytes()).is_ok(),
         "scalar 4 must remain the old accidental cross-curve pass"
     );
     assert_eq!(
@@ -147,8 +146,7 @@ fn genesis_parser_accepts_secp256k1_scalar_4() {
 
 #[test]
 fn genesis_committee_must_include_local_identity() {
-    let address = addr_from_signing_key(&secp256r1_key_from_seed(7));
-    let mut config = config_with_genesis(SettlementKey::from(address).to_string());
+    let mut config = config_with_genesis(p256_key(7).to_string());
     let other = ed25519::PrivateKey::from_seed(2);
     config.genesis.validators[0].public_key = hex::encode(other.public_key().encode());
 
@@ -160,8 +158,7 @@ fn genesis_committee_must_include_local_identity() {
 
 #[test]
 fn peer_topology_must_cover_exact_genesis_committee() {
-    let address = addr_from_signing_key(&secp256r1_key_from_seed(7));
-    let mut config = config_with_genesis(SettlementKey::from(address).to_string());
+    let mut config = config_with_genesis(p256_key(7).to_string());
     let other = ed25519::PrivateKey::from_seed(2);
     config.genesis.validators.push(GenesisValidator {
         public_key: hex::encode(other.public_key().encode()),
@@ -176,8 +173,7 @@ fn peer_topology_must_cover_exact_genesis_committee() {
 
 #[test]
 fn any_valid_genesis_network_id_is_accepted_and_carried() {
-    let address =
-        SettlementKey::from(addr_from_signing_key(&secp256r1_key_from_seed(7))).to_string();
+    let address = p256_key(7).to_string();
     for id in ["hellas-devnet-1", "another-network", "someone-elses-net"] {
         let mut config = config_with_genesis(address.clone());
         config.genesis.network_id = id.to_string();
@@ -189,4 +185,17 @@ fn any_valid_genesis_network_id_is_accepted_and_carried() {
             "the configured network must be the one the node signs under",
         );
     }
+}
+
+/// A valid compressed P-256 settlement key, derived from a scalar.
+fn p256_key(scalar: u8) -> SettlementKey {
+    let key = p256::ecdsa::SigningKey::from_slice(&[scalar; 32])
+        .expect("a repeated-byte scalar below the curve order");
+    let point = key.verifying_key().to_sec1_point(true);
+    SettlementKey::from_bytes(
+        point
+            .as_bytes()
+            .try_into()
+            .expect("a compressed P-256 point is 33 bytes"),
+    )
 }

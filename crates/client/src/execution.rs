@@ -64,7 +64,7 @@ pub fn genesis_text_execution_id(
     prompt: &[u32],
     max_tokens: u32,
     stop_tokens: &[u32],
-) -> hellas_rpc::Digest {
+) -> hellas_auth::Digest {
     use hellas_rpc::protocol::artifacts::{
         BoundTermId, InputAddressed, OutputAddressed, SourceRef, TextArtifact, TextExecution,
         TextPolicy, TokenIds,
@@ -92,7 +92,7 @@ type EvaluateStreamSource = (
 /// successful terminal and EOF; dropping a stream retains the source's own
 /// cancellation semantics.
 pub async fn prepare_evaluate_stream(
-    identity: hellas_rpc::Digest,
+    identity: hellas_auth::Digest,
     cache: Option<Arc<crate::cache::OutputCache>>,
     live: impl std::future::Future<Output = ExecutionResult<EvaluateStreamSource>>,
 ) -> ExecutionResult<PreparedExecution> {

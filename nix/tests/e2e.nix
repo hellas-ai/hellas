@@ -108,13 +108,32 @@ let
     HTTPServer(("127.0.0.1", 18080), Handler).serve_forever()
   '';
 
-  # The gateway's routes require this run's credential, which it draws at
-  # startup, keeps in memory, and hands out in exactly one other place:
-  # the environment of a command it wraps. So the caller that exercises
-  # them is a wrapped child. It waits for the upstream mock, writes what
-  # the gateway answered into the unit's state directory — the private
-  # /tmp of a DynamicUser unit is not the test's /tmp — and then stays up,
-  # so the unit and its port remain observable for the rest of the test.
+  # Public fixture policy only. The operator's software passkey bootstraps the
+  # HTTP authority offline in the test unit before its listener starts: the
+  # gateway's node holds the administrator credential, and the administrator's
+  # passkey session issues the separate gateway.invoke bearer it serves.
+  gatewayAuthority = builtins.fromJSON (builtins.readFile ./gateway-authority.json);
+  gatewayBootstrap = pkgs.writeShellScript "gateway-authority-fixture" ''
+    set -eu
+    umask 077
+    printf '%s' ${gatewayAuthority.passkey} > ./operator.passkey
+    ${package}/bin/hellas-cli --identity ./bootstrap.identity --software-root identity init
+    ${package}/bin/hellas-cli --identity ./bootstrap.identity identity show-holder > ./holder.json
+    ${package}/bin/hellas-cli --identity ./bootstrap.identity --passkey ./operator.passkey \
+      admin bootstrap \
+      --root-grant 00000000000000000000000000000000 --journal ./http-authority \
+      --administrator ${pkgs.writeText "gateway-admin.json" (builtins.toJSON gatewayAuthority.administrator)} \
+      --credential-scope ${pkgs.writeText "gateway-admin-scope.json" (builtins.toJSON gatewayAuthority.administrator)} \
+      --holder ./holder.json \
+      --credential-out ./admin.credential \
+      --bearer-scope ${pkgs.writeText "gateway-scope.json" (builtins.toJSON gatewayAuthority.scope)} \
+      --bearer-out ./http.credential
+    rm ./operator.passkey
+    cp ${pkgs.writeText "gateway-profile.json" (builtins.toJSON gatewayAuthority.profile)} ./gateway-profile.json
+  '';
+
+  # The wrapped child receives the scoped credential, writes its results into
+  # the unit's state directory and stays alive while the test inspects the unit.
   gatewayProbe = pkgs.writeShellScript "gateway-proxy-probe" ''
     set -eu
     until ${pkgs.curl}/bin/curl -sS -o /dev/null -X POST \
@@ -412,6 +431,7 @@ in
         (mkBaseNode package)
         {
           environment.systemPackages = [ pkgs.python3 ];
+          systemd.services.hellas-gateway.serviceConfig.ExecStartPre = [ gatewayBootstrap ];
           services.hellas = {
             inherit package;
             environment.OPENAI_API_KEY = "proxy-secret";
@@ -419,6 +439,8 @@ in
             gateway = {
               enable = true;
               port = gatewayPort;
+              gatewayProfile = "/var/lib/hellas-gateway/gateway-profile.json";
+              identityPath = "/var/lib/hellas-gateway/bootstrap.identity";
               responsesBackend = "proxy";
               responsesProxyUrl = "http://127.0.0.1:18080/v1/responses";
               responsesProxyApiKeyEnv = "OPENAI_API_KEY";
@@ -462,7 +484,7 @@ in
       # before the proxy is asked for anything.
       refused = gateway.succeed("curl -sS -X POST -H 'content-type: application/json' -d '{\"model\":\"llama-local\",\"input\":\"hello\"}' http://127.0.0.1:${toString gatewayPort}/v1/responses")
       print(refused)
-      assert "per-run credential" in refused
+      assert "current gateway credential" in refused
       assert "proxied-ok" not in refused
     '';
   };
@@ -556,7 +578,8 @@ in
         followerLog = "/tmp/chain-settlement/follower.log";
         allocations = [
           "${chainSettlementMaker}:100"
-          "${chainSettlementTaker}:100"
+          "${chainSettlementTaker}:50"
+          "${chainSettlementNative}:50"
         ];
         validatorSeed = 17;
         startPort = 31300;
@@ -697,7 +720,8 @@ in
       )
       # Scenario A: two genesis P-256 owners open with WebAuthn and mutually close.
       maker_genesis = wait_coin(maker, 100)
-      taker_genesis = wait_coin(taker, 100)
+      taker_genesis = wait_coin(taker, 50)
+      native_coin = wait_coin(native, 50)
       height = int(latest_block()["height"])
       baseline = follower_height()
       opened = machine.succeed(
@@ -706,7 +730,7 @@ in
           "--taker-key /tmp/chain-settlement/taker.key --taker-auth webauthn "
           f"--maker-funding {maker_genesis} --taker-funding {taker_genesis} "
           f"--protocol 1 --timeout {height + 1000000} "
-          f"--timeout-payout {maker}:100 --timeout-payout {taker}:100"
+          f"--timeout-payout {maker}:100 --timeout-payout {taker}:50"
       )
       edge_a = parse_fields(opened)["edge_id"]
       wait_edge(edge_a, True)
@@ -715,10 +739,35 @@ in
       assert f"maker {maker}" in edge_state.splitlines(), edge_state
       assert f"taker {taker}" in edge_state.splitlines(), edge_state
 
+      # A close may pay only its committed owners. Keep this invalid request
+      # value-conserving so it exercises the third-owner restriction.
+      balances_before = {owner: coin_map(owner)[0] for owner in [maker, taker, native]}
+      refused = machine.succeed(
+          f"{home} {cli} chain close --rpc {rpc} --edge-id {edge_a} --kind mutual "
+          f"--payout {maker}:80 --payout {taker}:20 --payout {native}:50 "
+          "--maker-key /tmp/chain-settlement/maker.key --maker-auth webauthn "
+          "--taker-key /tmp/chain-settlement/taker.key --taker-auth webauthn"
+      )
+      assert "enqueued, pending inclusion" in refused.splitlines(), refused
+      refusal_height = int(latest_block()["height"])
+      wait_progress(
+          lambda: True if int(latest_block()["height"]) >= refusal_height + 3 else None,
+          lambda: "chain did not finalize three blocks after the third-owner close",
+      )
+      edge_after = parse_fields(edge_output(edge_a))
+      edge_before = parse_fields(edge_state)
+      # The snapshot root may advance; every exposed edge field must stay put.
+      edge_after.pop("state_root", None)
+      edge_before.pop("state_root", None)
+      assert edge_after == edge_before, (edge_before, edge_after)
+      for owner, before in balances_before.items():
+          after, output = coin_map(owner)
+          assert after == before, f"rejected close changed {owner}: {output}"
+
       baseline = follower_height()
       machine.succeed(
           f"{home} {cli} chain close --rpc {rpc} --edge-id {edge_a} --kind mutual "
-          f"--payout {maker}:80 --payout {taker}:70 --payout {native}:50 "
+          f"--payout {maker}:80 --payout {taker}:70 "
           "--maker-key /tmp/chain-settlement/maker.key --maker-auth webauthn "
           "--taker-key /tmp/chain-settlement/taker.key --taker-auth webauthn"
       )
@@ -726,9 +775,9 @@ in
       wait_follower(baseline)
       maker_coin = wait_coin(maker, 80)
       assert wait_coin(taker, 70)
-      native_coin = wait_coin(native, 50)
+      assert wait_coin(native, 50) == native_coin
 
-      # Scenario B: the untagged k1 payout funds an all-native edge and close.
+      # Scenario B: the native genesis coin funds an all-native edge and close.
       height = int(latest_block()["height"])
       baseline = follower_height()
       opened = machine.succeed(

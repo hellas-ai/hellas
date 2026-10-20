@@ -2,8 +2,8 @@ use super::{CANARY_REGISTRY_SLOTS, FixedStore, canary_registry_slots, coin_id, s
 
 use hellas_kernel::{
     BlockHash, BlockHeight, CoinId, Context, EdgeId, Fees, Funding, Genesis, Key, List,
-    MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Parties, Payout, Proof, ProtocolCode, State, Terms, Tx,
-    View,
+    MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Parties, PartyKeys, Payout, Proof, ProtocolCode, State,
+    Terms, Tx, View,
 };
 
 pub(crate) const TIMEOUT: BlockHeight = BlockHeight::new(2);
@@ -103,11 +103,17 @@ pub(crate) fn context(height: i64, fees: Fees) -> Context {
 
 pub(crate) fn open(shape: FundingShape) -> Tx {
     let parties = parties(shape);
-    super::open_tx(
+    super::open(
         open_funding(shape),
         terms(shape),
-        parties.maker(),
-        parties.taker(),
+        (
+            hellas_kernel::PartyKeys::sole(parties.maker().owner()),
+            hellas_kernel::Authority::Owner,
+        ),
+        (
+            hellas_kernel::PartyKeys::sole(parties.taker().owner()),
+            hellas_kernel::Authority::Owner,
+        ),
     )
 }
 
@@ -121,11 +127,11 @@ pub(crate) fn close(shape: FundingShape, proof: ProofKey) -> Tx {
                 input,
                 terms(shape).hash(),
                 &outputs,
-                parties.maker(),
-                parties.taker(),
+                parties.maker().owner(),
+                parties.taker().owner(),
             )
         }
-        ProofKey::Timeout => Proof::timeout(terms(shape)),
+        ProofKey::Timeout => Proof::timeout(terms(shape), None),
     };
     Tx::close(input, proof, outputs)
 }
@@ -149,7 +155,10 @@ pub(crate) fn output_ids(shape: FundingShape) -> List<CoinId, MAX_EDGE_OUTPUTS> 
 pub(crate) fn payouts(shape: FundingShape) -> List<Payout, MAX_EDGE_OUTPUTS> {
     match shape {
         FundingShape::Full => payouts_with(MAKER, 29, TAKER, 28),
-        FundingShape::MakerOnly | FundingShape::SelfEdge => payouts_with(MAKER, 20, TAKER, 0),
+        FundingShape::MakerOnly => payouts_with(MAKER, 20, TAKER, 0),
+        // Both positions of a self-edge are the maker, so both committed
+        // destinations are the maker's: its taker payout lands there too.
+        FundingShape::SelfEdge => payouts_with(MAKER, 20, MAKER, 0),
         FundingShape::TakerOnly => payouts_with(MAKER, 0, TAKER, 20),
         FundingShape::Empty => payouts_with(MAKER, 0, TAKER, 0),
     }
@@ -161,11 +170,11 @@ pub(crate) fn terms(shape: FundingShape) -> Terms {
 
 pub(crate) const fn parties(shape: FundingShape) -> Parties {
     match shape {
-        FundingShape::SelfEdge => Parties::new(MAKER, MAKER),
+        FundingShape::SelfEdge => Parties::new(PartyKeys::sole(MAKER), PartyKeys::sole(MAKER)),
         FundingShape::Full
         | FundingShape::MakerOnly
         | FundingShape::TakerOnly
-        | FundingShape::Empty => Parties::new(MAKER, TAKER),
+        | FundingShape::Empty => Parties::new(PartyKeys::sole(MAKER), PartyKeys::sole(TAKER)),
     }
 }
 

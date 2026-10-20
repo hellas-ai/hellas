@@ -1,7 +1,7 @@
 use super::*;
 
 const TEST_ASSURANCE: Assurance = Assurance::ProducerSigned;
-use crate::ProducerSigningKey;
+use hellas_auth::ProducerSigningKey;
 
 fn key(byte: u8) -> ProducerSigningKey {
     ProducerSigningKey::from_secret_bytes([byte; 32]).unwrap()

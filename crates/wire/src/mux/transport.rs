@@ -29,6 +29,21 @@ pub trait MessagePipe: Send + 'static {
         bytes: Bytes,
     ) -> impl std::future::Future<Output = Result<(), Self::SendError>> + Send;
 
+    /// A protected frame must reach the carrier through its current authority
+    /// callback. A pipe that cannot do this must never send the frame.
+    fn send_message_authorized(
+        &mut self,
+        _bytes: Bytes,
+        _authority: &crate::WriteAuthority,
+    ) -> impl std::future::Future<Output = std::io::Result<()>> + Send {
+        async {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "pipe cannot authorize writes",
+            ))
+        }
+    }
+
     fn recv_message(
         &mut self,
     ) -> impl std::future::Future<Output = Result<Option<Bytes>, Self::RecvError>> + Send;
@@ -51,11 +66,13 @@ pub(crate) enum Command {
         key: StreamKey,
         payload: Bytes,
         reply: oneshot::Sender<Result<(), MuxError>>,
+        authority: Option<crate::WriteAuthority>,
     },
     CloseSend {
         key: StreamKey,
         trailer: Option<crate::metadata::Trailer>,
         reply: oneshot::Sender<Result<(), MuxError>>,
+        authority: Option<crate::WriteAuthority>,
     },
     Reset {
         key: StreamKey,
@@ -133,6 +150,7 @@ impl MuxTransport {
             inbound_tx,
             slot_to_chans: Default::default(),
             pending_sends: Default::default(),
+            authorities: Default::default(),
             context: context.clone(),
         };
         spawn(Box::pin(driver.run()));
@@ -188,6 +206,7 @@ struct MuxDriver<const N: usize, C: Clock + Clone, P: MessagePipe> {
     /// At most one blocked send per slot; `SendHalf::send_body` takes
     /// `&mut self`, so well-formed callers cannot create a second one.
     pending_sends: std::collections::HashMap<SlotIndex, PendingSend>,
+    authorities: std::collections::HashMap<StreamKey, crate::WriteAuthority>,
     context: TransportContext,
 }
 
@@ -205,6 +224,20 @@ impl<const N: usize, C: Clock + Clone, P: MessagePipe> MuxDriver<N, C, P> {
     async fn run(mut self) {
         loop {
             tokio::select! {
+                key = futures::future::poll_fn(|cx| {
+                    for (key, authority) in &self.authorities {
+                        if let std::task::Poll::Ready(Err(_)) = authority.poll_check(cx) {
+                            return std::task::Poll::Ready(*key);
+                        }
+                    }
+                    std::task::Poll::Pending
+                }) => {
+                    self.authorities.remove(&key);
+                    if let Some(slot) = self.live(key) {
+                        self.dispatch_event(Event::ResetStream { slot, code: WireCode::PermissionDenied });
+                        self.mux.reset(slot, WireCode::PermissionDenied);
+                    }
+                },
                 cmd = self.cmd_rx.recv() => match cmd {
                     Some(c) => self.handle_command(c).await,
                     None => break,
@@ -243,8 +276,14 @@ impl<const N: usize, C: Clock + Clone, P: MessagePipe> MuxDriver<N, C, P> {
                 key,
                 payload,
                 reply,
+                authority,
             } => match self.live(key) {
-                Some(slot) => self.start_send(slot, payload, reply),
+                Some(slot) => {
+                    if let Some(authority) = authority {
+                        self.authorities.entry(key).or_insert(authority);
+                    }
+                    self.start_send(slot, payload, reply);
+                }
                 None => {
                     let _ = reply.send(Err(MuxError::SlotClosed(key.stream_id)));
                 }
@@ -253,14 +292,21 @@ impl<const N: usize, C: Clock + Clone, P: MessagePipe> MuxDriver<N, C, P> {
                 key,
                 trailer,
                 reply,
+                authority,
             } => {
                 let result = match self.live(key) {
-                    Some(slot) => self.mux.close_send(slot, trailer),
+                    Some(slot) => {
+                        if let Some(authority) = authority {
+                            self.authorities.entry(key).or_insert(authority);
+                        }
+                        self.mux.close_send(slot, trailer)
+                    }
                     None => Err(MuxError::SlotClosed(key.stream_id)),
                 };
                 let _ = reply.send(result);
             }
             Command::Reset { key, code } => {
+                self.authorities.remove(&key);
                 if let Some(slot) = self.live(key) {
                     self.fail_pending_send(slot);
                     self.mux.reset(slot, code);
@@ -300,6 +346,7 @@ impl<const N: usize, C: Clock + Clone, P: MessagePipe> MuxDriver<N, C, P> {
         slot: SlotIndex,
         cmd_tx: mpsc::UnboundedSender<Command>,
     ) -> Result<MuxStream, MuxError> {
+        self.authorities.retain(|key, _| key.stream_id != slot);
         let generation = self
             .mux
             .generation(slot)
@@ -448,6 +495,7 @@ impl<const N: usize, C: Clock + Clone, P: MessagePipe> MuxDriver<N, C, P> {
                 }
             }
             Event::ResetStream { slot, code } => {
+                self.authorities.retain(|key, _| key.stream_id != slot);
                 self.fail_pending_send(slot);
                 if let Some(mut chans) = self.slot_to_chans.remove(&slot)
                     && let Some(t) = chans.trailer_tx.take()
@@ -467,9 +515,28 @@ impl<const N: usize, C: Clock + Clone, P: MessagePipe> MuxDriver<N, C, P> {
     async fn flush_outbound(&mut self) -> bool {
         loop {
             while let Some(bytes) = self.mux.next_outbound() {
-                if let Err(e) = self.pipe.send_message(bytes).await {
+                let Some((key, kind)) = super::wire::keyed_frame_header(&bytes) else {
+                    return false;
+                };
+                let authority = if matches!(kind, crate::FrameKind::Body | crate::FrameKind::End) {
+                    self.authorities.get(&key)
+                } else {
+                    None
+                };
+                let result = if let Some(authority) = authority {
+                    self.pipe.send_message_authorized(bytes, authority).await
+                } else {
+                    self.pipe
+                        .send_message(bytes)
+                        .await
+                        .map_err(std::io::Error::other)
+                };
+                if let Err(e) = result {
                     tracing::warn!("pipe send: {e}");
                     return false;
+                }
+                if matches!(kind, crate::FrameKind::End | crate::FrameKind::Reset) {
+                    self.authorities.remove(&key);
                 }
             }
             if !self.retry_pending_sends() {

@@ -74,6 +74,19 @@ where
         self.writer.flush().await
     }
 
+    async fn send_message_authorized(
+        &mut self,
+        bytes: Bytes,
+        authority: &crate::WriteAuthority,
+    ) -> io::Result<()> {
+        let len = self.checked_len(bytes.len())?;
+        authority
+            .write_all(&mut self.writer, &len.to_be_bytes())
+            .await?;
+        authority.write_all(&mut self.writer, &bytes).await?;
+        self.writer.flush().await
+    }
+
     /// Cancel-safe: the mux driver polls this inside `select!`, so it is
     /// routinely dropped mid-frame when a command wins the race. Every byte
     /// read goes straight into `read_buffer`, so a dropped call loses

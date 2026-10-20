@@ -1,10 +1,10 @@
 use super::*;
 use crate::test_support::enrollment;
-#[cfg(all(feature = "paid-provider", feature = "grant-client"))]
 mod offer;
 mod recovery;
+use hellas_auth::{ProducerSigningKey, PublicKey};
 use hellas_rpc::pb::execute::{OpenRequest, OpenResponse, open_response};
-use hellas_rpc::{Assurance, ProducerSigningKey, ProviderEnrollmentBundle, PublicKey};
+use hellas_rpc::{Assurance, ProviderEnrollmentBundle};
 use hellas_wire::{MethodMarker, StreamTransport, WireStatus};
 
 #[tokio::test]
@@ -62,7 +62,7 @@ async fn insufficient_collateral_is_rejected_before_network_or_journal_creation(
     assert!(matches!(
         result,
         Err(PaidClientError::WorkSetup(
-            hellas_rpc::protocol::work_setup::WorkSetupError::Undercollateralised {
+            hellas_work::model::setup::WorkSetupError::Undercollateralised {
                 bond: 51,
                 capacity: 949,
             }
@@ -105,6 +105,16 @@ async fn serve_open<M>(
     )
     .await
     .unwrap();
+    if M::Service::ALPN == hellas_rpc::services::work::Work::ALPN {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let Ok((mut send, mut recv)) = transport.connection().accept_bi().await else {
+            return;
+        };
+        assert_eq!(recv.read_u8().await.unwrap(), 1);
+        assert_eq!(recv.read(&mut [0]).await.unwrap(), None);
+        send.write_all(&[1]).await.unwrap();
+        send.shutdown().await.unwrap();
+    }
 }
 
 #[tokio::test]
@@ -125,6 +135,7 @@ async fn both_paid_connections_open_before_disclosure_and_refuse_wrong_assurance
             .unwrap();
         let (bundle, key) = enrollment(server.id());
         let trust = hellas_client::ProviderTrustAnchor {
+            allowed_environments: vec![],
             expected_genesis: bundle.content_id(),
             required_assurance: Assurance::ProducerSigned,
             apple_app_attest: None,
@@ -245,11 +256,11 @@ fn fetch_request(
     assurance: Assurance,
     retention: hellas_rpc::Retention,
 ) -> (ProviderChannelPolicy, PreparedWorkInput, PublicKey) {
-    use hellas_rpc::protocol::work::PaidChannelPolicyV1;
-    use hellas_rpc::protocol::work_fetch::{
+    use hellas_work::model::fetch::{
         FetchPolicyV2, FetchRoutePolicy, PreparedPaidFetchInputV1, fetch_route_commitment,
     };
-    let environment = hellas_rpc::FetchEnvironment::OpenAiResponses;
+    use hellas_work::model::work::PaidChannelPolicyV1;
+    let environment = test_responses_contract();
     let caller = ProducerSigningKey::from_secret_bytes([7; 32]).unwrap();
     let events = hellas_rpc::fetch::build_input_events_with_retention(
         "openai",
@@ -261,7 +272,7 @@ fn fetch_request(
         retention,
     )
     .unwrap();
-    let prepared = PreparedPaidFetchInputV1::new(&events, &environment.manifest())
+    let prepared = PreparedPaidFetchInputV1::new(&events, &environment)
         .unwrap()
         .into();
     let route = FetchRoutePolicy::sealed_route("openai", "responses").unwrap();
@@ -274,6 +285,7 @@ fn fetch_request(
             delivery_credit_limit: 40,
         },
         work_policy: WorkPolicy::Fetch {
+            contract: environment.clone(),
             policy: FetchPolicyV2 {
                 allowed_environment: environment.manifest_id(),
                 route_commitment: fetch_route_commitment(&route.canonical_body_bytes()).unwrap(),
@@ -301,6 +313,7 @@ fn fetch_preflight_requires_matching_trust_caller_and_ephemeral_retention() {
     use hellas_rpc::Retention;
     let (policy, prepared, caller) = fetch_request(Assurance::AppleAppAttest, Retention::Ephemeral);
     let mut trust = hellas_client::ProviderTrustAnchor {
+        allowed_environments: vec![policy.work_policy.allowed_environment()],
         expected_genesis: hellas_rpc::ContentId::from_bytes([8; 32]),
         required_assurance: Assurance::ProducerSigned,
         apple_app_attest: None,
@@ -336,11 +349,116 @@ fn fetch_preflight_requires_matching_trust_caller_and_ephemeral_retention() {
     );
 }
 
-fn payment_policy() -> hellas_rpc::protocol::work::JobPaymentPolicyV2 {
-    hellas_rpc::protocol::work::JobPaymentPolicyV2 {
+fn payment_policy() -> hellas_work::model::work::JobPaymentPolicyV2 {
+    hellas_work::model::work::JobPaymentPolicyV2 {
         fixed_price: 10,
         dispatch_margin_blocks: 4,
         delivery_margin_blocks: 2,
         oracle_grace_blocks: 6,
+    }
+}
+
+use hellas_work::test_support::test_responses_contract;
+
+#[tokio::test]
+async fn client_checks_live_owner_and_own_payout_before_countersigning() {
+    use crate::test_support::{PaidFixture, signer};
+    use hellas_auth::test_support::actors::{FRIEND, ROOT};
+    use hellas_kernel::{Auth, Key, Parties, PartyAuth, PartyKeys, Terms, Tx};
+    use hellas_work::model::bundle::WorkChannelSetupBundleV2;
+    use hellas_work::work_store::SetupScan;
+
+    let root = tempfile::tempdir().unwrap();
+    let peer = SecretKey::from_bytes(&[71; 32]).public();
+    let authority =
+        crate::test_support::authority(&root.path().join("authority"), enrollment(peer).0).await;
+    let fixture = PaidFixture::new();
+    let client = signer(1);
+    let provider = signer(2);
+    for (name, owner, delegate, refusal) in [
+        (
+            "foreign-owner",
+            FRIEND.principal(),
+            Some(client.party_key()),
+            Some("client coin owner"),
+        ),
+        (
+            "provider-selected-lock",
+            ROOT.principal(),
+            None,
+            Some("client payout delegation"),
+        ),
+        (
+            "own-owner",
+            ROOT.principal(),
+            Some(client.party_key()),
+            None,
+        ),
+    ] {
+        let mut bond_terms = fixture.proposal.bond_terms().clone();
+        bond_terms.parties = Parties::new(
+            PartyKeys::sole(provider.party_key()),
+            PartyKeys::new(
+                Key::from_bytes(*owner.as_bytes()),
+                client.party_key(),
+                delegate,
+            ),
+        );
+        let funding = fixture.proposal.bond_funding().clone();
+        let hash = Tx::open_hash(
+            fixture.config.chain.network,
+            &funding,
+            &Terms::work_stake_bond(bond_terms.clone()),
+        );
+        let proposal = WorkChannelSetupBundleV2::propose_bond(
+            fixture.config.chain.network,
+            funding.clone(),
+            bond_terms,
+            PartyAuth::owner(Auth::native(provider.sign(hash))),
+        )
+        .unwrap();
+        let store = SetupStore::open(
+            &root.path().join(name),
+            fixture.config.chain.network,
+            proposal.bond_edge(),
+            Role::Client,
+            &Secp256k1Verifier::new(),
+        )
+        .await
+        .unwrap();
+        let policy = fixture.config.provider_policy();
+        let mut setup = SetupEndpoint::new(
+            store,
+            client.clone(),
+            PaymentAdmission::Proposes(Box::new(policy.clone())),
+        );
+        setup.import(&proposal.encode()).await.unwrap();
+        setup
+            .arm_scan(SetupScan {
+                height: 0,
+                payload: [0; 32],
+            })
+            .await
+            .unwrap();
+        let terms = payment_terms(&fixture.config, &policy, &proposal, 601);
+        let payment_funding = Funding::new(
+            hellas_kernel::List::take(
+                [hellas_kernel::CoinId::from_bytes([91; 32]); hellas_kernel::MAX_PARTY_INPUTS],
+                1,
+            ),
+            hellas_kernel::List::empty(hellas_kernel::CoinId::from_bytes([0; 32])),
+        );
+        let result =
+            propose_client_payment(&mut setup, &authority, &client, payment_funding, terms).await;
+        if let Some(reason) = refusal {
+            assert!(
+                matches!(result, Err(PaidClientError::InputMismatch(actual)) if actual == reason)
+            );
+            assert_eq!(setup.state().revision(), Some(1));
+            assert_eq!(setup.state().bundle().unwrap(), &proposal);
+        } else {
+            result.unwrap();
+            assert_eq!(setup.state().revision(), Some(2));
+        }
     }
 }

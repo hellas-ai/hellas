@@ -12,6 +12,10 @@ use futures_core::Stream as FuturesStream;
 use crate::metadata::{Metadata, Trailer};
 use crate::status::WireCode;
 
+/// Shared connection exporter for confidential-open and domain-separated sessions.
+pub const OPEN_EXPORTER_LABEL: &[u8] = b"hellas/attest/open/v1";
+pub const OPEN_EXPORTER_LEN: usize = 32;
+
 /// Peer identity as the canonical 32-byte form. Transports that have a
 /// real identity (iroh `EndpointId`, mTLS-bound 32-byte key, handshake-
 /// agreed cookie) populate this. Transports that don't (browser WS,
@@ -19,12 +23,12 @@ use crate::status::WireCode;
 ///
 /// Byte-shaped, not string-shaped, so consumers — the
 /// `AccountingDispatcher` in particular — can construct a
-/// `hellas_rpc::peers::PeerId` directly without a hex round-trip.
+/// `crate::peers::PeerId` directly without a hex round-trip.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct PeerIdentity(pub [u8; 32]);
 
 impl std::fmt::Display for PeerIdentity {
-    /// Short hex (8 chars … 8 chars), matching `hellas_rpc::peers::PeerId`'s
+    /// Short hex (8 chars … 8 chars), matching `crate::peers::PeerId`'s
     /// log format. Use `{:#}` for the full 64-char form.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if f.alternate() {
@@ -44,8 +48,8 @@ impl std::fmt::Display for PeerIdentity {
     }
 }
 
-/// What kind of authentication the transport itself vouches for. Apps
-/// layer their own auth on top via metadata.
+/// Transport authentication metadata; checked services separately verify the
+/// application identity and credential before authorizing operations.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum AuthLevel {
     /// Transport offers no identity (browser WS).
@@ -53,9 +57,6 @@ pub enum AuthLevel {
     None,
     /// Transport-vouched identity (iroh NodeId, mTLS subject).
     Vouched,
-    /// The carrier checked that the caller is this process's OS owner.
-    /// Never set from RPC metadata, discovery, or a claimed remote identity.
-    LocalOwner,
 }
 
 /// Transport-provided context for an inbound stream.
@@ -149,6 +150,17 @@ pub trait Stream: Send {
 /// callers manage their own outbound queue if they want to coalesce.
 pub trait SendHalf: Send {
     type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Install once, before emitting protected responses. Implementations must
+    /// carry this check to the final carrier, not stop at an application queue.
+    /// Unsupported carriers refuse protected delivery and reset the stream.
+    fn set_write_authority(&mut self, _authority: crate::WriteAuthority) -> std::io::Result<()> {
+        self.reset(WireCode::PermissionDenied);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "carrier cannot authorize writes",
+        ))
+    }
 
     /// Send a body chunk. Resolves when the chunk has been handed off
     /// to the transport (not necessarily flushed to the wire).

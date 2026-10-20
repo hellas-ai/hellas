@@ -1,7 +1,8 @@
-//! Contacts and private Offers are scoped to the current enrolled identity.
+//! Contacts and private Offers belong to the principal a command acts for.
 use super::{CliResult, read_bounded_regular_file};
-use anyhow::{Context, ensure};
-use hellas_rpc::protocol::work_grant::{UnixMillis, records::*};
+use anyhow::ensure;
+use hellas_auth::authority::{ContactCard, PrincipalId, UnixMillis};
+use hellas_work::model::grant::records::*;
 use std::{
     io::Write,
     path::{Path, PathBuf},
@@ -9,12 +10,16 @@ use std::{
 
 #[derive(clap::Subcommand)]
 pub enum ContactCommand {
-    /// Export the current public enrollment as canonical bytes.
+    /// Sign this principal's contact card: its passkey public key and a
+    /// display name, with the passkey's assertion over both.
     Export {
+        /// The display name the card introduces this principal by.
+        #[arg(long)]
+        display_name: String,
         #[arg(long)]
         out: Option<PathBuf>,
     },
-    /// Verify a contact's enrollment and save a local alias.
+    /// Verify a contact card and save it under a local alias.
     Import {
         file: PathBuf,
         #[arg(long)]
@@ -25,7 +30,7 @@ pub enum ContactCommand {
 }
 #[derive(clap::Subcommand)]
 pub enum OfferCommand {
-    /// Verify the provider signature and require this identity as the audience.
+    /// Verify the provider signature and save the Work terms.
     Import {
         file: PathBuf,
         #[arg(long)]
@@ -33,17 +38,38 @@ pub enum OfferCommand {
         #[arg(long)]
         replace: bool,
     },
+    /// Import an access bundle for this principal and device: install its Work
+    /// profile as `NAME` and save each offer as `NAME.POLICY`, after the
+    /// offer's first policy.
+    ImportBundle {
+        file: PathBuf,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        replace: bool,
+    },
 }
-pub fn principal(identity: &crate::identity::LocalIdentity) -> CliResult<Principal> {
-    Principal::verify(identity.enrollment.clone())
-        .context("identity cannot participate in grant Work")
+/// The principal a software passkey controls.
+pub fn principal(passkey: &hellas_kernel::SoftPasskey) -> CliResult<PrincipalId> {
+    Ok(PrincipalId::from_public_key(hellas_auth::PublicKey::P256(
+        passkey.party_key().to_bytes(),
+    ))?)
 }
-pub(crate) fn data_root(identity: &Principal) -> CliResult<PathBuf> {
+/// The principal of a command that acts for one.
+pub fn require_principal(passkey: Option<&hellas_kernel::SoftPasskey>) -> CliResult<PrincipalId> {
+    principal(passkey.ok_or_else(|| {
+        anyhow::anyhow!(
+            "this command acts for a principal; pass its software passkey with --passkey"
+        )
+    })?)
+}
+/// One private tree per principal, named by its curve and compressed key.
+pub(crate) fn data_root(principal: &PrincipalId) -> CliResult<PathBuf> {
     let base = match std::env::var_os("HELLAS_GRANT_DATA_DIR") {
         Some(path) => PathBuf::from(path),
         None => crate::identity::default_grant_data_path()?,
     };
-    Ok(base.join(identity.id().0.to_string()))
+    Ok(base.join(format!("p256-{}", hex::encode(principal.as_bytes()))))
 }
 fn alias(root: &Path, kind: &str, name: &str) -> CliResult<PathBuf> {
     ensure!(
@@ -57,6 +83,16 @@ fn alias(root: &Path, kind: &str, name: &str) -> CliResult<PathBuf> {
     );
     Ok(root.join(kind).join(name))
 }
+
+/// Load an already imported, verified contact from this principal's address book.
+pub(crate) fn load_contact(principal: PrincipalId, name: &str) -> CliResult<ContactCard> {
+    let path = alias(&data_root(&principal)?, "contacts", name)?;
+    Ok(decode_contact_card(&read_bounded_regular_file(
+        &path,
+        "contact card",
+        MAX_CONTACT_CARD_BYTES,
+    )?)?)
+}
 pub(super) fn save(path: &Path, bytes: &[u8]) -> CliResult<()> {
     let directory = path
         .parent()
@@ -68,45 +104,73 @@ pub(super) fn save(path: &Path, bytes: &[u8]) -> CliResult<()> {
 }
 pub fn contact(
     command: ContactCommand,
-    identity: &crate::identity::LocalIdentity,
+    passkey: Option<&hellas_kernel::SoftPasskey>,
 ) -> CliResult<()> {
-    let identity = principal(identity)?;
     match command {
-        ContactCommand::Export { out } => {
-            let bytes = identity.bundle().canonical_bytes();
+        ContactCommand::Export { display_name, out } => {
+            let passkey = passkey.ok_or_else(|| {
+                anyhow::anyhow!("a contact card is signed by the principal's --passkey")
+            })?;
+            let principal = principal(passkey)?;
+            let envelope = passkey
+                .sign(hellas_kernel::PayloadHash::from_bytes(
+                    *ContactCard::digest(principal, &display_name).as_bytes(),
+                ))
+                .map_err(|error| anyhow::anyhow!("passkey signing failed: {error:?}"))?;
+            let card = ContactCard::new(
+                principal,
+                display_name,
+                hellas_work::node::passkey_assertion(&envelope)?,
+            )?;
+            let bytes = encode_contact_card(&card)?;
             if let Some(path) = out {
                 save(&path, &bytes)?;
             } else {
                 std::io::stdout().lock().write_all(&bytes)?;
             }
+            eprintln!("Principal fingerprint: {}", principal.fingerprint());
         }
         ContactCommand::Import {
             file,
             name,
             replace,
         } => {
-            let bytes = read_bounded_regular_file(&file, "contact", MAX_PRINCIPAL_BYTES)?;
-            let imported = Principal::decode(&bytes)?;
-            let path = alias(&data_root(&identity)?, "contacts", &name)?;
+            let bytes = read_bounded_regular_file(&file, "contact card", MAX_CONTACT_CARD_BYTES)?;
+            let imported = decode_contact_card(&bytes)?;
+            let path = alias(&data_root(&require_principal(passkey)?)?, "contacts", &name)?;
             if path.exists() && !replace {
-                let previous = Principal::decode(&read_bounded_regular_file(
+                let previous = decode_contact_card(&read_bounded_regular_file(
                     &path,
-                    "contact",
-                    MAX_PRINCIPAL_BYTES,
+                    "contact card",
+                    MAX_CONTACT_CARD_BYTES,
                 )?)?;
                 ensure!(
-                    previous == imported,
+                    previous.principal() == imported.principal(),
                     "contact alias already names another principal; use --replace explicitly"
                 );
             }
             save(&path, &bytes)?;
-            println!("{}", imported.id().0);
+            println!(
+                "{}",
+                serde_json::json!({
+                    "principal": hex::encode(imported.principal().as_bytes()),
+                    "fingerprint": imported.principal().fingerprint(),
+                    "display_name": imported.name(),
+                })
+            );
         }
     }
     Ok(())
 }
-pub fn offer(command: OfferCommand, identity: &crate::identity::LocalIdentity) -> CliResult<()> {
-    let identity = principal(identity)?;
+/// `identity_node` is this device's node key, which an access bundle's
+/// credential must be bound to; plain offer imports need none.
+pub fn offer(
+    command: OfferCommand,
+    passkey: Option<&hellas_kernel::SoftPasskey>,
+    identity_node: Option<&hellas_auth::ProducerSigningKey>,
+) -> CliResult<()> {
+    let identity = require_principal(passkey)?;
+    let root = data_root(&identity)?;
     match command {
         OfferCommand::Import {
             file,
@@ -114,49 +178,103 @@ pub fn offer(command: OfferCommand, identity: &crate::identity::LocalIdentity) -
             replace,
         } => {
             let bytes = read_bounded_regular_file(&file, "offer", MAX_OFFER_BYTES)?;
-            let imported = SignedOffer::decode(&bytes, identity.id(), UnixMillis(0))?;
-            let path = alias(&data_root(&identity)?, "offers", &name)?;
-            if path.exists() && !replace {
-                let previous = SignedOffer::decode(
-                    &read_bounded_regular_file(&path, "offer", MAX_OFFER_BYTES)?,
-                    identity.id(),
-                    UnixMillis(0),
-                )?;
-                let new = imported.offer();
-                let old = previous.offer();
-                ensure!(
-                    new.provider == old.provider
-                        && new.grant.id == old.grant.id
-                        && new.network == old.network,
-                    "offer alias already names another grant; use --replace explicitly"
-                );
-                ensure!(
-                    new.grant.revision >= old.grant.revision
-                        && new.generation >= old.generation
-                        && new.sequence >= old.sequence
-                        && new.valid_until >= old.valid_until,
-                    "offer import would roll back saved standing"
-                );
-            }
+            let imported = SignedOffer::decode(&bytes, UnixMillis(0))?;
+            let path = alias(&root, "offers", &name)?;
+            check_offer_alias(&path, &imported, replace)?;
             save(&path, &bytes)?;
             println!("{}", hex::encode(imported.offer().grant.id.0));
+            offer_fingerprints(&imported)?;
+        }
+        OfferCommand::ImportBundle {
+            file,
+            name,
+            replace,
+        } => {
+            let node = hellas_auth::authority::NodeKey::from_public_key(
+                identity_node
+                    .ok_or_else(|| anyhow::anyhow!("an access bundle is bound to a device"))?
+                    .public_key(),
+            )?;
+            let bundle = hellas_sdk::access_bundle::AccessBundle::load(&file, &identity, &node)?;
+            let mut saved = Vec::with_capacity(bundle.offers.len());
+            for offer in &bundle.offers {
+                let policy = offer
+                    .offer()
+                    .grant
+                    .policies
+                    .first()
+                    .ok_or_else(|| anyhow::anyhow!("a shared offer names a policy"))?;
+                let label = format!("{name}.{}", policy.name);
+                let path = alias(&root, "offers", &label)?;
+                ensure!(
+                    !saved.iter().any(|(other, _, _)| *other == label),
+                    "two shared offers would both be saved as {label}"
+                );
+                check_offer_alias(&path, offer, replace)?;
+                saved.push((label, path, offer));
+            }
+            let profile = bundle.install_profile(&alias(&root, "accesses", &name)?)?;
+            for (_, path, offer) in &saved {
+                save(path, &offer.encode()?)?;
+                offer_fingerprints(offer)?;
+            }
+            println!(
+                "{}",
+                serde_json::json!({
+                    "offers": saved.iter().map(|(label, _, offer)| serde_json::json!({
+                        "name": label,
+                        "grant": hex::encode(offer.offer().grant.id.0),
+                    })).collect::<Vec<_>>(),
+                    "work_profile": profile,
+                })
+            );
         }
     }
     Ok(())
 }
 
-#[cfg(feature = "gateway")]
-pub fn client_journal_root(identity: &Principal) -> CliResult<PathBuf> {
+fn check_offer_alias(path: &Path, imported: &SignedOffer, replace: bool) -> CliResult<()> {
+    if !path.exists() || replace {
+        return Ok(());
+    }
+    let previous = SignedOffer::decode(
+        &read_bounded_regular_file(path, "offer", MAX_OFFER_BYTES)?,
+        UnixMillis(0),
+    )?;
+    let new = imported.offer();
+    let old = previous.offer();
+    ensure!(
+        new.provider == old.provider && new.grant.id == old.grant.id && new.network == old.network,
+        "offer alias already names another grant; use --replace explicitly"
+    );
+    ensure!(
+        new.grant.revision >= old.grant.revision
+            && new.generation >= old.generation
+            && new.sequence >= old.sequence
+            && new.valid_until >= old.valid_until,
+        "offer import would roll back saved standing"
+    );
+    Ok(())
+}
+
+/// The provider is a machine: show its enrollment, never a principal.
+pub(super) fn offer_fingerprints(offer: &SignedOffer) -> CliResult<()> {
+    eprintln!(
+        "Provider enrollment: {}",
+        offer.offer().provider.content_id()
+    );
+    Ok(())
+}
+
+pub fn client_journal_root(identity: &PrincipalId) -> CliResult<PathBuf> {
     Ok(data_root(identity)?.join("channels"))
 }
 /// Saved Offer terms may have expired; only use this as a signed locator.
 /// GrantSession obtains fresh authenticated standing before proposing a job.
-#[cfg(feature = "gateway")]
-pub fn load_offer(identity: &Principal, name: &str) -> CliResult<SignedOffer> {
+pub fn load_offer(identity: &PrincipalId, name: &str) -> CliResult<SignedOffer> {
     let path = alias(&data_root(identity)?, "offers", name)?;
     Ok(SignedOffer::decode(
         &read_bounded_regular_file(&path, "offer", MAX_OFFER_BYTES)?,
-        identity.id(),
         UnixMillis(0),
     )?)
 }
@@ -165,7 +283,7 @@ pub fn load_offer(identity: &Principal, name: &str) -> CliResult<SignedOffer> {
 mod tests {
     use super::*;
     #[test]
-    fn aliases_cannot_escape_the_private_store_and_exports_verify() {
+    fn aliases_cannot_escape_the_private_store_and_cards_verify() {
         let root = tempfile::tempdir().unwrap();
         for name in ["", "..", "../secret", "/secret", "a/b", "a\\b", " x", "ö"] {
             assert!(alias(root.path(), "contacts", name).is_err(), "{name}");
@@ -174,28 +292,51 @@ mod tests {
             alias(root.path(), "contacts", "contact-1").unwrap(),
             root.path().join("contacts/contact-1")
         );
-        let identity =
-            crate::identity::load_or_create(Some(&root.path().join("identity"))).unwrap();
+        let friend = hellas_kernel::SoftPasskey::from_secret_scalar([0x41; 32]).unwrap();
         let out = root.path().join("export");
         contact(
             ContactCommand::Export {
+                display_name: "Friend".into(),
                 out: Some(out.clone()),
             },
-            &identity,
+            Some(&friend),
         )
         .unwrap();
-        let bytes = std::fs::read(&out).unwrap();
+        let card = decode_contact_card(&std::fs::read(&out).unwrap()).unwrap();
+        assert_eq!(card.principal(), principal(&friend).unwrap());
         assert_eq!(
-            Principal::decode(&bytes).unwrap(),
-            principal(&identity).unwrap()
+            card.principal().public_key().kind(),
+            hellas_auth::SignatureKind::P256
         );
+        assert_eq!(card.name(), "Friend");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(
-                std::fs::metadata(out).unwrap().permissions().mode() & 0o777,
+                std::fs::metadata(&out).unwrap().permissions().mode() & 0o777,
                 0o600
             );
         }
+        assert!(
+            contact(
+                ContactCommand::Export {
+                    display_name: "Nobody".into(),
+                    out: None,
+                },
+                None,
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn data_roots_name_the_principal_by_curve_and_key() {
+        let passkey = hellas_kernel::SoftPasskey::from_secret_scalar([0x42; 32]).unwrap();
+        let principal = principal(&passkey).unwrap();
+        let root = data_root(&principal).unwrap();
+        assert_eq!(
+            root.file_name().unwrap().to_str().unwrap(),
+            format!("p256-{}", hex::encode(principal.as_bytes()))
+        );
+        assert!(require_principal(None).is_err());
     }
 }

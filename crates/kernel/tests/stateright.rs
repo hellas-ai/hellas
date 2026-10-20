@@ -327,7 +327,10 @@ fn full_open_shape(view: &ModelView) -> bool {
         && view.coin(l1::TAKER_ID).is_none()
         && view.coin(l1::maker_out(EdgeKey::First)).is_none()
         && view.coin(l1::taker_out(EdgeKey::First)).is_none()
-        && view.edge(l1::open_case_id(OpenKey::Full)).map(edge_view)
+        && view
+            .edge(l1::open_case_id(OpenKey::Full))
+            .as_ref()
+            .map(edge_view)
             == Some((l1::EDGE_VALUE, l1::PARTIES))
 }
 
@@ -338,6 +341,7 @@ fn maker_open_shape(view: &ModelView) -> bool {
         && view.coin(l1::taker_out(EdgeKey::First)).is_none()
         && view
             .edge(l1::open_case_id(OpenKey::MakerOnly))
+            .as_ref()
             .map(edge_view)
             == Some((l1::MAKER_VALUE, l1::PARTIES))
 }
@@ -349,6 +353,7 @@ fn taker_open_shape(view: &ModelView) -> bool {
         && view.coin(l1::taker_out(EdgeKey::First)).is_none()
         && view
             .edge(l1::open_case_id(OpenKey::TakerOnly))
+            .as_ref()
             .map(edge_view)
             == Some((l1::TAKER_VALUE, l1::PARTIES))
 }
@@ -358,7 +363,11 @@ fn empty_open_shape(view: &ModelView) -> bool {
         && view.coin(l1::TAKER_ID).map(Coin::value) == Some(l1::TAKER_VALUE)
         && view.coin(l1::maker_out(EdgeKey::First)).is_none()
         && view.coin(l1::taker_out(EdgeKey::First)).is_none()
-        && view.edge(l1::open_case_id(OpenKey::Empty)).map(edge_view) == Some((0, l1::PARTIES))
+        && view
+            .edge(l1::open_case_id(OpenKey::Empty))
+            .as_ref()
+            .map(edge_view)
+            == Some((0, l1::PARTIES))
 }
 
 fn resolved_shape(view: &ModelView) -> bool {
@@ -369,6 +378,6 @@ fn resolved_shape(view: &ModelView) -> bool {
         && view.coin(l1::taker_out(EdgeKey::First)).map(Coin::value) == Some(l1::TAKER_PAYOUT)
 }
 
-const fn edge_view(edge: Edge) -> (u64, Parties) {
+const fn edge_view(edge: &Edge) -> (u64, Parties) {
     (edge.value(), edge.parties())
 }

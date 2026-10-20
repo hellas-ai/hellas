@@ -1,9 +1,7 @@
 //! Application import boundary: structural Offer decoding never grants trust.
 use crate::{ClientError, ClientResult, ProviderTrustAnchor};
-use hellas_rpc::protocol::work_grant::{
-    PrincipalId, UnixMillis,
-    records::{Offer, SignedOffer},
-};
+use hellas_auth::authority::UnixMillis;
+use hellas_work::model::grant::records::{Offer, SignedOffer};
 
 pub struct UnpinnedOffer(SignedOffer);
 #[derive(Clone, Debug)]
@@ -12,8 +10,8 @@ pub struct PinnedOffer {
     trust: ProviderTrustAnchor,
 }
 impl UnpinnedOffer {
-    pub fn decode(bytes: &[u8], audience: PrincipalId, now: UnixMillis) -> ClientResult<Self> {
-        SignedOffer::decode(bytes, audience, now)
+    pub fn decode(bytes: &[u8], now: UnixMillis) -> ClientResult<Self> {
+        SignedOffer::decode(bytes, now)
             .map(Self)
             .map_err(|e| ClientError::source("invalid Offer", e))
     }

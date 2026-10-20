@@ -1,17 +1,13 @@
 //! Operator-owned account aliases reference environment variables or private
 //! credential files; route configuration contains no secret values.
 use super::{HttpCredential, HttpEgressPolicy, HttpFetchProvider};
+use hellas_auth::authority::UnixMillis;
 use hellas_executor::{FetchProviderError, FetchRouteEntry, FetchRoutePolicy};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::{
-    io::Read,
-    path::PathBuf,
-    sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{io::Read, path::PathBuf, sync::Arc, time::Duration};
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HttpProviderConfig {
     #[serde(default)]
@@ -22,7 +18,7 @@ pub struct HttpProviderConfig {
     pub credentials: BTreeMap<String, HttpCredentialConfig>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HttpCredentialConfig {
     pub allowed_origins: Vec<String>,
@@ -32,6 +28,14 @@ pub struct HttpCredentialConfig {
     #[serde(default)]
     pub trust_roots: Option<hellas_rpc::http_fetch::HttpTrustRoots>,
     pub header_name: String,
+    #[serde(flatten)]
+    pub source: HttpSecretConfig,
+}
+
+/// The one operator-owned credential source used by HTTP routes and provisioning.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HttpSecretConfig {
     pub secret_env: Option<String>,
     /// A private JSON credential file maintained by the account's login tool.
     pub secret_file: Option<PathBuf>,
@@ -43,7 +47,7 @@ pub struct HttpCredentialConfig {
 
 /// An operator-owned login tool updates the same private JSON file. It receives
 /// no customer data, and its output is never forwarded to clients or logs.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CredentialRefresh {
     pub command: Vec<String>,
@@ -58,12 +62,7 @@ impl CredentialRefresh {
             .and_then(serde_json::Value::as_f64)
             .filter(|value| value.is_finite())
             .ok_or_else(|| super::fault("credential expiry unavailable"))?;
-        Ok(expiry
-            <= SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs_f64()
-                + 30.)
+        Ok(expiry <= (UnixMillis::now().unwrap_or_default().0 as f64 / 1_000.) + 30.)
     }
     async fn run(&self) -> Result<(), FetchProviderError> {
         use tracing::Instrument;
@@ -114,7 +113,7 @@ impl From<&str> for HttpSecret {
 }
 
 impl HttpSecret {
-    pub(super) async fn resolve(&self) -> Result<String, FetchProviderError> {
+    pub async fn resolve(&self) -> Result<String, FetchProviderError> {
         match self {
             Self::Value(value) => Ok(value.clone()),
             Self::JsonFile {
@@ -131,7 +130,9 @@ impl HttpSecret {
                 if let Some(refresh) = refresh
                     && refresh.due(&object)?
                 {
-                    let retry_at = guard.as_mut().expect("refresh holds its account lock");
+                    let Some(retry_at) = guard.as_mut() else {
+                        return Err(super::fault("credential refresh lock unavailable"));
+                    };
                     if retry_at.is_some_and(|deadline| deadline > std::time::Instant::now()) {
                         return Err(super::fault("credential refresh is cooling down"));
                     }
@@ -186,6 +187,43 @@ async fn read_credential(path: PathBuf) -> Result<serde_json::Value, FetchProvid
     .map_err(|_| super::fault("credential loader failed"))?
 }
 
+impl HttpSecretConfig {
+    pub fn into_secret(self) -> Result<HttpSecret, FetchProviderError> {
+        if self
+            .refresh
+            .as_ref()
+            .is_some_and(|refresh| refresh.command.is_empty() || refresh.expires_field.is_empty())
+        {
+            return Err(super::fault(
+                "credential refresh requires a command and expiry field",
+            ));
+        }
+        let secret = match (self.secret_env, self.secret_file, self.secret_field) {
+            (Some(name), None, None) if self.refresh.is_none() => {
+                let secret = std::env::var(name).map_err(|_| {
+                    super::fault("account secret environment variable is unavailable")
+                })?;
+                if secret.is_empty() {
+                    return Err(super::fault("account secret is empty"));
+                }
+                HttpSecret::Value(format!("{}{secret}", self.prefix))
+            }
+            (None, Some(path), Some(field)) if !field.is_empty() => HttpSecret::JsonFile {
+                path,
+                field,
+                prefix: self.prefix,
+                refresh: self.refresh,
+            },
+            _ => {
+                return Err(super::fault(
+                    "configure either secret_env or secret_file with secret_field",
+                ));
+            }
+        };
+        Ok(secret)
+    }
+}
+
 impl HttpProviderConfig {
     pub fn into_entry(
         self,
@@ -193,35 +231,7 @@ impl HttpProviderConfig {
     ) -> Result<FetchRouteEntry, FetchProviderError> {
         let mut credentials = BTreeMap::new();
         for (alias, config) in self.credentials {
-            if config.refresh.as_ref().is_some_and(|refresh| {
-                refresh.command.is_empty() || refresh.expires_field.is_empty()
-            }) {
-                return Err(super::fault(
-                    "credential refresh requires a command and expiry field",
-                ));
-            }
-            let header_value = match (config.secret_env, config.secret_file, config.secret_field) {
-                (Some(name), None, None) if config.refresh.is_none() => {
-                    let secret = std::env::var(name).map_err(|_| {
-                        super::fault("account secret environment variable is unavailable")
-                    })?;
-                    if secret.is_empty() {
-                        return Err(super::fault("account secret is empty"));
-                    }
-                    HttpSecret::Value(format!("{}{secret}", config.prefix))
-                }
-                (None, Some(path), Some(field)) if !field.is_empty() => HttpSecret::JsonFile {
-                    path,
-                    field,
-                    prefix: config.prefix,
-                    refresh: config.refresh,
-                },
-                _ => {
-                    return Err(super::fault(
-                        "configure either secret_env or secret_file with secret_field",
-                    ));
-                }
-            };
+            let header_value = config.source.into_secret()?;
             credentials.insert(
                 alias,
                 HttpCredential {
@@ -245,7 +255,10 @@ impl HttpProviderConfig {
         )?;
         FetchRouteEntry::new(
             std::sync::Arc::new(provider),
-            std::sync::Arc::new(super::HttpFetchAdaptorFactory),
+            std::sync::Arc::new(
+                super::HttpFetchAdaptorFactory::new()
+                    .map_err(|_| super::fault("invalid HTTP execution contract"))?,
+            ),
             capabilities,
         )
         .map_err(|_| super::fault("invalid HTTP Fetch route"))
@@ -255,6 +268,30 @@ impl HttpProviderConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flattened_source_preserves_http_scope_and_rejects_ambiguous_sources() {
+        let value = serde_json::json!({
+            "allowed_origins":["https://example.com"], "allowed_paths":["/exact"],
+            "allowed_methods":["POST"], "header_name":"authorization",
+            "secret_file":"account.json", "secret_field":"token", "prefix":"Bearer "
+        });
+        let config: HttpCredentialConfig = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(config.allowed_paths, ["/exact"]);
+        assert!(matches!(
+            config.source.into_secret().unwrap(),
+            HttpSecret::JsonFile { .. }
+        ));
+        let mut unknown = value.clone();
+        unknown["implicit_fallback"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<HttpCredentialConfig>(unknown).is_err());
+        let mut ambiguous = value;
+        ambiguous["secret_env"] = serde_json::json!("EXPLICIT_ACCOUNT_TOKEN");
+        let config: HttpCredentialConfig = serde_json::from_value(ambiguous).unwrap();
+        assert!(config.source.into_secret().is_err());
+        let missing: HttpSecretConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(missing.into_secret().is_err());
+    }
 
     #[tokio::test]
     async fn nested_file_credentials_follow_rotation_and_reject_missing_fields() {

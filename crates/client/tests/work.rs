@@ -16,6 +16,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::Bytes;
+use hellas_auth::Digest;
+use hellas_auth::{ProducerSigningKey, PublicKey};
 use hellas_client::work::payment::pay_for_result;
 use hellas_client::work::reproduce::{ReproduceFault, Reproduced, Reproducer};
 use hellas_client::work::{
@@ -24,34 +26,34 @@ use hellas_client::work::{
 };
 use hellas_kernel::{
     BlockHeight, Decode as _, Edge, EdgeId, EdgeValues, Fees, Key, LeaseSlots, List,
-    MAX_EDGE_OUTPUTS, NetworkId, Parties, Payout, PendingSlot, RegistryChunk, RegistryNamespace,
-    RegistryRecordTag, Secp256k1Signer, Secp256k1Verifier, Terms, TermsHash, WorkPaymentSettlement,
-    WorkPaymentTerms, WorkStakeBondTerms, work_payment_settlement,
+    MAX_EDGE_OUTPUTS, NetworkId, Parties, PartyKeys, Payout, PendingSlot, RegistryChunk,
+    RegistryNamespace, RegistryRecordTag, Secp256k1Signer, Secp256k1Verifier, Terms, TermsHash,
+    WorkPaymentSettlement, WorkPaymentTerms, WorkStakeBondTerms, work_payment_settlement,
 };
 use hellas_rpc::evaluate::{
     EvaluateOutputTranscriptBuilder, EvaluateStopReason, EvaluateTerminal, EvaluateUsage,
     input_commitment,
 };
-use hellas_rpc::protocol::Digest;
 use hellas_rpc::protocol::artifacts::{
-    BoundTermId, Canonical as _, InputAddressed as _, OutputAddressed as _, PreparedPaidInputV1,
-    SourceRef, TextArtifact, TextExecution, TextExecutionId, TextPolicy, TokenIds, completed_text,
-};
-use hellas_rpc::protocol::work::{
-    EvaluatePolicyV2, JobDeadlines, PaidChannelPolicyV1, PaidJobAuthorizationV2,
-    generation_policy_digest, identity_source_digest, private_policy_commitment,
-    propose_authorization, signing_hash, work_id,
-};
-use hellas_rpc::protocol::work_setup::{
-    ObservedChannel, ReadyChannel, WorkChannelConfig, WorkChannelDescriptor, payment_terms_hash,
+    BoundTermId, Canonical as _, InputAddressed as _, OutputAddressed as _, SourceRef,
+    TextArtifact, TextExecution, TextExecutionId, TextPolicy, TokenIds, completed_text,
 };
 use hellas_rpc::services::work::WorkServer;
 use hellas_rpc::{
     Application, Assurance, CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR, ContentId, EvaluateRequest,
-    OutputEventEnvelope, ProducerSigningKey, ProgramManifest, PublicKey,
+    OutputEventEnvelope, ProgramManifest,
 };
 use hellas_wire::mux::{MessagePipe, MuxConfig, MuxTransport, Role as MuxRole};
 use hellas_wire::{DefaultClock, Dispatcher, StreamTransport};
+use hellas_work::model::prepared_input::PreparedPaidInputV1;
+use hellas_work::model::setup::{
+    ObservedChannel, ReadyChannel, WorkChannelConfig, WorkChannelDescriptor, payment_terms_hash,
+};
+use hellas_work::model::work::{
+    EvaluatePolicyV2, JobDeadlines, PaidChannelPolicyV1, PaidJobAuthorizationV2,
+    generation_policy_digest, identity_source_digest, private_policy_commitment,
+    propose_authorization, signing_hash, work_id,
+};
 use hellas_work::work::{
     BackendFault, ClientEndpoint, PreparedEvaluateInput, ProviderEndpoint, RunOutcome, WorkBackend,
     WorkService, run_accepted_work,
@@ -133,7 +135,10 @@ fn channel_policy() -> PaidChannelPolicyV1 {
 
 fn bond_terms() -> WorkStakeBondTerms {
     WorkStakeBondTerms {
-        parties: Parties::new(provider().party_key(), client().party_key()),
+        parties: Parties::new(
+            PartyKeys::sole(provider().party_key()),
+            PartyKeys::sole(client().party_key()),
+        ),
         timeout: BlockHeight::new(HORIZON),
         timeout_outputs: List::take(
             [Payout::new(provider().party_key(), STAKE); MAX_EDGE_OUTPUTS],
@@ -230,7 +235,12 @@ fn temp() -> tempfile::TempDir {
     }
 }
 
-fn store_at(root: &std::path::Path, ready: &ReadyChannel, role: Role, height: u64) -> ChannelStore {
+async fn store_at(
+    root: &std::path::Path,
+    ready: &ReadyChannel,
+    role: Role,
+    height: u64,
+) -> ChannelStore {
     let mut store = match ChannelStore::open(
         root,
         ready.channel().clone(),
@@ -238,11 +248,13 @@ fn store_at(root: &std::path::Path, ready: &ReadyChannel, role: Role, height: u6
         role,
         origin(),
         &Secp256k1Verifier::new(),
-    ) {
+    )
+    .await
+    {
         Ok(store) => store,
         Err(error) => panic!("the fixture store opens: {error}"),
     };
-    advance(&mut store, height);
+    advance(&mut store, height).await;
     store
 }
 
@@ -276,7 +288,7 @@ fn origin() -> SetupOrigin {
 ///
 /// The same call the settlement loop makes, so a fixture cursor is a
 /// cursor this endpoint could have reached.
-fn advance(store: &mut ChannelStore, height: u64) {
+async fn advance(store: &mut ChannelStore, height: u64) {
     let mut next = store.state().cursor().0.saturating_add(1);
     while next <= height {
         let block = FinalizedWork {
@@ -285,15 +297,15 @@ fn advance(store: &mut ChannelStore, height: u64) {
             payload: payload_at(next),
             txs: Vec::new(),
         };
-        if let Err(error) = observe(store, &block, &Secp256k1Verifier::new()) {
+        if let Err(error) = observe(store, &block, &Secp256k1Verifier::new()).await {
             panic!("the fixture block applies: {error}");
         }
         next = next.saturating_add(1);
     }
 }
 
-fn commit(store: &mut ChannelStore, record: ChannelRecord) {
-    if let Err(error) = store.commit(record, &Secp256k1Verifier::new()) {
+async fn commit(store: &mut ChannelStore, record: ChannelRecord) {
+    if let Err(error) = store.commit(record, &Secp256k1Verifier::new()).await {
         panic!("the fixture record commits: {error}");
     }
 }
@@ -372,7 +384,7 @@ fn authorization(policy: &EvaluatePolicyV2, nonce: u8) -> PaidJobAuthorizationV2
 ///
 /// The acceptance exchange has its own file; these tests are about what
 /// happens after both signatures exist.
-fn accept(
+async fn accept(
     policy: &EvaluatePolicyV2,
     stores: &mut [&mut ChannelStore],
     nonce: u8,
@@ -391,14 +403,16 @@ fn accept(
                 client_signature: client().sign(signing_hash(id)),
                 prepared_input: prepared_input.clone(),
             },
-        );
+        )
+        .await;
         commit(
             store,
             ChannelRecord::JobAccepted {
                 work_id: id,
                 provider_signature: provider().sign(signing_hash(id)),
             },
-        );
+        )
+        .await;
     }
     (id, authorization)
 }
@@ -692,13 +706,14 @@ async fn a_checked_answer_is_the_only_thing_that_reaches_the_matched_phase() {
     let client_root = temp();
     let provider_root = temp();
     let ready = ready();
-    let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR);
-    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
+    let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR).await;
+    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR).await;
     let (id, _) = accept(
         &work_policy(),
         &mut [&mut client_store, &mut provider_store],
         1,
-    );
+    )
+    .await;
     let Ok(provider_endpoint) = ProviderEndpoint::new(ready.clone(), provider_store, provider())
     else {
         panic!("the provider endpoint binds");
@@ -758,6 +773,7 @@ async fn a_checked_answer_is_the_only_thing_that_reaches_the_matched_phase() {
         assert_eq!(
             service
                 .with_state(|state| state.jobs().next().map(JobState::phase))
+                .await
                 .expect("the endpoint is reachable"),
             Some(JobPhase::Delivered),
             "the provider delivered the plaintext once",
@@ -768,7 +784,7 @@ async fn a_checked_answer_is_the_only_thing_that_reaches_the_matched_phase() {
     // saw none of this, the job is still checked.
     drop(endpoint);
     drop(service);
-    let recovered = store_at(client_root.path(), &ready, Role::Client, CURSOR);
+    let recovered = store_at(client_root.path(), &ready, Role::Client, CURSOR).await;
     let Some(job) = recovered.state().jobs().next() else {
         panic!("the job is still open");
     };
@@ -787,13 +803,14 @@ async fn a_checked_answer_becomes_a_payment_the_provider_admitted() {
     let client_root = temp();
     let provider_root = temp();
     let ready = ready();
-    let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR);
-    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
+    let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR).await;
+    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR).await;
     let (id, _) = accept(
         &work_policy(),
         &mut [&mut client_store, &mut provider_store],
         1,
-    );
+    )
+    .await;
     let Ok(provider_endpoint) = ProviderEndpoint::new(ready.clone(), provider_store, provider())
     else {
         panic!("the provider endpoint binds");
@@ -829,6 +846,7 @@ async fn a_checked_answer_becomes_a_payment_the_provider_admitted() {
     {
         let state = service
             .with_state(|state| state.clone())
+            .await
             .expect("the endpoint is reachable");
         assert_eq!(state.ledger().credited_cumulative(), PRICE);
         assert_eq!(state.max_executable_certificate(), PRICE);
@@ -840,7 +858,7 @@ async fn a_checked_answer_becomes_a_payment_the_provider_admitted() {
 
     drop(endpoint);
     drop(service);
-    let recovered = store_at(client_root.path(), &ready, Role::Client, CURSOR);
+    let recovered = store_at(client_root.path(), &ready, Role::Client, CURSOR).await;
     let state = recovered.state();
     assert!(state.jobs().next().is_none());
     assert_eq!(state.ledger().credited_cumulative(), PRICE);
@@ -858,13 +876,14 @@ async fn an_authenticated_answer_is_paid_without_reexecution() {
     let client_root = temp();
     let provider_root = temp();
     let ready = ready();
-    let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR);
-    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
+    let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR).await;
+    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR).await;
     let (id, _) = accept(
         &work_policy(),
         &mut [&mut client_store, &mut provider_store],
         1,
-    );
+    )
+    .await;
     let provider_endpoint = ProviderEndpoint::new(ready.clone(), provider_store, provider())
         .expect("the provider endpoint binds");
     let service = WorkService::new(provider_endpoint);
@@ -901,13 +920,14 @@ async fn ordinary_collection_refuses_a_stale_payment_boundary() {
     let client_root = temp();
     let provider_root = temp();
     let ready = ready();
-    let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR);
-    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
+    let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR).await;
+    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR).await;
     let (id, authorization) = accept(
         &work_policy(),
         &mut [&mut client_store, &mut provider_store],
         1,
-    );
+    )
+    .await;
     let provider_endpoint = ProviderEndpoint::new(ready.clone(), provider_store, provider())
         .expect("the provider endpoint binds");
     let service = WorkService::new(provider_endpoint);
@@ -941,13 +961,14 @@ async fn a_payment_signed_before_a_crash_is_re_sent_after_it() {
     let client_root = temp();
     let provider_root = temp();
     let ready = ready();
-    let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR);
-    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
+    let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR).await;
+    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR).await;
     let (id, _) = accept(
         &work_policy(),
         &mut [&mut client_store, &mut provider_store],
         1,
-    );
+    )
+    .await;
     let Ok(provider_endpoint) = ProviderEndpoint::new(ready.clone(), provider_store, provider())
     else {
         panic!("the provider endpoint binds");
@@ -977,20 +998,21 @@ async fn a_payment_signed_before_a_crash_is_re_sent_after_it() {
 
     // Signed, and then the process is gone before a byte of the
     // certificate leaves it.
-    let signed = endpoint.pay(id);
+    let signed = endpoint.pay(id).await;
     assert!(signed.is_ok(), "the client signs its payment: {signed:?}");
     drop(endpoint);
     {
         assert_eq!(
             service
                 .with_state(|state| state.ledger().credited_cumulative())
+                .await
                 .expect("the endpoint is reachable"),
             0,
             "and the provider has seen nothing",
         );
     }
 
-    let recovered = store_at(client_root.path(), &ready, Role::Client, CURSOR);
+    let recovered = store_at(client_root.path(), &ready, Role::Client, CURSOR).await;
     let Ok(mut endpoint) = ClientEndpoint::new(ready.clone(), recovered, client()) else {
         panic!("the client endpoint rebinds");
     };
@@ -1002,6 +1024,7 @@ async fn a_payment_signed_before_a_crash_is_re_sent_after_it() {
     assert_eq!(
         service
             .with_state(|state| state.ledger().credited_cumulative())
+            .await
             .expect("the endpoint is reachable"),
         PRICE,
     );
@@ -1019,13 +1042,14 @@ async fn a_refuted_answer_closes_the_job_and_is_not_paid_for() {
     let client_root = temp();
     let provider_root = temp();
     let ready = ready();
-    let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR);
-    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
+    let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR).await;
+    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR).await;
     let (id, _) = accept(
         &work_policy(),
         &mut [&mut client_store, &mut provider_store],
         1,
-    );
+    )
+    .await;
     let Ok(provider_endpoint) = ProviderEndpoint::new(ready.clone(), provider_store, provider())
     else {
         panic!("the provider endpoint binds");
@@ -1089,6 +1113,7 @@ async fn a_refuted_answer_closes_the_job_and_is_not_paid_for() {
         assert_eq!(
             service
                 .with_state(|state| state.ledger().credited_cumulative())
+                .await
                 .expect("the endpoint is reachable"),
             0,
         );
@@ -1109,13 +1134,14 @@ async fn a_refutation_is_permanent_across_a_restart() {
     let client_root = temp();
     let provider_root = temp();
     let ready = ready();
-    let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR);
-    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
+    let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR).await;
+    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR).await;
     let (id, _) = accept(
         &work_policy(),
         &mut [&mut client_store, &mut provider_store],
         1,
-    );
+    )
+    .await;
     let Ok(provider_endpoint) = ProviderEndpoint::new(ready.clone(), provider_store, provider())
     else {
         panic!("the provider endpoint binds");
@@ -1149,7 +1175,7 @@ async fn a_refutation_is_permanent_across_a_restart() {
 
     // Reopened by a process that saw none of this, the job is still
     // refuted: the terminal is on the disk, and it is permanent.
-    let recovered = store_at(client_root.path(), &ready, Role::Client, CURSOR);
+    let recovered = store_at(client_root.path(), &ready, Role::Client, CURSOR).await;
     assert!(
         matches!(
             recovered
@@ -1201,13 +1227,14 @@ async fn an_engine_that_cannot_run_records_no_verdict() {
     let client_root = temp();
     let provider_root = temp();
     let ready = ready();
-    let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR);
-    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
+    let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR).await;
+    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR).await;
     let (id, _) = accept(
         &work_policy(),
         &mut [&mut client_store, &mut provider_store],
         1,
-    );
+    )
+    .await;
     let Ok(provider_endpoint) = ProviderEndpoint::new(ready.clone(), provider_store, provider())
     else {
         panic!("the provider endpoint binds");
@@ -1253,13 +1280,14 @@ async fn a_stalled_reproduction_refuses_to_pay_at_the_barrier() {
     let client_root = temp();
     let provider_root = temp();
     let ready = ready();
-    let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR);
-    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
+    let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR).await;
+    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR).await;
     let (id, authorization) = accept(
         &work_policy(),
         &mut [&mut client_store, &mut provider_store],
         1,
-    );
+    )
+    .await;
     let Ok(provider_endpoint) = ProviderEndpoint::new(ready.clone(), provider_store, provider())
     else {
         panic!("the provider endpoint binds");
@@ -1344,8 +1372,12 @@ impl EdgeBytes {
         out.extend_from_slice(&[FORMAT_VERSION, TAG_BLOCK_HEIGHT]);
         out.extend_from_slice(&HORIZON.to_be_bytes());
         out.extend_from_slice(&[FORMAT_VERSION, TAG_PARTIES]);
-        out.extend_from_slice(&self.maker.to_bytes());
-        out.extend_from_slice(&self.taker.to_bytes());
+        // Each party: owner, signer, and an absent payout delegate.
+        for party in [self.maker, self.taker] {
+            out.extend_from_slice(&party.to_bytes());
+            out.extend_from_slice(&party.to_bytes());
+            out.push(0);
+        }
         out.extend_from_slice(self.terms.as_bytes());
         out.push(self.allowed);
         match Edge::decode_exact(&out) {
@@ -1403,8 +1435,8 @@ fn lease_over(bond: EdgeId, payment: EdgeId) -> LeaseSlots {
     parsed
 }
 
-fn payment_policy() -> hellas_rpc::protocol::work::JobPaymentPolicyV2 {
-    hellas_rpc::protocol::work::JobPaymentPolicyV2 {
+fn payment_policy() -> hellas_work::model::work::JobPaymentPolicyV2 {
+    hellas_work::model::work::JobPaymentPolicyV2 {
         fixed_price: PRICE,
         dispatch_margin_blocks: 4,
         delivery_margin_blocks: 2,

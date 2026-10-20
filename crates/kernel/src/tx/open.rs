@@ -38,8 +38,8 @@ use crate::{
     context::{BlockHeight, Cost, Fees},
     error::InvalidOpenReason,
     list::List,
-    object::{Edge, EdgeValues},
-    primitive::{CoinId, EdgeId, Key},
+    object::{Edge, EdgeValues, PartyKeys},
+    primitive::{CoinId, EdgeId},
     terms::{Terms, TermsProfile, WorkPaymentTerms, WorkStakeBondTerms},
     tx::{CloseKind, Payout, Tx, work},
 };
@@ -85,8 +85,11 @@ impl OpenFunding {
         self.maker.len() + self.taker.len()
     }
 
-    const fn taker_funded(&self) -> bool {
-        !self.taker.is_empty()
+    const fn shape(&self) -> FundingShape {
+        FundingShape {
+            maker: !self.maker.is_empty(),
+            taker: !self.taker.is_empty(),
+        }
     }
 
     /// Sums both parties' contributions, `None` on overflow.
@@ -193,7 +196,7 @@ pub fn open_projection(
     terms: &Terms,
 ) -> Result<OpenProjection, InvalidOpenReason> {
     let debits = open_debits(height, fees, funding.len(), funding.total(), terms)?;
-    check_work_profile_open(&debits.edge, funding.taker_funded(), terms)?;
+    check_work_profile_open(&debits.edge, funding.shape(), terms)?;
     Ok(OpenProjection {
         edge: Tx::edge_id_of(&funding.funding(), terms),
         open_fee: debits.open_fee,
@@ -258,19 +261,20 @@ pub(super) fn open_debits(
 /// reaches for, read-only ones included, because the host has to fetch
 /// them whether or not the answer changes anything.
 ///
-/// The proof units follow the same split. Both native work profiles
-/// verify two signatures at open and are charged for them; the legacy
-/// profiles verify the same two and are charged nothing, which is a
-/// price this change deliberately leaves where it found it rather than
-/// repricing an already deployed open.
+/// Every profile verifies one witness per party, and is charged one
+/// proof unit for each.
 pub(super) fn open_cost(coins: usize, terms: &Terms) -> Cost {
     let inputs = units(coins);
     match terms.profile() {
-        TermsProfile::WorkPayment(_) => Cost::new(1, inputs.saturating_add(4), 2),
-        TermsProfile::WorkStakeBond(_) => Cost::new(1, inputs.saturating_add(1), 2),
-        TermsProfile::Basic => Cost::new(1, inputs.saturating_add(1), 0),
+        TermsProfile::WorkPayment(_) => Cost::new(1, inputs.saturating_add(4), OPEN_WITNESSES),
+        TermsProfile::WorkStakeBond(_) | TermsProfile::Basic => {
+            Cost::new(1, inputs.saturating_add(1), OPEN_WITNESSES)
+        }
     }
 }
+
+/// Witnesses an open verifies: one per party, funded or not.
+const OPEN_WITNESSES: u64 = 2;
 
 /// Reserve locked at open, by profile.
 ///
@@ -338,7 +342,13 @@ fn timeout_payout(values: EdgeValues, terms: &Terms) -> Result<Option<u64>, Inva
 }
 
 /// Checks the terms' committed timeout payouts against the total this
-/// open requires.
+/// open requires, and against the two destinations the terms commit.
+///
+/// A timeout close needs no signature, so whatever these payouts name is
+/// paid to whoever it names. Every one of them must therefore land
+/// exactly at one party's committed destination — owner and delegate
+/// both — or the timeout becomes a way to pay a key the parties never
+/// committed.
 ///
 /// Timeout-vs-height rejection happens earlier, in `open_lifetime_fee`:
 /// a non-future timeout cannot price a lifetime fee. By the time this
@@ -351,10 +361,17 @@ pub(super) fn check_timeout_payout(
         return Ok(());
     };
     let committed = payout_total(outputs).ok_or(InvalidOpenReason::TermsPayoutOverflow)?;
-    if committed == required {
+    if committed != required {
+        return Err(InvalidOpenReason::TermsValueMismatch);
+    }
+    let parties = terms.parties();
+    if outputs
+        .iter()
+        .all(|payout| parties.is_destination(*payout, false))
+    {
         Ok(())
     } else {
-        Err(InvalidOpenReason::TermsValueMismatch)
+        Err(InvalidOpenReason::TimeoutPayoutNotCommitted)
     }
 }
 
@@ -362,23 +379,48 @@ fn payout_total<const N: usize>(outputs: &List<Payout, N>) -> Option<u64> {
     outputs.checked_sum(|output| output.value())
 }
 
+/// Which sides of an open carry funding.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(super) struct FundingShape {
+    maker: bool,
+    taker: bool,
+}
+
+impl FundingShape {
+    pub(super) const fn of(funding: &Funding) -> Self {
+        Self {
+            maker: !funding.maker().is_empty(),
+            taker: !funding.taker().is_empty(),
+        }
+    }
+}
+
 /// Rules the work profiles add to an open, by profile.
 ///
 /// Matching on the profile rather than probing for one shape keeps a
 /// newly added shape from defaulting into "no extra rules".
 ///
-/// The one rule of a work open that is not here is
-/// `requires_native_auth`: it reads the authorization witnesses, which an
-/// open being constructed does not have yet.
+/// Each work shape is funded by its maker and by its maker alone. That
+/// is a rule, not a habit, because it is what proves each party's owner:
+/// the provider's by the bond it funds, the client's by the payment it
+/// funds — and the payment inherits the bond's parties, so every party
+/// that can act on a work edge has had its owner proved by funding on
+/// some edge.
+///
+/// The rules of a work open that are not here read the authorization
+/// witnesses, which an open being constructed does not have yet.
 pub(super) fn check_work_profile_open(
     edge: &Edge,
-    taker_funded: bool,
+    funding: FundingShape,
     terms: &Terms,
 ) -> Result<(), InvalidOpenReason> {
     match terms.profile() {
         TermsProfile::Basic => Ok(()),
         TermsProfile::WorkStakeBond(bond) => {
             check_work_bond_policy(bond)?;
+            if !funding.maker {
+                return Err(InvalidOpenReason::WorkStakeMakerUnfunded);
+            }
             // The stake is the edge's own locked value, and a zero-value
             // object is not a stake bond. There is no second `stake`
             // scalar to compare it against, so this is the whole rule.
@@ -388,7 +430,7 @@ pub(super) fn check_work_profile_open(
             // The stake is the provider's alone. Any client
             // contribution would be handed to the provider by the
             // permissionless timeout an unleased bond admits.
-            if taker_funded {
+            if funding.taker {
                 Err(InvalidOpenReason::WorkStakeTakerFunded)
             } else {
                 Ok(())
@@ -396,18 +438,14 @@ pub(super) fn check_work_profile_open(
         }
         TermsProfile::WorkPayment(payment) => {
             check_work_payment_terms(payment)?;
+            if funding.taker {
+                return Err(InvalidOpenReason::WorkPaymentTakerFunded);
+            }
+            if !funding.maker {
+                return Err(InvalidOpenReason::WorkPaymentMakerUnfunded);
+            }
             work::check_payment_capacity(edge, payment)
         }
-    }
-}
-
-/// True when this profile's later moves are signed with the parties'
-/// own secp256k1 keys, so an open authorized by a passkey would commit a
-/// channel neither party could operate.
-pub(super) const fn requires_native_auth(profile: &TermsProfile<'_>) -> bool {
-    match profile {
-        TermsProfile::Basic => false,
-        TermsProfile::WorkPayment(_) | TermsProfile::WorkStakeBond(_) => true,
     }
 }
 
@@ -468,7 +506,11 @@ fn check_work_payment_terms(payment: &WorkPaymentTerms) -> Result<(), InvalidOpe
     Ok(())
 }
 
-/// True when `outputs` is non-empty and pays nobody but `key`.
-fn paid_solely_to<const N: usize>(outputs: &List<Payout, N>, key: Key) -> bool {
-    !outputs.is_empty() && outputs.iter().all(|payout| payout.owner() == key)
+/// True when `outputs` is non-empty and pays nobody but `party`'s
+/// committed destination, owner and delegate both.
+fn paid_solely_to<const N: usize>(outputs: &List<Payout, N>, party: PartyKeys) -> bool {
+    !outputs.is_empty()
+        && outputs
+            .iter()
+            .all(|payout| party.is_destination(*payout, false))
 }

@@ -29,7 +29,7 @@ use support::l1::{
 };
 use support::{
     FAKE_VERIFIER, FixedStore, REJECT_VERIFIER, coin_id, coin_view, edge_view, list,
-    open_tx as open_tx_with, placeholder_mutual, state,
+    open as open_tx_with, placeholder_mutual, state,
 };
 
 use hellas_kernel::{
@@ -95,11 +95,11 @@ fn terms_paying(maker: u64, taker: u64) -> Terms {
 }
 
 fn proof() -> Proof {
-    Proof::timeout(basic_terms())
+    Proof::timeout(basic_terms(), None)
 }
 
 fn other_proof() -> Proof {
-    Proof::timeout(other_terms_value())
+    Proof::timeout(other_terms_value(), None)
 }
 
 fn mutual_proof(input: EdgeId, outputs: &List<Payout, MAX_EDGE_OUTPUTS>) -> Proof {
@@ -152,7 +152,7 @@ fn open_op() -> Tx {
 fn open_edge_id(open: &Tx) -> EdgeId {
     match open {
         Tx::Open { funding, terms, .. } => Tx::edge_id_of(funding, terms),
-        Tx::Close { .. } | Tx::Move { .. } => panic!("expected Tx::Open"),
+        Tx::Close { .. } | Tx::Move { .. } | Tx::Owner(_) => panic!("expected Tx::Open"),
     }
 }
 
@@ -160,7 +160,18 @@ fn open_edge_id(open: &Tx) -> EdgeId {
 /// `(MAKER, TAKER)`. Adversarial tests use `open_tx_with` and pass the
 /// keys they claim.
 fn open_tx(funding: Funding, terms: Terms) -> Tx {
-    open_tx_with(funding, terms, MAKER, TAKER)
+    open_tx_with(
+        funding,
+        terms,
+        (
+            hellas_kernel::PartyKeys::sole(MAKER),
+            hellas_kernel::Authority::Owner,
+        ),
+        (
+            hellas_kernel::PartyKeys::sole(TAKER),
+            hellas_kernel::Authority::Owner,
+        ),
+    )
 }
 
 fn funding(maker: CoinId, taker: CoinId) -> Funding {

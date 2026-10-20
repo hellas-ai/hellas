@@ -158,11 +158,19 @@ pub enum EventKind {
         output: EdgeId,
     },
 
-    /// One edge was closed into bounded owner-only coins.
+    /// One edge was closed into bounded coin payouts.
     EdgeClosed {
         /// Edge consumed by the close.
         input: EdgeId,
         /// Coins produced by the close.
+        outputs: List<CoinId, MAX_EDGE_OUTPUTS>,
+    },
+
+    /// An owner consumed coins it owned and issued new ones.
+    CoinsReshaped {
+        /// Coins consumed by the reshape.
+        inputs: List<CoinId, MAX_EDGE_INPUTS>,
+        /// Coins issued by the reshape.
         outputs: List<CoinId, MAX_EDGE_OUTPUTS>,
     },
 }
@@ -191,7 +199,7 @@ pub(super) enum Change {
 }
 
 impl Change {
-    pub(super) fn open(inputs: &OpenCoins, output: (EdgeId, Edge)) -> Self {
+    pub(super) fn open(inputs: &OpenCoins, output: &(EdgeId, Edge)) -> Self {
         let event = Event {
             kind: EventKind::EdgeOpened {
                 inputs: Self::ids(inputs),
@@ -201,12 +209,12 @@ impl Change {
 
         Self::Public {
             event,
-            effect: Effect::open(inputs.clone(), output),
+            effect: Effect::open(inputs.clone(), *output),
             registry: RegistryDiff::empty(),
         }
     }
 
-    pub(super) fn close(input: (EdgeId, Edge), outputs: &CloseCoins) -> Self {
+    pub(super) fn close(input: &(EdgeId, Edge), outputs: &CloseCoins) -> Self {
         let event = Event {
             kind: EventKind::EdgeClosed {
                 input: input.0,
@@ -216,7 +224,25 @@ impl Change {
 
         Self::Public {
             event,
-            effect: Effect::close(input, outputs.clone()),
+            effect: Effect::close(*input, outputs.clone()),
+            registry: RegistryDiff::empty(),
+        }
+    }
+
+    pub(super) fn reshape(inputs: &OpenCoins, outputs: &CloseCoins) -> Self {
+        let event = Event {
+            kind: EventKind::CoinsReshaped {
+                inputs: Self::ids(inputs),
+                outputs: Self::ids(outputs),
+            },
+        };
+
+        Self::Public {
+            event,
+            effect: Effect::Reshape {
+                inputs: inputs.clone(),
+                outputs: outputs.clone(),
+            },
             registry: RegistryDiff::empty(),
         }
     }
@@ -295,13 +321,25 @@ pub(super) enum Effect {
         edge: (EdgeId, Edge),
         coins: CloseCoins,
     },
+    Reshape {
+        inputs: OpenCoins,
+        outputs: CloseCoins,
+    },
 }
 
 impl Effect {
+    #[allow(
+        clippy::large_types_passed_by_value,
+        reason = "the effect owns the edge it stores"
+    )]
     const fn open(coins: OpenCoins, edge: (EdgeId, Edge)) -> Self {
         Self::Open { edge, coins }
     }
 
+    #[allow(
+        clippy::large_types_passed_by_value,
+        reason = "the effect owns the edge it stores"
+    )]
     const fn close(edge: (EdgeId, Edge), coins: CloseCoins) -> Self {
         Self::Close { edge, coins }
     }
@@ -310,11 +348,15 @@ impl Effect {
         match self {
             Self::Open { coins, edge } => {
                 Self::remove_coins(batch, coins)?;
-                Self::insert_edge(batch, *edge)
+                Self::insert_edge(batch, edge)
             }
             Self::Close { edge, coins } => {
-                Self::remove_edge(batch, *edge)?;
+                Self::remove_edge(batch, edge)?;
                 Self::insert_coins(batch, coins)
+            }
+            Self::Reshape { inputs, outputs } => {
+                Self::remove_coins(batch, inputs)?;
+                Self::insert_coins(batch, outputs)
             }
         }
     }
@@ -353,13 +395,13 @@ impl Effect {
         }
     }
 
-    fn insert_edge<B: Batch>(batch: &mut B, edge: (EdgeId, Edge)) -> KernelResult<()> {
+    fn insert_edge<B: Batch>(batch: &mut B, edge: &(EdgeId, Edge)) -> KernelResult<()> {
         batch
             .insert_edge(edge.0, edge.1)
             .map_err(|reason| ApplyError::EdgeInsertRejected { id: edge.0, reason })
     }
 
-    fn remove_edge<B: Batch>(batch: &mut B, edge: (EdgeId, Edge)) -> KernelResult<()> {
+    fn remove_edge<B: Batch>(batch: &mut B, edge: &(EdgeId, Edge)) -> KernelResult<()> {
         match batch.remove_edge(edge.0) {
             Some(removed) if removed == edge.1 => Ok(()),
             Some(_) => Err(ApplyError::EdgeChanged { id: edge.0 }),
@@ -378,7 +420,7 @@ impl Effect {
 mod tests {
     use super::*;
     use crate::{
-        BlockHeight, Fees, Key, MAX_REGISTRY_MUTATIONS, Parties, TermsHash,
+        BlockHeight, Fees, Key, MAX_REGISTRY_MUTATIONS, Parties, PartyKeys, TermsHash,
         registry::{
             RegistryChunk, RegistryChunkId, RegistryDiffError, RegistryMutation, RegistryNamespace,
             RegistryRecordTag,
@@ -395,6 +437,16 @@ mod tests {
                 assert_eq!(*input, edge.0);
                 assert_eq!(outputs, &Change::ids(coins));
             }
+            (
+                EventKind::CoinsReshaped {
+                    inputs: input_ids,
+                    outputs: output_ids,
+                },
+                Effect::Reshape { inputs, outputs },
+            ) => {
+                assert_eq!(input_ids, &Change::ids(inputs));
+                assert_eq!(output_ids, &Change::ids(outputs));
+            }
             _ => panic!("event and effect variants diverged"),
         }
     }
@@ -405,19 +457,19 @@ mod tests {
         let first = CoinId::from_bytes([0x31; CoinId::LENGTH]);
         let second = CoinId::from_bytes([0x32; CoinId::LENGTH]);
         let mut coin_slots = [(CoinId::ZERO, Coin::ZERO); MAX_EDGE_INPUTS];
-        coin_slots[0] = (first, Coin::issue(maker, 40));
-        coin_slots[1] = (second, Coin::issue(taker, 60));
+        coin_slots[0] = (first, Coin::issue(maker, None, 40));
+        coin_slots[1] = (second, Coin::issue(taker, None, 60));
         let coins = List::take(coin_slots, 2);
         let edge = Edge::open(
             100,
-            Parties::new(maker, taker),
+            Parties::new(PartyKeys::sole(maker), PartyKeys::sole(taker)),
             TermsHash::from_bytes([0x44; TermsHash::LENGTH]),
             (0, 0, 0, Fees::ZERO),
             BlockHeight::new(10),
             crate::tx::CloseKindSet::BASIC,
         )
         .expect("coherence edge");
-        Change::open(&coins, (EdgeId::from_bytes([0x51; EdgeId::LENGTH]), edge))
+        Change::open(&coins, &(EdgeId::from_bytes([0x51; EdgeId::LENGTH]), edge))
     }
 
     fn effect_of(change: &Change) -> &Effect {
@@ -456,13 +508,31 @@ mod tests {
         let mut coin_slots = [(CoinId::ZERO, Coin::ZERO); MAX_EDGE_OUTPUTS];
         coin_slots[0] = (
             CoinId::from_bytes([0x61; CoinId::LENGTH]),
-            Coin::issue(maker, 40),
+            Coin::issue(maker, None, 40),
         );
         coin_slots[1] = (
             CoinId::from_bytes([0x62; CoinId::LENGTH]),
-            Coin::issue(taker, 60),
+            Coin::issue(taker, None, 60),
         );
-        let change = Change::close(edge, &List::take(coin_slots, 2));
+        let change = Change::close(&edge, &List::take(coin_slots, 2));
+        assert_coherent(&event_of(&change), effect_of(&change));
+    }
+
+    #[test]
+    fn reshape_event_ids_equal_effect_mutation_slots() {
+        let owner = Key::from_bytes([0x11; Key::LENGTH]);
+        let node = Key::from_bytes([0x12; Key::LENGTH]);
+        let mut inputs = [(CoinId::ZERO, Coin::ZERO); MAX_EDGE_INPUTS];
+        inputs[0] = (
+            CoinId::from_bytes([0x71; CoinId::LENGTH]),
+            Coin::issue(owner, None, 30),
+        );
+        let mut outputs = [(CoinId::ZERO, Coin::ZERO); MAX_EDGE_OUTPUTS];
+        outputs[0] = (
+            CoinId::from_bytes([0x72; CoinId::LENGTH]),
+            Coin::issue(owner, Some(node), 30),
+        );
+        let change = Change::reshape(&List::take(inputs, 1), &List::take(outputs, 1));
         assert_coherent(&event_of(&change), effect_of(&change));
     }
 

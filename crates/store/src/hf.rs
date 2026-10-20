@@ -446,41 +446,35 @@ pub fn publish(dest: &Path, content: &[u8]) -> Result<()> {
     let name = dest
         .file_name()
         .ok_or_else(|| FetchError::Malformed(format!("{} is not a file name", dest.display())))?;
-    let mut incoming = name.to_os_string();
-    incoming.push(format!(
-        ".{}.{}.incoming",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos(),
-    ));
-    let incoming = dest.with_file_name(incoming);
-
+    let parent = dest
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
     let io = |context: String| move |source| FetchError::Io { context, source };
-    let write = || -> Result<()> {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&incoming)
-            .map_err(io(format!("creating {}", incoming.display())))?;
-        file.write_all(content)
-            .map_err(io(format!("writing {}", incoming.display())))?;
-        file.sync_all()
-            .map_err(io(format!("syncing {}", incoming.display())))?;
-        std::fs::rename(&incoming, dest).map_err(io(format!(
-            "renaming {} to {}",
-            incoming.display(),
-            dest.display(),
-        )))
-    };
-    let outcome = write();
-    if outcome.is_err() {
-        // Ours, and only ours: a file we created under a name nobody
-        // else knows.
-        let _ = std::fs::remove_file(&incoming);
-    }
-    outcome
+    let mut incoming = tempfile::Builder::new()
+        .prefix(name)
+        .suffix(".incoming")
+        .make_in(parent, |path| {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+        })
+        .map_err(io(format!(
+            "creating temporary file beside {}",
+            dest.display()
+        )))?;
+    incoming
+        .write_all(content)
+        .map_err(io(format!("writing {}", incoming.path().display())))?;
+    incoming
+        .as_file()
+        .sync_all()
+        .map_err(io(format!("syncing {}", incoming.path().display())))?;
+    let incoming = incoming.into_temp_path();
+    std::fs::rename(&incoming, dest).map_err(io(format!("publishing {}", dest.display())))?;
+    let _published = incoming.keep();
+    Ok(())
 }
 
 /// Trims the leading offset and checks the result is the content that

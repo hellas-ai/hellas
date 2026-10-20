@@ -3,8 +3,8 @@
 #![allow(clippy::indexing_slicing)] // tests may index; the panic-freedom lock targets src
 use hellas_kernel::{
     BlockHash, BlockHeight, CoinId, Context, Cost, Decode, DecodeError, EdgeId, Encode, Fees,
-    Funding, Key, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Parties, Party, Payout, ProtocolCode,
-    Sig, Terms, Tx,
+    Funding, Key, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Parties, Party, PartyKeys, Payout,
+    ProtocolCode, Sig, Terms, Tx,
 };
 
 const NETWORK: hellas_kernel::NetworkId = match hellas_kernel::NetworkId::new("hellas-kernel-test")
@@ -36,7 +36,7 @@ fn party_tags_are_stable() {
 fn terms_hash_commits_to_basic_fields() {
     let maker = Key::from_bytes([1; Key::LENGTH]);
     let taker = Key::from_bytes([2; Key::LENGTH]);
-    let parties = Parties::new(maker, taker);
+    let parties = Parties::new(PartyKeys::sole(maker), PartyKeys::sole(taker));
     let timeout = BlockHeight::new(11);
     let outputs = payouts(Payout::new(maker, 6), Payout::new(taker, 4));
     let other_outputs = payouts(Payout::new(maker, 5), Payout::new(taker, 5));
@@ -111,7 +111,10 @@ fn byte_newtypes_preserve_their_canonical_bytes() {
 
     let terms_hash = Terms::basic(
         ProtocolCode::new(7),
-        Parties::new(key, Key::from_bytes([6; Key::LENGTH])),
+        Parties::new(
+            PartyKeys::sole(key),
+            PartyKeys::sole(Key::from_bytes([6; Key::LENGTH])),
+        ),
         BlockHeight::new(9),
         payouts(Payout::new(key, 1), Payout::new(key, 2)),
     )
@@ -127,7 +130,7 @@ fn byte_newtypes_preserve_their_canonical_bytes() {
     );
     let payload_terms = Terms::basic(
         ProtocolCode::new(9),
-        Parties::new(key, key),
+        Parties::new(PartyKeys::sole(key), PartyKeys::sole(key)),
         BlockHeight::new(10),
         payouts(Payout::new(key, 0), Payout::new(key, 0)),
     );

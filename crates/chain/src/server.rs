@@ -1,26 +1,22 @@
-use crate::domain::Bounded;
-use crate::domain::{
-    Address, Coin, DecodeExt, Digest, MAX_MERGE_INPUTS, ObjectId, SettlementKey, Transaction,
-    UserPublicKey, UserSignature, WebAuthnSignature,
-};
+use crate::domain::{Coin, Digest, SettlementKey, Transaction};
 use crate::{
     ConsensusActivity, ConsensusInfo, EdgeLookup, EdgeState, FinalizedBlock, FinalizedBlockQuery,
     LatestBlock, LightClient as LightClientApi, MAX_CANONICAL_TRANSACTION_BYTES, OwnerEdges,
     ProposalInfo,
 };
-use futures_util::{Stream, StreamExt as _};
+use futures_util::StreamExt as _;
+use hellas_auth::authority::UnixMillis;
 use hellas_kernel::{Decode as _, Move as KernelMove, Tx as KernelTx};
 use hellas_rpc::pb::{
     chain::{
         self as pb, ActivityEvent, CoinEntry, EdgeEntry, EdgeState as ProtoEdgeState,
         FinalizationEvent, FinalizedBlock as ProtoFinalizedBlock, FinalizedSnapshot,
-        GetCoinResponse, GetCoinsByOwnerResponse, GetConsensusInfoResponse, GetEdgeResponse,
+        GetCoinResponse, GetCoinsResponse, GetConsensusInfoResponse, GetEdgeResponse,
         GetEdgesByOwnerResponse, GetFinalizationResponse, GetFinalizedBlockResponse,
         GetLatestBlockResponse, GetProofResponse, GetRelayInfoResponse, GetStateRootResponse,
-        GetValidatorsResponse, KernelFees, MergeCoinTx, NotarizationEvent, NotarizeEvent,
-        NullificationEvent, NullifyEvent, SubmitTxOutcome as ProtoSubmitTxOutcome,
-        SubmitTxResponse, SubmitWorkResponseRequest, TransferTx,
-        WebAuthnSignature as ProtoWebAuthnSignature, activity_event, submit_tx_request,
+        GetValidatorsResponse, KernelFees, NotarizationEvent, NotarizeEvent, NullificationEvent,
+        NullifyEvent, SubmitTxOutcome as ProtoSubmitTxOutcome, SubmitTxResponse,
+        SubmitWorkResponseRequest, activity_event, submit_tx_request,
     },
     services::light_client::{LightClientHandler, LightClientServer},
 };
@@ -29,15 +25,7 @@ use hellas_rpc::{
     call::{GeneralSubmitRoute, WorkResponseRoute},
 };
 use hellas_wire::{PeerIdentity, StreamTransport, TransportContext, WireCode, WireStatus};
-use p256::ecdsa::Signature as P256Signature;
-use std::{
-    collections::HashMap,
-    io,
-    net::SocketAddr,
-    pin::Pin,
-    sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{collections::HashMap, io, net::SocketAddr, sync::Arc};
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::broadcast,
@@ -47,8 +35,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_tungstenite::accept_async;
 use tracing::{info, warn};
 
-type ActivityStream =
-    Pin<Box<dyn Stream<Item = Result<ActivityEvent, WireStatus>> + Send + 'static>>;
+type ActivityStream = hellas_rpc::call::ResponseStream<ActivityEvent>;
 pub type LightClientServerError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 #[derive(Clone)]
@@ -66,7 +53,8 @@ pub struct LightClientRpc<T> {
 pub struct LightClientRpcState {
     response_route: Arc<WorkResponseRoute>,
     general_route: Arc<GeneralSubmitRoute>,
-    general_sources: Arc<tokio::sync::Mutex<GeneralSourceTable>>,
+    general_sources: Arc<tokio::sync::Mutex<SubmissionSourceTable>>,
+    response_sources: Arc<tokio::sync::Mutex<SubmissionSourceTable>>,
 }
 
 impl Default for LightClientRpcState {
@@ -74,21 +62,46 @@ impl Default for LightClientRpcState {
         Self {
             response_route: Arc::new(WorkResponseRoute::default()),
             general_route: Arc::new(GeneralSubmitRoute::default()),
-            general_sources: Arc::new(tokio::sync::Mutex::new(GeneralSourceTable::default())),
+            general_sources: Arc::new(tokio::sync::Mutex::new(SubmissionSourceTable::default())),
+            response_sources: Arc::new(tokio::sync::Mutex::new(SubmissionSourceTable::default())),
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-enum GeneralSourceKey {
+enum SubmissionSourceKey {
     Anonymous,
     Peer(PeerIdentity),
 }
 
 #[derive(Default)]
-struct GeneralSourceTable {
+struct SubmissionSourceTable {
     height: Option<u64>,
-    attempts: HashMap<GeneralSourceKey, u8>,
+    attempts: HashMap<SubmissionSourceKey, u8>,
+}
+
+impl SubmissionSourceTable {
+    fn consume(&mut self, context: &TransportContext, height: u64) -> bool {
+        if self.height.is_none_or(|observed| height > observed) {
+            self.height = Some(height);
+            self.attempts.clear();
+        }
+        let key = context
+            .vouched_peer()
+            .map_or(SubmissionSourceKey::Anonymous, SubmissionSourceKey::Peer);
+        if let Some(attempts) = self.attempts.get_mut(&key) {
+            if *attempts >= 8 {
+                return false;
+            }
+            *attempts += 1;
+            return true;
+        }
+        if self.attempts.len() >= 256 {
+            return false;
+        }
+        self.attempts.insert(key, 1);
+        true
+    }
 }
 
 impl<T> LightClientRpc<T> {
@@ -106,29 +119,6 @@ impl<T> LightClientRpc<T> {
             activity_tx,
             state,
         }
-    }
-
-    async fn consume_general_attempt(&self, context: &TransportContext, height: u64) -> bool {
-        let mut table = self.state.general_sources.lock().await;
-        if table.height != Some(height) {
-            table.height = Some(height);
-            table.attempts.clear();
-        }
-        let key = context
-            .peer
-            .map_or(GeneralSourceKey::Anonymous, GeneralSourceKey::Peer);
-        if let Some(attempts) = table.attempts.get_mut(&key) {
-            if *attempts >= 8 {
-                return false;
-            }
-            *attempts += 1;
-            return true;
-        }
-        if table.attempts.len() >= 256 {
-            return false;
-        }
-        table.attempts.insert(key, 1);
-        true
     }
 }
 
@@ -325,7 +315,13 @@ where
                 .await
                 .map_err(WireStatus::from)?
                 .map_or(0, |latest| latest.height);
-            if !self.consume_general_attempt(&context, height).await {
+            if !self
+                .state
+                .general_sources
+                .lock()
+                .await
+                .consume(&context, height)
+            {
                 return Ok(SubmitTxResponse {
                     outcome: ProtoSubmitTxOutcome::Full as i32,
                 });
@@ -340,6 +336,7 @@ where
     fn submit_work_response(
         &self,
         request: SubmitWorkResponseRequest,
+        context: TransportContext,
     ) -> impl Future<Output = Result<SubmitTxResponse, WireStatus>> + Send {
         let client = self.client.clone();
         async move {
@@ -350,6 +347,22 @@ where
                         "response must be one canonical PaymentCloseResponse",
                     )
                 })?;
+            let height = client
+                .get_latest_block()
+                .await
+                .map_err(WireStatus::from)?
+                .map_or(0, |latest| latest.height);
+            if !self
+                .state
+                .response_sources
+                .lock()
+                .await
+                .consume(&context, height)
+            {
+                return Ok(SubmitTxResponse {
+                    outcome: ProtoSubmitTxOutcome::Full as i32,
+                });
+            }
             let tx = Transaction::Kernel(KernelTx::move_action(KernelMove::RespondPaymentClose(
                 response,
             )));
@@ -382,7 +395,7 @@ where
                     }
                 }
             });
-            Ok(Box::pin(stream) as ActivityStream)
+            Ok(ActivityStream::new(stream))
         }
     }
 
@@ -400,32 +413,30 @@ where
     fn get_coins_by_owner(
         &self,
         request: pb::GetCoinsByOwnerRequest,
-    ) -> impl Future<Output = Result<GetCoinsByOwnerResponse, WireStatus>> + Send {
+    ) -> impl Future<Output = Result<GetCoinsResponse, WireStatus>> + Send {
         let client = self.client.clone();
         async move {
             let owner = settlement_key_from_bytes(request.owner, "owner")?;
-            let response = match client
+            let response = client
                 .get_coins_by_owner(owner)
                 .await
-                .map_err(WireStatus::from)?
-            {
-                Some(owner_coins) => GetCoinsByOwnerResponse {
-                    snapshot: Some(latest_block_to_proto(owner_coins.snapshot)),
-                    coins: owner_coins
-                        .coins
-                        .into_iter()
-                        .map(|(object_id, value)| CoinEntry {
-                            object_id: object_id.to_vec(),
-                            value,
-                        })
-                        .collect(),
-                },
-                None => GetCoinsByOwnerResponse {
-                    snapshot: None,
-                    coins: Vec::new(),
-                },
-            };
-            Ok(response)
+                .map_err(WireStatus::from)?;
+            Ok(coin_listing_response(response))
+        }
+    }
+
+    fn get_coins_by_delegate(
+        &self,
+        request: pb::GetCoinsByDelegateRequest,
+    ) -> impl Future<Output = Result<GetCoinsResponse, WireStatus>> + Send {
+        let client = self.client.clone();
+        async move {
+            let delegate = settlement_key_from_bytes(request.delegate, "delegate")?;
+            let response = client
+                .get_coins_by_delegate(delegate)
+                .await
+                .map_err(WireStatus::from)?;
+            Ok(coin_listing_response(response))
         }
     }
 
@@ -490,17 +501,6 @@ fn digest_from_bytes(bytes: Vec<u8>, field: &'static str) -> Result<Digest, Wire
     Ok(Digest::from(raw))
 }
 
-fn address_from_bytes(bytes: Vec<u8>, field: &'static str) -> Result<Address, WireStatus> {
-    UserPublicKey::decode(bytes.as_slice())
-        .map(Address::from)
-        .map_err(|_| {
-            WireStatus::new(
-                WireCode::InvalidArgument,
-                format!("{field} must be a valid public key"),
-            )
-        })
-}
-
 fn settlement_key_from_bytes(
     bytes: Vec<u8>,
     field: &'static str,
@@ -513,41 +513,6 @@ fn settlement_key_from_bytes(
         )
     })?;
     Ok(SettlementKey::from_bytes(raw))
-}
-
-fn user_signature_from_der(bytes: &[u8]) -> Result<UserSignature, WireStatus> {
-    let signature = P256Signature::from_der(bytes).map_err(|_| {
-        WireStatus::new(
-            WireCode::InvalidArgument,
-            "signature must be valid DER-encoded P-256 ECDSA",
-        )
-    })?;
-    let normalized = signature.normalize_s();
-    UserSignature::decode(normalized.to_bytes().as_ref()).map_err(|_| {
-        WireStatus::new(
-            WireCode::InvalidArgument,
-            "signature must be a valid low-S P-256 signature",
-        )
-    })
-}
-
-fn webauthn_signature_from_proto(
-    signature: Option<ProtoWebAuthnSignature>,
-) -> Result<WebAuthnSignature, WireStatus> {
-    let signature = signature
-        .ok_or_else(|| WireStatus::new(WireCode::InvalidArgument, "missing WebAuthn signature"))?;
-    let user_signature = user_signature_from_der(&signature.ecdsa_signature)?;
-    WebAuthnSignature::new(
-        user_signature,
-        &signature.authenticator_data,
-        &signature.client_data_json,
-    )
-    .ok_or_else(|| {
-        WireStatus::new(
-            WireCode::InvalidArgument,
-            "invalid WebAuthn signature payload",
-        )
-    })
 }
 
 fn submit_tx_outcome_to_proto(outcome: SubmitTxOutcome) -> ProtoSubmitTxOutcome {
@@ -574,8 +539,6 @@ fn transaction_from_proto(request: pb::SubmitTxRequest) -> Result<Transaction, W
         .tx
         .ok_or_else(|| WireStatus::new(WireCode::InvalidArgument, "missing transaction"))?
     {
-        submit_tx_request::Tx::Transfer(tx) => transfer_from_proto(tx),
-        submit_tx_request::Tx::MergeCoin(tx) => merge_from_proto(tx),
         submit_tx_request::Tx::KernelTx(bytes) => kernel_from_proto(&bytes),
     }
 }
@@ -591,54 +554,21 @@ fn kernel_from_proto(bytes: &[u8]) -> Result<Transaction, WireStatus> {
         })
 }
 
-fn transfer_from_proto(tx: TransferTx) -> Result<Transaction, WireStatus> {
-    Ok(Transaction::Transfer {
-        input: digest_from_bytes(tx.input, "input")?,
-        recipient: address_from_bytes(tx.recipient, "recipient")?,
-        amount: tx.amount,
-        signature: webauthn_signature_from_proto(tx.signature)?,
-    })
-}
-
-fn merge_from_proto(tx: MergeCoinTx) -> Result<Transaction, WireStatus> {
-    if tx.inputs.len() < 2 {
-        return Err(WireStatus::new(
-            WireCode::InvalidArgument,
-            "merge requires at least 2 inputs",
-        ));
-    }
-    if tx.inputs.len() > MAX_MERGE_INPUTS {
-        return Err(WireStatus::new(
-            WireCode::InvalidArgument,
-            format!("merge supports at most {MAX_MERGE_INPUTS} inputs"),
-        ));
-    }
-    let len = tx.inputs.len();
-    let mut inputs = [ObjectId::from([0; 32]); MAX_MERGE_INPUTS];
-    for (index, input) in tx.inputs.into_iter().enumerate() {
-        inputs[index] = digest_from_bytes(input, "input")?;
-    }
-    let inputs = Bounded::new(inputs, len).ok_or_else(|| {
-        WireStatus::new(
-            WireCode::InvalidArgument,
-            "merge input count exceeds capacity",
-        )
-    })?;
-    Ok(Transaction::MergeCoin {
-        inputs,
-        signature: webauthn_signature_from_proto(tx.signature)?,
-    })
-}
-
 fn coin_response(coin: Option<Coin>) -> GetCoinResponse {
     match coin {
-        Some(Coin { owner, value }) => GetCoinResponse {
+        Some(Coin {
+            owner,
+            delegate,
+            value,
+        }) => GetCoinResponse {
             owner: Some(owner.to_bytes().to_vec()),
             value: Some(value),
+            delegate: delegate.map(|delegate| delegate.to_bytes().to_vec()),
         },
         None => GetCoinResponse {
             owner: None,
             value: None,
+            delegate: None,
         },
     }
 }
@@ -761,11 +691,7 @@ fn activity_is_requested(urgent_events: &[i32], activity: &ConsensusActivity) ->
 }
 
 fn unix_time_ms() -> u64 {
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    u64::try_from(millis).unwrap_or(u64::MAX)
+    UnixMillis::now().unwrap_or_default().0
 }
 
 fn activity_to_proto(activity: ConsensusActivity) -> ActivityEvent {
@@ -856,4 +782,24 @@ where
     Ok(GetFinalizationResponse {
         certificate: read(digest_from_bytes(request.payload, "payload")?).await?,
     })
+}
+
+fn coin_listing_response(response: Option<crate::CoinListing>) -> GetCoinsResponse {
+    match response {
+        Some(listing) => GetCoinsResponse {
+            snapshot: Some(latest_block_to_proto(listing.snapshot)),
+            coins: listing
+                .coins
+                .into_iter()
+                .map(|(object_id, value)| CoinEntry {
+                    object_id: object_id.to_vec(),
+                    value,
+                })
+                .collect(),
+        },
+        None => GetCoinsResponse {
+            snapshot: None,
+            coins: Vec::new(),
+        },
+    }
 }

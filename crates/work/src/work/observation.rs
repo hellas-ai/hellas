@@ -1,7 +1,8 @@
 //! Process-local freshness of a continuously observed channel.
 
 use super::EndpointError;
-use std::time::{Duration, SystemTime};
+use hellas_auth::authority::UnixMillis;
+use std::time::Duration;
 use tokio::time::Instant;
 
 /// Capture before reading the chain. Using both clocks counts host sleep even
@@ -9,7 +10,7 @@ use tokio::time::Instant;
 #[derive(Clone, Copy, Debug)]
 pub struct ObservationTime {
     monotonic: Instant,
-    wall: SystemTime,
+    wall: Option<UnixMillis>,
 }
 
 impl ObservationTime {
@@ -18,15 +19,13 @@ impl ObservationTime {
     pub fn now() -> Self {
         Self {
             monotonic: Instant::now(),
-            wall: SystemTime::now(),
+            wall: UnixMillis::now().ok(),
         }
     }
 
     fn elapsed(self) -> Option<Duration> {
-        self.wall
-            .elapsed()
-            .ok()
-            .map(|wall| wall.max(self.monotonic.elapsed()))
+        let elapsed = UnixMillis::now().ok()?.0.checked_sub(self.wall?.0)?;
+        Some(Duration::from_millis(elapsed).max(self.monotonic.elapsed()))
     }
 }
 
@@ -67,17 +66,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn an_unreadable_clock_cannot_establish_freshness() {
+        let mut observation = Observation::default();
+        observation.confirm(
+            1,
+            ObservationTime {
+                monotonic: Instant::now(),
+                wall: None,
+            },
+            Duration::from_secs(5),
+        );
+        assert_eq!(observation.check(), Err(EndpointError::ObservationStale));
+    }
+
+    #[test]
     fn host_sleep_and_clock_rollback_cannot_extend_readiness() {
-        for wall in [
-            SystemTime::now() - Duration::from_secs(60),
-            SystemTime::now() + Duration::from_secs(60),
-        ] {
+        let now = UnixMillis::now().unwrap();
+        for wall in [UnixMillis(now.0 - 60_000), UnixMillis(now.0 + 60_000)] {
             let mut observation = Observation::default();
             observation.confirm(
                 1,
                 ObservationTime {
                     monotonic: Instant::now(),
-                    wall,
+                    wall: Some(wall),
                 },
                 Duration::from_secs(5),
             );

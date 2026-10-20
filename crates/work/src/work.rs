@@ -5,7 +5,7 @@
 //!
 //! Canonical private records, and nothing else. `AcceptWorkRequest`
 //! carries the exact bytes of a [`PaidJobAuthorizationV2`] and a
-//! [`hellas_rpc::protocol::artifacts::PreparedPaidInputV1`], not a protobuf transcription of their
+//! [`crate::model::prepared_input::PreparedPaidInputV1`], not a protobuf transcription of their
 //! fields, because the two signatures on this exchange are over digests
 //! of those bytes. A protobuf spelling beside them would be a second
 //! definition of what both parties signed, agreeing with the first until
@@ -118,6 +118,9 @@
 //! step, and the caller that owns a clock is the one that repeats it.
 
 mod observation;
+use hellas_rpc::pb::work::Refusable;
+use hex::encode as hex;
+
 use observation::Observation;
 pub use observation::ObservationTime;
 
@@ -129,8 +132,11 @@ mod stream;
 use admission::{AdmissionError, AdmittedWork, CapacityDomain, WorkAdmission, WorkPermit};
 pub use stream::{PaidProgress, PaidResultStream, ProgressError, fetch_result_stream};
 
+use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
+
+use crate::endpoint_lock::{EndpointGuard, EndpointLock};
 
 use hellas_kernel::{
     Decode as _, EarnedCertificate, Move, Party, PaymentCloseStart, PendingSlot, Secp256k1Signer,
@@ -140,17 +146,27 @@ use hellas_wire::{StreamTransport, TransportContext, WireStatus};
 
 use prost::Message as _;
 
+use crate::model::fetch::{FetchPolicyV2, PreparedPaidFetchInputParts};
+use crate::model::prepared_input::PreparedPaidInputParts;
+use crate::model::profile::{PreparedWorkInput, WorkPolicy};
+use crate::model::setup::{ObservedChannel, ReadyChannel, WorkSetupError};
+use crate::model::work::encode_kernel;
+use crate::model::work::{
+    JobDeadlines, PaidJobAuthorizationV2, PaidJobResultV1, PaidWorkError, PaymentBindingV1,
+    PrivateRecord as _, delivery_request_digest, encode_transcript, next_payment,
+    payment_binding_digest, result_digest, signing_hash, work_id,
+};
 use crate::work_close::{
     CatchUpError, CloseChannel, CloseError, CloseProgress, FinalizedBlocks, FinalizedWork, TxSink,
     adjudicated_close, advance_close, catch_up, close_duty_present, close_response, close_start,
     observe, response_body_digest,
 };
-use crate::work_store::channel::encode_kernel;
 use crate::work_store::journal::MAX_RECORD_BYTES;
 use crate::work_store::{
     Channel, ChannelRecord, ChannelStateError, ChannelStore, JobPhase, JobState, PaidCertificate,
-    Role, TerminalOutcome, WorkStoreError, hex,
+    Role, TerminalOutcome, WorkStoreError,
 };
+use hellas_auth::Digest;
 use hellas_rpc::observe::{LEVEL, TARGET, Timing};
 use hellas_rpc::pb::work::{
     AcceptWorkRequest, AcceptWorkResponse, AdmitCertificateRequest, AdmitCertificateResponse,
@@ -159,16 +175,6 @@ use hellas_rpc::pb::work::{
     admit_certificate_response::Outcome as AdmitOutcome,
     deliver_result_response::Outcome as DeliverOutcome,
 };
-use hellas_rpc::protocol::Digest;
-use hellas_rpc::protocol::artifacts::PreparedPaidInputParts;
-use hellas_rpc::protocol::work::{
-    JobDeadlines, PaidJobAuthorizationV2, PaidJobResultV1, PaidWorkError, PaymentBindingV1,
-    PrivateRecord as _, delivery_request_digest, encode_transcript, next_payment,
-    payment_binding_digest, result_digest, signing_hash, work_id,
-};
-use hellas_rpc::protocol::work_fetch::{FetchPolicyV2, PreparedPaidFetchInputParts};
-use hellas_rpc::protocol::work_profile::{PreparedWorkInput, WorkPolicy};
-use hellas_rpc::protocol::work_setup::{ObservedChannel, ReadyChannel, WorkSetupError};
 use hellas_rpc::services::work::{WorkClientImpl, WorkHandler};
 use hellas_rpc::{EvaluateRequest, OutputEventEnvelope, SubmitTxOutcome};
 
@@ -503,14 +509,14 @@ fn bind_store(
 /// Built from the journal and the key alone, because that is all a close
 /// reads. A close driver exists *because* a channel is contested, or its
 /// bond is gone, or its horizon has passed — and
-/// [`WorkChannelDescriptor::check_ready`](hellas_rpc::protocol::work_setup::WorkChannelDescriptor::check_ready)
+/// [`WorkChannelDescriptor::check_ready`](crate::model::setup::WorkChannelDescriptor::check_ready)
 /// refuses every one of those. A close capability that needed a
 /// [`ReadyChannel`] could therefore never be built for the channels it
 /// exists for.
 ///
 /// The two facts every method here reads are the *store's*: the channel
 /// each signature is bound to, and what the funded edge settles. Both
-/// were fixed when the journal was opened, and [`bind`] is what asserts
+/// were fixed when the journal was opened, and `bind` is what asserts
 /// they are the same two a readiness decision carries — so nothing is
 /// bypassed by reading them here, and there is no second copy to
 /// disagree with. What a readiness decision adds beyond them — the
@@ -531,7 +537,7 @@ pub struct CloseEndpoint {
 ///
 /// It owns one channel's journal and answers proposals on that channel
 /// alone. A proposal naming another channel is refused by
-/// [`hellas_rpc::protocol::work::check_authorization`], never routed: routing many channels through
+/// [`crate::model::work::check_authorization`], never routed: routing many channels through
 /// one endpoint is a later concern, and pretending to do it here would
 /// mean an authorization whose `channel_id` selects its own validator.
 ///
@@ -696,8 +702,8 @@ impl ProviderEndpoint {
     /// the deadlines still allow. A crash after the second commit and
     /// before the answer reaches the client leaves an accepted job, and
     /// the retry returns the retained signature.
-    pub fn accept(&mut self, request: &AcceptWorkRequest) -> AcceptWorkResponse {
-        acceptance_response(self.decide(request))
+    pub async fn accept(&mut self, request: &AcceptWorkRequest) -> AcceptWorkResponse {
+        acceptance_response(self.decide(request).await)
     }
 
     fn authenticate_proposal(
@@ -763,7 +769,7 @@ impl ProviderEndpoint {
         Ok(None)
     }
 
-    fn decide(&mut self, request: &AcceptWorkRequest) -> Result<(Digest, Sig), Refusal> {
+    async fn decide(&mut self, request: &AcceptWorkRequest) -> Result<(Digest, Sig), Refusal> {
         let (authorization, client_signature, work_id) = self.authenticate_proposal(request)?;
         if let Some(retained) = self.prior_acceptance(&authorization, work_id)? {
             return Ok((work_id, retained));
@@ -791,23 +797,29 @@ impl ProviderEndpoint {
 
         // The client's signature, its bundle, and the credit this job
         // costs, on the disk before a co-signature exists to leak.
-        self.close.store.commit(
-            ChannelRecord::JobProposed {
-                authorization,
-                client_signature,
-                prepared_input: request.prepared_input.clone(),
-            },
-            &Secp256k1Verifier::new(),
-        )?;
+        self.close
+            .store
+            .commit(
+                ChannelRecord::JobProposed {
+                    authorization,
+                    client_signature,
+                    prepared_input: request.prepared_input.clone(),
+                },
+                &Secp256k1Verifier::new(),
+            )
+            .await?;
 
         let signature = self.close.signer.sign(signing_hash(work_id));
-        self.close.store.commit(
-            ChannelRecord::JobAccepted {
-                work_id,
-                provider_signature: signature,
-            },
-            &Secp256k1Verifier::new(),
-        )?;
+        self.close
+            .store
+            .commit(
+                ChannelRecord::JobAccepted {
+                    work_id,
+                    provider_signature: signature,
+                },
+                &Secp256k1Verifier::new(),
+            )
+            .await?;
         Ok((work_id, signature))
     }
 
@@ -862,7 +874,7 @@ impl ProviderEndpoint {
     /// longer be met, [`RunError::Record`] when the stored bundle does
     /// not parse, and [`RunError::Store`] when the marker cannot be
     /// made durable.
-    pub fn begin_run(
+    pub async fn begin_run(
         &mut self,
         work_id: Digest,
         ready: &ReadyChannel,
@@ -895,7 +907,7 @@ impl ProviderEndpoint {
         }
         let (cursor_height, _) = self.state().cursor();
         let authorization = *job.authorization();
-        hellas_rpc::protocol::work::check_payment_policy_binding(
+        crate::model::work::check_payment_policy_binding(
             ready.channel(),
             &authorization,
             ready.payment_policy(),
@@ -936,17 +948,20 @@ impl ProviderEndpoint {
             _ => return Err(RunError::Policy),
         };
 
-        self.close.store.commit(
-            ChannelRecord::JobRunning { work_id },
-            &Secp256k1Verifier::new(),
-        )?;
+        self.close
+            .store
+            .commit(
+                ChannelRecord::JobRunning { work_id },
+                &Secp256k1Verifier::new(),
+            )
+            .await?;
         Ok(admission)
     }
 
     /// Signs the result of the transcript this job's invocation
     /// produced, and returns it only once it is on the disk.
     ///
-    /// The transcript is the provider's own: [`hellas_rpc::protocol::work::terminal_result`] refuses
+    /// The transcript is the provider's own: [`crate::model::work::terminal_result`] refuses
     /// events that are not one verified chain for this authorization's
     /// request under the channel's provider key, and the journal refuses
     /// the record unless the job is running, is not indeterminate, and
@@ -962,7 +977,7 @@ impl ProviderEndpoint {
     /// become is larger than the signed frame, and [`RunError::Store`]
     /// when the journal refuses the record — which is what it does for a
     /// job that is not running, or one left indeterminate by a crash.
-    pub fn record_result(
+    pub async fn record_result(
         &mut self,
         work_id: Digest,
         transcript: &[OutputEventEnvelope],
@@ -1014,11 +1029,11 @@ impl ProviderEndpoint {
             transcript: spool.clone(),
         };
         let frame = if matches!(ready.work_policy(), WorkPolicy::Fetch { .. }) {
-            if spool.len() > hellas_rpc::protocol::work_fetch::MAX_FETCH_TRANSCRIPT_BYTES {
+            if spool.len() > crate::model::fetch::MAX_FETCH_TRANSCRIPT_BYTES {
                 return Err(RunError::Record(PaidWorkError::OverEnvelope {
                     field: "Fetch transcript",
                     actual: spool.len() as u64,
-                    limit: hellas_rpc::protocol::work_fetch::MAX_FETCH_TRANSCRIPT_BYTES as u64,
+                    limit: crate::model::fetch::MAX_FETCH_TRANSCRIPT_BYTES as u64,
                 }));
             }
             stream::fetch_frames(
@@ -1041,15 +1056,18 @@ impl ProviderEndpoint {
                 limit: frame_limit,
             }));
         }
-        self.close.store.commit(
-            ChannelRecord::JobResult {
-                work_id,
-                result,
-                provider_signature: signature,
-                transcript: spool,
-            },
-            &Secp256k1Verifier::new(),
-        )?;
+        self.close
+            .store
+            .commit(
+                ChannelRecord::JobResult {
+                    work_id,
+                    result,
+                    provider_signature: signature,
+                    transcript: spool,
+                },
+                &Secp256k1Verifier::new(),
+            )
+            .await?;
         Ok((result, signature))
     }
 
@@ -1091,19 +1109,20 @@ impl ProviderEndpoint {
     /// the delivery margin no longer fits, and [`DeliverError::Store`]
     /// when the release cannot be made durable — which is what happens
     /// when this client's delivery credit is exhausted.
-    pub fn deliver(
+    pub async fn deliver(
         &mut self,
         request: &DeliverResultRequest,
         ready: &ReadyChannel,
         exporter: &[u8; 32],
     ) -> Result<Delivery, DeliverError> {
         self.deliver_with_readiness(request, Some(ready), exporter)
+            .await
     }
 
     /// A retained terminal needs authentication, but no permission to admit
     /// new work. Actual delivery still uses this endpoint's readiness, or
     /// the explicitly supplied decision checked against it below.
-    fn deliver_with_readiness(
+    async fn deliver_with_readiness(
         &mut self,
         request: &DeliverResultRequest,
         ready: Option<&ReadyChannel>,
@@ -1150,7 +1169,7 @@ impl ProviderEndpoint {
         if transcript.is_empty() {
             return Err(DeliverError::NoResult { phase: job.phase() });
         }
-        hellas_rpc::protocol::work::check_payment_policy_binding(
+        crate::model::work::check_payment_policy_binding(
             ready.channel(),
             job.authorization(),
             ready.payment_policy(),
@@ -1166,10 +1185,13 @@ impl ProviderEndpoint {
         let (cursor_height, _) = self.state().cursor();
         ready.check_releasable(cursor_height, terminal_deadline)?;
 
-        self.close.store.commit(
-            ChannelRecord::PlaintextReleased { work_id },
-            &Secp256k1Verifier::new(),
-        )?;
+        self.close
+            .store
+            .commit(
+                ChannelRecord::PlaintextReleased { work_id },
+                &Secp256k1Verifier::new(),
+            )
+            .await?;
         Ok(Delivery {
             result,
             signature,
@@ -1208,7 +1230,7 @@ impl ProviderEndpoint {
     /// every rule the journal applies — the client's two signatures, the
     /// binding and certificate against the ledger, and the phase this
     /// job is in.
-    pub fn admit(&mut self, request: &AdmitCertificateRequest) -> Result<u64, PaymentError> {
+    pub async fn admit(&mut self, request: &AdmitCertificateRequest) -> Result<u64, PaymentError> {
         if !request
             .route
             .as_ref()
@@ -1231,18 +1253,22 @@ impl ProviderEndpoint {
             observation.check()?;
         }
 
-        let state = self.close.store.commit(
-            ChannelRecord::JobTerminated {
-                work_id,
-                outcome: TerminalOutcome::Certified {
-                    certificate,
-                    binding: Box::new(binding),
-                    binding_signature,
-                    certificate_signature,
+        let state = self
+            .close
+            .store
+            .commit(
+                ChannelRecord::JobTerminated {
+                    work_id,
+                    outcome: TerminalOutcome::Certified {
+                        certificate,
+                        binding: Box::new(binding),
+                        binding_signature,
+                        certificate_signature,
+                    },
                 },
-            },
-            &Secp256k1Verifier::new(),
-        )?;
+                &Secp256k1Verifier::new(),
+            )
+            .await?;
         Ok(state.ledger().credited_cumulative())
     }
 
@@ -1262,17 +1288,20 @@ impl ProviderEndpoint {
     ///
     /// [`RunError::NoSuchJob`] when no open job carries this `work_id`,
     /// and [`RunError::Store`] when the ending cannot be made durable.
-    pub fn end_run(&mut self, work_id: Digest) -> Result<(), RunError> {
+    pub async fn end_run(&mut self, work_id: Digest) -> Result<(), RunError> {
         self.state().job_by_id(work_id).ok_or(RunError::NoSuchJob)?;
-        self.close.store.commit(
-            ChannelRecord::JobTerminated {
-                work_id,
-                outcome: TerminalOutcome::Failed {
-                    code: PROVIDER_FAULT_CODE,
+        self.close
+            .store
+            .commit(
+                ChannelRecord::JobTerminated {
+                    work_id,
+                    outcome: TerminalOutcome::Failed {
+                        code: PROVIDER_FAULT_CODE,
+                    },
                 },
-            },
-            &Secp256k1Verifier::new(),
-        )?;
+                &Secp256k1Verifier::new(),
+            )
+            .await?;
         Ok(())
     }
 }
@@ -1293,23 +1322,25 @@ const PROVIDER_FAULT_CODE: u32 = 1;
 /// leave, so it is an addend of the wait a start is signed against.
 /// Both endpoints prepare their own close and both go through here, so
 /// there is one spelling of the record and one of the sample.
-fn retain_close_start(
+async fn retain_close_start(
     store: &mut ChannelStore,
     start: &PaymentCloseStart,
 ) -> Result<(), WorkStoreError> {
     let fsynced = Timing::start();
-    store.commit(
-        ChannelRecord::ClosePrepared {
-            start: Box::new(start.clone()),
-        },
-        &Secp256k1Verifier::new(),
-    )?;
+    store
+        .commit(
+            ChannelRecord::ClosePrepared {
+                start: Box::new(start.clone()),
+            },
+            &Secp256k1Verifier::new(),
+        )
+        .await?;
     if let Some(ms) = fsynced.ms() {
         tracing::event!(
             name: "close_prepared_fsync_ms",
             target: TARGET,
             LEVEL,
-            edge = %hex(&start.payment_edge().to_bytes()),
+            edge = %hex(start.payment_edge().to_bytes()),
             valid_through = start.valid_through_height(),
             ms,
         );
@@ -1331,8 +1362,11 @@ impl CloseEndpoint {
     ///
     /// [`WorkStoreError`] when the block is not the contiguous next one,
     /// or a transition it carries is refused.
-    pub fn observe_finalized(&mut self, block: &FinalizedWork) -> Result<&Channel, WorkStoreError> {
-        observe(&mut self.store, block, &Secp256k1Verifier::new())?;
+    pub async fn observe_finalized(
+        &mut self,
+        block: &FinalizedWork,
+    ) -> Result<&Channel, WorkStoreError> {
+        observe(&mut self.store, block, &Secp256k1Verifier::new()).await?;
         Ok(self.store.state())
     }
 
@@ -1368,7 +1402,7 @@ impl CloseEndpoint {
     /// [`CloseError::Store`] when a job is still open, a contest is
     /// already live, or the journal refuses the record, and the window
     /// errors [`close_start`] raises.
-    pub fn prepare_close(&mut self) -> Result<PaymentCloseStart, CloseError> {
+    pub async fn prepare_close(&mut self) -> Result<PaymentCloseStart, CloseError> {
         let (height, _) = self.state().cursor();
         if let Some(retained) = self.state().includable_close_start(height) {
             return Ok(retained.clone());
@@ -1381,7 +1415,7 @@ impl CloseEndpoint {
             self.state().executable_certificate(),
             &self.signer,
         )?;
-        retain_close_start(&mut self.store, &start)?;
+        retain_close_start(&mut self.store, &start).await?;
         Ok(start)
     }
 
@@ -1424,11 +1458,13 @@ impl CloseEndpoint {
     /// different answer to this contest, and a record the state already
     /// holds is not written twice — so a resubmission after a failed
     /// hand-off costs no fsync and sends the same bytes.
-    fn fix_close_answer(&mut self, start_id: StartId) -> Result<Option<Tx>, WorkStoreError> {
-        let Some((responded, response)) = self.close_duty(start_id) else {
+    async fn fix_close_answer(&mut self, start_id: StartId) -> Result<Option<Tx>, WorkStoreError> {
+        let Some((responded, response)) = self.close_duty(start_id)? else {
             return Ok(None);
         };
-        self.store.commit(responded, &Secp256k1Verifier::new())?;
+        self.store
+            .commit(responded, &Secp256k1Verifier::new())
+            .await?;
         Ok(Some(response))
     }
 
@@ -1478,23 +1514,30 @@ impl CloseEndpoint {
     /// own rule — one answer per contest — is what makes the second
     /// offer the first one rather than a new decision. What it will not
     /// do is offer them to a sink that already took them.
-    fn close_duty(&self, start_id: StartId) -> Option<(ChannelRecord, Tx)> {
+    fn close_duty(&self, start_id: StartId) -> Result<Option<(ChannelRecord, Tx)>, WorkStoreError> {
         if self.accepted_contest() == Some(start_id) {
-            return None;
+            return Ok(None);
         }
-        let (contest, certificate) = self.state().answerable_contest()?;
+        let Some((contest, certificate)) = self.state().answerable_contest() else {
+            return Ok(None);
+        };
         if contest.start_id != start_id {
-            return None;
+            return Ok(None);
         }
         let channel = self.state().channel();
-        let response = close_response(channel, start_id, certificate, &self.signer);
-        Some((
+        let response =
+            close_response(channel, start_id, certificate, &self.signer).map_err(|_| {
+                WorkStoreError::Channel(ChannelStateError::WrongChannel {
+                    field: "close response signer",
+                })
+            })?;
+        Ok(Some((
             ChannelRecord::CloseResponded {
                 start_id,
                 response_digest: response_body_digest(channel, start_id, &certificate.0),
             },
             Tx::move_action(Move::RespondPaymentClose(response)),
-        ))
+        )))
     }
 
     /// Builds the close that ends this endpoint's contest.
@@ -1560,7 +1603,10 @@ impl CloseEndpoint {
     /// the contest does not already settle. [`CloseError::Store`] when
     /// the journal refuses the answer, which is where the contest and
     /// the certificate the answer is derived from are re-checked.
-    pub fn respond_to_close(&mut self, observed: &ObservedChannel<'_>) -> Result<Tx, CloseError> {
+    pub async fn respond_to_close(
+        &mut self,
+        observed: &ObservedChannel<'_>,
+    ) -> Result<Tx, CloseError> {
         let (held, _) = self.state().close_opened().ok_or(CloseError::NoContest)?;
         let PendingSlot::Present(record) = observed.pending else {
             return Err(CloseError::NoContest);
@@ -1588,14 +1634,16 @@ impl CloseEndpoint {
                 settled: record.final_cumulative(),
             })?;
         let channel = self.state().channel().clone();
-        let response = close_response(&channel, held, certificate, &self.signer);
-        self.store.commit(
-            ChannelRecord::CloseResponded {
-                start_id: held,
-                response_digest: response_body_digest(&channel, held, &certificate.0),
-            },
-            &Secp256k1Verifier::new(),
-        )?;
+        let response = close_response(&channel, held, certificate, &self.signer)?;
+        self.store
+            .commit(
+                ChannelRecord::CloseResponded {
+                    start_id: held,
+                    response_digest: response_body_digest(&channel, held, &certificate.0),
+                },
+                &Secp256k1Verifier::new(),
+            )
+            .await?;
         Ok(Tx::move_action(Move::RespondPaymentClose(response)))
     }
 }
@@ -1612,8 +1660,11 @@ impl ProviderEndpoint {
     /// # Errors
     ///
     /// Whatever [`CloseEndpoint::observe_finalized`] raises.
-    pub fn observe_finalized(&mut self, block: &FinalizedWork) -> Result<&Channel, WorkStoreError> {
-        self.close.observe_finalized(block)
+    pub async fn observe_finalized(
+        &mut self,
+        block: &FinalizedWork,
+    ) -> Result<&Channel, WorkStoreError> {
+        self.close.observe_finalized(block).await
     }
 
     /// Reads every finalized block this endpoint has not seen.
@@ -1633,8 +1684,8 @@ impl ProviderEndpoint {
     /// # Errors
     ///
     /// Whatever [`CloseEndpoint::prepare_close`] raises.
-    pub fn prepare_close(&mut self) -> Result<PaymentCloseStart, CloseError> {
-        self.close.prepare_close()
+    pub async fn prepare_close(&mut self) -> Result<PaymentCloseStart, CloseError> {
+        self.close.prepare_close().await
     }
 
     /// Runs one close step.
@@ -1669,30 +1720,30 @@ impl ProviderEndpoint {
     /// # Errors
     ///
     /// Whatever [`CloseEndpoint::respond_to_close`] raises.
-    pub fn respond_to_close(&mut self, observed: &ObservedChannel<'_>) -> Result<Tx, CloseError> {
-        self.close.respond_to_close(observed)
+    pub async fn respond_to_close(
+        &mut self,
+        observed: &ObservedChannel<'_>,
+    ) -> Result<Tx, CloseError> {
+        self.close.respond_to_close(observed).await
     }
 }
 
 /// A provider that owns its journal outright lends it directly, and owns
 /// the answer it may have to give.
 impl CloseChannel for CloseEndpoint {
-    fn with_store<R>(
-        &mut self,
-        step: impl FnOnce(&mut ChannelStore) -> R,
-    ) -> Result<R, CatchUpError> {
-        Ok(step(&mut self.store))
+    async fn store(&mut self) -> Result<impl DerefMut<Target = ChannelStore> + Send, CatchUpError> {
+        Ok(&mut self.store)
     }
 
-    fn handoff(&mut self) -> Result<Option<(StartId, Handoff)>, CatchUpError> {
+    async fn handoff(&mut self) -> Result<Option<(StartId, Handoff)>, CatchUpError> {
         Ok(self.close_handoff)
     }
 
-    fn fix_answer(&mut self, start_id: StartId) -> Result<Option<Tx>, CatchUpError> {
-        Ok(self.fix_close_answer(start_id)?)
+    async fn fix_answer(&mut self, start_id: StartId) -> Result<Option<Tx>, CatchUpError> {
+        Ok(self.fix_close_answer(start_id).await?)
     }
 
-    fn record_handoff(
+    async fn record_handoff(
         &mut self,
         start_id: StartId,
         outcome: SubmitTxOutcome,
@@ -1705,11 +1756,8 @@ impl CloseChannel for CloseEndpoint {
 /// A client lends its journal and nothing else: no contest is ever its
 /// to answer, so the three defaulted answers are the true ones.
 impl CloseChannel for ClientEndpoint {
-    fn with_store<R>(
-        &mut self,
-        step: impl FnOnce(&mut ChannelStore) -> R,
-    ) -> Result<R, CatchUpError> {
-        Ok(step(&mut self.store))
+    async fn store(&mut self) -> Result<impl DerefMut<Target = ChannelStore> + Send, CatchUpError> {
+        Ok(&mut self.store)
     }
 }
 
@@ -1721,8 +1769,11 @@ impl ClientEndpoint {
     ///
     /// [`WorkStoreError`] when the block is not the contiguous next one,
     /// or a transition it carries is refused.
-    pub fn observe_finalized(&mut self, block: &FinalizedWork) -> Result<&Channel, WorkStoreError> {
-        observe(&mut self.store, block, &Secp256k1Verifier::new())?;
+    pub async fn observe_finalized(
+        &mut self,
+        block: &FinalizedWork,
+    ) -> Result<&Channel, WorkStoreError> {
+        observe(&mut self.store, block, &Secp256k1Verifier::new()).await?;
         Ok(self.store.state())
     }
 
@@ -1761,7 +1812,7 @@ impl From<AdmissionError> for BackendFault {
 
 /// The complete journaled input handed to a paid Evaluate backend.
 ///
-/// All six bodies come from the same strictly decoded [`hellas_rpc::protocol::artifacts::PreparedPaidInputV1`]
+/// All six bodies come from the same strictly decoded [`crate::model::prepared_input::PreparedPaidInputV1`]
 /// whose digest the parties signed. Keeping the execution, tokens, policy, and
 /// identity here is what lets a backend run after restart without depending on
 /// transient executor state. Environment bytes remain content-store data below
@@ -1788,9 +1839,6 @@ impl PreparedEvaluateInput {
     }
 }
 impl<A> PreparedEvaluateInput<A> {
-    pub fn admission(&self) -> &A {
-        &self.admission
-    }
     pub fn into_parts_and_admission(self) -> (PreparedPaidInputParts, A) {
         (self.parts, self.admission)
     }
@@ -1859,9 +1907,6 @@ impl PreparedFetchInput {
     }
 }
 impl<A> PreparedFetchInput<A> {
-    pub fn admission(&self) -> &A {
-        &self.admission
-    }
     pub fn into_parts_and_admission(self) -> (PreparedPaidFetchInputParts, A) {
         (self.parts, self.admission)
     }
@@ -2049,7 +2094,7 @@ pub enum RunError {
 /// The order, and the whole of why it is this order: the running marker
 /// is journaled while the endpoint lock is held, the lock is then
 /// released, and only then is the backend called. Releasing the lock is
-/// deliberate — a synchronous journal must not be held across an
+/// deliberate — the journal must not be held across an
 /// invocation that takes minutes — and it is safe because the marker on
 /// the disk, not the lock, is what excludes a second call. A concurrent
 /// call finds the job running; a call after a restart finds it
@@ -2078,10 +2123,11 @@ pub async fn run_accepted_work<B>(
 where
     B: WorkBackend + Sync,
 {
-    let admission = service.begin_run(work_id, ready)?;
+    let admission = service.begin_run(work_id, ready).await?;
     let progress_service = service.clone();
+    let progress_policy = ready.work_policy().clone();
     let progress: PaidProgress =
-        Arc::new(move |event| progress_service.publish_progress(work_id, event));
+        Arc::new(move |event| progress_service.publish_progress(work_id, &progress_policy, event));
     let invoked = match admission {
         RunAdmission::Invoke(input) => backend.evaluate_stream(*input, progress).await,
         RunAdmission::InvokeFetch(input) => backend.fetch_stream(*input, progress).await,
@@ -2094,11 +2140,10 @@ where
 
     let transcript = match invoked {
         Ok(transcript) => transcript,
-        Err(fault) => return Err(end_failed(service, work_id, RunError::Backend(fault))),
+        Err(fault) => return Err(end_failed(service, work_id, RunError::Backend(fault)).await),
     };
 
-    let recorded = service.record_result(work_id, &transcript);
-    match recorded {
+    match service.record_result(work_id, &transcript).await {
         Ok((result, signature)) => Ok(RunOutcome::Completed { result, signature }),
         // A transcript that is not this job's, and a result the signed
         // envelope would not carry, are the same kind of fault: the
@@ -2106,7 +2151,7 @@ where
         // delivery. Both end the job, and both charge the client
         // nothing.
         Err(fault @ (RunError::Transcript(_) | RunError::Record(_))) => {
-            Err(end_failed(service, work_id, fault))
+            Err(end_failed(service, work_id, fault).await)
         }
         Err(error) => Err(error),
     }
@@ -2127,7 +2172,7 @@ pub struct Delivery {
     pub result: PaidJobResultV1,
     /// The provider's signature over its digest.
     pub signature: Sig,
-    /// The encoded transcript, as [`decode_transcript`] reads it.
+    /// The encoded transcript, as [`decode_transcript`](crate::model::work::decode_transcript) reads it.
     pub transcript: Vec<u8>,
 }
 
@@ -2327,8 +2372,8 @@ fn admit_request(channel_id: Digest, payment: &PaidCertificate) -> AdmitCertific
 
 /// Ends the job as failed, and returns `fault` if that ending was
 /// recorded.
-fn end_failed(service: &WorkService, work_id: Digest, fault: RunError) -> RunError {
-    match service.end_run(work_id) {
+async fn end_failed(service: &WorkService, work_id: Digest, fault: RunError) -> RunError {
+    match service.end_run(work_id).await {
         Ok(()) => fault,
         Err(error) => error,
     }
@@ -2341,9 +2386,8 @@ fn end_failed(service: &WorkService, work_id: Digest, fault: RunError) -> RunErr
 ///
 /// The lock is the endpoint's, not the journal's: the journal already
 /// refuses a second *process*, and this is what serialises the
-/// concurrent calls of one. It is never held across an await, because
-/// deciding a proposal — hashing, verifying, and two synchronous journal
-/// appends — never awaits.
+/// concurrent calls of one. Acquiring it yields to other tasks. Journal I/O
+/// may await under the guard; chain, transport and backend waits must release it.
 ///
 /// One type carries both halves because one handler answers the wire,
 /// and the halves are not both always present: [`Self::close_only`]
@@ -2353,7 +2397,7 @@ fn end_failed(service: &WorkService, work_id: Digest, fault: RunError) -> RunErr
 /// about a close consults that option.
 #[derive(Clone, Debug)]
 pub struct WorkService {
-    endpoint: Arc<Mutex<ProviderEndpoint>>,
+    endpoint: Arc<EndpointLock<ProviderEndpoint>>,
     driving: Arc<AtomicBool>,
     changed: Arc<tokio::sync::Notify>,
     progress: Arc<Mutex<std::collections::BTreeMap<Digest, stream::Progress>>>,
@@ -2453,10 +2497,14 @@ impl ChannelDriver<'_> {
     /// [`CatchUpError::Busy`] when the endpoint is unreachable, and
     /// [`CatchUpError::Store`] when the block is not the contiguous next
     /// one or a transition it carries is refused.
-    pub fn observe_finalized(&mut self, block: &FinalizedWork) -> Result<(), CatchUpError> {
-        let mut endpoint = self.service.endpoint().map_err(|_| CatchUpError::Busy)?;
+    pub async fn observe_finalized(&mut self, block: &FinalizedWork) -> Result<(), CatchUpError> {
+        let mut endpoint = self
+            .service
+            .endpoint()
+            .await
+            .map_err(|_| CatchUpError::Busy)?;
         self.readable_cursor(&endpoint)?;
-        endpoint.observe_finalized(block)?;
+        endpoint.observe_finalized(block).await?;
         Ok(())
     }
 
@@ -2480,7 +2528,7 @@ impl ChannelDriver<'_> {
         &mut self,
         source: &S,
     ) -> Result<u64, CatchUpError> {
-        let cursor = self.cursor()?;
+        let cursor = self.cursor().await?;
         let Some(latest) = source.latest_height().await? else {
             return Ok(cursor);
         };
@@ -2493,23 +2541,27 @@ impl ChannelDriver<'_> {
         source: &S,
         latest: u64,
     ) -> Result<u64, CatchUpError> {
-        let mut cursor = self.cursor()?;
+        let mut cursor = self.cursor().await?;
         while cursor < latest {
             let next = cursor.saturating_add(1);
             let block = source
                 .block_at(next)
                 .await?
                 .ok_or(CatchUpError::Missing { height: next })?;
-            self.observe_finalized(&block)?;
-            cursor = self.cursor()?;
+            self.observe_finalized(&block).await?;
+            cursor = self.cursor().await?;
         }
         Ok(cursor)
     }
 
     /// The cursor this driver may read on from, or the duty that stops
     /// it.
-    fn cursor(&self) -> Result<u64, CatchUpError> {
-        let endpoint = self.service.endpoint().map_err(|_| CatchUpError::Busy)?;
+    async fn cursor(&self) -> Result<u64, CatchUpError> {
+        let endpoint = self
+            .service
+            .endpoint()
+            .await
+            .map_err(|_| CatchUpError::Busy)?;
         self.readable_cursor(&endpoint)
     }
 
@@ -2526,8 +2578,12 @@ impl ChannelDriver<'_> {
     /// the acceptance phase boundary's own case: the digest being caught
     /// up for is the proposal's, and the journal learns it from the
     /// acceptance this read precedes.
-    fn for_job(&self, work_id: Digest) -> Result<(), CatchUpError> {
-        let endpoint = self.service.endpoint().map_err(|_| CatchUpError::Busy)?;
+    async fn for_job(&self, work_id: Digest) -> Result<(), CatchUpError> {
+        let endpoint = self
+            .service
+            .endpoint()
+            .await
+            .map_err(|_| CatchUpError::Busy)?;
         let state = endpoint.state();
         if state.job_by_id(work_id).is_some() || state.terminal_by_id(work_id).is_some() {
             return Ok(());
@@ -2540,39 +2596,69 @@ impl ChannelDriver<'_> {
     }
 }
 
-/// The driver reaches the same journal and the same hand-off the
-/// endpoint owns, one short borrow at a time.
-///
-/// Every method takes the endpoint lock and gives it back before it
-/// returns, and none of them is async, so there is no shape in which a
-/// borrow reaches a source or a sink wait. The endpoint's own methods
-/// are what decide anything; this is only where the borrow begins and
-/// ends.
+/// A journal projection that retains endpoint ownership and panic handling.
+enum ChannelStoreGuard<'a> {
+    Provider(EndpointGuard<'a, ProviderEndpoint>),
+    Client(EndpointGuard<'a, ClientEndpoint>),
+}
+
+impl Deref for ChannelStoreGuard<'_> {
+    type Target = ChannelStore;
+    fn deref(&self) -> &ChannelStore {
+        match self {
+            Self::Provider(endpoint) => &endpoint.close.store,
+            Self::Client(endpoint) => &endpoint.store,
+        }
+    }
+}
+
+impl DerefMut for ChannelStoreGuard<'_> {
+    fn deref_mut(&mut self) -> &mut ChannelStore {
+        match self {
+            Self::Provider(endpoint) => &mut endpoint.close.store,
+            Self::Client(endpoint) => &mut endpoint.store,
+        }
+    }
+}
+
 impl CloseChannel for ChannelDriver<'_> {
-    fn with_store<R>(
-        &mut self,
-        step: impl FnOnce(&mut ChannelStore) -> R,
-    ) -> Result<R, CatchUpError> {
-        let mut endpoint = self.service.endpoint().map_err(|_| CatchUpError::Busy)?;
-        Ok(step(&mut endpoint.close.store))
+    async fn store(&mut self) -> Result<impl DerefMut<Target = ChannelStore> + Send, CatchUpError> {
+        Ok(ChannelStoreGuard::Provider(
+            self.service
+                .endpoint()
+                .await
+                .map_err(|_| CatchUpError::Busy)?,
+        ))
     }
 
-    fn handoff(&mut self) -> Result<Option<(StartId, Handoff)>, CatchUpError> {
-        let endpoint = self.service.endpoint().map_err(|_| CatchUpError::Busy)?;
+    async fn handoff(&mut self) -> Result<Option<(StartId, Handoff)>, CatchUpError> {
+        let endpoint = self
+            .service
+            .endpoint()
+            .await
+            .map_err(|_| CatchUpError::Busy)?;
         Ok(endpoint.close.close_handoff)
     }
 
-    fn fix_answer(&mut self, start_id: StartId) -> Result<Option<Tx>, CatchUpError> {
-        let mut endpoint = self.service.endpoint().map_err(|_| CatchUpError::Busy)?;
-        Ok(endpoint.close.fix_close_answer(start_id)?)
+    async fn fix_answer(&mut self, start_id: StartId) -> Result<Option<Tx>, CatchUpError> {
+        let mut endpoint = self
+            .service
+            .endpoint()
+            .await
+            .map_err(|_| CatchUpError::Busy)?;
+        Ok(endpoint.close.fix_close_answer(start_id).await?)
     }
 
-    fn record_handoff(
+    async fn record_handoff(
         &mut self,
         start_id: StartId,
         outcome: SubmitTxOutcome,
     ) -> Result<(), CatchUpError> {
-        let mut endpoint = self.service.endpoint().map_err(|_| CatchUpError::Busy)?;
+        let mut endpoint = self
+            .service
+            .endpoint()
+            .await
+            .map_err(|_| CatchUpError::Busy)?;
         endpoint.close.record_close_handoff(start_id, outcome);
         Ok(())
     }
@@ -2583,7 +2669,7 @@ impl WorkService {
     #[must_use]
     pub fn new(endpoint: ProviderEndpoint) -> Self {
         Self {
-            endpoint: Arc::new(Mutex::new(endpoint)),
+            endpoint: Arc::new(EndpointLock::new(endpoint)),
             driving: Arc::new(AtomicBool::new(false)),
             changed: Arc::new(tokio::sync::Notify::new()),
             progress: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
@@ -2594,7 +2680,7 @@ impl WorkService {
     /// no new work.
     ///
     /// This is the mount a channel gets when
-    /// [`WorkChannelDescriptor::check_ready`](hellas_rpc::protocol::work_setup::WorkChannelDescriptor::check_ready)
+    /// [`WorkChannelDescriptor::check_ready`](crate::model::setup::WorkChannelDescriptor::check_ready)
     /// has nothing to say: a contest is open, the bond edge is gone, or
     /// the admission horizon has passed. Every one of those is a state a
     /// close driver exists for, and none of them is a readiness
@@ -2608,7 +2694,7 @@ impl WorkService {
     ///
     /// The one way an admitting service comes to exist after a close-only
     /// mount, and it takes the value only
-    /// [`WorkChannelDescriptor::check_ready`](hellas_rpc::protocol::work_setup::WorkChannelDescriptor::check_ready)
+    /// [`WorkChannelDescriptor::check_ready`](crate::model::setup::WorkChannelDescriptor::check_ready)
     /// produces. Nothing here refreshes it afterwards: its freshness is
     /// the caller's in exactly the sense [`ReadyChannel`] documents.
     ///
@@ -2617,24 +2703,24 @@ impl WorkService {
     /// [`EndpointError::Poisoned`] when the endpoint is unreachable, and
     /// the binding errors when the decision is not this journal's own
     /// channel at its own settlement.
-    pub fn admit_new_work(&self, ready: ReadyChannel) -> Result<(), EndpointError> {
-        self.endpoint()?.admit_new_work(ready)
+    pub async fn admit_new_work(&self, ready: ReadyChannel) -> Result<(), EndpointError> {
+        self.endpoint().await?.admit_new_work(ready)
     }
 
     /// Requires a live background observer before accepting or releasing work.
-    pub fn require_observer(&self) -> Result<(), EndpointError> {
-        self.endpoint()?.observation = Some(Observation::default());
+    pub async fn require_observer(&self) -> Result<(), EndpointError> {
+        self.endpoint().await?.observation = Some(Observation::default());
         Ok(())
     }
 
     /// Publishes readiness after applying all blocks through its snapshot.
-    pub fn observe_ready(
+    pub async fn observe_ready(
         &self,
         ready: ReadyChannel,
         started: ObservationTime,
         max_age: std::time::Duration,
     ) -> Result<(), EndpointError> {
-        let mut endpoint = self.endpoint()?;
+        let mut endpoint = self.endpoint().await?;
         if ready.check_caught_up(endpoint.state().cursor().0).is_err() {
             return Err(EndpointError::CatchingUp);
         }
@@ -2650,8 +2736,8 @@ impl WorkService {
     }
 
     /// Reads current local admission; no chain I/O is performed.
-    pub fn readiness(&self) -> Result<ReadyChannel, EndpointError> {
-        let endpoint = self.endpoint()?;
+    pub async fn readiness(&self) -> Result<ReadyChannel, EndpointError> {
+        let endpoint = self.endpoint().await?;
         if endpoint.state().is_closing() {
             return Err(EndpointError::NotAdmitting);
         }
@@ -2659,10 +2745,10 @@ impl WorkService {
     }
 
     /// Revokes observer freshness without discarding results or close duties.
-    pub fn suspend(&self) -> Result<(), EndpointError> {
+    pub async fn suspend(&self) -> Result<(), EndpointError> {
         // An endpoint without an observer has no freshness to revoke;
         // installing a defaulted one here would only close admission.
-        if let Some(observation) = self.endpoint()?.observation.as_mut() {
+        if let Some(observation) = self.endpoint().await?.observation.as_mut() {
             observation.suspend();
             self.changed.notify_waiters();
         }
@@ -2684,8 +2770,11 @@ impl WorkService {
     /// [`EndpointError::Poisoned`] after a handler panicked while
     /// holding it. The state is not recovered, because a panic mid-
     /// commit is a bug whose durable effect this type cannot know.
-    fn endpoint(&self) -> Result<MutexGuard<'_, ProviderEndpoint>, EndpointError> {
-        self.endpoint.lock().map_err(|_| EndpointError::Poisoned)
+    async fn endpoint(&self) -> Result<EndpointGuard<'_, ProviderEndpoint>, EndpointError> {
+        self.endpoint
+            .lock()
+            .await
+            .map_err(|_| EndpointError::Poisoned)
     }
 
     /// Reads what this endpoint durably knows, for exactly as long as
@@ -2698,9 +2787,12 @@ impl WorkService {
     ///
     /// # Errors
     ///
-    /// [`EndpointError::Poisoned`], as [`Self::endpoint`] documents.
-    pub fn with_state<R>(&self, read: impl FnOnce(&Channel) -> R) -> Result<R, EndpointError> {
-        Ok(read(self.endpoint()?.state()))
+    /// [`EndpointError::Poisoned`], as `endpoint` documents.
+    pub async fn with_state<R>(
+        &self,
+        read: impl FnOnce(&Channel) -> R,
+    ) -> Result<R, EndpointError> {
+        Ok(read(self.endpoint().await?.state()))
     }
 
     /// Takes this channel's one cursor-driving authority, or says it is
@@ -2741,7 +2833,7 @@ impl WorkService {
         work_id: Digest,
     ) -> Result<u64, CatchUpError> {
         let mut driver = self.drive().map_err(|_| CatchUpError::Busy)?;
-        driver.for_job(work_id)?;
+        driver.for_job(work_id).await?;
         driver.catch_up(source).await
     }
 
@@ -2751,8 +2843,8 @@ impl WorkService {
     ///
     /// [`CloseError::Endpoint`] when the endpoint is unreachable, and
     /// whatever [`ProviderEndpoint::prepare_close`] raises otherwise.
-    pub fn prepare_close(&self) -> Result<PaymentCloseStart, CloseError> {
-        self.endpoint()?.prepare_close()
+    pub async fn prepare_close(&self) -> Result<PaymentCloseStart, CloseError> {
+        self.endpoint().await?.prepare_close().await
     }
 
     /// Builds the close that ends this endpoint's contest, from one
@@ -2762,8 +2854,11 @@ impl WorkService {
     ///
     /// [`CloseError::Endpoint`] when the endpoint is unreachable, and
     /// whatever [`ProviderEndpoint::adjudicated_close`] raises otherwise.
-    pub fn adjudicated_close(&self, observed: &ObservedChannel<'_>) -> Result<Tx, CloseError> {
-        self.endpoint()?.adjudicated_close(observed)
+    pub async fn adjudicated_close(
+        &self,
+        observed: &ObservedChannel<'_>,
+    ) -> Result<Tx, CloseError> {
+        self.endpoint().await?.adjudicated_close(observed)
     }
 
     /// Reads to the tip and services whatever close duty that read
@@ -2817,9 +2912,13 @@ impl WorkService {
     /// or unauthenticated requests are refused before consulting job state.
     /// `None` means fresh readiness and the normal acceptance checks are needed.
     #[must_use]
-    pub fn precheck_acceptance(&self, request: &AcceptWorkRequest) -> Option<AcceptWorkResponse> {
+    pub async fn precheck_acceptance(
+        &self,
+        request: &AcceptWorkRequest,
+    ) -> Option<AcceptWorkResponse> {
         let result = self
             .endpoint()
+            .await
             .map_err(|error| Refusal::new(endpoint_refusal(error), error.to_string()))
             .and_then(|endpoint| {
                 let (authorization, _, work_id) = endpoint.authenticate_proposal(request)?;
@@ -2831,20 +2930,14 @@ impl WorkService {
     }
 
     /// Answers one proposal, or says the endpoint is unreachable.
-    ///
-    /// Synchronous, and that is the whole of why the lock above is a
-    /// plain [`Mutex`]: nothing between taking it and dropping it can
-    /// await.
-    pub fn accept(&self, request: &AcceptWorkRequest) -> AcceptWorkResponse {
-        match self.endpoint() {
-            Ok(mut endpoint) => endpoint.accept(request),
-            Err(error) => AcceptWorkResponse {
-                outcome: Some(Outcome::Refused(WorkRefused {
-                    grant: None,
-                    code: endpoint_refusal(error).code() as i32,
-                    reason: error.to_string(),
-                })),
-            },
+    pub async fn accept(&self, request: &AcceptWorkRequest) -> AcceptWorkResponse {
+        match self.endpoint().await {
+            Ok(mut endpoint) => endpoint.accept(request).await,
+            Err(error) => AcceptWorkResponse::refused(WorkRefused {
+                grant: None,
+                code: endpoint_refusal(error).code() as i32,
+                reason: error.to_string(),
+            }),
         }
     }
 
@@ -2855,12 +2948,12 @@ impl WorkService {
     ///
     /// [`RunError::Endpoint`] when the endpoint is unreachable, and
     /// whatever [`ProviderEndpoint::begin_run`] raises otherwise.
-    pub fn begin_run(
+    pub async fn begin_run(
         &self,
         work_id: Digest,
         ready: &ReadyChannel,
     ) -> Result<RunAdmission, RunError> {
-        let result = self.endpoint()?.begin_run(work_id, ready);
+        let result = self.endpoint().await?.begin_run(work_id, ready).await;
         self.changed.notify_waiters();
         result
     }
@@ -2871,18 +2964,23 @@ impl WorkService {
     ///
     /// [`RunError::Endpoint`] when the endpoint is unreachable, and
     /// whatever [`ProviderEndpoint::record_result`] raises otherwise.
-    pub fn record_result(
+    pub async fn record_result(
         &self,
         work_id: Digest,
         transcript: &[OutputEventEnvelope],
     ) -> Result<(PaidJobResultV1, Sig), RunError> {
-        let result = self.endpoint()?.record_result(work_id, transcript);
-        if result.is_ok() {
+        let result = self
+            .endpoint()
+            .await?
+            .record_result(work_id, transcript)
+            .await;
+        let result = result.and_then(|completed| {
             self.progress
                 .lock()
-                .expect("paid progress poisoned")
+                .map_err(|_| RunError::Backend(BackendFault::caused_by(ProgressError::Poisoned)))?
                 .remove(&work_id);
-        }
+            Ok(completed)
+        });
         self.changed.notify_waiters();
         result
     }
@@ -2893,14 +2991,17 @@ impl WorkService {
     ///
     /// [`RunError::Endpoint`] when the endpoint is unreachable, and
     /// whatever [`ProviderEndpoint::end_run`] raises otherwise.
-    pub fn end_run(&self, work_id: Digest) -> Result<(), RunError> {
-        let result = self.endpoint()?.end_run(work_id);
-        self.progress
+    pub async fn end_run(&self, work_id: Digest) -> Result<(), RunError> {
+        let result = self.endpoint().await?.end_run(work_id).await;
+        let cleanup = self
+            .progress
             .lock()
-            .expect("paid progress poisoned")
-            .remove(&work_id);
+            .map(|mut progress| {
+                progress.remove(&work_id);
+            })
+            .map_err(|_| RunError::Backend(BackendFault::caused_by(ProgressError::Poisoned)));
         self.changed.notify_waiters();
-        result
+        result.and(cleanup)
     }
 
     /// Releases one job's plaintext against this service's own
@@ -2915,13 +3016,15 @@ impl WorkService {
     ///
     /// [`DeliverError::Endpoint`] when the endpoint is unreachable, and
     /// whatever [`ProviderEndpoint::deliver`] raises otherwise.
-    pub fn deliver(
+    pub async fn deliver(
         &self,
         request: &DeliverResultRequest,
         exporter: &[u8; 32],
     ) -> Result<Delivery, DeliverError> {
-        self.endpoint()?
+        self.endpoint()
+            .await?
             .deliver_with_readiness(request, None, exporter)
+            .await
     }
 
     /// Releases one job's answer, or says why not.
@@ -2937,14 +3040,15 @@ impl WorkService {
     /// exactly the sense [`ReadyChannel`] documents; what is measured
     /// against it is the height this endpoint has actually processed
     /// finalized blocks through.
-    fn release(
+    async fn release(
         &self,
         request: &DeliverResultRequest,
         context: &TransportContext,
     ) -> DeliverResultResponse {
-        let outcome = match (self.endpoint(), context.open_exporter) {
+        let outcome = match (self.endpoint().await, context.open_exporter) {
             (Ok(mut endpoint), Some(exporter)) => endpoint
                 .deliver_with_readiness(request, None, &exporter)
+                .await
                 .map_err(Refusal::from),
             (Ok(_), None) => Err(Refusal::from(DeliverError::Unbindable)),
             (Err(error), _) => Err(Refusal::new(endpoint_refusal(error), error.to_string())),
@@ -2970,9 +3074,9 @@ impl WorkService {
     /// The answer is produced after [`ProviderEndpoint::admit`] returns,
     /// which is after its record is fsynced. Nothing on this path can
     /// acknowledge a payment the disk does not hold.
-    fn credit(&self, request: &AdmitCertificateRequest) -> AdmitCertificateResponse {
-        let outcome = match self.endpoint() {
-            Ok(mut endpoint) => endpoint.admit(request).map_err(Refusal::from),
+    async fn credit(&self, request: &AdmitCertificateRequest) -> AdmitCertificateResponse {
+        let outcome = match self.endpoint().await {
+            Ok(mut endpoint) => endpoint.admit(request).await.map_err(Refusal::from),
             Err(error) => Err(Refusal::new(endpoint_refusal(error), error.to_string())),
         };
         AdmitCertificateResponse {
@@ -3012,27 +3116,21 @@ impl WorkHandler for WorkService {
         impl Into<hellas_rpc::call::WithTrailer<hellas_rpc::pb::work::GetStandingResponse>> + Send,
         WireStatus,
     > {
-        use hellas_rpc::pb::work::{GetStandingResponse, get_standing_response};
-        Ok(GetStandingResponse {
-            outcome: Some(get_standing_response::Outcome::Refused(WorkRefused {
-                code: WorkRefusalCode::Invalid as i32,
-                reason: "GetStanding requires grant funding".into(),
-                grant: None,
-            })),
-        })
+        use hellas_rpc::pb::work::GetStandingResponse;
+        Ok(GetStandingResponse::refused(WorkRefused {
+            code: WorkRefusalCode::Invalid as i32,
+            reason: "GetStanding requires grant funding".into(),
+            grant: None,
+        }))
     }
 
-    fn accept_work(
+    async fn accept_work(
         &self,
         request: AcceptWorkRequest,
         _context: TransportContext,
-    ) -> impl core::future::Future<
-        Output = Result<
-            impl Into<hellas_rpc::call::WithTrailer<AcceptWorkResponse>> + Send,
-            WireStatus,
-        >,
-    > + Send {
-        core::future::ready(Ok(self.accept(&request)))
+    ) -> Result<impl Into<hellas_rpc::call::WithTrailer<AcceptWorkResponse>> + Send, WireStatus>
+    {
+        Ok(self.accept(&request).await)
     }
 
     async fn deliver_result(
@@ -3041,7 +3139,7 @@ impl WorkHandler for WorkService {
         context: TransportContext,
     ) -> Result<impl Into<hellas_rpc::call::WithTrailer<DeliverResultResponse>> + Send, WireStatus>
     {
-        Ok(self.release(&request, &context))
+        Ok(self.release(&request, &context).await)
     }
 
     async fn stream_result(
@@ -3052,17 +3150,13 @@ impl WorkHandler for WorkService {
         Ok(self.result_stream(request, context))
     }
 
-    fn admit_certificate(
+    async fn admit_certificate(
         &self,
         request: AdmitCertificateRequest,
         _context: TransportContext,
-    ) -> impl core::future::Future<
-        Output = Result<
-            impl Into<hellas_rpc::call::WithTrailer<AdmitCertificateResponse>> + Send,
-            WireStatus,
-        >,
-    > + Send {
-        core::future::ready(Ok(self.credit(&request)))
+    ) -> Result<impl Into<hellas_rpc::call::WithTrailer<AdmitCertificateResponse>> + Send, WireStatus>
+    {
+        Ok(self.credit(&request).await)
     }
 }
 
@@ -3079,7 +3173,7 @@ fn work_id_bytes(bytes: &[u8]) -> Option<Digest> {
 ///
 /// The two things a proposal actually chooses. Everything else in the
 /// authorization is derived from the channel, the policy, and this
-/// bundle by [`hellas_rpc::protocol::work::propose_authorization`].
+/// bundle by [`crate::model::work::propose_authorization`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JobProposal {
     /// The inputs the job runs on.
@@ -3202,7 +3296,10 @@ impl ClientEndpoint {
     /// proposal, [`ProposeError::Conflict`] when a different proposal is
     /// outstanding, and the record, readiness, and journal errors the
     /// proposal itself raises.
-    pub fn propose(&mut self, proposal: &JobProposal) -> Result<AcceptWorkRequest, ProposeError> {
+    pub async fn propose(
+        &mut self,
+        proposal: &JobProposal,
+    ) -> Result<AcceptWorkRequest, ProposeError> {
         if let Some(observation) = &self.observation {
             observation.check()?;
         }
@@ -3238,7 +3335,7 @@ impl ClientEndpoint {
         }
 
         if let Some((id, request)) = retry {
-            self.mark_proposal_pending(id)?;
+            self.mark_proposal_pending(id).await?;
             return Ok(request);
         }
 
@@ -3280,14 +3377,16 @@ impl ClientEndpoint {
         let work_id = work_id(self.state().channel(), &authorization);
 
         let signature = self.signer.sign(signing_hash(work_id));
-        self.store.commit(
-            ChannelRecord::JobProposed {
-                authorization,
-                client_signature: signature,
-                prepared_input: prepared_input.clone(),
-            },
-            &Secp256k1Verifier::new(),
-        )?;
+        self.store
+            .commit(
+                ChannelRecord::JobProposed {
+                    authorization,
+                    client_signature: signature,
+                    prepared_input: prepared_input.clone(),
+                },
+                &Secp256k1Verifier::new(),
+            )
+            .await?;
         Ok(wire_request(&authorization, signature, prepared_input))
     }
 
@@ -3297,7 +3396,10 @@ impl ClientEndpoint {
     /// # Errors
     /// Returns [`ProposeError::NoOpenJob`] for an unknown job and
     /// [`ProposeError::JobInFlight`] if the provider already co-signed it.
-    pub fn resume_proposal(&mut self, work_id: Digest) -> Result<AcceptWorkRequest, ProposeError> {
+    pub async fn resume_proposal(
+        &mut self,
+        work_id: Digest,
+    ) -> Result<AcceptWorkRequest, ProposeError> {
         let job = self
             .state()
             .job_by_id(work_id)
@@ -3310,11 +3412,11 @@ impl ClientEndpoint {
             job.client_signature(),
             job.prepared_input().to_vec(),
         );
-        self.mark_proposal_pending(work_id)?;
+        self.mark_proposal_pending(work_id).await?;
         Ok(request)
     }
 
-    fn mark_proposal_pending(&mut self, work_id: Digest) -> Result<(), ProposeError> {
+    async fn mark_proposal_pending(&mut self, work_id: Digest) -> Result<(), ProposeError> {
         if self
             .state()
             .job_book()
@@ -3323,13 +3425,15 @@ impl ClientEndpoint {
         {
             return Err(ProposeError::Conflict);
         }
-        self.store.commit(
-            ChannelRecord::ProposalExchange {
-                work_id,
-                pending: true,
-            },
-            &Secp256k1Verifier::new(),
-        )?;
+        self.store
+            .commit(
+                ChannelRecord::ProposalExchange {
+                    work_id,
+                    pending: true,
+                },
+                &Secp256k1Verifier::new(),
+            )
+            .await?;
         Ok(())
     }
 
@@ -3348,7 +3452,10 @@ impl ClientEndpoint {
     /// response this service does not define, and
     /// [`ProposeError::Store`] when the signature is not the provider's
     /// or the journal will not take it.
-    pub fn accepted(&mut self, response: &AcceptWorkResponse) -> Result<Digest, ProposeError> {
+    pub async fn accepted(
+        &mut self,
+        response: &AcceptWorkResponse,
+    ) -> Result<Digest, ProposeError> {
         let (work_id, signature) = match response.outcome.as_ref() {
             Some(Outcome::Accepted(accepted)) => (
                 work_id_bytes(&accepted.work_id).ok_or(ProposeError::Malformed("work id"))?,
@@ -3363,13 +3470,15 @@ impl ClientEndpoint {
                     .job_book()
                     .pending_proposal()
                     .ok_or(ProposeError::NoOpenJob)?;
-                self.store.commit(
-                    ChannelRecord::ProposalExchange {
-                        work_id,
-                        pending: false,
-                    },
-                    &Secp256k1Verifier::new(),
-                )?;
+                self.store
+                    .commit(
+                        ChannelRecord::ProposalExchange {
+                            work_id,
+                            pending: false,
+                        },
+                        &Secp256k1Verifier::new(),
+                    )
+                    .await?;
                 return Err(ProposeError::Refused {
                     refusal,
                     reason: refused.reason.clone(),
@@ -3388,13 +3497,15 @@ impl ClientEndpoint {
         self.state()
             .job_by_id(work_id)
             .ok_or(ProposeError::NoOpenJob)?;
-        self.store.commit(
-            ChannelRecord::JobAccepted {
-                work_id,
-                provider_signature: signature,
-            },
-            &Secp256k1Verifier::new(),
-        )?;
+        self.store
+            .commit(
+                ChannelRecord::JobAccepted {
+                    work_id,
+                    provider_signature: signature,
+                },
+                &Secp256k1Verifier::new(),
+            )
+            .await?;
         Ok(work_id)
     }
 }
@@ -3422,7 +3533,7 @@ impl ClientEndpoint {
     /// [`CloseError::Store`] when a job is still open, a contest is
     /// already live, or the journal refuses the record, and the window
     /// errors [`close_start`] raises.
-    pub fn prepare_close(&mut self) -> Result<PaymentCloseStart, CloseError> {
+    pub async fn prepare_close(&mut self) -> Result<PaymentCloseStart, CloseError> {
         let (height, _) = self.state().cursor();
         if let Some(retained) = self.state().includable_close_start(height) {
             return Ok(retained.clone());
@@ -3434,7 +3545,7 @@ impl ClientEndpoint {
             self.state().executable_certificate(),
             &self.signer,
         )?;
-        retain_close_start(&mut self.store, &start)?;
+        retain_close_start(&mut self.store, &start).await?;
         Ok(start)
     }
 
@@ -3488,16 +3599,16 @@ impl ClientEndpoint {
     /// [`DeliverError::Malformed`] for a signature that is not 64
     /// bytes, [`DeliverError::Record`] when the result does not parse,
     /// and [`DeliverError::Store`] for every rule above.
-    pub fn receive(
+    pub async fn receive(
         &mut self,
         work_id: Digest,
         ready: &ReadyChannel,
         delivered: &WorkDelivered,
     ) -> Result<Delivery, DeliverError> {
-        self.receive_inner(work_id, ready, delivered, false)
+        self.receive_inner(work_id, ready, delivered, false).await
     }
 
-    fn receive_inner(
+    async fn receive_inner(
         &mut self,
         work_id: Digest,
         ready: &ReadyChannel,
@@ -3509,7 +3620,7 @@ impl ClientEndpoint {
             .ok_or(DeliverError::NoSuchJob)?;
 
         bind(ready, &self.store, &self.signer, Role::Client)?;
-        hellas_rpc::protocol::work::check_payment_policy_binding(
+        crate::model::work::check_payment_policy_binding(
             ready.channel(),
             self.state()
                 .job_by_id(work_id)
@@ -3555,9 +3666,9 @@ impl ClientEndpoint {
                 .job_by_id(work_id)
                 .ok_or(DeliverError::NoSuchJob)?
                 .authorization();
-            let transcript = hellas_rpc::protocol::work::decode_transcript(
+            let transcript = crate::model::work::decode_transcript(
                 &delivered.transcript,
-                hellas_rpc::protocol::work_fetch::MAX_FETCH_TRANSCRIPT_BYTES,
+                crate::model::fetch::MAX_FETCH_TRANSCRIPT_BYTES,
             )?;
             let input = PreparedWorkInput::decode(
                 self.state()
@@ -3582,15 +3693,17 @@ impl ClientEndpoint {
         }
         let signature = signature(&delivered.provider_signature)
             .ok_or(DeliverError::Malformed("provider signature"))?;
-        self.store.commit(
-            ChannelRecord::JobResult {
-                work_id,
-                result,
-                provider_signature: signature,
-                transcript: delivered.transcript.clone(),
-            },
-            &Secp256k1Verifier::new(),
-        )?;
+        self.store
+            .commit(
+                ChannelRecord::JobResult {
+                    work_id,
+                    result,
+                    provider_signature: signature,
+                    transcript: delivered.transcript.clone(),
+                },
+                &Secp256k1Verifier::new(),
+            )
+            .await?;
         Ok(Delivery {
             result,
             signature,
@@ -3646,14 +3759,16 @@ impl ClientEndpoint {
     /// [`DeliverError::NoSuchJob`] when no open job carries this
     /// `work_id`, and [`DeliverError::Store`] when the job has no
     /// recorded result or the match cannot be made durable.
-    pub fn matched(&mut self, work_id: Digest) -> Result<(), DeliverError> {
+    pub async fn matched(&mut self, work_id: Digest) -> Result<(), DeliverError> {
         self.state()
             .job_by_id(work_id)
             .ok_or(DeliverError::NoSuchJob)?;
-        self.store.commit(
-            ChannelRecord::ResultMatched { work_id },
-            &Secp256k1Verifier::new(),
-        )?;
+        self.store
+            .commit(
+                ChannelRecord::ResultMatched { work_id },
+                &Secp256k1Verifier::new(),
+            )
+            .await?;
         Ok(())
     }
 
@@ -3671,7 +3786,7 @@ impl ClientEndpoint {
     /// [`DeliverError::NoSuchJob`] when no open job carries this
     /// `work_id`, and [`DeliverError::Store`] when the job has no
     /// recorded result or the refutation cannot be made durable.
-    pub fn refuted(
+    pub async fn refuted(
         &mut self,
         work_id: Digest,
         reproduction_digest: Digest,
@@ -3682,16 +3797,18 @@ impl ClientEndpoint {
             .ok_or(DeliverError::NoSuchJob)?;
         let (result, _) = job.result().ok_or(DeliverError::NoSuchJob)?;
         let result_digest = result_digest(self.state().channel(), result);
-        self.store.commit(
-            ChannelRecord::JobTerminated {
-                work_id,
-                outcome: TerminalOutcome::Refuted {
-                    result_digest,
-                    reproduction_digest,
+        self.store
+            .commit(
+                ChannelRecord::JobTerminated {
+                    work_id,
+                    outcome: TerminalOutcome::Refuted {
+                        result_digest,
+                        reproduction_digest,
+                    },
                 },
-            },
-            &Secp256k1Verifier::new(),
-        )?;
+                &Secp256k1Verifier::new(),
+            )
+            .await?;
         Ok(())
     }
 
@@ -3705,7 +3822,7 @@ impl ClientEndpoint {
     /// is nothing here a provider quoted.
     ///
     /// The journal then runs
-    /// [`hellas_rpc::protocol::work::CreditLedger::credit_payment`] over the
+    /// [`crate::model::work::CreditLedger::credit_payment`] over the
     /// job it recorded itself, so the two signatures below are made
     /// before the ledger has agreed and released after it has — a
     /// certificate the ledger refuses is one whose bytes never leave.
@@ -3724,7 +3841,7 @@ impl ClientEndpoint {
     /// [`PaymentError::Record`] when the payment would exceed what this
     /// edge can settle, and [`PaymentError::Store`] for every rule the
     /// journal applies — including a payment signed past its deadline.
-    pub fn pay(&mut self, work_id: Digest) -> Result<AdmitCertificateRequest, PaymentError> {
+    pub async fn pay(&mut self, work_id: Digest) -> Result<AdmitCertificateRequest, PaymentError> {
         if let Some(retained) = self.state().payment(work_id) {
             return Ok(admit_request(self.state().channel().id(), &retained));
         }
@@ -3755,18 +3872,20 @@ impl ClientEndpoint {
             .signer
             .sign(certificate.digest(self.state().channel().network()));
 
-        self.store.commit(
-            ChannelRecord::JobTerminated {
-                work_id,
-                outcome: TerminalOutcome::Certified {
-                    certificate,
-                    binding: Box::new(binding),
-                    binding_signature,
-                    certificate_signature,
+        self.store
+            .commit(
+                ChannelRecord::JobTerminated {
+                    work_id,
+                    outcome: TerminalOutcome::Certified {
+                        certificate,
+                        binding: Box::new(binding),
+                        binding_signature,
+                        certificate_signature,
+                    },
                 },
-            },
-            &Secp256k1Verifier::new(),
-        )?;
+                &Secp256k1Verifier::new(),
+            )
+            .await?;
         Ok(AdmitCertificateRequest {
             route: Some(hellas_rpc::pb::work::WorkRoute::payment(
                 self.state().channel().id(),
@@ -3849,9 +3968,9 @@ where
     T::Error: std::error::Error + Send + Sync + 'static,
     T::Stream: 'static,
 {
-    let request = endpoint.with_client(|endpoint| endpoint.pay(work_id))??;
+    let request = endpoint.client().await?.pay(work_id).await?;
     let response = client.admit_certificate(request).await?;
-    endpoint.with_client(|endpoint| endpoint.acknowledged(work_id, &response))?
+    endpoint.client().await?.acknowledged(work_id, &response)
 }
 
 /// Asks for one accepted job's answer over a live transport and makes it
@@ -3885,14 +4004,20 @@ where
     let Some(exporter) = transport.context().open_exporter else {
         return Err(DeliverError::Unbindable);
     };
-    let request =
-        endpoint.with_client(|endpoint| endpoint.request_delivery(work_id, &exporter))??;
+    let request = endpoint
+        .client()
+        .await?
+        .request_delivery(work_id, &exporter)?;
     let response = WorkClientImpl::new(transport)
         .deliver_result(request)
         .await?;
     match response.outcome {
         Some(DeliverOutcome::Delivered(delivered)) => {
-            endpoint.with_client(|endpoint| endpoint.receive(work_id, ready, &delivered))?
+            endpoint
+                .client()
+                .await?
+                .receive(work_id, ready, &delivered)
+                .await
         }
         Some(DeliverOutcome::Refused(refused)) => Err(DeliverError::Refused {
             refusal: WorkRefusal::from_code(refused.code)
@@ -3925,9 +4050,9 @@ where
     T::Error: std::error::Error + Send + Sync + 'static,
     T::Stream: 'static,
 {
-    let request = endpoint.with_client(|endpoint| endpoint.propose(proposal))??;
+    let request = endpoint.client().await?.propose(proposal).await?;
     let response = WorkClientImpl::new(transport).accept_work(request).await?;
-    endpoint.with_client(|endpoint| endpoint.accepted(&response))?
+    endpoint.client().await?.accepted(&response).await
 }
 
 /// Resend a retained proposal over a live transport and journal its answer.
@@ -3945,9 +4070,9 @@ where
     T::Error: std::error::Error + Send + Sync + 'static,
     T::Stream: 'static,
 {
-    let request = endpoint.with_client(|endpoint| endpoint.resume_proposal(work_id))??;
+    let request = endpoint.client().await?.resume_proposal(work_id).await?;
     let response = WorkClientImpl::new(transport).accept_work(request).await?;
-    endpoint.with_client(|endpoint| endpoint.accepted(&response))?
+    endpoint.client().await?.accepted(&response).await
 }
 
 // ── Wire shapes ───────────────────────────────────────────────────────

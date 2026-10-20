@@ -8,6 +8,20 @@ pub const MAX_HTTP_RESPONSE_BYTES: u32 = 8 * 1024 * 1024;
 pub const MAX_HTTP_HEADERS_BYTES: usize = 16 * 1024;
 pub const MAX_HTTP_HEADERS: usize = 64;
 
+/// Provider credential aliases are the only way to select these upstream secrets.
+pub const CREDENTIAL_HEADERS: &[&str] = &[
+    "authorization",
+    "cookie",
+    "x-api-key",
+    "api-key",
+    "x-goog-api-key",
+];
+pub fn credential_header(name: &str) -> bool {
+    CREDENTIAL_HEADERS
+        .iter()
+        .any(|header| name.eq_ignore_ascii_case(header))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HttpFetchRequest {
@@ -278,7 +292,8 @@ mod tests {
         verify_output_events,
     };
     use crate::output::{AdaptorEvent, HttpResponseEvent, OutputEvent, StopReason};
-    use crate::{Assurance, Digest, InputCommitment, ProducerSigningKey};
+    use crate::{Assurance, InputCommitment};
+    use hellas_auth::{Digest, ProducerSigningKey};
 
     fn request() -> HttpFetchRequest {
         HttpFetchRequest {

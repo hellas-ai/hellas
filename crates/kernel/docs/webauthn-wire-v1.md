@@ -82,15 +82,12 @@ key committed by the transaction. The compact `r || s` signature verifies over
 the prehash above, and `s` must be at or below the P-256 half-order; high-s
 signatures are rejected even if mathematically valid.
 
-## Deliberately portable, and deliberately different
+## Deliberately portable
 
 Kernel v1 does **not** enforce `origin`, does **not** bind or validate
 `rpIdHash`, and accepts either UP or UV. Those bytes remain signature-bound,
 but they are not authorization policy. This makes the assertion a portable
 P-256 signing envelope for kernel payload hashes.
 
-**Warning:** the chain-domain `Transfer`/`MergeCoin` WebAuthn path is a
-different, stricter product: it requires browser-shaped origin and RP policy
-and stronger flag checks. Its assertions and verifier must not be wired into
-kernel `Open`/`Close`, and the portable kernel verifier must not replace the
-chain-domain verifier.
+The policy itself lives in the `hellas-webauthn` crate, which every Hellas
+verifier shares.

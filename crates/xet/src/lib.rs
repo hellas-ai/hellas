@@ -222,28 +222,50 @@ impl<'de> Deserialize<'de> for XetHash {
     where
         D: Deserializer<'de>,
     {
-        struct XetHashVisitor;
+        struct XetHashVisitor {
+            human_readable: bool,
+        }
 
-        impl Visitor<'_> for XetHashVisitor {
+        impl<'de> Visitor<'de> for XetHashVisitor {
             type Value = XetHash;
 
             fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
                 formatter.write_str("a 32-byte Xet hash")
             }
 
-            // Only the borrowed form. serde's default `visit_byte_buf`
-            // already forwards an owned buffer here, so restating it
-            // would buy nothing but a `Vec` — and with it an allocator
-            // this crate refuses to require.
+            // serde forwards owned byte buffers here too; no allocator needed.
             fn visit_bytes<E>(self, bytes: &[u8]) -> Result<Self::Value, E>
             where
                 E: serde::de::Error,
             {
                 XetHash::from_slice(bytes).map_err(E::custom)
             }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                use serde::de::Error;
+                if !self.human_readable {
+                    return Err(A::Error::custom("binary Xet hashes require a byte string"));
+                }
+                // JSON represents serialize_bytes as an array. Read exactly the
+                // fixed width, without allocating for an untrusted sequence.
+                let mut bytes = [0; 32];
+                for (index, byte) in bytes.iter_mut().enumerate() {
+                    *byte = seq
+                        .next_element()?
+                        .ok_or_else(|| A::Error::invalid_length(index, &self))?;
+                }
+                if seq.next_element::<u8>()?.is_some() {
+                    return Err(A::Error::invalid_length(33, &self));
+                }
+                Ok(XetHash(bytes))
+            }
         }
 
-        deserializer.deserialize_bytes(XetHashVisitor)
+        let human_readable = deserializer.is_human_readable();
+        deserializer.deserialize_bytes(XetHashVisitor { human_readable })
     }
 }
 

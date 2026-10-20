@@ -43,6 +43,7 @@ let
       cp ${config} "$cargo_home/config.toml"
       export CARGO_HOME="$cargo_home"
       export CARGO_NET_OFFLINE=${lib.boolToString offline}
+      export SQLX_OFFLINE=true
       ${cmd}
     '' ([ pkgs.coreutils ] ++ inputs);
 
@@ -76,42 +77,34 @@ let
     clippy = mkCargo "check-clippy" "cargo clippy --workspace --all-targets -- -D warnings" (
       cargoEnv rustToolchain
     );
-    # Default features alone leave most of the CLI unlinted: `evaluate`,
-    # `node` and `gateway` are all off by default, which is most of what
-    # the binary actually does. So the buildable feature sets are named and
-    # checked independently.
+    # The default CLI includes client, gateway and daemon. Check the optional
+    # execution, indexing, consensus and telemetry integrations separately.
     clippy-features = mkCargo "check-clippy-features" (builtins.concatStringsSep " && " (
       map
         (f: "cargo clippy -p hellas-cli --no-default-features --features ${f} --all-targets -- -D warnings")
         (
           [
-            "chain"
             "indexer"
             "evaluate"
-            "node"
-            "llm"
-            "gateway"
-            "cloud"
-            "cloud,node,gateway"
             "otel"
           ]
           ++ lib.optionals isValidatorHost [ "validator" ]
         )
     )) (cargoEnv rustToolchain);
+    # Compile consumers without validator feature unification masking missing
+    # module gates or imports used only by the indexer API.
+    chain-features = mkCargo "check-chain-features" ''
+      cargo clippy -p hellas-chain --no-default-features --features client-core --all-targets -- -D warnings
+      cargo clippy -p hellas-chain --no-default-features --features proof-verify --all-targets -- -D warnings
+      cargo clippy -p hellas-chain --no-default-features --features full-node --all-targets -- -D warnings
+      cargo check -p hellas-sdk --all-features --all-targets
+    '' (cargoEnv rustToolchain);
     # Run command tests locally as well as in the release package builds.
-    cli = mkCargo "check-cli" "cargo test -p hellas-cli --no-default-features --features node,gateway" (
-      cargoEnv rustToolchain
-    );
+    cli = mkCargo "check-cli" "cargo test -p hellas-cli" (cargoEnv rustToolchain);
     cloud = mkCargo "check-cloud" ''
       cargo test -p hellas-cloud
-      cargo test -p hellas-cli --features cloud,node,gateway
-      cargo build -p hellas-cli --features cloud,node,gateway
-      cargo build -p hellas-cloud --bin hellas-agent
-      target_dir="''${CARGO_TARGET_DIR:-target}"
-      HELLAS_CLI="$(realpath "$target_dir/debug/hellas-cli")" \
-      HELLAS_AGENT="$(realpath "$target_dir/debug/hellas-agent")" \
-        cargo test -p hellas-cli --features cloud,node,gateway \
-          owner_controls_admin_and_hellas_rpc_even_when_receipt_is_stolen -- --ignored
+      cargo test -p hellas-cli
+      cargo build -p hellas-cli
     '' (cargoEnv rustToolchain);
     # The kernel's whole suite, including `tests/itf.rs` — the Quint↔Rust
     # replay that the entire abstract-correspondence story rests on — and
@@ -123,16 +116,9 @@ let
       cargoEnv rustToolchain
     );
     executor = mkCargo "check-executor" "cargo test -p hellas-executor" (cargoEnv rustToolchain);
-    # The paid-work wire records stay behind RPC's `work` feature, while
-    # endpoint workflow and durable recovery live in `hellas-work`.
-    # Neither enters the default graph, so both need an explicit gate.
-    #
-    # The whole package runs, not one named test file: `work` pulls
-    # `evaluate` and therefore `execute`, so this line is also what
-    # compiles `pb::id_pins` — the wire-id pins that no other gate here
-    # reaches, the `hellas.work.v1` service and method among them.
-    # Naming a single `--test` target would leave a rotated service id
-    # unnoticed, which is exactly what happened once.
+    # RPC owns the generated Work/WorkSetup interfaces and their wire-id pins;
+    # Work owns canonical paid/grant records, vectors and durable orchestration.
+    # Test each complete package so service/method identity pins stay covered.
     rpc-work =
       mkCargo "check-rpc-work"
         "cargo test -p hellas-rpc --features work && cargo test -p hellas-work && cargo clippy -p hellas-rpc --features work --all-targets -- -D warnings && cargo clippy -p hellas-work --all-targets -- -D warnings"
@@ -151,23 +137,10 @@ let
       mkCargo "check-http-fetch"
         "cargo test -p hellas-gateway -p hellas-providers -p hellas-private -p hellas-store"
         (cargoEnv rustToolchain);
-    # Exercise both fundings together and independently. Grant-only applications
-    # must work without compiling the chain client or payment observer.
+    # Native host composition has one implementation for both funding modes.
     sdk-paid-work = mkCargo "check-sdk-paid-work" ''
-      sdk_features=paid-client,paid-provider,paid-gateway,grant-client,grant-provider,grant-gateway,grant-admin
-      cargo test -p hellas-sdk --features "$sdk_features"
-      cargo clippy -p hellas-sdk --features "$sdk_features" --all-targets -- -D warnings
-      grant_features=grant-client,grant-provider,grant-gateway,grant-admin
-      cargo test -p hellas-sdk --no-default-features --features "$grant_features"
-      grant_dependencies=$(cargo tree -p hellas-sdk --no-default-features --features "$grant_features" --edges normal)
-      if [[ "$grant_dependencies" == *hellas-chain* ]]; then
-        echo "grant-only SDK unexpectedly depends on hellas-chain" >&2
-        exit 1
-      fi
-      for sdk_feature in paid-client paid-provider paid-gateway grant-client grant-provider grant-gateway grant-admin; do
-        cargo test -p hellas-sdk --no-default-features --features "$sdk_feature"
-        cargo clippy -p hellas-sdk --no-default-features --features "$sdk_feature" --all-targets -- -D warnings
-      done
+      cargo test -p hellas-sdk
+      cargo clippy -p hellas-sdk --all-targets -- -D warnings
     '' (cargoEnv rustToolchain);
     # The chain service's wire-id pins compile only under `chain`, which
     # `work` does not pull in. `check-validator` links hellas-rpc with
@@ -219,10 +192,12 @@ let
     # `work-watcher` for the journal and the driver — and neither of the
     # two dimensions above runs a test with the other's code compiled
     # in. This is the only line that runs a paid channel being opened
-    # against real finalized blocks.
+    # against real finalized blocks. Each paid scenario owns six validators and
+    # two full nodes; run that group separately and serially to avoid competing
+    # runtimes in the same test process during its bounded readiness wait.
     chain-setup =
       mkCargo "check-chain-setup"
-        "cargo test -p hellas-chain --no-default-features --features validator,work-watcher"
+        "cargo test -p hellas-chain --no-default-features --features validator,work-watcher -- --skip work_e2e && cargo test -p hellas-chain --no-default-features --features validator,work-watcher work_e2e -- --test-threads=1"
         (cargoEnv rustToolchain);
     sort = mk "check-sort" "cargo-sort --workspace --check --no-format" [ pkgs.cargo-sort ];
     taplo =
@@ -318,7 +293,6 @@ let
   }
   // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
     docker = "docker";
-    docker-cloud = "docker-cloud";
   }
   # CUDA/HIP images run in the dedicated trusted-branch image job, which
   # streams archives for publishing without requiring a Docker daemon.

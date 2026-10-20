@@ -7,7 +7,6 @@ pub struct SetupStore {
     root: PathBuf,
     journal: Journal,
     state: SetupState,
-    torn_tail: bool,
 }
 
 impl SetupStore {
@@ -23,7 +22,7 @@ impl SetupStore {
     /// [`WorkStoreError::Journal`] when the file is held, corrupt, or
     /// some other journal, and [`WorkStoreError::Setup`] when a
     /// replayed record does not obey the transition rules.
-    pub fn open<V: SigVerifier>(
+    pub async fn open<V: SigVerifier>(
         root: &Path,
         network: NetworkId,
         bond_edge: EdgeId,
@@ -35,10 +34,9 @@ impl SetupStore {
             kind: JournalKind::Setup,
             role,
             key: key.into_bytes(),
-            generation: 0,
         };
         let replayed = hellas_rpc::observe::Timing::start();
-        let (journal, replay) = Journal::open_latest(root, &setup_stem(key), id)?;
+        let (journal, replay) = Journal::open_latest(root, &setup_stem(key), id).await?;
         let mut state = match &replay.checkpoint {
             Some(bytes) => SetupState::from_checkpoint(bytes, network, bond_edge, role, verifier)?,
             None => SetupState::new(network, bond_edge, role),
@@ -53,20 +51,7 @@ impl SetupStore {
             root: root.to_path_buf(),
             journal,
             state,
-            torn_tail: replay.truncated_tail,
         })
-    }
-
-    /// Returns whether opening removed an interrupted write.
-    ///
-    /// True says the last thing this endpoint tried to record did not
-    /// finish reaching the disk, and the state above is the state
-    /// before it. Nothing was acknowledged, so nothing here is wrong —
-    /// but a clean shutdown does not produce it, and an operator who
-    /// sees it has been told the truth about a crash.
-    #[must_use]
-    pub const fn recovered_torn_tail(&self) -> bool {
-        self.torn_tail
     }
 
     /// Returns what the handshake has durably reached.
@@ -99,32 +84,36 @@ impl SetupStore {
     /// [`WorkStoreError::Setup`] when the step is not one this state
     /// may take — which is checked before anything is written — and
     /// [`WorkStoreError::Journal`] when the append or its sync fails.
-    pub fn commit<V: SigVerifier>(
-        &mut self,
+    pub fn commit<'a, V: SigVerifier>(
+        &'a mut self,
         record: SetupRecord,
         verifier: &V,
-    ) -> Result<&SetupState, WorkStoreError> {
-        check_signatures(&record, verifier)?;
-        // Applied to a copy first: a record that the rules refuse must
-        // leave neither the file nor the state touched.
-        let mut next = self.state.clone();
-        if next.apply(&record)? == Applied::Changed {
-            // A revision is exported after this returns, so the state
-            // that authorises it has to be one a rotation can still
-            // carry. Refused here, before the append and before the
-            // signature leaves, rather than at the rotation that finds
-            // out too late.
-            if record.exports_signature() {
-                let len = next.checkpoint().len();
-                if len > MAX_CHECKPOINT_BYTES {
-                    return Err(JournalError::CheckpointTooLarge { len }.into());
+    ) -> impl std::future::Future<Output = Result<&'a SetupState, WorkStoreError>> {
+        // Keep the retained setup copy and journal-write future off callers'
+        // poll stacks; witnesses are bounded inline in the no-alloc kernel.
+        Box::pin(async move {
+            check_signatures(&record, verifier)?;
+            // Applied to a copy first: a record that the rules refuse must
+            // leave neither the file nor the state touched.
+            let mut next = self.state.clone();
+            if next.apply(&record)? == Applied::Changed {
+                // A revision is exported after this returns, so the state
+                // that authorises it has to be one a rotation can still
+                // carry. Refused here, before the append and before the
+                // signature leaves, rather than at the rotation that finds
+                // out too late.
+                if record.exports_signature() {
+                    let len = next.checkpoint().len();
+                    if len > MAX_CHECKPOINT_BYTES {
+                        return Err(JournalError::CheckpointTooLarge { len }.into());
+                    }
                 }
+                self.rotate_if_full(record.is_new_work()).await?;
+                self.journal.append(&record.encode()).await?;
+                self.state = next;
             }
-            self.rotate_if_full(record.is_new_work())?;
-            self.journal.append(&record.encode())?;
-            self.state = next;
-        }
-        Ok(&self.state)
+            Ok(&self.state)
+        })
     }
 
     /// Moves the journal on to its next generation, carrying this state
@@ -138,8 +127,8 @@ impl SetupStore {
     ///
     /// [`WorkStoreError::Journal`] when the checkpoint does not fit one
     /// frame or an install step fails.
-    pub fn rotate(&mut self) -> Result<(), WorkStoreError> {
-        self.journal.rotate(&self.state.checkpoint())?;
+    pub async fn rotate(&mut self) -> Result<(), WorkStoreError> {
+        self.journal.rotate(&self.state.checkpoint()).await?;
         Ok(())
     }
 
@@ -147,14 +136,14 @@ impl SetupStore {
     ///
     /// New work stops when a rotation cannot complete, because admitting
     /// it would be promising a duty this journal has no room to finish.
-    /// A duty already exported does not stop: the reserve above the soft
-    /// limit is exactly the room it finishes in, and it is
-    /// [`Journal::append`] that refuses when even that is gone.
-    fn rotate_if_full(&mut self, new_work: bool) -> Result<(), WorkStoreError> {
+    /// A duty already exported can use the reserve after a rotation refused
+    /// before writing. [`Journal::append`] still refuses after a failed write,
+    /// until replay, or once the generation's reserve is exhausted.
+    async fn rotate_if_full(&mut self, new_work: bool) -> Result<(), WorkStoreError> {
         if !self.journal.at_soft_limit() {
             return Ok(());
         }
-        match self.journal.rotate(&self.state.checkpoint()) {
+        match self.journal.rotate(&self.state.checkpoint()).await {
             Ok(()) => Ok(()),
             Err(error) if new_work => Err(error.into()),
             Err(_) => Ok(()),
@@ -202,14 +191,14 @@ pub(super) fn check_bundle_signatures<V: SigVerifier>(
     let Some(bundle) = bundle else {
         return Ok(());
     };
-    let decoded = WorkChannelSetupBundleV1::decode(bundle)?;
+    let decoded = WorkChannelSetupBundleV2::decode(bundle)?;
     decoded.check(verifier)?;
     Ok(())
 }
 
 /// Returns the name every generation of one setup journal shares.
 fn setup_stem(key: Digest) -> String {
-    format!("setup-{}", hex(&key.into_bytes()))
+    format!("setup-{}", hex(key.into_bytes()))
 }
 
 /// Returns the key a setup journal is named and bound by.
@@ -295,7 +284,7 @@ pub struct SetupDiscovery {
 /// whose bond does not reproduce the name is a revision that does not
 /// belong to it, and is refused rather than believed.
 ///
-/// Only `setup-<key>.journal` files are considered. A channel journal
+/// Only `setup-<key>` journals are considered. A channel journal
 /// beside them is another store's, and a file that is not either is not
 /// this module's business.
 ///
@@ -307,75 +296,40 @@ pub struct SetupDiscovery {
 /// Nor is one unreadable journal — that is reported by name in
 /// [`SetupDiscovery::unidentified`], because the journals beside it are
 /// still this node's to open.
-pub fn discover_setups(root: &Path, network: NetworkId) -> Result<SetupDiscovery, WorkStoreError> {
-    let entries = match fs::read_dir(root) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(SetupDiscovery::default());
-        }
-        Err(error) => return Err(JournalError::Io(error).into()),
-    };
-    // Sorted, because `read_dir` hands them over in whatever order the
-    // filesystem holds them: a caller that mounted them in that order
-    // would mount them differently on two machines holding the same
-    // journals.
-    // One journal is a numbered sequence of files, and only its newest
-    // installed generation is the one to open. A discovery that offered
-    // the retired ones too would be a node mounting the same setup
-    // several times, once from a file it has already replaced.
-    let mut newest: std::collections::BTreeMap<[u8; 32], (u64, PathBuf)> =
-        std::collections::BTreeMap::new();
-    for entry in entries {
-        let path = entry.map_err(JournalError::Io)?.path();
-        if let Some((key, generation)) = setup_file_key(&path) {
-            let slot = newest.entry(key).or_insert((generation, path.clone()));
-            if generation >= slot.0 {
-                *slot = (generation, path);
-            }
-        }
-    }
-    let paths: Vec<PathBuf> = newest.into_values().map(|(_, path)| path).collect();
-
+pub async fn discover_setups(
+    root: &Path,
+    network: NetworkId,
+) -> Result<SetupDiscovery, WorkStoreError> {
     let mut discovery = SetupDiscovery::default();
-    for path in paths {
-        match identify_setup(&path, network) {
+    for stem in Journal::stems(root)? {
+        let Some(named) = setup_stem_key(&stem) else {
+            continue;
+        };
+        match identify_setup(root, &stem, named, network).await {
             Ok(setup) => discovery.setups.push(setup),
-            Err(reason) => discovery
-                .unidentified
-                .push(UnidentifiedSetup { path, reason }),
+            Err(reason) => discovery.unidentified.push(UnidentifiedSetup {
+                path: Journal::path(root, &stem),
+                reason,
+            }),
         }
     }
     Ok(discovery)
 }
 
-/// Returns the key and generation a setup journal's file name carries,
-/// if it is one.
-fn setup_file_key(path: &Path) -> Option<([u8; 32], u64)> {
-    let name = path.file_name()?.to_str()?;
-    let (stem, generation) = journal_name_parts(name)?;
-    let named = stem.strip_prefix("setup-")?;
-    if named.len() != 64 {
-        return None;
-    }
-    let mut key = [0_u8; 32];
-    for (slot, pair) in key.iter_mut().zip(named.as_bytes().as_chunks::<2>().0) {
-        let Ok(pair) = std::str::from_utf8(pair) else {
-            return None;
-        };
-        *slot = u8::from_str_radix(pair, 16).ok()?;
-    }
-    // Written back rather than trusted: the parse above accepts a sign
-    // and mixed case, and neither is a name this store ever wrote.
-    (hex(&key) == named).then_some((key, generation))
+/// Returns the key a setup journal's stem carries, if it is one.
+fn setup_stem_key(stem: &str) -> Option<[u8; 32]> {
+    hellas_auth::hex::parse_lower(stem.strip_prefix("setup-")?).ok()
 }
 
 /// Recovers what one setup journal is about, or says why it cannot.
-fn identify_setup(path: &Path, network: NetworkId) -> Result<DiscoveredSetup, SetupDiscoveryError> {
-    let Some((named, generation)) = setup_file_key(path) else {
-        return Err(SetupDiscoveryError::NotThisSetup);
-    };
-    let (id, replay) = Journal::inspect(path)?;
-    if id.kind != JournalKind::Setup || id.key != named || id.generation != generation {
+async fn identify_setup(
+    root: &Path,
+    stem: &str,
+    named: [u8; 32],
+    network: NetworkId,
+) -> Result<DiscoveredSetup, SetupDiscoveryError> {
+    let (id, replay) = Journal::inspect(root, stem).await?;
+    if id.kind != JournalKind::Setup || id.key != named {
         return Err(SetupDiscoveryError::NotThisSetup);
     }
     // A rotated journal keeps its revision in the checkpoint rather than
@@ -398,7 +352,7 @@ fn identify_setup(path: &Path, network: NetworkId) -> Result<DiscoveredSetup, Se
         }
     }
     if let Some(bundle) = retained.first() {
-        let decoded = WorkChannelSetupBundleV1::decode(bundle).map_err(SetupStateError::from)?;
+        let decoded = WorkChannelSetupBundleV2::decode(bundle).map_err(SetupStateError::from)?;
         let bond_edge = decoded.bond_edge();
         if setup_key(network, bond_edge).into_bytes() != id.key {
             return Err(SetupDiscoveryError::WrongKey);

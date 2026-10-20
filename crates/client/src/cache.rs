@@ -1,5 +1,6 @@
 //! Reusable inference recording, independent of HTTP and native storage.
 
+use hellas_auth::authority::UnixMillis;
 use std::sync::Arc;
 
 use futures::{StreamExt, stream::BoxStream};
@@ -135,10 +136,7 @@ impl OutputCache {
                 events,
             };
             let bytes = serde_ipld_dagcbor::to_vec(&transcript).map_err(cache_error)?;
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(cache_error)?
-                .as_secs();
+            let now = UnixMillis::now().map_err(cache_error)?.0 / 1_000;
             tokio::task::spawn_blocking(move || recording.insert(&key, &bytes, now))
                 .await
                 .map_err(cache_error)?

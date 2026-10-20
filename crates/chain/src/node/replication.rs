@@ -12,14 +12,14 @@ use commonware_utils::channel::oneshot;
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use hellas_rpc::{
     pb::{chain as pb, swarm},
-    peers::{
-        DiscoverySource, PeerDirectory, PeerDirectoryConfig, PeerId, PeerManager, RpcObservation,
-        ServiceAlias, TransportSecurity,
-    },
     services::{
         chain_sync::{ChainSync, ChainSyncClientImpl, GetFinalizedBlock, GetOperations},
         node::{Node, NodeClientImpl},
     },
+};
+use hellas_wire::peers::{
+    DiscoverySource, PeerDirectory, PeerDirectoryConfig, PeerId, PeerManager, RpcObservation,
+    ServiceAlias, TransportSecurity,
 };
 use hellas_wire::{ServiceMarker, iroh::IrohTransport};
 use rand::seq::SliceRandom;
@@ -43,7 +43,7 @@ impl Network {
         let directory = PeerDirectory::with_config(
             peer(endpoint.id()),
             PeerDirectoryConfig {
-                registry: hellas_rpc::peers::PeerRegistryConfig {
+                registry: hellas_wire::peers::PeerRegistryConfig {
                     max_peers: 128,
                     bucket_capacity: 64.0,
                     bucket_refill_per_sec: 32.0,

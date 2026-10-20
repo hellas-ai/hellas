@@ -7,6 +7,9 @@ limits. Separate `JobPaymentPolicyV2` terms bind the price and block margins.
 Both profiles use version-3 close descriptors and journal format 7. Older
 journals are refused; close old devnet channels with the old binary first.
 
+Canonical paid-work and grant records, prepared inputs, and usage accounting live in
+`hellas_work::model`. RPC owns generated messages and signed-transcript codecs.
+
 ## Provider storage
 
 The Fetch profile requires `Retention::Ephemeral` and a metadata-only provider
@@ -49,13 +52,13 @@ Opening one as the other fails.
 
 ## CLI
 
-Build the CLI with `node,llm`. Use `paid-work prepare-fetch` to create a
+Use `paid-work prepare-fetch` with the canonical contract descriptor to create a
 client-owned signed request:
 
 ```sh
 hellas-cli paid-work prepare-fetch \
   --service openai --method responses \
-  --execution-environment openai-responses \
+  --contract openai-responses-contract.json \
   --payload-file request.json --out paid-fetch.bin
 ```
 
@@ -64,33 +67,10 @@ Use the same local identity when preparing the input and running
 handles setup, acceptance, delivery, authenticated payment, and optional
 settlement; it still needs its existing provider/funding/config arguments.
 
-In the work config, replace `policies.execution` with `policies.fetch` (exactly
-one is allowed):
-
-```json
-{
-  "allowed_environment": "<64 hex digits of the Fetch manifest ID>",
-  "service": "openai",
-  "method": "responses",
-  "max_request_body_bytes": 4096,
-  "max_output_events": 64,
-  "max_output_bytes": 16384,
-  "max_spool_bytes": 65536,
-  "max_encoded_result_frame": 65536,
-  "max_encoded_prepared_input": 65536
-}
-```
-
-Both profiles require separate `policies.payment` terms:
-
-```json
-{
-  "dispatch_margin_blocks": 4,
-  "delivery_margin_blocks": 2,
-  "oracle_grace_blocks": 6,
-  "fixed_price": 10
-}
-```
+In the work config, select `policies.fetch` with its canonical `contract` descriptor
+and exact `allowed_environment` manifest; exactly one of Fetch and Evaluate is
+allowed. Separate `policies.payment` terms set prices and block margins. See the
+[paid gateway guide](../../docs/paid-gateway.md) for gateway setup and provider trust.
 
 The route must also exist in the provider's Fetch route configuration.
 Route-wide capabilities and shared Fetch concurrency limits remain enforced.
@@ -98,7 +78,7 @@ The mounted Work channel authorizes its jobs.
 
 ## Generic HTTPS and App Attest
 
-`FetchEnvironment::Http` interprets the caller-signed HTTPS request described
+The HTTP Fetch contract interprets the caller-signed HTTPS request described
 in [the HTTPS guide](../providers/HTTPS.md). The body binds the full URL,
 method, headers, binary request body, TLS roots, additional SPKI pins, account
 alias, and response-size ceiling. The result signs HTTP status, headers and
@@ -122,12 +102,13 @@ connection time. A registered route such as `http/request` must implement the
 HTTP manifest. The paid policy's byte/frame limits must cover the encoded HTTP
 response as well as its envelopes (base64 expands binary bodies).
 
-Use `paid-work prepare-fetch --execution-environment http` for this request.
-Every `paid-work run` requires `--provider-genesis`. Provisioned paid offers
-carry the provider enrollment and a settlement-key signature binding it to the
-bond proposal; the pool loader derives this pin directly from the offer. Add
-`--assurance apple-app-attest`, `--apple-app-id` and `--apple-cd-hashes` for
-attested Gate providers. Each paid
+Use `paid-work prepare-fetch --contract http-contract.json` with the canonical HTTP
+descriptor. Every `paid-work run` requires `--trust-store` and `--trust-policy`.
+Approve the independent enrollment, assurance, software pins and exact execution
+manifests through `hellas-cli trust ... approve` before execution; see the
+[paid gateway guide](../../docs/paid-gateway.md). Provisioned offers carry the
+provider enrollment and signed bond proposal, which must agree with the separately
+approved policy. Every paid
 Work and WorkSetup connection verifies a fresh Open proof before sending its
 request. The proof binds the TLS exporter, nonce, service ALPN, enrollment and
 producer key; the producer must also be the payment channel's provider.
@@ -151,15 +132,15 @@ rejects a weaker output scheme.
 - `FetchProviderOptions` and `start_fetch_provider` take an operator's route
   registry, enrollment and root prover. The host owns its identity and credentials;
   the SDK validates resources before opening journals and builds a `WorkRouter`
-  for grants, payment channels, or both. `GrantProviderPlan` is also used by CLI
-  servers and local owner execution. Only payment channels start a chain observer.
+  for grants, payment channels, or both. `GrantProviderOptions` supplies available
+  resource policies and job bounds. Only payment channels start a chain observer.
 - `HttpFetchRequest` and `HttpFetchResponse` express HTTPS semantics. The Fetch
   backend executes an admitted request; canonical transcript verification checks
   its result under the assurance requested by the caller.
 
-Grant-only SDK features (`grant-client`, `grant-provider`, `grant-gateway`, and
-`grant-admin`) do not depend on `hellas-chain`. Payment features add chain access
-through `paid-work`; each public feature is tested independently in CI.
+The native host SDK composes both funding modes in one build; funding is explicit
+runtime configuration. Consumers needing only the underlying grant protocol or
+ledger can use `hellas-rpc` and `hellas-work` without a chain runtime.
 
 Both funding paths reserve a `WorkPermit` before entering the executor queue.
 `AdmittedWork` carries that permit into `RunningWork`, which owns it until the

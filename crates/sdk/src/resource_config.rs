@@ -1,12 +1,10 @@
 //! Execution policy parsing shared by payment and grant configuration.
-use hellas_rpc::{
-    ContentId,
-    protocol::{
-        Digest,
-        work::{EvaluatePolicyV2, check_work_policy},
-        work_fetch::{FetchPolicyV2, FetchRoutePolicy, fetch_route_commitment},
-        work_profile::WorkPolicy,
-    },
+use hellas_auth::Digest;
+use hellas_rpc::ContentId;
+use hellas_work::model::{
+    fetch::{FetchPolicyV2, FetchRoutePolicy, fetch_route_commitment},
+    profile::WorkPolicy,
+    work::{EvaluatePolicyV2, check_work_policy},
 };
 use serde::Deserialize;
 
@@ -24,19 +22,13 @@ pub enum ResourceConfigError {
         field: &'static str,
         source: hex::FromHexError,
     },
-    #[error("{field} must be {expected} bytes, found {actual}")]
-    Length {
-        field: &'static str,
-        expected: usize,
-        actual: usize,
-    },
     #[error("{field}: {reason}")]
     Invalid {
         field: &'static str,
         reason: &'static str,
     },
     #[error("execution policy is not usable: {0}")]
-    Policy(#[from] hellas_rpc::protocol::work::PaidWorkError),
+    Policy(#[from] hellas_work::model::work::PaidWorkError),
 }
 type Result<T> = std::result::Result<T, ResourceConfigError>;
 
@@ -91,6 +83,7 @@ impl ExecutionPolicyFile {
 #[serde(deny_unknown_fields)]
 pub(crate) struct FetchPolicyFile {
     allowed_environment: String,
+    contract: hellas_rpc::FetchContract,
     service: Option<String>,
     method: Option<String>,
     open_fetch: Option<OpenFetchPolicyFile>,
@@ -140,7 +133,11 @@ impl FetchPolicyFile {
             max_encoded_result_frame: self.max_encoded_result_frame,
             max_encoded_prepared_input: self.max_encoded_prepared_input,
         };
-        let profile = WorkPolicy::Fetch { policy, route };
+        let profile = WorkPolicy::Fetch {
+            policy,
+            route,
+            contract: self.contract,
+        };
         profile.check()?;
         Ok(profile)
     }
@@ -159,15 +156,7 @@ pub(crate) fn parse_hex(field: &'static str, raw: &str) -> Result<Vec<u8>> {
 }
 
 pub(crate) fn parse_fixed_hex<const N: usize>(field: &'static str, raw: &str) -> Result<[u8; N]> {
-    let bytes = parse_hex(field, raw)?;
-    let Ok(bytes) = <[u8; N]>::try_from(bytes.as_slice()) else {
-        return Err(ResourceConfigError::Length {
-            field,
-            expected: N,
-            actual: bytes.len(),
-        });
-    };
-    Ok(bytes)
+    hellas_auth::hex::parse(raw.trim()).map_err(|source| ResourceConfigError::Hex { field, source })
 }
 
 pub(crate) fn parse_digest(field: &'static str, raw: &str) -> Result<Digest> {

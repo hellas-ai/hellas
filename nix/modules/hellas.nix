@@ -214,7 +214,7 @@ rec {
 
   protectedGatewayExtraArgs = [
     "--paid-work-config"
-    "--bearer-token-file"
+    "--gateway-profile"
     "--identity"
     "--log-file"
     "--assurance"
@@ -231,7 +231,6 @@ rec {
     "--node-id"
     "--node-addr"
     "--local"
-    "--provider"
     "--queue-size"
     "--retries"
     "--default-max-tokens"
@@ -243,8 +242,13 @@ rec {
     "--responses-fetch-route-method"
     "--responses-fetch-execution-environment"
     "--responses-fetch-request-overrides"
-    "--apple-app-attest-cdhashes"
-    "--apple-app-attest-app-id"
+    "--trust-store"
+    "--trust-policy"
+    "--offer"
+    "--passkey"
+    "--work-profile"
+    "--grant-policy"
+    "--local-grant"
   ];
 
   extraArgsAreSafe =
@@ -549,12 +553,17 @@ rec {
         default = [ ];
         description = "Client journal directories named in paidWorkConfig, made writable in the service sandbox. Preserve these across restarts and provision ownership before starting the service.";
       };
-      allowRemote = mkEnableOption "non-loopback gateway listening (requires bearerTokenFile)";
-      bearerTokenFile = mkOption {
+      allowRemote = mkEnableOption "non-loopback gateway listening";
+      gatewayProfile = mkOption {
         type = types.nullOr runtimePath;
         default = null;
-        example = "/var/lib/hellas-gateway/bearer-token";
-        description = "Private bearer credential file. Created on first startup and reused across restarts; never logged.";
+        example = "/var/lib/hellas-gateway/gateway-profile.json";
+        description = "Private runtime profile selecting an explicitly provisioned HTTP authority, grant and gateway.invoke bearer credential. Startup never issues credentials.";
+      };
+      authorityJournal = mkOption {
+        type = types.nullOr runtimePath;
+        default = null;
+        description = "Authority journal named in gatewayProfile. Set this when it is outside the managed state directory so the service sandbox permits durable writes.";
       };
       host = mkOption {
         type = types.str;
@@ -579,12 +588,32 @@ rec {
       local = mkOption {
         type = types.bool;
         default = false;
-        description = "Reserved for owner grant funding; currently returns an unsupported error.";
+        description = "Run an already configured local allowance using workProfile, localGrant and caller trust approval.";
       };
-      provider = mkOption {
+      offer = mkOption {
         type = types.nullOr types.str;
         default = null;
-        description = "Out-of-band ContentId pin on the enrollment bundle of the provider this gateway dials. Required whenever it dials one: with nodeId or responsesBackend = \"fetch\".";
+        description = "Previously imported allowance offer alias.";
+      };
+      passkey = mkOption {
+        type = types.nullOr runtimePath;
+        default = null;
+        description = "Private software passkey of the principal whose allowance local or offer execution uses.";
+      };
+      workProfile = mkOption {
+        type = types.nullOr runtimePath;
+        default = null;
+        description = "Provisioned private application credential and Work authorization profile.";
+      };
+      grantPolicy = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        description = "Select one granted resource by name.";
+      };
+      localGrant = mkOption {
+        type = types.nullOr (types.strMatching "[0-9a-f]{32}");
+        default = null;
+        description = "Already configured local allowance ID for local execution.";
       };
       queueSize = mkOption {
         type = types.nullOr types.ints.unsigned;
@@ -711,12 +740,11 @@ rec {
         description = "Fetch route method used when responsesBackend is fetch.";
       };
       responsesFetchExecutionEnvironment = mkOption {
-        type = types.nullOr (types.strMatching "(codex-responses|openai-responses|[0-9a-f]{64})");
+        type = types.nullOr (types.strMatching "[0-9a-f]{64}");
         default = null;
         description = ''
-          Built-in Fetch environment alias ("codex-responses" or
-          "openai-responses") or exact ProgramManifest identity expected from
-          the selected provider route.
+          Exact ProgramManifest identity for the selected versioned Fetch contract.
+          Vendor-name aliases are not supported.
         '';
       };
       responsesFetchRequestOverrides = mkOption {
@@ -732,16 +760,15 @@ rec {
         default = "producer-signed";
         description = "Assurance requested from the selected execution provider.";
       };
-      appleAppAttestCdhashes = mkOption {
-        type = types.listOf (types.strMatching "[0-9A-Fa-f]{64}");
-        default = [ ];
-        description = "Allowed Apple App Attest application CDhashes for remote confidential open. Required with apple-app-attest assurance.";
-      };
-      appleAppAttestAppId = mkOption {
-        type = types.nullOr types.str;
+      trustStore = mkOption {
+        type = types.nullOr runtimePath;
         default = null;
-        example = "TEAMID.example.hellas";
-        description = "Apple App Attest application identity in teamID.bundleID form. Required with apple-app-attest assurance.";
+        description = "Caller-owned native trust directory, provisioned separately by trust approve.";
+      };
+      trustPolicy = mkOption {
+        type = types.nullOr (types.strMatching "[a-z0-9_-]{1,64}");
+        default = null;
+        description = "Previously approved enrollment, assurance, manifest and software policy ID.";
       };
       identityPath = mkOption {
         type = runtimePath;
@@ -865,17 +892,19 @@ rec {
       "--assurance"
       gateway.assurance
     ]
-    ++ lib.concatMap (cdhash: [
-      "--apple-app-attest-cdhashes"
-      cdhash
-    ]) gateway.appleAppAttestCdhashes
-    ++ optArg "--apple-app-attest-app-id" gateway.appleAppAttestAppId
+    ++ optArg "--trust-store" gateway.trustStore
+    ++ optArg "--trust-policy" gateway.trustPolicy
+    ++ optArg "--offer" gateway.offer
+    ++ optArg "--passkey" gateway.passkey
+    ++ optArg "--work-profile" gateway.workProfile
+    ++ optArg "--grant-policy" gateway.grantPolicy
+    ++ optArg "--local-grant" gateway.localGrant
     ++ optArg "--environment" gateway.causalLmEnvironment
     ++ optArg "--tokenizer" gateway.tokenizer
     ++ optArg "--model" gateway.model
     ++ optArg "--paid-work-config" gateway.paidWorkConfig
     ++ lib.optional gateway.allowRemote "--allow-remote"
-    ++ optArg "--bearer-token-file" gateway.bearerTokenFile
+    ++ optArg "--gateway-profile" gateway.gatewayProfile
     ++ optArg "--chat-template" gateway.chatTemplate
     ++ [
       "--host"
@@ -888,7 +917,6 @@ rec {
       addr
     ]) gateway.nodeAddrs
     ++ lib.optionals gateway.local [ "--local" ]
-    ++ optArg "--provider" gateway.provider
     ++ optArg "--queue-size" gateway.queueSize
     ++ optArg "--retries" gateway.retries
     ++ optArg "--default-max-tokens" gateway.defaultMaxTokens
@@ -906,9 +934,11 @@ rec {
       (toString token)
     ]) gateway.stopTokenIds
     ++ optArg "--metrics-port" gateway.metricsPort
-    ++ [
+    ++ lib.optionals (gateway.offer == null) [
       "--responses-backend"
       gateway.responsesBackend
+    ]
+    ++ [
       "--responses-proxy-url"
       gateway.responsesProxyUrl
       "--responses-proxy-api-key-env"

@@ -417,16 +417,9 @@ async fn address(
 }
 
 fn digest(value: &str) -> Option<Digest> {
-    if value.len() != 64
-        || !value
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    {
-        return None;
-    }
-    let bytes: [u8; 32] = hex::decode(value).ok()?.try_into().ok()?;
-    Some(Digest::from(bytes))
+    hellas_auth::hex::parse_lower(value).ok().map(Digest::from)
 }
+
 async fn answer(
     state: OriginState,
     lookup: FinalizedBlockQuery,

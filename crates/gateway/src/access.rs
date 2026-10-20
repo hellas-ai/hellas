@@ -1,257 +1,159 @@
-//! These HTTP routes reach an executor and can spend funded channel credit.
-//! Loopback is the default boundary; remote listeners require explicit opt-in
-//! and a provisioned private bearer file so unattended clients can authenticate.
-
+//! HTTP admission through the host's existing Auth authority.
 use axum::body::Body;
 use axum::http::{HeaderMap, Request, Response, StatusCode, header};
 use futures::future::BoxFuture;
-use hellas_rpc::provenance::encode_hex;
-use std::fmt;
-use std::io::Write;
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::task::{Context, Poll};
+use hellas_auth::authority::{CredentialId, CredentialSecret, GrantId};
+use hellas_work::node::NodeCoordinator;
+use std::{
+    fmt,
+    io::Write,
+    net::SocketAddr,
+    sync::Arc,
+    task::{Context, Poll},
+};
 use tower::{Layer, Service};
 
-/// 256 bits, per §8. Rendered to the operator as lowercase hex, so the
-/// credential is `TOKEN_HEX_LEN` characters on the wire.
-const TOKEN_BYTES: usize = 32;
-const TOKEN_HEX_LEN: usize = TOKEN_BYTES * 2;
-
-/// A value no hex nibble can take, returned for any byte that is not a
-/// lowercase hex digit. A sentinel rather than an `Option` keeps
-/// [`Bearer::accepts`]'s loop straight-line.
-const NOT_A_DIGIT: usize = 0x100;
-
-// Digit steps taken by Bearer::accepts, isolated from concurrent tests.
-#[cfg(test)]
-thread_local! {
-    static DIGIT_STEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+/// A provisioned bearer credential scoped to gateway.invoke, authorized by
+/// `authorization`. HTTP requests present a bearer authorized by that grant,
+/// or one whose subject holds its own current grant of gateway.invoke alone. The host owns the authority
+/// writer; starting a listener never creates grants or credentials.
+#[derive(Clone)]
+pub struct GatewayAccess {
+    node: NodeCoordinator,
+    authorization: GrantId,
+    credential: Arc<CredentialSecret>,
 }
-
-/// The gateway bearer credential.
-///
-/// There is no `Display`, no `Serialize`, and no derived `Debug`: the
-/// only way out of this type is [`Bearer::announce`], which writes to the
-/// terminal and to nothing else.
-pub(crate) struct Bearer {
-    token: [u8; TOKEN_BYTES],
-}
-
-impl Bearer {
-    pub(crate) fn load_or_create(path: &std::path::Path) -> crate::GatewayResult<Self> {
-        let file = hellas_private::open_nofollow(path);
-        let mut file = match file {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let bearer = Self::generate();
-                bearer.write_private(path)?;
-                return Ok(bearer);
-            }
-            Err(source) => {
-                return Err(crate::GatewayError::Credential {
-                    operation: "open",
-                    path: path.into(),
-                    source,
-                });
-            }
+impl GatewayAccess {
+    pub async fn new(
+        node: NodeCoordinator,
+        authorization: GrantId,
+        credential: CredentialSecret,
+    ) -> crate::GatewayResult<Self> {
+        let access = Self {
+            node,
+            authorization,
+            credential: Arc::new(credential),
         };
-        if !(hellas_private::is_private(&file)?) {
-            return Err(crate::GatewayConfigError::CredentialPermissions.into());
-        }
-        let mut bytes = Vec::new();
-        std::io::Read::read_to_end(&mut std::io::Read::take(&mut file, 128), &mut bytes)?;
-        let text = std::str::from_utf8(&bytes)?.trim();
-        if text.len() != TOKEN_HEX_LEN {
-            return Err(crate::GatewayConfigError::CredentialLength.into());
-        }
-        let mut token = [0u8; TOKEN_BYTES];
-        for (index, byte) in token.iter_mut().enumerate() {
-            let hi = hex_digit(text.as_bytes()[index * 2]);
-            let lo = hex_digit(text.as_bytes()[index * 2 + 1]);
-            if !(hi < 16 && lo < 16) {
-                return Err(crate::GatewayConfigError::CredentialEncoding.into());
-            }
-            *byte = ((hi << 4) | lo) as u8;
-        }
-        Ok(Self { token })
+        access.validate().await?;
+        Ok(access)
     }
 
-    pub(crate) fn write_private(&self, path: &std::path::Path) -> crate::GatewayResult<()> {
-        // Private from creation (0600 / an owner-only protected DACL), so the
-        // secret never sits in a readable file; the rename atomically replaces
-        // the destination without following an existing symlink.
-        hellas_private::write_atomically(
-            path,
-            ".tmp",
-            format!("{}\n", self.child_credential()).as_bytes(),
+    pub fn shares_writer(&self, node: &NodeCoordinator) -> bool {
+        self.node.shares_writer(node)
+    }
+
+    /// The gateway's own credential, under its configured grant.
+    pub async fn validate(&self) -> crate::GatewayResult<()> {
+        let caller = self.node.authenticate(&self.credential).await?;
+        self.node
+            .authorize_gateway(&caller, self.authorization)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn authenticate(
+        &self,
+        credential: &CredentialSecret,
+    ) -> Result<(), hellas_work::work_store::grant::NodeStoreError> {
+        let caller = self.node.authenticate(credential).await?;
+        if self
+            .node
+            .authorize_gateway(&caller, self.authorization)
+            .await
+            .is_ok()
+        {
+            return Ok(());
+        }
+        self.node.authorize_gateway_bearer(&caller).await.map(drop)
+    }
+
+    /// Secret material for an explicitly authorized control response or child.
+    pub fn bearer(&self) -> String {
+        format!(
+            "{}{}",
+            self.credential.id(),
+            hellas_rpc::provenance::encode_hex(self.credential.expose_secret())
         )
-        .map_err(|source| crate::GatewayError::Credential {
-            operation: "publish",
-            path: path.into(),
-            source,
-        })
     }
 
-    /// Draw a fresh credential; callers may persist it for managed clients.
-    pub(crate) fn generate() -> Self {
-        Self {
-            token: rand::random(),
-        }
-    }
-
-    /// Show the operator the credential exactly once, on the controlling
-    /// terminal.
-    ///
-    /// `/dev/tty` is the terminal this process is attached to. It is
-    /// neither stdout nor stderr, so nothing that captures those sees it:
-    /// not a `>` redirect, not a pipe into a log shipper, not systemd's
-    /// `StandardOutput=journal`. Where there is no controlling terminal —
-    /// a systemd unit, a container started without a tty — the open fails
-    /// and we print nothing rather than fall back to a stream that is
-    /// captured by construction. The operator is told that happened; the
-    /// credential itself stays in memory.
     pub(crate) fn announce(&self) {
-        let line = format!(
-            "gateway bearer: Authorization: Bearer {}\n",
-            encode_hex(&self.token)
-        );
-        // CONOUT$ is Windows' /dev/tty: the attached console, bypassing any
-        // redirection of stdout and stderr.
         let terminal = if cfg!(windows) { "CONOUT$" } else { "/dev/tty" };
+        // Never fall back to stdout/stderr, which are routinely captured.
         match std::fs::OpenOptions::new().write(true).open(terminal) {
             Ok(mut tty) => {
-                if let Err(err) = tty.write_all(line.as_bytes()) {
-                    warn!("gateway bearer not shown: writing to {terminal} failed: {err}");
+                if let Err(error) = writeln!(
+                    tty,
+                    "gateway bearer: Authorization: Bearer {}",
+                    self.bearer()
+                ) {
+                    warn!(%error, "gateway credential could not be written to the controlling terminal");
                 }
             }
-            Err(err) => {
-                warn!("gateway bearer not shown: no controlling terminal ({err})");
-            }
+            Err(error) => warn!(%error, "gateway credential not shown: no controlling terminal"),
         }
     }
 
-    /// The credential as a child process we spawn must present it.
-    ///
-    /// The one way out of this type other than [`Bearer::announce`], and
-    /// it exists for `--wrap`: a command the gateway starts itself, on
-    /// this machine, whose requests would otherwise all be refused. It
-    /// goes into that child's environment and nowhere else — never into
-    /// a log line, an error, or a header we emit.
-    pub(crate) fn child_credential(&self) -> String {
-        encode_hex(&self.token)
-    }
-
-    /// Whether `headers` carries this run's credential in
-    /// `Authorization: Bearer …`.
-    ///
-    /// Only that header is consulted. A query parameter never reaches
-    /// here, and neither does any other header name, however well the
-    /// value matches.
-    fn authorizes(&self, headers: &HeaderMap) -> bool {
-        let Some(value) = headers.get(header::AUTHORIZATION) else {
+    async fn authorizes(&self, headers: &HeaderMap) -> bool {
+        let mut values = headers.get_all(header::AUTHORIZATION).iter();
+        let Some(value) = values.next() else {
             return false;
         };
-        let Some(credential) = strip_bearer(value.as_bytes()) else {
+        if values.next().is_some() {
             return false;
-        };
-        self.accepts(credential)
-    }
-
-    /// Whether `presented` is this run's credential.
-    ///
-    /// The work is fixed at `TOKEN_HEX_LEN` digit steps for every input,
-    /// whatever its length: a short credential, a long one, and a
-    /// right-length wrong one all cost the same. The length disagreement
-    /// is folded into the accumulator instead of being returned on —
-    /// an `if presented.len() != TOKEN_HEX_LEN { return false }` here is
-    /// exactly the short-circuit §8 forbids, because it answers "how long
-    /// is the secret" before it answers anything else.
-    ///
-    /// [`hex_digit`] does branch, but only on a byte the caller chose and
-    /// already knows; nothing in this loop branches on `self.token`.
-    fn accepts(&self, presented: &[u8]) -> bool {
-        let mut diff = presented.len() ^ TOKEN_HEX_LEN;
-        for index in 0..TOKEN_HEX_LEN {
-            #[cfg(test)]
-            DIGIT_STEPS.set(DIGIT_STEPS.get() + 1);
-            // Past the end of a short credential we decode a fixed
-            // filler, so the step count never depends on the length.
-            let digit = hex_digit(presented.get(index).copied().unwrap_or(0));
-            let byte = self.token[index / 2];
-            let nibble = if index % 2 == 0 {
-                byte >> 4
-            } else {
-                byte & 0x0f
-            };
-            diff |= digit ^ usize::from(nibble);
         }
-        diff == 0
+        let value = value.as_bytes();
+        let Some((scheme, text)) = value.split_at_checked(7) else {
+            return false;
+        };
+        if !scheme.eq_ignore_ascii_case(b"bearer ") {
+            return false;
+        }
+        let Ok(text) = std::str::from_utf8(text) else {
+            return false;
+        };
+        let Ok(bytes) = hellas_auth::hex::parse_lower::<48>(text) else {
+            return false;
+        };
+        let Ok(id) = CredentialId::try_from(&bytes[..16]) else {
+            return false;
+        };
+        let Ok(secret) = bytes[16..].try_into() else {
+            return false;
+        };
+        self.authenticate(&CredentialSecret::from_parts(id, secret))
+            .await
+            .is_ok()
     }
 }
-
-/// Redacted, so no `{:?}` anywhere — an options struct, a tracing field,
-/// a panic message — can spill the credential into a log.
-impl fmt::Debug for Bearer {
+impl fmt::Debug for GatewayAccess {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("Bearer(redacted)")
+        f.write_str("GatewayAccess(redacted)")
     }
 }
 
-/// The `Bearer ` scheme prefix, matched case-insensitively as RFC 7235
-/// requires, and the credential after it. Nothing here touches the
-/// secret, so returning early is free.
-fn strip_bearer(value: &[u8]) -> Option<&[u8]> {
-    const SCHEME: &[u8] = b"bearer ";
-    if value.len() < SCHEME.len() {
-        return None;
-    }
-    let (scheme, credential) = value.split_at(SCHEME.len());
-    scheme.eq_ignore_ascii_case(SCHEME).then_some(credential)
-}
-
-/// Value of one lowercase-hex digit, or [`NOT_A_DIGIT`].
-fn hex_digit(c: u8) -> usize {
-    match c {
-        b'0'..=b'9' => usize::from(c - b'0'),
-        b'a'..=b'f' => usize::from(c - b'a') + 10,
-        _ => NOT_A_DIGIT,
-    }
-}
-
-/// Requires this run's bearer on every request it wraps.
-///
-/// One implementation, shared: `hellas_gateway::run` puts it over the
-/// executor-reaching routes and `spawn_metrics_server` puts the same
-/// layer over `/metrics`.
 #[derive(Clone)]
 pub(crate) struct BearerLayer {
-    bearer: Arc<Bearer>,
+    access: GatewayAccess,
 }
-
 impl BearerLayer {
-    pub(crate) fn new(bearer: Arc<Bearer>) -> Self {
-        Self { bearer }
+    pub(crate) fn new(access: GatewayAccess) -> Self {
+        Self { access }
     }
 }
-
 impl<S> Layer<S> for BearerLayer {
     type Service = BearerService<S>;
-
     fn layer(&self, inner: S) -> Self::Service {
         BearerService {
             inner,
-            bearer: self.bearer.clone(),
+            access: self.access.clone(),
         }
     }
 }
-
 #[derive(Clone)]
 pub(crate) struct BearerService<S> {
     inner: S,
-    bearer: Arc<Bearer>,
+    access: GatewayAccess,
 }
-
 impl<S, B> Service<Request<B>> for BearerService<S>
 where
     S: Service<Request<B>, Response = Response<Body>> + Clone + Send + 'static,
@@ -260,32 +162,28 @@ where
 {
     type Response = Response<Body>;
     type Error = S::Error;
-    type Future = BoxFuture<'static, Result<Response<Body>, S::Error>>;
-
+    type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx)
     }
-
-    fn call(&mut self, request: Request<B>) -> Self::Future {
-        if !self.bearer.authorizes(request.headers()) {
-            // The request never reaches the inner service, so nothing
-            // downstream — handler, executor, provenance — observes it.
-            return Box::pin(async { Ok(unauthorized()) });
-        }
-        // Standard tower/axum cloning idiom: own a "ready" clone of the
-        // inner service for the spawned future, leave the original behind.
+    fn call(&mut self, mut request: Request<B>) -> Self::Future {
+        let access = self.access.clone();
         let clone = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, clone);
-        Box::pin(async move { inner.call(request).await })
+        Box::pin(async move {
+            if !access.authorizes(request.headers()).await {
+                return Ok(unauthorized());
+            }
+            // This credential belongs to local HTTP admission, never upstream.
+            request.headers_mut().remove(header::AUTHORIZATION);
+            inner.call(request).await
+        })
     }
 }
-
-/// The refusal. It says what is required and quotes nothing it was
-/// given, so a mistyped credential cannot land in a client's log either.
 fn unauthorized() -> Response<Body> {
     let mut response = crate::json_error(
         StatusCode::UNAUTHORIZED,
-        "this route requires the gateway's per-run credential in `Authorization: Bearer <token>`",
+        "a current gateway credential is required",
     );
     response.headers_mut().insert(
         header::WWW_AUTHENTICATE,
@@ -294,7 +192,6 @@ fn unauthorized() -> Response<Body> {
     response
 }
 
-/// Resolve the explicitly configured listener address.
 pub(crate) async fn bind_addr(
     host: &str,
     port: u16,
@@ -321,4 +218,4 @@ pub(crate) async fn bind_addr(
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

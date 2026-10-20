@@ -1,20 +1,18 @@
 //! Live delivery over the existing job authorization and payment lifecycle.
 use super::*;
-use futures::{StreamExt, stream::BoxStream};
+use crate::model::fetch::MAX_FETCH_TRANSCRIPT_BYTES;
+use crate::model::work::decode_transcript;
+use futures::StreamExt;
 use hellas_rpc::pb::work::{WorkStreamEvent, work_stream_event};
-use hellas_rpc::protocol::work::decode_transcript;
-use hellas_rpc::protocol::work_fetch::MAX_FETCH_TRANSCRIPT_BYTES;
 use hellas_rpc::{
     Operation, StreamId, output_genesis, scheme_id, verify_output_event_continuation,
 };
 
 pub type PaidProgress = Arc<dyn Fn(OutputEventEnvelope) -> Result<(), BackendFault> + Send + Sync>;
-pub type PaidResultStream = BoxStream<'static, Result<WorkStreamEvent, WireStatus>>;
+pub type PaidResultStream = hellas_rpc::call::ResponseStream<WorkStreamEvent>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProgressError {
-    #[error("channel has no execution policy")]
-    NoPolicy,
     #[error("live result exceeds its authorized spool")]
     SpoolBound,
     #[error("progress state lock is poisoned")]
@@ -100,14 +98,14 @@ fn spool_charge(event: &OutputEventEnvelope, fetch: bool) -> usize {
 }
 
 impl ProviderEndpoint {
-    fn reserve_stream(
+    async fn reserve_stream(
         &mut self,
         request: &DeliverResultRequest,
         exporter: &[u8; 32],
     ) -> Result<(), DeliverError> {
         // Delivery authenticates the client and connection before looking at
         // the phase. A ready result takes the ordinary durable release path.
-        match self.deliver_with_readiness(request, None, exporter) {
+        match self.deliver_with_readiness(request, None, exporter).await {
             Ok(_) => return Ok(()),
             Err(DeliverError::NoResult {
                 phase: JobPhase::Running | JobPhase::Streaming,
@@ -127,40 +125,39 @@ impl ProviderEndpoint {
             self.state().cursor().0,
             job.authorization().terminal_deadline,
         )?;
-        self.close.store.commit(
-            ChannelRecord::PlaintextReleased { work_id },
-            &Secp256k1Verifier::new(),
-        )?;
+        self.close
+            .store
+            .commit(
+                ChannelRecord::PlaintextReleased { work_id },
+                &Secp256k1Verifier::new(),
+            )
+            .await?;
         Ok(())
     }
 }
 
 impl WorkService {
-    fn check_stream_release(
+    async fn check_stream_release(
         &self,
         request: &DeliverResultRequest,
         exporter: &[u8; 32],
     ) -> Result<(), WireStatus> {
-        self.endpoint()
-            .map_err(DeliverError::from)
-            .and_then(|mut endpoint| endpoint.reserve_stream(request, exporter))
+        let outcome = match self.endpoint().await {
+            Ok(mut endpoint) => endpoint.reserve_stream(request, exporter).await,
+            Err(error) => Err(DeliverError::from(error)),
+        };
+        outcome
             .map_err(|error| WireStatus::new(hellas_wire::WireCode::Unavailable, error.to_string()))
     }
 
     pub(super) fn publish_progress(
         &self,
         work_id: Digest,
+        policy: &WorkPolicy,
         event: OutputEventEnvelope,
     ) -> Result<(), BackendFault> {
-        let policy = self
-            .endpoint()
-            .map_err(BackendFault::caused_by)?
-            .ready
-            .as_ref()
-            .ok_or_else(|| BackendFault::caused_by(ProgressError::NoPolicy))?
-            .work_policy()
-            .clone();
-        let limit = match &policy {
+        // Bounds were fixed by begin_run; delivery rechecks live readiness.
+        let limit = match policy {
             WorkPolicy::Fetch { .. } => policy
                 .max_spool_bytes()
                 .min(MAX_FETCH_TRANSCRIPT_BYTES as u64),
@@ -191,7 +188,7 @@ impl WorkService {
         context: TransportContext,
     ) -> PaidResultStream {
         let service = self.clone();
-        Box::pin(async_stream::stream! {
+        PaidResultStream::new(async_stream::stream! {
             let Some(exporter) = context.open_exporter else {
                 yield Err(WireStatus::new(hellas_wire::WireCode::PermissionDenied, "delivery requires a bound connection"));
                 return;
@@ -205,11 +202,13 @@ impl WorkService {
                 let changed = service.changed.notified();
                 tokio::pin!(changed);
                 changed.as_mut().enable();
-                let reserved = service.endpoint().map_err(DeliverError::from)
-                    .and_then(|mut endpoint| endpoint.reserve_stream(&request, &exporter));
+                let reserved = match service.endpoint().await {
+                    Ok(mut endpoint) => endpoint.reserve_stream(&request, &exporter).await,
+                    Err(error) => Err(DeliverError::from(error)),
+                };
                 match reserved {
                     Ok(()) => {
-                        let limits = service.endpoint().and_then(|endpoint| {
+                        let limits = service.endpoint().await.and_then(|endpoint| {
                             let policy = endpoint.admitting()?.work_policy();
                             Ok((policy.max_encoded_result_frame(), matches!(policy, WorkPolicy::Fetch { .. })))
                         });
@@ -220,7 +219,7 @@ impl WorkService {
                                 return;
                             }
                         };
-                        let response = service.release(&request, &context);
+                        let response = service.release(&request, &context).await;
                         match response.outcome {
                             Some(DeliverOutcome::Delivered(delivered)) => {
                                 let events = match decode_transcript(&delivered.transcript, MAX_FETCH_TRANSCRIPT_BYTES) {
@@ -236,7 +235,7 @@ impl WorkService {
                                         return;
                                     };
                                     for frame in fetch_frames(&delivered, tail, frame_limit) {
-                                        if let Err(error) = service.check_stream_release(&request, &exporter) {
+                                        if let Err(error) = service.check_stream_release(&request, &exporter).await {
                                             yield Err(error);
                                             return;
                                         }
@@ -253,12 +252,18 @@ impl WorkService {
                             }
                             _ => {}
                         }
-                        let pending = {
-                            let progress = service.progress.lock().expect("paid progress poisoned");
-                            progress.get(&work_id).map(|progress| progress.events[position.min(progress.events.len())..].to_vec()).unwrap_or_default()
+                        let pending = service.progress.lock()
+                            .map(|progress| progress.get(&work_id).map(|progress| progress.events[position.min(progress.events.len())..].to_vec()).unwrap_or_default())
+                            .map_err(|_| ProgressError::Poisoned);
+                        let pending = match pending {
+                            Ok(pending) => pending,
+                            Err(error) => {
+                                yield Err(WireStatus::new(hellas_wire::WireCode::Unavailable, error.to_string()));
+                                return;
+                            }
                         };
                         for batch in prefix_batches(&pending, frame_limit, fetch) {
-                            if let Err(error) = service.check_stream_release(&request, &exporter) {
+                            if let Err(error) = service.check_stream_release(&request, &exporter).await {
                                 yield Err(error);
                                 return;
                             }
@@ -310,7 +315,8 @@ where
         .context()
         .open_exporter
         .ok_or(DeliverError::Unbindable)?;
-    let (request, prepared) = endpoint.with_client(|endpoint| {
+    let (request, prepared) = {
+        let endpoint = endpoint.client().await?;
         let request = endpoint.request_delivery(work_id, &exporter)?;
         let job = endpoint
             .state()
@@ -318,8 +324,8 @@ where
             .ok_or(DeliverError::NoSuchJob)?;
         let prepared = PreparedWorkInput::decode(job.prepared_input(), MAX_RECORD_BYTES)
             .map_err(PaidWorkError::from)?;
-        Ok::<_, DeliverError>((request, prepared))
-    })??;
+        (request, prepared)
+    };
     let input = prepared.input_commitment()?;
     let (operation, kind, max_tokens, max_events, max_bytes) =
         match (&prepared, ready.work_policy()) {
@@ -362,7 +368,7 @@ where
     } else {
         ready.work_policy().max_spool_bytes()
     };
-    let key = hellas_rpc::PublicKey::Secp256k1(ready.channel().provider_key().to_bytes());
+    let key = hellas_auth::PublicKey::Secp256k1(ready.channel().provider_key().to_bytes());
     let scheme = scheme_id(operation, prepared.assurance()?);
     let mut previous = output_genesis(input, StreamId::from_input_commitment(input));
     let mut streamed = Vec::new();
@@ -434,7 +440,10 @@ where
                 }
                 stream.finish()?;
                 let result = endpoint
-                    .with_client(|endpoint| endpoint.receive(work_id, ready, &delivered))??;
+                    .client()
+                    .await?
+                    .receive(work_id, ready, &delivered)
+                    .await?;
                 for event in &events[streamed.len()..] {
                     if event.event().body().kind() == kind {
                         progress(event)?;
@@ -470,8 +479,10 @@ where
                 stream.finish()?;
                 streamed.append(&mut tail);
                 let transcript = encode_transcript(&streamed)?;
-                return endpoint.with_client(|endpoint| {
-                    endpoint.receive_inner(
+                return endpoint
+                    .client()
+                    .await?
+                    .receive_inner(
                         work_id,
                         ready,
                         &WorkDelivered {
@@ -481,7 +492,7 @@ where
                         },
                         true,
                     )
-                })?;
+                    .await;
             }
             Some(work_stream_event::Outcome::Refused(refused)) => {
                 return Err(DeliverError::Refused {
@@ -505,9 +516,9 @@ mod tests {
 
     #[test]
     fn batched_fetch_preserves_every_envelope_and_bounds_each_frame() {
-        let key = hellas_rpc::ProducerSigningKey::from_secret_bytes([1; 32]).unwrap();
+        let key = hellas_auth::ProducerSigningKey::from_secret_bytes([1; 32]).unwrap();
         let mut builder = hellas_rpc::fetch::FetchOutputTranscriptBuilder::new(
-            hellas_rpc::InputCommitment::from_digest(hellas_rpc::Digest::from_bytes([2; 32])),
+            hellas_rpc::InputCommitment::from_digest(hellas_auth::Digest::from_bytes([2; 32])),
             hellas_rpc::Assurance::ProducerSigned,
             &key,
         );

@@ -5,10 +5,10 @@
 
 use core::fmt;
 
+use hellas_webauthn::{AUTHENTICATOR_DATA_LEN, FLAG_UP, encode_challenge, signed_digest};
 use p256::ecdsa::{Signature as P256Signature, SigningKey, signature::hazmat::PrehashSigner};
-use sha2::{Digest, Sha256};
 
-use super::{MIN_AUTH_DATA_LEN, UP, base64url_32, p256_key};
+use super::p256_key;
 use crate::{
     Key, List, MAX_WEBAUTHN_DATA_LENGTH, PayloadHash, WebAuthnAssertion,
     consts::P256_COORDINATE_LENGTH,
@@ -121,9 +121,9 @@ fn build_assertion(
     let mut data = [0_u8; MAX_WEBAUTHN_DATA_LENGTH];
     let mut len = 0;
     append(&mut data, &mut len, &SOFT_PASSKEY_RP_ID_HASH)?;
-    append(&mut data, &mut len, &[UP])?;
+    append(&mut data, &mut len, &[FLAG_UP])?;
     append(&mut data, &mut len, &[0; 4])?;
-    if len != MIN_AUTH_DATA_LEN {
+    if len != AUTHENTICATOR_DATA_LEN {
         return Err(SoftPasskeyError::AssertionTooLarge);
     }
 
@@ -135,7 +135,7 @@ fn build_assertion(
     append(
         &mut data,
         &mut len,
-        &base64url_32(challenge_hash.as_bytes()),
+        &encode_challenge(challenge_hash.as_bytes()),
     )?;
     append(&mut data, &mut len, b"\",\"origin\":\"")?;
     append(&mut data, &mut len, SOFT_PASSKEY_ORIGIN)?;
@@ -154,19 +154,14 @@ pub(super) fn sign_assertion_data(
     len: usize,
 ) -> Result<WebAuthnAssertion, SoftPasskeyError> {
     let auth_data = data
-        .get(..MIN_AUTH_DATA_LEN)
+        .get(..AUTHENTICATOR_DATA_LEN)
         .ok_or(SoftPasskeyError::AssertionTooLarge)?;
     let client_data_json = data
-        .get(MIN_AUTH_DATA_LEN..len)
+        .get(AUTHENTICATOR_DATA_LEN..len)
         .ok_or(SoftPasskeyError::AssertionTooLarge)?;
-    let client_data_hash = Sha256::digest(client_data_json);
-    let mut hasher = Sha256::new();
-    hasher.update(auth_data);
-    hasher.update(client_data_hash);
-    let message_hash = hasher.finalize();
     let signature: P256Signature = passkey
         .signing_key
-        .sign_prehash(&message_hash)
+        .sign_prehash(&signed_digest(auth_data, client_data_json))
         .map_err(|_| SoftPasskeyError::SigningFailed)?;
     let signature = signature.normalize_s();
     let signature_bytes = signature.to_bytes();

@@ -1,5 +1,4 @@
 use crate::domain::{Coin, Digest, ObjectId, ObjectKind, SettlementKey, Transaction};
-use commonware_codec::EncodeSize;
 use hellas_kernel::Encode as _;
 use hellas_rpc::SubmitTxOutcome;
 use hellas_wire::{WireCode, WireStatus};
@@ -7,7 +6,6 @@ use hellas_wire::{WireCode, WireStatus};
 pub(crate) fn canonical_submission_size(tx: &Transaction) -> usize {
     match tx {
         Transaction::Kernel(kernel) => kernel.encoded_size(),
-        _ => tx.encode_size(),
     }
 }
 
@@ -109,7 +107,7 @@ pub enum FinalizedBlockQuery {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OwnerCoins {
+pub struct CoinListing {
     pub snapshot: LatestBlock,
     pub coins: Vec<(ObjectId, u64)>,
 }
@@ -120,7 +118,9 @@ pub struct EdgeState {
     pub reserve: u64,
     pub close_fees: hellas_kernel::Fees,
     pub timeout: hellas_kernel::BlockHeight,
+    /// The maker's committed owner.
     pub maker: SettlementKey,
+    /// The taker's committed owner.
     pub taker: SettlementKey,
     pub terms_hash: hellas_kernel::TermsHash,
 }
@@ -133,8 +133,8 @@ impl From<hellas_kernel::Edge> for EdgeState {
             reserve: edge.reserve(),
             close_fees: edge.close_fees(),
             timeout: edge.timeout(),
-            maker: SettlementKey::from(parties.maker()),
-            taker: SettlementKey::from(parties.taker()),
+            maker: SettlementKey::from(parties.maker().owner()),
+            taker: SettlementKey::from(parties.taker().owner()),
             terms_hash: edge.terms(),
         }
     }
@@ -274,7 +274,14 @@ pub trait LightClient: Clone + Send + Sync + 'static {
     fn get_coins_by_owner(
         &self,
         owner: SettlementKey,
-    ) -> impl Future<Output = Result<Option<OwnerCoins>, QueryError>> + Send;
+    ) -> impl Future<Output = Result<Option<CoinListing>, QueryError>> + Send;
+
+    /// Coins whose committed delegate is this node. Values are spendable funding,
+    /// not the node's owned balance.
+    fn get_coins_by_delegate(
+        &self,
+        delegate: SettlementKey,
+    ) -> impl Future<Output = Result<Option<CoinListing>, QueryError>> + Send;
 
     fn get_edges_by_owner(
         &self,

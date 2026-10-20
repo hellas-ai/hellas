@@ -7,7 +7,7 @@ use sha2::{Digest as _, Sha256};
 use std::sync::Arc;
 use x509_cert::der::{Decode as _, Encode as _};
 
-pub(super) fn config(settings: &HttpTls) -> Result<rustls::ClientConfig, &'static str> {
+pub(crate) fn config(settings: &HttpTls) -> Result<rustls::ClientConfig, &'static str> {
     settings.validate().map_err(|_| "invalid TLS settings")?;
     let mut roots = rustls::RootCertStore::empty();
     match &settings.roots {

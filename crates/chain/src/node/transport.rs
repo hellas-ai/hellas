@@ -3,15 +3,16 @@ use super::*;
 #[cfg(feature = "validator")]
 use crate::execution::store::UtxoDatabase;
 use commonware_runtime::Runner as _;
-use futures_util::{StreamExt as _, stream::BoxStream};
+use futures_util::StreamExt as _;
+use hellas_rpc::call::ResponseStream;
 use hellas_rpc::{
     pb::{chain as pb, swarm},
-    peers::PeerManager,
     services::{
         chain_sync::{ChainSync, ChainSyncHandler, ChainSyncServer},
         node::{Node, NodeHandler, NodeServer},
     },
 };
+use hellas_wire::peers::PeerManager;
 use hellas_wire::{Dispatcher, ServiceMarker, StreamTransport, WireStatus, iroh::IrohTransport};
 use std::{sync::Mutex as StdMutex, time::Duration};
 use tokio::sync::oneshot;
@@ -187,7 +188,7 @@ impl FullNode {
     }
     pub fn peer_registry(
         &self,
-    ) -> Result<hellas_rpc::peers::PeerRegistry, hellas_rpc::peers::PeerManagerError> {
+    ) -> Result<hellas_wire::peers::PeerRegistry, hellas_wire::peers::PeerManagerError> {
         self.0.manager.snapshot()
     }
     pub fn peer_ids(&self) -> Vec<iroh::EndpointId> {
@@ -313,8 +314,7 @@ impl ChainSyncHandler for SyncService {
     async fn subscribe_finalized(
         &self,
         _: pb::GetLatestBlockRequest,
-    ) -> Result<BoxStream<'static, Result<pb::GetFinalizedBlockResponse, WireStatus>>, WireStatus>
-    {
+    ) -> Result<ResponseStream<pb::GetFinalizedBlockResponse>, WireStatus> {
         let source = self.clone();
         let stream = futures_util::stream::unfold(
             (source.progress.subscribe(), source),
@@ -335,9 +335,9 @@ impl ChainSyncHandler for SyncService {
             },
         );
         let initial = self.get_latest_block(pb::GetLatestBlockRequest {}).await;
-        Ok(futures_util::stream::once(async move { initial })
-            .chain(stream)
-            .boxed())
+        Ok(ResponseStream::new(
+            futures_util::stream::once(async move { initial }).chain(stream),
+        ))
     }
 }
 
@@ -377,17 +377,14 @@ impl ChainSyncHandler for FullNode {
     async fn subscribe_finalized(
         &self,
         request: pb::GetLatestBlockRequest,
-    ) -> Result<BoxStream<'static, Result<pb::GetFinalizedBlockResponse, WireStatus>>, WireStatus>
-    {
+    ) -> Result<ResponseStream<pb::GetFinalizedBlockResponse>, WireStatus> {
         let stream = SyncService::new(&self.0.core, self.0.network.clone())
             .subscribe_finalized(request)
             .await?;
-        Ok(
-            futures_util::stream::unfold((self.clone(), stream), |(node, mut stream)| async move {
-                stream.next().await.map(|value| (value, (node, stream)))
-            })
-            .boxed(),
-        )
+        Ok(ResponseStream::new(futures_util::stream::unfold(
+            (self.clone(), stream),
+            |(node, mut stream)| async move { stream.next().await.map(|value| (value, (node, stream))) },
+        )))
     }
 }
 
@@ -488,7 +485,7 @@ async fn serve(service: SyncService, network: Network) {
                         let server = Admission(ChainSyncServer(service), network.manager());
                         tokio::join!(dispatch(transport, server), network.discover(id.into()));
                     } else if alpn == Node::ALPN.as_bytes() {
-                        dispatch(transport, hellas_rpc::serve::AccountingDispatcher::new(NodeServer(NodeService {
+                        dispatch(transport, hellas_wire::serve::AccountingDispatcher::new(NodeServer(NodeService {
                             id: network.endpoint.id(), service_alpns: vec![Node::ALPN.into(), ChainSync::ALPN.into()], network: network.clone(),
                         }), network.manager())).await;
                     }
@@ -582,9 +579,9 @@ where
         let permit = request.context.peer.and_then(|id| {
             self.1
                 .acquire_rpc(
-                    hellas_rpc::peers::PeerId::from_bytes(id.0),
-                    hellas_rpc::peers::RequestKind::new(ChainSync::NAME, "replication"),
-                    hellas_rpc::peers::RpcObservation::authenticated_transport("iroh"),
+                    hellas_wire::peers::PeerId::from_bytes(id.0),
+                    hellas_wire::peers::RequestKind::new(ChainSync::NAME, "replication"),
+                    hellas_wire::peers::RpcObservation::authenticated_transport("iroh"),
                 )
                 .ok()
         });
@@ -605,7 +602,7 @@ where
 
 #[derive(Default)]
 struct Handshakes(
-    std::collections::BTreeMap<(std::net::IpAddr, bool), (u64, hellas_rpc::peers::TokenBucket)>,
+    std::collections::BTreeMap<(std::net::IpAddr, bool), (u64, hellas_wire::peers::TokenBucket)>,
 );
 impl Handshakes {
     fn admit(&mut self, address: iroh::endpoint::IncomingAddr, now: u64) -> bool {
@@ -629,7 +626,7 @@ impl Handshakes {
             let (seen, bucket) = self
                 .0
                 .entry(key)
-                .or_insert_with(|| (now, hellas_rpc::peers::TokenBucket::new(now, capacity)));
+                .or_insert_with(|| (now, hellas_wire::peers::TokenBucket::new(now, capacity)));
             *seen = now;
             if bucket.try_take(now, capacity, rate).is_err() {
                 return false;

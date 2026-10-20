@@ -1,4 +1,5 @@
 use super::*;
+use hellas_kernel::PartyAuth;
 
 impl Channel<PaymentFunding> {
     fn check_result_payload(
@@ -23,9 +24,7 @@ impl Channel<PaymentFunding> {
         let input = PreparedWorkInput::decode(&job.prepared_input, MAX_RECORD_BYTES)
             .map_err(PaidWorkError::from)?;
         let budget = match &input {
-            PreparedWorkInput::Fetch(_) => {
-                hellas_rpc::protocol::work_fetch::MAX_FETCH_TRANSCRIPT_BYTES
-            }
+            PreparedWorkInput::Fetch(_) => crate::model::fetch::MAX_FETCH_TRANSCRIPT_BYTES,
             PreparedWorkInput::Evaluate(_) => MAX_RECORD_BYTES,
         };
         let events = decode_transcript(transcript, budget)?;
@@ -88,7 +87,7 @@ impl Channel<PaymentFunding> {
     /// the client's authorization, the provider's co-signature, the
     /// provider's result, and the client's binding and certificate. The
     /// result is rebuilt from the transcript beside it by
-    /// [`hellas_rpc::protocol::work::terminal_result`], exactly as a record replay rebuilds it. The
+    /// [`crate::model::work::terminal_result`], exactly as a record replay rebuilds it. The
     /// inputs are hashed against the digest the authorization commits
     /// to. The retained close start is checked against this channel and
     /// this role, and the fixed answer is re-derived from the contest
@@ -400,7 +399,10 @@ impl Channel<PaymentFunding> {
     /// pending close.
     #[must_use]
     pub const fn close_prepared(&self) -> Option<&PaymentCloseStart> {
-        self.funding.close_prepared.as_ref()
+        match &self.funding.close_prepared {
+            Some(start) => Some(start),
+            None => None,
+        }
     }
 
     /// Returns the retained close start while `height` is still inside
@@ -415,7 +417,7 @@ impl Channel<PaymentFunding> {
     pub fn includable_close_start(&self, height: u64) -> Option<&PaymentCloseStart> {
         self.funding
             .close_prepared
-            .as_ref()
+            .as_deref()
             .filter(|start| height <= start.valid_through_height())
     }
 
@@ -751,7 +753,7 @@ impl Channel<PaymentFunding> {
         &mut self,
         start: &PaymentCloseStart,
     ) -> Result<Applied, ChannelStateError> {
-        if self.funding.close_prepared.as_ref() == Some(start) {
+        if self.funding.close_prepared.as_deref() == Some(start) {
             return Ok(Applied::Redundant);
         }
         if self.funding.close_opened.is_some() || self.funding.close_settled.is_some() {
@@ -776,7 +778,7 @@ impl Channel<PaymentFunding> {
                 what: "a close start that can still be included",
             });
         }
-        self.funding.close_prepared = Some(start.clone());
+        self.funding.close_prepared = Some(Box::new(start.clone()));
         Ok(Applied::Changed)
     }
 
@@ -982,6 +984,21 @@ impl Channel<PaymentFunding> {
     /// and it moves — only whether it is this endpoint's start for this
     /// channel over the certificate this journal holds.
     fn check_close_start(&self, start: &PaymentCloseStart) -> Result<(), ChannelStateError> {
+        let certificate = self
+            .executable_certificate()
+            .map(|(certificate, sig)| {
+                let channel = &self.funding.channel;
+                let authority = channel
+                    .payment_terms()
+                    .parties()
+                    .maker()
+                    .authority_of(channel.client_key())
+                    .ok_or(ChannelStateError::WrongChannel {
+                        field: "close start certificate signer",
+                    })?;
+                Ok::<_, ChannelStateError>((certificate, PartyAuth::new(authority, sig.into())))
+            })
+            .transpose()?;
         for (field, holds) in [
             (
                 "close start payment_edge",
@@ -1001,7 +1018,7 @@ impl Channel<PaymentFunding> {
             ),
             (
                 "close start certificate",
-                start.certificate().copied() == self.executable_certificate(),
+                start.certificate().cloned() == certificate,
             ),
         ] {
             if !holds {
@@ -1127,7 +1144,7 @@ impl Channel<PaymentFunding> {
     /// summarises.
     ///
     /// The rule that makes this more than a signature check is the
-    /// reproduction below: [`hellas_rpc::protocol::work::terminal_result`] is handed the stored
+    /// reproduction below: [`crate::model::work::terminal_result`] is handed the stored
     /// events and this job's own authorization, and what it builds must
     /// be the result byte for byte. That establishes, on commit and on
     /// every replay, that the events are one verified signed chain for

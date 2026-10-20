@@ -1,5 +1,8 @@
 use std::time::Duration;
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use anyhow::Context as _;
 use clap::{Args, Subcommand, ValueEnum};
@@ -8,10 +11,11 @@ use hellas_chain::genesis::{Genesis, known_network, known_network_names};
 use hellas_chain::{FinalizedBlockQuery, LightClient as _, QueryError, client::RemoteLightClient};
 use hellas_kernel::{
     BlockHeight, CloseKind as KernelCloseKind, CoinId, Decode as _, EdgeId, Encode as _, Funding,
-    List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, NetworkId, Parties, Payout, Proof, ProtocolCode,
-    Terms, Tx,
+    List, MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS, NetworkId, Parties, PartyAuth, PartyKeys, Payout,
+    Proof, ProtocolCode, Terms, Tx,
 };
 
+pub(crate) use self::signer::passkey;
 use self::signer::{AuthScheme, DevSigner};
 use crate::commands::CliResult;
 
@@ -25,6 +29,16 @@ pub enum ChainCommand {
         #[command(subcommand)]
         query: QueryCommand,
     },
+    /// Delegate selected coins to a node using the global owner passkey
+    Delegate {
+        #[command(flatten)]
+        coins: OwnerCoinArgs,
+        /// Secp256k1 node settlement key (base58)
+        #[arg(long)]
+        node: SettlementKey,
+    },
+    /// Reclaim selected coins without a delegate using the global owner passkey
+    Sweep(OwnerCoinArgs),
     /// Sign and submit a kernel edge Open transaction
     Open(OpenArgs),
     /// Sign and submit a kernel edge Close transaction
@@ -41,6 +55,19 @@ pub enum ChainCommand {
         #[command(subcommand)]
         command: ValidatorCommand,
     },
+}
+
+#[derive(Args)]
+pub struct OwnerCoinArgs {
+    #[arg(long)]
+    rpc: String,
+    #[arg(long, default_value = "devnet", conflicts_with = "genesis")]
+    network: String,
+    #[arg(long)]
+    genesis: Option<PathBuf>,
+    /// Live coin ID; repeat or comma-separate values
+    #[arg(long = "coin", value_delimiter = ',', required = true)]
+    coins: Vec<String>,
 }
 
 #[derive(Args)]
@@ -312,8 +339,16 @@ pub enum ValidatorCommand {
     },
 }
 
-pub async fn run(command: ChainCommand) -> CliResult {
+pub async fn run(command: ChainCommand, passkey_path: Option<&Path>) -> CliResult {
     match command {
+        ChainCommand::Delegate { coins, node } => {
+            anyhow::ensure!(
+                hellas_kernel::Secp256k1Verifier::is_valid_key(node.into_kernel()),
+                "delegate must be a valid secp256k1 node key"
+            );
+            run_owner_coins(coins, Some(node.into_kernel()), passkey_path).await
+        }
+        ChainCommand::Sweep(coins) => run_owner_coins(coins, None, passkey_path).await,
         ChainCommand::Query { rpc, query } => run_query(rpc, query).await,
         ChainCommand::Open(args) => run_open(args).await,
         ChainCommand::Close(args) => run_close(args).await,
@@ -322,6 +357,39 @@ pub async fn run(command: ChainCommand) -> CliResult {
         #[cfg(feature = "validator")]
         ChainCommand::Validator { command } => run_validator(command).await,
     }
+}
+
+async fn run_owner_coins(
+    args: OwnerCoinArgs,
+    delegate: Option<hellas_kernel::Key>,
+    passkey_path: Option<&Path>,
+) -> CliResult {
+    let owner = passkey(passkey_path.context("chain delegate/sweep requires --passkey")?)?;
+    let selected = parse_coin_ids::<MAX_EDGE_INPUTS>(&args.coins, "coin")?;
+    let network = selected_network(&args.network, args.genesis)?;
+    let client = connect_verified(args.rpc).await?;
+    let plan = hellas_sdk::coin_owner::OwnerReshape::prepare(
+        &client,
+        network,
+        owner.party_key(),
+        selected.as_slice(),
+        delegate,
+    )
+    .await?;
+    let output_ids = plan.output_ids();
+    let auth = hellas_kernel::Auth::webauthn(
+        owner
+            .sign(plan.payload_hash())
+            .map_err(|error| anyhow::anyhow!("owner signing failed: {error:?}"))?,
+    );
+    let outcome = client
+        .submit_tx(Transaction::Kernel(plan.authorize(auth)?))
+        .await?;
+    println!("{outcome}");
+    for id in output_ids.as_slice() {
+        println!("coin_id {}", hex::encode(id.to_bytes()));
+    }
+    Ok(())
 }
 
 async fn run_query(rpc: String, query: QueryCommand) -> CliResult {
@@ -463,7 +531,10 @@ async fn run_open(args: OpenArgs) -> CliResult {
     let timeout_outputs = parse_payouts(&args.timeout_payouts, "timeout payout")?;
     let terms = Terms::basic(
         ProtocolCode::new(args.protocol),
-        Parties::new(maker.party_key(), taker.party_key()),
+        Parties::new(
+            PartyKeys::sole(maker.party_key()),
+            PartyKeys::sole(taker.party_key()),
+        ),
         BlockHeight::new(args.timeout),
         timeout_outputs,
     );
@@ -475,8 +546,8 @@ async fn run_open(args: OpenArgs) -> CliResult {
     let tx = Tx::open(
         funding,
         terms.clone(),
-        maker.sign(open_hash)?,
-        taker.sign(open_hash)?,
+        PartyAuth::owner(maker.sign(open_hash)?),
+        PartyAuth::owner(taker.sign(open_hash)?),
     );
 
     // Persist the reveal before submission. A failed submission leaves only a
@@ -523,7 +594,10 @@ async fn run_close(args: CloseArgs) -> CliResult {
                 edge.terms_hash,
                 &outputs,
             );
-            Proof::mutual(maker.sign(hash)?, taker.sign(hash)?)
+            Proof::mutual(
+                PartyAuth::owner(maker.sign(hash)?),
+                PartyAuth::owner(taker.sign(hash)?),
+            )
         }
         CloseKind::Timeout => {
             if args.maker_key.is_some()
@@ -544,7 +618,7 @@ async fn run_close(args: CloseArgs) -> CliResult {
             if terms.timeout_outputs() != Some(&outputs) {
                 anyhow::bail!("timeout payouts do not match the committed Terms file");
             }
-            Proof::timeout(terms)
+            Proof::timeout(terms, None)
         }
     };
 
@@ -662,17 +736,14 @@ fn load_mutual_signer(
     DevSigner::load(scheme, path)
 }
 
-fn parse_coin_ids(
+fn parse_coin_ids<const N: usize>(
     raw: &[String],
     field: &'static str,
-) -> CliResult<List<CoinId, MAX_PARTY_INPUTS>> {
-    if raw.len() > MAX_PARTY_INPUTS {
-        anyhow::bail!(
-            "{field} accepts at most {MAX_PARTY_INPUTS} coin ids, got {}",
-            raw.len()
-        );
+) -> CliResult<List<CoinId, N>> {
+    if raw.len() > N {
+        anyhow::bail!("{field} accepts at most {N} coin ids, got {}", raw.len());
     }
-    let mut ids = [CoinId::from_bytes([0; CoinId::LENGTH]); MAX_PARTY_INPUTS];
+    let mut ids = [CoinId::from_bytes([0; CoinId::LENGTH]); N];
     for (slot, value) in ids.iter_mut().zip(raw) {
         *slot = CoinId::from_bytes(parse_hex_32(value, field)?);
     }
@@ -708,12 +779,7 @@ fn parse_edge_id(raw: &str) -> CliResult<EdgeId> {
 }
 
 fn parse_hex_32(raw: &str, field: &'static str) -> CliResult<[u8; 32]> {
-    let bytes =
-        hex::decode(raw).map_err(|error| anyhow::anyhow!("bad hex for {field}: {error}"))?;
-    let actual = bytes.len();
-    bytes
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("{field} must be 32 bytes, got {actual}"))
+    hellas_auth::hex::parse(raw).with_context(|| format!("{field} must be 32 bytes of hex"))
 }
 
 fn write_terms(path: &std::path::Path, terms: &Terms) -> CliResult {
@@ -867,7 +933,60 @@ fn finalized_block_query(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hellas_kernel::Key;
+    use hellas_kernel::{Key, MAX_PARTY_INPUTS};
+
+    #[test]
+    fn owner_commands_use_global_passkey_and_one_coin_parser() {
+        use clap::Parser as _;
+        let node = hellas_kernel::Secp256k1Signer::from_secret_scalar([19; 32]).unwrap();
+        let key = SettlementKey::from(node.party_key()).to_string();
+        let coin = "01".repeat(32);
+        for operation in ["delegate", "sweep"] {
+            let mut args = vec![
+                "hellas",
+                "--passkey",
+                "owner.key",
+                "chain",
+                operation,
+                "--rpc",
+                "ws://127.0.0.1:1",
+                "--coin",
+                &coin,
+            ];
+            if operation == "delegate" {
+                args.extend(["--node", &key]);
+            }
+            assert!(crate::Cli::try_parse_from(&args).is_ok());
+            args.extend(["--owner-key", "other.key"]);
+            assert!(crate::Cli::try_parse_from(&args).is_err());
+        }
+        let maximum = vec![coin; MAX_EDGE_INPUTS];
+        assert_eq!(
+            parse_coin_ids::<MAX_EDGE_INPUTS>(&maximum, "coin")
+                .unwrap()
+                .len(),
+            MAX_EDGE_INPUTS
+        );
+    }
+
+    #[tokio::test]
+    async fn delegate_rejects_an_invalid_node_before_network_or_owner_access() {
+        let error = run(
+            ChainCommand::Delegate {
+                coins: OwnerCoinArgs {
+                    rpc: "invalid".into(),
+                    network: "devnet".into(),
+                    genesis: None,
+                    coins: vec!["01".repeat(32)],
+                },
+                node: SettlementKey::from(Key::from_bytes([0; Key::LENGTH])),
+            },
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("secp256k1"));
+    }
 
     #[test]
     fn canonical_terms_file_round_trips_and_rejects_trailing_bytes() {
@@ -876,7 +995,10 @@ mod tests {
             parse_payouts(&[format!("{owner}:42")], "timeout payout").expect("valid payout");
         let terms = Terms::basic(
             ProtocolCode::new(7),
-            Parties::new(owner.into_kernel(), owner.into_kernel()),
+            Parties::new(
+                PartyKeys::sole(owner.into_kernel()),
+                PartyKeys::sole(owner.into_kernel()),
+            ),
             BlockHeight::new(99),
             payouts,
         );
@@ -894,7 +1016,7 @@ mod tests {
     #[test]
     fn funding_and_payout_parsers_enforce_kernel_bounds() {
         let too_many = vec!["00".repeat(CoinId::LENGTH); MAX_PARTY_INPUTS + 1];
-        assert!(parse_coin_ids(&too_many, "maker funding").is_err());
+        assert!(parse_coin_ids::<MAX_PARTY_INPUTS>(&too_many, "maker funding").is_err());
 
         let owner = SettlementKey::from(Key::from_bytes([2; Key::LENGTH]));
         let too_many = vec![format!("{owner}:1"); MAX_EDGE_OUTPUTS + 1];
@@ -930,6 +1052,12 @@ mod signer {
     pub(crate) enum DevSigner {
         Webauthn(SoftPasskey),
         Native(Secp256k1Signer),
+    }
+
+    /// Loads a software passkey from a 32-byte P-256 scalar file.
+    pub(crate) fn passkey(path: &Path) -> Result<SoftPasskey> {
+        SoftPasskey::from_secret_scalar(read_scalar(path)?)
+            .map_err(|_| anyhow!("P-256 key file contains an invalid secret scalar"))
     }
 
     impl DevSigner {

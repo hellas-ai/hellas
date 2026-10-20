@@ -62,17 +62,25 @@ impl AuthorityState {
         }
     }
 
-    /// Used only by the host's explicit offline initialization of an empty store.
+    /// Used only by the host's explicit initialization of an empty store.
     /// Ordinary startup must restore existing state, never call this on failure.
+    /// `owner` is the administrator's assertion over the bootstrap digest.
     pub fn bootstrap(
         id: GrantId,
+        target: Option<[u8; 32]>,
         admin: GrantSpec,
-        mut credential: Credential,
+        credential: Credential,
+        owner: &PasskeyAssertion,
         now: UnixMillis,
     ) -> Result<Self, AuthorityError> {
         Self::validate_administrator(&admin, now)?;
         Self::validate_initial_credential(&admin, &credential, 1, now)?;
-        credential.bearer = true;
+        Self::check_owner(
+            Ownership::Bootstrap { root: id, target },
+            &admin,
+            &credential,
+            owner,
+        )?;
         Ok(Self {
             authority: admin.authority,
             revision: Revision(1),
@@ -95,6 +103,25 @@ impl AuthorityState {
             )]
             .into(),
         })
+    }
+
+    /// The administrator's passkey must approve the exact ownership change,
+    /// including the node key that will hold the initial credential.
+    fn check_owner(
+        ownership: Ownership,
+        admin: &GrantSpec,
+        credential: &Credential,
+        owner: &PasskeyAssertion,
+    ) -> Result<(), AuthorityError> {
+        let CredentialHolder::Node(holder) = credential.holder else {
+            return Err(AuthorityError::Invalid);
+        };
+        owner
+            .verify(
+                admin.subject,
+                ownership_digest(ownership, admin, &credential.scope, holder),
+            )
+            .map_err(|_| AuthorityError::Denied)
     }
 
     fn validate_administrator(admin: &GrantSpec, now: UnixMillis) -> Result<(), AuthorityError> {
@@ -223,6 +250,24 @@ impl AuthorityState {
             .collect())
     }
 
+    /// The first live grant to `actor` whose only permission is `permission`.
+    pub fn grant_for(
+        &self,
+        actor: PrincipalId,
+        permission: &Permission,
+        now: UnixMillis,
+    ) -> Option<GrantId> {
+        self.grants
+            .iter()
+            .filter(|(_, grant)| {
+                grant.spec.subject == actor
+                    && grant.spec.permissions.len() == 1
+                    && grant.spec.permissions.contains(permission)
+            })
+            .map(|(id, _)| *id)
+            .find(|id| self.live_lineage(*id, now).is_ok())
+    }
+
     pub fn issue(
         &mut self,
         actor: PrincipalId,
@@ -287,7 +332,7 @@ impl AuthorityState {
         now: UnixMillis,
     ) -> Result<(), AuthorityError> {
         self.check_spec(&spec, now)?;
-        let old = self.target(id, expected)?;
+        let old = self.grants.get(&id).ok_or(AuthorityError::Missing)?;
         self.administrator(actor, authorization, GRANT_ISSUE, &spec, now, true)?;
         self.check_self_assignment(actor, authorization, &spec)?;
         if old.spec.subject == actor {
@@ -301,6 +346,7 @@ impl AuthorityState {
                 return Err(AuthorityError::Denied);
             }
         }
+        self.target(id, expected)?;
         let updated = Grant {
             spec,
             revision: self.revision.next().ok_or(AuthorityError::Capacity)?,
@@ -318,7 +364,7 @@ impl AuthorityState {
         now: UnixMillis,
     ) -> Result<(), AuthorityError> {
         self.check_time(now)?;
-        let old = self.target(id, expected)?;
+        let old = self.grants.get(&id).ok_or(AuthorityError::Missing)?;
         self.live_lineage(authorization, now)?;
         let authorizer = &self.grants[&authorization].spec;
         let own_delegation = old.origin
@@ -332,6 +378,7 @@ impl AuthorityState {
         if !own_delegation {
             self.administrator(actor, authorization, GRANT_REVOKE, &old.spec, now, false)?;
         }
+        self.target(id, expected)?;
         let updated = Grant {
             revoked: true,
             revision: self.revision.next().ok_or(AuthorityError::Capacity)?,

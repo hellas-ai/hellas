@@ -40,7 +40,7 @@
 //! # What it does not decide
 //!
 //! Whether the channel is usable. This module reports what is there;
-//! `hellas_rpc::protocol::work_setup` decides what that means. The shape
+//! `hellas_work::model::setup` decides what that means. The shape
 //! of the two registry answers is not decided here either: the kernel's
 //! own [`parse_bond_lease`] and [`parse_pending_close`] are called, so
 //! an endpoint and a close cannot disagree about what a slot holds.
@@ -232,8 +232,8 @@ impl WorkChannelSnapshot {
     /// is the cursor, and `ReadyChannel::check_caught_up` is where the
     /// two are compared.
     #[must_use]
-    pub fn observed_channel(&self) -> hellas_rpc::protocol::work_setup::ObservedChannel<'_> {
-        hellas_rpc::protocol::work_setup::ObservedChannel {
+    pub fn observed_channel(&self) -> hellas_work::model::setup::ObservedChannel<'_> {
+        hellas_work::model::setup::ObservedChannel {
             height: self.block.height,
             bond: self.bond(),
             payment: self.payment(),

@@ -3,11 +3,12 @@ use axum::{
     http::HeaderMap,
 };
 use futures::StreamExt;
+use hellas_auth::authority::UnixMillis;
 use serde_json::json;
 use std::{
     io,
     path::{Path, PathBuf},
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::Instant,
 };
 use tokio::io::AsyncWriteExt;
 #[cfg(test)]
@@ -217,7 +218,7 @@ impl Exchange {
         let body = body.clone();
         let mut metadata = json!({
             "version": 1, "path": path, "method": method, "complete": false,
-            "started_unix_ms": SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
+            "started_unix_ms": UnixMillis::now().unwrap_or_default().0,
             "request_bytes": body.len(),
             "request_content_type": headers.get("content-type").and_then(|value| value.to_str().ok()),
             "request_content_encoding": headers.get("content-encoding").and_then(|value| value.to_str().ok()),

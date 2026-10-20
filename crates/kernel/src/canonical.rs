@@ -52,6 +52,7 @@ pub(crate) mod tag {
     pub(crate) const PAYMENT_CLOSE_PENDING: u8 = 23;
     pub(crate) const REGISTRY_CHUNK: u8 = 24;
     pub(crate) const BOND_LEASE: u8 = 31;
+    pub(crate) const PARTY_AUTH: u8 = 32;
 }
 
 /// Streaming destination for [`Encode`] output.
@@ -483,6 +484,46 @@ impl Decode for Party {
     }
 }
 
+// -- Option<T> (presence byte) ----------------------------------------------
+// An optional field is one presence byte, then the value only when it is
+// present. Absence writes nothing after its byte, so an absent value has
+// exactly one encoding and can never be read as a present all-zero one.
+
+const ABSENT: u8 = 0;
+const PRESENT: u8 = 1;
+
+impl<T: Encode> Encode for Option<T> {
+    const MAX_ENCODED_SIZE: usize = u8::MAX_ENCODED_SIZE + T::MAX_ENCODED_SIZE;
+
+    fn encoded_size(&self) -> usize {
+        u8::MAX_ENCODED_SIZE + self.as_ref().map_or(0, Encode::encoded_size)
+    }
+
+    fn encode_to<W: Writer + ?Sized>(&self, writer: &mut W) {
+        match self {
+            None => ABSENT.encode_to(writer),
+            Some(value) => {
+                PRESENT.encode_to(writer);
+                value.encode_to(writer);
+            }
+        }
+    }
+}
+
+impl<T: Decode> Decode for Option<T> {
+    fn decode(buf: &[u8]) -> Result<(Self, usize), DecodeError> {
+        let mut consumed = 0;
+        match decode_field::<u8>(buf, &mut consumed)? {
+            ABSENT => Ok((None, consumed)),
+            PRESENT => {
+                let value = decode_field(buf, &mut consumed)?;
+                Ok((Some(value), consumed))
+            }
+            tag => Err(DecodeError::InvalidTag { tag }),
+        }
+    }
+}
+
 // -- List<T, N> blanket impls -------------------------------------------------
 // List is encoded as `<len: usize big-endian> ‖ <entries...>` where each
 // entry uses its own canonical encoding. `MAX_ENCODED_SIZE` reserves the
@@ -572,5 +613,79 @@ mod tests {
                 .into_iter()
                 .all(|length| length < hellas_xet::MIN_CHUNK_SIZE)
         );
+    }
+}
+
+/// A cursor over one record's canonical bytes.
+#[derive(Debug)]
+pub struct Cursor<'a> {
+    bytes: &'a [u8],
+}
+
+impl<'a> Cursor<'a> {
+    /// Starts a cursor at the beginning of `bytes`.
+    #[must_use]
+    pub const fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes }
+    }
+
+    /// Returns whether every byte has been read.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    /// Takes one byte.
+    pub fn byte(&mut self) -> Option<u8> {
+        let (head, rest) = self.bytes.split_first()?;
+        self.bytes = rest;
+        Some(*head)
+    }
+
+    /// Takes exactly `len` bytes.
+    pub fn take(&mut self, len: usize) -> Option<&'a [u8]> {
+        let (head, rest) = self.bytes.split_at_checked(len)?;
+        self.bytes = rest;
+        Some(head)
+    }
+
+    /// Takes a fixed-width array.
+    pub fn array<const N: usize>(&mut self) -> Option<[u8; N]> {
+        let head = self.take(N)?;
+        let mut out = [0_u8; N];
+        out.copy_from_slice(head);
+        Some(out)
+    }
+
+    /// Takes one big-endian `u64`.
+    pub fn u64(&mut self) -> Option<u64> {
+        self.array::<8>().map(u64::from_be_bytes)
+    }
+
+    /// Takes every remaining byte.
+    ///
+    /// Only legal as a record's last field, where "the rest" and "a
+    /// length-prefixed body" are the same bytes and the prefix would be
+    /// a second, disagreeable spelling of the record's own length.
+    pub const fn rest(&mut self) -> &'a [u8] {
+        let all = self.bytes;
+        self.bytes = &[];
+        all
+    }
+}
+
+impl Cursor<'_> {
+    /// Reads one kernel value and advances by its decoded size.
+    pub fn field<T: Decode>(&mut self) -> Option<T> {
+        let (value, consumed) = T::decode(self.bytes).ok()?;
+        self.bytes = self.bytes.get(consumed..)?;
+        Some(value)
+    }
+
+    /// Reads the length-prefixed network name used in Work records.
+    pub fn network(&mut self) -> Option<crate::NetworkId> {
+        let len = usize::from(self.byte()?);
+        let name = core::str::from_utf8(self.take(len)?).ok()?;
+        crate::NetworkId::new(name)
     }
 }

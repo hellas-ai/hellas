@@ -1,8 +1,8 @@
 use super::*;
 use crate::test_support::{PaidFixture, enrollment, signer};
-use hellas_rpc::protocol::work_offer::{PaidOffer, SignedPaidOffer};
 use hellas_rpc::services::work::{Work, WorkServer};
 use hellas_wire::Dispatcher;
+use hellas_work::model::offer::{PaidOffer, SignedPaidOffer};
 use hellas_work::work::ObservationTime;
 use std::sync::Arc;
 
@@ -12,7 +12,7 @@ use std::sync::Arc;
 async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_refuse() {
     tokio::time::timeout(Duration::from_secs(20), async {
         let fixture = PaidFixture::new();
-        let service = fixture.provider();
+        let service = fixture.provider().await;
         let server = Endpoint::builder(presets::Minimal)
             .alpns(vec![Work::ALPN.as_bytes().to_vec()])
             .bind_addr("127.0.0.1:0".parse::<SocketAddr>().unwrap())
@@ -43,6 +43,7 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
             fixture.descriptor.bond_edge()
         );
         let trust = hellas_client::ProviderTrustAnchor {
+            allowed_environments: vec![fixture.config.work_policy.allowed_environment()],
             expected_genesis: imported.offer().provider.content_id(),
             required_assurance: Assurance::ProducerSigned,
             apple_app_attest: None,
@@ -52,39 +53,61 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
             crate::paid_provider::MountedWork::with_backend(super::recovery::Backend::default());
         mount
             .mount(
-                hellas_rpc::peers::PeerId::from_bytes(*client_endpoint.id().as_bytes()),
+                hellas_wire::peers::PeerId::from_bytes(*client_endpoint.id().as_bytes()),
                 &service,
             )
+            .await
             .unwrap();
-        use crate::grant_client::tests::{definition, network, principal};
+        use crate::grant_client::tests::principal;
         use crate::grant_client::{GrantSessionOptions, GrantTransport, UnpinnedOffer};
-        use hellas_rpc::protocol::work_grant::{
-            GrantId, UnixMillis,
+        use hellas_auth::authority::{GrantId, UnixMillis};
+        use hellas_work::model::grant::{
+            budget::{Limit, Meter, Window},
             records::{Offer, SignedOffer},
         };
-        let now = hellas_work::grant_service::wall_clock();
+        use hellas_work::test_support::{definition, network};
+        let now = hellas_auth::authority::UnixMillis::now().unwrap_or_default();
         let grant = definition(GrantId([1; 16]), principal(1).0);
-        let mut store = hellas_work::work_store::grant::GrantStore::open(
+        let (store, secret) = crate::test_node::bootstrap_node_with_credential(
             &fixture.root.path().join("grants"),
             network(),
-            bundle.clone(),
+            Some(bundle.clone()),
             now,
         )
+        .await
         .unwrap();
-        store.configure_machine(vec![], 2, now).unwrap();
-        store.define(grant.clone(), now).unwrap();
         let grants = hellas_work::grant_service::GrantService::new(
             store,
             Arc::new(producer.clone()),
             super::recovery::Backend::default(),
             vec![],
-            Arc::new(hellas_work::grant_service::wall_clock),
+            Arc::new(|| hellas_auth::authority::UnixMillis::now().unwrap_or_default()),
         )
         .unwrap();
-        let mount = crate::work_router::WorkRouter::Both {
-            payment: mount,
-            grants: grants.clone(),
-        };
+        let admin =
+            crate::test_node::WorkAdmin::new(grants.clone(), &secret, grant.policies.clone()).await;
+        admin.capacity(2, vec![]).await;
+        admin
+            .budgets(
+                crate::test_node::POOL,
+                principal(1).0,
+                vec![Limit {
+                    meter: Meter::Requests,
+                    window: Window::Total,
+                    amount: 3,
+                }],
+                2,
+            )
+            .await;
+        admin.create(grant.clone()).await;
+        let application = crate::test_support::application_profile(
+            &grants.node(),
+            &secret,
+            principal(1).0,
+            grant.id,
+        )
+        .await;
+        let mount = crate::work_router::WorkRouter::both(mount, grants.clone());
         let offer = SignedOffer::sign(
             Offer {
                 network: network(),
@@ -98,11 +121,10 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
             &producer,
         )
         .unwrap();
-        let grant_target =
-            UnpinnedOffer::decode(&offer.encode().unwrap(), principal(1).0.id(), now)
-                .unwrap()
-                .pin(&trust)
-                .unwrap();
+        let grant_target = UnpinnedOffer::decode(&offer.encode().unwrap(), now)
+            .unwrap()
+            .pin(&trust)
+            .unwrap();
         let serving = tokio::spawn({
             let server = server.clone();
             async move {
@@ -122,22 +144,27 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
                                 inbound.method_id,
                                 hellas_rpc::services::work::Open::METHOD_ID
                             );
-                            let _ =
-                                Dispatcher::<IrohTransport>::dispatch(&WorkServer(mount), inbound)
-                                    .await;
-                            return;
-                        }
-                        serve_open::<hellas_rpc::services::work::Open>(
-                            &transport, bundle, producer,
-                        )
-                        .await;
-                        while let Ok(Some(inbound)) = transport.accept().await {
-                            assert!(index < 2, "failed Open must not disclose a Work request");
                             let _ = Dispatcher::<IrohTransport>::dispatch(
-                                &WorkServer(mount.clone()),
+                                &WorkServer(crate::work_router::UnmountedWork),
                                 inbound,
                             )
                             .await;
+                            return;
+                        }
+                        let server = match mount
+                            .accept_iroh(
+                                &transport,
+                                crate::test_identity::OpenProof(bundle, producer),
+                            )
+                            .await
+                        {
+                            Ok(server) => server,
+                            Err(_) if index >= 2 => return,
+                            Err(error) => panic!("Work authentication failed: {error}"),
+                        };
+                        while let Ok(Some(inbound)) = transport.accept().await {
+                            assert!(index < 2, "failed Open must not disclose a Work request");
+                            let _ = Dispatcher::<IrohTransport>::dispatch(&server, inbound).await;
                         }
                     });
                 }
@@ -146,7 +173,7 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
                 }
             }
         });
-        let client = ClientService::new(fixture.client());
+        let client = ClientService::new(fixture.client().await);
         client
             .observer()
             .observe_ready(
@@ -154,6 +181,7 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
                 ObservationTime::now(),
                 Duration::from_secs(60),
             )
+            .await
             .unwrap();
         let mut session = PaidWorkSession {
             chain: SessionChain::Constructed,
@@ -194,14 +222,16 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
         assert_eq!(
             service
                 .with_state(|s| s.ledger().credited_cumulative())
+                .await
                 .unwrap(),
             crate::test_support::PRICE
         );
         let mut authorized = crate::grant_client::GrantSession::open(
             GrantSessionOptions {
                 target: grant_target,
-                client: principal(1).0,
+                principal: principal(1).0,
                 signer: Arc::new(principal(1).1),
+                application,
                 journal_root: fixture.root.path().join("grant-client"),
                 timeout: Duration::from_secs(5),
             },
@@ -223,6 +253,8 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
             .unwrap()
             .connection()
             .close(0u32.into(), b"new connection");
+        session.shutdown().await;
+        assert!(session.client.readiness().await.is_err());
         drop(session);
         let mut wrong = trust.clone();
         wrong.expected_genesis = hellas_rpc::ContentId::from_bytes([99; 32]);
@@ -243,6 +275,7 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
         assert_eq!(
             service
                 .with_state(|s| s.ledger().credited_cumulative())
+                .await
                 .unwrap(),
             crate::test_support::PRICE
         );

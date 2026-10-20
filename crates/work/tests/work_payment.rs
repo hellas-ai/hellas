@@ -16,161 +16,44 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use support::temp;
 
+use hellas_auth::Digest;
 use hellas_kernel::{
-    BlockHeight, Decode as _, EarnedCertificate, Edge, EdgeId, EdgeValues, Encode as _, Fees, Key,
-    LeaseSlots, List, MAX_EDGE_OUTPUTS, Parties, Payout, PendingSlot, Secp256k1Signer,
-    Secp256k1Verifier, Terms, TermsHash, WorkPaymentSettlement, WorkPaymentTerms,
-    WorkStakeBondTerms, work_payment_settlement,
+    Decode as _, EarnedCertificate, EdgeId, Encode as _, PendingSlot, Secp256k1Signer, TermsHash,
 };
-use hellas_rpc::evaluate::{
-    EvaluateOutputTranscriptBuilder, EvaluateStopReason, EvaluateTerminal, EvaluateUsage,
-    input_commitment,
-};
+use hellas_rpc::OutputEventEnvelope;
 use hellas_rpc::pb::work::{
     AdmitCertificateRequest, AdmitCertificateResponse, WorkPaid, WorkRefusalCode,
     admit_certificate_response::Outcome as AdmitOutcome,
 };
-use hellas_rpc::protocol::Digest;
-use hellas_rpc::protocol::artifacts::{
-    BoundTermId, Canonical as _, InputAddressed as _, OutputAddressed as _, PreparedPaidInputV1,
-    SourceRef, TextArtifact, TextExecution, TextPolicy, TokenIds,
-};
-use hellas_rpc::protocol::work::{
-    EvaluatePolicyV2, JobDeadlines, PaidChannelPolicyV1, PaidJobAuthorizationV2, PaymentBindingV1,
-    PrivateRecord as _, generation_policy_digest, identity_source_digest, payment_binding_digest,
-    private_policy_commitment, propose_authorization, signing_hash, work_id,
-};
-use hellas_rpc::protocol::work_setup::{
-    ObservedChannel, ReadyChannel, WorkChannelConfig, WorkChannelDescriptor, payment_terms_hash,
-};
 use hellas_rpc::services::work::{WorkClientImpl, WorkServer};
-use hellas_rpc::{
-    Application, Assurance, CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR, ContentId, EvaluateRequest,
-    OutputEventEnvelope, ProducerSigningKey, ProgramManifest, PublicKey,
-};
 use hellas_wire::mux::MuxTransport;
 use hellas_wire::{Dispatcher, StreamTransport};
+use hellas_work::model::setup::{ObservedChannel, ReadyChannel};
+use hellas_work::model::work::{
+    PaidJobAuthorizationV2, PaymentBindingV1, PrivateRecord as _, payment_binding_digest,
+    propose_authorization, signing_hash, work_id,
+};
+use hellas_work::test_support::paid::{
+    CURSOR, PRICE, bond_edge, bond_object, bundle, client, commit, deadlines, descriptor,
+    lease_over, payload_at, payment_edge, payment_object, payment_policy, provider, store_at,
+    transcript_for, work_policy,
+};
 use hellas_work::work::{
     BackendFault, ClientEndpoint, PaymentError, PreparedEvaluateInput, ProviderEndpoint, RunError,
     RunOutcome, WorkBackend, WorkRefusal, WorkService, admit_payment, fetch_result,
     run_accepted_work,
 };
 use hellas_work::work_close::FinalizedWork;
-use hellas_work::work_store::{ChannelRecord, ChannelStore, JobPhase, JobState, Role, SetupOrigin};
+use hellas_work::work_store::{ChannelRecord, ChannelStore, JobPhase, JobState, Role};
 
 mod support;
-use support::{advance, bond_edge, client, network, payload_at, payment_edge, provider, temp};
 
 /// The one proposal nonce every job in this file carries.
 const NONCE: u8 = 1;
 
 // ── Fixture ───────────────────────────────────────────────────────────
-
-const HORIZON: u64 = 500;
-const PRICE: u64 = 10;
-const CREDIT_LIMIT: u64 = 40;
-/// One over half the funding, so the bond exceeds the capacity it
-/// leaves behind at zero fees.
-const OMISSION_BOND: u64 = 601;
-const PAYMENT_VALUE: u64 = 1_000;
-const PAYMENT_RESERVE: u64 = 200;
-const STAKE: u64 = 64;
-const SALT: [u8; 32] = [0x5a; 32];
-/// The finalized block both endpoints have processed through.
-const CURSOR: u64 = 10;
-/// The prompt this fixture's bundle carries, in tokens.
-const PROMPT_TOKENS: u64 = 4;
-/// A frame bound no legal delivery here comes close to.
-const WIDE_FRAME: u32 = 262_144;
-
-const fn deadlines() -> JobDeadlines {
-    JobDeadlines {
-        acceptance: 50,
-        terminal: 100,
-        payment: 200,
-    }
-}
-
-fn provider_producer() -> ProducerSigningKey {
-    match ProducerSigningKey::from_secret_bytes([0x22; 32]) {
-        Ok(key) => key,
-        Err(error) => panic!("a fixed scalar is a producer key: {error}"),
-    }
-}
-
-fn channel_policy() -> PaidChannelPolicyV1 {
-    PaidChannelPolicyV1 {
-        compute_credit_limit: CREDIT_LIMIT,
-        delivery_credit_limit: CREDIT_LIMIT,
-    }
-}
-
-fn bond_terms() -> WorkStakeBondTerms {
-    WorkStakeBondTerms {
-        parties: Parties::new(provider().party_key(), client().party_key()),
-        timeout: BlockHeight::new(HORIZON),
-        timeout_outputs: List::take(
-            [Payout::new(provider().party_key(), STAKE); MAX_EDGE_OUTPUTS],
-            1,
-        ),
-        max_job_price: 40,
-    }
-}
-
-fn payment_terms() -> WorkPaymentTerms {
-    WorkPaymentTerms {
-        bond_edge: bond_edge(),
-        bond_terms: bond_terms(),
-        private_policy_commitment: private_policy_commitment(network(), &SALT, &channel_policy()),
-        omit_response_blocks: hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
-        start_validity_blocks: 8,
-        omission_bond: OMISSION_BOND,
-    }
-}
-
-/// The execution policy every job here runs under.
-fn work_policy() -> EvaluatePolicyV2 {
-    EvaluatePolicyV2 {
-        allowed_environment: manifest().content_id(),
-        generation_policy_digest: match generation_policy_digest(&text_policy().canonical_bytes()) {
-            Ok(digest) => digest,
-            Err(error) => panic!("the fixture policy hashes: {error}"),
-        },
-        identity_source_digest: match identity_source_digest(&identity_artifact().canonical_bytes())
-        {
-            Ok(digest) => digest,
-            Err(error) => panic!("the fixture identity hashes: {error}"),
-        },
-        max_prompt_tokens: 512,
-        max_new_tokens: 128,
-        max_stop_token_ids: 4,
-        max_spool_bytes: 1_048_576,
-        max_encoded_result_frame: WIDE_FRAME,
-        max_encoded_prepared_input: 1_048_576,
-    }
-}
-
-fn payment_values() -> EdgeValues {
-    EdgeValues::new(PAYMENT_VALUE, PAYMENT_RESERVE, Fees::new(0, 0, 0, 0))
-}
-
-fn descriptor() -> WorkChannelDescriptor {
-    let config = WorkChannelConfig {
-        payment_policy: payment_policy(),
-        network: network(),
-        payment_edge: payment_edge(),
-        payment_terms: payment_terms(),
-        policy_salt: SALT,
-        channel_policy: channel_policy(),
-        work_policy: work_policy().into(),
-        expected_payment_values: payment_values(),
-    };
-    match WorkChannelDescriptor::open(config) {
-        Ok(descriptor) => descriptor,
-        Err(error) => panic!("the fixture channel opens: {error}"),
-    }
-}
 
 /// The channel, ready at the height both endpoints have processed
 /// through.
@@ -190,100 +73,7 @@ fn ready() -> ReadyChannel {
     }
 }
 
-fn settlement() -> WorkPaymentSettlement {
-    let Some(settlement) = work_payment_settlement(payment_values(), OMISSION_BOND) else {
-        panic!("a funded edge prices both exits");
-    };
-    settlement
-}
-
-fn store_at(root: &std::path::Path, ready: &ReadyChannel, role: Role, height: u64) -> ChannelStore {
-    let mut store = match ChannelStore::open(
-        root,
-        ready.channel().clone(),
-        settlement(),
-        role,
-        origin(),
-        &Secp256k1Verifier::new(),
-    ) {
-        Ok(store) => store,
-        Err(error) => panic!("the fixture store opens: {error}"),
-    };
-    advance(&mut store, height);
-    store
-}
-
-/// The fixture channel starts at the synthetic chain genesis.
-fn origin() -> SetupOrigin {
-    SetupOrigin {
-        payment_edge: payment_edge(),
-        height: 0,
-        payload: payload_at(0),
-        parent: [0_u8; 32],
-    }
-}
-
-/// Runs the production watcher over one empty finalized block per
-/// height, up through `height`.
-///
-/// The same call the settlement loop makes, so a fixture cursor is a
-/// cursor this endpoint could have reached.
-fn commit(store: &mut ChannelStore, record: ChannelRecord) {
-    if let Err(error) = store.commit(record, &Secp256k1Verifier::new()) {
-        panic!("the fixture record commits: {error}");
-    }
-}
-
 // ── The prepared inputs a job executes from ───────────────────────────
-
-fn manifest() -> ProgramManifest {
-    ProgramManifest::new(
-        Application::new(CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR).unwrap(),
-        ContentId::from_bytes([0x16; 32]),
-    )
-}
-
-fn prompt_tokens() -> TokenIds {
-    TokenIds::from([9, 8, 7, 6])
-}
-
-fn text_policy() -> TextPolicy {
-    TextPolicy::from_u32_stop_tokens(64, [2, 1])
-}
-
-fn identity_artifact() -> TextArtifact {
-    TextArtifact::identity(BoundTermId::from_digest(manifest().content_id().digest()))
-}
-
-fn text_execution() -> TextExecution {
-    TextExecution::new(
-        SourceRef::output(identity_artifact().output_id()),
-        prompt_tokens().output_id(),
-        text_policy().output_id(),
-    )
-}
-
-fn evaluate_request(nonce: u8) -> EvaluateRequest {
-    EvaluateRequest {
-        text_execution: text_execution().input_id().digest(),
-        runner_public_key: PublicKey::Secp256k1(client().party_key().to_bytes()),
-        execution_environment: manifest().content_id(),
-        nonce: [nonce; 32],
-        assurance: Assurance::ProducerSigned,
-        retain: true,
-    }
-}
-
-fn bundle(nonce: u8) -> PreparedPaidInputV1 {
-    PreparedPaidInputV1::new(
-        &evaluate_request(nonce),
-        &manifest(),
-        &text_execution(),
-        &prompt_tokens(),
-        &text_policy(),
-        &identity_artifact(),
-    )
-}
 
 fn authorization() -> PaidJobAuthorizationV2 {
     match propose_authorization(
@@ -303,7 +93,7 @@ fn authorization() -> PaidJobAuthorizationV2 {
 ///
 /// The acceptance exchange has its own file; these tests are about what
 /// happens after both signatures exist.
-fn accept(stores: &mut [&mut ChannelStore]) -> Digest {
+async fn accept(stores: &mut [&mut ChannelStore]) -> Digest {
     let authorization = authorization();
     let ready = ready();
     let id = work_id(ready.channel(), &authorization);
@@ -318,14 +108,16 @@ fn accept(stores: &mut [&mut ChannelStore]) -> Digest {
                 client_signature: client().sign(signing_hash(id)),
                 prepared_input: prepared_input.clone(),
             },
-        );
+        )
+        .await;
         commit(
             store,
             ChannelRecord::JobAccepted {
                 work_id: id,
                 provider_signature: provider().sign(signing_hash(id)),
             },
-        );
+        )
+        .await;
     }
     id
 }
@@ -333,34 +125,6 @@ fn accept(stores: &mut [&mut ChannelStore]) -> Digest {
 // ── Transcripts and the backend that produces them ────────────────────
 
 const ANSWER: [u32; 5] = [101, 102, 103, 104, 105];
-
-fn transcript_for(request: &EvaluateRequest, answer: &[u32]) -> Vec<OutputEventEnvelope> {
-    let key = provider_producer();
-    let mut builder =
-        EvaluateOutputTranscriptBuilder::new(input_commitment(request), request.assurance, &key);
-    if let Err(error) = builder.push_token_delta(answer.to_vec()) {
-        panic!("a non-empty delta pushes: {error}");
-    }
-    let usage = EvaluateUsage {
-        input_units: PROMPT_TOKENS,
-        output_units: answer.len() as u64,
-    };
-    let billable_units = match usage.billable_units() {
-        Ok(units) => units,
-        Err(error) => panic!("the fixture usage sums: {error}"),
-    };
-    match builder.finish(EvaluateTerminal {
-        final_position: answer.len() as u64,
-        stop_reason: EvaluateStopReason::STOP_TOKEN,
-        matched_stop_token_id: Some(1),
-        text_artifact: Digest::from_bytes([0x77; 32]),
-        usage,
-        billable_units,
-    }) {
-        Ok(events) => events,
-        Err(error) => panic!("the fixture transcript finishes: {error}"),
-    }
-}
 
 /// A backend that counts its calls and signs the fixture answer.
 struct AnsweringBackend {
@@ -406,8 +170,7 @@ async fn run_to_result(service: &WorkService, ready: &ReadyChannel, id: Digest) 
 
 // ── Transport plumbing ────────────────────────────────────────────────
 
-#[path = "support/transport.rs"]
-mod transport;
+use hellas_work::test_support::transport;
 use transport::transport_pair;
 
 /// Stops one serving task and waits for it to be gone.
@@ -431,85 +194,6 @@ fn serve(transport: MuxTransport, service: WorkService) -> tokio::task::JoinHand
 
 // ── Canonical chain objects, spelled out ──────────────────────────────
 
-const FORMAT_VERSION: u8 = 1;
-const TAG_BLOCK_HEIGHT: u8 = 1;
-const TAG_FEES: u8 = 2;
-const TAG_PARTIES: u8 = 3;
-const TAG_EDGE: u8 = 5;
-const TAG_BOND_LEASE: u8 = 31;
-/// `Freeze | Adjudicated`: close-kind tags 3 and 4.
-const WORK_PAYMENT_CLOSES: u8 = 0b0001_1000;
-/// `Timeout` alone: close-kind tag 1.
-const WORK_STAKE_CLOSES: u8 = 0b0000_0010;
-
-struct EdgeBytes {
-    value: u64,
-    reserve: u64,
-    maker: Key,
-    taker: Key,
-    terms: TermsHash,
-    allowed: u8,
-}
-
-impl EdgeBytes {
-    fn build(&self) -> Edge {
-        let mut out = vec![FORMAT_VERSION, TAG_EDGE];
-        out.extend_from_slice(&self.value.to_be_bytes());
-        out.extend_from_slice(&self.reserve.to_be_bytes());
-        out.extend_from_slice(&[FORMAT_VERSION, TAG_FEES]);
-        for _ in 0..4 {
-            out.extend_from_slice(&0_u64.to_be_bytes());
-        }
-        out.extend_from_slice(&[FORMAT_VERSION, TAG_BLOCK_HEIGHT]);
-        out.extend_from_slice(&HORIZON.to_be_bytes());
-        out.extend_from_slice(&[FORMAT_VERSION, TAG_PARTIES]);
-        out.extend_from_slice(&self.maker.to_bytes());
-        out.extend_from_slice(&self.taker.to_bytes());
-        out.extend_from_slice(self.terms.as_bytes());
-        out.push(self.allowed);
-        match Edge::decode_exact(&out) {
-            Ok(edge) => edge,
-            Err(error) => panic!("the hand-written edge is canonical: {error:?}"),
-        }
-    }
-}
-
-fn lease_over(bond: EdgeId, payment: EdgeId) -> LeaseSlots {
-    support::lease_over(
-        bond,
-        payment,
-        payment_terms_hash(payment_terms()).as_bytes(),
-        &payment_terms().private_policy_commitment,
-        HORIZON,
-        FORMAT_VERSION,
-        TAG_BOND_LEASE,
-    )
-}
-
-fn bond_object() -> Edge {
-    EdgeBytes {
-        value: STAKE,
-        reserve: 0,
-        maker: provider().party_key(),
-        taker: client().party_key(),
-        terms: Terms::work_stake_bond(bond_terms()).hash(),
-        allowed: WORK_STAKE_CLOSES,
-    }
-    .build()
-}
-
-fn payment_object() -> Edge {
-    EdgeBytes {
-        value: PAYMENT_VALUE,
-        reserve: PAYMENT_RESERVE,
-        maker: client().party_key(),
-        taker: provider().party_key(),
-        terms: payment_terms_hash(payment_terms()),
-        allowed: WORK_PAYMENT_CLOSES,
-    }
-    .build()
-}
-
 // ── The state this phase begins from ──────────────────────────────────
 
 /// One job, accepted, computed, delivered and independently checked.
@@ -530,9 +214,9 @@ async fn checked_job() -> Checked {
     let client_root = temp();
     let provider_root = temp();
     let ready = ready();
-    let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR);
-    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
-    let id = accept(&mut [&mut client_store, &mut provider_store]);
+    let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR).await;
+    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR).await;
+    let id = accept(&mut [&mut client_store, &mut provider_store]).await;
 
     let Ok(provider_endpoint) = ProviderEndpoint::new(ready.clone(), provider_store, provider())
     else {
@@ -554,7 +238,7 @@ async fn checked_job() -> Checked {
     // The re-execution is `hellas-client`'s; what this file needs is the
     // durable match it records, which is the only phase an honest
     // client's journal signs a certificate from.
-    if let Err(error) = client.matched(id) {
+    if let Err(error) = client.matched(id).await {
         panic!("the fixture match records: {error}");
     }
     Checked {
@@ -664,6 +348,7 @@ async fn one_certificate_pays_for_one_job() {
         let state = fixture
             .service
             .with_state(|state| state.clone())
+            .await
             .expect("the endpoint is reachable");
         assert!(state.jobs().next().is_none());
         assert_eq!(state.ledger().credited_cumulative(), PRICE);
@@ -684,7 +369,7 @@ async fn one_certificate_pays_for_one_job() {
     // The retained payment answers for the job it paid for and no
     // other: a channel with a payment on its disk has not thereby paid
     // for everything.
-    let elsewhere = fixture.client.pay(Digest::from_bytes([0xaa; 32]));
+    let elsewhere = fixture.client.pay(Digest::from_bytes([0xaa; 32])).await;
     assert!(
         matches!(elsewhere, Err(PaymentError::NoSuchJob)),
         "another job's payment is not this one's: {elsewhere:?}",
@@ -697,13 +382,15 @@ async fn one_certificate_pays_for_one_job() {
         &fixture.ready,
         Role::Client,
         CURSOR,
-    );
+    )
+    .await;
     let provider_store = store_at(
         fixture.provider_root.path(),
         &fixture.ready,
         Role::Provider,
         CURSOR,
-    );
+    )
+    .await;
     // One cursor record per block read from the channel's origin to
     // `CURSOR`, and then the job's own steps.
     // Client: proposal, acceptance, result, verdict, payment.
@@ -747,7 +434,7 @@ async fn the_provider_prices_the_payment_itself() {
     let mut fixture = checked_job().await;
     let id = fixture.id;
     let channel = fixture.ready.channel().clone();
-    let honest = match fixture.client.pay(id) {
+    let honest = match fixture.client.pay(id).await {
         Ok(request) => request,
         Err(error) => panic!("the client signs its payment: {error}"),
     };
@@ -888,6 +575,7 @@ async fn the_provider_prices_the_payment_itself() {
 async fn assert_nothing_credited(service: &WorkService, what: &str) {
     let state = service
         .with_state(|state| state.clone())
+        .await
         .expect("the endpoint is reachable");
     assert_eq!(
         state.ledger().credited_cumulative(),
@@ -949,9 +637,9 @@ async fn an_uncomputed_job_is_not_paid_for() {
     let client_root = temp();
     let provider_root = temp();
     let ready = ready();
-    let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR);
-    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
-    let id = accept(&mut [&mut client_store, &mut provider_store]);
+    let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR).await;
+    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR).await;
+    let id = accept(&mut [&mut client_store, &mut provider_store]).await;
     let Ok(mut endpoint) = ClientEndpoint::new(ready.clone(), client_store, client()) else {
         panic!("the client endpoint binds");
     };
@@ -961,7 +649,7 @@ async fn an_uncomputed_job_is_not_paid_for() {
     };
     let service = WorkService::new(provider_endpoint);
 
-    let paid = endpoint.pay(id);
+    let paid = endpoint.pay(id).await;
     let Err(PaymentError::NotPayable { phase }) = paid else {
         panic!("an accepted job with no result: {paid:?}");
     };
@@ -999,6 +687,7 @@ async fn an_uncomputed_job_is_not_paid_for() {
     assert_eq!(refusal_of(&response), WorkRefusalCode::Declined);
     let state = service
         .with_state(|state| state.clone())
+        .await
         .expect("the endpoint is reachable");
     assert_eq!(state.ledger().credited_cumulative(), 0);
     assert_eq!(state.max_executable_certificate(), 0);
@@ -1019,7 +708,7 @@ async fn an_uncomputed_job_is_not_paid_for() {
 async fn a_payment_is_exactly_the_bytes_the_service_defines() {
     let mut fixture = checked_job().await;
     let id = fixture.id;
-    let honest = match fixture.client.pay(id) {
+    let honest = match fixture.client.pay(id).await {
         Ok(request) => request,
         Err(error) => panic!("the client signs its payment: {error}"),
     };
@@ -1093,15 +782,19 @@ async fn a_defaulted_job_is_not_paid_for_as_well() {
         };
         let mut next = provider
             .with_state(|state| state.cursor().0)
+            .await
             .expect("the endpoint is reachable")
             .saturating_add(1);
         while next <= deadlines().payment + 1 {
-            if let Err(error) = driver.observe_finalized(&FinalizedWork {
-                height: next,
-                parent: payload_at(next.saturating_sub(1)),
-                payload: payload_at(next),
-                txs: Vec::new(),
-            }) {
+            if let Err(error) = driver
+                .observe_finalized(&FinalizedWork {
+                    height: next,
+                    parent: payload_at(next.saturating_sub(1)),
+                    payload: payload_at(next),
+                    txs: Vec::new(),
+                })
+                .await
+            {
                 panic!("the fixture block applies: {error}");
             }
             next += 1;
@@ -1117,6 +810,7 @@ async fn a_defaulted_job_is_not_paid_for_as_well() {
                     ),
                 )
             })
+            .await
             .expect("the endpoint is reachable");
         assert!(!open_job, "the expired job is closed");
         assert!(expired, "and rests at an expired terminal");
@@ -1131,6 +825,7 @@ async fn a_defaulted_job_is_not_paid_for_as_well() {
         let state = fixture
             .service
             .with_state(|state| state.clone())
+            .await
             .expect("the endpoint is reachable");
         assert_eq!(state.ledger().credited_cumulative(), 0);
         assert_eq!(
@@ -1153,7 +848,7 @@ async fn a_defaulted_job_is_not_paid_for_as_well() {
         Err(error) => panic!("the checked job is paid: {error}"),
     }
     let provider = &fixture.service;
-    let ended = provider.end_run(id);
+    let ended = provider.end_run(id).await;
     assert!(
         matches!(ended, Err(RunError::NoSuchJob)),
         "a paid job is closed: {ended:?}",
@@ -1161,6 +856,7 @@ async fn a_defaulted_job_is_not_paid_for_as_well() {
     assert_eq!(
         provider
             .with_state(|state| state.ledger().credited_cumulative())
+            .await
             .expect("the endpoint is reachable"),
         PRICE,
     );
@@ -1173,12 +869,13 @@ async fn stale_observation_blocks_new_money_but_preserves_retransmission() {
     let mut client = ClientService::new(fixture.client);
     let id = fixture.id;
     assert!(matches!(
-        client.with_client(|endpoint| endpoint.pay(id)).unwrap(),
+        client.client().await.unwrap().pay(id).await,
         Err(PaymentError::Endpoint(EndpointError::ObservationStale))
     ));
     assert_eq!(
         client
             .with_state(|state| state.ledger().credited_cumulative())
+            .await
             .unwrap(),
         0
     );
@@ -1189,21 +886,16 @@ async fn stale_observation_blocks_new_money_but_preserves_retransmission() {
             hellas_work::work::ObservationTime::now(),
             std::time::Duration::from_secs(30),
         )
+        .await
         .unwrap();
-    let request = client
-        .with_client(|endpoint| endpoint.pay(id))
-        .unwrap()
-        .unwrap();
-    client.observer().suspend().unwrap();
+    let request = client.client().await.unwrap().pay(id).await.unwrap();
+    client.observer().suspend().await.unwrap();
     assert_eq!(
-        client
-            .with_client(|endpoint| endpoint.pay(id))
-            .unwrap()
-            .unwrap(),
+        client.client().await.unwrap().pay(id).await.unwrap(),
         request
     );
 
-    fixture.service.require_observer().unwrap();
+    fixture.service.require_observer().await.unwrap();
     let refused = admit_response(&fixture.service, request.clone()).await;
     assert_eq!(refusal_of(&refused), WorkRefusalCode::NotReady);
     assert_nothing_credited(&fixture.service, "observer has not initialized").await;
@@ -1214,15 +906,17 @@ async fn stale_observation_blocks_new_money_but_preserves_retransmission() {
             hellas_work::work::ObservationTime::now(),
             std::time::Duration::from_secs(30),
         )
+        .await
         .unwrap();
     let accepted = admit_response(&fixture.service, request.clone()).await;
     assert!(matches!(accepted.outcome, Some(AdmitOutcome::Paid(_))));
-    fixture.service.suspend().unwrap();
+    fixture.service.suspend().await.unwrap();
     assert_eq!(admit_response(&fixture.service, request).await, accepted);
     assert_eq!(
         fixture
             .service
             .with_state(|state| state.ledger().credited_cumulative())
+            .await
             .unwrap(),
         PRICE
     );
@@ -1231,18 +925,19 @@ async fn stale_observation_blocks_new_money_but_preserves_retransmission() {
 #[tokio::test]
 async fn client_close_recovery_does_not_require_new_work_readiness() {
     let mut fixture = checked_job().await;
-    fixture.client.pay(fixture.id).unwrap();
-    let start = fixture.client.prepare_close().unwrap();
+    fixture.client.pay(fixture.id).await.unwrap();
+    let start = fixture.client.prepare_close().await.unwrap();
     drop(fixture.client);
     let recovered_store = store_at(
         fixture.client_root.path(),
         &fixture.ready,
         Role::Client,
         CURSOR,
-    );
+    )
+    .await;
     let mut recovered = ClientEndpoint::recover(recovered_store, client()).unwrap();
     assert!(recovered.state().is_closing());
-    assert_eq!(recovered.prepare_close().unwrap(), start);
+    assert_eq!(recovered.prepare_close().await.unwrap(), start);
     assert_eq!(recovered.state().max_executable_certificate(), PRICE);
 }
 
@@ -1260,6 +955,7 @@ async fn observed_close_and_payment_have_one_journal_order() {
                 ObservationTime::now(),
                 std::time::Duration::from_secs(30),
             )
+            .await
             .unwrap();
         let start = close_start(
             fixture.ready.channel(),
@@ -1279,23 +975,35 @@ async fn observed_close_and_payment_have_one_journal_order() {
         };
         if payment_first {
             let request = client
-                .with_client(|endpoint| endpoint.pay(fixture.id))
+                .client()
+                .await
                 .unwrap()
+                .pay(fixture.id)
+                .await
                 .unwrap();
             let credited = admit_response(&fixture.service, request).await;
             assert!(matches!(credited.outcome, Some(AdmitOutcome::Paid(_))));
         }
-        observer.drive().unwrap().observe_finalized(&block).unwrap();
+        observer
+            .drive()
+            .unwrap()
+            .observe_finalized(&block)
+            .await
+            .unwrap();
         fixture
             .service
             .drive()
             .unwrap()
             .observe_finalized(&block)
+            .await
             .unwrap();
-        assert!(observer.with_state(|state| state.is_closing()).unwrap());
-        let retried = client
-            .with_client(|endpoint| endpoint.pay(fixture.id))
-            .unwrap();
+        assert!(
+            observer
+                .with_state(|state| state.is_closing())
+                .await
+                .unwrap()
+        );
+        let retried = client.client().await.unwrap().pay(fixture.id).await;
         if payment_first {
             // Retrying the durable certificate is allowed after close observation.
             let response = admit_response(&fixture.service, retried.unwrap()).await;
@@ -1307,6 +1015,7 @@ async fn observed_close_and_payment_have_one_journal_order() {
         assert_eq!(
             client
                 .with_state(|state| state.max_executable_certificate())
+                .await
                 .unwrap(),
             expected
         );
@@ -1314,17 +1023,9 @@ async fn observed_close_and_payment_have_one_journal_order() {
             fixture
                 .service
                 .with_state(|state| state.max_executable_certificate())
+                .await
                 .unwrap(),
             expected
         );
-    }
-}
-
-fn payment_policy() -> hellas_rpc::protocol::work::JobPaymentPolicyV2 {
-    hellas_rpc::protocol::work::JobPaymentPolicyV2 {
-        fixed_price: PRICE,
-        dispatch_margin_blocks: 4,
-        delivery_margin_blocks: 2,
-        oracle_grace_blocks: 6,
     }
 }

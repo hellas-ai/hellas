@@ -1,6 +1,6 @@
 use crate::domain::{
-    Address as UserAddress, PublicKey, SettlementKey as UserSettlementKey, SettlementKeyError,
-    ThresholdPolynomial, ThresholdShare,
+    PublicKey, SettlementKey as UserSettlementKey, SettlementKeyError, ThresholdPolynomial,
+    ThresholdShare,
 };
 pub use crate::genesis::{
     Genesis, GenesisAllocation as GenesisEntry, GenesisValidator, HELLAS_DEVNET_1_JSON,
@@ -305,7 +305,7 @@ pub(crate) fn parse_genesis_settlement_key(entry: &str) -> Result<UserSettlement
                 entry: entry.to_string(),
                 source,
             })?;
-    let valid_p256 = UserAddress::try_from(key).is_ok();
+    let valid_p256 = p256::PublicKey::from_sec1_bytes(key.as_bytes()).is_ok();
     let valid_secp256k1 = hellas_kernel::Secp256k1Verifier::is_valid_key(key.into_kernel());
     if !valid_p256 && !valid_secp256k1 {
         return Err(ConfigError::InvalidGenesisSettlementPoint {

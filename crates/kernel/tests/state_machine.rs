@@ -28,7 +28,7 @@ use std::collections::BTreeMap;
 
 use hellas_kernel::{
     BlockHash, BlockHeight, CoinId, Context, EdgeId, Funding, Genesis, Key, List, MAX_EDGE_OUTPUTS,
-    Parties, Payout, Proof, ProtocolCode, State, Terms, Tx,
+    Parties, PartyKeys, Payout, Proof, ProtocolCode, State, Terms, Tx,
 };
 use proptest::prelude::*;
 use proptest::test_runner::Config;
@@ -36,12 +36,12 @@ use proptest_state_machine::{ReferenceStateMachine, StateMachineTest, prop_state
 use support::{
     FAKE_VERIFIER, coin_id, list,
     map_store::{MapStore, map_state},
-    open_tx, placeholder_mutual,
+    open, placeholder_mutual,
 };
 
 const MAKER: Key = Key::from_bytes([7; Key::LENGTH]);
 const TAKER: Key = Key::from_bytes([8; Key::LENGTH]);
-const PARTIES: Parties = Parties::new(MAKER, TAKER);
+const PARTIES: Parties = Parties::new(PartyKeys::sole(MAKER), PartyKeys::sole(TAKER));
 const PROTOCOL: ProtocolCode = ProtocolCode::new(1);
 const MAKER_COIN: CoinId = coin_id(1);
 const TAKER_COIN: CoinId = coin_id(2);
@@ -96,7 +96,18 @@ const fn context_at(height: u64) -> Context {
 }
 
 fn open_op(params: Params) -> Tx {
-    open_tx(funding(), params.terms(), MAKER, TAKER)
+    open(
+        funding(),
+        params.terms(),
+        (
+            hellas_kernel::PartyKeys::sole(MAKER),
+            hellas_kernel::Authority::Owner,
+        ),
+        (
+            hellas_kernel::PartyKeys::sole(TAKER),
+            hellas_kernel::Authority::Owner,
+        ),
+    )
 }
 
 fn timeout_close(params: Params) -> Tx {
@@ -104,7 +115,11 @@ fn timeout_close(params: Params) -> Tx {
         params.timeout_maker_pay,
         params.total() - params.timeout_maker_pay,
     );
-    Tx::close(params.edge_id(), Proof::timeout(params.terms()), outputs)
+    Tx::close(
+        params.edge_id(),
+        Proof::timeout(params.terms(), None),
+        outputs,
+    )
 }
 
 fn mutual_close(params: Params, maker_pay: u64) -> Tx {

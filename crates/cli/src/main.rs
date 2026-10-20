@@ -1,26 +1,22 @@
 #[macro_use]
 extern crate tracing;
 
-#[cfg(feature = "gateway")]
 use clap::ValueEnum;
 use clap::{Args, Parser, Subcommand};
 use iroh::EndpointId;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 #[cfg(feature = "evaluate")]
-use std::time::Duration;
+mod evaluate;
 
-#[cfg(all(feature = "cloud", unix))]
-mod cloud;
 mod commands;
 mod identity;
-#[cfg(feature = "node")]
+#[cfg(unix)]
+mod machines;
 mod metrics;
-#[cfg(feature = "node")]
 mod platform_hardening;
 mod tracing_config;
 
-#[cfg(feature = "node")]
 fn validate_serve_assurance(
     software_root: bool,
     assurance: hellas_rpc::Assurance,
@@ -60,7 +56,6 @@ fn load_command_identity(
     command: &Commands,
     path: Option<&Path>,
 ) -> anyhow::Result<identity::LocalIdentity> {
-    #[cfg(feature = "node")]
     let settles_paid_work = matches!(
         command,
         Commands::Serve {
@@ -68,37 +63,31 @@ fn load_command_identity(
             ..
         } | Commands::Provision { .. }
             | Commands::PaidWork { .. }
-    );
-    #[cfg(not(feature = "node"))]
-    let settles_paid_work = false;
-    #[cfg(all(feature = "node", feature = "gateway"))]
-    let settles_paid_work = settles_paid_work
-        || matches!(
-            command,
-            Commands::Gateway {
+            | Commands::Gateway {
                 paid_work_config: Some(_),
                 ..
             }
-        );
-    #[cfg(all(feature = "cloud", unix))]
-    let owned_machine = command.owned_machine().is_some();
-    #[cfg(not(all(feature = "cloud", unix)))]
-    let owned_machine = false;
-    let grant_identity = matches!(command, Commands::Contact { .. } | Commands::Offer { .. });
-    #[cfg(feature = "node")]
-    let grant_identity = grant_identity || matches!(command, Commands::Admin(_));
-    #[cfg(feature = "gateway")]
-    let grant_identity =
-        grant_identity || matches!(command, Commands::Gateway { offer: Some(_), .. });
+    );
+    let grant_identity = matches!(
+        command,
+        Commands::Admin(_)
+            | Commands::Gateway { offer: Some(_), .. }
+            | Commands::Offer {
+                command: commands::contributions::OfferCommand::ImportBundle { .. },
+            }
+    );
     #[cfg(feature = "evaluate")]
-    let grant_identity = grant_identity || matches!(command, Commands::Gateway { local: true, .. });
+    let grant_identity = grant_identity
+        || matches!(command, Commands::Gateway { evaluation, .. } if evaluation.local);
     let read_only = grant_identity
-        || owned_machine
         || settles_paid_work
         || matches!(
             command,
             Commands::Identity {
-                command: IdentityCommand::ShowNodeId | IdentityCommand::ShowEnrollmentId,
+                command: IdentityCommand::ShowNodeId
+                    | IdentityCommand::ShowEnrollmentId
+                    | IdentityCommand::ShowHolder
+                    | IdentityCommand::ExportEnrollment { .. },
             }
         );
     if read_only {
@@ -108,7 +97,6 @@ fn load_command_identity(
     }
 }
 
-#[cfg(feature = "gateway")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum GatewayResponsesBackend {
     Hellas,
@@ -116,7 +104,6 @@ enum GatewayResponsesBackend {
     Fetch,
 }
 
-#[cfg(feature = "gateway")]
 impl From<GatewayResponsesBackend> for hellas_gateway::ResponsesBackend {
     fn from(value: GatewayResponsesBackend) -> Self {
         match value {
@@ -128,7 +115,6 @@ impl From<GatewayResponsesBackend> for hellas_gateway::ResponsesBackend {
 }
 
 /// Execution requires an explicit Work backend; proxy mode has no Hellas peer.
-#[cfg(feature = "gateway")]
 fn gateway_provider_trust(
     responses_backend: GatewayResponsesBackend,
 ) -> anyhow::Result<Option<hellas_client::ProviderTrustAnchor>> {
@@ -145,32 +131,35 @@ struct RemoteTrustArgs {
     #[arg(long, default_value = "producer-signed", value_parser = parse_assurance)]
     assurance: hellas_rpc::Assurance,
 
-    /// Out-of-band ContentId pin for the remote node's canonical enrollment
-    /// bundle. This is a hash asserted by the caller, not a document learned
-    /// from the node being checked.
-    #[arg(
-        long = "provider",
-        value_name = "CONTENT_ID",
-        value_parser = parse_content_id_hex
-    )]
-    provider_genesis: Option<hellas_rpc::ContentId>,
+    /// Caller-owned native trust directory.
+    #[arg(long, requires = "trust_policy", conflicts_with = "paid_work_config")]
+    trust_store: Option<PathBuf>,
+    /// Previously approved local policy ID.
+    #[arg(long, requires = "trust_store", conflicts_with = "paid_work_config")]
+    trust_policy: Option<String>,
+}
 
-    /// Apple App Attest application CDhashes trusted for confidential open.
-    /// Repeat the flag or pass a comma-separated list of 32-byte hex values.
-    #[arg(
-        long = "apple-app-attest-cdhashes",
-        value_delimiter = ',',
-        value_parser = parse_hex_array::<32>
-    )]
-    apple_app_attest_cdhashes: Vec<[u8; 32]>,
-
-    /// Apple App Attest application identity in <teamID>.<bundleID> form.
-    #[arg(long = "apple-app-attest-app-id")]
-    apple_app_attest_app_id: Option<String>,
+impl RemoteTrustArgs {
+    fn load(&self) -> anyhow::Result<hellas_client::ProviderTrustAnchor> {
+        let directory = self
+            .trust_store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("--trust-store is required for grant execution"))?;
+        let id = self
+            .trust_policy
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("--trust-policy is required for grant execution"))?;
+        Ok(
+            hellas_sdk::trust_policy::TrustPolicyStore::new(directory).resolve(
+                id,
+                self.assurance,
+                identity::assertion_counters()?,
+            )?,
+        )
+    }
 }
 
 /// One canonical causal-LM route and its untrusted text-presentation boundary.
-#[cfg(feature = "llm")]
 #[derive(Args)]
 struct CausalLmArgs {
     /// Canonical causal-LM environment root. Without --manifest-id, these
@@ -191,35 +180,6 @@ struct CausalLmArgs {
     /// and never enters the manifest, quote, or trusted executor input.
     #[arg(long = "model", value_name = "NAME")]
     model: Option<String>,
-
-    /// Local files that satisfy exact program/static content references.
-    /// Repeat for multiple objects; used only by local execution legs.
-    #[cfg(feature = "evaluate")]
-    #[arg(
-        long = "content",
-        value_name = "PATH",
-        requires = "causal_lm_local_mode"
-    )]
-    content_paths: Vec<PathBuf>,
-
-    /// Directory trees to adopt as local content. No network fetch or
-    /// compilation occurs; used only by local execution legs.
-    #[cfg(feature = "evaluate")]
-    #[arg(
-        long = "content-root",
-        value_name = "DIR",
-        requires = "causal_lm_local_mode"
-    )]
-    content_roots: Vec<PathBuf>,
-
-    /// Fast-resume content index (default: Hellas store state).
-    #[cfg(feature = "evaluate")]
-    #[arg(
-        long = "content-index",
-        value_name = "FILE",
-        requires = "causal_lm_local_mode"
-    )]
-    content_index: Option<PathBuf>,
 
     /// Tokenizer JSON used only for local text presentation. It is not part of
     /// the Hellas execution guarantee.
@@ -246,6 +206,12 @@ struct Cli {
     #[arg(long = "software-root", global = true)]
     software_root: bool,
 
+    /// The software passkey of the principal this command acts for: a file of
+    /// 32 raw bytes or 64 hex digits. Contacts, offers, grant data, gateway
+    /// allowances and passkey administration sessions use it.
+    #[arg(long, global = true)]
+    passkey: Option<PathBuf>,
+
     /// Also append tracing output to this file.
     #[arg(long = "log-file", global = true)]
     log_file: Option<PathBuf>,
@@ -262,12 +228,14 @@ enum IdentityCommand {
     ShowNodeId,
     /// Print the ContentId of the canonical enrollment bundle
     ShowEnrollmentId,
-}
-
-#[derive(Subcommand)]
-enum ProducerKeyCommand {
-    /// Print the producer public key and derived producer id
-    Show,
+    /// Print the JSON CredentialHolder naming this node's key, for issuing a
+    /// credential this node will hold
+    ShowHolder,
+    /// Write this node's canonical enrollment, which operators pin to reach it
+    ExportEnrollment {
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -300,32 +268,28 @@ enum CodexAuthCommand {
 #[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Commands {
-    #[cfg(all(feature = "cloud", unix))]
-    /// Provision and inspect remote Hellas workers.
-    Cloud(hellas_cloud::cloud::CloudArgs),
-    #[cfg(all(feature = "cloud", unix))]
-    /// Discover and administer machines owned by the selected Hellas identity.
-    Machines(hellas_cloud::machines::MachinesArgs),
-    /// Share this identity's verified public enrollment.
+    /// Approve and inspect caller-owned provider trust policies.
+    Trust(commands::trust::TrustArgs),
+    #[cfg(unix)]
+    /// Create, list and destroy machines through a configured provider.
+    Machines(machines::MachinesArgs),
+    /// Introduce the principal with a signed contact card, or save a friend's.
     Contact {
         #[command(subcommand)]
         command: commands::contributions::ContactCommand,
     },
-    /// Import a private provider Offer addressed to this identity.
+    /// Import a private provider Offer addressed to this principal.
     Offer {
         #[command(subcommand)]
         command: commands::contributions::OfferCommand,
     },
-    #[cfg(any(feature = "node", all(feature = "cloud", unix)))]
-    /// Administer this node and its users.
+    /// Administer node authority and settings.
     Admin(commands::admin::AdminArgs),
-    #[cfg(feature = "node")]
     /// Run the RPC server
     Serve {
-        /// Content store state used by local execution (default: HELLAS_STORE_DIR or ~/.hellas/store).
         #[cfg(feature = "evaluate")]
-        #[arg(long)]
-        store_dir: Option<PathBuf>,
+        #[command(flatten)]
+        evaluation: evaluate::ServeArgs,
         /// Assurance offered by this provider.
         #[arg(long, default_value = "producer-signed", value_parser = parse_assurance)]
         assurance: hellas_rpc::Assurance,
@@ -341,65 +305,18 @@ enum Commands {
             default_value_t = hellas_rpc::DEFAULT_EXECUTION_QUEUE_CAPACITY
         )]
         queue_size: usize,
-        /// Local files that may satisfy content references in submitted
-        /// canonical causal-LM environments. Repeat for programs/assets.
-        #[cfg(feature = "evaluate")]
-        #[arg(long = "content", value_name = "PATH")]
-        content_paths: Vec<PathBuf>,
-        /// Directory tree to adopt into the local content store. Repeat for
-        /// HuggingFace/Xet cache roots; no remote fetch is performed.
-        #[cfg(feature = "evaluate")]
-        #[arg(long = "content-root", value_name = "DIR")]
-        content_roots: Vec<PathBuf>,
-        /// Fast-resume index for local content (default: ~/.hellas/content-index.bin).
-        #[cfg(feature = "evaluate")]
-        #[arg(long = "content-index", value_name = "FILE")]
-        content_index: Option<PathBuf>,
-        /// GPU runtime to use: auto, hip, or cuda.
-        #[cfg(feature = "evaluate")]
-        #[arg(long = "gpu-backend", default_value_t = hellas_executor::GpuBackend::Auto)]
-        gpu_backend: hellas_executor::GpuBackend,
-        /// Maximum distinct Catena programs retained in one GPU session.
-        #[cfg(feature = "evaluate")]
-        #[arg(long = "gpu-session-programs", default_value_t = hellas_executor::DEFAULT_GPU_SESSION_PROGRAMS, value_parser = parse_positive_usize)]
-        gpu_session_programs: usize,
-        /// Maximum aggregate static asset bytes retained in one GPU session.
-        #[cfg(feature = "evaluate")]
-        #[arg(long = "gpu-session-asset-bytes", default_value_t = hellas_executor::DEFAULT_GPU_SESSION_ASSET_BYTES, value_parser = parse_positive_u64)]
-        gpu_session_asset_bytes: u64,
-        /// Maximum prompt-plus-output capacity of one GPU generation (at most
-        /// 524288 so retained token output fits the artifact transport).
-        #[cfg(feature = "evaluate")]
-        #[arg(long = "gpu-max-generation-capacity", default_value_t = hellas_executor::DEFAULT_GPU_MAX_GENERATION_CAPACITY, value_parser = parse_gpu_generation_capacity)]
-        gpu_max_generation_capacity: u64,
-        /// Maximum non-asset device bytes owned or allocated by one GPU generation.
-        #[cfg(feature = "evaluate")]
-        #[arg(long = "gpu-max-generation-device-bytes", default_value_t = hellas_executor::DEFAULT_GPU_MAX_GENERATION_DEVICE_BYTES, value_parser = parse_positive_u64)]
-        gpu_max_generation_device_bytes: u64,
-        /// Maximum seconds spent loading and compiling one Catena program.
-        #[cfg(feature = "evaluate")]
-        #[arg(long = "gpu-compile-timeout-secs", default_value_t = hellas_executor::DEFAULT_GPU_COMPILE_TIMEOUT_SECS, value_parser = parse_positive_u64)]
-        gpu_compile_timeout_secs: u64,
-        /// Maximum seconds for one GPU control operation or full generation.
-        #[cfg(feature = "evaluate")]
-        #[arg(long = "gpu-execution-timeout-secs", default_value_t = hellas_executor::DEFAULT_GPU_EXECUTION_TIMEOUT_SECS, value_parser = parse_positive_u64)]
-        gpu_execution_timeout_secs: u64,
         /// Paid-work configuration. Its presence serves WorkSetup and Work;
         /// Work remains retryably not ready until the configured state mounts.
         #[arg(long = "work-config")]
         work_config_file: Option<PathBuf>,
         #[command(flatten)]
         chain_node: commands::chain_node::ChainNodeArgs,
-        /// Grant resources and machine safety limits; no chain configuration is needed.
+        /// Resources and listeners for an explicitly initialized authority store.
         #[arg(long = "grant-config")]
         grant_config_file: Option<PathBuf>,
-        /// Explicitly initialize the local identity as owner.
-        #[arg(long, conflicts_with_all = ["owner_enrollment", "check_config"])]
-        init_owner: bool,
-        /// Authenticated managed-machine owner enrollment supplied by the agent.
-        #[arg(long, value_name = "FILE", conflicts_with = "check_config")]
-        owner_enrollment: Option<PathBuf>,
-
+        /// Wait for one owner pairing if uninitialized; use this directory for node state.
+        #[arg(long, num_args = 0..=1, default_missing_value = ".")]
+        await_owner: Option<PathBuf>,
         /// Prometheus metrics port (e.g. 9090)
         #[arg(long = "metrics-port")]
         metrics_port: Option<u16>,
@@ -428,29 +345,13 @@ enum Commands {
         )]
         fetch_queue_size: usize,
     },
-    #[cfg(feature = "gateway")]
     /// Run HTTP gateway exposing OpenAI/Anthropic/plain APIs over Hellas network
     ///
     /// Every route requires `Authorization: Bearer <token>`. Use
-    /// --bearer-token-file to retain the credential across restarts.
+    /// --gateway-profile to select its provisioned Auth authority and credential.
     /// Hellas routes use the configured causal-LM environment; the shared
     /// model adapter handles text and tool calls using --tokenizer and
     /// --chat-template.
-    #[cfg_attr(
-        feature = "evaluate",
-        command(group(
-            clap::ArgGroup::new("causal_lm_local_mode")
-                .args(["local"])
-        ))
-    )]
-    #[cfg_attr(
-        feature = "evaluate",
-        command(group(
-            clap::ArgGroup::new("causal_lm_local_content")
-                .args(["content_paths", "content_roots"])
-                .multiple(true)
-        ))
-    )]
     #[command(
         mut_arg("environment", |arg| arg
             .required(false)
@@ -459,10 +360,6 @@ enum Commands {
             .requires("tokenizer")),
         mut_arg("tokenizer", |arg| arg.required(false).requires("environment"))
     )]
-    #[cfg_attr(all(feature = "cloud", unix), command(group(
-        clap::ArgGroup::new("remote_target").args(["node_id", "machine"])
-    )))]
-    #[cfg_attr(all(feature = "cloud", unix), command(mut_arg("environment", |arg| arg.required_unless_present_any(["responses_backend", "http_fetch_config", "offer", "machine"]))))]
     Gateway {
         /// Inference reuse policy; record mode fails requests if cache writes fail.
         #[arg(long, default_value = "off")]
@@ -471,18 +368,18 @@ enum Commands {
         #[arg(long)]
         store_dir: Option<PathBuf>,
         /// Use a private Offer previously verified by `offer import`.
-        #[arg(long, value_name = "ALIAS", conflicts_with_all = ["node_id", "node_addrs", "provider_genesis", "responses_backend", "http_fetch_config"])]
-        #[cfg_attr(feature = "node", arg(conflicts_with = "paid_work_config"))]
-        #[cfg_attr(all(feature = "cloud", unix), arg(conflicts_with = "machine"))]
-        #[cfg_attr(feature = "evaluate", arg(conflicts_with = "local"))]
+        #[arg(long, value_name = "ALIAS", conflicts_with_all = ["node_id", "node_addrs", "responses_backend", "http_fetch_config"])]
+        #[arg(conflicts_with = "paid_work_config")]
         offer: Option<String>,
         /// Select one resource when the Offer includes several matching policies.
         #[arg(long)]
         grant_policy: Option<String>,
+        /// Private application credential, authority and Work authorization grant.
+        #[arg(long, value_name = "FILE")]
+        work_profile: Option<PathBuf>,
         /// Serve exact HTTP routes through paid HTTPS Fetch.
         #[arg(long, value_name = "FILE", conflicts_with_all = ["responses_backend", "environment"])]
-        #[cfg_attr(all(feature = "cloud", unix), arg(conflicts_with = "machine"))]
-        #[cfg_attr(feature = "node", arg(requires = "paid_work_config"))]
+        #[arg(requires = "paid_work_config")]
         http_fetch_config: Option<PathBuf>,
         /// Request/response archive directory (default: ~/.hellas/gateway-archive).
         #[arg(long, value_name = "DIRECTORY")]
@@ -491,27 +388,19 @@ enum Commands {
         #[arg(long)]
         zdr: bool,
         /// Pay a pool of providers using durable on-chain funded work channels.
-        #[cfg(feature = "node")]
         #[arg(long = "paid-work-config", value_name = "FILE")]
         paid_work_config: Option<PathBuf>,
-        #[cfg(feature = "node")]
         #[command(flatten)]
         chain_node: commands::chain_node::ChainNodeArgs,
-        /// Load a private bearer credential file, creating it when absent.
-        #[arg(long = "bearer-token-file", value_name = "FILE")]
-        bearer_token_file: Option<PathBuf>,
-        /// Allow a non-loopback listener; requires --bearer-token-file.
+        /// Private profile selecting the local HTTP authority and scoped credential.
+        #[arg(long = "gateway-profile", value_name = "FILE")]
+        gateway_profile: Option<PathBuf>,
+        /// Allow a non-loopback listener using the provisioned gateway authority.
         #[arg(long)]
         allow_remote: bool,
         /// Explicit local text-chat template.
         #[arg(long = "chat-template", value_name = "TEMPLATE")]
         chat_template: Option<hellas_presentation::ChatTemplate>,
-        /// Select an owned machine from this identity's inventory.
-        #[cfg(all(feature = "cloud", unix))]
-        #[arg(long, conflicts_with_all = ["node_id", "provider_genesis", "apple_app_attest_app_id", "apple_app_attest_cdhashes"])]
-        #[cfg_attr(feature = "evaluate", arg(conflicts_with = "local"))]
-        #[cfg_attr(feature = "node", arg(conflicts_with = "paid_work_config"))]
-        machine: Option<String>,
         #[command(flatten)]
         remote_trust: RemoteTrustArgs,
         #[command(flatten)]
@@ -527,25 +416,11 @@ enum Commands {
         node_id: Option<EndpointId>,
         /// Direct UDP address hint for the target node. Repeat or use commas.
         #[arg(long = "address", value_delimiter = ',')]
-        #[cfg_attr(all(feature = "cloud", unix), arg(requires = "remote_target"))]
-        #[cfg_attr(not(all(feature = "cloud", unix)), arg(requires = "node_id"))]
+        #[arg(requires = "node_id")]
         node_addrs: Vec<SocketAddr>,
-        /// Execute locally through this identity's durable owner grant
         #[cfg(feature = "evaluate")]
-        #[arg(
-            long = "local",
-            default_value_t = false,
-            conflicts_with_all = ["node_id", "node_addrs"],
-            requires = "causal_lm_local_content"
-        )]
-        local: bool,
-        /// Maximum number of queued local executions when `--local` is set
-        #[cfg(feature = "evaluate")]
-        #[arg(
-            long = "queue-size",
-            default_value_t = hellas_rpc::DEFAULT_EXECUTION_QUEUE_CAPACITY
-        )]
-        queue_size: usize,
+        #[command(flatten)]
+        evaluation: evaluate::GatewayArgs,
         /// Max execution retries on failure (discovery mode)
         #[arg(long = "retries", default_value_t = 2)]
         retries: usize,
@@ -577,13 +452,11 @@ enum Commands {
         /// Fetch route method used when --responses-backend=fetch.
         #[arg(long = "responses-fetch-route-method", default_value = "responses")]
         responses_fetch_route_method: String,
-        /// Built-in Fetch environment alias (`codex-responses` or
-        /// `openai-responses`) or exact ProgramManifest ContentId expected from
-        /// the provider route.
+        /// Exact Fetch contract ProgramManifest ContentId expected from the provider route.
         #[arg(
             long = "responses-fetch-execution-environment",
             required_if_eq("responses_backend", "fetch"),
-            value_parser = parse_fetch_environment
+            value_parser = parse_content_id_hex
         )]
         responses_fetch_execution_environment: Option<hellas_rpc::ContentId>,
         /// JSON object merged into OpenAI Responses requests before signing
@@ -606,7 +479,6 @@ enum Commands {
         node_addrs: Vec<SocketAddr>,
     },
     /// Inspect or run the durable paid-work client path.
-    #[cfg(feature = "node")]
     PaidWork {
         #[command(subcommand)]
         command: commands::paid_work::PaidWorkCommand,
@@ -625,7 +497,6 @@ enum Commands {
         command: commands::environment::EnvironmentCommand,
     },
     /// Query or run Hellas chain components
-    #[cfg(feature = "chain")]
     Chain {
         #[command(subcommand)]
         command: commands::chain::ChainCommand,
@@ -635,17 +506,11 @@ enum Commands {
         #[command(subcommand)]
         command: IdentityCommand,
     },
-    /// Inspect the local producer signing key
-    ProducerKey {
-        #[command(subcommand)]
-        command: ProducerKeyCommand,
-    },
     /// Manage Codex OAuth credentials
     CodexAuth {
         #[command(subcommand)]
         command: CodexAuthCommand,
     },
-    #[cfg(feature = "node")]
     /// Make one of this provider's bond offers, so its client has something to
     /// answer
     ///
@@ -661,9 +526,18 @@ enum Commands {
         /// The paid-work configuration this offer is made under
         #[arg(long = "work-config")]
         work_config: PathBuf,
-        /// The client this bond names as taker, hex-encoded
+        /// Existing node grant configuration; its authority must already be bootstrapped.
+        #[arg(long = "grant-config")]
+        grant_config: PathBuf,
+        /// Alias of an already imported, verified client contact.
+        #[arg(long)]
+        client_contact: String,
+        /// The client node signer this bond names as taker, hex-encoded.
         #[arg(long = "client")]
         client: String,
+        /// Return the provider's stake without delegating it back to this node.
+        #[arg(long)]
+        lock_provider_payout: bool,
         /// A coin this provider stakes, hex-encoded. Repeat it for each
         /// coin; the stake is the provider's alone, so none of these is
         /// the client's.
@@ -681,8 +555,8 @@ enum Commands {
         /// The largest job price this bond covers
         #[arg(long = "max-job-price")]
         max_job_price: u64,
-        /// Print the deterministic bond edge and exit before evidence,
-        /// routes, validators, or journals are opened.
+        /// Print the bond edge using the existing authority and contact,
+        /// before opening paid-work journals or connecting to validators.
         #[arg(long = "print-bond-only")]
         print_bond_only: bool,
     },
@@ -697,30 +571,28 @@ enum Commands {
     },
 }
 
-#[cfg(all(feature = "cloud", unix))]
-impl Commands {
-    fn owned_machine(&self) -> Option<&str> {
-        match self {
-            #[cfg(feature = "gateway")]
-            Self::Gateway { machine, .. } => machine.as_deref(),
-            _ => None,
-        }
-    }
-}
-
 fn validate_identity_options(
     command: &Commands,
     identity: Option<&Path>,
     software_root: bool,
 ) -> Result<(), String> {
     let identity_free = match command {
+        Commands::Admin(commands::admin::AdminArgs {
+            command: commands::admin::AdminCommand::InspectOffline { .. },
+            ..
+        }) => Some("admin inspect-offline"),
+        Commands::Trust(_) => Some("trust"),
+        #[cfg(unix)]
+        Commands::Machines(_) => Some("machines"),
+        Commands::Contact { .. } => Some("contact"),
+        Commands::Offer {
+            command: commands::contributions::OfferCommand::Import { .. },
+        } => Some("offer import"),
         Commands::Store { .. } => Some("store"),
         Commands::Environment { .. } => Some("environment"),
-        #[cfg(feature = "node")]
         Commands::Serve {
             check_config: true, ..
         } => Some("serve --check-config"),
-        #[cfg(feature = "chain")]
         Commands::Chain { .. } => Some("chain"),
         Commands::CodexAuth { .. } => Some("codex-auth"),
         _ => None,
@@ -739,35 +611,30 @@ fn validate_identity_options(
         ));
     }
 
-    let reads_existing_identity = match command {
-        #[cfg(all(feature = "cloud", unix))]
-        command if command.owned_machine().is_some() => true,
-        #[cfg(all(feature = "cloud", unix))]
-        Commands::Cloud(_) | Commands::Machines(_) => true,
-        Commands::Contact { .. } | Commands::Offer { .. } => true,
-        #[cfg(feature = "gateway")]
-        Commands::Gateway { offer: Some(_), .. } => true,
-        #[cfg(any(feature = "node", all(feature = "cloud", unix)))]
-        Commands::Admin(_) => true,
-        Commands::Identity {
-            command: IdentityCommand::ShowNodeId | IdentityCommand::ShowEnrollmentId,
-        }
-        | Commands::ProducerKey { .. } => true,
-        #[cfg(feature = "node")]
-        Commands::Serve {
-            work_config_file: Some(_),
-            ..
-        }
-        | Commands::Provision { .. } => true,
-        #[cfg(feature = "node")]
-        Commands::PaidWork { .. } => true,
-        #[cfg(all(feature = "node", feature = "gateway"))]
-        Commands::Gateway {
-            paid_work_config: Some(_),
-            ..
-        } => true,
-        _ => false,
-    };
+    let reads_existing_identity = matches!(
+        command,
+        Commands::Gateway { offer: Some(_), .. }
+            | Commands::Offer {
+                command: commands::contributions::OfferCommand::ImportBundle { .. },
+            }
+            | Commands::Admin(_)
+            | Commands::Identity {
+                command: IdentityCommand::ShowNodeId
+                    | IdentityCommand::ShowEnrollmentId
+                    | IdentityCommand::ShowHolder
+                    | IdentityCommand::ExportEnrollment { .. },
+            }
+            | Commands::Serve {
+                work_config_file: Some(_),
+                ..
+            }
+            | Commands::Provision { .. }
+            | Commands::PaidWork { .. }
+            | Commands::Gateway {
+                paid_work_config: Some(_),
+                ..
+            }
+    );
     if software_root && reads_existing_identity {
         return Err(
             "--software-root only selects the root when creating an identity; this command reads an existing identity"
@@ -818,14 +685,12 @@ async fn async_main() {
         eprintln!("error: {error}");
         std::process::exit(2);
     }
-    #[cfg(feature = "node")]
     if let Commands::Serve { assurance, .. } = &cli.command
         && let Err(error) = validate_serve_assurance(cli.software_root, *assurance, None)
     {
         eprintln!("error: {error}");
         std::process::exit(1);
     }
-    #[cfg(feature = "node")]
     if matches!(&cli.command, Commands::Serve { .. })
         && let Err(err) = platform_hardening::harden_provider_process()
     {
@@ -833,7 +698,15 @@ async fn async_main() {
         std::process::exit(1);
     }
     let tracer_provider = tracing_config::init_tracing(cli.log_file.as_deref());
-    #[cfg(feature = "node")]
+    if let Commands::Trust(args) = cli.command {
+        let result = commands::trust::run(args);
+        tracer_provider.shutdown();
+        if let Err(error) = result {
+            eprintln!("error: {error:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if let Commands::Serve {
         check_config: true,
         fetch_config_file,
@@ -848,20 +721,6 @@ async fn async_main() {
         tracer_provider.shutdown();
         if let Err(error) = result {
             eprintln!("error: {error:#}");
-            std::process::exit(1);
-        }
-        return;
-    }
-
-    if let Commands::ProducerKey {
-        command: ProducerKeyCommand::Show,
-    } = &cli.command
-    {
-        let result = identity::load_existing(cli.identity.as_deref())
-            .and_then(|identity| commands::identity::show_producer_key(&identity.producer_key));
-        tracer_provider.shutdown();
-        if let Err(err) = result {
-            eprintln!("error: {err:#}");
             std::process::exit(1);
         }
         return;
@@ -895,12 +754,13 @@ async fn async_main() {
     // effect; in particular, validator config generation runs in a pure Nix
     // build where there is deliberately no writable home directory.
     let command = match cli.command {
-        #[cfg(all(feature = "cloud", unix))]
-        command @ Commands::Admin(commands::admin::AdminArgs {
-            command: commands::admin::AdminCommand::Serve { .. },
-            ..
-        }) => {
-            let result = cloud::run(command, cli.identity.as_deref()).await;
+        Commands::Admin(
+            args @ commands::admin::AdminArgs {
+                command: commands::admin::AdminCommand::InspectOffline { .. },
+                ..
+            },
+        ) => {
+            let result = commands::admin::inspect_offline(args).await;
             tracer_provider.shutdown();
             if let Err(err) = result {
                 eprintln!("error: {err:#}");
@@ -908,9 +768,34 @@ async fn async_main() {
             }
             return;
         }
-        #[cfg(all(feature = "cloud", unix))]
-        command @ (Commands::Cloud(_) | Commands::Machines(_)) => {
-            let result = cloud::run(command, cli.identity.as_deref()).await;
+        #[cfg(unix)]
+        Commands::Machines(args) => {
+            let result = machines::run(args).await;
+            tracer_provider.shutdown();
+            if let Err(err) = result {
+                eprintln!("error: {err:#}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        command @ (Commands::Contact { .. }
+        | Commands::Offer {
+            command: commands::contributions::OfferCommand::Import { .. },
+        }) => {
+            let result = cli
+                .passkey
+                .as_deref()
+                .map(commands::chain::passkey)
+                .transpose()
+                .and_then(|passkey| match command {
+                    Commands::Contact { command } => {
+                        commands::contributions::contact(command, passkey.as_ref())
+                    }
+                    Commands::Offer { command } => {
+                        commands::contributions::offer(command, passkey.as_ref(), None)
+                    }
+                    _ => Ok(()),
+                });
             tracer_provider.shutdown();
             if let Err(err) = result {
                 eprintln!("error: {err:#}");
@@ -939,10 +824,9 @@ async fn async_main() {
         command => command,
     };
 
-    #[cfg(feature = "chain")]
     let command = match command {
         Commands::Chain { command } => {
-            let result = commands::chain::run(command).await;
+            let result = commands::chain::run(command, cli.passkey.as_deref()).await;
             tracer_provider.shutdown();
             if let Err(err) = result {
                 eprintln!("error: {err:#}");
@@ -963,7 +847,19 @@ async fn async_main() {
         }
     };
     let secret_key = local_identity.transport_key.clone();
-    #[cfg(feature = "node")]
+    let passkey = match cli
+        .passkey
+        .as_deref()
+        .map(commands::chain::passkey)
+        .transpose()
+    {
+        Ok(passkey) => passkey,
+        Err(err) => {
+            eprintln!("error: {err:#}");
+            std::process::exit(1);
+        }
+    };
+    let passkey = passkey.as_ref();
     if let Commands::Serve { assurance, .. } = &command
         && let Err(error) = validate_serve_assurance(
             cli.software_root,
@@ -976,46 +872,25 @@ async fn async_main() {
     }
 
     let result = match command {
-        Commands::Contact { command } => commands::contributions::contact(command, &local_identity),
-        Commands::Offer { command } => commands::contributions::offer(command, &local_identity),
-        #[cfg(feature = "node")]
-        Commands::Admin(args) => commands::admin::users::run(args, &local_identity).await,
-        #[cfg(all(feature = "cloud", unix, not(feature = "node")))]
-        Commands::Admin(_) => unreachable!("admin serve returned above"),
+        Commands::Offer { command } => {
+            commands::contributions::offer(command, passkey, Some(&local_identity.node_key))
+        }
+        Commands::Contact { .. } => {
+            unreachable!("contact commands handled before identity load")
+        }
+        Commands::Admin(args) => commands::admin::run(args, &local_identity, passkey).await,
 
-        #[cfg(feature = "node")]
         Commands::Serve {
             #[cfg(feature = "evaluate")]
-            store_dir,
+            evaluation,
             assurance,
             port,
             no_discovery,
             queue_size,
-            #[cfg(feature = "evaluate")]
-            content_paths,
-            #[cfg(feature = "evaluate")]
-            content_roots,
-            #[cfg(feature = "evaluate")]
-            content_index,
-            #[cfg(feature = "evaluate")]
-            gpu_session_programs,
-            #[cfg(feature = "evaluate")]
-            gpu_backend,
-            #[cfg(feature = "evaluate")]
-            gpu_session_asset_bytes,
-            #[cfg(feature = "evaluate")]
-            gpu_max_generation_capacity,
-            #[cfg(feature = "evaluate")]
-            gpu_max_generation_device_bytes,
-            #[cfg(feature = "evaluate")]
-            gpu_compile_timeout_secs,
-            #[cfg(feature = "evaluate")]
-            gpu_execution_timeout_secs,
             work_config_file,
             chain_node,
             grant_config_file,
-            init_owner,
-            owner_enrollment,
+            await_owner,
             metrics_port,
             graffiti,
             fetch_config_file,
@@ -1037,51 +912,44 @@ async fn async_main() {
                         // The key every settlement this node signs is signed
                         // with, taken from the identity loaded above and
                         // never made here.
-                        let settlement_key = identity::settlement_signer(&local_identity);
+                        let settlement_key = identity::settlement_signer(&local_identity)?;
                         let open_identity = local_identity.open_identity();
-                        let grants = if grant_config_file.is_some() || init_owner || owner_enrollment.is_some() {
+                        let grants = if let Some(path) = grant_config_file.as_deref() {
                             anyhow::ensure!(assurance == hellas_rpc::Assurance::ProducerSigned, "grants require producer-signed assurance");
-                            let provider = commands::contributions::principal(&local_identity)?;
-                            let root = commands::contributions::data_root(&provider)?;
-                            let config = if let Some(path) = grant_config_file.as_deref() {
-                                hellas_sdk::grant_config::GrantConfig::load(path, &root)?
-                            } else { hellas_sdk::grant_config::GrantConfig::unconfigured(&root) };
-                            let owner = if init_owner { Some(provider.clone()) } else {
-                                owner_enrollment.as_deref().map(|path| {
-                                    let bytes = commands::read_bounded_regular_file(path, "owner enrollment", hellas_rpc::protocol::work_grant::records::MAX_PRINCIPAL_BYTES)?;
-                                    Ok::<_,anyhow::Error>(hellas_rpc::protocol::work_grant::records::Principal::decode(&bytes)?)
-                                }).transpose()?
-                            };
-                            Some(commands::serve::GrantNodeConfig { config, provider, owner })
+                            let root = passkey
+                                .map(commands::contributions::principal)
+                                .transpose()?
+                                .map(|owner| commands::contributions::data_root(&owner))
+                                .transpose()?;
+                            let config = hellas_sdk::grant_config::GrantConfig::load(path, root.as_deref())?;
+                            Some(config)
                         } else { None };
 
-                        #[cfg(feature = "evaluate")]
-                        let gpu_config = hellas_executor::GpuConfig::new(
-                            gpu_session_programs,
-                            gpu_session_asset_bytes,
-                            gpu_max_generation_capacity,
-                            gpu_max_generation_device_bytes,
-                            Duration::from_secs(gpu_compile_timeout_secs),
-                            Duration::from_secs(gpu_execution_timeout_secs),
-                        )
-                        .map_err(anyhow::Error::msg)?
-                        .with_backend(gpu_backend);
+                        let (grants, transport) = match await_owner.as_deref() {
+                            Some(root) => {
+                                let (grants, transport) = commands::serve::bootstrap::prepare(root, &local_identity, port, grants).await?;
+                                (Some(grants), transport)
+                            }
+                            None => (grants, None),
+                        };
+                        let fetch_config_file = match (fetch_config_file, await_owner.as_deref()) {
+                            (Some(path), _) => Some(path),
+                            (None, Some(root)) => {
+                                let path = std::path::absolute(root)?.join("fetch.json");
+                                if !path.try_exists()? {
+                                    hellas_private::write_atomically(&path, ".initializing", br#"{"revision":0,"routes":[]}"#)?;
+                                }
+                                Some(path)
+                            }
+                            (None, None) => None,
+                        };
                         commands::serve::run(commands::serve::ServeOptions {
+                            transport,
                             port,
                             discovery: !no_discovery,
                             queue_size,
                             #[cfg(feature = "evaluate")]
-                            content_paths,
-                            #[cfg(feature = "evaluate")]
-                            content_roots,
-                            #[cfg(feature = "evaluate")]
-                            content_index: content_index.or_else(|| {
-                                store_dir
-                                    .as_deref()
-                                    .map(hellas_store::state::records_path_at)
-                            }),
-                            #[cfg(feature = "evaluate")]
-                            gpu_config,
+                            evaluation,
                             work_config,
                             chain_node,
                             grants,
@@ -1091,7 +959,7 @@ async fn async_main() {
                             fetch_max_in_flight,
                             fetch_queue_size,
                             secret_key,
-                            producer_key: local_identity.producer_key,
+                            producer_key: local_identity.node_key,
                             settlement_key,
                             open_identity,
                             assurance,
@@ -1102,11 +970,13 @@ async fn async_main() {
                 }
             }
         }
-        #[cfg(feature = "node")]
         Commands::Provision {
             chain_node,
             work_config,
+            grant_config,
+            client_contact,
             client,
+            lock_provider_payout,
             stake_coin,
             bond_timeout,
             timeout_payout,
@@ -1115,43 +985,45 @@ async fn async_main() {
         } => match commands::serve::load_work_config(&work_config) {
             Err(error) => Err(error.into()),
             Ok(work_config) => async {
+                let authority = identity::open_authority(
+                    &grant_config, passkey.map(commands::contributions::principal).transpose()?,
+                ).await?;
+                let contact = commands::contributions::load_contact(authority.owner().await?, &client_contact)?;
                 commands::serve::run_provision(commands::serve::ProvisionOptions {
                     work_config,
                     // The bond is staked by the party this node already
                     // settles as, taken from the identity loaded above
                     // and never made here.
-                    settlement_key: identity::settlement_signer(&local_identity),
+                    settlement_key: identity::settlement_signer(&local_identity)?,
                     provider: local_identity.enrollment.clone(),
                     addresses: Vec::new(),
-                    client: hellas_kernel::Key::from_bytes(commands::paid_work::fixed_hex("--client", &client)?),
+                    client: contact,
+                    client_node: hellas_kernel::Key::from_bytes(commands::paid_work::fixed_hex("--client", &client)?),
+                    redelegate_payout: !lock_provider_payout,
                     stake_coins: stake_coin.iter().map(|coin| {
                         commands::paid_work::fixed_hex("--stake-coin", coin).map(hellas_kernel::CoinId::from_bytes)
                     }).collect::<anyhow::Result<_>>()?,
                     bond_timeout,
                     timeout_payout,
                     max_job_price,
-                }, print_bond_only, chain_node)
+                }, print_bond_only, chain_node, authority)
                 .await
             }.await
         },
-        #[cfg(feature = "gateway")]
         Commands::Gateway {
             output_cache,
             store_dir,
             offer,
             grant_policy,
+            work_profile,
             http_fetch_config,
             archive_dir,
             zdr,
-            #[cfg(feature = "node")]
             paid_work_config,
-            #[cfg(feature = "node")]
             chain_node,
-            bearer_token_file,
+            gateway_profile,
             allow_remote,
             chat_template,
-            #[cfg(all(feature = "cloud", unix))]
-            machine,
             remote_trust,
             causal_lm,
             host,
@@ -1159,9 +1031,7 @@ async fn async_main() {
             node_id,
             node_addrs,
             #[cfg(feature = "evaluate")]
-            local,
-            #[cfg(feature = "evaluate")]
-            queue_size,
+            evaluation,
             retries,
             default_max_tokens,
             metrics_port,
@@ -1177,12 +1047,7 @@ async fn async_main() {
         } => {
             async {
                 #[cfg(feature = "evaluate")]
-                let local_content = causal_lm.as_ref().map(|args| commands::grant_gateway::local::LocalContent {
-                    paths: std::iter::once(args.environment.clone()).chain(args.content_paths.iter().cloned()).collect(),
-                    roots: args.content_roots.clone(),
-                    index: args.content_index.clone().or_else(|| store_dir.as_deref().map(hellas_store::state::records_path_at)),
-                    queue_size,
-                });
+                let local_content = causal_lm.as_ref().map(|args| evaluation.content(args, store_dir.as_deref()));
                 let cache_options =
                     commands::gateway_cache::options(output_cache, store_dir.clone())?;
                 let (
@@ -1194,12 +1059,6 @@ async fn async_main() {
                     environment,
                     manifest_id,
                     model,
-                    #[cfg(feature = "evaluate")]
-                    content_paths: _,
-                    #[cfg(feature = "evaluate")]
-                    content_roots: _,
-                    #[cfg(feature = "evaluate")]
-                    content_index: _,
                     tokenizer,
                     stop_token_ids,
                 }) = causal_lm
@@ -1218,86 +1077,95 @@ async fn async_main() {
                 } else {
                     (None, String::new(), None, Vec::new())
                 };
-                #[cfg(all(feature = "cloud", unix))]
-                anyhow::ensure!(
-                    machine.is_none() || responses_backend != GatewayResponsesBackend::Proxy,
-                    "--machine cannot be used with the external proxy backend"
-                );
                 let assurance = remote_trust.assurance;
-                #[cfg(all(feature = "node", not(feature = "evaluate")))]
-                let local = false;
-                #[cfg(feature = "node")]
-                let mut chain_shutdown = None;
-                #[cfg(feature = "node")]
-                let paid_work = if let Some(path) = paid_work_config.as_ref()
+                let application = work_profile.as_deref().map(hellas_sdk::node_control::profile::ClientProfile::load)
+                    .transpose()?.map(std::sync::Arc::new);
+                let work_application = || application.clone().ok_or_else(|| anyhow::anyhow!("--work-profile is required for grant Work"));
+                let grant_target = if let Some(name) = offer.as_deref() {
+                    let client = commands::contributions::require_principal(passkey)?;
+                    let offer = commands::contributions::load_offer(&client, name)?;
+                    Some(hellas_sdk::grant_client::UnpinnedOffer::decode(
+                        &offer.encode()?,  hellas_auth::authority::UnixMillis(0),
+                    )?.pin(&remote_trust.load()?)?)
+                } else { None };
+                let grant_source = if let Some(target) = grant_target
+                    && output_cache != hellas_rpc::cache::CachePolicy::ReplayOnly {
+                    anyhow::ensure!(assurance == target.trust().required_assurance, "requested assurance differs from the pinned grant provider");
+                    Some((commands::grant_gateway::session(target, &local_identity, commands::contributions::require_principal(passkey)?, work_application()?)?,
+                        hellas_sdk::grant_client::GrantTransport::remote(secret_key.clone()).await?))
+                } else { None };
+                #[cfg(feature = "evaluate")]
+                let (grant_source, grant_policy) = if evaluation.local && output_cache != hellas_rpc::cache::CachePolicy::ReplayOnly {
+                    anyhow::ensure!(responses_backend == GatewayResponsesBackend::Hellas, "--local requires the Hellas execution backend");
+                    anyhow::ensure!(grant_policy.as_deref().is_none_or(|name| name == "local"), "the local resource is named local");
+                    anyhow::ensure!(assurance == hellas_rpc::Assurance::ProducerSigned, "local Work requires producer-signed assurance");
+                    (Some(commands::grant_gateway::local::prepare(
+                        local_content.ok_or_else(|| anyhow::anyhow!("--local requires indexed content"))?,
+                        &local_identity, commands::contributions::require_principal(passkey)?, work_application()?, remote_trust.load()?,
+                    ).await?), Some("local".into()))
+                } else { (grant_source, grant_policy) };
+                if let Some((session, _)) = grant_source.as_ref()
+                    && hellas_sdk::grant_gateway::responses::selected_policy(&session.target, grant_policy.as_deref())?.is_some()
+                {
+                    anyhow::ensure!(paid_work_config.is_none() && loaded_environment.is_none(), "Responses grants require their own Fetch gateway");
+                    anyhow::ensure!(output_cache == hellas_rpc::cache::CachePolicy::Off, "Responses grants require --output-cache off");
+                    anyhow::ensure!(metrics_port.is_none(), "Responses Fetch does not support --metrics-port");
+                    let hellas_sdk::node_control::profile::GatewayHost { access, control, .. } = hellas_sdk::node_control::profile::GatewayProfile::load(
+                        gateway_profile.as_deref().ok_or_else(|| anyhow::anyhow!("--gateway-profile is required to serve HTTP"))?
+                    ).await?;
+                    let (session, transport) = grant_source.ok_or_else(|| anyhow::anyhow!("Responses grants require a transport"))?;
+                    let gateway = hellas_sdk::grant_gateway::responses::start_fetch(
+                        hellas_sdk::grant_gateway::responses::FetchGatewayOptions {
+                            access, host, port, allow_remote, wrap, wrap_args,
+                            archive: hellas_gateway::ArchiveOptions {
+                                directory: archive_dir.map(Ok).unwrap_or_else(identity::default_gateway_archive_path)?, zdr,
+                            },
+                            session,
+                            policy: grant_policy,
+                            request_overrides: responses_fetch_request_overrides.unwrap_or_default(),
+                        }, transport
+                    ).await?;
+                    let result = hellas_gateway::wait_for_shutdown(gateway).await.map_err(anyhow::Error::from);
+                    return match control {
+                        Some(control) => result.and(control.shutdown().await.map_err(anyhow::Error::from)),
+                        None => result,
+                    };
+                }
+                let paid_options = if let Some(path) = paid_work_config.as_ref()
                     && output_cache != hellas_rpc::cache::CachePolicy::ReplayOnly
                 {
                     anyhow::ensure!(
-                        !local && node_id.is_none()
+                        node_id.is_none()
                             && responses_backend == GatewayResponsesBackend::Hellas,
                         "--paid-work-config requires remote Hellas execution without --local, --node-id, or a Responses override",
                     );
-                    #[cfg(feature = "evaluate")]
                     anyhow::ensure!(http_fetch_config.is_some() || assurance == hellas_rpc::Assurance::ProducerSigned,
                         "token-native paid work uses producer-signed assurance");
-                    anyhow::ensure!(
-                        remote_trust.provider_genesis.is_none()
-                            && remote_trust.apple_app_attest_app_id.is_none()
-                            && remote_trust.apple_app_attest_cdhashes.is_empty(),
-                        "set provider enrollment and Apple trust pins in --paid-work-config",
-                    );
-                    let options = hellas_sdk::paid_gateway::load_pool_options(path, assurance)?;
+                    Some(hellas_sdk::paid_gateway::load_pool_options(path, assurance)?)
+                } else { None };
+                let hellas_sdk::node_control::profile::GatewayHost { access: gateway_access, control, node: authority } = hellas_sdk::node_control::profile::GatewayProfile::load(
+                    gateway_profile.as_deref().ok_or_else(|| anyhow::anyhow!("--gateway-profile is required to serve HTTP"))?
+                ).await?;
+                let mut chain_shutdown = None;
+                let paid_work = if let Some(options) = paid_options {
                     let node = chain_node.start(&options.providers.first().ok_or_else(|| anyhow::anyhow!("paid pool has no providers"))?.config).await?;
                     chain_shutdown = Some(node.clone());
                     Some(
                         hellas_sdk::paid_gateway::PaidGateway::open(
                             options,
-                            hellas_sdk::ClientIdentity::from_secret_bytes(secret_key.to_bytes(), local_identity.producer_key.to_secret_bytes())?,
+                            hellas_sdk::NodeIdentity::from_secret_bytes(secret_key.to_bytes(), local_identity.node_key.to_secret_bytes())?,
                             node,
+                            authority,
                         ).await? as std::sync::Arc<dyn hellas_gateway::WorkExecutionBackend>
                     )
                 } else {
                     None
                 };
-                #[cfg(not(feature = "node"))]
-                let paid_work = None;
-                let grant_target = if let Some(name) = offer.as_deref() {
-                    let client = commands::contributions::principal(&local_identity)?;
-                    let offer = commands::contributions::load_offer(&client, name)?;
-                    Some(hellas_sdk::grant_client::UnpinnedOffer::decode(
-                        &offer.encode()?, client.id(), hellas_rpc::protocol::work_grant::UnixMillis(0),
-                    )?.pin(&identity::provider_trust(
-                        Some(offer.offer().provider.content_id()), assurance,
-                        remote_trust.apple_app_attest_app_id.clone(),
-                        remote_trust.apple_app_attest_cdhashes.clone(),
-                    )?)?)
+
+                anyhow::ensure!(grant_policy.is_none() || offer.is_some() || grant_source.is_some(), "--grant-policy requires a remote or local allowance");
+                let grant_gateway = if let Some((session, transport)) = grant_source {
+                    Some(hellas_sdk::grant_gateway::GrantGateway::open(session, transport, grant_policy).await?)
                 } else { None };
-                #[cfg(all(feature = "cloud", unix))]
-                let grant_target = if let Some(name) = machine.as_deref()
-                    && output_cache != hellas_rpc::cache::CachePolicy::ReplayOnly {
-                    Some(cloud::machine_target(name, &local_identity, node_addrs.clone()).await?)
-                } else { grant_target };
-                #[cfg(feature = "evaluate")]
-                let local_grant = if local && output_cache != hellas_rpc::cache::CachePolicy::ReplayOnly {
-                    anyhow::ensure!(responses_backend == GatewayResponsesBackend::Hellas, "--local requires the Hellas execution backend");
-                    anyhow::ensure!(grant_policy.as_deref().is_none_or(|name| name == "local"), "the local owner resource is named local");
-                    anyhow::ensure!(assurance == hellas_rpc::Assurance::ProducerSigned, "local Work requires producer-signed assurance");
-                    Some(commands::grant_gateway::local::open(
-                        loaded_environment.as_ref().ok_or_else(|| anyhow::anyhow!("--local requires a causal-LM environment"))?.environment(),
-                        &stop_token_ids,
-                        local_content.ok_or_else(|| anyhow::anyhow!("--local requires indexed content"))?,
-                        &local_identity,
-                    ).await?)
-                } else { None };
-                #[cfg(not(feature = "evaluate"))]
-                let local_grant = None;
-                anyhow::ensure!(grant_policy.is_none() || grant_target.is_some() || local_grant.is_some(), "--grant-policy requires an Offer or owner grant");
-                let grant_gateway = if let Some(target) = grant_target
-                    && output_cache != hellas_rpc::cache::CachePolicy::ReplayOnly {
-                    anyhow::ensure!(assurance == target.trust().required_assurance, "requested assurance differs from the pinned grant provider");
-                    Some(commands::grant_gateway::remote(target, &local_identity, grant_policy).await?)
-                } else { None };
-                let grant_gateway = grant_gateway.or(local_grant);
                 let paid_work = grant_gateway.as_ref().map(|backend| backend.clone() as std::sync::Arc<dyn hellas_gateway::WorkExecutionBackend>).or(paid_work);
                 let shutdown = paid_work.clone();
                 let result = async {
@@ -1318,6 +1186,7 @@ async fn async_main() {
                 } else if loaded_environment.is_none() {
                     grant_gateway.as_ref().map(|gateway| gateway.http_config()).transpose()?
                 } else { None };
+                let served = async {
                 if let Some(config) = http_config {
                     anyhow::ensure!(output_cache == hellas_rpc::cache::CachePolicy::Off,
                         "HTTP routes archive exchanges; inference replay must be off");
@@ -1325,14 +1194,14 @@ async fn async_main() {
                     return hellas_gateway::run_http(hellas_gateway::HttpGatewayOptions {
                         config,
                         paid: paid_work.ok_or_else(|| anyhow::anyhow!("HTTP proxy requires a Work backend"))?,
-                        archive, bearer_token_file, allow_remote, host, port, wrap, wrap_args,
+                        archive, access: gateway_access, allow_remote, host, port, wrap, wrap_args,
                     }).await.map_err(anyhow::Error::from);
                 }
                 hellas_gateway::run(hellas_gateway::GatewayOptions {
                     archive,
                     output_cache: cache_options,
                     paid_work,
-                    bearer_token_file,
+                    access: gateway_access,
             allow_remote,
                     chat_template,
                     host,
@@ -1355,7 +1224,7 @@ async fn async_main() {
                     responses_fetch_request_overrides: responses_fetch_request_overrides
                         .unwrap_or_default(),
                     provider_trust,
-                    producer_key: local_identity.producer_key,
+                    producer_key: local_identity.node_key,
                     assurance,
                     secret_key,
                     wrap,
@@ -1363,11 +1232,15 @@ async fn async_main() {
                 })
                 .await.map_err(anyhow::Error::from)
                 }.await;
+                match control {
+                    Some(control) => served.and(control.shutdown().await.map_err(anyhow::Error::from)),
+                    None => served,
+                }
+                }.await;
                 let mut result = result;
                 if let Some(backend) = shutdown {
                     result = result.and(backend.drain().await.map_err(anyhow::Error::from));
                 }
-                #[cfg(feature = "node")]
                 if let Some(node) = chain_shutdown {
                     result = result.and(node.shutdown().await.map_err(anyhow::Error::from));
                 }
@@ -1379,21 +1252,24 @@ async fn async_main() {
             node_id,
             node_addrs,
         } => commands::rpc::run(node_id, node_addrs, secret_key).await,
-        #[cfg(feature = "node")]
-        Commands::PaidWork { command } => {
-            commands::paid_work::run(
-                command,
-                secret_key,
-                identity::settlement_signer(&local_identity),
-                local_identity.producer_key.clone(),
-            )
-            .await
-        }
-        #[cfg(feature = "chain")]
+        Commands::PaidWork { command } => match identity::settlement_signer(&local_identity) {
+            Ok(settlement_key) => async {
+                commands::paid_work::run(
+                    command,
+                    secret_key,
+                    settlement_key,
+                    local_identity.node_key.clone(),
+                    passkey.map(commands::contributions::principal).transpose()?,
+                )
+                .await
+            }.await,
+            Err(error) => Err(error),
+        },
+        Commands::Trust(args) => commands::trust::run(args),
         Commands::Chain { .. } => unreachable!("chain commands handled before identity load"),
         Commands::Store { .. } => unreachable!("store commands handled before identity load"),
-        #[cfg(all(feature = "cloud", unix))]
-        Commands::Cloud(_) | Commands::Machines(_) => {
+        #[cfg(unix)]
+        Commands::Machines(_) => {
             unreachable!("management commands handled before identity load")
         }
         Commands::Environment { .. } => {
@@ -1405,8 +1281,11 @@ async fn async_main() {
             IdentityCommand::ShowEnrollmentId => {
                 commands::identity::show_enrollment_id(&local_identity.enrollment)
             }
+            IdentityCommand::ShowHolder => commands::identity::show_holder(&local_identity.node_key),
+            IdentityCommand::ExportEnrollment { out } => {
+                commands::identity::export_enrollment(&local_identity.enrollment, out.as_deref())
+            }
         },
-        Commands::ProducerKey { .. } => unreachable!("producer-key handled before identity load"),
         Commands::CodexAuth { .. } => unreachable!("codex-auth handled before identity load"),
         Commands::Monitor {
             timeout_secs,

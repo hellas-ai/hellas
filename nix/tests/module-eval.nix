@@ -42,6 +42,7 @@ let
             inherit package;
             gateway = {
               enable = true;
+              gatewayProfile = "/run/hellas/gateway-profile.json";
               causalLmEnvironment = "/srv/hellas/test.environment";
               tokenizer = "/srv/hellas/tokenizer.json";
             }
@@ -53,7 +54,7 @@ let
   providerAssertion =
     evaluation:
     lib.findFirst (
-      assertion: lib.hasInfix "services.hellas.gateway.provider is required" assertion.message
+      assertion: lib.hasInfix "services.hellas.gateway execution requires" assertion.message
     ) (throw "missing gateway provider assertion") evaluation.config.assertions;
   gatewayModelAssertion =
     evaluation:
@@ -85,15 +86,15 @@ let
     lib.findFirst (
       assertion: lib.hasInfix "services.hellas.gateway.extraArgs may not override" assertion.message
     ) (throw "missing gateway extraArgs assertion") evaluation.config.assertions;
-  appleTrustPairAssertion =
+  trustPairAssertion =
     evaluation:
     lib.findFirst (
-      assertion: lib.hasInfix "appleAppAttestAppId and appleAppAttestCdhashes" assertion.message
+      assertion: lib.hasInfix "trustStore and trustPolicy" assertion.message
     ) (throw "missing Apple trust pair assertion") evaluation.config.assertions;
-  appleTrustRequiredAssertion =
+  trustRequiredAssertion =
     evaluation:
     lib.findFirst (
-      assertion: lib.hasInfix "apple-app-attest assurance requires" assertion.message
+      assertion: lib.hasInfix "grant execution requires" assertion.message
     ) (throw "missing required Apple trust assertion") evaluation.config.assertions;
   memoryHeadroomAssertion =
     evaluation:
@@ -439,13 +440,13 @@ let
   unsupportedProviderApple = evalProvider {
     assurance = "apple-app-attest";
   };
-  incompleteAppleTrust = evalGateway {
+  incompleteTrust = evalGateway {
     responsesBackend = "proxy";
-    appleAppAttestAppId = "TEAMID.example.hellas";
+    trustPolicy = "provider";
   };
-  missingRequiredAppleTrust = evalGateway {
+  missingRequiredTrust = evalGateway {
     responsesBackend = "proxy";
-    assurance = "apple-app-attest";
+    offer = "provider";
   };
   oversizedGpuCapacity =
     builtins.tryEval
@@ -649,17 +650,20 @@ let
           environmentFile = "/run/hellas/provider.env";
           gateway = {
             enable = true;
+            gatewayProfile = "/run/hellas/gateway-profile.json";
             causalLmEnvironment = "/srv/hellas/smollm2.environment";
             tokenizer = "/srv/hellas/tokenizer.json";
-            provider = builtins.concatStringsSep "" (builtins.genList (_: "00") 32);
+            offer = "provider";
+            passkey = "/run/hellas/principal.passkey";
+            workProfile = "/run/hellas/work-profile.json";
             queueSize = 0;
             defaultMaxTokens = 4294967295;
             stopTokenIds = [ 4294967295 ];
             assurance = "apple-app-attest";
-            appleAppAttestAppId = "TEAMID.example.hellas";
-            appleAppAttestCdhashes = [ (builtins.concatStringsSep "" (builtins.genList (_: "ab") 32)) ];
+            trustPolicy = "provider";
+            trustStore = "/var/lib/hellas-gateway/trust";
             responsesBackend = "fetch";
-            responsesFetchExecutionEnvironment = "openai-responses";
+            responsesFetchExecutionEnvironment = "a05c3a1d598166d4a85f6a6a0ff0302e71647b53109902ae5752f6bc04a1acac";
             retries = 7;
             environmentFile = "/run/hellas/gateway.env";
           };
@@ -770,16 +774,21 @@ in
     assert lib.hasInfix "--fetch-config /run/hellas/fetch.json" service.serviceConfig.ExecStart;
     assert
       (builtins.length (lib.splitString "--retries" gatewayService.serviceConfig.ExecStart) - 1) == 1;
-    assert lib.hasInfix "--responses-fetch-execution-environment openai-responses"
+    assert lib.hasInfix
+      "--responses-fetch-execution-environment a05c3a1d598166d4a85f6a6a0ff0302e71647b53109902ae5752f6bc04a1acac"
       gatewayService.serviceConfig.ExecStart;
+    assert lib.hasInfix "--gateway-profile /run/hellas/gateway-profile.json"
+      gatewayService.serviceConfig.ExecStart;
+    assert lib.elem "/run/hellas/gateway-profile.json" gatewayService.unitConfig.RequiresMountsFor;
+    assert lib.hasInfix "--passkey /run/hellas/principal.passkey"
+      gatewayService.serviceConfig.ExecStart;
+    assert lib.elem "/run/hellas/principal.passkey" gatewayService.unitConfig.RequiresMountsFor;
     assert lib.hasInfix "--queue-size 0" gatewayService.serviceConfig.ExecStart;
     assert lib.hasInfix "--default-max-tokens 4294967295" gatewayService.serviceConfig.ExecStart;
     assert lib.hasInfix "--stop-token 4294967295" gatewayService.serviceConfig.ExecStart;
     assert lib.hasInfix "--assurance apple-app-attest" gatewayService.serviceConfig.ExecStart;
-    assert lib.hasInfix "--apple-app-attest-app-id TEAMID.example.hellas"
-      gatewayService.serviceConfig.ExecStart;
-    assert lib.hasInfix
-      "--apple-app-attest-cdhashes abababababababababababababababababababababababababababababababab"
+    assert lib.hasInfix "--trust-policy provider" gatewayService.serviceConfig.ExecStart;
+    assert lib.hasInfix "--trust-store /var/lib/hellas-gateway/trust"
       gatewayService.serviceConfig.ExecStart;
     assert lib.elem "/run/hellas/gateway.env" gatewayService.unitConfig.RequiresMountsFor;
     assert gatewayService.serviceConfig.EnvironmentFile == "/run/hellas/gateway.env";
@@ -796,8 +805,8 @@ in
     assert !(gatewayExtraArgsAssertion unsafeGatewayExtraArgs).assertion;
     assert (serveExtraArgsAssertion harmlessExtraArgs).assertion;
     assert !(providerAssuranceAssertion unsupportedProviderApple).assertion;
-    assert !(appleTrustPairAssertion incompleteAppleTrust).assertion;
-    assert !(appleTrustRequiredAssertion missingRequiredAppleTrust).assertion;
+    assert !(trustPairAssertion incompleteTrust).assertion;
+    assert !(trustRequiredAssertion missingRequiredTrust).assertion;
     assert !oversizedGpuCapacity.success;
     assert !(memoryHeadroomAssertion insufficientMemoryHeadroom).assertion;
     assert !(memoryHeadroomAssertion insufficientDefaultMemoryHeadroom).assertion;

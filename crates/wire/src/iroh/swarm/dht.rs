@@ -15,7 +15,7 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, btree_map::Entry};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ::iroh::{Endpoint, EndpointId, SecretKey, Signature};
 use futures::stream::{Stream, StreamExt};
@@ -103,14 +103,9 @@ fn replica_shards_with_limits(
 
 /// Get current unix minute with optional offset.
 ///
-/// # Panics
-///
-/// Panics if the system clock is before the Unix epoch.
+/// Times before the Unix epoch use its first minute.
 fn unix_minute(offset: i64) -> u64 {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
+    let now = unix_timestamp_secs().unwrap_or_default();
     apply_minute_offset(now / 60, offset)
 }
 
@@ -123,8 +118,8 @@ fn apply_minute_offset(minute: u64, offset: i64) -> u64 {
 }
 
 fn unix_timestamp_secs() -> Result<u64, String> {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .map_err(|e| format!("system clock before unix epoch: {e}"))
 }
@@ -417,10 +412,7 @@ impl DhtResolver {
             result.push(item);
         }
 
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let now = unix_timestamp_secs().unwrap_or_default();
 
         let buckets = result
             .into_iter()

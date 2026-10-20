@@ -3,7 +3,7 @@
 //!
 //! # What this is, and what it is not
 //!
-//! [`hellas_rpc::protocol::work_bundle`] is the artifact, and it says of
+//! [`crate::model::bundle`] is the artifact, and it says of
 //! itself that "somebody has to carry half-signed bytes between the two
 //! processes". [`crate::work_store::setup`] is the journal that fsyncs
 //! each revision before the signature it carries is exported. This is
@@ -57,7 +57,7 @@
 //!
 //! # Who may sign what
 //!
-//! Not decided here either. `WorkChannelSetupBundleV1::check` reads the
+//! Not decided here either. `WorkChannelSetupBundleV2::check` reads the
 //! signing party out of `bond_terms.parties` — maker is the provider,
 //! taker is the client — so a client that tried to propose a bond, or a
 //! provider that tried to propose a payment, fails its own journal's
@@ -89,14 +89,19 @@
 //! until the horizon, and no automatic step returns it — see
 //! `hellas_work::work_open`'s note on `SetupDecision::TimeoutBond`.
 
-use std::sync::{Arc, Mutex};
+use std::ops::{Deref, DerefMut};
+use std::sync::Arc;
+
+use crate::endpoint_lock::{EndpointGuard, EndpointLock};
 
 use hellas_kernel::{
-    Auth, EdgeId, Funding, NetworkId, Secp256k1Signer, Secp256k1Verifier, Terms, Tx,
-    WorkPaymentTerms, WorkStakeBondTerms,
+    EdgeId, Funding, NetworkId, PartyAuth, PartyKeys, PayloadHash, Secp256k1Signer,
+    Secp256k1Verifier, Terms, Tx, WorkPaymentTerms, WorkStakeBondTerms,
 };
 use hellas_wire::{StreamTransport, TransportContext, WireStatus};
 
+use crate::model::bundle::{SetupBundleError, WorkChannelSetupBundleV2};
+use crate::model::setup::{CloseDescriptor, ProviderChannelPolicy, WorkChannelDescriptor};
 use crate::work::{Refusal, WorkRefusal};
 use crate::work_close::{FinalizedBlocks, TxSink};
 use crate::work_open::{SetupAdvance, SetupChannel, SetupDriveError, SetupView, advance_setup};
@@ -106,10 +111,6 @@ use crate::work_store::{
 use hellas_rpc::pb::work::{
     ExchangeSetupRequest, ExchangeSetupResponse, SetupAdvanced, WorkRefused,
     exchange_setup_response::Outcome,
-};
-use hellas_rpc::protocol::work_bundle::WorkChannelSetupBundleV1;
-use hellas_rpc::protocol::work_setup::{
-    CloseDescriptor, ProviderChannelPolicy, WorkChannelDescriptor,
 };
 use hellas_rpc::services::work_setup::{WorkSetupClientImpl, WorkSetupHandler};
 
@@ -200,6 +201,24 @@ pub struct SetupEndpoint {
 }
 
 impl SetupEndpoint {
+    fn authorize(
+        &self,
+        party: PartyKeys,
+        hash: PayloadHash,
+        slot: &'static str,
+        party_name: &'static str,
+    ) -> Result<PartyAuth, SetupExchangeError> {
+        let authority = party.authority_of(self.signer.party_key()).ok_or_else(|| {
+            WorkStoreError::Setup(SetupStateError::Bundle(
+                SetupBundleError::BadAuthorization {
+                    slot,
+                    party: party_name,
+                },
+            ))
+        })?;
+        Ok(PartyAuth::new(authority, self.signer.sign(hash).into()))
+    }
+
     /// Takes one setup journal, the settlement key its revisions are
     /// signed with, and what this endpoint will countersign a payment
     /// over.
@@ -229,14 +248,17 @@ impl SetupEndpoint {
     /// after importing revision 1 and before building revision 2. The setup
     /// store refuses every other stage and writes an identical retry zero
     /// times, so each journal contains exactly one scan arm.
-    pub fn arm_scan(&mut self, scan: SetupScan) -> Result<&SetupState, SetupExchangeError> {
-        Ok(self.store.commit(
-            SetupRecord::ScanArmed {
-                height: scan.height,
-                payload: scan.payload,
-            },
-            &Secp256k1Verifier::new(),
-        )?)
+    pub async fn arm_scan(&mut self, scan: SetupScan) -> Result<&SetupState, SetupExchangeError> {
+        Ok(self
+            .store
+            .commit(
+                SetupRecord::ScanArmed {
+                    height: scan.height,
+                    payload: scan.payload,
+                },
+                &Secp256k1Verifier::new(),
+            )
+            .await?)
     }
 
     /// Signs the bond this endpoint will stake, and journals it before
@@ -256,14 +278,14 @@ impl SetupEndpoint {
     /// the bundle is over another network or bond than this journal is
     /// keyed to, when the handshake has already moved past its first
     /// revision, or when the record cannot be made durable.
-    pub fn propose_bond(
+    pub async fn propose_bond(
         &mut self,
         network: NetworkId,
         bond_funding: Funding,
         bond_terms: WorkStakeBondTerms,
     ) -> Result<&SetupState, SetupExchangeError> {
         // The kernel's own open hash, which is the same function
-        // `WorkChannelSetupBundleV1::bond_open_hash` calls. It is
+        // `WorkChannelSetupBundleV2::bond_open_hash` calls. It is
         // reached directly here only because the bundle that would
         // expose it is the thing this signature is being made to build.
         let hash = Tx::open_hash(
@@ -271,11 +293,16 @@ impl SetupEndpoint {
             &bond_funding,
             &Terms::work_stake_bond(bond_terms.clone()),
         );
-        let auth = Auth::native(self.signer.sign(hash));
+        let auth = self.authorize(
+            bond_terms.parties.maker(),
+            hash,
+            "bond open",
+            "the provider",
+        )?;
         let bundle =
-            WorkChannelSetupBundleV1::propose_bond(network, bond_funding, bond_terms, auth)
+            WorkChannelSetupBundleV2::propose_bond(network, bond_funding, bond_terms, auth)
                 .map_err(|error| WorkStoreError::Setup(SetupStateError::Bundle(error)))?;
-        self.commit(&bundle)
+        self.commit(&bundle).await
     }
 
     /// Countersigns the retained bond and names the payment channel to
@@ -295,7 +322,7 @@ impl SetupEndpoint {
     /// coin funds both opens, when this signer is not the party the
     /// bond terms name as taker, or when the record cannot be made
     /// durable.
-    pub fn propose_payment(
+    pub async fn propose_payment(
         &mut self,
         payment_funding: Funding,
         payment_terms: WorkPaymentTerms,
@@ -317,16 +344,27 @@ impl SetupEndpoint {
             &payment_funding,
             &Terms::work_payment(payment_terms.clone()),
         );
-        let bond_auth = Auth::native(self.signer.sign(held.bond_open_hash()));
+        let bond_auth = self.authorize(
+            held.bond_terms().parties.taker(),
+            held.bond_open_hash(),
+            "bond open",
+            "the client",
+        )?;
+        let payment_auth = self.authorize(
+            payment_terms.parties().maker(),
+            payment_hash,
+            "payment open",
+            "the client",
+        )?;
         let bundle = held
             .countersign_bond_and_propose_payment(
                 bond_auth,
                 payment_funding,
                 payment_terms,
-                Auth::native(self.signer.sign(payment_hash)),
+                payment_auth,
             )
             .map_err(|error| WorkStoreError::Setup(SetupStateError::Bundle(error)))?;
-        self.commit_armed(&bundle, descriptor)
+        self.commit_armed(&bundle, descriptor).await
     }
 
     /// Takes one revision a peer answered with.
@@ -340,13 +378,16 @@ impl SetupEndpoint {
     ///
     /// [`SetupExchangeError::Store`] for every one of those rules, and
     /// when the record cannot be made durable.
-    pub fn import(&mut self, bundle: &[u8]) -> Result<&SetupState, SetupExchangeError> {
-        Ok(self.store.commit(
-            SetupRecord::Bundle {
-                bundle: bundle.to_vec(),
-            },
-            &Secp256k1Verifier::new(),
-        )?)
+    pub async fn import(&mut self, bundle: &[u8]) -> Result<&SetupState, SetupExchangeError> {
+        Ok(self
+            .store
+            .commit(
+                SetupRecord::Bundle {
+                    bundle: bundle.to_vec(),
+                },
+                &Secp256k1Verifier::new(),
+            )
+            .await?)
     }
 
     /// Answers one offered revision with the revision that extends it.
@@ -359,7 +400,7 @@ impl SetupEndpoint {
     /// An empty offer is a caller that holds nothing and wants this
     /// endpoint's proposal. A replayed offer writes nothing and is
     /// answered with the same bytes.
-    fn advance(&mut self, offered: &[u8]) -> Result<Vec<u8>, Refusal> {
+    async fn advance(&mut self, offered: &[u8]) -> Result<Vec<u8>, Refusal> {
         if !offered.is_empty() {
             self.store
                 .commit(
@@ -368,6 +409,7 @@ impl SetupEndpoint {
                     },
                     &Secp256k1Verifier::new(),
                 )
+                .await
                 .map_err(|error| refuse(&error))?;
         }
 
@@ -392,14 +434,19 @@ impl SetupEndpoint {
             // Before the signature, and that order is the whole of it: a
             // refusal here is a refusal this endpoint made with nothing
             // signed and nothing written.
+            let party = terms.parties().taker();
             let descriptor = self.admit(payment_edge, terms)?;
+            let auth = self
+                .authorize(party, hash, "payment open", "the provider")
+                .map_err(|error| Refusal::new(WorkRefusal::Invalid, error.to_string()))?;
             // `countersign_payment` refuses every stage but the second,
             // and the filter above is that stage. Mapped so the match
             // is total; no test reaches it, and none claims to.
             let next = bundle
-                .countersign_payment(Auth::native(self.signer.sign(hash)))
+                .countersign_payment(auth)
                 .map_err(|error| Refusal::new(WorkRefusal::Invalid, error.to_string()))?;
             self.commit_armed(&next, descriptor.close_descriptor())
+                .await
                 .map_err(|error| match error {
                     SetupExchangeError::Store(store) => refuse(&store),
                     other => Refusal::new(WorkRefusal::Unavailable, other.to_string()),
@@ -462,32 +509,38 @@ impl SetupEndpoint {
     ///
     /// The bytes committed are the encoding, because a revision this
     /// endpoint made has no earlier bytes to be faithful to.
-    fn commit(
+    async fn commit(
         &mut self,
-        bundle: &WorkChannelSetupBundleV1,
+        bundle: &WorkChannelSetupBundleV2,
     ) -> Result<&SetupState, SetupExchangeError> {
-        Ok(self.store.commit(
-            SetupRecord::Bundle {
-                bundle: bundle.encode(),
-            },
-            &Secp256k1Verifier::new(),
-        )?)
+        Ok(self
+            .store
+            .commit(
+                SetupRecord::Bundle {
+                    bundle: bundle.encode(),
+                },
+                &Secp256k1Verifier::new(),
+            )
+            .await?)
     }
 
     /// Journals an executable revision and its close-only recovery data in
     /// one fsynced record.
-    fn commit_armed(
+    async fn commit_armed(
         &mut self,
-        bundle: &WorkChannelSetupBundleV1,
+        bundle: &WorkChannelSetupBundleV2,
         close_descriptor: CloseDescriptor,
     ) -> Result<&SetupState, SetupExchangeError> {
-        Ok(self.store.commit(
-            SetupRecord::ArmedBundle {
-                bundle: bundle.encode(),
-                close_descriptor: Box::new(close_descriptor),
-            },
-            &Secp256k1Verifier::new(),
-        )?)
+        Ok(self
+            .store
+            .commit(
+                SetupRecord::ArmedBundle {
+                    bundle: bundle.encode(),
+                    close_descriptor: Box::new(close_descriptor),
+                },
+                &Secp256k1Verifier::new(),
+            )
+            .await?)
     }
 }
 
@@ -498,9 +551,8 @@ impl SetupEndpoint {
 /// Cheap to clone and shared by every connection, because one bond has
 /// one journal however many peers dial it. The lock serialises the
 /// concurrent calls of one process; the journal's own exclusive lock is
-/// what excludes a second process. It is never held across an await,
-/// because deciding a revision — verifying signatures, one signature of
-/// its own, and two synchronous journal appends — never awaits.
+/// what excludes a second process. Acquiring the lock yields to other tasks.
+/// Its guard may span journal I/O, but never chain or network waits.
 ///
 /// That exclusive lock is also why driving the setup is a method here
 /// rather than something a runner arranges for itself: a second
@@ -508,8 +560,24 @@ impl SetupEndpoint {
 /// exists there is exactly one journal and this is what reaches it.
 #[derive(Clone, Debug)]
 pub struct SetupService {
-    endpoint: Arc<Mutex<SetupEndpoint>>,
+    endpoint: Arc<EndpointLock<SetupEndpoint>>,
     driving: Arc<std::sync::atomic::AtomicBool>,
+}
+
+struct SetupGuard<'a>(EndpointGuard<'a, SetupEndpoint>);
+
+impl Deref for SetupGuard<'_> {
+    type Target = SetupStore;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0.store
+    }
+}
+
+impl DerefMut for SetupGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0.store
+    }
 }
 
 /// The authority to take this setup's next step, and the only thing that
@@ -538,21 +606,15 @@ impl Drop for SetupDriver<'_> {
 }
 
 impl SetupChannel for SetupDriver<'_> {
-    fn with_store<R>(
+    async fn store(
         &mut self,
-        step: impl FnOnce(&mut SetupStore) -> R,
-    ) -> Result<R, SetupDriveError> {
-        let mut endpoint = self
-            .service
-            .endpoint
-            .lock()
-            .map_err(|_| SetupDriveError::Busy)?;
-        Ok(step(&mut endpoint.store))
+    ) -> Result<impl DerefMut<Target = SetupStore> + Send, SetupDriveError> {
+        self.service.store().await
     }
 }
 
 impl SetupDriver<'_> {
-    /// Takes one step of this setup, holding the journal for no wait.
+    /// Takes one step without holding the journal across chain or network waits.
     ///
     /// The step is [`advance_setup`]'s and no other: what is different
     /// here is only where the borrow begins and ends, so a setup can be
@@ -584,7 +646,7 @@ impl SetupService {
     #[must_use]
     pub fn new(endpoint: SetupEndpoint) -> Self {
         Self {
-            endpoint: Arc::new(Mutex::new(endpoint)),
+            endpoint: Arc::new(EndpointLock::new(endpoint)),
             driving: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
@@ -627,20 +689,26 @@ impl SetupService {
         self.drive()?.advance(view, blocks, sink).await
     }
 
+    async fn store(&self) -> Result<SetupGuard<'_>, SetupDriveError> {
+        self.endpoint
+            .lock()
+            .await
+            .map(SetupGuard)
+            .map_err(|_| SetupDriveError::Busy)
+    }
+
     /// Answers one exchange, or says why not.
-    ///
-    /// Synchronous, which is why the lock above is a plain [`Mutex`]:
-    /// nothing between taking it and dropping it can await.
-    fn exchange(&self, request: &ExchangeSetupRequest) -> ExchangeSetupResponse {
-        let outcome = match self.endpoint.lock() {
-            Ok(mut endpoint) => {
+    async fn exchange(&self, request: &ExchangeSetupRequest) -> ExchangeSetupResponse {
+        let outcome = match self.store().await {
+            Ok(mut held) => {
+                let endpoint = &mut held.0;
                 if request.bond_edge != endpoint.state().bond_edge().as_bytes() {
                     Err(Refusal::new(
                         WorkRefusal::Invalid,
                         "setup route names another bond",
                     ))
                 } else {
-                    endpoint.advance(&request.bundle)
+                    endpoint.advance(&request.bundle).await
                 }
             }
             // A handler panicked mid-commit while holding this. The
@@ -665,17 +733,13 @@ impl SetupService {
 }
 
 impl WorkSetupHandler for SetupService {
-    fn exchange_setup(
+    async fn exchange_setup(
         &self,
         request: ExchangeSetupRequest,
         _context: TransportContext,
-    ) -> impl core::future::Future<
-        Output = Result<
-            impl Into<hellas_rpc::call::WithTrailer<ExchangeSetupResponse>> + Send,
-            WireStatus,
-        >,
-    > + Send {
-        core::future::ready(Ok(self.exchange(&request)))
+    ) -> Result<impl Into<hellas_rpc::call::WithTrailer<ExchangeSetupResponse>> + Send, WireStatus>
+    {
+        Ok(self.exchange(&request).await)
     }
 }
 
@@ -728,7 +792,7 @@ where
 }
 
 /// Applies one network answer after the endpoint has been reacquired.
-pub fn apply_setup_exchange(
+pub async fn apply_setup_exchange(
     endpoint: &mut SetupEndpoint,
     response: ExchangeSetupResponse,
 ) -> Result<(), SetupExchangeError> {
@@ -743,6 +807,6 @@ pub fn apply_setup_exchange(
         }
         None => return Err(SetupExchangeError::Malformed("outcome")),
     };
-    endpoint.import(&bundle)?;
+    endpoint.import(&bundle).await?;
     Ok(())
 }

@@ -190,46 +190,28 @@ impl SetupAdvance {
 
 /// Where a setup step reaches one endpoint's journal.
 ///
-/// Synchronous, which is the whole content of it: a setup step waits on
-/// a finalized view, on blocks and on a sink, and none of those waits
-/// may happen while the journal is borrowed. A caller that owns its
-/// store lends it directly; a service that keeps one behind a lock takes
-/// that lock for exactly as long as the step runs. The steps themselves
-/// are [`advance_setup`]'s and are written once for both.
+/// A caller that owns its store lends it directly; a service asynchronously
+/// acquires its endpoint lock. Release the borrow before waiting on a finalized
+/// view, blocks or a transaction sink. Only journal I/O may await under it.
 pub trait SetupChannel {
-    /// Lends this setup's journal for exactly as long as `step` runs.
+    /// Borrows this setup's journal until the returned guard is dropped.
     ///
     /// # Errors
     ///
     /// [`SetupDriveError::Busy`] when the journal cannot be reached at
     /// all, which is the only thing an implementation may decide here.
-    fn with_store<R>(
+    fn store(
         &mut self,
-        step: impl FnOnce(&mut SetupStore) -> R,
-    ) -> Result<R, SetupDriveError>;
-
-    /// The same borrow, for a step that can fail on its own.
-    ///
-    /// # Errors
-    ///
-    /// [`SetupDriveError::Busy`] as above, and whatever `step` raises.
-    fn try_with_store<R>(
-        &mut self,
-        step: impl FnOnce(&mut SetupStore) -> Result<R, SetupDriveError>,
-    ) -> Result<R, SetupDriveError>
-    where
-        Self: Sized,
-    {
-        self.with_store(step)?
-    }
+    ) -> impl core::future::Future<
+        Output = Result<impl core::ops::DerefMut<Target = SetupStore> + Send, SetupDriveError>,
+    > + Send;
 }
 
 impl SetupChannel for SetupStore {
-    fn with_store<R>(
+    async fn store(
         &mut self,
-        step: impl FnOnce(&mut SetupStore) -> R,
-    ) -> Result<R, SetupDriveError> {
-        Ok(step(self))
+    ) -> Result<impl core::ops::DerefMut<Target = Self> + Send, SetupDriveError> {
+        Ok(self)
     }
 }
 
@@ -324,7 +306,26 @@ pub enum SetupDriveError {
 /// be made durable, [`SetupDriveError::Busy`] when the journal cannot be
 /// reached at all, and the two origin errors when completion cannot be
 /// tied to the block that produced it.
-pub async fn advance_setup<C, W, B, T, V>(
+pub fn advance_setup<'a, C, W, B, T, V>(
+    view: &'a W,
+    blocks: &'a B,
+    sink: &'a T,
+    channel: &'a mut C,
+    verifier: &'a V,
+) -> impl std::future::Future<Output = Result<SetupAdvance, SetupDriveError>> + 'a
+where
+    C: SetupChannel,
+    W: SetupView + ?Sized,
+    B: FinalizedBlocks + ?Sized,
+    T: TxSink + ?Sized,
+    V: SigVerifier,
+{
+    // Construct the driver outside its caller's poll frame. Its bounded
+    // kernel witnesses and journal futures are too large to compose inline.
+    Box::pin(advance_setup_inner(view, blocks, sink, channel, verifier))
+}
+
+async fn advance_setup_inner<C, W, B, T, V>(
     view: &W,
     blocks: &B,
     sink: &T,
@@ -343,7 +344,7 @@ where
     // the same question and would answer it the same way — but the one
     // shortcut that keeps a finished setup from scanning the chain
     // forever, and the only place the recorded origin is still in hand.
-    let completed = match channel.with_store(|store| store.state().end())? {
+    let completed = match channel.store().await?.state().end() {
         Some(SetupEnd::Complete) => true,
         Some(SetupEnd::Aborted(abort)) => {
             return Ok(SetupAdvance::bare(SetupProgress::Aborted(abort)));
@@ -354,7 +355,7 @@ where
         None => false,
     };
 
-    let Some(query) = channel.with_store(|store| query_of(store.state()))? else {
+    let Some(query) = query_of(channel.store().await?.state()) else {
         // No payment leg has been proposed, so this setup names no
         // payment edge and there is no channel on chain to read for.
         return Ok(SetupAdvance::bare(SetupProgress::AwaitingCounterparty));
@@ -370,17 +371,21 @@ where
         // recorded the origin read it; the block scan the shortcut
         // exists to avoid is still avoided.
         let origin = channel
-            .with_store(|store| store.state().origin())?
+            .store()
+            .await?
+            .state()
+            .origin()
             .ok_or(SetupDriveError::CloseNotArmed)?;
         let Some(finalized) = view.finalized_setup(query).await? else {
             return Ok(SetupAdvance::bare(SetupProgress::AwaitingFinalizedState));
         };
-        let advance = channel.try_with_store(|store| {
-            Ok(SetupAdvance {
+        let advance = {
+            let store = channel.store().await?;
+            SetupAdvance {
                 progress: SetupProgress::Complete(origin),
-                mounted: Some(mount(store, verifier, origin, finalized.payment.as_ref())?),
-            })
-        })?;
+                mounted: Some(mount(&store, verifier, origin, finalized.payment.as_ref()).await?),
+            }
+        };
         return finish_mount(blocks, channel, advance, verifier).await;
     }
 
@@ -413,171 +418,137 @@ where
     // nothing here has a clock, and a handshake still arriving is the
     // caller's to come back to.
     const REREADS: usize = 2;
-    let (finalized, decision) = 'reread: {
-        for _ in 0..REREADS {
-            let Some(asked) = channel.with_store(|store| query_of(store.state()))? else {
-                return Ok(SetupAdvance::bare(SetupProgress::AwaitingCounterparty));
-            };
-            let Some(finalized) = view.finalized_setup(asked.clone()).await? else {
-                return Ok(SetupAdvance::bare(SetupProgress::AwaitingFinalizedState));
-            };
-            // One borrow for the comparison and the step it guards: a
-            // query compared in a borrow of its own would be a third
-            // state, and the decision would again be made at a state
-            // nothing checked.
-            let decision = match channel.try_with_store(|store| {
-                if query_of(store.state()).as_ref() != Some(&asked) {
-                    return Ok(Reread::Moved);
+    for _ in 0..REREADS {
+        let Some(asked) = query_of(channel.store().await?.state()) else {
+            return Ok(SetupAdvance::bare(SetupProgress::AwaitingCounterparty));
+        };
+        let Some(finalized) = view.finalized_setup(asked.clone()).await? else {
+            return Ok(SetupAdvance::bare(SetupProgress::AwaitingFinalizedState));
+        };
+        // Compare, decide and commit under one borrow. Reacquiring after
+        // deciding could commit against a revision this read never observed.
+        let mut store = channel.store().await?;
+        if query_of(store.state()).as_ref() != Some(&asked) {
+            continue;
+        }
+        // History proves whether this channel can still admit work, but
+        // settlement must use the surviving payment edge's current value.
+        if store.state().close_only_recovery() {
+            let advance = mount_close_only(&store, verifier, finalized.payment.as_ref()).await?;
+            drop(store);
+            return finish_mount(blocks, channel, advance, verifier).await;
+        }
+        let decision = store.state().decide(&finalized.observed());
+        // A newer snapshot can show spent funding before the scan has
+        // recorded the Open or Close that explains it. Terminal decisions
+        // require that evidence; submissions can proceed as new blocks arrive.
+        if matches!(decision, SetupDecision::Abort(_) | SetupDecision::Fault(_))
+            && store
+                .state()
+                .scan_cursor()
+                .is_none_or(|scan| scan.height < finalized.height)
+        {
+            return Ok(SetupAdvance::bare(SetupProgress::AwaitingFinalizedState));
+        }
+        let advance = match decision {
+            SetupDecision::SubmitBond | SetupDecision::SubmitPayment => {
+                let (step, record) = match decision {
+                    SetupDecision::SubmitBond => (SetupStep::Bond, SetupRecord::BondSubmitted),
+                    _ => (SetupStep::Payment, SetupRecord::PaymentSubmitted),
+                };
+                // Persist the submission marker before handing the Open to consensus.
+                let state = store.commit(record, verifier).await?;
+                let tx = match step {
+                    SetupStep::Bond => state.bond_open(),
+                    SetupStep::Payment => state.payment_open(),
                 }
-                // After the read, never before it. History proves this
-                // channel can no longer be admitted; what it cannot
-                // prove is what the surviving payment edge holds, and
-                // that is the number every close this mount will build
-                // has to distribute. Mounting first would fix the
-                // configured expectation as the answer, and the
-                // expectation is what admission hoped for rather than
-                // what the client funded.
-                if store.state().close_only_recovery() {
-                    return mount_close_only(store, verifier, finalized.payment.as_ref())
-                        .map(|advance| Reread::Mounted(Box::new(advance)));
-                }
-                let decision = store.state().decide(&finalized.observed());
-                // A newer snapshot can show spent funding before the scan has
-                // recorded the Open or Close that explains it. Terminal
-                // decisions require that evidence; submissions remain live
-                // even while new blocks keep arriving.
-                if matches!(decision, SetupDecision::Abort(_) | SetupDecision::Fault(_))
-                    && store
-                        .state()
-                        .scan_cursor()
-                        .is_none_or(|scan| scan.height < finalized.height)
-                {
-                    return Ok(Reread::Behind);
-                }
-                Ok(Reread::Decided(decision))
-            })? {
-                Reread::Moved => continue,
-                Reread::Behind => {
+                .ok_or(SetupDriveError::NothingRetained { step })?;
+                drop(store);
+                let outcome = sink.submit(tx).await?;
+                return Ok(SetupAdvance::bare(SetupProgress::Submitted {
+                    step,
+                    outcome,
+                }));
+            }
+            SetupDecision::Complete => {
+                let Some(origin) = store.state().origin() else {
+                    // Observe the Open on the next scan before recording completion.
                     return Ok(SetupAdvance::bare(SetupProgress::AwaitingFinalizedState));
-                }
-                Reread::Mounted(advance) => {
-                    return finish_mount(blocks, channel, *advance, verifier).await;
-                }
-                Reread::Decided(decision) => decision,
-            };
-            break 'reread (finalized, decision);
-        }
-        // Every pass found the question moved. Nothing was decided, and
-        // the caller asks again rather than this step deciding from the
-        // one answer it has left.
-        return Ok(SetupAdvance::bare(SetupProgress::AwaitingFinalizedState));
-    };
-    match decision {
-        SetupDecision::SubmitBond => submit(channel, sink, verifier, SetupStep::Bond).await,
-        SetupDecision::SubmitPayment => submit(channel, sink, verifier, SetupStep::Payment).await,
-        SetupDecision::Complete => {
-            let Some(origin) = channel.with_store(|store| store.state().origin())? else {
-                // The coherent state may advance during the read. Observe its
-                // Open on the next scan before making completion durable.
-                return Ok(SetupAdvance::bare(SetupProgress::AwaitingFinalizedState));
-            };
-            let advance = channel.try_with_store(|store| {
-                store.commit(
-                    SetupRecord::Complete {
-                        payment_edge: origin.payment_edge,
-                        origin_height: origin.height,
-                        origin_payload: origin.payload,
-                        origin_parent: origin.parent,
-                    },
-                    verifier,
-                )?;
-                // The completion is durable before the mount, in the
-                // order every other step here is written: the journal
-                // records where the channel begins, and only then is a
-                // channel opened there. A crash between the two restarts
-                // into the shortcut above, which mounts the same channel
-                // from the same origin and the same read.
-                Ok(SetupAdvance {
+                };
+                store
+                    .commit(
+                        SetupRecord::Complete {
+                            payment_edge: origin.payment_edge,
+                            origin_height: origin.height,
+                            origin_payload: origin.payload,
+                            origin_parent: origin.parent,
+                        },
+                        verifier,
+                    )
+                    .await?;
+                // Record the origin before opening the channel. A crash between
+                // these steps restarts through the completed-setup shortcut.
+                SetupAdvance {
                     progress: SetupProgress::Complete(origin),
-                    mounted: Some(mount(store, verifier, origin, finalized.payment.as_ref())?),
-                })
-            })?;
-            finish_mount(blocks, channel, advance, verifier).await
-        }
-        SetupDecision::CloseOnly => {
-            let advance = channel.try_with_store(|store| {
-                mount_close_only(store, verifier, finalized.payment.as_ref())
-            })?;
-            finish_mount(blocks, channel, advance, verifier).await
-        }
-        SetupDecision::Abort(abort) => {
-            channel.try_with_store(|store| {
-                store.commit(
-                    SetupRecord::Ended {
-                        outcome: SetupEnd::Aborted(abort),
-                    },
-                    verifier,
-                )?;
-                Ok(())
-            })?;
-            Ok(SetupAdvance::bare(SetupProgress::Aborted(abort)))
-        }
-        SetupDecision::Fault(fault) => {
-            channel.try_with_store(|store| {
-                store.commit(
-                    SetupRecord::Ended {
-                        outcome: SetupEnd::Faulted(fault),
-                    },
-                    verifier,
-                )?;
-                Ok(())
-            })?;
-            Ok(SetupAdvance::bare(SetupProgress::Faulted(fault)))
-        }
-        SetupDecision::TimeoutBond => {
-            let tx = channel.try_with_store(|store| {
+                    mounted: Some(
+                        mount(&store, verifier, origin, finalized.payment.as_ref()).await?,
+                    ),
+                }
+            }
+            SetupDecision::CloseOnly => {
+                mount_close_only(&store, verifier, finalized.payment.as_ref()).await?
+            }
+            SetupDecision::Abort(abort) => {
+                store
+                    .commit(
+                        SetupRecord::Ended {
+                            outcome: SetupEnd::Aborted(abort),
+                        },
+                        verifier,
+                    )
+                    .await?;
+                return Ok(SetupAdvance::bare(SetupProgress::Aborted(abort)));
+            }
+            SetupDecision::Fault(fault) => {
+                store
+                    .commit(
+                        SetupRecord::Ended {
+                            outcome: SetupEnd::Faulted(fault),
+                        },
+                        verifier,
+                    )
+                    .await?;
+                return Ok(SetupAdvance::bare(SetupProgress::Faulted(fault)));
+            }
+            SetupDecision::TimeoutBond => {
                 let tx = store
                     .state()
                     .bond_open()
                     .and_then(|open| match open {
-                        Tx::Open {
-                            funding: _, terms, ..
-                        } => Tx::timeout_close(store.state().bond_edge(), &terms),
+                        Tx::Open { terms, .. } => {
+                            Tx::timeout_close(store.state().bond_edge(), &terms)
+                        }
                         _ => None,
                     })
                     .ok_or(SetupDriveError::TimeoutUnavailable)?;
-                store.commit(SetupRecord::BondTimeoutSubmitted, verifier)?;
-                Ok(tx)
-            })?;
-            let outcome = sink.submit(tx).await?;
-            Ok(SetupAdvance::bare(SetupProgress::BondTimeoutSubmitted {
-                outcome,
-            }))
-        }
-        SetupDecision::AwaitingCounterparty => {
-            Ok(SetupAdvance::bare(SetupProgress::AwaitingCounterparty))
-        }
+                store
+                    .commit(SetupRecord::BondTimeoutSubmitted, verifier)
+                    .await?;
+                drop(store);
+                let outcome = sink.submit(tx).await?;
+                return Ok(SetupAdvance::bare(SetupProgress::BondTimeoutSubmitted {
+                    outcome,
+                }));
+            }
+            SetupDecision::AwaitingCounterparty => {
+                return Ok(SetupAdvance::bare(SetupProgress::AwaitingCounterparty));
+            }
+        };
+        drop(store);
+        return finish_mount(blocks, channel, advance, verifier).await;
     }
-}
-
-/// What the journal said when it was reacquired to decide.
-///
-/// The three answers of one borrow, because the comparison that decides
-/// whether a finalized answer may be used at all and the step that uses
-/// it cannot be two borrows.
-enum Reread {
-    /// The state read is newer than the contiguous evidence for a terminal decision.
-    Behind,
-    /// The query moved while its own answer was in flight. The answer is
-    /// about a funding set this setup no longer asks about, so it is
-    /// discarded rather than decided from.
-    Moved,
-    /// The close-only mount, made under that same borrow. Boxed because
-    /// an open channel journal is the outsized answer here and the other
-    /// two are a word.
-    Mounted(Box<SetupAdvance>),
-    /// What `decide` said at the state the answer was fetched for.
-    Decided(SetupDecision),
+    // Every read found a moved query. Let the next step retry with fresh state.
+    Ok(SetupAdvance::bare(SetupProgress::AwaitingFinalizedState))
 }
 
 async fn scan_finalized<C, B, V>(
@@ -591,7 +562,10 @@ where
     V: SigVerifier,
 {
     let scan = channel
-        .with_store(|store| store.state().scan_cursor())?
+        .store()
+        .await?
+        .state()
+        .scan_cursor()
         .ok_or(SetupDriveError::ScanNotArmed)?;
     let Some(tip) = blocks.latest_height().await? else {
         return Ok(None);
@@ -610,14 +584,16 @@ where
     while let Some(block) = pending.next().await {
         history.push(block?);
     }
-    channel.try_with_store(|store| {
+    {
+        let mut store = channel.store().await?;
         let observed = store
             .state()
             .observe(&history)
             .map_err(WorkStoreError::from)?;
-        store.commit(SetupRecord::Observed(observed), verifier)?;
-        Ok(())
-    })?;
+        store
+            .commit(SetupRecord::Observed(observed), verifier)
+            .await?;
+    }
     Ok(Some((through, tip)))
 }
 
@@ -631,7 +607,7 @@ where
         .ok_or(SetupDriveError::OriginUnreadable { height })
 }
 
-fn mount_close_only<V: SigVerifier>(
+async fn mount_close_only<V: SigVerifier>(
     store: &SetupStore,
     verifier: &V,
     payment: Option<&Edge>,
@@ -648,7 +624,7 @@ fn mount_close_only<V: SigVerifier>(
             tip: store.state().scan_cursor().map_or(0, |scan| scan.height),
             edge: payment_edge,
         })?;
-    let channel = mount(store, verifier, origin, payment)?;
+    let channel = mount(store, verifier, origin, payment).await?;
     let settled = channel.state().close_settled().is_some();
     Ok(SetupAdvance {
         progress: SetupProgress::CloseOnly { origin, settled },
@@ -656,54 +632,61 @@ fn mount_close_only<V: SigVerifier>(
     })
 }
 
-/// Opens the exclusive channel journal under the synchronous setup borrow.
-fn mount<V: SigVerifier>(
-    store: &SetupStore,
-    verifier: &V,
+/// Opens the exclusive channel journal while the setup journal is borrowed.
+/// Construct its large replay future behind a heap boundary, so setup steps
+/// that submit transactions do not carry journal-opening temporaries on their
+/// poll stack while connecting to the chain.
+fn mount<'a, V: SigVerifier>(
+    store: &'a SetupStore,
+    verifier: &'a V,
     origin: SetupOrigin,
-    payment: Option<&Edge>,
-) -> Result<ChannelStore, SetupDriveError> {
-    let descriptor = store
-        .state()
-        .close_descriptor()
-        .ok_or(SetupDriveError::CloseNotArmed)?;
-    let to_store =
-        |error| WorkStoreError::Setup(crate::work_store::SetupStateError::Descriptor(error));
-    // A surviving edge settles what it holds. The edge id is a hash over
-    // the funding *coins* and the terms, not over their values, so the
-    // client that named those coins decides the number and the
-    // provider's configured expectation is only ever what it hoped for:
-    // an edge funded above or below it is this same channel, and a close
-    // built on the expectation would name a total the edge does not
-    // distribute. The expectation is the fallback for a consumed edge
-    // alone, where there is no longer anything coherent to read it from.
-    let settlement = match payment {
-        None => descriptor.expected_settlement().map_err(to_store)?,
-        Some(payment) => descriptor.funded_settlement(payment).map_err(to_store)?,
-    };
-    let channel = if matches!(
-        descriptor.work_policy(),
-        hellas_rpc::protocol::work_profile::WorkPolicy::Fetch { .. }
-    ) {
-        ChannelStore::open_metadata_only(
-            store.root(),
-            descriptor.channel().clone(),
-            settlement,
-            store.role(),
-            origin,
-            verifier,
-        )?
-    } else {
-        ChannelStore::open(
-            store.root(),
-            descriptor.channel().clone(),
-            settlement,
-            store.role(),
-            origin,
-            verifier,
-        )?
-    };
-    Ok(channel)
+    payment: Option<&'a Edge>,
+) -> impl std::future::Future<Output = Result<ChannelStore, SetupDriveError>> + 'a {
+    Box::pin(async move {
+        let descriptor = store
+            .state()
+            .close_descriptor()
+            .ok_or(SetupDriveError::CloseNotArmed)?;
+        let to_store =
+            |error| WorkStoreError::Setup(crate::work_store::SetupStateError::Descriptor(error));
+        // A surviving edge settles what it holds. The edge id is a hash over
+        // the funding *coins* and the terms, not over their values, so the
+        // client that named those coins decides the number and the
+        // provider's configured expectation is only ever what it hoped for:
+        // an edge funded above or below it is this same channel, and a close
+        // built on the expectation would name a total the edge does not
+        // distribute. The expectation is the fallback for a consumed edge
+        // alone, where there is no longer anything coherent to read it from.
+        let settlement = match payment {
+            None => descriptor.expected_settlement().map_err(to_store)?,
+            Some(payment) => descriptor.funded_settlement(payment).map_err(to_store)?,
+        };
+        let channel = if matches!(
+            descriptor.work_policy(),
+            crate::model::profile::WorkPolicy::Fetch { .. }
+        ) {
+            ChannelStore::open_metadata_only(
+                store.root(),
+                descriptor.channel().clone(),
+                settlement,
+                store.role(),
+                origin,
+                verifier,
+            )
+            .await?
+        } else {
+            ChannelStore::open(
+                store.root(),
+                descriptor.channel().clone(),
+                settlement,
+                store.role(),
+                origin,
+                verifier,
+            )
+            .await?
+        };
+        Ok(channel)
+    })
 }
 
 /// Replays outside the setup borrow. The origin marker is written after its
@@ -719,8 +702,9 @@ where
     B: FinalizedBlocks + ?Sized,
     V: SigVerifier,
 {
-    let (origin, through) = setup.try_with_store(|store| {
-        Ok((
+    let (origin, through) = {
+        let store = setup.store().await?;
+        (
             store
                 .state()
                 .origin()
@@ -730,8 +714,8 @@ where
                 .scan_cursor()
                 .ok_or(SetupDriveError::ScanNotArmed)?
                 .height,
-        ))
-    })?;
+        )
+    };
     let channel = advance
         .mounted
         .as_mut()
@@ -746,12 +730,14 @@ where
                 height: origin.height,
             });
         }
-        apply_finalized_txs(channel, block.height, block.payload, &block.txs, verifier)?;
-        channel.commit(ChannelRecord::OriginObserved, verifier)?;
+        apply_finalized_txs(channel, block.height, block.payload, &block.txs, verifier).await?;
+        channel
+            .commit(ChannelRecord::OriginObserved, verifier)
+            .await?;
     }
     for height in channel.state().cursor().0.saturating_add(1)..=through {
         let block = history_block(blocks, height).await?;
-        observe(channel, &block, verifier)?;
+        observe(channel, &block, verifier).await?;
     }
     if let SetupProgress::CloseOnly { settled, .. } = &mut advance.progress {
         *settled = channel.state().close_settled().is_some();
@@ -771,42 +757,6 @@ fn query_of(state: &SetupState) -> Option<SetupQuery> {
         payment_edge: state.payment_edge()?,
         funding: state.funding_coins(),
     })
-}
-
-/// Journals one submission marker and then broadcasts the retained
-/// Open.
-///
-/// The commit is first and the `?` on it is what makes that binding: a
-/// journal that will not take the marker is a journal this endpoint
-/// does not broadcast from.
-async fn submit<C, T, V>(
-    channel: &mut C,
-    sink: &T,
-    verifier: &V,
-    step: SetupStep,
-) -> Result<SetupAdvance, SetupDriveError>
-where
-    C: SetupChannel,
-    T: TxSink + ?Sized,
-    V: SigVerifier,
-{
-    let record = match step {
-        SetupStep::Bond => SetupRecord::BondSubmitted,
-        SetupStep::Payment => SetupRecord::PaymentSubmitted,
-    };
-    let tx = channel.try_with_store(|store| {
-        let state = store.commit(record, verifier)?;
-        match step {
-            SetupStep::Bond => state.bond_open(),
-            SetupStep::Payment => state.payment_open(),
-        }
-        .ok_or(SetupDriveError::NothingRetained { step })
-    })?;
-    let outcome = sink.submit(tx).await?;
-    Ok(SetupAdvance::bare(SetupProgress::Submitted {
-        step,
-        outcome,
-    }))
 }
 
 /// Returns whether this transaction is the Open that produces `edge`.

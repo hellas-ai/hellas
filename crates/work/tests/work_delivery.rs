@@ -8,172 +8,58 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use support::temp;
 
 use bytes::Bytes;
 use futures::StreamExt as _;
-use hellas_kernel::{
-    BlockHeight, Decode as _, Edge, EdgeId, EdgeValues, Fees, Key, LeaseSlots, List,
-    MAX_EDGE_OUTPUTS, Parties, Payout, PendingSlot, Secp256k1Verifier, Terms, TermsHash,
-    WorkPaymentSettlement, WorkPaymentTerms, WorkStakeBondTerms, work_payment_settlement,
-};
-use hellas_rpc::evaluate::{
-    EvaluateOutputTranscriptBuilder, EvaluateStopReason, EvaluateTerminal, EvaluateUsage,
-    input_commitment,
-};
+use hellas_auth::Digest;
+use hellas_kernel::PendingSlot;
+use hellas_rpc::OutputEventEnvelope;
 use hellas_rpc::pb::work::{
     DeliverResultRequest, DeliverResultResponse, WorkDelivered, WorkRefusalCode,
     deliver_result_response::Outcome,
 };
-use hellas_rpc::protocol::Digest;
-use hellas_rpc::protocol::artifacts::{
-    BoundTermId, Canonical as _, InputAddressed as _, OutputAddressed as _, PreparedPaidInputV1,
-    SourceRef, TextArtifact, TextExecution, TextPolicy, TokenIds,
-};
-use hellas_rpc::protocol::work::{
-    EvaluatePolicyV2, JobDeadlines, PaidChannelPolicyV1, PaidJobAuthorizationV2, PaidWorkError,
-    PrivateRecord as _, delivery_request_digest, encode_transcript, generation_policy_digest,
-    identity_source_digest, private_policy_commitment, propose_authorization, signing_hash,
-    terminal_result, work_id,
-};
-use hellas_rpc::protocol::work_setup::{
-    ObservedChannel, ReadyChannel, WorkChannelConfig, WorkChannelDescriptor, WorkSetupError,
-    payment_terms_hash,
-};
 use hellas_rpc::services::work::{WorkClientImpl, WorkServer};
-use hellas_rpc::{
-    Application, Assurance, CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR, ContentId, EvaluateRequest,
-    OutputEventEnvelope, ProducerSigningKey, ProgramManifest, PublicKey,
-};
 use hellas_wire::mux::{MessagePipe, MuxConfig, MuxTransport, Role as MuxRole};
 use hellas_wire::{DefaultClock, Dispatcher, StreamTransport};
+use hellas_work::model::setup::{
+    ObservedChannel, ReadyChannel, WorkChannelDescriptor, WorkSetupError,
+};
+use hellas_work::model::work::{
+    EvaluatePolicyV2, PaidJobAuthorizationV2, PaidWorkError, PrivateRecord as _,
+    delivery_request_digest, encode_transcript, propose_authorization, signing_hash,
+    terminal_result, work_id,
+};
+use hellas_work::test_support::paid::{
+    CURSOR, WIDE_FRAME, advance, bond_edge, bond_object, bundle, client, commit, deadlines,
+    descriptor_with, evaluate_request, lease_over, payment_edge, payment_object, payment_policy,
+    provider, store_at, transcript_for, work_policy,
+};
 use hellas_work::work::{
     BackendFault, ClientEndpoint, CloseEndpoint, DeliverError, PreparedEvaluateInput,
     ProviderEndpoint, RunError, RunOutcome, WorkBackend, WorkService, fetch_result,
     run_accepted_work,
 };
 use hellas_work::work_store::{
-    ChannelRecord, ChannelStore, JobPhase, JobState, Role, SetupOrigin, TerminalOutcome,
+    ChannelRecord, ChannelStore, JobPhase, JobState, Role, TerminalOutcome,
 };
 use tokio::sync::mpsc;
 
 mod support;
-use support::{advance, bond_edge, client, network, payload_at, payment_edge, provider, temp};
 
 const EXPORTER: [u8; 32] = [0x5e; 32];
 
 // ── Fixture ───────────────────────────────────────────────────────────
 
-const HORIZON: u64 = 500;
-const PRICE: u64 = 10;
-const CREDIT_LIMIT: u64 = 40;
-/// One over half the funding, so the bond exceeds the capacity it
-/// leaves behind at zero fees.
-const OMISSION_BOND: u64 = 601;
-const PAYMENT_VALUE: u64 = 1_000;
-const PAYMENT_RESERVE: u64 = 200;
-const STAKE: u64 = 64;
-const SALT: [u8; 32] = [0x5a; 32];
-/// The finalized block both endpoints have processed through.
-const CURSOR: u64 = 10;
-/// The prompt this fixture's bundle carries, in tokens.
-const PROMPT_TOKENS: u64 = 4;
-/// A frame bound no legal delivery here comes close to.
-const WIDE_FRAME: u32 = 262_144;
-
-const fn deadlines() -> JobDeadlines {
-    JobDeadlines {
-        acceptance: 50,
-        terminal: 100,
-        payment: 200,
-    }
-}
-
 /// The last height at which the signed delivery margin still fits
 /// before the terminal deadline.
 const LAST_RELEASE: u64 = deadlines().terminal - 2;
 
-fn provider_producer() -> ProducerSigningKey {
-    match ProducerSigningKey::from_secret_bytes([0x22; 32]) {
-        Ok(key) => key,
-        Err(error) => panic!("a fixed scalar is a producer key: {error}"),
-    }
-}
-
-fn channel_policy() -> PaidChannelPolicyV1 {
-    PaidChannelPolicyV1 {
-        compute_credit_limit: CREDIT_LIMIT,
-        delivery_credit_limit: CREDIT_LIMIT,
-    }
-}
-
-fn bond_terms() -> WorkStakeBondTerms {
-    WorkStakeBondTerms {
-        parties: Parties::new(provider().party_key(), client().party_key()),
-        timeout: BlockHeight::new(HORIZON),
-        timeout_outputs: List::take(
-            [Payout::new(provider().party_key(), STAKE); MAX_EDGE_OUTPUTS],
-            1,
-        ),
-        max_job_price: 40,
-    }
-}
-
-fn payment_terms() -> WorkPaymentTerms {
-    WorkPaymentTerms {
-        bond_edge: bond_edge(),
-        bond_terms: bond_terms(),
-        private_policy_commitment: private_policy_commitment(network(), &SALT, &channel_policy()),
-        omit_response_blocks: hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
-        start_validity_blocks: 8,
-        omission_bond: OMISSION_BOND,
-    }
-}
-
-/// The execution policy, with the one bound a test varies as its
-/// argument.
+/// Vary just the frame bound of the shared execution policy.
 fn policy_with(max_encoded_result_frame: u32) -> EvaluatePolicyV2 {
     EvaluatePolicyV2 {
-        allowed_environment: manifest().content_id(),
-        generation_policy_digest: match generation_policy_digest(&text_policy().canonical_bytes()) {
-            Ok(digest) => digest,
-            Err(error) => panic!("the fixture policy hashes: {error}"),
-        },
-        identity_source_digest: match identity_source_digest(&identity_artifact().canonical_bytes())
-        {
-            Ok(digest) => digest,
-            Err(error) => panic!("the fixture identity hashes: {error}"),
-        },
-        max_prompt_tokens: 512,
-        max_new_tokens: 128,
-        max_stop_token_ids: 4,
-        max_spool_bytes: 1_048_576,
         max_encoded_result_frame,
-        max_encoded_prepared_input: 1_048_576,
-    }
-}
-
-fn work_policy() -> EvaluatePolicyV2 {
-    policy_with(WIDE_FRAME)
-}
-
-fn payment_values() -> EdgeValues {
-    EdgeValues::new(PAYMENT_VALUE, PAYMENT_RESERVE, Fees::new(0, 0, 0, 0))
-}
-
-fn descriptor_with(policy: EvaluatePolicyV2) -> WorkChannelDescriptor {
-    let config = WorkChannelConfig {
-        payment_policy: payment_policy(),
-        network: network(),
-        payment_edge: payment_edge(),
-        payment_terms: payment_terms(),
-        policy_salt: SALT,
-        channel_policy: channel_policy(),
-        work_policy: policy.into(),
-        expected_payment_values: payment_values(),
-    };
-    match WorkChannelDescriptor::open(config) {
-        Ok(descriptor) => descriptor,
-        Err(error) => panic!("the fixture channel opens: {error}"),
+        ..work_policy()
     }
 }
 
@@ -201,100 +87,7 @@ fn ready() -> ReadyChannel {
     ready_at(CURSOR)
 }
 
-fn settlement() -> WorkPaymentSettlement {
-    let Some(settlement) = work_payment_settlement(payment_values(), OMISSION_BOND) else {
-        panic!("a funded edge prices both exits");
-    };
-    settlement
-}
-
-fn store_at(root: &std::path::Path, ready: &ReadyChannel, role: Role, height: u64) -> ChannelStore {
-    let mut store = match ChannelStore::open(
-        root,
-        ready.channel().clone(),
-        settlement(),
-        role,
-        origin(),
-        &Secp256k1Verifier::new(),
-    ) {
-        Ok(store) => store,
-        Err(error) => panic!("the fixture store opens: {error}"),
-    };
-    advance(&mut store, height);
-    store
-}
-
-/// The fixture channel starts at the synthetic chain genesis.
-fn origin() -> SetupOrigin {
-    SetupOrigin {
-        payment_edge: payment_edge(),
-        height: 0,
-        payload: payload_at(0),
-        parent: [0_u8; 32],
-    }
-}
-
-/// Runs the production watcher over one empty finalized block per
-/// height, up through `height`.
-///
-/// The same call the settlement loop makes, so a fixture cursor is a
-/// cursor this endpoint could have reached.
-fn commit(store: &mut ChannelStore, record: ChannelRecord) {
-    if let Err(error) = store.commit(record, &Secp256k1Verifier::new()) {
-        panic!("the fixture record commits: {error}");
-    }
-}
-
 // ── The prepared inputs a job executes from ───────────────────────────
-
-fn manifest() -> ProgramManifest {
-    ProgramManifest::new(
-        Application::new(CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR).unwrap(),
-        ContentId::from_bytes([0x16; 32]),
-    )
-}
-
-fn prompt_tokens() -> TokenIds {
-    TokenIds::from([9, 8, 7, 6])
-}
-
-fn text_policy() -> TextPolicy {
-    TextPolicy::from_u32_stop_tokens(64, [2, 1])
-}
-
-fn identity_artifact() -> TextArtifact {
-    TextArtifact::identity(BoundTermId::from_digest(manifest().content_id().digest()))
-}
-
-fn text_execution() -> TextExecution {
-    TextExecution::new(
-        SourceRef::output(identity_artifact().output_id()),
-        prompt_tokens().output_id(),
-        text_policy().output_id(),
-    )
-}
-
-fn evaluate_request(nonce: u8) -> EvaluateRequest {
-    EvaluateRequest {
-        text_execution: text_execution().input_id().digest(),
-        runner_public_key: PublicKey::Secp256k1(client().party_key().to_bytes()),
-        execution_environment: manifest().content_id(),
-        nonce: [nonce; 32],
-        assurance: Assurance::ProducerSigned,
-        retain: true,
-    }
-}
-
-fn bundle(nonce: u8) -> PreparedPaidInputV1 {
-    PreparedPaidInputV1::new(
-        &evaluate_request(nonce),
-        &manifest(),
-        &text_execution(),
-        &prompt_tokens(),
-        &text_policy(),
-        &identity_artifact(),
-    )
-}
 
 fn authorization(policy: &EvaluatePolicyV2, nonce: u8) -> PaidJobAuthorizationV2 {
     match propose_authorization(
@@ -314,7 +107,7 @@ fn authorization(policy: &EvaluatePolicyV2, nonce: u8) -> PaidJobAuthorizationV2
 ///
 /// The acceptance exchange has its own file; these tests are about what
 /// happens after both signatures exist.
-fn accept(
+async fn accept(
     policy: &EvaluatePolicyV2,
     stores: &mut [&mut ChannelStore],
     nonce: u8,
@@ -333,14 +126,16 @@ fn accept(
                 client_signature: client().sign(signing_hash(id)),
                 prepared_input: prepared_input.clone(),
             },
-        );
+        )
+        .await;
         commit(
             store,
             ChannelRecord::JobAccepted {
                 work_id: id,
                 provider_signature: provider().sign(signing_hash(id)),
             },
-        );
+        )
+        .await;
     }
     (id, authorization)
 }
@@ -348,34 +143,6 @@ fn accept(
 // ── Transcripts and the backend that produces them ────────────────────
 
 const ANSWER: [u32; 5] = [101, 102, 103, 104, 105];
-
-fn transcript_for(request: &EvaluateRequest, answer: &[u32]) -> Vec<OutputEventEnvelope> {
-    let key = provider_producer();
-    let mut builder =
-        EvaluateOutputTranscriptBuilder::new(input_commitment(request), request.assurance, &key);
-    if let Err(error) = builder.push_token_delta(answer.to_vec()) {
-        panic!("a non-empty delta pushes: {error}");
-    }
-    let usage = EvaluateUsage {
-        input_units: PROMPT_TOKENS,
-        output_units: answer.len() as u64,
-    };
-    let billable_units = match usage.billable_units() {
-        Ok(units) => units,
-        Err(error) => panic!("the fixture usage sums: {error}"),
-    };
-    match builder.finish(EvaluateTerminal {
-        final_position: answer.len() as u64,
-        stop_reason: EvaluateStopReason::STOP_TOKEN,
-        matched_stop_token_id: Some(1),
-        text_artifact: Digest::from_bytes([0x77; 32]),
-        usage,
-        billable_units,
-    }) {
-        Ok(events) => events,
-        Err(error) => panic!("the fixture transcript finishes: {error}"),
-    }
-}
 
 /// A backend that counts its calls and signs the fixture answer.
 struct AnsweringBackend {
@@ -445,7 +212,7 @@ impl MessagePipe for Pipe {
 /// A `work_id` is an identifier; this is what makes it an authority,
 /// and only on the connection whose exporter it covers.
 fn delivery_request(
-    channel: &hellas_rpc::protocol::work::PaidChannel,
+    channel: &hellas_work::model::work::PaidChannel,
     work_id: Digest,
 ) -> DeliverResultRequest {
     DeliverResultRequest {
@@ -529,13 +296,14 @@ async fn one_answer_crosses_the_wire_and_is_debited_once() {
     let client_root = temp();
     let provider_root = temp();
     let ready = ready();
-    let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR);
-    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
+    let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR).await;
+    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR).await;
     let (id, authorization) = accept(
         &work_policy(),
         &mut [&mut client_store, &mut provider_store],
         1,
-    );
+    )
+    .await;
 
     let Ok(provider_endpoint) = ProviderEndpoint::new(ready.clone(), provider_store, provider())
     else {
@@ -557,7 +325,7 @@ async fn one_answer_crosses_the_wire_and_is_debited_once() {
 
     // The answer the client holds is the answer the provider computed,
     // rebuilt here from the delivered events rather than trusted.
-    let Ok(events) = hellas_rpc::protocol::work::decode_transcript(&delivered.transcript, 1 << 20)
+    let Ok(events) = hellas_work::model::work::decode_transcript(&delivered.transcript, 1 << 20)
     else {
         panic!("the delivered transcript decodes");
     };
@@ -573,6 +341,7 @@ async fn one_answer_crosses_the_wire_and_is_debited_once() {
         assert_eq!(
             service
                 .with_state(|state| state.jobs().next().map(JobState::phase))
+                .await
                 .expect("the endpoint is reachable"),
             Some(JobPhase::Delivered)
         );
@@ -605,7 +374,7 @@ async fn one_answer_crosses_the_wire_and_is_debited_once() {
 
     // And it is all on the disk: reopened from the files, the client's
     // journal still holds the result and the transcript it came with.
-    let recovered = store_at(client_root.path(), &ready, Role::Client, CURSOR);
+    let recovered = store_at(client_root.path(), &ready, Role::Client, CURSOR).await;
     let Some(job) = recovered.state().jobs().next() else {
         panic!("the job is still open");
     };
@@ -631,8 +400,9 @@ async fn the_last_height_the_delivery_margin_fits_is_the_last_that_may_release()
         // has its own margin; only the release height is varied.
         let provider_root = temp();
         let early = ready_at(CURSOR);
-        let mut provider_store = store_at(provider_root.path(), &early, Role::Provider, CURSOR);
-        let (id, _) = accept(&work_policy(), &mut [&mut provider_store], 1);
+        let mut provider_store =
+            store_at(provider_root.path(), &early, Role::Provider, CURSOR).await;
+        let (id, _) = accept(&work_policy(), &mut [&mut provider_store], 1).await;
         let Ok(endpoint) = ProviderEndpoint::new(early.clone(), provider_store, provider()) else {
             panic!("the provider endpoint binds");
         };
@@ -641,13 +411,16 @@ async fn the_last_height_the_delivery_margin_fits_is_the_last_that_may_release()
         drop(service);
 
         let ready = ready_at(height);
-        let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, height);
-        advance(&mut provider_store, height);
+        let mut provider_store =
+            store_at(provider_root.path(), &ready, Role::Provider, height).await;
+        advance(&mut provider_store, height).await;
         let Ok(mut endpoint) = ProviderEndpoint::new(ready.clone(), provider_store, provider())
         else {
             panic!("the provider endpoint binds at the release height");
         };
-        let released = endpoint.deliver(&delivery_request(ready.channel(), id), &ready, &EXPORTER);
+        let released = endpoint
+            .deliver(&delivery_request(ready.channel(), id), &ready, &EXPORTER)
+            .await;
         if may_release {
             if let Err(error) = released {
                 panic!("at {height} the margin still fits: {error}");
@@ -683,8 +456,8 @@ async fn the_last_height_the_delivery_margin_fits_is_the_last_that_may_release()
 async fn a_job_with_no_result_releases_nothing_yet() {
     let provider_root = temp();
     let ready = ready();
-    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
-    let (id, _) = accept(&work_policy(), &mut [&mut provider_store], 1);
+    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR).await;
+    let (id, _) = accept(&work_policy(), &mut [&mut provider_store], 1).await;
     let Ok(endpoint) = ProviderEndpoint::new(ready.clone(), provider_store, provider()) else {
         panic!("the provider endpoint binds");
     };
@@ -747,8 +520,8 @@ async fn a_failed_job_returns_its_terminal_after_authentication() {
 
     let provider_root = temp();
     let ready = ready();
-    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
-    let (id, _) = accept(&work_policy(), &mut [&mut provider_store], 1);
+    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR).await;
+    let (id, _) = accept(&work_policy(), &mut [&mut provider_store], 1).await;
     let endpoint = ProviderEndpoint::new(ready.clone(), provider_store, provider())
         .expect("the provider endpoint binds");
     let service = WorkService::new(endpoint);
@@ -787,7 +560,7 @@ async fn a_failed_job_returns_its_terminal_after_authentication() {
     let _ = serving.await;
     drop(service);
 
-    let recovered = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
+    let recovered = store_at(provider_root.path(), &ready, Role::Provider, CURSOR).await;
     assert!(recovered.state().job_by_id(id).is_none());
     assert_eq!(
         recovered
@@ -801,9 +574,12 @@ async fn a_failed_job_returns_its_terminal_after_authentication() {
     let service = WorkService::close_only(endpoint);
     let checkpoint = service
         .with_state(|state| state.checkpoint())
+        .await
         .expect("the restored state is available");
     assert!(matches!(
-        service.deliver(&delivery_request(ready.channel(), id), &EXPORTER),
+        service
+            .deliver(&delivery_request(ready.channel(), id), &EXPORTER)
+            .await,
         Err(DeliverError::Terminated { outcome: "failed" })
     ));
     let (transport, server_transport) = transport_pair();
@@ -854,7 +630,10 @@ async fn a_failed_job_returns_its_terminal_after_authentication() {
         }
     }
     assert_eq!(
-        service.with_state(|state| state.checkpoint()).unwrap(),
+        service
+            .with_state(|state| state.checkpoint())
+            .await
+            .unwrap(),
         checkpoint,
         "terminal diagnostics do not change the journal state",
     );
@@ -873,8 +652,8 @@ async fn a_failed_job_returns_its_terminal_after_authentication() {
 async fn a_release_past_the_deadline_is_expired_on_the_wire() {
     let provider_root = temp();
     let early = ready_at(CURSOR);
-    let mut provider_store = store_at(provider_root.path(), &early, Role::Provider, CURSOR);
-    let (id, _) = accept(&work_policy(), &mut [&mut provider_store], 1);
+    let mut provider_store = store_at(provider_root.path(), &early, Role::Provider, CURSOR).await;
+    let (id, _) = accept(&work_policy(), &mut [&mut provider_store], 1).await;
     let Ok(endpoint) = ProviderEndpoint::new(early.clone(), provider_store, provider()) else {
         panic!("the provider endpoint binds");
     };
@@ -884,8 +663,8 @@ async fn a_release_past_the_deadline_is_expired_on_the_wire() {
 
     let late = LAST_RELEASE + 1;
     let ready = ready_at(late);
-    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, late);
-    advance(&mut provider_store, late);
+    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, late).await;
+    advance(&mut provider_store, late).await;
     let Ok(endpoint) = ProviderEndpoint::new(ready.clone(), provider_store, provider()) else {
         panic!("the provider endpoint binds at the late height");
     };
@@ -905,6 +684,7 @@ async fn a_release_past_the_deadline_is_expired_on_the_wire() {
     assert_eq!(
         service
             .with_state(|state| state.jobs().next().map(JobState::phase))
+            .await
             .expect("the endpoint is reachable"),
         Some(JobPhase::Ready),
         "nothing was released",
@@ -917,8 +697,8 @@ async fn a_release_past_the_deadline_is_expired_on_the_wire() {
 async fn a_delivery_named_for_another_job_finds_nothing() {
     let provider_root = temp();
     let ready = ready();
-    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
-    let (id, _) = accept(&work_policy(), &mut [&mut provider_store], 1);
+    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR).await;
+    let (id, _) = accept(&work_policy(), &mut [&mut provider_store], 1).await;
     let Ok(endpoint) = ProviderEndpoint::new(ready.clone(), provider_store, provider()) else {
         panic!("the provider endpoint binds");
     };
@@ -962,6 +742,7 @@ async fn a_delivery_named_for_another_job_finds_nothing() {
     assert_eq!(
         service
             .with_state(|state| state.jobs().next().map(JobState::phase))
+            .await
             .expect("the endpoint is reachable"),
         Some(JobPhase::Ready),
     );
@@ -987,8 +768,8 @@ async fn a_provider_signs_no_result_the_frame_would_not_carry() {
     let provider_root = temp();
     let policy = policy_with(tight);
     let ready = ready_of(&descriptor_with(policy), CURSOR);
-    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
-    let (id, _) = accept(&policy, &mut [&mut provider_store], 1);
+    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR).await;
+    let (id, _) = accept(&policy, &mut [&mut provider_store], 1).await;
     let Ok(provider_endpoint) = ProviderEndpoint::new(ready.clone(), provider_store, provider())
     else {
         panic!("the provider endpoint binds");
@@ -1010,6 +791,7 @@ async fn a_provider_signs_no_result_the_frame_would_not_carry() {
     assert_eq!(
         service
             .with_state(|state| state.jobs().next().map(JobState::phase))
+            .await
             .expect("the endpoint is reachable"),
         None,
         "and the job is over, at the provider's own cost",
@@ -1032,9 +814,9 @@ async fn a_client_refuses_a_frame_over_the_bound_it_signed() {
     let provider_root = temp();
     let policy = policy_with(tight);
     let ready = ready_of(&descriptor_with(policy), CURSOR);
-    let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR);
-    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
-    let (id, _) = accept(&policy, &mut [&mut client_store, &mut provider_store], 1);
+    let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR).await;
+    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR).await;
+    let (id, _) = accept(&policy, &mut [&mut client_store, &mut provider_store], 1).await;
 
     // The delivery a provider that ignored its own bound would send:
     // the same job, the same answer, signed under the wide channel.
@@ -1042,16 +824,17 @@ async fn a_client_refuses_a_frame_over_the_bound_it_signed() {
     let wide_ready = ready_of(&descriptor_with(wide_policy), CURSOR);
     let oversized = {
         let wide_root = temp();
-        let mut wide_store = store_at(wide_root.path(), &wide_ready, Role::Provider, CURSOR);
-        let (wide_id, _) = accept(&wide_policy, &mut [&mut wide_store], 1);
+        let mut wide_store = store_at(wide_root.path(), &wide_ready, Role::Provider, CURSOR).await;
+        let (wide_id, _) = accept(&wide_policy, &mut [&mut wide_store], 1).await;
         let Ok(wide_endpoint) = ProviderEndpoint::new(wide_ready.clone(), wide_store, provider())
         else {
             panic!("the provider endpoint binds");
         };
         let wide_service = WorkService::new(wide_endpoint);
         run_to_result(&wide_service, &wide_ready, wide_id).await;
-        let Ok(delivery) =
-            wide_service.deliver(&delivery_request(wide_ready.channel(), wide_id), &EXPORTER)
+        let Ok(delivery) = wide_service
+            .deliver(&delivery_request(wide_ready.channel(), wide_id), &EXPORTER)
+            .await
         else {
             panic!("the wide delivery is released");
         };
@@ -1066,7 +849,7 @@ async fn a_client_refuses_a_frame_over_the_bound_it_signed() {
     let Ok(mut endpoint) = ClientEndpoint::new(ready.clone(), client_store, client()) else {
         panic!("the client endpoint binds");
     };
-    let refused = endpoint.receive(id, &ready, &oversized);
+    let refused = endpoint.receive(id, &ready, &oversized).await;
     let Err(DeliverError::OverFrame { actual, limit }) = refused else {
         panic!("an oversized frame is refused: {refused:?}");
     };
@@ -1086,14 +869,17 @@ async fn delivered_frame_len(frame: u32) -> u64 {
     let provider_root = temp();
     let policy = policy_with(frame);
     let ready = ready_of(&descriptor_with(policy), CURSOR);
-    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
-    let (id, _) = accept(&policy, &mut [&mut provider_store], 1);
+    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR).await;
+    let (id, _) = accept(&policy, &mut [&mut provider_store], 1).await;
     let Ok(endpoint) = ProviderEndpoint::new(ready.clone(), provider_store, provider()) else {
         panic!("the provider endpoint binds");
     };
     let service = WorkService::new(endpoint);
     run_to_result(&service, &ready, id).await;
-    let Ok(delivery) = service.deliver(&delivery_request(ready.channel(), id), &EXPORTER) else {
+    let Ok(delivery) = service
+        .deliver(&delivery_request(ready.channel(), id), &EXPORTER)
+        .await
+    else {
         panic!("the fixture delivery is released");
     };
     WorkDelivered {
@@ -1115,20 +901,24 @@ async fn a_transcript_swapped_in_transit_is_not_recorded() {
     let client_root = temp();
     let provider_root = temp();
     let ready = ready();
-    let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR);
-    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
+    let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR).await;
+    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR).await;
     let (id, _) = accept(
         &work_policy(),
         &mut [&mut client_store, &mut provider_store],
         1,
-    );
+    )
+    .await;
     let Ok(provider_endpoint) = ProviderEndpoint::new(ready.clone(), provider_store, provider())
     else {
         panic!("the provider endpoint binds");
     };
     let service = WorkService::new(provider_endpoint);
     run_to_result(&service, &ready, id).await;
-    let Ok(delivery) = service.deliver(&delivery_request(ready.channel(), id), &EXPORTER) else {
+    let Ok(delivery) = service
+        .deliver(&delivery_request(ready.channel(), id), &EXPORTER)
+        .await
+    else {
         panic!("the fixture delivery is released");
     };
 
@@ -1151,7 +941,7 @@ async fn a_transcript_swapped_in_transit_is_not_recorded() {
         transcript: other,
         ..honest.clone()
     };
-    let refused = endpoint.receive(id, &ready, &tampered);
+    let refused = endpoint.receive(id, &ready, &tampered).await;
     assert!(
         matches!(refused, Err(DeliverError::Store(_))),
         "a swapped transcript is refused: {refused:?}",
@@ -1163,7 +953,7 @@ async fn a_transcript_swapped_in_transit_is_not_recorded() {
     );
 
     // The control: the untampered delivery is taken.
-    if let Err(error) = endpoint.receive(id, &ready, &honest) {
+    if let Err(error) = endpoint.receive(id, &ready, &honest).await {
         panic!("the honest delivery records: {error}");
     }
     assert_eq!(
@@ -1179,20 +969,24 @@ async fn a_client_behind_its_readiness_records_no_receipt() {
     let client_root = temp();
     let provider_root = temp();
     let ready = ready();
-    let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR);
-    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
+    let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR).await;
+    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR).await;
     let (id, _) = accept(
         &work_policy(),
         &mut [&mut client_store, &mut provider_store],
         1,
-    );
+    )
+    .await;
     let Ok(provider_endpoint) = ProviderEndpoint::new(ready.clone(), provider_store, provider())
     else {
         panic!("the provider endpoint binds");
     };
     let service = WorkService::new(provider_endpoint);
     run_to_result(&service, &ready, id).await;
-    let Ok(delivery) = service.deliver(&delivery_request(ready.channel(), id), &EXPORTER) else {
+    let Ok(delivery) = service
+        .deliver(&delivery_request(ready.channel(), id), &EXPORTER)
+        .await
+    else {
         panic!("the fixture delivery is released");
     };
 
@@ -1209,7 +1003,7 @@ async fn a_client_behind_its_readiness_records_no_receipt() {
     // has processed. The blocks between are where a contest it must not
     // build evidence over would appear.
     let ahead = ready_at(CURSOR + 1);
-    let refused = endpoint.receive(id, &ahead, &delivered);
+    let refused = endpoint.receive(id, &ahead, &delivered).await;
     assert!(
         matches!(
             refused,
@@ -1222,91 +1016,12 @@ async fn a_client_behind_its_readiness_records_no_receipt() {
     );
 
     // The control: the readiness this endpoint has caught up to.
-    if let Err(error) = endpoint.receive(id, &ready, &delivered) {
+    if let Err(error) = endpoint.receive(id, &ready, &delivered).await {
         panic!("a caught-up client records the receipt: {error}");
     }
 }
 
 // ── Canonical chain objects, spelled out ──────────────────────────────
-
-const FORMAT_VERSION: u8 = 1;
-const TAG_BLOCK_HEIGHT: u8 = 1;
-const TAG_FEES: u8 = 2;
-const TAG_PARTIES: u8 = 3;
-const TAG_EDGE: u8 = 5;
-const TAG_BOND_LEASE: u8 = 31;
-/// `Freeze | Adjudicated`: close-kind tags 3 and 4.
-const WORK_PAYMENT_CLOSES: u8 = 0b0001_1000;
-/// `Timeout` alone: close-kind tag 1.
-const WORK_STAKE_CLOSES: u8 = 0b0000_0010;
-
-struct EdgeBytes {
-    value: u64,
-    reserve: u64,
-    maker: Key,
-    taker: Key,
-    terms: TermsHash,
-    allowed: u8,
-}
-
-impl EdgeBytes {
-    fn build(&self) -> Edge {
-        let mut out = vec![FORMAT_VERSION, TAG_EDGE];
-        out.extend_from_slice(&self.value.to_be_bytes());
-        out.extend_from_slice(&self.reserve.to_be_bytes());
-        out.extend_from_slice(&[FORMAT_VERSION, TAG_FEES]);
-        for _ in 0..4 {
-            out.extend_from_slice(&0_u64.to_be_bytes());
-        }
-        out.extend_from_slice(&[FORMAT_VERSION, TAG_BLOCK_HEIGHT]);
-        out.extend_from_slice(&HORIZON.to_be_bytes());
-        out.extend_from_slice(&[FORMAT_VERSION, TAG_PARTIES]);
-        out.extend_from_slice(&self.maker.to_bytes());
-        out.extend_from_slice(&self.taker.to_bytes());
-        out.extend_from_slice(self.terms.as_bytes());
-        out.push(self.allowed);
-        match Edge::decode_exact(&out) {
-            Ok(edge) => edge,
-            Err(error) => panic!("the hand-written edge is canonical: {error:?}"),
-        }
-    }
-}
-
-fn lease_over(bond: EdgeId, payment: EdgeId) -> LeaseSlots {
-    support::lease_over(
-        bond,
-        payment,
-        payment_terms_hash(payment_terms()).as_bytes(),
-        &payment_terms().private_policy_commitment,
-        HORIZON,
-        FORMAT_VERSION,
-        TAG_BOND_LEASE,
-    )
-}
-
-fn bond_object() -> Edge {
-    EdgeBytes {
-        value: STAKE,
-        reserve: 0,
-        maker: provider().party_key(),
-        taker: client().party_key(),
-        terms: Terms::work_stake_bond(bond_terms()).hash(),
-        allowed: WORK_STAKE_CLOSES,
-    }
-    .build()
-}
-
-fn payment_object() -> Edge {
-    EdgeBytes {
-        value: PAYMENT_VALUE,
-        reserve: PAYMENT_RESERVE,
-        maker: client().party_key(),
-        taker: provider().party_key(),
-        terms: payment_terms_hash(payment_terms()),
-        allowed: WORK_PAYMENT_CLOSES,
-    }
-    .build()
-}
 
 // ── Who may be handed the answer ──────────────────────────────────────
 
@@ -1327,8 +1042,8 @@ fn payment_object() -> Edge {
 async fn a_work_id_alone_releases_nothing() {
     let provider_root = temp();
     let ready = ready();
-    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
-    let (id, _) = accept(&work_policy(), &mut [&mut provider_store], 1);
+    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR).await;
+    let (id, _) = accept(&work_policy(), &mut [&mut provider_store], 1).await;
     let Ok(endpoint) = ProviderEndpoint::new(ready.clone(), provider_store, provider()) else {
         panic!("the provider endpoint binds");
     };
@@ -1389,6 +1104,7 @@ async fn a_work_id_alone_releases_nothing() {
         assert_eq!(
             service
                 .with_state(|state| state.jobs().next().map(JobState::phase))
+                .await
                 .expect("the endpoint is reachable"),
             Some(JobPhase::Ready),
             "{name} leaves the answer where it was",
@@ -1425,13 +1141,14 @@ async fn a_transport_without_an_exporter_delivers_nothing() {
     let provider_root = temp();
     let client_root = temp();
     let ready = ready();
-    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
-    let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR);
+    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR).await;
+    let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR).await;
     let (id, _) = accept(
         &work_policy(),
         &mut [&mut client_store, &mut provider_store],
         1,
-    );
+    )
+    .await;
     let Ok(endpoint) = ProviderEndpoint::new(ready.clone(), provider_store, provider()) else {
         panic!("the provider endpoint binds");
     };
@@ -1475,6 +1192,7 @@ async fn a_transport_without_an_exporter_delivers_nothing() {
     assert_eq!(
         service
             .with_state(|state| state.jobs().next().map(JobState::phase))
+            .await
             .expect("the endpoint is reachable"),
         Some(JobPhase::Ready),
         "nothing was released",
@@ -1518,13 +1236,14 @@ async fn live_prefix_precedes_terminal_and_reserves_delivery_credit() {
     let client_root = temp();
     let provider_root = temp();
     let ready = ready();
-    let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR);
-    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
+    let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR).await;
+    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR).await;
     let (id, _) = accept(
         &work_policy(),
         &mut [&mut client_store, &mut provider_store],
         1,
-    );
+    )
+    .await;
     let service =
         WorkService::new(ProviderEndpoint::new(ready.clone(), provider_store, provider()).unwrap());
     let release = Arc::new(tokio::sync::Notify::new());
@@ -1540,27 +1259,34 @@ async fn live_prefix_precedes_terminal_and_reserves_delivery_credit() {
     let serving = serve(server_transport, service.clone());
     let mut endpoint = ClientEndpoint::new(ready.clone(), client_store, client()).unwrap();
     let mut prefixes = 0;
-    let delivered = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        fetch_result_stream(transport, &mut endpoint, &ready, id, |_| {
-            assert!(
-                !computation.is_finished(),
-                "live tokens must not await completion"
-            );
-            assert_eq!(
-                service
-                    .with_state(|state| state.job_by_id(id).map(JobState::phase))
-                    .unwrap(),
-                Some(JobPhase::Streaming)
-            );
-            prefixes += 1;
-            release.notify_one();
-            Ok(())
-        }),
-    )
+    let prefix_seen = tokio::sync::Notify::new();
+    let (delivery, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::join!(
+            fetch_result_stream(transport, &mut endpoint, &ready, id, |_| {
+                assert!(
+                    !computation.is_finished(),
+                    "live tokens must not await completion"
+                );
+                prefixes += 1;
+                prefix_seen.notify_one();
+                Ok(())
+            }),
+            async {
+                prefix_seen.notified().await;
+                assert_eq!(
+                    service
+                        .with_state(|state| state.job_by_id(id).map(JobState::phase))
+                        .await
+                        .unwrap(),
+                    Some(JobPhase::Streaming)
+                );
+                release.notify_one();
+            }
+        )
+    })
     .await
-    .expect("stream must make progress")
-    .expect("signed delivery succeeds");
+    .expect("stream must make progress");
+    let delivered = delivery.expect("signed delivery succeeds");
     assert_eq!(prefixes, 1);
     assert!(matches!(
         computation.await.unwrap(),
@@ -1573,6 +1299,7 @@ async fn live_prefix_precedes_terminal_and_reserves_delivery_credit() {
     assert_eq!(
         service
             .with_state(|state| state.job_by_id(id).map(JobState::phase))
+            .await
             .unwrap(),
         Some(JobPhase::Delivered)
     );
@@ -1580,7 +1307,7 @@ async fn live_prefix_precedes_terminal_and_reserves_delivery_credit() {
     let _ = serving.await;
     drop(service);
     drop(endpoint);
-    let recovered = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
+    let recovered = store_at(provider_root.path(), &ready, Role::Provider, CURSOR).await;
     let job = recovered.state().job_by_id(id).unwrap();
     assert_eq!(job.phase(), JobPhase::Delivered);
     assert_eq!(job.transcript(), delivered.transcript);
@@ -1602,19 +1329,22 @@ async fn paid_stream_checks_status_and_terminal_shape_before_recording_delivery(
         let client_root = temp();
         let provider_root = temp();
         let ready = ready();
-        let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR);
-        let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR);
+        let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR).await;
+        let mut provider_store =
+            store_at(provider_root.path(), &ready, Role::Provider, CURSOR).await;
         let (id, _) = accept(
             &work_policy(),
             &mut [&mut client_store, &mut provider_store],
             1,
-        );
+        )
+        .await;
         let service = WorkService::new(
             ProviderEndpoint::new(ready.clone(), provider_store, provider()).unwrap(),
         );
         run_to_result(&service, &ready, id).await;
         let delivered = service
             .deliver(&delivery_request(ready.channel(), id), &EXPORTER)
+            .await
             .unwrap();
         let event = WorkStreamEvent {
             outcome: Some(work_stream_event::Outcome::Delivered(WorkDelivered {
@@ -1636,7 +1366,9 @@ async fn paid_stream_checks_status_and_terminal_shape_before_recording_delivery(
                     if status != WireCode::Ok {
                         events.push(Err(WireStatus::new(status, "delivery interrupted")));
                     }
-                    Ok(futures::stream::iter(events))
+                    Ok(hellas_rpc::call::ResponseStream::new(
+                        futures::stream::iter(events),
+                    ))
                 },
             )
             .await
@@ -1679,14 +1411,5 @@ async fn paid_stream_checks_status_and_terminal_shape_before_recording_delivery(
         assert_eq!(recovered, delivered);
         serving.abort();
         let _ = serving.await;
-    }
-}
-
-fn payment_policy() -> hellas_rpc::protocol::work::JobPaymentPolicyV2 {
-    hellas_rpc::protocol::work::JobPaymentPolicyV2 {
-        fixed_price: PRICE,
-        dispatch_margin_blocks: 4,
-        delivery_margin_blocks: 2,
-        oracle_grace_blocks: 6,
     }
 }

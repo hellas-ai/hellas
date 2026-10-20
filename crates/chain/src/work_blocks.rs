@@ -152,6 +152,7 @@ where
                 Terms::work_stake_bond(payment_terms.bond_terms.clone()),
             )
         })
+        .await
         .map_err(|error| PaidWorkClockError::Decision(CloseError::Endpoint(error)))?;
     let bond_edge = query.bond_edge;
     let Some(snapshot) = source
@@ -167,7 +168,10 @@ where
         });
     };
 
-    let adjudication = match service.adjudicated_close(&snapshot.observed_channel()) {
+    let adjudication = match service
+        .adjudicated_close(&snapshot.observed_channel())
+        .await
+    {
         Ok(tx) => Some(
             source
                 .submit(tx)
@@ -305,9 +309,8 @@ impl<C: LightClient> FinalizedBlocks for WorkBlocks<C> {
             txs: view
                 .txs()
                 .iter()
-                .filter_map(|tx| match tx {
-                    Transaction::Kernel(kernel) => Some(kernel.clone()),
-                    _ => None,
+                .map(|tx| match tx {
+                    Transaction::Kernel(kernel) => kernel.clone(),
                 })
                 .collect(),
         }))
@@ -333,6 +336,7 @@ mod tests {
 
     use commonware_glue::stateful::db::{DatabaseSet, Merkleized as _, Unmerkleized as _};
     use commonware_runtime::{Handle, Supervisor as _};
+    use hellas_auth::Digest as ProtocolDigest;
     use hellas_kernel::{
         BlockHash, BlockHeight, CoinId, Context as KernelContext, EdgeId, EdgeValues, Fees,
         Funding, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Move, Parties, Party, Payout,
@@ -341,15 +345,15 @@ mod tests {
     };
     use hellas_rpc::call::WithTrailer;
     use hellas_rpc::pb::work::{ExchangeSetupRequest, exchange_setup_response::Outcome};
-    use hellas_rpc::protocol::work::{
-        EvaluatePolicyV2, PaidChannelPolicyV1, private_policy_commitment,
-    };
-    use hellas_rpc::protocol::work_setup::{
-        ProviderChannelPolicy, WorkChannelConfig, WorkChannelDescriptor,
-    };
-    use hellas_rpc::protocol::{ContentId, Digest as ProtocolDigest};
+    use hellas_rpc::protocol::ContentId;
     use hellas_rpc::services::work_setup::WorkSetupHandler;
     use hellas_wire::TransportContext;
+    use hellas_work::model::setup::{
+        ProviderChannelPolicy, WorkChannelConfig, WorkChannelDescriptor,
+    };
+    use hellas_work::model::work::{
+        EvaluatePolicyV2, PaidChannelPolicyV1, private_policy_commitment,
+    };
     use hellas_work::work_close::{BlockSourceError, adjudicated_close, close_start};
     use hellas_work::work_handshake::{PaymentAdmission, SetupEndpoint, SetupService};
     use hellas_work::work_open::{SetupAdvance, SetupProgress, SetupStep, advance_setup};
@@ -414,19 +418,20 @@ mod tests {
         )
     }
 
-    /// The genesis coin allocated to the client, and the one allocated
-    /// to the provider. Allocation order fixes the two ids.
     fn client_coin() -> CoinId {
-        CoinId::from_bytes(genesis_object_id(0).into())
+        CoinId::from_bytes(genesis_object_id(0).0)
     }
 
     fn provider_coin() -> CoinId {
-        CoinId::from_bytes(genesis_object_id(1).into())
+        CoinId::from_bytes(genesis_object_id(1).0)
     }
 
     fn bond_terms() -> WorkStakeBondTerms {
         WorkStakeBondTerms {
-            parties: Parties::new(provider().party_key(), client().party_key()),
+            parties: Parties::new(
+                hellas_kernel::PartyKeys::sole(provider().party_key()),
+                hellas_kernel::PartyKeys::sole(client().party_key()),
+            ),
             timeout: BlockHeight::new(HORIZON),
             timeout_outputs: List::take(
                 [Payout::new(provider().party_key(), STAKE); MAX_EDGE_OUTPUTS],
@@ -596,7 +601,8 @@ mod tests {
         /// one, executes it, finalizes it, and indexes it.
         async fn seal(&mut self) -> HellasBlock {
             let pending = self.mempool.test_transactions().await;
-            let fresh = pending[self.sealed..].to_vec();
+            let mut fresh = Vec::new();
+            fresh.extend_from_slice(&pending[self.sealed..]);
             self.sealed = pending.len();
             self.height += 1;
 
@@ -648,27 +654,39 @@ mod tests {
         scan: SetupScan,
     ) {
         let mut proposer = SetupEndpoint::new(
-            open_store(provider_root, Role::Provider),
+            open_store(provider_root, Role::Provider).await,
             provider(),
             PaymentAdmission::Admits(Box::new(provider_policy())),
         );
-        proposer.arm_scan(scan).expect("the provider arms its scan");
-        if let Err(error) = proposer.propose_bond(TEST_NETWORK, bond_funding(), bond_terms()) {
+        proposer
+            .arm_scan(scan)
+            .await
+            .expect("the provider arms its scan");
+        if let Err(error) = proposer
+            .propose_bond(TEST_NETWORK, bond_funding(), bond_terms())
+            .await
+        {
             panic!("the provider proposes its bond: {error}");
         }
         let service = SetupService::new(proposer);
         let mut caller = SetupEndpoint::new(
-            open_store(client_root, Role::Client),
+            open_store(client_root, Role::Client).await,
             client(),
             PaymentAdmission::Proposes(Box::new(provider_policy())),
         );
 
         let proposal = exchange(&service, Vec::new()).await;
-        if let Err(error) = caller.import(&proposal) {
+        if let Err(error) = caller.import(&proposal).await {
             panic!("the client imports the bond proposal: {error}");
         }
-        caller.arm_scan(scan).expect("the client arms its scan");
-        if let Err(error) = caller.propose_payment(payment_funding, payment_terms()) {
+        caller
+            .arm_scan(scan)
+            .await
+            .expect("the client arms its scan");
+        if let Err(error) = caller
+            .propose_payment(payment_funding, payment_terms())
+            .await
+        {
             panic!("the client proposes its payment: {error}");
         }
         let offered = caller
@@ -677,7 +695,7 @@ mod tests {
             .map(<[u8]>::to_vec)
             .expect("the client holds revision 2");
         let countersigned = exchange(&service, offered).await;
-        if let Err(error) = caller.import(&countersigned) {
+        if let Err(error) = caller.import(&countersigned).await {
             panic!("the client imports the countersigned payment: {error}");
         }
         assert_eq!(caller.state().revision(), Some(3));
@@ -707,14 +725,16 @@ mod tests {
         }
     }
 
-    fn open_store(root: &std::path::Path, role: Role) -> SetupStore {
+    async fn open_store(root: &std::path::Path, role: Role) -> SetupStore {
         match SetupStore::open(
             root,
             TEST_NETWORK,
             bond_edge(),
             role,
             &Secp256k1Verifier::new(),
-        ) {
+        )
+        .await
+        {
             Ok(store) => store,
             Err(error) => panic!("the setup journal opens: {error}"),
         }
@@ -763,12 +783,12 @@ mod tests {
                 scan_at(&floor),
             )
             .await;
-            let mut provider_store = open_store(provider_root.path(), Role::Provider);
+            let mut provider_store = open_store(provider_root.path(), Role::Provider).await;
 
             // The client, at the same state, has nothing to do. Both
             // submissions are the provider's, and the client's journal
             // says so rather than trying to make one.
-            let mut client_store = open_store(client_root.path(), Role::Client);
+            let mut client_store = open_store(client_root.path(), Role::Client).await;
             assert_eq!(
                 step(&blocks, &blocks, &mut client_store).await,
                 SetupProgress::AwaitingCounterparty,
@@ -792,7 +812,7 @@ mod tests {
                 "a sink that refuses is an error, got {refused:?}",
             );
             drop(provider_store);
-            let mut provider_store = open_store(provider_root.path(), Role::Provider);
+            let mut provider_store = open_store(provider_root.path(), Role::Provider).await;
             assert!(
                 provider_store.state().bond_submitted(),
                 "the bond submission was journaled before it was broadcast",
@@ -840,7 +860,7 @@ mod tests {
             // The client's own journal, driven by the same function,
             // reaches the same origin. It submits nothing: every step
             // above was the provider's.
-            let mut client_store = open_store(client_root.path(), Role::Client);
+            let mut client_store = open_store(client_root.path(), Role::Client).await;
             assert_eq!(
                 step(&blocks, &blocks, &mut client_store).await,
                 SetupProgress::Complete(origin),
@@ -851,12 +871,14 @@ mod tests {
             drop(client_store);
             assert_eq!(
                 open_store(provider_root.path(), Role::Provider)
+                    .await
                     .state()
                     .origin(),
                 Some(origin),
             );
             assert_eq!(
                 open_store(client_root.path(), Role::Client)
+                    .await
                     .state()
                     .origin(),
                 Some(origin),
@@ -881,7 +903,7 @@ mod tests {
                 expected_values(),
                 "the funded edge is the one the provider's policy expected",
             );
-            let recovered = open_store(provider_root.path(), Role::Provider);
+            let recovered = open_store(provider_root.path(), Role::Provider).await;
             let armed = recovered
                 .state()
                 .close_descriptor()
@@ -937,7 +959,7 @@ mod tests {
             // Crash after the real handshake export. The only values kept
             // outside the dead process are the portable Opens the peer got.
             let (bond_open, payment_open) = {
-                let recovered = open_store(provider_root.path(), Role::Provider);
+                let recovered = open_store(provider_root.path(), Role::Provider).await;
                 (
                     recovered.state().bond_open().expect("portable bond Open"),
                     recovered
@@ -1009,7 +1031,7 @@ mod tests {
                 "the real finalized history contains the adjudicated payment Close",
             );
 
-            let mut restarted = open_store(provider_root.path(), Role::Provider);
+            let mut restarted = open_store(provider_root.path(), Role::Provider).await;
             let mounted = step(&blocks, &blocks, &mut restarted).await;
             assert!(
                 matches!(mounted, SetupProgress::CloseOnly { settled: true, .. }),
@@ -1037,7 +1059,7 @@ mod tests {
 
             let verifier = Secp256k1Verifier::new();
             let bond_open = {
-                let mut provider_store = open_store(provider_root.path(), Role::Provider);
+                let mut provider_store = open_store(provider_root.path(), Role::Provider).await;
                 let retained = provider_store.state().bond_open().expect("retained Open");
                 let refused = advance_setup(
                     &blocks,
@@ -1051,7 +1073,7 @@ mod tests {
                 retained
             };
 
-            let mut restarted = open_store(provider_root.path(), Role::Provider);
+            let mut restarted = open_store(provider_root.path(), Role::Provider).await;
             let blocked = restarted.commit(
                 SetupRecord::Ended {
                     outcome: SetupEnd::Aborted(SetupAbort::PaymentFundingSpent),
@@ -1059,7 +1081,7 @@ mod tests {
                 &verifier,
             );
             assert!(matches!(
-                blocked,
+                blocked.await,
                 Err(WorkStoreError::Setup(
                     SetupStateError::SubmittedOpenUnresolved
                 ))
@@ -1072,7 +1094,7 @@ mod tests {
                 .await;
             chain.seal().await;
 
-            let mut restarted = open_store(provider_root.path(), Role::Provider);
+            let mut restarted = open_store(provider_root.path(), Role::Provider).await;
             advance_setup(&blocks, &blocks, &blocks, &mut restarted, &verifier)
                 .await
                 .expect("the finalized Open is applied before the next setup decision");
@@ -1085,12 +1107,14 @@ mod tests {
                 "after catching up, the driver immediately submits the payment Open",
             );
             assert!(matches!(
-                restarted.commit(
-                    SetupRecord::Ended {
-                        outcome: SetupEnd::Aborted(SetupAbort::PaymentFundingSpent),
-                    },
-                    &verifier,
-                ),
+                restarted
+                    .commit(
+                        SetupRecord::Ended {
+                            outcome: SetupEnd::Aborted(SetupAbort::PaymentFundingSpent),
+                        },
+                        &verifier,
+                    )
+                    .await,
                 Err(WorkStoreError::Setup(
                     SetupStateError::SubmittedOpenUnresolved
                 ))
@@ -1125,7 +1149,7 @@ mod tests {
             )
             .await;
 
-            let mut provider_store = open_store(provider_root.path(), Role::Provider);
+            let mut provider_store = open_store(provider_root.path(), Role::Provider).await;
             assert_eq!(
                 step(&blocks, &blocks, &mut provider_store).await,
                 SetupProgress::Aborted(SetupAbort::PaymentFundingSpent),
@@ -1141,6 +1165,7 @@ mod tests {
             drop(provider_store);
             assert_eq!(
                 open_store(provider_root.path(), Role::Provider)
+                    .await
                     .state()
                     .end(),
                 Some(SetupEnd::Aborted(SetupAbort::PaymentFundingSpent)),
@@ -1180,7 +1205,7 @@ mod tests {
             .await;
 
             // The bond, posted by something that is not this driver.
-            let mut provider_store = open_store(provider_root.path(), Role::Provider);
+            let mut provider_store = open_store(provider_root.path(), Role::Provider).await;
             let bond_open = provider_store
                 .state()
                 .bond_open()
@@ -1238,8 +1263,8 @@ mod tests {
         }
     }
 
-    fn payment_policy() -> hellas_rpc::protocol::work::JobPaymentPolicyV2 {
-        hellas_rpc::protocol::work::JobPaymentPolicyV2 {
+    fn payment_policy() -> hellas_work::model::work::JobPaymentPolicyV2 {
+        hellas_work::model::work::JobPaymentPolicyV2 {
             fixed_price: 10,
             dispatch_margin_blocks: 4,
             delivery_margin_blocks: 2,

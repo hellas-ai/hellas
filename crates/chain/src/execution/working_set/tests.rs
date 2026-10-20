@@ -1,7 +1,7 @@
 use super::*;
 use hellas_kernel::{
     Auth, CloseKind, Funding, Genesis, Key, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Parties,
-    PayloadHash, Payout, ProtocolCode, Sig, SigVerifier, State, Terms, Tx,
+    PartyAuth, PartyKeys, PayloadHash, Payout, ProtocolCode, Sig, SigVerifier, State, Terms, Tx,
 };
 
 const MAKER: Key = Key::from_bytes([0xaa; Key::LENGTH]);
@@ -36,7 +36,7 @@ fn load_apply_replay_round_trip() {
     // id it touches; pre-load each into the working set.
     let terms = Terms::basic(
         ProtocolCode::new(1),
-        Parties::new(MAKER, TAKER),
+        Parties::new(PartyKeys::sole(MAKER), PartyKeys::sole(TAKER)),
         hellas_kernel::BlockHeight::new(2),
         payouts(10, 5),
     );
@@ -47,8 +47,8 @@ fn load_apply_replay_round_trip() {
     let open = Tx::open(
         funding,
         terms.clone(),
-        Auth::native(Sig::placeholder(MAKER, open_hash)),
-        Auth::native(Sig::placeholder(TAKER, open_hash)),
+        PartyAuth::owner(Auth::native(Sig::placeholder(MAKER, open_hash))),
+        PartyAuth::owner(Auth::native(Sig::placeholder(TAKER, open_hash))),
     );
 
     let close_outputs = payouts(10, 5);
@@ -63,8 +63,8 @@ fn load_apply_replay_round_trip() {
     let close = Tx::close(
         edge,
         hellas_kernel::Proof::mutual(
-            Auth::native(Sig::placeholder(MAKER, close_hash)),
-            Auth::native(Sig::placeholder(TAKER, close_hash)),
+            PartyAuth::owner(Auth::native(Sig::placeholder(MAKER, close_hash))),
+            PartyAuth::owner(Auth::native(Sig::placeholder(TAKER, close_hash))),
         ),
         close_outputs,
     );

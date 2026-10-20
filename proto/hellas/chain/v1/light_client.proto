@@ -36,7 +36,9 @@ service LightClient {
   rpc SubmitWorkResponse(SubmitWorkResponseRequest) returns (SubmitTxResponse);
   rpc SubscribeActivity(SubscribeActivityRequest) returns (stream ActivityEvent);
   rpc GetValidators(GetValidatorsRequest) returns (GetValidatorsResponse);
-  rpc GetCoinsByOwner(GetCoinsByOwnerRequest) returns (GetCoinsByOwnerResponse);
+  rpc GetCoinsByOwner(GetCoinsByOwnerRequest) returns (GetCoinsResponse);
+  // Coins delegated to this node, without counting them as its owned balance.
+  rpc GetCoinsByDelegate(GetCoinsByDelegateRequest) returns (GetCoinsResponse);
   rpc GetEdgesByOwner(GetEdgesByOwnerRequest) returns (GetEdgesByOwnerResponse);
   rpc GetRelayInfo(GetRelayInfoRequest) returns (GetRelayInfoResponse);
   rpc GetConsensusInfo(GetConsensusInfoRequest) returns (GetConsensusInfoResponse);
@@ -61,6 +63,8 @@ message GetCoinRequest {
 message GetCoinResponse {
   optional bytes owner = 1;
   optional uint64 value = 2;
+  // The key the coin is delegated to, absent for an undelegated coin.
+  optional bytes delegate = 3;
 }
 
 message GetEdgeRequest {
@@ -126,9 +130,10 @@ message GetFinalizedBlockResponse {
 }
 
 message SubmitTxRequest {
+  // 1 and 2 were the deleted chain-side transfer and merge.
+  reserved 1, 2;
+  reserved "transfer", "merge_coin";
   oneof tx {
-    TransferTx transfer = 1;
-    MergeCoinTx merge_coin = 2;
     bytes kernel_tx = 3;
   }
 }
@@ -137,24 +142,6 @@ message SubmitTxRequest {
 // carries no transport identity or caller-supplied admission key.
 message SubmitWorkResponseRequest {
   bytes response = 1;
-}
-
-message WebAuthnSignature {
-  bytes ecdsa_signature = 1;
-  bytes authenticator_data = 2;
-  bytes client_data_json = 3;
-}
-
-message TransferTx {
-  bytes input = 1;
-  bytes recipient = 2;
-  uint64 amount = 3;
-  WebAuthnSignature signature = 4;
-}
-
-message MergeCoinTx {
-  repeated bytes inputs = 1;
-  WebAuthnSignature signature = 2;
 }
 
 enum SubmitTxOutcome {
@@ -202,12 +189,16 @@ message GetCoinsByOwnerRequest {
   bytes owner = 1;
 }
 
+message GetCoinsByDelegateRequest {
+  bytes delegate = 1;
+}
+
 message CoinEntry {
   bytes object_id = 1;
   uint64 value = 2;
 }
 
-message GetCoinsByOwnerResponse {
+message GetCoinsResponse {
   FinalizedSnapshot snapshot = 1;
   repeated CoinEntry coins = 2;
 }

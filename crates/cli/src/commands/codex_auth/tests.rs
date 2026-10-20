@@ -1,13 +1,8 @@
 use super::*;
-#[cfg(feature = "node")]
 use axum::Router;
-#[cfg(feature = "node")]
 use axum::extract::State;
-#[cfg(feature = "node")]
 use axum::routing::post;
-#[cfg(feature = "node")]
 use serde_json::json;
-#[cfg(feature = "node")]
 use std::sync::Arc;
 
 #[test]
@@ -83,7 +78,6 @@ fn v1_auth_state_without_account_id_remains_loadable() {
     .unwrap();
     let store = CodexAuthStore::new(Some(&path)).unwrap();
     assert_eq!(store.load().unwrap().tokens.account_id, None);
-    #[cfg(feature = "node")]
     assert!(matches!(
         store.account_id(),
         Err(CodexAuthError::MissingAccountId)
@@ -112,7 +106,6 @@ fn import_rejects_invalid_account_ids() {
     }
 }
 
-#[cfg(feature = "node")]
 #[tokio::test]
 async fn refresh_rotates_tokens() {
     #[derive(Clone)]
@@ -164,20 +157,22 @@ async fn refresh_rotates_tokens() {
     assert!(body.contains("client_id=app_EMoamEEZ73f0CkXaXp7hrann"));
 }
 
-#[cfg(feature = "node")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_refreshes_do_not_block_the_async_runtime_or_rotate_twice() {
     #[derive(Clone)]
     struct RefreshState {
         calls: Arc<std::sync::atomic::AtomicUsize>,
         access_token: String,
+        started: Arc<tokio::sync::Notify>,
+        finish: Arc<tokio::sync::Semaphore>,
     }
 
     async fn token(State(state): State<RefreshState>) -> axum::Json<JsonValue> {
         state
             .calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        state.started.notify_one();
+        let _finish = state.finish.acquire().await.unwrap();
         axum::Json(json!({
             "access_token": state.access_token,
             "refresh_token": "new-refresh"
@@ -187,11 +182,15 @@ async fn concurrent_refreshes_do_not_block_the_async_runtime_or_rotate_twice() {
     let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"exp":4102444800}"#);
     let access_token = format!("header.{payload}.signature");
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let started = Arc::new(tokio::sync::Notify::new());
+    let finish = Arc::new(tokio::sync::Semaphore::new(0));
     let app = Router::new()
         .route("/token", post(token))
         .with_state(RefreshState {
             calls: Arc::clone(&calls),
             access_token: access_token.clone(),
+            started: started.clone(),
+            finish: finish.clone(),
         });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -215,22 +214,33 @@ async fn concurrent_refreshes_do_not_block_the_async_runtime_or_rotate_twice() {
         ))
         .unwrap();
 
-    let refreshes = (0..16).map(|_| {
-        let store = store.clone();
-        async move { store.access_token().await }
-    });
-    let tokens = tokio::time::timeout(Duration::from_secs(2), futures::future::join_all(refreshes))
+    let ready = Arc::new(tokio::sync::Barrier::new(17));
+    let refreshes: Vec<_> = (0..16)
+        .map(|_| {
+            let store = store.clone();
+            let ready = ready.clone();
+            tokio::spawn(async move {
+                ready.wait().await;
+                store.access_token().await
+            })
+        })
+        .collect();
+    ready.wait().await;
+    // Probe runtime progress while a refresh holds the file lock. Finishing
+    // all sixteen reads and the durable token write is not a liveness clock.
+    tokio::time::timeout(Duration::from_secs(2), started.notified())
         .await
         .expect("file-lock contention must not block Tokio workers");
+    finish.add_permits(1);
+    let tokens = futures::future::join_all(refreshes).await;
     assert!(
         tokens
             .into_iter()
-            .all(|token| matches!(token, Ok(token) if token == access_token))
+            .all(|token| matches!(token, Ok(Ok(token)) if token == access_token))
     );
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
-#[cfg(feature = "node")]
 #[tokio::test]
 async fn terminal_refresh_error_blocks_token() {
     async fn token() -> (axum::http::StatusCode, axum::Json<JsonValue>) {
@@ -267,16 +277,15 @@ async fn terminal_refresh_error_blocks_token() {
     assert!(store.load().unwrap().refresh_token_blocked.is_some());
 }
 
-#[cfg(feature = "node")]
 #[tokio::test]
-async fn persisted_terminal_refresh_diagnostic_is_bounded() {
+async fn refresh_errors_never_return_or_persist_upstream_content() {
     async fn token() -> (axum::http::StatusCode, axum::Json<JsonValue>) {
         (
             axum::http::StatusCode::BAD_REQUEST,
             axum::Json(json!({
                 "error": {
                     "code": "invalid_grant",
-                    "message": "x".repeat(MAX_REFRESH_ERROR_MESSAGE_BYTES * 2),
+                    "message": format!("PRIVATE_REFRESH_CANARY{}", "x".repeat(4_096)),
                 }
             })),
         )
@@ -304,16 +313,23 @@ async fn persisted_terminal_refresh_diagnostic_is_bounded() {
         ))
         .unwrap();
 
-    assert!(store.access_token().await.is_err());
+    let error = store.access_token().await.unwrap_err().to_string();
+    assert!(!error.contains("PRIVATE_REFRESH_CANARY"), "{error}");
     let blocked = store
         .load()
         .unwrap()
         .refresh_token_blocked
         .expect("terminal error is persisted");
-    assert_eq!(blocked.message.len(), MAX_REFRESH_ERROR_MESSAGE_BYTES);
+    assert!(blocked.message.len() < 256);
+    assert!(!blocked.message.contains("PRIVATE_REFRESH_CANARY"));
+    // A stored reason from an older writer is not safe diagnostic input either.
+    let mut state = store.load().unwrap();
+    state.refresh_token_blocked.as_mut().unwrap().message = "PRIVATE_REFRESH_CANARY".into();
+    store.save(&state).unwrap();
+    let repeated = store.access_token().await.unwrap_err().to_string();
+    assert!(!repeated.contains("PRIVATE_REFRESH_CANARY"));
 }
 
-#[cfg(feature = "node")]
 #[tokio::test]
 async fn oversized_refresh_body_is_retryable_and_never_persisted() {
     async fn token() -> String {
@@ -347,7 +363,6 @@ async fn oversized_refresh_body_is_retryable_and_never_persisted() {
     assert!(store.load().unwrap().refresh_token_blocked.is_none());
 }
 
-#[cfg(feature = "node")]
 #[tokio::test]
 async fn malformed_refresh_success_is_retryable() {
     async fn token() -> axum::Json<JsonValue> {

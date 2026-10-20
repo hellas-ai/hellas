@@ -16,13 +16,13 @@ mod support;
 
 use hellas_kernel::{
     ApplyError, Batch, BlockHash, BlockHeight, Coin, CoinId, Context, Edge, EdgeId, Funding,
-    Genesis, InsertError, KernelResult, Key, List, MAX_EDGE_OUTPUTS, Parties, Payout, Proof,
-    ProtocolCode, RegistryChunk, RegistryChunkId, State, Store, Terms, Tx,
+    Genesis, InsertError, KernelResult, Key, List, MAX_EDGE_OUTPUTS, Parties, PartyKeys, Payout,
+    Proof, ProtocolCode, RegistryChunk, RegistryChunkId, State, Store, Terms, Tx,
 };
 use support::{
     FAKE_VERIFIER, coin_id, key, list,
     map_store::{MapStore, MapTx, map_state},
-    open_tx,
+    open,
 };
 
 const TIMEOUT: BlockHeight = BlockHeight::new(2);
@@ -50,15 +50,26 @@ fn payouts(
 fn map_store_round_trip() {
     let maker = key(7);
     let taker = key(8);
-    let parties = Parties::new(maker, taker);
+    let parties = Parties::new(PartyKeys::sole(maker), PartyKeys::sole(taker));
     let maker_coin = coin_id(1);
     let taker_coin = coin_id(2);
     let outputs = payouts(maker, taker, 7, 8);
     let terms = Terms::basic(ProtocolCode::new(1), parties, TIMEOUT, outputs.clone());
     let funding_value = Funding::new(list(&[maker_coin]), list(&[taker_coin]));
     let edge = Tx::edge_id_of(&funding_value, &terms);
-    let open = open_tx(funding_value, terms.clone(), maker, taker);
-    let resolve = Tx::close(edge, Proof::timeout(terms), outputs);
+    let open = open(
+        funding_value,
+        terms.clone(),
+        (
+            hellas_kernel::PartyKeys::sole(maker),
+            hellas_kernel::Authority::Owner,
+        ),
+        (
+            hellas_kernel::PartyKeys::sole(taker),
+            hellas_kernel::Authority::Owner,
+        ),
+    );
+    let resolve = Tx::close(edge, Proof::timeout(terms, None), outputs);
 
     let mut state = map_state([
         Genesis::coin(maker_coin, maker, 10),
@@ -93,7 +104,7 @@ fn map_store_handles_long_chain() {
     const N: usize = 32;
     let maker = key(7);
     let taker = key(8);
-    let parties = Parties::new(maker, taker);
+    let parties = Parties::new(PartyKeys::sole(maker), PartyKeys::sole(taker));
     let payout_outputs = payouts(maker, taker, 7, 8);
     let terms = Terms::basic(ProtocolCode::new(1), parties, TIMEOUT, payout_outputs);
 
@@ -110,9 +121,20 @@ fn map_store_handles_long_chain() {
     for _ in 0..N {
         let funding_value = Funding::new(list(&[maker_coin]), list(&[taker_coin]));
         let edge = Tx::edge_id_of(&funding_value, &terms);
-        let open = open_tx(funding_value, terms.clone(), maker, taker);
+        let open = open(
+            funding_value,
+            terms.clone(),
+            (
+                hellas_kernel::PartyKeys::sole(maker),
+                hellas_kernel::Authority::Owner,
+            ),
+            (
+                hellas_kernel::PartyKeys::sole(taker),
+                hellas_kernel::Authority::Owner,
+            ),
+        );
         let outputs = payouts(maker, taker, 7, 8);
-        let resolve = Tx::close(edge, Proof::timeout(terms.clone()), outputs.clone());
+        let resolve = Tx::close(edge, Proof::timeout(terms.clone(), None), outputs.clone());
         // The two payout coins from this resolve become the next open's
         // funding. Compute them before consuming `resolve`.
         let resolved_outputs = Tx::close_output_ids(edge, &outputs);
@@ -147,6 +169,10 @@ fn map_store_handles_long_chain() {
 // ---------------------------------------------------------------------
 
 /// One specific way a batch can violate the [`Batch`] contract.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "one fixture value per test; an edge is the thing being swapped"
+)]
 #[derive(Debug, Clone, Copy)]
 enum Sabotage {
     /// `remove_coin` claims every slot is empty.
@@ -263,14 +289,25 @@ fn scenario() -> (State<MapStore>, Tx, Tx, EdgeId) {
     let outputs = payouts(maker, taker, 7, 8);
     let terms = Terms::basic(
         ProtocolCode::new(1),
-        Parties::new(maker, taker),
+        Parties::new(PartyKeys::sole(maker), PartyKeys::sole(taker)),
         TIMEOUT,
         outputs.clone(),
     );
     let funding = Funding::new(list(&[maker_coin]), list(&[taker_coin]));
     let edge = Tx::edge_id_of(&funding, &terms);
-    let open = open_tx(funding, terms.clone(), maker, taker);
-    let close = Tx::close(edge, Proof::timeout(terms), outputs);
+    let open = open(
+        funding,
+        terms.clone(),
+        (
+            hellas_kernel::PartyKeys::sole(maker),
+            hellas_kernel::Authority::Owner,
+        ),
+        (
+            hellas_kernel::PartyKeys::sole(taker),
+            hellas_kernel::Authority::Owner,
+        ),
+    );
+    let close = Tx::close(edge, Proof::timeout(terms, None), outputs);
     let state = map_state([
         Genesis::coin(maker_coin, maker, 10),
         Genesis::coin(taker_coin, taker, 5),
@@ -299,13 +336,13 @@ fn snapshot(store: &MapStore) -> Snapshot {
 /// contract-violation error and that the backing store is untouched.
 fn assert_sabotaged_apply(
     inner: MapStore,
-    mode: Sabotage,
+    mode: &Sabotage,
     context: Context,
     op: &Tx,
     expected: &ApplyError,
 ) {
     let before = snapshot(&inner);
-    let mut state = State::new(SabotageStore { inner, mode });
+    let mut state = State::new(SabotageStore { inner, mode: *mode });
 
     assert_eq!(state.apply(context, &FAKE_VERIFIER, op), Err(*expected));
     assert_eq!(snapshot(&state.into_store().inner), before);
@@ -320,7 +357,7 @@ fn fold_surfaces_coin_contract_violations_without_committing() {
 
     assert_sabotaged_apply(
         store,
-        Sabotage::LoseCoinOnRemove,
+        &Sabotage::LoseCoinOnRemove,
         CONTEXT,
         &open,
         &ApplyError::MissingCoin { id: maker_coin },
@@ -329,7 +366,7 @@ fn fold_surfaces_coin_contract_violations_without_committing() {
     let (state, open, _, _) = scenario();
     assert_sabotaged_apply(
         state.into_store(),
-        Sabotage::SwapCoinOnRemove(decoy),
+        &Sabotage::SwapCoinOnRemove(decoy),
         CONTEXT,
         &open,
         &ApplyError::CoinChanged { id: maker_coin },
@@ -351,7 +388,7 @@ fn fold_surfaces_edge_contract_violations_without_committing() {
     let output = Tx::close_output_ids(edge, &payouts(key(7), key(8), 7, 8)).as_slice()[0];
     assert_sabotaged_apply(
         store,
-        Sabotage::RejectCoinInsert,
+        &Sabotage::RejectCoinInsert,
         TIMEOUT_CONTEXT,
         &close,
         &ApplyError::CoinInsertRejected {
@@ -363,7 +400,7 @@ fn fold_surfaces_edge_contract_violations_without_committing() {
     let (store, close, edge) = opened();
     assert_sabotaged_apply(
         store,
-        Sabotage::LoseEdgeOnRemove,
+        &Sabotage::LoseEdgeOnRemove,
         TIMEOUT_CONTEXT,
         &close,
         &ApplyError::MissingEdge { id: edge },
@@ -373,7 +410,7 @@ fn fold_surfaces_edge_contract_violations_without_committing() {
     let (mut other, _, _, _) = scenario();
     let other_terms = Terms::basic(
         ProtocolCode::new(2),
-        Parties::new(key(7), key(8)),
+        Parties::new(PartyKeys::sole(key(7)), PartyKeys::sole(key(8))),
         TIMEOUT,
         payouts(key(7), key(8), 10, 5),
     );
@@ -383,7 +420,18 @@ fn fold_surfaces_edge_contract_violations_without_committing() {
         .apply(
             CONTEXT,
             &FAKE_VERIFIER,
-            &open_tx(other_funding, other_terms, key(7), key(8)),
+            &open(
+                other_funding,
+                other_terms,
+                (
+                    hellas_kernel::PartyKeys::sole(key(7)),
+                    hellas_kernel::Authority::Owner,
+                ),
+                (
+                    hellas_kernel::PartyKeys::sole(key(8)),
+                    hellas_kernel::Authority::Owner,
+                ),
+            ),
         )
         .expect("decoy open accepted");
     let decoy = other.store().edge(other_edge).expect("decoy edge live");
@@ -391,7 +439,7 @@ fn fold_surfaces_edge_contract_violations_without_committing() {
     let (store, close, edge) = opened();
     assert_sabotaged_apply(
         store,
-        Sabotage::SwapEdgeOnRemove(decoy),
+        &Sabotage::SwapEdgeOnRemove(decoy),
         TIMEOUT_CONTEXT,
         &close,
         &ApplyError::EdgeChanged { id: edge },

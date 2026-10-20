@@ -19,7 +19,7 @@ shapes intentionally have different trust boundaries:
 | Application | Root and trusted computation | Outside that guarantee |
 | --- | --- | --- |
 | `hellas/catena-gpu-0.0.1`, `causal-lm-0.0.1` | Exact Catena program, entrypoint, content-addressed static objects and borrowed slices, state sizing, vocabulary, capacity, and token-native invocation/result | Model acquisition, provider GPU/backend choice, tokenizer, chat template, text decoding, and API presentation |
-| `hellas/fetch-0.0.1`, `codex-responses-0.0.1` or `openai-responses-0.0.1` | A strict stateless Responses field set; typed reconstruction of provider-shaped JSON; `stream=true` and upstream `store=false`; the exact official Codex or OpenAI HTTPS endpoint; no redirects; and SSE response projection | The truth, correctness, and availability of the adversarial upstream service; provider route label; credentials/auth-file location; and access policy |
+| `hellas/fetch-0.0.1`, `codex-responses-0.0.1` or `openai-responses-0.0.2` | A strict stateless Responses field set; typed reconstruction of provider-shaped JSON; `stream=true` and upstream `store=false`; the exact official Codex or OpenAI HTTPS endpoint; no redirects; and SSE response projection | The truth, correctness, and availability of the adversarial upstream service; provider route label; credentials/auth-file location; and access policy |
 
 For causal LM work, the request and transcript bind the manifest, input token
 IDs, maximum output, explicit stop IDs, output token IDs, and termination.
@@ -37,9 +37,8 @@ A platform-backed Assurance authenticates the Fetch application. The
 it does not authenticate a running binary. The sealed Responses adaptor sends
 `store=false` upstream and accepts text and client-executed function tools.
 
-Work is the only execution protocol. This milestone supports payment-funded
-channels. Owner and principal grants share the Work protocol, including
-`gateway --machine` and sealed Fetch. Delegated project tracks remain a later milestone. Ticket execution, shadow verification, public retained-artifact
+Work is the execution protocol for payment-funded channels and owner, principal
+and delegated grants, including `gateway --offer` and sealed Fetch. Ticket execution, shadow verification, public retained-artifact
 retrieval and CacheControl have been removed. Work-side local reproduction
 remains available. Accepted paid inputs and results remain in the channel's
 recovery/evidence journal, independently of gateway archive settings.
@@ -129,16 +128,19 @@ the manifest ID is used.
 
 Configure a funded pool using the [paid gateway guide](docs/paid-gateway.md),
 then pass `--paid-work-config POOL` together with `--environment` and
-`--tokenizer`. The former in-process local route awaits owner grant funding.
+`--tokenizer`. Local execution requires an explicitly provisioned owner grant.
 
-It binds loopback by default. Non-loopback listening requires `--allow-remote`
-and `--bearer-token-file FILE`; the private credential file is created once and
-reused across restarts. Without a file, a fresh credential is shown on the
-controlling terminal. The causal-LM backend accepts plain text at
+It binds loopback by default; non-loopback listening requires `--allow-remote`.
+Every gateway requires a private `--gateway-profile FILE` selecting a provisioned
+local Auth authority and a bearer credential scoped to `gateway.invoke`.
+See [HTTP authority provisioning](docs/admin.md#http-gateway-authority). The causal-LM backend accepts plain text at
 `/v1/completions` and `/v1/responses`. Set `--chat-template` to enable the shared
 model adapter for chat, reasoning and tool calls supported by that model.
 The proxy Responses backend retains its explicit upstream semantics.
-The unpaid attested Fetch Responses backend awaits grant funding. `--responses-backend` changes only `/v1/responses`; every other
+A pinned Responses Offer uses `gateway --offer ALIAS --work-profile FILE` and
+the shared SDK Responses gateway; it exposes `/v1/responses` without a local
+causal-LM environment. See the [HTTP gateway guide](docs/http-gateway.md#responses-grants).
+`--responses-backend` changes only `/v1/responses`; every other
 route remains bound to the causal-LM environment, so `--environment` and
 `--tokenizer` are still required.
 
@@ -155,7 +157,7 @@ Monitor discovery and peer health with `hellas-cli monitor --timeout-secs 30`.
 
 ## Chain
 
-The `chain` feature provides `chain query`, `chain open`, and `chain close`.
+The standard CLI includes `chain query`, `chain open`, and `chain close`.
 The `indexer` feature adds `chain indexer follow`; the `validator` feature adds
 `chain validator config`, `chain validator run`, and
 `chain validator check-config`.
@@ -177,9 +179,8 @@ takes the same committed payouts and `--terms-file FILE`, with no signer
 options.
 
 Stored ownership uses raw, untagged 33-byte settlement keys. P-256 and
-secp256k1 keys can own stored coins. Legacy `Transfer` and `MergeCoin`
-verification remains P-256-only, and genesis owner strings must decode as
-P-256 keys when the validator config is loaded.
+secp256k1 keys can own stored coins. The single kernel `Auth` verifier selects
+the curve from the authorization variant.
 
 Given two P-256 key files whose settlement keys each own a 100-value coin:
 
@@ -193,7 +194,7 @@ MAKER_COIN=maker-coin-id
 TAKER_COIN=taker-coin-id
 
 OPEN=$(
-  cargo run --no-default-features --features chain -- chain open \
+  cargo run -- chain open \
     --rpc "$RPC" \
     --maker-key "$MAKER_KEY" --maker-auth webauthn \
     --taker-key "$TAKER_KEY" --taker-auth webauthn \
@@ -205,21 +206,21 @@ OPEN=$(
 EDGE_ID=$(printf '%s\n' "$OPEN" | awk '$1 == "edge_id" { print $2 }')
 
 # After the open finalizes:
-PAYLOAD=$(cargo run --no-default-features --features chain -- \
+PAYLOAD=$(cargo run -- \
   chain query --rpc "$RPC" latest-block | awk '$1 == "payload" { print $2 }')
-cargo run --no-default-features --features chain -- \
+cargo run -- \
   chain query --rpc "$RPC" edge --object-id "$EDGE_ID" --payload "$PAYLOAD"
 
-cargo run --no-default-features --features chain -- chain close \
+cargo run -- chain close \
   --rpc "$RPC" --edge-id "$EDGE_ID" --kind mutual \
   --payout "$MAKER_OWNER:100" --payout "$TAKER_OWNER:100" \
   --maker-key "$MAKER_KEY" --maker-auth webauthn \
   --taker-key "$TAKER_KEY" --taker-auth webauthn
 
 # After the close finalizes:
-cargo run --no-default-features --features chain -- \
+cargo run -- \
   chain query --rpc "$RPC" coins-by-owner --owner "$MAKER_OWNER"
-cargo run --no-default-features --features chain -- \
+cargo run -- \
   chain query --rpc "$RPC" coins-by-owner --owner "$TAKER_OWNER"
 ```
 

@@ -12,8 +12,8 @@ mod support;
 
 use hellas_kernel::{
     ApplyError, Auth, BlockHash, BlockHeight, CoinId, Context, Funding, Genesis, InvalidOpenReason,
-    Key, List, MAX_EDGE_OUTPUTS, Parties, PayloadHash, Payout, ProtocolCode, Sig, SigVerifier,
-    SoftPasskey, Terms, Tx, verify_webauthn_assertion,
+    Key, List, MAX_EDGE_OUTPUTS, Parties, PartyAuth, PartyKeys, PayloadHash, Payout, ProtocolCode,
+    Sig, SigVerifier, SoftPasskey, Terms, Tx, verify_webauthn_assertion,
 };
 use support::{FixedStore, coin_id, list, state};
 
@@ -50,7 +50,7 @@ fn keypair(seed: u8) -> SoftPasskey {
 }
 
 fn make_terms(maker: Key, protocol: u8) -> Terms {
-    let parties = Parties::new(maker, TAKER);
+    let parties = Parties::new(PartyKeys::sole(maker), PartyKeys::sole(TAKER));
     let outputs: List<Payout, MAX_EDGE_OUTPUTS> = support::payouts(&[(maker, 7), (TAKER, 8)]);
     Terms::basic(ProtocolCode::new(protocol), parties, TIMEOUT, outputs)
 }
@@ -72,8 +72,8 @@ fn webauthn_open_auth_is_checked_in_kernel() {
     let open = Tx::open(
         funding,
         terms,
-        Auth::webauthn(maker_assertion),
-        Auth::native(taker_sig),
+        PartyAuth::owner(Auth::webauthn(maker_assertion)),
+        PartyAuth::owner(Auth::native(taker_sig)),
     );
     let mut state = state(
         FixedStore::empty([MAKER_COIN, TAKER_COIN], [edge]),
@@ -108,8 +108,8 @@ fn webauthn_open_rejects_wrong_challenge() {
     let open = Tx::open(
         funding,
         terms,
-        Auth::webauthn(maker_assertion),
-        Auth::native(taker_sig),
+        PartyAuth::owner(Auth::webauthn(maker_assertion)),
+        PartyAuth::owner(Auth::native(taker_sig)),
     );
     let mut state = state(
         FixedStore::empty([MAKER_COIN, TAKER_COIN], [edge]),
@@ -143,8 +143,8 @@ fn webauthn_open_rejects_assertion_from_wrong_party_key() {
     let open = Tx::open(
         funding,
         terms,
-        Auth::webauthn(maker_assertion),
-        Auth::native(taker_sig),
+        PartyAuth::owner(Auth::webauthn(maker_assertion)),
+        PartyAuth::owner(Auth::native(taker_sig)),
     );
     let mut state = state(
         FixedStore::empty([MAKER_COIN, TAKER_COIN], [edge]),
@@ -194,7 +194,7 @@ fn bundled_verifier_accepts_passkey_open_and_mutual_close() {
     let outputs = support::payouts(&[(maker_key, 7), (taker_key, 8)]);
     let terms = Terms::basic(
         ProtocolCode::new(1),
-        Parties::new(maker_key, taker_key),
+        Parties::new(PartyKeys::sole(maker_key), PartyKeys::sole(taker_key)),
         TIMEOUT,
         outputs.clone(),
     );
@@ -208,8 +208,8 @@ fn bundled_verifier_accepts_passkey_open_and_mutual_close() {
     let open = Tx::open(
         funding,
         terms,
-        secp_sign(&maker_sk, open_hash),
-        Auth::webauthn(taker_assertion),
+        PartyAuth::owner(secp_sign(&maker_sk, open_hash)),
+        PartyAuth::owner(Auth::webauthn(taker_assertion)),
     );
     let mut state = state(
         FixedStore::empty([MAKER_COIN, TAKER_COIN, maker_out, taker_out], [edge]),
@@ -240,8 +240,8 @@ fn bundled_verifier_accepts_passkey_open_and_mutual_close() {
     let close = Tx::close(
         edge,
         Proof::mutual(
-            secp_sign(&maker_sk, close_hash),
-            Auth::webauthn(taker_close_assertion),
+            PartyAuth::owner(secp_sign(&maker_sk, close_hash)),
+            PartyAuth::owner(Auth::webauthn(taker_close_assertion)),
         ),
         outputs,
     );
@@ -264,4 +264,88 @@ fn bundled_verifier_accepts_passkey_open_and_mutual_close() {
             .map(hellas_kernel::Coin::value),
         Some(8),
     );
+}
+
+/// The delegation the identity cutover exists for, under the bundled
+/// production verifier with real keys on both curves: a passkey owner
+/// delegates a coin to a native node key with a `WebAuthn`-authorized
+/// reshape, and the node stakes it in a work bond under its own
+/// secp256k1 signature as the owner's signer. Neither key signs for the
+/// other: the node's signature claiming the owner's authority is refused.
+#[cfg(feature = "secp256k1")]
+#[test]
+fn a_passkey_owner_delegates_to_a_native_node_that_stakes_under_it() {
+    use hellas_kernel::{
+        ApplyOutcome, Authority, Coin, Edge, MAX_EDGE_INPUTS, Reshape, Secp256k1Signer,
+        Secp256k1Verifier, WorkStakeBondTerms,
+    };
+
+    let verifier = Secp256k1Verifier::new();
+    let owner = keypair(5);
+    let node = Secp256k1Signer::from_secret_scalar([6; 32]).expect("non-zero scalar");
+    let client = Secp256k1Signer::from_secret_scalar([7; 32]).expect("non-zero scalar");
+    let o = owner.party_key();
+    let n = node.party_key();
+    let mut state = support::map_store::map_state([Genesis::coin(MAKER_COIN, o, 10)]);
+
+    // The passkey reshapes its coin into one delegated to the node.
+    let inputs: List<CoinId, MAX_EDGE_INPUTS> = list(&[MAKER_COIN]);
+    let outputs: List<Payout, MAX_EDGE_OUTPUTS> = list(&[Payout::delegated(o, Some(n), 10)]);
+    let hash = Reshape::payload_hash(support::NETWORK, &inputs, &outputs);
+    let delegation = Tx::Owner(Reshape::new(
+        inputs.clone(),
+        outputs.clone(),
+        Auth::webauthn(owner.sign(hash).expect("fixture signing succeeds")),
+    ));
+    let outcome: ApplyOutcome = state
+        .apply(CONTEXT, &verifier, &delegation)
+        .expect("the passkey reshapes its own coin");
+    assert!(outcome.public_event().is_some());
+    let coin = Reshape::output_ids(support::NETWORK, &inputs, &outputs).as_slice()[0];
+    assert_eq!(state.store().coin(coin), Some(Coin::issue(o, Some(n), 10)));
+
+    // The node stakes it, as the owner's signer, back to itself.
+    let maker = PartyKeys::new(o, n, Some(n));
+    let bond = Terms::work_stake_bond(WorkStakeBondTerms {
+        parties: Parties::new(maker, PartyKeys::sole(client.party_key())),
+        timeout: TIMEOUT,
+        timeout_outputs: list(&[maker.payout(10, false)]),
+        max_job_price: 1,
+    });
+    let funding = Funding::new(list(&[coin]), list(&[]));
+    let open_hash = Tx::open_hash(support::NETWORK, &funding, &bond);
+    let open = |maker_auth: PartyAuth| {
+        Tx::open(
+            funding.clone(),
+            bond.clone(),
+            maker_auth,
+            PartyAuth::owner(client.sign(open_hash)),
+        )
+    };
+    let edge = Tx::edge_id_of(&funding, &bond);
+
+    // The node's signature does not stand in for the owner's.
+    assert_eq!(
+        state.apply(
+            CONTEXT,
+            &verifier,
+            &open(PartyAuth::new(
+                Authority::Owner,
+                Auth::native(node.sign(open_hash))
+            ))
+        ),
+        Err(ApplyError::InvalidOpen {
+            output: edge,
+            reason: InvalidOpenReason::BadSignature,
+        }),
+    );
+    state
+        .apply(
+            CONTEXT,
+            &verifier,
+            &open(PartyAuth::signer(node.sign(open_hash))),
+        )
+        .expect("the node stakes the coin delegated to it");
+    assert_eq!(state.store().edge(edge).map(Edge::value), Some(10));
+    assert_eq!(state.store().coin(coin), None);
 }

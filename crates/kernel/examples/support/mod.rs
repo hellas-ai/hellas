@@ -264,6 +264,23 @@ pub(crate) fn summarize(event: &EventKind) -> String {
                 outputs.join(", "),
             )
         }
+        EventKind::CoinsReshaped { inputs, outputs } => {
+            let inputs: Vec<String> = inputs
+                .as_slice()
+                .iter()
+                .map(|id| short(id.as_bytes()))
+                .collect();
+            let outputs: Vec<String> = outputs
+                .as_slice()
+                .iter()
+                .map(|id| short(id.as_bytes()))
+                .collect();
+            format!(
+                "CoinsReshaped(inputs=[{}], outputs=[{}])",
+                inputs.join(", "),
+                outputs.join(", "),
+            )
+        }
     }
 }
 

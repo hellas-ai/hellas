@@ -3,6 +3,8 @@ use std::path::PathBuf;
 /// Errors retain the admission/payment stage and the original typed cause.
 #[derive(Debug, thiserror::Error)]
 pub enum PaidClientError {
+    #[error(transparent)]
+    Authority(#[from] hellas_work::work_store::grant::NodeStoreError),
     #[error("invalid paid-work options: {0}")]
     InvalidOptions(&'static str),
     #[error("paid input does not match {0}")]
@@ -40,9 +42,9 @@ pub enum PaidClientError {
     #[error(transparent)]
     Canonical(#[from] hellas_rpc::protocol::value::CanonicalDecodeError),
     #[error(transparent)]
-    Work(#[from] hellas_rpc::protocol::work::PaidWorkError),
+    Work(#[from] hellas_work::model::work::PaidWorkError),
     #[error(transparent)]
-    WorkSetup(#[from] hellas_rpc::protocol::work_setup::WorkSetupError),
+    WorkSetup(#[from] hellas_work::model::setup::WorkSetupError),
     #[error(transparent)]
     Store(#[from] hellas_work::work_store::WorkStoreError),
     #[error(transparent)]

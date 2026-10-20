@@ -1,14 +1,14 @@
 use super::*;
 use hellas_kernel::NetworkId;
-use hellas_rpc::peers::PeerId;
+use hellas_wire::peers::PeerId;
 
 #[test]
 fn relative_deadlines_are_ordered_from_the_current_cursor() {
     let args = RunArgs {
+        grant_config: "grant.json".into(),
         chain_node: Default::default(),
-        provider_genesis: hellas_rpc::ContentId::from_bytes([1; 32]),
-        apple_app_id: None,
-        apple_cd_hashes: Vec::new(),
+        trust_store: "trust".into(),
+        trust_policy: "provider".into(),
         work_config: "work.json".into(),
         journal_root: "journal".into(),
         provider: SecretKey::generate().public(),
@@ -61,7 +61,7 @@ fn peer_id_hex_is_the_route_spelling() {
 #[test]
 fn terms_are_bound_to_the_configured_network() {
     let network = NetworkId::new("paid-work-cli-test").unwrap();
-    let policy = hellas_rpc::protocol::work::PaidChannelPolicyV1 {
+    let policy = hellas_work::model::work::PaidChannelPolicyV1 {
         compute_credit_limit: 4,
         delivery_credit_limit: 5,
     };
@@ -75,10 +75,10 @@ fn terms_are_bound_to_the_configured_network() {
     );
 }
 
-#[cfg(feature = "llm")]
 #[test]
 fn prepare_input_builds_a_bundle_from_an_environment_and_prompt() {
-    use hellas_rpc::{CausalLmEnvironment, ContentId, ContentRef, PublicKey};
+    use hellas_auth::PublicKey;
+    use hellas_rpc::{CausalLmEnvironment, ContentId, ContentRef};
 
     let root = tempfile::tempdir().unwrap();
     let environment_path = root.path().join("model.environment");
@@ -108,8 +108,8 @@ fn prepare_input_builds_a_bundle_from_an_environment_and_prompt() {
     let settlement = Secp256k1Signer::from_secret_scalar([7; 32]).unwrap();
     prepare_input(
         PrepareInputArgs {
-            environment: environment_path,
-            tokenizer: tokenizer_path,
+            environment: environment_path.clone(),
+            tokenizer: tokenizer_path.clone(),
             prompt: "hello world".to_owned(),
             max_new_tokens: 8,
             stop_token_ids: vec![2],
@@ -143,20 +143,53 @@ fn prepare_input_builds_a_bundle_from_an_environment_and_prompt() {
         parts.evaluate_request.execution_environment,
         environment.manifest().content_id(),
     );
+    for (name, prompt, max_new_tokens, stop_token_ids) in [
+        ("capacity", "hello world", 127, vec![2]),
+        ("empty", "", 8, vec![]),
+        ("stop", "hello world", 8, vec![3]),
+    ] {
+        let out = root.path().join(format!("{name}.bin"));
+        let result = prepare_input(
+            PrepareInputArgs {
+                environment: environment_path.clone(),
+                tokenizer: tokenizer_path.clone(),
+                prompt: prompt.into(),
+                max_new_tokens,
+                stop_token_ids,
+                out: out.clone(),
+            },
+            &transport,
+            &settlement,
+        );
+        assert!(
+            result.is_err(),
+            "{name} must be refused before writing a bundle"
+        );
+        assert!(!out.exists(), "{name}");
+    }
 }
 #[test]
 fn prepare_fetch_signs_an_ephemeral_client_request() {
     let root = tempfile::tempdir().unwrap();
     let payload_file = root.path().join("request.json");
     let out = root.path().join("input.bin");
+    let descriptor = hellas_rpc::FetchContract::new(
+        "example-responses-1",
+        hellas_rpc::FetchSchema::StatelessResponsesV1,
+        "example-driver-1",
+        hellas_rpc::FetchEgress::FixedHttps("https://example.com/responses".into()),
+    )
+    .unwrap();
+    let contract = root.path().join("contract.json");
+    std::fs::write(&contract, serde_json::to_vec(&descriptor).unwrap()).unwrap();
     std::fs::write(&payload_file, br#"{"input":"private prompt"}"#).unwrap();
-    let key = hellas_rpc::ProducerSigningKey::from_secret_bytes([7; 32]).unwrap();
+    let key = hellas_auth::ProducerSigningKey::from_secret_bytes([7; 32]).unwrap();
     prepare_fetch(
         PrepareFetchArgs {
             assurance: "producer-signed".into(),
             service: "openai".into(),
             method: "responses".into(),
-            execution_environment: "openai-responses".into(),
+            contract,
             payload_file,
             out: out.clone(),
         },
@@ -171,6 +204,7 @@ fn prepare_fetch_signs_an_ephemeral_client_request() {
     assert_eq!(request.retention, hellas_rpc::Retention::Ephemeral);
     assert_eq!(request.caller_key, key.public_key());
     assert_eq!(request.execution_environment, parts.manifest.content_id());
+    assert_eq!(parts.contract, descriptor);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;

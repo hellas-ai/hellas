@@ -1,81 +1,51 @@
 use super::*;
 
-#[cfg(all(feature = "cloud", unix))]
-#[path = "cloud_tests.rs"]
-mod cloud;
+#[cfg(unix)]
+mod machines;
 
-#[cfg(feature = "gateway")]
 const TEST_ENVIRONMENT: &str = "/path/to/model.environment";
-#[cfg(feature = "gateway")]
 const TEST_MANIFEST_ID: &str = "4444444444444444444444444444444444444444444444444444444444444444";
-#[cfg(feature = "gateway")]
 const TEST_TOKENIZER: &str = "/path/to/tokenizer.json";
-#[cfg(feature = "evaluate")]
 const TEST_CONTENT: &str = "/path/to/model.hex";
-const TEST_PROVIDER: &str = "1111111111111111111111111111111111111111111111111111111111111111";
-const TEST_APP_ID: &str = "2F53L9ZR3N.ai.hellas.app";
-const TEST_CDHASHES: &str = "2222222222222222222222222222222222222222222222222222222222222222,3333333333333333333333333333333333333333333333333333333333333333";
 const TEST_REMOTE_TRUST_ARGS: &[&str] = &[
-    "--provider",
-    TEST_PROVIDER,
+    "--trust-store",
+    "/state/trust",
+    "--trust-policy",
+    "provider",
     "--assurance",
     "apple-app-attest",
-    "--apple-app-attest-app-id",
-    TEST_APP_ID,
-    "--apple-app-attest-cdhashes",
-    TEST_CDHASHES,
 ];
 
-#[cfg(feature = "gateway")]
 fn assert_test_remote_trust(remote_trust: &RemoteTrustArgs) {
     assert_eq!(
-        remote_trust.provider_genesis,
-        Some(hellas_rpc::ContentId::from_bytes([0x11; 32]))
+        remote_trust.trust_store.as_deref(),
+        Some(Path::new("/state/trust"))
     );
+    assert_eq!(remote_trust.trust_policy.as_deref(), Some("provider"));
     assert_eq!(
         remote_trust.assurance,
         hellas_rpc::Assurance::AppleAppAttest
     );
-    assert_eq!(
-        remote_trust.apple_app_attest_app_id.as_deref(),
-        Some(TEST_APP_ID)
-    );
-    assert_eq!(
-        remote_trust.apple_app_attest_cdhashes,
-        vec![[0x22; 32], [0x33; 32]]
-    );
 }
 
-#[cfg(feature = "gateway")]
-fn fetch_environment_cases() -> [(&'static str, hellas_rpc::ContentId); 3] {
-    [
-        (
-            "codex-responses",
-            hellas_rpc::FetchEnvironment::CodexResponses.manifest_id(),
-        ),
-        (
-            "openai-responses",
-            hellas_rpc::FetchEnvironment::OpenAiResponses.manifest_id(),
-        ),
-        (
-            "0909090909090909090909090909090909090909090909090909090909090909",
-            hellas_rpc::ContentId::from_bytes([9; 32]),
-        ),
-    ]
+fn fetch_environment_cases() -> [(&'static str, hellas_rpc::ContentId); 1] {
+    [(
+        "0909090909090909090909090909090909090909090909090909090909090909",
+        hellas_rpc::ContentId::from_bytes([9; 32]),
+    )]
 }
 
-#[cfg(feature = "gateway")]
 fn parse_gateway(args: &[&str]) -> Result<Cli, clap::Error> {
-    #[cfg(feature = "evaluate")]
-    let local = args.contains(&"--local");
-    #[cfg(feature = "evaluate")]
-    let local_content: &[&str] = if local {
-        &["--content", TEST_CONTENT]
+    let local_content: &[&str] = if args.contains(&"--local") {
+        &[
+            "--content",
+            TEST_CONTENT,
+            "--local-grant",
+            "07070707070707070707070707070707",
+        ]
     } else {
         &[]
     };
-    #[cfg(not(feature = "evaluate"))]
-    let local_content: &[&str] = &[];
     Cli::try_parse_from(
         [
             "hellas",
@@ -91,10 +61,8 @@ fn parse_gateway(args: &[&str]) -> Result<Cli, clap::Error> {
     )
 }
 
-#[cfg(feature = "gateway")]
 fn causal_lm_args(command: Commands) -> CausalLmArgs {
     match command {
-        #[cfg(feature = "gateway")]
         Commands::Gateway { causal_lm, .. } => causal_lm.expect("causal-LM arguments"),
         _ => panic!("expected causal-LM command"),
     }
@@ -186,7 +154,6 @@ fn remote_trust_flags_are_rejected_by_irrelevant_commands() {
     }
 }
 
-#[cfg(feature = "node")]
 #[test]
 fn serve_accepts_only_its_command_local_assurance() {
     let cli = Cli::try_parse_from(["hellas", "serve", "--assurance", "apple-app-attest"]).unwrap();
@@ -211,7 +178,6 @@ fn serve_accepts_only_its_command_local_assurance() {
     }
 }
 
-#[cfg(feature = "gateway")]
 #[test]
 fn gateway_accepts_remote_trust_policy() {
     let cli = parse_gateway(TEST_REMOTE_TRUST_ARGS).unwrap();
@@ -221,7 +187,6 @@ fn gateway_accepts_remote_trust_policy() {
     assert_test_remote_trust(&remote_trust);
 }
 
-#[cfg(feature = "gateway")]
 #[test]
 fn gateway_accepts_the_optional_environment_pin() {
     let pinned = causal_lm_args(
@@ -235,7 +200,6 @@ fn gateway_accepts_the_optional_environment_pin() {
     );
 }
 
-#[cfg(feature = "gateway")]
 #[test]
 fn gateway_requires_explicit_environment_and_tokenizer() {
     assert!(Cli::try_parse_from(["hellas", "gateway"]).is_err());
@@ -245,7 +209,6 @@ fn gateway_requires_explicit_environment_and_tokenizer() {
     assert!(Cli::try_parse_from(["hellas", "gateway", "--tokenizer", TEST_TOKENIZER]).is_err());
 }
 
-#[cfg(all(feature = "gateway", feature = "node"))]
 #[test]
 fn http_gateway_requires_a_paid_pool() {
     assert!(
@@ -264,7 +227,6 @@ fn http_gateway_requires_a_paid_pool() {
     );
 }
 
-#[cfg(feature = "gateway")]
 #[test]
 fn gateway_model_is_only_an_optional_api_label() {
     let args = causal_lm_args(parse_gateway(&["--model", "api-label"]).unwrap().command);
@@ -273,94 +235,6 @@ fn gateway_model_is_only_an_optional_api_label() {
     assert!(args.model.is_none());
 }
 
-#[cfg(feature = "evaluate")]
-#[test]
-fn local_content_flags_are_scoped_to_local_modes() {
-    assert!(parse_gateway(&["--content", TEST_CONTENT]).is_err());
-    assert!(parse_gateway(&["--content-index", "/state/index.bin"]).is_err());
-}
-
-#[cfg(feature = "evaluate")]
-#[test]
-fn local_modes_accept_repeatable_content_and_roots() {
-    let cli = Cli::try_parse_from([
-        "hellas",
-        "gateway",
-        "--environment",
-        TEST_ENVIRONMENT,
-        "--tokenizer",
-        TEST_TOKENIZER,
-        "--local",
-        "--content",
-        "/content/program.hex",
-        "--content",
-        "/content/weights.bin",
-        "--content-root",
-        "/content/cache",
-        "--content-index",
-        "/state/index.bin",
-    ])
-    .unwrap();
-    let args = causal_lm_args(cli.command);
-    assert_eq!(
-        args.content_paths,
-        ["/content/program.hex", "/content/weights.bin"].map(PathBuf::from)
-    );
-    assert_eq!(args.content_roots, vec![PathBuf::from("/content/cache")]);
-    assert_eq!(args.content_index, Some(PathBuf::from("/state/index.bin")));
-}
-
-#[cfg(feature = "evaluate")]
-#[test]
-fn gateway_local_modes_require_and_accept_explicit_content() {
-    let cli = parse_gateway(&["--local"]).unwrap();
-    match cli.command {
-        Commands::Gateway {
-            causal_lm,
-            node_id,
-            node_addrs,
-            local,
-            ..
-        } => {
-            assert!(node_id.is_none());
-            assert!(node_addrs.is_empty());
-            assert!(local);
-            assert_eq!(
-                causal_lm.unwrap().content_paths,
-                vec![PathBuf::from(TEST_CONTENT)]
-            );
-        }
-        _ => panic!("expected gateway command"),
-    }
-
-    assert!(
-        Cli::try_parse_from([
-            "hellas",
-            "gateway",
-            "--environment",
-            TEST_ENVIRONMENT,
-            "--tokenizer",
-            TEST_TOKENIZER,
-            "--local",
-        ])
-        .is_err(),
-        "a local route without explicit content was accepted"
-    );
-}
-
-#[cfg(feature = "evaluate")]
-#[test]
-fn gateway_rejects_local_with_node_id() {
-    let result = parse_gateway(&[
-        "--local",
-        "--node-id",
-        "bb18ebc065d836ecc7e1f33972d2c17eac9894cd33ce4916f66cb1165ccc7550",
-    ]);
-
-    assert!(result.is_err());
-}
-
-#[cfg(feature = "gateway")]
 fn gateway_trust(args: &[&str]) -> anyhow::Result<Option<hellas_client::ProviderTrustAnchor>> {
     let cli = parse_gateway(args).expect("valid gateway arguments");
     let Commands::Gateway {
@@ -372,7 +246,6 @@ fn gateway_trust(args: &[&str]) -> anyhow::Result<Option<hellas_client::Provider
     gateway_provider_trust(responses_backend)
 }
 
-#[cfg(feature = "gateway")]
 #[test]
 fn gateway_rejects_address_without_node_id() {
     let result = parse_gateway(&["--address", "127.0.0.1:31145"]);
@@ -380,14 +253,13 @@ fn gateway_rejects_address_without_node_id() {
     assert!(result.is_err());
 }
 
-#[cfg(feature = "node")]
 #[test]
 fn admin_target_is_shared_and_requires_an_identity_pin() {
-    for operation in [vec!["users", "list"], vec!["repair-resource", "chat"]] {
+    for operation in [vec!["status"], vec!["grant", "change.json"]] {
         for before in [true, false] {
             let target = [
-                "--contact",
-                "node.contact",
+                "--node",
+                "node.enrollment",
                 "--address",
                 "127.0.0.1:9000,[::1]:9000",
             ];
@@ -402,12 +274,12 @@ fn admin_target_is_shared_and_requires_an_identity_pin() {
             let Commands::Admin(args) = Cli::try_parse_from(argv).unwrap().command else {
                 panic!("admin");
             };
-            assert_eq!(args.node_contact, Some(PathBuf::from("node.contact")));
+            assert_eq!(args.node_enrollment.as_deref(), Some("node.enrollment"));
             assert_eq!(args.addresses.len(), 2);
         }
         for invalid in [
             vec!["--address", "127.0.0.1:9000"],
-            vec!["--contact", "node.contact", "--control-socket", "node.sock"],
+            vec!["--node", "node.enrollment", "--control-socket", "node.sock"],
             vec!["--store-dir", "store"],
             vec!["--output-cache", "off"],
         ] {
@@ -419,7 +291,6 @@ fn admin_target_is_shared_and_requires_an_identity_pin() {
     }
 }
 
-#[cfg(feature = "node")]
 #[test]
 fn serve_rejects_software_root_with_apple_assurance() {
     assert!(validate_serve_assurance(true, hellas_rpc::Assurance::AppleAppAttest, None).is_err());
@@ -441,20 +312,17 @@ fn serve_rejects_software_root_with_apple_assurance() {
     );
 }
 
-#[cfg(feature = "gateway")]
 #[test]
 fn gateway_accepts_explicit_stop_tokens() {
     let cli = parse_gateway(&["--stop-token", "1,2", "--stop-token", "3"]).unwrap();
     assert_eq!(causal_lm_args(cli.command).stop_token_ids, vec![1, 2, 3]);
 }
 
-#[cfg(feature = "gateway")]
 #[test]
 fn gateway_rejects_a_zero_default_output_limit() {
     assert!(parse_gateway(&["--default-max-tokens", "0"]).is_err());
 }
 
-#[cfg(feature = "gateway")]
 #[test]
 fn gateway_wrap_forwards_trailing_args() {
     let cli = parse_gateway(&["--wrap", "pi", "--", "-p", "--no-session", "say hello"]).unwrap();
@@ -469,16 +337,14 @@ fn gateway_wrap_forwards_trailing_args() {
     }
 }
 
-#[cfg(feature = "gateway")]
 #[test]
 fn gateway_wrap_args_require_wrap() {
     let result = parse_gateway(&["--", "-p", "hi"]);
     assert!(result.is_err(), "trailing args without --wrap should error");
 }
 
-#[cfg(feature = "gateway")]
 #[test]
-fn gateway_fetch_backend_accepts_builtin_environment_aliases_and_exact_id() {
+fn gateway_fetch_backend_accepts_exact_contract_id() {
     for (spelling, expected) in fetch_environment_cases() {
         let cli = parse_gateway(&[
             "--responses-backend",
@@ -514,88 +380,28 @@ fn gateway_fetch_backend_accepts_builtin_environment_aliases_and_exact_id() {
 }
 
 #[test]
-fn producer_key_show_accepts_global_identity_path() {
+fn identity_show_holder_accepts_global_identity_path() {
     let cli = Cli::try_parse_from([
         "hellas",
         "--identity",
         "/tmp/hellas-identity",
-        "producer-key",
-        "show",
+        "identity",
+        "show-holder",
     ])
     .unwrap();
     assert_eq!(
         cli.identity.as_deref(),
         Some(std::path::Path::new("/tmp/hellas-identity"))
     );
-    match cli.command {
-        Commands::ProducerKey {
-            command: ProducerKeyCommand::Show,
-        } => {}
-        _ => panic!("expected producer-key show command"),
-    }
-}
-
-#[cfg(all(feature = "node", feature = "evaluate"))]
-#[test]
-fn serve_accepts_gpu_resource_envelope() {
-    let cli = Cli::try_parse_from([
-        "hellas",
-        "serve",
-        "--gpu-backend",
-        "cuda",
-        "--gpu-session-programs",
-        "3",
-        "--gpu-session-asset-bytes",
-        "5",
-        "--gpu-max-generation-capacity",
-        "7",
-        "--gpu-max-generation-device-bytes",
-        "11",
-        "--gpu-compile-timeout-secs",
-        "13",
-        "--gpu-execution-timeout-secs",
-        "17",
-    ])
-    .unwrap();
-    match cli.command {
-        Commands::Serve {
-            gpu_backend,
-            gpu_session_programs,
-            gpu_session_asset_bytes,
-            gpu_max_generation_capacity,
-            gpu_max_generation_device_bytes,
-            gpu_compile_timeout_secs,
-            gpu_execution_timeout_secs,
-            ..
-        } => {
-            assert_eq!(gpu_backend, hellas_executor::GpuBackend::Cuda);
-            assert_eq!(gpu_session_programs, 3);
-            assert_eq!(gpu_session_asset_bytes, 5);
-            assert_eq!(gpu_max_generation_capacity, 7);
-            assert_eq!(gpu_max_generation_device_bytes, 11);
-            assert_eq!(gpu_compile_timeout_secs, 13);
-            assert_eq!(gpu_execution_timeout_secs, 17);
+    assert!(matches!(
+        cli.command,
+        Commands::Identity {
+            command: IdentityCommand::ShowHolder
         }
-        _ => panic!("expected serve command"),
-    }
+    ));
+    assert!(Cli::try_parse_from(["hellas", "producer-key", "show"]).is_err());
 }
 
-#[cfg(all(feature = "node", feature = "evaluate"))]
-#[test]
-fn serve_rejects_a_generation_capacity_above_the_transport_bound() {
-    let over_limit = (hellas_executor::MAX_GPU_GENERATION_CAPACITY + 1).to_string();
-    assert!(
-        Cli::try_parse_from([
-            "hellas",
-            "serve",
-            "--gpu-max-generation-capacity",
-            &over_limit,
-        ])
-        .is_err()
-    );
-}
-
-#[cfg(feature = "node")]
 #[test]
 fn serve_accepts_work_config() {
     let cli = Cli::try_parse_from(["hellas", "serve", "--work-config", "/tmp/work.json"]).unwrap();
@@ -612,7 +418,6 @@ fn serve_accepts_work_config() {
 
 /// An offer names every term of the bond it stakes, and the coins it
 /// stakes them with come one flag at a time.
-#[cfg(feature = "node")]
 #[test]
 fn provision_accepts_the_terms_of_one_bond() {
     let cli = Cli::try_parse_from([
@@ -620,6 +425,10 @@ fn provision_accepts_the_terms_of_one_bond() {
         "provision",
         "--work-config",
         "/tmp/work.json",
+        "--grant-config",
+        "grant.json",
+        "--client-contact",
+        "client",
         "--client",
         "02aa",
         "--stake-coin",
@@ -657,7 +466,6 @@ fn provision_accepts_the_terms_of_one_bond() {
     }
 }
 
-#[cfg(feature = "node")]
 #[test]
 fn provision_accepts_a_bond_only_preview() {
     let cli = Cli::try_parse_from([
@@ -665,6 +473,10 @@ fn provision_accepts_a_bond_only_preview() {
         "provision",
         "--work-config",
         "/tmp/work.json",
+        "--grant-config",
+        "grant.json",
+        "--client-contact",
+        "client",
         "--client",
         "02aa",
         "--stake-coin",
@@ -689,7 +501,6 @@ fn provision_accepts_a_bond_only_preview() {
 
 /// A bond funded by no coin is not one, so the stake is required
 /// rather than defaulted to an empty list.
-#[cfg(feature = "node")]
 #[test]
 fn provision_rejects_an_offer_with_nothing_staked() {
     assert!(
@@ -698,6 +509,10 @@ fn provision_rejects_an_offer_with_nothing_staked() {
             "provision",
             "--work-config",
             "/tmp/work.json",
+            "--grant-config",
+            "grant.json",
+            "--client-contact",
+            "client",
             "--client",
             "02aa",
             "--bond-timeout",
@@ -715,7 +530,6 @@ fn provision_rejects_an_offer_with_nothing_staked() {
 /// The bond an offer stakes is settled with the key an operator
 /// already made, exactly as a paid `serve` is: the same refusal, and
 /// the same file named by it.
-#[cfg(feature = "node")]
 #[test]
 fn provisioning_an_offer_loads_a_stored_settlement_identity() {
     let dir = tempfile::tempdir().unwrap();
@@ -725,6 +539,10 @@ fn provisioning_an_offer_loads_a_stored_settlement_identity() {
         "provision",
         "--work-config",
         "/tmp/work.json",
+        "--grant-config",
+        "grant.json",
+        "--client-contact",
+        "client",
         "--client",
         "02aa",
         "--stake-coin",
@@ -757,7 +575,6 @@ fn provisioning_an_offer_loads_a_stored_settlement_identity() {
 /// below is this rule and not a loader that always refuses. A node
 /// that minted its own settlement key would advertise two paid ALPNs
 /// as a party nobody has funded — and would say nothing about it.
-#[cfg(feature = "node")]
 #[test]
 fn serving_paid_work_loads_a_stored_settlement_identity() {
     let dir = tempfile::tempdir().unwrap();
@@ -782,19 +599,21 @@ fn serving_paid_work_loads_a_stored_settlement_identity() {
     let loaded = load_command_identity(&paid.command, Some(&path))
         .expect("the stored identity is what paid work settles with");
     assert_eq!(
-        identity::settlement_signer(&loaded).party_key(),
-        identity::settlement_signer(&created).party_key(),
+        identity::settlement_signer(&loaded).unwrap().party_key(),
+        identity::settlement_signer(&created).unwrap().party_key(),
     );
     assert_eq!(
-        &identity::settlement_signer(&loaded).party_key().to_bytes()[..],
-        loaded.producer_key.public_key().bytes(),
+        &identity::settlement_signer(&loaded)
+            .unwrap()
+            .party_key()
+            .to_bytes()[..],
+        loaded.node_key.public_key().bytes(),
         "the settlement party is the producer identity, not a second key",
     );
 }
 
 /// An identity file that is there and is not one is the same
 /// startup failure, and names the same file.
-#[cfg(feature = "node")]
 #[test]
 fn an_unreadable_settlement_identity_is_a_startup_failure() {
     let dir = tempfile::tempdir().unwrap();
@@ -812,7 +631,6 @@ fn an_unreadable_settlement_identity_is_a_startup_failure() {
     );
 }
 
-#[cfg(feature = "node")]
 #[test]
 fn serve_accepts_fetch_config() {
     let cli = Cli::try_parse_from([
@@ -844,7 +662,6 @@ fn serve_accepts_fetch_config() {
     }
 }
 
-#[cfg(feature = "node")]
 #[test]
 fn serve_rejects_zero_fetch_concurrency() {
     assert!(
@@ -915,7 +732,6 @@ fn content_id_parser_round_trips_xet_text_encoding() {
         displayed
     );
 }
-#[cfg(feature = "gateway")]
 #[test]
 fn proxy_cache_needs_no_causal_lm_files() {
     let cli = Cli::try_parse_from([
@@ -936,7 +752,6 @@ fn proxy_cache_needs_no_causal_lm_files() {
     ));
 }
 
-#[cfg(feature = "gateway")]
 #[test]
 fn unfunded_gateway_routes_require_a_work_backend() {
     assert!(
@@ -950,7 +765,7 @@ fn unfunded_gateway_routes_require_a_work_backend() {
             "--responses-backend",
             "fetch",
             "--responses-fetch-execution-environment",
-            "openai-responses",
+            "a05c3a1d598166d4a85f6a6a0ff0302e71647b53109902ae5752f6bc04a1acac",
         ],
     ] {
         let error = gateway_trust(&args).unwrap_err();
@@ -968,7 +783,6 @@ fn retired_commands_are_not_exposed() {
     }
 }
 
-#[cfg(feature = "node")]
 #[test]
 fn serve_uses_bounded_fetch_defaults() {
     let cli = Cli::try_parse_from(["hellas", "serve"]).unwrap();
@@ -984,7 +798,6 @@ fn serve_uses_bounded_fetch_defaults() {
     assert_eq!(fetch_queue_size, hellas_rpc::DEFAULT_FETCH_QUEUE_CAPACITY);
 }
 
-#[cfg(feature = "gateway")]
 #[test]
 fn offer_gateway_uses_its_private_resources_and_existing_identity() {
     let cli = Cli::try_parse_from([
@@ -994,6 +807,10 @@ fn offer_gateway_uses_its_private_resources_and_existing_identity() {
         "lan-model",
         "--grant-policy",
         "chat",
+        "--work-profile",
+        "/work.json",
+        "--gateway-profile",
+        "/gateway.json",
     ])
     .unwrap();
     assert!(validate_identity_options(&cli.command, None, true).is_err());
@@ -1001,6 +818,18 @@ fn offer_gateway_uses_its_private_resources_and_existing_identity() {
     let path = root.path().join("missing-identity");
     assert!(load_command_identity(&cli.command, Some(&path)).is_err());
     assert!(!path.exists());
+    let Commands::Gateway {
+        grant_policy,
+        work_profile,
+        gateway_profile,
+        ..
+    } = &cli.command
+    else {
+        panic!("gateway")
+    };
+    assert_eq!(grant_policy.as_deref(), Some("chat"));
+    assert_eq!(work_profile.as_deref(), Some(Path::new("/work.json")));
+    assert_eq!(gateway_profile.as_deref(), Some(Path::new("/gateway.json")));
     for args in [
         vec!["--responses-backend", "proxy"],
         vec![
@@ -1015,32 +844,36 @@ fn offer_gateway_uses_its_private_resources_and_existing_identity() {
     }
 }
 
-#[cfg(feature = "gateway")]
 #[test]
 fn offer_gateway_accepts_independent_apple_trust_policy() {
-    let cli = Cli::try_parse_from([
-        "hellas",
-        "gateway",
-        "--offer",
-        "provider",
-        "--assurance",
-        "apple-app-attest",
-        "--apple-app-attest-app-id",
-        "TEAM.app",
-        "--apple-app-attest-cdhashes",
-        &"11".repeat(32),
-    ])
+    let cli = Cli::try_parse_from(
+        ["hellas", "gateway", "--offer", "provider"]
+            .into_iter()
+            .chain(TEST_REMOTE_TRUST_ARGS.iter().copied()),
+    )
     .unwrap();
     let Commands::Gateway { remote_trust, .. } = cli.command else {
         panic!("gateway");
     };
-    assert_eq!(
-        remote_trust.assurance,
-        hellas_rpc::Assurance::AppleAppAttest
-    );
-    assert_eq!(
-        remote_trust.apple_app_attest_app_id.as_deref(),
-        Some("TEAM.app")
-    );
-    assert_eq!(remote_trust.apple_app_attest_cdhashes, vec![[0x11; 32]]);
+    assert_test_remote_trust(&remote_trust);
+    for flag in [
+        "--provider",
+        "--apple-app-attest-app-id",
+        "--apple-app-attest-cdhashes",
+    ] {
+        assert!(
+            Cli::try_parse_from([
+                "hellas",
+                "gateway",
+                "--offer",
+                "provider",
+                flag,
+                "unapproved"
+            ])
+            .is_err()
+        );
+    }
 }
+
+#[cfg(feature = "evaluate")]
+mod evaluate;

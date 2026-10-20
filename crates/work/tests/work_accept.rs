@@ -8,37 +8,41 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use support::temp;
 
+use hellas_auth::Digest;
+use hellas_auth::PublicKey;
 use hellas_kernel::{
-    BlockHeight, Decode as _, Edge, EdgeId, EdgeValues, Fees, Key, LeaseSlots, List,
-    MAX_EDGE_OUTPUTS, Parties, PayloadHash, Payout, PendingSlot, Secp256k1Signer,
-    Secp256k1Verifier, Sig, SigVerifier as _, Terms, TermsHash, WorkPaymentSettlement,
-    WorkPaymentTerms, WorkStakeBondTerms, work_payment_settlement,
+    EdgeId, EdgeValues, Fees, PayloadHash, PendingSlot, Secp256k1Signer, Secp256k1Verifier, Sig,
+    SigVerifier as _, WorkPaymentSettlement, work_payment_settlement,
 };
 use hellas_rpc::pb::work::{
     AcceptWorkRequest, AcceptWorkResponse, WorkAccepted, WorkRefusalCode, WorkRefused,
     accept_work_response::Outcome,
 };
-use hellas_rpc::protocol::Digest;
 use hellas_rpc::protocol::artifacts::{
-    BoundTermId, Canonical as _, InputAddressed as _, OutputAddressed as _, PreparedPaidInputV1,
-    SourceRef, TextArtifact, TextExecution, TextPolicy, TokenIds,
-};
-use hellas_rpc::protocol::work::{
-    EvaluatePolicyV2, JobDeadlines, PaidChannel, PaidChannelPolicyV1, PaidJobAuthorizationV2,
-    PrivateRecord as _, generation_policy_digest, identity_source_digest, prepared_input_digest,
-    private_policy_commitment, propose_authorization, signing_hash, work_id, work_policy_digest,
-};
-use hellas_rpc::protocol::work_setup::{
-    ObservedChannel, ReadyChannel, WorkChannelConfig, WorkChannelDescriptor, payment_terms_hash,
+    InputAddressed as _, OutputAddressed as _, SourceRef, TextExecution, TextPolicy,
 };
 use hellas_rpc::services::work::{Work, WorkServer};
-use hellas_rpc::{
-    Application, Assurance, CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR, ContentId, Evaluate,
-    EvaluateRequest, ProgramManifest, PublicKey,
-};
+use hellas_rpc::{ContentId, Evaluate};
 use hellas_wire::mux::MuxTransport;
 use hellas_wire::{Dispatcher, ServiceMarker, StreamTransport};
+use hellas_work::model::prepared_input::PreparedPaidInputV1;
+use hellas_work::model::setup::{
+    ObservedChannel, ReadyChannel, WorkChannelDescriptor, payment_terms_hash,
+};
+use hellas_work::model::work::{
+    JobDeadlines, PaidChannel, PaidJobAuthorizationV2, PrivateRecord as _, prepared_input_digest,
+    propose_authorization, signing_hash, work_id, work_policy_digest,
+};
+use hellas_work::test_support::paid::{
+    CURSOR, OMISSION_BOND, PAYMENT_RESERVE, PAYMENT_VALUE, PRICE, SALT, advance, bond_edge,
+    bond_object, bundle, bundle_bytes, channel_policy, client, deadlines, descriptor,
+    descriptor_with as descriptor_with_policy, evaluate_request, identity_artifact, lease_over,
+    manifest, network, origin, payload_at, payment_edge, payment_object, payment_policy,
+    payment_terms, prompt_tokens, provider, settlement, signer, text_execution, text_policy,
+    work_policy,
+};
 use hellas_work::work::{
     ClientEndpoint, CloseEndpoint, EndpointError, JobProposal, ProposeError, ProviderEndpoint,
     WorkRefusal, WorkService, propose_work,
@@ -49,104 +53,12 @@ use hellas_work::work_store::{
 };
 
 mod support;
-use support::{
-    advance, bond_edge, client, network, payload_at, payment_edge, provider, signer, temp,
-};
 
 // ── Fixture ───────────────────────────────────────────────────────────
-
-const HORIZON: u64 = 500;
-const PRICE: u64 = 10;
-const CREDIT_LIMIT: u64 = 40;
-/// One over half the funding, so the bond exceeds the capacity it
-/// leaves behind at zero fees.
-const OMISSION_BOND: u64 = 601;
-const PAYMENT_VALUE: u64 = 1_000;
-const PAYMENT_RESERVE: u64 = 200;
-const STAKE: u64 = 64;
-const SALT: [u8; 32] = [0x5a; 32];
-/// The finalized block both endpoints have processed through.
-const CURSOR: u64 = 10;
 
 /// A third party with no role on this channel.
 fn stranger() -> Secp256k1Signer {
     signer(0x23)
-}
-
-fn channel_policy() -> PaidChannelPolicyV1 {
-    PaidChannelPolicyV1 {
-        compute_credit_limit: CREDIT_LIMIT,
-        delivery_credit_limit: CREDIT_LIMIT,
-    }
-}
-
-fn bond_terms() -> WorkStakeBondTerms {
-    WorkStakeBondTerms {
-        parties: Parties::new(provider().party_key(), client().party_key()),
-        timeout: BlockHeight::new(HORIZON),
-        timeout_outputs: List::take(
-            [Payout::new(provider().party_key(), STAKE); MAX_EDGE_OUTPUTS],
-            1,
-        ),
-        max_job_price: 40,
-    }
-}
-
-fn payment_terms() -> WorkPaymentTerms {
-    WorkPaymentTerms {
-        bond_edge: bond_edge(),
-        bond_terms: bond_terms(),
-        private_policy_commitment: private_policy_commitment(network(), &SALT, &channel_policy()),
-        omit_response_blocks: hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
-        start_validity_blocks: 8,
-        omission_bond: OMISSION_BOND,
-    }
-}
-
-fn work_policy() -> EvaluatePolicyV2 {
-    EvaluatePolicyV2 {
-        allowed_environment: manifest().content_id(),
-        generation_policy_digest: match generation_policy_digest(&text_policy().canonical_bytes()) {
-            Ok(digest) => digest,
-            Err(error) => panic!("the fixture policy hashes: {error}"),
-        },
-        identity_source_digest: match identity_source_digest(&identity_artifact().canonical_bytes())
-        {
-            Ok(digest) => digest,
-            Err(error) => panic!("the fixture identity hashes: {error}"),
-        },
-        max_prompt_tokens: 512,
-        max_new_tokens: 128,
-        max_stop_token_ids: 4,
-        max_spool_bytes: 1_048_576,
-        max_encoded_result_frame: 262_144,
-        max_encoded_prepared_input: 1_048_576,
-    }
-}
-
-fn payment_values() -> EdgeValues {
-    EdgeValues::new(PAYMENT_VALUE, PAYMENT_RESERVE, Fees::new(0, 0, 0, 0))
-}
-
-fn descriptor() -> WorkChannelDescriptor {
-    descriptor_with_policy(work_policy())
-}
-
-fn descriptor_with_policy(policy: EvaluatePolicyV2) -> WorkChannelDescriptor {
-    let config = WorkChannelConfig {
-        payment_policy: payment_policy(),
-        network: network(),
-        payment_edge: payment_edge(),
-        payment_terms: payment_terms(),
-        policy_salt: SALT,
-        channel_policy: channel_policy(),
-        work_policy: policy.into(),
-        expected_payment_values: payment_values(),
-    };
-    match WorkChannelDescriptor::open(config) {
-        Ok(descriptor) => descriptor,
-        Err(error) => panic!("the fixture channel opens: {error}"),
-    }
 }
 
 fn ready() -> ReadyChannel {
@@ -169,18 +81,11 @@ fn ready_with_descriptor(descriptor: WorkChannelDescriptor) -> ReadyChannel {
     }
 }
 
-fn settlement() -> WorkPaymentSettlement {
-    let Some(settlement) = work_payment_settlement(payment_values(), OMISSION_BOND) else {
-        panic!("a funded edge prices both exits");
-    };
-    settlement
+async fn store(root: &std::path::Path, role: Role) -> ChannelStore {
+    store_with(root, role, settlement()).await
 }
 
-fn store(root: &std::path::Path, role: Role) -> ChannelStore {
-    store_with(root, role, settlement())
-}
-
-fn store_with(
+async fn store_with(
     root: &std::path::Path,
     role: Role,
     settlement: WorkPaymentSettlement,
@@ -192,7 +97,9 @@ fn store_with(
         role,
         origin(),
         &Secp256k1Verifier::new(),
-    ) {
+    )
+    .await
+    {
         Ok(store) => store,
         Err(error) => panic!("the fixture store opens: {error}"),
     }
@@ -200,111 +107,34 @@ fn store_with(
 
 /// A store that has processed one finalized block, which is what lets
 /// either endpoint measure a deadline.
-fn store_at_cursor(root: &std::path::Path, role: Role) -> ChannelStore {
-    at_height(store(root, role), CURSOR)
+async fn store_at_cursor(root: &std::path::Path, role: Role) -> ChannelStore {
+    at_height(store(root, role).await, CURSOR).await
 }
 
-fn at_height(mut store: ChannelStore, height: u64) -> ChannelStore {
-    advance(&mut store, height);
+async fn at_height(mut store: ChannelStore, height: u64) -> ChannelStore {
+    advance(&mut store, height).await;
     store
 }
 
-/// The fixture channel starts at the synthetic chain genesis.
-fn origin() -> SetupOrigin {
-    SetupOrigin {
-        payment_edge: payment_edge(),
-        height: 0,
-        payload: payload_at(0),
-        parent: [0_u8; 32],
-    }
-}
-
-/// Runs the production watcher over one empty finalized block per
-/// height, up through `height`.
-///
-/// The same call the settlement loop makes, so a fixture cursor is a
-/// cursor this endpoint could have reached.
-fn client_endpoint(root: &std::path::Path) -> ClientEndpoint {
-    match ClientEndpoint::new(ready(), store_at_cursor(root, Role::Client), client()) {
+async fn client_endpoint(root: &std::path::Path) -> ClientEndpoint {
+    match ClientEndpoint::new(ready(), store_at_cursor(root, Role::Client).await, client()) {
         Ok(endpoint) => endpoint,
         Err(error) => panic!("the fixture client endpoint binds: {error}"),
     }
 }
 
-fn provider_endpoint(root: &std::path::Path) -> ProviderEndpoint {
-    match ProviderEndpoint::new(ready(), store_at_cursor(root, Role::Provider), provider()) {
+async fn provider_endpoint(root: &std::path::Path) -> ProviderEndpoint {
+    match ProviderEndpoint::new(
+        ready(),
+        store_at_cursor(root, Role::Provider).await,
+        provider(),
+    ) {
         Ok(endpoint) => endpoint,
         Err(error) => panic!("the fixture provider endpoint binds: {error}"),
     }
 }
 
 // ── The prepared inputs a job executes from ───────────────────────────
-
-fn manifest() -> ProgramManifest {
-    ProgramManifest::new(
-        Application::new(CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR).unwrap(),
-        ContentId::from_bytes([0x16; 32]),
-    )
-}
-
-fn prompt_tokens() -> TokenIds {
-    TokenIds::from([9, 8, 7, 6])
-}
-
-fn text_policy() -> TextPolicy {
-    TextPolicy::from_u32_stop_tokens(64, [2, 1])
-}
-
-fn identity_artifact() -> TextArtifact {
-    TextArtifact::identity(BoundTermId::from_digest(manifest().content_id().digest()))
-}
-
-fn text_execution() -> TextExecution {
-    TextExecution::new(
-        SourceRef::output(identity_artifact().output_id()),
-        prompt_tokens().output_id(),
-        text_policy().output_id(),
-    )
-}
-
-/// One job's request. The nonce byte makes two proposals two different
-/// bundles, and therefore two different jobs.
-fn evaluate_request(nonce: u8) -> EvaluateRequest {
-    EvaluateRequest {
-        text_execution: text_execution().input_id().digest(),
-        runner_public_key: PublicKey::Secp256k1(client().party_key().to_bytes()),
-        execution_environment: manifest().content_id(),
-        nonce: [nonce; 32],
-        assurance: Assurance::ProducerSigned,
-        retain: true,
-    }
-}
-
-fn bundle(nonce: u8) -> PreparedPaidInputV1 {
-    PreparedPaidInputV1::new(
-        &evaluate_request(nonce),
-        &manifest(),
-        &text_execution(),
-        &prompt_tokens(),
-        &text_policy(),
-        &identity_artifact(),
-    )
-}
-
-fn bundle_bytes(nonce: u8) -> Vec<u8> {
-    match bundle(nonce).encode() {
-        Ok(bytes) => bytes,
-        Err(error) => panic!("the fixture bundle encodes: {error}"),
-    }
-}
-
-const fn deadlines() -> JobDeadlines {
-    JobDeadlines {
-        acceptance: 50,
-        terminal: 100,
-        payment: 200,
-    }
-}
 
 fn proposal(nonce: u8) -> JobProposal {
     JobProposal {
@@ -368,85 +198,6 @@ fn signed_request_with(
 
 // ── Canonical chain objects, spelled out ──────────────────────────────
 
-const FORMAT_VERSION: u8 = 1;
-const TAG_BLOCK_HEIGHT: u8 = 1;
-const TAG_FEES: u8 = 2;
-const TAG_PARTIES: u8 = 3;
-const TAG_EDGE: u8 = 5;
-const TAG_BOND_LEASE: u8 = 31;
-/// `Freeze | Adjudicated`: close-kind tags 3 and 4.
-const WORK_PAYMENT_CLOSES: u8 = 0b0001_1000;
-/// `Timeout` alone: close-kind tag 1.
-const WORK_STAKE_CLOSES: u8 = 0b0000_0010;
-
-struct EdgeBytes {
-    value: u64,
-    reserve: u64,
-    maker: Key,
-    taker: Key,
-    terms: TermsHash,
-    allowed: u8,
-}
-
-impl EdgeBytes {
-    fn build(&self) -> Edge {
-        let mut out = vec![FORMAT_VERSION, TAG_EDGE];
-        out.extend_from_slice(&self.value.to_be_bytes());
-        out.extend_from_slice(&self.reserve.to_be_bytes());
-        out.extend_from_slice(&[FORMAT_VERSION, TAG_FEES]);
-        for _ in 0..4 {
-            out.extend_from_slice(&0_u64.to_be_bytes());
-        }
-        out.extend_from_slice(&[FORMAT_VERSION, TAG_BLOCK_HEIGHT]);
-        out.extend_from_slice(&HORIZON.to_be_bytes());
-        out.extend_from_slice(&[FORMAT_VERSION, TAG_PARTIES]);
-        out.extend_from_slice(&self.maker.to_bytes());
-        out.extend_from_slice(&self.taker.to_bytes());
-        out.extend_from_slice(self.terms.as_bytes());
-        out.push(self.allowed);
-        match Edge::decode_exact(&out) {
-            Ok(edge) => edge,
-            Err(error) => panic!("the hand-written edge is canonical: {error:?}"),
-        }
-    }
-}
-
-fn lease_over(bond: EdgeId, payment: EdgeId) -> LeaseSlots {
-    support::lease_over(
-        bond,
-        payment,
-        payment_terms_hash(payment_terms()).as_bytes(),
-        &payment_terms().private_policy_commitment,
-        HORIZON,
-        FORMAT_VERSION,
-        TAG_BOND_LEASE,
-    )
-}
-
-fn bond_object() -> Edge {
-    EdgeBytes {
-        value: STAKE,
-        reserve: 0,
-        maker: provider().party_key(),
-        taker: client().party_key(),
-        terms: Terms::work_stake_bond(bond_terms()).hash(),
-        allowed: WORK_STAKE_CLOSES,
-    }
-    .build()
-}
-
-fn payment_object() -> Edge {
-    EdgeBytes {
-        value: PAYMENT_VALUE,
-        reserve: PAYMENT_RESERVE,
-        maker: client().party_key(),
-        taker: provider().party_key(),
-        terms: payment_terms_hash(payment_terms()),
-        allowed: WORK_PAYMENT_CLOSES,
-    }
-    .build()
-}
-
 // ── Reading answers ───────────────────────────────────────────────────
 
 fn accepted_signature(response: &AcceptWorkResponse) -> Sig {
@@ -480,8 +231,7 @@ fn refusal_text(response: &AcceptWorkResponse) -> String {
 
 // ── An in-memory pipe pair, so the wire is a real wire ────────────────
 
-#[path = "support/transport.rs"]
-mod transport;
+use hellas_work::test_support::transport;
 use transport::transport_pair;
 
 /// Serves one provider endpoint over one transport until the caller
@@ -501,11 +251,11 @@ fn serve(transport: MuxTransport, service: WorkService) -> tokio::task::JoinHand
 async fn an_accepted_exchange_leaves_both_signatures_on_both_disks() {
     let client_root = temp();
     let provider_root = temp();
-    let service = WorkService::new(provider_endpoint(provider_root.path()));
+    let service = WorkService::new(provider_endpoint(provider_root.path()).await);
     let (client_transport, server_transport) = transport_pair();
     let serving = serve(server_transport, service.clone());
 
-    let mut endpoint = client_endpoint(client_root.path());
+    let mut endpoint = client_endpoint(client_root.path()).await;
     let accepted = propose_work(client_transport, &mut endpoint, &proposal(1)).await;
     let Ok(work_id) = accepted else {
         panic!("the fixture exchange completes: {accepted:?}");
@@ -521,8 +271,8 @@ async fn an_accepted_exchange_leaves_both_signatures_on_both_disks() {
 
     // Reopened from the files, not read from the objects that wrote
     // them: what is on the disk is the only thing a restart has.
-    let client_store = store(client_root.path(), Role::Client);
-    let provider_store = store(provider_root.path(), Role::Provider);
+    let client_store = store(client_root.path(), Role::Client).await;
+    let provider_store = store(provider_root.path(), Role::Provider).await;
     for (side, state) in [
         ("client", client_store.state()),
         ("provider", provider_store.state()),
@@ -545,7 +295,7 @@ async fn the_service_answers_a_refusal_over_the_same_wire() {
     // A provider that has processed no block cannot measure a deadline.
     let endpoint = match ProviderEndpoint::new(
         ready(),
-        store(provider_root.path(), Role::Provider),
+        store(provider_root.path(), Role::Provider).await,
         provider(),
     ) {
         Ok(endpoint) => endpoint,
@@ -571,17 +321,17 @@ async fn the_service_answers_a_refusal_over_the_same_wire() {
 /// what a caller says would hand the second call its own drive of the
 /// same cursor, and the two would fetch every block twice and each treat
 /// the other's apply as a redundant re-read of its own.
-#[test]
-fn one_channel_has_one_cursor_driver_whatever_a_second_caller_names() {
+#[tokio::test]
+async fn one_channel_has_one_cursor_driver_whatever_a_second_caller_names() {
     let root = temp();
-    let service = WorkService::new(provider_endpoint(root.path()));
+    let service = WorkService::new(provider_endpoint(root.path()).await);
     let held = service.drive().expect("the first driver enters");
     assert!(
         matches!(service.drive(), Err(EndpointError::CatchingUp)),
         "a second driver of this channel is refused",
     );
     assert!(
-        service.with_state(|state| state.cursor().0).is_ok(),
+        service.with_state(|state| state.cursor().0).await.is_ok(),
         "and the one driver does not strand brief journal work",
     );
     drop(held);
@@ -659,7 +409,7 @@ async fn reaches(count: &AtomicUsize, wanted: usize) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn one_job_has_one_cursor_driver_while_a_drive_is_in_flight() {
     let root = temp();
-    let service = WorkService::new(provider_endpoint(root.path()));
+    let service = WorkService::new(provider_endpoint(root.path()).await);
     let id = Digest::from_bytes([0x55; 32]);
     let released = Arc::new(AtomicBool::new(false));
     let chain = HeldChain::over((CURSOR + 1)..=(CURSOR + 3), &released);
@@ -707,6 +457,7 @@ async fn one_job_has_one_cursor_driver_while_a_drive_is_in_flight() {
     assert_eq!(
         service
             .with_state(|state| state.cursor().0)
+            .await
             .expect("the endpoint is reachable"),
         CURSOR + 3,
     );
@@ -724,7 +475,7 @@ async fn one_job_has_one_cursor_driver_while_a_drive_is_in_flight() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_second_driver_naming_another_job_is_refused_and_reads_nothing() {
     let root = temp();
-    let service = WorkService::new(provider_endpoint(root.path()));
+    let service = WorkService::new(provider_endpoint(root.path()).await);
     let released = Arc::new(AtomicBool::new(false));
     let chain = HeldChain::over((CURSOR + 1)..=(CURSOR + 3), &released);
     let fetches = Arc::clone(&chain.fetches);
@@ -784,7 +535,7 @@ async fn a_driver_naming_a_job_this_channel_does_not_hold_is_refused() {
     // phase boundary's own case: the digest is the proposal's, and this
     // journal learns it from the acceptance this read precedes.
     let fresh_root = temp();
-    let fresh = WorkService::new(provider_endpoint(fresh_root.path()));
+    let fresh = WorkService::new(provider_endpoint(fresh_root.path()).await);
     let unread = HeldChain::over((CURSOR + 1)..=(CURSOR + 3), &open);
     let ahead = fresh
         .catch_up_job(unread.as_ref(), Digest::from_bytes([0x55; 32]))
@@ -795,8 +546,8 @@ async fn a_driver_naming_a_job_this_channel_does_not_hold_is_refused() {
     );
 
     let root = temp();
-    let service = WorkService::new(provider_endpoint(root.path()));
-    accepted_signature(&service.accept(&signed_request(1, 1)));
+    let service = WorkService::new(provider_endpoint(root.path()).await);
+    accepted_signature(&service.accept(&signed_request(1, 1)).await);
     let chain = HeldChain::over((CURSOR + 1)..=(CURSOR + 3), &open);
     let fetches = Arc::clone(&chain.fetches);
     let stranger = service
@@ -814,6 +565,7 @@ async fn a_driver_naming_a_job_this_channel_does_not_hold_is_refused() {
     assert_eq!(
         service
             .with_state(|state| state.cursor().0)
+            .await
             .expect("the endpoint is reachable"),
         CURSOR,
         "so the cursor is where it was",
@@ -845,7 +597,7 @@ async fn a_driver_naming_another_job_is_refused_after_this_channel_s_job_ended()
     ] {
         let name = format!("{outcome:?}");
         let root = temp();
-        let (service, held) = terminated_provider(root.path(), outcome);
+        let (service, held) = terminated_provider(root.path(), outcome).await;
         let chain = HeldChain::over((CURSOR + 1)..=(CURSOR + 3), &open);
         let fetches = Arc::clone(&chain.fetches);
 
@@ -864,6 +616,7 @@ async fn a_driver_naming_another_job_is_refused_after_this_channel_s_job_ended()
         assert_eq!(
             service
                 .with_state(|state| state.cursor().0)
+                .await
                 .expect("the endpoint is reachable"),
             CURSOR,
             "{name}: so the cursor is where it was",
@@ -884,12 +637,15 @@ async fn a_driver_naming_another_job_is_refused_after_this_channel_s_job_ended()
 /// Journaled the way the endpoint journals it — the proposal, then the
 /// terminating record — and reopened, so what the driver reads is what
 /// a restart would replay rather than what one run happened to hold.
-fn terminated_provider(root: &std::path::Path, outcome: TerminalOutcome) -> (WorkService, Digest) {
+async fn terminated_provider(
+    root: &std::path::Path,
+    outcome: TerminalOutcome,
+) -> (WorkService, Digest) {
     let authorization = authorization(1, 1);
     let held = work_id(ready().channel(), &authorization);
     let client_signature = client().sign(signing_hash(held));
     let verifier = Secp256k1Verifier::new();
-    let mut store = store_at_cursor(root, Role::Provider);
+    let mut store = store_at_cursor(root, Role::Provider).await;
     for record in [
         ChannelRecord::JobProposed {
             authorization,
@@ -901,15 +657,16 @@ fn terminated_provider(root: &std::path::Path, outcome: TerminalOutcome) -> (Wor
             outcome,
         },
     ] {
-        if let Err(error) = store.commit(record, &verifier) {
+        if let Err(error) = store.commit(record, &verifier).await {
             panic!("the fixture reaches its terminal: {error}");
         }
     }
     drop(store);
 
-    let service = WorkService::new(provider_endpoint(root));
+    let service = WorkService::new(provider_endpoint(root).await);
     let ended = service
         .with_state(|state| state.jobs().next().is_none() && state.terminals().next().is_some())
+        .await
         .expect("the endpoint is reachable");
     assert!(
         ended,
@@ -929,7 +686,7 @@ fn terminated_provider(root: &std::path::Path, outcome: TerminalOutcome) -> (Wor
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_proposal_is_answered_while_a_drive_waits_on_the_chain() {
     let root = temp();
-    let service = WorkService::new(provider_endpoint(root.path()));
+    let service = WorkService::new(provider_endpoint(root.path()).await);
     let id = Digest::from_bytes([0x55; 32]);
     let released = Arc::new(AtomicBool::new(false));
     let chain = HeldChain::over((CURSOR + 1)..=(CURSOR + 3), &released);
@@ -944,7 +701,7 @@ async fn a_proposal_is_answered_while_a_drive_waits_on_the_chain() {
 
     let answering = tokio::spawn({
         let service = service.clone();
-        async move { service.accept(&signed_request(1, 1)) }
+        async move { service.accept(&signed_request(1, 1)).await }
     });
     let answered = tokio::time::timeout(std::time::Duration::from_secs(10), answering).await;
     let Ok(Ok(response)) = answered else {
@@ -971,7 +728,7 @@ async fn a_proposal_is_answered_while_a_drive_waits_on_the_chain() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_proposal_is_answered_while_a_close_drive_waits_on_the_chain() {
     let root = temp();
-    let service = WorkService::new(provider_endpoint(root.path()));
+    let service = WorkService::new(provider_endpoint(root.path()).await);
     let released = Arc::new(AtomicBool::new(false));
     let chain = HeldChain::over((CURSOR + 1)..=(CURSOR + 3), &released);
     let fetches = Arc::clone(&chain.fetches);
@@ -987,7 +744,7 @@ async fn a_proposal_is_answered_while_a_close_drive_waits_on_the_chain() {
 
     let answering = tokio::spawn({
         let service = service.clone();
-        async move { service.accept(&signed_request(1, 1)) }
+        async move { service.accept(&signed_request(1, 1)).await }
     });
     let answered = tokio::time::timeout(std::time::Duration::from_secs(10), answering).await;
     let Ok(Ok(response)) = answered else {
@@ -1016,6 +773,7 @@ async fn a_proposal_is_answered_while_a_close_drive_waits_on_the_chain() {
     assert_eq!(
         service
             .with_state(|state| state.cursor().0)
+            .await
             .expect("the endpoint is reachable"),
         CURSOR + 3,
     );
@@ -1058,16 +816,16 @@ fn the_service_catalogue_names_the_work_service_and_nothing_settled() {
 
 // ── What the client puts on its disk, and when ────────────────────────
 
-#[test]
-fn a_client_journals_its_signature_before_the_request_leaves() {
+#[tokio::test]
+async fn a_client_journals_its_signature_before_the_request_leaves() {
     let root = temp();
-    let mut endpoint = client_endpoint(root.path());
-    let Ok(request) = endpoint.propose(&proposal(1)) else {
+    let mut endpoint = client_endpoint(root.path()).await;
+    let Ok(request) = endpoint.propose(&proposal(1)).await else {
         panic!("the fixture proposal is accepted by its own rules");
     };
     drop(endpoint);
 
-    let reopened = store(root.path(), Role::Client);
+    let reopened = store(root.path(), Role::Client).await;
     let Some(job) = reopened.state().jobs().next() else {
         panic!("the journal holds the proposal the caller was handed");
     };
@@ -1081,10 +839,10 @@ fn a_client_journals_its_signature_before_the_request_leaves() {
     assert_eq!(job.prepared_input(), request.prepared_input);
 }
 
-#[test]
-fn a_proposal_refused_before_signing_leaves_no_job() {
+#[tokio::test]
+async fn a_proposal_refused_before_signing_leaves_no_job() {
     let root = temp();
-    let mut endpoint = client_endpoint(root.path());
+    let mut endpoint = client_endpoint(root.path()).await;
     // Terminal deadline inside the measured dispatch and delivery
     // margins: legal, ordered, and unreachable.
     let unreachable = JobProposal {
@@ -1095,7 +853,7 @@ fn a_proposal_refused_before_signing_leaves_no_job() {
             payment: 30,
         },
     };
-    let refused = endpoint.propose(&unreachable);
+    let refused = endpoint.propose(&unreachable).await;
     assert!(
         matches!(refused, Err(ProposeError::Setup(_))),
         "an unreachable terminal deadline is refused, got {refused:?}",
@@ -1104,6 +862,7 @@ fn a_proposal_refused_before_signing_leaves_no_job() {
     drop(endpoint);
     assert!(
         store(root.path(), Role::Client)
+            .await
             .state()
             .jobs()
             .next()
@@ -1111,62 +870,63 @@ fn a_proposal_refused_before_signing_leaves_no_job() {
     );
 }
 
-#[test]
-fn a_repeat_proposal_returns_the_retained_request() {
+#[tokio::test]
+async fn a_repeat_proposal_returns_the_retained_request() {
     let root = temp();
-    let mut endpoint = client_endpoint(root.path());
-    let Ok(first) = endpoint.propose(&proposal(1)) else {
+    let mut endpoint = client_endpoint(root.path()).await;
+    let Ok(first) = endpoint.propose(&proposal(1)).await else {
         panic!("the first proposal is built");
     };
-    let Ok(second) = endpoint.propose(&proposal(1)) else {
+    let Ok(second) = endpoint.propose(&proposal(1)).await else {
         panic!("the same proposal is retained, not rebuilt");
     };
     assert_eq!(first, second, "the retained bytes come back unchanged");
 }
 
-#[test]
-fn a_retained_proposal_survives_restart_expiry_and_policy_change() {
+#[tokio::test]
+async fn a_retained_proposal_survives_restart_expiry_and_policy_change() {
     let root = temp();
     let provider_root = temp();
-    let mut endpoint = client_endpoint(root.path());
-    let first = endpoint.propose(&proposal(1)).unwrap();
+    let mut endpoint = client_endpoint(root.path()).await;
+    let first = endpoint.propose(&proposal(1)).await.unwrap();
     let work_id = endpoint.state().jobs().next().unwrap().work_id();
-    let mut provider_endpoint = provider_endpoint(provider_root.path());
-    let response = provider_endpoint.accept(&first);
+    let mut provider_endpoint = provider_endpoint(provider_root.path()).await;
+    let response = provider_endpoint.accept(&first).await;
     drop(endpoint); // The provider response was lost before journaling.
 
     let mut policy = work_policy();
     policy.allowed_environment = ContentId::from_bytes([0x99; 32]);
     let changed = ready_with_descriptor(descriptor_with_policy(policy));
     let reopened = at_height(
-        store(root.path(), Role::Client),
+        store(root.path(), Role::Client).await,
         proposal(1).deadlines.acceptance + 1,
-    );
+    )
+    .await;
     let mut endpoint = ClientEndpoint::new(changed, reopened, client()).unwrap();
-    let resumed = endpoint.resume_proposal(work_id).unwrap();
+    let resumed = endpoint.resume_proposal(work_id).await.unwrap();
     assert_eq!(resumed, first);
     assert_eq!(endpoint.state().proposal_nonce_high_water(), 1);
-    assert_eq!(provider_endpoint.accept(&resumed), response);
-    assert_eq!(endpoint.accepted(&response).unwrap(), work_id);
+    assert_eq!(provider_endpoint.accept(&resumed).await, response);
+    assert_eq!(endpoint.accepted(&response).await.unwrap(), work_id);
 }
 
-#[test]
-fn a_different_proposal_waits_for_the_outstanding_reply() {
+#[tokio::test]
+async fn a_different_proposal_waits_for_the_outstanding_reply() {
     let root = temp();
-    let mut endpoint = client_endpoint(root.path());
-    let first = endpoint.propose(&proposal(1)).unwrap();
+    let mut endpoint = client_endpoint(root.path()).await;
+    let first = endpoint.propose(&proposal(1)).await.unwrap();
     assert!(matches!(
-        endpoint.propose(&proposal(2)),
+        endpoint.propose(&proposal(2)).await,
         Err(ProposeError::Conflict)
     ));
     assert_eq!(endpoint.state().jobs().len(), 1);
     assert_eq!(endpoint.state().proposal_nonce_high_water(), 1);
-    assert_eq!(endpoint.propose(&proposal(1)).unwrap(), first);
+    assert_eq!(endpoint.propose(&proposal(1)).await.unwrap(), first);
     let provider_root = temp();
-    let mut provider_endpoint = provider_endpoint(provider_root.path());
-    let response = provider_endpoint.accept(&first);
-    endpoint.accepted(&response).unwrap();
-    assert!(endpoint.propose(&proposal(2)).is_ok());
+    let mut provider_endpoint = provider_endpoint(provider_root.path()).await;
+    let response = provider_endpoint.accept(&first).await;
+    endpoint.accepted(&response).await.unwrap();
+    assert!(endpoint.propose(&proposal(2)).await.is_ok());
     assert_eq!(
         endpoint.state().jobs().len(),
         2,
@@ -1175,7 +935,7 @@ fn a_different_proposal_waits_for_the_outstanding_reply() {
     assert_eq!(endpoint.state().proposal_nonce_high_water(), 2);
     let pending = endpoint.state().job_book().pending_proposal();
     assert!(matches!(
-        endpoint.accepted(&response),
+        endpoint.accepted(&response).await,
         Err(ProposeError::Conflict)
     ));
     assert_eq!(
@@ -1185,11 +945,11 @@ fn a_different_proposal_waits_for_the_outstanding_reply() {
     );
 }
 
-#[test]
-fn a_known_refusal_releases_only_the_proposal_slot_durably() {
+#[tokio::test]
+async fn a_known_refusal_releases_only_the_proposal_slot_durably() {
     let root = temp();
-    let mut endpoint = client_endpoint(root.path());
-    let first = endpoint.propose(&proposal(1)).unwrap();
+    let mut endpoint = client_endpoint(root.path()).await;
+    let first = endpoint.propose(&proposal(1)).await.unwrap();
     let id = endpoint.state().job_book().pending_proposal().unwrap();
     let refused = AcceptWorkResponse {
         outcome: Some(Outcome::Refused(WorkRefused {
@@ -1199,7 +959,7 @@ fn a_known_refusal_releases_only_the_proposal_slot_durably() {
         })),
     };
     assert!(matches!(
-        endpoint.accepted(&refused),
+        endpoint.accepted(&refused).await,
         Err(ProposeError::Refused { .. })
     ));
     assert_eq!(endpoint.state().job_book().pending_proposal(), None);
@@ -1208,61 +968,66 @@ fn a_known_refusal_releases_only_the_proposal_slot_durably() {
         JobPhase::HalfSigned
     );
     drop(endpoint);
-    let mut reopened = client_endpoint(root.path());
+    let mut reopened = client_endpoint(root.path()).await;
     assert_eq!(reopened.state().job_book().pending_proposal(), None);
-    assert_eq!(reopened.resume_proposal(id).unwrap(), first);
+    assert_eq!(reopened.resume_proposal(id).await.unwrap(), first);
     assert_eq!(reopened.state().job_book().pending_proposal(), Some(id));
     assert!(matches!(
-        reopened.propose(&proposal(2)),
+        reopened.propose(&proposal(2)).await,
         Err(ProposeError::Conflict)
     ));
-    reopened.accepted(&refused).unwrap_err();
-    assert!(reopened.propose(&proposal(2)).is_ok());
+    reopened.accepted(&refused).await.unwrap_err();
+    assert!(reopened.propose(&proposal(2)).await.is_ok());
     assert_eq!(reopened.state().jobs().len(), 2);
 }
 
-#[test]
-fn a_lost_reply_blocks_new_nonces_across_restart_and_malformed_replies() {
+#[tokio::test]
+async fn a_lost_reply_blocks_new_nonces_across_restart_and_malformed_replies() {
     let root = temp();
-    let mut endpoint = client_endpoint(root.path());
-    let request = endpoint.propose(&proposal(1)).unwrap();
+    let mut endpoint = client_endpoint(root.path()).await;
+    let request = endpoint.propose(&proposal(1)).await.unwrap();
     let id = endpoint.state().job_book().pending_proposal().unwrap();
     drop(endpoint);
-    let mut reopened = client_endpoint(root.path());
+    let mut reopened = client_endpoint(root.path()).await;
     assert!(matches!(
-        reopened.propose(&proposal(2)),
+        reopened.propose(&proposal(2)).await,
         Err(ProposeError::Conflict)
     ));
-    assert!(reopened.accepted(&AcceptWorkResponse::default()).is_err());
+    assert!(
+        reopened
+            .accepted(&AcceptWorkResponse::default())
+            .await
+            .is_err()
+    );
     assert_eq!(reopened.state().job_book().pending_proposal(), Some(id));
-    assert_eq!(reopened.resume_proposal(id).unwrap(), request);
+    assert_eq!(reopened.resume_proposal(id).await.unwrap(), request);
     assert_eq!(reopened.state().proposal_nonce_high_water(), 1);
 }
 
-#[test]
-fn an_acceptance_with_no_proposal_has_nothing_to_answer() {
+#[tokio::test]
+async fn an_acceptance_with_no_proposal_has_nothing_to_answer() {
     let root = temp();
-    let mut endpoint = client_endpoint(root.path());
+    let mut endpoint = client_endpoint(root.path()).await;
     let authorization = authorization(1, 1);
     let signature = provider().sign(signing_hash(work_id(ready().channel(), &authorization)));
     let response = accepted_response(signature);
-    let refused = endpoint.accepted(&response);
+    let refused = endpoint.accepted(&response).await;
     assert!(
         matches!(refused, Err(ProposeError::NoOpenJob)),
         "an acceptance answers a proposal or nothing, got {refused:?}",
     );
 }
 
-#[test]
-fn a_co_signature_from_another_key_is_not_an_acceptance() {
+#[tokio::test]
+async fn a_co_signature_from_another_key_is_not_an_acceptance() {
     let root = temp();
-    let mut endpoint = client_endpoint(root.path());
-    let Ok(_) = endpoint.propose(&proposal(1)) else {
+    let mut endpoint = client_endpoint(root.path()).await;
+    let Ok(_) = endpoint.propose(&proposal(1)).await else {
         panic!("the proposal is built");
     };
     let authorization = authorization(1, 1);
     let forged = stranger().sign(signing_hash(work_id(ready().channel(), &authorization)));
-    let refused = endpoint.accepted(&accepted_response(forged));
+    let refused = endpoint.accepted(&accepted_response(forged)).await;
     assert!(
         matches!(refused, Err(ProposeError::Store(_))),
         "only the provider's key accepts, got {refused:?}",
@@ -1274,11 +1039,11 @@ fn a_co_signature_from_another_key_is_not_an_acceptance() {
     );
 }
 
-#[test]
-fn a_refusal_is_read_back_as_the_refusal_it_names() {
+#[tokio::test]
+async fn a_refusal_is_read_back_as_the_refusal_it_names() {
     let root = temp();
-    let mut endpoint = client_endpoint(root.path());
-    let Ok(_) = endpoint.propose(&proposal(1)) else {
+    let mut endpoint = client_endpoint(root.path()).await;
+    let Ok(_) = endpoint.propose(&proposal(1)).await else {
         panic!("the proposal is built");
     };
     let response = AcceptWorkResponse {
@@ -1288,7 +1053,7 @@ fn a_refusal_is_read_back_as_the_refusal_it_names() {
             reason: "no".into(),
         })),
     };
-    let refused = endpoint.accepted(&response);
+    let refused = endpoint.accepted(&response).await;
     assert!(
         matches!(
             refused,
@@ -1301,8 +1066,8 @@ fn a_refusal_is_read_back_as_the_refusal_it_names() {
     );
 }
 
-#[test]
-fn every_wire_code_reads_back_as_the_refusal_it_names() {
+#[tokio::test]
+async fn every_wire_code_reads_back_as_the_refusal_it_names() {
     // A known refusal releases the proposal slot, so each code is read
     // against its own fresh proposal.
     for (code, refusal) in [
@@ -1314,8 +1079,8 @@ fn every_wire_code_reads_back_as_the_refusal_it_names() {
         (WorkRefusalCode::Unavailable, WorkRefusal::Unavailable),
     ] {
         let root = temp();
-        let mut endpoint = client_endpoint(root.path());
-        let Ok(_) = endpoint.propose(&proposal(1)) else {
+        let mut endpoint = client_endpoint(root.path()).await;
+        let Ok(_) = endpoint.propose(&proposal(1)).await else {
             panic!("the proposal is built");
         };
         let response = AcceptWorkResponse {
@@ -1325,7 +1090,7 @@ fn every_wire_code_reads_back_as_the_refusal_it_names() {
                 reason: "no".into(),
             })),
         };
-        let refused = endpoint.accepted(&response);
+        let refused = endpoint.accepted(&response).await;
         assert!(
             matches!(refused, Err(ProposeError::Refused { refusal: got, .. }) if got == refusal),
             "{code:?} reads back as {refusal:?}, got {refused:?}",
@@ -1333,11 +1098,11 @@ fn every_wire_code_reads_back_as_the_refusal_it_names() {
     }
 }
 
-#[test]
-fn a_response_this_service_does_not_define_is_malformed() {
+#[tokio::test]
+async fn a_response_this_service_does_not_define_is_malformed() {
     let root = temp();
-    let mut endpoint = client_endpoint(root.path());
-    let Ok(_) = endpoint.propose(&proposal(1)) else {
+    let mut endpoint = client_endpoint(root.path()).await;
+    let Ok(_) = endpoint.propose(&proposal(1)).await else {
         panic!("the proposal is built");
     };
     for (what, response) in [
@@ -1372,7 +1137,7 @@ fn a_response_this_service_does_not_define_is_malformed() {
             },
         ),
     ] {
-        let refused = endpoint.accepted(&response);
+        let refused = endpoint.accepted(&response).await;
         assert!(
             matches!(refused, Err(ProposeError::Malformed(_))),
             "{what} is malformed, got {refused:?}",
@@ -1398,15 +1163,15 @@ fn phase_of(state: &Channel) -> Option<JobPhase> {
 
 // ── What the provider puts on its disk, and when ──────────────────────
 
-#[test]
-fn the_co_signature_is_on_the_disk_before_it_is_answered() {
+#[tokio::test]
+async fn the_co_signature_is_on_the_disk_before_it_is_answered() {
     let root = temp();
-    let mut endpoint = provider_endpoint(root.path());
-    let response = endpoint.accept(&signed_request(1, 1));
+    let mut endpoint = provider_endpoint(root.path()).await;
+    let response = endpoint.accept(&signed_request(1, 1)).await;
     let signature = accepted_signature(&response);
     drop(endpoint);
 
-    let reopened = store(root.path(), Role::Provider);
+    let reopened = store(root.path(), Role::Provider).await;
     let Some(job) = reopened.state().jobs().next() else {
         panic!("the journal holds the job it answered for");
     };
@@ -1414,23 +1179,24 @@ fn the_co_signature_is_on_the_disk_before_it_is_answered() {
     assert_eq!(job.provider_signature(), Some(signature));
 }
 
-#[test]
-fn nothing_is_journaled_for_a_proposal_that_is_refused() {
+#[tokio::test]
+async fn nothing_is_journaled_for_a_proposal_that_is_refused() {
     let root = temp();
-    let mut endpoint = provider_endpoint(root.path());
+    let mut endpoint = provider_endpoint(root.path()).await;
     let before = endpoint.state().jobs().next().is_none();
     // Another channel's authorization: the channel id is the first
     // thing `check_authorization` compares.
     let mut foreign = authorization(1, 1);
     foreign.channel_id = Digest::from_bytes([0x00; 32]);
     let signature = client().sign(signing_hash(work_id(ready().channel(), &foreign)));
-    let response = endpoint.accept(&request(&foreign, signature, 1));
+    let response = endpoint.accept(&request(&foreign, signature, 1)).await;
 
     assert_eq!(refusal_code(&response), WorkRefusalCode::Invalid);
     assert!(before && endpoint.state().jobs().next().is_none());
     drop(endpoint);
     assert!(
         store(root.path(), Role::Provider)
+            .await
             .state()
             .jobs()
             .next()
@@ -1447,14 +1213,14 @@ fn nothing_is_journaled_for_a_proposal_that_is_refused() {
 /// what a policy fixed. So this is the case that separates the two: with
 /// the acceptance checks removed, these bytes are journaled, credited,
 /// and co-signed.
-#[test]
-fn a_price_the_policy_does_not_fix_is_refused_before_anything_is_journaled() {
+#[tokio::test]
+async fn a_price_the_policy_does_not_fix_is_refused_before_anything_is_journaled() {
     let root = temp();
-    let mut endpoint = provider_endpoint(root.path());
+    let mut endpoint = provider_endpoint(root.path()).await;
     let mut overpriced = authorization(1, 1);
     overpriced.price = PRICE + 1;
     let signature = client().sign(signing_hash(work_id(ready().channel(), &overpriced)));
-    let response = endpoint.accept(&request(&overpriced, signature, 1));
+    let response = endpoint.accept(&request(&overpriced, signature, 1)).await;
 
     assert_eq!(
         refusal_code(&response),
@@ -1466,6 +1232,7 @@ fn a_price_the_policy_does_not_fix_is_refused_before_anything_is_journaled() {
     drop(endpoint);
     assert!(
         store(root.path(), Role::Provider)
+            .await
             .state()
             .jobs()
             .next()
@@ -1473,61 +1240,66 @@ fn a_price_the_policy_does_not_fix_is_refused_before_anything_is_journaled() {
     );
 }
 
-#[test]
-fn a_retry_returns_the_retained_co_signature() {
+#[tokio::test]
+async fn a_retry_returns_the_retained_co_signature() {
     let root = temp();
-    let mut endpoint = provider_endpoint(root.path());
-    let first = accepted_signature(&endpoint.accept(&signed_request(1, 1)));
-    let second = accepted_signature(&endpoint.accept(&signed_request(1, 1)));
+    let mut endpoint = provider_endpoint(root.path()).await;
+    let first = accepted_signature(&endpoint.accept(&signed_request(1, 1)).await);
+    let second = accepted_signature(&endpoint.accept(&signed_request(1, 1)).await);
     assert_eq!(first, second);
 }
 
-#[test]
-fn a_retry_after_the_deadline_still_returns_the_retained_signature() {
+#[tokio::test]
+async fn a_retry_after_the_deadline_still_returns_the_retained_signature() {
     let root = temp();
     let client_root = temp();
-    let mut caller = client_endpoint(client_root.path());
+    let mut caller = client_endpoint(client_root.path()).await;
     let request = caller
         .propose(&proposal(1))
+        .await
         .expect("the client journals its proposal");
-    let mut endpoint = provider_endpoint(root.path());
-    let first = accepted_signature(&endpoint.accept(&request));
+    let mut endpoint = provider_endpoint(root.path()).await;
+    let first = accepted_signature(&endpoint.accept(&request).await);
     drop(endpoint);
     drop(caller); // The acceptance acknowledgement never reached the client.
 
     // Both sides restart. The provider is past acceptance and close-only,
     // while the client still has only its own signature.
     let late = at_height(
-        store(root.path(), Role::Provider),
+        store(root.path(), Role::Provider).await,
         deadlines().acceptance + 1,
-    );
+    )
+    .await;
     let service = WorkService::close_only(CloseEndpoint::new(late, provider()).unwrap());
-    let checkpoint = service.with_state(Channel::checkpoint).unwrap();
-    let mut caller = client_endpoint(client_root.path());
+    let checkpoint = service.with_state(Channel::checkpoint).await.unwrap();
+    let mut caller = client_endpoint(client_root.path()).await;
     assert_eq!(phase_of(caller.state()), Some(JobPhase::HalfSigned));
     let id = work_id(ready().channel(), &authorization(1, 1));
-    let resumed = caller.resume_proposal(id).unwrap();
+    let resumed = caller.resume_proposal(id).await.unwrap();
     let mut forged = resumed.clone();
     forged.client_signature = stranger().sign(signing_hash(id)).as_bytes().to_vec();
     assert_eq!(
-        refusal_code(&service.precheck_acceptance(&forged).unwrap()),
+        refusal_code(&service.precheck_acceptance(&forged).await.unwrap()),
         WorkRefusalCode::Invalid,
         "a retained signature is returned only to an authenticated proposal",
     );
-    let again = service.precheck_acceptance(&resumed).unwrap();
+    let again = service.precheck_acceptance(&resumed).await.unwrap();
     assert_eq!(
         accepted_signature(&again),
         first,
         "an answer already given is not unsaid by a passing height",
     );
-    assert_eq!(service.accept(&resumed), again);
-    assert_eq!(service.with_state(Channel::checkpoint).unwrap(), checkpoint);
-    assert_eq!(caller.accepted(&again).unwrap(), id);
+    assert_eq!(service.accept(&resumed).await, again);
+    assert_eq!(
+        service.with_state(Channel::checkpoint).await.unwrap(),
+        checkpoint
+    );
+    assert_eq!(caller.accepted(&again).await.unwrap(), id);
     assert_eq!(phase_of(caller.state()), Some(JobPhase::Accepted));
 
     // A terminal is also an authenticated, permanent answer without readiness.
     drop(service);
-    let mut ended = store(root.path(), Role::Provider);
+    let mut ended = store(root.path(), Role::Provider).await;
     ended
         .commit(
             ChannelRecord::JobTerminated {
@@ -1536,92 +1308,104 @@ fn a_retry_after_the_deadline_still_returns_the_retained_signature() {
             },
             &Secp256k1Verifier::new(),
         )
+        .await
         .unwrap();
     let service = WorkService::close_only(CloseEndpoint::new(ended, provider()).unwrap());
-    let checkpoint = service.with_state(Channel::checkpoint).unwrap();
+    let checkpoint = service.with_state(Channel::checkpoint).await.unwrap();
     assert_eq!(
-        refusal_code(&service.precheck_acceptance(&forged).unwrap()),
+        refusal_code(&service.precheck_acceptance(&forged).await.unwrap()),
         WorkRefusalCode::Invalid
     );
     assert_eq!(
-        refusal_code(&service.precheck_acceptance(&resumed).unwrap()),
+        refusal_code(&service.precheck_acceptance(&resumed).await.unwrap()),
         WorkRefusalCode::Conflict
     );
-    assert_eq!(service.with_state(Channel::checkpoint).unwrap(), checkpoint);
+    assert_eq!(
+        service.with_state(Channel::checkpoint).await.unwrap(),
+        checkpoint
+    );
 }
 
-#[test]
-fn a_crash_between_the_two_commits_co_signs_on_retry() {
+#[tokio::test]
+async fn a_crash_between_the_two_commits_co_signs_on_retry() {
     let root = temp();
     // A provider that journaled the proposal and died before signing.
-    let mut store = store_at_cursor(root.path(), Role::Provider);
+    let mut store = store_at_cursor(root.path(), Role::Provider).await;
     let authorization = authorization(1, 1);
     let signature = client().sign(signing_hash(work_id(ready().channel(), &authorization)));
-    if let Err(error) = store.commit(
-        ChannelRecord::JobProposed {
-            authorization,
-            client_signature: signature,
-            prepared_input: bundle_bytes(1),
-        },
-        &Secp256k1Verifier::new(),
-    ) {
+    if let Err(error) = store
+        .commit(
+            ChannelRecord::JobProposed {
+                authorization,
+                client_signature: signature,
+                prepared_input: bundle_bytes(1),
+            },
+            &Secp256k1Verifier::new(),
+        )
+        .await
+    {
         panic!("the proposal is journaled: {error}");
     }
     drop(store);
 
-    let mut endpoint = provider_endpoint(root.path());
+    let mut endpoint = provider_endpoint(root.path()).await;
     assert_eq!(
         phase_of(endpoint.state()),
         Some(JobPhase::HalfSigned),
         "the reopened provider is half-signed",
     );
-    let response = endpoint.accept(&request(&authorization, signature, 1));
+    let response = endpoint
+        .accept(&request(&authorization, signature, 1))
+        .await;
     assert_eq!(phase_of(endpoint.state()), Some(JobPhase::Accepted),);
     accepted_signature(&response);
 }
 
 // ── The six refusals, one at a time ───────────────────────────────────
 
-#[test]
-fn a_provider_with_no_finalized_block_is_not_ready() {
+#[tokio::test]
+async fn a_provider_with_no_finalized_block_is_not_ready() {
     let root = temp();
-    let Ok(mut endpoint) =
-        ProviderEndpoint::new(ready(), store(root.path(), Role::Provider), provider())
-    else {
+    let Ok(mut endpoint) = ProviderEndpoint::new(
+        ready(),
+        store(root.path(), Role::Provider).await,
+        provider(),
+    ) else {
         panic!("the endpoint binds");
     };
-    let response = endpoint.accept(&signed_request(1, 1));
+    let response = endpoint.accept(&signed_request(1, 1)).await;
     assert_eq!(refusal_code(&response), WorkRefusalCode::NotReady);
     assert!(WorkRefusal::NotReady.is_retryable());
 }
 
-#[test]
-fn an_authorization_past_its_acceptance_deadline_expires() {
+#[tokio::test]
+async fn an_authorization_past_its_acceptance_deadline_expires() {
     let root = temp();
     let late = at_height(
-        store(root.path(), Role::Provider),
+        store(root.path(), Role::Provider).await,
         deadlines().acceptance + 1,
-    );
+    )
+    .await;
     let Ok(mut endpoint) = ProviderEndpoint::new(ready(), late, provider()) else {
         panic!("the endpoint binds");
     };
-    let response = endpoint.accept(&signed_request(1, 1));
+    let response = endpoint.accept(&signed_request(1, 1)).await;
     assert_eq!(refusal_code(&response), WorkRefusalCode::Expired);
     assert!(!WorkRefusal::Expired.is_retryable());
     drop(endpoint);
 
     let service = WorkService::close_only(
-        CloseEndpoint::new(store(root.path(), Role::Provider), provider()).unwrap(),
+        CloseEndpoint::new(store(root.path(), Role::Provider).await, provider()).unwrap(),
     );
-    let checkpoint = service.with_state(Channel::checkpoint).unwrap();
+    let checkpoint = service.with_state(Channel::checkpoint).await.unwrap();
     let expired = signed_request(1, 1);
     assert_eq!(
-        refusal_code(&service.precheck_acceptance(&expired).unwrap()),
+        refusal_code(&service.precheck_acceptance(&expired).await.unwrap()),
         WorkRefusalCode::Expired,
         "the persisted cursor proves expiry without any new readiness",
     );
     assert_eq!(
-        refusal_code(&service.accept(&expired)),
+        refusal_code(&service.accept(&expired).await),
         WorkRefusalCode::Expired
     );
     let mut forged = expired;
@@ -1633,7 +1417,7 @@ fn an_authorization_past_its_acceptance_deadline_expires() {
         .as_bytes()
         .to_vec();
     assert_eq!(
-        refusal_code(&service.precheck_acceptance(&forged).unwrap()),
+        refusal_code(&service.precheck_acceptance(&forged).await.unwrap()),
         WorkRefusalCode::Invalid
     );
     let fresh = signed_request_with(
@@ -1645,24 +1429,29 @@ fn an_authorization_past_its_acceptance_deadline_expires() {
         },
     );
     assert!(
-        service.precheck_acceptance(&fresh).is_none(),
+        service.precheck_acceptance(&fresh).await.is_none(),
         "the acceptance boundary remains inclusive"
     );
     assert_eq!(
-        refusal_code(&service.accept(&fresh)),
+        refusal_code(&service.accept(&fresh).await),
         WorkRefusalCode::NotReady
     );
-    assert_eq!(service.with_state(Channel::checkpoint).unwrap(), checkpoint);
+    assert_eq!(
+        service.with_state(Channel::checkpoint).await.unwrap(),
+        checkpoint
+    );
 }
 
-#[test]
-fn a_bundle_that_is_not_the_committed_one_is_invalid() {
+#[tokio::test]
+async fn a_bundle_that_is_not_the_committed_one_is_invalid() {
     let root = temp();
-    let mut endpoint = provider_endpoint(root.path());
+    let mut endpoint = provider_endpoint(root.path()).await;
     // The authorization commits to bundle 1; the request carries 2.
     let authorization = authorization(1, 1);
     let signature = client().sign(signing_hash(work_id(ready().channel(), &authorization)));
-    let response = endpoint.accept(&request(&authorization, signature, 2));
+    let response = endpoint
+        .accept(&request(&authorization, signature, 2))
+        .await;
     assert_eq!(refusal_code(&response), WorkRefusalCode::Invalid);
     assert!(endpoint.state().jobs().next().is_none());
 }
@@ -1709,10 +1498,10 @@ fn foreign_runner_bundle() -> PreparedPaidInputV1 {
     )
 }
 
-#[test]
-fn a_bundle_the_policy_does_not_allow_is_refused_though_its_digest_matches() {
+#[tokio::test]
+async fn a_bundle_the_policy_does_not_allow_is_refused_though_its_digest_matches() {
     let root = temp();
-    let mut endpoint = provider_endpoint(root.path());
+    let mut endpoint = provider_endpoint(root.path()).await;
     for (what, bundle) in [
         ("a generation policy over the envelope", overlong_bundle()),
         ("a runner that is not the client", foreign_runner_bundle()),
@@ -1732,14 +1521,16 @@ fn a_bundle_the_policy_does_not_allow_is_refused_though_its_digest_matches() {
         let Ok(bytes) = bundle.encode() else {
             panic!("{what} encodes");
         };
-        let response = endpoint.accept(&AcceptWorkRequest {
-            route: Some(hellas_rpc::pb::work::WorkRoute::payment(
-                authorization.channel_id,
-            )),
-            authorization: authorization.encode(),
-            client_signature: signature.as_bytes().to_vec(),
-            prepared_input: bytes,
-        });
+        let response = endpoint
+            .accept(&AcceptWorkRequest {
+                route: Some(hellas_rpc::pb::work::WorkRoute::payment(
+                    authorization.channel_id,
+                )),
+                authorization: authorization.encode(),
+                client_signature: signature.as_bytes().to_vec(),
+                prepared_input: bytes,
+            })
+            .await;
 
         assert_eq!(
             refusal_code(&response),
@@ -1754,13 +1545,13 @@ fn a_bundle_the_policy_does_not_allow_is_refused_though_its_digest_matches() {
     }
 }
 
-#[test]
-fn a_forged_client_signature_is_invalid() {
+#[tokio::test]
+async fn a_forged_client_signature_is_invalid() {
     let root = temp();
-    let mut endpoint = provider_endpoint(root.path());
+    let mut endpoint = provider_endpoint(root.path()).await;
     let authorization = authorization(1, 1);
     let forged = stranger().sign(signing_hash(work_id(ready().channel(), &authorization)));
-    let response = endpoint.accept(&request(&authorization, forged, 1));
+    let response = endpoint.accept(&request(&authorization, forged, 1)).await;
     assert_eq!(refusal_code(&response), WorkRefusalCode::Invalid);
     assert!(
         endpoint.state().jobs().next().is_none(),
@@ -1775,10 +1566,10 @@ fn a_forged_client_signature_is_invalid() {
 /// the verifier however the length is read, so on its own it proves
 /// nothing about the length rule — it is here as the neighbour that a
 /// reader who truncates would also refuse.
-#[test]
-fn a_signature_of_any_other_length_is_not_a_signature() {
+#[tokio::test]
+async fn a_signature_of_any_other_length_is_not_a_signature() {
     let root = temp();
-    let mut endpoint = provider_endpoint(root.path());
+    let mut endpoint = provider_endpoint(root.path()).await;
     let valid = signed_request(1, 1).client_signature;
 
     let mut cases: Vec<(String, Vec<u8>)> = [Sig::LENGTH - 1, Sig::LENGTH + 1, 0]
@@ -1797,7 +1588,7 @@ fn a_signature_of_any_other_length_is_not_a_signature() {
     for (what, client_signature) in cases {
         let mut request = signed_request(1, 1);
         request.client_signature = client_signature;
-        let response = endpoint.accept(&request);
+        let response = endpoint.accept(&request).await;
         assert_eq!(
             refusal_code(&response),
             WorkRefusalCode::Invalid,
@@ -1817,10 +1608,10 @@ fn a_signature_of_any_other_length_is_not_a_signature() {
 /// the height, and no later one recovers it. A payment deadline too
 /// close to its terminal is a fact about two carried numbers and no
 /// height at all, so it is wrong rather than late.
-#[test]
-fn the_measured_margins_separate_a_late_job_from_a_malformed_one() {
+#[tokio::test]
+async fn the_measured_margins_separate_a_late_job_from_a_malformed_one() {
     let root = temp();
-    let mut endpoint = provider_endpoint(root.path());
+    let mut endpoint = provider_endpoint(root.path()).await;
     for (what, deadlines, expected) in [
         (
             "a terminal deadline inside the dispatch and delivery margins",
@@ -1841,7 +1632,7 @@ fn the_measured_margins_separate_a_late_job_from_a_malformed_one() {
             WorkRefusalCode::Invalid,
         ),
     ] {
-        let response = endpoint.accept(&signed_request_with(1, 1, deadlines));
+        let response = endpoint.accept(&signed_request_with(1, 1, deadlines)).await;
         assert_eq!(
             refusal_code(&response),
             expected,
@@ -1855,70 +1646,77 @@ fn the_measured_margins_separate_a_late_job_from_a_malformed_one() {
     }
 }
 
-#[test]
-fn bytes_that_are_not_an_authorization_are_invalid() {
+#[tokio::test]
+async fn bytes_that_are_not_an_authorization_are_invalid() {
     let root = temp();
-    let mut endpoint = provider_endpoint(root.path());
+    let mut endpoint = provider_endpoint(root.path()).await;
     let mut truncated = signed_request(1, 1);
     truncated.authorization.pop();
     assert_eq!(
-        refusal_code(&endpoint.accept(&truncated)),
+        refusal_code(&endpoint.accept(&truncated).await),
         WorkRefusalCode::Invalid,
     );
 
     let mut retagged = signed_request(1, 1);
     retagged.authorization[1] = 0xfe;
     assert_eq!(
-        refusal_code(&endpoint.accept(&retagged)),
+        refusal_code(&endpoint.accept(&retagged).await),
         WorkRefusalCode::Invalid,
     );
 }
 
-#[test]
-fn a_job_already_in_flight_does_not_block_the_next_one() {
+#[tokio::test]
+async fn a_job_already_in_flight_does_not_block_the_next_one() {
     let root = temp();
-    let mut endpoint = provider_endpoint(root.path());
-    accepted_signature(&endpoint.accept(&signed_request(1, 1)));
-    let response = endpoint.accept(&signed_request(2, 2));
+    let mut endpoint = provider_endpoint(root.path()).await;
+    accepted_signature(&endpoint.accept(&signed_request(1, 1)).await);
+    let response = endpoint.accept(&signed_request(2, 2)).await;
     accepted_signature(&response);
     assert_eq!(endpoint.state().jobs().len(), 2);
 }
 
-#[test]
-fn a_poisoned_endpoint_is_unavailable() {
+#[tokio::test]
+async fn a_poisoned_endpoint_is_unavailable() {
     let root = temp();
-    let service = WorkService::new(provider_endpoint(root.path()));
-    let poisoner = service.clone();
+    let service = WorkService::new(provider_endpoint(root.path()).await);
     // The panic happens inside a service operation, which is the only
     // place the endpoint is borrowed from at all now.
+    use futures::FutureExt as _;
     let panicked =
-        std::thread::spawn(move || poisoner.with_state(|_| panic!("poison the endpoint"))).join();
-    assert!(panicked.is_err(), "the helper thread panicked on purpose");
+        std::panic::AssertUnwindSafe(service.with_state(|_| panic!("poison the endpoint")))
+            .catch_unwind()
+            .await;
+    assert!(
+        panicked.is_err(),
+        "the service operation panicked on purpose"
+    );
     assert!(matches!(
-        service.with_state(|state| state.cursor()),
+        service.with_state(|state| state.cursor()).await,
         Err(EndpointError::Poisoned)
     ));
     // And the refusal that answer becomes on the wire is unavailability,
     // not an accusation about the proposal.
     assert_eq!(
-        refusal_code(&service.accept(&signed_request(1, 1))),
+        refusal_code(&service.accept(&signed_request(1, 1)).await),
         WorkRefusalCode::Unavailable,
     );
 }
 
 // ── Binding an endpoint to its own half of its own channel ────────────
 
-#[test]
-fn an_endpoint_needs_its_own_store_settlement_role_and_key() {
+#[tokio::test]
+async fn an_endpoint_needs_its_own_store_settlement_role_and_key() {
     let root = temp();
-    let wrong_role = ProviderEndpoint::new(ready(), store(root.path(), Role::Client), provider());
+    let wrong_role =
+        ProviderEndpoint::new(ready(), store(root.path(), Role::Client).await, provider());
     assert!(
         matches!(wrong_role, Err(EndpointError::WrongRole { .. })),
         "a client journal is not a provider endpoint, got {wrong_role:?}",
     );
 
     let other = temp();
-    let wrong_key = ProviderEndpoint::new(ready(), store(other.path(), Role::Provider), client());
+    let wrong_key =
+        ProviderEndpoint::new(ready(), store(other.path(), Role::Provider).await, client());
     assert!(
         matches!(wrong_key, Err(EndpointError::WrongKey { .. })),
         "the client's key does not co-sign as the provider, got {wrong_key:?}",
@@ -1933,7 +1731,7 @@ fn an_endpoint_needs_its_own_store_settlement_role_and_key() {
     };
     let wrong_settlement = ProviderEndpoint::new(
         ready(),
-        store_with(third.path(), Role::Provider, thin),
+        store_with(third.path(), Role::Provider, thin).await,
         provider(),
     );
     assert!(
@@ -1962,7 +1760,9 @@ fn an_endpoint_needs_its_own_store_settlement_role_and_key() {
         Role::Provider,
         other_origin,
         &Secp256k1Verifier::new(),
-    ) else {
+    )
+    .await
+    else {
         panic!("the other channel's store opens");
     };
     let wrong_channel = ProviderEndpoint::new(ready(), other_store, provider());
@@ -1972,7 +1772,7 @@ fn an_endpoint_needs_its_own_store_settlement_role_and_key() {
     );
 
     let fifth = temp();
-    let ok = ClientEndpoint::new(ready(), store(fifth.path(), Role::Client), client());
+    let ok = ClientEndpoint::new(ready(), store(fifth.path(), Role::Client).await, client());
     assert!(ok.is_ok(), "the matching triple binds: {ok:?}");
 }
 
@@ -2023,11 +1823,11 @@ fn the_authorization_derives_every_field_it_does_not_choose() {
     );
 }
 
-#[test]
-fn the_wire_carries_the_authorization_the_signature_covers() {
+#[tokio::test]
+async fn the_wire_carries_the_authorization_the_signature_covers() {
     let root = temp();
-    let mut endpoint = client_endpoint(root.path());
-    let Ok(request) = endpoint.propose(&proposal(1)) else {
+    let mut endpoint = client_endpoint(root.path()).await;
+    let Ok(request) = endpoint.propose(&proposal(1)).await else {
         panic!("the proposal is built");
     };
     let authorization = authorization(1, 1);
@@ -2059,7 +1859,7 @@ fn the_wire_carries_the_authorization_the_signature_covers() {
 async fn client_observer_does_not_hold_the_journal_during_chain_io() {
     use hellas_work::work::{ClientChannel as _, ClientService};
     let root = temp();
-    let mut service = ClientService::new(client_endpoint(root.path()));
+    let mut service = ClientService::new(client_endpoint(root.path()).await);
     service
         .observer()
         .observe_ready(
@@ -2067,6 +1867,7 @@ async fn client_observer_does_not_hold_the_journal_during_chain_io() {
             hellas_work::work::ObservationTime::now(),
             std::time::Duration::from_secs(30),
         )
+        .await
         .unwrap();
     let released = Arc::new(AtomicBool::new(false));
     let source = HeldChain::over(CURSOR + 1..=CURSOR + 1, &released);
@@ -2081,13 +1882,17 @@ async fn client_observer_does_not_hold_the_journal_during_chain_io() {
     ));
     // The provider exchange can sign and journal while the observer waits.
     let request = service
-        .with_client(|endpoint| endpoint.propose(&proposal(1)))
+        .client()
+        .await
         .unwrap()
+        .propose(&proposal(1))
+        .await
         .unwrap();
     assert!(!request.client_signature.is_empty());
     assert_eq!(
         service
             .with_state(|state| state.proposal_nonce_high_water())
+            .await
             .unwrap(),
         1
     );
@@ -2101,7 +1906,7 @@ async fn shared_client_can_follow_blocks_while_waiting_for_provider_acceptance()
     use hellas_work::work::ClientService;
     let client_root = temp();
     let provider_root = temp();
-    let mut client = ClientService::new(client_endpoint(client_root.path()));
+    let mut client = ClientService::new(client_endpoint(client_root.path()).await);
     client
         .observer()
         .observe_ready(
@@ -2109,6 +1914,7 @@ async fn shared_client_can_follow_blocks_while_waiting_for_provider_acceptance()
             hellas_work::work::ObservationTime::now(),
             std::time::Duration::from_secs(30),
         )
+        .await
         .unwrap();
     let observer = client.observer();
     let (client_transport, server_transport) = transport_pair();
@@ -2120,6 +1926,7 @@ async fn shared_client_can_follow_blocks_while_waiting_for_provider_acceptance()
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         while observer
             .with_state(|state| state.proposal_nonce_high_water())
+            .await
             .unwrap()
             == 0
         {
@@ -2137,33 +1944,34 @@ async fn shared_client_can_follow_blocks_while_waiting_for_provider_acceptance()
             payload: payload_at(CURSOR + 1),
             txs: Vec::new(),
         })
+        .await
         .unwrap();
     let serving = serve(
         server_transport,
-        WorkService::new(provider_endpoint(provider_root.path())),
+        WorkService::new(provider_endpoint(provider_root.path()).await),
     );
     request.await.unwrap().unwrap();
     assert_eq!(
-        observer.with_state(|state| state.cursor().0).unwrap(),
+        observer.with_state(|state| state.cursor().0).await.unwrap(),
         CURSOR + 1
     );
     serving.abort();
 }
 
-#[test]
-fn managed_observers_start_closed_and_old_tips_cannot_renew_expired_readiness() {
+#[tokio::test]
+async fn managed_observers_start_closed_and_old_tips_cannot_renew_expired_readiness() {
     use hellas_work::work::{ClientChannel as _, ClientService};
     let client_root = temp();
     let provider_root = temp();
-    let mut client = ClientService::new(client_endpoint(client_root.path()));
-    let provider = WorkService::new(provider_endpoint(provider_root.path()));
-    provider.require_observer().unwrap();
+    let mut client = ClientService::new(client_endpoint(client_root.path()).await);
+    let provider = WorkService::new(provider_endpoint(provider_root.path()).await);
+    provider.require_observer().await.unwrap();
     assert!(matches!(
-        client.readiness(),
+        client.readiness().await,
         Err(EndpointError::ObservationStale)
     ));
     assert_eq!(
-        refusal_code(&provider.accept(&signed_request(1, 1))),
+        refusal_code(&provider.accept(&signed_request(1, 1)).await),
         WorkRefusalCode::NotReady
     );
     for max_age in [
@@ -2174,33 +1982,33 @@ fn managed_observers_start_closed_and_old_tips_cannot_renew_expired_readiness() 
         client
             .observer()
             .observe_ready(ready(), started, max_age)
+            .await
             .unwrap();
-        provider.observe_ready(ready(), started, max_age).unwrap();
+        provider
+            .observe_ready(ready(), started, max_age)
+            .await
+            .unwrap();
         assert!(matches!(
-            client
-                .with_client(|endpoint| endpoint.propose(&proposal(1)))
-                .unwrap(),
+            client.client().await.unwrap().propose(&proposal(1)).await,
             Err(ProposeError::Endpoint(EndpointError::ObservationStale))
         ));
         assert_eq!(
-            refusal_code(&provider.accept(&signed_request(1, 1))),
+            refusal_code(&provider.accept(&signed_request(1, 1)).await),
             WorkRefusalCode::NotReady
         );
     }
     assert_eq!(
         client
             .with_state(|state| state.proposal_nonce_high_water())
+            .await
             .unwrap(),
         0
     );
-    assert_eq!(provider.with_state(|state| state.jobs().len()).unwrap(), 0);
-}
-
-fn payment_policy() -> hellas_rpc::protocol::work::JobPaymentPolicyV2 {
-    hellas_rpc::protocol::work::JobPaymentPolicyV2 {
-        fixed_price: PRICE,
-        dispatch_margin_blocks: 4,
-        delivery_margin_blocks: 2,
-        oracle_grace_blocks: 6,
-    }
+    assert_eq!(
+        provider
+            .with_state(|state| state.jobs().len())
+            .await
+            .unwrap(),
+        0
+    );
 }

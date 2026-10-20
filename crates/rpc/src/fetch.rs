@@ -4,9 +4,10 @@ use crate::pb::execute::InputEventEnvelope as PbInputEventEnvelope;
 use crate::{
     Assurance, CanonicalizationId, ContentId, InputCommitment, InputEventEnvelope,
     InputTranscriptBuilder, JsonBytes, Operation, OutputEventEnvelope, OutputTranscriptBuilder,
-    ProducerSigningKey, PublicKey, Retention, StreamVerifyError, scheme_id,
-    verify_input_event_envelopes, verify_output_event_envelopes,
+    Retention, StreamVerifyError, scheme_id, verify_input_event_envelopes,
+    verify_output_event_envelopes,
 };
+use hellas_auth::{ProducerSigningKey, PublicKey};
 use k256::elliptic_curve::Generate as _;
 
 const INPUT_CANONICALIZATION: &[u8] = b"hellas.fetch.input.v3";

@@ -41,11 +41,11 @@ mod support;
 use hellas_kernel::{
     ApplyError, ApplyOutcome, BOND_LEASE_CHUNKS, BlockHash, BlockHeight, CoinId, Context, EdgeId,
     EventKind, Fees, Genesis, InvalidOpenReason, Key, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS,
-    OpenFunding, OpenProjection, Parties, Payout, ProtocolCode, RegistryChunkId, State, Terms,
-    TermsProfile, Tx, WorkPaymentTerms, WorkStakeBondTerms, bond_lease_slots, open_projection,
-    work_payment_settlement,
+    OpenFunding, OpenProjection, Parties, PartyKeys, Payout, ProtocolCode, RegistryChunkId, State,
+    Terms, TermsProfile, Tx, WorkPaymentTerms, WorkStakeBondTerms, bond_lease_slots,
+    open_projection, work_payment_settlement,
 };
-use support::{FAKE_VERIFIER, FixedStore, NETWORK, coin_id, key, open_tx, state};
+use support::{FAKE_VERIFIER, FixedStore, NETWORK, coin_id, key, open, state};
 
 const CLIENT: Key = key(7);
 const PROVIDER: Key = key(8);
@@ -259,11 +259,12 @@ fn projection_returns_the_rejection_apply_returns() {
             InvalidOpenReason::FeeOverflow,
         ),
         (
-            // A basic open verifies no proofs and reserves two, so a
-            // proof price that wraps the reserve leaves the open fee
-            // finite. Nothing else separates these two overflows.
+            // A one-coin basic open touches two slots and reserves
+            // five, so a slot price that wraps the reserve leaves the
+            // open fee finite. Nothing else separates these two
+            // overflows: both charge the same two proof units.
             "reserve wraps",
-            Fees::new(0, 0, u64::MAX, 0),
+            Fees::new(0, u64::MAX / 4, 0, 0),
             HORIZON,
             &[900],
             InvalidOpenReason::ReserveOverflow,
@@ -324,13 +325,13 @@ fn projection_matches_apply_at_the_funding_boundary() {
 /// This is the half a shared implementation cannot check against itself.
 #[test]
 fn projected_numbers_match_independently_computed_vectors() {
-    // Basic, two coins totalling 100, opened at height 1 with a horizon
-    // of 4. Open cost {base 1, slots 2+1, proofs 0} at (2,5,7,11):
-    // 2 + 15 = 17. Rent: 11 a block for 3 blocks = 33. Reserve cost
-    // {1, 5, 2}: 2 + 25 + 14 = 41. Principal: 100 - 17 - 33 - 41 = 9.
-    // A two-payout timeout costs {1, 2+1, 1} = 2 + 15 + 7 = 24, so it
-    // distributes 9 + (41 - 24) = 26.
-    let funding = funding_of(&[30, 70], &[]);
+    // Basic, two coins totalling 114, opened at height 1 with a horizon
+    // of 4. Open cost {base 1, slots 2+1, proofs 2} at (2,5,7,11):
+    // 2 + 15 + 14 = 31. Rent: 11 a block for 3 blocks = 33. Reserve
+    // cost {1, 5, 2}: 2 + 25 + 14 = 41. Principal: 114 - 31 - 33 - 41
+    // = 9. A two-payout timeout costs {1, 2+1, 1} = 2 + 15 + 7 = 24, so
+    // it distributes 9 + (41 - 24) = 26.
+    let funding = funding_of(&[44, 70], &[]);
     let terms = Terms::basic(
         PROTOCOL,
         parties(),
@@ -338,30 +339,31 @@ fn projected_numbers_match_independently_computed_vectors() {
         payouts_summing_to(26, 2, CLIENT),
     );
     let projection = project(Fees::new(2, 5, 7, 11), &funding, &terms);
-    assert_eq!(projection.open_fee(), 17);
+    assert_eq!(projection.open_fee(), 31);
     assert_eq!(projection.lifetime_fee(), 33);
     assert_eq!(projection.values().reserve(), 41);
     assert_eq!(projection.values().value(), 9);
     assert_eq!(projection.timeout_payout(), Some(26));
 
     // The same funding as a tag-4 bond at (1,3,0,3) with a horizon of 5.
-    // A bond is charged two proof units, reserves seven slots because
-    // its timeout reads both lease chunks, and here commits one payout:
-    // open 1 + 3*3 = 10, rent 3*4 = 12, reserve 1 + 3*7 = 22, principal
-    // 100 - 10 - 12 - 22 = 56. Its one-payout timeout costs
-    // 1 + 3*(1+3) = 13, so it distributes 56 + (22 - 13) = 65.
+    // A bond is charged two proof units, reserves eight slots because
+    // its timeout reads both lease chunks and the payment edge a lease
+    // names, and here commits one payout: open 1 + 3*3 = 10, rent
+    // 3*4 = 12, reserve 1 + 3*8 = 25, principal 114 - 10 - 12 - 25 = 67.
+    // Its one-payout timeout costs 1 + 3*(1+4) = 16, so it distributes
+    // 67 + (25 - 16) = 76.
     let terms = Terms::work_stake_bond(WorkStakeBondTerms {
         parties: parties(),
         timeout: BlockHeight::new(5),
-        timeout_outputs: payouts_summing_to(65, 1, CLIENT),
+        timeout_outputs: payouts_summing_to(76, 1, CLIENT),
         max_job_price: 4,
     });
     let projection = project(Fees::new(1, 3, 0, 3), &funding, &terms);
     assert_eq!(projection.open_fee(), 10);
     assert_eq!(projection.lifetime_fee(), 12);
-    assert_eq!(projection.values().reserve(), 22);
-    assert_eq!(projection.values().value(), 56);
-    assert_eq!(projection.timeout_payout(), Some(65));
+    assert_eq!(projection.values().reserve(), 25);
+    assert_eq!(projection.values().value(), 67);
+    assert_eq!(projection.timeout_payout(), Some(76));
 
     // A payment against a bond expiring at 5, at (2,5,7,11): its open
     // touches four more slots than a basic one, 2 + 5*5 + 14 = 41; rent
@@ -376,7 +378,7 @@ fn projected_numbers_match_independently_computed_vectors() {
     let terms = payment_terms(
         unused_edge(),
         &Terms::work_stake_bond(WorkStakeBondTerms {
-            parties: Parties::new(PROVIDER, CLIENT),
+            parties: Parties::new(PartyKeys::sole(PROVIDER), PartyKeys::sole(CLIENT)),
             timeout: BlockHeight::new(5),
             timeout_outputs: payouts_summing_to(1, 1, PROVIDER),
             max_job_price: 4,
@@ -427,7 +429,7 @@ const BOUNDARY_FEES: Fees = Fees::new(1, 3, 0, 3);
 const EXACT_DEBITS: u64 = 7 + 15 + 16;
 
 const fn parties() -> Parties {
-    Parties::new(CLIENT, PROVIDER)
+    Parties::new(PartyKeys::sole(CLIENT), PartyKeys::sole(PROVIDER))
 }
 
 const fn context(fees: Fees) -> Context {
@@ -481,7 +483,7 @@ fn basic_terms(fees: Fees, funding: &OpenFunding, payouts: usize) -> Terms {
 fn bond_terms(fees: Fees, funding: &OpenFunding, payouts: usize) -> Terms {
     let body = |outputs| {
         Terms::work_stake_bond(WorkStakeBondTerms {
-            parties: Parties::new(PROVIDER, CLIENT),
+            parties: Parties::new(PartyKeys::sole(PROVIDER), PartyKeys::sole(CLIENT)),
             timeout: HORIZON,
             timeout_outputs: outputs,
             max_job_price: 4,
@@ -580,11 +582,11 @@ fn case_state(
     state(
         store,
         [
-            Genesis::coin(MAKER_COINS[0], parties.maker(), at(maker, 0)),
-            Genesis::coin(MAKER_COINS[1], parties.maker(), at(maker, 1)),
-            Genesis::coin(MAKER_COINS[2], parties.maker(), at(maker, 2)),
-            Genesis::coin(TAKER_COINS[0], parties.taker(), at(taker, 0)),
-            Genesis::coin(TAKER_COINS[1], parties.taker(), at(taker, 1)),
+            Genesis::coin(MAKER_COINS[0], parties.maker().owner(), at(maker, 0)),
+            Genesis::coin(MAKER_COINS[1], parties.maker().owner(), at(maker, 1)),
+            Genesis::coin(MAKER_COINS[2], parties.maker().owner(), at(maker, 2)),
+            Genesis::coin(TAKER_COINS[0], parties.taker().owner(), at(taker, 0)),
+            Genesis::coin(TAKER_COINS[1], parties.taker().owner(), at(taker, 1)),
             Genesis::coin(BOND_COIN, PROVIDER, BOND_FUNDING),
         ],
     )
@@ -598,11 +600,17 @@ fn at(values: &[u64], index: usize) -> u64 {
 /// terms name.
 fn signed(funding: &OpenFunding, terms: &Terms) -> Tx {
     let parties = terms.parties();
-    open_tx(
+    open(
         funding.funding(),
         terms.clone(),
-        parties.maker(),
-        parties.taker(),
+        (
+            hellas_kernel::PartyKeys::sole(parties.maker().owner()),
+            hellas_kernel::Authority::Owner,
+        ),
+        (
+            hellas_kernel::PartyKeys::sole(parties.taker().owner()),
+            hellas_kernel::Authority::Owner,
+        ),
     )
 }
 

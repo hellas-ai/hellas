@@ -10,16 +10,19 @@ documentation.workspace = true
 [features]
 default = []
 otel = ["hellas-rpc/otel", "dep:hellas-wire"]
+test-support = ["dep:rcgen", "dep:tempfile", "dep:tokio-rustls"]
 
 [dependencies]
 async-stream = { workspace = true }
 base64.workspace = true
 futures.workspace = true
 hellas-adaptors.workspace = true
+hellas-auth.workspace = true
 hellas-executor = { workspace = true, default-features = false }
 hellas-private.workspace = true
 hellas-rpc = { workspace = true, features = ["fetch"] }
 hellas-wire = { workspace = true, optional = true }
+rcgen = { version = "0.14", optional = true }
 reqwest.workspace = true
 rustls = { version = "0.23", default-features = false, features = [
     "ring",
@@ -29,8 +32,12 @@ rustls = { version = "0.23", default-features = false, features = [
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-thiserror.workspace = true
+tempfile = { workspace = true, optional = true }
 tokio.workspace = true
+tokio-rustls = { version = "0.26", default-features = false, features = [
+    "ring",
+    "tls12",
+], optional = true }
 tracing.workspace = true
 url = "2"
 webpki-roots = "1"
@@ -38,6 +45,7 @@ x509-cert.workspace = true
 
 [dev-dependencies]
 axum.workspace = true
+hellas-providers = { path = ".", features = ["test-support"] }
 opentelemetry.workspace = true
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 rcgen = "0.14"

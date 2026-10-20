@@ -1,10 +1,10 @@
 use super::*;
-use hellas_kernel::{EdgeValues, Fees, Key, NetworkId};
-use hellas_rpc::peers::PeerId;
-use hellas_rpc::protocol::Digest;
-use hellas_rpc::protocol::work::*;
-use hellas_rpc::protocol::work_profile::WorkPolicy;
-use hellas_rpc::protocol::work_setup::ProviderChannelPolicy;
+use hellas_auth::Digest;
+use hellas_kernel::{EdgeValues, Fees, Key, NetworkId, PartyKeys};
+use hellas_wire::peers::PeerId;
+use hellas_work::model::profile::WorkPolicy;
+use hellas_work::model::setup::ProviderChannelPolicy;
+use hellas_work::model::work::*;
 use std::time::Duration;
 use std::{
     fs,
@@ -16,7 +16,8 @@ type CliResult<T> = anyhow::Result<T>;
 fn fetch_policy_loads_and_cannot_be_combined_with_evaluate() {
     let mut value = config();
     value["policies"]["fetch"] = serde_json::json!({
-    "allowed_environment": hex32(0x11),
+    "contract": hellas_rpc::FetchContract::http().unwrap(),
+    "allowed_environment": hellas_rpc::FetchContract::http().unwrap().manifest_id().to_string(),
     "service": "openai", "method": "responses",
     "max_request_body_bytes": 4096, "max_output_events": 64,
     "max_output_bytes": 16384, "max_spool_bytes": 65536,
@@ -446,8 +447,8 @@ use hellas_kernel::{
     BlockHeight, CoinId, EdgeId, Funding, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Parties,
     Payout, Secp256k1Signer, Secp256k1Verifier, Terms, Tx, WorkPaymentTerms, WorkStakeBondTerms,
 };
-use hellas_rpc::protocol::work::private_policy_commitment;
-use hellas_rpc::protocol::work_setup::WorkSetupError;
+use hellas_work::model::setup::WorkSetupError;
+use hellas_work::model::work::private_policy_commitment;
 use hellas_work::work_handshake::{PaymentAdmission, SetupEndpoint};
 use hellas_work::work_store::{Role, SetupScan, SetupStore};
 
@@ -505,7 +506,10 @@ fn bond_terms() -> WorkStakeBondTerms {
 /// fixture constant when the key comes from an identity file.
 fn bond_terms_staked_by(provider: &Secp256k1Signer) -> WorkStakeBondTerms {
     WorkStakeBondTerms {
-        parties: Parties::new(provider.party_key(), signer(0x21).party_key()),
+        parties: Parties::new(
+            PartyKeys::sole(provider.party_key()),
+            PartyKeys::sole(signer(0x21).party_key()),
+        ),
         timeout: BlockHeight::new(500),
         timeout_outputs: List::take([Payout::new(provider.party_key(), 64); MAX_EDGE_OUTPUTS], 1),
         max_job_price: 40,
@@ -559,22 +563,27 @@ fn payment_edge() -> EdgeId {
 /// The floor is armed here because a provider's own first revision
 /// is refused without one: recovery arming is not a step evidence
 /// gates, it is the step every later one is refused before.
-fn setup_endpoint(dir: &tempfile::TempDir, admission: PaymentAdmission) -> SetupEndpoint {
+async fn setup_endpoint(dir: &tempfile::TempDir, admission: PaymentAdmission) -> SetupEndpoint {
     let store = match SetupStore::open(
         dir.path(),
         network(),
         bond_edge(),
         Role::Provider,
         &Secp256k1Verifier::new(),
-    ) {
+    )
+    .await
+    {
         Ok(store) => store,
         Err(error) => panic!("the fixture journal opens: {error}"),
     };
     let mut endpoint = SetupEndpoint::new(store, signer(0x22), admission);
-    if let Err(error) = endpoint.arm_scan(SetupScan {
-        height: 7,
-        payload: [0x47; 32],
-    }) {
+    if let Err(error) = endpoint
+        .arm_scan(SetupScan {
+            height: 7,
+            payload: [0x47; 32],
+        })
+        .await
+    {
         panic!("the fixture arms its immutable history floor: {error}");
     }
     endpoint
@@ -591,10 +600,11 @@ fn admits() -> PaymentAdmission {
     PaymentAdmission::Admits(Box::new(policy()))
 }
 
-fn write_provider_offer(dir: &tempfile::TempDir) {
-    let mut endpoint = setup_endpoint(dir, admits());
+async fn write_provider_offer(dir: &tempfile::TempDir) {
+    let mut endpoint = setup_endpoint(dir, admits()).await;
     endpoint
         .propose_bond(network(), bond_funding(), bond_terms())
+        .await
         .expect("the provider offer is durable");
 }
 
@@ -615,20 +625,22 @@ fn config_for_route(root: &Path, client: Key) -> WorkConfig {
     .expect("the route fixture configuration loads")
 }
 
-#[test]
-fn a_route_loads_and_verifies_its_journals_client_taker() {
+#[tokio::test]
+async fn a_route_loads_and_verifies_its_journals_client_taker() {
     let dir = tempfile::tempdir().unwrap();
-    write_provider_offer(&dir);
+    write_provider_offer(&dir).await;
     let loaded = config_for_route(dir.path(), signer(0x21).party_key());
 
-    validate_work_routes(&loaded).expect("the route and its provider journal name the same client");
+    validate_work_routes(&loaded)
+        .await
+        .expect("the route and its provider journal name the same client");
     assert_eq!(loaded.routes.len(), 1);
 }
 
-#[test]
-fn a_route_is_refused_when_its_journal_names_another_client_taker() {
+#[tokio::test]
+async fn a_route_is_refused_when_its_journal_names_another_client_taker() {
     let dir = tempfile::tempdir().unwrap();
-    write_provider_offer(&dir);
+    write_provider_offer(&dir).await;
     let expected = signer(0x23).party_key();
     let journal_client = signer(0x21).party_key();
     let loaded = config_for_route(dir.path(), expected);
@@ -636,6 +648,7 @@ fn a_route_is_refused_when_its_journal_names_another_client_taker() {
     let error = format!(
         "{:#}",
         validate_work_routes(&loaded)
+            .await
             .expect_err("the configured client must be the bond terms' taker"),
     );
     assert!(
@@ -646,16 +659,17 @@ fn a_route_is_refused_when_its_journal_names_another_client_taker() {
     );
 }
 
-#[test]
-fn a_route_is_refused_when_its_journal_is_not_under_the_configured_root() {
+#[tokio::test]
+async fn a_route_is_refused_when_its_journal_is_not_under_the_configured_root() {
     let elsewhere = tempfile::tempdir().unwrap();
-    write_provider_offer(&elsewhere);
+    write_provider_offer(&elsewhere).await;
     let configured = tempfile::tempdir().unwrap();
     let loaded = config_for_route(configured.path(), signer(0x21).party_key());
 
     let error = format!(
         "{:#}",
         validate_work_routes(&loaded)
+            .await
             .expect_err("a route cannot reach a journal outside journal.root"),
     );
     assert!(
@@ -730,14 +744,15 @@ fn a_window_under_the_kernels_minimum_is_refused_by_the_loader() {
 /// A `ProviderChannelPolicy` is built from a configuration, and a
 /// `SetupEndpoint` over that — which is the pair nothing in this crate
 /// could construct at all.
-#[test]
-fn a_setup_endpoint_is_built_from_the_loaded_policy() {
+#[tokio::test]
+async fn a_setup_endpoint_is_built_from_the_loaded_policy() {
     let dir = tempfile::tempdir().unwrap();
-    let mut endpoint = setup_endpoint(&dir, admits());
+    let mut endpoint = setup_endpoint(&dir, admits()).await;
 
     assert!(endpoint.state().revision().is_none());
     let state = endpoint
         .propose_bond(network(), bond_funding(), bond_terms())
+        .await
         .expect("the endpoint signs and journals its bond proposal");
 
     assert_eq!(state.revision(), Some(1));
@@ -755,8 +770,8 @@ fn a_setup_endpoint_is_built_from_the_loaded_policy() {
 /// retained bond is what proves the rebuilt endpoint is the one that
 /// wrote the journal — a different key signs different bytes, and
 /// the journal refuses a revision that rewrites the one it holds.
-#[test]
-fn a_restarted_node_rebuilds_its_endpoint_from_the_root_and_the_identity() {
+#[tokio::test]
+async fn a_restarted_node_rebuilds_its_endpoint_from_the_root_and_the_identity() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("work-journals");
     let loaded = load(with(
@@ -772,7 +787,7 @@ fn a_restarted_node_rebuilds_its_endpoint_from_the_root_and_the_identity() {
     let identity_path = dir.path().join("identity");
     let identity = crate::identity::load_or_create(Some(&identity_path))
         .expect("the operator's identity is created once");
-    let settlement = crate::identity::settlement_signer(&identity);
+    let settlement = crate::identity::settlement_signer(&identity).unwrap();
     let terms = bond_terms_staked_by(&settlement);
     let bond_edge = Tx::edge_id_of(&bond_funding(), &Terms::work_stake_bond(terms.clone()));
 
@@ -786,6 +801,7 @@ fn a_restarted_node_rebuilds_its_endpoint_from_the_root_and_the_identity() {
             Role::Provider,
             &Secp256k1Verifier::new(),
         )
+        .await
         .expect("the journal opens under the configured root");
         let mut endpoint = SetupEndpoint::new(store, settlement.clone(), admission.clone());
         endpoint
@@ -793,9 +809,11 @@ fn a_restarted_node_rebuilds_its_endpoint_from_the_root_and_the_identity() {
                 height: 7,
                 payload: [0x47; 32],
             })
+            .await
             .expect("the immutable history floor is armed");
         endpoint
             .propose_bond(loaded.chain.network, bond_funding(), terms.clone())
+            .await
             .expect("the endpoint signs and journals its bond proposal");
     }
 
@@ -803,6 +821,7 @@ fn a_restarted_node_rebuilds_its_endpoint_from_the_root_and_the_identity() {
     // role anywhere in the configuration to be told them by.
     let found =
         hellas_work::work_store::discover_setups(&loaded.journal_root, loaded.chain.network)
+            .await
             .expect("the configured root enumerates");
     assert!(found.unidentified.is_empty(), "{:?}", found.unidentified);
     let [discovered] = found.setups.as_slice() else {
@@ -818,16 +837,18 @@ fn a_restarted_node_rebuilds_its_endpoint_from_the_root_and_the_identity() {
         discovered.role,
         &Secp256k1Verifier::new(),
     )
+    .await
     .expect("the discovered journal reopens");
     assert_eq!(store.state().revision(), Some(1));
     let mut endpoint = SetupEndpoint::new(
         store,
-        crate::identity::settlement_signer(&identity),
+        crate::identity::settlement_signer(&identity).unwrap(),
         admission.clone(),
     );
 
     let state = endpoint
         .propose_bond(loaded.chain.network, bond_funding(), terms)
+        .await
         .expect("the rebuilt endpoint answers for the journal it reopened");
 
     assert_eq!(state.revision(), Some(1));

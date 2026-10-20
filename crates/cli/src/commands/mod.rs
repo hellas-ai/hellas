@@ -2,33 +2,24 @@ pub type CliResult<T = ()> = anyhow::Result<T>;
 
 use anyhow::Context as _;
 use std::path::Path;
-use std::time::Duration;
 
-#[cfg(any(feature = "node", all(feature = "cloud", unix)))]
 pub mod admin;
-#[cfg(feature = "chain")]
 pub mod chain;
-#[cfg(feature = "node")]
 pub mod chain_node;
 pub(crate) mod codex_auth;
 pub mod contributions;
-#[cfg(feature = "node")]
-pub(crate) mod discovery;
+
 pub mod environment;
-#[cfg(feature = "gateway")]
 pub mod gateway_cache;
-#[cfg(feature = "gateway")]
 pub mod grant_gateway;
 pub mod identity;
-#[cfg(feature = "gateway")]
 pub mod llm;
 pub mod monitor;
-#[cfg(feature = "node")]
 pub mod paid_work;
 pub mod rpc;
-#[cfg(feature = "node")]
 pub mod serve;
 pub mod store;
+pub mod trust;
 
 /// Open an operator-selected ordinary file without hanging on a FIFO or
 /// device, then retain at most one byte beyond its protocol limit.
@@ -47,12 +38,4 @@ pub(crate) fn read_bounded_regular_file(
             path.display()
         )
     })
-}
-
-pub(crate) fn http_client(request_timeout: Duration) -> reqwest::Client {
-    reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(request_timeout)
-        .build()
-        .expect("HTTP client configuration is valid")
 }

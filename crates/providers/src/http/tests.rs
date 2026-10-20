@@ -1,6 +1,7 @@
 use super::*;
+use hellas_auth::Digest;
 use hellas_rpc::http_fetch::{HttpTls, HttpTrustRoots};
-use hellas_rpc::{Digest, InputCommitment, JsonBytes};
+use hellas_rpc::{InputCommitment, JsonBytes};
 use rcgen::generate_simple_self_signed;
 use sha2::{Digest as _, Sha256};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -224,7 +225,8 @@ fn prepared(request: &HttpFetchRequest) -> PreparedFetchRequest {
         JsonBytes::new(serde_json::to_vec(request).unwrap()),
         InputCommitment::from_digest(Digest::from_bytes([1; 32])),
     );
-    HttpFetchAdaptorFactory
+    HttpFetchAdaptorFactory::new()
+        .unwrap()
         .create(&call)
         .unwrap()
         .provider_request
@@ -496,11 +498,12 @@ fn special_addresses_never_qualify_as_public_egress() {
 /// the signed buyer request and authenticated response contain only the alias.
 #[tokio::test]
 async fn provider_injects_secret_without_disclosing_it_to_the_buyer() {
+    use hellas_auth::ProducerSigningKey;
     use hellas_rpc::fetch::{
         FetchOutputTranscriptBuilder, build_input_events_with_retention, verify_input_events,
         verify_output_events,
     };
-    use hellas_rpc::{Assurance, ProducerSigningKey, Retention};
+    use hellas_rpc::{Assurance, Retention};
     const SECRET: &str = "Bearer provider-only-demo-key";
     let (capture, mut captured) = tokio::sync::mpsc::unbounded_channel();
     let (mut request, calls, _, server) = server_fixture(
@@ -541,7 +544,7 @@ async fn provider_injects_secret_without_disclosing_it_to_the_buyer() {
         "http",
         "request",
         &serde_json::to_vec(&request).unwrap(),
-        FetchEnvironment::Http.manifest_id(),
+        hellas_rpc::FetchContract::http().unwrap().manifest_id(),
         Assurance::ProducerSigned,
         &buyer,
         Retention::Ephemeral,
@@ -554,7 +557,10 @@ async fn provider_injects_secret_without_disclosing_it_to_the_buyer() {
         input.body.clone(),
         input.input_commitment,
     );
-    let session = HttpFetchAdaptorFactory.create(&call).unwrap();
+    let session = HttpFetchAdaptorFactory::new()
+        .unwrap()
+        .create(&call)
+        .unwrap();
     let mut projector = session.projector;
     let response = provider.run(session.provider_request).await.unwrap();
     let mut projected = projector.begin(response.head).unwrap();

@@ -1,12 +1,13 @@
 use super::*;
-use hellas_rpc::ProducerSigningKey;
+use hellas_auth::ProducerSigningKey;
+use hellas_auth::ProducerSigningKey as SigningKey;
+use hellas_rpc::ContentId;
 use hellas_rpc::fetch::{
     FetchOutputTranscriptBuilder, FetchProtocolError, build_input_events, build_output_events,
     encode_fetch_event_payload, encode_fetch_terminal_payload,
 };
 use hellas_rpc::output::{OutputEvent, StopReason, TextChannel};
 use hellas_rpc::stream::{input_event_to_pb, output_event_to_pb};
-use hellas_rpc::{ContentId, ProducerSigningKey as SigningKey};
 
 const TEST_ASSURANCE: Assurance = Assurance::ProducerSigned;
 

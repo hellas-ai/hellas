@@ -5,11 +5,12 @@ use hellas_attestation::{
     AnchorTime, AppleCredential, ApplePolicy, AssertionCounterStore, RegisteredAppleCredential,
     apple_app_attest_root_ca, apple_app_id_hash, register_apple, verify_apple_assertion,
 };
+use hellas_auth::{Digest, PublicKey};
 use hellas_rpc::pb::execute::{OpenRequest, OpenResponse, open_response};
 use hellas_rpc::{
     AppleAppAttestEnrollment, Assurance, CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR,
-    CausalLmEnvironment, ContentId, Digest, PlatformCredential, PlatformEnrollment,
-    ProgramManifest, ProviderEnrollmentBundle, PublicKey, RootKind, RootProof,
+    CausalLmEnvironment, ContentId, PlatformCredential, PlatformEnrollment, ProgramManifest,
+    ProviderEnrollmentBundle, RootKind, RootProof,
 };
 use hellas_wire::iroh::IrohTransport;
 use hellas_wire::iroh::swarm::{DhtBackend, MdnsBackend, PeerExchangeBackend, ServiceRegistry};
@@ -98,10 +99,23 @@ impl Eq for AppleAppAttestTrust {}
 pub struct ProviderTrustAnchor {
     pub expected_genesis: ContentId,
     pub required_assurance: Assurance,
+    /// Caller-approved execution manifests. Discovery does not grant execution.
+    pub allowed_environments: Vec<ContentId>,
     pub apple_app_attest: Option<AppleAppAttestTrust>,
 }
 
 impl ProviderTrustAnchor {
+    /// Check each job, including resources revised after initial discovery.
+    pub fn verify_environment(&self, environment: ContentId) -> ClientResult<()> {
+        if self.allowed_environments.len() > 32 || !self.allowed_environments.contains(&environment)
+        {
+            return Err(ClientError::protocol(
+                "execution manifest is not independently approved",
+            ));
+        }
+        Ok(())
+    }
+
     /// Verify reusable enrollment evidence, without advancing a live assertion
     /// counter. Every remote connection must additionally authenticate Open.
     pub fn verify_enrollment(&self, bundle: &ProviderEnrollmentBundle) -> ClientResult<()> {
@@ -121,7 +135,7 @@ impl ProviderTrustAnchor {
             (RootKind::Software, RootProof::Software(signature), PlatformEnrollment::Absent)
                 if statement.platform_credential == PlatformCredential::Absent =>
             {
-                hellas_rpc::signature::verify_digest_signature(
+                hellas_auth::signature::verify_digest_signature(
                     &statement.root_public_key,
                     signature,
                     Digest::hash(&statement.canonical_bytes()),
@@ -378,7 +392,7 @@ fn verify_open_response(
                 hellas_rpc::signature_wire::signature_from_pb(signature).map_err(|source| {
                     ClientError::source("provider open signature is malformed", source)
                 })?;
-            hellas_rpc::signature::verify_digest_signature(
+            hellas_auth::signature::verify_digest_signature(
                 &genesis.statement.producer_public_key,
                 &signature,
                 binding,

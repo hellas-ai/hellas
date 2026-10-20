@@ -228,7 +228,7 @@ impl FetchProviderError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hellas_rpc::Digest;
+    use hellas_auth::Digest;
 
     #[test]
     fn prepared_request_identity_includes_the_signed_input() {

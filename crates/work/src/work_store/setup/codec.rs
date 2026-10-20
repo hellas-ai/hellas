@@ -201,7 +201,7 @@ pub(super) const fn role_from_code(code: u8) -> Result<Role, SetupStateError> {
 /// descriptor that described some other channel would be an endpoint
 /// recovering a close for a channel it does not have.
 pub(super) fn describes_bundle(
-    bundle: &WorkChannelSetupBundleV1,
+    bundle: &WorkChannelSetupBundleV2,
     close_descriptor: &CloseDescriptor,
 ) -> Result<(), SetupStateError> {
     let Some(payment_edge) = bundle.payment_edge() else {
@@ -297,7 +297,7 @@ impl SetupState {
         })?;
         let bundle = bundle_bytes
             .as_deref()
-            .map(WorkChannelSetupBundleV1::decode)
+            .map(WorkChannelSetupBundleV2::decode)
             .transpose()?;
         let scan_armed = take_option(&mut cursor, SetupStateError::Malformed, take_scan)?;
         let close_descriptor = take_option(&mut cursor, SetupStateError::Malformed, |cursor| {

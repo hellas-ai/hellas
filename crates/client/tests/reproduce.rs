@@ -2,36 +2,38 @@
 //!
 //! The honest result every test starts from is built the way a provider
 //! builds one: a real signed transcript, through
-//! `hellas_rpc::protocol::work::terminal_result`. Nothing here computes
+//! `hellas_work::model::work::terminal_result`. Nothing here computes
 //! the expected digest with the function under test, so a derivation that
 //! drifted would show up as the re-execution refuting an honest result
 //! rather than as two wrongs agreeing.
 
 #![cfg(feature = "work")]
 
+use hellas_auth::{Digest, ProducerSigningKey, PublicKey};
 use hellas_client::work::reproduce::{
     ReproduceFault, Reproduced, Reproducer, Reproduction, ReproductionRequest, plan, reproduce,
 };
 use hellas_kernel::{
-    BlockHeight, EdgeId, List, MAX_EDGE_OUTPUTS, NetworkId, Parties, Payout, Secp256k1Signer,
-    WorkPaymentTerms, WorkStakeBondTerms,
+    BlockHeight, EdgeId, List, MAX_EDGE_OUTPUTS, NetworkId, Parties, PartyKeys, Payout,
+    Secp256k1Signer, WorkPaymentTerms, WorkStakeBondTerms,
 };
 use hellas_rpc::evaluate::{
     EvaluateOutputTranscriptBuilder, EvaluateStopReason, EvaluateTerminal, EvaluateUsage,
     input_commitment,
 };
 use hellas_rpc::protocol::artifacts::{
-    BoundTermId, InputAddressed as _, OutputAddressed as _, PreparedPaidInputV1, SourceRef,
-    TextArtifact, TextExecution, TextExecutionId, TextPolicy, TokenIds, completed_text,
+    BoundTermId, InputAddressed as _, OutputAddressed as _, SourceRef, TextArtifact, TextExecution,
+    TextExecutionId, TextPolicy, TokenIds, completed_text,
 };
-use hellas_rpc::protocol::work::{
+use hellas_rpc::{
+    Application, Assurance, CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR, ContentId, EvaluateRequest,
+    OutputEventEnvelope, ProgramManifest,
+};
+use hellas_work::model::prepared_input::PreparedPaidInputV1;
+use hellas_work::model::work::{
     EvaluatePolicyV2, JobDeadlines, PaidChannel, PaidChannelPolicyV1, PaidJobAuthorizationV2,
     PaidJobResultV1, generation_policy_digest, identity_source_digest, private_policy_commitment,
     propose_authorization, terminal_result, work_id,
-};
-use hellas_rpc::{
-    Application, Assurance, CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR, ContentId, Digest,
-    EvaluateRequest, OutputEventEnvelope, ProducerSigningKey, ProgramManifest, PublicKey,
 };
 
 // ── Fixture ───────────────────────────────────────────────────────────
@@ -86,7 +88,10 @@ fn payment_terms() -> WorkPaymentTerms {
     WorkPaymentTerms {
         bond_edge: EdgeId::from_bytes([0x11; 32]),
         bond_terms: WorkStakeBondTerms {
-            parties: Parties::new(provider().party_key(), client().party_key()),
+            parties: Parties::new(
+                PartyKeys::sole(provider().party_key()),
+                PartyKeys::sole(client().party_key()),
+            ),
             timeout: BlockHeight::new(HORIZON),
             timeout_outputs: List::take(
                 [Payout::new(provider().party_key(), 64); MAX_EDGE_OUTPUTS],
@@ -588,8 +593,8 @@ async fn the_answer_is_bound_to_the_job_it_answers() {
     );
 }
 
-fn payment_policy() -> hellas_rpc::protocol::work::JobPaymentPolicyV2 {
-    hellas_rpc::protocol::work::JobPaymentPolicyV2 {
+fn payment_policy() -> hellas_work::model::work::JobPaymentPolicyV2 {
+    hellas_work::model::work::JobPaymentPolicyV2 {
         fixed_price: PRICE,
         dispatch_margin_blocks: 4,
         delivery_margin_blocks: 2,

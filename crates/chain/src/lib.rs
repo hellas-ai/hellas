@@ -16,8 +16,6 @@ pub mod domain;
 pub mod edge_index;
 #[cfg(any(feature = "indexer", feature = "validator"))]
 mod execution;
-#[cfg(feature = "validator")]
-pub mod faucet;
 #[cfg(feature = "client-core")]
 pub mod finality_proof;
 #[cfg(feature = "indexer-api")]
@@ -86,8 +84,8 @@ pub use hellas_rpc::{
 pub use indexer::{ChainIndexer, IngestError, IngestOutcome};
 #[cfg(any(feature = "client-core", feature = "server"))]
 pub use light_client::{
-    ConsensusActivity, ConsensusInfo, EdgeLookup, EdgeRecord, EdgeState, FinalizedBlock,
-    FinalizedBlockQuery, LatestBlock, LightClient, OwnerCoins, OwnerEdges, ProposalInfo,
+    CoinListing, ConsensusActivity, ConsensusInfo, EdgeLookup, EdgeRecord, EdgeState,
+    FinalizedBlock, FinalizedBlockQuery, LatestBlock, LightClient, OwnerEdges, ProposalInfo,
     QueryError,
 };
 #[cfg(any(feature = "indexer", feature = "validator"))]

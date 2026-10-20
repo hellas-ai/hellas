@@ -16,6 +16,8 @@ impl AuthorityState {
             actor: caller.subject,
             credential: caller.credential,
             credential_revision: caller.revision,
+            holder: caller.holder,
+            session: caller.session,
             at: now,
         })
     }
@@ -54,6 +56,8 @@ impl AuthorityState {
             || credential.generation != self.generation
             || credential.revision != record.credential_revision
             || credential.scope.subject != record.actor
+            || credential.holder != record.holder
+            || (record.session == SessionKind::Bearer) != credential.bearer()
             || record.at < credential.scope.not_before
             || record.at >= credential.scope.expires
         {
@@ -87,6 +91,9 @@ impl AuthorityState {
         record: &AdministrationRecord,
     ) -> Result<(), AuthorityError> {
         let scope = self.recorded_scope(&record.caller)?;
+        if self.step_up(record.caller.actor, &record.command) {
+            record.caller.session.step_up()?;
+        }
         match &record.command {
             AdministrationCommand::Grant(command) => {
                 self.check_credential_grant(scope, command, record.caller.at())?;
@@ -114,6 +121,25 @@ impl AuthorityState {
                 }
                 self.apply_credential(record.caller.actor(), command, record.caller.at())
             }
+        }
+    }
+
+    /// The step-up set within the authority: every credential issue or
+    /// revocation, and any grant change that names another principal (a
+    /// contact) or administrative rights. A principal's own execution grants
+    /// remain daily operations.
+    fn step_up(&self, actor: PrincipalId, command: &AdministrationCommand) -> bool {
+        let sensitive = |spec: &GrantSpec| spec.subject != actor || spec.administrative();
+        let existing = |id: &GrantId| self.grants.get(id).is_none_or(|g| sensitive(&g.spec));
+        match command {
+            AdministrationCommand::Credential(_) => true,
+            AdministrationCommand::Grant(
+                GrantCommand::Issue { spec, .. } | GrantCommand::Delegate { spec, .. },
+            ) => sensitive(spec),
+            AdministrationCommand::Grant(GrantCommand::Revise { id, spec, .. }) => {
+                sensitive(spec) || existing(id)
+            }
+            AdministrationCommand::Grant(GrantCommand::Revoke { id, .. }) => existing(id),
         }
     }
 
@@ -169,7 +195,7 @@ impl AuthorityState {
         Ok(())
     }
 
-    pub(super) fn admin_scope(
+    pub(in crate::authority) fn admin_scope(
         &self,
         scope: &GrantSpec,
         operation: &str,

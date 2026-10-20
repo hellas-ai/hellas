@@ -1,24 +1,31 @@
 use super::*;
 use crate::domain::genesis_object_id;
 use crate::execution::test_support::{
-    index_block, index_genesis as genesis, kernel_fixture, legacy_address as address,
+    index_block, index_genesis as genesis, kernel_fixture, owner_key as settlement, reshape,
     validator_key as key,
 };
 use commonware_consensus::types::{Epoch, Height, Round, View};
 use commonware_cryptography::{Digest as _, Signer as _};
+use commonware_cryptography::{Hasher as _, Sha256};
 use commonware_storage::{merkle::Location, mmr};
 use commonware_utils::non_empty_range;
 use hellas_kernel::SoftPasskey;
 use hellas_kernel::{
-    Auth, CloseKind, List, MAX_EDGE_OUTPUTS, Parties, Payout, Proof, ProtocolCode, Terms, Tx,
+    Auth, CloseKind, List, MAX_EDGE_OUTPUTS, Parties, PartyAuth, PartyKeys, Payout, Proof,
+    ProtocolCode, Terms, Tx,
 };
 
 fn block(parent: &HellasBlock, txs: Vec<Transaction>) -> HellasBlock {
     index_block(parent, commonware_cryptography::sha256::Digest::EMPTY, txs)
 }
 
-fn settlement(seed: u64) -> SettlementKey {
-    SettlementKey::from(address(seed))
+/// Owner 1 pays 40 of its 100 to owner 2 and keeps 60.
+fn payment() -> (Transaction, Vec<ObjectId>) {
+    reshape(
+        1,
+        &[genesis_object_id(0)],
+        &[(settlement(2), None, 40), (settlement(1), None, 60)],
+    )
 }
 
 #[test]
@@ -30,10 +37,8 @@ fn indexes_finalized_owner_transitions() {
         vec![(settlement(1), 100)],
     );
     let input = genesis_object_id(0);
-    let tx =
-        Transaction::transfer(crate::domain::TEST_NETWORK, &key(1), input, address(2), 40).unwrap();
-    let recipient_id = output_object_id(&Sha256::hash(&tx.encode()), 0);
-    let change_id = output_object_id(&Sha256::hash(&tx.encode()), 1);
+    let (tx, ids) = payment();
+    let (recipient_id, change_id) = (ids[0], ids[1]);
     let block = block(&genesis, vec![tx]);
 
     assert_eq!(indexer.apply_finalized(&block), Ok(ApplyOutcome::Applied));
@@ -56,14 +61,7 @@ fn duplicate_finalized_block_is_idempotent() {
         &genesis,
         vec![(settlement(1), 100)],
     );
-    let tx = Transaction::transfer(
-        crate::domain::TEST_NETWORK,
-        &key(1),
-        genesis_object_id(0),
-        address(2),
-        40,
-    )
-    .unwrap();
+    let (tx, _) = payment();
     let block = block(&genesis, vec![tx]);
 
     assert_eq!(indexer.apply_finalized(&block), Ok(ApplyOutcome::Applied));
@@ -83,14 +81,7 @@ fn stale_finalized_block_is_acknowledged_without_reapplying() {
         &genesis,
         vec![(settlement(1), 100)],
     );
-    let tx = Transaction::transfer(
-        crate::domain::TEST_NETWORK,
-        &key(1),
-        genesis_object_id(0),
-        address(2),
-        40,
-    )
-    .unwrap();
+    let (tx, _) = payment();
     let first = block(&genesis, vec![tx]);
     let second = block(&first, Vec::new());
 
@@ -151,6 +142,9 @@ fn conflicting_payload_at_cursor_height_is_rejected() {
     assert_eq!(indexer.cursor().payload, first.digest());
 }
 
+/// A block is applied whole or not at all: a reshape that spends a coin
+/// the index does not hold fails the block, and the good reshape before
+/// it in the same block leaves no trace.
 #[test]
 fn rejected_block_does_not_mutate_index() {
     let genesis = genesis();
@@ -159,69 +153,80 @@ fn rejected_block_does_not_mutate_index() {
         &genesis,
         vec![(settlement(1), 100)],
     );
-    let bad_tx = Transaction::transfer(
-        crate::domain::TEST_NETWORK,
-        &key(1),
-        genesis_object_id(0),
-        address(2),
-        0,
-    )
-    .unwrap();
-    let bad_block = block(&genesis, vec![bad_tx]);
+    let (good_tx, ids) = payment();
+    let missing = Sha256::hash(b"no such coin");
+    let (bad_tx, _) = reshape(1, &[missing], &[(settlement(2), None, 1)]);
+    let bad_block = block(&genesis, vec![good_tx.clone(), bad_tx]);
 
     assert_eq!(
         indexer.apply_finalized(&bad_block),
-        Err(OwnerIndexError::ZeroAmount)
+        Err(OwnerIndexError::ObjectNotFound { id: missing })
     );
     assert_eq!(indexer.cursor().height, 0);
     assert_eq!(indexer.get_coin(&genesis_object_id(0)), Ok(None));
+    assert!(indexer.get_coins_by_owner(&settlement(2)).is_empty());
 
-    let good_tx = Transaction::transfer(
-        crate::domain::TEST_NETWORK,
-        &key(1),
-        genesis_object_id(0),
-        address(2),
-        40,
-    )
-    .unwrap();
-    let recipient_id = output_object_id(&Sha256::hash(&good_tx.encode()), 0);
     let good_block = block(&genesis, vec![good_tx]);
-
     assert_eq!(
         indexer.apply_finalized(&good_block),
         Ok(ApplyOutcome::Applied)
     );
     assert_eq!(
         indexer.get_coins_by_owner(&settlement(2)),
-        vec![(recipient_id, 40)]
+        vec![(ids[0], 40)]
     );
 }
 
+/// A reshape's coins are indexed exactly as the kernel issues them,
+/// delegate included: the outputs name them, so the index needs no kernel
+/// to know them.
 #[test]
-fn legacy_transfer_cannot_spend_non_p256_settlement_key() {
+fn indexes_a_delegating_reshape_with_its_delegate() {
     let genesis = genesis();
-    let invalid_owner = SettlementKey::from_bytes([0xa5; SettlementKey::LENGTH]);
     let indexer = OwnerIndex::new(
         crate::domain::TEST_NETWORK,
         &genesis,
-        vec![(invalid_owner, 100)],
+        vec![(settlement(1), 100)],
     );
-    let tx = Transaction::transfer(
-        crate::domain::TEST_NETWORK,
-        &key(1),
-        genesis_object_id(0),
-        address(2),
-        40,
-    )
-    .unwrap();
-    let block = block(&genesis, vec![tx]);
-
+    let node = settlement(9);
+    let (tx, ids) = reshape(
+        1,
+        &[genesis_object_id(0)],
+        &[(settlement(1), Some(node), 70), (settlement(1), None, 30)],
+    );
     assert_eq!(
-        indexer.apply_finalized(&block),
-        Err(OwnerIndexError::InvalidSignature)
+        indexer.apply_finalized(&block(&genesis, vec![tx.clone()])),
+        Ok(ApplyOutcome::Applied)
     );
-    assert_eq!(indexer.cursor().height, 0);
+    assert_eq!(
+        indexer.get_coin(&ids[0]),
+        Ok(Some(Coin {
+            owner: settlement(1),
+            delegate: Some(node),
+            value: 70,
+        }))
+    );
+    assert_eq!(
+        indexer.get_coin(&ids[1]),
+        Ok(Some(Coin::owned(settlement(1), 30)))
+    );
     assert_eq!(indexer.get_coin(&genesis_object_id(0)), Ok(None));
+    // Delegated holdings are discoverable without increasing owned balance.
+    assert!(indexer.get_coins_by_owner(&node).is_empty());
+    {
+        let state = indexer.inner.read().unwrap();
+        assert_eq!(
+            state.by_owner[&node],
+            BTreeMap::from([((HOLDING_DELEGATED, ids[0]), 0)])
+        );
+        assert_eq!(state.by_owner[&settlement(1)].len(), 2);
+    }
+    let previous = block(&genesis, vec![tx.clone()]);
+    let (sweep, _) = reshape(1, &[ids[0]], &[(settlement(1), None, 70)]);
+    indexer
+        .apply_finalized(&block(&previous, vec![sweep]))
+        .unwrap();
+    assert!(!indexer.inner.read().unwrap().by_owner.contains_key(&node));
 }
 
 #[test]
@@ -235,7 +240,7 @@ fn indexes_kernel_edge_parties_and_coin_transitions() {
     );
     let open_block = block(&genesis, vec![Transaction::Kernel(fixture.open.clone())]);
     let edge_id = edge_object_id(fixture.edge);
-    let indexed_edge = IndexedEdge::from(fixture.terms.parties());
+    let indexed_edge = fixture.terms.parties();
     assert_eq!(
         indexer.apply_finalized(&open_block),
         Ok(ApplyOutcome::Applied)
@@ -245,11 +250,11 @@ fn indexes_kernel_edge_parties_and_coin_transitions() {
         Some(indexed_edge)
     );
     assert_eq!(
-        indexer.get_edges_by_owner(&indexed_edge.maker),
+        indexer.get_edges_by_owner(&SettlementKey::from(indexed_edge.maker().owner())),
         vec![(edge_id, indexed_edge)]
     );
     assert_eq!(
-        indexer.get_edges_by_owner(&indexed_edge.taker),
+        indexer.get_edges_by_owner(&SettlementKey::from(indexed_edge.taker().owner())),
         vec![(edge_id, indexed_edge)]
     );
     assert_eq!(indexer.get_coin(&genesis_object_id(0)), Ok(None));
@@ -272,16 +277,24 @@ fn indexes_kernel_edge_parties_and_coin_transitions() {
         Ok(ApplyOutcome::Applied)
     );
     assert_eq!(indexer.all_edges_for_test().get(&edge_id).copied(), None);
-    assert!(indexer.get_edges_by_owner(&indexed_edge.maker).is_empty());
-    assert!(indexer.get_edges_by_owner(&indexed_edge.taker).is_empty());
+    assert!(
+        indexer
+            .get_edges_by_owner(&SettlementKey::from(indexed_edge.maker().owner()))
+            .is_empty()
+    );
+    assert!(
+        indexer
+            .get_edges_by_owner(&SettlementKey::from(indexed_edge.taker().owner()))
+            .is_empty()
+    );
     for (id, payout) in fixture.payout_ids().iter().zip(&fixture.outputs) {
         let id = coin_object_id(*id);
         assert_eq!(
             indexer.get_coin(&id),
-            Ok(Some(Coin {
-                owner: SettlementKey::from(payout.owner()),
-                value: payout.value(),
-            }))
+            Ok(Some(Coin::owned(
+                SettlementKey::from(payout.owner()),
+                payout.value(),
+            )))
         );
     }
 }
@@ -299,7 +312,7 @@ fn same_party_edge_has_one_owner_membership_and_closes_cleanly() {
     let outputs = List::take(payout_values, 2);
     let terms = Terms::basic(
         ProtocolCode::new(1),
-        Parties::new(party, party),
+        Parties::new(PartyKeys::sole(party), PartyKeys::sole(party)),
         template.terms.timeout(),
         outputs.clone(),
     );
@@ -309,8 +322,12 @@ fn same_party_edge_has_one_owner_membership_and_closes_cleanly() {
     let open = Tx::open(
         funding,
         terms.clone(),
-        Auth::webauthn(passkey.sign(open_hash).expect("maker assertion")),
-        Auth::webauthn(passkey.sign(open_hash).expect("taker assertion")),
+        PartyAuth::owner(Auth::webauthn(
+            passkey.sign(open_hash).expect("maker assertion"),
+        )),
+        PartyAuth::owner(Auth::webauthn(
+            passkey.sign(open_hash).expect("taker assertion"),
+        )),
     );
     let close_hash = Tx::payload_hash(
         crate::domain::TEST_NETWORK,
@@ -322,8 +339,12 @@ fn same_party_edge_has_one_owner_membership_and_closes_cleanly() {
     let close = Tx::close(
         edge,
         Proof::mutual(
-            Auth::webauthn(passkey.sign(close_hash).expect("maker close assertion")),
-            Auth::webauthn(passkey.sign(close_hash).expect("taker close assertion")),
+            PartyAuth::owner(Auth::webauthn(
+                passkey.sign(close_hash).expect("maker close assertion"),
+            )),
+            PartyAuth::owner(Auth::webauthn(
+                passkey.sign(close_hash).expect("taker close assertion"),
+            )),
         ),
         outputs,
     );
@@ -334,7 +355,7 @@ fn same_party_edge_has_one_owner_membership_and_closes_cleanly() {
     );
     let open_block = block(&genesis, vec![Transaction::Kernel(open)]);
     let edge_id = edge_object_id(edge);
-    let indexed = IndexedEdge::from(terms.parties());
+    let indexed = terms.parties();
 
     assert_eq!(
         indexer.apply_finalized(&open_block),
@@ -404,24 +425,14 @@ fn close_of_unknown_edge_is_typed_and_does_not_mutate() {
 #[test]
 fn replay_matches_incremental_indexing() {
     let genesis = genesis();
-    let tx1 = Transaction::transfer(
-        crate::domain::TEST_NETWORK,
-        &key(1),
-        genesis_object_id(0),
-        address(2),
-        40,
-    )
-    .unwrap();
-    let change_id = output_object_id(&Sha256::hash(&tx1.encode()), 1);
+    let (tx1, ids) = payment();
+    let change_id = ids[1];
     let block1 = block(&genesis, vec![tx1]);
-    let tx2 = Transaction::transfer(
-        crate::domain::TEST_NETWORK,
-        &key(1),
-        change_id,
-        address(3),
-        25,
-    )
-    .unwrap();
+    let (tx2, _) = reshape(
+        1,
+        &[change_id],
+        &[(settlement(3), None, 25), (settlement(1), None, 35)],
+    );
     let block2 = block(&block1, vec![tx2]);
 
     let incremental = OwnerIndex::new(

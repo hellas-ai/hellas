@@ -6,6 +6,7 @@ use crate::worker::{
     EnqueueError, ExecuteJob, ExecuteWorker, GpuConfig, WorkerCompletion, WorkerCompletionResult,
 };
 use crate::{ExecutorError, ExecutorMetrics};
+use futures_util::future::BoxFuture;
 use hellas_rpc::evaluate::{
     EvaluateOutputTranscriptBuilder, EvaluateStopReason, EvaluateTerminal, EvaluateUsage,
     input_commitment,
@@ -13,9 +14,11 @@ use hellas_rpc::evaluate::{
 use hellas_rpc::protocol::artifacts::{OutputAddressed, TextExecutionId, completed_text};
 use hellas_rpc::{Assurance, ContentId, EvaluateRequest, OutputEventEnvelope};
 use hellas_store::ContentStore;
+use hellas_work::work::{BackendFault, admission::RunningWork};
 use std::{
     collections::{HashMap, VecDeque},
     sync::Arc,
+    task::{Context, Poll},
     time::Instant,
 };
 use tokio::sync::mpsc;
@@ -44,7 +47,9 @@ enum WorkerState {
 
 enum PendingExecution {
     Prepared {
-        input: hellas_work::work::PreparedEvaluateInput<hellas_work::work::admission::AdmittedWork>,
+        parts: hellas_work::model::prepared_input::PreparedPaidInputParts,
+        is_owed: bool,
+        dispatch: BoxFuture<'static, Result<RunningWork, BackendFault>>,
         complete: tokio::sync::oneshot::Sender<()>,
         sender:
             mpsc::Sender<Result<hellas_rpc::execution_event::WorkEvent, hellas_wire::WireStatus>>,
@@ -55,7 +60,7 @@ enum PendingExecution {
 impl PendingExecution {
     fn is_owed(&self) -> bool {
         match self {
-            Self::Prepared { input, .. } => input.admission().is_owed(),
+            Self::Prepared { is_owed, .. } => *is_owed,
             #[cfg(test)]
             Self::Resolved(_) => true,
         }
@@ -335,13 +340,15 @@ impl EvaluateEngine {
     ) -> Result<ExecuteOutcome, ExecutorError> {
         let (sender, events) = mpsc::channel(PER_EXECUTION_CHANNEL_CAPACITY);
         let (complete, completion) = tokio::sync::oneshot::channel();
+        let (parts, admission) = input.into_parts_and_admission();
         self.pending_owed_executions
             .push_back(PendingExecution::Prepared {
-                input,
+                parts,
+                is_owed: admission.is_owed(),
+                dispatch: Box::pin(admission.dispatch()),
                 sender,
                 complete,
             });
-        self.dispatch_next_execution();
         Ok(ExecuteOutcome { events, completion })
     }
 
@@ -352,67 +359,86 @@ impl EvaluateEngine {
         matches!(self.worker_state, WorkerState::Busy { .. })
             || !self.pending_owed_executions.is_empty()
     }
-    pub(crate) fn dispatch_next_execution(&mut self) {
+    pub(crate) fn poll_dispatch_execution(&mut self, cx: &mut Context<'_>) -> Poll<()> {
         if matches!(self.worker_state, WorkerState::Busy { .. }) {
-            return;
+            return Poll::Pending;
         }
-        loop {
-            let next = self
-                .pending_owed_executions
-                .iter()
-                .position(PendingExecution::is_owed)
-                .unwrap_or(0);
-            let Some(pending) = self.pending_owed_executions.remove(next) else {
-                return;
-            };
-            let job = match pending {
-                #[cfg(test)]
-                PendingExecution::Resolved(job) => job,
-                PendingExecution::Prepared {
-                    input,
-                    sender,
-                    complete,
-                } => {
-                    if matches!(self.worker_state, WorkerState::Stopped) {
-                        let _ = sender.try_send(Err(ExecutorError::ChannelClosed.into()));
-                        continue;
-                    }
-                    match self.prepare_for_dispatch(input, sender.clone(), complete) {
-                        Ok(job) => job,
-                        Err(error) => {
-                            let _ = sender.try_send(Err(error.into()));
-                            continue;
+        let next = self
+            .pending_owed_executions
+            .iter()
+            .position(PendingExecution::is_owed)
+            .unwrap_or(0);
+        let Some(pending) = self.pending_owed_executions.remove(next) else {
+            return Poll::Pending;
+        };
+        let job = match pending {
+            #[cfg(test)]
+            PendingExecution::Resolved(job) => job,
+            PendingExecution::Prepared {
+                parts,
+                is_owed,
+                mut dispatch,
+                complete,
+                sender,
+            } => {
+                let running = if matches!(self.worker_state, WorkerState::Stopped) {
+                    Err(ExecutorError::ChannelClosed)
+                } else {
+                    match dispatch.as_mut().poll(cx) {
+                        Poll::Ready(result) => result.map_err(ExecutorError::Backend),
+                        Poll::Pending => {
+                            self.pending_owed_executions.insert(
+                                next,
+                                PendingExecution::Prepared {
+                                    parts,
+                                    is_owed,
+                                    dispatch,
+                                    complete,
+                                    sender,
+                                },
+                            );
+                            return Poll::Pending;
                         }
                     }
-                }
-            };
-            match self.try_start_execution(job) {
-                Ok(()) => return,
-                Err(StartExecutionError::Busy(job) | StartExecutionError::Closed(job)) => {
-                    let _ = job
-                        .sender
-                        .try_send(Err(ExecutorError::ChannelClosed.into()));
-                }
-                Err(StartExecutionError::Rejected { job, error }) => {
-                    let _ = job.sender.try_send(Err(error.into()));
+                };
+                match running.and_then(|running| {
+                    self.prepare_for_dispatch(parts, running, sender.clone(), complete)
+                }) {
+                    Ok(job) => job,
+                    Err(error) => {
+                        let _ = sender.try_send(Err(error.into()));
+                        return Poll::Ready(());
+                    }
                 }
             }
+        };
+        match self.try_start_execution(job) {
+            Ok(()) => {}
+            Err(StartExecutionError::Busy(job) | StartExecutionError::Closed(job)) => {
+                let _ = job
+                    .sender
+                    .try_send(Err(ExecutorError::ChannelClosed.into()));
+            }
+            Err(StartExecutionError::Rejected { job, error }) => {
+                let _ = job.sender.try_send(Err(error.into()));
+            }
         }
+        Poll::Ready(())
     }
     fn prepare_for_dispatch(
         &mut self,
-        input: hellas_work::work::PreparedEvaluateInput<hellas_work::work::admission::AdmittedWork>,
+        parts: hellas_work::model::prepared_input::PreparedPaidInputParts,
+        running: RunningWork,
         sender: mpsc::Sender<
             Result<hellas_rpc::execution_event::WorkEvent, hellas_wire::WireStatus>,
         >,
         complete: tokio::sync::oneshot::Sender<()>,
     ) -> Result<ExecuteJob, ExecutorError> {
-        let (parts, admission) = input.into_parts_and_admission();
-        let running = admission.dispatch().map_err(ExecutorError::Backend)?;
+        running.check_active().map_err(ExecutorError::Backend)?;
         let (manifest, resolved) = resolve_prepared_paid_input(parts)?;
         let source = self.get_or_bind_environment(&manifest.canonical_bytes())?;
         let job = self.admit_resolved_job(resolved, source)?;
-        running.check_deadline().map_err(ExecutorError::Backend)?;
+        running.check_active().map_err(ExecutorError::Backend)?;
         let prompt = job.invocation.input_ids.len() as u64;
         self.metrics
             .record_execution_started("evaluate", "causal-lm", prompt, prompt);
@@ -430,7 +456,7 @@ impl EvaluateEngine {
         })
     }
     #[cfg(test)]
-    fn start(
+    async fn start(
         &mut self,
         job: EvaluateJob,
         execution_id: String,
@@ -446,6 +472,7 @@ impl EvaluateEngine {
         );
         let running = hellas_work::work::admission::AdmittedWork::payment(permit)
             .dispatch()
+            .await
             .unwrap();
         let job = ExecuteJob {
             span: tracing::Span::current(),
@@ -498,7 +525,8 @@ fn ensure_supported_assurance(
 #[cfg(test)]
 pub(crate) mod environment_admission_tests {
     use super::*;
-    use hellas_rpc::{CausalLmEnvironment, ContentRef, ProducerSigningKey};
+    use hellas_auth::ProducerSigningKey;
+    use hellas_rpc::{CausalLmEnvironment, ContentRef};
     use std::path::{Path, PathBuf};
     struct Scratch(PathBuf);
 
@@ -630,7 +658,7 @@ pub(crate) mod environment_admission_tests {
             .public_key();
         EvaluateJob {
             evaluate_request: EvaluateRequest {
-                text_execution: hellas_rpc::Digest::from_bytes([index; 32]),
+                text_execution: hellas_auth::Digest::from_bytes([index; 32]),
                 runner_public_key: runner,
                 execution_environment: fixture.manifest_id,
                 nonce: [index.wrapping_add(1); 32],
@@ -744,7 +772,7 @@ pub(crate) mod environment_admission_tests {
         };
         let resolved = ResolvedEvaluateExecution {
             evaluate_request: EvaluateRequest {
-                text_execution: hellas_rpc::Digest::from_bytes([4; 32]),
+                text_execution: hellas_auth::Digest::from_bytes([4; 32]),
                 runner_public_key: ProducerSigningKey::from_secret_bytes([8; 32])
                     .unwrap()
                     .public_key(),
@@ -786,8 +814,8 @@ pub(crate) mod environment_admission_tests {
         );
         let first = evaluate_job(&mut engine, &fixture, 1);
         let second = evaluate_job(&mut engine, &fixture, 2);
-        let first_stream = engine.start(first, "first".into()).unwrap();
-        drop(engine.start(second, "second".into()).unwrap());
+        let first_stream = engine.start(first, "first".into()).await.unwrap();
+        drop(engine.start(second, "second".into()).await.unwrap());
         assert!(!engine.has_queue_capacity());
         let job = control.try_recv().unwrap();
         assert_eq!(job.execution_id, "first");
@@ -807,7 +835,7 @@ pub(crate) mod environment_admission_tests {
                 },
             })
             .await;
-        engine.dispatch_next_execution();
+        futures_util::future::poll_fn(|cx| engine.poll_dispatch_execution(cx)).await;
         assert_eq!(control.try_recv().unwrap().execution_id, "second");
     }
 }

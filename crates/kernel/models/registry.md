@@ -41,13 +41,11 @@ reads it and — at the horizon — deletes it. No `.qnt` action opens a
 payment edge, so nothing abstract says a bond backs at most one channel,
 and nothing abstract distinguishes an unleased bond from a leased one.
 
-**The tag-4 bond itself is unmodelled.** `l1_stake.qnt` modelled the
-legacy tag-1 bond and was deleted with it. The tag-4 bond used to
-inherit its checked properties through a shared body; it no longer
-shares one, so stake conservation, provider-only funding, the immediate
-unleased timeout, the horizon leased timeout, and lease deletion are
-Rust-side properties only. A tag-4 lease/timeout model with ITF replay
-is owed before a paid release.
+**The unleased tag-4 bond is modelled by `delegation.qnt`.** Its traces
+cover delegated funding, value conservation, immediate unsigned timeout and
+owner-signed undelegated recovery. Payment leases, horizon expiry under a live
+lease and stale-lease deletion are checked by concrete Rust transaction tests;
+the delegation model has no lease state.
 
 There are no other registry records. The challenge bitmap, the
 live-game pointer and the winner record were deleted with the rest of
@@ -145,8 +143,8 @@ exactly the two lease writes.
 
 ## What the directory holds now, and what it dropped
 
-Four executable modules and their shared vocabulary. `l1.qnt` and
-`l1_fees.qnt` are the roots: typechecked, `quint test`ed, `quint run`
+Three executable roots and their shared vocabulary. `l1.qnt`,
+`l1_fees.qnt` and `delegation.qnt` are the roots: typechecked, `quint test`ed, `quint run`
 with named invariants, `quint verify`ed by Apalache, and — this is the
 part that makes them evidence rather than decoration — exported as ITF
 traces and replayed against the kernel by `tests/itf.rs`, which compares
@@ -154,7 +152,16 @@ coin owners and values, edge value, reserve, committed close fee,
 timeout, parties and terms hash, the emitted event, and the rejection of
 every input the model refused. `types.qnt`, `verifier.qnt`,
 `accounting.qnt`, `terms.qnt`, `bounds.qnt` and `rules/invariants.qnt`
-are their vocabulary and are reached through them.
+are the L1 models’ vocabulary and are reached through them.
+
+`delegation.qnt` tracks coin owner and delegate separately and checks consuming
+reshapes, signer admission, committed destinations and owner-signed recovery.
+Its nine ITF traces replay the same decisions against `State::apply`, including
+rejected transactions and the full live coin set. It covers Basic edges and
+unleased work-stake bonds, including owner-signed timeout recovery. The counterparty
+is a sole-key owner, so per-party recovery is exercised with its Owner close witness
+while the maker acts as Signer. Payment contests and leased-bond recovery remain
+covered by the concrete `tests/delegation.rs` transaction tests, not this model.
 
 Three things were removed because they modelled a system that does not
 exist, and the removal is recorded here rather than only in a commit

@@ -414,7 +414,8 @@ pub fn verify_apple_provider_genesis(
     credential: &RegisteredAppleCredential,
     policy: &ApplePolicy,
 ) -> Result<(), AttestationError> {
-    use hellas_rpc::{PlatformCredential, PublicKey, RootKind, RootProof};
+    use hellas_auth::PublicKey;
+    use hellas_rpc::{PlatformCredential, RootKind, RootProof};
     let statement = &genesis.statement;
     if statement.root_kind != RootKind::SecureEnclave
         || statement.platform_credential != PlatformCredential::Registered(credential.id)

@@ -8,7 +8,6 @@ pub use error::ExecutorError;
 #[cfg(feature = "evaluate")]
 mod artifacts;
 
-mod chain;
 #[cfg(feature = "evaluate")]
 mod environment;
 #[cfg(feature = "evaluate")]
@@ -27,7 +26,6 @@ mod worker;
 
 #[cfg(feature = "evaluate")]
 pub use catena_lang::safe_gpu::Backend as GpuBackend;
-pub use chain::kernel_signer;
 #[cfg(feature = "evaluate")]
 pub use environment::{CausalLmEnvironmentSource, CausalLmEnvironmentSourceError};
 pub use executor::{Executor, ExecutorHandle, ExecutorSpawnConfig};

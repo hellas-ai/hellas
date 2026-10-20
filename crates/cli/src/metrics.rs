@@ -12,7 +12,7 @@ use tracing::info;
 pub struct MetricsBundle {
     pub prometheus: Arc<Registry>,
     #[cfg(feature = "otel")]
-    pub iroh: Option<iroh::metrics::EndpointMetrics>,
+    pub iroh: Option<tokio::sync::watch::Receiver<Option<iroh::Endpoint>>>,
 }
 
 impl MetricsBundle {
@@ -26,8 +26,8 @@ impl MetricsBundle {
 
     /// Attach iroh's `EndpointMetrics` so they are emitted alongside the
     /// prometheus-client registry.
-    #[cfg(all(feature = "otel", feature = "node"))]
-    pub fn with_iroh(mut self, iroh: iroh::metrics::EndpointMetrics) -> Self {
+    #[cfg(feature = "otel")]
+    pub fn with_iroh(mut self, iroh: tokio::sync::watch::Receiver<Option<iroh::Endpoint>>) -> Self {
         self.iroh = Some(iroh);
         self
     }
@@ -104,7 +104,9 @@ fn append_iroh_metrics(buf: &mut String, bundle: &MetricsBundle) {
     };
 
     let mut reg = IrohRegistry::default();
-    reg.register_all_prefixed(iroh);
+    if let Some(endpoint) = iroh.borrow().as_ref() {
+        reg.register_all_prefixed(endpoint.metrics());
+    }
     let _ = reg.encode_openmetrics_to_writer(buf);
 }
 

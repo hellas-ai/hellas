@@ -54,10 +54,10 @@
 pub mod payment;
 pub mod reproduce;
 
-use hellas_rpc::protocol::artifacts::PreparedPaidInputV1;
-use hellas_rpc::protocol::work::PaidJobResultV1;
-use hellas_rpc::protocol::work_setup::ReadyChannel;
 use hellas_wire::StreamTransport;
+use hellas_work::model::prepared_input::PreparedPaidInputV1;
+use hellas_work::model::setup::ReadyChannel;
+use hellas_work::model::work::PaidJobResultV1;
 use hellas_work::work::{ClientEndpoint, DeliverError, fetch_result};
 use hellas_work::work_store::journal::MAX_RECORD_BYTES;
 
@@ -140,7 +140,7 @@ pub async fn collect_result<T, C>(
     endpoint: &mut ClientEndpoint,
     ready: &ReadyChannel,
     source: &C,
-    work_id: hellas_rpc::protocol::Digest,
+    work_id: hellas_auth::Digest,
 ) -> Result<CollectResultOutcome, CollectResultError>
 where
     T: StreamTransport + Sync,
@@ -229,7 +229,7 @@ pub enum CollectError {
     #[error("the separate re-execution refuted this result")]
     Refuted {
         /// The answer digest the client's own re-execution produced.
-        reproduction_digest: hellas_rpc::protocol::Digest,
+        reproduction_digest: hellas_auth::Digest,
     },
 }
 
@@ -275,7 +275,7 @@ pub async fn collect_checked_result<T, C, E>(
     ready: &ReadyChannel,
     source: &C,
     engine: &E,
-    work_id: hellas_rpc::protocol::Digest,
+    work_id: hellas_auth::Digest,
 ) -> Result<CollectOutcome, CollectError>
 where
     T: StreamTransport + Sync,
@@ -315,7 +315,7 @@ where
     // Phase 3 — checked apply, durable either way.
     match reproduction {
         Ok(Reproduction::Matched) => {
-            endpoint.matched(work_id)?;
+            endpoint.matched(work_id).await?;
             Ok(CollectOutcome::Checked(CheckedResult {
                 result: delivery.result,
                 transcript: delivery.transcript,
@@ -324,7 +324,7 @@ where
         Ok(Reproduction::Refuted {
             reproduction_digest,
         }) => {
-            endpoint.refuted(work_id, reproduction_digest)?;
+            endpoint.refuted(work_id, reproduction_digest).await?;
             Err(CollectError::Refuted {
                 reproduction_digest,
             })

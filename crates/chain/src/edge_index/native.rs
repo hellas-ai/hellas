@@ -430,10 +430,7 @@ impl EdgeIndex {
         let network = hellas_kernel::NetworkId::new(&self.store.identity.network_id)
             .ok_or_else(|| EdgeIndexError::corrupt("invalid network identity"))?;
         let payment_id = hellas_kernel::EdgeId::from_bytes(
-            hex::decode(&request.payment_edge_id)
-                .map_err(EdgeIndexError::bad)?
-                .try_into()
-                .map_err(|_| EdgeIndexError::bad("invalid edge id"))?,
+            hellas_auth::hex::parse(&request.payment_edge_id).map_err(EdgeIndexError::bad)?,
         );
         let mut raw_slots = [None; hellas_kernel::BOND_LEASE_CHUNKS as usize];
         let mut lease_slots = Vec::new();
@@ -446,7 +443,7 @@ impl EdgeIndex {
             raw_slots[index] = chunk;
             lease_slots.push(RegistrySlot {
                 object_id: hex::encode(object_id),
-                chunk: chunk.as_ref().map(canonical_bytes),
+                chunk: chunk.as_ref().map(encode_kernel),
             });
         }
         let pending_id = crate::domain::registry_chunk_object_id(
@@ -471,7 +468,7 @@ impl EdgeIndex {
             lease_slots,
             pending_slot: Some(RegistrySlot {
                 object_id: hex::encode(pending_id),
-                chunk: raw_pending.as_ref().map(canonical_bytes),
+                chunk: raw_pending.as_ref().map(encode_kernel),
             }),
             lease: Some(lease),
             pending: Some(pending),

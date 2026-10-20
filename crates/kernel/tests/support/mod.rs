@@ -13,9 +13,9 @@ pub(crate) mod map_store;
 
 use hellas_kernel::{
     Auth, Batch, BlockHeight, CloseKind, Coin, CoinId, Edge, EdgeId, Funding, Genesis, InsertError,
-    KernelResult, Key, List, MAX_EDGE_OUTPUTS, NetworkId, Parties, PayloadHash, Payout, Proof,
-    RegistryChunk, RegistryChunkId, RegistryNamespace, Sig, SigVerifier, Snapshot, State, Store,
-    Terms, TermsHash, Tx, View,
+    KernelResult, Key, List, MAX_EDGE_OUTPUTS, NetworkId, Parties, PartyAuth, PayloadHash, Payout,
+    Proof, RegistryChunk, RegistryChunkId, RegistryNamespace, Sig, SigVerifier, Snapshot, State,
+    Store, Terms, TermsHash, Tx, View,
 };
 
 /// The network every fixture in this crate's tests is bound to.
@@ -335,7 +335,7 @@ pub(crate) const fn coin_view(coin: Coin) -> (Key, u64) {
     (coin.owner(), coin.value())
 }
 
-pub(crate) const fn edge_view(edge: Edge) -> (u64, u64, BlockHeight, Parties, TermsHash) {
+pub(crate) const fn edge_view(edge: &Edge) -> (u64, u64, BlockHeight, Parties, TermsHash) {
     (
         edge.value(),
         edge.reserve(),
@@ -368,16 +368,31 @@ pub(crate) fn payouts(entries: &[(Key, u64)]) -> List<Payout, MAX_EDGE_OUTPUTS> 
     list
 }
 
-/// `Tx::Open` authorized with the placeholder sigs `FAKE_VERIFIER`
-/// accepts, keyed to `maker`/`taker`. Adversarial tests pass mismatching
-/// keys.
-pub(crate) fn open_tx(funding: Funding, terms: Terms, maker: Key, taker: Key) -> Tx {
+/// A role-labelled placeholder witness, verified through the kernel's shared path.
+pub(crate) fn witness(
+    party: hellas_kernel::PartyKeys,
+    authority: hellas_kernel::Authority,
+    hash: PayloadHash,
+) -> PartyAuth {
+    PartyAuth::new(
+        authority,
+        Auth::native(Sig::placeholder(party.key(authority), hash)),
+    )
+}
+
+/// An open with explicit role-labelled keys; adversarial tests may supply foreign parties.
+pub(crate) fn open(
+    funding: Funding,
+    terms: Terms,
+    maker: (hellas_kernel::PartyKeys, hellas_kernel::Authority),
+    taker: (hellas_kernel::PartyKeys, hellas_kernel::Authority),
+) -> Tx {
     let hash = Tx::open_hash(NETWORK, &funding, &terms);
     Tx::open(
         funding,
         terms,
-        Auth::native(Sig::placeholder(maker, hash)),
-        Auth::native(Sig::placeholder(taker, hash)),
+        witness(maker.0, maker.1, hash),
+        witness(taker.0, taker.1, hash),
     )
 }
 
@@ -391,8 +406,8 @@ pub(crate) fn placeholder_mutual(
 ) -> Proof {
     let hash = mutual_hash(input, terms, outputs);
     Proof::mutual(
-        Auth::native(Sig::placeholder(maker, hash)),
-        Auth::native(Sig::placeholder(taker, hash)),
+        PartyAuth::owner(Auth::native(Sig::placeholder(maker, hash))),
+        PartyAuth::owner(Auth::native(Sig::placeholder(taker, hash))),
     )
 }
 

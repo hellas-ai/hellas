@@ -5,7 +5,7 @@ use std::{io, path::Path};
 use tokio::net::UnixStream;
 mod server;
 pub use crate::local::{LOCAL_MUX_SLOTS, transport};
-pub use server::{LocalControlServer, connect};
+pub use server::{LocalControlServer, connect, connect_stream};
 
 pub type UnixMessagePipe = LengthDelimitedMessagePipe<UnixStream>;
 

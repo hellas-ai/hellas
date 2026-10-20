@@ -56,5 +56,5 @@ pub enum WorkConfigError {
     #[error(transparent)]
     Resource(#[from] crate::ResourceConfigError),
     #[error("paid execution policy is not usable: {0}")]
-    Policy(#[from] hellas_rpc::protocol::work::PaidWorkError),
+    Policy(#[from] hellas_work::model::work::PaidWorkError),
 }

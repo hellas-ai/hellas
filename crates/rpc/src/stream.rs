@@ -5,11 +5,11 @@ use crate::signature_wire::{
 #[cfg(test)]
 use crate::{Assurance, Operation, scheme_id};
 use crate::{
-    CanonicalizationId, Digest, EventCommitment, InputCommitment, InputEventBody,
-    InputEventBodyParts, InputEventEnvelope, OutputEventBody, OutputEventBodyParts,
-    OutputEventEnvelope, ProducerId, SchemeId, SignedInputEvent, SignedOutputEvent, StreamId,
-    StreamVerifyError,
+    CanonicalizationId, EventCommitment, InputCommitment, InputEventBody, InputEventBodyParts,
+    InputEventEnvelope, OutputEventBody, OutputEventBodyParts, OutputEventEnvelope, SchemeId,
+    SignedInputEvent, SignedOutputEvent, StreamId, StreamVerifyError,
 };
+use hellas_auth::{Digest, ProducerId};
 
 use crate::pb::execute as pb;
 
@@ -164,7 +164,7 @@ pub enum StreamEnvelopeError {
     #[error("unknown scheme id: {0}")]
     Scheme(#[from] TagError),
     #[error("signature error: {0}")]
-    Signature(#[from] crate::SignatureError),
+    Signature(#[from] hellas_auth::SignatureError),
     #[error("signature wire error: {0}")]
     SignatureWire(#[from] crate::signature_wire::SignatureWireError),
     #[error("stream verification error: {0}")]
@@ -175,9 +175,9 @@ pub enum StreamEnvelopeError {
 mod tests {
     use super::*;
     use crate::{
-        CanonicalizationId, InputTranscriptBuilder, OutputTranscriptBuilder, ProducerSigningKey,
-        input_genesis,
+        CanonicalizationId, InputTranscriptBuilder, OutputTranscriptBuilder, input_genesis,
     };
+    use hellas_auth::ProducerSigningKey;
 
     fn key(byte: u8) -> ProducerSigningKey {
         ProducerSigningKey::from_secret_bytes([byte; 32]).expect("valid test key")

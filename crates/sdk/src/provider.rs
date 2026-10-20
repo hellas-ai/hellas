@@ -1,10 +1,9 @@
+use hellas_work::model::grant::records::{check_grant_provider, grant_transport};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use hellas_attestation::RootProver;
 use hellas_executor::{Executor, ExecutorSpawnConfig, FetchRoute, FetchRouteRegistry};
-#[cfg(feature = "grant-provider")]
-use hellas_executor::{FetchRouteEntry, FetchRoutePolicy};
 use hellas_rpc::open::OpenDispatcher;
 use hellas_rpc::pb::execute::{OpenRequest, OpenResponse, open_response};
 use hellas_rpc::signature_wire::signature_to_pb;
@@ -17,16 +16,15 @@ use hellas_wire::{
 };
 use iroh::{Endpoint, EndpointId, endpoint::presets};
 
-use crate::ClientIdentity;
-
-const MAX_ACTIVE_CONNECTIONS: usize = 64;
-const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+use crate::NodeIdentity;
 
 /// Startup errors, before a provider accepts requests.
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
     #[error("provider task failed")]
     Task(#[from] tokio::task::JoinError),
+    #[error(transparent)]
+    Control(#[from] WireStatus),
     #[error("provider requires a Work funding configuration")]
     FundingRequired,
     #[error("paid channel names an unavailable Fetch route or manifest")]
@@ -35,17 +33,14 @@ pub enum ProviderError {
     WrongPaidPolicy,
     #[error("provider enrollment does not match this identity")]
     Identity,
-    #[cfg(feature = "grant-provider")]
     #[error(transparent)]
     GrantConfig(#[from] crate::grant_provider::GrantProviderError),
     #[error(transparent)]
-    Grant(#[from] hellas_rpc::protocol::work_grant::records::GrantError),
+    Grant(#[from] hellas_work::model::grant::records::GrantError),
     #[error(transparent)]
-    GrantStore(#[from] hellas_work::work_store::grant::GrantStoreError),
+    NodeStore(#[from] hellas_work::work_store::grant::NodeStoreError),
     #[error("invalid provider settlement key")]
     SettlementKey,
-    #[error(transparent)]
-    OpenAiKey(#[from] hellas_providers::EmptyOpenAiKey),
     #[error(transparent)]
     RouteBinding(#[from] hellas_executor::FetchRouteBindingError),
     #[error(transparent)]
@@ -58,39 +53,19 @@ pub enum ProviderError {
     Address(#[from] iroh::endpoint::InvalidSocketAddr),
     #[error(transparent)]
     Io(#[from] std::io::Error),
-    #[cfg(feature = "paid-provider")]
+    #[error("discovery could not start: {0}")]
+    Discovery(String),
     #[error(transparent)]
     Config(#[from] crate::work_config::WorkConfigError),
-    #[cfg(feature = "paid-provider")]
     #[error(transparent)]
     Paid(#[from] crate::paid_provider::PaidProviderError),
 }
 
-#[cfg(feature = "grant-provider")]
-pub struct OpenAiProviderOptions<R> {
-    pub port: Option<u16>,
-    pub identity: ClientIdentity,
-    pub enrollment: ProviderEnrollmentBundle,
-    pub root: Arc<R>,
-    pub state_directory: PathBuf,
-    pub service: String,
-    pub method: String,
-    pub bearer_token: String,
-    pub grantees: Vec<hellas_rpc::protocol::work_grant::records::Principal>,
-    /// Per-contact counters. The machine shares the configured execution capacity.
-    pub limits: Vec<hellas_rpc::protocol::work_grant::budget::Limit>,
-    pub max_job_millis: std::num::NonZeroU64,
-    pub fetch_max_in_flight: usize,
-    pub fetch_queue_capacity: usize,
-}
-
 /// Paid policy and its process-owned executing chain node.
-#[cfg(feature = "paid-provider")]
 pub struct PaidProviderOptions {
     config: crate::work_config::WorkConfig,
     node: crate::FullNode,
 }
-#[cfg(feature = "paid-provider")]
 impl PaidProviderOptions {
     pub fn new(
         config: crate::work_config::WorkConfig,
@@ -104,31 +79,279 @@ impl PaidProviderOptions {
 /// An attested Fetch provider with an operator-supplied route registry.
 pub struct FetchProviderOptions<R> {
     pub port: Option<u16>,
-    pub identity: ClientIdentity,
+    pub identity: NodeIdentity,
     pub enrollment: ProviderEnrollmentBundle,
     pub root: Arc<R>,
     pub state_directory: PathBuf,
-    #[cfg(feature = "grant-provider")]
     pub grants: Option<crate::GrantProviderOptions>,
     pub routes: FetchRouteRegistry,
     pub fetch_max_in_flight: usize,
     pub fetch_queue_capacity: usize,
-    #[cfg(feature = "paid-provider")]
     pub paid_work: Option<PaidProviderOptions>,
 }
 
-#[cfg(feature = "paid-provider")]
-use crate::paid_provider::WorkWatcher;
+impl<R> FetchProviderOptions<R> {
+    /// Validate Fetch-specific configuration before starting the shared native host.
+    pub async fn prepare(self) -> Result<ProviderOptions<R>, ProviderError> {
+        let options = self;
+        let has_paid_work = options.paid_work.is_some();
+        let has_grants = options.grants.is_some();
+        if !has_paid_work && !has_grants {
+            return Err(ProviderError::FundingRequired);
+        }
+        if let Some(paid) = &options.paid_work {
+            let config = &paid.config;
+            use hellas_work::model::{fetch::FetchRoutePolicy as PaidRoute, profile::WorkPolicy};
+            match &config.work_policy {
+                WorkPolicy::Fetch {
+                    policy,
+                    route: PaidRoute::SealedRoute { service, method },
+                    ..
+                } => {
+                    if !options
+                        .routes
+                        .entry(&FetchRoute::new(service, method))
+                        .is_some_and(|entry| {
+                            entry.execution_environment() == policy.allowed_environment
+                        })
+                    {
+                        return Err(ProviderError::MissingPaidRoute);
+                    }
+                }
+                WorkPolicy::Fetch {
+                    policy,
+                    route: PaidRoute::OpenFetch { .. },
+                    ..
+                } => {
+                    if !options.routes.has_environment(policy.allowed_environment) {
+                        return Err(ProviderError::MissingPaidRoute);
+                    }
+                }
+                _ => return Err(ProviderError::WrongPaidPolicy),
+            }
+            crate::work_config::validate_work_routes(config).await?;
+        }
+        let assurance = match options.enrollment.genesis.statement.root_kind {
+            hellas_rpc::RootKind::Software => Assurance::ProducerSigned,
+            hellas_rpc::RootKind::SecureEnclave => Assurance::AppleAppAttest,
+        };
+        if let Some(grants) = &options.grants {
+            crate::grant_provider::ProviderResources::Fetch(&options.routes)
+                .validate(&grants.policies)?;
+        }
+        let work_config = options
+            .paid_work
+            .map(|PaidProviderOptions { config, node }| {
+                let policy = config.provider_policy();
+                let settlement_key = hellas_kernel::Secp256k1Signer::from_secret_scalar(
+                    options.identity.node_secret_bytes(),
+                )
+                .map_err(|_| ProviderError::SettlementKey)?;
+                let runner_config = crate::paid_provider::WorkRunnerConfig {
+                    network: config.chain.network,
+                    journal_root: config.journal_root,
+                    routes: config.routes,
+                    poll: config.poll,
+                    max_observation_age: config.max_observation_age,
+                    settlement_key,
+                    policy,
+                };
+                runner_config.validate()?;
+                Ok::<_, ProviderError>((runner_config, node))
+            })
+            .transpose()?;
+        let producer_key = Arc::new(options.identity.node_key().clone());
+        let mut executor_config =
+            ExecutorSpawnConfig::fetch_only(producer_key.clone(), assurance, options.routes);
+        executor_config.fetch_max_in_flight = options.fetch_max_in_flight;
+        executor_config.fetch_queue_capacity = options.fetch_queue_capacity;
+        Ok(ProviderOptions {
+            port: options.port,
+            secret_key: options.identity.transport_key(),
+            open_identity: Arc::new(ProviderOpen::new(
+                producer_key,
+                options.enrollment,
+                Some(options.root),
+            )?),
+            executor: executor_config,
+            grants: options.grants.map(|config| ProviderGrants {
+                config,
+                authority: ProviderAuthority::Journal {
+                    root: options.state_directory.join("grants"),
+                },
+            }),
+            work: work_config,
+            build: String::new(),
+            graffiti: Vec::new(),
+            discovery: false,
+        })
+    }
+}
 
+/// Optional local control and explicitly admitted remote control peers.
+pub struct ProviderControl {
+    pub socket: PathBuf,
+    pub tls: Arc<rustls::ServerConfig>,
+    pub remote: crate::node_control::RemoteControlAdmission,
+}
+
+/// Already initialized node authority and the resources available on this host.
+#[derive(Clone)]
+pub struct ProviderGrants {
+    pub config: crate::GrantProviderOptions,
+    pub authority: ProviderAuthority,
+}
+
+/// A standalone provider opens its journal once; an embedded provider attaches
+/// to the host's existing control service and writer.
+#[derive(Clone)]
+pub enum ProviderAuthority {
+    Journal { root: PathBuf },
+    Host(crate::node_control::NodeControl),
+}
+impl ProviderAuthority {
+    fn remote_admission(&self) -> crate::node_control::RemoteControlAdmission {
+        match self {
+            Self::Journal { .. } => Default::default(),
+            Self::Host(control) => control.remote_admission(),
+        }
+    }
+}
+
+impl ProviderGrants {
+    pub(crate) async fn open(
+        &self,
+        resources: crate::grant_provider::ProviderResources<'_>,
+        provider: &ProviderEnrollmentBundle,
+    ) -> Result<hellas_work::node::NodeCoordinator, ProviderError> {
+        resources.validate(&self.config.policies)?;
+        match &self.authority {
+            ProviderAuthority::Journal { root, .. } => Ok(hellas_work::node::NodeCoordinator::new(
+                hellas_work::work_store::grant::NodeStore::open(
+                    root,
+                    hellas_work::model::grant::grant_network(),
+                    Some(provider.clone()),
+                    hellas_auth::authority::UnixMillis::now().unwrap_or_default(),
+                )
+                .await?,
+                Arc::new(|| hellas_auth::authority::UnixMillis::now().unwrap_or_default()),
+            )),
+            ProviderAuthority::Host(control) => {
+                let node = control.node();
+                node.check_provider(provider).await?;
+                Ok(node)
+            }
+        }
+    }
+}
+
+/// Shared provider composition for Fetch, local evaluation and optional paid work.
+/// The caller owns discovery advertising and the executing chain node's lifetime.
+pub struct ProviderOptions<R> {
+    pub executor: ExecutorSpawnConfig,
+    pub grants: Option<ProviderGrants>,
+    pub port: Option<u16>,
+    pub build: String,
+    pub graffiti: Vec<u8>,
+    pub discovery: bool,
+    pub work: Option<(WorkRunnerConfig, crate::FullNode)>,
+    pub secret_key: iroh::SecretKey,
+    pub open_identity: Arc<ProviderOpen<R>>,
+}
+
+impl<R> Clone for ProviderOptions<R> {
+    fn clone(&self) -> Self {
+        Self {
+            executor: self.executor.clone(),
+            grants: self.grants.clone(),
+            port: self.port,
+            build: self.build.clone(),
+            graffiti: self.graffiti.clone(),
+            work: self.work.clone(),
+            secret_key: self.secret_key.clone(),
+            open_identity: self.open_identity.clone(),
+            discovery: self.discovery,
+        }
+    }
+}
+
+impl<R> ProviderOptions<R> {
+    /// Select shared host ownership before starting any service or opening a journal.
+    pub fn on_host(
+        mut self,
+        control: crate::node_control::NodeControl,
+    ) -> Result<Self, ProviderError> {
+        self.grants
+            .as_mut()
+            .ok_or(ProviderError::FundingRequired)?
+            .authority = ProviderAuthority::Host(control);
+        Ok(self)
+    }
+}
+
+use crate::paid_provider::{MountedSetup, MountedWork, WorkRunner, WorkRunnerConfig, WorkWatcher};
+use crate::work_router::WorkRouter;
+use hellas_rpc::services::node::{Node, NodeServer};
+use hellas_rpc::services::work::Work;
+use hellas_rpc::services::work_setup::{WorkSetup, WorkSetupServer};
+use hellas_wire::peers::{PeerDirectory, PeerId, PeerManager};
+use hellas_wire::serve::AccountingDispatcher;
+use iroh::endpoint::{Connection, Incoming};
+use std::time::Duration;
+use tokio::sync::{mpsc, oneshot, watch};
+use tokio::task::JoinSet;
+use tracing::{debug, warn};
+mod discovery;
+mod node;
+use node::NodeHandlerImpl;
+const MAX_ACTIVE_RPC_CONNECTIONS: usize = 128;
+const MAX_RPC_IN_FLIGHT_PER_CONNECTION: usize = 16;
+const MAX_RPC_HANDSHAKES: usize = 16;
+const MAX_RPC_HANDSHAKES_PER_PEER: usize = 2;
+
+enum IncomingConnection {
+    Standalone(Box<Incoming>),
+    Host(Connection),
+}
+impl IncomingConnection {
+    fn refuse(self) {
+        match self {
+            Self::Standalone(incoming) => (*incoming).refuse(),
+            Self::Host(connection) => connection.close(503u32.into(), b"provider at capacity"),
+        }
+    }
+}
+
+const RPC_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+const RPC_CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 pub struct ProviderHandle {
-    router: crate::work_router::WorkRouter,
+    configuration: Option<crate::node_control::configuration::ProviderMetadata>,
+    administration: Option<hellas_work::grant_service::WorkAdministration>,
+    router: Option<WorkRouter>,
+    discovery: Option<discovery::DiscoveryAdvertiser>,
+    stop: Option<oneshot::Sender<()>>,
+    drained: Option<oneshot::Sender<()>>,
+    alpns: Vec<Vec<u8>>,
     endpoint: Endpoint,
+    owns_endpoint: bool,
     accept_task: tokio::task::JoinHandle<()>,
-    #[cfg(feature = "paid-provider")]
     work: Option<WorkWatcher>,
 }
 
 impl ProviderHandle {
+    pub fn with_configuration(
+        mut self,
+        metadata: crate::node_control::configuration::ProviderMetadata,
+    ) -> Self {
+        self.configuration = Some(metadata);
+        self
+    }
+    pub(crate) fn configuration(
+        &self,
+    ) -> Option<&crate::node_control::configuration::ProviderMetadata> {
+        self.configuration.as_ref()
+    }
+
     pub fn node_id(&self) -> EndpointId {
         self.endpoint.id()
     }
@@ -137,58 +360,50 @@ impl ProviderHandle {
         self.endpoint.bound_sockets()
     }
 
-    /// Export fresh private Offers to distribute to the configured contacts.
-    #[cfg(feature = "grant-provider")]
-    pub fn offers(
-        &self,
-    ) -> Result<Vec<hellas_rpc::protocol::work_grant::records::SignedOffer>, ProviderError> {
-        use hellas_rpc::protocol::work_grant::{
-            admin::{GrantCommand, GrantReply},
-            records::GrantState,
-        };
-        let Some(service) = self.router.grant_service() else {
-            return Ok(vec![]);
-        };
-        let ids = service.administer(|store, _| {
-            Ok(store
-                .state()
-                .grants()
-                .filter(|g| g.state == GrantState::Active)
-                .map(|g| g.id)
-                .collect::<Vec<_>>())
-        })?;
-        ids.into_iter()
-            .map(|id| {
-                match service.control(
-                    GrantCommand::Inspect { id },
-                    &[],
-                    std::num::NonZeroU64::new(1).unwrap(),
-                )? {
-                    GrantReply::Status { offer, .. } => Ok(*offer),
-                    _ => Err(ProviderError::FundingRequired),
-                }
-            })
-            .collect()
+    pub fn endpoint(&self) -> &Endpoint {
+        &self.endpoint
+    }
+
+    pub fn alpns(&self) -> &[Vec<u8>] {
+        &self.alpns
+    }
+
+    /// Checked native administration over this provider's exact node writer.
+    pub fn is_finished(&self) -> bool {
+        self.accept_task.is_finished()
+    }
+
+    pub fn administration(&self) -> Option<&hellas_work::grant_service::WorkAdministration> {
+        self.administration.as_ref()
     }
 
     /// Stop ingress, join accepted work and close the endpoint before returning errors.
     pub async fn shutdown(mut self) -> Result<(), ProviderError> {
-        self.accept_task.abort();
-        let mut result = match (&mut self.accept_task).await {
-            Ok(()) => Ok(()),
-            Err(error) if error.is_cancelled() => Ok(()),
-            Err(error) => Err(ProviderError::Task(error)),
-        };
-        if let Some(grants) = self.router.grant_service() {
+        self.stop.take();
+        let mut result = Ok(());
+        if let Some(discovery) = self.discovery.take() {
+            discovery.shutdown().await;
+        }
+        if let Some(grants) = self.router.as_ref().and_then(WorkRouter::grant_service) {
             let drained = grants.drain().await.map_err(ProviderError::from);
             result = result.and(drained);
         }
-        #[cfg(feature = "paid-provider")]
         if let Some(work) = &mut self.work {
             let stopped = work.shutdown().await.map_err(ProviderError::from);
             result = result.and(stopped);
         }
-        self.endpoint.close().await;
+        // Work has reached its durable completion boundary. Stop accepting
+        // further substreams, then let already dispatched replies finish.
+        self.drained.take();
+        let joined = match (&mut self.accept_task).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.is_cancelled() => Ok(()),
+            Err(error) => Err(ProviderError::Task(error)),
+        };
+        result = result.and(joined);
+        if self.owns_endpoint {
+            self.endpoint.close().await;
+        }
         result
     }
 }
@@ -199,394 +414,482 @@ impl Drop for ProviderHandle {
     }
 }
 
-#[cfg(feature = "grant-provider")]
-pub async fn start_openai_provider<R>(
-    options: OpenAiProviderOptions<R>,
-) -> Result<ProviderHandle, ProviderError>
-where
-    R: RootProver + Send + Sync + 'static,
-{
-    let policy = crate::grant_provider::responses_policy(&options.service, &options.method)?;
-    let upstream = Arc::new(hellas_providers::OpenAiResponsesFetchProvider::with_bearer(
-        options.bearer_token,
-    )?);
-    let adaptor = Arc::new(hellas_providers::ResponsesFetchAdaptorFactory::new(
-        hellas_rpc::FetchEnvironment::OpenAiResponses,
-    ));
-    let mut routes = FetchRouteRegistry::new();
-    routes.register(
-        FetchRoute::new(options.service, options.method),
-        FetchRouteEntry::new(upstream, adaptor, FetchRoutePolicy::default())?,
-    )?;
-    start_fetch_provider(FetchProviderOptions {
-        port: options.port,
-        identity: options.identity,
-        enrollment: options.enrollment,
-        root: options.root,
-        state_directory: options.state_directory,
-        routes,
-        grants: Some(crate::GrantProviderOptions {
-            grantees: options.grantees,
-            policies: vec![policy],
-            limits: options.limits,
-            max_job_millis: options.max_job_millis,
-        }),
-        fetch_max_in_flight: options.fetch_max_in_flight,
-        fetch_queue_capacity: options.fetch_queue_capacity,
-        #[cfg(feature = "paid-provider")]
-        paid_work: None,
-    })
-    .await
-}
-
-pub async fn start_fetch_provider<R>(
-    options: FetchProviderOptions<R>,
-) -> Result<ProviderHandle, ProviderError>
-where
-    R: RootProver + Send + Sync + 'static,
-{
-    #[cfg(feature = "paid-provider")]
-    let has_paid_work = options.paid_work.is_some();
-    #[cfg(not(feature = "paid-provider"))]
-    let has_paid_work = false;
-    #[cfg(feature = "grant-provider")]
-    let has_grants = options.grants.is_some();
-    #[cfg(not(feature = "grant-provider"))]
-    let has_grants = false;
-    if !has_paid_work && !has_grants {
-        return Err(ProviderError::FundingRequired);
-    }
-    #[cfg(feature = "paid-provider")]
-    if let Some(paid) = &options.paid_work {
-        let config = &paid.config;
-        use hellas_rpc::protocol::{
-            work_fetch::FetchRoutePolicy as PaidRoute, work_profile::WorkPolicy,
-        };
-        match &config.work_policy {
-            WorkPolicy::Fetch {
-                policy,
-                route: PaidRoute::SealedRoute { service, method },
-            } => {
-                if !options
-                    .routes
-                    .entry(&FetchRoute::new(service, method))
-                    .is_some_and(|entry| {
-                        entry.execution_environment() == policy.allowed_environment
-                    })
-                {
-                    return Err(ProviderError::MissingPaidRoute);
-                }
-            }
-            WorkPolicy::Fetch {
-                policy,
-                route: PaidRoute::OpenFetch { .. },
-            } => {
-                if !options.routes.has_environment(policy.allowed_environment) {
-                    return Err(ProviderError::MissingPaidRoute);
-                }
-            }
-            _ => return Err(ProviderError::WrongPaidPolicy),
-        }
-        crate::work_config::validate_work_routes(config)?;
-    }
-    options.enrollment.check_grant_provider()?;
-    if options.enrollment.genesis.statement.producer_public_key
-        != options.identity.caller_key().public_key()
-        || options.enrollment.grant_transport()? != *options.identity.node_id().as_bytes()
-    {
-        return Err(ProviderError::Identity);
-    }
-    let assurance = match options.enrollment.genesis.statement.root_kind {
-        hellas_rpc::RootKind::Software => Assurance::ProducerSigned,
-        hellas_rpc::RootKind::SecureEnclave => Assurance::AppleAppAttest,
-    };
-    #[cfg(feature = "grant-provider")]
-    let grant_plan = options
-        .grants
-        .as_ref()
-        .map(|grants| {
-            crate::grant_provider::GrantProviderPlan::contacts(
-                grants,
-                &options.state_directory,
-                options.enrollment.clone(),
-                hellas_rpc::protocol::work_grant::records::Principal::verify(
-                    options.enrollment.clone(),
-                )
-                .or_else(|_| {
-                    options
-                        .identity
-                        .contact_enrollment(options.identity.caller_key())
-                        .map_err(|_| {
-                            hellas_rpc::protocol::work_grant::records::GrantError::Signature
-                        })
-                        .and_then(hellas_rpc::protocol::work_grant::records::Principal::verify)
-                })?,
-                &options.routes,
-                options.fetch_max_in_flight,
-            )
-        })
-        .transpose()?;
-    #[cfg(feature = "paid-provider")]
-    let chain = options.paid_work.as_ref().map(|paid| paid.node.clone());
-    #[cfg(feature = "paid-provider")]
-    let work_config = options
-        .paid_work
-        .map(|PaidProviderOptions { config, node }| {
-            let policy = config.provider_policy();
-            let settlement_key = hellas_kernel::Secp256k1Signer::from_secret_scalar(
-                options.identity.caller_secret_bytes(),
-            )
-            .map_err(|_| ProviderError::SettlementKey)?;
-            let runner_config = crate::paid_provider::WorkRunnerConfig {
-                network: config.chain.network,
-                journal_root: config.journal_root,
-                routes: config.routes,
-                poll: config.poll,
-                max_observation_age: config.max_observation_age,
-                settlement_key,
-                policy,
-            };
-            runner_config.validate()?;
-            Ok::<_, ProviderError>((runner_config, node))
-        })
-        .transpose()?;
-    let producer_key = Arc::new(options.identity.caller_key().clone());
-    let mut executor_config =
-        ExecutorSpawnConfig::fetch_only(producer_key.clone(), assurance, options.routes);
-    executor_config.fetch_max_in_flight = options.fetch_max_in_flight;
-    executor_config.fetch_queue_capacity = options.fetch_queue_capacity;
-    let executor = Executor::spawn_configured(executor_config).await?;
-    #[cfg(feature = "grant-provider")]
-    let grant_store = grant_plan
-        .map(crate::grant_provider::GrantProviderPlan::open)
-        .transpose()?;
-
-    #[cfg(feature = "paid-provider")]
-    let work_mount = crate::paid_provider::MountedWork::with_backend(executor.clone());
-    #[cfg(feature = "paid-provider")]
-    let setup_mount = crate::paid_provider::MountedSetup::default();
-    #[cfg(feature = "paid-provider")]
-    let runner = work_config
-        .map(|(config, node)| {
-            crate::paid_provider::WorkRunner::discover(
-                config,
-                work_mount.clone(),
-                setup_mount.clone(),
-            )
-            .map(|runner| runner.on_node(node))
-        })
-        .transpose()?;
-    let open = ProviderOpen {
-        signer: producer_key.clone(),
-        root: options.root,
-        enrollment: options.enrollment,
-    };
-    let mut alpns = vec![hellas_rpc::services::work::Work::ALPN.as_bytes().to_vec()];
-    if has_paid_work {
-        alpns.push(
-            hellas_rpc::services::work_setup::WorkSetup::ALPN
-                .as_bytes()
-                .to_vec(),
-        );
-    }
-    #[cfg(feature = "paid-provider")]
-    if chain.is_some() {
-        alpns.push(
+fn served_alpns(
+    work_configured: bool,
+    grants_configured: bool,
+    remote_control: bool,
+) -> Vec<Vec<u8>> {
+    let mut alpns = vec![Node::ALPN.as_bytes().to_vec()];
+    if work_configured {
+        alpns.extend([
             hellas_rpc::services::chain_sync::ChainSync::ALPN
                 .as_bytes()
                 .to_vec(),
+            WorkSetup::ALPN.as_bytes().to_vec(),
+            Work::ALPN.as_bytes().to_vec(),
+        ]);
+    }
+    if grants_configured && !work_configured {
+        alpns.push(Work::ALPN.as_bytes().to_vec());
+    }
+    if grants_configured && remote_control {
+        alpns.push(
+            hellas_rpc::services::host_control::HostControl::ALPN
+                .as_bytes()
+                .to_vec(),
         );
-        alpns.push(hellas_rpc::services::node::Node::ALPN.as_bytes().to_vec());
     }
-    let mut builder = Endpoint::builder(presets::N0)
-        .secret_key(options.identity.transport_key())
-        .alpns(alpns.clone());
-    if let Some(port) = options.port {
-        builder = builder.bind_addr(std::net::SocketAddr::from(([0, 0, 0, 0], port)))?;
+    alpns
+}
+
+pub async fn start_fetch_provider<R>(
+    config: ProviderOptions<R>,
+) -> Result<ProviderHandle, ProviderError>
+where
+    R: RootProver + Send + Sync + 'static,
+{
+    if let Some((work, _)) = &config.work {
+        work.validate()?;
     }
-    let endpoint = builder.bind().await?;
-    #[cfg(feature = "paid-provider")]
-    let discovery = chain.as_ref().map(|node| {
-        node.discovery(
-            endpoint.id(),
-            alpns
-                .iter()
-                .map(|alpn| String::from_utf8(alpn.clone()).expect("service ALPN is ASCII"))
+    let enrollment = &config.open_identity.enrollment;
+    check_grant_provider(enrollment)?;
+    if grant_transport(enrollment)? != *config.secret_key.public().as_bytes()
+        || enrollment.genesis.statement.producer_public_key
+            != config.executor.producer_key.public_key()
+    {
+        return Err(ProviderError::Identity);
+    }
+    let prepared_grants = match config.grants {
+        Some(grants) => {
+            let resources = if config.executor.supports_evaluate() {
+                crate::grant_provider::ProviderResources::EvaluateAndFetch(
+                    &config.executor.fetch_routes,
+                )
+            } else {
+                crate::grant_provider::ProviderResources::Fetch(&config.executor.fetch_routes)
+            };
+            let store = grants.open(resources, enrollment).await?;
+            Some((grants, store))
+        }
+        None => None,
+    };
+    let signer = config.executor.producer_key.clone();
+    let handle = Executor::spawn_configured(config.executor).await?;
+    let remote_control = prepared_grants
+        .as_ref()
+        .map(|(grants, _)| grants.authority.remote_admission())
+        .unwrap_or_default();
+    let advertised_alpns = served_alpns(
+        config.work.is_some(),
+        prepared_grants.is_some(),
+        remote_control.enabled(),
+    );
+    let work_mount = MountedWork::with_backend(handle.clone());
+    let setup_mount = MountedSetup::default();
+    let chain = config.work.as_ref().map(|(_, chain)| chain.clone());
+    let runner = match config.work {
+        Some((work, chain)) => Some(
+            WorkRunner::discover(work, work_mount.clone(), setup_mount.clone())
+                .await?
+                .on_node(chain),
+        ),
+        None => None,
+    };
+    let alpns = advertised_alpns.clone();
+    let ingress = match prepared_grants
+        .as_ref()
+        .map(|(grants, _)| &grants.authority)
+    {
+        Some(ProviderAuthority::Host(control)) => control.provider_ingress()?,
+        _ => None,
+    };
+    let (endpoint, mut ingress, owns_endpoint) = match ingress {
+        Some((endpoint, receiver)) => {
+            if endpoint.id() != config.secret_key.public() {
+                return Err(ProviderError::Identity);
+            }
+            (endpoint, Some(receiver), false)
+        }
+        None => {
+            let mut builder = Endpoint::builder(presets::N0)
+                .secret_key(config.secret_key)
+                .hooks(remote_control.clone())
+                .alpns(alpns.clone());
+            if let Some(port) = config.port {
+                builder = builder.bind_addr(std::net::SocketAddr::from(([0, 0, 0, 0], port)))?;
+            }
+            (builder.bind().await?, None, true)
+        }
+    };
+    let discovery = config
+        .discovery
+        .then(|| discovery::start_server_advertising(&endpoint, &advertised_alpns))
+        .transpose()?;
+    let node_id = endpoint.id();
+
+    let local_peer = PeerId::from_bytes(*node_id.as_bytes());
+    let directory = Arc::new(PeerDirectory::with_config(
+        local_peer,
+        hellas_rpc::peer_directory_config(),
+    ));
+
+    let mut node_handler =
+        NodeHandlerImpl::new(node_id, config.build, config.graffiti, directory.clone());
+    node_handler.service_alpns = advertised_alpns
+        .iter()
+        .map(|alpn| String::from_utf8_lossy(alpn).into_owned())
+        .collect();
+    node_handler.chain = chain.clone();
+
+    let open_identity = config.open_identity;
+    let (grants, administration, admin) = if let Some((grants, store)) = prepared_grants {
+        let service = hellas_work::grant_service::GrantService::from_node(
+            store,
+            &open_identity.enrollment,
+            signer,
+            handle,
+            endpoint
+                .addr()
+                .ip_addrs()
+                .map(ToString::to_string)
                 .collect(),
         )
-    });
-    #[cfg(feature = "grant-provider")]
-    let grants = grant_store
-        .map(|store| {
-            hellas_work::grant_service::GrantService::new(
-                store,
-                producer_key,
-                executor,
-                endpoint
-                    .addr()
-                    .ip_addrs()
-                    .map(ToString::to_string)
-                    .collect(),
-                Arc::new(hellas_work::grant_service::wall_clock),
-            )
-        })
-        .transpose()?;
-    use crate::work_router::WorkRouter;
-    #[cfg(all(feature = "paid-provider", feature = "grant-provider"))]
-    let work_router = match (has_paid_work, grants.as_ref()) {
-        (true, Some(grants)) => WorkRouter::Both {
-            payment: work_mount,
-            grants: grants.clone(),
-        },
-        (true, None) => WorkRouter::Payment(work_mount),
-        (false, Some(grants)) => WorkRouter::Grants(grants.clone()),
-        (false, None) => return Err(ProviderError::FundingRequired),
+        .await?;
+        let administration = hellas_work::grant_service::WorkAdministration::new(
+            service.clone(),
+            grants.config.policies,
+            grants.config.max_job_millis,
+        )?;
+        let admin = match grants.authority {
+            ProviderAuthority::Host(control) => Some(control),
+            ProviderAuthority::Journal { .. } => None,
+        };
+        (Some(service), Some(administration), admin)
+    } else {
+        (None, None, None)
     };
-    #[cfg(all(feature = "paid-provider", not(feature = "grant-provider")))]
-    let work_router = WorkRouter::Payment(work_mount);
-    #[cfg(all(feature = "grant-provider", not(feature = "paid-provider")))]
-    let work_router = WorkRouter::Grants(
-        grants
-            .as_ref()
-            .ok_or(ProviderError::FundingRequired)?
-            .clone(),
-    );
-    #[cfg(feature = "paid-provider")]
     let work = runner.map(WorkWatcher::spawn);
-    let router = work_router.clone();
+    let serves_work = match (work.is_some(), grants.as_ref()) {
+        (true, Some(grants)) => Some(WorkRouter::both(work_mount, grants.clone())),
+        (true, None) => Some(WorkRouter::payment(work_mount)),
+        (false, Some(grants)) => Some(WorkRouter::grants(grants.clone())),
+        (false, None) => None,
+    };
+    let serves_setup = work.is_some().then(|| setup_mount.clone());
+
+    let router = serves_work.clone();
     let accept_endpoint = endpoint.clone();
+    let (stop, mut stopped) = oneshot::channel();
+    let (drained, drain_complete) = oneshot::channel();
     let accept_task = tokio::spawn(async move {
-        let slots = Arc::new(tokio::sync::Semaphore::new(MAX_ACTIVE_CONNECTIONS));
-        let mut connections = tokio::task::JoinSet::new();
+        let mut connections = JoinSet::new();
+        let (quiesce, quiesced) = watch::channel(false);
+        let mut handshake_slots = crate::transport_admission::HandshakeSlots::new(
+            MAX_RPC_HANDSHAKES,
+            MAX_RPC_HANDSHAKES_PER_PEER,
+        );
         loop {
+            // Both waits are cancellation-safe. Once accepted, a connection's
+            // handshake belongs to its task, never to the next select iteration.
+            let next = async {
+                if let Some(receiver) = &mut ingress {
+                    receiver.recv().await.map(IncomingConnection::Host)
+                } else {
+                    accept_endpoint
+                        .accept()
+                        .await
+                        .map(|incoming| IncomingConnection::Standalone(Box::new(incoming)))
+                }
+            };
             let incoming = tokio::select! {
+                biased;
+                _ = &mut stopped => break,
                 completed = connections.join_next(), if !connections.is_empty() => {
-                    if let Some(Err(error)) = completed {
-                        tracing::warn!(%error, "provider connection task failed");
-                    }
+                    if let Some(Err(error)) = completed { warn!(%error, "node connection task failed"); }
                     continue;
                 }
-                incoming = accept_endpoint.accept() => incoming,
+                incoming = next => match incoming { Some(incoming) => incoming, None => break },
             };
-            let Some(incoming) = incoming else {
-                break;
-            };
-            let slot = match slots.clone().acquire_owned().await {
-                Ok(slot) => slot,
-                Err(_) => break,
-            };
-            let accepting = match incoming.accept() {
-                Ok(accepting) => accepting,
-                Err(error) => {
-                    tracing::warn!(%error, "provider connection accept failed");
+            if connections.len() >= MAX_ACTIVE_RPC_CONNECTIONS {
+                incoming.refuse();
+                continue;
+            }
+            let permits = if let IncomingConnection::Standalone(connection) = &incoming {
+                let Some(permits) = handshake_slots.try_acquire(&connection.remote_addr()) else {
+                    incoming.refuse();
                     continue;
-                }
+                };
+                Some(permits)
+            } else {
+                None
             };
-            let work_router = work_router.clone();
-            #[cfg(feature = "paid-provider")]
-            let (setup_mount, chain, discovery) =
-                (setup_mount.clone(), chain.clone(), discovery.clone());
-            let open = open.clone();
+            let node_handler_for_conn = node_handler.clone();
+            let manager_for_conn = directory.manager();
+            let execution_for_conn = open_identity.clone();
+            let work_for_conn = serves_work.clone();
+            let setup_for_conn = serves_setup.clone();
+            let admin_for_conn = admin.clone();
+            let mut stopping = quiesced.clone();
             connections.spawn(async move {
-                let _slot = slot;
-                let connection = match tokio::time::timeout(HANDSHAKE_TIMEOUT, accepting).await {
-                    Ok(Ok(connection)) => connection,
-                    Ok(Err(error)) => {
-                        tracing::warn!(%error, "provider connection handshake failed");
-                        return;
-                    }
-                    Err(_) => {
-                        tracing::warn!("provider connection handshake timed out");
-                        return;
+                let conn = match incoming {
+                    IncomingConnection::Host(connection) => connection,
+                    IncomingConnection::Standalone(incoming) => {
+                        let Ok(accepting) = (*incoming).accept() else {
+                            return;
+                        };
+                        tokio::select! {
+                            _ = quiescing(&mut stopping) => return,
+                            result = tokio::time::timeout(RPC_HANDSHAKE_TIMEOUT, accepting) => {
+                                let Ok(Ok(connection)) = result else { return; };
+                                connection
+                            }
+                        }
                     }
                 };
-                let alpn = connection.alpn().to_vec();
-                let transport = Arc::new(IrohTransport::new(connection));
-                #[cfg(feature = "paid-provider")]
-                if alpn == hellas_rpc::services::chain_sync::ChainSync::ALPN.as_bytes()
-                    && let Some(chain) = chain
+                drop(permits);
+                let alpn = conn.alpn().to_vec();
+                debug!(
+                    alpn = %String::from_utf8_lossy(&alpn),
+                    "accepted RPC connection"
+                );
+                if let Err(e) = serve_connection(
+                    alpn,
+                    conn,
+                    execution_for_conn,
+                    node_handler_for_conn,
+                    manager_for_conn,
+                    setup_for_conn,
+                    work_for_conn,
+                    admin_for_conn,
+                    stopping,
+                )
+                .await
                 {
-                    chain.serve_chain(transport).await;
-                    return;
-                }
-                #[cfg(feature = "paid-provider")]
-                if alpn == hellas_rpc::services::node::Node::ALPN.as_bytes()
-                    && let Some(discovery) = discovery
-                {
-                    serve(transport, hellas_rpc::services::node::NodeServer(discovery)).await;
-                    return;
-                }
-                if alpn == hellas_rpc::services::work::Work::ALPN.as_bytes() {
-                    let server = OpenDispatcher::<_, _, hellas_rpc::services::work::Open>::new(
-                        hellas_rpc::services::work::WorkServer(work_router),
-                        open,
-                    );
-                    serve(transport, server).await;
-                    #[cfg(feature = "paid-provider")]
-                    return;
-                }
-                #[cfg(feature = "paid-provider")]
-                if has_paid_work
-                    && alpn == hellas_rpc::services::work_setup::WorkSetup::ALPN.as_bytes()
-                {
-                    let server =
-                        OpenDispatcher::<_, _, hellas_rpc::services::work_setup::Open>::new(
-                            hellas_rpc::services::work_setup::WorkSetupServer(setup_mount),
-                            open,
-                        );
-                    serve(transport, server).await;
+                    warn!("serve_connection error: {e}");
                 }
             });
         }
+        let _ = drain_complete.await;
+        quiesce.send_replace(true);
+        while let Some(result) = connections.join_next().await {
+            if let Err(error) = result {
+                warn!(%error, "node connection task failed while draining");
+            }
+        }
     });
+
     Ok(ProviderHandle {
+        configuration: None,
+        administration,
+        alpns: advertised_alpns,
         router,
-        endpoint,
+        discovery,
+        stop: Some(stop),
+        drained: Some(drained),
         accept_task,
-        #[cfg(feature = "paid-provider")]
+        endpoint,
+        owns_endpoint,
         work,
     })
 }
 
-/// Serves one connection until the peer leaves or a dispatch fails. Dispatch
-/// is deliberately unbounded here: streaming methods such as `StreamResult`
-/// stay open for the lifetime of a job and enforce their own application-level
-/// deadlines, so a wall-clock timeout at this layer would cancel paid work
-/// mid-delivery.
-async fn serve<T, S>(transport: Arc<T>, server: S)
-where
-    T: StreamTransport + Send + Sync + 'static,
-    T::Error: std::fmt::Display,
-    S: Dispatcher<T> + Send + Sync + 'static,
-    S::Error: std::fmt::Display + Send + Sync + 'static,
-{
-    loop {
-        match transport.accept().await {
-            Ok(Some(inbound)) => {
-                if let Err(error) = Dispatcher::<T>::dispatch(&server, inbound).await {
-                    tracing::warn!(%error, "provider RPC failed");
-                    break;
-                }
-            }
-            Ok(None) => break,
-            Err(error) => {
-                tracing::debug!(%error, "provider transport ended");
-                break;
-            }
-        }
+/// Per-connection serve: each inbound substream is dispatched to the
+/// service selected by the connection's negotiated ALPN.
+#[allow(clippy::too_many_arguments)]
+async fn serve_connection<R: RootProver + Send + Sync + 'static>(
+    alpn: Vec<u8>,
+    conn: Connection,
+    open_identity: Arc<ProviderOpen<R>>,
+    node_handler: NodeHandlerImpl,
+    manager: PeerManager,
+    setup: Option<MountedSetup>,
+    work: Option<WorkRouter>,
+    admin: Option<crate::node_control::NodeControl>,
+    mut quiesce: watch::Receiver<bool>,
+) -> Result<(), ProviderError> {
+    if alpn == hellas_rpc::services::host_control::HostControl::ALPN.as_bytes() {
+        let admin = admin
+            .ok_or_else(|| WireStatus::new(WireCode::Unavailable, "node control is unavailable"))?;
+        return tokio::select! {
+            _ = quiescing(&mut quiesce) => Ok(()),
+            result = admin.serve_iroh(conn) => result.map_err(ProviderError::from),
+        };
+    }
+    let transport = Arc::new(IrohTransport::new(conn));
+
+    // Account for inbound requests and refresh last_seen_ms in the shared registry.
+    if alpn == <Node as ServiceMarker>::ALPN.as_bytes() {
+        let server = AccountingDispatcher::new(NodeServer(node_handler), manager);
+        serve_loop(transport, server, quiesce).await;
+        Ok(())
+    } else if alpn == hellas_rpc::services::chain_sync::ChainSync::ALPN.as_bytes()
+        && let Some(chain) = node_handler.chain
+    {
+        let server = AccountingDispatcher::new(
+            hellas_rpc::services::chain_sync::ChainSyncServer(chain),
+            manager,
+        );
+        serve_loop(transport, server, quiesce).await;
+        Ok(())
+    } else if let Some(setup) =
+        setup.filter(|_| alpn == <WorkSetup as ServiceMarker>::ALPN.as_bytes())
+    {
+        let server = AccountingDispatcher::new(
+            OpenDispatcher::<_, _, hellas_rpc::services::work_setup::Open>::new(
+                WorkSetupServer(setup),
+                open_identity.clone(),
+            ),
+            manager,
+        );
+        serve_loop(transport, server, quiesce).await;
+        Ok(())
+    } else if let Some(work) = work.filter(|_| alpn == <Work as ServiceMarker>::ALPN.as_bytes()) {
+        let connection = tokio::select! {
+            _ = quiescing(&mut quiesce) => return Ok(()),
+            connection = work.accept_iroh(&transport, open_identity.clone()) => connection?,
+        };
+        let server = AccountingDispatcher::new(connection, manager);
+        serve_loop(transport, server, quiesce).await;
+        Ok(())
+    } else {
+        warn!("Unknown ALPN: {:?}", String::from_utf8_lossy(&alpn));
+        Ok(())
     }
 }
 
-#[cfg(all(test, feature = "paid-provider", feature = "paid-client"))]
-mod tests;
+async fn quiescing(receiver: &mut watch::Receiver<bool>) {
+    if receiver.wait_for(|stop| *stop).await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
 
-#[cfg(all(test, feature = "grant-provider", feature = "grant-gateway"))]
-mod grant_tests;
+async fn serve_loop<T, S>(transport: Arc<T>, server: S, mut quiesce: watch::Receiver<bool>)
+where
+    T: StreamTransport + Send + Sync + 'static,
+    S: Dispatcher<T> + Send + Sync + 'static,
+    S::Error: Send + Sync + 'static,
+{
+    let server = Arc::new(server);
+    let (inbound_tx, mut inbound_rx) = mpsc::channel(MAX_RPC_IN_FLIGHT_PER_CONNECTION);
+    let accept_transport = transport.clone();
+    // One task owns `accept`: dispatch completion can therefore never cancel
+    // a partially read Open frame. The bounded channel is the only hand-off.
+    let mut accepting = JoinSet::new();
+    accepting.spawn(async move {
+        loop {
+            match accept_transport.accept().await {
+                Ok(Some(inbound)) => {
+                    if inbound_tx.send(Ok(inbound)).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    let _ = inbound_tx.send(Err(error)).await;
+                    break;
+                }
+            }
+        }
+    });
 
-struct ProviderOpen<R> {
-    signer: Arc<hellas_rpc::ProducerSigningKey>,
-    root: Arc<R>,
-    enrollment: ProviderEnrollmentBundle,
+    let mut dispatches = JoinSet::new();
+    let mut draining = false;
+    loop {
+        if dispatches.len() >= MAX_RPC_IN_FLIGHT_PER_CONNECTION {
+            tokio::select! {
+                _ = quiescing(&mut quiesce) => { draining = true; break; }
+                completed = dispatches.join_next() => log_dispatch_result(completed),
+            }
+            continue;
+        }
+
+        let idle = dispatches.is_empty();
+        let next = tokio::select! {
+            biased;
+            _ = quiescing(&mut quiesce) => { draining = true; break; }
+            next = async {
+                if idle {
+                    tokio::time::timeout(RPC_CONNECTION_IDLE_TIMEOUT, inbound_rx.recv()).await.unwrap_or(None)
+                } else {
+                    inbound_rx.recv().await
+                }
+            } => next,
+            completed = dispatches.join_next(), if !dispatches.is_empty() => {
+                log_dispatch_result(completed);
+                continue;
+            }
+        };
+
+        match next {
+            Some(Ok(inbound)) => {
+                let server = server.clone();
+                dispatches.spawn(async move { server.dispatch(inbound).await });
+            }
+            Some(Err(_)) => {
+                debug!("provider transport ended");
+                break;
+            }
+            None => break,
+        }
+    }
+
+    accepting.shutdown().await;
+    if draining {
+        while let Some(result) = dispatches.join_next().await {
+            log_dispatch_result(Some(result));
+        }
+    } else {
+        dispatches.shutdown().await;
+    }
+}
+
+fn log_dispatch_result<E>(result: Option<Result<Result<(), E>, tokio::task::JoinError>>)
+where
+    E: std::error::Error,
+{
+    match result {
+        Some(Ok(Err(_))) => {
+            // RPC errors can be derived from request content. Keep the trace
+            // useful without copying prompt or token material into logs.
+            warn!("dispatch error; request details suppressed");
+        }
+        Some(Err(error)) if !error.is_cancelled() => {
+            warn!("RPC dispatch task failed; request details suppressed");
+        }
+        Some(Ok(Ok(())) | Err(_)) | None => {}
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests;
+
+/// The shared confidential-open proof handler. Software enrollment roots are
+/// discarded: the enrolled producer alone signs each live transport binding.
+pub struct ProviderOpen<R> {
+    signer: Arc<hellas_auth::ProducerSigningKey>,
+    root: Option<Arc<R>>,
+    pub(crate) enrollment: ProviderEnrollmentBundle,
+}
+
+impl<R> ProviderOpen<R> {
+    pub fn new(
+        signer: Arc<hellas_auth::ProducerSigningKey>,
+        enrollment: ProviderEnrollmentBundle,
+        root: Option<Arc<R>>,
+    ) -> Result<Self, ProviderError> {
+        if enrollment.genesis.statement.producer_public_key != signer.public_key() {
+            return Err(ProviderError::Identity);
+        }
+        let root = match enrollment.genesis.statement.root_kind {
+            hellas_rpc::RootKind::Software => None,
+            hellas_rpc::RootKind::SecureEnclave => Some(root.ok_or(ProviderError::Identity)?),
+        };
+        Ok(Self {
+            signer,
+            root,
+            enrollment,
+        })
+    }
 }
 
 impl<R> Clone for ProviderOpen<R> {
@@ -642,6 +945,8 @@ where
             }
             hellas_rpc::RootKind::SecureEnclave => match self
                 .root
+                .as_ref()
+                .ok_or_else(|| WireStatus::internal("provider root is unavailable"))?
                 .prove_open_binding(binding)
                 .await
                 .map_err(|_| WireStatus::internal("provider open assertion failed"))?

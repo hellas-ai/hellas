@@ -16,12 +16,13 @@ configuration:
 
 ```json
 {
+  "trust_store": "/var/lib/hellas-gateway/trust",
   "providers": [
     {
       "work_config": "/srv/hellas/provider-a-work.json",
       "journal_root": "/var/lib/hellas-gateway/provider-a",
       "provider": "PROVIDER_ENDPOINT_ID",
-      "provider_genesis": "PROVIDER_ENROLLMENT_CONTENT_ID",
+      "trust_policy": "provider-a",
       "provider_addrs": ["192.0.2.10:31145"],
       "bond": "PROVIDER_BOND_EDGE_HEX",
       "payment_coins": ["CLIENT_PAYMENT_COIN_HEX"],
@@ -36,17 +37,46 @@ configuration:
 }
 ```
 
-Every pool entry requires `provider_genesis`: either the enrollment ContentId
-or the signed offer object emitted by `hellas-cli provision`. The offer includes
-the provider enrollment, signed bond proposal and address hints. Its settlement
-key signs the entire offer and must equal the enrollment's producer. Import
-checks the configured network, bond and transport identity, then derives the
-pin. Empty `provider_addrs` uses the signed offer's address hints.
+Every pool entry selects a previously approved `trust_policy` ID. The caller owns
+`trust_store`; neither an offer nor an execution request can supply replacement pins.
+Optionally include the signed offer emitted by `hellas-cli provision` in `offer`.
+Import checks its network, bond, transport and enrollment against the separately
+approved policy. Empty `provider_addrs` uses the signed offer's address hints.
+An offer by itself does not authorize a provider.
 
-For `--assurance apple-app-attest`, each entry also needs an independently
-trusted `apple_app_id` and `apple_cd_hashes` (hex 32-byte hashes). The offer cannot
-supply its own allowed software. Every Work and WorkSetup connection performs
-Open before disclosing requests, for both producer-signed and App Attest policy.
+Approve a locally reviewed policy file before starting the gateway:
+
+```sh
+hellas-cli trust --store /var/lib/hellas-gateway/trust approve provider-a \
+  --expected-revision 0 --policy /srv/hellas/provider-a-trust.json \
+  --reason 'Reviewed enrollment and execution contract'
+hellas-cli trust --store /var/lib/hellas-gateway/trust show provider-a
+```
+
+The policy JSON has `provider_genesis` (the independently checked enrollment
+ContentId), `assurance` (0 for producer signatures or 1 for Apple App Attest),
+`environments` (1–32 exact approved manifest ContentIds), and `apple`.
+For software assurance, `apple` can be null. For Apple assurance it is
+`{"app_id":"TEAM.bundle.id","cd_hashes":["64_HEX_DIGITS"]}` with release pins
+obtained independently. The assurance must match the gateway's `--assurance`.
+A contract change requires an explicit approval; merely editing Work configuration
+does not approve its new environment. This approval selects trusted software and
+terms; it does not establish the still-required protected-platform guarantees.
+
+Replacement requires the current `--expected-revision` and an explicit reason.
+The private record stores the revision, approval time and previous policy commitment
+atomically with the pins. It retains the latest approval record, not a full audit
+history. Concurrent stale edits fail. Missing, corrupt, nonprivate or symlinked
+records fail; startup never creates approval. Assertion counters persist independently
+of policy replacement. Restart gateways to load a new approval; existing gateway
+instances retain their startup policy. `paid-work run` uses the same native store
+through required `--trust-store` and `--trust-policy` options. Grant gateways require
+the same selection with `--offer` or `--local`. Approved manifest IDs
+remain in the client anchor and are checked for every new job, including refreshed
+grant policies. Paid options also check them before funding.
+
+Every Work and WorkSetup connection performs Open before disclosing requests, for
+both producer-signed and App Attest policy.
 
 Bond or chain discovery distributes this same signed offer as an off-chain
 artifact. The consumer compares its network and bond to the discovered record;
@@ -55,9 +85,38 @@ that bond's maker. Endpoint advertisements alone never establish an enrollment
 pin. Chain validation and finalized funding checks still occur during setup.
 No enrollment data is added to on-chain transactions.
 
-Provision provider bonds with `hellas-cli provision`; coin
-values and policy terms must agree with the provider work config. Payment coins
-must be owned by the gateway settlement identity and cannot fund two channels.
+Provision provider bonds with `hellas-cli provision --grant-config grant.json
+--client-contact client --client CLIENT_NODE_KEY`; coin values and policy terms
+must agree with the provider work config. The contact alias selects an already
+imported, signature-verified ContactCard in the current authority owner's contact
+directory. Its principal is the client coin owner; `--client` names the separate
+settlement node. The card proves the principal's signature, not that the principal
+controls the selected node. The client checks the bond against its own live
+authority owner and node before countersigning, and chain funding requires that
+owner's coins delegated to that node.
+
+Provider and gateway coin owners come from their current node authority roots.
+The gateway reuses the authority opened by its gateway profile. Standalone
+`provision` and `paid-work run` require `--grant-config` pointing to an explicitly
+bootstrapped authority journal; stop its running writer before opening it offline.
+Payment coins cannot fund two channels. Recovery changes the live owner used for
+new setup; it does not reinterpret existing signed bond terms.
+
+Owners delegate or reclaim coins through the existing global passkey:
+
+```sh
+hellas-cli --passkey owner.key chain delegate --rpc ws://127.0.0.1:8788 \
+  --network devnet --node NODE_SETTLEMENT_KEY --coin COIN_ID
+hellas-cli --passkey owner.key chain sweep --rpc ws://127.0.0.1:8788 \
+  --network devnet --coin COIN_ID
+```
+
+`--node` uses the chain's base58 settlement-key spelling; coin IDs are hex.
+Default payouts remain delegated to each party's node. A provider can choose
+`provision --lock-provider-payout` to return its payout to its owner without a
+delegate. The client accepts only its own default delegated payout. An owner-led
+contested exit locks that owner's refund while preserving the other party's payout
+delegation.
 The omission bond must exceed the remaining payment capacity: with 1,000 units
 and zero fees/reserve, a bond of 501 leaves 499 spendable units. The client checks
 this before signing setup terms or creating a journal.
@@ -142,16 +201,17 @@ SIGTERM and wrapped-command failures drain outstanding operations. Set the servi
 stop timeout above `timeout_secs`. An operation that reaches its deadline retains
 its journal for recovery, as does abrupt process termination.
 
-For systemd, set `--bearer-token-file /var/lib/hellas-gateway/bearer-token`.
-The file is created with mode 0600 and reused across restarts. Clients read its
-trimmed contents as `Authorization: Bearer <credential>`. The configured listener
-may bind an explicitly selected LAN address; the default stays `127.0.0.1`.
-Every route still requires bearer authentication. Use a trusted local network or
-a TLS reverse proxy when configuring remote access.
+For systemd, set `--gateway-profile /var/lib/hellas-gateway/gateway-profile.json`.
+Provision the [HTTP authority and scoped credential](admin.md#http-gateway-authority)
+first. Startup opens that authority and never creates a token or administrator.
+Every request checks current credential and grant rights. Non-loopback listeners
+also require `--allow-remote`; use a trusted network or a TLS reverse proxy.
 
 The NixOS options are `services.hellas.gateway.paidWorkConfig`,
-`paidWorkJournalRoots` (the writable client journal directories), and
-`bearerTokenFile`, alongside the existing environment and tokenizer options.
+`paidWorkJournalRoots` (writable client journals), `gatewayProfile`, and
+`authorityJournal` when the authority journal is outside the managed state directory,
+alongside the existing environment and tokenizer options.
+
 
 ## Request traces
 
@@ -229,9 +289,9 @@ reuse. Worker spans report that observed reuse as
 
 ## Embedding
 
-The CLI and native hosts use `hellas_sdk::paid_gateway::PaidGateway`. Enable
-`paid-gateway`, load the same pool file with `load_pool_options(path, assurance)`,
-and pass the resulting typed `PaidGatewayOptions` and a `ClientIdentity` to
+The CLI and native hosts use `hellas_sdk::paid_gateway::PaidGateway`. Load
+the same pool file with `load_pool_options(path, assurance)`,
+and pass the resulting typed `PaidGatewayOptions` and a `NodeIdentity` to
 `PaidGateway::open`. Applications can also construct the options directly from
 `PaidWorkOptions`; the pool validates duplicate providers, journals and funding
 before opening any connections. It owns recovery, admission, per-channel
@@ -245,11 +305,13 @@ down the returned handle drains accepted paid work. Failed startup also drains
 recovery tasks. A host using the pool without a gateway must call its
 `WorkExecutionBackend::drain` method when shutting down.
 
-`paid-client` enables sessions without the executor or upstream-provider
-crates. `paid-provider` enables the provider runner and provisioning. Both
-include `work`, the shared typed configuration and provisioning API. Apple
-verification additionally needs `apple-verifier`; the file loader stores
-assertion counters under each provider's journal root in `apple-counters`.
+The native SDK includes paid and grant clients, providers, gateways and Apple
+verification in one build. Host configuration chooses the services and funding
+to assemble; Cargo features do not alter these dispatch paths. Consumers needing
+a smaller dependency graph can use the underlying Auth, RPC, Work and client
+crates directly. The file loader keeps assertion counters under each provider's existing journal
+root in `apple-counters`. CLI paid execution keeps its existing caller-wide counter
+directory. Approving or replacing a trust policy never moves or resets those files.
 Counter files alone do not trigger channel funding during startup recovery.
 Work and WorkSetup each reuse an authenticated QUIC connection. Reconnection
 repeats Open with that connection's exporter and the channel's producer pin;

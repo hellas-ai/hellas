@@ -6,8 +6,8 @@ use crate::{
         ChainVerifier, execute_all,
         store::utxo_db_config,
         test_support::{
-            consensus_fixture, finalization, index_block, index_genesis, kernel_fixture,
-            legacy_address, run_qmdb,
+            consensus_fixture, finalization, index_block, index_genesis, kernel_fixture, owner_key,
+            run_qmdb,
         },
     },
     indexer::spawn_archive,
@@ -16,7 +16,7 @@ use crate::{
 use commonware_cryptography::Digestible as _;
 use commonware_glue::stateful::db::{DatabaseSet, Merkleized as _, Unmerkleized as _};
 use commonware_runtime::{Handle, Supervisor as _};
-use hellas_kernel::{BlockHash, BlockHeight, Context as KernelContext};
+use hellas_kernel::{BlockHash, BlockHeight, Context as KernelContext, PartyAuth, PartyKeys};
 
 struct ResponseFixture {
     client: LocalLightClient,
@@ -74,7 +74,7 @@ async fn response_fixture_with_contests(
         allocations.push((SettlementKey::from(provider_key), STAKE));
 
         let bond = WorkStakeBondTerms {
-            parties: Parties::new(provider_key, client_key),
+            parties: Parties::new(PartyKeys::sole(provider_key), PartyKeys::sole(client_key)),
             timeout: BlockHeight::new(HORIZON),
             timeout_outputs: List::take([Payout::new(provider_key, STAKE); MAX_EDGE_OUTPUTS], 1),
             max_job_price: 4,
@@ -95,8 +95,8 @@ async fn response_fixture_with_contests(
         let bond_open = hellas_kernel::Tx::open(
             bond_funding,
             bond_terms,
-            Auth::native(provider_signer.sign(bond_hash)),
-            Auth::native(client_signer.sign(bond_hash)),
+            PartyAuth::owner(Auth::native(provider_signer.sign(bond_hash))),
+            PartyAuth::owner(Auth::native(client_signer.sign(bond_hash))),
         );
 
         let terms = Terms::work_payment(WorkPaymentTerms {
@@ -122,8 +122,8 @@ async fn response_fixture_with_contests(
         let payment_open = hellas_kernel::Tx::open(
             funding,
             terms.clone(),
-            Auth::native(client_signer.sign(open_hash)),
-            Auth::native(provider_signer.sign(open_hash)),
+            PartyAuth::owner(Auth::native(client_signer.sign(open_hash))),
+            PartyAuth::owner(Auth::native(provider_signer.sign(open_hash))),
         );
 
         let understated = EarnedCertificate::new(edge, terms.hash(), START_AMOUNT);
@@ -142,8 +142,11 @@ async fn response_fixture_with_contests(
                 terms.clone(),
                 Party::Maker,
                 (2, 65),
-                Some((understated, client_signer.sign(understated_digest))),
-                client_signer.sign(start_digest),
+                Some((
+                    understated,
+                    PartyAuth::owner(client_signer.sign(understated_digest)),
+                )),
+                PartyAuth::owner(client_signer.sign(start_digest)),
             )));
         let start_id = hellas_kernel::start_id(start_digest, 2);
         let make_response = |amount: u64, action_by_provider: bool| {
@@ -161,18 +164,21 @@ async fn response_fixture_with_contests(
                 edge,
                 start_id,
                 Party::Taker,
-                (certificate, client_signer.sign(earned_digest)),
-                if action_by_provider {
+                (
+                    certificate,
+                    PartyAuth::owner(client_signer.sign(earned_digest)),
+                ),
+                PartyAuth::owner(if action_by_provider {
                     provider_signer.sign(action_digest)
                 } else {
                     client_signer.sign(action_digest)
-                },
+                }),
             )
         };
         let valid = make_response(60, true);
         if contest_index == 0 {
             first_responses = Some((
-                valid,
+                valid.clone(),
                 make_response(61, true),
                 make_response(62, false),
                 start_id,
@@ -196,9 +202,9 @@ async fn response_fixture_with_contests(
         Party::Taker,
         (
             EarnedCertificate::new(EdgeId::from_bytes([0xa8; EdgeId::LENGTH]), terms_hash, 63),
-            client_signer.sign(understated_digest),
+            PartyAuth::owner(client_signer.sign(understated_digest)),
         ),
-        provider_signer.sign(start_digest),
+        PartyAuth::owner(provider_signer.sign(start_digest)),
     );
 
     let config = utxo_db_config(&runtime, partition, 1024, 8);
@@ -269,9 +275,9 @@ async fn response_fixture_with_contests(
     }
 }
 
-fn response_transaction(response: PaymentCloseResponse) -> Transaction {
+fn response_transaction(response: &PaymentCloseResponse) -> Transaction {
     Transaction::Kernel(hellas_kernel::Tx::move_action(
-        hellas_kernel::Move::RespondPaymentClose(response),
+        hellas_kernel::Move::RespondPaymentClose(response.clone()),
     ))
 }
 
@@ -307,6 +313,7 @@ fn round7_general_ids_cannot_block_response() {
                 request.clone(),
                 TransportContext {
                     peer: Some(PeerIdentity(bytes)),
+                    auth_level: hellas_wire::AuthLevel::Vouched,
                     ..TransportContext::default()
                 },
             )
@@ -322,6 +329,7 @@ fn round7_general_ids_cannot_block_response() {
             request,
             TransportContext {
                 peer: Some(PeerIdentity([0xff; 32])),
+                auth_level: hellas_wire::AuthLevel::Vouched,
                 ..TransportContext::default()
             },
         )
@@ -337,6 +345,7 @@ fn round7_general_ids_cannot_block_response() {
             SubmitWorkResponseRequest {
                 response: response_bytes,
             },
+            TransportContext::default(),
         )
         .await
         .expect("response route is independent of general identities");
@@ -361,7 +370,7 @@ fn round3_certificate_only_response_is_rejected_and_one_slot_per_finalized_conte
         assert_eq!(
             fixture
                 .client
-                .submit_tx(response_transaction(fixture.absent))
+                .submit_tx(response_transaction(&fixture.absent))
                 .await
                 .expect("absent contest is an admission outcome"),
             SubmitTxOutcome::ValidationRejected,
@@ -380,7 +389,7 @@ fn round3_certificate_only_response_is_rejected_and_one_slot_per_finalized_conte
         assert_eq!(
             fixture
                 .client
-                .submit_tx(response_transaction(fixture.bad_action))
+                .submit_tx(response_transaction(&fixture.bad_action))
                 .await
                 .expect("bad action is an admission outcome"),
             SubmitTxOutcome::ValidationRejected,
@@ -399,7 +408,7 @@ fn round3_certificate_only_response_is_rejected_and_one_slot_per_finalized_conte
         assert_eq!(
             fixture
                 .client
-                .submit_tx(response_transaction(fixture.valid))
+                .submit_tx(response_transaction(&fixture.valid))
                 .await
                 .expect("valid response admission"),
             SubmitTxOutcome::Enqueued,
@@ -407,7 +416,7 @@ fn round3_certificate_only_response_is_rejected_and_one_slot_per_finalized_conte
         assert_eq!(
             fixture
                 .client
-                .submit_tx(response_transaction(fixture.valid))
+                .submit_tx(response_transaction(&fixture.valid))
                 .await
                 .expect("exact resident admission"),
             SubmitTxOutcome::Duplicate,
@@ -415,7 +424,7 @@ fn round3_certificate_only_response_is_rejected_and_one_slot_per_finalized_conte
         assert_eq!(
             fixture
                 .client
-                .submit_tx(response_transaction(fixture.second))
+                .submit_tx(response_transaction(&fixture.second))
                 .await
                 .expect("occupied contest admission"),
             SubmitTxOutcome::Full,
@@ -457,7 +466,7 @@ fn resident_invalidated_by_finality_is_dropped_before_full() {
         assert_eq!(
             fixture
                 .client
-                .submit_tx(response_transaction(fixture.valid))
+                .submit_tx(response_transaction(&fixture.valid))
                 .await
                 .expect("valid response admission"),
             SubmitTxOutcome::Enqueued,
@@ -466,7 +475,7 @@ fn resident_invalidated_by_finality_is_dropped_before_full() {
         // Consensus executes the same response authoritatively. Once that
         // block finalizes, the old resident is no longer valid because
         // the contest record is answered.
-        let transactions = vec![response_transaction(fixture.valid)];
+        let transactions = vec![response_transaction(&fixture.valid)];
         let root = apply(&fixture.database, &fixture.allocations, 3, &transactions).await;
         let answered = index_block(&fixture.contest, root, transactions);
         let consensus = consensus_fixture(95);
@@ -480,11 +489,11 @@ fn resident_invalidated_by_finality_is_dropped_before_full() {
             Ok(ApplyOutcome::Applied)
         );
 
-        let fresh = fixture.valid_responses[1];
+        let fresh = fixture.valid_responses[1].clone();
         assert_eq!(
             fixture
                 .client
-                .submit_tx(response_transaction(fresh))
+                .submit_tx(response_transaction(&fresh))
                 .await
                 .expect("fresh finalized contest is admitted"),
             SubmitTxOutcome::Enqueued,
@@ -508,7 +517,7 @@ fn resident_invalidated_by_finality_is_dropped_before_full() {
 fn invalid_incoming_response_does_not_sweep_residents() {
     run_qmdb(|runtime| async move {
         let fixture = response_fixture(runtime, "response_auth_before_sweep").await;
-        let resident = MempoolEntry::new(response_transaction(fixture.bad_action));
+        let resident = MempoolEntry::new(response_transaction(&fixture.bad_action));
         let resident_digest = resident.digest;
         fixture
             .client
@@ -528,7 +537,7 @@ fn invalid_incoming_response_does_not_sweep_residents() {
         assert_eq!(
             fixture
                 .client
-                .submit_tx(response_transaction(fixture.bad_action))
+                .submit_tx(response_transaction(&fixture.bad_action))
                 .await
                 .expect("bad action is an admission outcome"),
             SubmitTxOutcome::ValidationRejected,
@@ -556,7 +565,6 @@ fn full_response_mempool_reuses_slot_invalidated_by_finality() {
             .valid_responses
             .iter()
             .take(RESPONSE_MEMPOOL_CAPACITY)
-            .copied()
         {
             assert_eq!(
                 fixture
@@ -572,8 +580,8 @@ fn full_response_mempool_reuses_slot_invalidated_by_finality() {
             RESPONSE_MEMPOOL_CAPACITY,
         );
 
-        let invalidated = fixture.valid_responses[0];
-        let transactions = vec![response_transaction(invalidated)];
+        let invalidated = fixture.valid_responses[0].clone();
+        let transactions = vec![response_transaction(&invalidated)];
         let root = apply(&fixture.database, &fixture.allocations, 3, &transactions).await;
         let answered = index_block(&fixture.contest, root, transactions);
         let consensus = consensus_fixture(95);
@@ -587,11 +595,11 @@ fn full_response_mempool_reuses_slot_invalidated_by_finality() {
             Ok(ApplyOutcome::Applied)
         );
 
-        let fresh = fixture.valid_responses[RESPONSE_MEMPOOL_CAPACITY];
+        let fresh = fixture.valid_responses[RESPONSE_MEMPOOL_CAPACITY].clone();
         assert_eq!(
             fixture
                 .client
-                .submit_tx(response_transaction(fresh))
+                .submit_tx(response_transaction(&fresh))
                 .await
                 .expect("fresh contest admission"),
             SubmitTxOutcome::Enqueued,
@@ -685,7 +693,7 @@ fn work_channel_snapshot_reads_every_object_at_one_finalized_block() {
     let provider_key = provider.party_key();
 
     let bond = WorkStakeBondTerms {
-        parties: Parties::new(provider_key, client_key),
+        parties: Parties::new(PartyKeys::sole(provider_key), PartyKeys::sole(client_key)),
         timeout: BlockHeight::new(HORIZON),
         timeout_outputs: List::take([Payout::new(provider_key, STAKE); MAX_EDGE_OUTPUTS], 1),
         max_job_price: 4,
@@ -706,8 +714,8 @@ fn work_channel_snapshot_reads_every_object_at_one_finalized_block() {
     let bond_open = KernelTx::open(
         bond_funding,
         bond_terms,
-        Auth::native(provider.sign(bond_open_hash)),
-        Auth::native(client.sign(bond_open_hash)),
+        PartyAuth::owner(Auth::native(provider.sign(bond_open_hash))),
+        PartyAuth::owner(Auth::native(client.sign(bond_open_hash))),
     );
 
     let payment_terms = KernelTerms::work_payment(WorkPaymentTerms {
@@ -733,8 +741,8 @@ fn work_channel_snapshot_reads_every_object_at_one_finalized_block() {
     let payment_open = KernelTx::open(
         payment_funding,
         payment_terms,
-        Auth::native(client.sign(payment_open_hash)),
-        Auth::native(provider.sign(payment_open_hash)),
+        PartyAuth::owner(Auth::native(client.sign(payment_open_hash))),
+        PartyAuth::owner(Auth::native(provider.sign(payment_open_hash))),
     );
 
     // The two coins the opens spend, and one the fixture leaves
@@ -763,7 +771,7 @@ fn work_channel_snapshot_reads_every_object_at_one_finalized_block() {
             // A third allocation, left unspent: the wrong-kind case
             // below needs a coin that still exists after both opens
             // have consumed the first two.
-            (SettlementKey::from(legacy_address(41)), 7),
+            (owner_key(41), 7),
         ];
         let genesis = index_genesis();
 
@@ -1006,7 +1014,7 @@ fn get_edge_reads_qmdb_with_served_root_and_typed_kind() {
         let database = <UtxoDatabase<_> as DatabaseSet<_>>::init(runtime, config).await;
         let fixture = kernel_fixture(3).expect("kernel fixture");
         let mut allocations = fixture.allocations.clone();
-        allocations.push((SettlementKey::from(legacy_address(41)), 7));
+        allocations.push((owner_key(41), 7));
         let genesis = index_genesis();
 
         let batches = database.new_batches().await;
@@ -1213,7 +1221,7 @@ fn every_judged_response_is_one_validation_sample() {
         assert_eq!(
             fixture
                 .client
-                .submit_tx(response_transaction(fixture.valid))
+                .submit_tx(response_transaction(&fixture.valid))
                 .with_subscriber(samples.clone())
                 .await
                 .expect("a live response is an admission outcome"),
@@ -1222,7 +1230,7 @@ fn every_judged_response_is_one_validation_sample() {
         assert_eq!(
             fixture
                 .client
-                .submit_tx(response_transaction(fixture.bad_action))
+                .submit_tx(response_transaction(&fixture.bad_action))
                 .with_subscriber(samples.clone())
                 .await
                 .expect("a bad action signature is an admission outcome"),
@@ -1258,5 +1266,102 @@ fn every_judged_response_is_one_validation_sample() {
             judged.iter().all(|sample| sample.ms >= 0.0),
             "every sample carries the duration it is a sample of",
         );
+    });
+}
+
+#[cfg(feature = "client")]
+#[test]
+fn delegated_coin_rpc_lists_funding_without_owned_balance() {
+    run_qmdb(|runtime| async move {
+        let indexer_context = runtime.child("delegate_indexer");
+        let config = utxo_db_config(&runtime, "delegate_rpc", 1024, 8);
+        let database = <UtxoDatabase<_> as DatabaseSet<_>>::init(runtime, config).await;
+        let owner = owner_key(41);
+        let node = owner_key(42);
+        let allocations = vec![(owner, 100)];
+        let genesis = index_genesis();
+        let (reshape, ids) = crate::execution::test_support::reshape(
+            41,
+            &[genesis_object_id(0)],
+            &[(owner, Some(node), 70), (owner, None, 30)],
+        );
+        let root = apply(&database, &allocations, 1, std::slice::from_ref(&reshape)).await;
+        let block = index_block(&genesis, root, vec![reshape]);
+        let (chain_indexer, _handle) =
+            finalized_payload_indexer(indexer_context, genesis.clone(), block.clone()).await;
+        let index = OwnerIndex::new(crate::domain::TEST_NETWORK, &genesis, allocations);
+        index.apply_finalized(&block).unwrap();
+        let local = LocalLightClient::new(
+            database.clone(),
+            index.clone(),
+            Mempool::default(),
+            chain_indexer.clone(),
+            ConsensusInfo {
+                validators: vec![],
+                threshold_identity: vec![],
+                network_id: crate::domain::TEST_NETWORK.as_str().into(),
+            },
+        );
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = probe.local_addr().unwrap();
+        drop(probe);
+        let (activity, _) = tokio::sync::broadcast::channel(8);
+        let server = crate::server::spawn_light_client_server(
+            address,
+            local,
+            activity,
+            crate::server::LightClientRpcState::default(),
+        )
+        .await
+        .unwrap();
+        let remote = crate::client::RemoteLightClient::connect(format!("ws://{address}"))
+            .await
+            .unwrap();
+        let held = remote.get_coins_by_delegate(node).await.unwrap().unwrap();
+        assert_eq!(held.snapshot.payload, block.digest());
+        assert_eq!(held.coins, vec![(ids[0], 70)]);
+        assert!(
+            remote
+                .get_coins_by_owner(node)
+                .await
+                .unwrap()
+                .unwrap()
+                .coins
+                .is_empty()
+        );
+        assert!(
+            remote
+                .get_coins_by_delegate(owner)
+                .await
+                .unwrap()
+                .unwrap()
+                .coins
+                .is_empty()
+        );
+        assert_eq!(
+            remote
+                .get_coins_by_owner(owner)
+                .await
+                .unwrap()
+                .unwrap()
+                .coins
+                .iter()
+                .map(|(_, value)| value)
+                .sum::<u64>(),
+            100
+        );
+        let (sweep, _) =
+            crate::execution::test_support::reshape(41, &[ids[0]], &[(owner, None, 70)]);
+        let next_root = apply(&database, &[(owner, 100)], 2, std::slice::from_ref(&sweep)).await;
+        let next = index_block(&block, next_root, vec![sweep]);
+        chain_indexer
+            .ingest_finalized(next.clone(), finalization(&consensus_fixture(91), &next))
+            .await
+            .unwrap();
+        index.apply_finalized(&next).unwrap();
+        let swept = remote.get_coins_by_delegate(node).await.unwrap().unwrap();
+        assert_eq!(swept.snapshot.payload, next.digest());
+        assert!(swept.coins.is_empty());
+        server.abort();
     });
 }

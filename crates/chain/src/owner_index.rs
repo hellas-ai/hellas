@@ -1,30 +1,41 @@
 use crate::HellasBlock;
 use crate::domain::{
-    Address, Coin, MergeInputFault, ObjectId, ObjectKind, SettlementKey, Transaction,
-    coin_object_id, edge_object_id, genesis_object_id, merge_input_fault, output_object_id,
+    Coin, ObjectId, ObjectKind, SettlementKey, Transaction, coin_object_id, edge_object_id,
+    genesis_object_id,
 };
-use commonware_codec::Encode;
+use crate::owner_proof::{HOLDING_COIN, HOLDING_DELEGATED};
 use commonware_consensus::{Block as _, Heightable};
-use commonware_cryptography::{Digestible, Hasher, Sha256, sha256::Digest};
-use hellas_kernel::NetworkId;
+use commonware_cryptography::{Digestible, sha256::Digest};
+use hellas_kernel::{NetworkId, Parties};
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{Arc, RwLock},
 };
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct IndexedEdge {
-    pub maker: SettlementKey,
-    pub taker: SettlementKey,
+/// Coin holdings shared by the replay index and authenticated owner tree.
+pub(crate) fn coin_holdings(coin: Coin) -> impl Iterator<Item = (SettlementKey, u8, u64)> {
+    std::iter::once((coin.owner, HOLDING_COIN, coin.value)).chain(
+        coin.delegate
+            .filter(|delegate| *delegate != coin.owner)
+            .map(|delegate| (delegate, HOLDING_DELEGATED, 0)),
+    )
 }
 
-impl From<hellas_kernel::Parties> for IndexedEdge {
-    fn from(parties: hellas_kernel::Parties) -> Self {
-        Self {
-            maker: SettlementKey::from(parties.maker()),
-            taker: SettlementKey::from(parties.taker()),
-        }
-    }
+/// Every authority or destination key committed by an edge, once each.
+pub(crate) fn edge_keys(parties: Parties) -> BTreeSet<SettlementKey> {
+    [parties.maker(), parties.taker()]
+        .into_iter()
+        .flat_map(|party| {
+            [
+                Some(party.owner()),
+                Some(party.signer()),
+                party.payout_delegate(),
+            ]
+            .into_iter()
+            .flatten()
+            .map(SettlementKey::from)
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -50,22 +61,6 @@ pub enum OwnerIndexError {
     ParentMismatch { height: u64 },
     #[error("object not found: {id:?}")]
     ObjectNotFound { id: ObjectId },
-    #[error("invalid signature")]
-    InvalidSignature,
-    #[error("insufficient balance: available={available} requested={requested}")]
-    InsufficientBalance { available: u64, requested: u64 },
-    #[error("transfer amount must be > 0")]
-    ZeroAmount,
-    #[error("duplicate merge input: {id:?}")]
-    DuplicateInput { id: ObjectId },
-    #[error("merge requires at least 2 inputs")]
-    TooFewMergeInputs,
-    #[error("merge inputs must be strictly increasing")]
-    NonCanonicalMergeInputs,
-    #[error("merge inputs must have the same owner")]
-    MergeOwnerMismatch,
-    #[error("merge overflowed u64 total")]
-    MergeOverflow,
     #[error("output object collision: {id:?}")]
     OutputCollision { id: ObjectId },
     #[error("wrong object kind for {id:?}: expected {expected}, found {actual}")]
@@ -133,14 +128,14 @@ impl OwnerIndex {
     }
 
     #[cfg(test)]
-    pub(crate) fn get_edges_by_owner(&self, owner: &SettlementKey) -> Vec<(ObjectId, IndexedEdge)> {
+    pub(crate) fn get_edges_by_owner(&self, owner: &SettlementKey) -> Vec<(ObjectId, Parties)> {
         self.get_edges_by_owner_snapshot(owner).1
     }
 
     pub fn get_edges_by_owner_snapshot(
         &self,
         owner: &SettlementKey,
-    ) -> (OwnerCursor, Vec<(ObjectId, IndexedEdge)>) {
+    ) -> (OwnerCursor, Vec<(ObjectId, Parties)>) {
         let state = self.inner.read().expect("owner index lock poisoned");
         let edges = state
             .edges_by_owner
@@ -165,7 +160,14 @@ impl OwnerIndex {
         let coins = state
             .by_owner
             .get(owner)
-            .map(|coins| coins.iter().map(|(id, value)| (*id, *value)).collect())
+            .map(|coins| {
+                coins
+                    .iter()
+                    .filter_map(|((kind, id), value)| {
+                        (*kind == HOLDING_COIN).then_some((*id, *value))
+                    })
+                    .collect()
+            })
             .unwrap_or_default();
         (state.cursor, coins)
     }
@@ -181,7 +183,7 @@ impl OwnerIndex {
     }
 
     #[cfg(test)]
-    pub(crate) fn all_edges_for_test(&self) -> BTreeMap<ObjectId, IndexedEdge> {
+    pub(crate) fn all_edges_for_test(&self) -> BTreeMap<ObjectId, Parties> {
         self.inner
             .read()
             .expect("owner index lock poisoned")
@@ -192,16 +194,16 @@ impl OwnerIndex {
 
 #[derive(Clone)]
 struct State {
-    /// The network whose signatures this index accepts. Held rather
-    /// than passed per call: the index replays finalized blocks from
-    /// one chain, so the network is a property of the index, not of an
-    /// individual transaction.
+    /// The network this index replays. Held rather than passed per call:
+    /// a reshape's output ids are derived under it, and the index replays
+    /// finalized blocks from one chain, so the network is a property of
+    /// the index, not of an individual transaction.
     network: NetworkId,
     cursor: OwnerCursor,
     genesis_allocations: Vec<(SettlementKey, u64)>,
     coins: BTreeMap<ObjectId, Coin>,
-    by_owner: BTreeMap<SettlementKey, BTreeMap<ObjectId, u64>>,
-    edges: BTreeMap<ObjectId, IndexedEdge>,
+    by_owner: BTreeMap<SettlementKey, BTreeMap<(u8, ObjectId), u64>>,
+    edges: BTreeMap<ObjectId, Parties>,
     edges_by_owner: BTreeMap<SettlementKey, BTreeSet<ObjectId>>,
 }
 
@@ -311,20 +313,16 @@ impl State {
             let Ok(validator_index) = u16::try_from(idx) else {
                 break;
             };
-            self.insert_coin(genesis_object_id(validator_index), Coin { owner, value })?;
+            self.insert_coin(
+                genesis_object_id(validator_index),
+                Coin::owned(owner, value),
+            )?;
         }
         Ok(())
     }
 
     fn apply_transaction(&mut self, tx: &Transaction) -> Result<(), OwnerIndexError> {
         match tx {
-            Transaction::Transfer {
-                input,
-                recipient,
-                amount,
-                ..
-            } => self.apply_transfer(tx, *input, recipient, *amount),
-            Transaction::MergeCoin { inputs, .. } => self.apply_merge(tx, inputs.as_slice()),
             Transaction::Kernel(tx) => self.apply_kernel(tx),
         }
     }
@@ -339,7 +337,7 @@ impl State {
                 for id in funding.maker().iter().chain(funding.taker()) {
                     self.remove_coin(&coin_object_id(*id))?;
                 }
-                self.insert_edge(edge_id, terms.parties().into())
+                self.insert_edge(edge_id, terms.parties())
             }
             hellas_kernel::Tx::Close { input, outputs, .. } => {
                 let edge_id = edge_object_id(*input);
@@ -348,13 +346,24 @@ impl State {
                     .iter()
                     .zip(outputs)
                 {
-                    self.insert_coin(
-                        coin_object_id(*id),
-                        Coin {
-                            owner: SettlementKey::from(payout.owner()),
-                            value: payout.value(),
-                        },
-                    )?;
+                    self.insert_coin(coin_object_id(*id), Coin::from(payout.coin()))?;
+                }
+                Ok(())
+            }
+            // The reshape's outputs name the coins it issues exactly,
+            // delegates included, so the index reads them off the
+            // transaction the way it reads a close's payouts.
+            hellas_kernel::Tx::Owner(reshape) => {
+                for id in reshape.inputs() {
+                    self.remove_coin(&coin_object_id(*id))?;
+                }
+                let ids = hellas_kernel::Reshape::output_ids(
+                    self.network,
+                    reshape.inputs(),
+                    reshape.outputs(),
+                );
+                for (id, payout) in ids.iter().zip(reshape.outputs()) {
+                    self.insert_coin(coin_object_id(*id), Coin::from(payout.coin()))?;
                 }
                 Ok(())
             }
@@ -366,135 +375,16 @@ impl State {
         }
     }
 
-    fn apply_transfer(
-        &mut self,
-        tx: &Transaction,
-        input: ObjectId,
-        recipient: &Address,
-        amount: u64,
-    ) -> Result<(), OwnerIndexError> {
-        let coin = self
-            .coins
-            .get(&input)
-            .cloned()
-            .ok_or(OwnerIndexError::ObjectNotFound { id: input })?;
-        let owner = Address::try_from(coin.owner).map_err(|_| OwnerIndexError::InvalidSignature)?;
-        if !tx.verify_signature(self.network, &owner) {
-            return Err(OwnerIndexError::InvalidSignature);
-        }
-        if amount == 0 {
-            return Err(OwnerIndexError::ZeroAmount);
-        }
-        if amount > coin.value {
-            return Err(OwnerIndexError::InsufficientBalance {
-                available: coin.value,
-                requested: amount,
-            });
-        }
-
-        let tx_digest = Sha256::hash(&tx.encode());
-        let recipient_id = output_object_id(&tx_digest, 0);
-        if self.kind_of(&recipient_id).is_some() {
-            return Err(OwnerIndexError::OutputCollision { id: recipient_id });
-        }
-
-        let change_value = coin.value - amount;
-        let change_id = if change_value > 0 {
-            let id = output_object_id(&tx_digest, 1);
-            if self.kind_of(&id).is_some() || id == recipient_id {
-                return Err(OwnerIndexError::OutputCollision { id });
-            }
-            Some(id)
-        } else {
-            None
-        };
-
-        self.remove_coin(&input)?;
-        self.insert_coin(
-            recipient_id,
-            Coin {
-                owner: SettlementKey::from(recipient),
-                value: amount,
-            },
-        )?;
-        if let Some(change_id) = change_id {
-            self.insert_coin(
-                change_id,
-                Coin {
-                    owner: coin.owner,
-                    value: change_value,
-                },
-            )?;
-        }
-        Ok(())
-    }
-
-    fn apply_merge(
-        &mut self,
-        tx: &Transaction,
-        inputs: &[ObjectId],
-    ) -> Result<(), OwnerIndexError> {
-        if let Some(fault) = merge_input_fault(inputs) {
-            return Err(match fault {
-                MergeInputFault::TooFew => OwnerIndexError::TooFewMergeInputs,
-                MergeInputFault::Duplicate(id) => OwnerIndexError::DuplicateInput { id },
-                MergeInputFault::NonCanonical => OwnerIndexError::NonCanonicalMergeInputs,
-            });
-        }
-
-        let mut owner = None;
-        let mut total = 0u64;
-        for input in inputs {
-            let coin = self
-                .coins
-                .get(input)
-                .ok_or(OwnerIndexError::ObjectNotFound { id: *input })?;
-            if let Some(expected) = owner.as_ref() {
-                if &coin.owner != expected {
-                    return Err(OwnerIndexError::MergeOwnerMismatch);
-                }
-            } else {
-                owner = Some(coin.owner);
-            }
-            total = total
-                .checked_add(coin.value)
-                .ok_or(OwnerIndexError::MergeOverflow)?;
-        }
-        let Some(owner) = owner else {
-            return Err(OwnerIndexError::MergeOwnerMismatch);
-        };
-        let address = Address::try_from(owner).map_err(|_| OwnerIndexError::InvalidSignature)?;
-        if !tx.verify_signature(self.network, &address) {
-            return Err(OwnerIndexError::InvalidSignature);
-        }
-
-        let tx_digest = Sha256::hash(&tx.encode());
-        let output_id = output_object_id(&tx_digest, 0);
-        if self.kind_of(&output_id).is_some() {
-            return Err(OwnerIndexError::OutputCollision { id: output_id });
-        }
-
-        for input in inputs {
-            self.remove_coin(input)?;
-        }
-        self.insert_coin(
-            output_id,
-            Coin {
-                owner,
-                value: total,
-            },
-        )?;
-        Ok(())
-    }
-
     fn insert_coin(&mut self, id: ObjectId, coin: Coin) -> Result<(), OwnerIndexError> {
         if self.kind_of(&id).is_some() {
             return Err(OwnerIndexError::OutputCollision { id });
         }
-        self.by_owner
-            .entry(coin.owner)
-            .or_default()
-            .insert(id, coin.value);
+        for (key, kind, balance) in coin_holdings(coin) {
+            self.by_owner
+                .entry(key)
+                .or_default()
+                .insert((kind, id), balance);
+        }
         self.coins.insert(id, coin);
         Ok(())
     }
@@ -504,37 +394,33 @@ impl State {
             .coins
             .remove(id)
             .ok_or(OwnerIndexError::ObjectNotFound { id: *id })?;
-        let remove_owner = {
-            let owned = self
+        for (key, kind, _) in coin_holdings(coin) {
+            let held = self
                 .by_owner
-                .get_mut(&coin.owner)
-                .expect("owner index missing active coin owner");
-            owned.remove(id);
-            owned.is_empty()
-        };
-        if remove_owner {
-            self.by_owner.remove(&coin.owner);
+                .get_mut(&key)
+                .ok_or(OwnerIndexError::ObjectNotFound { id: *id })?;
+            if held.remove(&(kind, *id)).is_none() {
+                return Err(OwnerIndexError::ObjectNotFound { id: *id });
+            }
+            if held.is_empty() {
+                self.by_owner.remove(&key);
+            }
         }
         Ok(coin)
     }
 
-    fn insert_edge(&mut self, id: ObjectId, edge: IndexedEdge) -> Result<(), OwnerIndexError> {
+    fn insert_edge(&mut self, id: ObjectId, edge: Parties) -> Result<(), OwnerIndexError> {
         if self.kind_of(&id).is_some() {
             return Err(OwnerIndexError::OutputCollision { id });
         }
-        self.edges_by_owner
-            .entry(edge.maker)
-            .or_default()
-            .insert(id);
-        self.edges_by_owner
-            .entry(edge.taker)
-            .or_default()
-            .insert(id);
+        for key in edge_keys(edge) {
+            self.edges_by_owner.entry(key).or_default().insert(id);
+        }
         self.edges.insert(id, edge);
         Ok(())
     }
 
-    fn remove_edge(&mut self, id: &ObjectId) -> Result<IndexedEdge, OwnerIndexError> {
+    fn remove_edge(&mut self, id: &ObjectId) -> Result<Parties, OwnerIndexError> {
         let edge = match self.edges.remove(id) {
             Some(edge) => edge,
             None => {
@@ -554,10 +440,7 @@ impl State {
                 };
             }
         };
-        for owner in [edge.maker, edge.taker]
-            .into_iter()
-            .take(if edge.maker == edge.taker { 1 } else { 2 })
-        {
+        for owner in edge_keys(edge) {
             let remove_owner = {
                 let owned = self
                     .edges_by_owner

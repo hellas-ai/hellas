@@ -10,6 +10,11 @@ use serde_json::{Map, Value};
 use std::sync::Arc;
 
 pub struct FetchGatewayOptions {
+    pub access: super::GatewayAccess,
+    pub archive: super::ArchiveOptions,
+    pub allow_remote: bool,
+    pub wrap: Option<String>,
+    pub wrap_args: Vec<String>,
     pub host: String,
     pub port: Option<u16>,
     pub provider: iroh::EndpointId,
@@ -22,8 +27,10 @@ pub struct FetchGatewayOptions {
 pub async fn start_fetch(options: FetchGatewayOptions) -> crate::GatewayResult<GatewayHandle> {
     let work = options.work.clone();
     let result = async {
-        let listener = super::bind_gateway(&options.host, options.port, false).await?;
-        let bearer = Arc::new(super::access::Bearer::generate());
+        let listener =
+            super::bind_gateway(&options.host, options.port, options.allow_remote).await?;
+        let bearer = options.access.clone();
+        bearer.validate().await?;
         let backend = Arc::new(FetchBackend {
             work: work.clone(),
             provider: options.provider,
@@ -31,11 +38,25 @@ pub async fn start_fetch(options: FetchGatewayOptions) -> crate::GatewayResult<G
             method: options.method,
             overrides: options.request_overrides,
         });
+        let archive = super::archive::Policy::new(options.archive, false);
+        archive.prepare();
         let app = Router::new()
             .route("/v1/responses", post(handle))
             .with_state(backend)
+            .layer(axum::middleware::from_fn_with_state(
+                archive,
+                super::archive::record,
+            ))
             .layer(super::access::BearerLayer::new(bearer.clone()));
-        super::launch_gateway(app, listener, bearer, None, &[], Some(work.clone())).await
+        super::launch_gateway(
+            app,
+            listener,
+            bearer,
+            options.wrap.as_deref(),
+            &options.wrap_args,
+            Some(work.clone()),
+        )
+        .await
     }
     .await;
     if result.is_err() {

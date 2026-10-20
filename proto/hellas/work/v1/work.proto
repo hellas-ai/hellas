@@ -90,7 +90,7 @@ service WorkSetup {
 message ExchangeSetupRequest {
   // Required even when bundle is empty; checked against the selected journal.
   bytes bond_edge = 2;
-  // Canonical `WorkChannelSetupBundleV1` the caller has journaled, or
+  // Canonical `WorkChannelSetupBundleV2` the caller has journaled, or
   // empty to ask for the provider's own proposal.
   //
   // Empty is unambiguous rather than a sentinel: no revision encodes to
@@ -110,7 +110,7 @@ message ExchangeSetupResponse {
 }
 
 message SetupAdvanced {
-  // Canonical `WorkChannelSetupBundleV1`: the revision the answering
+  // Canonical `WorkChannelSetupBundleV2`: the revision the answering
   // endpoint has journaled, which is the caller's own plus whatever
   // this endpoint added to it.
   bytes bundle = 1;
@@ -130,11 +130,11 @@ message WorkRoute {
 
 message GetStandingRequest {
   WorkRoute route = 1;
-  // Fixed 88-byte StandingLocator: provider PrincipalId, GrantId, client
-  // PrincipalId, last-known generation. Channel is derived, never allocated.
+  // Fixed 124-byte StandingLocator: provider enrollment ContentId, GrantId,
+  // client PrincipalId (curve tag, compressed P-256 key), client node key (curve
+  // tag, compressed secp256k1 key), last-known generation.
+  // Channel is derived, never allocated.
   bytes locator = 2;
-  // Compact secp256k1 over get-standing.v1, locator, channel and TLS exporter.
-  bytes client_signature = 3;
 }
 message GetStandingResponse {
   oneof outcome {
@@ -180,11 +180,11 @@ message DeliverResultRequest {
   // exactly 32 bytes. Several jobs may be in flight per channel, so
   // every follow-on message selects one explicitly.
   //
-  // It is an identifier and not an authority. What authorises the
-  // release is the signature below.
+  // It is an identifier, not authority. Grant delivery uses the authenticated
+  // session actor; paid delivery also requires the signature below.
   bytes work_id = 1;
-  // The client's compact secp256k1 signature over the delivery-request
-  // digest: exactly 64 bytes.
+  // Paid delivery only: the client's compact secp256k1 signature over the
+  // delivery-request digest, exactly 64 bytes. Empty for grant delivery.
   //
   // The digest binds the channel, this job, the action, and the TLS
   // exporter of the connection the request arrives on — so it proves

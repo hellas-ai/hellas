@@ -112,7 +112,7 @@ impl SetupState {
     /// Returns the revision this endpoint has durably retained.
     #[must_use]
     pub fn revision(&self) -> Option<u8> {
-        self.bundle.as_ref().map(WorkChannelSetupBundleV1::revision)
+        self.bundle.as_ref().map(WorkChannelSetupBundleV2::revision)
     }
 
     /// Returns the retained revision itself.
@@ -124,7 +124,7 @@ impl SetupState {
     /// re-decoding bytes this journal has already decoded and checked
     /// would be a second parse whose failure would have no meaning.
     #[must_use]
-    pub const fn bundle(&self) -> Option<&WorkChannelSetupBundleV1> {
+    pub const fn bundle(&self) -> Option<&WorkChannelSetupBundleV2> {
         self.bundle.as_ref()
     }
 
@@ -165,7 +165,7 @@ impl SetupState {
     pub fn payment_edge(&self) -> Option<EdgeId> {
         self.bundle
             .as_ref()
-            .and_then(WorkChannelSetupBundleV1::payment_edge)
+            .and_then(WorkChannelSetupBundleV2::payment_edge)
     }
 
     /// Returns whether the bond Open has been journaled as submitted.
@@ -240,7 +240,7 @@ impl SetupState {
     pub fn bond_open(&self) -> Option<Tx> {
         self.bundle
             .as_ref()
-            .and_then(WorkChannelSetupBundleV1::bond_open)
+            .and_then(WorkChannelSetupBundleV2::bond_open)
     }
 
     /// Returns the executable payment Open, once both parties have
@@ -249,7 +249,7 @@ impl SetupState {
     pub fn payment_open(&self) -> Option<Tx> {
         self.bundle
             .as_ref()
-            .and_then(WorkChannelSetupBundleV1::payment_open)
+            .and_then(WorkChannelSetupBundleV2::payment_open)
     }
 
     /// Returns the height at and after which the retained bond Open can
@@ -545,7 +545,7 @@ impl SetupState {
     }
 
     fn apply_bundle(&mut self, bytes: &[u8]) -> Result<Applied, SetupStateError> {
-        let bundle = WorkChannelSetupBundleV1::decode(bytes)?;
+        let bundle = WorkChannelSetupBundleV2::decode(bytes)?;
         if self.bundle.as_ref() == Some(&bundle) {
             return Ok(Applied::Redundant);
         }
@@ -581,7 +581,7 @@ impl SetupState {
         bytes: &[u8],
         close_descriptor: &CloseDescriptor,
     ) -> Result<Applied, SetupStateError> {
-        let bundle = WorkChannelSetupBundleV1::decode(bytes)?;
+        let bundle = WorkChannelSetupBundleV2::decode(bytes)?;
         let expected_revision = match self.role {
             Role::Client => 2,
             Role::Provider => 3,
@@ -608,7 +608,7 @@ impl SetupState {
     fn apply_decoded_bundle(
         &mut self,
         bytes: &[u8],
-        bundle: WorkChannelSetupBundleV1,
+        bundle: WorkChannelSetupBundleV2,
     ) -> Result<Applied, SetupStateError> {
         if bundle.network() != self.network {
             return Err(SetupStateError::WrongChannel { field: "network" });

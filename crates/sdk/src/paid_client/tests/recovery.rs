@@ -6,9 +6,9 @@ use hellas_rpc::fetch::{
 };
 use hellas_rpc::output::{OutputEvent, StopReason, TextChannel};
 use hellas_rpc::pb::work::WorkDelivered;
-use hellas_rpc::protocol::work::PrivateRecord as _;
 use hellas_rpc::services::work::{Work, WorkServer};
 use hellas_wire::Dispatcher;
+use hellas_work::model::work::PrivateRecord as _;
 use hellas_work::work::{
     BackendFault, ObservationTime, PreparedFetchInput, WorkBackend, run_accepted_work,
 };
@@ -50,7 +50,8 @@ impl WorkBackend for Backend {
                 self.try_admit(hellas_work::work::admission::CapacityDomain::Fetch)
             })
             .await?
-            .dispatch()?;
+            .dispatch()
+            .await?;
         let request = verify_input_events(&parts.fetch_input_transcript).unwrap();
         let key = ProducerSigningKey::from_secret_bytes([2; 32]).unwrap();
         let mut output =
@@ -99,19 +100,25 @@ fn assert_no_payloads(root: &std::path::Path) {
 async fn restart_pays_delivered_fetch_once_and_skips_lost_payload_jobs() {
     tokio::time::timeout(Duration::from_secs(15), async {
         let fixture = PaidFixture::new();
-        let provider = fixture.provider();
-        let mut client = fixture.client();
-        let request = client.propose(&fixture.proposal()).unwrap();
-        let lost = client.accepted(&provider.accept(&request)).unwrap();
-        let request = client.propose(&fixture.proposal()).unwrap();
-        let delivered = client.accepted(&provider.accept(&request)).unwrap();
+        let provider = fixture.provider().await;
+        let mut client = fixture.client().await;
+        let request = client.propose(&fixture.proposal()).await.unwrap();
+        let lost = client
+            .accepted(&provider.accept(&request).await)
+            .await
+            .unwrap();
+        let request = client.propose(&fixture.proposal()).await.unwrap();
+        let delivered = client
+            .accepted(&provider.accept(&request).await)
+            .await
+            .unwrap();
         assert_ne!(lost, delivered);
         let backend = Backend::default();
         run_accepted_work(&provider, &fixture.ready, &backend, delivered)
             .await
             .unwrap();
         let request = client.request_delivery(delivered, &[8; 32]).unwrap();
-        let result = provider.deliver(&request, &[8; 32]).unwrap();
+        let result = provider.deliver(&request, &[8; 32]).await.unwrap();
         client
             .receive(
                 delivered,
@@ -122,6 +129,7 @@ async fn restart_pays_delivered_fetch_once_and_skips_lost_payload_jobs() {
                     transcript: result.transcript,
                 },
             )
+            .await
             .unwrap();
         // Crash after verified delivery, before creating any payment certificate.
         assert!(client.state().last_payment().is_none());
@@ -137,6 +145,7 @@ async fn restart_pays_delivered_fetch_once_and_skips_lost_payload_jobs() {
             .unwrap();
         let (bundle, key) = enrollment(server.id());
         let trust = hellas_client::ProviderTrustAnchor {
+            allowed_environments: vec![fixture.config.work_policy.allowed_environment()],
             expected_genesis: bundle.content_id(),
             required_assurance: Assurance::ProducerSigned,
             apple_app_attest: None,
@@ -168,7 +177,7 @@ async fn restart_pays_delivered_fetch_once_and_skips_lost_payload_jobs() {
             }
         });
         for restart in 0..2 {
-            let store = fixture.store(Role::Client);
+            let store = fixture.store(Role::Client).await;
             assert!(store.state().job_by_id(lost).is_some());
             assert_eq!(store.state().last_payment().is_some(), restart == 1);
             for job in store.state().jobs() {
@@ -194,6 +203,7 @@ async fn restart_pays_delivered_fetch_once_and_skips_lost_payload_jobs() {
                     ObservationTime::now(),
                     Duration::from_secs(60),
                 )
+                .await
                 .unwrap();
             let endpoint = bind_paid_endpoint(SecretKey::from_bytes(&[5; 32]))
                 .await
@@ -233,6 +243,7 @@ async fn restart_pays_delivered_fetch_once_and_skips_lost_payload_jobs() {
             assert_eq!(
                 provider
                     .with_state(|state| state.ledger().credited_cumulative())
+                    .await
                     .unwrap(),
                 PRICE
             );

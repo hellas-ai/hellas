@@ -4,30 +4,31 @@
 //! checks every transition at its recorded cursor height, preserving per-job
 //! credit limits and terminal outcomes across restart.
 
+use hellas_kernel::Cursor;
+use hex::encode as hex;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use hellas_kernel::{
-    Decode, EarnedCertificate, Encode, Key, NetworkId, Party, PayloadHash, PaymentCloseStart, Sig,
+    Decode, EarnedCertificate, Key, NetworkId, Party, PayloadHash, PaymentCloseStart, Sig,
     SigVerifier, StartId, WorkPaymentSettlement,
 };
 use hellas_xet::XetFileHasher;
 
+use crate::model::profile::PreparedWorkInput;
+use crate::model::work::{
+    CreditLedger, PaidChannel, PaidJobAuthorizationV2, PaidJobResultV1, PaidWorkError,
+    PaymentBindingV1, PrivateRecord as _, decode_transcript, payment_binding_digest, result_digest,
+    signing_hash, work_id,
+};
 use crate::work_store::journal::{
     Journal, JournalError, JournalId, JournalKind, MAX_CHECKPOINT_BYTES, MAX_RECORD_BYTES, Role,
 };
 use crate::work_store::setup::SetupOrigin;
 use crate::work_store::{
-    Applied, WorkStoreError, cursor::Cursor, hex, put_bytes, put_option, put_u64, take_bytes,
-    take_option,
+    Applied, WorkStoreError, put_bytes, put_option, put_u64, take_bytes, take_option,
 };
-use hellas_rpc::protocol::Digest;
-use hellas_rpc::protocol::work::{
-    CreditLedger, PaidChannel, PaidJobAuthorizationV2, PaidJobResultV1, PaidWorkError,
-    PaymentBindingV1, PrivateRecord as _, decode_transcript, payment_binding_digest, result_digest,
-    signing_hash, work_id,
-};
-use hellas_rpc::protocol::work_profile::PreparedWorkInput;
+use hellas_auth::Digest;
 
 mod book;
 pub mod funding;
@@ -39,7 +40,6 @@ mod codec;
 mod state;
 mod store;
 
-pub(crate) use codec::encode_kernel;
 pub use store::ChannelStore;
 
 /// Domain of a channel journal's key.
@@ -703,7 +703,8 @@ pub struct PaymentState {
     settlement: WorkPaymentSettlement,
     cursor: (u64, [u8; 32]),
     origin_observed: bool,
-    close_prepared: Option<PaymentCloseStart>,
+    // Retain the large no-alloc kernel witness behind the journal state's heap boundary.
+    close_prepared: Option<Box<PaymentCloseStart>>,
     close_opened: Option<OpenContest>,
     close_responded: Option<RespondedContest>,
     close_settled: Option<CloseSettlement>,

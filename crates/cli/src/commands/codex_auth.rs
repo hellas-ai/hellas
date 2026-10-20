@@ -1,11 +1,9 @@
+use hellas_auth::authority::UnixMillis;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-#[cfg(feature = "node")]
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-#[cfg(feature = "node")]
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use reqwest::Url;
@@ -13,26 +11,22 @@ use reqwest::header::{CONTENT_TYPE, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
-use crate::commands::http_client;
+use hellas_providers::responses_http_client;
 
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const ISSUER: &str = "https://auth.openai.com";
 const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const AUTH_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const AUTH_FILE_LOCK_TIMEOUT: Duration = Duration::from_secs(35);
-#[cfg(feature = "node")]
 const REFRESH_SKEW_SECONDS: u64 = 120;
-#[cfg(feature = "node")]
 const MAX_REFRESH_RESPONSE_BYTES: usize = 64 * 1024;
-#[cfg(feature = "node")]
-const MAX_REFRESH_ERROR_MESSAGE_BYTES: usize = 2 * 1024;
 
 pub(crate) async fn login(auth_path: Option<&Path>) -> anyhow::Result<()> {
     let store = CodexAuthStore::new(auth_path)?;
     let client = CodexAuthClient::new(
         Url::parse(ISSUER).expect("Codex auth issuer URL is valid"),
         Url::parse(TOKEN_URL).expect("Codex auth token URL is valid"),
-    );
+    )?;
     let tokens = client.device_login().await?;
     store.save(&CodexAuthState::new(tokens, None))?;
     eprintln!("Codex auth saved: {}", store.path().display());
@@ -91,11 +85,9 @@ pub(crate) fn import_codex_cli(
 #[derive(Clone, Debug)]
 pub(crate) struct CodexAuthStore {
     path: PathBuf,
-    #[cfg(feature = "node")]
     token_url: Url,
     /// Prevent many callers in this process from occupying Tokio blocking
     /// threads on the cross-process file lock while one refresh awaits HTTP.
-    #[cfg(feature = "node")]
     refresh_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
@@ -107,14 +99,12 @@ impl CodexAuthStore {
         };
         Ok(Self {
             path,
-            #[cfg(feature = "node")]
             token_url: Url::parse(TOKEN_URL).expect("Codex auth token URL is valid"),
-            #[cfg(feature = "node")]
             refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
-    #[cfg(all(test, feature = "node"))]
+    #[cfg(test)]
     pub(crate) fn with_token_url(path: PathBuf, token_url: Url) -> Self {
         Self {
             path,
@@ -131,7 +121,6 @@ impl CodexAuthStore {
         self.load_unlocked()
     }
 
-    #[cfg(feature = "node")]
     pub(crate) fn account_id(&self) -> Result<String, CodexAuthError> {
         self.load_unlocked()?
             .tokens
@@ -147,7 +136,6 @@ impl CodexAuthStore {
         }
     }
 
-    #[cfg(feature = "node")]
     pub(crate) async fn access_token(&self) -> Result<String, CodexAuthError> {
         if !self.path.exists() {
             return Err(CodexAuthError::Missing);
@@ -158,11 +146,11 @@ impl CodexAuthStore {
             .await
             .map_err(|error| CodexAuthError::LockTask(error.to_string()))??;
         let mut state = self.load_unlocked()?;
-        if let Some(blocked) = &state.refresh_token_blocked {
-            return Err(CodexAuthError::RefreshBlocked(blocked.message.clone()));
+        if state.refresh_token_blocked.is_some() {
+            return Err(CodexAuthError::RefreshBlocked);
         }
         if access_token_expiring(&state.tokens.access_token, REFRESH_SKEW_SECONDS) {
-            let client = http_client(AUTH_HTTP_TIMEOUT);
+            let client = responses_http_client(Default::default())?;
             let refreshed = refresh_tokens(&client, self.token_url.clone(), &state.tokens).await;
             match refreshed {
                 Ok(tokens) => {
@@ -173,7 +161,7 @@ impl CodexAuthStore {
                 }
                 Err(err) if err.is_terminal() => {
                     state.refresh_token_blocked = Some(BlockedRefreshToken {
-                        message: bounded_diagnostic(&err.to_string()),
+                        message: err.to_string(),
                         blocked_at: now_timestamp(),
                     });
                     self.save_unlocked(&state)?;
@@ -190,7 +178,7 @@ impl CodexAuthStore {
             .path
             .parent()
             .ok_or_else(|| CodexAuthError::InvalidPath(self.path.clone()))?;
-        create_dir_restricted(dir).map_err(CodexAuthError::Io)?;
+        hellas_private::create_dir_all_durable(dir).map_err(CodexAuthError::Io)?;
         let _guard = FileLock::lock(&self.path)?;
         self.save_unlocked(state)
     }
@@ -230,7 +218,7 @@ pub(crate) struct CodexTokens {
     account_id: Option<String>,
 }
 
-#[cfg(all(test, feature = "node"))]
+#[cfg(test)]
 pub(crate) fn test_tokens_with_account_id(
     access_token: &str,
     refresh_token: &str,
@@ -253,10 +241,10 @@ struct BlockedRefreshToken {
 pub(crate) enum CodexAuthError {
     #[error("no Codex credentials found; run `hellas codex-auth login`")]
     Missing,
-    #[cfg(feature = "node")]
-    #[error("Codex auth refresh token is blocked: {0}")]
-    RefreshBlocked(String),
-    #[cfg(feature = "node")]
+    #[error("Codex auth refresh token is blocked; sign in again")]
+    RefreshBlocked,
+    #[error("Codex HTTP client initialization failed")]
+    HttpClient(#[from] hellas_executor::FetchProviderError),
     #[error("Codex auth lock task failed: {0}")]
     LockTask(String),
     #[error("Codex auth path has no parent directory: {0}")]
@@ -275,7 +263,6 @@ pub(crate) enum CodexAuthError {
     CodexCliAuthInvalidJson(serde_json::Error),
     #[error("Codex CLI auth file is missing tokens.access_token or tokens.refresh_token")]
     CodexCliAuthShape,
-    #[cfg(feature = "node")]
     #[error("Codex ChatGPT credentials have no account id; re-import Codex CLI credentials")]
     MissingAccountId,
     #[error("Codex account id must be 1 to {MAX_ACCOUNT_ID_BYTES} valid HTTP-header bytes")]
@@ -304,13 +291,14 @@ pub(crate) enum CodexAuthError {
     TokenMissingAccessToken,
     #[error("Codex token response is missing refresh_token")]
     TokenMissingRefreshToken,
-    #[cfg(feature = "node")]
     #[error("Codex token refresh failed: {message}")]
-    RefreshFailed { message: String, terminal: bool },
+    RefreshFailed {
+        message: &'static str,
+        terminal: bool,
+    },
 }
 
 impl CodexAuthError {
-    #[cfg(feature = "node")]
     fn is_terminal(&self) -> bool {
         matches!(self, Self::RefreshFailed { terminal: true, .. })
     }
@@ -323,12 +311,12 @@ struct CodexAuthClient {
 }
 
 impl CodexAuthClient {
-    fn new(issuer: Url, token_url: Url) -> Self {
-        Self {
-            http: http_client(AUTH_HTTP_TIMEOUT),
+    fn new(issuer: Url, token_url: Url) -> Result<Self, CodexAuthError> {
+        Ok(Self {
+            http: responses_http_client(Default::default())?,
             issuer,
             token_url,
-        }
+        })
     }
 
     async fn device_login(&self) -> Result<CodexTokens, CodexAuthError> {
@@ -356,6 +344,7 @@ impl CodexAuthClient {
                 serde_json::to_vec(&serde_json::json!({ "client_id": CLIENT_ID }))
                     .expect("valid JSON"),
             )
+            .timeout(AUTH_HTTP_TIMEOUT)
             .send()
             .await
             .map_err(CodexAuthError::DeviceCodeRequest)?;
@@ -407,6 +396,7 @@ impl CodexAuthClient {
                     }))
                     .expect("valid JSON"),
                 )
+                .timeout(AUTH_HTTP_TIMEOUT)
                 .send()
                 .await
                 .map_err(CodexAuthError::DeviceCodeRequest)?;
@@ -452,6 +442,7 @@ impl CodexAuthClient {
                 ("client_id", CLIENT_ID),
                 ("code_verifier", exchange.code_verifier.as_str()),
             ]))
+            .timeout(AUTH_HTTP_TIMEOUT)
             .send()
             .await
             .map_err(CodexAuthError::TokenExchange)?;
@@ -480,7 +471,6 @@ struct DeviceExchange {
     code_verifier: String,
 }
 
-#[cfg(feature = "node")]
 async fn refresh_tokens(
     client: &reqwest::Client,
     token_url: Url,
@@ -488,7 +478,7 @@ async fn refresh_tokens(
 ) -> Result<CodexTokens, CodexAuthError> {
     if tokens.refresh_token.trim().is_empty() {
         return Err(CodexAuthError::RefreshFailed {
-            message: "missing refresh_token".to_string(),
+            message: "missing refresh_token",
             terminal: true,
         });
     }
@@ -500,10 +490,11 @@ async fn refresh_tokens(
             ("refresh_token", tokens.refresh_token.as_str()),
             ("client_id", CLIENT_ID),
         ]))
+        .timeout(AUTH_HTTP_TIMEOUT)
         .send()
         .await
-        .map_err(|err| CodexAuthError::RefreshFailed {
-            message: err.to_string(),
+        .map_err(|_| CodexAuthError::RefreshFailed {
+            message: "refresh transport or certificate verification failed",
             terminal: false,
         })?;
     let status = response.status();
@@ -520,13 +511,13 @@ async fn refresh_tokens(
     // caller's pace and self-heals when the server recovers. Only the
     // explicit auth-error codes and 401/403 in `refresh_error` are terminal.
     let value: JsonValue =
-        serde_json::from_slice(&bytes).map_err(|err| CodexAuthError::RefreshFailed {
-            message: format!("invalid JSON: {err}"),
+        serde_json::from_slice(&bytes).map_err(|_| CodexAuthError::RefreshFailed {
+            message: "invalid refresh response JSON",
             terminal: false,
         })?;
     let access_token =
         required_string(&value, "access_token").ok_or_else(|| CodexAuthError::RefreshFailed {
-            message: "missing access_token".to_string(),
+            message: "missing access_token",
             terminal: false,
         })?;
     let refresh_token =
@@ -538,17 +529,15 @@ async fn refresh_tokens(
     })
 }
 
-#[cfg(feature = "node")]
 async fn bounded_refresh_body(mut response: reqwest::Response) -> Result<Vec<u8>, CodexAuthError> {
     let mut body = Vec::new();
-    while let Some(chunk) =
-        response
-            .chunk()
-            .await
-            .map_err(|error| CodexAuthError::RefreshFailed {
-                message: format!("body read failed: {error}"),
-                terminal: false,
-            })?
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| CodexAuthError::RefreshFailed {
+            message: "refresh response body read failed",
+            terminal: false,
+        })?
     {
         let Some(next_len) = body.len().checked_add(chunk.len()) else {
             return Err(refresh_body_too_large());
@@ -561,10 +550,9 @@ async fn bounded_refresh_body(mut response: reqwest::Response) -> Result<Vec<u8>
     Ok(body)
 }
 
-#[cfg(feature = "node")]
 fn refresh_body_too_large() -> CodexAuthError {
     CodexAuthError::RefreshFailed {
-        message: format!("response body exceeds the {MAX_REFRESH_RESPONSE_BYTES}-byte limit"),
+        message: "refresh response body exceeds the byte limit",
         terminal: false,
     }
 }
@@ -627,65 +615,29 @@ fn tokens_from_codex_cli_json(value: &JsonValue) -> Result<CodexTokens, CodexAut
     })
 }
 
-#[cfg(feature = "node")]
-fn refresh_error(status: reqwest::StatusCode, body: &str) -> (String, bool) {
-    let mut code = None;
-    let mut message = None;
-    if let Ok(JsonValue::Object(object)) = serde_json::from_str::<JsonValue>(body)
-        && let Some(error) = object.get("error")
-    {
-        match error {
-            JsonValue::String(value) => code = Some(value.clone()),
-            JsonValue::Object(error) => {
-                code = error
-                    .get("code")
-                    .or_else(|| error.get("type"))
-                    .and_then(JsonValue::as_str)
-                    .map(ToString::to_string);
-                message = error
-                    .get("message")
-                    .and_then(JsonValue::as_str)
-                    .map(ToString::to_string);
-            }
-            _ => {}
-        }
-        message = message.or_else(|| {
-            object
-                .get("error_description")
-                .or_else(|| object.get("message"))
-                .and_then(JsonValue::as_str)
-                .map(ToString::to_string)
-        });
-    }
-
+fn refresh_error(status: reqwest::StatusCode, body: &str) -> (&'static str, bool) {
+    let value = serde_json::from_str::<JsonValue>(body).ok();
+    let error = value.as_ref().and_then(|value| value.get("error"));
+    let code = match error {
+        Some(JsonValue::String(code)) => Some(code.as_str()),
+        Some(JsonValue::Object(error)) => error
+            .get("code")
+            .or_else(|| error.get("type"))
+            .and_then(JsonValue::as_str),
+        _ => None,
+    };
     let terminal = matches!(
-        code.as_deref(),
+        code,
         Some("invalid_grant" | "invalid_token" | "invalid_request" | "refresh_token_reused")
     ) || matches!(status.as_u16(), 401 | 403);
-    let message = message.unwrap_or_else(|| format!("HTTP {status}"));
-    let message = bounded_diagnostic(&message);
-    (message, terminal)
-}
-
-#[cfg(feature = "node")]
-fn bounded_diagnostic(message: &str) -> String {
-    let mut output = String::with_capacity(message.len().min(MAX_REFRESH_ERROR_MESSAGE_BYTES));
-    for character in message.chars() {
-        let character = if character.is_control() {
-            ' '
-        } else {
-            character
-        };
-        if output.len() + character.len_utf8() > MAX_REFRESH_ERROR_MESSAGE_BYTES {
-            break;
-        }
-        output.push(character);
-    }
-    if output.is_empty() {
-        "upstream returned an empty error".to_string()
+    // Inspect only the closed terminal-code set. Upstream descriptions and unknown
+    // codes may contain credentials; neither returned errors nor disk may retain them.
+    let message = if terminal {
+        "refresh token refused; sign in again"
     } else {
-        output
-    }
+        "upstream refresh request failed"
+    };
+    (message, terminal)
 }
 
 fn form_body(pairs: &[(&str, &str)]) -> String {
@@ -722,7 +674,6 @@ fn required_string(value: &JsonValue, key: &str) -> Option<String> {
         .map(ToString::to_string)
 }
 
-#[cfg(feature = "node")]
 fn access_token_expiring(token: &str, skew_seconds: u64) -> bool {
     let Some(expires_at) = access_token_expiry_seconds(token) else {
         return true;
@@ -744,15 +695,10 @@ fn access_token_expiry_seconds(token: &str) -> Option<u64> {
     value.get("exp").and_then(JsonValue::as_u64)
 }
 
-#[cfg(feature = "node")]
 fn unix_seconds() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or_default()
+    UnixMillis::now().unwrap_or_default().0 / 1_000
 }
 
-#[cfg(feature = "node")]
 fn now_timestamp() -> String {
     unix_seconds().to_string()
 }
@@ -780,21 +726,6 @@ fn default_codex_cli_auth_path() -> Result<PathBuf, CodexAuthError> {
     Ok(home_dir()?.join(".codex").join("auth.json"))
 }
 
-fn create_dir_restricted(path: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(path)
-    }
-    #[cfg(not(unix))]
-    {
-        fs::create_dir_all(path)
-    }
-}
-
 /// Exclusive advisory lock beside the auth file (flock on Unix, LockFileEx
 /// on Windows), released when the file is dropped.
 struct FileLock {
@@ -803,20 +734,7 @@ struct FileLock {
 
 impl FileLock {
     fn lock(path: &Path) -> Result<Self, CodexAuthError> {
-        let mut options = fs::OpenOptions::new();
-        options
-            .read(true)
-            .write(true)
-            .create(true)
-            // Lock files carry no content; never clobber what's there.
-            .truncate(false);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
-        }
-        let file = options
-            .open(path.with_extension("lock"))
+        let file = hellas_private::open_lock_beside(&path.with_extension(""))
             .map_err(CodexAuthError::Io)?;
         let deadline = Instant::now() + AUTH_FILE_LOCK_TIMEOUT;
         loop {

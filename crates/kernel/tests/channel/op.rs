@@ -11,7 +11,8 @@ fn operations_report_deterministic_cost() {
     // payouts under `Mutual` (the proof kind charging the most proof units).
     let worst_case = Tx::close(edge(), mutual_proof(edge(), &payouts4()), payouts4()).cost();
 
-    assert_eq!(open_cost, Cost::new(1, 3, 0));
+    // One proof unit per party witness, Basic included.
+    assert_eq!(open_cost, Cost::new(1, 3, 2));
     assert_eq!(close_cost, Cost::new(1, 3, 1));
     assert_eq!(worst_case, Cost::new(1, 5, 2));
     assert!(close_cost.fits(worst_case));
@@ -20,7 +21,10 @@ fn operations_report_deterministic_cost() {
         Cost::new(0, 0, 2)
     );
     assert_eq!(proof().kind(), CloseKind::Timeout);
-    assert_eq!(Proof::timeout(basic_terms()).cost(), Cost::new(0, 0, 1));
+    assert_eq!(
+        Proof::timeout(basic_terms(), None).cost(),
+        Cost::new(0, 0, 1)
+    );
 }
 
 #[test]
@@ -73,15 +77,15 @@ fn block_reports_deterministic_cost_and_fee() {
     ]);
     let block = Block::new(RESOURCE_CONTEXT, ops);
 
-    assert_eq!(block.cost(), Some(Cost::new(2, 6, 1)));
-    // 1*2 + 3*6 + 0*1 = 20 under RESOURCE_CONTEXT.
+    assert_eq!(block.cost(), Some(Cost::new(2, 6, 3)));
+    // 1*2 + 3*6 + 0*3 = 20 under RESOURCE_CONTEXT.
     assert_eq!(block.fee(), Some(20));
-    assert!(Cost::new(2, 6, 1).fits(Cost::new(2, 6, 1)));
-    assert!(block.fits(Cost::new(2, 6, 1)));
-    assert!(block.fits(Cost::new(3, 6, 1)));
-    assert!(!block.fits(Cost::new(1, 6, 1)));
-    assert!(!block.fits(Cost::new(2, 5, 1)));
-    assert!(!block.fits(Cost::new(2, 6, 0)));
+    assert!(Cost::new(2, 6, 3).fits(Cost::new(2, 6, 3)));
+    assert!(block.fits(Cost::new(2, 6, 3)));
+    assert!(block.fits(Cost::new(3, 6, 3)));
+    assert!(!block.fits(Cost::new(1, 6, 3)));
+    assert!(!block.fits(Cost::new(2, 5, 3)));
+    assert!(!block.fits(Cost::new(2, 6, 2)));
 }
 
 #[test]

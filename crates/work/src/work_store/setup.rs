@@ -3,23 +3,23 @@
 //! Each signed revision is fsynced before export; recovery resumes from the
 //! retained revision and decides from one coherent observed chain state.
 
+use hellas_kernel::Cursor;
+use hex::encode as hex;
 use std::collections::BTreeSet;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use hellas_kernel::{CoinId, Edge, EdgeId, LeaseSlots, NetworkId, SigVerifier, Tx};
 use hellas_xet::XetFileHasher;
 
+use crate::model::bundle::{SetupBundleError, WorkChannelSetupBundleV2};
+use crate::model::setup::{CloseDescriptor, WorkSetupError};
 use crate::work_store::journal::{
-    Journal, JournalError, JournalId, JournalKind, MAX_CHECKPOINT_BYTES, Role, journal_name_parts,
+    Journal, JournalError, JournalId, JournalKind, MAX_CHECKPOINT_BYTES, Role,
 };
 use crate::work_store::{
-    Applied, WorkStoreError, cursor::Cursor, hex, put_bytes, put_option, put_u64, take_bool,
-    take_bytes, take_option,
+    Applied, WorkStoreError, put_bytes, put_option, put_u64, take_bool, take_bytes, take_option,
 };
-use hellas_rpc::protocol::Digest;
-use hellas_rpc::protocol::work_bundle::{SetupBundleError, WorkChannelSetupBundleV1};
-use hellas_rpc::protocol::work_setup::{CloseDescriptor, WorkSetupError};
+use hellas_auth::Digest;
 
 mod codec;
 mod state;
@@ -347,7 +347,7 @@ pub struct SetupState {
     network: NetworkId,
     bond_edge: EdgeId,
     role: Role,
-    bundle: Option<WorkChannelSetupBundleV1>,
+    bundle: Option<WorkChannelSetupBundleV2>,
     bundle_bytes: Vec<u8>,
     scan_armed: Option<SetupScan>,
     close_descriptor: Option<CloseDescriptor>,

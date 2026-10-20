@@ -1,16 +1,16 @@
 //! Host composition for the Responses gateway over a pinned grant Offer.
 use crate::{
-    ClientIdentity,
     grant_client::{GrantSessionOptions, GrantTransport, PinnedOffer},
     grant_gateway::GrantGateway,
 };
 use hellas_gateway::GatewayHandle;
-use hellas_rpc::protocol::{
-    work_fetch::FetchRoutePolicy,
-    work_grant::records::{GrantError, Principal},
-    work_profile::WorkPolicy,
+use hellas_work::model::grant::records::grant_transport;
+use hellas_work::model::{
+    fetch::FetchRoutePolicy,
+    grant::records::{GrantError, GrantPolicy},
+    profile::WorkPolicy,
 };
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::sync::Arc;
 
 #[derive(Debug, thiserror::Error)]
 pub enum FetchGatewayError {
@@ -19,41 +19,57 @@ pub enum FetchGatewayError {
     #[error(transparent)]
     Key(#[from] iroh::KeyParsingError),
     #[error(transparent)]
-    Bind(#[from] iroh::endpoint::BindError),
-    #[error(transparent)]
     Work(#[from] hellas_gateway::WorkGatewayError),
     #[error(transparent)]
     Gateway(#[from] hellas_gateway::GatewayError),
 }
 
+#[derive(Clone)]
 pub struct FetchGatewayOptions {
+    pub access: hellas_gateway::GatewayAccess,
+    pub archive: hellas_gateway::ArchiveOptions,
     pub host: String,
     pub port: Option<u16>,
-    pub offer: PinnedOffer,
-    pub identity: ClientIdentity,
-    /// Persistent private directory; a pending acceptance survives host restarts.
-    pub journal_root: PathBuf,
+    pub allow_remote: bool,
+    pub wrap: Option<String>,
+    pub wrap_args: Vec<String>,
+    pub session: GrantSessionOptions,
+    pub policy: Option<String>,
     pub request_overrides: serde_json::Map<String, serde_json::Value>,
 }
 
-/// This constructor owns endpoint shutdown, including failed startup and drain.
-pub async fn start_fetch(options: FetchGatewayOptions) -> Result<GatewayHandle, FetchGatewayError> {
-    let grant = &options.offer.offer().grant;
-    let client: Principal = grant.kind.principal().clone();
-    if client.producer().to_bytes().as_slice() != options.identity.caller_key().public_key().bytes()
-        || client.transport() != *options.identity.node_id().as_bytes()
-    {
-        return Err(GrantError::Audience.into());
-    }
-    let mut policies = grant.policies.iter().filter(|p| {
+/// Identify the Responses presentation without opening an endpoint or channel.
+/// An ambiguous offer requires an explicit resource selection.
+pub fn selected_policy<'a>(
+    offer: &'a PinnedOffer,
+    name: Option<&str>,
+) -> Result<Option<&'a GrantPolicy>, GrantError> {
+    let mut candidates = offer
+        .offer()
+        .grant
+        .policies
+        .iter()
+        .filter(|p| name.is_none_or(|name| name == p.name));
+    let response = |p: &&GrantPolicy| {
         p.https.is_none()
-            && p.work.allowed_environment()
-                == hellas_rpc::FetchEnvironment::OpenAiResponses.manifest_id()
-    });
-    let policy = policies.next().ok_or(GrantError::OutOfScope)?;
-    if policies.next().is_some() {
-        return Err(GrantError::OutOfScope.into());
+            && matches!(&p.work, WorkPolicy::Fetch { contract, .. } if contract.schema() == hellas_rpc::FetchSchema::StatelessResponsesV1)
+    };
+    let Some(policy) = candidates.clone().find(response) else {
+        return Ok(None);
+    };
+    if candidates.nth(1).is_some() {
+        return Err(GrantError::OutOfScope);
     }
+    Ok(Some(policy))
+}
+
+/// This constructor owns endpoint shutdown, including failed startup and drain.
+pub async fn start_fetch(
+    options: FetchGatewayOptions,
+    transport: GrantTransport,
+) -> Result<GatewayHandle, FetchGatewayError> {
+    let policy = selected_policy(&options.session.target, options.policy.as_deref())?
+        .ok_or(GrantError::OutOfScope)?;
     let WorkPolicy::Fetch {
         route: FetchRoutePolicy::SealedRoute { service, method },
         ..
@@ -63,33 +79,16 @@ pub async fn start_fetch(options: FetchGatewayOptions) -> Result<GatewayHandle, 
     };
     let (name, service, method) = (policy.name.clone(), service.clone(), method.clone());
     let provider =
-        iroh::EndpointId::from_bytes(&options.offer.offer().provider.grant_transport()?)?;
-    let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
-        .secret_key(options.identity.transport_key())
-        .bind()
-        .await?;
-    let backend = GrantGateway::open(
-        GrantSessionOptions {
-            timeout: Duration::from_millis(grant.max_job_millis.get()),
-            target: options.offer,
-            client,
-            signer: Arc::new(options.identity.caller_key().clone()),
-            journal_root: options.journal_root,
-        },
-        GrantTransport::Remote(endpoint.clone()),
-        Some(name),
-    )
-    .await;
-    let work = match backend {
-        Ok(work) => work,
-        Err(error) => {
-            endpoint.close().await;
-            return Err(error.into());
-        }
-    };
+        iroh::EndpointId::from_bytes(&grant_transport(&options.session.target.offer().provider)?)?;
+    let work = GrantGateway::open(options.session, transport, Some(name)).await?;
     hellas_gateway::start_fetch(hellas_gateway::FetchGatewayOptions {
+        access: options.access,
+        archive: options.archive,
         host: options.host,
         port: options.port,
+        allow_remote: options.allow_remote,
+        wrap: options.wrap,
+        wrap_args: options.wrap_args,
         provider,
         service,
         method,
@@ -98,4 +97,18 @@ pub async fn start_fetch(options: FetchGatewayOptions) -> Result<GatewayHandle, 
     })
     .await
     .map_err(Into::into)
+}
+
+impl FetchGatewayOptions {
+    /// The host supplies the access it validated; `self.access` is replaced.
+    pub fn into_factory(self, key: iroh::SecretKey) -> crate::node_control::host::GatewayFactory {
+        Arc::new(move |access| {
+            let (mut options, key) = (self.clone(), key.clone());
+            options.access = access;
+            Box::pin(async move {
+                let transport = GrantTransport::remote(key).await?;
+                Ok(start_fetch(options, transport).await?)
+            })
+        })
+    }
 }

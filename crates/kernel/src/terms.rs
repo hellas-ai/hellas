@@ -415,7 +415,7 @@ impl Encode for WorkStakeBondTerms {
         + u64::MAX_ENCODED_SIZE;
 
     fn encoded_size(&self) -> usize {
-        Parties::MAX_ENCODED_SIZE
+        self.parties.encoded_size()
             + BlockHeight::MAX_ENCODED_SIZE
             + self.timeout_outputs.encoded_size()
             + u64::MAX_ENCODED_SIZE
@@ -600,6 +600,7 @@ mod tests {
     use crate::{
         canonical::{BufferWriter, hash},
         consts::{TERMS_BASIC, TERMS_WORK_PAYMENT, TERMS_WORK_STAKE_BOND},
+        object::PartyKeys,
         primitive::Key,
         tx::CloseKind,
     };
@@ -610,7 +611,7 @@ mod tests {
         let mut outputs = [Payout::default(); MAX_EDGE_OUTPUTS];
         outputs[0] = Payout::new(provider, 12);
         WorkStakeBondTerms {
-            parties: Parties::new(provider, client),
+            parties: Parties::new(PartyKeys::sole(provider), PartyKeys::sole(client)),
             timeout: BlockHeight::new(77),
             timeout_outputs: List::take(outputs, 1),
             max_job_price: 4,
@@ -730,7 +731,7 @@ mod tests {
         let taker = Key::from_bytes([2; Key::LENGTH]);
         let basic = Terms::basic(
             ProtocolCode::new(1),
-            Parties::new(maker, taker),
+            Parties::new(PartyKeys::sole(maker), PartyKeys::sole(taker)),
             BlockHeight::new(99),
             List::take([Payout::default(); MAX_EDGE_OUTPUTS], 0),
         );
@@ -750,7 +751,7 @@ mod tests {
         let taker = Key::from_bytes([2; Key::LENGTH]);
         let basic = Terms::basic(
             ProtocolCode::new(1),
-            Parties::new(maker, taker),
+            Parties::new(PartyKeys::sole(maker), PartyKeys::sole(taker)),
             BlockHeight::new(99),
             List::take([Payout::default(); MAX_EDGE_OUTPUTS], 0),
         );
@@ -783,7 +784,7 @@ mod tests {
         let outputs = List::take(outputs, 2);
         let terms = Terms::basic(
             ProtocolCode::new(1),
-            Parties::new(maker, taker),
+            Parties::new(PartyKeys::sole(maker), PartyKeys::sole(taker)),
             BlockHeight::new(99),
             outputs,
         );
@@ -799,7 +800,7 @@ mod tests {
         let outputs = List::all([Payout::new(maker, 7); MAX_EDGE_OUTPUTS]);
         let body = TermsBody::Basic {
             protocol: ProtocolCode::new(1),
-            parties: Parties::new(maker, taker),
+            parties: Parties::new(PartyKeys::sole(maker), PartyKeys::sole(taker)),
             timeout: BlockHeight::new(99),
             timeout_outputs: outputs,
         };
@@ -810,15 +811,29 @@ mod tests {
 
         assert_eq!(body.encoded_size(), writer.position());
         assert!(body.encoded_size() <= TermsBody::MAX_ENCODED_SIZE);
+        // Each party is `owner ‖ signer ‖ payout_delegate`, the absent
+        // delegate one zero byte.
         let maker_start =
             ENVELOPE_SIZE + u8::MAX_ENCODED_SIZE + ProtocolCode::MAX_ENCODED_SIZE + ENVELOPE_SIZE;
-        let taker_start = maker_start + Key::LENGTH;
-        let parties_end = taker_start + Key::LENGTH;
+        let taker_start = maker_start + 2 * Key::LENGTH + 1;
+        let parties_end = taker_start + 2 * Key::LENGTH + 1;
 
         assert_eq!(&buf[..4], &[1, tag::TERMS, BASIC_TAG, 1]);
         assert_eq!(&buf[4..maker_start], &[1, tag::PARTIES]);
-        assert_eq!(&buf[maker_start..taker_start], maker.as_bytes());
-        assert_eq!(&buf[taker_start..parties_end], taker.as_bytes());
+        assert_eq!(
+            &buf[maker_start..maker_start + Key::LENGTH],
+            maker.as_bytes()
+        );
+        assert_eq!(
+            &buf[maker_start + Key::LENGTH..maker_start + 2 * Key::LENGTH],
+            maker.as_bytes()
+        );
+        assert_eq!(buf[taker_start - 1], 0);
+        assert_eq!(
+            &buf[taker_start..taker_start + Key::LENGTH],
+            taker.as_bytes()
+        );
+        assert_eq!(buf[parties_end - 1], 0);
     }
 
     /// The widest body is the work payment, and it is what every buffer
@@ -838,8 +853,14 @@ mod tests {
         );
 
         let maker = Key::from_bytes([1; Key::LENGTH]);
+        let delegate = Some(Key::from_bytes([3; Key::LENGTH]));
         let mut widest = sample_payment();
-        widest.bond_terms.timeout_outputs = List::all([Payout::new(maker, 7); MAX_EDGE_OUTPUTS]);
+        widest.bond_terms.parties = Parties::new(
+            PartyKeys::new(maker, Key::from_bytes([4; Key::LENGTH]), delegate),
+            PartyKeys::new(Key::from_bytes([2; Key::LENGTH]), maker, delegate),
+        );
+        widest.bond_terms.timeout_outputs =
+            List::all([Payout::delegated(maker, delegate, 7); MAX_EDGE_OUTPUTS]);
         let terms = Terms::work_payment(widest);
         assert_eq!(terms.encoded_size(), Terms::MAX_ENCODED_SIZE);
         round_trip(&terms);

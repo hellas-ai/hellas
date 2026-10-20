@@ -1,100 +1,64 @@
 [package]
 name = "hellas-sdk"
-description = "Transport-neutral composition facade for Hellas applications"
+description = "Native host composition for Hellas services and clients"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 documentation.workspace = true
 
-[features]
-default = ["client", "apple-verifier"]
-client = [
-    "dep:futures-core",
-    "dep:hellas-client",
-    "dep:iroh",
-    "hellas-client/iroh",
-    "hellas-wire/iroh",
-]
-apple-verifier = ["hellas-attestation/apple-app-attest"]
-gateway = ["dep:hellas-gateway"]
-provider = [
-    "client",
-    "dep:hellas-executor",
-    "dep:hellas-providers",
-    "dep:iroh",
-    "dep:tokio",
-    "dep:tracing",
-    "hellas-wire/iroh",
-]
-local-control = ["dep:tokio", "hellas-rpc/host-control", "hellas-wire/unix"]
-
-grant-admin = ["work", "local-control"]
-grant-client = [
-    "work",
-    "client",
-    "hellas-client/work",
-    "dep:async-stream",
-    "dep:prost",
-    "dep:rand",
-]
-paid-client = ["paid-work", "client", "dep:async-stream", "hellas-client/work"]
-paid-provider = ["paid-work", "provider"]
-grant-provider = ["work", "provider"]
-grant-gateway = ["grant-client", "gateway", "dep:rand"]
-paid-gateway = ["paid-client", "gateway", "dep:rand"]
-# Shared channel configuration and provisioning, independent of execution servers.
-work = [
-    "dep:iroh",
-    "hellas-wire/iroh",
-    "dep:tokio",
-    "dep:tracing",
-    "dep:hellas-kernel",
-    "hellas-kernel/secp256k1",
-    "dep:hellas-work",
-    "dep:hellas-private",
-    "hellas-rpc/work",
-    "dep:futures",
-    "dep:serde",
-    "dep:serde_json",
-    "dep:hex",
-]
-
-# Payment observation and settlement require verified chain access.
-paid-work = [
-    "work",
-    "dep:hellas-chain",
-    "hellas-chain/full-node",
-    "hellas-chain/work-watcher",
-    "dep:url",
-]
-
 [dependencies]
-async-stream = { workspace = true, optional = true }
-futures = { workspace = true, optional = true }
-futures-core = { workspace = true, optional = true }
-hellas-attestation.workspace = true
-hellas-chain = { workspace = true, default-features = false, optional = true }
-hellas-client = { workspace = true, optional = true }
-hellas-executor = { workspace = true, default-features = false, optional = true }
-hellas-gateway = { workspace = true, optional = true }
-hellas-kernel = { workspace = true, default-features = false, optional = true }
-hellas-private = { workspace = true, optional = true }
-hellas-providers = { workspace = true, optional = true }
-hellas-rpc = { workspace = true, features = ["execute", "fetch"] }
-hellas-wire = { workspace = true, features = ["mux"] }
-hellas-work = { workspace = true, optional = true }
-hex = { workspace = true, optional = true }
-iroh = { workspace = true, features = ["tls-ring"], optional = true }
-prost = { version = "0.14", optional = true }
-rand = { workspace = true, optional = true }
-serde = { workspace = true, optional = true }
-serde_json = { workspace = true, optional = true }
+async-stream = { workspace = true }
+futures = { workspace = true }
+futures-core = { workspace = true }
+hellas-attestation = { workspace = true, features = ["apple-app-attest"] }
+hellas-auth = { workspace = true }
+hellas-chain = { workspace = true, default-features = false, features = [
+    "full-node",
+    "work-watcher",
+] }
+hellas-client = { workspace = true, features = ["iroh", "work"] }
+hellas-executor = { workspace = true, default-features = false }
+hellas-gateway = { workspace = true }
+hellas-kernel = { workspace = true, default-features = false, features = [
+    "secp256k1",
+    "webauthn",
+] }
+hellas-private = { workspace = true }
+hellas-providers = { workspace = true }
+hellas-rpc = { workspace = true, features = [
+    "execute",
+    "fetch",
+    "work",
+    "host-control",
+] }
+hellas-wire = { workspace = true, features = [
+    "mux",
+    "iroh",
+    "unix",
+    "tls",
+    "discovery-mdns",
+] }
+hellas-work = { workspace = true }
+hex = { workspace = true }
+iroh = { workspace = true, features = ["tls-ring"] }
+iroh-mdns-address-lookup = { workspace = true }
+prost = { version = "0.14" }
+rand = { workspace = true }
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+] }
+serde = { workspace = true }
+serde_bytes = { workspace = true }
+serde_json = { workspace = true }
+subtle = "2"
 tempfile = { workspace = true }
 thiserror.workspace = true
-tokio = { workspace = true, features = ["net", "sync"], optional = true }
-tracing = { workspace = true, optional = true }
-url = { version = "2", optional = true }
+tokio = { workspace = true, features = ["net", "sync"] }
+tracing = { workspace = true }
+url = { version = "2" }
+zeroize = { version = "1.9" }
 
 [dev-dependencies]
 base64.workspace = true
@@ -102,6 +66,7 @@ bytes.workspace = true
 commonware-codec.workspace = true
 commonware-cryptography.workspace = true
 commonware-runtime.workspace = true
+hellas-work = { workspace = true, features = ["test-support"] }
 rcgen = "0.14"
 reqwest = { workspace = true, features = ["json"] }
 rustls = { version = "0.23", default-features = false, features = [

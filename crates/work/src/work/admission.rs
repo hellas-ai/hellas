@@ -2,6 +2,8 @@
 use super::BackendFault;
 use std::{future::Future, time::Instant};
 use tokio::sync::OwnedSemaphorePermit;
+mod cancellation;
+pub(crate) use cancellation::{CancelOnFailure, Cancellation};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CapacityDomain {
@@ -24,6 +26,8 @@ pub enum AdmissionError {
     },
     #[error("grant execution deadline passed")]
     Deadline,
+    #[error("execution authority was cancelled")]
+    Cancelled,
 }
 
 #[derive(Debug)]
@@ -43,7 +47,7 @@ impl WorkPermit {
     }
 }
 
-type Dispatch = Box<dyn FnOnce() -> Result<(), BackendFault> + Send>;
+type Dispatch = futures::future::BoxFuture<'static, Result<(), BackendFault>>;
 
 /// Payment obligations wait for capacity; grants reserve it before acceptance.
 #[derive(Debug)]
@@ -60,10 +64,19 @@ impl WorkAdmission {
         Self(Authorization::Payment)
     }
 
-    pub(crate) fn grant(permit: WorkPermit, deadline: Instant, dispatch: Dispatch) -> Self {
+    pub(crate) fn grant(
+        permit: WorkPermit,
+        deadline: Instant,
+        cancellation: Cancellation,
+        dispatch: impl Future<Output = Result<(), BackendFault>> + Send + 'static,
+    ) -> Self {
         Self(Authorization::Grant(AdmittedWork {
             permit,
-            funding: Funding::Grant { deadline, dispatch },
+            funding: Funding::Grant {
+                deadline,
+                cancellation,
+                dispatch: Box::pin(dispatch),
+            },
         }))
     }
 
@@ -98,6 +111,7 @@ enum Funding {
     Payment,
     Grant {
         deadline: Instant,
+        cancellation: Cancellation,
         dispatch: Dispatch,
     },
 }
@@ -121,22 +135,36 @@ impl AdmittedWork {
     }
 
     /// Durably authorize dispatch before any backend preparation or execution.
-    pub fn dispatch(self) -> Result<RunningWork, BackendFault> {
+    pub async fn dispatch(self) -> Result<RunningWork, BackendFault> {
         let started = Instant::now();
-        let deadline = match self.funding {
-            Funding::Payment => None,
-            Funding::Grant { deadline, dispatch } => {
+        let (deadline, cancellation) = match self.funding {
+            Funding::Payment => (None, None),
+            Funding::Grant {
+                deadline,
+                cancellation,
+                dispatch,
+            } => {
+                if cancellation.is_cancelled() {
+                    return Err(AdmissionError::Cancelled.into());
+                }
                 if started >= deadline {
                     return Err(AdmissionError::Deadline.into());
                 }
-                dispatch()?;
-                Some(deadline)
+                dispatch.await?;
+                if cancellation.is_cancelled() {
+                    return Err(AdmissionError::Cancelled.into());
+                }
+                if Instant::now() >= deadline {
+                    return Err(AdmissionError::Deadline.into());
+                }
+                (Some(deadline), Some(cancellation))
             }
         };
         Ok(RunningWork {
             _permit: self.permit,
             started,
             deadline,
+            cancellation,
         })
     }
 }
@@ -147,20 +175,35 @@ pub struct RunningWork {
     _permit: WorkPermit,
     started: Instant,
     deadline: Option<Instant>,
+    cancellation: Option<Cancellation>,
 }
 impl RunningWork {
     pub fn deadline(&self) -> Option<Instant> {
         self.deadline
     }
-    pub fn deadline_with(&self, maximum: std::time::Duration) -> Instant {
-        let provider = self.started + maximum;
-        self.deadline
-            .map_or(provider, |deadline| deadline.min(provider))
+    /// The signed grant deadline; work funded without one stops after `fallback`.
+    pub fn deadline_or(&self, fallback: std::time::Duration) -> Instant {
+        self.deadline.unwrap_or(self.started + fallback)
     }
     pub fn elapsed_millis(&self) -> u64 {
         self.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
     }
-    pub fn check_deadline(&self) -> Result<(), BackendFault> {
+    /// Wait for authority cancellation without releasing physical ownership.
+    /// Paid work retains its settlement duty and has no grant cancellation signal.
+    pub async fn cancelled(&self) {
+        match &self.cancellation {
+            Some(cancellation) => cancellation.cancelled().await,
+            None => std::future::pending().await,
+        }
+    }
+    pub fn check_active(&self) -> Result<(), BackendFault> {
+        if self
+            .cancellation
+            .as_ref()
+            .is_some_and(Cancellation::is_cancelled)
+        {
+            return Err(AdmissionError::Cancelled.into());
+        }
         if self
             .deadline
             .is_some_and(|deadline| Instant::now() >= deadline)
@@ -206,7 +249,7 @@ mod tests {
         capacity.add_permits(1);
         let admitted = waiting.await.unwrap();
         assert_eq!(capacity.available_permits(), 0);
-        let running = admitted.dispatch().unwrap();
+        let running = admitted.dispatch().await.unwrap();
         assert_eq!(capacity.available_permits(), 0);
         drop(running);
         assert_eq!(capacity.available_permits(), 1);
@@ -214,29 +257,71 @@ mod tests {
 
     #[tokio::test]
     async fn grants_keep_the_acceptance_reservation_and_dispatch_before_execution() {
-        let capacity = Arc::new(Semaphore::new(1));
-        let dispatched = Arc::new(AtomicBool::new(false));
-        let observed = dispatched.clone();
-        let admission = WorkAdmission::grant(
+        for cancel in [true, false] {
+            let capacity = Arc::new(Semaphore::new(1));
+            let dispatched = Arc::new(AtomicBool::new(false));
+            let observed = dispatched.clone();
+            let (commit, committed) = tokio::sync::oneshot::channel();
+            let admission = WorkAdmission::grant(
+                permit(&capacity, CapacityDomain::Fetch),
+                Instant::now() + Duration::from_secs(10),
+                Cancellation::new(),
+                async move {
+                    committed.await.unwrap();
+                    observed.store(true, Ordering::SeqCst);
+                    Ok(())
+                },
+            );
+            let admitted = admission
+                .reserve(CapacityDomain::Fetch, async {
+                    panic!("grant reserved payment capacity")
+                })
+                .await
+                .unwrap();
+            assert!(!dispatched.load(Ordering::SeqCst));
+            let mut dispatch = Box::pin(admitted.dispatch());
+            assert!(futures::poll!(&mut dispatch).is_pending());
+            assert_eq!(capacity.available_permits(), 0);
+            assert!(!dispatched.load(Ordering::SeqCst));
+            if cancel {
+                drop(dispatch);
+                assert!(commit.send(()).is_err());
+                assert!(!dispatched.load(Ordering::SeqCst));
+                assert_eq!(capacity.available_permits(), 1);
+                continue;
+            }
+            commit.send(()).unwrap();
+            let running = dispatch.await.unwrap();
+            assert!(dispatched.load(Ordering::SeqCst));
+            assert_eq!(capacity.available_permits(), 0);
+            drop(running);
+            assert_eq!(capacity.available_permits(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn signed_grant_deadlines_are_not_clamped_to_the_payment_fallback() {
+        let capacity = Arc::new(Semaphore::new(2));
+        let fallback = Duration::from_secs(90);
+        let signed = Instant::now() + Duration::from_secs(20 * 60);
+        let running = WorkAdmission::grant(
             permit(&capacity, CapacityDomain::Fetch),
-            Instant::now() + Duration::from_secs(10),
-            Box::new(move || {
-                observed.store(true, Ordering::SeqCst);
-                Ok(())
-            }),
-        );
-        let admitted = admission
-            .reserve(CapacityDomain::Fetch, async {
-                panic!("grant reserved payment capacity")
-            })
+            signed,
+            Cancellation::new(),
+            async { Ok(()) },
+        )
+        .reserve(CapacityDomain::Fetch, async { panic!("reserved twice") })
+        .await
+        .unwrap()
+        .dispatch()
+        .await
+        .unwrap();
+        assert_eq!(running.deadline_or(fallback), signed);
+        let paid = AdmittedWork::payment(permit(&capacity, CapacityDomain::Fetch))
+            .dispatch()
             .await
             .unwrap();
-        assert!(!dispatched.load(Ordering::SeqCst));
-        let running = admitted.dispatch().unwrap();
-        assert!(dispatched.load(Ordering::SeqCst));
-        assert_eq!(capacity.available_permits(), 0);
-        drop(running);
-        assert_eq!(capacity.available_permits(), 1);
+        assert!(paid.deadline_or(fallback) <= Instant::now() + fallback);
     }
 
     #[tokio::test]
@@ -245,18 +330,92 @@ mod tests {
         let admission = WorkAdmission::grant(
             permit(&capacity, CapacityDomain::Gpu),
             Instant::now(),
-            Box::new(|| panic!("expired grant dispatched")),
+            Cancellation::new(),
+            async { panic!("expired grant dispatched") },
         );
         let admitted = admission
             .reserve(CapacityDomain::Gpu, async { panic!("reserved twice") })
             .await
             .unwrap();
-        let error = admitted.dispatch().unwrap_err();
+        let error = admitted.dispatch().await.unwrap_err();
         assert!(matches!(
             error.source().unwrap().downcast_ref::<AdmissionError>(),
             Some(AdmissionError::Deadline)
         ));
         assert_eq!(capacity.available_permits(), 1);
+
+        // A write can finish after the grant expires. It must not return an
+        // execution permit even though its dispatch record is now durable.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let completed = Arc::new(AtomicBool::new(false));
+        let observed = completed.clone();
+        let admitted = WorkAdmission::grant(
+            permit(&capacity, CapacityDomain::Gpu),
+            deadline,
+            Cancellation::new(),
+            async move {
+                tokio::time::sleep_until(deadline.into()).await;
+                observed.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .reserve(CapacityDomain::Gpu, async { panic!("reserved twice") })
+        .await
+        .unwrap();
+        let error = admitted.dispatch().await.unwrap_err();
+        assert!(completed.load(Ordering::SeqCst));
+        assert!(matches!(
+            error.source().unwrap().downcast_ref::<AdmissionError>(),
+            Some(AdmissionError::Deadline)
+        ));
+        assert_eq!(capacity.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancellation_survives_dispatch_and_keeps_capacity_until_teardown() {
+        for at in ["queued", "committing", "running"] {
+            let capacity = Arc::new(Semaphore::new(1));
+            let cancellation = Cancellation::new();
+            let (commit, committed) = tokio::sync::oneshot::channel();
+            let admitted = WorkAdmission::grant(
+                permit(&capacity, CapacityDomain::Fetch),
+                Instant::now() + Duration::from_secs(30),
+                cancellation.clone(),
+                async {
+                    committed.await.unwrap();
+                    Ok(())
+                },
+            )
+            .reserve(CapacityDomain::Fetch, async { panic!("reserved twice") })
+            .await
+            .unwrap();
+            if at == "queued" {
+                cancellation.cancel();
+                assert!(admitted.dispatch().await.is_err());
+            } else {
+                let mut dispatch = Box::pin(admitted.dispatch());
+                assert!(futures::poll!(&mut dispatch).is_pending());
+                if at == "committing" {
+                    cancellation.cancel();
+                    assert!(futures::poll!(&mut dispatch).is_pending());
+                    assert_eq!(capacity.available_permits(), 0);
+                    commit.send(()).unwrap();
+                    assert!(dispatch.await.is_err());
+                } else {
+                    commit.send(()).unwrap();
+                    let running = dispatch.await.unwrap();
+                    assert!(running.check_active().is_ok());
+                    let mut waiting = Box::pin(running.cancelled());
+                    assert!(futures::poll!(&mut waiting).is_pending());
+                    cancellation.cancel();
+                    waiting.await;
+                    assert!(running.check_active().is_err());
+                    assert_eq!(capacity.available_permits(), 0);
+                    drop(running);
+                }
+            }
+            assert_eq!(capacity.available_permits(), 1);
+        }
     }
 
     #[tokio::test]

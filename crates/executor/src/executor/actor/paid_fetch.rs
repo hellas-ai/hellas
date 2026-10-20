@@ -1,10 +1,17 @@
 //! Paid Fetch runs have their own durable admission in hellas-work. Bodies
 //! remain in memory; the payment journal owns recovery.
 
-use std::sync::Arc;
+use futures_util::future::BoxFuture;
+use std::{
+    sync::Arc,
+    task::{Context, Poll},
+};
 
 use hellas_rpc::OutputEventEnvelope;
-use hellas_work::work::{PreparedFetchInput, admission::AdmittedWork};
+use hellas_work::work::{
+    BackendFault, PreparedFetchInput,
+    admission::{AdmittedWork, RunningWork},
+};
 use tokio::sync::{mpsc, oneshot};
 use tracing::Instrument as _;
 
@@ -15,7 +22,10 @@ use crate::fetch_policy::FetchRoute;
 use crate::fetch_provider::FetchCall;
 
 pub(super) struct PendingPaidFetch {
-    input: PreparedFetchInput<AdmittedWork>,
+    parts: hellas_work::model::fetch::PreparedPaidFetchInputParts,
+    policy: hellas_work::model::fetch::FetchPolicyV2,
+    is_owed: bool,
+    dispatch: BoxFuture<'static, Result<RunningWork, BackendFault>>,
     progress: Option<hellas_work::work::PaidProgress>,
     reply: oneshot::Sender<Result<Vec<OutputEventEnvelope>, ExecutorError>>,
     span: tracing::Span,
@@ -28,31 +38,50 @@ impl Executor {
     /// Already accepted work waits in a bounded FIFO when dispatch is full.
     /// Backpressure then reaches the owed mailbox; peer requests and completion
     /// handling remain live while the upstream is busy.
-    pub(super) fn start_paid_fetch(
+    pub(super) fn queue_paid_fetch(
         &mut self,
         input: PreparedFetchInput<AdmittedWork>,
         progress: Option<hellas_work::work::PaidProgress>,
         reply: oneshot::Sender<Result<Vec<OutputEventEnvelope>, ExecutorError>>,
         span: tracing::Span,
     ) {
-        if self.active_fetches >= self.fetch_max_in_flight {
-            self.pending_paid_fetches.push_back(PendingPaidFetch {
-                input,
-                progress,
-                reply,
-                span,
-            });
-            return;
-        }
         let policy = *input.policy();
         let (parts, admission) = input.into_parts_and_admission();
-        let running = match admission.dispatch() {
+        self.pending_paid_fetches.push_back(PendingPaidFetch {
+            parts,
+            policy,
+            is_owed: admission.is_owed(),
+            dispatch: Box::pin(admission.dispatch()),
+            progress,
+            reply,
+            span,
+        });
+    }
+
+    pub(super) fn start_paid_fetch(
+        &mut self,
+        pending: PendingPaidFetch,
+        result: Result<RunningWork, BackendFault>,
+    ) {
+        let running = match result {
             Ok(running) => running,
             Err(error) => {
-                let _ = reply.send(Err(ExecutorError::PolicyDenied(error.to_string())));
+                let _ = pending.reply.send(Err(ExecutorError::Backend(error)));
                 return;
             }
         };
+        let PendingPaidFetch {
+            parts,
+            policy,
+            progress,
+            reply,
+            span,
+            ..
+        } = pending;
+        if let Err(error) = running.check_active() {
+            let _ = reply.send(Err(ExecutorError::Backend(error)));
+            return;
+        }
         let prepared = self.prepare_paid_fetch(parts, policy);
         let (entry, session, request, policy) = match prepared {
             Ok(prepared) => prepared,
@@ -66,6 +95,15 @@ impl Executor {
         let key = Arc::clone(&self.provider.producer_key);
         let task = async move {
             let _running = running;
+            if let Err(error) = _running.check_active() {
+                let _ = completion
+                    .send(ExecutorCompletion::PaidFetch {
+                        reply,
+                        result: Err(ExecutorError::Backend(error)),
+                    })
+                    .await;
+                return;
+            }
             let (sender, mut receiver) =
                 mpsc::channel(super::execution::PER_EXECUTION_CHANNEL_CAPACITY);
             let run = super::execution::run_fetch_provider(
@@ -98,9 +136,20 @@ impl Executor {
                 }
                 Ok::<_, ExecutorError>(())
             };
-            let deadline = _running.deadline_with(std::time::Duration::from_secs(90));
-            let joined =
-                tokio::time::timeout_at(deadline.into(), async { tokio::join!(run, drain) }).await;
+            let deadline = _running.deadline_or(std::time::Duration::from_secs(90));
+            let joined = tokio::select! {
+                biased;
+                () = _running.cancelled() => {
+                    let _ = completion.send(ExecutorCompletion::PaidFetch {
+                        reply,
+                        result: Err(ExecutorError::Backend(
+                            hellas_work::work::admission::AdmissionError::Cancelled.into(),
+                        )),
+                    }).await;
+                    return;
+                }
+                joined = tokio::time::timeout_at(deadline.into(), async { tokio::join!(run, drain) }) => joined,
+            };
             let (result, drained) = match joined {
                 Ok(result) => result,
                 Err(_) => {
@@ -129,7 +178,7 @@ impl Executor {
                         ExecutorError::Execution("paid fetch upstream or projection failed".into())
                     })
                     .and_then(|run| {
-                        hellas_rpc::protocol::work_fetch::check_fetch_output_limits(
+                        hellas_work::model::fetch::check_fetch_output_limits(
                             &policy,
                             &run.output_events,
                         )
@@ -150,14 +199,14 @@ impl Executor {
 
     fn prepare_paid_fetch(
         &self,
-        parts: hellas_rpc::protocol::work_fetch::PreparedPaidFetchInputParts,
-        policy: hellas_rpc::protocol::work_fetch::FetchPolicyV2,
+        parts: hellas_work::model::fetch::PreparedPaidFetchInputParts,
+        policy: hellas_work::model::fetch::FetchPolicyV2,
     ) -> Result<
         (
             crate::FetchRouteEntry,
             crate::FetchAdaptorSession,
             hellas_rpc::fetch::FetchInput,
-            hellas_rpc::protocol::work_fetch::FetchPolicyV2,
+            hellas_work::model::fetch::FetchPolicyV2,
         ),
         ExecutorError,
     > {
@@ -166,6 +215,7 @@ impl Executor {
         if request.retention != hellas_rpc::Retention::Ephemeral
             || request.assurance != self.provider.assurance
             || request.execution_environment != parts.manifest.content_id()
+            || parts.contract.manifest() != parts.manifest
         {
             return Err(ExecutorError::InvalidInput(
                 "paid fetch contract mismatch".into(),
@@ -198,22 +248,29 @@ impl Executor {
             })?;
         Ok((entry, session, request, policy))
     }
+}
 
-    pub(super) fn dispatch_paid_fetches(&mut self) {
-        while self.active_fetches < self.fetch_max_in_flight {
-            let next = self
-                .pending_paid_fetches
-                .iter()
-                .position(|p| p.input.admission().is_owed())
-                .unwrap_or(0);
-            let Some(pending) = self.pending_paid_fetches.remove(next) else {
-                break;
-            };
-            // The durable invocation is owed even if its original waiter left.
-            self.start_paid_fetch(pending.input, pending.progress, pending.reply, pending.span);
+/// Poll only when execution capacity is available. The queue retains pending
+/// authorization across select cancellation, before any backend preparation.
+pub(super) fn poll_dispatch(
+    queue: &mut std::collections::VecDeque<PendingPaidFetch>,
+    cx: &mut Context<'_>,
+) -> Poll<(PendingPaidFetch, Result<RunningWork, BackendFault>)> {
+    let next = queue.iter().position(|p| p.is_owed).unwrap_or(0);
+    let Some(mut pending) = queue.remove(next) else {
+        return Poll::Pending;
+    };
+    match pending.dispatch.as_mut().poll(cx) {
+        Poll::Ready(result) => Poll::Ready((pending, result)),
+        Poll::Pending => {
+            queue.insert(next, pending);
+            Poll::Pending
         }
     }
 }
+
+#[cfg(test)]
+use hellas_work::test_support::test_responses_contract;
 
 #[cfg(test)]
 mod tests {
@@ -222,17 +279,15 @@ mod tests {
     use std::time::Duration;
 
     use futures_util::stream;
+    use hellas_auth::{Digest, ProducerSigningKey};
     use hellas_rpc::fetch::{
         FetchTerminalPayload, build_input_events_with_retention, decode_fetch_event_payload,
         decode_fetch_terminal_payload, encode_fetch_event_payload, encode_fetch_terminal_payload,
         verify_input_events, verify_output_events,
     };
     use hellas_rpc::output::{OutputEvent, StopReason, TextChannel};
-    use hellas_rpc::protocol::work_fetch::{FetchPolicyV2, PreparedPaidFetchInputParts};
-    use hellas_rpc::{
-        Assurance, ContentId, Digest, FetchEnvironment, InputCommitment, InputEventEnvelope,
-        ProducerSigningKey, Retention,
-    };
+    use hellas_rpc::{Assurance, ContentId, InputCommitment, InputEventEnvelope, Retention};
+    use hellas_work::model::fetch::{FetchPolicyV2, PreparedPaidFetchInputParts};
     use hellas_work::work::PaidProgress;
     use tokio::sync::Notify;
     use tokio::time::timeout;
@@ -255,8 +310,8 @@ mod tests {
     const METHOD: &str = "responses";
     const BODY: &[u8] = br#"{"input":"paid"}"#;
 
-    fn environment() -> FetchEnvironment {
-        FetchEnvironment::OpenAiResponses
+    fn environment() -> hellas_rpc::FetchContract {
+        test_responses_contract()
     }
 
     fn signing_key() -> ProducerSigningKey {
@@ -292,6 +347,7 @@ mod tests {
     fn prepared_input(events: Vec<InputEventEnvelope>) -> PreparedFetchInput {
         PreparedFetchInput::new(
             PreparedPaidFetchInputParts {
+                contract: environment(),
                 fetch_input_transcript: events,
                 manifest: environment().manifest(),
             },
@@ -337,12 +393,12 @@ mod tests {
                 delta: "paid-output".to_string(),
                 channel: TextChannel::Output,
             })
-            .map_err(|error| FetchAdaptorError::failed(error.to_string()))?;
+            .map_err(|_| FetchAdaptorError::failed("fixture payload encoding failed"))?;
             let terminal = encode_fetch_terminal_payload(&OutputEvent::Finished {
                 stop_reason: StopReason::EndOfText,
                 usage: None,
             })
-            .map_err(|error| FetchAdaptorError::failed(error.to_string()))?;
+            .map_err(|_| FetchAdaptorError::failed("fixture payload encoding failed"))?;
             Ok(vec![
                 ProjectedFetch::Event(event),
                 ProjectedFetch::Terminal(terminal),

@@ -1,0 +1,6 @@
+{
+  "provider": "runpod",
+  "config": {
+    "template": "your-hellas-template-id"
+  }
+}

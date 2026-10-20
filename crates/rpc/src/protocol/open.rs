@@ -1,4 +1,5 @@
-use crate::{ContentId, Digest, PublicKey, hash_tuple};
+use crate::ContentId;
+use hellas_auth::{Digest, PublicKey, hash_tuple};
 
 pub const OPEN_PROOF_DOMAIN: &str = "hellas.attest.open.proof.v1";
 pub const OPEN_PROVIDER_ROLE: &[u8] = b"provider";

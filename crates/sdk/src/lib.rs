@@ -5,100 +5,69 @@
 //! crates without making a CLI binary their library boundary.
 
 pub use hellas_attestation::{AttestationError, Attester, Binding, RootProver};
-#[cfg(any(feature = "paid-client", feature = "paid-provider"))]
 pub use hellas_chain::node::{Config as ChainNodeConfig, FullNode};
 pub use hellas_rpc as rpc;
 pub use hellas_wire as wire;
+pub use hellas_work as work;
 
-#[cfg(feature = "apple-verifier")]
+#[cfg(test)]
+use hellas_work::test_support::common_node as test_node;
+
 mod counter_store;
-#[cfg(feature = "apple-verifier")]
 pub use counter_store::FilesystemAssertionCounterStore;
+pub mod coin_owner;
+pub mod trust_policy;
 
-#[cfg(feature = "client")]
 pub use hellas_client as client;
-#[cfg(feature = "client")]
 pub use iroh;
-#[cfg(feature = "client")]
 mod remote;
-#[cfg(feature = "gateway")]
 pub use hellas_gateway as gateway;
-#[cfg(feature = "grant-provider")]
 pub mod grant_provider;
-#[cfg(any(feature = "paid-provider", feature = "grant-provider"))]
 mod provider;
-#[cfg(feature = "grant-provider")]
-pub use grant_provider::{GrantProviderOptions, responses_policy};
-#[cfg(feature = "provider")]
+pub use grant_provider::GrantProviderOptions;
 pub use hellas_executor::{FetchRoute, FetchRouteEntry, FetchRoutePolicy, FetchRouteRegistry};
-#[cfg(feature = "work")]
 pub use hellas_kernel as kernel;
-#[cfg(feature = "provider")]
-pub use hellas_providers::{
-    HttpProviderConfig, OpenAiResponsesFetchProvider, ResponsesFetchAdaptorFactory,
-};
-#[cfg(feature = "paid-provider")]
+pub use hellas_providers::HttpProviderConfig;
 pub use provider::PaidProviderOptions;
-#[cfg(any(feature = "paid-provider", feature = "grant-provider"))]
-pub use provider::{FetchProviderOptions, ProviderError, ProviderHandle, start_fetch_provider};
-#[cfg(feature = "grant-provider")]
-pub use provider::{OpenAiProviderOptions, start_openai_provider};
-#[cfg(feature = "client")]
-pub use remote::ClientIdentity;
+pub use provider::{
+    FetchProviderOptions, ProviderAuthority, ProviderControl, ProviderError, ProviderGrants,
+    ProviderHandle, ProviderOpen, ProviderOptions, start_fetch_provider,
+};
+pub use remote::NodeIdentity;
 
-#[cfg(all(
-    feature = "local-control",
-    any(all(unix, not(target_os = "espidf")), windows)
-))]
 pub mod local {
     pub use hellas_wire::local::{LOCAL_MUX_SLOTS, LocalControlServer, connect, transport};
 }
 
-#[cfg(feature = "paid-provider")]
 pub mod paid_provider;
-#[cfg(feature = "paid-work")]
 pub mod work_config;
-#[cfg(any(feature = "paid-provider", feature = "grant-provider"))]
 pub mod work_router;
 
-#[cfg(feature = "paid-client")]
 pub mod paid_client;
-#[cfg(any(feature = "paid-client", feature = "grant-client"))]
 mod work_link;
 
-#[cfg(feature = "paid-work")]
 pub mod work_provision;
 
-#[cfg(all(test, any(feature = "paid-client", feature = "paid-provider")))]
+#[cfg(test)]
 mod test_support;
 
-#[cfg(feature = "paid-gateway")]
 pub mod paid_gateway;
 
-#[cfg(feature = "grant-client")]
 pub mod grant_client;
 
-#[cfg(feature = "grant-admin")]
-pub mod grant_admin;
-#[cfg(feature = "work")]
+pub mod access_bundle;
+mod application_handshake;
 pub mod grant_config;
+pub mod node_control;
 
-#[cfg(any(feature = "paid-gateway", feature = "grant-gateway"))]
 mod gateway_work;
-#[cfg(feature = "grant-gateway")]
+pub use gateway_work::prepare_evaluate;
 pub mod grant_gateway;
 
-#[cfg(feature = "work")]
 mod resource_config;
-#[cfg(feature = "work")]
 pub use resource_config::ResourceConfigError;
 
-#[cfg(all(
-    test,
-    any(
-        feature = "paid-client",
-        feature = "grant-admin",
-        feature = "grant-provider"
-    )
-))]
+#[cfg(test)]
 mod test_identity;
+
+mod transport_admission;

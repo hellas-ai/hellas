@@ -3,15 +3,20 @@
 //! Everything in this module is gated by the crate's `test-support` feature.
 //! It is suitable for integration tests and examples.
 
+use hellas_webauthn::{
+    AUTHENTICATOR_DATA_LEN, FLAG_AT as AT, FLAG_ED as ED, FLAG_UP as UP, encode_challenge,
+};
+
+use super::WebAuthnError;
 use super::soft_passkey::{
     SOFT_PASSKEY_ORIGIN, SOFT_PASSKEY_RP_ID_HASH, SoftPasskey, SoftPasskeyError, append,
     sign_assertion_data,
 };
-use super::{AT, ED, MIN_AUTH_DATA_LEN, UP, WebAuthnError, base64url_32};
 use crate::{
     Auth, CloseKind, CoinId, EdgeId, Funding, Key, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS,
-    MAX_WEBAUTHN_DATA_LENGTH, NetworkId, Parties, PayloadHash, Payout, Proof, ProtocolCode, Terms,
-    Tx, WebAuthnAssertion, consts::P256_COORDINATE_LENGTH, context::BlockHeight,
+    MAX_WEBAUTHN_DATA_LENGTH, NetworkId, Parties, PartyAuth, PartyKeys, PayloadHash, Payout, Proof,
+    ProtocolCode, Terms, Tx, WebAuthnAssertion, consts::P256_COORDINATE_LENGTH,
+    context::BlockHeight,
 };
 
 /// Number of named invalid fixtures returned by [`negative_assertions`].
@@ -146,8 +151,8 @@ pub fn valid_mutual_close_assertion() -> Result<WebAuthnFixture, SoftPasskeyErro
 /// assembly fails.
 pub fn valid_open_tx() -> Result<Tx, SoftPasskeyError> {
     let context = fixture_context()?;
-    let maker_auth = Auth::webauthn(context.passkey.sign(context.open_hash)?);
-    let taker_auth = Auth::webauthn(context.other.sign(context.open_hash)?);
+    let maker_auth = PartyAuth::owner(Auth::webauthn(context.passkey.sign(context.open_hash)?));
+    let taker_auth = PartyAuth::owner(Auth::webauthn(context.other.sign(context.open_hash)?));
     Ok(Tx::open(
         context.funding,
         context.terms,
@@ -165,8 +170,12 @@ pub fn valid_open_tx() -> Result<Tx, SoftPasskeyError> {
 /// assembly fails.
 pub fn valid_mutual_close_tx() -> Result<Tx, SoftPasskeyError> {
     let context = fixture_context()?;
-    let maker_auth = Auth::webauthn(context.passkey.sign(context.mutual_close_hash)?);
-    let taker_auth = Auth::webauthn(context.other.sign(context.mutual_close_hash)?);
+    let maker_auth = PartyAuth::owner(Auth::webauthn(
+        context.passkey.sign(context.mutual_close_hash)?,
+    ));
+    let taker_auth = PartyAuth::owner(Auth::webauthn(
+        context.other.sign(context.mutual_close_hash)?,
+    ));
     Ok(Tx::close(
         context.edge,
         Proof::mutual(maker_auth, taker_auth),
@@ -338,7 +347,10 @@ fn fixture_context() -> Result<FixtureContext, SoftPasskeyError> {
     let outputs = List::take(payout_values, 2);
     let terms = Terms::basic(
         ProtocolCode::new(1),
-        Parties::new(passkey.party_key(), other.party_key()),
+        Parties::new(
+            PartyKeys::sole(passkey.party_key()),
+            PartyKeys::sole(other.party_key()),
+        ),
         BlockHeight::new(100),
         outputs.clone(),
     );
@@ -384,7 +396,7 @@ fn build_assertion(
     append(&mut data, &mut len, &SOFT_PASSKEY_RP_ID_HASH)?;
     append(&mut data, &mut len, &[flags])?;
     append(&mut data, &mut len, &[0; 4])?;
-    if len != MIN_AUTH_DATA_LEN {
+    if len != AUTHENTICATOR_DATA_LEN {
         return Err(SoftPasskeyError::AssertionTooLarge);
     }
 
@@ -414,7 +426,7 @@ fn write_client_data(
         _ => append(data, len, b"webauthn.get")?,
     }
     append(data, len, b"\",\"challenge\":\"")?;
-    let challenge = base64url_32(challenge_hash.as_bytes());
+    let challenge = encode_challenge(challenge_hash.as_bytes());
     append(data, len, &challenge)?;
     append(data, len, b"\"")?;
     append(data, len, b",\"origin\":\"")?;

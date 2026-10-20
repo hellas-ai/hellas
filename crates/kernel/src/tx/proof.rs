@@ -2,7 +2,8 @@
 //!
 //! A [`Proof`] is the kernel-visible *shape* of why an edge should
 //! close. Each variant maps to exactly one validation kind: `Mutual` and
-//! `Freeze` → [`crate::SigVerifier`], `Timeout` and `Adjudicated` →
+//! `Freeze` and owner-signed `Timeout` → [`crate::SigVerifier`]; unsigned
+//! `Timeout` and `Adjudicated` →
 //! kernel inline structural checks against committed terms and staged
 //! registry state. No close consults an external verifier.
 //!
@@ -19,9 +20,8 @@ use crate::{
     },
     consts::HASH_LENGTH,
     context::Cost,
-    primitive::Sig,
     terms::Terms,
-    tx::Auth,
+    tx::PartyAuth,
 };
 
 // Tag numbers are fixed consensus assignments, not positions. 2 and 5
@@ -253,8 +253,8 @@ impl Decode for PaymentContestCommitment {
 /// Bounded close witness.
 ///
 /// Each variant maps to one check: `Mutual` and `Freeze` are checked by
-/// [`crate::SigVerifier`]; `Timeout` and `Adjudicated` are checked
-/// structurally inside the kernel.
+/// [`crate::SigVerifier`], as is a timeout's optional owner witness.
+/// Unsigned timeout and adjudicated closes use structural kernel checks.
 #[allow(
     clippy::large_enum_variant,
     reason = "Mutual auth is stored inline so the no-alloc kernel can verify WebAuthn bytes directly"
@@ -267,15 +267,17 @@ pub enum Proof {
     /// no terms reveal is needed here.
     Mutual {
         /// Maker authorization.
-        maker: Auth,
+        maker: PartyAuth,
         /// Taker authorization.
-        taker: Auth,
+        taker: PartyAuth,
     },
 
     /// Timeout close under committed terms.
     Timeout {
         /// Concrete terms revealed to check the timeout.
         terms: Terms,
+        /// Optional bond-owner authorization to reclaim undelegated stake.
+        owner: Option<PartyAuth>,
     },
 
     /// Cooperative close of a work-payment channel at a jointly signed
@@ -293,10 +295,10 @@ pub enum Proof {
         valid_from_height: u64,
         /// Last height this freeze may be included at.
         valid_through_height: u64,
-        /// Client (maker) signature over the freeze digest.
-        maker: Sig,
-        /// Provider (taker) signature over the freeze digest.
-        taker: Sig,
+        /// Client (maker) authorization over the freeze digest.
+        maker: PartyAuth,
+        /// Provider (taker) authorization over the freeze digest.
+        taker: PartyAuth,
     },
 
     /// Unilateral close of a work-payment channel at the amount its
@@ -314,19 +316,24 @@ pub enum Proof {
 impl Proof {
     /// Creates a cooperative close witness.
     #[must_use]
-    pub const fn mutual(maker: Auth, taker: Auth) -> Self {
+    pub const fn mutual(maker: PartyAuth, taker: PartyAuth) -> Self {
         Self::Mutual { maker, taker }
     }
 
     /// Creates a timeout close witness.
     #[must_use]
-    pub const fn timeout(terms: Terms) -> Self {
-        Self::Timeout { terms }
+    pub const fn timeout(terms: Terms, owner: Option<PartyAuth>) -> Self {
+        Self::Timeout { terms, owner }
     }
 
     /// Creates a cooperative work-payment freeze witness.
     #[must_use]
-    pub const fn freeze(earned: u64, validity: (u64, u64), maker: Sig, taker: Sig) -> Self {
+    pub const fn freeze(
+        earned: u64,
+        validity: (u64, u64),
+        maker: PartyAuth,
+        taker: PartyAuth,
+    ) -> Self {
         let (valid_from_height, valid_through_height) = validity;
         Self::Freeze {
             earned,
@@ -363,9 +370,9 @@ impl Proof {
 
 /// Body bytes of the widest [`Proof`] variant.
 const MAX_PROOF_BODY: usize = {
-    let mut max = 2 * Auth::MAX_ENCODED_SIZE;
-    if Terms::MAX_ENCODED_SIZE > max {
-        max = Terms::MAX_ENCODED_SIZE;
+    let mut max = 2 * PartyAuth::MAX_ENCODED_SIZE;
+    if Terms::MAX_ENCODED_SIZE + <Option<PartyAuth>>::MAX_ENCODED_SIZE > max {
+        max = Terms::MAX_ENCODED_SIZE + <Option<PartyAuth>>::MAX_ENCODED_SIZE;
     }
     if FREEZE_BODY_SIZE > max {
         max = FREEZE_BODY_SIZE;
@@ -376,7 +383,7 @@ const MAX_PROOF_BODY: usize = {
     max
 };
 
-const FREEZE_BODY_SIZE: usize = 3 * u64::MAX_ENCODED_SIZE + 2 * Sig::MAX_ENCODED_SIZE;
+const FREEZE_BODY_SIZE: usize = 3 * u64::MAX_ENCODED_SIZE + 2 * PartyAuth::MAX_ENCODED_SIZE;
 
 impl Encode for Proof {
     const MAX_ENCODED_SIZE: usize = ENVELOPE_SIZE + u8::MAX_ENCODED_SIZE + MAX_PROOF_BODY;
@@ -386,8 +393,10 @@ impl Encode for Proof {
             + u8::MAX_ENCODED_SIZE
             + match self {
                 Self::Mutual { maker, taker } => maker.encoded_size() + taker.encoded_size(),
-                Self::Timeout { terms } => terms.encoded_size(),
-                Self::Freeze { .. } => FREEZE_BODY_SIZE,
+                Self::Timeout { terms, owner } => terms.encoded_size() + owner.encoded_size(),
+                Self::Freeze { maker, taker, .. } => {
+                    3 * u64::MAX_ENCODED_SIZE + maker.encoded_size() + taker.encoded_size()
+                }
                 Self::Adjudicated { contest_commitment } => contest_commitment.encoded_size(),
             }
     }
@@ -400,9 +409,10 @@ impl Encode for Proof {
                 maker.encode_to(writer);
                 taker.encode_to(writer);
             }
-            Self::Timeout { terms } => {
+            Self::Timeout { terms, owner } => {
                 TIMEOUT_TAG.encode_to(writer);
                 terms.encode_to(writer);
+                owner.encode_to(writer);
             }
             Self::Freeze {
                 earned,
@@ -438,7 +448,8 @@ impl Decode for Proof {
             }
             TIMEOUT_TAG => {
                 let terms = decode_field(buf, &mut consumed)?;
-                Ok((Self::timeout(terms), consumed))
+                let owner = decode_field(buf, &mut consumed)?;
+                Ok((Self::timeout(terms, owner), consumed))
             }
             FREEZE_TAG => {
                 let earned = decode_field(buf, &mut consumed)?;

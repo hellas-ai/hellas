@@ -2,21 +2,21 @@
 
 use super::*;
 
-/// Synchronous access to a client journal, used between transport awaits.
+/// Borrows a client endpoint for local state and journal operations.
+/// Release the guard before waiting on a transport or finalized history.
 pub trait ClientChannel: Send {
-    /// Runs one journal operation without allowing the borrow to escape.
-    fn with_client<R>(
+    /// # Errors
+    /// [`EndpointError::Poisoned`] after a panic while holding the endpoint.
+    fn client(
         &mut self,
-        step: impl FnOnce(&mut ClientEndpoint) -> R,
-    ) -> Result<R, EndpointError>;
+    ) -> impl core::future::Future<
+        Output = Result<impl DerefMut<Target = ClientEndpoint> + Send, EndpointError>,
+    > + Send;
 }
 
 impl ClientChannel for ClientEndpoint {
-    fn with_client<R>(
-        &mut self,
-        step: impl FnOnce(&mut ClientEndpoint) -> R,
-    ) -> Result<R, EndpointError> {
-        Ok(step(self))
+    async fn client(&mut self) -> Result<impl DerefMut<Target = Self> + Send, EndpointError> {
+        Ok(self)
     }
 }
 
@@ -34,7 +34,7 @@ impl ClientService {
         endpoint.observation = Some(Observation::default());
         Self {
             observer: ClientObserver {
-                endpoint: Arc::new(Mutex::new(endpoint)),
+                endpoint: Arc::new(EndpointLock::new(endpoint)),
                 driving: Arc::new(AtomicBool::new(false)),
             },
         }
@@ -47,13 +47,16 @@ impl ClientService {
     }
 
     /// Reads local accounting without holding a borrow across an await.
-    pub fn with_state<R>(&self, read: impl FnOnce(&Channel) -> R) -> Result<R, EndpointError> {
-        self.observer.with_state(read)
+    pub async fn with_state<R>(
+        &self,
+        read: impl FnOnce(&Channel) -> R,
+    ) -> Result<R, EndpointError> {
+        self.observer.with_state(read).await
     }
 
     /// Checks the observer's current admission decision locally.
-    pub fn readiness(&self) -> Result<ReadyChannel, EndpointError> {
-        self.observer.readiness()
+    pub async fn readiness(&self) -> Result<ReadyChannel, EndpointError> {
+        self.observer.readiness().await
     }
 }
 
@@ -61,49 +64,55 @@ impl ClientService {
 /// Cloning this handle cannot create another payer. Driving remains exclusive.
 #[derive(Clone, Debug)]
 pub struct ClientObserver {
-    endpoint: Arc<Mutex<ClientEndpoint>>,
+    endpoint: Arc<EndpointLock<ClientEndpoint>>,
     driving: Arc<AtomicBool>,
 }
 
 impl ClientObserver {
-    fn endpoint(&self) -> Result<MutexGuard<'_, ClientEndpoint>, EndpointError> {
-        self.endpoint.lock().map_err(|_| EndpointError::Poisoned)
+    async fn endpoint(&self) -> Result<EndpointGuard<'_, ClientEndpoint>, EndpointError> {
+        self.endpoint
+            .lock()
+            .await
+            .map_err(|_| EndpointError::Poisoned)
     }
 
     /// Reads local state without holding it across an await.
-    pub fn with_state<R>(&self, read: impl FnOnce(&Channel) -> R) -> Result<R, EndpointError> {
-        Ok(read(self.endpoint()?.state()))
+    pub async fn with_state<R>(
+        &self,
+        read: impl FnOnce(&Channel) -> R,
+    ) -> Result<R, EndpointError> {
+        Ok(read(self.endpoint().await?.state()))
     }
 
     /// Publishes a coherent snapshot only after its history has been applied.
-    pub fn observe_ready(
+    pub async fn observe_ready(
         &self,
         ready: ReadyChannel,
         started: ObservationTime,
         max_age: std::time::Duration,
     ) -> Result<(), EndpointError> {
-        let mut endpoint = self.endpoint()?;
+        let mut endpoint = self.endpoint().await?;
         bind(&ready, &endpoint.store, &endpoint.signer, Role::Client)?;
         if ready.check_caught_up(endpoint.state().cursor().0).is_err() {
             return Err(EndpointError::CatchingUp);
         }
         let height = ready.finalized_height();
-        endpoint.ready = Some(ready);
         endpoint
             .observation
             .as_mut()
-            .expect("shared client observation")
+            .ok_or(EndpointError::NotAdmitting)?
             .confirm(height, started, max_age);
+        endpoint.ready = Some(ready);
         Ok(())
     }
 
     /// Returns local readiness; never contacts a validator.
-    pub fn readiness(&self) -> Result<ReadyChannel, EndpointError> {
-        let endpoint = self.endpoint()?;
+    pub async fn readiness(&self) -> Result<ReadyChannel, EndpointError> {
+        let endpoint = self.endpoint().await?;
         endpoint
             .observation
             .as_ref()
-            .expect("shared client observation")
+            .ok_or(EndpointError::NotAdmitting)?
             .check()?;
         if endpoint.state().is_closing() {
             return Err(EndpointError::NotAdmitting);
@@ -112,11 +121,12 @@ impl ClientObserver {
     }
 
     /// Stops new signatures while the observer reconnects or shuts down.
-    pub fn suspend(&self) -> Result<(), EndpointError> {
-        self.endpoint()?
+    pub async fn suspend(&self) -> Result<(), EndpointError> {
+        self.endpoint()
+            .await?
             .observation
             .as_mut()
-            .expect("shared client observation")
+            .ok_or(EndpointError::NotAdmitting)?
             .suspend();
         Ok(())
     }
@@ -131,11 +141,10 @@ impl ClientObserver {
 }
 
 impl ClientChannel for ClientService {
-    fn with_client<R>(
+    async fn client(
         &mut self,
-        step: impl FnOnce(&mut ClientEndpoint) -> R,
-    ) -> Result<R, EndpointError> {
-        Ok(step(&mut *self.observer.endpoint()?))
+    ) -> Result<impl DerefMut<Target = ClientEndpoint> + Send, EndpointError> {
+        self.observer.endpoint().await
     }
 }
 
@@ -151,19 +160,20 @@ impl Drop for ClientDriver<'_> {
 }
 
 impl CloseChannel for ClientDriver<'_> {
-    fn with_store<R>(
-        &mut self,
-        step: impl FnOnce(&mut ChannelStore) -> R,
-    ) -> Result<R, CatchUpError> {
-        let mut endpoint = self.service.endpoint().map_err(|_| CatchUpError::Busy)?;
-        Ok(step(&mut endpoint.store))
+    async fn store(&mut self) -> Result<impl DerefMut<Target = ChannelStore> + Send, CatchUpError> {
+        Ok(ChannelStoreGuard::Client(
+            self.service
+                .endpoint()
+                .await
+                .map_err(|_| CatchUpError::Busy)?,
+        ))
     }
 }
 
 impl ClientDriver<'_> {
     /// Applies a verified block under the same lock used by payments.
-    pub fn observe_finalized(&mut self, block: &FinalizedWork) -> Result<(), CatchUpError> {
-        self.with_store(|store| observe(store, block, &Secp256k1Verifier::new()))??;
+    pub async fn observe_finalized(&mut self, block: &FinalizedWork) -> Result<(), CatchUpError> {
+        observe(&mut *self.store().await?, block, &Secp256k1Verifier::new()).await?;
         Ok(())
     }
 
@@ -173,7 +183,7 @@ impl ClientDriver<'_> {
         source: &S,
     ) -> Result<u64, CatchUpError> {
         let Some(latest) = source.latest_height().await? else {
-            return self.with_store(|store| store.state().cursor().0);
+            return Ok(self.store().await?.state().cursor().0);
         };
         self.catch_up_to(source, latest).await
     }
@@ -184,17 +194,15 @@ impl ClientDriver<'_> {
         source: &S,
         latest: u64,
     ) -> Result<u64, CatchUpError> {
-        let next = self
-            .with_store(|store| store.state().cursor().0)?
-            .saturating_add(1);
+        let next = self.store().await?.state().cursor().0.saturating_add(1);
         for height in next..=latest {
             let block = source
                 .block_at(height)
                 .await?
                 .ok_or(CatchUpError::Missing { height })?;
-            self.observe_finalized(&block)?;
+            self.observe_finalized(&block).await?;
         }
-        self.with_store(|store| store.state().cursor().0)
+        Ok(self.store().await?.state().cursor().0)
     }
 
     /// Drives a retained close without blocking ordinary state access.

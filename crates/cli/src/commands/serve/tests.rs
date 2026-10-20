@@ -1,3 +1,5 @@
+use std::fs;
+mod control;
 use super::*;
 
 fn write_config(dir: &tempfile::TempDir, config: serde_json::Value) -> PathBuf {
@@ -118,7 +120,7 @@ fn load_fetch_config_rejects_operator_selected_destination() {
 }
 
 #[test]
-fn config_has_two_sealed_destination_variants_and_no_url_field() {
+fn core_cli_rejects_moved_openai_hosting_and_operator_endpoints() {
     let codex: FetchDestination = serde_json::from_value(serde_json::json!({
         "type": "codex-responses",
         "auth_path": "target/codex-auth.json"
@@ -126,23 +128,12 @@ fn config_has_two_sealed_destination_variants_and_no_url_field() {
     .unwrap();
     assert!(matches!(codex, FetchDestination::CodexResponses { .. }));
 
-    let openai: FetchDestination = serde_json::from_value(serde_json::json!({
-        "type": "openai-responses",
-        "api_key_env": "HELLAS_TEST_OPENAI_KEY"
-    }))
-    .unwrap();
-    assert!(matches!(
-        openai,
-        FetchDestination::OpenaiResponses { ref api_key_env }
-            if api_key_env == "HELLAS_TEST_OPENAI_KEY"
-    ));
-
-    let error = serde_json::from_value::<FetchDestination>(serde_json::json!({
-        "type": "openai-responses",
-        "url": "https://example.invalid/v1/responses"
-    }))
-    .unwrap_err();
-    assert!(error.to_string().contains("unknown field `url`"));
+    for value in [
+        serde_json::json!({"type":"openai-responses","api_key_env":"HELLAS_TEST_OPENAI_KEY"}),
+        serde_json::json!({"type":"codex-responses","url":"https://example.invalid/v1/responses"}),
+    ] {
+        assert!(serde_json::from_value::<FetchDestination>(value).is_err());
+    }
 }
 
 #[test]

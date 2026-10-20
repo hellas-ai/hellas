@@ -1,6 +1,5 @@
 use crate::domain::{
-    Address, PublicKey, Scheme, SettlementKey, ThresholdPolynomial, ThresholdShare,
-    ThresholdVariant, UserPublicKey,
+    PublicKey, Scheme, SettlementKey, ThresholdPolynomial, ThresholdShare, ThresholdVariant,
 };
 use crate::{
     ActivityReporter, Application, ApplicationConfig, ConsensusInfo, LightClientRpcState, UtxoDb,
@@ -307,22 +306,21 @@ fn generate_network(args: GenerateNetworkArgs) -> Result<(), ValidatorError> {
         .iter()
         .map(|raw| parse_genesis_allocation(raw))
         .collect::<Result<Vec<_>, _>>()?;
+    // The treasury is a software passkey: a P-256 scalar whose
+    // compressed point owns the allocation.
     let treasury_key = treasury_balance.map(|balance| {
-        let signing_key = loop {
+        let (scalar, passkey) = loop {
             let mut raw = [0u8; 32];
             rand::rng().fill_bytes(&mut raw);
-            if let Ok(key) = p256::ecdsa::SigningKey::from_slice(&raw) {
-                break key;
+            if let Ok(passkey) = hellas_kernel::SoftPasskey::from_secret_scalar(raw) {
+                break (raw, passkey);
             }
         };
         allocations.push(GenesisEntry {
-            address: SettlementKey::from(Address::from(UserPublicKey::from(
-                signing_key.verifying_key().to_owned(),
-            )))
-            .to_string(),
+            address: SettlementKey::from(passkey.party_key()).to_string(),
             balance,
         });
-        signing_key
+        scalar
     });
     let genesis = Genesis {
         schema_version: crate::genesis::GENESIS_SCHEMA_VERSION,
@@ -345,12 +343,7 @@ fn generate_network(args: GenerateNetworkArgs) -> Result<(), ValidatorError> {
     std::fs::write(output_dir.join("genesis.json"), genesis_json)?;
     if let Some(treasury_key) = treasury_key {
         let path = output_dir.join("treasury.key");
-        std::fs::write(&path, treasury_key.to_bytes())?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-        }
+        hellas_private::write_atomically(&path, ".tmp", &treasury_key)?;
     }
 
     for (index, my_key) in keys.iter().enumerate() {
@@ -388,12 +381,7 @@ fn generate_network(args: GenerateNetworkArgs) -> Result<(), ValidatorError> {
         };
         let rendered = toml::to_string_pretty(&config)?;
         let path = output_dir.join(format!("validator-{index}.toml"));
-        std::fs::write(&path, rendered)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-        }
+        hellas_private::write_atomically(&path, ".tmp", rendered.as_bytes())?;
     }
 
     println!("{}", output_dir.join("genesis.json").display());
@@ -554,7 +542,7 @@ fn parse_genesis_allocation(raw: &str) -> Result<GenesisEntry, ValidatorError> {
 #[cfg(test)]
 mod genesis_allocation_tests {
     use super::*;
-    use crate::domain::{SettlementKey, addr_from_signing_key, secp256r1_key_from_seed};
+    use crate::domain::SettlementKey;
 
     #[test]
     fn generated_network_exports_public_trust_bound_to_exact_genesis() {
@@ -574,6 +562,10 @@ mod genesis_allocation_tests {
             output_dir: output_dir.clone(),
         })
         .unwrap();
+        for name in ["treasury.key", "validator-0.toml"] {
+            let file = hellas_private::open_nofollow(&output_dir.join(name)).unwrap();
+            assert!(hellas_private::is_private(&file).unwrap(), "{name}");
+        }
         let config: ValidatorConfig =
             toml::from_str(&std::fs::read_to_string(output_dir.join("validator-0.toml")).unwrap())
                 .unwrap();
@@ -615,8 +607,8 @@ mod genesis_allocation_tests {
 
     #[test]
     fn accepts_p256_settlement_key() {
-        let address = addr_from_signing_key(&secp256r1_key_from_seed(11));
-        let key = SettlementKey::from(address);
+        let passkey = hellas_kernel::SoftPasskey::from_secret_scalar([11; 32]).expect("scalar");
+        let key = SettlementKey::from(passkey.party_key());
         let entry =
             parse_genesis_allocation(&format!("{key}:10")).expect("valid P-256 genesis owner");
         assert_eq!(entry.address, key.to_string());
@@ -1006,7 +998,10 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
         // highest finalization f + 1 peers vouch for. A whole network
         // starting from genesis has no finalizations to offer; after the
         // wait it replays from genesis as before.
-        if plan.may_state_sync() {
+        // A fresh single-validator node has no other validator to offer
+        // a floor. Reachability must not bypass probing a larger committee.
+        let has_other_validator = scheme.participants().iter().any(|key| key != &me);
+        if plan.may_state_sync() && has_other_validator {
             match ::tokio::time::timeout(PROBE_WAIT, probe_mailbox.subscribe()).await {
                 Ok(Ok(floor)) => {
                     info!(round = ?floor.round(), "state syncing from a peer-certified floor");

@@ -24,6 +24,7 @@ apple-app-attest = [
 [dependencies]
 base64 = { workspace = true, optional = true }
 ciborium = { workspace = true, optional = true }
+hellas-auth.workspace = true
 hellas-rpc = { workspace = true, features = ["execute"] }
 p256 = { workspace = true, optional = true }
 rustls-pki-types = { workspace = true, optional = true }

@@ -1,7 +1,7 @@
 use super::*;
 
 pub(super) fn install(s: &mut AuthorityState, scope: GrantSpec) -> CredentialSecret {
-    let (credential, secret) = Credential::prepare(scope, s.generation()).unwrap();
+    let (credential, secret) = prepare(scope, s.generation());
     s.apply_credential(
         ROOT.principal(),
         &CredentialCommand::Issue {
@@ -42,7 +42,7 @@ impl Credentials {
     }
     fn caller(&self) -> AuthenticatedCaller {
         self.state
-            .authenticate_secret(&self.secret, UnixMillis(3))
+            .authenticate_secret(&self.secret, SessionKind::Passkey, UnixMillis(3))
             .unwrap()
     }
     fn revoke(&mut self) {
@@ -111,7 +111,9 @@ fn credential_scope_intersects_the_selected_grant() {
                 .allow(case.credential, resource(1))
                 .build(),
         );
-        let caller = s.authenticate_secret(&secret, UnixMillis(3)).unwrap();
+        let caller = s
+            .authenticate_secret(&secret, SessionKind::Passkey, UnixMillis(3))
+            .unwrap();
         let before = s.clone();
         assert_eq!(caller.subject(), OPERATOR.principal());
         assert_eq!(
@@ -131,9 +133,10 @@ fn credential_scope_intersects_the_selected_grant() {
 #[test]
 fn a_wrong_credential_secret_is_refused() {
     let w = Credentials::operator();
-    let wrong = CredentialSecret::from_parts(w.secret.id(), STRANGER.key().to_secret_bytes());
+    let wrong = CredentialSecret::from_parts(w.secret.id(), STRANGER.node_key().to_secret_bytes());
     assert_err!(
-        w.state.authenticate_secret(&wrong, UnixMillis(4)),
+        w.state
+            .authenticate_secret(&wrong, SessionKind::Passkey, UnixMillis(4)),
         AuthorityError::Credential
     );
 }
@@ -144,7 +147,8 @@ fn credential_expiry_invalidates_previously_authenticated_callers() {
     let caller = w.caller();
     w.authorize(&caller, 499).unwrap();
     assert_err!(
-        w.state.authenticate_secret(&w.secret, UnixMillis(500)),
+        w.state
+            .authenticate_secret(&w.secret, SessionKind::Passkey, UnixMillis(500)),
         AuthorityError::Credential
     );
     assert_eq!(w.authorize(&caller, 500), Err(AuthorityError::Credential));
@@ -162,7 +166,7 @@ fn grant_revocation_takes_effect_without_revoking_the_credential() {
     let caller = w.caller();
     revoke(&mut w.state, ids::OPERATOR_GRANT, 4);
     w.state
-        .authenticate_secret(&w.secret, UnixMillis(4))
+        .authenticate_secret(&w.secret, SessionKind::Passkey, UnixMillis(4))
         .unwrap();
     assert_eq!(w.authorize(&caller, 4), Err(AuthorityError::Revoked));
 }
@@ -175,7 +179,7 @@ fn credential_issuance_requires_its_own_permission() {
         .permissions
         .retain(|p| p.operation.as_str() != CREDENTIAL_ISSUE);
     issue(&mut s, ids::OPERATOR_GRANT, admin);
-    let (credential, _) = Credential::prepare(spec(FRIEND), 1).unwrap();
+    let (credential, _) = prepare(spec(FRIEND), 1);
     let before = s.clone();
     assert_eq!(
         s.apply_credential(
@@ -253,7 +257,8 @@ fn credential_revocation_invalidates_all_caller_entry_points() {
     w.revoke();
     let before = w.state.clone();
     assert_err!(
-        w.state.authenticate_secret(&w.secret, UnixMillis(4)),
+        w.state
+            .authenticate_secret(&w.secret, SessionKind::Passkey, UnixMillis(4)),
         AuthorityError::Credential
     );
     assert_eq!(w.authorize(&caller, 4), Err(AuthorityError::Credential));
@@ -299,9 +304,11 @@ fn administrative_credentials_cannot_borrow_a_wider_issuance_ceiling() {
         max_validity_ms: 50,
         max_delegation_depth: 0,
     });
-    let (credential, token) = Credential::prepare(scope, 1).unwrap();
-    let s = AuthorityState::bootstrap(ids::ROOT_GRANT, root, credential, UnixMillis(0)).unwrap();
-    let caller = s.authenticate_secret(&token, UnixMillis(1)).unwrap();
+    let (credential, token) = prepare(scope, 1);
+    let s = bootstrap(ids::ROOT_GRANT, root, credential, UnixMillis(0)).unwrap();
+    let caller = s
+        .authenticate_secret(&token, SessionKind::Passkey, UnixMillis(1))
+        .unwrap();
     let mut target = spec(OPERATOR);
     target.expires = UnixMillis(50);
     issuance_record(&s, &caller, target.clone(), UnixMillis(1)).unwrap();
@@ -334,7 +341,7 @@ fn snapshots_never_contain_credential_secrets() {
         AuthorityState::restore(serde_ipld_dagcbor::from_slice(&bytes).unwrap()).unwrap();
     assert_eq!(restored, w.state);
     restored
-        .authenticate_secret(&w.secret, UnixMillis(3))
+        .authenticate_secret(&w.secret, SessionKind::Passkey, UnixMillis(3))
         .unwrap();
 }
 
@@ -357,7 +364,7 @@ fn credential_verifiers_are_bound_to_the_authority() {
     }
     let other = AuthorityState::restore(other).unwrap();
     assert_err!(
-        other.authenticate_secret(&w.secret, UnixMillis(3)),
+        other.authenticate_secret(&w.secret, SessionKind::Passkey, UnixMillis(3)),
         AuthorityError::Credential
     );
 }
@@ -386,7 +393,7 @@ fn malformed_credential_snapshots_are_refused() {
 #[test]
 fn a_caller_authenticated_against_forged_state_has_no_authority() {
     let w = Credentials::operator();
-    let forged = CredentialSecret::from_parts(w.secret.id(), STRANGER.key().to_secret_bytes());
+    let forged = CredentialSecret::from_parts(w.secret.id(), STRANGER.node_key().to_secret_bytes());
     let mut fabricated = w.state.snapshot();
     fabricated
         .credentials
@@ -396,7 +403,7 @@ fn a_caller_authenticated_against_forged_state_has_no_authority() {
         .verifier = forged.verifier(authority(), 1);
     let fabricated = AuthorityState::restore(fabricated).unwrap();
     let caller = fabricated
-        .authenticate_secret(&forged, UnixMillis(3))
+        .authenticate_secret(&forged, SessionKind::Passkey, UnixMillis(3))
         .unwrap();
     assert_eq!(w.authorize(&caller, 3), Err(AuthorityError::Credential));
 }
@@ -406,27 +413,23 @@ fn recovery_replaces_credential_evidence_without_revoking_execution_grants() {
     let mut w = Credentials::operator();
     let caller = w.caller();
     let administrator = administrator(OPERATOR);
-    let (credential, replacement) = Credential::prepare(administrator.clone(), 2).unwrap();
+    let (credential, replacement) = prepare(administrator.clone(), 2);
     w.state
         .recover(
-            &RecoveryCommand {
-                expected: w.state.revision(),
-                administrator,
-                credential,
-                revoke: Default::default(),
-            },
+            &recovery(&w.state, administrator, credential, Default::default()),
             UnixMillis(4),
         )
         .unwrap();
     assert_eq!(w.state.credentials().count(), 1);
     assert_err!(
-        w.state.authenticate_secret(&w.secret, UnixMillis(4)),
+        w.state
+            .authenticate_secret(&w.secret, SessionKind::Passkey, UnixMillis(4)),
         AuthorityError::Credential
     );
     assert_eq!(w.authorize(&caller, 4), Err(AuthorityError::Credential));
     let caller = w
         .state
-        .authenticate_secret(&replacement, UnixMillis(4))
+        .authenticate_secret(&replacement, SessionKind::Passkey, UnixMillis(4))
         .unwrap();
     w.authorize(&caller, 4).unwrap();
 }
@@ -442,26 +445,55 @@ fn copying_an_old_verifier_cannot_revive_a_previous_generation_secret() {
     snapshot.credentials[0].verifier = w.secret.verifier(authority(), 1);
     let restored = AuthorityState::restore(snapshot).unwrap();
     assert_err!(
-        restored.authenticate_secret(&w.secret, UnixMillis(4)),
+        restored.authenticate_secret(&w.secret, SessionKind::Passkey, UnixMillis(4)),
         AuthorityError::Credential
     );
 }
 
 #[test]
-fn bearer_secrets_authenticate_only_the_issuers_own_subject() {
+fn only_gateway_bearer_credentials_authenticate_by_secret_alone() {
     let mut w = Credentials::operator();
     assert!(!w.state.credential(w.secret.id()).unwrap().bearer());
     assert_err!(
         w.state.authenticate(&w.secret, UnixMillis(3)),
         AuthorityError::Credential
     );
+    assert_err!(
+        Credential::prepare(spec(ROOT), CredentialHolder::Bearer, 1),
+        AuthorityError::Invalid
+    );
+    let gateway = Rights::new(authority(), ROOT)
+        .allow(GATEWAY_INVOKE, resource(1))
+        .build();
+    let (credential, secret) = Credential::prepare(gateway, CredentialHolder::Bearer, 1).unwrap();
     w.state
-        .authenticate_secret(&w.secret, UnixMillis(3))
+        .apply_credential(
+            ROOT.principal(),
+            &CredentialCommand::Issue {
+                authorization: ids::ROOT_GRANT,
+                credential: Box::new(credential),
+            },
+            UnixMillis(3),
+        )
         .unwrap();
-    let own = install(&mut w.state, spec(ROOT));
+    let caller = w.state.authenticate(&secret, UnixMillis(3)).unwrap();
     assert_eq!(
-        w.state.authenticate(&own, UnixMillis(3)).unwrap().subject(),
-        ROOT.principal()
+        (caller.subject(), caller.session()),
+        (ROOT.principal(), SessionKind::Bearer)
+    );
+    // A bearer secret opens no session, whatever proof accompanies it.
+    let binding = Digest::hash(b"bearer connection");
+    let pending = w
+        .state
+        .begin_authentication(binding, UnixMillis(3))
+        .unwrap();
+    let proof = pending
+        .challenge()
+        .sign_daily(authority(), binding, secret.id(), &ROOT.node_key())
+        .unwrap();
+    assert_err!(
+        pending.complete(&w.state, binding, &secret, &proof, UnixMillis(3)),
+        AuthorityError::Credential
     );
 }
 
@@ -473,7 +505,7 @@ fn the_257th_live_credential_is_refused_atomically() {
     }
     assert_eq!(s.credentials().count(), 256);
     let before = s.clone();
-    let (credential, _) = Credential::prepare(spec(FRIEND), 1).unwrap();
+    let (credential, _) = prepare(spec(FRIEND), 1);
     assert_eq!(
         s.apply_credential(
             ROOT.principal(),

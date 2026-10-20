@@ -24,21 +24,32 @@ use crate::{
     list::List,
     primitive::{CoinId, Key, TermsHash},
     store::Batch,
-    tx::{CloseKind, CloseKindSet},
+    tx::{Authority, CloseKind, CloseKindSet, Payout},
 };
 
-/// Owner-only UTXO object.
+/// Owned UTXO object.
+///
+/// `owner` is the key that controls the coin outright. `delegate`, when
+/// present, is the one other key that may spend it — and only to fund a
+/// work open or bond under its own signature, never to produce a coin.
+/// Only the owner can set or clear it, and only by consuming the coin in
+/// a [`crate::Reshape`].
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 pub struct Coin {
     owner: Key,
+    delegate: Option<Key>,
     value: u64,
 }
 
 impl Coin {
-    pub(super) const ZERO: Self = Self::new(Key::from_bytes([0; Key::LENGTH]), 0);
+    pub(super) const ZERO: Self = Self::new(Key::from_bytes([0; Key::LENGTH]), None, 0);
 
-    const fn new(owner: Key, value: u64) -> Self {
-        Self { owner, value }
+    const fn new(owner: Key, delegate: Option<Key>, value: u64) -> Self {
+        Self {
+            owner,
+            delegate,
+            value,
+        }
     }
 
     /// Issues a coin from a trusted host state transition.
@@ -46,14 +57,20 @@ impl Coin {
     /// This is an issuance path, not a persistence reconstitution path:
     /// stored coins must still be reconstructed through [`Decode`].
     #[must_use]
-    pub const fn issue(owner: Key, value: u64) -> Self {
-        Self::new(owner, value)
+    pub const fn issue(owner: Key, delegate: Option<Key>, value: u64) -> Self {
+        Self::new(owner, delegate, value)
     }
 
     /// Returns the owner settlement key.
     #[must_use]
     pub const fn owner(self) -> Key {
         self.owner
+    }
+
+    /// Returns the key this coin is delegated to, if any.
+    #[must_use]
+    pub const fn delegate(self) -> Option<Key> {
+        self.delegate
     }
 
     /// Returns the coin value.
@@ -64,15 +81,19 @@ impl Coin {
 }
 
 impl Encode for Coin {
-    const MAX_ENCODED_SIZE: usize = ENVELOPE_SIZE + Key::MAX_ENCODED_SIZE + u64::MAX_ENCODED_SIZE;
+    const MAX_ENCODED_SIZE: usize = ENVELOPE_SIZE
+        + Key::MAX_ENCODED_SIZE
+        + <Option<Key> as Encode>::MAX_ENCODED_SIZE
+        + u64::MAX_ENCODED_SIZE;
 
     fn encoded_size(&self) -> usize {
-        Self::MAX_ENCODED_SIZE
+        ENVELOPE_SIZE + Key::MAX_ENCODED_SIZE + self.delegate.encoded_size() + u64::MAX_ENCODED_SIZE
     }
 
     fn encode_to<W: Writer + ?Sized>(&self, writer: &mut W) {
         encode_envelope(writer, tag::COIN);
         self.owner.encode_to(writer);
+        self.delegate.encode_to(writer);
         self.value.encode_to(writer);
     }
 }
@@ -81,43 +102,177 @@ impl Decode for Coin {
     fn decode(buf: &[u8]) -> Result<(Self, usize), DecodeError> {
         let mut consumed = decode_envelope(buf, tag::COIN)?;
         let owner = decode_field(buf, &mut consumed)?;
+        let delegate = decode_field(buf, &mut consumed)?;
         let value = decode_field(buf, &mut consumed)?;
-        Ok((Self::new(owner, value), consumed))
+        Ok((Self::new(owner, delegate, value), consumed))
     }
 }
 
-/// Positional settlement keys committed by an edge.
+/// The keys one party commits to an edge.
+///
+/// `owner` is the principal whose coins the party spends and who receives
+/// the party's payouts. `signer` is the one other key that may authorize
+/// for the party — a node key acting under delegation. `payout_delegate`
+/// is the delegate the party's payout coins carry. The party's committed
+/// destination is therefore `{ owner, payout_delegate }`: a destination
+/// can name no owner but the party's own.
+#[derive(Debug, Clone, Copy, Default, Eq, Hash, PartialEq)]
+pub struct PartyKeys {
+    owner: Key,
+    signer: Key,
+    payout_delegate: Option<Key>,
+}
+
+impl PartyKeys {
+    /// Creates a party's committed keys.
+    #[must_use]
+    pub const fn new(owner: Key, signer: Key, payout_delegate: Option<Key>) -> Self {
+        Self {
+            owner,
+            signer,
+            payout_delegate,
+        }
+    }
+
+    /// A party whose owner signs for itself: `owner` and `signer` are the
+    /// same key and its payouts are undelegated.
+    #[must_use]
+    pub const fn sole(key: Key) -> Self {
+        Self::new(key, key, None)
+    }
+
+    /// Returns the owning principal.
+    #[must_use]
+    pub const fn owner(self) -> Key {
+        self.owner
+    }
+
+    /// Returns the key that may sign for the owner.
+    #[must_use]
+    pub const fn signer(self) -> Key {
+        self.signer
+    }
+
+    /// Returns the delegate this party's payout coins carry.
+    #[must_use]
+    pub const fn payout_delegate(self) -> Option<Key> {
+        self.payout_delegate
+    }
+
+    /// Returns the one key a witness claiming `authority` is verified
+    /// against.
+    #[must_use]
+    pub const fn key(self, authority: Authority) -> Key {
+        match authority {
+            Authority::Owner => self.owner,
+            Authority::Signer => self.signer,
+        }
+    }
+
+    /// Returns the authority held by `key`, preferring Owner when both keys
+    /// are equal. A foreign key has no authority for this party.
+    #[must_use]
+    pub fn authority_of(self, key: Key) -> Option<Authority> {
+        if key == self.owner {
+            Some(Authority::Owner)
+        } else if key == self.signer {
+            Some(Authority::Signer)
+        } else {
+            None
+        }
+    }
+
+    /// Returns the payout of `value` at this party's committed
+    /// destination.
+    ///
+    /// An owner-signed close issues it undelegated whatever the terms
+    /// committed: the owner exercising its own authority is the exit
+    /// from a delegation, and a payout that re-armed the delegate would
+    /// hand the coin straight back to the key the owner is leaving.
+    #[must_use]
+    pub const fn payout(self, value: u64, owner_signed: bool) -> Payout {
+        let delegate = if owner_signed {
+            None
+        } else {
+            self.payout_delegate
+        };
+        Payout::delegated(self.owner, delegate, value)
+    }
+
+    /// True when `payout` lands exactly at this party's destination:
+    /// owner and delegate both, as [`Self::payout`] would issue it.
+    #[must_use]
+    pub fn is_destination(self, payout: Payout, owner_signed: bool) -> bool {
+        payout == self.payout(payout.value(), owner_signed)
+    }
+}
+
+impl Encode for PartyKeys {
+    const MAX_ENCODED_SIZE: usize =
+        2 * Key::MAX_ENCODED_SIZE + <Option<Key> as Encode>::MAX_ENCODED_SIZE;
+
+    fn encoded_size(&self) -> usize {
+        2 * Key::MAX_ENCODED_SIZE + self.payout_delegate.encoded_size()
+    }
+
+    fn encode_to<W: Writer + ?Sized>(&self, writer: &mut W) {
+        self.owner.encode_to(writer);
+        self.signer.encode_to(writer);
+        self.payout_delegate.encode_to(writer);
+    }
+}
+
+impl Decode for PartyKeys {
+    fn decode(buf: &[u8]) -> Result<(Self, usize), DecodeError> {
+        let mut consumed = 0;
+        let owner = decode_field(buf, &mut consumed)?;
+        let signer = decode_field(buf, &mut consumed)?;
+        let payout_delegate = decode_field(buf, &mut consumed)?;
+        Ok((Self::new(owner, signer, payout_delegate), consumed))
+    }
+}
+
+/// Positional party keys committed by an edge.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 pub struct Parties {
-    maker: Key,
-    taker: Key,
+    maker: PartyKeys,
+    taker: PartyKeys,
 }
 
 impl Parties {
     /// Creates the positional parties for a bilateral edge.
     #[must_use]
-    pub const fn new(maker: Key, taker: Key) -> Self {
+    pub const fn new(maker: PartyKeys, taker: PartyKeys) -> Self {
         Self { maker, taker }
     }
 
-    /// Returns the maker settlement key.
+    /// Returns the maker's committed keys.
     #[must_use]
-    pub const fn maker(self) -> Key {
+    pub const fn maker(self) -> PartyKeys {
         self.maker
     }
 
-    /// Returns the taker settlement key.
+    /// Returns the taker's committed keys.
     #[must_use]
-    pub const fn taker(self) -> Key {
+    pub const fn taker(self) -> PartyKeys {
         self.taker
+    }
+
+    /// True when `payout` lands exactly at one of the two committed
+    /// destinations. Which one, and how often, is free: multiplicity is
+    /// not a rule, and zero-value payouts are legal.
+    #[must_use]
+    pub fn is_destination(self, payout: Payout, owner_signed: bool) -> bool {
+        self.maker.is_destination(payout, owner_signed)
+            || self.taker.is_destination(payout, owner_signed)
     }
 }
 
 impl Encode for Parties {
-    const MAX_ENCODED_SIZE: usize = ENVELOPE_SIZE + 2 * Key::MAX_ENCODED_SIZE;
+    const MAX_ENCODED_SIZE: usize = ENVELOPE_SIZE + 2 * PartyKeys::MAX_ENCODED_SIZE;
 
     fn encoded_size(&self) -> usize {
-        Self::MAX_ENCODED_SIZE
+        ENVELOPE_SIZE + self.maker.encoded_size() + self.taker.encoded_size()
     }
 
     fn encode_to<W: Writer + ?Sized>(&self, writer: &mut W) {
@@ -361,7 +516,7 @@ impl Encode for Edge {
         + CloseKindSet::MAX_ENCODED_SIZE;
 
     fn encoded_size(&self) -> usize {
-        Self::MAX_ENCODED_SIZE
+        Self::MAX_ENCODED_SIZE - Parties::MAX_ENCODED_SIZE + self.parties.encoded_size()
     }
 
     fn encode_to<W: Writer + ?Sized>(&self, writer: &mut W) {
@@ -415,7 +570,7 @@ impl Genesis {
     pub const fn coin(id: CoinId, owner: Key, value: u64) -> Self {
         Self {
             id,
-            coin: Coin::new(owner, value),
+            coin: Coin::new(owner, None, value),
         }
     }
 
@@ -432,6 +587,22 @@ impl Genesis {
 )]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authority_follows_the_signing_key_and_prefers_owner_for_sole_parties() {
+        let owner = Key::from_bytes([1; Key::LENGTH]);
+        let signer = Key::from_bytes([2; Key::LENGTH]);
+        let foreign = Key::from_bytes([3; Key::LENGTH]);
+        let split = PartyKeys::new(owner, signer, Some(signer));
+        assert_eq!(split.authority_of(owner), Some(Authority::Owner));
+        assert_eq!(split.authority_of(signer), Some(Authority::Signer));
+        assert_eq!(split.authority_of(foreign), None);
+        assert_eq!(
+            PartyKeys::sole(owner).authority_of(owner),
+            Some(Authority::Owner)
+        );
+        assert_eq!(PartyKeys::sole(owner).authority_of(signer), None);
+    }
 
     fn assert_canonical_round_trip<T>(value: T, buf: &mut [u8])
     where
@@ -455,10 +626,18 @@ mod tests {
 
     #[test]
     fn private_coin_and_edge_payloads_round_trip_only_through_their_codecs() {
-        let coin = Coin::new(Key::from_bytes([1; Key::LENGTH]), 23);
+        let coin = Coin::new(Key::from_bytes([1; Key::LENGTH]), None, 23);
         let mut coin_buf = [0; Coin::MAX_ENCODED_SIZE + 1];
         assert_canonical_round_trip(coin, &mut coin_buf);
         assert_eq!(&coin_buf[..2], &[1, tag::COIN]);
+        let delegated = Coin::new(
+            Key::from_bytes([1; Key::LENGTH]),
+            Some(Key::from_bytes([9; Key::LENGTH])),
+            23,
+        );
+        let mut delegated_buf = [0; Coin::MAX_ENCODED_SIZE + 1];
+        assert_canonical_round_trip(delegated, &mut delegated_buf);
+        assert_eq!(delegated.encoded_size(), Coin::MAX_ENCODED_SIZE);
 
         let edge = Edge::new(
             100,
@@ -466,8 +645,12 @@ mod tests {
             Fees::new(1, 2, 3, 4),
             BlockHeight::new(99),
             Parties::new(
-                Key::from_bytes([2; Key::LENGTH]),
-                Key::from_bytes([3; Key::LENGTH]),
+                PartyKeys::sole(Key::from_bytes([2; Key::LENGTH])),
+                PartyKeys::new(
+                    Key::from_bytes([3; Key::LENGTH]),
+                    Key::from_bytes([5; Key::LENGTH]),
+                    Some(Key::from_bytes([6; Key::LENGTH])),
+                ),
             ),
             TermsHash::from_bytes([4; TermsHash::LENGTH]),
             CloseKindSet::BASIC,
@@ -477,11 +660,11 @@ mod tests {
         assert_eq!(&edge_buf[..2], &[1, tag::EDGE]);
 
         assert_eq!(
-            Edge::decode_exact(&coin_buf[..Coin::MAX_ENCODED_SIZE]),
+            Edge::decode_exact(&coin_buf[..coin.encoded_size()]),
             Err(DecodeError::InvalidTag { tag: tag::COIN }),
         );
         assert_eq!(
-            Coin::decode_exact(&edge_buf[..Edge::MAX_ENCODED_SIZE]),
+            Coin::decode_exact(&edge_buf[..edge.encoded_size()]),
             Err(DecodeError::InvalidTag { tag: tag::EDGE }),
         );
     }
