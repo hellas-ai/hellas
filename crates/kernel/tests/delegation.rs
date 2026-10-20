@@ -1250,6 +1250,33 @@ fn both_owner_curves_delegate_and_reclaim_through_the_same_auth_path() {
         let terms =
             Terms::work_stake_bond(bond_terms(maker, PartyKeys::sole(taker.party_key()), VALUE));
         let funding = Funding::new(party_coins(&[delegated]), party_coins(&[]));
+        // A valid delegate signature cannot fund a bond naming a different
+        // owner, even when the coin delegates to exactly that signer.
+        let wrong_terms = Terms::work_stake_bond(bond_terms(
+            PartyKeys::new(taker.party_key(), node.party_key(), Some(node.party_key())),
+            PartyKeys::sole(taker.party_key()),
+            VALUE,
+        ));
+        let wrong_hash = Tx::open_hash(NETWORK, &funding, &wrong_terms);
+        let wrong_edge = Tx::edge_id_of(&funding, &wrong_terms);
+        let before: Vec<_> = state.store().coins().collect();
+        assert_eq!(
+            state.apply(
+                at(1),
+                &Secp256k1Verifier,
+                &Tx::open(
+                    funding.clone(),
+                    wrong_terms,
+                    PartyAuth::signer(node.sign(wrong_hash)),
+                    PartyAuth::owner(taker.sign(wrong_hash)),
+                )
+            ),
+            Err(invalid_open(
+                wrong_edge,
+                InvalidOpenReason::FundingUnauthorized
+            )),
+        );
+        assert_eq!(state.store().coins().collect::<Vec<_>>(), before);
         let hash = Tx::open_hash(NETWORK, &funding, &terms);
         let edge = Tx::edge_id_of(&funding, &terms);
         let tx = Tx::open(

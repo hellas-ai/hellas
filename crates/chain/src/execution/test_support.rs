@@ -317,6 +317,17 @@ pub(crate) fn reshape(
     inputs: &[ObjectId],
     outputs: &[(SettlementKey, Option<SettlementKey>, u64)],
 ) -> (Transaction, Vec<ObjectId>) {
+    reshape_authorized(inputs, outputs, |hash| {
+        Auth::native(owner_signer(owner).sign(hash))
+    })
+}
+
+/// The same consuming reshape for either supported owner authorization curve.
+pub(crate) fn reshape_authorized(
+    inputs: &[ObjectId],
+    outputs: &[(SettlementKey, Option<SettlementKey>, u64)],
+    authorize: impl FnOnce(hellas_kernel::PayloadHash) -> Auth,
+) -> (Transaction, Vec<ObjectId>) {
     let mut input_ids = [CoinId::from_bytes([0; 32]); hellas_kernel::MAX_EDGE_INPUTS];
     for (slot, id) in input_ids.iter_mut().zip(inputs) {
         *slot = CoinId::from_bytes(id.0);
@@ -337,7 +348,7 @@ pub(crate) fn reshape(
         .copied()
         .map(crate::domain::coin_object_id)
         .collect();
-    let auth = Auth::native(owner_signer(owner).sign(hash));
+    let auth = authorize(hash);
     (
         Transaction::Kernel(Tx::Owner(hellas_kernel::Reshape::new(
             inputs, outputs, auth,
