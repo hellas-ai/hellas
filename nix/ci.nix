@@ -192,10 +192,12 @@ let
     # `work-watcher` for the journal and the driver — and neither of the
     # two dimensions above runs a test with the other's code compiled
     # in. This is the only line that runs a paid channel being opened
-    # against real finalized blocks.
+    # against real finalized blocks. Each paid scenario owns six validators and
+    # two full nodes; run that group separately and serially to avoid competing
+    # runtimes in the same test process during its bounded readiness wait.
     chain-setup =
       mkCargo "check-chain-setup"
-        "cargo test -p hellas-chain --no-default-features --features validator,work-watcher"
+        "cargo test -p hellas-chain --no-default-features --features validator,work-watcher -- --skip work_e2e && cargo test -p hellas-chain --no-default-features --features validator,work-watcher work_e2e -- --test-threads=1"
         (cargoEnv rustToolchain);
     sort = mk "check-sort" "cargo-sort --workspace --check --no-format" [ pkgs.cargo-sort ];
     taplo =
