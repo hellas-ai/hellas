@@ -211,6 +211,19 @@ impl NodeStore {
 
 /// Called while the store's identity lock excludes every writer.
 fn inspection_snapshot(directory: &Path) -> Result<tempfile::TempDir, NodeStoreError> {
+    // The identity lock excludes live inspections. Only our scratch directories
+    // can be stale; DirEntry::file_type and remove_dir_all do not follow symlinks.
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        if entry
+            .file_name()
+            .as_encoded_bytes()
+            .starts_with(b".inspection-")
+            && entry.file_type()?.is_dir()
+        {
+            std::fs::remove_dir_all(entry.path())?;
+        }
+    }
     // A read-only SQLite connection may create shared-memory sidecars for a
     // crash-left WAL. Replay a private copy under the identity lock so even
     // that recovery leaves every source file unchanged.

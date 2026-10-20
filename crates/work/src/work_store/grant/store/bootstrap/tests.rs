@@ -821,3 +821,56 @@ async fn offline_inspection_reads_a_crash_left_wal_without_creating_source_sidec
     assert_eq!(inspection_files(crashed.path()), before);
     assert!(!shm.exists());
 }
+
+#[tokio::test]
+async fn offline_inspection_removes_only_stale_snapshot_directories() {
+    let directory = tempfile::tempdir().unwrap();
+    let (store, _) = bootstrap(directory.path()).await;
+    let query = auth::InspectionQuery::Grant {
+        id: ids::ROOT_GRANT,
+    };
+    let stale = directory.path().join(".inspection-abandoned");
+    std::fs::create_dir(&stale).unwrap();
+    std::fs::write(stale.join("snapshot"), b"private stale data").unwrap();
+    let unrelated = directory.path().join("unrelated");
+    std::fs::create_dir(&unrelated).unwrap();
+    std::fs::write(unrelated.join("keep"), b"unrelated data").unwrap();
+    let prefixed_file = directory.path().join(".inspection-regular-file");
+    std::fs::write(&prefixed_file, b"not a directory").unwrap();
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&unrelated, directory.path().join(".inspection-link")).unwrap();
+        std::os::unix::fs::symlink(&unrelated, stale.join("nested-link")).unwrap();
+    }
+    // Cleanup is also excluded while a writer owns the journal.
+    assert!(
+        NodeStore::inspect_offline(directory.path(), network(), &query)
+            .await
+            .is_err()
+    );
+    assert!(stale.exists());
+    drop(store);
+    NodeStore::inspect_offline(directory.path(), network(), &query)
+        .await
+        .unwrap();
+    assert!(!stale.exists());
+    assert_eq!(
+        std::fs::read(unrelated.join("keep")).unwrap(),
+        b"unrelated data"
+    );
+    assert_eq!(std::fs::read(prefixed_file).unwrap(), b"not a directory");
+    #[cfg(unix)]
+    assert!(
+        std::fs::symlink_metadata(directory.path().join(".inspection-link"))
+            .unwrap()
+            .is_symlink()
+    );
+    assert!(std::fs::read_dir(directory.path()).unwrap().all(|entry| {
+        let entry = entry.unwrap();
+        !entry
+            .file_name()
+            .as_encoded_bytes()
+            .starts_with(b".inspection-")
+            || !entry.file_type().unwrap().is_dir()
+    }));
+}
