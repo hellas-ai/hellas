@@ -1,41 +1,53 @@
-//! Proof of possession for offline ownership changes: nobody can bootstrap or
+//! Proof of possession for ownership changes: nobody can bootstrap or
 //! recover an authority administered by someone else's passkey.
 use super::*;
 use crate::{Digest, hash_tuple};
 
-/// The offline ownership change an owner approves.
+/// The ownership change an owner approves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ownership {
     /// A new authority whose administrator grant is `root`.
-    Bootstrap { root: GrantId },
+    Bootstrap {
+        root: GrantId,
+        /// Remote machine transport pin; absent only for offline creation.
+        target: Option<[u8; 32]>,
+    },
     /// A new administrator for the authority at exactly revision `expected`.
     Recover { expected: Revision },
 }
 
 /// The challenge the administrator's passkey signs. It commits to the
 /// administrator grant, the initial credential's scope and the node key that
-/// will hold that credential.
+/// will hold that credential. Remote bootstrap also commits to the machine pin.
 pub fn ownership_digest(
     ownership: Ownership,
     administrator: &GrantSpec,
     credential: &GrantSpec,
     holder: NodeKey,
 ) -> Digest {
-    let (domain, anchor) = match ownership {
-        Ownership::Bootstrap { root } => ("hellas.auth.bootstrap.v2", root.0.to_vec()),
-        Ownership::Recover { expected } => {
-            ("hellas.auth.recovery.v2", expected.0.to_be_bytes().to_vec())
-        }
-    };
-    hash_tuple(
-        domain,
-        &[
-            &anchor,
-            administrator.commitment().as_bytes(),
-            credential.commitment().as_bytes(),
-            holder.as_bytes(),
-        ],
-    )
+    let admin = administrator.commitment();
+    let credential = credential.commitment();
+    match ownership {
+        Ownership::Bootstrap { root, target } => hash_tuple(
+            "hellas.auth.bootstrap.v3",
+            &[
+                &root.0,
+                target.as_ref().map_or(&[][..], |id| id.as_slice()),
+                admin.as_bytes(),
+                credential.as_bytes(),
+                holder.as_bytes(),
+            ],
+        ),
+        Ownership::Recover { expected } => hash_tuple(
+            "hellas.auth.recovery.v2",
+            &[
+                &expected.0.to_be_bytes(),
+                admin.as_bytes(),
+                credential.as_bytes(),
+                holder.as_bytes(),
+            ],
+        ),
+    }
 }
 
 impl GrantSpec {

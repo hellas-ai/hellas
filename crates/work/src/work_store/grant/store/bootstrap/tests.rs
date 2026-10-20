@@ -106,6 +106,7 @@ async fn bootstrap(path: &Path) -> (NodeStore, CredentialSecret) {
         crate::test_support::common_node::approval_for(
             auth::Ownership::Bootstrap {
                 root: ids::ROOT_GRANT,
+                target: None,
             },
             admin(),
             admin(),
@@ -186,7 +187,8 @@ async fn bootstrap_refuses_a_foreign_credential_subject_atomically() {
             ids::ROOT_GRANT,
             crate::test_support::common_node::approval_for(
                 auth::Ownership::Bootstrap {
-                    root: ids::ROOT_GRANT
+                    root: ids::ROOT_GRANT,
+                    target: None
                 },
                 admin(),
                 scope
@@ -240,7 +242,8 @@ async fn an_existing_authority_cannot_be_bootstrapped_again() {
             ids::ROOT_GRANT,
             crate::test_support::common_node::approval_for(
                 auth::Ownership::Bootstrap {
-                    root: ids::ROOT_GRANT
+                    root: ids::ROOT_GRANT,
+                    target: None
                 },
                 admin(),
                 admin()
@@ -301,12 +304,14 @@ async fn an_initialization_frame_cannot_reset_existing_state() {
     let reset = Change::Initialize {
         authority: AuthorityState::bootstrap(
             ids::ROOT_GRANT,
+            None,
             admin(),
             Credential::prepare(admin(), ROOT.holder(), 1).unwrap().0,
             &hellas_auth::test_support::approve(
                 ROOT,
                 auth::Ownership::Bootstrap {
                     root: ids::ROOT_GRANT,
+                    target: None,
                 },
                 &admin(),
                 &admin(),
@@ -397,7 +402,8 @@ async fn damaged_initialization_never_opens_as_empty() {
                 ids::ROOT_GRANT,
                 crate::test_support::common_node::approval_for(
                     auth::Ownership::Bootstrap {
-                        root: ids::ROOT_GRANT
+                        root: ids::ROOT_GRANT,
+                        target: None
                     },
                     admin(),
                     admin()
@@ -486,6 +492,7 @@ async fn service_and_mixed_administration_are_revoked_while_execution_and_accoun
         crate::test_support::common_node::approval_for(
             auth::Ownership::Bootstrap {
                 root: ids::ROOT_GRANT,
+                target: None,
             },
             initial.clone(),
             initial,
@@ -576,6 +583,7 @@ async fn offline_recovery_changes_the_authority_once_and_journals_no_secret() {
         crate::test_support::common_node::approval_for(
             auth::Ownership::Bootstrap {
                 root: ids::ROOT_GRANT,
+                target: None,
             },
             admin(),
             admin(),
@@ -881,21 +889,12 @@ async fn client_prepared_bootstrap_survives_a_lost_reply() {
     let approval = crate::test_support::common_node::approval_for(
         auth::Ownership::Bootstrap {
             root: ids::ROOT_GRANT,
+            target: None,
         },
         admin(),
         admin(),
     );
-    let (credential, secret) = Credential::prepare(
-        approval.credential,
-        CredentialHolder::Node(approval.holder),
-        1,
-    )
-    .unwrap();
-    let request = PreparedBootstrap {
-        administrator: approval.administrator,
-        credential,
-        assertion: approval.assertion,
-    };
+    let (request, secret) = approval.prepare(None).unwrap();
     drop(
         NodeStore::bootstrap_prepared(
             directory.path(),
@@ -1012,6 +1011,7 @@ async fn concurrent_bootstrap_commits_only_one_complete_store() {
             crate::test_support::common_node::approval(
                 auth::Ownership::Bootstrap {
                     root: ids::ROOT_GRANT,
+                    target: None,
                 },
                 admin(),
             ),

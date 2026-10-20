@@ -296,7 +296,7 @@ fn bootstrap_and_recovery_without_proof_of_possession_fail() {
     };
     let approve = |root, holder| {
         ownership_digest(
-            Ownership::Bootstrap { root },
+            Ownership::Bootstrap { root, target: None },
             &admin,
             credential.scope(),
             holder,
@@ -313,6 +313,7 @@ fn bootstrap_and_recovery_without_proof_of_possession_fail() {
         assert_err!(
             AuthorityState::bootstrap(
                 ids::ROOT_GRANT,
+                None,
                 admin.clone(),
                 credential.clone(),
                 &owner,

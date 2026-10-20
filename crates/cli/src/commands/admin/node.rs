@@ -540,7 +540,7 @@ async fn offline(
                 &journal,
                 network,
                 root,
-                approve(Ownership::Bootstrap { root })?,
+                approve(Ownership::Bootstrap { root, target: None })?,
                 Some(identity.enrollment.clone()),
                 now,
             )
@@ -648,29 +648,21 @@ async fn bootstrap_remote(
     let holder = hellas_auth::authority::NodeKey::from_public_key(identity.node_key.public_key())?;
     let approval = owner_approval(
         passkey,
-        Ownership::Bootstrap { root },
+        Ownership::Bootstrap {
+            root,
+            target: Some(*invitation.node.as_bytes()),
+        },
         &administrator,
         &scope,
         holder,
     )?;
-    let (credential, secret) =
-        Credential::prepare(scope.clone(), CredentialHolder::Node(holder), 1)?;
+    let (approval, secret) = approval.prepare(Some(*invitation.node.as_bytes()))?;
     let profile = profile::install_remote(&profile_out, scope.authority, root, &secret)?;
     let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
         .secret_key(identity.transport_key.clone())
         .bind()
         .await?;
-    let result = node_control::bootstrap::connect(
-        &endpoint,
-        &invitation,
-        root,
-        hellas_work::work_store::grant::PreparedBootstrap {
-            administrator,
-            credential,
-            assertion: approval.assertion,
-        },
-    )
-    .await;
+    let result = node_control::bootstrap::connect(&endpoint, &invitation, root, approval).await;
     endpoint.close().await;
     result.with_context(|| format!("credential {} retained in {}; authenticate and inspect its exact ID after a lost reply", secret.id(), profile.display()))?;
     println!(

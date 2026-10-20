@@ -531,7 +531,13 @@ async fn controlled_gateway_profile(root: &Path) -> (PathBuf, PathBuf) {
         &journal,
         hellas_work::model::grant::grant_network(),
         root_grant,
-        common_node::approval(Ownership::Bootstrap { root: root_grant }, administrator),
+        common_node::approval(
+            Ownership::Bootstrap {
+                root: root_grant,
+                target: None,
+            },
+            administrator,
+        ),
         None,
         now,
     )

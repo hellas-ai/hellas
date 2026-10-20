@@ -45,9 +45,31 @@ pub struct OwnerApproval {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PreparedBootstrap {
+    pub target: Option<[u8; 32]>,
     pub administrator: GrantSpec,
     pub credential: Credential,
     pub assertion: PasskeyAssertion,
+}
+
+impl OwnerApproval {
+    /// Prepare the verifier once, before the owner saves the secret and submits
+    /// the approval. Remote approvals bind the authenticated machine pin.
+    pub fn prepare(
+        self,
+        target: Option<[u8; 32]>,
+    ) -> Result<(PreparedBootstrap, CredentialSecret), hellas_auth::authority::AuthorityError> {
+        let (credential, secret) =
+            Credential::prepare(self.credential, CredentialHolder::Node(self.holder), 1)?;
+        Ok((
+            PreparedBootstrap {
+                target,
+                administrator: self.administrator,
+                credential,
+                assertion: self.assertion,
+            },
+            secret,
+        ))
+    }
 }
 
 impl NodeStore {
@@ -122,24 +144,10 @@ impl NodeStore {
         provider: Option<ProviderEnrollmentBundle>,
         now: UnixMillis,
     ) -> Result<(Self, CredentialSecret), NodeStoreError> {
-        let (credential, secret) = Credential::prepare(
-            approval.credential,
-            CredentialHolder::Node(approval.holder),
-            1,
-        )?;
-        let store = Self::bootstrap_prepared(
-            directory,
-            network,
-            root_grant,
-            PreparedBootstrap {
-                administrator: approval.administrator,
-                credential,
-                assertion: approval.assertion,
-            },
-            provider,
-            now,
-        )
-        .await?;
+        let (approval, secret) = approval.prepare(None)?;
+        let store =
+            Self::bootstrap_prepared(directory, network, root_grant, approval, provider, now)
+                .await?;
         Ok((store, secret))
     }
 
@@ -157,6 +165,7 @@ impl NodeStore {
         clock.check(now)?;
         let authority = AuthorityState::bootstrap(
             root_grant,
+            approval.target,
             approval.administrator,
             approval.credential,
             &approval.assertion,

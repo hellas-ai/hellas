@@ -29,7 +29,14 @@ async fn authentication_rejects_prefix_only_oversize_replay_and_trailing_data_an
     // allocate a peer-selected body before checking the authentication bound.
     AsyncWriteExt::write_u16(&mut send, 257).await.unwrap();
     rejected(task).await;
-    assert_eq!(f.service.remote_slots.available_permits(), MAX_CONNECTIONS);
+    assert_eq!(
+        f.service.remote_capacity.handshakes.available_permits(),
+        MAX_CONNECTIONS
+    );
+    assert_eq!(
+        f.service.remote_capacity.sessions.available_permits(),
+        MAX_CONNECTIONS
+    );
     for trailing in [false, true] {
         let (_ce, _se, cc, sc) = pair().await;
         let task = serve(&f.service, sc);
@@ -63,11 +70,19 @@ async fn authentication_rejects_prefix_only_oversize_replay_and_trailing_data_an
         .await
         .unwrap()
         .unwrap_err();
-    assert_eq!(f.service.remote_slots.available_permits(), MAX_CONNECTIONS);
+    assert_eq!(
+        f.service.remote_capacity.handshakes.available_permits(),
+        MAX_CONNECTIONS
+    );
+    assert_eq!(
+        f.service.remote_capacity.sessions.available_permits(),
+        MAX_CONNECTIONS
+    );
     // Admission precedes challenge allocation and all rejected connections close.
     let held = f
         .service
-        .remote_slots
+        .remote_capacity
+        .handshakes
         .acquire_many(MAX_CONNECTIONS as u32)
         .await
         .unwrap();

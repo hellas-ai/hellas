@@ -74,7 +74,10 @@ pub async fn bootstrap_node_with_credential(
         path,
         network,
         root,
-        approval(auth::Ownership::Bootstrap { root }, administrator),
+        approval(
+            auth::Ownership::Bootstrap { root, target: None },
+            administrator,
+        ),
         Some(provider),
         now,
     )

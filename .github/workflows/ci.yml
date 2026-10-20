@@ -204,25 +204,18 @@ jobs:
           persist-credentials: false
       - if: runner.environment == 'github-hosted'
         uses: NixOS/nix-installer-action@62c1943b776c509394b550f3f983adc14e9212d6
-      - name: Build ordinary and managed images
+      - name: Build node images
         env:
           BACKEND: ${{ matrix.backend }}
         run: |
           set -euo pipefail
           mkdir images
-          for variant in node cloud; do
-            attr=docker
-            flavor="$BACKEND"
-            if [ "$variant" = cloud ]; then
-              attr=docker-cloud
-              flavor="cloud-$BACKEND"
-            fi
-            if [ "$BACKEND" != network ]; then
-              attr="$attr-$BACKEND"
-            fi
-            stream=$(nix build --accept-flake-config --print-build-logs --no-link --print-out-paths ".#packages.x86_64-linux.$attr")
-            "$stream" | gzip -1 > "images/$flavor.tar.gz"
-          done
+          attr=docker
+          if [ "$BACKEND" != network ]; then
+            attr="$attr-$BACKEND"
+          fi
+          stream=$(nix build --accept-flake-config --print-build-logs --no-link --print-out-paths ".#packages.x86_64-linux.$attr")
+          "$stream" | gzip -1 > "images/$BACKEND.tar.gz"
           cd images
           sha256sum ./*.tar.gz > SHA256SUMS
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -280,12 +273,11 @@ jobs:
           printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
           prefix="sha-$GITHUB_SHA"
           if [ -n "$PR_NUMBER" ]; then prefix="pr-$PR_NUMBER-$GITHUB_SHA"; fi
-          for flavor in "$BACKEND" "cloud-$BACKEND"; do
-            source="ghcr.io/hellas-ai/hellas:$flavor"
-            target="$repository:$prefix-$flavor"
-            docker tag "$source" "$target"
-            docker push "$target"
-            digest=$(docker image inspect --format '{{index .RepoDigests 0}}' "$target")
-            [[ "$digest" == "$repository@sha256:"* ]]
-            printf '%s: %s\n\nPull by digest: %s\n\n' "$flavor" "$target" "$digest" >> "$GITHUB_STEP_SUMMARY"
-          done
+          flavor="$BACKEND"
+          source="ghcr.io/hellas-ai/hellas:$flavor"
+          target="$repository:$prefix-$flavor"
+          docker tag "$source" "$target"
+          docker push "$target"
+          digest=$(docker image inspect --format '{{index .RepoDigests 0}}' "$target")
+          [[ "$digest" == "$repository@sha256:"* ]]
+          printf '%s: %s\n\nPull by digest: %s\n\n' "$flavor" "$target" "$digest" >> "$GITHUB_STEP_SUMMARY"

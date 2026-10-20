@@ -64,12 +64,15 @@ fn bootstrap(
         return Err(AuthorityError::Invalid);
     };
     let owner = actor(admin.subject).assert(ownership_digest(
-        Ownership::Bootstrap { root: id },
+        Ownership::Bootstrap {
+            root: id,
+            target: None,
+        },
         &admin,
         credential.scope(),
         holder,
     ));
-    AuthorityState::bootstrap(id, admin, credential, &owner, now)
+    AuthorityState::bootstrap(id, None, admin, credential, &owner, now)
 }
 
 /// Recovery approved by the new administrator's own passkey.

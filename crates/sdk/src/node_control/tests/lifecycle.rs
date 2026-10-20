@@ -192,7 +192,10 @@ async fn unbound_fixture() -> Fixture {
         hellas_work::test_support::network(),
         ROOT_GRANT,
         hellas_work::test_support::common_node::approval_for(
-            hellas_auth::authority::Ownership::Bootstrap { root: ROOT_GRANT },
+            hellas_auth::authority::Ownership::Bootstrap {
+                root: ROOT_GRANT,
+                target: None,
+            },
             scope(ROOT),
             scope(ROOT),
         ),

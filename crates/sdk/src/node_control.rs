@@ -19,7 +19,11 @@ use hellas_work::{
     work_store::grant::NodeStoreError,
 };
 use iroh::endpoint::Connection;
-use std::{sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex, Weak},
+    time::Duration,
+};
 use tokio::{sync::Semaphore, time::Instant};
 
 use crate::application_handshake as handshake;
@@ -34,16 +38,22 @@ const MAX_COMMAND_BYTES: usize = 64 * 1024;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// A node service, including nodes without a Work provider. Connection slots
-/// cover handshake, dispatch and shutdown; they are not permission grants.
+/// A node service, including nodes without a Work provider. Remote authentication
+/// and authenticated sessions have separate capacity; neither grants permission.
 #[derive(Clone)]
 pub struct NodeControl {
     node: NodeCoordinator,
     work: Option<hellas_work::grant_service::WorkAdministration>,
     host: Option<host::Runtime>,
     local_slots: Arc<Semaphore>,
-    remote_slots: Arc<Semaphore>,
+    remote_capacity: Arc<RemoteCapacity>,
     remote_admission: RemoteControlAdmission,
+}
+
+struct RemoteCapacity {
+    sessions: Arc<Semaphore>,
+    handshakes: Arc<Semaphore>,
+    peers: Mutex<BTreeMap<iroh::EndpointId, Weak<Semaphore>>>,
 }
 
 impl NodeControl {
@@ -53,7 +63,11 @@ impl NodeControl {
             work: None,
             host: None,
             local_slots: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
-            remote_slots: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
+            remote_capacity: Arc::new(RemoteCapacity {
+                sessions: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
+                handshakes: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
+                peers: Mutex::default(),
+            }),
             remote_admission: RemoteControlAdmission::default(),
         }
     }
@@ -117,12 +131,35 @@ impl NodeControl {
             tracing::warn!("remote control transport admission refused");
             return Err(denied());
         }
-        let _slot = self.remote_slots.try_acquire().map_err(|_| {
+        // Unauthenticated peers cannot occupy the authenticated session pool.
+        // Each transport key gets at most two simultaneous credential attempts.
+        let handshake_slot = self.remote_capacity.handshakes.try_acquire().map_err(|_| {
+            tracing::warn!("remote control authentication capacity refused");
             WireStatus::new(WireCode::ResourceExhausted, "node control is at capacity")
         })?;
+        let peer_slot = {
+            let mut peers = self
+                .remote_capacity
+                .peers
+                .lock()
+                .map_err(|_| unavailable())?;
+            peers.retain(|_, slots| slots.strong_count() > 0);
+            let slots = peers
+                .get(&connection.remote_id())
+                .and_then(Weak::upgrade)
+                .unwrap_or_else(|| {
+                    let slots = Arc::new(Semaphore::new(2));
+                    peers.insert(connection.remote_id(), Arc::downgrade(&slots));
+                    slots
+                });
+            slots.try_acquire_owned().map_err(|_| {
+                tracing::warn!("remote control per-peer authentication capacity refused");
+                WireStatus::new(WireCode::ResourceExhausted, "node control is at capacity")
+            })?
+        };
         let transport = checked_transport(connection)?;
         let binding = binding(&transport)?;
-        let (session, deadline) = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
+        let (session, deadline, _slot) = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
             let (mut send, mut recv) = transport
                 .connection()
                 .accept_bi()
@@ -136,8 +173,12 @@ impl NodeControl {
                 handshake::Framing::Substream,
             )
             .await?;
+            let slot = self.remote_capacity.sessions.try_acquire().map_err(|_| {
+                tracing::warn!("remote control authenticated session capacity refused");
+                WireStatus::new(WireCode::ResourceExhausted, "node control is at capacity")
+            })?;
             handshake::acknowledge(&mut send, handshake::Framing::Substream).await?;
-            Ok::<_, WireStatus>(authenticated)
+            Ok::<_, WireStatus>((authenticated.0, authenticated.1, slot))
         })
         .await
         .map_err(|_| {
@@ -147,6 +188,8 @@ impl NodeControl {
         .inspect_err(|_| {
             tracing::warn!("remote control authentication refused");
         })?;
+        drop(peer_slot);
+        drop(handshake_slot);
         tracing::info!("remote control application session admitted");
         serve(
             transport,

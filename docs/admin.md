@@ -431,17 +431,23 @@ Provisioning uses the client-side `machines --provider NAME --credential-source 
 shown in [machine provider configuration](machine-provider-config.md). Provisioning
 passes no owner credential or transport secret to the provider.
 
-The ordinary node image runs `serve --await-owner STATE_DIRECTORY`. An unowned
+The ordinary node image runs `serve --port 31145`. Owner bootstrap is an explicit
+opt-in: append `--await-owner STATE_DIRECTORY` to its arguments. An unowned
 node prints a pairing document containing its public transport pin, direct
 addresses, expiry and a fresh random secret. Obtain that document through the
 provider's authenticated console/output and keep it private. Before ownership,
-only the bounded one-shot bootstrap exchange is available. Eight refused attempts
-invalidate the invitation; restarting generates a different secret.
+only the bounded one-shot bootstrap exchange is available. Eight incorrect pairing proofs
+invalidate the invitation. Malformed traffic and stalled connections do not consume
+that budget; concurrent handshakes and per-source capacity are bounded separately.
+The invitation expires after 15 minutes. Restarting generates a fresh 256-bit secret
+and resets the attempt budget, so unauthenticated exhaustion cannot permanently
+disable bootstrap. No attempt state or pairing secret is persisted.
 
 The owner uses `admin bootstrap-remote --invitation FILE --root-grant ID
 --administrator FILE --credential-scope FILE --profile-out DIRECTORY` with their
 passkey. The CLI saves the prepared credential and pinned remote profile before
-sending the owner approval. A lost acknowledgement does not require issuing a
+sending the owner approval. The v3 bootstrap digest binds that approval to the
+machine's public transport pin as well as the authority and credential scope. A lost acknowledgement does not require issuing a
 second credential: use the saved profile to inspect the node. The authority store
 is published atomically and refuses another bootstrap after success.
 
@@ -450,9 +456,13 @@ Use the saved `admin --profile DIRECTORY/profile.json` for status, capacity, aut
 administration. `admin configure-provider FILE` applies a typed, revision-checked
 upstream mutation. Adding a new key requires a daily application session; replacing
 or removing a key and changing endpoints require a passkey session. Status exposes
-endpoint metadata and key names, never key material. Failed configuration/startup
-restores the prior configuration and keys and reports the provider as failed;
-`admin set-provider-state --enabled true` explicitly starts it again.
+endpoint metadata and key names, never key material. Configuration is validated
+and staged before a running provider stops. Rejected revision, input, mount or
+read-only requests leave its state unchanged. Valid configuration while stopped
+or failed preserves that state. For a running provider, a failed restart restores
+the prior configuration and keys and reports failed until
+`admin set-provider-state --enabled true` explicitly starts it again. A rollback
+I/O failure is reported as a failure, never as successful recovery.
 
 Share execution through a signed allowance offer, import it, then select
 `gateway --offer ALIAS` with the caller's approved trust policy and Work profile.

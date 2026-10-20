@@ -49,7 +49,10 @@ async fn handshake_hook_rejects_unlisted_endpoints_before_control_admission() {
                 .await, status if status.code() == WireCode::PermissionDenied);
             rejected(task).await;
         }
-        assert_eq!(f.service.remote_slots.available_permits(), MAX_CONNECTIONS);
+        assert_eq!(
+            f.service.remote_capacity.sessions.available_permits(),
+            MAX_CONNECTIONS
+        );
         client.close().await;
     }
     server.close().await;
@@ -103,4 +106,105 @@ async fn idle_sessions_release_control_capacity() {
     hellas_work::test_support::assert_err!(client
             .get_host_status(read_request(ROOT_GRANT))
             .await, status if matches!(status.code(), WireCode::Unavailable | WireCode::Internal));
+}
+
+#[tokio::test]
+async fn pending_peer_cannot_take_session_capacity_or_block_a_second_owner_key() {
+    let f = fixture().await;
+    let service = f
+        .service
+        .clone()
+        .with_remote_admission(RemoteControlAdmission::credential_gated());
+    let (client, server, pending, accepted) = pair().await;
+    let first = serve(&service, accepted);
+    let (pending2, accepted2) = tokio::join!(
+        client.connect(server.addr(), HostControl::ALPN.as_bytes()),
+        async {
+            server
+                .accept()
+                .await
+                .unwrap()
+                .accept()
+                .unwrap()
+                .await
+                .unwrap()
+        }
+    );
+    let second = serve(&service, accepted2);
+    let (excess, accepted3) = tokio::join!(
+        client.connect(server.addr(), HostControl::ALPN.as_bytes()),
+        async {
+            server
+                .accept()
+                .await
+                .unwrap()
+                .accept()
+                .unwrap()
+                .await
+                .unwrap()
+        }
+    );
+    // Await admission deterministically before testing the third connection.
+    hellas_work::test_support::within(async {
+        while service.remote_capacity.handshakes.available_permits() != MAX_CONNECTIONS - 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    let error = service.serve_iroh(accepted3).await.unwrap_err();
+    assert_eq!(error.code(), WireCode::ResourceExhausted);
+    assert_eq!(
+        service.remote_capacity.sessions.available_permits(),
+        MAX_CONNECTIONS
+    );
+    let other = Endpoint::builder(presets::Minimal).bind().await.unwrap();
+    let (owner, accepted) = tokio::join!(
+        other.connect(server.addr(), HostControl::ALPN.as_bytes()),
+        async {
+            server
+                .accept()
+                .await
+                .unwrap()
+                .accept()
+                .unwrap()
+                .await
+                .unwrap()
+        }
+    );
+    let owner_task = serve(&service, accepted);
+    let (owner, _) = connect_iroh(
+        owner.unwrap(),
+        authority(),
+        &f.secret,
+        hellas_work::node::SessionKey::Passkey(&ROOT.passkey()),
+    )
+    .await
+    .unwrap();
+    hellas_work::test_support::within(async {
+        while service.remote_capacity.sessions.available_permits() != MAX_CONNECTIONS - 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    // Once authenticated, even a full pre-auth pool cannot evict the owner.
+    let remaining = service
+        .remote_capacity
+        .handshakes
+        .clone()
+        .try_acquire_many_owned((MAX_CONNECTIONS - 2) as u32)
+        .unwrap();
+    owner
+        .get_host_status(read_request(ROOT_GRANT))
+        .await
+        .unwrap();
+    drop(remaining);
+    drop(excess);
+    drop(pending);
+    drop(pending2);
+    client.close().await;
+    other.close().await;
+    server.close().await;
+    let _ = first.await;
+    let _ = second.await;
+    let _ = owner_task.await;
 }

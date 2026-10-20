@@ -267,7 +267,8 @@ async fn local_listener_bounds_authentication_and_joins_connections_without_remo
         .unwrap();
     let held_remote = f
         .service
-        .remote_slots
+        .remote_capacity
+        .sessions
         .acquire_many((MAX_CONNECTIONS - 1) as u32)
         .await
         .unwrap();

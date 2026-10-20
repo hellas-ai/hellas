@@ -24,7 +24,8 @@ let
   originalEntrypoint = [
     (if cuda then "${entrypoint}" else "${runtime}/bin/hellas-cli")
     "serve"
-    "--await-owner"
+    "--port"
+    "31145"
   ]
   ++ pkgs.lib.optionals gpu [
     "--gpu-backend"

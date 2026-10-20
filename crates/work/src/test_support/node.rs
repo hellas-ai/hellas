@@ -161,6 +161,7 @@ impl Node {
             common_node::approval(
                 Ownership::Bootstrap {
                     root: ids::ROOT_GRANT,
+                    target: None,
                 },
                 root,
             ),

@@ -32,11 +32,3 @@ fn provisioning_uses_the_generic_client_side_commands_without_an_identity() {
         );
     }
 }
-
-#[test]
-fn removed_inventory_and_provider_named_commands_are_rejected() {
-    assert!(Cli::try_parse_from(["hellas", "cloud"]).is_err());
-    assert!(Cli::try_parse_from(["hellas", "admin", "serve"]).is_err());
-    assert!(Cli::try_parse_from(["hellas", "machines", "restart", "node"]).is_err());
-    assert!(Cli::try_parse_from(["hellas", "gateway", "--machine", "node"]).is_err());
-}

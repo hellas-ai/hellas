@@ -40,7 +40,8 @@ pub enum Error {
 }
 
 /// No owner keys or bootstrap credentials cross this interface. The pinned
-/// image boots `hellas serve --await-owner` and generates its own node identity.
+/// template explicitly opts into `hellas serve --await-owner`; the machine generates
+/// its own node identity.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateMachine {

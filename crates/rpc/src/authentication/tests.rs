@@ -19,13 +19,13 @@ fn fixture() -> (AuthorityState, CredentialSecret) {
     let root = GrantId([1; 16]);
     let owner = approve(
         ROOT,
-        Ownership::Bootstrap { root },
+        Ownership::Bootstrap { root, target: None },
         &scope,
         &scope,
         ROOT.holder(),
     );
     (
-        AuthorityState::bootstrap(root, scope, record, &owner, UnixMillis(0)).unwrap(),
+        AuthorityState::bootstrap(root, None, scope, record, &owner, UnixMillis(0)).unwrap(),
         secret,
     )
 }

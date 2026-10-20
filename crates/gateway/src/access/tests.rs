@@ -36,7 +36,10 @@ impl Fixture {
             hellas_work::model::grant::grant_network(),
             ROOT_GRANT,
             hellas_work::test_support::common_node::approval_for(
-                hellas_auth::authority::Ownership::Bootstrap { root: ROOT_GRANT },
+                hellas_auth::authority::Ownership::Bootstrap {
+                    root: ROOT_GRANT,
+                    target: None,
+                },
                 administrator.clone(),
                 administrator,
             ),

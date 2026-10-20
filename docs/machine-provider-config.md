@@ -21,3 +21,12 @@ through its normal HostControl using the invitation printed by `serve
 --await-owner` in the provider's authenticated console. If creation cannot be
 confirmed, reconcile by the requested name before retrying; a failed response
 can still correspond to an allocated, billable resource.
+
+The ordinary image does not enable bootstrap by default. Its entrypoint is
+`serve --port 31145`; configure the provider template's additional arguments as
+`--await-owner /var/lib/hellas/authority` to opt in. Preserve the persistent mount
+and publish UDP port 31145. The console's direct addresses are those visible to
+the container; where NAT changes them, use the provider's authenticated public
+UDP mapping in the invitation. Production uses the normal N0 relay configuration;
+relay-disabled endpoints are test fixtures, not an image guarantee. The public
+transport pin must remain the console-provided pin when addresses are adjusted.

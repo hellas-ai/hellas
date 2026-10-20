@@ -23,6 +23,7 @@ async fn fixture(path: &std::path::Path, admin: GrantSpec) -> (NodeCoordinator, 
         crate::test_support::common_node::approval(
             Ownership::Bootstrap {
                 root: ids::ROOT_GRANT,
+                target: None,
             },
             admin,
         ),
@@ -540,6 +541,7 @@ async fn a_provider_can_initialize_its_machine_capacity() {
         common::common_node::approval(
             Ownership::Bootstrap {
                 root: ids::ROOT_GRANT,
+                target: None,
             },
             admin,
         ),

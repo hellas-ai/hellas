@@ -62,11 +62,12 @@ impl AuthorityState {
         }
     }
 
-    /// Used only by the host's explicit offline initialization of an empty store.
+    /// Used only by the host's explicit initialization of an empty store.
     /// Ordinary startup must restore existing state, never call this on failure.
     /// `owner` is the administrator's assertion over the bootstrap digest.
     pub fn bootstrap(
         id: GrantId,
+        target: Option<[u8; 32]>,
         admin: GrantSpec,
         credential: Credential,
         owner: &PasskeyAssertion,
@@ -75,7 +76,7 @@ impl AuthorityState {
         Self::validate_administrator(&admin, now)?;
         Self::validate_initial_credential(&admin, &credential, 1, now)?;
         Self::check_owner(
-            Ownership::Bootstrap { root: id },
+            Ownership::Bootstrap { root: id, target },
             &admin,
             &credential,
             owner,

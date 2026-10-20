@@ -121,6 +121,9 @@ impl HostHandle {
         };
         let (stop, stopped) = watch::channel(false);
         let remote = transport.map(|endpoint| {
+            // A bootstrap listener admitted only HostControl. Normal service
+            // ALPNs become available after its committed authority is mounted.
+            endpoint.set_alpns(transport_alpns());
             let task = tokio::spawn(accept(
                 endpoint.clone(),
                 control.clone(),
@@ -689,21 +692,25 @@ pub async fn bind_transport(
     let mut builder = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
         .secret_key(key)
         .hooks(admission)
-        .alpns(vec![
-            hellas_rpc::services::node::Node::ALPN.as_bytes().to_vec(),
-            hellas_rpc::services::work::Work::ALPN.as_bytes().to_vec(),
-            hellas_rpc::services::work_setup::WorkSetup::ALPN
-                .as_bytes()
-                .to_vec(),
-            hellas_rpc::services::chain_sync::ChainSync::ALPN
-                .as_bytes()
-                .to_vec(),
-            HostControl::ALPN.as_bytes().to_vec(),
-        ]);
+        .alpns(transport_alpns());
     if let Some(port) = port {
         builder = builder
             .bind_addr(std::net::SocketAddr::from(([0, 0, 0, 0], port)))
             .map_err(ProviderError::from)?;
     }
     Ok(builder.bind().await.map_err(ProviderError::from)?)
+}
+
+fn transport_alpns() -> Vec<Vec<u8>> {
+    vec![
+        hellas_rpc::services::node::Node::ALPN.as_bytes().to_vec(),
+        hellas_rpc::services::work::Work::ALPN.as_bytes().to_vec(),
+        hellas_rpc::services::work_setup::WorkSetup::ALPN
+            .as_bytes()
+            .to_vec(),
+        hellas_rpc::services::chain_sync::ChainSync::ALPN
+            .as_bytes()
+            .to_vec(),
+        HostControl::ALPN.as_bytes().to_vec(),
+    ]
 }
