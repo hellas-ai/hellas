@@ -161,11 +161,11 @@ impl LocalLightClient {
                 self.consensus_info.network_id
             )));
         };
+        let slot = (response.payment_edge(), response.start_id());
         let transaction = Transaction::Kernel(hellas_kernel::Tx::move_action(
-            hellas_kernel::Move::RespondPaymentClose(response),
+            hellas_kernel::Move::RespondPaymentClose(response.clone()),
         ));
         let incoming = MempoolEntry::new(transaction);
-        let slot = (response.payment_edge(), response.start_id());
 
         // Hold one finalized reader across authentication, the resident sweep,
         // and insertion. An unauthenticated newcomer is checked before taking
@@ -270,7 +270,7 @@ impl LocalLightClient {
         let residents: Vec<PaymentCloseResponse> = mempool
             .responses
             .values()
-            .filter_map(|entry| payment_close_response(&entry.transaction).copied())
+            .filter_map(|entry| payment_close_response(&entry.transaction).cloned())
             .collect();
         for candidate in residents.iter() {
             let edge_id = candidate.payment_edge();
@@ -758,7 +758,7 @@ impl LightClient for LocalLightClient {
             match &self.ingress {
                 #[cfg(feature = "validator")]
                 TransactionIngress::Mempool(_) => {
-                    if let Some(response) = payment_close_response(&tx).copied() {
+                    if let Some(response) = payment_close_response(&tx).cloned() {
                         self.submit_response(response).await
                     } else {
                         Ok(self.submit_general(tx).await)
@@ -806,7 +806,7 @@ impl LightClient for LocalLightClient {
             coins: holdings
                 .into_iter()
                 .filter_map(|(id, object)| match object {
-                    Object::Coin(coin) => Some((id, coin.value)),
+                    Object::Coin(coin) if coin.owner == owner => Some((id, coin.value)),
                     _ => None,
                 })
                 .collect(),
@@ -825,8 +825,8 @@ impl LightClient for LocalLightClient {
                 .filter_map(|(object_id, object)| match object {
                     Object::Edge(edge) => Some(EdgeRecord {
                         object_id,
-                        maker: edge.parties().maker().into(),
-                        taker: edge.parties().taker().into(),
+                        maker: edge.parties().maker().owner().into(),
+                        taker: edge.parties().taker().owner().into(),
                     }),
                     _ => None,
                 })

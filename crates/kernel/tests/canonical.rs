@@ -5,13 +5,13 @@
 #![allow(clippy::indexing_slicing)] // tests may index; the panic-freedom lock targets src
 
 use hellas_kernel::{
-    Auth, BOND_LEASE_CHUNKS, BlockHeight, BondLease, BufferWriter, CoinId, Decode, DecodeError,
-    EarnedCertificate, EdgeId, Encode, Fees, Funding, Key, List, MAX_EDGE_OUTPUTS,
-    MAX_PARTY_INPUTS, MAX_WEBAUTHN_DATA_LENGTH, Move, Parties, Party, PayloadHash,
-    PaymentCloseResponse, PaymentCloseStart, PaymentContestCommitment, Payout, PendingPaymentClose,
-    Proof, ProtocolCode, Sig, StartId, Terms, TermsHash, Tx, WebAuthnAssertion, WebAuthnData,
-    WorkPaymentTerms, WorkStakeBondTerms, Writer, freeze_digest, no_earned_digest, response_digest,
-    settlement_commitment, start_digest, start_id,
+    Auth, Authority, BOND_LEASE_CHUNKS, BlockHeight, BondLease, BufferWriter, Coin, CoinId, Decode,
+    DecodeError, EarnedCertificate, EdgeId, Encode, Fees, Funding, Key, List, MAX_EDGE_INPUTS,
+    MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, MAX_WEBAUTHN_DATA_LENGTH, Move, Parties, Party, PartyAuth,
+    PartyKeys, PayloadHash, PaymentCloseResponse, PaymentCloseStart, PaymentContestCommitment,
+    Payout, PendingPaymentClose, Proof, ProtocolCode, Reshape, Sig, StartId, Terms, TermsHash, Tx,
+    WebAuthnAssertion, WebAuthnData, WorkPaymentTerms, WorkStakeBondTerms, Writer, freeze_digest,
+    no_earned_digest, response_digest, settlement_commitment, start_digest, start_id,
 };
 
 const NETWORK: hellas_kernel::NetworkId = match hellas_kernel::NetworkId::new("hellas-kernel-test")
@@ -46,7 +46,7 @@ fn payouts() -> List<Payout, MAX_EDGE_OUTPUTS> {
 fn terms() -> Terms {
     Terms::basic(
         ProtocolCode::new(7),
-        Parties::new(key(0x31), key(0x32)),
+        Parties::new(PartyKeys::sole(key(0x31)), PartyKeys::sole(key(0x32))),
         BlockHeight::new(101),
         payouts(),
     )
@@ -250,19 +250,46 @@ fn payout_encoding_round_trips_owner_value_and_consumed_size() {
 
     let written = payout.write_to(&mut buf);
 
-    assert_eq!(payout.encoded_size(), 2 + Key::LENGTH + 8);
-    assert_eq!(written, 2 + Key::LENGTH + 8);
+    // Envelope, owner, an absent delegate's one zero byte, value.
+    let undelegated = 2 + Key::LENGTH + 1 + 8;
+    assert_eq!(payout.encoded_size(), undelegated);
+    assert_eq!(written, undelegated);
     assert_eq!(&buf[..2], &[1, 7]);
     assert_eq!(&buf[2..2 + Key::LENGTH], owner.as_bytes());
-    assert_eq!(&buf[2 + Key::LENGTH..], &[1, 2, 3, 4, 5, 6, 7, 8]);
+    assert_eq!(buf[2 + Key::LENGTH], 0);
+    assert_eq!(
+        &buf[3 + Key::LENGTH..undelegated],
+        &[1, 2, 3, 4, 5, 6, 7, 8]
+    );
 
     let (decoded, consumed) = Payout::decode(&buf).expect("canonical payout decodes");
     assert_eq!(decoded, payout);
-    assert_eq!(consumed, 2 + Key::LENGTH + 8);
+    assert_eq!(consumed, undelegated);
 
     assert_eq!(
-        Payout::decode(&buf[..2 + Key::LENGTH + 7]),
+        Payout::decode(&buf[..undelegated - 1]),
         Err(DecodeError::InsufficientBytes { needed: 8, got: 7 }),
+    );
+
+    // A present delegate is its byte and then the key, and that is the
+    // codec maximum.
+    let delegate = Key::from_bytes([0xcd; Key::LENGTH]);
+    let delegated = Payout::delegated(owner, Some(delegate), 9);
+    let written = delegated.write_to(&mut buf);
+    assert_eq!(written, Payout::MAX_ENCODED_SIZE);
+    assert_eq!(written, undelegated + Key::LENGTH);
+    assert_eq!(buf[2 + Key::LENGTH], 1);
+    assert_eq!(
+        &buf[3 + Key::LENGTH..3 + 2 * Key::LENGTH],
+        delegate.as_bytes()
+    );
+    assert_eq!(Payout::decode_exact(&buf[..written]), Ok(delegated));
+
+    // The presence byte has two spellings, not three.
+    buf[2 + Key::LENGTH] = 2;
+    assert_eq!(
+        Payout::decode_exact(&buf[..written]),
+        Err(DecodeError::InvalidTag { tag: 2 }),
     );
 }
 
@@ -274,7 +301,7 @@ fn bounded_list_of_payouts_uses_actual_live_encoded_size() {
 
     assert_eq!(
         outputs.encoded_size(),
-        <usize as Encode>::MAX_ENCODED_SIZE + 3 * Payout::MAX_ENCODED_SIZE,
+        <usize as Encode>::MAX_ENCODED_SIZE + 3 * (Payout::MAX_ENCODED_SIZE - Key::LENGTH),
     );
 }
 
@@ -288,7 +315,7 @@ fn full_transaction_graph_and_persistence_values_round_trip_exactly() {
     let mut height_buf = [0; BlockHeight::MAX_ENCODED_SIZE + 1];
     assert_canonical_round_trip(&height, &mut height_buf);
 
-    let parties = Parties::new(key(1), key(2));
+    let parties = Parties::new(PartyKeys::sole(key(1)), PartyKeys::sole(key(2)));
     let mut parties_buf = [0; Parties::MAX_ENCODED_SIZE + 1];
     assert_canonical_round_trip(&parties, &mut parties_buf);
 
@@ -316,7 +343,10 @@ fn full_transaction_graph_and_persistence_values_round_trip_exactly() {
     let mut terms_buf = [0; Terms::MAX_ENCODED_SIZE + 1];
     assert_canonical_round_trip(&terms, &mut terms_buf);
 
-    let mutual = Proof::mutual(native_auth(7), native_auth(8));
+    let mutual = Proof::mutual(
+        PartyAuth::owner(native_auth(7)),
+        PartyAuth::owner(native_auth(8)),
+    );
     let mut mutual_buf = [0; Proof::MAX_ENCODED_SIZE + 1];
     assert_canonical_round_trip(&mutual, &mut mutual_buf);
 
@@ -330,7 +360,12 @@ fn full_transaction_graph_and_persistence_values_round_trip_exactly() {
     let mut adjudicated_buf = [0; Proof::MAX_ENCODED_SIZE + 1];
     assert_canonical_round_trip(&adjudicated, &mut adjudicated_buf);
 
-    let open = Tx::open(funding, terms.clone(), native_auth(9), webauthn.clone());
+    let open = Tx::open(
+        funding,
+        terms.clone(),
+        PartyAuth::owner(native_auth(9)),
+        PartyAuth::owner(webauthn.clone()),
+    );
     let mut open_buf = [0; Tx::MAX_ENCODED_SIZE + 1];
     assert_canonical_round_trip(&open, &mut open_buf);
 
@@ -398,7 +433,11 @@ fn composite_types_have_distinct_versioned_domain_tags() {
 
     assert_tag!(BlockHeight::new(1), BlockHeight, 1);
     assert_tag!(Fees::ZERO, Fees, 2);
-    assert_tag!(Parties::new(key(1), key(2)), Parties, 3);
+    assert_tag!(
+        Parties::new(PartyKeys::sole(key(1)), PartyKeys::sole(key(2))),
+        Parties,
+        3
+    );
     assert_tag!(funding(), Funding, 6);
     assert_tag!(Payout::new(key(3), 4), Payout, 7);
     assert_tag!(webauthn_assertion(), WebAuthnAssertion, 9);
@@ -550,7 +589,12 @@ fn maximum_bounded_lists_reach_their_declared_codec_bounds() {
     let max_terms = Terms::work_payment(widest_work_payment());
     assert_eq!(max_terms.encoded_size(), Terms::MAX_ENCODED_SIZE);
 
-    let tx = Tx::open(funding, max_terms, auth.clone(), auth);
+    let tx = Tx::open(
+        funding,
+        max_terms,
+        PartyAuth::owner(auth.clone()),
+        PartyAuth::owner(auth),
+    );
     assert_eq!(tx.encoded_size(), Tx::MAX_ENCODED_SIZE);
     let mut buf = [0; Tx::MAX_ENCODED_SIZE];
     assert_eq!(tx.write_to(&mut buf), Tx::MAX_ENCODED_SIZE);
@@ -587,15 +631,23 @@ fn arbitrary_transaction_bytes_never_panic_the_decoder() {
     }
 }
 
-/// Widest possible terms: a work payment whose embedded bond carries a
-/// full timeout payout list.
+/// Widest possible terms: a work payment whose embedded bond commits a
+/// signer and a payout delegate for both parties, and carries a full
+/// timeout payout list of delegated payouts.
 const fn widest_work_payment() -> WorkPaymentTerms {
     let provider = key(0x51);
+    let provider_node = key(0x56);
     let client = key(0x52);
+    let client_node = key(0x57);
     let bond = WorkStakeBondTerms {
-        parties: Parties::new(provider, client),
+        parties: Parties::new(
+            PartyKeys::new(provider, provider_node, Some(provider_node)),
+            PartyKeys::new(client, client_node, Some(client_node)),
+        ),
         timeout: BlockHeight::new(200),
-        timeout_outputs: List::all([Payout::new(provider, 10); MAX_EDGE_OUTPUTS]),
+        timeout_outputs: List::all(
+            [Payout::delegated(provider, Some(provider_node), 10); MAX_EDGE_OUTPUTS],
+        ),
         max_job_price: 6,
     };
     WorkPaymentTerms {
@@ -609,21 +661,28 @@ const fn widest_work_payment() -> WorkPaymentTerms {
 }
 
 /// The owned maxima every stack buffer and chain payload bound is sized
-/// from. They have moved twice: up when the work profiles landed, which
-/// took `Terms` from 335 to 555 bytes, and back down when the cutover
-/// reduced the stake surface to one body, which took it to 360. A silent
-/// third move would resize chain transaction buffers.
+/// from. They have moved three times: up when the work profiles landed,
+/// which took `Terms` from 335 to 555 bytes, back down when the cutover
+/// reduced the stake surface to one body, which took it to 360, and up
+/// to 630 when parties gained a signer and a payout delegate. A silent
+/// fourth move would resize chain transaction buffers.
 #[test]
 fn owned_terms_and_transaction_maxima_are_pinned() {
     assert_eq!(Terms::MAX_ENCODED_SIZE, TERMS_MAX);
     assert_eq!(Tx::MAX_ENCODED_SIZE, TX_MAX);
-    assert_eq!(terms().encoded_size(), 176);
+    assert_eq!(terms().encoded_size(), 246);
 }
 
 /// The widest owned bodies. Every stack buffer and chain payload bound
 /// is sized from these two numbers.
-const TERMS_MAX: usize = 360;
-const TX_MAX: usize = 5_015;
+///
+/// The identity cutover moved both: each party now commits an owner, a
+/// signer and an optional payout delegate (67 to 100 bytes a side), each
+/// payout an optional delegate, and each party witness an authority
+/// byte inside its own envelope. The widest transaction is still the
+/// open, now carrying two maximal `WebAuthn` party witnesses.
+const TERMS_MAX: usize = 630;
+const TX_MAX: usize = 5_291;
 
 /// `Terms::decode` recomputes the terms commitment, and a work payment
 /// recomputes its embedded bond's commitment too. `SingleChunkHasher`
@@ -636,7 +695,7 @@ fn the_widest_terms_preimage_stays_inside_one_xet_chunk() {
     assert_eq!(terms.encoded_size(), Terms::MAX_ENCODED_SIZE);
 
     // Longest domain separator any terms body is hashed under.
-    let longest_domain = b"hellas.terms.work-stake-bond.v3".len();
+    let longest_domain = b"hellas.terms.work-stake-bond.v4".len();
     assert!(longest_domain + Terms::MAX_ENCODED_SIZE < hellas_xet::MIN_CHUNK_SIZE);
 
     let mut buf = [0; Terms::MAX_ENCODED_SIZE];
@@ -649,11 +708,11 @@ fn the_widest_terms_preimage_stays_inside_one_xet_chunk() {
 /// an edit that moves either one is a consensus break, not a refactor.
 #[test]
 fn basic_terms_encoding_is_byte_identical() {
-    const BASIC_BYTES: &str = "010b00070103313131313131313131313131313131313131313131313131313131313131313131323232323232323232323232323232323232323232323232323232323232323232010100000000000000650000000000000002010731313131313131313131313131313131313131313131313131313131313131313100000000000000290107323232323232323232323232323232323232323232323232323232323232323232000000000000003b";
-    const BASIC_HASH: &str = "f868ca23d33933194d51959382aafa5786d6b41020b113880d4bdec094214f3b";
+    const BASIC_BYTES: &str = "010b0007010331313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313100323232323232323232323232323232323232323232323232323232323232323232323232323232323232323232323232323232323232323232323232323232323232000101000000000000006500000000000000020107313131313131313131313131313131313131313131313131313131313131313131000000000000000029010732323232323232323232323232323232323232323232323232323232323232323200000000000000003b";
+    const BASIC_HASH: &str = "8544185735b8328460c568236772fdbf7397fdcc56f80a11818b231531105766";
     let basic = Terms::basic(
         ProtocolCode::new(7),
-        Parties::new(key(0x31), key(0x32)),
+        Parties::new(PartyKeys::sole(key(0x31)), PartyKeys::sole(key(0x32))),
         BlockHeight::new(101),
         payouts(),
     );
@@ -706,14 +765,14 @@ fn golden_certificate() -> EarnedCertificate {
     EarnedCertificate::new(golden_edge(), golden_terms_hash(), 4_242)
 }
 
-fn golden_start(certificate: Option<(EarnedCertificate, Sig)>) -> PaymentCloseStart {
+fn golden_start(certificate: Option<(EarnedCertificate, PartyAuth)>) -> PaymentCloseStart {
     PaymentCloseStart::new(
         golden_edge(),
         Terms::work_payment(widest_work_payment()),
         Party::Taker,
         (900, 907),
         certificate,
-        Sig::from_bytes([0x77; Sig::LENGTH]),
+        PartyAuth::owner(Sig::from_bytes([0x77; Sig::LENGTH])),
     )
 }
 
@@ -722,18 +781,22 @@ fn golden_response() -> PaymentCloseResponse {
         golden_edge(),
         StartId::from_bytes([0x33; StartId::LENGTH]),
         Party::Taker,
-        (golden_certificate(), Sig::from_bytes([0x66; Sig::LENGTH])),
-        Sig::from_bytes([0x77; Sig::LENGTH]),
+        (
+            golden_certificate(),
+            PartyAuth::owner(Sig::from_bytes([0x66; Sig::LENGTH])),
+        ),
+        PartyAuth::owner(Sig::from_bytes([0x77; Sig::LENGTH])),
     )
 }
 
 /// The stored contest record every record and seal golden is taken from.
 ///
 /// Its three u64s are pairwise distinct — deadline 907, start 4,242,
-/// final 4,243 — and its two flags disagree, so any pair of neighbouring
-/// fields exchanged in the layout or in the seal preimage moves a value
-/// some assertion below names.
-const GOLDEN_PENDING_RECORD: &str = "0117021111111111111111111111111111111111111111111111111111111111111111013333333333333333333333333333333333333333333333333333333333333333000000000000038b0000000000001092000000000000109301000000000000000011";
+/// final 4,243 — and its neighbouring flags disagree (responded, no
+/// penalty; then the bond; then owner-signed), so any pair of
+/// neighbouring fields exchanged in the layout or in the seal preimage
+/// moves a value some assertion below names.
+const GOLDEN_PENDING_RECORD: &str = "0117031111111111111111111111111111111111111111111111111111111111111111013333333333333333333333333333333333333333333333333333333333333333000000000000038b000000000000109200000000000010930100000000000000001101";
 
 /// The record those bytes spell.
 ///
@@ -777,6 +840,7 @@ fn payment_close_pending_record_bytes_are_pinned() {
     assert!(record.responded());
     assert!(!record.penalty_due());
     assert_eq!(record.penalty_amount(), 17);
+    assert!(record.owner_signed());
 
     // And the encoder puts them back exactly where they were found.
     let mut buf = [0; PendingPaymentClose::ENCODED_SIZE];
@@ -799,31 +863,37 @@ fn payment_close_wire_widths_are_pinned() {
 
     // A start carries the complete revealed payment terms, so its
     // maximum is the widest terms plus its own fields.
-    let present = golden_start(Some((certificate, Sig::from_bytes([0x66; Sig::LENGTH]))));
-    assert_eq!(present.encoded_size(), 616);
-    assert_eq!(PaymentCloseStart::MAX_ENCODED_SIZE, 616);
-    // Absence encodes neither conditional field: 75 + 64 bytes shorter.
-    assert_eq!(golden_start(None).encoded_size(), 616 - 75 - 64);
+    let present = golden_start(Some((
+        certificate,
+        PartyAuth::owner(Sig::from_bytes([0x66; Sig::LENGTH])),
+    )));
+    // Each native party witness is 70 bytes: its envelope, the
+    // authority byte, and the 67-byte native `Auth`.
+    assert_eq!(present.encoded_size(), 898);
+    // The maximum carries two maximal `WebAuthn` witnesses instead.
+    assert_eq!(PaymentCloseStart::MAX_ENCODED_SIZE, 5_142);
+    // Absence encodes neither conditional field: 75 + 70 bytes shorter.
+    assert_eq!(golden_start(None).encoded_size(), 898 - 75 - 70);
 
     let response = golden_response();
-    assert_eq!(response.encoded_size(), 271);
-    assert_eq!(PaymentCloseResponse::MAX_ENCODED_SIZE, 271);
+    assert_eq!(response.encoded_size(), 283);
+    assert_eq!(PaymentCloseResponse::MAX_ENCODED_SIZE, 4_527);
 
     // The nested dispatch adds the outer `Tx` envelope and its variant
     // byte, and nothing else: the action's own tag is what selects it.
     let start_tx = Tx::move_action(Move::StartPaymentClose(present));
     let response_tx = Tx::move_action(Move::RespondPaymentClose(response));
-    assert_eq!(start_tx.encoded_size(), 619);
-    assert_eq!(response_tx.encoded_size(), 274);
+    assert_eq!(start_tx.encoded_size(), 901);
+    assert_eq!(response_tx.encoded_size(), 286);
 
     let freeze = Proof::freeze(
         7,
         (900, 907),
-        Sig::from_bytes([0x66; Sig::LENGTH]),
-        Sig::from_bytes([0x77; Sig::LENGTH]),
+        PartyAuth::owner(Sig::from_bytes([0x66; Sig::LENGTH])),
+        PartyAuth::owner(Sig::from_bytes([0x77; Sig::LENGTH])),
     );
     let adjudicated = Proof::adjudicated(PaymentContestCommitment::from_bytes([0x88; 32]));
-    assert_eq!(freeze.encoded_size(), 155);
+    assert_eq!(freeze.encoded_size(), 167);
     assert_eq!(adjudicated.encoded_size(), 35);
 
     let mut split = [Payout::default(); MAX_EDGE_OUTPUTS];
@@ -832,15 +902,15 @@ fn payment_close_wire_widths_are_pinned() {
     let split = List::take(split, 2);
     assert_eq!(
         Tx::close(golden_edge(), freeze, split.clone()).encoded_size(),
-        284,
+        298,
     );
     assert_eq!(
         Tx::close(golden_edge(), adjudicated, split).encoded_size(),
-        164,
+        166,
     );
 
-    // The owned maxima are unchanged by the move arm: a start is 619
-    // bytes against the ceiling the open arm sets.
+    // The owned maxima are unchanged by the move arm: a start is at most
+    // 5,145 bytes against the ceiling the open arm sets.
     assert_eq!(Terms::MAX_ENCODED_SIZE, TERMS_MAX);
     assert_eq!(Tx::MAX_ENCODED_SIZE, TX_MAX);
 }
@@ -848,7 +918,10 @@ fn payment_close_wire_widths_are_pinned() {
 /// Round trips through the exact wire, including the nested dispatch.
 #[test]
 fn payment_close_bodies_round_trip_through_the_move_envelope() {
-    let certificate = (golden_certificate(), Sig::from_bytes([0x66; Sig::LENGTH]));
+    let certificate = (
+        golden_certificate(),
+        PartyAuth::owner(Sig::from_bytes([0x66; Sig::LENGTH])),
+    );
     let cases = [
         Tx::move_action(Move::StartPaymentClose(golden_start(Some(certificate)))),
         Tx::move_action(Move::StartPaymentClose(golden_start(None))),
@@ -906,14 +979,14 @@ fn an_unassigned_move_tag_is_rejected() {
 /// changed domain is a consensus break rather than a refactor.
 #[test]
 fn payment_close_digests_are_pinned() {
-    const EARNED: &str = "efaebccb3b8dae5bb2ebdc3aed9cc62f77fc2807593597ca9ec028783c30d4f8";
-    const NO_EARNED: &str = "bf9a0a3fd7bcf8ded8c6df3a99611faaa24fb4baa8d2d8380fd8225c06c19e96";
-    const SETTLEMENT: &str = "a8e6e24c24e14eb6ca4b179431b64520c5da833e85db20f6659689383d6e7634";
-    const START: &str = "aa5542a8a429fa7e2c847579c88255a5ec41b251bd722fc10c3a7835ddefd6c5";
-    const START_ID: &str = "ed37dee622a84ec77220ca81122978023451fde519e6b0ce97b903dcdf7a615e";
-    const RESPONSE: &str = "7cf8b8d0296d911b2addbe3c9e968230644e78d443ce4e40467f2658e46ded76";
-    const FREEZE: &str = "e872443259af9e87915ab5aa87b08400d52d65592c6c4ea9d830f6d2c6bcc437";
-    const CONTEST: &str = "ef33b7b7fb8c96c08bd35781060203fbe91d405eaa6f8ee29ccb83364ae7c986";
+    const EARNED: &str = "58e07a6b410528c13bf7bee08ad6479013aec69c93decfa4198d4637ce1f86cf";
+    const NO_EARNED: &str = "a03d8875c77877f17b9a53a42dcd382d5bc7872ed5850bdc658b45be951cf420";
+    const SETTLEMENT: &str = "615cab1d79ed09aae8800fc5693254584d457d086274c6b5a3e151eccec77177";
+    const START: &str = "d73a97a117c9f7995b87461baa84b5bab7e4f029b3cf3649a2362449941216e2";
+    const START_ID: &str = "bc7bb08d13ccc5898f8b02935ebf60052f32e9f35456f400fd18845310081fa8";
+    const RESPONSE: &str = "b8e34b3c4e176af4b4d1ce34388aa2006120e4e2c6d1a90c957b4a548f30d679";
+    const FREEZE: &str = "d9884b2aeb703634ddd5037ba31a5f8cf0661e99517572f2782cb4d592fe46a9";
+    const CONTEST: &str = "2cf9333d35b5994ba82ea2ea3252aa2acc502265090c11d7102732aaa325f8ca";
 
     let edge = golden_edge();
     let terms = golden_terms_hash();
@@ -1053,4 +1126,236 @@ fn a_lease_decodes_only_under_its_own_tag_and_version() {
         BondLease::decode_exact(&bytes[..BondLease::ENCODED_SIZE - 1]),
         Err(DecodeError::InsufficientBytes { needed: 8, got: 7 }),
     );
+}
+
+// ── Delegation wire ───────────────────────────────────────────────────
+//
+// Every byte the identity cutover added to consensus, pinned before any
+// rule reads it: the witness classes, the delegate a coin and a payout
+// carry, the keys a party commits, the owner transaction and the two
+// hashes it is bound by. The domains behind those hashes are pinned
+// through them: a domain string that moved would move every digest here.
+
+/// The two authority bytes and the two witness curves. A P-256 and a
+/// secp256k1 key are both 33 bytes, so the only things telling the
+/// verifier which key and which curve a witness claims are these tags.
+#[test]
+fn party_witness_role_and_curve_tags_are_pinned() {
+    assert_eq!(Authority::Owner.tag(), 0);
+    assert_eq!(Authority::Signer.tag(), 1);
+    assert_eq!(Party::Maker.tag(), 0);
+    assert_eq!(Party::Taker.tag(), 1);
+
+    let sig = Sig::from_bytes([0x5a; Sig::LENGTH]);
+    let mut buf = [0; PartyAuth::MAX_ENCODED_SIZE];
+
+    // Envelope (format 1, tag 32), authority, then the `Auth` envelope
+    // (tag 10) whose variant byte is the curve: 0 native secp256k1.
+    let owner = PartyAuth::owner(sig);
+    let written = owner.write_to(&mut buf);
+    assert_hex(
+        &buf[..written],
+        concat!(
+            "01200001",
+            "0a00",
+            "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+            "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+        ),
+    );
+    assert_eq!(PartyAuth::decode_exact(&buf[..written]), Ok(owner));
+
+    let signer = PartyAuth::signer(sig);
+    let written = signer.write_to(&mut buf);
+    assert_eq!(&buf[..5], &[1, 32, 1, 1, 10]);
+    assert_eq!(buf[5], 0, "native secp256k1 curve tag");
+    assert_eq!(PartyAuth::decode_exact(&buf[..written]), Ok(signer));
+
+    // 1 is the P-256 `WebAuthn` curve tag.
+    let passkey = PartyAuth::owner(Auth::webauthn(WebAuthnAssertion::new(
+        [1; 32],
+        [2; 32],
+        [3; 32],
+        [4; 32],
+        List::take([9; MAX_WEBAUTHN_DATA_LENGTH], 3),
+    )));
+    let written = passkey.write_to(&mut buf);
+    assert_eq!(&buf[..6], &[1, 32, 0, 1, 10, 1]);
+    assert_eq!(PartyAuth::decode_exact(&buf[..written]), Ok(passkey));
+
+    // No third authority.
+    buf[2] = 2;
+    assert_eq!(
+        PartyAuth::decode_exact(&buf[..written]),
+        Err(DecodeError::InvalidTag { tag: 2 }),
+    );
+}
+
+/// A coin's delegate is one presence byte, then the key only when it is
+/// present: absence has one spelling, and it is never a present all-zero
+/// key.
+#[test]
+fn coin_bytes_are_pinned_with_and_without_a_delegate() {
+    let mut buf = [0; Coin::MAX_ENCODED_SIZE];
+
+    let owned = Coin::issue(key(0x31), None, 7);
+    let written = owned.write_to(&mut buf);
+    assert_eq!(written, Coin::MAX_ENCODED_SIZE - Key::LENGTH);
+    assert_hex(
+        &buf[..written],
+        "0104313131313131313131313131313131313131313131313131313131313131313131000000000000000007",
+    );
+    assert_eq!(Coin::decode_exact(&buf[..written]), Ok(owned));
+
+    let delegated = Coin::issue(key(0x31), Some(key(0x41)), 7);
+    let written = delegated.write_to(&mut buf);
+    assert_eq!(written, Coin::MAX_ENCODED_SIZE);
+    assert_eq!(Coin::MAX_ENCODED_SIZE, 77);
+    assert_hex(
+        &buf[..written],
+        "0104313131313131313131313131313131313131313131313131313131313131313131014141414141414141414141414141414141414141414141414141414141414141410000000000000007",
+    );
+    assert_eq!(Coin::decode_exact(&buf[..written]), Ok(delegated));
+
+    // Delegate presence admits exactly its two values.
+    buf[2 + Key::LENGTH] = 2;
+    assert_eq!(
+        Coin::decode_exact(&buf[..written]),
+        Err(DecodeError::InvalidTag { tag: 2 }),
+    );
+}
+
+/// Each party commits `owner ‖ signer ‖ payout_delegate`, maker first.
+/// Every key here is distinct, so a layout that swapped two of them
+/// moves a byte.
+#[test]
+fn party_keys_bytes_are_pinned() {
+    let parties = Parties::new(
+        PartyKeys::new(key(0x31), key(0x41), Some(key(0x51))),
+        PartyKeys::new(key(0x32), key(0x42), None),
+    );
+    let mut buf = [0; Parties::MAX_ENCODED_SIZE];
+    let written = parties.write_to(&mut buf);
+    assert_eq!(written, Parties::MAX_ENCODED_SIZE - Key::LENGTH);
+    assert_eq!(Parties::MAX_ENCODED_SIZE, 202);
+    assert_hex(
+        &buf[..written],
+        concat!(
+            "0103",
+            "313131313131313131313131313131313131313131313131313131313131313131",
+            "414141414141414141414141414141414141414141414141414141414141414141",
+            "01515151515151515151515151515151515151515151515151515151515151515151",
+            "323232323232323232323232323232323232323232323232323232323232323232",
+            "424242424242424242424242424242424242424242424242424242424242424242",
+            "00",
+        ),
+    );
+    assert_eq!(Parties::decode_exact(&buf[..written]), Ok(parties));
+    assert_eq!(parties.maker().owner(), key(0x31));
+    assert_eq!(parties.maker().signer(), key(0x41));
+    assert_eq!(parties.maker().payout_delegate(), Some(key(0x51)));
+    assert_eq!(parties.taker().payout_delegate(), None);
+}
+
+/// The two terms domains that are not pinned through the basic golden:
+/// a work payment's hash and the embedded bond's, which the payment
+/// names by.
+#[test]
+fn work_terms_hashes_are_pinned() {
+    let payment = widest_work_payment();
+    assert_hex(
+        &Terms::work_payment(payment.clone()).hash().to_bytes(),
+        "a027be73e947101d97c4c1bbc542aabf05f007b4da3c5d51f8299ba1344d8a07",
+    );
+    assert_hex(
+        &payment.bond_terms_hash().to_bytes(),
+        "a73c777546a3bff014c3fb3c1138acae228648b102fefdae31b1458269e7a954",
+    );
+}
+
+const fn golden_reshape_inputs() -> List<CoinId, MAX_EDGE_INPUTS> {
+    List::take(
+        [
+            CoinId::from_bytes([0x61; CoinId::LENGTH]),
+            CoinId::from_bytes([0x62; CoinId::LENGTH]),
+            CoinId::from_bytes([0; CoinId::LENGTH]),
+            CoinId::from_bytes([0; CoinId::LENGTH]),
+            CoinId::from_bytes([0; CoinId::LENGTH]),
+            CoinId::from_bytes([0; CoinId::LENGTH]),
+            CoinId::from_bytes([0; CoinId::LENGTH]),
+            CoinId::from_bytes([0; CoinId::LENGTH]),
+        ],
+        2,
+    )
+}
+
+fn golden_reshape_outputs() -> List<Payout, MAX_EDGE_OUTPUTS> {
+    let mut outputs = [Payout::default(); MAX_EDGE_OUTPUTS];
+    outputs[0] = Payout::delegated(key(0x31), Some(key(0x41)), 11);
+    outputs[1] = Payout::new(key(0x71), 22);
+    List::take(outputs, 2)
+}
+
+/// The owner transaction: tag 3, its inputs, its outputs, its owner's
+/// `Auth`. And the two hashes that bind it — the payload the owner signs
+/// and the ids of the coins it issues — which pin `OWNER_RESHAPE` and
+/// `COIN_RESHAPE`.
+#[test]
+fn reshape_bytes_and_hashes_are_pinned() {
+    let inputs = golden_reshape_inputs();
+    let outputs = golden_reshape_outputs();
+    let tx = Tx::Owner(Reshape::new(
+        inputs.clone(),
+        outputs.clone(),
+        Auth::native(Sig::from_bytes([0x5a; Sig::LENGTH])),
+    ));
+    let mut buf = [0; Tx::MAX_ENCODED_SIZE];
+    let written = tx.write_to(&mut buf);
+    assert_hex(
+        &buf[..written],
+        concat!(
+            // Tx envelope, owner variant 3.
+            "010d03",
+            // Two input ids.
+            "0000000000000002",
+            "6161616161616161616161616161616161616161616161616161616161616161",
+            "6262626262626262626262626262626262626262626262626262626262626262",
+            // Two payouts: delegated, then undelegated.
+            "0000000000000002",
+            "0107313131313131313131313131313131313131313131313131313131313131313131",
+            "01414141414141414141414141414141414141414141414141414141414141414141",
+            "000000000000000b",
+            "0107717171717171717171717171717171717171717171717171717171717171717171",
+            "00",
+            "0000000000000016",
+            // The owner's native `Auth`.
+            "010a00",
+            "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+            "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+        ),
+    );
+    assert_eq!(Tx::decode_exact(&buf[..written]), Ok(tx));
+
+    assert_hex(
+        &Reshape::payload_hash(NETWORK, &inputs, &outputs).to_bytes(),
+        "59bdc47623d9a71282ae3e284506291d20a4f140c7bcc74ae2e942470f069e8a",
+    );
+    let ids = Reshape::output_ids(NETWORK, &inputs, &outputs);
+    assert_eq!(ids.len(), 2);
+    assert_hex(
+        &ids.as_slice()[0].to_bytes(),
+        "e04b82c053e104cd191bdd1b9d59beec7fbd37d1f6cc44ed549d8bad79d61b9e",
+    );
+    assert_hex(
+        &ids.as_slice()[1].to_bytes(),
+        "ad2e50c146e621002541ffb835ae3732715e0f4e7a806c1cfc6b4e3cd042111b",
+    );
+
+    // The payload is network-bound; the ids are too, so a reshape on one
+    // network issues no coin another network could have named.
+    let other = hellas_kernel::NetworkId::new("hellas-kernel-other").expect("legal id");
+    assert_ne!(
+        Reshape::payload_hash(other, &inputs, &outputs),
+        Reshape::payload_hash(NETWORK, &inputs, &outputs),
+    );
+    assert_ne!(Reshape::output_ids(other, &inputs, &outputs), ids);
 }

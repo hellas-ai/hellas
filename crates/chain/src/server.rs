@@ -1,8 +1,4 @@
-use crate::domain::Bounded;
-use crate::domain::{
-    Address, Coin, DecodeExt, Digest, MAX_MERGE_INPUTS, ObjectId, SettlementKey, Transaction,
-    UserPublicKey, UserSignature, WebAuthnSignature,
-};
+use crate::domain::{Coin, Digest, SettlementKey, Transaction};
 use crate::{
     ConsensusActivity, ConsensusInfo, EdgeLookup, EdgeState, FinalizedBlock, FinalizedBlockQuery,
     LatestBlock, LightClient as LightClientApi, MAX_CANONICAL_TRANSACTION_BYTES, OwnerEdges,
@@ -18,10 +14,9 @@ use hellas_rpc::pb::{
         GetCoinResponse, GetCoinsByOwnerResponse, GetConsensusInfoResponse, GetEdgeResponse,
         GetEdgesByOwnerResponse, GetFinalizationResponse, GetFinalizedBlockResponse,
         GetLatestBlockResponse, GetProofResponse, GetRelayInfoResponse, GetStateRootResponse,
-        GetValidatorsResponse, KernelFees, MergeCoinTx, NotarizationEvent, NotarizeEvent,
-        NullificationEvent, NullifyEvent, SubmitTxOutcome as ProtoSubmitTxOutcome,
-        SubmitTxResponse, SubmitWorkResponseRequest, TransferTx,
-        WebAuthnSignature as ProtoWebAuthnSignature, activity_event, submit_tx_request,
+        GetValidatorsResponse, KernelFees, NotarizationEvent, NotarizeEvent, NullificationEvent,
+        NullifyEvent, SubmitTxOutcome as ProtoSubmitTxOutcome, SubmitTxResponse,
+        SubmitWorkResponseRequest, activity_event, submit_tx_request,
     },
     services::light_client::{LightClientHandler, LightClientServer},
 };
@@ -508,17 +503,6 @@ fn digest_from_bytes(bytes: Vec<u8>, field: &'static str) -> Result<Digest, Wire
     Ok(Digest::from(raw))
 }
 
-fn address_from_bytes(bytes: Vec<u8>, field: &'static str) -> Result<Address, WireStatus> {
-    UserPublicKey::decode(bytes.as_slice())
-        .map(Address::from)
-        .map_err(|_| {
-            WireStatus::new(
-                WireCode::InvalidArgument,
-                format!("{field} must be a valid public key"),
-            )
-        })
-}
-
 fn settlement_key_from_bytes(
     bytes: Vec<u8>,
     field: &'static str,
@@ -531,40 +515,6 @@ fn settlement_key_from_bytes(
         )
     })?;
     Ok(SettlementKey::from_bytes(raw))
-}
-
-fn user_signature_from_der(bytes: &[u8]) -> Result<UserSignature, WireStatus> {
-    let signature = hellas_webauthn::signature_from_der(bytes).map_err(|_| {
-        WireStatus::new(
-            WireCode::InvalidArgument,
-            "signature must be valid DER-encoded P-256 ECDSA",
-        )
-    })?;
-    UserSignature::decode(signature.as_slice()).map_err(|_| {
-        WireStatus::new(
-            WireCode::InvalidArgument,
-            "signature must be a valid low-S P-256 signature",
-        )
-    })
-}
-
-fn webauthn_signature_from_proto(
-    signature: Option<ProtoWebAuthnSignature>,
-) -> Result<WebAuthnSignature, WireStatus> {
-    let signature = signature
-        .ok_or_else(|| WireStatus::new(WireCode::InvalidArgument, "missing WebAuthn signature"))?;
-    let user_signature = user_signature_from_der(&signature.ecdsa_signature)?;
-    WebAuthnSignature::new(
-        user_signature,
-        &signature.authenticator_data,
-        &signature.client_data_json,
-    )
-    .ok_or_else(|| {
-        WireStatus::new(
-            WireCode::InvalidArgument,
-            "invalid WebAuthn signature payload",
-        )
-    })
 }
 
 fn submit_tx_outcome_to_proto(outcome: SubmitTxOutcome) -> ProtoSubmitTxOutcome {
@@ -591,8 +541,6 @@ fn transaction_from_proto(request: pb::SubmitTxRequest) -> Result<Transaction, W
         .tx
         .ok_or_else(|| WireStatus::new(WireCode::InvalidArgument, "missing transaction"))?
     {
-        submit_tx_request::Tx::Transfer(tx) => transfer_from_proto(tx),
-        submit_tx_request::Tx::MergeCoin(tx) => merge_from_proto(tx),
         submit_tx_request::Tx::KernelTx(bytes) => kernel_from_proto(&bytes),
     }
 }
@@ -608,54 +556,21 @@ fn kernel_from_proto(bytes: &[u8]) -> Result<Transaction, WireStatus> {
         })
 }
 
-fn transfer_from_proto(tx: TransferTx) -> Result<Transaction, WireStatus> {
-    Ok(Transaction::Transfer {
-        input: digest_from_bytes(tx.input, "input")?,
-        recipient: address_from_bytes(tx.recipient, "recipient")?,
-        amount: tx.amount,
-        signature: webauthn_signature_from_proto(tx.signature)?,
-    })
-}
-
-fn merge_from_proto(tx: MergeCoinTx) -> Result<Transaction, WireStatus> {
-    if tx.inputs.len() < 2 {
-        return Err(WireStatus::new(
-            WireCode::InvalidArgument,
-            "merge requires at least 2 inputs",
-        ));
-    }
-    if tx.inputs.len() > MAX_MERGE_INPUTS {
-        return Err(WireStatus::new(
-            WireCode::InvalidArgument,
-            format!("merge supports at most {MAX_MERGE_INPUTS} inputs"),
-        ));
-    }
-    let len = tx.inputs.len();
-    let mut inputs = [ObjectId::from([0; 32]); MAX_MERGE_INPUTS];
-    for (index, input) in tx.inputs.into_iter().enumerate() {
-        inputs[index] = digest_from_bytes(input, "input")?;
-    }
-    let inputs = Bounded::new(inputs, len).ok_or_else(|| {
-        WireStatus::new(
-            WireCode::InvalidArgument,
-            "merge input count exceeds capacity",
-        )
-    })?;
-    Ok(Transaction::MergeCoin {
-        inputs,
-        signature: webauthn_signature_from_proto(tx.signature)?,
-    })
-}
-
 fn coin_response(coin: Option<Coin>) -> GetCoinResponse {
     match coin {
-        Some(Coin { owner, value }) => GetCoinResponse {
+        Some(Coin {
+            owner,
+            delegate,
+            value,
+        }) => GetCoinResponse {
             owner: Some(owner.to_bytes().to_vec()),
             value: Some(value),
+            delegate: delegate.map(|delegate| delegate.to_bytes().to_vec()),
         },
         None => GetCoinResponse {
             owner: None,
             value: None,
+            delegate: None,
         },
     }
 }

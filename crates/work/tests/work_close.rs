@@ -20,7 +20,7 @@ use support::temp;
 
 use hellas_auth::Digest;
 use hellas_kernel::{
-    Edge, EdgeId, LeaseSlots, List, MAX_EDGE_OUTPUTS, Party, PaymentCloseStart, Payout,
+    Edge, EdgeId, LeaseSlots, List, MAX_EDGE_OUTPUTS, Party, PartyAuth, PaymentCloseStart, Payout,
     PendingSlot, RegistryChunk, RegistryNamespace, RegistryRecordTag, Secp256k1Verifier, Terms,
 };
 use hellas_rpc::OutputEventEnvelope;
@@ -353,7 +353,7 @@ fn pending_bytes(record: &Contest) -> Vec<u8> {
     // envelope: canonical format version 1, type tag 23.
     let mut value = vec![1_u8, 23];
     // body version.
-    value.push(2);
+    value.push(3);
     value.extend_from_slice(&payment_edge().to_bytes());
     // opener_role: the taker, which on a payment edge is the provider.
     value.push(1);
@@ -364,6 +364,8 @@ fn pending_bytes(record: &Contest) -> Vec<u8> {
     value.push(u8::from(record.responded));
     value.push(u8::from(record.penalty_due));
     value.extend_from_slice(&OMISSION_BOND.to_be_bytes());
+    // owner_signed: no owner acted on this contest.
+    value.push(0);
     value
 }
 
@@ -466,7 +468,10 @@ async fn a_paid_job_closes_at_exactly_what_it_earned() {
     };
     assert_eq!(
         (certificate, signature),
-        (&payment.certificate, &payment.certificate_signature),
+        (
+            &payment.certificate,
+            &PartyAuth::owner(payment.certificate_signature)
+        ),
         "the close carries the client's own certificate, not a copy of the number",
     );
 
@@ -1062,7 +1067,7 @@ async fn a_catch_up_reads_every_block_between() {
             hellas_kernel::Party::Taker,
             (CURSOR + 1, CURSOR + 1),
             None,
-            signer(0x22).sign(hellas_kernel::PayloadHash::from_bytes([0x01; 32])),
+            PartyAuth::owner(signer(0x22).sign(hellas_kernel::PayloadHash::from_bytes([0x01; 32]))),
         ),
     ));
     let foreign_close = hellas_kernel::Tx::close(
@@ -3108,8 +3113,11 @@ async fn a_client_closes_the_channel_its_provider_stopped_answering() {
         panic!("the client retains what it paid");
     };
     assert_eq!(
-        start.certificate().copied(),
-        Some((payment.certificate, payment.certificate_signature)),
+        start.certificate().cloned(),
+        Some((
+            payment.certificate,
+            PartyAuth::owner(payment.certificate_signature)
+        )),
     );
 
     // Retained, and offered again rather than signed twice.

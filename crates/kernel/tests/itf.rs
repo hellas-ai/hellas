@@ -25,6 +25,8 @@
 //! Adding a trace test to an existing fixture schema means regenerating
 //! fixtures; no Rust changes are needed.
 
+#[path = "support/itf_delegation.rs"]
+mod delegation;
 mod support;
 
 use std::fs;
@@ -46,7 +48,7 @@ use support::{
     l1_fees as fee_model,
 };
 
-use hellas_kernel::{ApplyOutcome, EventKind, Fees, View};
+use hellas_kernel::{ApplyOutcome, EventKind, Fees, PartyKeys, View};
 
 /// The abstract `lastEvent` an outcome corresponds to.
 ///
@@ -510,7 +512,7 @@ fn check_edge(
     id: hellas_kernel::EdgeId,
 ) -> Result<bool, String> {
     let live = expected.live_edges.contains(&tag);
-    let kernel_edge = view.edge(id).map(edge_value);
+    let kernel_edge = view.edge(id).as_ref().map(edge_value);
 
     if live {
         let value = expected
@@ -559,7 +561,10 @@ fn check_open_auth(view: &TraceView, expected: &State) -> Result<bool, String> {
         let edge = view
             .edge(id)
             .ok_or_else(|| format!("{tag:?}: model says live, kernel has no edge"))?;
-        let want = hellas_kernel::Parties::new(party_key(auth.maker), party_key(auth.taker));
+        let want = hellas_kernel::Parties::new(
+            PartyKeys::sole(party_key(auth.maker)),
+            PartyKeys::sole(party_key(auth.taker)),
+        );
         if edge.parties() != want {
             return Err(format!(
                 "{tag:?}: kernel parties {:?} do not match authorized open {want:?}",
@@ -599,11 +604,14 @@ fn check_fee_coin(
     tag: fee_itf::CoinTag,
     shape: fee_model::FundingShape,
 ) -> Result<bool, String> {
+    // A payout lands at its party's committed owner, which for the
+    // taker of a self-edge is the maker.
+    let parties = fee_model::parties(shape);
     let (owner, id) = match tag {
         fee_itf::CoinTag::MakerCoin => (fee_model::MAKER, fee_model::MAKER_ID),
         fee_itf::CoinTag::TakerCoin => (fee_model::TAKER, fee_model::TAKER_ID),
-        fee_itf::CoinTag::MakerOut => (fee_model::MAKER, fee_model::maker_out(shape)),
-        fee_itf::CoinTag::TakerOut => (fee_model::TAKER, fee_model::taker_out(shape)),
+        fee_itf::CoinTag::MakerOut => (parties.maker().owner(), fee_model::maker_out(shape)),
+        fee_itf::CoinTag::TakerOut => (parties.taker().owner(), fee_model::taker_out(shape)),
     };
     let coin = view.coin(id).map(coin_view);
 
@@ -746,6 +754,7 @@ fn expected_nonnegative(name: &str, value: Option<i64>) -> Result<u64, String> {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum FixtureKind {
+    Delegation,
     L1,
     L1Fees,
 }
@@ -754,7 +763,9 @@ impl FixtureKind {
     fn from_name(name: &str) -> Option<Self> {
         // Longest prefix first: `l1_fees_` also starts with `l1_`, so
         // the bare-L1 arm must come last.
-        if name.starts_with("l1_fees_") {
+        if name.starts_with("delegation_") {
+            Some(Self::Delegation)
+        } else if name.starts_with("l1_fees_") {
             Some(Self::L1Fees)
         } else if name.starts_with("l1_") {
             Some(Self::L1)
@@ -797,6 +808,13 @@ fn replays_all_itf_fixtures() {
         match FixtureKind::from_name(&name)
             .unwrap_or_else(|| panic!("unrecognized ITF fixture prefix: {name}"))
         {
+            FixtureKind::Delegation => {
+                let trace: itf::Trace<delegation::State> = itf::trace_from_str(&json)
+                    .unwrap_or_else(|err| panic!("invalid ITF fixture {name}: {err}"));
+                trace
+                    .run_on(delegation::Runner)
+                    .unwrap_or_else(|err| panic!("fixture {name} replay failed: {err:?}"));
+            }
             FixtureKind::L1 => {
                 let trace: itf::Trace<State> = itf::trace_from_str(&json)
                     .unwrap_or_else(|err| panic!("invalid ITF fixture {name}: {err}"));

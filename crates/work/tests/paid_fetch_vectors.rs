@@ -15,9 +15,9 @@
 
 use hellas_auth::{Digest, ProducerSigningKey, PublicKey};
 use hellas_kernel::{
-    BlockHeight, EdgeId, EdgeValues, Fees, List, NetworkId, Parties, Payout, Secp256k1Signer,
-    Secp256k1Verifier, SigVerifier, WorkPaymentSettlement, WorkPaymentTerms, WorkStakeBondTerms,
-    work_payment_settlement,
+    BlockHeight, EdgeId, EdgeValues, Fees, List, NetworkId, Parties, PartyKeys, Payout,
+    Secp256k1Signer, Secp256k1Verifier, SigVerifier, WorkPaymentSettlement, WorkPaymentTerms,
+    WorkStakeBondTerms, work_payment_settlement,
 };
 use hellas_rpc::fetch::{
     FetchOutputTranscriptBuilder, build_input_events_with_retention, encode_fetch_event_payload,
@@ -108,7 +108,10 @@ fn payment_terms() -> WorkPaymentTerms {
     let bond = WorkStakeBondTerms {
         // Bond maker is the provider, taker is the client; the payment
         // edge mirrors that, which is where `PaidChannel` reads its keys.
-        parties: Parties::new(provider().party_key(), client().party_key()),
+        parties: Parties::new(
+            PartyKeys::sole(provider().party_key()),
+            PartyKeys::sole(client().party_key()),
+        ),
         timeout: BlockHeight::new(5_000),
         timeout_outputs: List::take(
             [
@@ -582,19 +585,19 @@ fn golden_fetch_digests_are_pinned() {
     // XH("hellas.work.fetch-policy.v2" || network || channel || record).
     assert_eq!(
         hex(fetch_policy_digest(&channel, &fetch_policy()).as_bytes()),
-        "e91ecd6dd49ccf9ba34bc84aa03ae5763e3f63310e336e32eab0c9abcd40cd09"
+        "89f9855281b225fdddf219679aa44ad328cf053673e667ae64cbd38b8759a3d0"
     );
     // XFH("hellas.work.prepared-fetch-input.v1" || network || channel ||
     // bundle).
     assert_eq!(
         hex(input_digest(&channel, &bundle()).as_bytes()),
-        "f356dc2a2c71c8761389b4f9a4ac338b528027406c82166c32726df9920eb323"
+        "7c7e3aa54b8ca8e3ec3c3e3106ad485c94b42b5b5254252b86d94e4364e41d24"
     );
     // XH("hellas.work.paid-job-authorize.v2" || network || channel ||
     // authorization): the shared record, signed under this profile.
     assert_eq!(
         hex(work_id(&channel, &authorization()).as_bytes()),
-        "10ed0852aa021119ed673d4e8c6908d219c520946c2c01dca417e50e0db13171"
+        "cf6c6af0792d5b7e9c0c2fb40730c69f78e3fcfd0e77c2d98cd4279d9aedc6ad"
     );
 }
 
@@ -1387,11 +1390,11 @@ fn terminal_fetch_result_is_pinned() {
     );
     assert_eq!(
         hex(result.canonical_output_digest.as_bytes()),
-        "daa2ca758ba8496243f8e50980969c740447f8c692d4825e67844c7ed67b1001"
+        "ada28e2134cbae88d023dde42d284b26e3409441a6fdf4c691509846188db524"
     );
     assert_eq!(
         hex(result_digest(&channel, &result).as_bytes()),
-        "c449e8c3b3563084caa71a9682b31ae587a2dab34b17477e4f7a40512b5f0793"
+        "d5d328a7ca1f92d91300c87a4db1a24a6cb53da0260af7e2556e5e700eec8257"
     );
 
     // The result record round-trips through the wire codec and the
@@ -1549,7 +1552,7 @@ fn fetch_output_digest_normalizes_chunking() {
     // stream and nothing else.
     assert_eq!(
         hex(digest.as_bytes()),
-        "daa2ca758ba8496243f8e50980969c740447f8c692d4825e67844c7ed67b1001"
+        "ada28e2134cbae88d023dde42d284b26e3409441a6fdf4c691509846188db524"
     );
 }
 

@@ -306,7 +306,26 @@ pub enum SetupDriveError {
 /// be made durable, [`SetupDriveError::Busy`] when the journal cannot be
 /// reached at all, and the two origin errors when completion cannot be
 /// tied to the block that produced it.
-pub async fn advance_setup<C, W, B, T, V>(
+pub fn advance_setup<'a, C, W, B, T, V>(
+    view: &'a W,
+    blocks: &'a B,
+    sink: &'a T,
+    channel: &'a mut C,
+    verifier: &'a V,
+) -> impl std::future::Future<Output = Result<SetupAdvance, SetupDriveError>> + 'a
+where
+    C: SetupChannel,
+    W: SetupView + ?Sized,
+    B: FinalizedBlocks + ?Sized,
+    T: TxSink + ?Sized,
+    V: SigVerifier,
+{
+    // Construct the driver outside its caller's poll frame. Its bounded
+    // kernel witnesses and journal futures are too large to compose inline.
+    Box::pin(advance_setup_inner(view, blocks, sink, channel, verifier))
+}
+
+async fn advance_setup_inner<C, W, B, T, V>(
     view: &W,
     blocks: &B,
     sink: &T,
@@ -614,55 +633,60 @@ async fn mount_close_only<V: SigVerifier>(
 }
 
 /// Opens the exclusive channel journal while the setup journal is borrowed.
-async fn mount<V: SigVerifier>(
-    store: &SetupStore,
-    verifier: &V,
+/// Construct its large replay future behind a heap boundary, so setup steps
+/// that submit transactions do not carry journal-opening temporaries on their
+/// poll stack while connecting to the chain.
+fn mount<'a, V: SigVerifier>(
+    store: &'a SetupStore,
+    verifier: &'a V,
     origin: SetupOrigin,
-    payment: Option<&Edge>,
-) -> Result<ChannelStore, SetupDriveError> {
-    let descriptor = store
-        .state()
-        .close_descriptor()
-        .ok_or(SetupDriveError::CloseNotArmed)?;
-    let to_store =
-        |error| WorkStoreError::Setup(crate::work_store::SetupStateError::Descriptor(error));
-    // A surviving edge settles what it holds. The edge id is a hash over
-    // the funding *coins* and the terms, not over their values, so the
-    // client that named those coins decides the number and the
-    // provider's configured expectation is only ever what it hoped for:
-    // an edge funded above or below it is this same channel, and a close
-    // built on the expectation would name a total the edge does not
-    // distribute. The expectation is the fallback for a consumed edge
-    // alone, where there is no longer anything coherent to read it from.
-    let settlement = match payment {
-        None => descriptor.expected_settlement().map_err(to_store)?,
-        Some(payment) => descriptor.funded_settlement(payment).map_err(to_store)?,
-    };
-    let channel = if matches!(
-        descriptor.work_policy(),
-        crate::model::profile::WorkPolicy::Fetch { .. }
-    ) {
-        ChannelStore::open_metadata_only(
-            store.root(),
-            descriptor.channel().clone(),
-            settlement,
-            store.role(),
-            origin,
-            verifier,
-        )
-        .await?
-    } else {
-        ChannelStore::open(
-            store.root(),
-            descriptor.channel().clone(),
-            settlement,
-            store.role(),
-            origin,
-            verifier,
-        )
-        .await?
-    };
-    Ok(channel)
+    payment: Option<&'a Edge>,
+) -> impl std::future::Future<Output = Result<ChannelStore, SetupDriveError>> + 'a {
+    Box::pin(async move {
+        let descriptor = store
+            .state()
+            .close_descriptor()
+            .ok_or(SetupDriveError::CloseNotArmed)?;
+        let to_store =
+            |error| WorkStoreError::Setup(crate::work_store::SetupStateError::Descriptor(error));
+        // A surviving edge settles what it holds. The edge id is a hash over
+        // the funding *coins* and the terms, not over their values, so the
+        // client that named those coins decides the number and the
+        // provider's configured expectation is only ever what it hoped for:
+        // an edge funded above or below it is this same channel, and a close
+        // built on the expectation would name a total the edge does not
+        // distribute. The expectation is the fallback for a consumed edge
+        // alone, where there is no longer anything coherent to read it from.
+        let settlement = match payment {
+            None => descriptor.expected_settlement().map_err(to_store)?,
+            Some(payment) => descriptor.funded_settlement(payment).map_err(to_store)?,
+        };
+        let channel = if matches!(
+            descriptor.work_policy(),
+            crate::model::profile::WorkPolicy::Fetch { .. }
+        ) {
+            ChannelStore::open_metadata_only(
+                store.root(),
+                descriptor.channel().clone(),
+                settlement,
+                store.role(),
+                origin,
+                verifier,
+            )
+            .await?
+        } else {
+            ChannelStore::open(
+                store.root(),
+                descriptor.channel().clone(),
+                settlement,
+                store.role(),
+                origin,
+                verifier,
+            )
+            .await?
+        };
+        Ok(channel)
+    })
 }
 
 /// Replays outside the setup borrow. The origin marker is written after its

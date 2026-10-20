@@ -204,18 +204,19 @@ pub(crate) const OPEN: &[u8] = b"hellas.edge.open.v1";
 pub(crate) const CLOSE: &[u8] = b"hellas.edge.close.v1";
 
 /// Prefix for the basic-terms commitment. Inputs: protocol code,
-/// parties, timeout height, timeout payouts.
-pub(crate) const TERMS_BASIC: &[u8] = b"hellas.terms.basic.v1";
+/// parties (each `{ owner, signer, payout_delegate }`), timeout height,
+/// timeout payouts.
+pub(crate) const TERMS_BASIC: &[u8] = b"hellas.terms.basic.v2";
 
 /// Prefix for the work-payment terms commitment. Inputs: the complete
 /// canonical tag-2 terms body.
-pub(crate) const TERMS_WORK_PAYMENT: &[u8] = b"hellas.terms.work-payment.v3";
+pub(crate) const TERMS_WORK_PAYMENT: &[u8] = b"hellas.terms.work-payment.v4";
 
 /// Prefix for the work-stake-bond terms commitment. Inputs: the
 /// complete canonical tag-4 terms bytes, envelope and variant included,
 /// so an embedded bond witness and a standalone bond commit to the same
 /// hash.
-pub(crate) const TERMS_WORK_STAKE_BOND: &[u8] = b"hellas.terms.work-stake-bond.v3";
+pub(crate) const TERMS_WORK_STAKE_BOND: &[u8] = b"hellas.terms.work-stake-bond.v4";
 
 /// Prefix for the earned-certificate digest the client signs. Inputs:
 /// network id, payment edge, payment terms hash, and the complete
@@ -256,12 +257,25 @@ pub(crate) const WORK_RESPOND_PAYMENT_CLOSE: &[u8] = b"hellas.work.respond-payme
 /// id, payment edge, payment terms hash, and the complete pending record
 /// the contest ended in.
 pub(crate) const WORK_ADJUDICATED_PAYMENT_CLOSE: &[u8] =
-    b"hellas.work.adjudicated-payment-close.v2";
+    b"hellas.work.adjudicated-payment-close.v3";
 
 /// Prefix for the cooperative freeze digest both parties sign. Inputs:
 /// network id, payment edge, payment terms hash, settlement commitment,
 /// validity bounds.
 pub(crate) const WORK_FREEZE_CLOSE: &[u8] = b"hellas.work.freeze-close.v2";
+
+/// Prefix for the payload hash an owner signs to reshape its coins.
+/// Inputs: network id, then the canonical reshape body — its input ids
+/// and its output payouts.
+pub(crate) const OWNER_RESHAPE: &[u8] = b"hellas.owner.reshape.v2";
+
+/// Prefix for reshape output coin id derivation. Inputs: network id, the
+/// complete input id list, output index, output owner.
+///
+/// The inputs are what make the ids fresh: every input is consumed by the
+/// reshape, so no later reshape can name the same list, and a replayed
+/// one fails on its first missing input before it could collide.
+pub(crate) const COIN_RESHAPE: &[u8] = b"hellas.owner.coin.v2";
 
 /// Prefix for registry chunk id derivation. Inputs: network id,
 /// namespace tag, logical key, chunk index.

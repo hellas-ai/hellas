@@ -1,4 +1,5 @@
 use super::*;
+use hellas_kernel::PartyAuth;
 
 impl Channel<PaymentFunding> {
     fn check_result_payload(
@@ -999,7 +1000,10 @@ impl Channel<PaymentFunding> {
             ),
             (
                 "close start certificate",
-                start.certificate().copied() == self.executable_certificate(),
+                start.certificate().cloned()
+                    == self
+                        .executable_certificate()
+                        .map(|(certificate, sig)| (certificate, PartyAuth::owner(sig))),
             ),
         ] {
             if !holds {

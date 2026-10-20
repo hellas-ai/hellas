@@ -20,8 +20,8 @@ use hellas_genesis::{
     Genesis, GenesisAllocation, GenesisValidator, HELLAS_DEVNET_1_ID, TrustDocument, TrustEpoch,
 };
 use hellas_kernel::{
-    Auth, BlockHeight, CoinId, Funding, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Parties, Payout,
-    ProtocolCode, Secp256k1Signer, Terms, Tx,
+    Auth, BlockHeight, CoinId, Funding, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Parties,
+    PartyAuth, PartyKeys, Payout, ProtocolCode, Secp256k1Signer, Terms, Tx,
 };
 
 pub(crate) struct Harness {
@@ -320,9 +320,7 @@ impl Harness {
                 let bytes =
                     Base64::decode_vec(data["items"][0]["canonical_transaction"].as_str().unwrap())
                         .unwrap();
-                let Transaction::Kernel(tx) = Transaction::decode(bytes.as_slice()).unwrap() else {
-                    panic!()
-                };
+                let Transaction::Kernel(tx) = Transaction::decode(bytes.as_slice()).unwrap();
                 let id = match tx {
                     Tx::Open { funding, terms, .. } => Tx::edge_id_of(&funding, &terms),
                     Tx::Close { input, .. } => input,
@@ -332,6 +330,7 @@ impl Harness {
                             response.payment_edge()
                         }
                     },
+                    Tx::Owner(_) => panic!("an edge event is never a reshape"),
                 };
                 let id = hex::encode(id.as_bytes());
                 ("events", format!("/api/v1/edges/{id}/events"), Some(id))
@@ -399,8 +398,8 @@ fn open(
     Tx::open(
         funding,
         terms,
-        Auth::native(maker.sign(hash)),
-        Auth::native(taker.sign(hash)),
+        PartyAuth::owner(Auth::native(maker.sign(hash))),
+        PartyAuth::owner(Auth::native(taker.sign(hash))),
     )
 }
 pub(crate) fn basic(
@@ -411,7 +410,10 @@ pub(crate) fn basic(
 ) -> (hellas_kernel::EdgeId, Terms, Tx) {
     let terms = Terms::basic(
         ProtocolCode::new(7),
-        Parties::new(maker.party_key(), taker.party_key()),
+        Parties::new(
+            PartyKeys::sole(maker.party_key()),
+            PartyKeys::sole(taker.party_key()),
+        ),
         BlockHeight::new(2),
         List::take([Payout::new(maker.party_key(), 100); MAX_EDGE_OUTPUTS], 1),
     );
@@ -878,7 +880,10 @@ fn work_pair(
     let client = signer(client_secret);
     let provider = signer(provider_secret);
     let body = hellas_kernel::WorkStakeBondTerms {
-        parties: Parties::new(provider.party_key(), client.party_key()),
+        parties: Parties::new(
+            PartyKeys::sole(provider.party_key()),
+            PartyKeys::sole(client.party_key()),
+        ),
         timeout: BlockHeight::new(5),
         timeout_outputs: List::take([Payout::new(provider.party_key(), 12); MAX_EDGE_OUTPUTS], 1),
         max_job_price: 4,
@@ -1093,8 +1098,8 @@ fn native_edge_index_work_channel_lifecycle_and_evidence() {
             a.terms.clone(),
             Party::Maker,
             (2, 2),
-            Some((understated, a.client.sign(earned_hash))),
-            a.client.sign(start_hash),
+            Some((understated, PartyAuth::owner(a.client.sign(earned_hash)))),
+            PartyAuth::owner(a.client.sign(start_hash)),
         )));
         let start_id = hellas_kernel::start_id(start_hash, 2);
         let earned = EarnedCertificate::new(a.payment, a.terms.hash(), 60);
@@ -1111,8 +1116,8 @@ fn native_edge_index_work_channel_lifecycle_and_evidence() {
             a.payment,
             start_id,
             Party::Taker,
-            (earned, a.client.sign(digest)),
-            a.provider.sign(response_hash),
+            (earned, PartyAuth::owner(a.client.sign(digest))),
+            PartyAuth::owner(a.provider.sign(response_hash)),
         )));
         h.append(vec![Transaction::Kernel(start)]).await;
         let started = channel(&h, a.payment, None);
@@ -1360,8 +1365,8 @@ fn native_edge_index_work_channel_lifecycle_and_evidence() {
             Proof::freeze(
                 60,
                 (6, 6),
-                b.client.sign(freeze_hash),
-                b.provider.sign(freeze_hash),
+                PartyAuth::owner(b.client.sign(freeze_hash)),
+                PartyAuth::owner(b.provider.sign(freeze_hash)),
             ),
             outputs,
         ))])

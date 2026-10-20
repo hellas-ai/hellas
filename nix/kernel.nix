@@ -9,9 +9,25 @@ let
   modelTestModules = [
     "l1.qnt"
     "l1_fees.qnt"
+    "delegation.qnt"
   ];
 
   runSpecs = [
+    {
+      model = "delegation.qnt";
+      maxSamples = 500;
+      maxSteps = 8;
+      invariants = [
+        "valueConserved"
+        "nodeNeverOwns"
+        "reshapeConsumesItsInput"
+        "basicIsOwnerOpened"
+        "signerReachIsItsDelegation"
+        "payoutsAtCommittedDestinations"
+        "heightAtLeastGenesis"
+      ];
+    }
+
     {
       model = "l1.qnt";
       maxSamples = 500;
@@ -65,6 +81,20 @@ let
   ];
 
   verifySpecs = [
+    {
+      model = "delegation.qnt";
+      maxSteps = 5;
+      invariants = [
+        "valueConserved"
+        "nodeNeverOwns"
+        "reshapeConsumesItsInput"
+        "basicIsOwnerOpened"
+        "signerReachIsItsDelegation"
+        "payoutsAtCommittedDestinations"
+        "heightAtLeastGenesis"
+      ];
+    }
+
     {
       model = "l1.qnt";
       maxSteps = 5;
@@ -139,6 +169,7 @@ let
     mkdir -p models/traces
     quint test models/l1.qnt --out-itf 'models/traces/l1_{test}.itf.json' --verbosity=0
     quint test models/l1_fees.qnt --out-itf 'models/traces/l1_fees_{test}.itf.json' --verbosity=0
+    quint test models/delegation.qnt --out-itf 'models/traces/delegation_{test}.itf.json' --verbosity=0
   '';
 
   modelRuntimePackages = with pkgs; [
@@ -280,6 +311,7 @@ let
     command = freshnessCommand "kernel" [
       "l1"
       "l1_fees"
+      "delegation"
     ];
   };
 

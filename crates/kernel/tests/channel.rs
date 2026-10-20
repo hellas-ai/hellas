@@ -152,7 +152,7 @@ fn open_op() -> Tx {
 fn open_edge_id(open: &Tx) -> EdgeId {
     match open {
         Tx::Open { funding, terms, .. } => Tx::edge_id_of(funding, terms),
-        Tx::Close { .. } | Tx::Move { .. } => panic!("expected Tx::Open"),
+        Tx::Close { .. } | Tx::Move { .. } | Tx::Owner(_) => panic!("expected Tx::Open"),
     }
 }
 

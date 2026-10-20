@@ -2,7 +2,7 @@ use hellas_auth::ProducerSigningKey;
 use std::fs;
 
 use hellas_auth::Digest;
-use hellas_kernel::{EdgeValues, Fees, MIN_OMIT_RESPONSE_BLOCKS};
+use hellas_kernel::{EdgeValues, Fees, MIN_OMIT_RESPONSE_BLOCKS, PartyKeys};
 use hellas_work::model::setup::ProviderChannelPolicy;
 use hellas_work::model::work::{EvaluatePolicyV2, PaidChannelPolicyV1};
 use hellas_work::work_close::{BlockSourceError, FinalizedWork};
@@ -222,7 +222,10 @@ fn bond_funding_for(stake_coins: &[u8]) -> Funding {
 
 fn bond_terms_for(client: Key, max_job_price: u64) -> WorkStakeBondTerms {
     WorkStakeBondTerms {
-        parties: Parties::new(provider().party_key(), client),
+        parties: Parties::new(
+            PartyKeys::sole(provider().party_key()),
+            PartyKeys::sole(client),
+        ),
         timeout: BlockHeight::new(500),
         timeout_outputs: List::take(
             [Payout::new(provider().party_key(), 64); MAX_EDGE_OUTPUTS],

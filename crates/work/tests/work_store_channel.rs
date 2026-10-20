@@ -15,8 +15,8 @@ use hellas_auth::Digest;
 use hellas_auth::PublicKey;
 use hellas_kernel::{
     BlockHeight, EarnedCertificate, EdgeId, EdgeValues, Encode as _, Fees, List, MAX_EDGE_OUTPUTS,
-    Parties, Party, PayloadHash, Payout, Secp256k1Verifier, Sig, TermsHash, WorkPaymentSettlement,
-    WorkPaymentTerms, WorkStakeBondTerms, work_payment_settlement,
+    Parties, Party, PartyAuth, PartyKeys, PayloadHash, Payout, Secp256k1Verifier, Sig, TermsHash,
+    WorkPaymentSettlement, WorkPaymentTerms, WorkStakeBondTerms, work_payment_settlement,
 };
 use hellas_rpc::protocol::artifacts::InputAddressed as _;
 use hellas_rpc::{Assurance, Evaluate, EvaluateRequest, OutputEventEnvelope};
@@ -62,7 +62,10 @@ const fn limits(compute: u64, delivery: u64) -> PaidChannelPolicyV1 {
 
 fn bond_terms() -> WorkStakeBondTerms {
     WorkStakeBondTerms {
-        parties: Parties::new(provider().party_key(), client().party_key()),
+        parties: Parties::new(
+            PartyKeys::sole(provider().party_key()),
+            PartyKeys::sole(client().party_key()),
+        ),
         timeout: BlockHeight::new(HORIZON),
         timeout_outputs: List::take(
             [Payout::new(provider().party_key(), 64); MAX_EDGE_OUTPUTS],
@@ -1863,7 +1866,7 @@ fn the_record_codec_is_exact_and_ordered() {
         hellas_kernel::Party::Taker,
         (11, 18),
         None,
-        provider().sign(payload(job.work_id)),
+        PartyAuth::owner(provider().sign(payload(job.work_id))),
     );
     let prepared = ChannelRecord::ClosePrepared {
         start: Box::new(start.clone()),
@@ -2849,9 +2852,9 @@ async fn closed_store(root: &std::path::Path) -> ChannelStore {
         (RECEIPT_HEIGHT + 1, RECEIPT_HEIGHT + 8),
         Some((
             job.certificate,
-            client().sign(job.certificate.digest(channel.network())),
+            PartyAuth::owner(client().sign(job.certificate.digest(channel.network()))),
         )),
-        provider().sign(payload(job.work_id)),
+        PartyAuth::owner(provider().sign(payload(job.work_id))),
     );
     let start_id = hellas_kernel::StartId::from_bytes([0x7c; 32]);
     commit_all(

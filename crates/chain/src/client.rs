@@ -1,7 +1,4 @@
-use crate::domain::{
-    Coin, Digest, Encode, ObjectId, SettlementKey, Transaction,
-    WebAuthnSignature as DomainWebAuthnSignature,
-};
+use crate::domain::{Coin, Digest, ObjectId, SettlementKey, Transaction};
 use crate::{
     ConsensusInfo, ConsensusVerifier, EdgeLookup, EdgeRecord, EdgeState, FinalizedBlock,
     FinalizedBlockQuery, LatestBlock, LightClient, OwnerCoins, OwnerEdges, QueryError,
@@ -15,7 +12,6 @@ use hellas_rpc::{
     pb::{chain::*, services::light_client::LightClientClientImpl},
 };
 use hellas_wire::mux::MuxTransport;
-use p256::ecdsa::Signature as P256Signature;
 use std::collections::BTreeSet;
 
 /// Wire-backed light client that connects to a remote validator or relay.
@@ -150,20 +146,14 @@ impl LightClient for RemoteLightClient {
                 .await
                 .map_err(QueryError::from)?;
             match (response.owner, response.value) {
-                (Some(owner_bytes), Some(value)) => {
-                    let actual = owner_bytes.len();
-                    let raw: [u8; SettlementKey::LENGTH] =
-                        owner_bytes.try_into().map_err(|_| {
-                            QueryError::Remote(format!(
-                                "owner settlement key was {} bytes, got {actual}",
-                                SettlementKey::LENGTH
-                            ))
-                        })?;
-                    Ok(Some(Coin {
-                        owner: SettlementKey::from_bytes(raw),
-                        value,
-                    }))
-                }
+                (Some(owner), Some(value)) => Ok(Some(Coin {
+                    owner: settlement_key_from_wire(owner, "owner")?,
+                    delegate: response
+                        .delegate
+                        .map(|delegate| settlement_key_from_wire(delegate, "delegate"))
+                        .transpose()?,
+                    value,
+                })),
                 _ => Ok(None),
             }
         }
@@ -550,39 +540,7 @@ fn transaction_to_proto(tx: Transaction) -> Result<SubmitTxRequest, QueryError> 
         )));
     }
 
-    let signature_to_der = |signature: &DomainWebAuthnSignature| {
-        let raw = signature.signature.encode();
-        let parsed = P256Signature::from_slice(raw.as_ref())
-            .expect("internal transaction signature should always be canonical 64-byte secp256r1");
-        parsed.to_der().as_bytes().to_vec()
-    };
-
     let tx_oneof = match tx {
-        Transaction::Transfer {
-            input,
-            recipient,
-            amount,
-            signature,
-        } => submit_tx_request::Tx::Transfer(TransferTx {
-            input: input.to_vec(),
-            recipient: recipient.encode().to_vec(),
-            amount,
-            signature: Some(WebAuthnSignature {
-                ecdsa_signature: signature_to_der(&signature),
-                authenticator_data: signature.authenticator_data.as_slice().to_vec(),
-                client_data_json: signature.client_data_json.as_slice().to_vec(),
-            }),
-        }),
-        Transaction::MergeCoin { inputs, signature } => {
-            submit_tx_request::Tx::MergeCoin(MergeCoinTx {
-                inputs: inputs.iter().map(|i| i.to_vec()).collect(),
-                signature: Some(WebAuthnSignature {
-                    ecdsa_signature: signature_to_der(&signature),
-                    authenticator_data: signature.authenticator_data.as_slice().to_vec(),
-                    client_data_json: signature.client_data_json.as_slice().to_vec(),
-                }),
-            })
-        }
         Transaction::Kernel(tx) => {
             let mut bytes = vec![0_u8; hellas_kernel::Tx::MAX_ENCODED_SIZE];
             let written = tx.write_to(&mut bytes);

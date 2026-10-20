@@ -49,7 +49,14 @@ impl PaidOffer {
         }
         check_grant_provider(&self.provider).map_err(|_| PaidOfferError::Provider)?;
         if self.provider.genesis.statement.producer_public_key
-            != PublicKey::Secp256k1(self.proposal.bond_terms().parties.maker().to_bytes())
+            != PublicKey::Secp256k1(
+                self.proposal
+                    .bond_terms()
+                    .parties
+                    .maker()
+                    .signer()
+                    .to_bytes(),
+            )
         {
             return Err(PaidOfferError::Provider);
         }
@@ -75,7 +82,7 @@ pub struct SignedPaidOffer {
 impl SignedPaidOffer {
     pub fn sign(offer: PaidOffer, key: &Secp256k1Signer) -> Result<Self, PaidOfferError> {
         offer.check()?;
-        if key.party_key() != offer.proposal.bond_terms().parties.maker() {
+        if key.party_key() != offer.proposal.bond_terms().parties.maker().signer() {
             return Err(PaidOfferError::Provider);
         }
         let signature = Signature::Secp256k1(

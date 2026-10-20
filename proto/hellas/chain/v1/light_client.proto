@@ -61,6 +61,8 @@ message GetCoinRequest {
 message GetCoinResponse {
   optional bytes owner = 1;
   optional uint64 value = 2;
+  // The key the coin is delegated to, absent for an undelegated coin.
+  optional bytes delegate = 3;
 }
 
 message GetEdgeRequest {
@@ -126,9 +128,10 @@ message GetFinalizedBlockResponse {
 }
 
 message SubmitTxRequest {
+  // 1 and 2 were the deleted chain-side transfer and merge.
+  reserved 1, 2;
+  reserved "transfer", "merge_coin";
   oneof tx {
-    TransferTx transfer = 1;
-    MergeCoinTx merge_coin = 2;
     bytes kernel_tx = 3;
   }
 }
@@ -137,24 +140,6 @@ message SubmitTxRequest {
 // carries no transport identity or caller-supplied admission key.
 message SubmitWorkResponseRequest {
   bytes response = 1;
-}
-
-message WebAuthnSignature {
-  bytes ecdsa_signature = 1;
-  bytes authenticator_data = 2;
-  bytes client_data_json = 3;
-}
-
-message TransferTx {
-  bytes input = 1;
-  bytes recipient = 2;
-  uint64 amount = 3;
-  WebAuthnSignature signature = 4;
-}
-
-message MergeCoinTx {
-  repeated bytes inputs = 1;
-  WebAuthnSignature signature = 2;
 }
 
 enum SubmitTxOutcome {

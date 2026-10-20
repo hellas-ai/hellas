@@ -52,8 +52,10 @@ fn component_sizes() {
         "Funding size {}",
         size_of::<Funding>(),
     );
+    // An owner, an optional delegate and a value: the delegate took the
+    // cap from 64 to 96 bytes.
     assert!(
-        size_of::<Payout>() <= 64,
+        size_of::<Payout>() <= 96,
         "Payout size {}",
         size_of::<Payout>(),
     );

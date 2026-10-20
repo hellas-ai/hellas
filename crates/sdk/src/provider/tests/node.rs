@@ -1,7 +1,7 @@
 use hellas_auth::authority::GrantId;
 use hellas_chain::FinalizedWorkView;
 use hellas_executor::FetchRouteRegistry;
-use hellas_kernel::{EdgeId, NetworkId, Secp256k1Signer, Secp256k1Verifier};
+use hellas_kernel::{EdgeId, NetworkId, PartyKeys, Secp256k1Signer, Secp256k1Verifier};
 use hellas_rpc::pb::work::{
     AcceptWorkRequest, AcceptWorkResponse, AdmitCertificateRequest, AdmitCertificateResponse,
     DeliverResultRequest, DeliverResultResponse, ExchangeSetupRequest, ExchangeSetupResponse,
@@ -523,12 +523,12 @@ async fn two_vouched_peers_receive_their_distinct_configured_offers() {
         "the two peers do not receive one global first mount",
     );
     assert_eq!(
-        first_bundle.bond_terms().parties.taker(),
+        first_bundle.bond_terms().parties.taker().signer(),
         first.client().party_key(),
         "the first peer reaches the journal configured for its client",
     );
     assert_eq!(
-        second_bundle.bond_terms().parties.taker(),
+        second_bundle.bond_terms().parties.taker().signer(),
         second.client().party_key(),
         "the second peer reaches the journal configured for its client",
     );
@@ -729,7 +729,7 @@ async fn completion_clears_and_mounts_only_the_completing_route() {
     let proposal = advanced_setup_bundle(response.response);
     assert_eq!(proposal.revision(), 1, "B remains at revision one");
     assert_eq!(
-        proposal.bond_terms().parties.taker(),
+        proposal.bond_terms().parties.taker().signer(),
         second.client().party_key(),
         "B still receives B's configured proposal",
     );
@@ -1169,7 +1169,10 @@ fn coins(ids: &[u8]) -> List<CoinId, MAX_PARTY_INPUTS> {
 
 fn bond_terms() -> WorkStakeBondTerms {
     WorkStakeBondTerms {
-        parties: Parties::new(provider().party_key(), client().party_key()),
+        parties: Parties::new(
+            PartyKeys::sole(provider().party_key()),
+            PartyKeys::sole(client().party_key()),
+        ),
         timeout: BlockHeight::new(500),
         timeout_outputs: List::take(
             [Payout::new(provider().party_key(), 64); MAX_EDGE_OUTPUTS],
@@ -1693,7 +1696,7 @@ fn channel_snapshot(
 /// decode at the end proves this literal is its canonical shape.
 fn pending_contest(responded: bool) -> RegistryChunk {
     let mut value = Vec::with_capacity(PendingPaymentClose::ENCODED_SIZE);
-    value.extend_from_slice(&[1, 23, 2]); // envelope and work-close version
+    value.extend_from_slice(&[1, 23, 3]); // envelope and work-close version
     value.extend_from_slice(payment_edge().as_bytes());
     value.push(Party::Maker.tag());
     value.extend_from_slice(&[0x7c; StartId::LENGTH]);
@@ -1708,6 +1711,7 @@ fn pending_contest(responded: bool) -> RegistryChunk {
     value.push(u8::from(responded));
     value.push(u8::from(responded));
     value.extend_from_slice(&OMISSION_BOND.to_be_bytes());
+    value.push(0); // owner_signed
     assert_eq!(value.len(), PendingPaymentClose::ENCODED_SIZE);
     let record = match PendingPaymentClose::decode_exact(&value) {
         Ok(record) => record,
@@ -2467,7 +2471,10 @@ impl OfferFixture {
 
     fn bond_terms(self) -> WorkStakeBondTerms {
         WorkStakeBondTerms {
-            parties: Parties::new(provider().party_key(), self.client().party_key()),
+            parties: Parties::new(
+                PartyKeys::sole(provider().party_key()),
+                PartyKeys::sole(self.client().party_key()),
+            ),
             timeout: BlockHeight::new(500),
             timeout_outputs: List::take(
                 [Payout::new(provider().party_key(), 64); MAX_EDGE_OUTPUTS],

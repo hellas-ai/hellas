@@ -8,8 +8,8 @@ use hellas_chain::genesis::{Genesis, known_network, known_network_names};
 use hellas_chain::{FinalizedBlockQuery, LightClient as _, QueryError, client::RemoteLightClient};
 use hellas_kernel::{
     BlockHeight, CloseKind as KernelCloseKind, CoinId, Decode as _, EdgeId, Encode as _, Funding,
-    List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, NetworkId, Parties, Payout, Proof, ProtocolCode,
-    Terms, Tx,
+    List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, NetworkId, Parties, PartyAuth, PartyKeys, Payout,
+    Proof, ProtocolCode, Terms, Tx,
 };
 
 pub(crate) use self::signer::passkey;
@@ -464,7 +464,10 @@ async fn run_open(args: OpenArgs) -> CliResult {
     let timeout_outputs = parse_payouts(&args.timeout_payouts, "timeout payout")?;
     let terms = Terms::basic(
         ProtocolCode::new(args.protocol),
-        Parties::new(maker.party_key(), taker.party_key()),
+        Parties::new(
+            PartyKeys::sole(maker.party_key()),
+            PartyKeys::sole(taker.party_key()),
+        ),
         BlockHeight::new(args.timeout),
         timeout_outputs,
     );
@@ -476,8 +479,8 @@ async fn run_open(args: OpenArgs) -> CliResult {
     let tx = Tx::open(
         funding,
         terms.clone(),
-        maker.sign(open_hash)?,
-        taker.sign(open_hash)?,
+        PartyAuth::owner(maker.sign(open_hash)?),
+        PartyAuth::owner(taker.sign(open_hash)?),
     );
 
     // Persist the reveal before submission. A failed submission leaves only a
@@ -524,7 +527,10 @@ async fn run_close(args: CloseArgs) -> CliResult {
                 edge.terms_hash,
                 &outputs,
             );
-            Proof::mutual(maker.sign(hash)?, taker.sign(hash)?)
+            Proof::mutual(
+                PartyAuth::owner(maker.sign(hash)?),
+                PartyAuth::owner(taker.sign(hash)?),
+            )
         }
         CloseKind::Timeout => {
             if args.maker_key.is_some()
@@ -872,7 +878,10 @@ mod tests {
             parse_payouts(&[format!("{owner}:42")], "timeout payout").expect("valid payout");
         let terms = Terms::basic(
             ProtocolCode::new(7),
-            Parties::new(owner.into_kernel(), owner.into_kernel()),
+            Parties::new(
+                PartyKeys::sole(owner.into_kernel()),
+                PartyKeys::sole(owner.into_kernel()),
+            ),
             BlockHeight::new(99),
             payouts,
         );

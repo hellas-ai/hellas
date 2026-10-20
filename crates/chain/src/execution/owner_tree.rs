@@ -6,7 +6,10 @@ use super::{kernel::ExecutionError, store::UtxoDatabase};
 use crate::owner_proof::OwnerPageProof;
 use crate::{
     domain::{Object, ObjectId, SettlementKey},
-    owner_proof::{OWNER_NODE_BYTES, OwnerProofError, OwnerTreeStore, update_holding},
+    owner_proof::{
+        HOLDING_COIN, HOLDING_DELEGATED, HOLDING_EDGE, OWNER_NODE_BYTES, OwnerProofError,
+        OwnerTreeStore, update_holding,
+    },
 };
 use commonware_glue::stateful::db::DatabaseSet;
 use commonware_runtime::Spawner;
@@ -117,19 +120,31 @@ impl<E: StorageContext + Spawner + Send + Sync + 'static> OwnerTreeStore for Bat
     }
 }
 
+/// The keys an object is filed under, with the holding kind and balance
+/// each sees.
+///
+/// A coin is its owner's spendable value, and a zero-balance entry for
+/// the key it is delegated to: that key must be able to find the coins it
+/// may spend, and its owner's exposure to it is exactly those entries. An
+/// edge is filed under every key it commits — both owners, both signers,
+/// and every payout delegate — so a node finds the channels it signs for
+/// and the owner finds every edge whose payouts name its delegate. One key
+/// committed in two roles is one entry.
 fn ownership(object: Option<Object>) -> Vec<(SettlementKey, u8, u64)> {
     match object {
-        Some(Object::Coin(coin)) => vec![(coin.owner, 0, coin.value)],
-        Some(Object::Edge(edge)) => {
-            let parties = edge.parties();
-            let maker = SettlementKey::from(parties.maker());
-            let taker = SettlementKey::from(parties.taker());
-            if maker == taker {
-                vec![(maker, 1, 0)]
-            } else {
-                vec![(maker, 1, 0), (taker, 1, 0)]
+        Some(Object::Coin(coin)) => {
+            let mut entries = vec![(coin.owner, HOLDING_COIN, coin.value)];
+            if let Some(delegate) = coin.delegate
+                && delegate != coin.owner
+            {
+                entries.push((delegate, HOLDING_DELEGATED, 0));
             }
+            entries
         }
+        Some(Object::Edge(edge)) => crate::owner_index::edge_keys(edge.parties())
+            .into_iter()
+            .map(|key| (key, HOLDING_EDGE, 0))
+            .collect(),
         _ => Vec::new(),
     }
 }
@@ -230,7 +245,7 @@ mod tests {
             let batch = match write_owned(
                 database.new_batches().await,
                 id,
-                Some(Object::Coin(Coin { owner, value: 321 })),
+                Some(Object::Coin(Coin::owned(owner, 321))),
             )
             .await
             .map_err(|failure| *failure)

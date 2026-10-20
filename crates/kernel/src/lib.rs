@@ -224,7 +224,7 @@ pub use consts::{
 pub use context::{BlockHash, BlockHeight, Context, Cost, Fees};
 pub use error::{
     ApplyError, BatchError, BondLeaseFault, InsertError, InvalidCloseReason, InvalidMoveReason,
-    InvalidOpenReason, InvalidProofReason, KernelResult, PendingCloseFault,
+    InvalidOpenReason, InvalidProofReason, InvalidReshapeReason, KernelResult, PendingCloseFault,
 };
 pub use event::{ApplyOutcome, Diff, Event, EventKind};
 pub use lease::{
@@ -232,7 +232,7 @@ pub use lease::{
 };
 pub use list::List;
 pub use network::{MAX_NETWORK_ID_LENGTH, NetworkId};
-pub use object::{Coin, Edge, EdgeValues, Genesis, Parties};
+pub use object::{Coin, Edge, EdgeValues, Genesis, Parties, PartyKeys};
 pub use primitive::{CoinId, EdgeId, Key, Party, PayloadHash, ProtocolCode, Sig, TermsHash};
 pub use registry::{
     MAX_REGISTRY_VALUE_LEN, RegistryChunk, RegistryChunkId, RegistryDiff, RegistryDiffError,
@@ -244,9 +244,9 @@ pub use state::State;
 pub use store::{Batch, Store};
 pub use terms::{Terms, TermsProfile, WorkPaymentTerms, WorkStakeBondTerms};
 pub use tx::{
-    Auth, CloseKind, CloseKindSet, Funding, Move, OpenFunding, OpenProjection,
-    PaymentContestCommitment, Payout, Proof, Tx, WebAuthnAssertion, WebAuthnData, check_response,
-    open_projection,
+    Auth, Authority, CloseKind, CloseKindSet, Funding, Move, OpenFunding, OpenProjection,
+    PartyAuth, PaymentContestCommitment, Payout, Proof, Reshape, Tx, WebAuthnAssertion,
+    WebAuthnData, check_response, open_projection,
 };
 pub use verifier::SigVerifier;
 pub use view::{Snapshot, View};

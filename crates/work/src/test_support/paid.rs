@@ -12,8 +12,8 @@ use crate::work_store::{ChannelRecord, ChannelStore, Role, SetupOrigin};
 use hellas_auth::{Digest, ProducerSigningKey, PublicKey};
 use hellas_kernel::{
     BlockHeight, Decode as _, Edge, EdgeId, EdgeValues, Fees, Key, LeaseSlots, List,
-    MAX_EDGE_OUTPUTS, NetworkId, Parties, Payout, Secp256k1Signer, Secp256k1Verifier, Terms,
-    TermsHash, WorkPaymentSettlement, WorkPaymentTerms, WorkStakeBondTerms,
+    MAX_EDGE_OUTPUTS, NetworkId, Parties, PartyKeys, Payout, Secp256k1Signer, Secp256k1Verifier,
+    Terms, TermsHash, WorkPaymentSettlement, WorkPaymentTerms, WorkStakeBondTerms,
     work_payment_settlement,
 };
 use hellas_rpc::evaluate::{
@@ -131,7 +131,10 @@ pub fn channel_policy() -> PaidChannelPolicyV1 {
 
 fn bond_terms() -> WorkStakeBondTerms {
     WorkStakeBondTerms {
-        parties: Parties::new(provider().party_key(), client().party_key()),
+        parties: Parties::new(
+            PartyKeys::sole(provider().party_key()),
+            PartyKeys::sole(client().party_key()),
+        ),
         timeout: BlockHeight::new(HORIZON),
         timeout_outputs: List::take(
             [Payout::new(provider().party_key(), STAKE); MAX_EDGE_OUTPUTS],
@@ -402,8 +405,12 @@ impl EdgeBytes {
         out.extend_from_slice(&[FORMAT_VERSION, TAG_BLOCK_HEIGHT]);
         out.extend_from_slice(&HORIZON.to_be_bytes());
         out.extend_from_slice(&[FORMAT_VERSION, TAG_PARTIES]);
-        out.extend_from_slice(&self.maker.to_bytes());
-        out.extend_from_slice(&self.taker.to_bytes());
+        // Each party: owner, signer, and an absent payout delegate.
+        for party in [self.maker, self.taker] {
+            out.extend_from_slice(&party.to_bytes());
+            out.extend_from_slice(&party.to_bytes());
+            out.push(0);
+        }
         out.extend_from_slice(self.terms.as_bytes());
         out.push(self.allowed);
         match Edge::decode_exact(&out) {

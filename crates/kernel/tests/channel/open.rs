@@ -1,4 +1,5 @@
 use super::*;
+use hellas_kernel::PartyKeys;
 
 #[test]
 fn open_locks_two_coins_into_one_edge() {
@@ -18,7 +19,7 @@ fn open_locks_two_coins_into_one_edge() {
     assert_eq!(state.store().coin(MAKER_COIN), None);
     assert_eq!(state.store().coin(TAKER_COIN), None);
     assert_eq!(
-        state.store().edge(edge()).map(edge_view),
+        state.store().edge(edge()).as_ref().map(edge_view),
         Some((15, 0, TIMEOUT, PARTIES, terms())),
     );
 }
@@ -45,7 +46,7 @@ fn open_locks_three_coins_into_one_edge() {
     );
     assert_eq!(state.store().coin(EXTRA_COIN), None);
     assert_eq!(
-        state.store().edge(output).map(edge_view),
+        state.store().edge(output).as_ref().map(edge_view),
         Some((18, 0, TIMEOUT, PARTIES, terms_hash)),
     );
 }
@@ -73,7 +74,7 @@ fn open_allows_maker_only_funding() {
         Some((TAKER, 5))
     );
     assert_eq!(
-        state.store().edge(output).map(edge_view),
+        state.store().edge(output).as_ref().map(edge_view),
         Some((10, 0, TIMEOUT, PARTIES, terms_hash)),
     );
 }
@@ -101,7 +102,7 @@ fn open_allows_taker_only_funding() {
     );
     assert_eq!(state.store().coin(TAKER_COIN), None);
     assert_eq!(
-        state.store().edge(output).map(edge_view),
+        state.store().edge(output).as_ref().map(edge_view),
         Some((5, 0, TIMEOUT, PARTIES, terms_hash)),
     );
 }
@@ -111,7 +112,7 @@ fn open_allows_same_maker_and_taker_party() {
     // Both parties = MAKER. The funding ownership rule now requires every
     // coin to be owned by the matching party key, so both coins are seeded
     // as MAKER-owned (using `EXTRA_COIN` as the second slot).
-    let parties = Parties::new(MAKER, MAKER);
+    let parties = Parties::new(PartyKeys::sole(MAKER), PartyKeys::sole(MAKER));
     let outputs = payouts(Payout::new(MAKER, 7), Payout::new(MAKER, 8));
     let terms_value = Terms::basic(PROTOCOL, parties, TIMEOUT, outputs);
     let terms_hash = terms_value.hash();
@@ -132,7 +133,7 @@ fn open_allows_same_maker_and_taker_party() {
         },
     );
     assert_eq!(
-        state.store().edge(output).map(edge_view),
+        state.store().edge(output).as_ref().map(edge_view),
         Some((15, 0, TIMEOUT, parties, terms_hash)),
     );
 }
@@ -163,7 +164,7 @@ fn open_allows_empty_funding_when_fee_is_zero() {
         Some((TAKER, 5)),
     );
     assert_eq!(
-        state.store().edge(output).map(edge_view),
+        state.store().edge(output).as_ref().map(edge_view),
         Some((0, 0, TIMEOUT, PARTIES, terms_hash)),
     );
 }
@@ -191,7 +192,7 @@ fn open_pays_fee_from_funding() {
         },
     );
     assert_eq!(
-        state.store().edge(output).map(edge_view),
+        state.store().edge(output).as_ref().map(edge_view),
         Some((9, 3, TIMEOUT, PARTIES, terms_hash)),
     );
 }
@@ -231,7 +232,7 @@ fn open_fee_uses_resource_cost() {
     assert_eq!(RESOURCE_CONTEXT.fee(reserve_cost), Some(16));
     assert_eq!(lifetime_fee, Some(3));
     assert_eq!(
-        state.store().edge(output).map(edge_view),
+        state.store().edge(output).as_ref().map(edge_view),
         Some((21, 16, TIMEOUT, PARTIES, terms_hash)),
     );
 }
@@ -281,11 +282,15 @@ fn open_lifetime_fee_scales_with_timeout_span() {
     assert_eq!(lifetime_fee_for(lifetime_priced, short_timeout), Some(1));
     assert_eq!(lifetime_fee_for(lifetime_priced, long_timeout), Some(3));
     assert_eq!(
-        short_state.store().edge(short_output).map(edge_view),
+        short_state
+            .store()
+            .edge(short_output)
+            .as_ref()
+            .map(edge_view),
         Some((21, 5, short_timeout, PARTIES, short_hash)),
     );
     assert_eq!(
-        long_state.store().edge(long_output).map(edge_view),
+        long_state.store().edge(long_output).as_ref().map(edge_view),
         Some((19, 5, long_timeout, PARTIES, long_hash)),
     );
 }
@@ -320,7 +325,7 @@ fn open_allows_exact_fee_and_reserve_funding() {
     assert_eq!(RESOURCE_CONTEXT.fee(reserve_cost), Some(16));
     assert_eq!(lifetime_fee, Some(3));
     assert_eq!(
-        state.store().edge(output).map(edge_view),
+        state.store().edge(output).as_ref().map(edge_view),
         Some((0, 16, TIMEOUT, PARTIES, terms_hash)),
     );
 }
@@ -545,7 +550,7 @@ fn reserve_cost_for(edge: EdgeId) -> Cost {
 // ---------------------------------------------------------------------
 
 const EVE: Key = Key::from_bytes([0xee; Key::LENGTH]);
-const EVE_PARTIES: Parties = Parties::new(EVE, EVE);
+const EVE_PARTIES: Parties = Parties::new(PartyKeys::sole(EVE), PartyKeys::sole(EVE));
 
 fn eve_terms() -> Terms {
     Terms::basic(
@@ -590,7 +595,7 @@ fn open_rejects_terms_party_that_does_not_own_funding() {
     let funding = funding(MAKER_COIN, TAKER_COIN);
     let mixed_terms = Terms::basic(
         PROTOCOL,
-        Parties::new(EVE, TAKER),
+        Parties::new(PartyKeys::sole(EVE), PartyKeys::sole(TAKER)),
         TIMEOUT,
         payouts(Payout::new(EVE, 10), Payout::new(TAKER, 5)),
     );

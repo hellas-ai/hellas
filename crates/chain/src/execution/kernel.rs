@@ -1,20 +1,18 @@
 use super::{store::UtxoDatabase, verifier::ChainVerifier, working_set::BlockWorkingSet};
 use crate::domain::{
-    Address, Coin, MAX_EDGE_LIFETIME_BLOCKS, MergeInputFault, Object, ObjectId, ObjectKind,
-    SettlementKey, Transaction, coin_object_id, edge_object_id, genesis_object_id,
-    merge_input_fault, output_object_id, registry_chunk_object_id,
+    Coin, MAX_EDGE_LIFETIME_BLOCKS, Object, ObjectId, ObjectKind, SettlementKey, Transaction,
+    coin_object_id, edge_object_id, genesis_object_id, registry_chunk_object_id,
 };
-use commonware_codec::Encode;
 use commonware_codec::EncodeSize;
-use commonware_cryptography::{Hasher, Sha256};
 use commonware_glue::stateful::db::DatabaseSet;
 use commonware_runtime::Spawner;
 use commonware_storage::Context as StorageContext;
 use hellas_kernel::InvalidProofReason;
 use hellas_kernel::{
-    ApplyError, CloseKind, Coin as KernelCoin, CoinId, Context as KernelContext, EdgeId, Event,
-    EventKind, Move as KernelMove, Proof as KernelProof, RegistryChunkId, RegistryDiff, State,
-    TermsProfile, Tx as KernelTx, bond_lease_slots, pending_payment_close_slot,
+    ApplyError, BOND_LEASE_CHUNKS, CloseKind, Coin as KernelCoin, CoinId, Context as KernelContext,
+    EdgeId, Event, EventKind, LeaseSlots, Move as KernelMove, Proof as KernelProof,
+    RegistryChunkId, RegistryDiff, Reshape, State, TermsProfile, Tx as KernelTx, bond_lease_slots,
+    parse_bond_lease, pending_payment_close_slot,
 };
 use thiserror::Error;
 use tracing::warn;
@@ -31,24 +29,6 @@ pub enum ExecutionError {
         expected: ObjectKind,
         actual: ObjectKind,
     },
-    #[error("invalid signature")]
-    InvalidSignature,
-    #[error("insufficient balance: available={available} requested={requested}")]
-    InsufficientBalance { available: u64, requested: u64 },
-    #[error("transfer amount must be > 0")]
-    ZeroAmount,
-    #[error("duplicate merge input: {id:?}")]
-    DuplicateInput { id: ObjectId },
-    #[error("merge requires at least 2 inputs")]
-    TooFewMergeInputs,
-    #[error("merge inputs must be strictly increasing")]
-    NonCanonicalMergeInputs,
-    #[error("merge inputs must have the same owner")]
-    MergeOwnerMismatch,
-    #[error("merge overflowed u64 total")]
-    MergeOverflow,
-    #[error("output object collision: {id:?}")]
-    OutputCollision { id: ObjectId },
     #[error("executed {0} root differs from the certified block")]
     RootMismatch(&'static str),
     #[error("storage error: {0}")]
@@ -82,33 +62,6 @@ impl ExecutionError {
 
 fn storage_err<E: core::fmt::Debug>(err: E) -> ExecutionError {
     ExecutionError::Storage(format!("{err:?}"))
-}
-
-fn require_coin(id: ObjectId, object: Option<Object>) -> Result<Coin, ExecutionError> {
-    match object {
-        Some(Object::Coin(coin)) => Ok(coin),
-        Some(object) => Err(ExecutionError::WrongObjectKind {
-            id,
-            expected: ObjectKind::Coin,
-            actual: object.kind(),
-        }),
-        None => Err(ExecutionError::ObjectNotFound { id }),
-    }
-}
-
-fn legacy_owner_address(owner: SettlementKey) -> Result<Address, ExecutionError> {
-    Address::try_from(owner).map_err(|_| ExecutionError::InvalidSignature)
-}
-
-async fn object_exists<E>(batches: &Batch<E>, id: &ObjectId) -> Result<bool, ExecutionError>
-where
-    E: StorageContext + Spawner + Send + Sync + 'static,
-{
-    batches
-        .get(id)
-        .await
-        .map(|value| value.is_some())
-        .map_err(storage_err)
 }
 
 pub async fn execute_all<E>(
@@ -214,13 +167,7 @@ fn genesis_coins(
                 );
                 return None;
             };
-            Some((
-                genesis_object_id(index),
-                Coin {
-                    owner: *owner,
-                    value: *balance,
-                },
-            ))
+            Some((genesis_object_id(index), Coin::owned(*owner, *balance)))
         })
 }
 
@@ -249,7 +196,7 @@ where
 }
 
 async fn apply_transaction<E>(
-    mut batches: Batch<E>,
+    batches: Batch<E>,
     context: KernelContext,
     verifier: &ChainVerifier,
     tx: &Transaction,
@@ -258,169 +205,6 @@ where
     E: StorageContext + Spawner + Send + Sync + 'static,
 {
     match tx {
-        Transaction::Transfer {
-            input,
-            recipient,
-            amount,
-            ..
-        } => {
-            let object = match batches.get(input).await.map_err(storage_err) {
-                Ok(object) => object,
-                Err(err) => return Err((batches, err).into()),
-            };
-            let coin = match require_coin(*input, object) {
-                Ok(coin) => coin,
-                Err(err) => return Err((batches, err).into()),
-            };
-            let owner = match legacy_owner_address(coin.owner) {
-                Ok(owner) => owner,
-                Err(err) => return Err((batches, err).into()),
-            };
-            if !tx.verify_signature(context.network(), &owner) {
-                return Err((batches, ExecutionError::InvalidSignature).into());
-            }
-            if *amount == 0 {
-                return Err((batches, ExecutionError::ZeroAmount).into());
-            }
-            if *amount > coin.value {
-                return Err((
-                    batches,
-                    ExecutionError::InsufficientBalance {
-                        available: coin.value,
-                        requested: *amount,
-                    },
-                )
-                    .into());
-            }
-
-            let tx_digest = Sha256::hash(&tx.encode());
-            let recipient_id = output_object_id(&tx_digest, 0);
-            match object_exists(&batches, &recipient_id).await {
-                Ok(false) => {}
-                Ok(true) => {
-                    return Err((
-                        batches,
-                        ExecutionError::OutputCollision { id: recipient_id },
-                    )
-                        .into());
-                }
-                Err(err) => return Err((batches, err).into()),
-            }
-
-            let change_value = coin.value - amount;
-            let change_id = if change_value > 0 {
-                let id = output_object_id(&tx_digest, 1);
-                let exists = if id == recipient_id {
-                    true
-                } else {
-                    match object_exists(&batches, &id).await {
-                        Ok(exists) => exists,
-                        Err(err) => return Err((batches, err).into()),
-                    }
-                };
-                if exists {
-                    return Err((batches, ExecutionError::OutputCollision { id }).into());
-                }
-                Some(id)
-            } else {
-                None
-            };
-
-            batches = super::owner_tree::write_owned(batches, *input, None).await?;
-            batches = super::owner_tree::write_owned(
-                batches,
-                recipient_id,
-                Some(Object::Coin(Coin {
-                    owner: SettlementKey::from(recipient),
-                    value: *amount,
-                })),
-            )
-            .await?;
-
-            if let Some(change_id) = change_id {
-                batches = super::owner_tree::write_owned(
-                    batches,
-                    change_id,
-                    Some(Object::Coin(Coin {
-                        owner: coin.owner,
-                        value: change_value,
-                    })),
-                )
-                .await?;
-            }
-            Ok(batches)
-        }
-        Transaction::MergeCoin { inputs, .. } => {
-            if let Some(fault) = merge_input_fault(inputs.as_slice()) {
-                return Err((
-                    batches,
-                    match fault {
-                        MergeInputFault::TooFew => ExecutionError::TooFewMergeInputs,
-                        MergeInputFault::Duplicate(id) => ExecutionError::DuplicateInput { id },
-                        MergeInputFault::NonCanonical => ExecutionError::NonCanonicalMergeInputs,
-                    },
-                )
-                    .into());
-            }
-
-            let mut owner: Option<SettlementKey> = None;
-            let mut total = 0u64;
-            for input in inputs {
-                let object = match batches.get(input).await.map_err(storage_err) {
-                    Ok(object) => object,
-                    Err(err) => return Err((batches, err).into()),
-                };
-                let coin = match require_coin(*input, object) {
-                    Ok(coin) => coin,
-                    Err(err) => return Err((batches, err).into()),
-                };
-                if let Some(expected_owner) = owner.as_ref() {
-                    if &coin.owner != expected_owner {
-                        return Err((batches, ExecutionError::MergeOwnerMismatch).into());
-                    }
-                } else {
-                    owner = Some(coin.owner);
-                }
-                total = match total.checked_add(coin.value) {
-                    Some(total) => total,
-                    None => return Err((batches, ExecutionError::MergeOverflow).into()),
-                };
-            }
-            let Some(owner) = owner else {
-                return Err((batches, ExecutionError::MergeOwnerMismatch).into());
-            };
-            let address = match legacy_owner_address(owner) {
-                Ok(address) => address,
-                Err(err) => return Err((batches, err).into()),
-            };
-            if !tx.verify_signature(context.network(), &address) {
-                return Err((batches, ExecutionError::InvalidSignature).into());
-            }
-
-            let tx_digest = Sha256::hash(&tx.encode());
-            let output_id = output_object_id(&tx_digest, 0);
-            match object_exists(&batches, &output_id).await {
-                Ok(false) => {}
-                Ok(true) => {
-                    return Err((batches, ExecutionError::OutputCollision { id: output_id }).into());
-                }
-                Err(err) => return Err((batches, err).into()),
-            }
-
-            for input in inputs {
-                batches = super::owner_tree::write_owned(batches, *input, None).await?;
-            }
-            batches = super::owner_tree::write_owned(
-                batches,
-                output_id,
-                Some(Object::Coin(Coin {
-                    owner,
-                    value: total,
-                })),
-            )
-            .await?;
-            Ok(batches)
-        }
         Transaction::Kernel(tx) => apply_kernel_transaction(batches, context, verifier, tx).await,
     }
 }
@@ -560,8 +344,17 @@ where
             if let KernelProof::Timeout { terms } = proof
                 && matches!(terms.profile(), TermsProfile::WorkStakeBond(_))
             {
-                for slot in bond_lease_slots(context.network(), *input) {
+                let slots = bond_lease_slots(context.network(), *input);
+                for slot in slots {
                     load_registry_chunk_slot(batches, &mut working, slot).await?;
+                }
+                // A present lease is decided by whether the payment edge
+                // it names still exists, so that edge is declared too.
+                // Its id is only knowable from the lease itself; a lease
+                // that does not parse names no edge, and the kernel
+                // refuses it on its own read.
+                if let Some(payment_edge) = leased_payment_edge(&working, input, slots) {
+                    load_edge_slot(batches, &mut working, payment_edge).await?;
                 }
             }
         }
@@ -582,8 +375,32 @@ where
             )
             .await?;
         }
+        // A reshape consumes its inputs and issues its outputs, and owns
+        // nothing else.
+        KernelTx::Owner(reshape) => {
+            for id in reshape.inputs() {
+                load_coin_slot(batches, &mut working, *id).await?;
+            }
+            let outputs =
+                Reshape::output_ids(context.network(), reshape.inputs(), reshape.outputs());
+            for id in &outputs {
+                load_coin_slot(batches, &mut working, *id).await?;
+            }
+        }
     }
     Ok(working)
+}
+
+/// The payment edge a bond's loaded lease names, if the lease is whole.
+fn leased_payment_edge(
+    working: &BlockWorkingSet,
+    bond: &EdgeId,
+    slots: [RegistryChunkId; BOND_LEASE_CHUNKS as usize],
+) -> Option<EdgeId> {
+    match parse_bond_lease(slots.map(|slot| working.registry_chunk(slot)), *bond) {
+        LeaseSlots::Present(lease) => Some(lease.payment_edge()),
+        LeaseSlots::Absent | LeaseSlots::Faulty(_) => None,
+    }
 }
 
 // `State::apply` uses the same MissingCoin/MissingEdge variants during its
@@ -630,7 +447,8 @@ fn classify_kernel_error(working: &BlockWorkingSet, source: ApplyError) -> Execu
         | ApplyError::InvalidOpen { .. }
         | ApplyError::InvalidClose { .. }
         | ApplyError::InvalidProof { .. }
-        | ApplyError::InvalidMove { .. } => ExecutionError::KernelApply { error: source },
+        | ApplyError::InvalidMove { .. }
+        | ApplyError::InvalidReshape { .. } => ExecutionError::KernelApply { error: source },
     }
 }
 
@@ -699,6 +517,46 @@ where
                 Ok(next) => next,
                 Err((next, error)) => return (next, Some(error)),
             };
+            for id in outputs {
+                let Some(coin) = working.coin(*id) else {
+                    return (
+                        batches,
+                        Some(ExecutionError::KernelHostContract {
+                            error: ApplyError::MissingCoin { id: *id },
+                        }),
+                    );
+                };
+                batches = match super::owner_tree::write_owned(
+                    batches,
+                    coin_object_id(*id),
+                    Some(Object::Coin(Coin::from(coin))),
+                )
+                .await
+                .map_err(|failure| *failure)
+                {
+                    Ok(next) => next,
+                    Err((next, error)) => return (next, Some(error)),
+                };
+            }
+        }
+        EventKind::CoinsReshaped { inputs, outputs } => {
+            for id in inputs {
+                if working.coin(*id).is_some() {
+                    return (
+                        batches,
+                        Some(ExecutionError::KernelHostContract {
+                            error: ApplyError::CoinChanged { id: *id },
+                        }),
+                    );
+                }
+                batches = match super::owner_tree::write_owned(batches, coin_object_id(*id), None)
+                    .await
+                    .map_err(|failure| *failure)
+                {
+                    Ok(next) => next,
+                    Err((next, error)) => return (next, Some(error)),
+                };
+            }
             for id in outputs {
                 let Some(coin) = working.coin(*id) else {
                     return (
@@ -871,6 +729,15 @@ where
                                 )
                             }));
                         }
+                        EventKind::CoinsReshaped { inputs, outputs } => {
+                            changes.extend(inputs.iter().map(|id| (coin_object_id(*id), None)));
+                            changes.extend(outputs.iter().map(|id| {
+                                (
+                                    coin_object_id(*id),
+                                    working.coin(*id).map(|coin| Object::Coin(Coin::from(coin))),
+                                )
+                            }));
+                        }
                     }
                 }
                 changes.extend(outcome.registry().into_iter().map(|mutation| {
@@ -903,34 +770,16 @@ where
     let mut batches =
         maybe_seed_genesis(context, genesis_allocations, batches, Some(&mut changes)).await?;
     for tx in txs {
-        if let Transaction::Kernel(kernel) = tx {
-            batches = apply_kernel_transaction_observed(
-                batches,
-                context,
-                verifier,
-                kernel,
-                Some(&mut changes),
-            )
-            .await
-            .map_err(|failure| failure.1)?;
-        } else {
-            batches = apply_transaction(batches, context, verifier, tx)
-                .await
-                .map_err(|failure| failure.1)?;
-            let digest = Sha256::hash(&tx.encode());
-            let mut ids = vec![output_object_id(&digest, 0)];
-            match tx {
-                Transaction::Transfer { input, .. } => {
-                    ids.push(*input);
-                    ids.push(output_object_id(&digest, 1));
-                }
-                Transaction::MergeCoin { inputs, .. } => ids.extend(inputs.iter().copied()),
-                Transaction::Kernel(_) => unreachable!(),
-            }
-            for id in ids {
-                changes.push((id, batches.get(&id).await.map_err(storage_err)?));
-            }
-        }
+        let Transaction::Kernel(kernel) = tx;
+        batches = apply_kernel_transaction_observed(
+            batches,
+            context,
+            verifier,
+            kernel,
+            Some(&mut changes),
+        )
+        .await
+        .map_err(|failure| failure.1)?;
     }
     Ok((batches, changes))
 }

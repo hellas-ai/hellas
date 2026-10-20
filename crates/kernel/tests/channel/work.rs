@@ -9,8 +9,8 @@
 
 use super::*;
 use hellas_kernel::{
-    BOND_LEASE_CHUNKS, BondLease, BondLeaseFault, PaymentContestCommitment, SigVerifier,
-    WebAuthnAssertion, WorkPaymentTerms, WorkStakeBondTerms, bond_lease_slot, bond_lease_slots,
+    BOND_LEASE_CHUNKS, BondLease, BondLeaseFault, PartyAuth, PartyKeys, PaymentContestCommitment,
+    SigVerifier, WorkPaymentTerms, WorkStakeBondTerms, bond_lease_slot, bond_lease_slots,
     check_response,
 };
 use std::cell::Cell;
@@ -71,7 +71,7 @@ fn open_work_bond_state() -> State<FixedStore<6, 1>> {
 
 fn payment_bond() -> WorkStakeBondTerms {
     WorkStakeBondTerms {
-        parties: Parties::new(TAKER, MAKER),
+        parties: Parties::new(PartyKeys::sole(TAKER), PartyKeys::sole(MAKER)),
         timeout_outputs: list(&[Payout::new(TAKER, STAKE)]),
         ..bond()
     }
@@ -195,18 +195,38 @@ fn work_bond_open_checks_every_conjunct_of_its_policy() {
     }
 }
 
-/// The stake is the edge's own value, so an unfunded bond is refused as
-/// a zero-value stake rather than accepted as a bond insuring nothing.
+/// The stake is the edge's own value, so a bond funded only with a
+/// worthless coin is refused as a zero-value stake rather than accepted
+/// as a bond insuring nothing — and a bond funded with nothing at all is
+/// refused before that, because its maker's owner is proved by nothing.
 #[test]
 fn work_bond_open_rejects_a_zero_value_stake() {
     let terms = work_terms_of(WorkStakeBondTerms {
         timeout_outputs: list(&[Payout::new(MAKER, 0)]),
         ..bond()
     });
-    let funding = Funding::new(empty_party(), empty_party());
+
+    let unfunded = Funding::new(empty_party(), empty_party());
+    let output = Tx::edge_id_of(&unfunded, &terms);
+    let open = open_tx(unfunded, terms.clone());
+    let mut empty = funded_state_for(&work_open());
+    let store = *empty.store();
+    assert_eq!(
+        empty.apply(CONTEXT, &FAKE_VERIFIER, &open),
+        Err(ApplyError::InvalidOpen {
+            output,
+            reason: InvalidOpenReason::WorkStakeMakerUnfunded,
+        }),
+    );
+    assert_eq!(*empty.store(), store);
+
+    let funding = Funding::new(list(&[EXTRA_COIN]), empty_party());
     let output = Tx::edge_id_of(&funding, &terms);
     let open = open_tx(funding, terms);
-    let mut state = funded_state_for(&work_open());
+    let mut state = state(
+        store_for(&open),
+        [MAKER_SEED, TAKER_SEED, Genesis::coin(EXTRA_COIN, MAKER, 0)],
+    );
     let store = *state.store();
 
     assert_eq!(
@@ -242,35 +262,6 @@ fn work_bond_open_rejects_client_funding() {
         }),
     );
     assert_eq!(*state.store(), store);
-}
-
-/// Work profiles run on the parties' own secp256k1 keys. An open a
-/// passkey authorized would commit a channel neither party could move.
-#[test]
-fn work_opens_admit_native_authorization_only() {
-    let assertion = WebAuthnAssertion::new([1; 32], [2; 32], [3; 32], [4; 32], list(&[5, 6, 7]));
-    for terms in [work_terms(), payment_terms()] {
-        let funding = work_funding();
-        let output = Tx::edge_id_of(&funding, &terms);
-        let hash = Tx::open_hash(support::NETWORK, &funding, &terms);
-        let open = Tx::open(
-            funding,
-            terms,
-            Auth::webauthn(assertion.clone()),
-            Auth::native(Sig::placeholder(TAKER, hash)),
-        );
-        let mut state = funded_state_for(&work_open());
-        let store = *state.store();
-
-        assert_eq!(
-            state.apply(CONTEXT, &FAKE_VERIFIER, &open),
-            Err(ApplyError::InvalidOpen {
-                output,
-                reason: InvalidOpenReason::WorkAuthNotNative,
-            }),
-        );
-        assert_eq!(*state.store(), store);
-    }
 }
 
 /// The payment edge has no timeout close and no payout fixed at open:
@@ -511,13 +502,16 @@ fn certificate(amount: u64) -> EarnedCertificate {
 
 /// A certificate signed by the client, which is the only party whose
 /// signature the kernel accepts on one.
-fn signed_certificate(amount: u64) -> (EarnedCertificate, Sig) {
+fn signed_certificate(amount: u64) -> (EarnedCertificate, PartyAuth) {
     signed_certificate_by(MAKER, certificate(amount))
 }
 
-fn signed_certificate_by(key: Key, certificate: EarnedCertificate) -> (EarnedCertificate, Sig) {
+fn signed_certificate_by(
+    key: Key,
+    certificate: EarnedCertificate,
+) -> (EarnedCertificate, PartyAuth) {
     let sig = Sig::placeholder(key, certificate.digest(support::NETWORK));
-    (certificate, sig)
+    (certificate, PartyAuth::owner(sig))
 }
 
 const fn key_of(role: Party) -> Key {
@@ -527,7 +521,7 @@ const fn key_of(role: Party) -> Key {
     }
 }
 
-fn earned_digest_of(certificate: Option<&(EarnedCertificate, Sig)>) -> PayloadHash {
+fn earned_digest_of(certificate: Option<&(EarnedCertificate, PartyAuth)>) -> PayloadHash {
     certificate.map_or_else(
         || no_earned_digest(payment_edge_id(), payment_terms_hash()),
         |(certificate, _)| certificate.digest(support::NETWORK),
@@ -537,7 +531,7 @@ fn earned_digest_of(certificate: Option<&(EarnedCertificate, Sig)>) -> PayloadHa
 fn start_body(
     role: Party,
     validity: (u64, u64),
-    certificate: Option<(EarnedCertificate, Sig)>,
+    certificate: Option<(EarnedCertificate, PartyAuth)>,
     signer: Key,
 ) -> PaymentCloseStart {
     let digest = start_digest(
@@ -554,7 +548,7 @@ fn start_body(
         role,
         validity,
         certificate,
-        Sig::placeholder(signer, digest),
+        PartyAuth::owner(Sig::placeholder(signer, digest)),
     )
 }
 
@@ -570,7 +564,7 @@ fn start_tx(role: Party, amount: Option<u64>) -> Tx {
 fn response_body(
     start: StartId,
     role: Party,
-    certificate: (EarnedCertificate, Sig),
+    certificate: (EarnedCertificate, PartyAuth),
     signer: Key,
 ) -> PaymentCloseResponse {
     let digest = response_digest(
@@ -586,7 +580,7 @@ fn response_body(
         start,
         role,
         certificate,
-        Sig::placeholder(signer, digest),
+        PartyAuth::owner(Sig::placeholder(signer, digest)),
     )
 }
 
@@ -620,8 +614,8 @@ fn freeze_tx(earned: u64, validity: (u64, u64), provider: u64) -> Tx {
         Proof::freeze(
             earned,
             validity,
-            Sig::placeholder(MAKER, digest),
-            Sig::placeholder(TAKER, digest),
+            PartyAuth::owner(Sig::placeholder(MAKER, digest)),
+            PartyAuth::owner(Sig::placeholder(TAKER, digest)),
         ),
         payment_payouts(provider, PAYMENT_VALUE - provider),
     )
@@ -913,7 +907,7 @@ fn assert_response_corresponds<const C: usize, const E: usize, const R: usize>(
     let applied = state.apply(
         context,
         &FAKE_VERIFIER,
-        &Tx::move_action(Move::RespondPaymentClose(*response)),
+        &Tx::move_action(Move::RespondPaymentClose(response.clone())),
     );
 
     match (checked, applied) {
@@ -966,12 +960,12 @@ fn response_on_work_bond() -> PaymentCloseResponse {
         unknown_start(),
         Party::Taker,
         signed_certificate_by(MAKER, earned),
-        Sig::from_bytes([0; Sig::LENGTH]),
+        PartyAuth::owner(Sig::from_bytes([0; Sig::LENGTH])),
     )
 }
 
 /// A certificate the client really signed, for another edge entirely.
-fn certificate_for_another_edge() -> (EarnedCertificate, Sig) {
+fn certificate_for_another_edge() -> (EarnedCertificate, PartyAuth) {
     let earned = EarnedCertificate::new(
         EdgeId::from_bytes([0x77; EdgeId::LENGTH]),
         payment_terms_hash(),
@@ -982,13 +976,13 @@ fn certificate_for_another_edge() -> (EarnedCertificate, Sig) {
 
 /// A certificate the client really signed, on this edge but under terms
 /// that are not this channel's.
-fn certificate_for_other_terms() -> (EarnedCertificate, Sig) {
+fn certificate_for_other_terms() -> (EarnedCertificate, PartyAuth) {
     signed_certificate_by(MAKER, EarnedCertificate::new(payment_edge_id(), terms(), 5))
 }
 
 /// This channel's own certificate, signed by the provider instead of the
 /// client — the only party whose signature the kernel accepts on one.
-fn provider_signed_certificate() -> (EarnedCertificate, Sig) {
+fn provider_signed_certificate() -> (EarnedCertificate, PartyAuth) {
     signed_certificate_by(TAKER, certificate(5))
 }
 
@@ -1034,7 +1028,7 @@ impl Verdict {
 }
 
 /// One predicate of the response check, and the verdict it is owed.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct Predicate {
     /// What this case is called when it fails.
     case: &'static str,
@@ -1053,6 +1047,10 @@ struct Predicate {
 /// answer, the nine refusals of an answer to one, and the acceptance. A
 /// predicate added to the kernel and not to this list leaves the count
 /// short; a row that stops mattering leaves it long.
+#[allow(
+    clippy::large_stack_arrays,
+    reason = "fourteen inline responses, each carrying two bounded party witnesses"
+)]
 fn response_predicates(start: StartId) -> [Predicate; 14] {
     [
         Predicate {
@@ -1210,7 +1208,7 @@ fn a_start_binds_to_the_payment_terms_of_a_payment_edge() {
         Party::Taker,
         START_VALIDITY,
         None,
-        Sig::from_bytes([0; 64]),
+        PartyAuth::owner(Sig::from_bytes([0; 64])),
     )));
     assert_start_rejected(
         &mut state,
@@ -1226,7 +1224,7 @@ fn a_start_binds_to_the_payment_terms_of_a_payment_edge() {
         Party::Taker,
         START_VALIDITY,
         None,
-        Sig::from_bytes([0; 64]),
+        PartyAuth::owner(Sig::from_bytes([0; 64])),
     )));
     let store = *bond_state.store();
     assert_eq!(
@@ -1533,7 +1531,7 @@ fn a_certificate_signed_for_another_network_does_not_settle_here() {
     let earned = certificate(5);
     let foreign = (
         earned,
-        Sig::placeholder(MAKER, earned.digest(OTHER_NETWORK)),
+        PartyAuth::owner(Sig::placeholder(MAKER, earned.digest(OTHER_NETWORK))),
     );
 
     assert_start_rejected(
@@ -1565,8 +1563,8 @@ fn a_certificate_signed_for_another_network_does_not_settle_here() {
                 Proof::freeze(
                     5,
                     START_VALIDITY,
-                    Sig::placeholder(MAKER, digest),
-                    Sig::placeholder(TAKER, digest),
+                    PartyAuth::owner(Sig::placeholder(MAKER, digest)),
+                    PartyAuth::owner(Sig::placeholder(TAKER, digest)),
                 ),
                 payment_payouts(5, PAYMENT_VALUE - 5),
             ),
@@ -1726,7 +1724,7 @@ fn a_response_is_refused_on_an_edge_that_is_not_a_payment_channel() {
             MAKER,
             EarnedCertificate::new(work_edge(), work_terms().hash(), 1),
         ),
-        Sig::from_bytes([0; 64]),
+        PartyAuth::owner(Sig::from_bytes([0; 64])),
     )));
     let store = *bond_state.store();
     assert_eq!(
@@ -1812,7 +1810,7 @@ fn a_response_needs_both_of_its_signatures() {
             opened.start_id(),
             Party::Taker,
             forged,
-            Sig::placeholder(TAKER, digest),
+            PartyAuth::owner(Sig::placeholder(TAKER, digest)),
         ))),
         InvalidMoveReason::BadCertificateSignature,
     );
@@ -1996,7 +1994,12 @@ fn a_freeze_needs_both_parties() {
             CONTEXT,
             &Tx::close(
                 payment_edge_id(),
-                Proof::freeze(6, validity, maker, taker),
+                Proof::freeze(
+                    6,
+                    validity,
+                    PartyAuth::owner(maker),
+                    PartyAuth::owner(taker),
+                ),
                 payment_payouts(6, PAYMENT_VALUE - 6),
             ),
             InvalidProofReason::BadSignature,
@@ -2044,15 +2047,15 @@ fn corrupted_record_bytes(
         panic!("a contest is live");
     };
     let mut bytes = [0_u8; hellas_kernel::REGISTRY_CHUNK_DATA_CAPACITY + 1];
-    bytes[..102].copy_from_slice(chunk.data());
+    bytes[..103].copy_from_slice(chunk.data());
     match corruption {
         Corruption::Byte(offset) => {
             bytes[offset] ^= 0xff;
-            list(&bytes[..102])
+            list(&bytes[..103])
         }
         // 121 bytes is one past a chunk's data capacity.
         Corruption::Longer => list(&bytes[..]),
-        Corruption::Shorter => list(&bytes[..101]),
+        Corruption::Shorter => list(&bytes[..102]),
     }
 }
 
@@ -2197,18 +2200,18 @@ fn payment_close_costs_are_the_assigned_vectors() {
 /// different places, one of these two operations is refused.
 #[test]
 fn a_work_bond_prices_its_lease_reading_timeout_under_nonzero_fees() {
-    /// The provider's coin: open fee 7, lifetime fee 3, reserve 22.
-    const FUNDED: u64 = 40;
+    /// The provider's coin: open fee 7, lifetime fee 3, reserve 25.
+    const FUNDED: u64 = 43;
     /// What the edge locks once those three are taken.
     const STAKED: u64 = 8;
-    /// `STAKED` plus the reserve left after a 13-unit timeout close.
+    /// `STAKED` plus the reserve left after a 16-unit timeout close.
     const RETURNED: u64 = 17;
 
     const FEE_COIN: CoinId = coin_id(0x53);
     let seed = Genesis::coin(FEE_COIN, TAKER, FUNDED);
     let outputs = list(&[Payout::new(TAKER, RETURNED)]);
     let terms = Terms::work_stake_bond(WorkStakeBondTerms {
-        parties: Parties::new(TAKER, MAKER),
+        parties: Parties::new(PartyKeys::sole(TAKER), PartyKeys::sole(MAKER)),
         timeout_outputs: outputs.clone(),
         ..bond()
     });
@@ -2227,7 +2230,7 @@ fn a_work_bond_prices_its_lease_reading_timeout_under_nonzero_fees() {
         panic!("bond edge live");
     };
     assert_eq!(live.value(), STAKED);
-    assert_eq!(live.reserve(), 22);
+    assert_eq!(live.reserve(), 25);
 
     // Unleased, so it closes at once — and for exactly the committed
     // payout, which the open accepted only because both sides priced
@@ -2255,9 +2258,9 @@ fn a_work_bond_prices_its_lease_reading_timeout_under_nonzero_fees() {
 /// Slots count every physical store slot a transition touches: a
 /// payment open reaches for its funding coin, the edge it creates, the
 /// bond it verifies, and both chunks of the lease it writes, and a
-/// tag-4 timeout reads both lease chunks before it can know which
-/// height rule governs it. The generic Basic vectors are pinned beside
-/// them because the work profiles must not reprice them.
+/// tag-4 timeout reads both lease chunks, and the payment edge a present
+/// lease names, before it can know which height rule governs it. The
+/// generic Basic vectors are pinned beside them.
 #[test]
 fn work_open_and_bond_timeout_costs_are_the_assigned_vectors() {
     assert_eq!(
@@ -2265,15 +2268,14 @@ fn work_open_and_bond_timeout_costs_are_the_assigned_vectors() {
         Cost::new(1, 5, 2),
     );
     assert_eq!(payment_bond_open().cost(), Cost::new(1, 2, 2));
-    assert_eq!(bond_timeout_tx().cost(), Cost::new(1, 4, 1));
+    assert_eq!(bond_timeout_tx().cost(), Cost::new(1, 5, 1));
 
-    // Generic, unchanged: one funding coin and one edge at open, one
-    // edge and one payout at timeout, and no charged proof units on the
-    // open's two signatures.
+    // Generic: one funding coin and one edge at open, one edge and one
+    // payout at timeout, and one proof unit for each party's witness.
     let generic = basic_terms();
     let funding = Funding::new(list(&[MAKER_COIN]), empty_party());
     let edge = Tx::edge_id_of(&funding, &generic);
-    assert_eq!(open_tx(funding, generic.clone()).cost(), Cost::new(1, 2, 0));
+    assert_eq!(open_tx(funding, generic.clone()).cost(), Cost::new(1, 2, 2));
     assert_eq!(
         Tx::close(
             edge,
@@ -2885,7 +2887,8 @@ fn the_public_payout_helper_builds_the_close_consensus_accepts() {
     assert_eq!(settlement.capacity(), PAYMENT_CAPACITY);
     assert_eq!(settlement.omission_bond(), OMISSION_BOND);
 
-    let Ok(outputs) = adjudicated_payouts(settlement, PARTIES, record.final_cumulative(), false)
+    let Ok(outputs) =
+        adjudicated_payouts(settlement, PARTIES, record.final_cumulative(), false, false)
     else {
         panic!("a contest inside capacity has payouts");
     };
@@ -2900,7 +2903,8 @@ fn the_public_payout_helper_builds_the_close_consensus_accepts() {
     ) else {
         panic!("the inflated settlement is representable");
     };
-    let Ok(over) = adjudicated_payouts(inflated, PARTIES, record.final_cumulative(), true) else {
+    let Ok(over) = adjudicated_payouts(inflated, PARTIES, record.final_cumulative(), true, false)
+    else {
         panic!("the inflated payout is representable");
     };
     assert_close_rejected(
@@ -2940,14 +2944,19 @@ fn the_public_payout_helper_covers_both_penalty_values() {
         PARTIES,
         answered.final_cumulative(),
         answered.penalty_due(),
+        false,
     ) else {
         panic!("the proved understatement has payouts");
     };
 
     // MUTATION: the same contest settled as though nothing were proved.
-    let Ok(unpenalised) =
-        adjudicated_payouts(settlement, PARTIES, answered.final_cumulative(), false)
-    else {
+    let Ok(unpenalised) = adjudicated_payouts(
+        settlement,
+        PARTIES,
+        answered.final_cumulative(),
+        false,
+        false,
+    ) else {
         panic!("the unpenalised payout is representable");
     };
     let seal =
@@ -2979,7 +2988,7 @@ fn the_public_freeze_payout_matches_the_cooperative_close() {
     let settlement = settlement_of(&state, OMISSION_BOND);
     assert_eq!(settlement.freeze_total(), PAYMENT_VALUE);
 
-    let Ok(outputs) = freeze_payouts(settlement, PARTIES, 6, 0) else {
+    let Ok(outputs) = freeze_payouts(settlement, PARTIES, 6, 0, false) else {
         panic!("a freeze inside capacity has payouts");
     };
     let validity = (1, 1);
@@ -2998,8 +3007,8 @@ fn the_public_freeze_payout_matches_the_cooperative_close() {
             Proof::freeze(
                 6,
                 validity,
-                Sig::placeholder(MAKER, digest),
-                Sig::placeholder(TAKER, digest),
+                PartyAuth::owner(Sig::placeholder(MAKER, digest)),
+                PartyAuth::owner(Sig::placeholder(TAKER, digest)),
             ),
             list(&outputs),
         ),
@@ -3056,7 +3065,8 @@ fn nonzero_fees_separate_the_two_routes_and_the_capacity_they_imply() {
     let Some(record) = pending_record(&state) else {
         panic!("the start wrote a contest");
     };
-    let Ok(outputs) = adjudicated_payouts(settlement, PARTIES, record.final_cumulative(), false)
+    let Ok(outputs) =
+        adjudicated_payouts(settlement, PARTIES, record.final_cumulative(), false, false)
     else {
         panic!("a contest at capacity has payouts");
     };
@@ -3142,12 +3152,13 @@ fn a_settlement_that_cannot_be_priced_is_absent() {
         panic!("the largest edge is representable");
     };
     assert_eq!(
-        adjudicated_payouts(settlement, PARTIES, u64::MAX, true),
+        adjudicated_payouts(settlement, PARTIES, u64::MAX, true, false),
         Err(InvalidProofReason::PayoutOverCapacity),
         "adding the forfeited bond must not wrap",
     );
     assert_eq!(
-        adjudicated_payouts(settlement, PARTIES, u64::MAX, false).map(|payouts| payouts[1].value()),
+        adjudicated_payouts(settlement, PARTIES, u64::MAX, false, false)
+            .map(|payouts| payouts[1].value()),
         Ok(0),
     );
 }

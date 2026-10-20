@@ -5,9 +5,9 @@ use crate::work_config::{ChainCrossCheck, WorkConfig};
 use hellas_auth::ProducerSigningKey;
 use hellas_kernel::{
     BlockHeight, Decode as _, Edge, EdgeId, EdgeValues, Fees, Key, LeaseSlots, List,
-    MAX_EDGE_OUTPUTS, NetworkId, Parties, Payout, PendingSlot, RegistryChunk, RegistryNamespace,
-    RegistryRecordTag, Secp256k1Signer, Secp256k1Verifier, Terms, TermsHash, WorkPaymentTerms,
-    WorkStakeBondTerms, work_payment_settlement,
+    MAX_EDGE_OUTPUTS, NetworkId, Parties, PartyKeys, Payout, PendingSlot, RegistryChunk,
+    RegistryNamespace, RegistryRecordTag, Secp256k1Signer, Secp256k1Verifier, Terms, TermsHash,
+    WorkPaymentTerms, WorkStakeBondTerms, work_payment_settlement,
 };
 use hellas_rpc::{Assurance, Retention};
 use hellas_work::model::fetch::{
@@ -137,7 +137,10 @@ impl PaidFixture {
             route,
         };
         let bond_terms = WorkStakeBondTerms {
-            parties: Parties::new(signer(2).party_key(), signer(1).party_key()),
+            parties: Parties::new(
+                PartyKeys::sole(signer(2).party_key()),
+                PartyKeys::sole(signer(1).party_key()),
+            ),
             timeout: BlockHeight::new(HORIZON),
             timeout_outputs: List::take(
                 [Payout::new(signer(2).party_key(), 64); MAX_EDGE_OUTPUTS],
@@ -325,8 +328,12 @@ fn edge(value: u64, reserve: u64, maker: Key, taker: Key, terms: TermsHash, allo
     bytes.extend_from_slice(&[1, 1]);
     bytes.extend_from_slice(&HORIZON.to_be_bytes());
     bytes.extend_from_slice(&[1, 3]);
-    bytes.extend_from_slice(&maker.to_bytes());
-    bytes.extend_from_slice(&taker.to_bytes());
+    // Each party: owner, signer, and an absent payout delegate.
+    for party in [maker, taker] {
+        bytes.extend_from_slice(&party.to_bytes());
+        bytes.extend_from_slice(&party.to_bytes());
+        bytes.push(0);
+    }
     bytes.extend_from_slice(terms.as_bytes());
     bytes.push(allowed);
     Edge::decode_exact(&bytes).unwrap()

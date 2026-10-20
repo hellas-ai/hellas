@@ -17,8 +17,8 @@ use support::{FAKE_VERIFIER, FixedStore, list, open_tx};
 
 use hellas_kernel::{
     Auth, BlockHash, BlockHeight, CloseKind, CoinId, Context, Event, EventKind, Funding, Genesis,
-    Key, List, MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Parties, Payout, Proof,
-    ProtocolCode, Sig, State, Terms, Tx,
+    Key, List, MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Parties, PartyAuth, PartyKeys,
+    Payout, Proof, ProtocolCode, Sig, State, Terms, Tx,
 };
 
 const CONTEXT: Context = Context::new(
@@ -31,7 +31,7 @@ const CONTEXT: Context = Context::new(
 fn open_resolve_and_operation_match_do_not_allocate() {
     let maker_key = Key::from_bytes([7; Key::LENGTH]);
     let taker_key = Key::from_bytes([8; Key::LENGTH]);
-    let parties = Parties::new(maker_key, taker_key);
+    let parties = Parties::new(PartyKeys::sole(maker_key), PartyKeys::sole(taker_key));
     let maker = CoinId::from_bytes([1; CoinId::LENGTH]);
     let taker = CoinId::from_bytes([2; CoinId::LENGTH]);
     let funding_value = funding(maker, taker);
@@ -54,8 +54,14 @@ fn open_resolve_and_operation_match_do_not_allocate() {
     let expected_close = Tx::close(
         edge,
         Proof::mutual(
-            Auth::native(Sig::placeholder(maker_key, expected_close_hash)),
-            Auth::native(Sig::placeholder(taker_key, expected_close_hash)),
+            PartyAuth::owner(Auth::native(Sig::placeholder(
+                maker_key,
+                expected_close_hash,
+            ))),
+            PartyAuth::owner(Auth::native(Sig::placeholder(
+                taker_key,
+                expected_close_hash,
+            ))),
         ),
         close_outputs.clone(),
     );
@@ -84,8 +90,8 @@ fn open_resolve_and_operation_match_do_not_allocate() {
             &outputs,
         );
         let proof = Proof::mutual(
-            Auth::native(Sig::placeholder(maker_key, close_hash)),
-            Auth::native(Sig::placeholder(taker_key, close_hash)),
+            PartyAuth::owner(Auth::native(Sig::placeholder(maker_key, close_hash))),
+            PartyAuth::owner(Auth::native(Sig::placeholder(taker_key, close_hash))),
         );
         let open = open_tx(funding(maker, taker), terms, maker_key, taker_key);
         assert_eq!(open, expected_open.clone());

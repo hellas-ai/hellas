@@ -14,8 +14,8 @@ use hellas_client::work::reproduce::{
     ReproduceFault, Reproduced, Reproducer, Reproduction, ReproductionRequest, plan, reproduce,
 };
 use hellas_kernel::{
-    BlockHeight, EdgeId, List, MAX_EDGE_OUTPUTS, NetworkId, Parties, Payout, Secp256k1Signer,
-    WorkPaymentTerms, WorkStakeBondTerms,
+    BlockHeight, EdgeId, List, MAX_EDGE_OUTPUTS, NetworkId, Parties, PartyKeys, Payout,
+    Secp256k1Signer, WorkPaymentTerms, WorkStakeBondTerms,
 };
 use hellas_rpc::evaluate::{
     EvaluateOutputTranscriptBuilder, EvaluateStopReason, EvaluateTerminal, EvaluateUsage,
@@ -88,7 +88,10 @@ fn payment_terms() -> WorkPaymentTerms {
     WorkPaymentTerms {
         bond_edge: EdgeId::from_bytes([0x11; 32]),
         bond_terms: WorkStakeBondTerms {
-            parties: Parties::new(provider().party_key(), client().party_key()),
+            parties: Parties::new(
+                PartyKeys::sole(provider().party_key()),
+                PartyKeys::sole(client().party_key()),
+            ),
             timeout: BlockHeight::new(HORIZON),
             timeout_outputs: List::take(
                 [Payout::new(provider().party_key(), 64); MAX_EDGE_OUTPUTS],

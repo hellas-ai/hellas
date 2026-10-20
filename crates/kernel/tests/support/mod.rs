@@ -13,9 +13,9 @@ pub(crate) mod map_store;
 
 use hellas_kernel::{
     Auth, Batch, BlockHeight, CloseKind, Coin, CoinId, Edge, EdgeId, Funding, Genesis, InsertError,
-    KernelResult, Key, List, MAX_EDGE_OUTPUTS, NetworkId, Parties, PayloadHash, Payout, Proof,
-    RegistryChunk, RegistryChunkId, RegistryNamespace, Sig, SigVerifier, Snapshot, State, Store,
-    Terms, TermsHash, Tx, View,
+    KernelResult, Key, List, MAX_EDGE_OUTPUTS, NetworkId, Parties, PartyAuth, PayloadHash, Payout,
+    Proof, RegistryChunk, RegistryChunkId, RegistryNamespace, Sig, SigVerifier, Snapshot, State,
+    Store, Terms, TermsHash, Tx, View,
 };
 
 /// The network every fixture in this crate's tests is bound to.
@@ -335,7 +335,7 @@ pub(crate) const fn coin_view(coin: Coin) -> (Key, u64) {
     (coin.owner(), coin.value())
 }
 
-pub(crate) const fn edge_view(edge: Edge) -> (u64, u64, BlockHeight, Parties, TermsHash) {
+pub(crate) const fn edge_view(edge: &Edge) -> (u64, u64, BlockHeight, Parties, TermsHash) {
     (
         edge.value(),
         edge.reserve(),
@@ -376,8 +376,8 @@ pub(crate) fn open_tx(funding: Funding, terms: Terms, maker: Key, taker: Key) ->
     Tx::open(
         funding,
         terms,
-        Auth::native(Sig::placeholder(maker, hash)),
-        Auth::native(Sig::placeholder(taker, hash)),
+        PartyAuth::owner(Auth::native(Sig::placeholder(maker, hash))),
+        PartyAuth::owner(Auth::native(Sig::placeholder(taker, hash))),
     )
 }
 
@@ -391,8 +391,8 @@ pub(crate) fn placeholder_mutual(
 ) -> Proof {
     let hash = mutual_hash(input, terms, outputs);
     Proof::mutual(
-        Auth::native(Sig::placeholder(maker, hash)),
-        Auth::native(Sig::placeholder(taker, hash)),
+        PartyAuth::owner(Auth::native(Sig::placeholder(maker, hash))),
+        PartyAuth::owner(Auth::native(Sig::placeholder(taker, hash))),
     )
 }
 

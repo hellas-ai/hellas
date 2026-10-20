@@ -24,7 +24,9 @@ use support::l1::{
 };
 use support::{FAKE_VERIFIER, FixedStore, l1};
 
-use hellas_kernel::{Auth, BlockHash, BlockHeight, CloseKind, Context, NetworkId, Sig, State, Tx};
+use hellas_kernel::{
+    Auth, BlockHash, BlockHeight, CloseKind, Context, NetworkId, PartyAuth, Sig, State, Tx,
+};
 
 /// A second network, identical to the test network in every respect
 /// except its name.
@@ -63,8 +65,8 @@ fn open_for(network: NetworkId) -> Tx {
     Tx::open(
         funding,
         terms,
-        Auth::native(Sig::placeholder(MAKER, hash)),
-        Auth::native(Sig::placeholder(TAKER, hash)),
+        PartyAuth::owner(Auth::native(Sig::placeholder(MAKER, hash))),
+        PartyAuth::owner(Auth::native(Sig::placeholder(TAKER, hash))),
     )
 }
 

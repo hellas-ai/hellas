@@ -12,8 +12,8 @@
 
 use hellas_auth::{Digest, PublicKey};
 use hellas_kernel::{
-    BlockHeight, EarnedCertificate, EdgeId, EdgeValues, Fees, List, NetworkId, Parties, Payout,
-    Secp256k1Signer, Secp256k1Verifier, SigVerifier, TermsHash, WorkPaymentSettlement,
+    BlockHeight, EarnedCertificate, EdgeId, EdgeValues, Fees, List, NetworkId, Parties, PartyKeys,
+    Payout, Secp256k1Signer, Secp256k1Verifier, SigVerifier, TermsHash, WorkPaymentSettlement,
     WorkPaymentTerms, WorkStakeBondTerms, work_payment_settlement,
 };
 use hellas_rpc::evaluate::{EvaluateStopReason, EvaluateTerminal, EvaluateUsage};
@@ -108,7 +108,10 @@ fn payment_terms() -> WorkPaymentTerms {
     let bond = WorkStakeBondTerms {
         // Bond maker is the provider, taker is the client; the payment
         // edge mirrors that, which is where `PaidChannel` reads its keys.
-        parties: Parties::new(provider().party_key(), client().party_key()),
+        parties: Parties::new(
+            PartyKeys::sole(provider().party_key()),
+            PartyKeys::sole(client().party_key()),
+        ),
         timeout: BlockHeight::new(5_000),
         timeout_outputs: List::take(
             [
@@ -535,11 +538,11 @@ fn golden_digests_bind_the_encoded_network() {
     let channel = channel();
     assert_eq!(
         hex(channel.id().as_bytes()),
-        "3fb8c6063009d6fa39e41884fcbc325ce0886f34e5ca0ff9f7893fcb9f29cb66"
+        "a5f19693d012ce8a1b6aa6094ecc34e9bbe005587825bc4e193a484f0ab60251"
     );
     assert_eq!(
         hex(&work_id(&channel, &authorization()).into_bytes()),
-        "fdc1f978817cfe2d3374705dc56acd1b678dc6cba3345c945db70787ca725051"
+        "d7495faa86b30ee323b5fbba1bd889a781badd2566b9beb67c48f7bb4b808c2a"
     );
 
     let other = channel_on(
@@ -560,7 +563,7 @@ fn golden_digests_bind_the_encoded_network() {
     assert_eq!(Digest::hash(&preimage), other.id());
     assert_eq!(
         hex(other.id().as_bytes()),
-        "2242df9d621b8156cec0a1903919d46739dd79665df31e04e5bb5499174e5191"
+        "eb36293e12b4cd91c64c361051d23af77f51734fab4085f215be10af3c8d98c0"
     );
 }
 
@@ -2431,7 +2434,7 @@ fn digest_preimages_are_reproducible_by_hand() {
     assert_eq!(preimage.len(), 30 + 16 + 32 + 98);
     assert_eq!(
         hex(&Digest::hash(&preimage).into_bytes()),
-        "83bb5166e608eb7e0ef4078074ead44efc220474a264c149205820e0caa5da70"
+        "75c96eb08b677491f8b3124f120017e23cd316654b0ea40fa2a65e8c992be9a3"
     );
 
     // The payment binding, whose three fields are all 32 bytes: a round
@@ -2457,7 +2460,7 @@ fn digest_preimages_are_reproducible_by_hand() {
     );
     assert_eq!(
         hex(&payment_binding_digest(&channel, &binding).into_bytes()),
-        "5a4a09be82eeeb121ca16ce6cefa64a8318af45d37c522c9141eaff96851940b"
+        "715c9a47cd79490b150f871960e472254962b87c28d3b0fdb65edfa11fc06531"
     );
 }
 
@@ -2512,7 +2515,7 @@ fn the_canonical_output_preimage_is_reproducible_by_hand() {
     );
     assert_eq!(
         hex(&Digest::hash(&preimage).into_bytes()),
-        "782f58af12859938749283772c36b3269f6b0506197dcde7ef3466ab3ef81b68"
+        "5a6e996c508376c257f74686658da3c0597fc3519bdacf9a59a00741f4eec8ee"
     );
 }
 

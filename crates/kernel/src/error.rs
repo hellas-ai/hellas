@@ -153,6 +153,12 @@ pub enum ApplyError {
         reason: InvalidMoveReason,
     },
 
+    /// An owner's reshape is not admissible.
+    InvalidReshape {
+        /// Specific reason the reshape was rejected.
+        reason: InvalidReshapeReason,
+    },
+
     /// A transition produced a registry diff its own bound refuses.
     ///
     /// A transition bug, not user input: an operation decides which slots
@@ -210,11 +216,29 @@ pub enum InvalidOpenReason {
     /// edge principal plus timeout reserve surplus under the open-time close
     /// fee schedule.
     TermsValueMismatch,
-    /// A funding coin's owner does not match its party's settlement key.
-    /// The maker funding list must contain coins owned by
-    /// `terms.parties().maker()`; the taker funding list, by
-    /// `terms.parties().taker()`.
+    /// A funding coin's owner is not its party's committed owner. The
+    /// maker funding list must contain coins owned by
+    /// `terms.parties().maker().owner()`; the taker funding list, by the
+    /// taker's.
     FundingUnauthorized,
+    /// A signer-authorized party spends a coin not delegated to that
+    /// signer. A delegate reaches exactly the coins its owner delegated
+    /// to it, and no others of the same owner.
+    FundingNotDelegated,
+    /// A signer-authorized party commits a payout delegate other than
+    /// itself or none. A delegate may keep its earnings spendable by
+    /// itself, but may never hand them to another key.
+    PayoutDelegateNotSigner,
+    /// A basic open carries a signer-authorized party. A basic edge
+    /// pays its committed timeout outputs with no signature at all, so a
+    /// delegate that could open one could park its owner's coins until a
+    /// height of its choosing with no exit for the owner; only the work
+    /// profiles, whose every shape leaves the owner a bounded exit, admit
+    /// a delegate.
+    BasicAuthNotOwner,
+    /// A committed timeout payout lands somewhere other than exactly one
+    /// of the two parties' committed destinations.
+    TimeoutPayoutNotCommitted,
     /// One of the open signatures was rejected by the configured
     /// `SigVerifier`. Both maker and taker must sign the canonical open
     /// hash for the produced edge.
@@ -230,15 +254,21 @@ pub enum InvalidOpenReason {
     /// so any other routing would let the stake return to the wrong
     /// party.
     WorkStakeReturnRouting,
-    /// A work-profile open carries a `WebAuthn` authorization. These
-    /// profiles' later moves need the parties' own secp256k1
-    /// signatures, so an open they could not follow up on is refused.
-    WorkAuthNotNative,
+    /// A work-stake-bond open carries no maker funding. The bond is the
+    /// provider's stake, and its owner is proved by the coins that fund
+    /// it.
+    WorkStakeMakerUnfunded,
     /// A work-stake-bond open carries taker funding. The bond is the
     /// provider's stake alone; a client contribution would be
     /// transferred to the provider by a permissionless unleased
     /// timeout.
     WorkStakeTakerFunded,
+    /// A work-payment open carries taker funding. The client funds the
+    /// channel; the provider's stake is the bond.
+    WorkPaymentTakerFunded,
+    /// A work-payment open carries no maker funding. The client's
+    /// owner is proved by the coins that fund the channel.
+    WorkPaymentMakerUnfunded,
     /// Work-payment terms commit a zero or over-long response window.
     WorkResponseWindowOutOfRange,
     /// Work-payment terms commit a zero or over-long start validity
@@ -404,8 +434,13 @@ pub enum InvalidProofReason {
     /// A `Proof::Timeout` was submitted before the committed timeout height.
     TimeoutNotReached,
     /// A `Proof::Timeout` carries payouts that do not equal
-    /// `Terms::timeout_outputs`.
+    /// `Terms::timeout_outputs`, or a work-payment exit carries payouts
+    /// other than the exact split its contest or freeze settles.
     PayoutMismatch,
+    /// A mutual close pays somewhere other than exactly one of the two
+    /// committed destinations, with the delegate stripped when either
+    /// party signed as its owner.
+    PayoutNotCommitted,
     /// An adjudicated close names an edge with no live contest. The
     /// contest *is* the proof, so its absence leaves nothing adjudicated.
     ClosePendingMissing,
@@ -438,4 +473,20 @@ pub enum InvalidProofReason {
     /// rule, and a rejection rather than a wrapping subtraction because
     /// the alternative is paying the client from nothing.
     PayoutOverCapacity,
+}
+
+/// Specific reason [`ApplyError::InvalidReshape`] refused a reshape.
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+pub enum InvalidReshapeReason {
+    /// The reshape consumes no coin, so there is no owner to authorize it.
+    NoInputs,
+    /// The inputs are not all owned by one key.
+    OwnerMismatch,
+    /// The input or output values overflowed when summed.
+    ValueOverflow,
+    /// The outputs do not carry exactly the value the inputs held.
+    ValueMismatch,
+    /// The owner's authorization did not verify over the reshape's
+    /// payload hash.
+    BadSignature,
 }

@@ -19,8 +19,9 @@ mod support;
 
 use hellas_kernel::{
     ApplyError, Auth, BlockHash, BlockHeight, CloseKind, CoinId, Context, Funding, Genesis,
-    InvalidProofReason, Key, List, MAX_EDGE_OUTPUTS, Parties, PayloadHash, Payout, Proof,
-    ProtocolCode, Secp256k1Signer, Secp256k1Verifier, Sig, SigVerifier, State, Terms, Tx,
+    InvalidProofReason, Key, List, MAX_EDGE_OUTPUTS, Parties, PartyAuth, PartyKeys, PayloadHash,
+    Payout, Proof, ProtocolCode, Secp256k1Signer, Secp256k1Verifier, Sig, SigVerifier, State,
+    Terms, Tx,
 };
 use secp256k1::{Message, SecretKey, ecdsa};
 use support::{FixedStore, list};
@@ -91,7 +92,7 @@ fn high_s_counterpart_of_valid_signature_is_rejected() {
 fn mutual_with_real_ecdsa_signatures_closes_under_production_verifier() {
     let (maker_sk, maker_pk) = keypair(1);
     let (taker_sk, taker_pk) = keypair(2);
-    let parties = Parties::new(maker_pk, taker_pk);
+    let parties = Parties::new(PartyKeys::sole(maker_pk), PartyKeys::sole(taker_pk));
     let outputs = payouts(maker_pk, taker_pk);
     let timeout_outputs = payouts(maker_pk, taker_pk);
     let terms = Terms::basic(ProtocolCode::new(1), parties, TIMEOUT, timeout_outputs);
@@ -104,8 +105,8 @@ fn mutual_with_real_ecdsa_signatures_closes_under_production_verifier() {
     let open = Tx::open(
         funding,
         terms,
-        sign(&maker_sk, open_hash),
-        sign(&taker_sk, open_hash),
+        PartyAuth::owner(sign(&maker_sk, open_hash)),
+        PartyAuth::owner(sign(&taker_sk, open_hash)),
     );
     let close_hash = Tx::payload_hash(
         support::NETWORK,
@@ -114,7 +115,10 @@ fn mutual_with_real_ecdsa_signatures_closes_under_production_verifier() {
         terms_hash,
         &outputs,
     );
-    let proof = Proof::mutual(sign(&maker_sk, close_hash), sign(&taker_sk, close_hash));
+    let proof = Proof::mutual(
+        PartyAuth::owner(sign(&maker_sk, close_hash)),
+        PartyAuth::owner(sign(&taker_sk, close_hash)),
+    );
     let maker_out = outputs.as_slice()[0].id(edge, 0);
     let taker_out = outputs.as_slice()[1].id(edge, 1);
     let close = Tx::close(edge, proof, outputs);
@@ -143,7 +147,7 @@ fn mutual_with_real_ecdsa_signatures_closes_under_production_verifier() {
 fn forged_signature_is_rejected_by_real_verifier() {
     let (maker_sk, maker_pk) = keypair(1);
     let (taker_sk, taker_pk) = keypair(2);
-    let parties = Parties::new(maker_pk, taker_pk);
+    let parties = Parties::new(PartyKeys::sole(maker_pk), PartyKeys::sole(taker_pk));
     let outputs = payouts(maker_pk, taker_pk);
     let terms = Terms::basic(ProtocolCode::new(1), parties, TIMEOUT, outputs.clone());
     let terms_hash = terms.hash();
@@ -157,8 +161,8 @@ fn forged_signature_is_rejected_by_real_verifier() {
     let open = Tx::open(
         funding,
         terms,
-        sign(&maker_sk, open_hash),
-        sign(&taker_sk, open_hash),
+        PartyAuth::owner(sign(&maker_sk, open_hash)),
+        PartyAuth::owner(sign(&taker_sk, open_hash)),
     );
     let close_hash = Tx::payload_hash(
         support::NETWORK,
@@ -168,7 +172,10 @@ fn forged_signature_is_rejected_by_real_verifier() {
         &outputs,
     );
     // Sign with maker's key in *both* slots — taker's signature is forged.
-    let proof = Proof::mutual(sign(&maker_sk, close_hash), sign(&maker_sk, close_hash));
+    let proof = Proof::mutual(
+        PartyAuth::owner(sign(&maker_sk, close_hash)),
+        PartyAuth::owner(sign(&maker_sk, close_hash)),
+    );
     let maker_out = outputs.as_slice()[0].id(edge, 0);
     let taker_out = outputs.as_slice()[1].id(edge, 1);
     let close = Tx::close(edge, proof, outputs);

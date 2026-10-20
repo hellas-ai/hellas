@@ -29,11 +29,11 @@ use crate::{
     event::Change,
     lease::{BondLease, create_mutations as create_lease, read_bond_lease},
     object::{Edge, Parties},
-    primitive::{EdgeId, Party, Sig, TermsHash},
+    primitive::{EdgeId, Party, TermsHash},
     registry::{RegistryDiff, RegistryMutation},
     store::Batch,
     terms::{Terms, TermsProfile, WorkPaymentTerms},
-    tx::{CloseKind, PaymentContestCommitment},
+    tx::{CloseKind, PartyAuth, PaymentContestCommitment, verify_party},
     verifier::SigVerifier,
     work::{
         EarnedCertificate, PaymentCloseResponse, PaymentCloseStart, PendingPaymentClose,
@@ -130,11 +130,11 @@ where
     // also pay for signature verification.
     let earned_digest = match start.certificate() {
         None => crate::work::no_earned_digest(input, edge.terms()),
-        Some((certificate, sig)) => {
+        Some((certificate, auth)) => {
             let digest = certificate.digest(context.network());
             // Only the client signs a certificate. A provider-signed one
             // would be the provider paying itself.
-            if !verifier.verify_sig(*sig, edge.parties().maker(), digest) {
+            if !verify_party(verifier, auth, edge.parties().maker(), digest) {
                 return Err(reject(InvalidMoveReason::BadCertificateSignature));
             }
             digest
@@ -148,9 +148,10 @@ where
         (start.valid_from_height(), start.valid_through_height()),
         earned_digest,
     );
-    if !verifier.verify_sig(
-        start.action_sig(),
-        start.opener_role().key_of(edge.parties()),
+    if !verify_party(
+        verifier,
+        start.action(),
+        start.opener_role().keys_of(edge.parties()),
         start_digest,
     ) {
         return Err(reject(InvalidMoveReason::BadSignature));
@@ -161,8 +162,8 @@ where
         start.opener_role(),
         crate::work::start_id(start_digest, height),
         response_deadline,
-        claimed,
-        payment.omission_bond,
+        (claimed, payment.omission_bond),
+        start.action().is_owner(),
     );
     let chunk = record.to_chunk().ok_or_else(|| {
         reject(InvalidMoveReason::ClosePendingFault {
@@ -254,22 +255,27 @@ where
         response.responder_role(),
         earned_digest,
     );
-    if !verifier.verify_sig(
-        response.action_sig(),
-        response.responder_role().key_of(edge.parties()),
+    if !verify_party(
+        verifier,
+        response.action(),
+        response.responder_role().keys_of(edge.parties()),
         digest,
     ) {
         return Err(reject(InvalidMoveReason::BadSignature));
     }
-    if !verifier.verify_sig(
-        response.certificate_sig(),
+    if !verify_party(
+        verifier,
+        response.certificate_auth(),
         edge.parties().maker(),
         earned_digest,
     ) {
         return Err(reject(InvalidMoveReason::BadCertificateSignature));
     }
 
-    Ok(record.responded_at(certificate.earned_cumulative()))
+    Ok(record.responded_at(
+        certificate.earned_cumulative(),
+        response.action().is_owner(),
+    ))
 }
 
 /// Applies a [`PaymentCloseResponse`].
@@ -348,7 +354,14 @@ pub(super) fn check_adjudicated<B: Batch>(
         .final_cumulative()
         .checked_add(record.penalty())
         .ok_or(InvalidProofReason::PayoutOverCapacity)?;
-    check_split(edge.parties(), total, provider, outputs)?;
+    // No signature here, so the contest's own actions decide the
+    // delegates: an owner that started or answered it is exiting.
+    check_split(
+        edge.parties(),
+        (total, provider),
+        record.owner_signed(),
+        outputs,
+    )?;
 
     // Recomputed and byte-compared rather than verified: it names
     // the contest state this transaction expects to settle, so a close
@@ -366,7 +379,7 @@ pub(super) fn check_adjudicated<B: Batch>(
 /// Checks a `Proof::Freeze` and returns the registry write it makes.
 pub(super) fn check_freeze<B, V>(
     close: CloseSubject<'_>,
-    freeze: (u64, (u64, u64), Sig, Sig),
+    freeze: (u64, (u64, u64), &PartyAuth, &PartyAuth),
     context: Context,
     verifier: &V,
     batch: &B,
@@ -381,7 +394,7 @@ where
         total,
         outputs,
     } = close;
-    let (earned, validity, maker_sig, taker_sig) = freeze;
+    let (earned, validity, maker_auth, taker_auth) = freeze;
     let height = context.block_height().get();
     // Consensus bounds the freeze window itself: the terms bound the
     // start's, and a cooperative close carries no terms to bound its own.
@@ -422,13 +435,18 @@ where
                 .ok_or(InvalidProofReason::PayoutOverCapacity)?
         }
     };
-    check_split(edge.parties(), total, provider, outputs)?;
+    // An owner signing the freeze, or an owner that acted on the contest
+    // it ends, is exiting the delegation: the payouts are undelegated.
+    let owner_signed = maker_auth.is_owner()
+        || taker_auth.is_owner()
+        || pending.is_some_and(|record| record.owner_signed());
+    check_split(edge.parties(), (total, provider), owner_signed, outputs)?;
 
     let digest =
         crate::work::freeze_digest(context.network(), input, edge.terms(), earned, validity);
     let parties = edge.parties();
-    if !verifier.verify_sig(maker_sig, parties.maker(), digest)
-        || !verifier.verify_sig(taker_sig, parties.taker(), digest)
+    if !verify_party(verifier, maker_auth, parties.maker(), digest)
+        || !verify_party(verifier, taker_auth, parties.taker(), digest)
     {
         return Err(InvalidProofReason::BadSignature);
     }
@@ -628,7 +646,8 @@ fn check_capacity(edge: &Edge, omission_bond: u64, amount: u64) -> Result<(), In
     Ok(())
 }
 
-/// A work-payment close pays exactly two coins, provider first.
+/// A work-payment close pays exactly two coins, provider first, each at
+/// its party's committed destination.
 ///
 /// The shape is fixed rather than carried because the cost is: the open
 /// reserved four slots for two payouts, so a close with a different
@@ -637,11 +656,12 @@ fn check_capacity(edge: &Edge, omission_bond: u64, amount: u64) -> Result<(), In
 /// subtraction and not a second opinion.
 fn check_split(
     parties: Parties,
-    total: u64,
-    provider_total: u64,
+    amounts: (u64, u64),
+    owner_signed: bool,
     outputs: &Payouts,
 ) -> Result<(), InvalidProofReason> {
-    let expected = split_payouts(parties, total, provider_total)?;
+    let (total, provider_total) = amounts;
+    let expected = split_payouts(parties, total, provider_total, owner_signed)?;
     if outputs.as_slice() == expected.as_slice() {
         Ok(())
     } else {

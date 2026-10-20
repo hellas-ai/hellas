@@ -7,8 +7,7 @@ license.workspace = true
 [features]
 default = []
 otel = ["hellas-rpc?/otel"]
-# Chain/light-client domain vocabulary: addresses, transactions, and
-# WebAuthn challenge derivation (`domain` module).
+# Chain/light-client domain vocabulary: settlement keys and transactions.
 domain = [
     "dep:hellas-auth",
     "dep:bs58",
@@ -17,7 +16,6 @@ domain = [
     "dep:commonware-cryptography",
     "dep:hellas-genesis",
     "dep:hellas-kernel",
-    "dep:hellas-webauthn",
     "dep:p256",
     "dep:serde",
     "dep:serde_json",
@@ -185,7 +183,6 @@ hellas-genesis = { workspace = true, optional = true }
 hellas-kernel = { workspace = true, optional = true, default-features = false }
 hellas-private = { workspace = true, optional = true }
 hellas-rpc = { workspace = true, optional = true, features = ["chain"] }
-hellas-webauthn = { workspace = true, optional = true, features = ["der"] }
 hellas-wire = { workspace = true, optional = true }
 hellas-work = { workspace = true, optional = true }
 hex = { workspace = true, optional = true }

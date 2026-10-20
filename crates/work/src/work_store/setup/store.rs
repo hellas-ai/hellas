@@ -84,32 +84,36 @@ impl SetupStore {
     /// [`WorkStoreError::Setup`] when the step is not one this state
     /// may take — which is checked before anything is written — and
     /// [`WorkStoreError::Journal`] when the append or its sync fails.
-    pub async fn commit<V: SigVerifier>(
-        &mut self,
+    pub fn commit<'a, V: SigVerifier>(
+        &'a mut self,
         record: SetupRecord,
         verifier: &V,
-    ) -> Result<&SetupState, WorkStoreError> {
-        check_signatures(&record, verifier)?;
-        // Applied to a copy first: a record that the rules refuse must
-        // leave neither the file nor the state touched.
-        let mut next = self.state.clone();
-        if next.apply(&record)? == Applied::Changed {
-            // A revision is exported after this returns, so the state
-            // that authorises it has to be one a rotation can still
-            // carry. Refused here, before the append and before the
-            // signature leaves, rather than at the rotation that finds
-            // out too late.
-            if record.exports_signature() {
-                let len = next.checkpoint().len();
-                if len > MAX_CHECKPOINT_BYTES {
-                    return Err(JournalError::CheckpointTooLarge { len }.into());
+    ) -> impl std::future::Future<Output = Result<&'a SetupState, WorkStoreError>> {
+        // Keep the retained setup copy and journal-write future off callers'
+        // poll stacks; witnesses are bounded inline in the no-alloc kernel.
+        Box::pin(async move {
+            check_signatures(&record, verifier)?;
+            // Applied to a copy first: a record that the rules refuse must
+            // leave neither the file nor the state touched.
+            let mut next = self.state.clone();
+            if next.apply(&record)? == Applied::Changed {
+                // A revision is exported after this returns, so the state
+                // that authorises it has to be one a rotation can still
+                // carry. Refused here, before the append and before the
+                // signature leaves, rather than at the rotation that finds
+                // out too late.
+                if record.exports_signature() {
+                    let len = next.checkpoint().len();
+                    if len > MAX_CHECKPOINT_BYTES {
+                        return Err(JournalError::CheckpointTooLarge { len }.into());
+                    }
                 }
+                self.rotate_if_full(record.is_new_work()).await?;
+                self.journal.append(&record.encode()).await?;
+                self.state = next;
             }
-            self.rotate_if_full(record.is_new_work()).await?;
-            self.journal.append(&record.encode()).await?;
-            self.state = next;
-        }
-        Ok(&self.state)
+            Ok(&self.state)
+        })
     }
 
     /// Moves the journal on to its next generation, carrying this state

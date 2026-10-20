@@ -145,8 +145,8 @@ exactly the two lease writes.
 
 ## What the directory holds now, and what it dropped
 
-Four executable modules and their shared vocabulary. `l1.qnt` and
-`l1_fees.qnt` are the roots: typechecked, `quint test`ed, `quint run`
+Three executable roots and their shared vocabulary. `l1.qnt`,
+`l1_fees.qnt` and `delegation.qnt` are the roots: typechecked, `quint test`ed, `quint run`
 with named invariants, `quint verify`ed by Apalache, and — this is the
 part that makes them evidence rather than decoration — exported as ITF
 traces and replayed against the kernel by `tests/itf.rs`, which compares
@@ -154,7 +154,14 @@ coin owners and values, edge value, reserve, committed close fee,
 timeout, parties and terms hash, the emitted event, and the rejection of
 every input the model refused. `types.qnt`, `verifier.qnt`,
 `accounting.qnt`, `terms.qnt`, `bounds.qnt` and `rules/invariants.qnt`
-are their vocabulary and are reached through them.
+are the L1 models’ vocabulary and are reached through them.
+
+`delegation.qnt` tracks coin owner and delegate separately and checks consuming
+reshapes, signer admission, committed destinations and owner-signed recovery.
+Its eight ITF traces replay the same decisions against `State::apply`, including
+rejected transactions and the full live coin set. It covers Basic edges and
+unleased work-stake bonds; payment contests and leased-bond recovery remain
+covered by the concrete `tests/delegation.rs` transaction tests, not this model.
 
 Three things were removed because they modelled a system that does not
 exist, and the removal is recorded here rather than only in a commit

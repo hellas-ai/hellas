@@ -14,8 +14,9 @@ use super::soft_passkey::{
 };
 use crate::{
     Auth, CloseKind, CoinId, EdgeId, Funding, Key, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS,
-    MAX_WEBAUTHN_DATA_LENGTH, NetworkId, Parties, PayloadHash, Payout, Proof, ProtocolCode, Terms,
-    Tx, WebAuthnAssertion, consts::P256_COORDINATE_LENGTH, context::BlockHeight,
+    MAX_WEBAUTHN_DATA_LENGTH, NetworkId, Parties, PartyAuth, PartyKeys, PayloadHash, Payout, Proof,
+    ProtocolCode, Terms, Tx, WebAuthnAssertion, consts::P256_COORDINATE_LENGTH,
+    context::BlockHeight,
 };
 
 /// Number of named invalid fixtures returned by [`negative_assertions`].
@@ -150,8 +151,8 @@ pub fn valid_mutual_close_assertion() -> Result<WebAuthnFixture, SoftPasskeyErro
 /// assembly fails.
 pub fn valid_open_tx() -> Result<Tx, SoftPasskeyError> {
     let context = fixture_context()?;
-    let maker_auth = Auth::webauthn(context.passkey.sign(context.open_hash)?);
-    let taker_auth = Auth::webauthn(context.other.sign(context.open_hash)?);
+    let maker_auth = PartyAuth::owner(Auth::webauthn(context.passkey.sign(context.open_hash)?));
+    let taker_auth = PartyAuth::owner(Auth::webauthn(context.other.sign(context.open_hash)?));
     Ok(Tx::open(
         context.funding,
         context.terms,
@@ -169,8 +170,12 @@ pub fn valid_open_tx() -> Result<Tx, SoftPasskeyError> {
 /// assembly fails.
 pub fn valid_mutual_close_tx() -> Result<Tx, SoftPasskeyError> {
     let context = fixture_context()?;
-    let maker_auth = Auth::webauthn(context.passkey.sign(context.mutual_close_hash)?);
-    let taker_auth = Auth::webauthn(context.other.sign(context.mutual_close_hash)?);
+    let maker_auth = PartyAuth::owner(Auth::webauthn(
+        context.passkey.sign(context.mutual_close_hash)?,
+    ));
+    let taker_auth = PartyAuth::owner(Auth::webauthn(
+        context.other.sign(context.mutual_close_hash)?,
+    ));
     Ok(Tx::close(
         context.edge,
         Proof::mutual(maker_auth, taker_auth),
@@ -342,7 +347,10 @@ fn fixture_context() -> Result<FixtureContext, SoftPasskeyError> {
     let outputs = List::take(payout_values, 2);
     let terms = Terms::basic(
         ProtocolCode::new(1),
-        Parties::new(passkey.party_key(), other.party_key()),
+        Parties::new(
+            PartyKeys::sole(passkey.party_key()),
+            PartyKeys::sole(other.party_key()),
+        ),
         BlockHeight::new(100),
         outputs.clone(),
     );

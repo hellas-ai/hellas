@@ -28,8 +28,8 @@ use hellas_client::work::{CheckedResult, CollectOutcome, collect_checked_result}
 use hellas_kernel::{
     BlockHash, BlockHeight, CoinId, Context as KernelContext, EdgeId, EdgeValues, Fees, Funding,
     List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, MIN_OMIT_RESPONSE_BLOCKS, Move, Parties, Party,
-    Payout, PendingSlot, Secp256k1Signer, Secp256k1Verifier, Terms as KernelTerms, Tx as KernelTx,
-    WorkPaymentTerms, WorkStakeBondTerms,
+    PartyKeys, Payout, PendingSlot, Secp256k1Signer, Secp256k1Verifier, Terms as KernelTerms,
+    Tx as KernelTx, WorkPaymentTerms, WorkStakeBondTerms,
 };
 use hellas_rpc::call::WithTrailer;
 use hellas_rpc::evaluate::{
@@ -232,7 +232,10 @@ fn no_coins() -> List<CoinId, MAX_PARTY_INPUTS> {
 
 fn bond_terms() -> WorkStakeBondTerms {
     WorkStakeBondTerms {
-        parties: Parties::new(provider().party_key(), client().party_key()),
+        parties: Parties::new(
+            PartyKeys::sole(provider().party_key()),
+            PartyKeys::sole(client().party_key()),
+        ),
         timeout: BlockHeight::new(HORIZON),
         timeout_outputs: List::take(
             [Payout::new(provider().party_key(), PROVIDER_STAKE); MAX_EDGE_OUTPUTS],

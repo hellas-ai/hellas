@@ -4,14 +4,14 @@ use crate::execution::{
     ChainVerifier,
     store::{UtxoDatabase, utxo_db_config},
     test_support::{
-        index_block, index_genesis, kernel_fixture, kernel_fixture_at, legacy_address, run_qmdb,
-        validator_key,
+        index_block, index_genesis, kernel_fixture, kernel_fixture_at, owner_key, owner_signer,
+        run_qmdb,
     },
 };
 use crate::owner_index::{ApplyOutcome, OwnerIndex};
 use commonware_glue::stateful::db::{DatabaseSet, Merkleized as _, Unmerkleized as _};
 use commonware_runtime::{Supervisor as _, tokio};
-use hellas_kernel::{BlockHash, BlockHeight, InsertError};
+use hellas_kernel::{BlockHash, BlockHeight, InsertError, PartyAuth, PartyKeys};
 use std::collections::{BTreeMap, BTreeSet};
 
 fn context(height: u64) -> KernelContext {
@@ -102,45 +102,22 @@ async fn assert_index_matches_qmdb(
 
     let mut edge_owners: BTreeSet<_> = known_edge_owners.iter().copied().collect();
     for (id, edge) in &edges {
-        let indexed = crate::owner_index::IndexedEdge::from(edge.parties());
+        let indexed = edge.parties();
         assert_eq!(indexed_edges.get(id), Some(&indexed));
-        edge_owners.insert(indexed.maker);
-        edge_owners.insert(indexed.taker);
+        edge_owners.extend(crate::owner_index::edge_keys(indexed));
     }
     for owner in edge_owners {
         let expected: Vec<_> = edges
             .iter()
             .filter_map(|(id, edge)| {
-                let indexed = crate::owner_index::IndexedEdge::from(edge.parties());
-                (owner == indexed.maker || owner == indexed.taker).then_some((*id, indexed))
+                let indexed = edge.parties();
+                crate::owner_index::edge_keys(indexed)
+                    .contains(&owner)
+                    .then_some((*id, indexed))
             })
             .collect();
         assert_eq!(index.get_edges_by_owner(&owner), expected);
     }
-}
-
-#[test]
-fn edge_in_coin_slot_is_typed_and_non_transient() {
-    let id = ObjectId::from([0x44; 32]);
-    let err = require_coin(id, Some(Object::Edge(crate::domain::test_edge())))
-        .expect_err("edge is not a coin");
-    assert_eq!(
-        err,
-        ExecutionError::WrongObjectKind {
-            id,
-            expected: ObjectKind::Coin,
-            actual: ObjectKind::Edge,
-        }
-    );
-    assert!(!err.is_transient_for_mempool());
-}
-
-#[test]
-fn non_p256_owner_is_invalid_not_transient() {
-    let owner = SettlementKey::from_bytes([0xa5; SettlementKey::LENGTH]);
-    let err = legacy_owner_address(owner).expect_err("not a P-256 point");
-    assert_eq!(err, ExecutionError::InvalidSignature);
-    assert!(!err.is_transient_for_mempool());
 }
 
 #[test]
@@ -191,38 +168,51 @@ fn qmdb_genesis_open_mutual_close_lands_payouts_and_consumes_edge() {
                     .get(&coin_object_id(*id))
                     .await
                     .expect("payout read"),
-                Some(Object::Coin(Coin {
-                    owner: SettlementKey::from(payout.owner()),
-                    value: payout.value(),
-                }))
+                Some(Object::Coin(Coin::owned(
+                    SettlementKey::from(payout.owner()),
+                    payout.value(),
+                )))
             );
         }
     });
 }
 
+/// Owner 21 reshapes its genesis coin at allocation index 4 into 35 for
+/// owner 22, delegated to node key 23, and 55 back to itself.
+fn reshape_fixture() -> (Transaction, ObjectId, ObjectId) {
+    let inputs = hellas_kernel::List::take(
+        [CoinId::from_bytes(genesis_object_id(4).0); hellas_kernel::MAX_EDGE_INPUTS],
+        1,
+    );
+    let mut payouts = [hellas_kernel::Payout::default(); hellas_kernel::MAX_EDGE_OUTPUTS];
+    payouts[0] = hellas_kernel::Payout::delegated(
+        owner_key(22).into_kernel(),
+        Some(owner_key(23).into_kernel()),
+        35,
+    );
+    payouts[1] = hellas_kernel::Payout::new(owner_key(21).into_kernel(), 55);
+    let outputs = hellas_kernel::List::take(payouts, 2);
+    let hash = Reshape::payload_hash(crate::domain::TEST_NETWORK, &inputs, &outputs);
+    let ids = Reshape::output_ids(crate::domain::TEST_NETWORK, &inputs, &outputs);
+    let auth = hellas_kernel::Auth::native(owner_signer(21).sign(hash));
+    (
+        Transaction::Kernel(KernelTx::Owner(Reshape::new(inputs, outputs, auth))),
+        coin_object_id(ids.as_slice()[0]),
+        coin_object_id(ids.as_slice()[1]),
+    )
+}
+
 #[test]
-fn owner_index_matches_qmdb_across_legacy_and_kernel_blocks() {
+fn owner_index_matches_qmdb_across_reshape_and_channel_blocks() {
     run_qmdb(|runtime| async move {
         let database = database(runtime, "index_qmdb_agreement").await;
         let mutual = kernel_fixture(10).expect("mutual-close fixture");
         let timeout = kernel_fixture_at(4, 2, 9, 10).expect("timeout-close fixture");
-        let legacy_owner = legacy_address(21);
-        let legacy_recipient = legacy_address(22);
         let mut allocations = mutual.allocations.clone();
         allocations.extend_from_slice(&timeout.allocations);
-        allocations.push((SettlementKey::from(&legacy_owner), 90));
+        allocations.push((owner_key(21), 90));
 
-        let transfer = Transaction::transfer(
-            crate::domain::TEST_NETWORK,
-            &validator_key(21),
-            genesis_object_id(4),
-            legacy_recipient,
-            35,
-        )
-        .expect("legacy transfer fixture");
-        let transfer_digest = Sha256::hash(&transfer.encode());
-        let transfer_recipient = output_object_id(&transfer_digest, 0);
-        let transfer_change = output_object_id(&transfer_digest, 1);
+        let (reshape, reshape_recipient, reshape_change) = reshape_fixture();
         let mutual_edge_id = edge_object_id(mutual.edge);
         let timeout_edge_id = edge_object_id(timeout.edge);
         let mutual_payout_ids: Vec<_> = mutual
@@ -239,8 +229,8 @@ fn owner_index_matches_qmdb_across_legacy_and_kernel_blocks() {
             .collect();
         let mut known_ids: Vec<_> = (0..=4).map(genesis_object_id).collect();
         known_ids.extend([
-            transfer_recipient,
-            transfer_change,
+            reshape_recipient,
+            reshape_change,
             mutual_edge_id,
             timeout_edge_id,
         ]);
@@ -251,15 +241,15 @@ fn owner_index_matches_qmdb_across_legacy_and_kernel_blocks() {
         let mutual_parties = mutual.terms.parties();
         let timeout_parties = timeout.terms.parties();
         let known_edge_owners = [
-            SettlementKey::from(mutual_parties.maker()),
-            SettlementKey::from(mutual_parties.taker()),
-            SettlementKey::from(timeout_parties.maker()),
-            SettlementKey::from(timeout_parties.taker()),
+            SettlementKey::from(mutual_parties.maker().owner()),
+            SettlementKey::from(mutual_parties.taker().owner()),
+            SettlementKey::from(timeout_parties.maker().owner()),
+            SettlementKey::from(timeout_parties.taker().owner()),
         ];
         let genesis = index_genesis();
         let index = OwnerIndex::new(crate::domain::TEST_NETWORK, &genesis, allocations.clone());
         let first_txs = vec![
-            transfer,
+            reshape,
             Transaction::Kernel(mutual.open.clone()),
             Transaction::Kernel(timeout.open.clone()),
         ];
@@ -452,9 +442,9 @@ fn response_with_removed_payment_edge_is_dropped_from_proposals() {
             Party::Taker,
             (
                 EarnedCertificate::new(edge, TermsHash::from_bytes([0x43; 32]), 7),
-                Sig::from_bytes([0x44; Sig::LENGTH]),
+                PartyAuth::owner(Sig::from_bytes([0x44; Sig::LENGTH])),
             ),
-            Sig::from_bytes([0x45; Sig::LENGTH]),
+            PartyAuth::owner(Sig::from_bytes([0x45; Sig::LENGTH])),
         );
         let (_, included, retained) = execute_proposal(
             context(1),
@@ -494,8 +484,8 @@ fn basic_opens_are_bounded_by_the_lifetime_cap() {
             let terms = KernelTerms::basic(
                 ProtocolCode::new(1),
                 Parties::new(
-                    KernelKey::from_bytes([2; KernelKey::LENGTH]),
-                    KernelKey::from_bytes([3; KernelKey::LENGTH]),
+                    PartyKeys::sole(KernelKey::from_bytes([2; KernelKey::LENGTH])),
+                    PartyKeys::sole(KernelKey::from_bytes([3; KernelKey::LENGTH])),
                 ),
                 KernelHeight::new(timeout),
                 List::take([KernelPayout::default(); OUTPUTS], 0),
@@ -506,8 +496,8 @@ fn basic_opens_are_bounded_by_the_lifetime_cap() {
             Transaction::Kernel(KernelTx::open(
                 Funding::new(empty.clone(), empty),
                 terms,
-                garbage.clone(),
-                garbage,
+                PartyAuth::owner(garbage.clone()),
+                PartyAuth::owner(garbage),
             ))
         };
         let over = 1 + crate::domain::MAX_EDGE_LIFETIME_BLOCKS + 1;
@@ -557,7 +547,7 @@ fn the_native_work_profiles_reach_the_kernel_ungated() {
     let mut stake_outputs = [KernelPayout::default(); OUTPUTS];
     stake_outputs[0] = KernelPayout::new(provider, 1);
     let bond = WorkStakeBondTerms {
-        parties: Parties::new(provider, client),
+        parties: Parties::new(PartyKeys::sole(provider), PartyKeys::sole(client)),
         timeout: KernelHeight::new(50),
         timeout_outputs: List::take(stake_outputs, 1),
         max_job_price: 1,
@@ -577,8 +567,8 @@ fn the_native_work_profiles_reach_the_kernel_ungated() {
         Transaction::Kernel(KernelTx::open(
             Funding::new(empty.clone(), empty),
             terms,
-            garbage.clone(),
-            garbage,
+            PartyAuth::owner(garbage.clone()),
+            PartyAuth::owner(garbage),
         ))
     };
     let work_bond = work_open(KernelTerms::work_stake_bond(bond));
@@ -607,10 +597,9 @@ fn the_native_work_profiles_reach_the_kernel_ungated() {
         // The payment edge locks no stake and consensus settles it
         // inline, so admission has nothing left to say about it. It
         // is refused here by the kernel, for an unfunded channel:
-        // this open locks no value at all, so its omission bond is
-        // larger than everything a close could distribute. That
-        // check runs before the bond is loaded, which is why this
-        // names a capacity failure and not a missing bond.
+        // no maker coin proves the client's owner. That check runs
+        // before the bond is loaded, which is why this names the
+        // funding and not a missing bond.
         let (_batches, error) =
             *apply_transaction(batches, context(1), &ChainVerifier::new(), &work_payment)
                 .await
@@ -627,7 +616,7 @@ fn the_native_work_profiles_reach_the_kernel_ungated() {
                         ),
                         &payment_terms,
                     ),
-                    reason: hellas_kernel::InvalidOpenReason::WorkPaymentCapacityUnfunded,
+                    reason: hellas_kernel::InvalidOpenReason::WorkPaymentMakerUnfunded,
                 },
             },
         );
@@ -666,7 +655,7 @@ fn a_payment_open_naming_an_absent_bond_is_retained_not_settled() {
     let network = crate::domain::TEST_NETWORK;
 
     let bond = WorkStakeBondTerms {
-        parties: Parties::new(provider_key, client_key),
+        parties: Parties::new(PartyKeys::sole(provider_key), PartyKeys::sole(client_key)),
         timeout: KernelHeight::new(500),
         timeout_outputs: List::take([KernelPayout::new(provider_key, 12); MAX_EDGE_OUTPUTS], 1),
         max_job_price: 4,
@@ -696,8 +685,8 @@ fn a_payment_open_naming_an_absent_bond_is_retained_not_settled() {
     let open = Transaction::Kernel(KernelTx::open(
         funding,
         terms,
-        Auth::native(client.sign(open_hash)),
-        Auth::native(provider.sign(open_hash)),
+        PartyAuth::owner(Auth::native(client.sign(open_hash))),
+        PartyAuth::owner(Auth::native(provider.sign(open_hash))),
     ));
 
     run_qmdb(|runtime| async move {
@@ -818,7 +807,7 @@ fn a_work_payment_channel_settles_end_to_end_through_consensus() {
     let network = crate::domain::TEST_NETWORK;
 
     let bond = WorkStakeBondTerms {
-        parties: Parties::new(provider_key, client_key),
+        parties: Parties::new(PartyKeys::sole(provider_key), PartyKeys::sole(client_key)),
         timeout: KernelHeight::new(HORIZON),
         timeout_outputs: List::take(
             [KernelPayout::new(provider_key, STAKE); MAX_EDGE_OUTPUTS],
@@ -839,8 +828,8 @@ fn a_work_payment_channel_settles_end_to_end_through_consensus() {
     let bond_open = KernelTx::open(
         bond_funding,
         bond_terms,
-        Auth::native(provider.sign(bond_open_hash)),
-        Auth::native(client.sign(bond_open_hash)),
+        PartyAuth::owner(Auth::native(provider.sign(bond_open_hash))),
+        PartyAuth::owner(Auth::native(client.sign(bond_open_hash))),
     );
 
     let terms = KernelTerms::work_payment(WorkPaymentTerms {
@@ -861,8 +850,8 @@ fn a_work_payment_channel_settles_end_to_end_through_consensus() {
     let open = KernelTx::open(
         funding,
         terms.clone(),
-        Auth::native(client.sign(open_hash)),
-        Auth::native(provider.sign(open_hash)),
+        PartyAuth::owner(Auth::native(client.sign(open_hash))),
+        PartyAuth::owner(Auth::native(provider.sign(open_hash))),
     );
 
     // The client understates, having closed its own issuance gate
@@ -882,8 +871,8 @@ fn a_work_payment_channel_settles_end_to_end_through_consensus() {
         terms.clone(),
         Party::Maker,
         (2, 2),
-        Some((understated, client.sign(start_earned))),
-        client.sign(start_body_digest),
+        Some((understated, PartyAuth::owner(client.sign(start_earned)))),
+        PartyAuth::owner(client.sign(start_body_digest)),
     )));
     let start_id = hellas_kernel::start_id(start_body_digest, 2);
 
@@ -903,8 +892,8 @@ fn a_work_payment_channel_settles_end_to_end_through_consensus() {
         edge,
         start_id,
         Party::Taker,
-        (earned, client.sign(earned_digest)),
-        provider.sign(response_body_digest),
+        (earned, PartyAuth::owner(client.sign(earned_digest))),
+        PartyAuth::owner(provider.sign(response_body_digest)),
     )));
     // The same answer, kept to resubmit once its window has shut.
     let late_response = response.clone();
@@ -924,8 +913,8 @@ fn a_work_payment_channel_settles_end_to_end_through_consensus() {
             edge,
             start_id,
             Party::Maker,
-            (earned, client.sign(earned_digest)),
-            client.sign(client_response_digest),
+            (earned, PartyAuth::owner(client.sign(earned_digest))),
+            PartyAuth::owner(client.sign(client_response_digest)),
         )));
 
     // The bond's own exit, at the horizon it committed to. It is
@@ -1298,7 +1287,7 @@ fn an_endpoint_built_close_settles_on_a_real_chain() {
     };
 
     let bond = WorkStakeBondTerms {
-        parties: Parties::new(provider_key, client_key),
+        parties: Parties::new(PartyKeys::sole(provider_key), PartyKeys::sole(client_key)),
         timeout: KernelHeight::new(HORIZON),
         timeout_outputs: List::take(
             [KernelPayout::new(provider_key, STAKE); MAX_EDGE_OUTPUTS],
@@ -1316,8 +1305,8 @@ fn an_endpoint_built_close_settles_on_a_real_chain() {
     let bond_open = KernelTx::open(
         bond_funding,
         bond_terms,
-        Auth::native(provider.sign(bond_open_hash)),
-        Auth::native(client.sign(bond_open_hash)),
+        PartyAuth::owner(Auth::native(provider.sign(bond_open_hash))),
+        PartyAuth::owner(Auth::native(client.sign(bond_open_hash))),
     );
 
     let payment = WorkPaymentTerms {
@@ -1338,8 +1327,8 @@ fn an_endpoint_built_close_settles_on_a_real_chain() {
     let open = KernelTx::open(
         funding,
         terms.clone(),
-        Auth::native(client.sign(open_hash)),
-        Auth::native(provider.sign(open_hash)),
+        PartyAuth::owner(Auth::native(client.sign(open_hash))),
+        PartyAuth::owner(Auth::native(provider.sign(open_hash))),
     );
 
     // The endpoint's view of the same channel, derived from the same
@@ -1430,7 +1419,7 @@ fn an_endpoint_built_close_settles_on_a_real_chain() {
             panic!("an adjudicated close is a close");
         };
         let Ok(expected_payouts) =
-            adjudicated_payouts(settlement, payment.parties(), EARNED, false)
+            adjudicated_payouts(settlement, payment.parties(), EARNED, false, false)
         else {
             panic!("the settled amount fits the route");
         };
@@ -1518,7 +1507,7 @@ fn an_endpoint_built_response_forfeits_the_understaters_bond() {
     };
 
     let bond = WorkStakeBondTerms {
-        parties: Parties::new(provider_key, client_key),
+        parties: Parties::new(PartyKeys::sole(provider_key), PartyKeys::sole(client_key)),
         timeout: KernelHeight::new(HORIZON),
         timeout_outputs: List::take(
             [KernelPayout::new(provider_key, STAKE); MAX_EDGE_OUTPUTS],
@@ -1536,8 +1525,8 @@ fn an_endpoint_built_response_forfeits_the_understaters_bond() {
     let bond_open = KernelTx::open(
         bond_funding,
         bond_terms,
-        Auth::native(provider.sign(bond_open_hash)),
-        Auth::native(client.sign(bond_open_hash)),
+        PartyAuth::owner(Auth::native(provider.sign(bond_open_hash))),
+        PartyAuth::owner(Auth::native(client.sign(bond_open_hash))),
     );
 
     let payment = WorkPaymentTerms {
@@ -1558,8 +1547,8 @@ fn an_endpoint_built_response_forfeits_the_understaters_bond() {
     let open = KernelTx::open(
         funding,
         terms.clone(),
-        Auth::native(client.sign(open_hash)),
-        Auth::native(provider.sign(open_hash)),
+        PartyAuth::owner(Auth::native(client.sign(open_hash))),
+        PartyAuth::owner(Auth::native(provider.sign(open_hash))),
     );
     let Ok(channel) = PaidChannel::new(network, edge, payment.clone(), &SALT, policy) else {
         panic!("the fixture channel opens");
@@ -1647,7 +1636,8 @@ fn an_endpoint_built_response_forfeits_the_understaters_bond() {
         let KernelTx::Close { outputs, .. } = &close else {
             panic!("an adjudicated close is a close");
         };
-        let Ok(expected_payouts) = adjudicated_payouts(settlement, payment.parties(), EARNED, true)
+        let Ok(expected_payouts) =
+            adjudicated_payouts(settlement, payment.parties(), EARNED, true, false)
         else {
             panic!("the settled amount fits the route");
         };
@@ -1739,10 +1729,7 @@ fn open_edge_id_collision_with_coin_is_wrong_kind_drop_and_preserves_state() {
         .await
         .expect("genesis seed");
         let collision_id = edge_object_id(fixture.edge);
-        let collision = Object::Coin(Coin {
-            owner: fixture.maker,
-            value: 7,
-        });
+        let collision = Object::Coin(Coin::owned(fixture.maker, 7));
         let batches = batches.write(collision_id, Some(collision));
         let verifier = ChainVerifier::new();
         let (batches, error) = *apply_transaction(
@@ -1788,10 +1775,7 @@ fn open_edge_id_collision_with_coin_is_wrong_kind_drop_and_preserves_state() {
             let id = genesis_object_id(u16::try_from(index).expect("fixture index"));
             assert_eq!(
                 batches.get(&id).await.expect("funding read"),
-                Some(Object::Coin(Coin {
-                    owner: *owner,
-                    value: *value,
-                }))
+                Some(Object::Coin(Coin::owned(*owner, *value)))
             );
         }
     });
@@ -1857,10 +1841,7 @@ fn open_edge_id_collision_with_edge_is_edge_exists_drop_and_preserves_state() {
             let id = genesis_object_id(u16::try_from(index).expect("fixture index"));
             assert_eq!(
                 batches.get(&id).await.expect("funding read"),
-                Some(Object::Coin(Coin {
-                    owner: *owner,
-                    value: *value,
-                }))
+                Some(Object::Coin(Coin::owned(*owner, *value)))
             );
         }
     });
@@ -1898,10 +1879,10 @@ fn registry_chunk_slots_load_from_the_authenticated_database() {
         );
         let batches = batches.write(
             registry_chunk_object_id(occupied),
-            Some(Object::Coin(Coin {
-                owner: SettlementKey::from_bytes([0x42; SettlementKey::LENGTH]),
-                value: 5,
-            })),
+            Some(Object::Coin(Coin::owned(
+                SettlementKey::from_bytes([0x42; SettlementKey::LENGTH]),
+                5,
+            ))),
         );
 
         // The chunk survives the object codec's fixed-size padding
@@ -2149,15 +2130,63 @@ fn owner_commitments_are_speculative_replayable_and_match_native_reconstruction(
     run_qmdb(|runtime| async move {
         let first = database(runtime.child("owner_first"), "owner-first").await;
         let replay = database(runtime.child("owner_replay"), "owner-replay").await;
-        let fixture = kernel_fixture(10).unwrap();
-        let genesis = index_genesis();
-        let owners = OwnerIndex::new(
-            crate::domain::TEST_NETWORK,
-            &genesis,
-            fixture.allocations.clone(),
+        let maker = owner_signer(25);
+        let taker = owner_signer(26);
+        let allocations = vec![(owner_key(25), 40), (owner_key(26), 60)];
+        // Owners, signers and payout delegates differ. Reconstructing the
+        // authenticated tree from the native index must retain all six keys.
+        let parties = hellas_kernel::Parties::new(
+            hellas_kernel::PartyKeys::new(
+                maker.party_key(),
+                owner_key(21).into_kernel(),
+                Some(owner_key(22).into_kernel()),
+            ),
+            hellas_kernel::PartyKeys::new(
+                taker.party_key(),
+                owner_key(23).into_kernel(),
+                Some(owner_key(24).into_kernel()),
+            ),
         );
+        let payouts = hellas_kernel::List::take(
+            [
+                parties.maker().payout(40, false),
+                parties.taker().payout(60, false),
+                hellas_kernel::Payout::default(),
+                hellas_kernel::Payout::default(),
+            ],
+            2,
+        );
+        let funding = hellas_kernel::Funding::new(
+            hellas_kernel::List::take(
+                [hellas_kernel::CoinId::from_bytes(genesis_object_id(0).0);
+                    hellas_kernel::MAX_PARTY_INPUTS],
+                1,
+            ),
+            hellas_kernel::List::take(
+                [hellas_kernel::CoinId::from_bytes(genesis_object_id(1).0);
+                    hellas_kernel::MAX_PARTY_INPUTS],
+                1,
+            ),
+        );
+        let terms = hellas_kernel::Terms::basic(
+            hellas_kernel::ProtocolCode::new(1),
+            parties,
+            hellas_kernel::BlockHeight::new(2),
+            payouts,
+        );
+        let edge = hellas_kernel::Tx::edge_id_of(&funding, &terms);
+        let hash = hellas_kernel::Tx::open_hash(crate::domain::TEST_NETWORK, &funding, &terms);
+        let open = hellas_kernel::Tx::open(
+            funding,
+            terms.clone(),
+            hellas_kernel::PartyAuth::owner(maker.sign(hash)),
+            hellas_kernel::PartyAuth::owner(taker.sign(hash)),
+        );
+        let close = hellas_kernel::Tx::timeout_close(edge, &terms).unwrap();
+        let genesis = index_genesis();
+        let owners = OwnerIndex::new(crate::domain::TEST_NETWORK, &genesis, allocations.clone());
         let mut parent = genesis;
-        for (height, tx) in [(1, fixture.open.clone()), (2, fixture.mutual_close.clone())] {
+        for (height, tx) in [(1, open), (2, close)] {
             let before = super::super::owner_tree::root(&first.new_batches().await)
                 .await
                 .unwrap();
@@ -2165,7 +2194,7 @@ fn owner_commitments_are_speculative_replayable_and_match_native_reconstruction(
                 context(height),
                 &ChainVerifier::new(),
                 &[Transaction::Kernel(tx.clone())],
-                &fixture.allocations,
+                &allocations,
                 first.new_batches().await,
             )
             .await
@@ -2185,7 +2214,7 @@ fn owner_commitments_are_speculative_replayable_and_match_native_reconstruction(
                 context(height),
                 &ChainVerifier::new(),
                 &[Transaction::Kernel(tx.clone())],
-                &fixture.allocations,
+                &allocations,
                 replay.new_batches().await,
             )
             .await
@@ -2212,13 +2241,15 @@ fn owner_commitments_are_speculative_replayable_and_match_native_reconstruction(
                 )
                 .await
                 .unwrap();
+                if let Some(delegate) = coin.delegate.filter(|key| *key != coin.owner) {
+                    crate::owner_proof::update_holding(&mut rebuilt, delegate, id, Some((2, 0)))
+                        .await
+                        .unwrap();
+                }
             }
             for (id, edge) in owners.all_edges_for_test() {
-                crate::owner_proof::update_holding(&mut rebuilt, edge.maker, id, Some((1, 0)))
-                    .await
-                    .unwrap();
-                if edge.taker != edge.maker {
-                    crate::owner_proof::update_holding(&mut rebuilt, edge.taker, id, Some((1, 0)))
+                for key in crate::owner_index::edge_keys(edge) {
+                    crate::owner_proof::update_holding(&mut rebuilt, key, id, Some((1, 0)))
                         .await
                         .unwrap();
                 }
@@ -2227,10 +2258,10 @@ fn owner_commitments_are_speculative_replayable_and_match_native_reconstruction(
                 crate::owner_proof::owner_root(&rebuilt).await.unwrap(),
                 expected
             );
-            let page = crate::owner_proof::prove_owner_page(&rebuilt, fixture.maker, 0, 64)
+            let page = crate::owner_proof::prove_owner_page(&rebuilt, owner_key(25), 0, 64)
                 .await
                 .unwrap();
-            crate::owner_proof::verify_owner_page(expected, fixture.maker, 0, 64, &page).unwrap();
+            crate::owner_proof::verify_owner_page(expected, owner_key(25), 0, 64, &page).unwrap();
             parent = block;
         }
     });
@@ -2244,15 +2275,12 @@ fn genesis_allocation_ids_stop_at_the_validator_index_boundary() {
         .collect();
     let coins: Vec<_> = genesis_coins(&allocations).collect();
     assert_eq!(coins.len(), u16::MAX as usize + 1);
-    assert_eq!(coins[0], (genesis_object_id(0), Coin { owner, value: 0 }));
+    assert_eq!(coins[0], (genesis_object_id(0), Coin::owned(owner, 0)));
     assert_eq!(
         coins.last(),
         Some(&(
             genesis_object_id(u16::MAX),
-            Coin {
-                owner,
-                value: u16::MAX as u64
-            }
+            Coin::owned(owner, u16::MAX as u64)
         ))
     );
 }

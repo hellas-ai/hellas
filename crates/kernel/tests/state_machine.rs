@@ -28,7 +28,7 @@ use std::collections::BTreeMap;
 
 use hellas_kernel::{
     BlockHash, BlockHeight, CoinId, Context, EdgeId, Funding, Genesis, Key, List, MAX_EDGE_OUTPUTS,
-    Parties, Payout, Proof, ProtocolCode, State, Terms, Tx,
+    Parties, PartyKeys, Payout, Proof, ProtocolCode, State, Terms, Tx,
 };
 use proptest::prelude::*;
 use proptest::test_runner::Config;
@@ -41,7 +41,7 @@ use support::{
 
 const MAKER: Key = Key::from_bytes([7; Key::LENGTH]);
 const TAKER: Key = Key::from_bytes([8; Key::LENGTH]);
-const PARTIES: Parties = Parties::new(MAKER, TAKER);
+const PARTIES: Parties = Parties::new(PartyKeys::sole(MAKER), PartyKeys::sole(TAKER));
 const PROTOCOL: ProtocolCode = ProtocolCode::new(1);
 const MAKER_COIN: CoinId = coin_id(1);
 const TAKER_COIN: CoinId = coin_id(2);

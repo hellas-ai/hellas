@@ -15,8 +15,9 @@ use hellas_auth::Digest;
 use hellas_kernel::{
     Auth, BlockHeight, CoinId, Decode as _, Edge, EdgeId, EdgeValues, Fees, Funding, Key,
     LeaseSlots, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Move, NetworkId, Parties, Party,
-    PaymentCloseStart, Payout, Proof, RegistryChunk, RegistryNamespace, RegistryRecordTag,
-    Secp256k1Verifier, Sig, Terms, TermsHash, Tx, WorkPaymentTerms, WorkStakeBondTerms,
+    PartyAuth, PartyKeys, PaymentCloseStart, Payout, Proof, RegistryChunk, RegistryNamespace,
+    RegistryRecordTag, Secp256k1Verifier, Sig, Terms, TermsHash, Tx, WorkPaymentTerms,
+    WorkStakeBondTerms,
 };
 use hellas_rpc::pb::work::{ExchangeSetupRequest, exchange_setup_response::Outcome};
 use hellas_rpc::protocol::ContentId;
@@ -74,7 +75,10 @@ fn empty_coins() -> List<CoinId, MAX_PARTY_INPUTS> {
 
 fn bond_terms() -> WorkStakeBondTerms {
     WorkStakeBondTerms {
-        parties: Parties::new(provider().party_key(), client().party_key()),
+        parties: Parties::new(
+            PartyKeys::sole(provider().party_key()),
+            PartyKeys::sole(client().party_key()),
+        ),
         timeout: BlockHeight::new(HORIZON),
         timeout_outputs: List::take(
             [Payout::new(provider().party_key(), STAKE); MAX_EDGE_OUTPUTS],
@@ -250,7 +254,7 @@ fn same_block_contest() -> Tx {
         Party::Maker,
         (scan().height + 2, scan().height + 9),
         None,
-        Sig::from_bytes([0_u8; Sig::LENGTH]),
+        PartyAuth::owner(Sig::from_bytes([0_u8; Sig::LENGTH])),
     )))
 }
 
@@ -364,8 +368,12 @@ fn valued_edge(value: u64, terms: TermsHash, maker: Key, taker: Key, allowed: u8
     out.extend_from_slice(&[FORMAT_VERSION, TAG_BLOCK_HEIGHT]);
     out.extend_from_slice(&HORIZON.to_be_bytes());
     out.extend_from_slice(&[FORMAT_VERSION, TAG_PARTIES]);
-    out.extend_from_slice(&maker.to_bytes());
-    out.extend_from_slice(&taker.to_bytes());
+    // Each party: owner, signer, and an absent payout delegate.
+    for party in [maker, taker] {
+        out.extend_from_slice(&party.to_bytes());
+        out.extend_from_slice(&party.to_bytes());
+        out.push(0);
+    }
     out.extend_from_slice(terms.as_bytes());
     out.push(allowed);
     match Edge::decode_exact(&out) {

@@ -48,8 +48,8 @@
 //! durable endpoint state, and durable endpoint state is P3's.
 
 use hellas_kernel::{
-    Auth, EdgeId, Funding, Key, NetworkId, PayloadHash, SigVerifier, Terms, TermsProfile, Tx,
-    WorkPaymentTerms, WorkStakeBondTerms,
+    Auth, EdgeId, Funding, Key, NetworkId, PartyAuth, PayloadHash, SigVerifier, Terms,
+    TermsProfile, Tx, WorkPaymentTerms, WorkStakeBondTerms,
 };
 use hellas_xet::XetFileHasher;
 
@@ -400,8 +400,8 @@ impl WorkChannelSetupBundleV1 {
         Some(Tx::open(
             self.bond_funding.clone(),
             Terms::work_stake_bond(self.bond_terms.clone()),
-            self.provider_bond_auth.clone(),
-            payment.client_bond_auth.clone(),
+            PartyAuth::owner(self.provider_bond_auth.clone()),
+            PartyAuth::owner(payment.client_bond_auth.clone()),
         ))
     }
 
@@ -418,8 +418,8 @@ impl WorkChannelSetupBundleV1 {
         Some(Tx::open(
             payment.funding.clone(),
             Terms::work_payment(payment.terms.clone()),
-            payment.client_auth.clone(),
-            (**provider_auth).clone(),
+            PartyAuth::owner(payment.client_auth.clone()),
+            PartyAuth::owner((**provider_auth).clone()),
         ))
     }
 
@@ -443,8 +443,9 @@ impl WorkChannelSetupBundleV1 {
     /// [`Self::countersign_bond_and_propose_payment`] raises — checked
     /// again here because an imported bundle was built somewhere else.
     pub fn check<V: SigVerifier>(&self, verifier: &V) -> Result<(), SetupBundleError> {
-        let provider: Key = self.bond_terms.parties.maker();
-        let client: Key = self.bond_terms.parties.taker();
+        // Both opens are authorized by each party's owner.
+        let provider: Key = self.bond_terms.parties.maker().owner();
+        let client: Key = self.bond_terms.parties.taker().owner();
 
         check_funding_disjoint(&self.bond_funding, self.payment().map(|leg| &leg.funding))?;
 

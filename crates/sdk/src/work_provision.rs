@@ -17,7 +17,7 @@ use hellas_chain::WorkBlocks;
 use hellas_chain::domain::MAX_EDGE_LIFETIME_BLOCKS;
 use hellas_kernel::{
     BlockHeight, CoinId, EdgeId, Funding, Key, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, NetworkId,
-    Parties, Payout, Secp256k1Signer, Secp256k1Verifier, Terms, Tx, WorkStakeBondTerms,
+    Parties, PartyKeys, Payout, Secp256k1Signer, Secp256k1Verifier, Terms, Tx, WorkStakeBondTerms,
 };
 use hellas_work::model::setup::ProviderChannelPolicy;
 use hellas_work::work_close::FinalizedBlocks;
@@ -101,7 +101,7 @@ impl BondCandidate {
         // whose staking party this key is not.
         let provider = options.settlement_key.party_key();
         let bond_terms = WorkStakeBondTerms {
-            parties: Parties::new(provider, options.client),
+            parties: Parties::new(PartyKeys::sole(provider), PartyKeys::sole(options.client)),
             timeout: BlockHeight::new(options.bond_timeout),
             timeout_outputs: List::take(
                 [Payout::new(provider, options.timeout_payout); MAX_EDGE_OUTPUTS],
@@ -274,7 +274,7 @@ fn route_for_candidate<'config>(
         .iter()
         .find(|route| route.bond == bond_edge)
         .ok_or(ProvisionError::MissingRoute(bond_edge))?;
-    check_client(route, bond_edge, bond_terms.parties.taker())?;
+    check_client(route, bond_edge, bond_terms.parties.taker().signer())?;
     Ok(route)
 }
 
@@ -319,7 +319,11 @@ async fn refuse_offer_collisions(
             .state()
             .bundle()
             .ok_or(ProvisionError::MissingProposal(held.bond_edge))?;
-        check_client(route, held.bond_edge, bundle.bond_terms().parties.taker())?;
+        check_client(
+            route,
+            held.bond_edge,
+            bundle.bond_terms().parties.taker().signer(),
+        )?;
         // Revision-one funding is reserved even before an executable Open exists.
         let reserved = funding_coins(bundle.bond_funding());
         if let Some(coin) = candidate_coins.intersection(&reserved).next() {

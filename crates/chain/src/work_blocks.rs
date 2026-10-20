@@ -309,9 +309,8 @@ impl<C: LightClient> FinalizedBlocks for WorkBlocks<C> {
             txs: view
                 .txs()
                 .iter()
-                .filter_map(|tx| match tx {
-                    Transaction::Kernel(kernel) => Some(kernel.clone()),
-                    _ => None,
+                .map(|tx| match tx {
+                    Transaction::Kernel(kernel) => kernel.clone(),
                 })
                 .collect(),
         }))
@@ -431,7 +430,10 @@ mod tests {
 
     fn bond_terms() -> WorkStakeBondTerms {
         WorkStakeBondTerms {
-            parties: Parties::new(provider().party_key(), client().party_key()),
+            parties: Parties::new(
+                hellas_kernel::PartyKeys::sole(provider().party_key()),
+                hellas_kernel::PartyKeys::sole(client().party_key()),
+            ),
             timeout: BlockHeight::new(HORIZON),
             timeout_outputs: List::take(
                 [Payout::new(provider().party_key(), STAKE); MAX_EDGE_OUTPUTS],

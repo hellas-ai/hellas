@@ -849,14 +849,16 @@ impl PaidChannel {
         &self.channel_policy
     }
 
-    /// Returns the client's settlement key: the payment edge's maker.
+    /// Returns the key that signs for the client: the payment edge
+    /// maker's signer.
     pub const fn client_key(&self) -> Key {
-        self.payment_terms.parties().maker()
+        self.payment_terms.parties().maker().signer()
     }
 
-    /// Returns the provider's settlement key: the payment edge's taker.
+    /// Returns the key that signs for the provider: the payment edge
+    /// taker's signer.
     pub const fn provider_key(&self) -> Key {
-        self.payment_terms.parties().taker()
+        self.payment_terms.parties().taker().signer()
     }
 
     pub(crate) fn network_bytes(&self) -> EncodedNetwork {

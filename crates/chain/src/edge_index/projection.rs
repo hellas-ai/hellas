@@ -163,8 +163,8 @@ mod tests {
             bond_edge: kernel::EdgeId::from_bytes([3; 32]),
             bond_terms: kernel::WorkStakeBondTerms {
                 parties: kernel::Parties::new(
-                    kernel::Key::from_bytes([1; kernel::Key::LENGTH]),
-                    kernel::Key::from_bytes([2; kernel::Key::LENGTH]),
+                    kernel::PartyKeys::sole(kernel::Key::from_bytes([1; kernel::Key::LENGTH])),
+                    kernel::PartyKeys::sole(kernel::Key::from_bytes([2; kernel::Key::LENGTH])),
                 ),
                 timeout: kernel::BlockHeight::new(100),
                 timeout_outputs: kernel::List::take(
@@ -201,8 +201,8 @@ mod tests {
         let terms = kernel::Terms::basic(
             kernel::ProtocolCode::new(7),
             kernel::Parties::new(
-                kernel::Key::from_bytes([1; kernel::Key::LENGTH]),
-                kernel::Key::from_bytes([2; kernel::Key::LENGTH]),
+                kernel::PartyKeys::sole(kernel::Key::from_bytes([1; kernel::Key::LENGTH])),
+                kernel::PartyKeys::sole(kernel::Key::from_bytes([2; kernel::Key::LENGTH])),
             ),
             kernel::BlockHeight::new(8),
             kernel::List::take([kernel::Payout::default(); kernel::MAX_EDGE_OUTPUTS], 0),
@@ -570,8 +570,8 @@ pub(crate) fn edge_projection(edge: &kernel::Edge) -> EdgeProjection {
             lifetime: fees.lifetime(),
         }),
         timeout: edge.timeout().get(),
-        maker: edge.parties().maker().as_bytes().to_vec(),
-        taker: edge.parties().taker().as_bytes().to_vec(),
+        maker: edge.parties().maker().owner().as_bytes().to_vec(),
+        taker: edge.parties().taker().owner().as_bytes().to_vec(),
         terms_hash: hex::encode(edge.terms().as_bytes()),
         allowed_close_kinds: close_kinds(edge.allowed_closes()),
     }
@@ -602,8 +602,8 @@ fn payouts(values: &[kernel::Payout]) -> Vec<PublicPayout> {
 }
 fn bond_terms(bond: &kernel::WorkStakeBondTerms) -> WorkStakeBondTerms {
     WorkStakeBondTerms {
-        maker: bond.parties.maker().as_bytes().to_vec(),
-        taker: bond.parties.taker().as_bytes().to_vec(),
+        maker: bond.parties.maker().owner().as_bytes().to_vec(),
+        taker: bond.parties.taker().owner().as_bytes().to_vec(),
         timeout: bond.timeout.get(),
         timeout_payouts: payouts(bond.timeout_outputs.as_slice()),
         max_job_price: bond.max_job_price,
@@ -615,8 +615,8 @@ pub(crate) fn public_terms(terms: &kernel::Terms) -> Result<PublicTerms, Project
             let protocol = terms.basic_protocol().ok_or(ProjectionError::Unsupported)?;
             TermsKind::Basic(BasicTerms {
                 protocol: u32::from(protocol.get()),
-                maker: terms.parties().maker().as_bytes().to_vec(),
-                taker: terms.parties().taker().as_bytes().to_vec(),
+                maker: terms.parties().maker().owner().as_bytes().to_vec(),
+                taker: terms.parties().taker().owner().as_bytes().to_vec(),
                 timeout: terms.timeout().get(),
                 timeout_payouts: payouts(
                     terms
@@ -634,8 +634,8 @@ pub(crate) fn public_terms(terms: &kernel::Terms) -> Result<PublicTerms, Project
             )),
             bond_terms: Some(bond_terms(&payment.bond_terms)),
             bond_terms_hash: hex::encode(payment.bond_terms_hash().as_bytes()),
-            maker: payment.parties().maker().as_bytes().to_vec(),
-            taker: payment.parties().taker().as_bytes().to_vec(),
+            maker: payment.parties().maker().owner().as_bytes().to_vec(),
+            taker: payment.parties().taker().owner().as_bytes().to_vec(),
             admission_horizon: payment.admission_horizon().get(),
             private_policy_commitment: hex::encode(payment.private_policy_commitment),
             omission_bond: payment.omission_bond,
@@ -677,8 +677,8 @@ pub(crate) fn summary_from_open(
             Some(hex::encode(payment.bond_edge.as_bytes())),
         ),
     };
-    let maker = terms.parties().maker().as_bytes().to_vec();
-    let taker = terms.parties().taker().as_bytes().to_vec();
+    let maker = terms.parties().maker().owner().as_bytes().to_vec();
+    let taker = terms.parties().taker().owner().as_bytes().to_vec();
     Ok(EdgeSummary {
         edge_id: edge_id.into(),
         kind: kind.into(),

@@ -32,7 +32,8 @@ mod support;
 
 use hellas_kernel::{
     Auth, BlockHeight, CloseKind, EdgeId, Fees, Funding, Genesis, Key, List, MAX_EDGE_OUTPUTS,
-    Parties, Payout, Proof, ProtocolCode, Secp256k1Verifier, Terms, TermsHash, Tx,
+    Parties, PartyAuth, PartyKeys, Payout, Proof, ProtocolCode, Secp256k1Verifier, Terms,
+    TermsHash, Tx,
 };
 use secp256k1::SecretKey;
 use support::{
@@ -64,7 +65,10 @@ impl Wallets {
     }
 
     const fn parties(&self) -> Parties {
-        Parties::new(self.maker_key, self.taker_key)
+        Parties::new(
+            PartyKeys::sole(self.maker_key),
+            PartyKeys::sole(self.taker_key),
+        )
     }
 }
 
@@ -206,8 +210,8 @@ fn signed_open(wallets: &Wallets, funding: Funding, terms: Terms) -> Tx {
     Tx::open(
         funding,
         terms,
-        Auth::native(secp_sign(&wallets.maker_secret, hash)),
-        Auth::native(secp_sign(&wallets.taker_secret, hash)),
+        PartyAuth::owner(Auth::native(secp_sign(&wallets.maker_secret, hash))),
+        PartyAuth::owner(Auth::native(secp_sign(&wallets.taker_secret, hash))),
     )
 }
 
@@ -227,8 +231,8 @@ fn signed_mutual_close(
     Tx::close(
         edge_id,
         Proof::mutual(
-            Auth::native(secp_sign(&wallets.maker_secret, hash)),
-            Auth::native(secp_sign(&wallets.taker_secret, hash)),
+            PartyAuth::owner(Auth::native(secp_sign(&wallets.maker_secret, hash))),
+            PartyAuth::owner(Auth::native(secp_sign(&wallets.taker_secret, hash))),
         ),
         outputs,
     )

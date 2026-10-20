@@ -52,6 +52,7 @@ pub(crate) mod tag {
     pub(crate) const PAYMENT_CLOSE_PENDING: u8 = 23;
     pub(crate) const REGISTRY_CHUNK: u8 = 24;
     pub(crate) const BOND_LEASE: u8 = 31;
+    pub(crate) const PARTY_AUTH: u8 = 32;
 }
 
 /// Streaming destination for [`Encode`] output.
@@ -480,6 +481,46 @@ impl Decode for Party {
         Self::from_tag(byte)
             .map(|party| (party, consumed))
             .ok_or(DecodeError::InvalidTag { tag: byte })
+    }
+}
+
+// -- Option<T> (presence byte) ----------------------------------------------
+// An optional field is one presence byte, then the value only when it is
+// present. Absence writes nothing after its byte, so an absent value has
+// exactly one encoding and can never be read as a present all-zero one.
+
+const ABSENT: u8 = 0;
+const PRESENT: u8 = 1;
+
+impl<T: Encode> Encode for Option<T> {
+    const MAX_ENCODED_SIZE: usize = u8::MAX_ENCODED_SIZE + T::MAX_ENCODED_SIZE;
+
+    fn encoded_size(&self) -> usize {
+        u8::MAX_ENCODED_SIZE + self.as_ref().map_or(0, Encode::encoded_size)
+    }
+
+    fn encode_to<W: Writer + ?Sized>(&self, writer: &mut W) {
+        match self {
+            None => ABSENT.encode_to(writer),
+            Some(value) => {
+                PRESENT.encode_to(writer);
+                value.encode_to(writer);
+            }
+        }
+    }
+}
+
+impl<T: Decode> Decode for Option<T> {
+    fn decode(buf: &[u8]) -> Result<(Self, usize), DecodeError> {
+        let mut consumed = 0;
+        match decode_field::<u8>(buf, &mut consumed)? {
+            ABSENT => Ok((None, consumed)),
+            PRESENT => {
+                let value = decode_field(buf, &mut consumed)?;
+                Ok((Some(value), consumed))
+            }
+            tag => Err(DecodeError::InvalidTag { tag }),
+        }
     }
 }
 

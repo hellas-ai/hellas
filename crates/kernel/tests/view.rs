@@ -10,8 +10,8 @@
 mod support;
 
 use hellas_kernel::{
-    Batch, BlockHash, BlockHeight, Context, Funding, Genesis, MAX_EDGE_OUTPUTS, Parties, Payout,
-    ProtocolCode, REGISTRY_CHUNK_DATA_CAPACITY, RegistryChunkId, RegistryNamespace,
+    Batch, BlockHash, BlockHeight, Context, Funding, Genesis, MAX_EDGE_OUTPUTS, Parties, PartyKeys,
+    Payout, ProtocolCode, REGISTRY_CHUNK_DATA_CAPACITY, RegistryChunkId, RegistryNamespace,
     RegistryRecordTag, Snapshot, Store, Terms, Tx, View,
 };
 use support::{FAKE_VERIFIER, FixedStore, coin_id, key, list, open_tx as open, state};
@@ -95,7 +95,7 @@ fn terms(maker: hellas_kernel::Key, taker: hellas_kernel::Key, protocol: u8) -> 
     let outputs = hellas_kernel::List::new(outputs, 2).expect("two payouts fit");
     Terms::basic(
         ProtocolCode::new(protocol),
-        Parties::new(maker, taker),
+        Parties::new(PartyKeys::sole(maker), PartyKeys::sole(taker)),
         BlockHeight::new(9),
         outputs,
     )

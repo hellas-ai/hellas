@@ -72,7 +72,7 @@
 //! and a place to put the other.
 
 use hellas_kernel::{
-    EarnedCertificate, List, MAX_EDGE_OUTPUTS, Party, PayloadHash, PaymentCloseResponse,
+    EarnedCertificate, List, MAX_EDGE_OUTPUTS, Party, PartyAuth, PayloadHash, PaymentCloseResponse,
     PaymentCloseStart, Payout, PendingPaymentClose, Proof, Secp256k1Signer, Sig, SigVerifier,
     StartId, Terms, Tx, WorkPaymentSettlement, adjudicated_payouts, no_earned_digest,
 };
@@ -365,8 +365,8 @@ pub fn close_start(
         Terms::work_payment(channel.payment_terms().clone()),
         opener_role,
         (valid_from, valid_through),
-        certificate,
-        Sig::from_bytes([0_u8; Sig::LENGTH]),
+        certificate.map(|(certificate, sig)| (certificate, PartyAuth::owner(sig))),
+        PartyAuth::owner(Sig::from_bytes([0_u8; Sig::LENGTH])),
     );
     let action_sig = signer.sign(start_body_digest(channel, &unsigned));
     Ok(PaymentCloseStart::new(
@@ -374,8 +374,8 @@ pub fn close_start(
         Terms::work_payment(channel.payment_terms().clone()),
         opener_role,
         (valid_from, valid_through),
-        unsigned.certificate().copied(),
-        action_sig,
+        unsigned.certificate().cloned(),
+        PartyAuth::owner(action_sig),
     ))
 }
 
@@ -428,12 +428,13 @@ pub fn close_response(
     // of `Wresp`'s three fsyncs.
     let built = Timing::start();
     let digest = response_body_digest(channel, start_id, &certificate.0);
+    let (certificate, certificate_sig) = certificate;
     let response = PaymentCloseResponse::new(
         channel.payment_edge(),
         start_id,
         Party::Taker,
-        certificate,
-        signer.sign(digest),
+        (certificate, PartyAuth::owner(certificate_sig)),
+        PartyAuth::owner(signer.sign(digest)),
     );
     if let Some(ms) = built.ms() {
         tracing::event!(
@@ -479,6 +480,7 @@ pub fn adjudicated_close(
         channel.payment_terms().parties(),
         pending.final_cumulative(),
         pending.penalty_due(),
+        false,
     )
     .map_err(|_| CloseError::Unpayable)?;
     let mut outputs = [Payout::default(); MAX_EDGE_OUTPUTS];
@@ -697,7 +699,9 @@ pub(crate) async fn apply_finalized_txs<V: SigVerifier>(
                 let provider_payout = outputs
                     .as_slice()
                     .iter()
-                    .find(|payout| payout.owner() == channel.provider_key())
+                    .find(|payout| {
+                        payout.owner() == channel.payment_terms().parties().taker().owner()
+                    })
                     .map_or(0, |payout| payout.value());
                 let open: Vec<_> = store
                     .state()

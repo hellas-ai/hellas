@@ -9,6 +9,16 @@ use serde::{Deserialize, Serialize};
 
 pub const OWNER_PAGE_LIMIT: u32 = 64;
 pub const OWNER_NODE_BYTES: usize = 163;
+
+/// A coin its owner holds. The only kind whose balance is spendable, and
+/// so the only kind a page's balance counts.
+pub const HOLDING_COIN: u8 = 0;
+/// An edge one of the key's party roles is committed to, as owner,
+/// signer or payout delegate. Balance zero.
+pub const HOLDING_EDGE: u8 = 1;
+/// A coin delegated to the key: it may fund a work open under the key's
+/// own signature, but it is its owner's coin. Balance zero.
+pub const HOLDING_DELEGATED: u8 = 2;
 type Key = [u8; 32];
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -166,7 +176,15 @@ fn leaf_commit(
             root.balance
         }
         OwnerLeaf::Holding { kind, balance } => {
-            if scope == [0; 32] || *kind > 1 || (*kind == 1 && *balance != 0) {
+            // Only a held coin carries balance, so a page's total is the
+            // key's spendable value and never counts a delegated coin or
+            // an edge.
+            let valid = match *kind {
+                HOLDING_COIN => true,
+                HOLDING_EDGE | HOLDING_DELEGATED => *balance == 0,
+                _ => false,
+            };
+            if scope == [0; 32] || !valid {
                 return Err(OwnerProofError::Invalid);
             }
             bytes.push(2);
@@ -333,8 +351,9 @@ pub async fn owner_root<S: OwnerTreeStore>(store: &S) -> Result<Key, OwnerProofE
     Ok(combine(left, right)?.hash)
 }
 
-/// Applies one object's owner membership to speculative storage. kind 0 is a coin; kind 1 is an
-/// edge and contributes zero to spendable balance. Removing the last holding removes its owner.
+/// Applies one object's owner membership to speculative storage. The kind is one of
+/// [`HOLDING_COIN`], [`HOLDING_EDGE`] and [`HOLDING_DELEGATED`]; only a held coin contributes to
+/// spendable balance. Removing the last holding removes its owner.
 pub async fn update_holding<S: OwnerTreeStore>(
     store: &mut S,
     owner: SettlementKey,

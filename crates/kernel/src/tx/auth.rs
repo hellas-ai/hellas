@@ -1,11 +1,18 @@
 //! Party-key authorization witnesses.
 //!
-//! [`Auth`] is the kernel's one consent envelope: it proves that a party
-//! key authorized a canonical payload hash — the open hash when opening an
-//! edge, the close payload hash for a cooperative close. `Native` carries a
-//! compact settlement signature; `WebAuthn` carries an assertion whose
-//! challenge is that same hash. Both prove consent from the same kernel
-//! party key used for funding ownership, terms, and payouts.
+//! [`Auth`] is the kernel's one consent envelope: it proves that a key
+//! authorized a canonical payload hash. `Native` carries a compact
+//! settlement signature; `WebAuthn` carries an assertion whose challenge
+//! is that same hash.
+//!
+//! [`PartyAuth`] is what a party to an edge signs with. A party commits
+//! two keys that may act for it — its `owner` and its `signer` — and the
+//! witness names which one it is in a byte, [`Authority`], rather than
+//! leaving the kernel to discover it by trying both. The classification
+//! decides rules (a signer may only spend coins delegated to it; an
+//! owner-signed close pays undelegated), so it has to be a fact of the
+//! transaction, not an accident of verification order. The kernel
+//! verifies exactly the one key the byte names.
 
 use crate::{
     canonical::{
@@ -158,16 +165,6 @@ impl Auth {
     pub const fn webauthn(assertion: WebAuthnAssertion) -> Self {
         Self::WebAuthn(assertion)
     }
-
-    /// Returns true when this witness is a native settlement signature.
-    ///
-    /// Terms shapes whose later transactions need the party's own
-    /// secp256k1 key read this at open: a passkey can authorize the
-    /// open and then be unable to sign anything the channel runs on.
-    #[must_use]
-    pub const fn is_native(&self) -> bool {
-        matches!(self, Self::Native(_))
-    }
 }
 
 impl Encode for Auth {
@@ -219,5 +216,129 @@ impl Decode for Auth {
 impl From<Sig> for Auth {
     fn from(sig: Sig) -> Self {
         Self::Native(sig)
+    }
+}
+
+const OWNER_TAG: u8 = 0;
+const SIGNER_TAG: u8 = 1;
+
+/// Which of a party's two committed keys a [`PartyAuth`] is verified
+/// against.
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+pub enum Authority {
+    /// The party's owning principal.
+    Owner,
+    /// The key the owner committed to sign for it.
+    Signer,
+}
+
+impl Authority {
+    /// Returns the canonical one-byte authority tag.
+    #[must_use]
+    pub const fn tag(self) -> u8 {
+        match self {
+            Self::Owner => OWNER_TAG,
+            Self::Signer => SIGNER_TAG,
+        }
+    }
+
+    /// Decodes a canonical one-byte authority tag.
+    #[must_use]
+    pub const fn from_tag(tag: u8) -> Option<Self> {
+        match tag {
+            OWNER_TAG => Some(Self::Owner),
+            SIGNER_TAG => Some(Self::Signer),
+            _ => None,
+        }
+    }
+}
+
+impl Encode for Authority {
+    const MAX_ENCODED_SIZE: usize = u8::MAX_ENCODED_SIZE;
+
+    fn encoded_size(&self) -> usize {
+        Self::MAX_ENCODED_SIZE
+    }
+
+    fn encode_to<W: Writer + ?Sized>(&self, writer: &mut W) {
+        self.tag().encode_to(writer);
+    }
+}
+
+impl Decode for Authority {
+    fn decode(buf: &[u8]) -> Result<(Self, usize), DecodeError> {
+        let (byte, consumed) = u8::decode(buf)?;
+        Self::from_tag(byte)
+            .map(|authority| (authority, consumed))
+            .ok_or(DecodeError::InvalidTag { tag: byte })
+    }
+}
+
+/// One party's authorization, and which of its keys gave it.
+#[derive(Debug, Clone, Eq, Hash, PartialEq)]
+pub struct PartyAuth {
+    authority: Authority,
+    auth: Auth,
+}
+
+impl PartyAuth {
+    /// Wraps `auth` as given by the key `authority` names.
+    #[must_use]
+    pub const fn new(authority: Authority, auth: Auth) -> Self {
+        Self { authority, auth }
+    }
+
+    /// Wraps `auth` as given by the party's owner.
+    #[must_use]
+    pub fn owner(auth: impl Into<Auth>) -> Self {
+        Self::new(Authority::Owner, auth.into())
+    }
+
+    /// Wraps `auth` as given by the party's signer.
+    #[must_use]
+    pub fn signer(auth: impl Into<Auth>) -> Self {
+        Self::new(Authority::Signer, auth.into())
+    }
+
+    /// Returns which of the party's keys this witness claims.
+    #[must_use]
+    pub const fn authority(&self) -> Authority {
+        self.authority
+    }
+
+    /// Returns the witness itself.
+    #[must_use]
+    pub const fn auth(&self) -> &Auth {
+        &self.auth
+    }
+
+    /// True when this witness is the party's owner acting directly.
+    #[must_use]
+    pub const fn is_owner(&self) -> bool {
+        matches!(self.authority, Authority::Owner)
+    }
+}
+
+impl Encode for PartyAuth {
+    const MAX_ENCODED_SIZE: usize =
+        ENVELOPE_SIZE + Authority::MAX_ENCODED_SIZE + Auth::MAX_ENCODED_SIZE;
+
+    fn encoded_size(&self) -> usize {
+        ENVELOPE_SIZE + self.authority.encoded_size() + self.auth.encoded_size()
+    }
+
+    fn encode_to<W: Writer + ?Sized>(&self, writer: &mut W) {
+        encode_envelope(writer, tag::PARTY_AUTH);
+        self.authority.encode_to(writer);
+        self.auth.encode_to(writer);
+    }
+}
+
+impl Decode for PartyAuth {
+    fn decode(buf: &[u8]) -> Result<(Self, usize), DecodeError> {
+        let mut consumed = decode_envelope(buf, tag::PARTY_AUTH)?;
+        let authority = decode_field(buf, &mut consumed)?;
+        let auth = decode_field(buf, &mut consumed)?;
+        Ok((Self::new(authority, auth), consumed))
     }
 }

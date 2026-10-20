@@ -7,7 +7,8 @@
 
 use hellas_kernel::{
     Auth, BlockHeight, CoinId, EdgeId, Funding, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS,
-    NetworkId, Parties, Payout, Secp256k1Verifier, Terms, Tx, WorkPaymentTerms, WorkStakeBondTerms,
+    NetworkId, Parties, PartyKeys, Payout, Secp256k1Verifier, Terms, Tx, WorkPaymentTerms,
+    WorkStakeBondTerms,
 };
 use hellas_work::model::bundle::{SetupBundleError, WorkChannelSetupBundleV1};
 use hellas_work::test_support::paid::{client, provider};
@@ -36,7 +37,10 @@ fn empty_coins() -> List<CoinId, MAX_PARTY_INPUTS> {
 
 fn bond_terms() -> WorkStakeBondTerms {
     WorkStakeBondTerms {
-        parties: Parties::new(provider().party_key(), client().party_key()),
+        parties: Parties::new(
+            PartyKeys::sole(provider().party_key()),
+            PartyKeys::sole(client().party_key()),
+        ),
         timeout: BlockHeight::new(HORIZON),
         timeout_outputs: List::take(
             [Payout::new(provider().party_key(), STAKE); MAX_EDGE_OUTPUTS],
@@ -533,7 +537,10 @@ fn decoding_a_bundle_is_exact() {
     };
     let substitute = encode_kernel(&Terms::basic(
         hellas_kernel::ProtocolCode::new(1),
-        Parties::new(provider().party_key(), client().party_key()),
+        Parties::new(
+            PartyKeys::sole(provider().party_key()),
+            PartyKeys::sole(client().party_key()),
+        ),
         BlockHeight::new(HORIZON),
         List::take(
             [Payout::new(provider().party_key(), 1); MAX_EDGE_OUTPUTS],

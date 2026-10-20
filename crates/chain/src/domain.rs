@@ -1,8 +1,8 @@
 //! Domain types used by the Hellas chain and light-client API.
 //!
-//! [`Transaction::verify_signature`] verifies through `hellas-webauthn`, the
-//! policy every Hellas verifier shares; this module only builds the
-//! challenges a transfer or merge signs.
+//! Every transaction the chain admits is a kernel transaction, and every
+//! signature on one is checked inside the kernel. Nothing in this module
+//! verifies a signature.
 
 /// Digest used by chain-facing APIs.
 pub use commonware_cryptography::sha256::Digest;
@@ -18,96 +18,24 @@ use commonware_codec::{
 };
 /// Signing helper for domain key types.
 pub use commonware_cryptography::Signer;
-use commonware_cryptography::{Hasher, Sha256, ed25519, secp256r1};
+use commonware_cryptography::{Hasher, Sha256, ed25519};
 use hellas_kernel::{
     Coin as KernelCoin, Decode as KernelDecode, Edge as KernelEdge, Encode as KernelEncode, Fees,
     Key as KernelKey, NetworkId, RegistryChunk as KernelRegistryChunk, Tx as KernelTx,
 };
-#[cfg(test)]
-use sha2::{Digest as _, Sha256 as Sha2};
 
 /// Validator public key.
 pub type PublicKey = ed25519::PublicKey;
 /// Validator private key.
 pub type PrivateKey = ed25519::PrivateKey;
-/// User public key.
-pub type UserPublicKey = secp256r1::standard::PublicKey;
-/// User signature.
-pub type UserSignature = secp256r1::standard::Signature;
 /// Object identifier in the chain state.
 pub type ObjectId = Digest;
 
-/// User address derived from a secp256r1 public key.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct Address(UserPublicKey);
-
-impl Address {
-    /// Returns the public key encoded by this address.
-    #[must_use]
-    pub const fn public_key(&self) -> &UserPublicKey {
-        &self.0
-    }
-}
-
-impl From<UserPublicKey> for Address {
-    fn from(pk: UserPublicKey) -> Self {
-        Self(pk)
-    }
-}
-
-impl core::fmt::Display for Address {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        use commonware_codec::Encode;
-        f.write_str(&bs58::encode(self.0.encode()).into_string())
-    }
-}
-
-impl core::str::FromStr for Address {
-    type Err = AddressError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let bytes = bs58::decode(s).into_vec().map_err(AddressError::Base58)?;
-        let pk = UserPublicKey::decode(bytes.as_slice()).map_err(|_| AddressError::InvalidKey)?;
-        Ok(Self(pk))
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-/// Address parsing error.
-pub enum AddressError {
-    /// Invalid base58 encoding.
-    #[error("invalid base58: {0}")]
-    Base58(bs58::decode::Error),
-    /// Invalid secp256r1 public key bytes.
-    #[error("invalid secp256r1 public key")]
-    InvalidKey,
-}
-
-impl FixedSize for Address {
-    const SIZE: usize = UserPublicKey::SIZE;
-}
-
-impl Write for Address {
-    fn write(&self, buf: &mut impl bytes::BufMut) {
-        self.0.write(buf);
-    }
-}
-
-impl Read for Address {
-    type Cfg = ();
-
-    fn read_cfg(buf: &mut impl bytes::Buf, _cfg: &Self::Cfg) -> Result<Self, CodecError> {
-        Ok(Self(UserPublicKey::read(buf)?))
-    }
-}
-
 /// Raw compressed settlement key used for stored object ownership.
 ///
-/// Unlike [`Address`], this type does not validate a curve. Both compressed
-/// P-256 and compressed secp256k1 keys are 33-byte settlement keys. Legacy
-/// [`Transaction::Transfer`] and [`Transaction::MergeCoin`] verification
-/// explicitly converts a stored key back to [`Address`] and rejects keys that
-/// are not valid P-256 encodings.
+/// This type does not validate a curve. Both compressed P-256 and
+/// compressed secp256k1 keys are 33-byte settlement keys, and the kernel
+/// decides which one a witness is checked against.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SettlementKey(KernelKey);
 
@@ -149,30 +77,6 @@ impl From<KernelKey> for SettlementKey {
 impl From<SettlementKey> for KernelKey {
     fn from(key: SettlementKey) -> Self {
         key.0
-    }
-}
-
-impl From<&Address> for SettlementKey {
-    fn from(address: &Address) -> Self {
-        let mut bytes = [0_u8; Self::LENGTH];
-        bytes.copy_from_slice(address.public_key().as_ref());
-        Self::from_bytes(bytes)
-    }
-}
-
-impl From<Address> for SettlementKey {
-    fn from(address: Address) -> Self {
-        Self::from(&address)
-    }
-}
-
-impl TryFrom<SettlementKey> for Address {
-    type Error = AddressError;
-
-    fn try_from(key: SettlementKey) -> Result<Self, Self::Error> {
-        UserPublicKey::decode(key.as_bytes().as_slice())
-            .map(Self)
-            .map_err(|_| AddressError::InvalidKey)
     }
 }
 
@@ -322,22 +226,6 @@ impl<const N: usize> Read for Bounded<u8, N> {
     }
 }
 
-impl<const N: usize> Read for Bounded<ObjectId, N> {
-    type Cfg = (RangeCfg<usize>, ());
-
-    fn read_cfg(buf: &mut impl bytes::Buf, (range, _cfg): &Self::Cfg) -> Result<Self, CodecError> {
-        let len = usize::read_cfg(buf, range)?;
-        if len > N {
-            return Err(CodecError::InvalidLength(len));
-        }
-        let mut items = [ObjectId::from([0; 32]); N];
-        for slot in items.iter_mut().take(len) {
-            *slot = ObjectId::read(buf)?;
-        }
-        Ok(Self { items, len })
-    }
-}
-
 /// Threshold signature variant used by consensus.
 #[cfg(feature = "domain-consensus")]
 pub type ThresholdVariant = commonware_cryptography::bls12381::primitives::variant::MinPk;
@@ -361,17 +249,6 @@ pub type Context = commonware_consensus::simplex::types::Context<Digest, PublicK
 #[cfg(feature = "domain-consensus")]
 pub type Activity = commonware_consensus::simplex::types::Activity<Scheme, Digest>;
 
-/// Version byte every chain `WebAuthn` challenge starts with, after the domain.
-pub const WEBAUTHN_POLICY_VERSION: u8 = 1;
-
-/// Domain separator for `WebAuthn` challenges.
-pub const CHALLENGE_DOMAIN: &[u8] = b"hellas-webauthn-challenge-v1";
-/// Transfer transaction tag.
-pub const TRANSFER_TAG: u8 = 0x01;
-/// Merge transaction tag.
-pub const MERGE_TAG: u8 = 0x02;
-/// Maximum merge input count.
-pub const MAX_MERGE_INPUTS: usize = 32;
 /// Maximum transactions per block.
 pub const MAX_TXS_PER_BLOCK: usize = 256;
 /// Maximum aggregate encoded transaction bytes admitted to one block.
@@ -393,35 +270,12 @@ pub const KERNEL_FEES: Fees = Fees::ZERO;
 /// span directly until a schedule is set. Delete this in favour of the
 /// derived bound when it is.
 pub const MAX_EDGE_LIFETIME_BLOCKS: u64 = 1_000_000;
-/// Minimum `WebAuthn` authenticator data length.
-pub const MIN_AUTHENTICATOR_DATA_LEN: usize = 37;
-/// Maximum `WebAuthn` authenticator data length.
-pub const MAX_AUTHENTICATOR_DATA_LEN: usize = 256;
-/// Maximum `WebAuthn` client data JSON length.
-pub const MAX_CLIENT_DATA_JSON_LEN: usize = 1024;
-
-/// Bounded authenticator data carried by a `WebAuthn` signature.
-pub type AuthenticatorData = Bounded<u8, MAX_AUTHENTICATOR_DATA_LEN>;
-/// Bounded client data JSON carried by a `WebAuthn` signature.
-pub type ClientDataJson = Bounded<u8, MAX_CLIENT_DATA_JSON_LEN>;
-/// Bounded merge input list.
-pub type MergeInputs = Bounded<ObjectId, MAX_MERGE_INPUTS>;
-
 /// Returns the deterministic object id for a genesis allocation.
 #[must_use]
 pub fn genesis_object_id(validator_index: u16) -> ObjectId {
     let mut buf = BytesMut::new();
     buf.extend_from_slice(b"hellas-genesis");
     validator_index.write(&mut buf);
-    Sha256::hash(&buf)
-}
-
-/// Returns the deterministic object id for a transaction output.
-#[must_use]
-pub fn output_object_id(tx_digest: &Digest, output_index: u8) -> ObjectId {
-    let mut buf = BytesMut::new();
-    tx_digest.write(&mut buf);
-    output_index.write(&mut buf);
     Sha256::hash(&buf)
 }
 
@@ -464,83 +318,15 @@ pub struct NetworkIdError(pub String);
 ///
 /// The single conversion from "the document this node was started
 /// with" to "the network every signature it makes is bound to". It
-/// lives here, beside the challenge builders it feeds, rather than in
-/// `config`: reading a network off a document is what every signer
-/// does, and only a validator reads a validator config.
+/// lives here rather than in `config`: reading a network off a document
+/// is what every signer does, and only a validator reads a validator
+/// config.
 ///
 /// There is deliberately no compile-time default. A binary that
 /// carries one silently re-domains every signature in the tree the
 /// moment that constant moves, which is not hypothetical.
 pub fn network_id(genesis: &crate::genesis::Genesis) -> Result<NetworkId, NetworkIdError> {
     NetworkId::new(&genesis.network_id).ok_or_else(|| NetworkIdError(genesis.network_id.clone()))
-}
-
-/// Writes the network-scoped domain prefix every `WebAuthn` challenge
-/// starts with.
-///
-/// The network is a runtime value, not a constant: a passkey signature
-/// says "I authorize this transfer *on this network*", and a compiled-in
-/// chain id would silently re-domain every signature in the tree the
-/// moment that constant moved. [`NetworkId`]'s own encoding is
-/// length-prefixed, which is what keeps the prefix unambiguous when a
-/// variable-width id sits next to the tag.
-fn challenge_prefix(buf: &mut BytesMut, network: NetworkId, tag: u8) {
-    buf.extend_from_slice(CHALLENGE_DOMAIN);
-    WEBAUTHN_POLICY_VERSION.write(buf);
-    let mut encoded = [0_u8; NetworkId::MAX_ENCODED_SIZE];
-    let len = network.write_to(&mut encoded);
-    buf.extend_from_slice(&encoded[..len]);
-    tag.write(buf);
-}
-
-/// Returns the `WebAuthn` challenge for a transfer transaction on
-/// `network`.
-#[must_use]
-pub fn transfer_challenge(
-    network: NetworkId,
-    input: &ObjectId,
-    recipient: &Address,
-    amount: u64,
-) -> Digest {
-    let mut buf = BytesMut::new();
-    challenge_prefix(&mut buf, network, TRANSFER_TAG);
-    input.write(&mut buf);
-    recipient.write(&mut buf);
-    amount.write(&mut buf);
-    Sha256::hash(&buf)
-}
-
-/// Returns the `WebAuthn` challenge for a merge transaction on
-/// `network`.
-#[must_use]
-pub fn merge_challenge(network: NetworkId, sorted_inputs: &[ObjectId]) -> Digest {
-    let mut buf = BytesMut::new();
-    challenge_prefix(&mut buf, network, MERGE_TAG);
-    sorted_inputs.write(&mut buf);
-    Sha256::hash(&buf)
-}
-
-#[cfg(test)]
-fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
-    let mut hasher = Sha2::new();
-    hasher.update(bytes);
-    hasher.finalize().into()
-}
-
-#[cfg(test)]
-fn secp256r1_key_from_material(material: &[u8]) -> p256::ecdsa::SigningKey {
-    let mut salt = 0u8;
-    loop {
-        let mut hasher = Sha2::new();
-        hasher.update(b"hellas-secp256r1-material-v1");
-        hasher.update(material);
-        hasher.update([salt]);
-        let raw: [u8; 32] = hasher.finalize().into();
-        if let Ok(key) = p256::ecdsa::SigningKey::from_slice(&raw) {
-            return key;
-        }
-        salt = salt.wrapping_add(1);
-    }
 }
 
 // --- Stored objects (gated) ---
@@ -550,14 +336,30 @@ fn secp256r1_key_from_material(material: &[u8]) -> p256::ecdsa::SigningKey {
 pub struct Coin {
     /// Coin owner.
     pub owner: SettlementKey,
+    /// The one other key that may spend this coin, and only to fund a
+    /// work open or bond under its own signature.
+    pub delegate: Option<SettlementKey>,
     /// Coin value.
     pub value: u64,
+}
+
+impl Coin {
+    /// An undelegated coin.
+    #[must_use]
+    pub const fn owned(owner: SettlementKey, value: u64) -> Self {
+        Self {
+            owner,
+            delegate: None,
+            value,
+        }
+    }
 }
 
 impl From<KernelCoin> for Coin {
     fn from(coin: KernelCoin) -> Self {
         Self {
             owner: SettlementKey::from(coin.owner()),
+            delegate: coin.delegate().map(SettlementKey::from),
             value: coin.value(),
         }
     }
@@ -565,7 +367,11 @@ impl From<KernelCoin> for Coin {
 
 impl From<Coin> for KernelCoin {
     fn from(coin: Coin) -> Self {
-        Self::issue(coin.owner.into_kernel(), coin.value)
+        Self::issue(
+            coin.owner.into_kernel(),
+            coin.delegate.map(SettlementKey::into_kernel),
+            coin.value,
+        )
     }
 }
 
@@ -630,10 +436,13 @@ impl Object {
     /// widest arm, so a literal here would silently truncate the moment
     /// a kernel payload grew past it.
     pub const PAYLOAD_SIZE: usize = larger(
-        KernelCoin::MAX_ENCODED_SIZE,
+        crate::owner_proof::OWNER_NODE_BYTES,
         larger(
-            KernelEdge::MAX_ENCODED_SIZE,
-            KernelRegistryChunk::MAX_ENCODED_SIZE,
+            KernelCoin::MAX_ENCODED_SIZE,
+            larger(
+                KernelEdge::MAX_ENCODED_SIZE,
+                KernelRegistryChunk::MAX_ENCODED_SIZE,
+            ),
         ),
     );
 
@@ -690,7 +499,9 @@ impl Write for Object {
             }
             Self::OwnerData(data) => {
                 Self::OWNER_DATA_TAG.write(buf);
-                buf.put_slice(data);
+                let mut payload = [0_u8; Self::PAYLOAD_SIZE];
+                payload[..crate::owner_proof::OWNER_NODE_BYTES].copy_from_slice(data);
+                buf.put_slice(&payload);
             }
             Self::RegistryChunk(chunk) => {
                 Self::REGISTRY_CHUNK_TAG.write(buf);
@@ -707,7 +518,15 @@ impl Read for Object {
         let tag = u8::read(buf)?;
         let payload = <[u8; Self::PAYLOAD_SIZE]>::read(buf)?;
         match tag {
-            Self::OWNER_DATA_TAG => Ok(Self::OwnerData(payload)),
+            Self::OWNER_DATA_TAG => {
+                let (node, padding) = payload.split_at(crate::owner_proof::OWNER_NODE_BYTES);
+                if padding.iter().any(|byte| *byte != 0) {
+                    return Err(CodecError::Invalid("Object", "non-zero owner node padding"));
+                }
+                let mut data = [0_u8; crate::owner_proof::OWNER_NODE_BYTES];
+                data.copy_from_slice(node);
+                Ok(Self::OwnerData(data))
+            }
             Self::COIN_TAG => {
                 let coin = Self::read_payload::<KernelCoin>(&payload)?;
                 Ok(Self::Coin(Coin::from(coin)))
@@ -747,235 +566,42 @@ pub(crate) fn test_edge() -> KernelEdge {
     }
     bytes.extend_from_slice(&[1, 1]);
     bytes.extend_from_slice(&99_u64.to_be_bytes());
+    // Parties: each is owner, signer, then an absent payout delegate.
     bytes.extend_from_slice(&[1, 3]);
     bytes.extend_from_slice(&[2; KernelKey::LENGTH]);
+    bytes.extend_from_slice(&[2; KernelKey::LENGTH]);
+    bytes.push(0);
     bytes.extend_from_slice(&[3; KernelKey::LENGTH]);
+    bytes.extend_from_slice(&[3; KernelKey::LENGTH]);
+    bytes.push(0);
     bytes.extend_from_slice(&[4; 32]);
     // CloseKindSet: the basic-terms set (mutual, timeout).
     bytes.push(0b011);
-    assert_eq!(bytes.len(), KernelEdge::MAX_ENCODED_SIZE);
+    assert_eq!(
+        bytes.len(),
+        KernelEdge::MAX_ENCODED_SIZE - 2 * KernelKey::LENGTH
+    );
     KernelEdge::decode_exact(&bytes).expect("test edge must use the kernel canonical layout")
 }
 
-// --- WebAuthnSignature (gated) ---
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-/// `WebAuthn` signature payload committed by a transaction.
-pub struct WebAuthnSignature {
-    /// Raw secp256r1 ECDSA signature.
-    pub signature: UserSignature,
-    /// `WebAuthn` authenticator data.
-    pub authenticator_data: AuthenticatorData,
-    /// `WebAuthn` client data JSON.
-    pub client_data_json: ClientDataJson,
-}
-
-fn byte_list_from_slice<const N: usize>(bytes: &[u8]) -> Option<Bounded<u8, N>> {
-    if bytes.len() > N {
-        return None;
-    }
-    let mut items = [0_u8; N];
-    items[..bytes.len()].copy_from_slice(bytes);
-    Bounded::new(items, bytes.len())
-}
-
-impl WebAuthnSignature {
-    /// Builds a bounded `WebAuthn` signature payload.
-    #[must_use]
-    pub fn new(
-        signature: UserSignature,
-        authenticator_data: &[u8],
-        client_data_json: &[u8],
-    ) -> Option<Self> {
-        if authenticator_data.len() < MIN_AUTHENTICATOR_DATA_LEN || client_data_json.is_empty() {
-            return None;
-        }
-        Some(Self {
-            signature,
-            authenticator_data: byte_list_from_slice(authenticator_data)?,
-            client_data_json: byte_list_from_slice(client_data_json)?,
-        })
-    }
-
-    /// Builds a bounded signature payload from the DER encoding returned by
-    /// `AuthenticatorAssertionResponse.signature`.
-    #[must_use]
-    pub fn from_der(
-        signature_der: &[u8],
-        authenticator_data: &[u8],
-        client_data_json: &[u8],
-    ) -> Option<Self> {
-        let signature = hellas_webauthn::signature_from_der(signature_der).ok()?;
-        let signature = UserSignature::decode(signature.as_slice()).ok()?;
-        Self::new(signature, authenticator_data, client_data_json)
-    }
-}
-
-impl EncodeSize for WebAuthnSignature {
-    fn encode_size(&self) -> usize {
-        self.signature.encode_size()
-            + self.authenticator_data.encode_size()
-            + self.client_data_json.encode_size()
-    }
-}
-
-impl Write for WebAuthnSignature {
-    fn write(&self, buf: &mut impl bytes::BufMut) {
-        self.signature.write(buf);
-        self.authenticator_data.write(buf);
-        self.client_data_json.write(buf);
-    }
-}
-
-impl Read for WebAuthnSignature {
-    type Cfg = ();
-
-    fn read_cfg(buf: &mut impl bytes::Buf, _cfg: &Self::Cfg) -> Result<Self, CodecError> {
-        Ok(Self {
-            signature: UserSignature::read(buf)?,
-            authenticator_data: AuthenticatorData::read_cfg(
-                buf,
-                &(
-                    RangeCfg::new(MIN_AUTHENTICATOR_DATA_LEN..=MAX_AUTHENTICATOR_DATA_LEN),
-                    (),
-                ),
-            )?,
-            client_data_json: ClientDataJson::read_cfg(
-                buf,
-                &(RangeCfg::new(1..=MAX_CLIENT_DATA_JSON_LEN), ()),
-            )?,
-        })
-    }
-}
-
 // --- Transaction (gated) ---
+
+/// Wire tag of the one transaction arm.
+///
+/// A fixed consensus assignment, not a position. 0 and 1 were the
+/// deleted chain-side transfer and merge, which verified their own
+/// passkey signatures beside the kernel's; both bytes are ordinary
+/// rejections and neither is reserved. Moving coins between owners is the
+/// kernel's owner reshape.
+const KERNEL_TAG: u8 = 2;
 
 // Keep transactions inline/stack-allocated to avoid per-transaction heap churn in hot paths.
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug)]
 /// Chain transaction.
 pub enum Transaction {
-    /// Transfer part or all of one input coin to a recipient.
-    Transfer {
-        /// Input coin object id.
-        input: ObjectId,
-        /// Recipient address.
-        recipient: Address,
-        /// Amount transferred to the recipient.
-        amount: u64,
-        /// Owner signature over the transfer challenge.
-        signature: WebAuthnSignature,
-    },
-    /// Merge multiple input coins owned by the same address.
-    MergeCoin {
-        /// Sorted input coin object ids.
-        inputs: MergeInputs,
-        /// Owner signature over the merge challenge.
-        signature: WebAuthnSignature,
-    },
     /// Canonically encoded transaction for the settlement kernel.
     Kernel(KernelTx),
-}
-
-/// Why a merge transaction's input list is not admissible.
-///
-/// Merge validation runs twice — against QMDB in `execution::kernel`
-/// and against the in-memory `owner_index` — and the two must agree
-/// exactly, so the predicate lives here and each caller maps the fault
-/// into its own error type. Callers keep their distinctions: a
-/// duplicated input is a different fault from an out-of-order one.
-#[cfg(any(feature = "indexer", feature = "validator"))]
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub(crate) enum MergeInputFault {
-    /// Fewer than two inputs — nothing to merge.
-    TooFew,
-    /// The same object appears twice.
-    Duplicate(ObjectId),
-    /// Inputs are not in ascending order.
-    NonCanonical,
-}
-
-/// Validates a merge input list, or reports the first fault found.
-#[cfg(any(feature = "indexer", feature = "validator"))]
-pub(crate) fn merge_input_fault(inputs: &[ObjectId]) -> Option<MergeInputFault> {
-    if inputs.len() < 2 {
-        return Some(MergeInputFault::TooFew);
-    }
-    inputs.windows(2).find_map(|pair| {
-        if pair[0] == pair[1] {
-            Some(MergeInputFault::Duplicate(pair[0]))
-        } else if pair[0] > pair[1] {
-            Some(MergeInputFault::NonCanonical)
-        } else {
-            None
-        }
-    })
-}
-
-fn verify_webauthn_signature(
-    expected_challenge: &Digest,
-    signature: &WebAuthnSignature,
-    owner: &UserPublicKey,
-) -> bool {
-    let Ok(key) = hellas_webauthn::PublicKey::from_sec1(owner.as_ref()) else {
-        return false;
-    };
-    let Ok(compact) = signature.signature.as_ref().try_into() else {
-        return false;
-    };
-    let Ok(challenge) = expected_challenge.as_ref().try_into() else {
-        return false;
-    };
-    hellas_webauthn::verify(
-        &hellas_webauthn::Assertion {
-            signature: compact,
-            authenticator_data: signature.authenticator_data.as_slice(),
-            client_data_json: signature.client_data_json.as_slice(),
-        },
-        &key,
-        challenge,
-    )
-    .is_ok()
-}
-
-impl Transaction {
-    /// Verifies a legacy transaction `WebAuthn` signature against
-    /// `owner`, as authorized for `network`.
-    ///
-    /// A signature made for one network fails here under any other: the
-    /// challenge it was produced over is not the challenge this
-    /// recomputes.
-    ///
-    /// Kernel transactions deliberately return `false`: they authenticate
-    /// inside kernel [`hellas_kernel::State::apply`] beginning in M4, never at
-    /// this chain-domain signature layer.
-    #[must_use]
-    pub fn verify_signature(&self, network: NetworkId, owner: &Address) -> bool {
-        match self {
-            Self::Transfer {
-                input,
-                recipient,
-                amount,
-                signature,
-            } => {
-                let expected = transfer_challenge(network, input, recipient, *amount);
-                verify_webauthn_signature(&expected, signature, owner.public_key())
-            }
-            Self::MergeCoin { inputs, signature } => {
-                let expected = merge_challenge(network, inputs.as_slice());
-                verify_webauthn_signature(&expected, signature, owner.public_key())
-            }
-            Self::Kernel(_) => false,
-        }
-    }
-}
-
-#[cfg(test)]
-impl From<ed25519::PublicKey> for Address {
-    fn from(pk: ed25519::PublicKey) -> Self {
-        let key = secp256r1_key_from_material(pk.as_ref());
-        addr_from_signing_key(&key)
-    }
 }
 
 /// The network every in-crate test signs under.
@@ -990,66 +616,9 @@ pub(crate) const TEST_NETWORK: NetworkId = match NetworkId::new("hellas-chain-te
     None => panic!("literal is a legal network id"),
 };
 
-#[cfg(test)]
-impl Transaction {
-    /// Builds a signed transfer transaction for tests, authorized for
-    /// `network`.
-    #[must_use]
-    pub fn transfer(
-        network: NetworkId,
-        key: &PrivateKey,
-        input: ObjectId,
-        recipient: Address,
-        amount: u64,
-    ) -> Option<Self> {
-        let secp_key = secp256r1_key_from_material(key.public_key().as_ref());
-        let challenge = transfer_challenge(network, &input, &recipient, amount);
-        Some(Self::Transfer {
-            input,
-            recipient,
-            amount,
-            signature: mock_webauthn_sign(&secp_key, &challenge)?,
-        })
-    }
-
-    /// Builds a signed merge transaction for tests, authorized for
-    /// `network`.
-    #[must_use]
-    pub fn merge(network: NetworkId, key: &PrivateKey, inputs: &[ObjectId]) -> Option<Self> {
-        let mut items = [ObjectId::from([0; 32]); MAX_MERGE_INPUTS];
-        if inputs.len() > items.len() {
-            return None;
-        }
-        items[..inputs.len()].copy_from_slice(inputs);
-        items[..inputs.len()].sort();
-        let inputs = MergeInputs::new(items, inputs.len())?;
-        let secp_key = secp256r1_key_from_material(key.public_key().as_ref());
-        let challenge = merge_challenge(network, inputs.as_slice());
-        Some(Self::MergeCoin {
-            inputs,
-            signature: mock_webauthn_sign(&secp_key, &challenge)?,
-        })
-    }
-}
-
 impl EncodeSize for Transaction {
     fn encode_size(&self) -> usize {
         match self {
-            Self::Transfer {
-                input,
-                recipient,
-                amount,
-                signature,
-            } => {
-                u8::SIZE
-                    + input.encode_size()
-                    + recipient.encode_size()
-                    + amount.encode_size()
-                    + signature.encode_size()
-            }
-            Self::MergeCoin { inputs, signature } => {
-                u8::SIZE + inputs.encode_size() + signature.encode_size()
-            }
             Self::Kernel(tx) => u8::SIZE + tx.encoded_size().encode_size() + tx.encoded_size(),
         }
     }
@@ -1066,25 +635,8 @@ impl<B: bytes::BufMut + ?Sized> hellas_kernel::Writer for KernelTransactionWrite
 impl Write for Transaction {
     fn write(&self, buf: &mut impl bytes::BufMut) {
         match self {
-            Self::Transfer {
-                input,
-                recipient,
-                amount,
-                signature,
-            } => {
-                0u8.write(buf);
-                input.write(buf);
-                recipient.write(buf);
-                amount.write(buf);
-                signature.write(buf);
-            }
-            Self::MergeCoin { inputs, signature } => {
-                1u8.write(buf);
-                inputs.write(buf);
-                signature.write(buf);
-            }
             Self::Kernel(tx) => {
-                2u8.write(buf);
+                KERNEL_TAG.write(buf);
                 tx.encoded_size().write(buf);
                 tx.encode_to(&mut KernelTransactionWriter(buf));
             }
@@ -1098,17 +650,7 @@ impl Read for Transaction {
     fn read_cfg(buf: &mut impl bytes::Buf, _cfg: &Self::Cfg) -> Result<Self, CodecError> {
         let tag = u8::read(buf)?;
         match tag {
-            0 => Ok(Self::Transfer {
-                input: ObjectId::read(buf)?,
-                recipient: Address::read(buf)?,
-                amount: u64::read(buf)?,
-                signature: WebAuthnSignature::read(buf)?,
-            }),
-            1 => Ok(Self::MergeCoin {
-                inputs: MergeInputs::read_cfg(buf, &(RangeCfg::new(2..=MAX_MERGE_INPUTS), ()))?,
-                signature: WebAuthnSignature::read(buf)?,
-            }),
-            2 => {
+            KERNEL_TAG => {
                 let payload = Bounded::<u8, { KernelTx::MAX_ENCODED_SIZE }>::read_cfg(
                     buf,
                     &(RangeCfg::new(0..=KernelTx::MAX_ENCODED_SIZE), ()),
@@ -1125,145 +667,41 @@ impl Read for Transaction {
 }
 
 #[cfg(test)]
-/// Derives a deterministic secp256r1 signing key from `seed`.
-#[must_use]
-pub fn secp256r1_key_from_seed(seed: u64) -> p256::ecdsa::SigningKey {
-    secp256r1_key_from_material(&seed.to_le_bytes())
-}
-
-#[cfg(test)]
-/// Derives a chain address from a secp256r1 signing key.
-#[must_use]
-pub fn addr_from_signing_key(key: &p256::ecdsa::SigningKey) -> Address {
-    Address::from(UserPublicKey::from(key.verifying_key().to_owned()))
-}
-
-/// The origin the mock signer claims. The verifier ignores it; the mock
-/// keeps emitting it, with its RP ID hash, so the golden encodings below
-/// still show a browser-shaped assertion.
-#[cfg(test)]
-const MOCK_WEBAUTHN_ORIGIN: &str = "https://wallet.hellas.ai";
-#[cfg(test)]
-const MOCK_WEBAUTHN_RP_ID: &str = "wallet.hellas.ai";
-
-#[cfg(test)]
-fn push_bytes(dst: &mut [u8], len: &mut usize, bytes: &[u8]) -> Option<()> {
-    let end = len.checked_add(bytes.len())?;
-    if end > dst.len() {
-        return None;
-    }
-    dst[*len..end].copy_from_slice(bytes);
-    *len = end;
-    Some(())
-}
-
-#[cfg(test)]
-fn mock_client_data_json(challenge: &Digest) -> Option<ClientDataJson> {
-    let challenge = hellas_webauthn::encode_challenge(challenge.as_ref().try_into().ok()?);
-    let mut json = [0_u8; MAX_CLIENT_DATA_JSON_LEN];
-    let mut len = 0;
-    push_bytes(
-        &mut json,
-        &mut len,
-        br#"{"type":"webauthn.get","challenge":""#,
-    )?;
-    push_bytes(&mut json, &mut len, &challenge)?;
-    push_bytes(&mut json, &mut len, br#"","origin":""#)?;
-    push_bytes(&mut json, &mut len, MOCK_WEBAUTHN_ORIGIN.as_bytes())?;
-    push_bytes(&mut json, &mut len, br#"","crossOrigin":false}"#)?;
-    byte_list_from_slice(&json[..len])
-}
-
-#[cfg(test)]
-/// Creates a deterministic `WebAuthn` signature for tests.
-#[must_use]
-pub fn mock_webauthn_sign(
-    key: &p256::ecdsa::SigningKey,
-    challenge: &Digest,
-) -> Option<WebAuthnSignature> {
-    use p256::ecdsa::signature::hazmat::PrehashSigner as _;
-
-    let client_data_json = mock_client_data_json(challenge)?;
-
-    let mut authenticator_data = [0_u8; MIN_AUTHENTICATOR_DATA_LEN];
-    authenticator_data[..32].copy_from_slice(&sha256_bytes(MOCK_WEBAUTHN_RP_ID.as_bytes()));
-    authenticator_data[32] = hellas_webauthn::FLAG_UP | hellas_webauthn::FLAG_UV;
-
-    let digest = hellas_webauthn::signed_digest(&authenticator_data, client_data_json.as_slice());
-    let signed: p256::ecdsa::Signature = key.sign_prehash(&digest).ok()?;
-    let normalized = signed.normalize_s();
-    let Ok(signature) = UserSignature::decode(normalized.to_bytes().as_ref()) else {
-        return None;
-    };
-
-    Some(WebAuthnSignature {
-        signature,
-        authenticator_data: byte_list_from_slice(&authenticator_data)?,
-        client_data_json,
-    })
-}
-
-#[cfg(test)]
 #[allow(clippy::disallowed_types, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use commonware_codec::{DecodeExt, Encode};
     use hellas_kernel::test_support::{valid_mutual_close_tx, valid_open_tx};
 
-    fn test_merge_inputs(values: &[ObjectId]) -> MergeInputs {
-        let mut items = [ObjectId::from([0; 32]); MAX_MERGE_INPUTS];
-        items[..values.len()].copy_from_slice(values);
-        MergeInputs::new(items, values.len()).expect("test merge inputs fit")
-    }
-
-    fn sample_transfer(key: &p256::ecdsa::SigningKey) -> (Address, Transaction) {
-        let sender_addr = addr_from_signing_key(key);
-        let recipient = addr_from_signing_key(&secp256r1_key_from_seed(2));
-        let input = Digest::from([7; 32]);
-        let challenge = transfer_challenge(TEST_NETWORK, &input, &recipient, 5);
-        let signature = mock_webauthn_sign(key, &challenge).expect("mock signature");
-        (
-            sender_addr,
-            Transaction::Transfer {
-                input,
-                recipient,
-                amount: 5,
-                signature,
-            },
-        )
-    }
-
-    #[test]
-    fn webauthn_signature_accepts_browser_der() {
-        let key = secp256r1_key_from_seed(17);
-        let challenge = Digest::from([9; 32]);
-        let original = mock_webauthn_sign(&key, &challenge).unwrap();
-        let signature = p256::ecdsa::Signature::from_slice(original.signature.as_ref()).unwrap();
-        let decoded = WebAuthnSignature::from_der(
-            signature.to_der().as_bytes(),
-            original.authenticator_data.as_slice(),
-            original.client_data_json.as_slice(),
-        )
-        .unwrap();
-        assert_eq!(decoded, original);
-    }
-
     #[test]
     fn object_coin_codec_uses_kernel_canonical_payload_and_zero_padding() {
-        let address = addr_from_signing_key(&secp256r1_key_from_seed(1));
-        let owner = SettlementKey::from(&address);
-        let object = Object::Coin(Coin { owner, value: 123 });
-        let encoded = object.encode();
+        let owner = SettlementKey::from_bytes([0x31; SettlementKey::LENGTH]);
+        let delegate = SettlementKey::from_bytes([0x41; SettlementKey::LENGTH]);
+        for coin in [
+            Coin::owned(owner, 123),
+            Coin {
+                owner,
+                delegate: Some(delegate),
+                value: 123,
+            },
+        ] {
+            let object = Object::Coin(coin);
+            let encoded = object.encode();
 
-        let kernel_coin = KernelCoin::issue(owner.into_kernel(), 123);
-        let mut canonical = [0_u8; KernelCoin::MAX_ENCODED_SIZE];
-        let canonical_len = kernel_coin.write_to(&mut canonical);
+            let kernel_coin = KernelCoin::from(coin);
+            assert_eq!(
+                kernel_coin.delegate().map(SettlementKey::from),
+                coin.delegate
+            );
+            let mut canonical = [0_u8; KernelCoin::MAX_ENCODED_SIZE];
+            let canonical_len = kernel_coin.write_to(&mut canonical);
 
-        assert_eq!(encoded.len(), Object::SIZE);
-        assert_eq!(encoded[0], Object::COIN_TAG);
-        assert_eq!(&encoded[1..1 + canonical_len], &canonical);
-        assert!(encoded[1 + canonical_len..].iter().all(|byte| *byte == 0));
-        assert_eq!(Object::decode(encoded).expect("object decode"), object);
+            assert_eq!(encoded.len(), Object::SIZE);
+            assert_eq!(encoded[0], Object::COIN_TAG);
+            assert_eq!(&encoded[1..1 + canonical_len], &canonical[..canonical_len]);
+            assert!(encoded[1 + canonical_len..].iter().all(|byte| *byte == 0));
+            assert_eq!(Object::decode(encoded).expect("object decode"), object);
+        }
     }
 
     #[test]
@@ -1274,32 +712,41 @@ mod tests {
         let mut canonical = [0_u8; KernelEdge::MAX_ENCODED_SIZE];
         let canonical_len = edge.write_to(&mut canonical);
 
-        assert_eq!(canonical_len, Object::PAYLOAD_SIZE);
+        // Neither party commits a payout delegate, so the edge is two
+        // absent keys short of the widest one and the rest is padding.
+        assert_eq!(
+            canonical_len,
+            Object::PAYLOAD_SIZE - 2 * SettlementKey::LENGTH
+        );
         assert_eq!(encoded[0], Object::EDGE_TAG);
-        assert_eq!(&encoded[1..], &canonical);
+        assert_eq!(&encoded[1..1 + canonical_len], &canonical[..canonical_len]);
+        assert!(encoded[1 + canonical_len..].iter().all(|byte| *byte == 0));
         assert_eq!(Object::decode(encoded).expect("object decode"), object);
     }
 
     #[test]
-    fn stored_object_stays_164_bytes_across_every_arm() {
+    fn stored_object_is_298_bytes_across_every_arm() {
         // The stored object is a one-byte kind tag plus a payload area
-        // padded to the widest kernel arm. A registry chunk is 130
-        // canonical bytes, under the 163-byte edge, so adding it did not
-        // widen a single stored coin, edge, or chunk. This number is
-        // load-bearing for the fixed-size QMDB journal: changing it
-        // rewrites every stored object.
+        // padded to the widest kernel arm. That arm is the edge: since
+        // each party commits an owner, a signer and an optional payout
+        // delegate, an edge is 297 canonical bytes at its widest, above
+        // the 130-byte registry chunk and the 77-byte delegated coin.
+        // This number is load-bearing for the fixed-size QMDB journal:
+        // changing it rewrites every stored object, which is why it is
+        // pinned rather than derived here.
         assert_eq!(KernelRegistryChunk::MAX_ENCODED_SIZE, 130);
-        assert_eq!(KernelEdge::MAX_ENCODED_SIZE, 163);
+        assert_eq!(KernelCoin::MAX_ENCODED_SIZE, 77);
+        assert_eq!(KernelEdge::MAX_ENCODED_SIZE, 297);
         const { assert!(KernelCoin::MAX_ENCODED_SIZE <= KernelEdge::MAX_ENCODED_SIZE) };
-        assert_eq!(Object::PAYLOAD_SIZE, 163);
-        assert_eq!(Object::SIZE, 164);
+        assert_eq!(Object::PAYLOAD_SIZE, 297);
+        assert_eq!(Object::SIZE, 298);
 
         let chunk = test_registry_chunk();
         for object in [
-            Object::Coin(Coin {
-                owner: SettlementKey::from_bytes([0x42; SettlementKey::LENGTH]),
-                value: 7,
-            }),
+            Object::Coin(Coin::owned(
+                SettlementKey::from_bytes([0x42; SettlementKey::LENGTH]),
+                7,
+            )),
             Object::Edge(test_edge()),
             Object::RegistryChunk(chunk),
         ] {
@@ -1326,10 +773,10 @@ mod tests {
 
     #[test]
     fn object_codec_rejects_non_zero_padding() {
-        let object = Object::Coin(Coin {
-            owner: SettlementKey::from_bytes([0x42; SettlementKey::LENGTH]),
-            value: 7,
-        });
+        let object = Object::Coin(Coin::owned(
+            SettlementKey::from_bytes([0x42; SettlementKey::LENGTH]),
+            7,
+        ));
         let mut encoded = object.encode().to_vec();
         let last = encoded.len() - 1;
         encoded[last] = 1;
@@ -1347,64 +794,33 @@ mod tests {
         let encoded = key.to_string();
         let decoded: SettlementKey = encoded.parse().expect("base58 settlement key");
         assert_eq!(decoded, key);
-        assert_eq!(Address::try_from(decoded), Err(AddressError::InvalidKey));
     }
 
     #[test]
-    fn address_converts_to_and_from_settlement_key() {
-        let address = addr_from_signing_key(&secp256r1_key_from_seed(42));
-        let key = SettlementKey::from(&address);
-        assert_eq!(Address::try_from(key), Ok(address));
-    }
-
-    #[test]
-    fn transfer_codec_roundtrip() {
-        let key = secp256r1_key_from_seed(1);
-        let (_, tx) = sample_transfer(&key);
-        let encoded = tx.encode();
-        let decoded = Transaction::decode(encoded).expect("tx decode");
-        assert_eq!(decoded.encode(), tx.encode());
-    }
-
-    #[test]
-    fn every_transaction_arm_max_encoding_fits_advisory_block_budget() {
-        let webauthn_max = UserSignature::SIZE
-            + MAX_AUTHENTICATOR_DATA_LEN.encode_size()
-            + MAX_AUTHENTICATOR_DATA_LEN
-            + MAX_CLIENT_DATA_JSON_LEN.encode_size()
-            + MAX_CLIENT_DATA_JSON_LEN;
-        let transfer_max = u8::SIZE + ObjectId::SIZE + Address::SIZE + u64::SIZE + webauthn_max;
-        let merge_max = u8::SIZE
-            + MAX_MERGE_INPUTS.encode_size()
-            + MAX_MERGE_INPUTS * ObjectId::SIZE
-            + webauthn_max;
+    fn the_transaction_max_encoding_fits_advisory_block_budget() {
         let kernel_max =
             u8::SIZE + KernelTx::MAX_ENCODED_SIZE.encode_size() + KernelTx::MAX_ENCODED_SIZE;
-
-        for (arm, maximum) in [
-            ("transfer", transfer_max),
-            ("merge", merge_max),
-            ("kernel", kernel_max),
-        ] {
-            assert!(
-                maximum < MAX_BLOCK_TX_BYTES / 8,
-                "{arm} maximum {maximum} is not far below advisory block budget {MAX_BLOCK_TX_BYTES}"
-            );
-        }
+        assert!(
+            kernel_max < MAX_BLOCK_TX_BYTES / 8,
+            "kernel maximum {kernel_max} is not far below advisory block budget {MAX_BLOCK_TX_BYTES}"
+        );
     }
 
     /// A maximum-width close start: the widest revealed payment terms
     /// plus a present certificate.
     fn payment_close_start_tx() -> KernelTx {
         use hellas_kernel::{
-            EarnedCertificate, Move, Party, PaymentCloseStart, Payout as KernelPayout, Sig,
-            Terms as KernelTerms, WorkPaymentTerms, WorkStakeBondTerms,
+            EarnedCertificate, Move, Party, PartyAuth, PaymentCloseStart, Payout as KernelPayout,
+            Sig, Terms as KernelTerms, WorkPaymentTerms, WorkStakeBondTerms,
         };
 
         let maker = hellas_kernel::Key::from_bytes([0x31; 33]);
         let taker = hellas_kernel::Key::from_bytes([0x32; 33]);
         let bond = WorkStakeBondTerms {
-            parties: hellas_kernel::Parties::new(taker, maker),
+            parties: hellas_kernel::Parties::new(
+                hellas_kernel::PartyKeys::sole(taker),
+                hellas_kernel::PartyKeys::sole(maker),
+            ),
             timeout: hellas_kernel::BlockHeight::new(900),
             timeout_outputs: hellas_kernel::List::all(
                 [KernelPayout::new(taker, 3); hellas_kernel::MAX_EDGE_OUTPUTS],
@@ -1426,14 +842,15 @@ mod tests {
             terms,
             Party::Taker,
             (900, 907),
-            Some((certificate, Sig::from_bytes([0x66; 64]))),
-            Sig::from_bytes([0x77; 64]),
+            Some((certificate, PartyAuth::owner(Sig::from_bytes([0x66; 64])))),
+            PartyAuth::owner(Sig::from_bytes([0x77; 64])),
         )))
     }
 
     fn payment_close_response_tx() -> KernelTx {
         use hellas_kernel::{
-            EarnedCertificate, Move, Party, PaymentCloseResponse, Sig, StartId, TermsHash,
+            EarnedCertificate, Move, Party, PartyAuth, PaymentCloseResponse, Sig, StartId,
+            TermsHash,
         };
 
         let edge = hellas_kernel::EdgeId::from_bytes([0x11; 32]);
@@ -1444,9 +861,9 @@ mod tests {
             Party::Taker,
             (
                 EarnedCertificate::new(edge, terms, 4_242),
-                Sig::from_bytes([0x66; 64]),
+                PartyAuth::owner(Sig::from_bytes([0x66; 64])),
             ),
-            Sig::from_bytes([0x77; 64]),
+            PartyAuth::owner(Sig::from_bytes([0x77; 64])),
         )))
     }
 
@@ -1465,9 +882,7 @@ mod tests {
         );
         assert_eq!(body, &canonical[..canonical_len]);
         let decoded = Transaction::decode(encoded).expect("kernel transaction decode");
-        let Transaction::Kernel(decoded) = decoded else {
-            panic!("expected kernel transaction")
-        };
+        let Transaction::Kernel(decoded) = decoded;
         assert_eq!(decoded, kernel_tx);
     }
 
@@ -1494,8 +909,8 @@ mod tests {
     #[test]
     fn the_payment_close_chain_wrapper_is_three_bytes() {
         for (kernel_tx, kernel_len, chain_len) in [
-            (payment_close_start_tx(), 619, 622),
-            (payment_close_response_tx(), 274, 277),
+            (payment_close_start_tx(), 703, 706),
+            (payment_close_response_tx(), 286, 289),
         ] {
             assert_eq!(kernel_tx.encoded_size(), kernel_len);
             let encoded = Transaction::Kernel(kernel_tx).encode();
@@ -1511,13 +926,6 @@ mod tests {
         assert_eq!(82_usize.encode_size(), 1);
         assert_eq!(16_383_usize.encode_size(), 2);
         assert_eq!(16_384_usize.encode_size(), 3);
-    }
-
-    #[test]
-    fn kernel_signature_verification_stays_inside_the_kernel() {
-        let owner = addr_from_signing_key(&secp256r1_key_from_seed(1));
-        let tx = Transaction::Kernel(valid_open_tx().expect("valid kernel open fixture"));
-        assert!(!tx.verify_signature(TEST_NETWORK, &owner));
     }
 
     #[test]
@@ -1541,89 +949,19 @@ mod tests {
         assert!(Transaction::decode(encoded).is_err());
     }
 
-    /// Renders bytes for the golden-vector comparisons below.
-    ///
-    /// Local rather than `hex::encode`: `hex` arrives with the
-    /// `indexer` feature, but this module compiles under `domain`
-    /// alone, so reaching for it made `--features domain` fail to
-    /// build its own tests.
-    fn hex(bytes: &[u8]) -> String {
-        bytes.iter().fold(String::new(), |mut out, byte| {
-            use core::fmt::Write as _;
-            let _ = write!(out, "{byte:02x}");
-            out
-        })
-    }
-
+    /// 0 and 1 were the deleted chain-side transfer and merge. They are
+    /// rejections like any other unassigned byte, not reserved arms.
     #[test]
     fn transaction_codec_rejects_unknown_tag() {
-        assert!(Transaction::decode([0xff].as_slice()).is_err());
-    }
-
-    #[test]
-    fn transfer_codec_matches_golden_bytes() {
-        let key = secp256r1_key_from_seed(1);
-        let (_, tx) = sample_transfer(&key);
-        assert_eq!(
-            hex(&tx.encode()),
-            "00070707070707070707070707070707070707070707070707070707070707070703e57aa4ea4cd5ed2c6e5b23a5c9895b2ef185df9a63876b948e53179a9072787000000000000000055515839a903a3667bfd81cb8a112a4c33d392b489741d8caa5b0aca0a27678071efbd051540628bd0039b747a2e75c325f4dc01361241806d94112d327b8817125d6200140e870713dad50719cecb0abe5d8444155b8ab423f64c4358a412dcd52050000000089017b2274797065223a22776562617574686e2e676574222c226368616c6c656e6765223a2276764f315f77344373763270344c4d4e68485964766275733465743748486d4a7a316e316f465f58544a63222c226f726967696e223a2268747470733a2f2f77616c6c65742e68656c6c61732e6169222c2263726f73734f726967696e223a66616c73657d"
-        );
-    }
-
-    #[test]
-    fn merge_codec_roundtrip() {
-        let key = secp256r1_key_from_seed(1);
-        let mut values = [
-            Digest::from([3; 32]),
-            Digest::from([1; 32]),
-            Digest::from([2; 32]),
-        ];
-        values.sort();
-        let inputs = test_merge_inputs(&values);
-        let challenge = merge_challenge(TEST_NETWORK, inputs.as_slice());
-        let tx = Transaction::MergeCoin {
-            inputs,
-            signature: mock_webauthn_sign(&key, &challenge).expect("mock signature"),
-        };
-        let encoded = tx.encode();
-        let decoded = Transaction::decode(encoded).expect("tx decode");
-        assert_eq!(decoded.encode(), tx.encode());
-    }
-
-    #[test]
-    fn merge_codec_matches_golden_bytes() {
-        let key = secp256r1_key_from_seed(1);
-        let mut values = [
-            Digest::from([3; 32]),
-            Digest::from([1; 32]),
-            Digest::from([2; 32]),
-        ];
-        values.sort();
-        let inputs = test_merge_inputs(&values);
-        let challenge = merge_challenge(TEST_NETWORK, inputs.as_slice());
-        let tx = Transaction::MergeCoin {
-            inputs,
-            signature: mock_webauthn_sign(&key, &challenge).expect("mock signature"),
-        };
-        assert_eq!(
-            hex(&tx.encode()),
-            "010301010101010101010101010101010101010101010101010101010101010101010202020202020202020202020202020202020202020202020202020202020202030303030303030303030303030303030303030303030303030303030303030359c01cf0a9db59d8ed0dd411537f2386cca8faf41f3d577fe2432f2482f3cc517de9a527c492d08b5454b5680903b28530a6b9af0a882a00ef60dbf570593c7925d6200140e870713dad50719cecb0abe5d8444155b8ab423f64c4358a412dcd52050000000089017b2274797065223a22776562617574686e2e676574222c226368616c6c656e6765223a227a3075326c4f53546c78305038334844387946734c37745f422d6a5f4b79326e62516a5f325558756d3149222c226f726967696e223a2268747470733a2f2f77616c6c65742e68656c6c61732e6169222c2263726f73734f726967696e223a66616c73657d"
-        );
-    }
-
-    #[test]
-    fn signature_verification_succeeds_with_correct_key() {
-        let key = secp256r1_key_from_seed(1);
-        let (sender, tx) = sample_transfer(&key);
-        assert!(tx.verify_signature(TEST_NETWORK, &sender));
-    }
-
-    #[test]
-    fn signature_verification_fails_with_wrong_key() {
-        let key = secp256r1_key_from_seed(1);
-        let wrong = addr_from_signing_key(&secp256r1_key_from_seed(2));
-        let (_, tx) = sample_transfer(&key);
-        assert!(!tx.verify_signature(TEST_NETWORK, &wrong));
+        for tag in [0, 1, 3, 0xff] {
+            assert!(
+                matches!(
+                    Transaction::decode([tag].as_slice()),
+                    Err(CodecError::InvalidEnum(found)) if found == tag
+                ),
+                "transaction tag {tag}",
+            );
+        }
     }
 
     /// The funded accounts in the shipped genesis documents are
@@ -1636,7 +974,12 @@ mod tests {
             let mut raw = [0_u8; 32];
             raw[31] = scalar;
             let key = p256::ecdsa::SigningKey::from_slice(&raw).expect("valid scalar");
-            SettlementKey::from(addr_from_signing_key(&key)).to_string()
+            let point = key.verifying_key().to_sec1_point(true);
+            let bytes: [u8; SettlementKey::LENGTH] = point
+                .as_bytes()
+                .try_into()
+                .expect("a compressed P-256 point is 33 bytes");
+            SettlementKey::from_bytes(bytes).to_string()
         }
 
         let genesis: crate::genesis::Genesis =
@@ -1655,86 +998,13 @@ mod tests {
     }
 
     #[test]
-    fn address_base58_roundtrip() {
-        let addr = addr_from_signing_key(&secp256r1_key_from_seed(42));
-        let encoded = addr.to_string();
-        let decoded: Address = encoded.parse().expect("base58 decode");
-        assert_eq!(addr, decoded);
-    }
-
-    #[test]
-    fn challenge_prefix_declares_the_runtime_network_length() {
-        let mut buf = BytesMut::new();
-        challenge_prefix(&mut buf, TEST_NETWORK, TRANSFER_TAG);
-
-        let after_domain = &buf[CHALLENGE_DOMAIN.len()..];
-        assert_eq!(after_domain[0], WEBAUTHN_POLICY_VERSION);
-        let declared_len = after_domain[1] as usize;
-        assert_eq!(declared_len, TEST_NETWORK.as_bytes().len());
-        assert_eq!(&after_domain[2..2 + declared_len], TEST_NETWORK.as_bytes());
-        assert_eq!(after_domain[2 + declared_len], TRANSFER_TAG);
-    }
-
-    /// The whole point of making the network a runtime value: two
-    /// networks must not produce the same challenge, and a passkey
-    /// signature made for one must not verify under the other.
-    #[test]
-    fn a_challenge_is_bound_to_one_network() {
-        let other = NetworkId::new("hellas-chain-other").expect("legal id");
-        let key = PrivateKey::from_seed(3);
-        let sender = Address::from(key.public_key());
-        let input = ObjectId::from([9; 32]);
-        let recipient = Address::from(PrivateKey::from_seed(4).public_key());
-
-        assert_ne!(
-            transfer_challenge(TEST_NETWORK, &input, &recipient, 5),
-            transfer_challenge(other, &input, &recipient, 5),
-        );
-        assert_ne!(
-            merge_challenge(TEST_NETWORK, &[input]),
-            merge_challenge(other, &[input]),
-        );
-
-        let tx = Transaction::transfer(TEST_NETWORK, &key, input, recipient, 5)
-            .expect("test transfer signs");
-        assert!(tx.verify_signature(TEST_NETWORK, &sender));
-        assert!(
-            !tx.verify_signature(other, &sender),
-            "a transfer authorized on one network must not settle on another",
-        );
-
-        let merge = Transaction::merge(TEST_NETWORK, &key, &[input]).expect("test merge signs");
-        assert!(merge.verify_signature(TEST_NETWORK, &sender));
-        assert!(
-            !merge.verify_signature(other, &sender),
-            "a merge authorized on one network must not settle on another",
-        );
-    }
-
-    #[test]
     fn bounded_read_rejects_len_over_capacity_despite_loose_range() {
         // A caller passing a RangeCfg wider than the type's capacity must
         // still get a decode error, not a corrupt list.
-        let oversized: Bounded<u8, 8> = byte_list_from_slice(&[7; 8]).expect("fits");
+        let oversized: Bounded<u8, 8> = Bounded::new([7; 8], 8).expect("fits");
         let encoded = oversized.encode();
         let decoded =
             Bounded::<u8, 4>::read_cfg(&mut encoded.as_ref(), &(RangeCfg::new(0..=usize::MAX), ()));
         assert!(matches!(decoded, Err(CodecError::InvalidLength(8))));
-    }
-
-    #[cfg(any(feature = "indexer", feature = "validator"))]
-    #[test]
-    fn merge_input_faults_are_reported_in_order() {
-        let id = |b: u8| ObjectId::from([b; 32]);
-        assert_eq!(merge_input_fault(&[id(1)]), Some(MergeInputFault::TooFew));
-        assert_eq!(
-            merge_input_fault(&[id(1), id(1)]),
-            Some(MergeInputFault::Duplicate(id(1))),
-        );
-        assert_eq!(
-            merge_input_fault(&[id(3), id(1)]),
-            Some(MergeInputFault::NonCanonical),
-        );
-        assert_eq!(merge_input_fault(&[id(1), id(2), id(3)]), None);
     }
 }

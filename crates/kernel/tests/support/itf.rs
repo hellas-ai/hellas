@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use itf::de::{As, Integer, Same};
 use serde::Deserialize;
 
-use hellas_kernel::{BlockHash, BlockHeight, Context, Parties, Proof, Terms, Tx};
+use hellas_kernel::{BlockHash, BlockHeight, Context, Parties, PartyKeys, Proof, Terms, Tx};
 
 use super::l1;
 
@@ -200,7 +200,7 @@ fn rejected_open_op(body: RejectedOpenBody) -> Tx {
     let taker_key = party_key(body.as_taker);
     let terms = Terms::basic(
         l1::PROTOCOL,
-        Parties::new(maker_key, taker_key),
+        Parties::new(PartyKeys::sole(maker_key), PartyKeys::sole(taker_key)),
         l1::TIMEOUT,
         l1::payouts_owned(maker_key, taker_key),
     );

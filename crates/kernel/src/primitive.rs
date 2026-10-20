@@ -130,6 +130,10 @@ impl CoinId {
     }
 
     /// Derives the canonical id for one close payout coin.
+    ///
+    /// The delegate the coin carries is not in the preimage: the edge
+    /// and the position already make the id unique, and one close pays
+    /// each position exactly once.
     pub(crate) fn payout(edge: EdgeId, index: usize, owner: Key) -> Self {
         let mut hasher = SingleChunkHasher::new();
         hasher.update(crate::consts::COIN_PAYOUT);
@@ -387,9 +391,8 @@ impl Decode for Sig {
 ///
 /// A deployment's own label on a [`crate::Terms::basic`] edge, carried in
 /// the terms preimage and therefore in the edge id. No kernel rule reads
-/// it: it separates one operator's Basic edges from another's — the
-/// faucet's from the CLI's — and that separation is the whole of its
-/// behaviour. It has no meaning on the work-payment or work-stake bodies,
+/// it: it separates one operator's Basic edges from another's, and that
+/// separation is the whole of its behaviour. It has no meaning on the work-payment or work-stake bodies,
 /// which do not carry it.
 ///
 /// This is deliberately one byte in v1: protocol tags are scarce, governed hot
@@ -459,14 +462,14 @@ impl Party {
         }
     }
 
-    /// Returns the settlement key `parties` assigns to this position.
+    /// Returns the keys `parties` commits for this position.
     ///
     /// The work-channel roles *are* these positions — on a payment edge
     /// the client is the maker and the provider is the taker — so one
-    /// closed enum names the signer of every payment-close action, and a
-    /// role that could not answer this question could not be checked.
+    /// closed enum names the party behind every payment-close action, and
+    /// a role that could not answer this question could not be checked.
     #[must_use]
-    pub const fn key_of(self, parties: crate::object::Parties) -> Key {
+    pub const fn keys_of(self, parties: crate::object::Parties) -> crate::object::PartyKeys {
         match self {
             Self::Maker => parties.maker(),
             Self::Taker => parties.taker(),

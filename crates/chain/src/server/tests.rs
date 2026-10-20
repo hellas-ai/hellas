@@ -1,8 +1,9 @@
 use super::*;
+use crate::domain::ObjectId;
 use crate::{Mempool, OwnerCoins, light_client::QueryError};
 use bytes::Bytes;
 use hellas_kernel::test_support::valid_open_tx;
-use hellas_kernel::{EdgeId, Encode as _};
+use hellas_kernel::{EdgeId, Encode as _, PartyAuth};
 use hellas_rpc::pb::services::light_client::LightClientClientImpl;
 use hellas_wire::DefaultClock;
 use hellas_wire::mux::{MessagePipe, MuxConfig, MuxTransport, Role as MuxRole};
@@ -185,9 +186,9 @@ fn synthetic_response_request() -> SubmitWorkResponseRequest {
         Party::Taker,
         (
             EarnedCertificate::new(edge, TermsHash::from_bytes([0x33; 32]), 9),
-            Sig::from_bytes([0x34; Sig::LENGTH]),
+            PartyAuth::owner(Sig::from_bytes([0x34; Sig::LENGTH])),
         ),
-        Sig::from_bytes([0x35; Sig::LENGTH]),
+        PartyAuth::owner(Sig::from_bytes([0x35; Sig::LENGTH])),
     );
     let mut bytes = vec![0; PaymentCloseResponse::MAX_ENCODED_SIZE];
     let written = response.write_to(&mut bytes);
@@ -216,9 +217,7 @@ async fn kernel_submit_boundary_accepts_only_exact_bounded_canonical_bytes() {
     assert_eq!(response.outcome, ProtoSubmitTxOutcome::Enqueued as i32);
     let pending = mempool.test_transactions().await;
     assert_eq!(pending.len(), 1);
-    let Transaction::Kernel(pending_tx) = &pending[0] else {
-        panic!("pending transaction was not a kernel transaction")
-    };
+    let Transaction::Kernel(pending_tx) = &pending[0];
     assert_eq!(pending_tx, &tx);
 
     let mut trailing = canonical;
@@ -558,8 +557,8 @@ async fn get_edge_endpoint_preserves_full_state_root_absence_and_wrong_kind() {
         reserve: 9,
         close_fees: hellas_kernel::Fees::new(1, 2, 3, 4),
         timeout: hellas_kernel::BlockHeight::new(55),
-        maker: SettlementKey::from(parties.maker()),
-        taker: SettlementKey::from(parties.taker()),
+        maker: SettlementKey::from(parties.maker().owner()),
+        taker: SettlementKey::from(parties.taker().owner()),
         terms_hash: terms.hash(),
     };
     let (activity_tx, _activity_rx) = broadcast::channel(1);
@@ -651,8 +650,8 @@ async fn get_edges_by_owner_endpoint_tracks_open_close_and_empty_owner() {
                 .into_iter()
                 .map(|(object_id, edge)| crate::EdgeRecord {
                     object_id,
-                    maker: edge.maker,
-                    taker: edge.taker,
+                    maker: SettlementKey::from(edge.maker().owner()),
+                    taker: SettlementKey::from(edge.taker().owner()),
                 })
                 .collect(),
         }
@@ -748,7 +747,7 @@ fn owner_query_accepts_raw_non_p256_settlement_key() {
     let raw = vec![0xa5; SettlementKey::LENGTH];
     let key = settlement_key_from_bytes(raw.clone(), "owner").expect("raw settlement key");
     assert_eq!(key.as_bytes().as_slice(), raw.as_slice());
-    assert!(Address::try_from(key).is_err());
+    assert!(p256::PublicKey::from_sec1_bytes(key.as_bytes()).is_err());
 }
 
 #[test]

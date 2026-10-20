@@ -1,7 +1,7 @@
 use crate::HellasBlock;
 use crate::consensus::{ConsensusVerifier, Finalization};
 use crate::domain::{
-    Address, ObjectId, PrivateKey, PublicKey, Scheme, SettlementKey, ThresholdVariant, Transaction,
+    ObjectId, PrivateKey, PublicKey, Scheme, SettlementKey, ThresholdVariant, Transaction,
     genesis_object_id,
 };
 use crate::execution::store::UtxoSyncTarget;
@@ -24,8 +24,8 @@ use commonware_utils::{N3f1, non_empty_range, ordered::Set};
 use core::future::Future;
 use hellas_kernel::{
     Auth, BlockHeight, CloseKind, CoinId, EdgeId, Funding, List, MAX_EDGE_OUTPUTS,
-    MAX_PARTY_INPUTS, Parties, Payout, Proof, ProtocolCode, SoftPasskey, SoftPasskeyError, Terms,
-    Tx,
+    MAX_PARTY_INPUTS, Parties, PartyAuth, PartyKeys, Payout, Proof, ProtocolCode, SoftPasskey,
+    SoftPasskeyError, Terms, Tx,
 };
 use rand::{SeedableRng, rngs::StdRng};
 
@@ -121,8 +121,15 @@ pub(crate) fn validator_key(seed: u64) -> PrivateKey {
     ed25519::PrivateKey::from_seed(seed)
 }
 
-pub(crate) fn legacy_address(seed: u64) -> Address {
-    Address::from(validator_key(seed).public_key())
+/// A native owner for index and reshape fixtures, from a non-zero seed.
+pub(crate) fn owner_signer(seed: u8) -> hellas_kernel::Secp256k1Signer {
+    hellas_kernel::Secp256k1Signer::from_secret_scalar([seed; 32])
+        .expect("a repeated non-zero byte is a valid secp256k1 scalar")
+}
+
+/// The settlement key [`owner_signer`] owns coins under.
+pub(crate) fn owner_key(seed: u8) -> SettlementKey {
+    SettlementKey::from(owner_signer(seed).party_key())
 }
 
 pub(crate) fn index_genesis() -> HellasBlock {
@@ -209,8 +216,8 @@ impl KernelFixture {
         Ok(Tx::open(
             self.funding.clone(),
             self.terms.clone(),
-            Auth::webauthn(self.maker_passkey.sign(wrong_hash)?),
-            Auth::webauthn(self.taker_passkey.sign(hash)?),
+            PartyAuth::owner(Auth::webauthn(self.maker_passkey.sign(wrong_hash)?)),
+            PartyAuth::owner(Auth::webauthn(self.taker_passkey.sign(hash)?)),
         ))
     }
 }
@@ -255,7 +262,10 @@ pub(crate) fn kernel_fixture_at(
     let outputs = List::take(payout_values, 2);
     let terms = Terms::basic(
         ProtocolCode::new(1),
-        Parties::new(maker_passkey.party_key(), taker_passkey.party_key()),
+        Parties::new(
+            PartyKeys::sole(maker_passkey.party_key()),
+            PartyKeys::sole(taker_passkey.party_key()),
+        ),
         BlockHeight::new(timeout),
         outputs.clone(),
     );
@@ -264,8 +274,8 @@ pub(crate) fn kernel_fixture_at(
     let open = Tx::open(
         funding.clone(),
         terms.clone(),
-        Auth::webauthn(maker_passkey.sign(open_hash)?),
-        Auth::webauthn(taker_passkey.sign(open_hash)?),
+        PartyAuth::owner(Auth::webauthn(maker_passkey.sign(open_hash)?)),
+        PartyAuth::owner(Auth::webauthn(taker_passkey.sign(open_hash)?)),
     );
     let close_hash = Tx::payload_hash(
         crate::domain::TEST_NETWORK,
@@ -277,8 +287,8 @@ pub(crate) fn kernel_fixture_at(
     let mutual_close = Tx::close(
         edge,
         Proof::mutual(
-            Auth::webauthn(maker_passkey.sign(close_hash)?),
-            Auth::webauthn(taker_passkey.sign(close_hash)?),
+            PartyAuth::owner(Auth::webauthn(maker_passkey.sign(close_hash)?)),
+            PartyAuth::owner(Auth::webauthn(taker_passkey.sign(close_hash)?)),
         ),
         outputs.clone(),
     );

@@ -1,6 +1,6 @@
 use super::*;
 use hellas_auth::Digest;
-use hellas_kernel::{EdgeValues, Fees, Key, NetworkId};
+use hellas_kernel::{EdgeValues, Fees, Key, NetworkId, PartyKeys};
 use hellas_wire::peers::PeerId;
 use hellas_work::model::profile::WorkPolicy;
 use hellas_work::model::setup::ProviderChannelPolicy;
@@ -506,7 +506,10 @@ fn bond_terms() -> WorkStakeBondTerms {
 /// fixture constant when the key comes from an identity file.
 fn bond_terms_staked_by(provider: &Secp256k1Signer) -> WorkStakeBondTerms {
     WorkStakeBondTerms {
-        parties: Parties::new(provider.party_key(), signer(0x21).party_key()),
+        parties: Parties::new(
+            PartyKeys::sole(provider.party_key()),
+            PartyKeys::sole(signer(0x21).party_key()),
+        ),
         timeout: BlockHeight::new(500),
         timeout_outputs: List::take([Payout::new(provider.party_key(), 64); MAX_EDGE_OUTPUTS], 1),
         max_job_price: 40,

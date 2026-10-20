@@ -242,9 +242,7 @@ impl IndexStore {
                 write
                     .open_table(TRANSACTIONS)?
                     .insert(transaction_digest.as_str(), height)?;
-                let Transaction::Kernel(tx) = transaction else {
-                    continue;
-                };
+                let Transaction::Kernel(tx) = transaction;
                 let reference = TransactionRef {
                     height,
                     payload: intent.proof.payload.clone(),
@@ -331,6 +329,9 @@ impl IndexStore {
                         };
                         (hex::encode(id.as_bytes()), "move")
                     }
+                    // A reshape moves coins and touches no edge, so it
+                    // has no place in an edge's history.
+                    Tx::Owner(_) => continue,
                 };
                 let event = StoredEvent {
                     kind: kind.into(),
@@ -505,8 +506,8 @@ fn transaction_at(block: &crate::HellasBlock, reference: &TransactionRef) -> Res
 }
 
 fn lookup_prefixes(terms: &hellas_kernel::Terms) -> Vec<String> {
-    let maker = crate::domain::SettlementKey::from(terms.parties().maker()).to_string();
-    let taker = crate::domain::SettlementKey::from(terms.parties().taker()).to_string();
+    let maker = crate::domain::SettlementKey::from(terms.parties().maker().owner()).to_string();
+    let taker = crate::domain::SettlementKey::from(terms.parties().taker().owner()).to_string();
     let kind = match terms.profile() {
         TermsProfile::Basic => "basic",
         TermsProfile::WorkPayment(_) => "work-payment",

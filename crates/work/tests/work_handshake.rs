@@ -15,8 +15,8 @@ use bytes::Bytes;
 use hellas_auth::Digest;
 use hellas_kernel::{
     BlockHeight, CoinId, EdgeId, EdgeValues, Fees, Funding, List, MAX_EDGE_OUTPUTS,
-    MAX_PARTY_INPUTS, Parties, Payout, Secp256k1Signer, Secp256k1Verifier, SigVerifier as _, Terms,
-    Tx, WorkPaymentTerms, WorkStakeBondTerms,
+    MAX_PARTY_INPUTS, Parties, PartyKeys, Payout, Secp256k1Signer, Secp256k1Verifier,
+    SigVerifier as _, Terms, Tx, WorkPaymentTerms, WorkStakeBondTerms,
 };
 use hellas_rpc::pb::work::{
     ExchangeSetupRequest, ExchangeSetupResponse, SetupAdvanced, WorkRefusalCode, WorkRefused,
@@ -90,7 +90,10 @@ fn empty_coins() -> List<CoinId, MAX_PARTY_INPUTS> {
 
 fn bond_terms() -> WorkStakeBondTerms {
     WorkStakeBondTerms {
-        parties: Parties::new(provider().party_key(), client().party_key()),
+        parties: Parties::new(
+            PartyKeys::sole(provider().party_key()),
+            PartyKeys::sole(client().party_key()),
+        ),
         timeout: BlockHeight::new(HORIZON),
         timeout_outputs: List::take(
             [Payout::new(provider().party_key(), STAKE); MAX_EDGE_OUTPUTS],
@@ -634,15 +637,19 @@ async fn the_answer_is_signed_over_this_payment_open_and_no_other_hash() {
     // countersignature is the taker's.
     let verifier = Secp256k1Verifier::new();
     assert!(
-        verifier.verify_auth(&taker_auth, provider().party_key(), payment_hash),
+        verifier.verify_auth(taker_auth.auth(), provider().party_key(), payment_hash),
         "the provider signed the payment open",
     );
     assert!(
-        !verifier.verify_auth(&taker_auth, provider().party_key(), bundle.bond_open_hash()),
+        !verifier.verify_auth(
+            taker_auth.auth(),
+            provider().party_key(),
+            bundle.bond_open_hash()
+        ),
         "the same signature does not also verify over the bond open",
     );
     assert!(
-        !verifier.verify_auth(&taker_auth, client().party_key(), payment_hash),
+        !verifier.verify_auth(taker_auth.auth(), client().party_key(), payment_hash),
         "and it is not the client's signature",
     );
 }

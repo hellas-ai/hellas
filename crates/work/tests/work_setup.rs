@@ -10,8 +10,8 @@
 use hellas_auth::Digest;
 use hellas_kernel::{
     BlockHeight, Decode as _, Edge, EdgeId, EdgeValues, Fees, LeaseSlots, List, MAX_EDGE_OUTPUTS,
-    NetworkId, Parties, Payout, PendingSlot, RegistryChunk, RegistryNamespace, RegistryRecordTag,
-    Terms, TermsHash, WorkPaymentTerms, WorkStakeBondTerms,
+    NetworkId, Parties, PartyKeys, Payout, PendingSlot, RegistryChunk, RegistryNamespace,
+    RegistryRecordTag, Terms, TermsHash, WorkPaymentTerms, WorkStakeBondTerms,
 };
 use hellas_rpc::protocol::ContentId;
 use hellas_work::model::setup::{
@@ -61,7 +61,10 @@ fn payment_edge() -> EdgeId {
 fn bond_terms() -> WorkStakeBondTerms {
     WorkStakeBondTerms {
         // Maker = provider, taker = client. The payment edge mirrors it.
-        parties: Parties::new(provider_key(), client_key()),
+        parties: Parties::new(
+            PartyKeys::sole(provider_key()),
+            PartyKeys::sole(client_key()),
+        ),
         timeout: BlockHeight::new(HORIZON),
         timeout_outputs: List::take([Payout::new(provider_key(), STAKE); MAX_EDGE_OUTPUTS], 1),
         max_job_price: 40,
@@ -164,8 +167,12 @@ impl EdgeBytes {
         out.extend_from_slice(&[FORMAT_VERSION, TAG_BLOCK_HEIGHT]);
         out.extend_from_slice(&self.timeout.to_be_bytes());
         out.extend_from_slice(&[FORMAT_VERSION, TAG_PARTIES]);
-        out.extend_from_slice(&self.maker.to_bytes());
-        out.extend_from_slice(&self.taker.to_bytes());
+        // Each party: owner, signer, and an absent payout delegate.
+        for party in [self.maker, self.taker] {
+            out.extend_from_slice(&party.to_bytes());
+            out.extend_from_slice(&party.to_bytes());
+            out.push(0);
+        }
         out.extend_from_slice(self.terms.as_bytes());
         out.push(self.allowed);
         match Edge::decode_exact(&out) {
@@ -253,7 +260,7 @@ fn faulty_lease() -> LeaseSlots {
 fn live_pending() -> PendingSlot {
     let mut value = vec![FORMAT_VERSION, TAG_PAYMENT_CLOSE_PENDING];
     // body version
-    value.push(2);
+    value.push(3);
     value.extend_from_slice(&payment_edge().to_bytes());
     // opener_role: maker
     value.push(0);
@@ -264,6 +271,7 @@ fn live_pending() -> PendingSlot {
     value.push(0); // responded
     value.push(0); // penalty_due
     value.extend_from_slice(&2_u64.to_be_bytes()); // penalty_amount
+    value.push(0); // owner_signed
 
     let Some(chunk) = RegistryChunk::split(
         RegistryNamespace::PaymentClose,

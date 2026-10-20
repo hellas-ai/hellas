@@ -349,11 +349,11 @@ impl PaidWorkSession {
         if bundle.bond_edge() != bond {
             return Err(PaidClientError::InputMismatch("bond edge"));
         }
-        if bundle.bond_terms().parties.taker() != settlement_key.party_key() {
+        if bundle.bond_terms().parties.taker().signer() != settlement_key.party_key() {
             return Err(PaidClientError::InputMismatch("client settlement identity"));
         }
         dialer.require_producer(hellas_auth::PublicKey::Secp256k1(
-            bundle.bond_terms().parties.maker().to_bytes(),
+            bundle.bond_terms().parties.maker().signer().to_bytes(),
         ))?;
         if setup.state().scan_armed().is_none() {
             setup.arm_scan(finalized_floor(&chain).await?).await?;

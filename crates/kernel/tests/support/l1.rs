@@ -11,8 +11,8 @@ use super::{
 
 use hellas_kernel::{
     BlockHash, BlockHeight, CoinId, Context, Edge, EdgeId, Funding, Genesis, Key, List,
-    MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS, Parties, Payout, Proof, ProtocolCode, State, Terms, Tx,
-    View,
+    MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS, Parties, PartyKeys, Payout, Proof, ProtocolCode, State,
+    Terms, Tx, View,
 };
 
 pub(crate) const CONTEXT: Context = Context::new(
@@ -31,7 +31,7 @@ pub(crate) const TAKER: Key = Key::from_bytes([8; Key::LENGTH]);
 /// Third party owning nothing; the concrete realization of the model's
 /// `Adversary` party in rejected-open replay.
 pub(crate) const ADVERSARY: Key = Key::from_bytes([0xee; Key::LENGTH]);
-pub(crate) const PARTIES: Parties = Parties::new(MAKER, TAKER);
+pub(crate) const PARTIES: Parties = Parties::new(PartyKeys::sole(MAKER), PartyKeys::sole(TAKER));
 pub(crate) const PROTOCOL: ProtocolCode = ProtocolCode::new(1);
 pub(crate) const OTHER_PROTOCOL: ProtocolCode = ProtocolCode::new(2);
 pub(crate) const MAKER_ID: CoinId = coin_id(1);
@@ -168,7 +168,7 @@ pub(crate) fn output_ids(edge: EdgeKey) -> List<CoinId, MAX_EDGE_OUTPUTS> {
     Tx::close_output_ids(edge_id(edge), &payouts())
 }
 
-pub(crate) const fn edge_value(edge: Edge) -> u64 {
+pub(crate) const fn edge_value(edge: &Edge) -> u64 {
     edge.value()
 }
 

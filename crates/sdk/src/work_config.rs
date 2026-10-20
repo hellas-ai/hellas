@@ -264,7 +264,7 @@ pub async fn validate_work_routes(config: &WorkConfig) -> Result<()> {
         let Some(bundle) = store.state().bundle() else {
             return Err(WorkConfigError::MissingProposal(route.bond));
         };
-        let journal_client = bundle.bond_terms().parties.taker();
+        let journal_client = bundle.bond_terms().parties.taker().signer();
         if journal_client != route.client {
             return Err(WorkConfigError::WrongClient {
                 bond: route.bond,
