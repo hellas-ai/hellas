@@ -512,6 +512,37 @@ mod timeout_tests {
     }
 
     #[tokio::test]
+    async fn final_response_survives_immediate_connection_shutdown() {
+        use crate::transport::RecvHalf as _;
+        let (client, server, client_connection, server_connection) = connected_pair().await;
+        let transport = IrohTransport::new(server_connection.clone());
+        let (client_send, client_recv) =
+            raw_stream(&client_connection, &framed(open_frame(10))).await;
+        let inbound = transport.accept().await.unwrap().unwrap();
+        let (mut send, _request) = inbound.stream.split();
+        let body = Bytes::from(vec![42; 128 * 1024]);
+        let expected = body.clone();
+        let response = tokio::spawn(async move {
+            send.send_body(body).await.unwrap();
+            send.close_send(None).await.unwrap();
+            server_connection.close(0u32.into(), b"provider drained");
+        });
+        let (_send, mut recv) =
+            IrohStream::new(client_send, client_recv, OUTER_TIMEOUT, OUTER_TIMEOUT).split();
+        tokio::time::timeout(OUTER_TIMEOUT, response)
+            .await
+            .unwrap()
+            .unwrap();
+        // Reading starts after the sender's shutdown, so success cannot depend
+        // on application scheduling draining the final frame before close_send.
+        assert_eq!(recv.next().await.unwrap().unwrap(), expected);
+        assert!(recv.next().await.is_none());
+        assert_eq!(recv.trailer().unwrap().status, crate::status::WireCode::Ok);
+        client.close().await;
+        server.close().await;
+    }
+
+    #[tokio::test]
     async fn incomplete_open_is_reset_and_accept_capacity_is_released() {
         let (client, server, client_connection, server_connection) = connected_pair().await;
         let transport = IrohTransport::with_timeouts(

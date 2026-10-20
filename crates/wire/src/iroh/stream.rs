@@ -246,8 +246,29 @@ impl crate::transport::SendHalf for IrohSendHalf {
             trailer,
         }))
         .await?;
-        if let Some(mut s) = self.send.take() {
-            let _ = s.finish();
+        if let Some(mut send) = self.send.take() {
+            send.finish().map_err(std::io::Error::other)?;
+            // Dispatch completion permits the owner to close the connection.
+            // Keep the final frame alive until QUIC acknowledges it, bounded by
+            // the same timeout as its writes, so graceful drain cannot lose End.
+            match n0_future::time::timeout(self.write_timeout, send.stopped()).await {
+                Ok(Ok(None)) => {}
+                Ok(Ok(Some(code))) if code == 0_u32.into() => {}
+                Ok(Ok(Some(_))) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "peer stopped the final frame",
+                    ));
+                }
+                Ok(Err(error)) => return Err(std::io::Error::other(error)),
+                Err(_) => {
+                    let _ = send.reset(STREAM_ERROR_CODE.into());
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "iroh final frame acknowledgement timed out",
+                    ));
+                }
+            }
         }
         Ok(())
     }
