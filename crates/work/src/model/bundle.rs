@@ -11,7 +11,7 @@
 //! the two processes, and "the parties exchange signatures out of band"
 //! is not an implementation.
 //!
-//! [`WorkChannelSetupBundleV1`] is that carrier. It has exactly three
+//! [`WorkChannelSetupBundleV2`] is that carrier. It has exactly three
 //! revisions, each one strictly extending the last:
 //!
 //! 1. `BondProposed` — P names the funding it will stake and the tag-4
@@ -24,7 +24,7 @@
 //!
 //! # What it establishes
 //!
-//! [`WorkChannelSetupBundleV1::check`] verifies every signature the
+//! [`WorkChannelSetupBundleV2::check`] verifies every signature the
 //! revision carries against the open hash the kernel will compute, by
 //! the party the terms name — so an endpoint countersigns a bond only
 //! after checking the other side's signature over the same bytes, not
@@ -48,8 +48,8 @@
 //! durable endpoint state, and durable endpoint state is P3's.
 
 use hellas_kernel::{
-    Auth, EdgeId, Funding, Key, NetworkId, PartyAuth, PayloadHash, SigVerifier, Terms,
-    TermsProfile, Tx, WorkPaymentTerms, WorkStakeBondTerms,
+    EdgeId, Funding, NetworkId, PartyAuth, PayloadHash, SigVerifier, Terms, TermsProfile, Tx,
+    WorkPaymentTerms, WorkStakeBondTerms, verify_party,
 };
 use hellas_xet::XetFileHasher;
 
@@ -58,15 +58,15 @@ use hellas_auth::Digest;
 /// Domain of the bundle digest. An endpoint records the revision it
 /// exported by this digest, so it must not collide with any other body
 /// this crate hashes.
-const SETUP_BUNDLE: &[u8] = b"hellas.work.channel-setup-bundle.v1";
+const SETUP_BUNDLE: &[u8] = b"hellas.work.channel-setup-bundle.v2";
 
 /// First byte of every encoded bundle.
-const FORMAT_VERSION: u8 = 1;
+const FORMAT_VERSION: u8 = 2;
 
 /// Why a setup bundle is not one this endpoint may act on.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum SetupBundleError {
-    /// The envelope's first byte was not the format version `1`.
+    /// The envelope's first byte was not the current format version.
     #[error("setup bundle format version {actual} is not {FORMAT_VERSION}")]
     UnknownFormatVersion {
         /// Version byte carried.
@@ -143,11 +143,11 @@ pub enum SetupBundleError {
 /// be countersigned but has no countersignature is not a state this type
 /// can be in.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct WorkChannelSetupBundleV1 {
+pub struct WorkChannelSetupBundleV2 {
     network: NetworkId,
     bond_funding: Funding,
     bond_terms: WorkStakeBondTerms,
-    provider_bond_auth: Auth,
+    provider_bond_auth: PartyAuth,
     stage: SetupStage,
 }
 
@@ -164,16 +164,16 @@ enum SetupStage {
     /// payment open over it.
     PaymentProposed(Box<PaymentLeg>),
     /// Revision 3: the provider has countersigned that payment.
-    Complete(Box<PaymentLeg>, Box<Auth>),
+    Complete(Box<PaymentLeg>, Box<PartyAuth>),
 }
 
 /// What the client's revision adds.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PaymentLeg {
-    client_bond_auth: Auth,
+    client_bond_auth: PartyAuth,
     funding: Funding,
     terms: WorkPaymentTerms,
-    client_auth: Auth,
+    client_auth: PartyAuth,
 }
 
 impl SetupStage {
@@ -191,7 +191,7 @@ impl SetupStage {
     }
 }
 
-impl WorkChannelSetupBundleV1 {
+impl WorkChannelSetupBundleV2 {
     /// Starts the handshake: the provider's staked funding, the bond
     /// terms, and the provider's signature over that open.
     ///
@@ -203,7 +203,7 @@ impl WorkChannelSetupBundleV1 {
         network: NetworkId,
         bond_funding: Funding,
         bond_terms: WorkStakeBondTerms,
-        provider_bond_auth: Auth,
+        provider_bond_auth: PartyAuth,
     ) -> Result<Self, SetupBundleError> {
         check_funding_disjoint(&bond_funding, None)?;
         Ok(Self {
@@ -232,10 +232,10 @@ impl WorkChannelSetupBundleV1 {
     /// [`SetupBundleError::DuplicateFunding`] when a coin funds both.
     pub fn countersign_bond_and_propose_payment(
         mut self,
-        client_bond_auth: Auth,
+        client_bond_auth: PartyAuth,
         payment_funding: Funding,
         payment_terms: WorkPaymentTerms,
-        client_payment_auth: Auth,
+        client_payment_auth: PartyAuth,
     ) -> Result<Self, SetupBundleError> {
         if !matches!(self.stage, SetupStage::BondProposed) {
             return Err(SetupBundleError::WrongStage {
@@ -261,7 +261,7 @@ impl WorkChannelSetupBundleV1 {
     /// second.
     pub fn countersign_payment(
         mut self,
-        provider_payment_auth: Auth,
+        provider_payment_auth: PartyAuth,
     ) -> Result<Self, SetupBundleError> {
         self.stage = match self.stage {
             SetupStage::PaymentProposed(payment) => {
@@ -289,7 +289,7 @@ impl WorkChannelSetupBundleV1 {
         }
     }
 
-    const fn provider_payment_auth(&self) -> Option<&Auth> {
+    const fn provider_payment_auth(&self) -> Option<&PartyAuth> {
         match &self.stage {
             SetupStage::Complete(_, auth) => Some(auth),
             _ => None,
@@ -400,8 +400,8 @@ impl WorkChannelSetupBundleV1 {
         Some(Tx::open(
             self.bond_funding.clone(),
             Terms::work_stake_bond(self.bond_terms.clone()),
-            PartyAuth::owner(self.provider_bond_auth.clone()),
-            PartyAuth::owner(payment.client_bond_auth.clone()),
+            self.provider_bond_auth.clone(),
+            payment.client_bond_auth.clone(),
         ))
     }
 
@@ -418,8 +418,8 @@ impl WorkChannelSetupBundleV1 {
         Some(Tx::open(
             payment.funding.clone(),
             Terms::work_payment(payment.terms.clone()),
-            PartyAuth::owner(payment.client_auth.clone()),
-            PartyAuth::owner((**provider_auth).clone()),
+            payment.client_auth.clone(),
+            (**provider_auth).clone(),
         ))
     }
 
@@ -443,14 +443,14 @@ impl WorkChannelSetupBundleV1 {
     /// [`Self::countersign_bond_and_propose_payment`] raises — checked
     /// again here because an imported bundle was built somewhere else.
     pub fn check<V: SigVerifier>(&self, verifier: &V) -> Result<(), SetupBundleError> {
-        // Both opens are authorized by each party's owner.
-        let provider: Key = self.bond_terms.parties.maker().owner();
-        let client: Key = self.bond_terms.parties.taker().owner();
+        // Every witness carries its authority; the kernel selects its committed key.
+        let provider = self.bond_terms.parties.maker();
+        let client = self.bond_terms.parties.taker();
 
         check_funding_disjoint(&self.bond_funding, self.payment().map(|leg| &leg.funding))?;
 
         let bond_hash = self.bond_open_hash();
-        if !verifier.verify_auth(&self.provider_bond_auth, provider, bond_hash) {
+        if !verify_party(verifier, &self.provider_bond_auth, provider, bond_hash) {
             return Err(SetupBundleError::BadAuthorization {
                 slot: "bond open",
                 party: "the provider",
@@ -461,7 +461,7 @@ impl WorkChannelSetupBundleV1 {
             return Ok(());
         };
         check_payment_over_bond(&self.bond_funding, &self.bond_terms, &payment.terms)?;
-        if !verifier.verify_auth(&payment.client_bond_auth, client, bond_hash) {
+        if !verify_party(verifier, &payment.client_bond_auth, client, bond_hash) {
             return Err(SetupBundleError::BadAuthorization {
                 slot: "bond open",
                 party: "the client",
@@ -469,14 +469,14 @@ impl WorkChannelSetupBundleV1 {
         }
 
         let payment_hash = self.leg_open_hash(payment);
-        if !verifier.verify_auth(&payment.client_auth, client, payment_hash) {
+        if !verify_party(verifier, &payment.client_auth, client, payment_hash) {
             return Err(SetupBundleError::BadAuthorization {
                 slot: "payment open",
                 party: "the client",
             });
         }
         if let Some(provider_auth) = self.provider_payment_auth()
-            && !verifier.verify_auth(provider_auth, provider, payment_hash)
+            && !verify_party(verifier, provider_auth, provider, payment_hash)
         {
             return Err(SetupBundleError::BadAuthorization {
                 slot: "payment open",
@@ -586,12 +586,12 @@ impl WorkChannelSetupBundleV1 {
                 });
             }
         };
-        let provider_bond_auth: Auth = cursor.field().ok_or(SetupBundleError::Malformed)?;
+        let provider_bond_auth: PartyAuth = cursor.field().ok_or(SetupBundleError::Malformed)?;
 
         let bundle = if revision == 1 {
             Self::propose_bond(network, bond_funding, bond_terms, provider_bond_auth)?
         } else {
-            let client_bond_auth: Auth = cursor.field().ok_or(SetupBundleError::Malformed)?;
+            let client_bond_auth: PartyAuth = cursor.field().ok_or(SetupBundleError::Malformed)?;
             let payment_funding: Funding = cursor.field().ok_or(SetupBundleError::Malformed)?;
             let payment_terms = match cursor
                 .field::<Terms>()
@@ -606,7 +606,8 @@ impl WorkChannelSetupBundleV1 {
                     });
                 }
             };
-            let client_payment_auth: Auth = cursor.field().ok_or(SetupBundleError::Malformed)?;
+            let client_payment_auth: PartyAuth =
+                cursor.field().ok_or(SetupBundleError::Malformed)?;
             let proposed =
                 Self::propose_bond(network, bond_funding, bond_terms, provider_bond_auth)?
                     .countersign_bond_and_propose_payment(

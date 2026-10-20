@@ -341,7 +341,7 @@ where
             // way that goes, for the same reason the freeze route
             // declares a slot it may find empty — the absence is the
             // answer, so it has to be read rather than assumed.
-            if let KernelProof::Timeout { terms } = proof
+            if let KernelProof::Timeout { terms, .. } = proof
                 && matches!(terms.profile(), TermsProfile::WorkStakeBond(_))
             {
                 let slots = bond_lease_slots(context.network(), *input);

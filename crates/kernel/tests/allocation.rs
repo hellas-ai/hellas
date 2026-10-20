@@ -13,12 +13,12 @@
 #![allow(clippy::indexing_slicing)] // tests may index; the panic-freedom lock targets src
 mod support;
 
-use support::{FAKE_VERIFIER, FixedStore, list, open_tx};
+use support::{FAKE_VERIFIER, FixedStore, list, open};
 
 use hellas_kernel::{
-    Auth, BlockHash, BlockHeight, CloseKind, CoinId, Context, Event, EventKind, Funding, Genesis,
-    Key, List, MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Parties, PartyAuth, PartyKeys,
-    Payout, Proof, ProtocolCode, Sig, State, Terms, Tx,
+    BlockHash, BlockHeight, CloseKind, CoinId, Context, Event, EventKind, Funding, Genesis, Key,
+    List, MAX_EDGE_INPUTS, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Parties, PartyKeys, Payout, Proof,
+    ProtocolCode, State, Terms, Tx,
 };
 
 const CONTEXT: Context = Context::new(
@@ -32,6 +32,8 @@ fn open_resolve_and_operation_match_do_not_allocate() {
     let maker_key = Key::from_bytes([7; Key::LENGTH]);
     let taker_key = Key::from_bytes([8; Key::LENGTH]);
     let parties = Parties::new(PartyKeys::sole(maker_key), PartyKeys::sole(taker_key));
+    let maker_auth = (parties.maker(), hellas_kernel::Authority::Owner);
+    let taker_auth = (parties.taker(), hellas_kernel::Authority::Owner);
     let maker = CoinId::from_bytes([1; CoinId::LENGTH]);
     let taker = CoinId::from_bytes([2; CoinId::LENGTH]);
     let funding_value = funding(maker, taker);
@@ -42,7 +44,7 @@ fn open_resolve_and_operation_match_do_not_allocate() {
         payouts(Payout::new(maker_key, 9), Payout::new(taker_key, 6)),
     );
     let edge = Tx::edge_id_of(&funding_value, &terms_value);
-    let expected_open = open_tx(funding_value, terms_value.clone(), maker_key, taker_key);
+    let expected_open = open(funding_value, terms_value.clone(), maker_auth, taker_auth);
     let close_outputs = payouts(Payout::new(maker_key, 9), Payout::new(taker_key, 6));
     let expected_close_hash = Tx::payload_hash(
         support::NETWORK,
@@ -54,14 +56,8 @@ fn open_resolve_and_operation_match_do_not_allocate() {
     let expected_close = Tx::close(
         edge,
         Proof::mutual(
-            PartyAuth::owner(Auth::native(Sig::placeholder(
-                maker_key,
-                expected_close_hash,
-            ))),
-            PartyAuth::owner(Auth::native(Sig::placeholder(
-                taker_key,
-                expected_close_hash,
-            ))),
+            support::witness(maker_auth.0, maker_auth.1, expected_close_hash),
+            support::witness(taker_auth.0, taker_auth.1, expected_close_hash),
         ),
         close_outputs.clone(),
     );
@@ -90,10 +86,10 @@ fn open_resolve_and_operation_match_do_not_allocate() {
             &outputs,
         );
         let proof = Proof::mutual(
-            PartyAuth::owner(Auth::native(Sig::placeholder(maker_key, close_hash))),
-            PartyAuth::owner(Auth::native(Sig::placeholder(taker_key, close_hash))),
+            support::witness(maker_auth.0, maker_auth.1, close_hash),
+            support::witness(taker_auth.0, taker_auth.1, close_hash),
         );
-        let open = open_tx(funding(maker, taker), terms, maker_key, taker_key);
+        let open = open(funding(maker, taker), terms, maker_auth, taker_auth);
         assert_eq!(open, expected_open.clone());
         let is_open = matches!(open, Tx::Open { .. });
         let close = Tx::close(edge, proof, outputs);

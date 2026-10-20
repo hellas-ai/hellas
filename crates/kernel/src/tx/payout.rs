@@ -103,7 +103,8 @@ impl Payout {
     }
 
     /// Returns the coin this payout issues.
-    pub(crate) const fn coin(self) -> Coin {
+    #[must_use]
+    pub const fn coin(self) -> Coin {
         Coin::issue(self.owner, self.delegate, self.value)
     }
 

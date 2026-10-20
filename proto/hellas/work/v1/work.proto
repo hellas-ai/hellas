@@ -90,7 +90,7 @@ service WorkSetup {
 message ExchangeSetupRequest {
   // Required even when bundle is empty; checked against the selected journal.
   bytes bond_edge = 2;
-  // Canonical `WorkChannelSetupBundleV1` the caller has journaled, or
+  // Canonical `WorkChannelSetupBundleV2` the caller has journaled, or
   // empty to ask for the provider's own proposal.
   //
   // Empty is unambiguous rather than a sentinel: no revision encodes to
@@ -110,7 +110,7 @@ message ExchangeSetupResponse {
 }
 
 message SetupAdvanced {
-  // Canonical `WorkChannelSetupBundleV1`: the revision the answering
+  // Canonical `WorkChannelSetupBundleV2`: the revision the answering
   // endpoint has journaled, which is the caller's own plus whatever
   // this endpoint added to it.
   bytes bundle = 1;

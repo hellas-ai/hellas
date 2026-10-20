@@ -52,7 +52,7 @@ pub(crate) struct PaidFixture {
     pub ready: ReadyChannel,
     pub descriptor: WorkChannelDescriptor,
     pub config: WorkConfig,
-    pub proposal: hellas_work::model::bundle::WorkChannelSetupBundleV1,
+    pub proposal: hellas_work::model::bundle::WorkChannelSetupBundleV2,
 }
 
 pub(crate) fn signer(byte: u8) -> Secp256k1Signer {
@@ -160,11 +160,11 @@ impl PaidFixture {
             &funding,
             &Terms::work_stake_bond(bond_terms.clone()),
         );
-        let proposal = hellas_work::model::bundle::WorkChannelSetupBundleV1::propose_bond(
+        let proposal = hellas_work::model::bundle::WorkChannelSetupBundleV2::propose_bond(
             network,
             funding,
             bond_terms.clone(),
-            hellas_kernel::Auth::native(signer(2).sign(hash)),
+            hellas_kernel::PartyAuth::signer(hellas_kernel::Auth::native(signer(2).sign(hash))),
         )
         .unwrap();
         let bond_id = proposal.bond_edge();

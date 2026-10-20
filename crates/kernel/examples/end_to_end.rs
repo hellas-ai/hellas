@@ -193,7 +193,7 @@ fn run_maker_funded_timeout(wallets: &Wallets, verifier: Secp256k1Verifier) {
         lifetime_fee,
     );
 
-    let close = Tx::close(edge_id, Proof::timeout(terms), timeout_outputs);
+    let close = Tx::close(edge_id, Proof::timeout(terms, None), timeout_outputs);
     let close_fee = schedule_fee(opened.close_fees(), close.cost());
     let event = apply_one(&mut state, &verifier, close_context, close);
     println!(

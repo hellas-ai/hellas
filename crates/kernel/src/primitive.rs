@@ -129,6 +129,23 @@ impl CoinId {
         Self(crate::canonical::hash(crate::consts::COIN_GENESIS, &index))
     }
 
+    /// Derives one coin issued by a consuming owner reshape.
+    #[must_use]
+    pub fn reshape(
+        network: crate::NetworkId,
+        inputs: &crate::List<Self, { crate::MAX_EDGE_INPUTS }>,
+        index: usize,
+        owner: Key,
+    ) -> Self {
+        let mut hasher = SingleChunkHasher::new();
+        hasher.update(crate::consts::COIN_RESHAPE);
+        network.encode_to(&mut hasher);
+        inputs.encode_to(&mut hasher);
+        index.encode_to(&mut hasher);
+        owner.encode_to(&mut hasher);
+        Self(hasher.finalize())
+    }
+
     /// Derives the canonical id for one close payout coin.
     ///
     /// The delegate the coin carries is not in the preimage: the edge

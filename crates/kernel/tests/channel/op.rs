@@ -21,7 +21,10 @@ fn operations_report_deterministic_cost() {
         Cost::new(0, 0, 2)
     );
     assert_eq!(proof().kind(), CloseKind::Timeout);
-    assert_eq!(Proof::timeout(basic_terms()).cost(), Cost::new(0, 0, 1));
+    assert_eq!(
+        Proof::timeout(basic_terms(), None).cost(),
+        Cost::new(0, 0, 1)
+    );
 }
 
 #[test]

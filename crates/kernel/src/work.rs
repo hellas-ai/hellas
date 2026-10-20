@@ -70,6 +70,7 @@ use crate::{
 /// Version byte every work-payment v3 body carries. Decode rejects any
 /// other value, so one body shape has exactly one meaning.
 const WORK_CLOSE_VERSION: u8 = 3;
+const WORK_PENDING_VERSION: u8 = 4;
 
 /// Physical store slots a work-payment close touches: the payment edge,
 /// its two payout coins, and the pending-close registry slot.
@@ -208,7 +209,7 @@ pub fn work_payment_settlement(
 ///
 /// `final_cumulative` is the scalar the contest ended at, `penalty_due`
 /// is whether that contest proved an understatement, and `owner_signed`
-/// is whether either of its actions was signed by a party's owner — see
+/// records owner actions separately as `[maker, taker]` — see
 /// [`PendingPaymentClose::owner_signed`]. There is no route argument: a
 /// work-payment edge admits two exits, and the two functions that build
 /// them are the two exits.
@@ -223,7 +224,7 @@ pub fn adjudicated_payouts(
     parties: Parties,
     final_cumulative: u64,
     penalty_due: bool,
-    owner_signed: bool,
+    owner_signed: [bool; 2],
 ) -> Result<[Payout; 2], InvalidProofReason> {
     let penalty = if penalty_due {
         settlement.omission_bond
@@ -246,8 +247,8 @@ pub fn adjudicated_payouts(
 /// `penalty` is an amount and not a flag because a freeze's penalty is
 /// whatever the contest it ends had already proved, which is zero for
 /// the uncontested close both parties are agreeing to. `owner_signed` is
-/// whether either freeze witness, or either action of the contest it
-/// ends, was signed by a party's owner.
+/// `[maker, taker]`: each flag combines that party's freeze witness with its
+/// retained owner actions in the contest.
 ///
 /// # Errors
 ///
@@ -259,7 +260,7 @@ pub fn freeze_payouts(
     parties: Parties,
     earned: u64,
     penalty: u64,
-    owner_signed: bool,
+    owner_signed: [bool; 2],
 ) -> Result<[Payout; 2], InvalidProofReason> {
     let provider = earned
         .checked_add(penalty)
@@ -276,22 +277,20 @@ pub fn freeze_payouts(
 /// endpoint builds and a payout consensus expects cannot be two
 /// different opinions about who is owed what.
 ///
-/// `owner_signed` strips both payouts' delegates: when an owner acts on
-/// a channel directly it is leaving the delegation, and a payout that
-/// re-armed the committed delegate would hand the coin back to the key
-/// the owner is leaving.
+/// `owner_signed` records maker and taker independently. An owner exits only
+/// its own delegation; the counterparty keeps its committed destination.
 pub(crate) fn split_payouts(
     parties: Parties,
     total: u64,
     provider_total: u64,
-    owner_signed: bool,
+    owner_signed: [bool; 2],
 ) -> Result<[Payout; 2], InvalidProofReason> {
     let client_total = total
         .checked_sub(provider_total)
         .ok_or(InvalidProofReason::PayoutOverCapacity)?;
     Ok([
-        parties.taker().payout(provider_total, owner_signed),
-        parties.maker().payout(client_total, owner_signed),
+        parties.taker().payout(provider_total, owner_signed[1]),
+        parties.maker().payout(client_total, owner_signed[0]),
     ])
 }
 
@@ -1006,7 +1005,7 @@ pub struct PendingPaymentClose {
     responded: bool,
     penalty_due: bool,
     penalty_amount: u64,
-    owner_signed: bool,
+    owner_signed: [bool; 2],
 }
 
 const FLAG_CLEAR: u8 = 0;
@@ -1022,7 +1021,7 @@ impl PendingPaymentClose {
         + 3 * u64::MAX_ENCODED_SIZE
         + 2 * u8::MAX_ENCODED_SIZE
         + u64::MAX_ENCODED_SIZE
-        + u8::MAX_ENCODED_SIZE;
+        + 2 * u8::MAX_ENCODED_SIZE;
 
     /// Creates the record an accepted start writes.
     ///
@@ -1040,6 +1039,10 @@ impl PendingPaymentClose {
         claim: (u64, u64),
         owner_signed: bool,
     ) -> Self {
+        let owner_signed = match opener_role {
+            Party::Maker => [owner_signed, false],
+            Party::Taker => [false, owner_signed],
+        };
         let (claimed, omission_bond) = claim;
         Self {
             payment_edge,
@@ -1109,16 +1112,13 @@ impl PendingPaymentClose {
         self.penalty_amount
     }
 
-    /// Returns true once either action of this contest was signed by a
-    /// party's owner rather than its signer.
+    /// Returns which parties acted as owner rather than signer in this contest.
     ///
-    /// Sticky, and read by both exits: an owner that starts or answers a
-    /// contest is leaving the delegation, so every payout that settles it
-    /// — adjudicated, or a freeze that ends it early — is issued
-    /// undelegated. A freeze co-signed afterwards by the delegate cannot
-    /// restore the delegate's reach over the payouts.
+    /// Ordered `[maker, taker]`, sticky, and read by both exits. Only the
+    /// acting owner's payout loses delegation. A later freeze signed by
+    /// that party's node cannot restore its delegation.
     #[must_use]
-    pub const fn owner_signed(&self) -> bool {
+    pub const fn owner_signed(&self) -> [bool; 2] {
         self.owner_signed
     }
 
@@ -1156,7 +1156,7 @@ impl PendingPaymentClose {
             final_cumulative: amount,
             responded: true,
             penalty_due: self.penalty_due || matches!(self.opener_role, Party::Maker),
-            owner_signed: self.owner_signed || owner_signed,
+            owner_signed: [self.owner_signed[0], self.owner_signed[1] || owner_signed],
             ..self
         }
     }
@@ -1206,7 +1206,7 @@ impl PendingPaymentClose {
     /// Returns this record packed into its single registry chunk.
     ///
     /// `None` is unreachable for a record of this fixed width — the
-    /// encoding is 103 bytes and one chunk carries 120 — and is kept a
+    /// encoding is 104 bytes and one chunk carries 120 — and is kept a
     /// rejection rather than a panic because this runs on the apply path.
     #[must_use]
     pub(crate) fn to_chunk(self) -> Option<RegistryChunk> {
@@ -1345,7 +1345,8 @@ fn adjudicated_preimage<W: Writer + ?Sized>(
     record.final_cumulative.encode_to(writer);
     flag(record.penalty_due).encode_to(writer);
     record.penalty_amount.encode_to(writer);
-    flag(record.owner_signed).encode_to(writer);
+    flag(record.owner_signed[0]).encode_to(writer);
+    flag(record.owner_signed[1]).encode_to(writer);
 }
 
 const ADJUDICATED_PREIMAGE_MAX: usize = crate::consts::WORK_ADJUDICATED_PAYMENT_CLOSE.len()
@@ -1356,7 +1357,7 @@ const ADJUDICATED_PREIMAGE_MAX: usize = crate::consts::WORK_ADJUDICATED_PAYMENT_
     + 3 * u64::MAX_ENCODED_SIZE
     + u8::MAX_ENCODED_SIZE
     + u64::MAX_ENCODED_SIZE
-    + u8::MAX_ENCODED_SIZE;
+    + 2 * u8::MAX_ENCODED_SIZE;
 
 /// Returns the digest both parties sign to freeze a payment channel.
 #[must_use]
@@ -1452,7 +1453,7 @@ impl Encode for PendingPaymentClose {
 
     fn encode_to<W: Writer + ?Sized>(&self, writer: &mut W) {
         encode_envelope(writer, tag::PAYMENT_CLOSE_PENDING);
-        WORK_CLOSE_VERSION.encode_to(writer);
+        WORK_PENDING_VERSION.encode_to(writer);
         self.payment_edge.encode_to(writer);
         self.opener_role.encode_to(writer);
         self.start_id.encode_to(writer);
@@ -1462,7 +1463,8 @@ impl Encode for PendingPaymentClose {
         flag(self.responded).encode_to(writer);
         flag(self.penalty_due).encode_to(writer);
         self.penalty_amount.encode_to(writer);
-        flag(self.owner_signed).encode_to(writer);
+        flag(self.owner_signed[0]).encode_to(writer);
+        flag(self.owner_signed[1]).encode_to(writer);
     }
 }
 
@@ -1470,7 +1472,7 @@ impl Decode for PendingPaymentClose {
     fn decode(buf: &[u8]) -> Result<(Self, usize), DecodeError> {
         let mut consumed = decode_envelope(buf, tag::PAYMENT_CLOSE_PENDING)?;
         let version = decode_field::<u8>(buf, &mut consumed)?;
-        if version != WORK_CLOSE_VERSION {
+        if version != WORK_PENDING_VERSION {
             return Err(DecodeError::InvalidTag { tag: version });
         }
         let payment_edge = decode_field(buf, &mut consumed)?;
@@ -1482,7 +1484,10 @@ impl Decode for PendingPaymentClose {
         let responded = decode_flag(buf, &mut consumed, "PendingPaymentClose.responded")?;
         let penalty_due = decode_flag(buf, &mut consumed, "PendingPaymentClose.penalty_due")?;
         let penalty_amount = decode_field(buf, &mut consumed)?;
-        let owner_signed = decode_flag(buf, &mut consumed, "PendingPaymentClose.owner_signed")?;
+        let owner_signed = [
+            decode_flag(buf, &mut consumed, "PendingPaymentClose.maker_owner_signed")?,
+            decode_flag(buf, &mut consumed, "PendingPaymentClose.taker_owner_signed")?,
+        ];
         Ok((
             Self {
                 payment_edge,
@@ -1724,7 +1729,9 @@ mod tests {
         let mut other_bond = base;
         other_bond.penalty_amount = base.penalty_amount + 1;
         let mut other_owner = base;
-        other_owner.owner_signed = !base.owner_signed;
+        other_owner.owner_signed[0] = !base.owner_signed[0];
+        let mut other_taker_owner = base;
+        other_taker_owner.owner_signed[1] = !base.owner_signed[1];
 
         assert_all_distinct(&[
             ("base", commitment_of(&base)),
@@ -1734,7 +1741,8 @@ mod tests {
             ("final_cumulative", commitment_of(&other_final)),
             ("penalty_due", commitment_of(&other_due)),
             ("penalty_amount", commitment_of(&other_bond)),
-            ("owner_signed", commitment_of(&other_owner)),
+            ("maker_owner_signed", commitment_of(&other_owner)),
+            ("taker_owner_signed", commitment_of(&other_taker_owner)),
         ]);
 
         // The edge and terms the commitment is derived against are the close's,
@@ -2000,7 +2008,7 @@ mod tests {
     /// read and write of a contest a single charged slot.
     #[test]
     fn the_pending_record_is_one_registry_chunk() {
-        assert_eq!(PendingPaymentClose::ENCODED_SIZE, 103);
+        assert_eq!(PendingPaymentClose::ENCODED_SIZE, 104);
         assert_eq!(
             PendingPaymentClose::ENCODED_SIZE.min(crate::consts::REGISTRY_CHUNK_DATA_CAPACITY),
             PendingPaymentClose::ENCODED_SIZE,
@@ -2079,8 +2087,8 @@ mod tests {
         let Some(byte) = corrupt.get_mut(version) else {
             panic!("the version byte follows the envelope");
         };
-        assert_eq!(*byte, WORK_CLOSE_VERSION);
-        *byte = WORK_CLOSE_VERSION.wrapping_add(1);
+        assert_eq!(*byte, WORK_PENDING_VERSION);
+        *byte = WORK_PENDING_VERSION.wrapping_add(1);
         let Some(corrupt_chunk) = RegistryChunk::split(
             RegistryNamespace::PaymentClose,
             RegistryRecordTag::PaymentPending,
@@ -2102,9 +2110,10 @@ mod tests {
     fn record_flags_decode_only_as_zero_or_one() {
         // Offsets of `responded`, `penalty_due` and `owner_signed` inside
         // the body.
-        const RESPONDED: usize = PendingPaymentClose::ENCODED_SIZE - 11;
-        const PENALTY_DUE: usize = PendingPaymentClose::ENCODED_SIZE - 10;
-        const OWNER_SIGNED: usize = PendingPaymentClose::ENCODED_SIZE - 1;
+        const RESPONDED: usize = PendingPaymentClose::ENCODED_SIZE - 12;
+        const PENALTY_DUE: usize = PendingPaymentClose::ENCODED_SIZE - 11;
+        const OWNER_SIGNED: usize = PendingPaymentClose::ENCODED_SIZE - 2;
+        const TAKER_OWNER_SIGNED: usize = PendingPaymentClose::ENCODED_SIZE - 1;
 
         let mut buf = [0_u8; PendingPaymentClose::ENCODED_SIZE];
         let written = sample_record().write_to(&mut buf);
@@ -2115,7 +2124,8 @@ mod tests {
         for (offset, field) in [
             (RESPONDED, "PendingPaymentClose.responded"),
             (PENALTY_DUE, "PendingPaymentClose.penalty_due"),
-            (OWNER_SIGNED, "PendingPaymentClose.owner_signed"),
+            (OWNER_SIGNED, "PendingPaymentClose.maker_owner_signed"),
+            (TAKER_OWNER_SIGNED, "PendingPaymentClose.taker_owner_signed"),
         ] {
             let mut corrupt = buf;
             corrupt[offset] = 2;

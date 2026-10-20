@@ -214,7 +214,7 @@ module delegation {
   // C2 and C3′: the one payout lands exactly at the committed
   // destination, undelegated when the owner signed the close.
   def canClose(p: Proof, auth: Authority, payOwner: Key, payDelegate: Key): bool =
-    val ownerSigned = p == Mutual and auth == Owner
+    val ownerSigned = (p == Mutual or edge.shape == Bond) and auth == Owner
     edgeLive
       and (match edge.shape {
         | Basic =>
@@ -328,7 +328,7 @@ module delegation {
     edgeLive' = false,
     opened' = opened,
     closedEdge' = closedEdge.set(edge.shape, edge),
-    closedOwnerSigned' = closedOwnerSigned.set(edge.shape, p == Mutual and auth == Owner),
+    closedOwnerSigned' = closedOwnerSigned.set(edge.shape, (p == Mutual or edge.shape == Bond) and auth == Owner),
     height' = height,
     lastInput' = CloseInput({ proof: p, makerAuth: auth, payOwner: payOwner, payDelegate: payDelegate }),
     lastEvent' = EdgeClosedEvent(edge.shape),
@@ -502,6 +502,14 @@ module delegation {
       .then(rejectClose(Mutual, Signer, O, NoKey))
       .then(closeEdge(Mutual, Signer, O, N))
       .expect(coins.get(BasicOut).delegate == N and not(closedOwnerSigned.get(Basic)))
+
+  run ownerSignedBondTimeoutPaysUndelegatedTest =
+    init
+      .then(reshape(DelegateToN, O))
+      .then(openEdge(Bond, DelN, N, Signer))
+      .then(rejectClose(Timeout, Owner, O, N))
+      .then(closeEdge(Timeout, Owner, O, NoKey))
+      .expect(coins.get(BondOut).delegate == NoKey and closedOwnerSigned.get(Bond))
 
   run timeoutPaysCommittedTest =
     init

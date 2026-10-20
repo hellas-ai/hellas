@@ -118,7 +118,18 @@ fn open_allows_same_maker_and_taker_party() {
     let terms_hash = terms_value.hash();
     let funding_value = funding(MAKER_COIN, EXTRA_COIN);
     let output = Tx::edge_id_of(&funding_value, &terms_value);
-    let open = open_tx_with(funding_value, terms_value, MAKER, MAKER);
+    let open = open_tx_with(
+        funding_value,
+        terms_value,
+        (
+            hellas_kernel::PartyKeys::sole(MAKER),
+            hellas_kernel::Authority::Owner,
+        ),
+        (
+            hellas_kernel::PartyKeys::sole(MAKER),
+            hellas_kernel::Authority::Owner,
+        ),
+    );
     let mut state = state(
         store_for(&open),
         [MAKER_SEED, TAKER_SEED, Genesis::coin(EXTRA_COIN, MAKER, 5)],
@@ -572,7 +583,18 @@ fn open_rejects_funding_owned_by_other_keys() {
     // cannot produce Maker's or Taker's signature, so any choice she
     // makes here is unauthenticated; the funding ownership check fires
     // first regardless.
-    let attack = open_tx_with(funding, eve_terms(), EVE, EVE);
+    let attack = open_tx_with(
+        funding,
+        eve_terms(),
+        (
+            hellas_kernel::PartyKeys::sole(EVE),
+            hellas_kernel::Authority::Owner,
+        ),
+        (
+            hellas_kernel::PartyKeys::sole(EVE),
+            hellas_kernel::Authority::Owner,
+        ),
+    );
     let mut state = funded_state_for(&attack);
     let output = open_edge_id(&attack);
     let store = *state.store();
@@ -599,7 +621,18 @@ fn open_rejects_terms_party_that_does_not_own_funding() {
         TIMEOUT,
         payouts(Payout::new(EVE, 10), Payout::new(TAKER, 5)),
     );
-    let attack = open_tx_with(funding, mixed_terms, EVE, TAKER);
+    let attack = open_tx_with(
+        funding,
+        mixed_terms,
+        (
+            hellas_kernel::PartyKeys::sole(EVE),
+            hellas_kernel::Authority::Owner,
+        ),
+        (
+            hellas_kernel::PartyKeys::sole(TAKER),
+            hellas_kernel::Authority::Owner,
+        ),
+    );
     let mut state = funded_state_for(&attack);
     let output = open_edge_id(&attack);
     let store = *state.store();
@@ -618,7 +651,18 @@ fn open_rejects_terms_party_that_does_not_own_funding() {
 fn open_rejects_wrong_maker_auth_even_when_taker_funds_everything() {
     let funding = Funding::new(empty_party(), party1(TAKER_COIN));
     let terms = terms_paying(0, 5);
-    let open = open_tx_with(funding, terms, EVE, TAKER);
+    let open = open_tx_with(
+        funding,
+        terms,
+        (
+            hellas_kernel::PartyKeys::sole(EVE),
+            hellas_kernel::Authority::Owner,
+        ),
+        (
+            hellas_kernel::PartyKeys::sole(TAKER),
+            hellas_kernel::Authority::Owner,
+        ),
+    );
     let mut state = funded_state_for(&open);
     let output = open_edge_id(&open);
     let store = *state.store();
@@ -637,7 +681,18 @@ fn open_rejects_wrong_maker_auth_even_when_taker_funds_everything() {
 fn open_rejects_wrong_taker_auth_even_when_maker_funds_everything() {
     let funding = Funding::new(party1(MAKER_COIN), empty_party());
     let terms = terms_paying(10, 0);
-    let open = open_tx_with(funding, terms, MAKER, EVE);
+    let open = open_tx_with(
+        funding,
+        terms,
+        (
+            hellas_kernel::PartyKeys::sole(MAKER),
+            hellas_kernel::Authority::Owner,
+        ),
+        (
+            hellas_kernel::PartyKeys::sole(EVE),
+            hellas_kernel::Authority::Owner,
+        ),
+    );
     let mut state = funded_state_for(&open);
     let output = open_edge_id(&open);
     let store = *state.store();
@@ -656,7 +711,18 @@ fn open_rejects_wrong_taker_auth_even_when_maker_funds_everything() {
 fn open_rejects_empty_funding_without_both_party_auth() {
     let funding = Funding::new(empty_party(), empty_party());
     let terms = terms_with(&no_payouts());
-    let open = open_tx_with(funding, terms, MAKER, EVE);
+    let open = open_tx_with(
+        funding,
+        terms,
+        (
+            hellas_kernel::PartyKeys::sole(MAKER),
+            hellas_kernel::Authority::Owner,
+        ),
+        (
+            hellas_kernel::PartyKeys::sole(EVE),
+            hellas_kernel::Authority::Owner,
+        ),
+    );
     let mut state = funded_state_for(&open);
     let output = open_edge_id(&open);
     let store = *state.store();

@@ -140,11 +140,11 @@ fn provider_producer() -> ProducerSigningKey {
 }
 
 fn client_key() -> SettlementKey {
-    SettlementKey::from(client().party_key())
+    SettlementKey::from(signer(0x31).party_key())
 }
 
 fn provider_key() -> SettlementKey {
-    SettlementKey::from(provider().party_key())
+    SettlementKey::from(signer(0x32).party_key())
 }
 
 // ── Genesis, as a document ────────────────────────────────────────────
@@ -215,6 +215,36 @@ fn genesis_coin(allocations: &[(SettlementKey, u64)], owner: SettlementKey) -> C
     CoinId::from_bytes(genesis_object_id(index).into())
 }
 
+fn delegate_tx(allocations: &[(SettlementKey, u64)], is_client: bool) -> KernelTx {
+    let (owner, node, value) = if is_client {
+        (signer(0x31), client(), CLIENT_FUNDING)
+    } else {
+        (signer(0x32), provider(), PROVIDER_STAKE)
+    };
+    let inputs = List::take(
+        [genesis_coin(allocations, owner.party_key().into()); hellas_kernel::MAX_EDGE_INPUTS],
+        1,
+    );
+    let outputs = List::take(
+        [Payout::delegated(owner.party_key(), Some(node.party_key()), value); MAX_EDGE_OUTPUTS],
+        1,
+    );
+    let hash = hellas_kernel::Reshape::payload_hash(TEST_NETWORK, &inputs, &outputs);
+    KernelTx::Owner(hellas_kernel::Reshape::new(
+        inputs,
+        outputs,
+        hellas_kernel::Auth::native(owner.sign(hash)),
+    ))
+}
+
+fn delegated_coin(allocations: &[(SettlementKey, u64)], is_client: bool) -> CoinId {
+    let KernelTx::Owner(reshape) = delegate_tx(allocations, is_client) else {
+        unreachable!()
+    };
+    hellas_kernel::Reshape::output_ids(TEST_NETWORK, reshape.inputs(), reshape.outputs()).as_slice()
+        [0]
+}
+
 // ── The channel both parties sign ─────────────────────────────────────
 
 fn one_coin(id: CoinId) -> List<CoinId, MAX_PARTY_INPUTS> {
@@ -233,12 +263,24 @@ fn no_coins() -> List<CoinId, MAX_PARTY_INPUTS> {
 fn bond_terms() -> WorkStakeBondTerms {
     WorkStakeBondTerms {
         parties: Parties::new(
-            PartyKeys::sole(provider().party_key()),
-            PartyKeys::sole(client().party_key()),
+            PartyKeys::new(
+                provider_key().into_kernel(),
+                provider().party_key(),
+                Some(provider().party_key()),
+            ),
+            PartyKeys::new(
+                client_key().into_kernel(),
+                client().party_key(),
+                Some(client().party_key()),
+            ),
         ),
         timeout: BlockHeight::new(HORIZON),
         timeout_outputs: List::take(
-            [Payout::new(provider().party_key(), PROVIDER_STAKE); MAX_EDGE_OUTPUTS],
+            [Payout::delegated(
+                provider_key().into_kernel(),
+                Some(provider().party_key()),
+                PROVIDER_STAKE,
+            ); MAX_EDGE_OUTPUTS],
             1,
         ),
         max_job_price: CREDIT_LIMIT,
@@ -246,17 +288,11 @@ fn bond_terms() -> WorkStakeBondTerms {
 }
 
 fn bond_funding(allocations: &[(SettlementKey, u64)]) -> Funding {
-    Funding::new(
-        one_coin(genesis_coin(allocations, provider_key())),
-        no_coins(),
-    )
+    Funding::new(one_coin(delegated_coin(allocations, false)), no_coins())
 }
 
 fn payment_funding(allocations: &[(SettlementKey, u64)]) -> Funding {
-    Funding::new(
-        one_coin(genesis_coin(allocations, client_key())),
-        no_coins(),
-    )
+    Funding::new(one_coin(delegated_coin(allocations, true)), no_coins())
 }
 
 fn bond_edge(allocations: &[(SettlementKey, u64)]) -> EdgeId {
@@ -765,6 +801,17 @@ impl Devnet {
                 .expect("the finalized QMDB answers a coin read")
             {
                 Some(Object::Coin(coin)) if coin.owner == owner => {
+                    let expected_delegate = if id == genesis_coin(&self.allocations, owner) {
+                        None
+                    } else if owner == client_key() {
+                        Some(SettlementKey::from(client().party_key()))
+                    } else {
+                        Some(SettlementKey::from(provider().party_key()))
+                    };
+                    assert_eq!(
+                        coin.delegate, expected_delegate,
+                        "executed payout retains its committed node delegation"
+                    );
                     executed.push((id, coin.value));
                 }
                 Some(Object::Coin(_)) | None => {}
@@ -1229,7 +1276,7 @@ async fn open_channel(
 ) -> Opened {
     let allocations = devnet.allocations.clone();
     // Full-node views are unavailable until the first certified block executes.
-    let floor = devnet.seal().await;
+    devnet.seal().await;
     let provider_blocks = devnet.blocks(PROVIDER_NODE);
     let client_blocks = devnet.blocks(CLIENT_NODE);
     assert_eq!(
@@ -1241,7 +1288,7 @@ async fn open_channel(
             )
             .await,
         Some(CLIENT_FUNDING),
-        "genesis funded the client's secp256k1 settlement key",
+        "genesis funded the client owner",
     );
     assert_eq!(
         devnet
@@ -1252,9 +1299,20 @@ async fn open_channel(
             )
             .await,
         Some(PROVIDER_STAKE),
-        "genesis funded the provider's secp256k1 settlement key",
+        "genesis funded the provider owner",
     );
 
+    for is_client in [false, true] {
+        assert_eq!(
+            devnet
+                .blocks(CLIENT_NODE)
+                .submit(delegate_tx(&allocations, is_client))
+                .await
+                .unwrap(),
+            crate::SubmitTxOutcome::Enqueued
+        );
+    }
+    let floor = devnet.seal().await;
     let handshake = shake_hands(provider_root, client_root, &allocations, scan_at(&floor)).await;
 
     // The bond, submitted by the driver and finalized by consensus.
@@ -1562,8 +1620,13 @@ async fn return_the_stake(devnet: &mut Devnet, service: &WorkService) -> CoinId 
 fn payment_close_coins(allocations: &[(SettlementKey, u64)]) -> (CoinId, CoinId) {
     let edge = payment_edge(allocations);
     (
-        Payout::new(provider().party_key(), 0).id(edge, 0),
-        Payout::new(client().party_key(), 0).id(edge, 1),
+        Payout::delegated(
+            provider_key().into_kernel(),
+            Some(provider().party_key()),
+            0,
+        )
+        .id(edge, 0),
+        Payout::delegated(client_key().into_kernel(), Some(client().party_key()), 0).id(edge, 1),
     )
 }
 

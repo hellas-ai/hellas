@@ -368,16 +368,31 @@ pub(crate) fn payouts(entries: &[(Key, u64)]) -> List<Payout, MAX_EDGE_OUTPUTS> 
     list
 }
 
-/// `Tx::Open` authorized with the placeholder sigs `FAKE_VERIFIER`
-/// accepts, keyed to `maker`/`taker`. Adversarial tests pass mismatching
-/// keys.
-pub(crate) fn open_tx(funding: Funding, terms: Terms, maker: Key, taker: Key) -> Tx {
+/// A role-labelled placeholder witness, verified through the kernel's shared path.
+pub(crate) fn witness(
+    party: hellas_kernel::PartyKeys,
+    authority: hellas_kernel::Authority,
+    hash: PayloadHash,
+) -> PartyAuth {
+    PartyAuth::new(
+        authority,
+        Auth::native(Sig::placeholder(party.key(authority), hash)),
+    )
+}
+
+/// An open with explicit role-labelled keys; adversarial tests may supply foreign parties.
+pub(crate) fn open(
+    funding: Funding,
+    terms: Terms,
+    maker: (hellas_kernel::PartyKeys, hellas_kernel::Authority),
+    taker: (hellas_kernel::PartyKeys, hellas_kernel::Authority),
+) -> Tx {
     let hash = Tx::open_hash(NETWORK, &funding, &terms);
     Tx::open(
         funding,
         terms,
-        PartyAuth::owner(Auth::native(Sig::placeholder(maker, hash))),
-        PartyAuth::owner(Auth::native(Sig::placeholder(taker, hash))),
+        witness(maker.0, maker.1, hash),
+        witness(taker.0, taker.1, hash),
     )
 }
 

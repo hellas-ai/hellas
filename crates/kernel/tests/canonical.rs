@@ -350,7 +350,7 @@ fn full_transaction_graph_and_persistence_values_round_trip_exactly() {
     let mut mutual_buf = [0; Proof::MAX_ENCODED_SIZE + 1];
     assert_canonical_round_trip(&mutual, &mut mutual_buf);
 
-    let timeout = Proof::timeout(terms.clone());
+    let timeout = Proof::timeout(terms.clone(), None);
     let mut timeout_buf = [0; Proof::MAX_ENCODED_SIZE + 1];
     assert_canonical_round_trip(&timeout, &mut timeout_buf);
 
@@ -371,7 +371,7 @@ fn full_transaction_graph_and_persistence_values_round_trip_exactly() {
 
     let close = Tx::close(
         EdgeId::from_bytes([0x71; EdgeId::LENGTH]),
-        Proof::timeout(terms),
+        Proof::timeout(terms, None),
         payouts(),
     );
     let mut close_buf = [0; Tx::MAX_ENCODED_SIZE + 1];
@@ -382,7 +382,7 @@ fn full_transaction_graph_and_persistence_values_round_trip_exactly() {
 fn plain_tx_decode_accepts_trailing_bytes_but_exact_decode_rejects_them() {
     let tx = Tx::close(
         EdgeId::from_bytes([0x91; EdgeId::LENGTH]),
-        Proof::timeout(terms()),
+        Proof::timeout(terms(), None),
         payouts(),
     );
     let mut buf = [0; Tx::MAX_ENCODED_SIZE + 1];
@@ -443,11 +443,11 @@ fn composite_types_have_distinct_versioned_domain_tags() {
     assert_tag!(webauthn_assertion(), WebAuthnAssertion, 9);
     assert_tag!(native_auth(6), Auth, 10);
     assert_tag!(terms(), Terms, 11);
-    assert_tag!(Proof::timeout(terms()), Proof, 12);
+    assert_tag!(Proof::timeout(terms(), None), Proof, 12);
     assert_tag!(
         Tx::close(
             EdgeId::from_bytes([7; EdgeId::LENGTH]),
-            Proof::timeout(terms()),
+            Proof::timeout(terms(), None),
             payouts(),
         ),
         Tx,
@@ -489,7 +489,7 @@ fn malformed_envelopes_variants_and_bounded_lengths_are_rejected() {
     );
 
     let mut proof_buf = [0; Proof::MAX_ENCODED_SIZE];
-    let proof_len = Proof::timeout(terms()).write_to(&mut proof_buf);
+    let proof_len = Proof::timeout(terms(), None).write_to(&mut proof_buf);
     proof_buf[2] = 0xff;
     assert_eq!(
         Proof::decode_exact(&proof_buf[..proof_len]),
@@ -499,7 +499,7 @@ fn malformed_envelopes_variants_and_bounded_lengths_are_rejected() {
     let mut tx_buf = [0; Tx::MAX_ENCODED_SIZE];
     let tx_len = Tx::close(
         EdgeId::from_bytes([3; EdgeId::LENGTH]),
-        Proof::timeout(terms()),
+        Proof::timeout(terms(), None),
         payouts(),
     )
     .write_to(&mut tx_buf);
@@ -552,7 +552,7 @@ fn malformed_envelopes_variants_and_bounded_lengths_are_rejected() {
 #[test]
 fn the_removed_proof_variants_decode_as_nothing() {
     let mut proof_buf = [0; Proof::MAX_ENCODED_SIZE];
-    let proof_len = Proof::timeout(terms()).write_to(&mut proof_buf);
+    let proof_len = Proof::timeout(terms(), None).write_to(&mut proof_buf);
     for variant in [2, 5] {
         proof_buf[2] = variant;
         assert_eq!(
@@ -796,7 +796,7 @@ fn golden_response() -> PaymentCloseResponse {
 /// penalty; then the bond; then owner-signed), so any pair of
 /// neighbouring fields exchanged in the layout or in the seal preimage
 /// moves a value some assertion below names.
-const GOLDEN_PENDING_RECORD: &str = "0117031111111111111111111111111111111111111111111111111111111111111111013333333333333333333333333333333333333333333333333333333333333333000000000000038b000000000000109200000000000010930100000000000000001101";
+const GOLDEN_PENDING_RECORD: &str = "0117041111111111111111111111111111111111111111111111111111111111111111013333333333333333333333333333333333333333333333333333333333333333000000000000038b00000000000010920000000000001093010000000000000000110100";
 
 /// The record those bytes spell.
 ///
@@ -840,7 +840,7 @@ fn payment_close_pending_record_bytes_are_pinned() {
     assert!(record.responded());
     assert!(!record.penalty_due());
     assert_eq!(record.penalty_amount(), 17);
-    assert!(record.owner_signed());
+    assert_eq!(record.owner_signed(), [true, false]);
 
     // And the encoder puts them back exactly where they were found.
     let mut buf = [0; PendingPaymentClose::ENCODED_SIZE];
@@ -986,7 +986,7 @@ fn payment_close_digests_are_pinned() {
     const START_ID: &str = "bc7bb08d13ccc5898f8b02935ebf60052f32e9f35456f400fd18845310081fa8";
     const RESPONSE: &str = "b8e34b3c4e176af4b4d1ce34388aa2006120e4e2c6d1a90c957b4a548f30d679";
     const FREEZE: &str = "d9884b2aeb703634ddd5037ba31a5f8cf0661e99517572f2782cb4d592fe46a9";
-    const CONTEST: &str = "2cf9333d35b5994ba82ea2ea3252aa2acc502265090c11d7102732aaa325f8ca";
+    const CONTEST: &str = "d652c76ef2744235d5bc4dbd43f0e0e8a86ee3b74f017edfdf343b5eb697e122";
 
     let edge = golden_edge();
     let terms = golden_terms_hash();
@@ -1310,6 +1310,12 @@ fn reshape_bytes_and_hashes_are_pinned() {
     ));
     let mut buf = [0; Tx::MAX_ENCODED_SIZE];
     let written = tx.write_to(&mut buf);
+    assert_eq!(tx.encoded_size(), written);
+    let Tx::Owner(reshape) = &tx else {
+        unreachable!()
+    };
+    let mut body = [0; Reshape::MAX_ENCODED_SIZE];
+    assert_eq!(reshape.encoded_size(), reshape.write_to(&mut body));
     assert_hex(
         &buf[..written],
         concat!(
@@ -1358,4 +1364,37 @@ fn reshape_bytes_and_hashes_are_pinned() {
         Reshape::payload_hash(NETWORK, &inputs, &outputs),
     );
     assert_ne!(Reshape::output_ids(other, &inputs, &outputs), ids);
+}
+
+#[test]
+fn timeout_owner_witness_layout_is_pinned() {
+    let terms = terms();
+    let mut body = [0; Terms::MAX_ENCODED_SIZE];
+    let terms_len = terms.write_to(&mut body);
+    for owner in [None, Some(PartyAuth::owner(native_auth(0x5a)))] {
+        let proof = Proof::timeout(terms.clone(), owner.clone());
+        let mut buf = [0; Proof::MAX_ENCODED_SIZE + 1];
+        let written = proof.write_to(&mut buf);
+        assert_eq!(proof.encoded_size(), written);
+        assert_hex(&buf[..3], "010c01");
+        assert_eq!(&buf[3..3 + terms_len], &body[..terms_len]);
+        if owner.is_some() {
+            assert_hex(
+                &buf[3 + terms_len..written],
+                concat!(
+                    "01012000010a00",
+                    "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+                    "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a"
+                ),
+            );
+        } else {
+            assert_hex(&buf[3 + terms_len..written], "00");
+        }
+        assert_eq!(Proof::decode_exact(&buf[..written]), Ok(proof));
+        buf[3 + terms_len] = 2;
+        assert_eq!(
+            Proof::decode_exact(&buf[..written]),
+            Err(DecodeError::InvalidTag { tag: 2 })
+        );
+    }
 }

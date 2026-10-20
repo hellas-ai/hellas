@@ -42,8 +42,8 @@ type Outputs = List<Payout, MAX_EDGE_OUTPUTS>;
 ///
 /// Every input must exist and share one owner, `auth` must be that
 /// owner's over [`Reshape::payload_hash`], and the outputs must carry
-/// exactly the value the inputs held. Outputs may name any owner and any
-/// delegate: paying a third party, or delegating to a node key, is the
+/// exactly the value the inputs held. Outputs may name any owner, but only outputs retained by the
+/// input owner may carry a delegate: paying a third party, or delegating to a node key, is the
 /// owner's decision and this is the one place it is made.
 #[derive(Debug, Clone, Eq, Hash, PartialEq)]
 pub struct Reshape {
@@ -107,7 +107,7 @@ impl Reshape {
     ) -> List<CoinId, MAX_EDGE_OUTPUTS> {
         let mut ids = [CoinId::ZERO; MAX_EDGE_OUTPUTS];
         for (index, (slot, payout)) in ids.iter_mut().zip(outputs).enumerate() {
-            *slot = output_id(network, inputs, index, *payout);
+            *slot = CoinId::reshape(network, inputs, index, payout.owner());
         }
         List::take(ids, outputs.len())
     }
@@ -153,6 +153,14 @@ impl Reshape {
             return Err(reject(InvalidReshapeReason::OwnerMismatch));
         }
 
+        for payout in &self.outputs {
+            if payout.value() == 0 {
+                return Err(reject(InvalidReshapeReason::ZeroOutput));
+            }
+            if payout.delegate().is_some() && payout.owner() != owner {
+                return Err(reject(InvalidReshapeReason::ForeignDelegation));
+            }
+        }
         let held = coins
             .checked_sum(|(_, coin)| coin.value())
             .ok_or_else(|| reject(InvalidReshapeReason::ValueOverflow))?;
@@ -167,7 +175,7 @@ impl Reshape {
         let network = context.network();
         let mut issued_coins = [(CoinId::ZERO, Coin::ZERO); MAX_EDGE_OUTPUTS];
         for (index, (slot, payout)) in issued_coins.iter_mut().zip(&self.outputs).enumerate() {
-            let id = output_id(network, &self.inputs, index, *payout);
+            let id = CoinId::reshape(network, &self.inputs, index, payout.owner());
             if batch.coin(id).is_some() {
                 return Err(ApplyError::OutputExists { id });
             }
@@ -182,16 +190,6 @@ impl Reshape {
         }
         Ok(Change::reshape(&coins, &issued_coins))
     }
-}
-
-fn output_id(network: NetworkId, inputs: &Inputs, index: usize, payout: Payout) -> CoinId {
-    let mut hasher = SingleChunkHasher::new();
-    hasher.update(crate::consts::COIN_RESHAPE);
-    network.encode_to(&mut hasher);
-    inputs.encode_to(&mut hasher);
-    index.encode_to(&mut hasher);
-    payout.owner().encode_to(&mut hasher);
-    CoinId::from_bytes(hasher.finalize().into_bytes())
 }
 
 impl Encode for Reshape {

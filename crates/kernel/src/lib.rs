@@ -246,7 +246,7 @@ pub use terms::{Terms, TermsProfile, WorkPaymentTerms, WorkStakeBondTerms};
 pub use tx::{
     Auth, Authority, CloseKind, CloseKindSet, Funding, Move, OpenFunding, OpenProjection,
     PartyAuth, PaymentContestCommitment, Payout, Proof, Reshape, Tx, WebAuthnAssertion,
-    WebAuthnData, check_response, open_projection,
+    WebAuthnData, check_response, open_projection, verify_party,
 };
 pub use verifier::SigVerifier;
 pub use view::{Snapshot, View};

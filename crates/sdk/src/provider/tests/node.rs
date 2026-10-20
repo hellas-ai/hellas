@@ -46,7 +46,7 @@ use hellas_rpc::services::work::WorkClientImpl;
 use hellas_rpc::services::work_setup::WorkSetupClientImpl;
 use hellas_rpc::{Assurance, EvaluateRequest, OutputEventEnvelope, SubmitTxOutcome};
 use hellas_wire::{AuthLevel, PeerIdentity};
-use hellas_work::model::bundle::WorkChannelSetupBundleV1;
+use hellas_work::model::bundle::WorkChannelSetupBundleV2;
 use hellas_work::model::prepared_input::PreparedPaidInputV1;
 use hellas_work::model::setup::ProviderChannelPolicy;
 use hellas_work::model::work::{
@@ -422,11 +422,11 @@ async fn exchange_routed_setup(
     response
 }
 
-fn advanced_setup_bundle(response: ExchangeSetupResponse) -> WorkChannelSetupBundleV1 {
+fn advanced_setup_bundle(response: ExchangeSetupResponse) -> WorkChannelSetupBundleV2 {
     let Some(exchange_setup_response::Outcome::Advanced(advanced)) = response.outcome else {
         panic!("a configured peer receives its setup proposal")
     };
-    match WorkChannelSetupBundleV1::decode(&advanced.bundle) {
+    match WorkChannelSetupBundleV2::decode(&advanced.bundle) {
         Ok(bundle) => bundle,
         Err(error) => panic!("the routed setup proposal decodes: {error}"),
     }
@@ -1247,24 +1247,24 @@ fn admits() -> PaymentAdmission {
 
 // ── The handshake this journal retains ────────────────────────────
 
-fn proposed() -> WorkChannelSetupBundleV1 {
+fn proposed() -> WorkChannelSetupBundleV2 {
     let hash = Tx::open_hash(
         network(),
         &bond_funding(),
         &Terms::work_stake_bond(bond_terms()),
     );
-    match WorkChannelSetupBundleV1::propose_bond(
+    match WorkChannelSetupBundleV2::propose_bond(
         network(),
         bond_funding(),
         bond_terms(),
-        Auth::native(provider().sign(hash)),
+        hellas_kernel::PartyAuth::signer(Auth::native(provider().sign(hash))),
     ) {
         Ok(bundle) => bundle,
         Err(error) => panic!("the fixture bond proposes: {error}"),
     }
 }
 
-fn countersigned(bundle: WorkChannelSetupBundleV1) -> WorkChannelSetupBundleV1 {
+fn countersigned(bundle: WorkChannelSetupBundleV2) -> WorkChannelSetupBundleV2 {
     let bond_hash = bundle.bond_open_hash();
     let payment_hash = Tx::open_hash(
         network(),
@@ -1272,21 +1272,23 @@ fn countersigned(bundle: WorkChannelSetupBundleV1) -> WorkChannelSetupBundleV1 {
         &Terms::work_payment(payment_terms()),
     );
     match bundle.countersign_bond_and_propose_payment(
-        Auth::native(client().sign(bond_hash)),
+        hellas_kernel::PartyAuth::signer(Auth::native(client().sign(bond_hash))),
         payment_funding(),
         payment_terms(),
-        Auth::native(client().sign(payment_hash)),
+        hellas_kernel::PartyAuth::signer(Auth::native(client().sign(payment_hash))),
     ) {
         Ok(bundle) => bundle,
         Err(error) => panic!("the fixture payment proposes: {error}"),
     }
 }
 
-fn completed(bundle: WorkChannelSetupBundleV1) -> WorkChannelSetupBundleV1 {
+fn completed(bundle: WorkChannelSetupBundleV2) -> WorkChannelSetupBundleV2 {
     let Some(hash) = bundle.payment_open_hash() else {
         panic!("a proposed payment has an open hash");
     };
-    match bundle.countersign_payment(Auth::native(provider().sign(hash))) {
+    match bundle.countersign_payment(hellas_kernel::PartyAuth::signer(Auth::native(
+        provider().sign(hash),
+    ))) {
         Ok(bundle) => bundle,
         Err(error) => panic!("the fixture payment countersigns: {error}"),
     }
@@ -2517,24 +2519,24 @@ impl OfferFixture {
         )
     }
 
-    fn proposed(self) -> WorkChannelSetupBundleV1 {
+    fn proposed(self) -> WorkChannelSetupBundleV2 {
         let hash = Tx::open_hash(
             network(),
             &self.bond_funding(),
             &Terms::work_stake_bond(self.bond_terms()),
         );
-        match WorkChannelSetupBundleV1::propose_bond(
+        match WorkChannelSetupBundleV2::propose_bond(
             network(),
             self.bond_funding(),
             self.bond_terms(),
-            Auth::native(provider().sign(hash)),
+            hellas_kernel::PartyAuth::signer(Auth::native(provider().sign(hash))),
         ) {
             Ok(bundle) => bundle,
             Err(error) => panic!("the routed bond proposes: {error}"),
         }
     }
 
-    fn countersigned(self, bundle: WorkChannelSetupBundleV1) -> WorkChannelSetupBundleV1 {
+    fn countersigned(self, bundle: WorkChannelSetupBundleV2) -> WorkChannelSetupBundleV2 {
         let bond_hash = bundle.bond_open_hash();
         let payment_hash = Tx::open_hash(
             network(),
@@ -2542,21 +2544,23 @@ impl OfferFixture {
             &Terms::work_payment(self.payment_terms()),
         );
         match bundle.countersign_bond_and_propose_payment(
-            Auth::native(self.client().sign(bond_hash)),
+            hellas_kernel::PartyAuth::signer(Auth::native(self.client().sign(bond_hash))),
             self.payment_funding(),
             self.payment_terms(),
-            Auth::native(self.client().sign(payment_hash)),
+            hellas_kernel::PartyAuth::signer(Auth::native(self.client().sign(payment_hash))),
         ) {
             Ok(bundle) => bundle,
             Err(error) => panic!("the routed payment proposes: {error}"),
         }
     }
 
-    fn completed(self, bundle: WorkChannelSetupBundleV1) -> WorkChannelSetupBundleV1 {
+    fn completed(self, bundle: WorkChannelSetupBundleV2) -> WorkChannelSetupBundleV2 {
         let Some(hash) = bundle.payment_open_hash() else {
             panic!("the routed payment has an open hash");
         };
-        match bundle.countersign_payment(Auth::native(provider().sign(hash))) {
+        match bundle.countersign_payment(hellas_kernel::PartyAuth::signer(Auth::native(
+            provider().sign(hash),
+        ))) {
             Ok(bundle) => bundle,
             Err(error) => panic!("the routed payment countersigns: {error}"),
         }

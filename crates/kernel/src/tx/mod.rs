@@ -245,7 +245,11 @@ impl Tx {
     #[must_use]
     pub fn timeout_close(edge: EdgeId, terms: &Terms) -> Option<Self> {
         let outputs = terms.timeout_outputs()?.clone();
-        Some(Self::close(edge, Proof::timeout(terms.clone()), outputs))
+        Some(Self::close(
+            edge,
+            Proof::timeout(terms.clone(), None),
+            outputs,
+        ))
     }
 
     /// Predicts the edge id that [`Tx::open`] would produce for `funding` and
@@ -489,7 +493,7 @@ fn close_cost(outputs: usize, proof: &Proof) -> Cost {
         // Only the timeout's price depends on the profile, and only a
         // timeout reveals the terms that name one. Every other kind is
         // priced by its kind alone.
-        Proof::Timeout { terms } => timeout_close_cost(outputs, is_work_bond(terms)),
+        Proof::Timeout { terms, .. } => timeout_close_cost(outputs, is_work_bond(terms)),
         Proof::Mutual { .. } | Proof::Freeze { .. } | Proof::Adjudicated { .. } => {
             kind_close_cost(outputs, proof.kind())
         }
@@ -689,7 +693,7 @@ fn check_open_auth<V: SigVerifier + ?Sized>(
 
 /// Verifies `auth` against exactly the one key its authority names
 /// among `party`'s committed keys.
-fn verify_party<V: SigVerifier + ?Sized>(
+pub fn verify_party<V: SigVerifier + ?Sized>(
     verifier: &V,
     auth: &PartyAuth,
     party: PartyKeys,
@@ -757,11 +761,103 @@ where
 /// exits stage one, and the rest stage none.
 type StagedCloseRegistry = [Option<RegistryMutation>; 2];
 
+fn check_timeout<B: Batch, V: SigVerifier + ?Sized>(
+    close: work::CloseSubject<'_>,
+    terms: &Terms,
+    owner: Option<&PartyAuth>,
+    context: Context,
+    verifier: &V,
+    batch: &B,
+) -> Result<StagedCloseRegistry, InvalidProofReason> {
+    let work::CloseSubject {
+        input,
+        edge,
+        outputs,
+        ..
+    } = close;
+    if terms.hash() != edge.terms() {
+        return Err(InvalidProofReason::TermsMismatch);
+    }
+    // Only a tag-4 bond has lease state, so only a tag-4 bond
+    // pays to read it. Both slots are consulted, and anything
+    // that is not exactly a whole lease or exactly nothing is a
+    // rejection: reading a half-written record as "unleased"
+    // would open the immediate exit under a live channel's
+    // recourse.
+    let lease = if is_work_bond(terms) {
+        crate::lease::read_bond_lease(batch, context.network(), input)
+            .map_err(|fault| InvalidProofReason::BondLeaseFault { fault })?
+    } else {
+        None
+    };
+    // A lease whose payment edge is gone insures nothing. The
+    // channel it backed has settled, so nobody holds recourse
+    // through it, and holding the stake to the horizon would only
+    // let whoever opened that channel lock the bond for as long
+    // as it chose — at the cost of the channel's dust. The lease
+    // is created in the same change as its payment edge, so a
+    // present lease naming an absent edge always means "closed",
+    // never "not yet opened".
+    let live_lease = lease.filter(|lease| batch.edge(lease.payment_edge()).is_some());
+    // An unleased bond is the one shape whose timeout does not
+    // wait. Nobody holds recourse against it, so there is
+    // nothing for the horizon to protect — and consuming it is
+    // what makes a delayed payment open fail its live-bond
+    // check instead of leasing stake the provider has already
+    // given up on. Every other shape, this one leased by a live
+    // channel and every edge that is not a tag-4 bond at all,
+    // waits.
+    if !(is_work_bond(terms) && live_lease.is_none()) && context.block_height() < edge.timeout() {
+        return Err(InvalidProofReason::TimeoutNotReached);
+    }
+    // Shapes with no committed timeout payout do not admit this
+    // close at all, so this is unreachable through a live edge;
+    // it stays a rejection rather than a payout of the caller's
+    // choosing.
+    let Some(committed) = terms.timeout_outputs() else {
+        return Err(InvalidProofReason::PayoutMismatch);
+    };
+    if let Some(auth) = owner {
+        if !is_work_bond(terms) || !auth.is_owner() {
+            return Err(InvalidProofReason::BadSignature);
+        }
+        let hash = Tx::payload_hash(
+            context.network(),
+            input,
+            CloseKind::Timeout,
+            edge.terms(),
+            outputs,
+        );
+        if !verify_party(verifier, auth, edge.parties().maker(), hash) {
+            return Err(InvalidProofReason::BadSignature);
+        }
+    }
+    if committed.len() != outputs.len()
+        || committed.iter().zip(outputs).any(|(expected, actual)| {
+            let expected = if owner.is_some() {
+                Payout::new(expected.owner(), expected.value())
+            } else {
+                *expected
+            };
+            expected != *actual
+        })
+    {
+        return Err(InvalidProofReason::PayoutMismatch);
+    }
+    // A leased bond's timeout takes the lease with it, live or
+    // stale. The channel it insured keeps its own exits — a
+    // payment edge outlives the admission horizon — but nothing
+    // may still be reached through a bond that no longer exists.
+    Ok(lease.map_or(NO_STAGED_REGISTRY, |_| {
+        crate::lease::delete_mutations(context.network(), input).map(Some)
+    }))
+}
+
 /// Checks the close witness and returns the registry slots the close
 /// writes, if it writes any.
 ///
-/// Timeout is checked structurally because none of its rules — terms-hash
-/// binding, height guard, payout shape — need cryptography. It does read
+/// Timeout checks terms binding, height and payout shape, plus the optional
+/// bond-owner witness through the shared party verifier. It reads
 /// the staged batch for one profile: a tag-4 bond's height rule is
 /// decided by whether a lease exists. The two work-payment kinds read it
 /// too — their payout is derived from the contest record, not carried by
@@ -793,11 +889,10 @@ where
             // is not a way to pay anyone the terms did not name: that is
             // a reshape's job, and a delegate co-signing with a colluding
             // counterparty must not get a third destination out of it.
-            let owner_signed = maker.is_owner() || taker.is_owner();
-            if !outputs
-                .iter()
-                .all(|payout| parties.is_destination(*payout, owner_signed))
-            {
+            if !outputs.iter().all(|payout| {
+                parties.maker().is_destination(*payout, maker.is_owner())
+                    || parties.taker().is_destination(*payout, taker.is_owner())
+            }) {
                 return Err(InvalidProofReason::PayoutNotCommitted);
             }
             let hash = Tx::payload_hash(
@@ -815,58 +910,8 @@ where
                 Err(InvalidProofReason::BadSignature)
             }
         }
-        Proof::Timeout { terms } => {
-            if terms.hash() != edge.terms() {
-                return Err(InvalidProofReason::TermsMismatch);
-            }
-            // Only a tag-4 bond has lease state, so only a tag-4 bond
-            // pays to read it. Both slots are consulted, and anything
-            // that is not exactly a whole lease or exactly nothing is a
-            // rejection: reading a half-written record as "unleased"
-            // would open the immediate exit under a live channel's
-            // recourse.
-            let lease = if is_work_bond(terms) {
-                crate::lease::read_bond_lease(batch, context.network(), input)
-                    .map_err(|fault| InvalidProofReason::BondLeaseFault { fault })?
-            } else {
-                None
-            };
-            // A lease whose payment edge is gone insures nothing. The
-            // channel it backed has settled, so nobody holds recourse
-            // through it, and holding the stake to the horizon would only
-            // let whoever opened that channel lock the bond for as long
-            // as it chose — at the cost of the channel's dust. The lease
-            // is created in the same change as its payment edge, so a
-            // present lease naming an absent edge always means "closed",
-            // never "not yet opened".
-            let live_lease = lease.filter(|lease| batch.edge(lease.payment_edge()).is_some());
-            // An unleased bond is the one shape whose timeout does not
-            // wait. Nobody holds recourse against it, so there is
-            // nothing for the horizon to protect — and consuming it is
-            // what makes a delayed payment open fail its live-bond
-            // check instead of leasing stake the provider has already
-            // given up on. Every other shape, this one leased by a live
-            // channel and every edge that is not a tag-4 bond at all,
-            // waits.
-            if !(is_work_bond(terms) && live_lease.is_none())
-                && context.block_height() < edge.timeout()
-            {
-                return Err(InvalidProofReason::TimeoutNotReached);
-            }
-            // Shapes with no committed timeout payout do not admit this
-            // close at all, so this is unreachable through a live edge;
-            // it stays a rejection rather than a payout of the caller's
-            // choosing.
-            if terms.timeout_outputs() != Some(outputs) {
-                return Err(InvalidProofReason::PayoutMismatch);
-            }
-            // A leased bond's timeout takes the lease with it, live or
-            // stale. The channel it insured keeps its own exits — a
-            // payment edge outlives the admission horizon — but nothing
-            // may still be reached through a bond that no longer exists.
-            Ok(lease.map_or(NO_STAGED_REGISTRY, |_| {
-                crate::lease::delete_mutations(context.network(), input).map(Some)
-            }))
+        Proof::Timeout { terms, owner } => {
+            check_timeout(close, terms, owner.as_ref(), context, verifier, batch)
         }
         // Neither work-payment exit expires at the admission horizon. That
         // horizon buys admission and rent, not a refund, and a channel

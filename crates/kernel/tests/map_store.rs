@@ -22,7 +22,7 @@ use hellas_kernel::{
 use support::{
     FAKE_VERIFIER, coin_id, key, list,
     map_store::{MapStore, MapTx, map_state},
-    open_tx,
+    open,
 };
 
 const TIMEOUT: BlockHeight = BlockHeight::new(2);
@@ -57,8 +57,19 @@ fn map_store_round_trip() {
     let terms = Terms::basic(ProtocolCode::new(1), parties, TIMEOUT, outputs.clone());
     let funding_value = Funding::new(list(&[maker_coin]), list(&[taker_coin]));
     let edge = Tx::edge_id_of(&funding_value, &terms);
-    let open = open_tx(funding_value, terms.clone(), maker, taker);
-    let resolve = Tx::close(edge, Proof::timeout(terms), outputs);
+    let open = open(
+        funding_value,
+        terms.clone(),
+        (
+            hellas_kernel::PartyKeys::sole(maker),
+            hellas_kernel::Authority::Owner,
+        ),
+        (
+            hellas_kernel::PartyKeys::sole(taker),
+            hellas_kernel::Authority::Owner,
+        ),
+    );
+    let resolve = Tx::close(edge, Proof::timeout(terms, None), outputs);
 
     let mut state = map_state([
         Genesis::coin(maker_coin, maker, 10),
@@ -110,9 +121,20 @@ fn map_store_handles_long_chain() {
     for _ in 0..N {
         let funding_value = Funding::new(list(&[maker_coin]), list(&[taker_coin]));
         let edge = Tx::edge_id_of(&funding_value, &terms);
-        let open = open_tx(funding_value, terms.clone(), maker, taker);
+        let open = open(
+            funding_value,
+            terms.clone(),
+            (
+                hellas_kernel::PartyKeys::sole(maker),
+                hellas_kernel::Authority::Owner,
+            ),
+            (
+                hellas_kernel::PartyKeys::sole(taker),
+                hellas_kernel::Authority::Owner,
+            ),
+        );
         let outputs = payouts(maker, taker, 7, 8);
-        let resolve = Tx::close(edge, Proof::timeout(terms.clone()), outputs.clone());
+        let resolve = Tx::close(edge, Proof::timeout(terms.clone(), None), outputs.clone());
         // The two payout coins from this resolve become the next open's
         // funding. Compute them before consuming `resolve`.
         let resolved_outputs = Tx::close_output_ids(edge, &outputs);
@@ -273,8 +295,19 @@ fn scenario() -> (State<MapStore>, Tx, Tx, EdgeId) {
     );
     let funding = Funding::new(list(&[maker_coin]), list(&[taker_coin]));
     let edge = Tx::edge_id_of(&funding, &terms);
-    let open = open_tx(funding, terms.clone(), maker, taker);
-    let close = Tx::close(edge, Proof::timeout(terms), outputs);
+    let open = open(
+        funding,
+        terms.clone(),
+        (
+            hellas_kernel::PartyKeys::sole(maker),
+            hellas_kernel::Authority::Owner,
+        ),
+        (
+            hellas_kernel::PartyKeys::sole(taker),
+            hellas_kernel::Authority::Owner,
+        ),
+    );
+    let close = Tx::close(edge, Proof::timeout(terms, None), outputs);
     let state = map_state([
         Genesis::coin(maker_coin, maker, 10),
         Genesis::coin(taker_coin, taker, 5),
@@ -387,7 +420,18 @@ fn fold_surfaces_edge_contract_violations_without_committing() {
         .apply(
             CONTEXT,
             &FAKE_VERIFIER,
-            &open_tx(other_funding, other_terms, key(7), key(8)),
+            &open(
+                other_funding,
+                other_terms,
+                (
+                    hellas_kernel::PartyKeys::sole(key(7)),
+                    hellas_kernel::Authority::Owner,
+                ),
+                (
+                    hellas_kernel::PartyKeys::sole(key(8)),
+                    hellas_kernel::Authority::Owner,
+                ),
+            ),
         )
         .expect("decoy open accepted");
     let decoy = other.store().edge(other_edge).expect("decoy edge live");

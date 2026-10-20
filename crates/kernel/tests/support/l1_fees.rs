@@ -103,11 +103,17 @@ pub(crate) fn context(height: i64, fees: Fees) -> Context {
 
 pub(crate) fn open(shape: FundingShape) -> Tx {
     let parties = parties(shape);
-    super::open_tx(
+    super::open(
         open_funding(shape),
         terms(shape),
-        parties.maker().owner(),
-        parties.taker().owner(),
+        (
+            hellas_kernel::PartyKeys::sole(parties.maker().owner()),
+            hellas_kernel::Authority::Owner,
+        ),
+        (
+            hellas_kernel::PartyKeys::sole(parties.taker().owner()),
+            hellas_kernel::Authority::Owner,
+        ),
     )
 }
 
@@ -125,7 +131,7 @@ pub(crate) fn close(shape: FundingShape, proof: ProofKey) -> Tx {
                 parties.taker().owner(),
             )
         }
-        ProofKey::Timeout => Proof::timeout(terms(shape)),
+        ProofKey::Timeout => Proof::timeout(terms(shape), None),
     };
     Tx::close(input, proof, outputs)
 }

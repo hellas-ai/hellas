@@ -131,13 +131,7 @@ fn delegate(state: &mut State<MapStore>, coin: CoinId, to: Key) -> CoinId {
     reshape_ids(&[coin], &outputs)[0]
 }
 
-/// The witness `authority` gives for `party`, over `hash`.
-fn witness(party: PartyKeys, authority: Authority, hash: hellas_kernel::PayloadHash) -> PartyAuth {
-    PartyAuth::new(
-        authority,
-        Auth::native(Sig::placeholder(party.key(authority), hash)),
-    )
-}
+use support::witness;
 
 fn open(
     maker_coins: &[CoinId],
@@ -146,13 +140,12 @@ fn open(
     authorities: (Authority, Authority),
 ) -> Tx {
     let funding = Funding::new(party_coins(maker_coins), party_coins(taker_coins));
-    let hash = Tx::open_hash(NETWORK, &funding, terms);
     let parties = terms.parties();
-    Tx::open(
+    support::open(
         funding,
         terms.clone(),
-        witness(parties.maker(), authorities.0, hash),
-        witness(parties.taker(), authorities.1, hash),
+        (parties.maker(), authorities.0),
+        (parties.taker(), authorities.1),
     )
 }
 
@@ -769,7 +762,7 @@ impl Channel {
         hellas_kernel::work_payment_settlement(edge.values(), OMISSION_BOND).expect("settles")
     }
 
-    fn adjudicated(&self, owner_signed: bool) -> (Tx, [Payout; 2]) {
+    fn adjudicated(&self, owner_signed: [bool; 2]) -> (Tx, [Payout; 2]) {
         let record = self.pending().expect("a live contest");
         let payouts = hellas_kernel::adjudicated_payouts(
             self.settlement(),
@@ -804,7 +797,7 @@ impl Channel {
         )
     }
 
-    fn freeze_payouts(&self, earned: u64, penalty: u64, owner_signed: bool) -> [Payout; 2] {
+    fn freeze_payouts(&self, earned: u64, penalty: u64, owner_signed: [bool; 2]) -> [Payout; 2] {
         hellas_kernel::freeze_payouts(
             self.settlement(),
             self.parties(),
@@ -891,7 +884,7 @@ fn every_channel_move_takes_a_party_witness() {
     channel.apply(at(2), &start);
     let record = channel.pending().expect("contest open");
     assert_eq!(record.final_cumulative(), 5);
-    assert!(!record.owner_signed());
+    assert_eq!(record.owner_signed(), [false; 2]);
 }
 
 /// C2: a cooperative close pays exactly the committed destinations — no
@@ -944,8 +937,8 @@ fn a_mutual_close_pays_only_committed_destinations() {
     );
 }
 
-/// C3′: when an owner signs a close, every payout is issued
-/// undelegated, whatever the terms committed. The committed delegate is
+/// C3′: when an owner signs a close, its own payout is issued
+/// undelegated; the signer counterparty keeps its delegation. The committed delegate is
 /// then refused, and the signer-only close still pays it.
 #[test]
 fn an_owner_signed_mutual_close_pays_undelegated() {
@@ -981,9 +974,9 @@ fn an_owner_signed_mutual_close_pays_undelegated() {
             reason: InvalidProofReason::PayoutNotCommitted,
         },
     );
-    let stripped = [O_VIA_N.payout(60, true), taker.payout(40, true)];
+    let stripped = [O_VIA_N.payout(60, true), taker.payout(40, false)];
     assert_eq!(stripped[0], Payout::new(O, 60));
-    assert_eq!(stripped[1], Payout::new(P, 40));
+    assert_eq!(stripped[1], Payout::delegated(P, Some(PN), 40));
     apply(&mut state, at(2), &close(&stripped, owner));
     let ids = Tx::close_output_ids(edge, &payouts(&stripped));
     assert_eq!(
@@ -992,7 +985,7 @@ fn an_owner_signed_mutual_close_pays_undelegated() {
     );
     assert_eq!(
         state.store().coin(ids.as_slice()[1]),
-        Some(Coin::issue(P, None, 40))
+        Some(Coin::issue(P, Some(PN), 40))
     );
 }
 
@@ -1005,8 +998,15 @@ fn an_owner_started_contest_pays_undelegated_by_either_exit() {
     // Adjudicated.
     let mut channel = Channel::open(O_VIA_N, P_VIA_PN);
     channel.apply(at(2), &channel.start(Party::Maker, Authority::Owner, None));
-    assert!(channel.pending().expect("contest").owner_signed());
-    let (delegated, _) = channel.adjudicated(false);
+    assert!(
+        channel
+            .pending()
+            .expect("contest")
+            .owner_signed()
+            .into_iter()
+            .any(|signed| signed)
+    );
+    let (delegated, _) = channel.adjudicated([false; 2]);
     channel.refuse(
         after_window(),
         &delegated,
@@ -1015,7 +1015,7 @@ fn an_owner_started_contest_pays_undelegated_by_either_exit() {
             reason: InvalidProofReason::PayoutMismatch,
         },
     );
-    let (close, payouts) = channel.adjudicated(true);
+    let (close, payouts) = channel.adjudicated([true, false]);
     channel.apply(after_window(), &close);
     let [provider, client] = channel.issued(&payouts);
     assert_eq!(client.map(Coin::delegate), Some(None));
@@ -1026,7 +1026,7 @@ fn an_owner_started_contest_pays_undelegated_by_either_exit() {
     let mut channel = Channel::open(O_VIA_N, P_VIA_PN);
     channel.apply(at(2), &channel.start(Party::Maker, Authority::Owner, None));
     let signers = (Authority::Signer, Authority::Signer);
-    let delegated = channel.freeze_payouts(0, 0, false);
+    let delegated = channel.freeze_payouts(0, 0, [false; 2]);
     channel.refuse(
         at(2),
         &channel.freeze(0, signers, &delegated),
@@ -1035,7 +1035,7 @@ fn an_owner_started_contest_pays_undelegated_by_either_exit() {
             reason: InvalidProofReason::PayoutMismatch,
         },
     );
-    let stripped = channel.freeze_payouts(0, 0, true);
+    let stripped = channel.freeze_payouts(0, 0, [true, false]);
     channel.apply(at(2), &channel.freeze(0, signers, &stripped));
     let [_, client] = channel.issued(&stripped);
     assert_eq!(client, Some(Coin::issue(O, None, client.unwrap().value())));
@@ -1048,15 +1048,15 @@ fn an_owner_started_contest_pays_undelegated_by_either_exit() {
 fn a_delegate_run_contest_pays_the_committed_delegate() {
     let mut channel = Channel::open(O_VIA_N, P_VIA_PN);
     channel.apply(at(2), &channel.start(Party::Maker, Authority::Signer, None));
-    let (close, payouts) = channel.adjudicated(false);
+    let (close, payouts) = channel.adjudicated([false; 2]);
     channel.apply(after_window(), &close);
     let [_, client] = channel.issued(&payouts);
     assert_eq!(client.map(Coin::delegate), Some(Some(N)));
 
     // An owner-signed freeze, no contest.
     let mut channel = Channel::open(O_VIA_N, P_VIA_PN);
-    let stripped = channel.freeze_payouts(3, 0, true);
-    let delegated = channel.freeze_payouts(3, 0, false);
+    let stripped = channel.freeze_payouts(3, 0, [true, false]);
+    let delegated = channel.freeze_payouts(3, 0, [false; 2]);
     channel.refuse(
         at(2),
         &channel.freeze(3, (Authority::Owner, Authority::Signer), &delegated),
@@ -1074,7 +1074,14 @@ fn a_delegate_run_contest_pays_the_committed_delegate() {
     let mut channel = Channel::open(O_VIA_N, P_VIA_PN);
     channel.apply(at(2), &channel.start(Party::Maker, Authority::Signer, None));
     channel.apply(at(3), &channel.respond(4, Authority::Owner));
-    assert!(channel.pending().expect("contest").owner_signed());
+    assert!(
+        channel
+            .pending()
+            .expect("contest")
+            .owner_signed()
+            .into_iter()
+            .any(|signed| signed)
+    );
 }
 
 /// C5: the omission penalty is keyed to the role, not the key. A client
@@ -1145,7 +1152,7 @@ fn a_bond_whose_payment_edge_is_gone_times_out_at_once() {
 
     // O, the payment's provider, starts and adjudicates with its own key.
     channel.apply(at(2), &channel.start(Party::Taker, Authority::Owner, None));
-    let (close, _) = channel.adjudicated(true);
+    let (close, _) = channel.adjudicated([false, true]);
     channel.apply(after_window(), &close);
     assert_eq!(channel.state.store().edge(payment_edge), None);
     let lease_slots = bond_lease_slots(NETWORK, bond_edge);
@@ -1170,8 +1177,8 @@ fn a_bond_whose_payment_edge_is_gone_times_out_at_once() {
             .state
             .store()
             .coin(ids.as_slice()[0])
-            .map(Coin::owner),
-        Some(O),
+            .map(|coin| (coin.owner(), coin.delegate())),
+        Some((O, Some(N))),
     );
 }
 
@@ -1201,81 +1208,313 @@ fn a_start_id_names_the_signed_start() {
 /// including attempts to relabel the node's signature as the owner's.
 #[cfg(all(feature = "webauthn", feature = "secp256k1"))]
 #[test]
-fn passkey_owner_delegates_to_a_native_node_and_reclaims_its_coin() {
+#[allow(
+    clippy::too_many_lines,
+    reason = "One real-crypto lifecycle runs unchanged for both owner curves"
+)]
+fn both_owner_curves_delegate_and_reclaim_through_the_same_auth_path() {
     use hellas_kernel::{Secp256k1Signer, Secp256k1Verifier, SoftPasskey};
-    let owner = SoftPasskey::from_secret_scalar([71; 32]).unwrap();
-    let node = Secp256k1Signer::from_secret_scalar([72; 32]).unwrap();
-    let taker = Secp256k1Signer::from_secret_scalar([73; 32]).unwrap();
-    let mut state = map_state([Genesis::coin(O_COIN, owner.party_key(), VALUE)]);
-    let input = inputs(&[O_COIN]);
-    let output = payouts(&[Payout::delegated(
-        owner.party_key(),
-        Some(node.party_key()),
-        VALUE,
-    )]);
-    let hash = Reshape::payload_hash(NETWORK, &input, &output);
-    let delegated = Reshape::output_ids(NETWORK, &input, &output).as_slice()[0];
-    let tx = Tx::Owner(Reshape::new(
-        input,
-        output,
-        Auth::webauthn(owner.sign(hash).unwrap()),
-    ));
-    state.apply(at(1), &Secp256k1Verifier, &tx).unwrap();
-    assert!(
-        state.apply(at(1), &Secp256k1Verifier, &tx).is_err(),
-        "signed reshape cannot replay"
-    );
+    for passkey in [false, true] {
+        let native = Secp256k1Signer::from_secret_scalar([71; 32]).unwrap();
+        let passkey_key = SoftPasskey::from_secret_scalar([71; 32]).unwrap();
+        let owner_key = if passkey {
+            passkey_key.party_key()
+        } else {
+            native.party_key()
+        };
+        let authorize = |hash| {
+            if passkey {
+                Auth::webauthn(passkey_key.sign(hash).unwrap())
+            } else {
+                Auth::native(native.sign(hash))
+            }
+        };
+        let node = Secp256k1Signer::from_secret_scalar([72; 32]).unwrap();
+        let taker = Secp256k1Signer::from_secret_scalar([73; 32]).unwrap();
+        let mut state = map_state([
+            Genesis::coin(O_COIN, owner_key, VALUE),
+            Genesis::coin(K_COIN, taker.party_key(), VALUE),
+        ]);
+        let input = inputs(&[O_COIN]);
+        let output = payouts(&[Payout::delegated(owner_key, Some(node.party_key()), VALUE)]);
+        let hash = Reshape::payload_hash(NETWORK, &input, &output);
+        let delegated = Reshape::output_ids(NETWORK, &input, &output).as_slice()[0];
+        let tx = Tx::Owner(Reshape::new(input, output, authorize(hash)));
+        state.apply(at(1), &Secp256k1Verifier, &tx).unwrap();
+        assert!(
+            state.apply(at(1), &Secp256k1Verifier, &tx).is_err(),
+            "signed reshape cannot replay"
+        );
 
-    let maker = PartyKeys::new(owner.party_key(), node.party_key(), Some(node.party_key()));
-    let terms =
-        Terms::work_stake_bond(bond_terms(maker, PartyKeys::sole(taker.party_key()), VALUE));
-    let funding = Funding::new(party_coins(&[delegated]), party_coins(&[]));
-    let hash = Tx::open_hash(NETWORK, &funding, &terms);
-    let edge = Tx::edge_id_of(&funding, &terms);
-    let tx = Tx::open(
-        funding.clone(),
-        terms.clone(),
-        PartyAuth::owner(node.sign(hash)),
-        PartyAuth::owner(taker.sign(hash)),
-    );
-    assert!(
-        state.apply(at(1), &Secp256k1Verifier, &tx).is_err(),
-        "node cannot act as owner"
-    );
-    let tx = Tx::open(
-        funding,
-        terms.clone(),
-        PartyAuth::signer(node.sign(hash)),
-        PartyAuth::owner(taker.sign(hash)),
-    );
-    state.apply(at(1), &Secp256k1Verifier, &tx).unwrap();
-    let output = terms.timeout_outputs().unwrap().clone();
-    let returned = Tx::close_output_ids(edge, &output).as_slice()[0];
-    state
-        .apply(
+        let maker = PartyKeys::new(owner_key, node.party_key(), Some(node.party_key()));
+        let terms =
+            Terms::work_stake_bond(bond_terms(maker, PartyKeys::sole(taker.party_key()), VALUE));
+        let funding = Funding::new(party_coins(&[delegated]), party_coins(&[]));
+        let hash = Tx::open_hash(NETWORK, &funding, &terms);
+        let edge = Tx::edge_id_of(&funding, &terms);
+        let tx = Tx::open(
+            funding.clone(),
+            terms.clone(),
+            PartyAuth::owner(node.sign(hash)),
+            PartyAuth::owner(taker.sign(hash)),
+        );
+        assert!(
+            state.apply(at(1), &Secp256k1Verifier, &tx).is_err(),
+            "node cannot act as owner"
+        );
+        let tx = Tx::open(
+            funding,
+            terms.clone(),
+            PartyAuth::signer(node.sign(hash)),
+            PartyAuth::owner(taker.sign(hash)),
+        );
+        state.apply(at(1), &Secp256k1Verifier, &tx).unwrap();
+        let output = payouts(&[Payout::new(owner_key, VALUE)]);
+        let timeout_hash =
+            Tx::payload_hash(NETWORK, edge, CloseKind::Timeout, terms.hash(), &output);
+        let returned = Tx::close_output_ids(edge, &output).as_slice()[0];
+        state
+            .apply(
+                at(1),
+                &Secp256k1Verifier,
+                &Tx::close(
+                    edge,
+                    Proof::Timeout {
+                        terms,
+                        owner: Some(PartyAuth::owner(authorize(timeout_hash))),
+                    },
+                    output,
+                ),
+            )
+            .unwrap();
+        let input = inputs(&[returned]);
+        let output = payouts(&[Payout::new(owner_key, VALUE)]);
+        let hash = Reshape::payload_hash(NETWORK, &input, &output);
+        let reclaimed = Reshape::output_ids(NETWORK, &input, &output).as_slice()[0];
+        let forged = Tx::Owner(Reshape::new(
+            input.clone(),
+            output.clone(),
+            Auth::native(node.sign(hash)),
+        ));
+        assert!(state.apply(at(1), &Secp256k1Verifier, &forged).is_err());
+        let tx = Tx::Owner(Reshape::new(input, output, authorize(hash)));
+        state.apply(at(1), &Secp256k1Verifier, &tx).unwrap();
+        assert_eq!(
+            state.store().coin(reclaimed),
+            Some(Coin::issue(owner_key, None, VALUE))
+        );
+
+        // The same owner authorization opens and mutually closes Basic terms.
+        let other = PartyKeys::sole(taker.party_key());
+        let terms = basic(maker, other, &[maker.payout(VALUE, false)]);
+        let funding = Funding::new(party_coins(&[reclaimed]), party_coins(&[]));
+        let hash = Tx::open_hash(NETWORK, &funding, &terms);
+        let edge = Tx::edge_id_of(&funding, &terms);
+        state
+            .apply(
+                at(1),
+                &Secp256k1Verifier,
+                &Tx::open(
+                    funding,
+                    terms.clone(),
+                    PartyAuth::owner(authorize(hash)),
+                    PartyAuth::owner(taker.sign(hash)),
+                ),
+            )
+            .unwrap();
+        let outputs = payouts(&[Payout::new(owner_key, VALUE)]);
+        let hash = Tx::payload_hash(NETWORK, edge, CloseKind::Mutual, terms.hash(), &outputs);
+        let recovered_coin = Tx::close_output_ids(edge, &outputs).as_slice()[0];
+        state
+            .apply(
+                at(1),
+                &Secp256k1Verifier,
+                &Tx::close(
+                    edge,
+                    Proof::mutual(
+                        PartyAuth::owner(authorize(hash)),
+                        PartyAuth::owner(taker.sign(hash)),
+                    ),
+                    outputs,
+                ),
+            )
+            .unwrap();
+
+        // A payment contest uses that same Auth path, independently of curve.
+        let body = bond_terms(maker, other, VALUE);
+        let bond = Terms::work_stake_bond(body.clone());
+        let funding = Funding::new(party_coins(&[recovered_coin]), party_coins(&[]));
+        let bond_edge = Tx::edge_id_of(&funding, &bond);
+        let hash = Tx::open_hash(NETWORK, &funding, &bond);
+        state
+            .apply(
+                at(1),
+                &Secp256k1Verifier,
+                &Tx::open(
+                    funding,
+                    bond,
+                    PartyAuth::owner(authorize(hash)),
+                    PartyAuth::owner(taker.sign(hash)),
+                ),
+            )
+            .unwrap();
+        let payment = payment_terms(bond_edge, body);
+        let funding = Funding::new(party_coins(&[K_COIN]), party_coins(&[]));
+        let edge = Tx::edge_id_of(&funding, &payment);
+        let hash = Tx::open_hash(NETWORK, &funding, &payment);
+        state
+            .apply(
+                at(1),
+                &Secp256k1Verifier,
+                &Tx::open(
+                    funding,
+                    payment.clone(),
+                    PartyAuth::owner(taker.sign(hash)),
+                    PartyAuth::signer(node.sign(hash)),
+                ),
+            )
+            .unwrap();
+        let hash = start_digest(
+            NETWORK,
+            edge,
+            payment.hash(),
+            Party::Taker,
+            (2, 2),
+            no_earned_digest(edge, payment.hash()),
+        );
+        let start = Tx::move_action(Move::StartPaymentClose(PaymentCloseStart::new(
+            edge,
+            payment.clone(),
+            Party::Taker,
+            (2, 2),
+            None,
+            PartyAuth::owner(authorize(hash)),
+        )));
+        state.apply(at(2), &Secp256k1Verifier, &start).unwrap();
+        let mut channel = Channel {
+            state,
+            payment,
+            edge,
+        };
+        assert_eq!(channel.pending().unwrap().owner_signed(), [false, true]);
+        let (close, outputs) = channel.adjudicated([false, true]);
+        channel
+            .state
+            .apply(after_window(), &Secp256k1Verifier, &close)
+            .unwrap();
+        assert_eq!(channel.issued(&outputs)[0].unwrap().delegate(), None);
+    }
+}
+
+#[test]
+fn recovery_flags_follow_each_party_through_freeze_and_contest() {
+    for maker_owner in [false, true] {
+        for taker_owner in [false, true] {
+            let flags = [maker_owner, taker_owner];
+            let roles = (
+                if maker_owner {
+                    Authority::Owner
+                } else {
+                    Authority::Signer
+                },
+                if taker_owner {
+                    Authority::Owner
+                } else {
+                    Authority::Signer
+                },
+            );
+            let provider = PartyKeys::new(P, PN, Some(PN));
+            let mut channel = Channel::open(O_VIA_N, provider);
+            let outputs = channel.freeze_payouts(3, 0, flags);
+            channel.apply(at(2), &channel.freeze(3, roles, &outputs));
+            let [provider_coin, client_coin] = channel.issued(&outputs);
+            assert_eq!(
+                provider_coin.unwrap().delegate(),
+                (!taker_owner).then_some(PN)
+            );
+            assert_eq!(client_coin.unwrap().delegate(), (!maker_owner).then_some(N));
+
+            let mut channel = Channel::open(O_VIA_N, provider);
+            channel.apply(at(2), &channel.start(Party::Maker, roles.0, None));
+            channel.apply(at(3), &channel.respond(4, roles.1));
+            assert_eq!(channel.pending().unwrap().owner_signed(), flags);
+            let (close, outputs) = channel.adjudicated(flags);
+            channel.apply(after_window(), &close);
+            let [provider_coin, client_coin] = channel.issued(&outputs);
+            assert_eq!(
+                provider_coin.unwrap().delegate(),
+                (!taker_owner).then_some(PN)
+            );
+            assert_eq!(client_coin.unwrap().delegate(), (!maker_owner).then_some(N));
+        }
+    }
+}
+
+#[test]
+fn reshape_rejects_zero_outputs_and_delegating_a_transfer() {
+    for (outputs, reason) in [
+        (
+            vec![Payout::new(O, VALUE), Payout::new(O, 0)],
+            InvalidReshapeReason::ZeroOutput,
+        ),
+        (
+            vec![Payout::delegated(P, Some(N), VALUE)],
+            InvalidReshapeReason::ForeignDelegation,
+        ),
+    ] {
+        let mut state = genesis();
+        refuse(
+            &mut state,
             at(1),
-            &Secp256k1Verifier,
-            &Tx::close(edge, Proof::Timeout { terms }, output),
-        )
-        .unwrap();
-    let input = inputs(&[returned]);
-    let output = payouts(&[Payout::new(owner.party_key(), VALUE)]);
-    let hash = Reshape::payload_hash(NETWORK, &input, &output);
-    let reclaimed = Reshape::output_ids(NETWORK, &input, &output).as_slice()[0];
-    let forged = Tx::Owner(Reshape::new(
-        input.clone(),
-        output.clone(),
-        Auth::native(node.sign(hash)),
-    ));
-    assert!(state.apply(at(1), &Secp256k1Verifier, &forged).is_err());
-    let tx = Tx::Owner(Reshape::new(
-        input,
-        output,
-        Auth::webauthn(owner.sign(hash).unwrap()),
-    ));
-    state.apply(at(1), &Secp256k1Verifier, &tx).unwrap();
-    assert_eq!(
-        state.store().coin(reclaimed),
-        Some(Coin::issue(owner.party_key(), None, VALUE))
+            &reshape(&[O_COIN], &outputs, O),
+            ApplyError::InvalidReshape { reason },
+        );
+    }
+    let mut state = genesis();
+    apply(
+        &mut state,
+        at(1),
+        &reshape(&[O_COIN], &[Payout::new(P, VALUE)], O),
     );
+}
+
+#[test]
+fn bond_owner_timeout_refuses_signer_and_foreign_witnesses() {
+    let mut state = genesis();
+    let coin = delegate(&mut state, O_COIN, N);
+    let terms = Terms::work_stake_bond(bond_terms(O_VIA_N, PartyKeys::sole(K), VALUE));
+    apply(
+        &mut state,
+        at(1),
+        &open(&[coin], &[], &terms, (Authority::Signer, Authority::Owner)),
+    );
+    let edge = edge_of(&[coin], &[], &terms);
+    let outputs = payouts(&[Payout::new(O, VALUE)]);
+    let hash = Tx::payload_hash(NETWORK, edge, CloseKind::Timeout, terms.hash(), &outputs);
+    for auth in [
+        witness(O_VIA_N, Authority::Signer, hash),
+        witness(PartyKeys::sole(K), Authority::Owner, hash),
+    ] {
+        refuse(
+            &mut state,
+            at(1),
+            &Tx::close(
+                edge,
+                Proof::timeout(terms.clone(), Some(auth)),
+                outputs.clone(),
+            ),
+            ApplyError::InvalidProof {
+                input: edge,
+                reason: InvalidProofReason::BadSignature,
+            },
+        );
+    }
+    let close = Tx::close(
+        edge,
+        Proof::timeout(terms, Some(witness(O_VIA_N, Authority::Owner, hash))),
+        outputs.clone(),
+    );
+    apply(&mut state, at(1), &close);
+    let coin = Tx::close_output_ids(edge, &outputs).as_slice()[0];
+    assert_eq!(state.store().coin(coin), Some(Coin::issue(O, None, VALUE)));
 }

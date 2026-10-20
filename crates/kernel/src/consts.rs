@@ -257,7 +257,7 @@ pub(crate) const WORK_RESPOND_PAYMENT_CLOSE: &[u8] = b"hellas.work.respond-payme
 /// id, payment edge, payment terms hash, and the complete pending record
 /// the contest ended in.
 pub(crate) const WORK_ADJUDICATED_PAYMENT_CLOSE: &[u8] =
-    b"hellas.work.adjudicated-payment-close.v3";
+    b"hellas.work.adjudicated-payment-close.v4";
 
 /// Prefix for the cooperative freeze digest both parties sign. Inputs:
 /// network id, payment edge, payment terms hash, settlement commitment,

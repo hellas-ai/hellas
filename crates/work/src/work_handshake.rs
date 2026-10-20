@@ -57,7 +57,7 @@
 //!
 //! # Who may sign what
 //!
-//! Not decided here either. `WorkChannelSetupBundleV1::check` reads the
+//! Not decided here either. `WorkChannelSetupBundleV2::check` reads the
 //! signing party out of `bond_terms.parties` — maker is the provider,
 //! taker is the client — so a client that tried to propose a bond, or a
 //! provider that tried to propose a payment, fails its own journal's
@@ -95,12 +95,12 @@ use std::sync::Arc;
 use crate::endpoint_lock::{EndpointGuard, EndpointLock};
 
 use hellas_kernel::{
-    Auth, EdgeId, Funding, NetworkId, Secp256k1Signer, Secp256k1Verifier, Terms, Tx,
-    WorkPaymentTerms, WorkStakeBondTerms,
+    EdgeId, Funding, NetworkId, Secp256k1Signer, Secp256k1Verifier, Terms, Tx, WorkPaymentTerms,
+    WorkStakeBondTerms,
 };
 use hellas_wire::{StreamTransport, TransportContext, WireStatus};
 
-use crate::model::bundle::WorkChannelSetupBundleV1;
+use crate::model::bundle::WorkChannelSetupBundleV2;
 use crate::model::setup::{CloseDescriptor, ProviderChannelPolicy, WorkChannelDescriptor};
 use crate::work::{Refusal, WorkRefusal};
 use crate::work_close::{FinalizedBlocks, TxSink};
@@ -267,7 +267,7 @@ impl SetupEndpoint {
         bond_terms: WorkStakeBondTerms,
     ) -> Result<&SetupState, SetupExchangeError> {
         // The kernel's own open hash, which is the same function
-        // `WorkChannelSetupBundleV1::bond_open_hash` calls. It is
+        // `WorkChannelSetupBundleV2::bond_open_hash` calls. It is
         // reached directly here only because the bundle that would
         // expose it is the thing this signature is being made to build.
         let hash = Tx::open_hash(
@@ -275,9 +275,9 @@ impl SetupEndpoint {
             &bond_funding,
             &Terms::work_stake_bond(bond_terms.clone()),
         );
-        let auth = Auth::native(self.signer.sign(hash));
+        let auth = hellas_kernel::PartyAuth::signer(self.signer.sign(hash));
         let bundle =
-            WorkChannelSetupBundleV1::propose_bond(network, bond_funding, bond_terms, auth)
+            WorkChannelSetupBundleV2::propose_bond(network, bond_funding, bond_terms, auth)
                 .map_err(|error| WorkStoreError::Setup(SetupStateError::Bundle(error)))?;
         self.commit(&bundle).await
     }
@@ -321,13 +321,13 @@ impl SetupEndpoint {
             &payment_funding,
             &Terms::work_payment(payment_terms.clone()),
         );
-        let bond_auth = Auth::native(self.signer.sign(held.bond_open_hash()));
+        let bond_auth = hellas_kernel::PartyAuth::signer(self.signer.sign(held.bond_open_hash()));
         let bundle = held
             .countersign_bond_and_propose_payment(
                 bond_auth,
                 payment_funding,
                 payment_terms,
-                Auth::native(self.signer.sign(payment_hash)),
+                hellas_kernel::PartyAuth::signer(self.signer.sign(payment_hash)),
             )
             .map_err(|error| WorkStoreError::Setup(SetupStateError::Bundle(error)))?;
         self.commit_armed(&bundle, descriptor).await
@@ -405,7 +405,7 @@ impl SetupEndpoint {
             // and the filter above is that stage. Mapped so the match
             // is total; no test reaches it, and none claims to.
             let next = bundle
-                .countersign_payment(Auth::native(self.signer.sign(hash)))
+                .countersign_payment(hellas_kernel::PartyAuth::signer(self.signer.sign(hash)))
                 .map_err(|error| Refusal::new(WorkRefusal::Invalid, error.to_string()))?;
             self.commit_armed(&next, descriptor.close_descriptor())
                 .await
@@ -473,7 +473,7 @@ impl SetupEndpoint {
     /// endpoint made has no earlier bytes to be faithful to.
     async fn commit(
         &mut self,
-        bundle: &WorkChannelSetupBundleV1,
+        bundle: &WorkChannelSetupBundleV2,
     ) -> Result<&SetupState, SetupExchangeError> {
         Ok(self
             .store
@@ -490,7 +490,7 @@ impl SetupEndpoint {
     /// one fsynced record.
     async fn commit_armed(
         &mut self,
-        bundle: &WorkChannelSetupBundleV1,
+        bundle: &WorkChannelSetupBundleV2,
         close_descriptor: CloseDescriptor,
     ) -> Result<&SetupState, SetupExchangeError> {
         Ok(self

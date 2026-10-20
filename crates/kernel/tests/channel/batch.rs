@@ -46,7 +46,11 @@ fn apply_all_opens_and_closes_one_batch() {
 fn apply_all_reports_first_operation_error_index() {
     let mut state = funded_state();
     let outputs = payouts(Payout::new(MAKER, 7), Payout::new(TAKER, 8));
-    let ops = List::all([Tx::close(edge(), Proof::timeout(basic_terms()), outputs)]);
+    let ops = List::all([Tx::close(
+        edge(),
+        Proof::timeout(basic_terms(), None),
+        outputs,
+    )]);
 
     let Err(error) = state.apply_all(CONTEXT, &FAKE_VERIFIER, &ops) else {
         panic!("invalid first operation accepted");
@@ -78,7 +82,7 @@ fn apply_all_rolls_back_on_error() {
     let store = *state.store();
     let ops = List::all([
         open,
-        Tx::close(edge(), Proof::timeout(basic_terms()), outputs),
+        Tx::close(edge(), Proof::timeout(basic_terms(), None), outputs),
     ]);
 
     let Err(error) = state.apply_all(CONTEXT, &FAKE_VERIFIER, &ops) else {
@@ -162,7 +166,7 @@ fn apply_iter_rolls_back_on_mid_batch_failure() {
     let store_before = *state.store();
     let ops = [
         open,
-        Tx::close(edge_id, Proof::timeout(basic_terms()), outputs),
+        Tx::close(edge_id, Proof::timeout(basic_terms(), None), outputs),
     ];
 
     let mut observed = Vec::new();

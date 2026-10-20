@@ -1866,7 +1866,7 @@ fn the_record_codec_is_exact_and_ordered() {
         hellas_kernel::Party::Taker,
         (11, 18),
         None,
-        PartyAuth::owner(provider().sign(payload(job.work_id))),
+        PartyAuth::signer(provider().sign(payload(job.work_id))),
     );
     let prepared = ChannelRecord::ClosePrepared {
         start: Box::new(start.clone()),
@@ -2852,9 +2852,9 @@ async fn closed_store(root: &std::path::Path) -> ChannelStore {
         (RECEIPT_HEIGHT + 1, RECEIPT_HEIGHT + 8),
         Some((
             job.certificate,
-            PartyAuth::owner(client().sign(job.certificate.digest(channel.network()))),
+            PartyAuth::signer(client().sign(job.certificate.digest(channel.network()))),
         )),
-        PartyAuth::owner(provider().sign(payload(job.work_id))),
+        PartyAuth::signer(provider().sign(payload(job.work_id))),
     );
     let start_id = hellas_kernel::StartId::from_bytes([0x7c; 32]);
     commit_all(

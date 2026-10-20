@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use hellas_kernel::{CoinId, Edge, EdgeId, LeaseSlots, NetworkId, SigVerifier, Tx};
 use hellas_xet::XetFileHasher;
 
-use crate::model::bundle::{SetupBundleError, WorkChannelSetupBundleV1};
+use crate::model::bundle::{SetupBundleError, WorkChannelSetupBundleV2};
 use crate::model::setup::{CloseDescriptor, WorkSetupError};
 use crate::work_store::journal::{
     Journal, JournalError, JournalId, JournalKind, MAX_CHECKPOINT_BYTES, Role,
@@ -347,7 +347,7 @@ pub struct SetupState {
     network: NetworkId,
     bond_edge: EdgeId,
     role: Role,
-    bundle: Option<WorkChannelSetupBundleV1>,
+    bundle: Option<WorkChannelSetupBundleV2>,
     bundle_bytes: Vec<u8>,
     scan_armed: Option<SetupScan>,
     close_descriptor: Option<CloseDescriptor>,

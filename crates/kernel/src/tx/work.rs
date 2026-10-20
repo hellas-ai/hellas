@@ -436,10 +436,12 @@ where
         }
     };
     // An owner signing the freeze, or an owner that acted on the contest
-    // it ends, is exiting the delegation: the payouts are undelegated.
-    let owner_signed = maker_auth.is_owner()
-        || taker_auth.is_owner()
-        || pending.is_some_and(|record| record.owner_signed());
+    // it ends, exits only its own delegation.
+    let previous = pending.map_or([false; 2], |record| record.owner_signed());
+    let owner_signed = [
+        maker_auth.is_owner() || previous[0],
+        taker_auth.is_owner() || previous[1],
+    ];
     check_split(edge.parties(), (total, provider), owner_signed, outputs)?;
 
     let digest =
@@ -657,7 +659,7 @@ fn check_capacity(edge: &Edge, omission_bond: u64, amount: u64) -> Result<(), In
 fn check_split(
     parties: Parties,
     amounts: (u64, u64),
-    owner_signed: bool,
+    owner_signed: [bool; 2],
     outputs: &Payouts,
 ) -> Result<(), InvalidProofReason> {
     let (total, provider_total) = amounts;

@@ -260,7 +260,7 @@ fn faulty_lease() -> LeaseSlots {
 fn live_pending() -> PendingSlot {
     let mut value = vec![FORMAT_VERSION, TAG_PAYMENT_CLOSE_PENDING];
     // body version
-    value.push(3);
+    value.push(4);
     value.extend_from_slice(&payment_edge().to_bytes());
     // opener_role: maker
     value.push(0);
@@ -271,7 +271,7 @@ fn live_pending() -> PendingSlot {
     value.push(0); // responded
     value.push(0); // penalty_due
     value.extend_from_slice(&2_u64.to_be_bytes()); // penalty_amount
-    value.push(0); // owner_signed
+    value.extend_from_slice(&[0, 0]); // maker/taker owner flags
 
     let Some(chunk) = RegistryChunk::split(
         RegistryNamespace::PaymentClose,

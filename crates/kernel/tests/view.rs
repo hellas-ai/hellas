@@ -14,7 +14,7 @@ use hellas_kernel::{
     Payout, ProtocolCode, REGISTRY_CHUNK_DATA_CAPACITY, RegistryChunkId, RegistryNamespace,
     RegistryRecordTag, Snapshot, Store, Terms, Tx, View,
 };
-use support::{FAKE_VERIFIER, FixedStore, coin_id, key, list, open_tx as open, state};
+use support::{FAKE_VERIFIER, FixedStore, coin_id, key, list, open, state};
 
 #[test]
 fn view_compacts_sparse_coins_and_sorts_by_id() {
@@ -55,8 +55,30 @@ fn view_compacts_sparse_edges_and_sorts_by_id() {
     let terms_b = terms(maker, taker, 2);
     let edge_a = Tx::edge_id_of(&funding_a, &terms_a);
     let edge_b = Tx::edge_id_of(&funding_b, &terms_b);
-    let open_a = open(funding_a, terms_a, maker, taker);
-    let open_b = open(funding_b, terms_b, maker, taker);
+    let open_a = open(
+        funding_a,
+        terms_a,
+        (
+            hellas_kernel::PartyKeys::sole(maker),
+            hellas_kernel::Authority::Owner,
+        ),
+        (
+            hellas_kernel::PartyKeys::sole(taker),
+            hellas_kernel::Authority::Owner,
+        ),
+    );
+    let open_b = open(
+        funding_b,
+        terms_b,
+        (
+            hellas_kernel::PartyKeys::sole(maker),
+            hellas_kernel::Authority::Owner,
+        ),
+        (
+            hellas_kernel::PartyKeys::sole(taker),
+            hellas_kernel::Authority::Owner,
+        ),
+    );
     let mut expected = vec![edge_a, edge_b];
     expected.sort();
     let mut state = state(

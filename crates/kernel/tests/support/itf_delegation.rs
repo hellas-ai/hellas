@@ -2,6 +2,7 @@
 #![allow(dead_code)] // The complete ITF schema includes model history variables.
 //! Concrete replay of the delegation model. Symbolic ids are bound to the
 //! actual ids emitted by each transaction; live objects are compared in full.
+use crate::support::witness;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::support::{
@@ -10,8 +11,8 @@ use crate::support::{
 };
 use hellas_kernel::{
     Auth, Authority, BlockHash, BlockHeight, CloseKind, Coin, CoinId, Context, EdgeId, EventKind,
-    Funding, Genesis, Key, List, Parties, PartyAuth, PartyKeys, Payout, Proof, ProtocolCode,
-    Reshape, Sig, State as KernelState, Terms, Tx, WorkStakeBondTerms,
+    Funding, Genesis, Key, List, Parties, PartyKeys, Payout, Proof, ProtocolCode, Reshape, Sig,
+    State as KernelState, Terms, Tx, WorkStakeBondTerms,
 };
 use itf::de::{As, Integer};
 use serde::Deserialize;
@@ -157,9 +158,6 @@ const fn authority(tag: AuthorityTag) -> Authority {
         AuthorityTag::Signer => Authority::Signer,
     }
 }
-fn witness(party: PartyKeys, role: Authority, hash: hellas_kernel::PayloadHash) -> PartyAuth {
-    PartyAuth::new(role, Auth::native(Sig::placeholder(party.key(role), hash)))
-}
 const fn output(shape: Shape) -> CoinTag {
     match shape {
         Shape::Basic => CoinTag::BasicOut,
@@ -261,6 +259,18 @@ impl itf::Runner for Runner {
                 let proof = match input.proof {
                     ProofTag::Timeout => Proof::Timeout {
                         terms: terms.clone(),
+                        owner: if *shape == Shape::Bond && input.maker_auth == AuthorityTag::Owner {
+                            let hash = Tx::payload_hash(
+                                NETWORK,
+                                *id,
+                                CloseKind::Timeout,
+                                terms.hash(),
+                                &payouts,
+                            );
+                            Some(witness(terms.parties().maker(), Authority::Owner, hash))
+                        } else {
+                            None
+                        },
                     },
                     ProofTag::Mutual => {
                         let hash = Tx::payload_hash(
@@ -270,15 +280,13 @@ impl itf::Runner for Runner {
                             terms.hash(),
                             &payouts,
                         );
-                        // The taker always closes as Signer; otherwise its Owner
-                        // witness would strip delegates even in the signer test.
                         Proof::Mutual {
                             maker: witness(
                                 terms.parties().maker(),
                                 authority(input.maker_auth),
                                 hash,
                             ),
-                            taker: witness(terms.parties().taker(), Authority::Signer, hash),
+                            taker: witness(terms.parties().taker(), Authority::Owner, hash),
                         }
                     }
                 };

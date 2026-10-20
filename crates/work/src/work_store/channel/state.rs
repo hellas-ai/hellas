@@ -1003,7 +1003,7 @@ impl Channel<PaymentFunding> {
                 start.certificate().cloned()
                     == self
                         .executable_certificate()
-                        .map(|(certificate, sig)| (certificate, PartyAuth::owner(sig))),
+                        .map(|(certificate, sig)| (certificate, PartyAuth::signer(sig))),
             ),
         ] {
             if !holds {

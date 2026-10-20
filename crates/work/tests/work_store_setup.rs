@@ -22,7 +22,7 @@ use hellas_kernel::{
 use hellas_rpc::pb::work::{ExchangeSetupRequest, exchange_setup_response::Outcome};
 use hellas_rpc::protocol::ContentId;
 use hellas_rpc::services::work_setup::WorkSetupHandler;
-use hellas_work::model::bundle::WorkChannelSetupBundleV1;
+use hellas_work::model::bundle::WorkChannelSetupBundleV2;
 use hellas_work::model::setup::ProviderChannelPolicy;
 use hellas_work::model::work::{EvaluatePolicyV2, PaidChannelPolicyV1, private_policy_commitment};
 use hellas_work::work_close::{BlockSourceError, FinalizedBlocks, FinalizedWork, TxSink};
@@ -150,24 +150,24 @@ fn provider_policy() -> ProviderChannelPolicy {
     }
 }
 
-fn proposed() -> WorkChannelSetupBundleV1 {
+fn proposed() -> WorkChannelSetupBundleV2 {
     proposed_over(bond_funding())
 }
 
-fn proposed_over(funding: Funding) -> WorkChannelSetupBundleV1 {
+fn proposed_over(funding: Funding) -> WorkChannelSetupBundleV2 {
     let hash = Tx::open_hash(network(), &funding, &Terms::work_stake_bond(bond_terms()));
-    match WorkChannelSetupBundleV1::propose_bond(
+    match WorkChannelSetupBundleV2::propose_bond(
         network(),
         funding,
         bond_terms(),
-        Auth::native(provider().sign(hash)),
+        hellas_kernel::PartyAuth::signer(Auth::native(provider().sign(hash))),
     ) {
         Ok(bundle) => bundle,
         Err(error) => panic!("the fixture bond proposes: {error}"),
     }
 }
 
-fn countersigned(bundle: WorkChannelSetupBundleV1) -> WorkChannelSetupBundleV1 {
+fn countersigned(bundle: WorkChannelSetupBundleV2) -> WorkChannelSetupBundleV2 {
     let bond_hash = bundle.bond_open_hash();
     let terms = payment_terms(bundle.bond_edge());
     let payment_hash = Tx::open_hash(
@@ -176,27 +176,29 @@ fn countersigned(bundle: WorkChannelSetupBundleV1) -> WorkChannelSetupBundleV1 {
         &Terms::work_payment(terms.clone()),
     );
     match bundle.countersign_bond_and_propose_payment(
-        Auth::native(client().sign(bond_hash)),
+        hellas_kernel::PartyAuth::signer(Auth::native(client().sign(bond_hash))),
         payment_funding(),
         terms,
-        Auth::native(client().sign(payment_hash)),
+        hellas_kernel::PartyAuth::signer(Auth::native(client().sign(payment_hash))),
     ) {
         Ok(bundle) => bundle,
         Err(error) => panic!("the fixture payment proposes: {error}"),
     }
 }
 
-fn completed(bundle: WorkChannelSetupBundleV1) -> WorkChannelSetupBundleV1 {
+fn completed(bundle: WorkChannelSetupBundleV2) -> WorkChannelSetupBundleV2 {
     let Some(hash) = bundle.payment_open_hash() else {
         panic!("a proposed payment has an open hash");
     };
-    match bundle.countersign_payment(Auth::native(provider().sign(hash))) {
+    match bundle.countersign_payment(hellas_kernel::PartyAuth::signer(Auth::native(
+        provider().sign(hash),
+    ))) {
         Ok(bundle) => bundle,
         Err(error) => panic!("the fixture payment countersigns: {error}"),
     }
 }
 
-fn bundle_record(bundle: &WorkChannelSetupBundleV1) -> SetupRecord {
+fn bundle_record(bundle: &WorkChannelSetupBundleV2) -> SetupRecord {
     SetupRecord::Bundle {
         bundle: bundle.encode(),
     }
@@ -217,7 +219,7 @@ fn scan_record() -> SetupRecord {
     }
 }
 
-fn armed_record(bundle: &WorkChannelSetupBundleV1) -> SetupRecord {
+fn armed_record(bundle: &WorkChannelSetupBundleV2) -> SetupRecord {
     let payment_edge = bundle
         .payment_edge()
         .expect("an armed revision has a payment edge");
@@ -254,7 +256,7 @@ fn same_block_contest() -> Tx {
         Party::Maker,
         (scan().height + 2, scan().height + 9),
         None,
-        PartyAuth::owner(Sig::from_bytes([0_u8; Sig::LENGTH])),
+        PartyAuth::signer(Sig::from_bytes([0_u8; Sig::LENGTH])),
     )))
 }
 
@@ -766,11 +768,11 @@ async fn an_unverified_revision_is_not_journaled() {
         &bond_funding(),
         &Terms::work_stake_bond(bond_terms()),
     );
-    let Ok(forged) = WorkChannelSetupBundleV1::propose_bond(
+    let Ok(forged) = WorkChannelSetupBundleV2::propose_bond(
         network(),
         bond_funding(),
         bond_terms(),
-        Auth::native(client().sign(hash)),
+        hellas_kernel::PartyAuth::signer(Auth::native(client().sign(hash))),
     ) else {
         panic!("the bundle assembles");
     };
@@ -3014,11 +3016,11 @@ async fn replay_checks_the_signatures_again() {
         &bond_funding(),
         &Terms::work_stake_bond(bond_terms()),
     );
-    let Ok(forged) = WorkChannelSetupBundleV1::propose_bond(
+    let Ok(forged) = WorkChannelSetupBundleV2::propose_bond(
         network(),
         bond_funding(),
         bond_terms(),
-        Auth::native(client().sign(hash)),
+        hellas_kernel::PartyAuth::signer(Auth::native(client().sign(hash))),
     ) else {
         panic!("the bundle assembles");
     };
@@ -3122,7 +3124,8 @@ async fn settled_store(root: &std::path::Path) -> SetupStore {
     let Some(outputs) = bond.timeout_outputs().cloned() else {
         panic!("a bond commits its timeout payout");
     };
-    let close_of = |edge: EdgeId| Tx::close(edge, Proof::timeout(bond.clone()), outputs.clone());
+    let close_of =
+        |edge: EdgeId| Tx::close(edge, Proof::timeout(bond.clone(), None), outputs.clone());
     let blocks = vec![
         FinalizedWork {
             height: scan().height + 1,

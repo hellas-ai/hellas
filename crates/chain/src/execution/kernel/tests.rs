@@ -931,7 +931,7 @@ fn a_work_payment_channel_settles_end_to_end_through_consensus() {
         .expect("one stake payout");
     let bond_timeout = KernelTx::close(
         bond_edge,
-        Proof::timeout(KernelTerms::work_stake_bond(bond_for_timeout)),
+        Proof::timeout(KernelTerms::work_stake_bond(bond_for_timeout), None),
         stake_return,
     );
 
@@ -1419,7 +1419,7 @@ fn an_endpoint_built_close_settles_on_a_real_chain() {
             panic!("an adjudicated close is a close");
         };
         let Ok(expected_payouts) =
-            adjudicated_payouts(settlement, payment.parties(), EARNED, false, false)
+            adjudicated_payouts(settlement, payment.parties(), EARNED, false, [false; 2])
         else {
             panic!("the settled amount fits the route");
         };
@@ -1637,7 +1637,7 @@ fn an_endpoint_built_response_forfeits_the_understaters_bond() {
             panic!("an adjudicated close is a close");
         };
         let Ok(expected_payouts) =
-            adjudicated_payouts(settlement, payment.parties(), EARNED, true, false)
+            adjudicated_payouts(settlement, payment.parties(), EARNED, true, [false; 2])
         else {
             panic!("the settled amount fits the route");
         };

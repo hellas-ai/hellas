@@ -1,7 +1,7 @@
 //! A provider enrollment bound to its signed stake-bond proposal.
 use crate::model::grant::records::check_grant_provider;
 use crate::model::{
-    bundle::WorkChannelSetupBundleV1,
+    bundle::WorkChannelSetupBundleV2,
     grant::records::{MAX_OFFER_BYTES, provider_bytes},
     work::xfh,
 };
@@ -31,7 +31,7 @@ pub struct PaidOffer {
     #[serde(with = "provider_bytes")]
     pub provider: ProviderEnrollmentBundle,
     #[serde(with = "setup_bytes")]
-    pub proposal: WorkChannelSetupBundleV1,
+    pub proposal: WorkChannelSetupBundleV2,
     pub addresses: Vec<String>,
 }
 
@@ -130,13 +130,13 @@ impl SignedPaidOffer {
 
 mod setup_bytes {
     use super::*;
-    pub fn serialize<S: Serializer>(p: &WorkChannelSetupBundleV1, s: S) -> Result<S::Ok, S::Error> {
+    pub fn serialize<S: Serializer>(p: &WorkChannelSetupBundleV2, s: S) -> Result<S::Ok, S::Error> {
         s.serialize_bytes(&p.encode())
     }
     pub fn deserialize<'de, D: Deserializer<'de>>(
         d: D,
-    ) -> Result<WorkChannelSetupBundleV1, D::Error> {
-        WorkChannelSetupBundleV1::decode(&serde_bytes::ByteBuf::deserialize(d)?)
+    ) -> Result<WorkChannelSetupBundleV2, D::Error> {
+        WorkChannelSetupBundleV2::decode(&serde_bytes::ByteBuf::deserialize(d)?)
             .map_err(D::Error::custom)
     }
 }

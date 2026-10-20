@@ -478,6 +478,10 @@ pub enum InvalidProofReason {
 /// Specific reason [`ApplyError::InvalidReshape`] refused a reshape.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 pub enum InvalidReshapeReason {
+    /// Reshape outputs must carry positive value.
+    ZeroOutput,
+    /// A transfer to another owner cannot choose that owner's delegate.
+    ForeignDelegation,
     /// The reshape consumes no coin, so there is no owner to authorize it.
     NoInputs,
     /// The inputs are not all owned by one key.

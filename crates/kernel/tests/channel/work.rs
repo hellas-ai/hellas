@@ -94,7 +94,18 @@ fn payment_bond_edge() -> EdgeId {
 /// Authorized by the mirrored pair: this bond's maker is the payment
 /// channel's taker, so the provider signs the maker side of it.
 fn payment_bond_open() -> Tx {
-    open_tx_with(payment_bond_funding(), payment_bond_terms(), TAKER, MAKER)
+    open_tx_with(
+        payment_bond_funding(),
+        payment_bond_terms(),
+        (
+            hellas_kernel::PartyKeys::sole(TAKER),
+            hellas_kernel::Authority::Owner,
+        ),
+        (
+            hellas_kernel::PartyKeys::sole(MAKER),
+            hellas_kernel::Authority::Owner,
+        ),
+    )
 }
 
 /// The one payout an unleased or expired bond returns to its provider.
@@ -112,7 +123,7 @@ fn bond_timeout_out() -> CoinId {
 fn bond_timeout_tx() -> Tx {
     Tx::close(
         payment_bond_edge(),
-        Proof::timeout(payment_bond_terms()),
+        Proof::timeout(payment_bond_terms(), None),
         bond_timeout_outputs(),
     )
 }
@@ -2047,15 +2058,15 @@ fn corrupted_record_bytes(
         panic!("a contest is live");
     };
     let mut bytes = [0_u8; hellas_kernel::REGISTRY_CHUNK_DATA_CAPACITY + 1];
-    bytes[..103].copy_from_slice(chunk.data());
+    bytes[..PendingPaymentClose::ENCODED_SIZE].copy_from_slice(chunk.data());
     match corruption {
         Corruption::Byte(offset) => {
             bytes[offset] ^= 0xff;
-            list(&bytes[..103])
+            list(&bytes[..PendingPaymentClose::ENCODED_SIZE])
         }
         // 121 bytes is one past a chunk's data capacity.
         Corruption::Longer => list(&bytes[..]),
-        Corruption::Shorter => list(&bytes[..102]),
+        Corruption::Shorter => list(&bytes[..PendingPaymentClose::ENCODED_SIZE - 1]),
     }
 }
 
@@ -2217,7 +2228,18 @@ fn a_work_bond_prices_its_lease_reading_timeout_under_nonzero_fees() {
     });
     let funding = Funding::new(list(&[FEE_COIN]), empty_party());
     let edge = Tx::edge_id_of(&funding, &terms);
-    let open = open_tx_with(funding, terms.clone(), TAKER, MAKER);
+    let open = open_tx_with(
+        funding,
+        terms.clone(),
+        (
+            hellas_kernel::PartyKeys::sole(TAKER),
+            hellas_kernel::Authority::Owner,
+        ),
+        (
+            hellas_kernel::PartyKeys::sole(MAKER),
+            hellas_kernel::Authority::Owner,
+        ),
+    );
 
     let store = FixedStore::empty_with_registry(
         [FEE_COIN, nth(&Tx::close_output_ids(edge, &outputs), 0)],
@@ -2238,7 +2260,7 @@ fn a_work_bond_prices_its_lease_reading_timeout_under_nonzero_fees() {
     let _event = apply_with(
         &mut state,
         RESOURCE_CONTEXT,
-        &Tx::close(edge, Proof::timeout(terms), outputs),
+        &Tx::close(edge, Proof::timeout(terms, None), outputs),
     );
     assert_eq!(
         state
@@ -2279,7 +2301,7 @@ fn work_open_and_bond_timeout_costs_are_the_assigned_vectors() {
     assert_eq!(
         Tx::close(
             edge,
-            Proof::timeout(generic),
+            Proof::timeout(generic, None),
             list(&[Payout::new(MAKER, STAKE)]),
         )
         .cost(),
@@ -2595,7 +2617,18 @@ fn a_payment_open_needs_the_bond_whose_terms_it_embeds() {
     let mut state = state(store, [MAKER_SEED, BOND_SEED]);
     let _event = apply(
         &mut state,
-        &open_tx_with(payment_bond_funding(), other_bond_terms(), TAKER, MAKER),
+        &open_tx_with(
+            payment_bond_funding(),
+            other_bond_terms(),
+            (
+                hellas_kernel::PartyKeys::sole(TAKER),
+                hellas_kernel::Authority::Owner,
+            ),
+            (
+                hellas_kernel::PartyKeys::sole(MAKER),
+                hellas_kernel::Authority::Owner,
+            ),
+        ),
     );
     let before = *state.store();
 
@@ -2887,9 +2920,13 @@ fn the_public_payout_helper_builds_the_close_consensus_accepts() {
     assert_eq!(settlement.capacity(), PAYMENT_CAPACITY);
     assert_eq!(settlement.omission_bond(), OMISSION_BOND);
 
-    let Ok(outputs) =
-        adjudicated_payouts(settlement, PARTIES, record.final_cumulative(), false, false)
-    else {
+    let Ok(outputs) = adjudicated_payouts(
+        settlement,
+        PARTIES,
+        record.final_cumulative(),
+        false,
+        [false; 2],
+    ) else {
         panic!("a contest inside capacity has payouts");
     };
     let seal = record.contest_commitment(support::NETWORK, payment_edge_id(), payment_terms_hash());
@@ -2903,8 +2940,13 @@ fn the_public_payout_helper_builds_the_close_consensus_accepts() {
     ) else {
         panic!("the inflated settlement is representable");
     };
-    let Ok(over) = adjudicated_payouts(inflated, PARTIES, record.final_cumulative(), true, false)
-    else {
+    let Ok(over) = adjudicated_payouts(
+        inflated,
+        PARTIES,
+        record.final_cumulative(),
+        true,
+        [false; 2],
+    ) else {
         panic!("the inflated payout is representable");
     };
     assert_close_rejected(
@@ -2944,7 +2986,7 @@ fn the_public_payout_helper_covers_both_penalty_values() {
         PARTIES,
         answered.final_cumulative(),
         answered.penalty_due(),
-        false,
+        [false; 2],
     ) else {
         panic!("the proved understatement has payouts");
     };
@@ -2955,7 +2997,7 @@ fn the_public_payout_helper_covers_both_penalty_values() {
         PARTIES,
         answered.final_cumulative(),
         false,
-        false,
+        [false; 2],
     ) else {
         panic!("the unpenalised payout is representable");
     };
@@ -2988,7 +3030,7 @@ fn the_public_freeze_payout_matches_the_cooperative_close() {
     let settlement = settlement_of(&state, OMISSION_BOND);
     assert_eq!(settlement.freeze_total(), PAYMENT_VALUE);
 
-    let Ok(outputs) = freeze_payouts(settlement, PARTIES, 6, 0, false) else {
+    let Ok(outputs) = freeze_payouts(settlement, PARTIES, 6, 0, [false; 2]) else {
         panic!("a freeze inside capacity has payouts");
     };
     let validity = (1, 1);
@@ -3065,9 +3107,13 @@ fn nonzero_fees_separate_the_two_routes_and_the_capacity_they_imply() {
     let Some(record) = pending_record(&state) else {
         panic!("the start wrote a contest");
     };
-    let Ok(outputs) =
-        adjudicated_payouts(settlement, PARTIES, record.final_cumulative(), false, false)
-    else {
+    let Ok(outputs) = adjudicated_payouts(
+        settlement,
+        PARTIES,
+        record.final_cumulative(),
+        false,
+        [false; 2],
+    ) else {
         panic!("a contest at capacity has payouts");
     };
     let seal = record.contest_commitment(support::NETWORK, payment_edge_id(), payment_terms_hash());
@@ -3152,12 +3198,12 @@ fn a_settlement_that_cannot_be_priced_is_absent() {
         panic!("the largest edge is representable");
     };
     assert_eq!(
-        adjudicated_payouts(settlement, PARTIES, u64::MAX, true, false),
+        adjudicated_payouts(settlement, PARTIES, u64::MAX, true, [false; 2]),
         Err(InvalidProofReason::PayoutOverCapacity),
         "adding the forfeited bond must not wrap",
     );
     assert_eq!(
-        adjudicated_payouts(settlement, PARTIES, u64::MAX, false, false)
+        adjudicated_payouts(settlement, PARTIES, u64::MAX, false, [false; 2])
             .map(|payouts| payouts[1].value()),
         Ok(0),
     );

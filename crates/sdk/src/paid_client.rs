@@ -982,7 +982,7 @@ pub fn check_evaluate_input(
 fn payment_terms(
     config: &WorkConfig,
     policy: &ProviderChannelPolicy,
-    bundle: &hellas_work::model::bundle::WorkChannelSetupBundleV1,
+    bundle: &hellas_work::model::bundle::WorkChannelSetupBundleV2,
     omission_bond: u64,
 ) -> WorkPaymentTerms {
     WorkPaymentTerms {

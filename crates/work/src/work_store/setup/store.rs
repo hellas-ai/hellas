@@ -191,7 +191,7 @@ pub(super) fn check_bundle_signatures<V: SigVerifier>(
     let Some(bundle) = bundle else {
         return Ok(());
     };
-    let decoded = WorkChannelSetupBundleV1::decode(bundle)?;
+    let decoded = WorkChannelSetupBundleV2::decode(bundle)?;
     decoded.check(verifier)?;
     Ok(())
 }
@@ -352,7 +352,7 @@ async fn identify_setup(
         }
     }
     if let Some(bundle) = retained.first() {
-        let decoded = WorkChannelSetupBundleV1::decode(bundle).map_err(SetupStateError::from)?;
+        let decoded = WorkChannelSetupBundleV2::decode(bundle).map_err(SetupStateError::from)?;
         let bond_edge = decoded.bond_edge();
         if setup_key(network, bond_edge).into_bytes() != id.key {
             return Err(SetupDiscoveryError::WrongKey);

@@ -45,7 +45,7 @@ use hellas_kernel::{
     Terms, TermsProfile, Tx, WorkPaymentTerms, WorkStakeBondTerms, bond_lease_slots,
     open_projection, work_payment_settlement,
 };
-use support::{FAKE_VERIFIER, FixedStore, NETWORK, coin_id, key, open_tx, state};
+use support::{FAKE_VERIFIER, FixedStore, NETWORK, coin_id, key, open, state};
 
 const CLIENT: Key = key(7);
 const PROVIDER: Key = key(8);
@@ -600,11 +600,17 @@ fn at(values: &[u64], index: usize) -> u64 {
 /// terms name.
 fn signed(funding: &OpenFunding, terms: &Terms) -> Tx {
     let parties = terms.parties();
-    open_tx(
+    open(
         funding.funding(),
         terms.clone(),
-        parties.maker().owner(),
-        parties.taker().owner(),
+        (
+            hellas_kernel::PartyKeys::sole(parties.maker().owner()),
+            hellas_kernel::Authority::Owner,
+        ),
+        (
+            hellas_kernel::PartyKeys::sole(parties.taker().owner()),
+            hellas_kernel::Authority::Owner,
+        ),
     )
 }
 

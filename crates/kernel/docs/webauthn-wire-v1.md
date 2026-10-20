@@ -90,6 +90,4 @@ but they are not authorization policy. This makes the assertion a portable
 P-256 signing envelope for kernel payload hashes.
 
 The policy itself lives in the `hellas-webauthn` crate, which every Hellas
-verifier shares. The chain-domain `Transfer`/`MergeCoin` path verifies
-through the same policy; only its envelope and its challenge construction
-differ from the kernel's.
+verifier shares.

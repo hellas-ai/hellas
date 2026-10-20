@@ -180,9 +180,8 @@ takes the same committed payouts and `--terms-file FILE`, with no signer
 options.
 
 Stored ownership uses raw, untagged 33-byte settlement keys. P-256 and
-secp256k1 keys can own stored coins. Legacy `Transfer` and `MergeCoin`
-verification remains P-256-only, and genesis owner strings must decode as
-P-256 keys when the validator config is loaded.
+secp256k1 keys can own stored coins. The single kernel `Auth` verifier selects
+the curve from the authorization variant.
 
 Given two P-256 key files whose settlement keys each own a 100-value coin:
 

@@ -365,8 +365,8 @@ pub fn close_start(
         Terms::work_payment(channel.payment_terms().clone()),
         opener_role,
         (valid_from, valid_through),
-        certificate.map(|(certificate, sig)| (certificate, PartyAuth::owner(sig))),
-        PartyAuth::owner(Sig::from_bytes([0_u8; Sig::LENGTH])),
+        certificate.map(|(certificate, sig)| (certificate, PartyAuth::signer(sig))),
+        PartyAuth::signer(Sig::from_bytes([0_u8; Sig::LENGTH])),
     );
     let action_sig = signer.sign(start_body_digest(channel, &unsigned));
     Ok(PaymentCloseStart::new(
@@ -375,7 +375,7 @@ pub fn close_start(
         opener_role,
         (valid_from, valid_through),
         unsigned.certificate().cloned(),
-        PartyAuth::owner(action_sig),
+        PartyAuth::signer(action_sig),
     ))
 }
 
@@ -433,8 +433,8 @@ pub fn close_response(
         channel.payment_edge(),
         start_id,
         Party::Taker,
-        (certificate, PartyAuth::owner(certificate_sig)),
-        PartyAuth::owner(signer.sign(digest)),
+        (certificate, PartyAuth::signer(certificate_sig)),
+        PartyAuth::signer(signer.sign(digest)),
     );
     if let Some(ms) = built.ms() {
         tracing::event!(
@@ -480,7 +480,7 @@ pub fn adjudicated_close(
         channel.payment_terms().parties(),
         pending.final_cumulative(),
         pending.penalty_due(),
-        false,
+        pending.owner_signed(),
     )
     .map_err(|_| CloseError::Unpayable)?;
     let mut outputs = [Payout::default(); MAX_EDGE_OUTPUTS];

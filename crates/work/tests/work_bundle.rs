@@ -10,7 +10,7 @@ use hellas_kernel::{
     NetworkId, Parties, PartyKeys, Payout, Secp256k1Verifier, Terms, Tx, WorkPaymentTerms,
     WorkStakeBondTerms,
 };
-use hellas_work::model::bundle::{SetupBundleError, WorkChannelSetupBundleV1};
+use hellas_work::model::bundle::{SetupBundleError, WorkChannelSetupBundleV2};
 use hellas_work::test_support::paid::{client, provider};
 
 const HORIZON: u64 = 500;
@@ -72,17 +72,17 @@ fn payment_terms(bond_edge: EdgeId) -> WorkPaymentTerms {
 }
 
 /// Revision 1, as the provider exports it.
-fn proposed() -> WorkChannelSetupBundleV1 {
+fn proposed() -> WorkChannelSetupBundleV2 {
     let hash = Tx::open_hash(
         network(),
         &bond_funding(),
         &Terms::work_stake_bond(bond_terms()),
     );
-    match WorkChannelSetupBundleV1::propose_bond(
+    match WorkChannelSetupBundleV2::propose_bond(
         network(),
         bond_funding(),
         bond_terms(),
-        Auth::native(provider().sign(hash)),
+        hellas_kernel::PartyAuth::signer(Auth::native(provider().sign(hash))),
     ) {
         Ok(bundle) => bundle,
         Err(error) => panic!("the fixture bond proposes: {error}"),
@@ -90,7 +90,7 @@ fn proposed() -> WorkChannelSetupBundleV1 {
 }
 
 /// Revision 2, as the client exports it.
-fn countersigned(bundle: WorkChannelSetupBundleV1) -> WorkChannelSetupBundleV1 {
+fn countersigned(bundle: WorkChannelSetupBundleV2) -> WorkChannelSetupBundleV2 {
     let bond_hash = bundle.bond_open_hash();
     let terms = payment_terms(bundle.bond_edge());
     let payment_hash = Tx::open_hash(
@@ -99,10 +99,10 @@ fn countersigned(bundle: WorkChannelSetupBundleV1) -> WorkChannelSetupBundleV1 {
         &Terms::work_payment(terms.clone()),
     );
     match bundle.countersign_bond_and_propose_payment(
-        Auth::native(client().sign(bond_hash)),
+        hellas_kernel::PartyAuth::signer(Auth::native(client().sign(bond_hash))),
         payment_funding(),
         terms,
-        Auth::native(client().sign(payment_hash)),
+        hellas_kernel::PartyAuth::signer(Auth::native(client().sign(payment_hash))),
     ) {
         Ok(bundle) => bundle,
         Err(error) => panic!("the fixture payment proposes: {error}"),
@@ -110,11 +110,13 @@ fn countersigned(bundle: WorkChannelSetupBundleV1) -> WorkChannelSetupBundleV1 {
 }
 
 /// Revision 3, as the provider exports it.
-fn completed(bundle: WorkChannelSetupBundleV1) -> WorkChannelSetupBundleV1 {
+fn completed(bundle: WorkChannelSetupBundleV2) -> WorkChannelSetupBundleV2 {
     let Some(hash) = bundle.payment_open_hash() else {
         panic!("a proposed payment has an open hash");
     };
-    match bundle.countersign_payment(Auth::native(provider().sign(hash))) {
+    match bundle.countersign_payment(hellas_kernel::PartyAuth::signer(Auth::native(
+        provider().sign(hash),
+    ))) {
         Ok(bundle) => bundle,
         Err(error) => panic!("the fixture payment countersigns: {error}"),
     }
@@ -177,7 +179,7 @@ fn the_three_revisions_check_extend_and_round_trip() {
         assert_eq!(bundle.bond_funding(), &bond_funding());
         let encoded = bundle.encode();
         assert_eq!(
-            WorkChannelSetupBundleV1::decode(&encoded).as_ref(),
+            WorkChannelSetupBundleV2::decode(&encoded).as_ref(),
             Ok(bundle),
         );
         // The digest is over exactly these bytes, and the revision byte
@@ -190,7 +192,7 @@ fn the_three_revisions_check_extend_and_round_trip() {
 
 use hellas_auth::Digest;
 
-fn payment_edge_of(bundle: &WorkChannelSetupBundleV1) -> EdgeId {
+fn payment_edge_of(bundle: &WorkChannelSetupBundleV2) -> EdgeId {
     Tx::edge_id_of(
         &payment_funding(),
         &Terms::work_payment(payment_terms(bundle.bond_edge())),
@@ -206,23 +208,27 @@ fn a_step_from_the_wrong_revision_is_refused() {
 
     assert_eq!(
         one.clone()
-            .countersign_payment(Auth::native(provider().sign(one.bond_open_hash()))),
+            .countersign_payment(hellas_kernel::PartyAuth::signer(Auth::native(
+                provider().sign(one.bond_open_hash())
+            ))),
         Err(SetupBundleError::WrongStage { actual: 1 }),
     );
     let bond_hash = two.bond_open_hash();
     assert_eq!(
         two.clone().countersign_bond_and_propose_payment(
-            Auth::native(client().sign(bond_hash)),
+            hellas_kernel::PartyAuth::signer(Auth::native(client().sign(bond_hash))),
             payment_funding(),
             payment_terms(two.bond_edge()),
-            Auth::native(client().sign(bond_hash)),
+            hellas_kernel::PartyAuth::signer(Auth::native(client().sign(bond_hash)))
         ),
         Err(SetupBundleError::WrongStage { actual: 2 }),
     );
     assert_eq!(
         three
             .clone()
-            .countersign_payment(Auth::native(provider().sign(bond_hash))),
+            .countersign_payment(hellas_kernel::PartyAuth::signer(Auth::native(
+                provider().sign(bond_hash)
+            ))),
         Err(SetupBundleError::WrongStage { actual: 3 }),
     );
 
@@ -265,11 +271,11 @@ fn an_import_that_rewrote_the_previous_revision_is_refused() {
         &other_bond_funding,
         &Terms::work_stake_bond(bond_terms()),
     );
-    let Ok(other) = WorkChannelSetupBundleV1::propose_bond(
+    let Ok(other) = WorkChannelSetupBundleV2::propose_bond(
         network(),
         other_bond_funding,
         bond_terms(),
-        Auth::native(provider().sign(other_hash)),
+        hellas_kernel::PartyAuth::signer(Auth::native(provider().sign(other_hash))),
     ) else {
         panic!("the alternative bond proposes");
     };
@@ -301,10 +307,10 @@ fn a_payment_over_another_bond_is_refused() {
     );
     assert_eq!(
         one.clone().countersign_bond_and_propose_payment(
-            Auth::native(client().sign(bond_hash)),
+            hellas_kernel::PartyAuth::signer(Auth::native(client().sign(bond_hash))),
             payment_funding(),
             wrong_edge,
-            Auth::native(client().sign(hash)),
+            hellas_kernel::PartyAuth::signer(Auth::native(client().sign(hash)))
         ),
         Err(SetupBundleError::BondEdgeMismatch {
             named: EdgeId::from_bytes([0x99; EdgeId::LENGTH]),
@@ -327,10 +333,10 @@ fn a_payment_over_another_bond_is_refused() {
     );
     assert_eq!(
         one.countersign_bond_and_propose_payment(
-            Auth::native(client().sign(bond_hash)),
+            hellas_kernel::PartyAuth::signer(Auth::native(client().sign(bond_hash))),
             payment_funding(),
             wrong_witness,
-            Auth::native(client().sign(hash)),
+            hellas_kernel::PartyAuth::signer(Auth::native(client().sign(hash)))
         ),
         Err(SetupBundleError::BondWitnessMismatch),
     );
@@ -349,11 +355,11 @@ fn a_coin_may_fund_only_one_input_of_the_setup() {
         &Terms::work_stake_bond(bond_terms()),
     );
     assert_eq!(
-        WorkChannelSetupBundleV1::propose_bond(
+        WorkChannelSetupBundleV2::propose_bond(
             network(),
             duplicated,
             bond_terms(),
-            Auth::native(provider().sign(hash)),
+            hellas_kernel::PartyAuth::signer(Auth::native(provider().sign(hash)))
         ),
         Err(SetupBundleError::DuplicateFunding { coin: repeated }),
     );
@@ -366,10 +372,10 @@ fn a_coin_may_fund_only_one_input_of_the_setup() {
     let hash = Tx::open_hash(network(), &reused, &Terms::work_payment(terms.clone()));
     assert_eq!(
         one.countersign_bond_and_propose_payment(
-            Auth::native(client().sign(bond_hash)),
+            hellas_kernel::PartyAuth::signer(Auth::native(client().sign(bond_hash))),
             reused,
             terms,
-            Auth::native(client().sign(hash)),
+            hellas_kernel::PartyAuth::signer(Auth::native(client().sign(hash)))
         ),
         Err(SetupBundleError::DuplicateFunding { coin: repeated }),
     );
@@ -389,11 +395,11 @@ fn each_signature_is_checked_against_its_own_party_and_hash() {
 
     // The client's signature in the provider's bond slot. It is a valid
     // signature over the right bytes by the wrong party.
-    let Ok(wrong_party) = WorkChannelSetupBundleV1::propose_bond(
+    let Ok(wrong_party) = WorkChannelSetupBundleV2::propose_bond(
         network(),
         bond_funding(),
         bond_terms(),
-        Auth::native(client().sign(bond_hash)),
+        hellas_kernel::PartyAuth::signer(Auth::native(client().sign(bond_hash))),
     ) else {
         panic!("the bundle builds without verifying");
     };
@@ -407,11 +413,11 @@ fn each_signature_is_checked_against_its_own_party_and_hash() {
 
     // The provider's signature over the payment hash in its bond slot:
     // the right party over the wrong bytes.
-    let Ok(wrong_hash) = WorkChannelSetupBundleV1::propose_bond(
+    let Ok(wrong_hash) = WorkChannelSetupBundleV2::propose_bond(
         network(),
         bond_funding(),
         bond_terms(),
-        Auth::native(provider().sign(payment_hash)),
+        hellas_kernel::PartyAuth::signer(Auth::native(provider().sign(payment_hash))),
     ) else {
         panic!("the bundle builds without verifying");
     };
@@ -432,10 +438,10 @@ fn each_signature_is_checked_against_its_own_party_and_hash() {
         &Terms::work_payment(terms.clone()),
     );
     let Ok(bad_countersign) = one.clone().countersign_bond_and_propose_payment(
-        Auth::native(client().sign(real_payment_hash)),
+        hellas_kernel::PartyAuth::signer(Auth::native(client().sign(real_payment_hash))),
         payment_funding(),
         terms.clone(),
-        Auth::native(client().sign(real_payment_hash)),
+        hellas_kernel::PartyAuth::signer(Auth::native(client().sign(real_payment_hash))),
     ) else {
         panic!("the bundle builds without verifying");
     };
@@ -449,10 +455,10 @@ fn each_signature_is_checked_against_its_own_party_and_hash() {
 
     // The client's payment signature made by the provider.
     let Ok(bad_payment) = one.countersign_bond_and_propose_payment(
-        Auth::native(client().sign(bond_hash)),
+        hellas_kernel::PartyAuth::signer(Auth::native(client().sign(bond_hash))),
         payment_funding(),
         terms,
-        Auth::native(provider().sign(real_payment_hash)),
+        hellas_kernel::PartyAuth::signer(Auth::native(provider().sign(real_payment_hash))),
     ) else {
         panic!("the bundle builds without verifying");
     };
@@ -466,8 +472,9 @@ fn each_signature_is_checked_against_its_own_party_and_hash() {
 
     // The provider's payment countersignature made by the client.
     let two = countersigned(proposed());
-    let Ok(bad_complete) = two.countersign_payment(Auth::native(client().sign(payment_hash)))
-    else {
+    let Ok(bad_complete) = two.countersign_payment(hellas_kernel::PartyAuth::signer(Auth::native(
+        client().sign(payment_hash),
+    ))) else {
         panic!("the bundle builds without verifying");
     };
     assert_eq!(
@@ -487,16 +494,16 @@ fn decoding_a_bundle_is_exact() {
     let encoded = three.encode();
 
     let mut wrong_version = encoded.clone();
-    wrong_version[0] = 2;
+    wrong_version[0] = 1;
     assert_eq!(
-        WorkChannelSetupBundleV1::decode(&wrong_version),
-        Err(SetupBundleError::UnknownFormatVersion { actual: 2 }),
+        WorkChannelSetupBundleV2::decode(&wrong_version),
+        Err(SetupBundleError::UnknownFormatVersion { actual: 1 }),
     );
 
     let mut wrong_revision = encoded.clone();
     wrong_revision[1] = 4;
     assert_eq!(
-        WorkChannelSetupBundleV1::decode(&wrong_revision),
+        WorkChannelSetupBundleV2::decode(&wrong_revision),
         Err(SetupBundleError::UnknownRevision { actual: 4 }),
     );
 
@@ -505,25 +512,25 @@ fn decoding_a_bundle_is_exact() {
     let mut understated = encoded.clone();
     understated[1] = 2;
     assert_eq!(
-        WorkChannelSetupBundleV1::decode(&understated),
+        WorkChannelSetupBundleV2::decode(&understated),
         Err(SetupBundleError::Malformed),
     );
 
     let mut trailing = encoded.clone();
     trailing.push(0);
     assert_eq!(
-        WorkChannelSetupBundleV1::decode(&trailing),
+        WorkChannelSetupBundleV2::decode(&trailing),
         Err(SetupBundleError::Malformed),
     );
 
     let truncated = &encoded[..encoded.len() - 1];
     assert_eq!(
-        WorkChannelSetupBundleV1::decode(truncated),
+        WorkChannelSetupBundleV2::decode(truncated),
         Err(SetupBundleError::Malformed),
     );
 
     assert_eq!(
-        WorkChannelSetupBundleV1::decode(&[]),
+        WorkChannelSetupBundleV2::decode(&[]),
         Err(SetupBundleError::Malformed),
     );
 
@@ -552,7 +559,7 @@ fn decoding_a_bundle_is_exact() {
         substitute.iter().copied(),
     );
     assert_eq!(
-        WorkChannelSetupBundleV1::decode(&basic),
+        WorkChannelSetupBundleV2::decode(&basic),
         Err(SetupBundleError::WrongTermsShape {
             slot: "bond",
             expected: "work-stake bond",

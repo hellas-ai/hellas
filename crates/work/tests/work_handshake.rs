@@ -26,7 +26,7 @@ use hellas_rpc::protocol::ContentId;
 use hellas_rpc::services::work_setup::{WorkSetup, WorkSetupClientImpl, WorkSetupServer};
 use hellas_wire::mux::{MessagePipe, MuxConfig, MuxTransport, Role as MuxRole};
 use hellas_wire::{DefaultClock, Dispatcher, ServiceMarker, StreamTransport};
-use hellas_work::model::bundle::WorkChannelSetupBundleV1;
+use hellas_work::model::bundle::WorkChannelSetupBundleV2;
 use hellas_work::model::setup::ProviderChannelPolicy;
 use hellas_work::model::work::{EvaluatePolicyV2, PaidChannelPolicyV1, private_policy_commitment};
 use hellas_work::test_support::paid::{client, network, provider, signer};
@@ -426,7 +426,7 @@ async fn two_endpoints_that_have_never_met_open_a_channel() {
     );
 
     // And what it holds is two transactions the kernel can execute.
-    let bundle = match WorkChannelSetupBundleV1::decode(&provider_bytes) {
+    let bundle = match WorkChannelSetupBundleV2::decode(&provider_bytes) {
         Ok(bundle) => bundle,
         Err(error) => panic!("the completed handshake decodes: {error}"),
     };
@@ -623,7 +623,7 @@ async fn the_answer_is_signed_over_this_payment_open_and_no_other_hash() {
         .bundle_bytes()
         .map(<[u8]>::to_vec)
         .expect("a completed handshake");
-    let bundle = match WorkChannelSetupBundleV1::decode(&bytes) {
+    let bundle = match WorkChannelSetupBundleV2::decode(&bytes) {
         Ok(bundle) => bundle,
         Err(error) => panic!("the completed handshake decodes: {error}"),
     };
@@ -795,7 +795,7 @@ async fn a_provider_with_no_proposal_is_not_ready() {
 /// provider refuses it, because the key is not the one its bond terms
 /// name as taker.
 ///
-/// Delete the client-signature check in `WorkChannelSetupBundleV1::check`
+/// Delete the client-signature check in `WorkChannelSetupBundleV2::check`
 /// and this fails: the provider countersigns a payment channel funded
 /// by coins the client never agreed to lock.
 #[tokio::test]
@@ -1046,7 +1046,9 @@ fn complete_revision_three() -> Vec<u8> {
     let Some(hash) = two.payment_open_hash() else {
         panic!("a proposed payment has an open hash");
     };
-    match two.countersign_payment(hellas_kernel::Auth::native(provider().sign(hash))) {
+    match two.countersign_payment(hellas_kernel::PartyAuth::signer(
+        hellas_kernel::Auth::native(provider().sign(hash)),
+    )) {
         Ok(bundle) => bundle.encode(),
         Err(error) => panic!("the fixture payment countersigns: {error}"),
     }
@@ -1055,17 +1057,17 @@ fn complete_revision_three() -> Vec<u8> {
 fn revision_two_signed_by(
     caller: &Secp256k1Signer,
     terms: WorkStakeBondTerms,
-) -> WorkChannelSetupBundleV1 {
+) -> WorkChannelSetupBundleV2 {
     let bond_hash = Tx::open_hash(
         network(),
         &bond_funding(),
         &Terms::work_stake_bond(terms.clone()),
     );
-    let bundle = match WorkChannelSetupBundleV1::propose_bond(
+    let bundle = match WorkChannelSetupBundleV2::propose_bond(
         network(),
         bond_funding(),
         terms.clone(),
-        hellas_kernel::Auth::native(provider().sign(bond_hash)),
+        hellas_kernel::PartyAuth::signer(hellas_kernel::Auth::native(provider().sign(bond_hash))),
     ) {
         Ok(bundle) => bundle,
         Err(error) => panic!("the fixture bond proposes: {error}"),
@@ -1081,10 +1083,10 @@ fn revision_two_signed_by(
         &Terms::work_payment(payment.clone()),
     );
     match bundle.countersign_bond_and_propose_payment(
-        hellas_kernel::Auth::native(caller.sign(bond_hash)),
+        hellas_kernel::PartyAuth::signer(hellas_kernel::Auth::native(caller.sign(bond_hash))),
         payment_funding(),
         payment,
-        hellas_kernel::Auth::native(caller.sign(payment_hash)),
+        hellas_kernel::PartyAuth::signer(hellas_kernel::Auth::native(caller.sign(payment_hash))),
     ) {
         Ok(bundle) => bundle,
         Err(error) => panic!("the fixture payment proposes: {error}"),

@@ -16,7 +16,6 @@ pub mod domain;
 pub mod edge_index;
 #[cfg(any(feature = "indexer", feature = "validator"))]
 mod execution;
-#[cfg(feature = "validator")]
 #[cfg(feature = "client-core")]
 pub mod finality_proof;
 #[cfg(feature = "indexer-api")]
