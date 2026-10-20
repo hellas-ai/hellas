@@ -14,6 +14,45 @@ const PREDECESSOR: [&[u8]; 3] = [b"one", b"two", b"three"];
 const CHECKPOINT: &[u8] = b"the state the predecessor reached";
 
 impl Journal {
+    /// Pause the next statement on SQLite's worker until the sender is dropped.
+    /// Tokio's blocking pool does not control sqlx's dedicated SQLite thread.
+    pub(crate) async fn pause_next_statement(
+        &mut self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let mut entered = Some(entered);
+        self.connection
+            .as_mut()
+            .unwrap()
+            .lock_handle()
+            .await
+            .unwrap()
+            .set_progress_handler(1, move || {
+                if let Some(entered) = entered.take() {
+                    let _ = entered.send(());
+                    let _ = blocked.recv();
+                }
+                true
+            });
+        (started, release)
+    }
+
+    /// Release the paused statement and remove its one-shot test hook.
+    pub(crate) async fn resume_statements(&mut self, release: std::sync::mpsc::Sender<()>) {
+        drop(release);
+        self.connection
+            .as_mut()
+            .unwrap()
+            .lock_handle()
+            .await
+            .unwrap()
+            .remove_progress_handler();
+    }
+
     /// Makes the database itself refuse every `operation` on `table`,
     /// the way a full disk or an I/O error would.
     pub(crate) async fn refuse(&mut self, operation: &str, table: &str) {
@@ -152,16 +191,20 @@ async fn a_lost_write_acknowledgement_requires_replay() {
     let (mut journal, _) = Journal::open_latest(dir.path(), "duty", id())
         .await
         .unwrap();
+    let (started, release) = journal.pause_next_statement().await;
     {
-        // One poll hands the insert to sqlx's worker; dropping the future
-        // then loses its acknowledgement, not the write.
         let mut append = std::pin::pin!(journal.append(b"uncertain append"));
-        assert!(futures::poll!(append.as_mut()).is_pending());
+        tokio::select! {
+            entered = started => entered.unwrap(),
+            result = &mut append => panic!("append completed before cancellation: {result:?}"),
+        }
+        // SQLite has started the insert; cancellation loses its acknowledgement.
     }
     assert_err!(
         journal.append(b"must not append").await,
         JournalError::Poisoned
     );
+    journal.resume_statements(release).await;
     drop(journal);
     let (mut journal, replay) = Journal::open_latest(dir.path(), "duty", id())
         .await

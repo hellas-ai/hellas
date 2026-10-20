@@ -167,7 +167,6 @@ async fn committed_revocation_cancels_execution_but_retains_physical_ownership_a
 fn interrupted_authority_append_cancels_execution_and_recovery_keeps_the_charge() {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
-        .max_blocking_threads(1)
         .build()
         .unwrap()
         .block_on(async {
@@ -189,20 +188,17 @@ fn interrupted_authority_append_cancels_execution_and_recovery_keeps_the_charge(
                 .await
                 .unwrap();
             let admin = crate::test_support::session(&node, &secret).await;
-            let (entered, started) = tokio::sync::oneshot::channel();
-            let (release, blocked) = std::sync::mpsc::channel();
-            let blocker = tokio::task::spawn_blocking(move || {
-                entered.send(()).unwrap();
-                blocked.recv().unwrap();
-            });
-            started.await.unwrap();
+            let (started, release) = node.store.lock().await.unwrap().pause_next_statement().await;
             let mut revoke = Box::pin(node.revoke_credential(
                 &admin,
                 GrantId([0; 16]),
                 credential.id(),
                 Revision(1),
             ));
-            assert!(futures::poll!(&mut revoke).is_pending());
+            tokio::select! {
+                entered = started => entered.unwrap(),
+                result = &mut revoke => panic!("administration completed before cancellation: {result:?}"),
+            }
             drop(revoke);
             cache::discarded(&cache);
             assert!(
@@ -216,9 +212,7 @@ fn interrupted_authority_append_cancels_execution_and_recovery_keeps_the_charge(
             backend.finish.release();
             assert_err!(service.drain().await, NodeStoreError::Completion(source) if matches!(source.as_ref(), NodeStoreError::Journal(crate::work_store::journal::JournalError::Poisoned)));
             assert_eq!(backend.slots.available_permits(), 1);
-            release.send(()).unwrap();
-            blocker.await.unwrap();
-            tokio::task::spawn_blocking(|| {}).await.unwrap();
+            node.store.lock().await.unwrap().resume_statements(release).await;
             drop(work);
             drop(node);
             drop(service);

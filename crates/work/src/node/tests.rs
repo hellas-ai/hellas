@@ -172,7 +172,6 @@ async fn unmounted_operations_cannot_be_issued() {
 fn cancelled_native_append_refuses_authentication_and_administration_until_reopen() {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
-        .max_blocking_threads(1)
         .build()
         .unwrap()
         .block_on(async {
@@ -196,13 +195,7 @@ fn cancelled_native_append_refuses_authentication_and_administration_until_reope
                 let (prepared, retained) =
                     Credential::prepare(scope(OPERATOR), OPERATOR.holder(), caller.generation())
                         .unwrap();
-                let (entered, started) = tokio::sync::oneshot::channel();
-                let (release, blocked) = std::sync::mpsc::channel();
-                let blocker = tokio::task::spawn_blocking(move || {
-                    entered.send(()).unwrap();
-                    blocked.recv().unwrap();
-                });
-                started.await.unwrap();
+                let (started, release) = node.store.lock().await.unwrap().pause_next_statement().await;
                 {
                     let mut issue = Box::pin(async {
                         if matches!(command, Command::Capacity) {
@@ -221,7 +214,10 @@ fn cancelled_native_append_refuses_authentication_and_administration_until_reope
                                 .map(|_| ())
                         }
                     });
-                    assert!(futures::poll!(&mut issue).is_pending());
+                    tokio::select! {
+                        entered = started => entered.unwrap(),
+                        result = &mut issue => panic!("administration completed before cancellation: {result:?}"),
+                    }
                 }
                 assert_eq!(node.store.lock().await.unwrap().state(), &before);
                 assert_err!(
@@ -250,9 +246,7 @@ fn cancelled_native_append_refuses_authentication_and_administration_until_reope
                         .await,
                     NodeStoreError::Journal(crate::work_store::journal::JournalError::Poisoned)
                 );
-                release.send(()).unwrap();
-                blocker.await.unwrap();
-                tokio::task::spawn_blocking(|| {}).await.unwrap();
+                node.store.lock().await.unwrap().resume_statements(release).await;
                 drop(node);
                 let reopened = NodeStore::open(directory.path(), network(), None, UnixMillis(11))
                     .await

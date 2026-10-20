@@ -3,6 +3,19 @@ use crate::test_support::{accept, proposal, setup};
 use hellas_auth::assert_err;
 
 impl NodeStore {
+    pub(crate) async fn pause_next_statement(
+        &mut self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        self.journal.pause_next_statement().await
+    }
+
+    pub(crate) async fn resume_statements(&mut self, release: std::sync::mpsc::Sender<()>) {
+        self.journal.resume_statements(release).await;
+    }
+
     pub(crate) const fn journal_len(&self) -> u64 {
         self.journal.len()
     }
