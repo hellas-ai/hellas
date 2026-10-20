@@ -64,7 +64,9 @@ pub struct HostHandle {
     transport: Option<(iroh::Endpoint, tokio::task::JoinHandle<()>)>,
 }
 impl HostHandle {
-    pub fn endpoint(&self) -> Option<&iroh::Endpoint> { self.runtime.transport.as_ref() }
+    pub fn endpoint(&self) -> Option<&iroh::Endpoint> {
+        self.runtime.transport.as_ref()
+    }
 
     /// Both services begin stopped. Startup neither creates authority nor grants.
     /// An authority without a provider binding still serves control; provider
@@ -119,7 +121,12 @@ impl HostHandle {
         };
         let (stop, stopped) = watch::channel(false);
         let remote = transport.map(|endpoint| {
-            let task = tokio::spawn(accept(endpoint.clone(), control.clone(), runtime.clone(), stopped.clone()));
+            let task = tokio::spawn(accept(
+                endpoint.clone(),
+                control.clone(),
+                runtime.clone(),
+                stopped.clone(),
+            ));
             (endpoint, task)
         });
         let task = tokio::spawn(run(
@@ -138,9 +145,16 @@ impl HostHandle {
             task,
         };
         if options.start_provider {
-            let result = host.runtime.enqueue(Service::Provider, true).map_err(ProviderError::from)?
-                .await.map_err(|_| ProviderError::from(unavailable()))?;
-            if let Err(error) = result { host.shutdown().await?; return Err(ProviderError::from(error).into()); }
+            let result = host
+                .runtime
+                .enqueue(Service::Provider, true)
+                .map_err(ProviderError::from)?
+                .await
+                .map_err(|_| ProviderError::from(unavailable()))?;
+            if let Err(error) = result {
+                host.shutdown().await?;
+                return Err(ProviderError::from(error).into());
+            }
         }
         Ok(host)
     }
@@ -207,8 +221,13 @@ struct Command {
     reply: oneshot::Sender<Result<(), WireStatus>>,
 }
 impl Runtime {
-    pub(crate) fn provider_ingress(&self) -> Result<Option<(iroh::Endpoint, mpsc::Receiver<iroh::endpoint::Connection>)>, WireStatus> {
-        let Some(endpoint) = &self.transport else { return Ok(None) };
+    pub(crate) fn provider_ingress(
+        &self,
+    ) -> Result<Option<(iroh::Endpoint, mpsc::Receiver<iroh::endpoint::Connection>)>, WireStatus>
+    {
+        let Some(endpoint) = &self.transport else {
+            return Ok(None);
+        };
         let (sender, receiver) = mpsc::channel(128);
         self.with(|state| state.ingress = Some(sender))?;
         Ok(Some((endpoint.clone(), receiver)))
@@ -247,11 +266,27 @@ impl Runtime {
             })?;
         Ok(receiver)
     }
-    pub(super) fn configure(&self, update: super::configuration::ProviderUpdate) -> Result<oneshot::Receiver<Result<(), WireStatus>>, WireStatus> {
-        if !self.has_provider { return Err(unsupported()); }
+    pub(super) fn configure(
+        &self,
+        update: super::configuration::ProviderUpdate,
+    ) -> Result<oneshot::Receiver<Result<(), WireStatus>>, WireStatus> {
+        if !self.has_provider {
+            return Err(unsupported());
+        }
         let (reply, receiver) = oneshot::channel();
-        self.commands.try_send(Command { service: Service::Provider, enabled: true, update: Some(update), reply })
-            .map_err(|_| WireStatus::new(WireCode::ResourceExhausted, "host command queue unavailable"))?;
+        self.commands
+            .try_send(Command {
+                service: Service::Provider,
+                enabled: true,
+                update: Some(update),
+                reply,
+            })
+            .map_err(|_| {
+                WireStatus::new(
+                    WireCode::ResourceExhausted,
+                    "host command queue unavailable",
+                )
+            })?;
         Ok(receiver)
     }
     pub(super) fn decorate(&self, status: &mut HostStatus) -> Result<(), WireStatus> {
@@ -281,12 +316,18 @@ impl Runtime {
                     state.gateway_failure.as_deref(),
                 )
             });
-            status.endpoint = self.transport.as_ref().map(|endpoint| endpoint.id().to_string()).unwrap_or_else(|| state
-                .provider
+            status.endpoint = self
+                .transport
                 .as_ref()
-                .filter(|handle| !handle.is_finished())
-                .map(|handle| handle.node_id().to_string())
-                .unwrap_or_default());
+                .map(|endpoint| endpoint.id().to_string())
+                .unwrap_or_else(|| {
+                    state
+                        .provider
+                        .as_ref()
+                        .filter(|handle| !handle.is_finished())
+                        .map(|handle| handle.node_id().to_string())
+                        .unwrap_or_default()
+                });
         })
     }
     pub(super) fn work(
@@ -429,20 +470,10 @@ impl Runtime {
                         })
                     }
                     Err(error) => {
-                        if command.update.is_some() && let Ok(handle) = factory(control.clone(), None).await {
-                            self.with(|state| {
-                                self.endpoint.send_replace(Some(handle.endpoint().clone()));
-                                state.configuration = handle.configuration().cloned();
-                                state.work = handle.administration().cloned();
-                                state.provider = Some(handle);
-                                state.provider_state = RuntimeState::Running;
-                            })?;
-                        } else {
-                            self.with(|state| {
-                                state.provider_state = RuntimeState::Failed;
-                                state.provider_failure = Some(failure_detail(&*error));
-                            })?;
-                        }
+                        self.with(|state| {
+                            state.provider_state = RuntimeState::Failed;
+                            state.provider_failure = Some(failure_detail(&*error));
+                        })?;
                         Err(unavailable())
                     }
                 }
@@ -565,17 +596,33 @@ async fn accept(
             _ = tasks.join_next(), if !tasks.is_empty() => continue,
             incoming = endpoint.accept() => match incoming { Some(incoming) => incoming, None => break },
         };
-        if tasks.len() >= 128 { incoming.refuse(); continue; }
+        if tasks.len() >= 128 {
+            tracing::warn!("host transport connection capacity exhausted");
+            incoming.refuse();
+            continue;
+        }
         let control = control.clone();
         let runtime = runtime.clone();
         tasks.spawn(async move {
-            let Ok(accepting) = incoming.accept() else { return };
-            let Ok(Ok(connection)) = tokio::time::timeout(HANDSHAKE_TIMEOUT, accepting).await else { return };
+            let Ok(accepting) = incoming.accept() else {
+                tracing::warn!("host transport acceptance refused");
+                return;
+            };
+            let Ok(Ok(connection)) = tokio::time::timeout(HANDSHAKE_TIMEOUT, accepting).await
+            else {
+                tracing::warn!("host transport handshake failed or timed out");
+                return;
+            };
             if connection.alpn() == HostControl::ALPN.as_bytes() {
-                if let Some(control) = control { let _ = control.serve_iroh(connection).await; }
+                if let Some(control) = control {
+                    let _ = control.serve_iroh(connection).await;
+                }
             } else {
                 let sender = runtime.with(|state| state.ingress.clone()).ok().flatten();
-                if sender.as_ref().is_none_or(|sender| sender.try_send(connection.clone()).is_err()) {
+                if sender
+                    .as_ref()
+                    .is_none_or(|sender| sender.try_send(connection.clone()).is_err())
+                {
                     connection.close(503u32.into(), b"provider unavailable");
                 }
             }
@@ -590,46 +637,46 @@ pub async fn prepare_provider<R: hellas_attestation::RootProver + Send + Sync + 
     provider: &mut crate::ProviderOptions<R>,
     grants: Option<crate::grant_config::GrantConfig>,
 ) -> Result<Option<(NodeCoordinator, ProviderControl)>, HostError> {
-        if provider.grants.is_some() {
-            return Err(HostError::Composition);
-        }
-        let control = if let Some(config) = grants {
-            let tls = super::profile::server_identity(
-                &config.control_certificate,
-                &config.control_private_key,
-            )
-            .map_err(ProviderError::from)?;
-            let grants = crate::ProviderGrants {
-                config: crate::GrantProviderOptions {
-                    policies: config.resources,
-                    max_job_millis: config.max_job_millis,
-                },
-                authority: crate::ProviderAuthority::Journal {
-                    root: config.journal_root,
-                },
-            };
-            let resources = if provider.executor.supports_evaluate() {
-                crate::grant_provider::ProviderResources::EvaluateAndFetch(
-                    &provider.executor.fetch_routes,
-                )
-            } else {
-                crate::grant_provider::ProviderResources::Fetch(&provider.executor.fetch_routes)
-            };
-            let node = grants
-                .open(resources, &provider.open_identity.enrollment)
-                .await?;
-            provider.grants = Some(grants);
-            Some((
-                node,
-                ProviderControl {
-                    socket: config.control_socket,
-                    tls,
-                    remote: config.remote_control,
-                },
-            ))
-        } else {
-            None
+    if provider.grants.is_some() {
+        return Err(HostError::Composition);
+    }
+    let control = if let Some(config) = grants {
+        let tls = super::profile::server_identity(
+            &config.control_certificate,
+            &config.control_private_key,
+        )
+        .map_err(ProviderError::from)?;
+        let grants = crate::ProviderGrants {
+            config: crate::GrantProviderOptions {
+                policies: config.resources,
+                max_job_millis: config.max_job_millis,
+            },
+            authority: crate::ProviderAuthority::Journal {
+                root: config.journal_root,
+            },
         };
+        let resources = if provider.executor.supports_evaluate() {
+            crate::grant_provider::ProviderResources::EvaluateAndFetch(
+                &provider.executor.fetch_routes,
+            )
+        } else {
+            crate::grant_provider::ProviderResources::Fetch(&provider.executor.fetch_routes)
+        };
+        let node = grants
+            .open(resources, &provider.open_identity.enrollment)
+            .await?;
+        provider.grants = Some(grants);
+        Some((
+            node,
+            ProviderControl {
+                socket: config.control_socket,
+                tls,
+                remote: config.remote_control,
+            },
+        ))
+    } else {
+        None
+    };
     Ok(control)
 }
 
@@ -640,15 +687,22 @@ pub async fn bind_transport(
     admission: RemoteControlAdmission,
 ) -> Result<iroh::Endpoint, HostError> {
     let mut builder = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
-        .secret_key(key).hooks(admission).alpns(vec![
+        .secret_key(key)
+        .hooks(admission)
+        .alpns(vec![
             hellas_rpc::services::node::Node::ALPN.as_bytes().to_vec(),
             hellas_rpc::services::work::Work::ALPN.as_bytes().to_vec(),
-            hellas_rpc::services::work_setup::WorkSetup::ALPN.as_bytes().to_vec(),
-            hellas_rpc::services::chain_sync::ChainSync::ALPN.as_bytes().to_vec(),
+            hellas_rpc::services::work_setup::WorkSetup::ALPN
+                .as_bytes()
+                .to_vec(),
+            hellas_rpc::services::chain_sync::ChainSync::ALPN
+                .as_bytes()
+                .to_vec(),
             HostControl::ALPN.as_bytes().to_vec(),
         ]);
     if let Some(port) = port {
-        builder = builder.bind_addr(std::net::SocketAddr::from(([0, 0, 0, 0], port)))
+        builder = builder
+            .bind_addr(std::net::SocketAddr::from(([0, 0, 0, 0], port)))
             .map_err(ProviderError::from)?;
     }
     Ok(builder.bind().await.map_err(ProviderError::from)?)

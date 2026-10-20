@@ -879,7 +879,9 @@ async fn offline_inspection_removes_only_stale_snapshot_directories() {
 async fn client_prepared_bootstrap_survives_a_lost_reply() {
     let directory = tempfile::tempdir().unwrap();
     let approval = crate::test_support::common_node::approval_for(
-        auth::Ownership::Bootstrap { root: ids::ROOT_GRANT },
+        auth::Ownership::Bootstrap {
+            root: ids::ROOT_GRANT,
+        },
         admin(),
         admin(),
     );
@@ -887,22 +889,40 @@ async fn client_prepared_bootstrap_survives_a_lost_reply() {
         approval.credential,
         CredentialHolder::Node(approval.holder),
         1,
-    ).unwrap();
+    )
+    .unwrap();
     let request = PreparedBootstrap {
         administrator: approval.administrator,
         credential,
         assertion: approval.assertion,
     };
-    drop(NodeStore::bootstrap_prepared(
-        directory.path(), network(), ids::ROOT_GRANT,
-        request.clone(), None, UnixMillis(1),
-    ).await.unwrap());
-    assert_err!(NodeStore::bootstrap_prepared(
-        directory.path(), network(), ids::ROOT_GRANT,
-        request, None, UnixMillis(2),
-    ).await, NodeStoreError::AlreadyInitialized);
+    drop(
+        NodeStore::bootstrap_prepared(
+            directory.path(),
+            network(),
+            ids::ROOT_GRANT,
+            request.clone(),
+            None,
+            UnixMillis(1),
+        )
+        .await
+        .unwrap(),
+    );
+    assert_err!(
+        NodeStore::bootstrap_prepared(
+            directory.path(),
+            network(),
+            ids::ROOT_GRANT,
+            request,
+            None,
+            UnixMillis(2),
+        )
+        .await,
+        NodeStoreError::AlreadyInitialized
+    );
     let store = NodeStore::open(directory.path(), network(), None, UnixMillis(2))
-        .await.unwrap();
+        .await
+        .unwrap();
     crate::test_support::passkey_caller(store.state().authority(), &secret, UnixMillis(2));
 }
 
@@ -914,16 +934,24 @@ async fn abandoned_staging_store_does_not_initialize_the_destination() {
     // journal in its staging directory, with no visible destination authority.
     let staging = parent.path().join(".bootstrap-interrupted");
     drop(bootstrap(&staging).await);
-    assert_err!(NodeStore::open(&destination, network(), None, UnixMillis(2)).await,
-        NodeStoreError::Uninitialized);
+    assert_err!(
+        NodeStore::open(&destination, network(), None, UnixMillis(2)).await,
+        NodeStoreError::Uninitialized
+    );
     drop(bootstrap(&destination).await);
-    assert!(NodeStore::open(&destination, network(), None, UnixMillis(2)).await.is_ok());
+    assert!(
+        NodeStore::open(&destination, network(), None, UnixMillis(2))
+            .await
+            .is_ok()
+    );
     assert!(!staging.exists());
 }
 
 #[tokio::test]
 async fn bootstrap_crash_child() {
-    let Ok(path) = std::env::var("HELLAS_TEST_BOOTSTRAP_PATH") else { return };
+    let Ok(path) = std::env::var("HELLAS_TEST_BOOTSTRAP_PATH") else {
+        return;
+    };
     drop(bootstrap(Path::new(&path)).await);
     panic!("configured crash point was not reached");
 }
@@ -933,16 +961,27 @@ async fn process_death_before_and_after_publication_never_exposes_partial_author
         let parent = tempfile::tempdir().unwrap();
         let destination = parent.path().join("node");
         let status = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "work_store::grant::store::bootstrap::tests::bootstrap_crash_child", "--nocapture"])
+            .args([
+                "--exact",
+                "work_store::grant::store::bootstrap::tests::bootstrap_crash_child",
+                "--nocapture",
+            ])
             .env("HELLAS_TEST_BOOTSTRAP_PATH", &destination)
-            .env("HELLAS_TEST_BOOTSTRAP_CRASH", phase).status().unwrap();
+            .env("HELLAS_TEST_BOOTSTRAP_CRASH", phase)
+            .status()
+            .unwrap();
         assert_eq!(status.code(), Some(73));
         if phase == "staged" {
-            assert_err!(NodeStore::open(&destination, network(), None, UnixMillis(2)).await, NodeStoreError::Uninitialized);
+            assert_err!(
+                NodeStore::open(&destination, network(), None, UnixMillis(2)).await,
+                NodeStoreError::Uninitialized
+            );
             drop(bootstrap(&destination).await);
             assert_eq!(std::fs::read_dir(parent.path()).unwrap().count(), 1);
         }
-        let store = NodeStore::open(&destination, network(), None, UnixMillis(2)).await.unwrap();
+        let store = NodeStore::open(&destination, network(), None, UnixMillis(2))
+            .await
+            .unwrap();
         assert_eq!(store.state().authority().revision(), Revision(1));
     }
 }
@@ -965,15 +1004,33 @@ async fn cleanup_preserves_live_stages_and_inert_unmarked_directories() {
 async fn concurrent_bootstrap_commits_only_one_complete_store() {
     let parent = tempfile::tempdir().unwrap();
     let path = parent.path().join("node");
-    let initialize = || NodeStore::bootstrap(&path, network(), ids::ROOT_GRANT,
-        crate::test_support::common_node::approval(auth::Ownership::Bootstrap { root: ids::ROOT_GRANT }, admin()), None, UnixMillis(1));
+    let initialize = || {
+        NodeStore::bootstrap(
+            &path,
+            network(),
+            ids::ROOT_GRANT,
+            crate::test_support::common_node::approval(
+                auth::Ownership::Bootstrap {
+                    root: ids::ROOT_GRANT,
+                },
+                admin(),
+            ),
+            None,
+            UnixMillis(1),
+        )
+    };
     let (first, second) = tokio::join!(initialize(), initialize());
     assert_ne!(first.is_ok(), second.is_ok());
     let error = match (first, second) {
-        (Ok(store), Err(error)) | (Err(error), Ok(store)) => { drop(store); error },
+        (Ok(store), Err(error)) | (Err(error), Ok(store)) => {
+            drop(store);
+            error
+        }
         _ => panic!("one initialization must commit"),
     };
     assert!(matches!(error, NodeStoreError::AlreadyInitialized));
-    let reopened = NodeStore::open(&path, network(), None, UnixMillis(2)).await.unwrap();
+    let reopened = NodeStore::open(&path, network(), None, UnixMillis(2))
+        .await
+        .unwrap();
     assert_eq!(reopened.state().authority().revision(), Revision(1));
 }

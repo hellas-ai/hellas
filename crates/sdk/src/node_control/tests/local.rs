@@ -359,3 +359,33 @@ async fn tls_twelve_is_refused_before_application_authentication() {
     );
     assert_eq!(f.service.local_slots.available_permits(), MAX_CONNECTIONS);
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn same_uid_with_pinned_tls_but_no_credential_cannot_dispatch_an_operation() {
+    let f = fixture().await;
+    let (server_config, client_config) = tls_configs();
+    let socket = f.directory.path().join("no-credential.sock");
+    let listener = f.service.bind_local(&socket, server_config).unwrap();
+    let stream = hellas_wire::local::connect_stream(&socket).await.unwrap();
+    let (stream, context) = hellas_wire::tls::connect(
+        stream,
+        client_config,
+        "localhost".try_into().unwrap(),
+        HostControl::ALPN.as_bytes(),
+    )
+    .await
+    .unwrap();
+    // This process has the right UID and server pin, but deliberately skips
+    // application authentication and sends an actual typed operation.
+    let transport =
+        hellas_wire::local::transport(stream, hellas_wire::mux::Role::Client, context).unwrap();
+    let client = HostControlClientImpl::new(transport);
+    assert!(
+        hellas_work::test_support::within(client.get_host_status(read_request(ROOT_GRANT)))
+            .await
+            .is_err()
+    );
+    listener.shutdown().await.unwrap();
+    assert_eq!(f.service.local_slots.available_permits(), MAX_CONNECTIONS);
+}

@@ -65,16 +65,26 @@ pub async fn run(
     passkey: Option<&hellas_kernel::SoftPasskey>,
 ) -> Result<()> {
     if matches!(args.command, AdminCommand::BootstrapRemote { .. }) {
-        ensure!(args.profile.is_none() && args.control_socket.is_none() && args.node_enrollment.is_none()
-            && args.addresses.is_empty(), "bootstrap uses the invitation's pin and addresses");
-        return bootstrap_remote(args.command, identity, passkey.context("bootstrap requires --passkey")?).await;
+        ensure!(
+            args.profile.is_none()
+                && args.control_socket.is_none()
+                && args.node_enrollment.is_none()
+                && args.addresses.is_empty(),
+            "bootstrap uses the invitation's pin and addresses"
+        );
+        return bootstrap_remote(
+            args.command,
+            identity,
+            passkey.context("bootstrap requires --passkey")?,
+        )
+        .await;
     }
     match &args.command {
         AdminCommand::Bootstrap { .. } | AdminCommand::Recover { .. } => {
             ensure!(
                 args.profile.is_none()
                     && args.control_socket.is_none()
-                        && args.node_enrollment.is_none()
+                    && args.node_enrollment.is_none()
                     && args.addresses.is_empty(),
                 "offline initialization does not connect to a daemon"
             );
@@ -86,12 +96,19 @@ pub async fn run(
     let key = passkey.map_or(SessionKey::Node(&identity.node_key), SessionKey::Passkey);
     let profile =
         profile::ClientProfile::load(args.profile.as_deref().context("--profile is required")?)?;
-    let remote = args.node_enrollment.map(|target| -> Result<iroh::EndpointId> {
-        if let Ok(pin) = target.parse() { return Ok(pin); }
-        let provider = decode_enrollment(&hellas_private::read_bounded_regular_file(
-            Path::new(&target), hellas_work::model::grant::records::MAX_ENROLLMENT_BYTES)?)?;
-        Ok(iroh::EndpointId::from_bytes(&grant_transport(&provider)?)?)
-    }).transpose()?;
+    let remote = args
+        .node_enrollment
+        .map(|target| -> Result<iroh::EndpointId> {
+            if let Ok(pin) = target.parse() {
+                return Ok(pin);
+            }
+            let provider = decode_enrollment(&hellas_private::read_bounded_regular_file(
+                Path::new(&target),
+                hellas_work::model::grant::records::MAX_ENROLLMENT_BYTES,
+            )?)?;
+            Ok(iroh::EndpointId::from_bytes(&grant_transport(&provider)?)?)
+        })
+        .transpose()?;
     if let Some(node) = remote {
         // The application identity is proved inside the authenticated session.
         // A stable endpoint key permits explicit remote ingress admission; use
@@ -186,15 +203,21 @@ where
         }
         AdminCommand::ConfigureProvider { command } => {
             let update: node_control::configuration::ProviderUpdate = read(&command)?;
-            let status = client.configure_provider(hellas_rpc::pb::host::ConfigureProviderRequest {
-                authorization:authorization.0.to_vec(), update:Some(update),
-            }).await?;
+            let status = client
+                .configure_provider(hellas_rpc::pb::host::ConfigureProviderRequest {
+                    authorization: authorization.0.to_vec(),
+                    update: Some(update),
+                })
+                .await?;
             print_status(status)?;
         }
         AdminCommand::SetProviderState { enabled } => {
-            let status = client.set_provider_state(hellas_rpc::pb::host::SetProviderStateRequest {
-                authorization:authorization.0.to_vec(), enabled,
-            }).await?;
+            let status = client
+                .set_provider_state(hellas_rpc::pb::host::SetProviderStateRequest {
+                    authorization: authorization.0.to_vec(),
+                    enabled,
+                })
+                .await?;
             print_status(status)?;
         }
         AdminCommand::Status => {
@@ -592,10 +615,15 @@ fn owner_approval(
     holder: hellas_auth::authority::NodeKey,
 ) -> Result<OwnerApproval> {
     let digest = ownership_digest(ownership, administrator, scope, holder);
-    let envelope = passkey.sign(hellas_kernel::PayloadHash::from_bytes(*digest.as_bytes()))
+    let envelope = passkey
+        .sign(hellas_kernel::PayloadHash::from_bytes(*digest.as_bytes()))
         .map_err(|error| anyhow::anyhow!("passkey signing failed: {error:?}"))?;
-    Ok(OwnerApproval { administrator: administrator.clone(), credential: scope.clone(), holder,
-        assertion: passkey_assertion(&envelope)? })
+    Ok(OwnerApproval {
+        administrator: administrator.clone(),
+        credential: scope.clone(),
+        holder,
+        assertion: passkey_assertion(&envelope)?,
+    })
 }
 
 async fn bootstrap_remote(
@@ -603,45 +631,73 @@ async fn bootstrap_remote(
     identity: &LocalIdentity,
     passkey: &hellas_kernel::SoftPasskey,
 ) -> Result<()> {
-    let AdminCommand::BootstrapRemote { invitation, root_grant, administrator, credential_scope, profile_out } = command
-        else { anyhow::bail!("remote bootstrap required") };
+    let AdminCommand::BootstrapRemote {
+        invitation,
+        root_grant,
+        administrator,
+        credential_scope,
+        profile_out,
+    } = command
+    else {
+        anyhow::bail!("remote bootstrap required")
+    };
     let invitation: node_control::bootstrap::Invitation = read(&invitation)?;
     let root: GrantId = root_grant.parse()?;
     let administrator: GrantSpec = read(&administrator)?;
     let scope: GrantSpec = read(&credential_scope)?;
     let holder = hellas_auth::authority::NodeKey::from_public_key(identity.node_key.public_key())?;
-    let approval = owner_approval(passkey, Ownership::Bootstrap { root }, &administrator, &scope, holder)?;
-    let (credential, secret) = Credential::prepare(scope.clone(), CredentialHolder::Node(holder), 1)?;
+    let approval = owner_approval(
+        passkey,
+        Ownership::Bootstrap { root },
+        &administrator,
+        &scope,
+        holder,
+    )?;
+    let (credential, secret) =
+        Credential::prepare(scope.clone(), CredentialHolder::Node(holder), 1)?;
     let profile = profile::install_remote(&profile_out, scope.authority, root, &secret)?;
     let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
-        .secret_key(identity.transport_key.clone()).bind().await?;
-    let result = node_control::bootstrap::connect(&endpoint, &invitation, root,
-        hellas_work::work_store::grant::PreparedBootstrap { administrator,
-            credential, assertion: approval.assertion }).await;
+        .secret_key(identity.transport_key.clone())
+        .bind()
+        .await?;
+    let result = node_control::bootstrap::connect(
+        &endpoint,
+        &invitation,
+        root,
+        hellas_work::work_store::grant::PreparedBootstrap {
+            administrator,
+            credential,
+            assertion: approval.assertion,
+        },
+    )
+    .await;
     endpoint.close().await;
     result.with_context(|| format!("credential {} retained in {}; authenticate and inspect its exact ID after a lost reply", secret.id(), profile.display()))?;
-    println!("{}", serde_json::json!({"profile":profile,"node_id":invitation.node,"credential_id":secret.id()}));
+    println!(
+        "{}",
+        serde_json::json!({"profile":profile,"node_id":invitation.node,"credential_id":secret.id()})
+    );
     Ok(())
 }
 
 fn print_status(status: hellas_rpc::pb::host::HostStatus) -> Result<()> {
     let configuration = status.provider_configuration;
-            let machine = status.machine.map(|m| -> Result<_> {
+    let machine = status.machine.map(|m| -> Result<_> {
                 let limits: Vec<hellas_work::model::grant::budget::Limit> = decode_dag_cbor(&m.limits)?;
                 Ok(serde_json::json!({"revision": m.revision, "max_in_flight": m.max_in_flight, "limits": limits}))
             }).transpose()?;
-            println!(
-                "{}",
-                serde_json::json!({
-                    "authority": hex::encode(status.authority),
-                    "revision": status.authority_revision,
-                    "generation": status.generation,
-                    "provider_configured": status.provider_configured,
-                    "machine": machine,
-                    "endpoint": status.endpoint,
-                    "provider_state": status.provider.map(|provider| provider.state),
-                    "configuration": configuration,
-                })
-            );
+    println!(
+        "{}",
+        serde_json::json!({
+            "authority": hex::encode(status.authority),
+            "revision": status.authority_revision,
+            "generation": status.generation,
+            "provider_configured": status.provider_configured,
+            "machine": machine,
+            "endpoint": status.endpoint,
+            "provider_state": status.provider.map(|provider| provider.state),
+            "configuration": configuration,
+        })
+    );
     Ok(())
 }

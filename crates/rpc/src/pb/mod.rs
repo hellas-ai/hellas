@@ -244,7 +244,10 @@ mod id_pins {
 #[cfg(feature = "host-control")]
 impl core::fmt::Debug for host::UpstreamKey {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("UpstreamKey").field("service", &self.service)
-            .field("method", &self.method).field("key", &self.key).finish_non_exhaustive()
+        f.debug_struct("UpstreamKey")
+            .field("service", &self.service)
+            .field("method", &self.method)
+            .field("key", &self.key)
+            .finish_non_exhaustive()
     }
 }

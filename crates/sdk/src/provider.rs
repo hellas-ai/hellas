@@ -322,11 +322,18 @@ pub struct ProviderHandle {
 }
 
 impl ProviderHandle {
-    pub fn with_configuration(mut self, metadata: crate::node_control::configuration::ProviderMetadata) -> Self {
+    pub fn with_configuration(
+        mut self,
+        metadata: crate::node_control::configuration::ProviderMetadata,
+    ) -> Self {
         self.configuration = Some(metadata);
         self
     }
-    pub(crate) fn configuration(&self) -> Option<&crate::node_control::configuration::ProviderMetadata> { self.configuration.as_ref() }
+    pub(crate) fn configuration(
+        &self,
+    ) -> Option<&crate::node_control::configuration::ProviderMetadata> {
+        self.configuration.as_ref()
+    }
 
     pub fn node_id(&self) -> EndpointId {
         self.endpoint.id()
@@ -372,7 +379,9 @@ impl ProviderHandle {
             let stopped = work.shutdown().await.map_err(ProviderError::from);
             result = result.and(stopped);
         }
-        if self.owns_endpoint { self.endpoint.close().await; }
+        if self.owns_endpoint {
+            self.endpoint.close().await;
+        }
         result
     }
 }
@@ -465,13 +474,18 @@ where
         None => None,
     };
     let alpns = advertised_alpns.clone();
-    let ingress = match prepared_grants.as_ref().map(|(grants, _)| &grants.authority) {
+    let ingress = match prepared_grants
+        .as_ref()
+        .map(|(grants, _)| &grants.authority)
+    {
         Some(ProviderAuthority::Host(control)) => control.provider_ingress()?,
         _ => None,
     };
     let (endpoint, mut ingress, owns_endpoint) = match ingress {
         Some((endpoint, receiver)) => {
-            if endpoint.id() != config.secret_key.public() { return Err(ProviderError::Identity); }
+            if endpoint.id() != config.secret_key.public() {
+                return Err(ProviderError::Identity);
+            }
             (endpoint, Some(receiver), false)
         }
         None => {
@@ -554,9 +568,16 @@ where
                 } else {
                     loop {
                         let incoming = accept_endpoint.accept().await?;
-                        if at_capacity { incoming.refuse(); continue; }
-                        let Ok(accepting) = incoming.accept() else { continue };
-                        if let Ok(Ok(connection)) = tokio::time::timeout(RPC_HANDSHAKE_TIMEOUT, accepting).await {
+                        if at_capacity {
+                            incoming.refuse();
+                            continue;
+                        }
+                        let Ok(accepting) = incoming.accept() else {
+                            continue;
+                        };
+                        if let Ok(Ok(connection)) =
+                            tokio::time::timeout(RPC_HANDSHAKE_TIMEOUT, accepting).await
+                        {
                             return Some(connection);
                         }
                     }

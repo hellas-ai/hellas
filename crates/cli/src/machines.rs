@@ -16,23 +16,41 @@ pub struct MachinesArgs {
 }
 #[derive(clap::Subcommand)]
 enum MachineCommand {
-    Create { #[arg(long)] spec: PathBuf },
+    Create {
+        #[arg(long)]
+        spec: PathBuf,
+    },
     List,
-    Destroy { id: String },
+    Destroy {
+        id: String,
+    },
 }
 pub async fn run(args: MachinesArgs) -> Result<()> {
     let provider_name = args.provider.context("--provider is required")?;
-    let source = args.credential_source.context("--credential-source is required")?;
+    let source = args
+        .credential_source
+        .context("--credential-source is required")?;
     let credential = serde_json::from_slice(&hellas_private::read_bounded_regular_file(
-        &source, 64 * 1024,
-    )?).context("invalid provider credential source")?;
-    let config = args.provider_config.map(|path| -> Result<serde_json::Value> {
-        Ok(serde_json::from_slice(&hellas_private::read_bounded_regular_file(&path, 64 * 1024)?)?)
-    }).transpose()?.unwrap_or_else(|| serde_json::json!({}));
+        &source,
+        64 * 1024,
+    )?)
+    .context("invalid provider credential source")?;
+    let config = args
+        .provider_config
+        .map(|path| -> Result<serde_json::Value> {
+            Ok(serde_json::from_slice(
+                &hellas_private::read_bounded_regular_file(&path, 64 * 1024)?,
+            )?)
+        })
+        .transpose()?
+        .unwrap_or_else(|| serde_json::json!({}));
     let provider = hellas_cloud::open(&provider_name, credential, config)?;
     match args.command {
         MachineCommand::Create { spec } => {
-            let spec = serde_json::from_slice(&hellas_private::read_bounded_regular_file(&spec, 64 * 1024)?)?;
+            let spec = serde_json::from_slice(&hellas_private::read_bounded_regular_file(
+                &spec,
+                64 * 1024,
+            )?)?;
             println!("{}", serde_json::to_string(&provider.create(&spec).await?)?);
         }
         MachineCommand::List => println!("{}", serde_json::to_string(&provider.list().await?)?),

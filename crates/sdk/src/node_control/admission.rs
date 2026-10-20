@@ -27,13 +27,19 @@ impl RemoteControlAdmission {
                 "remote control requires at most 128 distinct endpoint keys",
             ));
         }
-        Ok(Self { peers: Arc::new(peers), public: false })
+        Ok(Self {
+            peers: Arc::new(peers),
+            public: false,
+        })
     }
 
     /// Explicitly enable public transport ingress. Every peer must still prove
     /// its application credential and holder before any operation is dispatched.
     pub fn credential_gated() -> Self {
-        Self { peers: Arc::default(), public: true }
+        Self {
+            peers: Arc::default(),
+            public: true,
+        }
     }
 
     pub fn enabled(&self) -> bool {
@@ -51,6 +57,7 @@ impl EndpointHooks for RemoteControlAdmission {
             && connection.alpn() == HostControl::ALPN.as_bytes()
             && !self.allows(connection.remote_id())
         {
+            tracing::warn!("remote control peer restriction refused transport");
             AfterHandshakeOutcome::Reject {
                 error_code: 403u32.into(),
                 reason: b"remote control endpoint is not admitted".to_vec(),

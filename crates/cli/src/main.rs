@@ -9,10 +9,10 @@ use std::path::{Path, PathBuf};
 #[cfg(feature = "evaluate")]
 mod evaluate;
 
-#[cfg(unix)]
-mod machines;
 mod commands;
 mod identity;
+#[cfg(unix)]
+mod machines;
 mod metrics;
 mod platform_hardening;
 mod tracing_config;

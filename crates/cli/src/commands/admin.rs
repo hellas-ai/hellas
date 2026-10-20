@@ -60,7 +60,10 @@ pub enum AdminCommand {
     /// Apply a typed upstream update; endpoint changes and key replacement/removal require --passkey.
     ConfigureProvider { command: PathBuf },
     /// Start or stop the provider through the normal host lifecycle.
-    SetProviderState { #[arg(long, action = clap::ArgAction::Set)] enabled: bool },
+    SetProviderState {
+        #[arg(long, action = clap::ArgAction::Set)]
+        enabled: bool,
+    },
     /// Replace machine concurrency and budgets; revision zero initializes a provider.
     SetCapacity {
         #[arg(long)]

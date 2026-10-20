@@ -13,8 +13,8 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-mod codex_provider;
 pub mod bootstrap;
+mod codex_provider;
 mod configuration;
 pub mod provision;
 pub mod work_config;
@@ -174,18 +174,24 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
     let chain = work_runner.as_ref().map(|(_, chain)| chain.clone());
     let node_id = options.secret_key.public();
     let provider = hellas_sdk::ProviderOptions {
-            port: options.port,
-            executor,
-            build,
-            graffiti,
-            work: work_runner,
-            grants: None,
-            discovery: options.discovery,
-            secret_key: options.secret_key,
-            open_identity: options.open_identity,
-        };
-    let node = configuration::start_host(provider, options.grants, options.fetch_config_file, options.transport)
-        .await.context("failed to start node server")?;
+        port: options.port,
+        executor,
+        build,
+        graffiti,
+        work: work_runner,
+        grants: None,
+        discovery: options.discovery,
+        secret_key: options.secret_key,
+        open_identity: options.open_identity,
+    };
+    let node = configuration::start_host(
+        provider,
+        options.grants,
+        options.fetch_config_file,
+        options.transport,
+    )
+    .await
+    .context("failed to start node server")?;
 
     if let Some(metrics_port) = options.metrics_port {
         let mut registry = prometheus_client::registry::Registry::default();
@@ -235,7 +241,8 @@ fn shutdown_signal() -> std::io::Result<impl std::future::Future<Output = std::i
 }
 
 fn load_fetch_config(path: &std::path::Path) -> CliResult<FetchRouteRegistry> {
-    let bytes = hellas_private::read_bounded_regular_file(path, 64 * 1024).with_context(|| format!("failed to read {}", path.display()))?;
+    let bytes = hellas_private::read_bounded_regular_file(path, 64 * 1024)
+        .with_context(|| format!("failed to read {}", path.display()))?;
     let file: FetchConfigFile = serde_json::from_slice(&bytes)
         .with_context(|| format!("failed to parse {}", path.display()))?;
 

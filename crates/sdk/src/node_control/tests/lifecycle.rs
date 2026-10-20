@@ -43,7 +43,9 @@ impl Harness {
                     forbidden_journal.clone(),
                 );
                 Box::pin(async move {
-                    if update.is_some() { return Err("configuration is not mounted".into()); }
+                    if update.is_some() {
+                        return Err("configuration is not mounted".into());
+                    }
                     if starts.fetch_add(1, Ordering::SeqCst) == 0 {
                         starting.notify_one();
                         release.acquire().await.unwrap().forget();
@@ -82,8 +84,15 @@ impl Harness {
             })
         };
         let host = HostHandle::start(HostOptions {
-            transport: Some(host::bind_transport(SecretKey::from_bytes(&[5; 32]), Some(0),
-                RemoteControlAdmission::credential_gated()).await.unwrap()),
+            transport: Some(
+                host::bind_transport(
+                    SecretKey::from_bytes(&[5; 32]),
+                    Some(0),
+                    RemoteControlAdmission::credential_gated(),
+                )
+                .await
+                .unwrap(),
+            ),
             start_provider: false,
             control: Some((
                 f.node.clone(),
@@ -541,8 +550,8 @@ async fn controlled_host(
     let (tls, client_tls) = tls_configs();
     let socket = directory.join("control.sock");
     let host = HostHandle::start(HostOptions {
-            transport: None,
-            start_provider: false,
+        transport: None,
+        start_provider: false,
         control: Some((
             node,
             crate::ProviderControl {
@@ -759,20 +768,117 @@ async fn normal_remote_control_survives_provider_restarts_and_accepts_another_de
     h.release.add_permits(1);
     let address = h.host.endpoint().unwrap().addr();
     for key in [[91; 32], [92; 32]] {
-        let endpoint = Endpoint::builder(presets::Minimal).secret_key(SecretKey::from_bytes(&key))
-            .bind().await.unwrap();
-        let connection = endpoint.connect(address.clone(), HostControl::ALPN.as_bytes()).await.unwrap();
-        let (client, _) = connect_iroh(connection, authority(), &h.fixture.secret,
-            hellas_work::node::SessionKey::Passkey(&ROOT.passkey())).await.unwrap();
+        let endpoint = Endpoint::builder(presets::Minimal)
+            .secret_key(SecretKey::from_bytes(&key))
+            .bind()
+            .await
+            .unwrap();
+        let connection = endpoint
+            .connect(address.clone(), HostControl::ALPN.as_bytes())
+            .await
+            .unwrap();
+        let (client, _) = connect_iroh(
+            connection,
+            authority(),
+            &h.fixture.secret,
+            hellas_work::node::SessionKey::Passkey(&ROOT.passkey()),
+        )
+        .await
+        .unwrap();
         for enabled in [true, false, true] {
-            let status = client.set_provider_state(SetProviderStateRequest {
-                enabled, authorization: ROOT_GRANT.0.to_vec(),
-            }).await.unwrap();
+            let status = client
+                .set_provider_state(SetProviderStateRequest {
+                    enabled,
+                    authorization: ROOT_GRANT.0.to_vec(),
+                })
+                .await
+                .unwrap();
             assert_eq!(status.authority, authority().0.as_bytes());
-            assert_eq!(status.provider.unwrap().state, if enabled { RuntimeState::Running } else { RuntimeState::Stopped } as i32);
+            assert_eq!(
+                status.provider.unwrap().state,
+                if enabled {
+                    RuntimeState::Running
+                } else {
+                    RuntimeState::Stopped
+                } as i32
+            );
             assert_eq!(status.endpoint, address.id.to_string());
         }
         endpoint.close().await;
     }
+    h.host.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn host_enforces_configuration_step_up_before_calling_the_embedder() {
+    use crate::node_control::configuration::*;
+    let h = Harness::new().await;
+    let (client, _) = connect_local(
+        &h.socket,
+        h.tls.clone(),
+        "localhost".try_into().unwrap(),
+        authority(),
+        &h.fixture.secret,
+        hellas_work::node::SessionKey::Node(&ROOT.node_key()),
+    )
+    .await
+    .unwrap();
+    let key = UpstreamKey {
+        service: "api".into(),
+        method: "fetch".into(),
+        key: "key".into(),
+        allowed_origins: vec!["https://example.com".into()],
+        allowed_paths: vec!["/v1".into()],
+        allowed_methods: vec!["POST".into()],
+        header_name: "authorization".into(),
+        prefix: "Bearer ".into(),
+        secret: "never-in-status".into(),
+    };
+    for change in [
+        UpstreamChange::SetEndpoint(UpstreamEndpoint {
+            service: "api".into(),
+            method: "fetch".into(),
+            allowed_hosts: vec!["example.com".into()],
+            allow_private_addresses: false,
+        }),
+        UpstreamChange::RemoveEndpoint(UpstreamRoute {
+            service: "api".into(),
+            method: "fetch".into(),
+        }),
+        UpstreamChange::ReplaceKey(key.clone()),
+        UpstreamChange::RemoveKey(UpstreamKeyId {
+            service: "api".into(),
+            method: "fetch".into(),
+            key: "key".into(),
+        }),
+    ] {
+        let error = client
+            .configure_provider(ConfigureProviderRequest {
+                authorization: ROOT_GRANT.0.to_vec(),
+                update: Some(ProviderUpdate {
+                    expected_revision: 0,
+                    change: Some(change),
+                }),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), WireCode::PermissionDenied);
+    }
+    assert_eq!(h.starts.load(Ordering::SeqCst), 0);
+    // Add-only reaches the configured embedding on a daily session. This fixture
+    // intentionally has no configuration implementation, so it refuses there.
+    h.release.add_permits(1);
+    let error = client
+        .configure_provider(ConfigureProviderRequest {
+            authorization: ROOT_GRANT.0.to_vec(),
+            update: Some(ProviderUpdate {
+                expected_revision: 0,
+                change: Some(UpstreamChange::AddKey(key)),
+            }),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), WireCode::Unavailable);
+    assert_eq!(h.starts.load(Ordering::SeqCst), 0);
     h.host.shutdown().await.unwrap();
 }

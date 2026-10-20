@@ -24,9 +24,9 @@ use tokio::{sync::Semaphore, time::Instant};
 
 use crate::application_handshake as handshake;
 mod admission;
-pub mod host;
 pub mod bootstrap;
 pub mod configuration;
+pub mod host;
 pub use admission::RemoteControlAdmission;
 pub mod profile;
 const MAX_CONNECTIONS: usize = 16;
@@ -58,8 +58,14 @@ impl NodeControl {
         }
     }
 
-    pub(crate) fn provider_ingress(&self) -> Result<Option<(iroh::Endpoint, tokio::sync::mpsc::Receiver<Connection>)>, WireStatus> {
-        self.host.as_ref().map(host::Runtime::provider_ingress).transpose().map(Option::flatten)
+    pub(crate) fn provider_ingress(
+        &self,
+    ) -> Result<Option<(iroh::Endpoint, tokio::sync::mpsc::Receiver<Connection>)>, WireStatus> {
+        self.host
+            .as_ref()
+            .map(host::Runtime::provider_ingress)
+            .transpose()
+            .map(Option::flatten)
     }
 
     pub(crate) fn node(&self) -> NodeCoordinator {
@@ -134,8 +140,13 @@ impl NodeControl {
             Ok::<_, WireStatus>(authenticated)
         })
         .await
-        .map_err(|_| { tracing::warn!("remote control authentication timed out"); denied() })?
-        .map_err(|error| { tracing::warn!("remote control authentication refused"); error })?;
+        .map_err(|_| {
+            tracing::warn!("remote control authentication timed out");
+            denied()
+        })?
+        .inspect_err(|_| {
+            tracing::warn!("remote control authentication refused");
+        })?;
         tracing::info!("remote control application session admitted");
         serve(
             transport,
@@ -525,17 +536,44 @@ impl HostControlHandler for ControlSession {
         })
     }
 
-    async fn configure_provider(&self, request: ConfigureProviderRequest) -> Result<HostStatus, WireStatus> {
+    async fn configure_provider(
+        &self,
+        request: ConfigureProviderRequest,
+    ) -> Result<HostStatus, WireStatus> {
         let authorization = grant_id(&request.authorization)?;
-        let update = request.update.filter(|update| update.change.is_some()).ok_or_else(invalid)?;
+        let update = request
+            .update
+            .filter(|update| update.change.is_some())
+            .ok_or_else(invalid)?;
         let caller = self.caller().await?;
-        let receiver = self.node.host_action(caller, authorization, hellas_work::node::HOST_PROVIDER_CONFIGURE, |_| {
-            if configuration::requires_passkey(&update) { caller.session().step_up().map_err(|_| denied())?; }
-            self.host.as_ref().ok_or_else(unsupported)?.configure(update)
-        }).await.map_err(node_error)??;
+        let receiver = self
+            .node
+            .host_action(
+                caller,
+                authorization,
+                hellas_work::node::HOST_PROVIDER_CONFIGURE,
+                |_| {
+                    if configuration::requires_passkey(&update) {
+                        caller.session().step_up().map_err(|_| denied())?;
+                    }
+                    self.host
+                        .as_ref()
+                        .ok_or_else(unsupported)?
+                        .configure(update)
+                },
+            )
+            .await
+            .map_err(node_error)??;
         receiver.await.map_err(|_| unavailable())??;
-        self.node.host_action(self.caller().await?, authorization, hellas_work::node::HOST_PROVIDER_CONFIGURE,
-            |status| self.status_reply(status)).await.map_err(node_error)?
+        self.node
+            .host_action(
+                self.caller().await?,
+                authorization,
+                hellas_work::node::HOST_PROVIDER_CONFIGURE,
+                |status| self.status_reply(status),
+            )
+            .await
+            .map_err(node_error)?
     }
     async fn set_provider_state(
         &self,

@@ -97,7 +97,9 @@ impl<R: RootProver + Send + Sync + 'static> OpenAiProviderOptions<R> {
         Arc::new(move |host, update| {
             let options = options.clone();
             Box::pin(async move {
-                if update.is_some() { return Err("provider configuration is not mounted".into()); }
+                if update.is_some() {
+                    return Err("provider configuration is not mounted".into());
+                }
                 Ok(start_openai_provider(&options, host).await?)
             })
         })

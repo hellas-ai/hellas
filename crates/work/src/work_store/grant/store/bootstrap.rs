@@ -219,8 +219,8 @@ impl NodeStore {
         // empty destination is safe: no authority exists there, and a concurrent
         // committed initialization makes remove_dir fail rather than replacing it.
         match std::fs::remove_dir(directory) {
-            Ok(()) => {},
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(_) => return Err(NodeStoreError::AlreadyInitialized),
         }
         // The marker's exclusive lock stays held across publication.
@@ -234,8 +234,7 @@ impl NodeStore {
         hellas_private::sync_directory(parent)?;
         #[cfg(test)]
         bootstrap_crash_point("published");
-        let (journal, _) =
-            Journal::open_existing(directory, "grants", marker.journal_id()).await?;
+        let (journal, _) = Journal::open_existing(directory, "grants", marker.journal_id()).await?;
         Ok(Self {
             clock,
             _identity_lock: identity_lock,
@@ -289,15 +288,21 @@ impl NodeStore {
 fn remove_abandoned_bootstrap_stages(parent: &Path) -> Result<(), NodeStoreError> {
     for entry in std::fs::read_dir(parent)? {
         let entry = entry?;
-        if !entry.file_name().as_encoded_bytes().starts_with(b".bootstrap-")
+        if !entry
+            .file_name()
+            .as_encoded_bytes()
+            .starts_with(b".bootstrap-")
             || !entry.file_type()?.is_dir()
         {
             continue;
         }
-        let Ok(file) = hellas_private::open_regular_file_nofollow(&entry.path().join(MARKER)) else {
+        let Ok(file) = hellas_private::open_regular_file_nofollow(&entry.path().join(MARKER))
+        else {
             continue;
         };
-        if !hellas_private::is_private(&file)? { continue; }
+        if !hellas_private::is_private(&file)? {
+            continue;
+        }
         if file.try_lock().is_ok() {
             let _lock = IdentityLock(file);
             std::fs::remove_dir_all(entry.path())?;
