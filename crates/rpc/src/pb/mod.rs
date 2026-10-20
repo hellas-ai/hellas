@@ -148,12 +148,6 @@ pub mod services {
     include!(concat!(env!("OUT_DIR"), "/hellas_rpc_services.rs"));
 }
 
-/// Pinned wire IDs, end-to-end: proto file → descriptor walk → canonical
-/// schema encoding → truncated Xet hash. If one of these assertions fails,
-/// either the canonical encoding or the proto definition changed — both
-/// rotate the ID, and deployed nodes will refuse this build's calls on
-/// the affected methods. Update a pin only as a deliberate protocol break.
-
 #[cfg(feature = "host-control")]
 impl core::fmt::Debug for host::UpstreamKey {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -165,6 +159,11 @@ impl core::fmt::Debug for host::UpstreamKey {
     }
 }
 
+/// Pinned wire IDs, end-to-end: proto file → descriptor walk → canonical
+/// schema encoding → truncated Xet hash. If one of these assertions fails,
+/// either the canonical encoding or the proto definition changed — both
+/// rotate the ID, and deployed nodes will refuse this build's calls on
+/// the affected methods. Update a pin only as a deliberate protocol break.
 #[cfg(test)]
 mod id_pins {
     #[allow(unused_imports)]
@@ -207,8 +206,8 @@ mod id_pins {
     #[test]
     fn host_control_ids_are_stable() {
         use super::services::host_control::{
-            BindProvider, ConfigureProvider, GetGatewayAccess, GrantControl, HostControl, IssueCredential,
-            RevokeCredential, SetGatewayState, SetProviderState, WorkControl,
+            BindProvider, ConfigureProvider, GetGatewayAccess, GrantControl, HostControl,
+            IssueCredential, RevokeCredential, SetGatewayState, SetProviderState, WorkControl,
         };
         // Typed provider configuration changes the HostControl service descriptor.
         assert_eq!(<HostControl as ServiceMarker>::SERVICE_ID, 0x5169_5ede);

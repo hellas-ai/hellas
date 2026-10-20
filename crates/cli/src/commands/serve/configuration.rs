@@ -111,7 +111,7 @@ fn apply(path: &Path, update: ProviderUpdate) -> CliResult<Vec<u8>> {
     Ok(old)
 }
 fn write_update(path: &Path, old: &[u8], update: ProviderUpdate) -> CliResult<()> {
-    let mut file: FetchConfigFile = serde_json::from_slice(&old)?;
+    let mut file: FetchConfigFile = serde_json::from_slice(old)?;
     anyhow::ensure!(
         file.revision == update.expected_revision,
         "stale provider configuration revision"
@@ -314,6 +314,27 @@ fn clean_unused_keys(path: &Path) -> CliResult<()> {
     Ok(())
 }
 
+fn key_directory(path: &Path) -> CliResult<PathBuf> {
+    let mut name = path
+        .file_name()
+        .context("configuration needs a file name")?
+        .to_os_string();
+    name.push(".keys");
+    Ok(path.with_file_name(name))
+}
+
+fn check_key_directory(path: &Path) -> CliResult<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => anyhow::ensure!(
+            metadata.is_dir() && !metadata.file_type().is_symlink(),
+            "managed key directory must be an ordinary directory"
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -495,25 +516,4 @@ mod tests {
         assert!(clean_unused_keys(&path).is_err());
         assert_eq!(std::fs::read_to_string(protected).unwrap(), "retained");
     }
-}
-
-fn key_directory(path: &Path) -> CliResult<PathBuf> {
-    let mut name = path
-        .file_name()
-        .context("configuration needs a file name")?
-        .to_os_string();
-    name.push(".keys");
-    Ok(path.with_file_name(name))
-}
-
-fn check_key_directory(path: &Path) -> CliResult<()> {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) => anyhow::ensure!(
-            metadata.is_dir() && !metadata.file_type().is_symlink(),
-            "managed key directory must be an ordinary directory"
-        ),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
-    Ok(())
 }

@@ -7,7 +7,6 @@ const TEST_ENVIRONMENT: &str = "/path/to/model.environment";
 const TEST_MANIFEST_ID: &str = "4444444444444444444444444444444444444444444444444444444444444444";
 const TEST_TOKENIZER: &str = "/path/to/tokenizer.json";
 const TEST_CONTENT: &str = "/path/to/model.hex";
-const TEST_PROVIDER: &str = "1111111111111111111111111111111111111111111111111111111111111111";
 const TEST_REMOTE_TRUST_ARGS: &[&str] = &[
     "--trust-store",
     "/state/trust",

@@ -602,31 +602,30 @@ fn validate_identity_options(
         ));
     }
 
-    let reads_existing_identity = match command {
-        Commands::Gateway { offer: Some(_), .. } => true,
-        Commands::Offer {
-            command: commands::contributions::OfferCommand::ImportBundle { .. },
-        } => true,
-        Commands::Admin(_) => true,
-        Commands::Identity {
-            command:
-                IdentityCommand::ShowNodeId
-                | IdentityCommand::ShowEnrollmentId
-                | IdentityCommand::ShowHolder
-                | IdentityCommand::ExportEnrollment { .. },
-        } => true,
-        Commands::Serve {
-            work_config_file: Some(_),
-            ..
-        }
-        | Commands::Provision { .. } => true,
-        Commands::PaidWork { .. } => true,
-        Commands::Gateway {
-            paid_work_config: Some(_),
-            ..
-        } => true,
-        _ => false,
-    };
+    let reads_existing_identity = matches!(
+        command,
+        Commands::Gateway { offer: Some(_), .. }
+            | Commands::Offer {
+                command: commands::contributions::OfferCommand::ImportBundle { .. },
+            }
+            | Commands::Admin(_)
+            | Commands::Identity {
+                command: IdentityCommand::ShowNodeId
+                    | IdentityCommand::ShowEnrollmentId
+                    | IdentityCommand::ShowHolder
+                    | IdentityCommand::ExportEnrollment { .. },
+            }
+            | Commands::Serve {
+                work_config_file: Some(_),
+                ..
+            }
+            | Commands::Provision { .. }
+            | Commands::PaidWork { .. }
+            | Commands::Gateway {
+                paid_work_config: Some(_),
+                ..
+            }
+    );
     if software_root && reads_existing_identity {
         return Err(
             "--software-root only selects the root when creating an identity; this command reads an existing identity"

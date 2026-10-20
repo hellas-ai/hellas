@@ -505,7 +505,7 @@ change a resource's current policy, but every new job must still use an approved
 execution manifest before its proposal or payload is sent. Review and approve a new
 contract explicitly, then restart the gateway to use the updated caller policy.
 Nix gateway services use `trustStore`, `trustPolicy`, `workProfile` and the
-principal's `passkey` file, plus `offer`, `machine` or `local`/`localGrant`.
+principal's `passkey` file, plus `offer` or `local`/`localGrant`.
 Provision these private files for the service user before startup; Nix declarations
 do not approve trust or create grants.
 
