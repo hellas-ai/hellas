@@ -12,6 +12,7 @@ struct Harness {
     starting: Arc<tokio::sync::Notify>,
     release: Arc<Semaphore>,
     starts: Arc<AtomicUsize>,
+    invocations: Arc<AtomicUsize>,
     forbidden_journal: std::path::PathBuf,
 }
 impl Harness {
@@ -19,6 +20,9 @@ impl Harness {
         Self::with(fixture().await).await
     }
     async fn with(f: Fixture) -> Self {
+        Self::build(f, true).await
+    }
+    async fn build(f: Fixture, configurable: bool) -> Self {
         let (tls, client_tls) = tls_configs();
         let socket = f.directory.path().join("host.sock");
         let forbidden_journal = f.directory.path().join("unused-provider-directory");
@@ -26,6 +30,7 @@ impl Harness {
         let starting = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(Semaphore::new(0));
         let starts = Arc::new(AtomicUsize::new(0));
+        let invocations = Arc::new(AtomicUsize::new(0));
         let factory: host::ProviderFactory = {
             let (starting, release, starts, enrollment, forbidden_journal) = (
                 starting.clone(),
@@ -34,54 +39,64 @@ impl Harness {
                 enrollment.clone(),
                 forbidden_journal.clone(),
             );
-            Arc::new(move |control: Option<NodeControl>, update| {
-                let (starting, release, starts, enrollment, forbidden_journal) = (
-                    starting.clone(),
-                    release.clone(),
-                    starts.clone(),
-                    enrollment.clone(),
-                    forbidden_journal.clone(),
-                );
-                Box::pin(async move {
-                    if update.is_some() {
-                        return Err("configuration is not mounted".into());
-                    }
-                    if starts.fetch_add(1, Ordering::SeqCst) == 0 {
-                        starting.notify_one();
-                        release.acquire().await.unwrap().forget();
-                    }
-                    Ok(crate::start_fetch_provider(
-                        crate::FetchProviderOptions {
-                            port: Some(0),
-                            identity: crate::NodeIdentity::from_secret_bytes(
-                                [5; 32],
-                                hellas_work::test_support::actors::PROVIDER
-                                    .node_key()
-                                    .to_secret_bytes(),
-                            )?,
-                            enrollment,
-                            root: Arc::new(hellas_work::test_support::actors::PROVIDER.node_key()),
-                            state_directory: forbidden_journal,
-                            grants: Some(crate::GrantProviderOptions {
-                                policies: vec![],
-                                max_job_millis: std::num::NonZeroU64::MIN,
-                            }),
-                            routes: crate::FetchRouteRegistry::new(),
-                            fetch_max_in_flight: 1,
-                            fetch_queue_capacity: 1,
-                            paid_work: None,
+            let prepares = invocations.clone();
+            let calls = invocations.clone();
+            host::ProviderFactory {
+                prepare: configurable.then(|| {
+                    Arc::new(move |_| {
+                        prepares.fetch_add(1, Ordering::SeqCst);
+                        Err("configuration is not mounted".into())
+                    }) as host::ProviderPrepare
+                }),
+                start: Arc::new(move |control: Option<NodeControl>| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    let (starting, release, starts, enrollment, forbidden_journal) = (
+                        starting.clone(),
+                        release.clone(),
+                        starts.clone(),
+                        enrollment.clone(),
+                        forbidden_journal.clone(),
+                    );
+                    Box::pin(async move {
+                        if starts.fetch_add(1, Ordering::SeqCst) == 0 {
+                            starting.notify_one();
+                            release.acquire().await.unwrap().forget();
                         }
-                        .prepare()
-                        .await?
-                        .on_host(control.ok_or(crate::ProviderError::FundingRequired)?)?,
-                    )
-                    .await?)
-                })
-                    as futures::future::BoxFuture<
-                        'static,
-                        Result<crate::ProviderHandle, Box<dyn std::error::Error + Send + Sync>>,
-                    >
-            })
+                        Ok(crate::start_fetch_provider(
+                            crate::FetchProviderOptions {
+                                port: Some(0),
+                                identity: crate::NodeIdentity::from_secret_bytes(
+                                    [5; 32],
+                                    hellas_work::test_support::actors::PROVIDER
+                                        .node_key()
+                                        .to_secret_bytes(),
+                                )?,
+                                enrollment,
+                                root: Arc::new(
+                                    hellas_work::test_support::actors::PROVIDER.node_key(),
+                                ),
+                                state_directory: forbidden_journal,
+                                grants: Some(crate::GrantProviderOptions {
+                                    policies: vec![],
+                                    max_job_millis: std::num::NonZeroU64::MIN,
+                                }),
+                                routes: crate::FetchRouteRegistry::new(),
+                                fetch_max_in_flight: 1,
+                                fetch_queue_capacity: 1,
+                                paid_work: None,
+                            }
+                            .prepare()
+                            .await?
+                            .on_host(control.ok_or(crate::ProviderError::FundingRequired)?)?,
+                        )
+                        .await?)
+                    })
+                        as futures::future::BoxFuture<
+                            'static,
+                            Result<crate::ProviderHandle, Box<dyn std::error::Error + Send + Sync>>,
+                        >
+                }),
+            }
         };
         let host = HostHandle::start(HostOptions {
             transport: Some(
@@ -115,6 +130,7 @@ impl Harness {
             starting,
             release,
             starts,
+            invocations,
             forbidden_journal,
         }
     }
@@ -633,14 +649,17 @@ async fn set_gateway_state_starts_the_gateway_chosen_at_run_time() {
 #[tokio::test]
 async fn failed_provider_start_reports_its_error() {
     let f = fixture().await;
-    let factory: host::ProviderFactory = Arc::new(|_, _| {
-        Box::pin(async {
-            let panicked = tokio::spawn(async { panic!("model weights are missing") })
-                .await
-                .unwrap_err();
-            Err(crate::ProviderError::from(panicked).into())
-        })
-    });
+    let factory = host::ProviderFactory {
+        prepare: None,
+        start: Arc::new(|_| {
+            Box::pin(async {
+                let panicked = tokio::spawn(async { panic!("model weights are missing") })
+                    .await
+                    .unwrap_err();
+                Err(crate::ProviderError::from(panicked).into())
+            })
+        }),
+    };
     let (host, client, _observer) = controlled_host(
         f.node.clone(),
         &f.secret,
@@ -867,7 +886,7 @@ async fn host_enforces_configuration_step_up_before_calling_the_embedder() {
             .unwrap_err();
         assert_eq!(error.code(), WireCode::PermissionDenied);
     }
-    assert_eq!(h.starts.load(Ordering::SeqCst), 0);
+    assert_eq!(h.invocations.load(Ordering::SeqCst), 0);
     // Add-only reaches the configured embedding on a daily session. This fixture
     // intentionally has no configuration implementation, so it refuses there.
     h.release.add_permits(1);
@@ -881,7 +900,161 @@ async fn host_enforces_configuration_step_up_before_calling_the_embedder() {
         })
         .await
         .unwrap_err();
-    assert_eq!(error.code(), WireCode::Unavailable);
-    assert_eq!(h.starts.load(Ordering::SeqCst), 0);
+    assert_eq!(error.code(), WireCode::InvalidArgument);
+    assert_eq!(h.invocations.load(Ordering::SeqCst), 1);
     h.host.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn unmounted_configuration_does_not_stop_a_running_provider() {
+    let h = Harness::build(fixture().await, false).await;
+    h.release.add_permits(1);
+    let client = h.owner().await;
+    client
+        .set_provider_state(provider_state(true))
+        .await
+        .unwrap();
+    let error = client
+        .configure_provider(ConfigureProviderRequest {
+            authorization: ROOT_GRANT.0.to_vec(),
+            update: Some(crate::node_control::configuration::ProviderUpdate {
+                expected_revision: 0,
+                change: Some(
+                    crate::node_control::configuration::UpstreamChange::RemoveEndpoint(
+                        crate::node_control::configuration::UpstreamRoute {
+                            service: "api".into(),
+                            method: "fetch".into(),
+                        },
+                    ),
+                ),
+            }),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), WireCode::Unimplemented);
+    assert_eq!(
+        h.status().await.provider.unwrap().state,
+        RuntimeState::Running as i32
+    );
+    assert_eq!(h.invocations.load(Ordering::SeqCst), 1);
+    h.host.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn shutdown_refuses_queued_starts_and_configurations() {
+    let h = Harness::new().await;
+    let first = h
+        .host
+        .runtime
+        .enqueue(host::Service::Provider, true)
+        .unwrap();
+    within(h.starting.notified()).await;
+    let queued_start = h
+        .host
+        .runtime
+        .enqueue(host::Service::Provider, true)
+        .unwrap();
+    let queued_config = h
+        .host
+        .runtime
+        .configure(crate::node_control::configuration::ProviderUpdate {
+            expected_revision: 0,
+            change: Some(
+                crate::node_control::configuration::UpstreamChange::RemoveEndpoint(
+                    crate::node_control::configuration::UpstreamRoute {
+                        service: "api".into(),
+                        method: "fetch".into(),
+                    },
+                ),
+            ),
+        })
+        .unwrap();
+    let queued_stop = h
+        .host
+        .runtime
+        .enqueue(host::Service::Provider, false)
+        .unwrap();
+    let shutdown = tokio::spawn(h.host.shutdown());
+    // The shutdown task has signalled stop and entered listener shutdown.
+    within(async {
+        while h.socket.exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    h.release.add_permits(1);
+    within(first).await.unwrap().unwrap();
+    assert_eq!(
+        within(queued_start).await.unwrap().unwrap_err().code(),
+        WireCode::Unavailable
+    );
+    assert_eq!(
+        within(queued_config).await.unwrap().unwrap_err().code(),
+        WireCode::Unavailable
+    );
+    within(queued_stop).await.unwrap().unwrap();
+    within(shutdown).await.unwrap().unwrap();
+    assert_eq!(h.invocations.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn a_failed_commit_exposes_rollback_failure_instead_of_claiming_recovery() {
+    struct FailedCommit;
+    impl host::PreparedProviderConfiguration for FailedCommit {
+        fn commit(
+            &mut self,
+        ) -> Result<crate::node_control::configuration::ProviderMetadata, host::ProviderErrorBox>
+        {
+            Err("commit failed".into())
+        }
+        fn rollback(&mut self) -> Result<(), host::ProviderErrorBox> {
+            Err("rollback storage unavailable".into())
+        }
+    }
+    let f = fixture().await;
+    let factory = host::ProviderFactory {
+        prepare: Some(Arc::new(|_| Ok(Box::new(FailedCommit)))),
+        start: Arc::new(|_| {
+            Box::pin(async { panic!("a failed commit cannot start the provider") })
+        }),
+    };
+    let (host, client, _) = controlled_host(
+        f.node.clone(),
+        &f.secret,
+        f.directory.path(),
+        Some(factory),
+        None,
+    )
+    .await;
+    let error = client
+        .configure_provider(ConfigureProviderRequest {
+            authorization: ROOT_GRANT.0.to_vec(),
+            update: Some(crate::node_control::configuration::ProviderUpdate {
+                expected_revision: 0,
+                change: Some(
+                    crate::node_control::configuration::UpstreamChange::RemoveEndpoint(
+                        crate::node_control::configuration::UpstreamRoute {
+                            service: "api".into(),
+                            method: "fetch".into(),
+                        },
+                    ),
+                ),
+            }),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), WireCode::Unavailable);
+    let status = client
+        .get_host_status(read_request(ROOT_GRANT))
+        .await
+        .unwrap()
+        .provider
+        .unwrap();
+    assert_eq!(status.state, RuntimeState::Failed as i32);
+    assert!(
+        status
+            .detail
+            .contains("configuration rollback failed: rollback storage unavailable")
+    );
+    host.shutdown().await.unwrap();
 }

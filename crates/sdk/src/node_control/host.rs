@@ -9,15 +9,32 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 const PROVIDER_NOT_BOUND: &str = "provider is not bound";
 
-pub type ProviderFactory = Arc<
-    dyn Fn(
-            Option<NodeControl>,
-            Option<super::configuration::ProviderUpdate>,
-        )
-            -> BoxFuture<'static, Result<ProviderHandle, Box<dyn std::error::Error + Send + Sync>>>
+pub type ProviderErrorBox = Box<dyn std::error::Error + Send + Sync>;
+pub type ProviderStart = Arc<
+    dyn Fn(Option<NodeControl>) -> BoxFuture<'static, Result<ProviderHandle, ProviderErrorBox>>
         + Send
         + Sync,
 >;
+pub type ProviderPrepare = Arc<
+    dyn Fn(
+            super::configuration::ProviderUpdate,
+        ) -> Result<Box<dyn PreparedProviderConfiguration>, ProviderErrorBox>
+        + Send
+        + Sync,
+>;
+
+/// One provider lifetime, with optional configuration prepared before stopping it.
+pub struct ProviderFactory {
+    pub start: ProviderStart,
+    pub prepare: Option<ProviderPrepare>,
+}
+
+/// A validated configuration whose resources remain staged until commit.
+/// Dropping a preparation releases its unused resources.
+pub trait PreparedProviderConfiguration: Send {
+    fn commit(&mut self) -> Result<super::configuration::ProviderMetadata, ProviderErrorBox>;
+    fn rollback(&mut self) -> Result<(), ProviderErrorBox>;
+}
 
 /// Starts the gateway with the access the host validated at startup.
 pub type GatewayFactory = Arc<
@@ -68,7 +85,8 @@ impl HostHandle {
         self.runtime.transport.as_ref()
     }
 
-    /// Both services begin stopped. Startup neither creates authority nor grants.
+    /// Provider startup follows `start_provider`; the gateway begins stopped.
+    /// Startup neither creates authority nor grants.
     /// An authority without a provider binding still serves control; provider
     /// start is refused until the binding exists.
     pub async fn start(options: HostOptions) -> Result<Self, HostError> {
@@ -173,14 +191,15 @@ impl HostHandle {
             Some(listener) => listener.shutdown().await.map_err(HostError::from),
             None => Ok(()),
         };
-        if let Some((endpoint, task)) = self.transport.take() {
-            endpoint.close().await;
-            task.await?;
-        }
         let stopped = (&mut self.task)
             .await
             .map_err(HostError::from)
             .and_then(|result| result);
+        // Accepted remote Work drains while the host-owned endpoint is alive.
+        if let Some((endpoint, task)) = self.transport.take() {
+            endpoint.close().await;
+            task.await?;
+        }
         listener.and(stopped)
     }
 }
@@ -404,12 +423,29 @@ impl Runtime {
             }
         }
     }
+    fn provider_failed(
+        &self,
+        mut detail: String,
+        prepared: Option<&mut Box<dyn PreparedProviderConfiguration>>,
+    ) -> Result<(), WireStatus> {
+        if let Some(prepared) = prepared
+            && let Err(error) = prepared.rollback()
+        {
+            detail = format!("configuration rollback failed: {}", failure_detail(&*error));
+        }
+        detail.truncate(detail.floor_char_boundary(1024));
+        self.with(|state| {
+            state.provider_state = RuntimeState::Failed;
+            state.provider_failure = Some(detail);
+        })
+    }
     async fn set(
         &self,
         command: &Command,
         control: &Option<NodeControl>,
         provider: &Option<ProviderFactory>,
         gateway: &Option<GatewayFactory>,
+        stopped: &watch::Receiver<bool>,
     ) -> Result<(), WireStatus> {
         if !command.enabled {
             return self.stop(command.service).await.map_err(|_| unavailable());
@@ -427,28 +463,69 @@ impl Runtime {
         if running && command.update.is_none() {
             return Ok(());
         }
-        // A failed service is drained before an explicit restart, never retried.
+        if *stopped.borrow() {
+            return Err(unavailable());
+        }
+        let mut prepared = match &command.update {
+            Some(update) => {
+                let factory = provider.as_ref().ok_or_else(unsupported)?;
+                let prepare = factory.prepare.as_ref().ok_or_else(unsupported)?;
+                Some(prepare(update.clone()).map_err(|_| {
+                    WireStatus::new(WireCode::InvalidArgument, "provider configuration refused")
+                })?)
+            }
+            None => None,
+        };
+        // Configuration does not turn a deliberately stopped or failed service on.
+        if !running && let Some(prepared) = prepared.as_mut() {
+            let metadata = match prepared.commit() {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    self.provider_failed(failure_detail(&*error), Some(prepared))?;
+                    return Err(unavailable());
+                }
+            };
+            return self.with(|state| state.configuration = Some(metadata));
+        }
+        if matches!(command.service, Service::Provider)
+            && let Some(control) = control
+            && control
+                .node
+                .provider()
+                .await
+                .map_err(|_| unavailable())?
+                .is_none()
+        {
+            return Err(WireStatus::new(
+                WireCode::FailedPrecondition,
+                PROVIDER_NOT_BOUND,
+            ));
+        }
+        if *stopped.borrow() {
+            return Err(unavailable());
+        }
+        // Drain only after configuration preparation succeeded.
         self.stop(command.service)
             .await
             .map_err(|_| unavailable())?;
+        if *stopped.borrow() {
+            return Err(unavailable());
+        }
+        if let Some(prepared) = prepared.as_mut()
+            && let Err(error) = prepared.commit()
+        {
+            self.provider_failed(failure_detail(&*error), Some(prepared))?;
+            return Err(unavailable());
+        }
         match command.service {
             Service::Provider => {
                 let factory = provider.as_ref().ok_or_else(unsupported)?;
-                if let Some(control) = control
-                    && control
-                        .node
-                        .provider()
-                        .await
-                        .map_err(|_| unavailable())?
-                        .is_none()
-                {
-                    return Err(WireStatus::new(
-                        WireCode::FailedPrecondition,
-                        PROVIDER_NOT_BOUND,
-                    ));
+                if *stopped.borrow() {
+                    self.provider_failed("host is shutting down".into(), prepared.as_mut())?;
+                    return Err(unavailable());
                 }
                 self.with(|state| state.provider_state = RuntimeState::Starting)?;
-                match factory(control.clone(), command.update.clone()).await {
+                match (factory.start)(control.clone()).await {
                     Ok(handle) => {
                         if !match (control, handle.administration()) {
                             (Some(control), Some(admin)) => {
@@ -458,10 +535,10 @@ impl Runtime {
                             _ => false,
                         } {
                             let _ = handle.shutdown().await;
-                            self.with(|state| {
-                                state.provider_state = RuntimeState::Failed;
-                                state.provider_failure = Some(HostError::Composition.to_string());
-                            })?;
+                            self.provider_failed(
+                                HostError::Composition.to_string(),
+                                prepared.as_mut(),
+                            )?;
                             return Err(unavailable());
                         }
                         self.with(|state| {
@@ -473,10 +550,7 @@ impl Runtime {
                         })
                     }
                     Err(error) => {
-                        self.with(|state| {
-                            state.provider_state = RuntimeState::Failed;
-                            state.provider_failure = Some(failure_detail(&*error));
-                        })?;
+                        self.provider_failed(failure_detail(&*error), prepared.as_mut())?;
                         Err(unavailable())
                     }
                 }
@@ -519,12 +593,20 @@ async fn run(
             _ = stopped.wait_for(|stop| *stop) => break,
             command = receiver.recv() => match command { Some(command) => command, None => break },
         };
-        let result = runtime.set(&command, &control, &provider, &gateway).await;
+        let result = runtime
+            .set(&command, &control, &provider, &gateway, &stopped)
+            .await;
         let _ = command.reply.send(result);
     }
     receiver.close();
     while let Some(command) = receiver.recv().await {
-        let result = runtime.set(&command, &control, &provider, &gateway).await;
+        let result = if command.enabled || command.update.is_some() {
+            Err(unavailable())
+        } else {
+            runtime
+                .set(&command, &control, &provider, &gateway, &stopped)
+                .await
+        };
         let _ = command.reply.send(result);
     }
     let gateway = runtime.stop(Service::Gateway).await;

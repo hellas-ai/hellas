@@ -282,7 +282,7 @@ impl ManagedWorker {
         args.extend_from_slice(command);
         serde_json::from_str(&self.owner.run(&args).await).unwrap()
     }
-    async fn fetch(&self) {
+    async fn gateway(&self) -> (Process, String) {
         let mut gateway = self.owner.spawn(
             &[
                 "gateway",
@@ -305,6 +305,10 @@ impl ManagedWorker {
             "managed-gateway.log",
         );
         let address = gateway.wait_for("gateway listening on ").await;
+        (gateway, address)
+    }
+    async fn fetch(&self) {
+        let (mut gateway, address) = self.gateway().await;
         let response = post(
             &gateway_client(&self.gateway_token),
             &format!("http://{address}/v1/chat/completions"),
@@ -433,4 +437,171 @@ async fn failed_configuration_restores_the_route_and_requires_explicit_restart()
     worker.fetch().await;
     assert_eq!(worker._upstream.calls.load(Ordering::SeqCst), 2);
     worker.node.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rejected_configuration_keeps_running_and_valid_configuration_keeps_stopped() {
+    let mut worker = ManagedWorker::start().await;
+    let path = worker.root.path().join("worker/fetch.json");
+    let original = std::fs::read(&path).unwrap();
+    let endpoint = || {
+        UpstreamChange::SetEndpoint(UpstreamEndpoint {
+            service: "http".into(),
+            method: "request".into(),
+            allowed_hosts: vec!["localhost".into()],
+            allow_private_addresses: true,
+        })
+    };
+    for (revision, change) in [
+        (0, endpoint()),
+        (
+            1,
+            UpstreamChange::RemoveEndpoint(UpstreamRoute {
+                service: "missing".into(),
+                method: "request".into(),
+            }),
+        ),
+        (
+            1,
+            UpstreamChange::AddKey(UpstreamKey {
+                service: "http".into(),
+                method: "request".into(),
+                key: "invalid".into(),
+                allowed_origins: vec!["https://localhost".into()],
+                allowed_paths: vec!["/v1".into()],
+                allowed_methods: vec!["POST".into()],
+                header_name: "invalid header name".into(),
+                prefix: "Bearer ".into(),
+                secret: "abandoned-key".into(),
+            }),
+        ),
+    ] {
+        let command = request_file(
+            worker.root.path(),
+            &ProviderUpdate {
+                expected_revision: revision,
+                change: Some(change),
+            },
+        );
+        let result = worker
+            .owner
+            .output(&[
+                "admin",
+                "--node",
+                &worker.pin,
+                "--address",
+                &worker.address,
+                "--profile",
+                string(&worker.profile),
+                "configure-provider",
+                string(&command),
+            ])
+            .await;
+        assert!(!result.status.success());
+        assert_eq!(
+            worker.control(&["status"]).await["provider_state"],
+            hellas_rpc::pb::host::RuntimeState::Running as i32
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+    let permissions = std::fs::metadata(&path).unwrap().permissions();
+    let mut readonly = permissions.clone();
+    readonly.set_readonly(true);
+    std::fs::set_permissions(&path, readonly).unwrap();
+    let command = request_file(
+        worker.root.path(),
+        &ProviderUpdate {
+            expected_revision: 1,
+            change: Some(endpoint()),
+        },
+    );
+    let result = worker
+        .owner
+        .output(&[
+            "admin",
+            "--node",
+            &worker.pin,
+            "--address",
+            &worker.address,
+            "--profile",
+            string(&worker.profile),
+            "configure-provider",
+            string(&command),
+        ])
+        .await;
+    assert!(!result.status.success());
+    std::fs::set_permissions(&path, permissions).unwrap();
+    assert_eq!(
+        worker.control(&["status"]).await["provider_state"],
+        hellas_rpc::pb::host::RuntimeState::Running as i32
+    );
+    worker.fetch().await;
+    worker
+        .control(&["set-provider-state", "--enabled", "false"])
+        .await;
+    worker
+        .control(&["configure-provider", string(&command)])
+        .await;
+    let status = worker.control(&["status"]).await;
+    assert_eq!(
+        status["provider_state"],
+        hellas_rpc::pb::host::RuntimeState::Stopped as i32
+    );
+    assert_eq!(status["configuration"]["revision"], 2);
+    worker
+        .control(&["set-provider-state", "--enabled", "true"])
+        .await;
+    worker.fetch().await;
+    worker.node.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn host_shutdown_finishes_remote_work_before_closing_its_transport() {
+    let mut worker = ManagedWorker::start().await;
+    let (mut gateway, address) = worker.gateway().await;
+    let client = gateway_client(&worker.gateway_token);
+    let response = tokio::spawn(async move {
+        let response = post(
+            &client,
+            &format!("http://{address}/v1/chat/completions"),
+            json!({"messages":[], "stream":true}),
+        )
+        .await;
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        response.text().await.unwrap()
+    });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while worker._upstream.calls.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    unsafe {
+        libc::kill(worker.node.child.id().unwrap() as i32, libc::SIGTERM);
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), worker.node.child.wait())
+            .await
+            .is_err(),
+        "host exited before accepted Work completed"
+    );
+    assert!(!response.is_finished());
+    worker._upstream.finish.add_permits(1);
+    let body = tokio::time::timeout(Duration::from_secs(10), response)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(body.contains("hello"));
+    assert!(body.contains("[DONE]"));
+    let status = tokio::time::timeout(Duration::from_secs(15), worker.node.child.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        status.success(),
+        "{}",
+        std::fs::read_to_string(&worker.node.log).unwrap()
+    );
+    gateway.stop().await;
 }

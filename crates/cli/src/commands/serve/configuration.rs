@@ -23,22 +23,18 @@ pub(super) async fn start_host<R: hellas_attestation::RootProver + Send + Sync +
         ),
         (None, None) => None,
     };
-    let factory: ProviderFactory = Arc::new(move |control, update| {
-        let mut provider = provider.clone();
-        let path = path.clone();
-        Box::pin(async move {
-            if let Some(path) = &path {
-                clean_unused_keys(path)?;
-            }
-            let rollback = match update {
-                Some(update) => Some(apply(
-                    path.as_deref()
-                        .ok_or("provider configuration is not mounted")?,
-                    update,
-                )?),
-                None => None,
-            };
-            let result = async {
+    if let Some(path) = &path {
+        clean_unused_keys(path)?;
+    }
+    let prepare = path.clone().map(|path| -> ProviderPrepare {
+        Arc::new(move |update| Ok(Box::new(StagedConfiguration::prepare(&path, update)?)))
+    });
+    let factory = ProviderFactory {
+        prepare,
+        start: Arc::new(move |control| {
+            let mut provider = provider.clone();
+            let path = path.clone();
+            Box::pin(async move {
                 let metadata = match &path {
                     Some(path) => {
                         provider.executor.fetch_routes = load_fetch_config(path)?;
@@ -50,23 +46,13 @@ pub(super) async fn start_host<R: hellas_attestation::RootProver + Send + Sync +
                     provider = provider.on_host(control)?;
                 }
                 let handle = hellas_sdk::start_fetch_provider(provider).await?;
-                Ok::<_, anyhow::Error>(match metadata {
+                Ok(match metadata {
                     Some(metadata) => handle.with_configuration(metadata),
                     None => handle,
                 })
-            }
-            .await;
-            if result.is_err()
-                && let (Some(path), Some(bytes)) = (&path, rollback)
-            {
-                hellas_private::write_atomically(path, ".rollback", &bytes)?;
-            }
-            if let Some(path) = &path {
-                clean_unused_keys(path)?;
-            }
-            result.map_err(Into::into)
-        })
-    });
+            })
+        }),
+    };
     Ok(HostHandle::start(HostOptions {
         transport,
         start_provider: true,
@@ -101,16 +87,76 @@ fn metadata(config: &FetchConfigFile) -> ProviderMetadata {
             .collect(),
     }
 }
-fn apply(path: &Path, update: ProviderUpdate) -> CliResult<Vec<u8>> {
-    let old = hellas_private::read_bounded_regular_file(path, 64 * 1024)?;
-    if let Err(error) = write_update(path, &old, update) {
-        hellas_private::write_atomically(path, ".rollback", &old)?;
-        clean_unused_keys(path)?;
-        return Err(error);
-    }
-    Ok(old)
+struct StagedConfiguration {
+    path: PathBuf,
+    old: Vec<u8>,
+    stage: Option<tempfile::TempPath>,
+    metadata: ProviderMetadata,
+    committed: bool,
+    retain_keys: bool,
 }
-fn write_update(path: &Path, old: &[u8], update: ProviderUpdate) -> CliResult<()> {
+impl StagedConfiguration {
+    fn prepare(path: &Path, update: ProviderUpdate) -> CliResult<Self> {
+        use std::io::Write as _;
+        let parent = path.parent().context("configuration needs a parent")?;
+        anyhow::ensure!(
+            !std::fs::metadata(path)?.permissions().readonly()
+                && !std::fs::metadata(parent)?.permissions().readonly(),
+            "configuration is read-only"
+        );
+        let old = hellas_private::read_bounded_regular_file(path, 64 * 1024)?;
+        let mut prepared = Self {
+            path: path.into(),
+            old,
+            stage: None,
+            metadata: ProviderMetadata::default(),
+            committed: false,
+            retain_keys: false,
+        };
+        let bytes = prepare_update(path, &prepared.old, update)?;
+        prepared.metadata = metadata(&serde_json::from_slice(&bytes)?);
+        let mut stage = hellas_private::private_tempfile(parent, ".configure-", ".json")?;
+        stage.write_all(&bytes)?;
+        stage.as_file().sync_all()?;
+        prepared.stage = Some(stage.into_temp_path());
+        Ok(prepared)
+    }
+}
+impl PreparedProviderConfiguration for StagedConfiguration {
+    fn commit(&mut self) -> Result<ProviderMetadata, ProviderErrorBox> {
+        let stage = self
+            .stage
+            .as_ref()
+            .ok_or("configuration already committed")?;
+        std::fs::rename(stage, &self.path)?;
+        self.committed = true;
+        hellas_private::sync_directory(self.path.parent().ok_or("configuration needs a parent")?)?;
+        self.stage = None;
+        Ok(self.metadata.clone())
+    }
+    fn rollback(&mut self) -> Result<(), ProviderErrorBox> {
+        if self.committed {
+            if let Err(error) = hellas_private::write_atomically(&self.path, ".rollback", &self.old)
+            {
+                self.retain_keys = true;
+                return Err(error.into());
+            }
+            self.committed = false;
+        }
+        Ok(())
+    }
+}
+impl Drop for StagedConfiguration {
+    fn drop(&mut self) {
+        if self.retain_keys {
+            return;
+        }
+        if let Err(error) = clean_unused_keys(&self.path) {
+            tracing::warn!(%error, "provider configuration key cleanup failed");
+        }
+    }
+}
+fn prepare_update(path: &Path, old: &[u8], update: ProviderUpdate) -> CliResult<Vec<u8>> {
     let mut file: FetchConfigFile = serde_json::from_slice(old)?;
     anyhow::ensure!(
         file.revision == update.expected_revision,
@@ -257,8 +303,7 @@ fn write_update(path: &Path, old: &[u8], update: ProviderUpdate) -> CliResult<()
         bytes.len() <= 64 * 1024,
         "provider configuration exceeds limit"
     );
-    hellas_private::write_atomically(path, ".configure", &bytes)?;
-    Ok(())
+    Ok(bytes)
 }
 fn http<'a>(
     file: &'a mut FetchConfigFile,
@@ -338,6 +383,12 @@ fn check_key_directory(path: &Path) -> CliResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn apply(path: &Path, update: ProviderUpdate) -> CliResult<()> {
+        let mut prepared = StagedConfiguration::prepare(path, update)?;
+        prepared.commit().map_err(anyhow::Error::from_boxed)?;
+        Ok(())
+    }
+
     fn endpoint() -> UpstreamChange {
         UpstreamChange::SetEndpoint(UpstreamEndpoint {
             service: "api".into(),
@@ -503,6 +554,67 @@ mod tests {
         load_fetch_config(&a).unwrap();
         load_fetch_config(&b).unwrap();
     }
+    #[test]
+    fn staged_replacement_retains_old_keys_until_commit_succeeds_or_rolls_back() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("fetch.json");
+        std::fs::write(&path, br#"{"routes":[]}"#).unwrap();
+        apply(
+            &path,
+            ProviderUpdate {
+                expected_revision: 0,
+                change: Some(endpoint()),
+            },
+        )
+        .unwrap();
+        apply(
+            &path,
+            ProviderUpdate {
+                expected_revision: 1,
+                change: Some(UpstreamChange::AddKey(key("original-key"))),
+            },
+        )
+        .unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let mut prepared = StagedConfiguration::prepare(
+            &path,
+            ProviderUpdate {
+                expected_revision: 2,
+                change: Some(UpstreamChange::ReplaceKey(key("new-key"))),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            original,
+            "preparation cannot change live config"
+        );
+        assert_eq!(
+            std::fs::read_dir(key_directory(&path).unwrap())
+                .unwrap()
+                .count(),
+            2
+        );
+        prepared.commit().unwrap();
+        assert_eq!(
+            std::fs::read_dir(key_directory(&path).unwrap())
+                .unwrap()
+                .count(),
+            2,
+            "old key remains available until startup outcome"
+        );
+        prepared.rollback().unwrap();
+        drop(prepared);
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(
+            std::fs::read_dir(key_directory(&path).unwrap())
+                .unwrap()
+                .count(),
+            1
+        );
+        load_fetch_config(&path).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn cleanup_refuses_a_symlinked_key_directory() {
