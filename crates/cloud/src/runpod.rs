@@ -7,21 +7,54 @@ use serde_json::{Value, json};
 
 use crate::{CreateMachine, Error, Machine, Provider, Result};
 
-pub(crate) fn open(provider: &str, credential: HttpSecretConfig) -> Result<Box<dyn Provider>> {
-    if provider != "runpod" {
-        return Err(Error::UnsupportedProvider);
+pub(crate) fn open(credential: HttpSecretConfig, config: Value) -> Result<Box<dyn Provider>> {
+    let config =
+        serde_json::from_value(config).map_err(|_| Error::Invalid("provider configuration"))?;
+    Ok(Box::new(RunPod::new(credential, config)?))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Config {
+    template: Option<String>,
+    #[cfg(feature = "test-support")]
+    api_base: Option<String>,
+}
+
+impl Config {
+    fn base(&self) -> Result<String> {
+        #[cfg(feature = "test-support")]
+        if let Some(base) = &self.api_base {
+            let url = reqwest::Url::parse(base).map_err(|_| Error::Invalid("test API base"))?;
+            if url.scheme() != "http"
+                || !url.username().is_empty()
+                || url.password().is_some()
+                || url.query().is_some()
+                || url.fragment().is_some()
+                || !url
+                    .host_str()
+                    .and_then(|host| host.parse::<std::net::IpAddr>().ok())
+                    .is_some_and(|ip| ip.is_loopback())
+            {
+                return Err(Error::Invalid(
+                    "test API base must be a loopback HTTP endpoint",
+                ));
+            }
+            return Ok(base.trim_end_matches('/').into());
+        }
+        Ok("https://rest.runpod.io/v1".into())
     }
-    Ok(Box::new(RunPod::new(credential)?))
 }
 
 struct RunPod {
     client: reqwest::Client,
     base: String,
     credential: HttpSecret,
+    config: Config,
 }
 
 impl RunPod {
-    fn new(credential: HttpSecretConfig) -> Result<Self> {
+    fn new(credential: HttpSecretConfig, config: Config) -> Result<Self> {
         let credential = credential.into_secret().map_err(|_| Error::Credential)?;
         let client = reqwest::Client::builder()
             .user_agent(concat!("hellas-cloud/", env!("CARGO_PKG_VERSION")))
@@ -31,8 +64,9 @@ impl RunPod {
             .map_err(Error::Request)?;
         Ok(Self {
             client,
-            base: "https://rest.runpod.io/v1".into(),
+            base: config.base()?,
             credential,
+            config,
         })
     }
 
@@ -72,14 +106,16 @@ impl RunPod {
 impl Provider for RunPod {
     async fn create(&self, request: &CreateMachine) -> Result<Machine> {
         validate_request(request)?;
+        let template_id = self
+            .config
+            .template
+            .as_deref()
+            .ok_or(Error::Invalid("provider template required for creation"))?;
+        validate_id(template_id)?;
         let template = self
-            .request(
-                Method::GET,
-                &format!("/templates/{}", request.template),
-                None,
-            )
+            .request(Method::GET, &format!("/templates/{template_id}"), None)
             .await?;
-        validate_template(request, &template)?;
+        validate_template(request, template_id, &template)?;
         // Preserve template attribution and its persistent storage settings.
         // No transport secret, owner, bootstrap token, or environment is supplied.
         let created = self
@@ -87,7 +123,7 @@ impl Provider for RunPod {
                 Method::POST,
                 "/pods",
                 Some(json!({
-                    "name": request.name, "templateId": request.template,
+                    "name": request.name, "templateId": template_id,
                     "computeType": "GPU", "cloudType": "SECURE",
                     "gpuTypeIds": [request.accelerator], "gpuCount": request.accelerator_count,
                     "interruptible": request.interruptible
@@ -115,7 +151,7 @@ impl Provider for RunPod {
                 reason: "could not read allocated machine",
             })?;
         if live["id"].as_str() != Some(&id)
-            || live["templateId"].as_str() != Some(&request.template)
+            || live["templateId"].as_str() != Some(template_id)
             || image(&live) != Some(&request.image)
         {
             return Err(Error::Allocated {
@@ -185,7 +221,6 @@ fn validate_id(id: &str) -> Result<()> {
 
 fn validate_request(request: &CreateMachine) -> Result<()> {
     validate_id(&request.name)?;
-    validate_id(&request.template)?;
     if request.accelerator.is_empty()
         || request.accelerator.len() > 128
         || request.accelerator_count == 0
@@ -208,8 +243,8 @@ fn validate_request(request: &CreateMachine) -> Result<()> {
     Ok(())
 }
 
-fn validate_template(request: &CreateMachine, template: &Value) -> Result<()> {
-    if template["id"].as_str() != Some(&request.template)
+fn validate_template(request: &CreateMachine, template_id: &str, template: &Value) -> Result<()> {
+    if template["id"].as_str() != Some(template_id)
         || template["imageName"].as_str() != Some(&request.image)
         || template["isServerless"] == true
         || template["volumeMountPath"] != "/var/lib/hellas"
@@ -235,7 +270,6 @@ mod tests {
         CreateMachine {
             name: "worker".into(),
             image: format!("registry/hellas@sha256:{}", "a".repeat(64)),
-            template: "template".into(),
             accelerator: "NVIDIA L4".into(),
             accelerator_count: 1,
             interruptible: false,
@@ -251,6 +285,28 @@ mod tests {
         json!({"id":"pod1", "name":"worker", "desiredStatus":"RUNNING",
             "image":spec().image, "templateId":"template", "publicIp":"192.0.2.1",
             "env":{"SECRET":"never-project-this"}})
+    }
+
+    fn config() -> Config {
+        serde_json::from_value(json!({"template":"template"})).unwrap()
+    }
+
+    #[test]
+    fn provider_settings_do_not_enter_the_generic_request() {
+        let request = json!({"name":"worker","image":spec().image,"accelerator":"NVIDIA L4",
+            "accelerator_count":1,"template":"template"});
+        assert!(serde_json::from_value::<CreateMachine>(request).is_err());
+        let settings = json!({"template":"template","api_base":"http://127.0.0.1:1234"});
+        #[cfg(not(feature = "test-support"))]
+        assert!(serde_json::from_value::<Config>(settings).is_err());
+        #[cfg(feature = "test-support")]
+        assert_eq!(
+            serde_json::from_value::<Config>(settings)
+                .unwrap()
+                .base()
+                .unwrap(),
+            "http://127.0.0.1:1234"
+        );
     }
 
     fn source(path: &std::path::Path) -> HttpSecretConfig {
@@ -335,7 +391,7 @@ mod tests {
                 respond(&mut socket, "200 OK", &response.to_string());
             }
         });
-        let mut provider = RunPod::new(source(&path)).unwrap();
+        let mut provider = RunPod::new(source(&path), config()).unwrap();
         provider.base = format!("http://{address}");
         let created = provider.create(&spec()).await.unwrap();
         assert_eq!(created.id, "pod1");
@@ -362,7 +418,7 @@ mod tests {
         ] {
             let mut invalid = template();
             invalid[field] = value;
-            assert!(validate_template(&spec(), &invalid).is_err());
+            assert!(validate_template(&spec(), "template", &invalid).is_err());
         }
         for id in ["", "../pods", "one?two", "one/two"] {
             assert!(validate_id(id).is_err());
@@ -395,7 +451,7 @@ mod tests {
                 respond(&mut socket, "200 OK", &value.to_string());
             }
         });
-        let mut provider = RunPod::new(source(&path)).unwrap();
+        let mut provider = RunPod::new(source(&path), config()).unwrap();
         provider.base = format!("http://{address}");
         assert!(
             matches!(provider.create(&spec()).await, Err(Error::Allocated { id, .. }) if id == "pod1")
@@ -420,7 +476,7 @@ mod tests {
                     respond(&mut socket, "200 OK", &"x".repeat(1024 * 1024 + 1));
                 }
             });
-            let mut provider = RunPod::new(source(&path)).unwrap();
+            let mut provider = RunPod::new(source(&path), config()).unwrap();
             provider.base = format!("http://{address}");
             let result = provider.list().await;
             if redirect {

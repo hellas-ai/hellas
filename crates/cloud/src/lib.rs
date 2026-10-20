@@ -46,7 +46,6 @@ pub enum Error {
 pub struct CreateMachine {
     pub name: String,
     pub image: String,
-    pub template: String,
     pub accelerator: String,
     pub accelerator_count: u32,
     #[serde(default)]
@@ -72,6 +71,13 @@ pub trait Provider: Send + Sync {
     async fn destroy(&self, id: &str) -> Result<()>;
 }
 
-pub fn open(provider: &str, credential: HttpSecretConfig) -> Result<Box<dyn Provider>> {
-    runpod::open(provider, credential)
+pub fn open(
+    provider: &str,
+    credential: HttpSecretConfig,
+    config: serde_json::Value,
+) -> Result<Box<dyn Provider>> {
+    match provider {
+        "runpod" => runpod::open(credential, config),
+        _ => Err(Error::UnsupportedProvider),
+    }
 }
