@@ -68,6 +68,7 @@ async fn checked_administration_persists_caller_audit_and_rechecks_sessions_afte
             binding,
             secret.id(),
         )
+        .await
         .unwrap();
     let session = node
         .complete_authentication(pending, binding, &secret, &proof)
@@ -803,4 +804,48 @@ async fn checked_capacity_changes_reach_work_admission() {
     finish.add_permits(2);
     within(world.service.drain()).await.unwrap();
     assert_eq!(backend.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn session_checks_binding_before_calling_the_authenticator_and_propagates_refusal() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Refusing(AtomicUsize);
+    #[async_trait::async_trait]
+    impl crate::authenticator::Authenticator for Refusing {
+        fn public_key(&self) -> Result<crate::authenticator::PublicKey, AuthorityError> {
+            ROOT.passkey().public_key()
+        }
+        async fn assert(&self, _: Digest) -> Result<PasskeyAssertion, AuthorityError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(AuthorityError::Credential)
+        }
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let (node, secret) = fixture(directory.path(), scope(ROOT)).await;
+    let binding = Digest::hash(b"expected connection");
+    let pending = node.begin_authentication(binding).await.unwrap();
+    let authenticator = Refusing(AtomicUsize::new(0));
+    let key = SessionKey::Passkey(&authenticator);
+    assert!(
+        key.prove(
+            pending.challenge(),
+            scope(ROOT).authority,
+            Digest::hash(b"wrong"),
+            secret.id()
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(authenticator.0.load(Ordering::SeqCst), 0);
+    assert!(matches!(
+        key.prove(
+            pending.challenge(),
+            scope(ROOT).authority,
+            binding,
+            secret.id()
+        )
+        .await,
+        Err(AuthorityError::Credential)
+    ));
+    assert_eq!(authenticator.0.load(Ordering::SeqCst), 1);
 }

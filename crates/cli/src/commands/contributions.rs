@@ -2,6 +2,7 @@
 use super::{CliResult, read_bounded_regular_file};
 use anyhow::ensure;
 use hellas_auth::authority::{ContactCard, PrincipalId, UnixMillis};
+use hellas_work::authenticator::Authenticator;
 use hellas_work::model::grant::records::*;
 use std::{
     io::Write,
@@ -49,14 +50,14 @@ pub enum OfferCommand {
         replace: bool,
     },
 }
-/// The principal a software passkey controls.
-pub fn principal(passkey: &hellas_kernel::SoftPasskey) -> CliResult<PrincipalId> {
+/// The principal controlled by this authenticator.
+pub fn principal(passkey: &dyn Authenticator) -> CliResult<PrincipalId> {
     Ok(PrincipalId::from_public_key(hellas_auth::PublicKey::P256(
-        passkey.party_key().to_bytes(),
+        passkey.public_key()?.to_compressed(),
     ))?)
 }
 /// The principal of a command that acts for one.
-pub fn require_principal(passkey: Option<&hellas_kernel::SoftPasskey>) -> CliResult<PrincipalId> {
+pub fn require_principal(passkey: Option<&dyn Authenticator>) -> CliResult<PrincipalId> {
     principal(passkey.ok_or_else(|| {
         anyhow::anyhow!(
             "this command acts for a principal; pass its software passkey with --passkey"
@@ -102,9 +103,9 @@ pub(super) fn save(path: &Path, bytes: &[u8]) -> CliResult<()> {
     hellas_private::write_atomically(path, ".record", bytes)?;
     Ok(())
 }
-pub fn contact(
+pub async fn contact(
     command: ContactCommand,
-    passkey: Option<&hellas_kernel::SoftPasskey>,
+    passkey: Option<&dyn Authenticator>,
 ) -> CliResult<()> {
     match command {
         ContactCommand::Export { display_name, out } => {
@@ -112,16 +113,10 @@ pub fn contact(
                 anyhow::anyhow!("a contact card is signed by the principal's --passkey")
             })?;
             let principal = principal(passkey)?;
-            let envelope = passkey
-                .sign(hellas_kernel::PayloadHash::from_bytes(
-                    *ContactCard::digest(principal, &display_name).as_bytes(),
-                ))
-                .map_err(|error| anyhow::anyhow!("passkey signing failed: {error:?}"))?;
-            let card = ContactCard::new(
-                principal,
-                display_name,
-                hellas_work::node::passkey_assertion(&envelope)?,
-            )?;
+            let assertion = passkey
+                .assert(ContactCard::digest(principal, &display_name))
+                .await?;
+            let card = ContactCard::new(principal, display_name, assertion)?;
             let bytes = encode_contact_card(&card)?;
             if let Some(path) = out {
                 save(&path, &bytes)?;
@@ -166,7 +161,7 @@ pub fn contact(
 /// credential must be bound to; plain offer imports need none.
 pub fn offer(
     command: OfferCommand,
-    passkey: Option<&hellas_kernel::SoftPasskey>,
+    passkey: Option<&dyn Authenticator>,
     identity_node: Option<&hellas_auth::ProducerSigningKey>,
 ) -> CliResult<()> {
     let identity = require_principal(passkey)?;
@@ -282,8 +277,8 @@ pub fn load_offer(identity: &PrincipalId, name: &str) -> CliResult<SignedOffer> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn aliases_cannot_escape_the_private_store_and_cards_verify() {
+    #[tokio::test]
+    async fn aliases_cannot_escape_the_private_store_and_cards_verify() {
         let root = tempfile::tempdir().unwrap();
         for name in ["", "..", "../secret", "/secret", "a/b", "a\\b", " x", "ö"] {
             assert!(alias(root.path(), "contacts", name).is_err(), "{name}");
@@ -301,6 +296,7 @@ mod tests {
             },
             Some(&friend),
         )
+        .await
         .unwrap();
         let card = decode_contact_card(&std::fs::read(&out).unwrap()).unwrap();
         assert_eq!(card.principal(), principal(&friend).unwrap());
@@ -325,6 +321,7 @@ mod tests {
                 },
                 None,
             )
+            .await
             .is_err()
         );
     }

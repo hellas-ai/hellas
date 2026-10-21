@@ -11,6 +11,7 @@ documentation.workspace = true
 test-support = ["dep:bytes", "hellas-auth/test-support", "hellas-wire/mux"]
 
 [dependencies]
+async-trait = "0.1"
 async-stream.workspace = true
 base64.workspace = true
 brotli = "9"
@@ -22,6 +23,7 @@ hellas-auth.workspace = true
 hellas-kernel = { workspace = true, features = ["secp256k1", "webauthn"] }
 hellas-private.workspace = true
 hellas-rpc = { workspace = true, features = ["evaluate", "fetch", "work"] }
+hellas-webauthn.workspace = true
 hellas-wire.workspace = true
 hellas-xet.workspace = true
 hex.workspace = true

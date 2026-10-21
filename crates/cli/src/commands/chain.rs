@@ -1,3 +1,4 @@
+use hellas_work::authenticator::{Authenticator, kernel_auth};
 use std::time::Duration;
 use std::{
     fs,
@@ -371,17 +372,18 @@ async fn run_owner_coins(
     let plan = hellas_sdk::coin_owner::OwnerReshape::prepare(
         &client,
         network,
-        owner.party_key(),
+        hellas_kernel::Key::from_bytes(owner.public_key()?.to_compressed()),
         selected.as_slice(),
         delegate,
     )
     .await?;
     let output_ids = plan.output_ids();
-    let auth = hellas_kernel::Auth::webauthn(
-        owner
-            .sign(plan.payload_hash())
-            .map_err(|error| anyhow::anyhow!("owner signing failed: {error:?}"))?,
-    );
+    let auth = kernel_auth(
+        &owner.public_key()?,
+        &owner
+            .assert(hellas_auth::Digest::from(*plan.payload_hash().as_bytes()))
+            .await?,
+    )?;
     let outcome = client
         .submit_tx(Transaction::Kernel(plan.authorize(auth)?))
         .await?;
@@ -532,8 +534,8 @@ async fn run_open(args: OpenArgs) -> CliResult {
     let terms = Terms::basic(
         ProtocolCode::new(args.protocol),
         Parties::new(
-            PartyKeys::sole(maker.party_key()),
-            PartyKeys::sole(taker.party_key()),
+            PartyKeys::sole(maker.party_key()?),
+            PartyKeys::sole(taker.party_key()?),
         ),
         BlockHeight::new(args.timeout),
         timeout_outputs,
@@ -546,8 +548,8 @@ async fn run_open(args: OpenArgs) -> CliResult {
     let tx = Tx::open(
         funding,
         terms.clone(),
-        PartyAuth::owner(maker.sign(open_hash)?),
-        PartyAuth::owner(taker.sign(open_hash)?),
+        PartyAuth::owner(maker.sign(open_hash).await?),
+        PartyAuth::owner(taker.sign(open_hash).await?),
     );
 
     // Persist the reveal before submission. A failed submission leaves only a
@@ -561,8 +563,8 @@ async fn run_open(args: OpenArgs) -> CliResult {
 
     println!("edge_id {}", hex::encode(edge_id.to_bytes()));
     println!("terms_hash {}", hex::encode(terms.hash().to_bytes()));
-    println!("maker {}", SettlementKey::from(maker.party_key()));
-    println!("taker {}", SettlementKey::from(taker.party_key()));
+    println!("maker {}", SettlementKey::from(maker.party_key()?));
+    println!("taker {}", SettlementKey::from(taker.party_key()?));
     Ok(())
 }
 
@@ -581,10 +583,10 @@ async fn run_close(args: CloseArgs) -> CliResult {
             }
             let maker = load_mutual_signer("maker", args.maker_auth, args.maker_key.as_deref())?;
             let taker = load_mutual_signer("taker", args.taker_auth, args.taker_key.as_deref())?;
-            if SettlementKey::from(maker.party_key()) != edge.maker {
+            if SettlementKey::from(maker.party_key()?) != edge.maker {
                 anyhow::bail!("maker key file does not control the live edge maker");
             }
-            if SettlementKey::from(taker.party_key()) != edge.taker {
+            if SettlementKey::from(taker.party_key()?) != edge.taker {
                 anyhow::bail!("taker key file does not control the live edge taker");
             }
             let hash = Tx::payload_hash(
@@ -595,8 +597,8 @@ async fn run_close(args: CloseArgs) -> CliResult {
                 &outputs,
             );
             Proof::mutual(
-                PartyAuth::owner(maker.sign(hash)?),
-                PartyAuth::owner(taker.sign(hash)?),
+                PartyAuth::owner(maker.sign(hash).await?),
+                PartyAuth::owner(taker.sign(hash).await?),
             )
         }
         CloseKind::Timeout => {
@@ -1031,6 +1033,7 @@ mod signer {
     //! material is read only from the file paths supplied to the chain commands;
     //! no command accepts a scalar value directly.
 
+    use hellas_work::authenticator::{Authenticator, kernel_auth};
     use std::{fs, path::Path};
 
     use anyhow::{Context as _, Result, anyhow};
@@ -1087,20 +1090,22 @@ mod signer {
         }
 
         /// Returns the compressed settlement key controlled by this signer.
-        pub(crate) const fn party_key(&self) -> Key {
+        pub(crate) fn party_key(&self) -> Result<Key> {
             match self {
-                Self::Webauthn(signer) => signer.party_key(),
-                Self::Native(signer) => signer.party_key(),
+                Self::Webauthn(signer) => Ok(Key::from_bytes(signer.public_key()?.to_compressed())),
+                Self::Native(signer) => Ok(signer.party_key()),
             }
         }
 
         /// Signs one canonical kernel authorization payload.
-        pub(crate) fn sign(&self, hash: PayloadHash) -> Result<Auth> {
+        pub(crate) async fn sign(&self, hash: PayloadHash) -> Result<Auth> {
             match self {
-                Self::Webauthn(signer) => signer
-                    .sign(hash)
-                    .map(Auth::webauthn)
-                    .map_err(|error| anyhow!("kernel WebAuthn signing failed: {error:?}")),
+                Self::Webauthn(signer) => Ok(kernel_auth(
+                    &signer.public_key()?,
+                    &signer
+                        .assert(hellas_auth::Digest::from(*hash.as_bytes()))
+                        .await?,
+                )?),
                 Self::Native(signer) => Ok(Auth::native(signer.sign(hash))),
             }
         }
@@ -1137,8 +1142,8 @@ mod signer {
             file
         }
 
-        #[test]
-        fn native_signer_uses_compact_secp256k1_over_payload_hash() {
+        #[tokio::test]
+        async fn native_signer_uses_compact_secp256k1_over_payload_hash() {
             let file =
                 key_file(b"0000000000000000000000000000000000000000000000000000000000000001\n");
             let signer = DevSigner::load(AuthScheme::Native, file.path()).expect("native signer");
@@ -1147,10 +1152,10 @@ mod signer {
                     .expect("public key hex")
                     .try_into()
                     .expect("public key length");
-            assert_eq!(signer.party_key().to_bytes(), expected);
+            assert_eq!(signer.party_key().unwrap().to_bytes(), expected);
             let hash = PayloadHash::default();
-            let auth = signer.sign(hash).expect("native auth");
-            assert!(Secp256k1Verifier::new().verify_auth(&auth, signer.party_key(), hash));
+            let auth = signer.sign(hash).await.expect("native auth");
+            assert!(Secp256k1Verifier::new().verify_auth(&auth, signer.party_key().unwrap(), hash));
         }
 
         #[test]
@@ -1163,15 +1168,19 @@ mod signer {
             assert!(error.to_string().contains("key file"));
         }
 
-        #[test]
-        fn validator_kernel_accepts_both_cli_auth_envelopes() {
+        #[tokio::test]
+        async fn validator_kernel_accepts_both_cli_auth_envelopes() {
             let hash = PayloadHash::default();
             for scheme in [AuthScheme::Webauthn, AuthScheme::Native] {
                 let file =
                     key_file(b"0000000000000000000000000000000000000000000000000000000000000001\n");
                 let signer = DevSigner::load(scheme, file.path()).expect("CLI signer");
-                let auth = signer.sign(hash).expect("CLI auth");
-                assert!(Secp256k1Verifier::new().verify_auth(&auth, signer.party_key(), hash));
+                let auth = signer.sign(hash).await.expect("CLI auth");
+                assert!(Secp256k1Verifier::new().verify_auth(
+                    &auth,
+                    signer.party_key().unwrap(),
+                    hash
+                ));
             }
         }
     }
