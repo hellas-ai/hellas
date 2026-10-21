@@ -5,14 +5,12 @@ use async_trait::async_trait;
 use hellas_providers::HttpSecretConfig;
 use serde::{Deserialize, Serialize};
 
-mod runpod;
+pub mod runpod;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("unsupported machine provider")]
-    UnsupportedProvider,
     #[error("invalid machine request: {0}")]
     Invalid(&'static str),
     #[error("credential source unavailable")]
@@ -72,13 +70,41 @@ pub trait Provider: Send + Sync {
     async fn destroy(&self, id: &str) -> Result<()>;
 }
 
-pub fn open(
-    provider: &str,
-    credential: HttpSecretConfig,
-    config: serde_json::Value,
-) -> Result<Box<dyn Provider>> {
-    match provider {
-        "runpod" => runpod::open(credential, config),
-        _ => Err(Error::UnsupportedProvider),
+/// Provider selection and its implementation-specific settings.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(
+    tag = "provider",
+    content = "config",
+    rename_all = "lowercase",
+    deny_unknown_fields
+)]
+pub enum ProviderConfig {
+    RunPod(runpod::Config),
+}
+
+pub fn open(credential: HttpSecretConfig, config: ProviderConfig) -> Result<Box<dyn Provider>> {
+    match config {
+        ProviderConfig::RunPod(config) => runpod::open(credential, config),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_config_rejects_unknown_selection_and_fields() {
+        for invalid in [
+            r#"{"provider":"unknown","config":{}}"#,
+            r#"{"provider":"runpod","config":{"unknown":true}}"#,
+            r#"{"provider":"runpod","config":{},"unknown":true}"#,
+        ] {
+            assert!(serde_json::from_str::<ProviderConfig>(invalid).is_err());
+        }
+        let ProviderConfig::RunPod(config) = serde_json::from_str::<ProviderConfig>(include_str!(
+            "../../../docs/machine-provider.json"
+        ))
+        .unwrap();
+        assert_eq!(config.template.as_deref(), Some("your-hellas-template-id"));
     }
 }

@@ -1,8 +1,10 @@
 # Machine provider configuration
 
 The provider selector and provider-specific configuration are illustrated in
-[machine-provider.json](machine-provider.json). Pass its `provider` value with `--provider`, and save the `config` object as the file supplied to
-`--provider-config`. Replace the example template id with your own.
+[machine-provider.json](machine-provider.json). Pass the whole file to
+`--provider-config`; its `provider` selects the typed provider configuration in
+`config`. Replace the example template id with your own. For list or destroy,
+`config` may be an empty object; creation requires a template.
 
 The RunPod template must use the same digest-pinned image requested by the
 machine spec, mount persistent data at `/var/lib/hellas`, and provide nonzero

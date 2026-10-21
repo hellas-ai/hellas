@@ -2,15 +2,12 @@ use super::*;
 
 #[test]
 fn provisioning_uses_the_generic_client_side_commands_without_an_identity() {
-    let fixture: serde_json::Value =
-        serde_json::from_str(include_str!("../../../../docs/machine-provider.json")).unwrap();
-    let provider = fixture["provider"].as_str().unwrap();
     for action in ["list", "create", "destroy"] {
         let mut args = vec![
             "hellas",
             "machines",
-            "--provider",
-            provider,
+            "--provider-config",
+            "provider.json",
             "--credential-source",
             "source.json",
             action,
