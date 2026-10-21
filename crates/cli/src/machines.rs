@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 #[derive(clap::Args)]
 pub struct MachinesArgs {
-    /// Existing HTTP secret-source configuration: explicit env, file or refresh.
+    /// HTTP secret-source configuration: explicit env, file/refresh or secret store.
     #[arg(long, global = true)]
     credential_source: Option<PathBuf>,
     #[arg(long, global = true)]
