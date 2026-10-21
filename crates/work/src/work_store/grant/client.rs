@@ -549,6 +549,21 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    impl GrantClientStore {
+        pub(crate) async fn pause_next_statement(
+            &mut self,
+        ) -> (
+            tokio::sync::oneshot::Receiver<()>,
+            std::sync::mpsc::Sender<()>,
+        ) {
+            self.journal.pause_next_statement().await
+        }
+
+        pub(crate) async fn resume_statements(&mut self, release: std::sync::mpsc::Sender<()>) {
+            self.journal.resume_statements(release).await;
+        }
+    }
+
     static DECODED: AtomicBool = AtomicBool::new(false);
     #[derive(Serialize)]
     struct Probe;
