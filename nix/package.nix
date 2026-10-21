@@ -99,9 +99,18 @@ let
       lib.optionalString
         (pkgs.stdenv.hostPlatform.isMusl && pkgs.stdenv.buildPlatform.canExecute pkgs.stdenv.hostPlatform)
         ''
-          timeout 120 cargo test --offline --release --target ${targetTriple} \
-            -p hellas-sdk --features hellas-chain/validator \
-            node_control::bootstrap::tests::pairing_commits_the_saved_credential_and_cannot_be_replayed -- --exact
+          bootstrapTest=node_control::bootstrap::tests::pairing_commits_the_saved_credential_and_cannot_be_replayed
+          cargo test --offline --release --target ${targetTriple} \
+            -p hellas-sdk --features hellas-chain/validator "$bootstrapTest" \
+            --no-run --message-format=json-render-diagnostics > bootstrap-test-build.json
+          bootstrapTestBinary=$(${pkgs.buildPackages.jq}/bin/jq -sre '
+            [.[] | select(.reason == "compiler-artifact" and .profile.test == true
+              and .target.name == "hellas_sdk" and .target.kind == ["lib"]
+              and .executable != null) | .executable]
+            | if length == 1 then .[0] else error("expected one SDK test executable") end
+          ' bootstrap-test-build.json)
+          # Bound test execution only; invoking Cargo again can trigger rebuilds.
+          timeout 120 "$bootstrapTestBinary" "$bootstrapTest" --exact
         '';
     checkInputs = with pkgs; [ cargo-outdated ];
     separateDebugInfo = true;
