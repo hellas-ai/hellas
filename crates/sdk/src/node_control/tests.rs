@@ -136,8 +136,10 @@ fn read_request(grant: GrantId) -> GetHostStatusRequest {
         authorization: grant.0.to_vec(),
     }
 }
+/// The host refuses actively: a denial produced by its own handshake deadline
+/// cannot satisfy this wait.
 async fn rejected(task: tokio::task::JoinHandle<Result<(), WireStatus>>) {
-    let error = tokio::time::timeout(Duration::from_secs(5), task)
+    let error = tokio::time::timeout(HANDSHAKE_TIMEOUT / 2, task)
         .await
         .unwrap()
         .unwrap()
