@@ -1365,3 +1365,94 @@ fn delegated_coin_rpc_lists_funding_without_owned_balance() {
         server.abort();
     });
 }
+
+#[test]
+fn finalized_reads_wait_for_publication_without_holding_the_database() {
+    run_qmdb(|runtime| async move {
+        let indexer_context = runtime.child("publication_indexer");
+        let config = utxo_db_config(&runtime, "publication_rpc", 1024, 8);
+        let database = <UtxoDatabase<_> as DatabaseSet<_>>::init(runtime, config).await;
+        let owner = owner_key(41);
+        let allocations = vec![(owner, 100)];
+        let genesis = index_genesis();
+        let root = apply(&database, &allocations, 1, &[]).await;
+        let floor = index_block(&genesis, root, vec![]);
+        let (chain_indexer, _handle) =
+            finalized_payload_indexer(indexer_context, genesis.clone(), floor.clone()).await;
+        let index = OwnerIndex::new(crate::domain::TEST_NETWORK, &genesis, allocations.clone());
+        index.apply_finalized(&floor).unwrap();
+        let local = LocalLightClient::new(
+            database.clone(),
+            index.clone(),
+            Mempool::default(),
+            chain_indexer.clone(),
+            ConsensusInfo {
+                validators: vec![],
+                threshold_identity: vec![],
+                network_id: crate::domain::TEST_NETWORK.as_str().into(),
+            },
+        );
+        let (reshape, ids) = crate::execution::test_support::reshape(
+            41,
+            &[genesis_object_id(0)],
+            &[(owner, None, 100)],
+        );
+        // Commit the real database but deliberately stop before App::finalized's
+        // cursor publication. All reads below run inside that exact window.
+        let root = apply(&database, &allocations, 2, std::slice::from_ref(&reshape)).await;
+        let next = index_block(&floor, root, vec![reshape]);
+        chain_indexer
+            .ingest_finalized(next.clone(), finalization(&consensus_fixture(91), &next))
+            .await
+            .unwrap();
+        assert_ne!(index.cursor().state_root, root);
+        let query = WorkChannelQuery {
+            bond_edge: EdgeId::from_bytes([71; 32]),
+            payment_edge: EdgeId::from_bytes([72; 32]),
+            funding: BTreeSet::new(),
+        };
+        let coin = local.get_coin(floor.digest(), ids[0]);
+        let holdings = local.get_coins_by_owner(owner);
+        let edge = local.get_edge(floor.digest(), edge_object_id(query.bond_edge));
+        let snapshot = local.work_channel_snapshot(query);
+        tokio::pin!(coin, holdings, edge, snapshot);
+        // Holdings and work snapshots enter the publication wait directly;
+        // coin/edge reads can first pend while resolving the finalized floor.
+        assert!(futures::poll!(&mut coin).is_pending());
+        assert!(futures::poll!(&mut holdings).is_pending());
+        assert!(futures::poll!(&mut edge).is_pending());
+        assert!(futures::poll!(&mut snapshot).is_pending());
+        // A waiting reader must never prevent the publisher from taking a write
+        // lock. Restore the unmodified DB immediately after proving access.
+        let (slot, db) = tokio::time::timeout(std::time::Duration::from_secs(1), database.write())
+            .await
+            .expect("publication wait released every read lock");
+        slot.put(db);
+        index.publish_cursor(&next);
+        let (coin, held, edge, snapshot) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                tokio::join!(coin, holdings, edge, snapshot)
+            })
+            .await
+            .expect("publication wakes every waiting read");
+        assert_eq!(coin.unwrap().unwrap().value, 100);
+        let held = held.unwrap().unwrap();
+        assert_eq!(held.snapshot.payload, next.digest());
+        assert_eq!(held.coins, vec![(ids[0], 100)]);
+        let edge = edge.unwrap().unwrap();
+        assert_eq!(edge.state_root, root);
+        assert!(edge.edge.is_none());
+        assert_eq!(snapshot.unwrap().unwrap().block().payload, next.digest());
+
+        // A cursor that never catches up must refuse on the same bounded wait,
+        // rather than hanging or serving a mixed snapshot.
+        index.publish_cursor(&floor);
+        let started = tokio::time::Instant::now();
+        let result = tokio::time::timeout(PUBLICATION_WAIT * 2, local.get_coins_by_owner(owner))
+            .await
+            .expect("publication refusal is bounded");
+        assert!(matches!(result, Err(QueryError::StateUnavailable(message))
+            if message == "finalized state publication timed out"));
+        assert!(started.elapsed() >= PUBLICATION_WAIT);
+    });
+}
