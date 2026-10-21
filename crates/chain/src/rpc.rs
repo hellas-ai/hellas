@@ -13,13 +13,13 @@ use crate::domain::{
     registry_chunk_object_id,
 };
 use crate::{
-    execution::store::UtxoDatabase,
+    execution::store::{UtxoDatabase, UtxoDb},
     indexer::ChainIndexer,
     light_client::{
         CoinListing, ConsensusInfo, EdgeLookup, EdgeRecord, EdgeState, FinalizedBlock,
         FinalizedBlockQuery, LatestBlock, LightClient, OwnerEdges, QueryError,
     },
-    owner_index::OwnerIndex,
+    owner_index::{OwnerCursor, OwnerIndex},
     work_view::{FinalizedWorkView, WorkChannelQuery, WorkChannelSnapshot},
 };
 use commonware_cryptography::sha256::Digest;
@@ -426,6 +426,40 @@ fn require_finalized_floor(floor_height: u64, cursor_height: u64) -> Result<(), 
     Ok(())
 }
 
+/// Bound publication waits, including lock acquisition, without pinning the
+/// database against the writer that must complete publication.
+const PUBLICATION_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+async fn coherent_reader<'a>(
+    databases: &'a UtxoDatabase<commonware_runtime::tokio::Context>,
+    owner_index: &OwnerIndex,
+) -> Result<
+    (
+        commonware_glue::stateful::db::ReadGuard<'a, UtxoDb<commonware_runtime::tokio::Context>>,
+        OwnerCursor,
+    ),
+    QueryError,
+> {
+    tokio::time::timeout(PUBLICATION_WAIT, async {
+        loop {
+            // Register before sampling either value so publication cannot be
+            // lost between discovering a mismatch and starting to wait.
+            let published = owner_index.published();
+            tokio::pin!(published);
+            published.as_mut().enable();
+            let reader = databases.read().await;
+            let cursor = owner_index.cursor();
+            if reader.root() == cursor.state_root {
+                return (reader, cursor);
+            }
+            drop(reader);
+            published.await;
+        }
+    })
+    .await
+    .map_err(|_| QueryError::StateUnavailable("finalized state publication timed out".into()))
+}
+
 async fn get_edge_at(
     databases: &UtxoDatabase<commonware_runtime::tokio::Context>,
     owner_index: &OwnerIndex,
@@ -439,15 +473,9 @@ async fn get_edge_at(
     }
     let floor_height = finalized_floor_height(chain_indexer, payload).await?;
 
-    let reader = databases.read().await;
+    let (reader, cursor) = coherent_reader(databases, owner_index).await?;
     let state_root = reader.root();
-    let cursor = owner_index.cursor();
     require_finalized_floor(floor_height, cursor.height)?;
-    if cursor.state_root != state_root {
-        return Err(QueryError::StateUnavailable(
-            "owner index and application state are not synchronized".to_string(),
-        ));
-    }
     let edge = match reader
         .get(&object_id)
         .await
@@ -496,9 +524,9 @@ async fn get_coin_at(
 ///
 /// The state the reader holds is the state the owner index has applied
 /// up to, so the finalized block reported beside the objects is that
-/// index's cursor. If the two have drifted apart between the two reads
-/// the whole snapshot is refused rather than reported at a block it was
-/// not read at.
+/// index's cursor. During publication, wait without holding the reader until
+/// the cursor catches up, bounded by PUBLICATION_WAIT. A snapshot is never
+/// reported at a block it was not read at.
 async fn work_channel_snapshot_at(
     databases: &UtxoDatabase<commonware_runtime::tokio::Context>,
     owner_index: &OwnerIndex,
@@ -506,19 +534,11 @@ async fn work_channel_snapshot_at(
     network: NetworkId,
     query: WorkChannelQuery,
 ) -> Result<Option<WorkChannelSnapshot>, QueryError> {
-    let reader = databases.read().await;
-    let state_root = reader.root();
-    // Read after the reader is held: a cursor sampled before it says
-    // nothing about the state the objects will come out of.
-    let cursor = owner_index.cursor();
-    if cursor.height == 0 {
+    if owner_index.cursor().height == 0 {
         return Ok(None);
     }
-    if cursor.state_root != state_root {
-        return Err(QueryError::StateUnavailable(
-            "owner index and application state are not synchronized".to_string(),
-        ));
-    }
+    let (reader, cursor) = coherent_reader(databases, owner_index).await?;
+    let state_root = reader.root();
     let Some(finalization) = chain_indexer.get_finalization(cursor.payload).await? else {
         return Err(QueryError::StateUnavailable(
             "owner index cursor finalization is unavailable".to_string(),
@@ -657,14 +677,8 @@ impl LightClient for LocalLightClient {
     ) -> Result<Option<Coin>, QueryError> {
         self.require_ready()?;
         let floor = finalized_floor_height(&self.chain_indexer, payload).await?;
-        let reader = self.databases.read().await;
-        let cursor = self.owner_index.cursor();
+        let (reader, cursor) = coherent_reader(&self.databases, &self.owner_index).await?;
         require_finalized_floor(floor, cursor.height)?;
-        if reader.root() != cursor.state_root {
-            return Err(QueryError::StateUnavailable(
-                "finalized state is being published".into(),
-            ));
-        }
         match reader
             .get(&object_id)
             .await
@@ -861,16 +875,10 @@ impl LocalLightClient {
         owner: SettlementKey,
     ) -> Result<(Option<LatestBlock>, Vec<(ObjectId, Object)>), QueryError> {
         self.require_ready()?;
-        let reader = self.databases.read().await;
-        let cursor = self.owner_index.cursor();
-        if cursor.height == 0 {
+        if self.owner_index.cursor().height == 0 {
             return Ok((None, vec![]));
         }
-        if reader.root() != cursor.state_root {
-            return Err(QueryError::StateUnavailable(
-                "finalized state is being published".into(),
-            ));
-        }
+        let (reader, cursor) = coherent_reader(&self.databases, &self.owner_index).await?;
         let finalization = self
             .chain_indexer
             .get_finalization(cursor.payload)
