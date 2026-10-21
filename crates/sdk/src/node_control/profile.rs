@@ -59,38 +59,55 @@ impl ClientProfile {
 
 impl LocalTrust {
     fn load(self, parent: &Path) -> io::Result<(Arc<ClientConfig>, ServerName<'static>)> {
-        let mut roots = RootCertStore::empty();
-        roots
-            .add(CertificateDer::from(
-                read_private(&parent.join(self.certificate))?.to_vec(),
-            ))
-            .map_err(|_| invalid("invalid control certificate"))?;
-        let mut tls =
-            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-                .with_protocol_versions(&[&rustls::version::TLS13])
-                .map_err(|_| invalid("TLS 1.3 unavailable"))?
-                .with_root_certificates(roots)
-                .with_no_client_auth();
-        tls.alpn_protocols = vec![HostControl::ALPN.as_bytes().to_vec()];
-        Ok((
-            Arc::new(tls),
-            ServerName::try_from(self.server_name)
-                .map_err(|_| invalid("invalid control server name"))?,
-        ))
+        let certificate =
+            CertificateDer::from(read_private(&parent.join(self.certificate))?.to_vec());
+        local_trust(certificate, self.server_name)
     }
 }
 
-/// Provisioned DER certificate and PKCS#8 key; ordinary startup generates neither.
+/// Trust exactly one local HostControl server certificate over TLS 1.3.
+pub fn local_trust(
+    certificate: CertificateDer<'static>,
+    server_name: String,
+) -> io::Result<(Arc<ClientConfig>, ServerName<'static>)> {
+    let mut roots = RootCertStore::empty();
+    roots
+        .add(certificate)
+        .map_err(|_| invalid("invalid control certificate"))?;
+    let mut tls =
+        ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .map_err(|_| invalid("TLS 1.3 unavailable"))?
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+    tls.alpn_protocols = vec![HostControl::ALPN.as_bytes().to_vec()];
+    Ok((
+        Arc::new(tls),
+        ServerName::try_from(server_name).map_err(|_| invalid("invalid control server name"))?,
+    ))
+}
+
+/// Load a provisioned DER certificate and PKCS#8 key from private files.
 pub fn server_identity(certificate: &Path, key: &Path) -> io::Result<Arc<ServerConfig>> {
     let certificate = CertificateDer::from(read_private(certificate)?.to_vec());
     let mut key = read_private(key)?;
-    let key = PrivatePkcs8KeyDer::from(std::mem::take(&mut *key)).into();
+    server_tls(
+        certificate,
+        PrivatePkcs8KeyDer::from(std::mem::take(&mut *key)),
+    )
+}
+
+/// The HostControl TLS 1.3 server identity; ordinary startup generates none.
+pub fn server_tls(
+    certificate: CertificateDer<'static>,
+    key: PrivatePkcs8KeyDer<'static>,
+) -> io::Result<Arc<ServerConfig>> {
     let mut config =
         ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
             .with_protocol_versions(&[&rustls::version::TLS13])
             .map_err(|_| invalid("TLS 1.3 unavailable"))?
             .with_no_client_auth()
-            .with_single_cert(vec![certificate], key)
+            .with_single_cert(vec![certificate], key.into())
             .map_err(|_| invalid("invalid control TLS identity"))?;
     config.alpn_protocols = vec![HostControl::ALPN.as_bytes().to_vec()];
     Ok(Arc::new(config))
