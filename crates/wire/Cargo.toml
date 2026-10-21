@@ -32,7 +32,7 @@ discovery-mdns = [
 # Mux is shared infrastructure for transports without native substreams.
 mux = []
 tls = ["dep:rustls", "dep:tokio-rustls"]
-ws = ["mux", "dep:tokio-tungstenite"]
+ws = ["mux", "tokio/net", "dep:tokio-tungstenite"]
 # Local native transport: a Unix socket, or an owner-authenticated named pipe
 # on Windows. `mux` keeps the RPC framing and service dispatch identical to
 # WebSocket carriers.
@@ -45,7 +45,7 @@ unix = [
 ]
 # Opt-in TLS for native WebSocket clients. Keeping this separate from `ws`
 # preserves a TLS-free transport build for constrained native targets.
-ws-rustls = ["ws", "dep:rustls", "tokio-tungstenite/rustls-tls-webpki-roots"]
+ws-rustls = ["ws", "tls", "rustls/tls12", "dep:webpki-roots"]
 ws-wasm = ["mux", "dep:ws_stream_wasm", "dep:wasm-bindgen-futures"]
 
 [dependencies]
@@ -89,6 +89,7 @@ tokio-tungstenite = { workspace = true, optional = true }
 tracing = { workspace = true }
 wasm-bindgen-futures = { version = "0.4", optional = true }
 web-time = { workspace = true }
+webpki-roots = { version = "1", optional = true }
 ws_stream_wasm = { version = "0.7", optional = true }
 
 [target.'cfg(all(unix, not(target_os = "espidf")))'.dependencies]
@@ -119,5 +120,6 @@ windows-sys = { version = "0.61", optional = true, features = [
 
 [dev-dependencies]
 iroh = { workspace = true, features = ["tls-ring"] }
+rcgen = "0.14"
 tokio = { workspace = true, features = ["full"] }
 tracing-subscriber = { workspace = true }
