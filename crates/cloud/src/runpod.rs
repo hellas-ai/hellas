@@ -7,18 +7,17 @@ use serde_json::{Value, json};
 
 use crate::{CreateMachine, Error, Machine, Provider, Result};
 
-pub(crate) fn open(credential: HttpSecretConfig, config: Value) -> Result<Box<dyn Provider>> {
-    let config =
-        serde_json::from_value(config).map_err(|_| Error::Invalid("provider configuration"))?;
+pub(crate) fn open(credential: HttpSecretConfig, config: Config) -> Result<Box<dyn Provider>> {
     Ok(Box::new(RunPod::new(credential, config)?))
 }
 
-#[derive(serde::Deserialize)]
+/// RunPod settings; the generic machine request contains no template metadata.
+#[derive(Clone, Debug, Default, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Config {
-    template: Option<String>,
+pub struct Config {
+    pub template: Option<String>,
     #[cfg(feature = "test-support")]
-    api_base: Option<String>,
+    pub api_base: Option<String>,
 }
 
 impl Config {
@@ -288,7 +287,11 @@ mod tests {
     }
 
     fn config() -> Config {
-        serde_json::from_value(json!({"template":"template"})).unwrap()
+        Config {
+            template: Some("template".into()),
+            #[cfg(feature = "test-support")]
+            api_base: None,
+        }
     }
 
     #[test]
@@ -391,8 +394,21 @@ mod tests {
                 respond(&mut socket, "200 OK", &response.to_string());
             }
         });
-        let mut provider = RunPod::new(source(&path), config()).unwrap();
-        provider.base = format!("http://{address}");
+        #[cfg(feature = "test-support")]
+        let provider = crate::open(
+            source(&path),
+            crate::ProviderConfig::RunPod(Config {
+                api_base: Some(format!("http://{address}")),
+                ..config()
+            }),
+        )
+        .unwrap();
+        #[cfg(not(feature = "test-support"))]
+        let provider = {
+            let mut provider = RunPod::new(source(&path), config()).unwrap();
+            provider.base = format!("http://{address}");
+            provider
+        };
         let created = provider.create(&spec()).await.unwrap();
         assert_eq!(created.id, "pod1");
         assert!(

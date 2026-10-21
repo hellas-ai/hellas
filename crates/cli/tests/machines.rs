@@ -10,13 +10,12 @@ use std::{
 #[tokio::test]
 async fn generic_machine_commands_use_the_documented_provider_and_real_http_driver() {
     let root = tempfile::tempdir().unwrap();
-    let documented: Value =
+    let mut documented: Value =
         serde_json::from_str(include_str!("../../../docs/machine-provider.json")).unwrap();
-    let provider = documented["provider"].as_str().unwrap();
     let image = format!("registry/hellas@sha256:{}", "a".repeat(64));
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
-    let mut configuration = documented["config"].clone();
+    let configuration = &mut documented["config"];
     configuration["api_base"] = json!(base);
     let template = configuration["template"].as_str().unwrap().to_owned();
     let source = root.path().join("source.json");
@@ -29,7 +28,7 @@ async fn generic_machine_commands_use_the_documented_provider_and_real_http_driv
         json!({"secret_file":secret,"secret_field":"token"}).to_string(),
     )
     .unwrap();
-    std::fs::write(&config, configuration.to_string()).unwrap();
+    std::fs::write(&config, documented.to_string()).unwrap();
     std::fs::write(
         &spec,
         json!({
@@ -126,8 +125,6 @@ async fn generic_machine_commands_use_the_documented_provider_and_real_http_driv
             tokio::process::Command::new(env!("CARGO_BIN_EXE_hellas-cli"))
                 .args([
                     "machines",
-                    "--provider",
-                    provider,
                     "--credential-source",
                     source.to_str().unwrap(),
                     "--provider-config",
