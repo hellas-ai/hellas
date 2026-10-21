@@ -255,10 +255,16 @@ async fn client_replays_its_journal_after_a_cancelled_append() {
         .await
         .unwrap();
     // A gateway deadline drops the session future while the append is in flight.
+    let (started, release) = client.pause_next_statement().await;
     {
         let mut cancelled = std::pin::pin!(client.accepted(work, accepted, UnixMillis(1_000)));
+        tokio::select! {
+            entered = started => entered.unwrap(),
+            result = &mut cancelled => panic!("append completed before cancellation: {result:?}"),
+        }
         assert!(futures::poll!(&mut cancelled).is_pending());
     }
+    client.resume_statements(release).await;
     client
         .accepted(work, accepted, UnixMillis(1_000))
         .await
