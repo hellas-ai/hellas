@@ -44,7 +44,7 @@ pub enum WsError {
 /// `MessagePipe` adapter over a tokio-tungstenite `WebSocketStream`.
 ///
 /// Generic over the underlying byte stream so the same pipe works for
-/// `connect_async` (which yields `MaybeTlsStream<TcpStream>`) and for
+/// outbound TCP/TLS connections and for
 /// upgraded server sockets (`hyper::upgrade::Upgraded`, plain
 /// `TcpStream`, etc.).
 pub struct WsPipe<S> {
@@ -114,7 +114,13 @@ where
 /// in client role. The caller polls `transport.open(...)` / `accept()`
 /// as usual; the mux's spawned I/O loop drives the WebSocket.
 pub async fn connect(url: &str) -> Result<WsTransport, WsError> {
-    connect_with_role::<NATIVE_MUX_N>(url, Role::Client).await
+    connect_with_role::<NATIVE_MUX_N>(
+        url,
+        Role::Client,
+        #[cfg(feature = "ws-rustls")]
+        websocket_tls_config()?,
+    )
+    .await
 }
 
 /// Dial a WebSocket as the HTTP client while serving inbound mux streams.
@@ -125,23 +131,75 @@ pub async fn connect(url: &str) -> Result<WsTransport, WsError> {
 /// role. The request form lets callers add authenticated-upgrade headers before
 /// dialing.
 pub async fn connect_server(request: Request<()>) -> Result<WsTransport, WsError> {
-    connect_with_role::<RELAY_MUX_N>(request, Role::Server).await
+    connect_with_role::<RELAY_MUX_N>(
+        request,
+        Role::Server,
+        #[cfg(feature = "ws-rustls")]
+        websocket_tls_config()?,
+    )
+    .await
 }
 
 async fn connect_with_role<const N: usize>(
     request: impl IntoClientRequest + Unpin,
     role: Role,
+    #[cfg(feature = "ws-rustls")] tls_config: std::sync::Arc<rustls::ClientConfig>,
 ) -> Result<WsTransport, WsError> {
-    #[cfg(feature = "ws-rustls")]
-    ensure_rustls_crypto_provider()?;
-
-    let (ws, _resp) = tokio_tungstenite::connect_async(request)
+    let request = request
+        .into_client_request()
+        .map_err(|e| WsError::Connect(e.to_string()))?;
+    let secure = match request.uri().scheme_str() {
+        Some("ws") => false,
+        Some("wss") => true,
+        _ => return Err(WsError::Connect("unsupported WebSocket URL scheme".into())),
+    };
+    #[cfg(not(feature = "ws-rustls"))]
+    if secure {
+        return Err(WsError::Connect("WebSocket TLS support is disabled".into()));
+    }
+    let host = request
+        .uri()
+        .host()
+        .ok_or_else(|| WsError::Connect("WebSocket URL has no host".into()))?;
+    // http::Uri retains IPv6 brackets; socket lookup and Rustls names do not.
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    let port = request
+        .uri()
+        .port_u16()
+        .unwrap_or(if secure { 443 } else { 80 });
+    let stream = tokio::net::TcpStream::connect((host, port))
         .await
-        .map_err(|e| WsError::Connect(format!("{e}")))?;
+        .map_err(|e| WsError::Connect(e.to_string()))?;
+    #[cfg(feature = "ws-rustls")]
+    if secure {
+        let server = rustls::pki_types::ServerName::try_from(host.to_owned())
+            .map_err(|e| WsError::Connect(e.to_string()))?;
+        let stream = tokio_rustls::TlsConnector::from(tls_config)
+            .connect(server, stream)
+            .await
+            .map_err(|e| WsError::Connect(e.to_string()))?;
+        return connect_stream::<N, _>(request, stream, role).await;
+    }
+    connect_stream::<N, _>(request, stream, role).await
+}
+
+async fn connect_stream<const N: usize, S>(
+    request: Request<()>,
+    stream: S,
+    role: Role,
+) -> Result<WsTransport, WsError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let (ws, _resp) = tokio_tungstenite::client_async(request, stream)
+        .await
+        .map_err(|e| WsError::Connect(e.to_string()))?;
     let pipe = WsPipe::new(ws);
-    // A WebSocket mux vouches for nothing on its own: the TLS below it
-    // is the browser's or the runtime's, and this layer can neither
-    // name the peer nor export the session's keying material.
+    // HTTPS certificate validation does not establish a Hellas principal.
+    // WebSocket connections carry no protocol service binding or exporter.
     let transport = MuxTransport::spawn::<N, DefaultClock, _>(
         role,
         DefaultClock,
@@ -153,17 +211,22 @@ async fn connect_with_role<const N: usize>(
 }
 
 #[cfg(feature = "ws-rustls")]
-fn ensure_rustls_crypto_provider() -> Result<(), WsError> {
-    if rustls::crypto::CryptoProvider::get_default().is_none() {
-        // A larger application may link both Rustls backends through unrelated
-        // dependencies. Rustls deliberately refuses to guess in that case, so
-        // install one explicitly unless the application already chose one.
-        let _ = rustls::crypto::ring::default_provider().install_default();
-    }
-
-    rustls::crypto::CryptoProvider::get_default()
-        .map(|_| ())
-        .ok_or_else(|| WsError::Connect("failed to install a Rustls crypto provider".to_string()))
+fn websocket_tls_config() -> Result<std::sync::Arc<rustls::ClientConfig>, WsError> {
+    use std::sync::{Arc, OnceLock};
+    static CONFIG: OnceLock<Result<Arc<rustls::ClientConfig>, String>> = OnceLock::new();
+    CONFIG
+        .get_or_init(|| {
+            let roots =
+                rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            rustls::ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .map(|builder| Arc::new(builder.with_root_certificates(roots).with_no_client_auth()))
+            .map_err(|e| e.to_string())
+        })
+        .clone()
+        .map_err(WsError::Connect)
 }
 
 /// Wrap an already-upgraded `WebSocketStream` as a server-side
@@ -242,9 +305,210 @@ mod tests {
 
     #[cfg(feature = "ws-rustls")]
     #[test]
-    fn tls_feature_installs_a_process_crypto_provider() {
-        ensure_rustls_crypto_provider().unwrap();
-        assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+    fn tls_config_is_shared_and_does_not_require_alpn() {
+        let first = websocket_tls_config().unwrap();
+        let second = websocket_tls_config().unwrap();
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
+        assert!(first.alpn_protocols.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unsupported_scheme_is_rejected_before_dialing() {
+        let error = connect("https://127.0.0.1:1/").await.err().unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported WebSocket URL scheme")
+        );
+    }
+
+    #[cfg(not(feature = "ws-rustls"))]
+    #[tokio::test]
+    async fn wss_without_tls_is_rejected_before_dialing() {
+        let error = connect("wss://127.0.0.1:1/").await.err().unwrap();
+        assert!(error.to_string().contains("TLS support is disabled"));
+    }
+
+    #[allow(
+        clippy::result_large_err,
+        reason = "tungstenite fixes its upgrade callback error type"
+    )]
+    fn assert_upgrade_request(
+        request: &tokio_tungstenite::tungstenite::handshake::server::Request,
+        response: tokio_tungstenite::tungstenite::handshake::server::Response,
+    ) -> Result<
+        tokio_tungstenite::tungstenite::handshake::server::Response,
+        tokio_tungstenite::tungstenite::handshake::server::ErrorResponse,
+    > {
+        assert_eq!(
+            request.uri().path_and_query().unwrap().as_str(),
+            "/relay?node=1"
+        );
+        assert_eq!(request.headers()["authorization"], "Bearer local-test");
+        Ok(response)
+    }
+
+    #[tokio::test]
+    async fn ipv6_websocket_dial_preserves_upgrade_headers() {
+        let listener = TcpListener::bind("[::1]:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let ws = tokio_tungstenite::accept_hdr_async(tcp, assert_upgrade_request)
+                .await
+                .unwrap();
+            let transport = MuxTransport::spawn::<NATIVE_MUX_N, DefaultClock, _>(
+                Role::Client,
+                DefaultClock,
+                MuxConfig::default(),
+                WsPipe::new(ws),
+                TransportContext::default(),
+            );
+            let _stream = transport.open(42, Metadata::new()).await.unwrap();
+        });
+        let mut request = format!("ws://{addr}/relay?node=1")
+            .into_client_request()
+            .unwrap();
+        request
+            .headers_mut()
+            .insert("authorization", "Bearer local-test".parse().unwrap());
+        let transport = connect_server(request).await.unwrap();
+        assert_eq!(transport.accept().await.unwrap().unwrap().method_id, 42);
+        peer.await.unwrap();
+    }
+
+    #[cfg(feature = "ws-rustls")]
+    fn local_tls_server(
+        version: &'static rustls::SupportedProtocolVersion,
+    ) -> (
+        std::sync::Arc<rustls::ServerConfig>,
+        rustls::pki_types::CertificateDer<'static>,
+    ) {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let certificate = cert.cert.der().clone();
+        let server = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[version])
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![certificate.clone()],
+            rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()).into(),
+        )
+        .unwrap();
+        (std::sync::Arc::new(server), certificate)
+    }
+
+    #[cfg(feature = "ws-rustls")]
+    #[tokio::test]
+    async fn local_wss_supports_tls12_and_tls13_without_alpn() {
+        for version in [&rustls::version::TLS12, &rustls::version::TLS13] {
+            let (server, certificate) = local_tls_server(version);
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let peer = tokio::spawn(async move {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let tls = tokio_rustls::TlsAcceptor::from(server)
+                    .accept(tcp)
+                    .await
+                    .unwrap();
+                assert_eq!(tls.get_ref().1.protocol_version(), Some(version.version));
+                assert!(tls.get_ref().1.alpn_protocol().is_none());
+                let ws = tokio_tungstenite::accept_hdr_async(tls, assert_upgrade_request)
+                    .await
+                    .unwrap();
+                let transport = accept_upgraded(ws, None);
+                let inbound = transport.accept().await.unwrap().unwrap();
+                assert_eq!(inbound.method_id, 42);
+            });
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(certificate).unwrap();
+            let config = rustls::ClientConfig::builder_with_provider(
+                websocket_tls_config().unwrap().crypto_provider().clone(),
+            )
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+            let mut request = format!("wss://localhost:{}/relay?node=1", addr.port())
+                .into_client_request()
+                .unwrap();
+            request
+                .headers_mut()
+                .insert("authorization", "Bearer local-test".parse().unwrap());
+            let client = connect_with_role::<NATIVE_MUX_N>(
+                request,
+                Role::Client,
+                std::sync::Arc::new(config),
+            )
+            .await
+            .unwrap();
+            let _stream = client.open(42, Metadata::new()).await.unwrap();
+            peer.await.unwrap();
+        }
+    }
+
+    #[cfg(feature = "ws-rustls")]
+    #[tokio::test]
+    async fn trusted_certificate_with_wrong_hostname_is_rejected() {
+        let (server, certificate) = local_tls_server(&rustls::version::TLS13);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            assert!(
+                tokio_rustls::TlsAcceptor::from(server)
+                    .accept(tcp)
+                    .await
+                    .is_err()
+            );
+        });
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(certificate).unwrap();
+        let config = rustls::ClientConfig::builder_with_provider(
+            websocket_tls_config().unwrap().crypto_provider().clone(),
+        )
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        let error = connect_with_role::<NATIVE_MUX_N>(
+            format!("wss://{addr}"),
+            Role::Client,
+            std::sync::Arc::new(config),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(
+            error.to_string().contains("certificate not valid for name"),
+            "{error}"
+        );
+        peer.await.unwrap();
+    }
+
+    #[cfg(feature = "ws-rustls")]
+    #[tokio::test]
+    async fn public_wss_dial_rejects_an_untrusted_certificate() {
+        let (server, _) = local_tls_server(&rustls::version::TLS13);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            assert!(
+                tokio_rustls::TlsAcceptor::from(server)
+                    .accept(tcp)
+                    .await
+                    .is_err()
+            );
+        });
+        let error = connect(&format!("wss://localhost:{}", addr.port()))
+            .await
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("UnknownIssuer"), "{error}");
+        peer.await.unwrap();
     }
 
     #[tokio::test]

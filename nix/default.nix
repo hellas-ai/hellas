@@ -61,10 +61,7 @@ let
 
   denyConfig = pkgs.writeText "hellas-deny.toml" ''
     [advisories]
-    # tokio-tungstenite uses the 0.26.11 shim, which re-exports 1.x roots.
-    # Keep the advisory exception paired with the version bans below.
     ignore = [
-      { id = "RUSTSEC-2026-0381", reason = "webpki-roots 0.26.11 only re-exports 1.x; bans reject vulnerable versions of both lines." },
       { id = "RUSTSEC-2024-0436", reason = "Transitive through commonware/gemm; no safe upgrade is available." },
     ]
 
@@ -89,10 +86,6 @@ let
 
     [bans]
     multiple-versions = "allow"
-    deny = [
-      { name = "webpki-roots", version = "<0.26.11", reason = "RUSTSEC-2026-0381: only the 0.26.11 re-export shim is safe with patched 1.x roots." },
-      { name = "webpki-roots", version = ">=0.26.12, <1.0.10", reason = "RUSTSEC-2026-0381: require removal of the distrusted emSign root." },
-    ]
 
     [sources]
     allow-git = ["https://github.com/georgewhewell/commonware-monorepo", "https://github.com/georgewhewell/catena-lang"]
