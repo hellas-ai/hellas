@@ -425,7 +425,7 @@ Local evaluation uses `gateway --local --local-grant ID` to select an already
 configured allowance with a `local` policy. It never creates an owner grant or
 changes the selected allowance's policy while opening the gateway.
 
-Provisioning uses the client-side `machines --provider NAME --credential-source FILE
+Provisioning uses the client-side `machines --credential-source FILE
 --provider-config FILE create --spec FILE` command, with matching `list` and
 `destroy ID` commands. The provider settings and credential-source formats are
 shown in [machine provider configuration](machine-provider-config.md). Provisioning
