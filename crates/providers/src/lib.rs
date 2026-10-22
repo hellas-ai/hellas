@@ -8,6 +8,7 @@ pub mod stream;
 pub use http::{
     CredentialRefresh, HttpCredential, HttpCredentialConfig, HttpEgressPolicy,
     HttpFetchAdaptorFactory, HttpFetchProvider, HttpProviderConfig, HttpSecret, HttpSecretConfig,
+    HttpSecretStore,
 };
 
 pub use codex_responses::{

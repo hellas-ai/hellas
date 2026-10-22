@@ -60,7 +60,14 @@ async fn run(
         .as_deref()
         .map(crate::commands::chain::passkey)
         .transpose()?;
-    crate::commands::admin::run(args, identity, passkey.as_ref()).await
+    crate::commands::admin::run(
+        args,
+        identity,
+        passkey
+            .as_ref()
+            .map(|key| key as &dyn hellas_work::authenticator::Authenticator),
+    )
+    .await
 }
 fn offline_args(command: AdminCommand, passkey: Option<&Path>) -> Invocation {
     Invocation(

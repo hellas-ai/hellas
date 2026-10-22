@@ -163,16 +163,45 @@ mod tests {
         );
         assert!(plan.authorize(delegation_auth).is_ok());
     }
-    #[test]
-    fn standalone_sdk_accepts_a_passkey_owner() {
-        let owner = hellas_kernel::SoftPasskey::from_secret_scalar([21; 32]).unwrap();
+    #[tokio::test]
+    async fn standalone_sdk_accepts_an_async_passkey_authenticator() {
+        use hellas_auth::{
+            Digest,
+            authority::{AuthorityError, PasskeyAssertion},
+        };
+        use hellas_work::authenticator::{Authenticator, PublicKey, kernel_auth};
+        struct NativePrompt(hellas_kernel::SoftPasskey);
+        #[async_trait::async_trait]
+        impl Authenticator for NativePrompt {
+            fn public_key(&self) -> Result<PublicKey, AuthorityError> {
+                self.0.public_key()
+            }
+            async fn assert(&self, challenge: Digest) -> Result<PasskeyAssertion, AuthorityError> {
+                tokio::task::yield_now().await;
+                self.0.assert(challenge).await
+            }
+        }
+        let owner = NativePrompt(hellas_kernel::SoftPasskey::from_secret_scalar([21; 32]).unwrap());
         let plan = OwnerReshape {
             network: NetworkId::new("owner-passkey-test").unwrap(),
-            owner: owner.party_key(),
+            owner: Key::from_bytes(owner.public_key().unwrap().to_compressed()),
             inputs: List::take([CoinId::from_bytes([1; 32]); MAX_EDGE_INPUTS], 1),
-            outputs: List::take([Payout::new(owner.party_key(), 100); MAX_EDGE_OUTPUTS], 1),
+            outputs: List::take(
+                [Payout::new(
+                    Key::from_bytes(owner.public_key().unwrap().to_compressed()),
+                    100,
+                ); MAX_EDGE_OUTPUTS],
+                1,
+            ),
         };
-        let auth = Auth::webauthn(owner.sign(plan.payload_hash()).unwrap());
+        let auth = kernel_auth(
+            &owner.public_key().unwrap(),
+            &owner
+                .assert(Digest::from(*plan.payload_hash().as_bytes()))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
         assert!(plan.authorize(auth).is_ok());
     }
 }

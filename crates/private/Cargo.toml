@@ -7,10 +7,21 @@ license.workspace = true
 repository.workspace = true
 documentation.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+base64.workspace = true
+dbus-secret-service-keyring-store = { version = "1", features = [
+    "crypto-rust",
+    "vendored",
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store = { version = "1", features = ["keychain"] }
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
+windows-native-keyring-store = "1"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
@@ -21,5 +32,6 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dependencies]
+keyring-core = "1"
 tempfile.workspace = true
 zeroize = "1.9"

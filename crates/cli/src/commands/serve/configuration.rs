@@ -278,6 +278,7 @@ fn prepare_update(path: &Path, old: &[u8], update: ProviderUpdate) -> CliResult<
                     header_name: key.header_name,
                     source: hellas_providers::HttpSecretConfig {
                         secret_env: None,
+                        secret_store: None,
                         secret_file: Some(secret_path),
                         secret_field: Some("secret".into()),
                         refresh: None,

@@ -8,6 +8,9 @@
 //! in a Windows DACL for the same reason root is on Unix: they can reach the
 //! object regardless of what it says.
 
+mod secrets;
+pub use secrets::{MAX_SECRET_BYTES, SecretError, SecretStore};
+
 mod regular;
 pub use regular::{
     ReadLimit, open_regular_file, open_regular_file_nofollow, read_bounded,

@@ -1,10 +1,10 @@
 //! Checked authority service sharing the node's existing durable writer.
+use crate::authenticator::Authenticator;
 use crate::endpoint_lock::{EndpointGuard, EndpointLock};
 use crate::operations::validate_scope;
 use crate::work_store::grant::{NodeStore, NodeStoreError};
 use hellas_auth::authority::*;
 use hellas_auth::{Digest, ProducerSigningKey};
-use hellas_kernel::{PayloadHash, SoftPasskey, WebAuthnAssertion};
 use std::sync::Arc;
 mod host;
 pub use host::{
@@ -17,7 +17,7 @@ pub use host::{
 #[derive(Clone, Copy)]
 pub enum SessionKey<'a> {
     /// The credential subject's passkey: a passkey session, as step-up needs.
-    Passkey(&'a SoftPasskey),
+    Passkey(&'a dyn Authenticator),
     /// The node key the credential is bound to: a daily session.
     Node(&'a ProducerSigningKey),
 }
@@ -25,7 +25,7 @@ pub enum SessionKey<'a> {
 impl SessionKey<'_> {
     /// Answer `challenge` for `credential`, after checking it names the
     /// expected authority and this connection's binding.
-    pub fn prove(
+    pub async fn prove(
         self,
         challenge: &SessionChallenge,
         authority: AuthorityId,
@@ -36,22 +36,10 @@ impl SessionKey<'_> {
             Self::Node(key) => challenge.sign_daily(authority, binding, credential, key),
             Self::Passkey(passkey) => {
                 let digest = challenge.proof_digest(authority, binding, credential)?;
-                let envelope = passkey
-                    .sign(PayloadHash::from_bytes(*digest.as_bytes()))
-                    .map_err(|_| AuthorityError::Credential)?;
-                passkey_assertion(&envelope).map(SessionProof::Passkey)
+                passkey.assert(digest).await.map(SessionProof::Passkey)
             }
         }
     }
-}
-
-/// A kernel-envelope assertion, as a software passkey produces it.
-pub fn passkey_assertion(envelope: &WebAuthnAssertion) -> Result<PasskeyAssertion, AuthorityError> {
-    let mut signature = [0; 64];
-    let (r, s) = signature.split_at_mut(32);
-    r.copy_from_slice(envelope.r());
-    s.copy_from_slice(envelope.s());
-    PasskeyAssertion::from_envelope(signature, envelope.webauthn_data().as_slice())
 }
 
 /// Cloneable service handle, not caller authority. No method exposes a mutable
@@ -186,7 +174,9 @@ impl NodeCoordinator {
         let binding = Digest::hash(b"hellas.auth.in-process.v1");
         let pending = self.begin_authentication(binding).await?;
         let authority = pending.challenge().authority;
-        let proof = key.prove(pending.challenge(), authority, binding, secret.id())?;
+        let proof = key
+            .prove(pending.challenge(), authority, binding, secret.id())
+            .await?;
         Ok(self
             .complete_authentication(pending, binding, secret, &proof)
             .await?
