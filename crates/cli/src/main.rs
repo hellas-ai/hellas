@@ -782,20 +782,26 @@ async fn async_main() {
         | Commands::Offer {
             command: commands::contributions::OfferCommand::Import { .. },
         }) => {
-            let result = cli
-                .passkey
-                .as_deref()
-                .map(commands::chain::passkey)
-                .transpose()
-                .and_then(|passkey| match command {
+            let result: anyhow::Result<()> = async {
+                let passkey = cli
+                    .passkey
+                    .as_deref()
+                    .map(commands::chain::passkey)
+                    .transpose()?;
+                let passkey = passkey
+                    .as_ref()
+                    .map(|key| key as &dyn hellas_work::authenticator::Authenticator);
+                match command {
                     Commands::Contact { command } => {
-                        commands::contributions::contact(command, passkey.as_ref())
+                        commands::contributions::contact(command, passkey).await
                     }
                     Commands::Offer { command } => {
-                        commands::contributions::offer(command, passkey.as_ref(), None)
+                        commands::contributions::offer(command, passkey, None)
                     }
                     _ => Ok(()),
-                });
+                }
+            }
+            .await;
             tracer_provider.shutdown();
             if let Err(err) = result {
                 eprintln!("error: {err:#}");
@@ -859,7 +865,9 @@ async fn async_main() {
             std::process::exit(1);
         }
     };
-    let passkey = passkey.as_ref();
+    let passkey = passkey
+        .as_ref()
+        .map(|key| key as &dyn hellas_work::authenticator::Authenticator);
     if let Commands::Serve { assurance, .. } = &command
         && let Err(error) = validate_serve_assurance(
             cli.software_root,

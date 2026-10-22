@@ -61,6 +61,7 @@ url = { version = "2" }
 zeroize = { version = "1.9" }
 
 [dev-dependencies]
+async-trait = "0.1"
 base64.workspace = true
 bytes.workspace = true
 commonware-codec.workspace = true
