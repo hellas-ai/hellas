@@ -53,12 +53,12 @@ pub fn try_passkey_caller(
         .subject;
     let binding = hellas_auth::Digest::hash(b"test session");
     let pending = authority.begin_authentication(binding, now)?;
-    let proof = crate::node::SessionKey::Passkey(&passkey_of(subject)).prove(
-        pending.challenge(),
-        authority.authority(),
-        binding,
-        secret.id(),
-    )?;
+    let digest = pending
+        .challenge()
+        .proof_digest(authority.authority(), binding, secret.id())?;
+    let proof = hellas_auth::authority::SessionProof::Passkey(
+        hellas_auth::test_support::assertion(&passkey_of(subject), digest),
+    );
     Ok(pending
         .complete(authority, binding, secret, &proof, now)?
         .into_caller())

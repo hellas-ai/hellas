@@ -1,5 +1,5 @@
-//! Operator-owned account aliases reference environment variables or private
-//! credential files; route configuration contains no secret values.
+//! Operator-owned account aliases reference environment variables, private
+//! credential files or secret stores; route configuration contains no secret values.
 use super::{HttpCredential, HttpEgressPolicy, HttpFetchProvider};
 use hellas_auth::authority::UnixMillis;
 use hellas_executor::{FetchProviderError, FetchRouteEntry, FetchRoutePolicy};
@@ -37,12 +37,48 @@ pub struct HttpCredentialConfig {
 #[serde(deny_unknown_fields)]
 pub struct HttpSecretConfig {
     pub secret_env: Option<String>,
+    pub secret_store: Option<HttpSecretStore>,
     /// A private JSON credential file maintained by the account's login tool.
     pub secret_file: Option<PathBuf>,
     pub secret_field: Option<String>,
     pub refresh: Option<CredentialRefresh>,
     #[serde(default)]
     pub prefix: String,
+}
+
+/// A reference, never a secret value. Headless files require explicit selection.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "backend", rename_all = "snake_case", deny_unknown_fields)]
+pub enum HttpSecretStore {
+    Native {
+        service: String,
+        key: String,
+    },
+    HeadlessFiles {
+        directory: PathBuf,
+        service: String,
+        key: String,
+    },
+}
+impl HttpSecretStore {
+    fn into_entry(self) -> Result<(hellas_private::SecretStore, String), FetchProviderError> {
+        let (store, key) = match self {
+            Self::Native { service, key } => (hellas_private::SecretStore::native(service), key),
+            Self::HeadlessFiles {
+                directory,
+                service,
+                key,
+            } => (
+                hellas_private::SecretStore::headless_files(directory, service),
+                key,
+            ),
+        };
+        let store = store.map_err(|_| super::fault("invalid secret store reference"))?;
+        store
+            .validate_key(&key)
+            .map_err(|_| super::fault("invalid secret store key"))?;
+        Ok((store, key))
+    }
 }
 
 /// An operator-owned login tool updates the same private JSON file. It receives
@@ -93,6 +129,11 @@ impl CredentialRefresh {
 #[derive(Clone)]
 pub enum HttpSecret {
     Value(String),
+    Store {
+        store: hellas_private::SecretStore,
+        key: String,
+        prefix: String,
+    },
     JsonFile {
         path: PathBuf,
         field: String,
@@ -116,6 +157,20 @@ impl HttpSecret {
     pub async fn resolve(&self) -> Result<String, FetchProviderError> {
         match self {
             Self::Value(value) => Ok(value.clone()),
+            Self::Store { store, key, prefix } => {
+                let store = store.clone();
+                let key = key.clone();
+                let bytes = tokio::task::spawn_blocking(move || store.get(&key))
+                    .await
+                    .map_err(|_| super::fault("secret store reader failed"))?
+                    .map_err(|_| super::fault("secret store unavailable or access denied"))?
+                    .ok_or_else(|| super::fault("secret store entry unavailable"))?;
+                let secret = std::str::from_utf8(&bytes)
+                    .ok()
+                    .filter(|secret| !secret.is_empty())
+                    .ok_or_else(|| super::fault("secret store entry must be nonempty UTF-8"))?;
+                Ok(format!("{prefix}{secret}"))
+            }
             Self::JsonFile {
                 path,
                 field,
@@ -198,8 +253,13 @@ impl HttpSecretConfig {
                 "credential refresh requires a command and expiry field",
             ));
         }
-        let secret = match (self.secret_env, self.secret_file, self.secret_field) {
-            (Some(name), None, None) if self.refresh.is_none() => {
+        let secret = match (
+            self.secret_env,
+            self.secret_file,
+            self.secret_field,
+            self.secret_store,
+        ) {
+            (Some(name), None, None, None) if self.refresh.is_none() => {
                 let secret = std::env::var(name).map_err(|_| {
                     super::fault("account secret environment variable is unavailable")
                 })?;
@@ -208,15 +268,23 @@ impl HttpSecretConfig {
                 }
                 HttpSecret::Value(format!("{}{secret}", self.prefix))
             }
-            (None, Some(path), Some(field)) if !field.is_empty() => HttpSecret::JsonFile {
+            (None, Some(path), Some(field), None) if !field.is_empty() => HttpSecret::JsonFile {
                 path,
                 field,
                 prefix: self.prefix,
                 refresh: self.refresh,
             },
+            (None, None, None, Some(reference)) if self.refresh.is_none() => {
+                let (store, key) = reference.into_entry()?;
+                HttpSecret::Store {
+                    store,
+                    key,
+                    prefix: self.prefix,
+                }
+            }
             _ => {
                 return Err(super::fault(
-                    "configure either secret_env or secret_file with secret_field",
+                    "configure exactly one of secret_env, secret_file with secret_field, or secret_store",
                 ));
             }
         };
@@ -268,6 +336,73 @@ impl HttpProviderConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn store_credentials_resolve_rotation_and_refuse_invalid_values() {
+        let directory = tempfile::tempdir().unwrap();
+        hellas_private::restrict_directory(directory.path()).unwrap();
+        let store =
+            hellas_private::SecretStore::headless_files(directory.path().into(), "http-test")
+                .unwrap();
+        let value = serde_json::json!({"secret_store": {"backend":"headless_files", "directory":directory.path(), "service":"http-test", "key":"token"}, "prefix":"Bearer "});
+        let source = serde_json::from_value::<HttpSecretConfig>(value.clone())
+            .unwrap()
+            .into_secret()
+            .unwrap();
+        assert!(source.resolve().await.is_err());
+        for token in ["first", "rotated"] {
+            store.set("token", token.as_bytes()).unwrap();
+            assert_eq!(source.resolve().await.unwrap(), format!("Bearer {token}"));
+        }
+        for invalid in [b"".as_slice(), b"\xffPRIVATE-PAYLOAD".as_slice()] {
+            store.set("token", invalid).unwrap();
+            let error = source.resolve().await.unwrap_err().to_string();
+            assert!(!error.contains("PRIVATE-PAYLOAD"));
+        }
+        store.delete("token").unwrap();
+        assert!(source.resolve().await.is_err());
+        for (name, extra) in [
+            ("secret_env", serde_json::json!("IGNORED")),
+            ("secret_file", serde_json::json!("ignored")),
+            ("secret_field", serde_json::json!("token")),
+            (
+                "refresh",
+                serde_json::json!({"command":["unused"],"expires_field":"expiry"}),
+            ),
+        ] {
+            let mut ambiguous = value.clone();
+            ambiguous[name] = extra;
+            assert!(
+                serde_json::from_value::<HttpSecretConfig>(ambiguous)
+                    .unwrap()
+                    .into_secret()
+                    .is_err()
+            );
+        }
+        let mut unknown = value;
+        unknown["secret_store"]["fallback"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<HttpSecretConfig>(unknown).is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an explicitly prepared disposable native secret-store session"]
+    async fn native_store_source_resolves_on_current_thread_runtime() {
+        let service = std::env::var("HELLAS_SECRET_TEST_SERVICE").unwrap();
+        assert!(service.starts_with("hellas-secret-test-"));
+        let store = hellas_private::SecretStore::native(&service).unwrap();
+        let writer = store.clone();
+        tokio::task::spawn_blocking(move || writer.set("http-token", b"native-token"))
+            .await
+            .unwrap()
+            .unwrap();
+        let source = serde_json::from_value::<HttpSecretConfig>(serde_json::json!({"secret_store":{"backend":"native","service":service,"key":"http-token"},"prefix":"Bearer "})).unwrap().into_secret().unwrap();
+        let result = source.resolve().await;
+        tokio::task::spawn_blocking(move || store.delete("http-token"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.unwrap(), "Bearer native-token");
+    }
 
     #[test]
     fn flattened_source_preserves_http_scope_and_rejects_ambiguous_sources() {

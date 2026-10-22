@@ -1,6 +1,7 @@
 use super::*;
 mod admission;
 mod authentication;
+mod authenticator;
 #[cfg(unix)]
 mod lifecycle;
 mod local;
@@ -136,8 +137,10 @@ fn read_request(grant: GrantId) -> GetHostStatusRequest {
         authorization: grant.0.to_vec(),
     }
 }
+/// The host refuses actively: a denial produced by its own handshake deadline
+/// cannot satisfy this wait.
 async fn rejected(task: tokio::task::JoinHandle<Result<(), WireStatus>>) {
-    let error = tokio::time::timeout(Duration::from_secs(5), task)
+    let error = tokio::time::timeout(HANDSHAKE_TIMEOUT / 2, task)
         .await
         .unwrap()
         .unwrap()
@@ -146,7 +149,19 @@ async fn rejected(task: tokio::task::JoinHandle<Result<(), WireStatus>>) {
 }
 
 fn tls_configs() -> (Arc<rustls::ServerConfig>, Arc<rustls::ClientConfig>) {
-    tls_configs_with_versions(&[&rustls::version::TLS13])
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let server = super::profile::server_tls(
+        cert.cert.der().clone(),
+        rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()),
+    )
+    .unwrap();
+    let (client, name) =
+        super::profile::local_trust(cert.cert.der().clone(), "localhost".into()).unwrap();
+    assert_eq!(
+        name,
+        rustls::pki_types::ServerName::try_from("localhost").unwrap()
+    );
+    (server, client)
 }
 fn tls_configs_with_versions(
     versions: &[&'static rustls::SupportedProtocolVersion],
