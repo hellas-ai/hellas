@@ -28,6 +28,7 @@ mod config;
 pub(crate) mod tls;
 pub use config::{
     CredentialRefresh, HttpCredentialConfig, HttpProviderConfig, HttpSecret, HttpSecretConfig,
+    HttpSecretStore,
 };
 
 const CHUNK_BYTES: usize = 16 * 1024;

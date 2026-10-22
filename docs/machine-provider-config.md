@@ -32,3 +32,22 @@ the container; where NAT changes them, use the provider's authenticated public
 UDP mapping in the invitation. Production uses the normal N0 relay configuration;
 relay-disabled endpoints are test fixtures, not an image guarantee. The public
 transport pin must remain the console-provided pin when addresses are adjusted.
+
+An OS store reference uses the same credential source:
+`{"secret_store":{"backend":"native","service":"hellas-gate","key":"provider-token"}}`.
+The native store is macOS Keychain, Windows Credential Manager or Linux Secret
+Service. Missing, locked or unavailable stores fail; they never fall back to a
+file or an environment variable. The credential must contain nonempty UTF-8.
+The existing `prefix` field applies after resolution, and rotation is observed
+on the next request. `secret_store` is exclusive with env, file and refresh
+settings.
+
+Headless operators may explicitly select
+`{"secret_store":{"backend":"headless_files","directory":"/private/secrets","service":"hellas-node","key":"provider-token"}}`.
+This uses `hellas-private`'s opaque-secret store, not a JSON credential file.
+Service and key names contain 1–128 ASCII letters, digits, hyphens or underscores.
+`SecretStore::set/get/delete` are blocking APIs; async applications use a blocking
+worker. The common bound is 64 KiB per secret; Windows Credential Manager's
+native limit is 2,560 bytes. Oversize values fail rather than being split or
+written elsewhere. Linux stores base64 internally to preserve arbitrary bytes
+with Secret Service implementations that accept only UTF-8.
