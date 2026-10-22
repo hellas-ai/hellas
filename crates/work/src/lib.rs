@@ -15,6 +15,7 @@ extern crate self as hellas_work;
 pub mod test_support;
 
 mod audit;
+pub mod authenticator;
 mod endpoint_lock;
 pub mod grant_service;
 pub mod model;

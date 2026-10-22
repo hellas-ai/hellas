@@ -21,7 +21,8 @@ use hellas_sdk::{
     access_bundle::{AccessBundle, MAX_BUNDLE_OFFERS, MAX_LABEL_BYTES},
     node_control::{self, profile},
     work::{
-        node::{SessionKey, passkey_assertion},
+        authenticator::Authenticator,
+        node::SessionKey,
         work_store::grant::{NodeStore, OwnerApproval},
     },
 };
@@ -62,7 +63,7 @@ pub async fn inspect_offline(args: AdminArgs) -> Result<()> {
 pub async fn run(
     args: AdminArgs,
     identity: &LocalIdentity,
-    passkey: Option<&hellas_kernel::SoftPasskey>,
+    passkey: Option<&dyn Authenticator>,
 ) -> Result<()> {
     if matches!(args.command, AdminCommand::BootstrapRemote { .. }) {
         ensure!(
@@ -490,7 +491,7 @@ where
 async fn offline(
     command: AdminCommand,
     identity: &LocalIdentity,
-    passkey: &hellas_kernel::SoftPasskey,
+    passkey: &dyn Authenticator,
 ) -> Result<()> {
     let (state, root, revision, bearer) = match command {
         AdminCommand::Bootstrap {
@@ -540,7 +541,7 @@ async fn offline(
                 &journal,
                 network,
                 root,
-                approve(Ownership::Bootstrap { root, target: None })?,
+                approve(Ownership::Bootstrap { root, target: None }).await?,
                 Some(identity.enrollment.clone()),
                 now,
             )
@@ -572,7 +573,7 @@ async fn offline(
                 &journal,
                 network,
                 expected,
-                approve(Ownership::Recover { expected })?,
+                approve(Ownership::Recover { expected }).await?,
                 now,
             )
             .await?;
@@ -607,29 +608,26 @@ fn credential_output(path: &Path) -> Result<tempfile::NamedTempFile> {
     )?)
 }
 
-fn owner_approval(
-    passkey: &hellas_kernel::SoftPasskey,
+async fn owner_approval(
+    passkey: &dyn Authenticator,
     ownership: Ownership,
     administrator: &GrantSpec,
     scope: &GrantSpec,
     holder: hellas_auth::authority::NodeKey,
 ) -> Result<OwnerApproval> {
     let digest = ownership_digest(ownership, administrator, scope, holder);
-    let envelope = passkey
-        .sign(hellas_kernel::PayloadHash::from_bytes(*digest.as_bytes()))
-        .map_err(|error| anyhow::anyhow!("passkey signing failed: {error:?}"))?;
     Ok(OwnerApproval {
         administrator: administrator.clone(),
         credential: scope.clone(),
         holder,
-        assertion: passkey_assertion(&envelope)?,
+        assertion: passkey.assert(digest).await?,
     })
 }
 
 async fn bootstrap_remote(
     command: AdminCommand,
     identity: &LocalIdentity,
-    passkey: &hellas_kernel::SoftPasskey,
+    passkey: &dyn Authenticator,
 ) -> Result<()> {
     let AdminCommand::BootstrapRemote {
         invitation,
@@ -655,7 +653,8 @@ async fn bootstrap_remote(
         &administrator,
         &scope,
         holder,
-    )?;
+    )
+    .await?;
     let (approval, secret) = approval.prepare(Some(*invitation.node.as_bytes()))?;
     let profile = profile::install_remote(&profile_out, scope.authority, root, &secret)?;
     let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)

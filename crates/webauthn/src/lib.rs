@@ -158,6 +158,22 @@ impl PublicKey {
             .map_err(|_| Error::InvalidPublicKey)
     }
 
+    /// Returns the affine coordinates used by the kernel assertion envelope.
+    #[must_use]
+    pub fn to_coordinates(&self) -> ([u8; COORDINATE_LEN], [u8; COORDINATE_LEN]) {
+        let point = self.0.to_sec1_point(false);
+        let mut x = [0; COORDINATE_LEN];
+        let mut y = [0; COORDINATE_LEN];
+        for (dst, src) in x
+            .iter_mut()
+            .chain(y.iter_mut())
+            .zip(point.as_bytes().iter().skip(1))
+        {
+            *dst = *src;
+        }
+        (x, y)
+    }
+
     /// Returns the compressed SEC1 encoding.
     #[must_use]
     pub fn to_compressed(&self) -> [u8; COMPRESSED_KEY_LEN] {
