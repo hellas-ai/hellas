@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::{io, path::PathBuf, sync::Arc};
 
 const MAX_FILE: usize = 64 * 1024;
+const MAX_POLICIES: usize = 256;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -150,6 +151,33 @@ impl TrustPolicyStore {
         let record: ApprovalRecord = serde_json::from_slice(&bytes)?;
         record.check(id)?;
         Ok(record)
+    }
+
+    /// Every approved policy, sorted by ID. Each record is loaded and checked
+    /// exactly as `load` does; one invalid record fails the whole listing.
+    pub fn list(&self) -> io::Result<Vec<ApprovalRecord>> {
+        let entries = match std::fs::read_dir(&self.directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+        let mut ids = Vec::new();
+        for entry in entries {
+            let name = entry?.file_name();
+            // Locks, pending writes and counter state never match `<id>.json`.
+            let Some(id) = name.to_str().and_then(|name| name.strip_suffix(".json")) else {
+                continue;
+            };
+            if self.path(id, "").is_err() {
+                continue;
+            }
+            if ids.len() == MAX_POLICIES {
+                return Err(invalid("trust policies exceed their bound"));
+            }
+            ids.push(id.to_owned());
+        }
+        ids.sort_unstable();
+        ids.iter().map(|id| self.load(id)).collect()
     }
 
     /// Approval is a local-owner configuration action, never a connection side
