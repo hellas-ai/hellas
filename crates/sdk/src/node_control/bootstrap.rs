@@ -261,6 +261,53 @@ mod tests {
         (root, approval, secret)
     }
     #[tokio::test]
+    async fn bootstrap_accepts_an_external_async_authenticator_assertion() {
+        use hellas_work::authenticator::{Authenticator, PublicKey};
+        struct Prompt(hellas_kernel::SoftPasskey);
+        #[async_trait::async_trait]
+        impl Authenticator for Prompt {
+            fn public_key(&self) -> Result<PublicKey, AuthorityError> {
+                self.0.public_key()
+            }
+            async fn assert(&self, digest: Digest) -> Result<PasskeyAssertion, AuthorityError> {
+                tokio::task::yield_now().await;
+                self.0.assert(digest).await
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let (server, client) = endpoints().await;
+        let invitation = invitation(&server);
+        let (root, mut approval, _) = prepared(server.id());
+        let CredentialHolder::Node(holder) = approval.credential.holder() else {
+            panic!("device credential");
+        };
+        let digest = ownership_digest(
+            Ownership::Bootstrap {
+                root,
+                target: Some(*server.id().as_bytes()),
+            },
+            &approval.administrator,
+            approval.credential.scope(),
+            holder,
+        );
+        approval.assertion = Prompt(ROOT.passkey()).assert(digest).await.unwrap();
+        let (accepted, connected) = tokio::join!(
+            accept(
+                &server,
+                &invitation,
+                directory.path(),
+                hellas_work::test_support::network(),
+                None
+            ),
+            connect(&client, &invitation, root, approval),
+        );
+        accepted.unwrap();
+        connected.unwrap();
+        server.close().await;
+        client.close().await;
+    }
+
+    #[tokio::test]
     async fn owner_approval_cannot_be_retargeted_to_another_machine() {
         let directory = tempfile::tempdir().unwrap();
         let (server, other) = endpoints().await;

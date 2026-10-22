@@ -101,6 +101,7 @@ pub(super) async fn connect<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     let challenge = decode_challenge(&bytes).map_err(|_| denied())?;
     let proof = key
         .prove(&challenge, authority, binding, credential.id())
+        .await
         .map_err(|_| denied())?;
     let lifetime = challenge
         .session_expires
