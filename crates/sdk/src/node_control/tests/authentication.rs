@@ -27,7 +27,9 @@ async fn authentication_rejects_prefix_only_oversize_replay_and_trailing_data_an
     let replay = encode_response(&f.secret, &signature).unwrap();
     // No body and no FIN: refusing this prefix proves it does not wait for or
     // allocate a peer-selected body before checking the authentication bound.
-    AsyncWriteExt::write_u16(&mut send, 257).await.unwrap();
+    let oversize =
+        u16::try_from(hellas_rpc::authentication::MAX_AUTHENTICATION_MESSAGE_BYTES + 1).unwrap();
+    AsyncWriteExt::write_u16(&mut send, oversize).await.unwrap();
     rejected(task).await;
     assert_eq!(
         f.service.remote_capacity.handshakes.available_permits(),
