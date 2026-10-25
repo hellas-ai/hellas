@@ -125,3 +125,39 @@ fn peer_hint_processing_is_bounded_including_invalid_ids() {
     assert!(peers.is_empty());
     assert_eq!(invalid, MAX_KNOWN_PEERS);
 }
+
+#[test]
+fn node_info_record_escapes_peer_controlled_fields() {
+    let text = "\nevent=monitor-summary forged=true\r\x1b[2J\u{9b}31m\t\"\\";
+    let info = GetNodeInfoResponse {
+        node_id: text.into(),
+        version: text.into(),
+        build: text.into(),
+        os: text.into(),
+        uptime_seconds: 1,
+        graffiti: [text.as_bytes(), &[0xff]].concat(),
+        ..Default::default()
+    };
+    let record = node_info_record(endpoint_id(1), &info);
+    assert_eq!(record.lines().count(), 1);
+    assert!(record.chars().all(|character| !character.is_control()));
+    assert!(record.contains(r#"reported_node_id="\nevent=monitor-summary"#));
+    assert!(record.contains(r#"\"\\"#));
+}
+
+#[test]
+fn error_records_escape_peer_controlled_messages() {
+    let text = "\"\nevent=monitor-stop reason=forged\r\x1b[2J\u{9b}31m";
+    for event in [
+        "discovery-error service=node",
+        "known-peers-error",
+        "interrogate-error",
+    ] {
+        for peer in [None, Some(endpoint_id(1))] {
+            let record = error_record(event, peer, text);
+            assert_eq!(record.lines().count(), 1);
+            assert!(record.chars().all(|character| !character.is_control()));
+            assert!(record.contains(r#"error="\"\nevent=monitor-stop"#));
+        }
+    }
+}

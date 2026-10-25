@@ -162,12 +162,13 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
     }
 
     let build = option_env!("GIT_REV").unwrap_or("unknown").to_string();
+    // At most 16 bytes, cut on a character boundary and never padded.
     let graffiti = {
-        let mut buf = [0u8; 16];
-        let src = options.graffiti.as_bytes();
-        let len = src.len().min(16);
-        buf[..len].copy_from_slice(&src[..len]);
-        buf.to_vec()
+        let mut len = options.graffiti.len().min(16);
+        while !options.graffiti.is_char_boundary(len) {
+            len -= 1;
+        }
+        options.graffiti.as_bytes()[..len].to_vec()
     };
     // Install signal handlers before publishing a ready local control socket.
     let shutdown = shutdown_signal().context("failed to listen for shutdown signal")?;

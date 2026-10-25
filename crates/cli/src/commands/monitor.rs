@@ -4,6 +4,7 @@
 //! service, optionally interrogates each peer with `get_node_info` +
 //! `get_known_peers`, and prints the events as whitespace-separated
 //! `key=value` records that downstream pipelines can grep.
+//! Peer text uses quoted Rust string escapes to keep each event on one line.
 //!
 //! Uses `hellas_wire::iroh::swarm::ServiceRegistry` plus per-service
 //! pools for peer discovery and interrogation.
@@ -140,7 +141,7 @@ pub async fn run(
                         );
                     }
                     Some(Err(err)) => {
-                        println!("event=discovery-error service=node error=\"{err}\"");
+                        println!("{}", error_record("discovery-error service=node", None, &err.to_string()));
                     }
                     None => {
                         node_done = true;
@@ -152,20 +153,10 @@ pub async fn run(
                 match joined {
                     Some(Ok((peer_id, Ok(outcome), _permit))) => {
                         interrogation_ok += 1;
-                        let info = &outcome.node_info;
-                        println!(
-                            "event=node-info peer={} reported_node_id={} version={} build={} os={} uptime_seconds={} graffiti={}",
-                            peer_id,
-                            info.node_id,
-                            info.version,
-                            info.build,
-                            info.os,
-                            info.uptime_seconds,
-                            String::from_utf8_lossy(&info.graffiti),
-                        );
+                        println!("{}", node_info_record(peer_id, &outcome.node_info));
 
                         if let Some(err) = outcome.known_peers_error.as_deref() {
-                            println!("event=known-peers-error peer={} error=\"{}\"", peer_id, err);
+                            println!("{}", error_record("known-peers-error", Some(peer_id), err));
                         }
 
                         if outcome.invalid_known_peers > 0 {
@@ -192,11 +183,11 @@ pub async fn run(
                     }
                     Some(Ok((peer_id, Err(err), _permit))) => {
                         interrogation_failed += 1;
-                        println!("event=interrogate-error peer={} error=\"{err:#}\"", peer_id);
+                        println!("{}", error_record("interrogate-error", Some(peer_id), &format!("{err:#}")));
                     }
                     Some(Err(err)) => {
                         interrogation_failed += 1;
-                        println!("event=interrogate-error error=\"task join failed: {err}\"");
+                        println!("{}", error_record("interrogate-error", None, &format!("task join failed: {err}")));
                     }
                     None => {}
                 }
@@ -220,6 +211,26 @@ pub async fn run(
 
     endpoint.close().await;
     Ok(())
+}
+
+fn node_info_record(peer_id: EndpointId, info: &GetNodeInfoResponse) -> String {
+    format!(
+        "event=node-info peer={} reported_node_id={:?} version={:?} build={:?} os={:?} uptime_seconds={} graffiti={:?}",
+        peer_id,
+        info.node_id,
+        info.version,
+        info.build,
+        info.os,
+        info.uptime_seconds,
+        String::from_utf8_lossy(&info.graffiti),
+    )
+}
+
+fn error_record(event: &str, peer_id: Option<EndpointId>, error: &str) -> String {
+    match peer_id {
+        Some(peer_id) => format!("event={event} peer={peer_id} error={error:?}"),
+        None => format!("event={event} error={error:?}"),
+    }
 }
 
 fn handle_discovery_event<S: RpcService>(

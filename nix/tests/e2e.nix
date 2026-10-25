@@ -419,7 +419,8 @@ in
           machine.succeed("systemctl stop hellas-monitor.service")
           monitor_output = machine.succeed("cat /tmp/hellas-monitor.log")
           print(monitor_output)
-      assert "graffiti=e2e-discovery" in monitor_output
+      # Peer-controlled text is printed escaped and quoted.
+      assert 'graffiti="e2e-discovery"' in monitor_output
       assert "event=monitor-stop reason=signal" in monitor_output
     '';
   };
