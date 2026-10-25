@@ -73,7 +73,7 @@ pub async fn accept(
     endpoint.set_alpns(vec![HostControl::ALPN.as_bytes().to_vec()]);
     let deadline = Instant::now() + Duration::from_millis(remaining);
     let mut attempts = 0;
-    let mut slots = crate::transport_admission::HandshakeSlots::new(MAX_HANDSHAKES, 2);
+    let slots = hellas_wire::admission::ConnectionSlots::new(MAX_HANDSHAKES, 2, 8);
     let mut pending = tokio::task::JoinSet::new();
     while attempts < MAX_PAIRING_ATTEMPTS {
         let result = tokio::select! {
@@ -85,7 +85,7 @@ pub async fn accept(
                     incoming.refuse();
                     continue;
                 }
-                let Some(permits) = slots.try_acquire(&incoming.remote_addr()) else {
+                let Some(permits) = slots.try_acquire(crate::transport_admission::source_ip(incoming.remote_addr())) else {
                     tracing::warn!("owner bootstrap connection capacity refused");
                     incoming.refuse();
                     continue;

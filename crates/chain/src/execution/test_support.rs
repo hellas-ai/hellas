@@ -1,3 +1,4 @@
+use crate::ConsensusInfo;
 use crate::HellasBlock;
 use crate::consensus::{ConsensusVerifier, Finalization};
 use crate::domain::{
@@ -5,7 +6,6 @@ use crate::domain::{
     genesis_object_id,
 };
 use crate::execution::store::UtxoSyncTarget;
-use crate::{CONSENSUS_NAMESPACE, ConsensusInfo};
 use commonware_codec::Encode;
 use commonware_consensus::{
     CertifiableBlock, Heightable,
@@ -47,6 +47,21 @@ pub(crate) fn consensus_fixture(seed: u64) -> ConsensusFixture {
 /// fixture that could only be four would make "the shipped validator
 /// count" untestable.
 pub(crate) fn consensus_fixture_of(seed: u64, validators: u64) -> ConsensusFixture {
+    consensus_fixture_in(
+        seed,
+        validators,
+        crate::domain::TEST_NETWORK,
+        [0; 32].into(),
+    )
+}
+
+pub(crate) fn consensus_fixture_in(
+    seed: u64,
+    validators: u64,
+    network: hellas_kernel::NetworkId,
+    genesis: commonware_cryptography::sha256::Digest,
+) -> ConsensusFixture {
+    let namespace = crate::consensus_namespace(network, genesis);
     let private_keys = (0..validators)
         .map(|offset| ed25519::PrivateKey::from_seed(seed + offset))
         .collect::<Vec<_>>();
@@ -64,25 +79,20 @@ pub(crate) fn consensus_fixture_of(seed: u64, validators: u64) -> ConsensusFixtu
         .iter()
         .map(|key| {
             let share = shares.get_value(&key.public_key()).expect("share").clone();
-            Scheme::signer(
-                CONSENSUS_NAMESPACE,
-                participants.clone(),
-                polynomial.clone(),
-                share,
-            )
-            .expect("scheme")
+            Scheme::signer(&namespace, participants.clone(), polynomial.clone(), share)
+                .expect("scheme")
         })
         .collect::<Vec<_>>();
-    let assembler = Scheme::verifier(CONSENSUS_NAMESPACE, participants, polynomial);
+    let assembler = Scheme::verifier(&namespace, participants, polynomial);
     let info = ConsensusInfo {
-        network_id: crate::domain::TEST_NETWORK.as_str().to_string(),
+        network_id: network.as_str().to_string(),
         validators: leaders
             .iter()
             .map(|public_key| hex::encode(public_key.encode()))
             .collect(),
         threshold_identity: assembler.identity().encode().to_vec(),
     };
-    let verifier = ConsensusVerifier::new(&info).expect("verifier");
+    let verifier = ConsensusVerifier::new(&info, genesis).expect("verifier");
     ConsensusFixture {
         schemes,
         assembler,
@@ -144,6 +154,7 @@ pub(crate) fn index_genesis() -> HellasBlock {
         validator_key(0).public_key(),
         commonware_cryptography::sha256::Digest::EMPTY,
         sync_target,
+        commonware_cryptography::sha256::Digest::from([0; 32]),
     )
 }
 

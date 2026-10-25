@@ -1,7 +1,28 @@
+/// Digest of the genesis document's canonical JSON representation.
+/// Whitespace in independently provisioned JSON does not change consensus identity.
+pub fn genesis_digest(
+    genesis: &hellas_genesis::Genesis,
+) -> commonware_cryptography::sha256::Digest {
+    use commonware_cryptography::{Hasher as _, Sha256};
+    Sha256::hash(&serde_json::to_vec(genesis).expect("genesis serializes"))
+}
+
+/// Shared domain for every consensus signature, including finalization and round seeds.
+pub fn consensus_namespace(
+    network: hellas_kernel::NetworkId,
+    genesis: commonware_cryptography::sha256::Digest,
+) -> Vec<u8> {
+    let mut namespace = b"hellas/consensus/v1".to_vec();
+    namespace.extend_from_slice(&(network.as_str().len() as u16).to_be_bytes());
+    namespace.extend_from_slice(network.as_str().as_bytes());
+    namespace.extend_from_slice(genesis.as_ref());
+    namespace
+}
+
 #[cfg(any(feature = "indexer", feature = "validator"))]
 mod full {
     use crate::domain::{Scheme, ThresholdVariant};
-    use crate::{CONSENSUS_NAMESPACE, ConsensusInfo, LatestBlock, QueryError};
+    use crate::{ConsensusInfo, LatestBlock, QueryError};
     use commonware_codec::{Decode, DecodeExt};
     use commonware_consensus::simplex::types::Finalization as SimplexFinalization;
     use commonware_cryptography::{certificate::Verifier as _, sha256::Digest};
@@ -16,6 +37,8 @@ mod full {
     pub enum ConsensusVerificationError {
         #[error("threshold identity was empty")]
         EmptyThresholdIdentity,
+        #[error("invalid consensus network id")]
+        InvalidNetwork,
         #[error("invalid threshold identity")]
         InvalidThresholdIdentity,
         #[error("invalid finalization")]
@@ -38,14 +61,20 @@ mod full {
     }
 
     impl ConsensusVerifier {
-        pub fn new(info: &ConsensusInfo) -> Result<Self, ConsensusVerificationError> {
+        pub fn new(
+            info: &ConsensusInfo,
+            genesis: Digest,
+        ) -> Result<Self, ConsensusVerificationError> {
+            let network = hellas_kernel::NetworkId::new(&info.network_id)
+                .ok_or(ConsensusVerificationError::InvalidNetwork)?;
+            let namespace = super::consensus_namespace(network, genesis);
             if info.threshold_identity.is_empty() {
                 return Err(ConsensusVerificationError::EmptyThresholdIdentity);
             }
             let identity = ConsensusIdentity::decode(info.threshold_identity.as_slice())
                 .map_err(|_| ConsensusVerificationError::InvalidThresholdIdentity)?;
             Ok(Self {
-                scheme: Scheme::certificate_verifier(CONSENSUS_NAMESPACE, identity),
+                scheme: Scheme::certificate_verifier(&namespace, identity),
             })
         }
 
@@ -78,7 +107,13 @@ mod full {
         pub fn verify_snapshot(
             &self,
             snapshot: &LatestBlock,
+            block: &[u8],
         ) -> Result<(), ConsensusVerificationError> {
+            crate::FinalizedBlockView::decode(&crate::FinalizedBlock {
+                snapshot: snapshot.clone(),
+                block: block.to_vec(),
+            })
+            .map_err(|_| ConsensusVerificationError::InvalidFinalization)?;
             crate::finality_proof::FinalityProof::decode(&snapshot.finalization)?
                 .verify(self, snapshot)
         }
@@ -87,7 +122,7 @@ mod full {
 
 #[cfg(not(any(feature = "indexer", feature = "validator")))]
 mod light {
-    use crate::{CONSENSUS_NAMESPACE, ConsensusInfo, LatestBlock, QueryError};
+    use crate::{ConsensusInfo, LatestBlock, QueryError};
     use commonware_codec::{DecodeExt, ReadExt, Write, varint::UInt};
     use commonware_cryptography::{
         bls12381::primitives::{
@@ -106,6 +141,8 @@ mod light {
     pub enum ConsensusVerificationError {
         #[error("threshold identity was empty")]
         EmptyThresholdIdentity,
+        #[error("invalid consensus network id")]
+        InvalidNetwork,
         #[error("invalid threshold identity")]
         InvalidThresholdIdentity,
         #[error("invalid finalization")]
@@ -156,16 +193,26 @@ mod light {
     #[derive(Clone)]
     pub struct ConsensusVerifier {
         identity: ConsensusIdentity,
+        namespace: Vec<u8>,
     }
 
     impl ConsensusVerifier {
-        pub fn new(info: &ConsensusInfo) -> Result<Self, ConsensusVerificationError> {
+        pub fn new(
+            info: &ConsensusInfo,
+            genesis: Digest,
+        ) -> Result<Self, ConsensusVerificationError> {
+            let network = hellas_kernel::NetworkId::new(&info.network_id)
+                .ok_or(ConsensusVerificationError::InvalidNetwork)?;
+            let namespace = super::consensus_namespace(network, genesis);
             if info.threshold_identity.is_empty() {
                 return Err(ConsensusVerificationError::EmptyThresholdIdentity);
             }
             let identity = ConsensusIdentity::decode(info.threshold_identity.as_slice())
                 .map_err(|_| ConsensusVerificationError::InvalidThresholdIdentity)?;
-            Ok(Self { identity })
+            Ok(Self {
+                identity,
+                namespace,
+            })
         }
 
         pub fn decode_finalization(
@@ -205,8 +252,8 @@ mod light {
                 return Err(ConsensusVerificationError::PayloadMismatch);
             }
 
-            let finalize_namespace = namespace(b"_FINALIZE");
-            let seed_namespace = namespace(b"_SEED");
+            let finalize_namespace = namespace(&self.namespace, b"_FINALIZE");
+            let seed_namespace = namespace(&self.namespace, b"_SEED");
             let proposal_message = encode_proposal(&finalization.proposal);
             let seed_message = encode_round(finalization.proposal.round);
             let entries = [
@@ -239,7 +286,13 @@ mod light {
         pub fn verify_snapshot(
             &self,
             snapshot: &LatestBlock,
+            block: &[u8],
         ) -> Result<(), ConsensusVerificationError> {
+            crate::FinalizedBlockView::decode(&crate::FinalizedBlock {
+                snapshot: snapshot.clone(),
+                block: block.to_vec(),
+            })
+            .map_err(|_| ConsensusVerificationError::InvalidFinalization)?;
             crate::finality_proof::FinalityProof::decode(&snapshot.finalization)?
                 .verify(self, snapshot)
         }
@@ -269,9 +322,9 @@ mod light {
         encoded
     }
 
-    fn namespace(suffix: &[u8]) -> Vec<u8> {
-        let mut namespace = Vec::with_capacity(CONSENSUS_NAMESPACE.len() + suffix.len());
-        namespace.extend_from_slice(CONSENSUS_NAMESPACE);
+    fn namespace(base: &[u8], suffix: &[u8]) -> Vec<u8> {
+        let mut namespace = Vec::with_capacity(base.len() + suffix.len());
+        namespace.extend_from_slice(base);
         namespace.extend_from_slice(suffix);
         namespace
     }

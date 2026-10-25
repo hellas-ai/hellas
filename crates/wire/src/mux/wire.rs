@@ -5,6 +5,9 @@ use bytes::{Bytes, BytesMut};
 
 use crate::frame::{Frame, FrameError, decode_frame, encode_frame};
 
+/// A mux message adds a four-byte stream key to one bounded wire frame.
+pub const MAX_KEYED_FRAME_BYTES: usize = crate::frame::MAX_FRAME_BYTES + 4;
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct StreamKey {
     pub stream_id: u16,
@@ -85,4 +88,17 @@ mod tests {
             _ => panic!("expected Open"),
         }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn keyed_frames_obey_the_frame_cap_including_the_kind_byte() {
+    let mut bytes = vec![0; crate::frame::MAX_FRAME_BYTES + 4];
+    bytes[4] = crate::FrameKind::Body.as_u8();
+    assert!(decode_keyed_frame(&bytes).is_ok());
+    bytes.push(0);
+    assert!(matches!(
+        decode_keyed_frame(&bytes),
+        Err(FrameError::OversizedFrame { .. })
+    ));
 }

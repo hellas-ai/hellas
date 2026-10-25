@@ -220,7 +220,7 @@ pub(super) struct Runtime {
 }
 struct State {
     configuration: Option<super::configuration::ProviderMetadata>,
-    ingress: Option<mpsc::Sender<iroh::endpoint::Connection>>,
+    ingress: Option<mpsc::Sender<crate::transport_admission::AdmittedConnection>>,
     provider: Option<ProviderHandle>,
     gateway: Option<hellas_gateway::GatewayHandle>,
     work: Option<hellas_work::grant_service::WorkAdministration>,
@@ -245,8 +245,13 @@ struct Command {
 impl Runtime {
     pub(crate) fn provider_ingress(
         &self,
-    ) -> Result<Option<(iroh::Endpoint, mpsc::Receiver<iroh::endpoint::Connection>)>, WireStatus>
-    {
+    ) -> Result<
+        Option<(
+            iroh::Endpoint,
+            mpsc::Receiver<crate::transport_admission::AdmittedConnection>,
+        )>,
+        WireStatus,
+    > {
         let Some(endpoint) = &self.transport else {
             return Ok(None);
         };
@@ -674,6 +679,7 @@ async fn accept(
     mut stopped: watch::Receiver<bool>,
 ) {
     let mut tasks = tokio::task::JoinSet::new();
+    let mut admission = crate::transport_admission::Admission::new();
     loop {
         let incoming = tokio::select! {
             biased;
@@ -686,27 +692,25 @@ async fn accept(
             incoming.refuse();
             continue;
         }
+        let Some(pending) = admission.accept(incoming) else {
+            continue;
+        };
         let control = control.clone();
         let runtime = runtime.clone();
         tasks.spawn(async move {
-            let Ok(accepting) = incoming.accept() else {
-                tracing::warn!("host transport acceptance refused");
+            let Some(admitted) = pending.finish().await else {
                 return;
             };
-            let Ok(Ok(connection)) = tokio::time::timeout(HANDSHAKE_TIMEOUT, accepting).await
-            else {
-                tracing::warn!("host transport handshake failed or timed out");
-                return;
-            };
+            let connection = admitted.connection.clone();
             if connection.alpn() == HostControl::ALPN.as_bytes() {
                 if let Some(control) = control {
-                    let _ = control.serve_iroh(connection).await;
+                    let _ = admitted.run(control.serve_iroh(connection)).await;
                 }
             } else {
                 let sender = runtime.with(|state| state.ingress.clone()).ok().flatten();
                 if sender
                     .as_ref()
-                    .is_none_or(|sender| sender.try_send(connection.clone()).is_err())
+                    .is_none_or(|sender| sender.try_send(admitted).is_err())
                 {
                     connection.close(503u32.into(), b"provider unavailable");
                 }

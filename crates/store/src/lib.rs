@@ -73,11 +73,18 @@ pub struct Indexed {
     pub len: u64,
 }
 
+#[cfg(test)]
+thread_local! {
+    static HASH_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Hashes exactly the length captured from the descriptor, then probes one
 /// byte past it. `None` means the file was truncated or grew while it was
 /// being read; importantly, a writer that grows forever cannot extend this
 /// loop forever.
 fn hash_exact_length(reader: &mut impl io::Read, expected_len: u64) -> io::Result<Option<Indexed>> {
+    #[cfg(test)]
+    HASH_CALLS.with(|calls| calls.set(calls.get() + 1));
     let mut hasher = XetFileHasher::new();
     let mut buffer = vec![0_u8; STREAM_BUFFER];
     let mut remaining = expected_len;

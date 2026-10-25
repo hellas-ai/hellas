@@ -1037,7 +1037,7 @@ const RESPONSE_DEADLINE: u64 = 60;
 const FLOOR: u64 = 7;
 
 fn network() -> NetworkId {
-    let Some(network) = NetworkId::new("hellas-devnet") else {
+    let Some(network) = NetworkId::new("hellas-devnet-1") else {
         panic!("a short ascii id is a network id");
     };
     network

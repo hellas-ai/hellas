@@ -231,6 +231,7 @@ fn genesis_allocations(genesis: Genesis) -> Vec<(SettlementKey, u64)> {
         threshold_polynomial: String::new(),
         listen_port: 0,
         metrics_port: None,
+        metrics_bind_address: std::net::Ipv4Addr::LOCALHOST.into(),
         light_client_bind: None,
         chain_sync_bind: None,
         archive_blocks: None,
@@ -475,7 +476,8 @@ impl Devnet {
         Box::pin(async move {
             // Full nodes use live peer discovery; each devnet needs its own committee
             // so concurrent tests cannot accept one another's certified blocks.
-            let fixture = consensus_fixture_of(rand::random(), VALIDATORS);
+            let seed = rand::random();
+            let fixture = consensus_fixture_of(seed, VALIDATORS);
             let mut allocations = Allocations {
                 coins: Vec::new(),
                 owners,
@@ -499,6 +501,12 @@ impl Devnet {
                 2,
                 "genesis funds exactly the two parties",
             );
+            let fixture = crate::execution::test_support::consensus_fixture_in(
+                seed,
+                VALIDATORS,
+                network,
+                crate::genesis_digest(&document),
+            );
             let consensus_info = ConsensusInfo {
                 validators: fixture
                     .leaders
@@ -517,8 +525,12 @@ impl Devnet {
                 8,
             )
             .await;
-            let genesis =
-                HellasBlock::genesis(fixture.leaders.iter().min().unwrap().clone(), root, target);
+            let genesis = HellasBlock::genesis(
+                fixture.leaders.iter().min().unwrap().clone(),
+                root,
+                target,
+                crate::genesis_digest(&document),
+            );
             let mut nodes = Vec::new();
             for (ordinal, label) in NODE_LABELS.iter().enumerate().take(VALIDATORS as usize) {
                 let partition = format!("{name}_{ordinal}");
@@ -597,8 +609,8 @@ impl Devnet {
                             let (stream, _) = accepted.unwrap();
                             let service = service.clone();
                             connections.spawn(async move {
-                                let ws = tokio_tungstenite::accept_async(stream).await.unwrap();
-                                let transport = hellas_wire::ws::accept_upgraded(ws, None);
+                                let ws = tokio_tungstenite::accept_async_with_config(stream, Some(hellas_wire::ws::websocket_config())).await.unwrap();
+                                let transport = hellas_wire::ws::accept_upgraded(ws, None).unwrap();
                                 let _ = crate::server::serve_light_client_transport(transport, service).await;
                             });
                         },

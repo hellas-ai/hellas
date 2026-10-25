@@ -119,3 +119,8 @@ also cover pagination within a checkpoint, typed restart after publication, old 
 readers, gap/parent/root refusal, nonempty publication recovery on both sides of
 QMDB finalize, and a large cold closed index. Fixture blocks are produced by the
 validator execution path, independently of the observed replay adapter.
+
+The loopback indexer API accepts native clients without browser headers. WebSocket
+upgrades carrying `Origin` are refused. HTTP requests with `Origin`, cross-site
+or same-site Fetch Metadata, or a non-loopback Host are refused before query
+admission. Proxies connecting to this private API must send a loopback Host.

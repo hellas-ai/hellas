@@ -320,3 +320,58 @@ async fn invalid_resources_are_rejected_before_opening_a_journal() {
     ));
     assert!(!root.path().join("provider").exists());
 }
+
+#[tokio::test(start_paused = true)]
+async fn cheap_streams_cannot_extend_the_connection_lifetime() {
+    let (client, server) = mux_pair();
+    let serving = tokio::spawn(serve_loop(
+        Arc::new(server),
+        SlowStream,
+        tokio::sync::watch::channel(false).1,
+    ));
+    let started = Instant::now();
+    let max_lifetime = Duration::from_secs(15 * 60);
+    loop {
+        let mut response = match hellas_rpc::call::server_streaming::<_, StreamResult>(
+            &client,
+            DeliverResultRequest::default(),
+            Metadata::new(),
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(_) => break,
+        };
+        while response.next().await.is_some() {}
+        if serving.is_finished() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert!(
+            started.elapsed() <= max_lifetime + Duration::from_secs(121),
+            "repeated streams must not renew a connection forever"
+        );
+    }
+    serving.await.unwrap();
+    assert!(started.elapsed() >= max_lifetime);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_connection_without_a_first_stream_is_reaped() {
+    let (_client, server) = mux_pair();
+    let serving = tokio::spawn(serve_loop(
+        Arc::new(server),
+        SlowStream,
+        tokio::sync::watch::channel(false).1,
+    ));
+    tokio::task::yield_now().await;
+    tokio::time::advance(RPC_CONNECTION_IDLE_TIMEOUT - Duration::from_secs(1)).await;
+    assert!(!serving.is_finished());
+    tokio::time::advance(Duration::from_secs(2)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        serving.is_finished(),
+        "no-stream connections release their slot on idle timeout"
+    );
+    serving.await.unwrap();
+}

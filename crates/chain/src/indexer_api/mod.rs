@@ -85,7 +85,8 @@ pub fn run(options: OriginOptions) -> OriginResult<()> {
             128,
         )
         .await;
-        let genesis_block = crate::HellasBlock::genesis(leader, root, target);
+        let genesis_block =
+            crate::HellasBlock::genesis(leader, root, target, crate::genesis_digest(&genesis));
         let node = crate::node::FullNode::start_indexed(
             crate::node::Config {
                 genesis: genesis.clone(),
@@ -162,7 +163,6 @@ fn router(state: OriginState) -> Router {
         .route("/api/v1/edges/{edge_id}/events", get(edge_index_http))
         .route("/api/v1/edges/{edge_id}/evidence", get(edge_index_http))
         .route("/api/v1/channels/{payment_edge_id}", get(edge_index_http))
-        .route("/api/v1/edge-index/rpc", get(edge_index_ws))
         .route("/api/v1/blocks/{selector}", get(block))
         .route("/api/v1/blocks/{selector}/proof", get(block))
         .route("/api/v1/blocks/by-payload/{payload}", get(payload))
@@ -170,12 +170,55 @@ fn router(state: OriginState) -> Router {
         .route("/api/v1/transactions/{digest}/proof", get(transaction))
         .route("/api/v1/addresses/{owner}/proof", get(address))
         .route("/api/v1/addresses/{owner}", get(address))
+        .layer(axum::middleware::from_fn(local_http_request))
+        .route("/api/v1/edge-index/rpc", get(edge_index_ws))
         .with_state(state);
     #[cfg(feature = "otel")]
     let router = router.layer(axum::middleware::from_fn(
         hellas_rpc::telemetry::http::trace_request,
     ));
     router
+}
+
+// Fetch Metadata covers no-cors GETs, which need not carry Origin. Checking
+// the authority also rejects DNS rebinding before any query acquires a permit.
+async fn local_http_request(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let headers = request.headers();
+    let foreign = headers.contains_key(header::ORIGIN)
+        || headers
+            .get_all("sec-fetch-site")
+            .iter()
+            .any(|site| site != "same-origin" && site != "none")
+        || headers.get_all(header::HOST).iter().any(|host| {
+            host.to_str()
+                .ok()
+                .is_none_or(|host| !loopback_authority(host))
+        })
+        || request
+            .uri()
+            .authority()
+            .is_some_and(|authority| !loopback_authority(authority.as_str()));
+    if foreign {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    next.run(request).await
+}
+
+fn loopback_authority(value: &str) -> bool {
+    value
+        .parse::<axum::http::uri::Authority>()
+        .ok()
+        .is_some_and(|authority| {
+            let host = authority.host();
+            host.eq_ignore_ascii_case("localhost")
+                || host
+                    .trim_matches(['[', ']'])
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        })
 }
 
 async fn edge_index_http(
@@ -187,9 +230,16 @@ async fn edge_index_http(
 }
 async fn edge_index_ws(
     State(state): State<OriginState>,
+    headers: HeaderMap,
     ws: axum::extract::ws::WebSocketUpgrade,
 ) -> Response {
-    ws.on_upgrade(move |socket| crate::edge_index::rpc::serve_socket(socket, state.edge_index))
+    // This private API is consumed by native clients, not browser pages.
+    if headers.contains_key(header::ORIGIN) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    ws.max_message_size(hellas_wire::mux::MAX_KEYED_FRAME_BYTES)
+        .max_frame_size(hellas_wire::mux::MAX_KEYED_FRAME_BYTES)
+        .on_upgrade(move |socket| crate::edge_index::rpc::serve_socket(socket, state.edge_index))
 }
 
 async fn block(
@@ -505,6 +555,219 @@ mod tests {
     use commonware_cryptography::Digestible as _;
     use hellas_genesis::HELLAS_DEVNET_1_ID;
     use tower::ServiceExt as _;
+
+    async fn published_router(context: tokio::Context) -> (Router, commonware_runtime::Handle<()>) {
+        let mut h =
+            crate::edge_index::ReplayHarness::new(context.child("h"), Vec::new(), "browser-test")
+                .await;
+        let genesis = h.head.clone();
+        h.append(Vec::new()).await;
+        let (indexer, handle) = crate::spawn_archive(
+            context.child("archive"),
+            "browser-archive",
+            Config::default(),
+            h.committee.verifier.clone(),
+            genesis,
+        )
+        .await
+        .unwrap();
+        indexer
+            .ingest_finalized(h.head.clone(), finalization(&h.committee, &h.head))
+            .await
+            .unwrap();
+        (
+            router(OriginState {
+                edge_index: h.index,
+                indexer,
+                owner_proofs: OwnerProofSource::Constructed(Arc::new(::tokio::sync::Mutex::new(
+                    h.replay,
+                ))),
+                verifier: Arc::new(h.verifier),
+                network_id: HELLAS_DEVNET_1_ID.into(),
+            }),
+            handle,
+        )
+    }
+
+    #[test]
+    fn edge_index_websocket_rejects_browser_origins_and_accepts_native_clients() {
+        use ::tokio_tungstenite::tungstenite::{Error, client::IntoClientRequest as _};
+        crate::execution::test_support::run_qmdb(|context| async move {
+            let (app, _archive) = published_router(context).await;
+            let listener = ::tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .unwrap();
+            let address = listener.local_addr().unwrap();
+            let serving = ::tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let url = format!("ws://{address}/api/v1/edge-index/rpc");
+            for origin in ["https://attacker.example", "null", "http://127.0.0.1"] {
+                let mut request = url.clone().into_client_request().unwrap();
+                request
+                    .headers_mut()
+                    .insert(header::ORIGIN, origin.parse().unwrap());
+                match ::tokio_tungstenite::connect_async(request).await {
+                    Err(Error::Http(response)) => {
+                        assert_eq!(response.status(), StatusCode::FORBIDDEN)
+                    }
+                    _ => panic!("browser WebSocket upgrade was accepted"),
+                }
+            }
+            let (mut socket, response) = ::tokio_tungstenite::connect_async(url).await.unwrap();
+            assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+            socket.close(None).await.unwrap();
+            serving.abort();
+            let _ = serving.await;
+        });
+    }
+
+    #[test]
+    fn cross_site_simple_gets_cannot_enter_the_shared_query_pool() {
+        crate::execution::test_support::run_qmdb(|context| async move {
+            let (app, _archive) = published_router(context).await;
+            // Real no-cors GETs can omit Origin. Their browser-generated Fetch
+            // Metadata must be checked before reaching EdgeIndex admission.
+            for site in ["cross-site", "same-site"] {
+                let mut attempts = ::tokio::task::JoinSet::new();
+                for _ in 0..32 {
+                    let app = app.clone();
+                    attempts.spawn(async move {
+                        app.oneshot(
+                            axum::http::Request::builder()
+                                .uri("/api/v1/edges")
+                                .header(header::HOST, "127.0.0.1:8788")
+                                .header("sec-fetch-site", site)
+                                .header("sec-fetch-mode", "no-cors")
+                                .body(axum::body::Body::empty())
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap()
+                    });
+                }
+                while let Some(response) = attempts.join_next().await {
+                    assert_eq!(response.unwrap().status(), StatusCode::FORBIDDEN);
+                }
+            }
+            for (name, value) in [
+                (header::ORIGIN.as_str(), "https://attacker.example"),
+                (header::HOST.as_str(), "rebinding.attacker.example:8788"),
+            ] {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        axum::http::Request::builder()
+                            .uri("/api/v1/edges")
+                            .header(name, value)
+                            .body(axum::body::Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            }
+            for site in [None, Some("same-origin")] {
+                let mut request = axum::http::Request::builder()
+                    .uri("/api/v1/edges")
+                    .header(header::HOST, "localhost:8788");
+                if let Some(site) = site {
+                    request = request.header("sec-fetch-site", site);
+                }
+                let response = app
+                    .clone()
+                    .oneshot(request.body(axum::body::Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+            }
+        });
+    }
+
+    #[test]
+    fn websocket_upgrade_rejects_oversized_messages_and_frames() {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        use tokio_tungstenite::tungstenite::{
+            Message,
+            protocol::frame::{
+                Frame,
+                coding::{Data, OpCode},
+            },
+        };
+        crate::execution::test_support::run_qmdb(|context| async move {
+            let owner = crate::domain::SettlementKey::from(
+                hellas_kernel::Secp256k1Signer::from_secret_scalar([19; 32])
+                    .unwrap()
+                    .party_key(),
+            );
+            let h = crate::edge_index::ReplayHarness::new(
+                context.child("h"),
+                vec![(owner, 100)],
+                "origin-ws-cap",
+            )
+            .await;
+            let (indexer, _handle) = crate::spawn_archive(
+                context.child("follower"),
+                "origin-ws-cap-test",
+                Config::default(),
+                h.committee.verifier.clone(),
+                h.head,
+            )
+            .await
+            .unwrap();
+            let app = router(OriginState {
+                edge_index: h.index,
+                indexer,
+                owner_proofs: OwnerProofSource::Constructed(Arc::new(::tokio::sync::Mutex::new(
+                    h.replay,
+                ))),
+                verifier: Arc::new(h.verifier),
+                network_id: HELLAS_DEVNET_1_ID.into(),
+            });
+            let listener = ::tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = ::tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let cap = hellas_wire::mux::MAX_KEYED_FRAME_BYTES;
+            for fragmented in [false, true] {
+                let (mut ws, _) =
+                    tokio_tungstenite::connect_async(format!("ws://{addr}/api/v1/edge-index/rpc"))
+                        .await
+                        .unwrap();
+                if fragmented {
+                    let half = bytes::Bytes::from(vec![0; cap / 2 + 1]);
+                    let _ = ws
+                        .send(Message::Frame(Frame::message(
+                            half.clone(),
+                            OpCode::Data(Data::Binary),
+                            false,
+                        )))
+                        .await;
+                    let _ = ws
+                        .send(Message::Frame(Frame::message(
+                            half,
+                            OpCode::Data(Data::Continue),
+                            true,
+                        )))
+                        .await;
+                } else {
+                    use ::tokio::io::AsyncWriteExt as _;
+                    let mut header = vec![0x82, 0xff];
+                    header.extend_from_slice(&((cap + 1) as u64).to_be_bytes());
+                    header.extend_from_slice(&[0; 4]);
+                    ws.get_mut().write_all(&header).await.unwrap();
+                }
+                let closed = ::tokio::time::timeout(std::time::Duration::from_secs(2), ws.next())
+                    .await
+                    .expect("the actual upgrade must close a message above the wire cap");
+                assert!(!matches!(closed, Some(Ok(Message::Binary(_)))));
+            }
+            server.abort();
+        });
+    }
 
     #[test]
     fn representation_respects_qualities_aliases_and_exclusions() {

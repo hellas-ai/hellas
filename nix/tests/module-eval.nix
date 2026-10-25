@@ -188,6 +188,7 @@ let
     nodeOffset = 2;
     startPort = 31900;
     metricsBasePort = 9090;
+    metricsBindAddress = "10.100.0.10";
     seed = 7;
     lightClientRpc = {
       enable = true;
@@ -1009,16 +1010,8 @@ in
         31903
         31904
       ];
-    assert
-      loopbackValidators.config.networking.firewall.interfaces.wg0.allowedTCPPorts == [
-        9090
-        31900
-      ];
-    assert
-      validatorsWithoutRpc.config.networking.firewall.interfaces.wg0.allowedTCPPorts == [
-        9090
-        31900
-      ];
+    assert loopbackValidators.config.networking.firewall.interfaces.wg0.allowedTCPPorts == [ 31900 ];
+    assert validatorsWithoutRpc.config.networking.firewall.interfaces.wg0.allowedTCPPorts == [ 31900 ];
     assert
       !(validatorAssertion "lightClientRpc port range exceeds 65535" overflowingValidatorRpc).assertion;
     assert !(validatorAssertion "lightClientRpc ports overlap" collidingValidatorRpc).assertion;
@@ -1062,6 +1055,8 @@ in
 
       ${pkgs.gnugrep}/bin/grep -Fx -- '--validator=2' "$config2"
       ${pkgs.gnugrep}/bin/grep -Fx -- '--metrics-port=9092' "$config2"
+      ${pkgs.gnugrep}/bin/grep -Fx -- '--metrics-bind-address=10.100.0.10' "$config2"
+      ${pkgs.gnugrep}/bin/grep -Fx -- '--metrics-bind-address=127.0.0.1' "$loopback_config"
       ${pkgs.gnugrep}/bin/grep -Fx -- '--light-client-bind=0.0.0.0:31248' "$config2"
       ${pkgs.gnugrep}/bin/grep -Fx -- '--chain-sync-bind=10.100.0.10:31348' "$config2"
       ${pkgs.gnugrep}/bin/grep -Fx -- '--archive-blocks=1500000' "$config2"

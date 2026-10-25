@@ -8,9 +8,7 @@
 use anyhow::{Context as _, bail};
 use clap::{Args, Subcommand};
 use hellas_chain::client::RemoteLightClient;
-use hellas_chain::{
-    ConsensusInfo, ConsensusVerifier, FinalizedBlockQuery, FinalizedBlockView, LightClient as _,
-};
+use hellas_chain::{ConsensusInfo, FinalizedBlockQuery, FinalizedBlockView, LightClient as _};
 use hellas_kernel::{CoinId, EdgeId, Funding, List, MAX_PARTY_INPUTS, Secp256k1Signer};
 use hellas_sdk::paid_client::{InputIdentities, PaidWorkOptions, PaidWorkRun, run_paid_work};
 use hellas_work::model::fetch::PreparedPaidFetchInputV1;
@@ -101,6 +99,12 @@ pub struct InspectChainArgs {
     /// Validator light-client WebSocket URL. Repeat exactly six times.
     #[arg(long = "validator", value_name = "URL")]
     validators: Vec<String>,
+    /// Independently authenticated deployment trust document.
+    #[arg(long)]
+    trust: PathBuf,
+    /// Genesis document; defaults to the shipped devnet.
+    #[arg(long)]
+    genesis: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Args)]
@@ -187,7 +191,9 @@ pub async fn run(
         PaidWorkCommand::InspectInput(args) => {
             inspect_input(&args.prepared_input, &transport_key, &settlement_key)
         }
-        PaidWorkCommand::InspectChain(args) => inspect_chain(&args.validators).await,
+        PaidWorkCommand::InspectChain(args) => {
+            inspect_chain(&args.validators, &args.trust, args.genesis.as_deref()).await
+        }
         PaidWorkCommand::Run(args) => {
             anyhow::ensure!(
                 args.timeout_secs > 0,
@@ -333,12 +339,23 @@ fn inspect_prepared(
     Ok(())
 }
 
-async fn inspect_chain(validators: &[String]) -> CliResult<()> {
+async fn inspect_chain(
+    validators: &[String],
+    trust_path: &std::path::Path,
+    genesis_path: Option<&std::path::Path>,
+) -> CliResult<()> {
     anyhow::ensure!(
         validators.len() == 6,
         "--validator must be passed exactly six times, got {}",
         validators.len(),
     );
+    let trust = serde_json::from_slice(&std::fs::read(trust_path)?)?;
+    let genesis_json = match genesis_path {
+        Some(path) => std::fs::read(path)?,
+        None => hellas_chain::genesis::HELLAS_DEVNET_1_JSON
+            .as_bytes()
+            .to_vec(),
+    };
     let mut observed: Option<(ConsensusInfo, [u8; 32])> = None;
     for url in validators {
         let client = RemoteLightClient::connect(url.clone())
@@ -357,9 +374,8 @@ async fn inspect_chain(validators: &[String]) -> CliResult<()> {
                     "validator {url} has no finalized block 1; genesis cannot be authenticated until block 1 is finalized",
                 )
             })?;
-        ConsensusVerifier::new(&info)
-            .with_context(|| format!("validator {url} reported an unusable threshold identity"))?
-            .verify_snapshot(&first.snapshot)
+        super::chain::pinned_consensus_verifier(&trust, &genesis_json, &info)?
+            .verify_snapshot(&first.snapshot, &first.block)
             .with_context(|| format!("validator {url} returned an unauthenticated block 1"))?;
         let first = FinalizedBlockView::decode(&first)
             .with_context(|| format!("validator {url} returned malformed finalized block 1"))?;

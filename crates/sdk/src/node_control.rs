@@ -74,7 +74,13 @@ impl NodeControl {
 
     pub(crate) fn provider_ingress(
         &self,
-    ) -> Result<Option<(iroh::Endpoint, tokio::sync::mpsc::Receiver<Connection>)>, WireStatus> {
+    ) -> Result<
+        Option<(
+            iroh::Endpoint,
+            tokio::sync::mpsc::Receiver<crate::transport_admission::AdmittedConnection>,
+        )>,
+        WireStatus,
+    > {
         self.host
             .as_ref()
             .map(host::Runtime::provider_ingress)

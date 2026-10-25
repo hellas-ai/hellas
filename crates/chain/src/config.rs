@@ -124,6 +124,9 @@ pub struct ValidatorConfig {
     pub listen_port: u16,
     #[serde(default)]
     pub metrics_port: Option<u16>,
+    /// Bind elsewhere only when a remote scraper is explicitly intended.
+    #[serde(default = "default_metrics_bind_address")]
+    pub metrics_bind_address: std::net::IpAddr,
     /// Address for a direct light-client RPC listener. Absent means no
     /// inbound light-client socket is opened; `relay_urls` configures
     /// serving through a relay separately, and both may be on at once —
@@ -157,7 +160,16 @@ pub struct PeerEntry {
     pub address: String,
 }
 
+fn default_metrics_bind_address() -> std::net::IpAddr {
+    std::net::Ipv4Addr::LOCALHOST.into()
+}
+
 impl ValidatorConfig {
+    pub fn metrics_address(&self) -> Option<SocketAddr> {
+        self.metrics_port
+            .map(|port| SocketAddr::new(self.metrics_bind_address, port))
+    }
+
     pub fn validate_genesis(&self) -> Result<(), ConfigError> {
         self.genesis.validate()?;
         self.network_id()?;

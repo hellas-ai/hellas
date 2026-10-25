@@ -208,8 +208,8 @@ impl Network {
                     let Some(wire) = response.block else {
                         return Ok(None);
                     };
-                    let block = crate::client::verified_finalized_block_from_proto(wire, None)
-                        .map_err(invalid)?;
+                    let block =
+                        crate::client::finalized_block_from_proto(wire, None).map_err(invalid)?;
                     self.trust.verify(&block)?;
                     if match query {
                         FinalizedBlockQuery::Height(h) => h != block.snapshot.height,
@@ -304,8 +304,8 @@ impl Network {
                     let Some(wire) = response.block else {
                         continue;
                     };
-                    let block = crate::client::verified_finalized_block_from_proto(wire, None)
-                        .map_err(invalid)?;
+                    let block =
+                        crate::client::finalized_block_from_proto(wire, None).map_err(invalid)?;
                     if self.manager().is_blocked(peer(id)) {
                         return Err(invalid("peer quarantined"));
                     }

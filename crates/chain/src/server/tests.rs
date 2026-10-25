@@ -34,6 +34,7 @@ struct MempoolClient {
     edge_result: Option<Result<Option<EdgeLookup>, QueryError>>,
     owner_edges_result: Option<Result<Option<OwnerEdges>, QueryError>>,
     response_blocker: Option<Arc<ResponseBlocker>>,
+    validators_blocker: Option<Arc<ResponseBlocker>>,
     forced_submit_outcome: Arc<std::sync::Mutex<Option<SubmitTxOutcome>>>,
 }
 
@@ -98,6 +99,11 @@ impl LightClientApi for MempoolClient {
     }
 
     async fn get_validators(&self) -> Result<Vec<String>, QueryError> {
+        if let Some(blocker) = &self.validators_blocker {
+            blocker.started.fetch_add(1, Ordering::SeqCst);
+            blocker.notify.notify_one();
+            blocker.release.acquire().await.unwrap().forget();
+        }
         Ok(vec!["validator-a".to_string()])
     }
 
@@ -826,4 +832,202 @@ async fn one_validator_submission_is_one_rpc_sample() {
     assert!(calls[0].ms >= 0.0);
 
     server.abort();
+}
+
+#[tokio::test]
+async fn tcp_admission_caps_the_global_pool_before_upgrade() {
+    use tokio::io::AsyncReadExt as _;
+    async fn refused(mut stream: TcpStream) {
+        let read = tokio::time::timeout(Duration::from_secs(1), stream.read_u8())
+            .await
+            .expect("a full global budget must immediately close the new socket");
+        assert!(read.is_err());
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (activity, _) = broadcast::channel(1);
+    let server = tokio::spawn(serve_listener(
+        listener,
+        MempoolClient::default(),
+        activity,
+        LightClientRpcState::default(),
+        hellas_wire::admission::ConnectionSlots::new(3, 1, 1),
+    ));
+    // Loopback peers skip the per-source caps (1 here) but not the global pool.
+    let mut admitted = Vec::new();
+    for _ in 0..3 {
+        admitted.push(TcpStream::connect(addr).await.unwrap());
+    }
+    refused(TcpStream::connect(addr).await.unwrap()).await;
+    for stream in &admitted {
+        assert_eq!(
+            stream.try_read(&mut [0]).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock,
+            "admitted connections remain usable while excess connections are refused"
+        );
+    }
+    server.abort();
+}
+
+#[tokio::test]
+async fn tcp_connections_without_a_websocket_upgrade_hit_the_handshake_deadline() {
+    use tokio::io::AsyncReadExt as _;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (activity, _) = broadcast::channel(1);
+    let server = tokio::spawn(serve_listener(
+        listener,
+        MempoolClient::default(),
+        activity,
+        LightClientRpcState::default(),
+        hellas_wire::admission::ConnectionSlots::new(3, 2, 3),
+    ));
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    let closed = tokio::time::timeout(Duration::from_secs(12), client.read_u8())
+        .await
+        .expect("an incomplete HTTP upgrade must not retain its connection slot forever");
+    assert!(closed.is_err());
+    server.abort();
+}
+
+#[tokio::test]
+async fn subscriptions_are_capped_without_starving_unary_requests() {
+    let (client, transport) = transport_pair();
+    let (activity, _) = broadcast::channel(16);
+    let server = tokio::spawn(serve_light_client_transport(
+        transport,
+        LightClientRpc::new(MempoolClient::default(), activity.clone()),
+    ));
+    let client = LightClientClientImpl::new(client);
+    let mut held = Vec::new();
+    for _ in 0..8 {
+        held.push(
+            client
+                .subscribe_activity(pb::SubscribeActivityRequest::default())
+                .await
+                .unwrap(),
+        );
+    }
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while activity.receiver_count() < 8 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let mut excess = client
+        .subscribe_activity(pb::SubscribeActivityRequest::default())
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), excess.next())
+            .await
+            .expect("the ninth subscription must be refused")
+            .is_none()
+    );
+    assert_eq!(
+        excess.finish().unwrap_err().code,
+        WireCode::ResourceExhausted
+    );
+    let validators = tokio::time::timeout(
+        Duration::from_secs(1),
+        client.get_validators(pb::GetValidatorsRequest {}),
+    )
+    .await
+    .expect("subscriptions leave unary dispatch capacity")
+    .unwrap();
+    assert_eq!(validators.validators, ["validator-a"]);
+    assert_eq!(activity.receiver_count(), 8);
+    server.abort();
+}
+
+#[tokio::test]
+async fn unary_dispatches_are_bounded_per_connection() {
+    let (client, transport) = transport_pair();
+    let (activity, _) = broadcast::channel(1);
+    let blocker = Arc::new(ResponseBlocker::default());
+    let server = tokio::spawn(serve_light_client_transport(
+        transport,
+        LightClientRpc::new(
+            MempoolClient {
+                validators_blocker: Some(blocker.clone()),
+                ..Default::default()
+            },
+            activity,
+        ),
+    ));
+    let client = Arc::new(LightClientClientImpl::new(client));
+    let mut calls = JoinSet::new();
+    for _ in 0..20 {
+        let client = client.clone();
+        calls.spawn(async move { client.get_validators(pb::GetValidatorsRequest {}).await });
+    }
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while blocker.started.load(Ordering::SeqCst) < 16 {
+            blocker.notify.notified().await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(
+        blocker.started.load(Ordering::SeqCst),
+        16,
+        "pending RPCs cannot spawn unlimited handlers"
+    );
+    blocker.release.add_permits(20);
+    while let Some(result) = calls.join_next().await {
+        result.unwrap().unwrap();
+    }
+    server.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn idle_light_client_transports_are_reaped() {
+    let (_client, transport) = transport_pair();
+    let (activity, _) = broadcast::channel(1);
+    let server = tokio::spawn(serve_light_client_transport(
+        transport,
+        LightClientRpc::new(MempoolClient::default(), activity),
+    ));
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(119)).await;
+    assert!(!server.is_finished());
+    tokio::time::advance(Duration::from_secs(2)).await;
+    for _ in 0..4 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        server.is_finished(),
+        "idle streams must release their connection budget"
+    );
+    server.await.unwrap().unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn cheap_light_client_requests_cannot_renew_the_connection_forever() {
+    let (client, transport) = transport_pair();
+    let (activity, _) = broadcast::channel(1);
+    let server = tokio::spawn(serve_light_client_transport(
+        transport,
+        LightClientRpc::new(MempoolClient::default(), activity),
+    ));
+    let client = LightClientClientImpl::new(client);
+    let start = Instant::now();
+    loop {
+        if client
+            .get_validators(pb::GetValidatorsRequest {})
+            .await
+            .is_err()
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert!(
+            start.elapsed() <= Duration::from_secs(16 * 60),
+            "trickling RPCs cannot renew a slot forever"
+        );
+    }
+    server.await.unwrap().unwrap();
+    assert!(start.elapsed() >= Duration::from_secs(15 * 60));
 }

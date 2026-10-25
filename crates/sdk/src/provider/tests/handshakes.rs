@@ -213,3 +213,79 @@ async fn completed_session_does_not_cancel_another_handshake() {
     other.close().await;
     provider.shutdown().await.unwrap();
 }
+
+// These fixtures bind separate addresses in Linux's 127/8 loopback range.
+#[cfg(target_os = "linux")]
+async fn sourced_endpoint(ip: [u8; 4], key: Option<iroh::SecretKey>) -> Endpoint {
+    let mut builder = Endpoint::builder(presets::Minimal)
+        .bind_addr(SocketAddr::from((ip, 0)))
+        .unwrap();
+    if let Some(key) = key {
+        builder = builder.secret_key(key);
+    }
+    builder.bind().await.unwrap()
+}
+
+#[cfg(target_os = "linux")]
+async fn connect(provider: &ProviderHandle, client: &Endpoint) -> Result<Connection, String> {
+    tokio::time::timeout(
+        PROGRESS,
+        client.connect(
+            EndpointAddr::new(provider.node_id()).with_ip_addr(socket(provider)),
+            Node::ALPN.as_bytes(),
+        ),
+    )
+    .await
+    .expect("admission must complete or refuse promptly")
+    .map_err(|e| e.to_string())
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn local_processes_are_not_held_to_the_per_ip_cap() {
+    // Per-IP and per-subnet caps bound remote peers (see hellas_wire::admission
+    // tests); several local tools reaching their own node share loopback.
+    let provider = provider().await;
+    let mut local = Vec::new();
+    for _ in 0..crate::transport_admission::PER_IP + 2 {
+        let endpoint = endpoint().await;
+        let connection = connect(&provider, &endpoint).await.unwrap();
+        info(&connection, provider.node_id()).await;
+        local.push((endpoint, connection));
+    }
+    assert!(local.iter().all(|(_, conn)| conn.close_reason().is_none()));
+    for (endpoint, _) in local {
+        endpoint.close().await;
+    }
+    provider.shutdown().await.unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn held_connections_from_one_identity_are_capped_across_source_ips() {
+    let provider = provider().await;
+    let key = iroh::SecretKey::from_bytes(&[77; 32]);
+    let mut attackers = Vec::new();
+    for host in 1..=4 {
+        let endpoint = sourced_endpoint([127, 2, 0, host as u8], Some(key.clone())).await;
+        let connection = connect(&provider, &endpoint).await.unwrap();
+        info(&connection, provider.node_id()).await;
+        attackers.push((endpoint, connection));
+    }
+    let excess = sourced_endpoint([127, 2, 0, 99], Some(key)).await;
+    // The identity becomes available only after TLS; excess connections are closed then.
+    if let Ok(connection) = connect(&provider, &excess).await {
+        tokio::time::timeout(PROGRESS, connection.closed())
+            .await
+            .expect("an identity cannot retain a fifth connection");
+    }
+    let honest = sourced_endpoint([127, 3, 0, 1], None).await;
+    let connection = connect(&provider, &honest).await.unwrap();
+    info(&connection, provider.node_id()).await;
+    for (endpoint, _) in attackers {
+        endpoint.close().await;
+    }
+    excess.close().await;
+    honest.close().await;
+    provider.shutdown().await.unwrap();
+}

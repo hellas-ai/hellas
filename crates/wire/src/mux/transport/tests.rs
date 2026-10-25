@@ -89,7 +89,7 @@ fn end_frame(slot: SlotIndex, generation: u16) -> Bytes {
 #[tokio::test]
 async fn a_finished_stream_s_reset_cannot_cancel_the_slot_s_next_tenant() {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-    let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel();
+    let (inbound_tx, mut inbound_rx) = mpsc::channel(4);
     let (_wire_tx, wire_rx) = mpsc::unbounded_channel();
     let (sent_tx, mut sent_rx) = mpsc::unbounded_channel();
     let mut driver = MuxDriver::<8, _, _> {
@@ -177,7 +177,7 @@ async fn a_finished_stream_s_reset_cannot_cancel_the_slot_s_next_tenant() {
 #[tokio::test]
 async fn blocked_send_resumes_when_peer_credit_arrives() {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-    let (inbound_tx, _inbound_rx) = mpsc::unbounded_channel();
+    let (inbound_tx, _inbound_rx) = mpsc::channel(4);
     let (_wire_tx, wire_rx) = mpsc::unbounded_channel();
     let mut driver = MuxDriver::<8, _, _> {
         mux: Multiplexer::new(Role::Client, DefaultClock, MuxConfig { stream_window: 8 }),
@@ -240,4 +240,64 @@ async fn dropping_last_transport_owner_drops_the_pipe() {
     dropped_rx
         .await
         .expect("driver must terminate when its final owner disappears");
+}
+
+#[tokio::test]
+async fn recycled_peer_slots_cannot_overflow_the_inbound_queue() {
+    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+    let (inbound_tx, mut inbound_rx) = mpsc::channel(4);
+    let (_wire_tx, wire_rx) = mpsc::unbounded_channel();
+    let (sent_tx, mut sent_rx) = mpsc::unbounded_channel();
+    let mut driver = MuxDriver::<8, _, _> {
+        mux: Multiplexer::new(Role::Server, DefaultClock, MuxConfig::default()),
+        pipe: RecordingPipe {
+            recv_rx: wire_rx,
+            sent: sent_tx,
+        },
+        cmd_rx,
+        cmd_tx: cmd_tx.downgrade(),
+        inbound_tx,
+        slot_to_chans: Default::default(),
+        pending_sends: Default::default(),
+        authorities: Default::default(),
+        context: TransportContext::default(),
+    };
+    for generation in 1..=12 {
+        driver.handle_inbound(open_frame(0, generation, 7)).await;
+        assert!(driver.flush_outbound().await);
+        driver
+            .handle_inbound(encode_keyed_frame(
+                StreamKey::new(0, generation),
+                &Frame::Reset(crate::ResetFrame {
+                    code: WireCode::Cancelled,
+                }),
+            ))
+            .await;
+        assert!(driver.flush_outbound().await);
+    }
+    assert_eq!(
+        inbound_rx.len(),
+        4,
+        "resetting slots cannot grow the pending queue"
+    );
+    let mut refused = 0;
+    while let Ok(bytes) = sent_rx.try_recv() {
+        if let Frame::Reset(reset) = decode_keyed_frame(&bytes).unwrap().frame {
+            assert_eq!(reset.code, WireCode::ResourceExhausted);
+            refused += 1;
+        }
+    }
+    assert_eq!(
+        refused, 8,
+        "every overflowing Open gets a resource-exhausted reset"
+    );
+    for _ in 0..4 {
+        drop(inbound_rx.try_recv().unwrap());
+    }
+    driver.handle_inbound(open_frame(0, 13, 99)).await;
+    assert_eq!(
+        inbound_rx.try_recv().unwrap().method_id,
+        99,
+        "draining restores admission"
+    );
 }

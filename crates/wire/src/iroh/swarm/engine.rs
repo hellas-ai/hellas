@@ -1,11 +1,12 @@
 //! Swarm engine: merges peer feeds with priority and deduplication.
 
-use std::collections::HashSet;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use crate::peers::{DiscoverySource, PeerEvent, PeerId, PeerRegistry, TransportSecurity};
 use ::iroh::EndpointId;
 use futures::stream::{SelectAll, Stream};
+use web_time::Instant;
 
 use super::discovery::Peer;
 use super::peers::{FeedError, FeedResult, PeerFeed, PeerFeedSpec, scope_matches};
@@ -43,7 +44,8 @@ type TaggedPeerFeed = Pin<Box<dyn Stream<Item = FeedResult<Peer>>>>;
 /// Merges multiple peer feeds into a single deduped stream.
 pub struct SwarmEngine {
     inner: SelectAll<TaggedPeerFeed>,
-    seen: HashSet<[u8; 32]>,
+    seen: PeerRegistry,
+    started: Instant,
     local_id: EndpointId,
 }
 
@@ -52,7 +54,8 @@ impl SwarmEngine {
     ///
     /// Feeds whose scope doesn't match `alpn` are dropped; the rest are
     /// sorted by priority (ascending = polled first) and merged with
-    /// per-peer dedup that also skips the local endpoint.
+    /// per-peer dedup that also skips the local endpoint. Deduplication
+    /// lasts only while the bounded peer registry retains the identity.
     #[must_use]
     pub fn new(local_id: EndpointId, alpn: &[u8], mut feeds: Vec<PeerFeedSpec>) -> Self {
         let mut inner = SelectAll::new();
@@ -70,7 +73,8 @@ impl SwarmEngine {
         }
         Self {
             inner,
-            seen: HashSet::new(),
+            seen: PeerRegistry::default(),
+            started: Instant::now(),
             local_id,
         }
     }
@@ -88,7 +92,15 @@ impl Stream for SwarmEngine {
                         if peer.id() == this.local_id {
                             continue;
                         }
-                        if this.seen.insert(*peer.id().as_bytes()) {
+                        let change = this.seen.apply(
+                            u64::try_from(this.started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                            PeerId::from(*peer.id().as_bytes()),
+                            PeerEvent::Discovered {
+                                source: DiscoverySource::Transport("discovery"),
+                                transport_security: TransportSecurity::Untrusted,
+                            },
+                        );
+                        if change.inserted && !change.dropped {
                             return Poll::Ready(Some(Ok(peer)));
                         }
                     }
@@ -111,6 +123,37 @@ mod tests {
 
     fn endpoint_id(byte: u8) -> EndpointId {
         SecretKey::from([byte; 32]).public()
+    }
+
+    #[tokio::test]
+    async fn discovery_retention_is_bounded_across_identity_churn() {
+        let bound = crate::peers::PeerRegistryConfig::default().max_peers;
+        let peers = (0..bound + 16)
+            .map(|number| {
+                let mut secret = [0; 32];
+                secret[..8].copy_from_slice(&u64::try_from(number).unwrap().to_le_bytes());
+                SecretKey::from(secret).public()
+            })
+            .collect();
+        let mut engine = SwarmEngine::new(
+            endpoint_id(255),
+            b"/svc.Test/2.0",
+            vec![static_feed(peers, 0, 0, Scope::Any)],
+        );
+        let mut emitted = 0;
+        while let Some(peer) = engine.next().await {
+            peer.expect("valid discovery");
+            emitted += 1;
+            assert!(
+                engine.seen.len() <= bound,
+                "discovery retained too many identities"
+            );
+        }
+        assert_eq!(
+            emitted,
+            bound + 16,
+            "new identities still flow after eviction"
+        );
     }
 
     #[tokio::test]

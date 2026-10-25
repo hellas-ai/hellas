@@ -235,5 +235,5 @@ hellas-work.workspace = true
 serde = { workspace = true, features = ["derive"] }
 sha2.workspace = true
 tempfile = "3"
-tokio = { workspace = true, features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
 tower = { version = "0.5", features = ["util"] }

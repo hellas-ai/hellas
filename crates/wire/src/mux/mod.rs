@@ -20,7 +20,9 @@ pub use slot::{Role, SlotIndex, SlotState, StreamSlot};
 pub use state::{Event, Multiplexer, MuxConfig, MuxError, SendBodyOutcome};
 pub use stream::{MuxRecvHalf, MuxSendHalf, MuxStream, MuxStreamError};
 pub use transport::{MessagePipe, MuxTransport, MuxTransportError};
-pub use wire::{KeyedFrame, StreamKey, decode_keyed_frame, encode_keyed_frame};
+pub use wire::{
+    KeyedFrame, MAX_KEYED_FRAME_BYTES, StreamKey, decode_keyed_frame, encode_keyed_frame,
+};
 
 /// Default maximum unconsumed body bytes per direction per stream.
 ///

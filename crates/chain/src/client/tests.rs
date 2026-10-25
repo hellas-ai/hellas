@@ -50,14 +50,14 @@ fn finalized_block_verification_checks_block_bytes() {
     let block = b"encoded-block".to_vec();
     let payload = Sha256::hash(&block);
 
-    let verified = verified_finalized_block_from_proto(proto_block(block.clone(), payload), None)
+    let verified = finalized_block_from_proto(proto_block(block.clone(), payload), None)
         .expect("matching block bytes should verify without a configured certificate verifier");
     assert_eq!(verified.snapshot.payload, payload);
     assert_eq!(verified.block, block);
 
     let mismatched_payload = Sha256::hash(b"different-block");
     assert!(
-        verified_finalized_block_from_proto(
+        finalized_block_from_proto(
             proto_block(b"encoded-block".to_vec(), mismatched_payload),
             None
         )
@@ -124,7 +124,6 @@ fn remote_owner_edges_decode_records_and_reject_malformed_keys() {
             snapshot: Some(proto_snapshot()),
             edges: vec![proto_edge_record(9, owner, taker)],
         },
-        None,
     )
     .expect("valid owner edge response")
     .expect("snapshot is present");
@@ -149,7 +148,6 @@ fn remote_owner_edges_decode_records_and_reject_malformed_keys() {
                     snapshot: Some(proto_snapshot()),
                     edges: vec![malformed],
                 },
-                None,
             )
             .is_err()
         );
@@ -168,7 +166,6 @@ fn remote_owner_edges_reject_duplicates_and_unrelated_records() {
                 snapshot: Some(proto_snapshot()),
                 edges: vec![duplicate.clone(), duplicate],
             },
-            None,
         )
         .is_err()
     );
@@ -181,7 +178,6 @@ fn remote_owner_edges_reject_duplicates_and_unrelated_records() {
                 snapshot: Some(proto_snapshot()),
                 edges: vec![proto_edge_record(9, maker, taker)],
             },
-            None,
         )
         .is_err()
     );

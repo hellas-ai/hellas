@@ -12,6 +12,7 @@ async fn genesis(context: deterministic::Context, leader: PublicKey, prefix: &st
     Application::new(
         context,
         crate::domain::TEST_NETWORK,
+        commonware_cryptography::sha256::Digest::from([0; 32]),
         leader,
         Vec::new(),
         prefix,

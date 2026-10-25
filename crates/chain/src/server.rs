@@ -28,12 +28,22 @@ use hellas_wire::{PeerIdentity, StreamTransport, TransportContext, WireCode, Wir
 use std::{collections::HashMap, io, net::SocketAddr, sync::Arc};
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::broadcast,
-    task::JoinHandle,
+    sync::{Semaphore, broadcast},
+    task::{JoinHandle, JoinSet},
+    time::{Duration, Instant},
 };
 use tokio_stream::wrappers::BroadcastStream;
-use tokio_tungstenite::accept_async;
+use tokio_tungstenite::accept_async_with_config;
 use tracing::{info, warn};
+
+const MAX_CONNECTIONS: usize = 128;
+const MAX_CONNECTIONS_PER_IP: usize = 4;
+const MAX_CONNECTIONS_PER_SUBNET: usize = 16;
+const MAX_DISPATCHES: usize = 16;
+const MAX_SUBSCRIPTIONS: usize = 8;
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+const MAX_CONNECTION_LIFETIME: Duration = Duration::from_secs(15 * 60);
 
 type ActivityStream = hellas_rpc::call::ResponseStream<ActivityEvent>;
 pub type LightClientServerError = Box<dyn std::error::Error + Send + Sync + 'static>;
@@ -43,6 +53,7 @@ pub struct LightClientRpc<T> {
     client: T,
     activity_tx: broadcast::Sender<ConsensusActivity>,
     state: LightClientRpcState,
+    subscriptions: Arc<Semaphore>,
 }
 
 /// Node-scoped concurrency and source-accounting state for light-client RPCs.
@@ -118,6 +129,7 @@ impl<T> LightClientRpc<T> {
             client,
             activity_tx,
             state,
+            subscriptions: Arc::new(Semaphore::new(MAX_SUBSCRIPTIONS)),
         }
     }
 }
@@ -132,25 +144,57 @@ where
     T: LightClientApi,
 {
     let listener = TcpListener::bind(addr).await?;
-    Ok(tokio::spawn(async move {
-        info!(%addr, "light client rpc server started");
-        loop {
-            let (stream, peer) = match listener.accept().await {
-                Ok(connection) => connection,
-                Err(err) => {
-                    warn!(?err, "light client rpc accept failed");
-                    continue;
-                }
-            };
-            let service =
-                LightClientRpc::with_state(client.clone(), activity_tx.clone(), state.clone());
-            tokio::spawn(async move {
-                if let Err(err) = serve_connection(stream, service).await {
-                    warn!(?err, %peer, "light client rpc connection failed");
-                }
-            });
+    Ok(tokio::spawn(serve_listener(
+        listener,
+        client,
+        activity_tx,
+        state,
+        hellas_wire::admission::ConnectionSlots::new(
+            MAX_CONNECTIONS,
+            MAX_CONNECTIONS_PER_IP,
+            MAX_CONNECTIONS_PER_SUBNET,
+        ),
+    )))
+}
+
+async fn serve_listener<T: LightClientApi>(
+    listener: TcpListener,
+    client: T,
+    activity_tx: broadcast::Sender<ConsensusActivity>,
+    state: LightClientRpcState,
+    slots: hellas_wire::admission::ConnectionSlots,
+) {
+    info!(addr = ?listener.local_addr(), "light client rpc server started");
+    let mut connections = JoinSet::new();
+    let mut handshakes = hellas_wire::admission::Handshakes::default();
+    let epoch = Instant::now();
+    loop {
+        let accepted = tokio::select! {
+            _ = connections.join_next(), if !connections.is_empty() => continue,
+            accepted = listener.accept() => accepted,
+        };
+        let (stream, peer) = match accepted {
+            Ok(connection) => connection,
+            Err(err) => {
+                warn!(?err, "light client rpc accept failed");
+                continue;
+            }
+        };
+        let Some(slot) = slots.try_acquire(Some(peer.ip())) else {
+            continue;
+        };
+        if !handshakes.admit(Some(peer.ip()), epoch.elapsed().as_millis() as u64) {
+            continue;
         }
-    }))
+        let service =
+            LightClientRpc::with_state(client.clone(), activity_tx.clone(), state.clone());
+        connections.spawn(async move {
+            let _slot = slot;
+            if let Err(err) = serve_connection(stream, service).await {
+                warn!(?err, %peer, "light client rpc connection failed");
+            }
+        });
+    }
 }
 
 async fn serve_connection<T>(
@@ -160,18 +204,45 @@ async fn serve_connection<T>(
 where
     T: LightClientApi,
 {
-    let ws = accept_async(stream).await?;
-    let transport = hellas_wire::ws::accept_upgraded(ws, None);
+    let ws = tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        accept_async_with_config(stream, Some(hellas_wire::ws::websocket_config())),
+    )
+    .await??;
+    let transport = hellas_wire::ws::accept_upgraded(ws, None)?;
     serve_light_client_transport(transport, service).await
+}
+
+/// No new RPC Open within the idle deadline ends the connection, including quiet
+/// subscriptions. Clients can reopen them; keepalives do not extend this budget.
+struct IdleTransport<T>(T);
+impl<T: StreamTransport + Sync> StreamTransport for IdleTransport<T> {
+    type Stream = T::Stream;
+    type Error = T::Error;
+    fn context(&self) -> TransportContext {
+        self.0.context()
+    }
+    async fn open(
+        &self,
+        method: u32,
+        headers: hellas_wire::Metadata,
+    ) -> Result<Self::Stream, Self::Error> {
+        self.0.open(method, headers).await
+    }
+    async fn accept(&self) -> Result<Option<hellas_wire::Inbound<Self::Stream>>, Self::Error> {
+        tokio::time::timeout(IDLE_TIMEOUT, self.0.accept())
+            .await
+            .unwrap_or(Ok(None))
+    }
 }
 
 /// Serve the typed light-client API over any inbound-stream transport.
 ///
-/// Each RPC is dispatched in its own task. Server-streaming calls can remain
-/// open indefinitely and must not block unary calls on other mux streams.
+/// Subscriptions have their own smaller budget so they leave room for unary
+/// calls. Idle and lifetime deadlines bound silent and continuously busy peers.
 pub async fn serve_light_client_transport<T, C>(
     transport: T,
-    service: LightClientRpc<C>,
+    mut service: LightClientRpc<C>,
 ) -> Result<(), LightClientServerError>
 where
     T: StreamTransport + Send + Sync + 'static,
@@ -180,18 +251,22 @@ where
     <T::Stream as hellas_wire::Stream>::SendHalf: 'static,
     C: LightClientApi,
 {
-    // Unbounded on purpose: this service exposes long-lived server-streaming
-    // calls (activity subscriptions), and an in-flight cap counts open
-    // streams, so a handful of subscribers would starve every later call on
-    // the connection.
-    hellas_wire::serve_dispatched(transport, "light-client", None, || {
-        LightClientServer(
-            service.clone(),
-            service.state.response_route.clone(),
-            service.state.general_route.clone(),
-        )
-    })
-    .await?;
+    service.subscriptions = Arc::new(Semaphore::new(MAX_SUBSCRIPTIONS));
+    let serving = hellas_wire::serve_dispatched(
+        IdleTransport(transport),
+        "light-client",
+        Some(MAX_DISPATCHES),
+        || {
+            LightClientServer(
+                service.clone(),
+                service.state.response_route.clone(),
+                service.state.general_route.clone(),
+            )
+        },
+    );
+    if let Ok(result) = tokio::time::timeout(MAX_CONNECTION_LIFETIME, serving).await {
+        result?;
+    }
     Ok(())
 }
 
@@ -378,7 +453,14 @@ where
         request: pb::SubscribeActivityRequest,
     ) -> impl Future<Output = Result<ActivityStream, WireStatus>> + Send {
         let activity_tx = self.activity_tx.clone();
+        let subscriptions = self.subscriptions.clone();
         async move {
+            let permit = subscriptions.try_acquire_owned().map_err(|_| {
+                WireStatus::new(
+                    WireCode::ResourceExhausted,
+                    "connection subscription capacity exhausted",
+                )
+            })?;
             let urgent_events = request.urgent_events;
             let stream = BroadcastStream::new(activity_tx.subscribe()).filter_map(move |event| {
                 let urgent_events = urgent_events.clone();
@@ -395,7 +477,11 @@ where
                     }
                 }
             });
-            Ok(ActivityStream::new(stream))
+            Ok(ActivityStream::new(stream.map(move |event| {
+                // The stream owns its subscription budget through cancellation.
+                let _permit = &permit;
+                event
+            })))
         }
     }
 

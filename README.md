@@ -162,6 +162,12 @@ The `indexer` feature adds `chain indexer follow`; the `validator` feature adds
 `chain validator config`, `chain validator run`, and
 `chain validator check-config`.
 
+Validator metrics default to `127.0.0.1`. A remote scraper requires an explicit
+`metrics_bind_address` in validator TOML, `--metrics-bind-address` when generating
+it, or `services.hellas-chain-validators.<name>.metricsBindAddress` in NixOS.
+For the devnet's VictoriaMetrics WireGuard scrape, set that option to each
+validator host's WireGuard IP before deploying this change.
+
 `chain query --rpc URL` supports `latest-block`, `state-root`, `finalization`,
 `finalized-block`, `coin`, `edge`, `validators`, `coins-by-owner`, and
 `edges-by-owner`.

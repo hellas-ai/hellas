@@ -56,6 +56,7 @@ hellas-attestation = { workspace = true, features = ["apple-app-attest"] }
 hellas-auth.workspace = true
 hellas-chain = { workspace = true, default-features = false, features = [
     "client",
+    "proof-verify",
     "work-watcher",
 ] }
 hellas-client = { workspace = true, features = ["iroh", "work", "evaluate"] }

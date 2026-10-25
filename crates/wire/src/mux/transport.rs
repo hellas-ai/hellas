@@ -87,7 +87,7 @@ pub(crate) enum Command {
 #[derive(Clone)]
 pub struct MuxTransport {
     cmd_tx: mpsc::UnboundedSender<Command>,
-    inbound_rx: Arc<Mutex<mpsc::UnboundedReceiver<Inbound<MuxStream>>>>,
+    inbound_rx: Arc<Mutex<mpsc::Receiver<Inbound<MuxStream>>>>,
     /// What the enclosing session vouches for: the peer it authenticated,
     /// and the keying material it can export. A mux is carried by
     /// something else — a WebSocket, a QUIC connection — and only that
@@ -139,7 +139,7 @@ impl MuxTransport {
         F: FnOnce(std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>),
     {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-        let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
+        let (inbound_tx, inbound_rx) = mpsc::channel((N / 2).max(1));
 
         let mux = Multiplexer::<N, C>::new(role, clock, config);
         let driver = MuxDriver::<N, C, P> {
@@ -198,7 +198,7 @@ struct MuxDriver<const N: usize, C: Clock + Clone, P: MessagePipe> {
     /// Weak by design: the driver must not keep its own command channel
     /// alive. Real transport/stream owners hold the strong senders.
     cmd_tx: mpsc::WeakUnboundedSender<Command>,
-    inbound_tx: mpsc::UnboundedSender<Inbound<MuxStream>>,
+    inbound_tx: mpsc::Sender<Inbound<MuxStream>>,
     /// Per-slot channels owned by application halves. `Body`/`End`/
     /// `Reset` events are forwarded into the slot's recv channel; the
     /// I/O loop sends Body acks to the slot's send-side oneshots.
@@ -474,7 +474,14 @@ impl<const N: usize, C: Clock + Clone, P: MessagePipe> MuxDriver<N, C, P> {
                     stream,
                     context: self.context.clone(),
                 };
-                let _ = self.inbound_tx.send(inbound);
+                if let Err(error) = self.inbound_tx.try_send(inbound) {
+                    let code = match error {
+                        mpsc::error::TrySendError::Full(_) => WireCode::ResourceExhausted,
+                        mpsc::error::TrySendError::Closed(_) => WireCode::Cancelled,
+                    };
+                    self.mux.reset(slot, code);
+                    self.dispatch_event(Event::ResetStream { slot, code });
+                }
             }
             Event::BodyChunk { slot, payload } => {
                 let delivered = self

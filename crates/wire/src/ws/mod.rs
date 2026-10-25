@@ -8,7 +8,7 @@
 pub mod native;
 
 #[cfg(all(feature = "ws", not(target_family = "wasm")))]
-pub use native::{WsError, WsPipe, accept_upgraded, connect, connect_server};
+pub use native::{WsError, WsPipe, accept_upgraded, connect, connect_server, websocket_config};
 
 #[cfg(all(feature = "ws-wasm", target_family = "wasm"))]
 pub mod wasm;

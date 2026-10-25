@@ -64,14 +64,20 @@ impl HellasBlock {
         self
     }
 
-    pub fn genesis(leader: PublicKey, state_root: Digest, sync_target: UtxoSyncTarget) -> Self {
+    pub fn genesis(
+        leader: PublicKey,
+        state_root: Digest,
+        sync_target: UtxoSyncTarget,
+        genesis: Digest,
+    ) -> Self {
         Self {
             context: Context {
                 round: Round::new(Epoch::zero(), View::zero()),
                 leader,
                 parent: (View::zero(), Digest::EMPTY),
             },
-            parent: Digest::EMPTY,
+            // Height zero anchors the history to the provisioned genesis document.
+            parent: genesis,
             height: Height::zero(),
             timestamp: 0,
             state_root,

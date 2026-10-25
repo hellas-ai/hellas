@@ -80,6 +80,7 @@ let
         ${addressesFlag} \
         ${relayFlags} \
         --metrics-port ${toString (validator.metricsBasePort + index)} \
+        --metrics-bind-address ${escapeShellArg validator.metricsBindAddress} \
         ${lightClientFlag} \
         ${chainSyncFlag} \
         ${archiveFlag} \
@@ -125,6 +126,12 @@ let
           type = types.port;
           default = 9090;
           description = "Base Prometheus metrics port.";
+        };
+        metricsBindAddress = mkOption {
+          type = types.strMatching "[0-9A-Fa-f:.]+";
+          default = "127.0.0.1";
+          example = "10.100.0.10";
+          description = "Metrics listener IP. Set the WireGuard IP explicitly for remote scrapers.";
         };
         lightClientRpc = {
           enable = mkEnableOption "a direct light-client RPC listener for every validator";
@@ -366,7 +373,12 @@ in
     networking.firewall.interfaces.wg0.allowedTCPPorts = concatLists (
       mapAttrsToList (
         _: validator:
-        localPorts validator validator.metricsBasePort
+        lib.optionals (
+          !(builtins.elem validator.metricsBindAddress [
+            "127.0.0.1"
+            "::1"
+          ])
+        ) (localPorts validator validator.metricsBasePort)
         ++ localPorts validator validator.startPort
         ++ lib.optionals (validator.lightClientRpc.enable && validator.lightClientRpc.openFirewall) (
           localPorts validator validator.lightClientRpc.basePort

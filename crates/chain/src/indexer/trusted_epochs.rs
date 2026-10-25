@@ -28,16 +28,22 @@ impl TrustedEpochs {
                 "native marshal requires consecutive epochs beginning at zero".into(),
             ));
         }
+        let genesis = serde_json::from_slice(genesis_json)
+            .map_err(|e| IngestError::TrustSchedule(e.to_string()))?;
+        let genesis_digest = crate::genesis_digest(&genesis);
         let verifiers = trust
             .epochs
             .iter()
             .map(|epoch| {
-                ConsensusVerifier::new(&crate::ConsensusInfo {
-                    network_id: trust.network_id.clone(),
-                    validators: Vec::new(),
-                    threshold_identity: hex::decode(&epoch.threshold_identity)
-                        .expect("validated threshold encoding"),
-                })
+                ConsensusVerifier::new(
+                    &crate::ConsensusInfo {
+                        network_id: trust.network_id.clone(),
+                        validators: Vec::new(),
+                        threshold_identity: hex::decode(&epoch.threshold_identity)
+                            .expect("validated threshold encoding"),
+                    },
+                    genesis_digest,
+                )
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
@@ -102,9 +108,7 @@ impl Provider for TrustedEpochs {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::execution::test_support::{
-        consensus_fixture, finalization, index_block, index_genesis,
-    };
+    use crate::execution::test_support::{finalization, index_block, index_genesis};
     use commonware_consensus::{
         simplex::types::Context,
         types::{Round, View},
@@ -116,8 +120,18 @@ mod tests {
     #[test]
     fn follower_accepts_rotated_threshold_keys_only_at_the_scheduled_height() {
         deterministic::Runner::default().start(|context| async move {
-            let first = consensus_fixture(501);
-            let second = consensus_fixture(601);
+            let first = crate::execution::test_support::consensus_fixture_in(
+                501,
+                4,
+                hellas_kernel::NetworkId::new(HELLAS_DEVNET_1_ID).unwrap(),
+                crate::genesis_digest(&serde_json::from_str(HELLAS_DEVNET_1_JSON).unwrap()),
+            );
+            let second = crate::execution::test_support::consensus_fixture_in(
+                601,
+                4,
+                hellas_kernel::NetworkId::new(HELLAS_DEVNET_1_ID).unwrap(),
+                crate::genesis_digest(&serde_json::from_str(HELLAS_DEVNET_1_JSON).unwrap()),
+            );
             let trust = TrustDocument {
                 schema_version: 1,
                 network_id: HELLAS_DEVNET_1_ID.into(),

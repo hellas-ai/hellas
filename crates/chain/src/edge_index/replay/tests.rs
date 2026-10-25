@@ -120,6 +120,12 @@ impl Harness {
         genesis
             .validators
             .sort_by(|a, b| b.public_key.cmp(&a.public_key));
+        let committee = crate::execution::test_support::consensus_fixture_in(
+            7191,
+            4,
+            network,
+            crate::genesis_digest(&genesis),
+        );
         let genesis_json = serde_json::to_vec(&genesis).unwrap();
         let trust = TrustDocument {
             schema_version: 1,
@@ -141,11 +147,17 @@ impl Harness {
         )
         .await;
         let leader = committee.leaders.iter().min().unwrap().clone();
-        let head = HellasBlock::genesis(leader, root, target.clone());
+        let head = HellasBlock::genesis(
+            leader,
+            root,
+            target.clone(),
+            crate::genesis_digest(&genesis),
+        );
         let origin_genesis = HellasBlock::genesis(
             crate::indexer_api::genesis_leader(&genesis).unwrap(),
             root,
             target,
+            crate::genesis_digest(&genesis),
         );
         let directory = tempfile::tempdir().unwrap();
         let index = EdgeIndex::open(
