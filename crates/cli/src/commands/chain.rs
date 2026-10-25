@@ -325,6 +325,9 @@ pub enum ValidatorCommand {
         /// Prometheus metrics port
         #[arg(long)]
         metrics_port: Option<u16>,
+        /// Metrics listener IP; remote scrapers require an explicit address
+        #[arg(long, default_value = "127.0.0.1")]
+        metrics_bind_address: std::net::IpAddr,
         /// Direct light-client RPC bind address
         #[arg(long)]
         light_client_bind: Option<std::net::SocketAddr>,
@@ -968,6 +971,7 @@ async fn run_validator(command: ValidatorCommand) -> CliResult {
             addresses,
             relay_urls,
             metrics_port,
+            metrics_bind_address,
             light_client_bind,
             chain_sync_bind,
             archive_blocks,
@@ -981,6 +985,7 @@ async fn run_validator(command: ValidatorCommand) -> CliResult {
             addresses,
             relay_urls,
             metrics_port,
+            metrics_bind_address,
             light_client_bind,
             chain_sync_bind,
             archive_blocks,

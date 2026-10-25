@@ -231,6 +231,7 @@ fn genesis_allocations(genesis: Genesis) -> Vec<(SettlementKey, u64)> {
         threshold_polynomial: String::new(),
         listen_port: 0,
         metrics_port: None,
+        metrics_bind_address: std::net::Ipv4Addr::LOCALHOST.into(),
         light_client_bind: None,
         chain_sync_bind: None,
         archive_blocks: None,

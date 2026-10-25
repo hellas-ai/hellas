@@ -21,6 +21,7 @@ fn config_with_genesis(address: String) -> ValidatorConfig {
         threshold_polynomial: String::new(),
         listen_port: 0,
         metrics_port: None,
+        metrics_bind_address: std::net::Ipv4Addr::LOCALHOST.into(),
         light_client_bind: None,
         chain_sync_bind: None,
         archive_blocks: None,
@@ -198,4 +199,26 @@ fn p256_key(scalar: u8) -> SettlementKey {
             .try_into()
             .expect("a compressed P-256 point is 33 bytes"),
     )
+}
+
+#[test]
+fn validator_metrics_default_to_loopback_and_remote_bind_is_explicit() {
+    let mut value = serde_json::to_value(config_with_genesis(String::new())).unwrap();
+    value["metrics_port"] = serde_json::json!(9090);
+    value
+        .as_object_mut()
+        .unwrap()
+        .remove("metrics_bind_address");
+    let config: ValidatorConfig = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(
+        config.metrics_address().unwrap(),
+        "127.0.0.1:9090".parse().unwrap()
+    );
+    assert!(config.metrics_address().unwrap().ip().is_loopback());
+    value["metrics_bind_address"] = serde_json::json!("10.100.0.10");
+    let config: ValidatorConfig = serde_json::from_value(value).unwrap();
+    assert_eq!(
+        config.metrics_address().unwrap(),
+        "10.100.0.10:9090".parse().unwrap()
+    );
 }
