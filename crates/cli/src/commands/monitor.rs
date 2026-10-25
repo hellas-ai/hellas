@@ -17,6 +17,7 @@ use futures::StreamExt;
 use hellas_client::iroh::build_client_registry;
 use hellas_rpc::pb::swarm::{GetKnownPeersRequest, GetNodeInfoRequest, GetNodeInfoResponse};
 use hellas_rpc::services::node::{Node, NodeClientImpl};
+use hellas_wire::admission::{ConnectionPermit, ConnectionSlots};
 use hellas_wire::iroh::pool::PoolOptions;
 use hellas_wire::iroh::swarm::{Peer, ServiceRegistry};
 use hellas_wire::peers::{DiscoverySource, PeerId, PeerManager, RpcService, TransportSecurity};
@@ -29,6 +30,14 @@ use crate::commands::CliResult;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const RPC_TIMEOUT: Duration = Duration::from_secs(3);
+const MAX_INTERROGATIONS: usize = 32;
+const MAX_KNOWN_PEERS: usize = 128;
+
+type Interrogations = JoinSet<(
+    EndpointId,
+    anyhow::Result<PeerInterrogationOutcome>,
+    ConnectionPermit,
+)>;
 
 struct PeerInterrogationOutcome {
     node_info: GetNodeInfoResponse,
@@ -41,8 +50,9 @@ struct DiscoveryEventContext<'a> {
     registry: &'a ServiceRegistry,
     peer_manager: &'a PeerManager,
     interrogate: bool,
-    interrogated: &'a mut HashSet<EndpointId>,
-    interrogations: &'a mut JoinSet<(EndpointId, anyhow::Result<PeerInterrogationOutcome>)>,
+    interrogated: &'a mut usize,
+    interrogations: &'a mut Interrogations,
+    admission: &'a ConnectionSlots,
 }
 
 pub async fn run(
@@ -75,7 +85,9 @@ pub async fn run(
     let mut node_discovery = Box::pin(registry.discover::<Node>());
 
     let mut interrogations = JoinSet::new();
-    let mut interrogated = HashSet::new();
+    let mut interrogated = 0usize;
+    let admission =
+        ConnectionSlots::new(MAX_INTERROGATIONS, MAX_INTERROGATIONS, MAX_INTERROGATIONS);
 
     let mut interrogation_ok = 0usize;
     let mut interrogation_failed = 0usize;
@@ -123,6 +135,7 @@ pub async fn run(
                                 interrogate,
                                 interrogated: &mut interrogated,
                                 interrogations: &mut interrogations,
+                                admission: &admission,
                             },
                         );
                     }
@@ -137,7 +150,7 @@ pub async fn run(
             }
             joined = interrogations.join_next(), if !interrogations.is_empty() => {
                 match joined {
-                    Some(Ok((peer_id, Ok(outcome)))) => {
+                    Some(Ok((peer_id, Ok(outcome), _permit))) => {
                         interrogation_ok += 1;
                         let info = &outcome.node_info;
                         println!(
@@ -172,20 +185,12 @@ pub async fn run(
                         if !outcome.known_peers.is_empty() {
                             hinted_peers += outcome.known_peers.len();
                             for hinted in &outcome.known_peers {
-                                let _ = peer_manager
-                                    .peer(PeerId::from(*hinted.as_bytes()))
-                                    .observe_discovered(
-                                        DiscoverySource::PeerExchange,
-                                        TransportSecurity::Untrusted,
-                                    );
-                            }
-                            for hinted in &outcome.known_peers {
                                 println!("event=peer-hint from={} peer={}", peer_id, hinted);
                             }
                             peer_exchange.ingest_peers(outcome.known_peers.iter().copied());
                         }
                     }
-                    Some(Ok((peer_id, Err(err)))) => {
+                    Some(Ok((peer_id, Err(err), _permit))) => {
                         interrogation_failed += 1;
                         println!("event=interrogate-error peer={} error=\"{err:#}\"", peer_id);
                     }
@@ -210,11 +215,7 @@ pub async fn run(
 
     println!(
         "event=monitor-summary unique_peers={} interrogated={} interrogation_ok={} interrogation_failed={} hinted_peers={}",
-        unique_peers,
-        interrogated.len(),
-        interrogation_ok,
-        interrogation_failed,
-        hinted_peers
+        unique_peers, interrogated, interrogation_ok, interrogation_failed, hinted_peers
     );
 
     endpoint.close().await;
@@ -235,7 +236,7 @@ fn handle_discovery_event<S: RpcService>(
             discovery_source(peer.source()),
             TransportSecurity::Untrusted,
         )
-        .map_or(true, |observation| observation.service_inserted);
+        .is_ok_and(|observation| observation.service_inserted && !observation.dropped);
     if !service_inserted {
         return;
     }
@@ -250,12 +251,18 @@ fn handle_discovery_event<S: RpcService>(
         peer.source_trust()
     );
 
-    if context.interrogate && context.interrogated.insert(peer_id) {
+    if context.interrogate {
+        let Some(permit) = context.admission.try_acquire(None) else {
+            return;
+        };
+        *context.interrogated += 1;
         println!("event=interrogate-start peer={}", peer_id);
         let registry = context.registry.clone();
         context.interrogations.spawn(async move {
             let result = interrogate_peer(registry, peer_id).await;
-            (peer_id, result)
+            // Keep occupancy until the result is drained, bounding completed
+            // tasks and their responses as well as active dials and RPCs.
+            (peer_id, result, permit)
         });
     }
 }
@@ -309,18 +316,7 @@ async fn interrogate_peer(
     .await
     {
         Ok(Ok(resp)) => {
-            let mut dedupe = HashSet::new();
-            for raw_id in resp.peer_ids {
-                match decode_endpoint_id(&raw_id) {
-                    Ok(id) if id != peer_id => {
-                        if dedupe.insert(id) {
-                            known_peers.push(id);
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(_) => invalid_known_peers += 1,
-                }
-            }
+            (known_peers, invalid_known_peers) = decode_known_peers(peer_id, resp.peer_ids);
         }
         Ok(Err(err)) => {
             known_peers_error = Some(format!("get_known_peers RPC failed: {err}"));
@@ -339,9 +335,30 @@ async fn interrogate_peer(
     })
 }
 
+fn decode_known_peers(peer_id: EndpointId, peer_ids: Vec<Vec<u8>>) -> (Vec<EndpointId>, usize) {
+    let mut known_peers = Vec::new();
+    let mut invalid = 0;
+    let mut dedupe = HashSet::new();
+    for raw_id in peer_ids.into_iter().take(MAX_KNOWN_PEERS) {
+        match decode_endpoint_id(&raw_id) {
+            Ok(id) if id != peer_id => {
+                if dedupe.insert(id) {
+                    known_peers.push(id);
+                }
+            }
+            Ok(_) => {}
+            Err(_) => invalid += 1,
+        }
+    }
+    (known_peers, invalid)
+}
+
 fn decode_endpoint_id(raw_id: &[u8]) -> anyhow::Result<EndpointId> {
     let bytes: [u8; 32] = raw_id
         .try_into()
         .map_err(|_| anyhow::anyhow!("invalid endpoint id length: {}", raw_id.len()))?;
     EndpointId::from_bytes(&bytes).context("invalid endpoint id bytes")
 }
+
+#[cfg(test)]
+mod tests;
