@@ -24,7 +24,10 @@ let
     cargo-audit
     cargo-deny
     cargo-fuzz
-    cargo-llvm-cov
+    # nixpkgs tests cargo-llvm-cov with its own rustc, whose raw profiles
+    # (format 11) its paired llvm-profdata (format 10) cannot read. At run
+    # time the tool uses our toolchain's llvm-tools-preview instead.
+    (cargo-llvm-cov.overrideAttrs { doCheck = false; })
     cargo-mutants
     cargo-nextest
     cargo-outdated
