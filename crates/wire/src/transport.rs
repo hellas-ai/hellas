@@ -271,10 +271,9 @@ pub trait Dispatcher<T: StreamTransport> {
 /// error, the other logged errors and had no cap at all.
 ///
 /// `max_in_flight` bounds concurrent dispatches, waiting for a slot rather
-/// than dropping work. Pass `None` for unbounded, which is **required** for
-/// any service exposing long-lived server-streaming calls: a cap counts open
-/// streams, so N held subscriptions would starve every subsequent call on
-/// that connection. Bound only services whose calls are all short reads.
+/// than dropping work. A service with long-lived subscriptions needs a
+/// separate, smaller subscription cap to reserve dispatch capacity for unary
+/// calls. Pass `None` only when the caller provides its own dispatch bound.
 ///
 /// `service` names the server in logs.
 ///
