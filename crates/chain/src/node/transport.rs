@@ -86,7 +86,7 @@ impl FullNode {
                             .alpns(vec![ChainSync::ALPN.as_bytes().to_vec(), Node::ALPN.as_bytes().to_vec()])
                             .bind().await.map_err(storage)?;
                         let trust = match &indexing {
-                            Indexing::Off => Trust::Genesis(Arc::new(ConsensusVerifier::new(&config.info()?).map_err(invalid)?)),
+                            Indexing::Off => Trust::Genesis(Arc::new(ConsensusVerifier::new(&config.info()?, crate::genesis_digest(&config.genesis)).map_err(invalid)?)),
                             #[cfg(feature = "indexer-api")]
                             Indexing::On { trust, genesis_json, .. } => {
                                 let supplied: hellas_genesis::Genesis = serde_json::from_slice(genesis_json).map_err(invalid)?;

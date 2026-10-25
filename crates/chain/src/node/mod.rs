@@ -87,7 +87,8 @@ impl Config {
                 .collect(),
             threshold_identity: self.threshold_identity.clone(),
         };
-        ConsensusVerifier::new(&info).map_err(|e| Error::Config(e.to_string()))?;
+        ConsensusVerifier::new(&info, crate::genesis_digest(&self.genesis))
+            .map_err(|e| Error::Config(e.to_string()))?;
         Ok(info)
     }
 }
@@ -320,6 +321,7 @@ impl Core {
         let mut application = crate::Application::new(
             context.child("app"),
             crate::domain::network_id(&config.genesis).map_err(invalid)?,
+            crate::genesis_digest(&config.genesis),
             leader,
             genesis_allocations(&config.genesis).map_err(invalid)?,
             "chain",

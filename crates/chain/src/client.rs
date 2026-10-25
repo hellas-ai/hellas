@@ -36,8 +36,12 @@ impl RemoteLightClient {
     }
 
     /// Configure this client to verify finalized snapshots.
-    pub fn with_consensus_info(mut self, info: &ConsensusInfo) -> Result<Self, QueryError> {
-        self.verifier = Some(ConsensusVerifier::new(info).map_err(QueryError::from)?);
+    pub fn with_consensus_info(
+        mut self,
+        info: &ConsensusInfo,
+        genesis: Digest,
+    ) -> Result<Self, QueryError> {
+        self.verifier = Some(ConsensusVerifier::new(info, genesis).map_err(QueryError::from)?);
         Ok(self)
     }
 

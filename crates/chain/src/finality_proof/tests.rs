@@ -19,6 +19,17 @@ fn fixture() -> (ConsensusVerifier, Vec<HellasBlock>, Vec<u8>, Vec<u8>) {
 fn fixture_with_epochs(
     cross_epoch: bool,
 ) -> (ConsensusVerifier, Vec<HellasBlock>, Vec<u8>, Vec<u8>) {
+    let (network, genesis) = if cross_epoch {
+        let document: hellas_genesis::Genesis =
+            serde_json::from_str(hellas_genesis::HELLAS_DEVNET_1_JSON).unwrap();
+        (
+            crate::domain::network_id(&document).unwrap(),
+            crate::genesis_digest(&document),
+        )
+    } else {
+        (crate::domain::TEST_NETWORK, [0; 32].into())
+    };
+    let namespace = crate::consensus_namespace(network, genesis);
     let keys = (0..4)
         .map(ed25519::PrivateKey::from_seed)
         .collect::<Vec<_>>();
@@ -34,7 +45,7 @@ fn fixture_with_epochs(
         .iter()
         .map(|key| {
             Scheme::signer(
-                crate::CONSENSUS_NAMESPACE,
+                &namespace,
                 participants.clone(),
                 output.public().clone(),
                 shares.get_value(&key.public_key()).unwrap().clone(),
@@ -42,17 +53,16 @@ fn fixture_with_epochs(
             .unwrap()
         })
         .collect::<Vec<_>>();
-    let assembler = Scheme::verifier(
-        crate::CONSENSUS_NAMESPACE,
-        participants,
-        output.public().clone(),
-    );
+    let assembler = Scheme::verifier(&namespace, participants, output.public().clone());
     let identity = assembler.identity().encode().to_vec();
-    let verifier = ConsensusVerifier::new(&crate::ConsensusInfo {
-        network_id: crate::domain::TEST_NETWORK.as_str().into(),
-        validators: Vec::new(),
-        threshold_identity: identity.clone(),
-    })
+    let verifier = ConsensusVerifier::new(
+        &crate::ConsensusInfo {
+            network_id: network.as_str().into(),
+            validators: Vec::new(),
+            threshold_identity: identity.clone(),
+        },
+        genesis,
+    )
     .unwrap();
     let genesis = HellasBlock::genesis(
         keys[0].public_key(),
@@ -64,6 +74,7 @@ fn fixture_with_epochs(
                 Location::<mmr::Family>::new(1)
             ),
         ),
+        commonware_cryptography::sha256::Digest::from([0; 32]),
     );
     let mut blocks = vec![genesis];
     for height in 1..=3 {
@@ -332,4 +343,29 @@ fn descendant_finality_persists_every_ancestor_before_advancing_follower() {
             crate::IngestOutcome::Duplicate
         );
     });
+}
+
+#[test]
+fn shared_threshold_certificates_cannot_cross_genesis_or_network() {
+    let (verifier, blocks, certificate, identity) = fixture();
+    let snapshot = snapshot(blocks.last().unwrap(), certificate);
+    verifier.verify_snapshot(&snapshot).unwrap();
+    for (network, genesis) in [
+        (crate::domain::TEST_NETWORK.as_str(), [1; 32]),
+        ("another-network", [0; 32]),
+    ] {
+        let foreign = ConsensusVerifier::new(
+            &crate::ConsensusInfo {
+                validators: Vec::new(),
+                threshold_identity: identity.clone(),
+                network_id: network.into(),
+            },
+            genesis.into(),
+        )
+        .unwrap();
+        assert!(
+            foreign.verify_snapshot(&snapshot).is_err(),
+            "foreign certificate accepted"
+        );
+    }
 }

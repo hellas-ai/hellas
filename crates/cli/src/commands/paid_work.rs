@@ -357,10 +357,15 @@ async fn inspect_chain(validators: &[String]) -> CliResult<()> {
                     "validator {url} has no finalized block 1; genesis cannot be authenticated until block 1 is finalized",
                 )
             })?;
-        ConsensusVerifier::new(&info)
-            .with_context(|| format!("validator {url} reported an unusable threshold identity"))?
-            .verify_snapshot(&first.snapshot)
-            .with_context(|| format!("validator {url} returned an unauthenticated block 1"))?;
+        ConsensusVerifier::new(
+            &info,
+            hellas_chain::genesis_digest(&serde_json::from_str(
+                hellas_chain::genesis::HELLAS_DEVNET_1_JSON,
+            )?),
+        )
+        .with_context(|| format!("validator {url} reported an unusable threshold identity"))?
+        .verify_snapshot(&first.snapshot)
+        .with_context(|| format!("validator {url} returned an unauthenticated block 1"))?;
         let first = FinalizedBlockView::decode(&first)
             .with_context(|| format!("validator {url} returned malformed finalized block 1"))?;
         anyhow::ensure!(

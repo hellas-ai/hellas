@@ -29,12 +29,20 @@ struct Fixture {
 }
 impl Fixture {
     async fn new(runtime: runtime::Context, directory: &std::path::Path) -> Self {
+        Self::new_in(runtime, directory, domain::TEST_NETWORK, 5000).await
+    }
+    async fn new_in(
+        runtime: runtime::Context,
+        directory: &std::path::Path,
+        network: hellas_kernel::NetworkId,
+        balance: u64,
+    ) -> Self {
         let committee = consensus_fixture(97521);
         let signer = hellas_kernel::Secp256k1Signer::from_secret_scalar([17; 32]).unwrap();
-        let allocations = vec![(SettlementKey::from(signer.party_key()), 5000)];
+        let allocations = vec![(SettlementKey::from(signer.party_key()), balance)];
         let genesis = hellas_genesis::Genesis {
             schema_version: 1,
-            network_id: domain::TEST_NETWORK.as_str().into(),
+            network_id: network.as_str().into(),
             validators: committee
                 .leaders
                 .iter()
@@ -53,12 +61,19 @@ impl Fixture {
                 })
                 .collect(),
         };
+        let committee = crate::execution::test_support::consensus_fixture_in(
+            97521,
+            4,
+            network,
+            crate::genesis_digest(&genesis),
+        );
         let (root, target) =
             empty_state(runtime.child("producer_genesis"), "producer", 4096, 128).await;
         let head = HellasBlock::genesis(
             committee.leaders.iter().min().unwrap().clone(),
             root,
             target,
+            crate::genesis_digest(&genesis),
         );
         let config = Config {
             genesis,
@@ -538,8 +553,13 @@ fn indexed_node_publishes_from_its_execution_database_and_reopens_pruned_state()
     use commonware_cryptography::{Hasher as _, Sha256};
     run_qmdb(|runtime| async move {
         let directory = tempfile::tempdir().unwrap();
-        let mut fixture = Fixture::new(runtime, directory.path()).await;
-        fixture.config.genesis.network_id = hellas_genesis::HELLAS_DEVNET_1_ID.into();
+        let mut fixture = Fixture::new_in(
+            runtime,
+            directory.path(),
+            hellas_kernel::NetworkId::new(hellas_genesis::HELLAS_DEVNET_1_ID).unwrap(),
+            5000,
+        )
+        .await;
         fixture.config.archive_blocks = NonZeroU64::new(1);
         let json = serde_json::to_vec(&fixture.config.genesis).unwrap();
         let trust = hellas_genesis::TrustDocument {
@@ -865,6 +885,7 @@ fn full_node_and_validator_execution_roles_share_the_same_directory() {
                 let mut app = crate::Application::new(
                     context.child("app"),
                     domain::network_id(&config.genesis).unwrap(),
+                    crate::genesis_digest(&config.genesis),
                     signer.participants().iter().min().unwrap().clone(),
                     genesis_allocations(&config.genesis).unwrap(),
                     "chain",
@@ -1086,5 +1107,107 @@ fn cancelled_bootstrap_releases_its_writer_and_resumes_the_certified_floor() {
         let _ = serving.await;
         endpoint.close().await;
         seed.shutdown().await.unwrap();
+    });
+}
+
+#[test]
+fn shared_committee_foreign_genesis_is_rejected_before_follower_execution() {
+    rejects_foreign_chain(domain::TEST_NETWORK, 5001);
+}
+
+#[test]
+fn shared_committee_foreign_network_is_rejected_before_follower_execution() {
+    rejects_foreign_chain(
+        hellas_kernel::NetworkId::new("another-chain").unwrap(),
+        5000,
+    );
+}
+
+fn rejects_foreign_chain(target_network: hellas_kernel::NetworkId, target_balance: u64) {
+    run_qmdb(|runtime| async move {
+        let directory = tempfile::tempdir().unwrap();
+        let mut source =
+            Fixture::new(runtime.child("source"), &directory.path().join("source")).await;
+        let incoming = source.next().await;
+        let (endpoint, serving) = serve_source(CorruptSource(
+            crate::server::finalized_block_response(Some(incoming.clone())),
+            None,
+            None,
+        ))
+        .await;
+        let label = "target";
+        let network = target_network;
+        let balance = target_balance;
+        {
+            let target = Fixture::new_in(
+                runtime.child(label),
+                &directory.path().join(label),
+                network,
+                balance,
+            )
+            .await;
+            assert_eq!(
+                source.config.threshold_identity,
+                target.config.threshold_identity
+            );
+            let verifier = ConsensusVerifier::new(
+                &target.config.info().unwrap(),
+                crate::genesis_digest(&target.config.genesis),
+            )
+            .unwrap();
+            let trust = Trust::Genesis(Arc::new(verifier));
+            // Exercise ChainSync's untrusted fetch, the same gate used for startup floors.
+            let client = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+                .bind()
+                .await
+                .unwrap();
+            let network = replication::Network::new(client.clone(), trust);
+            network.seed(endpoint.addr());
+            assert!(
+                network.fetch(FinalizedBlockQuery::Latest).await.is_none(),
+                "{label}: ChainSync accepted foreign history"
+            );
+            client.close().await;
+            let follower = FullNode::start(target.config).await.unwrap();
+            assert!(matches!(
+                follower.0.core.apply(incoming.clone()).await,
+                Err(Error::InvalidBlock(_))
+            ));
+            assert_eq!(follower.0.core.applied(), 0);
+            assert!(follower.0.core.readiness.running().is_ok());
+            follower.shutdown().await.unwrap();
+        }
+        serving.abort();
+        let _ = serving.await;
+        endpoint.close().await;
+    });
+}
+
+#[test]
+fn genesis_payload_pin_distinguishes_allocations_and_networks() {
+    run_qmdb(|runtime| async move {
+        let directory = tempfile::tempdir().unwrap();
+        let source = Fixture::new(runtime.child("source"), &directory.path().join("source")).await;
+        for (label, network, balance) in [
+            ("allocations", domain::TEST_NETWORK, 5001),
+            (
+                "network",
+                hellas_kernel::NetworkId::new("another-chain").unwrap(),
+                5000,
+            ),
+        ] {
+            let target = Fixture::new_in(
+                runtime.child(label),
+                &directory.path().join(label),
+                network,
+                balance,
+            )
+            .await;
+            assert_eq!(
+                source.config.threshold_identity,
+                target.config.threshold_identity
+            );
+            assert_ne!(source.config.genesis_payload, target.config.genesis_payload);
+        }
     });
 }

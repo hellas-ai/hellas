@@ -99,6 +99,7 @@ impl PaidFixture {
             .unwrap();
         let directory = self.root.path().join("genesis-probe");
         let network = self.config.chain.network;
+        let genesis_document = hellas_chain::genesis_digest(&genesis);
         let digest = tokio::task::spawn_blocking(move || {
             let runtime = commonware_runtime::tokio::Runner::new(
                 commonware_runtime::tokio::Config::new().with_storage_directory(directory),
@@ -107,6 +108,7 @@ impl PaidFixture {
                 let application = hellas_chain::Application::new(
                     context,
                     network,
+                    genesis_document,
                     leader,
                     vec![],
                     "fixture",

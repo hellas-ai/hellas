@@ -11,7 +11,7 @@
 use crate::domain::Digest;
 use crate::{
     ConsensusInfo, ConsensusVerifier, FinalizedBlock, FinalizedBlockQuery, FinalizedBlockView,
-    LatestBlock,
+    LatestBlock, genesis_digest,
 };
 use commonware_codec::{DecodeExt as _, Encode as _};
 use commonware_consensus::CertifiableBlock as _;
@@ -91,12 +91,15 @@ impl ProofVerifier {
             .epochs
             .iter()
             .map(|epoch| {
-                ConsensusVerifier::new(&ConsensusInfo {
-                    validators: Vec::new(),
-                    network_id: trust.network_id.clone(),
-                    threshold_identity: hex::decode(&epoch.threshold_identity)
-                        .expect("validated hex"),
-                })
+                ConsensusVerifier::new(
+                    &ConsensusInfo {
+                        validators: Vec::new(),
+                        network_id: trust.network_id.clone(),
+                        threshold_identity: hex::decode(&epoch.threshold_identity)
+                            .expect("validated hex"),
+                    },
+                    genesis_digest(&genesis),
+                )
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
@@ -373,6 +376,24 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn shared_threshold_proof_cannot_cross_genesis() {
+        let (source, mut bundle) = fixture();
+        let mut genesis: hellas_genesis::Genesis =
+            serde_json::from_str(HELLAS_DEVNET_1_JSON).unwrap();
+        genesis.validators[0].label = "different-generation".into();
+        let document = serde_json::to_vec(&genesis).unwrap();
+        let mut trust = source.trust.clone();
+        trust.genesis_sha256 = hex::encode(Sha256::hash(&document));
+        let target = ProofVerifier::with_genesis(trust, &document).unwrap();
+        bundle.trust_sha256 = target.trust_sha256().into();
+        assert!(
+            target
+                .verify(bundle, ProofQuery::Block(FinalizedBlockQuery::Latest))
+                .is_err()
+        );
+    }
+
     fn fixture() -> (ProofVerifier, ProofBundle) {
         fixture_at_height(1)
     }
@@ -394,7 +415,10 @@ mod tests {
             .iter()
             .map(|key| {
                 Scheme::signer(
-                    crate::CONSENSUS_NAMESPACE,
+                    &crate::consensus_namespace(
+                        hellas_kernel::NetworkId::new(HELLAS_DEVNET_1_ID).unwrap(),
+                        crate::genesis_digest(&serde_json::from_str(HELLAS_DEVNET_1_JSON).unwrap()),
+                    ),
                     participants.clone(),
                     polynomial.clone(),
                     shares.get_value(&key.public_key()).unwrap().clone(),
@@ -402,7 +426,14 @@ mod tests {
                 .unwrap()
             })
             .collect::<Vec<_>>();
-        let assembler = Scheme::verifier(crate::CONSENSUS_NAMESPACE, participants, polynomial);
+        let assembler = Scheme::verifier(
+            &crate::consensus_namespace(
+                hellas_kernel::NetworkId::new(HELLAS_DEVNET_1_ID).unwrap(),
+                crate::genesis_digest(&serde_json::from_str(HELLAS_DEVNET_1_JSON).unwrap()),
+            ),
+            participants,
+            polynomial,
+        );
         let trust = TrustDocument {
             schema_version: 1,
             network_id: HELLAS_DEVNET_1_ID.into(),

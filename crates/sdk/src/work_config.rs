@@ -120,26 +120,7 @@ impl WorkConfig {
         storage_dir: PathBuf,
         archive_blocks: Option<std::num::NonZeroU64>,
     ) -> Result<hellas_chain::node::Config> {
-        let genesis = match &self.chain.genesis {
-            Some(genesis) => genesis.clone(),
-            None => {
-                let network = hellas_chain::genesis::known_network(self.chain.network.as_str())
-                    .ok_or(WorkConfigError::Invalid {
-                        field: "chain.genesis",
-                        reason: "required for a network without a shipped genesis document",
-                    })?;
-                serde_json::from_str(network.json).map_err(|_| WorkConfigError::Invalid {
-                    field: "chain.genesis",
-                    reason: "shipped genesis document cannot be decoded",
-                })?
-            }
-        };
-        if genesis.network_id != self.chain.network.as_str() {
-            return Err(WorkConfigError::Invalid {
-                field: "chain.genesis.network_id",
-                reason: "must match chain.network_id",
-            });
-        }
+        let genesis = chain_genesis(self.chain.network, &self.chain.genesis)?;
         Ok(hellas_chain::node::Config {
             genesis,
             threshold_identity: self.chain.threshold_identity.clone(),
@@ -292,6 +273,34 @@ struct WorkConfigFile {
     min_omit_response_blocks: u64,
 }
 
+fn chain_genesis(
+    network: NetworkId,
+    genesis: &Option<hellas_chain::genesis::Genesis>,
+) -> Result<hellas_chain::genesis::Genesis> {
+    let genesis = match genesis {
+        Some(genesis) => genesis.clone(),
+        None => {
+            let network = hellas_chain::genesis::known_network(network.as_str()).ok_or(
+                WorkConfigError::Invalid {
+                    field: "chain.genesis",
+                    reason: "required for a network without a shipped genesis document",
+                },
+            )?;
+            serde_json::from_str(network.json).map_err(|_| WorkConfigError::Invalid {
+                field: "chain.genesis",
+                reason: "shipped genesis document cannot be decoded",
+            })?
+        }
+    };
+    if genesis.network_id != network.as_str() {
+        return Err(WorkConfigError::Invalid {
+            field: "chain.genesis.network_id",
+            reason: "must match chain.network_id",
+        });
+    }
+    Ok(genesis)
+}
+
 fn default_observation_age_ms() -> u64 {
     5_000
 }
@@ -312,11 +321,14 @@ impl WorkConfigFile {
         // The same constructor consensus verification uses. A threshold
         // identity that cannot be decoded here is one no finalized block
         // would ever verify under, and the node says so before it serves.
-        hellas_chain::ConsensusVerifier::new(&hellas_chain::light_client::ConsensusInfo {
-            validators: validators.clone(),
-            threshold_identity: threshold_identity.clone(),
-            network_id: network.as_str().to_owned(),
-        })?;
+        hellas_chain::ConsensusVerifier::new(
+            &hellas_chain::light_client::ConsensusInfo {
+                validators: validators.clone(),
+                threshold_identity: threshold_identity.clone(),
+                network_id: network.as_str().to_owned(),
+            },
+            hellas_chain::genesis_digest(&chain_genesis(network, &self.chain.genesis)?),
+        )?;
 
         let journal_root = self.journal.into_root()?;
         let routes = WorkRoutes::from_files(self.routes)?;

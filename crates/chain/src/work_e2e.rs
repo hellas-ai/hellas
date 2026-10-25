@@ -475,7 +475,8 @@ impl Devnet {
         Box::pin(async move {
             // Full nodes use live peer discovery; each devnet needs its own committee
             // so concurrent tests cannot accept one another's certified blocks.
-            let fixture = consensus_fixture_of(rand::random(), VALIDATORS);
+            let seed = rand::random();
+            let fixture = consensus_fixture_of(seed, VALIDATORS);
             let mut allocations = Allocations {
                 coins: Vec::new(),
                 owners,
@@ -499,6 +500,12 @@ impl Devnet {
                 2,
                 "genesis funds exactly the two parties",
             );
+            let fixture = crate::execution::test_support::consensus_fixture_in(
+                seed,
+                VALIDATORS,
+                network,
+                crate::genesis_digest(&document),
+            );
             let consensus_info = ConsensusInfo {
                 validators: fixture
                     .leaders
@@ -517,8 +524,12 @@ impl Devnet {
                 8,
             )
             .await;
-            let genesis =
-                HellasBlock::genesis(fixture.leaders.iter().min().unwrap().clone(), root, target);
+            let genesis = HellasBlock::genesis(
+                fixture.leaders.iter().min().unwrap().clone(),
+                root,
+                target,
+                crate::genesis_digest(&document),
+            );
             let mut nodes = Vec::new();
             for (ordinal, label) in NODE_LABELS.iter().enumerate().take(VALIDATORS as usize) {
                 let partition = format!("{name}_{ordinal}");

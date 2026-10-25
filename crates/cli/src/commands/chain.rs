@@ -367,8 +367,8 @@ async fn run_owner_coins(
 ) -> CliResult {
     let owner = passkey(passkey_path.context("chain delegate/sweep requires --passkey")?)?;
     let selected = parse_coin_ids::<MAX_EDGE_INPUTS>(&args.coins, "coin")?;
-    let network = selected_network(&args.network, args.genesis)?;
-    let client = connect_verified(args.rpc).await?;
+    let network = selected_network(&args.network, args.genesis.clone())?;
+    let client = connect_verified(args.rpc, args.genesis.as_deref()).await?;
     let plan = hellas_sdk::coin_owner::OwnerReshape::prepare(
         &client,
         network,
@@ -395,7 +395,7 @@ async fn run_owner_coins(
 }
 
 async fn run_query(rpc: String, query: QueryCommand) -> CliResult {
-    let client = connect_verified(rpc).await?;
+    let client = connect_verified(rpc, None).await?;
     match query {
         QueryCommand::LatestBlock => match client.get_latest_block().await? {
             Some(block) => {
@@ -541,8 +541,8 @@ async fn run_open(args: OpenArgs) -> CliResult {
         timeout_outputs,
     );
     let edge_id = Tx::edge_id_of(&funding, &terms);
-    let network = selected_network(&args.network, args.genesis)?;
-    let client = connect_verified(args.rpc).await?;
+    let network = selected_network(&args.network, args.genesis.clone())?;
+    let client = connect_verified(args.rpc, args.genesis.as_deref()).await?;
     let network = confirm_network(network, &client).await?;
     let open_hash = Tx::open_hash(network, &funding, &terms);
     let tx = Tx::open(
@@ -571,8 +571,8 @@ async fn run_open(args: OpenArgs) -> CliResult {
 async fn run_close(args: CloseArgs) -> CliResult {
     let edge_id = parse_edge_id(&args.edge_id)?;
     let outputs = parse_payouts(&args.payouts, "payout")?;
-    let network = selected_network(&args.network, args.genesis)?;
-    let client = connect_verified(args.rpc).await?;
+    let network = selected_network(&args.network, args.genesis.clone())?;
+    let client = connect_verified(args.rpc, args.genesis.as_deref()).await?;
     let network = confirm_network(network, &client).await?;
     let edge = get_live_edge(&client, edge_id).await?;
 
@@ -636,10 +636,17 @@ async fn run_close(args: CloseArgs) -> CliResult {
     Ok(())
 }
 
-async fn connect_verified(rpc: String) -> CliResult<RemoteLightClient> {
+async fn connect_verified(rpc: String, genesis: Option<&Path>) -> CliResult<RemoteLightClient> {
+    let document = match genesis {
+        Some(path) => fs::read(path)?,
+        None => hellas_chain::genesis::HELLAS_DEVNET_1_JSON
+            .as_bytes()
+            .to_vec(),
+    };
+    let genesis: Genesis = serde_json::from_slice(&document)?;
     let client = RemoteLightClient::connect(rpc).await?;
     let consensus_info = client.get_consensus_info().await?;
-    Ok(client.with_consensus_info(&consensus_info)?)
+    Ok(client.with_consensus_info(&consensus_info, hellas_chain::genesis_digest(&genesis))?)
 }
 
 /// Resolves the network to sign for, and refuses if the node on the

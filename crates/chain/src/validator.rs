@@ -49,7 +49,6 @@ use std::{
 use thiserror::Error;
 use tracing::{info, warn};
 
-const NAMESPACE: &[u8] = b"hellas";
 const MAX_MESSAGE_SIZE: u32 = 1024 * 1024;
 const CHANNEL_BACKLOG: usize = 1024;
 /// How long a validator with empty state waits for peers to offer a floor.
@@ -770,7 +769,7 @@ pub fn export_trust(
         ));
     }
     let scheme = Scheme::signer(
-        NAMESPACE,
+        &crate::consensus_namespace(config.network_id()?, crate::genesis_digest(&config.genesis)),
         config.participants()?,
         config.decode_threshold_polynomial()?,
         config.decode_threshold_share()?,
@@ -841,9 +840,12 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
 
     let listen_addr: SocketAddr = format!("0.0.0.0:{}", validator_config.listen_port).parse()?;
 
+    let genesis_digest = crate::genesis_digest(&validator_config.genesis);
+    let namespace = crate::consensus_namespace(network_id, genesis_digest);
+
     // Build consensus scheme
     let scheme = match Scheme::signer(
-        NAMESPACE,
+        &namespace,
         participants,
         threshold_polynomial,
         threshold_share,
@@ -895,7 +897,7 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
         }
 
         // Create lookup-based p2p network
-        let p2p_cfg = lookup::Config::local(private_key, NAMESPACE, listen_addr, MAX_MESSAGE_SIZE);
+        let p2p_cfg = lookup::Config::local(private_key, &namespace, listen_addr, MAX_MESSAGE_SIZE);
         let (mut network, mut oracle) = lookup::Network::new(context.child("network"), p2p_cfg);
 
         // Register all validators with the oracle, then allow address refreshes
@@ -953,6 +955,7 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
         let mut application = Application::new(
             context.child("app"),
             network_id,
+            crate::genesis_digest(&validator_config.genesis),
             genesis_leader,
             genesis_allocations.clone(),
             &partition_prefix,
@@ -979,7 +982,8 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
         )
         .await;
         let trust = crate::node::Trust::Genesis(std::sync::Arc::new(
-            crate::ConsensusVerifier::new(&consensus_info).expect("provisioned consensus identity"),
+            crate::ConsensusVerifier::new(&consensus_info, genesis_digest)
+                .expect("provisioned consensus identity"),
         ));
         let (probe, probe_mailbox) = Probe::new(ProbeConfig {
             context: context.child("probe"),
@@ -1184,7 +1188,8 @@ fn run(config_path: PathBuf) -> Result<(), ValidatorError> {
             iroh::SecretKey::from_bytes(&peer_key),
             validator_config.chain_sync_bind,
             databases.clone(),
-            crate::ConsensusVerifier::new(&consensus_info).expect("provisioned consensus identity"),
+            crate::ConsensusVerifier::new(&consensus_info, genesis_digest)
+                .expect("provisioned consensus identity"),
         ));
         let light_client_rpc_state = LightClientRpcState::default();
         let light_client_server_handle = if let Some(addr) = validator_config.light_client_bind {

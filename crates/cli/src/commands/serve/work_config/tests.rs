@@ -75,7 +75,7 @@ const THRESHOLD_IDENTITY: [u8; 48] = [
 fn config() -> serde_json::Value {
     serde_json::json!({
         "chain": {
-            "network_id": "hellas-devnet",
+            "network_id": "hellas-devnet-1",
             "genesis_payload_digest": hex32(0x01),
             "threshold_identity": threshold_identity(),
         },
@@ -151,7 +151,7 @@ fn with(mut value: serde_json::Value, field: &str, entry: serde_json::Value) -> 
 fn a_work_config_round_trips_from_a_file() {
     let loaded = load(config()).expect("the fixture config loads");
 
-    assert_eq!(loaded.chain.network.as_str(), "hellas-devnet");
+    assert_eq!(loaded.chain.network.as_str(), "hellas-devnet-1");
     assert_eq!(
         loaded.chain.genesis_payload_digest,
         Digest::from_bytes([0x01; 32]),
@@ -421,7 +421,7 @@ fn a_threshold_identity_consensus_cannot_decode_is_refused() {
     let mut broken = THRESHOLD_IDENTITY.to_vec();
     broken.truncate(32);
     let chain = serde_json::json!({
-        "network_id": "hellas-devnet",
+        "network_id": "hellas-devnet-1",
         "genesis_payload_digest": hex32(0x01),
         "threshold_identity": hex::encode(&broken),
     });
@@ -461,7 +461,7 @@ const PAYMENT_VALUE: u64 = 1_000;
 const PAYMENT_RESERVE: u64 = 200;
 
 fn network() -> NetworkId {
-    let Some(network) = NetworkId::new("hellas-devnet") else {
+    let Some(network) = NetworkId::new("hellas-devnet-1") else {
         panic!("the fixture configuration's network id is one");
     };
     network

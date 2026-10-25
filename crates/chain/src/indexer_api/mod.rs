@@ -85,7 +85,8 @@ pub fn run(options: OriginOptions) -> OriginResult<()> {
             128,
         )
         .await;
-        let genesis_block = crate::HellasBlock::genesis(leader, root, target);
+        let genesis_block =
+            crate::HellasBlock::genesis(leader, root, target, crate::genesis_digest(&genesis));
         let node = crate::node::FullNode::start_indexed(
             crate::node::Config {
                 genesis: genesis.clone(),

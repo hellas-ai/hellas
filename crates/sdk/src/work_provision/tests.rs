@@ -12,7 +12,7 @@ use super::*;
 use crate::work_config::load_work_config;
 
 fn network() -> NetworkId {
-    let Some(network) = NetworkId::new("hellas-devnet") else {
+    let Some(network) = NetworkId::new("hellas-devnet-1") else {
         panic!("the fixture network id is one");
     };
     network

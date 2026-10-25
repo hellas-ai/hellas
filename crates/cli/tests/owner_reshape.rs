@@ -146,7 +146,9 @@ async fn owner_prepare_and_cli_delegate_sweep_execute_on_a_real_validator() {
             if let Ok(client) = RemoteLightClient::connect(rpc.clone()).await
                 && let Ok(info) = client.get_consensus_info().await
             {
-                break client.with_consensus_info(&info).unwrap();
+                break client
+                    .with_consensus_info(&info, hellas_chain::genesis_digest(&config.genesis))
+                    .unwrap();
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }

@@ -243,6 +243,7 @@ impl Application {
     pub async fn new<E>(
         context: E,
         network: NetworkId,
+        genesis_digest: Digest,
         genesis_leader: PublicKey,
         genesis_allocations: Vec<(SettlementKey, u64)>,
         partition_prefix: &str,
@@ -264,7 +265,7 @@ impl Application {
             config.page_cache_count,
         )
         .await;
-        let genesis = HellasBlock::genesis(genesis_leader, state_root, sync_target);
+        let genesis = HellasBlock::genesis(genesis_leader, state_root, sync_target, genesis_digest);
         let owner_index = OwnerIndex::new(network, &genesis, genesis_allocations.clone());
         Self {
             #[cfg(feature = "full-node")]
@@ -805,6 +806,7 @@ mod tests {
             let mut app = Application::new(
                 runtime.child("app"),
                 crate::domain::TEST_NETWORK,
+                commonware_cryptography::sha256::Digest::from([0; 32]),
                 validator_key(0).public_key(),
                 fixture.allocations,
                 "publication_app",
@@ -879,6 +881,7 @@ mod tests {
             let mut app = Application::new(
                 runtime.child("app"),
                 crate::domain::TEST_NETWORK,
+                commonware_cryptography::sha256::Digest::from([0; 32]),
                 validator_key(0).public_key(),
                 fixture.allocations.clone(),
                 "abandoned_proposal_app",
@@ -988,6 +991,7 @@ mod tests {
             let mut app = Application::new(
                 runtime.child("app"),
                 crate::domain::TEST_NETWORK,
+                commonware_cryptography::sha256::Digest::from([0; 32]),
                 validator_key(0).public_key(),
                 fixture.allocations.clone(),
                 "context_boundary_app",

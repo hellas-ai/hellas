@@ -57,7 +57,7 @@ mod work_e2e;
 pub mod work_view;
 
 #[cfg(any(feature = "client-core", feature = "indexer", feature = "validator"))]
-pub const CONSENSUS_NAMESPACE: &[u8] = b"hellas";
+pub use consensus::{consensus_namespace, genesis_digest};
 
 #[cfg(any(feature = "indexer", feature = "validator"))]
 pub use app::{ActivityReporter, Application, ApplicationConfig};
