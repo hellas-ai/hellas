@@ -34,23 +34,25 @@ hellas store fetch --id <64 hex> --repo org/name --out PATH
 ```
 
 `adopt` is a read, not a copy: the store points at the files where they
-already lie. Cost is one read per blob — and one read *ever* per
-unchanged blob, because the result is persisted.
-
-Measured on a real 29-blob cache: **647 ms cold, 549 µs warm.**
+already lie. Cost is one read per blob. Later scans and restarts reuse
+hashes while the file identity remains unchanged and the persisted index
+stays inside the user-private state boundary.
 
 ## Persisting hashing work
 
 `adopt` writes `fastresume.bin` under `$HOME/.hellas/store` — or
 `$HELLAS_STORE_DIR`, and never inside the HuggingFace cache, which is not
 ours. The record contains the file identity, content id, and chunk list
-from earlier hashing work, so a later run can skip files that are still
-unchanged.
+from earlier hashing work, so a later run can skip unchanged files.
 
 The record is a cache of work, not a registry of cache roots and not a
-source of truth. Every entry is checked against the live file's identity
-before it is reused. Presence is still a `stat`, and integrity is still a
-hash.
+source of truth. It is trusted private state: loading requires an ordinary
+file owned by the effective user with no group/other permissions, opened
+without following a final symlink. Its parent must be owned by that user,
+not a symlink, and not group/other writable. The parent and its ancestors
+must remain stable and trusted. Non-private indexes are ignored, so their
+files are re-hashed. Accepted records are still checked against the live
+content file's identity before reuse.
 
 ## Indexing produces two things, and the second is the valuable one
 

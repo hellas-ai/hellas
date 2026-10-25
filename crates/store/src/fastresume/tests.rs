@@ -29,6 +29,120 @@ fn one_record(marker: u8) -> Records {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn forged_persisted_identity_cannot_supply_content_or_chunks() {
+    let directory = tempfile::tempdir().expect("fixture directory");
+    let path = directory.path().join("content");
+    let index = directory.path().join("index");
+    let bytes = b"actual file bytes";
+    std::fs::write(&path, bytes).expect("write content");
+    let metadata = std::fs::metadata(&path).expect("stat content");
+    let forged = Indexed {
+        id: XetHash::from_bytes([99; 32]),
+        chunks: Vec::new(),
+        len: metadata.len(),
+    };
+    let records = Records::default();
+    records.put(&metadata, &forged);
+    records.save(&index).expect("save forged index");
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(&index, std::fs::Permissions::from_mode(0o660))
+        .expect("make forged index group-writable");
+
+    let store = crate::ContentStore::new();
+    let loaded = store.records().load(&index);
+    let indexed = store.index(&path).expect("index content");
+    assert_eq!(indexed.id, XetHash::hash(bytes));
+    assert_eq!(loaded, 0);
+    assert_ne!(indexed.chunks, forged.chunks);
+    assert!(!store.have(forged.id));
+    assert!(
+        store
+            .open_verified(forged.id, forged.len)
+            .expect("lookup")
+            .is_none()
+    );
+
+    // A later import must not replace the verified in-process result.
+    assert_eq!(store.records().load(&index), 0);
+    assert_eq!(
+        store.records().get(&metadata).expect("verified record").id,
+        indexed.id
+    );
+    assert_eq!(
+        store.index(&path).expect("reuse verified record").id,
+        indexed.id
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn private_persisted_index_skips_rehashing_after_restart() {
+    let directory = tempfile::tempdir().expect("fixture directory");
+    let path = directory.path().join("weights");
+    let index = directory.path().join("index");
+    std::fs::write(&path, b"unchanged model weights").expect("write content");
+    let store = crate::ContentStore::new();
+    let indexed = store.index(&path).expect("initial hash");
+    store.records().save(&index).expect("save private index");
+    drop(store);
+
+    let restarted = crate::ContentStore::new();
+    assert_eq!(restarted.records().load(&index), 1);
+    let before = crate::HASH_CALLS.with(std::cell::Cell::get);
+    let remembered = restarted.index(&path).expect("index after restart");
+    assert_eq!(remembered.id, indexed.id);
+    assert_eq!(remembered.chunks, indexed.chunks);
+    assert_eq!(remembered.len, indexed.len);
+    assert_eq!(
+        crate::HASH_CALLS.with(std::cell::Cell::get),
+        before,
+        "private fast-resume must not hash file bytes again"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn persisted_index_rejects_public_modes_symlinks_and_writable_parents() {
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+    let directory = tempfile::tempdir().expect("fixture directory");
+    let parent = directory.path().join("state");
+    let index = parent.join("index");
+    one_record(1).save(&index).expect("save private index");
+    assert_eq!(Records::default().load(&index), 1);
+    for mode in [0o640, 0o660, 0o604, 0o606] {
+        std::fs::set_permissions(&index, std::fs::Permissions::from_mode(mode)).unwrap();
+        assert_eq!(Records::default().load(&index), 0, "accepted mode {mode:o}");
+    }
+    std::fs::set_permissions(&index, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let link = parent.join("linked-index");
+    symlink(&index, &link).unwrap();
+    assert_eq!(Records::default().load(&link), 0, "followed index symlink");
+    let linked_parent = directory.path().join("linked-state");
+    symlink(&parent, &linked_parent).unwrap();
+    assert_eq!(
+        Records::default().load(&linked_parent.join("index")),
+        0,
+        "followed parent symlink"
+    );
+    for mode in [0o770, 0o707] {
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(mode)).unwrap();
+        assert_eq!(
+            Records::default().load(&index),
+            0,
+            "accepted parent mode {mode:o}"
+        );
+    }
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(
+        Records::default().load(&index),
+        1,
+        "a non-writable parent may be readable"
+    );
+}
+
 #[test]
 fn debris_is_recognised_and_real_files_are_not() {
     assert!(is_cache_debris(Path::new("/c/blobs/abc.lock")));
@@ -44,16 +158,17 @@ fn debris_is_recognised_and_real_files_are_not() {
 fn oversized_persisted_index_is_rejected_without_reading_its_body() {
     let path = test_path("oversized-index");
     std::fs::create_dir_all(path.parent().expect("fixture parent")).expect("create fixture parent");
-    let file = std::fs::File::create(&path).expect("create sparse oversized index");
-    file.set_len(
-        u64::try_from(MAX_FASTRESUME_INDEX_BYTES)
-            .unwrap()
-            .saturating_add(1),
-    )
-    .expect("size sparse oversized index");
+    let file = hellas_private::private_tempfile(path.parent().unwrap(), "oversized-index", ".bin")
+        .expect("create private sparse oversized index");
+    file.as_file()
+        .set_len(
+            u64::try_from(MAX_FASTRESUME_INDEX_BYTES)
+                .unwrap()
+                .saturating_add(1),
+        )
+        .expect("size sparse oversized index");
 
-    assert_eq!(Records::default().load(&path), 0);
-    std::fs::remove_file(path).expect("remove oversized fixture");
+    assert_eq!(Records::default().load(file.path()), 0);
 }
 
 #[cfg(unix)]
@@ -151,7 +266,10 @@ fn concurrent_saves_publish_only_complete_parseable_indexes() {
         let bytes = std::fs::read(&path).expect("read published index");
         assert_eq!(parse(&bytes).expect("published index parses").len(), 1);
     }
-    assert_eq!(Records::default().load(&path), 1);
+    assert_eq!(
+        Records::default().load(&path),
+        usize::from(FileIdentity::REMEMBERS)
+    );
 
     let final_name = path.file_name().expect("final file name").to_string_lossy();
     let temporary_prefix = format!(".{final_name}.");

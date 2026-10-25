@@ -46,26 +46,28 @@
 //!
 //! # Persistence
 //!
-//! Records survive restarts via [`load`] and [`save`], because a store
-//! that re-hashes a 1.5 TB cache every boot is a store nobody will
-//! adopt. The file format carries a magic and a version, and anything
+//! Records survive restarts via [`Records::load`] and [`Records::save`].
+//! Re-hashing a large cache every boot would make routine starts expensive.
+//! The file format carries a magic and a version, and anything
 //! it does not recognise is discarded rather than guessed at — a
 //! misparsed record is a wrong content id, which is the one failure
 //! this module exists to prevent.
 //!
-//! Loading is not trusting: a loaded record is still checked against the
-//! live file's identity before it is used, exactly as an in-process one
-//! is. The file is a cache of work, never a source of truth.
+//! Persisted records are trusted user-private state: loading requires an
+//! owner-only regular file, no final symlink, and a user-owned parent
+//! directory that other users cannot write. As with other state paths,
+//! the parent and its ancestors must remain stable and trusted. Loaded
+//! records are still checked against the live content file's identity.
+//! An index outside this boundary is ignored and its files are re-hashed.
 
 use std::collections::HashMap;
 use std::fs::Metadata;
-use std::io::Read;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::sync::Mutex;
 
-use crate::{Indexed, open_regular_file};
+use crate::Indexed;
 use hellas_xet::{Chunk, XetHash};
 
 /// What a file must still look like for its recorded hash to be reused.
@@ -160,7 +162,7 @@ impl Records {
     /// The chunk list is stored, not just the id: re-deriving the id
     /// costs a full read, and the chunk list is what a later partial
     /// fetch needs to be verifiable.
-    pub fn put(&self, metadata: &Metadata, indexed: &Indexed) {
+    pub(crate) fn put(&self, metadata: &Metadata, indexed: &Indexed) {
         if !FileIdentity::REMEMBERS {
             return;
         }
@@ -312,37 +314,55 @@ fn create_durable_parent(path: &Path) -> std::io::Result<()> {
 /// The cost of ignoring a cache is a re-hash; the cost of misreading one
 /// is a wrong content id.
 impl Records {
-    /// Reads records from `path`, returning how many were adopted.
+    /// Reads user-private records from `path`, returning how many were parsed.
+    /// Non-private files, final symlinks, and untrusted parents yield zero.
     #[must_use]
     pub fn load(&self, path: &Path) -> usize {
-        let Ok(file) = open_regular_file(path) else {
+        if !FileIdentity::REMEMBERS {
+            return 0;
+        }
+        #[cfg(unix)]
+        {
+            let parent = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            let Ok(directory) = hellas_private::unix::open_owned_directory(parent) else {
+                return 0;
+            };
+            let Ok(metadata) = directory.metadata() else {
+                return 0;
+            };
+            // A private file can be replaced through a writable parent.
+            if metadata.mode() & 0o022 != 0 {
+                return 0;
+            }
+        }
+        let Ok(file) = hellas_private::open_regular_file_nofollow(path) else {
             return 0;
         };
         let Ok(metadata) = file.metadata() else {
             return 0;
         };
-        let max_bytes = u64::try_from(MAX_FASTRESUME_INDEX_BYTES).unwrap_or(u64::MAX);
-        if metadata.len() > max_bytes {
+        let Ok(length) = usize::try_from(metadata.len()) else {
+            return 0;
+        };
+        if length > MAX_FASTRESUME_INDEX_BYTES {
             return 0;
         }
-        // The descriptor can grow after metadata inspection. Read one byte
-        // beyond the limit so that race is rejected rather than truncated
-        // into a different valid-looking index.
-        let mut bytes = Vec::new();
-        if file
-            .take(max_bytes.saturating_add(1))
-            .read_to_end(&mut bytes)
-            .is_err()
-            || bytes.len() > MAX_FASTRESUME_INDEX_BYTES
-        {
+        // Bound allocation to this descriptor's size, not the 1 GiB ceiling;
+        // growth during the read is rejected by the shared private reader.
+        let Ok(bytes) = hellas_private::read_private_bounded(file, length) else {
             return 0;
-        }
+        };
         let Some(parsed) = parse(&bytes) else {
             return 0;
         };
         let count = parsed.len();
         if let Ok(mut entries) = self.entries.lock() {
-            entries.extend(parsed);
+            for (identity, indexed) in parsed {
+                entries.entry(identity).or_insert(indexed);
+            }
         }
         count
     }
