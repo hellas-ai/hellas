@@ -163,7 +163,6 @@ fn router(state: OriginState) -> Router {
         .route("/api/v1/edges/{edge_id}/events", get(edge_index_http))
         .route("/api/v1/edges/{edge_id}/evidence", get(edge_index_http))
         .route("/api/v1/channels/{payment_edge_id}", get(edge_index_http))
-        .route("/api/v1/edge-index/rpc", get(edge_index_ws))
         .route("/api/v1/blocks/{selector}", get(block))
         .route("/api/v1/blocks/{selector}/proof", get(block))
         .route("/api/v1/blocks/by-payload/{payload}", get(payload))
@@ -171,12 +170,55 @@ fn router(state: OriginState) -> Router {
         .route("/api/v1/transactions/{digest}/proof", get(transaction))
         .route("/api/v1/addresses/{owner}/proof", get(address))
         .route("/api/v1/addresses/{owner}", get(address))
+        .layer(axum::middleware::from_fn(local_http_request))
+        .route("/api/v1/edge-index/rpc", get(edge_index_ws))
         .with_state(state);
     #[cfg(feature = "otel")]
     let router = router.layer(axum::middleware::from_fn(
         hellas_rpc::telemetry::http::trace_request,
     ));
     router
+}
+
+// Fetch Metadata covers no-cors GETs, which need not carry Origin. Checking
+// the authority also rejects DNS rebinding before any query acquires a permit.
+async fn local_http_request(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let headers = request.headers();
+    let foreign = headers.contains_key(header::ORIGIN)
+        || headers
+            .get_all("sec-fetch-site")
+            .iter()
+            .any(|site| site != "same-origin" && site != "none")
+        || headers.get_all(header::HOST).iter().any(|host| {
+            host.to_str()
+                .ok()
+                .is_none_or(|host| !loopback_authority(host))
+        })
+        || request
+            .uri()
+            .authority()
+            .is_some_and(|authority| !loopback_authority(authority.as_str()));
+    if foreign {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    next.run(request).await
+}
+
+fn loopback_authority(value: &str) -> bool {
+    value
+        .parse::<axum::http::uri::Authority>()
+        .ok()
+        .is_some_and(|authority| {
+            let host = authority.host();
+            host.eq_ignore_ascii_case("localhost")
+                || host
+                    .trim_matches(['[', ']'])
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        })
 }
 
 async fn edge_index_http(
@@ -575,6 +617,68 @@ mod tests {
             socket.close(None).await.unwrap();
             serving.abort();
             let _ = serving.await;
+        });
+    }
+
+    #[test]
+    fn cross_site_simple_gets_cannot_enter_the_shared_query_pool() {
+        crate::execution::test_support::run_qmdb(|context| async move {
+            let (app, _archive) = published_router(context).await;
+            // Real no-cors GETs can omit Origin. Their browser-generated Fetch
+            // Metadata must be checked before reaching EdgeIndex admission.
+            for site in ["cross-site", "same-site"] {
+                let mut attempts = ::tokio::task::JoinSet::new();
+                for _ in 0..32 {
+                    let app = app.clone();
+                    attempts.spawn(async move {
+                        app.oneshot(
+                            axum::http::Request::builder()
+                                .uri("/api/v1/edges")
+                                .header(header::HOST, "127.0.0.1:8788")
+                                .header("sec-fetch-site", site)
+                                .header("sec-fetch-mode", "no-cors")
+                                .body(axum::body::Body::empty())
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap()
+                    });
+                }
+                while let Some(response) = attempts.join_next().await {
+                    assert_eq!(response.unwrap().status(), StatusCode::FORBIDDEN);
+                }
+            }
+            for (name, value) in [
+                (header::ORIGIN.as_str(), "https://attacker.example"),
+                (header::HOST.as_str(), "rebinding.attacker.example:8788"),
+            ] {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        axum::http::Request::builder()
+                            .uri("/api/v1/edges")
+                            .header(name, value)
+                            .body(axum::body::Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            }
+            for site in [None, Some("same-origin")] {
+                let mut request = axum::http::Request::builder()
+                    .uri("/api/v1/edges")
+                    .header(header::HOST, "localhost:8788");
+                if let Some(site) = site {
+                    request = request.header("sec-fetch-site", site);
+                }
+                let response = app
+                    .clone()
+                    .oneshot(request.body(axum::body::Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+            }
         });
     }
 
