@@ -426,13 +426,14 @@ fn require_finalized_floor(floor_height: u64, cursor_height: u64) -> Result<(), 
     Ok(())
 }
 
-/// Bound publication waits, including lock acquisition, without pinning the
-/// database against the writer that must complete publication.
-const PUBLICATION_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
-
+/// The finalized block whose state `reader` holds. Glue commits a finalized
+/// block, then calls `App::finalized`, which publishes its owner cursor, and
+/// commits nothing else until that returns. Under the read guard the state is
+/// therefore the published cursor's block or the next finalized block.
 async fn coherent_reader<'a>(
     databases: &'a UtxoDatabase<commonware_runtime::tokio::Context>,
     owner_index: &OwnerIndex,
+    chain_indexer: &ChainIndexer,
 ) -> Result<
     (
         commonware_glue::stateful::db::ReadGuard<'a, UtxoDb<commonware_runtime::tokio::Context>>,
@@ -440,24 +441,29 @@ async fn coherent_reader<'a>(
     ),
     QueryError,
 > {
-    tokio::time::timeout(PUBLICATION_WAIT, async {
-        loop {
-            // Register before sampling either value so publication cannot be
-            // lost between discovering a mismatch and starting to wait.
-            let published = owner_index.published();
-            tokio::pin!(published);
-            published.as_mut().enable();
-            let reader = databases.read().await;
-            let cursor = owner_index.cursor();
-            if reader.root() == cursor.state_root {
-                return (reader, cursor);
-            }
-            drop(reader);
-            published.await;
-        }
-    })
-    .await
-    .map_err(|_| QueryError::StateUnavailable("finalized state publication timed out".into()))
+    let reader = databases.read().await;
+    let cursor = owner_index.cursor();
+    if reader.root() == cursor.state_root {
+        return Ok((reader, cursor));
+    }
+    // Marshal reports blocks without awaiting the application, so this lookup
+    // cannot wait on the commit that the read guard holds back.
+    let next = chain_indexer
+        .get_finalized_block(FinalizedBlockQuery::Height(cursor.height.saturating_add(1)))
+        .await?
+        .map(|block| block.snapshot)
+        .filter(|next| next.state_root == reader.root())
+        .ok_or_else(|| {
+            QueryError::StateUnavailable("database state is not a finalized block".into())
+        })?;
+    Ok((
+        reader,
+        OwnerCursor {
+            height: next.height,
+            payload: next.payload,
+            state_root: next.state_root,
+        },
+    ))
 }
 
 async fn get_edge_at(
@@ -473,7 +479,7 @@ async fn get_edge_at(
     }
     let floor_height = finalized_floor_height(chain_indexer, payload).await?;
 
-    let (reader, cursor) = coherent_reader(databases, owner_index).await?;
+    let (reader, cursor) = coherent_reader(databases, owner_index, chain_indexer).await?;
     let state_root = reader.root();
     require_finalized_floor(floor_height, cursor.height)?;
     let edge = match reader
@@ -522,11 +528,9 @@ async fn get_coin_at(
 /// live, and a coin read at any other state is a premise about a state
 /// the decision is not being made at.
 ///
-/// The state the reader holds is the state the owner index has applied
-/// up to, so the finalized block reported beside the objects is that
-/// index's cursor. During publication, wait without holding the reader until
-/// the cursor catches up, bounded by PUBLICATION_WAIT. A snapshot is never
-/// reported at a block it was not read at.
+/// The finalized block reported beside the objects is the block whose state
+/// the reader holds, so a snapshot is never reported at a block it was not
+/// read at.
 async fn work_channel_snapshot_at(
     databases: &UtxoDatabase<commonware_runtime::tokio::Context>,
     owner_index: &OwnerIndex,
@@ -537,7 +541,7 @@ async fn work_channel_snapshot_at(
     if owner_index.cursor().height == 0 {
         return Ok(None);
     }
-    let (reader, cursor) = coherent_reader(databases, owner_index).await?;
+    let (reader, cursor) = coherent_reader(databases, owner_index, chain_indexer).await?;
     let state_root = reader.root();
     let Some(finalization) = chain_indexer.get_finalization(cursor.payload).await? else {
         return Err(QueryError::StateUnavailable(
@@ -677,7 +681,8 @@ impl LightClient for LocalLightClient {
     ) -> Result<Option<Coin>, QueryError> {
         self.require_ready()?;
         let floor = finalized_floor_height(&self.chain_indexer, payload).await?;
-        let (reader, cursor) = coherent_reader(&self.databases, &self.owner_index).await?;
+        let (reader, cursor) =
+            coherent_reader(&self.databases, &self.owner_index, &self.chain_indexer).await?;
         require_finalized_floor(floor, cursor.height)?;
         match reader
             .get(&object_id)
@@ -878,7 +883,8 @@ impl LocalLightClient {
         if self.owner_index.cursor().height == 0 {
             return Ok((None, vec![]));
         }
-        let (reader, cursor) = coherent_reader(&self.databases, &self.owner_index).await?;
+        let (reader, cursor) =
+            coherent_reader(&self.databases, &self.owner_index, &self.chain_indexer).await?;
         let finalization = self
             .chain_indexer
             .get_finalization(cursor.payload)

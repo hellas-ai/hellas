@@ -74,7 +74,6 @@ pub enum OwnerIndexError {
 #[derive(Clone)]
 pub struct OwnerIndex {
     inner: Arc<RwLock<State>>,
-    published: Arc<tokio::sync::Notify>,
 }
 
 impl OwnerIndex {
@@ -89,20 +88,14 @@ impl OwnerIndex {
                 genesis,
                 genesis_allocations,
             ))),
-            published: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
     pub fn apply_finalized(&self, block: &HellasBlock) -> Result<ApplyOutcome, OwnerIndexError> {
-        let outcome = self
-            .inner
+        self.inner
             .write()
             .expect("owner index lock poisoned")
-            .apply_finalized(block)?;
-        if outcome == ApplyOutcome::Applied {
-            self.published.notify_waiters();
-        }
-        Ok(outcome)
+            .apply_finalized(block)
     }
 
     #[cfg(feature = "full-node")]
@@ -115,12 +108,6 @@ impl OwnerIndex {
             payload: block.digest(),
             state_root: block.state_root(),
         };
-        self.published.notify_waiters();
-    }
-
-    #[cfg(any(feature = "validator", feature = "full-node"))]
-    pub(crate) fn published(&self) -> tokio::sync::futures::Notified<'_> {
-        self.published.notified()
     }
 
     pub fn cursor(&self) -> OwnerCursor {
