@@ -293,3 +293,65 @@ fn concurrent_processes_cannot_overwrite_one_expected_revision() {
     assert_eq!(latest.revision, 2);
     assert_eq!(latest.previous, Some(policy().commitment().unwrap()));
 }
+
+#[test]
+fn listing_returns_every_checked_record_and_ignores_store_bookkeeping() {
+    let temporary = tempfile::tempdir().unwrap();
+    let directory = temporary.path().join("trust");
+    let store = TrustPolicyStore::new(&directory);
+    assert!(store.list().unwrap().is_empty());
+    assert!(!directory.exists());
+    store
+        .approve("beta", 0, policy(), "first beta".into())
+        .unwrap();
+    store
+        .approve("alpha", 0, policy(), "first alpha".into())
+        .unwrap();
+    store
+        .approve("alpha", 1, policy(), "replaced alpha".into())
+        .unwrap();
+    // Counter state, a stale pending write and a stray file share the directory.
+    store
+        .resolve("alpha", Assurance::ProducerSigned, counters(&store))
+        .unwrap();
+    std::fs::create_dir_all(directory.join("existing-counters")).unwrap();
+    hellas_private::write_atomically(&directory.join(".alpha.json.x.pending"), "", b"{}").unwrap();
+    hellas_private::write_atomically(&directory.join("Not-An-Id.json"), "", b"{}").unwrap();
+    let listed = store.list().unwrap();
+    assert_eq!(
+        listed
+            .iter()
+            .map(|record| (record.id.as_str(), record.revision, record.reason.as_str()))
+            .collect::<Vec<_>>(),
+        [("alpha", 2, "replaced alpha"), ("beta", 1, "first beta")]
+    );
+    for record in &listed {
+        let loaded = store.load(&record.id).unwrap();
+        assert_eq!(
+            serde_json::to_value(record).unwrap(),
+            serde_json::to_value(loaded).unwrap()
+        );
+    }
+}
+
+#[test]
+fn listing_fails_closed_on_any_invalid_record_and_on_its_bound() {
+    let temporary = tempfile::tempdir().unwrap();
+    let directory = temporary.path().join("trust");
+    let store = TrustPolicyStore::new(&directory);
+    store
+        .approve("good", 0, policy(), "reviewed".into())
+        .unwrap();
+    hellas_private::write_atomically(&directory.join("corrupt.json"), "", b"{}").unwrap();
+    assert_eq!(store.list().unwrap_err().kind(), io::ErrorKind::InvalidData);
+    std::fs::remove_file(directory.join("corrupt.json")).unwrap();
+    assert_eq!(store.list().unwrap().len(), 1);
+    for index in 0..MAX_POLICIES {
+        hellas_private::write_atomically(&directory.join(format!("p{index}.json")), "", b"")
+            .unwrap();
+    }
+    assert_eq!(
+        store.list().unwrap_err().to_string(),
+        "trust policies exceed their bound"
+    );
+}
