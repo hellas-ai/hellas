@@ -290,6 +290,9 @@ impl<R> ProviderOptions<R> {
 }
 
 use crate::paid_provider::{MountedSetup, MountedWork, WorkRunner, WorkRunnerConfig, WorkWatcher};
+use crate::transport_admission::{
+    Admission, AdmittedConnection, IDLE_TIMEOUT, MAX_CONNECTIONS, MAX_LIFETIME,
+};
 use crate::work_router::WorkRouter;
 use hellas_rpc::services::node::{Node, NodeServer};
 use hellas_rpc::services::work::Work;
@@ -304,26 +307,22 @@ use tracing::{debug, warn};
 mod discovery;
 mod node;
 use node::NodeHandlerImpl;
-const MAX_ACTIVE_RPC_CONNECTIONS: usize = 128;
 const MAX_RPC_IN_FLIGHT_PER_CONNECTION: usize = 16;
-const MAX_RPC_HANDSHAKES: usize = 16;
-const MAX_RPC_HANDSHAKES_PER_PEER: usize = 2;
 
 enum IncomingConnection {
     Standalone(Box<Incoming>),
-    Host(Connection),
+    Host(AdmittedConnection),
 }
 impl IncomingConnection {
     fn refuse(self) {
         match self {
             Self::Standalone(incoming) => (*incoming).refuse(),
-            Self::Host(connection) => connection.close(503u32.into(), b"provider at capacity"),
+            Self::Host(connection) => drop(connection),
         }
     }
 }
 
-const RPC_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
-const RPC_CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+const RPC_CONNECTION_IDLE_TIMEOUT: Duration = IDLE_TIMEOUT;
 pub struct ProviderHandle {
     configuration: Option<crate::node_control::configuration::ProviderMetadata>,
     administration: Option<hellas_work::grant_service::WorkAdministration>,
@@ -584,10 +583,7 @@ where
     let accept_task = tokio::spawn(async move {
         let mut connections = JoinSet::new();
         let (quiesce, quiesced) = watch::channel(false);
-        let mut handshake_slots = crate::transport_admission::HandshakeSlots::new(
-            MAX_RPC_HANDSHAKES,
-            MAX_RPC_HANDSHAKES_PER_PEER,
-        );
+        let mut admission = Admission::new();
         loop {
             // Both waits are cancellation-safe. Once accepted, a connection's
             // handshake belongs to its task, never to the next select iteration.
@@ -610,18 +606,18 @@ where
                 }
                 incoming = next => match incoming { Some(incoming) => incoming, None => break },
             };
-            if connections.len() >= MAX_ACTIVE_RPC_CONNECTIONS {
+            if connections.len() >= MAX_CONNECTIONS {
                 incoming.refuse();
                 continue;
             }
-            let permits = if let IncomingConnection::Standalone(connection) = &incoming {
-                let Some(permits) = handshake_slots.try_acquire(&connection.remote_addr()) else {
-                    incoming.refuse();
-                    continue;
-                };
-                Some(permits)
-            } else {
-                None
+            let incoming = match incoming {
+                IncomingConnection::Standalone(incoming) => {
+                    let Some(pending) = admission.accept(*incoming) else {
+                        continue;
+                    };
+                    Ok(pending)
+                }
+                IncomingConnection::Host(connection) => Err(connection),
             };
             let node_handler_for_conn = node_handler.clone();
             let manager_for_conn = directory.manager();
@@ -631,39 +627,35 @@ where
             let admin_for_conn = admin.clone();
             let mut stopping = quiesced.clone();
             connections.spawn(async move {
-                let conn = match incoming {
-                    IncomingConnection::Host(connection) => connection,
-                    IncomingConnection::Standalone(incoming) => {
-                        let Ok(accepting) = (*incoming).accept() else {
-                            return;
-                        };
-                        tokio::select! {
-                            _ = quiescing(&mut stopping) => return,
-                            result = tokio::time::timeout(RPC_HANDSHAKE_TIMEOUT, accepting) => {
-                                let Ok(Ok(connection)) = result else { return; };
-                                connection
-                            }
-                        }
-                    }
+                let admitted = match incoming {
+                    Err(connection) => connection,
+                    Ok(pending) => tokio::select! {
+                        _ = quiescing(&mut stopping) => return,
+                        connection = pending.finish() => match connection {
+                            Some(connection) => connection,
+                            None => return,
+                        },
+                    },
                 };
-                drop(permits);
+                let conn = admitted.connection.clone();
                 let alpn = conn.alpn().to_vec();
                 debug!(
                     alpn = %String::from_utf8_lossy(&alpn),
                     "accepted RPC connection"
                 );
-                if let Err(e) = serve_connection(
-                    alpn,
-                    conn,
-                    execution_for_conn,
-                    node_handler_for_conn,
-                    manager_for_conn,
-                    setup_for_conn,
-                    work_for_conn,
-                    admin_for_conn,
-                    stopping,
-                )
-                .await
+                if let Some(Err(e)) = admitted
+                    .run(serve_connection(
+                        alpn,
+                        conn,
+                        execution_for_conn,
+                        node_handler_for_conn,
+                        manager_for_conn,
+                        setup_for_conn,
+                        work_for_conn,
+                        admin_for_conn,
+                        stopping,
+                    ))
+                    .await
                 {
                     warn!("serve_connection error: {e}");
                 }
@@ -746,7 +738,10 @@ async fn serve_connection<R: RootProver + Send + Sync + 'static>(
     } else if let Some(work) = work.filter(|_| alpn == <Work as ServiceMarker>::ALPN.as_bytes()) {
         let connection = tokio::select! {
             _ = quiescing(&mut quiesce) => return Ok(()),
-            connection = work.accept_iroh(&transport, open_identity.clone()) => connection?,
+            connection = tokio::time::timeout(IDLE_TIMEOUT, work.accept_iroh(&transport, open_identity.clone())) => {
+                let Ok(connection) = connection else { return Ok(()); };
+                connection?
+            },
         };
         let server = AccountingDispatcher::new(connection, manager);
         serve_loop(transport, server, quiesce).await;
@@ -793,10 +788,13 @@ where
     });
 
     let mut dispatches = JoinSet::new();
+    let lifetime = tokio::time::sleep(MAX_LIFETIME);
+    tokio::pin!(lifetime);
     let mut draining = false;
     loop {
         if dispatches.len() >= MAX_RPC_IN_FLIGHT_PER_CONNECTION {
             tokio::select! {
+                _ = &mut lifetime => break,
                 _ = quiescing(&mut quiesce) => { draining = true; break; }
                 completed = dispatches.join_next() => log_dispatch_result(completed),
             }
@@ -806,6 +804,7 @@ where
         let idle = dispatches.is_empty();
         let next = tokio::select! {
             biased;
+            _ = &mut lifetime => break,
             _ = quiescing(&mut quiesce) => { draining = true; break; }
             next = async {
                 if idle {

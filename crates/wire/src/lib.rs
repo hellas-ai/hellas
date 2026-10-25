@@ -1,5 +1,7 @@
 //! `hellas-wire` — transport-agnostic RPC wire layer.
 
+#[cfg(not(target_family = "wasm"))]
+pub mod admission;
 pub mod canonical;
 pub mod clock;
 pub mod error;

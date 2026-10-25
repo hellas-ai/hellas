@@ -466,14 +466,14 @@ where
 }
 
 async fn serve(service: SyncService, network: Network) {
-    let mut handshakes = Handshakes::default();
+    let mut handshakes = hellas_wire::admission::Handshakes::default();
     let mut connections = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
             _ = connections.join_next(), if !connections.is_empty() => {},
             incoming = network.endpoint.accept(), if connections.len() < 64 => {
                 let Some(incoming) = incoming else { return; };
-                if !handshakes.admit(incoming.remote_addr(), network.manager().now_ms()) { incoming.refuse(); continue; }
+                if !handshakes.admit(match incoming.remote_addr() { iroh::endpoint::IncomingAddr::Ip(addr) => Some(addr.ip()), _ => None }, network.manager().now_ms()) { incoming.refuse(); continue; }
                 let (service, network) = (service.clone(), network.clone());
                 connections.spawn(async move {
                     let Ok(Ok(connection)) = tokio::time::timeout(RPC_TIMEOUT, incoming).await else { return; };
@@ -597,66 +597,5 @@ where
             Err(e) => permit.finish_err(e.to_string()),
         }
         result
-    }
-}
-
-#[derive(Default)]
-struct Handshakes(
-    std::collections::BTreeMap<(std::net::IpAddr, bool), (u64, hellas_wire::peers::TokenBucket)>,
-);
-impl Handshakes {
-    fn admit(&mut self, address: iroh::endpoint::IncomingAddr, now: u64) -> bool {
-        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-        let iroh::endpoint::IncomingAddr::Ip(socket) = address else {
-            // Relays expose an authenticated endpoint identity, not its IP.
-            // Identity admission and the global connection bound still apply.
-            return true;
-        };
-        self.0
-            .retain(|_, (seen, _)| now.saturating_sub(*seen) < 60_000);
-        let ip = socket.ip().to_canonical();
-        let subnet = match ip {
-            IpAddr::V4(ip) => IpAddr::V4(Ipv4Addr::from(u32::from(ip) & 0xffffff00)),
-            IpAddr::V6(ip) => IpAddr::V6(Ipv6Addr::from(u128::from(ip) & (u128::MAX << 64))),
-        };
-        for (key, capacity, rate) in [((ip, false), 8.0, 2.0), ((subnet, true), 32.0, 8.0)] {
-            if self.0.len() >= 1024 && !self.0.contains_key(&key) {
-                return false;
-            }
-            let (seen, bucket) = self
-                .0
-                .entry(key)
-                .or_insert_with(|| (now, hellas_wire::peers::TokenBucket::new(now, capacity)));
-            *seen = now;
-            if bucket.try_take(now, capacity, rate).is_err() {
-                return false;
-            }
-        }
-        true
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn handshakes_bound_each_ip_subnet_and_idle_lifetime() {
-        let mut gate = Handshakes::default();
-        let ip = |last| {
-            iroh::endpoint::IncomingAddr::Ip(std::net::SocketAddr::from(([192, 0, 2, last], 1234)))
-        };
-        for _ in 0..8 {
-            assert!(gate.admit(ip(1), 0));
-        }
-        assert!(!gate.admit(ip(1), 0));
-        for host in 2..5 {
-            for _ in 0..8 {
-                assert!(gate.admit(ip(host), 0));
-            }
-        }
-        assert!(!gate.admit(ip(5), 0));
-        assert!(gate.admit(ip(1), 1_000));
-        assert!(gate.admit(ip(1), 61_000));
-        assert_eq!(gate.0.len(), 2);
     }
 }
