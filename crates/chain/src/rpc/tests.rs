@@ -877,11 +877,10 @@ fn work_channel_snapshot_reads_every_object_at_one_finalized_block() {
             None,
         );
 
-        // An index one block behind the database it is reporting
-        // for. Its cursor block is finalized and its finalization
-        // is available, so nothing but the root disagrees — and a
-        // snapshot reported at that cursor would carry objects read
-        // from a state the cursor never named.
+        // An index one block behind the database it is reporting for:
+        // finalization committed the next block before publishing its
+        // cursor. The snapshot is reported at the committed block the
+        // objects were read from, never at the cursor the index still names.
         let behind = OwnerIndex::new(network, &genesis, behind_allocations);
         assert_eq!(
             behind.apply_finalized(&floor_block),
@@ -896,11 +895,14 @@ fn work_channel_snapshot_reads_every_object_at_one_finalized_block() {
                 .is_some(),
             "the behind cursor's own block is finalized, so only the root disagrees",
         );
-        assert!(matches!(
+        let behind_snapshot =
             work_channel_snapshot_at(&database, &behind, &chain_indexer, network, query.clone())
-                .await,
-            Err(QueryError::StateUnavailable(_)),
-        ));
+                .await
+                .expect("the committed block is finalized")
+                .expect("both edges are open at the committed block");
+        assert_eq!(behind_snapshot.block().payload, open_block.digest());
+        assert_eq!(behind_snapshot.block().state_root, open_root);
+        assert_eq!(behind_snapshot.live_funding(), &live);
 
         // A channel naming a bond nobody opened is absent, not
         // faulty, and its edges are absent too.
@@ -1367,7 +1369,7 @@ fn delegated_coin_rpc_lists_funding_without_owned_balance() {
 }
 
 #[test]
-fn finalized_reads_wait_for_publication_without_holding_the_database() {
+fn finalized_reads_inside_the_commit_before_publish_window_use_the_committed_block() {
     run_qmdb(|runtime| async move {
         let indexer_context = runtime.child("publication_indexer");
         let config = utxo_db_config(&runtime, "publication_rpc", 1024, 8);
@@ -1411,48 +1413,41 @@ fn finalized_reads_wait_for_publication_without_holding_the_database() {
             payment_edge: EdgeId::from_bytes([72; 32]),
             funding: BTreeSet::new(),
         };
-        let coin = local.get_coin(floor.digest(), ids[0]);
-        let holdings = local.get_coins_by_owner(owner);
-        let edge = local.get_edge(floor.digest(), edge_object_id(query.bond_edge));
-        let snapshot = local.work_channel_snapshot(query);
-        tokio::pin!(coin, holdings, edge, snapshot);
-        // Holdings and work snapshots enter the publication wait directly;
-        // coin/edge reads can first pend while resolving the finalized floor.
-        assert!(futures::poll!(&mut coin).is_pending());
-        assert!(futures::poll!(&mut holdings).is_pending());
-        assert!(futures::poll!(&mut edge).is_pending());
-        assert!(futures::poll!(&mut snapshot).is_pending());
-        // A waiting reader must never prevent the publisher from taking a write
-        // lock. Restore the unmodified DB immediately after proving access.
-        let (slot, db) = tokio::time::timeout(std::time::Duration::from_secs(1), database.write())
-            .await
-            .expect("publication wait released every read lock");
-        slot.put(db);
-        index.publish_cursor(&next);
+        // Every read resolves at once against the committed block; none waits
+        // for the cursor, and nothing is published below.
         let (coin, held, edge, snapshot) =
             tokio::time::timeout(std::time::Duration::from_secs(1), async {
-                tokio::join!(coin, holdings, edge, snapshot)
+                tokio::join!(
+                    local.get_coin(floor.digest(), ids[0]),
+                    local.get_coins_by_owner(owner),
+                    local.get_edge(floor.digest(), edge_object_id(query.bond_edge)),
+                    local.work_channel_snapshot(query.clone()),
+                )
             })
             .await
-            .expect("publication wakes every waiting read");
+            .expect("reads inside the window do not wait for publication");
+        assert_eq!(index.cursor().payload, floor.digest());
         assert_eq!(coin.unwrap().unwrap().value, 100);
         let held = held.unwrap().unwrap();
         assert_eq!(held.snapshot.payload, next.digest());
+        assert_eq!(held.snapshot.state_root, root);
         assert_eq!(held.coins, vec![(ids[0], 100)]);
         let edge = edge.unwrap().unwrap();
         assert_eq!(edge.state_root, root);
         assert!(edge.edge.is_none());
         assert_eq!(snapshot.unwrap().unwrap().block().payload, next.digest());
 
-        // A cursor that never catches up must refuse on the same bounded wait,
-        // rather than hanging or serving a mixed snapshot.
-        index.publish_cursor(&floor);
-        let started = tokio::time::Instant::now();
-        let result = tokio::time::timeout(PUBLICATION_WAIT * 2, local.get_coins_by_owner(owner))
-            .await
-            .expect("publication refusal is bounded");
-        assert!(matches!(result, Err(QueryError::StateUnavailable(message))
-            if message == "finalized state publication timed out"));
-        assert!(started.elapsed() >= PUBLICATION_WAIT);
+        // State that is not the next finalized block is refused at once, rather
+        // than served at a block it was not read at.
+        let (spend, _) =
+            crate::execution::test_support::reshape(41, &[ids[0]], &[(owner, None, 100)]);
+        apply(&database, &allocations, 3, &[spend]).await;
+        for result in [
+            local.get_coins_by_owner(owner).await.map(|_| ()),
+            local.work_channel_snapshot(query).await.map(|_| ()),
+        ] {
+            assert!(matches!(result, Err(QueryError::StateUnavailable(message))
+                if message == "database state is not a finalized block"));
+        }
     });
 }
