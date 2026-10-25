@@ -188,8 +188,13 @@ async fn edge_index_http(
 }
 async fn edge_index_ws(
     State(state): State<OriginState>,
+    headers: HeaderMap,
     ws: axum::extract::ws::WebSocketUpgrade,
 ) -> Response {
+    // This private API is consumed by native clients, not browser pages.
+    if headers.contains_key(header::ORIGIN) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     ws.on_upgrade(move |socket| crate::edge_index::rpc::serve_socket(socket, state.edge_index))
 }
 
@@ -506,6 +511,72 @@ mod tests {
     use commonware_cryptography::Digestible as _;
     use hellas_genesis::HELLAS_DEVNET_1_ID;
     use tower::ServiceExt as _;
+
+    async fn published_router(context: tokio::Context) -> (Router, commonware_runtime::Handle<()>) {
+        let mut h =
+            crate::edge_index::ReplayHarness::new(context.child("h"), Vec::new(), "browser-test")
+                .await;
+        let genesis = h.head.clone();
+        h.append(Vec::new()).await;
+        let (indexer, handle) = crate::spawn_archive(
+            context.child("archive"),
+            "browser-archive",
+            Config::default(),
+            h.committee.verifier.clone(),
+            genesis,
+        )
+        .await
+        .unwrap();
+        indexer
+            .ingest_finalized(h.head.clone(), finalization(&h.committee, &h.head))
+            .await
+            .unwrap();
+        (
+            router(OriginState {
+                edge_index: h.index,
+                indexer,
+                owner_proofs: OwnerProofSource::Constructed(Arc::new(::tokio::sync::Mutex::new(
+                    h.replay,
+                ))),
+                verifier: Arc::new(h.verifier),
+                network_id: HELLAS_DEVNET_1_ID.into(),
+            }),
+            handle,
+        )
+    }
+
+    #[test]
+    fn edge_index_websocket_rejects_browser_origins_and_accepts_native_clients() {
+        use ::tokio_tungstenite::tungstenite::{Error, client::IntoClientRequest as _};
+        crate::execution::test_support::run_qmdb(|context| async move {
+            let (app, _archive) = published_router(context).await;
+            let listener = ::tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .unwrap();
+            let address = listener.local_addr().unwrap();
+            let serving = ::tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let url = format!("ws://{address}/api/v1/edge-index/rpc");
+            for origin in ["https://attacker.example", "null", "http://127.0.0.1"] {
+                let mut request = url.clone().into_client_request().unwrap();
+                request
+                    .headers_mut()
+                    .insert(header::ORIGIN, origin.parse().unwrap());
+                match ::tokio_tungstenite::connect_async(request).await {
+                    Err(Error::Http(response)) => {
+                        assert_eq!(response.status(), StatusCode::FORBIDDEN)
+                    }
+                    _ => panic!("browser WebSocket upgrade was accepted"),
+                }
+            }
+            let (mut socket, response) = ::tokio_tungstenite::connect_async(url).await.unwrap();
+            assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+            socket.close(None).await.unwrap();
+            serving.abort();
+            let _ = serving.await;
+        });
+    }
 
     #[test]
     fn representation_respects_qualities_aliases_and_exclusions() {
