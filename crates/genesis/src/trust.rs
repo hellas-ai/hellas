@@ -1,5 +1,4 @@
 //! Authenticated light-client configuration, distributed independently of an RPC origin.
-use crate::HELLAS_DEVNET_1_ID;
 use serde::{Deserialize, Serialize};
 
 pub const TRUST_SCHEMA_VERSION: u16 = 1;
@@ -30,7 +29,7 @@ pub struct TrustEpoch {
 pub enum TrustError {
     #[error("unsupported trust schema version")]
     Schema,
-    #[error("only the shipped devnet network is supported")]
+    #[error("invalid network id")]
     Network,
     #[error("invalid genesis digest")]
     Genesis,
@@ -47,7 +46,7 @@ impl TrustDocument {
         if self.schema_version != TRUST_SCHEMA_VERSION {
             return Err(TrustError::Schema);
         }
-        if self.network_id != HELLAS_DEVNET_1_ID {
+        if !crate::is_token(&self.network_id, crate::MAX_NETWORK_ID_BYTES) {
             return Err(TrustError::Network);
         }
         if !canonical_hex(&self.genesis_sha256, 64) {
@@ -97,6 +96,7 @@ fn canonical_hex(value: &str, len: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::HELLAS_DEVNET_1_ID;
     fn document() -> TrustDocument {
         TrustDocument {
             schema_version: 1,
@@ -144,9 +144,9 @@ mod tests {
         assert_eq!(trust.validate(), Err(TrustError::Identity));
     }
     #[test]
-    fn rejects_wrong_network_and_schema() {
+    fn rejects_invalid_network_and_schema() {
         let mut trust = document();
-        trust.network_id = "another-network".into();
+        trust.network_id = "invalid network".into();
         assert_eq!(trust.validate(), Err(TrustError::Network));
         let mut trust = document();
         trust.schema_version = 2;

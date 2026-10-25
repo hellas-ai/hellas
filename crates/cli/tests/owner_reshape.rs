@@ -141,14 +141,22 @@ async fn owner_prepare_and_cli_delegate_sweep_execute_on_a_real_validator() {
         ],
     );
     let network = config.network_id().unwrap();
+    let trust_path = home.path().join("trust.json");
+    let genesis_json = std::fs::read(&genesis_path).unwrap();
+    let trust = hellas_chain::validator::export_trust(&config, &genesis_json).unwrap();
+    std::fs::write(&trust_path, serde_json::to_vec(&trust).unwrap()).unwrap();
     let client = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             if let Ok(client) = RemoteLightClient::connect(rpc.clone()).await
                 && let Ok(info) = client.get_consensus_info().await
             {
-                break client
-                    .with_consensus_info(&info, hellas_chain::genesis_digest(&config.genesis))
-                    .unwrap();
+                break client.with_consensus_verifier(
+                    hellas_chain::ConsensusVerifier::new(
+                        &info,
+                        hellas_chain::genesis_digest(&config.genesis),
+                    )
+                    .unwrap(),
+                );
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -215,6 +223,8 @@ async fn owner_prepare_and_cli_delegate_sweep_execute_on_a_real_validator() {
                 .arg(&key_path)
                 .args(["chain", "sweep", "--rpc", &rpc, "--genesis"])
                 .arg(&genesis_path)
+                .arg("--trust")
+                .arg(&trust_path)
                 .args(["--coin", &hex::encode(delegated.to_bytes())]);
             let swept = result_coin(output(sweep));
             assert_eq!(coin(&client, swept).await.delegate, None);
@@ -224,6 +234,8 @@ async fn owner_prepare_and_cli_delegate_sweep_execute_on_a_real_validator() {
                 .arg(&key_path)
                 .args(["chain", "delegate", "--rpc", &rpc, "--genesis"])
                 .arg(&genesis_path)
+                .arg("--trust")
+                .arg(&trust_path)
                 .args([
                     "--coin",
                     &hex::encode(swept.to_bytes()),

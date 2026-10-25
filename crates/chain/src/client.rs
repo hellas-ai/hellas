@@ -35,14 +35,11 @@ impl RemoteLightClient {
         Ok(Self::new(connect_transport(&addr).await?))
     }
 
-    /// Configure this client to verify finalized snapshots.
-    pub fn with_consensus_info(
-        mut self,
-        info: &ConsensusInfo,
-        genesis: Digest,
-    ) -> Result<Self, QueryError> {
-        self.verifier = Some(ConsensusVerifier::new(info, genesis).map_err(QueryError::from)?);
-        Ok(self)
+    /// Verify snapshots with an independently provisioned consensus authority.
+    /// Coin and edge records still need state proofs; this authenticates their snapshot only.
+    pub fn with_consensus_verifier(mut self, verifier: ConsensusVerifier) -> Self {
+        self.verifier = Some(verifier);
+        self
     }
 
     /// Subscribe to the consensus activity stream.
@@ -101,9 +98,16 @@ impl RemoteLightClient {
 
 impl LightClient for RemoteLightClient {
     fn get_state_root(&self) -> impl Future<Output = Result<Option<Digest>, QueryError>> + Send {
-        let client = self.rpc_client().clone();
+        let client = self.clone();
         async move {
+            if client.verifier.is_some() {
+                return Ok(client
+                    .get_latest_block()
+                    .await?
+                    .map(|snapshot| snapshot.state_root));
+            }
             let response = client
+                .rpc_client()
                 .get_state_root(GetStateRootRequest {})
                 .await
                 .map_err(QueryError::from)?;
@@ -207,10 +211,11 @@ impl LightClient for RemoteLightClient {
                 .get_latest_block(GetLatestBlockRequest {})
                 .await
                 .map_err(QueryError::from)?;
-            response
-                .latest
-                .map(|snapshot| verified_latest_block_from_proto(snapshot, verifier.as_ref()))
-                .transpose()
+            let latest = response.latest.map(latest_block_from_proto).transpose()?;
+            if let Some(snapshot) = &latest {
+                authenticate_snapshot(&client, snapshot, verifier.as_ref()).await?;
+            }
+            Ok(latest)
         }
     }
 
@@ -227,7 +232,7 @@ impl LightClient for RemoteLightClient {
                 .map_err(QueryError::from)?;
             response
                 .block
-                .map(|block| verified_finalized_block_from_proto(block, verifier.as_ref()))
+                .map(|block| finalized_block_from_proto(block, verifier.as_ref()))
                 .transpose()
         }
     }
@@ -335,7 +340,11 @@ impl LightClient for RemoteLightClient {
                 })
                 .await
                 .map_err(QueryError::from)?;
-            coin_listing_from_proto(resp, verifier.as_ref())
+            let listing = coin_listing_from_proto(resp)?;
+            if let Some(listing) = &listing {
+                authenticate_snapshot(&client, &listing.snapshot, verifier.as_ref()).await?;
+            }
+            Ok(listing)
         }
     }
 
@@ -352,7 +361,11 @@ impl LightClient for RemoteLightClient {
                 })
                 .await
                 .map_err(QueryError::from)?;
-            coin_listing_from_proto(resp, verifier.as_ref())
+            let listing = coin_listing_from_proto(resp)?;
+            if let Some(listing) = &listing {
+                authenticate_snapshot(&client, &listing.snapshot, verifier.as_ref()).await?;
+            }
+            Ok(listing)
         }
     }
 
@@ -369,15 +382,16 @@ impl LightClient for RemoteLightClient {
                 })
                 .await
                 .map_err(QueryError::from)?;
-            owner_edges_from_proto(owner, resp, verifier.as_ref())
+            let listing = owner_edges_from_proto(owner, resp)?;
+            if let Some(listing) = &listing {
+                authenticate_snapshot(&client, &listing.snapshot, verifier.as_ref()).await?;
+            }
+            Ok(listing)
         }
     }
 }
 
-fn coin_listing_from_proto(
-    resp: GetCoinsResponse,
-    verifier: Option<&ConsensusVerifier>,
-) -> Result<Option<CoinListing>, QueryError> {
+fn coin_listing_from_proto(resp: GetCoinsResponse) -> Result<Option<CoinListing>, QueryError> {
     let Some(snapshot) = resp.snapshot else {
         if resp.coins.is_empty() {
             return Ok(None);
@@ -386,7 +400,7 @@ fn coin_listing_from_proto(
             "GetCoinsResponse had coins without a snapshot".to_string(),
         ));
     };
-    let snapshot = verified_latest_block_from_proto(snapshot, verifier)?;
+    let snapshot = latest_block_from_proto(snapshot)?;
     let coins = resp
         .coins
         .into_iter()
@@ -417,7 +431,6 @@ fn edge_lookup_from_proto(response: GetEdgeResponse) -> Result<Option<EdgeLookup
 fn owner_edges_from_proto(
     owner: SettlementKey,
     response: GetEdgesByOwnerResponse,
-    verifier: Option<&ConsensusVerifier>,
 ) -> Result<Option<OwnerEdges>, QueryError> {
     let Some(snapshot) = response.snapshot else {
         if response.edges.is_empty() {
@@ -427,7 +440,7 @@ fn owner_edges_from_proto(
             "GetEdgesByOwnerResponse had edges without a snapshot".to_string(),
         ));
     };
-    let snapshot = verified_latest_block_from_proto(snapshot, verifier)?;
+    let snapshot = latest_block_from_proto(snapshot)?;
     let mut seen = BTreeSet::new();
     let mut edges = Vec::with_capacity(response.edges.len());
     for edge in response.edges {
@@ -491,20 +504,29 @@ fn edge_state_from_proto(edge: hellas_rpc::pb::chain::EdgeState) -> Result<EdgeS
     })
 }
 
-fn verified_latest_block_from_proto(
-    snapshot: FinalizedSnapshot,
+async fn authenticate_snapshot(
+    client: &LightClientClientImpl<MuxTransport>,
+    snapshot: &LatestBlock,
     verifier: Option<&ConsensusVerifier>,
-) -> Result<LatestBlock, QueryError> {
-    let latest = latest_block_from_proto(snapshot)?;
-    if let Some(verifier) = verifier {
-        verifier
-            .verify_snapshot(&latest)
-            .map_err(QueryError::from)?;
-    }
-    Ok(latest)
+) -> Result<(), QueryError> {
+    let Some(verifier) = verifier else {
+        return Ok(());
+    };
+    let response = client
+        .get_finalized_block(finalized_block_query_to_proto(
+            FinalizedBlockQuery::Payload(snapshot.payload),
+        ))
+        .await
+        .map_err(QueryError::from)?;
+    let block = response
+        .block
+        .ok_or_else(|| QueryError::Remote("canonical snapshot block was missing".into()))?;
+    verifier
+        .verify_snapshot(snapshot, &block.block)
+        .map_err(QueryError::from)
 }
 
-pub(crate) fn verified_finalized_block_from_proto(
+pub(crate) fn finalized_block_from_proto(
     block: hellas_rpc::pb::chain::FinalizedBlock,
     verifier: Option<&ConsensusVerifier>,
 ) -> Result<FinalizedBlock, QueryError> {
@@ -513,11 +535,16 @@ pub(crate) fn verified_finalized_block_from_proto(
             "FinalizedBlock had no snapshot".to_string(),
         ));
     };
-    let snapshot = verified_latest_block_from_proto(snapshot, verifier)?;
+    let snapshot = latest_block_from_proto(snapshot)?;
     if Sha256::hash(&block.block) != snapshot.payload {
         return Err(QueryError::Remote(
             "block bytes did not match finalized payload".to_string(),
         ));
+    }
+    if let Some(verifier) = verifier {
+        verifier
+            .verify_snapshot(&snapshot, &block.block)
+            .map_err(QueryError::from)?;
     }
     Ok(FinalizedBlock {
         snapshot,

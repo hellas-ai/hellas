@@ -63,6 +63,13 @@ public trust data. Authenticate `network/trust.json` and the exact genesis file
 separately from the RPC peer. Do not parse, reserialize, trim, or otherwise
 change the provisioned genesis bytes.
 
+CLI chain queries and signing commands also require `--trust network/trust.json`.
+Pass `--genesis network/genesis.json` for a separately provisioned genesis. The
+RPC client authenticates snapshot height and roots by fetching the canonical
+block committed by its certificate. Coin and edge records remain unverified;
+the CLI labels them accordingly. RPC snapshot verification currently accepts
+one open epoch beginning at zero; scheduled proofs use `ProofVerifier`.
+
 `ProofVerifier::with_genesis(trust, genesis_bytes)` pins both inputs.
 `ProofVerifier::new(trust)` and `chain indexer serve` without `--genesis` use
 the embedded devnet genesis.

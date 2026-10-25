@@ -107,7 +107,13 @@ mod full {
         pub fn verify_snapshot(
             &self,
             snapshot: &LatestBlock,
+            block: &[u8],
         ) -> Result<(), ConsensusVerificationError> {
+            crate::FinalizedBlockView::decode(&crate::FinalizedBlock {
+                snapshot: snapshot.clone(),
+                block: block.to_vec(),
+            })
+            .map_err(|_| ConsensusVerificationError::InvalidFinalization)?;
             crate::finality_proof::FinalityProof::decode(&snapshot.finalization)?
                 .verify(self, snapshot)
         }
@@ -280,7 +286,13 @@ mod light {
         pub fn verify_snapshot(
             &self,
             snapshot: &LatestBlock,
+            block: &[u8],
         ) -> Result<(), ConsensusVerificationError> {
+            crate::FinalizedBlockView::decode(&crate::FinalizedBlock {
+                snapshot: snapshot.clone(),
+                block: block.to_vec(),
+            })
+            .map_err(|_| ConsensusVerificationError::InvalidFinalization)?;
             crate::finality_proof::FinalityProof::decode(&snapshot.finalization)?
                 .verify(self, snapshot)
         }

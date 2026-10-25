@@ -2,7 +2,7 @@
 mod app;
 #[cfg(feature = "client-core")]
 pub mod block;
-#[cfg(feature = "block-view")]
+#[cfg(feature = "client-core")]
 pub mod block_view;
 #[cfg(feature = "client-core")]
 pub mod client;
@@ -67,7 +67,7 @@ pub use app::{ActivityReporter, Application, ApplicationConfig};
 pub use app::{GENERAL_MEMPOOL_CAPACITY, Mempool};
 #[cfg(feature = "client-core")]
 pub use block::{HellasBlock, UtxoSyncTarget};
-#[cfg(feature = "block-view")]
+#[cfg(feature = "client-core")]
 pub use block_view::{BlockViewError, FinalizedBlockView};
 #[cfg(any(feature = "client-core", feature = "indexer", feature = "validator"))]
 pub use consensus::{ConsensusVerificationError, ConsensusVerifier, Finalization};

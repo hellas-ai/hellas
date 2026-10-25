@@ -125,11 +125,16 @@ fn snapshot(block: &HellasBlock, proof: Vec<u8>) -> LatestBlock {
 fn descendant_finality_verifies_with_full_and_light_consensus() {
     let (verifier, blocks, certificate, _) = fixture();
     verifier
-        .verify_snapshot(&snapshot(&blocks[3], certificate.clone()))
+        .verify_snapshot(
+            &snapshot(&blocks[3], certificate.clone()),
+            &blocks[3].encode(),
+        )
         .unwrap();
     let encoded = encode(&certificate, &blocks[2..]).unwrap();
     let target = snapshot(&blocks[1], encoded.clone());
-    verifier.verify_snapshot(&target).unwrap();
+    verifier
+        .verify_snapshot(&target, &blocks[1].encode())
+        .unwrap();
     assert_eq!(
         FinalityProof::decode(&encoded)
             .unwrap()
@@ -163,7 +168,11 @@ fn descendant_finality_verifies_with_full_and_light_consensus() {
             ..target.clone()
         },
     ] {
-        assert!(verifier.verify_snapshot(&invalid).is_err());
+        assert!(
+            verifier
+                .verify_snapshot(&invalid, &blocks[1].encode())
+                .is_err()
+        );
     }
     let mut trailing = encoded.clone();
     trailing.push(0);
@@ -325,7 +334,9 @@ fn descendant_finality_persists_every_ancestor_before_advancing_follower() {
                 .unwrap()
                 .unwrap();
             assert_eq!(answer.block, block.encode().to_vec());
-            verifier.verify_snapshot(&answer.snapshot).unwrap();
+            verifier
+                .verify_snapshot(&answer.snapshot, &answer.block)
+                .unwrap();
             assert_eq!(
                 replica
                     .get_finalization(block.digest())
@@ -349,7 +360,9 @@ fn descendant_finality_persists_every_ancestor_before_advancing_follower() {
 fn shared_threshold_certificates_cannot_cross_genesis_or_network() {
     let (verifier, blocks, certificate, identity) = fixture();
     let snapshot = snapshot(blocks.last().unwrap(), certificate);
-    verifier.verify_snapshot(&snapshot).unwrap();
+    verifier
+        .verify_snapshot(&snapshot, &blocks.last().unwrap().encode())
+        .unwrap();
     for (network, genesis) in [
         (crate::domain::TEST_NETWORK.as_str(), [1; 32]),
         ("another-network", [0; 32]),
@@ -364,8 +377,42 @@ fn shared_threshold_certificates_cannot_cross_genesis_or_network() {
         )
         .unwrap();
         assert!(
-            foreign.verify_snapshot(&snapshot).is_err(),
+            foreign
+                .verify_snapshot(&snapshot, &blocks.last().unwrap().encode())
+                .is_err(),
             "foreign certificate accepted"
         );
     }
+}
+
+#[test]
+fn direct_certificate_rejects_forged_snapshot_height() {
+    let (verifier, blocks, certificate, _) = fixture();
+    let block = blocks.last().unwrap();
+    let mut snapshot = snapshot(block, certificate);
+    verifier
+        .verify_snapshot(&snapshot, &block.encode())
+        .unwrap();
+    snapshot.height += 100;
+    assert!(
+        verifier
+            .verify_snapshot(&snapshot, &block.encode())
+            .is_err()
+    );
+}
+
+#[test]
+fn direct_certificate_rejects_forged_snapshot_state_root() {
+    let (verifier, blocks, certificate, _) = fixture();
+    let block = blocks.last().unwrap();
+    let mut snapshot = snapshot(block, certificate);
+    verifier
+        .verify_snapshot(&snapshot, &block.encode())
+        .unwrap();
+    snapshot.state_root = [99; 32].into();
+    assert!(
+        verifier
+            .verify_snapshot(&snapshot, &block.encode())
+            .is_err()
+    );
 }

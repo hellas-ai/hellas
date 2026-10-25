@@ -193,6 +193,7 @@ let
       import tomllib
 
       cli = "${validatorPackage}/bin/hellas-cli"
+      trust_args = "--trust ${homePrefix}/trust.json --genesis ${homePrefix}/genesis.json"
       rpc = "ws://127.0.0.1:${toString chainRpcPort}"
       follower_api = "http://127.0.0.1:31247/api/v1/blocks"
       home = "HOME=${homePrefix}/client-home OTEL_SERVICE_NAME=hellas-test-client"
@@ -208,7 +209,7 @@ let
           return fields
 
       def latest_block():
-          output = machine.succeed(f"{home} {cli} chain query --rpc {rpc} latest-block")
+          output = machine.succeed(f"{home} {cli} chain query --rpc {rpc} {trust_args} latest-block")
           fields = parse_fields(output)
           assert "height" in fields and int(fields["height"]) > 0, output
           assert "payload" in fields, output
@@ -275,7 +276,7 @@ let
           f"> {follower_log} 2>&1 & echo $! > ${homePrefix}/follower.pid"
       )
       machine.wait_until_succeeds(
-          f"{home} {cli} chain query --rpc {rpc} latest-block "
+          f"{home} {cli} chain query --rpc {rpc} {trust_args} latest-block "
           f"> ${homePrefix}/latest.log && grep -Eq '^height [1-9][0-9]*$' ${homePrefix}/latest.log"
       )
       wait_for_follower_ready()
@@ -538,22 +539,22 @@ in
       assert int(local_block["height"]) == height, local_block
       assert local_block["payload"] == payload, local_block
 
-      by_height = machine.succeed(f"{home} {cli} chain query --rpc {rpc} finalized-block --height {height}")
+      by_height = machine.succeed(f"{home} {cli} chain query --rpc {rpc} {trust_args} finalized-block --height {height}")
       assert f"height {height}" in by_height.splitlines(), by_height
       assert f"payload {payload}" in by_height.splitlines(), by_height
       assert any(line.startswith("block ") for line in by_height.splitlines()), by_height
 
-      by_payload = machine.succeed(f"{home} {cli} chain query --rpc {rpc} finalized-block --payload {payload}")
+      by_payload = machine.succeed(f"{home} {cli} chain query --rpc {rpc} {trust_args} finalized-block --payload {payload}")
       assert f"height {height}" in by_payload.splitlines(), by_payload
       assert f"payload {payload}" in by_payload.splitlines(), by_payload
 
-      finalization = machine.succeed(f"{home} {cli} chain query --rpc {rpc} finalization --payload {payload}").strip()
+      finalization = machine.succeed(f"{home} {cli} chain query --rpc {rpc} {trust_args} finalization --payload {payload}").strip()
       assert len(finalization) > 64 and all(c in "0123456789abcdef" for c in finalization), finalization
 
-      validators = machine.succeed(f"{home} {cli} chain query --rpc {rpc} validators")
+      validators = machine.succeed(f"{home} {cli} chain query --rpc {rpc} {trust_args} validators")
       assert validators.strip(), validators
 
-      coins = machine.succeed(f"{home} {cli} chain query --rpc {rpc} coins-by-owner --owner {owner}")
+      coins = machine.succeed(f"{home} {cli} chain query --rpc {rpc} {trust_args} coins-by-owner --owner {owner}")
       coin_lines = [line for line in coins.splitlines() if line.endswith(" 424242")]
       assert len(coin_lines) == 1, coins
 
@@ -593,7 +594,7 @@ in
       native = "${chainSettlementNative}"
 
       def coin_map(owner):
-          output = machine.succeed(f"{home} {cli} chain query --rpc {rpc} coins-by-owner --owner {owner}")
+          output = machine.succeed(f"{home} {cli} chain query --rpc {rpc} {trust_args} coins-by-owner --owner {owner}")
           coins = {}
           for line in output.splitlines():
               parts = line.split()
@@ -652,7 +653,7 @@ in
           while time.time() < deadline:
               payload = latest_block()["payload"]
               status, output = machine.execute(
-                  f"{home} {cli} chain query --rpc {rpc} edge --object-id {edge_id} --payload {payload}"
+                  f"{home} {cli} chain query --rpc {rpc} {trust_args} edge --object-id {edge_id} --payload {payload}"
               )
               if status == 0:
                   return output
@@ -725,7 +726,7 @@ in
       height = int(latest_block()["height"])
       baseline = follower_height()
       opened = machine.succeed(
-          f"{home} {cli} chain open --rpc {rpc} "
+          f"{home} {cli} chain open --rpc {rpc} {trust_args} "
           "--maker-key /tmp/chain-settlement/maker.key --maker-auth webauthn "
           "--taker-key /tmp/chain-settlement/taker.key --taker-auth webauthn "
           f"--maker-funding {maker_genesis} --taker-funding {taker_genesis} "
@@ -743,7 +744,7 @@ in
       # value-conserving so it exercises the third-owner restriction.
       balances_before = {owner: coin_map(owner)[0] for owner in [maker, taker, native]}
       refused = machine.succeed(
-          f"{home} {cli} chain close --rpc {rpc} --edge-id {edge_a} --kind mutual "
+          f"{home} {cli} chain close --rpc {rpc} {trust_args} --edge-id {edge_a} --kind mutual "
           f"--payout {maker}:80 --payout {taker}:20 --payout {native}:50 "
           "--maker-key /tmp/chain-settlement/maker.key --maker-auth webauthn "
           "--taker-key /tmp/chain-settlement/taker.key --taker-auth webauthn"
@@ -766,7 +767,7 @@ in
 
       baseline = follower_height()
       machine.succeed(
-          f"{home} {cli} chain close --rpc {rpc} --edge-id {edge_a} --kind mutual "
+          f"{home} {cli} chain close --rpc {rpc} {trust_args} --edge-id {edge_a} --kind mutual "
           f"--payout {maker}:80 --payout {taker}:70 "
           "--maker-key /tmp/chain-settlement/maker.key --maker-auth webauthn "
           "--taker-key /tmp/chain-settlement/taker.key --taker-auth webauthn"
@@ -781,7 +782,7 @@ in
       height = int(latest_block()["height"])
       baseline = follower_height()
       opened = machine.succeed(
-          f"{home} {cli} chain open --rpc {rpc} "
+          f"{home} {cli} chain open --rpc {rpc} {trust_args} "
           "--maker-key /tmp/chain-settlement/native.key --maker-auth native "
           "--taker-key /tmp/chain-settlement/native.key --taker-auth native "
           f"--maker-funding {native_coin} --protocol 2 --timeout {height + 1000000} "
@@ -793,7 +794,7 @@ in
 
       baseline = follower_height()
       machine.succeed(
-          f"{home} {cli} chain close --rpc {rpc} --edge-id {edge_b} --kind mutual "
+          f"{home} {cli} chain close --rpc {rpc} {trust_args} --edge-id {edge_b} --kind mutual "
           f"--payout {native}:50 "
           "--maker-key /tmp/chain-settlement/native.key --maker-auth native "
           "--taker-key /tmp/chain-settlement/native.key --taker-auth native"
@@ -807,7 +808,7 @@ in
       timeout = height + 2000
       baseline = follower_height()
       opened = machine.succeed(
-          f"{home} {cli} chain open --rpc {rpc} "
+          f"{home} {cli} chain open --rpc {rpc} {trust_args} "
           "--maker-key /tmp/chain-settlement/maker.key --maker-auth webauthn "
           "--taker-key /tmp/chain-settlement/taker.key --taker-auth webauthn "
           f"--maker-funding {maker_coin} --protocol 3 --timeout {timeout} "
@@ -821,7 +822,7 @@ in
 
       baseline = follower_height()
       machine.succeed(
-          f"{home} {cli} chain close --rpc {rpc} --edge-id {edge_c} --kind timeout "
+          f"{home} {cli} chain close --rpc {rpc} {trust_args} --edge-id {edge_c} --kind timeout "
           f"--payout {maker}:80 --terms-file /tmp/chain-settlement/timeout.terms"
       )
       wait_edge(edge_c, False)

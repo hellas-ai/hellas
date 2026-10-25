@@ -172,7 +172,7 @@ impl Trust {
                     return Err(invalid("epoch is absent from the provisioned authority"));
                 }
                 verifier
-                    .verify_snapshot(&incoming.snapshot)
+                    .verify_snapshot(&incoming.snapshot, &incoming.block)
                     .map_err(invalid)?;
             }
             #[cfg(feature = "indexer-api")]

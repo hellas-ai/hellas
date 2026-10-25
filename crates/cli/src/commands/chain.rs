@@ -27,6 +27,12 @@ pub enum ChainCommand {
         /// RPC endpoint
         #[arg(long)]
         rpc: String,
+        /// Independently authenticated deployment trust document
+        #[arg(long)]
+        trust: PathBuf,
+        /// Genesis document; defaults to the shipped devnet
+        #[arg(long)]
+        genesis: Option<PathBuf>,
         #[command(subcommand)]
         query: QueryCommand,
     },
@@ -62,6 +68,9 @@ pub enum ChainCommand {
 pub struct OwnerCoinArgs {
     #[arg(long)]
     rpc: String,
+    /// Independently authenticated deployment trust document
+    #[arg(long)]
+    trust: PathBuf,
     #[arg(long, default_value = "devnet", conflicts_with = "genesis")]
     network: String,
     #[arg(long)]
@@ -76,6 +85,9 @@ pub struct OpenArgs {
     /// Chain light-client RPC endpoint
     #[arg(long)]
     rpc: String,
+    /// Independently authenticated deployment trust document
+    #[arg(long)]
+    trust: PathBuf,
     /// Network to sign for: a shipped name (`devnet`) or a
     /// full network id
     #[arg(long, default_value = "devnet", conflicts_with = "genesis")]
@@ -120,6 +132,9 @@ pub struct CloseArgs {
     /// Chain light-client RPC endpoint
     #[arg(long)]
     rpc: String,
+    /// Independently authenticated deployment trust document
+    #[arg(long)]
+    trust: PathBuf,
     /// Network to sign for: a shipped name (`devnet`) or a
     /// full network id
     #[arg(long, default_value = "devnet", conflicts_with = "genesis")]
@@ -350,7 +365,12 @@ pub async fn run(command: ChainCommand, passkey_path: Option<&Path>) -> CliResul
             run_owner_coins(coins, Some(node.into_kernel()), passkey_path).await
         }
         ChainCommand::Sweep(coins) => run_owner_coins(coins, None, passkey_path).await,
-        ChainCommand::Query { rpc, query } => run_query(rpc, query).await,
+        ChainCommand::Query {
+            rpc,
+            trust,
+            genesis,
+            query,
+        } => run_query(rpc, trust, genesis, query).await,
         ChainCommand::Open(args) => run_open(args).await,
         ChainCommand::Close(args) => run_close(args).await,
         #[cfg(feature = "indexer")]
@@ -368,7 +388,8 @@ async fn run_owner_coins(
     let owner = passkey(passkey_path.context("chain delegate/sweep requires --passkey")?)?;
     let selected = parse_coin_ids::<MAX_EDGE_INPUTS>(&args.coins, "coin")?;
     let network = selected_network(&args.network, args.genesis.clone())?;
-    let client = connect_verified(args.rpc, args.genesis.as_deref()).await?;
+    let client =
+        connect_with_verified_snapshots(args.rpc, &args.trust, args.genesis.as_deref()).await?;
     let plan = hellas_sdk::coin_owner::OwnerReshape::prepare(
         &client,
         network,
@@ -394,8 +415,24 @@ async fn run_owner_coins(
     Ok(())
 }
 
-async fn run_query(rpc: String, query: QueryCommand) -> CliResult {
-    let client = connect_verified(rpc, None).await?;
+async fn run_query(
+    rpc: String,
+    trust: PathBuf,
+    genesis: Option<PathBuf>,
+    query: QueryCommand,
+) -> CliResult {
+    let client = connect_with_verified_snapshots(rpc, &trust, genesis.as_deref()).await?;
+    if matches!(
+        query,
+        QueryCommand::Coin { .. }
+            | QueryCommand::Edge { .. }
+            | QueryCommand::CoinsByOwner { .. }
+            | QueryCommand::EdgesByOwner { .. }
+            | QueryCommand::Validators
+            | QueryCommand::Finalization { .. }
+    ) {
+        eprintln!("records are unverified; only finalized block snapshots are authenticated");
+    }
     match query {
         QueryCommand::LatestBlock => match client.get_latest_block().await? {
             Some(block) => {
@@ -542,7 +579,8 @@ async fn run_open(args: OpenArgs) -> CliResult {
     );
     let edge_id = Tx::edge_id_of(&funding, &terms);
     let network = selected_network(&args.network, args.genesis.clone())?;
-    let client = connect_verified(args.rpc, args.genesis.as_deref()).await?;
+    let client =
+        connect_with_verified_snapshots(args.rpc, &args.trust, args.genesis.as_deref()).await?;
     let network = confirm_network(network, &client).await?;
     let open_hash = Tx::open_hash(network, &funding, &terms);
     let tx = Tx::open(
@@ -572,7 +610,8 @@ async fn run_close(args: CloseArgs) -> CliResult {
     let edge_id = parse_edge_id(&args.edge_id)?;
     let outputs = parse_payouts(&args.payouts, "payout")?;
     let network = selected_network(&args.network, args.genesis.clone())?;
-    let client = connect_verified(args.rpc, args.genesis.as_deref()).await?;
+    let client =
+        connect_with_verified_snapshots(args.rpc, &args.trust, args.genesis.as_deref()).await?;
     let network = confirm_network(network, &client).await?;
     let edge = get_live_edge(&client, edge_id).await?;
 
@@ -636,17 +675,55 @@ async fn run_close(args: CloseArgs) -> CliResult {
     Ok(())
 }
 
-async fn connect_verified(rpc: String, genesis: Option<&Path>) -> CliResult<RemoteLightClient> {
-    let document = match genesis {
+async fn connect_with_verified_snapshots(
+    rpc: String,
+    trust: &Path,
+    genesis: Option<&Path>,
+) -> CliResult<RemoteLightClient> {
+    let trust: hellas_chain::genesis::TrustDocument = serde_json::from_slice(&fs::read(trust)?)?;
+    let genesis_json = match genesis {
         Some(path) => fs::read(path)?,
         None => hellas_chain::genesis::HELLAS_DEVNET_1_JSON
             .as_bytes()
             .to_vec(),
     };
-    let genesis: Genesis = serde_json::from_slice(&document)?;
     let client = RemoteLightClient::connect(rpc).await?;
-    let consensus_info = client.get_consensus_info().await?;
-    Ok(client.with_consensus_info(&consensus_info, hellas_chain::genesis_digest(&genesis))?)
+    let reported = client.get_consensus_info().await?;
+    let verifier = pinned_consensus_verifier(&trust, &genesis_json, &reported)?;
+    Ok(client.with_consensus_verifier(verifier))
+}
+
+pub(super) fn pinned_consensus_verifier(
+    trust: &hellas_chain::genesis::TrustDocument,
+    genesis_json: &[u8],
+    reported: &hellas_chain::ConsensusInfo,
+) -> CliResult<hellas_chain::ConsensusVerifier> {
+    hellas_chain::proof_verify::ProofVerifier::with_genesis(trust.clone(), genesis_json)?;
+    anyhow::ensure!(
+        trust.epochs.len() == 1
+            && trust.epochs[0].epoch == 0
+            && trust.epochs[0].end_height.is_none(),
+        "RPC snapshot verification requires one open epoch starting at zero"
+    );
+    let genesis: Genesis = serde_json::from_slice(genesis_json)?;
+    let pinned = hellas_chain::ConsensusInfo {
+        network_id: trust.network_id.clone(),
+        threshold_identity: hex::decode(&trust.epochs[0].threshold_identity)?,
+        validators: genesis
+            .validators
+            .iter()
+            .map(|v| v.public_key.clone())
+            .collect(),
+    };
+    anyhow::ensure!(
+        reported.network_id == pinned.network_id
+            && reported.threshold_identity == pinned.threshold_identity,
+        "endpoint consensus identity differs from the authenticated trust document"
+    );
+    Ok(hellas_chain::ConsensusVerifier::new(
+        &pinned,
+        hellas_chain::genesis_digest(&genesis),
+    )?)
 }
 
 /// Resolves the network to sign for, and refuses if the node on the
@@ -945,6 +1022,76 @@ mod tests {
     use hellas_kernel::{Key, MAX_PARTY_INPUTS};
 
     #[test]
+    fn pinned_custom_network_accepts_matching_identity_and_rejects_substitution() {
+        let mut genesis: Genesis =
+            serde_json::from_slice(hellas_chain::genesis::HELLAS_DEVNET_1_JSON.as_bytes()).unwrap();
+        genesis.network_id = "custom-network-1".into();
+        genesis.validate().unwrap();
+        let json = serde_json::to_vec(&genesis).unwrap();
+        let identity = "97f1d3a73197d7942695638c4fa9ac0fc3688c4f9774b905a14e3a3f171bac586c55e83ff97a1aeffb3af00adb22c6bb";
+        let mut trust = hellas_chain::genesis::TrustDocument {
+            schema_version: 1,
+            network_id: genesis.network_id.clone(),
+            genesis_sha256: hex::encode(hellas_chain::genesis_digest(&genesis)),
+            epochs: vec![hellas_chain::genesis::TrustEpoch {
+                epoch: 0,
+                start_height: 0,
+                end_height: None,
+                threshold_identity: identity.into(),
+            }],
+        };
+        let mut reported = hellas_chain::ConsensusInfo {
+            network_id: trust.network_id.clone(),
+            threshold_identity: hex::decode(identity).unwrap(),
+            validators: vec![],
+        };
+        assert!(pinned_consensus_verifier(&trust, &json, &reported).is_ok());
+        reported.threshold_identity[0] ^= 0x20;
+        assert!(pinned_consensus_verifier(&trust, &json, &reported).is_err());
+        reported.threshold_identity[0] ^= 0x20;
+        reported.network_id = hellas_chain::genesis::HELLAS_DEVNET_1_ID.into();
+        assert!(pinned_consensus_verifier(&trust, &json, &reported).is_err());
+        reported.network_id = trust.network_id.clone();
+        trust.genesis_sha256 = "00".repeat(32);
+        assert!(pinned_consensus_verifier(&trust, &json, &reported).is_err());
+        trust.genesis_sha256 = hex::encode(hellas_chain::genesis_digest(&genesis));
+        trust.network_id = hellas_chain::genesis::HELLAS_DEVNET_1_ID.into();
+        assert!(pinned_consensus_verifier(&trust, &json, &reported).is_err());
+    }
+
+    #[test]
+    fn endpoint_cannot_choose_its_own_threshold_identity() {
+        let json = hellas_chain::genesis::HELLAS_DEVNET_1_JSON.as_bytes();
+        let identity = "97f1d3a73197d7942695638c4fa9ac0fc3688c4f9774b905a14e3a3f171bac586c55e83ff97a1aeffb3af00adb22c6bb";
+        let trust = hellas_chain::genesis::TrustDocument {
+            schema_version: 1,
+            network_id: hellas_chain::genesis::HELLAS_DEVNET_1_ID.into(),
+            genesis_sha256: "6e5e8d2b35f62724380afd2735ff8677f503bfc0c008e7bc8935e9a1214099bb"
+                .into(),
+            epochs: vec![hellas_chain::genesis::TrustEpoch {
+                epoch: 0,
+                start_height: 0,
+                end_height: None,
+                threshold_identity: identity.into(),
+            }],
+        };
+        let mut reported = hellas_chain::ConsensusInfo {
+            validators: vec![],
+            network_id: trust.network_id.clone(),
+            threshold_identity: hex::decode(identity).unwrap(),
+        };
+        assert!(pinned_consensus_verifier(&trust, json, &reported).is_ok());
+        // The negative of the pinned generator is also a valid BLS identity.
+        reported.threshold_identity[0] ^= 0x20;
+        let genesis: Genesis = serde_json::from_slice(json).unwrap();
+        assert!(
+            hellas_chain::ConsensusVerifier::new(&reported, hellas_chain::genesis_digest(&genesis))
+                .is_ok()
+        );
+        assert!(pinned_consensus_verifier(&trust, json, &reported).is_err());
+    }
+
+    #[test]
     fn owner_commands_use_global_passkey_and_one_coin_parser() {
         use clap::Parser as _;
         let node = hellas_kernel::Secp256k1Signer::from_secret_scalar([19; 32]).unwrap();
@@ -959,6 +1106,8 @@ mod tests {
                 operation,
                 "--rpc",
                 "ws://127.0.0.1:1",
+                "--trust",
+                "trust.json",
                 "--coin",
                 &coin,
             ];
@@ -986,6 +1135,7 @@ mod tests {
                     rpc: "invalid".into(),
                     network: "devnet".into(),
                     genesis: None,
+                    trust: "trust.json".into(),
                     coins: vec!["01".repeat(32)],
                 },
                 node: SettlementKey::from(Key::from_bytes([0; Key::LENGTH])),

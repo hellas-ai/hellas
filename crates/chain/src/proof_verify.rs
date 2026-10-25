@@ -40,7 +40,7 @@ pub enum VerificationError {
     Consensus(#[from] crate::ConsensusVerificationError),
     #[error(transparent)]
     Block(#[from] crate::BlockViewError),
-    #[error("trust document does not match the independently provisioned devnet genesis")]
+    #[error("trust document does not match the independently provisioned genesis")]
     Genesis,
     #[error("proof schema, network, or trust document does not match")]
     Identity,
@@ -78,7 +78,6 @@ impl ProofVerifier {
         let genesis: hellas_genesis::Genesis =
             serde_json::from_slice(genesis_json).map_err(|_| VerificationError::Genesis)?;
         if genesis.validate().is_err()
-            || genesis.network_id != hellas_genesis::HELLAS_DEVNET_1_ID
             || genesis.network_id != trust.network_id
             || trust.genesis_sha256 != hex::encode(Sha256::hash(genesis_json))
         {
