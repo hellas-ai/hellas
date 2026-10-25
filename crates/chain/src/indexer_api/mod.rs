@@ -237,7 +237,9 @@ async fn edge_index_ws(
     if headers.contains_key(header::ORIGIN) {
         return StatusCode::FORBIDDEN.into_response();
     }
-    ws.on_upgrade(move |socket| crate::edge_index::rpc::serve_socket(socket, state.edge_index))
+    ws.max_message_size(hellas_wire::mux::MAX_KEYED_FRAME_BYTES)
+        .max_frame_size(hellas_wire::mux::MAX_KEYED_FRAME_BYTES)
+        .on_upgrade(move |socket| crate::edge_index::rpc::serve_socket(socket, state.edge_index))
 }
 
 async fn block(
@@ -679,6 +681,91 @@ mod tests {
                     .unwrap();
                 assert_eq!(response.status(), StatusCode::OK);
             }
+        });
+    }
+
+    #[test]
+    fn websocket_upgrade_rejects_oversized_messages_and_frames() {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        use tokio_tungstenite::tungstenite::{
+            Message,
+            protocol::frame::{
+                Frame,
+                coding::{Data, OpCode},
+            },
+        };
+        crate::execution::test_support::run_qmdb(|context| async move {
+            let owner = crate::domain::SettlementKey::from(
+                hellas_kernel::Secp256k1Signer::from_secret_scalar([19; 32])
+                    .unwrap()
+                    .party_key(),
+            );
+            let h = crate::edge_index::ReplayHarness::new(
+                context.child("h"),
+                vec![(owner, 100)],
+                "origin-ws-cap",
+            )
+            .await;
+            let (indexer, _handle) = crate::spawn_archive(
+                context.child("follower"),
+                "origin-ws-cap-test",
+                Config::default(),
+                h.committee.verifier.clone(),
+                h.head,
+            )
+            .await
+            .unwrap();
+            let app = router(OriginState {
+                edge_index: h.index,
+                indexer,
+                owner_proofs: OwnerProofSource::Constructed(Arc::new(::tokio::sync::Mutex::new(
+                    h.replay,
+                ))),
+                verifier: Arc::new(h.verifier),
+                network_id: HELLAS_DEVNET_1_ID.into(),
+            });
+            let listener = ::tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = ::tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let cap = hellas_wire::mux::MAX_KEYED_FRAME_BYTES;
+            for fragmented in [false, true] {
+                let (mut ws, _) =
+                    tokio_tungstenite::connect_async(format!("ws://{addr}/api/v1/edge-index/rpc"))
+                        .await
+                        .unwrap();
+                if fragmented {
+                    let half = bytes::Bytes::from(vec![0; cap / 2 + 1]);
+                    let _ = ws
+                        .send(Message::Frame(Frame::message(
+                            half.clone(),
+                            OpCode::Data(Data::Binary),
+                            false,
+                        )))
+                        .await;
+                    let _ = ws
+                        .send(Message::Frame(Frame::message(
+                            half,
+                            OpCode::Data(Data::Continue),
+                            true,
+                        )))
+                        .await;
+                } else {
+                    use ::tokio::io::AsyncWriteExt as _;
+                    let mut header = vec![0x82, 0xff];
+                    header.extend_from_slice(&((cap + 1) as u64).to_be_bytes());
+                    header.extend_from_slice(&[0; 4]);
+                    ws.get_mut().write_all(&header).await.unwrap();
+                }
+                let closed = ::tokio::time::timeout(std::time::Duration::from_secs(2), ws.next())
+                    .await
+                    .expect("the actual upgrade must close a message above the wire cap");
+                assert!(!matches!(closed, Some(Ok(Message::Binary(_)))));
+            }
+            server.abort();
         });
     }
 
