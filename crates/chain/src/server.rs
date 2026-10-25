@@ -32,7 +32,7 @@ use tokio::{
     task::JoinHandle,
 };
 use tokio_stream::wrappers::BroadcastStream;
-use tokio_tungstenite::accept_async;
+use tokio_tungstenite::accept_async_with_config;
 use tracing::{info, warn};
 
 type ActivityStream = hellas_rpc::call::ResponseStream<ActivityEvent>;
@@ -160,8 +160,8 @@ async fn serve_connection<T>(
 where
     T: LightClientApi,
 {
-    let ws = accept_async(stream).await?;
-    let transport = hellas_wire::ws::accept_upgraded(ws, None);
+    let ws = accept_async_with_config(stream, Some(hellas_wire::ws::websocket_config())).await?;
+    let transport = hellas_wire::ws::accept_upgraded(ws, None)?;
     serve_light_client_transport(transport, service).await
 }
 

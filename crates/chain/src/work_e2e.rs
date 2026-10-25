@@ -609,8 +609,8 @@ impl Devnet {
                             let (stream, _) = accepted.unwrap();
                             let service = service.clone();
                             connections.spawn(async move {
-                                let ws = tokio_tungstenite::accept_async(stream).await.unwrap();
-                                let transport = hellas_wire::ws::accept_upgraded(ws, None);
+                                let ws = tokio_tungstenite::accept_async_with_config(stream, Some(hellas_wire::ws::websocket_config())).await.unwrap();
+                                let transport = hellas_wire::ws::accept_upgraded(ws, None).unwrap();
                                 let _ = crate::server::serve_light_client_transport(transport, service).await;
                             });
                         },

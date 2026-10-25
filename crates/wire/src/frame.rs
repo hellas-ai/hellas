@@ -240,6 +240,7 @@ fn checked_encoded_add(left: usize, right: usize) -> Result<usize, FrameError> {
 }
 
 pub fn decode_frame(buf: &[u8]) -> Result<Frame, FrameError> {
+    bounded_frame_len(buf.len() as u64)?;
     if buf.is_empty() {
         return Err(FrameError::Short { needed: 1, got: 0 });
     }
@@ -506,7 +507,6 @@ pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 /// Validate an untrusted wire length before narrowing it to the host pointer
 /// width. Comparing in `u64` first is essential on 32-bit targets: a direct
 /// `as usize` cast can wrap a huge announced length below the frame cap.
-#[cfg(any(feature = "iroh", test))]
 pub(crate) fn bounded_frame_len(len: u64) -> Result<usize, FrameError> {
     if len > MAX_FRAME_BYTES as u64 {
         return Err(FrameError::OversizedFrame {

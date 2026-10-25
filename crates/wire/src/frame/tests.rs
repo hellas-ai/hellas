@@ -178,3 +178,15 @@ fn end_frame_roundtrip() {
         _ => panic!("expected End"),
     }
 }
+
+#[test]
+fn inbound_frame_size_is_rejected_before_body_copy() {
+    let mut bytes = vec![0; MAX_FRAME_BYTES];
+    bytes[0] = FrameKind::Body.as_u8();
+    assert!(matches!(decode_frame(&bytes), Ok(Frame::Body(_))));
+    bytes.push(0);
+    assert!(
+        matches!(decode_frame(&bytes), Err(FrameError::OversizedFrame { len, cap })
+        if len == MAX_FRAME_BYTES + 1 && cap == MAX_FRAME_BYTES)
+    );
+}

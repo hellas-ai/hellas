@@ -41,6 +41,13 @@ pub enum WsError {
     Connect(String),
 }
 
+/// Configure both complete messages and individual fragments before any reads.
+pub fn websocket_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+    tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+        .max_message_size(Some(crate::mux::MAX_KEYED_FRAME_BYTES))
+        .max_frame_size(Some(crate::mux::MAX_KEYED_FRAME_BYTES))
+}
+
 /// `MessagePipe` adapter over a tokio-tungstenite `WebSocketStream`.
 ///
 /// Generic over the underlying byte stream so the same pipe works for
@@ -52,8 +59,17 @@ pub struct WsPipe<S> {
 }
 
 impl<S> WsPipe<S> {
-    pub fn new(ws: WebSocketStream<S>) -> Self {
-        Self { ws }
+    pub fn new(ws: WebSocketStream<S>) -> Result<Self, WsError> {
+        let config = ws.get_config();
+        let cap = crate::mux::MAX_KEYED_FRAME_BYTES;
+        if config.max_message_size.is_none_or(|size| size > cap)
+            || config.max_frame_size.is_none_or(|size| size > cap)
+        {
+            return Err(WsError::Connect(
+                "WebSocket exceeds the wire frame cap".into(),
+            ));
+        }
+        Ok(Self { ws })
     }
 
     pub fn into_inner(self) -> WebSocketStream<S> {
@@ -194,10 +210,11 @@ async fn connect_stream<const N: usize, S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let (ws, _resp) = tokio_tungstenite::client_async(request, stream)
-        .await
-        .map_err(|e| WsError::Connect(e.to_string()))?;
-    let pipe = WsPipe::new(ws);
+    let (ws, _resp) =
+        tokio_tungstenite::client_async_with_config(request, stream, Some(websocket_config()))
+            .await
+            .map_err(|e| WsError::Connect(e.to_string()))?;
+    let pipe = WsPipe::new(ws)?;
     // HTTPS certificate validation does not establish a Hellas principal.
     // WebSocket connections carry no protocol service binding or exporter.
     let transport = MuxTransport::spawn::<N, DefaultClock, _>(
@@ -238,12 +255,15 @@ fn websocket_tls_config() -> Result<std::sync::Arc<rustls::ClientConfig>, WsErro
 /// `peer` is the optional transport-vouched identity (e.g. extracted
 /// from a TLS client cert or an upstream auth header); pass `None` if
 /// the transport itself has nothing to vouch for.
-pub fn accept_upgraded<S>(ws: WebSocketStream<S>, peer: Option<PeerIdentity>) -> WsTransport
+pub fn accept_upgraded<S>(
+    ws: WebSocketStream<S>,
+    peer: Option<PeerIdentity>,
+) -> Result<WsTransport, WsError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let pipe = WsPipe::new(ws);
-    MuxTransport::spawn::<NATIVE_MUX_N, DefaultClock, _>(
+    let pipe = WsPipe::new(ws)?;
+    Ok(MuxTransport::spawn::<NATIVE_MUX_N, DefaultClock, _>(
         Role::Server,
         DefaultClock,
         MuxConfig::default(),
@@ -257,7 +277,7 @@ where
             peer,
             ..TransportContext::default()
         },
-    )
+    ))
 }
 
 // Compile-time assertion: keep our error type compatible with the
@@ -270,13 +290,93 @@ const _: fn() = || {
 #[cfg(test)]
 mod tests {
     #[tokio::test]
+    async fn websocket_parser_rejects_an_oversized_frame_header_before_its_payload() {
+        use tokio::io::AsyncWriteExt as _;
+        use tokio_tungstenite::tungstenite::{Error, protocol::Role};
+        let (local, mut remote) = tokio::io::duplex(512);
+        let ws =
+            WebSocketStream::from_raw_socket(local, Role::Client, Some(websocket_config())).await;
+        let mut pipe = WsPipe::new(ws).unwrap();
+        let mut header = vec![0x82, 0x7f];
+        header.extend_from_slice(&((crate::mux::MAX_KEYED_FRAME_BYTES + 1) as u64).to_be_bytes());
+        remote.write_all(&header).await.unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), pipe.recv_message())
+            .await
+            .expect("the frame length is refused without waiting for any payload");
+        assert!(matches!(result, Err(WsError::Ws(Error::Capacity(_)))));
+    }
+
+    #[tokio::test]
+    async fn pipe_rejects_unbounded_websocket_parsers() {
+        use tokio_tungstenite::tungstenite::protocol::Role;
+        let (local, _remote) = tokio::io::duplex(512);
+        let ws = WebSocketStream::from_raw_socket(local, Role::Server, None).await;
+        assert!(WsPipe::new(ws).is_err());
+    }
+
+    #[tokio::test]
+    async fn websocket_parser_rejects_oversized_messages_and_fragments() {
+        use tokio_tungstenite::tungstenite::{
+            Error,
+            protocol::{
+                Role,
+                frame::{
+                    Frame,
+                    coding::{Data, OpCode},
+                },
+            },
+        };
+        let cap = crate::mux::MAX_KEYED_FRAME_BYTES;
+        for fragmented in [false, true] {
+            let (local, remote) = tokio::io::duplex(64 * 1024);
+            let ws =
+                WebSocketStream::from_raw_socket(local, Role::Server, Some(websocket_config()))
+                    .await;
+            let mut pipe = WsPipe::new(ws).unwrap();
+            let sending = tokio::spawn(async move {
+                let mut peer = WebSocketStream::from_raw_socket(remote, Role::Client, None).await;
+                if fragmented {
+                    let half = Bytes::from(vec![0; cap / 2 + 1]);
+                    peer.send(Message::Frame(Frame::message(
+                        half.clone(),
+                        OpCode::Data(Data::Binary),
+                        false,
+                    )))
+                    .await?;
+                    peer.send(Message::Frame(Frame::message(
+                        half,
+                        OpCode::Data(Data::Continue),
+                        true,
+                    )))
+                    .await?;
+                } else {
+                    peer.send(Message::Binary(Bytes::from(vec![0; cap + 1])))
+                        .await?;
+                }
+                Ok::<_, Error>(peer)
+            });
+            assert!(
+                matches!(
+                    pipe.recv_message().await,
+                    Err(WsError::Ws(Error::Capacity(_)))
+                ),
+                "the WS parser must reject excess bytes before mux decoding"
+            );
+            drop(pipe);
+            let _ = sending.await;
+        }
+    }
+
+    #[tokio::test]
     async fn write_authority_is_checked_before_handing_a_message_to_websocket() {
         use super::*;
         use crate::write_authority::tests::Gate;
         use tokio_tungstenite::tungstenite::protocol::Role;
         let (local, remote) = tokio::io::duplex(512);
-        let mut pipe =
-            WsPipe::new(WebSocketStream::from_raw_socket(local, Role::Server, None).await);
+        let mut pipe = WsPipe::new(
+            WebSocketStream::from_raw_socket(local, Role::Server, Some(websocket_config())).await,
+        )
+        .unwrap();
         let mut peer = WebSocketStream::from_raw_socket(remote, Role::Client, None).await;
         let gate = Gate::default();
         let authority = gate.authority();
@@ -301,7 +401,6 @@ mod tests {
     use super::*;
     use crate::{Metadata, StreamTransport};
     use tokio::net::TcpListener;
-    use tokio_tungstenite::accept_async;
 
     #[cfg(feature = "ws-rustls")]
     #[test]
@@ -354,14 +453,18 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let peer = tokio::spawn(async move {
             let (tcp, _) = listener.accept().await.unwrap();
-            let ws = tokio_tungstenite::accept_hdr_async(tcp, assert_upgrade_request)
-                .await
-                .unwrap();
+            let ws = tokio_tungstenite::accept_hdr_async_with_config(
+                tcp,
+                assert_upgrade_request,
+                Some(websocket_config()),
+            )
+            .await
+            .unwrap();
             let transport = MuxTransport::spawn::<NATIVE_MUX_N, DefaultClock, _>(
                 Role::Client,
                 DefaultClock,
                 MuxConfig::default(),
-                WsPipe::new(ws),
+                WsPipe::new(ws).unwrap(),
                 TransportContext::default(),
             );
             let _stream = transport.open(42, Metadata::new()).await.unwrap();
@@ -415,10 +518,14 @@ mod tests {
                     .unwrap();
                 assert_eq!(tls.get_ref().1.protocol_version(), Some(version.version));
                 assert!(tls.get_ref().1.alpn_protocol().is_none());
-                let ws = tokio_tungstenite::accept_hdr_async(tls, assert_upgrade_request)
-                    .await
-                    .unwrap();
-                let transport = accept_upgraded(ws, None);
+                let ws = tokio_tungstenite::accept_hdr_async_with_config(
+                    tls,
+                    assert_upgrade_request,
+                    Some(websocket_config()),
+                )
+                .await
+                .unwrap();
+                let transport = accept_upgraded(ws, None).unwrap();
                 let inbound = transport.accept().await.unwrap().unwrap();
                 assert_eq!(inbound.method_id, 42);
             });
@@ -517,12 +624,14 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let relay = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            let ws = accept_async(stream).await.unwrap();
+            let ws = tokio_tungstenite::accept_async_with_config(stream, Some(websocket_config()))
+                .await
+                .unwrap();
             let transport = MuxTransport::spawn::<NATIVE_MUX_N, DefaultClock, _>(
                 Role::Client,
                 DefaultClock,
                 MuxConfig::default(),
-                WsPipe::new(ws),
+                WsPipe::new(ws).unwrap(),
                 TransportContext::default(),
             );
             transport.open(0xfeed_beef, Metadata::new()).await.unwrap()
