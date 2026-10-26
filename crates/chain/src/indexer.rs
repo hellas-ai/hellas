@@ -2,9 +2,9 @@
 mod retention;
 #[cfg(feature = "indexer-api")]
 pub(crate) mod trusted_epochs;
-#[cfg(any(test, feature = "indexer-api"))]
+#[cfg(any(test, feature = "indexer-api", feature = "test-support"))]
 use crate::ConsensusVerifier;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use crate::domain::PublicKey;
 use crate::{
     app::{HellasBlock, MarshalMailbox},
@@ -13,9 +13,9 @@ use crate::{
 };
 #[cfg(any(test, feature = "full-node"))]
 use crate::{config::Config, consensus::Finalization, domain::Scheme};
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use commonware_actor::Feedback;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use commonware_codec::DecodeExt;
 use commonware_codec::Encode;
 use commonware_consensus::{
@@ -32,7 +32,7 @@ use commonware_cryptography::{Digestible, sha256::Digest};
 use commonware_runtime::{BufferPooler, Clock, Handle, Metrics, Spawner, Storage};
 #[cfg(any(test, feature = "full-node"))]
 use commonware_utils::NZU64;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use commonware_utils::sync::AsyncMutex;
 #[cfg(any(test, feature = "full-node"))]
 use rand_core::CryptoRng;
@@ -128,13 +128,13 @@ where
 #[derive(Clone)]
 pub struct ChainIndexer {
     pub(crate) marshal: MarshalMailbox,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     verifier: Option<ConsensusVerifier>,
     #[cfg(all(test, feature = "indexer-api"))]
     schedule: Option<TrustedEpochs>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     ingest_lock: Arc<AsyncMutex<()>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fixture_source: FixtureSource,
     #[cfg(feature = "full-node")]
     retained_from: Arc<std::sync::atomic::AtomicU64>,
@@ -196,13 +196,13 @@ impl ChainIndexer {
     pub fn new(marshal: MarshalMailbox) -> Self {
         Self {
             marshal,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             verifier: None,
             #[cfg(all(test, feature = "indexer-api"))]
             schedule: None,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             ingest_lock: Arc::new(AsyncMutex::new(())),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             fixture_source: FixtureSource::default(),
             #[cfg(feature = "full-node")]
             retained_from: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -211,18 +211,18 @@ impl ChainIndexer {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn with_verifier(mut self, verifier: ConsensusVerifier) -> Self {
         self.verifier = Some(verifier);
         self
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn decode_block(bytes: &[u8]) -> Result<HellasBlock, IngestError> {
         HellasBlock::decode(bytes).map_err(|_| IngestError::InvalidBlock)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub async fn ingest_finalized(
         &self,
         block: HellasBlock,
@@ -238,7 +238,7 @@ impl ChainIndexer {
         .await
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub async fn ingest_finalized_proof(
         &self,
         block: HellasBlock,
@@ -251,7 +251,7 @@ impl ChainIndexer {
         .await
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     async fn ingest_proven_blocks(
         &self,
         block: HellasBlock,
@@ -499,7 +499,7 @@ impl ChainIndexer {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub async fn spawn_archive<E>(
     context: E,
     partition_prefix: &str,
@@ -577,7 +577,7 @@ where
     Ok((indexer, handle))
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 async fn spawn_archive_with_provider<E, P, H>(
     context: E,
     partition_prefix: &str,
@@ -629,11 +629,11 @@ fn finalized_block(block: HellasBlock, finalization: Vec<u8>) -> FinalizedBlock 
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Copy)]
 struct AutoAckApplication;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl Reporter for AutoAckApplication {
     type Activity = Update<HellasBlock>;
 
@@ -646,12 +646,12 @@ impl Reporter for AutoAckApplication {
 }
 
 // Test producers expose their certified blocks through an in-memory source.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Default)]
 struct FixtureSource(
     Arc<std::sync::Mutex<std::collections::BTreeMap<ResolverKey<Digest>, bytes::Bytes>>>,
 );
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl commonware_resolver::opaque::Fetcher for FixtureSource {
     type Key = ResolverKey<Digest>;
     type Value = bytes::Bytes;
@@ -663,7 +663,7 @@ impl commonware_resolver::opaque::Fetcher for FixtureSource {
 #[cfg(test)]
 mod tests;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use commonware_consensus::{
     Reporter,
     marshal::{
@@ -673,9 +673,9 @@ use commonware_consensus::{
     simplex::types::Activity,
     types::FixedEpocher,
 };
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use commonware_cryptography::certificate::ConstantProvider;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use commonware_utils::Acknowledgement;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use std::num::NonZeroU64;

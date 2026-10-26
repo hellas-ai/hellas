@@ -46,6 +46,10 @@ pub mod relay;
 pub mod rpc;
 #[cfg(feature = "server")]
 pub mod server;
+/// The six-validator devnet harness, for this crate's tests and, behind
+/// `test-support`, for other crates' tests.
+#[cfg(all(any(test, feature = "test-support"), feature = "validator"))]
+pub mod test_support;
 #[cfg(feature = "validator")]
 pub mod validator;
 #[cfg(feature = "work-watcher")]

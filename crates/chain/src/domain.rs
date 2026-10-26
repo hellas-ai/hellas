@@ -610,7 +610,7 @@ pub enum Transaction {
 /// network than the one its verifier runs on would fail for the right
 /// reason but the wrong cause, and the failure would read as a broken
 /// signature rather than a mismatched fixture.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) const TEST_NETWORK: NetworkId = match NetworkId::new("hellas-chain-test") {
     Some(network) => network,
     None => panic!("literal is a legal network id"),

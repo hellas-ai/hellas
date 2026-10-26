@@ -8,17 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::Bytes;
-use commonware_codec::Encode as _;
-use commonware_consensus::{
-    Block as _, CertifiableBlock as _,
-    simplex::types::Context,
-    types::{Epoch, Height, Round, View},
-};
 use commonware_cryptography::Digestible as _;
-use commonware_glue::stateful::db::{DatabaseSet, Merkleized as _, Unmerkleized as _};
-use commonware_runtime::{Handle, Supervisor as _};
-use commonware_storage::{mmr::Location, qmdb::sync::Target};
-use commonware_utils::non_empty_range;
 use hellas_auth::{ProducerSigningKey, PublicKey as RpcPublicKey};
 use hellas_client::work::payment::pay_for_result;
 use hellas_client::work::reproduce::{
@@ -26,10 +16,10 @@ use hellas_client::work::reproduce::{
 };
 use hellas_client::work::{CheckedResult, CollectOutcome, collect_checked_result};
 use hellas_kernel::{
-    BlockHash, BlockHeight, CoinId, Context as KernelContext, EdgeId, EdgeValues, Fees, Funding,
-    List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, MIN_OMIT_RESPONSE_BLOCKS, Move, Parties, Party,
-    PartyKeys, Payout, PendingSlot, Secp256k1Signer, Secp256k1Verifier, Terms as KernelTerms,
-    Tx as KernelTx, WorkPaymentTerms, WorkStakeBondTerms,
+    BlockHeight, CoinId, EdgeId, EdgeValues, Fees, Funding, List, MAX_EDGE_OUTPUTS,
+    MAX_PARTY_INPUTS, MIN_OMIT_RESPONSE_BLOCKS, Move, Parties, Party, PartyKeys, Payout,
+    PendingSlot, Secp256k1Signer, Secp256k1Verifier, Terms as KernelTerms, Tx as KernelTx,
+    WorkPaymentTerms, WorkStakeBondTerms,
 };
 use hellas_rpc::call::WithTrailer;
 use hellas_rpc::evaluate::{
@@ -68,21 +58,12 @@ use hellas_work::work_store::{Role, SetupOrigin, SetupScan, SetupStore};
 use tokio::sync::mpsc;
 
 use crate::HellasBlock;
-use crate::app::Mempool;
-use crate::config::{Genesis, GenesisEntry, GenesisValidator, ValidatorConfig};
-use crate::domain::{
-    KERNEL_FEES, Object, SettlementKey, TEST_NETWORK, coin_object_id, genesis_object_id,
-};
-use crate::execution::store::{UtxoDatabase, utxo_db_config};
-use crate::execution::test_support::{
-    ConsensusFixture, consensus_fixture_of, finalization, reshape_authorized, run_qmdb,
-};
-use crate::execution::{ChainVerifier, execute_all};
-use crate::genesis::GENESIS_SCHEMA_VERSION;
-use crate::indexer::spawn_archive;
-use crate::light_client::{ConsensusInfo, LightClient};
-use crate::owner_index::{ApplyOutcome, OwnerIndex};
+use crate::domain::{SettlementKey, TEST_NETWORK};
 use crate::rpc::LocalLightClient;
+use crate::test_support::devnet::{
+    Devnet, DevnetConfig, GenesisOwner, OwnerKind, delegate_allocation, genesis_coin,
+    run as run_qmdb,
+};
 use crate::work_blocks::{PaidWorkClockAdvance, WorkBlocks, advance_paid_work_clock};
 use crate::work_view::{FinalizedWorkView, WorkChannelQuery};
 
@@ -104,8 +85,6 @@ const OMISSION_BOND: u64 = 51;
 const PRICE: u64 = 10;
 /// The bond's timeout, and so the channel's admission horizon.
 const HORIZON: u64 = 64;
-/// The shipped devnet document's committee size.
-const VALIDATORS: u64 = 6;
 /// The response window the terms commit and the measurements claim.
 const WINDOW: u64 = MIN_OMIT_RESPONSE_BLOCKS + 4;
 const SALT: [u8; 32] = [0x5a; 32];
@@ -139,35 +118,8 @@ fn provider_producer() -> ProducerSigningKey {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-enum OwnerKind {
-    Native,
-    Passkey,
-}
-
-impl OwnerKind {
-    fn key(self, seed: u8) -> SettlementKey {
-        match self {
-            Self::Native => signer(seed).party_key().into(),
-            Self::Passkey => hellas_kernel::SoftPasskey::from_secret_scalar([seed; 32])
-                .unwrap()
-                .party_key()
-                .into(),
-        }
-    }
-    fn authorize(self, seed: u8, hash: hellas_kernel::PayloadHash) -> hellas_kernel::Auth {
-        match self {
-            Self::Native => hellas_kernel::Auth::native(signer(seed).sign(hash)),
-            Self::Passkey => hellas_kernel::Auth::webauthn(
-                hellas_kernel::SoftPasskey::from_secret_scalar([seed; 32])
-                    .unwrap()
-                    .sign(hash)
-                    .unwrap(),
-            ),
-        }
-    }
-}
-
+/// The two genesis allocations, as the chain minted them, and how the
+/// parties hold them.
 #[derive(Clone)]
 struct Allocations {
     coins: Vec<(SettlementKey, u64)>,
@@ -182,98 +134,40 @@ impl std::ops::Deref for Allocations {
     }
 }
 impl Allocations {
+    fn client_owner(&self) -> GenesisOwner {
+        GenesisOwner {
+            kind: self.owners,
+            seed: 0x31,
+            balance: CLIENT_FUNDING,
+        }
+    }
+    fn provider_owner(&self) -> GenesisOwner {
+        GenesisOwner {
+            kind: self.owners,
+            seed: 0x32,
+            balance: PROVIDER_STAKE,
+        }
+    }
     fn client_key(&self) -> SettlementKey {
-        self.owners.key(0x31)
+        self.client_owner().key()
     }
     fn provider_key(&self) -> SettlementKey {
-        self.owners.key(0x32)
+        self.provider_owner().key()
     }
 }
 
-// ── Genesis, as a document ────────────────────────────────────────────
-
-/// The genesis document this network is defined by.
-///
-/// Six validators and two allocations using the selected owner curve.
-/// Nothing here bypasses the genesis key parser.
-fn genesis_document(fixture: &ConsensusFixture, allocations: &Allocations) -> Genesis {
-    Genesis {
-        schema_version: GENESIS_SCHEMA_VERSION,
-        network_id: TEST_NETWORK.as_str().to_string(),
-        validators: fixture
-            .leaders
-            .iter()
-            .enumerate()
-            .map(|(index, key)| GenesisValidator {
-                public_key: hex::encode(key.encode()),
-                label: format!("validator-{index}"),
-            })
-            .collect(),
-        allocations: vec![
-            GenesisEntry {
-                address: allocations.client_key().to_string(),
-                balance: CLIENT_FUNDING,
-            },
-            GenesisEntry {
-                address: allocations.provider_key().to_string(),
-                balance: PROVIDER_STAKE,
-            },
-        ],
-    }
-}
-
-/// The allocations that document funds, derived the way a validator
-/// derives them.
-fn genesis_allocations(genesis: Genesis) -> Vec<(SettlementKey, u64)> {
-    let config = ValidatorConfig {
-        private_key: String::new(),
-        threshold_share: String::new(),
-        threshold_polynomial: String::new(),
-        listen_port: 0,
-        metrics_port: None,
-        metrics_bind_address: std::net::Ipv4Addr::LOCALHOST.into(),
-        light_client_bind: None,
-        chain_sync_bind: None,
-        archive_blocks: None,
-        relay_urls: Vec::new(),
-        genesis,
-        peers: Vec::new(),
-    };
-    match config.genesis_allocations() {
-        Ok(allocations) => allocations,
-        Err(error) => panic!("the genesis document funds both parties: {error}"),
-    }
-}
-
-/// The genesis coin one allocation minted, named by its position in the
-/// sorted allocation list — which is the index
-/// `maybe_seed_genesis` writes it under.
-fn genesis_coin(allocations: &Allocations, owner: SettlementKey) -> CoinId {
-    let Some(index) = allocations.iter().position(|(key, _)| *key == owner) else {
-        panic!("genesis funds this owner");
-    };
-    let Ok(index) = u16::try_from(index) else {
-        panic!("two allocations fit in a u16");
-    };
-    CoinId::from_bytes(genesis_object_id(index).into())
-}
-
+/// One party's whole genesis allocation, reshaped into a coin delegated
+/// to its node key.
 fn delegated_funding(
     allocations: &Allocations,
     is_client: bool,
 ) -> (crate::domain::Transaction, CoinId) {
-    let (seed, node, value) = if is_client {
-        (0x31, client(), CLIENT_FUNDING)
+    let (owner, node) = if is_client {
+        (allocations.client_owner(), client())
     } else {
-        (0x32, provider(), PROVIDER_STAKE)
+        (allocations.provider_owner(), provider())
     };
-    let owner = allocations.owners.key(seed);
-    let (tx, ids) = reshape_authorized(
-        &[coin_object_id(genesis_coin(allocations, owner))],
-        &[(owner, Some(node.party_key().into()), value)],
-        |hash| allocations.owners.authorize(seed, hash),
-    );
-    (tx, CoinId::from_bytes(ids[0].0))
+    delegate_allocation(allocations, &owner, node.party_key().into())
 }
 
 // ── The channel both parties sign ─────────────────────────────────────
@@ -420,483 +314,105 @@ fn descriptor(allocations: &Allocations) -> WorkChannelDescriptor {
     }
 }
 
-// ── One node, and six of them ─────────────────────────────────────────
+// ── The chain both parties read ───────────────────────────────────────
 
-/// One validator's own state: its database, its kernel's output, its
-/// owner index, its finalized-block indexer, and its mempool.
-struct Node {
-    database: UtxoDatabase<commonware_runtime::tokio::Context>,
-    index: OwnerIndex,
-    indexer: crate::indexer::ChainIndexer,
-    mempool: Mempool,
-    task: Handle<()>,
-}
-
-/// One runtime label per node. Static because `Supervisor::child` takes
-/// a `&'static str`, and six of them is the shipped committee.
-const NODE_LABELS: [&str; 6] = [
-    "validator_0",
-    "validator_1",
-    "validator_2",
-    "validator_3",
-    "validator_4",
-    "validator_5",
-];
-
-/// Six nodes on one genesis, and the proposer they do not have.
-struct Devnet {
-    nodes: Vec<Node>,
-    fixture: ConsensusFixture,
+/// The six-validator devnet with both parties' allocations, and the
+/// paid-work reads this file asserts through.
+struct WorkDevnet {
+    devnet: Devnet,
     allocations: Allocations,
-    full_nodes: Vec<crate::node::FullNode>,
-    rpc: tokio::task::JoinSet<()>,
-    activity: Vec<tokio::sync::broadcast::Sender<crate::ConsensusActivity>>,
-    _storage: tempfile::TempDir,
-    head: HellasBlock,
-    height: u64,
-    /// Every transaction already in finalized history, by digest.
-    ///
-    /// A count would not do. A mempool snapshot lists its response
-    /// residents in front of its general ones, so the moment a contest
-    /// answer arrives a positional cursor re-proposes transactions that
-    /// are already on chain — which the kernel then refuses. This is the
-    /// proposer's own rule, spelled here because there is no proposer.
-    included: BTreeSet<crate::domain::Digest>,
 }
 
-impl Devnet {
-    fn start(
+impl std::ops::Deref for WorkDevnet {
+    type Target = Devnet;
+    fn deref(&self) -> &Devnet {
+        &self.devnet
+    }
+}
+
+impl std::ops::DerefMut for WorkDevnet {
+    fn deref_mut(&mut self) -> &mut Devnet {
+        &mut self.devnet
+    }
+}
+
+impl WorkDevnet {
+    async fn start(
         runtime: commonware_runtime::tokio::Context,
         name: &str,
         owners: OwnerKind,
         locked: bool,
         owner_exit: bool,
-    ) -> impl std::future::Future<Output = Self> + '_ {
-        // Construct the network startup future outside the paid-job poll frame.
-        Box::pin(async move {
-            // Full nodes use live peer discovery; each devnet needs its own committee
-            // so concurrent tests cannot accept one another's certified blocks.
-            let seed = rand::random();
-            let fixture = consensus_fixture_of(seed, VALIDATORS);
-            let mut allocations = Allocations {
-                coins: Vec::new(),
-                owners,
-                locked,
-                owner_exit,
-            };
-            let document = genesis_document(&fixture, &allocations);
-            // The document is the network's identity, so the id everything
-            // below signs under is read back out of it rather than assumed.
-            let network = match crate::domain::network_id(&document) {
-                Ok(network) => network,
-                Err(error) => panic!("the genesis document names its network: {error}"),
-            };
-            assert_eq!(
-                network, TEST_NETWORK,
-                "every signature below is bound to the id the document declares",
-            );
-            allocations.coins = genesis_allocations(document.clone());
-            assert_eq!(
-                allocations.len(),
-                2,
-                "genesis funds exactly the two parties",
-            );
-            let fixture = crate::execution::test_support::consensus_fixture_in(
-                seed,
-                VALIDATORS,
-                network,
-                crate::genesis_digest(&document),
-            );
-            let consensus_info = ConsensusInfo {
-                validators: fixture
-                    .leaders
-                    .iter()
-                    .map(|key| hex::encode(key.encode()))
-                    .collect(),
-                threshold_identity: fixture.assembler.identity().encode().to_vec(),
-                network_id: TEST_NETWORK.as_str().to_string(),
-            };
-            assert_eq!(consensus_info.validators.len(), VALIDATORS as usize);
-
-            let (root, target) = crate::execution::store::empty_state(
-                runtime.child("genesis"),
-                &format!("{name}-genesis"),
-                1024,
-                8,
-            )
-            .await;
-            let genesis = HellasBlock::genesis(
-                fixture.leaders.iter().min().unwrap().clone(),
-                root,
-                target,
-                crate::genesis_digest(&document),
-            );
-            let mut nodes = Vec::new();
-            for (ordinal, label) in NODE_LABELS.iter().enumerate().take(VALIDATORS as usize) {
-                let partition = format!("{name}_{ordinal}");
-                let node_context = runtime.child(label);
-                let config = utxo_db_config(&node_context, &partition, 1024, 8);
-                let database =
-                    <UtxoDatabase<_> as DatabaseSet<_>>::init(node_context.child("db"), config)
-                        .await;
-                let (indexer, task) = spawn_archive(
-                    node_context.child("indexer"),
-                    &partition,
-                    crate::config::Config {
-                        mailbox_size: 32,
-                        replay_buffer: 32,
-                        write_buffer: 32,
-                        page_cache_size: 1024,
-                        page_cache_count: 8,
-                        ..crate::config::Config::default()
-                    },
-                    fixture.verifier.clone(),
-                    genesis.clone(),
-                )
-                .await
-                .expect("a follower indexer");
-                nodes.push(Node {
-                    database,
-                    index: OwnerIndex::new(TEST_NETWORK, &genesis, allocations.coins.clone()),
-                    indexer,
-                    mempool: Mempool::default(),
-                    task,
-                });
-            }
-
-            let storage = tempfile::tempdir().unwrap();
-            let mut full_nodes: Vec<crate::node::FullNode> = Vec::new();
-            let mut rpc = tokio::task::JoinSet::new();
-            let mut activity = Vec::new();
-            for (ordinal, node) in nodes.iter().take(2).enumerate() {
-                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-                let address = format!("ws://{}", listener.local_addr().unwrap());
-                let validator = LocalLightClient::new(
-                    node.database.clone(),
-                    node.index.clone(),
-                    node.mempool.clone(),
-                    node.indexer.clone(),
-                    consensus_info.clone(),
-                );
-                let (events, _) = tokio::sync::broadcast::channel(128);
-                activity.push(events.clone());
-                use hellas_wire::ServiceMarker as _;
-                let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
-                    .alpns(vec![
-                        hellas_rpc::services::chain_sync::ChainSync::ALPN
-                            .as_bytes()
-                            .to_vec(),
-                        hellas_rpc::services::node::Node::ALPN.as_bytes().to_vec(),
-                    ])
-                    .bind()
-                    .await
-                    .unwrap();
-                let seed = endpoint.addr();
-                rpc.spawn(crate::node::transport::serve_validator_endpoint(
-                    node.indexer.clone(),
-                    events.clone(),
-                    endpoint,
-                    node.database.clone(),
-                    fixture.verifier.clone(),
-                ));
-                rpc.spawn(async move {
-                let service = crate::LightClientRpc::with_state(validator, events,
-                    crate::LightClientRpcState::default());
-                let mut connections = tokio::task::JoinSet::new();
-                loop {
-                    tokio::select! {
-                        accepted = listener.accept() => {
-                            let (stream, _) = accepted.unwrap();
-                            let service = service.clone();
-                            connections.spawn(async move {
-                                let ws = tokio_tungstenite::accept_async_with_config(stream, Some(hellas_wire::ws::websocket_config())).await.unwrap();
-                                let transport = hellas_wire::ws::accept_upgraded(ws, None).unwrap();
-                                let _ = crate::server::serve_light_client_transport(transport, service).await;
-                            });
-                        },
-                        _ = connections.join_next(), if !connections.is_empty() => {},
-                    }
-                }
-            });
-                let node = crate::node::FullNode::start(crate::node::Config {
-                    genesis: document.clone(),
-                    threshold_identity: consensus_info.threshold_identity.clone(),
-                    genesis_payload: genesis.digest(),
-                    storage_dir: storage.path().join(format!("party-{ordinal}")),
-                    validators: vec![address],
-                    peers: std::iter::once(seed)
-                        .chain(full_nodes.iter().map(|node| node.endpoint_addr()))
-                        .collect(),
-                    archive_blocks: None,
-                })
-                .await
-                .unwrap();
-                full_nodes.push(node);
-            }
-
-            Self {
-                nodes,
-                fixture,
-                allocations,
-                full_nodes,
-                rpc,
-                activity,
-                _storage: storage,
-                head: genesis,
-                height: 0,
-                included: BTreeSet::new(),
-            }
-        })
-    }
-
-    fn light_client(&self, node: usize) -> LocalLightClient {
-        self.full_nodes[node]
-            .view()
-            .expect("party's full node has executed the finalized tip")
-            .client()
+    ) -> Self {
+        let mut allocations = Allocations {
+            coins: Vec::new(),
+            owners,
+            locked,
+            owner_exit,
+        };
+        let devnet = Devnet::start(
+            runtime,
+            DevnetConfig {
+                name,
+                owners: vec![allocations.client_owner(), allocations.provider_owner()],
+                full_nodes: 2,
+            },
+        )
+        .await;
+        allocations.coins = devnet.allocations().to_vec();
+        Self {
+            devnet,
+            allocations,
+        }
     }
 
     fn blocks(&self, node: usize) -> WorkBlocks<LocalLightClient> {
         WorkBlocks::new(self.light_client(node))
     }
 
-    /// Plays the proposer: everything every node's mempool has taken
-    /// since the last block goes into the next one, and all six execute
-    /// it.
-    ///
-    /// This is the simulated part, and it is simulated in exactly one
-    /// direction: the *ordering* is this function's, and the *execution*
-    /// is each node's own kernel. A block whose six state roots disagree
-    /// is refused here rather than finalized, so nothing below can rest
-    /// on one node's private opinion of the state.
-    async fn seal(&mut self) -> HellasBlock {
-        let mut fresh = Vec::new();
-        let mut proposed = BTreeSet::new();
-        for node in &self.nodes {
-            for transaction in node.mempool.test_transactions().await {
-                let digest =
-                    <commonware_cryptography::Sha256 as commonware_cryptography::Hasher>::hash(
-                        &commonware_codec::Encode::encode(&transaction),
-                    );
-                if self.included.contains(&digest) || !proposed.insert(digest) {
-                    continue;
-                }
-                fresh.push(transaction);
-            }
-        }
-        self.included.extend(proposed);
-        self.height += 1;
-
-        let mut root = None;
-        let mut owner_root = None;
-        let mut target = None;
-        for node in &self.nodes {
-            let batches = node.database.new_batches().await;
-            let batches = execute_all(
-                KernelContext::with_fees(
-                    TEST_NETWORK,
-                    BlockHeight::new(self.height),
-                    BlockHash::from_bytes(self.head.digest().0),
-                    KERNEL_FEES,
-                ),
-                &ChainVerifier::new(),
-                &fresh,
-                &self.allocations,
-                batches,
-            )
-            .await
-            .expect("the block executes");
-            let owners = crate::execution::owner_tree::root(&batches).await.unwrap();
-            if let Some(expected) = owner_root {
-                assert_eq!(owners, expected);
-            }
-            owner_root = Some(owners);
-            let merkleized = batches.merkleize().await.expect("state merkleizes");
-            let bounds = merkleized.bounds();
-            let node_target = Target {
-                root: merkleized.root(),
-                range: non_empty_range!(bounds.inactivity_floor, Location::new(bounds.total_size)),
-            };
-            if let Some(expected) = &target {
-                assert_eq!(&node_target, expected);
-            }
-            target = Some(node_target);
-            let node_root = merkleized.root();
-            match root {
-                None => root = Some(node_root),
-                Some(agreed) => assert_eq!(
-                    node_root, agreed,
-                    "every validator's own execution reaches the same state root",
-                ),
-            }
-            node.database.finalize(merkleized).await;
-        }
-        let Some(root) = root else {
-            panic!("a devnet has at least one node");
-        };
-
-        let block = HellasBlock::new(
-            Context {
-                round: Round::new(Epoch::zero(), View::new(self.height)),
-                leader: self.fixture.leaders[0].clone(),
-                parent: (self.head.context().round.view(), self.head.digest()),
-            },
-            self.head.digest(),
-            Height::new(self.height),
-            self.height,
-            root,
-            target.unwrap(),
-            fresh,
-        )
-        .with_owner_root(owner_root.unwrap());
-        let certificate = finalization(&self.fixture, &block);
-        for node in &self.nodes {
-            node.indexer
-                .ingest_finalized(block.clone(), certificate.clone())
-                .await
-                .expect("a certified block is ingested");
-            assert_eq!(
-                node.index.apply_finalized(&block),
-                Ok(ApplyOutcome::Applied),
-            );
-        }
-        self.head = block.clone();
-        for events in &self.activity {
-            let _ = events.send(crate::ConsensusActivity::Finalization {
-                proposal: crate::ProposalInfo {
-                    epoch: 0,
-                    view: self.height,
-                    parent_view: self.height - 1,
-                    parent_payload: block.parent(),
-                    payload: block.digest(),
-                },
-                signers: vec![],
-                certificate: certificate.encode().to_vec(),
-            });
-        }
-        for node in &self.full_nodes {
-            let mut progress = node.finalized();
-            tokio::time::timeout(std::time::Duration::from_secs(20), async {
-                while *progress.borrow_and_update() < self.height {
-                    progress.changed().await.unwrap();
-                }
-                node.wait_ready().await.unwrap();
-            })
-            .await
-            .unwrap_or_else(|error| {
-                panic!(
-                    "full node at {:?} did not reach {}: {error}; {:?}",
-                    *node.finalized().borrow(),
-                    self.height,
-                    node.peer_registry()
-                )
-            });
-            assert_eq!(
-                node.view()
-                    .unwrap()
-                    .client()
-                    .get_state_root()
-                    .await
-                    .unwrap(),
-                Some(root)
-            );
-        }
-        block
-    }
-
-    async fn seal_through(&mut self, height: u64) {
-        while self.height < height {
-            self.seal().await;
-        }
-    }
-
-    /// Every coin this fixture can mint for one owner at the finalized
-    /// tip, read from that node's executed QMDB state.
-    ///
-    /// QMDB has no full-object iterator, so the fixed transaction graph's
-    /// complete coin-id set is probed directly. Projected ids are added to
-    /// that set so an index-only extra is also caught, and the projection
-    /// must then equal the coins and values actually read from QMDB.
+    /// Every coin this fixture's transaction graph can mint for one
+    /// owner at the finalized tip, each checked for the delegation its
+    /// payout committed.
     async fn coins(&self, node: usize, owner: SettlementKey) -> Vec<(CoinId, u64)> {
         let allocations = &self.allocations;
-        let Some(held) = self
-            .light_client(node)
-            .get_coins_by_owner(owner)
-            .await
-            .expect("the owner index answers")
-        else {
-            panic!("the owner index has a finalized cursor");
-        };
-        let projected_root = held.snapshot.state_root;
-        let mut projected = held
-            .coins
-            .into_iter()
-            .map(|(id, value)| (CoinId::from_bytes(id.into()), value))
-            .collect::<Vec<_>>();
-        projected.sort_by_key(|(id, value)| (*value, *id));
-
-        let (earnings, refund) = payment_close_coins(&self.allocations);
+        let (earnings, refund) = payment_close_coins(allocations);
         let mut ids = BTreeSet::from([
-            genesis_coin(&self.allocations, allocations.client_key()),
-            genesis_coin(&self.allocations, allocations.provider_key()),
+            genesis_coin(allocations, allocations.client_key()),
+            genesis_coin(allocations, allocations.provider_key()),
             earnings,
             refund,
         ]);
         ids.extend(
             KernelTx::close_output_ids(
-                bond_edge(&self.allocations),
+                bond_edge(allocations),
                 &bond_terms(allocations).timeout_outputs,
             )
             .iter()
             .copied(),
         );
-        ids.extend(projected.iter().map(|(id, _)| *id));
-
-        let reader = self.nodes[node].database.read().await;
-        assert_eq!(
-            reader.root(),
-            projected_root,
-            "the owner projection and executed reads name the same finalized state",
-        );
-        let mut executed = Vec::new();
-        for id in ids {
-            match reader
-                .get(&coin_object_id(id))
-                .await
-                .expect("the finalized QMDB answers a coin read")
-            {
-                Some(Object::Coin(coin)) if coin.owner == owner => {
-                    let funding_coin =
-                        delegated_funding(allocations, owner == allocations.client_key()).1;
-                    let undelegated = id == genesis_coin(allocations, owner)
-                        || (allocations.locked && id != funding_coin)
-                        || (allocations.owner_exit && id == refund);
-                    let expected_delegate = if undelegated {
-                        None
-                    } else if owner == allocations.client_key() {
-                        Some(SettlementKey::from(client().party_key()))
-                    } else {
-                        Some(SettlementKey::from(provider().party_key()))
-                    };
-                    assert_eq!(
-                        coin.delegate, expected_delegate,
-                        "executed payout retains its committed node delegation"
-                    );
-                    executed.push((id, coin.value));
-                }
-                Some(Object::Coin(_)) | None => {}
-                Some(object) => panic!(
-                    "fixture coin id {id:?} resolved to a {} in finalized QMDB",
-                    object.kind(),
-                ),
-            }
-        }
-        executed.sort_by_key(|(id, value)| (*value, *id));
-        assert_eq!(
-            projected, executed,
-            "the owner-index projection agrees with the executed coin state",
-        );
-        executed
+        let funding_coin = delegated_funding(allocations, owner == allocations.client_key()).1;
+        self.devnet
+            .coins(node, owner, ids)
+            .await
+            .into_iter()
+            .map(|(id, coin)| {
+                let undelegated = id == genesis_coin(allocations, owner)
+                    || (allocations.locked && id != funding_coin)
+                    || (allocations.owner_exit && id == refund);
+                let expected_delegate = if undelegated {
+                    None
+                } else if owner == allocations.client_key() {
+                    Some(SettlementKey::from(client().party_key()))
+                } else {
+                    Some(SettlementKey::from(provider().party_key()))
+                };
+                assert_eq!(
+                    coin.delegate, expected_delegate,
+                    "executed payout retains its committed node delegation"
+                );
+                (id, coin.value)
+            })
+            .collect()
     }
 
     async fn value_of(&self, node: usize, owner: SettlementKey, coin: CoinId) -> Option<u64> {
@@ -923,17 +439,8 @@ impl Devnet {
             .expect("finalized channel state exists")
     }
 
-    /// Stops every follower indexer before the commonware runtime that
-    /// owns it is dropped.
-    async fn shutdown(mut self) {
-        for node in self.full_nodes {
-            node.shutdown().await.unwrap();
-        }
-        self.rpc.shutdown().await;
-        for node in self.nodes {
-            node.task.abort();
-            let _ = node.task.await;
-        }
+    async fn shutdown(self) {
+        self.devnet.shutdown().await;
     }
 }
 
@@ -1344,7 +851,7 @@ struct Opened {
 /// Steps 1 and 2: a real chain, a real genesis, and a real channel
 /// opened through it.
 async fn open_channel(
-    devnet: &mut Devnet,
+    devnet: &mut WorkDevnet,
     provider_root: &std::path::Path,
     client_root: &std::path::Path,
 ) -> Opened {
@@ -1501,7 +1008,7 @@ async fn open_channel(
 /// Step 3: one paid job, with both invocation counts asserted.
 ///
 /// Returns the price the provider acknowledged crediting.
-async fn run_one_paid_job(devnet: &Devnet, opened: &mut Opened) -> u64 {
+async fn run_one_paid_job(devnet: &WorkDevnet, opened: &mut Opened) -> u64 {
     let provider_calls = Arc::new(AtomicUsize::new(0));
     let client_calls = Arc::new(AtomicUsize::new(0));
     let backend = ProviderBackend {
@@ -1605,7 +1112,7 @@ async fn run_one_paid_job(devnet: &Devnet, opened: &mut Opened) -> u64 {
 }
 
 /// One tick through the same per-channel entry `serve` puts on its timer.
-async fn provider_clock(devnet: &Devnet, service: &WorkService) -> PaidWorkClockAdvance {
+async fn provider_clock(devnet: &WorkDevnet, service: &WorkService) -> PaidWorkClockAdvance {
     let blocks = devnet.blocks(PROVIDER_NODE);
     advance_paid_work_clock(service, &blocks)
         .await
@@ -1613,7 +1120,7 @@ async fn provider_clock(devnet: &Devnet, service: &WorkService) -> PaidWorkClock
 }
 
 /// Drives the provider's close until the contest it opened is on chain.
-async fn drive_close_onto_chain(devnet: &mut Devnet, service: &WorkService) {
+async fn drive_close_onto_chain(devnet: &mut WorkDevnet, service: &WorkService) {
     let advance = provider_clock(devnet, service).await;
     assert!(
         matches!(advance.close, CloseProgress::Submitted { .. }),
@@ -1635,7 +1142,7 @@ async fn drive_close_onto_chain(devnet: &mut Devnet, service: &WorkService) {
 }
 
 /// Lets the production clock submit a due adjudication and finalizes it.
-async fn settle_on_the_clock(devnet: &mut Devnet, service: &WorkService) -> HellasBlock {
+async fn settle_on_the_clock(devnet: &mut WorkDevnet, service: &WorkService) -> HellasBlock {
     let allocations = devnet.allocations.clone();
     assert_eq!(
         provider_clock(devnet, service).await.adjudication,
@@ -1655,7 +1162,7 @@ async fn settle_on_the_clock(devnet: &mut Devnet, service: &WorkService) -> Hell
 }
 
 /// Lets the production clock return the completed bond at its horizon.
-async fn return_the_stake(devnet: &mut Devnet, service: &WorkService) -> CoinId {
+async fn return_the_stake(devnet: &mut WorkDevnet, service: &WorkService) -> CoinId {
     let allocations = devnet.allocations.clone();
     devnet.seal_through(HORIZON).await;
     assert_eq!(
@@ -1735,7 +1242,7 @@ fn one_paid_job_earns_the_price_and_returns_the_stake_separately() {
                 let provider_root = tempfile::tempdir().expect("a temp dir");
                 let client_root = tempfile::tempdir().expect("a temp dir");
                 let mut devnet =
-                    Devnet::start(runtime, "work_e2e_paid", owners, locked, false).await;
+                    WorkDevnet::start(runtime, "work_e2e_paid", owners, locked, false).await;
                 let allocations = devnet.allocations.clone();
 
                 let mut opened =
@@ -1906,7 +1413,7 @@ fn an_understated_close_is_answered_and_pays_the_certificate() {
                 let provider_root = tempfile::tempdir().expect("a temp dir");
                 let client_root = tempfile::tempdir().expect("a temp dir");
                 let mut devnet =
-                    Devnet::start(runtime, "work_e2e_contest", owners, false, owner_exit).await;
+                    WorkDevnet::start(runtime, "work_e2e_contest", owners, false, owner_exit).await;
                 let allocations = devnet.allocations.clone();
 
                 let mut opened =
@@ -1919,7 +1426,7 @@ fn an_understated_close_is_answered_and_pays_the_certificate() {
                 let start = close_start(
                     opened.ready.channel(),
                     Party::Maker,
-                    devnet.height,
+                    devnet.height(),
                     None,
                     &client(),
                 )
@@ -1935,7 +1442,7 @@ fn an_understated_close_is_answered_and_pays_the_certificate() {
                         start.certificate().cloned(),
                         hellas_kernel::PartyAuth::new(
                             hellas_kernel::Authority::Owner,
-                            allocations.owners.authorize(0x31, hash),
+                            allocations.client_owner().authorize(hash),
                         ),
                     )
                 } else {
@@ -1955,7 +1462,7 @@ fn an_understated_close_is_answered_and_pays_the_certificate() {
                 );
                 devnet.seal().await;
 
-                let opened_at = devnet.height;
+                let opened_at = devnet.height();
                 let deadline = match devnet.snapshot(PROVIDER_NODE, &allocations).await.pending() {
                     PendingSlot::Present(pending) => {
                         assert_eq!(
@@ -1994,9 +1501,9 @@ fn an_understated_close_is_answered_and_pays_the_certificate() {
                     "the response is in finalized history",
                 );
                 assert!(
-                    devnet.height < deadline,
+                    devnet.height() < deadline,
                     "and it landed at {} — before the deadline at {deadline}",
-                    devnet.height,
+                    devnet.height(),
                 );
 
                 let settled = match devnet.snapshot(PROVIDER_NODE, &allocations).await.pending() {

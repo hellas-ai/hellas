@@ -147,6 +147,9 @@ validator = [
     "hellas-kernel/secp256k1",
     "hellas-kernel/webauthn",
 ]
+# The six-validator devnet harness (`test_support::devnet`) other crates'
+# tests run a chain with. No shipped build enables it.
+test-support = ["validator", "dep:tempfile"]
 wasm-client = ["client-core", "hellas-wire/ws-wasm"]
 # The block source a paid endpoint's settlement watcher reads. It is its
 # own feature because a paid endpoint needs both the block codec and the
@@ -197,6 +200,7 @@ rand_core = { workspace = true, optional = true }
 redb = { version = "4", optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
+tempfile = { workspace = true, optional = true }
 thiserror = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true, features = [
     "net",

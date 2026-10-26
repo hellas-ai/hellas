@@ -5,14 +5,17 @@ mod kernel;
 #[cfg(feature = "full-node")]
 pub(crate) mod owner_tree;
 pub mod store;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
+// Outside this crate's own tests only the devnet harness reads it, and
+// it reads a subset.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod test_support;
 #[cfg(feature = "full-node")]
 mod verifier;
 #[cfg(feature = "full-node")]
 mod working_set;
 
-#[cfg(all(test, feature = "full-node"))]
+#[cfg(all(any(test, feature = "test-support"), feature = "full-node"))]
 pub use kernel::execute_all;
 #[cfg(feature = "full-node")]
 pub use kernel::{ExecutionError, execute_proposal};
