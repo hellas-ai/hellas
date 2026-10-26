@@ -155,7 +155,7 @@ wasm-client = ["client-core", "hellas-wire/ws-wasm"]
 # own feature because a paid endpoint needs both the block codec and the
 # durable work driver, while a chain client that only serves coins has no
 # use for either.
-work-watcher = ["block-view", "dep:hellas-work"]
+work-watcher = ["block-view", "dep:hellas-work", "dep:tokio"]
 
 [dependencies]
 axum = { workspace = true, optional = true }

@@ -25,6 +25,14 @@ use tokio::sync::watch;
 pub(crate) mod replication;
 pub(crate) mod transport;
 pub use transport::FullNode;
+
+/// One bounded ChainSync recovery cycle: idle subscription, maximum retry,
+/// connection and subscription establishment.
+pub const RECOVERY_TIMEOUT: std::time::Duration = replication::STREAM_IDLE_TIMEOUT
+    .saturating_add(std::time::Duration::from_millis(
+        replication::MAX_RETRY_DELAY_MS,
+    ))
+    .saturating_add(replication::TIMEOUT.saturating_mul(2));
 #[cfg(feature = "validator")]
 pub(crate) use transport::serve_validator_archive;
 

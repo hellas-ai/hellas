@@ -52,15 +52,6 @@ where
 /// The shipped devnet document's committee size.
 pub const VALIDATORS: usize = 6;
 
-// Allow one ChainSync recovery cycle: idle stream + maximum retry delay
-// + connection + subscription (20 + 30 + 5 + 5 = 60 seconds).
-// A notification alone is insufficient: seal still checks the executed root.
-const FULL_NODE_TIMEOUT: std::time::Duration = crate::node::replication::STREAM_IDLE_TIMEOUT
-    .saturating_add(std::time::Duration::from_millis(
-        crate::node::replication::MAX_RETRY_DELAY_MS,
-    ))
-    .saturating_add(crate::node::replication::TIMEOUT.saturating_mul(2));
-
 /// The runtime handed to [`Devnet::start`]; [`run`] provides one.
 pub type Runtime = commonware_runtime::tokio::Context;
 
@@ -634,7 +625,7 @@ impl Devnet {
         }
         for node in &self.full_nodes {
             let mut progress = node.finalized();
-            tokio::time::timeout(FULL_NODE_TIMEOUT, async {
+            tokio::time::timeout(crate::node::RECOVERY_TIMEOUT, async {
                 while *progress.borrow_and_update() < self.height {
                     progress.changed().await.unwrap();
                 }

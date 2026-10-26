@@ -256,15 +256,16 @@ async fn sealing_while<T>(
     work: impl std::future::Future<Output = T>,
 ) -> T {
     tokio::time::timeout(Duration::from_secs(120), async {
-        tokio::pin!(work);
-        loop {
-            tokio::select! {
-                output = &mut work => return output,
-                _ = tokio::time::sleep(period) => {},
+        let proposer = async {
+            loop {
+                tokio::time::sleep(period).await;
+                devnet.seal().await;
             }
-            // Setup reads require a caught-up local node. Poll the command only
-            // between blocks, after seal has waited for both nodes to apply them.
-            devnet.seal().await;
+        };
+        tokio::pin!(proposer);
+        tokio::select! {
+            output = work => output,
+            () = &mut proposer => unreachable!(),
         }
     })
     .await
@@ -450,23 +451,38 @@ fn a_paid_fetch_job_through_the_sdk_earns_the_price_and_returns_the_stake_separa
             timeout: Duration::from_secs(120),
         };
         let client_authority = client_authority(&root.path().join("client-authority"), now).await;
-        // Open on controlled blocks, then run the job on a fixed finalized
-        // tip. The local-node setup path rejects reads during catch-up, and
-        // its observer suspends payment readiness during that same window.
+        // Setup runs concurrently with node execution. Keep the job on a
+        // stable tip because payment readiness expires while its independent
+        // observer catches up; setup read recovery is exercised separately.
         let endpoint = bind_paid_endpoint(client_transport.clone()).await.unwrap();
-        let mut session = sealing_while(
-            &mut devnet,
-            Duration::from_millis(100),
-            PaidWorkSession::open(
-                options.clone(),
-                endpoint.clone(),
-                client_settlement(),
-                client_node.clone(),
-                client_authority.clone(),
-            ),
-        )
-        .await
-        .unwrap();
+        let open = PaidWorkSession::open(
+            options.clone(),
+            endpoint.clone(),
+            client_settlement(),
+            client_node.clone(),
+            client_authority.clone(),
+        );
+        tokio::pin!(open);
+        // Let initial readiness succeed, then force the retained source behind
+        // while its first setup exchange is in flight.
+        tokio::select! {
+            result = &mut open => panic!("setup ended before any Open finalized: {}", result.err().map_or_else(|| "unexpected success".into(), |error| error.to_string())),
+            () = async {
+                while !options.journal_root.exists() {
+                    tokio::task::yield_now().await;
+                }
+            } => {},
+        }
+        client_node.require_finalized_height_for_test(devnet.height() + 1);
+        assert!(client_node.view().is_err());
+        assert!(
+            tokio::time::timeout(options.config.poll, &mut open)
+                .await
+                .is_err()
+        );
+        let mut session = sealing_while(&mut devnet, Duration::from_millis(100), open)
+            .await
+            .unwrap();
         session.shutdown().await;
         drop(session);
         endpoint.close().await;
@@ -560,6 +576,74 @@ fn a_paid_fetch_job_through_the_sdk_earns_the_price_and_returns_the_stake_separa
         );
 
         provider.shutdown().await.unwrap();
+        devnet.shutdown().await;
+    });
+}
+
+#[test]
+fn setup_reads_recover_after_execution_and_expire_with_a_typed_error() {
+    use hellas_chain::WorkBlocks;
+    use hellas_work::work_close::{BlockSourceError, FinalizedBlocks as _};
+    use hellas_work::work_open::{SetupQuery, SetupView as _};
+
+    run(|runtime| async move {
+        let mut devnet = Devnet::start(
+            runtime,
+            DevnetConfig {
+                name: "sdk_setup_reads",
+                owners: vec![CLIENT_OWNER],
+                full_nodes: 1,
+            },
+        )
+        .await;
+        devnet.seal().await;
+        let node = devnet.full_node(0).clone();
+        let client = node.view().unwrap().client();
+        let timeout = hellas_chain::node::RECOVERY_TIMEOUT;
+        let poll = work_config(&devnet, std::path::PathBuf::new()).poll;
+        let source = WorkBlocks::new(client.clone()).with_read_retry(poll, timeout);
+        let query = SetupQuery {
+            bond_edge: hellas_kernel::EdgeId::from_bytes([0; 32]),
+            payment_edge: hellas_kernel::EdgeId::from_bytes([1; 32]),
+            funding: Default::default(),
+        };
+        let next = devnet.height() + 1;
+        node.require_finalized_height_for_test(next);
+        assert!(matches!(
+            client.get_latest_block().await,
+            Err(hellas_chain::QueryError::StateUnavailable(_))
+        ));
+        let read = source.finalized_setup(query.clone());
+        tokio::pin!(read);
+        assert!(tokio::time::timeout(poll, &mut read).await.is_err());
+        let (snapshot, block) = tokio::join!(read, devnet.seal());
+        assert_eq!(snapshot.unwrap().unwrap().height, next);
+        assert_eq!(source.latest_height().await.unwrap(), Some(next));
+        assert_eq!(
+            source.block_at(next).await.unwrap().unwrap().payload,
+            hellas_chain::FinalizedBlockView::decode(
+                &client
+                    .get_finalized_block(hellas_chain::FinalizedBlockQuery::Height(next))
+                    .await
+                    .unwrap()
+                    .unwrap()
+            )
+            .unwrap()
+            .payload()
+            .0
+        );
+        drop(block);
+
+        node.require_finalized_height_for_test(next + 1);
+        let started = tokio::time::Instant::now();
+        let error = source.finalized_setup(query).await.unwrap_err();
+        assert!(
+            matches!(error, BlockSourceError::ReadUnavailableTimeout { timeout: elapsed, .. }
+            if elapsed == timeout)
+        );
+        assert!(started.elapsed() >= timeout);
+        // A failed read never advances a journal or makes the stale node usable.
+        assert!(node.view().is_err());
         devnet.shutdown().await;
     });
 }

@@ -243,6 +243,16 @@ impl FullNode {
     pub fn finalized(&self) -> watch::Receiver<u64> {
         self.0.core.progress.subscribe()
     }
+    /// Requires the real executor to reach `height` before test reads can resume.
+    #[cfg(feature = "test-support")]
+    pub fn require_finalized_height_for_test(&self, height: u64) {
+        self.0
+            .core
+            .readiness
+            .seen
+            .fetch_max(height, Ordering::AcqRel);
+    }
+
     pub async fn wait_ready(&self) -> Result<ChainView, QueryError> {
         let mut progress = self.finalized();
         loop {

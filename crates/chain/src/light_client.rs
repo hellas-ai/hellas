@@ -174,6 +174,11 @@ pub enum QueryError {
     ChannelClosed,
     #[error("state unavailable: {0}")]
     StateUnavailable(String),
+    #[error("chain read remained unavailable for {timeout:?}: {reason}")]
+    ReadUnavailableTimeout {
+        timeout: std::time::Duration,
+        reason: String,
+    },
     #[error("wrong object kind: expected {expected}, found {actual}")]
     WrongObjectKind {
         expected: ObjectKind,
@@ -196,6 +201,10 @@ impl From<QueryError> for WireStatus {
             QueryError::StateUnavailable(message) => {
                 WireStatus::new(WireCode::FailedPrecondition, message)
             }
+            QueryError::ReadUnavailableTimeout { timeout, reason } => WireStatus::new(
+                WireCode::Unavailable,
+                format!("chain read remained unavailable for {timeout:?}: {reason}"),
+            ),
             QueryError::WrongObjectKind { expected, actual } => WireStatus::new(
                 WireCode::Aborted,
                 wrong_object_kind_message(expected, actual),
