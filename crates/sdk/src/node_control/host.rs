@@ -432,17 +432,19 @@ impl Runtime {
         &self,
         mut detail: String,
         prepared: Option<&mut Box<dyn PreparedProviderConfiguration>>,
-    ) -> Result<(), WireStatus> {
+    ) -> Result<WireStatus, WireStatus> {
         if let Some(prepared) = prepared
             && let Err(error) = prepared.rollback()
         {
             detail = format!("configuration rollback failed: {}", failure_detail(&*error));
         }
         detail.truncate(detail.floor_char_boundary(1024));
+        let status = WireStatus::new(WireCode::Unavailable, detail.clone());
         self.with(|state| {
             state.provider_state = RuntimeState::Failed;
             state.provider_failure = Some(detail);
-        })
+        })?;
+        Ok(status)
     }
     async fn set(
         &self,
@@ -475,8 +477,8 @@ impl Runtime {
             Some(update) => {
                 let factory = provider.as_ref().ok_or_else(unsupported)?;
                 let prepare = factory.prepare.as_ref().ok_or_else(unsupported)?;
-                Some(prepare(update.clone()).map_err(|_| {
-                    WireStatus::new(WireCode::InvalidArgument, "provider configuration refused")
+                Some(prepare(update.clone()).map_err(|error| {
+                    WireStatus::new(WireCode::InvalidArgument, failure_detail(&*error))
                 })?)
             }
             None => None,
@@ -486,8 +488,7 @@ impl Runtime {
             let metadata = match prepared.commit() {
                 Ok(metadata) => metadata,
                 Err(error) => {
-                    self.provider_failed(failure_detail(&*error), Some(prepared))?;
-                    return Err(unavailable());
+                    return Err(self.provider_failed(failure_detail(&*error), Some(prepared))?);
                 }
             };
             return self.with(|state| state.configuration = Some(metadata));
@@ -519,15 +520,15 @@ impl Runtime {
         if let Some(prepared) = prepared.as_mut()
             && let Err(error) = prepared.commit()
         {
-            self.provider_failed(failure_detail(&*error), Some(prepared))?;
-            return Err(unavailable());
+            return Err(self.provider_failed(failure_detail(&*error), Some(prepared))?);
         }
         match command.service {
             Service::Provider => {
                 let factory = provider.as_ref().ok_or_else(unsupported)?;
                 if *stopped.borrow() {
-                    self.provider_failed("host is shutting down".into(), prepared.as_mut())?;
-                    return Err(unavailable());
+                    return Err(
+                        self.provider_failed("host is shutting down".into(), prepared.as_mut())?
+                    );
                 }
                 self.with(|state| state.provider_state = RuntimeState::Starting)?;
                 match (factory.start)(control.clone()).await {
@@ -540,11 +541,10 @@ impl Runtime {
                             _ => false,
                         } {
                             let _ = handle.shutdown().await;
-                            self.provider_failed(
+                            return Err(self.provider_failed(
                                 HostError::Composition.to_string(),
                                 prepared.as_mut(),
-                            )?;
-                            return Err(unavailable());
+                            )?);
                         }
                         self.with(|state| {
                             self.endpoint.send_replace(Some(handle.endpoint().clone()));
@@ -555,8 +555,7 @@ impl Runtime {
                         })
                     }
                     Err(error) => {
-                        self.provider_failed(failure_detail(&*error), prepared.as_mut())?;
-                        Err(unavailable())
+                        Err(self.provider_failed(failure_detail(&*error), prepared.as_mut())?)
                     }
                 }
             }
@@ -572,11 +571,12 @@ impl Runtime {
                         state.gateway_state = RuntimeState::Running;
                     }),
                     Err(error) => {
+                        let detail = failure_detail(&*error);
                         self.with(|state| {
                             state.gateway_state = RuntimeState::Failed;
-                            state.gateway_failure = Some(failure_detail(&*error));
+                            state.gateway_failure = Some(detail.clone());
                         })?;
-                        Err(unavailable())
+                        Err(WireStatus::new(WireCode::Unavailable, detail))
                     }
                 }
             }

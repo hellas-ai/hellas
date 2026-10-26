@@ -4,6 +4,8 @@ use hellas_work::test_support::{assert_err, within};
 use std::sync::atomic::AtomicUsize;
 
 type Client = Arc<HostControlClientImpl<hellas_wire::mux::MuxTransport>>;
+mod gateway_keys;
+mod startup_errors;
 struct Harness {
     fixture: Fixture,
     host: HostHandle,

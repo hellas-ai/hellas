@@ -860,6 +860,37 @@ mod tests {
         }
     }
 
+    #[test]
+    fn invalid_pool_options_are_refused_without_starting_a_gateway() {
+        use hellas_kernel::{CoinId, Funding, List};
+        let fixture = crate::test_support::PaidFixture::new();
+        assert!(pool_options(&fixture).validate().is_ok());
+
+        let mut zero = pool_options(&fixture);
+        zero.max_pending_requests = 0;
+        assert!(matches!(zero.validate(), Err(PoolError::Invalid(_))));
+
+        let mut duplicate = pool_options(&fixture);
+        let mut second = duplicate.providers[0].clone();
+        second.journal_root = fixture.root.path().join("second");
+        second.payment_funding = Funding::new(
+            List::take([CoinId::from_bytes([2; 32]); 4], 1),
+            List::empty(CoinId::from_bytes([0; 32])),
+        );
+        duplicate.providers.push(second);
+        assert!(matches!(
+            duplicate.validate(),
+            Err(PoolError::DuplicateProvider(_))
+        ));
+
+        let mut shared = pool_options(&fixture);
+        let mut other = shared.providers[0].clone();
+        other.journal_root = fixture.root.path().join("other");
+        other.provider = iroh::SecretKey::from_bytes(&[4; 32]).public();
+        shared.providers.push(other);
+        assert!(matches!(shared.validate(), Err(PoolError::Invalid(_))));
+    }
+
     #[tokio::test]
     async fn paid_responses_backend_uses_its_manifest_and_refuses_route_mismatch_before_funding() {
         let mut fixture = crate::test_support::PaidFixture::new();
