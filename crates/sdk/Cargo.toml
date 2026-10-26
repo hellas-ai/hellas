@@ -67,6 +67,7 @@ bytes.workspace = true
 commonware-codec.workspace = true
 commonware-cryptography.workspace = true
 commonware-runtime.workspace = true
+hellas-chain = { workspace = true, features = ["test-support"] }
 hellas-work = { workspace = true, features = ["test-support"] }
 rcgen = "0.14"
 reqwest = { workspace = true, features = ["json"] }
