@@ -253,6 +253,12 @@ impl FullNode {
             .fetch_max(height, Ordering::AcqRel);
     }
 
+    /// Readiness checks attempted by this node's readers, for deterministic tests.
+    #[cfg(feature = "test-support")]
+    pub fn read_attempts_for_test(&self) -> u64 {
+        self.0.core.readiness.read_attempts.load(Ordering::Acquire)
+    }
+
     pub async fn wait_ready(&self) -> Result<ChainView, QueryError> {
         let mut progress = self.finalized();
         loop {

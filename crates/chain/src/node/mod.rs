@@ -103,6 +103,8 @@ impl Config {
 
 #[derive(Default)]
 pub(crate) struct Readiness {
+    #[cfg(feature = "test-support")]
+    pub(crate) read_attempts: AtomicU64,
     seen: AtomicU64,
     pub(crate) applied: AtomicU64,
     observed: AtomicBool,
@@ -118,6 +120,8 @@ impl Readiness {
         Ok(())
     }
     pub(crate) fn check(&self) -> Result<(), QueryError> {
+        #[cfg(feature = "test-support")]
+        self.read_attempts.fetch_add(1, Ordering::AcqRel);
         self.running()?;
         if !self.observed.load(Ordering::Acquire)
             || self.applied.load(Ordering::Acquire) < self.seen.load(Ordering::Acquire)
