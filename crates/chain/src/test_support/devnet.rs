@@ -816,16 +816,34 @@ mod tests {
     #[test]
     fn a_full_node_recovers_when_its_chain_sync_source_returns_after_twenty_seconds() {
         run(|runtime| async move {
+            let owner = GenesisOwner {
+                kind: OwnerKind::Native,
+                seed: 0x43,
+                balance: 7,
+            };
             let mut devnet = Devnet::start(
                 runtime,
                 DevnetConfig {
                     name: "devnet_sync_recovery",
-                    owners: vec![],
+                    owners: vec![owner],
                     full_nodes: 1,
                 },
             )
             .await;
             devnet.seal().await;
+            let (tx, _) = delegate_allocation(
+                devnet.allocations(),
+                &owner,
+                native_signer(0x44).party_key().into(),
+            );
+            assert_eq!(
+                devnet
+                    .validator_light_client(0)
+                    .submit_tx(tx)
+                    .await
+                    .unwrap(),
+                crate::SubmitTxOutcome::Enqueued,
+            );
 
             // Stop the actual transport, including its existing subscriptions.
             // Keep its address so the node's ordinary reconnect path can recover.
@@ -855,6 +873,7 @@ mod tests {
                 .await;
             });
             let block = devnet.seal().await;
+            assert_eq!(block.txs().len(), 1, "recovery executes a nonempty block");
             assert!(started.elapsed() >= outage);
             assert_eq!(
                 devnet
