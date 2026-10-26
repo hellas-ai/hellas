@@ -97,6 +97,7 @@ let
       cargo clippy -p hellas-chain --no-default-features --features client-core --all-targets -- -D warnings
       cargo clippy -p hellas-chain --no-default-features --features proof-verify --all-targets -- -D warnings
       cargo clippy -p hellas-chain --no-default-features --features full-node --all-targets -- -D warnings
+      cargo check -p hellas-chain --no-default-features --features test-support,indexer-api --lib
       cargo check -p hellas-sdk --all-features --all-targets
     '' (cargoEnv rustToolchain);
     # Run command tests locally as well as in the release package builds.

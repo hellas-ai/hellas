@@ -39,7 +39,7 @@ use rand_core::CryptoRng;
 #[cfg(any(test, feature = "full-node"))]
 use std::{num::NonZeroUsize, sync::Arc};
 use thiserror::Error;
-#[cfg(all(test, feature = "indexer-api"))]
+#[cfg(all(any(test, feature = "test-support"), feature = "indexer-api"))]
 use trusted_epochs::TrustedEpochs;
 
 #[cfg(any(test, feature = "full-node"))]
@@ -130,7 +130,7 @@ pub struct ChainIndexer {
     pub(crate) marshal: MarshalMailbox,
     #[cfg(any(test, feature = "test-support"))]
     verifier: Option<ConsensusVerifier>,
-    #[cfg(all(test, feature = "indexer-api"))]
+    #[cfg(all(any(test, feature = "test-support"), feature = "indexer-api"))]
     schedule: Option<TrustedEpochs>,
     #[cfg(any(test, feature = "test-support"))]
     ingest_lock: Arc<AsyncMutex<()>>,
@@ -198,7 +198,7 @@ impl ChainIndexer {
             marshal,
             #[cfg(any(test, feature = "test-support"))]
             verifier: None,
-            #[cfg(all(test, feature = "indexer-api"))]
+            #[cfg(all(any(test, feature = "test-support"), feature = "indexer-api"))]
             schedule: None,
             #[cfg(any(test, feature = "test-support"))]
             ingest_lock: Arc::new(AsyncMutex::new(())),
