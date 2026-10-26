@@ -52,6 +52,15 @@ where
 /// The shipped devnet document's committee size.
 pub const VALIDATORS: usize = 6;
 
+// Allow one ChainSync recovery cycle: idle stream + maximum retry delay
+// + connection + subscription (20 + 30 + 5 + 5 = 60 seconds).
+// A notification alone is insufficient: seal still checks the executed root.
+const FULL_NODE_TIMEOUT: std::time::Duration = crate::node::replication::STREAM_IDLE_TIMEOUT
+    .saturating_add(std::time::Duration::from_millis(
+        crate::node::replication::MAX_RETRY_DELAY_MS,
+    ))
+    .saturating_add(crate::node::replication::TIMEOUT.saturating_mul(2));
+
 /// The runtime handed to [`Devnet::start`]; [`run`] provides one.
 pub type Runtime = commonware_runtime::tokio::Context;
 
@@ -167,6 +176,10 @@ struct Validator {
     task: Handle<()>,
     light_client_url: String,
     chain_sync: iroh::EndpointAddr,
+    #[cfg(test)]
+    sync_endpoint: iroh::Endpoint,
+    #[cfg(test)]
+    sync_task: tokio::task::AbortHandle,
 }
 
 /// One runtime label per validator. Static because `Supervisor::child`
@@ -324,7 +337,9 @@ impl Devnet {
                     .await
                     .unwrap();
                 let chain_sync = endpoint.addr();
-                rpc.spawn(crate::node::transport::serve_validator_endpoint(
+                #[cfg(test)]
+                let sync_endpoint = endpoint.clone();
+                let _sync_task = rpc.spawn(crate::node::transport::serve_validator_endpoint(
                     indexer.clone(),
                     events.clone(),
                     endpoint,
@@ -355,6 +370,10 @@ impl Devnet {
                     task,
                     light_client_url,
                     chain_sync,
+                    #[cfg(test)]
+                    sync_endpoint,
+                    #[cfg(test)]
+                    sync_task: _sync_task,
                 });
             }
 
@@ -615,7 +634,7 @@ impl Devnet {
         }
         for node in &self.full_nodes {
             let mut progress = node.finalized();
-            tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            tokio::time::timeout(FULL_NODE_TIMEOUT, async {
                 while *progress.borrow_and_update() < self.height {
                     progress.changed().await.unwrap();
                 }
@@ -793,6 +812,64 @@ mod tests {
     use super::*;
     use crate::client::RemoteLightClient;
     use crate::light_client::FinalizedBlockQuery;
+
+    #[test]
+    fn a_full_node_recovers_when_its_chain_sync_source_returns_after_twenty_seconds() {
+        run(|runtime| async move {
+            let mut devnet = Devnet::start(
+                runtime,
+                DevnetConfig {
+                    name: "devnet_sync_recovery",
+                    owners: vec![],
+                    full_nodes: 1,
+                },
+            )
+            .await;
+            devnet.seal().await;
+
+            // Stop the actual transport, including its existing subscriptions.
+            // Keep its address so the node's ordinary reconnect path can recover.
+            let validator = &devnet.validators[0];
+            validator.sync_task.abort();
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !validator.sync_task.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the ChainSync server stopped");
+            let (indexer, events, endpoint, database, verifier) = (
+                validator.indexer.clone(),
+                devnet.activity[0].clone(),
+                validator.sync_endpoint.clone(),
+                validator.database.clone(),
+                devnet.fixture.verifier.clone(),
+            );
+            let started = tokio::time::Instant::now();
+            let outage = std::time::Duration::from_secs(30);
+            devnet.rpc.spawn(async move {
+                tokio::time::sleep_until(started + outage).await;
+                crate::node::transport::serve_validator_endpoint(
+                    indexer, events, endpoint, database, verifier,
+                )
+                .await;
+            });
+            let block = devnet.seal().await;
+            assert!(started.elapsed() >= outage);
+            assert_eq!(
+                devnet
+                    .light_client(0)
+                    .get_latest_block()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .payload,
+                block.digest(),
+                "the recovered node executed the certified block, not just a notification",
+            );
+            devnet.shutdown().await;
+        });
+    }
 
     /// A client with no node of its own reads each validator over its
     /// light-client URL, checks every answer against the committee the
