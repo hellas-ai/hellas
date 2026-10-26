@@ -1,7 +1,8 @@
 //! One paid Fetch job through the SDK, against the six-validator devnet.
 //!
 //! The provider is provisioned with `provision_offer` and served by
-//! `start_fetch_provider`; the client runs `run_paid_work` with `settle`.
+//! `start_fetch_provider`; the client runs `run_paid_work`, then settles
+//! through a recovered `PaidWorkSession`.
 //! Both parties hold genesis allocations owned by software passkeys and
 //! read the chain through their own full node. Only block ordering (the
 //! devnet's proposer) and the upstream HTTP response are fixtures; the
@@ -26,7 +27,9 @@ use hellas_executor::{
 use hellas_kernel::{CoinId, EdgeValues, Fees, Funding, Key, List, Secp256k1Signer};
 use hellas_rpc::output::{OutputEvent, StopReason, TextChannel};
 use hellas_rpc::{Assurance, ContentId, Retention, RootProof};
-use hellas_sdk::paid_client::{PaidWorkOptions, PaidWorkRun, run_paid_work};
+use hellas_sdk::paid_client::{
+    PaidWorkOptions, PaidWorkRun, PaidWorkSession, bind_paid_endpoint, run_paid_work,
+};
 use hellas_sdk::work_config::{ChainCrossCheck, WorkConfig, WorkRoute, WorkRoutes};
 use hellas_sdk::work_provision::{ProvisionOptions, preview_bond, provision_offer};
 use hellas_sdk::{
@@ -252,21 +255,20 @@ async fn sealing_while<T>(
     period: Duration,
     work: impl std::future::Future<Output = T>,
 ) -> T {
-    let done = std::sync::atomic::AtomicBool::new(false);
-    let (output, ()) = tokio::join!(
-        async {
-            let output = work.await;
-            done.store(true, std::sync::atomic::Ordering::SeqCst);
-            output
-        },
-        async {
-            while !done.load(std::sync::atomic::Ordering::SeqCst) {
-                tokio::time::sleep(period).await;
-                devnet.seal().await;
+    tokio::time::timeout(Duration::from_secs(120), async {
+        tokio::pin!(work);
+        loop {
+            tokio::select! {
+                output = &mut work => return output,
+                _ = tokio::time::sleep(period) => {},
             }
-        },
-    );
-    output
+            // Setup reads require a caught-up local node. Poll the command only
+            // between blocks, after seal has waited for both nodes to apply them.
+            devnet.seal().await;
+        }
+    })
+    .await
+    .expect("the SDK phase completes within its deadline")
 }
 
 /// The coins `owner` holds at the tip, by value, as validator 0 and the
@@ -448,48 +450,67 @@ fn a_paid_fetch_job_through_the_sdk_earns_the_price_and_returns_the_stake_separa
             timeout: Duration::from_secs(120),
         };
         let client_authority = client_authority(&root.path().join("client-authority"), now).await;
-        // `run_paid_work` fails outright when one of its chain reads lands
-        // while the client's full node is still executing a block it has
-        // just seen. Its journal makes a second run resume the same
-        // channel and job, which is what an operator does; only that
-        // failure is retried.
-        let work = async {
-            let mut catching_up = 0;
-            loop {
-                match run_paid_work(
-                    PaidWorkRun {
-                        options: options.clone(),
-                        prepared_input: prepared_input.clone().into(),
-                        settle: true,
-                    },
-                    client_transport.clone(),
-                    client_settlement(),
-                    client_node.clone(),
-                    client_authority.clone(),
-                )
+        // Open on controlled blocks, then run the job on a fixed finalized
+        // tip. The local-node setup path rejects reads during catch-up, and
+        // its observer suspends payment readiness during that same window.
+        let endpoint = bind_paid_endpoint(client_transport.clone()).await.unwrap();
+        let mut session = sealing_while(
+            &mut devnet,
+            Duration::from_millis(100),
+            PaidWorkSession::open(
+                options.clone(),
+                endpoint.clone(),
+                client_settlement(),
+                client_node.clone(),
+                client_authority.clone(),
+            ),
+        )
+        .await
+        .unwrap();
+        session.shutdown().await;
+        drop(session);
+        endpoint.close().await;
+
+        let result = run_paid_work(
+            PaidWorkRun {
+                options: options.clone(),
+                prepared_input: prepared_input.into(),
+                settle: false,
+            },
+            client_transport.clone(),
+            client_settlement(),
+            client_node.clone(),
+            client_authority.clone(),
+        )
+        .await
+        .unwrap();
+        let endpoint = bind_paid_endpoint(client_transport).await.unwrap();
+        let mut session = tokio::time::timeout(
+            options.timeout,
+            PaidWorkSession::open(
+                options,
+                endpoint.clone(),
+                client_settlement(),
+                client_node,
+                client_authority,
+            ),
+        )
+        .await
+        .expect("the settled session opens within its deadline")
+        .unwrap();
+        let settled_provider_payout =
+            sealing_while(&mut devnet, Duration::from_millis(100), session.settle())
                 .await
-                {
-                    Err(error)
-                        if format!("{error:?}").contains("chain node is catching up")
-                            && catching_up < 20 =>
-                    {
-                        catching_up += 1;
-                    }
-                    result => return (result, catching_up),
-                }
-            }
-        };
-        let (result, catching_up) =
-            sealing_while(&mut devnet, Duration::from_millis(100), work).await;
-        eprintln!("run_paid_work retried {catching_up} times after a catching-up read");
-        let result = result.unwrap();
+                .unwrap();
+        session.shutdown().await;
+        drop(session);
+        endpoint.close().await;
 
         assert_eq!(result.bond_edge, bond);
         assert_eq!(result.job_price, PRICE);
         assert_eq!(result.credited_cumulative, PRICE, "one job at its price");
         assert_eq!(
-            result.settled_provider_payout,
-            Some(PRICE),
+            settled_provider_payout, PRICE,
             "the settled close paid the provider the price",
         );
         assert_eq!(upstream.calls("openai", "responses", BODY), 1);
@@ -524,14 +545,14 @@ fn a_paid_fetch_job_through_the_sdk_earns_the_price_and_returns_the_stake_separa
             devnet.seal().await;
         }
         assert_eq!(
-            held,
-            vec![earnings[0], (held[1].0, PROVIDER_STAKE)],
-            "RETURNED PRINCIPAL: the stake, unchanged, beside the unchanged earnings",
-        );
-        assert_eq!(
             held.len(),
             2,
             "the bond timeout returned the stake: {held:?}"
+        );
+        assert_eq!(
+            held,
+            vec![earnings[0], (held[1].0, PROVIDER_STAKE)],
+            "RETURNED PRINCIPAL: the stake, unchanged, beside the unchanged earnings",
         );
         assert_ne!(
             held[1].0, earnings[0].0,
