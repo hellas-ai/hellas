@@ -1118,7 +1118,7 @@ fn loaded_routes(
             "threshold_identity": hex::encode(threshold_identity()),
         },
         "validators": (1..=6)
-            .map(|index| format!("http://127.0.0.1:900{index}"))
+            .map(|index| format!("ws://127.0.0.1:900{index}"))
             .collect::<Vec<_>>(),
         "journal": { "root": "/var/lib/hellas/work" },
         "routes": route_values,

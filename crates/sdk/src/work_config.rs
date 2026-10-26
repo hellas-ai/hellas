@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 mod error;
+#[cfg(test)]
+mod tests;
 pub use error::WorkConfigError;
 type Result<T> = std::result::Result<T, WorkConfigError>;
 use crate::resource_config::{
@@ -28,7 +30,8 @@ use serde::Deserialize;
 /// Number of distinct validator RPC URLs required by this deployment.
 pub const VALIDATOR_COUNT: usize = 6;
 
-/// Parsed paid-work configuration. `load_work_config` checks its fields;
+/// Paid-work configuration. Call [`WorkConfig::validate`] after typed construction;
+/// [`load_work_config`] runs the same checks and normalization.
 /// `validate_work_routes` checks agreement with provider journals at startup.
 #[derive(Clone, Debug)]
 pub struct WorkConfig {
@@ -125,6 +128,59 @@ impl WorkRoutes {
 }
 
 impl WorkConfig {
+    /// Checks chain identity, policy and timing bounds, and normalizes the six
+    /// distinct WebSocket validator URLs. This is the validation used by
+    /// [`load_work_config`]; journal agreement still requires [`validate_work_routes`].
+    pub fn validate(mut self) -> Result<Self> {
+        self.validators = parse_validators(self.validators)?;
+        if self.chain.threshold_identity.is_empty() {
+            return Err(crate::ResourceConfigError::Invalid {
+                field: "chain.threshold_identity",
+                reason: "must not be empty",
+            }
+            .into());
+        }
+        // Use the same decoder as finalized-block verification.
+        hellas_chain::ConsensusVerifier::new(
+            &hellas_chain::light_client::ConsensusInfo {
+                validators: self.validators.clone(),
+                threshold_identity: self.chain.threshold_identity.clone(),
+                network_id: self.chain.network.as_str().to_owned(),
+            },
+            hellas_chain::genesis_digest(&chain_genesis(self.chain.network, &self.chain.genesis)?),
+        )?;
+        if self.journal_root.as_os_str().is_empty() {
+            return Err(WorkConfigError::Invalid {
+                field: "journal.root",
+                reason: "must be a path",
+            });
+        }
+        self.payment_policy.check()?;
+        self.work_policy
+            .check()
+            .map_err(crate::ResourceConfigError::from)?;
+        if self.poll.is_zero() {
+            return Err(WorkConfigError::Invalid {
+                field: "poll_ms",
+                reason: "must be greater than zero",
+            });
+        }
+        if self.max_observation_age <= self.poll {
+            return Err(WorkConfigError::Invalid {
+                field: "max_observation_age_ms",
+                reason: "must exceed poll_ms",
+            });
+        }
+        // The kernel refuses shorter windows when opening a payment edge.
+        if self.min_omit_response_blocks < MIN_OMIT_RESPONSE_BLOCKS {
+            return Err(WorkConfigError::ResponseWindow {
+                actual: self.min_omit_response_blocks,
+                minimum: MIN_OMIT_RESPONSE_BLOCKS,
+            });
+        }
+        Ok(self)
+    }
+
     /// Builds the process's shared executing node. The host owns its directory
     /// and passes the same node handle to every paid client and provider.
     pub fn node_config(
@@ -325,61 +381,23 @@ impl WorkConfigFile {
                 reason: "not a network id",
             });
         };
-        let threshold_identity =
-            parse_hex("chain.threshold_identity", &self.chain.threshold_identity)?;
-        // Parsed before the verifier is built, so the list consensus is
-        // handed is the normalised one this node will actually dial.
-        let validators = parse_validators(self.validators)?;
-        // The same constructor consensus verification uses. A threshold
-        // identity that cannot be decoded here is one no finalized block
-        // would ever verify under, and the node says so before it serves.
-        hellas_chain::ConsensusVerifier::new(
-            &hellas_chain::light_client::ConsensusInfo {
-                validators: validators.clone(),
-                threshold_identity: threshold_identity.clone(),
-                network_id: network.as_str().to_owned(),
-            },
-            hellas_chain::genesis_digest(&chain_genesis(network, &self.chain.genesis)?),
-        )?;
-
-        let journal_root = self.journal.into_root()?;
-        let routes = WorkRoutes::from_files(self.routes)?;
         let policies = self.policies.into_policies()?;
-        if self.poll_ms == 0 {
-            return Err(WorkConfigError::Invalid {
-                field: "poll_ms",
-                reason: "must be greater than zero",
-            });
-        }
-        if self.max_observation_age_ms <= self.poll_ms {
-            return Err(WorkConfigError::Invalid {
-                field: "max_observation_age_ms",
-                reason: "must exceed poll_ms",
-            });
-        }
-        // The kernel refuses a shorter window at every payment open, so a
-        // configuration under it would sign terms consensus then throws
-        // away.
-        if self.min_omit_response_blocks < MIN_OMIT_RESPONSE_BLOCKS {
-            return Err(WorkConfigError::ResponseWindow {
-                actual: self.min_omit_response_blocks,
-                minimum: MIN_OMIT_RESPONSE_BLOCKS,
-            });
-        }
-
-        Ok(WorkConfig {
+        WorkConfig {
             chain: ChainCrossCheck {
                 network,
                 genesis_payload_digest: parse_digest(
                     "chain.genesis_payload_digest",
                     &self.chain.genesis_payload_digest,
                 )?,
-                threshold_identity,
+                threshold_identity: parse_hex(
+                    "chain.threshold_identity",
+                    &self.chain.threshold_identity,
+                )?,
                 genesis: self.chain.genesis,
             },
-            validators,
-            journal_root,
-            routes,
+            validators: self.validators,
+            journal_root: self.journal.root,
+            routes: WorkRoutes::from_files(self.routes)?,
             policy_salt: policies.0,
             channel_policy: policies.1,
             work_policy: policies.2,
@@ -388,7 +406,8 @@ impl WorkConfigFile {
             max_observation_age: Duration::from_millis(self.max_observation_age_ms),
             expected_payment_values: self.expected_payment_values.into_values(),
             min_omit_response_blocks: self.min_omit_response_blocks,
-        })
+        }
+        .validate()
     }
 }
 
@@ -418,6 +437,12 @@ fn parse_validators(entries: Vec<String>) -> Result<Vec<String>> {
         })?;
         if url.host_str().is_none() {
             return Err(WorkConfigError::ValidatorHost(entry.to_owned()));
+        }
+        if !matches!(url.scheme(), "ws" | "wss") {
+            return Err(WorkConfigError::Invalid {
+                field: "validators",
+                reason: "must use ws:// or wss:// URLs",
+            });
         }
         let normalised = url.as_str().to_string();
         if validators.contains(&normalised) {
@@ -450,18 +475,6 @@ struct JournalFile {
     root: PathBuf,
 }
 
-impl JournalFile {
-    fn into_root(self) -> Result<PathBuf> {
-        if self.root.as_os_str().is_empty() {
-            return Err(WorkConfigError::Invalid {
-                field: "journal.root",
-                reason: "must be a path",
-            });
-        }
-        Ok(self.root)
-    }
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PoliciesFile {
@@ -482,7 +495,7 @@ impl PoliciesFile {
         JobPaymentPolicyV2,
     )> {
         let salt = parse_fixed_hex("policies.policy_salt", &self.policy_salt)?;
-        let payment = self.payment.into_policy()?;
+        let payment = self.payment.into_policy();
         Ok((
             salt,
             PaidChannelPolicyV1 {
@@ -490,8 +503,8 @@ impl PoliciesFile {
                 delivery_credit_limit: self.channel.delivery_credit_limit,
             },
             match (self.execution, self.fetch) {
-                (Some(execution), None) => execution.into_policy()?.into(),
-                (None, Some(fetch)) => fetch.into_policy()?,
+                (Some(execution), None) => execution.decode()?.into(),
+                (None, Some(fetch)) => fetch.decode()?,
                 _ => {
                     return Err(WorkConfigError::Invalid {
                         field: "policies",
@@ -554,15 +567,13 @@ struct PaymentPolicyFile {
     oracle_grace_blocks: u64,
 }
 impl PaymentPolicyFile {
-    fn into_policy(self) -> Result<JobPaymentPolicyV2> {
-        let policy = JobPaymentPolicyV2 {
+    fn into_policy(self) -> JobPaymentPolicyV2 {
+        JobPaymentPolicyV2 {
             fixed_price: self.fixed_price,
             dispatch_margin_blocks: self.dispatch_margin_blocks,
             delivery_margin_blocks: self.delivery_margin_blocks,
             oracle_grace_blocks: self.oracle_grace_blocks,
-        };
-        policy.check()?;
-        Ok(policy)
+        }
     }
 }
 

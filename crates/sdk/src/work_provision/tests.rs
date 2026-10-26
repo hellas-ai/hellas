@@ -108,7 +108,7 @@ fn routed_work_config(
     routes: Vec<serde_json::Value>,
 ) -> std::result::Result<WorkConfig, Box<dyn std::error::Error>> {
     let validators: Vec<String> = (1..=6)
-        .map(|index| format!("http://127.0.0.1:900{index}"))
+        .map(|index| format!("ws://127.0.0.1:900{index}"))
         .collect();
     let file = serde_json::json!({
         "chain": {
