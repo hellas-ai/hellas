@@ -11,9 +11,7 @@ use hellas_work::model::fetch::{
 };
 use hellas_work::model::profile::WorkPolicy;
 use hellas_work::model::work::PrivateRecord as _;
-use hellas_work::work::{
-    ClientEndpoint, DeliverError, EndpointError, JobProposal, PreparedFetchInput,
-};
+use hellas_work::work::{ClientEndpoint, DeliverError, EndpointError, JobProposal};
 
 const PROMPT: &[u8] = br#"{"input":"private-customer-prompt-never-on-provider-disk"}"#;
 const RESPONSE: &str = "private-provider-response-never-on-provider-disk";
@@ -36,12 +34,19 @@ async fn fetch_streams_before_terminal_then_pays_once_with_metadata_only_journal
             Err(hellas_work::work::admission::AdmissionError::Unsupported(domain).into())
         }
 
-        async fn fetch_stream(
+        async fn execute_stream(
             &self,
-            input: PreparedFetchInput,
+            prepared: hellas_work::work::PreparedWorkInput,
             progress: PaidProgress,
-        ) -> Result<Vec<OutputEventEnvelope>, BackendFault> {
-            let events = FetchBackend::default().fetch(input).await?;
+        ) -> Result<Vec<hellas_rpc::OutputEventEnvelope>, hellas_work::work::BackendFault> {
+            let hellas_work::work::PreparedWorkInput::Fetch(input) = prepared else {
+                return Err(hellas_work::work::admission::AdmissionError::Unsupported(
+                    hellas_work::work::admission::CapacityDomain::Gpu,
+                )
+                .into());
+            };
+            let input = *input;
+            let events = FetchBackend::default().execute(input.into()).await?;
             progress(events[0].clone())?;
             self.0.notified().await;
             Ok(events)
@@ -249,10 +254,17 @@ async fn paid_fetch_larger_than_a_wire_frame_streams_and_pays_without_disk_paylo
             Err(hellas_work::work::admission::AdmissionError::Unsupported(domain).into())
         }
 
-        async fn fetch(
+        async fn execute(
             &self,
-            input: PreparedFetchInput,
-        ) -> Result<Vec<OutputEventEnvelope>, BackendFault> {
+            prepared: hellas_work::work::PreparedWorkInput,
+        ) -> Result<Vec<hellas_rpc::OutputEventEnvelope>, hellas_work::work::BackendFault> {
+            let hellas_work::work::PreparedWorkInput::Fetch(input) = prepared else {
+                return Err(hellas_work::work::admission::AdmissionError::Unsupported(
+                    hellas_work::work::admission::CapacityDomain::Gpu,
+                )
+                .into());
+            };
+            let input = *input;
             let request = verify_input_events(&input.into_parts().fetch_input_transcript).unwrap();
             let key = provider_producer();
             let mut transcript = FetchOutputTranscriptBuilder::new(
@@ -449,10 +461,17 @@ impl WorkBackend for FetchBackend {
         Err(hellas_work::work::admission::AdmissionError::Unsupported(domain).into())
     }
 
-    async fn fetch(
+    async fn execute(
         &self,
-        input: PreparedFetchInput,
-    ) -> Result<Vec<OutputEventEnvelope>, BackendFault> {
+        prepared: hellas_work::work::PreparedWorkInput,
+    ) -> Result<Vec<hellas_rpc::OutputEventEnvelope>, hellas_work::work::BackendFault> {
+        let hellas_work::work::PreparedWorkInput::Fetch(input) = prepared else {
+            return Err(hellas_work::work::admission::AdmissionError::Unsupported(
+                hellas_work::work::admission::CapacityDomain::Gpu,
+            )
+            .into());
+        };
+        let input = *input;
         self.0.fetch_add(1, Ordering::SeqCst);
         let parts = input.into_parts();
         let request = verify_input_events(&parts.fetch_input_transcript).unwrap();
@@ -672,7 +691,10 @@ async fn fetch_output_limits_include_terminal_and_bad_results_are_never_payable(
     else {
         panic!("first Fetch dispatch");
     };
-    let transcript = FetchBackend::default().fetch(*input).await.unwrap();
+    let transcript = FetchBackend::default()
+        .execute((*input).into())
+        .await
+        .unwrap();
     let WorkPolicy::Fetch { mut policy, .. } = policy() else {
         unreachable!()
     };

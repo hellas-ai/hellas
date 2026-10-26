@@ -9,9 +9,7 @@ use hellas_rpc::pb::work::WorkDelivered;
 use hellas_rpc::services::work::{Work, WorkServer};
 use hellas_wire::Dispatcher;
 use hellas_work::model::work::PrivateRecord as _;
-use hellas_work::work::{
-    BackendFault, ObservationTime, PreparedFetchInput, WorkBackend, run_accepted_work,
-};
+use hellas_work::work::{BackendFault, ObservationTime, WorkBackend, run_accepted_work};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
@@ -39,10 +37,17 @@ impl WorkBackend for Backend {
             })?,
         ))
     }
-    async fn fetch(
+    async fn execute(
         &self,
-        input: PreparedFetchInput,
-    ) -> Result<Vec<hellas_rpc::OutputEventEnvelope>, BackendFault> {
+        prepared: hellas_work::work::PreparedWorkInput,
+    ) -> Result<Vec<hellas_rpc::OutputEventEnvelope>, hellas_work::work::BackendFault> {
+        let hellas_work::work::PreparedWorkInput::Fetch(input) = prepared else {
+            return Err(hellas_work::work::admission::AdmissionError::Unsupported(
+                hellas_work::work::admission::CapacityDomain::Gpu,
+            )
+            .into());
+        };
+        let input = *input;
         self.0.fetch_add(1, Ordering::SeqCst);
         let (parts, admission) = input.into_parts_and_admission();
         let _running = admission

@@ -322,14 +322,14 @@ where
             .state()
             .job_by_id(work_id)
             .ok_or(DeliverError::NoSuchJob)?;
-        let prepared = PreparedWorkInput::decode(job.prepared_input(), MAX_RECORD_BYTES)
+        let prepared = PreparedWorkBundle::decode(job.prepared_input(), MAX_RECORD_BYTES)
             .map_err(PaidWorkError::from)?;
         (request, prepared)
     };
     let input = prepared.input_commitment()?;
     let (operation, kind, max_tokens, max_events, max_bytes) =
         match (&prepared, ready.work_policy()) {
-            (PreparedWorkInput::Evaluate(prepared), WorkPolicy::Evaluate(_)) => (
+            (PreparedWorkBundle::Evaluate(prepared), WorkPolicy::Evaluate(_)) => (
                 Operation::Evaluate,
                 hellas_rpc::evaluate::TOKEN_DELTA_EVENT_KIND,
                 u64::from(
@@ -342,7 +342,7 @@ where
                 u64::MAX,
                 u64::MAX,
             ),
-            (PreparedWorkInput::Fetch(_), WorkPolicy::Fetch { policy, .. }) => (
+            (PreparedWorkBundle::Fetch(_), WorkPolicy::Fetch { policy, .. }) => (
                 Operation::Fetch,
                 hellas_rpc::fetch::OUTPUT_EVENT_KIND,
                 0,

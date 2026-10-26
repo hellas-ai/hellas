@@ -56,7 +56,7 @@ use hellas_work::model::work::{
     private_policy_commitment, propose_authorization, result_digest, signing_hash, terminal_result,
     work_id,
 };
-use hellas_work::work::{BackendFault, PreparedEvaluateInput, WorkRefusal};
+use hellas_work::work::{BackendFault, WorkRefusal};
 use hellas_work::work_close::{BlockSourceError, FinalizedWork};
 use hellas_work::work_handshake::{apply_setup_exchange, prepare_setup_exchange};
 use hellas_work::work_open::{FinalizedSetup, SetupQuery};
@@ -1532,10 +1532,17 @@ impl WorkBackend for AnsweringPaidBackend {
         Err(hellas_work::work::admission::AdmissionError::Unsupported(domain).into())
     }
 
-    async fn evaluate(
+    async fn execute(
         &self,
-        input: PreparedEvaluateInput,
-    ) -> Result<Vec<OutputEventEnvelope>, BackendFault> {
+        prepared: hellas_work::work::PreparedWorkInput,
+    ) -> Result<Vec<hellas_rpc::OutputEventEnvelope>, hellas_work::work::BackendFault> {
+        let hellas_work::work::PreparedWorkInput::Evaluate(input) = prepared else {
+            return Err(hellas_work::work::admission::AdmissionError::Unsupported(
+                hellas_work::work::admission::CapacityDomain::Fetch,
+            )
+            .into());
+        };
+        let input = *input;
         assert_eq!(
             input.evaluate_request().text_execution,
             evaluate_request().text_execution,
@@ -1581,23 +1588,37 @@ impl WorkBackend for BlockingPaidBackend {
         Err(hellas_work::work::admission::AdmissionError::Unsupported(domain).into())
     }
 
-    async fn evaluate_stream(
+    async fn execute_stream(
         &self,
-        input: PreparedEvaluateInput,
+        prepared: hellas_work::work::PreparedWorkInput,
         progress: hellas_work::work::PaidProgress,
-    ) -> Result<Vec<OutputEventEnvelope>, BackendFault> {
+    ) -> Result<Vec<hellas_rpc::OutputEventEnvelope>, hellas_work::work::BackendFault> {
+        let hellas_work::work::PreparedWorkInput::Evaluate(input) = prepared else {
+            return Err(hellas_work::work::admission::AdmissionError::Unsupported(
+                hellas_work::work::admission::CapacityDomain::Fetch,
+            )
+            .into());
+        };
+        let input = *input;
         for event in answer_transcript() {
             if event.event().body().kind() == hellas_rpc::evaluate::TOKEN_DELTA_EVENT_KIND {
                 progress(event)?;
             }
         }
-        self.evaluate(input).await
+        self.execute(input.into()).await
     }
 
-    async fn evaluate(
+    async fn execute(
         &self,
-        _input: PreparedEvaluateInput,
-    ) -> Result<Vec<OutputEventEnvelope>, BackendFault> {
+        prepared: hellas_work::work::PreparedWorkInput,
+    ) -> Result<Vec<hellas_rpc::OutputEventEnvelope>, hellas_work::work::BackendFault> {
+        let hellas_work::work::PreparedWorkInput::Evaluate(input) = prepared else {
+            return Err(hellas_work::work::admission::AdmissionError::Unsupported(
+                hellas_work::work::admission::CapacityDomain::Fetch,
+            )
+            .into());
+        };
+        let _input = *input;
         self.entered.add_permits(1);
         match self.release.acquire().await {
             Ok(permit) => permit.forget(),
@@ -4384,10 +4405,17 @@ async fn grant_and_paid_work_share_a_peer_but_never_a_journal() {
                 })?,
             ))
         }
-        async fn evaluate(
+        async fn execute(
             &self,
-            input: PreparedEvaluateInput,
-        ) -> Result<Vec<OutputEventEnvelope>, BackendFault> {
+            prepared: hellas_work::work::PreparedWorkInput,
+        ) -> Result<Vec<hellas_rpc::OutputEventEnvelope>, hellas_work::work::BackendFault> {
+            let hellas_work::work::PreparedWorkInput::Evaluate(input) = prepared else {
+                return Err(hellas_work::work::admission::AdmissionError::Unsupported(
+                    hellas_work::work::admission::CapacityDomain::Fetch,
+                )
+                .into());
+            };
+            let input = *input;
             let (_, admission) = input.into_parts_and_admission();
             let _running = admission
                 .reserve(hellas_work::work::admission::CapacityDomain::Gpu, async {

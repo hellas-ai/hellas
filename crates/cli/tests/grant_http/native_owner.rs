@@ -19,7 +19,7 @@ use hellas_work::model::{
 use hellas_work::{
     grant_service::GrantService,
     work::{
-        BackendFault, PaidProgress, PreparedEvaluateInput, WorkBackend,
+        BackendFault, PaidProgress, WorkBackend,
         admission::{CapacityDomain, WorkPermit},
     },
 };
@@ -39,11 +39,18 @@ impl WorkBackend for Native {
             })?,
         ))
     }
-    async fn evaluate_stream(
+    async fn execute_stream(
         &self,
-        input: PreparedEvaluateInput,
+        prepared: hellas_work::work::PreparedWorkInput,
         progress: PaidProgress,
-    ) -> Result<Vec<OutputEventEnvelope>, BackendFault> {
+    ) -> Result<Vec<hellas_rpc::OutputEventEnvelope>, hellas_work::work::BackendFault> {
+        let hellas_work::work::PreparedWorkInput::Evaluate(input) = prepared else {
+            return Err(hellas_work::work::admission::AdmissionError::Unsupported(
+                hellas_work::work::admission::CapacityDomain::Fetch,
+            )
+            .into());
+        };
+        let input = *input;
         let (parts, admission) = input.into_parts_and_admission();
         let _running = admission
             .reserve(hellas_work::work::admission::CapacityDomain::Gpu, async {

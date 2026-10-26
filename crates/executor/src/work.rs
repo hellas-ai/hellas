@@ -45,7 +45,9 @@ use crate::ExecutorError;
 use crate::executor::{ExecutorHandle, ExecutorOwedRequest};
 use hellas_rpc::OutputEventEnvelope;
 use hellas_work::work::admission::{AdmissionError, CapacityDomain, WorkPermit};
-use hellas_work::work::{BackendFault, PaidProgress, PreparedEvaluateInput, WorkBackend};
+use hellas_work::work::{
+    BackendFault, PaidProgress, PreparedEvaluateInput, PreparedWorkInput, WorkBackend,
+};
 
 impl ExecutorHandle {
     fn capacity(
@@ -83,13 +85,6 @@ impl ExecutorHandle {
     /// [`ExecutorError`] when the engine will not start the request,
     /// when the stream ends without a terminal, when the execution
     /// failed, or when an event does not decode.
-    pub async fn run_paid_evaluate(
-        &self,
-        input: PreparedEvaluateInput,
-    ) -> Result<Vec<OutputEventEnvelope>, ExecutorError> {
-        self.run_paid_evaluate_stream(input, None).await
-    }
-
     async fn run_paid_evaluate_stream(
         &self,
         input: PreparedEvaluateInput,
@@ -115,6 +110,31 @@ impl ExecutorHandle {
         }
         .instrument(hellas_rpc::request_span!(target: "hellas_request", "paid.executor.stream"))
         .await
+    }
+    async fn execute_prepared(
+        &self,
+        input: PreparedWorkInput,
+        progress: Option<PaidProgress>,
+    ) -> Result<Vec<OutputEventEnvelope>, BackendFault> {
+        match input {
+            PreparedWorkInput::Evaluate(input) => self
+                .run_paid_evaluate_stream(*input, progress)
+                .await
+                .map_err(BackendFault::caused_by),
+            PreparedWorkInput::Fetch(input) => {
+                let input = input
+                    .reserve(self.reserve_payment_capacity(CapacityDomain::Fetch))
+                    .await?;
+                self.send_owed(|reply| ExecutorOwedRequest::RunPaidFetch {
+                    span: hellas_rpc::request_span!(target: "hellas_request", "paid.executor.fetch"),
+                    input: Box::new(input),
+                    progress,
+                    reply,
+                })
+                .await
+                .map_err(BackendFault::caused_by)
+            }
+        }
     }
 }
 
@@ -218,57 +238,19 @@ impl WorkBackend for ExecutorHandle {
             .map_err(|_| BackendFault::from(AdmissionError::Capacity))?;
         Ok(WorkPermit::new(domain, permit))
     }
-    async fn fetch(
+    async fn execute(
         &self,
-        input: hellas_work::work::PreparedFetchInput,
+        input: PreparedWorkInput,
     ) -> Result<Vec<OutputEventEnvelope>, BackendFault> {
-        let input = input
-            .reserve(self.reserve_payment_capacity(CapacityDomain::Fetch))
-            .await?;
-        self.send_owed(|reply| ExecutorOwedRequest::RunPaidFetch {
-            span: hellas_rpc::request_span!(target: "hellas_request", "paid.executor.fetch"),
-            input: Box::new(input),
-            progress: None,
-            reply,
-        })
-        .await
-        .map_err(BackendFault::caused_by)
+        self.execute_prepared(input, None).await
     }
 
-    async fn fetch_stream(
+    async fn execute_stream(
         &self,
-        input: hellas_work::work::PreparedFetchInput,
+        input: PreparedWorkInput,
         progress: PaidProgress,
     ) -> Result<Vec<OutputEventEnvelope>, BackendFault> {
-        let input = input
-            .reserve(self.reserve_payment_capacity(CapacityDomain::Fetch))
-            .await?;
-        self.send_owed(|reply| ExecutorOwedRequest::RunPaidFetch {
-            span: hellas_rpc::request_span!(target: "hellas_request", "paid.executor.fetch"),
-            input: Box::new(input),
-            progress: Some(progress),
-            reply,
-        })
-        .await
-        .map_err(BackendFault::caused_by)
-    }
-
-    async fn evaluate(
-        &self,
-        input: PreparedEvaluateInput,
-    ) -> Result<Vec<OutputEventEnvelope>, BackendFault> {
-        self.run_paid_evaluate(input)
-            .await
-            .map_err(BackendFault::caused_by)
-    }
-    async fn evaluate_stream(
-        &self,
-        input: PreparedEvaluateInput,
-        progress: PaidProgress,
-    ) -> Result<Vec<OutputEventEnvelope>, BackendFault> {
-        self.run_paid_evaluate_stream(input, Some(progress))
-            .await
-            .map_err(BackendFault::caused_by)
+        self.execute_prepared(input, Some(progress)).await
     }
 }
 
