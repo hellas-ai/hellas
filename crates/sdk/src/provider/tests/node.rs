@@ -1094,9 +1094,13 @@ fn vouched_context(peer: PeerId) -> TransportContext {
     }
 }
 
-/// Builds routes through the production loader, the only constructor
-/// that can establish their duplicate-peer and duplicate-bond invariants.
 fn configured_routes(routes: &[(PeerId, EdgeId, Key)]) -> WorkRoutes {
+    loaded_routes(routes).expect("the route fixture passes the production loader")
+}
+
+fn loaded_routes(
+    routes: &[(PeerId, EdgeId, Key)],
+) -> Result<WorkRoutes, crate::work_config::WorkConfigError> {
     let route_values: Vec<_> = routes
         .iter()
         .map(|(peer, bond, client)| {
@@ -1155,9 +1159,64 @@ fn configured_routes(routes: &[(PeerId, EdgeId, Key)]) -> WorkRoutes {
     if let Err(error) = std::fs::write(&path, value.to_string()) {
         panic!("the route fixture is written: {error}");
     }
-    match load_work_config(&path) {
-        Ok(config) => config.routes,
-        Err(error) => panic!("the route fixture passes the production loader: {error}"),
+    load_work_config(&path).map(|config| config.routes)
+}
+
+#[test]
+fn typed_work_routes_match_file_loading_and_allow_multiple_bonds_per_peer() {
+    use crate::work_config::WorkRoute;
+    for entries in [
+        vec![],
+        vec![(first_route_peer(), bond_edge(), client().party_key())],
+        vec![
+            (
+                first_route_peer(),
+                EdgeId::from_bytes([9; 32]),
+                client().party_key(),
+            ),
+            (first_route_peer(), bond_edge(), client().party_key()),
+            (
+                second_route_peer(),
+                EdgeId::from_bytes([8; 32]),
+                client().party_key(),
+            ),
+        ],
+    ] {
+        let typed =
+            WorkRoutes::try_from_iter(entries.iter().map(|&(peer, bond, client)| WorkRoute {
+                peer,
+                bond,
+                client,
+            }))
+            .unwrap();
+        let loaded = loaded_routes(&entries).unwrap();
+        assert_eq!(typed, loaded);
+        assert_eq!(typed.len(), entries.len());
+        assert_eq!(
+            typed.iter().copied().collect::<Vec<_>>(),
+            loaded.iter().copied().collect::<Vec<_>>()
+        );
+    }
+}
+
+#[test]
+fn typed_work_routes_and_file_loading_refuse_duplicate_bonds() {
+    use crate::work_config::{WorkConfigError, WorkRoute};
+    for other_peer in [first_route_peer(), second_route_peer()] {
+        let entries = [
+            (first_route_peer(), bond_edge(), client().party_key()),
+            (other_peer, bond_edge(), provider().party_key()),
+        ];
+        let typed = WorkRoutes::try_from_iter(entries.map(|(peer, bond, client)| WorkRoute {
+            peer,
+            bond,
+            client,
+        }));
+        assert!(matches!(typed, Err(WorkConfigError::DuplicateBond(bond)) if bond == bond_edge()));
+        let Err(WorkConfigError::File { source, .. }) = loaded_routes(&entries) else {
+            panic!("the file loader must refuse duplicate bonds");
+        };
+        assert!(matches!(*source, WorkConfigError::DuplicateBond(bond) if bond == bond_edge()));
     }
 }
 

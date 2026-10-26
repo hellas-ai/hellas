@@ -80,6 +80,18 @@ pub struct WorkRoutes {
 }
 
 impl WorkRoutes {
+    /// Checks and indexes typed routes, rejecting every duplicate bond.
+    /// One authenticated peer may have several distinct bonds.
+    pub fn try_from_iter(routes: impl IntoIterator<Item = WorkRoute>) -> Result<Self> {
+        let mut by_bond = BTreeMap::new();
+        for route in routes {
+            if by_bond.insert(route.bond, route).is_some() {
+                return Err(WorkConfigError::DuplicateBond(route.bond));
+            }
+        }
+        Ok(Self { by_bond })
+    }
+
     /// Returns every configured route in bond order.
     pub fn iter(&self) -> impl Iterator<Item = &WorkRoute> {
         self.by_bond.values()
@@ -98,17 +110,17 @@ impl WorkRoutes {
     }
 
     fn from_files(files: Vec<WorkRouteFile>) -> Result<Self> {
-        let mut by_bond = BTreeMap::new();
-        for file in files {
-            let peer = PeerId::from_bytes(parse_fixed_hex("routes[].peer", &file.peer)?);
-            let bond = EdgeId::from_bytes(parse_fixed_hex("routes[].bond", &file.bond)?);
-            let client = Key::from_bytes(parse_fixed_hex("routes[].client", &file.client)?);
-            let route = WorkRoute { peer, bond, client };
-            if by_bond.insert(bond, route).is_some() {
-                return Err(WorkConfigError::DuplicateBond(bond));
-            }
-        }
-        Ok(Self { by_bond })
+        let routes = files
+            .into_iter()
+            .map(|file| {
+                Ok(WorkRoute {
+                    peer: PeerId::from_bytes(parse_fixed_hex("routes[].peer", &file.peer)?),
+                    bond: EdgeId::from_bytes(parse_fixed_hex("routes[].bond", &file.bond)?),
+                    client: Key::from_bytes(parse_fixed_hex("routes[].client", &file.client)?),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Self::try_from_iter(routes)
     }
 }
 
