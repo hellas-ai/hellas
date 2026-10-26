@@ -146,3 +146,6 @@ fn map_error(error: WorkGatewayError) -> BackendError {
         _ => BackendError::failed(error.to_string()),
     }
 }
+
+#[cfg(test)]
+mod tests;
