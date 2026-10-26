@@ -951,7 +951,7 @@ dependencies = [
 [[package]]
 name = "commonware-actor"
 version = "2026.7.0"
-source = "git+https://github.com/georgewhewell/commonware-monorepo?rev=0dd4d0e166b6b10f870dc68d0664b98a42324ddc#0dd4d0e166b6b10f870dc68d0664b98a42324ddc"
+source = "git+https://github.com/georgewhewell/commonware-monorepo?rev=51a917ec79063b5c9abdeb084243d398ecb23dae#51a917ec79063b5c9abdeb084243d398ecb23dae"
 dependencies = [
  "cfg-if",
  "commonware-macros",
@@ -964,7 +964,7 @@ dependencies = [
 [[package]]
 name = "commonware-broadcast"
 version = "2026.7.0"
-source = "git+https://github.com/georgewhewell/commonware-monorepo?rev=0dd4d0e166b6b10f870dc68d0664b98a42324ddc#0dd4d0e166b6b10f870dc68d0664b98a42324ddc"
+source = "git+https://github.com/georgewhewell/commonware-monorepo?rev=51a917ec79063b5c9abdeb084243d398ecb23dae#51a917ec79063b5c9abdeb084243d398ecb23dae"
 dependencies = [
  "commonware-actor",
  "commonware-codec",
@@ -980,7 +980,7 @@ dependencies = [
 [[package]]
 name = "commonware-codec"
 version = "2026.7.0"
-source = "git+https://github.com/georgewhewell/commonware-monorepo?rev=0dd4d0e166b6b10f870dc68d0664b98a42324ddc#0dd4d0e166b6b10f870dc68d0664b98a42324ddc"
+source = "git+https://github.com/georgewhewell/commonware-monorepo?rev=51a917ec79063b5c9abdeb084243d398ecb23dae#51a917ec79063b5c9abdeb084243d398ecb23dae"
 dependencies = [
  "bytes",
  "cfg-if",
@@ -994,7 +994,7 @@ dependencies = [
 [[package]]
 name = "commonware-codec-macros"
 version = "2026.7.0"
-source = "git+https://github.com/georgewhewell/commonware-monorepo?rev=0dd4d0e166b6b10f870dc68d0664b98a42324ddc#0dd4d0e166b6b10f870dc68d0664b98a42324ddc"
+source = "git+https://github.com/georgewhewell/commonware-monorepo?rev=51a917ec79063b5c9abdeb084243d398ecb23dae#51a917ec79063b5c9abdeb084243d398ecb23dae"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -1005,7 +1005,7 @@ dependencies = [
 [[package]]
 name = "commonware-coding"
 version = "2026.7.0"
-source = "git+https://github.com/georgewhewell/commonware-monorepo?rev=0dd4d0e166b6b10f870dc68d0664b98a42324ddc#0dd4d0e166b6b10f870dc68d0664b98a42324ddc"
+source = "git+https://github.com/georgewhewell/commonware-monorepo?rev=51a917ec79063b5c9abdeb084243d398ecb23dae#51a917ec79063b5c9abdeb084243d398ecb23dae"
 dependencies = [
  "bytes",
  "commonware-codec",
@@ -1023,7 +1023,7 @@ dependencies = [
 [[package]]
 name = "commonware-consensus"
 version = "2026.7.0"
-source = "git+https://github.com/georgewhewell/commonware-monorepo?rev=0dd4d0e166b6b10f870dc68d0664b98a42324ddc#0dd4d0e166b6b10f870dc68d0664b98a42324ddc"
+source = "git+https://github.com/georgewhewell/commonware-monorepo?rev=51a917ec79063b5c9abdeb084243d398ecb23dae#51a917ec79063b5c9abdeb084243d398ecb23dae"
 dependencies = [
  "bytes",
  "cfg-if",
@@ -1054,7 +1054,7 @@ dependencies = [
 [[package]]
 name = "commonware-cryptography"
 version = "2026.7.0"
-source = "git+https://github.com/georgewhewell/commonware-monorepo?rev=0dd4d0e166b6b10f870dc68d0664b98a42324ddc#0dd4d0e166b6b10f870dc68d0664b98a42324ddc"
+source = "git+https://github.com/georgewhewell/commonware-monorepo?rev=51a917ec79063b5c9abdeb084243d398ecb23dae#51a917ec79063b5c9abdeb084243d398ecb23dae"
 dependencies = [
  "ahash",
  "anyhow",
@@ -1095,7 +1095,7 @@ dependencies = [
 [[package]]
 name = "commonware-formatting"
 version = "2026.7.0"
-source = "git+https://github.com/georgewhewell/commonware-monorepo?rev=0dd4d0e166b6b10f870dc68d0664b98a42324ddc#0dd4d0e166b6b10f870dc68d0664b98a42324ddc"
+source = "git+https://github.com/georgewhewell/commonware-monorepo?rev=51a917ec79063b5c9abdeb084243d398ecb23dae#51a917ec79063b5c9abdeb084243d398ecb23dae"
 dependencies = [
  "commonware-macros",
  "const-hex",
@@ -1104,7 +1104,7 @@ dependencies = [
 [[package]]
 name = "commonware-glue"
 version = "2026.7.0"
-source = "git+https://github.com/georgewhewell/commonware-monorepo?rev=0dd4d0e166b6b10f870dc68d0664b98a42324ddc#0dd4d0e166b6b10f870dc68d0664b98a42324ddc"
+source = "git+https://github.com/georgewhewell/commonware-monorepo?rev=51a917ec79063b5c9abdeb084243d398ecb23dae#51a917ec79063b5c9abdeb084243d398ecb23dae"
 dependencies = [
  "bytes",
  "commonware-actor",
@@ -1128,7 +1128,7 @@ dependencies = [
 [[package]]
 name = "commonware-macros"
 version = "2026.7.0"
-source = "git+https://github.com/georgewhewell/commonware-monorepo?rev=0dd4d0e166b6b10f870dc68d0664b98a42324ddc#0dd4d0e166b6b10f870dc68d0664b98a42324ddc"
+source = "git+https://github.com/georgewhewell/commonware-monorepo?rev=51a917ec79063b5c9abdeb084243d398ecb23dae#51a917ec79063b5c9abdeb084243d398ecb23dae"
 dependencies = [
  "commonware-macros-impl",
  "tokio",
@@ -1137,7 +1137,7 @@ dependencies = [
 [[package]]
 name = "commonware-macros-impl"
 version = "2026.7.0"
-source = "git+https://github.com/georgewhewell/commonware-monorepo?rev=0dd4d0e166b6b10f870dc68d0664b98a42324ddc#0dd4d0e166b6b10f870dc68d0664b98a42324ddc"
+source = "git+https://github.com/georgewhewell/commonware-monorepo?rev=51a917ec79063b5c9abdeb084243d398ecb23dae#51a917ec79063b5c9abdeb084243d398ecb23dae"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -1149,7 +1149,7 @@ dependencies = [
 [[package]]
 name = "commonware-math"
 version = "2026.7.0"
-source = "git+https://github.com/georgewhewell/commonware-monorepo?rev=0dd4d0e166b6b10f870dc68d0664b98a42324ddc#0dd4d0e166b6b10f870dc68d0664b98a42324ddc"
+source = "git+https://github.com/georgewhewell/commonware-monorepo?rev=51a917ec79063b5c9abdeb084243d398ecb23dae#51a917ec79063b5c9abdeb084243d398ecb23dae"
 dependencies = [
  "bytes",
  "commonware-codec",
@@ -1162,7 +1162,7 @@ dependencies = [
 [[package]]
 name = "commonware-p2p"
 version = "2026.7.0"
-source = "git+https://github.com/georgewhewell/commonware-monorepo?rev=0dd4d0e166b6b10f870dc68d0664b98a42324ddc#0dd4d0e166b6b10f870dc68d0664b98a42324ddc"
+source = "git+https://github.com/georgewhewell/commonware-monorepo?rev=51a917ec79063b5c9abdeb084243d398ecb23dae#51a917ec79063b5c9abdeb084243d398ecb23dae"
 dependencies = [
  "commonware-actor",
  "commonware-codec",
@@ -1188,7 +1188,7 @@ dependencies = [
 [[package]]
 name = "commonware-parallel"
 version = "2026.7.0"
-source = "git+https://github.com/georgewhewell/commonware-monorepo?rev=0dd4d0e166b6b10f870dc68d0664b98a42324ddc#0dd4d0e166b6b10f870dc68d0664b98a42324ddc"
+source = "git+https://github.com/georgewhewell/commonware-monorepo?rev=51a917ec79063b5c9abdeb084243d398ecb23dae#51a917ec79063b5c9abdeb084243d398ecb23dae"
 dependencies = [
  "cfg-if",
  "commonware-macros",
@@ -1200,7 +1200,7 @@ dependencies = [
 [[package]]
 name = "commonware-resolver"
 version = "2026.7.0"
-source = "git+https://github.com/georgewhewell/commonware-monorepo?rev=0dd4d0e166b6b10f870dc68d0664b98a42324ddc#0dd4d0e166b6b10f870dc68d0664b98a42324ddc"
+source = "git+https://github.com/georgewhewell/commonware-monorepo?rev=51a917ec79063b5c9abdeb084243d398ecb23dae#51a917ec79063b5c9abdeb084243d398ecb23dae"
 dependencies = [
  "bytes",
  "commonware-actor",
@@ -1221,7 +1221,7 @@ dependencies = [
 [[package]]
 name = "commonware-runtime"
 version = "2026.7.0"
-source = "git+https://github.com/georgewhewell/commonware-monorepo?rev=0dd4d0e166b6b10f870dc68d0664b98a42324ddc#0dd4d0e166b6b10f870dc68d0664b98a42324ddc"
+source = "git+https://github.com/georgewhewell/commonware-monorepo?rev=51a917ec79063b5c9abdeb084243d398ecb23dae#51a917ec79063b5c9abdeb084243d398ecb23dae"
 dependencies = [
  "ahash",
  "bytes",
@@ -1255,7 +1255,7 @@ dependencies = [
 [[package]]
 name = "commonware-runtime-macros"
 version = "2026.7.0"
-source = "git+https://github.com/georgewhewell/commonware-monorepo?rev=0dd4d0e166b6b10f870dc68d0664b98a42324ddc#0dd4d0e166b6b10f870dc68d0664b98a42324ddc"
+source = "git+https://github.com/georgewhewell/commonware-monorepo?rev=51a917ec79063b5c9abdeb084243d398ecb23dae#51a917ec79063b5c9abdeb084243d398ecb23dae"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -1266,7 +1266,7 @@ dependencies = [
 [[package]]
 name = "commonware-storage"
 version = "2026.7.0"
-source = "git+https://github.com/georgewhewell/commonware-monorepo?rev=0dd4d0e166b6b10f870dc68d0664b98a42324ddc#0dd4d0e166b6b10f870dc68d0664b98a42324ddc"
+source = "git+https://github.com/georgewhewell/commonware-monorepo?rev=51a917ec79063b5c9abdeb084243d398ecb23dae#51a917ec79063b5c9abdeb084243d398ecb23dae"
 dependencies = [
  "ahash",
  "anyhow",
@@ -1284,13 +1284,13 @@ dependencies = [
  "hashbrown 0.17.1",
  "thiserror 2.0.21",
  "tracing",
- "zstd 0.13.3",
+ "zstd",
 ]
 
 [[package]]
 name = "commonware-stream"
 version = "2026.7.0"
-source = "git+https://github.com/georgewhewell/commonware-monorepo?rev=0dd4d0e166b6b10f870dc68d0664b98a42324ddc#0dd4d0e166b6b10f870dc68d0664b98a42324ddc"
+source = "git+https://github.com/georgewhewell/commonware-monorepo?rev=51a917ec79063b5c9abdeb084243d398ecb23dae#51a917ec79063b5c9abdeb084243d398ecb23dae"
 dependencies = [
  "chacha20poly1305",
  "commonware-codec",
@@ -1309,7 +1309,7 @@ dependencies = [
 [[package]]
 name = "commonware-utils"
 version = "2026.7.0"
-source = "git+https://github.com/georgewhewell/commonware-monorepo?rev=0dd4d0e166b6b10f870dc68d0664b98a42324ddc#0dd4d0e166b6b10f870dc68d0664b98a42324ddc"
+source = "git+https://github.com/georgewhewell/commonware-monorepo?rev=51a917ec79063b5c9abdeb084243d398ecb23dae#51a917ec79063b5c9abdeb084243d398ecb23dae"
 dependencies = [
  "ahash",
  "bytes",
@@ -2982,7 +2982,7 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "url",
- "zstd 0.14.3",
+ "zstd",
 ]
 
 [[package]]
@@ -8743,29 +8743,11 @@ checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
 
 [[package]]
 name = "zstd"
-version = "0.13.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e91ee311a569c327171651566e07972200e76fcfe2242a4fa446149a3881c08a"
-dependencies = [
- "zstd-safe 7.2.4",
-]
-
-[[package]]
-name = "zstd"
 version = "0.14.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "db3ae9bf90af6e40197bef767eeefc46ad6397420fe873830bd85e5fbbfb3c70"
 dependencies = [
- "zstd-safe 8.2.0",
-]
-
-[[package]]
-name = "zstd-safe"
-version = "7.2.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8f49c4d5f0abb602a93fb8736af2a4f4dd9512e36f7f570d66e65ff867ed3b9d"
-dependencies = [
- "zstd-sys",
+ "zstd-safe",
 ]
 
 [[package]]
