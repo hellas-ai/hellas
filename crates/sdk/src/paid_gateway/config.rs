@@ -20,7 +20,9 @@ pub struct PaidGatewayOptions {
 }
 
 impl PaidGatewayOptions {
-    pub(super) fn validate(&self) -> Result<()> {
+    /// The check the paid gateway applies when it starts. Callers replacing a
+    /// running pool use it to refuse invalid options before retiring anything.
+    pub fn validate(&self) -> Result<()> {
         if self.providers.is_empty() {
             return Err(PoolError::Invalid(
                 "paid gateway requires at least one provider",
