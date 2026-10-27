@@ -1223,7 +1223,11 @@ async fn every_provider_write_boundary_recovers_to_one_state() {
             "credited after {} records",
             index + 1
         );
-        assert_eq!(recovered.len(), index as u64 + 1);
+        assert_eq!(
+            recovered.len(),
+            if phase.is_none() { 0 } else { index as u64 + 1 },
+            "terminal accounting is checkpointed after its payload is retired"
+        );
     }
 }
 
@@ -2311,11 +2315,18 @@ async fn inputs_swapped_on_the_disk_are_not_a_job_to_execute() {
                 Ok(opened) => opened,
                 Err(error) => panic!("the journal opens: {error}"),
             };
+            let bytes = bundle_bytes(bundle_nonce);
+            let reference = hellas_rpc::ContentRef::for_bytes(&bytes);
+            let payloads = dir.path().join(format!("{stem}.payloads"));
+            std::fs::create_dir_all(&payloads).unwrap();
+            std::fs::write(payloads.join(reference.id().to_string()), &bytes).unwrap();
             for record in [
                 ChannelRecord::JobProposed {
                     authorization: job.authorization,
                     client_signature: client().sign(payload(job.work_id)),
-                    prepared_input: bundle_bytes(bundle_nonce),
+                    prepared_input: hellas_rpc::protocol::content_upload::encode_reference(
+                        reference,
+                    ),
                 },
                 ChannelRecord::JobAccepted {
                     work_id: job.work_id,

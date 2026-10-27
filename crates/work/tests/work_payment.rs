@@ -396,19 +396,12 @@ async fn one_certificate_pays_for_one_job() {
         CURSOR,
     )
     .await;
-    // One cursor record per block read from the channel's origin to
-    // `CURSOR`, and then the job's own steps.
-    // Client: proposal, acceptance, result, verdict, payment.
-    // Provider: proposal, acceptance, running marker, result, release,
-    // payment.
-    for (store, role, records) in [
-        (&client_store, "client", CURSOR + 5),
-        (&provider_store, "provider", CURSOR + 6),
-    ] {
+    // Retiring a job checkpoints its accounting and removes its payload frames.
+    for (store, role) in [(&client_store, "client"), (&provider_store, "provider")] {
         assert_eq!(
             store.len(),
-            records,
-            "the {role} journal wrote each step once",
+            0,
+            "the {role} journal retired the paid job's records"
         );
         let state = store.state();
         assert!(state.jobs().next().is_none(), "the {role} job is closed");

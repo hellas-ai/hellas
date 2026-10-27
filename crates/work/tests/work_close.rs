@@ -3852,19 +3852,19 @@ async fn a_restart_samples_the_replay_it_ran() {
         Some(Ok(value)) => value,
         other => panic!("{name} is a number: {other:?}"),
     };
-    let frames = number("frames");
-    assert!(
-        number("records") > 0,
-        "a paid job leaves a checkpoint to replay"
+    assert_eq!(
+        number("frames"),
+        0,
+        "retiring the paid job rotates its payload records out"
     );
     assert_eq!(
         number("records"),
-        frames + 1,
-        "retiring the paid job rotates its payload out; replay includes that checkpoint",
+        0,
+        "the reopened generation consists of its checkpoint"
     );
     assert!(
-        number("bytes") > frames,
-        "the physical size of what was walked, not a frame count again",
+        number("bytes") > 0,
+        "replay includes the checkpoint's physical bytes"
     );
     drop(watcher);
 }

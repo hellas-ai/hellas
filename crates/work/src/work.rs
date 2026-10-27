@@ -788,16 +788,16 @@ impl ProviderEndpoint {
             }
             return Ok((work_id, retained));
         }
+        let ready = self
+            .admitting()
+            .map_err(|error| Refusal::new(endpoint_refusal(error), error.to_string()))?
+            .clone();
         if self.state().close_prepared().is_some()
             || self.state().close_opened().is_some()
             || self.state().close_settled().is_some()
         {
             return Err(Refusal::new(WorkRefusal::Declined, "channel is closing"));
         }
-        let ready = self
-            .admitting()
-            .map_err(|error| Refusal::new(endpoint_refusal(error), error.to_string()))?
-            .clone();
         let (cursor_height, _) = self.state().cursor();
         let policy = ready.work_policy();
         policy.check_authorization(
