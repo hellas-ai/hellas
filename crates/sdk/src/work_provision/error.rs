@@ -1,8 +1,10 @@
-use hellas_kernel::{CoinId, EdgeId, Key};
+use hellas_kernel::{CoinId, EdgeId};
 use std::path::PathBuf;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProvisionError {
+    #[error(transparent)]
+    Store(#[from] hellas_work::work_store::WorkStoreError),
     #[error(transparent)]
     Authority(#[from] hellas_work::work_store::grant::NodeStoreError),
     #[error(transparent)]
@@ -15,20 +17,12 @@ pub enum ProvisionError {
     StakeCount(usize),
     #[error("duplicate stake coin {}", hex::encode(.0.to_bytes()))]
     DuplicateCoin(CoinId),
-    #[error("bond {} has no bilateral route in this work configuration", hex::encode(.0.to_bytes()))]
-    MissingRoute(EdgeId),
     #[error("provider offer over bond {} has no retained revision", hex::encode(.0.to_bytes()))]
     MissingProposal(EdgeId),
     #[error("candidate bond {} collides with an existing provider offer", hex::encode(.0.to_bytes()))]
     BondCollision(EdgeId),
     #[error("candidate stake coin {} is reserved by bond {}", hex::encode(coin.to_bytes()), hex::encode(bond.to_bytes()))]
     ReservedCoin { coin: CoinId, bond: EdgeId },
-    #[error("route for bond {} expects client {}, but the bond names {}", hex::encode(bond.to_bytes()), hex::encode(expected.to_bytes()), hex::encode(actual.to_bytes()))]
-    WrongClient {
-        bond: EdgeId,
-        expected: Key,
-        actual: Key,
-    },
     #[error("journal under {} replays as revision {revision:?} over floor {floor:?}, not the armed proposal", root.display())]
     JournalReplay {
         root: PathBuf,

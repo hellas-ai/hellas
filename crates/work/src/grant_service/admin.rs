@@ -58,6 +58,9 @@ impl WorkAdministration {
         command: WorkControlCommand,
     ) -> Result<WorkControlReply, NodeStoreError> {
         let operation = match &command {
+            WorkControlCommand::SetPaidPolicy { .. } => {
+                crate::work_store::grant::WORK_PAID_POLICY_CONFIGURE
+            }
             WorkControlCommand::List
             | WorkControlCommand::Catalogue
             | WorkControlCommand::InspectBudget { .. }
@@ -87,6 +90,26 @@ impl WorkAdministration {
                     now,
                 )?;
                 let (mutation, reply) = match command {
+                    WorkControlCommand::SetPaidPolicy {
+                        expected_revision,
+                        policy,
+                    } => {
+                        let mut policy_salt = [0; 32];
+                        getrandom::fill(&mut policy_salt)
+                            .map_err(|_| hellas_auth::authority::AuthorityError::Entropy)?;
+                        (
+                            WorkMutation::PaidPolicy {
+                                expected: expected_revision,
+                                policy_salt,
+                                policy: Box::new(policy),
+                            },
+                            ChangeReply::Ready(WorkControlReply::PaidPolicyChanged {
+                                revision: expected_revision
+                                    .next()
+                                    .ok_or(GrantError::StateCapacity)?,
+                            }),
+                        )
+                    }
                     WorkControlCommand::ConfigureResource { policy } => {
                         let definition = self.resource(&policy)?.clone();
                         let resource = definition.resource;

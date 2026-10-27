@@ -48,8 +48,8 @@ use hellas_work::model::work::{
     identity_source_digest, private_policy_commitment,
 };
 use hellas_work::work::{
-    BackendFault, ClientEndpoint, CloseEndpoint, JobProposal, PaymentError, PreparedEvaluateInput,
-    RunOutcome, WorkBackend, WorkService, propose_work, run_accepted_work,
+    BackendFault, ClientEndpoint, CloseEndpoint, JobProposal, PaymentError, RunOutcome,
+    WorkBackend, WorkService, propose_work, run_accepted_work,
 };
 use hellas_work::work_close::{CloseProgress, TxSink, close_start};
 use hellas_work::work_handshake::{PaymentAdmission, SetupEndpoint, SetupService};
@@ -431,7 +431,7 @@ impl WorkDevnet {
         self.light_client(node)
             .work_channel_snapshot(WorkChannelQuery {
                 bond_edge: bond_edge(allocations),
-                payment_edge: payment_edge(allocations),
+                payment_edge: Some(payment_edge(allocations)),
                 funding: BTreeSet::new(),
             })
             .await
@@ -634,19 +634,25 @@ impl WorkBackend for ProviderBackend {
     fn try_admit(
         &self,
         domain: hellas_work::work::admission::CapacityDomain,
-    ) -> Result<hellas_work::work::admission::WorkPermit, hellas_work::work::BackendFault> {
+    ) -> Result<hellas_work::work::admission::WorkPermit, BackendFault> {
         Err(hellas_work::work::admission::AdmissionError::Unsupported(domain).into())
     }
 
-    fn evaluate(
+    async fn execute(
         &self,
-        input: PreparedEvaluateInput,
-    ) -> impl core::future::Future<Output = Result<Vec<OutputEventEnvelope>, BackendFault>> + Send
-    {
+        prepared: hellas_work::work::PreparedWorkInput,
+    ) -> Result<Vec<hellas_rpc::OutputEventEnvelope>, BackendFault> {
+        let hellas_work::work::PreparedWorkInput::Evaluate(input) = prepared else {
+            return Err(hellas_work::work::admission::AdmissionError::Unsupported(
+                hellas_work::work::admission::CapacityDomain::Fetch,
+            )
+            .into());
+        };
+        let input = *input;
         self.calls.fetch_add(1, Ordering::SeqCst);
         let answer = FixtureExecutor::run(&self.prompt, work_policy().max_new_tokens);
         let prompt = self.prompt.clone();
-        async move { Ok(transcript_for(input.evaluate_request(), &prompt, &answer)) }
+        Ok(transcript_for(input.evaluate_request(), &prompt, &answer))
     }
 }
 

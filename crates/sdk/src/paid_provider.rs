@@ -1,7 +1,7 @@
 //! Shared provider routing and finalized-chain clock for paid work.
 use hellas_rpc::pb::work::Refusable;
 
-use crate::work_config::WorkRoutes;
+mod offers;
 use crate::work_router::{UnmountedWork, not_ready};
 use futures::future::BoxFuture;
 use hellas_auth::Digest;
@@ -31,6 +31,7 @@ use hellas_work::work_close::{FinalizedBlocks, TxSink};
 use hellas_work::work_handshake::{PaymentAdmission, SetupEndpoint, SetupService};
 use hellas_work::work_open::{SetupAdvance, SetupDriveError, SetupProgress, SetupView};
 use hellas_work::work_store::{ChannelStore, JobPhase, Role, SetupStore, discover_setups};
+use offers::{AutomaticOffers, OfferAllocator};
 use std::{
     collections::BTreeMap,
     path::PathBuf,
@@ -42,6 +43,10 @@ use tracing::{Instrument as _, debug, info, warn};
 /// Provider observation and recovery failures preserve their typed causes.
 #[derive(Debug, thiserror::Error)]
 pub enum PaidProviderError {
+    #[error(transparent)]
+    Store(#[from] hellas_work::work_store::WorkStoreError),
+    #[error("provider setup has no durable offer or its signing identity differs")]
+    InvalidOffer,
     #[error("paid-work observer task failed")]
     Task(#[from] tokio::task::JoinError),
     #[error(transparent)]
@@ -81,16 +86,12 @@ pub struct WorkRunnerConfig {
     pub network: NetworkId,
     /// The configured root the setup journals live under.
     pub journal_root: PathBuf,
-    /// Bilateral routes from authenticated peers to owned journals.
-    pub routes: WorkRoutes,
     /// How often the clock ticks.
     pub poll: Duration,
     /// Bounds observer stalls and the age of local admission evidence.
     pub max_observation_age: Duration,
     /// The key every settlement this node signs is signed with.
     pub settlement_key: Secp256k1Signer,
-    /// What every setup endpoint this node builds countersigns over.
-    pub policy: ProviderChannelPolicy,
 }
 
 #[derive(Clone, Default)]
@@ -149,6 +150,8 @@ impl Drop for WorkWatcher {
 /// Mount failures are distinct from a valid route with no matching channel.
 #[derive(Debug, thiserror::Error)]
 pub enum MountError {
+    #[error("offer worker failed")]
+    OfferWorker(#[source] tokio::task::JoinError),
     #[error("payment mount lock is poisoned")]
     Poisoned,
     #[error("channel {0:?} is already mounted")]
@@ -463,6 +466,7 @@ impl MountedWork {
 pub struct MountedSetup(
     Arc<Mutex<BTreeMap<(PeerId, EdgeId), SetupService>>>,
     AdmissionNode,
+    Arc<std::sync::OnceLock<AutomaticOffers>>,
 );
 
 impl MountedSetup {
@@ -522,6 +526,21 @@ impl MountedSetup {
 }
 
 impl WorkSetupHandler for MountedSetup {
+    async fn request_offer(
+        &self,
+        request: hellas_rpc::pb::work::RequestOfferRequest,
+        context: TransportContext,
+    ) -> Result<impl Into<WithTrailer<hellas_rpc::pb::work::RequestOfferResponse>> + Send, WireStatus>
+    {
+        let offers = self.2.get().ok_or_else(|| {
+            WireStatus::new(
+                hellas_wire::WireCode::Unavailable,
+                "paid offers unavailable",
+            )
+        })?;
+        offers.request(request, context).await
+    }
+
     async fn exchange_setup(
         &self,
         request: ExchangeSetupRequest,
@@ -641,7 +660,7 @@ impl DrivenChannel {
             .ok_or(PaidProviderError::NoDescriptor)?;
         let query = WorkChannelQuery {
             bond_edge: descriptor.bond_edge(),
-            payment_edge: descriptor.channel().payment_edge(),
+            payment_edge: Some(descriptor.channel().payment_edge()),
             funding: Default::default(),
         };
         let snapshot = snapshot.ok_or(PaidProviderError::NoSnapshot)?;
@@ -844,6 +863,10 @@ impl SetupClock {
 
 /// The clock, over every paid-work journal this node owns.
 pub struct WorkRunner {
+    config: WorkRunnerConfig,
+    adopt: tokio::sync::mpsc::Receiver<SetupClock>,
+    sender: tokio::sync::mpsc::Sender<SetupClock>,
+    registry: BTreeMap<EdgeId, SetupService>,
     clocks: Vec<SetupClock>,
     signer: Secp256k1Signer,
     work_mount: MountedWork,
@@ -873,85 +896,78 @@ impl WorkRunner {
         setup_mount: MountedSetup,
     ) -> Result<Self, PaidProviderError> {
         config.validate()?;
-        let settlement_verifier = Secp256k1Verifier::new();
         let found = discover_setups(&config.journal_root, config.network)
             .await
             .map_err(|source| PaidProviderError::Discover {
                 path: config.journal_root.clone(),
                 source,
             })?;
-        for unnamed in &found.unidentified {
-            warn!(
-                path = %unnamed.path.display(),
-                reason = %unnamed.reason,
-                "a setup journal under the work root could not be named",
-            );
+        if !found.unidentified.is_empty() {
+            return Err(PaidProviderError::InvalidOffer);
         }
-        let mut clocks = Vec::with_capacity(found.setups.len());
-        for setup in found.setups {
-            let bond = hex::encode(setup.bond_edge.to_bytes());
-            let route_peer = config
-                .routes
-                .iter()
-                .find(|route| route.bond == setup.bond_edge)
-                .map(|route| route.peer);
-            // A close capability binds the provider half, and this
-            // process holds the provider's key. A client journal beside
-            // this node's own is another party's, and this runner has
-            // nothing to sign for it.
-            if setup.role != Role::Provider {
-                warn!(
-                    bond,
-                    "a setup journal under the work root is not this node's half"
-                );
-                continue;
-            }
-            let store = match SetupStore::open(
+        let mut clocks = Vec::new();
+        let mut registry = BTreeMap::new();
+        for setup in found
+            .setups
+            .into_iter()
+            .filter(|s| s.role == Role::Provider)
+        {
+            let store = SetupStore::open(
                 &config.journal_root,
                 config.network,
                 setup.bond_edge,
-                setup.role,
-                &settlement_verifier,
+                Role::Provider,
+                &Secp256k1Verifier::new(),
             )
-            .await
-            {
-                Ok(store) => store,
-                Err(error) => {
-                    warn!(bond, %error, "a discovered setup journal did not open");
-                    continue;
-                }
-            };
-            let policy = Box::new(config.policy.clone());
-            let service = SetupService::new(SetupEndpoint::new(
-                store,
-                config.settlement_key.clone(),
-                PaymentAdmission::Admits(policy.clone()),
-            ));
-            if let Some(peer) = route_peer {
-                match setup_mount.mount(peer, setup.bond_edge, &service) {
-                    Ok(()) => info!(
-                        bond,
-                        "this node now answers WorkSetup from its driven setup"
-                    ),
-                    Err(error) => warn!(bond, %error, "provider setup could not be mounted"),
-                }
-            } else {
-                warn!(bond, "this provider setup has no configured peer route");
+            .await?;
+            let clock = Self::adopt_setup(&config, store, &setup_mount)?;
+            if let Driven::Setup { service, .. } = &clock.driven {
+                registry.insert(setup.bond_edge, service.clone());
             }
-            let driven = Driven::Setup { service, policy };
-            clocks.push(SetupClock {
-                max_observation_age: config.max_observation_age,
-                bond_edge: setup.bond_edge,
-                route_peer,
-                driven,
-            });
+            clocks.push(clock);
         }
+        let (sender, adopt) = tokio::sync::mpsc::channel(16);
         Ok(Self {
+            signer: config.settlement_key.clone(),
+            poll: config.poll,
             clocks,
-            signer: config.settlement_key,
             work_mount,
             setup_mount,
-            poll: config.poll,
+            config,
+            sender,
+            adopt,
+            registry,
+        })
+    }
+
+    fn adopt_setup(
+        config: &WorkRunnerConfig,
+        store: SetupStore,
+        setup_mount: &MountedSetup,
+    ) -> Result<SetupClock, PaidProviderError> {
+        let (peer, offer) = store
+            .state()
+            .offer()
+            .ok_or(PaidProviderError::InvalidOffer)?;
+        if offer.offer().proposal.bond_terms().parties.maker().signer()
+            != config.settlement_key.party_key()
+        {
+            return Err(PaidProviderError::InvalidOffer);
+        }
+        let peer = PeerId::from_bytes(*peer);
+        let bond_edge = offer.offer().proposal.bond_edge();
+        let policy = Box::new(offer.offer().policy.clone());
+        let service = SetupService::new(SetupEndpoint::new(
+            store,
+            config.settlement_key.clone(),
+            PaymentAdmission::Admits(policy.clone()),
+        ));
+        setup_mount.mount(peer, bond_edge, &service)?;
+        Ok(SetupClock {
+            max_observation_age: config.max_observation_age,
+            bond_edge,
+            route_peer: Some(peer),
+            driven: Driven::Setup { service, policy },
         })
     }
 
@@ -961,6 +977,9 @@ impl WorkRunner {
     where
         S: SetupView + FinalizedBlocks + FinalizedWorkView + TxSink + Sync,
     {
+        while let Ok(clock) = self.adopt.try_recv() {
+            self.clocks.push(clock);
+        }
         let mut answered = true;
         for clock in &mut self.clocks {
             answered &= clock
@@ -995,12 +1014,6 @@ impl WorkRunner {
         D: Fn() -> F,
         F: core::future::Future<Output = Option<S>>,
     {
-        if self.clocks.is_empty() {
-            info!("no provider setup journal under the work root; the clock has nothing to drive");
-            return self.unmount_all().await;
-        }
-        // Each channel consumes the same local finalization stream. Independent
-        // journal scheduling keeps a slow close submission from blocking another.
         {
             use futures::{StreamExt as _, stream::FuturesUnordered};
             let signer = &self.signer;
@@ -1009,10 +1022,8 @@ impl WorkRunner {
             let dial = &dial;
             let poll = self.poll;
             let finalized = &finalized;
-            let mut observers = self
-                .clocks
-                .iter_mut()
-                .map(|clock| async move {
+            let observe = |mut clock: SetupClock| {
+                Box::pin(async move {
                     let mut chain = None;
                     let mut finalized = finalized.clone();
                     loop {
@@ -1049,14 +1060,22 @@ impl WorkRunner {
                         }
                     }
                 })
+            };
+            let mut observers = self
+                .clocks
+                .drain(..)
+                .map(observe)
                 .collect::<FuturesUnordered<_>>();
             loop {
                 tokio::select! {
                     _ = &mut stop => break,
-                    next = observers.next() => if next.is_none() { break; },
+                    Some(clock) = self.adopt.recv() => observers.push(observe(clock)),
+                    Some(()) = observers.next(), if !observers.is_empty() => {},
                 }
             }
         }
+        self.adopt.close();
+        while self.adopt.try_recv().is_ok() {}
         let result = self.unmount_all().await;
         info!("the paid-work clock stopped, and its journals are closed");
         result
@@ -1071,12 +1090,39 @@ pub struct NodeWorkRunner {
 
 impl WorkRunner {
     async fn unmount_all(&self) -> Result<(), MountError> {
+        let offers = match self.setup_mount.2.get() {
+            Some(offers) => offers.shutdown().await,
+            None => Ok(()),
+        };
         let work = self.work_mount.clear_all().await;
         let setup = self.setup_mount.clear_all();
-        work.and(setup)
+        offers.and(work).and(setup)
     }
 
-    pub fn on_node(self, node: FullNode) -> NodeWorkRunner {
+    pub fn on_node(
+        self,
+        node: FullNode,
+        authority: hellas_work::node::NodeCoordinator,
+        provider: hellas_rpc::ProviderEnrollmentBundle,
+        addresses: Vec<String>,
+    ) -> NodeWorkRunner {
+        self.setup_mount
+            .2
+            .set(AutomaticOffers::spawn(OfferAllocator {
+                config: self.config.clone(),
+                node: node.clone(),
+                authority,
+                provider,
+                addresses,
+                registry: Arc::new(tokio::sync::Mutex::new(self.registry.clone())),
+                adopt: self.sender.clone(),
+                mount: MountedSetup(
+                    self.setup_mount.0.clone(),
+                    self.setup_mount.1.clone(),
+                    Default::default(),
+                ),
+            }))
+            .unwrap_or_else(|_| panic!("offer service already installed"));
         self.work_mount
             .node
             .0
@@ -1176,11 +1222,9 @@ mod tests {
             WorkRunnerConfig {
                 network: config.chain.network,
                 journal_root: config.journal_root.clone(),
-                routes: config.routes.clone(),
                 poll: Duration::ZERO,
                 max_observation_age: config.max_observation_age,
                 settlement_key: crate::test_support::signer(2),
-                policy: config.provider_policy(),
             },
             MountedWork::default(),
             MountedSetup::default(),

@@ -48,7 +48,8 @@ const OPEN_FETCH_SCHEMA: &str = "hellas.work.fetch-route.open.v1";
 
 /// Canonical route policy. Its variable-length body is committed by digest in
 /// the fixed-width `FetchPolicyV2` record and opened during input validation.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum FetchRoutePolicy {
     /// Requires the signed request to use this service and method.
     SealedRoute {
@@ -216,7 +217,8 @@ pub fn fetch_route_commitment(canonical_body_bytes: &[u8]) -> Result<Digest, Pai
 // ── The fetch execution policy ────────────────────────────────────────
 
 /// Price-free Fetch resource envelope, record tag 7.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FetchPolicyV2 {
     /// The one fetch environment manifest this channel will run.
     pub allowed_environment: ContentId,

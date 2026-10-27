@@ -5,6 +5,7 @@ use crate::{
     work_router::{WorkConnection, WorkRouter},
 };
 use hellas_auth::authority::{AuthorityId, CredentialSecret};
+use hellas_rpc::authentication::MAX_AUTHENTICATION_MESSAGE_BYTES;
 use hellas_rpc::pb::work::{FundingKind, WorkRoute};
 use hellas_rpc::services::work::{AcceptWork, Open, Work, WorkClientImpl};
 use hellas_wire::{Dispatcher, Metadata, WireCode};
@@ -203,7 +204,8 @@ async fn work_rejects_wrong_application_identity_audience_and_grant_binding() {
                     let length = recv.read_u16().await.unwrap();
                     let mut challenge = vec![0; usize::from(length)];
                     recv.read_exact(&mut challenge).await.unwrap();
-                    send.write_u16(257).await.unwrap();
+                    let oversize = u16::try_from(MAX_AUTHENTICATION_MESSAGE_BYTES + 1).unwrap();
+                    send.write_u16(oversize).await.unwrap();
                     // No body follows: reject the length without waiting for bytes.
                     recv.read_u8().await.unwrap_err();
                 } else {
@@ -258,11 +260,15 @@ async fn work_rejects_wrong_application_identity_audience_and_grant_binding() {
                         .close(0u32.into(), b"failed authentication");
                 }
             });
-            assert_eq!(
-                server.err().unwrap().code,
-                WireCode::PermissionDenied,
-                "{attack:?}"
-            );
+            let refusal = server.err().unwrap();
+            assert_eq!(refusal.code, WireCode::PermissionDenied, "{attack:?}");
+            if attack == ApplicationAttack::Oversize {
+                assert_eq!(
+                    refusal.message(),
+                    "application authentication failed",
+                    "the frame reader must reject the length before reading the body",
+                );
+            }
             pair.close().await;
         }
         assert_eq!(f.calls.load(Ordering::SeqCst), 0);

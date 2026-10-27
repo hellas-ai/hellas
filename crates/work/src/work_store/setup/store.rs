@@ -173,6 +173,10 @@ fn check_signatures<V: SigVerifier>(
     verifier: &V,
 ) -> Result<(), SetupStateError> {
     let bundle = match record {
+        SetupRecord::Offer { offer, .. } => {
+            offer.check().map_err(|_| SetupStateError::Malformed)?;
+            return check_bundle_signatures(Some(&offer.offer().proposal.encode()), verifier);
+        }
         SetupRecord::Bundle { bundle } | SetupRecord::ArmedBundle { bundle, .. } => bundle,
         _ => return Ok(()),
     };
@@ -306,7 +310,8 @@ pub async fn discover_setups(
             continue;
         };
         match identify_setup(root, &stem, named, network).await {
-            Ok(setup) => discovery.setups.push(setup),
+            Ok(Some(setup)) => discovery.setups.push(setup),
+            Ok(None) => {}
             Err(reason) => discovery.unidentified.push(UnidentifiedSetup {
                 path: Journal::path(root, &stem),
                 reason,
@@ -327,10 +332,15 @@ async fn identify_setup(
     stem: &str,
     named: [u8; 32],
     network: NetworkId,
-) -> Result<DiscoveredSetup, SetupDiscoveryError> {
+) -> Result<Option<DiscoveredSetup>, SetupDiscoveryError> {
     let (id, replay) = Journal::inspect(root, stem).await?;
     if id.kind != JournalKind::Setup || id.key != named {
         return Err(SetupDiscoveryError::NotThisSetup);
+    }
+    // An empty initialized journal has exported no signature. A process can
+    // stop between creating its header and atomically committing its offer.
+    if replay.checkpoint.is_none() && replay.records.is_empty() {
+        return Ok(None);
     }
     // A rotated journal keeps its revision in the checkpoint rather than
     // in a frame, so a discovery that read only the frames would report
@@ -345,10 +355,12 @@ async fn identify_setup(
         );
     }
     for bytes in &replay.records {
-        if let SetupRecord::Bundle { bundle } | SetupRecord::ArmedBundle { bundle, .. } =
-            SetupRecord::decode(bytes)?
-        {
-            retained.push(bundle);
+        match SetupRecord::decode(bytes)? {
+            SetupRecord::Bundle { bundle } | SetupRecord::ArmedBundle { bundle, .. } => {
+                retained.push(bundle)
+            }
+            SetupRecord::Offer { offer, .. } => retained.push(offer.offer().proposal.encode()),
+            _ => {}
         }
     }
     if let Some(bundle) = retained.first() {
@@ -357,10 +369,10 @@ async fn identify_setup(
         if setup_key(network, bond_edge).into_bytes() != id.key {
             return Err(SetupDiscoveryError::WrongKey);
         }
-        return Ok(DiscoveredSetup {
+        return Ok(Some(DiscoveredSetup {
             bond_edge,
             role: id.role,
-        });
+        }));
     }
     Err(SetupDiscoveryError::NoRevision)
 }

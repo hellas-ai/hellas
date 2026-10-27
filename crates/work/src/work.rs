@@ -148,7 +148,7 @@ use prost::Message as _;
 
 use crate::model::fetch::{FetchPolicyV2, PreparedPaidFetchInputParts};
 use crate::model::prepared_input::PreparedPaidInputParts;
-use crate::model::profile::{PreparedWorkInput, WorkPolicy};
+use crate::model::profile::{PreparedWorkInput as PreparedWorkBundle, WorkPolicy};
 use crate::model::setup::{ObservedChannel, ReadyChannel, WorkSetupError};
 use crate::model::work::encode_kernel;
 use crate::model::work::{
@@ -786,7 +786,7 @@ impl ProviderEndpoint {
             &authorization,
             cursor_height,
         )?;
-        let bundle = PreparedWorkInput::decode(&request.prepared_input, MAX_RECORD_BYTES)
+        let bundle = PreparedWorkBundle::decode(&request.prepared_input, MAX_RECORD_BYTES)
             .map_err(|error| Refusal::invalid(error.to_string()))?;
         policy.check_input(ready.channel(), &authorization, &bundle)?;
         ready.check_signable(
@@ -926,19 +926,19 @@ impl ProviderEndpoint {
         if job.prepared_input().is_empty() {
             return Ok(RunAdmission::Indeterminate);
         }
-        let bundle = PreparedWorkInput::decode(job.prepared_input(), MAX_RECORD_BYTES)
+        let bundle = PreparedWorkBundle::decode(job.prepared_input(), MAX_RECORD_BYTES)
             .map_err(PaidWorkError::from)?;
         ready
             .work_policy()
             .check_input(ready.channel(), &authorization, &bundle)?;
         let admission = match (bundle, ready.work_policy()) {
-            (PreparedWorkInput::Evaluate(bundle), WorkPolicy::Evaluate(_)) => {
+            (PreparedWorkBundle::Evaluate(bundle), WorkPolicy::Evaluate(_)) => {
                 RunAdmission::Invoke(Box::new(PreparedEvaluateInput {
                     parts: bundle.parts().map_err(PaidWorkError::from)?,
                     admission: WorkAdmission::payment(),
                 }))
             }
-            (PreparedWorkInput::Fetch(bundle), WorkPolicy::Fetch { policy, .. }) => {
+            (PreparedWorkBundle::Fetch(bundle), WorkPolicy::Fetch { policy, .. }) => {
                 RunAdmission::InvokeFetch(Box::new(PreparedFetchInput {
                     parts: bundle.parts().map_err(PaidWorkError::from)?,
                     policy: *policy,
@@ -984,7 +984,7 @@ impl ProviderEndpoint {
     ) -> Result<(PaidJobResultV1, Sig), RunError> {
         let job = self.state().job_by_id(work_id).ok_or(RunError::NoSuchJob)?;
         let authorization = *job.authorization();
-        let input = PreparedWorkInput::decode(job.prepared_input(), MAX_RECORD_BYTES)
+        let input = PreparedWorkBundle::decode(job.prepared_input(), MAX_RECORD_BYTES)
             .map_err(|e| RunError::Transcript(e.into()))?;
         let ready = self
             .ready
@@ -1921,6 +1921,25 @@ impl<A> PreparedFetchInput<A> {
     }
 }
 
+/// One admitted request, retaining its profile's input, limits and capacity ticket.
+#[derive(Debug)]
+pub enum PreparedWorkInput {
+    Evaluate(Box<PreparedEvaluateInput>),
+    Fetch(Box<PreparedFetchInput>),
+}
+
+impl From<PreparedEvaluateInput> for PreparedWorkInput {
+    fn from(input: PreparedEvaluateInput) -> Self {
+        Self::Evaluate(Box::new(input))
+    }
+}
+
+impl From<PreparedFetchInput> for PreparedWorkInput {
+    fn from(input: PreparedFetchInput) -> Self {
+        Self::Fetch(Box::new(input))
+    }
+}
+
 /// The one seam a paid job crosses on its way to real execution.
 ///
 /// The endpoint selects Evaluate or Fetch from the admitted profile and passes
@@ -1937,53 +1956,37 @@ impl<A> PreparedFetchInput<A> {
 pub trait WorkBackend: Sync {
     /// A grant must reserve bounded executor capacity before co-signature.
     fn try_admit(&self, domain: CapacityDomain) -> Result<WorkPermit, BackendFault>;
-    /// Runs an authorized Fetch without persisting request or response bodies.
-    fn fetch(
-        &self,
-        _input: PreparedFetchInput,
-    ) -> impl core::future::Future<Output = Result<Vec<OutputEventEnvelope>, BackendFault>> + Send
-    {
-        async { Err(AdmissionError::Unsupported(CapacityDomain::Fetch).into()) }
-    }
 
-    /// Runs once, exposing signed Fetch prefixes before terminal delivery.
-    fn fetch_stream(
+    /// Runs an admitted request to its complete signed transcript.
+    fn execute(
         &self,
-        input: PreparedFetchInput,
-        progress: PaidProgress,
+        input: PreparedWorkInput,
     ) -> impl core::future::Future<Output = Result<Vec<OutputEventEnvelope>, BackendFault>> + Send
     {
         async move {
-            let events = self.fetch(input).await?;
-            for event in &events {
-                if event.event().body().kind() == hellas_rpc::fetch::OUTPUT_EVENT_KIND {
-                    progress(event.clone())?;
-                }
-            }
-            Ok(events)
+            let domain = match input {
+                PreparedWorkInput::Evaluate(_) => CapacityDomain::Gpu,
+                PreparedWorkInput::Fetch(_) => CapacityDomain::Fetch,
+            };
+            Err(AdmissionError::Unsupported(domain).into())
         }
     }
-    /// Runs one journaled Evaluate input to its terminal.
-    fn evaluate(
-        &self,
-        _input: PreparedEvaluateInput,
-    ) -> impl core::future::Future<Output = Result<Vec<OutputEventEnvelope>, BackendFault>> + Send
-    {
-        async { Err(AdmissionError::Unsupported(CapacityDomain::Gpu).into()) }
-    }
 
-    /// Run once, exposing authenticated token prefixes while retaining the
-    /// complete transcript for durable terminal delivery.
-    fn evaluate_stream(
+    /// Runs once, exposing authenticated prefixes before terminal delivery.
+    fn execute_stream(
         &self,
-        input: PreparedEvaluateInput,
+        input: PreparedWorkInput,
         progress: PaidProgress,
     ) -> impl core::future::Future<Output = Result<Vec<OutputEventEnvelope>, BackendFault>> + Send
     {
         async move {
-            let events = self.evaluate(input).await?;
+            let kind = match &input {
+                PreparedWorkInput::Evaluate(_) => hellas_rpc::evaluate::TOKEN_DELTA_EVENT_KIND,
+                PreparedWorkInput::Fetch(_) => hellas_rpc::fetch::OUTPUT_EVENT_KIND,
+            };
+            let events = self.execute(input).await?;
             for event in &events {
-                if event.event().body().kind() == hellas_rpc::evaluate::TOKEN_DELTA_EVENT_KIND {
+                if event.event().body().kind() == kind {
                     progress(event.clone())?;
                 }
             }
@@ -2128,9 +2131,9 @@ where
     let progress_policy = ready.work_policy().clone();
     let progress: PaidProgress =
         Arc::new(move |event| progress_service.publish_progress(work_id, &progress_policy, event));
-    let invoked = match admission {
-        RunAdmission::Invoke(input) => backend.evaluate_stream(*input, progress).await,
-        RunAdmission::InvokeFetch(input) => backend.fetch_stream(*input, progress).await,
+    let input = match admission {
+        RunAdmission::Invoke(input) => PreparedWorkInput::Evaluate(input),
+        RunAdmission::InvokeFetch(input) => PreparedWorkInput::Fetch(input),
         RunAdmission::Running => return Ok(RunOutcome::Running),
         RunAdmission::Indeterminate => return Ok(RunOutcome::Indeterminate),
         RunAdmission::Ready { result, signature } => {
@@ -2138,7 +2141,7 @@ where
         }
     };
 
-    let transcript = match invoked {
+    let transcript = match backend.execute_stream(input, progress).await {
         Ok(transcript) => transcript,
         Err(fault) => return Err(end_failed(service, work_id, RunError::Backend(fault)).await),
     };
@@ -3177,7 +3180,7 @@ fn work_id_bytes(bytes: &[u8]) -> Option<Digest> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JobProposal {
     /// The inputs the job runs on.
-    pub prepared_input: PreparedWorkInput,
+    pub prepared_input: PreparedWorkBundle,
     /// The three heights the job is bound by.
     pub deadlines: JobDeadlines,
 }
@@ -3670,7 +3673,7 @@ impl ClientEndpoint {
                 &delivered.transcript,
                 crate::model::fetch::MAX_FETCH_TRANSCRIPT_BYTES,
             )?;
-            let input = PreparedWorkInput::decode(
+            let input = PreparedWorkBundle::decode(
                 self.state()
                     .job_by_id(work_id)
                     .ok_or(DeliverError::NoSuchJob)?

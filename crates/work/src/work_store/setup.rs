@@ -229,6 +229,12 @@ pub struct SetupObservation {
 /// a second copy could only ever be a different one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SetupRecord {
+    /// The original offer and authenticated peer, durable with revision one.
+    Offer {
+        peer: [u8; 32],
+        floor: Option<SetupScan>,
+        offer: Box<crate::model::offer::SignedPaidOffer>,
+    },
     /// One revision of the handshake, written before the signature it
     /// carries is exported.
     Bundle {
@@ -288,6 +294,7 @@ mod tag {
     pub(super) const ARMED_BUNDLE: u8 = 6;
     pub(super) const OBSERVED: u8 = 7;
     pub(super) const BOND_TIMEOUT_SUBMITTED: u8 = 8;
+    pub(super) const OFFER: u8 = 9;
 }
 
 mod end_code {
@@ -344,6 +351,7 @@ pub struct SetupOrigin {
 /// Everything the handshake has durably reached.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SetupState {
+    offer: Option<([u8; 32], crate::model::offer::SignedPaidOffer)>,
     network: NetworkId,
     bond_edge: EdgeId,
     role: Role,

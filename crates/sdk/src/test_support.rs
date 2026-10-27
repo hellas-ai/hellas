@@ -22,7 +22,6 @@ use hellas_work::work::{ClientEndpoint, JobProposal, ProviderEndpoint, WorkServi
 use hellas_work::work_store::{ChannelStore, Role, SetupOrigin};
 
 pub(crate) use crate::test_identity::enrollment;
-use iroh::EndpointId;
 
 pub(crate) async fn authority(
     root: &std::path::Path,
@@ -68,6 +67,7 @@ pub(crate) struct PaidFixture {
     pub ready: ReadyChannel,
     pub descriptor: WorkChannelDescriptor,
     pub config: WorkConfig,
+    pub policy: hellas_work::model::setup::ProviderChannelPolicy,
     pub proposal: hellas_work::model::bundle::WorkChannelSetupBundleV2,
 }
 
@@ -252,19 +252,26 @@ impl PaidFixture {
                 pending: PendingSlot::Absent,
             })
             .unwrap();
+        let policy = hellas_work::model::setup::ProviderChannelPolicy {
+            payment_policy: payment_policy(),
+            network,
+            policy_salt: [9; 32],
+            channel_policy,
+            work_policy,
+            expected_payment_values: values,
+            min_omit_response_blocks: hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
+        };
         let config = WorkConfig {
-        payment_policy: payment_policy(),
             chain: ChainCrossCheck { network, genesis: None, genesis_payload_digest: [0; 32].into(), threshold_identity: hex::decode("97f1d3a73197d7942695638c4fa9ac0fc3688c4f9774b905a14e3a3f171bac586c55e83ff97a1aeffb3af00adb22c6bb").unwrap() },
-            validators: vec!["ws://unused.invalid".to_owned()], journal_root: root.path().join("provider"), routes: Default::default(),
-            policy_salt: [9; 32], channel_policy, work_policy,
+            validators: vec!["ws://unused.invalid".to_owned()], journal_root: root.path().join("provider"),
             poll: std::time::Duration::from_millis(10), max_observation_age: std::time::Duration::from_secs(60),
-            expected_payment_values: values, min_omit_response_blocks: hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
         };
         Self {
             root,
             ready,
             descriptor,
             config,
+            policy,
             proposal,
         }
     }
@@ -278,7 +285,7 @@ impl PaidFixture {
         ChannelStore::open_metadata_only(
             &self.root.path().join(name),
             self.ready.channel().clone(),
-            work_payment_settlement(self.config.expected_payment_values, OMISSION_BOND).unwrap(),
+            work_payment_settlement(self.policy.expected_payment_values, OMISSION_BOND).unwrap(),
             role,
             SetupOrigin {
                 payment_edge: self.ready.channel().payment_edge(),
@@ -363,15 +370,6 @@ fn payment_policy() -> hellas_work::model::work::JobPaymentPolicyV2 {
         dispatch_margin_blocks: 4,
         delivery_margin_blocks: 2,
         oracle_grace_blocks: 6,
-    }
-}
-
-pub(crate) fn provider_trust(peer: EndpointId) -> hellas_client::ProviderTrustAnchor {
-    hellas_client::ProviderTrustAnchor {
-        allowed_environments: vec![test_responses_contract().manifest_id()],
-        expected_genesis: enrollment(peer).0.content_id(),
-        required_assurance: Assurance::ProducerSigned,
-        apple_app_attest: None,
     }
 }
 

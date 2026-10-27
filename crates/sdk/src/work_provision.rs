@@ -1,7 +1,6 @@
 //! Provider bond provisioning.
 //!
-//! Preview derives the bond without reading the chain or writing a journal.
-//! Provisioning checks that the route, bond and staked coins are unreserved, then
+//! Provisioning checks that the bond and staked coins are unreserved, then
 //! arms a finalized history floor and journals the signed offer. It reopens the
 //! journal to verify durability before returning. Unanswered offers reserve their
 //! staked coins as soon as revision one is signed.
@@ -19,26 +18,29 @@ use hellas_kernel::{
     BlockHeight, CoinId, EdgeId, Funding, Key, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, NetworkId,
     Parties, PartyKeys, Payout, Secp256k1Signer, Secp256k1Verifier, Terms, Tx, WorkStakeBondTerms,
 };
+use hellas_work::model::bundle::WorkChannelSetupBundleV2;
 use hellas_work::model::setup::ProviderChannelPolicy;
 use hellas_work::work_close::FinalizedBlocks;
-use hellas_work::work_handshake::{PaymentAdmission, SetupEndpoint};
-use hellas_work::work_store::{Role, SetupScan, SetupStore, discover_setups};
-use tracing::info;
+use hellas_work::work_store::{Role, SetupScan, SetupStore};
+use hellas_work::work_store::{SetupRecord, SetupState};
 
-use crate::work_config::{WorkConfig, WorkRoute};
-
-/// What an operator asks for when they make one offer.
+/// Checked inputs selected by the provider under its standing policy.
 pub struct ProvisionOptions {
-    /// Chain, journal, route and execution-policy configuration.
-    pub work_config: WorkConfig,
+    /// Chain and journal identity.
+    pub network: NetworkId,
+    pub journal_root: PathBuf,
+    pub policy: ProviderChannelPolicy,
+    pub omission_bond: u64,
+    pub payment_funding: Funding,
+    pub peer: [u8; 32],
     /// The key this provider stakes and signs the bond with, read from
     /// the identity the operator already has and never made here.
     pub settlement_key: Secp256k1Signer,
     pub provider: hellas_rpc::ProviderEnrollmentBundle,
     pub addresses: Vec<String>,
-    /// Existing verified contact selected by the provider for this client.
-    pub client: hellas_auth::authority::ContactCard,
-    /// The client's node signer. The contact alone does not prove this association.
+    /// Principal authorized by the finalized funding delegation.
+    pub client_principal: hellas_auth::authority::PrincipalId,
+    /// The node key named by that delegation.
     pub client_node: Key,
     /// Whether returned stake remains delegated to this provider node.
     pub redelegate_payout: bool,
@@ -53,25 +55,16 @@ pub struct ProvisionOptions {
     pub max_job_price: u64,
 }
 
-/// Compute the bond before the operator adds its bilateral route.
-pub async fn preview_bond(
-    options: &ProvisionOptions,
-    authority: &hellas_work::node::NodeCoordinator,
-) -> Result<EdgeId> {
-    authority.check_provider(&options.provider).await?;
-    Ok(BondCandidate::plan(options, authority.owner().await?)?.bond_edge)
-}
-
 /// Sign and journal an offer under an existing provider identity.
 pub async fn provision_offer(
     options: ProvisionOptions,
     node: &hellas_chain::node::FullNode,
     authority: &hellas_work::node::NodeCoordinator,
+    held: &[SetupState],
 ) -> Result<Provisioned> {
-    options.work_config.check_node(node)?;
     authority.check_provider(&options.provider).await?;
     let candidate = BondCandidate::plan(&options, authority.owner().await?)?;
-    let offer = Offer::plan(&options, options.work_config.provider_policy(), candidate).await?;
+    let offer = Offer::plan(&options, candidate, held)?;
     let view = tokio::time::timeout(std::time::Duration::from_secs(30), node.wait_ready())
         .await
         .map_err(|_| ProvisionError::NoFinalizedBlock)??;
@@ -92,7 +85,7 @@ pub struct Provisioned {
     pub offer: hellas_work::model::offer::SignedPaidOffer,
 }
 
-/// Deterministic inputs shared by bond preview and provisioning.
+/// Deterministic bond inputs, checked before a signature is journaled.
 struct BondCandidate {
     network: NetworkId,
     journal_root: PathBuf,
@@ -107,8 +100,8 @@ impl BondCandidate {
         options: &ProvisionOptions,
         owner: hellas_auth::authority::PrincipalId,
     ) -> Result<Self> {
-        let network = options.work_config.chain.network;
-        let journal_root = options.work_config.journal_root.clone();
+        let network = options.network;
+        let journal_root = options.journal_root.clone();
         // Maker is the provider and taker is the client, which is what
         // makes this signature the maker's: `propose_bond` refuses a bond
         // whose staking party this key is not.
@@ -121,7 +114,7 @@ impl BondCandidate {
                     options.redelegate_payout.then_some(provider),
                 ),
                 PartyKeys::new(
-                    Key::from_bytes(*options.client.principal().as_bytes()),
+                    Key::from_bytes(*options.client_principal.as_bytes()),
                     options.client_node,
                     Some(options.client_node),
                 ),
@@ -156,7 +149,10 @@ impl BondCandidate {
 /// One offer, decided before anything is dialled or written.
 struct Offer {
     candidate: BondCandidate,
-    admission: PaymentAdmission,
+    policy: ProviderChannelPolicy,
+    omission_bond: u64,
+    payment_funding: Funding,
+    peer: [u8; 32],
     provider: hellas_rpc::ProviderEnrollmentBundle,
     addresses: Vec<String>,
 }
@@ -164,10 +160,10 @@ struct Offer {
 impl Offer {
     /// Reads the operator's answers, and refuses everything refusable
     /// without a chain.
-    async fn plan(
+    fn plan(
         options: &ProvisionOptions,
-        policy: ProviderChannelPolicy,
         candidate: BondCandidate,
+        held: &[SetupState],
     ) -> Result<Self> {
         check_grant_provider(&options.provider)
             .map_err(|_| hellas_work::model::offer::PaidOfferError::Provider)?;
@@ -185,15 +181,13 @@ impl Offer {
         {
             return Err(hellas_work::model::offer::PaidOfferError::Malformed.into());
         }
-        let route = route_for_candidate(
-            &options.work_config,
-            candidate.bond_edge,
-            &candidate.bond_terms,
-        )?;
-        refuse_offer_collisions(&options.work_config, route, &candidate.bond_funding).await?;
+        refuse_offer_collisions(candidate.bond_edge, &candidate.bond_funding, held)?;
         Ok(Self {
             candidate,
-            admission: PaymentAdmission::Admits(Box::new(policy)),
+            policy: options.policy.clone(),
+            omission_bond: options.omission_bond,
+            payment_funding: options.payment_funding.clone(),
+            peer: options.peer,
             provider: options.provider.clone(),
             addresses: options.addresses.clone(),
         })
@@ -214,7 +208,10 @@ impl Offer {
         }
         let Self {
             candidate,
-            admission,
+            policy,
+            omission_bond,
+            payment_funding,
+            peer,
             provider,
             addresses,
         } = self;
@@ -226,20 +223,35 @@ impl Offer {
             bond_terms,
             settlement_key,
         } = candidate;
+        let terms = Terms::work_stake_bond(bond_terms.clone());
+        let auth = hellas_kernel::PartyAuth::signer(hellas_kernel::Auth::native(
+            settlement_key.sign(Tx::open_hash(network, &bond_funding, &terms)),
+        ));
+        let proposal =
+            WorkChannelSetupBundleV2::propose_bond(network, bond_funding, bond_terms, auth)
+                .map_err(hellas_work::model::offer::PaidOfferError::from)?;
+        let offer = hellas_work::model::offer::SignedPaidOffer::sign(
+            hellas_work::model::offer::PaidOffer {
+                provider,
+                proposal,
+                policy,
+                omission_bond,
+                payment_funding,
+                addresses,
+            },
+            &settlement_key,
+        )?;
         {
-            let store = open_provider_journal(&journal_root, network, bond_edge).await?;
-            let mut endpoint = SetupEndpoint::new(store, settlement_key.clone(), admission);
-            // Preserve the journal's immutable history floor on retry.
-            if let Some(held) = endpoint.state().scan_armed() {
-                info!(
-                    height = held.height,
-                    "this journal already holds its history floor, and a floor does not move",
-                );
-            } else {
-                endpoint.arm_scan(floor).await?;
-            }
-            endpoint
-                .propose_bond(network, bond_funding, bond_terms)
+            let mut store = open_provider_journal(&journal_root, network, bond_edge).await?;
+            store
+                .commit(
+                    SetupRecord::Offer {
+                        peer,
+                        floor: Some(floor),
+                        offer: Box::new(offer),
+                    },
+                    &Secp256k1Verifier::new(),
+                )
                 .await?;
         }
 
@@ -253,17 +265,10 @@ impl Offer {
                 floor: state.scan_armed().map(|scan| scan.height),
             });
         };
-        let offer = hellas_work::model::offer::SignedPaidOffer::sign(
-            hellas_work::model::offer::PaidOffer {
-                provider,
-                proposal: state
-                    .bundle()
-                    .cloned()
-                    .ok_or(ProvisionError::MissingProposal(bond_edge))?,
-                addresses,
-            },
-            &settlement_key,
-        )?;
+        let offer = state
+            .offer()
+            .map(|(_, offer)| offer.clone())
+            .ok_or(ProvisionError::MissingProposal(bond_edge))?;
         Ok(Provisioned {
             bond_edge,
             floor,
@@ -291,86 +296,23 @@ async fn open_provider_journal(
     })
 }
 
-/// Finds the candidate bond's route and checks its client before signing.
-fn route_for_candidate<'config>(
-    config: &'config WorkConfig,
-    bond_edge: EdgeId,
-    bond_terms: &WorkStakeBondTerms,
-) -> Result<&'config WorkRoute> {
-    let route = config
-        .routes
-        .iter()
-        .find(|route| route.bond == bond_edge)
-        .ok_or(ProvisionError::MissingRoute(bond_edge))?;
-    check_client(route, bond_edge, bond_terms.parties.taker().signer())?;
-    Ok(route)
-}
-
-/// Checks route, bond and coin reservations before opening the candidate journal.
-/// Unidentified or unreadable existing journals prevent provisioning.
-async fn refuse_offer_collisions(
-    config: &WorkConfig,
-    candidate: &WorkRoute,
-    candidate_funding: &Funding,
-) -> Result<()> {
-    let root = &config.journal_root;
-    let network = config.chain.network;
-    let found = discover_setups(root, network)
-        .await
-        .map_err(|source| ProvisionError::Journal {
-            root: root.clone(),
-            source,
-        })?;
-    if let Some(unnamed) = found.unidentified.into_iter().next() {
-        return Err(ProvisionError::Unidentified {
-            path: unnamed.path,
-            source: unnamed.reason,
-        });
-    }
-
-    let candidate_coins = funding_coins(candidate_funding);
-    for held in found
-        .setups
-        .iter()
-        .filter(|setup| setup.role == Role::Provider)
-    {
-        if held.bond_edge == candidate.bond {
-            return Err(ProvisionError::BondCollision(candidate.bond));
+/// Reservations include every journaled proposal, before either Open is posted.
+fn refuse_offer_collisions(bond: EdgeId, funding: &Funding, held: &[SetupState]) -> Result<()> {
+    let candidate_coins = funding_coins(funding);
+    for state in held {
+        let Some(bundle) = state.bundle() else {
+            continue;
+        };
+        if bundle.bond_edge() == bond {
+            return Err(ProvisionError::BondCollision(bond));
         }
-        let route = config
-            .routes
-            .iter()
-            .find(|route| route.bond == held.bond_edge)
-            .ok_or(ProvisionError::MissingRoute(held.bond_edge))?;
-        let store = open_provider_journal(root, network, held.bond_edge).await?;
-        let bundle = store
-            .state()
-            .bundle()
-            .ok_or(ProvisionError::MissingProposal(held.bond_edge))?;
-        check_client(
-            route,
-            held.bond_edge,
-            bundle.bond_terms().parties.taker().signer(),
-        )?;
-        // Revision-one funding is reserved even before an executable Open exists.
         let reserved = funding_coins(bundle.bond_funding());
         if let Some(coin) = candidate_coins.intersection(&reserved).next() {
             return Err(ProvisionError::ReservedCoin {
                 coin: *coin,
-                bond: held.bond_edge,
+                bond: bundle.bond_edge(),
             });
         }
-    }
-    Ok(())
-}
-
-fn check_client(route: &WorkRoute, bond: EdgeId, actual: Key) -> Result<()> {
-    if route.client != actual {
-        return Err(ProvisionError::WrongClient {
-            bond,
-            expected: route.client,
-            actual,
-        });
     }
     Ok(())
 }

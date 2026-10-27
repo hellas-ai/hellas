@@ -49,6 +49,12 @@ pub(crate) struct ExecutionPolicyFile {
 
 impl ExecutionPolicyFile {
     pub(crate) fn into_policy(self) -> Result<EvaluatePolicyV2> {
+        let policy = self.decode()?;
+        check_work_policy(&policy)?;
+        Ok(policy)
+    }
+
+    pub(crate) fn decode(self) -> Result<EvaluatePolicyV2> {
         let allowed_environment: ContentId =
             self.allowed_environment
                 .parse()
@@ -73,8 +79,6 @@ impl ExecutionPolicyFile {
             max_encoded_result_frame: self.max_encoded_result_frame,
             max_encoded_prepared_input: self.max_encoded_prepared_input,
         };
-        // Validate with the protocol rules before any channel is proposed.
-        check_work_policy(&policy)?;
         Ok(policy)
     }
 }
@@ -106,8 +110,16 @@ struct OpenFetchPolicyFile {
 
 impl FetchPolicyFile {
     pub(crate) fn into_policy(self) -> Result<WorkPolicy> {
+        let profile = self.decode()?;
+        profile.check()?;
+        Ok(profile)
+    }
+
+    pub(crate) fn decode(self) -> Result<WorkPolicy> {
         let route = match (self.service, self.method, self.open_fetch) {
-            (Some(service), Some(method), None) => FetchRoutePolicy::sealed_route(service, method)?,
+            (Some(service), Some(method), None) => {
+                FetchRoutePolicy::SealedRoute { service, method }
+            }
             (None, None, Some(open)) => {
                 FetchRoutePolicy::open_fetch(open.require_spki_pin, open.allowed_hosts)
             }
@@ -138,7 +150,6 @@ impl FetchPolicyFile {
             route,
             contract: self.contract,
         };
-        profile.check()?;
         Ok(profile)
     }
 }
@@ -146,12 +157,6 @@ impl FetchPolicyFile {
 pub(crate) fn parse_hex(field: &'static str, raw: &str) -> Result<Vec<u8>> {
     let bytes =
         hex::decode(raw.trim()).map_err(|source| ResourceConfigError::Hex { field, source })?;
-    if bytes.is_empty() {
-        return Err(ResourceConfigError::Invalid {
-            field,
-            reason: "must not be empty",
-        });
-    }
     Ok(bytes)
 }
 

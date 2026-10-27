@@ -77,6 +77,24 @@ pub(crate) fn not_ready() -> WorkRefused {
 }
 
 impl WorkSetupHandler for UnmountedWork {
+    async fn request_offer(
+        &self,
+        _request: hellas_rpc::pb::work::RequestOfferRequest,
+        _context: TransportContext,
+    ) -> Result<impl Into<WithTrailer<hellas_rpc::pb::work::RequestOfferResponse>> + Send, WireStatus>
+    {
+        Ok(hellas_rpc::pb::work::RequestOfferResponse {
+            outcome: Some(
+                hellas_rpc::pb::work::request_offer_response::Outcome::Refused(
+                    hellas_rpc::pb::work::OfferRefused {
+                        code: hellas_rpc::pb::work::OfferRefusalCode::NoPolicy as i32,
+                        required: 0,
+                    },
+                ),
+            ),
+        })
+    }
+
     async fn exchange_setup(
         &self,
         _request: ExchangeSetupRequest,

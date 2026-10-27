@@ -7,7 +7,10 @@ impl SetupRecord {
     /// marker about transactions already signed, or a note of what a
     /// finalized block said.
     pub(super) const fn exports_signature(&self) -> bool {
-        matches!(self, Self::Bundle { .. } | Self::ArmedBundle { .. })
+        matches!(
+            self,
+            Self::Bundle { .. } | Self::ArmedBundle { .. } | Self::Offer { .. }
+        )
     }
 
     /// Whether this step takes on an obligation rather than discharging
@@ -23,7 +26,10 @@ impl SetupRecord {
     pub(super) const fn is_new_work(&self) -> bool {
         matches!(
             self,
-            Self::Bundle { .. } | Self::ArmedBundle { .. } | Self::ScanArmed { .. }
+            Self::Bundle { .. }
+                | Self::ArmedBundle { .. }
+                | Self::ScanArmed { .. }
+                | Self::Offer { .. }
         )
     }
 
@@ -32,6 +38,12 @@ impl SetupRecord {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         match self {
+            Self::Offer { peer, floor, offer } => {
+                out.push(tag::OFFER);
+                out.extend_from_slice(peer);
+                put_option(&mut out, floor.as_ref(), put_scan);
+                out.extend_from_slice(&offer.encode().expect("checked provider offer"));
+            }
             Self::Bundle { bundle } => {
                 out.push(tag::BUNDLE);
                 // Last field, and the whole of the rest: the journal
@@ -97,6 +109,14 @@ impl SetupRecord {
     pub fn decode(bytes: &[u8]) -> Result<Self, SetupStateError> {
         let mut cursor = Cursor::new(bytes);
         let record = match cursor.byte().ok_or(SetupStateError::Malformed)? {
+            tag::OFFER => Self::Offer {
+                peer: cursor.array().ok_or(SetupStateError::Malformed)?,
+                floor: take_option(&mut cursor, SetupStateError::Malformed, take_scan)?,
+                offer: Box::new(
+                    crate::model::offer::SignedPaidOffer::decode(cursor.rest())
+                        .map_err(|_| SetupStateError::Malformed)?,
+                ),
+            },
             tag::BUNDLE => Self::Bundle {
                 bundle: cursor.rest().to_vec(),
             },
@@ -223,6 +243,7 @@ impl SetupState {
     #[must_use]
     pub fn checkpoint(&self) -> Vec<u8> {
         let Self {
+            offer,
             network,
             bond_edge,
             role,
@@ -267,6 +288,10 @@ impl SetupState {
         put_option(&mut out, origin.as_ref(), put_origin);
         put_option(&mut out, end.as_ref(), |out, end| {
             out.push(end_to_code(*end));
+        });
+        put_option(&mut out, offer.as_ref(), |out, (peer, offer)| {
+            out.extend_from_slice(peer);
+            put_bytes(out, &offer.encode().expect("checked provider offer"));
         });
         out
     }
@@ -329,6 +354,15 @@ impl SetupState {
             end: take_option(&mut cursor, SetupStateError::Malformed, |cursor| {
                 end_from_code(cursor.byte().ok_or(SetupStateError::Malformed)?)
                     .ok_or(SetupStateError::Malformed)
+            })?,
+            offer: take_option(&mut cursor, SetupStateError::Malformed, |cursor| {
+                let peer = cursor.array().ok_or(SetupStateError::Malformed)?;
+                let offer = crate::model::offer::SignedPaidOffer::decode(take_bytes(
+                    cursor,
+                    SetupStateError::Malformed,
+                )?)
+                .map_err(|_| SetupStateError::Malformed)?;
+                Ok((peer, offer))
             })?,
         };
         if cursor.is_empty() {

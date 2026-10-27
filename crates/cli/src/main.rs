@@ -42,7 +42,7 @@ fn validate_serve_assurance(
 ///
 /// Identity queries read the file and create nothing as a side effect: doing
 /// so could race with a running service's own creator. Paid-work commands also read
-/// an existing identity: providers, provisioning, the operator client, and
+/// an existing identity: providers, the operator client, and
 /// gateways configured with a paid provider pool. They sign with the stored
 /// identity's key, so the key must be one an operator already made —
 /// `identity init` is where it comes from. Minting one here would give
@@ -62,8 +62,7 @@ fn load_command_identity(
         Commands::Serve {
             work_config_file: Some(_),
             ..
-        } | Commands::Provision { .. }
-            | Commands::PaidWork { .. }
+        } | Commands::PaidWork { .. }
             | Commands::Gateway {
                 paid_work_config: Some(_),
                 ..
@@ -509,55 +508,6 @@ enum Commands {
         #[command(subcommand)]
         command: CodexAuthCommand,
     },
-    /// Make one of this provider's bond offers, so its client has something to
-    /// answer
-    ///
-    /// A node serves `WorkSetup` from the setup journals under its work
-    /// root and creates none, so a fresh provider offers nothing however
-    /// well it is configured. This signs one bond and journals it, and
-    /// returns only once the runner's own replay of that journal finds
-    /// it. A root may hold several offers only when their configured routes,
-    /// bonds, and every staked coin are pairwise disjoint.
-    Provision {
-        #[command(flatten)]
-        chain_node: commands::chain_node::ChainNodeArgs,
-        /// The paid-work configuration this offer is made under
-        #[arg(long = "work-config")]
-        work_config: PathBuf,
-        /// Existing node grant configuration; its authority must already be bootstrapped.
-        #[arg(long = "grant-config")]
-        grant_config: PathBuf,
-        /// Alias of an already imported, verified client contact.
-        #[arg(long)]
-        client_contact: String,
-        /// The client node signer this bond names as taker, hex-encoded.
-        #[arg(long = "client")]
-        client: String,
-        /// Return the provider's stake without delegating it back to this node.
-        #[arg(long)]
-        lock_provider_payout: bool,
-        /// A coin this provider stakes, hex-encoded. Repeat it for each
-        /// coin; the stake is the provider's alone, so none of these is
-        /// the client's.
-        #[arg(long = "stake-coin", required = true)]
-        stake_coin: Vec<String>,
-        /// Height the bond expires at, which is also the admission
-        /// horizon of the channel it insures
-        #[arg(long = "bond-timeout")]
-        bond_timeout: u64,
-        /// What the bond's timeout returns to this provider. Consensus
-        /// requires it to be the staked edge's close value exactly, and
-        /// refuses the open otherwise.
-        #[arg(long = "timeout-payout")]
-        timeout_payout: u64,
-        /// The largest job price this bond covers
-        #[arg(long = "max-job-price")]
-        max_job_price: u64,
-        /// Print the bond edge using the existing authority and contact,
-        /// before opening paid-work journals or connecting to validators.
-        #[arg(long = "print-bond-only")]
-        print_bond_only: bool,
-    },
     /// Discover peers and log network events
     Monitor {
         /// Stop monitoring after N seconds (default: run until Ctrl+C)
@@ -626,7 +576,6 @@ fn validate_identity_options(
                 work_config_file: Some(_),
                 ..
             }
-            | Commands::Provision { .. }
             | Commands::PaidWork { .. }
             | Commands::Gateway {
                 paid_work_config: Some(_),
@@ -964,46 +913,6 @@ async fn async_main() {
                 }
             }
         }
-        Commands::Provision {
-            chain_node,
-            work_config,
-            grant_config,
-            client_contact,
-            client,
-            lock_provider_payout,
-            stake_coin,
-            bond_timeout,
-            timeout_payout,
-            max_job_price,
-            print_bond_only,
-        } => match commands::serve::load_work_config(&work_config) {
-            Err(error) => Err(error.into()),
-            Ok(work_config) => async {
-                let authority = identity::open_authority(
-                    &grant_config, passkey.map(commands::contributions::principal).transpose()?,
-                ).await?;
-                let contact = commands::contributions::load_contact(authority.owner().await?, &client_contact)?;
-                commands::serve::run_provision(commands::serve::ProvisionOptions {
-                    work_config,
-                    // The bond is staked by the party this node already
-                    // settles as, taken from the identity loaded above
-                    // and never made here.
-                    settlement_key: identity::settlement_signer(&local_identity)?,
-                    provider: local_identity.enrollment.clone(),
-                    addresses: Vec::new(),
-                    client: contact,
-                    client_node: hellas_kernel::Key::from_bytes(commands::paid_work::fixed_hex("--client", &client)?),
-                    redelegate_payout: !lock_provider_payout,
-                    stake_coins: stake_coin.iter().map(|coin| {
-                        commands::paid_work::fixed_hex("--stake-coin", coin).map(hellas_kernel::CoinId::from_bytes)
-                    }).collect::<anyhow::Result<_>>()?,
-                    bond_timeout,
-                    timeout_payout,
-                    max_job_price,
-                }, print_bond_only, chain_node, authority)
-                .await
-            }.await
-        },
         Commands::Gateway {
             output_cache,
             store_dir,

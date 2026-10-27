@@ -185,20 +185,21 @@ async fn owner_prepare_and_cli_delegate_sweep_execute_on_a_real_validator() {
             vec![id; hellas_kernel::MAX_EDGE_INPUTS + 1],
         ] {
             assert!(matches!(
-                OwnerReshape::prepare(&client, network, owner, &selected, None).await,
+                OwnerReshape::prepare(&client, network, owner, &selected, None, None).await,
                 Err(hellas_sdk::coin_owner::CoinOwnerError::Inputs)
             ));
         }
         let foreign = owner_ids.iter().find(|(key, _)| *key != owner).unwrap().1;
         for absent in [foreign, CoinId::from_bytes([0xff; 32])] {
             assert!(
-                matches!(OwnerReshape::prepare(&client, network, owner, &[absent], None).await,
+                matches!(OwnerReshape::prepare(&client, network, owner, &[absent], None, None).await,
                 Err(hellas_sdk::coin_owner::CoinOwnerError::Missing(actual)) if actual == absent)
             );
         }
-        let plan = OwnerReshape::prepare(&client, network, owner, &[id], Some(node.party_key()))
-            .await
-            .unwrap();
+        let plan =
+            OwnerReshape::prepare(&client, network, owner, &[id], Some(node.party_key()), None)
+                .await
+                .unwrap();
         let auth = if owner == passkey.party_key() {
             Auth::webauthn(passkey.sign(plan.payload_hash()).unwrap())
         } else {
@@ -251,7 +252,7 @@ async fn owner_prepare_and_cli_delegate_sweep_execute_on_a_real_validator() {
             assert_eq!(found.value, 1000);
             final_id = restored;
         }
-        let sweep = OwnerReshape::prepare(&client, network, owner, &[final_id], None)
+        let sweep = OwnerReshape::prepare(&client, network, owner, &[final_id], None, None)
             .await
             .unwrap();
         let auth = if owner == passkey.party_key() {

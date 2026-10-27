@@ -5,6 +5,7 @@ pub mod fetch;
 pub mod grant;
 pub mod http_usage;
 pub mod offer;
+pub mod paid_policy;
 pub mod prepared_input;
 pub mod profile;
 pub mod setup;

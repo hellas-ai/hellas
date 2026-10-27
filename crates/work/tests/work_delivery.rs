@@ -36,9 +36,8 @@ use hellas_work::test_support::paid::{
     provider, store_at, transcript_for, work_policy,
 };
 use hellas_work::work::{
-    BackendFault, ClientEndpoint, CloseEndpoint, DeliverError, PreparedEvaluateInput,
-    ProviderEndpoint, RunError, RunOutcome, WorkBackend, WorkService, fetch_result,
-    run_accepted_work,
+    BackendFault, ClientEndpoint, CloseEndpoint, DeliverError, ProviderEndpoint, RunError,
+    RunOutcome, WorkBackend, WorkService, fetch_result, run_accepted_work,
 };
 use hellas_work::work_store::{
     ChannelRecord, ChannelStore, JobPhase, JobState, Role, TerminalOutcome,
@@ -165,14 +164,20 @@ impl WorkBackend for AnsweringBackend {
         Err(hellas_work::work::admission::AdmissionError::Unsupported(domain).into())
     }
 
-    fn evaluate(
+    async fn execute(
         &self,
-        input: PreparedEvaluateInput,
-    ) -> impl core::future::Future<Output = Result<Vec<OutputEventEnvelope>, BackendFault>> + Send
-    {
+        prepared: hellas_work::work::PreparedWorkInput,
+    ) -> Result<Vec<OutputEventEnvelope>, hellas_work::work::BackendFault> {
+        let hellas_work::work::PreparedWorkInput::Evaluate(input) = prepared else {
+            return Err(hellas_work::work::admission::AdmissionError::Unsupported(
+                hellas_work::work::admission::CapacityDomain::Fetch,
+            )
+            .into());
+        };
+        let input = *input;
         self.calls.fetch_add(1, Ordering::SeqCst);
         let produced = transcript_for(input.evaluate_request(), &ANSWER);
-        async move { Ok(produced) }
+        Ok(produced)
     }
 }
 
@@ -507,10 +512,17 @@ async fn a_failed_job_returns_its_terminal_after_authentication() {
             Err(hellas_work::work::admission::AdmissionError::Unsupported(domain).into())
         }
 
-        async fn evaluate(
+        async fn execute(
             &self,
-            _input: PreparedEvaluateInput,
-        ) -> Result<Vec<OutputEventEnvelope>, BackendFault> {
+            prepared: hellas_work::work::PreparedWorkInput,
+        ) -> Result<Vec<OutputEventEnvelope>, hellas_work::work::BackendFault> {
+            let hellas_work::work::PreparedWorkInput::Evaluate(input) = prepared else {
+                return Err(hellas_work::work::admission::AdmissionError::Unsupported(
+                    hellas_work::work::admission::CapacityDomain::Fetch,
+                )
+                .into());
+            };
+            let _input = *input;
             Err(BackendFault::caused_by(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 "fixture content is unavailable",
@@ -1216,17 +1228,31 @@ async fn live_prefix_precedes_terminal_and_reserves_delivery_credit() {
             Err(hellas_work::work::admission::AdmissionError::Unsupported(domain).into())
         }
 
-        async fn evaluate(
+        async fn execute(
             &self,
-            input: PreparedEvaluateInput,
-        ) -> Result<Vec<OutputEventEnvelope>, BackendFault> {
+            prepared: hellas_work::work::PreparedWorkInput,
+        ) -> Result<Vec<OutputEventEnvelope>, hellas_work::work::BackendFault> {
+            let hellas_work::work::PreparedWorkInput::Evaluate(input) = prepared else {
+                return Err(hellas_work::work::admission::AdmissionError::Unsupported(
+                    hellas_work::work::admission::CapacityDomain::Fetch,
+                )
+                .into());
+            };
+            let input = *input;
             Ok(transcript_for(input.evaluate_request(), &ANSWER))
         }
-        async fn evaluate_stream(
+        async fn execute_stream(
             &self,
-            input: PreparedEvaluateInput,
+            prepared: hellas_work::work::PreparedWorkInput,
             progress: PaidProgress,
-        ) -> Result<Vec<OutputEventEnvelope>, BackendFault> {
+        ) -> Result<Vec<OutputEventEnvelope>, hellas_work::work::BackendFault> {
+            let hellas_work::work::PreparedWorkInput::Evaluate(input) = prepared else {
+                return Err(hellas_work::work::admission::AdmissionError::Unsupported(
+                    hellas_work::work::admission::CapacityDomain::Fetch,
+                )
+                .into());
+            };
+            let input = *input;
             let transcript = transcript_for(input.evaluate_request(), &ANSWER);
             progress(transcript[0].clone())?;
             self.release.notified().await;

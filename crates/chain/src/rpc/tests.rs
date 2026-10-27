@@ -757,7 +757,7 @@ fn work_channel_snapshot_reads_every_object_at_one_finalized_block() {
         .collect();
     let query = WorkChannelQuery {
         bond_edge,
-        payment_edge,
+        payment_edge: Some(payment_edge),
         funding: funding.clone(),
     };
 
@@ -913,7 +913,7 @@ fn work_channel_snapshot_reads_every_object_at_one_finalized_block() {
             network,
             WorkChannelQuery {
                 bond_edge: hellas_kernel::EdgeId::from_bytes([0xa7; 32]),
-                payment_edge: hellas_kernel::EdgeId::from_bytes([0xa8; 32]),
+                payment_edge: Some(hellas_kernel::EdgeId::from_bytes([0xa8; 32])),
                 funding: [CoinId::from_bytes([0xa9; CoinId::LENGTH])]
                     .into_iter()
                     .collect(),
@@ -943,7 +943,7 @@ fn work_channel_snapshot_reads_every_object_at_one_finalized_block() {
                 network,
                 WorkChannelQuery {
                     bond_edge,
-                    payment_edge,
+                    payment_edge: Some(payment_edge),
                     funding: [CoinId::from_bytes(payment_edge.to_bytes())]
                         .into_iter()
                         .collect(),
@@ -966,7 +966,7 @@ fn work_channel_snapshot_reads_every_object_at_one_finalized_block() {
                 network,
                 WorkChannelQuery {
                     bond_edge: hellas_kernel::EdgeId::from_bytes(genesis_object_id(2).into()),
-                    payment_edge,
+                    payment_edge: Some(payment_edge),
                     funding: BTreeSet::new(),
                 },
             )
@@ -1410,7 +1410,7 @@ fn finalized_reads_inside_the_commit_before_publish_window_use_the_committed_blo
         assert_ne!(index.cursor().state_root, root);
         let query = WorkChannelQuery {
             bond_edge: EdgeId::from_bytes([71; 32]),
-            payment_edge: EdgeId::from_bytes([72; 32]),
+            payment_edge: Some(EdgeId::from_bytes([72; 32])),
             funding: BTreeSet::new(),
         };
         // Every read resolves at once against the committed block; none waits

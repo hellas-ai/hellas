@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use hellas_attestation::RootProver;
-use hellas_executor::{Executor, ExecutorSpawnConfig, FetchRoute, FetchRouteRegistry};
+use hellas_executor::{Executor, ExecutorSpawnConfig, FetchRouteRegistry};
 use hellas_rpc::open::OpenDispatcher;
 use hellas_rpc::pb::execute::{OpenRequest, OpenResponse, open_response};
 use hellas_rpc::signature_wire::signature_to_pb;
@@ -99,38 +99,6 @@ impl<R> FetchProviderOptions<R> {
         if !has_paid_work && !has_grants {
             return Err(ProviderError::FundingRequired);
         }
-        if let Some(paid) = &options.paid_work {
-            let config = &paid.config;
-            use hellas_work::model::{fetch::FetchRoutePolicy as PaidRoute, profile::WorkPolicy};
-            match &config.work_policy {
-                WorkPolicy::Fetch {
-                    policy,
-                    route: PaidRoute::SealedRoute { service, method },
-                    ..
-                } => {
-                    if !options
-                        .routes
-                        .entry(&FetchRoute::new(service, method))
-                        .is_some_and(|entry| {
-                            entry.execution_environment() == policy.allowed_environment
-                        })
-                    {
-                        return Err(ProviderError::MissingPaidRoute);
-                    }
-                }
-                WorkPolicy::Fetch {
-                    policy,
-                    route: PaidRoute::OpenFetch { .. },
-                    ..
-                } => {
-                    if !options.routes.has_environment(policy.allowed_environment) {
-                        return Err(ProviderError::MissingPaidRoute);
-                    }
-                }
-                _ => return Err(ProviderError::WrongPaidPolicy),
-            }
-            crate::work_config::validate_work_routes(config).await?;
-        }
         let assurance = match options.enrollment.genesis.statement.root_kind {
             hellas_rpc::RootKind::Software => Assurance::ProducerSigned,
             hellas_rpc::RootKind::SecureEnclave => Assurance::AppleAppAttest,
@@ -142,7 +110,6 @@ impl<R> FetchProviderOptions<R> {
         let work_config = options
             .paid_work
             .map(|PaidProviderOptions { config, node }| {
-                let policy = config.provider_policy();
                 let settlement_key = hellas_kernel::Secp256k1Signer::from_secret_scalar(
                     options.identity.node_secret_bytes(),
                 )
@@ -150,11 +117,9 @@ impl<R> FetchProviderOptions<R> {
                 let runner_config = crate::paid_provider::WorkRunnerConfig {
                     network: config.chain.network,
                     journal_root: config.journal_root,
-                    routes: config.routes,
                     poll: config.poll,
                     max_observation_age: config.max_observation_age,
                     settlement_key,
-                    policy,
                 };
                 runner_config.validate()?;
                 Ok::<_, ProviderError>((runner_config, node))
@@ -490,7 +455,16 @@ where
         Some((work, chain)) => Some(
             WorkRunner::discover(work, work_mount.clone(), setup_mount.clone())
                 .await?
-                .on_node(chain),
+                .on_node(
+                    chain,
+                    prepared_grants
+                        .as_ref()
+                        .ok_or(ProviderError::FundingRequired)?
+                        .1
+                        .clone(),
+                    enrollment.clone(),
+                    vec![],
+                ),
         ),
         None => None,
     };

@@ -20,6 +20,7 @@ use proptest::prelude::*;
 use crate::test_support::*;
 mod budgets;
 mod catalogue;
+mod paid_policy;
 mod pricing;
 mod reservations;
 mod resource_health;

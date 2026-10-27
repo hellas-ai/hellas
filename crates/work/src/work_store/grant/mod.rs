@@ -11,7 +11,7 @@ pub mod refusal;
 pub(crate) use administration::{BindRecord, WorkMutation, WorkRecord};
 pub use administration::{
     WORK_ALLOWANCE_CONFIGURE, WORK_ALLOWANCE_READ, WORK_BUDGET_CONFIGURE, WORK_GENERATION_RESET,
-    WORK_OFFER_EXPORT, WORK_RESOURCE_CONFIGURE, WORK_RESOURCE_REPAIR,
+    WORK_OFFER_EXPORT, WORK_PAID_POLICY_CONFIGURE, WORK_RESOURCE_CONFIGURE, WORK_RESOURCE_REPAIR,
 };
 pub use client::GrantClientStore;
 pub mod ledger;

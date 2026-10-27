@@ -265,35 +265,24 @@ impl GrantService {
         let run = Arc::new(move |input, policy: GrantPolicy, admission, progress| {
             let backend = backend.clone();
             Box::pin(async move {
-                match (input, policy.work) {
-                    (PreparedWorkInput::Evaluate(input), _) => {
-                        backend
-                            .evaluate_stream(
-                                PreparedEvaluateInput::admitted(
-                                    input.parts().map_err(BackendFault::caused_by)?,
-                                    admission,
-                                ),
-                                progress,
-                            )
-                            .await
-                    }
+                let input = match (input, policy.work) {
+                    (PreparedWorkInput::Evaluate(input), _) => PreparedEvaluateInput::admitted(
+                        input.parts().map_err(BackendFault::caused_by)?,
+                        admission,
+                    )
+                    .into(),
                     (
                         PreparedWorkInput::Fetch(input),
                         crate::model::profile::WorkPolicy::Fetch { policy, .. },
-                    ) => {
-                        backend
-                            .fetch_stream(
-                                PreparedFetchInput::admitted(
-                                    input.parts().map_err(BackendFault::caused_by)?,
-                                    policy,
-                                    admission,
-                                ),
-                                progress,
-                            )
-                            .await
-                    }
-                    _ => Err(BackendFault::caused_by(ExecutionError::Profile)),
-                }
+                    ) => PreparedFetchInput::admitted(
+                        input.parts().map_err(BackendFault::caused_by)?,
+                        policy,
+                        admission,
+                    )
+                    .into(),
+                    _ => return Err(BackendFault::caused_by(ExecutionError::Profile)),
+                };
+                backend.execute_stream(input, progress).await
             }) as BoxFuture<'static, _>
         });
         Self {

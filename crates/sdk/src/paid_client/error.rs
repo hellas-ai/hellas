@@ -3,6 +3,10 @@ use std::path::PathBuf;
 /// Errors retain the admission/payment stage and the original typed cause.
 #[derive(Debug, thiserror::Error)]
 pub enum PaidClientError {
+    #[error("provider refused offer request ({0})")]
+    OfferRefused(i32),
+    #[error(transparent)]
+    Offer(#[from] hellas_work::model::offer::PaidOfferError),
     #[error(transparent)]
     Authority(#[from] hellas_work::work_store::grant::NodeStoreError),
     #[error("invalid paid-work options: {0}")]

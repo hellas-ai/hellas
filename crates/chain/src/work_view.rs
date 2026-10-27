@@ -73,7 +73,7 @@ pub struct WorkChannelQuery {
     /// The tag-4 work-stake bond insuring the channel.
     pub bond_edge: EdgeId,
     /// The tag-2 payment edge work is paid from.
-    pub payment_edge: EdgeId,
+    pub payment_edge: Option<EdgeId>,
     /// Coins whose liveness is to be read at the same block as the
     /// objects above.
     pub funding: BTreeSet<CoinId>,
@@ -180,7 +180,9 @@ impl WorkChannelSnapshot {
     /// contest, or something that is neither.
     #[must_use]
     pub fn pending(&self) -> PendingSlot {
-        parse_pending_close(self.pending_slot, self.query.payment_edge)
+        self.query.payment_edge.map_or(PendingSlot::Absent, |edge| {
+            parse_pending_close(self.pending_slot, edge)
+        })
     }
 
     /// Returns which of the coins the query named are still live at this
@@ -308,7 +310,7 @@ mod tests {
     fn query() -> WorkChannelQuery {
         WorkChannelQuery {
             bond_edge: bond(),
-            payment_edge: payment(),
+            payment_edge: Some(payment()),
             funding: BTreeSet::new(),
         }
     }
@@ -395,7 +397,7 @@ mod tests {
         // different bond. Only the query moves.
         let other = WorkChannelQuery {
             bond_edge: EdgeId::from_bytes([0x99; EdgeId::LENGTH]),
-            payment_edge: payment(),
+            payment_edge: Some(payment()),
             funding: BTreeSet::new(),
         };
         let elsewhere =

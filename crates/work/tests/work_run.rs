@@ -32,8 +32,8 @@ use hellas_work::test_support::paid::{
     settlement, work_policy,
 };
 use hellas_work::work::{
-    BackendFault, PreparedEvaluateInput, ProviderEndpoint, RunAdmission, RunError, RunOutcome,
-    WorkBackend, WorkService, run_accepted_work,
+    BackendFault, ProviderEndpoint, RunAdmission, RunError, RunOutcome, WorkBackend, WorkService,
+    run_accepted_work,
 };
 use hellas_work::work_store::{
     ChannelRecord, ChannelStateError, ChannelStore, JobPhase, JobState, Role, TerminalOutcome,
@@ -261,16 +261,22 @@ impl WorkBackend for CountingBackend {
         Err(hellas_work::work::admission::AdmissionError::Unsupported(domain).into())
     }
 
-    fn evaluate(
+    async fn execute(
         &self,
-        input: PreparedEvaluateInput,
-    ) -> impl core::future::Future<Output = Result<Vec<OutputEventEnvelope>, BackendFault>> + Send
-    {
+        prepared: hellas_work::work::PreparedWorkInput,
+    ) -> Result<Vec<hellas_rpc::OutputEventEnvelope>, hellas_work::work::BackendFault> {
+        let hellas_work::work::PreparedWorkInput::Evaluate(input) = prepared else {
+            return Err(hellas_work::work::admission::AdmissionError::Unsupported(
+                hellas_work::work::admission::CapacityDomain::Fetch,
+            )
+            .into());
+        };
+        let input = *input;
         self.calls.fetch_add(1, Ordering::SeqCst);
         assert_eq!(input.program_manifest(), manifest().canonical_bytes());
         let request = input.evaluate_request();
         let answer = self.answer.clone();
-        let produced = match answer {
+        match answer {
             Answer::Transcript => Ok(answer_transcript(request)),
             Answer::ForAnotherRequest(nonce) => Ok(answer_transcript(&evaluate_request(nonce))),
             Answer::UnderAnotherKey(byte) => Ok(transcript_for(
@@ -284,8 +290,7 @@ impl WorkBackend for CountingBackend {
                 struct InjectedFault(&'static str);
                 Err(BackendFault::caused_by(InjectedFault(reason)))
             }
-        };
-        async move { produced }
+        }
     }
 }
 

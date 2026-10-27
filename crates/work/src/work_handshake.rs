@@ -390,6 +390,24 @@ impl SetupEndpoint {
             .await?)
     }
 
+    pub async fn import_offer(
+        &mut self,
+        peer: [u8; 32],
+        offer: crate::model::offer::SignedPaidOffer,
+    ) -> Result<&SetupState, SetupExchangeError> {
+        Ok(self
+            .store
+            .commit(
+                SetupRecord::Offer {
+                    peer,
+                    floor: None,
+                    offer: Box::new(offer),
+                },
+                &Secp256k1Verifier::new(),
+            )
+            .await?)
+    }
+
     /// Answers one offered revision with the revision that extends it.
     ///
     /// The server half, and the order is the whole of it: the offered
@@ -401,6 +419,13 @@ impl SetupEndpoint {
     /// endpoint's proposal. A replayed offer writes nothing and is
     /// answered with the same bytes.
     async fn advance(&mut self, offered: &[u8]) -> Result<Vec<u8>, Refusal> {
+        if self
+            .state()
+            .end()
+            .is_some_and(|end| end != crate::work_store::SetupEnd::Complete)
+        {
+            return Err(Refusal::new(WorkRefusal::Expired, "setup has ended"));
+        }
         if !offered.is_empty() {
             self.store
                 .commit(
@@ -642,6 +667,10 @@ impl SetupDriver<'_> {
 }
 
 impl SetupService {
+    /// Read retained setup facts through the same writer used by dispatch and driving.
+    pub async fn state(&self) -> Result<SetupState, SetupDriveError> {
+        Ok(self.store().await?.state().clone())
+    }
     /// Wraps one setup endpoint as a dispatchable service.
     #[must_use]
     pub fn new(endpoint: SetupEndpoint) -> Self {
@@ -733,6 +762,19 @@ impl SetupService {
 }
 
 impl WorkSetupHandler for SetupService {
+    async fn request_offer(
+        &self,
+        _request: hellas_rpc::pb::work::RequestOfferRequest,
+        _context: TransportContext,
+    ) -> Result<
+        impl Into<hellas_rpc::call::WithTrailer<hellas_rpc::pb::work::RequestOfferResponse>> + Send,
+        WireStatus,
+    > {
+        Err::<hellas_rpc::pb::work::RequestOfferResponse, _>(WireStatus::new(
+            hellas_wire::WireCode::Unavailable,
+            "offer allocation requires a provider",
+        ))
+    }
     async fn exchange_setup(
         &self,
         request: ExchangeSetupRequest,

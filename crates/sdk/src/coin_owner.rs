@@ -20,6 +20,8 @@ pub enum CoinOwnerError {
     Inputs,
     #[error("selected coin is absent from this owner's live coins: {0:?}")]
     Missing(CoinId),
+    #[error("split requires a positive delegated value within the selected balance")]
+    Split,
     #[error("selected coin values overflow")]
     ValueOverflow,
     #[error("chain network does not match the requested signing network")]
@@ -47,6 +49,7 @@ impl OwnerReshape {
         owner: Key,
         selected: &[CoinId],
         delegate: Option<Key>,
+        split: Option<u64>,
     ) -> Result<Self, CoinOwnerError> {
         if selected.is_empty()
             || selected.len() > MAX_EDGE_INPUTS
@@ -77,14 +80,31 @@ impl OwnerReshape {
                 .ok_or(CoinOwnerError::ValueOverflow)?;
             *slot = *id;
         }
+        let mut outputs = Vec::new();
+        if let Some(unit) = split {
+            if delegate.is_none() || unit == 0 || unit > value {
+                return Err(CoinOwnerError::Split);
+            }
+            let count = (value / unit).min((MAX_EDGE_OUTPUTS - 1) as u64);
+            for _ in 0..count {
+                outputs.push(Payout::delegated(owner, delegate, unit));
+            }
+            let change = value - count * unit;
+            if change > 0 {
+                outputs.push(Payout::new(owner, change));
+            }
+        } else {
+            outputs.push(Payout::delegated(owner, delegate, value));
+        }
+        let count = outputs.len();
+        let slots = std::array::from_fn(|index| {
+            outputs.get(index).cloned().unwrap_or(Payout::new(owner, 0))
+        });
         Ok(Self {
             network,
             owner,
             inputs: List::take(inputs, selected.len()),
-            outputs: List::take(
-                [Payout::delegated(owner, delegate, value); MAX_EDGE_OUTPUTS],
-                1,
-            ),
+            outputs: List::take(slots, count),
         })
     }
 

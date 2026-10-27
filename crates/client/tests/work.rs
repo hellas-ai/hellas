@@ -55,8 +55,8 @@ use hellas_work::model::work::{
     propose_authorization, signing_hash, work_id,
 };
 use hellas_work::work::{
-    BackendFault, ClientEndpoint, PreparedEvaluateInput, ProviderEndpoint, RunOutcome, WorkBackend,
-    WorkService, run_accepted_work,
+    BackendFault, ClientEndpoint, ProviderEndpoint, RunOutcome, WorkBackend, WorkService,
+    run_accepted_work,
 };
 use hellas_work::work_close::{BlockSourceError, FinalizedBlocks, FinalizedWork, observe};
 use hellas_work::work_store::{
@@ -478,18 +478,24 @@ impl WorkBackend for AnsweringBackend {
     fn try_admit(
         &self,
         domain: hellas_work::work::admission::CapacityDomain,
-    ) -> Result<hellas_work::work::admission::WorkPermit, hellas_work::work::BackendFault> {
+    ) -> Result<hellas_work::work::admission::WorkPermit, BackendFault> {
         Err(hellas_work::work::admission::AdmissionError::Unsupported(domain).into())
     }
 
-    fn evaluate(
+    async fn execute(
         &self,
-        input: PreparedEvaluateInput,
-    ) -> impl core::future::Future<Output = Result<Vec<OutputEventEnvelope>, BackendFault>> + Send
-    {
+        prepared: hellas_work::work::PreparedWorkInput,
+    ) -> Result<Vec<hellas_rpc::OutputEventEnvelope>, BackendFault> {
+        let hellas_work::work::PreparedWorkInput::Evaluate(input) = prepared else {
+            return Err(hellas_work::work::admission::AdmissionError::Unsupported(
+                hellas_work::work::admission::CapacityDomain::Fetch,
+            )
+            .into());
+        };
+        let input = *input;
         self.calls.fetch_add(1, Ordering::SeqCst);
         let produced = transcript_for(input.evaluate_request(), &ANSWER);
-        async move { Ok(produced) }
+        Ok(produced)
     }
 }
 

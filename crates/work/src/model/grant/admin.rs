@@ -23,6 +23,10 @@ pub struct AllowanceTerms {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub enum WorkControlCommand {
+    SetPaidPolicy {
+        expected_revision: Revision,
+        policy: crate::model::paid_policy::PaidPolicy,
+    },
     ConfigureResource {
         policy: String,
     },
@@ -76,6 +80,9 @@ pub struct AllowanceSummary {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub enum WorkControlReply {
+    PaidPolicyChanged {
+        revision: Revision,
+    },
     ResourceChanged {
         resource: ResourceId,
         revision: Revision,

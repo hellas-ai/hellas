@@ -28,6 +28,12 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
             PaidOffer {
                 provider: bundle.clone(),
                 proposal: fixture.proposal.clone(),
+                policy: fixture.policy.clone(),
+                omission_bond: 601,
+                payment_funding: Funding::new(
+                    hellas_kernel::List::take([hellas_kernel::CoinId::from_bytes([1; 32]); 4], 1),
+                    hellas_kernel::List::empty(hellas_kernel::CoinId::from_bytes([0; 32])),
+                ),
                 addresses: server
                     .bound_sockets()
                     .iter()
@@ -43,7 +49,7 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
             fixture.descriptor.bond_edge()
         );
         let trust = hellas_client::ProviderTrustAnchor {
-            allowed_environments: vec![fixture.config.work_policy.allowed_environment()],
+            allowed_environments: vec![fixture.policy.work_policy.allowed_environment()],
             expected_genesis: imported.offer().provider.content_id(),
             required_assurance: Assurance::ProducerSigned,
             apple_app_attest: None,
@@ -190,19 +196,20 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
                 journal_root: fixture.root.path().join("client"),
                 provider: server.id(),
                 provider_addrs: server.bound_sockets(),
-                provider_trust: trust.clone(),
-                bond: fixture.descriptor.bond_edge(),
+                apple_trust: None,
+                assurance: Assurance::ProducerSigned,
+                expected_price: crate::test_support::PRICE,
                 payment_funding: Funding::new(
                     hellas_kernel::List::empty(hellas_kernel::CoinId::from_bytes([0; 32])),
                     hellas_kernel::List::empty(hellas_kernel::CoinId::from_bytes([0; 32])),
                 ),
-                omission_bond: 601,
                 acceptance_blocks: 49,
                 terminal_blocks: 99,
                 payment_blocks: 199,
                 timeout: Duration::from_secs(5),
             },
             descriptor: fixture.descriptor.clone(),
+            policy: fixture.policy.clone(),
             dialer: ProviderDialer::new(
                 server.id(),
                 server.bound_sockets(),

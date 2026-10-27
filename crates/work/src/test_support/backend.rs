@@ -1,6 +1,6 @@
 use super::principal;
 use crate::work::{admission::*, *};
-use hellas_rpc::{OutputEventEnvelope, fetch::*, output::*};
+use hellas_rpc::{fetch::*, output::*};
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -125,43 +125,137 @@ impl Default for Backend {
     }
 }
 impl WorkBackend for Backend {
-    async fn evaluate_stream(
+    async fn execute_stream(
         &self,
-        input: PreparedEvaluateInput,
-        progress: PaidProgress,
-    ) -> Result<Vec<OutputEventEnvelope>, BackendFault> {
-        use hellas_rpc::evaluate::*;
-        let (parts, admission) = input.into_parts_and_admission();
-        let _running = admission
-            .reserve(CapacityDomain::Gpu, async {
-                self.try_admit(CapacityDomain::Gpu)
-            })
-            .await?
-            .dispatch()
-            .await?;
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        let mut output = EvaluateOutputTranscriptBuilder::new(
-            input_commitment(&parts.evaluate_request),
-            parts.evaluate_request.assurance,
-            &self.signer,
-        );
-        progress(output.push_token_delta(vec![0]).unwrap())?;
-        self.started.notify_one();
-        self.finish.wait().await;
-        let usage = EvaluateUsage {
-            input_units: parts.prompt_tokens.as_slice().len() as u64,
-            output_units: 1,
-        };
-        Ok(output
-            .finish(EvaluateTerminal {
-                final_position: 1,
-                stop_reason: EvaluateStopReason::MAX_OUTPUT,
-                matched_stop_token_id: None,
-                text_artifact: hellas_auth::Digest::hash(b"test native result"),
-                usage,
-                billable_units: usage.billable_units().unwrap(),
-            })
-            .unwrap())
+        prepared: crate::work::PreparedWorkInput,
+        progress: crate::work::PaidProgress,
+    ) -> Result<Vec<hellas_rpc::OutputEventEnvelope>, crate::work::BackendFault> {
+        match prepared {
+            crate::work::PreparedWorkInput::Evaluate(input) => {
+                let input = *input;
+
+                use hellas_rpc::evaluate::*;
+                let (parts, admission) = input.into_parts_and_admission();
+                let _running = admission
+                    .reserve(CapacityDomain::Gpu, async {
+                        self.try_admit(CapacityDomain::Gpu)
+                    })
+                    .await?
+                    .dispatch()
+                    .await?;
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let mut output = EvaluateOutputTranscriptBuilder::new(
+                    input_commitment(&parts.evaluate_request),
+                    parts.evaluate_request.assurance,
+                    &self.signer,
+                );
+                progress(output.push_token_delta(vec![0]).unwrap())?;
+                self.started.notify_one();
+                self.finish.wait().await;
+                let usage = EvaluateUsage {
+                    input_units: parts.prompt_tokens.as_slice().len() as u64,
+                    output_units: 1,
+                };
+                Ok(output
+                    .finish(EvaluateTerminal {
+                        final_position: 1,
+                        stop_reason: EvaluateStopReason::MAX_OUTPUT,
+                        matched_stop_token_id: None,
+                        text_artifact: hellas_auth::Digest::hash(b"test native result"),
+                        usage,
+                        billable_units: usage.billable_units().unwrap(),
+                    })
+                    .unwrap())
+            }
+            crate::work::PreparedWorkInput::Fetch(input) => {
+                let input = *input;
+
+                let (parts, admission) = input.into_parts_and_admission();
+                if let Some(queued) = &self.queued {
+                    queued.notified().await;
+                }
+                let running = admission
+                    .reserve(CapacityDomain::Fetch, async {
+                        self.try_admit(CapacityDomain::Fetch)
+                    })
+                    .await?
+                    .dispatch()
+                    .await?;
+                let Reply::Events {
+                    prefixes,
+                    replacement,
+                } = &self.reply
+                else {
+                    self.started.notify_one();
+                    self.finish.wait().await;
+                    assert!(
+                        !matches!(self.reply, Reply::Failure { panic: true }),
+                        "backend fixture panic"
+                    );
+                    return Err(BackendFault::caused_by(std::io::Error::other(
+                        "backend fixture stopped",
+                    )));
+                };
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let request = verify_input_events(&parts.fetch_input_transcript).unwrap();
+                if let Some(inspect) = self.inspect {
+                    inspect(&request);
+                }
+                let key = self.signer.clone();
+                let mut output = FetchOutputTranscriptBuilder::new(
+                    request.input_commitment,
+                    request.assurance,
+                    &key,
+                );
+                for (index, event) in prefixes.iter().enumerate() {
+                    if index > 0
+                        && let Some(pace) = &self.pace
+                    {
+                        pace.wait().await;
+                    }
+                    progress(
+                        output
+                            .push_event(encode_fetch_event_payload(event).unwrap())
+                            .unwrap(),
+                    )?;
+                }
+                self.started.notify_one();
+                if matches!(self.finish, Completion::Notified(_)) {
+                    tokio::select! {
+                        () = self.finish.wait() => {},
+                        () = running.cancelled() => {
+                            self.cancelled.notify_one();
+                            // Physical teardown still owns its permit after the cancellation signal.
+                            self.finish.wait().await;
+                            if self.stop_on_cancel { return Err(AdmissionError::Cancelled.into()); }
+                        }
+                    }
+                } else {
+                    self.finish.wait().await;
+                }
+                if let Some(events) = replacement {
+                    output = FetchOutputTranscriptBuilder::new(
+                        request.input_commitment,
+                        request.assurance,
+                        &key,
+                    );
+                    for event in events {
+                        output
+                            .push_event(encode_fetch_event_payload(event).unwrap())
+                            .unwrap();
+                    }
+                }
+                Ok(output
+                    .finish(
+                        encode_fetch_terminal_payload(&OutputEvent::Finished {
+                            stop_reason: StopReason::EndOfText,
+                            usage: None,
+                        })
+                        .unwrap(),
+                    )
+                    .unwrap())
+            }
+        }
     }
 
     fn try_admit(&self, domain: CapacityDomain) -> Result<WorkPermit, BackendFault> {
@@ -172,92 +266,5 @@ impl WorkBackend for Backend {
                 .try_acquire_owned()
                 .map_err(|_| AdmissionError::Capacity)?,
         ))
-    }
-    async fn fetch_stream(
-        &self,
-        input: PreparedFetchInput,
-        progress: PaidProgress,
-    ) -> Result<Vec<OutputEventEnvelope>, BackendFault> {
-        let (parts, admission) = input.into_parts_and_admission();
-        if let Some(queued) = &self.queued {
-            queued.notified().await;
-        }
-        let running = admission
-            .reserve(CapacityDomain::Fetch, async {
-                self.try_admit(CapacityDomain::Fetch)
-            })
-            .await?
-            .dispatch()
-            .await?;
-        let Reply::Events {
-            prefixes,
-            replacement,
-        } = &self.reply
-        else {
-            self.started.notify_one();
-            self.finish.wait().await;
-            assert!(
-                !matches!(self.reply, Reply::Failure { panic: true }),
-                "backend fixture panic"
-            );
-            return Err(BackendFault::caused_by(std::io::Error::other(
-                "backend fixture stopped",
-            )));
-        };
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        let request = verify_input_events(&parts.fetch_input_transcript).unwrap();
-        if let Some(inspect) = self.inspect {
-            inspect(&request);
-        }
-        let key = self.signer.clone();
-        let mut output =
-            FetchOutputTranscriptBuilder::new(request.input_commitment, request.assurance, &key);
-        for (index, event) in prefixes.iter().enumerate() {
-            if index > 0
-                && let Some(pace) = &self.pace
-            {
-                pace.wait().await;
-            }
-            progress(
-                output
-                    .push_event(encode_fetch_event_payload(event).unwrap())
-                    .unwrap(),
-            )?;
-        }
-        self.started.notify_one();
-        if matches!(self.finish, Completion::Notified(_)) {
-            tokio::select! {
-                () = self.finish.wait() => {},
-                () = running.cancelled() => {
-                    self.cancelled.notify_one();
-                    // Physical teardown still owns its permit after the cancellation signal.
-                    self.finish.wait().await;
-                    if self.stop_on_cancel { return Err(AdmissionError::Cancelled.into()); }
-                }
-            }
-        } else {
-            self.finish.wait().await;
-        }
-        if let Some(events) = replacement {
-            output = FetchOutputTranscriptBuilder::new(
-                request.input_commitment,
-                request.assurance,
-                &key,
-            );
-            for event in events {
-                output
-                    .push_event(encode_fetch_event_payload(event).unwrap())
-                    .unwrap();
-            }
-        }
-        Ok(output
-            .finish(
-                encode_fetch_terminal_payload(&OutputEvent::Finished {
-                    stop_reason: StopReason::EndOfText,
-                    usage: None,
-                })
-                .unwrap(),
-            )
-            .unwrap())
     }
 }
