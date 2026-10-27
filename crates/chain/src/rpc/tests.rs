@@ -17,6 +17,7 @@ use commonware_cryptography::Digestible as _;
 use commonware_glue::stateful::db::{DatabaseSet, Merkleized as _, Unmerkleized as _};
 use commonware_runtime::{Handle, Supervisor as _};
 use hellas_kernel::{BlockHash, BlockHeight, Context as KernelContext, PartyAuth, PartyKeys};
+use std::collections::BTreeSet;
 
 struct ResponseFixture {
     client: LocalLightClient,
