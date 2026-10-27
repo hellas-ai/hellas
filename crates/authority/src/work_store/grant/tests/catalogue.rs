@@ -4,7 +4,6 @@ use super::*;
 async fn signed_model_and_settings_limits_reject_before_client_signing_and_provider_reservation() {
     use crate::model::grant::resource::TemplateError;
     use hellas_authority::work_store::grant::{GrantChannelState, GrantClientStore};
-    use hellas_channel::model::fetch::PreparedPaidFetchInputV1;
     let directory = tempfile::tempdir().unwrap();
     let (mut store, application) = setup(&directory.path().join("provider")).await;
     let now = UnixMillis(1000);
@@ -61,13 +60,12 @@ async fn signed_model_and_settings_limits_reject_before_client_signing_and_provi
             "openai", "responses", body, test_responses_contract().manifest_id(),
             Assurance::ProducerSigned, &principal(1).1, Retention::Ephemeral,
         ).unwrap();
-        let input: PreparedWorkInput = PreparedPaidFetchInputV1::new(
-            &events, &test_responses_contract(),
-        ).unwrap().into();
+        let input = hellas_rpc::protocol::invocation::fetch::prepare(&events, &test_responses_contract(), valid_input.request.runner_public_key,
+            valid_input.application_policy.0.clone(), valid_input.request.nonce).unwrap();
         let mut a = template;
-        a.input_content = hellas_rpc::ContentRef::for_bytes(&input.encode().unwrap());
-        a.prepared_input_digest = input.bound_digest(network(), a.channel_id.0).unwrap();
-        a.request_commitment = RequestCommitment::from_digest(input.input_commitment().unwrap().digest());
+        a.input_content = hellas_rpc::ContentRef::for_bytes(&input.canonical_bytes().unwrap());
+        a.prepared_input_digest = hellas_channel::job::bound_prepared_input_digest(network(), a.channel_id.0, &input).unwrap();
+        a.request_commitment = input.request.commitment().unwrap();
         assert_err!(client.propose(&offer, a, &input, &principal(1).1, now).await, NodeStoreError::Resource(error) if error == expected);
         assert_eq!(client.next_nonce().unwrap(), 1);
         assert!(client.book().pending_proposal().is_none());
@@ -154,8 +152,10 @@ fn response_limits_are_mandatory_and_only_apply_to_their_sealed_schema() {
     missing.responses = None;
     assert_eq!(missing.validate(), Err(GrantError::Malformed));
     let mut wrong_schema = original.clone();
-    if let WorkPolicy::Fetch { policy, .. } = &mut wrong_schema.work {
-        policy.allowed_environment = test_items_contract().manifest_id();
+    if let hellas_rpc::protocol::invocation::Admission::Fetch { admission } =
+        &mut wrong_schema.invocation_policy.admissions[0]
+    {
+        admission.contract = hellas_rpc::FetchContract::http().unwrap();
     }
     assert_eq!(wrong_schema.validate(), Err(GrantError::Malformed));
     let mut zero = original.clone();
@@ -163,7 +163,7 @@ fn response_limits_are_mandatory_and_only_apply_to_their_sealed_schema() {
     assert_eq!(zero.validate(), Err(GrantError::Malformed));
     let mut changed = original.clone();
     changed.responses.as_mut().unwrap().model = "other-model".into();
-    assert_eq!(changed.work, original.work);
+    assert_eq!(changed.invocation_policy, original.invocation_policy);
     assert_ne!(changed, original);
 }
 
@@ -185,7 +185,7 @@ async fn identical_interpreters_keep_separate_accounts_and_exact_signed_resource
         store.configure_budget(budget, now).await.unwrap();
     }
     store.configure_resource(second.clone(), now).await.unwrap();
-    assert_eq!(first.work, second.work);
+    assert_eq!(first.invocation_policy, second.invocation_policy);
     let mut grant = definition(GrantId([2; 16]), principal(1).0);
     grant.policies = vec![second.clone()];
     let before = store.state().clone();
@@ -276,12 +276,10 @@ async fn same_work_policy_uses_the_selected_resources_https_bounds() {
     let now = UnixMillis(1000);
     let mut large = policy();
     large.revision.0 += 1;
-    if let WorkPolicy::Fetch {
-        policy, contract, ..
-    } = &mut large.work
+    if let hellas_rpc::protocol::invocation::Admission::Fetch { admission } =
+        &mut large.invocation_policy.admissions[0]
     {
-        *contract = hellas_rpc::FetchContract::http().unwrap();
-        policy.allowed_environment = contract.manifest_id();
+        admission.contract = hellas_rpc::FetchContract::http().unwrap();
     }
     large.responses = None;
     large.https = Some(chat_resource("https://glm.test", 8));
@@ -451,16 +449,3 @@ async fn checkpoints_bind_every_policy_copy_to_its_account() {
 }
 
 use hellas_channel::test_support::test_responses_contract;
-
-#[cfg(test)]
-fn test_items_contract() -> hellas_rpc::FetchContract {
-    hellas_rpc::FetchContract::new(
-        "codex-responses-0.0.1",
-        hellas_rpc::FetchSchema::ResponsesItemsV1,
-        "codex-responses-driver-0.0.1",
-        hellas_rpc::FetchEgress::FixedHttps(
-            "https://chatgpt.com/backend-api/codex/responses".into(),
-        ),
-    )
-    .unwrap()
-}

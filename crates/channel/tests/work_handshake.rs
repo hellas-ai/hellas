@@ -11,12 +11,9 @@
 //! Each mutation test states what it breaks. A rule with no test that
 //! fails when the rule is deleted is not a rule.
 
-use hellas_auth::Digest;
 use hellas_channel::model::bundle::WorkChannelSetupBundleV2;
 use hellas_channel::model::setup::ProviderChannelPolicy;
-use hellas_channel::model::work::{
-    EvaluatePolicyV2, PaidChannelPolicyV1, private_policy_commitment,
-};
+use hellas_channel::model::work::{PaidChannelPolicyV1, private_policy_commitment};
 use hellas_channel::test_support::channel::serve_setup as serve;
 use hellas_channel::test_support::channel::{client, network, provider, signer};
 use hellas_channel::work_handshake::{
@@ -33,7 +30,7 @@ use hellas_rpc::pb::work::{
     ExchangeSetupRequest, ExchangeSetupResponse, SetupAdvanced, WorkRefusalCode, WorkRefused,
     exchange_setup_response::Outcome,
 };
-use hellas_rpc::protocol::ContentId;
+use hellas_rpc::protocol::invocation::InvocationPolicy;
 use hellas_rpc::services::work_setup::{WorkSetup, WorkSetupClientImpl};
 use hellas_wire::mux::MuxTransport;
 use hellas_wire::{ServiceMarker, StreamTransport};
@@ -131,12 +128,8 @@ fn other_channel_policy() -> PaidChannelPolicyV1 {
     hellas_channel::test_support::channel::credit_policy(39, 40)
 }
 
-fn work_policy() -> EvaluatePolicyV2 {
-    hellas_channel::test_support::channel::evaluate_policy(
-        ContentId::from_bytes([0x31; 32]),
-        Digest::from_bytes([0x32; 32]),
-        Digest::from_bytes([0x33; 32]),
-    )
+fn work_policy() -> InvocationPolicy {
+    hellas_channel::test_support::channel::work_policy()
 }
 
 /// What this provider will countersign a payment over.
@@ -146,7 +139,7 @@ fn provider_policy() -> ProviderChannelPolicy {
         network: network(),
         policy_salt: SALT,
         channel_policy: channel_policy(),
-        work_policy: work_policy().into(),
+        invocation_policy: work_policy(),
         expected_payment_values: EdgeValues::new(
             PAYMENT_VALUE,
             PAYMENT_RESERVE,

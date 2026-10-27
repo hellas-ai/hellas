@@ -15,7 +15,7 @@ fn paid() -> PaidPolicy {
             compute_credit_limit: 40,
             delivery_credit_limit: 40,
         },
-        work_policy: policy().work,
+        invocation_policy: policy().invocation_policy,
         payment_policy: JobPaymentPolicyV2 {
             fixed_price: 10,
             dispatch_margin_blocks: 4,

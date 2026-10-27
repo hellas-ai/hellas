@@ -62,7 +62,7 @@ impl SetupRecord {
                 out.push(tag::ARMED_BUNDLE);
                 put_u64(&mut out, u64::try_from(bundle.len()).unwrap_or(u64::MAX));
                 out.extend_from_slice(bundle);
-                out.extend_from_slice(&close_descriptor.encode());
+                out.extend_from_slice(&close_descriptor.encode()?);
             }
             Self::Observed(observed) => {
                 out.push(tag::OBSERVED);
@@ -272,8 +272,9 @@ impl SetupState {
             put_bytes(out, bundle_bytes);
         });
         put_option(&mut out, scan_armed.as_ref(), put_scan);
-        put_option(&mut out, close_descriptor.as_ref(), |out, descriptor| {
-            put_bytes(out, &descriptor.encode());
+        let close_bytes = close_descriptor.as_ref().map(|d| d.encode()).transpose()?;
+        put_option(&mut out, close_bytes.as_ref(), |out, bytes| {
+            put_bytes(out, bytes);
         });
         out.push(u8::from(*unresolved_bond_open));
         out.push(u8::from(*unresolved_payment_open));

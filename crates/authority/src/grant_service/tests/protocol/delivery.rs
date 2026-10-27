@@ -2,8 +2,8 @@ use super::*;
 use hellas_channel::test_support::transport::{CarrierGate, transport_pair_with_server_gate};
 use std::{future::Future, io, task::Poll, time::Duration};
 
-pub(super) fn delivery_request(a: &GrantJobAuthorizationV1, id: Digest) -> DeliverResultRequest {
-    DeliverResultRequest {
+pub(super) fn delivery_request(a: &GrantJobAuthorizationV1, id: Digest) -> StreamResultRequest {
+    StreamResultRequest {
         route: Some(WorkRoute::grant(a.channel_id.0)),
         work_id: id.as_bytes().to_vec(),
         client_signature: Vec::new(),
@@ -360,12 +360,10 @@ async fn delivery_write_rechecks_under_writer_and_releases_it_on_backpressure() 
 }
 
 #[tokio::test]
-async fn rpc_revocation_blocks_encoded_unary_stream_body_and_end_at_the_carrier() {
+async fn rpc_revocation_blocks_stream_body_and_end_at_the_carrier() {
     use hellas_rpc::services::work::{WorkClientImpl, WorkServer};
     for target in [AccessTarget::Credential, AccessTarget::Grant] {
-        for (streaming, allowed, recovered) in
-            [(false, 0, false), (true, 1, false), (true, 0, true)]
-        {
+        for (allowed, recovered) in [(0, false), (1, false), (0, true)] {
             tokio::time::timeout(Duration::from_secs(30), async {
                 let dir = tempfile::tempdir().unwrap();
                 let (store, secret) = setup_with_credential(dir.path()).await;
@@ -439,15 +437,11 @@ async fn rpc_revocation_blocks_encoded_unary_stream_body_and_end_at_the_carrier(
                 let reading = tokio::spawn(async move {
                     let rpc = WorkClientImpl::new(client);
                     let request = delivery_request(&a, id);
-                    if streaming {
-                        let mut stream = rpc.stream_result(request).await?;
-                        while let Some(event) = stream.next().await {
-                            event?;
-                        }
-                        stream.finish().map(|_| ())
-                    } else {
-                        rpc.deliver_result(request).await.map(|_| ())
+                    let mut stream = rpc.stream_result(request).await?;
+                    while let Some(event) = stream.next().await {
+                        event?;
                     }
+                    stream.finish().map(|_| ())
                 });
                 gate.blocked.notified().await;
                 assert_eq!(gate.sent.load(Ordering::SeqCst), allowed);

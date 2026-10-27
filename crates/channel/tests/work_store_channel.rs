@@ -6,22 +6,20 @@
 //! assertions are about the second process — never about what the first
 //! one intended.
 
+use hellas_channel::test_support::channel as fixture;
 use hellas_channel::test_support::channel::{
-    client, identity_artifact, manifest, network, payload_at, prompt_tokens, provider,
-    text_execution, text_policy, transcript_for as transcript_of,
+    client, network, payload_at, provider, transcript_for as transcript_of,
 };
+use hellas_rpc::protocol::invocation::{InvocationRequest, PreparedInvocation};
 
 use hellas_auth::Digest;
-use hellas_auth::PublicKey;
-use hellas_channel::model::prepared_input::PreparedPaidInputV1;
 use hellas_channel::model::work::{
     PaidChannel, PaidChannelPolicyV1, PaidJobAuthorizationV2, PaidJobResultV1, PaidWorkError,
     PaymentBindingV1, PrivateRecord as _, decode_transcript, encode_transcript, next_payment,
-    payment_binding_digest, prepared_input_digest, private_policy_commitment, result_digest,
-    terminal_result, work_id,
+    payment_binding_digest, private_policy_commitment, result_digest, work_id,
 };
 use hellas_channel::work_store::channel::funding::{Clock, FinalizedHeight};
-use hellas_channel::work_store::journal::{Journal, JournalError, JournalId, JournalKind};
+use hellas_channel::work_store::journal::{Journal, JournalError};
 use hellas_channel::work_store::{
     ChannelRecord, ChannelStateError, ChannelStore, JobPhase, JobState, Role, SetupOrigin,
     TerminalOutcome, WorkStoreError,
@@ -31,8 +29,7 @@ use hellas_kernel::{
     PartyAuth, PartyKeys, PayloadHash, Payout, Secp256k1Verifier, Sig, TermsHash,
     WorkPaymentSettlement, WorkPaymentTerms, WorkStakeBondTerms, work_payment_settlement,
 };
-use hellas_rpc::protocol::artifacts::InputAddressed as _;
-use hellas_rpc::{Evaluate, EvaluateRequest, OutputEventEnvelope};
+use hellas_rpc::OutputEventEnvelope;
 
 mod support;
 use support::temp;
@@ -147,30 +144,32 @@ fn payload(digest: Digest) -> PayloadHash {
 
 /// One job's request. The nonce moves with the proposal nonce, so two
 /// jobs on one channel are two different prepared bundles.
-fn evaluate_request(nonce: u64) -> EvaluateRequest {
-    let mut bytes = [0x77; 32];
-    bytes[..8].copy_from_slice(&nonce.to_be_bytes());
-    hellas_channel::test_support::channel::evaluate_request_for(
-        text_execution().input_id().digest(),
-        PublicKey::Secp256k1(client().party_key().to_bytes()),
-        manifest().content_id(),
-        bytes,
-    )
+fn invocation_request(nonce: u64) -> InvocationRequest {
+    let mut request = fixture::invocation_request(0);
+    request.nonce[..8].copy_from_slice(&nonce.to_be_bytes());
+    request
 }
-
-fn bundle(nonce: u64) -> PreparedPaidInputV1 {
-    PreparedPaidInputV1::new(
-        &evaluate_request(nonce),
-        &manifest(),
-        &text_execution(),
-        &prompt_tokens(),
-        &text_policy(),
-        &identity_artifact(),
+fn bundle(nonce: u64) -> PreparedInvocation {
+    let mut prepared = fixture::bundle(0);
+    prepared.request = invocation_request(nonce);
+    prepared
+}
+fn terminal_result(
+    channel: &PaidChannel,
+    authorization: &PaidJobAuthorizationV2,
+    events: &[OutputEventEnvelope],
+) -> Result<PaidJobResultV1, PaidWorkError> {
+    hellas_channel::job::paid_terminal_result(
+        channel,
+        authorization,
+        &fixture::work_policy(),
+        &bundle(authorization.proposal_nonce),
+        events,
     )
 }
 
 fn bundle_bytes(nonce: u64) -> Vec<u8> {
-    match bundle(nonce).encode() {
+    match bundle(nonce).canonical_bytes() {
         Ok(bytes) => bytes,
         Err(error) => panic!("the fixture bundle encodes: {error}"),
     }
@@ -185,6 +184,7 @@ fn spool(transcript: &[OutputEventEnvelope]) -> Vec<u8> {
 
 /// Everything one job's records are built from, at one ledger position.
 struct Job {
+    input: Vec<u8>,
     authorization: PaidJobAuthorizationV2,
     work_id: Digest,
     result: PaidJobResultV1,
@@ -199,7 +199,7 @@ fn job_at(channel: &PaidChannel, nonce: u64, credited: u64) -> Job {
     // The result is derived from a real transcript rather than made up:
     // the store rebuilds it from the stored events, so a hand-written
     // pair of digests is not a result any journal here would take.
-    let transcript = transcript_of(&evaluate_request(nonce), &[101, 102, 103]);
+    let transcript = transcript_of(&invocation_request(nonce), &[101, 102, 103]);
     let result = match terminal_result(channel, &authorization, &transcript) {
         Ok(result) => result,
         Err(error) => panic!("the fixture transcript is a terminal: {error}"),
@@ -210,6 +210,7 @@ fn job_at(channel: &PaidChannel, nonce: u64, credited: u64) -> Job {
             Err(error) => panic!("the fixture payment builds: {error}"),
         };
     Job {
+        input: bundle_bytes(nonce),
         authorization,
         work_id,
         result,
@@ -220,27 +221,58 @@ fn job_at(channel: &PaidChannel, nonce: u64, credited: u64) -> Job {
 }
 
 fn authorization_for(channel: &PaidChannel, nonce: u64) -> PaidJobAuthorizationV2 {
-    let terms = channel.payment_terms();
-    PaidJobAuthorizationV2 {
-        channel_id: channel.id(),
-        bond_edge: terms.bond_edge,
-        bond_terms_hash: terms.bond_terms_hash(),
-        payment_edge: channel.payment_edge(),
-        payment_terms_hash: channel.payment_terms_hash(),
-        work_policy_digest: Digest::from_bytes([0x31; 32]),
-        payment_policy_digest: Digest::from_bytes([0xec; 32]),
-        input_content: hellas_rpc::ContentRef::for_bytes(&bundle(nonce).encode().unwrap()),
-        prepared_input_digest: match prepared_input_digest(channel, &bundle(nonce)) {
-            Ok(digest) => digest,
-            Err(error) => panic!("the fixture bundle hashes: {error}"),
+    let mut authorization = hellas_channel::job::propose(
+        channel,
+        &fixture::work_policy(),
+        &fixture::payment_policy(),
+        &bundle(nonce),
+        nonce,
+        hellas_channel::model::work::JobDeadlines {
+            acceptance: 160,
+            terminal: 200,
+            payment: 300,
         },
-        proposal_nonce: nonce,
-        acceptance_deadline: 160,
-        request_commitment: Evaluate::commit_request(&evaluate_request(nonce)),
-        environment_commitment: manifest().content_id(),
-        price: PRICE,
-        terminal_deadline: 200,
-        payment_deadline: 300,
+    )
+    .unwrap();
+    authorization.payment_policy_digest = Digest::from_bytes([0xec; 32]);
+    authorization
+}
+
+fn ephemeral_job_at(channel: &PaidChannel, nonce: u8, credited: u64) -> Job {
+    let input = fixture::fetch_bundle(nonce);
+    let transcript = fixture::fetch_transcript(&input);
+    let authorization = hellas_channel::job::propose(
+        channel,
+        &fixture::fetch_policy(),
+        &fixture::payment_policy(),
+        &input,
+        u64::from(nonce),
+        hellas_channel::model::work::JobDeadlines {
+            acceptance: 160,
+            terminal: 200,
+            payment: 300,
+        },
+    )
+    .unwrap();
+    let work_id = work_id(channel, &authorization);
+    let result = hellas_channel::job::paid_terminal_result(
+        channel,
+        &authorization,
+        &fixture::fetch_policy(),
+        &input,
+        &transcript,
+    )
+    .unwrap();
+    let (certificate, binding) =
+        next_payment(channel, &authorization, &result, credited, settlement()).unwrap();
+    Job {
+        input: input.canonical_bytes().unwrap(),
+        authorization,
+        work_id,
+        result,
+        transcript,
+        binding,
+        certificate,
     }
 }
 
@@ -249,7 +281,7 @@ impl Job {
         ChannelRecord::JobProposed {
             authorization: self.authorization,
             client_signature: client().sign(payload(self.work_id)),
-            prepared_input: bundle_bytes(self.authorization.proposal_nonce),
+            prepared_input: self.input.clone(),
         }
     }
 
@@ -273,6 +305,10 @@ impl Job {
         ChannelRecord::JobTerminated {
             work_id: self.work_id,
             outcome: TerminalOutcome::Certified {
+                signed_result: Box::new((
+                    self.result,
+                    provider().sign(payload(result_digest(channel, &self.result))),
+                )),
                 certificate: self.certificate,
                 binding: Box::new(self.binding),
                 binding_signature: client()
@@ -310,7 +346,7 @@ async fn client_sequence(channel: &PaidChannel, job: &Job) -> Vec<ChannelRecord>
         job.proposed(),
         job.accepted(),
         job.result_record(channel),
-        ChannelRecord::ResultMatched {
+        ChannelRecord::ResultVerified {
             work_id: job.work_id,
         },
         job.paid(channel),
@@ -347,7 +383,7 @@ async fn commit_all(store: &mut ChannelStore, records: &[ChannelRecord]) {
 }
 
 async fn open_metadata(root: &std::path::Path) -> ChannelStore {
-    ChannelStore::open_metadata_only(
+    ChannelStore::open(
         root,
         channel(),
         settlement(),
@@ -381,9 +417,9 @@ fn assert_payloads_absent(root: &std::path::Path, needles: &[&[u8]]) {
 #[tokio::test]
 async fn metadata_journal_never_writes_payloads_at_any_commit_or_rotation() {
     let channel = channel();
-    let job = job_at(&channel, 1, 0);
+    let job = ephemeral_job_at(&channel, 1, 0);
     let sequence = provider_sequence(&channel, &job).await;
-    let input = bundle_bytes(1);
+    let input = job.input.clone();
     let output = spool(&job.transcript);
     let payloads = [&input[..], &output[..], job.transcript[0].payload()];
     for boundary in 1..=sequence.len() {
@@ -420,7 +456,7 @@ async fn metadata_journal_never_writes_payloads_at_any_commit_or_rotation() {
 async fn metadata_journal_can_credit_an_already_delivered_result_after_restart() {
     let root = temp();
     let channel = channel();
-    let job = job_at(&channel, 1, 0);
+    let job = ephemeral_job_at(&channel, 1, 0);
     let mut store = open_metadata(root.path()).await;
     commit_all(&mut store, &provider_sequence(&channel, &job).await[..5]).await;
     drop(store);
@@ -446,7 +482,7 @@ async fn metadata_journal_can_credit_an_already_delivered_result_after_restart()
 async fn metadata_replay_does_not_weaken_live_payload_validation() {
     let root = temp();
     let channel = channel();
-    let job = job_at(&channel, 1, 0);
+    let job = ephemeral_job_at(&channel, 1, 0);
     let mut store = open_metadata(root.path()).await;
     let mut proposal = job.proposed();
     if let ChannelRecord::JobProposed { prepared_input, .. } = &mut proposal {
@@ -472,44 +508,6 @@ async fn metadata_replay_does_not_weaken_live_payload_validation() {
             .is_err()
     );
     assert_eq!(store.len(), records);
-}
-
-#[tokio::test]
-async fn journal_retention_mode_cannot_change_when_reopened() {
-    for metadata in [false, true] {
-        let root = temp();
-        let store = if metadata {
-            open_metadata(root.path()).await
-        } else {
-            open(root.path(), Role::Provider).await
-        };
-        drop(store);
-        let reopened = if metadata {
-            ChannelStore::open(
-                root.path(),
-                channel(),
-                settlement(),
-                Role::Provider,
-                origin_of(&channel()),
-                &Secp256k1Verifier::new(),
-            )
-            .await
-        } else {
-            ChannelStore::open_metadata_only(
-                root.path(),
-                channel(),
-                settlement(),
-                Role::Provider,
-                origin_of(&channel()),
-                &Secp256k1Verifier::new(),
-            )
-            .await
-        };
-        assert!(
-            reopened.is_err(),
-            "retention mode is part of journal identity"
-        );
-    }
 }
 
 // ── The happy path ────────────────────────────────────────────────────
@@ -633,7 +631,7 @@ async fn a_result_must_be_the_transcript_it_is_stored_beside() {
 
     // MUTATION: the same signed result, spooled beside a transcript of
     // a different answer to the same request.
-    let other_answer = transcript_of(&evaluate_request(1), &[201, 202, 203]);
+    let other_answer = transcript_of(&invocation_request(1), &[201, 202, 203]);
     let error = store
         .commit(
             ChannelRecord::JobResult {
@@ -867,7 +865,7 @@ async fn the_payment_deadline_is_the_last_height_a_payment_may_be_signed_at() {
         commit_all(&mut store, &sequence[..5]).await;
         assert_eq!(
             store.state().jobs().next().map(JobState::phase),
-            Some(JobPhase::Matched),
+            Some(JobPhase::Verified),
         );
         advance(&mut store, height).await;
 
@@ -947,7 +945,7 @@ async fn a_store_opens_anchored_at_the_channels_origin() {
 
 /// A verdict is the client's step, and it needs a result to be about.
 ///
-/// This is what keeps [`ChannelRecord::ResultMatched`] worth its tag.
+/// This is what keeps [`ChannelRecord::ResultVerified`] worth its tag.
 /// Without the phase rule below, a client could record a verdict about
 /// an answer that had not arrived, and the payment gate that reads it
 /// would be gating on nothing.
@@ -967,7 +965,7 @@ async fn a_verdict_belongs_to_a_client_holding_a_result() {
     .await;
     let error = provider_store
         .commit(
-            ChannelRecord::ResultMatched {
+            ChannelRecord::ResultVerified {
                 work_id: job.work_id,
             },
             &verifier,
@@ -978,7 +976,7 @@ async fn a_verdict_belongs_to_a_client_holding_a_result() {
         matches!(
             error,
             WorkStoreError::Channel(ChannelStateError::WrongRole {
-                step: "recording a reproduction match",
+                step: "recording a verified result",
                 expected: "client"
             })
         ),
@@ -996,7 +994,7 @@ async fn a_verdict_belongs_to_a_client_holding_a_result() {
     );
     let error = store
         .commit(
-            ChannelRecord::ResultMatched {
+            ChannelRecord::ResultVerified {
                 work_id: job.work_id,
             },
             &verifier,
@@ -1007,7 +1005,7 @@ async fn a_verdict_belongs_to_a_client_holding_a_result() {
         matches!(
             error,
             WorkStoreError::Channel(ChannelStateError::WrongPhase {
-                step: "recording a reproduction match",
+                step: "recording a verified result",
                 phase: "accepted"
             })
         ),
@@ -1020,7 +1018,7 @@ async fn a_verdict_belongs_to_a_client_holding_a_result() {
     let before = store.len();
     if let Err(error) = store
         .commit(
-            ChannelRecord::ResultMatched {
+            ChannelRecord::ResultVerified {
                 work_id: job.work_id,
             },
             &verifier,
@@ -1032,15 +1030,14 @@ async fn a_verdict_belongs_to_a_client_holding_a_result() {
     assert_eq!(store.len(), before, "and it is not written twice");
     assert_eq!(
         store.state().jobs().next().map(JobState::phase),
-        Some(JobPhase::Matched)
+        Some(JobPhase::Verified)
     );
 }
 
 /// An authenticated result is payable without mandatory reproduction.
 ///
-/// The optional matched marker remains valid, but does not gate ordinary
-/// settlement: the provider's result signature and transcript binding
-/// are the evidence the payment names.
+/// The durable verified marker checks provenance, binding and conformance.
+/// It does not invoke the application again.
 #[tokio::test]
 async fn an_authenticated_result_is_payable_without_reproduction() {
     let dir = temp();
@@ -1055,7 +1052,19 @@ async fn an_authenticated_result_is_payable_without_reproduction() {
         Some(JobPhase::Ready)
     );
 
-    // The ordinary path pays directly from Ready.
+    let before = store.len();
+    assert!(store.commit(job.paid(&channel), &verifier).await.is_err());
+    assert_eq!(store.len(), before);
+    assert_eq!(store.state().ledger().credited_cumulative(), 0);
+    store
+        .commit(
+            ChannelRecord::ResultVerified {
+                work_id: job.work_id,
+            },
+            &verifier,
+        )
+        .await
+        .unwrap();
     if let Err(error) = store.commit(job.paid(&channel), &verifier).await {
         panic!("an authenticated result is paid for: {error}");
     }
@@ -1494,6 +1503,10 @@ async fn a_signature_from_the_wrong_party_is_not_evidence() {
             ChannelRecord::JobTerminated {
                 work_id: job.work_id,
                 outcome: TerminalOutcome::Certified {
+                    signed_result: Box::new((
+                        job.result,
+                        provider().sign(payload(result_digest(&channel, &job.result))),
+                    )),
                     certificate: job.certificate,
                     binding: Box::new(job.binding),
                     binding_signature: client().sign(payload(job.work_id)),
@@ -1507,6 +1520,10 @@ async fn a_signature_from_the_wrong_party_is_not_evidence() {
             ChannelRecord::JobTerminated {
                 work_id: job.work_id,
                 outcome: TerminalOutcome::Certified {
+                    signed_result: Box::new((
+                        job.result,
+                        provider().sign(payload(result_digest(&channel, &job.result))),
+                    )),
                     certificate: job.certificate,
                     binding: Box::new(job.binding),
                     binding_signature: client()
@@ -1590,6 +1607,10 @@ async fn a_payment_must_be_the_one_this_position_admits() {
                 ChannelRecord::JobTerminated {
                     work_id: job.work_id,
                     outcome: TerminalOutcome::Certified {
+                        signed_result: Box::new((
+                            job.result,
+                            provider().sign(payload(result_digest(&channel, &job.result))),
+                        )),
                         certificate: job.certificate,
                         binding: Box::new(binding),
                         binding_signature: client()
@@ -1647,6 +1668,10 @@ async fn a_payment_must_be_the_one_this_position_admits() {
                 ChannelRecord::JobTerminated {
                     work_id: job.work_id,
                     outcome: TerminalOutcome::Certified {
+                        signed_result: Box::new((
+                            job.result,
+                            provider().sign(payload(result_digest(&channel, &job.result))),
+                        )),
                         certificate,
                         binding: Box::new(job.binding),
                         binding_signature: client()
@@ -2002,7 +2027,7 @@ fn the_record_codec_is_exact_and_ordered() {
         ChannelRecord::PlaintextReleased {
             work_id: job.work_id,
         },
-        ChannelRecord::ResultMatched {
+        ChannelRecord::ResultVerified {
             work_id: job.work_id,
         },
     ] {
@@ -2021,6 +2046,12 @@ fn the_record_codec_is_exact_and_ordered() {
     let mut expected = vec![7_u8];
     expected.extend_from_slice(job.work_id.as_bytes());
     expected.push(0_u8);
+    expected.extend_from_slice(&job.result.encode());
+    expected.extend_from_slice(
+        provider()
+            .sign(payload(result_digest(&channel, &job.result)))
+            .as_bytes(),
+    );
     let mut certificate = vec![0_u8; job.certificate.encoded_size()];
     let written = job.certificate.write_to(&mut certificate);
     certificate.truncate(written);
@@ -2036,6 +2067,8 @@ fn the_record_codec_is_exact_and_ordered() {
     assert_eq!(
         bytes.len(),
         2 + Digest::LEN
+            + PaidJobResultV1::ENCODED_SIZE
+            + Sig::LENGTH
             + EarnedCertificate::ENCODED_SIZE
             + PaymentBindingV1::ENCODED_SIZE
             + 2 * Sig::LENGTH
@@ -2048,6 +2081,10 @@ fn the_record_codec_is_exact_and_ordered() {
     let swapped = ChannelRecord::JobTerminated {
         work_id: job.work_id,
         outcome: TerminalOutcome::Certified {
+            signed_result: Box::new((
+                job.result,
+                provider().sign(payload(result_digest(&channel, &job.result))),
+            )),
             certificate: job.certificate,
             binding: Box::new(job.binding),
             binding_signature: client().sign(job.certificate.digest(network())),
@@ -2062,9 +2099,9 @@ fn the_record_codec_is_exact_and_ordered() {
     for (discriminant, outcome) in [
         (
             1_u8,
-            TerminalOutcome::Refuted {
+            TerminalOutcome::Rejected {
                 result_digest: Digest::from_bytes([0x51; 32]),
-                reproduction_digest: Digest::from_bytes([0x52; 32]),
+                evidence_digest: Digest::from_bytes([0x52; 32]),
             },
         ),
         (
@@ -2228,7 +2265,8 @@ async fn the_retained_dispatch_input_is_the_one_the_authorization_commits_to() {
     };
     assert_eq!(open_job.prepared_input(), bundle_bytes(1).as_slice());
     // And they are a bundle, not opaque bytes that happen to be stored.
-    if let Err(error) = PreparedPaidInputV1::decode(open_job.prepared_input(), 1 << 20) {
+    if let Err(error) = PreparedInvocation::from_canonical_bytes(open_job.prepared_input(), 1 << 20)
+    {
         panic!("the retained inputs are a bundle: {error}");
     }
 
@@ -2285,52 +2323,16 @@ async fn inputs_swapped_on_the_disk_are_not_a_job_to_execute() {
     let channel = channel();
     let job = job_at(&channel, 1, 0);
 
-    // Two journals written the same way, behind the store's back
-    // because no store would take the second: the same authorization,
-    // the same real client signature, and the same real co-signature
-    // over the same work id. Only the bundle differs.
     for (bundle_nonce, readable) in [(1_u64, true), (2, false)] {
         let dir = temp();
-        {
-            // One store, opened and dropped, so the journal exists with
-            // the name and header its key fixes.
-            drop(open(dir.path(), Role::Provider).await);
-        }
-        let stem = channel_stem(dir.path());
-        {
-            let id = JournalId {
-                kind: JournalKind::Channel,
-                role: Role::Provider,
-                key: channel_key_bytes(&stem),
-            };
-            let (mut journal, _) = match Journal::open_existing(dir.path(), &stem, id).await {
-                Ok(opened) => opened,
-                Err(error) => panic!("the journal opens: {error}"),
-            };
-            let bytes = bundle_bytes(bundle_nonce);
-            let reference = hellas_rpc::ContentRef::for_bytes(&bytes);
-            let payloads = dir.path().join(format!("{stem}.payloads"));
-            std::fs::create_dir_all(&payloads).unwrap();
-            std::fs::write(payloads.join(reference.id().to_string()), &bytes).unwrap();
-            for record in [
-                ChannelRecord::JobProposed {
-                    authorization: job.authorization,
-                    client_signature: client().sign(payload(job.work_id)),
-                    prepared_input: hellas_rpc::protocol::content_upload::encode_reference(
-                        reference,
-                    ),
-                },
-                ChannelRecord::JobAccepted {
-                    work_id: job.work_id,
-                    provider_signature: provider().sign(payload(job.work_id)),
-                },
-            ] {
-                if let Err(error) = journal.append(&record.encode()).await {
-                    panic!("the record appends: {error}");
-                }
-            }
-        }
-
+        let mut store = open(dir.path(), Role::Provider).await;
+        commit_all(&mut store, &[job.proposed(), job.accepted()]).await;
+        drop(store);
+        let path = dir
+            .path()
+            .join("content/objects")
+            .join(job.authorization.input_content.id().to_string());
+        hellas_private::write_atomically(&path, ".tamper", &bundle_bytes(bundle_nonce)).unwrap();
         let opened = ChannelStore::open(
             dir.path(),
             channel.clone(),
@@ -2341,40 +2343,17 @@ async fn inputs_swapped_on_the_disk_are_not_a_job_to_execute() {
         )
         .await;
         if readable {
-            match opened {
-                Ok(store) => assert!(store.state().jobs().next().is_some(), "the job replays"),
-                Err(error) => panic!("the journal this route wrote reopens: {error}"),
-            }
-            continue;
-        }
-        let Err(error) = opened else {
-            panic!("those are not the inputs the authorization names");
-        };
-        assert!(
-            matches!(error, WorkStoreError::Channel(ChannelStateError::Record(_))),
-            "unexpected error: {error}"
-        );
-    }
-}
-
-/// The 32-byte key a channel journal's own stem carries.
-///
-/// Read from the name rather than derived a second time: a second
-/// derivation could be wrong in the same way twice.
-fn channel_key_bytes(stem: &str) -> [u8; 32] {
-    let hex = stem.strip_prefix("channel-").unwrap();
-    let mut key = [0_u8; 32];
-    assert_eq!(hex.len(), 2 * key.len(), "the name carries a 32-byte key");
-    for (byte, pair) in key.iter_mut().zip(hex.as_bytes().as_chunks::<2>().0) {
-        let Ok(text) = std::str::from_utf8(pair) else {
-            panic!("hex is ascii");
-        };
-        match u8::from_str_radix(text, 16) {
-            Ok(value) => *byte = value,
-            Err(error) => panic!("the name is hex: {error}"),
+            assert!(
+                opened.unwrap().state().job_by_id(job.work_id).is_some(),
+                "the accepted input reopens"
+            );
+        } else {
+            assert!(
+                opened.is_err(),
+                "a substituted object cannot become input to execution"
+            );
         }
     }
-    key
 }
 
 // ── The close cutoff ──────────────────────────────────────────────────
@@ -2455,7 +2434,7 @@ async fn each_job_terminal_rejects_a_late_reply_and_a_second_proposal() {
     let channel = channel();
     let job = job_at(&channel, 1, 0);
     let result_digest = result_digest(&channel, &job.result);
-    let reproduction_digest = Digest::from_bytes([0xab; 32]);
+    let evidence_digest = Digest::from_bytes([0xab; 32]);
 
     let variants: Vec<(&str, Role, Vec<ChannelRecord>)> = vec![
         (
@@ -2464,7 +2443,7 @@ async fn each_job_terminal_rejects_a_late_reply_and_a_second_proposal() {
             provider_sequence(&channel, &job).await,
         ),
         (
-            "refuted",
+            "rejected",
             Role::Client,
             vec![
                 cursor_at(RECEIPT_HEIGHT),
@@ -2473,9 +2452,9 @@ async fn each_job_terminal_rejects_a_late_reply_and_a_second_proposal() {
                 job.result_record(&channel),
                 ChannelRecord::JobTerminated {
                     work_id: job.work_id,
-                    outcome: TerminalOutcome::Refuted {
+                    outcome: TerminalOutcome::Rejected {
                         result_digest,
-                        reproduction_digest,
+                        evidence_digest,
                     },
                 },
             ],

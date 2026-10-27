@@ -39,6 +39,11 @@ pub fn open_nofollow(path: &Path) -> io::Result<File> {
     imp::open_nofollow(path)
 }
 
+/// Opens an existing private staging file for bounded upload append without following links.
+pub fn open_nofollow_rw(path: &Path) -> io::Result<File> {
+    imp::open_nofollow_rw(path)
+}
+
 /// Whether `file` is a regular file that only this user can reach.
 pub fn is_private(file: &File) -> io::Result<bool> {
     if !file.metadata()?.is_file() {

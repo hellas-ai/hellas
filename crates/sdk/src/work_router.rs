@@ -6,8 +6,9 @@ use hellas_authority::grant_service::{GrantService, GrantWork};
 use hellas_rpc::call::{WithTrailer, with_trailer as wt};
 use hellas_rpc::pb::work::{
     AcceptWorkRequest, AcceptWorkResponse, AdmitCertificateRequest, AdmitCertificateResponse,
-    DeliverResultRequest, DeliverResultResponse, ExchangeSetupRequest, ExchangeSetupResponse,
-    FundingKind, GetStandingRequest, GetStandingResponse, WorkRefusalCode, WorkRefused, WorkRoute,
+    DeliverResultResponse, ExchangeSetupRequest, ExchangeSetupResponse, FundingKind,
+    GetStandingRequest, GetStandingResponse, StreamResultRequest, WorkRefusalCode, WorkRefused,
+    WorkRoute,
 };
 use hellas_rpc::services::work::WorkHandler;
 use hellas_rpc::services::work_setup::WorkSetupHandler;
@@ -136,7 +137,7 @@ impl WorkHandler for UnmountedWork {
     }
     async fn deliver_result(
         &self,
-        _request: DeliverResultRequest,
+        _request: StreamResultRequest,
         _context: TransportContext,
     ) -> Result<impl Into<WithTrailer<DeliverResultResponse>> + Send, WireStatus> {
         Ok(DeliverResultResponse::refused(not_ready()))
@@ -144,7 +145,7 @@ impl WorkHandler for UnmountedWork {
 
     async fn stream_result(
         &self,
-        _request: DeliverResultRequest,
+        _request: StreamResultRequest,
         _context: TransportContext,
     ) -> Result<hellas_channel::work::PaidResultStream, WireStatus> {
         Err(WireStatus::new(
@@ -201,7 +202,7 @@ impl WorkHandler for ConnectionWork {
     }
     async fn deliver_result(
         &self,
-        request: DeliverResultRequest,
+        request: StreamResultRequest,
         context: TransportContext,
     ) -> Result<impl Into<WithTrailer<DeliverResultResponse>> + Send, WireStatus> {
         match self.handler(&context, request.route.as_ref())? {
@@ -223,7 +224,7 @@ impl WorkHandler for ConnectionWork {
     }
     async fn stream_result(
         &self,
-        request: DeliverResultRequest,
+        request: StreamResultRequest,
         context: TransportContext,
     ) -> Result<hellas_channel::work::PaidResultStream, WireStatus> {
         match self.handler(&context, request.route.as_ref())? {

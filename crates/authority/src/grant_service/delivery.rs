@@ -15,7 +15,7 @@ impl Delivery {
     pub(super) fn verify(
         store: &NodeStore,
         access: &Access,
-        request: &DeliverResultRequest,
+        request: &StreamResultRequest,
         now: UnixMillis,
     ) -> Result<Self, WorkRefused> {
         let id = digest(&request.work_id)?;
@@ -120,7 +120,7 @@ impl GrantService {
     pub(super) async fn bind_delivery(
         &self,
         access: &Access,
-        request: &DeliverResultRequest,
+        request: &StreamResultRequest,
     ) -> Result<Arc<Delivery>, WorkRefused> {
         let mut decision = access.decision("work.delivery");
         let result = async {

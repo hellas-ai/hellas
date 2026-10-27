@@ -44,7 +44,7 @@ fn request(store: &NodeStore, nonce: u64) -> AcceptWorkRequest {
         route: Some(WorkRoute::grant(a.channel_id.0)),
         authorization: a.encode(),
         client_signature: signature.bytes().to_vec(),
-        prepared_input: input.encode().unwrap(),
+        prepared_input: input.canonical_bytes().unwrap(),
     }
 }
 fn accepted_id(response: AcceptWorkResponse) -> Digest {
@@ -176,4 +176,4 @@ async fn revoke_access(
     }
 }
 
-mod native_usage;
+mod compute_usage;

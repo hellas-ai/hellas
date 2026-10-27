@@ -14,7 +14,7 @@ use hellas_executor::FetchRouteRegistry;
 use hellas_kernel::{EdgeId, NetworkId, PartyKeys, Secp256k1Signer, Secp256k1Verifier};
 use hellas_rpc::pb::work::{
     AcceptWorkRequest, AcceptWorkResponse, AdmitCertificateRequest, AdmitCertificateResponse,
-    DeliverResultRequest, DeliverResultResponse, ExchangeSetupRequest, ExchangeSetupResponse,
+    DeliverResultResponse, ExchangeSetupRequest, ExchangeSetupResponse, StreamResultRequest,
     WorkRefusalCode, WorkRefused, accept_work_response, admit_certificate_response,
     deliver_result_response, exchange_setup_response,
 };
@@ -1067,7 +1067,7 @@ async fn unmounted_work_refuses_every_method_as_bounded_retryable_not_ready() {
     assert_retryable_not_ready(refusal);
 
     let delivery: WithTrailer<DeliverResultResponse> = UnmountedWork
-        .deliver_result(DeliverResultRequest::default(), TransportContext::default())
+        .deliver_result(StreamResultRequest::default(), TransportContext::default())
         .await
         .unwrap()
         .into();
@@ -3119,7 +3119,7 @@ impl RunningPaidNode {
             Ok(exporter) => exporter,
             Err(error) => panic!("the client derives this Work connection's exporter: {error}"),
         };
-        let request = DeliverResultRequest {
+        let request = StreamResultRequest {
             route: Some(hellas_rpc::pb::work::WorkRoute::payment(
                 descriptor().channel().id(),
             )),
@@ -3735,7 +3735,7 @@ fn the_clock_resumes_an_accepted_job_after_restart() {
         let exporter = [0x5b; 32];
         let mut context = vouched_context(default_route_peer());
         context.open_exporter = Some(exporter);
-        let request = DeliverResultRequest {
+        let request = StreamResultRequest {
             route: Some(hellas_rpc::pb::work::WorkRoute::payment(
                 descriptor().channel().id(),
             )),
@@ -3802,7 +3802,7 @@ async fn open_result_stream_stops_when_a_contest_finalizes() {
     let exporter = [0x5b; 32];
     let mut context = vouched_context(default_route_peer());
     context.open_exporter = Some(exporter);
-    let request = DeliverResultRequest {
+    let request = StreamResultRequest {
         route: Some(hellas_rpc::pb::work::WorkRoute::payment(
             descriptor().channel().id(),
         )),
@@ -4168,7 +4168,7 @@ async fn one_peer_routes_distinct_channels_without_crossing_journals() {
     let mut context = vouched_context(peer);
     context.open_exporter = Some([0x5b; 32]);
     let id = work_id(first.descriptor().channel(), &first.authorization());
-    let delivery = DeliverResultRequest {
+    let delivery = StreamResultRequest {
         route: Some(WorkRoute::payment(second.descriptor().channel().id())),
         work_id: id.as_bytes().to_vec(),
         client_signature: first

@@ -1,11 +1,11 @@
-//! Shared funded-channel and signed Evaluate fixtures for paid-work tests.
+//! Shared funded-channel and signed invocation fixtures for paid-work tests.
 
 use super::transport::transport_pair;
 use crate::model::setup::ObservedChannel;
-use crate::model::work::{PaidJobAuthorizationV2, propose_authorization, signing_hash, work_id};
+use crate::model::work::{PaidJobAuthorizationV2, signing_hash, work_id};
 use crate::work::{
     BackendFault, ClientEndpoint, ProviderEndpoint, RunOutcome, WorkBackend, WorkService,
-    fetch_result, run_accepted_work,
+    fetch_result_stream, run_accepted_work,
 };
 use hellas_kernel::PendingSlot;
 use hellas_rpc::services::work::WorkServer;
@@ -16,14 +16,10 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
-use crate::model::prepared_input::PreparedPaidInputV1;
 use crate::model::setup::{
     ReadyChannel, WorkChannelConfig, WorkChannelDescriptor, payment_terms_hash,
 };
-use crate::model::work::{
-    EvaluatePolicyV2, JobDeadlines, PaidChannelPolicyV1, generation_policy_digest,
-    identity_source_digest, private_policy_commitment,
-};
+use crate::model::work::{JobDeadlines, PaidChannelPolicyV1, private_policy_commitment};
 use crate::work_store::{ChannelRecord, ChannelStore, Role, SetupOrigin};
 use hellas_auth::{Digest, ProducerSigningKey, PublicKey};
 use hellas_kernel::{
@@ -32,18 +28,11 @@ use hellas_kernel::{
     Terms, TermsHash, WorkPaymentSettlement, WorkPaymentTerms, WorkStakeBondTerms,
     work_payment_settlement,
 };
-use hellas_rpc::evaluate::{
-    EvaluateOutputTranscriptBuilder, EvaluateStopReason, EvaluateTerminal, EvaluateUsage,
-    input_commitment,
+use hellas_rpc::protocol::invocation::{
+    self, Admission, Artifact, InvocationInput, InvocationPolicy, InvocationRequest, Limits,
+    PreparedInvocation, compute, output,
 };
-use hellas_rpc::protocol::artifacts::{
-    BoundTermId, Canonical as _, InputAddressed as _, OutputAddressed as _, SourceRef,
-    TextArtifact, TextExecution, TextPolicy, TokenIds,
-};
-use hellas_rpc::{
-    Application, Assurance, CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR, ContentId, EvaluateRequest,
-    OutputEventEnvelope, ProgramManifest,
-};
+use hellas_rpc::{Assurance, ContentId, JsonBytes, OutputEventEnvelope, ProgramManifest};
 
 pub const HORIZON: u64 = 500;
 pub const PRICE: u64 = 10;
@@ -194,51 +183,51 @@ pub fn payment_policy() -> crate::model::work::JobPaymentPolicyV2 {
     }
 }
 
+pub fn environment() -> compute::Environment {
+    compute::Environment {
+        sources: vec![],
+        assets: vec![],
+    }
+}
 pub fn manifest() -> ProgramManifest {
-    ProgramManifest::new(
-        Application::new(CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR).unwrap(),
-        ContentId::from_bytes([0x16; 32]),
-    )
+    environment().manifest().unwrap()
 }
-
-pub fn prompt_tokens() -> TokenIds {
-    TokenIds::from([9, 8, 7, 6])
+pub fn plan() -> compute::Plan {
+    compute::Plan {
+        calls: vec![compute::Call {
+            entry: "answer".into(),
+            args: vec![],
+            bind: vec![compute::Bind::Name("answer".into())],
+        }],
+        step: None,
+        outputs: vec![compute::Declared {
+            slot: "answer".into(),
+            kind: compute::OutputKind::Buffer { max_bytes: 4096 },
+        }],
+    }
 }
-
-pub fn text_policy() -> TextPolicy {
-    TextPolicy::from_u32_stop_tokens(64, [2, 1])
+pub fn invocation_request(nonce: u8) -> InvocationRequest {
+    bundle(nonce).request
 }
-
-pub fn identity_artifact() -> TextArtifact {
-    TextArtifact::identity(BoundTermId::from_digest(manifest().content_id().digest()))
-}
-
-pub fn text_execution() -> TextExecution {
-    TextExecution::new(
-        SourceRef::output(identity_artifact().output_id()),
-        prompt_tokens().output_id(),
-        text_policy().output_id(),
-    )
-}
-
-pub fn evaluate_request(nonce: u8) -> EvaluateRequest {
-    evaluate_request_for(
-        text_execution().input_id().digest(),
-        PublicKey::Secp256k1(client().party_key().to_bytes()),
-        manifest().content_id(),
-        [nonce; 32],
-    )
-}
-
-pub fn bundle(nonce: u8) -> PreparedPaidInputV1 {
-    PreparedPaidInputV1::new(
-        &evaluate_request(nonce),
+pub fn bundle(nonce: u8) -> PreparedInvocation {
+    let input = InvocationInput {
+        artifacts: vec![],
+        parameters: JsonBytes(plan().canonical_bytes().unwrap()),
+    };
+    PreparedInvocation::new(
+        InvocationRequest {
+            execution_environment: manifest().content_id(),
+            input: input.content_id().unwrap(),
+            runner_public_key: PublicKey::Secp256k1(provider().party_key().to_bytes()),
+            nonce: [nonce; 32],
+            assurance: Assurance::ProducerSigned,
+            retain: true,
+        },
         &manifest(),
-        &text_execution(),
-        &prompt_tokens(),
-        &text_policy(),
-        &identity_artifact(),
+        input,
+        work_policy().canonical_bytes().unwrap(),
     )
+    .unwrap()
 }
 
 pub const fn deadlines() -> JobDeadlines {
@@ -299,7 +288,7 @@ pub fn lease_over(bond: EdgeId, payment: EdgeId) -> LeaseSlots {
 }
 
 pub fn bundle_bytes(nonce: u8) -> Vec<u8> {
-    match bundle(nonce).encode() {
+    match bundle(nonce).canonical_bytes() {
         Ok(bytes) => bytes,
         Err(error) => panic!("the fixture bundle encodes: {error}"),
     }
@@ -354,6 +343,16 @@ pub fn input_uploads(
     let reference = hellas_rpc::ContentRef::new(ContentId::hash(bytes), bytes.len() as u64);
     wire.prepared_input = encode_reference(reference);
     let id = work_id(channel, &a);
+    let program_manifest =
+        PreparedInvocation::from_canonical_bytes(bytes, crate::content::MAX_CONTENT_BYTES)
+            .ok()
+            .map(|input| input.manifest().unwrap().canonical_bytes())
+            .unwrap_or_default();
+    let program_root =
+        PreparedInvocation::from_canonical_bytes(bytes, crate::content::MAX_CONTENT_BYTES)
+            .ok()
+            .map(|input| program_root(&input))
+            .unwrap_or_default();
     let uploads = bytes
         .chunks(CONTENT_CHUNK_BYTES)
         .enumerate()
@@ -368,6 +367,8 @@ pub fn input_uploads(
                 &[7; 32],
             )));
             hellas_rpc::pb::work::UploadContentRequest {
+                program_root: program_root.clone(),
+                program_manifest: program_manifest.clone(),
                 route: wire.route.clone(),
                 authorization: wire.authorization.clone(),
                 client_signature: wire.client_signature.clone(),
@@ -427,12 +428,59 @@ pub async fn accept_uploaded_service(
 }
 
 pub async fn commit(store: &mut ChannelStore, record: ChannelRecord) {
+    if let ChannelRecord::JobProposed {
+        authorization,
+        prepared_input,
+        ..
+    } = &record
+        && store.state().role() == Role::Provider
+        && let Ok(input) = PreparedInvocation::from_canonical_bytes(
+            prepared_input,
+            crate::content::MAX_CONTENT_BYTES,
+        )
+    {
+        let root = program_root(&input);
+        if !root.is_empty() {
+            let policy =
+                InvocationPolicy::from_canonical_bytes(input.application_policy.as_bytes())
+                    .unwrap();
+            let objects = crate::job::content_closure(
+                &policy,
+                &input.manifest().unwrap(),
+                &root,
+                authorization.input_content,
+            )
+            .unwrap();
+            let work = work_id(store.state().channel(), authorization);
+            store
+                .uploads
+                .declare_closure(
+                    work,
+                    &objects,
+                    authorization.acceptance_deadline,
+                    authorization.retention,
+                    policy.limits.max_upload_bytes,
+                )
+                .unwrap();
+            store
+                .uploads
+                .stage_complete(
+                    work,
+                    hellas_rpc::ContentRef::for_bytes(&root),
+                    authorization.acceptance_deadline,
+                    authorization.retention,
+                    policy.limits.max_upload_bytes,
+                    &root,
+                )
+                .unwrap();
+        }
+    }
     if let Err(error) = store.commit(record, &Secp256k1Verifier::new()).await {
         panic!("the fixture record commits: {error}");
     }
 }
 
-pub fn transcript_for(request: &EvaluateRequest, answer: &[u32]) -> Vec<OutputEventEnvelope> {
+pub fn transcript_for(request: &InvocationRequest, answer: &[u32]) -> Vec<OutputEventEnvelope> {
     transcript_chunks(
         request,
         &[answer],
@@ -465,20 +513,17 @@ pub async fn store_at(
     store
 }
 
-pub fn work_policy() -> EvaluatePolicyV2 {
-    EvaluatePolicyV2 {
-        max_encoded_result_frame: WIDE_FRAME,
-        ..evaluate_policy(
-            manifest().content_id(),
-            match generation_policy_digest(&text_policy().canonical_bytes()) {
-                Ok(digest) => digest,
-                Err(error) => panic!("the fixture policy hashes: {error}"),
-            },
-            match identity_source_digest(&identity_artifact().canonical_bytes()) {
-                Ok(digest) => digest,
-                Err(error) => panic!("the fixture identity hashes: {error}"),
-            },
-        )
+pub fn work_policy() -> InvocationPolicy {
+    InvocationPolicy {
+        admissions: vec![Admission::Compute {
+            evaluator: compute::EVALUATOR.into(),
+        }],
+        limits: Limits {
+            max_upload_bytes: 1 << 20,
+            max_output_bytes: 1 << 20,
+            max_steps: 128,
+            execution_timeout_ms: 60_000,
+        },
     }
 }
 
@@ -531,9 +576,7 @@ pub fn descriptor() -> WorkChannelDescriptor {
     descriptor_with(work_policy())
 }
 
-pub fn descriptor_with(
-    policy: impl Into<crate::model::profile::WorkPolicy>,
-) -> WorkChannelDescriptor {
+pub fn descriptor_with(policy: InvocationPolicy) -> WorkChannelDescriptor {
     let config = WorkChannelConfig {
         payment_policy: payment_policy(),
         network: network(),
@@ -541,7 +584,7 @@ pub fn descriptor_with(
         payment_terms: payment_terms(),
         policy_salt: SALT,
         channel_policy: channel_policy(),
-        work_policy: policy.into(),
+        invocation_policy: policy,
         expected_payment_values: payment_values(),
     };
     match WorkChannelDescriptor::open(config) {
@@ -591,7 +634,7 @@ pub fn ready() -> ReadyChannel {
 // ── The prepared inputs a job executes from ───────────────────────────
 
 pub fn authorization() -> PaidJobAuthorizationV2 {
-    match propose_authorization(
+    match crate::job::propose(
         ready().channel(),
         &work_policy(),
         &payment_policy(),
@@ -612,7 +655,7 @@ pub async fn accept(stores: &mut [&mut ChannelStore]) -> Digest {
     let authorization = authorization();
     let ready = ready();
     let id = work_id(ready.channel(), &authorization);
-    let Ok(prepared_input) = bundle(NONCE).encode() else {
+    let Ok(prepared_input) = bundle(NONCE).canonical_bytes() else {
         panic!("the fixture bundle encodes");
     };
     for store in stores {
@@ -644,12 +687,12 @@ pub const ANSWER: [u32; 5] = [101, 102, 103, 104, 105];
 /// A backend that counts its calls and signs the fixture answer.
 pub struct AnsweringBackend {
     pub calls: Arc<AtomicUsize>,
-    transcript: fn(&EvaluateRequest, &[u32]) -> Vec<OutputEventEnvelope>,
+    transcript: fn(&InvocationRequest, &[u32]) -> Vec<OutputEventEnvelope>,
 }
 
 impl AnsweringBackend {
     pub fn with_transcript(
-        transcript: fn(&EvaluateRequest, &[u32]) -> Vec<OutputEventEnvelope>,
+        transcript: fn(&InvocationRequest, &[u32]) -> Vec<OutputEventEnvelope>,
     ) -> Self {
         Self {
             transcript,
@@ -675,17 +718,10 @@ impl WorkBackend for AnsweringBackend {
 
     async fn execute(
         &self,
-        prepared: crate::work::PreparedWorkInput,
+        prepared: crate::work::Admitted<PreparedInvocation>,
     ) -> Result<Vec<OutputEventEnvelope>, BackendFault> {
-        let crate::work::PreparedWorkInput::Evaluate(input) = prepared else {
-            return Err(crate::work::admission::AdmissionError::Unsupported(
-                crate::work::admission::CapacityDomain::Fetch,
-            )
-            .into());
-        };
-        let input = *input;
         self.calls.fetch_add(1, Ordering::SeqCst);
-        let produced = (self.transcript)(input.evaluate_request(), &ANSWER);
+        let produced = (self.transcript)(&prepared.invocation().request, &ANSWER);
         Ok(produced)
     }
 }
@@ -759,16 +795,14 @@ pub async fn checked_job() -> Checked {
 
     let (transport, server) = transport_pair();
     let serving = serve_work(server, service.clone());
-    let delivered = fetch_result(transport, &mut client, &ready, id).await;
+    let delivered = fetch_result_stream(transport, &mut client, &ready, id, |_| Ok(())).await;
     stop(serving).await;
     if let Err(error) = delivered {
         panic!("the fixture delivery completes: {error}");
     }
-    // The re-execution is `hellas-client`'s; what this file needs is the
-    // durable match it records, which is the only phase an honest
-    // client's journal signs a certificate from.
-    if let Err(error) = client.matched(id).await {
-        panic!("the fixture match records: {error}");
+    // The client journals authenticated verification before signing payment.
+    if let Err(error) = client.verified(id).await {
+        panic!("the fixture verification records: {error}");
     }
     Checked {
         client_root,
@@ -819,41 +853,6 @@ pub fn payment_terms_for(
     }
 }
 
-pub fn evaluate_policy(
-    allowed_environment: ContentId,
-    generation_policy_digest: Digest,
-    identity_source_digest: Digest,
-) -> EvaluatePolicyV2 {
-    EvaluatePolicyV2 {
-        allowed_environment,
-        generation_policy_digest,
-        identity_source_digest,
-        max_prompt_tokens: 512,
-        max_new_tokens: 128,
-        max_stop_token_ids: 4,
-        max_spool_bytes: 1_048_576,
-        max_encoded_result_frame: 262_144,
-        max_encoded_prepared_input: 1_048_576,
-        max_upload_bytes: 1_048_576,
-    }
-}
-
-pub fn evaluate_request_for(
-    text_execution: Digest,
-    runner_public_key: PublicKey,
-    execution_environment: ContentId,
-    nonce: [u8; 32],
-) -> EvaluateRequest {
-    EvaluateRequest {
-        text_execution,
-        runner_public_key,
-        execution_environment,
-        nonce,
-        assurance: Assurance::ProducerSigned,
-        retain: true,
-    }
-}
-
 impl Default for AnsweringBackend {
     fn default() -> Self {
         Self::new()
@@ -897,36 +896,30 @@ pub async fn exchange_setup(
 }
 
 pub fn transcript_chunks(
-    request: &EvaluateRequest,
+    request: &InvocationRequest,
     chunks: &[&[u32]],
     key: &ProducerSigningKey,
     input_units: u64,
     text_artifact: Digest,
 ) -> Vec<OutputEventEnvelope> {
-    let mut builder =
-        EvaluateOutputTranscriptBuilder::new(input_commitment(request), request.assurance, key);
-    let mut generated = Vec::new();
-    for chunk in chunks {
-        builder
-            .push_token_delta(chunk.to_vec())
-            .expect("a non-empty delta pushes");
-        generated.extend_from_slice(chunk);
+    let _ = (input_units, text_artifact);
+    let answer: Vec<u8> = chunks
+        .iter()
+        .flat_map(|chunk| chunk.iter().flat_map(|v| v.to_le_bytes()))
+        .collect();
+    output::InvocationOutput {
+        outcome: output::Outcome::Succeeded,
+        artifacts: vec![Artifact::new("answer", "catena.bytes.v1", answer)],
+        metadata: JsonBytes(
+            hellas_rpc::protocol::value::canonical_dag_cbor(&compute::RunMetadata {
+                steps: 0,
+                stop: None,
+            })
+            .unwrap(),
+        ),
     }
-    let usage = EvaluateUsage {
-        input_units,
-        output_units: generated.len() as u64,
-    };
-    let billable_units = usage.billable_units().expect("the fixture usage sums");
-    builder
-        .finish(EvaluateTerminal {
-            final_position: generated.len() as u64,
-            stop_reason: EvaluateStopReason::STOP_TOKEN,
-            matched_stop_token_id: Some(1),
-            text_artifact,
-            usage,
-            billable_units,
-        })
-        .expect("the fixture transcript finishes")
+    .sign(request, key, 1024)
+    .unwrap()
 }
 
 pub fn ready_of(descriptor: &WorkChannelDescriptor, height: u64) -> ReadyChannel {
@@ -988,4 +981,97 @@ pub async fn finish_setup(
         .import(&countersigned)
         .await
         .expect("the client imports the countersigned payment");
+}
+
+/// A Fetch invocation on the same financial channel, with ephemeral content.
+pub fn fetch_policy() -> InvocationPolicy {
+    use invocation::fetch::{FetchAdmission, FetchLimits, FetchRoutePolicy};
+    InvocationPolicy {
+        admissions: vec![Admission::Fetch {
+            admission: FetchAdmission {
+                contract: hellas_rpc::FetchContract::http().unwrap(),
+                route: FetchRoutePolicy::open_fetch(false, vec!["example.com".into()]),
+                limits: FetchLimits {
+                    max_request_body_bytes: 4096,
+                    max_output_events: 64,
+                    max_spool_bytes: 1 << 20,
+                    max_encoded_result_frame: 262144,
+                    max_encoded_prepared_input: 1 << 20,
+                },
+            },
+        }],
+        limits: work_policy().limits,
+    }
+}
+pub fn fetch_bundle(nonce: u8) -> PreparedInvocation {
+    let contract = hellas_rpc::FetchContract::http().unwrap();
+    let body = serde_json::to_vec(&hellas_rpc::http_fetch::HttpFetchRequest {
+        url: "https://example.com/private-input".into(),
+        method: "GET".into(),
+        headers: vec![],
+        body_base64: String::new(),
+        tls: hellas_rpc::http_fetch::HttpTls {
+            roots: hellas_rpc::http_fetch::HttpTrustRoots::WebPki,
+            spki_sha256: vec![],
+        },
+        credential: None,
+        max_response_bytes: 128,
+    })
+    .unwrap();
+    let caller = ProducerSigningKey::from_secret_bytes([0x21; 32]).unwrap();
+    let events = hellas_rpc::fetch::build_input_events_with_retention(
+        "http",
+        "fetch",
+        &body,
+        contract.manifest_id(),
+        Assurance::ProducerSigned,
+        &caller,
+        hellas_rpc::Retention::Ephemeral,
+    )
+    .unwrap();
+    invocation::fetch::prepare(
+        &events,
+        &contract,
+        provider_producer().public_key(),
+        fetch_policy().canonical_bytes().unwrap(),
+        [nonce; 32],
+    )
+    .unwrap()
+}
+pub fn fetch_transcript(input: &PreparedInvocation) -> Vec<OutputEventEnvelope> {
+    use hellas_rpc::output::{AdaptorEvent, HttpResponseEvent, OutputEvent, StopReason};
+    let events = [
+        OutputEvent::Adaptor(AdaptorEvent::Http(HttpResponseEvent::Head {
+            status: 200,
+            headers: vec![],
+        })),
+        OutputEvent::Adaptor(AdaptorEvent::Http(HttpResponseEvent::Body {
+            base64: "cHJpdmF0ZS1yZXN1bHQ=".into(),
+        })),
+    ]
+    .iter()
+    .map(|e| hellas_rpc::fetch::encode_fetch_event_payload(e).unwrap())
+    .collect::<Vec<_>>();
+    let terminal = hellas_rpc::fetch::encode_fetch_terminal_payload(&OutputEvent::Finished {
+        stop_reason: StopReason::EndOfText,
+        usage: None,
+    })
+    .unwrap();
+    invocation::fetch::output(&events, &terminal)
+        .unwrap()
+        .sign(&input.request, &provider_producer(), 1024)
+        .unwrap()
+}
+
+pub fn program_root(input: &PreparedInvocation) -> Vec<u8> {
+    if input.request.execution_environment == manifest().content_id() {
+        environment().canonical_bytes().unwrap()
+    } else {
+        Vec::new()
+    }
+}
+pub fn program_content() -> crate::content::InvocationContent {
+    let mut content = crate::content::EphemeralContent::default();
+    content.insert(environment().canonical_bytes().unwrap());
+    crate::content::InvocationContent::Ephemeral(content)
 }

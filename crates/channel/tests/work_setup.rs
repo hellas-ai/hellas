@@ -7,20 +7,17 @@
 //! round trip against the kernel's own encoder would pass with two
 //! fields transposed; these do not.
 
-use hellas_auth::Digest;
 use hellas_channel::model::setup::{
     CloseDescriptor, LeaseState, ObservedChannel, PendingState, WorkChannelConfig,
     WorkChannelDescriptor, WorkSetupError, check_collateral, payment_terms_hash,
 };
-use hellas_channel::model::work::{
-    EvaluatePolicyV2, PaidChannelPolicyV1, PaidWorkError, private_policy_commitment,
-};
+use hellas_channel::model::work::{PaidChannelPolicyV1, PaidWorkError, private_policy_commitment};
 use hellas_kernel::{
     BlockHeight, Decode as _, Edge, EdgeId, EdgeValues, Fees, LeaseSlots, NetworkId, Parties,
     PartyKeys, Payout, PendingSlot, RegistryChunk, RegistryNamespace, RegistryRecordTag, Terms,
     TermsHash, WorkPaymentTerms, WorkStakeBondTerms,
 };
-use hellas_rpc::protocol::ContentId;
+use hellas_rpc::protocol::invocation::InvocationPolicy;
 
 // ── Fixture ───────────────────────────────────────────────────────────
 
@@ -85,12 +82,8 @@ fn payment_terms() -> WorkPaymentTerms {
     )
 }
 
-fn work_policy() -> EvaluatePolicyV2 {
-    hellas_channel::test_support::channel::evaluate_policy(
-        ContentId::from_bytes([0x31; 32]),
-        Digest::from_bytes([0x32; 32]),
-        Digest::from_bytes([0x33; 32]),
-    )
+fn work_policy() -> InvocationPolicy {
+    hellas_channel::test_support::channel::work_policy()
 }
 
 fn payment_values() -> EdgeValues {
@@ -105,7 +98,7 @@ fn config() -> WorkChannelConfig {
         payment_terms: payment_terms(),
         policy_salt: SALT,
         channel_policy: channel_policy(),
-        work_policy: work_policy().into(),
+        invocation_policy: work_policy(),
         expected_payment_values: payment_values(),
     }
 }
@@ -803,9 +796,9 @@ fn signing_measures_the_margins_from_the_cursor_not_the_readiness_height() {
 #[test]
 fn close_descriptor_round_trips_without_new_work_policy() {
     let armed = descriptor().close_descriptor();
-    let bytes = armed.encode();
-    assert_eq!(bytes[0], 3);
-    for version in [1, 2] {
+    let bytes = armed.encode().unwrap();
+    assert_eq!(bytes[0], 4);
+    for version in [1, 2, 3] {
         let mut legacy = bytes.clone();
         legacy[0] = version;
         assert_eq!(

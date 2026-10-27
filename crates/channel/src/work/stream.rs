@@ -1,12 +1,9 @@
-//! Live delivery over the existing job authorization and payment lifecycle.
+//! Streaming delivery over the existing authorization and payment lifecycle.
 use super::*;
-use crate::model::fetch::MAX_FETCH_TRANSCRIPT_BYTES;
 use crate::model::work::decode_transcript;
 use futures::StreamExt;
 use hellas_rpc::pb::work::{WorkStreamEvent, work_stream_event};
-use hellas_rpc::{
-    Operation, StreamId, output_genesis, scheme_id, verify_output_event_continuation,
-};
+use hellas_rpc::protocol::invocation::output;
 
 pub type PaidProgress = Arc<dyn Fn(OutputEventEnvelope) -> Result<(), BackendFault> + Send + Sync>;
 pub type PaidResultStream = hellas_rpc::call::ResponseStream<WorkStreamEvent>;
@@ -18,22 +15,20 @@ pub enum ProgressError {
     #[error("progress state lock is poisoned")]
     Poisoned,
 }
-
 #[derive(Debug, Default)]
 pub(super) struct Progress {
     events: Vec<OutputEventEnvelope>,
     bytes: usize,
 }
 
-/// Fetch's terminal authenticates the assembled transcript without repeating it
-/// in one wire frame. Signatures, result digests and payment records are unchanged.
-pub(super) fn fetch_frames<'a>(
-    delivered: &'a WorkDelivered,
+// The terminal authenticates the complete stream without repeating it in one frame.
+pub(super) fn result_frames<'a>(
+    delivered: &'a ResultTranscript,
     events: &'a [OutputEventEnvelope],
     frame_limit: u32,
 ) -> impl Iterator<Item = Result<WorkStreamEvent, PaidWorkError>> + 'a {
     let prefixes = &events[..events.len().saturating_sub(1)];
-    prefix_batches(prefixes, frame_limit, true)
+    prefix_batches(prefixes, frame_limit)
         .map(|batch| {
             Ok(WorkStreamEvent {
                 outcome: Some(work_stream_event::Outcome::Prefix(encode_transcript(
@@ -42,43 +37,36 @@ pub(super) fn fetch_frames<'a>(
             })
         })
         .chain(events.last().into_iter().map(|event| {
-            let transcript = encode_transcript(std::slice::from_ref(event))?;
-            let outcome =
-                work_stream_event::Outcome::Terminal(hellas_rpc::pb::work::WorkStreamTerminal {
-                    result: delivered.result.clone(),
-                    provider_signature: delivered.provider_signature.clone(),
-                    terminal_transcript: transcript,
-                });
             Ok(WorkStreamEvent {
-                outcome: Some(outcome),
+                outcome: Some(work_stream_event::Outcome::Terminal(
+                    hellas_rpc::pb::work::WorkStreamTerminal {
+                        result: delivered.result.clone(),
+                        provider_signature: delivered.provider_signature.clone(),
+                        terminal_transcript: encode_transcript(std::slice::from_ref(event))?,
+                    },
+                )),
             })
         }))
 }
-
-// Batch only events already available. Each bounded frame still passes the
-// provider's local readiness check; the client verifies each envelope separately.
 fn prefix_batches(
     mut events: &[OutputEventEnvelope],
     frame_limit: u32,
-    fetch: bool,
 ) -> impl Iterator<Item = &[OutputEventEnvelope]> {
-    let budget = if fetch {
-        (frame_limit as usize).min(64 * 1024).saturating_sub(32)
-    } else {
-        0
-    };
     std::iter::from_fn(move || {
         if events.is_empty() {
             return None;
         }
-        let mut bytes = 0usize;
-        let mut count = 0;
-        for event in events {
-            let next = bytes.saturating_add(spool_charge(event, fetch));
-            if count > 0 && next > budget {
+        let mut count = 1;
+        while count < events.len() {
+            let Ok(bytes) = encode_transcript(&events[..count + 1]) else {
+                break;
+            };
+            let frame = WorkStreamEvent {
+                outcome: Some(work_stream_event::Outcome::Prefix(bytes)),
+            };
+            if frame.encoded_len() > (frame_limit as usize).min(64 * 1024) {
                 break;
             }
-            bytes = next;
             count += 1;
         }
         let (batch, rest) = events.split_at(count);
@@ -86,26 +74,31 @@ fn prefix_batches(
         Some(batch)
     })
 }
-
-fn spool_charge(event: &OutputEventEnvelope, fetch: bool) -> usize {
-    // The canonical envelope represents payload bytes as CBOR integers, up to
-    // two encoded bytes each. Include signature/structure overhead before decode.
-    event
-        .payload()
-        .len()
-        .saturating_mul(if fetch { 2 } else { 1 })
-        .saturating_add(1024)
-}
-
 impl ProviderEndpoint {
+    fn job_facts(&self, work_id: Digest) -> Result<AdmissionFacts, DeliverError> {
+        let job = self
+            .state()
+            .job_by_id(work_id)
+            .ok_or(DeliverError::NoSuchJob)?;
+        let input = PreparedInvocation::from_canonical_bytes(
+            job.prepared_input(),
+            crate::content::MAX_CONTENT_BYTES,
+        )
+        .map_err(PaidWorkError::from)?;
+        Ok(crate::job::check_paid_input(
+            self.state().channel(),
+            job.authorization(),
+            self.admitting()?.invocation_policy(),
+            &input,
+        )?)
+    }
     async fn reserve_stream(
         &mut self,
-        request: &DeliverResultRequest,
+        request: &StreamResultRequest,
         exporter: &[u8; 32],
     ) -> Result<(), DeliverError> {
-        // Delivery authenticates the client and connection before looking at
-        // the phase. A ready result takes the ordinary durable release path.
-        match self.deliver_with_readiness(request, None, exporter).await {
+        // This authenticates route, caller and connection before any phase is disclosed.
+        match self.release_ready(request, None, exporter).await {
             Ok(_) => return Ok(()),
             Err(DeliverError::NoResult {
                 phase: JobPhase::Running | JobPhase::Streaming,
@@ -121,6 +114,12 @@ impl ProviderEndpoint {
         if self.state().job_is_indeterminate(work_id) {
             return Err(DeliverError::NoSuchJob);
         }
+        crate::model::work::check_payment_policy_binding(
+            ready.channel(),
+            job.authorization(),
+            ready.payment_policy(),
+        )?;
+        self.job_facts(work_id)?;
         ready.check_releasable(
             self.state().cursor().0,
             job.authorization().terminal_deadline,
@@ -135,11 +134,10 @@ impl ProviderEndpoint {
         Ok(())
     }
 }
-
 impl WorkService {
     async fn reserve_stream_durably(
         &self,
-        request: &DeliverResultRequest,
+        request: &StreamResultRequest,
         exporter: &[u8; 32],
     ) -> Result<(), DeliverError> {
         let mut endpoint = self
@@ -148,169 +146,134 @@ impl WorkService {
             .await
             .map_err(|_| EndpointError::Poisoned)?;
         let (request, exporter) = (request.clone(), *exporter);
-        // Acquire before spawning so disconnected waiters cannot accumulate
-        // detached tasks. A started SQLite append must outlive its RPC.
+        // A started SQLite append outlives its RPC. Acquire first to bound detached tasks.
         tokio::spawn(async move { endpoint.reserve_stream(&request, &exporter).await })
             .await
             .map_err(|_| DeliverError::Endpoint(EndpointError::Poisoned))?
     }
-
     async fn check_stream_release(
         &self,
-        request: &DeliverResultRequest,
+        request: &StreamResultRequest,
         exporter: &[u8; 32],
     ) -> Result<(), WireStatus> {
-        let outcome = self.reserve_stream_durably(request, exporter).await;
-        outcome
+        self.reserve_stream_durably(request, exporter)
+            .await
             .map_err(|error| WireStatus::new(hellas_wire::WireCode::Unavailable, error.to_string()))
     }
-
     pub(super) fn publish_progress(
         &self,
         work_id: Digest,
-        policy: &WorkPolicy,
+        facts: &AdmissionFacts,
         event: OutputEventEnvelope,
     ) -> Result<(), BackendFault> {
-        // Bounds were fixed by begin_run; delivery rechecks live readiness.
-        let limit = match policy {
-            WorkPolicy::Fetch { .. } => policy
-                .max_spool_bytes()
-                .min(MAX_FETCH_TRANSCRIPT_BYTES as u64),
-            WorkPolicy::Evaluate(_) => policy.max_spool_bytes(),
-        };
+        if matches!(
+            event.event().body().kind(),
+            output::TERMINAL | output::FAILURE
+        ) {
+            return Ok(());
+        }
         let mut jobs = self
             .progress
             .lock()
             .map_err(|_| BackendFault::caused_by(ProgressError::Poisoned))?;
         let progress = jobs.entry(work_id).or_default();
-        // Signed prefixes are bounded by the same spool as final delivery.
-        let fetch = matches!(policy, WorkPolicy::Fetch { .. });
-        let bytes = spool_charge(&event, fetch);
-        let retained = progress.bytes.saturating_add(bytes);
-        if retained as u64 > limit {
+        let mut events = progress.events.clone();
+        events.push(event.clone());
+        let bytes = encode_transcript(&events)
+            .map_err(BackendFault::caused_by)?
+            .len();
+        if bytes as u64 > facts.max_spool_bytes || events.len() as u64 >= facts.max_output_events {
             return Err(BackendFault::caused_by(ProgressError::SpoolBound));
         }
-        progress.bytes = retained;
+        progress.bytes = bytes;
         progress.events.push(event);
         drop(jobs);
         self.changed.notify_waiters();
         Ok(())
     }
-
     pub(super) fn result_stream(
         &self,
-        request: DeliverResultRequest,
+        request: StreamResultRequest,
         context: TransportContext,
     ) -> PaidResultStream {
         let service = self.clone();
         PaidResultStream::new(async_stream::stream! {
             let Some(exporter) = context.open_exporter else {
-                yield Err(WireStatus::new(hellas_wire::WireCode::PermissionDenied, "delivery requires a bound connection"));
-                return;
+                yield Err(WireStatus::new(hellas_wire::WireCode::PermissionDenied, "delivery requires a bound connection")); return;
             };
             let Some(work_id) = work_id_bytes(&request.work_id) else {
-                yield Err(WireStatus::new(hellas_wire::WireCode::InvalidArgument, "invalid work id"));
-                return;
+                yield Err(WireStatus::new(hellas_wire::WireCode::InvalidArgument, "invalid work id")); return;
             };
             let mut position = 0;
             loop {
-                let changed = service.changed.notified();
-                tokio::pin!(changed);
-                changed.as_mut().enable();
-                let reserved = service.reserve_stream_durably(&request, &exporter).await;
-                match reserved {
-                    Ok(()) => {
-                        let limits = service.endpoint().await.and_then(|endpoint| {
-                            let policy = endpoint.admitting()?.work_policy();
-                            Ok((policy.max_encoded_result_frame(), matches!(policy, WorkPolicy::Fetch { .. })))
-                        });
-                        let (frame_limit, fetch) = match limits {
-                            Ok(limits) => limits,
-                            Err(error) => {
-                                yield Err(WireStatus::new(hellas_wire::WireCode::Unavailable, error.to_string()));
-                                return;
-                            }
-                        };
-                        let response = service.release(&request, &context).await;
-                        match response.outcome {
-                            Some(DeliverOutcome::Delivered(delivered)) => {
-                                let events = match decode_transcript(&delivered.transcript, MAX_FETCH_TRANSCRIPT_BYTES) {
-                                    Ok(events) => events,
-                                    Err(error) => {
-                                        yield Err(WireStatus::new(hellas_wire::WireCode::Internal, error.to_string()));
-                                        return;
-                                    }
-                                };
-                                if events.last().is_some_and(|event| event.event().body().kind() == hellas_rpc::fetch::OUTPUT_TERMINAL_KIND) {
-                                    let Some(tail) = events.get(position..) else {
-                                        yield Err(WireStatus::new(hellas_wire::WireCode::Internal, "terminal result is shorter than streamed output"));
-                                        return;
-                                    };
-                                    for frame in fetch_frames(&delivered, tail, frame_limit) {
-                                        if let Err(error) = service.check_stream_release(&request, &exporter).await {
-                                            yield Err(error);
-                                            return;
-                                        }
-                                        yield frame.map_err(|error| WireStatus::new(hellas_wire::WireCode::Internal, error.to_string()));
-                                    }
-                                } else {
-                                    yield Ok(WorkStreamEvent { outcome: Some(work_stream_event::Outcome::Delivered(delivered)) });
-                                }
-                                return;
-                            }
-                            Some(DeliverOutcome::Refused(refused)) if refused.code != WorkRefusal::NotReady.code() as i32 => {
-                                yield Ok(WorkStreamEvent { outcome: Some(work_stream_event::Outcome::Refused(refused)) });
-                                return;
-                            }
-                            _ => {}
-                        }
-                        let pending = service.progress.lock()
-                            .map(|progress| progress.get(&work_id).map(|progress| progress.events[position.min(progress.events.len())..].to_vec()).unwrap_or_default())
-                            .map_err(|_| ProgressError::Poisoned);
-                        let pending = match pending {
-                            Ok(pending) => pending,
-                            Err(error) => {
-                                yield Err(WireStatus::new(hellas_wire::WireCode::Unavailable, error.to_string()));
-                                return;
-                            }
-                        };
-                        for batch in prefix_batches(&pending, frame_limit, fetch) {
-                            if let Err(error) = service.check_stream_release(&request, &exporter).await {
-                                yield Err(error);
-                                return;
-                            }
-                            match encode_transcript(batch) {
-                                Ok(prefix) => {
-                                    position += batch.len();
-                                    yield Ok(WorkStreamEvent { outcome: Some(work_stream_event::Outcome::Prefix(prefix)) });
-                                }
-                                Err(error) => {
-                                    yield Err(WireStatus::new(hellas_wire::WireCode::Internal, error.to_string()));
-                                    return;
-                                }
-                            }
-                        }
+                let changed = service.changed.notified(); tokio::pin!(changed); changed.as_mut().enable();
+                match service.reserve_stream_durably(&request, &exporter).await {
+                    Ok(()) => {},
+                    Err(DeliverError::NoResult { phase: JobPhase::HalfSigned | JobPhase::Accepted | JobPhase::Running | JobPhase::Streaming }) => {
+                        let _ = tokio::time::timeout(std::time::Duration::from_secs(30), changed).await;
+                        continue;
                     }
-                    Err(DeliverError::NoResult { .. }) => {},
                     Err(error) => {
                         let refusal = Refusal::from(error);
                         yield Ok(WorkStreamEvent { outcome: Some(work_stream_event::Outcome::Refused(WorkRefused {
-                            grant: None,
-                            code: refusal.code.code() as i32, reason: refusal.reason,
-                        })) });
-                        return;
+                            grant: None, code: refusal.code.code() as i32, reason: refusal.reason,
+                        })) }); return;
                     }
                 }
-                // Recheck finalized deadlines even when a failed worker never
-                // sends another notification. This is one open subscription.
+                let facts = match service.endpoint().await.and_then(|endpoint| endpoint.job_facts(work_id).map_err(|_| EndpointError::NotAdmitting)) {
+                    Ok(facts) => facts,
+                    Err(error) => { yield Err(WireStatus::new(hellas_wire::WireCode::Unavailable, error.to_string())); return; }
+                };
+                match service.retained_delivery(&request, &context).await {
+                    Ok(delivery) => {
+                        let events = match decode_transcript(&delivery.transcript, facts.max_spool_bytes as usize) {
+                            Ok(events) => events,
+                            Err(error) => { yield Err(WireStatus::new(hellas_wire::WireCode::Internal, error.to_string())); return; }
+                        };
+                        let Some(tail) = events.get(position..) else {
+                            yield Err(WireStatus::new(hellas_wire::WireCode::Internal, "result shorter than streamed prefix")); return;
+                        };
+                        let delivered = ResultTranscript { result: delivery.result.encode(), provider_signature: delivery.signature.as_bytes().to_vec(), transcript: Vec::new() };
+                        for frame in result_frames(&delivered, tail, facts.max_encoded_result_frame) {
+                            if let Err(error) = service.check_stream_release(&request, &exporter).await { yield Err(error); return; }
+                            match frame {
+                                Ok(frame) if frame.encoded_len() <= facts.max_encoded_result_frame as usize => yield Ok(frame),
+                                _ => { yield Err(WireStatus::new(hellas_wire::WireCode::Internal, "result frame exceeds bound")); return; }
+                            }
+                        }
+                        return;
+                    }
+                    Err(refusal) if refusal.code != WorkRefusal::NotReady => {
+                        yield Ok(WorkStreamEvent { outcome: Some(work_stream_event::Outcome::Refused(WorkRefused {
+                            grant: None, code: refusal.code.code() as i32, reason: refusal.reason,
+                        })) }); return;
+                    }
+                    Err(_) => {},
+                }
+                let pending = service.progress.lock().map(|jobs| jobs.get(&work_id)
+                    .map(|p| p.events[position.min(p.events.len())..].to_vec()).unwrap_or_default()).map_err(|_| ProgressError::Poisoned);
+                let pending = match pending {
+                    Ok(events) => events,
+                    Err(_) => { yield Err(WireStatus::new(hellas_wire::WireCode::Unavailable, "progress lock poisoned")); return; }
+                };
+                for batch in prefix_batches(&pending, facts.max_encoded_result_frame) {
+                    if let Err(error) = service.check_stream_release(&request, &exporter).await { yield Err(error); return; }
+                    match encode_transcript(batch) {
+                        Ok(prefix) => {
+                            let frame = WorkStreamEvent { outcome: Some(work_stream_event::Outcome::Prefix(prefix)) };
+                            if frame.encoded_len() > facts.max_encoded_result_frame as usize {
+                                yield Err(WireStatus::new(hellas_wire::WireCode::Internal, "prefix exceeds frame bound")); return;
+                            }
+                            position += batch.len(); yield Ok(frame);
+                        }
+                        Err(error) => { yield Err(WireStatus::new(hellas_wire::WireCode::Internal, error.to_string())); return; }
+                    }
+                }
                 let _ = tokio::time::timeout(std::time::Duration::from_secs(30), changed).await;
             }
         })
     }
 }
-
-/// Deliver verified prefixes and finally journal the complete result.
-/// The caller pays only after this returns; it must keep running if its UI drops.
 pub async fn fetch_result_stream<T>(
     transport: T,
     endpoint: &mut impl ClientChannel,
@@ -327,184 +290,51 @@ where
         .context()
         .open_exporter
         .ok_or(DeliverError::Unbindable)?;
-    let (request, prepared) = {
+    let (request, prepared, facts) = {
         let endpoint = endpoint.client().await?;
-        let request = endpoint.request_delivery(work_id, &exporter)?;
         let job = endpoint
             .state()
             .job_by_id(work_id)
             .ok_or(DeliverError::NoSuchJob)?;
-        let prepared = PreparedWorkBundle::decode(job.prepared_input(), MAX_RECORD_BYTES)
-            .map_err(PaidWorkError::from)?;
-        (request, prepared)
+        let prepared = PreparedInvocation::from_canonical_bytes(
+            job.prepared_input(),
+            crate::content::MAX_CONTENT_BYTES,
+        )
+        .map_err(PaidWorkError::from)?;
+        let facts = crate::job::check_paid_input(
+            ready.channel(),
+            job.authorization(),
+            ready.invocation_policy(),
+            &prepared,
+        )?;
+        (
+            endpoint.request_delivery(work_id, &exporter)?,
+            prepared,
+            facts,
+        )
     };
-    let input = prepared.input_commitment()?;
-    let (operation, kind, max_tokens, max_events, max_bytes) =
-        match (&prepared, ready.work_policy()) {
-            (PreparedWorkBundle::Evaluate(prepared), WorkPolicy::Evaluate(_)) => (
-                Operation::Evaluate,
-                hellas_rpc::evaluate::TOKEN_DELTA_EVENT_KIND,
-                u64::from(
-                    prepared
-                        .parts()
-                        .map_err(PaidWorkError::from)?
-                        .text_policy
-                        .max_new_tokens(),
-                ),
-                u64::MAX,
-                u64::MAX,
-            ),
-            (PreparedWorkBundle::Fetch(_), WorkPolicy::Fetch { policy, .. }) => (
-                Operation::Fetch,
-                hellas_rpc::fetch::OUTPUT_EVENT_KIND,
-                0,
-                u64::from(policy.max_output_events)
-                    .min(hellas_rpc::fetch::MAX_FETCH_OUTPUT_EVENTS as u64),
-                u64::from(policy.max_output_bytes)
-                    .min(hellas_rpc::fetch::MAX_FETCH_OUTPUT_PAYLOAD_BYTES as u64),
-            ),
-            _ => {
-                return Err(DeliverError::Malformed(
-                    "stream profile differs from channel",
-                ));
-            }
-        };
-    let mut token_count = 0u64;
-    let mut payload_bytes = 0u64;
-    let mut retained_bytes = 0usize;
-    let spool_limit = if operation == Operation::Fetch {
-        ready
-            .work_policy()
-            .max_spool_bytes()
-            .min(MAX_FETCH_TRANSCRIPT_BYTES as u64)
-    } else {
-        ready.work_policy().max_spool_bytes()
-    };
-    let key = hellas_auth::PublicKey::Secp256k1(ready.channel().provider_key().to_bytes());
-    let scheme = scheme_id(operation, prepared.assurance()?);
-    let mut previous = output_genesis(input, StreamId::from_input_commitment(input));
-    let mut streamed = Vec::new();
+    let mut verifier = output::StreamVerifier::new(
+        prepared.request.clone(),
+        hellas_auth::PublicKey::Secp256k1(ready.channel().provider_key().to_bytes()),
+        facts.max_transcript_payload_bytes as usize,
+    )
+    .map_err(PaidWorkError::from)?;
+    let mut events = Vec::new();
     let mut stream = WorkClientImpl::new(transport)
         .stream_result(request)
         .await?;
-    while let Some(event) = stream.next().await {
-        let event = event?;
-        let frame_limit = ready.work_policy().max_encoded_result_frame() as u64;
-        if operation == Operation::Fetch && event.encoded_len() as u64 > frame_limit {
+    while let Some(frame) = stream.next().await {
+        let frame = frame?;
+        if frame.encoded_len() > facts.max_encoded_result_frame as usize {
             return Err(DeliverError::OverFrame {
-                actual: event.encoded_len() as u64,
-                limit: frame_limit,
+                actual: frame.encoded_len() as u64,
+                limit: facts.max_encoded_result_frame as u64,
             });
         }
-        match event.outcome {
-            Some(work_stream_event::Outcome::Prefix(prefix)) => {
-                let events = decode_transcript(&prefix, MAX_RECORD_BYTES)?;
-                for event in events {
-                    previous = verify_output_event_continuation(
-                        scheme,
-                        input,
-                        &key,
-                        streamed.len() as u64,
-                        previous,
-                        &event,
-                    )
-                    .map_err(|error| PaidWorkError::Transcript(error.to_string()))?;
-                    if event.event().body().kind() != kind {
-                        return Err(DeliverError::Malformed(
-                            "live prefix has the wrong event kind",
-                        ));
-                    }
-                    if operation == Operation::Evaluate {
-                        let delta =
-                            hellas_rpc::evaluate::decode_token_delta_payload(event.payload())
-                                .map_err(|error| PaidWorkError::Transcript(error.to_string()))?;
-                        token_count = token_count.saturating_add(delta.token_ids.len() as u64);
-                    } else {
-                        hellas_rpc::fetch::decode_fetch_event_payload(event.payload())
-                            .map_err(|error| PaidWorkError::Transcript(error.to_string()))?;
-                    }
-                    payload_bytes = payload_bytes.saturating_add(event.payload().len() as u64);
-                    retained_bytes = retained_bytes
-                        .saturating_add(spool_charge(&event, operation == Operation::Fetch));
-                    // Reserve one envelope for the required terminal.
-                    if token_count > max_tokens
-                        || streamed.len() as u64 + 1 >= max_events
-                        || payload_bytes > max_bytes
-                        || retained_bytes as u64 > spool_limit
-                    {
-                        return Err(DeliverError::Malformed(
-                            "live result exceeds authorized output",
-                        ));
-                    }
-                    progress(&event)?;
-                    streamed.push(event);
-                }
-            }
-            Some(work_stream_event::Outcome::Delivered(delivered)) => {
-                let events = decode_transcript(&delivered.transcript, MAX_RECORD_BYTES)?;
-                if !events.starts_with(&streamed) {
-                    return Err(DeliverError::Malformed(
-                        "terminal result changed streamed output",
-                    ));
-                }
-                if stream.next().await.transpose()?.is_some() {
-                    return Err(DeliverError::Malformed("event after terminal result"));
-                }
-                stream.finish()?;
-                let result = endpoint
-                    .client()
-                    .await?
-                    .receive(work_id, ready, &delivered)
-                    .await?;
-                for event in &events[streamed.len()..] {
-                    if event.event().body().kind() == kind {
-                        progress(event)?;
-                    }
-                }
-                return Ok(result);
-            }
+        let (bytes, terminal) = match frame.outcome {
+            Some(work_stream_event::Outcome::Prefix(bytes)) => (bytes, None),
             Some(work_stream_event::Outcome::Terminal(terminal)) => {
-                if operation != Operation::Fetch {
-                    return Err(DeliverError::Malformed("stream terminal requires Fetch"));
-                }
-                let mut tail = decode_transcript(&terminal.terminal_transcript, MAX_RECORD_BYTES)?;
-                if tail.len() != 1
-                    || tail[0].event().body().kind() != hellas_rpc::fetch::OUTPUT_TERMINAL_KIND
-                {
-                    return Err(DeliverError::Malformed(
-                        "stream terminal must contain one terminal envelope",
-                    ));
-                }
-                if payload_bytes.saturating_add(tail[0].payload().len() as u64) > max_bytes
-                    || retained_bytes.saturating_add(spool_charge(&tail[0], true)) as u64
-                        > spool_limit
-                {
-                    return Err(DeliverError::Malformed(
-                        "live result exceeds authorized output",
-                    ));
-                }
-                // No delivery or payment is recorded before the stream's final
-                // status and the complete signed transcript have both verified.
-                if stream.next().await.transpose()?.is_some() {
-                    return Err(DeliverError::Malformed("event after terminal result"));
-                }
-                stream.finish()?;
-                streamed.append(&mut tail);
-                let transcript = encode_transcript(&streamed)?;
-                return endpoint
-                    .client()
-                    .await?
-                    .receive_inner(
-                        work_id,
-                        ready,
-                        &WorkDelivered {
-                            result: terminal.result,
-                            provider_signature: terminal.provider_signature,
-                            transcript,
-                        },
-                        true,
-                    )
-                    .await;
+                (terminal.terminal_transcript.clone(), Some(terminal))
             }
             Some(work_stream_event::Outcome::Refused(refused)) => {
                 return Err(DeliverError::Refused {
@@ -513,7 +343,53 @@ where
                     reason: refused.reason,
                 });
             }
-            None => return Err(DeliverError::Malformed("empty stream event")),
+            _ => return Err(DeliverError::Malformed("invalid streaming result frame")),
+        };
+        let batch = decode_transcript(&bytes, facts.max_spool_bytes as usize)?;
+        if batch.is_empty() || (terminal.is_some() && batch.len() != 1) {
+            return Err(DeliverError::Malformed("invalid stream terminal"));
+        }
+        for event in batch {
+            verifier.push(event.clone()).map_err(PaidWorkError::from)?;
+            if terminal.is_none() && verifier.terminal_seen() {
+                return Err(DeliverError::Malformed("terminal in prefix frame"));
+            }
+            events.push(event.clone());
+            if events.len() as u64 > facts.max_output_events
+                || encode_transcript(&events)?.len() as u64 > facts.max_spool_bytes
+            {
+                return Err(DeliverError::Malformed(
+                    "live result exceeds authorized output",
+                ));
+            }
+            if terminal.is_none() {
+                progress(&event)?;
+            }
+        }
+        if let Some(terminal) = terminal {
+            if stream.next().await.transpose()?.is_some() {
+                return Err(DeliverError::Malformed("event after terminal result"));
+            }
+            stream.finish()?;
+            verifier.finish().map_err(PaidWorkError::from)?;
+            prepared
+                .verify_output(
+                    ready.invocation_policy(),
+                    &hellas_auth::PublicKey::Secp256k1(ready.channel().client_key().to_bytes()),
+                    &hellas_auth::PublicKey::Secp256k1(ready.channel().provider_key().to_bytes()),
+                    &events,
+                )
+                .map_err(PaidWorkError::from)?;
+            let delivered = ResultTranscript {
+                result: terminal.result,
+                provider_signature: terminal.provider_signature,
+                transcript: encode_transcript(&events)?,
+            };
+            return endpoint
+                .client()
+                .await?
+                .receive_stream(work_id, ready, &delivered)
+                .await;
         }
     }
     stream.finish()?;
@@ -562,7 +438,7 @@ mod tests {
         .unwrap();
         let proposal = client
             .propose(&JobProposal {
-                prepared_input: fixture::bundle(1).into(),
+                prepared_input: fixture::bundle(1),
                 deadlines: fixture::deadlines(),
             })
             .await
@@ -632,16 +508,21 @@ mod tests {
     #[test]
     fn batched_fetch_preserves_every_envelope_and_bounds_each_frame() {
         let key = hellas_auth::ProducerSigningKey::from_secret_bytes([1; 32]).unwrap();
-        let mut builder = hellas_rpc::fetch::FetchOutputTranscriptBuilder::new(
+        let mut builder = hellas_rpc::OutputTranscriptBuilder::new(
+            hellas_rpc::scheme_id(
+                hellas_rpc::Operation::Fetch,
+                hellas_rpc::Assurance::ProducerSigned,
+            ),
             hellas_rpc::InputCommitment::from_digest(hellas_auth::Digest::from_bytes([2; 32])),
-            hellas_rpc::Assurance::ProducerSigned,
             &key,
+            hellas_rpc::fetch::output_canonicalization(),
         );
         for _ in 0..100 {
-            builder.push_event(vec![7; 256]).unwrap();
+            builder.push("response.event", vec![7; 256]).unwrap();
         }
-        let events = builder.finish(vec![8; 16]).unwrap();
-        let delivered = WorkDelivered {
+        builder.push("response.terminal", vec![8; 16]).unwrap();
+        let (events, _) = builder.finish().unwrap();
+        let delivered = ResultTranscript {
             result: vec![3; 128],
             provider_signature: vec![4; 64],
             transcript: encode_transcript(&events).unwrap(),
@@ -649,7 +530,7 @@ mod tests {
         for limit in [4096, 65536] {
             // Resuming after an arbitrary prefix must skip envelopes, not batches.
             for position in [0, 1, 47, 100] {
-                let frames = fetch_frames(&delivered, &events[position..], limit)
+                let frames = result_frames(&delivered, &events[position..], limit)
                     .collect::<Result<Vec<_>, _>>()
                     .unwrap();
                 let mut decoded = Vec::new();
@@ -660,7 +541,10 @@ mod tests {
                         work_stream_event::Outcome::Terminal(end) => &end.terminal_transcript,
                         _ => panic!("unexpected frame"),
                     };
-                    decoded.extend(decode_transcript(bytes, MAX_RECORD_BYTES).unwrap());
+                    decoded.extend(
+                        decode_transcript(bytes, crate::work_store::journal::MAX_RECORD_BYTES)
+                            .unwrap(),
+                    );
                 }
                 assert_eq!(decoded, events[position..]);
                 assert!(matches!(

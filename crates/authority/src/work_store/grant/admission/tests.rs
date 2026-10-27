@@ -51,6 +51,8 @@ async fn reserved_checkpoint_space_covers_maximum_metadata() {
                     b"terminal",
                 )),
                 canonical_output_digest: Digest::hash(b"output"),
+                outcome: hellas_channel::model::work::ResultOutcome::Finished,
+                transcript_content: hellas_rpc::ContentRef::for_bytes(b"transcript"),
             },
             signature,
         }),

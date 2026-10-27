@@ -55,11 +55,6 @@ impl ProviderEndpoint {
                 .map_err(|_| Refusal::invalid("invalid content id"))?,
             request.total_bytes,
         );
-        if object != authorization.input_content {
-            return Err(Refusal::invalid(
-                "object is outside the signed proposal's closure",
-            ));
-        }
         let signature = signature(&request.chunk_signature)
             .ok_or_else(|| Refusal::invalid("invalid chunk signature"))?;
         if !Secp256k1Verifier::new().verify_sig(
@@ -84,12 +79,31 @@ impl ProviderEndpoint {
                 .state()
                 .job_by_id(id)
                 .ok_or_else(|| Refusal::invalid("accepted input unavailable"))?;
-            if ContentId::hash(job.prepared_input()) != object.id()
-                || job.prepared_input().len() as u64 != object.bytes()
-            {
+            let input = PreparedInvocation::from_canonical_bytes(
+                job.prepared_input(),
+                crate::content::MAX_CONTENT_BYTES,
+            )
+            .map_err(|e| Refusal::invalid(e.to_string()))?;
+            let policy = hellas_rpc::protocol::invocation::InvocationPolicy::from_canonical_bytes(
+                input.application_policy.as_bytes(),
+            )
+            .map_err(|e| Refusal::invalid(e.to_string()))?;
+            let manifest = input
+                .manifest()
+                .map_err(|e| Refusal::invalid(e.to_string()))?;
+            if request.program_manifest != manifest.canonical_bytes() {
                 return Err(Refusal::invalid(
-                    "object is outside the signed proposal's closure",
+                    "manifest differs from accepted invocation",
                 ));
+            }
+            let objects = crate::job::content_closure(
+                &policy,
+                &manifest,
+                &request.program_root,
+                authorization.input_content,
+            )?;
+            if !objects.contains(&object) {
+                return Err(Refusal::invalid("object is outside the accepted closure"));
             }
             return Ok(object.bytes());
         }
@@ -103,23 +117,81 @@ impl ProviderEndpoint {
             .admitting()
             .map_err(|error| Refusal::new(endpoint_refusal(error), error.to_string()))?
             .clone();
-        let policy = ready.work_policy();
-        if object.bytes() > u64::from(policy.max_encoded_prepared_input()) {
-            return Err(Refusal::invalid(
-                "prepared input exceeds its encoded byte limit",
-            ));
-        }
-        policy.check_authorization(
-            ready.channel(),
-            ready.payment_policy(),
-            &authorization,
-            self.state().cursor().0,
-        )?;
+        let policy = ready.invocation_policy();
+        let preflight = (|| -> Result<Vec<ContentRef>, Refusal> {
+            if request.program_manifest.len() > 4096 {
+                return Err(Refusal::invalid("manifest exceeds metadata bound"));
+            }
+            let manifest =
+                hellas_rpc::ProgramManifest::from_canonical_bytes(&request.program_manifest)
+                    .map_err(|e| Refusal::invalid(e.to_string()))?;
+            if manifest.content_id() != authorization.environment_commitment {
+                return Err(Refusal::invalid("manifest differs from signed environment"));
+            }
+            let facts = policy
+                .classify_manifest(&manifest)
+                .map_err(|e| Refusal::invalid(e.to_string()))?;
+            if authorization.retention != facts.retention
+                || authorization.input_content.bytes() > u64::from(facts.max_encoded_prepared_input)
+            {
+                return Err(Refusal::invalid(
+                    "input retention or length differs from admitted manifest",
+                ));
+            }
+            crate::job::check_authorization(
+                ready.channel(),
+                &authorization,
+                policy,
+                ready.payment_policy(),
+                self.state().cursor().0,
+            )?;
+            if request.program_root.len() > crate::content::MAX_PROGRAM_ROOT_BYTES {
+                return Err(Refusal::invalid("program root exceeds metadata bound"));
+            }
+            let objects = crate::job::content_closure(
+                policy,
+                &manifest,
+                &request.program_root,
+                authorization.input_content,
+            )?;
+            if !objects.contains(&object) {
+                return Err(Refusal::invalid(
+                    "object is outside the signed proposal's closure",
+                ));
+            }
+            Ok(objects)
+        })();
+        let objects = preflight?;
         ready.check_signable(
             self.state().cursor().0,
             authorization.terminal_deadline,
             authorization.payment_deadline,
         )?;
+        self.close
+            .store
+            .uploads
+            .declare_closure(
+                id,
+                &objects,
+                authorization.acceptance_deadline,
+                authorization.retention,
+                policy.limits.max_upload_bytes,
+            )
+            .map_err(content_refusal)?;
+        if !request.program_root.is_empty() {
+            self.close
+                .store
+                .uploads
+                .stage_complete(
+                    id,
+                    ContentRef::for_bytes(&request.program_root),
+                    authorization.acceptance_deadline,
+                    authorization.retention,
+                    policy.limits.max_upload_bytes,
+                    &request.program_root,
+                )
+                .map_err(content_refusal)?;
+        }
         let next = self
             .close
             .store
@@ -128,27 +200,38 @@ impl ProviderEndpoint {
                 id,
                 object,
                 authorization.acceptance_deadline,
-                policy.max_upload_bytes(),
+                authorization.retention,
+                policy.limits.max_upload_bytes,
                 request.offset,
                 &request.chunk,
             )
             .map_err(content_refusal)?;
-        if next == object.bytes() {
+        if next == object.bytes() && object == authorization.input_content {
             let bytes = self
                 .close
                 .store
                 .uploads
-                .read(id, object)
+                .read(id, object, authorization.retention)
                 .map_err(content_refusal)?;
-            let result = PreparedWorkBundle::decode(&bytes, crate::content::MAX_CONTENT_BYTES)
-                .map_err(|error| Refusal::invalid(error.to_string()))
-                .and_then(|input| {
-                    policy
-                        .check_input(ready.channel(), &authorization, &input)
+            let result =
+                PreparedInvocation::from_canonical_bytes(&bytes, crate::content::MAX_CONTENT_BYTES)
+                    .map_err(|error| Refusal::invalid(error.to_string()))
+                    .and_then(|input| {
+                        crate::job::check_paid_input(
+                            ready.channel(),
+                            &authorization,
+                            policy,
+                            &input,
+                        )
+                        .map(|_| ())
                         .map_err(Refusal::from)
-                });
+                    });
             if let Err(error) = result {
-                self.close.store.uploads.clear().map_err(content_refusal)?;
+                self.close
+                    .store
+                    .uploads
+                    .discard(id)
+                    .map_err(content_refusal)?;
                 return Err(error);
             }
         }
@@ -187,6 +270,7 @@ pub(super) async fn send_proposal<T>(
     transport: T,
     endpoint: &mut impl ClientChannel,
     request: AcceptWorkRequest,
+    content: &crate::content::InvocationContent,
 ) -> Result<Digest, ProposeError>
 where
     T: StreamTransport + Sync,
@@ -200,69 +284,103 @@ where
     let reference = decode_reference(&request.prepared_input)
         .ok_or(ProposeError::Malformed("input reference"))?;
     let authorization = PaidJobAuthorizationV2::decode(&request.authorization)?;
-    let id = {
+    let (id, prepared_bytes) = {
         let client = endpoint.client().await?;
-        work_id(client.state().channel(), &authorization)
+        let id = work_id(client.state().channel(), &authorization);
+        let bytes = client
+            .state()
+            .job_by_id(id)
+            .ok_or(ProposeError::NoOpenJob)?
+            .prepared_input()
+            .to_vec();
+        (id, bytes)
     };
+    let prepared = PreparedInvocation::from_canonical_bytes(
+        &prepared_bytes,
+        crate::content::MAX_CONTENT_BYTES,
+    )
+    .map_err(PaidWorkError::from)?;
+    let manifest = prepared.manifest().map_err(PaidWorkError::from)?;
+    let policy = hellas_rpc::protocol::invocation::InvocationPolicy::from_canonical_bytes(
+        prepared.application_policy.as_bytes(),
+    )
+    .map_err(PaidWorkError::from)?;
+    // The application decides whether an opening is needed; unrelated cached
+    // objects must not change a self-contained program's upload.
+    let program_root = if policy.content_closure(&manifest, &[]).is_ok() {
+        Vec::new()
+    } else {
+        match content.read_bounded(
+            manifest.root(),
+            crate::content::MAX_PROGRAM_ROOT_BYTES as u64,
+        ) {
+            Ok(bytes) => bytes.as_ref().clone(),
+            Err(crate::content::ContentError::Missing) => Vec::new(),
+            Err(error) => return Err(error.into()),
+        }
+    };
+    let objects = crate::job::content_closure(&policy, &manifest, &program_root, reference)?;
     let client = WorkClientImpl::new(transport);
-    let mut offset = 0_u64;
-    let mut probing = true;
-    loop {
-        let (chunk, chunk_signature) = {
-            let endpoint = endpoint.client().await?;
-            let bytes = endpoint
-                .state()
-                .job_by_id(id)
-                .ok_or(ProposeError::NoOpenJob)?
-                .prepared_input();
+    for object in objects {
+        let mut offset = 0u64;
+        let mut probing = true;
+        loop {
             let chunk = if probing {
                 Vec::new()
-            } else {
-                bytes
-                    .get(offset as usize..(offset as usize + CONTENT_CHUNK_BYTES).min(bytes.len()))
+            } else if object == reference {
+                let end = (offset as usize + CONTENT_CHUNK_BYTES).min(prepared_bytes.len());
+                prepared_bytes
+                    .get(offset as usize..end)
                     .ok_or(ProposeError::Malformed("upload offset"))?
                     .to_vec()
+            } else {
+                content.read_chunk(object, offset, CONTENT_CHUNK_BYTES)?
             };
-            let signature = endpoint.signer.sign(signing_hash(chunk_digest(
-                authorization.channel_id,
-                id,
-                reference,
-                offset,
-                &chunk,
-                &exporter,
-            )));
-            (chunk, signature)
-        };
-        let end = offset + chunk.len() as u64;
-        let uploaded = client
-            .upload_content(UploadContentRequest {
-                route: request.route.clone(),
-                authorization: request.authorization.clone(),
-                client_signature: request.client_signature.clone(),
-                content_id: reference.id().as_bytes().to_vec(),
-                total_bytes: reference.bytes(),
-                offset,
-                chunk,
-                chunk_signature: chunk_signature.as_bytes().to_vec(),
-            })
-            .await?;
-        if let Some(refusal) = uploaded.refused {
-            return endpoint
+            let chunk_signature = endpoint
                 .client()
                 .await?
-                .accepted(&AcceptWorkResponse {
-                    outcome: Some(Outcome::Refused(refusal)),
+                .signer
+                .sign(signing_hash(chunk_digest(
+                    authorization.channel_id,
+                    id,
+                    object,
+                    offset,
+                    &chunk,
+                    &exporter,
+                )));
+            let end = offset + chunk.len() as u64;
+            let uploaded = client
+                .upload_content(UploadContentRequest {
+                    route: request.route.clone(),
+                    authorization: request.authorization.clone(),
+                    client_signature: request.client_signature.clone(),
+                    program_manifest: manifest.canonical_bytes(),
+                    program_root: program_root.clone(),
+                    content_id: object.id().as_bytes().to_vec(),
+                    total_bytes: object.bytes(),
+                    offset,
+                    chunk,
+                    chunk_signature: chunk_signature.as_bytes().to_vec(),
                 })
-                .await;
+                .await?;
+            if let Some(refusal) = uploaded.refused {
+                return endpoint
+                    .client()
+                    .await?
+                    .accepted(&AcceptWorkResponse {
+                        outcome: Some(Outcome::Refused(refusal)),
+                    })
+                    .await;
+            }
+            if uploaded.next_offset > object.bytes() || (!probing && uploaded.next_offset < end) {
+                return Err(ProposeError::Malformed("upload offset"));
+            }
+            if uploaded.next_offset == object.bytes() {
+                break;
+            }
+            offset = uploaded.next_offset;
+            probing = false;
         }
-        if uploaded.next_offset > reference.bytes() || (!probing && uploaded.next_offset < end) {
-            return Err(ProposeError::Malformed("upload offset"));
-        }
-        if uploaded.next_offset == reference.bytes() {
-            break;
-        }
-        offset = uploaded.next_offset;
-        probing = false;
     }
     let response = client.accept_work(request).await?;
     endpoint.client().await?.accepted(&response).await

@@ -6,7 +6,7 @@ use bytes::Bytes;
 use futures::StreamExt as _;
 use hellas_executor::FetchRoute;
 use hellas_executor::{FetchRouteEntry, FetchRoutePolicy};
-use hellas_rpc::pb::work::{DeliverResultRequest, WorkStreamEvent};
+use hellas_rpc::pb::work::{StreamResultRequest, WorkStreamEvent};
 use hellas_rpc::services::work::StreamResult;
 use hellas_wire::mux::{MessagePipe, MuxConfig, MuxTransport, Role};
 use hellas_wire::{DefaultClock, Metadata};
@@ -158,7 +158,7 @@ impl Dispatcher<MuxTransport> for SlowStream {
     ) -> Result<(), Self::Error> {
         hellas_rpc::call::dispatch_server_streaming::<MuxTransport, StreamResult, _, _, _>(
             inbound,
-            |_: DeliverResultRequest| async {
+            |_: StreamResultRequest| async {
                 Ok(hellas_rpc::call::ResponseStream::new(
                     async_stream::stream! {
                         yield Ok(WorkStreamEvent::default());
@@ -199,7 +199,7 @@ async fn quiescing_finishes_an_active_response_before_closing_the_session() {
     let serving = tokio::spawn(serve_loop(Arc::new(server), SlowStream, stopping));
     let mut response = hellas_rpc::call::server_streaming::<_, StreamResult>(
         &client,
-        DeliverResultRequest::default(),
+        StreamResultRequest::default(),
         Metadata::new(),
     )
     .await
@@ -226,7 +226,7 @@ async fn paid_stream_outlives_the_idle_limit_but_idle_connections_close() {
         let started = Instant::now();
         let mut response = hellas_rpc::call::server_streaming::<_, StreamResult>(
             &client,
-            DeliverResultRequest::default(),
+            StreamResultRequest::default(),
             Metadata::new(),
         )
         .await
@@ -349,7 +349,7 @@ async fn cheap_streams_cannot_extend_the_connection_lifetime() {
     loop {
         let mut response = match hellas_rpc::call::server_streaming::<_, StreamResult>(
             &client,
-            DeliverResultRequest::default(),
+            StreamResultRequest::default(),
             Metadata::new(),
         )
         .await

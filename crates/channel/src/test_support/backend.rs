@@ -91,6 +91,14 @@ impl Reply {
     }
 }
 
+pub type ContentInspection = Arc<
+    dyn Fn(
+            &hellas_rpc::protocol::invocation::PreparedInvocation,
+            &crate::content::InvocationContent,
+        ) + Send
+        + Sync,
+>;
+
 /// One signed Fetch backend; replies, completion gates and cancellation remain explicit.
 #[derive(Clone)]
 pub struct Backend {
@@ -105,6 +113,7 @@ pub struct Backend {
     pub stop_on_cancel: bool,
     pub reply: Reply,
     pub inspect: Option<fn(&FetchInput)>,
+    pub inspect_content: Option<ContentInspection>,
     pub signer: Arc<hellas_auth::ProducerSigningKey>,
 }
 impl Default for Backend {
@@ -120,142 +129,148 @@ impl Default for Backend {
             stop_on_cancel: false,
             reply: Reply::text("private-grant-result", 1),
             inspect: None,
+            inspect_content: None,
             signer: Arc::new(principal(2).1),
         }
     }
 }
 impl WorkBackend for Backend {
+    async fn execute(
+        &self,
+        input: Admitted<hellas_rpc::protocol::invocation::PreparedInvocation>,
+    ) -> Result<Vec<hellas_rpc::OutputEventEnvelope>, BackendFault> {
+        self.execute_stream(input, Arc::new(|_| Ok(()))).await
+    }
     async fn execute_stream(
         &self,
-        prepared: crate::work::PreparedWorkInput,
-        progress: crate::work::PaidProgress,
-    ) -> Result<Vec<hellas_rpc::OutputEventEnvelope>, crate::work::BackendFault> {
-        match prepared {
-            crate::work::PreparedWorkInput::Evaluate(input) => {
-                let input = *input;
-
-                use hellas_rpc::evaluate::*;
-                let (parts, admission) = input.into_parts_and_admission();
-                let _running = admission
-                    .reserve(CapacityDomain::Gpu, async {
-                        self.try_admit(CapacityDomain::Gpu)
-                    })
-                    .await?
-                    .dispatch()
-                    .await?;
-                self.calls.fetch_add(1, Ordering::SeqCst);
-                let mut output = EvaluateOutputTranscriptBuilder::new(
-                    input_commitment(&parts.evaluate_request),
-                    parts.evaluate_request.assurance,
-                    &self.signer,
-                );
-                progress(output.push_token_delta(vec![0]).unwrap())?;
+        prepared: Admitted<hellas_rpc::protocol::invocation::PreparedInvocation>,
+        progress: PaidProgress,
+    ) -> Result<Vec<hellas_rpc::OutputEventEnvelope>, BackendFault> {
+        use hellas_rpc::protocol::invocation::{
+            fetch as invocation_fetch, output as invocation_output,
+        };
+        let domain = prepared.capacity_domain();
+        let (prepared, limits, content, admission) = prepared.into_parts_and_admission();
+        if let Some(queued) = &self.queued {
+            queued.notified().await;
+        }
+        let running = admission
+            .reserve(domain, async { self.try_admit(domain) })
+            .await?
+            .dispatch()
+            .await?;
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(inspect) = &self.inspect_content {
+            inspect(&prepared, &content);
+        }
+        let mut stream = invocation_output::OutputStream::new(
+            &prepared.request,
+            &self.signer,
+            limits.max_output_bytes as usize,
+        )
+        .unwrap();
+        let output = if domain == CapacityDomain::Gpu {
+            let output = invocation_output::InvocationOutput {
+                outcome: invocation_output::Outcome::Succeeded,
+                artifacts: vec![hellas_rpc::protocol::invocation::Artifact::new(
+                    "answer",
+                    "catena.bytes.v1",
+                    vec![0],
+                )],
+                metadata: hellas_rpc::JsonBytes(
+                    hellas_rpc::protocol::value::canonical_dag_cbor(
+                        &hellas_rpc::protocol::invocation::compute::RunMetadata {
+                            steps: 0,
+                            stop: None,
+                        },
+                    )
+                    .unwrap(),
+                ),
+            };
+            progress(stream.push("answer", "catena.bytes.v1", 0, &[0]).unwrap())?;
+            output
+        } else {
+            let artifact = &prepared.input.artifacts[0];
+            let events: Vec<hellas_rpc::InputEventEnvelope> =
+                hellas_rpc::protocol::value::decode_canonical_dag_cbor(artifact.bytes.as_bytes())
+                    .unwrap();
+            let request = verify_input_events(&events).unwrap();
+            if let Some(inspect) = self.inspect {
+                inspect(&request);
+            }
+            let Reply::Events {
+                prefixes,
+                replacement,
+            } = &self.reply
+            else {
                 self.started.notify_one();
                 self.finish.wait().await;
-                let usage = EvaluateUsage {
-                    input_units: parts.prompt_tokens.as_slice().len() as u64,
-                    output_units: 1,
-                };
-                Ok(output
-                    .finish(EvaluateTerminal {
-                        final_position: 1,
-                        stop_reason: EvaluateStopReason::MAX_OUTPUT,
-                        matched_stop_token_id: None,
-                        text_artifact: hellas_auth::Digest::hash(b"test native result"),
-                        usage,
-                        billable_units: usage.billable_units().unwrap(),
-                    })
-                    .unwrap())
-            }
-            crate::work::PreparedWorkInput::Fetch(input) => {
-                let input = *input;
-
-                let (parts, admission) = input.into_parts_and_admission();
-                if let Some(queued) = &self.queued {
-                    queued.notified().await;
-                }
-                let running = admission
-                    .reserve(CapacityDomain::Fetch, async {
-                        self.try_admit(CapacityDomain::Fetch)
-                    })
-                    .await?
-                    .dispatch()
-                    .await?;
-                let Reply::Events {
-                    prefixes,
-                    replacement,
-                } = &self.reply
-                else {
-                    self.started.notify_one();
-                    self.finish.wait().await;
-                    assert!(
-                        !matches!(self.reply, Reply::Failure { panic: true }),
-                        "backend fixture panic"
-                    );
-                    return Err(BackendFault::caused_by(std::io::Error::other(
-                        "backend fixture stopped",
-                    )));
-                };
-                self.calls.fetch_add(1, Ordering::SeqCst);
-                let request = verify_input_events(&parts.fetch_input_transcript).unwrap();
-                if let Some(inspect) = self.inspect {
-                    inspect(&request);
-                }
-                let key = self.signer.clone();
-                let mut output = FetchOutputTranscriptBuilder::new(
-                    request.input_commitment,
-                    request.assurance,
-                    &key,
+                assert!(
+                    !matches!(self.reply, Reply::Failure { panic: true }),
+                    "backend fixture panic"
                 );
-                for (index, event) in prefixes.iter().enumerate() {
-                    if index > 0
-                        && let Some(pace) = &self.pace
-                    {
-                        pace.wait().await;
-                    }
-                    progress(
-                        output
-                            .push_event(encode_fetch_event_payload(event).unwrap())
-                            .unwrap(),
-                    )?;
+                return Err(BackendFault::caused_by(std::io::Error::other(
+                    "backend fixture stopped",
+                )));
+            };
+            let mut offset = 0;
+            let mut payloads = Vec::new();
+            for (index, event) in prefixes.iter().enumerate() {
+                if index > 0
+                    && let Some(pace) = &self.pace
+                {
+                    pace.wait().await;
                 }
-                self.started.notify_one();
-                if matches!(self.finish, Completion::Notified(_)) {
-                    tokio::select! {
-                        () = self.finish.wait() => {},
-                        () = running.cancelled() => {
-                            self.cancelled.notify_one();
-                            // Physical teardown still owns its permit after the cancellation signal.
-                            self.finish.wait().await;
-                            if self.stop_on_cancel { return Err(AdmissionError::Cancelled.into()); }
-                        }
-                    }
-                } else {
-                    self.finish.wait().await;
-                }
-                if let Some(events) = replacement {
-                    output = FetchOutputTranscriptBuilder::new(
-                        request.input_commitment,
-                        request.assurance,
-                        &key,
-                    );
-                    for event in events {
-                        output
-                            .push_event(encode_fetch_event_payload(event).unwrap())
-                            .unwrap();
-                    }
-                }
-                Ok(output
-                    .finish(
-                        encode_fetch_terminal_payload(&OutputEvent::Finished {
-                            stop_reason: StopReason::EndOfText,
-                            usage: None,
-                        })
+                let payload = encode_fetch_event_payload(event).unwrap();
+                let bytes = invocation_fetch::frame_event(&payload).unwrap();
+                progress(
+                    stream
+                        .push(
+                            invocation_fetch::RESPONSE_EVENTS,
+                            invocation_fetch::RESPONSE_EVENTS_FORMAT,
+                            offset,
+                            &bytes,
+                        )
                         .unwrap(),
-                    )
-                    .unwrap())
+                )?;
+                offset += bytes.len() as u64;
+                payloads.push(payload);
             }
+            if let Some(events) = replacement {
+                payloads = events
+                    .iter()
+                    .map(|event| encode_fetch_event_payload(event).unwrap())
+                    .collect();
+                stream = invocation_output::OutputStream::new(
+                    &prepared.request,
+                    &self.signer,
+                    limits.max_output_bytes as usize,
+                )
+                .unwrap();
+            }
+            invocation_fetch::output(
+                &payloads,
+                &encode_fetch_terminal_payload(&OutputEvent::Finished {
+                    stop_reason: StopReason::EndOfText,
+                    usage: None,
+                })
+                .unwrap(),
+            )
+            .unwrap()
+        };
+        self.started.notify_one();
+        if matches!(self.finish, Completion::Notified(_)) {
+            tokio::select! {
+                () = self.finish.wait() => {},
+                () = running.cancelled() => {
+                    self.cancelled.notify_one(); self.finish.wait().await;
+                    if self.stop_on_cancel { return Err(AdmissionError::Cancelled.into()); }
+                }
+            }
+        } else {
+            self.finish.wait().await;
         }
+        Ok(stream.finish(&output, 1024).unwrap())
     }
 
     fn try_admit(&self, domain: CapacityDomain) -> Result<WorkPermit, BackendFault> {

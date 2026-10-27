@@ -26,13 +26,6 @@ impl Refusable for AcceptWorkResponse {
         }
     }
 }
-impl Refusable for DeliverResultResponse {
-    fn refused(refusal: WorkRefused) -> Self {
-        Self {
-            outcome: Some(deliver_result_response::Outcome::Refused(refusal)),
-        }
-    }
-}
 impl Refusable for AdmitCertificateResponse {
     fn refused(refusal: WorkRefused) -> Self {
         Self {

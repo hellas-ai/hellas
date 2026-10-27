@@ -17,7 +17,7 @@ async fn fixture_clock(
 ) -> (GrantService, GrantWork, AcceptWorkRequest, Vec<u8>) {
     let (store, secret) = common::setup_with_credential(root).await;
     let (a, signature, input) = common::proposal(&store, 1);
-    let bytes = input.encode().unwrap();
+    let bytes = input.canonical_bytes().unwrap();
     let request = AcceptWorkRequest {
         route: Some(WorkRoute::grant(a.channel_id.0)),
         authorization: a.encode(),
@@ -64,6 +64,22 @@ fn signed(
         ))
         .unwrap();
     UploadContentRequest {
+        program_root: hellas_rpc::protocol::invocation::PreparedInvocation::from_canonical_bytes(
+            &request.prepared_input,
+            hellas_channel::content::MAX_CONTENT_BYTES,
+        )
+        .ok()
+        .map(|input| hellas_channel::test_support::channel::program_root(&input))
+        .unwrap_or_default(),
+        program_manifest:
+            hellas_rpc::protocol::invocation::PreparedInvocation::from_canonical_bytes(
+                &request.prepared_input,
+                hellas_channel::content::MAX_CONTENT_BYTES,
+            )
+            .unwrap()
+            .manifest()
+            .unwrap()
+            .canonical_bytes(),
         route: request.route.clone(),
         authorization: request.authorization.clone(),
         client_signature: request.client_signature.clone(),
@@ -151,6 +167,7 @@ async fn an_idle_partial_grant_upload_expires_without_another_request_or_mutatio
             Digest::hash(b"work"),
             ContentRef::for_bytes(&all),
             50,
+            hellas_rpc::Retention::Ephemeral,
             all.len() as u64,
             0,
             &[],
@@ -199,7 +216,7 @@ async fn grant_and_paid_handlers_share_quota_and_drain_releases_ephemeral_stagin
         .unwrap(),
     );
     paid.set_upload_quota(quota.clone()).await.unwrap();
-    let a = hellas_channel::model::work::propose_authorization(
+    let a = hellas_channel::job::propose(
         ready.channel(),
         &paid::work_policy(),
         &paid::payment_policy(),
@@ -270,6 +287,7 @@ async fn grant_and_paid_handlers_share_quota_and_drain_releases_ephemeral_stagin
             Digest::hash(b"work"),
             ContentRef::for_bytes(&entire_cap),
             50,
+            hellas_rpc::Retention::Ephemeral,
             entire_cap.len() as u64,
             0,
             &entire_cap,

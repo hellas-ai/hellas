@@ -37,7 +37,7 @@ async fn start(directory: &std::path::Path, backend: Backend) -> (GrantService, 
             route: Some(WorkRoute::grant(authorization.channel_id.0)),
             authorization: authorization.encode(),
             client_signature: signature.bytes().to_vec(),
-            prepared_input: input.encode().unwrap(),
+            prepared_input: input.canonical_bytes().unwrap(),
         },
         &common::principal(1).1,
     )

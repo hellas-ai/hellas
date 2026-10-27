@@ -251,22 +251,22 @@ impl<F: Funding> JobBook<F> {
         };
         Ok(Applied::Changed)
     }
-    pub(in crate::work_store) fn mark_matched(
+    pub(in crate::work_store) fn mark_verified(
         &mut self,
         id: Digest,
     ) -> Result<Applied, ChannelStateError> {
-        let job = self.open_job_mut(id, "recording a reproduction match")?;
+        let job = self.open_job_mut(id, "recording a verified result")?;
         match job.phase {
-            JobPhase::Matched => return Ok(Applied::Redundant),
+            JobPhase::Verified => return Ok(Applied::Redundant),
             JobPhase::Ready => {}
             phase => {
                 return Err(ChannelStateError::WrongPhase {
-                    step: "recording a reproduction match",
+                    step: "recording a verified result",
                     phase: phase.name(),
                 });
             }
         }
-        job.phase = JobPhase::Matched;
+        job.phase = JobPhase::Verified;
         Ok(Applied::Changed)
     }
     pub(in crate::work_store) fn release(

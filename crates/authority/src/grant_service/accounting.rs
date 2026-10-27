@@ -1,44 +1,46 @@
-//! Meter only a fully verified transcript. Unknown Fetch usage settles at the
-//! signed reserve; native Evaluate's terminal supplies exact token counts.
+//! Meter only fully verified application output. Generic invocations cost one request.
 use crate::model::grant::{
     budget::{Charge, Meter, Usage},
     records::GrantPolicy,
 };
 use crate::model::http_usage::{AccountingProfile, Mode, UsageDecoder};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use hellas_channel::model::profile::WorkPolicy;
-use hellas_rpc::OutputEventEnvelope;
 use hellas_rpc::output::{AdaptorEvent, HttpResponseEvent, OutputEvent};
-use std::time::Duration;
+use hellas_rpc::protocol::invocation::output::InvocationOutput;
 
 pub(super) fn usage(
     policy: &GrantPolicy,
-    events: &[OutputEventEnvelope],
-    elapsed: Option<Duration>,
+    domain: hellas_rpc::protocol::invocation::CapacityDomain,
+    input: &hellas_rpc::protocol::invocation::PreparedInvocation,
+    output: &InvocationOutput,
+    provider: &hellas_auth::PublicKey,
 ) -> Usage {
-    observed(policy, events, elapsed).map_or(Usage::Unknown, Usage::Observed)
+    observed(policy, domain, input, output, provider).map_or(Usage::Unknown, Usage::Observed)
 }
 fn observed(
     policy: &GrantPolicy,
-    events: &[OutputEventEnvelope],
-    elapsed: Option<Duration>,
+    domain: hellas_rpc::protocol::invocation::CapacityDomain,
+    input: &hellas_rpc::protocol::invocation::PreparedInvocation,
+    output: &InvocationOutput,
+    provider: &hellas_auth::PublicKey,
 ) -> Option<Charge> {
     let mut charge = Charge::default();
     charge.set(Meter::Requests, 1);
-    if matches!(policy.work, WorkPolicy::Evaluate(_)) {
-        let terminal =
-            hellas_rpc::evaluate::decode_terminal_payload(events.last()?.payload()).ok()?;
-        charge.set(Meter::InputTokens, terminal.usage.input_units);
-        charge.set(Meter::OutputTokens, terminal.usage.output_units);
-        charge.set(
-            Meter::DeviceMillis,
-            elapsed?.as_millis().min(u128::from(u64::MAX)) as u64,
-        );
+    if domain == hellas_rpc::protocol::invocation::CapacityDomain::Gpu {
         return Some(charge);
     }
-    if policy.responses.is_some() {
+    let parameters = hellas_rpc::protocol::invocation::fetch::Parameters::from_canonical_bytes(
+        input.input.parameters.as_bytes(),
+    )
+    .ok()?;
+    if policy.responses.is_none() && policy.https.is_none() {
+        return Some(charge);
+    }
+    let output = hellas_rpc::protocol::invocation::fetch::decode_output(output, provider).ok()?;
+    let (events, terminal) = output.output_event_payloads();
+    if parameters.contract.schema() == hellas_rpc::FetchSchema::StatelessResponsesV1 {
         let hellas_rpc::fetch::FetchTerminalPayload::Finished { usage, .. } =
-            hellas_rpc::fetch::decode_fetch_terminal_payload(events.last()?.payload()).ok()?;
+            hellas_rpc::fetch::decode_fetch_terminal_payload(terminal).ok()?;
         let usage = usage?;
         let output = usage.output_tokens?;
         if let Some(total) = usage.total_tokens
@@ -52,19 +54,14 @@ fn observed(
         charge.set(Meter::OutputTokens, output);
         return Some(charge);
     }
-    let Some(resource) = &policy.https else {
-        return Some(charge);
-    };
+    let resource = policy.https.as_ref()?;
     if resource.accounting == AccountingProfile::None {
         return Some(charge);
     }
     let mut decoder = UsageDecoder::new(Mode::Strict(resource.accounting), None, None);
     let mut head = false;
     for event in events {
-        if event.event().body().kind() != hellas_rpc::fetch::OUTPUT_EVENT_KIND {
-            continue;
-        }
-        match hellas_rpc::fetch::decode_fetch_event_payload(event.payload()).ok()? {
+        match hellas_rpc::fetch::decode_fetch_event_payload(event).ok()? {
             OutputEvent::Adaptor(AdaptorEvent::Http(HttpResponseEvent::Head {
                 status: _,
                 headers,
@@ -101,24 +98,45 @@ fn observed(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hellas_auth::Digest;
-    use hellas_rpc::{Assurance, InputCommitment, fetch::FetchOutputTranscriptBuilder};
+    use hellas_rpc::Assurance;
 
-    fn transcript(usage: Option<hellas_rpc::output::Usage>) -> Vec<OutputEventEnvelope> {
-        let key = hellas_channel::test_support::principal(2).1;
-        FetchOutputTranscriptBuilder::new(
-            InputCommitment::from_digest(Digest::hash(b"accounting fixture")),
+    fn transcript(usage: Option<hellas_rpc::output::Usage>) -> InvocationOutput {
+        let terminal = hellas_rpc::fetch::encode_fetch_terminal_payload(&OutputEvent::Finished {
+            stop_reason: hellas_rpc::output::StopReason::EndOfText,
+            usage,
+        })
+        .unwrap();
+        hellas_rpc::protocol::invocation::fetch::output(&[], &terminal).unwrap()
+    }
+    fn metered(policy: &GrantPolicy, output: &InvocationOutput) -> Usage {
+        let key = hellas_channel::test_support::principal(1).1;
+        let contract = hellas_channel::test_support::test_responses_contract();
+        let events = hellas_rpc::fetch::build_input_events_with_retention(
+            "openai",
+            "responses",
+            b"{}",
+            contract.manifest_id(),
             Assurance::ProducerSigned,
             &key,
+            hellas_rpc::Retention::Ephemeral,
         )
-        .finish(
-            hellas_rpc::fetch::encode_fetch_terminal_payload(&OutputEvent::Finished {
-                stop_reason: hellas_rpc::output::StopReason::EndOfText,
-                usage,
-            })
-            .unwrap(),
+        .unwrap();
+        let provider = hellas_channel::test_support::principal(2).1.public_key();
+        let input = hellas_rpc::protocol::invocation::fetch::prepare(
+            &events,
+            &contract,
+            provider,
+            policy.invocation_policy.canonical_bytes().unwrap(),
+            [1; 32],
         )
-        .unwrap()
+        .unwrap();
+        super::usage(
+            policy,
+            hellas_rpc::protocol::invocation::CapacityDomain::Fetch,
+            &input,
+            output,
+            &provider,
+        )
     }
 
     #[test]
@@ -133,7 +151,7 @@ mod tests {
                 total_tokens: None,
             }));
             assert_eq!(
-                usage(&policy, &events, None),
+                metered(&policy, &events),
                 Usage::Observed(Charge([1, 0, output, 0, 0]))
             );
         }
@@ -143,10 +161,20 @@ mod tests {
             total_tokens: Some(5),
         }));
         assert_eq!(
-            usage(&policy, &events, None),
+            metered(&policy, &events),
             Usage::Observed(Charge([1, 0, 2, 0, 0]))
         );
-        assert_eq!(usage(&policy, &[], None), Usage::Unknown);
+        assert_eq!(
+            metered(
+                &policy,
+                &InvocationOutput {
+                    outcome: hellas_rpc::protocol::invocation::output::Outcome::Succeeded,
+                    artifacts: vec![],
+                    metadata: hellas_rpc::JsonBytes(vec![])
+                }
+            ),
+            Usage::Unknown
+        );
     }
 
     #[test]
@@ -175,7 +203,7 @@ mod tests {
                 total_tokens: Some(1),
             }),
         ] {
-            assert_eq!(usage(&policy, &transcript(observed), None), Usage::Unknown);
+            assert_eq!(metered(&policy, &transcript(observed)), Usage::Unknown);
         }
     }
 }

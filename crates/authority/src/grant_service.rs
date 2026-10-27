@@ -11,22 +11,19 @@ use crate::model::grant::{
 use futures::{FutureExt, future::BoxFuture};
 use hellas_auth::authority::UnixMillis;
 use hellas_auth::{Digest, ProducerSigningKey, PublicKey, Signature};
-use hellas_channel::model::profile::{PreparedWorkInput, WorkContext};
+use hellas_channel::job::WorkContext;
 use hellas_channel::model::work::{PrivateRecord, bound_result_digest, encode_transcript};
 use hellas_channel::work::admission::{CapacityDomain, WorkAdmission, WorkPermit};
-use hellas_channel::work::{
-    BackendFault, PaidProgress, PaidResultStream, PreparedEvaluateInput, PreparedFetchInput,
-    WorkBackend,
-};
+use hellas_channel::work::{Admitted, BackendFault, PaidProgress, PaidResultStream, WorkBackend};
 use hellas_rpc::OutputEventEnvelope;
 use hellas_rpc::pb::work::Refusable;
 use hellas_rpc::pb::work::{
     AcceptWorkRequest, AcceptWorkResponse, AdmitCertificateRequest, AdmitCertificateResponse,
-    DeliverResultRequest, DeliverResultResponse, GetStandingRequest, GetStandingResponse,
-    GrantRefusal, GrantRefusalCode, GrantTerminalMetadata, GrantTerminalState, WorkAccepted,
-    WorkDelivered, WorkRefused, WorkRoute, WorkStreamEvent, WorkStreamTerminal,
-    accept_work_response, deliver_result_response, get_standing_response, work_stream_event,
+    GetStandingRequest, GetStandingResponse, GrantRefusal, GrantRefusalCode, GrantTerminalMetadata,
+    GrantTerminalState, StreamResultRequest, WorkAccepted, WorkRefused, WorkRoute, WorkStreamEvent,
+    WorkStreamTerminal, accept_work_response, get_standing_response, work_stream_event,
 };
+use hellas_rpc::protocol::invocation::PreparedInvocation;
 use hellas_wire::{TransportContext, WireStatus};
 use std::{
     collections::BTreeMap,
@@ -63,8 +60,9 @@ fn transcript_ram(events: &[OutputEventEnvelope]) -> usize {
 }
 type Admit = dyn Fn(CapacityDomain) -> Result<WorkPermit, BackendFault> + Send + Sync;
 type Run = dyn Fn(
-        PreparedWorkInput,
+        PreparedInvocation,
         GrantPolicy,
+        hellas_channel::content::InvocationContent,
         WorkAdmission,
         PaidProgress,
     ) -> BoxFuture<'static, Result<Vec<OutputEventEnvelope>, BackendFault>>
@@ -92,6 +90,7 @@ struct Runtime {
 struct Live {
     authorization: GrantJobAuthorizationV1,
     policy: GrantPolicy,
+    facts: hellas_rpc::protocol::invocation::AdmissionFacts,
     cache: Arc<ResultCache>,
     prefix: cache::Prefix,
     reserved_ram: usize,
@@ -155,20 +154,14 @@ impl Runtime {
 }
 enum LivePhase {
     Queued,
-    Running { started: Instant },
+    Running,
     Completing,
-    Finished(SignedResult),
+    Finished(Box<SignedResult>),
     Refused(GrantRefusalCode),
 }
 impl LivePhase {
     fn active(&self) -> bool {
-        matches!(self, Self::Queued | Self::Running { .. } | Self::Completing)
-    }
-    fn started(&self) -> Option<Instant> {
-        match self {
-            Self::Running { started } => Some(*started),
-            _ => None,
-        }
+        matches!(self, Self::Queued | Self::Running | Self::Completing)
     }
     fn result(&self) -> Option<&SignedResult> {
         match self {
@@ -180,8 +173,6 @@ impl LivePhase {
 
 #[derive(Debug, thiserror::Error)]
 enum ExecutionError {
-    #[error("grant input does not match its execution policy")]
-    Profile,
     #[error("grant is no longer dispatchable")]
     NotDispatchable,
     #[error("grant input is missing")]
@@ -270,29 +261,25 @@ impl GrantService {
         // does not cancel the node's persistent assignments or settlement duties.
         let backend = Arc::new(backend);
         let capacity = backend.clone();
-        let run = Arc::new(move |input, policy: GrantPolicy, admission, progress| {
-            let backend = backend.clone();
-            Box::pin(async move {
-                let input = match (input, policy.work) {
-                    (PreparedWorkInput::Evaluate(input), _) => PreparedEvaluateInput::admitted(
-                        input.parts().map_err(BackendFault::caused_by)?,
+        let run = Arc::new(
+            move |input: PreparedInvocation, policy: GrantPolicy, content, admission, progress| {
+                let backend = backend.clone();
+                Box::pin(async move {
+                    let facts = policy
+                        .invocation_policy
+                        .classify_manifest(&input.manifest().map_err(BackendFault::caused_by)?)
+                        .map_err(BackendFault::caused_by)?;
+                    let input = Admitted::new(
+                        input,
+                        facts.limits,
+                        facts.capacity_domain,
+                        content,
                         admission,
-                    )
-                    .into(),
-                    (
-                        PreparedWorkInput::Fetch(input),
-                        hellas_channel::model::profile::WorkPolicy::Fetch { policy, .. },
-                    ) => PreparedFetchInput::admitted(
-                        input.parts().map_err(BackendFault::caused_by)?,
-                        policy,
-                        admission,
-                    )
-                    .into(),
-                    _ => return Err(BackendFault::caused_by(ExecutionError::Profile)),
-                };
-                backend.execute_stream(input, progress).await
-            }) as BoxFuture<'static, _>
-        });
+                    );
+                    backend.execute_stream(input, progress).await
+                }) as BoxFuture<'static, _>
+            },
+        );
         Self {
             node,
             inner: Arc::new(Mutex::new(Runtime {
@@ -443,9 +430,60 @@ impl GrantService {
                 .uploads
                 .get(&a.channel_id.0)
                 .ok_or_else(|| refused(GrantRefusalCode::Malformed))?
-                .read(id, reference)
+                .read(id, reference, hellas_rpc::Retention::Ephemeral)
                 .map_err(|_| refused(GrantRefusalCode::Malformed))?;
-            let (policy, reserve) = {
+            let policy = store.state().policy_for(&a)?.clone();
+            let input = PreparedInvocation::from_canonical_bytes(
+                &prepared_input,
+                hellas_channel::content::MAX_CONTENT_BYTES,
+            )
+            .map_err(|_| refused(GrantRefusalCode::Malformed))?;
+            let context = WorkContext {
+                network: store.state().network(),
+                channel: a.channel_id.0,
+                client: client.signer(),
+                provider: grant_producer(store.state().provider()?)
+                    .map_err(NodeStoreError::from)?,
+            };
+            let facts = hellas_channel::job::check_input(
+                &context,
+                &(&a).into(),
+                &policy.invocation_policy,
+                &input,
+            )
+            .map_err(|_| refused(GrantRefusalCode::Malformed))?;
+            let manifest = input
+                .manifest()
+                .map_err(|_| refused(GrantRefusalCode::Malformed))?;
+            let content = {
+                let held = self
+                    .inner
+                    .lock()
+                    .map_err(|_| refused(GrantRefusalCode::StorageUnavailable))?;
+                let uploads = held
+                    .uploads
+                    .get(&a.channel_id.0)
+                    .ok_or_else(|| refused(GrantRefusalCode::Malformed))?;
+                let root = uploads
+                    .root(id, manifest.root(), hellas_rpc::Retention::Ephemeral)
+                    .map_err(|_| refused(GrantRefusalCode::Malformed))?;
+                let objects = hellas_channel::job::content_closure(
+                    &policy.invocation_policy,
+                    &manifest,
+                    &root,
+                    a.input_content,
+                )
+                .map_err(|_| refused(GrantRefusalCode::Malformed))?;
+                uploads
+                    .invocation_content(id, &objects, hellas_rpc::Retention::Ephemeral)
+                    .map_err(|_| refused(GrantRefusalCode::Malformed))?
+            };
+            let reserve = input
+                .retained_heap_bytes()
+                .unwrap_or(usize::MAX)
+                .saturating_add(content.ephemeral_bytes().try_into().unwrap_or(usize::MAX))
+                .saturating_add(facts.max_spool_bytes.try_into().unwrap_or(usize::MAX));
+            {
                 let mut held = self
                     .inner
                     .lock()
@@ -458,14 +496,6 @@ impl GrantService {
                     l.phase.active()
                         || (l.authorization.delivery_deadline_ms >= now && l.cache.retained())
                 });
-                let policy = store.state().policy_for(&a)?.clone();
-                let reserve = prepared_input.len().saturating_add(
-                    policy
-                        .work
-                        .max_spool_bytes()
-                        .try_into()
-                        .unwrap_or(usize::MAX),
-                );
                 if held.live.len() >= 256
                     || held
                         .live
@@ -475,22 +505,13 @@ impl GrantService {
                 {
                     return Err(refused(GrantRefusalCode::StateCapacity));
                 }
-                (policy, reserve)
-            };
-            let domain = match policy.work {
-                hellas_channel::model::profile::WorkPolicy::Evaluate(_) => CapacityDomain::Gpu,
-                _ => CapacityDomain::Fetch,
-            };
+            }
+            let domain = facts.capacity_domain;
             let permit =
                 (self.admit)(domain).map_err(|_| refused(GrantRefusalCode::QueueCapacity))?;
             if permit.domain() != domain {
                 return Err(refused(GrantRefusalCode::QueueCapacity));
             }
-            let input = PreparedWorkInput::decode(
-                &prepared_input,
-                hellas_channel::content::MAX_CONTENT_BYTES,
-            )
-            .map_err(|_| refused(GrantRefusalCode::Malformed))?;
             let deadline = observed_at
                 .checked_add(Duration::from_millis(
                     a.terminal_deadline_ms.0.saturating_sub(now.0),
@@ -519,6 +540,7 @@ impl GrantService {
                 Live {
                     authorization: a,
                     policy: policy.clone(),
+                    facts,
                     cache,
                     prefix: Default::default(),
                     reserved_ram: reserve,
@@ -554,7 +576,6 @@ impl GrantService {
                     if job.is_none_or(|j| j.phase() != JobPhase::Accepted) {
                         return Err(BackendFault::caused_by(ExecutionError::NotDispatchable));
                     }
-                    let started = Instant::now();
                     let now = service.node.observed_time(&store);
                     let application = execution_access
                         .application(&store, now)
@@ -570,15 +591,16 @@ impl GrantService {
                         .live
                         .get_mut(&id)
                         .ok_or_else(|| BackendFault::caused_by(ExecutionError::MissingInput))?
-                        .phase = LivePhase::Running { started };
+                        .phase = LivePhase::Running;
                     Ok(())
                 });
             let service = self.clone();
             let progress_service = self.clone();
             let progress = Arc::new(move |event| progress_service.progress(id, event));
             let task = tokio::spawn(async move {
-                let execution =
-                    async { (service.run)(input.clone(), policy, admission, progress).await };
+                let execution = async {
+                    (service.run)(input.clone(), policy, content, admission, progress).await
+                };
                 let execution = std::panic::AssertUnwindSafe(execution).catch_unwind();
                 tokio::pin!(execution);
                 let output = tokio::select! {
@@ -629,6 +651,13 @@ impl GrantService {
         }
     }
     fn progress(&self, id: Digest, event: OutputEventEnvelope) -> Result<(), BackendFault> {
+        if matches!(
+            event.event().body().kind(),
+            hellas_rpc::protocol::invocation::output::TERMINAL
+                | hellas_rpc::protocol::invocation::output::FAILURE
+        ) {
+            return Ok(());
+        }
         let mut held = self
             .inner
             .lock()
@@ -637,7 +666,7 @@ impl GrantService {
             .live
             .get_mut(&id)
             .ok_or_else(|| BackendFault::caused_by(ExecutionError::MissingInput))?;
-        if !matches!(live.phase, LivePhase::Running { .. }) {
+        if !matches!(live.phase, LivePhase::Running) {
             return Err(BackendFault::caused_by(ExecutionError::NotDispatched));
         }
         if (self.node.clock)() > live.authorization.terminal_deadline_ms {
@@ -653,8 +682,8 @@ impl GrantService {
         }
         let charge = event_ram(&event);
         let next = body.bytes.saturating_add(charge);
-        if next as u64 > live.policy.work.max_spool_bytes()
-            || charge as u64 > live.policy.work.max_encoded_result_frame() as u64
+        if next as u64 > live.facts.max_spool_bytes
+            || charge as u64 > live.facts.max_encoded_result_frame as u64
         {
             return Err(BackendFault::caused_by(ExecutionError::OutputBound));
         }
@@ -669,7 +698,7 @@ impl GrantService {
     async fn finish(
         &self,
         id: Digest,
-        input: &PreparedWorkInput,
+        input: &PreparedInvocation,
         output: Result<Vec<OutputEventEnvelope>, BackendFault>,
     ) -> Result<(), NodeStoreError> {
         let mut store = self.node.writer().await?;
@@ -699,11 +728,13 @@ impl GrantService {
             } else {
                 None
             };
-            let usage = verified.as_ref().map_or(Usage::Unknown, |(events, _)| {
+            let usage = verified.as_ref().map_or(Usage::Unknown, |(_, _, output)| {
                 accounting::usage(
                     &live.policy,
-                    events,
-                    live.phase.started().map(|s| s.elapsed()),
+                    live.facts.capacity_domain,
+                    input,
+                    output,
+                    &input.request.runner_public_key,
                 )
             });
             // Seal progress before persistence, without holding the RAM lock over I/O.
@@ -724,12 +755,15 @@ impl GrantService {
                 .finish(
                     a.channel_id,
                     id,
-                    if completion.is_some() {
+                    if completion.as_ref().is_some_and(|(_, signed, _)| {
+                        signed.result.outcome
+                            == hellas_channel::model::work::ResultOutcome::Finished
+                    }) {
                         GrantOutcome::Finished
                     } else {
                         GrantOutcome::Failed
                     },
-                    completion.as_ref().map(|(_, signed)| signed.clone()),
+                    completion.as_ref().map(|(_, signed, _)| signed.clone()),
                     usage,
                     now,
                 )
@@ -740,13 +774,13 @@ impl GrantService {
             .lock()
             .map_err(|_| NodeStoreError::WriterPoisoned)?;
         let live = held.live.get_mut(&id).ok_or(GrantError::Unauthorized)?;
-        if let Some((events, signed)) = completion {
+        if let Some((events, signed, _)) = completion {
             let mut body = live.cache.lock()?;
             if body.retained {
                 body.bytes = transcript_ram(&events);
                 body.events = events;
             }
-            live.phase = LivePhase::Finished(signed);
+            live.phase = LivePhase::Finished(Box::new(signed));
         } else {
             live.cache.cancel();
             live.phase =
@@ -763,14 +797,21 @@ impl GrantService {
         store: &NodeStore,
         live: &Live,
         id: Digest,
-        input: &PreparedWorkInput,
+        input: &PreparedInvocation,
         output: Result<Vec<OutputEventEnvelope>, BackendFault>,
-    ) -> Result<(Vec<OutputEventEnvelope>, SignedResult), CompletionError> {
+    ) -> Result<
+        (
+            Vec<OutputEventEnvelope>,
+            SignedResult,
+            hellas_rpc::protocol::invocation::output::InvocationOutput,
+        ),
+        CompletionError,
+    > {
         let events = output?;
         if !live.prefix.matches(&events)? {
             return Err(CompletionError::Prefix);
         }
-        let maximum = live.policy.work.max_spool_bytes();
+        let maximum = live.facts.max_spool_bytes;
         if transcript_ram(&events) as u64 > maximum
             || encode_transcript(&events)?.len() as u64 > maximum
         {
@@ -792,18 +833,30 @@ impl GrantService {
                     .map_err(|_| CompletionError::ProviderUnavailable)?,
             )?,
         };
-        let result =
-            live.policy
-                .work
-                .bound_terminal_result(&context, id, &a.into(), input, &events)?;
+        let result = hellas_channel::job::terminal_result(
+            &context,
+            id,
+            &a.into(),
+            &live.policy.invocation_policy,
+            input,
+            &events,
+        )?;
         let signature = self.signer.sign_digest(bound_result_digest(
             context.network,
             context.channel,
             &result,
         ))?;
-        Ok((events, SignedResult { result, signature }))
+        let verified = input
+            .verify_output(
+                &live.policy.invocation_policy,
+                &PublicKey::Secp256k1(context.client.to_bytes()),
+                &PublicKey::Secp256k1(context.provider.to_bytes()),
+                &events,
+            )
+            .map_err(hellas_channel::model::work::PaidWorkError::from)?;
+        Ok((events, SignedResult { result, signature }, verified.output))
     }
-    fn stream(&self, access: Access, request: DeliverResultRequest) -> PaidResultStream {
+    fn stream(&self, access: Access, request: StreamResultRequest) -> PaidResultStream {
         let service = self.clone();
         self.stream_binding(async move { service.bind_delivery(&access, &request).await })
     }
@@ -1098,7 +1151,7 @@ impl hellas_rpc::services::work::WorkHandler for GrantWork {
     }
     async fn stream_result(
         &self,
-        request: DeliverResultRequest,
+        request: StreamResultRequest,
         _context: TransportContext,
     ) -> Result<PaidResultStream, WireStatus> {
         let delivery = match self.service.bind_delivery(&self.access, &request).await {
@@ -1115,78 +1168,6 @@ impl hellas_rpc::services::work::WorkHandler for GrantWork {
             .service
             .stream_binding(futures::future::ready(Ok(delivery.clone())))
             .with_write_authority(self.service.delivery_authority(delivery)))
-    }
-    async fn deliver_result(
-        &self,
-        request: DeliverResultRequest,
-        _context: TransportContext,
-    ) -> Result<impl Into<hellas_rpc::call::WithTrailer<DeliverResultResponse>> + Send, WireStatus>
-    {
-        use futures::StreamExt;
-        use hellas_channel::model::work::decode_transcript;
-        use hellas_rpc::call::WithTrailer;
-        let delivery = match self.service.bind_delivery(&self.access, &request).await {
-            Ok(delivery) => delivery,
-            Err(refusal) => {
-                return Ok(WithTrailer::new(DeliverResultResponse::refused(refusal)));
-            }
-        };
-        let bound = hellas_channel::work_store::journal::MAX_RECORD_BYTES;
-        let mut stream = self
-            .service
-            .stream_binding(futures::future::ready(Ok(delivery.clone())));
-        let mut events = Vec::new();
-        let mut retained = 0usize;
-        let mut outcome =
-            deliver_result_response::Outcome::Refused(refused(GrantRefusalCode::OutputUnavailable));
-        while let Some(event) = stream.next().await {
-            match event?.outcome {
-                Some(work_stream_event::Outcome::Prefix(bytes)) => {
-                    retained = retained.saturating_add(bytes.len());
-                    if retained > bound {
-                        break;
-                    }
-                    let prefix = decode_transcript(&bytes, bound).map_err(|_| {
-                        WireStatus::new(hellas_wire::WireCode::Internal, "invalid stored prefix")
-                    })?;
-                    events.extend(prefix);
-                }
-                Some(work_stream_event::Outcome::Terminal(terminal)) => {
-                    let tail =
-                        decode_transcript(&terminal.terminal_transcript, bound).map_err(|_| {
-                            WireStatus::new(
-                                hellas_wire::WireCode::Internal,
-                                "invalid stored terminal",
-                            )
-                        })?;
-                    events.extend(tail);
-                    let transcript = encode_transcript(&events).map_err(|_| {
-                        WireStatus::new(
-                            hellas_wire::WireCode::Internal,
-                            "invalid stored transcript",
-                        )
-                    })?;
-                    if transcript.len().saturating_add(1024) > bound {
-                        break;
-                    }
-                    outcome = deliver_result_response::Outcome::Delivered(WorkDelivered {
-                        result: terminal.result,
-                        provider_signature: terminal.provider_signature,
-                        transcript,
-                    });
-                    break;
-                }
-                Some(work_stream_event::Outcome::Refused(refusal)) => {
-                    outcome = deliver_result_response::Outcome::Refused(refusal);
-                    break;
-                }
-                _ => break,
-            }
-        }
-        Ok(WithTrailer::new(DeliverResultResponse {
-            outcome: Some(outcome),
-        })
-        .with_write_authority(self.service.delivery_authority(delivery)))
     }
     async fn admit_certificate(
         &self,

@@ -5,10 +5,7 @@ use hellas_auth::Digest;
 use hellas_auth::authority::{GrantId, ResourceId, Revision, UnixMillis};
 use hellas_rpc::*;
 use proptest::prelude::*;
-use {
-    crate::model::grant::budget::*, crate::model::grant::records::*, crate::model::grant::*,
-    hellas_channel::model::profile::*,
-};
+use {crate::model::grant::budget::*, crate::model::grant::records::*, crate::model::grant::*};
 use {
     hellas_authority::work_store::grant::GrantOutcome,
     hellas_authority::work_store::grant::NodeStore,
@@ -650,6 +647,18 @@ async fn new_machine_meters_check_accepted_and_paused_terms() {
     for revoke in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let (mut store, application) = setup(dir.path()).await;
+        let mut initial = store.state().grant(GrantId([1; 16])).unwrap().clone();
+        initial.revision = Revision(2);
+        let policy = &mut initial.policies[0];
+        policy.revision.0 += 1;
+        use_https(policy, chat_resource("https://meter.test", 8));
+        policy.https.as_mut().unwrap().accounting =
+            crate::model::grant::resource::AccountingProfile::None;
+        store
+            .configure_resource(policy.clone(), UnixMillis(1000))
+            .await
+            .unwrap();
+        store.define(initial, UnixMillis(1000)).await.unwrap();
         let (a, sig, input) = proposal(&store, 1);
         let work = grant_work_id(network(), &a);
         accept(&mut store, &application, (a, sig, &input), 1000)
@@ -659,24 +668,12 @@ async fn new_machine_meters_check_accepted_and_paused_terms() {
             .await
             .unwrap();
         let mut def = store.state().grant(a.grant_id).unwrap().clone();
-        def.revision = Revision(2);
+        def.revision = Revision(3);
         if revoke {
             def.enabled = false;
         } else {
-            def.policies[0].responses = None;
-            def.policies[0].work =
-                WorkPolicy::Evaluate(hellas_channel::model::work::EvaluatePolicyV2 {
-                    allowed_environment: test_responses_contract().manifest_id(),
-                    generation_policy_digest: Digest::hash(b"native-generation"),
-                    identity_source_digest: Digest::hash(b"native-identity"),
-                    max_prompt_tokens: 512,
-                    max_new_tokens: 128,
-                    max_stop_token_ids: 4,
-                    max_spool_bytes: 1_048_576,
-                    max_encoded_result_frame: 262_144,
-                    max_encoded_prepared_input: 1_048_576,
-                    max_upload_bytes: 1_048_576,
-                });
+            def.policies[0].https.as_mut().unwrap().accounting =
+                crate::model::grant::resource::AccountingProfile::OpenaiChat;
         }
         if !revoke {
             def.policies[0].revision.0 += 1;
@@ -687,7 +684,7 @@ async fn new_machine_meters_check_accepted_and_paused_terms() {
         }
         store.define(def, UnixMillis(1002)).await.unwrap();
         let limits = vec![Limit {
-            meter: Meter::DeviceMillis,
+            meter: Meter::OutputTokens,
             window: Window::Day,
             amount: 1000,
         }];
@@ -941,5 +938,3 @@ impl NodeStore {
         self.commit(now, Change::RepairResource(id), true).await
     }
 }
-
-use hellas_channel::test_support::test_responses_contract;

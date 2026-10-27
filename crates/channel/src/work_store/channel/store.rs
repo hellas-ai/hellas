@@ -6,8 +6,7 @@ use super::*;
 pub struct ChannelStore {
     journal: Journal,
     state: Channel,
-    metadata_only: bool,
-    payloads: payload::PayloadStore,
+    contents: BTreeMap<Digest, crate::content::InvocationContent>,
     pub(crate) uploads: crate::content::UploadStore,
 }
 
@@ -48,36 +47,6 @@ impl ChannelStore {
         origin: SetupOrigin,
         verifier: &V,
     ) -> Result<Self, WorkStoreError> {
-        Self::open_inner(root, channel, settlement, role, origin, verifier, false).await
-    }
-
-    /// Opens a journal that stores accounting evidence only.
-    ///
-    /// Inputs and output transcripts are verified before commit and retained
-    /// in memory. Append and checkpoint encodings omit both bodies. After a
-    /// restart an accepted request cannot run and a completed response cannot
-    /// be replayed; a signed payment for an already delivered result can still
-    /// be credited. Existing payload-bearing journals are refused.
-    pub async fn open_metadata_only<V: SigVerifier>(
-        root: &Path,
-        channel: PaidChannel,
-        settlement: WorkPaymentSettlement,
-        role: Role,
-        origin: SetupOrigin,
-        verifier: &V,
-    ) -> Result<Self, WorkStoreError> {
-        Self::open_inner(root, channel, settlement, role, origin, verifier, true).await
-    }
-
-    async fn open_inner<V: SigVerifier>(
-        root: &Path,
-        channel: PaidChannel,
-        settlement: WorkPaymentSettlement,
-        role: Role,
-        origin: SetupOrigin,
-        verifier: &V,
-        metadata_only: bool,
-    ) -> Result<Self, WorkStoreError> {
         if origin.payment_edge != channel.payment_edge() {
             return Err(ChannelStateError::WrongChannel {
                 field: "setup origin payment_edge",
@@ -86,51 +55,48 @@ impl ChannelStore {
         }
         let key = channel_key(&channel).into_bytes();
         let stem = format!("channel-{}", hex(key));
-        let payloads = payload::PayloadStore::new(root, &stem);
         let replayed = hellas_rpc::observe::Timing::start();
         let (journal, replay) = Journal::open_latest(
             root,
             &format!("channel-{}", hex(key)),
             JournalId {
-                kind: if metadata_only {
-                    JournalKind::MetadataChannel
-                } else {
-                    JournalKind::Channel
-                },
+                kind: JournalKind::Channel,
                 role,
                 key,
             },
         )
         .await?;
-        let uploads = if metadata_only {
-            crate::content::UploadStore::memory(channel.id(), Default::default())
-        } else {
-            crate::content::UploadStore::durable(root, &stem, channel.id())?
-        };
+        let mut uploads = crate::content::UploadStore::durable(root, &stem, channel.id())?;
         let mut state = match &replay.checkpoint {
-            Some(bytes) => Channel::from_checkpoint(
-                bytes,
-                channel,
-                settlement,
-                role,
-                verifier,
-                metadata_only,
-                &payloads,
-            )?,
+            Some(bytes) => Channel::from_checkpoint(bytes, channel, settlement, role, verifier)?,
             None => Channel::new(channel, settlement, role, origin),
         };
-        let mut referenced: std::collections::BTreeSet<String> = state
-            .jobs()
-            .map(|job| hellas_rpc::ContentId::hash(job.prepared_input()).to_string())
-            .collect();
         for bytes in &replay.records {
-            let mut record = ChannelRecord::decode(bytes)?;
-            if !metadata_only && let ChannelRecord::JobProposed { prepared_input, .. } = &mut record
-            {
-                *prepared_input = payloads.read(prepared_input)?;
-                referenced.insert(hellas_rpc::ContentId::hash(prepared_input).to_string());
+            let record = ChannelRecord::decode(bytes)?;
+            state.apply(&record, verifier, true)?;
+        }
+        // Acceptance is durable before promotion. Recover that gap before deadline GC.
+        for job in state.book.jobs.values_mut() {
+            if job.authorization.retention == hellas_rpc::Retention::Retain {
+                let reference = job.authorization.input_content;
+                let input =
+                    match uploads.read(job.work_id, reference, hellas_rpc::Retention::Retain) {
+                        Ok(input) => input,
+                        Err(crate::content::ContentError::Missing)
+                            if job.phase == JobPhase::HalfSigned =>
+                        {
+                            continue;
+                        }
+                        Err(error) => return Err(error.into()),
+                    };
+                if job.provider_signature.is_some() {
+                    uploads.publish_accepted(job.work_id, &input, hellas_rpc::Retention::Retain)?;
+                }
+                job.prepared_input = input;
+                if let Some((result, _)) = &job.result {
+                    job.transcript = uploads.retained(result.transcript_content)?;
+                }
             }
-            state.apply(&record, verifier, metadata_only)?;
         }
         state.book.indeterminate = state
             .book
@@ -139,29 +105,59 @@ impl ChannelStore {
             .filter(|job| matches!(job.phase, JobPhase::Running | JobPhase::Streaming))
             .map(|job| job.work_id)
             .collect();
-        let live: std::collections::BTreeSet<String> = state
-            .jobs()
-            .map(|job| hellas_rpc::ContentId::hash(job.prepared_input()).to_string())
-            .collect();
-        let retired_payloads = !metadata_only && referenced != live;
-        if !metadata_only {
-            payloads.prune_ids(&referenced)?;
-        }
         journal.observe_replay(replayed, replay.records.len());
         let mut store = Self {
             journal,
             state,
-            metadata_only,
-            payloads,
             uploads,
+            contents: BTreeMap::new(),
         };
-        // A terminal append can survive a crash before its payload cleanup.
-        // Retire those replay references durably before removing their files.
-        if retired_payloads {
-            store.rotate().await?;
-        }
         store.gc_uploads()?;
         Ok(store)
+    }
+
+    pub(crate) fn remember_content(
+        &mut self,
+        work: Digest,
+        content: crate::content::InvocationContent,
+    ) {
+        self.contents.insert(work, content);
+    }
+    pub(crate) fn invocation_content(
+        &self,
+        work: Digest,
+        policy: &InvocationPolicy,
+    ) -> Result<crate::content::InvocationContent, WorkStoreError> {
+        if let Some(content) = self.contents.get(&work) {
+            return Ok(content.clone());
+        }
+        let job = self
+            .state
+            .job_by_id(work)
+            .ok_or(ChannelStateError::Malformed)?;
+        let input = PreparedInvocation::from_canonical_bytes(
+            job.prepared_input(),
+            crate::content::MAX_CONTENT_BYTES,
+        )
+        .map_err(PaidWorkError::from)
+        .map_err(ChannelStateError::from)?;
+        let manifest = input
+            .manifest()
+            .map_err(PaidWorkError::from)
+            .map_err(ChannelStateError::from)?;
+        let root = self
+            .uploads
+            .root(work, manifest.root(), job.authorization().retention)?;
+        let objects = crate::job::content_closure(
+            policy,
+            &manifest,
+            &root,
+            job.authorization().input_content,
+        )
+        .map_err(ChannelStateError::from)?;
+        Ok(self
+            .uploads
+            .invocation_content(work, &objects, job.authorization().retention)?)
     }
 
     /// Returns what this endpoint durably knows.
@@ -191,12 +187,6 @@ impl ChannelStore {
         self.journal.pause_next_statement().await
     }
 
-    /// Whether this journal excludes request and response bodies from disk.
-    #[must_use]
-    pub const fn metadata_only(&self) -> bool {
-        self.metadata_only
-    }
-
     /// Journals one step, and returns only once it is on the disk.
     ///
     /// The rule this exists to enforce: call it *before* the bytes it
@@ -215,6 +205,7 @@ impl ChannelStore {
         record: ChannelRecord,
         verifier: &V,
     ) -> Result<&Channel, WorkStoreError> {
+        self.promote_accepted_content()?;
         // Applied to a copy first: a record the rules refuse must leave
         // neither the file nor the state touched. A cheap exact check
         // first: the stream replay path offers a redundant release per
@@ -222,11 +213,11 @@ impl ChannelStore {
         if self.state.is_redundant(&record) {
             return Ok(&self.state);
         }
-        let mut next = self.state.clone();
         let previous_jobs = self.state.jobs().count();
+        let mut next = self.state.clone();
         // The `false` keeps commit-time validation at full strength even
         // for a metadata-only journal: bodies are verified — digest and
-        // transcript-to-result reproduction — before they are stripped
+        // transcript-to-result authentication — before they are stripped
         // from the bytes written. Only replay and checkpoint validation
         // downgrade for body-less records.
         if next.apply(&record, verifier, false)? == Applied::Changed {
@@ -237,25 +228,75 @@ impl ChannelStore {
             // answered with and the terminal that pays for it — because
             // by then there is no refusal left that costs nothing.
             if let Some(tail) = record.checkpoint_tail() {
-                let len = payload::checkpoint(&next, self.metadata_only)
-                    .len()
-                    .saturating_add(tail);
+                let len = next.checkpoint_for_storage().len().saturating_add(tail);
                 if len > MAX_CHECKPOINT_BYTES {
                     return Err(JournalError::CheckpointTooLarge { len }.into());
                 }
             }
             self.rotate_if_full(record.is_new_work()).await?;
-            let mut stored = record;
-            if !self.metadata_only
-                && let ChannelRecord::JobProposed { prepared_input, .. } = &mut stored
+            if let ChannelRecord::JobProposed {
+                authorization,
+                prepared_input,
+                ..
+            } = &record
+                && authorization.retention == hellas_rpc::Retention::Retain
             {
-                *prepared_input = self.payloads.write(prepared_input)?;
+                if next.role() == Role::Client {
+                    self.uploads.retain(prepared_input)?;
+                } else {
+                    let input = PreparedInvocation::from_canonical_bytes(
+                        prepared_input,
+                        crate::content::MAX_CONTENT_BYTES,
+                    )
+                    .map_err(PaidWorkError::from)
+                    .map_err(ChannelStateError::from)?;
+                    let policy =
+                        InvocationPolicy::from_canonical_bytes(input.application_policy.as_bytes())
+                            .map_err(PaidWorkError::from)
+                            .map_err(ChannelStateError::from)?;
+                    self.uploads.stage_complete(
+                        work_id(next.channel(), authorization),
+                        authorization.input_content,
+                        authorization.acceptance_deadline,
+                        authorization.retention,
+                        policy.limits.max_upload_bytes,
+                        prepared_input,
+                    )?;
+                }
             }
-            self.journal
-                .append(&stored.encode_for_storage(self.metadata_only))
-                .await?;
+            // Retain the exact signed transcript before its reference becomes durable.
+            if let ChannelRecord::JobResult {
+                work_id,
+                result,
+                transcript,
+                ..
+            } = &record
+            {
+                let job = next
+                    .job_by_id(*work_id)
+                    .ok_or(ChannelStateError::Malformed)?;
+                if job.authorization().retention == hellas_rpc::Retention::Retain
+                    && self.uploads.retain(transcript)? != result.transcript_content
+                {
+                    return Err(crate::content::ContentError::Hash.into());
+                }
+            }
+            self.journal.append(&record.encode_for_storage()).await?;
             self.state = next;
-            if !self.metadata_only && self.state.jobs().count() < previous_jobs {
+            self.contents
+                .retain(|id, _| self.state.job_by_id(*id).is_some());
+            if let ChannelRecord::JobAccepted { work_id, .. } = &record {
+                let job = self
+                    .state
+                    .job_by_id(*work_id)
+                    .ok_or(ChannelStateError::Malformed)?;
+                self.uploads.publish_accepted(
+                    *work_id,
+                    job.prepared_input(),
+                    job.authorization().retention,
+                )?;
+            }
+            if self.state.jobs().count() < previous_jobs {
                 self.rotate().await?;
             }
         }
@@ -263,7 +304,29 @@ impl ChannelStore {
         Ok(&self.state)
     }
 
+    fn promote_accepted_content(&mut self) -> Result<(), WorkStoreError> {
+        for job in self.state.jobs() {
+            if job.authorization().retention == hellas_rpc::Retention::Retain
+                && job.provider_signature().is_some()
+                && self.uploads.has_stage(job.work_id())
+            {
+                let bytes = self.uploads.read(
+                    job.work_id(),
+                    job.authorization().input_content,
+                    hellas_rpc::Retention::Retain,
+                )?;
+                self.uploads.publish_accepted(
+                    job.work_id(),
+                    &bytes,
+                    hellas_rpc::Retention::Retain,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn gc_uploads(&mut self) -> Result<(), WorkStoreError> {
+        self.promote_accepted_content()?;
         self.uploads.gc(
             self.state.cursor().0,
             self.state.close_prepared().is_some()
@@ -288,11 +351,8 @@ impl ChannelStore {
     /// frame or an install step fails.
     pub async fn rotate(&mut self) -> Result<(), WorkStoreError> {
         self.journal
-            .rotate(&payload::checkpoint(&self.state, self.metadata_only))
+            .rotate(&self.state.checkpoint_for_storage())
             .await?;
-        if !self.metadata_only {
-            self.payloads.prune(&self.state)?;
-        }
         Ok(())
     }
 
@@ -309,15 +369,10 @@ impl ChannelStore {
         }
         match self
             .journal
-            .rotate(&payload::checkpoint(&self.state, self.metadata_only))
+            .rotate(&self.state.checkpoint_for_storage())
             .await
         {
-            Ok(()) => {
-                if !self.metadata_only {
-                    self.payloads.prune(&self.state)?;
-                }
-                Ok(())
-            }
+            Ok(()) => Ok(()),
             Err(error) if new_work => Err(error.into()),
             Err(_) => Ok(()),
         }

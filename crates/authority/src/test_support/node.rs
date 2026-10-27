@@ -242,7 +242,7 @@ pub struct TestNode {
 pub struct Proposal {
     pub authorization: crate::model::grant::GrantJobAuthorizationV1,
     pub signature: hellas_auth::Signature,
-    pub input: hellas_channel::model::profile::PreparedWorkInput,
+    pub input: hellas_rpc::protocol::invocation::PreparedInvocation,
 }
 impl Proposal {
     fn new(
@@ -278,7 +278,7 @@ impl Proposal {
             )),
             authorization: self.authorization.encode(),
             client_signature: self.signature.bytes().to_vec(),
-            prepared_input: self.input.encode().unwrap(),
+            prepared_input: self.input.canonical_bytes().unwrap(),
         }
     }
 

@@ -10,32 +10,29 @@
 //! Each mutation test states what it breaks. A rule with no test that
 //! fails when the rule is deleted is not a rule.
 
-use hellas_auth::{Digest, PublicKey};
-use hellas_channel::model::prepared_input::PreparedPaidInputV1;
-use hellas_channel::model::work::{
-    CreditLedger, EvaluatePolicyV2, JobPaymentPolicyV2, PaidChannel, PaidChannelPolicyV1,
-    PaidJobAuthorizationV2, PaidJobResultV1, PaidWorkError, PaymentBindingV1, PrivateRecord,
-    canonical_output_digest, check_authorization, check_payment_policy_binding,
-    check_prepared_input, check_result, check_work_policy, decode_transcript, encode_transcript,
-    generation_policy_digest, identity_source_digest, next_payment, payment_binding_digest,
-    prepared_input_digest, private_policy_commitment, result_digest, work_id, work_policy_digest,
+use hellas_auth::Digest;
+use hellas_channel::job::{
+    check_authorization, check_paid_input as check_prepared_input, prepared_input_digest,
 };
-use hellas_channel::test_support::channel::{
-    identity_artifact, manifest, prompt_tokens, text_execution, text_policy,
+use hellas_channel::test_support::channel as fixture;
+use hellas_channel::{
+    job,
+    model::work::{
+        CreditLedger, JobDeadlines, JobPaymentPolicyV2, PaidChannel, PaidChannelPolicyV1,
+        PaidJobAuthorizationV2, PaidJobResultV1, PaidWorkError, PaymentBindingV1, PrivateRecord,
+        ResultOutcome, check_payment_policy_binding, check_result, decode_transcript,
+        encode_transcript, next_payment, payment_binding_digest, private_policy_commitment,
+        result_digest, work_id,
+    },
 };
 use hellas_kernel::{
     BlockHeight, EarnedCertificate, EdgeId, EdgeValues, Fees, List, NetworkId, Parties, PartyKeys,
     Payout, Secp256k1Signer, Secp256k1Verifier, SigVerifier, TermsHash, WorkPaymentSettlement,
     WorkPaymentTerms, WorkStakeBondTerms, work_payment_settlement,
 };
-use hellas_rpc::evaluate::{EvaluateStopReason, EvaluateTerminal, EvaluateUsage};
-use hellas_rpc::protocol::artifacts::{
-    BoundTermId, Canonical, InputAddressed, OutputAddressed, SourceRef, TextArtifact,
-    TextExecution, TextExecutionId, TextPolicy, TextState, TokenIds, completed_text,
-};
 use hellas_rpc::{
-    Application, Assurance, CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR, ContentId, Evaluate,
-    EvaluateRequest, EventCommitment, ProgramManifest, RequestCommitment,
+    ContentId, ContentRef, EventCommitment, RequestCommitment, Retention,
+    protocol::invocation::{InvocationPolicy, PreparedInvocation},
 };
 
 // ── Fixtures ──────────────────────────────────────────────────────────
@@ -56,21 +53,6 @@ fn capacity() -> WorkPaymentSettlement {
 }
 const SALT: [u8; 32] = [0x5a; 32];
 
-fn evaluate_request_bytes_of() -> Vec<u8> {
-    hellas_rpc::protocol::schemes::evaluate::evaluate_request_bytes(&evaluate_request())
-}
-
-/// Assembles bundle bytes from six arbitrary bodies, so a test can build
-/// a spelling the constructor would never produce.
-fn assemble(bodies: &[&[u8]]) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    for body in bodies {
-        bytes.extend_from_slice(&(body.len() as u32).to_be_bytes());
-        bytes.extend_from_slice(body);
-    }
-    bytes
-}
-
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -80,16 +62,8 @@ fn hex(bytes: &[u8]) -> String {
 /// Every fixture body here is a few hundred bytes, so the only error
 /// these can return — a body too long for its `u32` length prefix — is
 /// noise at each of their sixteen call sites.
-fn input_digest(channel: &PaidChannel, bundle: &PreparedPaidInputV1) -> Digest {
+fn input_digest(channel: &PaidChannel, bundle: &PreparedInvocation) -> Digest {
     prepared_input_digest(channel, bundle).expect("a representable bundle")
-}
-
-fn policy_digest_of(policy: &TextPolicy) -> Digest {
-    generation_policy_digest(&policy.canonical_bytes()).expect("a representable policy body")
-}
-
-fn identity_digest_of(artifact: &TextArtifact) -> Digest {
-    identity_source_digest(&artifact.canonical_bytes()).expect("a representable artifact body")
 }
 
 fn network() -> NetworkId {
@@ -166,70 +140,33 @@ fn channel_policy() -> PaidChannelPolicyV1 {
     }
 }
 
-fn evaluate_request() -> EvaluateRequest {
-    EvaluateRequest {
-        text_execution: text_execution().input_id().digest(),
-        runner_public_key: PublicKey::Secp256k1(client().party_key().to_bytes()),
-        execution_environment: manifest().content_id(),
-        nonce: [0x77; 32],
-        assurance: Assurance::ProducerSigned,
-        retain: true,
-    }
+fn bundle() -> PreparedInvocation {
+    let mut input = fixture::bundle(0x77);
+    input.request.runner_public_key =
+        hellas_auth::PublicKey::Secp256k1(provider().party_key().to_bytes());
+    input
 }
-
-fn bundle() -> PreparedPaidInputV1 {
-    PreparedPaidInputV1::new(
-        &evaluate_request(),
-        &manifest(),
-        &text_execution(),
-        &prompt_tokens(),
-        &text_policy(),
-        &identity_artifact(),
-    )
+fn work_policy() -> InvocationPolicy {
+    fixture::work_policy()
 }
-
-fn work_policy() -> EvaluatePolicyV2 {
-    EvaluatePolicyV2 {
-        allowed_environment: manifest().content_id(),
-        generation_policy_digest: policy_digest_of(&text_policy()),
-        identity_source_digest: identity_digest_of(&identity_artifact()),
-        max_prompt_tokens: 8,
-        max_new_tokens: 64,
-        max_stop_token_ids: 4,
-        max_spool_bytes: 65_536,
-        max_encoded_result_frame: 262_144,
-        max_encoded_prepared_input: 1_048_576,
-        max_upload_bytes: 1_048_576,
-    }
+fn work_policy_digest(channel: &PaidChannel, policy: &InvocationPolicy) -> Digest {
+    job::policy_digest(channel.network(), channel.id(), policy).unwrap()
 }
-
 fn authorization() -> PaidJobAuthorizationV2 {
-    let channel = channel();
-    let terms = payment_terms();
-    PaidJobAuthorizationV2 {
-        channel_id: channel.id(),
-        bond_edge: terms.bond_edge,
-        bond_terms_hash: terms.bond_terms_hash(),
-        payment_edge: channel.payment_edge(),
-        payment_terms_hash: channel.payment_terms_hash(),
-        work_policy_digest: work_policy_digest(&channel, &work_policy()),
-        payment_policy_digest: hellas_channel::model::work::job_payment_policy_digest(
-            channel.network(),
-            channel.id(),
-            &payment_policy(),
-        ),
-        input_content: hellas_rpc::ContentRef::for_bytes(&bundle().encode().unwrap()),
-        prepared_input_digest: input_digest(&channel, &bundle()),
-        proposal_nonce: 0x0102_0304_0506_0708,
-        acceptance_deadline: 1_000,
-        request_commitment: Evaluate::commit_request(&evaluate_request()),
-        environment_commitment: manifest().content_id(),
-        price: 250,
-        terminal_deadline: 1_050,
-        payment_deadline: 1_100,
-    }
+    job::propose(
+        &channel(),
+        &work_policy(),
+        &payment_policy(),
+        &bundle(),
+        0x0102_0304_0506_0708,
+        JobDeadlines {
+            acceptance: 1000,
+            terminal: 1050,
+            payment: 1100,
+        },
+    )
+    .unwrap()
 }
-
 fn job_result(work_id: Digest) -> PaidJobResultV1 {
     PaidJobResultV1 {
         work_id,
@@ -237,6 +174,8 @@ fn job_result(work_id: Digest) -> PaidJobResultV1 {
             [0x31; 32],
         )),
         canonical_output_digest: Digest::from_bytes([0x32; 32]),
+        outcome: ResultOutcome::Finished,
+        transcript_content: ContentRef::new(ContentId::from_bytes([0x35; 32]), 0x0102030405060708),
     }
 }
 
@@ -250,12 +189,10 @@ fn job_result(work_id: Digest) -> PaidJobResultV1 {
 fn golden_record_encodings_are_pinned() {
     assert_eq!(PaidChannelPolicyV1::BODY_SIZE, 16);
     assert_eq!(PaidChannelPolicyV1::ENCODED_SIZE, 18);
-    assert_eq!(EvaluatePolicyV2::BODY_SIZE, 130);
-    assert_eq!(EvaluatePolicyV2::ENCODED_SIZE, 132);
-    assert_eq!(PaidJobAuthorizationV2::BODY_SIZE, 400);
-    assert_eq!(PaidJobAuthorizationV2::ENCODED_SIZE, 402);
-    assert_eq!(PaidJobResultV1::BODY_SIZE, 96);
-    assert_eq!(PaidJobResultV1::ENCODED_SIZE, 98);
+    assert_eq!(PaidJobAuthorizationV2::BODY_SIZE, 273);
+    assert_eq!(PaidJobAuthorizationV2::ENCODED_SIZE, 275);
+    assert_eq!(PaidJobResultV1::BODY_SIZE, 137);
+    assert_eq!(PaidJobResultV1::ENCODED_SIZE, 139);
     assert_eq!(PaymentBindingV1::BODY_SIZE, 96);
     assert_eq!(PaymentBindingV1::ENCODED_SIZE, 98);
 
@@ -277,6 +214,9 @@ fn golden_record_encodings_are_pinned() {
             "3030303030303030303030303030303030303030303030303030303030303030", // work_id
             "3131313131313131313131313131313131313131313131313131313131313131", // transcript
             "3232323232323232323232323232323232323232323232323232323232323232", // output digest
+            "00", // finished
+            "3535353535353535353535353535353535353535353535353535353535353535", // transcript object
+            "0102030405060708", // transcript bytes
         )
     );
 
@@ -301,42 +241,8 @@ fn golden_record_encodings_are_pinned() {
     );
     assert_eq!(PaymentBindingV1::decode(&binding.encode()), Ok(binding));
 
-    let policy = EvaluatePolicyV2 {
-        allowed_environment: ContentId::from_bytes([0x40; 32]),
-        generation_policy_digest: Digest::from_bytes([0x41; 32]),
-        identity_source_digest: Digest::from_bytes([0x42; 32]),
-        max_prompt_tokens: 1,
-        max_new_tokens: 2,
-        max_stop_token_ids: 3,
-        max_spool_bytes: 5,
-        max_encoded_result_frame: 6,
-        max_encoded_prepared_input: 7,
-        max_upload_bytes: 7,
-    };
-    assert_eq!(
-        hex(&policy.encode()),
-        concat!(
-            "01",
-            "06", // format version 1, tag 6 = EVALUATE_POLICY_V2
-            "4040404040404040404040404040404040404040404040404040404040404040", // environment
-            "4141414141414141414141414141414141414141414141414141414141414141", // generation
-            "4242424242424242424242424242424242424242424242424242424242424242", // identity
-            "00000001", // max_prompt_tokens
-            "00000002", // max_new_tokens
-            "0003", // max_stop_token_ids
-            "0000000000000005", // max_spool_bytes
-            "00000006", // max_encoded_result_frame
-            "00000007", // max_encoded_prepared_input
-            "0000000000000007", // max_upload_bytes
-        )
-    );
-
     let authorization = PaidJobAuthorizationV2 {
         channel_id: Digest::from_bytes([0x50; 32]),
-        bond_edge: EdgeId::from_bytes([0x51; 32]),
-        bond_terms_hash: TermsHash::from_bytes([0x52; 32]),
-        payment_edge: EdgeId::from_bytes([0x53; 32]),
-        payment_terms_hash: TermsHash::from_bytes([0x54; 32]),
         work_policy_digest: Digest::from_bytes([0x55; 32]),
         payment_policy_digest: Digest::from_bytes([0x59; 32]),
         input_content: hellas_rpc::ContentRef::new(ContentId::from_bytes([0x5a; 32]), 123),
@@ -348,6 +254,7 @@ fn golden_record_encodings_are_pinned() {
         price: 3,
         terminal_deadline: 4,
         payment_deadline: 5,
+        retention: Retention::Retain,
     };
     assert_eq!(
         hex(&authorization.encode()),
@@ -355,10 +262,6 @@ fn golden_record_encodings_are_pinned() {
             "01",
             "09", // format version 1, tag 9 = PAID_JOB_AUTHORIZATION_V2
             "5050505050505050505050505050505050505050505050505050505050505050", // channel_id
-            "5151515151515151515151515151515151515151515151515151515151515151", // bond_edge
-            "5252525252525252525252525252525252525252525252525252525252525252", // bond_terms
-            "5353535353535353535353535353535353535353535353535353535353535353", // payment_edge
-            "5454545454545454545454545454545454545454545454545454545454545454", // payment_terms
             "5555555555555555555555555555555555555555555555555555555555555555", // policy digest
             "5959595959595959595959595959595959595959595959595959595959595959", // payment policy
             "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a", // input content id
@@ -371,6 +274,7 @@ fn golden_record_encodings_are_pinned() {
             "0000000000000003", // price
             "0000000000000004", // terminal_deadline
             "0000000000000005", // payment_deadline
+            "01", // retained content
         )
     );
 }
@@ -388,9 +292,9 @@ fn maximum_value_bodies_stay_fixed_width() {
     assert_eq!(bytes.len(), PaidJobAuthorizationV2::ENCODED_SIZE);
     assert_eq!(PaidJobAuthorizationV2::decode(&bytes), Ok(authorization));
     // The five `u64`s, all `ff`, at the offsets the layout puts them.
-    assert_eq!(hex(&bytes[298..314]), "ffffffffffffffffffffffffffffffff");
+    assert_eq!(hex(&bytes[170..186]), "ffffffffffffffffffffffffffffffff");
     assert_eq!(
-        hex(&bytes[378..402]),
+        hex(&bytes[250..274]),
         "ffffffffffffffffffffffffffffffffffffffffffffffff"
     );
 }
@@ -437,8 +341,8 @@ fn envelope_and_length_mutations_reject() {
     assert_eq!(
         PaidJobResultV1::decode(truncated),
         Err(PaidWorkError::RecordLength {
-            expected: 98,
-            actual: 97
+            expected: 139,
+            actual: 138
         })
     );
 
@@ -448,8 +352,8 @@ fn envelope_and_length_mutations_reject() {
     assert_eq!(
         PaidJobResultV1::decode(&trailing),
         Err(PaidWorkError::RecordLength {
-            expected: 98,
-            actual: 99
+            expected: 139,
+            actual: 140
         })
     );
 }
@@ -474,63 +378,20 @@ fn envelope_and_length_mutations_reject() {
 #[test]
 fn a_body_cannot_be_reinterpreted_under_another_record() {
     let sizes = [
-        ("channel policy", PaidChannelPolicyV1::ENCODED_SIZE),
-        ("execution policy", EvaluatePolicyV2::ENCODED_SIZE),
-        ("authorization", PaidJobAuthorizationV2::ENCODED_SIZE),
-        ("result", PaidJobResultV1::ENCODED_SIZE),
-        ("payment binding", PaymentBindingV1::ENCODED_SIZE),
+        PaidChannelPolicyV1::ENCODED_SIZE,
+        PaidJobAuthorizationV2::ENCODED_SIZE,
+        PaidJobResultV1::ENCODED_SIZE,
+        PaymentBindingV1::ENCODED_SIZE,
     ];
-    let collisions: Vec<(&str, &str)> = sizes
-        .iter()
-        .enumerate()
-        .flat_map(|(index, (name, size))| {
-            sizes
-                .iter()
-                .skip(index + 1)
-                .filter(move |(_, other)| other == size)
-                .map(move |(other, _)| (*name, *other))
-        })
-        .collect();
-    assert_eq!(
-        collisions,
-        vec![("result", "payment binding")],
-        "the set of same-width pairs is exactly the one the tag rule covers",
-    );
-
-    // The pair the length cannot separate: relabelled, and refused by
-    // the tag it now carries.
-    let result = job_result(Digest::from_bytes([0x30; 32])).encode();
-    let mut relabelled = result.clone();
-    relabelled[1] = 4;
-    assert!(PaymentBindingV1::decode(&relabelled).is_ok());
-    assert_eq!(
-        PaymentBindingV1::decode(&result),
-        Err(PaidWorkError::WrongRecordTag {
-            expected: 4,
-            actual: 3
-        })
-    );
-
-    let policy = work_policy().encode();
-    assert_eq!(
-        PaidJobAuthorizationV2::decode(&policy),
-        Err(PaidWorkError::RecordLength {
-            expected: 402,
-            actual: 132
-        })
-    );
-
-    // The tag relabelled too, which changes nothing: the length is read
-    // before the envelope is.
-    let mut disguised = policy.clone();
-    disguised[1] = 9;
-    assert_eq!(
-        PaidJobAuthorizationV2::decode(&disguised),
-        Err(PaidWorkError::RecordLength {
-            expected: 402,
-            actual: 132
-        })
-    );
+    for (i, size) in sizes.iter().enumerate() {
+        for other in &sizes[i + 1..] {
+            assert_ne!(size, other);
+        }
+    }
+    let mut result = job_result(Digest::from_bytes([0x30; 32])).encode();
+    assert!(PaymentBindingV1::decode(&result).is_err());
+    result[1] = 4;
+    assert!(PaymentBindingV1::decode(&result).is_err());
 }
 
 // ── Golden digests ────────────────────────────────────────────────────
@@ -549,7 +410,7 @@ fn golden_digests_bind_the_encoded_network() {
     );
     assert_eq!(
         hex(&work_id(&channel, &authorization()).into_bytes()),
-        "365c54d051a66b4fb5e130020b1af1a7e82d113399af98fd7cfca439c82e4fbf"
+        "383a70f2e0c87e6b9e709091e6aacfc6fa3165e8a45a8be8024e8e3eaf24ca15"
     );
 
     let other = channel_on(
@@ -635,178 +496,6 @@ fn records_do_not_cross_channels() {
 
 // ── Prepared input bundle ─────────────────────────────────────────────
 
-/// The bundle encodes as six big-endian lengths and six bodies, and its
-/// digest is reproducible from the same six component bodies with no
-/// cache in the process.
-#[test]
-fn prepared_input_is_reproducible_from_its_components() {
-    let bundle = bundle();
-    let encoded = bundle.encode().expect("a representable bundle");
-
-    let expected = assemble(&[
-        &evaluate_request_bytes_of(),
-        &manifest().canonical_bytes(),
-        &text_execution().canonical_bytes(),
-        &prompt_tokens().canonical_bytes(),
-        &text_policy().canonical_bytes(),
-        &identity_artifact().canonical_bytes(),
-    ]);
-    assert_eq!(encoded, expected);
-
-    let decoded = PreparedPaidInputV1::decode(&encoded, 1_048_576).expect("legal bundle");
-    assert_eq!(decoded, bundle);
-    assert_eq!(
-        decoded
-            .parts()
-            .expect("the canonical bodies parse")
-            .manifest
-            .canonical_bytes(),
-        manifest().canonical_bytes(),
-    );
-    assert_eq!(
-        input_digest(&channel(), &decoded),
-        input_digest(&channel(), &bundle)
-    );
-}
-
-/// Reordering, relabelling, or padding the bundle rejects rather than
-/// producing a second acceptable spelling of the same job.
-#[test]
-fn prepared_input_mutations_reject() {
-    let encoded = bundle().encode().expect("a representable bundle");
-    let budget = 1_048_576;
-    assert!(PreparedPaidInputV1::decode(&encoded, budget).is_ok());
-
-    // MUTATION: swap the prompt-token and policy segments. They decode
-    // as each other's schema, so the bundle has no second spelling.
-    let swapped = assemble(&[
-        &evaluate_request_bytes_of(),
-        &manifest().canonical_bytes(),
-        &text_execution().canonical_bytes(),
-        &text_policy().canonical_bytes(),
-        &prompt_tokens().canonical_bytes(),
-        &identity_artifact().canonical_bytes(),
-    ]);
-    assert_ne!(swapped, encoded);
-    let err = PreparedPaidInputV1::decode(&swapped, budget)
-        .expect("lengths are still well formed")
-        .parts()
-        .expect_err("swapped components must not parse");
-    assert!(
-        err.to_string().contains("expected array length 2, got 3"),
-        "{err}"
-    );
-
-    // MUTATION: the first declared length one byte short. Every later
-    // segment then starts one byte early, so the next length is read out
-    // of a body and refused before anything is allocated for it.
-    let mut short_length = encoded.clone();
-    let first_len = u32::from_be_bytes([
-        short_length[0],
-        short_length[1],
-        short_length[2],
-        short_length[3],
-    ]);
-    short_length[..4].copy_from_slice(&(first_len - 1).to_be_bytes());
-    let err = PreparedPaidInputV1::decode(&short_length, budget)
-        .expect_err("a shortened length must not decode");
-    assert!(err.to_string().contains("budget"), "{err}");
-
-    // MUTATION: the last declared length one byte short, which leaves a
-    // well-formed prefix and one byte over.
-    let mut short_last = encoded.clone();
-    let last_prefix = encoded.len() - identity_artifact().canonical_bytes().len() - 4;
-    let last_len = u32::from_be_bytes([
-        short_last[last_prefix],
-        short_last[last_prefix + 1],
-        short_last[last_prefix + 2],
-        short_last[last_prefix + 3],
-    ]);
-    short_last[last_prefix..last_prefix + 4].copy_from_slice(&(last_len - 1).to_be_bytes());
-    let err = PreparedPaidInputV1::decode(&short_last, budget)
-        .expect_err("a shortened final length must not decode");
-    assert!(
-        err.to_string()
-            .contains("trailing bytes after prepared input"),
-        "{err}"
-    );
-
-    // MUTATION: one appended byte.
-    let mut trailing = encoded.clone();
-    trailing.push(0);
-    let err = PreparedPaidInputV1::decode(&trailing, budget)
-        .expect_err("a trailing byte must not decode");
-    assert!(
-        err.to_string()
-            .contains("trailing bytes after prepared input"),
-        "{err}"
-    );
-
-    // MUTATION: a noncanonical nested body — the last token id re-spelled
-    // with a wider integer header.
-    let mut widened = prompt_tokens().canonical_bytes();
-    let position = widened
-        .iter()
-        .rposition(|byte| *byte == 6)
-        .expect("last token id");
-    widened.splice(position..=position, [0x18, 6]);
-    let noncanonical = assemble(&[
-        &evaluate_request_bytes_of(),
-        &manifest().canonical_bytes(),
-        &text_execution().canonical_bytes(),
-        &widened,
-        &text_policy().canonical_bytes(),
-        &identity_artifact().canonical_bytes(),
-    ]);
-    let err = PreparedPaidInputV1::decode(&noncanonical, budget)
-        .expect("lengths are still well formed")
-        .parts()
-        .expect_err("a noncanonical token body must not parse");
-    assert!(err.to_string().contains("non-canonical"), "{err}");
-
-    // MUTATION: the carried manifest must be parsed too; hashing arbitrary
-    // bytes would let a paid-input graph commit to an invalid application.
-    let mut noncanonical_manifest = manifest().canonical_bytes();
-    noncanonical_manifest.push(0);
-    let noncanonical = assemble(&[
-        &evaluate_request_bytes_of(),
-        &noncanonical_manifest,
-        &text_execution().canonical_bytes(),
-        &prompt_tokens().canonical_bytes(),
-        &text_policy().canonical_bytes(),
-        &identity_artifact().canonical_bytes(),
-    ]);
-    let err = PreparedPaidInputV1::decode(&noncanonical, budget)
-        .expect("lengths are still well formed")
-        .parts()
-        .expect_err("a noncanonical manifest body must not parse");
-    assert!(err.to_string().contains("trailing bytes"), "{err}");
-}
-
-/// A declared length is never trusted: not against the input, not
-/// against the budget, and not in aggregate.
-#[test]
-fn prepared_input_lengths_are_bounded_before_allocation() {
-    let encoded = bundle().encode().expect("a representable bundle");
-
-    // MUTATION: u32::MAX in the first length.
-    let mut huge = encoded.clone();
-    huge[..4].copy_from_slice(&u32::MAX.to_be_bytes());
-    let err = PreparedPaidInputV1::decode(&huge, 1_048_576)
-        .expect_err("a u32::MAX length must not decode");
-    assert!(err.to_string().contains("budget"), "{err}");
-
-    // MUTATION: six lengths that are individually legal and jointly
-    // beyond the budget.
-    let budget = encoded.len() - 1;
-    let err = PreparedPaidInputV1::decode(&encoded, budget)
-        .expect_err("a bundle over its budget must not decode");
-    assert!(err.to_string().contains("budget"), "{err}");
-
-    // The exact budget is legal; one byte less is not.
-    assert!(PreparedPaidInputV1::decode(&encoded, encoded.len()).is_ok());
-}
-
 // ── Streaming hash equivalence ────────────────────────────────────────
 
 /// Every `XFH` preimage hashes the same however it is written, and the
@@ -834,107 +523,6 @@ fn streaming_hash_matches_one_shot_under_every_segmentation() {
         hasher.finalize()
     });
     assert!(panicked.is_err());
-}
-
-/// A legal bundle can be far larger than the single-chunk limit, and its
-/// digest is computed anyway.
-///
-/// This is the test that makes the choice of hasher load-bearing: a
-/// prompt of a few thousand tokens puts the prepared-input preimage past
-/// [`hellas_xet::MIN_CHUNK_SIZE`], where the single-chunk hasher asserts.
-#[test]
-fn a_bundle_over_the_single_chunk_limit_still_hashes() {
-    let long_prompt = TokenIds::from_u32s(0..4_000);
-    let execution = TextExecution::new(
-        SourceRef::output(identity_artifact().output_id()),
-        long_prompt.output_id(),
-        text_policy().output_id(),
-    );
-    let request = EvaluateRequest {
-        text_execution: execution.input_id().digest(),
-        ..evaluate_request()
-    };
-    let large = PreparedPaidInputV1::new(
-        &request,
-        &manifest(),
-        &execution,
-        &long_prompt,
-        &text_policy(),
-        &identity_artifact(),
-    );
-    assert!(
-        large.encode().expect("a representable bundle").len() > hellas_xet::MIN_CHUNK_SIZE,
-        "the fixture must exceed the single-chunk limit to be a test of it",
-    );
-    let digest = input_digest(&channel(), &large);
-    assert_ne!(digest, input_digest(&channel(), &bundle()));
-
-    // The same bundle over a channel-sized budget still decodes, and its
-    // digest survives the round trip.
-    let encoded = large.encode().expect("a representable bundle");
-    let decoded = PreparedPaidInputV1::decode(&encoded, 1_048_576).expect("legal bundle");
-    assert_eq!(input_digest(&channel(), &decoded), digest);
-}
-
-/// Every fixed-record preimage is measured, not assumed, to be under the
-/// single-chunk limit.
-///
-/// The widest is `longest domain || network || channel || widest record`.
-/// Both maxima are taken over the whole set rather than named, so the
-/// record and the domain that happen to be widest today are asserted to
-/// be the widest rather than assumed to stay so.
-#[test]
-fn widest_fixed_preimage_is_measured() {
-    let longest_network =
-        NetworkId::new(&"n".repeat(hellas_kernel::MAX_NETWORK_ID_LENGTH)).expect("legal id");
-    let encoded_network = 1 + hellas_kernel::MAX_NETWORK_ID_LENGTH;
-    for size in [
-        PaidChannelPolicyV1::ENCODED_SIZE,
-        EvaluatePolicyV2::ENCODED_SIZE,
-        PaidJobResultV1::ENCODED_SIZE,
-        PaymentBindingV1::ENCODED_SIZE,
-    ] {
-        assert!(
-            size <= PaidJobAuthorizationV2::ENCODED_SIZE,
-            "{size} is wider than the record the bound is taken over"
-        );
-    }
-    for domain in [
-        "hellas.work.channel.v2",
-        "hellas.work.generation-policy.v1",
-        "hellas.work.identity-source.v1",
-        "hellas.work.evaluate-policy.v2",
-        "hellas.work.prepared-input.v1",
-        "hellas.work.paid-job-authorize.v2",
-        "hellas.work.paid-job-result.v1",
-        "hellas.work.payment-binding.v1",
-        "hellas.work.evaluate-output.v2",
-    ] {
-        assert!(
-            domain.len() <= "hellas.work.paid-channel-policy.v1".len(),
-            "{domain} is longer than the domain the bound is taken over"
-        );
-    }
-    let widest = "hellas.work.paid-channel-policy.v1".len()
-        + encoded_network
-        + 32
-        + PaidJobAuthorizationV2::ENCODED_SIZE;
-    assert_eq!(widest, 34 + 64 + 32 + 402);
-    assert_eq!(widest, 532);
-    assert!(widest < hellas_xet::MIN_CHUNK_SIZE);
-
-    // The one shape that is not record-shaped is bounded too: the
-    // channel id, which is derived before a channel id exists and so
-    // carries no channel field.
-    assert_eq!(
-        "hellas.work.channel.v2".len() + encoded_network + 4 * 32,
-        214
-    );
-
-    // The widest preimage is also a preimage that must hash rather than
-    // panic, so it is actually hashed here.
-    let channel = channel_on(longest_network, EdgeId::from_bytes([0xe1; 32]));
-    let _ = work_id(&channel, &authorization());
 }
 
 // ── Authorization ─────────────────────────────────────────────────────
@@ -991,26 +579,6 @@ fn every_authorization_field_moves_the_work_id() {
         ("channel_id", {
             let mut m = base;
             m.channel_id = Digest::from_bytes([0; 32]);
-            m
-        }),
-        ("bond_edge", {
-            let mut m = base;
-            m.bond_edge = EdgeId::from_bytes([0; 32]);
-            m
-        }),
-        ("bond_terms_hash", {
-            let mut m = base;
-            m.bond_terms_hash = TermsHash::from_bytes([0; 32]);
-            m
-        }),
-        ("payment_edge", {
-            let mut m = base;
-            m.payment_edge = EdgeId::from_bytes([0; 32]);
-            m
-        }),
-        ("payment_terms_hash", {
-            let mut m = base;
-            m.payment_terms_hash = TermsHash::from_bytes([0; 32]);
             m
         }),
         ("work_policy_digest", {
@@ -1079,8 +647,13 @@ fn every_authorization_field_moves_the_work_id() {
             m.payment_deadline += 1;
             m
         }),
+        ("retention", {
+            let mut m = base;
+            m.retention = Retention::Ephemeral;
+            m
+        }),
     ];
-    assert_eq!(mutations.len(), 17, "every field must be mutated");
+    assert_eq!(mutations.len(), 14, "every field must be mutated");
     for (field, mutated) in mutations {
         assert_ne!(
             work_id(&channel, &mutated),
@@ -1174,87 +747,6 @@ fn authorization_rules_reject_their_violations() {
     ));
 }
 
-/// Every execution-policy field is inside the digest the authorization
-/// pins, so a locally re-decoded policy that differs anywhere fails the
-/// comparison.
-#[test]
-fn every_work_policy_field_moves_its_digest() {
-    let channel = channel();
-    let base = work_policy();
-    let pinned = work_policy_digest(&channel, &base);
-    let authorization = authorization();
-
-    let mutations: Vec<(&str, EvaluatePolicyV2)> = vec![
-        ("allowed_environment", {
-            let mut m = base;
-            m.allowed_environment = ContentId::from_bytes([0; 32]);
-            m
-        }),
-        ("generation_policy_digest", {
-            let mut m = base;
-            m.generation_policy_digest = Digest::from_bytes([0; 32]);
-            m
-        }),
-        ("identity_source_digest", {
-            let mut m = base;
-            m.identity_source_digest = Digest::from_bytes([0; 32]);
-            m
-        }),
-        ("max_prompt_tokens", {
-            let mut m = base;
-            m.max_prompt_tokens += 1;
-            m
-        }),
-        ("max_new_tokens", {
-            let mut m = base;
-            m.max_new_tokens += 1;
-            m
-        }),
-        ("max_stop_token_ids", {
-            let mut m = base;
-            m.max_stop_token_ids += 1;
-            m
-        }),
-        ("max_spool_bytes", {
-            let mut m = base;
-            m.max_spool_bytes += 1;
-            m
-        }),
-        ("max_encoded_result_frame", {
-            let mut m = base;
-            m.max_encoded_result_frame += 1;
-            m
-        }),
-        ("max_encoded_prepared_input", {
-            let mut m = base;
-            m.max_encoded_prepared_input += 1;
-            m
-        }),
-        ("max_upload_bytes", {
-            let mut m = base;
-            m.max_upload_bytes += 1;
-            m
-        }),
-    ];
-    assert_eq!(mutations.len(), 10, "every field must be mutated");
-    for (field, mutated) in mutations {
-        assert_ne!(
-            work_policy_digest(&channel, &mutated),
-            pinned,
-            "{field} left the policy digest alone"
-        );
-        // A recomputed digest does not help: the authorization pins the
-        // one both parties agreed to.
-        assert_eq!(
-            check_authorization(&channel, &authorization, &mutated, &payment_policy(), 900).err(),
-            Some(PaidWorkError::Mismatch {
-                field: "work_policy_digest"
-            }),
-            "{field} was accepted under a recomputed digest"
-        );
-    }
-}
-
 /// The channel opens its own credit commitment, so a policy the terms do
 /// not commit to is a channel that cannot be built.
 #[test]
@@ -1329,7 +821,6 @@ fn a_price_above_the_channel_credit_limits_is_refused() {
     dear.fixed_price = 500;
     let mut authorization = authorization();
     authorization.channel_id = channel.id();
-    authorization.payment_terms_hash = channel.payment_terms_hash();
     authorization.price = 500;
     authorization.payment_policy_digest = hellas_channel::model::work::job_payment_policy_digest(
         channel.network(),
@@ -1337,7 +828,8 @@ fn a_price_above_the_channel_credit_limits_is_refused() {
         &dear,
     );
     authorization.work_policy_digest = work_policy_digest(&channel, &work_policy());
-    authorization.input_content = hellas_rpc::ContentRef::for_bytes(&bundle().encode().unwrap());
+    authorization.input_content =
+        hellas_rpc::ContentRef::for_bytes(&bundle().canonical_bytes().unwrap());
     authorization.prepared_input_digest = input_digest(&channel, &bundle());
 
     assert_eq!(
@@ -1367,7 +859,6 @@ fn a_price_above_the_channel_credit_limits_is_refused() {
         both,
     )
     .expect("terms that commit to this credit policy");
-    authorization.payment_terms_hash = channel.payment_terms_hash();
     authorization.channel_id = channel.id();
     authorization.payment_policy_digest = hellas_channel::model::work::job_payment_policy_digest(
         channel.network(),
@@ -1385,569 +876,7 @@ fn a_price_above_the_channel_credit_limits_is_refused() {
     );
 }
 
-/// Every bound the profile requires to be positive is refused at zero,
-/// one field at a time.
-#[test]
-fn an_absent_work_policy_bound_is_refused() {
-    let base = work_policy();
-    assert!(check_work_policy(&base).is_ok());
-
-    let zeroed: Vec<(&str, EvaluatePolicyV2)> = vec![
-        (
-            "max_prompt_tokens",
-            EvaluatePolicyV2 {
-                max_prompt_tokens: 0,
-                ..base
-            },
-        ),
-        (
-            "max_new_tokens",
-            EvaluatePolicyV2 {
-                max_new_tokens: 0,
-                ..base
-            },
-        ),
-        (
-            "max_spool_bytes",
-            EvaluatePolicyV2 {
-                max_spool_bytes: 0,
-                ..base
-            },
-        ),
-        (
-            "max_encoded_result_frame",
-            EvaluatePolicyV2 {
-                max_encoded_result_frame: 0,
-                ..base
-            },
-        ),
-        (
-            "max_encoded_prepared_input",
-            EvaluatePolicyV2 {
-                max_encoded_prepared_input: 0,
-                ..base
-            },
-        ),
-        (
-            "max_upload_bytes",
-            EvaluatePolicyV2 {
-                max_upload_bytes: 0,
-                ..base
-            },
-        ),
-    ];
-    assert_eq!(zeroed.len(), 6, "every required bound must be zeroed");
-    for (field, policy) in zeroed {
-        assert_eq!(
-            check_work_policy(&policy),
-            Err(PaidWorkError::PolicyZero { field }),
-            "{field} was accepted at zero"
-        );
-    }
-
-    // `max_stop_token_ids` is the one bound that may be zero: a channel
-    // that admits no stop tokens is a usable channel.
-    assert!(
-        check_work_policy(&EvaluatePolicyV2 {
-            max_stop_token_ids: 0,
-            ..base
-        })
-        .is_ok()
-    );
-}
-
 // ── Prepared input graph ──────────────────────────────────────────────
-
-/// The bundle's nested commitments must equal the authorization and the
-/// policy; a digest match is not a graph check.
-#[test]
-fn prepared_input_graph_is_checked_not_assumed() {
-    let channel = channel();
-    let policy = work_policy();
-    let authorization = authorization();
-    assert!(check_prepared_input(&channel, &authorization, &policy, &bundle()).is_ok());
-
-    // MUTATION: a bundle for a different prompt, with its digest
-    // recomputed so only the graph check can catch it.
-    let other_prompt = TokenIds::from([1, 2, 3]);
-    let other_execution = TextExecution::new(
-        SourceRef::output(identity_artifact().output_id()),
-        other_prompt.output_id(),
-        text_policy().output_id(),
-    );
-    let other_bundle = PreparedPaidInputV1::new(
-        &evaluate_request(),
-        &manifest(),
-        &other_execution,
-        &other_prompt,
-        &text_policy(),
-        &identity_artifact(),
-    );
-    let mut repointed = authorization;
-    repointed.input_content = hellas_rpc::ContentRef::for_bytes(&other_bundle.encode().unwrap());
-    repointed.prepared_input_digest = input_digest(&channel, &other_bundle);
-    assert_eq!(
-        check_prepared_input(&channel, &repointed, &policy, &other_bundle),
-        Err(PaidWorkError::Mismatch {
-            field: "text_execution id"
-        })
-    );
-
-    // MUTATION: an over-long prompt.
-    let long_prompt = TokenIds::from([1, 2, 3, 4, 5, 6, 7, 8, 9]);
-    let long_execution = TextExecution::new(
-        SourceRef::output(identity_artifact().output_id()),
-        long_prompt.output_id(),
-        text_policy().output_id(),
-    );
-    let long_request = EvaluateRequest {
-        text_execution: long_execution.input_id().digest(),
-        ..evaluate_request()
-    };
-    let long_bundle = PreparedPaidInputV1::new(
-        &long_request,
-        &manifest(),
-        &long_execution,
-        &long_prompt,
-        &text_policy(),
-        &identity_artifact(),
-    );
-    let mut long_auth = authorization;
-    long_auth.input_content = hellas_rpc::ContentRef::for_bytes(&long_bundle.encode().unwrap());
-    long_auth.prepared_input_digest = input_digest(&channel, &long_bundle);
-    long_auth.request_commitment = Evaluate::commit_request(&long_request);
-    assert_eq!(
-        check_prepared_input(&channel, &long_auth, &policy, &long_bundle),
-        Err(PaidWorkError::OverEnvelope {
-            field: "prompt tokens",
-            actual: 9,
-            limit: 8
-        })
-    );
-
-    // MUTATION: resume from a previous output instead of the identity
-    // artifact this profile pins.
-    let resumed_execution = TextExecution::new(
-        SourceRef::input(text_execution().input_id()),
-        prompt_tokens().output_id(),
-        text_policy().output_id(),
-    );
-    let resumed_request = EvaluateRequest {
-        text_execution: resumed_execution.input_id().digest(),
-        ..evaluate_request()
-    };
-    let resumed_bundle = PreparedPaidInputV1::new(
-        &resumed_request,
-        &manifest(),
-        &resumed_execution,
-        &prompt_tokens(),
-        &text_policy(),
-        &identity_artifact(),
-    );
-    let mut resumed_auth = authorization;
-    resumed_auth.input_content =
-        hellas_rpc::ContentRef::for_bytes(&resumed_bundle.encode().unwrap());
-    resumed_auth.prepared_input_digest = input_digest(&channel, &resumed_bundle);
-    resumed_auth.request_commitment = Evaluate::commit_request(&resumed_request);
-    assert_eq!(
-        check_prepared_input(&channel, &resumed_auth, &policy, &resumed_bundle),
-        Err(PaidWorkError::Mismatch {
-            field: "text_execution source"
-        })
-    );
-
-    // MUTATION: another assurance mode under an otherwise legal bundle.
-    let attested = EvaluateRequest {
-        assurance: Assurance::AppleAppAttest,
-        ..evaluate_request()
-    };
-    let attested_bundle = PreparedPaidInputV1::new(
-        &attested,
-        &manifest(),
-        &text_execution(),
-        &prompt_tokens(),
-        &text_policy(),
-        &identity_artifact(),
-    );
-    let mut attested_auth = authorization;
-    attested_auth.input_content =
-        hellas_rpc::ContentRef::for_bytes(&attested_bundle.encode().unwrap());
-    attested_auth.prepared_input_digest = input_digest(&channel, &attested_bundle);
-    attested_auth.request_commitment = Evaluate::commit_request(&attested);
-    assert_eq!(
-        check_prepared_input(&channel, &attested_auth, &policy, &attested_bundle),
-        Err(PaidWorkError::Mismatch {
-            field: "request assurance"
-        })
-    );
-
-    // MUTATION: a runner key that is not the channel's client.
-    let delegated = EvaluateRequest {
-        runner_public_key: PublicKey::Secp256k1(provider().party_key().to_bytes()),
-        ..evaluate_request()
-    };
-    let delegated_bundle = PreparedPaidInputV1::new(
-        &delegated,
-        &manifest(),
-        &text_execution(),
-        &prompt_tokens(),
-        &text_policy(),
-        &identity_artifact(),
-    );
-    let mut delegated_auth = authorization;
-    delegated_auth.input_content =
-        hellas_rpc::ContentRef::for_bytes(&delegated_bundle.encode().unwrap());
-    delegated_auth.prepared_input_digest = input_digest(&channel, &delegated_bundle);
-    delegated_auth.request_commitment = Evaluate::commit_request(&delegated);
-    assert_eq!(
-        check_prepared_input(&channel, &delegated_auth, &policy, &delegated_bundle),
-        Err(PaidWorkError::Mismatch {
-            field: "runner_public_key"
-        })
-    );
-}
-
-/// Each binding in the bundle's graph is broken on its own.
-///
-/// Mutating a component and the record that names it together proves
-/// only that *some* check fired. Here every case leaves the rest of the
-/// graph intact and recomputes the bundle digest, so the named check is
-/// the only thing that can refuse it — which is what makes the check's
-/// removal a test failure rather than a silent loss.
-#[test]
-fn each_graph_binding_is_checked_on_its_own() {
-    let channel = channel();
-    let policy = work_policy();
-    let base = authorization();
-
-    // A prompt body the execution does not name.
-    let other_prompt = TokenIds::from([5, 5, 5, 5]);
-    assert_ne!(other_prompt.output_id(), prompt_tokens().output_id());
-    let mismatched_prompt = PreparedPaidInputV1::new(
-        &evaluate_request(),
-        &manifest(),
-        &text_execution(),
-        &other_prompt,
-        &text_policy(),
-        &identity_artifact(),
-    );
-    let mut authorization = base;
-    authorization.input_content =
-        hellas_rpc::ContentRef::for_bytes(&mismatched_prompt.encode().unwrap());
-    authorization.prepared_input_digest = input_digest(&channel, &mismatched_prompt);
-    assert_eq!(
-        check_prepared_input(&channel, &authorization, &policy, &mismatched_prompt),
-        Err(PaidWorkError::Mismatch {
-            field: "prompt_tokens id"
-        })
-    );
-
-    // A generation policy the execution does not name.
-    let other_policy = TextPolicy::from_u32_stop_tokens(32, [3]);
-    assert_ne!(other_policy.output_id(), text_policy().output_id());
-    let mismatched_policy = PreparedPaidInputV1::new(
-        &evaluate_request(),
-        &manifest(),
-        &text_execution(),
-        &prompt_tokens(),
-        &other_policy,
-        &identity_artifact(),
-    );
-    let mut authorization = base;
-    authorization.input_content =
-        hellas_rpc::ContentRef::for_bytes(&mismatched_policy.encode().unwrap());
-    authorization.prepared_input_digest = input_digest(&channel, &mismatched_policy);
-    assert_eq!(
-        check_prepared_input(&channel, &authorization, &policy, &mismatched_policy),
-        Err(PaidWorkError::Mismatch {
-            field: "text_policy id"
-        })
-    );
-
-    // A manifest that is not the environment the request commits to.
-    let other_manifest = ProgramManifest::new(
-        Application::new(CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR).unwrap(),
-        ContentId::from_bytes([0x99; 32]),
-    );
-    assert_ne!(other_manifest.content_id(), manifest().content_id());
-    let mismatched_manifest = PreparedPaidInputV1::new(
-        &evaluate_request(),
-        &other_manifest,
-        &text_execution(),
-        &prompt_tokens(),
-        &text_policy(),
-        &identity_artifact(),
-    );
-    let mut authorization = base;
-    authorization.input_content =
-        hellas_rpc::ContentRef::for_bytes(&mismatched_manifest.encode().unwrap());
-    authorization.prepared_input_digest = input_digest(&channel, &mismatched_manifest);
-    assert_eq!(
-        check_prepared_input(&channel, &authorization, &policy, &mismatched_manifest),
-        Err(PaidWorkError::Mismatch {
-            field: "manifest content id"
-        })
-    );
-
-    // A request commitment the authorization does not carry.
-    let mut restamped = base;
-    restamped.request_commitment = RequestCommitment::from_digest(Digest::from_bytes([0x88; 32]));
-    assert_eq!(
-        check_prepared_input(&channel, &restamped, &policy, &bundle()),
-        Err(PaidWorkError::Mismatch {
-            field: "request_commitment"
-        })
-    );
-
-    // An environment commitment the request does not name.
-    let mut reenvironed = base;
-    reenvironed.environment_commitment = ContentId::from_bytes([0x87; 32]);
-    assert_eq!(
-        check_prepared_input(&channel, &reenvironed, &policy, &bundle()),
-        Err(PaidWorkError::Mismatch {
-            field: "environment_commitment"
-        })
-    );
-
-    // A policy pinned to a generation policy this bundle does not carry.
-    let mut repinned = policy;
-    repinned.generation_policy_digest = Digest::from_bytes([0x86; 32]);
-    assert_eq!(
-        check_prepared_input(&channel, &base, &repinned, &bundle()),
-        Err(PaidWorkError::Mismatch {
-            field: "generation_policy_digest"
-        })
-    );
-
-    // A policy pinned to an identity artifact this bundle does not
-    // carry.
-    let mut resourced = policy;
-    resourced.identity_source_digest = Digest::from_bytes([0x85; 32]);
-    assert_eq!(
-        check_prepared_input(&channel, &base, &resourced, &bundle()),
-        Err(PaidWorkError::Mismatch {
-            field: "identity_source_digest"
-        })
-    );
-
-    // An identity artifact bound to another environment than the one
-    // the request runs in. It is a legal artifact and a legal request;
-    // what is wrong is the edge between them, and the provider reads
-    // the model out of this end of it.
-    let elsewhere = TextArtifact::identity(BoundTermId::from_bytes([0x83; 32]));
-    let mut rebound_policy = policy;
-    rebound_policy.identity_source_digest =
-        match identity_source_digest(&elsewhere.canonical_bytes()) {
-            Ok(digest) => digest,
-            Err(error) => panic!("the identity hashes: {error}"),
-        };
-    let rebound_execution = TextExecution::new(
-        SourceRef::output(elsewhere.output_id()),
-        prompt_tokens().output_id(),
-        text_policy().output_id(),
-    );
-    let mut rebound_request = evaluate_request();
-    rebound_request.text_execution = rebound_execution.input_id().digest();
-    let rebound = PreparedPaidInputV1::new(
-        &rebound_request,
-        &manifest(),
-        &rebound_execution,
-        &prompt_tokens(),
-        &text_policy(),
-        &elsewhere,
-    );
-    let mut authorization = base;
-    authorization.input_content = hellas_rpc::ContentRef::for_bytes(&rebound.encode().unwrap());
-    authorization.prepared_input_digest = input_digest(&channel, &rebound);
-    authorization.request_commitment = Evaluate::commit_request(&rebound_request);
-    assert_eq!(
-        check_prepared_input(&channel, &authorization, &rebound_policy, &rebound),
-        Err(PaidWorkError::Mismatch {
-            field: "identity_artifact bound_term"
-        })
-    );
-
-    // A bundle whose digest is not the one the authorization named at
-    // all: the cheapest check, and the one that must not be the only
-    // one.
-    let mut unbound = base;
-    unbound.prepared_input_digest = Digest::from_bytes([0x84; 32]);
-    assert_eq!(
-        check_prepared_input(&channel, &unbound, &policy, &bundle()),
-        Err(PaidWorkError::Mismatch {
-            field: "prepared_input_digest"
-        })
-    );
-}
-
-/// Each bound of the resource envelope refuses on its own.
-///
-/// Every case here recomputes the bundle digest and leaves the rest of
-/// the graph intact, so the named rule is the only thing that can
-/// refuse it: deleting any one of them makes exactly one of these
-/// assertions return `Ok`. The two `max_new_tokens` rules are not the
-/// envelope loop's own, though: both live in `matches_generation_policy`,
-/// which the graph check runs before the envelope loop, and deleting
-/// them there is what these two assertions catch.
-#[test]
-fn each_envelope_bound_is_checked_on_its_own() {
-    let channel = channel();
-    let base = work_policy();
-    let authorization = authorization();
-    assert!(check_prepared_input(&channel, &authorization, &base, &bundle()).is_ok());
-
-    // A bundle larger than the complete quote response this channel
-    // agreed to hold. Refused before its digest is even computed: an
-    // endpoint does not hash a body it has not agreed to receive.
-    let encoded = bundle().encode().expect("a representable bundle");
-    let cramped = EvaluatePolicyV2 {
-        max_encoded_prepared_input: 100,
-        max_upload_bytes: 100,
-        ..base
-    };
-    assert_eq!(
-        check_prepared_input(&channel, &authorization, &cramped, &bundle()),
-        Err(PaidWorkError::OverEnvelope {
-            field: "prepared input length",
-            actual: encoded.len() as u64,
-            limit: 100
-        })
-    );
-    // The exact length is legal; one byte less is not.
-    let exact = EvaluatePolicyV2 {
-        max_encoded_prepared_input: encoded.len() as u32,
-        max_upload_bytes: u64::from(encoded.len() as u32),
-        ..base
-    };
-    assert!(check_prepared_input(&channel, &authorization, &exact, &bundle()).is_ok());
-
-    // A generation longer than the policy admits.
-    let short = EvaluatePolicyV2 {
-        max_new_tokens: 63,
-        ..base
-    };
-    assert_eq!(
-        check_prepared_input(&channel, &authorization, &short, &bundle()),
-        Err(PaidWorkError::OverEnvelope {
-            field: "max_new_tokens",
-            actual: 64,
-            limit: 63
-        })
-    );
-
-    // More stop tokens than the policy admits.
-    let few = EvaluatePolicyV2 {
-        max_stop_token_ids: 1,
-        ..base
-    };
-    assert_eq!(
-        check_prepared_input(&channel, &authorization, &few, &bundle()),
-        Err(PaidWorkError::OverEnvelope {
-            field: "stop token ids",
-            actual: 2,
-            limit: 1
-        })
-    );
-
-    // A request authorized to generate nothing. Zero is inside every
-    // bound above it; the refusal is `matches_generation_policy`'s,
-    // reached by the graph check before the envelope loop runs.
-    let silent = TextPolicy::from_u32_stop_tokens(0, [2, 1]);
-    let (silent_bundle, silent_auth) = bundle_with_policy(&channel, &silent);
-    let admits_silence = EvaluatePolicyV2 {
-        generation_policy_digest: policy_digest_of(&silent),
-        ..base
-    };
-    assert_eq!(
-        check_prepared_input(&channel, &silent_auth, &admits_silence, &silent_bundle),
-        Err(PaidWorkError::PolicyZero {
-            field: "request max_new_tokens"
-        })
-    );
-}
-
-/// Rebuilds the bundle and the authorization around one replacement
-/// generation policy, leaving every other binding intact.
-fn bundle_with_policy(
-    channel: &PaidChannel,
-    policy: &TextPolicy,
-) -> (PreparedPaidInputV1, PaidJobAuthorizationV2) {
-    let execution = TextExecution::new(
-        SourceRef::output(identity_artifact().output_id()),
-        prompt_tokens().output_id(),
-        policy.output_id(),
-    );
-    let request = EvaluateRequest {
-        text_execution: execution.input_id().digest(),
-        ..evaluate_request()
-    };
-    let bundle = PreparedPaidInputV1::new(
-        &request,
-        &manifest(),
-        &execution,
-        &prompt_tokens(),
-        policy,
-        &identity_artifact(),
-    );
-    let authorization = PaidJobAuthorizationV2 {
-        input_content: hellas_rpc::ContentRef::for_bytes(&bundle.encode().unwrap()),
-        prepared_input_digest: input_digest(channel, &bundle),
-        request_commitment: Evaluate::commit_request(&request),
-        ..authorization()
-    };
-    (bundle, authorization)
-}
-
-/// This profile starts from the identity artifact and nothing else.
-///
-/// A job resumed from a previous output would be paid for work whose
-/// input the bundle does not carry. The policy here is repinned to the
-/// output artifact and the execution names it as its source, so the two
-/// neighbouring rules — the source check and the identity commitment —
-/// both pass, and only the artifact's kind refuses it.
-#[test]
-fn only_the_identity_artifact_may_start_a_paid_job() {
-    let channel = channel();
-    let resumed = TextArtifact::output(
-        text_execution().input_id(),
-        4,
-        TextState::new(prompt_tokens().output_id()).output_id(),
-        prompt_tokens().output_id(),
-    );
-    let execution = TextExecution::new(
-        SourceRef::output(resumed.output_id()),
-        prompt_tokens().output_id(),
-        text_policy().output_id(),
-    );
-    let request = EvaluateRequest {
-        text_execution: execution.input_id().digest(),
-        ..evaluate_request()
-    };
-    let bundle = PreparedPaidInputV1::new(
-        &request,
-        &manifest(),
-        &execution,
-        &prompt_tokens(),
-        &text_policy(),
-        &resumed,
-    );
-    let authorization = PaidJobAuthorizationV2 {
-        input_content: hellas_rpc::ContentRef::for_bytes(&bundle.encode().unwrap()),
-        prepared_input_digest: input_digest(&channel, &bundle),
-        request_commitment: Evaluate::commit_request(&request),
-        ..authorization()
-    };
-    let policy = EvaluatePolicyV2 {
-        identity_source_digest: identity_digest_of(&resumed),
-        ..work_policy()
-    };
-    assert_eq!(
-        check_prepared_input(&channel, &authorization, &policy, &bundle),
-        Err(PaidWorkError::Mismatch {
-            field: "identity_artifact kind"
-        })
-    );
-}
 
 // ── Result, binding, payment ──────────────────────────────────────────
 
@@ -2378,85 +1307,6 @@ fn payment_binding_digest_binds_every_field() {
 
 // ── Canonical output ──────────────────────────────────────────────────
 
-/// The normalized answer ignores chunk boundaries and binds everything
-/// the oracle compares.
-#[test]
-fn canonical_output_digest_normalizes_chunking() {
-    let network = network();
-    let id = work_id(&channel(), &authorization());
-    let terminal = EvaluateTerminal {
-        final_position: 4,
-        stop_reason: EvaluateStopReason::STOP_TOKEN,
-        matched_stop_token_id: Some(1),
-        text_artifact: Digest::from_bytes([0x60; 32]),
-        usage: EvaluateUsage {
-            input_units: 4,
-            output_units: 4,
-        },
-        billable_units: 8,
-    };
-    let tokens = [11, 12, 13, 14];
-    let digest = canonical_output_digest(network, id, &tokens, &terminal).expect("legal terminal");
-
-    // MUTATION: reorder the tokens.
-    assert_ne!(
-        canonical_output_digest(network, id, &[11, 12, 14, 13], &terminal).expect("legal"),
-        digest
-    );
-
-    // MUTATION: another stop reason.
-    let mut stopped = terminal.clone();
-    stopped.stop_reason = EvaluateStopReason::MAX_OUTPUT;
-    stopped.matched_stop_token_id = None;
-    assert_ne!(
-        canonical_output_digest(network, id, &tokens, &stopped).expect("legal"),
-        digest
-    );
-
-    // MUTATION: another selected stop token.
-    let mut witness = terminal.clone();
-    witness.matched_stop_token_id = Some(2);
-    assert_ne!(
-        canonical_output_digest(network, id, &tokens, &witness).expect("legal"),
-        digest
-    );
-
-    // MUTATION: another text artifact.
-    let mut artifact = terminal.clone();
-    artifact.text_artifact = Digest::from_bytes([0x61; 32]);
-    assert_ne!(
-        canonical_output_digest(network, id, &tokens, &artifact).expect("legal"),
-        digest
-    );
-
-    // MUTATION: usage that does not describe the token list.
-    let mut usage = terminal.clone();
-    usage.usage.output_units = 3;
-    assert_eq!(
-        canonical_output_digest(network, id, &tokens, &usage),
-        Err(PaidWorkError::Mismatch {
-            field: "output token count"
-        })
-    );
-
-    // MUTATION: a billable total that is not the sum.
-    let mut billable = terminal.clone();
-    billable.billable_units = 9;
-    assert_eq!(
-        canonical_output_digest(network, id, &tokens, &billable),
-        Err(PaidWorkError::Mismatch {
-            field: "billable units"
-        })
-    );
-
-    // The same answer for another job is another digest.
-    assert_ne!(
-        canonical_output_digest(network, Digest::from_bytes([0; 32]), &tokens, &terminal)
-            .expect("legal"),
-        digest
-    );
-}
-
 // ── Independent preimage reproduction ─────────────────────────────────
 
 /// Rebuilds three complete preimages by hand and hashes them through the
@@ -2496,11 +1346,14 @@ fn digest_preimages_are_reproducible_by_hand() {
     preimage.extend_from_slice(result.work_id.as_bytes());
     preimage.extend_from_slice(result.terminal_transcript_commitment.as_bytes());
     preimage.extend_from_slice(result.canonical_output_digest.as_bytes());
+    preimage.push(0);
+    preimage.extend_from_slice(result.transcript_content.id().as_bytes());
+    preimage.extend_from_slice(&result.transcript_content.bytes().to_be_bytes());
     assert_eq!(Digest::hash(&preimage), result_digest(&channel, &result));
-    assert_eq!(preimage.len(), 30 + 16 + 32 + 98);
+    assert_eq!(preimage.len(), 30 + 16 + 32 + 139);
     assert_eq!(
         hex(&Digest::hash(&preimage).into_bytes()),
-        "bd4cd5aa978aa14f4341029672f56ad109ae2577d2f97bbfc8a0b3273e286c8c"
+        "cb3111b193c16e52f54d851f9f7eafbb873413de95b5e4e0bb925b29abe93328"
     );
 
     // The payment binding, whose three fields are all 32 bytes: a round
@@ -2530,92 +1383,11 @@ fn digest_preimages_are_reproducible_by_hand() {
     );
 }
 
-/// Rebuilds the normalized answer's preimage by hand, field by field.
-///
-/// The one digest in this module whose exact layout is fixed outside it:
-/// the client's independent oracle recomputes this from its own
-/// reexecution, so an implementation that agreed with `work.rs` and with
-/// nothing else would be a check the two halves of a payment could pass
-/// while meaning different things. Round-tripping cannot catch a
-/// transposed pair of same-width fields — `final_position` beside
-/// `input_units`, or the three usage counts among themselves — and this
-/// does.
-#[test]
-fn the_canonical_output_preimage_is_reproducible_by_hand() {
-    let id = work_id(&channel(), &authorization());
-    let tokens: [u32; 3] = [7, 0, 0x0001_0203];
-    let terminal = EvaluateTerminal {
-        final_position: 3,
-        stop_reason: EvaluateStopReason::MAX_OUTPUT,
-        matched_stop_token_id: None,
-        text_artifact: Digest::from_bytes([0x60; 32]),
-        usage: EvaluateUsage {
-            input_units: 5,
-            output_units: 3,
-        },
-        billable_units: 8,
-    };
-
-    let mut preimage = b"hellas.work.evaluate-output.v2".to_vec();
-    preimage.push(NETWORK.len() as u8);
-    preimage.extend_from_slice(NETWORK.as_bytes());
-    preimage.extend_from_slice(id.as_bytes());
-    preimage.extend_from_slice(&3_u64.to_be_bytes());
-    preimage.extend_from_slice(&7_u32.to_be_bytes());
-    preimage.extend_from_slice(&0_u32.to_be_bytes());
-    preimage.extend_from_slice(&[0x00, 0x01, 0x02, 0x03]);
-    preimage.extend_from_slice(&3_u64.to_be_bytes());
-    preimage.push(2);
-    preimage.push(0);
-    preimage.extend_from_slice(&[0x60; 32]);
-    preimage.extend_from_slice(&5_u64.to_be_bytes());
-    preimage.extend_from_slice(&3_u64.to_be_bytes());
-    preimage.extend_from_slice(&8_u64.to_be_bytes());
-    // 30 domain, 16 network, 32 work id, 8 count, 12 tokens, 8 position,
-    // 1 stop reason, 1 absent-witness marker, 32 artifact, 24 usage.
-    assert_eq!(preimage.len(), 30 + 16 + 32 + 8 + 12 + 8 + 1 + 1 + 32 + 24);
-
-    assert_eq!(
-        Digest::hash(&preimage),
-        canonical_output_digest(network(), id, &tokens, &terminal).expect("legal terminal"),
-    );
-    assert_eq!(
-        hex(&Digest::hash(&preimage).into_bytes()),
-        "cf11c6f8572daab86bac1d4d3f914324cfe947af6dbe4dd5ea64a896ece69adf"
-    );
-}
-
 // ── Carrying a transcript ─────────────────────────────────────────────
 
 /// One signed transcript, for a request nothing else here uses.
 fn spool_transcript() -> Vec<hellas_rpc::OutputEventEnvelope> {
-    let Ok(key) = hellas_auth::ProducerSigningKey::from_secret_bytes([0x42; 32]) else {
-        panic!("a fixed scalar is a producer key");
-    };
-    let request = evaluate_request();
-    let mut builder = hellas_rpc::evaluate::EvaluateOutputTranscriptBuilder::new(
-        hellas_rpc::evaluate::input_commitment(&request),
-        request.assurance,
-        &key,
-    );
-    if let Err(error) = builder.push_token_delta(vec![5, 6, 7]) {
-        panic!("a non-empty delta pushes: {error}");
-    }
-    let usage = EvaluateUsage {
-        input_units: 4,
-        output_units: 3,
-    };
-    match builder.finish(EvaluateTerminal {
-        final_position: 3,
-        stop_reason: EvaluateStopReason::STOP_TOKEN,
-        matched_stop_token_id: Some(1),
-        text_artifact: Digest::from_bytes([0x77; 32]),
-        usage,
-        billable_units: 7,
-    }) {
-        Ok(events) => events,
-        Err(error) => panic!("the fixture transcript finishes: {error}"),
-    }
+    fixture::transcript_for(&fixture::invocation_request(1), &[5, 6, 7])
 }
 
 /// A spooled transcript comes back as the events that were spooled.
@@ -2659,96 +1431,6 @@ fn a_spooled_transcript_decodes_to_the_events_that_were_spooled() {
 }
 
 // ── What one finished execution produced ──────────────────────────────
-
-/// Hand-builds the three canonical bodies a finished execution derives,
-/// and pins the artifact id they add up to.
-///
-/// This is the derivation two implementations depend on and neither
-/// owns: the provider stores these bodies and signs the artifact id
-/// inside its terminal event, and the client's oracle rebuilds the id
-/// from the same inputs with no store at all. Sharing the code makes
-/// them agree; this is what says what they agree *on*, in bytes rather
-/// than by calling the function twice.
-#[test]
-fn the_completed_output_derivation_is_reproducible_by_hand() {
-    const TOKEN_IDS_SCHEMA: &str = "hellas.evaluate.token_ids.v1";
-    const TEXT_STATE_SCHEMA: &str = "hellas.evaluate.text.state.v1";
-    const TEXT_ARTIFACT_OUTPUT_SCHEMA: &str = "hellas.evaluate.text.artifact.output.v1";
-
-    let execution = TextExecutionId::from_bytes([0x41; 32]);
-    let input_ids = [9_u32, 8, 7, 6];
-    let output_tokens = [101_u32, 102, 103];
-    let completed = completed_text(execution, &input_ids, &output_tokens);
-
-    // DAG-CBOR by hand. A text head is `0x60 | len` below 24 and
-    // `0x78, len` up to 255; a byte head for 32 bytes is `0x58, 32`;
-    // an integer is its own value below 24 and `0x18, value` up to 255.
-    fn text(out: &mut Vec<u8>, value: &str) {
-        assert!(value.len() < 256, "the fixture schemas are short");
-        if value.len() < 24 {
-            out.push(0x60 | value.len() as u8);
-        } else {
-            out.push(0x78);
-            out.push(value.len() as u8);
-        }
-        out.extend_from_slice(value.as_bytes());
-    }
-    fn integer(out: &mut Vec<u8>, value: u32) {
-        assert!(value < 256, "the fixture values fit one byte");
-        if value < 24 {
-            out.push(value as u8);
-        } else {
-            out.push(0x18);
-            out.push(value as u8);
-        }
-    }
-    fn digest32(out: &mut Vec<u8>, bytes: &[u8; 32]) {
-        out.extend_from_slice(&[0x58, 32]);
-        out.extend_from_slice(bytes);
-    }
-
-    // `[schema, [tokens...]]`
-    let token_ids_bytes = |tokens: &[u32]| {
-        let mut out = vec![0x82];
-        text(&mut out, TOKEN_IDS_SCHEMA);
-        out.push(0x80 | tokens.len() as u8);
-        for token in tokens {
-            integer(&mut out, *token);
-        }
-        out
-    };
-
-    let generated = token_ids_bytes(&output_tokens);
-    assert_eq!(completed.generated_tokens.canonical_bytes(), generated);
-    let state_tokens = token_ids_bytes(&[9, 8, 7, 6, 101, 102, 103]);
-    assert_eq!(completed.state_tokens.canonical_bytes(), state_tokens);
-
-    // `[schema, tokens_id]`
-    let mut state = vec![0x82];
-    text(&mut state, TEXT_STATE_SCHEMA);
-    digest32(&mut state, Digest::hash(&state_tokens).as_bytes());
-    assert_eq!(completed.state.canonical_bytes(), state);
-
-    // `[schema, execution, position, state_id, generated_id]`
-    let mut artifact = vec![0x85];
-    text(&mut artifact, TEXT_ARTIFACT_OUTPUT_SCHEMA);
-    digest32(&mut artifact, execution.as_bytes());
-    integer(&mut artifact, output_tokens.len() as u32);
-    digest32(&mut artifact, Digest::hash(&state).as_bytes());
-    digest32(&mut artifact, Digest::hash(&generated).as_bytes());
-    assert_eq!(completed.artifact.canonical_bytes(), artifact);
-
-    assert_eq!(
-        hex(completed.artifact.output_id().as_bytes()),
-        "47e767f99550bbafc883a2a3968ecdee60288b47e002038a15898d2e2e34f4d8"
-    );
-
-    // The control: one more input token is a different state and a
-    // different artifact, though the generated tokens are the same.
-    let longer = completed_text(execution, &[9, 8, 7, 6, 5], &output_tokens);
-    assert_eq!(longer.generated_tokens, completed.generated_tokens);
-    assert_ne!(longer.artifact, completed.artifact);
-}
 
 fn payment_policy() -> hellas_channel::model::work::JobPaymentPolicyV2 {
     hellas_channel::model::work::JobPaymentPolicyV2 {

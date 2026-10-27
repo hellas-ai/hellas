@@ -16,10 +16,10 @@ use hellas_kernel::{
     WorkPaymentTerms, work_payment_settlement,
 };
 
-use crate::model::profile::WorkPolicy;
 use crate::model::work::{
     JobPaymentPolicyV2, PaidChannel, PaidChannelPolicyV1, PaidWorkError, PrivateRecord,
 };
+use hellas_rpc::protocol::invocation::InvocationPolicy;
 
 /// Why a configured channel is not one this endpoint may work over.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -226,7 +226,7 @@ pub struct WorkChannelConfig {
     /// The credit policy those terms commit to.
     pub channel_policy: PaidChannelPolicyV1,
     /// The execution policy in force on this channel.
-    pub work_policy: WorkPolicy,
+    pub invocation_policy: InvocationPolicy,
     /// Per-job payment terms, separate from execution limits.
     pub payment_policy: JobPaymentPolicyV2,
     /// The payment edge's value, reserve, and close fees as the
@@ -256,7 +256,7 @@ pub struct ProviderChannelPolicy {
     /// The credit policy this provider will work under.
     pub channel_policy: PaidChannelPolicyV1,
     /// The execution policy this provider will run jobs under.
-    pub work_policy: WorkPolicy,
+    pub invocation_policy: InvocationPolicy,
     /// Per-job payment terms, separate from execution limits.
     pub payment_policy: JobPaymentPolicyV2,
     /// The payment edge's value, reserve, and close fees as the provider
@@ -300,7 +300,9 @@ impl ProviderChannelPolicy {
             &self.policy_salt,
             self.channel_policy,
         )?;
-        self.work_policy.check()?;
+        self.invocation_policy
+            .validate()
+            .map_err(PaidWorkError::from)?;
         self.payment_policy.check()?;
         if work_payment_settlement(
             self.expected_payment_values,
@@ -314,7 +316,7 @@ impl ProviderChannelPolicy {
             channel,
             bond_edge,
             policy_salt: self.policy_salt,
-            work_policy: self.work_policy.clone(),
+            invocation_policy: self.invocation_policy.clone(),
             payment_policy: self.payment_policy,
             expected_payment_values: self.expected_payment_values,
         })
@@ -370,7 +372,7 @@ impl ProviderChannelPolicy {
             payment_terms,
             policy_salt: self.policy_salt,
             channel_policy: self.channel_policy,
-            work_policy: self.work_policy.clone(),
+            invocation_policy: self.invocation_policy.clone(),
             payment_policy: self.payment_policy,
             expected_payment_values: self.expected_payment_values,
         })
@@ -390,7 +392,7 @@ pub struct WorkChannelDescriptor {
     bond_edge: EdgeId,
     bond_terms_hash: TermsHash,
     policy_salt: [u8; 32],
-    work_policy: WorkPolicy,
+    invocation_policy: InvocationPolicy,
     /// Per-job payment terms, separate from execution limits.
     payment_policy: JobPaymentPolicyV2,
     expected_payment_values: EdgeValues,
@@ -430,7 +432,10 @@ impl WorkChannelDescriptor {
             &config.policy_salt,
             config.channel_policy,
         )?;
-        config.work_policy.check()?;
+        config
+            .invocation_policy
+            .validate()
+            .map_err(PaidWorkError::from)?;
         config.payment_policy.check()?;
 
         let settlement = work_payment_settlement(config.expected_payment_values, omission_bond)
@@ -442,7 +447,7 @@ impl WorkChannelDescriptor {
             bond_edge,
             bond_terms_hash,
             policy_salt: config.policy_salt,
-            work_policy: config.work_policy,
+            invocation_policy: config.invocation_policy,
             payment_policy: config.payment_policy,
             expected_payment_values: config.expected_payment_values,
         })
@@ -459,8 +464,8 @@ impl WorkChannelDescriptor {
     }
 
     /// Returns the execution policy in force on this channel.
-    pub const fn work_policy(&self) -> &WorkPolicy {
-        &self.work_policy
+    pub const fn invocation_policy(&self) -> &InvocationPolicy {
+        &self.invocation_policy
     }
 
     /// Returns the independently committed per-job payment terms.
@@ -481,7 +486,7 @@ impl WorkChannelDescriptor {
             channel: self.channel.clone(),
             bond_edge: self.bond_edge,
             policy_salt: self.policy_salt,
-            work_policy: self.work_policy.clone(),
+            invocation_policy: self.invocation_policy.clone(),
             payment_policy: self.payment_policy,
             expected_payment_values: self.expected_payment_values,
         }
@@ -598,7 +603,7 @@ impl WorkChannelDescriptor {
 
         Ok(ReadyChannel {
             channel: self.channel.clone(),
-            work_policy: self.work_policy.clone(),
+            invocation_policy: self.invocation_policy.clone(),
             payment_policy: self.payment_policy,
             settlement,
             finalized_height: observed.height,
@@ -628,14 +633,14 @@ pub struct CloseDescriptor {
     channel: PaidChannel,
     bond_edge: EdgeId,
     policy_salt: [u8; 32],
-    work_policy: WorkPolicy,
+    invocation_policy: InvocationPolicy,
     /// Per-job payment terms, separate from execution limits.
     payment_policy: JobPaymentPolicyV2,
     expected_payment_values: EdgeValues,
 }
 
 /// Only close-descriptor v3 is supported. Older formats require old binaries.
-const CLOSE_DESCRIPTOR_VERSION: u8 = 3;
+const CLOSE_DESCRIPTOR_VERSION: u8 = 4;
 
 impl CloseDescriptor {
     /// Returns the payment channel, including both complete terms bodies and
@@ -653,8 +658,8 @@ impl CloseDescriptor {
 
     /// Returns the execution policy the armed endpoint accepted.
     #[must_use]
-    pub const fn work_policy(&self) -> &WorkPolicy {
-        &self.work_policy
+    pub const fn invocation_policy(&self) -> &InvocationPolicy {
+        &self.invocation_policy
     }
 
     /// Returns the independently committed per-job payment terms.
@@ -699,8 +704,7 @@ impl CloseDescriptor {
     }
 
     /// Returns the descriptor's canonical journal bytes.
-    #[must_use]
-    pub fn encode(&self) -> Vec<u8> {
+    pub fn encode(&self) -> Result<Vec<u8>, WorkSetupError> {
         let mut out = vec![CLOSE_DESCRIPTOR_VERSION];
         push_kernel(&mut out, &self.channel.network());
         push_kernel(&mut out, &self.channel.payment_edge());
@@ -710,7 +714,10 @@ impl CloseDescriptor {
         );
         out.extend_from_slice(&self.policy_salt);
         out.extend_from_slice(&self.channel.channel_policy().encode());
-        let policy_bytes = self.work_policy.encode();
+        let policy_bytes = self
+            .invocation_policy
+            .canonical_bytes()
+            .map_err(PaidWorkError::from)?;
         out.extend_from_slice(&(policy_bytes.len() as u64).to_be_bytes());
         out.extend_from_slice(&policy_bytes);
         let payment_bytes = self.payment_policy.encode();
@@ -719,7 +726,7 @@ impl CloseDescriptor {
         out.extend_from_slice(&self.expected_payment_values.value().to_be_bytes());
         out.extend_from_slice(&self.expected_payment_values.reserve().to_be_bytes());
         push_kernel(&mut out, &self.expected_payment_values.close_fees());
-        out
+        Ok(out)
     }
 
     /// Reads one descriptor from exactly its canonical journal bytes.
@@ -757,7 +764,7 @@ impl CloseDescriptor {
         .map_err(|_| WorkSetupError::DescriptorMalformed)?;
         let policy_len = usize::try_from(cursor.u64().ok_or(WorkSetupError::DescriptorMalformed)?)
             .map_err(|_| WorkSetupError::DescriptorMalformed)?;
-        let work_policy = WorkPolicy::decode(
+        let invocation_policy = InvocationPolicy::from_canonical_bytes(
             cursor
                 .take(policy_len)
                 .ok_or(WorkSetupError::DescriptorMalformed)?,
@@ -790,7 +797,7 @@ impl CloseDescriptor {
             &policy_salt,
             channel_policy,
         )?;
-        work_policy.check()?;
+        invocation_policy.validate().map_err(PaidWorkError::from)?;
         if work_payment_settlement(
             expected_payment_values,
             channel.payment_terms().omission_bond,
@@ -803,7 +810,7 @@ impl CloseDescriptor {
             bond_edge: channel.payment_terms().bond_edge,
             channel,
             policy_salt,
-            work_policy,
+            invocation_policy,
             payment_policy,
             expected_payment_values,
         })
@@ -861,7 +868,7 @@ pub struct ObservedChannel<'a> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReadyChannel {
     channel: PaidChannel,
-    work_policy: WorkPolicy,
+    invocation_policy: InvocationPolicy,
     /// Per-job payment terms, separate from execution limits.
     payment_policy: JobPaymentPolicyV2,
     settlement: WorkPaymentSettlement,
@@ -887,8 +894,8 @@ impl ReadyChannel {
     /// whose margins [`Self::check_signable`] measures against and whose
     /// digest the authorization names. Carrying it here is what stops
     /// those three from being three copies.
-    pub const fn work_policy(&self) -> &WorkPolicy {
-        &self.work_policy
+    pub const fn invocation_policy(&self) -> &InvocationPolicy {
+        &self.invocation_policy
     }
 
     /// Returns the independently committed per-job payment terms.

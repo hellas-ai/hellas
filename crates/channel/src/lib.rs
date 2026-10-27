@@ -16,6 +16,7 @@ pub mod test_support;
 
 pub mod content;
 pub mod endpoint_lock;
+pub mod job;
 pub mod model;
 pub mod work;
 pub mod work_close;

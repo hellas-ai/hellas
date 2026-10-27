@@ -1,5 +1,4 @@
 use super::*;
-use hellas_channel::model::{fetch::PreparedPaidFetchInputV1, profile::PreparedWorkInput};
 use hellas_rpc::http_fetch::{HttpFetchRequest, HttpTrustRoots};
 use {crate::test_support::ids, hellas_channel::test_support::actors::*};
 
@@ -108,18 +107,25 @@ impl Case {
                     Retention::Ephemeral,
                 )
                 .unwrap();
-                request.input = PreparedWorkInput::from(
-                    PreparedPaidFetchInputV1::new(&events, &contract).unwrap(),
-                );
+                request.input = hellas_rpc::protocol::invocation::fetch::prepare(
+                    &events,
+                    &contract,
+                    PROVIDER.node_key().public_key(),
+                    request.input.application_policy.0.clone(),
+                    [1; 32],
+                )
+                .unwrap();
                 request.authorization.input_content =
-                    hellas_rpc::ContentRef::for_bytes(&request.input.encode().unwrap());
-                request.authorization.prepared_input_digest = request
-                    .input
-                    .bound_digest(network(), request.authorization.channel_id.0)
+                    hellas_rpc::ContentRef::for_bytes(&request.input.canonical_bytes().unwrap());
+                request.authorization.prepared_input_digest =
+                    hellas_channel::job::bound_prepared_input_digest(
+                        network(),
+                        request.authorization.channel_id.0,
+                        &request.input,
+                    )
                     .unwrap();
-                request.authorization.request_commitment = RequestCommitment::from_digest(
-                    request.input.input_commitment().unwrap().digest(),
-                );
+                request.authorization.request_commitment =
+                    request.input.request.commitment().unwrap();
             }
             _ => {}
         }

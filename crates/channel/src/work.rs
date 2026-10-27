@@ -64,22 +64,14 @@
 //!
 //! # Delivering the answer
 //!
-//! [`ProviderEndpoint::deliver`] and [`ClientEndpoint::receive`] are the
-//! third exchange, and they obey the same rule at the one moment it is
-//! irreversible: the release marker — which is what debits this client's
-//! delivery credit — is fsynced before a byte of plaintext is returned.
+//! Signed events cross one authenticated result stream. The release marker
+//! reserves delivery credit durably before its first plaintext prefix. The
+//! client records the result only after verifying the complete terminal and
+//! successful stream status; authenticated verification is durable before a
+//! payment certificate leaves.
 //!
-//! It is one unary call carrying the whole answer, and that is the
-//! profile rather than a shortcut. Nothing is released before the
-//! terminal result is durable and its price is reserved, so there is no
-//! prefix to stream; what the client gets is the signed result and the
-//! transcript the provider's own journal holds, and what it does with
-//! them is rebuild one from the other before anything is stored.
-//!
-//! A lost response costs a round trip. The provider answers a second
-//! call from the same spool and re-commits the same marker as a
-//! redundant step, so one job's plaintext is debited once however many
-//! times it is fetched.
+//! A retry reads the retained spool and repeats the same release marker,
+//! so delivery credit is debited once per job.
 //!
 //! # Paying for it
 //!
@@ -125,8 +117,10 @@ mod client_channel;
 pub use client_channel::{ClientChannel, ClientDriver, ClientObserver, ClientService};
 
 pub mod admission;
+mod admitted;
+pub use admitted::Admitted;
 mod stream;
-use admission::{AdmissionError, AdmittedWork, CapacityDomain, WorkAdmission, WorkPermit};
+use admission::{AdmissionError, CapacityDomain, WorkAdmission, WorkPermit};
 pub use stream::{PaidProgress, PaidResultStream, ProgressError, fetch_result_stream};
 
 mod upload;
@@ -147,9 +141,6 @@ use hellas_wire::{StreamTransport, TransportContext, WireStatus};
 
 use prost::Message as _;
 
-use crate::model::fetch::{FetchPolicyV2, PreparedPaidFetchInputParts};
-use crate::model::prepared_input::PreparedPaidInputParts;
-use crate::model::profile::{PreparedWorkInput as PreparedWorkBundle, WorkPolicy};
 use crate::model::setup::{ObservedChannel, ReadyChannel, WorkSetupError};
 use crate::model::work::encode_kernel;
 use crate::model::work::{
@@ -162,7 +153,6 @@ use crate::work_close::{
     adjudicated_close, advance_close, catch_up, close_duty_present, close_response, close_start,
     observe, response_body_digest,
 };
-use crate::work_store::journal::MAX_RECORD_BYTES;
 use crate::work_store::{
     Channel, ChannelRecord, ChannelStateError, ChannelStore, JobPhase, JobState, PaidCertificate,
     Role, TerminalOutcome, WorkStoreError,
@@ -171,13 +161,18 @@ use hellas_auth::Digest;
 use hellas_rpc::observe::{LEVEL, TARGET, Timing};
 use hellas_rpc::pb::work::{
     AcceptWorkRequest, AcceptWorkResponse, AdmitCertificateRequest, AdmitCertificateResponse,
-    DeliverResultRequest, DeliverResultResponse, WorkAccepted, WorkDelivered, WorkPaid,
-    WorkRefusalCode, WorkRefused, accept_work_response::Outcome,
-    admit_certificate_response::Outcome as AdmitOutcome,
-    deliver_result_response::Outcome as DeliverOutcome,
+    StreamResultRequest, WorkAccepted, WorkPaid, WorkRefusalCode, WorkRefused,
+    accept_work_response::Outcome, admit_certificate_response::Outcome as AdmitOutcome,
 };
+use hellas_rpc::protocol::invocation::{AdmissionFacts, PreparedInvocation};
 use hellas_rpc::services::work::{WorkClientImpl, WorkHandler};
-use hellas_rpc::{EvaluateRequest, OutputEventEnvelope, SubmitTxOutcome};
+use hellas_rpc::{OutputEventEnvelope, SubmitTxOutcome};
+
+pub(super) struct ResultTranscript {
+    result: Vec<u8>,
+    provider_signature: Vec<u8>,
+    transcript: Vec<u8>,
+}
 
 // ── Refusals ──────────────────────────────────────────────────────────
 
@@ -407,9 +402,6 @@ pub enum EndpointError {
     /// found, so the two bound payments differently.
     #[error("the store's settlement is not the one this readiness read")]
     WrongSettlement,
-    /// Paid Fetch providers must never persist customer payloads.
-    #[error("paid fetch requires a provider journal containing metadata only")]
-    PayloadRetention,
     /// The journal is the other role's.
     #[error("the store is the {found} journal, and this is the {expected} endpoint")]
     WrongRole {
@@ -458,12 +450,6 @@ fn bind(
     signer: &Secp256k1Signer,
     role: Role,
 ) -> Result<(), EndpointError> {
-    if role == Role::Provider
-        && matches!(ready.work_policy(), WorkPolicy::Fetch { .. })
-        && !store.metadata_only()
-    {
-        return Err(EndpointError::PayloadRetention);
-    }
     let state = store.state();
     if state.channel() != ready.channel() {
         return Err(EndpointError::WrongChannel);
@@ -782,7 +768,7 @@ impl ProviderEndpoint {
                     self.close
                         .store
                         .uploads
-                        .publish_accepted(work_id, &bytes)
+                        .publish_accepted(work_id, &bytes, authorization.retention)
                         .map_err(content_refusal)?;
                 }
             }
@@ -799,11 +785,12 @@ impl ProviderEndpoint {
             return Err(Refusal::new(WorkRefusal::Declined, "channel is closing"));
         }
         let (cursor_height, _) = self.state().cursor();
-        let policy = ready.work_policy();
-        policy.check_authorization(
+        let policy = ready.invocation_policy();
+        crate::job::check_authorization(
             ready.channel(),
-            ready.payment_policy(),
             &authorization,
+            policy,
+            ready.payment_policy(),
             cursor_height,
         )?;
         ready.check_signable(
@@ -818,27 +805,36 @@ impl ProviderEndpoint {
                 "input reference differs from the signed proposal",
             ));
         }
-        if self
-            .close
-            .store
-            .uploads
-            .missing_bytes(reference)
-            .map_err(content_refusal)?
-            > policy.max_upload_bytes()
-        {
-            return Err(content_refusal(crate::content::ContentError::UploadLimit(
-                policy.max_upload_bytes(),
-            )));
-        }
         let prepared_input = self
             .close
             .store
             .uploads
-            .read(work_id, reference)
+            .read(work_id, reference, authorization.retention)
             .map_err(content_refusal)?;
-        let bundle = PreparedWorkBundle::decode(&prepared_input, crate::content::MAX_CONTENT_BYTES)
+        let bundle = PreparedInvocation::from_canonical_bytes(
+            &prepared_input,
+            crate::content::MAX_CONTENT_BYTES,
+        )
+        .map_err(|error| Refusal::invalid(error.to_string()))?;
+        crate::job::check_paid_input(ready.channel(), &authorization, policy, &bundle)?;
+
+        let manifest = bundle
+            .manifest()
             .map_err(|error| Refusal::invalid(error.to_string()))?;
-        policy.check_input(ready.channel(), &authorization, &bundle)?;
+        let root = self
+            .close
+            .store
+            .uploads
+            .root(work_id, manifest.root(), authorization.retention)
+            .map_err(content_refusal)?;
+        let objects =
+            crate::job::content_closure(policy, &manifest, &root, authorization.input_content)?;
+        let content = self
+            .close
+            .store
+            .uploads
+            .invocation_content(work_id, &objects, authorization.retention)
+            .map_err(content_refusal)?;
 
         // The client's signature, its bundle, and the credit this job
         // costs, on the disk before a co-signature exists to leak.
@@ -854,6 +850,7 @@ impl ProviderEndpoint {
             )
             .await?;
 
+        self.close.store.remember_content(work_id, content);
         let signature = self.close.signer.sign(signing_hash(work_id));
         self.close
             .store
@@ -868,7 +865,7 @@ impl ProviderEndpoint {
         self.close
             .store
             .uploads
-            .publish_accepted(work_id, &prepared_input)
+            .publish_accepted(work_id, &prepared_input, authorization.retention)
             .map_err(content_refusal)?;
         Ok((work_id, signature))
     }
@@ -884,8 +881,7 @@ impl ProviderEndpoint {
     /// Decides whether the backend may be invoked for `work_id`, and
     /// makes that decision durable before it is returned.
     ///
-    /// [`RunAdmission::Invoke`] or [`RunAdmission::InvokeFetch`] is
-    /// returned only when the job was
+    /// [`RunAdmission::Invoke`] is returned only when the job was
     /// accepted and not yet running, and only after the running marker
     /// is on the disk — so a crash between the marker and the answer
     /// costs the invocation, never a second one. Every other phase past
@@ -907,12 +903,9 @@ impl ProviderEndpoint {
     /// finalized blocks through, not at the height the readiness was
     /// decided at.
     ///
-    /// The request and canonical manifest it hands back are rebuilt from the
-    /// bundle the journal holds, never from a quote. That bundle is the one the
-    /// authorization both parties signed commits to: its digest is checked
-    /// before it is stored and again on every replay
-    /// (`Channel::apply_proposed`), so a bundle altered on disk fails when
-    /// the journal is opened rather than producing a job nobody agreed to.
+    /// The authorization binds the exact request, manifest and input bytes.
+    /// Retained content is recovered and verified from the content store;
+    /// ephemeral content must still be present in this process's RAM.
     ///
     /// # Errors
     ///
@@ -950,7 +943,7 @@ impl ProviderEndpoint {
         }
 
         bind(ready, &self.close.store, &self.close.signer, Role::Provider)?;
-        if ready.work_policy() != self.admitting()?.work_policy()
+        if ready.invocation_policy() != self.admitting()?.invocation_policy()
             || ready.payment_policy() != self.admitting()?.payment_policy()
         {
             return Err(RunError::Policy);
@@ -976,28 +969,26 @@ impl ProviderEndpoint {
         if job.prepared_input().is_empty() {
             return Ok(RunAdmission::Indeterminate);
         }
-        let bundle =
-            PreparedWorkBundle::decode(job.prepared_input(), crate::content::MAX_CONTENT_BYTES)
-                .map_err(PaidWorkError::from)?;
-        ready
-            .work_policy()
-            .check_input(ready.channel(), &authorization, &bundle)?;
-        let admission = match (bundle, ready.work_policy()) {
-            (PreparedWorkBundle::Evaluate(bundle), WorkPolicy::Evaluate(_)) => {
-                RunAdmission::Invoke(Box::new(PreparedEvaluateInput {
-                    parts: bundle.parts().map_err(PaidWorkError::from)?,
-                    admission: WorkAdmission::payment(),
-                }))
-            }
-            (PreparedWorkBundle::Fetch(bundle), WorkPolicy::Fetch { policy, .. }) => {
-                RunAdmission::InvokeFetch(Box::new(PreparedFetchInput {
-                    parts: bundle.parts().map_err(PaidWorkError::from)?,
-                    policy: *policy,
-                    admission: WorkAdmission::payment(),
-                }))
-            }
-            _ => return Err(RunError::Policy),
-        };
+        let bundle = PreparedInvocation::from_canonical_bytes(
+            job.prepared_input(),
+            crate::content::MAX_CONTENT_BYTES,
+        )
+        .map_err(PaidWorkError::from)?;
+        let facts = crate::job::check_paid_input(
+            ready.channel(),
+            &authorization,
+            ready.invocation_policy(),
+            &bundle,
+        )?;
+        let admission = RunAdmission::Invoke(Box::new(Admitted::new(
+            bundle,
+            facts.limits,
+            facts.capacity_domain,
+            self.close
+                .store
+                .invocation_content(work_id, ready.invocation_policy())?,
+            WorkAdmission::payment(),
+        )));
 
         self.close
             .store
@@ -1012,7 +1003,7 @@ impl ProviderEndpoint {
     /// Signs the result of the transcript this job's invocation
     /// produced, and returns it only once it is on the disk.
     ///
-    /// The transcript is the provider's own: [`crate::model::work::terminal_result`] refuses
+    /// The transcript is the provider's own: [`crate::job::paid_terminal_result`] refuses
     /// events that are not one verified chain for this authorization's
     /// request under the channel's provider key, and the journal refuses
     /// the record unless the job is running, is not indeterminate, and
@@ -1035,9 +1026,11 @@ impl ProviderEndpoint {
     ) -> Result<(PaidJobResultV1, Sig), RunError> {
         let job = self.state().job_by_id(work_id).ok_or(RunError::NoSuchJob)?;
         let authorization = *job.authorization();
-        let input =
-            PreparedWorkBundle::decode(job.prepared_input(), crate::content::MAX_CONTENT_BYTES)
-                .map_err(|e| RunError::Transcript(e.into()))?;
+        let input = PreparedInvocation::from_canonical_bytes(
+            job.prepared_input(),
+            crate::content::MAX_CONTENT_BYTES,
+        )
+        .map_err(|e| RunError::Transcript(e.into()))?;
         let ready = self
             .ready
             .as_ref()
@@ -1049,64 +1042,42 @@ impl ProviderEndpoint {
         // upstream work that the client may still pay for. Release and
         // payment still require a fresh observation.
         let channel = ready.channel();
-        let result = ready
-            .work_policy()
-            .terminal_result(channel, &authorization, &input, transcript)
-            .map_err(RunError::Transcript)?;
+        let result = crate::job::paid_terminal_result(
+            channel,
+            &authorization,
+            ready.invocation_policy(),
+            &input,
+            transcript,
+        )
+        .map_err(RunError::Transcript)?;
         let spool = encode_transcript(transcript).map_err(RunError::Transcript)?;
-        let spooled = u64::try_from(spool.len()).unwrap_or(u64::MAX);
-        let limit = ready.work_policy().max_spool_bytes();
-        if spooled > limit {
-            return Err(RunError::Record(PaidWorkError::OverEnvelope {
-                field: "spooled transcript length",
-                actual: spooled,
-                limit,
-            }));
-        }
+        let facts = crate::job::check_paid_input(
+            channel,
+            &authorization,
+            ready.invocation_policy(),
+            &input,
+        )?;
         let signature = self
             .close
             .signer
             .sign(signing_hash(result_digest(channel, &result)));
-        // The delivery this result will become, measured before it is
-        // recorded. The client refuses a frame over the bound both
-        // parties signed, so a result that does not fit is one the
-        // client cannot record a receipt for and therefore cannot pay
-        // for — and recording it anyway would leave a job the ending
-        // ledger charges this client for over an answer it was never
-        // able to take. The client's own check is the other end of the
-        // same bound, against a provider that does not apply this one.
-        let delivered = WorkDelivered {
+        let delivered = ResultTranscript {
             result: result.encode(),
             provider_signature: signature.as_bytes().to_vec(),
-            transcript: spool.clone(),
+            transcript: Vec::new(),
         };
-        let frame = if matches!(ready.work_policy(), WorkPolicy::Fetch { .. }) {
-            if spool.len() > crate::model::fetch::MAX_FETCH_TRANSCRIPT_BYTES {
+        for frame in stream::result_frames(&delivered, transcript, facts.max_encoded_result_frame) {
+            let frame = frame?;
+            if frame.encoded_len() as u64
+                > u64::from(facts.max_encoded_result_frame)
+                    .min(hellas_wire::frame::MAX_FRAME_BYTES as u64)
+            {
                 return Err(RunError::Record(PaidWorkError::OverEnvelope {
-                    field: "Fetch transcript",
-                    actual: spool.len() as u64,
-                    limit: crate::model::fetch::MAX_FETCH_TRANSCRIPT_BYTES as u64,
+                    field: "encoded result frame",
+                    actual: frame.encoded_len() as u64,
+                    limit: u64::from(facts.max_encoded_result_frame),
                 }));
             }
-            stream::fetch_frames(
-                &delivered,
-                transcript,
-                ready.work_policy().max_encoded_result_frame(),
-            )
-            .try_fold(0, |size, frame| {
-                Ok::<_, RunError>(size.max(frame?.encoded_len() as u64))
-            })?
-        } else {
-            delivered.encoded_len() as u64
-        };
-        let frame_limit = u64::from(ready.work_policy().max_encoded_result_frame())
-            .min(hellas_wire::frame::MAX_FRAME_BYTES as u64);
-        if frame > frame_limit {
-            return Err(RunError::Record(PaidWorkError::OverEnvelope {
-                field: "encoded result frame",
-                actual: frame,
-                limit: frame_limit,
-            }));
         }
         self.close
             .store
@@ -1123,60 +1094,12 @@ impl ProviderEndpoint {
         Ok((result, signature))
     }
 
-    /// Releases the answer for a job whose result is signed and durable.
-    ///
-    /// The order is the module's rule applied to plaintext: the release
-    /// is journaled — which is what debits this client's delivery
-    /// credit — before a byte of the answer is returned. A crash between
-    /// the two costs a round trip and no credit: the retry finds the job
-    /// already delivered, re-commits the same marker as a redundant
-    /// step, and hands back the same bytes.
-    ///
-    /// That is the whole of the idempotence claim, and it is worth being
-    /// exact about its key. The marker is per open job, not per
-    /// `(work_id, result_digest)` pair, because a job has at most one
-    /// result: the journal refuses a second one for the same job
-    /// outright. So a replay carrying a different result is not a
-    /// conflict resolved here — it is a request this endpoint has no
-    /// second answer to give.
-    ///
-    /// The deadline is checked on every call, including replays. A
-    /// release begun too late to arrive is refused even though the
-    /// plaintext already left on the first attempt, because the client's
-    /// own journal refuses a receipt past the same deadline: bytes it
-    /// may not record are bytes it cannot pay for.
-    ///
-    /// # Errors
-    ///
-    /// [`DeliverError::Malformed`] when a field is not the identifier
-    /// or signature it must be, [`DeliverError::NoSuchJob`] when neither
-    /// an open job nor a retained terminal carries this `work_id`,
-    /// [`DeliverError::Terminated`] when the job has ended permanently,
-    /// [`DeliverError::Unbound`] when
-    /// the signature is not the channel's client's over this connection,
-    /// [`DeliverError::NoResult`] before the result is
-    /// signed, [`DeliverError::Endpoint`] when `ready` is not this
-    /// endpoint's channel, [`DeliverError::Policy`] when it carries
-    /// another execution policy, [`DeliverError::Setup`] when
-    /// the delivery margin no longer fits, and [`DeliverError::Store`]
-    /// when the release cannot be made durable — which is what happens
-    /// when this client's delivery credit is exhausted.
-    pub async fn deliver(
-        &mut self,
-        request: &DeliverResultRequest,
-        ready: &ReadyChannel,
-        exporter: &[u8; 32],
-    ) -> Result<Delivery, DeliverError> {
-        self.deliver_with_readiness(request, Some(ready), exporter)
-            .await
-    }
-
     /// A retained terminal needs authentication, but no permission to admit
     /// new work. Actual delivery still uses this endpoint's readiness, or
     /// the explicitly supplied decision checked against it below.
-    async fn deliver_with_readiness(
+    async fn release_ready(
         &mut self,
-        request: &DeliverResultRequest,
+        request: &StreamResultRequest,
         ready: Option<&ReadyChannel>,
         exporter: &[u8; 32],
     ) -> Result<Delivery, DeliverError> {
@@ -1229,7 +1152,7 @@ impl ProviderEndpoint {
         let terminal_deadline = job.authorization().terminal_deadline;
 
         bind(ready, &self.close.store, &self.close.signer, Role::Provider)?;
-        if ready.work_policy() != admitted.work_policy()
+        if ready.invocation_policy() != admitted.invocation_policy()
             || ready.payment_policy() != admitted.payment_policy()
         {
             return Err(DeliverError::Policy);
@@ -1305,6 +1228,37 @@ impl ProviderEndpoint {
             observation.check()?;
         }
 
+        let signed_result = self
+            .state()
+            .job_by_id(work_id)
+            .and_then(|job| job.result().copied())
+            .or_else(|| {
+                self.state()
+                    .terminal_by_id(work_id)
+                    .and_then(|terminal| match &terminal.outcome {
+                        TerminalOutcome::Certified { signed_result, .. } => Some(**signed_result),
+                        _ => None,
+                    })
+            })
+            .ok_or_else(|| {
+                WorkStoreError::Channel(
+                    if let Some(terminal) = self.state().terminal_by_id(work_id) {
+                        ChannelStateError::Terminated {
+                            step: "crediting a payment",
+                            outcome: terminal.outcome.name(),
+                        }
+                    } else if let Some(job) = self.state().job_by_id(work_id) {
+                        ChannelStateError::WrongPhase {
+                            step: "crediting a payment",
+                            phase: job.phase().name(),
+                        }
+                    } else {
+                        ChannelStateError::WrongChannel {
+                            field: "binding work_id",
+                        }
+                    },
+                )
+            })?;
         let state = self
             .close
             .store
@@ -1312,6 +1266,7 @@ impl ProviderEndpoint {
                 ChannelRecord::JobTerminated {
                     work_id,
                     outcome: TerminalOutcome::Certified {
+                        signed_result: Box::new(signed_result),
                         certificate,
                         binding: Box::new(binding),
                         binding_signature,
@@ -1862,185 +1817,26 @@ impl From<AdmissionError> for BackendFault {
     }
 }
 
-/// The complete journaled input handed to a paid Evaluate backend.
-///
-/// All six bodies come from the same strictly decoded [`crate::model::prepared_input::PreparedPaidInputV1`]
-/// whose digest the parties signed. Keeping the execution, tokens, policy, and
-/// identity here is what lets a backend run after restart without depending on
-/// transient executor state. Environment bytes remain content-store data below
-/// the manifest root and do not cross this seam.
-#[derive(Debug)]
-pub struct PreparedEvaluateInput<A = WorkAdmission> {
-    parts: PreparedPaidInputParts,
-    admission: A,
-}
-
-impl PreparedEvaluateInput {
-    pub fn admitted(parts: PreparedPaidInputParts, admission: WorkAdmission) -> Self {
-        Self { parts, admission }
-    }
-    pub async fn reserve(
-        self,
-        payment: impl core::future::Future<Output = Result<WorkPermit, BackendFault>>,
-    ) -> Result<PreparedEvaluateInput<AdmittedWork>, BackendFault> {
-        let admission = self.admission.reserve(CapacityDomain::Gpu, payment).await?;
-        Ok(PreparedEvaluateInput {
-            parts: self.parts,
-            admission,
-        })
-    }
-}
-impl<A> PreparedEvaluateInput<A> {
-    pub fn into_parts_and_admission(self) -> (PreparedPaidInputParts, A) {
-        (self.parts, self.admission)
-    }
-    /// Returns the Evaluate request rebuilt from the journal.
-    #[must_use]
-    pub const fn evaluate_request(&self) -> &EvaluateRequest {
-        &self.parts.evaluate_request
-    }
-
-    /// Returns the exact canonical ProgramManifest bytes from the journal.
-    #[must_use]
-    pub fn program_manifest(&self) -> Vec<u8> {
-        self.parts.manifest.canonical_bytes()
-    }
-
-    /// Transfers all six strictly decoded bodies to the backend implementation.
-    #[must_use]
-    pub fn into_parts(self) -> PreparedPaidInputParts {
-        self.parts
-    }
-}
-
-/// A paid Fetch input admitted under a channel policy. It is held only in
-/// memory on the provider, even while the job's accounting state is durable.
-#[derive(Debug)]
-pub struct PreparedFetchInput<A = WorkAdmission> {
-    parts: PreparedPaidFetchInputParts,
-    policy: FetchPolicyV2,
-    admission: A,
-}
-
-impl PreparedFetchInput {
-    /// Builds an admitted input from its verified parts and channel policy.
-    #[must_use]
-    pub fn new(parts: PreparedPaidFetchInputParts, policy: FetchPolicyV2) -> Self {
-        Self {
-            parts,
-            policy,
-            admission: WorkAdmission::payment(),
-        }
-    }
-    pub fn admitted(
-        parts: PreparedPaidFetchInputParts,
-        policy: FetchPolicyV2,
-        admission: WorkAdmission,
-    ) -> Self {
-        Self {
-            parts,
-            policy,
-            admission,
-        }
-    }
-    pub async fn reserve(
-        self,
-        payment: impl core::future::Future<Output = Result<WorkPermit, BackendFault>>,
-    ) -> Result<PreparedFetchInput<AdmittedWork>, BackendFault> {
-        let admission = self
-            .admission
-            .reserve(CapacityDomain::Fetch, payment)
-            .await?;
-        Ok(PreparedFetchInput {
-            parts: self.parts,
-            policy: self.policy,
-            admission,
-        })
-    }
-}
-impl<A> PreparedFetchInput<A> {
-    pub fn into_parts_and_admission(self) -> (PreparedPaidFetchInputParts, A) {
-        (self.parts, self.admission)
-    }
-    /// Returns the fixed output bounds the provider must enforce while running.
-    pub const fn policy(&self) -> &FetchPolicyV2 {
-        &self.policy
-    }
-
-    /// Transfers the signed request and canonical manifest to the backend.
-    pub fn into_parts(self) -> PreparedPaidFetchInputParts {
-        self.parts
-    }
-}
-
-/// One admitted request, retaining its profile's input, limits and capacity ticket.
-#[derive(Debug)]
-pub enum PreparedWorkInput {
-    Evaluate(Box<PreparedEvaluateInput>),
-    Fetch(Box<PreparedFetchInput>),
-}
-
-impl From<PreparedEvaluateInput> for PreparedWorkInput {
-    fn from(input: PreparedEvaluateInput) -> Self {
-        Self::Evaluate(Box::new(input))
-    }
-}
-
-impl From<PreparedFetchInput> for PreparedWorkInput {
-    fn from(input: PreparedFetchInput) -> Self {
-        Self::Fetch(Box::new(input))
-    }
-}
-
-/// The one seam a paid job crosses on its way to real execution.
-///
-/// The endpoint selects Evaluate or Fetch from the admitted profile and passes
-/// the verified prepared input. Evaluate inputs survive journal recovery;
-/// Fetch bodies exist only in this process's memory. Implement only the profiles
-/// the backend serves; unsupported profiles fail without running work.
-/// What comes back is the complete signed transcript of that invocation — not
-/// a digest of one, because a digest is exactly what a backend that ran nothing
-/// could also return.
-///
-/// Implementors must invoke once per call. That is not a property this
-/// trait can check, and it is not the one the gate rests on: the gate
-/// calls this at most once per `work_id` whatever the implementor does.
+/// One application-neutral invocation seam after funding and resource admission.
 pub trait WorkBackend: Sync {
-    /// A grant must reserve bounded executor capacity before co-signature.
     fn try_admit(&self, domain: CapacityDomain) -> Result<WorkPermit, BackendFault>;
-
-    /// Runs an admitted request to its complete signed transcript.
     fn execute(
         &self,
-        input: PreparedWorkInput,
+        input: Admitted<PreparedInvocation>,
     ) -> impl core::future::Future<Output = Result<Vec<OutputEventEnvelope>, BackendFault>> + Send
     {
-        async move {
-            let domain = match input {
-                PreparedWorkInput::Evaluate(_) => CapacityDomain::Gpu,
-                PreparedWorkInput::Fetch(_) => CapacityDomain::Fetch,
-            };
-            Err(AdmissionError::Unsupported(domain).into())
-        }
+        async move { Err(AdmissionError::Unsupported(input.capacity_domain()).into()) }
     }
-
-    /// Runs once, exposing authenticated prefixes before terminal delivery.
     fn execute_stream(
         &self,
-        input: PreparedWorkInput,
+        input: Admitted<PreparedInvocation>,
         progress: PaidProgress,
     ) -> impl core::future::Future<Output = Result<Vec<OutputEventEnvelope>, BackendFault>> + Send
     {
         async move {
-            let kind = match &input {
-                PreparedWorkInput::Evaluate(_) => hellas_rpc::evaluate::TOKEN_DELTA_EVENT_KIND,
-                PreparedWorkInput::Fetch(_) => hellas_rpc::fetch::OUTPUT_EVENT_KIND,
-            };
             let events = self.execute(input).await?;
-            for event in &events {
-                if event.event().body().kind() == kind {
-                    progress(event.clone())?;
-                }
+            for event in &events[..events.len().saturating_sub(1)] {
+                progress(event.clone())?;
             }
             Ok(events)
         }
@@ -2052,9 +1848,7 @@ pub trait WorkBackend: Sync {
 pub enum RunAdmission {
     /// The marker is durable and the backend has not been called.
     /// Invoke exactly once, with this journaled input.
-    Invoke(Box<PreparedEvaluateInput>),
-    /// The fetch running marker is durable; invoke once with the in-memory input.
-    InvokeFetch(Box<PreparedFetchInput>),
+    Invoke(Box<Admitted<PreparedInvocation>>),
     /// This process marked the job and has not recorded its result.
     Running,
     /// A signed result already exists.
@@ -2078,8 +1872,8 @@ pub enum RunAdmission {
 /// leaves a job whose `Completed` never comes.
 ///
 /// Neither variant carries the transcript, and no caller needs one to:
-/// the invocation's events are journaled beside the result, and
-/// [`ProviderEndpoint::deliver`] is what serves them. Handing them back
+/// the invocation's events are held by its content view and the result stream
+/// serves them. Handing them back
 /// here as well would put the answer in two places and make the second
 /// one look authoritative.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2179,19 +1973,24 @@ where
     B: WorkBackend + Sync,
 {
     let admission = service.begin_run(work_id, ready).await?;
-    let progress_service = service.clone();
-    let progress_policy = ready.work_policy().clone();
-    let progress: PaidProgress =
-        Arc::new(move |event| progress_service.publish_progress(work_id, &progress_policy, event));
     let input = match admission {
-        RunAdmission::Invoke(input) => PreparedWorkInput::Evaluate(input),
-        RunAdmission::InvokeFetch(input) => PreparedWorkInput::Fetch(input),
+        RunAdmission::Invoke(input) => *input,
         RunAdmission::Running => return Ok(RunOutcome::Running),
         RunAdmission::Indeterminate => return Ok(RunOutcome::Indeterminate),
         RunAdmission::Ready { result, signature } => {
             return Ok(RunOutcome::Ready { result, signature });
         }
     };
+    let facts = ready
+        .invocation_policy()
+        .admit(
+            input.invocation(),
+            &hellas_auth::PublicKey::Secp256k1(ready.channel().client_key().to_bytes()),
+        )
+        .map_err(PaidWorkError::from)?;
+    let progress_service = service.clone();
+    let progress: PaidProgress =
+        Arc::new(move |event| progress_service.publish_progress(work_id, &facts, event));
 
     let transcript = match backend.execute_stream(input, progress).await {
         Ok(transcript) => transcript,
@@ -2219,8 +2018,7 @@ where
 ///
 /// The two travel together because neither is the answer alone. The
 /// result is a pair of digests the provider stands behind; the
-/// transcript is the signed events those digests are over, and the
-/// tokens the client actually wanted.
+/// transcript is the signed events those digests authenticate.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Delivery {
     /// The provider's signed result.
@@ -2627,7 +2425,7 @@ impl ChannelDriver<'_> {
     /// one contradicts a stranger: ending a job clears the open one but
     /// keeps the terminal, so a check that read only the open job would
     /// stop refusing the moment the job was certified, expired, failed
-    /// or refuted.
+    /// or rejected.
     ///
     /// A channel that has neither holds no job to contradict, which is
     /// the acceptance phase boundary's own case: the digest being caught
@@ -2987,7 +2785,7 @@ impl WorkService {
                             .close
                             .store
                             .uploads
-                            .publish_accepted(work_id, &bytes)
+                            .publish_accepted(work_id, &bytes, authorization.retention)
                             .map_err(content_refusal)?;
                     }
                 }
@@ -3071,29 +2869,6 @@ impl WorkService {
         result.and(cleanup)
     }
 
-    /// Releases one job's plaintext against this service's own
-    /// readiness, to a request bound to `exporter`.
-    ///
-    /// The readiness is not a parameter, and that is deliberate: it is
-    /// the endpoint's own, at the height this endpoint has actually
-    /// processed finalized blocks through. A caller choosing one would
-    /// be choosing the margins its own delivery is measured against.
-    ///
-    /// # Errors
-    ///
-    /// [`DeliverError::Endpoint`] when the endpoint is unreachable, and
-    /// whatever [`ProviderEndpoint::deliver`] raises otherwise.
-    pub async fn deliver(
-        &self,
-        request: &DeliverResultRequest,
-        exporter: &[u8; 32],
-    ) -> Result<Delivery, DeliverError> {
-        self.endpoint()
-            .await?
-            .deliver_with_readiness(request, None, exporter)
-            .await
-    }
-
     /// Releases one job's answer, or says why not.
     ///
     /// The exporter comes from `context`, which is the transport's own
@@ -3107,33 +2882,20 @@ impl WorkService {
     /// exactly the sense [`ReadyChannel`] documents; what is measured
     /// against it is the height this endpoint has actually processed
     /// finalized blocks through.
-    async fn release(
+    async fn retained_delivery(
         &self,
-        request: &DeliverResultRequest,
+        request: &StreamResultRequest,
         context: &TransportContext,
-    ) -> DeliverResultResponse {
-        let outcome = match (self.endpoint().await, context.open_exporter) {
-            (Ok(mut endpoint), Some(exporter)) => endpoint
-                .deliver_with_readiness(request, None, &exporter)
-                .await
-                .map_err(Refusal::from),
-            (Ok(_), None) => Err(Refusal::from(DeliverError::Unbindable)),
-            (Err(error), _) => Err(Refusal::new(endpoint_refusal(error), error.to_string())),
-        };
-        DeliverResultResponse {
-            outcome: Some(match outcome {
-                Ok(delivery) => DeliverOutcome::Delivered(WorkDelivered {
-                    result: delivery.result.encode(),
-                    provider_signature: delivery.signature.as_bytes().to_vec(),
-                    transcript: delivery.transcript,
-                }),
-                Err(refusal) => DeliverOutcome::Refused(WorkRefused {
-                    grant: None,
-                    code: refusal.code.code() as i32,
-                    reason: refusal.reason,
-                }),
-            }),
-        }
+    ) -> Result<Delivery, Refusal> {
+        let exporter = context
+            .open_exporter
+            .ok_or_else(|| Refusal::from(DeliverError::Unbindable))?;
+        self.endpoint()
+            .await
+            .map_err(|e| Refusal::new(endpoint_refusal(e), e.to_string()))?
+            .release_ready(request, None, &exporter)
+            .await
+            .map_err(Refusal::from)
     }
 
     /// Admits one payment, or says why not.
@@ -3211,18 +2973,9 @@ impl WorkHandler for WorkService {
         self.upload(&request, &context).await
     }
 
-    async fn deliver_result(
-        &self,
-        request: DeliverResultRequest,
-        context: TransportContext,
-    ) -> Result<impl Into<hellas_rpc::call::WithTrailer<DeliverResultResponse>> + Send, WireStatus>
-    {
-        Ok(self.release(&request, &context).await)
-    }
-
     async fn stream_result(
         &self,
-        request: DeliverResultRequest,
+        request: StreamResultRequest,
         context: TransportContext,
     ) -> Result<PaidResultStream, WireStatus> {
         Ok(self.result_stream(request, context))
@@ -3255,7 +3008,7 @@ fn work_id_bytes(bytes: &[u8]) -> Option<Digest> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JobProposal {
     /// The inputs the job runs on.
-    pub prepared_input: PreparedWorkBundle,
+    pub prepared_input: PreparedInvocation,
     /// The three heights the job is bound by.
     pub deadlines: JobDeadlines,
 }
@@ -3263,6 +3016,8 @@ pub struct JobProposal {
 /// Why a client could not complete one acceptance exchange.
 #[derive(Debug, thiserror::Error)]
 pub enum ProposeError {
+    #[error(transparent)]
+    Content(#[from] crate::content::ContentError),
     /// The shared client endpoint is unavailable.
     #[error(transparent)]
     Endpoint(#[from] EndpointError),
@@ -3383,7 +3138,7 @@ impl ClientEndpoint {
         }
         let (cursor_height, _) = self.state().cursor();
         let ready = self.ready.as_ref().ok_or(EndpointError::NotAdmitting)?;
-        let policy = ready.work_policy();
+        let policy = ready.invocation_policy();
 
         let mut retry = None;
         for job in self
@@ -3392,8 +3147,9 @@ impl ClientEndpoint {
             .filter(|job| job.phase() == JobPhase::HalfSigned)
         {
             let retained = *job.authorization();
-            let rebuilt = policy.propose(
+            let rebuilt = crate::job::propose(
                 self.state().channel(),
+                policy,
                 ready.payment_policy(),
                 &proposal.prepared_input,
                 retained.proposal_nonce,
@@ -3425,22 +3181,25 @@ impl ClientEndpoint {
         // No crash or reordered response can make
         // the sequence move backwards or reuse a number.
         let proposal_nonce = self.state().proposal_nonce_high_water().saturating_add(1);
-        let authorization = policy.propose(
+        let authorization = crate::job::propose(
             self.state().channel(),
+            policy,
             ready.payment_policy(),
             &proposal.prepared_input,
             proposal_nonce,
             proposal.deadlines,
         )?;
-        policy.check_authorization(
+        crate::job::check_authorization(
             self.state().channel(),
-            ready.payment_policy(),
             &authorization,
+            policy,
+            ready.payment_policy(),
             cursor_height,
         )?;
-        policy.check_input(
+        crate::job::check_paid_input(
             self.state().channel(),
             &authorization,
+            policy,
             &proposal.prepared_input,
         )?;
         ready.check_signable(
@@ -3450,7 +3209,7 @@ impl ClientEndpoint {
         )?;
         let prepared_input = proposal
             .prepared_input
-            .encode()
+            .canonical_bytes()
             .map_err(PaidWorkError::from)?;
         let work_id = work_id(self.state().channel(), &authorization);
 
@@ -3650,125 +3409,34 @@ impl ClientEndpoint {
         advance_close(source, sink, self, &Secp256k1Verifier::new()).await
     }
 
-    /// Takes one delivered answer, and makes it durable before it is
-    /// returned.
-    ///
-    /// What this establishes, and the order it establishes it in: the
-    /// encoded delivery is inside the frame both parties signed a bound
-    /// for; the result parses as this profile's record; and the store
-    /// takes it, which is where the three rules that matter live —
-    /// the transcript rebuilds exactly this result, the signature is
-    /// the provider's over its digest, and the receipt is at or before
-    /// the terminal deadline. None of those is spelled a second time
-    /// here.
-    ///
-    /// What it does *not* establish is that the answer is right. That
-    /// is the re-execution's, it runs on the bytes this returns, and
-    /// its outcome is a separate durable step.
-    ///
-    /// # Errors
-    ///
-    /// [`DeliverError::NoSuchJob`] when no open job carries this
-    /// `work_id`, [`DeliverError::Endpoint`] when `ready` is not this
-    /// endpoint's channel, [`DeliverError::Policy`] when it carries
-    /// another execution policy, [`DeliverError::Setup`] when
-    /// this endpoint has not caught up to that readiness,
-    /// [`DeliverError::OverFrame`] above the signed frame bound,
-    /// [`DeliverError::Malformed`] for a signature that is not 64
-    /// bytes, [`DeliverError::Record`] when the result does not parse,
-    /// and [`DeliverError::Store`] for every rule above.
-    pub async fn receive(
+    /// Accepts a complete stream only after its EOF, trailer and signed result verify.
+    async fn receive_stream(
         &mut self,
         work_id: Digest,
         ready: &ReadyChannel,
-        delivered: &WorkDelivered,
+        delivered: &ResultTranscript,
     ) -> Result<Delivery, DeliverError> {
-        self.receive_inner(work_id, ready, delivered, false).await
-    }
-
-    async fn receive_inner(
-        &mut self,
-        work_id: Digest,
-        ready: &ReadyChannel,
-        delivered: &WorkDelivered,
-        streamed: bool,
-    ) -> Result<Delivery, DeliverError> {
-        self.state()
+        bind(ready, &self.store, &self.signer, Role::Client)?;
+        let job = self
+            .state()
             .job_by_id(work_id)
             .ok_or(DeliverError::NoSuchJob)?;
-
-        bind(ready, &self.store, &self.signer, Role::Client)?;
         crate::model::work::check_payment_policy_binding(
             ready.channel(),
-            self.state()
-                .job_by_id(work_id)
-                .ok_or(DeliverError::NoSuchJob)?
-                .authorization(),
+            job.authorization(),
             ready.payment_policy(),
         )?;
-        if ready.work_policy()
+        if ready.invocation_policy()
             != self
                 .ready
                 .as_ref()
                 .ok_or(EndpointError::NotAdmitting)?
-                .work_policy()
+                .invocation_policy()
         {
             return Err(DeliverError::Policy);
         }
-        let (cursor_height, _) = self.state().cursor();
-        ready.check_caught_up(cursor_height)?;
-
-        // The bound is on the encoded message, which is what this
-        // endpoint agreed to hold; the transport's own framing around
-        // it is the transport's and is not measured here.
-        let limit = u64::from(ready.work_policy().max_encoded_result_frame());
-        let actual = u64::try_from(delivered.encoded_len()).unwrap_or(u64::MAX);
-        if !streamed && actual > limit {
-            return Err(DeliverError::OverFrame { actual, limit });
-        }
-
+        ready.check_caught_up(self.state().cursor().0)?;
         let result = PaidJobResultV1::decode(&delivered.result)?;
-        if matches!(ready.work_policy(), WorkPolicy::Fetch { .. }) {
-            let actual = delivered.transcript.len() as u64;
-            let limit = ready.work_policy().max_spool_bytes();
-            if actual > limit {
-                return Err(PaidWorkError::OverEnvelope {
-                    field: "spooled transcript length",
-                    actual,
-                    limit,
-                }
-                .into());
-            }
-            let authorization = self
-                .state()
-                .job_by_id(work_id)
-                .ok_or(DeliverError::NoSuchJob)?
-                .authorization();
-            let transcript = crate::model::work::decode_transcript(
-                &delivered.transcript,
-                crate::model::fetch::MAX_FETCH_TRANSCRIPT_BYTES,
-            )?;
-            let input = PreparedWorkBundle::decode(
-                self.state()
-                    .job_by_id(work_id)
-                    .ok_or(DeliverError::NoSuchJob)?
-                    .prepared_input(),
-                crate::content::MAX_CONTENT_BYTES,
-            )
-            .map_err(PaidWorkError::from)?;
-            let expected = ready.work_policy().terminal_result(
-                ready.channel(),
-                authorization,
-                &input,
-                &transcript,
-            )?;
-            if expected != result {
-                return Err(PaidWorkError::Mismatch {
-                    field: "result against its transcript",
-                }
-                .into());
-            }
-        }
         let signature = signature(&delivered.provider_signature)
             .ok_or(DeliverError::Malformed("provider signature"))?;
         self.store
@@ -3806,7 +3474,7 @@ impl ClientEndpoint {
         &self,
         work_id: Digest,
         exporter: &[u8; 32],
-    ) -> Result<DeliverResultRequest, DeliverError> {
+    ) -> Result<StreamResultRequest, DeliverError> {
         self.state()
             .job_by_id(work_id)
             .ok_or(DeliverError::NoSuchJob)?;
@@ -3815,7 +3483,7 @@ impl ClientEndpoint {
             work_id,
             exporter,
         )));
-        Ok(DeliverResultRequest {
+        Ok(StreamResultRequest {
             route: Some(hellas_rpc::pb::work::WorkRoute::payment(
                 self.state().channel().id(),
             )),
@@ -3824,50 +3492,26 @@ impl ClientEndpoint {
         })
     }
 
-    /// Records that this client's own re-execution reproduced the answer
-    /// and it matched.
-    ///
-    /// It takes no verdict argument, and that is deliberate: a function
-    /// that could be handed `false` would be a function some caller
-    /// could hand `true`. The only way to record a match is to have
-    /// reproduced one, and the caller that has calls this.
-    ///
-    /// # Errors
-    ///
-    /// [`DeliverError::NoSuchJob`] when no open job carries this
-    /// `work_id`, and [`DeliverError::Store`] when the job has no
-    /// recorded result or the match cannot be made durable.
-    pub async fn matched(&mut self, work_id: Digest) -> Result<(), DeliverError> {
+    /// Durably records authenticated invocation verification before payment.
+    /// The store rechecks the exact input, signed output and stop rule.
+    pub async fn verified(&mut self, work_id: Digest) -> Result<(), DeliverError> {
         self.state()
             .job_by_id(work_id)
             .ok_or(DeliverError::NoSuchJob)?;
         self.store
             .commit(
-                ChannelRecord::ResultMatched { work_id },
+                ChannelRecord::ResultVerified { work_id },
                 &Secp256k1Verifier::new(),
             )
             .await?;
         Ok(())
     }
 
-    /// Records that this client's own re-execution did not reproduce the
-    /// answer, resting the job at a permanent refuted terminal.
-    ///
-    /// The refutation is durable for the same reason a match is: a job a
-    /// client's own engine refused must never afterwards be paid for,
-    /// even across a restart, and a second proposal of it must fail. The
-    /// signed result's digest is read off the job this journal recorded;
-    /// the reproduction digest is what the client's own engine produced.
-    ///
-    /// # Errors
-    ///
-    /// [`DeliverError::NoSuchJob`] when no open job carries this
-    /// `work_id`, and [`DeliverError::Store`] when the job has no
-    /// recorded result or the refutation cannot be made durable.
-    pub async fn refuted(
+    /// Permanently rejects this signed result, retaining only evidence digests.
+    pub async fn rejected(
         &mut self,
         work_id: Digest,
-        reproduction_digest: Digest,
+        evidence_digest: Digest,
     ) -> Result<(), DeliverError> {
         let job = self
             .state()
@@ -3879,9 +3523,9 @@ impl ClientEndpoint {
             .commit(
                 ChannelRecord::JobTerminated {
                     work_id,
-                    outcome: TerminalOutcome::Refuted {
+                    outcome: TerminalOutcome::Rejected {
                         result_digest,
-                        reproduction_digest,
+                        evidence_digest,
                     },
                 },
                 &Secp256k1Verifier::new(),
@@ -3930,10 +3574,11 @@ impl ClientEndpoint {
             .state()
             .job_by_id(work_id)
             .ok_or(PaymentError::NoSuchJob)?;
-        let Some((result, _)) = job.result() else {
+        let Some((result, result_signature)) = job.result() else {
             return Err(PaymentError::NotPayable { phase: job.phase() });
         };
-        let (authorization, result) = (*job.authorization(), *result);
+        let (authorization, result, result_signature) =
+            (*job.authorization(), *result, *result_signature);
 
         let (certificate, binding) = next_payment(
             self.state().channel(),
@@ -3955,6 +3600,7 @@ impl ClientEndpoint {
                 ChannelRecord::JobTerminated {
                     work_id,
                     outcome: TerminalOutcome::Certified {
+                        signed_result: Box::new((result, result_signature)),
                         certificate,
                         binding: Box::new(binding),
                         binding_signature,
@@ -4051,61 +3697,6 @@ where
     endpoint.client().await?.acknowledged(work_id, &response)
 }
 
-/// Asks for one accepted job's answer over a live transport and makes it
-/// durable.
-///
-/// Idempotent by the same rule as the exchange above: a lost response
-/// costs a round trip, because the provider answers a second call from
-/// its own spool and this endpoint's store takes the same result twice
-/// as one.
-///
-/// # Errors
-///
-/// [`DeliverError::Unbindable`] when the transport exposes no
-/// connection exporter to bind the request to,
-/// [`DeliverError::Transport`] when the call does not complete,
-/// [`DeliverError::Refused`] for a refusal, [`DeliverError::Malformed`]
-/// for a response this service does not define, and whatever
-/// [`ClientEndpoint::request_delivery`] or [`ClientEndpoint::receive`]
-/// raise.
-pub async fn fetch_result<T>(
-    transport: T,
-    endpoint: &mut impl ClientChannel,
-    ready: &ReadyChannel,
-    work_id: Digest,
-) -> Result<Delivery, DeliverError>
-where
-    T: StreamTransport + Sync,
-    T::Error: std::error::Error + Send + Sync + 'static,
-    T::Stream: 'static,
-{
-    let Some(exporter) = transport.context().open_exporter else {
-        return Err(DeliverError::Unbindable);
-    };
-    let request = endpoint
-        .client()
-        .await?
-        .request_delivery(work_id, &exporter)?;
-    let response = WorkClientImpl::new(transport)
-        .deliver_result(request)
-        .await?;
-    match response.outcome {
-        Some(DeliverOutcome::Delivered(delivered)) => {
-            endpoint
-                .client()
-                .await?
-                .receive(work_id, ready, &delivered)
-                .await
-        }
-        Some(DeliverOutcome::Refused(refused)) => Err(DeliverError::Refused {
-            refusal: WorkRefusal::from_code(refused.code)
-                .ok_or(DeliverError::Malformed("refusal code"))?,
-            reason: refused.reason,
-        }),
-        None => Err(DeliverError::Malformed("outcome")),
-    }
-}
-
 /// Proposes one job over a live transport and applies the answer.
 ///
 /// The whole exchange, in the order the durability rule fixes: journal,
@@ -4122,6 +3713,7 @@ pub async fn propose_work<T>(
     transport: T,
     endpoint: &mut impl ClientChannel,
     proposal: &JobProposal,
+    content: &crate::content::InvocationContent,
 ) -> Result<Digest, ProposeError>
 where
     T: StreamTransport + Sync,
@@ -4129,7 +3721,7 @@ where
     T::Stream: 'static,
 {
     let request = endpoint.client().await?.propose(proposal).await?;
-    upload::send_proposal(transport, endpoint, request).await
+    upload::send_proposal(transport, endpoint, request, content).await
 }
 
 /// Resend a retained proposal over a live transport and journal its answer.
@@ -4141,6 +3733,7 @@ pub async fn resume_work_proposal<T>(
     transport: T,
     endpoint: &mut impl ClientChannel,
     work_id: Digest,
+    content: &crate::content::InvocationContent,
 ) -> Result<Digest, ProposeError>
 where
     T: StreamTransport + Sync,
@@ -4148,7 +3741,7 @@ where
     T::Stream: 'static,
 {
     let request = endpoint.client().await?.resume_proposal(work_id).await?;
-    upload::send_proposal(transport, endpoint, request).await
+    upload::send_proposal(transport, endpoint, request, content).await
 }
 
 // ── Wire shapes ───────────────────────────────────────────────────────

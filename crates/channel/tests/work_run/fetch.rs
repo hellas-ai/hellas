@@ -1,18 +1,18 @@
 use super::*;
-use hellas_channel::model::fetch::{
-    FetchPolicyV2, FetchRoutePolicy, PreparedPaidFetchInputV1, fetch_route_commitment,
-};
-use hellas_channel::model::profile::WorkPolicy;
 use hellas_channel::model::work::PrivateRecord as _;
 use hellas_channel::test_support::channel::accept_uploaded_client;
-use hellas_channel::work::{ClientEndpoint, DeliverError, EndpointError, JobProposal};
-use hellas_rpc::Retention;
+use hellas_channel::work::{Admitted, ClientEndpoint, JobProposal, fetch_result_stream};
 use hellas_rpc::fetch::{
-    FetchOutputTranscriptBuilder, build_input_events_with_retention, encode_fetch_event_payload,
-    encode_fetch_terminal_payload, verify_input_events,
+    build_input_events_with_retention, encode_fetch_event_payload, encode_fetch_terminal_payload,
+    verify_input_events,
 };
 use hellas_rpc::output::{OutputEvent, StopReason, TextChannel};
-use hellas_rpc::pb::work::WorkDelivered;
+use hellas_rpc::protocol::invocation::{
+    Admission, Limits, PreparedInvocation,
+    fetch::{self as invocation_fetch, FetchAdmission, FetchLimits, FetchRoutePolicy},
+    output::OutputStream,
+};
+use hellas_rpc::{Assurance, Retention};
 
 const PROMPT: &[u8] = br#"{"input":"private-customer-prompt-never-on-provider-disk"}"#;
 const RESPONSE: &str = "private-provider-response-never-on-provider-disk";
@@ -37,20 +37,11 @@ async fn fetch_streams_before_terminal_then_pays_once_with_metadata_only_journal
 
         async fn execute_stream(
             &self,
-            prepared: hellas_channel::work::PreparedWorkInput,
+            input: Admitted,
             progress: PaidProgress,
         ) -> Result<Vec<hellas_rpc::OutputEventEnvelope>, hellas_channel::work::BackendFault>
         {
-            let hellas_channel::work::PreparedWorkInput::Fetch(input) = prepared else {
-                return Err(
-                    hellas_channel::work::admission::AdmissionError::Unsupported(
-                        hellas_channel::work::admission::CapacityDomain::Gpu,
-                    )
-                    .into(),
-                );
-            };
-            let input = *input;
-            let events = FetchBackend::default().execute(input.into()).await?;
+            let events = FetchBackend::default().execute(input).await?;
             progress(events[0].clone())?;
             self.0.notified().await;
             Ok(events)
@@ -62,7 +53,7 @@ async fn fetch_streams_before_terminal_then_pays_once_with_metadata_only_journal
         let mut client = client_endpoint(client_dir.path()).await;
         let service = service(provider_dir.path()).await;
         let proposal = JobProposal {
-            prepared_input: input_with_assurance(Retention::Ephemeral, assurance).into(),
+            prepared_input: input_with_assurance(Retention::Ephemeral, assurance),
             deadlines: deadlines(),
         };
         let request = client.propose(&proposal).await.unwrap();
@@ -95,7 +86,10 @@ async fn fetch_streams_before_terminal_then_pays_once_with_metadata_only_journal
             tokio::join!(
                 fetch_result_stream(transport.clone(), &mut client, &ready, id, |event| {
                     assert!(!worker.is_finished());
-                    assert!(hellas_rpc::fetch::decode_fetch_event_payload(event.payload()).is_ok());
+                    assert_eq!(
+                        event.event().body().kind(),
+                        hellas_rpc::protocol::invocation::output::ARTIFACT_CHUNK
+                    );
                     prefixes += 1;
                     prefix_seen.notify_one();
                     Ok(())
@@ -121,6 +115,7 @@ async fn fetch_streams_before_terminal_then_pays_once_with_metadata_only_journal
             worker.await.unwrap().unwrap(),
             RunOutcome::Completed { .. }
         ));
+        client.verified(id).await.unwrap();
         let rpc = WorkClientImpl::new(transport);
         assert_eq!(admit_payment(&rpc, &mut client, id).await.unwrap(), PRICE);
         assert_eq!(admit_payment(&rpc, &mut client, id).await.unwrap(), PRICE);
@@ -131,22 +126,27 @@ async fn fetch_streams_before_terminal_then_pays_once_with_metadata_only_journal
     }
 }
 
-fn policy() -> WorkPolicy {
-    let route = FetchRoutePolicy::sealed_route("openai", "responses").unwrap();
-    WorkPolicy::Fetch {
-        contract: test_responses_contract(),
-        policy: FetchPolicyV2 {
-            allowed_environment: test_responses_contract().manifest_id(),
-            route_commitment: fetch_route_commitment(&route.canonical_body_bytes()).unwrap(),
-            max_request_body_bytes: 4096,
-            max_output_events: 64,
-            max_output_bytes: 16384,
-            max_spool_bytes: 65536,
-            max_encoded_result_frame: 65536,
-            max_encoded_prepared_input: 65536,
+fn policy() -> InvocationPolicy {
+    InvocationPolicy {
+        admissions: vec![Admission::Fetch {
+            admission: FetchAdmission {
+                contract: test_responses_contract(),
+                route: FetchRoutePolicy::sealed_route("openai", "responses").unwrap(),
+                limits: FetchLimits {
+                    max_request_body_bytes: 4096,
+                    max_output_events: 64,
+                    max_spool_bytes: 65536,
+                    max_encoded_result_frame: 65536,
+                    max_encoded_prepared_input: 65536,
+                },
+            },
+        }],
+        limits: Limits {
             max_upload_bytes: 65536,
+            max_output_bytes: 16384,
+            max_steps: 1,
+            execution_timeout_ms: 60_000,
         },
-        route,
     }
 }
 
@@ -191,10 +191,17 @@ async fn invalid_paid_authorizations_never_invoke_fetch() {
     }
 }
 
-fn input(retention: Retention) -> PreparedPaidFetchInputV1 {
+fn input(retention: Retention) -> PreparedInvocation {
     input_with_assurance(retention, Assurance::ProducerSigned)
 }
-fn input_with_assurance(retention: Retention, assurance: Assurance) -> PreparedPaidFetchInputV1 {
+fn input_with_assurance(retention: Retention, assurance: Assurance) -> PreparedInvocation {
+    input_under(&policy(), retention, assurance)
+}
+fn input_under(
+    policy: &InvocationPolicy,
+    retention: Retention,
+    assurance: Assurance,
+) -> PreparedInvocation {
     let environment = test_responses_contract();
     let events = build_input_events_with_retention(
         "openai",
@@ -203,15 +210,91 @@ fn input_with_assurance(retention: Retention, assurance: Assurance) -> PreparedP
         environment.manifest_id(),
         assurance,
         &producer(0x21),
-        retention,
+        Retention::Ephemeral,
     )
     .unwrap();
-    PreparedPaidFetchInputV1::new(&events, &environment).unwrap()
+    let mut input = invocation_fetch::prepare(
+        &events,
+        &environment,
+        provider_producer().public_key(),
+        policy.canonical_bytes().unwrap(),
+        [1; 32],
+    )
+    .unwrap();
+    if retention == Retention::Retain {
+        let events = build_input_events_with_retention(
+            "openai",
+            "responses",
+            PROMPT,
+            environment.manifest_id(),
+            assurance,
+            &producer(0x21),
+            retention,
+        )
+        .unwrap();
+        input.input.artifacts[0].bytes = hellas_rpc::JsonBytes(
+            hellas_rpc::protocol::value::canonical_dag_cbor(&events).unwrap(),
+        );
+        input.request.input = input.input.content_id().unwrap();
+        input.request.retain = true;
+    }
+    input
+}
+fn request(input: &PreparedInvocation) -> hellas_rpc::fetch::FetchInput {
+    let events: Vec<hellas_rpc::InputEventEnvelope> =
+        hellas_rpc::protocol::value::decode_canonical_dag_cbor(
+            input.input.artifacts[0].bytes.as_bytes(),
+        )
+        .unwrap();
+    verify_input_events(&events).unwrap()
+}
+fn signed_output(input: &PreparedInvocation, payloads: &[Vec<u8>]) -> Vec<OutputEventEnvelope> {
+    let output = invocation_fetch::output(
+        payloads,
+        &encode_fetch_terminal_payload(&OutputEvent::Finished {
+            stop_reason: StopReason::EndOfText,
+            usage: None,
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let key = provider_producer();
+    let mut stream = OutputStream::new(&input.request, &key, 16 << 20).unwrap();
+    let mut offset = 0;
+    for payload in payloads {
+        let bytes = invocation_fetch::frame_event(payload).unwrap();
+        stream
+            .push(
+                invocation_fetch::RESPONSE_EVENTS,
+                invocation_fetch::RESPONSE_EVENTS_FORMAT,
+                offset,
+                &bytes,
+            )
+            .unwrap();
+        offset += bytes.len() as u64;
+    }
+    stream.finish(&output, 64 << 10).unwrap()
+}
+async fn receive(
+    service: &WorkService,
+    client: &mut ClientEndpoint,
+    ready: &ReadyChannel,
+    id: Digest,
+) -> hellas_channel::work::Delivery {
+    let (transport, server) = transport::transport_pair();
+    let serving = hellas_channel::test_support::channel::serve_work(server, service.clone());
+    let result = fetch_result_stream(transport, client, ready, id, |_| Ok(()))
+        .await
+        .unwrap();
+    serving.abort();
+    let _ = serving.await;
+    client.verified(id).await.unwrap();
+    result
 }
 
 fn proposal() -> JobProposal {
     JobProposal {
-        prepared_input: input(Retention::Ephemeral).into(),
+        prepared_input: input(Retention::Ephemeral),
         deadlines: deadlines(),
     }
 }
@@ -221,7 +304,7 @@ async fn metadata_store(root: &std::path::Path) -> ChannelStore {
 }
 
 async fn store_for(root: &std::path::Path, ready: &ReadyChannel, role: Role) -> ChannelStore {
-    let mut store = ChannelStore::open_metadata_only(
+    let mut store = ChannelStore::open(
         root,
         ready.channel().clone(),
         settlement(),
@@ -263,57 +346,32 @@ async fn paid_fetch_larger_than_a_wire_frame_streams_and_pays_without_disk_paylo
 
         async fn execute(
             &self,
-            prepared: hellas_channel::work::PreparedWorkInput,
+            input: Admitted,
         ) -> Result<Vec<hellas_rpc::OutputEventEnvelope>, hellas_channel::work::BackendFault>
         {
-            let hellas_channel::work::PreparedWorkInput::Fetch(input) = prepared else {
-                return Err(
-                    hellas_channel::work::admission::AdmissionError::Unsupported(
-                        hellas_channel::work::admission::CapacityDomain::Gpu,
-                    )
-                    .into(),
-                );
-            };
-            let input = *input;
-            let request = verify_input_events(&input.into_parts().fetch_input_transcript).unwrap();
-            let key = provider_producer();
-            let mut transcript = FetchOutputTranscriptBuilder::new(
-                request.input_commitment,
-                request.assurance,
-                &key,
-            );
-            for index in 0..256 {
-                transcript
-                    .push_event(
-                        encode_fetch_event_payload(&OutputEvent::TextDelta {
-                            index,
-                            delta: RESPONSE.repeat(400),
-                            channel: TextChannel::Output,
-                        })
-                        .unwrap(),
-                    )
-                    .unwrap();
-            }
-            Ok(transcript
-                .finish(
-                    encode_fetch_terminal_payload(&OutputEvent::Finished {
-                        stop_reason: StopReason::EndOfText,
-                        usage: None,
+            let _request = request(input.invocation());
+            let payloads: Vec<_> = (0..256)
+                .map(|index| {
+                    encode_fetch_event_payload(&OutputEvent::TextDelta {
+                        index,
+                        delta: RESPONSE.repeat(400),
+                        channel: TextChannel::Output,
                     })
-                    .unwrap(),
-                )
-                .unwrap())
+                    .unwrap()
+                })
+                .collect();
+            Ok(signed_output(input.invocation(), &payloads))
         }
     }
     let mut profile = policy();
-    let WorkPolicy::Fetch { policy, .. } = &mut profile else {
+    profile.limits.max_output_bytes = 8 << 20;
+    let Admission::Fetch { admission } = &mut profile.admissions[0] else {
         unreachable!()
     };
-    policy.max_output_events = 512;
-    policy.max_output_bytes = 8 << 20;
-    policy.max_spool_bytes = 16 << 20;
-    policy.max_encoded_result_frame = 64 << 10;
-    let ready = ready_of(descriptor_with(profile), CURSOR);
+    admission.limits.max_output_events = 512;
+    admission.limits.max_spool_bytes = 16 << 20;
+    admission.limits.max_encoded_result_frame = 64 << 10;
+    let ready = ready_of(descriptor_with(profile.clone()), CURSOR);
     let client_dir = temp();
     let provider_dir = temp();
     let mut client = ClientEndpoint::new(
@@ -330,7 +388,13 @@ async fn paid_fetch_larger_than_a_wire_frame_streams_and_pays_without_disk_paylo
         )
         .unwrap(),
     );
-    let request = client.propose(&proposal()).await.unwrap();
+    let request = client
+        .propose(&JobProposal {
+            prepared_input: input_under(&profile, Retention::Ephemeral, Assurance::ProducerSigned),
+            deadlines: deadlines(),
+        })
+        .await
+        .unwrap();
     let id = client
         .accepted(&accept_uploaded_client(&service, &client, &request).await)
         .await
@@ -362,6 +426,7 @@ async fn paid_fetch_larger_than_a_wire_frame_streams_and_pays_without_disk_paylo
     })
     .unwrap();
     assert_eq!(received, 256);
+    client.verified(id).await.unwrap();
     assert!(delivered.transcript.len() > hellas_wire::frame::MAX_FRAME_BYTES);
     assert_eq!(
         admit_payment(&WorkClientImpl::new(transport), &mut client, id)
@@ -396,10 +461,42 @@ async fn streamed_fetch_cannot_pay_without_a_complete_authenticated_terminal() {
             .await
             .unwrap();
         let exporter = [0x5e; 32];
-        let delivered = service
-            .deliver(&client.request_delivery(id, &exporter).unwrap(), &exporter)
+        use futures::StreamExt as _;
+        use hellas_rpc::services::work::WorkHandler as _;
+        let mut source = service
+            .stream_result(
+                client.request_delivery(id, &exporter).unwrap(),
+                hellas_wire::TransportContext {
+                    open_exporter: Some(exporter),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
+        let mut source_prefix = Vec::new();
+        let mut source_terminal = None;
+        while let Some(frame) = source.next().await {
+            match frame.unwrap().outcome.unwrap() {
+                Outcome::Prefix(bytes) => {
+                    source_prefix.extend(decode_transcript(&bytes, 65536).unwrap())
+                }
+                Outcome::Terminal(terminal) => {
+                    source_prefix
+                        .extend(decode_transcript(&terminal.terminal_transcript, 65536).unwrap());
+                    source_terminal = Some(terminal);
+                }
+                other => panic!("unexpected source frame {other:?}"),
+            }
+        }
+        let source_terminal = source_terminal.unwrap();
+        let delivered = hellas_channel::work::Delivery {
+            result: hellas_channel::model::work::PaidJobResultV1::decode(&source_terminal.result)
+                .unwrap(),
+            signature: hellas_kernel::Sig::from_bytes(
+                source_terminal.provider_signature.try_into().unwrap(),
+            ),
+            transcript: encode_transcript(&source_prefix).unwrap(),
+        };
         let events = decode_transcript(&delivered.transcript, 65536).unwrap();
         let mut terminal = WorkStreamTerminal {
             result: delivered.result.encode(),
@@ -444,6 +541,7 @@ async fn streamed_fetch_cannot_pay_without_a_complete_authenticated_terminal() {
         serving.await.unwrap();
         if fault == "none" {
             result.unwrap();
+            client.verified(id).await.unwrap();
             assert!(client.pay(id).await.is_ok());
         } else {
             assert!(result.is_err(), "{fault}");
@@ -474,44 +572,21 @@ impl WorkBackend for FetchBackend {
 
     async fn execute(
         &self,
-        prepared: hellas_channel::work::PreparedWorkInput,
+        input: Admitted,
     ) -> Result<Vec<hellas_rpc::OutputEventEnvelope>, hellas_channel::work::BackendFault> {
-        let hellas_channel::work::PreparedWorkInput::Fetch(input) = prepared else {
-            return Err(
-                hellas_channel::work::admission::AdmissionError::Unsupported(
-                    hellas_channel::work::admission::CapacityDomain::Gpu,
-                )
-                .into(),
-            );
-        };
-        let input = *input;
         self.0.fetch_add(1, Ordering::SeqCst);
-        let parts = input.into_parts();
-        let request = verify_input_events(&parts.fetch_input_transcript).unwrap();
+        let request = request(input.invocation());
         assert_eq!(request.body.as_bytes(), PROMPT);
         assert_eq!(request.retention, Retention::Ephemeral);
-        let key = provider_producer();
-        let mut builder =
-            FetchOutputTranscriptBuilder::new(request.input_commitment, request.assurance, &key);
-        builder
-            .push_event(
-                encode_fetch_event_payload(&OutputEvent::TextDelta {
-                    index: 0,
-                    delta: RESPONSE.into(),
-                    channel: TextChannel::Output,
-                })
-                .unwrap(),
-            )
-            .unwrap();
-        Ok(builder
-            .finish(
-                encode_fetch_terminal_payload(&OutputEvent::Finished {
-                    stop_reason: StopReason::EndOfText,
-                    usage: None,
-                })
-                .unwrap(),
-            )
-            .unwrap())
+        Ok(signed_output(
+            input.invocation(),
+            &[encode_fetch_event_payload(&OutputEvent::TextDelta {
+                index: 0,
+                delta: RESPONSE.into(),
+                channel: TextChannel::Output,
+            })
+            .unwrap()],
+        ))
     }
 }
 
@@ -554,19 +629,7 @@ async fn fetch_is_run_delivered_and_paid_without_provider_disk_bodies() {
     ));
     assert_no_bodies(provider_dir.path());
     let request = client.request_delivery(id, &[8; 32]).unwrap();
-    let delivered = service.deliver(&request, &[8; 32]).await.unwrap();
-    client
-        .receive(
-            id,
-            &fetch_ready(),
-            &WorkDelivered {
-                result: delivered.result.encode(),
-                provider_signature: delivered.signature.as_bytes().to_vec(),
-                transcript: delivered.transcript,
-            },
-        )
-        .await
-        .unwrap();
+    receive(&service, &mut client, &fetch_ready(), id).await;
     assert_no_bodies(provider_dir.path());
     assert_no_bodies(client_dir.path());
     let payment = client.pay(id).await.unwrap();
@@ -587,11 +650,37 @@ async fn fetch_is_run_delivered_and_paid_without_provider_disk_bodies() {
             .is_empty()
     );
     assert!(store.state().job_by_id(id).unwrap().transcript().is_empty());
-    let mut recovered = ProviderEndpoint::new(fetch_ready(), store, provider()).unwrap();
+    let recovered =
+        WorkService::new(ProviderEndpoint::new(fetch_ready(), store, provider()).unwrap());
+    use futures::StreamExt as _;
+    use hellas_rpc::services::work::WorkHandler as _;
+    let mut frames = recovered
+        .stream_result(
+            request,
+            hellas_wire::TransportContext {
+                open_exporter: Some([8; 32]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let first = tokio::time::timeout(std::time::Duration::from_secs(5), frames.next())
+        .await
+        .expect("a restarted ephemeral result promptly refuses missing bodies")
+        .unwrap()
+        .unwrap();
     assert!(matches!(
-        recovered.deliver(&request, &fetch_ready(), &[8; 32]).await,
-        Err(DeliverError::NoResult { .. })
+        first.outcome,
+        Some(hellas_rpc::pb::work::work_stream_event::Outcome::Refused(_))
     ));
+    drop(frames);
+    drop(recovered);
+    let mut recovered = ProviderEndpoint::new(
+        fetch_ready(),
+        metadata_store(provider_dir.path()).await,
+        provider(),
+    )
+    .unwrap();
     assert_eq!(recovered.admit(&payment).await.unwrap(), PRICE);
     assert_eq!(recovered.admit(&payment).await.unwrap(), PRICE);
     assert_eq!(backend.0.load(Ordering::SeqCst), 1);
@@ -626,19 +715,11 @@ async fn restarting_an_accepted_fetch_never_reinvokes_from_a_missing_payload() {
 
 #[tokio::test]
 async fn fetch_refuses_payload_journals_and_retention_requests() {
-    let provider_dir = temp();
-    assert!(matches!(
-        ProviderEndpoint::new(
-            fetch_ready(),
-            store_at(provider_dir.path(), CURSOR).await,
-            provider()
-        ),
-        Err(EndpointError::PayloadRetention)
-    ));
+    // Every journal is metadata-only; a signed request cannot opt Fetch into retention.
     let client_dir = temp();
     let mut client = client_endpoint(client_dir.path()).await;
     let retained = JobProposal {
-        prepared_input: input(Retention::Retain).into(),
+        prepared_input: input(Retention::Retain),
         deadlines: deadlines(),
     };
     assert!(client.propose(&retained).await.is_err());
@@ -646,15 +727,15 @@ async fn fetch_refuses_payload_journals_and_retention_requests() {
     // A peer bypassing the client API cannot obtain a provider acceptance either.
     let provider_dir = temp();
     let channel = fetch_ready();
-    let authorization = policy()
-        .propose(
-            channel.channel(),
-            channel.payment_policy(),
-            &retained.prepared_input,
-            1,
-            deadlines(),
-        )
-        .unwrap();
+    let authorization = propose_authorization(
+        channel.channel(),
+        &policy(),
+        channel.payment_policy(),
+        &retained.prepared_input,
+        1,
+        deadlines(),
+    )
+    .unwrap();
     let id = work_id(channel.channel(), &authorization);
     let request = hellas_rpc::pb::work::AcceptWorkRequest {
         route: Some(hellas_rpc::pb::work::WorkRoute::payment(
@@ -662,7 +743,7 @@ async fn fetch_refuses_payload_journals_and_retention_requests() {
         )),
         authorization: authorization.encode(),
         client_signature: super::client().sign(signing_hash(id)).as_bytes().to_vec(),
-        prepared_input: retained.prepared_input.encode().unwrap(),
+        prepared_input: retained.prepared_input.canonical_bytes().unwrap(),
     };
     assert!(matches!(
         service(provider_dir.path())
@@ -679,7 +760,7 @@ async fn fetch_refuses_payload_journals_and_retention_requests() {
 fn fetch_close_descriptor_round_trips_and_rejects_profile_version_confusion() {
     use hellas_channel::model::setup::CloseDescriptor;
     let descriptor = descriptor_with(policy()).close_descriptor();
-    let bytes = descriptor.encode();
+    let bytes = descriptor.encode().unwrap();
     assert_eq!(CloseDescriptor::decode(&bytes).unwrap(), descriptor);
     let mut trailing = bytes.clone();
     trailing.push(0);
@@ -700,22 +781,52 @@ async fn fetch_output_limits_include_terminal_and_bad_results_are_never_payable(
         .accepted(&accept_uploaded_client(&service, &client, &request).await)
         .await
         .unwrap();
-    let RunAdmission::InvokeFetch(input) = service.begin_run(id, &fetch_ready()).await.unwrap()
-    else {
+    let RunAdmission::Invoke(input) = service.begin_run(id, &fetch_ready()).await.unwrap() else {
         panic!("first Fetch dispatch");
     };
-    let transcript = FetchBackend::default()
-        .execute((*input).into())
-        .await
-        .unwrap();
-    let WorkPolicy::Fetch { mut policy, .. } = policy() else {
+    let prepared = input.invocation().clone();
+    let transcript = FetchBackend::default().execute(*input).await.unwrap();
+    let checked = prepared.verify_output(
+        &policy(),
+        &producer(0x21).public_key(),
+        &provider_producer().public_key(),
+        &transcript,
+    );
+    assert!(checked.is_ok(), "{checked:?}");
+    let mut policy = policy();
+    let Admission::Fetch { admission } = &mut policy.admissions[0] else {
         unreachable!()
     };
-    policy.max_output_events = u32::try_from(transcript.len() - 1).unwrap();
-    assert!(hellas_channel::model::fetch::check_fetch_output_limits(&policy, &transcript).is_err());
-    policy.max_output_events += 1;
-    policy.max_output_bytes = 1;
-    assert!(hellas_channel::model::fetch::check_fetch_output_limits(&policy, &transcript).is_err());
+    admission.limits.max_output_events = 1; // one application event plus its terminal
+    let mut bounded = prepared.clone();
+    bounded.application_policy = hellas_rpc::JsonBytes(policy.canonical_bytes().unwrap());
+    assert!(
+        bounded
+            .verify_output(
+                &policy,
+                &producer(0x21).public_key(),
+                &provider_producer().public_key(),
+                &transcript
+            )
+            .is_err()
+    );
+    let Admission::Fetch { admission } = &mut policy.admissions[0] else {
+        unreachable!()
+    };
+    admission.limits.max_output_events = 64;
+    policy.limits.max_output_bytes = 1;
+    let mut bounded = prepared.clone();
+    bounded.application_policy = hellas_rpc::JsonBytes(policy.canonical_bytes().unwrap());
+    assert!(
+        bounded
+            .verify_output(
+                &policy,
+                &producer(0x21).public_key(),
+                &provider_producer().public_key(),
+                &transcript
+            )
+            .is_err()
+    );
     assert!(
         service
             .record_result(id, &transcript[..transcript.len() - 1])
@@ -733,8 +844,7 @@ async fn app_attest_paid_fetch_uses_the_signed_scheme_without_disk_payloads() {
     let mut client = client_endpoint(client_dir.path()).await;
     let service = service(provider_dir.path()).await;
     let proposal = JobProposal {
-        prepared_input: input_with_assurance(Retention::Ephemeral, Assurance::AppleAppAttest)
-            .into(),
+        prepared_input: input_with_assurance(Retention::Ephemeral, Assurance::AppleAppAttest),
         deadlines: deadlines(),
     };
     let request = client.propose(&proposal).await.unwrap();
@@ -749,20 +859,7 @@ async fn app_attest_paid_fetch_uses_the_signed_scheme_without_disk_payloads() {
             .unwrap(),
         RunOutcome::Completed { .. }
     ));
-    let request = client.request_delivery(id, &[8; 32]).unwrap();
-    let delivered = service.deliver(&request, &[8; 32]).await.unwrap();
-    client
-        .receive(
-            id,
-            &fetch_ready(),
-            &WorkDelivered {
-                result: delivered.result.encode(),
-                provider_signature: delivered.signature.as_bytes().to_vec(),
-                transcript: delivered.transcript,
-            },
-        )
-        .await
-        .unwrap();
+    receive(&service, &mut client, &fetch_ready(), id).await;
     let payment = client.pay(id).await.unwrap();
     use hellas_rpc::services::work::WorkHandler;
     let response: hellas_rpc::call::WithTrailer<hellas_rpc::pb::work::AdmitCertificateResponse> =
@@ -779,3 +876,43 @@ async fn app_attest_paid_fetch_uses_the_signed_scheme_without_disk_payloads() {
 }
 
 use hellas_channel::test_support::test_responses_contract;
+
+#[tokio::test]
+async fn the_generic_proposal_helper_ignores_unneeded_cached_root_openings_for_fetch() {
+    use hellas_channel::{
+        content::{EphemeralContent, InvocationContent},
+        work::propose_work,
+    };
+    for cached in [false, true] {
+        let provider_dir = temp();
+        let client_dir = temp();
+        let service = service(provider_dir.path()).await;
+        let mut client = client_endpoint(client_dir.path()).await;
+        let mut memory = EphemeralContent::default();
+        if cached {
+            let reference = memory.insert(test_responses_contract().canonical_bytes());
+            assert_eq!(reference.id(), test_responses_contract().manifest().root());
+        }
+        let content = InvocationContent::Ephemeral(memory);
+        let (transport, server) = transport::transport_pair();
+        let serving = hellas_channel::test_support::channel::serve_work(server, service.clone());
+        let id = propose_work(transport, &mut client, &proposal(), &content)
+            .await
+            .unwrap();
+        assert_eq!(
+            client.state().job_by_id(id).unwrap().phase(),
+            JobPhase::Accepted
+        );
+        assert_eq!(
+            service
+                .with_state(|s| s.job_by_id(id).unwrap().phase())
+                .await
+                .unwrap(),
+            JobPhase::Accepted
+        );
+        serving.abort();
+        let _ = serving.await;
+        assert_no_bodies(provider_dir.path());
+        assert_no_bodies(client_dir.path());
+    }
+}

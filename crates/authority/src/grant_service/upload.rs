@@ -33,9 +33,6 @@ impl GrantWork {
                     .map_err(|_| refused(GrantRefusalCode::Malformed))?,
                 request.total_bytes,
             );
-            if object != a.input_content {
-                return Err(refused(GrantRefusalCode::Malformed));
-            }
             hellas_auth::signature::verify_digest_signature(
                 &client.node.public_key(),
                 &super::signature(&request.chunk_signature)?,
@@ -49,15 +46,44 @@ impl GrantWork {
                 ),
             )
             .map_err(|_| refused(GrantRefusalCode::Malformed))?;
+            let policy = store.state().policy_for(&a)?.invocation_policy.clone();
+            let preflight = (|| -> Result<_, WorkRefused> {
+                if request.program_manifest.len() > 4096 {
+                    return Err(refused(GrantRefusalCode::Malformed));
+                }
+                let manifest =
+                    hellas_rpc::ProgramManifest::from_canonical_bytes(&request.program_manifest)
+                        .map_err(|_| refused(GrantRefusalCode::Malformed))?;
+                if manifest.content_id() != a.environment_commitment {
+                    return Err(refused(GrantRefusalCode::Malformed));
+                }
+                let facts = policy
+                    .classify_manifest(&manifest)
+                    .map_err(|_| refused(GrantRefusalCode::Malformed))?;
+                if a.input_content.bytes() > u64::from(facts.max_encoded_prepared_input) {
+                    return Err(refused(GrantRefusalCode::Malformed));
+                }
+                if request.program_root.len() > hellas_channel::content::MAX_PROGRAM_ROOT_BYTES {
+                    return Err(refused(GrantRefusalCode::Malformed));
+                }
+                let objects = hellas_channel::job::content_closure(
+                    &policy,
+                    &manifest,
+                    &request.program_root,
+                    a.input_content,
+                )
+                .map_err(|_| refused(GrantRefusalCode::Malformed))?;
+                if !objects.contains(&object) {
+                    return Err(refused(GrantRefusalCode::Malformed));
+                }
+                Ok(objects)
+            })();
+            let objects = preflight?;
             if prior.is_some() {
                 return Ok(UploadContentResponse {
                     next_offset: object.bytes(),
                     refused: None,
                 });
-            }
-            let policy = store.state().policy_for(&a)?.work.clone();
-            if object.bytes() > u64::from(policy.max_encoded_prepared_input()) {
-                return Err(refused(GrantRefusalCode::Malformed));
             }
             let mut runtime = self
                 .service
@@ -81,11 +107,33 @@ impl GrantWork {
                     self.service.upload_quota.clone(),
                 )
             });
+            uploads
+                .declare_closure(
+                    id,
+                    &objects,
+                    a.acceptance_deadline_ms.0,
+                    hellas_rpc::Retention::Ephemeral,
+                    policy.limits.max_upload_bytes,
+                )
+                .map_err(|_| refused(GrantRefusalCode::StateCapacity))?;
+            if !request.program_root.is_empty() {
+                uploads
+                    .stage_complete(
+                        id,
+                        ContentRef::for_bytes(&request.program_root),
+                        a.acceptance_deadline_ms.0,
+                        hellas_rpc::Retention::Ephemeral,
+                        policy.limits.max_upload_bytes,
+                        &request.program_root,
+                    )
+                    .map_err(|_| refused(GrantRefusalCode::StateCapacity))?;
+            }
             let staged = uploads.stage(
                 id,
                 object,
                 a.acceptance_deadline_ms.0,
-                policy.max_upload_bytes(),
+                hellas_rpc::Retention::Ephemeral,
+                policy.limits.max_upload_bytes,
                 request.offset,
                 &request.chunk,
             );
@@ -100,12 +148,12 @@ impl GrantWork {
                     return Err(refused(GrantRefusalCode::StateCapacity));
                 }
             };
-            if next == object.bytes() {
+            if next == object.bytes() && object == a.input_content {
                 let checked = (|| -> Result<(), WorkRefused> {
                     let bytes = uploads
-                        .read(id, object)
+                        .read(id, object, hellas_rpc::Retention::Ephemeral)
                         .map_err(|_| refused(GrantRefusalCode::Malformed))?;
-                    let input = PreparedWorkInput::decode(
+                    let input = PreparedInvocation::from_canonical_bytes(
                         &bytes,
                         hellas_channel::content::MAX_CONTENT_BYTES,
                     )
@@ -117,8 +165,8 @@ impl GrantWork {
                         provider: grant_producer(store.state().provider()?)
                             .map_err(NodeStoreError::from)?,
                     };
-                    policy
-                        .check_bound_input(&context, &(&a).into(), &input)
+                    hellas_channel::job::check_input(&context, &(&a).into(), &policy, &input)
+                        .map(|_| ())
                         .map_err(|_| refused(GrantRefusalCode::Malformed))
                 })();
                 if let Err(error) = checked {

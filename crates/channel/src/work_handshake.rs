@@ -39,7 +39,7 @@
 //!
 //! # Why no connection binding
 //!
-//! `DeliverResult` needs one because a `work_id` is an identifier: it
+//! `StreamResult` needs one because a `work_id` is an identifier: it
 //! travels, and anyone holding one could make the provider release
 //! plaintext and debit the real client's credit. Nothing here has that
 //! shape. The request carries no identifier — it carries the artifact

@@ -1,7 +1,7 @@
 use super::*;
+use hellas_auth::ProducerSigningKey;
 use hellas_auth::test_support::actors::{FRIEND, ROOT};
-use hellas_auth::{Digest, ProducerSigningKey};
-use hellas_channel::model::work::{EvaluatePolicyV2, JobPaymentPolicyV2, PaidChannelPolicyV1};
+use hellas_channel::model::work::{JobPaymentPolicyV2, PaidChannelPolicyV1};
 use hellas_channel::work_store::discover_setups;
 use hellas_kernel::{EdgeValues, Fees};
 
@@ -37,19 +37,7 @@ fn options(root: &Path) -> ProvisionOptions {
                 compute_credit_limit: 40,
                 delivery_credit_limit: 40,
             },
-            work_policy: EvaluatePolicyV2 {
-                allowed_environment: hellas_rpc::ContentId::from_bytes([0x11; 32]),
-                generation_policy_digest: Digest::from_bytes([0x12; 32]),
-                identity_source_digest: Digest::from_bytes([0x13; 32]),
-                max_prompt_tokens: 512,
-                max_new_tokens: 128,
-                max_stop_token_ids: 4,
-                max_spool_bytes: 1 << 20,
-                max_encoded_result_frame: 262144,
-                max_encoded_prepared_input: 1 << 20,
-                max_upload_bytes: 1 << 20,
-            }
-            .into(),
+            work_policy: hellas_channel::test_support::channel::work_policy(),
             payment_policy: JobPaymentPolicyV2 {
                 fixed_price: 10,
                 dispatch_margin_blocks: 4,

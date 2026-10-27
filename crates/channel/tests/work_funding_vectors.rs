@@ -1,14 +1,15 @@
 //! Fixed V2 encodings assembled field-by-field before caller migration.
 use hellas_auth::Digest;
 use hellas_auth::authority::{GrantId, NodeKey, PrincipalId, ResourceId, Revision, UnixMillis};
-use hellas_channel::model::fetch::{FetchPolicyV2, fetch_policy_v2_digest};
+use hellas_channel::job;
 use hellas_channel::model::grant::*;
 use hellas_channel::model::work::{
-    EvaluatePolicyV2, JobPaymentPolicyV2, PaidJobAuthorizationV2, PrivateRecord,
-    evaluate_policy_v2_digest, job_payment_policy_digest, paid_work_v2_id,
+    JobPaymentPolicyV2, PaidJobAuthorizationV2, PrivateRecord, job_payment_policy_digest,
+    paid_work_v2_id,
 };
-use hellas_kernel::{EdgeId, NetworkId, TermsHash};
-use hellas_rpc::{ContentId, RequestCommitment};
+use hellas_kernel::NetworkId;
+use hellas_rpc::protocol::invocation::{Admission, InvocationPolicy, Limits};
+use hellas_rpc::{ContentId, RequestCommitment, Retention};
 fn network() -> NetworkId {
     NetworkId::new("funding-v2").unwrap()
 }
@@ -30,37 +31,22 @@ fn bytes(hex: &str) -> Vec<u8> {
         .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
         .collect()
 }
-const EVALUATE: &str = "01060101010101010101010101010101010101010101010101010101010101010101020202020202020202020202020202020202020202020202020202020202020203030303030303030303030303030303030303030303030303030303030303030102030405060708090a111213141516171821222324313233340000000031323334";
-const FETCH: &str = "010701010101010101010101010101010101010101010101010101010101010101010202020202020202020202020202020202020202020202020202020202020202010203040506070811121314212223242526272831323334414243440000000041424344";
+const INVOCATION: &str = "82781b68656c6c61732e696e766f636174696f6e2e706f6c6963792e7631a2666c696d697473a4696d61785f73746570731a090a0b0c706d61785f6f75747075745f62797465731a05060708706d61785f75706c6f61645f62797465731a0102030474657865637574696f6e5f74696d656f75745f6d731a111213146a61646d697373696f6e7381a2646b696e6467636f6d70757465696576616c7561746f72781a68656c6c61732f636174656e612d396563336636323531373065";
 const PAYMENT: &str = "01080102030405060708111213141516171821222324252627283132333435363738";
-const PAID: &str = "010901010101010101010101010101010101010101010101010101010101010101010202020202020202020202020202020202020202020202020202020202020202030303030303030303030303030303030303030303030303030303030303030304040404040404040404040404040404040404040404040404040404040404040505050505050505050505050505050505050505050505050505050505050505060606060606060606060606060606060606060606060606060606060606060607070707070707070707070707070707070707070707070707070707070707076060606060606060606060606060606060606060606060606060606060606060616263646566676808080808080808080808080808080808080808080808080808080808080808080102030405060708111213141516171809090909090909090909090909090909090909090909090909090909090909090a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a212223242526272831323334353637384142434445464748";
+const PAID: &str = "01090101010101010101010101010101010101010101010101010101010101010101060606060606060606060606060606060606060606060606060606060606060607070707070707070707070707070707070707070707070707070707070707076060606060606060606060606060606060606060606060606060606060606060616263646566676808080808080808080808080808080808080808080808080808080808080808080102030405060708111213141516171809090909090909090909090909090909090909090909090909090909090909090a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a21222324252627283132333435363738414243444546474801";
 const GRANT: &str = "010a01010101010101010101010101010101010101010101010101010101010101010f0f0f0f0f0f0f0f0202020202020202020202020202020203030303030303030d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d04040404040404040e0e0e0e0e0e0e0e05050505050505050505050505050505050505050505050505050505050505056060606060606060606060606060606060606060606060606060606060606060616263646566676806060606060606060606060606060606060606060606060606060606060606060707070707070707080808080808080809090909090909090909090909090909090909090909090909090909090909090a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0b0b0b0b0b0b0b0b0c0c0c0c0c0c0c0c";
 
-fn evaluate() -> EvaluatePolicyV2 {
-    EvaluatePolicyV2 {
-        allowed_environment: c(1),
-        generation_policy_digest: d(2),
-        identity_source_digest: d(3),
-        max_prompt_tokens: 0x01020304,
-        max_new_tokens: 0x05060708,
-        max_stop_token_ids: 0x090a,
-        max_spool_bytes: 0x1112131415161718,
-        max_encoded_result_frame: 0x21222324,
-        max_encoded_prepared_input: 0x31323334,
-        max_upload_bytes: 0x31323334,
-    }
-}
-fn fetch() -> FetchPolicyV2 {
-    FetchPolicyV2 {
-        allowed_environment: c(1),
-        route_commitment: d(2),
-        max_request_body_bytes: 0x01020304,
-        max_output_events: 0x05060708,
-        max_output_bytes: 0x11121314,
-        max_spool_bytes: 0x2122232425262728,
-        max_encoded_result_frame: 0x31323334,
-        max_encoded_prepared_input: 0x41424344,
-        max_upload_bytes: 0x41424344,
+fn invocation() -> InvocationPolicy {
+    InvocationPolicy {
+        admissions: vec![Admission::Compute {
+            evaluator: "hellas/catena-9ec3f625170e".into(),
+        }],
+        limits: Limits {
+            max_upload_bytes: 0x01020304,
+            max_output_bytes: 0x05060708,
+            max_steps: 0x090a0b0c,
+            execution_timeout_ms: 0x11121314,
+        },
     }
 }
 fn payment() -> JobPaymentPolicyV2 {
@@ -74,10 +60,6 @@ fn payment() -> JobPaymentPolicyV2 {
 fn paid() -> PaidJobAuthorizationV2 {
     PaidJobAuthorizationV2 {
         channel_id: d(1),
-        bond_edge: EdgeId::from_bytes([2; 32]),
-        bond_terms_hash: TermsHash::from_bytes([3; 32]),
-        payment_edge: EdgeId::from_bytes([4; 32]),
-        payment_terms_hash: TermsHash::from_bytes([5; 32]),
         work_policy_digest: d(6),
         payment_policy_digest: d(7),
         input_content: hellas_rpc::ContentRef::new(c(0x60), 0x6162636465666768),
@@ -89,6 +71,7 @@ fn paid() -> PaidJobAuthorizationV2 {
         price: 0x2122232425262728,
         terminal_deadline: 0x3132333435363738,
         payment_deadline: 0x4142434445464748,
+        retention: Retention::Retain,
     }
 }
 fn grant() -> GrantJobAuthorizationV1 {
@@ -136,52 +119,33 @@ fn record<R: PrivateRecord + std::fmt::Debug + PartialEq>(value: R, expected: &s
 }
 #[test]
 fn record_bytes_and_all_envelopes_are_pinned() {
-    record(evaluate(), EVALUATE, 132);
-    record(fetch(), FETCH, 102);
+    assert_eq!(hex(&invocation().canonical_bytes().unwrap()), INVOCATION);
     record(payment(), PAYMENT, 34);
-    record(paid(), PAID, 402);
+    record(paid(), PAID, 275);
     record(grant(), GRANT, 314);
 }
-// A frozen V1 envelope/width contract, not a production compatibility decoder.
-// These predicates are necessary for every old decoder to accept any body.
-fn legacy_accepts(tag: u8, size: usize, bytes: &[u8]) -> bool {
-    bytes.len() == size && bytes[..2] == [1, tag]
-}
 #[test]
-fn v1_and_v2_records_cannot_be_substituted_even_at_matching_lengths() {
-    for (new, old_tag, old_size) in [
-        (bytes(EVALUATE), 1, 156),
-        (bytes(FETCH), 5, 126),
-        (bytes(PAID), 2, 330),
-    ] {
-        assert!(!legacy_accepts(old_tag, old_size, &new));
-        let mut padded = new.clone();
-        padded.resize(old_size, 0);
-        assert!(!legacy_accepts(old_tag, old_size, &padded));
-        let mut old = padded;
-        old[1] = old_tag;
-        assert!(legacy_accepts(old_tag, old_size, &old));
-        assert!(EvaluatePolicyV2::decode(&old).is_err());
-        assert!(FetchPolicyV2::decode(&old).is_err());
+fn obsolete_authorization_widths_and_policy_tags_are_refused() {
+    for size in [330, 402] {
+        let mut old = bytes(PAID);
+        old.resize(size, 0);
         assert!(PaidJobAuthorizationV2::decode(&old).is_err());
+    }
+    for tag in [1, 2, 5, 6, 7] {
+        let mut wrong = bytes(PAID);
+        wrong[1] = tag;
+        assert!(PaidJobAuthorizationV2::decode(&wrong).is_err());
     }
 }
 #[test]
 fn independent_preimages_match_the_versioned_digest_domains() {
     let cases = [
         (
-            "evaluate",
-            "hellas.work.evaluate-policy.v2",
-            EVALUATE,
+            "invocation",
+            "hellas.work.invocation-policy.v1",
+            INVOCATION,
             channel(),
-            evaluate_policy_v2_digest(network(), channel(), &evaluate()),
-        ),
-        (
-            "fetch",
-            "hellas.work.fetch-policy.v2",
-            FETCH,
-            channel(),
-            fetch_policy_v2_digest(network(), channel(), &fetch()),
+            job::policy_digest(network(), channel(), &invocation()).unwrap(),
         ),
         (
             "payment",
@@ -214,10 +178,9 @@ fn independent_preimages_match_the_versioned_digest_domains() {
         let expected = hellas_xet::XetHash::hash(&preimage);
         assert_eq!(actual.as_bytes(), expected.as_bytes());
         let golden = match name {
-            "evaluate" => "61945b5ba18ffbf01e9d29065ea7c7dd087a5fb37eca470fb2e14321f7692554",
-            "fetch" => "dc42651e45945d96f00cec83f760f06eb6c9c876a1f03ff413f8c767ba01579d",
+            "invocation" => "81d893a1ab2fc7bd9bfb7373660e8f902287a19d42bf64434fb00e75b45861a9",
             "payment" => "acce5bee9ffcfc0a3d79884c2989384458aa52691b0750a7161da4800720d771",
-            "paid" => "bcaef689210ad3728a8cbd066e1cb367ec6b488e29131e35cb0d918aa8f6a35e",
+            "paid" => "a6355f9b5ccee30d70203959e9a09a70f27ff7c29c1adb637a48e9fc397d43eb",
             "grant" => "95e0601f3319c852f7a7f1dcc25954fbd89d3d7cc3bd0fa84c9c01c223d9e75e",
             _ => unreachable!(),
         };

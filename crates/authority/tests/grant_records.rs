@@ -8,8 +8,8 @@ use hellas_rpc::*;
 use std::num::NonZeroU64;
 use {
     hellas_authority::model::grant::records::*, hellas_authority::model::grant::resource::*,
-    hellas_authority::model::grant::*, hellas_channel::model::fetch::*,
-    hellas_channel::model::profile::WorkPolicy,
+    hellas_authority::model::grant::*, hellas_rpc::protocol::invocation::InvocationPolicy,
+    hellas_rpc::protocol::invocation::fetch::*,
 };
 fn resource() -> HttpsResource {
     HttpsResource {
@@ -97,20 +97,26 @@ fn contact_proof_offer_signature_and_actor_channel_binding_are_not_advisory() {
         account: hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test account")),
         revision: hellas_auth::authority::Revision(1),
         name: "glm".into(),
-        work: WorkPolicy::Fetch {
-            contract: hellas_rpc::FetchContract::http().unwrap(),
-            policy: FetchPolicyV2 {
-                allowed_environment: hellas_rpc::FetchContract::http().unwrap().manifest_id(),
-                route_commitment: fetch_route_commitment(&route.canonical_body_bytes()).unwrap(),
-                max_request_body_bytes: 4096,
-                max_output_events: 64,
-                max_output_bytes: 65536,
-                max_spool_bytes: 131072,
-                max_encoded_result_frame: 131072,
-                max_encoded_prepared_input: 65536,
+        invocation_policy: InvocationPolicy {
+            admissions: vec![hellas_rpc::protocol::invocation::Admission::Fetch {
+                admission: FetchAdmission {
+                    contract: hellas_rpc::FetchContract::http().unwrap(),
+                    route,
+                    limits: FetchLimits {
+                        max_request_body_bytes: 4096,
+                        max_output_events: 64,
+                        max_spool_bytes: 131072,
+                        max_encoded_result_frame: 131072,
+                        max_encoded_prepared_input: 65536,
+                    },
+                },
+            }],
+            limits: hellas_rpc::protocol::invocation::Limits {
                 max_upload_bytes: 65536,
+                max_output_bytes: 65536,
+                max_steps: 128,
+                execution_timeout_ms: 10_000,
             },
-            route,
         },
         https: Some(resource()),
         pricing: hellas_authority::model::grant::pricing::Pricing {

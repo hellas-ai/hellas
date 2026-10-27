@@ -7,7 +7,7 @@ impl ChannelRecord {
     ///
     /// `None` for the records that carry no signature and no
     /// variable-width body: a cursor advance, a running marker, a
-    /// plaintext release, a match, and the two a finalized block
+    /// plaintext release, a verification, and the two a finalized block
     /// dictates. Those cannot move the width of a checkpoint by anything
     /// this endpoint chooses.
     pub(super) const fn checkpoint_tail(&self) -> Option<usize> {
@@ -43,10 +43,14 @@ impl ChannelRecord {
     /// bytes whose digests the signatures beside them cover.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        self.encode_for_storage(false)
+        self.encode_inner(false)
     }
 
-    pub(super) fn encode_for_storage(&self, metadata_only: bool) -> Vec<u8> {
+    pub(super) fn encode_for_storage(&self) -> Vec<u8> {
+        self.encode_inner(true)
+    }
+
+    fn encode_inner(&self, metadata_only: bool) -> Vec<u8> {
         let mut out = Vec::new();
         match self {
             Self::OriginObserved => out.push(tag::ORIGIN_OBSERVED),
@@ -113,8 +117,8 @@ impl ChannelRecord {
                 out.push(tag::PLAINTEXT);
                 out.extend_from_slice(work_id.as_bytes());
             }
-            Self::ResultMatched { work_id } => {
-                out.push(tag::MATCHED);
+            Self::ResultVerified { work_id } => {
+                out.push(tag::VERIFIED);
                 out.extend_from_slice(work_id.as_bytes());
             }
             Self::JobTerminated { work_id, outcome } => {
@@ -205,7 +209,7 @@ impl ChannelRecord {
             tag::PLAINTEXT => Self::PlaintextReleased {
                 work_id: digest(&mut cursor)?,
             },
-            tag::MATCHED => Self::ResultMatched {
+            tag::VERIFIED => Self::ResultVerified {
                 work_id: digest(&mut cursor)?,
             },
             tag::TERMINATED => Self::JobTerminated {
@@ -261,24 +265,27 @@ impl ChannelRecord {
 pub(super) fn put_outcome(out: &mut Vec<u8>, outcome: &TerminalOutcome) {
     match outcome {
         TerminalOutcome::Certified {
+            signed_result,
             certificate,
             binding,
             binding_signature,
             certificate_signature,
         } => {
             out.push(outcome_code::CERTIFIED);
+            out.extend_from_slice(&signed_result.0.encode());
+            out.extend_from_slice(signed_result.1.as_bytes());
             out.extend_from_slice(&encode_kernel(certificate));
             out.extend_from_slice(&binding.encode());
             out.extend_from_slice(binding_signature.as_bytes());
             out.extend_from_slice(certificate_signature.as_bytes());
         }
-        TerminalOutcome::Refuted {
+        TerminalOutcome::Rejected {
             result_digest,
-            reproduction_digest,
+            evidence_digest,
         } => {
-            out.push(outcome_code::REFUTED);
+            out.push(outcome_code::REJECTED);
             out.extend_from_slice(result_digest.as_bytes());
-            out.extend_from_slice(reproduction_digest.as_bytes());
+            out.extend_from_slice(evidence_digest.as_bytes());
         }
         TerminalOutcome::Expired {
             deadline,
@@ -302,14 +309,15 @@ pub(super) fn put_outcome(out: &mut Vec<u8>, outcome: &TerminalOutcome) {
 pub(super) fn take_outcome(cursor: &mut Cursor<'_>) -> Result<TerminalOutcome, ChannelStateError> {
     Ok(match cursor.byte().ok_or(ChannelStateError::Malformed)? {
         outcome_code::CERTIFIED => TerminalOutcome::Certified {
+            signed_result: Box::new((private_record(cursor)?, signature(cursor)?)),
             certificate: certificate(cursor)?,
             binding: Box::new(private_record(cursor)?),
             binding_signature: signature(cursor)?,
             certificate_signature: signature(cursor)?,
         },
-        outcome_code::REFUTED => TerminalOutcome::Refuted {
+        outcome_code::REJECTED => TerminalOutcome::Rejected {
             result_digest: digest(cursor)?,
-            reproduction_digest: digest(cursor)?,
+            evidence_digest: digest(cursor)?,
         },
         outcome_code::EXPIRED => TerminalOutcome::Expired {
             deadline: cursor.u64().ok_or(ChannelStateError::Malformed)?,
@@ -414,10 +422,14 @@ impl Channel<PaymentFunding> {
     /// is one channel and not two that happen to agree.
     #[must_use]
     pub fn checkpoint(&self) -> Vec<u8> {
-        self.checkpoint_for_storage(false)
+        self.checkpoint_inner(false)
     }
 
-    pub(super) fn checkpoint_for_storage(&self, metadata_only: bool) -> Vec<u8> {
+    pub(super) fn checkpoint_for_storage(&self) -> Vec<u8> {
+        self.checkpoint_inner(true)
+    }
+
+    fn checkpoint_inner(&self, metadata_only: bool) -> Vec<u8> {
         let Self {
             funding:
                 PaymentState {

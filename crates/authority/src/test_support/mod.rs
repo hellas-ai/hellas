@@ -4,8 +4,13 @@ use hellas_auth::{Digest, ProducerSigningKey, Signature};
 use hellas_rpc::*;
 use std::num::NonZeroU64;
 use {
-    crate::model::grant::budget::*, crate::model::grant::records::*, crate::model::grant::*,
-    hellas_channel::model::fetch::*, hellas_channel::model::profile::*,
+    crate::model::grant::budget::*,
+    crate::model::grant::records::*,
+    crate::model::grant::*,
+    hellas_rpc::protocol::invocation::{
+        Admission, InvocationPolicy, Limits, PreparedInvocation,
+        fetch::{FetchAdmission, FetchLimits, FetchRoutePolicy},
+    },
 };
 pub fn budget() -> BudgetNode {
     BudgetNode::Subject {
@@ -94,20 +99,26 @@ pub fn policy() -> GrantPolicy {
         account: hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test account")),
         revision: hellas_auth::authority::Revision(1),
         name: "responses".into(),
-        work: WorkPolicy::Fetch {
-            contract: test_responses_contract(),
-            policy: FetchPolicyV2 {
-                allowed_environment: test_responses_contract().manifest_id(),
-                route_commitment: fetch_route_commitment(&route.canonical_body_bytes()).unwrap(),
-                max_request_body_bytes: 4096,
-                max_output_events: 64,
-                max_output_bytes: 1_048_576,
-                max_spool_bytes: 65_536,
-                max_encoded_result_frame: 262_144,
-                max_encoded_prepared_input: 1_048_576,
+        invocation_policy: InvocationPolicy {
+            admissions: vec![Admission::Fetch {
+                admission: FetchAdmission {
+                    contract: test_responses_contract(),
+                    route,
+                    limits: FetchLimits {
+                        max_request_body_bytes: 4096,
+                        max_output_events: 64,
+                        max_spool_bytes: 65_536,
+                        max_encoded_result_frame: 262_144,
+                        max_encoded_prepared_input: 1_048_576,
+                    },
+                },
+            }],
+            limits: Limits {
                 max_upload_bytes: 1_048_576,
+                max_output_bytes: 1_048_576,
+                max_steps: 128,
+                execution_timeout_ms: 10_000,
             },
-            route,
         },
         https: None,
         pricing: crate::model::grant::pricing::Pricing {
@@ -153,12 +164,10 @@ pub fn chat_resource(origin: &str, max_output_tokens: u64) -> resource::HttpsRes
 }
 
 pub fn use_https(policy: &mut GrantPolicy, resource: resource::HttpsResource) {
-    if let WorkPolicy::Fetch {
-        policy, contract, ..
-    } = &mut policy.work
-    {
-        *contract = hellas_rpc::FetchContract::http().unwrap();
-        policy.allowed_environment = contract.manifest_id();
+    for admission in &mut policy.invocation_policy.admissions {
+        if let Admission::Fetch { admission } = admission {
+            admission.contract = hellas_rpc::FetchContract::http().unwrap();
+        }
     }
     policy.responses = None;
     policy.https = Some(resource);
@@ -249,7 +258,7 @@ pub async fn setup_with_credential(
 pub fn proposal(
     store: &NodeStore,
     nonce: u64,
-) -> (GrantJobAuthorizationV1, Signature, PreparedWorkInput) {
+) -> (GrantJobAuthorizationV1, Signature, PreparedInvocation) {
     proposal_for(store, GrantId([1; 16]), nonce, principal(1).1)
 }
 pub fn proposal_for(
@@ -257,7 +266,7 @@ pub fn proposal_for(
     id: GrantId,
     nonce: u64,
     key: ProducerSigningKey,
-) -> (GrantJobAuthorizationV1, Signature, PreparedWorkInput) {
+) -> (GrantJobAuthorizationV1, Signature, PreparedInvocation) {
     let def = store.state().grant(id).unwrap();
     let client = channel_client(subject_of(&key));
     let channel = store.state().channel_id(id, client).unwrap();
@@ -290,9 +299,18 @@ pub fn proposal_for(
         Retention::Ephemeral,
     )
     .unwrap();
-    let input: PreparedWorkInput = PreparedPaidFetchInputV1::new(&events, &environment)
-        .unwrap()
-        .into();
+    let input = hellas_rpc::protocol::invocation::fetch::prepare(
+        &events,
+        &environment,
+        hellas_auth::PublicKey::Secp256k1(
+            grant_producer(store.state().provider().unwrap())
+                .unwrap()
+                .to_bytes(),
+        ),
+        def.policies[0].invocation_policy.canonical_bytes().unwrap(),
+        [nonce as u8; 32],
+    )
+    .unwrap();
     let a = GrantJobAuthorizationV1 {
         channel_id: channel,
         generation: store.state().generation(id).unwrap(),
@@ -301,14 +319,22 @@ pub fn proposal_for(
         resource_id: def.policies[0].resource,
         resource_revision: def.policies[0].revision,
         pricing_revision: def.policies[0].pricing.revision,
-        work_policy_digest: def.policies[0].work.digest(network(), channel.0),
-        input_content: hellas_rpc::ContentRef::for_bytes(&input.encode().unwrap()),
-        prepared_input_digest: input.bound_digest(network(), channel.0).unwrap(),
+        work_policy_digest: hellas_channel::job::policy_digest(
+            network(),
+            channel.0,
+            &def.policies[0].invocation_policy,
+        )
+        .unwrap(),
+        input_content: hellas_rpc::ContentRef::for_bytes(&input.canonical_bytes().unwrap()),
+        prepared_input_digest: hellas_channel::job::bound_prepared_input_digest(
+            network(),
+            channel.0,
+            &input,
+        )
+        .unwrap(),
         proposal_nonce: nonce,
         acceptance_deadline_ms: UnixMillis(2_000),
-        request_commitment: RequestCommitment::from_digest(
-            input.input_commitment().unwrap().digest(),
-        ),
+        request_commitment: input.request.commitment().unwrap(),
         environment_commitment: environment.manifest_id(),
         terminal_deadline_ms: UnixMillis(4_000),
         delivery_deadline_ms: UnixMillis(5_000),
@@ -352,7 +378,7 @@ pub async fn accept_grant(
 pub async fn accept(
     store: &mut NodeStore,
     caller: &hellas_auth::authority::AuthenticatedCaller,
-    request: (GrantJobAuthorizationV1, Signature, &PreparedWorkInput),
+    request: (GrantJobAuthorizationV1, Signature, &PreparedInvocation),
     now: u64,
 ) -> Result<Signature, crate::work_store::grant::NodeStoreError> {
     store
@@ -435,7 +461,7 @@ pub use node::{
     provider_enrollment, within,
 };
 
-pub mod evaluate;
+pub mod compute;
 
 pub use hellas_channel::test_support::{
     all_files, backend, channel, channel_client, device, enrollment, grant_upload_requests, holder,

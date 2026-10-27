@@ -21,8 +21,8 @@ use hellas_rpc::{
     EventCommitment, InputCommitment, Operation, OutputEventEnvelope, ProviderEnrollmentBundle,
     RequestCommitment, SchemeId, StreamId, output_genesis,
     pb::work::{
-        AcceptWorkRequest, AcceptWorkResponse, DeliverResultRequest, GetStandingRequest,
-        GetStandingResponse, GrantRefusalCode, GrantTerminalMetadata, GrantTerminalState,
+        AcceptWorkRequest, AcceptWorkResponse, GetStandingRequest, GetStandingResponse,
+        GrantRefusalCode, GrantTerminalMetadata, GrantTerminalState, StreamResultRequest,
         WorkRefusalCode, WorkRefused, WorkRoute, WorkStreamEvent, accept_work_response,
         get_standing_response, work_stream_event,
     },
@@ -425,7 +425,7 @@ impl Link {
     }
     async fn stream(
         &self,
-        request: DeliverResultRequest,
+        request: StreamResultRequest,
     ) -> Result<BoxStream<'static, Result<WorkStreamEvent>>> {
         match self {
             Self::Remote(t, _) => {
@@ -949,7 +949,7 @@ impl GrantSession {
         .await
         .map_err(|_| GrantClientError::Timeout)??;
         self.apply_acceptance(id, response, false).await?;
-        let delivery = DeliverResultRequest {
+        let delivery = StreamResultRequest {
             route: Some(WorkRoute::grant(channel.0)),
             work_id: id.as_bytes().to_vec(),
             client_signature: Vec::new(),

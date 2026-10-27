@@ -6,17 +6,15 @@
 //! one meant to do.
 
 use hellas_channel::test_support::channel::{client, network, provider};
+use hellas_rpc::protocol::invocation::InvocationPolicy;
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use hellas_auth::Digest;
 use hellas_channel::model::bundle::WorkChannelSetupBundleV2;
 use hellas_channel::model::setup::ProviderChannelPolicy;
-use hellas_channel::model::work::{
-    EvaluatePolicyV2, PaidChannelPolicyV1, private_policy_commitment,
-};
+use hellas_channel::model::work::{PaidChannelPolicyV1, private_policy_commitment};
 use hellas_channel::work_close::{BlockSourceError, FinalizedBlocks, FinalizedWork, TxSink};
 use hellas_channel::work_handshake::{PaymentAdmission, SetupEndpoint, SetupService};
 use hellas_channel::work_open::{
@@ -37,7 +35,6 @@ use hellas_kernel::{
     Secp256k1Verifier, Sig, Terms, TermsHash, Tx, WorkPaymentTerms, WorkStakeBondTerms,
 };
 use hellas_rpc::pb::work::{ExchangeSetupRequest, exchange_setup_response::Outcome};
-use hellas_rpc::protocol::ContentId;
 use hellas_rpc::services::work_setup::WorkSetupHandler;
 
 mod support;
@@ -117,12 +114,8 @@ fn channel_policy() -> PaidChannelPolicyV1 {
     hellas_channel::test_support::channel::credit_policy(40, 40)
 }
 
-fn work_policy() -> EvaluatePolicyV2 {
-    hellas_channel::test_support::channel::evaluate_policy(
-        ContentId::from_bytes([0x31; 32]),
-        Digest::from_bytes([0x32; 32]),
-        Digest::from_bytes([0x33; 32]),
-    )
+fn work_policy() -> InvocationPolicy {
+    hellas_channel::test_support::channel::work_policy()
 }
 
 fn provider_policy() -> ProviderChannelPolicy {
@@ -131,7 +124,7 @@ fn provider_policy() -> ProviderChannelPolicy {
         network: network(),
         policy_salt: SALT,
         channel_policy: channel_policy(),
-        work_policy: work_policy().into(),
+        invocation_policy: work_policy(),
         expected_payment_values: EdgeValues::new(3_000, 200, Fees::ZERO),
         min_omit_response_blocks: hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
     }

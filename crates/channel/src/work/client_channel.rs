@@ -61,7 +61,7 @@ impl ClientService {
         &mut self,
         work_id: Digest,
         ready: &ReadyChannel,
-        input: &crate::model::profile::PreparedWorkInput,
+        input: &hellas_rpc::protocol::invocation::PreparedInvocation,
     ) -> Result<(), DeliverError> {
         let mut endpoint = self.observer.endpoint().await?;
         bind(ready, &endpoint.store, &endpoint.signer, Role::Client)?;
@@ -69,12 +69,16 @@ impl ClientService {
             .state()
             .job_by_id(work_id)
             .ok_or(DeliverError::NoSuchJob)?;
-        ready
-            .work_policy()
-            .check_input(ready.channel(), job.authorization(), input)?;
-        endpoint
-            .store
-            .restore_client_input(work_id, input.encode().map_err(PaidWorkError::from)?)?;
+        crate::job::check_paid_input(
+            ready.channel(),
+            job.authorization(),
+            ready.invocation_policy(),
+            input,
+        )?;
+        endpoint.store.restore_client_input(
+            work_id,
+            input.canonical_bytes().map_err(PaidWorkError::from)?,
+        )?;
         Ok(())
     }
 

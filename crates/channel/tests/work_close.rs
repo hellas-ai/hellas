@@ -20,10 +20,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use support::temp;
 
 use hellas_auth::Digest;
+use hellas_channel::job::propose as propose_authorization;
 use hellas_channel::model::setup::{ObservedChannel, ReadyChannel, WorkSetupError};
-use hellas_channel::model::work::{
-    PrivateRecord as _, propose_authorization, signing_hash, work_id,
-};
+use hellas_channel::model::work::{PrivateRecord as _, signing_hash, work_id};
 use hellas_channel::test_support::channel::{
     CURSOR, HORIZON, OMISSION_BOND, PRICE, SALT, advance, bond_edge, bond_object, bundle,
     channel_policy, client, commit, deadlines, descriptor, lease_over, network, origin, payload_at,
@@ -32,7 +31,7 @@ use hellas_channel::test_support::channel::{
 };
 use hellas_channel::work::{
     ClientEndpoint, CloseEndpoint, PaymentError, ProviderEndpoint, WorkService, admit_payment,
-    fetch_result,
+    fetch_result_stream,
 };
 use hellas_channel::work_close::{
     BlockSourceError, CatchUpError, CloseError, CloseProgress, FinalizedBlocks, FinalizedWork,
@@ -116,7 +115,7 @@ fn signed_request(nonce: u8, proposal_nonce: u64) -> AcceptWorkRequest {
         Ok(authorization) => authorization,
         Err(error) => panic!("the fixture authorization builds: {error}"),
     };
-    let Ok(prepared_input) = bundle(nonce).encode() else {
+    let Ok(prepared_input) = bundle(nonce).canonical_bytes() else {
         panic!("the fixture bundle encodes");
     };
     AcceptWorkRequest {
@@ -2655,7 +2654,7 @@ async fn a_finalized_close_start_takes_the_answer_off_the_wire() {
     // The delivery call the exploit ends with.
     let (transport, server) = transport_pair();
     let serving = serve(server, fixture.service.clone());
-    let refused = fetch_result(transport, &mut fixture.client, &ready, id).await;
+    let refused = fetch_result_stream(transport, &mut fixture.client, &ready, id, |_| Ok(())).await;
     stop(serving).await;
     let Err(hellas_channel::work::DeliverError::Refused { refusal, .. }) = refused else {
         panic!("a closed channel releases nothing: {refused:?}");
@@ -3049,7 +3048,7 @@ async fn each_deadline_ends_its_own_job() {
         let ready = ready();
         let mut store = store_at(root.path(), &ready, Role::Provider, CURSOR).await;
         let authorization = authorization();
-        let Ok(prepared_input) = bundle(NONCE).encode() else {
+        let Ok(prepared_input) = bundle(NONCE).canonical_bytes() else {
             panic!("the fixture bundle encodes");
         };
         commit(

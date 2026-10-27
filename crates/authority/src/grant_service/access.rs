@@ -165,7 +165,7 @@ impl GrantWork {
     pub async fn accept(&self, request: &AcceptWorkRequest) -> AcceptWorkResponse {
         self.service.accept(&self.access, request).await
     }
-    pub fn stream(&self, request: DeliverResultRequest) -> PaidResultStream {
+    pub fn stream(&self, request: StreamResultRequest) -> PaidResultStream {
         self.service.stream(self.access.clone(), request)
     }
 }

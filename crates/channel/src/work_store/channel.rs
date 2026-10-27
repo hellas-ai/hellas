@@ -15,20 +15,20 @@ use hellas_kernel::{
 };
 use hellas_xet::XetFileHasher;
 
-use crate::model::profile::PreparedWorkInput;
 use crate::model::work::{
     CreditLedger, PaidChannel, PaidJobAuthorizationV2, PaidJobResultV1, PaidWorkError,
-    PaymentBindingV1, PrivateRecord as _, decode_transcript, payment_binding_digest, result_digest,
-    signing_hash, work_id,
+    PaymentBindingV1, PrivateRecord as _, ResultOutcome, decode_transcript, payment_binding_digest,
+    result_digest, signing_hash, work_id,
 };
 use crate::work_store::journal::{
-    Journal, JournalError, JournalId, JournalKind, MAX_CHECKPOINT_BYTES, MAX_RECORD_BYTES, Role,
+    Journal, JournalError, JournalId, JournalKind, MAX_CHECKPOINT_BYTES, Role,
 };
 use crate::work_store::setup::SetupOrigin;
 use crate::work_store::{
     Applied, WorkStoreError, put_bytes, put_option, put_u64, take_bytes, take_option,
 };
 use hellas_auth::Digest;
+use hellas_rpc::protocol::invocation::{InvocationPolicy, PreparedInvocation};
 
 mod book;
 pub mod funding;
@@ -37,7 +37,6 @@ use funding::{Clock, ClockReading};
 pub use funding::{FinalizedHeight, Funding, PaymentFunding};
 
 mod codec;
-mod payload;
 mod state;
 mod store;
 
@@ -207,9 +206,9 @@ pub enum JobPhase {
     Streaming,
     /// A signed terminal result exists.
     Ready,
-    /// The client's own re-execution reproduced the answer and it
-    /// matched. Client-only.
-    Matched,
+    /// The client authenticated the provider's result and declared stop rule.
+    /// Client-only.
+    Verified,
     /// The plaintext has left the provider. Provider-only.
     Delivered,
 }
@@ -221,14 +220,14 @@ impl core::fmt::Display for JobPhase {
 }
 
 impl JobPhase {
-    const fn name(self) -> &'static str {
+    pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::HalfSigned => "half-signed",
             Self::Accepted => "accepted",
             Self::Running => "running",
             Self::Streaming => "streaming",
             Self::Ready => "ready",
-            Self::Matched => "matched",
+            Self::Verified => "verified",
             Self::Delivered => "delivered",
         }
     }
@@ -244,7 +243,7 @@ impl JobPhase {
             Self::Accepted => 1,
             Self::Running => 2,
             Self::Ready => 3,
-            Self::Matched => 4,
+            Self::Verified => 4,
             Self::Delivered => 5,
             Self::Streaming => 6,
         }
@@ -256,7 +255,7 @@ impl JobPhase {
             1 => Ok(Self::Accepted),
             2 => Ok(Self::Running),
             3 => Ok(Self::Ready),
-            4 => Ok(Self::Matched),
+            4 => Ok(Self::Verified),
             5 => Ok(Self::Delivered),
             6 => Ok(Self::Streaming),
             _ => Err(ChannelStateError::Malformed),
@@ -268,14 +267,14 @@ impl JobPhase {
     const fn only_role(self) -> Option<Role> {
         match self {
             Self::Running | Self::Streaming | Self::Delivered => Some(Role::Provider),
-            Self::Matched => Some(Role::Client),
+            Self::Verified => Some(Role::Client),
             _ => None,
         }
     }
 
     /// Whether a signed result exists once a job has reached this phase.
     const fn has_result(self) -> bool {
-        matches!(self, Self::Ready | Self::Matched | Self::Delivered)
+        matches!(self, Self::Ready | Self::Verified | Self::Delivered)
     }
 }
 
@@ -289,6 +288,8 @@ pub enum TerminalOutcome {
     /// bytes a recovered endpoint re-sends: the job is closed, so this is
     /// the only remaining copy of what was agreed.
     Certified {
+        /// The provider receipt keeps success independently checkable after rotation.
+        signed_result: Box<(PaidJobResultV1, Sig)>,
         /// The scalar consensus will settle.
         certificate: EarnedCertificate,
         /// The private evidence of what it bought.
@@ -303,14 +304,13 @@ pub enum TerminalOutcome {
         /// The client's signature over the kernel's earned digest.
         certificate_signature: Sig,
     },
-    /// The client's own re-execution did not reproduce the signed result.
-    /// The job is over and unpayable; these two digests are what
-    /// disagreed.
-    Refuted {
+    /// The client rejected the signed result. The job is over and unpayable;
+    /// these digests identify its result and rejection evidence.
+    Rejected {
         /// The digest the provider signed.
         result_digest: Digest,
-        /// The digest the client's re-execution produced.
-        reproduction_digest: Digest,
+        /// The digest of the client's rejection evidence.
+        evidence_digest: Digest,
     },
     /// The job can no longer be paid for, at this finalized height:
     /// either a deadline passed with it unfinished or unpaid, or a close
@@ -343,7 +343,7 @@ impl TerminalOutcome {
     pub const fn name(&self) -> &'static str {
         match self {
             Self::Certified { .. } => "certified",
-            Self::Refuted { .. } => "refuted",
+            Self::Rejected { .. } => "rejected",
             Self::Expired { .. } => "expired",
             Self::Failed { .. } => "failed",
             Self::Indeterminate => "indeterminate",
@@ -367,7 +367,7 @@ pub struct JobTerminal<F: Funding = PaymentFunding> {
 
 mod outcome_code {
     pub(super) const CERTIFIED: u8 = 0;
-    pub(super) const REFUTED: u8 = 1;
+    pub(super) const REJECTED: u8 = 1;
     pub(super) const EXPIRED: u8 = 2;
     pub(super) const FAILED: u8 = 3;
     pub(super) const INDETERMINATE: u8 = 4;
@@ -433,11 +433,9 @@ pub enum ChannelRecord {
     /// The provider's signed terminal result, and the signed events it
     /// summarises.
     ///
-    /// The transcript rides here because the result is a pair of digests
-    /// over it: a provider that kept only the digests could not deliver
-    /// the answer it was paid for after a restart, and a client that
-    /// kept only the digests could not run its own re-execution without
-    /// asking the provider for the bytes again.
+    /// Live validation authenticates the complete transcript before persisting
+    /// its reference. Journals store only metadata; retained content survives
+    /// restart in the content store and ephemeral content remains in RAM.
     JobResult {
         /// Job the result belongs to.
         work_id: Digest,
@@ -453,13 +451,10 @@ pub enum ChannelRecord {
         /// Job whose plaintext is being released.
         work_id: Digest,
     },
-    /// The client's own re-execution reproduced this job's answer and it
-    /// matched.
-    ///
-    /// Client-only evidence from optional local reproduction. Payment also
-    /// permits an authenticated result without this record.
-    ResultMatched {
-        /// Job whose result the client reproduced.
+    /// The client authenticated this job's result and its declared stop rule.
+    /// This durable record is required before signing a payment.
+    ResultVerified {
+        /// Job whose result the client authenticated.
         work_id: Digest,
     },
     /// The named job reaches its permanent terminal.
@@ -564,7 +559,7 @@ mod tag {
     pub(super) const RUNNING: u8 = 3;
     pub(super) const RESULT: u8 = 4;
     pub(super) const PLAINTEXT: u8 = 5;
-    pub(super) const MATCHED: u8 = 6;
+    pub(super) const VERIFIED: u8 = 6;
     pub(super) const TERMINATED: u8 = 7;
     pub(super) const CLOSE_PREPARED: u8 = 8;
     pub(super) const CLOSE_OPENED: u8 = 9;
@@ -580,7 +575,7 @@ mod tag {
 /// proposal cannot know, and it is charged where it is known, at
 /// [`ChannelRecord::JobResult`], which is still ahead of the provider's
 /// own signature leaving the process.
-const JOB_TAIL_BYTES: usize = PaidJobResultV1::ENCODED_SIZE
+const JOB_TAIL_BYTES: usize = 2 * (PaidJobResultV1::ENCODED_SIZE + Sig::LENGTH)
     + PaymentBindingV1::ENCODED_SIZE
     + EarnedCertificate::ENCODED_SIZE
     + 4 * Sig::LENGTH

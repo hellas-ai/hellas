@@ -49,8 +49,6 @@ pub mod paid_client;
 pub mod transact;
 mod work_link;
 
-pub mod work_provision;
-
 #[cfg(test)]
 mod test_support;
 

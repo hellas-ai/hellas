@@ -1,11 +1,8 @@
 //! Canonical paid-work and grant records shared by clients and hosts.
 
 pub mod bundle;
-pub mod fetch;
 pub mod grant;
 pub mod offer;
 pub mod paid_policy;
-pub mod prepared_input;
-pub mod profile;
 pub mod setup;
 pub mod work;

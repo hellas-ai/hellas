@@ -173,17 +173,15 @@ mod id_pins {
     #[test]
     fn work_ids_are_stable() {
         use super::services::work::{
-            AcceptWork, AdmitCertificate, DeliverResult, GetStanding, Open, StreamResult,
-            UploadContent, Work,
+            AcceptWork, AdmitCertificate, GetStanding, Open, StreamResult, UploadContent, Work,
         };
-        // Adding proposal-scoped content upload deliberately rotates Work.
-        assert_eq!(<Work as ServiceMarker>::SERVICE_ID, 0x1d74e0d5);
+        // Signed program-root uploads and stream-only result delivery rotate these IDs.
+        assert_eq!(<Work as ServiceMarker>::SERVICE_ID, 0xc910d7a8);
         assert_eq!(<Open as MethodMarker>::METHOD_ID, 0x93cb0b39);
         assert_eq!(<AcceptWork as MethodMarker>::METHOD_ID, 0x5188734e);
-        assert_eq!(<UploadContent as MethodMarker>::METHOD_ID, 0xa60dfd8b);
+        assert_eq!(<UploadContent as MethodMarker>::METHOD_ID, 0x696080b2);
         assert_eq!(<GetStanding as MethodMarker>::METHOD_ID, 0x64b53882);
-        assert_eq!(<DeliverResult as MethodMarker>::METHOD_ID, 0x74bb099b);
-        assert_eq!(<StreamResult as MethodMarker>::METHOD_ID, 0xb2043ac5);
+        assert_eq!(<StreamResult as MethodMarker>::METHOD_ID, 0x6f992f60);
         assert_eq!(<AdmitCertificate as MethodMarker>::METHOD_ID, 0x07db8b8e);
     }
 

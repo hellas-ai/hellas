@@ -143,7 +143,7 @@ async fn checked_services_audit_reads_and_final_refusals_without_request_content
             route: Some(WorkRoute::grant(authorization.channel_id.0)),
             authorization: authorization.encode(),
             client_signature: signature.bytes().to_vec(),
-            prepared_input: input.encode().unwrap(),
+            prepared_input: input.canonical_bytes().unwrap(),
         },
         &common::principal(1).1,
     )

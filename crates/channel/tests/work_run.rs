@@ -12,15 +12,13 @@ use support::temp;
 
 use hellas_auth::Digest;
 use hellas_auth::{ProducerSigningKey, PublicKey};
+use hellas_channel::job::propose as propose_authorization;
 use hellas_channel::model::setup::{ReadyChannel, WorkChannelDescriptor, WorkSetupError};
-use hellas_channel::model::work::{
-    EvaluatePolicyV2, PaidJobAuthorizationV2, PaidWorkError, canonical_output_digest,
-    propose_authorization, result_digest, signing_hash, terminal_result, work_id,
-};
+use hellas_channel::model::work::{PaidJobAuthorizationV2, result_digest, signing_hash, work_id};
 use hellas_channel::test_support::channel::{
     CURSOR, PRICE, PROMPT_TOKENS, advance, bundle, bundle_bytes, client, commit, deadlines,
-    descriptor, descriptor_with, evaluate_request, manifest, network, origin, payment_policy,
-    provider, provider_producer, settlement, work_policy,
+    descriptor, descriptor_with, invocation_request, manifest, origin, payment_policy, provider,
+    provider_producer, settlement, work_policy,
 };
 use hellas_channel::work::{
     BackendFault, ProviderEndpoint, RunAdmission, RunError, RunOutcome, WorkBackend, WorkService,
@@ -31,8 +29,8 @@ use hellas_channel::work_store::{
     WorkStoreError,
 };
 use hellas_kernel::{Secp256k1Verifier, SigVerifier as _};
-use hellas_rpc::evaluate::{EvaluateStopReason, EvaluateTerminal, EvaluateUsage};
-use hellas_rpc::{Assurance, EvaluateRequest, OutputEventEnvelope};
+use hellas_rpc::OutputEventEnvelope;
+use hellas_rpc::protocol::invocation::{InvocationPolicy, InvocationRequest};
 
 #[path = "work_run/fetch.rs"]
 mod fetch;
@@ -52,11 +50,10 @@ fn producer(byte: u8) -> ProducerSigningKey {
 }
 
 /// A second policy, differing from the first in one resource limit.
-fn other_work_policy() -> EvaluatePolicyV2 {
-    EvaluatePolicyV2 {
-        max_prompt_tokens: work_policy().max_prompt_tokens + 1,
-        ..work_policy()
-    }
+fn other_work_policy() -> InvocationPolicy {
+    let mut policy = work_policy();
+    policy.limits.max_upload_bytes += 1;
+    policy
 }
 
 /// One readiness decision, taken at `height` against a healthy channel.
@@ -137,13 +134,13 @@ async fn accept(store: &mut ChannelStore, nonce: u8) -> Digest {
 /// otherwise.
 const ANSWER: [u32; 5] = [101, 102, 103, 104, 105];
 
-/// Builds one complete signed Evaluate transcript for `request`.
+/// Builds one complete signed invocation transcript for `request`.
 ///
 /// `chunks` is how the answer is split across signed token-delta events.
 /// The answer itself is their concatenation, so two different splits are
 /// two transcripts of one answer.
 fn transcript_for(
-    request: &EvaluateRequest,
+    request: &InvocationRequest,
     chunks: &[&[u32]],
     key: &ProducerSigningKey,
 ) -> Vec<OutputEventEnvelope> {
@@ -156,7 +153,7 @@ fn transcript_for(
     )
 }
 
-fn answer_transcript(request: &EvaluateRequest) -> Vec<OutputEventEnvelope> {
+fn answer_transcript(request: &InvocationRequest) -> Vec<OutputEventEnvelope> {
     transcript_for(request, &[&ANSWER[..2], &ANSWER[2..]], &provider_producer())
 }
 
@@ -210,29 +207,28 @@ impl WorkBackend for CountingBackend {
 
     async fn execute(
         &self,
-        prepared: hellas_channel::work::PreparedWorkInput,
+        input: hellas_channel::work::Admitted,
     ) -> Result<Vec<hellas_rpc::OutputEventEnvelope>, hellas_channel::work::BackendFault> {
-        let hellas_channel::work::PreparedWorkInput::Evaluate(input) = prepared else {
-            return Err(
-                hellas_channel::work::admission::AdmissionError::Unsupported(
-                    hellas_channel::work::admission::CapacityDomain::Fetch,
-                )
-                .into(),
-            );
-        };
-        let input = *input;
         self.calls.fetch_add(1, Ordering::SeqCst);
-        assert_eq!(input.program_manifest(), manifest().canonical_bytes());
-        let request = input.evaluate_request();
+        assert_eq!(
+            input.invocation().manifest().unwrap().canonical_bytes(),
+            manifest().canonical_bytes()
+        );
+        let request = &input.invocation().request;
         let answer = self.answer.clone();
         match answer {
             Answer::Transcript => Ok(answer_transcript(request)),
-            Answer::ForAnotherRequest(nonce) => Ok(answer_transcript(&evaluate_request(nonce))),
-            Answer::UnderAnotherKey(byte) => Ok(transcript_for(
-                request,
-                &[&ANSWER[..2], &ANSWER[2..]],
-                &producer(byte),
-            )),
+            Answer::ForAnotherRequest(nonce) => Ok(answer_transcript(&invocation_request(nonce))),
+            Answer::UnderAnotherKey(byte) => {
+                let key = producer(byte);
+                let mut foreign = request.clone();
+                foreign.runner_public_key = key.public_key();
+                Ok(transcript_for(
+                    &foreign,
+                    &[&ANSWER[..2], &ANSWER[2..]],
+                    &key,
+                ))
+            }
             Answer::Fault(reason) => {
                 #[derive(Debug, thiserror::Error)]
                 #[error("{0}")]
@@ -276,163 +272,6 @@ fn a_providers_producer_key_is_its_party_key() {
         panic!("producer keys are secp256k1");
     };
     assert_ne!(provider().party_key().to_bytes(), other);
-}
-
-// ── The terminal a result is built from ───────────────────────────────
-
-/// The result summarises the transcript that produced it, and both of
-/// its digests come from that transcript.
-#[test]
-fn a_result_is_derived_from_the_transcript_that_produced_it() {
-    let channel = ready().channel().clone();
-    let authorization = authorization(1);
-    let transcript = answer_transcript(&evaluate_request(1));
-
-    let result = match terminal_result(&channel, &authorization, &transcript) {
-        Ok(result) => result,
-        Err(error) => panic!("the fixture transcript is a terminal: {error}"),
-    };
-
-    assert_eq!(result.work_id, work_id(&channel, &authorization));
-
-    // The terminal commitment is the last signed event's own, taken
-    // from the transcript rather than from anything beside it.
-    let Some(last) = transcript.last() else {
-        panic!("the fixture transcript is not empty");
-    };
-    assert_eq!(
-        result.terminal_transcript_commitment,
-        last.event_commitment()
-    );
-    assert_ne!(
-        transcript[0].event_commitment(),
-        last.event_commitment(),
-        "the events differ, so naming the last one is a choice"
-    );
-
-    // And the answer is the flattened token list, recomputed here from
-    // the tokens the fixture generated rather than from the result.
-    let terminal = EvaluateTerminal {
-        final_position: ANSWER.len() as u64,
-        stop_reason: EvaluateStopReason::STOP_TOKEN,
-        matched_stop_token_id: Some(1),
-        text_artifact: Digest::from_bytes([0x77; 32]),
-        usage: EvaluateUsage {
-            input_units: PROMPT_TOKENS,
-            output_units: ANSWER.len() as u64,
-        },
-        billable_units: PROMPT_TOKENS + ANSWER.len() as u64,
-    };
-    let expected = match canonical_output_digest(network(), result.work_id, &ANSWER, &terminal) {
-        Ok(digest) => digest,
-        Err(error) => panic!("the fixture terminal hashes: {error}"),
-    };
-    assert_eq!(result.canonical_output_digest, expected);
-}
-
-/// Splitting one answer differently changes the transcript and not the
-/// answer.
-///
-/// The two digests in a result say different things, and this is the
-/// difference: the client's oracle compares the second, so a provider
-/// that batched its tokens differently must still be paid.
-#[test]
-fn chunking_moves_the_transcript_commitment_and_not_the_answer() {
-    let channel = ready().channel().clone();
-    let authorization = authorization(1);
-    let request = evaluate_request(1);
-    let key = provider_producer();
-
-    let one = transcript_for(&request, &[&ANSWER[..]], &key);
-    let many = transcript_for(&request, &[&ANSWER[..1], &ANSWER[1..3], &ANSWER[3..]], &key);
-    assert_eq!(one.len(), 2, "one delta and a terminal");
-    assert_eq!(many.len(), 4, "three deltas and a terminal");
-
-    let (Ok(first), Ok(second)) = (
-        terminal_result(&channel, &authorization, &one),
-        terminal_result(&channel, &authorization, &many),
-    ) else {
-        panic!("both fixture transcripts are terminals");
-    };
-    assert_eq!(
-        first.canonical_output_digest,
-        second.canonical_output_digest
-    );
-    assert_ne!(
-        first.terminal_transcript_commitment,
-        second.terminal_transcript_commitment
-    );
-
-    // The control: a different answer is a different answer under both
-    // splits.
-    let other = transcript_for(&request, &[&[201, 202, 203, 204, 205][..]], &key);
-    let Ok(third) = terminal_result(&channel, &authorization, &other) else {
-        panic!("the fixture transcript is a terminal");
-    };
-    assert_ne!(first.canonical_output_digest, third.canonical_output_digest);
-}
-
-/// A transcript that is not one verified terminal chain for this
-/// authorization is not a result.
-///
-/// Each case varies exactly one thing about an otherwise valid
-/// transcript, and each one is refused for its own reason.
-#[test]
-fn only_this_jobs_own_terminal_transcript_becomes_a_result() {
-    let channel = ready().channel().clone();
-    let authorization = authorization(1);
-    let request = evaluate_request(1);
-    let good = answer_transcript(&request);
-    assert!(
-        terminal_result(&channel, &authorization, &good).is_ok(),
-        "the unvaried transcript is accepted",
-    );
-
-    // MUTATION: no events at all.
-    let empty = terminal_result(&channel, &authorization, &[]);
-    assert!(
-        matches!(empty, Err(PaidWorkError::Transcript(_))),
-        "unexpected answer: {empty:?}",
-    );
-
-    // MUTATION: the terminal event removed, leaving a legal prefix.
-    let mut headless = good.clone();
-    headless.pop();
-    let refused = terminal_result(&channel, &authorization, &headless);
-    assert!(
-        matches!(refused, Err(PaidWorkError::Transcript(_))),
-        "unexpected answer: {refused:?}",
-    );
-
-    // MUTATION: a whole, valid transcript — for another request.
-    let elsewhere = answer_transcript(&evaluate_request(2));
-    let refused = terminal_result(&channel, &authorization, &elsewhere);
-    assert!(
-        matches!(refused, Err(PaidWorkError::Transcript(_))),
-        "unexpected answer: {refused:?}",
-    );
-
-    // MUTATION: a whole, valid, correctly self-signed transcript — under
-    // a key that is not this channel's provider. Every signature in it
-    // verifies, which is why the key has to be checked against the
-    // channel and not merely against the transcript.
-    let stranger = transcript_for(&request, &[&ANSWER[..2], &ANSWER[2..]], &producer(0x23));
-    assert_eq!(
-        terminal_result(&channel, &authorization, &stranger),
-        Err(PaidWorkError::Mismatch {
-            field: "transcript producer key"
-        })
-    );
-
-    // MUTATION: an event lifted from another transcript into this one,
-    // breaking the chain rather than the signatures.
-    let mut spliced = good.clone();
-    spliced[0] = elsewhere[0].clone();
-    let refused = terminal_result(&channel, &authorization, &spliced);
-    assert!(
-        matches!(refused, Err(PaidWorkError::Transcript(_))),
-        "unexpected answer: {refused:?}",
-    );
 }
 
 // ── One accepted job, one invocation ──────────────────────────────────
@@ -548,7 +387,7 @@ async fn a_marker_a_process_did_not_come_back_from_is_indeterminate() {
     );
 
     // Nor may a result be recorded for it, however well formed.
-    let transcript = answer_transcript(&evaluate_request(1));
+    let transcript = answer_transcript(&invocation_request(1));
     let refused = service.record_result(id, &transcript).await;
     assert!(
         matches!(
@@ -588,8 +427,11 @@ async fn a_job_this_process_is_running_is_not_started_again() {
     };
     // Both bodies come out of the journal, not out of a quote: these are
     // the exact canonical values both parties signed the digest of.
-    assert_eq!(input.evaluate_request(), &evaluate_request(1));
-    assert_eq!(input.program_manifest(), manifest().canonical_bytes());
+    assert_eq!(&input.invocation().request, &invocation_request(1));
+    assert_eq!(
+        input.invocation().manifest().unwrap().canonical_bytes(),
+        manifest().canonical_bytes()
+    );
 
     assert!(
         matches!(

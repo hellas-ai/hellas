@@ -29,7 +29,7 @@ hellas-auth.workspace = true
 hellas-channel.workspace = true
 hellas-kernel = { workspace = true, features = ["secp256k1", "webauthn"] }
 hellas-private.workspace = true
-hellas-rpc = { workspace = true, features = ["evaluate", "fetch", "work"] }
+hellas-rpc = { workspace = true, features = ["fetch", "work"] }
 hellas-store.workspace = true
 hellas-webauthn.workspace = true
 hellas-wire.workspace = true

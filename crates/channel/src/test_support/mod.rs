@@ -196,6 +196,22 @@ pub fn grant_upload_requests(
                 ))
                 .unwrap();
             hellas_rpc::pb::work::UploadContentRequest {
+                program_root:
+                    hellas_rpc::protocol::invocation::PreparedInvocation::from_canonical_bytes(
+                        &request.prepared_input,
+                        crate::content::MAX_CONTENT_BYTES,
+                    )
+                    .ok()
+                    .map(|input| channel::program_root(&input))
+                    .unwrap_or_default(),
+                program_manifest:
+                    hellas_rpc::protocol::invocation::PreparedInvocation::from_canonical_bytes(
+                        &request.prepared_input,
+                        crate::content::MAX_CONTENT_BYTES,
+                    )
+                    .ok()
+                    .map(|input| input.manifest().unwrap().canonical_bytes())
+                    .unwrap_or_default(),
                 route: wire.route.clone(),
                 authorization: wire.authorization.clone(),
                 client_signature: wire.client_signature.clone(),

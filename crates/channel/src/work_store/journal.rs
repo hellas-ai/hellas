@@ -60,11 +60,8 @@ pub const MAX_CHECKPOINT_BYTES: usize = MAX_RECORD_BYTES;
 pub enum JournalKind {
     /// The two-Open handshake and its recovery state.
     Setup = 1,
-    /// One channel's job, credit, and certificate.
-    Channel = 2,
-    /// Provider accounting whose request and response bodies never reach disk.
-    /// A different kind prevents reopening a payload-bearing journal as ZDR.
-    MetadataChannel = 3,
+    /// Metadata-only channel accounting, with content retained separately per job.
+    Channel = 5,
     /// Provider-wide, metadata-only grant tree and channel books.
     Grant = 4,
 }
@@ -548,7 +545,7 @@ async fn read_head(
         return Ok(None);
     };
     use {JournalKind::*, Role::*};
-    let kind = [Setup, Channel, MetadataChannel, Grant]
+    let kind = [Setup, Channel, Grant]
         .into_iter()
         .find(|k| *k as i64 == row.kind);
     let role = [Client, Provider]

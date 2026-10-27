@@ -23,29 +23,45 @@ impl Channel<PaymentFunding> {
         job: &JobState,
         result: &PaidJobResultV1,
         transcript: &[u8],
-        metadata_only: bool,
+        replaying: bool,
     ) -> Result<(), ChannelStateError> {
         if result.work_id != job.work_id {
             return Err(ChannelStateError::WrongChannel {
                 field: "result work_id",
             });
         }
-        if metadata_only {
+        if replaying {
             return if transcript.is_empty() {
                 Ok(())
             } else {
                 Err(ChannelStateError::Malformed)
             };
         }
-        let input =
-            PreparedWorkInput::decode(&job.prepared_input, crate::content::MAX_CONTENT_BYTES)
-                .map_err(PaidWorkError::from)?;
-        let budget = match &input {
-            PreparedWorkInput::Fetch(_) => crate::model::fetch::MAX_FETCH_TRANSCRIPT_BYTES,
-            PreparedWorkInput::Evaluate(_) => MAX_RECORD_BYTES,
-        };
-        let events = decode_transcript(transcript, budget)?;
-        if input.terminal_result(&self.funding.channel, &job.authorization, &events)? != *result {
+        let input = PreparedInvocation::from_canonical_bytes(
+            &job.prepared_input,
+            crate::content::MAX_CONTENT_BYTES,
+        )
+        .map_err(PaidWorkError::from)?;
+        let policy = InvocationPolicy::from_canonical_bytes(input.application_policy.as_bytes())
+            .map_err(PaidWorkError::from)?;
+        let facts = crate::job::check_paid_input(
+            &self.funding.channel,
+            &job.authorization,
+            &policy,
+            &input,
+        )?;
+        let events = decode_transcript(
+            transcript,
+            usize::try_from(facts.max_spool_bytes).unwrap_or(usize::MAX),
+        )?;
+        if crate::job::paid_terminal_result(
+            &self.funding.channel,
+            &job.authorization,
+            &policy,
+            &input,
+            &events,
+        )? != *result
+        {
             return Err(ChannelStateError::WrongChannel {
                 field: "result against its transcript",
             });
@@ -89,18 +105,9 @@ impl Channel<PaymentFunding> {
         settlement: WorkPaymentSettlement,
         role: Role,
         verifier: &V,
-        metadata_only: bool,
-        payloads: &super::payload::PayloadStore,
     ) -> Result<Self, ChannelStateError> {
-        let mut state = Self::decode_checkpoint(bytes, channel, settlement, role)?;
-        if !metadata_only {
-            for job in state.book.jobs.values_mut() {
-                job.prepared_input = payloads
-                    .read(&job.prepared_input)
-                    .map_err(|_| ChannelStateError::Malformed)?;
-            }
-        }
-        state.revalidate(verifier, metadata_only)?;
+        let state = Self::decode_checkpoint(bytes, channel, settlement, role)?;
+        state.revalidate(verifier, true)?;
         Ok(state)
     }
 
@@ -111,10 +118,10 @@ impl Channel<PaymentFunding> {
     /// against the party the channel names and over the same digest —
     /// the client's authorization, the provider's co-signature, the
     /// provider's result, and the client's binding and certificate. The
-    /// result is rebuilt from the transcript beside it by
-    /// [`crate::model::work::terminal_result`], exactly as a record replay rebuilds it. The
-    /// inputs are hashed against the digest the authorization commits
-    /// to. The retained close start is checked against this channel and
+    /// live result is authenticated against its complete transcript by
+    /// [`crate::job::paid_terminal_result`]. Metadata replay verifies the signed
+    /// receipt and its job binding; retained bodies are independently checked
+    /// when the content store recovers them. The retained close start is checked against this channel and
     /// this role, and the fixed answer is re-derived from the contest
     /// and the certificate that determine it.
     ///
@@ -176,6 +183,11 @@ impl Channel<PaymentFunding> {
                 });
             }
             if let Some((result, provider_signature)) = &job.result {
+                if job.phase == JobPhase::Verified && result.outcome != ResultOutcome::Finished {
+                    return Err(ChannelStateError::WrongChannel {
+                        field: "verified failed result",
+                    });
+                }
                 self.check_result_payload(job, result, &job.transcript, metadata_only)?;
                 if !verifier.verify_sig(
                     *provider_signature,
@@ -197,12 +209,28 @@ impl Channel<PaymentFunding> {
                 });
             }
             if let TerminalOutcome::Certified {
+                signed_result,
                 certificate,
                 binding,
                 binding_signature,
                 certificate_signature,
             } = &terminal.outcome
             {
+                let (result, signature) = **signed_result;
+                if result.outcome != ResultOutcome::Finished
+                    || result.work_id != terminal.work_id
+                    || binding.work_id != terminal.work_id
+                    || binding.result_digest != result_digest(&self.funding.channel, &result)
+                    || !verifier.verify_sig(
+                        signature,
+                        self.provider_key(),
+                        signing_hash(result_digest(&self.funding.channel, &result)),
+                    )
+                {
+                    return Err(ChannelStateError::WrongChannel {
+                        field: "certified success receipt",
+                    });
+                }
                 for (slot, signature, hash) in [
                     (
                         "binding",
@@ -345,6 +373,7 @@ impl Channel<PaymentFunding> {
             binding,
             binding_signature,
             certificate_signature,
+            ..
         } = &terminal.outcome
         else {
             return None;
@@ -663,7 +692,9 @@ impl Channel<PaymentFunding> {
                 metadata_only,
             ),
             ChannelRecord::PlaintextReleased { work_id } => self.apply_plaintext(*work_id),
-            ChannelRecord::ResultMatched { work_id } => self.apply_matched(*work_id),
+            ChannelRecord::ResultVerified { work_id } => {
+                self.apply_verified(*work_id, metadata_only)
+            }
             ChannelRecord::JobTerminated { work_id, outcome } => {
                 self.apply_terminated(*work_id, outcome, verifier)
             }
@@ -951,57 +982,28 @@ impl Channel<PaymentFunding> {
         &self,
         authorization: &PaidJobAuthorizationV2,
         prepared_input: &[u8],
-        metadata_only: bool,
+        replaying: bool,
     ) -> Result<(), ChannelStateError> {
-        let terms = self.funding.channel.payment_terms();
-        for (field, holds) in [
-            (
-                "channel_id",
-                authorization.channel_id.as_bytes() == self.funding.channel.id().as_bytes(),
-            ),
-            (
-                "payment_edge",
-                authorization.payment_edge == self.funding.channel.payment_edge(),
-            ),
-            (
-                "payment_terms_hash",
-                authorization.payment_terms_hash == self.funding.channel.payment_terms_hash(),
-            ),
-            ("bond_edge", authorization.bond_edge == terms.bond_edge),
-            (
-                "bond_terms_hash",
-                authorization.bond_terms_hash == terms.bond_terms_hash(),
-            ),
-        ] {
-            if !holds {
-                return Err(ChannelStateError::WrongChannel { field });
-            }
+        if authorization.channel_id != self.funding.channel.id() {
+            return Err(ChannelStateError::WrongChannel {
+                field: "channel_id",
+            });
         }
-
-        // The inputs this job will be executed from, against the digest
-        // the authorization both parties sign commits to. A bundle that
-        // does not hash to it is a job neither party agreed to run.
-        if metadata_only {
+        if replaying {
             return if prepared_input.is_empty() {
                 Ok(())
             } else {
                 Err(ChannelStateError::Malformed)
             };
         }
-        if hellas_rpc::ContentRef::for_bytes(prepared_input) != authorization.input_content {
-            return Err(ChannelStateError::Record(PaidWorkError::Mismatch {
-                field: "input_content",
-            }));
-        }
-        let bundle = PreparedWorkInput::decode(prepared_input, crate::content::MAX_CONTENT_BYTES)
+        let input = PreparedInvocation::from_canonical_bytes(
+            prepared_input,
+            crate::content::MAX_CONTENT_BYTES,
+        )
+        .map_err(PaidWorkError::from)?;
+        let policy = InvocationPolicy::from_canonical_bytes(input.application_policy.as_bytes())
             .map_err(PaidWorkError::from)?;
-        if bundle.digest(&self.funding.channel)?.as_bytes()
-            != authorization.prepared_input_digest.as_bytes()
-        {
-            return Err(ChannelStateError::Record(PaidWorkError::Mismatch {
-                field: "prepared_input_digest",
-            }));
-        }
+        crate::job::check_paid_input(&self.funding.channel, authorization, &policy, &input)?;
         Ok(())
     }
 
@@ -1174,7 +1176,7 @@ impl Channel<PaymentFunding> {
     /// summarises.
     ///
     /// The rule that makes this more than a signature check is the
-    /// reproduction below: [`crate::model::work::terminal_result`] is handed the stored
+    /// authenticated check below: [`crate::job::paid_terminal_result`] is handed the stored
     /// events and this job's own authorization, and what it builds must
     /// be the result byte for byte. That establishes, on commit and on
     /// every replay, that the events are one verified signed chain for
@@ -1274,20 +1276,33 @@ impl Channel<PaymentFunding> {
         self.book
             .record_result(work_id, *result, provider_signature, transcript.to_vec())
     }
-
-    /// Records that this client's own re-execution reproduced the answer
-    /// and it matched.
-    ///
-    /// It checks that there is a delivered result to have an opinion
-    /// about and that this journal is a client's. What it cannot check is
-    /// the reproduction itself: the engine is the caller's, and this
-    /// records a decision rather than making one. That is why matching is
-    /// a step of its own rather than a flag on the result — a receipt is
-    /// timely or late whatever a re-execution later says, and the two are
-    /// decided at different heights.
-    fn apply_matched(&mut self, work_id: Digest) -> Result<Applied, ChannelStateError> {
-        self.require_role("recording a reproduction match", Role::Client)?;
-        self.book.mark_matched(work_id)
+    /// Full verification precedes a new durable verification decision. Replay
+    /// keeps the prior decision without requiring ephemeral bodies to survive.
+    fn apply_verified(
+        &mut self,
+        work_id: Digest,
+        replaying: bool,
+    ) -> Result<Applied, ChannelStateError> {
+        self.require_role("recording a verified result", Role::Client)?;
+        let job = self.book.open_job(work_id, "recording a verified result")?;
+        let Some((result, _)) = &job.result else {
+            return Err(ChannelStateError::WrongPhase {
+                step: "recording a verified result",
+                phase: job.phase.name(),
+            });
+        };
+        if result.outcome != ResultOutcome::Finished {
+            return Err(ChannelStateError::WrongChannel {
+                field: "verified failed result",
+            });
+        }
+        if job.phase == JobPhase::Verified {
+            return Ok(Applied::Redundant);
+        }
+        if !replaying {
+            self.check_result_payload(&job, result, &job.transcript, false)?;
+        }
+        self.book.mark_verified(work_id)
     }
 
     fn apply_plaintext(&mut self, work_id: Digest) -> Result<Applied, ChannelStateError> {
@@ -1344,21 +1359,23 @@ impl Channel<PaymentFunding> {
         let job = self.book.open_job(work_id, "terminating the job")?;
         match outcome {
             TerminalOutcome::Certified {
+                signed_result,
                 certificate,
                 binding,
                 binding_signature,
                 certificate_signature,
             } => self.terminate_certified(
                 &job,
+                signed_result,
                 certificate,
                 binding,
                 *binding_signature,
                 *certificate_signature,
                 verifier,
             ),
-            TerminalOutcome::Refuted {
+            TerminalOutcome::Rejected {
                 result_digest: named,
-                reproduction_digest,
+                evidence_digest,
             } => {
                 self.require_role("refuting a result", Role::Client)?;
                 if job.phase != JobPhase::Ready {
@@ -1373,20 +1390,19 @@ impl Channel<PaymentFunding> {
                         phase: job.phase.name(),
                     });
                 };
-                // The refuted digest is this job's own signed result's,
-                // not a number the record chose: a refutation is a
-                // statement about the result the delivery recorded.
+                // Rejection evidence identifies the provider-signed result
+                // already authenticated by delivery.
                 if named.as_bytes() != result_digest(&self.funding.channel, result).as_bytes() {
                     return Err(ChannelStateError::WrongChannel {
-                        field: "refuted result_digest",
+                        field: "rejected result_digest",
                     });
                 }
                 self.book.rest_at(JobTerminal {
                     work_id: job.work_id,
                     phase: job.phase,
-                    outcome: TerminalOutcome::Refuted {
+                    outcome: TerminalOutcome::Rejected {
                         result_digest: *named,
-                        reproduction_digest: *reproduction_digest,
+                        evidence_digest: *evidence_digest,
                     },
                 });
                 Ok(Applied::Changed)
@@ -1406,21 +1422,25 @@ impl Channel<PaymentFunding> {
 
     /// Credits one client payment and rests the job at a certified
     /// terminal.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The receipt, payment binding and certificate are checked together."
+    )]
     fn terminate_certified<V: SigVerifier>(
         &mut self,
         job: &JobState,
+        signed_result: &(PaidJobResultV1, Sig),
         certificate: &EarnedCertificate,
         binding: &PaymentBindingV1,
         binding_signature: Sig,
         certificate_signature: Sig,
         verifier: &V,
     ) -> Result<Applied, ChannelStateError> {
-        // A provider credits only plaintext it released. A client may
-        // pay an authenticated result as soon as it is durably Ready;
-        // Matched remains the stronger, opt-in local-reexecution state.
+        // A provider credits only output it released. A client must durably
+        // verify the complete signed invocation result before issuing payment.
         let payable = match self.role {
             Role::Provider => job.phase == JobPhase::Delivered,
-            Role::Client => matches!(job.phase, JobPhase::Ready | JobPhase::Matched),
+            Role::Client => job.phase == JobPhase::Verified,
         };
         if !payable {
             return Err(ChannelStateError::WrongPhase {
@@ -1428,7 +1448,7 @@ impl Channel<PaymentFunding> {
                 phase: job.phase.name(),
             });
         }
-        let Some((result, _)) = job.result else {
+        let Some((result, result_signature)) = job.result else {
             // Unreachable: both phases above are phases a result was
             // recorded to reach. It is a refusal rather than an `expect`
             // because nothing here panics on stored state.
@@ -1438,6 +1458,11 @@ impl Channel<PaymentFunding> {
             });
         };
 
+        if signed_result != &(result, result_signature) {
+            return Err(ChannelStateError::WrongChannel {
+                field: "certified receipt",
+            });
+        }
         // A client pays by the height it signed to pay by, and this is
         // the last step where refusing costs it nothing. Past that height
         // the provider may end the job as expired and bear its cost
@@ -1491,6 +1516,7 @@ impl Channel<PaymentFunding> {
             work_id: job.work_id,
             phase: job.phase,
             outcome: TerminalOutcome::Certified {
+                signed_result: Box::new(*signed_result),
                 certificate: *certificate,
                 binding: Box::new(*binding),
                 binding_signature,
@@ -1541,5 +1567,145 @@ impl Channel<PaymentFunding> {
             });
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::channel as fixture;
+    use hellas_rpc::protocol::invocation::output::{FailureReason, InvocationOutput, Outcome};
+
+    #[tokio::test]
+    async fn signed_failed_receipts_remain_unpayable_after_metadata_rotation_and_replay() {
+        let root = tempfile::tempdir().unwrap();
+        let ready = fixture::ready();
+        let mut store = fixture::store_at(root.path(), &ready, Role::Client, fixture::CURSOR).await;
+        let id = fixture::accept(&mut [&mut store]).await;
+        let authorization = *store.state().job_by_id(id).unwrap().authorization();
+        let input = fixture::bundle(1);
+        let events = InvocationOutput {
+            outcome: Outcome::Failed(FailureReason::Execution),
+            artifacts: vec![],
+            metadata: hellas_rpc::JsonBytes(vec![]),
+        }
+        .sign(&input.request, &fixture::provider_producer(), 1024)
+        .unwrap();
+        let result = crate::job::paid_terminal_result(
+            ready.channel(),
+            &authorization,
+            ready.invocation_policy(),
+            &input,
+            &events,
+        )
+        .unwrap();
+        store
+            .commit(
+                ChannelRecord::JobResult {
+                    work_id: id,
+                    result,
+                    provider_signature: fixture::provider()
+                        .sign(signing_hash(result_digest(ready.channel(), &result))),
+                    transcript: crate::model::work::encode_transcript(&events).unwrap(),
+                },
+                &hellas_kernel::Secp256k1Verifier::new(),
+            )
+            .await
+            .unwrap();
+        store.rotate().await.unwrap();
+        drop(store);
+        let mut store = fixture::store_at(root.path(), &ready, Role::Client, fixture::CURSOR).await;
+        assert_eq!(
+            store
+                .state()
+                .job_by_id(id)
+                .unwrap()
+                .result()
+                .unwrap()
+                .0
+                .outcome,
+            ResultOutcome::Failed
+        );
+        let before = store.len();
+        assert!(
+            store
+                .commit(
+                    ChannelRecord::ResultVerified { work_id: id },
+                    &hellas_kernel::Secp256k1Verifier::new()
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(store.len(), before);
+        let mut forged = store.state().clone();
+        forged.book.jobs.get_mut(&id).unwrap().phase = JobPhase::Verified;
+        assert!(
+            Channel::from_checkpoint(
+                &forged.checkpoint_for_storage(),
+                ready.channel().clone(),
+                fixture::settlement(),
+                Role::Client,
+                &hellas_kernel::Secp256k1Verifier::new()
+            )
+            .is_err()
+        );
+        let mut endpoint =
+            crate::work::ClientEndpoint::new(ready, store, fixture::client()).unwrap();
+        assert!(endpoint.pay(id).await.is_err());
+        assert_eq!(endpoint.state().ledger().credited_cumulative(), 0);
+        assert!(endpoint.state().payment(id).is_none());
+    }
+    #[tokio::test]
+    async fn certified_checkpoint_rechecks_the_provider_signed_success_receipt() {
+        let checked = fixture::checked_job().await;
+        let mut endpoint = checked.client;
+        endpoint.pay(checked.id).await.unwrap();
+        let ready = checked.ready;
+        let mut state = endpoint.state().clone();
+        let input = fixture::bundle(1);
+        let authorization = fixture::authorization();
+        let events = InvocationOutput {
+            outcome: Outcome::Failed(FailureReason::Execution),
+            artifacts: vec![],
+            metadata: hellas_rpc::JsonBytes(vec![]),
+        }
+        .sign(&input.request, &fixture::provider_producer(), 1024)
+        .unwrap();
+        let failed = crate::job::paid_terminal_result(
+            ready.channel(),
+            &authorization,
+            ready.invocation_policy(),
+            &input,
+            &events,
+        )
+        .unwrap();
+        let TerminalOutcome::Certified {
+            signed_result,
+            binding,
+            binding_signature,
+            ..
+        } = &mut state.book.terminals.get_mut(&checked.id).unwrap().outcome
+        else {
+            panic!("certified terminal");
+        };
+        **signed_result = (
+            failed,
+            fixture::provider().sign(signing_hash(result_digest(ready.channel(), &failed))),
+        );
+        binding.result_digest = result_digest(ready.channel(), &failed);
+        *binding_signature = fixture::client().sign(signing_hash(payment_binding_digest(
+            ready.channel(),
+            binding,
+        )));
+        assert!(
+            Channel::from_checkpoint(
+                &state.checkpoint_for_storage(),
+                ready.channel().clone(),
+                fixture::settlement(),
+                Role::Client,
+                &hellas_kernel::Secp256k1Verifier::new()
+            )
+            .is_err()
+        );
     }
 }

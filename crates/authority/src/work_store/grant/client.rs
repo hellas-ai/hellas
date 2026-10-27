@@ -8,7 +8,7 @@ use crate::model::grant::{
 };
 use hellas_auth::authority::UnixMillis;
 use hellas_auth::{Digest, ProducerSigningKey, PublicKey};
-use hellas_channel::model::profile::{PreparedWorkInput, WorkContext, WorkPolicy};
+use hellas_channel::job::WorkContext;
 use hellas_channel::model::work::bound_result_digest;
 use hellas_channel::work_store::channel::funding::GrantFunding;
 use hellas_channel::work_store::journal::{
@@ -18,6 +18,7 @@ use hellas_channel::work_store::{Applied, JobBook, JobPhase, JobState, Role};
 use hellas_kernel::NetworkId;
 use hellas_rpc::OutputEventEnvelope;
 use hellas_rpc::ProviderEnrollmentBundle;
+use hellas_rpc::protocol::invocation::{InvocationPolicy, PreparedInvocation};
 use hellas_rpc::protocol::value::{decode_canonical_bounded, encode_bounded};
 use std::path::{Path, PathBuf};
 
@@ -179,7 +180,7 @@ impl GrantClientStore {
         &mut self,
         offer: &SignedOffer,
         authorization: GrantJobAuthorizationV1,
-        input: &PreparedWorkInput,
+        input: &PreparedInvocation,
         signer: &ProducerSigningKey,
         now: UnixMillis,
     ) -> Result<Signature, NodeStoreError> {
@@ -213,27 +214,22 @@ impl GrantClientStore {
                 p.resource == a.resource_id
                     && p.revision == a.resource_revision
                     && p.pricing.revision == a.pricing_revision
-                    && p.work.digest(self.context.network, self.context.channel)
-                        == a.work_policy_digest
+                    && hellas_channel::job::policy_digest(
+                        self.context.network,
+                        self.context.channel,
+                        &p.invocation_policy,
+                    )
+                    .ok()
+                        == Some(a.work_policy_digest)
             })
             .ok_or(GrantError::OutOfScope)?;
-        policy
-            .work
-            .check_bound_input(&self.context, &a.into(), input)?;
-        if let PreparedWorkInput::Fetch(bundle) = input {
-            let parts = bundle.parts().map_err(|_| GrantError::Malformed)?;
-            let input = hellas_rpc::fetch::verify_input_events(&parts.fetch_input_transcript)
-                .map_err(|_| GrantError::Malformed)?;
-            if let Some(resource) = &policy.https {
-                let request =
-                    hellas_rpc::http_fetch::HttpFetchRequest::decode(input.body.as_bytes())
-                        .map_err(|_| GrantError::Malformed)?;
-                resource.matches(&request)?;
-            }
-            if let Some(resource) = &policy.responses {
-                resource.matches(input.body.as_bytes())?;
-            }
-        }
+        hellas_channel::job::check_input(
+            &self.context,
+            &a.into(),
+            &policy.invocation_policy,
+            input,
+        )?;
+        crate::work_store::grant::store::resource_charge(policy, input)?;
         if signer.public_key() != PublicKey::Secp256k1(self.context.client.to_bytes()) {
             return Err(GrantError::Signature.into());
         }
@@ -291,8 +287,8 @@ impl GrantClientStore {
     pub async fn complete(
         &mut self,
         work: Digest,
-        policy: &WorkPolicy,
-        input: &PreparedWorkInput,
+        policy: &InvocationPolicy,
+        input: &PreparedInvocation,
         events: &[OutputEventEnvelope],
         signed: SignedResult,
         now: UnixMillis,
@@ -302,9 +298,16 @@ impl GrantClientStore {
             .job_by_id(work)
             .ok_or(GrantError::Unauthorized)?;
         let a = job.authorization();
-        if policy.digest(self.context.network, self.context.channel) != a.work_policy_digest
-            || policy.bound_terminal_result(&self.context, work, &a.into(), input, events)?
-                != signed.result
+        if hellas_channel::job::policy_digest(self.context.network, self.context.channel, policy)?
+            != a.work_policy_digest
+            || hellas_channel::job::terminal_result(
+                &self.context,
+                work,
+                &a.into(),
+                policy,
+                input,
+                events,
+            )? != signed.result
         {
             return Err(GrantError::OutOfScope.into());
         }

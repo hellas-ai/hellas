@@ -2,30 +2,24 @@ use hellas_auth::Digest;
 use hellas_channel::{
     content::{ContentError, UploadQuota, UploadStore},
     model::{
-        prepared_input::PreparedPaidInputV1,
         setup::{ObservedChannel, ReadyChannel},
-        work::{
-            EvaluatePolicyV2, PaidJobAuthorizationV2, PrivateRecord as _, signing_hash, work_id,
-        },
+        work::{PaidJobAuthorizationV2, PrivateRecord as _, signing_hash, work_id},
     },
     test_support::channel::*,
     work::{ClientEndpoint, JobProposal, ProviderEndpoint, WorkService},
     work_store::{ChannelStore, Role},
 };
 use hellas_kernel::{PendingSlot, Secp256k1Verifier};
+use hellas_rpc::Retention;
+use hellas_rpc::protocol::invocation::{Artifact, InvocationPolicy, PreparedInvocation};
 use hellas_rpc::{
     ContentId, ContentRef,
     pb::work::{AcceptWorkRequest, UploadContentRequest, accept_work_response},
-    protocol::{
-        artifacts::{
-            InputAddressed as _, OutputAddressed as _, SourceRef, TextExecution, TokenIds,
-        },
-        content_upload::{CONTENT_CHUNK_BYTES, chunk_digest},
-    },
+    protocol::content_upload::{CONTENT_CHUNK_BYTES, chunk_digest},
 };
 use hellas_wire::TransportContext;
 
-fn ready(policy: EvaluatePolicyV2) -> ReadyChannel {
+fn ready(policy: InvocationPolicy) -> ReadyChannel {
     descriptor_with(policy)
         .check_ready(&ObservedChannel {
             height: CURSOR,
@@ -49,7 +43,7 @@ async fn service(root: &std::path::Path, ready: &ReadyChannel) -> WorkService {
 async fn proposal(
     root: &std::path::Path,
     ready: &ReadyChannel,
-    input: PreparedPaidInputV1,
+    mut input: PreparedInvocation,
 ) -> (ClientEndpoint, AcceptWorkRequest, Vec<u8>) {
     let mut client = ClientEndpoint::new(
         ready.clone(),
@@ -57,10 +51,12 @@ async fn proposal(
         client(),
     )
     .unwrap();
-    let bytes = input.encode().unwrap();
+    input.application_policy =
+        hellas_rpc::JsonBytes(ready.invocation_policy().canonical_bytes().unwrap());
+    let bytes = input.canonical_bytes().unwrap();
     let request = client
         .propose(&JobProposal {
-            prepared_input: input.into(),
+            prepared_input: input,
             deadlines: deadlines(),
         })
         .await
@@ -93,6 +89,8 @@ fn chunk(
         offset,
         chunk: bytes.to_vec(),
         chunk_signature: signature.as_bytes().to_vec(),
+        program_manifest: manifest().canonical_bytes(),
+        program_root: program_root(&bundle(1)),
     }
 }
 fn context(exporter: [u8; 32]) -> TransportContext {
@@ -156,6 +154,7 @@ async fn a_foreign_first_object_and_a_chunk_replayed_under_another_valid_job_sta
             Digest::hash(b"work"),
             object(&bytes),
             50,
+            Retention::Ephemeral,
             bytes.len() as u64,
             0,
             &[],
@@ -220,17 +219,6 @@ async fn unaccepted_compute_payloads_and_atomic_write_debris_are_collected_after
         .map(|entry| entry.unwrap().path())
         .find(|path| path.to_string_lossy().ends_with(".staging"))
         .unwrap();
-    let stem = staging
-        .file_name()
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .trim_end_matches(".staging");
-    let payloads = provider_root.join(format!("{stem}.payloads"));
-    std::fs::create_dir_all(&payloads).unwrap();
-    // A body written before its proposal journal append is unreferenced.
-    std::fs::write(payloads.join(object(&bytes).id().to_string()), &bytes).unwrap();
-    std::fs::write(payloads.join(".orphan.pending"), &bytes).unwrap();
     std::fs::write(staging.join(".proposal.crash.pending"), &bytes).unwrap();
     let mut store = ChannelStore::open(
         &provider_root,
@@ -242,7 +230,6 @@ async fn unaccepted_compute_payloads_and_atomic_write_debris_are_collected_after
     )
     .await
     .unwrap();
-    assert_eq!(std::fs::read_dir(&payloads).unwrap().count(), 0);
     assert!(!staging.join(".proposal.crash.pending").exists());
     let a = PaidJobAuthorizationV2::decode(&request.authorization).unwrap();
     store
@@ -258,7 +245,8 @@ async fn unaccepted_compute_payloads_and_atomic_write_debris_are_collected_after
         )
         .await
         .unwrap();
-    assert_eq!(std::fs::read_dir(&payloads).unwrap().count(), 1);
+    assert_eq!(std::fs::read_dir(&staging).unwrap().count(), 3);
+    assert!(!provider_root.join("content").exists());
     drop(store); // Crash after JobProposed, before JobAccepted.
     let mut store = ChannelStore::open(
         &provider_root,
@@ -271,7 +259,6 @@ async fn unaccepted_compute_payloads_and_atomic_write_debris_are_collected_after
     .await
     .unwrap();
     advance(&mut store, a.acceptance_deadline + 1).await;
-    assert_eq!(std::fs::read_dir(&payloads).unwrap().count(), 0);
     assert_eq!(std::fs::read_dir(&staging).unwrap().count(), 0);
     drop(store);
     // No proposal was installed before the first atomic staging rename.
@@ -385,12 +372,6 @@ async fn a_crash_after_the_expiry_append_collects_payloads_on_reopen() {
         .unwrap();
         assert!(store.state().jobs().next().is_none());
         assert!(store.state().terminal_by_id(id).is_some());
-        assert_eq!(
-            std::fs::read_dir(provider_root.join(format!("{stem}.payloads")))
-                .unwrap()
-                .count(),
-            0
-        );
         assert_eq!(
             std::fs::read_dir(provider_root.join(format!("{stem}.staging")))
                 .unwrap()
@@ -572,10 +553,21 @@ async fn signed_chunks_bind_connection_job_offset_and_closure_and_publish_only_a
 async fn wrong_hash_limits_and_second_proposal_never_publish_or_overwrite_staging() {
     let root = tempfile::tempdir().unwrap();
     let mut policy = work_policy();
-    policy.max_upload_bytes = 10;
+    policy.limits.max_upload_bytes = 10;
     let r = ready(policy);
     let service = service(&root.path().join("provider"), &r).await;
     let (_, request, bytes) = proposal(&root.path().join("client"), &r, bundle(1)).await;
+    drop(service);
+    let stem = hellas_channel::work_store::journal::Journal::stems(&root.path().join("provider"))
+        .unwrap()
+        .pop()
+        .unwrap();
+    let before =
+        hellas_channel::work_store::journal::Journal::inspect(&root.path().join("provider"), &stem)
+            .await
+            .unwrap()
+            .1;
+    let service = self::service(&root.path().join("provider"), &r).await;
     assert!(
         service
             .upload(
@@ -587,6 +579,14 @@ async fn wrong_hash_limits_and_second_proposal_never_publish_or_overwrite_stagin
             .refused
             .is_some()
     );
+    drop(service);
+    let after =
+        hellas_channel::work_store::journal::Journal::inspect(&root.path().join("provider"), &stem)
+            .await
+            .unwrap()
+            .1;
+    assert_eq!(before.records, after.records);
+    assert_eq!(before.checkpoint, after.checkpoint);
     assert!(!root.path().join("provider/content").exists());
     assert!(
         std::fs::read_dir(root.path().join("provider"))
@@ -652,10 +652,18 @@ fn shared_quota_resume_gc_and_ephemeral_storage_enforce_real_byte_and_disk_bound
     let bytes = b"0123456789";
     let work = Digest::hash(b"proposal");
     first
-        .stage(work, object(bytes), 50, 10, 0, &bytes[..4])
+        .stage(
+            work,
+            object(bytes),
+            50,
+            Retention::Retain,
+            10,
+            0,
+            &bytes[..4],
+        )
         .unwrap();
     assert!(matches!(
-        second.stage(work, object(bytes), 50, 10, 0, b""),
+        second.stage(work, object(bytes), 50, Retention::Ephemeral, 10, 0, b""),
         Err(ContentError::StagingLimit(16))
     ));
     let directory = first.directory().unwrap().to_owned();
@@ -663,23 +671,43 @@ fn shared_quota_resume_gc_and_ephemeral_storage_enforce_real_byte_and_disk_bound
     let mut resumed = UploadStore::durable(root.path(), "first", Digest::hash(b"first")).unwrap();
     resumed.set_quota(quota).unwrap();
     assert_eq!(
-        resumed.stage(work, object(bytes), 50, 10, 0, b"").unwrap(),
+        resumed
+            .stage(work, object(bytes), 50, Retention::Retain, 10, 0, b"")
+            .unwrap(),
         4
     );
     assert_eq!(
         resumed
-            .stage(work, object(bytes), 50, 10, 4, &bytes[4..])
+            .stage(
+                work,
+                object(bytes),
+                50,
+                Retention::Retain,
+                10,
+                4,
+                &bytes[4..]
+            )
             .unwrap(),
         10
     );
     resumed.gc(51, false).unwrap();
     assert_eq!(std::fs::read_dir(directory).unwrap().count(), 0);
-    second.stage(work, object(bytes), 50, 10, 0, bytes).unwrap();
+    second
+        .stage(work, object(bytes), 50, Retention::Ephemeral, 10, 0, bytes)
+        .unwrap();
     assert!(second.directory().is_none());
     second.gc(51, false).unwrap();
     assert!(!second.is_staged());
     assert!(matches!(
-        second.stage(work, object(bytes), 60, 10, 0, b"012345678X"),
+        second.stage(
+            work,
+            object(bytes),
+            60,
+            Retention::Ephemeral,
+            10,
+            0,
+            b"012345678X"
+        ),
         Err(ContentError::Hash)
     ));
     assert!(
@@ -691,26 +719,16 @@ fn shared_quota_resume_gc_and_ephemeral_storage_enforce_real_byte_and_disk_bound
 #[tokio::test]
 async fn twelve_mib_compute_input_resumes_accepts_reopens_and_reuses_content() {
     let root = tempfile::tempdir().unwrap();
-    let tokens = TokenIds::from(vec![u32::MAX; (12 * 1024 * 1024) / 5]);
-    let execution = TextExecution::new(
-        SourceRef::output(identity_artifact().output_id()),
-        tokens.output_id(),
-        text_policy().output_id(),
-    );
-    let mut request = evaluate_request(4);
-    request.text_execution = execution.input_id().digest();
-    let input = PreparedPaidInputV1::new(
-        &request,
-        &manifest(),
-        &execution,
-        &tokens,
-        &text_policy(),
-        &identity_artifact(),
-    );
+    let mut input = bundle(4);
+    input.input.artifacts.push(Artifact::new(
+        "input",
+        "catena.bytes.v1",
+        vec![0xa5; 12 * 1024 * 1024],
+    ));
+    input.request.input = input.input.content_id().unwrap();
     let mut policy = work_policy();
-    policy.max_prompt_tokens = tokens.as_slice().len() as u32;
-    policy.max_encoded_prepared_input = 13 * 1024 * 1024;
-    policy.max_upload_bytes = u64::from(policy.max_encoded_prepared_input);
+    policy.limits.max_upload_bytes = 13 * 1024 * 1024;
+    input.application_policy = hellas_rpc::JsonBytes(policy.canonical_bytes().unwrap());
     let r = ready(policy);
     let provider_root = root.path().join("provider");
     let mut service = service(&provider_root, &r).await;
@@ -786,7 +804,7 @@ async fn twelve_mib_compute_input_resumes_accepts_reopens_and_reuses_content() {
     );
     let next = caller
         .propose(&JobProposal {
-            prepared_input: input.into(),
+            prepared_input: input,
             deadlines: deadlines(),
         })
         .await
@@ -806,9 +824,14 @@ async fn twelve_mib_compute_input_resumes_accepts_reopens_and_reuses_content() {
         .map(|entry| entry.unwrap().path())
         .find(|path| path.to_string_lossy().ends_with(".staging"))
         .unwrap();
+    let ticket = std::fs::read_dir(&staging)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|ext| ext == "ticket"))
+        .unwrap();
     assert_eq!(
-        std::fs::metadata(staging.join("proposal")).unwrap().len(),
-        80,
+        std::fs::metadata(ticket).unwrap().len(),
+        120,
         "only proposal metadata is staged for the fresh job; zero body bytes were uploaded"
     );
     let mut third = next.clone();
@@ -836,4 +859,110 @@ async fn twelve_mib_compute_input_resumes_accepts_reopens_and_reuses_content() {
         Some(accept_work_response::Outcome::Accepted(_))
     ));
     assert_eq!(std::fs::read_dir(staging).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn a_paid_unseen_program_requires_its_complete_verified_source_and_asset_closure() {
+    use hellas_rpc::protocol::invocation::compute::{Environment, NamedAsset};
+    for fault in ["missing", "corrupt", "none"] {
+        let root = tempfile::tempdir().unwrap();
+        let r = ready(work_policy());
+        let provider_root = root.path().join("provider");
+        let provider = service(&provider_root, &r).await;
+        let source = b"unseen source program bytes";
+        let asset = b"unseen signed program asset bytes";
+        let environment = Environment {
+            sources: vec![object(source)],
+            assets: vec![NamedAsset {
+                name: "weights.bin".into(),
+                object: object(asset),
+            }],
+        };
+        let manifest = environment.manifest().unwrap();
+        let program_root = environment.canonical_bytes().unwrap();
+        let base = bundle(1);
+        let mut invocation = base.request;
+        invocation.execution_environment = manifest.content_id();
+        let input = PreparedInvocation::new(
+            invocation,
+            &manifest,
+            base.input,
+            r.invocation_policy().canonical_bytes().unwrap(),
+        )
+        .unwrap();
+        let (_, request, bytes) = proposal(&root.path().join("client"), &r, input).await;
+        let upload = |reference, payload: &[u8]| {
+            let mut upload = chunk(&request, reference, 0, payload, [3; 32]);
+            upload.program_manifest = manifest.canonical_bytes();
+            upload.program_root = program_root.clone();
+            upload
+        };
+        assert!(
+            provider
+                .upload(&upload(object(&bytes), &bytes), &context([3; 32]))
+                .await
+                .unwrap()
+                .refused
+                .is_none()
+        );
+        assert!(
+            provider
+                .upload(&upload(object(source), source), &context([3; 32]))
+                .await
+                .unwrap()
+                .refused
+                .is_none()
+        );
+        if fault != "missing" {
+            let mut bytes = asset.to_vec();
+            if fault == "corrupt" {
+                bytes[0] ^= 1;
+            }
+            let response = provider
+                .upload(&upload(object(asset), &bytes), &context([3; 32]))
+                .await
+                .unwrap();
+            assert_eq!(response.refused.is_some(), fault == "corrupt");
+        }
+        let response = provider.accept(&request).await;
+        if fault != "none" {
+            assert!(matches!(
+                response.outcome,
+                Some(accept_work_response::Outcome::Refused(_))
+            ));
+            assert!(
+                provider
+                    .with_state(|s| s.jobs().next().is_none())
+                    .await
+                    .unwrap()
+            );
+            assert!(!provider_root.join("content").exists());
+        } else {
+            assert!(matches!(
+                response.outcome,
+                Some(accept_work_response::Outcome::Accepted(_))
+            ));
+            drop(provider);
+            let reopened = service(&provider_root, &r).await;
+            let authorization = PaidJobAuthorizationV2::decode(&request.authorization).unwrap();
+            let id = work_id(r.channel(), &authorization);
+            let hellas_channel::work::RunAdmission::Invoke(input) =
+                reopened.begin_run(id, &r).await.unwrap()
+            else {
+                panic!("accepted closure dispatches after restart")
+            };
+            assert!(input.content().retained_store().is_some());
+            for bytes in [
+                program_root.as_slice(),
+                source.as_slice(),
+                asset.as_slice(),
+                bytes.as_slice(),
+            ] {
+                assert_eq!(
+                    input.content().read(object(bytes)).unwrap().as_slice(),
+                    bytes
+                );
+            }
+        }
+    }
 }

@@ -3,8 +3,8 @@
 use super::{budget::*, *};
 use hellas_auth::authority::ContactCard;
 use hellas_auth::{ProducerSigningKey, PublicKey, Signature};
-use hellas_channel::model::profile::WorkPolicy;
 use hellas_kernel::NetworkId;
+use hellas_rpc::protocol::invocation::{Admission, InvocationPolicy, fetch::FetchRoutePolicy};
 use hellas_rpc::protocol::value::{BoundedCborError, canonical_dag_cbor, decode_canonical_bounded};
 use hellas_rpc::{
     PlatformCredential, PlatformEnrollment, ProviderEnrollmentBundle, RootKind, RootProof,
@@ -104,7 +104,7 @@ pub struct GrantPolicy {
     pub revision: Revision,
     pub name: String,
     #[serde(with = "policy_bytes")]
-    pub work: WorkPolicy,
+    pub invocation_policy: InvocationPolicy,
     pub https: Option<super::resource::HttpsResource>,
     pub responses: Option<super::responses::ResponsesResource>,
     pub pricing: super::pricing::Pricing,
@@ -114,7 +114,9 @@ impl GrantPolicy {
         if self.revision.0 == 0 || self.name.is_empty() || self.name.len() > 64 {
             return Err(GrantError::Malformed);
         }
-        self.work.check().map_err(|_| GrantError::Malformed)?;
+        self.invocation_policy
+            .validate()
+            .map_err(|_| GrantError::Malformed)?;
         self.pricing.validate().map_err(|_| GrantError::Limits)?;
         if self
             .pricing
@@ -124,64 +126,54 @@ impl GrantPolicy {
         {
             return Err(GrantError::Limits);
         }
-        let responses = matches!(&self.work, WorkPolicy::Fetch { contract, .. }
-            if contract.schema() == hellas_rpc::FetchSchema::StatelessResponsesV1);
-        if responses != self.responses.is_some() {
+        let fetch: Vec<_> = self
+            .invocation_policy
+            .admissions
+            .iter()
+            .filter_map(|a| match a {
+                Admission::Fetch { admission } => Some(admission),
+                _ => None,
+            })
+            .collect();
+        let responses = fetch
+            .iter()
+            .any(|a| a.contract.schema() == hellas_rpc::FetchSchema::StatelessResponsesV1);
+        let https = fetch
+            .iter()
+            .any(|a| a.contract.schema() == hellas_rpc::FetchSchema::HttpV1);
+        if responses != self.responses.is_some() || https != self.https.is_some() {
             return Err(GrantError::Malformed);
+        }
+        if (self.responses.is_some() || self.https.is_some())
+            && fetch
+                .iter()
+                .any(|a| !matches!(a.route, FetchRoutePolicy::SealedRoute { .. }))
+        {
+            return Err(GrantError::OutOfScope);
         }
         if let Some(resource) = &self.responses {
-            if !matches!(
-                &self.work,
-                WorkPolicy::Fetch {
-                    route: hellas_channel::model::fetch::FetchRoutePolicy::SealedRoute { .. },
-                    ..
-                }
-            ) {
-                return Err(GrantError::OutOfScope);
-            }
             resource.validate().map_err(|_| GrantError::Malformed)?;
-        }
-        if matches!(&self.work, WorkPolicy::Fetch { contract, .. }
-            if contract.schema() == hellas_rpc::FetchSchema::HttpV1)
-            && self.https.is_none()
-        {
-            return Err(GrantError::Malformed);
         }
         if let Some(resource) = &self.https {
-            if !matches!(
-                &self.work,
-                WorkPolicy::Fetch {
-                    route: hellas_channel::model::fetch::FetchRoutePolicy::SealedRoute { .. },
-                    ..
-                }
-            ) {
-                return Err(GrantError::OutOfScope);
-            }
-            if !matches!(&self.work, WorkPolicy::Fetch { contract, .. }
-                if contract.schema() == hellas_rpc::FetchSchema::HttpV1)
-            {
-                return Err(GrantError::Malformed);
-            }
             resource.validate().map_err(|_| GrantError::Malformed)?;
         }
+
         Ok(())
     }
     pub fn supports(&self, meter: Meter) -> bool {
         if meter == Meter::UsdMicros {
             return self.pricing.rates.is_some();
         }
-        match &self.work {
-            WorkPolicy::Evaluate(_) => true,
-            WorkPolicy::Fetch { .. } => match meter {
-                Meter::Requests => true,
-                Meter::OutputTokens => {
-                    self.responses.is_some()
-                        || self.https.as_ref().is_some_and(|r| {
-                            r.accounting != super::resource::AccountingProfile::None
-                        })
-                }
-                Meter::InputTokens | Meter::DeviceMillis | Meter::UsdMicros => false,
-            },
+        match meter {
+            Meter::Requests => true,
+            Meter::OutputTokens => {
+                self.responses.is_some()
+                    || self
+                        .https
+                        .as_ref()
+                        .is_some_and(|r| r.accounting != super::resource::AccountingProfile::None)
+            }
+            Meter::InputTokens | Meter::DeviceMillis | Meter::UsdMicros => false,
         }
     }
 }
@@ -212,12 +204,13 @@ impl GrantDef {
             if !names.insert(&policy.name) || !policies.insert(policy.resource) {
                 return Err(GrantError::Malformed);
             }
-            let account_backed = match &policy.work {
-                WorkPolicy::Evaluate(_) => false,
-                WorkPolicy::Fetch { .. } => {
-                    policy.https.as_ref().is_none_or(|r| r.credential.is_some())
+            let account_backed = policy.invocation_policy.admissions.iter().any(|a| match a {
+                Admission::Compute { .. } => false,
+                Admission::Fetch { admission } => {
+                    admission.contract.schema() == hellas_rpc::FetchSchema::StatelessResponsesV1
+                        || policy.https.as_ref().is_none_or(|r| r.credential.is_some())
                 }
-            };
+            });
             if !self.allow_account_backed && account_backed {
                 return Err(GrantError::AccountBacked);
             }
@@ -324,10 +317,11 @@ impl Offer {
 
 mod policy_bytes {
     use super::*;
-    pub fn serialize<S: Serializer>(p: &WorkPolicy, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_bytes(&p.encode())
+    pub fn serialize<S: Serializer>(p: &InvocationPolicy, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_bytes(&p.canonical_bytes().map_err(serde::ser::Error::custom)?)
     }
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<WorkPolicy, D::Error> {
-        WorkPolicy::decode(&serde_bytes::ByteBuf::deserialize(d)?).map_err(D::Error::custom)
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<InvocationPolicy, D::Error> {
+        InvocationPolicy::from_canonical_bytes(&serde_bytes::ByteBuf::deserialize(d)?)
+            .map_err(D::Error::custom)
     }
 }

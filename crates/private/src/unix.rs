@@ -10,6 +10,14 @@ pub(super) fn open_nofollow(path: &Path) -> io::Result<File> {
         .open(path)
 }
 
+pub(super) fn open_nofollow_rw(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+}
+
 pub(super) fn is_private(file: &File) -> io::Result<bool> {
     let metadata = file.metadata()?;
     // SAFETY: geteuid has no preconditions and cannot fail.

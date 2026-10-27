@@ -88,8 +88,8 @@ impl PaidOffer {
             return Err(PaidOfferError::Malformed);
         }
         self.policy
-            .work_policy
-            .check()
+            .invocation_policy
+            .validate()
             .map_err(|_| PaidOfferError::Malformed)?;
         self.policy
             .payment_policy

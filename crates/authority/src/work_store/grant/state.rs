@@ -736,9 +736,6 @@ impl State {
             return Err(GrantError::Malformed.into());
         }
         let policy = self.policy_for(a)?;
-        if policy.work.allowed_environment() != a.environment_commitment {
-            return Err(GrantError::OutOfScope.into());
-        }
         self.check_resource(a)?;
         if self
             .resources
@@ -761,7 +758,13 @@ impl State {
                 p.resource == a.resource_id
                     && p.revision == a.resource_revision
                     && p.pricing.revision == a.pricing_revision
-                    && p.work.digest(self.network, a.channel_id.0) == a.work_policy_digest
+                    && hellas_channel::job::policy_digest(
+                        self.network,
+                        a.channel_id.0,
+                        &p.invocation_policy,
+                    )
+                    .ok()
+                        == Some(a.work_policy_digest)
             })
             .ok_or_else(|| GrantError::OutOfScope.into())
     }
@@ -791,10 +794,23 @@ impl State {
             .map(|charge| policy.pricing.settle(charge))
             .transpose()
             .map_err(|_| NodeStoreError::Malformed)?;
-        let strict_accounting = policy.responses.is_some()
-            || policy.https.as_ref().is_some_and(|r| {
-                r.accounting != crate::model::grant::resource::AccountingProfile::None
-            });
+        let strict_accounting =
+            policy
+                .invocation_policy
+                .admissions
+                .iter()
+                .any(|admission| match admission {
+                    hellas_rpc::protocol::invocation::Admission::Compute { .. } => false,
+                    hellas_rpc::protocol::invocation::Admission::Fetch { admission } => {
+                        admission.contract.manifest_id() == auth.environment_commitment
+                            && (admission.contract.schema()
+                                == hellas_rpc::FetchSchema::StatelessResponsesV1
+                                || policy.https.as_ref().is_some_and(|r| {
+                                    r.accounting
+                                        != crate::model::grant::resource::AccountingProfile::None
+                                }))
+                    }
+                });
         let provider_key = grant_producer(self.provider()?)?;
         let book = &mut self
             .channels
@@ -819,6 +835,8 @@ impl State {
         }
         if let Some(r) = &result {
             if r.result.work_id != work
+                || (r.result.outcome == hellas_channel::model::work::ResultOutcome::Finished)
+                    != (outcome == GrantOutcome::Finished)
                 || matches!(
                     outcome,
                     GrantOutcome::Released | GrantOutcome::Indeterminate
@@ -1271,7 +1289,6 @@ impl State {
                     || a.acceptance_deadline_ms >= a.terminal_deadline_ms
                     || a.terminal_deadline_ms >= a.delivery_deadline_ms
                     || a.delivery_deadline_ms.0 - a.terminal_deadline_ms.0 > 300_000
-                    || state.policy_for(a)?.work.allowed_environment() != a.environment_commitment
                 {
                     return Err(NodeStoreError::Malformed);
                 }
@@ -1288,10 +1305,17 @@ impl State {
                     }
                     GrantOutcome::Finished => {
                         matches!(terminal.phase, JobPhase::Running | JobPhase::Streaming)
-                            && t.result.is_some()
+                            && t.result.as_ref().is_some_and(|r| {
+                                r.result.outcome
+                                    == hellas_channel::model::work::ResultOutcome::Finished
+                            })
                     }
                     GrantOutcome::Failed => {
                         matches!(terminal.phase, JobPhase::Running | JobPhase::Streaming)
+                            && t.result.as_ref().is_none_or(|r| {
+                                r.result.outcome
+                                    == hellas_channel::model::work::ResultOutcome::Failed
+                            })
                     }
                 };
                 if !valid_phase {

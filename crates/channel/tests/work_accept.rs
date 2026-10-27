@@ -12,18 +12,16 @@ use support::temp;
 
 use hellas_auth::Digest;
 use hellas_auth::PublicKey;
-use hellas_channel::model::prepared_input::PreparedPaidInputV1;
-use hellas_channel::model::setup::{ReadyChannel, WorkChannelDescriptor, payment_terms_hash};
+use hellas_channel::job::{prepared_input_digest, propose as propose_authorization};
+use hellas_channel::model::setup::{ReadyChannel, WorkChannelDescriptor};
 use hellas_channel::model::work::{
-    JobDeadlines, PaidChannel, PaidJobAuthorizationV2, PrivateRecord as _, prepared_input_digest,
-    propose_authorization, signing_hash, work_id, work_policy_digest,
+    JobDeadlines, PaidChannel, PaidJobAuthorizationV2, PrivateRecord as _, signing_hash, work_id,
 };
 use hellas_channel::test_support::channel::{
-    CURSOR, OMISSION_BOND, PAYMENT_RESERVE, PAYMENT_VALUE, PRICE, SALT, advance, bond_edge, bundle,
+    CURSOR, OMISSION_BOND, PAYMENT_RESERVE, PAYMENT_VALUE, PRICE, SALT, advance, bundle,
     bundle_bytes, channel_policy, client, deadlines, descriptor,
-    descriptor_with as descriptor_with_policy, evaluate_request, identity_artifact, manifest,
-    network, origin, payload_at, payment_edge, payment_policy, payment_terms, prompt_tokens,
-    provider, settlement, signer, text_execution, text_policy, work_policy,
+    descriptor_with as descriptor_with_policy, invocation_request, manifest, network, origin,
+    payload_at, payment_policy, payment_terms, provider, settlement, signer, work_policy,
 };
 use hellas_channel::test_support::channel::{accept_uploaded, accept_uploaded_service};
 use hellas_channel::work::{
@@ -42,11 +40,10 @@ use hellas_rpc::pb::work::{
     AcceptWorkRequest, AcceptWorkResponse, WorkAccepted, WorkRefusalCode, WorkRefused,
     accept_work_response::Outcome,
 };
-use hellas_rpc::protocol::artifacts::{
-    InputAddressed as _, OutputAddressed as _, SourceRef, TextExecution, TextPolicy,
-};
+use hellas_rpc::protocol::invocation::{PreparedInvocation, compute};
+
+use hellas_rpc::ContentId;
 use hellas_rpc::services::work::{Work, WorkServer};
-use hellas_rpc::{ContentId, Evaluate};
 use hellas_wire::mux::MuxTransport;
 use hellas_wire::{Dispatcher, ServiceMarker, StreamTransport};
 
@@ -124,7 +121,7 @@ async fn provider_endpoint(root: &std::path::Path) -> ProviderEndpoint {
 
 fn proposal(nonce: u8) -> JobProposal {
     JobProposal {
-        prepared_input: bundle(nonce).into(),
+        prepared_input: bundle(nonce),
         deadlines: deadlines(),
     }
 }
@@ -247,7 +244,13 @@ async fn an_accepted_exchange_leaves_both_signatures_on_both_disks() {
     let serving = serve(server_transport, service.clone());
 
     let mut endpoint = client_endpoint(client_root.path()).await;
-    let accepted = propose_work(client_transport, &mut endpoint, &proposal(1)).await;
+    let accepted = propose_work(
+        client_transport,
+        &mut endpoint,
+        &proposal(1),
+        &hellas_channel::test_support::channel::program_content(),
+    )
+    .await;
     let Ok(work_id) = accepted else {
         panic!("the fixture exchange completes: {accepted:?}");
     };
@@ -843,7 +846,7 @@ async fn a_proposal_refused_before_signing_leaves_no_job() {
     // Terminal deadline inside the measured dispatch and delivery
     // margins: legal, ordered, and unreachable.
     let unreachable = JobProposal {
-        prepared_input: bundle(1).into(),
+        prepared_input: bundle(1),
         deadlines: JobDeadlines {
             acceptance: 11,
             terminal: 12,
@@ -892,7 +895,9 @@ async fn a_retained_proposal_survives_restart_expiry_and_policy_change() {
     drop(endpoint); // The provider response was lost before journaling.
 
     let mut policy = work_policy();
-    policy.allowed_environment = ContentId::from_bytes([0x99; 32]);
+    policy.admissions[0] = hellas_rpc::protocol::invocation::Admission::Compute {
+        evaluator: "other/evaluator".into(),
+    };
     let changed = ready_with_descriptor(descriptor_with_policy(policy));
     let reopened = at_height(
         store(root.path(), Role::Client).await,
@@ -1333,19 +1338,15 @@ async fn a_crash_between_the_two_commits_co_signs_on_retry() {
     let mut store = store_at_cursor(root.path(), Role::Provider).await;
     let authorization = authorization(1, 1);
     let signature = client().sign(signing_hash(work_id(ready().channel(), &authorization)));
-    if let Err(error) = store
-        .commit(
-            ChannelRecord::JobProposed {
-                authorization,
-                client_signature: signature,
-                prepared_input: bundle_bytes(1),
-            },
-            &Secp256k1Verifier::new(),
-        )
-        .await
-    {
-        panic!("the proposal is journaled: {error}");
-    }
+    hellas_channel::test_support::channel::commit(
+        &mut store,
+        ChannelRecord::JobProposed {
+            authorization,
+            client_signature: signature,
+            prepared_input: bundle_bytes(1),
+        },
+    )
+    .await;
     drop(store);
 
     let mut endpoint = provider_endpoint(root.path()).await;
@@ -1459,39 +1460,20 @@ async fn a_bundle_that_is_not_the_committed_one_is_invalid() {
 /// free to commit to whatever it likes, and what makes a proposal
 /// runnable is that the committed graph fits inside the bounds both
 /// parties fixed. Nothing in a journal can see that.
-fn overlong_bundle() -> PreparedPaidInputV1 {
-    // The channel allows 128 new tokens; this asks for 129.
-    let policy = TextPolicy::from_u32_stop_tokens(129, [2, 1]);
-    let execution = TextExecution::new(
-        SourceRef::output(identity_artifact().output_id()),
-        prompt_tokens().output_id(),
-        policy.output_id(),
-    );
-    let mut request = evaluate_request(1);
-    request.text_execution = execution.input_id().digest();
-    PreparedPaidInputV1::new(
-        &request,
-        &manifest(),
-        &execution,
-        &prompt_tokens(),
-        &policy,
-        &identity_artifact(),
-    )
+fn overlong_bundle() -> PreparedInvocation {
+    let mut input = bundle(1);
+    let mut plan = hellas_channel::test_support::channel::plan();
+    plan.outputs[0].kind = compute::OutputKind::Buffer {
+        max_bytes: work_policy().limits.max_output_bytes + 1,
+    };
+    input.input.parameters = hellas_rpc::JsonBytes(plan.canonical_bytes().unwrap());
+    input.request.input = input.input.content_id().unwrap();
+    input
 }
-
-/// A bundle whose runner is not the channel's client, likewise
-/// self-consistent and likewise not runnable here.
-fn foreign_runner_bundle() -> PreparedPaidInputV1 {
-    let mut request = evaluate_request(1);
-    request.runner_public_key = PublicKey::Secp256k1(stranger().party_key().to_bytes());
-    PreparedPaidInputV1::new(
-        &request,
-        &manifest(),
-        &text_execution(),
-        &prompt_tokens(),
-        &text_policy(),
-        &identity_artifact(),
-    )
+fn foreign_runner_bundle() -> PreparedInvocation {
+    let mut input = bundle(1);
+    input.request.runner_public_key = PublicKey::Secp256k1(stranger().party_key().to_bytes());
+    input
 }
 
 #[tokio::test]
@@ -1514,7 +1496,7 @@ async fn a_bundle_the_policy_does_not_allow_is_refused_though_its_digest_matches
             Err(error) => panic!("{what} still builds an authorization: {error}"),
         };
         let signature = client().sign(signing_hash(work_id(ready().channel(), &authorization)));
-        let Ok(bytes) = bundle.encode() else {
+        let Ok(bytes) = bundle.canonical_bytes() else {
             panic!("{what} encodes");
         };
         let response = accept_uploaded(
@@ -1781,22 +1763,16 @@ fn the_authorization_derives_every_field_it_does_not_choose() {
     let channel = ready().channel().clone();
     let policy = work_policy();
     let built = authorization(7, 3);
-    let request = evaluate_request(7);
+    let request = invocation_request(7);
 
     // Each field against an independently computed value, not against
     // a second call to the same constructor: a swap of two fields of
     // the same width survives a round trip and does not survive this.
     assert_eq!(built.channel_id, channel.id());
-    assert_eq!(built.bond_edge, bond_edge());
-    assert_eq!(built.bond_terms_hash, payment_terms().bond_terms_hash());
-    assert_eq!(built.payment_edge, payment_edge());
-    assert_eq!(
-        built.payment_terms_hash,
-        payment_terms_hash(payment_terms()),
-    );
+    assert_eq!(built.retention, hellas_rpc::Retention::Retain);
     assert_eq!(
         built.work_policy_digest,
-        work_policy_digest(&channel, &policy),
+        hellas_channel::job::policy_digest(channel.network(), channel.id(), &policy).unwrap(),
     );
     assert_eq!(
         built.prepared_input_digest,
@@ -1807,7 +1783,7 @@ fn the_authorization_derives_every_field_it_does_not_choose() {
     );
     assert_eq!(built.proposal_nonce, 3);
     assert_eq!(built.acceptance_deadline, deadlines().acceptance);
-    assert_eq!(built.request_commitment, Evaluate::commit_request(&request));
+    assert_eq!(built.request_commitment, request.commitment().unwrap());
     assert_eq!(built.environment_commitment, manifest().content_id());
     assert_eq!(built.price, payment_policy().fixed_price);
     assert_eq!(built.terminal_deadline, deadlines().terminal);
@@ -1922,10 +1898,15 @@ async fn shared_client_can_follow_blocks_while_waiting_for_provider_acceptance()
         .unwrap();
     let observer = client.observer();
     let (client_transport, server_transport) = transport_pair();
-    let request =
-        tokio::spawn(
-            async move { propose_work(client_transport, &mut client, &proposal(1)).await },
-        );
+    let request = tokio::spawn(async move {
+        propose_work(
+            client_transport,
+            &mut client,
+            &proposal(1),
+            &hellas_channel::test_support::channel::program_content(),
+        )
+        .await
+    });
     // No server is running yet, so the request must wait for its response.
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         while observer

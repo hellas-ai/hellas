@@ -5,6 +5,7 @@ use super::{
     ChannelId, GrantId, GrantJobAuthorizationV1, GrantOutcome, NodeStoreError, Serialize,
     SignedResult, ledger,
 };
+use crate::model::grant::records::GrantPolicy;
 use crate::model::grant::records::grant_producer;
 use crate::model::grant::standing::{CounterAllowance, NodeAllowance, Standing, StandingLocator};
 use crate::model::grant::{
@@ -14,13 +15,14 @@ use crate::model::grant::{
 };
 use hellas_auth::authority::{Revision, UnixMillis};
 use hellas_auth::{Digest, ProducerSigningKey, PublicKey, Signature};
-use hellas_channel::model::profile::{PreparedWorkInput, WorkContext, WorkPolicy};
+use hellas_channel::job::WorkContext;
 use hellas_channel::work_store::journal::{
     Journal, JournalId, JournalKind, MAX_CHECKPOINT_BYTES, MAX_RECORD_BYTES,
 };
 use hellas_channel::work_store::{Applied, JobPhase, Role};
 use hellas_kernel::NetworkId;
 use hellas_rpc::ProviderEnrollmentBundle;
+use hellas_rpc::protocol::invocation::PreparedInvocation;
 use hellas_rpc::protocol::value::{decode_canonical_bounded, encode_bounded};
 use std::path::Path;
 mod bootstrap;
@@ -261,7 +263,7 @@ impl NodeStore {
         application: (&hellas_auth::authority::AuthenticatedCaller, GrantId),
         a: GrantJobAuthorizationV1,
         client_signature: Signature,
-        input: &PreparedWorkInput,
+        input: &PreparedInvocation,
         signer: &ProducerSigningKey,
         now: UnixMillis,
     ) -> Result<Signature, NodeStoreError> {
@@ -281,10 +283,6 @@ impl NodeStore {
             return Ok(signature);
         }
         let id = grant_work_id(self.state.network(), &a);
-        let def = self
-            .state
-            .grant(a.grant_id)
-            .ok_or(GrantError::Unauthorized)?;
         let context = WorkContext {
             network: self.state.network(),
             channel: a.channel_id.0,
@@ -292,43 +290,8 @@ impl NodeStore {
             provider: grant_producer(self.state.provider()?)?,
         };
         let policy = self.state.policy_for(&a)?;
-        policy
-            .work
-            .check_bound_input(&context, &(&a).into(), input)?;
-        let mut charge = Charge::default();
-        charge.set(Meter::Requests, 1);
-        match (&policy.work, input) {
-            (WorkPolicy::Evaluate(_), PreparedWorkInput::Evaluate(bundle)) => {
-                let parts = bundle.parts().map_err(|_| GrantError::Malformed)?;
-                charge.set(
-                    Meter::InputTokens,
-                    parts.prompt_tokens.as_slice().len() as u64,
-                );
-                charge.set(
-                    Meter::OutputTokens,
-                    u64::from(parts.text_policy.max_new_tokens()),
-                );
-                charge.set(Meter::DeviceMillis, def.max_job_millis.get());
-            }
-            (WorkPolicy::Fetch { .. }, PreparedWorkInput::Fetch(bundle)) => {
-                let parts = bundle.parts().map_err(|_| GrantError::Malformed)?;
-                let input = hellas_rpc::fetch::verify_input_events(&parts.fetch_input_transcript)
-                    .map_err(|_| GrantError::Malformed)?;
-                if let Some(resource) = &policy.responses {
-                    charge.set(
-                        Meter::OutputTokens,
-                        resource.matches(input.body.as_bytes())?,
-                    );
-                }
-                if let Some(resource) = &policy.https {
-                    let request =
-                        hellas_rpc::http_fetch::HttpFetchRequest::decode(input.body.as_bytes())
-                            .map_err(|_| GrantError::Malformed)?;
-                    charge.set(Meter::OutputTokens, resource.matches(&request)?);
-                }
-            }
-            _ => return Err(GrantError::OutOfScope.into()),
-        }
+        hellas_channel::job::check_input(&context, &(&a).into(), &policy.invocation_policy, input)?;
+        let charge = resource_charge(policy, input)?;
         let charge = policy
             .pricing
             .reserve(charge)
@@ -583,4 +546,46 @@ fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, NodeStoreError> {
 }
 fn decode<T: serde::de::DeserializeOwned + Serialize>(bytes: &[u8]) -> Result<T, NodeStoreError> {
     decode_canonical_bounded(bytes, MAX_RECORD_BYTES).map_err(Into::into)
+}
+
+/// Application-specific resource and token constraints remain in authority.
+pub(super) fn resource_charge(
+    policy: &GrantPolicy,
+    input: &PreparedInvocation,
+) -> Result<Charge, NodeStoreError> {
+    let mut charge = Charge::default();
+    charge.set(Meter::Requests, 1);
+    let manifest = input.manifest().map_err(|_| GrantError::Malformed)?;
+    let fetch = policy
+        .invocation_policy
+        .admissions_for(&manifest)
+        .any(|a| matches!(a, hellas_rpc::protocol::invocation::Admission::Fetch { .. }));
+    if fetch {
+        let artifact = input.input.artifacts.first().ok_or(GrantError::Malformed)?;
+        let events: Vec<hellas_rpc::InputEventEnvelope> =
+            hellas_rpc::protocol::value::decode_canonical_dag_cbor(artifact.bytes.as_bytes())
+                .map_err(|_| GrantError::Malformed)?;
+        let signed =
+            hellas_rpc::fetch::verify_input_events(&events).map_err(|_| GrantError::Malformed)?;
+        let parameters = hellas_rpc::protocol::invocation::fetch::Parameters::from_canonical_bytes(
+            input.input.parameters.as_bytes(),
+        )
+        .map_err(|_| GrantError::Malformed)?;
+        if parameters.contract.schema() == hellas_rpc::FetchSchema::StatelessResponsesV1
+            && let Some(resource) = &policy.responses
+        {
+            charge.set(
+                Meter::OutputTokens,
+                resource.matches(signed.body.as_bytes())?,
+            );
+        }
+        if parameters.contract.schema() == hellas_rpc::FetchSchema::HttpV1
+            && let Some(resource) = &policy.https
+        {
+            let request = hellas_rpc::http_fetch::HttpFetchRequest::decode(signed.body.as_bytes())
+                .map_err(|_| GrantError::Malformed)?;
+            charge.set(Meter::OutputTokens, resource.matches(&request)?);
+        }
+    }
+    Ok(charge)
 }

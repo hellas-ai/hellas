@@ -5,11 +5,7 @@ use tokio::sync::OwnedSemaphorePermit;
 mod cancellation;
 pub use cancellation::{CancelOnFailure, Cancellation};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CapacityDomain {
-    Gpu,
-    Fetch,
-}
+pub use hellas_rpc::protocol::invocation::CapacityDomain;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AdmissionError {
@@ -60,7 +56,7 @@ enum Authorization {
 }
 
 impl WorkAdmission {
-    pub(crate) fn payment() -> Self {
+    pub fn payment() -> Self {
         Self(Authorization::Payment)
     }
 

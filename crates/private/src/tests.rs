@@ -106,3 +106,24 @@ fn a_group_readable_file_is_not_private() {
 fn this_process_runs_as_the_current_user() {
     assert!(windows::process_is_current_user(std::process::id()).unwrap());
 }
+
+#[test]
+fn read_write_open_keeps_a_private_existing_file_and_refuses_symlinks() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("upload.part");
+    write_atomically(&path, ".pending", b"before").unwrap();
+    let mut file = open_nofollow_rw(&path).unwrap();
+    assert!(is_private(&file).unwrap());
+    use std::io::Write as _;
+    file.write_all(b"after!").unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    assert_eq!(std::fs::read(&path).unwrap(), b"after!");
+    #[cfg(unix)]
+    {
+        let link = directory.path().join("linked.part");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(open_nofollow_rw(&link).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"after!");
+    }
+}

@@ -2,7 +2,8 @@ use super::*;
 
 #[tokio::test]
 async fn recovered_delivery_returns_durable_status_and_signed_metadata_without_reexecution() {
-    use hellas_channel::model::profile::{PreparedWorkInput, WorkContext};
+    use hellas_channel::job::WorkContext;
+
     for (step, expected_state, expected_code) in [
         (0, GrantTerminalState::Released, GrantRefusalCode::Released),
         (
@@ -50,50 +51,36 @@ async fn recovered_delivery_returns_durable_status_and_signed_metadata_without_r
         }
         let mut signed = None;
         if step == 3 {
-            let PreparedWorkInput::Fetch(fetch) = &input else {
-                unreachable!()
-            };
-            let parts = fetch.parts().unwrap();
-            let request =
-                hellas_rpc::fetch::verify_input_events(&parts.fetch_input_transcript).unwrap();
             let key = principal(2).1;
-            let output = hellas_rpc::fetch::FetchOutputTranscriptBuilder::new(
-                request.input_commitment,
-                request.assurance,
-                &key,
-            )
-            .finish(
-                hellas_rpc::fetch::encode_fetch_terminal_payload(
-                    &hellas_rpc::output::OutputEvent::Finished {
-                        stop_reason: hellas_rpc::output::StopReason::EndOfText,
-                        usage: None,
-                    },
-                )
-                .unwrap(),
+            let terminal = hellas_rpc::fetch::encode_fetch_terminal_payload(
+                &hellas_rpc::output::OutputEvent::Finished {
+                    stop_reason: hellas_rpc::output::StopReason::EndOfText,
+                    usage: None,
+                },
             )
             .unwrap();
-            let result = store
-                .state()
-                .policy_for(&a)
+            let output = hellas_rpc::protocol::invocation::fetch::output(&[], &terminal)
                 .unwrap()
-                .work
-                .bound_terminal_result(
-                    &WorkContext {
-                        network: network(),
-                        channel: a.channel_id.0,
-                        client: hellas_kernel::Key::from_bytes(
-                            *hellas_channel::test_support::node_key(1).as_bytes(),
-                        ),
-                        provider: hellas_kernel::Key::from_bytes(
-                            *hellas_channel::test_support::node_key(2).as_bytes(),
-                        ),
-                    },
-                    work,
-                    &(&a).into(),
-                    &input,
-                    &output,
-                )
+                .sign(&input.request, &key, 1024)
                 .unwrap();
+            let result = hellas_channel::job::terminal_result(
+                &WorkContext {
+                    network: network(),
+                    channel: a.channel_id.0,
+                    client: hellas_kernel::Key::from_bytes(
+                        *hellas_channel::test_support::node_key(1).as_bytes(),
+                    ),
+                    provider: hellas_kernel::Key::from_bytes(
+                        *hellas_channel::test_support::node_key(2).as_bytes(),
+                    ),
+                },
+                work,
+                &(&a).into(),
+                &store.state().policy_for(&a).unwrap().invocation_policy,
+                &input,
+                &output,
+            )
+            .unwrap();
             signed = Some(SignedResult {
                 signature: key
                     .sign_digest(bound_result_digest(network(), a.channel_id.0, &result))

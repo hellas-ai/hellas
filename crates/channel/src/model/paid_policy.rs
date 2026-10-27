@@ -1,17 +1,18 @@
 //! Owner-approved terms for automatic paid-channel offers.
-use super::{profile::WorkPolicy, setup::ProviderChannelPolicy, work::*};
+use super::{setup::ProviderChannelPolicy, work::*};
 use hellas_auth::authority::Revision;
 use hellas_kernel::{
     EdgeValues, Fees, MAX_OMIT_RESPONSE_BLOCKS, MIN_OMIT_RESPONSE_BLOCKS, NetworkId,
     work_payment_settlement,
 };
+use hellas_rpc::protocol::invocation::InvocationPolicy;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PaidPolicy {
     pub channel_policy: PaidChannelPolicyV1,
-    pub work_policy: WorkPolicy,
+    pub invocation_policy: InvocationPolicy,
     pub payment_policy: JobPaymentPolicyV2,
     #[serde(with = "edge_values")]
     pub expected_payment_values: EdgeValues,
@@ -49,7 +50,7 @@ pub struct StoredPaidPolicy {
 
 impl PaidPolicy {
     pub fn check(&self) -> Result<(), PaidWorkError> {
-        self.work_policy.check()?;
+        self.invocation_policy.validate()?;
         self.payment_policy.check()?;
         let capacity = self
             .jobs_per_channel
@@ -90,7 +91,7 @@ impl StoredPaidPolicy {
             network,
             policy_salt: self.policy_salt,
             channel_policy: self.policy.channel_policy,
-            work_policy: self.policy.work_policy.clone(),
+            invocation_policy: self.policy.invocation_policy.clone(),
             payment_policy: self.policy.payment_policy,
             expected_payment_values: self.policy.expected_payment_values,
             min_omit_response_blocks: self.policy.min_omit_response_blocks,

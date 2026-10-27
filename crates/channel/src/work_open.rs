@@ -661,30 +661,15 @@ fn mount<'a, V: SigVerifier>(
             None => descriptor.expected_settlement().map_err(to_store)?,
             Some(payment) => descriptor.funded_settlement(payment).map_err(to_store)?,
         };
-        let channel = if matches!(
-            descriptor.work_policy(),
-            crate::model::profile::WorkPolicy::Fetch { .. }
-        ) {
-            ChannelStore::open_metadata_only(
-                store.root(),
-                descriptor.channel().clone(),
-                settlement,
-                store.role(),
-                origin,
-                verifier,
-            )
-            .await?
-        } else {
-            ChannelStore::open(
-                store.root(),
-                descriptor.channel().clone(),
-                settlement,
-                store.role(),
-                origin,
-                verifier,
-            )
-            .await?
-        };
+        let channel = ChannelStore::open(
+            store.root(),
+            descriptor.channel().clone(),
+            settlement,
+            store.role(),
+            origin,
+            verifier,
+        )
+        .await?;
         Ok(channel)
     })
 }
