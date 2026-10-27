@@ -15,36 +15,36 @@
         export HOME="$TMPDIR/home"
         mkdir -p "$HOME"
 
-        ! ${package}/bin/hellas-cli fetch --help
-        ! ${package}/bin/hellas-cli llm --help
-        ${package}/bin/hellas-cli --version
-        ${package}/bin/hellas-cli --help | grep -F "Hellas node CLI"
-        ${package}/bin/hellas-cli gateway --help | grep -F -- "--wrap"
-        ${package}/bin/hellas-cli gateway --help | grep -F -- "--environment <FILE>"
-        ${package}/bin/hellas-cli gateway --help | grep -F -- "--manifest-id <CONTENT_ID>"
-        ${package}/bin/hellas-cli gateway --help | grep -F -- "--model <NAME>"
-        ${package}/bin/hellas-cli gateway --help | grep -F -- "--tokenizer"
-        ${package}/bin/hellas-cli gateway --help | grep -F -- "--stop-token"
-        ${package}/bin/hellas-cli gateway --help | grep -F -- "--content <PATH>"
-        ${package}/bin/hellas-cli gateway --help | grep -F -- "--content-root <DIR>"
-        ${package}/bin/hellas-cli gateway --help | grep -F -- "--responses-fetch-execution-environment"
-        ${package}/bin/hellas-cli gateway --help | grep -F -- "--trust-policy"
-        ${package}/bin/hellas-cli gateway --help | grep -F -- "--trust-store"
-        ${package}/bin/hellas-cli serve --help | grep -F -- "--content <PATH>"
-        ${package}/bin/hellas-cli serve --help | grep -F -- "--identity <IDENTITY>"
-        ${package}/bin/hellas-cli serve --help | grep -F -- "--content-root <DIR>"
-        ${package}/bin/hellas-cli serve --help | grep -F -- "--content-index <FILE>"
-        ${package}/bin/hellas-cli serve --help | grep -F -- "--gpu-session-programs"
-        ${package}/bin/hellas-cli serve --help | grep -F -- "--gpu-session-asset-bytes"
-        ${package}/bin/hellas-cli serve --help | grep -F -- "--paid-work-config"
-        ! ${package}/bin/hellas-cli serve --help | grep -F -- "--gfx"
-        ${package}/bin/hellas-cli identity --help | grep -F -- "show-enrollment-id"
+        ! ${package}/bin/hellas fetch --help
+        ! ${package}/bin/hellas llm --help
+        ${package}/bin/hellas --version
+        ${package}/bin/hellas --help | grep -F "Hellas node CLI"
+        ${package}/bin/hellas gateway --help | grep -F -- "--wrap"
+        ${package}/bin/hellas gateway --help | grep -F -- "--environment <FILE>"
+        ${package}/bin/hellas gateway --help | grep -F -- "--manifest-id <CONTENT_ID>"
+        ${package}/bin/hellas gateway --help | grep -F -- "--model <NAME>"
+        ${package}/bin/hellas gateway --help | grep -F -- "--tokenizer"
+        ${package}/bin/hellas gateway --help | grep -F -- "--stop-token"
+        ${package}/bin/hellas gateway --help | grep -F -- "--content <PATH>"
+        ${package}/bin/hellas gateway --help | grep -F -- "--content-root <DIR>"
+        ${package}/bin/hellas gateway --help | grep -F -- "--responses-fetch-execution-environment"
+        ${package}/bin/hellas gateway --help | grep -F -- "--trust-policy"
+        ${package}/bin/hellas gateway --help | grep -F -- "--trust-store"
+        ${package}/bin/hellas serve --help | grep -F -- "--content <PATH>"
+        ${package}/bin/hellas serve --help | grep -F -- "--identity <IDENTITY>"
+        ${package}/bin/hellas serve --help | grep -F -- "--content-root <DIR>"
+        ${package}/bin/hellas serve --help | grep -F -- "--content-index <FILE>"
+        ${package}/bin/hellas serve --help | grep -F -- "--gpu-session-programs"
+        ${package}/bin/hellas serve --help | grep -F -- "--gpu-session-asset-bytes"
+        ${package}/bin/hellas serve --help | grep -F -- "--paid-work-config"
+        ! ${package}/bin/hellas serve --help | grep -F -- "--gfx"
+        ${package}/bin/hellas identity --help | grep -F -- "show-enrollment-id"
 
-        ${package}/bin/hellas-cli --identity "$TMPDIR/identity" --software-root \
+        ${package}/bin/hellas --identity "$TMPDIR/identity" --software-root \
           monitor --timeout-secs 1 >/dev/null 2>&1 || true
-        ${package}/bin/hellas-cli --identity "$TMPDIR/identity" identity show-node-id \
+        ${package}/bin/hellas --identity "$TMPDIR/identity" identity show-node-id \
           | grep -E '^[0-9a-f]{64}$'
-        ${package}/bin/hellas-cli --identity "$TMPDIR/identity" identity show-enrollment-id \
+        ${package}/bin/hellas --identity "$TMPDIR/identity" identity show-enrollment-id \
           | grep -E '^[0-9a-f]{64}$'
 
         touch "$out"

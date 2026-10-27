@@ -117,9 +117,9 @@ let
     set -eu
     umask 077
     printf '%s' ${gatewayAuthority.passkey} > ./operator.passkey
-    ${package}/bin/hellas-cli --identity ./bootstrap.identity --software-root identity init
-    ${package}/bin/hellas-cli --identity ./bootstrap.identity identity show-holder > ./holder.json
-    ${package}/bin/hellas-cli --identity ./bootstrap.identity --passkey ./operator.passkey \
+    ${package}/bin/hellas --identity ./bootstrap.identity --software-root identity init
+    ${package}/bin/hellas --identity ./bootstrap.identity identity show-holder > ./holder.json
+    ${package}/bin/hellas --identity ./bootstrap.identity --passkey ./operator.passkey \
       admin bootstrap \
       --root-grant 00000000000000000000000000000000 --journal ./http-authority \
       --administrator ${pkgs.writeText "gateway-admin.json" (builtins.toJSON gatewayAuthority.administrator)} \
@@ -192,7 +192,7 @@ let
       import time
       import tomllib
 
-      cli = "${validatorPackage}/bin/hellas-cli"
+      cli = "${validatorPackage}/bin/hellas"
       trust_args = "--trust ${homePrefix}/trust.json --genesis ${homePrefix}/genesis.json"
       rpc = "ws://127.0.0.1:${toString chainRpcPort}"
       follower_api = "http://127.0.0.1:31247/api/v1/blocks"
@@ -300,7 +300,7 @@ in
           systemd.services.hellas-monitor = {
             environment.OTEL_SERVICE_NAME = "hellas-test-monitor";
             serviceConfig = {
-              ExecStart = "${package}/bin/hellas-cli --identity /tmp/hellas-monitor.key monitor";
+              ExecStart = "${package}/bin/hellas --identity /tmp/hellas-monitor.key monitor";
               KillSignal = "SIGINT";
               StandardOutput = "file:/tmp/hellas-monitor.log";
               StandardError = "inherit";
@@ -350,15 +350,15 @@ in
           "printf '%s\\n' "
           "'{\"version\":\"1.0\",\"truncation\":null,\"padding\":null,\"added_tokens\":[],\"normalizer\":null,\"pre_tokenizer\":{\"type\":\"Whitespace\"},\"post_processor\":null,\"decoder\":null,\"model\":{\"type\":\"WordLevel\",\"vocab\":{\"hello\":0,\"world\":1,\"<unk>\":2},\"unk_token\":\"<unk>\"}}' "
           "> /var/lib/hellas-e2e/tokenizer.json; "
-          "${package}/bin/hellas-cli environment build "
+          "${package}/bin/hellas environment build "
           "--program /srv/hellas-content/arbitrary.hex "
           "--settings /var/lib/hellas-e2e/environment.toml "
           "--out /srv/hellas-content/arbitrary.environment; "
-          "${package}/bin/hellas-cli environment build "
+          "${package}/bin/hellas environment build "
           "--program /var/lib/hellas-e2e/missing.hex "
           "--settings /var/lib/hellas-e2e/environment.toml "
           "--out /srv/hellas-content/missing-program.environment; "
-          "${package}/bin/hellas-cli environment build "
+          "${package}/bin/hellas environment build "
           "--program /srv/hellas-content/arbitrary.hex "
           "--settings /var/lib/hellas-e2e/missing-static.toml "
           "--out /srv/hellas-content/missing-static.environment; "
@@ -370,11 +370,11 @@ in
       machine.succeed("test -s /var/lib/hellas/content-index.bin")
 
       # Readiness remains a local content check, independent of execution funding.
-      verifier = "${package}/bin/hellas-cli environment verify --content-root /srv/hellas-content --content-index /var/lib/hellas-e2e/verify-index.bin"
+      verifier = "${package}/bin/hellas environment verify --content-root /srv/hellas-content --content-index /var/lib/hellas-e2e/verify-index.bin"
       machine.succeed(f"{verifier} --environment /srv/hellas-content/arbitrary.environment")
       for missing in ["missing-program", "missing-static"]:
           machine.fail(f"{verifier} --environment /srv/hellas-content/{missing}.environment")
-      machine.fail("${package}/bin/hellas-cli llm --help")
+      machine.fail("${package}/bin/hellas llm --help")
 
       unit = machine.succeed(
           "systemctl show hellas.service "

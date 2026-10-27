@@ -55,10 +55,10 @@ Opening one as the other fails.
 Use a [job folder](../../docs/jobs.md) to keep the caller input reusable:
 
 ```sh
-hellas-cli --passkey owner.key transact --job ./job --provider NODE_ID -o ./result
-hellas-cli --faucet fetch https://example.com/data --provider NODE_ID --payment 20 \
+hellas --passkey owner.key transact --job ./job --provider NODE_ID -o ./result
+hellas --faucet fetch https://example.com/data --provider NODE_ID --payment 20 \
   --spki-sha256 LEAF_SPKI_SHA256 --save-job ./request -o ./response
-hellas-cli --passkey owner.key transact --settle --provider NODE_ID
+hellas --passkey owner.key transact --settle --provider NODE_ID
 ```
 
 The helper selects the Fetch contract from the authenticated provider quote and

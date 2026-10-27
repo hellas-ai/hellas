@@ -165,7 +165,7 @@ let
     environment:
     lib.escapeShellArgs (
       [
-        "${cfg.package}/bin/hellas-cli"
+        "${cfg.package}/bin/hellas"
         "environment"
         "verify"
         "--environment"
@@ -439,7 +439,7 @@ in
       );
       serviceConfig = {
         ExecStart = lib.escapeShellArgs (
-          [ "${cfg.package}/bin/hellas-cli" ]
+          [ "${cfg.package}/bin/hellas" ]
           ++ hellas.mkServeArgs {
             inherit lib;
             serve = cfg;
@@ -531,7 +531,7 @@ in
       );
       serviceConfig = {
         ExecStart = lib.escapeShellArgs (
-          [ "${gateway.package}/bin/hellas-cli" ]
+          [ "${gateway.package}/bin/hellas" ]
           ++ hellas.mkGatewayArgs {
             inherit lib gateway;
           }

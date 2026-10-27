@@ -40,7 +40,7 @@ let
     }
     // cfg.environment;
   serveCommand = [
-    "${cfg.package}/bin/hellas-cli"
+    "${cfg.package}/bin/hellas"
   ]
   ++ hellas.mkServeArgs {
     inherit lib;

@@ -6,7 +6,7 @@ fn embedded_devnet_trust_is_the_offline_seed_100_export_for_the_shipped_genesis(
     let root = tempfile::tempdir().unwrap();
     let genesis = root.path().join("genesis.json");
     std::fs::write(&genesis, hellas_chain::genesis::HELLAS_DEVNET_1_JSON).unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_hellas-cli"))
+    let output = Command::new(env!("CARGO_BIN_EXE_hellas"))
         .args([
             "chain",
             "validator",
@@ -33,7 +33,7 @@ fn embedded_devnet_trust_is_the_offline_seed_100_export_for_the_shipped_genesis(
     );
     let config = root.path().join("validator.toml");
     std::fs::write(&config, output.stdout).unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_hellas-cli"))
+    let output = Command::new(env!("CARGO_BIN_EXE_hellas"))
         .args(["chain", "validator", "export-trust", "--config"])
         .arg(config)
         .arg("--genesis")

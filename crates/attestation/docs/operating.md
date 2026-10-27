@@ -32,14 +32,14 @@ Attestation only works on a genuine, locked-down Apple machine.
 
 Use the paid HTTPS Fetch gateway. Each pool entry selects a named `trust_policy`
 from the caller's native private `trust_store`. Approve the enrollment, Apple app ID,
-CDHashes and exact manifest IDs through the separate `hellas-cli trust ... approve`
+CDHashes and exact manifest IDs through the separate `hellas trust ... approve`
 operation using independently reviewed release metadata. Offers cannot replace these
 pins. See the
 [paid gateway guide](../../../docs/paid-gateway.md) for funding and pool fields,
 and [HTTP routing](../../../docs/http-gateway.md) for exact route configuration.
 
 ```sh
-hellas-cli gateway \
+hellas gateway \
   --assurance apple-app-attest \
   --paid-work-config /srv/hellas/pool.json \
   --http-fetch-config /srv/hellas/http-routes.json \

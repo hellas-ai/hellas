@@ -18,7 +18,7 @@ async fn offline_inspection_needs_no_identity_and_refuses_a_running_writer() {
         .await;
     let expected = world.store.state().authority().revision();
     let invoke = || {
-        Command::new(env!("CARGO_BIN_EXE_hellas-cli"))
+        Command::new(env!("CARGO_BIN_EXE_hellas"))
             .args(["admin", "inspect-offline", "--journal"])
             .arg(&root)
             .arg(&query)

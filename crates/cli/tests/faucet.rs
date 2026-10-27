@@ -7,7 +7,7 @@ fn faucet_flags_sign_as_the_announced_account_without_creating_a_node() {
     let accounts: Vec<FaucetAccount> = serde_json::from_str(HELLAS_DEVNET_1_FAUCET_JSON).unwrap();
     for selection in [vec!["--faucet"], vec!["--faucet-account", "7"]] {
         let home = tempfile::tempdir().unwrap();
-        let output = Command::new(env!("CARGO_BIN_EXE_hellas-cli"))
+        let output = Command::new(env!("CARGO_BIN_EXE_hellas"))
             .env("HOME", home.path())
             .env("XDG_DATA_HOME", home.path().join("data"))
             .args(["contact", "export", "--display-name", "Public devnet user"])

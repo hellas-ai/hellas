@@ -54,8 +54,8 @@ For a disposable devnet, export the public epoch-zero trust from the generated
 validator configuration:
 
 ```sh
-hellas-cli chain validator export-trust --config network/validator-0.toml --genesis network/genesis.json > network/trust.json
-hellas-cli chain indexer serve --rpc ws://127.0.0.1:8789 --genesis network/genesis.json --trust network/trust.json --storage-dir network/indexer
+hellas chain validator export-trust --config network/validator-0.toml --genesis network/genesis.json > network/trust.json
+hellas chain indexer serve --rpc ws://127.0.0.1:8789 --genesis network/genesis.json --trust network/trust.json --storage-dir network/indexer
 ```
 
 The exporter checks the genesis against the validator configuration and emits
@@ -74,7 +74,7 @@ one open epoch beginning at zero; scheduled proofs use `ProofVerifier`.
 `ProofVerifier::new(trust)` and `chain indexer serve` without `--genesis` use
 the embedded devnet genesis.
 
-`hellas-cli chain indexer serve --rpc wss://relay.example/ws --trust trust.json
+`hellas chain indexer serve --rpc wss://relay.example/ws --trust trust.json
 --storage-dir /var/lib/hellas/explorer --listen 127.0.0.1:8788` starts the local
 origin over a full executing chain node. Repeat `--rpc` for multiple validator
 or relay seeds; the node also discovers iroh ChainSync peers from its provisioned

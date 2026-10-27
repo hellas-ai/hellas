@@ -1,18 +1,18 @@
 # Paid jobs
 
-`hellas-cli transact --job DIR` executes a caller-owned job folder for any
-application. `hellas-cli run` (one call of a Catena program) and `hellas-cli fetch`
+`hellas transact --job DIR` executes a caller-owned job folder for any
+application. `hellas run` (one call of a Catena program) and `hellas fetch`
 (one HTTPS request) build such a folder and go through the same SDK
 transaction. Requesters run no node: they keep local signing keys and
 wallet/channel metadata, and chain reads use authenticated validator RPCs.
 
 ```sh
-hellas-cli --faucet run --provider NODE_ID --source counter.hex --entry advance \
+hellas --faucet run --provider NODE_ID --source counter.hex --entry advance \
   --arg u64:2 --arg u64:3 --returns u64 --payment 20 --save-job ./add
-hellas-cli --faucet transact --job ./add --provider NODE_ID@127.0.0.1:9000 -o ./result
-hellas-cli --faucet fetch https://example.com/data --provider NODE_ID --payment 20 \
+hellas --faucet transact --job ./add --provider NODE_ID@127.0.0.1:9000 -o ./result
+hellas --faucet fetch https://example.com/data --provider NODE_ID --payment 20 \
   --spki-sha256 LEAF_SPKI_SHA256 --save-job ./request -o ./response
-hellas-cli --faucet transact --settle --provider NODE_ID
+hellas --faucet transact --settle --provider NODE_ID
 ```
 
 `--faucet` only selects a key from the devnet genesis faucet allocation and

@@ -100,7 +100,7 @@ jobs:
           if [ "$BUILD_NAME" = hellas-rpc-wasm ]; then
             test -s "$BUILD_OUTPUT/lib/libhellas_rpc.rlib"
           else
-            test -x "$BUILD_OUTPUT/bin/hellas-cli"
+            test -x "$BUILD_OUTPUT/bin/hellas"
           fi
           mkdir artifacts
           tar --dereference -C "$BUILD_OUTPUT" -czf "artifacts/hellas-$BUILD_NAME-$GITHUB_SHA.tar.gz" .

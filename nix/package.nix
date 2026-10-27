@@ -111,7 +111,7 @@ let
     # stdenv's default stripDebugList only does --strip-debug on bin/;
     # stripAllList promotes it to --strip-all so .symtab goes too.
     stripAllList = [ "bin" ];
-    meta.mainProgram = "hellas-cli";
+    meta.mainProgram = "hellas";
   }
   // crossEnv;
 

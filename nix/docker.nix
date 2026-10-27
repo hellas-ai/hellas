@@ -15,14 +15,14 @@ let
       }
       ''
         mkdir -p "$out/bin"
-        cp "${cli}/bin/hellas-cli" "$out/bin/hellas-cli"
-        chmod u+w "$out/bin/hellas-cli"
-        remove-references-to -t ${rustToolchain} "$out/bin/hellas-cli"
-        chmod 0555 "$out/bin/hellas-cli"
+        cp "${cli}/bin/hellas" "$out/bin/hellas"
+        chmod u+w "$out/bin/hellas"
+        remove-references-to -t ${rustToolchain} "$out/bin/hellas"
+        chmod 0555 "$out/bin/hellas"
       '';
 
   originalEntrypoint = [
-    (if cuda then "${entrypoint}" else "${runtime}/bin/hellas-cli")
+    (if cuda then "${entrypoint}" else "${runtime}/bin/hellas")
     "serve"
     "--port"
     "31145"
@@ -46,7 +46,7 @@ let
       fi
     ''
     + ''
-      exec ${runtime}/bin/hellas-cli "$@"
+      exec ${runtime}/bin/hellas "$@"
     ''
   );
   image = pkgs.dockerTools.streamLayeredImage {

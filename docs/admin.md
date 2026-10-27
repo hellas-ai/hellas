@@ -25,15 +25,15 @@ Online commands take a private `--profile` file. With `--passkey` the session is
 passkey session; without it, the node key of `--identity` opens a daily session:
 
 ```sh
-hellas-cli --identity node.identity admin --profile operator.json status
-hellas-cli --identity node.identity admin --profile operator.json set-capacity --expected-revision 1 --max-in-flight 4 --limits machine-limits.json
-hellas-cli --identity node.identity --passkey operator.passkey admin --profile operator.json grant change.json
-hellas-cli --identity node.identity --passkey operator.passkey admin --profile operator.json issue-credential --scope friend-scope.json --holder friend-holder.json --credential-out friend.credential
-hellas-cli --identity node.identity --passkey operator.passkey admin --profile operator.json revoke-credential --credential-id ID --expected-revision 1
-hellas-cli --identity node.identity --passkey operator.passkey admin --profile operator.json bind-provider --enrollment provider.enrollment
-hellas-cli --identity node.identity admin --profile operator.json work allowance.json
-hellas-cli --identity node.identity admin --profile operator.json work export.json --offer-out friend.offer
-hellas-cli --identity laptop.identity admin --profile remote.json --node node.enrollment --address 192.0.2.10:9000 status
+hellas --identity node.identity admin --profile operator.json status
+hellas --identity node.identity admin --profile operator.json set-capacity --expected-revision 1 --max-in-flight 4 --limits machine-limits.json
+hellas --identity node.identity --passkey operator.passkey admin --profile operator.json grant change.json
+hellas --identity node.identity --passkey operator.passkey admin --profile operator.json issue-credential --scope friend-scope.json --holder friend-holder.json --credential-out friend.credential
+hellas --identity node.identity --passkey operator.passkey admin --profile operator.json revoke-credential --credential-id ID --expected-revision 1
+hellas --identity node.identity --passkey operator.passkey admin --profile operator.json bind-provider --enrollment provider.enrollment
+hellas --identity node.identity admin --profile operator.json work allowance.json
+hellas --identity node.identity admin --profile operator.json work export.json --offer-out friend.offer
+hellas --identity laptop.identity admin --profile remote.json --node node.enrollment --address 192.0.2.10:9000 status
 ```
 
 `status` requires `host.status` on this authority's host resource. `set-capacity`
@@ -67,7 +67,7 @@ table is full.
 
 `issue-credential` takes an Auth `GrantSpec` scope, bounded by the issuer's explicit
 credential-issuance ceiling, and a `--holder` file: the JSON `CredentialHolder` of
-the device that will hold it. `hellas-cli --identity node.identity identity
+the device that will hold it. `hellas --identity node.identity identity
 show-holder` prints that device's holder, `{"Node":[1,[...]]}`, its node key with
 the secp256k1 curve tag. Issuing creates no grant: the recipient also needs current
 grants for the requested operations. The client prepares the credential using the
@@ -316,11 +316,11 @@ An access bundle shares allowances with one contact device: one signed offer per
 allowance, the authority ID, the contact's Auth grant ID, the credential subject,
 the node key of the contact's device, the credential ID and secret, the expiry and
 an optional provider label of at most 64 bytes. It contains no provider trust; the
-contact still approves a trust policy with `hellas-cli trust` before running work.
+contact still approves a trust policy with `hellas trust` before running work.
 
 ```sh
-hellas-cli --identity node.identity --passkey operator.passkey admin --profile operator.json export-bundle --allowance ALLOWANCE_A --allowance ALLOWANCE_B --grant-id GRANT --credential-scope friend-scope.json --holder friend-holder.json --label "Alice's node" --out friend.access
-hellas-cli --identity friend.identity --passkey friend.passkey offer import-bundle friend.access --name alice
+hellas --identity node.identity --passkey operator.passkey admin --profile operator.json export-bundle --allowance ALLOWANCE_A --allowance ALLOWANCE_B --grant-id GRANT --credential-scope friend-scope.json --holder friend-holder.json --label "Alice's node" --out friend.access
+hellas --identity friend.identity --passkey friend.passkey offer import-bundle friend.access --name alice
 ```
 
 `export-bundle` takes `--allowance` once per shared allowance, at most 16. The
@@ -366,8 +366,8 @@ Work inspection and standing queries calculate current windows without writing c
 ticks. Existing spending and reservations are preserved.
 
 ```sh
-hellas-cli --identity node.identity --passkey operator.passkey admin bootstrap --journal state/provider --root-grant 01010101010101010101010101010101 --administrator administrator.json --credential-scope application-scope.json --holder holder.json --credential-out operator.credential
-hellas-cli --identity node.identity --passkey operator.passkey admin recover --journal state/provider --expected-revision REVISION --administrator administrator.json --credential-scope application-scope.json --holder holder.json --credential-out recovered.credential
+hellas --identity node.identity --passkey operator.passkey admin bootstrap --journal state/provider --root-grant 01010101010101010101010101010101 --administrator administrator.json --credential-scope application-scope.json --holder holder.json --credential-out operator.credential
+hellas --identity node.identity --passkey operator.passkey admin recover --journal state/provider --expected-revision REVISION --administrator administrator.json --credential-scope application-scope.json --holder holder.json --credential-out recovered.credential
 ```
 
 Bootstrap can also issue a bearer for an HTTP gateway: `--bearer-scope` names its
@@ -512,7 +512,7 @@ A standalone `NodeControl` without a host supervisor leaves lifecycle operations
 unmounted; constructing the composed host supplies their implementation.
 
 
-Caller trust for paid and grant execution is configured separately with `hellas-cli trust`.
+Caller trust for paid and grant execution is configured separately with `hellas trust`.
 `approve` requires a reviewed policy file, expected revision (zero for creation) and
 reason; `show` reports current pins and latest approval. Paid requests and grant gateways (`--offer`) select
 `--trust-store` and `--trust-policy`; imported offers cannot replace the approved pins.

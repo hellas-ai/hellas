@@ -25,7 +25,7 @@ rec {
         paths = [ package ];
         nativeBuildInputs = [ pkgs.makeWrapper ];
         postBuild = ''
-          wrapProgram "$out/bin/hellas-cli" ${
+          wrapProgram "$out/bin/hellas" ${
             lib.concatStringsSep " " (
               lib.mapAttrsToList (
                 name: value: "--set-default ${lib.escapeShellArg name} ${lib.escapeShellArg (toString value)}"
@@ -350,7 +350,7 @@ rec {
     };
 
   # Serve-daemon options. Reused by NixOS systemd, HM-on-darwin launchd, and
-  # any other future daemon surface. The keys here mirror `hellas-cli serve`'s
+  # any other future daemon surface. The keys here mirror `hellas serve`'s
   # CLI flags one-for-one — see `mkServeArgs` for the binding.
   serveOptions =
     { lib, pkgs }:
@@ -513,7 +513,7 @@ rec {
       extraArgs = mkOption {
         type = types.listOf types.str;
         default = [ ];
-        description = "Extra arguments to pass to `hellas-cli serve`. They may add unsupported harmless switches such as `--software-root`, but may not override module-managed runtime, content, identity, trust, or configuration flags (including `--flag=value`).";
+        description = "Extra arguments to pass to `hellas serve`. They may add unsupported harmless switches such as `--software-root`, but may not override module-managed runtime, content, identity, trust, or configuration flags (including `--flag=value`).";
       };
     };
 
@@ -773,7 +773,7 @@ rec {
       extraArgs = mkOption {
         type = types.listOf types.str;
         default = [ ];
-        description = "Extra arguments to pass to `hellas-cli gateway`. They may add unsupported harmless switches such as `--wrap`, but may not override module-managed runtime, content, identity, trust, or configuration flags (including `--flag=value`).";
+        description = "Extra arguments to pass to `hellas gateway`. They may add unsupported harmless switches such as `--wrap`, but may not override module-managed runtime, content, identity, trust, or configuration flags (including `--flag=value`).";
       };
     };
 
@@ -805,7 +805,7 @@ rec {
       }
     );
 
-  # `hellas-cli serve ...` argv from a resolved serve cfg. The cfg shape is
+  # `hellas serve ...` argv from a resolved serve cfg. The cfg shape is
   # whatever attrset carries `serveOptions` keys — for NixOS that's the top-
   # level `services.hellas`, for HM-darwin it's `programs.hellas.serve`.
   mkServeArgs =

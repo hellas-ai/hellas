@@ -93,7 +93,7 @@ let
         cp -R ${workspace}/. /build/workspace/
         chmod -R u+w /build/workspace
         cd /build/workspace
-        ${hellas}/bin/hellas-cli --identity /build/identity --software-root \
+        ${hellas}/bin/hellas --identity /build/identity --software-root \
           --output-cache "$1" --store-dir "$2" gateway \
           ${lib.escapeShellArgs gatewayArgs} --wrap ${agent}
       '';

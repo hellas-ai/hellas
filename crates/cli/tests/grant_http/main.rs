@@ -175,7 +175,7 @@ impl Cli {
         path
     }
     fn command(&self, args: &[&str]) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_hellas-cli"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_hellas"));
         // These commands use no node identity and refuse `--identity`.
         if !matches!(
             args,

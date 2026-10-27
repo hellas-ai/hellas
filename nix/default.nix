@@ -558,7 +558,7 @@ in
       pkgs.runCommand "hellas-cli-windows-smoke"
         {
           requiredSystemFeatures = [ "wsl" ];
-          exe = "${windowsPackages.cli}/bin/hellas-cli.exe";
+          exe = "${windowsPackages.cli}/bin/hellas.exe";
         }
         ''
           cd /

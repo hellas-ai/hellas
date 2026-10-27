@@ -1,12 +1,12 @@
 # Paid gateway
 
-`hellas-cli --passkey owner.key gateway --paid-work-config /srv/hellas/pool.json
+`hellas --passkey owner.key gateway --paid-work-config /srv/hellas/pool.json
 --text-model qwen3.gguf` renders each text request as a Compute job, sends it
 to the configured providers and pays through their real funded work channels.
 Each provider has its own endpoint identity, bond, payment funding, and client
 journals. The gateway skips busy provider channels and serializes requests
 within each channel. Providers must already hold the GGUF named by the job (for
-example via `hellas-cli store adopt`); the gateway never uploads the weights.
+example via `hellas store adopt`); the gateway never uploads the weights.
 
 With `--http-fetch-config`, the same pool carries HTTP Fetch requests. Its paid
 policy must select the HTTP Fetch manifest and a matching Fetch route policy;
@@ -28,7 +28,7 @@ already-delegated coin fits it; use the explicit owner `chain delegate --split`
 path to reshape unused stake first. The saved `admin.json` profile beside the
 provider identity works with the passkey administration commands.
 
-An owner can also set the policy with `hellas-cli admin work
+An owner can also set the policy with `hellas admin work
 policy-command.json`, using a `SetPaidPolicy` command with `expected_revision`
 and `policy`. A stale revision or a daily node-key session cannot change it.
 
@@ -94,7 +94,7 @@ For those entries, add a top-level `trust_store` directory and a per-provider
 `trust_policy` ID. Approve app IDs and release CDHashes independently:
 
 ```sh
-hellas-cli trust --store /var/lib/hellas-gateway/trust approve provider-a \
+hellas trust --store /var/lib/hellas-gateway/trust approve provider-a \
   --expected-revision 0 --policy /srv/hellas/provider-a-trust.json \
   --reason 'Reviewed Apple application and release hashes'
 ```
@@ -109,10 +109,10 @@ need them. Grant gateways keep their existing independent approval requirements.
 Owners delegate or reclaim coins through the global passkey:
 
 ```sh
-hellas-cli --passkey owner.key chain delegate --rpc ws://127.0.0.1:8788 \
+hellas --passkey owner.key chain delegate --rpc ws://127.0.0.1:8788 \
   --trust ./chain-trust.json --network devnet --node NODE_SETTLEMENT_KEY \
   --coin COIN_ID --split 12
-hellas-cli --passkey owner.key chain sweep --rpc ws://127.0.0.1:8788 \
+hellas --passkey owner.key chain sweep --rpc ws://127.0.0.1:8788 \
   --trust ./chain-trust.json --network devnet --coin COIN_ID
 ```
 

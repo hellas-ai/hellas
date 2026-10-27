@@ -14,7 +14,7 @@ fn local_approval_cli_is_separate_from_identity_and_execution_and_preserves_revi
     };
     std::fs::write(&source, serde_json::to_vec(&policy).unwrap()).unwrap();
     let invoke = |revision: &str| {
-        Command::new(env!("CARGO_BIN_EXE_hellas-cli"))
+        Command::new(env!("CARGO_BIN_EXE_hellas"))
             .args(["trust", "--store"])
             .arg(&root)
             .args([
@@ -41,7 +41,7 @@ fn local_approval_cli_is_separate_from_identity_and_execution_and_preserves_revi
     assert_eq!(stored.load("provider").unwrap().revision, 1);
     assert!(!invoke("0").status.success());
     assert!(invoke("1").status.success());
-    let shown = Command::new(env!("CARGO_BIN_EXE_hellas-cli"))
+    let shown = Command::new(env!("CARGO_BIN_EXE_hellas"))
         .args(["trust", "--store"])
         .arg(&root)
         .args(["show", "provider"])
@@ -65,7 +65,7 @@ fn local_approval_cli_is_separate_from_identity_and_execution_and_preserves_revi
             .expected_genesis,
         policy.provider_genesis
     );
-    let help = Command::new(env!("CARGO_BIN_EXE_hellas-cli"))
+    let help = Command::new(env!("CARGO_BIN_EXE_hellas"))
         .args(["transact", "--help"])
         .output()
         .unwrap();

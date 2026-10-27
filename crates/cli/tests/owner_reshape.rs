@@ -16,7 +16,7 @@ use std::{
     time::Duration,
 };
 
-const CLI: &str = env!("CARGO_BIN_EXE_hellas-cli");
+const CLI: &str = env!("CARGO_BIN_EXE_hellas");
 fn command(home: &Path) -> Command {
     let mut command = Command::new(CLI);
     command

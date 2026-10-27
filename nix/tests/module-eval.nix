@@ -136,7 +136,7 @@ let
       ];
     };
   validatorPackageFixture =
-    (pkgs.writeShellScriptBin "hellas-cli" ''
+    (pkgs.writeShellScriptBin "hellas" ''
       set -eu
 
       test "$1" = chain
@@ -163,7 +163,7 @@ let
       esac
     '').overrideAttrs
       (_: {
-        meta.mainProgram = "hellas-cli";
+        meta.mainProgram = "hellas";
       });
   evalValidators =
     validator:
@@ -866,7 +866,7 @@ in
     assert
       builtins.tail homeManagerDarwinProgramArguments == [
         "/Users/hellas/.config/hellas/provider.env"
-        "${package}/bin/hellas-cli"
+        "${package}/bin/hellas"
         "serve"
         "--identity"
         "/Users/hellas/Library/Application Support/Hellas/identity"
@@ -881,7 +881,7 @@ in
     assert homeManagerDarwinService.config.EnvironmentVariables == { HOME = "/Users/hellas"; };
     assert
       homeManagerDarwinDirect.config.launchd.agents.hellas.config.ProgramArguments == [
-        "${package}/bin/hellas-cli"
+        "${package}/bin/hellas"
         "serve"
         "--identity"
         "/Users/hellas/.hellas/identity"

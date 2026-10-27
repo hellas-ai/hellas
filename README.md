@@ -42,7 +42,7 @@ Person A sells GPU compute on the devnet with a GPU build (`.#cli-catena` or
 the `hip`/`cuda` image below):
 
 ```sh
-hellas-cli --faucet serve --paid-work-config docs/examples/faucet-provider.toml
+hellas --faucet serve --paid-work-config docs/examples/faucet-provider.toml
 ```
 
 `--faucet` only selects a key from the devnet genesis faucet allocation. These
@@ -65,9 +65,9 @@ one command builds a job, pays A and prints the result; a second closes the
 channel:
 
 ```sh
-hellas-cli --faucet run --provider NODE_ID --source counter.hex --entry advance \
+hellas --faucet run --provider NODE_ID --source counter.hex --entry advance \
   --arg u64:2 --arg u64:3 --returns u64 --payment 20
-hellas-cli --faucet transact --settle --provider NODE_ID
+hellas --faucet transact --settle --provider NODE_ID
 ```
 
 B's key approves funding once per channel: A's jobs per channel times its
@@ -76,8 +76,8 @@ closes it and returns the unspent part. Before paying, B checks that the result
 is signed by A and matches this job. Hellas does not re-run the job, so this
 shows who answered, not that the answer is correct.
 
-`run` writes a job folder and transacts it exactly as `hellas-cli transact
---job DIR`, the raw command for any application. `hellas-cli fetch URL` does
+`run` writes a job folder and transacts it exactly as `hellas transact
+--job DIR`, the raw command for any application. `hellas fetch URL` does
 the same for a paid HTTPS request. See [jobs](docs/jobs.md) for the folder
 format, multi-step jobs and Fetch.
 
@@ -88,7 +88,7 @@ memory metering. A job over A's upload limit is refused before it runs; a job
 that exceeds the execution limit is killed with its worker and is not paid.
 Compilation has no time limit. Sources and weights a job names by content ID
 must be available to A: index local files with `serve --content FILE` or
-`--content-root DIR`, or adopt a HuggingFace cache with `hellas-cli store
+`--content-root DIR`, or adopt a HuggingFace cache with `hellas store
 --store-dir DIR adopt` and serve with the same `--store-dir DIR`.
 
 Indexed provider content is an immutable local-cache assumption. Hellas pins
@@ -146,7 +146,7 @@ POST /v1/chat/completions
 POST /v1/messages
 ```
 
-Monitor discovery and peer health with `hellas-cli monitor --timeout-secs 30`.
+Monitor discovery and peer health with `hellas monitor --timeout-secs 30`.
 
 ## Chain
 
@@ -355,8 +355,8 @@ copying a complete store snapshot for offline replay. Recording persists payload
 and is incompatible with gateway ZDR mode. Agent tool execution is not cached.
 
 ```sh
-hellas-cli gateway --output-cache record --responses-backend proxy --wrap opencode
-hellas-cli gateway --output-cache replay-only --responses-backend proxy --wrap opencode
+hellas gateway --output-cache record --responses-backend proxy --wrap opencode
+hellas gateway --output-cache replay-only --responses-backend proxy --wrap opencode
 ```
 
 For a Linux Nix agent build, use the overlay's `pkgs.hellasLib.agent` helpers:
@@ -437,7 +437,7 @@ A configured endpoint enables the feature on the module's default package;
 packages remain the caller's choice. `collectorEndpoint` is the standard OTLP
 HTTP/protobuf base URL for traces and metrics; the existing `endpoint` option
 continues to accept an exact trace URL. Home Manager and nix-darwin scope
-variables to `hellas-cli`, rather than enabling unrelated applications.
+variables to `hellas`, rather than enabling unrelated applications.
 Home Manager's `programs.hellas.serve` supplies the Darwin user service.
 Direct package users can use `cli.override { otel = true; }` (also
 `cli-catena` and `cli-validator`) and the standard `OTEL_*` environment variables.
