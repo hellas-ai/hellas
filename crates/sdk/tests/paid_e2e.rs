@@ -63,13 +63,13 @@ const BODY: &[u8] = br#"{"model":"fixture","input":"sdk-paid-e2e","max_output_to
 /// its node authority.
 const PROVIDER_OWNER: GenesisOwner = GenesisOwner {
     kind: OwnerKind::Passkey,
-    seed: 0x11,
+    secret_scalar: [0x11; 32],
     balance: PROVIDER_STAKE,
 };
 /// The client's genesis owner: the `FRIEND` actor's passkey.
 const CLIENT_OWNER: GenesisOwner = GenesisOwner {
     kind: OwnerKind::Passkey,
-    seed: 0x13,
+    secret_scalar: [0x13; 32],
     balance: CLIENT_FUNDING,
 };
 

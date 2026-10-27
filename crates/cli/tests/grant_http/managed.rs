@@ -315,8 +315,14 @@ impl ManagedWorker {
             json!({"messages":[]}),
         )
         .await;
-        assert_eq!(response.status(), reqwest::StatusCode::OK);
-        assert!(response.text().await.unwrap().contains("hello"));
+        let body = assert_http_response(
+            response,
+            reqwest::StatusCode::OK,
+            &[&gateway.log, &self.node.log],
+            &self._upstream,
+        )
+        .await;
+        assert!(body.contains("hello"));
         gateway.stop().await;
     }
 }

@@ -358,16 +358,16 @@ pub enum ValidatorCommand {
     },
 }
 
-pub async fn run(command: ChainCommand, passkey_path: Option<&Path>) -> CliResult {
+pub async fn run(command: ChainCommand, owner: Option<&hellas_kernel::SoftPasskey>) -> CliResult {
     match command {
         ChainCommand::Delegate { coins, node } => {
             anyhow::ensure!(
                 hellas_kernel::Secp256k1Verifier::is_valid_key(node.into_kernel()),
                 "delegate must be a valid secp256k1 node key"
             );
-            run_owner_coins(coins, Some(node.into_kernel()), passkey_path).await
+            run_owner_coins(coins, Some(node.into_kernel()), owner).await
         }
-        ChainCommand::Sweep(coins) => run_owner_coins(coins, None, passkey_path).await,
+        ChainCommand::Sweep(coins) => run_owner_coins(coins, None, owner).await,
         ChainCommand::Query {
             rpc,
             trust,
@@ -386,9 +386,10 @@ pub async fn run(command: ChainCommand, passkey_path: Option<&Path>) -> CliResul
 async fn run_owner_coins(
     args: OwnerCoinArgs,
     delegate: Option<hellas_kernel::Key>,
-    passkey_path: Option<&Path>,
+    owner: Option<&hellas_kernel::SoftPasskey>,
 ) -> CliResult {
-    let owner = passkey(passkey_path.context("chain delegate/sweep requires --passkey")?)?;
+    let owner =
+        owner.context("chain delegate/sweep requires --passkey, --faucet or --faucet-account")?;
     let selected = parse_coin_ids::<MAX_EDGE_INPUTS>(&args.coins, "coin")?;
     let network = selected_network(&args.network, args.genesis.clone())?;
     let client =
@@ -1071,7 +1072,7 @@ mod tests {
         let trust = hellas_chain::genesis::TrustDocument {
             schema_version: 1,
             network_id: hellas_chain::genesis::HELLAS_DEVNET_1_ID.into(),
-            genesis_sha256: "6e5e8d2b35f62724380afd2735ff8677f503bfc0c008e7bc8935e9a1214099bb"
+            genesis_sha256: "4dd31668a5822fa8326245bd2ad58af1086f2f377a074e44be0345f1e5dfec17"
                 .into(),
             epochs: vec![hellas_chain::genesis::TrustEpoch {
                 epoch: 0,

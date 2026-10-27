@@ -97,7 +97,7 @@ fn shipped_documents_hash_to_the_bytes_that_were_reviewed() {
     let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
     assert_eq!(
         hex,
-        "6e5e8d2b35f62724380afd2735ff8677f503bfc0c008e7bc8935e9a1214099bb"
+        "4dd31668a5822fa8326245bd2ad58af1086f2f377a074e44be0345f1e5dfec17"
     );
 }
 
@@ -107,7 +107,33 @@ fn canonical_devnet_genesis_is_valid_and_matches_its_id_constant() {
     genesis.validate().unwrap();
     assert_eq!(genesis.network_id, HELLAS_DEVNET_1_ID);
     assert_eq!(genesis.validators.len(), 6);
-    assert_eq!(genesis.allocations.len(), 3);
+    assert_eq!(genesis.allocations.len(), 103);
+}
+
+#[test]
+fn every_public_faucet_account_has_exactly_931145_credits() {
+    let genesis: Genesis = serde_json::from_str(HELLAS_DEVNET_1_JSON).unwrap();
+    let accounts: Vec<FaucetAccount> = serde_json::from_str(HELLAS_DEVNET_1_FAUCET_JSON).unwrap();
+    assert_eq!(accounts.len(), 100);
+    let mut addresses = BTreeSet::new();
+    for (index, account) in accounts.iter().enumerate() {
+        assert_eq!(usize::from(account.index), index);
+        assert!(addresses.insert(&account.address));
+        assert_eq!(account.secret_scalar.len(), 64);
+        assert!(
+            account
+                .secret_scalar
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        );
+        let allocation = genesis
+            .allocations
+            .iter()
+            .find(|a| a.address == account.address)
+            .expect("each published account is funded in the shipped genesis");
+        assert_eq!(allocation.balance, 931_145, "faucet account {index}");
+    }
+    genesis.validate().unwrap();
 }
 
 #[test]

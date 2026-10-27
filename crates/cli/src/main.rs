@@ -14,6 +14,7 @@ mod identity;
 #[cfg(unix)]
 mod machines;
 mod metrics;
+mod owner;
 mod platform_hardening;
 mod tracing_config;
 
@@ -206,11 +207,8 @@ struct Cli {
     #[arg(long = "software-root", global = true)]
     software_root: bool,
 
-    /// The software passkey of the principal this command acts for: a file of
-    /// 32 raw bytes or 64 hex digits. Contacts, offers, grant data, gateway
-    /// allowances and passkey administration sessions use it.
-    #[arg(long, global = true)]
-    passkey: Option<PathBuf>,
+    #[command(flatten)]
+    owner: owner::OwnerArgs,
 
     /// Also append tracing output to this file.
     #[arg(long = "log-file", global = true)]
@@ -726,6 +724,17 @@ async fn async_main() {
         return;
     }
 
+    let owner = match cli.owner.load() {
+        Ok(owner) => owner,
+        Err(error) => {
+            eprintln!("error: {error:#}");
+            std::process::exit(1);
+        }
+    };
+    let passkey = owner
+        .as_ref()
+        .map(|key| key as &dyn hellas_work::authenticator::Authenticator);
+
     if let Commands::CodexAuth { command } = &cli.command {
         let result = match command {
             CodexAuthCommand::Login { auth_path } => {
@@ -783,14 +792,6 @@ async fn async_main() {
             command: commands::contributions::OfferCommand::Import { .. },
         }) => {
             let result: anyhow::Result<()> = async {
-                let passkey = cli
-                    .passkey
-                    .as_deref()
-                    .map(commands::chain::passkey)
-                    .transpose()?;
-                let passkey = passkey
-                    .as_ref()
-                    .map(|key| key as &dyn hellas_work::authenticator::Authenticator);
                 match command {
                     Commands::Contact { command } => {
                         commands::contributions::contact(command, passkey).await
@@ -832,7 +833,7 @@ async fn async_main() {
 
     let command = match command {
         Commands::Chain { command } => {
-            let result = commands::chain::run(command, cli.passkey.as_deref()).await;
+            let result = commands::chain::run(command, owner.as_ref()).await;
             tracer_provider.shutdown();
             if let Err(err) = result {
                 eprintln!("error: {err:#}");
@@ -853,21 +854,6 @@ async fn async_main() {
         }
     };
     let secret_key = local_identity.transport_key.clone();
-    let passkey = match cli
-        .passkey
-        .as_deref()
-        .map(commands::chain::passkey)
-        .transpose()
-    {
-        Ok(passkey) => passkey,
-        Err(err) => {
-            eprintln!("error: {err:#}");
-            std::process::exit(1);
-        }
-    };
-    let passkey = passkey
-        .as_ref()
-        .map(|key| key as &dyn hellas_work::authenticator::Authenticator);
     if let Commands::Serve { assurance, .. } = &command
         && let Err(error) = validate_serve_assurance(
             cli.software_root,

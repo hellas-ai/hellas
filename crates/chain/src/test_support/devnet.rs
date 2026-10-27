@@ -70,25 +70,45 @@ pub enum OwnerKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GenesisOwner {
     pub kind: OwnerKind,
-    /// Every byte of the owner's 32-byte secret scalar.
-    pub seed: u8,
+    /// The owner's complete 32-byte secret scalar.
+    pub secret_scalar: [u8; 32],
     pub balance: u64,
 }
 
 impl GenesisOwner {
+    /// A published devnet faucet owner, with its full genesis allocation.
+    /// Panics if `index` is not in 0..100.
+    pub fn faucet(index: u8) -> Self {
+        let accounts: Vec<crate::genesis::FaucetAccount> =
+            serde_json::from_str(crate::genesis::HELLAS_DEVNET_1_FAUCET_JSON)
+                .expect("the shipped faucet list parses");
+        let account = accounts
+            .into_iter()
+            .find(|account| account.index == index)
+            .expect("faucet index is in 0..100");
+        Self {
+            kind: OwnerKind::Passkey,
+            secret_scalar: hex::decode(account.secret_scalar)
+                .unwrap()
+                .try_into()
+                .unwrap(),
+            balance: 931_145,
+        }
+    }
+
     /// The settlement key genesis funds.
     pub fn key(&self) -> SettlementKey {
         match self.kind {
-            OwnerKind::Native => native_signer(self.seed).party_key().into(),
-            OwnerKind::Passkey => passkey(self.seed).party_key().into(),
+            OwnerKind::Native => native_signer(self.secret_scalar).party_key().into(),
+            OwnerKind::Passkey => passkey(self.secret_scalar).party_key().into(),
         }
     }
 
     /// This owner's authorization of one kernel payload.
     pub fn authorize(&self, hash: PayloadHash) -> Auth {
         match self.kind {
-            OwnerKind::Native => Auth::native(native_signer(self.seed).sign(hash)),
-            OwnerKind::Passkey => Auth::webauthn(match passkey(self.seed).sign(hash) {
+            OwnerKind::Native => Auth::native(native_signer(self.secret_scalar).sign(hash)),
+            OwnerKind::Passkey => Auth::webauthn(match passkey(self.secret_scalar).sign(hash) {
                 Ok(assertion) => assertion,
                 Err(error) => panic!("a software passkey signs: {error:?}"),
             }),
@@ -97,19 +117,19 @@ impl GenesisOwner {
 
     /// The 32-byte secret scalar, as the CLI's file-backed signers read it.
     pub fn scalar(&self) -> [u8; 32] {
-        [self.seed; 32]
+        self.secret_scalar
     }
 }
 
-fn native_signer(seed: u8) -> hellas_kernel::Secp256k1Signer {
-    match hellas_kernel::Secp256k1Signer::from_secret_scalar([seed; 32]) {
+fn native_signer(scalar: [u8; 32]) -> hellas_kernel::Secp256k1Signer {
+    match hellas_kernel::Secp256k1Signer::from_secret_scalar(scalar) {
         Ok(signer) => signer,
         Err(error) => panic!("a fixed scalar is a secp256k1 key: {error:?}"),
     }
 }
 
-fn passkey(seed: u8) -> hellas_kernel::SoftPasskey {
-    match hellas_kernel::SoftPasskey::from_secret_scalar([seed; 32]) {
+fn passkey(scalar: [u8; 32]) -> hellas_kernel::SoftPasskey {
+    match hellas_kernel::SoftPasskey::from_secret_scalar(scalar) {
         Ok(passkey) => passkey,
         Err(error) => panic!("a fixed scalar is a P-256 key: {error:?}"),
     }
@@ -774,7 +794,7 @@ fn genesis_document(fixture: &ConsensusFixture, owners: &[GenesisOwner]) -> Gene
 }
 
 fn owner_file(storage: &Path, owner: &GenesisOwner) -> PathBuf {
-    storage.join(format!("owner-{:02x}.key", owner.seed))
+    storage.join(format!("owner-{}.key", owner.key()))
 }
 
 /// Serves one validator's light-client protocol on `listener`, without the
@@ -813,11 +833,97 @@ mod tests {
     use crate::light_client::FinalizedBlockQuery;
 
     #[test]
+    fn a_public_faucet_passkey_spends_on_all_six_validators() {
+        run(|runtime| async move {
+            let owners: Vec<_> = (0..100).map(GenesisOwner::faucet).collect();
+            let published: Vec<crate::genesis::FaucetAccount> =
+                serde_json::from_str(crate::genesis::HELLAS_DEVNET_1_FAUCET_JSON).unwrap();
+            for (owner, account) in owners.iter().zip(&published) {
+                assert_eq!(owner.key().to_string(), account.address);
+            }
+            let sender = owners[7];
+            let recipient = owners[8];
+            let mut devnet = Devnet::start(
+                runtime,
+                DevnetConfig {
+                    name: "faucet_spend",
+                    owners,
+                    full_nodes: 1,
+                },
+            )
+            .await;
+            devnet.seal().await;
+            let input = genesis_coin(devnet.allocations(), sender.key());
+            let recipient_genesis = genesis_coin(devnet.allocations(), recipient.key());
+            let (tx, outputs) = reshape_authorized(
+                &[coin_object_id(input)],
+                &[(recipient.key(), None, 42), (sender.key(), None, 931_103)],
+                |hash| sender.authorize(hash),
+            );
+            assert_eq!(
+                devnet.light_client(0).submit_tx(tx).await.unwrap(),
+                crate::SubmitTxOutcome::Enqueued
+            );
+            let block = devnet.seal().await;
+            assert_eq!(block.txs().len(), 1);
+            for validator in 0..VALIDATORS {
+                let client = devnet.validator_light_client(validator);
+                assert!(
+                    client
+                        .get_coin(block.digest(), input.to_bytes().into())
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                for (output, owner, value) in [
+                    (outputs[0], recipient.key(), 42),
+                    (outputs[1], sender.key(), 931_103),
+                ] {
+                    let coin = client
+                        .get_coin(block.digest(), output)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(
+                        (coin.owner, coin.value, coin.delegate),
+                        (owner, value, None)
+                    );
+                }
+            }
+            let candidates = [
+                input,
+                recipient_genesis,
+                CoinId::from_bytes(outputs[0].0),
+                CoinId::from_bytes(outputs[1].0),
+            ];
+            assert_eq!(
+                devnet
+                    .coins(0, sender.key(), candidates)
+                    .await
+                    .iter()
+                    .map(|(_, c)| c.value)
+                    .sum::<u64>(),
+                931_103
+            );
+            assert_eq!(
+                devnet
+                    .coins(0, recipient.key(), candidates)
+                    .await
+                    .iter()
+                    .map(|(_, c)| c.value)
+                    .sum::<u64>(),
+                931_187
+            );
+            devnet.shutdown().await;
+        });
+    }
+
+    #[test]
     fn a_full_node_recovers_when_its_chain_sync_source_returns_after_twenty_seconds() {
         run(|runtime| async move {
             let owner = GenesisOwner {
                 kind: OwnerKind::Native,
-                seed: 0x43,
+                secret_scalar: [0x43; 32],
                 balance: 7,
             };
             let mut devnet = Devnet::start(
@@ -833,7 +939,7 @@ mod tests {
             let (tx, _) = delegate_allocation(
                 devnet.allocations(),
                 &owner,
-                native_signer(0x44).party_key().into(),
+                native_signer([0x44; 32]).party_key().into(),
             );
             assert_eq!(
                 devnet
@@ -900,7 +1006,7 @@ mod tests {
         run(|runtime| async move {
             let owner = GenesisOwner {
                 kind: OwnerKind::Passkey,
-                seed: 0x41,
+                secret_scalar: [0x41; 32],
                 balance: 7,
             };
             let mut devnet = Devnet::start(
@@ -930,7 +1036,7 @@ mod tests {
 
             // A non-empty block, submitted by a client with no node.
             devnet.seal().await;
-            let node_key = SettlementKey::from(native_signer(0x42).party_key());
+            let node_key = SettlementKey::from(native_signer([0x42; 32]).party_key());
             let (tx, delegated) = delegate_allocation(devnet.allocations(), &owner, node_key);
             let submitter = RemoteLightClient::connect(devnet.light_client_url(3))
                 .await

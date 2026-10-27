@@ -967,12 +967,12 @@ mod tests {
     /// The funded accounts in the shipped genesis documents are
     /// derivations, not opaque strings.
     ///
-    /// The devnet README documents the low secret scalars used below.
+    /// The devnet README documents both the low scalars and faucet derivation.
     #[test]
     fn shipped_genesis_allocations_match_their_documented_scalars() {
-        fn address_for(scalar: u8) -> String {
-            let mut raw = [0_u8; 32];
-            raw[31] = scalar;
+        use sha2::{Digest as _, Sha256};
+
+        fn address_for(raw: [u8; 32]) -> String {
             let key = p256::ecdsa::SigningKey::from_slice(&raw).expect("valid scalar");
             let point = key.verifying_key().to_sec1_point(true);
             let bytes: [u8; SettlementKey::LENGTH] = point
@@ -990,10 +990,31 @@ mod tests {
             .iter()
             .map(|allocation| allocation.address.as_str())
             .collect();
-        let mut expected: Vec<String> = [1_u8, 2].into_iter().map(address_for).collect();
+        let mut expected: Vec<String> = [1_u8, 2]
+            .into_iter()
+            .map(|n| {
+                let mut scalar = [0; 32];
+                scalar[31] = n;
+                address_for(scalar)
+            })
+            .collect();
         // The foundation allocation is documented in the network README; its
         // key is generated independently, not derived from a public scalar.
         expected.push("25uDmUCQcwYUHHyXthtEspGB2KVTmbys8vTSqAMXKNqRV".to_string());
+        let accounts: Vec<crate::genesis::FaucetAccount> =
+            serde_json::from_str(crate::genesis::HELLAS_DEVNET_1_FAUCET_JSON).unwrap();
+        assert_eq!(accounts.len(), 100);
+        for (index, account) in accounts.iter().enumerate() {
+            let mut hash = Sha256::new();
+            hash.update(b"hellas-devnet-1/faucet/v1\0");
+            hash.update((index as u32).to_be_bytes());
+            let scalar: [u8; 32] = hash.finalize().into();
+            let secret: String = scalar.iter().map(|b| format!("{b:02x}")).collect();
+            assert_eq!(account.secret_scalar, secret, "faucet account {index}");
+            let address = address_for(scalar);
+            assert_eq!(account.address, address, "faucet account {index}");
+            expected.push(address);
+        }
         assert_eq!(funded, expected, "{}", genesis.network_id);
     }
 
