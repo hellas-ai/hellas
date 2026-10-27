@@ -13,7 +13,7 @@ pub use secrets::{MAX_SECRET_BYTES, SecretError, SecretStore};
 
 mod regular;
 pub use regular::{
-    ReadLimit, open_regular_file, open_regular_file_nofollow, read_bounded,
+    ReadDirectory, ReadLimit, open_regular_file, open_regular_file_nofollow, read_bounded,
     read_bounded_regular_file, read_private_bounded,
 };
 

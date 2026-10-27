@@ -108,6 +108,31 @@ pub fn build_input_events_with_retention(
     key: &ProducerSigningKey,
     retention: Retention,
 ) -> Result<Vec<InputEventEnvelope>, FetchProtocolError> {
+    build_input_events_with_nonce(
+        service,
+        method,
+        payload,
+        execution_environment,
+        assurance,
+        key,
+        retention,
+        <[u8; 32]>::generate(),
+    )
+}
+
+/// A caller-retained nonce lets an interrupted purchase reconstruct its exact
+/// signed input without retaining the Fetch body in a journal.
+#[allow(clippy::too_many_arguments)]
+pub fn build_input_events_with_nonce(
+    service: &str,
+    method: &str,
+    payload: &[u8],
+    execution_environment: ContentId,
+    assurance: Assurance,
+    key: &ProducerSigningKey,
+    retention: Retention,
+    nonce: [u8; 32],
+) -> Result<Vec<InputEventEnvelope>, FetchProtocolError> {
     validate_service_method(service.as_bytes(), method.as_bytes())?;
     validate_request_body_limit(payload)?;
     validate_json("request.body", payload)?;
@@ -116,7 +141,6 @@ pub fn build_input_events_with_retention(
         key,
         input_canonicalization(),
     );
-    let nonce = <[u8; 32]>::generate();
     builder.push("assurance", vec![assurance.to_byte()])?;
     builder.push(
         "execution.environment",

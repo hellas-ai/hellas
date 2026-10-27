@@ -1,5 +1,6 @@
 //! Reusable paid gateway pool over durable client-owned state channels.
 
+use crate::job::{Job, JobInput};
 use crate::paid_client::{
     PaidClientError, PaidWorkOptions, PaidWorkResult, PaidWorkSession, bind_paid_endpoint,
     check_evaluate_input,
@@ -23,7 +24,9 @@ use hellas_gateway::{
     ExecutionEvent, Outcome, WorkExecutionBackend, WorkExecutionRequest, WorkFetchRequest,
 };
 use hellas_rpc::output::OutputEvent as FetchEvent;
-use hellas_work::model::profile::{PreparedWorkInput, WorkPolicy};
+#[cfg(test)]
+use hellas_work::model::profile::PreparedWorkInput;
+use hellas_work::model::profile::WorkPolicy;
 use iroh::Endpoint;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -206,7 +209,14 @@ async fn provider_policy<
         args.timeout.min(hellas_chain::node::RECOVERY_TIMEOUT),
     );
     Ok(
-        match crate::paid_client::offer::retained_offer(args, &chain).await? {
+        match crate::paid_client::offer::retained_offer(
+            &args.journal_root,
+            args.config.chain.network,
+            args.provider,
+            &chain,
+        )
+        .await?
+        {
             Some((_, signed)) => signed.offer().policy.clone(),
             None => {
                 tokio::time::timeout(
@@ -308,6 +318,12 @@ impl PaidGateway {
             .map_err(|_| hellas_gateway::WorkGatewayBusy)?;
         let input_ids = request.input_ids.clone();
         let cache_update = CacheUpdate::from_request(&request.environment, &input_ids);
+        let input = JobInput::CausalLm {
+            environment: request.environment.clone(),
+            input_ids: request.input_ids.clone(),
+            max_new_tokens: request.max_new_tokens,
+            stop_token_ids: request.stop_token_ids.clone(),
+        };
         let prepared = prepare_request(request, &self.settlement_key)?;
         let eligible = self
             .providers
@@ -334,7 +350,7 @@ impl PaidGateway {
         candidates.sort_by_key(|(_, route)| std::cmp::Reverse(route.score()));
         self.submit(
             candidates,
-            Some(prepared.into()),
+            Some(input),
             Some(cache_update),
             None,
             Some(permit),
@@ -344,7 +360,7 @@ impl PaidGateway {
     fn submit<E: GatewayEvent>(
         &self,
         candidates: Vec<(Arc<Provider>, Route)>,
-        prepared: Option<PreparedWorkInput>,
+        prepared: Option<JobInput>,
         cache_update: Option<CacheUpdate>,
         recovery_timeout: Option<Duration>,
         permit: Option<OwnedSemaphorePermit>,
@@ -355,6 +371,7 @@ impl PaidGateway {
         let endpoint = self.endpoint.clone();
         let owner = self.owner.clone();
         let settlement_key = self.settlement_key.clone();
+        let producer_key = self.producer_key.clone();
         let (sender, receiver) = mpsc::channel::<BufferedEvent<E>>(OUTPUT_BUFFER_EVENTS);
         let (overflow, overflow_receiver) = watch::channel(false);
         let output_budget = Arc::new(Semaphore::new(OUTPUT_BUFFER_BYTES));
@@ -390,7 +407,7 @@ impl PaidGateway {
                 Ok(())
             });
             let result = async {
-                let prepared_bytes = prepared.as_ref().map(PreparedWorkInput::encode).transpose()?;
+
                 let mut provider_errors = Vec::new();
                 for (provider, route) in candidates {
                     let _occupied = occupied.take().or_else(|| {
@@ -400,7 +417,7 @@ impl PaidGateway {
                     task_span.record("hellas.route.cache_affinity_tokens", route.cache_affinity_tokens);
                     task_span.record("hellas.route.pending", route.pending);
                     // Serialize jobs on one funded channel; its observer runs independently.
-                    let mut session = if recovery || matches!(prepared, Some(PreparedWorkInput::Fetch(_))) {
+                    let mut session = if recovery || matches!(prepared, Some(JobInput::Fetch { .. })) {
                         before_proposal(
                             &sender, streamed, deadline,
                             |_| provider.serial.lock().instrument(hellas_rpc::request_span!(target: "hellas_request", "paid.queue")),
@@ -484,17 +501,26 @@ impl PaidGateway {
                     // its signature. Recovery and a failed dial need not propose
                     // this request; a lost acceptance response does advance it.
                     let proposal_nonce = session.with_state(|state| state.proposal_nonce_high_water()).await?;
-                    let already_proposed = session.with_state(|state| prepared_bytes.as_ref().is_some_and(|input| state.jobs().any(|job| job.prepared_input() == input))).await?;
+
                     let request_session = &mut *session;
-                    let input = prepared.clone();
+                    let input = prepared.clone().map(|input| Job::from_input(provider.args.expected_price, input)).transpose()?;
+                    let signer = producer_key.clone();
                     let on_progress = streamed.then(|| progress.clone());
                     let result = before_proposal(
                         &sender, streamed, deadline,
                         |proposed| async move {
-                            request_session.run_with_admission(input, true, on_progress, Some(&proposed)).await
+                            match input {
+                                Some(job) => crate::transact::transact(request_session, &job, &signer,
+                                    crate::transact::TransactionOptions { new_purchase: true, progress: on_progress, proposed: Some(&proposed), ..Default::default() }
+                                ).await.map(Some).map_err(|error| match error {
+                                    crate::transact::TransactError::Client(client) => PoolError::Client(client),
+                                    error => PoolError::Transaction(Box::new(error)),
+                                }),
+                                None => request_session.run(None, true, on_progress).await.map_err(PoolError::from),
+                            }
                         },
                     ).await
-                        .and_then(|result| result.map_err(PoolError::from))
+                        .flatten()
                         .and_then(|output| output.map(E::completed).transpose())
                         .map(Option::unwrap_or_default);
                     if let Err(error) = &result {
@@ -515,7 +541,7 @@ impl PaidGateway {
                             error,
                             PoolError::Client(PaidClientError::Propose(hellas_work::work::ProposeError::Store(_))),
                         );
-                        if !already_proposed && !uncertain_append
+                        if !uncertain_append
                             && session.with_state(|state| state.proposal_nonce_high_water()).await? == proposal_nonce
                         {
                             provider.connection_failed();
@@ -601,12 +627,7 @@ impl WorkExecutionBackend for PaidGateway {
             .try_acquire_owned()
             .map_err(|_| hellas_gateway::WorkGatewayBusy)?;
         let submit = || -> Result<_> {
-            let prepared = prepare_fetch(
-                &provider.args,
-                &provider.policy,
-                &request,
-                &self.producer_key,
-            )?;
+            let prepared = prepare_fetch(&provider.args, &provider.policy, &request)?;
             let route = Route {
                 available: provider.available(),
                 cache_affinity_tokens: 0,
@@ -752,8 +773,7 @@ fn prepare_fetch(
     options: &PaidWorkOptions,
     channel_policy: &ProviderChannelPolicy,
     request: &WorkFetchRequest,
-    signer: &hellas_auth::ProducerSigningKey,
-) -> Result<PreparedWorkInput> {
+) -> Result<JobInput> {
     let WorkPolicy::Fetch {
         contract, route, ..
     } = &channel_policy.work_policy
@@ -766,18 +786,16 @@ fn prepare_fetch(
     {
         return Err(PoolError::NoMatchingPolicy);
     }
-    let input = hellas_rpc::fetch::build_input_events_with_retention(
-        &request.service,
-        &request.method,
-        &request.body,
-        contract.manifest_id(),
+    Ok(Job::fetch(
+        options.expected_price,
+        contract.clone(),
+        request.service.clone(),
+        request.method.clone(),
+        request.body.clone(),
         options.assurance,
-        signer,
-        hellas_rpc::Retention::Ephemeral,
-    )?;
-    let prepared =
-        hellas_work::model::fetch::PreparedPaidFetchInputV1::new(&input, contract)?.into();
-    Ok(prepared)
+    )?
+    .input()
+    .clone())
 }
 
 fn prepare_request(
@@ -1050,9 +1068,12 @@ mod tests {
             &options.providers[0],
             &fixture.policy,
             &request("responses"),
-            identity.node_key(),
         )
         .unwrap();
+        let prepared = Job::from_input(10, prepared)
+            .unwrap()
+            .prepare(identity.node_key(), [1; 32])
+            .unwrap();
         let PreparedWorkInput::Fetch(prepared) = prepared else {
             panic!("Fetch input")
         };
@@ -1068,8 +1089,7 @@ mod tests {
             prepare_fetch(
                 &options.providers[0],
                 &fixture.policy,
-                &request("another-route"),
-                identity.node_key()
+                &request("another-route")
             )
             .is_err()
         );
@@ -1106,13 +1126,11 @@ mod tests {
             method: "responses".into(),
             body: crate::test_support::BODY.to_vec(),
         };
-        let prepared = prepare_fetch(
-            &options.providers[0],
-            &quoted,
-            &request,
-            identity.node_key(),
-        )
-        .unwrap();
+        let prepared = prepare_fetch(&options.providers[0], &quoted, &request).unwrap();
+        let prepared = Job::from_input(10, prepared)
+            .unwrap()
+            .prepare(identity.node_key(), [1; 32])
+            .unwrap();
         let PreparedWorkInput::Fetch(prepared) = prepared else {
             panic!("Fetch input")
         };
@@ -1121,15 +1139,7 @@ mod tests {
             panic!("Fetch fixture")
         };
         policy.allowed_environment = hellas_rpc::ContentId::from_bytes([99; 32]);
-        assert!(
-            prepare_fetch(
-                &options.providers[0],
-                &quoted,
-                &request,
-                identity.node_key()
-            )
-            .is_err()
-        );
+        assert!(prepare_fetch(&options.providers[0], &quoted, &request).is_err());
         assert!(!fixture.root.path().join("client").exists());
     }
 

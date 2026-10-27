@@ -3,6 +3,10 @@ use std::{path::PathBuf, time::Duration};
 #[derive(Debug, thiserror::Error)]
 pub enum PoolError {
     #[error(transparent)]
+    Job(#[from] crate::job::JobError),
+    #[error(transparent)]
+    Transaction(Box<crate::transact::TransactError>),
+    #[error(transparent)]
     Gateway(#[from] hellas_gateway::WorkGatewayError),
     #[error("invalid paid pool: {0}")]
     Invalid(&'static str),

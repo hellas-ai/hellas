@@ -1,3 +1,4 @@
+mod transact;
 use super::*;
 use clap::Parser as _;
 use hellas_chain::test_support::devnet::{Devnet, DevnetConfig, GenesisOwner, run};
@@ -8,10 +9,18 @@ use hellas_sdk::{
 use std::sync::Arc;
 
 async fn sealing<T>(devnet: &mut Devnet, work: impl std::future::Future<Output = T>) -> T {
+    sealing_with_period(devnet, work, Duration::from_millis(100)).await
+}
+
+async fn sealing_with_period<T>(
+    devnet: &mut Devnet,
+    work: impl std::future::Future<Output = T>,
+    period: Duration,
+) -> T {
     tokio::time::timeout(hellas_chain::node::RECOVERY_TIMEOUT.saturating_mul(3), async {
         tokio::pin!(work);
         loop {
-            tokio::select! { output = &mut work => return output, () = tokio::time::sleep(Duration::from_millis(100)) => {} }
+            tokio::select! { output = &mut work => return output, () = tokio::time::sleep(period) => {} }
             let seal = devnet.seal();tokio::pin!(seal);
             tokio::select! { output = &mut work => {seal.await;return output}, _ = &mut seal => {} }
         }
@@ -39,6 +48,16 @@ async fn host(
     cfg: WorkConfig,
     node: hellas_sdk::FullNode,
 ) -> CliResult<hellas_sdk::node_control::host::HostHandle> {
+    host_with_config(startup, identity, cfg, node, None).await
+}
+
+async fn host_with_config(
+    startup: &Startup,
+    identity: &crate::identity::LocalIdentity,
+    cfg: WorkConfig,
+    node: hellas_sdk::FullNode,
+    path: Option<PathBuf>,
+) -> CliResult<hellas_sdk::node_control::host::HostHandle> {
     let options = hellas_sdk::ProviderOptions {
         port: None,
         executor: ExecutorSpawnConfig::fetch_only(
@@ -63,7 +82,7 @@ async fn host(
         secret_key: identity.transport_key.clone(),
         open_identity: identity.open_identity(),
     };
-    startup.start(options, None, None, None).await
+    startup.start(options, None, path, None).await
 }
 
 struct Case {

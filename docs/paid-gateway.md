@@ -78,7 +78,7 @@ The pool selects providers and expected prices. It obtains each policy with
 `poll_ms` and optional `max_observation_age_ms`. It contains no paid policies or
 client routes. The requester and gateway start no chain node. They authenticate
 remote state against independently configured genesis and consensus pins; relay
-URLs supply transport only. `paid-work run` defaults to the embedded devnet trust
+URLs supply transport only. `transact` defaults to the embedded devnet trust
 and `wss://devnet.hellas.ai/ws/validator-{0..5}`. Local transport and settlement
 keys are created on first use and retained with the identity.
 
@@ -88,7 +88,7 @@ provider's jobs per channel times its price, plus omission reserve and fees.
 At most four eligible owner coins fund one delegated output; change returns
 undelegated to the same owner. The wallet records the signed reshape before
 submission and shares reservations across gateway providers. Later jobs reuse
-the open channel. `paid-work run --settle` closes it and returns unspent funding.
+the open channel. `transact --settle --provider NODE_ID` closes it and returns unspent funding.
 
 A request without funding coins returns a quote and writes no paid journal. The
 quote states the canonical channel policy, omission collateral and exact funding.
@@ -115,7 +115,7 @@ hellas-cli trust --store /var/lib/hellas-gateway/trust approve provider-a \
 The existing trust JSON contains `provider_genesis`, `assurance`, approved
 `environments`, and `apple` with `app_id` and `cd_hashes`. Missing or mismatched
 Apple approval fails before funding or disclosure. Approval replacement retains
-its revision checks and persistent assertion counters. `paid-work run` accepts
+its revision checks and persistent assertion counters. `transact` accepts
 `--trust-store` and `--trust-policy` for Apple providers; software providers do not
 need them. Grant gateways keep their existing independent approval requirements.
 

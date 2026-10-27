@@ -131,7 +131,9 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
             .unwrap()
             .pin(&trust)
             .unwrap();
+        let first_upload = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let serving = tokio::spawn({
+            let first_upload = first_upload.clone();
             let server = server.clone();
             async move {
                 let mut tasks = tokio::task::JoinSet::new();
@@ -140,6 +142,7 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
                     let bundle = bundle.clone();
                     let producer = producer.clone();
                     let mount = mount.clone();
+                    let first_upload = first_upload.clone();
                     tasks.spawn(async move {
                         let transport = IrohTransport::new(connection);
                         if index == 3 {
@@ -170,7 +173,21 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
                         };
                         while let Ok(Some(inbound)) = transport.accept().await {
                             assert!(index < 2, "failed Open must not disclose a Work request");
-                            let _ = Dispatcher::<IrohTransport>::dispatch(&server, inbound).await;
+                            // The client can observe finalized setup before the
+                            // provider's clock has mounted its Work channel.
+                            if inbound.method_id
+                                == hellas_rpc::services::work::UploadContent::METHOD_ID
+                                && first_upload.swap(false, std::sync::atomic::Ordering::SeqCst)
+                            {
+                                let _ = Dispatcher::<IrohTransport>::dispatch(
+                                    &WorkServer(crate::work_router::UnmountedWork),
+                                    inbound,
+                                )
+                                .await;
+                            } else {
+                                let _ =
+                                    Dispatcher::<IrohTransport>::dispatch(&server, inbound).await;
+                            }
                         }
                     });
                 }
@@ -220,6 +237,15 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
             .await
             .unwrap()
             .unwrap();
+        assert!(!first_upload.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            session
+                .with_state(|state| state.proposal_nonce_high_water())
+                .await
+                .unwrap(),
+            1,
+            "mount retry reuses the original authorization"
+        );
         assert_eq!(result.credited_cumulative, crate::test_support::PRICE);
         assert_eq!(
             service

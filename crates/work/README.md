@@ -52,25 +52,20 @@ Opening one as the other fails.
 
 ## CLI
 
-Use `paid-work prepare-fetch` with the canonical contract descriptor to create a
-client-owned signed request:
+Use a [job folder](../../docs/jobs.md) to keep the caller input reusable:
 
 ```sh
-hellas-cli paid-work prepare-fetch \
-  --service openai --method responses \
-  --contract openai-responses-contract.json \
-  --payload-file request.json --out paid-fetch.bin
+hellas-cli --passkey owner.key transact --job ./job --provider NODE_ID -o ./result
+hellas-cli --faucet fetch https://example.com/data --provider NODE_ID --payment 20 \
+  --spki-sha256 LEAF_SPKI_SHA256 --save-job ./request -o ./response
+hellas-cli --passkey owner.key transact --settle --provider NODE_ID
 ```
 
-Use the same local identity when preparing the input and running
-`paid-work run --prepared-input paid-fetch.bin`. The existing run command
-handles setup, acceptance, delivery, authenticated payment, and optional
-settlement; it still needs its existing provider/funding/config arguments.
-
-In the work config, select `policies.fetch` with its canonical `contract` descriptor
-and exact `allowed_environment` manifest; exactly one of Fetch and Evaluate is
-allowed. Separate `policies.payment` terms set prices and block margins. See the
-[paid gateway guide](../../docs/paid-gateway.md) for gateway setup and provider trust.
+The helper selects the Fetch contract from the authenticated provider quote and
+calls the same transaction as a raw folder. The provider's owner-approved
+`PaidPolicy` fixes its contract, route, price and resource limits. Chain
+configuration holds chain pins and journal locations. See the
+[paid gateway guide](../../docs/paid-gateway.md) for provider and wallet setup.
 
 The route must also exist in the provider's Fetch route configuration.
 Route-wide capabilities and shared Fetch concurrency limits remain enforced.
@@ -84,8 +79,8 @@ method, headers, binary request body, TLS roots, additional SPKI pins, account
 alias, and response-size ceiling. The result signs HTTP status, headers and
 exact response bytes. No upstream vendor needs to be compiled into Gate.
 
-To sell this interpreter, use its manifest ID as `allowed_environment` and
-replace `service`/`method` in `policies.fetch` with:
+To sell this interpreter, its manifest is the paid policy's
+`allowed_environment`; its route policy can use:
 
 ```json
 "open_fetch": {
@@ -102,8 +97,8 @@ connection time. A registered route such as `http/request` must implement the
 HTTP manifest. The paid policy's byte/frame limits must cover the encoded HTTP
 response as well as its envelopes (base64 expands binary bodies).
 
-Use `paid-work prepare-fetch --contract http-contract.json` with the canonical HTTP
-descriptor. Software providers require the selected endpoint identity. Apple-attested
+Use `hellas fetch --contract http-contract.json` to select the quoted canonical
+HTTP descriptor explicitly. Software providers require the selected endpoint identity. Apple-attested
 providers also require an independently approved `--trust-store` and `--trust-policy`
 with app IDs and release CDHashes; see the [paid gateway guide](../../docs/paid-gateway.md).
 The signed offer carries the provider enrollment and channel policy. Every paid
@@ -119,7 +114,7 @@ rejects a weaker output scheme.
 
 - `paid_client::PaidWorkSession` owns one funded channel. It authenticates the
   provider, resumes journaled jobs, verifies results, pays, and closes. The CLI
-  and paid gateway use this same session. `run_paid_work` wraps one complete job.
+  and paid gateway use this same session. `hellas_sdk::transact` executes folders and helper-built jobs.
 - `grant_client::GrantSession` owns a private grant channel and its proposal
   journal. Both session types use `WorkLink` for authenticated transport and the
   common Work policy and transcript verification code. Grant Responses startup

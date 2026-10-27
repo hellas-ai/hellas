@@ -67,7 +67,7 @@ fn local_approval_cli_is_separate_from_identity_and_execution_and_preserves_revi
         policy.provider_genesis
     );
     let help = Command::new(env!("CARGO_BIN_EXE_hellas-cli"))
-        .args(["paid-work", "run", "--help"])
+        .args(["transact", "--help"])
         .output()
         .unwrap();
     assert!(help.status.success());
