@@ -48,6 +48,11 @@ impl<T> Deref for OwnedEndpointGuard<T> {
         &self.0.value
     }
 }
+impl<T> DerefMut for OwnedEndpointGuard<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.0.value
+    }
+}
 impl<T> Drop for OwnedEndpointGuard<T> {
     fn drop(&mut self) {
         self.0.failed |= std::thread::panicking();

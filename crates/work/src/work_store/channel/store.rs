@@ -170,6 +170,16 @@ impl ChannelStore {
         &self.state
     }
 
+    #[cfg(test)]
+    pub(crate) async fn pause_next_statement_for_test(
+        &mut self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        self.journal.pause_next_statement().await
+    }
+
     /// Whether this journal excludes request and response bodies from disk.
     #[must_use]
     pub const fn metadata_only(&self) -> bool {
