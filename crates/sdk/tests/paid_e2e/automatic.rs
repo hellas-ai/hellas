@@ -87,6 +87,7 @@ impl WorkBackend for CpuEvaluate {
 /// Only arithmetic execution is a double. Setup, Work, journals, clocks and
 /// owner signatures use the native services and the six-validator chain.
 struct Provider {
+    enrollment: hellas_rpc::ProviderEnrollmentBundle,
     node: hellas_sdk::FullNode,
     funded_height: Arc<std::sync::atomic::AtomicU64>,
     unavailable: Arc<std::sync::atomic::AtomicUsize>,
@@ -112,6 +113,14 @@ impl hellas_rpc::services::work_setup::WorkSetupHandler for RecoveringSetup {
     ) -> Result<impl Into<hellas_rpc::call::WithTrailer<RequestOfferResponse>> + Send, WireStatus>
     {
         if !request.funding_coins.is_empty() {
+            if self.funded_height.load(std::sync::atomic::Ordering::SeqCst) == u64::MAX {
+                self.unavailable
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return Err(WireStatus::new(
+                    hellas_wire::WireCode::Unavailable,
+                    "held funded-offer read",
+                ));
+            }
             let height = self
                 .funded_height
                 .swap(0, std::sync::atomic::Ordering::SeqCst);
@@ -147,8 +156,9 @@ impl Provider {
         config: WorkConfig,
         node: hellas_sdk::FullNode,
         calls: Arc<std::sync::atomic::AtomicUsize>,
+        identity: NodeIdentity,
     ) -> impl std::future::Future<Output = Self> + 'a {
-        Box::pin(Self::start_inner(root, config, node, calls))
+        Box::pin(Self::start_inner(root, config, node, calls, identity))
     }
 
     async fn start_inner(
@@ -156,11 +166,13 @@ impl Provider {
         config: WorkConfig,
         node: hellas_sdk::FullNode,
         calls: Arc<std::sync::atomic::AtomicUsize>,
+        identity: NodeIdentity,
     ) -> Self {
+        let enrollment = provider_enrollment(&identity);
         let store = NodeStore::open(
             &root.join("authority"),
             hellas_work::model::grant::grant_network(),
-            Some(provider_enrollment()),
+            Some(enrollment.clone()),
             UnixMillis(1),
         )
         .await
@@ -169,7 +181,7 @@ impl Provider {
         let key = Arc::new(ProducerSigningKey::from_secret_bytes([2; 32]).unwrap());
         let grants = hellas_work::grant_service::GrantService::from_node(
             authority.clone(),
-            &provider_enrollment(),
+            &enrollment,
             key.clone(),
             hellas_work::test_support::common_node::NoBackend,
             vec![],
@@ -183,7 +195,7 @@ impl Provider {
         )
         .unwrap();
         let endpoint = Endpoint::builder(presets::Minimal)
-            .secret_key(provider_identity().transport_key())
+            .secret_key(identity.transport_key())
             .alpns(vec![
                 WorkSetup::ALPN.as_bytes().to_vec(),
                 hellas_rpc::services::work::Work::ALPN.as_bytes().to_vec(),
@@ -212,7 +224,7 @@ impl Provider {
         .on_node(
             node.clone(),
             authority,
-            provider_enrollment(),
+            enrollment.clone(),
             endpoint
                 .bound_sockets()
                 .iter()
@@ -230,7 +242,7 @@ impl Provider {
         };
         let router = WorkRouter::payment(work);
         let open = Arc::new(
-            hellas_sdk::ProviderOpen::<ProducerSigningKey>::new(key, provider_enrollment(), None)
+            hellas_sdk::ProviderOpen::<ProducerSigningKey>::new(key, enrollment.clone(), None)
                 .unwrap(),
         );
         let server = endpoint.clone();
@@ -276,6 +288,7 @@ impl Provider {
             }
         });
         Self {
+            enrollment,
             node,
             funded_height,
             unavailable,
@@ -368,7 +381,7 @@ async fn request(
     let genesis = if mutation == Some("provider") {
         ContentId::from_bytes([7; 32])
     } else {
-        provider_enrollment().content_id()
+        provider.enrollment.content_id()
     };
     let hash = request_digest(signed_network, genesis, &request, &exporter);
     request.signature = key
@@ -456,8 +469,35 @@ async fn evaluate_and_settle(
     provider: &Provider,
     original: &SignedPaidOffer,
 ) {
-    let authority = client_authority(&root.join("client-authority"), UnixMillis(1)).await;
-    let client_node = devnet.full_node(1).clone();
+    let owner = Arc::new(
+        hellas_sdk::client_owner::ClientOwner::new(
+            Arc::new(FRIEND.passkey()),
+            key.party_key(),
+            &root.join("client-funding"),
+        )
+        .unwrap(),
+    );
+    let store = SetupStore::open(
+        &options.journal_root,
+        devnet.network(),
+        original.offer().proposal.bond_edge(),
+        Role::Client,
+        &hellas_kernel::Secp256k1Verifier::new(),
+    )
+    .await
+    .unwrap();
+    let mut setup = hellas_work::work_handshake::SetupEndpoint::new(
+        store,
+        key.clone(),
+        hellas_work::work_handshake::PaymentAdmission::Proposes(Box::new(
+            original.offer().policy.clone(),
+        )),
+    );
+    setup
+        .import_offer(*options.provider.as_bytes(), original.clone())
+        .await
+        .unwrap();
+    drop(setup);
     let coin = original
         .offer()
         .payment_funding
@@ -502,22 +542,32 @@ async fn evaluate_and_settle(
     let attempts = provider
         .unavailable
         .load(std::sync::atomic::Ordering::SeqCst);
+    let error = request(
+        endpoint,
+        provider,
+        devnet.network(),
+        FRIEND,
+        key,
+        &[coin],
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code(), hellas_wire::WireCode::Unavailable);
+    assert!(
+        provider
+            .unavailable
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > attempts
+    );
+    devnet.seal().await;
     let open = PaidWorkSession::open(
         options.clone(),
         endpoint.clone(),
         key.clone(),
-        client_node.clone(),
-        authority.clone(),
+        owner.clone(),
     );
     tokio::pin!(open);
-    tokio::time::timeout(options.timeout, async {
-        tokio::select! {
-            result = &mut open => panic!("setup ended before provider recovery: {}", result.err().map_or_else(|| "unexpected success".into(), |error| error.to_string())),
-            () = async {
-                while provider.unavailable.load(std::sync::atomic::Ordering::SeqCst) < attempts + 2 { tokio::task::yield_now().await; }
-            } => {},
-        }
-    }).await.expect("the same funded offer request retries while the provider is behind");
     let mut session = sealing_while(devnet, Duration::from_millis(100), &mut open)
         .await
         .unwrap();
@@ -548,15 +598,9 @@ async fn evaluate_and_settle(
     // race. Reopen from journals on that stable tip before testing payment.
     session.shutdown().await;
     drop(session);
-    let mut session = PaidWorkSession::open(
-        options,
-        endpoint.clone(),
-        key.clone(),
-        client_node,
-        authority,
-    )
-    .await
-    .unwrap();
+    let mut session = PaidWorkSession::open(options, endpoint.clone(), key.clone(), owner)
+        .await
+        .unwrap();
     assert_eq!(
         session.descriptor().bond_edge(),
         original.offer().proposal.bond_edge()
@@ -589,6 +633,7 @@ pub(super) fn exercise(
 }
 
 struct Case {
+    identity: NodeIdentity,
     root: tempfile::TempDir,
     devnet: Devnet,
     chain: RemoteLightClient,
@@ -613,6 +658,7 @@ async fn exercise_inner(runtime: commonware_runtime::tokio::Context) {
 }
 
 async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
+    let identity = provider_identity();
     let root = tempfile::tempdir().unwrap();
     let owners = [
         GenesisOwner {
@@ -651,14 +697,15 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
         DevnetConfig {
             name: "sdk_automatic_offers",
             owners: owners.to_vec(),
-            full_nodes: 2,
+            full_nodes: 1,
         },
     )
     .await;
     devnet.seal().await;
     let chain = RemoteLightClient::connect(devnet.light_client_url(0))
         .await
-        .unwrap();
+        .unwrap()
+        .with_consensus_verifier(devnet.consensus_verifier());
     let mut payment_coins = Vec::new();
     let mut alternate_funding = Vec::new();
     let mut short_funding = None;
@@ -825,7 +872,7 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
     let (store, secret) = hellas_work::test_support::common_node::bootstrap_node_with_credential(
         &root.path().join("authority"),
         hellas_work::model::grant::grant_network(),
-        Some(provider_enrollment()),
+        Some(provider_enrollment(&identity)),
         UnixMillis(1),
     )
     .await
@@ -838,9 +885,10 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
         config.clone(),
         devnet.full_node(0).clone(),
         calls.clone(),
+        identity.clone(),
     )
     .await;
-    let endpoint = bind_paid_endpoint(iroh::SecretKey::from_bytes(&[0x43; 32]))
+    let endpoint = bind_paid_endpoint(iroh::SecretKey::generate())
         .await
         .unwrap();
     refused(
@@ -1008,6 +1056,7 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
         config.clone(),
         devnet.full_node(0).clone(),
         calls.clone(),
+        identity.clone(),
     )
     .await;
     let first = granted(
@@ -1079,7 +1128,7 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
         first.encode().unwrap()
     );
     assert_eq!(files(&config.journal_root), before);
-    let other_peer = bind_paid_endpoint(iroh::SecretKey::from_bytes(&[0x44; 32]))
+    let other_peer = bind_paid_endpoint(iroh::SecretKey::generate())
         .await
         .unwrap();
     assert_eq!(
@@ -1262,6 +1311,7 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
         config.clone(),
         devnet.full_node(0).clone(),
         calls.clone(),
+        identity.clone(),
     )
     .await;
     assert_eq!(
@@ -1294,6 +1344,7 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
         first.encode().unwrap()
     );
     Box::new(Case {
+        identity,
         root,
         devnet,
         chain,
@@ -1315,6 +1366,7 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
 
 async fn finish(case: Box<Case>) {
     let Case {
+        identity,
         root,
         mut devnet,
         chain,
@@ -1340,7 +1392,6 @@ async fn finish(case: Box<Case>) {
         assurance: Assurance::ProducerSigned,
         apple_trust: None,
         expected_price: JOB_PRICE,
-        payment_funding: first.offer().payment_funding.clone(),
         acceptance_blocks: 16,
         terminal_blocks: 64,
         payment_blocks: 32,
@@ -1469,6 +1520,7 @@ async fn finish(case: Box<Case>) {
         config.clone(),
         devnet.full_node(0).clone(),
         calls.clone(),
+        identity.clone(),
     )
     .await;
     policy.offers.max_stake_per_client = 11;
@@ -1492,23 +1544,32 @@ async fn finish(case: Box<Case>) {
     let mut fresh_args = options;
     fresh_args.journal_root = interrupted_root;
     fresh_args.provider_addrs = provider.endpoint.bound_sockets();
-    fresh_args.payment_funding = third.offer().payment_funding.clone();
-    let agent_authority =
-        client_authority_for(&root.path().join("agent-authority"), UnixMillis(1), AGENT).await;
-    let client_node = devnet.full_node(1).clone();
-    let mut fresh = sealing_while(
-        &mut devnet,
-        Duration::from_millis(100),
-        PaidWorkSession::open(
-            fresh_args,
-            endpoint.clone(),
-            keys[3].clone(),
-            client_node,
-            agent_authority,
-        ),
-    )
-    .await
-    .unwrap();
+    let agent_owner = Arc::new(
+        hellas_sdk::client_owner::ClientOwner::new(
+            Arc::new(AGENT.passkey()),
+            keys[3].party_key(),
+            &root.path().join("agent-funding"),
+        )
+        .unwrap(),
+    );
+    provider
+        .funded_height
+        .store(u64::MAX, std::sync::atomic::Ordering::SeqCst);
+    let attempts = provider
+        .unavailable
+        .load(std::sync::atomic::Ordering::SeqCst);
+    let open = PaidWorkSession::open(fresh_args, endpoint.clone(), keys[3].clone(), agent_owner);
+    let mut fresh = sealing_while(&mut devnet, Duration::from_millis(100), async {
+        tokio::pin!(open);
+        tokio::time::timeout(hellas_chain::node::RECOVERY_TIMEOUT, async {
+            tokio::select! {
+                result = &mut open => panic!("session ended before funded offer recovery: {}", result.err().map_or_else(|| "unexpected success".into(), |error| error.to_string())),
+                () = async { while provider.unavailable.load(std::sync::atomic::Ordering::SeqCst) < attempts + 2 { tokio::task::yield_now().await; } } => {},
+            }
+        }).await.expect("one session retries its funded offer while the provider source is unavailable");
+        provider.funded_height.store(0, std::sync::atomic::Ordering::SeqCst);
+        open.await
+    }).await.unwrap();
     assert_ne!(
         fresh.descriptor().bond_edge(),
         third.offer().proposal.bond_edge(),

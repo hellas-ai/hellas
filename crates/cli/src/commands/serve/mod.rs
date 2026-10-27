@@ -16,11 +16,13 @@ use std::sync::Arc;
 pub mod bootstrap;
 mod codex_provider;
 mod configuration;
+pub(crate) mod faucet;
 pub mod work_config;
 
 pub use work_config::{WorkConfig, load_work_config};
 
 pub struct ServeOptions {
+    pub faucet: Option<faucet::Startup>,
     pub transport: Option<iroh::Endpoint>,
     pub grants: Option<hellas_sdk::grant_config::GrantConfig>,
     pub port: Option<u16>,
@@ -174,14 +176,26 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
         secret_key: options.secret_key,
         open_identity: options.open_identity,
     };
-    let node = configuration::start_host(
-        provider,
-        options.grants,
-        options.fetch_config_file,
-        options.transport,
-    )
-    .await
-    .context("failed to start node server")?;
+    let node = match &options.faucet {
+        Some(startup) => {
+            startup
+                .start(
+                    provider,
+                    options.grants,
+                    options.fetch_config_file,
+                    options.transport,
+                )
+                .await?
+        }
+        None => configuration::start_host(
+            provider,
+            options.grants,
+            options.fetch_config_file,
+            options.transport,
+        )
+        .await
+        .context("failed to start node server")?,
+    };
 
     if let Some(metrics_port) = options.metrics_port {
         let mut registry = prometheus_client::registry::Registry::default();

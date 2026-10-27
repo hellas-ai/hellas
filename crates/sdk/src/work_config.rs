@@ -166,7 +166,7 @@ struct WorkConfigFile {
     max_observation_age_ms: u64,
 }
 
-fn chain_genesis(
+pub(crate) fn chain_genesis(
     network: NetworkId,
     genesis: &Option<hellas_chain::genesis::Genesis>,
 ) -> Result<hellas_chain::genesis::Genesis> {

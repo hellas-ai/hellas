@@ -20,6 +20,7 @@ pub struct ExecutorSpawnConfig {
     pub fetch_routes: FetchRouteRegistry,
     pub fetch_max_in_flight: usize,
     pub fetch_queue_capacity: usize,
+    pub paid_fetch_timeout: std::time::Duration,
     #[cfg(feature = "evaluate")]
     pub content_store: hellas_store::ContentStore,
     #[cfg(feature = "evaluate")]
@@ -43,6 +44,7 @@ impl ExecutorSpawnConfig {
             fetch_routes,
             fetch_max_in_flight: hellas_rpc::DEFAULT_FETCH_MAX_IN_FLIGHT,
             fetch_queue_capacity: hellas_rpc::DEFAULT_FETCH_QUEUE_CAPACITY,
+            paid_fetch_timeout: std::time::Duration::from_secs(90),
             #[cfg(feature = "evaluate")]
             content_store: hellas_store::ContentStore::new(),
             #[cfg(feature = "evaluate")]
@@ -60,6 +62,7 @@ pub struct Executor {
     pub(super) fetch_max_in_flight: usize,
     fetch_queue_capacity: usize,
     pub(super) active_fetches: usize,
+    pub(super) paid_fetch_timeout: std::time::Duration,
     #[cfg(feature = "evaluate")]
     evaluate: EvaluateEngine,
 }
@@ -67,6 +70,15 @@ impl Executor {
     pub async fn spawn_configured(
         config: ExecutorSpawnConfig,
     ) -> Result<ExecutorHandle, ExecutorError> {
+        if config.paid_fetch_timeout.is_zero()
+            || std::time::Instant::now()
+                .checked_add(config.paid_fetch_timeout)
+                .is_none()
+        {
+            return Err(ExecutorError::ResourceExhausted(
+                "paid Fetch timeout is outside the clock range".into(),
+            ));
+        }
         if config.fetch_max_in_flight == 0 {
             return Err(ExecutorError::ResourceExhausted(
                 "Fetch concurrency must be positive".into(),
@@ -116,6 +128,7 @@ impl Executor {
             fetch_max_in_flight: config.fetch_max_in_flight,
             fetch_queue_capacity: config.fetch_queue_capacity,
             active_fetches: 0,
+            paid_fetch_timeout: config.paid_fetch_timeout,
             #[cfg(feature = "evaluate")]
             evaluate,
         };

@@ -185,17 +185,18 @@ pub struct PaidGateway {
     providers: Vec<Arc<Provider>>,
     next: AtomicUsize,
     endpoint: Endpoint,
-    node: crate::FullNode,
-    authority: hellas_work::node::NodeCoordinator,
+    owner: Arc<crate::client_owner::ClientOwner>,
     settlement_key: Secp256k1Signer,
     producer_key: hellas_auth::ProducerSigningKey,
     admission: Arc<Semaphore>,
     tasks: crate::gateway_work::WorkTasks,
 }
 
-async fn provider_policy(
+async fn provider_policy<
+    C: hellas_chain::LightClient + hellas_chain::work_view::FinalizedWorkView,
+>(
     args: &PaidWorkOptions,
-    chain: hellas_chain::WorkBlocks<hellas_chain::rpc::LocalLightClient>,
+    chain: hellas_chain::WorkBlocks<C>,
     endpoint: &Endpoint,
     settlement_key: &Secp256k1Signer,
     owner: hellas_auth::authority::PrincipalId,
@@ -226,29 +227,32 @@ impl PaidGateway {
     pub async fn open(
         options: PaidGatewayOptions,
         identity: crate::NodeIdentity,
-        node: crate::FullNode,
-        authority: hellas_work::node::NodeCoordinator,
+        owner: Arc<crate::client_owner::ClientOwner>,
     ) -> Result<Arc<Self>> {
         options.validate()?;
         for provider in &options.providers {
-            provider.config.check_node(&node)?;
+            provider.config.clone().validate()?;
         }
         let settlement_key = Secp256k1Signer::from_secret_scalar(identity.node_secret_bytes())
             .map_err(|_| PoolError::Invalid("node key is not a secp256k1 channel signer"))?;
         let endpoint = bind_paid_endpoint(identity.transport_key()).await?;
-        let owner = authority
-            .owner()
-            .await
-            .map_err(crate::paid_client::PaidClientError::from)?;
-        let view = tokio::time::timeout(Duration::from_secs(30), node.wait_ready())
-            .await
-            .map_err(|_| PoolError::ConnectionTimeout(Duration::from_secs(30)))?
-            .map_err(crate::paid_client::PaidClientError::from)?;
-        let chain = hellas_chain::WorkBlocks::new(view.client());
+        if owner.delegate() != settlement_key.party_key() {
+            return Err(PoolError::Invalid(
+                "funding delegate differs from the gateway settlement key",
+            ));
+        }
         let mut providers = Vec::with_capacity(options.providers.len());
         for args in options.providers {
+            let remote = crate::client_chain::connect(
+                &args.config,
+                args.timeout.min(hellas_chain::node::RECOVERY_TIMEOUT),
+            )
+            .await
+            .map_err(PaidClientError::from)?;
+            let chain = hellas_chain::WorkBlocks::new(remote);
             let policy =
-                provider_policy(&args, chain.clone(), &endpoint, &settlement_key, owner).await?;
+                provider_policy(&args, chain, &endpoint, &settlement_key, owner.principal())
+                    .await?;
             providers.push(Arc::new(Provider {
                 policy,
                 args,
@@ -265,8 +269,7 @@ impl PaidGateway {
             // One transport identity has one relay registration, shared by every
             // provider and request for the lifetime of this gateway.
             endpoint,
-            node,
-            authority,
+            owner,
             settlement_key,
             producer_key: identity.node_key().clone(),
             tasks: crate::gateway_work::WorkTasks::default(),
@@ -350,8 +353,7 @@ impl PaidGateway {
             return Err(hellas_gateway::WorkGatewayBusy.into());
         }
         let endpoint = self.endpoint.clone();
-        let node = self.node.clone();
-        let authority = self.authority.clone();
+        let owner = self.owner.clone();
         let settlement_key = self.settlement_key.clone();
         let (sender, receiver) = mpsc::channel::<BufferedEvent<E>>(OUTPUT_BUFFER_EVENTS);
         let (overflow, overflow_receiver) = watch::channel(false);
@@ -430,7 +432,7 @@ impl PaidGateway {
                     if session.is_none() {
                         match connect_before_deadline(
                             &sender, streamed, deadline, PROVIDER_CONNECTION_TIMEOUT,
-                            async { PaidWorkSession::open(provider.args.clone(), endpoint.clone(), settlement_key.clone(), node.clone(), authority.clone()).await.map_err(PoolError::from) },
+                            async { PaidWorkSession::open(provider.args.clone(), endpoint.clone(), settlement_key.clone(), owner.clone()).await.map_err(PoolError::from) },
                         ).await
                         {
                             Ok(opened) => {
@@ -880,7 +882,6 @@ mod tests {
     use iroh::Endpoint;
 
     fn pool_options(fixture: &crate::test_support::PaidFixture) -> PaidGatewayOptions {
-        use hellas_kernel::{CoinId, Funding, List};
         PaidGatewayOptions {
             max_pending_requests: 4,
             providers: vec![PaidWorkOptions {
@@ -891,10 +892,6 @@ mod tests {
                 apple_trust: None,
                 assurance: hellas_rpc::Assurance::ProducerSigned,
                 expected_price: crate::test_support::PRICE,
-                payment_funding: Funding::new(
-                    List::take([CoinId::from_bytes([1; 32]); 4], 1),
-                    List::empty(CoinId::from_bytes([0; 32])),
-                ),
                 acceptance_blocks: 16,
                 terminal_blocks: 64,
                 payment_blocks: 32,
@@ -936,7 +933,13 @@ mod tests {
                         proposal: fixture.proposal.clone(),
                         policy: fixture.policy.clone(),
                         omission_bond: 601,
-                        payment_funding: args.payment_funding.clone(),
+                        payment_funding: hellas_kernel::Funding::new(
+                            hellas_kernel::List::take(
+                                [hellas_kernel::CoinId::from_bytes([1; 32]); 4],
+                                1,
+                            ),
+                            hellas_kernel::List::empty(hellas_kernel::CoinId::from_bytes([0; 32])),
+                        ),
                         addresses: vec![],
                     },
                     &signer(2),
@@ -1006,7 +1009,6 @@ mod tests {
 
     #[test]
     fn invalid_pool_options_are_refused_without_starting_a_gateway() {
-        use hellas_kernel::{CoinId, Funding, List};
         let fixture = crate::test_support::PaidFixture::new();
         assert!(pool_options(&fixture).validate().is_ok());
 
@@ -1017,10 +1019,6 @@ mod tests {
         let mut duplicate = pool_options(&fixture);
         let mut second = duplicate.providers[0].clone();
         second.journal_root = fixture.root.path().join("second");
-        second.payment_funding = Funding::new(
-            List::take([CoinId::from_bytes([2; 32]); 4], 1),
-            List::empty(CoinId::from_bytes([0; 32])),
-        );
         duplicate.providers.push(second);
         assert!(matches!(
             duplicate.validate(),
@@ -1032,7 +1030,7 @@ mod tests {
         other.journal_root = fixture.root.path().join("other");
         other.provider = iroh::SecretKey::from_bytes(&[4; 32]).public();
         shared.providers.push(other);
-        assert!(matches!(shared.validate(), Err(PoolError::Invalid(_))));
+        assert!(shared.validate().is_ok());
     }
 
     #[tokio::test]
@@ -1186,34 +1184,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shared_pool_rejects_reused_funding_before_opening_or_writing() {
-        let mut fixture = crate::test_support::PaidFixture::new();
-        let node = fixture.node().await;
+    async fn shared_pool_rejects_reused_journal_before_opening_or_writing() {
+        let fixture = crate::test_support::PaidFixture::new();
         let mut options = pool_options(&fixture);
         let mut second = options.providers[0].clone();
         second.provider = iroh::SecretKey::from_bytes(&[4; 32]).public();
-        second.journal_root = fixture.root.path().join("other");
         options.providers.push(second);
-        let result = PaidGateway::open(
-            options,
-            crate::NodeIdentity::generate(),
-            node.clone(),
-            crate::test_support::authority(
-                &fixture.root.path().join("authority"),
-                crate::test_support::enrollment(iroh::SecretKey::from_bytes(&[3; 32]).public()).0,
+        let identity = crate::NodeIdentity::generate();
+        let owner = Arc::new(
+            crate::client_owner::ClientOwner::new(
+                Arc::new(hellas_auth::test_support::actors::FRIEND.passkey()),
+                Secp256k1Signer::from_secret_scalar(identity.node_secret_bytes())
+                    .unwrap()
+                    .party_key(),
+                &fixture.root.path().join("funding"),
             )
-            .await,
-        )
-        .await;
+            .unwrap(),
+        );
+        let result = PaidGateway::open(options, identity, owner).await;
         assert!(matches!(
             result,
             Err(PoolError::Invalid(
-                "a payment coin cannot fund two provider channels or appear twice"
+                "paid providers must have distinct journal roots"
             ))
         ));
         assert!(!fixture.root.path().join("client").exists());
-        assert!(!fixture.root.path().join("other").exists());
-        node.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -1343,16 +1338,19 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_rejects_admitted_work_not_yet_registered() {
-        let mut fixture = crate::test_support::PaidFixture::new();
-        let node = fixture.node().await;
+        let fixture = crate::test_support::PaidFixture::new();
         let gateway = PaidGateway {
-            authority: crate::test_support::authority(
-                &fixture.root.path().join("authority"),
-                crate::test_support::enrollment(iroh::SecretKey::from_bytes(&[3; 32]).public()).0,
-            )
-            .await,
+            owner: Arc::new(
+                crate::client_owner::ClientOwner::new(
+                    Arc::new(hellas_auth::test_support::actors::FRIEND.passkey()),
+                    Secp256k1Signer::from_secret_scalar([7; 32])
+                        .unwrap()
+                        .party_key(),
+                    &fixture.root.path().join("funding"),
+                )
+                .unwrap(),
+            ),
             providers: Vec::new(),
-            node: node.clone(),
             next: AtomicUsize::new(0),
             endpoint: Endpoint::builder(iroh::endpoint::presets::Minimal)
                 .bind()
@@ -1373,7 +1371,6 @@ mod tests {
             PoolError::Busy(_)
         ));
         assert_eq!(gateway.admission.available_permits(), 1);
-        node.shutdown().await.unwrap();
     }
 
     #[test]

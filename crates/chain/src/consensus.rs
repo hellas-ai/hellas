@@ -57,10 +57,15 @@ mod full {
 
     #[derive(Clone)]
     pub struct ConsensusVerifier {
+        network: hellas_kernel::NetworkId,
         scheme: Scheme,
     }
 
     impl ConsensusVerifier {
+        pub const fn network(&self) -> hellas_kernel::NetworkId {
+            self.network
+        }
+
         pub fn new(
             info: &ConsensusInfo,
             genesis: Digest,
@@ -74,6 +79,7 @@ mod full {
             let identity = ConsensusIdentity::decode(info.threshold_identity.as_slice())
                 .map_err(|_| ConsensusVerificationError::InvalidThresholdIdentity)?;
             Ok(Self {
+                network,
                 scheme: Scheme::certificate_verifier(&namespace, identity),
             })
         }
@@ -192,11 +198,16 @@ mod light {
 
     #[derive(Clone)]
     pub struct ConsensusVerifier {
+        network: hellas_kernel::NetworkId,
         identity: ConsensusIdentity,
         namespace: Vec<u8>,
     }
 
     impl ConsensusVerifier {
+        pub const fn network(&self) -> hellas_kernel::NetworkId {
+            self.network
+        }
+
         pub fn new(
             info: &ConsensusInfo,
             genesis: Digest,
@@ -210,6 +221,7 @@ mod light {
             let identity = ConsensusIdentity::decode(info.threshold_identity.as_slice())
                 .map_err(|_| ConsensusVerificationError::InvalidThresholdIdentity)?;
             Ok(Self {
+                network,
                 identity,
                 namespace,
             })

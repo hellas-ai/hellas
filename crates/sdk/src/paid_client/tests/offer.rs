@@ -190,7 +190,6 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
             .await
             .unwrap();
         let mut session = PaidWorkSession {
-            chain: SessionChain::Constructed,
             args: PaidWorkOptions {
                 config: fixture.config.clone(),
                 journal_root: fixture.root.path().join("client"),
@@ -199,10 +198,6 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
                 apple_trust: None,
                 assurance: Assurance::ProducerSigned,
                 expected_price: crate::test_support::PRICE,
-                payment_funding: Funding::new(
-                    hellas_kernel::List::empty(hellas_kernel::CoinId::from_bytes([0; 32])),
-                    hellas_kernel::List::empty(hellas_kernel::CoinId::from_bytes([0; 32])),
-                ),
                 acceptance_blocks: 49,
                 terminal_blocks: 99,
                 payment_blocks: 199,

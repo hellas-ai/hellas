@@ -103,12 +103,10 @@ HTTP manifest. The paid policy's byte/frame limits must cover the encoded HTTP
 response as well as its envelopes (base64 expands binary bodies).
 
 Use `paid-work prepare-fetch --contract http-contract.json` with the canonical HTTP
-descriptor. Every `paid-work run` requires `--trust-store` and `--trust-policy`.
-Approve the independent enrollment, assurance, software pins and exact execution
-manifests through `hellas-cli trust ... approve` before execution; see the
-[paid gateway guide](../../docs/paid-gateway.md). Provisioned offers carry the
-provider enrollment and signed bond proposal, which must agree with the separately
-approved policy. Every paid
+descriptor. Software providers require the selected endpoint identity. Apple-attested
+providers also require an independently approved `--trust-store` and `--trust-policy`
+with app IDs and release CDHashes; see the [paid gateway guide](../../docs/paid-gateway.md).
+The signed offer carries the provider enrollment and channel policy. Every paid
 Work and WorkSetup connection verifies a fresh Open proof before sending its
 request. The proof binds the TLS exporter, nonce, service ALPN, enrollment and
 producer key; the producer must also be the payment channel's provider.

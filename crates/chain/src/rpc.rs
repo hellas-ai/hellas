@@ -2,16 +2,16 @@
 
 #[cfg(feature = "validator")]
 use crate::app::{Mempool, MempoolEntry, RESPONSE_MEMPOOL_CAPACITY};
+#[cfg(feature = "validator")]
+use crate::domain::{edge_object_id, registry_chunk_object_id};
 #[cfg(all(test, feature = "validator"))]
 use crate::owner_index::OwnerIndexError;
-use std::collections::BTreeSet;
+#[cfg(feature = "validator")]
+use hellas_kernel::pending_payment_close_slot;
 #[cfg(feature = "validator")]
 use std::collections::{BTreeMap, btree_map::Entry};
 
-use crate::domain::{
-    Coin, Object, ObjectId, ObjectKind, SettlementKey, Transaction, coin_object_id, edge_object_id,
-    registry_chunk_object_id,
-};
+use crate::domain::{Coin, Object, ObjectId, ObjectKind, SettlementKey, Transaction};
 use crate::{
     execution::store::{UtxoDatabase, UtxoDb},
     indexer::ChainIndexer,
@@ -22,14 +22,15 @@ use crate::{
     owner_index::{OwnerCursor, OwnerIndex},
     work_view::{FinalizedWorkView, WorkChannelQuery, WorkChannelSnapshot},
 };
+use commonware_codec::DecodeExt as _;
 use commonware_cryptography::sha256::Digest;
+use hellas_kernel::NetworkId;
 #[cfg(feature = "validator")]
 use hellas_kernel::{
     Batch as KernelBatch, BlockHash, BlockHeight, Coin as KernelCoin, CoinId,
     Context as KernelContext, Edge, EdgeId, InsertError, KernelResult, PaymentCloseResponse,
     RegistryChunk, RegistryChunkId, check_response,
 };
-use hellas_kernel::{NetworkId, bond_lease_slots, pending_payment_close_slot};
 use hellas_rpc::SubmitTxOutcome;
 #[cfg(feature = "validator")]
 use hellas_rpc::observe::{LEVEL, TARGET, Timing};
@@ -538,108 +539,55 @@ async fn work_channel_snapshot_at(
     network: NetworkId,
     query: WorkChannelQuery,
 ) -> Result<Option<WorkChannelSnapshot>, QueryError> {
+    let keys = query.object_keys(network);
+    objects_at(databases, owner_index, chain_indexer, keys, network)
+        .await?
+        .map(|snapshot| WorkChannelSnapshot::from_objects(network, query, snapshot))
+        .transpose()
+}
+
+async fn objects_at(
+    databases: &UtxoDatabase<commonware_runtime::tokio::Context>,
+    owner_index: &OwnerIndex,
+    chain_indexer: &ChainIndexer,
+    keys: Vec<ObjectId>,
+    network: NetworkId,
+) -> Result<Option<crate::light_client::ObjectSnapshot>, QueryError> {
+    if keys.len() > 32 {
+        return Err(QueryError::InvalidTransaction(
+            "at most 32 object keys are allowed".into(),
+        ));
+    }
     if owner_index.cursor().height == 0 {
         return Ok(None);
     }
     let (reader, cursor) = coherent_reader(databases, owner_index, chain_indexer).await?;
-    let state_root = reader.root();
-    let Some(finalization) = chain_indexer.get_finalization(cursor.payload).await? else {
-        return Err(QueryError::StateUnavailable(
-            "owner index cursor finalization is unavailable".to_string(),
-        ));
-    };
-
-    let mut bond = None;
-    let mut payment = None;
-    for (slot, edge) in [
-        (&mut bond, Some(query.bond_edge)),
-        (&mut payment, query.payment_edge),
-    ] {
-        let Some(edge) = edge else {
-            continue;
-        };
-        *slot =
-            match reader.get(&edge_object_id(edge)).await.map_err(|error| {
-                QueryError::StateUnavailable(format!("edge read failed: {error:?}"))
-            })? {
-                Some(Object::Edge(edge)) => Some(edge),
-                Some(object) => {
-                    return Err(QueryError::WrongObjectKind {
-                        expected: ObjectKind::Edge,
-                        actual: object.kind(),
-                    });
-                }
-                None => None,
-            };
-    }
-
-    let [first_lease, second_lease] = bond_lease_slots(network, query.bond_edge);
-    let mut registry = [None, None, None];
-    for (stored, id) in registry.iter_mut().zip([
-        Some(first_lease),
-        Some(second_lease),
-        query
-            .payment_edge
-            .map(|edge| pending_payment_close_slot(network, edge)),
-    ]) {
-        let Some(id) = id else {
-            continue;
-        };
-        *stored = match reader
-            .get(&registry_chunk_object_id(id))
+    let finalization = chain_indexer
+        .get_finalization(cursor.payload)
+        .await?
+        .ok_or_else(|| {
+            QueryError::StateUnavailable("finalized object certificate is unavailable".into())
+        })?;
+    let mut objects = std::collections::BTreeMap::new();
+    for key in keys {
+        if let Some(object) = reader
+            .get(&key)
             .await
-            .map_err(|error| {
-                QueryError::StateUnavailable(format!("registry read failed: {error:?}"))
-            })? {
-            Some(Object::RegistryChunk(chunk)) => Some(chunk),
-            Some(object) => {
-                return Err(QueryError::WrongObjectKind {
-                    expected: ObjectKind::RegistryChunk,
-                    actual: object.kind(),
-                });
-            }
-            None => None,
-        };
-    }
-    let [lease_first, lease_second, pending_slot] = registry;
-
-    let mut live_funding = BTreeSet::new();
-    for coin in &query.funding {
-        match reader
-            .get(&coin_object_id(*coin))
-            .await
-            .map_err(|error| QueryError::StateUnavailable(format!("coin read failed: {error:?}")))?
+            .map_err(|error| QueryError::StateUnavailable(format!("object read: {error:?}")))?
         {
-            Some(Object::Coin(_)) => {
-                live_funding.insert(*coin);
-            }
-            // A spent coin is absent, and that is the answer the
-            // preflight wants. An object of another kind under a coin's
-            // derived id is not an answer at all.
-            None => {}
-            Some(object) => {
-                return Err(QueryError::WrongObjectKind {
-                    expected: ObjectKind::Coin,
-                    actual: object.kind(),
-                });
-            }
+            objects.insert(key, object);
         }
     }
-
-    Ok(Some(WorkChannelSnapshot::new(
-        query,
-        LatestBlock {
+    Ok(Some(crate::light_client::ObjectSnapshot {
+        network,
+        block: LatestBlock {
             height: cursor.height,
             payload: cursor.payload,
-            state_root,
+            state_root: reader.root(),
             finalization,
         },
-        bond,
-        payment,
-        [lease_first, lease_second],
-        pending_slot,
-        live_funding,
-    )))
+        objects,
+    }))
 }
 
 impl FinalizedWorkView for LocalLightClient {
@@ -670,6 +618,63 @@ impl FinalizedWorkView for LocalLightClient {
 }
 
 impl LightClient for LocalLightClient {
+    async fn get_operations(
+        &self,
+        request: hellas_rpc::pb::chain::GetOperationsRequest,
+    ) -> Result<hellas_rpc::pb::chain::GetOperationsResponse, QueryError> {
+        use commonware_codec::Encode as _;
+        use commonware_storage::mmr;
+        self.require_ready()?;
+        let max = std::num::NonZeroU64::new(request.max_ops)
+            .filter(|max| max.get() <= 64)
+            .ok_or_else(|| {
+                QueryError::InvalidTransaction("operation count must be 1..=64".into())
+            })?;
+        let count = mmr::Location::new(request.op_count);
+        let start = mmr::Location::new(request.start);
+        if request.include_pinned_nodes
+            || !count.is_valid()
+            || !start.is_valid_index()
+            || start >= count
+        {
+            return Err(QueryError::InvalidTransaction(
+                "invalid object witness range".into(),
+            ));
+        }
+        let database = self.databases.read().await;
+        if count > database.bounds().end {
+            return Err(QueryError::NotYetApplied);
+        }
+        let (proof, operations) = database
+            .historical_proof(count, start, max)
+            .await
+            .map_err(|error| QueryError::StateUnavailable(format!("operation range: {error:?}")))?;
+        Ok(hellas_rpc::pb::chain::GetOperationsResponse {
+            proof: proof.encode().to_vec(),
+            operations: operations
+                .iter()
+                .map(|operation| operation.encode().to_vec())
+                .collect(),
+            pinned_nodes: Vec::new(),
+        })
+    }
+
+    async fn get_objects(
+        &self,
+        keys: Vec<ObjectId>,
+    ) -> Result<Option<crate::light_client::ObjectSnapshot>, QueryError> {
+        self.require_ready()?;
+        objects_at(
+            &self.databases,
+            &self.owner_index,
+            &self.chain_indexer,
+            keys,
+            NetworkId::new(&self.consensus_info.network_id)
+                .ok_or_else(|| QueryError::Remote("invalid chain network".into()))?,
+        )
+        .await
+    }
+
     async fn get_state_root(&self) -> Result<Option<Digest>, QueryError> {
         self.require_ready()?;
         Ok(Some(self.databases.read().await.root()))
@@ -765,6 +770,38 @@ impl LightClient for LocalLightClient {
                 .map(Some);
         }
         Ok(block)
+    }
+
+    async fn get_applied_finalized_block(
+        &self,
+        query: FinalizedBlockQuery,
+    ) -> Result<Option<FinalizedBlock>, QueryError> {
+        self.require_ready()?;
+        let (reader, cursor) =
+            coherent_reader(&self.databases, &self.owner_index, &self.chain_indexer).await?;
+        let selected = if matches!(query, FinalizedBlockQuery::Latest) {
+            FinalizedBlockQuery::Payload(cursor.payload)
+        } else {
+            query
+        };
+        let Some(block) = self.chain_indexer.get_finalized_block(selected).await? else {
+            return Ok(None);
+        };
+        let target = crate::HellasBlock::decode(block.block.as_slice())
+            .map_err(|error| QueryError::StateUnavailable(format!("applied block: {error:?}")))?
+            .sync_target();
+        let bounds = reader.bounds();
+        if block.snapshot.height > cursor.height || target.range.end() > bounds.end {
+            return Err(QueryError::NotYetApplied);
+        }
+        if matches!(query, FinalizedBlockQuery::Latest)
+            && (block.snapshot.state_root != reader.root() || target.range.end() != bounds.end)
+        {
+            return Err(QueryError::StateUnavailable(
+                "applied checkpoint does not match committed state".into(),
+            ));
+        }
+        Ok(Some(block))
     }
 
     fn submit_tx(

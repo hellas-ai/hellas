@@ -23,6 +23,12 @@ pub const HELLAS_DEVNET_1_JSON: &str = include_str!("../networks/hellas-devnet-1
 /// The id that document names.
 pub const HELLAS_DEVNET_1_ID: &str = "hellas-devnet-1";
 
+/// Offline seed-100 finality trust bound to the shipped devnet genesis.
+pub const HELLAS_DEVNET_1_TRUST_JSON: &str = include_str!("../networks/hellas-devnet-1/trust.json");
+/// Genesis block payload independently derived from the shipped document.
+pub const HELLAS_DEVNET_1_GENESIS_PAYLOAD: &str =
+    include_str!("../networks/hellas-devnet-1/genesis-payload.hex");
+
 /// Intentionally public software-passkey credentials for the development network.
 pub const HELLAS_DEVNET_1_FAUCET_JSON: &str =
     include_str!("../networks/hellas-devnet-1/faucet.json");

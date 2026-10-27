@@ -61,6 +61,7 @@ use crate::work_view::{FinalizedWorkView, WorkChannelQuery, WorkChannelSnapshot}
 pub struct WorkBlocks<C> {
     client: C,
     read_retry: Option<(std::time::Duration, std::time::Duration)>,
+    min_height: u64,
 }
 
 /// What one production clock step did for a mounted paid channel.
@@ -113,6 +114,7 @@ impl<C: LightClient> WorkBlocks<C> {
         Self {
             client,
             read_retry: None,
+            min_height: 0,
         }
     }
 
@@ -124,6 +126,13 @@ impl<C: LightClient> WorkBlocks<C> {
         timeout: std::time::Duration,
     ) -> Self {
         self.read_retry = Some((poll, timeout));
+        self
+    }
+
+    /// A persisted journal must never interpret absence at an earlier root.
+    #[must_use]
+    pub fn with_min_height(mut self, height: u64) -> Self {
+        self.min_height = self.min_height.max(height);
         self
     }
 
@@ -177,7 +186,7 @@ impl From<QueryError> for BlockSourceError {
 /// bond terms. One coherent finalized snapshot from `source` decides both
 /// permissionless submissions: the payment close through
 /// [`WorkService::adjudicated_close`], and the bond timeout when that same
-/// read still contains the bond at or beyond its committed horizon.
+/// read still contains the bond after finalized payment closure or at its horizon.
 ///
 /// `NoContest`, `OtherContest`, and `ResponseWindowOpen` are clock states,
 /// not failures. They leave adjudication absent from the returned advance
@@ -198,7 +207,7 @@ where
         .advance_close(source, source)
         .await
         .map_err(PaidWorkClockError::CloseDrive)?;
-    let (query, bond_terms) = service
+    let (query, bond_terms, settled_height) = service
         .with_state(|state| {
             let channel = state.channel();
             let payment_terms = channel.payment_terms();
@@ -209,6 +218,7 @@ where
                     funding: Default::default(),
                 },
                 Terms::work_stake_bond(payment_terms.bond_terms.clone()),
+                state.close_settled().map(|settled| settled.height),
             )
         })
         .await
@@ -245,19 +255,24 @@ where
         Err(error) => return Err(PaidWorkClockError::Decision(error)),
     };
 
-    let bond_timeout =
-        if snapshot.bond().is_some() && snapshot.block().height >= bond_terms.timeout().get() {
-            let tx = Tx::timeout_close(bond_edge, &bond_terms)
-                .ok_or(PaidWorkClockError::TimeoutUnavailable)?;
-            Some(
-                source
-                    .submit(tx)
-                    .await
-                    .map_err(PaidWorkClockError::Submission)?,
-            )
-        } else {
-            None
-        };
+    // The journal's finalized close and a snapshot at least that new jointly
+    // prove the lease no longer protects a live payment edge.
+    let payment_closed = settled_height.is_some_and(|height| snapshot.block().height >= height)
+        && snapshot.payment().is_none();
+    let bond_timeout = if snapshot.bond().is_some()
+        && (payment_closed || snapshot.block().height >= bond_terms.timeout().get())
+    {
+        let tx = Tx::timeout_close(bond_edge, &bond_terms)
+            .ok_or(PaidWorkClockError::TimeoutUnavailable)?;
+        Some(
+            source
+                .submit(tx)
+                .await
+                .map_err(PaidWorkClockError::Submission)?,
+        )
+    } else {
+        None
+    };
 
     Ok(PaidWorkClockAdvance {
         snapshot: Some(snapshot),
@@ -289,12 +304,10 @@ impl<C: LightClient + FinalizedWorkView> SetupView for WorkBlocks<C> {
     ) -> Result<Option<FinalizedSetup>, BlockSourceError> {
         let funding = query.funding;
         let Some(snapshot) = self
-            .read(|| {
-                self.client.work_channel_snapshot(WorkChannelQuery {
-                    bond_edge: query.bond_edge,
-                    payment_edge: query.payment_edge,
-                    funding: funding.clone(),
-                })
+            .work_channel_snapshot(WorkChannelQuery {
+                bond_edge: query.bond_edge,
+                payment_edge: query.payment_edge,
+                funding: funding.clone(),
             })
             .await
             .map_err(BlockSourceError::from)?
@@ -319,8 +332,17 @@ impl<C: LightClient + FinalizedWorkView> FinalizedWorkView for WorkBlocks<C> {
         &self,
         query: WorkChannelQuery,
     ) -> Result<Option<WorkChannelSnapshot>, QueryError> {
-        self.read(|| self.client.work_channel_snapshot(query.clone()))
-            .await
+        self.read(|| async {
+            let snapshot = self.client.work_channel_snapshot(query.clone()).await?;
+            if snapshot.as_ref().map_or(0, |value| value.block().height) < self.min_height {
+                return Err(QueryError::StateUnavailable(format!(
+                    "chain is behind persisted journal height {}",
+                    self.min_height
+                )));
+            }
+            Ok(snapshot)
+        })
+        .await
     }
 }
 
@@ -336,7 +358,21 @@ impl<C: LightClient> TxSink for WorkBlocks<C> {
 impl<C: LightClient> FinalizedBlocks for WorkBlocks<C> {
     async fn latest_height(&self) -> Result<Option<u64>, BlockSourceError> {
         Ok(self
-            .read(|| self.client.get_latest_block())
+            .read(|| async {
+                // A journal floor must stay within the state this source can prove.
+                let latest = self
+                    .client
+                    .get_applied_finalized_block(FinalizedBlockQuery::Latest)
+                    .await?
+                    .map(|block| block.snapshot);
+                if latest.as_ref().map_or(0, |value| value.height) < self.min_height {
+                    return Err(QueryError::StateUnavailable(format!(
+                        "chain is behind persisted journal height {}",
+                        self.min_height
+                    )));
+                }
+                Ok(latest)
+            })
             .await
             .map_err(BlockSourceError::from)?
             .map(|block| block.height))
@@ -396,8 +432,15 @@ mod tests {
 
     use std::collections::BTreeSet;
 
+    use commonware_consensus::{
+        CertifiableBlock as _,
+        simplex::types::Context,
+        types::{Epoch, Height, Round, View},
+    };
     use commonware_glue::stateful::db::{DatabaseSet, Merkleized as _, Unmerkleized as _};
     use commonware_runtime::{Handle, Supervisor as _};
+    use commonware_storage::mmr::Location;
+    use commonware_utils::non_empty_range;
     use hellas_auth::Digest as ProtocolDigest;
     use hellas_kernel::{
         BlockHash, BlockHeight, CoinId, Context as KernelContext, EdgeId, EdgeValues, Fees,
@@ -430,7 +473,7 @@ mod tests {
     use crate::domain::{KERNEL_FEES, SettlementKey, TEST_NETWORK, genesis_object_id};
     use crate::execution::store::{UtxoDatabase, utxo_db_config};
     use crate::execution::test_support::{
-        consensus_fixture, finalization, index_block, index_genesis, run_qmdb,
+        consensus_fixture, finalization, index_genesis, run_qmdb,
     };
     use crate::execution::{ChainVerifier, execute_all};
     use crate::indexer::spawn_archive;
@@ -601,7 +644,7 @@ mod tests {
         /// Nothing else drains this mempool, so everything past it is
         /// what the driver submitted since.
         sealed: usize,
-        _indexer_task: Handle<()>,
+        indexer_task: Handle<()>,
     }
 
     impl Chain {
@@ -642,8 +685,13 @@ mod tests {
                 head: genesis,
                 height: 0,
                 sealed: 0,
-                _indexer_task: task,
+                indexer_task: task,
             }
+        }
+
+        async fn shutdown(self) {
+            self.indexer_task.abort();
+            let _ = self.indexer_task.await;
         }
 
         fn light_client(&self) -> LocalLightClient {
@@ -686,13 +734,28 @@ mod tests {
             .expect("the block executes");
             let merkleized = batches.merkleize().await.expect("state merkleizes");
             let root = merkleized.root();
-            self.database.finalize(merkleized).await;
-
-            let block = index_block(&self.head, root, fresh);
+            let bounds = merkleized.bounds();
+            let block = HellasBlock::new(
+                Context {
+                    round: Round::new(Epoch::zero(), View::new(self.height)),
+                    leader: self.fixture.leaders[0].clone(),
+                    parent: (self.head.context().round.view(), self.head.digest()),
+                },
+                self.head.digest(),
+                Height::new(self.height),
+                self.height,
+                root,
+                crate::UtxoSyncTarget::new(
+                    root,
+                    non_empty_range!(bounds.inactivity_floor, Location::new(bounds.total_size)),
+                ),
+                fresh,
+            );
             self.indexer
                 .ingest_finalized(block.clone(), finalization(&self.fixture, &block))
                 .await
                 .expect("finalized ingest");
+            self.database.finalize(merkleized).await;
             assert_eq!(
                 self.index.apply_finalized(&block),
                 Ok(ApplyOutcome::Applied)
@@ -995,6 +1058,7 @@ mod tests {
             };
             assert_eq!(ready.finalized_height(), snapshot.block().height);
             assert_eq!(ready.settlement().capacity(), FUNDING - OMISSION_BOND);
+            chain.shutdown().await;
         });
     }
 
@@ -1100,6 +1164,7 @@ mod tests {
                 matches!(mounted, SetupProgress::CloseOnly { settled: true, .. }),
                 "journal-only recovery mounts CloseOnly: {mounted:?}",
             );
+            chain.shutdown().await;
         });
     }
 
@@ -1182,6 +1247,7 @@ mod tests {
                     SetupStateError::SubmittedOpenUnresolved
                 ))
             ));
+            chain.shutdown().await;
         });
     }
 
@@ -1233,6 +1299,7 @@ mod tests {
                     .end(),
                 Some(SetupEnd::Aborted(SetupAbort::PaymentFundingSpent)),
             );
+            chain.shutdown().await;
         });
     }
 
@@ -1296,6 +1363,7 @@ mod tests {
                 None,
                 "and it recorded no ending it could not act on",
             );
+            chain.shutdown().await;
         });
     }
 

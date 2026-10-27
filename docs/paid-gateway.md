@@ -1,6 +1,6 @@
 # Paid gateway
 
-`hellas-cli gateway --paid-work-config /srv/hellas/pool.json` sends token-native
+`hellas-cli --passkey owner.key gateway --paid-work-config /srv/hellas/pool.json` sends token-native
 inference to the configured providers and pays through their real funded work
 channels. Each provider has its own endpoint identity, bond, payment funding,
 and client journals. The gateway prefers idle matching providers and matching
@@ -18,6 +18,40 @@ its channel credit, execution and payment policies, expected payment-edge values
 response window, `jobs_per_channel` (default 10), and offer bounds. A stale revision
 or a daily node-key session cannot change it.
 
+For public devnet onboarding, `hellas-cli serve --faucet` selects and retains one
+published faucet owner with the provider identity. It uses the embedded public devnet genesis
+and offline seed-100 trust export; the six relay URLs are transports and supply no
+trust pins. `--work-config` and `--chain-store-dir` still override chain deployment
+and storage. `--faucet-account N` selects a specific account on its first start.
+An existing provider cannot change its saved account with this flag.
+
+Faucet startup bootstraps the normal authority, approves a real HTTP Fetch policy
+through an owner passkey session, and delegates up to three 12-credit coins with
+undelegated change. It records the exact signed owner transaction before submission
+and confirms its inclusion in finalized history. Restarts retain the original
+policy revision/salt and delegation, including when a bond has consumed its output.
+It never takes coins already delegated to another provider sharing that public owner.
+
+Initial defaults are price 20, ten jobs/channel, stake cap 12/client, three open
+offers, a 256-block bond lifetime, 1 MiB signed upload, 64 KiB request body,
+1 MiB output, 1024 output events and 4 MiB spool. The paid Fetch executor stops
+execution after 90 seconds; grant execution keeps its own signed deadline. HTTP
+uses the built-in contract, public-address egress and a caller-supplied SPKI pin.
+No upstream API credential is installed.
+
+Override onboarding with `--paid-price`, `--paid-jobs-per-channel`,
+`--paid-max-stake-per-client`, `--paid-max-open-offers`,
+`--paid-bond-lifetime-blocks`, `--paid-max-upload-bytes` and
+`--paid-execution-timeout-secs`. Price/jobs changes derive exact payment funding
+and omission collateral together. Explicit policy changes are owner-approved;
+plain restarts preserve existing policies and the saved execution timeout. A lower
+stake cap is refused before changing policy if no already-delegated coin fits it;
+use the explicit owner `chain delegate --split` path to reshape unused stake first.
+The initial delegation is a fixed owner budget and is never topped up on restart.
+The saved `<identity>.faucet/admin.json` profile works with the existing passkey
+administration commands. Without a faucet flag, owner approval and delegation
+remain explicit.
+
 The pool selects providers and expected prices. It obtains each policy with
 `RequestOffer`; it does not copy the provider's policy or name a prebuilt bond:
 
@@ -29,8 +63,7 @@ The pool selects providers and expected prices. It obtains each policy with
       "journal_root": "/var/lib/hellas-gateway/provider-a",
       "provider": "PROVIDER_ENDPOINT_ID",
       "provider_addrs": ["192.0.2.10:31145"],
-      "payment": 20,
-      "payment_coins": ["CLIENT_PAYMENT_COIN_HEX"]
+      "payment": 20
     }
   ],
   "acceptance_blocks": 16,
@@ -43,7 +76,19 @@ The pool selects providers and expected prices. It obtains each policy with
 
 `chain_config` contains the chain cross-check, six validator URLs, journal root,
 `poll_ms` and optional `max_observation_age_ms`. It contains no paid policies or
-client routes. The gateway checks that its entries use its executing chain node.
+client routes. The requester and gateway start no chain node. They authenticate
+remote state against independently configured genesis and consensus pins; relay
+URLs supply transport only. `paid-work run` defaults to the embedded devnet trust
+and `wss://devnet.hellas.ai/ws/validator-{0..5}`. Local transport and settlement
+keys are created on first use and retained with the identity.
+
+Use `--passkey owner.key`, `--faucet`, or `--faucet-account N` for channel funding.
+A new channel asks for one owner approval over its exact quoted amount: the
+provider's jobs per channel times its price, plus omission reserve and fees.
+At most four eligible owner coins fund one delegated output; change returns
+undelegated to the same owner. The wallet records the signed reshape before
+submission and shares reservations across gateway providers. Later jobs reuse
+the open channel. `paid-work run --settle` closes it and returns unspent funding.
 
 A request without funding coins returns a quote and writes no paid journal. The
 quote states the canonical channel policy, omission collateral and exact funding.
@@ -266,10 +311,10 @@ reuse. Worker spans report that observed reuse as
 
 The CLI and native hosts use `hellas_sdk::paid_gateway::PaidGateway`. Load
 the same pool file with `load_pool_options(path, assurance)`,
-and pass the resulting typed `PaidGatewayOptions` and a `NodeIdentity` to
-`PaidGateway::open`. Applications can also construct the options directly from
-`PaidWorkOptions`; the pool validates duplicate providers, journals and funding
-before opening any connections. It owns recovery, admission, per-channel
+and pass the resulting typed `PaidGatewayOptions`, a `NodeIdentity`, and an
+`Arc<ClientOwner>` to `PaidGateway::open`. Construct the owner with the passkey
+authenticator, the identity's settlement key and a private funding directory. Applications can also construct the options directly from
+`PaidWorkOptions`; the pool validates duplicate providers and journals before opening connections. It owns recovery, admission, per-channel
 serialization and payment tasks. No CLI argument structures are part of its API.
 
 For transparent HTTP, pass this pool to `hellas_gateway::start_http` using

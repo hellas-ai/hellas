@@ -19,6 +19,59 @@ pub(crate) struct OwnerArgs {
 }
 
 impl OwnerArgs {
+    pub(crate) fn is_faucet(&self) -> bool {
+        self.faucet || self.faucet_account.is_some()
+    }
+
+    pub(crate) fn provider_root(identity: Option<&std::path::Path>) -> anyhow::Result<PathBuf> {
+        let mut path = identity
+            .map(PathBuf::from)
+            .map(Ok)
+            .unwrap_or_else(crate::identity::default_path)?
+            .into_os_string();
+        path.push(".faucet");
+        Ok(PathBuf::from(path))
+    }
+
+    /// Keep the selected public owner with this identity across restarts.
+    pub(crate) fn load_persistent(
+        &self,
+        identity: Option<&std::path::Path>,
+    ) -> anyhow::Result<Option<SoftPasskey>> {
+        if !self.is_faucet() {
+            return self.load();
+        }
+        let root = Self::provider_root(identity)?;
+        hellas_private::create_dir_all_durable(&root)?;
+        let path = root.join("account");
+        if !path.try_exists()? {
+            let index = self
+                .faucet_account
+                .unwrap_or_else(|| rand::random_range(0..100));
+            let temporary = hellas_private::private_tempfile(&root, ".account-", ".new")?;
+            match hellas_sdk::node_control::profile::publish_private(temporary, &path, &[index]) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let bytes = hellas_private::read_bounded_regular_file(&path, 1)?;
+        let [index] = bytes.as_slice() else {
+            anyhow::bail!("invalid saved faucet account");
+        };
+        anyhow::ensure!(
+            self.faucet_account
+                .is_none_or(|requested| requested == *index),
+            "this provider already uses a different faucet account"
+        );
+        let account = faucet_account(*index)?;
+        eprintln!(
+            "devnet faucet account {}: {}",
+            account.index, account.address
+        );
+        Ok(Some(faucet_passkey(&account)?))
+    }
+
     pub(crate) fn load(&self) -> anyhow::Result<Option<SoftPasskey>> {
         let index = self
             .faucet_account

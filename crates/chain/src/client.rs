@@ -14,18 +14,41 @@ use hellas_rpc::{
 use hellas_wire::mux::MuxTransport;
 use std::collections::BTreeSet;
 
+mod objects;
+
 /// Wire-backed light client that connects to a remote validator or relay.
 #[derive(Clone)]
 pub struct RemoteLightClient {
     client: LightClientClientImpl<MuxTransport>,
     verifier: Option<ConsensusVerifier>,
+    finalized_height: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    applied_height: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl RemoteLightClient {
+    pub(crate) fn pinned_network(&self) -> Result<hellas_kernel::NetworkId, QueryError> {
+        self.verifier
+            .as_ref()
+            .map(ConsensusVerifier::network)
+            .ok_or_else(|| QueryError::Remote("a pinned consensus verifier is required".into()))
+    }
+
+    /// Notifications only wake the caller; subsequent reads verify their data.
+    pub async fn subscribe_finalized(
+        &self,
+    ) -> Result<StreamingCall<GetFinalizedBlockResponse>, QueryError> {
+        self.rpc_client()
+            .subscribe_finalized(GetLatestBlockRequest {})
+            .await
+            .map_err(QueryError::from)
+    }
+
     pub fn new(transport: MuxTransport) -> Self {
         Self {
             client: LightClientClientImpl::new(transport),
             verifier: None,
+            finalized_height: Default::default(),
+            applied_height: Default::default(),
         }
     }
 
@@ -39,6 +62,8 @@ impl RemoteLightClient {
     /// Coin and edge records still need state proofs; this authenticates their snapshot only.
     pub fn with_consensus_verifier(mut self, verifier: ConsensusVerifier) -> Self {
         self.verifier = Some(verifier);
+        self.finalized_height = Default::default();
+        self.applied_height = Default::default();
         self
     }
 
@@ -62,6 +87,21 @@ impl RemoteLightClient {
             .await
             .map_err(QueryError::from)
     }
+}
+
+fn record_progress(
+    progress: &std::sync::atomic::AtomicU64,
+    height: u64,
+    latest: bool,
+) -> Result<(), QueryError> {
+    use std::sync::atomic::Ordering;
+    let known = progress.fetch_max(height, Ordering::AcqRel);
+    if latest && height < known {
+        return Err(QueryError::StateUnavailable(format!(
+            "remote tip {height} is behind verified height {known}"
+        )));
+    }
+    Ok(())
 }
 
 async fn connect_transport(addr: &str) -> Result<MuxTransport, QueryError> {
@@ -97,6 +137,23 @@ impl RemoteLightClient {
 }
 
 impl LightClient for RemoteLightClient {
+    async fn get_operations(
+        &self,
+        request: GetOperationsRequest,
+    ) -> Result<GetOperationsResponse, QueryError> {
+        self.rpc_client()
+            .get_operations(request)
+            .await
+            .map_err(QueryError::from)
+    }
+
+    async fn get_objects(
+        &self,
+        keys: Vec<crate::domain::ObjectId>,
+    ) -> Result<Option<crate::light_client::ObjectSnapshot>, QueryError> {
+        objects::read(self, keys).await
+    }
+
     fn get_state_root(&self) -> impl Future<Output = Result<Option<Digest>, QueryError>> + Send {
         let client = self.clone();
         async move {
@@ -204,6 +261,7 @@ impl LightClient for RemoteLightClient {
     fn get_latest_block(
         &self,
     ) -> impl Future<Output = Result<Option<LatestBlock>, QueryError>> + Send {
+        let progress = self.finalized_height.clone();
         let client = self.rpc_client().clone();
         let verifier = self.consensus_verifier().cloned();
         async move {
@@ -214,6 +272,9 @@ impl LightClient for RemoteLightClient {
             let latest = response.latest.map(latest_block_from_proto).transpose()?;
             if let Some(snapshot) = &latest {
                 authenticate_snapshot(&client, snapshot, verifier.as_ref()).await?;
+                if verifier.is_some() {
+                    record_progress(&progress, snapshot.height, true)?;
+                }
             }
             Ok(latest)
         }
@@ -223,6 +284,7 @@ impl LightClient for RemoteLightClient {
         &self,
         query: FinalizedBlockQuery,
     ) -> impl Future<Output = Result<Option<FinalizedBlock>, QueryError>> + Send {
+        let progress = self.finalized_height.clone();
         let client = self.rpc_client().clone();
         let verifier = self.consensus_verifier().cloned();
         async move {
@@ -230,10 +292,61 @@ impl LightClient for RemoteLightClient {
                 .get_finalized_block(finalized_block_query_to_proto(query))
                 .await
                 .map_err(QueryError::from)?;
-            response
+            let block = response
                 .block
                 .map(|block| finalized_block_from_proto(block, verifier.as_ref()))
-                .transpose()
+                .transpose()?;
+            if let Some(block) = &block
+                && verifier.is_some()
+            {
+                record_progress(
+                    &progress,
+                    block.snapshot.height,
+                    matches!(query, FinalizedBlockQuery::Latest),
+                )?;
+            }
+            Ok(block)
+        }
+    }
+
+    fn get_applied_finalized_block(
+        &self,
+        query: FinalizedBlockQuery,
+    ) -> impl Future<Output = Result<Option<FinalizedBlock>, QueryError>> + Send {
+        let progress = self.applied_height.clone();
+        let client = self.rpc_client().clone();
+        let verifier = self.consensus_verifier().cloned();
+        async move {
+            let response = client
+                .get_applied_finalized_block(finalized_block_query_to_proto(query))
+                .await
+                .map_err(QueryError::from)?;
+            let block = response
+                .block
+                .map(|block| finalized_block_from_proto(block, verifier.as_ref()))
+                .transpose()?;
+            if let Some(block) = &block {
+                let matches = match query {
+                    FinalizedBlockQuery::Latest => true,
+                    FinalizedBlockQuery::Height(height) => block.snapshot.height == height,
+                    FinalizedBlockQuery::Payload(payload) => block.snapshot.payload == payload,
+                };
+                if !matches {
+                    return Err(QueryError::Remote(
+                        "applied checkpoint does not answer the requested query".into(),
+                    ));
+                }
+            }
+            if let Some(block) = &block
+                && verifier.is_some()
+            {
+                record_progress(
+                    &progress,
+                    block.snapshot.height,
+                    matches!(query, FinalizedBlockQuery::Latest),
+                )?;
+            }
+            Ok(block)
         }
     }
 

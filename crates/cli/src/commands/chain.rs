@@ -702,38 +702,7 @@ async fn connect_with_verified_snapshots(
     Ok(client.with_consensus_verifier(verifier))
 }
 
-pub(super) fn pinned_consensus_verifier(
-    trust: &hellas_chain::genesis::TrustDocument,
-    genesis_json: &[u8],
-    reported: &hellas_chain::ConsensusInfo,
-) -> CliResult<hellas_chain::ConsensusVerifier> {
-    hellas_chain::proof_verify::ProofVerifier::with_genesis(trust.clone(), genesis_json)?;
-    anyhow::ensure!(
-        trust.epochs.len() == 1
-            && trust.epochs[0].epoch == 0
-            && trust.epochs[0].end_height.is_none(),
-        "RPC snapshot verification requires one open epoch starting at zero"
-    );
-    let genesis: Genesis = serde_json::from_slice(genesis_json)?;
-    let pinned = hellas_chain::ConsensusInfo {
-        network_id: trust.network_id.clone(),
-        threshold_identity: hex::decode(&trust.epochs[0].threshold_identity)?,
-        validators: genesis
-            .validators
-            .iter()
-            .map(|v| v.public_key.clone())
-            .collect(),
-    };
-    anyhow::ensure!(
-        reported.network_id == pinned.network_id
-            && reported.threshold_identity == pinned.threshold_identity,
-        "endpoint consensus identity differs from the authenticated trust document"
-    );
-    Ok(hellas_chain::ConsensusVerifier::new(
-        &pinned,
-        hellas_chain::genesis_digest(&genesis),
-    )?)
-}
+pub(super) use hellas_sdk::client_chain::pinned_consensus_verifier;
 
 /// Resolves the network to sign for, and refuses if the node on the
 /// other end is not on it.

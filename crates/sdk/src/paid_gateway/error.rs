@@ -35,11 +35,6 @@ pub enum PoolError {
         path: PathBuf,
         source: serde_json::Error,
     },
-    #[error("invalid {field}: {source}")]
-    Hex {
-        field: &'static str,
-        source: hex::FromHexError,
-    },
     #[error(transparent)]
     Stopped(#[from] super::RequestStopped),
     #[error(transparent)]

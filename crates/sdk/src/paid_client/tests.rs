@@ -26,10 +26,6 @@ fn insufficient_quoted_collateral_is_rejected_before_a_bond_request_or_journal()
         assurance: Assurance::ProducerSigned,
         apple_trust: None,
         expected_price: policy.payment_policy.fixed_price,
-        payment_funding: Funding::new(
-            hellas_kernel::List::empty(hellas_kernel::CoinId::from_bytes([0; 32])),
-            hellas_kernel::List::empty(hellas_kernel::CoinId::from_bytes([0; 32])),
-        ),
         acceptance_blocks: 300,
         terminal_blocks: 3000,
         payment_blocks: 600,
@@ -424,8 +420,14 @@ async fn client_checks_live_owner_and_own_payout_before_countersigning() {
             ),
             hellas_kernel::List::empty(hellas_kernel::CoinId::from_bytes([0; 32])),
         );
-        let result =
-            propose_client_payment(&mut setup, &authority, &client, payment_funding, terms).await;
+        let result = propose_client_payment(
+            &mut setup,
+            authority.owner().await.unwrap(),
+            &client,
+            payment_funding,
+            terms,
+        )
+        .await;
         if let Some(reason) = refusal {
             assert!(
                 matches!(result, Err(PaidClientError::InputMismatch(actual)) if actual == reason)

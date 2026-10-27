@@ -1,7 +1,6 @@
 use super::{PaidWorkOptions, PoolError, Result};
 use crate::trust_policy::TrustPolicyStore;
 use crate::work_config::load_work_config;
-use hellas_kernel::{CoinId, Funding, List, MAX_PARTY_INPUTS};
 use hellas_rpc::Assurance;
 use iroh::EndpointId;
 use serde::Deserialize;
@@ -36,7 +35,6 @@ impl PaidGatewayOptions {
         }
         let mut journals = BTreeSet::new();
         let mut endpoints = BTreeSet::new();
-        let mut funding = BTreeSet::new();
         for provider in &self.providers {
             provider.validate()?;
             if provider.timeout.is_zero()
@@ -58,22 +56,6 @@ impl PaidGatewayOptions {
             }
             if !endpoints.insert(provider.provider) {
                 return Err(PoolError::DuplicateProvider(provider.provider));
-            }
-            let coins = provider
-                .payment_funding
-                .maker()
-                .iter()
-                .chain(provider.payment_funding.taker().iter())
-                .collect::<Vec<_>>();
-            if coins.is_empty() {
-                return Err(PoolError::Invalid("paid provider needs payment coins"));
-            }
-            for coin in coins {
-                if !funding.insert(*coin) {
-                    return Err(PoolError::Invalid(
-                        "a payment coin cannot fund two provider channels or appear twice",
-                    ));
-                }
             }
         }
         Ok(())
@@ -102,14 +84,6 @@ pub fn load_pool_options(path: &Path, assurance: Assurance) -> Result<PaidGatewa
             if !p.chain_config.is_absolute() {
                 return Err(PoolError::Invalid("chain_config must be absolute"));
             }
-            if p.payment_coins.is_empty() || p.payment_coins.len() > MAX_PARTY_INPUTS {
-                return Err(PoolError::Invalid("payment_coins must name 1 to 4 coins"));
-            }
-            let coins = p
-                .payment_coins
-                .iter()
-                .map(|value| fixed("payment_coins", value).map(CoinId::from_bytes))
-                .collect::<Result<Vec<_>>>()?;
             let config = load_work_config(&p.chain_config)?;
             let apple_trust = match (&file.trust_store, &p.trust_policy) {
                 (Some(directory), Some(id)) if directory.is_absolute() => {
@@ -137,11 +111,6 @@ pub fn load_pool_options(path: &Path, assurance: Assurance) -> Result<PaidGatewa
                 apple_trust,
                 assurance,
                 expected_price: p.payment,
-                payment_funding: Funding::new(
-                    crate::work_config::coin_list(&coins)
-                        .ok_or(PoolError::Invalid("payment_coins must name 1 to 4 coins"))?,
-                    List::empty(CoinId::from_bytes([0; CoinId::LENGTH])),
-                ),
                 acceptance_blocks: file.acceptance_blocks,
                 terminal_blocks: file.terminal_blocks,
                 payment_blocks: file.payment_blocks,
@@ -155,10 +124,6 @@ pub fn load_pool_options(path: &Path, assurance: Assurance) -> Result<PaidGatewa
     };
     options.validate()?;
     Ok(options)
-}
-
-fn fixed<const N: usize>(field: &'static str, value: &str) -> Result<[u8; N]> {
-    hellas_auth::hex::parse(value).map_err(|source| PoolError::Hex { field, source })
 }
 
 #[derive(Deserialize)]
@@ -202,7 +167,6 @@ struct ProviderFile {
     #[serde(default)]
     provider_addrs: Vec<SocketAddr>,
     payment: u64,
-    payment_coins: Vec<String>,
     trust_policy: Option<String>,
 }
 
@@ -211,14 +175,20 @@ mod tests {
     use super::*;
     fn provider() -> serde_json::Value {
         serde_json::json!({"chain_config":"/config/chain.json", "journal_root":"/state/client", "provider":iroh::SecretKey::from_bytes(&[4;32]).public(),
-            "payment":10, "payment_coins":[hex::encode([1;32])]})
+            "payment":10})
     }
     #[test]
     fn software_pool_selects_node_and_price_without_a_policy_or_offer_copy() {
         let entry: ProviderFile = serde_json::from_value(provider()).unwrap();
         assert_eq!(entry.payment, 10);
         assert!(entry.trust_policy.is_none());
-        for field in ["offer", "work_config", "bond", "omission_bond"] {
+        for field in [
+            "offer",
+            "work_config",
+            "bond",
+            "omission_bond",
+            "payment_coins",
+        ] {
             let mut value = provider();
             value[field] = serde_json::json!({});
             assert!(

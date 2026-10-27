@@ -11,9 +11,11 @@ pub(crate) mod offer;
 pub use error::PaidClientError;
 pub use offer::{PaidQuote, request_paid_quote};
 type Result<T, E = PaidClientError> = std::result::Result<T, E>;
+use crate::client_owner::ClientOwner;
 use crate::work_link::WorkLink as ProviderDialer;
+use futures::StreamExt as _;
+use hellas_chain::client::RemoteLightClient;
 use hellas_chain::{FinalizedWorkView as _, WorkBlocks, WorkChannelQuery};
-use hellas_chain::{node::FullNode, rpc::LocalLightClient};
 use hellas_client::work::payment::pay_for_result;
 use hellas_kernel::{
     EdgeId, Funding, MAX_START_VALIDITY_BLOCKS, Secp256k1Signer, Secp256k1Verifier,
@@ -42,6 +44,7 @@ use hellas_work::work_open::{SetupAdvance, SetupProgress};
 use hellas_work::work_store::{Role, SetupScan, SetupStore};
 use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointId, SecretKey};
+use std::sync::Arc;
 
 use crate::work_config::WorkConfig;
 
@@ -55,7 +58,6 @@ pub struct PaidWorkOptions {
     pub assurance: hellas_rpc::Assurance,
     pub apple_trust: Option<hellas_client::ProviderTrustAnchor>,
     pub expected_price: u64,
-    pub payment_funding: Funding,
     pub acceptance_blocks: u64,
     pub terminal_blocks: u64,
     pub payment_blocks: u64,
@@ -65,7 +67,7 @@ pub struct PaidWorkOptions {
 }
 
 impl PaidWorkOptions {
-    /// Reject impossible deadlines and collateral before starting a node or signing.
+    /// Reject impossible deadlines and collateral before connecting or signing.
     pub fn validate(&self) -> Result<()> {
         if !(self.acceptance_blocks > 0 && self.terminal_blocks > 0 && self.payment_blocks > 0) {
             return Err(PaidClientError::InvalidOptions(
@@ -76,10 +78,8 @@ impl PaidWorkOptions {
             return Err(PaidClientError::InvalidOptions("timeout must be positive"));
         }
 
-        if self.expected_price == 0 || !self.payment_funding.taker().is_empty() {
-            return Err(PaidClientError::InvalidOptions(
-                "price must be positive and only the client funds payment",
-            ));
+        if self.expected_price == 0 {
+            return Err(PaidClientError::InvalidOptions("price must be positive"));
         }
         Ok(())
     }
@@ -87,7 +87,7 @@ impl PaidWorkOptions {
 
 async fn propose_client_payment(
     setup: &mut SetupEndpoint,
-    authority: &hellas_work::node::NodeCoordinator,
+    owner: hellas_auth::authority::PrincipalId,
     signer: &Secp256k1Signer,
     funding: Funding,
     terms: WorkPaymentTerms,
@@ -96,18 +96,17 @@ async fn propose_client_payment(
         .state()
         .bundle()
         .ok_or(PaidClientError::MissingState("bond proposal"))?;
-    check_client_party(bundle, authority, signer).await?;
+    check_client_party(bundle, owner, signer)?;
     setup.propose_payment(funding, terms).await?;
     Ok(())
 }
 
-async fn check_client_party(
+fn check_client_party(
     bundle: &hellas_work::model::bundle::WorkChannelSetupBundleV2,
-    authority: &hellas_work::node::NodeCoordinator,
+    owner: hellas_auth::authority::PrincipalId,
     signer: &Secp256k1Signer,
 ) -> Result<()> {
     let party = bundle.bond_terms().parties.taker();
-    let owner = authority.owner().await?;
     if party.owner().to_bytes() != *owner.as_bytes() {
         return Err(PaidClientError::InputMismatch("client coin owner"));
     }
@@ -145,8 +144,7 @@ pub async fn run_paid_work(
     args: PaidWorkRun,
     transport_key: SecretKey,
     settlement_key: Secp256k1Signer,
-    node: FullNode,
-    authority: hellas_work::node::NodeCoordinator,
+    owner: Arc<ClientOwner>,
 ) -> Result<PaidWorkResult> {
     if args.options.timeout.is_zero() {
         return Err(PaidClientError::InvalidOptions("timeout must be positive"));
@@ -159,8 +157,7 @@ pub async fn run_paid_work(
         } = args;
         let endpoint = bind_paid_endpoint(transport_key).await?;
         let mut session =
-            PaidWorkSession::open(options, endpoint.clone(), settlement_key, node, authority)
-                .await?;
+            PaidWorkSession::open(options, endpoint.clone(), settlement_key, owner).await?;
         let mut result = session
             .run(Some(prepared_input), false, None)
             .await?
@@ -219,25 +216,6 @@ pub struct PaidWorkSession {
     client: ClientService,
     observer: Option<tokio::task::JoinHandle<()>>,
     needs_recovery: bool,
-    chain: SessionChain,
-}
-
-enum SessionChain {
-    Node(FullNode),
-    #[cfg(test)]
-    Constructed,
-}
-impl SessionChain {
-    fn ready(&self) -> Result<()> {
-        match self {
-            Self::Node(node) => {
-                node.view()?;
-            }
-            #[cfg(test)]
-            Self::Constructed => {}
-        }
-        Ok(())
-    }
 }
 
 impl Drop for PaidWorkSession {
@@ -253,11 +231,14 @@ fn spawn_observer(
     client: ClientObserver,
     descriptor: WorkChannelDescriptor,
     config: WorkConfig,
-    chain: WorkBlocks<LocalLightClient>,
-    node: FullNode,
+    mut remote: RemoteLightClient,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut finalized = node.finalized();
+        let mut source_config = config.clone();
+        let mut finalized = tokio::time::timeout(config.poll, remote.subscribe_finalized())
+            .await
+            .ok()
+            .and_then(|result| result.ok());
         loop {
             if client
                 .with_state(|state| state.close_settled().is_some())
@@ -266,6 +247,11 @@ fn spawn_observer(
             {
                 break;
             }
+            let Ok(floor) = client.with_state(|state| state.cursor().0).await else {
+                let _ = client.suspend().await;
+                break;
+            };
+            let chain = WorkBlocks::new(remote.clone()).with_min_height(floor);
             let started = hellas_work::work::ObservationTime::now();
             let span = hellas_rpc::request_span!(target: "hellas_request", parent: None, "paid.channel.observe", hellas.channel.role = "client");
             let result = tokio::time::timeout(
@@ -294,10 +280,29 @@ fn spawn_observer(
             if let Err(error) = result {
                 let _ = client.suspend().await;
                 tracing::debug!(%error, "paid client observation unavailable");
+                finalized = None;
+                source_config.validators.rotate_left(1);
+                match crate::client_chain::connect(&source_config, config.max_observation_age).await
+                {
+                    Ok(next) => remote = next,
+                    Err(error) => {
+                        tracing::debug!(%error, "waiting for a verified remote chain source");
+                        tokio::time::sleep(config.poll).await;
+                        continue;
+                    }
+                }
             }
-            tokio::select! {
-                changed = finalized.changed() => if changed.is_err() { break; },
-                _ = tokio::time::sleep(config.poll) => {},
+            if let Some(stream) = &mut finalized {
+                tokio::select! {
+                    item = stream.next() => if !matches!(item, Some(Ok(_))) { finalized = None; },
+                    _ = tokio::time::sleep(config.poll) => {},
+                }
+            } else {
+                tokio::time::sleep(config.poll).await;
+                finalized = tokio::time::timeout(config.poll, remote.subscribe_finalized())
+                    .await
+                    .ok()
+                    .and_then(|result| result.ok());
             }
         }
     })
@@ -323,37 +328,28 @@ impl PaidWorkSession {
         args: PaidWorkOptions,
         endpoint: Endpoint,
         settlement_key: Secp256k1Signer,
-        node: FullNode,
-        authority: hellas_work::node::NodeCoordinator,
+        owner: Arc<ClientOwner>,
     ) -> impl std::future::Future<Output = Result<Self>> {
-        Box::pin(Self::open_inner(
-            args,
-            endpoint,
-            settlement_key,
-            node,
-            authority,
-        ))
+        Box::pin(Self::open_inner(args, endpoint, settlement_key, owner))
     }
 
     async fn open_inner(
         args: PaidWorkOptions,
         endpoint: Endpoint,
         settlement_key: Secp256k1Signer,
-        node: FullNode,
-        authority: hellas_work::node::NodeCoordinator,
+        owner: Arc<ClientOwner>,
     ) -> Result<Self> {
         args.validate()?;
         let config = &args.config;
-        let payment_funding = args.payment_funding.clone();
-        config.check_node(&node)?;
+        config.clone().validate()?;
+        if owner.delegate() != settlement_key.party_key() {
+            return Err(PaidClientError::InvalidOptions(
+                "funding delegate differs from the settlement key",
+            ));
+        }
         let read_timeout = args.timeout.min(hellas_chain::node::RECOVERY_TIMEOUT);
-        let view = tokio::time::timeout(read_timeout, node.wait_ready())
-            .await
-            .map_err(|_| hellas_chain::QueryError::ReadUnavailableTimeout {
-                timeout: read_timeout,
-                reason: "chain node is catching up".into(),
-            })??;
-        let chain = WorkBlocks::new(view.client()).with_read_retry(config.poll, read_timeout);
+        let remote = crate::client_chain::connect(config, read_timeout).await?;
+        let chain = WorkBlocks::new(remote.clone()).with_read_retry(config.poll, read_timeout);
 
         std::fs::create_dir_all(&args.journal_root).map_err(|source| {
             PaidClientError::JournalDirectory {
@@ -364,14 +360,9 @@ impl PaidWorkSession {
         let (store, signed) = match offer::retained_offer(&args, &chain).await? {
             Some(retained) => retained,
             None => {
-                let signed = offer::obtain_offer(
-                    &args,
-                    &endpoint,
-                    &settlement_key,
-                    authority.owner().await?,
-                )
-                .await?;
-                check_client_party(&signed.offer().proposal, &authority, &settlement_key).await?;
+                let signed =
+                    offer::obtain_offer(&args, &endpoint, &settlement_key, &owner, &remote).await?;
+                check_client_party(&signed.offer().proposal, owner.principal(), &settlement_key)?;
                 let store = SetupStore::open(
                     &args.journal_root,
                     config.chain.network,
@@ -384,10 +375,11 @@ impl PaidWorkSession {
             }
         };
         signed.check()?;
+        let payment_funding = signed.offer().payment_funding.clone();
         let policy = signed.offer().policy.clone();
         let omission_bond = signed.offer().omission_bond;
         offer::check_policy(&args, &policy, omission_bond)?;
-        check_client_party(&signed.offer().proposal, &authority, &settlement_key).await?;
+        check_client_party(&signed.offer().proposal, owner.principal(), &settlement_key)?;
         let bond = signed.offer().proposal.bond_edge();
         let trust = hellas_client::selected_provider_trust(
             &signed.offer().provider,
@@ -406,6 +398,9 @@ impl PaidWorkSession {
                 .import_offer(*args.provider.as_bytes(), signed)
                 .await?;
         }
+        owner
+            .claim(config.chain.network, args.provider, &payment_funding)
+            .await?;
         let bundle = setup
             .state()
             .bundle()
@@ -426,17 +421,17 @@ impl PaidWorkSession {
             let terms = payment_terms(config, &policy, &bundle, omission_bond);
             propose_client_payment(
                 &mut setup,
-                &authority,
+                owner.principal(),
                 &settlement_key,
                 payment_funding,
                 terms,
             )
             .await?;
         } else {
-            check_client_party(&bundle, &authority, &settlement_key).await?;
+            check_client_party(&bundle, owner.principal(), &settlement_key)?;
         }
         if setup.state().revision() == Some(2) {
-            exchange_setup(&dialer, &mut setup).await?;
+            exchange_setup(&dialer, &mut setup, config.poll, args.timeout).await?;
         }
         if setup.state().revision() != Some(3) {
             return Err(PaidClientError::MissingState(
@@ -447,6 +442,7 @@ impl PaidWorkSession {
         let setup_service = SetupService::new(setup);
         let (mounted, descriptor) =
             drive_setup(&setup_service, &policy, &chain, config.poll).await?;
+        let chain = chain.with_min_height(mounted.state().cursor().0);
         let started = hellas_work::work::ObservationTime::now();
         let ready = match ready_channel(&descriptor, &chain).await {
             Ok(ready) => Some(ready),
@@ -463,13 +459,11 @@ impl PaidWorkSession {
                 .observe_ready(ready, started, config.max_observation_age)
                 .await?;
         }
-        let chain = WorkBlocks::new(view.client());
         let observer = spawn_observer(
             client.observer(),
             descriptor.clone(),
             config.clone(),
-            chain,
-            node.clone(),
+            remote,
         );
 
         let session = Self {
@@ -480,7 +474,6 @@ impl PaidWorkSession {
             client,
             observer: Some(observer),
             needs_recovery: true,
-            chain: SessionChain::Node(node),
         };
         if initially_ready {
             // A long restart catch-up may outlive the first observation. Wait
@@ -613,7 +606,6 @@ impl PaidWorkSession {
                 Err(hellas_work::work::EndpointError::NotAdmitting.into())
             };
         }
-        self.chain.ready()?;
         let ready = client.readiness().await?;
         if recover && *needs_recovery {
             enum RecoveredJob {
@@ -733,7 +725,6 @@ impl PaidWorkSession {
         }
         let result = match prepared {
             Some(prepared) => {
-                self.chain.ready()?;
                 let ready = client.readiness().await?;
                 Some(
                     execute_paid_job(
@@ -1081,7 +1072,7 @@ fn payment_terms(
 async fn drive_setup(
     setup: &SetupService,
     policy: &ProviderChannelPolicy,
-    chain: &WorkBlocks<LocalLightClient>,
+    chain: &WorkBlocks<RemoteLightClient>,
     poll: Duration,
 ) -> Result<(hellas_work::work_store::ChannelStore, WorkChannelDescriptor)> {
     loop {
@@ -1103,7 +1094,7 @@ async fn drive_setup(
 
 async fn ready_channel(
     descriptor: &WorkChannelDescriptor,
-    chain: &WorkBlocks<LocalLightClient>,
+    chain: &WorkBlocks<RemoteLightClient>,
 ) -> Result<hellas_work::model::setup::ReadyChannel> {
     let query = WorkChannelQuery {
         bond_edge: descriptor.bond_edge(),
@@ -1186,25 +1177,42 @@ pub async fn bind_paid_endpoint(secret_key: SecretKey) -> Result<Endpoint> {
         .map_err(PaidClientError::from)
 }
 
-async fn exchange_setup(dialer: &ProviderDialer, setup: &mut SetupEndpoint) -> Result<()> {
+async fn exchange_setup(
+    dialer: &ProviderDialer,
+    setup: &mut SetupEndpoint,
+    poll: Duration,
+    timeout: Duration,
+) -> Result<()> {
     let request = prepare_setup_exchange(setup);
-    let response = send_setup_exchange(dialer.setup().await?, request).await?;
-    apply_setup_exchange(setup, response).await?;
-    Ok(())
+    tokio::time::timeout(timeout, async {
+        loop {
+            let response = send_setup_exchange(dialer.setup().await?, request.clone()).await?;
+            match apply_setup_exchange(setup, response).await {
+                Err(hellas_work::work_handshake::SetupExchangeError::Refused {
+                    refusal, ..
+                }) if refusal.is_retryable() => tokio::time::sleep(poll).await,
+                result => return Ok(result?),
+            }
+        }
+    })
+    .await
+    .map_err(|_| PaidClientError::Timeout {
+        stage: "setup exchange",
+    })?
 }
 
-async fn finalized_floor(chain: &WorkBlocks<LocalLightClient>) -> Result<SetupScan> {
+async fn finalized_floor(chain: &WorkBlocks<RemoteLightClient>) -> Result<SetupScan> {
     let height = chain
         .latest_height()
         .await?
         .ok_or(PaidClientError::MissingState(
-            "local node has executed no finalized blocks",
+            "remote chain has no finalized blocks",
         ))?;
     let block = chain
         .block_at(height)
         .await?
         .ok_or(PaidClientError::MissingState(
-            "local archive did not return its finalized tip",
+            "remote archive did not return its finalized tip",
         ))?;
     Ok(SetupScan {
         height,
