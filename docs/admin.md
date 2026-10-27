@@ -48,6 +48,11 @@ provider's price, execution limits and automatic-offer bounds. It requires the
 authority owner's passkey session and `work.paid.configure` on the machine
 resource. The node generates the policy salt and retains the original terms
 with each signed offer; changing the standing policy does not alter open channels.
+`serve --paid-work-config FILE` approves a file's policy this way at startup; see
+the [paid gateway guide](paid-gateway.md). The provider runs each Catena job in a
+separate worker process. That isolation is crash/timeout containment, not a
+sandbox, and there is no memory metering. Requesters pay only for a result
+signed by this provider that matches their job; Hellas does not re-run it.
 
 `grant` accepts the
 Auth crate's `GrantCommand` JSON, including its explicit authorization grant and
@@ -147,8 +152,8 @@ an explicit `resource` ID, `account` ID and positive `revision`. Both IDs use Au
 exactly one. `Catalogue` returns the durable configuration through checked inspection.
 Configuration returns only the changed resource ID and revision.
 
-Each Fetch policy carries a required `contract` descriptor alongside its exact
-`allowed_environment` manifest ID. The descriptor selects a compiled request/result
+Each Fetch admission in a resource's `invocation_policy` carries a required
+`contract` descriptor. The descriptor selects a compiled request/result
 schema and commits the adapter, driver and egress terms. For example, the current
 reseller Responses contract is:
 
@@ -429,10 +434,6 @@ policy revisions. The OpenAI `0.0.2` contract preserves verified overruns for se
 the old contract identity is rejected. Input-token budgets remain unsupported for
 these resources until a conservative input bound exists.
 
-Local evaluation uses `gateway --local --local-grant ID` to select an already
-configured allowance with a `local` policy. It never creates an owner grant or
-changes the selected allowance's policy while opening the gateway.
-
 Provisioning uses the client-side `machines --credential-source FILE
 --provider-config FILE create --spec FILE` command, with matching `list` and
 `destroy ID` commands. The provider settings and credential-source formats are
@@ -513,17 +514,14 @@ unmounted; constructing the composed host supplies their implementation.
 
 Caller trust for paid and grant execution is configured separately with `hellas-cli trust`.
 `approve` requires a reviewed policy file, expected revision (zero for creation) and
-reason; `show` reports current pins and latest approval. Paid requests and grant gateways (`--offer` or `--local`) select
+reason; `show` reports current pins and latest approval. Paid requests and grant gateways (`--offer`) select
 `--trust-store` and `--trust-policy`; imported offers cannot replace the approved pins.
 See [paid gateway trust configuration](paid-gateway.md) for the file format and
 replacement procedure. This does not grant provider administration rights.
 
-Approved manifest IDs remain attached to the client session. Refreshed standing may
-change a resource's current policy, but every new job must still use an approved
-execution manifest before its proposal or payload is sent. Review and approve a new
-contract explicitly, then restart the gateway to use the updated caller policy.
+Restart the gateway to use an updated caller policy.
 Nix gateway services use `trustStore`, `trustPolicy`, `workProfile` and the
-principal's `passkey` file, plus `offer` or `local`/`localGrant`.
+principal's `passkey` file, plus `offer`.
 Provision these private files for the service user before startup; Nix declarations
 do not approve trust or create grants.
 

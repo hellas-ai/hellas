@@ -79,14 +79,13 @@ method, headers, binary request body, TLS roots, additional SPKI pins, account
 alias, and response-size ceiling. The result signs HTTP status, headers and
 exact response bytes. No upstream vendor needs to be compiled into Gate.
 
-To sell this interpreter, its manifest is the paid policy's
-`allowed_environment`; its route policy can use:
+To sell this interpreter, admit it in the `[fetch]` section of the provider's
+paid-work config; its route policy can use:
 
-```json
-"open_fetch": {
-  "require_spki_pin": false,
-  "allowed_hosts": []
-}
+```toml
+[fetch.route.OpenFetch]
+require_spki_pin = false
+allowed_hosts = []
 ```
 
 An empty list permits any public host, subject to the operator's independently
@@ -143,9 +142,9 @@ joined at shutdown, including after a journal failure. Provider and gateway
 shutdown return errors after cleanup, so callers must handle the result.
 
 A session serializes its jobs. After cancellation, recover the journal before
-admitting another job. Evaluate supports authenticated incremental token delivery;
-Fetch currently returns a complete bounded response. Fetch journals are
-metadata-only on both endpoints; Evaluate client journals may retain payloads.
+admitting another job. Compute step loops deliver one signed, chained event per
+step; Fetch currently returns a complete bounded response. Fetch journals are
+metadata-only on both endpoints.
 
 Apple App Attest requires a provisioned, signed macOS host. `ProducerSigned`
 verifies the key and transcript but does not attest the binary. These are the
