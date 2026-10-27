@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 #[macro_use]
 extern crate tracing;
 
@@ -279,17 +281,6 @@ enum Commands {
     ///
     /// Every route requires `Authorization: Bearer <token>`. Use
     /// --gateway-profile to select its provisioned Auth authority and credential.
-    /// Hellas routes use the configured causal-LM environment; the shared
-    /// model adapter handles text and tool calls using --tokenizer and
-    /// --chat-template.
-    #[command(
-        mut_arg("environment", |arg| arg
-            .required(false)
-            .required_unless_present_any(["responses_backend", "http_fetch_config", "offer"])
-            .required_if_eq("responses_backend", "hellas")
-            .requires("tokenizer")),
-        mut_arg("tokenizer", |arg| arg.required(false).requires("environment"))
-    )]
     Gateway {
         /// Inference reuse policy; record mode fails requests if cache writes fail.
         #[arg(long, default_value = "off")]
@@ -308,7 +299,7 @@ enum Commands {
         #[arg(long, value_name = "FILE")]
         work_profile: Option<PathBuf>,
         /// Serve exact HTTP routes through paid HTTPS Fetch.
-        #[arg(long, value_name = "FILE", conflicts_with_all = ["responses_backend", "environment"])]
+        #[arg(long, value_name = "FILE", conflicts_with = "responses_backend")]
         #[arg(requires = "paid_work_config")]
         http_fetch_config: Option<PathBuf>,
         /// Request/response archive directory (default: ~/.hellas/gateway-archive).

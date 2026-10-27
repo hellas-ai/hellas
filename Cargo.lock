@@ -2863,7 +2863,6 @@ dependencies = [
  "async-stream",
  "axum",
  "base64 0.23.1",
- "catena-lang",
  "ciborium",
  "clap",
  "commonware-cryptography",
