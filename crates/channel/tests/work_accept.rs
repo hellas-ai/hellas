@@ -79,6 +79,7 @@ async fn store_with(
         settlement,
         role,
         origin(),
+        hellas_store::ContentStore::new(),
         &Secp256k1Verifier::new(),
     )
     .await
@@ -1739,6 +1740,7 @@ async fn an_endpoint_needs_its_own_store_settlement_role_and_key() {
         settlement(),
         Role::Provider,
         other_origin,
+        hellas_store::ContentStore::new(),
         &Secp256k1Verifier::new(),
     )
     .await

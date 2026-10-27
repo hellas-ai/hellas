@@ -483,9 +483,18 @@ pub struct MountedSetup(
     Arc<Mutex<BTreeMap<(PeerId, EdgeId), SetupService>>>,
     AdmissionNode,
     Arc<std::sync::OnceLock<AutomaticOffers>>,
+    hellas_store::ContentStore,
 );
 
 impl MountedSetup {
+    pub(crate) fn with_content_store(content: hellas_store::ContentStore) -> Self {
+        Self(
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            content,
+        )
+    }
     /// Mounts a distinct bond under its authenticated transport peer.
     pub fn mount(
         &self,
@@ -962,7 +971,7 @@ impl WorkRunner {
 
     fn adopt_setup(
         config: &WorkRunnerConfig,
-        store: SetupStore,
+        mut store: SetupStore,
         setup_mount: &MountedSetup,
     ) -> Result<SetupClock, PaidProviderError> {
         let (peer, offer) = store
@@ -977,6 +986,7 @@ impl WorkRunner {
         let peer = PeerId::from_bytes(*peer);
         let bond_edge = offer.offer().proposal.bond_edge();
         let policy = Box::new(offer.offer().policy.clone());
+        store.set_content_store(setup_mount.3.clone());
         let service = SetupService::new(SetupEndpoint::new(
             store,
             config.settlement_key.clone(),
@@ -1141,6 +1151,7 @@ impl WorkRunner {
                     self.setup_mount.0.clone(),
                     self.setup_mount.1.clone(),
                     Default::default(),
+                    self.setup_mount.3.clone(),
                 ),
             }))
             .unwrap_or_else(|_| panic!("offer service already installed"));

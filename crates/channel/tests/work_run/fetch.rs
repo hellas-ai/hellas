@@ -310,6 +310,7 @@ async fn store_for(root: &std::path::Path, ready: &ReadyChannel, role: Role) -> 
         settlement(),
         role,
         origin(),
+        hellas_store::ContentStore::new(),
         &Secp256k1Verifier::new(),
     )
     .await

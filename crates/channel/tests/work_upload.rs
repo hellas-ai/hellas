@@ -226,6 +226,7 @@ async fn unaccepted_compute_payloads_and_atomic_write_debris_are_collected_after
         settlement(),
         Role::Provider,
         origin(),
+        hellas_store::ContentStore::new(),
         &Secp256k1Verifier::new(),
     )
     .await
@@ -254,6 +255,7 @@ async fn unaccepted_compute_payloads_and_atomic_write_debris_are_collected_after
         settlement(),
         Role::Provider,
         origin(),
+        hellas_store::ContentStore::new(),
         &Secp256k1Verifier::new(),
     )
     .await
@@ -269,6 +271,7 @@ async fn unaccepted_compute_payloads_and_atomic_write_debris_are_collected_after
         settlement(),
         Role::Provider,
         origin(),
+        hellas_store::ContentStore::new(),
         &Secp256k1Verifier::new(),
     )
     .await
@@ -305,6 +308,7 @@ async fn a_crash_after_the_expiry_append_collects_payloads_on_reopen() {
         settlement(),
         Role::Provider,
         origin(),
+        hellas_store::ContentStore::new(),
         &Secp256k1Verifier::new(),
     )
     .await
@@ -366,6 +370,7 @@ async fn a_crash_after_the_expiry_append_collects_payloads_on_reopen() {
             settlement(),
             Role::Provider,
             origin(),
+            hellas_store::ContentStore::new(),
             &Secp256k1Verifier::new(),
         )
         .await
@@ -646,7 +651,13 @@ async fn wrong_hash_limits_and_second_proposal_never_publish_or_overwrite_stagin
 fn shared_quota_resume_gc_and_ephemeral_storage_enforce_real_byte_and_disk_bounds() {
     let root = tempfile::tempdir().unwrap();
     let quota = UploadQuota::new(16);
-    let mut first = UploadStore::durable(root.path(), "first", Digest::hash(b"first")).unwrap();
+    let mut first = UploadStore::durable(
+        root.path(),
+        "first",
+        Digest::hash(b"first"),
+        hellas_store::ContentStore::new(),
+    )
+    .unwrap();
     first.set_quota(quota.clone()).unwrap();
     let mut second = UploadStore::memory(Digest::hash(b"second"), quota.clone());
     let bytes = b"0123456789";
@@ -668,7 +679,13 @@ fn shared_quota_resume_gc_and_ephemeral_storage_enforce_real_byte_and_disk_bound
     ));
     let directory = first.directory().unwrap().to_owned();
     drop(first);
-    let mut resumed = UploadStore::durable(root.path(), "first", Digest::hash(b"first")).unwrap();
+    let mut resumed = UploadStore::durable(
+        root.path(),
+        "first",
+        Digest::hash(b"first"),
+        hellas_store::ContentStore::new(),
+    )
+    .unwrap();
     resumed.set_quota(quota).unwrap();
     assert_eq!(
         resumed
@@ -776,6 +793,7 @@ async fn twelve_mib_compute_input_resumes_accepts_reopens_and_reuses_content() {
         settlement(),
         Role::Provider,
         origin(),
+        hellas_store::ContentStore::new(),
         &Secp256k1Verifier::new(),
     )
     .await
@@ -864,22 +882,51 @@ async fn twelve_mib_compute_input_resumes_accepts_reopens_and_reuses_content() {
 #[tokio::test]
 async fn a_paid_unseen_program_requires_its_complete_verified_source_and_asset_closure() {
     use hellas_rpc::protocol::invocation::compute::{Environment, NamedAsset};
-    for fault in ["missing", "corrupt", "none"] {
+    for fault in ["missing", "corrupt", "none", "adopted"] {
         let root = tempfile::tempdir().unwrap();
         let r = ready(work_policy());
         let provider_root = root.path().join("provider");
-        let provider = service(&provider_root, &r).await;
         let source = b"unseen source program bytes";
-        let asset = b"unseen signed program asset bytes";
+        let asset = if fault == "adopted" {
+            vec![0x42; r.invocation_policy().limits.max_upload_bytes as usize + 1]
+        } else {
+            b"unseen signed program asset bytes".to_vec()
+        };
         let environment = Environment {
             sources: vec![object(source)],
             assets: vec![NamedAsset {
                 name: "weights.bin".into(),
-                object: object(asset),
+                object: object(&asset),
             }],
         };
         let manifest = environment.manifest().unwrap();
         let program_root = environment.canonical_bytes().unwrap();
+        let content = hellas_store::ContentStore::new();
+        if fault == "adopted" {
+            for (name, bytes) in [
+                ("environment", program_root.as_slice()),
+                ("source", source.as_slice()),
+                ("asset", asset.as_slice()),
+            ] {
+                let path = root.path().join(name);
+                std::fs::write(&path, bytes).unwrap();
+                content.index(&path).unwrap();
+            }
+        }
+        let mut store = ChannelStore::open(
+            &provider_root,
+            r.channel().clone(),
+            settlement(),
+            Role::Provider,
+            origin(),
+            content.clone(),
+            &Secp256k1Verifier::new(),
+        )
+        .await
+        .unwrap();
+        advance(&mut store, CURSOR).await;
+        let provider =
+            WorkService::new(ProviderEndpoint::new(r.clone(), store, provider()).unwrap());
         let base = bundle(1);
         let mut invocation = base.request;
         invocation.execution_environment = manifest.content_id();
@@ -897,35 +944,43 @@ async fn a_paid_unseen_program_requires_its_complete_verified_source_and_asset_c
             upload.program_root = program_root.clone();
             upload
         };
-        assert!(
-            provider
-                .upload(&upload(object(&bytes), &bytes), &context([3; 32]))
-                .await
-                .unwrap()
-                .refused
-                .is_none()
-        );
-        assert!(
-            provider
-                .upload(&upload(object(source), source), &context([3; 32]))
-                .await
-                .unwrap()
-                .refused
-                .is_none()
-        );
+        let uploaded = provider
+            .upload(&upload(object(&bytes), &bytes), &context([3; 32]))
+            .await
+            .unwrap();
+        assert!(uploaded.refused.is_none(), "{fault}: {uploaded:?}");
+        let source_upload = provider
+            .upload(
+                &upload(
+                    object(source),
+                    if fault == "adopted" { b"" } else { source },
+                ),
+                &context([3; 32]),
+            )
+            .await
+            .unwrap();
+        assert!(source_upload.refused.is_none(), "{source_upload:?}");
+        assert_eq!(source_upload.next_offset, source.len() as u64);
         if fault != "missing" {
-            let mut bytes = asset.to_vec();
+            let mut bytes = if fault == "adopted" {
+                vec![]
+            } else {
+                asset.to_vec()
+            };
             if fault == "corrupt" {
                 bytes[0] ^= 1;
             }
             let response = provider
-                .upload(&upload(object(asset), &bytes), &context([3; 32]))
+                .upload(&upload(object(&asset), &bytes), &context([3; 32]))
                 .await
                 .unwrap();
             assert_eq!(response.refused.is_some(), fault == "corrupt");
+            if fault == "adopted" {
+                assert_eq!(response.next_offset, asset.len() as u64);
+            }
         }
         let response = provider.accept(&request).await;
-        if fault != "none" {
+        if matches!(fault, "missing" | "corrupt") {
             assert!(matches!(
                 response.outcome,
                 Some(accept_work_response::Outcome::Refused(_))
@@ -943,7 +998,21 @@ async fn a_paid_unseen_program_requires_its_complete_verified_source_and_asset_c
                 Some(accept_work_response::Outcome::Accepted(_))
             ));
             drop(provider);
-            let reopened = service(&provider_root, &r).await;
+            let mut store = ChannelStore::open(
+                &provider_root,
+                r.channel().clone(),
+                settlement(),
+                Role::Provider,
+                origin(),
+                content,
+                &Secp256k1Verifier::new(),
+            )
+            .await
+            .unwrap();
+            advance(&mut store, CURSOR).await;
+            let reopened = WorkService::new(
+                ProviderEndpoint::new(r.clone(), store, self::provider()).unwrap(),
+            );
             let authorization = PaidJobAuthorizationV2::decode(&request.authorization).unwrap();
             let id = work_id(r.channel(), &authorization);
             let hellas_channel::work::RunAdmission::Invoke(input) =

@@ -502,6 +502,7 @@ pub async fn store_at(
         settlement(),
         role,
         origin(),
+        hellas_store::ContentStore::new(),
         &Secp256k1Verifier::new(),
     )
     .await

@@ -1416,6 +1416,7 @@ async fn open_channel(root: &Path) -> ChannelStore {
         settlement(),
         Role::Provider,
         origin(),
+        hellas_store::ContentStore::new(),
         &Secp256k1Verifier::new(),
     )
     .await

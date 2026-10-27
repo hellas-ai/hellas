@@ -440,6 +440,7 @@ where
         None => None,
     };
     let signer = config.executor.producer_key.clone();
+    let content = config.executor.content_store.clone();
     let handle = Executor::spawn_configured(config.executor).await?;
     let remote_control = prepared_grants
         .as_ref()
@@ -451,7 +452,7 @@ where
         remote_control.enabled(),
     );
     let work_mount = MountedWork::with_backend(handle.clone());
-    let setup_mount = MountedSetup::default();
+    let setup_mount = MountedSetup::with_content_store(content);
     let chain = config.work.as_ref().map(|(_, chain)| chain.clone());
     let runner = match config.work {
         Some((work, chain)) => Some(

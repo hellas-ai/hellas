@@ -7,6 +7,7 @@ pub struct SetupStore {
     root: PathBuf,
     journal: Journal,
     state: SetupState,
+    content: hellas_store::ContentStore,
 }
 
 impl SetupStore {
@@ -51,7 +52,16 @@ impl SetupStore {
             root: root.to_path_buf(),
             journal,
             state,
+            content: hellas_store::ContentStore::new(),
         })
+    }
+
+    pub fn set_content_store(&mut self, content: hellas_store::ContentStore) {
+        self.content = content;
+    }
+
+    pub(crate) fn content_store(&self) -> hellas_store::ContentStore {
+        self.content.clone()
     }
 
     /// Returns what the handshake has durably reached.

@@ -494,6 +494,7 @@ mod tests {
             fixture::settlement(),
             Role::Provider,
             fixture::origin(),
+            hellas_store::ContentStore::new(),
             &Secp256k1Verifier::new(),
         )
         .await

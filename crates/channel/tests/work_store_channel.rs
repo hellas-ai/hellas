@@ -115,6 +115,7 @@ async fn open_on(root: &std::path::Path, channel: PaidChannel, role: Role) -> Ch
         settlement(),
         role,
         origin,
+        hellas_store::ContentStore::new(),
         &Secp256k1Verifier::new(),
     )
     .await
@@ -389,6 +390,7 @@ async fn open_metadata(root: &std::path::Path) -> ChannelStore {
         settlement(),
         Role::Provider,
         origin_of(&channel()),
+        hellas_store::ContentStore::new(),
         &Secp256k1Verifier::new(),
     )
     .await
@@ -928,6 +930,7 @@ async fn a_store_opens_anchored_at_the_channels_origin() {
             payload: payload_at(RECEIPT_HEIGHT - 1),
             parent: payload_at(RECEIPT_HEIGHT - 2),
         },
+        hellas_store::ContentStore::new(),
         &Secp256k1Verifier::new(),
     )
     .await
@@ -1836,6 +1839,7 @@ async fn a_second_process_cannot_hold_the_same_channel() {
         settlement(),
         Role::Provider,
         origin_of(&channel()),
+        hellas_store::ContentStore::new(),
         &Secp256k1Verifier::new(),
     )
     .await
@@ -2169,6 +2173,7 @@ async fn replay_checks_the_signatures_again() {
             settlement(),
             Role::Provider,
             origin_of(&channel),
+            hellas_store::ContentStore::new(),
             &AcceptAll,
         )
         .await
@@ -2185,6 +2190,7 @@ async fn replay_checks_the_signatures_again() {
         settlement(),
         Role::Provider,
         origin_of(&channel),
+        hellas_store::ContentStore::new(),
         &Secp256k1Verifier::new(),
     )
     .await
@@ -2339,6 +2345,7 @@ async fn inputs_swapped_on_the_disk_are_not_a_job_to_execute() {
             settlement(),
             Role::Provider,
             origin_of(&channel),
+            hellas_store::ContentStore::new(),
             &Secp256k1Verifier::new(),
         )
         .await;
@@ -2968,6 +2975,7 @@ async fn invalid_pending_proposals_are_rejected_at_checkpoint_replay() {
                 settlement(),
                 role,
                 origin_of(&channel),
+                hellas_store::ContentStore::new(),
                 &verifier
             )
             .await,

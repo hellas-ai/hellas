@@ -3198,6 +3198,7 @@ async fn close_only_store(root: &std::path::Path, height: u64) -> ChannelStore {
         settlement(),
         Role::Provider,
         origin(),
+        hellas_store::ContentStore::new(),
         &Secp256k1Verifier::new(),
     )
     .await

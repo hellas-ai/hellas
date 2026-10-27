@@ -45,6 +45,7 @@ impl ChannelStore {
         settlement: WorkPaymentSettlement,
         role: Role,
         origin: SetupOrigin,
+        content: hellas_store::ContentStore,
         verifier: &V,
     ) -> Result<Self, WorkStoreError> {
         if origin.payment_edge != channel.payment_edge() {
@@ -66,7 +67,7 @@ impl ChannelStore {
             },
         )
         .await?;
-        let mut uploads = crate::content::UploadStore::durable(root, &stem, channel.id())?;
+        let mut uploads = crate::content::UploadStore::durable(root, &stem, channel.id(), content)?;
         let mut state = match &replay.checkpoint {
             Some(bytes) => Channel::from_checkpoint(bytes, channel, settlement, role, verifier)?,
             None => Channel::new(channel, settlement, role, origin),
