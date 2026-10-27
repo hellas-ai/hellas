@@ -6,7 +6,7 @@
 //! assertions are about the second process — never about what the first
 //! one intended.
 
-use hellas_work::test_support::paid::{
+use hellas_work::test_support::channel::{
     client, identity_artifact, manifest, network, payload_at, prompt_tokens, provider,
     text_execution, text_policy, transcript_for as transcript_of,
 };
@@ -14,12 +14,12 @@ use hellas_work::test_support::paid::{
 use hellas_auth::Digest;
 use hellas_auth::PublicKey;
 use hellas_kernel::{
-    BlockHeight, EarnedCertificate, EdgeId, EdgeValues, Encode as _, Fees, List, MAX_EDGE_OUTPUTS,
-    Parties, Party, PartyAuth, PartyKeys, PayloadHash, Payout, Secp256k1Verifier, Sig, TermsHash,
+    BlockHeight, EarnedCertificate, EdgeId, EdgeValues, Encode as _, Fees, Parties, Party,
+    PartyAuth, PartyKeys, PayloadHash, Payout, Secp256k1Verifier, Sig, TermsHash,
     WorkPaymentSettlement, WorkPaymentTerms, WorkStakeBondTerms, work_payment_settlement,
 };
 use hellas_rpc::protocol::artifacts::InputAddressed as _;
-use hellas_rpc::{Assurance, Evaluate, EvaluateRequest, OutputEventEnvelope};
+use hellas_rpc::{Evaluate, EvaluateRequest, OutputEventEnvelope};
 use hellas_work::model::prepared_input::PreparedPaidInputV1;
 use hellas_work::model::work::{
     PaidChannel, PaidChannelPolicyV1, PaidJobAuthorizationV2, PaidJobResultV1, PaidWorkError,
@@ -54,36 +54,30 @@ fn channel_policy() -> PaidChannelPolicyV1 {
 }
 
 const fn limits(compute: u64, delivery: u64) -> PaidChannelPolicyV1 {
-    PaidChannelPolicyV1 {
-        compute_credit_limit: compute,
-        delivery_credit_limit: delivery,
-    }
+    hellas_work::test_support::channel::credit_policy(compute, delivery)
 }
 
 fn bond_terms() -> WorkStakeBondTerms {
-    WorkStakeBondTerms {
-        parties: Parties::new(
+    hellas_work::test_support::channel::bond_terms_for(
+        Parties::new(
             PartyKeys::sole(provider().party_key()),
             PartyKeys::sole(client().party_key()),
         ),
-        timeout: BlockHeight::new(HORIZON),
-        timeout_outputs: List::take(
-            [Payout::new(provider().party_key(), 64); MAX_EDGE_OUTPUTS],
-            1,
-        ),
-        max_job_price: 40,
-    }
+        BlockHeight::new(HORIZON),
+        Payout::new(provider().party_key(), 64),
+        40,
+    )
 }
 
 fn terms_for(policy: PaidChannelPolicyV1) -> WorkPaymentTerms {
-    WorkPaymentTerms {
-        bond_edge: EdgeId::from_bytes([0xb0; 32]),
-        bond_terms: bond_terms(),
-        private_policy_commitment: private_policy_commitment(network(), &SALT, &policy),
-        omit_response_blocks: hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
-        start_validity_blocks: 8,
-        omission_bond: OMISSION_BOND,
-    }
+    hellas_work::test_support::channel::payment_terms_for(
+        EdgeId::from_bytes([0xb0; 32]),
+        bond_terms(),
+        private_policy_commitment(network(), &SALT, &policy),
+        hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
+        8,
+        OMISSION_BOND,
+    )
 }
 
 fn channel_on(payment_edge: EdgeId) -> PaidChannel {
@@ -156,14 +150,12 @@ fn payload(digest: Digest) -> PayloadHash {
 fn evaluate_request(nonce: u64) -> EvaluateRequest {
     let mut bytes = [0x77; 32];
     bytes[..8].copy_from_slice(&nonce.to_be_bytes());
-    EvaluateRequest {
-        text_execution: text_execution().input_id().digest(),
-        runner_public_key: PublicKey::Secp256k1(client().party_key().to_bytes()),
-        execution_environment: manifest().content_id(),
-        nonce: bytes,
-        assurance: Assurance::ProducerSigned,
-        retain: true,
-    }
+    hellas_work::test_support::channel::evaluate_request_for(
+        text_execution().input_id().digest(),
+        PublicKey::Secp256k1(client().party_key().to_bytes()),
+        manifest().content_id(),
+        bytes,
+    )
 }
 
 fn bundle(nonce: u64) -> PreparedPaidInputV1 {

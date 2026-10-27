@@ -11,7 +11,7 @@ use hellas_kernel::{
     WorkStakeBondTerms,
 };
 use hellas_work::model::bundle::{SetupBundleError, WorkChannelSetupBundleV2};
-use hellas_work::test_support::paid::{client, provider};
+use hellas_work::test_support::channel::{client, provider};
 
 const HORIZON: u64 = 500;
 const STAKE: u64 = 64;
@@ -36,18 +36,15 @@ fn empty_coins() -> List<CoinId, MAX_PARTY_INPUTS> {
 }
 
 fn bond_terms() -> WorkStakeBondTerms {
-    WorkStakeBondTerms {
-        parties: Parties::new(
+    hellas_work::test_support::channel::bond_terms_for(
+        Parties::new(
             PartyKeys::sole(provider().party_key()),
             PartyKeys::sole(client().party_key()),
         ),
-        timeout: BlockHeight::new(HORIZON),
-        timeout_outputs: List::take(
-            [Payout::new(provider().party_key(), STAKE); MAX_EDGE_OUTPUTS],
-            1,
-        ),
-        max_job_price: 40,
-    }
+        BlockHeight::new(HORIZON),
+        Payout::new(provider().party_key(), STAKE),
+        40,
+    )
 }
 
 /// The provider's stake funding: its own coins, none of the client's.

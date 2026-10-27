@@ -14,8 +14,7 @@ use hellas_client::work::reproduce::{
     ReproduceFault, Reproduced, Reproducer, Reproduction, ReproductionRequest, plan, reproduce,
 };
 use hellas_kernel::{
-    BlockHeight, EdgeId, List, MAX_EDGE_OUTPUTS, NetworkId, Parties, PartyKeys, Payout,
-    Secp256k1Signer, WorkPaymentTerms, WorkStakeBondTerms,
+    BlockHeight, EdgeId, NetworkId, Parties, PartyKeys, Payout, Secp256k1Signer, WorkPaymentTerms,
 };
 use hellas_rpc::evaluate::{
     EvaluateOutputTranscriptBuilder, EvaluateStopReason, EvaluateTerminal, EvaluateUsage,
@@ -26,7 +25,7 @@ use hellas_rpc::protocol::artifacts::{
     TextExecutionId, TextPolicy, TokenIds, completed_text,
 };
 use hellas_rpc::{
-    Application, Assurance, CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR, ContentId, EvaluateRequest,
+    Application, CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR, ContentId, EvaluateRequest,
     OutputEventEnvelope, ProgramManifest,
 };
 use hellas_work::model::prepared_input::PreparedPaidInputV1;
@@ -78,32 +77,26 @@ fn provider_producer() -> ProducerSigningKey {
 }
 
 fn channel_policy() -> PaidChannelPolicyV1 {
-    PaidChannelPolicyV1 {
-        compute_credit_limit: 100,
-        delivery_credit_limit: 100,
-    }
+    hellas_work::test_support::channel::credit_policy(100, 100)
 }
 
 fn payment_terms() -> WorkPaymentTerms {
-    WorkPaymentTerms {
-        bond_edge: EdgeId::from_bytes([0x11; 32]),
-        bond_terms: WorkStakeBondTerms {
-            parties: Parties::new(
+    hellas_work::test_support::channel::payment_terms_for(
+        EdgeId::from_bytes([0x11; 32]),
+        hellas_work::test_support::channel::bond_terms_for(
+            Parties::new(
                 PartyKeys::sole(provider().party_key()),
                 PartyKeys::sole(client().party_key()),
             ),
-            timeout: BlockHeight::new(HORIZON),
-            timeout_outputs: List::take(
-                [Payout::new(provider().party_key(), 64); MAX_EDGE_OUTPUTS],
-                1,
-            ),
-            max_job_price: 40,
-        },
-        private_policy_commitment: private_policy_commitment(network(), &SALT, &channel_policy()),
-        omit_response_blocks: hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
-        start_validity_blocks: 8,
-        omission_bond: 4,
-    }
+            BlockHeight::new(HORIZON),
+            Payout::new(provider().party_key(), 64),
+            40,
+        ),
+        private_policy_commitment(network(), &SALT, &channel_policy()),
+        hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
+        8,
+        4,
+    )
 }
 
 fn channel() -> PaidChannel {
@@ -144,14 +137,12 @@ fn text_execution() -> TextExecution {
 }
 
 fn evaluate_request() -> EvaluateRequest {
-    EvaluateRequest {
-        text_execution: text_execution().input_id().digest(),
-        runner_public_key: PublicKey::Secp256k1(client().party_key().to_bytes()),
-        execution_environment: manifest().content_id(),
-        nonce: [0x33; 32],
-        assurance: Assurance::ProducerSigned,
-        retain: true,
-    }
+    hellas_work::test_support::channel::evaluate_request_for(
+        text_execution().input_id().digest(),
+        PublicKey::Secp256k1(client().party_key().to_bytes()),
+        manifest().content_id(),
+        [0x33; 32],
+    )
 }
 
 fn bundle() -> PreparedPaidInputV1 {
@@ -166,28 +157,21 @@ fn bundle() -> PreparedPaidInputV1 {
 }
 
 fn work_policy() -> EvaluatePolicyV2 {
-    EvaluatePolicyV2 {
-        allowed_environment: manifest().content_id(),
-        generation_policy_digest: match generation_policy_digest(
+    hellas_work::test_support::channel::evaluate_policy(
+        manifest().content_id(),
+        match generation_policy_digest(
             &hellas_rpc::protocol::artifacts::Canonical::canonical_bytes(&text_policy()),
         ) {
             Ok(digest) => digest,
             Err(error) => panic!("the fixture policy hashes: {error}"),
         },
-        identity_source_digest: match identity_source_digest(
+        match identity_source_digest(
             &hellas_rpc::protocol::artifacts::Canonical::canonical_bytes(&identity_artifact()),
         ) {
             Ok(digest) => digest,
             Err(error) => panic!("the fixture identity hashes: {error}"),
         },
-        max_prompt_tokens: 512,
-        max_new_tokens: 128,
-        max_stop_token_ids: 4,
-        max_spool_bytes: 1_048_576,
-        max_encoded_result_frame: 262_144,
-        max_encoded_prepared_input: 1_048_576,
-        max_upload_bytes: 1_048_576,
-    }
+    )
 }
 
 fn authorization() -> PaidJobAuthorizationV2 {

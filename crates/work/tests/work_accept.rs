@@ -35,7 +35,7 @@ use hellas_work::model::work::{
     JobDeadlines, PaidChannel, PaidJobAuthorizationV2, PrivateRecord as _, prepared_input_digest,
     propose_authorization, signing_hash, work_id, work_policy_digest,
 };
-use hellas_work::test_support::paid::{
+use hellas_work::test_support::channel::{
     CURSOR, OMISSION_BOND, PAYMENT_RESERVE, PAYMENT_VALUE, PRICE, SALT, advance, bond_edge,
     bond_object, bundle, bundle_bytes, channel_policy, client, deadlines, descriptor,
     descriptor_with as descriptor_with_policy, evaluate_request, identity_artifact, lease_over,
@@ -43,7 +43,7 @@ use hellas_work::test_support::paid::{
     payment_terms, prompt_tokens, provider, settlement, signer, text_execution, text_policy,
     work_policy,
 };
-use hellas_work::test_support::paid::{accept_uploaded, accept_uploaded_service};
+use hellas_work::test_support::channel::{accept_uploaded, accept_uploaded_service};
 use hellas_work::work::{
     ClientEndpoint, CloseEndpoint, EndpointError, JobProposal, ProposeError, ProviderEndpoint,
     WorkRefusal, WorkService, propose_work,

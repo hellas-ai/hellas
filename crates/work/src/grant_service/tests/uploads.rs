@@ -160,7 +160,7 @@ async fn an_idle_partial_grant_upload_expires_without_another_request_or_mutatio
 #[tokio::test]
 async fn grant_and_paid_handlers_share_quota_and_drain_releases_ephemeral_staging() {
     use crate::model::setup::ObservedChannel;
-    use crate::test_support::paid;
+    use crate::test_support::channel as paid;
     use crate::work::{ProviderEndpoint, WorkService};
     let root = tempfile::tempdir().unwrap();
     let paid_bytes = paid::bundle_bytes(1);

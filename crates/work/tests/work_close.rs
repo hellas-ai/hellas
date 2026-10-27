@@ -14,7 +14,8 @@
 //! before it sends, what it refuses once it has, and what its watcher
 //! does with the blocks that come back.
 
-use std::sync::Arc;
+use hellas_work::test_support::channel::NONCE;
+use hellas_work::test_support::transport::transport_pair;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use support::temp;
 
@@ -23,27 +24,22 @@ use hellas_kernel::{
     Edge, EdgeId, LeaseSlots, List, MAX_EDGE_OUTPUTS, Party, PartyAuth, PaymentCloseStart, Payout,
     PendingSlot, RegistryChunk, RegistryNamespace, RegistryRecordTag, Secp256k1Verifier, Terms,
 };
-use hellas_rpc::OutputEventEnvelope;
 use hellas_rpc::observe::Samples;
 use hellas_rpc::pb::work::{
     AcceptWorkRequest, WorkRefusalCode, accept_work_response::Outcome as AcceptOutcome,
 };
-use hellas_rpc::services::work::{WorkClientImpl, WorkServer};
-use hellas_wire::mux::MuxTransport;
-use hellas_wire::{Dispatcher, StreamTransport};
+use hellas_rpc::services::work::WorkClientImpl;
 use hellas_work::model::setup::{ObservedChannel, ReadyChannel, WorkSetupError};
-use hellas_work::model::work::{
-    PaidJobAuthorizationV2, PrivateRecord as _, propose_authorization, signing_hash, work_id,
-};
-use hellas_work::test_support::paid::{
+use hellas_work::model::work::{PrivateRecord as _, propose_authorization, signing_hash, work_id};
+use hellas_work::test_support::channel::{
     CURSOR, HORIZON, OMISSION_BOND, PRICE, SALT, advance, bond_edge, bond_object, bundle,
     channel_policy, client, commit, deadlines, descriptor, lease_over, network, origin, payload_at,
     payment_edge, payment_object, payment_policy, payment_terms, provider, settlement, signer,
-    store_at, transcript_for, work_policy,
+    store_at, work_policy,
 };
 use hellas_work::work::{
-    BackendFault, ClientEndpoint, CloseEndpoint, PaymentError, ProviderEndpoint, RunOutcome,
-    WorkBackend, WorkService, admit_payment, fetch_result, run_accepted_work,
+    ClientEndpoint, CloseEndpoint, PaymentError, ProviderEndpoint, WorkService, admit_payment,
+    fetch_result,
 };
 use hellas_work::work_close::{
     BlockSourceError, CatchUpError, CloseError, CloseProgress, FinalizedBlocks, FinalizedWork,
@@ -55,212 +51,9 @@ use hellas_work::work_store::{
 
 mod support;
 
-/// The one proposal nonce every job in this file carries.
-const NONCE: u8 = 1;
-
-// ── Fixture ───────────────────────────────────────────────────────────
-
-/// The channel, ready at the height both endpoints have processed
-/// through.
-fn ready() -> ReadyChannel {
-    let bond = bond_object();
-    let payment = payment_object();
-    let observed = ObservedChannel {
-        height: CURSOR,
-        bond: Some(&bond),
-        payment: Some(&payment),
-        lease: lease_over(bond_edge(), payment_edge()),
-        pending: PendingSlot::Absent,
-    };
-    match descriptor().check_ready(&observed) {
-        Ok(ready) => ready,
-        Err(error) => panic!("the fixture channel is ready: {error}"),
-    }
-}
-
-// ── The prepared inputs a job executes from ───────────────────────────
-
-fn authorization() -> PaidJobAuthorizationV2 {
-    match propose_authorization(
-        ready().channel(),
-        &work_policy(),
-        &payment_policy(),
-        &bundle(NONCE),
-        u64::from(NONCE),
-        deadlines(),
-    ) {
-        Ok(authorization) => authorization,
-        Err(error) => panic!("the fixture authorization builds: {error}"),
-    }
-}
-
-/// Puts one accepted job on both journals, and returns its `work_id`.
-///
-/// The acceptance exchange has its own file; these tests are about what
-/// happens after both signatures exist.
-async fn accept(stores: &mut [&mut ChannelStore]) -> Digest {
-    let authorization = authorization();
-    let ready = ready();
-    let id = work_id(ready.channel(), &authorization);
-    let Ok(prepared_input) = bundle(NONCE).encode() else {
-        panic!("the fixture bundle encodes");
-    };
-    for store in stores {
-        commit(
-            store,
-            ChannelRecord::JobProposed {
-                authorization,
-                client_signature: client().sign(signing_hash(id)),
-                prepared_input: prepared_input.clone(),
-            },
-        )
-        .await;
-        commit(
-            store,
-            ChannelRecord::JobAccepted {
-                work_id: id,
-                provider_signature: provider().sign(signing_hash(id)),
-            },
-        )
-        .await;
-    }
-    id
-}
-
-// ── Transcripts and the backend that produces them ────────────────────
-
-const ANSWER: [u32; 5] = [101, 102, 103, 104, 105];
-
-/// A backend that counts its calls and signs the fixture answer.
-struct AnsweringBackend {
-    calls: Arc<AtomicUsize>,
-}
-
-impl AnsweringBackend {
-    fn new() -> Self {
-        Self {
-            calls: Arc::new(AtomicUsize::new(0)),
-        }
-    }
-}
-
-impl WorkBackend for AnsweringBackend {
-    fn try_admit(
-        &self,
-        domain: hellas_work::work::admission::CapacityDomain,
-    ) -> Result<hellas_work::work::admission::WorkPermit, BackendFault> {
-        Err(hellas_work::work::admission::AdmissionError::Unsupported(domain).into())
-    }
-
-    async fn execute(
-        &self,
-        prepared: hellas_work::work::PreparedWorkInput,
-    ) -> Result<Vec<OutputEventEnvelope>, BackendFault> {
-        let hellas_work::work::PreparedWorkInput::Evaluate(input) = prepared else {
-            return Err(hellas_work::work::admission::AdmissionError::Unsupported(
-                hellas_work::work::admission::CapacityDomain::Fetch,
-            )
-            .into());
-        };
-        let input = *input;
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        let produced = transcript_for(input.evaluate_request(), &ANSWER);
-        Ok(produced)
-    }
-}
-
-/// Runs one accepted job to a signed, durable result.
-async fn run_to_result(service: &WorkService, ready: &ReadyChannel, id: Digest) {
-    let backend = AnsweringBackend::new();
-    let outcome = run_accepted_work(service, ready, &backend, id).await;
-    assert!(
-        matches!(outcome, Ok(RunOutcome::Completed { .. })),
-        "the fixture job completes: {outcome:?}",
-    );
-}
-
-// ── Transport plumbing ────────────────────────────────────────────────
-
-use hellas_work::test_support::transport;
-use transport::transport_pair;
-
-/// Stops one serving task and waits for it to be gone.
-///
-/// Awaited rather than merely cancelled: the task holds a handle to the
-/// provider's endpoint, and a test that reopens that journal from its
-/// files needs the process to have actually let go of it.
-async fn stop(serving: tokio::task::JoinHandle<()>) {
-    serving.abort();
-    let _ = serving.await;
-}
-
-fn serve(transport: MuxTransport, service: WorkService) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let server = WorkServer(service);
-        while let Ok(Some(inbound)) = transport.accept().await {
-            let _ = Dispatcher::<MuxTransport>::dispatch(&server, inbound).await;
-        }
-    })
-}
-
-// ── Canonical chain objects, spelled out ──────────────────────────────
-
-// ── The state this phase begins from ──────────────────────────────────
-
-/// One job, accepted, computed, delivered and independently checked.
-///
-/// Everything before the invoice, driven exactly as the earlier phases
-/// drive it, because a payment for a job that reached this state any
-/// other way would be a payment for something these tests invented.
-struct Checked {
-    client_root: tempfile::TempDir,
-    provider_root: tempfile::TempDir,
-    ready: ReadyChannel,
-    service: WorkService,
-    client: ClientEndpoint,
-    id: Digest,
-}
-
-async fn checked_job() -> Checked {
-    let client_root = temp();
-    let provider_root = temp();
-    let ready = ready();
-    let mut client_store = store_at(client_root.path(), &ready, Role::Client, CURSOR).await;
-    let mut provider_store = store_at(provider_root.path(), &ready, Role::Provider, CURSOR).await;
-    let id = accept(&mut [&mut client_store, &mut provider_store]).await;
-
-    let Ok(provider_endpoint) = ProviderEndpoint::new(ready.clone(), provider_store, provider())
-    else {
-        panic!("the provider endpoint binds");
-    };
-    let service = WorkService::new(provider_endpoint);
-    let Ok(mut client) = ClientEndpoint::new(ready.clone(), client_store, client()) else {
-        panic!("the client endpoint binds");
-    };
-    run_to_result(&service, &ready, id).await;
-
-    let (transport, server) = transport_pair();
-    let serving = serve(server, service.clone());
-    let delivered = fetch_result(transport, &mut client, &ready, id).await;
-    stop(serving).await;
-    if let Err(error) = delivered {
-        panic!("the fixture delivery completes: {error}");
-    }
-    // The oracle is `hellas-client`'s; what this file needs is the
-    // durable verdict it records, which is the only phase an honest
-    // client's journal signs a certificate from.
-    if let Err(error) = client.matched(id).await {
-        panic!("the fixture verdict records: {error}");
-    }
-    Checked {
-        client_root,
-        provider_root,
-        ready,
-        service,
-        client,
-        id,
-    }
-}
+use hellas_work::test_support::channel::{
+    Checked, accept, authorization, checked_job, ready, run_to_result, serve_work as serve, stop,
+};
 
 // ── Driving the two calls ─────────────────────────────────────────────
 
@@ -3710,7 +3503,7 @@ async fn a_close_only_service_admits_work_only_once_a_readiness_arrives() {
         .await
         .expect("a fresh readiness for this journal's own channel is taken");
 
-    match hellas_work::test_support::paid::accept_uploaded_service(
+    match hellas_work::test_support::channel::accept_uploaded_service(
         &service,
         &signed_request(NONCE, 1),
     )

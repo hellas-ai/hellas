@@ -34,7 +34,7 @@ use hellas_work::model::work::{
     generation_policy_digest, identity_source_digest, next_payment, payment_binding_digest,
     prepared_input_digest, private_policy_commitment, result_digest, work_id, work_policy_digest,
 };
-use hellas_work::test_support::paid::{
+use hellas_work::test_support::channel::{
     identity_artifact, manifest, prompt_tokens, text_execution, text_policy,
 };
 

@@ -432,15 +432,13 @@ mod tests {
     use hellas_auth::Digest as ProtocolDigest;
     use hellas_kernel::{
         BlockHash, BlockHeight, CoinId, Context as KernelContext, EdgeId, EdgeValues, Fees,
-        Funding, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Move, Parties, Party, Payout,
-        PendingSlot, Secp256k1Signer, Secp256k1Verifier, Terms as KernelTerms, Tx as KernelTx,
-        WorkPaymentTerms, WorkStakeBondTerms,
+        Funding, List, MAX_PARTY_INPUTS, Move, Parties, Party, Payout, PendingSlot,
+        Secp256k1Signer, Secp256k1Verifier, Terms as KernelTerms, Tx as KernelTx, WorkPaymentTerms,
+        WorkStakeBondTerms,
     };
-    use hellas_rpc::call::WithTrailer;
-    use hellas_rpc::pb::work::{ExchangeSetupRequest, exchange_setup_response::Outcome};
+
     use hellas_rpc::protocol::ContentId;
-    use hellas_rpc::services::work_setup::WorkSetupHandler;
-    use hellas_wire::TransportContext;
+
     use hellas_work::model::setup::{
         ProviderChannelPolicy, WorkChannelConfig, WorkChannelDescriptor,
     };
@@ -520,18 +518,15 @@ mod tests {
     }
 
     fn bond_terms() -> WorkStakeBondTerms {
-        WorkStakeBondTerms {
-            parties: Parties::new(
+        hellas_work::test_support::channel::bond_terms_for(
+            Parties::new(
                 hellas_kernel::PartyKeys::sole(provider().party_key()),
                 hellas_kernel::PartyKeys::sole(client().party_key()),
             ),
-            timeout: BlockHeight::new(HORIZON),
-            timeout_outputs: List::take(
-                [Payout::new(provider().party_key(), STAKE); MAX_EDGE_OUTPUTS],
-                1,
-            ),
-            max_job_price: 4,
-        }
+            BlockHeight::new(HORIZON),
+            Payout::new(provider().party_key(), STAKE),
+            4,
+        )
     }
 
     fn bond_funding() -> Funding {
@@ -543,25 +538,15 @@ mod tests {
     }
 
     fn channel_policy() -> PaidChannelPolicyV1 {
-        PaidChannelPolicyV1 {
-            compute_credit_limit: 40,
-            delivery_credit_limit: 40,
-        }
+        hellas_work::test_support::channel::credit_policy(40, 40)
     }
 
     fn work_policy() -> EvaluatePolicyV2 {
-        EvaluatePolicyV2 {
-            allowed_environment: ContentId::from_bytes([0x31; 32]),
-            generation_policy_digest: ProtocolDigest::from_bytes([0x32; 32]),
-            identity_source_digest: ProtocolDigest::from_bytes([0x33; 32]),
-            max_prompt_tokens: 512,
-            max_new_tokens: 128,
-            max_stop_token_ids: 4,
-            max_spool_bytes: 1_048_576,
-            max_encoded_result_frame: 262_144,
-            max_encoded_prepared_input: 1_048_576,
-            max_upload_bytes: 1_048_576,
-        }
+        hellas_work::test_support::channel::evaluate_policy(
+            ContentId::from_bytes([0x31; 32]),
+            ProtocolDigest::from_bytes([0x32; 32]),
+            ProtocolDigest::from_bytes([0x33; 32]),
+        )
     }
 
     /// The edge the provider requires the client to fund: the whole
@@ -583,18 +568,14 @@ mod tests {
     }
 
     fn payment_terms() -> WorkPaymentTerms {
-        WorkPaymentTerms {
-            bond_edge: bond_edge(),
-            bond_terms: bond_terms(),
-            private_policy_commitment: private_policy_commitment(
-                TEST_NETWORK,
-                &SALT,
-                &channel_policy(),
-            ),
-            omit_response_blocks: WINDOW,
-            start_validity_blocks: hellas_kernel::MAX_START_VALIDITY_BLOCKS,
-            omission_bond: OMISSION_BOND,
-        }
+        hellas_work::test_support::channel::payment_terms_for(
+            bond_edge(),
+            bond_terms(),
+            private_policy_commitment(TEST_NETWORK, &SALT, &channel_policy()),
+            WINDOW,
+            hellas_kernel::MAX_START_VALIDITY_BLOCKS,
+            OMISSION_BOND,
+        )
     }
 
     fn payment_edge_of(funding: &Funding) -> EdgeId {
@@ -769,29 +750,15 @@ mod tests {
             PaymentAdmission::Proposes(Box::new(provider_policy())),
         );
 
-        let proposal = exchange(&service, Vec::new()).await;
-        if let Err(error) = caller.import(&proposal).await {
-            panic!("the client imports the bond proposal: {error}");
-        }
-        caller
-            .arm_scan(scan)
-            .await
-            .expect("the client arms its scan");
-        if let Err(error) = caller
-            .propose_payment(payment_funding, payment_terms())
-            .await
-        {
-            panic!("the client proposes its payment: {error}");
-        }
-        let offered = caller
-            .state()
-            .bundle_bytes()
-            .map(<[u8]>::to_vec)
-            .expect("the client holds revision 2");
-        let countersigned = exchange(&service, offered).await;
-        if let Err(error) = caller.import(&countersigned).await {
-            panic!("the client imports the countersigned payment: {error}");
-        }
+        hellas_work::test_support::channel::finish_setup(
+            &service,
+            &mut caller,
+            bond_edge(),
+            scan,
+            payment_funding,
+            payment_terms(),
+        )
+        .await;
         assert_eq!(caller.state().revision(), Some(3));
         // Both journals let go of their files, so everything below reads
         // what actually reached the disk.
@@ -799,39 +766,9 @@ mod tests {
         drop(caller);
     }
 
-    /// Offers one revision to the provider's service and returns the
-    /// revision it answers with.
-    async fn exchange(service: &SetupService, bundle: Vec<u8>) -> Vec<u8> {
-        let answered = WorkSetupHandler::exchange_setup(
-            service,
-            ExchangeSetupRequest {
-                bond_edge: bond_edge().as_bytes().to_vec(),
-                bundle,
-            },
-            TransportContext::default(),
-        )
-        .await
-        .expect("the setup handler answers");
-        let response: WithTrailer<_> = answered.into();
-        match response.response.outcome {
-            Some(Outcome::Advanced(advanced)) => advanced.bundle,
-            other => panic!("expected an advanced revision, got {other:?}"),
-        }
-    }
-
     async fn open_store(root: &std::path::Path, role: Role) -> SetupStore {
-        match SetupStore::open(
-            root,
-            TEST_NETWORK,
-            bond_edge(),
-            role,
-            &Secp256k1Verifier::new(),
-        )
-        .await
-        {
-            Ok(store) => store,
-            Err(error) => panic!("the setup journal opens: {error}"),
-        }
+        hellas_work::test_support::channel::open_setup_store(root, TEST_NETWORK, bond_edge(), role)
+            .await
     }
 
     fn scan_at(block: &HellasBlock) -> SetupScan {

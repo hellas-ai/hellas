@@ -6,34 +6,31 @@
 //! handed to a function. Every crash is a real one: the store is dropped
 //! and reopened over its own files.
 
+use hellas_work::test_support::channel::ANSWER;
+use hellas_work::test_support::channel::ready_of;
+use hellas_work::test_support::channel::serve_work as serve;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use support::temp;
 
-use bytes::Bytes;
 use futures::StreamExt as _;
 use hellas_auth::Digest;
-use hellas_kernel::PendingSlot;
 use hellas_rpc::OutputEventEnvelope;
 use hellas_rpc::pb::work::{
     DeliverResultRequest, DeliverResultResponse, WorkDelivered, WorkRefusalCode,
     deliver_result_response::Outcome,
 };
-use hellas_rpc::services::work::{WorkClientImpl, WorkServer};
-use hellas_wire::mux::{MessagePipe, MuxConfig, MuxTransport, Role as MuxRole};
-use hellas_wire::{DefaultClock, Dispatcher, StreamTransport};
-use hellas_work::model::setup::{
-    ObservedChannel, ReadyChannel, WorkChannelDescriptor, WorkSetupError,
-};
+use hellas_rpc::services::work::WorkClientImpl;
+use hellas_wire::StreamTransport;
+use hellas_wire::mux::MuxTransport;
+use hellas_work::model::setup::{ReadyChannel, WorkSetupError};
 use hellas_work::model::work::{
     EvaluatePolicyV2, PaidJobAuthorizationV2, PaidWorkError, PrivateRecord as _,
     delivery_request_digest, encode_transcript, propose_authorization, signing_hash,
     terminal_result, work_id,
 };
-use hellas_work::test_support::paid::{
-    CURSOR, WIDE_FRAME, advance, bond_edge, bond_object, bundle, client, commit, deadlines,
-    descriptor_with, evaluate_request, lease_over, payment_edge, payment_object, payment_policy,
-    provider, store_at, transcript_for, work_policy,
+use hellas_work::test_support::channel::{
+    CURSOR, WIDE_FRAME, advance, bundle, client, commit, deadlines, descriptor_with,
+    evaluate_request, payment_policy, provider, store_at, transcript_for, work_policy,
 };
 use hellas_work::work::{
     BackendFault, ClientEndpoint, CloseEndpoint, DeliverError, ProviderEndpoint, RunError,
@@ -42,7 +39,6 @@ use hellas_work::work::{
 use hellas_work::work_store::{
     ChannelRecord, ChannelStore, JobPhase, JobState, Role, TerminalOutcome,
 };
-use tokio::sync::mpsc;
 
 mod support;
 
@@ -59,22 +55,6 @@ fn policy_with(max_encoded_result_frame: u32) -> EvaluatePolicyV2 {
     EvaluatePolicyV2 {
         max_encoded_result_frame,
         ..work_policy()
-    }
-}
-
-fn ready_of(descriptor: &WorkChannelDescriptor, height: u64) -> ReadyChannel {
-    let bond = bond_object();
-    let payment = payment_object();
-    let observed = ObservedChannel {
-        height,
-        bond: Some(&bond),
-        payment: Some(&payment),
-        lease: lease_over(bond_edge(), payment_edge()),
-        pending: PendingSlot::Absent,
-    };
-    match descriptor.check_ready(&observed) {
-        Ok(ready) => ready,
-        Err(error) => panic!("the fixture channel is ready: {error}"),
     }
 }
 
@@ -141,104 +121,10 @@ async fn accept(
 
 // ── Transcripts and the backend that produces them ────────────────────
 
-const ANSWER: [u32; 5] = [101, 102, 103, 104, 105];
-
-/// A backend that counts its calls and signs the fixture answer.
-struct AnsweringBackend {
-    calls: Arc<AtomicUsize>,
-}
-
-impl AnsweringBackend {
-    fn new() -> Self {
-        Self {
-            calls: Arc::new(AtomicUsize::new(0)),
-        }
-    }
-}
-
-impl WorkBackend for AnsweringBackend {
-    fn try_admit(
-        &self,
-        domain: hellas_work::work::admission::CapacityDomain,
-    ) -> Result<hellas_work::work::admission::WorkPermit, hellas_work::work::BackendFault> {
-        Err(hellas_work::work::admission::AdmissionError::Unsupported(domain).into())
-    }
-
-    async fn execute(
-        &self,
-        prepared: hellas_work::work::PreparedWorkInput,
-    ) -> Result<Vec<OutputEventEnvelope>, hellas_work::work::BackendFault> {
-        let hellas_work::work::PreparedWorkInput::Evaluate(input) = prepared else {
-            return Err(hellas_work::work::admission::AdmissionError::Unsupported(
-                hellas_work::work::admission::CapacityDomain::Fetch,
-            )
-            .into());
-        };
-        let input = *input;
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        let produced = transcript_for(input.evaluate_request(), &ANSWER);
-        Ok(produced)
-    }
-}
-
-/// Runs one accepted job to a signed, durable result.
-async fn run_to_result(service: &WorkService, ready: &ReadyChannel, id: Digest) {
-    let backend = AnsweringBackend::new();
-    let outcome = run_accepted_work(service, ready, &backend, id).await;
-    assert!(
-        matches!(outcome, Ok(RunOutcome::Completed { .. })),
-        "the fixture job completes: {outcome:?}",
-    );
-}
+use hellas_work::test_support::channel::{AnsweringBackend, run_to_result};
 
 // ── Transport plumbing ────────────────────────────────────────────────
 
-struct Pipe {
-    out: mpsc::UnboundedSender<Bytes>,
-    inbox: mpsc::UnboundedReceiver<Bytes>,
-}
-
-impl MessagePipe for Pipe {
-    type SendError = std::io::Error;
-    type RecvError = std::io::Error;
-
-    async fn send_message(&mut self, bytes: Bytes) -> Result<(), Self::SendError> {
-        let _ = self.out.send(bytes);
-        Ok(())
-    }
-
-    async fn recv_message(&mut self) -> Result<Option<Bytes>, Self::RecvError> {
-        Ok(self.inbox.recv().await)
-    }
-}
-
-/// The request a client signs on the fixture session for `work_id`.
-///
-/// A `work_id` is an identifier; this is what makes it an authority,
-/// and only on the connection whose exporter it covers.
-fn delivery_request(
-    channel: &hellas_work::model::work::PaidChannel,
-    work_id: Digest,
-) -> DeliverResultRequest {
-    DeliverResultRequest {
-        route: Some(hellas_rpc::pb::work::WorkRoute::payment(channel.id())),
-        work_id: work_id.as_bytes().to_vec(),
-        client_signature: client()
-            .sign(signing_hash(delivery_request_digest(
-                channel, work_id, &EXPORTER,
-            )))
-            .as_bytes()
-            .to_vec(),
-    }
-}
-
-/// What the two ends of one live session both know.
-///
-/// A mux over a pair of in-memory pipes has no TLS of its own, so the
-/// exporter is supplied here — which is what a QUIC connection does for
-/// itself. Both halves are handed the same value, because that is the
-/// one property the delivery binding rests on: the number is known to
-/// exactly the two ends of one connection.
 fn session() -> hellas_wire::TransportContext {
     hellas_wire::TransportContext {
         open_exporter: Some(EXPORTER),
@@ -247,38 +133,10 @@ fn session() -> hellas_wire::TransportContext {
 }
 
 fn transport_pair() -> (MuxTransport, MuxTransport) {
-    let (to_server, server_inbox) = mpsc::unbounded_channel();
-    let (to_client, client_inbox) = mpsc::unbounded_channel();
-    let client = MuxTransport::spawn::<8, _, _>(
-        MuxRole::Client,
-        DefaultClock,
-        MuxConfig::default(),
-        Pipe {
-            out: to_server,
-            inbox: client_inbox,
-        },
+    hellas_work::test_support::transport::transport_pair_without_write_authority(
         session(),
-    );
-    let server = MuxTransport::spawn::<8, _, _>(
-        MuxRole::Server,
-        DefaultClock,
-        MuxConfig::default(),
-        Pipe {
-            out: to_client,
-            inbox: server_inbox,
-        },
         session(),
-    );
-    (client, server)
-}
-
-fn serve(transport: MuxTransport, service: WorkService) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let server = WorkServer(service);
-        while let Ok(Some(inbound)) = transport.accept().await {
-            let _ = Dispatcher::<MuxTransport>::dispatch(&server, inbound).await;
-        }
-    })
+    )
 }
 
 fn refusal_code(response: &DeliverResultResponse) -> WorkRefusalCode {
@@ -1167,28 +1025,11 @@ async fn a_transport_without_an_exporter_delivers_nothing() {
     let service = WorkService::new(endpoint);
     run_to_result(&service, &ready, id).await;
 
-    let (to_server, server_inbox) = mpsc::unbounded_channel();
-    let (to_client, client_inbox) = mpsc::unbounded_channel();
-    let bare = |out, inbox| {
-        MuxTransport::spawn::<8, _, _>(
-            MuxRole::Client,
-            DefaultClock,
-            MuxConfig::default(),
-            Pipe { out, inbox },
+    let (client_transport, server_transport) =
+        hellas_work::test_support::transport::transport_pair_without_write_authority(
             hellas_wire::TransportContext::default(),
-        )
-    };
-    let client_transport = bare(to_server, client_inbox);
-    let server_transport = MuxTransport::spawn::<8, _, _>(
-        MuxRole::Server,
-        DefaultClock,
-        MuxConfig::default(),
-        Pipe {
-            out: to_client,
-            inbox: server_inbox,
-        },
-        hellas_wire::TransportContext::default(),
-    );
+            hellas_wire::TransportContext::default(),
+        );
     let serving = serve(server_transport, service.clone());
 
     // The client holds the accepted job and still cannot ask for it.
@@ -1437,5 +1278,21 @@ async fn paid_stream_checks_status_and_terminal_shape_before_recording_delivery(
         assert_eq!(recovered, delivered);
         serving.abort();
         let _ = serving.await;
+    }
+}
+
+fn delivery_request(
+    channel: &hellas_work::model::work::PaidChannel,
+    work_id: Digest,
+) -> DeliverResultRequest {
+    DeliverResultRequest {
+        route: Some(hellas_rpc::pb::work::WorkRoute::payment(channel.id())),
+        work_id: work_id.as_bytes().to_vec(),
+        client_signature: client()
+            .sign(signing_hash(delivery_request_digest(
+                channel, work_id, &EXPORTER,
+            )))
+            .as_bytes()
+            .to_vec(),
     }
 }

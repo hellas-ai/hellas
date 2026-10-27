@@ -11,32 +11,31 @@
 //! Each mutation test states what it breaks. A rule with no test that
 //! fails when the rule is deleted is not a rule.
 
-use bytes::Bytes;
 use hellas_auth::Digest;
 use hellas_kernel::{
-    BlockHeight, CoinId, EdgeId, EdgeValues, Fees, Funding, List, MAX_EDGE_OUTPUTS,
-    MAX_PARTY_INPUTS, Parties, PartyKeys, Payout, Secp256k1Signer, Secp256k1Verifier,
-    SigVerifier as _, Terms, Tx, WorkPaymentTerms, WorkStakeBondTerms,
+    BlockHeight, CoinId, EdgeId, EdgeValues, Fees, Funding, List, MAX_PARTY_INPUTS, Parties,
+    PartyKeys, Payout, Secp256k1Signer, Secp256k1Verifier, SigVerifier as _, Terms, Tx,
+    WorkPaymentTerms, WorkStakeBondTerms,
 };
 use hellas_rpc::pb::work::{
     ExchangeSetupRequest, ExchangeSetupResponse, SetupAdvanced, WorkRefusalCode, WorkRefused,
     exchange_setup_response::Outcome,
 };
 use hellas_rpc::protocol::ContentId;
-use hellas_rpc::services::work_setup::{WorkSetup, WorkSetupClientImpl, WorkSetupServer};
-use hellas_wire::mux::{MessagePipe, MuxConfig, MuxTransport, Role as MuxRole};
-use hellas_wire::{DefaultClock, Dispatcher, ServiceMarker, StreamTransport};
+use hellas_rpc::services::work_setup::{WorkSetup, WorkSetupClientImpl};
+use hellas_wire::mux::MuxTransport;
+use hellas_wire::{ServiceMarker, StreamTransport};
 use hellas_work::model::bundle::WorkChannelSetupBundleV2;
 use hellas_work::model::setup::ProviderChannelPolicy;
 use hellas_work::model::work::{EvaluatePolicyV2, PaidChannelPolicyV1, private_policy_commitment};
-use hellas_work::test_support::paid::{client, network, provider, signer};
+use hellas_work::test_support::channel::serve_setup as serve;
+use hellas_work::test_support::channel::{client, network, provider, signer};
 use hellas_work::work_handshake::{
     PaymentAdmission, SetupEndpoint, SetupExchangeError, SetupService, apply_setup_exchange,
     prepare_setup_exchange, send_setup_exchange,
 };
 use hellas_work::work_store::{Role, SetupScan, SetupStore};
 use prost::Message as _;
-use tokio::sync::mpsc;
 
 async fn exchange_setup<T>(
     transport: T,
@@ -89,18 +88,15 @@ fn empty_coins() -> List<CoinId, MAX_PARTY_INPUTS> {
 }
 
 fn bond_terms() -> WorkStakeBondTerms {
-    WorkStakeBondTerms {
-        parties: Parties::new(
+    hellas_work::test_support::channel::bond_terms_for(
+        Parties::new(
             PartyKeys::sole(provider().party_key()),
             PartyKeys::sole(client().party_key()),
         ),
-        timeout: BlockHeight::new(HORIZON),
-        timeout_outputs: List::take(
-            [Payout::new(provider().party_key(), STAKE); MAX_EDGE_OUTPUTS],
-            1,
-        ),
-        max_job_price: 40,
-    }
+        BlockHeight::new(HORIZON),
+        Payout::new(provider().party_key(), STAKE),
+        40,
+    )
 }
 
 /// The provider's stake funding: its own coins, none of the client's.
@@ -129,10 +125,7 @@ fn payment_terms(bond_edge: EdgeId) -> WorkPaymentTerms {
 }
 
 fn channel_policy() -> PaidChannelPolicyV1 {
-    PaidChannelPolicyV1 {
-        compute_credit_limit: 40,
-        delivery_credit_limit: 40,
-    }
+    hellas_work::test_support::channel::credit_policy(40, 40)
 }
 
 fn other_channel_policy() -> PaidChannelPolicyV1 {
@@ -143,18 +136,11 @@ fn other_channel_policy() -> PaidChannelPolicyV1 {
 }
 
 fn work_policy() -> EvaluatePolicyV2 {
-    EvaluatePolicyV2 {
-        allowed_environment: ContentId::from_bytes([0x31; 32]),
-        generation_policy_digest: Digest::from_bytes([0x32; 32]),
-        identity_source_digest: Digest::from_bytes([0x33; 32]),
-        max_prompt_tokens: 512,
-        max_new_tokens: 128,
-        max_stop_token_ids: 4,
-        max_spool_bytes: 1_048_576,
-        max_encoded_result_frame: 262_144,
-        max_encoded_prepared_input: 1_048_576,
-        max_upload_bytes: 1_048_576,
-    }
+    hellas_work::test_support::channel::evaluate_policy(
+        ContentId::from_bytes([0x31; 32]),
+        Digest::from_bytes([0x32; 32]),
+        Digest::from_bytes([0x33; 32]),
+    )
 }
 
 /// What this provider will countersign a payment over.
@@ -262,73 +248,11 @@ async fn no_export_path_can_return_unjournaled_revision_bytes() {
 
 // ── An in-memory pipe pair, so the wire is a real wire ────────────────
 
-struct Pipe {
-    out: mpsc::UnboundedSender<Bytes>,
-    inbox: mpsc::UnboundedReceiver<Bytes>,
-}
-
-impl MessagePipe for Pipe {
-    type SendError = std::io::Error;
-    type RecvError = std::io::Error;
-
-    async fn send_message(&mut self, bytes: Bytes) -> Result<(), Self::SendError> {
-        let _ = self.out.send(bytes);
-        Ok(())
-    }
-
-    async fn recv_message(&mut self) -> Result<Option<Bytes>, Self::RecvError> {
-        Ok(self.inbox.recv().await)
-    }
-}
-
 fn transport_pair() -> (MuxTransport, MuxTransport) {
-    let (to_server, server_inbox) = mpsc::unbounded_channel();
-    let (to_client, client_inbox) = mpsc::unbounded_channel();
-    let dialer = MuxTransport::spawn::<8, _, _>(
-        MuxRole::Client,
-        DefaultClock,
-        MuxConfig::default(),
-        Pipe {
-            out: to_server,
-            inbox: client_inbox,
-        },
+    hellas_work::test_support::transport::transport_pair_without_write_authority(
         hellas_wire::TransportContext::default(),
-    );
-    let listener = MuxTransport::spawn::<8, _, _>(
-        MuxRole::Server,
-        DefaultClock,
-        MuxConfig::default(),
-        Pipe {
-            out: to_client,
-            inbox: server_inbox,
-        },
         hellas_wire::TransportContext::default(),
-    );
-    (dialer, listener)
-}
-
-/// Serves one setup endpoint over one transport until the caller stops
-/// it.
-fn serve(transport: MuxTransport, service: SetupService) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let server = WorkSetupServer(service);
-        while let Ok(Some(inbound)) = transport.accept().await {
-            let _ = Dispatcher::<MuxTransport>::dispatch(&server, inbound).await;
-        }
-    })
-}
-
-/// Stops the server and lets go of the journal's exclusive lock.
-///
-/// Every assertion about what a provider durably holds is made over a
-/// journal reopened from its own files, which is only possible once the
-/// process that held it is gone — so the check and the crash are the
-/// same step, and no test can read a value that only ever lived in
-/// memory.
-async fn stop(serving: tokio::task::JoinHandle<()>, service: SetupService) {
-    serving.abort();
-    let _ = serving.await;
-    drop(service);
+    )
 }
 
 /// Reopens one setup journal over its own files.
@@ -1101,4 +1025,9 @@ fn payment_policy() -> hellas_work::model::work::JobPaymentPolicyV2 {
         delivery_margin_blocks: 2,
         oracle_grace_blocks: 6,
     }
+}
+
+async fn stop(serving: tokio::task::JoinHandle<()>, service: SetupService) {
+    hellas_work::test_support::channel::stop(serving).await;
+    drop(service);
 }

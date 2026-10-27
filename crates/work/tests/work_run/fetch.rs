@@ -11,7 +11,7 @@ use hellas_work::model::fetch::{
 };
 use hellas_work::model::profile::WorkPolicy;
 use hellas_work::model::work::PrivateRecord as _;
-use hellas_work::test_support::paid::accept_uploaded_client;
+use hellas_work::test_support::channel::accept_uploaded_client;
 use hellas_work::work::{ClientEndpoint, DeliverError, EndpointError, JobProposal};
 
 const PROMPT: &[u8] = br#"{"input":"private-customer-prompt-never-on-provider-disk"}"#;
