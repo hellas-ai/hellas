@@ -2885,6 +2885,7 @@ dependencies = [
  "iroh",
  "iroh-mdns-address-lookup",
  "p256",
+ "proptest",
  "rand 0.10.3",
  "serde",
  "serde_bytes",
