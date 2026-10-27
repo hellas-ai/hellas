@@ -26,7 +26,7 @@ hellas-adaptors.workspace = true
 hellas-auth.workspace = true
 hellas-authority.workspace = true
 hellas-channel.workspace = true
-hellas-client = { workspace = true, features = ["iroh"] }
+hellas-client = { workspace = true, features = ["iroh", "text"] }
 hellas-presentation.workspace = true
 hellas-private.workspace = true
 hellas-rpc = { workspace = true, features = ["fetch"] }

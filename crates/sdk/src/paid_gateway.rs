@@ -19,10 +19,10 @@ type Result<T, E = PoolError> = std::result::Result<T, E>;
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use hellas_channel::content::{EphemeralContent, InvocationContent};
-use hellas_gateway::{WorkExecutionBackend, WorkFetchRequest};
+use hellas_gateway::{ExecutionEvent, Outcome, StopReason, WorkExecutionBackend, WorkFetchRequest};
 use hellas_rpc::output::OutputEvent as FetchEvent;
 use hellas_rpc::protocol::invocation::{
-    Admission,
+    Admission, compute,
     fetch::FetchRoutePolicy,
     output::{ArtifactChunk, ArtifactPrefix},
 };
@@ -509,6 +509,41 @@ impl WorkExecutionBackend for PaidGateway {
         paid_stream(submit())
     }
 
+    fn generate(
+        &self,
+        job: hellas_client::text::TextJob,
+    ) -> Result<hellas_gateway::WorkOutputStream<ExecutionEvent>, hellas_gateway::WorkGatewayError>
+    {
+        let permit = self
+            .admission
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| hellas_gateway::WorkGatewayBusy)?;
+        let input = JobInput::Compute {
+            environment: job.environment,
+            plan: job.plan,
+            inputs: job.inputs,
+            content: InvocationContent::Ephemeral(job.content),
+        };
+        let mut candidates = self
+            .providers
+            .iter()
+            .filter(|provider| {
+                Job::from_input(provider.args.expected_price, input.clone())
+                    .and_then(|job| job.check_policy(&provider.policy))
+                    .is_ok()
+            })
+            .map(|provider| {
+                let route = Route {
+                    pending: provider.pending.load(Ordering::Relaxed),
+                };
+                (provider.clone(), route)
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|(provider, route)| (!provider.available(), route.pending));
+        paid_stream(self.submit::<ExecutionEvent>(candidates, Some(input), None, Some(permit)))
+    }
+
     fn timeout(&self) -> Duration {
         self.providers
             .iter()
@@ -670,6 +705,71 @@ impl GatewayEvent for FetchEvent {
             &output.output,
             &output.provider_key,
         )?])
+    }
+    fn is_terminal(&self) -> bool {
+        self.terminal().is_some()
+    }
+    fn bytes(&self) -> usize {
+        serde_json::to_vec(self).map_or(MAX_RECORD_BYTES, |bytes| bytes.len())
+    }
+}
+
+const EMITTED: &str = "emitted";
+
+/// Emitted u64 token ids become the gateway's u32 token stream.
+impl GatewayEvent for ExecutionEvent {
+    fn prefix(chunk: ArtifactChunk, pending: &mut Vec<u8>) -> Result<Vec<Self>> {
+        let format = compute::OutputKind::Scalar(compute::ValueKind::U64).format();
+        if chunk.name != EMITTED || chunk.format != format {
+            return Err(PoolError::MissingOutput(
+                "text output is not the emitted token stream",
+            ));
+        }
+        let position = (chunk.offset - pending.len() as u64) / 8;
+        pending.extend_from_slice(chunk.bytes.as_bytes());
+        let (whole, _) = pending.as_chunks::<8>();
+        let tokens = whole
+            .iter()
+            .map(|token| u32::try_from(u64::from_le_bytes(*token)))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| PoolError::MissingOutput("emitted token id exceeds u32"))?;
+        pending.drain(..tokens.len() * 8);
+        Ok(if tokens.is_empty() {
+            Vec::new()
+        } else {
+            vec![Self::Chunk {
+                position,
+                tokens: hellas_rpc::encode_token_ids(&tokens),
+            }]
+        })
+    }
+    fn completed(output: PaidWorkResult) -> Result<Vec<Self>> {
+        let metadata: compute::RunMetadata =
+            hellas_rpc::protocol::value::decode_canonical_dag_cbor(
+                output.output.metadata.as_bytes(),
+            )?;
+        let emitted = output
+            .output
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.name == EMITTED)
+            .ok_or(PoolError::MissingOutput(
+                "text output has no emitted tokens",
+            ))?;
+        let stop_reason = match metadata.stop {
+            Some(compute::StopReason::Matched(token)) => StopReason::StopToken(
+                u32::try_from(token)
+                    .map_err(|_| PoolError::MissingOutput("stop token id exceeds u32"))?,
+            ),
+            Some(compute::StopReason::MaxSteps) => StopReason::MaxNewTokens,
+            None => return Err(PoolError::MissingOutput("text output has no stop reason")),
+        };
+        Ok(vec![Self::Done(Outcome::Completed {
+            total_tokens: metadata.steps,
+            stop_reason,
+            text_artifact: emitted.content_id()?.digest(),
+            output_events: Vec::new(),
+        })])
     }
     fn is_terminal(&self) -> bool {
         self.terminal().is_some()

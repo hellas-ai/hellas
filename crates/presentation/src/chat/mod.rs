@@ -224,7 +224,9 @@ mod tests {
 
     fn presentation() -> TextPresentation {
         TextPresentation {
-            tokenizer: tokenizers::Tokenizer::from_bytes(br#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"<unk>":0},"unk_token":"<unk>"}}"#).unwrap(),
+            tokenizer: crate::tests::tokenizer(
+                r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"<unk>":0},"unk_token":"<unk>"}}"#,
+            ),
             chat_template: Some(ChatTemplate::Qwen3),
         }
     }

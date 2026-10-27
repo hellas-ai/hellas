@@ -17,28 +17,10 @@ fn endpoint(byte: u8) -> EndpointId {
     }
 }
 
-fn test_environment() -> CausalLmExecutionEnvironment {
-    let environment = hellas_rpc::CausalLmEnvironment::new(
-        hellas_rpc::ContentRef::new(hellas_rpc::ContentId::from_bytes([8; 32]), 1024),
-        "model",
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        256,
-        1024,
-        hellas_rpc::CausalLmGenerationSchedule {
-            fixed_capacity: 1024,
-            prefill_chunk_tokens: 64,
-        },
-    )
-    .unwrap();
-    let manifest = environment.manifest();
-    CausalLmExecutionEnvironment::from_canonical_bytes(
-        manifest.content_id(),
-        manifest.canonical_bytes(),
-        environment.canonical_bytes(),
-    )
-    .unwrap()
+/// The tiny Qwen3 GGUF the client text package tests render.
+fn text_model() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../client/src/text/package/mini-qwen3.gguf")
 }
 
 /// A gateway pointed at one node, which callers then vary.
@@ -64,10 +46,7 @@ async fn options(
             retries: 2,
             default_max_tokens: 128,
             model_name: "smollm2-135m".to_string(),
-            causal_lm: Some(test_environment()),
-            tokenizer: Some("tokenizer.json".into()),
-            chat_template: None,
-            stop_token_ids: Vec::new(),
+            text_model: Some(text_model()),
             metrics_port: None,
             responses_backend: ResponsesBackend::Hellas,
             responses_proxy_url: String::new(),
@@ -89,10 +68,9 @@ async fn options(
 
 #[cfg(unix)]
 #[tokio::test]
-async fn proxy_without_causal_lm_does_not_bind_remote_transport() {
+async fn proxy_without_text_model_does_not_bind_remote_transport() {
     let (_root, mut options) = options(None).await;
-    options.causal_lm = None;
-    options.tokenizer = None;
+    options.text_model = None;
     options.responses_backend = ResponsesBackend::Proxy;
     options.responses_proxy_url = "http://127.0.0.1:1/v1/responses".into();
     let state = GatewayState::from_options(&options).await.unwrap();
@@ -101,9 +79,10 @@ async fn proxy_without_causal_lm_does_not_bind_remote_transport() {
 
 #[tokio::test]
 async fn paid_generation_records_after_payment_and_replays_without_a_backend() {
-    use crate::{ExecutionEvent, Outcome, StopReason, WorkExecutionBackend, WorkExecutionRequest};
+    use crate::{ExecutionEvent, Outcome, StopReason, WorkExecutionBackend};
     use futures::{StreamExt, TryStreamExt};
     use hellas_rpc::cache::{CacheOptions, CachePolicy, CacheStore, MemoryCacheStore};
+    use hellas_rpc::protocol::invocation::Artifact;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct Paid {
@@ -111,13 +90,20 @@ async fn paid_generation_records_after_payment_and_replays_without_a_backend() {
         payment_ack: Arc<tokio::sync::Notify>,
     }
     impl WorkExecutionBackend for Paid {
-        fn execute(
+        fn generate(
             &self,
-            request: WorkExecutionRequest,
+            job: hellas_client::text::TextJob,
         ) -> Result<crate::WorkOutputStream<ExecutionEvent>, crate::WorkGatewayError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            assert_eq!(request.input_ids, vec![0]);
-            assert_eq!(request.max_new_tokens, 1);
+            assert_eq!(
+                job.inputs,
+                vec![Artifact::new(
+                    "prompt",
+                    "catena.u64le.v1",
+                    0u64.to_le_bytes().to_vec()
+                )]
+            );
+            assert_eq!(job.plan.step.unwrap().stop.max_steps, 1);
             let payment_ack = self.payment_ack.clone();
             Ok(Box::pin(async_stream::try_stream! {
                 yield ExecutionEvent::Chunk {
@@ -141,17 +127,10 @@ async fn paid_generation_records_after_payment_and_replays_without_a_backend() {
         }
     }
 
-    let tokenizer = tempfile::NamedTempFile::new().unwrap();
-    std::fs::write(
-        tokenizer.path(),
-        br#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":{"type":"Whitespace"},"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"hello":0,"<unk>":1},"unk_token":"<unk>"}}"#,
-    )
-    .unwrap();
     let calls = Arc::new(AtomicUsize::new(0));
     let payment_ack = Arc::new(tokio::sync::Notify::new());
     let store = Arc::new(MemoryCacheStore::default());
     let (_root, mut options) = options(None).await;
-    options.tokenizer = Some(tokenizer.path().into());
     options.paid_work = Some(Arc::new(Paid {
         calls: calls.clone(),
         payment_ack: payment_ack.clone(),
@@ -228,9 +207,9 @@ async fn paid_capacity_is_a_retryable_error_and_uses_the_pool_deadline() {
         fn timeout(&self) -> Duration {
             Duration::from_secs(17)
         }
-        fn execute(
+        fn generate(
             &self,
-            _: crate::WorkExecutionRequest,
+            _: hellas_client::text::TextJob,
         ) -> Result<crate::WorkOutputStream<crate::ExecutionEvent>, crate::WorkGatewayError>
         {
             Err(crate::WorkGatewayBusy.into())
@@ -239,13 +218,7 @@ async fn paid_capacity_is_a_retryable_error_and_uses_the_pool_deadline() {
             Box::pin(async { Ok(()) })
         }
     }
-    let tokenizer = tempfile::NamedTempFile::new().unwrap();
-    std::fs::write(
-        tokenizer.path(),
-        br#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"hello":0,"<unk>":1},"unk_token":"<unk>"}}"#,
-    ).unwrap();
     let (_root, mut options) = options(None).await;
-    options.tokenizer = Some(tokenizer.path().into());
     options.paid_work = Some(Arc::new(Busy));
     let state = GatewayState::from_options(&options).await.unwrap();
     assert_eq!(state.inference_timeout, Duration::from_secs(17));
