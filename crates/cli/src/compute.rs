@@ -44,8 +44,8 @@ impl ServeArgs {
                     .as_deref()
                     .map(hellas_store::state::records_path_at)
             })
-            .map(Ok)
-            .unwrap_or_else(crate::identity::default_content_index_path)?;
+            .or_else(hellas_store::state::records_path)
+            .ok_or_else(|| anyhow::anyhow!("no store location; set HELLAS_STORE_DIR or --store-dir"))?;
         executor.content_store = index_content(&self.content_paths, &self.content_roots, &index)?;
         Ok(())
     }

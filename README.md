@@ -88,8 +88,9 @@ memory metering. A job over A's upload limit is refused before it runs; a job
 that exceeds the execution limit is killed with its worker and is not paid.
 Compilation has no time limit. Sources and weights a job names by content ID
 must be available to A: index local files with `serve --content FILE` or
-`--content-root DIR`, or adopt a HuggingFace cache with `hellas store
---store-dir DIR adopt` and serve with the same `--store-dir DIR`.
+`--content-root DIR`, or adopt a HuggingFace cache with `hellas store adopt`.
+Both commands default to the same store (`HELLAS_STORE_DIR` or
+`~/.hellas/store`).
 
 Indexed provider content is an immutable local-cache assumption. Hellas pins
 the verified read-only descriptor and detects path/inode replacement; it does
