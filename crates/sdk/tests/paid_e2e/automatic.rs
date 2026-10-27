@@ -153,7 +153,6 @@ impl hellas_executor::catena::driver::Device for HostScalarDevice {
     fn load(
         &mut self,
         module: &catena_lang::runtime::RuntimeModule,
-        _retention: Retention,
     ) -> DeviceResult<hellas_executor::catena::Cancellation> {
         self.state
             .loads

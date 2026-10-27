@@ -643,7 +643,7 @@ impl PaidWorkSession {
                 Replay(
                     hellas_auth::Digest,
                     hellas_channel::work_store::JobPhase,
-                    PreparedInvocation,
+                    Box<PreparedInvocation>,
                 ),
             }
             let pending = client
@@ -696,7 +696,9 @@ impl PaidWorkSession {
                                 job.prepared_input(),
                                 hellas_channel::content::MAX_CONTENT_BYTES,
                             )
-                            .map(|input| RecoveredJob::Replay(job.work_id(), job.phase(), input))
+                            .map(|input| {
+                                RecoveredJob::Replay(job.work_id(), job.phase(), Box::new(input))
+                            })
                             .map_err(PaidClientError::from)
                         })
                         .collect::<Result<Vec<_>, _>>()
@@ -721,7 +723,7 @@ impl PaidWorkSession {
                         );
                         continue;
                     }
-                    RecoveredJob::Replay(work_id, phase, input) => (work_id, phase, input),
+                    RecoveredJob::Replay(work_id, phase, input) => (work_id, phase, *input),
                 };
                 check_request(
                     policy,
@@ -833,17 +835,16 @@ fn permanently_refused_delivery(error: &PaidClientError) -> bool {
 /// while bounded exponential backoff avoids turning recovery into a request
 /// flood.
 async fn propose_when_ready(
+    args: &PaidWorkOptions,
     dialer: &ProviderDialer,
     client: &mut ClientService,
     proposal: &JobProposal,
     content: &InvocationContent,
     retained: Option<hellas_auth::Digest>,
-    poll: Duration,
-    timeout: Option<Duration>,
     proposed: Option<&AtomicBool>,
 ) -> Result<hellas_auth::Digest> {
-    let deadline = timeout.map(|timeout| Instant::now() + timeout);
-    let mut delay = poll.max(Duration::from_secs(1));
+    let deadline = args.timeout.map(|timeout| Instant::now() + timeout);
+    let mut delay = args.config.poll.max(Duration::from_secs(1));
     loop {
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return Err(PaidClientError::Timeout {
@@ -926,7 +927,6 @@ async fn execute_paid_job(
     proposed: Option<&AtomicBool>,
     mut purchase: Option<&mut crate::transact::Purchase>,
 ) -> Result<PaidWorkResult> {
-    let readiness_timeout = args.timeout;
     let prepared_bytes = prepared.canonical_bytes()?;
     let current = client.with_state(|state| state.cursor().0).await?;
     let deadlines = deadlines(
@@ -975,13 +975,12 @@ async fn execute_paid_job(
     let (work_id, already_collected) = match existing.first().copied() {
         Some((work_id, hellas_channel::work_store::JobPhase::HalfSigned, _)) => (
             propose_when_ready(
+                args,
                 dialer,
                 client,
                 &proposal,
                 content,
                 Some(work_id),
-                poll,
-                readiness_timeout,
                 proposed,
             )
             .await?,
@@ -1000,17 +999,7 @@ async fn execute_paid_job(
         }
         Some((work_id, _, _)) => (work_id, false),
         None => (
-            propose_when_ready(
-                dialer,
-                client,
-                &proposal,
-                content,
-                None,
-                poll,
-                readiness_timeout,
-                proposed,
-            )
-            .await?,
+            propose_when_ready(args, dialer, client, &proposal, content, None, proposed).await?,
             false,
         ),
     };

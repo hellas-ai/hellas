@@ -147,7 +147,7 @@ assurance = "producer-signed"
         },
     };
     assert_eq!(
-        raw.prepare(&key, [9; 32], runner.clone(), &policy)
+        raw.prepare(&key, [9; 32], runner, &policy)
             .unwrap()
             .canonical_bytes()
             .unwrap(),
