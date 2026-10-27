@@ -243,7 +243,7 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
                 acceptance_blocks: 49,
                 terminal_blocks: 99,
                 payment_blocks: 199,
-                timeout: Duration::from_secs(5),
+                timeout: Some(Duration::from_secs(5)),
             },
             descriptor: fixture.descriptor.clone(),
             policy: fixture.policy.clone(),

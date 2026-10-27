@@ -36,7 +36,7 @@
         ${package}/bin/hellas-cli serve --help | grep -F -- "--content-index <FILE>"
         ${package}/bin/hellas-cli serve --help | grep -F -- "--gpu-session-programs"
         ${package}/bin/hellas-cli serve --help | grep -F -- "--gpu-session-asset-bytes"
-        ${package}/bin/hellas-cli serve --help | grep -F -- "--work-config"
+        ${package}/bin/hellas-cli serve --help | grep -F -- "--paid-work-config"
         ! ${package}/bin/hellas-cli serve --help | grep -F -- "--gfx"
         ${package}/bin/hellas-cli identity --help | grep -F -- "show-enrollment-id"
 

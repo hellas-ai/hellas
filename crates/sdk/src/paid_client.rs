@@ -58,9 +58,30 @@ pub struct PaidWorkOptions {
     pub acceptance_blocks: u64,
     pub terminal_blocks: u64,
     pub payment_blocks: u64,
-    /// Bounds retries while a provider is not ready. A session's overall lifetime
-    /// is controlled by its caller; `transact` also enforces an overall limit.
-    pub timeout: Duration,
+    /// Bounds retries while a provider is not ready; `None` waits until done.
+    /// A session's overall lifetime is controlled by its caller.
+    pub timeout: Option<Duration>,
+}
+
+/// Chain reads keep their recovery bound even when the caller sets none.
+pub(crate) fn read_timeout(timeout: Option<Duration>) -> Duration {
+    timeout.map_or(hellas_chain::node::RECOVERY_TIMEOUT, |timeout| {
+        timeout.min(hellas_chain::node::RECOVERY_TIMEOUT)
+    })
+}
+
+/// Bounds `work` by the caller's timeout; without one it waits until done.
+async fn within<T>(
+    timeout: Option<Duration>,
+    stage: &'static str,
+    work: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    match timeout {
+        Some(timeout) => tokio::time::timeout(timeout, work)
+            .await
+            .map_err(|_| PaidClientError::Timeout { stage })?,
+        None => work.await,
+    }
 }
 
 impl PaidWorkOptions {
@@ -71,7 +92,7 @@ impl PaidWorkOptions {
                 "deadline spans must be positive",
             ));
         }
-        if self.timeout.is_zero() {
+        if self.timeout.is_some_and(|timeout| timeout.is_zero()) {
             return Err(PaidClientError::InvalidOptions("timeout must be positive"));
         }
 
@@ -327,7 +348,7 @@ impl PaidWorkSession {
                 "funding delegate differs from the settlement key",
             ));
         }
-        let read_timeout = args.timeout.min(hellas_chain::node::RECOVERY_TIMEOUT);
+        let read_timeout = read_timeout(args.timeout);
         let remote = crate::client_chain::connect(config, read_timeout).await?;
         let chain = WorkBlocks::new(remote.clone()).with_read_retry(config.poll, read_timeout);
 
@@ -479,7 +500,7 @@ impl PaidWorkSession {
             // A long restart catch-up may outlive the first observation. Wait
             // during channel opening; requests never perform this catch-up.
             // The session already owns the task, so cancellation aborts it.
-            tokio::time::timeout(session.args.timeout, async {
+            within(session.args.timeout, "initial channel observation", async {
                 while session.client.readiness().await.is_err()
                     && !session
                         .client
@@ -488,12 +509,9 @@ impl PaidWorkSession {
                 {
                     tokio::time::sleep(session.args.config.poll).await;
                 }
-                Ok::<_, PaidClientError>(())
+                Ok(())
             })
-            .await
-            .map_err(|_| PaidClientError::Timeout {
-                stage: "initial channel observation",
-            })??;
+            .await?;
         }
         Ok(session)
     }
@@ -821,13 +839,13 @@ async fn propose_when_ready(
     content: &InvocationContent,
     retained: Option<hellas_auth::Digest>,
     poll: Duration,
-    timeout: Duration,
+    timeout: Option<Duration>,
     proposed: Option<&AtomicBool>,
 ) -> Result<hellas_auth::Digest> {
-    let deadline = Instant::now() + timeout;
+    let deadline = timeout.map(|timeout| Instant::now() + timeout);
     let mut delay = poll.max(Duration::from_secs(1));
     loop {
-        if Instant::now() >= deadline {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return Err(PaidClientError::Timeout {
                 stage: "provider admission",
             });
@@ -853,7 +871,9 @@ async fn propose_when_ready(
                 if status.code() == hellas_wire::WireCode::Unavailable => {}
             Err(error) => return Err(error.into()),
         }
-        let remaining = deadline.saturating_duration_since(Instant::now());
+        let remaining = deadline.map_or(delay, |deadline| {
+            deadline.saturating_duration_since(Instant::now())
+        });
         tokio::time::sleep(delay.min(remaining)).await;
         delay = delay.saturating_mul(2).min(Duration::from_secs(10));
     }
@@ -866,9 +886,9 @@ async fn pay_when_ready(
     client: &mut ClientService,
     work_id: hellas_auth::Digest,
     poll: Duration,
-    timeout: Duration,
+    timeout: Option<Duration>,
 ) -> Result<u64> {
-    tokio::time::timeout(timeout, async {
+    within(timeout, "payment acknowledgement", async {
         let mut delay = poll.max(Duration::from_secs(1));
         loop {
             match pay_for_result(dialer.work().await?, client, work_id).await {
@@ -884,9 +904,6 @@ async fn pay_when_ready(
         }
     })
     .await
-    .map_err(|_| PaidClientError::Timeout {
-        stage: "payment acknowledgement",
-    })?
 }
 
 enum JobLookup {
@@ -1228,10 +1245,10 @@ async fn exchange_setup(
     dialer: &ProviderDialer,
     setup: &mut SetupEndpoint,
     poll: Duration,
-    timeout: Duration,
+    timeout: Option<Duration>,
 ) -> Result<()> {
     let request = prepare_setup_exchange(setup);
-    tokio::time::timeout(timeout, async {
+    within(timeout, "setup exchange", async {
         loop {
             let response = send_setup_exchange(dialer.setup().await?, request.clone()).await?;
             match apply_setup_exchange(setup, response).await {
@@ -1244,9 +1261,6 @@ async fn exchange_setup(
         }
     })
     .await
-    .map_err(|_| PaidClientError::Timeout {
-        stage: "setup exchange",
-    })?
 }
 
 async fn finalized_floor(chain: &WorkBlocks<RemoteLightClient>) -> Result<SetupScan> {

@@ -85,7 +85,7 @@ impl OfferConnection {
             .sign(hellas_kernel::PayloadHash::from_bytes(*digest.as_bytes()))
             .as_bytes()
             .to_vec();
-        let timeout = args.timeout.min(hellas_chain::node::RECOVERY_TIMEOUT);
+        let timeout = super::read_timeout(args.timeout);
         let response = tokio::time::timeout(timeout, async {
             loop {
                 let response = hellas_rpc::call::unary::<
@@ -220,7 +220,7 @@ pub(super) async fn obtain_offer(
             args.provider,
             quote.funding_value,
             args.config.poll,
-            args.timeout.min(hellas_chain::node::RECOVERY_TIMEOUT),
+            super::read_timeout(args.timeout),
         )
         .await?;
     let connection = OfferConnection::open(args, endpoint).await?;
@@ -341,10 +341,10 @@ pub async fn retained_paid_policy(
     config: &WorkConfig,
     journal_root: &std::path::Path,
     provider: EndpointId,
-    timeout: Duration,
+    timeout: Option<Duration>,
 ) -> Result<Option<(ProviderChannelPolicy, hellas_rpc::Assurance)>> {
     config.clone().validate()?;
-    let timeout = timeout.min(hellas_chain::node::RECOVERY_TIMEOUT);
+    let timeout = super::read_timeout(timeout);
     let remote = crate::client_chain::connect(config, timeout).await?;
     let chain = WorkBlocks::new(remote).with_read_retry(config.poll, timeout);
     Ok(

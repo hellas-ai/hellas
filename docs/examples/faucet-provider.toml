@@ -1,0 +1,50 @@
+# Paid terms for `hellas serve --faucet --paid-work-config faucet-provider.toml`.
+# The selected owner (here a public devnet faucet account) approves exactly
+# these terms at startup and delegates the stake its offers bond. Nothing
+# here has a built-in default; every field is required unless noted.
+
+# Omit to use the shipped devnet. Otherwise a JSON chain configuration,
+# relative to this file.
+# chain_config = "chain.json"
+
+jobs_per_channel = 10
+# Kernel minimum (MIN_OMIT_RESPONSE_BLOCKS).
+min_omit_response_blocks = 16
+# Admit Catena compute jobs.
+compute = true
+
+[payment]
+fixed_price = 20
+dispatch_margin_blocks = 4
+delivery_margin_blocks = 2
+oracle_grace_blocks = 6
+
+[channel]
+compute_credit_limit = 40
+delivery_credit_limit = 40
+
+[offers]
+max_stake_per_client = 12
+max_open_offers = 3
+bond_lifetime_blocks = 256
+# Must exceed fixed_price * jobs_per_channel (200).
+omission_bond = 201
+redelegate_payout = true
+
+[limits]
+max_upload_bytes = 1048576
+max_output_bytes = 1048576
+max_steps = 64
+execution_timeout_ms = 90000
+
+# Caller-signed HTTPS Fetch. Remove this section to sell compute only.
+[fetch.limits]
+max_request_body_bytes = 65536
+max_output_events = 1024
+max_spool_bytes = 4194304
+max_encoded_result_frame = 1048576
+max_encoded_prepared_input = 1048576
+
+[fetch.route.OpenFetch]
+require_spki_pin = true
+allowed_hosts = []

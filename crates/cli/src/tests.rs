@@ -330,13 +330,13 @@ fn identity_show_holder_accepts_global_identity_path() {
 
 #[test]
 fn serve_accepts_work_config() {
-    let cli = Cli::try_parse_from(["hellas", "serve", "--work-config", "/tmp/work.json"]).unwrap();
+    let cli = Cli::try_parse_from(["hellas", "serve", "--paid-work-config", "/tmp/work.toml"]).unwrap();
     match cli.command {
         Commands::Serve {
             work_config_file, ..
         } => assert_eq!(
             work_config_file.as_deref(),
-            Some(std::path::Path::new("/tmp/work.json"))
+            Some(std::path::Path::new("/tmp/work.toml"))
         ),
         _ => panic!("expected serve command"),
     }
@@ -347,60 +347,14 @@ fn manual_provisioning_command_is_removed() {
     assert!(Cli::try_parse_from(["hellas", "provision"]).is_err());
 }
 
-/// A node asked to serve paid work loads its settlement identity
-/// before anything binds, and a missing one is a startup failure
-/// naming the file.
-///
-/// The whole point is what it does *not* do: the same `serve`
-/// without a work configuration creates the file, so the refusal
-/// below is this rule and not a loader that always refuses. A node
-/// that minted its own settlement key would advertise two paid ALPNs
-/// as a party nobody has funded — and would say nothing about it.
-#[test]
-fn serving_paid_work_loads_a_stored_settlement_identity() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("identity");
-    let paid = Cli::try_parse_from(["hellas", "serve", "--work-config", "/tmp/work.json"]).unwrap();
-    let unpaid = Cli::try_parse_from(["hellas", "serve"]).unwrap();
-
-    let Err(error) = load_command_identity(&paid.command, Some(&path)) else {
-        panic!("paid work is settled with a key an operator already made");
-    };
-    assert!(
-        format!("{error:#}").contains(&path.display().to_string()),
-        "the refusal does not name the identity file: {error:#}",
-    );
-    assert!(!path.exists(), "no identity was created by the refusal");
-
-    // The key is the identity's own, and the identity is the one on
-    // disk: created here by a `serve` that was asked for no paid
-    // work, and read back by the paid one that would not create it.
-    let created = load_command_identity(&unpaid.command, Some(&path))
-        .expect("a serve with no paid work still creates its transport identity");
-    let loaded = load_command_identity(&paid.command, Some(&path))
-        .expect("the stored identity is what paid work settles with");
-    assert_eq!(
-        identity::settlement_signer(&loaded).unwrap().party_key(),
-        identity::settlement_signer(&created).unwrap().party_key(),
-    );
-    assert_eq!(
-        &identity::settlement_signer(&loaded)
-            .unwrap()
-            .party_key()
-            .to_bytes()[..],
-        loaded.node_key.public_key().bytes(),
-        "the settlement party is the producer identity, not a second key",
-    );
-}
-
-/// An identity file that is there and is not one is the same
-/// startup failure, and names the same file.
+/// An identity file that is there and is not one is a startup
+/// failure naming that file.
 #[test]
 fn an_unreadable_settlement_identity_is_a_startup_failure() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("identity");
     std::fs::write(&path, b"not an identity").unwrap();
-    let paid = Cli::try_parse_from(["hellas", "serve", "--work-config", "/tmp/work.json"]).unwrap();
+    let paid = Cli::try_parse_from(["hellas", "serve", "--paid-work-config", "/tmp/work.toml"]).unwrap();
 
     let Err(error) = load_command_identity(&paid.command, Some(&path)) else {
         panic!("an identity file that is not one is not a key to settle with");

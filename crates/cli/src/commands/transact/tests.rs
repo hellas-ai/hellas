@@ -46,7 +46,6 @@ fn command_shapes_require_a_job_or_settlement_and_remove_paid_work() {
         .is_err()
     );
     assert!(crate::Cli::try_parse_from(["hellas", "paid-work", "--help"]).is_err());
-    assert!(crate::Cli::try_parse_from(["hellas", "run", "--help"]).is_err());
     for invalid in ["0s", "300", "18446744073709551615m"] {
         assert!(
             crate::Cli::try_parse_from([
@@ -67,7 +66,7 @@ fn command_shapes_require_a_job_or_settlement_and_remove_paid_work() {
         p.addresses,
         vec!["127.0.0.1:1234".parse::<SocketAddr>().unwrap()]
     );
-    assert!(fetch_args(&["--faucet"]).client.timeout == Duration::from_secs(300));
+    assert!(fetch_args(&["--faucet"]).client.timeout.is_none());
 }
 
 #[test]
@@ -231,4 +230,90 @@ fn output_claims_only_provider_signature_and_job_binding() {
     for forbidden in ["verified", "correct"] {
         assert!(!output.to_lowercase().contains(forbidden), "{output}");
     }
+}
+
+#[test]
+fn run_writes_one_call_job_that_transact_loads_unchanged() {
+    use hellas_rpc::protocol::invocation::compute::*;
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("increment.hex");
+    let input = root.path().join("data.bin");
+    std::fs::write(&source, b"source bytes").unwrap();
+    std::fs::write(&input, [1, 2, 3]).unwrap();
+    let (source, input, id) = (
+        source.display().to_string(),
+        input.display().to_string(),
+        provider(),
+    );
+    let crate::Commands::Run(args) = crate::Cli::try_parse_from([
+        "hellas",
+        "run",
+        "--provider",
+        &id,
+        "--source",
+        &source,
+        "--entry",
+        "increment",
+        "--arg",
+        "u64:41",
+        "--input",
+        &input,
+        "--arg",
+        "input:data.bin",
+        "--returns",
+        "u64",
+        "--returns",
+        "buffer:16",
+        "--payment",
+        "20",
+    ])
+    .unwrap()
+    .command
+    else {
+        panic!("run");
+    };
+    assert!(args.client.timeout.is_none());
+    let job = args.job().unwrap();
+    let folder = root.path().join("job");
+    job.save(&folder).unwrap();
+    let loaded = Job::load(&folder).unwrap();
+    assert_eq!(loaded.digest(), job.digest());
+    let JobInput::Compute {
+        plan,
+        inputs,
+        environment,
+        ..
+    } = loaded.input()
+    else {
+        panic!("compute job");
+    };
+    assert_eq!(environment.sources.len(), 1);
+    assert_eq!(inputs[0].name, "data.bin");
+    let slots = ["output-0000", "output-0001"];
+    assert_eq!(
+        plan,
+        &Plan {
+            calls: vec![Call {
+                entry: "increment".into(),
+                args: vec![
+                    Arg::U64(41),
+                    Arg::Input {
+                        object: "data.bin".into()
+                    }
+                ],
+                bind: slots.iter().map(|s| Bind::Name((*s).into())).collect(),
+            }],
+            step: None,
+            outputs: vec![
+                Declared {
+                    slot: slots[0].into(),
+                    kind: OutputKind::Scalar(ValueKind::U64)
+                },
+                Declared {
+                    slot: slots[1].into(),
+                    kind: OutputKind::Buffer { max_bytes: 16 }
+                },
+            ],
+        }
+    );
 }

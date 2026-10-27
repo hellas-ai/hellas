@@ -20,6 +20,8 @@ use std::{
 };
 
 mod client;
+mod run;
+pub use run::{RunArgs, run as run_program};
 #[cfg(test)]
 mod tests;
 
@@ -72,8 +74,9 @@ pub struct ClientArgs {
     #[arg(long, value_name = "DIR")]
     state_dir: Option<PathBuf>,
     /// Wall-clock deadline for quote, funding, execution and payment.
-    #[arg(long, default_value = "300s", value_parser = duration)]
-    timeout: Duration,
+    /// Without it, wait until the job is done.
+    #[arg(long, value_parser = duration)]
+    timeout: Option<Duration>,
     /// Wait for channel settlement after the job.
     #[arg(long)]
     settle: bool,
@@ -252,6 +255,20 @@ impl ClientArgs {
     }
 }
 
+/// Bound `work` by `--timeout`; without one, wait until it is done.
+async fn bounded<T>(
+    timeout: Option<Duration>,
+    work: impl std::future::Future<Output = super::CliResult<T>>,
+    expired: impl FnOnce(Duration) -> String,
+) -> super::CliResult<T> {
+    match timeout {
+        Some(timeout) => tokio::time::timeout(timeout, work)
+            .await
+            .map_err(|_| anyhow::anyhow!(expired(timeout)))?,
+        None => work.await,
+    }
+}
+
 async fn execute(
     args: &ClientArgs,
     context: &Context,
@@ -285,8 +302,7 @@ async fn execute(
 pub async fn run(args: TransactArgs, context: Context) -> super::CliResult<()> {
     // Load every input before network activity or an owner approval.
     let job = args.job.as_deref().map(Job::load).transpose()?;
-    let timeout = args.client.timeout;
-    tokio::time::timeout(timeout, async {
+    bounded(args.client.timeout, async {
         let Some(job) = job else { return client::settle(&args.client, &context).await; };
         let options = args.client.options(&context, job.price(), job.assurance()).await?;
         let mut purchase = args.client.purchase(&context, &job, &options).await?;
@@ -305,14 +321,13 @@ pub async fn run(args: TransactArgs, context: Context) -> super::CliResult<()> {
         std::io::stdout().lock().flush()?;
         purchase.reported()?;
         Ok(())
-    }).await.with_context(|| format!("transaction exceeded {timeout:?}; retry the same folder to resume its unpaid work"))?
+    }, |timeout| format!("transaction exceeded {timeout:?}; retry the same folder to resume its unpaid work")).await
 }
 
 pub async fn fetch(args: FetchArgs, context: Context) -> super::CliResult<()> {
     let mut request = args.request()?;
     ensure!(args.payment > 0, "--payment must be positive");
-    let timeout = args.client.timeout;
-    tokio::time::timeout(timeout, async {
+    bounded(args.client.timeout, async {
         let options = args
             .client
             .options(&context, args.payment, args.assurance())
@@ -419,11 +434,10 @@ pub async fn fetch(args: FetchArgs, context: Context) -> super::CliResult<()> {
         .await;
         endpoint.close().await;
         result
+    }, |timeout| {
+        format!("Fetch exceeded {timeout:?}; resume with transact --job and the saved folder")
     })
     .await
-    .with_context(|| {
-        format!("Fetch exceeded {timeout:?}; resume with transact --job and the saved folder")
-    })?
 }
 
 impl FetchArgs {

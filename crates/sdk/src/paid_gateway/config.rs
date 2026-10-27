@@ -37,7 +37,7 @@ impl PaidGatewayOptions {
         let mut endpoints = BTreeSet::new();
         for provider in &self.providers {
             provider.validate()?;
-            if provider.timeout.is_zero()
+            if provider.timeout.is_none_or(|timeout| timeout.is_zero())
                 || provider.acceptance_blocks == 0
                 || provider.terminal_blocks == 0
                 || provider.payment_blocks == 0
@@ -114,7 +114,7 @@ pub fn load_pool_options(path: &Path, assurance: Assurance) -> Result<PaidGatewa
                 acceptance_blocks: file.acceptance_blocks,
                 terminal_blocks: file.terminal_blocks,
                 payment_blocks: file.payment_blocks,
-                timeout: Duration::from_secs(file.timeout_secs),
+                timeout: Some(Duration::from_secs(file.timeout_secs)),
             })
         })
         .collect::<Result<_>>()?;

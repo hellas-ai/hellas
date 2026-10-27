@@ -120,6 +120,12 @@ pub struct PaidGateway {
     tasks: crate::gateway_work::WorkTasks,
 }
 
+/// Every pooled request is bounded; [`PaidGatewayOptions::validate`] requires it.
+fn request_timeout(args: &PaidWorkOptions) -> Duration {
+    args.timeout
+        .expect("validated paid gateway providers carry a request timeout")
+}
+
 async fn provider_policy<
     C: hellas_chain::LightClient + hellas_chain::work_view::FinalizedWorkView,
 >(
@@ -131,7 +137,7 @@ async fn provider_policy<
 ) -> Result<ProviderChannelPolicy> {
     let chain = chain.with_read_retry(
         args.config.poll,
-        args.timeout.min(hellas_chain::node::RECOVERY_TIMEOUT),
+        crate::paid_client::read_timeout(args.timeout),
     );
     Ok(
         match crate::paid_client::offer::retained_offer(
@@ -145,11 +151,11 @@ async fn provider_policy<
             Some((_, signed)) => signed.offer().policy.clone(),
             None => {
                 tokio::time::timeout(
-                    args.timeout,
+                    request_timeout(args),
                     crate::paid_client::request_paid_quote(args, endpoint, settlement_key, owner),
                 )
                 .await
-                .map_err(|_| PoolError::ConnectionTimeout(args.timeout))??
+                .map_err(|_| PoolError::ConnectionTimeout(request_timeout(args)))??
                 .policy
             }
         },
@@ -180,7 +186,7 @@ impl PaidGateway {
         for args in options.providers {
             let remote = crate::client_chain::connect(
                 &args.config,
-                args.timeout.min(hellas_chain::node::RECOVERY_TIMEOUT),
+                crate::paid_client::read_timeout(args.timeout),
             )
             .await
             .map_err(PaidClientError::from)?;
@@ -253,7 +259,7 @@ impl PaidGateway {
         let mut occupied = prepared
             .as_ref()
             .map(|_| ProviderUse::new(initial_provider.clone()));
-        let timeout = recovery_timeout.unwrap_or_else(|| initial_provider.args.timeout);
+        let timeout = recovery_timeout.unwrap_or_else(|| request_timeout(&initial_provider.args));
         // Queueing, recovery and fallback all consume the same request budget.
         let deadline = tokio::time::Instant::now() + timeout;
         let task_span = span.clone();
@@ -512,7 +518,7 @@ impl WorkExecutionBackend for PaidGateway {
     fn timeout(&self) -> Duration {
         self.providers
             .iter()
-            .map(|provider| provider.args.timeout)
+            .map(|provider| request_timeout(&provider.args))
             .max()
             .unwrap_or_default()
     }
@@ -701,7 +707,7 @@ mod tests {
                 acceptance_blocks: 16,
                 terminal_blocks: 64,
                 payment_blocks: 32,
-                timeout: Duration::from_secs(30),
+                timeout: Some(Duration::from_secs(30)),
             }],
         }
     }
@@ -732,7 +738,7 @@ mod tests {
                 devnet.seal().await;
                 let fixture = PaidFixture::on_network(devnet.network());
                 let mut args = pool_options(&fixture).providers.remove(0);
-                args.timeout = hellas_chain::node::RECOVERY_TIMEOUT;
+                args.timeout = Some(hellas_chain::node::RECOVERY_TIMEOUT);
                 let signed = SignedPaidOffer::sign(
                     PaidOffer {
                         provider: crate::test_support::enrollment(args.provider).0,
@@ -792,7 +798,7 @@ mod tests {
                     policy.unwrap()
                 };
                 assert_eq!(policy, fixture.policy);
-                args.timeout = Duration::from_millis(100);
+                args.timeout = Some(Duration::from_millis(100));
                 node.require_finalized_height_for_test(devnet.height() + 1);
                 let started = tokio::time::Instant::now();
                 let error = tokio::time::timeout(
@@ -803,10 +809,10 @@ mod tests {
                 .unwrap()
                 .unwrap_err();
                 assert!(
-                    matches!(error, PoolError::Client(PaidClientError::Query(hellas_chain::QueryError::ReadUnavailableTimeout { timeout, .. })) if timeout == args.timeout),
+                    matches!(error, PoolError::Client(PaidClientError::Query(hellas_chain::QueryError::ReadUnavailableTimeout { timeout, .. })) if Some(timeout) == args.timeout),
                     "bounded gateway policy expiry: {error}"
                 );
-                assert!(started.elapsed() >= args.timeout);
+                assert!(started.elapsed() >= args.timeout.unwrap());
                 endpoint.close().await;
                 devnet.shutdown().await;
             })

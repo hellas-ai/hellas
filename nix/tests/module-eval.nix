@@ -399,7 +399,7 @@ let
   };
   defaultIdentityProvider = evalProvider { };
   storePathWorkConfig = evalProvider {
-    workConfigFile = "${builtins.storeDir}/work.json";
+    workConfigFile = "${builtins.storeDir}/work.toml";
   };
   storePathFetchConfig = evalProvider {
     fetchConfigFile = "${builtins.storeDir}/fetch.json";
@@ -450,11 +450,11 @@ let
     offer = "provider";
   };
   cudaProvider = evalProvider {
-    workConfigFile = "/run/hellas/work.json";
+    workConfigFile = "/run/hellas/work.toml";
     gpuBackend = "cuda";
   };
   hipProvider = evalProvider {
-    workConfigFile = "/run/hellas/work.json";
+    workConfigFile = "/run/hellas/work.toml";
     gpuBackend = "hip";
   };
   maxGpuSessionAssetBytes = evalProvider {
@@ -565,7 +565,7 @@ let
     content = [ "${builtins.storeDir}/model.hex" ];
   };
   homeManagerDarwinStoreWorkConfig = evalDarwinServe {
-    workConfigFile = "${builtins.storeDir}/work.json";
+    workConfigFile = "${builtins.storeDir}/work.toml";
   };
   homeManagerDarwinStoreFetchConfig = evalDarwinServe {
     fetchConfigFile = "${builtins.storeDir}/fetch.json";
@@ -640,7 +640,8 @@ let
           readinessEnvironments = [ "/srv/hellas/content/smollm2.environment" ];
           gpuSessionAssetBytes = 1073741824;
           memoryMaxBytes = 2147483648;
-          workConfigFile = "/run/hellas/work.json";
+          workConfigFile = "/run/hellas/work.toml";
+          passkey = "/run/hellas/owner.passkey";
           queueSize = 0;
           fetchConfigFile = "/run/hellas/fetch.json";
           environmentFile = "/run/hellas/provider.env";
@@ -736,7 +737,7 @@ in
       "/srv/hellas/content"
       "/srv/hellas/content/smollm2.environment"
       "/srv/hellas-index/content-index.bin"
-      "/run/hellas/work.json"
+      "/run/hellas/work.toml"
       "/run/hellas/fetch.json"
       "/run/hellas/provider.env"
     ];
@@ -766,7 +767,9 @@ in
       ];
     assert !(managedContentGatewayService.serviceConfig ? ReadWritePaths);
     assert service.serviceConfig.EnvironmentFile == "/run/hellas/provider.env";
-    assert lib.hasInfix "--work-config /run/hellas/work.json" service.serviceConfig.ExecStart;
+    assert lib.hasInfix "--paid-work-config /run/hellas/work.toml" service.serviceConfig.ExecStart;
+    assert lib.hasInfix "--passkey /run/hellas/owner.passkey" service.serviceConfig.ExecStart;
+    assert lib.elem "/run/hellas/owner.passkey" service.unitConfig.RequiresMountsFor;
     assert lib.hasInfix "--fetch-config /run/hellas/fetch.json" service.serviceConfig.ExecStart;
     assert
       (builtins.length (lib.splitString "--retries" gatewayService.serviceConfig.ExecStart) - 1) == 1;

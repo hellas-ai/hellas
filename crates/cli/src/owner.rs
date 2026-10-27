@@ -23,7 +23,7 @@ impl OwnerArgs {
         self.faucet || self.faucet_account.is_some()
     }
 
-    pub(crate) fn provider_root(identity: Option<&std::path::Path>) -> anyhow::Result<PathBuf> {
+    fn faucet_root(identity: Option<&std::path::Path>) -> anyhow::Result<PathBuf> {
         let mut path = identity
             .map(PathBuf::from)
             .map(Ok)
@@ -41,7 +41,7 @@ impl OwnerArgs {
         if !self.is_faucet() {
             return self.load();
         }
-        let root = Self::provider_root(identity)?;
+        let root = Self::faucet_root(identity)?;
         hellas_private::create_dir_all_durable(&root)?;
         let path = root.join("account");
         if !path.try_exists()? {
@@ -136,6 +136,24 @@ mod tests {
             assert_eq!(address, faucet_account(index).unwrap().address);
         }
         assert!(faucet_account(100).is_err());
+    }
+
+    #[test]
+    fn a_selected_account_stays_with_its_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let identity = root.path().join("identity");
+        let load = |args: &[&str]| {
+            crate::Cli::try_parse_from(args)
+                .unwrap()
+                .owner
+                .load_persistent(Some(&identity))
+        };
+        let first = load(&["hellas", "serve", "--faucet-account", "7"])
+            .unwrap()
+            .unwrap();
+        let again = load(&["hellas", "serve", "--faucet"]).unwrap().unwrap();
+        assert_eq!(again.party_key(), first.party_key());
+        assert!(load(&["hellas", "serve", "--faucet-account", "8"]).is_err());
     }
 
     #[test]

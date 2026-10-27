@@ -16,6 +16,7 @@ use std::sync::Arc;
 pub mod bootstrap;
 mod codex_provider;
 mod configuration;
+pub mod paid;
 pub mod work_config;
 
 pub use work_config::{WorkConfig, load_work_config};
@@ -28,11 +29,8 @@ pub struct ServeOptions {
     pub queue_size: usize,
     pub native: crate::compute::ServeArgs,
     /// The loaded paid-work configuration, not the path it came from.
-    /// Its presence is still what serves the two work ALPNs; what is new
-    /// is that the node holds the chain cross-check, the validator
-    /// fan-out, the journal root, and the policies it would mount a
-    /// channel with.
-    pub work_config: Option<WorkConfig>,
+    /// Only its presence serves the two work ALPNs and sells paid work.
+    pub paid: Option<paid::PaidWork>,
     pub chain_node: super::chain_node::ChainNodeArgs,
     pub metrics_port: Option<u16>,
     pub graffiti: String,
@@ -116,7 +114,7 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
     // contest, and countersigns new paid channels over the policy that
     // configuration makes. There is no second gate in front of that.
     let mut work_runner = None;
-    if let Some(work) = options.work_config.as_ref() {
+    if let Some(work) = options.paid.as_ref().map(|paid| &paid.chain) {
         info!(
             network = %work.chain.network,
             validators = work.validators.len(),
@@ -165,14 +163,25 @@ pub async fn run(options: ServeOptions) -> CliResult<()> {
         secret_key: options.secret_key,
         open_identity: options.open_identity,
     };
-    let node = configuration::start_host(
-        provider,
-        options.grants,
-        options.fetch_config_file,
-        options.transport,
-    )
-    .await
-    .context("failed to start node server")?;
+    let node = match &options.paid {
+        Some(paid) => {
+            paid.start(
+                provider,
+                options.grants,
+                options.fetch_config_file,
+                options.transport,
+            )
+            .await?
+        }
+        None => configuration::start_host(
+            provider,
+            options.grants,
+            options.fetch_config_file,
+            options.transport,
+        )
+        .await
+        .context("failed to start node server")?,
+    };
 
     if let Some(metrics_port) = options.metrics_port {
         let mut registry = prometheus_client::registry::Registry::default();

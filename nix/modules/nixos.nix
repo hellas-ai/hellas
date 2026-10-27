@@ -122,6 +122,7 @@ let
   ++ cfg.readinessEnvironments
   ++ lib.optional (cfg.contentIndex != null) cfg.contentIndex
   ++ lib.optional (cfg.workConfigFile != null) cfg.workConfigFile
+  ++ lib.optional (cfg.passkey != null) cfg.passkey
   ++ lib.optional (cfg.fetchConfigFile != null) cfg.fetchConfigFile
   ++ lib.optional (cfg.environmentFile != null) cfg.environmentFile;
   gatewayRuntimePaths = lib.optionals gateway.enable (

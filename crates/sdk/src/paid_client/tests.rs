@@ -28,7 +28,7 @@ fn insufficient_quoted_collateral_is_rejected_before_a_bond_request_or_journal()
         acceptance_blocks: 300,
         terminal_blocks: 3000,
         payment_blocks: 600,
-        timeout: Duration::from_secs(30),
+        timeout: Some(Duration::from_secs(30)),
     };
     assert!(matches!(
         super::offer::check_policy(&args, &policy, 51),
