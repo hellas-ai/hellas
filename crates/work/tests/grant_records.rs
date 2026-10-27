@@ -108,6 +108,7 @@ fn contact_proof_offer_signature_and_actor_channel_binding_are_not_advisory() {
                 max_spool_bytes: 131072,
                 max_encoded_result_frame: 131072,
                 max_encoded_prepared_input: 65536,
+                max_upload_bytes: 65536,
             },
             route,
         },

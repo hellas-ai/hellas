@@ -34,15 +34,14 @@ impl SetupRecord {
     }
 
     /// Returns this record's canonical bytes.
-    #[must_use]
-    pub fn encode(&self) -> Vec<u8> {
+    pub fn encode(&self) -> Result<Vec<u8>, SetupStateError> {
         let mut out = Vec::new();
         match self {
             Self::Offer { peer, floor, offer } => {
                 out.push(tag::OFFER);
                 out.extend_from_slice(peer);
                 put_option(&mut out, floor.as_ref(), put_scan);
-                out.extend_from_slice(&offer.encode().expect("checked provider offer"));
+                out.extend_from_slice(&offer.encode().map_err(|_| SetupStateError::Malformed)?);
             }
             Self::Bundle { bundle } => {
                 out.push(tag::BUNDLE);
@@ -97,7 +96,7 @@ impl SetupRecord {
                 out.push(end_to_code(*outcome));
             }
         }
-        out
+        Ok(out)
     }
 
     /// Reads one record from exactly its canonical bytes.
@@ -240,8 +239,7 @@ pub(super) fn describes_bundle(
 impl SetupState {
     /// Encodes the signed handshake, observation cursor and outcomes. Its
     /// size is independent of chain length; blocks live in the node archive.
-    #[must_use]
-    pub fn checkpoint(&self) -> Vec<u8> {
+    pub fn checkpoint(&self) -> Result<Vec<u8>, SetupStateError> {
         let Self {
             offer,
             network,
@@ -289,11 +287,18 @@ impl SetupState {
         put_option(&mut out, end.as_ref(), |out, end| {
             out.push(end_to_code(*end));
         });
-        put_option(&mut out, offer.as_ref(), |out, (peer, offer)| {
-            out.extend_from_slice(peer);
-            put_bytes(out, &offer.encode().expect("checked provider offer"));
-        });
-        out
+        match offer {
+            Some((peer, offer)) => {
+                out.push(1);
+                out.extend_from_slice(peer);
+                put_bytes(
+                    &mut out,
+                    &offer.encode().map_err(|_| SetupStateError::Malformed)?,
+                );
+            }
+            None => out.push(0),
+        }
+        Ok(out)
     }
 
     /// Reads a checkpoint back into the state it was written from.

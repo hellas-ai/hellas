@@ -53,6 +53,7 @@ pub struct GrantJobAuthorizationV1 {
     /// Commitment to the application resource policy.
     pub work_policy_digest: Digest,
     /// Commitment to the prepared input bundle.
+    pub input_content: hellas_rpc::ContentRef,
     pub prepared_input_digest: Digest,
     /// Monotone proposal nonce allocated by the channel's single writer.
     pub proposal_nonce: u64,
@@ -69,7 +70,7 @@ pub struct GrantJobAuthorizationV1 {
 }
 impl PrivateRecord for GrantJobAuthorizationV1 {
     const TAG: u8 = tag::GRANT_JOB_AUTHORIZATION_V1;
-    const BODY_SIZE: usize = 6 * 32 + 16 + 8 * 8;
+    const BODY_SIZE: usize = 6 * 32 + 16 + 8 * 8 + 40;
     fn encode_body(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(self.channel_id.0.as_bytes());
         out.extend_from_slice(&self.generation.to_be_bytes());
@@ -79,6 +80,9 @@ impl PrivateRecord for GrantJobAuthorizationV1 {
         out.extend_from_slice(&self.resource_revision.0.to_be_bytes());
         out.extend_from_slice(&self.pricing_revision.0.to_be_bytes());
         out.extend_from_slice(self.work_policy_digest.as_bytes());
+        out.extend_from_slice(&hellas_rpc::protocol::content_upload::encode_reference(
+            self.input_content,
+        ));
         out.extend_from_slice(self.prepared_input_digest.as_bytes());
         out.extend_from_slice(&self.proposal_nonce.to_be_bytes());
         out.extend_from_slice(&self.acceptance_deadline_ms.0.to_be_bytes());
@@ -97,6 +101,10 @@ impl PrivateRecord for GrantJobAuthorizationV1 {
             resource_revision: Revision(reader.u64()?),
             pricing_revision: Revision(reader.u64()?),
             work_policy_digest: Digest::from_bytes(reader.bytes32()?),
+            input_content: hellas_rpc::ContentRef::new(
+                ContentId::from_bytes(reader.bytes32()?),
+                reader.u64()?,
+            ),
             prepared_input_digest: Digest::from_bytes(reader.bytes32()?),
             proposal_nonce: reader.u64()?,
             acceptance_deadline_ms: UnixMillis(reader.u64()?),

@@ -189,6 +189,7 @@ fn fetch_policy() -> FetchPolicyV2 {
         max_spool_bytes: 65_536,
         max_encoded_result_frame: 262_144,
         max_encoded_prepared_input: 1_048_576,
+        max_upload_bytes: 1_048_576,
     }
 }
 
@@ -335,8 +336,8 @@ fn output_transcript(authorization: &PaidJobAuthorizationV2) -> Vec<OutputEventE
 /// The fetch policy record's exact bytes, decoded field by field.
 #[test]
 fn golden_fetch_policy_encoding_is_pinned() {
-    assert_eq!(FetchPolicyV2::BODY_SIZE, 92);
-    assert_eq!(FetchPolicyV2::ENCODED_SIZE, 94);
+    assert_eq!(FetchPolicyV2::BODY_SIZE, 100);
+    assert_eq!(FetchPolicyV2::ENCODED_SIZE, 102);
 
     let policy = FetchPolicyV2 {
         allowed_environment: ContentId::from_bytes([0x40; 32]),
@@ -347,6 +348,7 @@ fn golden_fetch_policy_encoding_is_pinned() {
         max_spool_bytes: 4,
         max_encoded_result_frame: 5,
         max_encoded_prepared_input: 6,
+        max_upload_bytes: 6,
     };
     assert_eq!(
         hex(&policy.encode()),
@@ -361,6 +363,7 @@ fn golden_fetch_policy_encoding_is_pinned() {
             "0000000000000004", // max_spool_bytes
             "00000005", // max_encoded_result_frame
             "00000006", // max_encoded_prepared_input
+            "0000000000000006", // max_upload_bytes
         )
     );
     assert_eq!(FetchPolicyV2::decode(&policy.encode()), Ok(policy));
@@ -398,8 +401,8 @@ fn fetch_policy_envelope_mutations_reject() {
     assert_eq!(
         FetchPolicyV2::decode(truncated),
         Err(PaidWorkError::RecordLength {
-            expected: 94,
-            actual: 93
+            expected: 102,
+            actual: 101
         })
     );
 
@@ -409,8 +412,8 @@ fn fetch_policy_envelope_mutations_reject() {
     assert_eq!(
         FetchPolicyV2::decode(&trailing),
         Err(PaidWorkError::RecordLength {
-            expected: 94,
-            actual: 95
+            expected: 102,
+            actual: 103
         })
     );
 }
@@ -585,7 +588,7 @@ fn golden_fetch_digests_are_pinned() {
     // XH("hellas.work.fetch-policy.v2" || network || channel || record).
     assert_eq!(
         hex(fetch_policy_digest(&channel, &fetch_policy()).as_bytes()),
-        "89f9855281b225fdddf219679aa44ad328cf053673e667ae64cbd38b8759a3d0"
+        "cf23ac798ed99168437e8650b53cadcf07a18094f17bf0cf7b0b9480338795e9"
     );
     // XFH("hellas.work.prepared-fetch-input.v1" || network || channel ||
     // bundle).
@@ -597,7 +600,7 @@ fn golden_fetch_digests_are_pinned() {
     // authorization): the shared record, signed under this profile.
     assert_eq!(
         hex(work_id(&channel, &authorization()).as_bytes()),
-        "cf6c6af0792d5b7e9c0c2fb40730c69f78e3fcfd0e77c2d98cd4279d9aedc6ad"
+        "a814546638b6f3a9f2caf322e377dd2f90d633a86b92ff70ff8fb1c50b597925"
     );
 }
 
@@ -1010,8 +1013,15 @@ fn an_absent_fetch_policy_bound_is_refused() {
                 ..base
             },
         ),
+        (
+            "max_upload_bytes",
+            FetchPolicyV2 {
+                max_upload_bytes: 0,
+                ..base
+            },
+        ),
     ];
-    assert_eq!(zeroed.len(), 6, "every required bound must be zeroed");
+    assert_eq!(zeroed.len(), 7, "every required bound must be zeroed");
     for (field, policy) in zeroed {
         assert_eq!(
             check_fetch_policy(&policy),
@@ -1069,8 +1079,13 @@ fn every_fetch_policy_field_moves_its_digest() {
             m.max_encoded_prepared_input += 1;
             m
         }),
+        ("max_upload_bytes", {
+            let mut m = base;
+            m.max_upload_bytes += 1;
+            m
+        }),
     ];
-    assert_eq!(mutations.len(), 8, "every field must be mutated");
+    assert_eq!(mutations.len(), 9, "every field must be mutated");
     for (field, mutated) in mutations {
         assert_ne!(
             fetch_policy_digest(&channel, &mutated),
@@ -1133,6 +1148,7 @@ fn each_fetch_input_binding_is_checked_on_its_own() {
     let encoded = bundle().encode().expect("a representable bundle");
     let cramped = FetchPolicyV2 {
         max_encoded_prepared_input: 100,
+        max_upload_bytes: 100,
         ..policy
     };
     assert_eq!(
@@ -1146,6 +1162,7 @@ fn each_fetch_input_binding_is_checked_on_its_own() {
     // The exact length is legal; one byte less is not.
     let exact = FetchPolicyV2 {
         max_encoded_prepared_input: encoded.len() as u32,
+        max_upload_bytes: u64::from(encoded.len() as u32),
         ..policy
     };
     assert!(check_prepared_fetch_input(&channel, &base, &exact, &route(), &bundle()).is_ok());
@@ -1390,11 +1407,11 @@ fn terminal_fetch_result_is_pinned() {
     );
     assert_eq!(
         hex(result.canonical_output_digest.as_bytes()),
-        "ada28e2134cbae88d023dde42d284b26e3409441a6fdf4c691509846188db524"
+        "f27678e3a7043e79f2bebecd6dad9bed96d8427020355a737e0d7212be72a323"
     );
     assert_eq!(
         hex(result_digest(&channel, &result).as_bytes()),
-        "d5d328a7ca1f92d91300c87a4db1a24a6cb53da0260af7e2556e5e700eec8257"
+        "949597c7e687915cdd07fd40e6f5cbcda3941cb66dfbd8b2c0ae04236412f9e3"
     );
 
     // The result record round-trips through the wire codec and the
@@ -1552,7 +1569,7 @@ fn fetch_output_digest_normalizes_chunking() {
     // stream and nothing else.
     assert_eq!(
         hex(digest.as_bytes()),
-        "ada28e2134cbae88d023dde42d284b26e3409441a6fdf4c691509846188db524"
+        "f27678e3a7043e79f2bebecd6dad9bed96d8427020355a737e0d7212be72a323"
     );
 }
 
@@ -1649,8 +1666,8 @@ fn widest_fetch_preimage_is_measured() {
 
     let widest =
         "hellas.work.fetch-policy.v2".len() + encoded_network + 32 + FetchPolicyV2::ENCODED_SIZE;
-    assert_eq!(widest, 27 + 64 + 32 + 94);
-    assert_eq!(widest, 217);
+    assert_eq!(widest, 27 + 64 + 32 + 102);
+    assert_eq!(widest, 225);
     assert!(widest < hellas_xet::MIN_CHUNK_SIZE);
 
     // The variable-body domains are streamed; asserting their digests
@@ -1694,6 +1711,7 @@ fn the_two_profiles_do_not_mix() {
         max_spool_bytes: fetch_policy.max_spool_bytes,
         max_encoded_result_frame: fetch_policy.max_encoded_result_frame,
         max_encoded_prepared_input: fetch_policy.max_encoded_prepared_input,
+        max_upload_bytes: fetch_policy.max_upload_bytes,
     };
     assert_ne!(
         work_policy_digest(&channel, &evaluate_policy),

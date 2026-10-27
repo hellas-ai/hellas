@@ -59,7 +59,6 @@ use hellas_work::model::prepared_input::PreparedPaidInputV1;
 use hellas_work::model::setup::ReadyChannel;
 use hellas_work::model::work::PaidJobResultV1;
 use hellas_work::work::{ClientEndpoint, DeliverError, fetch_result};
-use hellas_work::work_store::journal::MAX_RECORD_BYTES;
 
 use reproduce::{ReproduceFault, Reproducer, Reproduction};
 
@@ -297,8 +296,11 @@ where
     let Some(job) = endpoint.state().job_by_id(work_id) else {
         return Err(CollectError::Deliver(DeliverError::NoSuchJob));
     };
-    let bundle = PreparedPaidInputV1::decode(job.prepared_input(), MAX_RECORD_BYTES)
-        .map_err(|error| CollectError::Bundle(error.to_string()))?;
+    let bundle = PreparedPaidInputV1::decode(
+        job.prepared_input(),
+        hellas_work::content::MAX_CONTENT_BYTES,
+    )
+    .map_err(|error| CollectError::Bundle(error.to_string()))?;
     let network = endpoint.state().channel().network();
 
     let reproduction =

@@ -392,8 +392,10 @@ fn prepare(
     let request_commitment = hellas_rpc::RequestCommitment::from_digest(
         input.input_commitment().map_err(error)?.digest(),
     );
+    let input_content = hellas_rpc::ContentRef::for_bytes(&input.encode().map_err(error)?);
     let mut candidates = standing.grant.policies.iter().filter(|p| {
         let binding = hellas_work::model::profile::JobInputBinding {
+            input_content,
             prepared_input_digest,
             request_commitment,
             environment_commitment: p.work.allowed_environment(),

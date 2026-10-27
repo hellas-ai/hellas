@@ -61,6 +61,7 @@ pub async fn provision_offer(
     node: &hellas_chain::node::FullNode,
     authority: &hellas_work::node::NodeCoordinator,
     held: &[SetupState],
+    write_started: &std::sync::atomic::AtomicBool,
 ) -> Result<Provisioned> {
     authority.check_provider(&options.provider).await?;
     let candidate = BondCandidate::plan(&options, authority.owner().await?)?;
@@ -71,7 +72,7 @@ pub async fn provision_offer(
     let floor = floor_of(&WorkBlocks::new(view.client()))
         .await?
         .ok_or(ProvisionError::NoFinalizedBlock)?;
-    offer.journal(floor).await
+    offer.journal(floor, write_started).await
 }
 
 /// One offer as the disk holds it, read back after it was written.
@@ -195,7 +196,11 @@ impl Offer {
 
     /// Journals revision 1, and returns only once a fresh open of the
     /// journal replays it.
-    async fn journal(self, floor: SetupScan) -> Result<Provisioned> {
+    async fn journal(
+        self,
+        floor: SetupScan,
+        write_started: &std::sync::atomic::AtomicBool,
+    ) -> Result<Provisioned> {
         let timeout = self.candidate.bond_terms.timeout.get();
         if timeout <= floor.height {
             return Err(ProvisionError::ExpiredBond {
@@ -241,6 +246,9 @@ impl Offer {
             },
             &settlement_key,
         )?;
+        // A failed open, append or replay can leave a committed reservation.
+        // Preflight reads and signatures above this boundary cannot do so.
+        write_started.store(true, std::sync::atomic::Ordering::Release);
         {
             let mut store = open_provider_journal(&journal_root, network, bond_edge).await?;
             store

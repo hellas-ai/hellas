@@ -65,6 +65,7 @@ async fn signed_model_and_settings_limits_reject_before_client_signing_and_provi
             &events, &test_responses_contract(),
         ).unwrap().into();
         let mut a = template;
+        a.input_content = hellas_rpc::ContentRef::for_bytes(&input.encode().unwrap());
         a.prepared_input_digest = input.bound_digest(network(), a.channel_id.0).unwrap();
         a.request_commitment = RequestCommitment::from_digest(input.input_commitment().unwrap().digest());
         assert_err!(client.propose(&offer, a, &input, &principal(1).1, now).await, NodeStoreError::Resource(error) if error == expected);

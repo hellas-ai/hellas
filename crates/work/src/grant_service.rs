@@ -47,6 +47,7 @@ mod access;
 mod cache;
 mod delivery;
 pub(crate) use access::Access;
+mod upload;
 pub use access::{GrantWork, WORK_EXECUTE, allowance_resource};
 pub(crate) use cache::ResultCache;
 pub(crate) use delivery::Delivery;
@@ -80,8 +81,10 @@ pub struct GrantService {
     run: Arc<Run>,
     draining: Arc<tokio::sync::Mutex<()>>,
     addresses: Arc<Vec<String>>,
+    upload_quota: crate::content::UploadQuota,
 }
 struct Runtime {
+    uploads: BTreeMap<Digest, crate::content::UploadStore>,
     live: BTreeMap<Digest, Live>,
     status: ServiceStatus,
     tasks: BTreeMap<Digest, tokio::task::JoinHandle<()>>,
@@ -118,10 +121,11 @@ impl ServiceStatus {
     }
 }
 impl Runtime {
-    fn discard(&self) {
+    fn discard(&mut self) {
         for live in self.live.values() {
             live.cache.cancel();
         }
+        self.uploads.clear();
     }
     fn fail(&mut self, error: NodeStoreError) {
         self.discard();
@@ -211,6 +215,10 @@ enum CompletionError {
 }
 
 impl GrantService {
+    pub fn with_upload_quota(mut self, quota: crate::content::UploadQuota) -> Self {
+        self.upload_quota = quota;
+        self
+    }
     /// Shares this exact writer; the returned interface still requires an
     /// authenticated application caller for every authority mutation.
     pub fn node(&self) -> crate::node::NodeCoordinator {
@@ -288,6 +296,7 @@ impl GrantService {
         Self {
             node,
             inner: Arc::new(Mutex::new(Runtime {
+                uploads: BTreeMap::new(),
                 live: BTreeMap::new(),
                 status: ServiceStatus::Serving,
                 tasks: BTreeMap::new(),
@@ -297,6 +306,7 @@ impl GrantService {
             run,
             draining: Arc::new(tokio::sync::Mutex::new(())),
             addresses: Arc::new(addresses),
+            upload_quota: Default::default(),
         }
     }
     /// Internal serialized driver access. Public administration verifies its caller.
@@ -423,6 +433,18 @@ impl GrantService {
             let observed_at = Instant::now();
             let now = self.node.observed_time(&store);
             access.authorize(&store, a.grant_id, now)?;
+            let reference =
+                hellas_rpc::protocol::content_upload::decode_reference(&request.prepared_input)
+                    .ok_or_else(|| refused(GrantRefusalCode::Malformed))?;
+            let prepared_input = self
+                .inner
+                .lock()
+                .map_err(|_| refused(GrantRefusalCode::StorageUnavailable))?
+                .uploads
+                .get(&a.channel_id.0)
+                .ok_or_else(|| refused(GrantRefusalCode::Malformed))?
+                .read(id, reference)
+                .map_err(|_| refused(GrantRefusalCode::Malformed))?;
             let (policy, reserve) = {
                 let mut held = self
                     .inner
@@ -437,7 +459,7 @@ impl GrantService {
                         || (l.authorization.delivery_deadline_ms >= now && l.cache.retained())
                 });
                 let policy = store.state().policy_for(&a)?.clone();
-                let reserve = request.prepared_input.len().saturating_add(
+                let reserve = prepared_input.len().saturating_add(
                     policy
                         .work
                         .max_spool_bytes()
@@ -464,11 +486,9 @@ impl GrantService {
             if permit.domain() != domain {
                 return Err(refused(GrantRefusalCode::QueueCapacity));
             }
-            let input = PreparedWorkInput::decode(
-                &request.prepared_input,
-                crate::work_store::journal::MAX_RECORD_BYTES,
-            )
-            .map_err(|_| refused(GrantRefusalCode::Malformed))?;
+            let input =
+                PreparedWorkInput::decode(&prepared_input, crate::content::MAX_CONTENT_BYTES)
+                    .map_err(|_| refused(GrantRefusalCode::Malformed))?;
             let deadline = observed_at
                 .checked_add(Duration::from_millis(
                     a.terminal_deadline_ms.0.saturating_sub(now.0),
@@ -478,6 +498,11 @@ impl GrantService {
             let signature = store
                 .accept(application, a, client_signature, &input, &self.signer, now)
                 .await?;
+            self.inner
+                .lock()
+                .map_err(|_| refused(GrantRefusalCode::StorageUnavailable))?
+                .uploads
+                .remove(&a.channel_id.0);
             let cache = ResultCache::new(a.terminal_deadline_ms, self.node.changed.clone());
             let registered_at = self.node.observed_time(&store);
             let cancellation =
@@ -919,6 +944,7 @@ impl GrantService {
                 held.reap();
                 if matches!(held.status, ServiceStatus::Serving) {
                     held.status = ServiceStatus::Draining;
+                    held.uploads.clear();
                 }
                 match &store {
                     Ok(store) if held.status.check().is_ok() => held
@@ -1057,6 +1083,16 @@ impl hellas_rpc::services::work::WorkHandler for GrantWork {
     ) -> Result<impl Into<hellas_rpc::call::WithTrailer<AcceptWorkResponse>> + Send, WireStatus>
     {
         Ok(self.accept(&request).await)
+    }
+    async fn upload_content(
+        &self,
+        request: hellas_rpc::pb::work::UploadContentRequest,
+        context: TransportContext,
+    ) -> Result<
+        impl Into<hellas_rpc::call::WithTrailer<hellas_rpc::pb::work::UploadContentResponse>> + Send,
+        WireStatus,
+    > {
+        self.upload(&request, &context).await
     }
     async fn stream_result(
         &self,

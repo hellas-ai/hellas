@@ -173,13 +173,14 @@ mod id_pins {
     #[test]
     fn work_ids_are_stable() {
         use super::services::work::{
-            AcceptWork, AdmitCertificate, DeliverResult, GetStanding, Open, StreamResult, Work,
+            AcceptWork, AdmitCertificate, DeliverResult, GetStanding, Open, StreamResult,
+            UploadContent, Work,
         };
-        // Session-bound standing removes its redundant request signature,
-        // deliberately rotating GetStanding and Work. Open stays fixed.
-        assert_eq!(<Work as ServiceMarker>::SERVICE_ID, 0x584721e6);
+        // Adding proposal-scoped content upload deliberately rotates Work.
+        assert_eq!(<Work as ServiceMarker>::SERVICE_ID, 0x1d74e0d5);
         assert_eq!(<Open as MethodMarker>::METHOD_ID, 0x93cb0b39);
         assert_eq!(<AcceptWork as MethodMarker>::METHOD_ID, 0x5188734e);
+        assert_eq!(<UploadContent as MethodMarker>::METHOD_ID, 0xa60dfd8b);
         assert_eq!(<GetStanding as MethodMarker>::METHOD_ID, 0x64b53882);
         assert_eq!(<DeliverResult as MethodMarker>::METHOD_ID, 0x74bb099b);
         assert_eq!(<StreamResult as MethodMarker>::METHOD_ID, 0xb2043ac5);
@@ -196,10 +197,12 @@ mod id_pins {
     #[cfg(feature = "work")]
     #[test]
     fn work_setup_ids_are_stable() {
-        use super::services::work_setup::{ExchangeSetup, Open, WorkSetup};
-        assert_eq!(<WorkSetup as ServiceMarker>::SERVICE_ID, 0xdfbb90af);
+        use super::services::work_setup::{ExchangeSetup, Open, RequestOffer, WorkSetup};
+        // RequestOffer deliberately rotates the setup service descriptor.
+        assert_eq!(<WorkSetup as ServiceMarker>::SERVICE_ID, 0x0fb60b29);
         assert_eq!(<Open as MethodMarker>::METHOD_ID, 0xcbe4ebd5);
         assert_eq!(<ExchangeSetup as MethodMarker>::METHOD_ID, 0x14d05693);
+        assert_eq!(<RequestOffer as MethodMarker>::METHOD_ID, 0x97c491fd);
     }
 
     #[cfg(feature = "host-control")]

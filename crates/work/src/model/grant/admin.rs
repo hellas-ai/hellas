@@ -25,7 +25,7 @@ pub struct AllowanceTerms {
 pub enum WorkControlCommand {
     SetPaidPolicy {
         expected_revision: Revision,
-        policy: crate::model::paid_policy::PaidPolicy,
+        policy: Box<crate::model::paid_policy::PaidPolicy>,
     },
     ConfigureResource {
         policy: String,

@@ -3,6 +3,7 @@
 pub mod artifacts;
 pub mod causal_lm;
 pub mod commitment;
+pub mod content_upload;
 pub mod digest;
 pub mod fetch_contract;
 pub use fetch_contract::{FETCH_EVALUATOR, FetchContract, FetchEgress, FetchSchema};

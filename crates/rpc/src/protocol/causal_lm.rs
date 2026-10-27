@@ -59,6 +59,11 @@ impl ContentRef {
         Self { id, bytes }
     }
 
+    #[must_use]
+    pub fn for_bytes(bytes: &[u8]) -> Self {
+        Self::new(ContentId::hash(bytes), bytes.len() as u64)
+    }
+
     /// Returns the Xet content identifier.
     #[must_use]
     pub const fn id(self) -> ContentId {

@@ -103,13 +103,13 @@ impl SetupStore {
                 // signature leaves, rather than at the rotation that finds
                 // out too late.
                 if record.exports_signature() {
-                    let len = next.checkpoint().len();
+                    let len = next.checkpoint()?.len();
                     if len > MAX_CHECKPOINT_BYTES {
                         return Err(JournalError::CheckpointTooLarge { len }.into());
                     }
                 }
                 self.rotate_if_full(record.is_new_work()).await?;
-                self.journal.append(&record.encode()).await?;
+                self.journal.append(&record.encode()?).await?;
                 self.state = next;
             }
             Ok(&self.state)
@@ -128,7 +128,7 @@ impl SetupStore {
     /// [`WorkStoreError::Journal`] when the checkpoint does not fit one
     /// frame or an install step fails.
     pub async fn rotate(&mut self) -> Result<(), WorkStoreError> {
-        self.journal.rotate(&self.state.checkpoint()).await?;
+        self.journal.rotate(&self.state.checkpoint()?).await?;
         Ok(())
     }
 
@@ -143,7 +143,7 @@ impl SetupStore {
         if !self.journal.at_soft_limit() {
             return Ok(());
         }
-        match self.journal.rotate(&self.state.checkpoint()).await {
+        match self.journal.rotate(&self.state.checkpoint()?).await {
             Ok(()) => Ok(()),
             Err(error) if new_work => Err(error.into()),
             Err(_) => Ok(()),

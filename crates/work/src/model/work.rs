@@ -352,11 +352,12 @@ pub struct EvaluatePolicyV2 {
     pub max_encoded_result_frame: u32,
     /// Largest complete encoded prepared-input bundle.
     pub max_encoded_prepared_input: u32,
+    pub max_upload_bytes: u64,
 }
 
 impl PrivateRecord for EvaluatePolicyV2 {
     const TAG: u8 = tag::EVALUATE_POLICY_V2;
-    const BODY_SIZE: usize = 3 * 32 + 4 + 4 + 2 + 8 + 4 + 4;
+    const BODY_SIZE: usize = 3 * 32 + 4 + 4 + 2 + 8 + 4 + 4 + 8;
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(self.allowed_environment.as_bytes());
@@ -368,6 +369,7 @@ impl PrivateRecord for EvaluatePolicyV2 {
         put_u64(out, self.max_spool_bytes);
         put_u32(out, self.max_encoded_result_frame);
         put_u32(out, self.max_encoded_prepared_input);
+        put_u64(out, self.max_upload_bytes);
     }
 
     fn decode_body(reader: &mut BodyReader<'_>) -> Result<Self, PaidWorkError> {
@@ -381,6 +383,7 @@ impl PrivateRecord for EvaluatePolicyV2 {
             max_spool_bytes: reader.u64()?,
             max_encoded_result_frame: reader.u32()?,
             max_encoded_prepared_input: reader.u32()?,
+            max_upload_bytes: reader.u64()?,
         })
     }
 }
@@ -403,6 +406,7 @@ pub struct PaidJobAuthorizationV2 {
     /// Commitment to the separate job payment policy.
     pub payment_policy_digest: Digest,
     /// Commitment to the prepared input bundle.
+    pub input_content: hellas_rpc::ContentRef,
     pub prepared_input_digest: Digest,
     /// Client-chosen nonce making this proposal unique.
     ///
@@ -431,7 +435,7 @@ pub struct PaidJobAuthorizationV2 {
 
 impl PrivateRecord for PaidJobAuthorizationV2 {
     const TAG: u8 = tag::PAID_JOB_AUTHORIZATION_V2;
-    const BODY_SIZE: usize = 10 * 32 + 5 * 8;
+    const BODY_SIZE: usize = 10 * 32 + 5 * 8 + 40;
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(self.channel_id.as_bytes());
@@ -441,6 +445,9 @@ impl PrivateRecord for PaidJobAuthorizationV2 {
         out.extend_from_slice(self.payment_terms_hash.as_bytes());
         out.extend_from_slice(self.work_policy_digest.as_bytes());
         out.extend_from_slice(self.payment_policy_digest.as_bytes());
+        out.extend_from_slice(&hellas_rpc::protocol::content_upload::encode_reference(
+            self.input_content,
+        ));
         out.extend_from_slice(self.prepared_input_digest.as_bytes());
         put_u64(out, self.proposal_nonce);
         put_u64(out, self.acceptance_deadline);
@@ -460,6 +467,10 @@ impl PrivateRecord for PaidJobAuthorizationV2 {
             payment_terms_hash: TermsHash::from_bytes(reader.bytes32()?),
             work_policy_digest: Digest::from_bytes(reader.bytes32()?),
             payment_policy_digest: Digest::from_bytes(reader.bytes32()?),
+            input_content: hellas_rpc::ContentRef::new(
+                ContentId::from_bytes(reader.bytes32()?),
+                reader.u64()?,
+            ),
             prepared_input_digest: Digest::from_bytes(reader.bytes32()?),
             proposal_nonce: reader.u64()?,
             acceptance_deadline: reader.u64()?,
@@ -1168,6 +1179,7 @@ pub fn check_work_policy(policy: &EvaluatePolicyV2) -> Result<(), PaidWorkError>
         ("max_prompt_tokens", u64::from(policy.max_prompt_tokens)),
         ("max_new_tokens", u64::from(policy.max_new_tokens)),
         ("max_spool_bytes", policy.max_spool_bytes),
+        ("max_upload_bytes", policy.max_upload_bytes),
         (
             "max_encoded_result_frame",
             u64::from(policy.max_encoded_result_frame),
@@ -1246,6 +1258,7 @@ pub fn propose_authorization(
         payment_terms_hash: channel.payment_terms_hash(),
         work_policy_digest: work_policy_digest(channel, policy),
         payment_policy_digest: job_payment_policy_digest(channel.network(), channel.id(), payment),
+        input_content: hellas_rpc::ContentRef::for_bytes(&bundle.encode()?),
         prepared_input_digest: prepared_input_digest(channel, bundle)?,
         proposal_nonce,
         acceptance_deadline: deadlines.acceptance,
@@ -1443,6 +1456,7 @@ pub fn check_bound_evaluate_input(
     bundle: &PreparedPaidInputV1,
 ) -> Result<(), PaidWorkError> {
     let encoded = bundle.encode()?;
+    binding.check_content(&encoded)?;
     let limit = u64::from(policy.max_encoded_prepared_input);
     let actual = u64::try_from(encoded.len()).map_err(|_| PaidWorkError::Overflow {
         field: "prepared input length",

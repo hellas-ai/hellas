@@ -101,6 +101,50 @@ fn assert_no_payloads(root: &std::path::Path) {
     }
 }
 
+async fn accept_uploaded_fetch(
+    fixture: &PaidFixture,
+    provider: &hellas_work::work::WorkService,
+    client: &hellas_work::work::ClientEndpoint,
+    request: &hellas_rpc::pb::work::AcceptWorkRequest,
+) -> hellas_rpc::pb::work::AcceptWorkResponse {
+    let authorization =
+        hellas_work::model::work::PaidJobAuthorizationV2::decode(&request.authorization).unwrap();
+    let work = hellas_work::model::work::work_id(fixture.ready.channel(), &authorization);
+    let bytes = client
+        .state()
+        .job_by_id(work)
+        .unwrap()
+        .prepared_input()
+        .to_vec();
+    let (wire, uploads) =
+        hellas_work::test_support::paid::input_uploads(fixture.ready.channel(), request, &bytes);
+    let context = hellas_wire::TransportContext {
+        open_exporter: Some([7; 32]),
+        ..Default::default()
+    };
+    let a =
+        hellas_work::model::work::PaidJobAuthorizationV2::decode(&request.authorization).unwrap();
+    let id = hellas_work::model::work::work_id(fixture.ready.channel(), &a);
+    for mut upload in uploads {
+        upload.chunk_signature = signer(1)
+            .sign(hellas_work::model::work::signing_hash(
+                hellas_rpc::protocol::content_upload::chunk_digest(
+                    a.channel_id,
+                    id,
+                    a.input_content,
+                    upload.offset,
+                    &upload.chunk,
+                    &[7; 32],
+                ),
+            ))
+            .as_bytes()
+            .to_vec();
+        let response = provider.upload(&upload, &context).await.unwrap();
+        assert!(response.refused.is_none(), "{response:?}");
+    }
+    provider.accept(&wire).await
+}
+
 #[tokio::test]
 async fn restart_pays_delivered_fetch_once_and_skips_lost_payload_jobs() {
     tokio::time::timeout(Duration::from_secs(15), async {
@@ -108,15 +152,11 @@ async fn restart_pays_delivered_fetch_once_and_skips_lost_payload_jobs() {
         let provider = fixture.provider().await;
         let mut client = fixture.client().await;
         let request = client.propose(&fixture.proposal()).await.unwrap();
-        let lost = client
-            .accepted(&provider.accept(&request).await)
-            .await
-            .unwrap();
+        let response = accept_uploaded_fetch(&fixture, &provider, &client, &request).await;
+        let lost = client.accepted(&response).await.unwrap();
         let request = client.propose(&fixture.proposal()).await.unwrap();
-        let delivered = client
-            .accepted(&provider.accept(&request).await)
-            .await
-            .unwrap();
+        let response = accept_uploaded_fetch(&fixture, &provider, &client, &request).await;
+        let delivered = client.accepted(&response).await.unwrap();
         assert_ne!(lost, delivered);
         let backend = Backend::default();
         run_accepted_work(&provider, &fixture.ready, &backend, delivered)

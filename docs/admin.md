@@ -43,6 +43,12 @@ for example `[{"meter":"Requests","window":"Day","amount":100}]`; an explicit `[
 removes budget limits. Changes preserve counters, reservations and outstanding work,
 so removing and restoring a limit cannot reset usage. Revision zero initializes a
 provider whose machine has not been configured. `status` includes the current limits.
+`work` also accepts `SetPaidPolicy { expected_revision, policy }` to set the
+provider's price, execution limits and automatic-offer bounds. It requires the
+authority owner's passkey session and `work.paid.configure` on the machine
+resource. The node generates the policy salt and retains the original terms
+with each signed offer; changing the standing policy does not alter open channels.
+
 `grant` accepts the
 Auth crate's `GrantCommand` JSON, including its explicit authorization grant and
 any required revision. Grant issuance and credential scope both bound the action;
@@ -119,6 +125,7 @@ table below is checked against the implementation by the Work tests.
 | `work.generation.reset` | Work machine | Provider |
 | `work.resource.configure` | Work machine | Provider |
 | `work.resource.repair` | Work machine | Provider |
+| `work.paid.configure` | Work machine | Provider |
 | `work.execute` | Selected allowance | Provider |
 <!-- operations:end -->
 

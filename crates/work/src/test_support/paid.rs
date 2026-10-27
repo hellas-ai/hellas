@@ -297,6 +297,127 @@ pub fn bundle_bytes(nonce: u8) -> Vec<u8> {
     }
 }
 
+/// A fixture client resolves its locally held objects before exercising the
+/// provider's upload and reference-only acceptance methods. Requests produced
+/// by ClientEndpoint already name a reference; hand-authored fixture requests
+/// still carry their local body here, before any provider call.
+pub fn fixture_uploads(
+    channel: &crate::model::work::PaidChannel,
+    request: &hellas_rpc::pb::work::AcceptWorkRequest,
+) -> (
+    hellas_rpc::pb::work::AcceptWorkRequest,
+    Vec<hellas_rpc::pb::work::UploadContentRequest>,
+) {
+    use crate::model::work::{PaidJobAuthorizationV2, PrivateRecord as _};
+    use hellas_rpc::protocol::content_upload::decode_reference;
+    let wire = request.clone();
+    let Ok(_) = PaidJobAuthorizationV2::decode(&request.authorization) else {
+        return (wire, Vec::new());
+    };
+    let bytes = if let Some(reference) = decode_reference(&request.prepared_input) {
+        let Some(bytes) = (0..=u8::MAX).map(bundle_bytes).find(|bytes| {
+            ContentId::hash(bytes) == reference.id() && bytes.len() as u64 == reference.bytes()
+        }) else {
+            return (wire, Vec::new());
+        };
+        bytes
+    } else {
+        request.prepared_input.clone()
+    };
+    input_uploads(channel, &wire, &bytes)
+}
+
+pub fn input_uploads(
+    channel: &crate::model::work::PaidChannel,
+    request: &hellas_rpc::pb::work::AcceptWorkRequest,
+    bytes: &[u8],
+) -> (
+    hellas_rpc::pb::work::AcceptWorkRequest,
+    Vec<hellas_rpc::pb::work::UploadContentRequest>,
+) {
+    use crate::model::work::{PaidJobAuthorizationV2, PrivateRecord as _, signing_hash, work_id};
+    use hellas_rpc::protocol::content_upload::{
+        CONTENT_CHUNK_BYTES, chunk_digest, encode_reference,
+    };
+    let mut wire = request.clone();
+    let Ok(a) = PaidJobAuthorizationV2::decode(&request.authorization) else {
+        return (wire, Vec::new());
+    };
+    let reference = hellas_rpc::ContentRef::new(ContentId::hash(bytes), bytes.len() as u64);
+    wire.prepared_input = encode_reference(reference);
+    let id = work_id(channel, &a);
+    let uploads = bytes
+        .chunks(CONTENT_CHUNK_BYTES)
+        .enumerate()
+        .map(|(index, bytes)| {
+            let offset = (index * CONTENT_CHUNK_BYTES) as u64;
+            let sig = client().sign(signing_hash(chunk_digest(
+                a.channel_id,
+                id,
+                reference,
+                offset,
+                bytes,
+                &[7; 32],
+            )));
+            hellas_rpc::pb::work::UploadContentRequest {
+                route: wire.route.clone(),
+                authorization: wire.authorization.clone(),
+                client_signature: wire.client_signature.clone(),
+                content_id: reference.id().as_bytes().to_vec(),
+                total_bytes: reference.bytes(),
+                offset,
+                chunk: bytes.to_vec(),
+                chunk_signature: sig.as_bytes().to_vec(),
+            }
+        })
+        .collect();
+    (wire, uploads)
+}
+pub async fn accept_uploaded(
+    endpoint: &mut crate::work::ProviderEndpoint,
+    request: &hellas_rpc::pb::work::AcceptWorkRequest,
+) -> hellas_rpc::pb::work::AcceptWorkResponse {
+    let (wire, uploads) = fixture_uploads(endpoint.state().channel(), request);
+    for upload in uploads {
+        if let Some(refusal) = super::upload_failure(endpoint.upload_content(
+            &upload,
+            &hellas_wire::TransportContext {
+                open_exporter: Some([7; 32]),
+                ..Default::default()
+            },
+        )) {
+            return refusal;
+        }
+    }
+    endpoint.accept(&wire).await
+}
+
+pub async fn accept_uploaded_service(
+    service: &crate::work::WorkService,
+    request: &hellas_rpc::pb::work::AcceptWorkRequest,
+) -> hellas_rpc::pb::work::AcceptWorkResponse {
+    let Ok(channel) = service.with_state(|state| state.channel().clone()).await else {
+        return service.accept(request).await;
+    };
+    let (wire, uploads) = fixture_uploads(&channel, request);
+    for upload in uploads {
+        if let Some(refusal) = super::upload_failure(
+            service
+                .upload(
+                    &upload,
+                    &hellas_wire::TransportContext {
+                        open_exporter: Some([7; 32]),
+                        ..Default::default()
+                    },
+                )
+                .await,
+        ) {
+            return refusal;
+        }
+    }
+    service.accept(&wire).await
+}
+
 pub async fn commit(store: &mut ChannelStore, record: ChannelRecord) {
     if let Err(error) = store.commit(record, &Secp256k1Verifier::new()).await {
         panic!("the fixture record commits: {error}");
@@ -372,6 +493,7 @@ pub fn work_policy() -> EvaluatePolicyV2 {
         max_spool_bytes: 1_048_576,
         max_encoded_result_frame: WIDE_FRAME,
         max_encoded_prepared_input: 1_048_576,
+        max_upload_bytes: 1_048_576,
     }
 }
 
@@ -441,4 +563,36 @@ pub fn descriptor_with(
         Ok(descriptor) => descriptor,
         Err(error) => panic!("the fixture channel opens: {error}"),
     }
+}
+
+pub async fn accept_uploaded_client(
+    service: &crate::work::WorkService,
+    client: &crate::work::ClientEndpoint,
+    request: &hellas_rpc::pb::work::AcceptWorkRequest,
+) -> hellas_rpc::pb::work::AcceptWorkResponse {
+    use crate::model::work::{PaidJobAuthorizationV2, PrivateRecord as _, work_id};
+    let Ok(a) = PaidJobAuthorizationV2::decode(&request.authorization) else {
+        return service.accept(request).await;
+    };
+    let id = work_id(client.state().channel(), &a);
+    let Some(job) = client.state().job_by_id(id) else {
+        return service.accept(request).await;
+    };
+    let (wire, uploads) = input_uploads(client.state().channel(), request, job.prepared_input());
+    for upload in uploads {
+        if let Some(refusal) = super::upload_failure(
+            service
+                .upload(
+                    &upload,
+                    &hellas_wire::TransportContext {
+                        open_exporter: Some([7; 32]),
+                        ..Default::default()
+                    },
+                )
+                .await,
+        ) {
+            return refusal;
+        }
+    }
+    service.accept(&wire).await
 }

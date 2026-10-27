@@ -11,6 +11,7 @@ use hellas_work::model::fetch::{
 };
 use hellas_work::model::profile::WorkPolicy;
 use hellas_work::model::work::PrivateRecord as _;
+use hellas_work::test_support::paid::accept_uploaded_client;
 use hellas_work::work::{ClientEndpoint, DeliverError, EndpointError, JobProposal};
 
 const PROMPT: &[u8] = br#"{"input":"private-customer-prompt-never-on-provider-disk"}"#;
@@ -63,7 +64,7 @@ async fn fetch_streams_before_terminal_then_pays_once_with_metadata_only_journal
         };
         let request = client.propose(&proposal).await.unwrap();
         let id = client
-            .accepted(&service.accept(&request).await)
+            .accepted(&accept_uploaded_client(&service, &client, &request).await)
             .await
             .unwrap();
         let release = Arc::new(tokio::sync::Notify::new());
@@ -140,6 +141,7 @@ fn policy() -> WorkPolicy {
             max_spool_bytes: 65536,
             max_encoded_result_frame: 65536,
             max_encoded_prepared_input: 65536,
+            max_upload_bytes: 65536,
         },
         route,
     }
@@ -170,7 +172,9 @@ async fn invalid_paid_authorizations_never_invoke_fetch() {
             request.client_signature[0] ^= 1;
         }
         assert!(matches!(
-            service.accept(&request).await.outcome,
+            accept_uploaded_client(&service, &client, &request)
+                .await
+                .outcome,
             Some(hellas_rpc::pb::work::accept_work_response::Outcome::Refused(_))
         ));
         let backend = FetchBackend::default();
@@ -322,7 +326,7 @@ async fn paid_fetch_larger_than_a_wire_frame_streams_and_pays_without_disk_paylo
     );
     let request = client.propose(&proposal()).await.unwrap();
     let id = client
-        .accepted(&service.accept(&request).await)
+        .accepted(&accept_uploaded_client(&service, &client, &request).await)
         .await
         .unwrap();
     run_accepted_work(&service, &ready, &LargeFetch, id)
@@ -379,7 +383,7 @@ async fn streamed_fetch_cannot_pay_without_a_complete_authenticated_terminal() {
         let service = service(provider_dir.path()).await;
         let request = client.propose(&proposal()).await.unwrap();
         let id = client
-            .accepted(&service.accept(&request).await)
+            .accepted(&accept_uploaded_client(&service, &client, &request).await)
             .await
             .unwrap();
         run_accepted_work(&service, &fetch_ready(), &FetchBackend::default(), id)
@@ -529,7 +533,7 @@ async fn fetch_is_run_delivered_and_paid_without_provider_disk_bodies() {
     let backend = FetchBackend::default();
     let request = client.propose(&proposal()).await.unwrap();
     let id = client
-        .accepted(&service.accept(&request).await)
+        .accepted(&accept_uploaded_client(&service, &client, &request).await)
         .await
         .unwrap();
     assert_no_bodies(provider_dir.path());
@@ -593,7 +597,7 @@ async fn restarting_an_accepted_fetch_never_reinvokes_from_a_missing_payload() {
     let service_before = service(provider_dir.path()).await;
     let request = client.propose(&proposal()).await.unwrap();
     let id = client
-        .accepted(&service_before.accept(&request).await)
+        .accepted(&accept_uploaded_client(&service_before, &client, &request).await)
         .await
         .unwrap();
     drop(service_before);
@@ -684,7 +688,7 @@ async fn fetch_output_limits_include_terminal_and_bad_results_are_never_payable(
     let service = service(provider_dir.path()).await;
     let request = client.propose(&proposal()).await.unwrap();
     let id = client
-        .accepted(&service.accept(&request).await)
+        .accepted(&accept_uploaded_client(&service, &client, &request).await)
         .await
         .unwrap();
     let RunAdmission::InvokeFetch(input) = service.begin_run(id, &fetch_ready()).await.unwrap()
@@ -726,7 +730,7 @@ async fn app_attest_paid_fetch_uses_the_signed_scheme_without_disk_payloads() {
     };
     let request = client.propose(&proposal).await.unwrap();
     let id = client
-        .accepted(&service.accept(&request).await)
+        .accepted(&accept_uploaded_client(&service, &client, &request).await)
         .await
         .unwrap();
     let backend = FetchBackend::default();

@@ -33,6 +33,7 @@ pub fn responses_policy(
                 max_spool_bytes: 4 << 20,
                 max_encoded_result_frame: 4 << 20,
                 max_encoded_prepared_input: 128 << 10,
+                max_upload_bytes: 128 << 10,
             },
             route,
             contract,

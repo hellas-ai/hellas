@@ -137,15 +137,30 @@ impl ProviderEndpoint {
 }
 
 impl WorkService {
+    async fn reserve_stream_durably(
+        &self,
+        request: &DeliverResultRequest,
+        exporter: &[u8; 32],
+    ) -> Result<(), DeliverError> {
+        let mut endpoint = self
+            .endpoint
+            .lock_owned()
+            .await
+            .map_err(|_| EndpointError::Poisoned)?;
+        let (request, exporter) = (request.clone(), *exporter);
+        // Acquire before spawning so disconnected waiters cannot accumulate
+        // detached tasks. A started SQLite append must outlive its RPC.
+        tokio::spawn(async move { endpoint.reserve_stream(&request, &exporter).await })
+            .await
+            .map_err(|_| DeliverError::Endpoint(EndpointError::Poisoned))?
+    }
+
     async fn check_stream_release(
         &self,
         request: &DeliverResultRequest,
         exporter: &[u8; 32],
     ) -> Result<(), WireStatus> {
-        let outcome = match self.endpoint().await {
-            Ok(mut endpoint) => endpoint.reserve_stream(request, exporter).await,
-            Err(error) => Err(DeliverError::from(error)),
-        };
+        let outcome = self.reserve_stream_durably(request, exporter).await;
         outcome
             .map_err(|error| WireStatus::new(hellas_wire::WireCode::Unavailable, error.to_string()))
     }
@@ -202,10 +217,7 @@ impl WorkService {
                 let changed = service.changed.notified();
                 tokio::pin!(changed);
                 changed.as_mut().enable();
-                let reserved = match service.endpoint().await {
-                    Ok(mut endpoint) => endpoint.reserve_stream(&request, &exporter).await,
-                    Err(error) => Err(DeliverError::from(error)),
-                };
+                let reserved = service.reserve_stream_durably(&request, &exporter).await;
                 match reserved {
                     Ok(()) => {
                         let limits = service.endpoint().await.and_then(|endpoint| {
@@ -513,6 +525,109 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn disconnect_during_plaintext_append_cannot_poison_the_provider_journal() {
+        use crate::model::setup::ObservedChannel;
+        use crate::test_support::paid as fixture;
+        use hellas_kernel::PendingSlot;
+        let provider_root = tempfile::tempdir().unwrap();
+        let client_root = tempfile::tempdir().unwrap();
+        let ready = fixture::descriptor()
+            .check_ready(&ObservedChannel {
+                height: fixture::CURSOR,
+                bond: Some(&fixture::bond_object()),
+                payment: Some(&fixture::payment_object()),
+                lease: fixture::lease_over(fixture::bond_edge(), fixture::payment_edge()),
+                pending: PendingSlot::Absent,
+            })
+            .unwrap();
+        let mut provider = ProviderEndpoint::new(
+            ready.clone(),
+            fixture::store_at(
+                provider_root.path(),
+                &ready,
+                Role::Provider,
+                fixture::CURSOR,
+            )
+            .await,
+            fixture::provider(),
+        )
+        .unwrap();
+        let mut client = ClientEndpoint::new(
+            ready.clone(),
+            fixture::store_at(client_root.path(), &ready, Role::Client, fixture::CURSOR).await,
+            fixture::client(),
+        )
+        .unwrap();
+        let proposal = client
+            .propose(&JobProposal {
+                prepared_input: fixture::bundle(1).into(),
+                deadlines: fixture::deadlines(),
+            })
+            .await
+            .unwrap();
+        let response = fixture::accept_uploaded(&mut provider, &proposal).await;
+        let work = client.accepted(&response).await.unwrap();
+        provider.begin_run(work, &ready).await.unwrap();
+        let request = client.request_delivery(work, &[7; 32]).unwrap();
+        let service = WorkService::new(provider);
+        let (entered, release) = service
+            .endpoint()
+            .await
+            .unwrap()
+            .close
+            .store
+            .pause_next_statement_for_test()
+            .await;
+        {
+            let reserve = service.reserve_stream_durably(&request, &[7; 32]);
+            tokio::pin!(reserve);
+            tokio::select! {
+                result = &mut reserve => panic!("append completed before cancellation: {result:?}"),
+                result = entered => result.unwrap(),
+            }
+        }
+        drop(release);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut endpoint = service.endpoint().await.unwrap();
+            endpoint
+                .close
+                .store
+                .commit(
+                    ChannelRecord::CursorAdvanced {
+                        height: fixture::CURSOR + 1,
+                        parent: fixture::payload_at(fixture::CURSOR),
+                        payload: fixture::payload_at(fixture::CURSOR + 1),
+                    },
+                    &Secp256k1Verifier::new(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                endpoint.state().job_by_id(work).unwrap().phase(),
+                JobPhase::Streaming
+            );
+        })
+        .await
+        .expect("the detached durable append finishes and the journal remains writable");
+        drop(service);
+        let store = ChannelStore::open(
+            provider_root.path(),
+            ready.channel().clone(),
+            fixture::settlement(),
+            Role::Provider,
+            fixture::origin(),
+            &Secp256k1Verifier::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            store.state().job_by_id(work).unwrap().phase(),
+            JobPhase::Streaming
+        );
+        assert_eq!(store.state().cursor().0, fixture::CURSOR + 1);
+    }
 
     #[test]
     fn batched_fetch_preserves_every_envelope_and_bounds_each_frame() {

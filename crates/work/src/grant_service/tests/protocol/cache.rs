@@ -64,7 +64,14 @@ async fn revoke_discards_active_and_completed_bodies_without_delivery_polling() 
             let a = GrantJobAuthorizationV1::decode(&request.authorization).unwrap();
             let backend = Backend::default();
             let (service, work, credential) = service(store, backend.clone(), &secret).await;
-            let id = accepted_id(work.accept(&request).await);
+            let id = accepted_id(
+                crate::test_support::accept_grant(
+                    &work,
+                    &request,
+                    &crate::test_support::principal(1).1,
+                )
+                .await,
+            );
             within(backend.started.notified()).await;
             if completed {
                 backend.finish.release();
@@ -161,7 +168,10 @@ async fn completed_cache_expires_without_a_delivery_or_mutation_and_never_owns_t
     .unwrap();
     let (work, _) = common_node::execution(&service, &secret, &principal(1).1, a.grant_id).await;
     set_execution_expiry(&service, &secret, UnixMillis(1100)).await;
-    let id = accepted_id(work.accept(&request).await);
+    let id = accepted_id(
+        crate::test_support::accept_grant(&work, &request, &crate::test_support::principal(1).1)
+            .await,
+    );
     within(backend.started.notified()).await;
     backend.finish.release();
     within(service.drain()).await.unwrap();
@@ -220,7 +230,14 @@ async fn discarded_prefix_still_verifies_usage_and_rejects_a_different_signed_co
             ..Backend::default()
         };
         let (service, work, credential) = service(store, backend.clone(), &secret).await;
-        let id = accepted_id(work.accept(&request).await);
+        let id = accepted_id(
+            crate::test_support::accept_grant(
+                &work,
+                &request,
+                &crate::test_support::principal(1).1,
+            )
+            .await,
+        );
         within(backend.started.notified()).await;
         let cache = cached(&service, id);
         assert!(cache.bytes() > 0);
@@ -271,7 +288,14 @@ async fn catalogue_change_discards_bodies_and_cancels_bound_responses_before_lat
         let a = GrantJobAuthorizationV1::decode(&request.authorization).unwrap();
         let backend = Backend::default();
         let (service, work, _) = service(store, backend.clone(), &secret).await;
-        let id = accepted_id(work.accept(&request).await);
+        let id = accepted_id(
+            crate::test_support::accept_grant(
+                &work,
+                &request,
+                &crate::test_support::principal(1).1,
+            )
+            .await,
+        );
         within(backend.started.notified()).await;
         if completed {
             backend.finish.release();

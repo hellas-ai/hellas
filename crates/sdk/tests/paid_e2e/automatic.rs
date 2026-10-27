@@ -87,13 +87,71 @@ impl WorkBackend for CpuEvaluate {
 /// Only arithmetic execution is a double. Setup, Work, journals, clocks and
 /// owner signatures use the native services and the six-validator chain.
 struct Provider {
+    node: hellas_sdk::FullNode,
+    funded_height: Arc<std::sync::atomic::AtomicU64>,
+    unavailable: Arc<std::sync::atomic::AtomicUsize>,
     endpoint: Endpoint,
     clock: WorkWatcher,
     serving: tokio::task::JoinHandle<()>,
     admin: hellas_work::grant_service::WorkAdministration,
 }
+
+#[derive(Clone)]
+struct RecoveringSetup {
+    inner: MountedSetup,
+    node: hellas_sdk::FullNode,
+    funded_height: Arc<std::sync::atomic::AtomicU64>,
+    unavailable: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl hellas_rpc::services::work_setup::WorkSetupHandler for RecoveringSetup {
+    async fn request_offer(
+        &self,
+        request: RequestOfferRequest,
+        context: hellas_wire::TransportContext,
+    ) -> Result<impl Into<hellas_rpc::call::WithTrailer<RequestOfferResponse>> + Send, WireStatus>
+    {
+        if !request.funding_coins.is_empty() {
+            let height = self
+                .funded_height
+                .swap(0, std::sync::atomic::Ordering::SeqCst);
+            if height != 0 {
+                self.node.require_finalized_height_for_test(height);
+            }
+        }
+        let result = self.inner.request_offer(request, context).await;
+        if result
+            .as_ref()
+            .is_err_and(|status| status.code() == hellas_wire::WireCode::Unavailable)
+        {
+            self.unavailable
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        result
+    }
+
+    async fn exchange_setup(
+        &self,
+        request: ExchangeSetupRequest,
+        context: hellas_wire::TransportContext,
+    ) -> Result<
+        impl Into<hellas_rpc::call::WithTrailer<hellas_rpc::pb::work::ExchangeSetupResponse>> + Send,
+        WireStatus,
+    > {
+        self.inner.exchange_setup(request, context).await
+    }
+}
 impl Provider {
-    async fn start(
+    fn start<'a>(
+        root: &'a std::path::Path,
+        config: WorkConfig,
+        node: hellas_sdk::FullNode,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> impl std::future::Future<Output = Self> + 'a {
+        Box::pin(Self::start_inner(root, config, node, calls))
+    }
+
+    async fn start_inner(
         root: &std::path::Path,
         config: WorkConfig,
         node: hellas_sdk::FullNode,
@@ -152,7 +210,7 @@ impl Provider {
         .await
         .unwrap()
         .on_node(
-            node,
+            node.clone(),
             authority,
             provider_enrollment(),
             endpoint
@@ -162,6 +220,14 @@ impl Provider {
                 .collect(),
         );
         let clock = WorkWatcher::spawn(runner);
+        let funded_height = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let unavailable = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let setup = RecoveringSetup {
+            inner: setup,
+            node: node.clone(),
+            funded_height: funded_height.clone(),
+            unavailable: unavailable.clone(),
+        };
         let router = WorkRouter::payment(work);
         let open = Arc::new(
             hellas_sdk::ProviderOpen::<ProducerSigningKey>::new(key, provider_enrollment(), None)
@@ -210,6 +276,9 @@ impl Provider {
             }
         });
         Self {
+            node,
+            funded_height,
+            unavailable,
             endpoint,
             clock,
             serving,
@@ -230,7 +299,7 @@ impl Provider {
                 auth::GrantId([0; 16]),
                 hellas_work::model::grant::admin::WorkControlCommand::SetPaidPolicy {
                     expected_revision: auth::Revision(revision),
-                    policy,
+                    policy: Box::new(policy),
                 },
             )
             .await
@@ -320,11 +389,11 @@ async fn request(
     )
     .await
 }
-fn granted(response: RequestOfferResponse) -> SignedPaidOffer {
+fn granted(response: RequestOfferResponse) -> Box<SignedPaidOffer> {
     let Some(Outcome::Granted(granted)) = response.outcome else {
         panic!("expected offer, got {response:?}")
     };
-    SignedPaidOffer::decode(&granted.offer).unwrap()
+    Box::new(SignedPaidOffer::decode(&granted.offer).unwrap())
 }
 fn refused(response: RequestOfferResponse, code: OfferRefusalCode) {
     let Some(Outcome::Refused(refused)) = response.outcome else {
@@ -378,32 +447,197 @@ fn revision_two(
         .unwrap()
 }
 
-pub(super) async fn exercise(runtime: commonware_runtime::tokio::Context) {
+async fn evaluate_and_settle(
+    devnet: &mut Devnet,
+    options: PaidWorkOptions,
+    endpoint: &Endpoint,
+    key: &Secp256k1Signer,
+    root: &std::path::Path,
+    provider: &Provider,
+    original: &SignedPaidOffer,
+) {
+    let authority = client_authority(&root.join("client-authority"), UnixMillis(1)).await;
+    let client_node = devnet.full_node(1).clone();
+    let coin = original
+        .offer()
+        .payment_funding
+        .maker()
+        .iter()
+        .next()
+        .copied()
+        .unwrap();
+    provider
+        .node
+        .require_finalized_height_for_test(devnet.height() + 1);
+    let mut unavailable_args = options.clone();
+    unavailable_args.timeout = Duration::from_millis(100);
+    let started = tokio::time::Instant::now();
+    let error = tokio::time::timeout(
+        Duration::from_secs(5),
+        hellas_sdk::paid_client::request_paid_quote(
+            &unavailable_args,
+            endpoint,
+            key,
+            FRIEND.principal(),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            hellas_sdk::paid_client::PaidClientError::Timeout {
+                stage: "offer availability"
+            }
+        ),
+        "bounded quote expiry: {error}"
+    );
+    assert!(started.elapsed() >= unavailable_args.timeout);
+    devnet.seal().await;
+
+    provider
+        .funded_height
+        .store(devnet.height() + 1, std::sync::atomic::Ordering::SeqCst);
+    let attempts = provider
+        .unavailable
+        .load(std::sync::atomic::Ordering::SeqCst);
+    let open = PaidWorkSession::open(
+        options.clone(),
+        endpoint.clone(),
+        key.clone(),
+        client_node.clone(),
+        authority.clone(),
+    );
+    tokio::pin!(open);
+    tokio::time::timeout(options.timeout, async {
+        tokio::select! {
+            result = &mut open => panic!("setup ended before provider recovery: {}", result.err().map_or_else(|| "unexpected success".into(), |error| error.to_string())),
+            () = async {
+                while provider.unavailable.load(std::sync::atomic::Ordering::SeqCst) < attempts + 2 { tokio::task::yield_now().await; }
+            } => {},
+        }
+    }).await.expect("the same funded offer request retries while the provider is behind");
+    let mut session = sealing_while(devnet, Duration::from_millis(100), &mut open)
+        .await
+        .unwrap();
+    assert_eq!(
+        session.descriptor().bond_edge(),
+        original.offer().proposal.bond_edge()
+    );
+    // Idempotence survives consumption of the originally proven payment coins.
+    assert_eq!(
+        granted(
+            request(
+                endpoint,
+                provider,
+                devnet.network(),
+                FRIEND,
+                key,
+                &[coin],
+                None
+            )
+            .await
+            .unwrap()
+        )
+        .encode()
+        .unwrap(),
+        original.encode().unwrap()
+    );
+    // The sealing driver finishes its last block even when setup wins the
+    // race. Reopen from journals on that stable tip before testing payment.
+    session.shutdown().await;
+    drop(session);
+    let mut session = PaidWorkSession::open(
+        options,
+        endpoint.clone(),
+        key.clone(),
+        client_node,
+        authority,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        session.descriptor().bond_edge(),
+        original.offer().proposal.bond_edge()
+    );
+    let result = session
+        .run(
+            Some(hellas_work::test_support::paid::bundle(7).into()),
+            false,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.job_price, JOB_PRICE);
+    assert_eq!(result.credited_cumulative, JOB_PRICE);
+    assert_eq!(
+        sealing_while(devnet, Duration::from_millis(100), session.settle())
+            .await
+            .unwrap(),
+        JOB_PRICE
+    );
+    session.shutdown().await;
+    drop(session);
+}
+
+pub(super) fn exercise(
+    runtime: commonware_runtime::tokio::Context,
+) -> impl std::future::Future<Output = ()> {
+    Box::pin(exercise_inner(runtime))
+}
+
+struct Case {
+    root: tempfile::TempDir,
+    devnet: Devnet,
+    chain: RemoteLightClient,
+    owners: [GenesisOwner; 5],
+    keys: Vec<Secp256k1Signer>,
+    payment_coins: Vec<CoinId>,
+    config: WorkConfig,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    provider: Provider,
+    endpoint: Endpoint,
+    policy: hellas_work::model::paid_policy::PaidPolicy,
+    secret: auth::CredentialSecret,
+    first: Box<SignedPaidOffer>,
+    second: Box<SignedPaidOffer>,
+    third: Box<SignedPaidOffer>,
+    interrupted_root: std::path::PathBuf,
+}
+
+async fn exercise_inner(runtime: commonware_runtime::tokio::Context) {
+    let case = Box::pin(allocate(runtime)).await;
+    Box::pin(finish(case)).await;
+}
+
+async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
     let root = tempfile::tempdir().unwrap();
     let owners = [
         GenesisOwner {
             kind: OwnerKind::Passkey,
-            seed: 0x11,
-            balance: 36,
+            secret_scalar: [0x11; 32],
+            balance: 39,
         },
         GenesisOwner {
             kind: OwnerKind::Passkey,
-            seed: 0x13,
+            secret_scalar: [0x13; 32],
+            balance: 3 * FUNDING,
+        },
+        GenesisOwner {
+            kind: OwnerKind::Passkey,
+            secret_scalar: [0x12; 32],
+            balance: 2 * FUNDING,
+        },
+        GenesisOwner {
+            kind: OwnerKind::Passkey,
+            secret_scalar: [0x14; 32],
             balance: FUNDING,
         },
         GenesisOwner {
             kind: OwnerKind::Passkey,
-            seed: 0x12,
-            balance: FUNDING,
-        },
-        GenesisOwner {
-            kind: OwnerKind::Passkey,
-            seed: 0x14,
-            balance: FUNDING,
-        },
-        GenesisOwner {
-            kind: OwnerKind::Passkey,
-            seed: 0x16,
+            secret_scalar: [0x16; 32],
             balance: FUNDING,
         },
     ];
@@ -426,6 +660,8 @@ pub(super) async fn exercise(runtime: commonware_runtime::tokio::Context) {
         .await
         .unwrap();
     let mut payment_coins = Vec::new();
+    let mut alternate_funding = Vec::new();
+    let mut short_funding = None;
     for index in 0..owners.len() {
         assert_eq!(
             owners[index].key().into_kernel().to_bytes(),
@@ -452,7 +688,24 @@ pub(super) async fn exercise(runtime: commonware_runtime::tokio::Context) {
             )
             .await
             .unwrap();
-            assert_eq!(plan.outputs().len(), 3);
+            assert_eq!(plan.outputs().len(), 4);
+            let outputs: Vec<_> = plan.outputs().iter().cloned().collect();
+            assert_eq!(
+                outputs.iter().map(|p| p.value()).collect::<Vec<_>>(),
+                vec![12, 12, 12, 3]
+            );
+            assert_eq!(
+                outputs[3],
+                hellas_kernel::Payout::new(owners[0].key().into_kernel(), 3)
+            );
+            assert!(
+                plan.clone()
+                    .authorize(hellas_kernel::Auth::native(
+                        keys[0].sign(plan.payload_hash())
+                    ))
+                    .is_err(),
+                "node delegation never grants reshape authority"
+            );
             let tx = plan
                 .clone()
                 .authorize(owners[0].authorize(plan.payload_hash()))
@@ -461,12 +714,114 @@ pub(super) async fn exercise(runtime: commonware_runtime::tokio::Context) {
                 .submit_tx(hellas_chain::domain::Transaction::Kernel(tx))
                 .await
                 .unwrap();
+        } else if index <= 2 {
+            let hellas_chain::domain::Transaction::Kernel(hellas_kernel::Tx::Owner(reshape)) = tx
+            else {
+                panic!("owner delegation")
+            };
+            let selected: Vec<_> = reshape.inputs().iter().copied().collect();
+            let plan = hellas_sdk::coin_owner::OwnerReshape::prepare(
+                &chain,
+                devnet.network(),
+                owners[index].key().into_kernel(),
+                &selected,
+                Some(keys[index].party_key()),
+                Some(FUNDING),
+            )
+            .await
+            .unwrap();
+            let ids: Vec<_> = plan.output_ids().iter().copied().collect();
+            assert_eq!(ids.len(), if index == 1 { 3 } else { 2 });
+            if index == 1 {
+                short_funding = Some(ids[2]);
+            }
+            payment_coins.push(ids[0]);
+            alternate_funding.push((index, ids[1]));
+            let tx = plan
+                .clone()
+                .authorize(owners[index].authorize(plan.payload_hash()))
+                .unwrap();
+            chain
+                .submit_tx(hellas_chain::domain::Transaction::Kernel(tx))
+                .await
+                .unwrap();
+            continue;
         } else {
             chain.submit_tx(tx).await.unwrap();
         }
         payment_coins.push(coin);
     }
     devnet.seal().await;
+    let mut alternate_coins = std::collections::BTreeMap::new();
+    for (index, coin) in alternate_funding {
+        let other_key = if index == 1 { &keys[2] } else { &keys[1] };
+        let plan = hellas_sdk::coin_owner::OwnerReshape::prepare(
+            &chain,
+            devnet.network(),
+            owners[index].key().into_kernel(),
+            &[coin],
+            Some(other_key.party_key()),
+            None,
+        )
+        .await
+        .unwrap();
+        alternate_coins.insert(index, *plan.output_ids().iter().next().unwrap());
+        let tx = plan
+            .clone()
+            .authorize(owners[index].authorize(plan.payload_hash()))
+            .unwrap();
+        chain
+            .submit_tx(hellas_chain::domain::Transaction::Kernel(tx))
+            .await
+            .unwrap();
+    }
+    let short_plan = hellas_sdk::coin_owner::OwnerReshape::prepare(
+        &chain,
+        devnet.network(),
+        owners[1].key().into_kernel(),
+        &[short_funding.unwrap()],
+        Some(keys[1].party_key()),
+        Some(FUNDING - 1),
+    )
+    .await
+    .unwrap();
+    let short_coin = *short_plan.output_ids().iter().next().unwrap();
+    let short_tx = short_plan
+        .clone()
+        .authorize(owners[1].authorize(short_plan.payload_hash()))
+        .unwrap();
+    chain
+        .submit_tx(hellas_chain::domain::Transaction::Kernel(short_tx))
+        .await
+        .unwrap();
+    devnet.seal().await;
+    let tip = chain.get_latest_block().await.unwrap().unwrap();
+    for (index, id) in &alternate_coins {
+        let coin = chain
+            .get_coin(tip.payload, id.to_bytes().into())
+            .await
+            .unwrap()
+            .unwrap();
+        let delegate = if *index == 1 {
+            keys[2].party_key()
+        } else {
+            keys[1].party_key()
+        };
+        assert_eq!(coin.owner.into_kernel(), owners[*index].key().into_kernel());
+        assert_eq!(coin.delegate.map(|key| key.into_kernel()), Some(delegate));
+        assert_eq!(coin.value, FUNDING);
+    }
+    let short = chain
+        .get_coin(tip.payload, short_coin.to_bytes().into())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(short.owner.into_kernel(), owners[1].key().into_kernel());
+    assert_eq!(
+        short.delegate.map(|key| key.into_kernel()),
+        Some(keys[1].party_key())
+    );
+    assert_eq!(short.value, FUNDING - 1);
     let (store, secret) = hellas_work::test_support::common_node::bootstrap_node_with_credential(
         &root.path().join("authority"),
         hellas_work::model::grant::grant_network(),
@@ -585,6 +940,23 @@ pub(super) async fn exercise(runtime: commonware_runtime::tokio::Context) {
         .unwrap(),
         OfferRefusalCode::NeedsFunding,
     );
+    for coins in [vec![short_coin], vec![payment_coins[1], short_coin]] {
+        refused(
+            request(
+                &endpoint,
+                &provider,
+                devnet.network(),
+                FRIEND,
+                &keys[1],
+                &coins,
+                None,
+            )
+            .await
+            .unwrap(),
+            OfferRefusalCode::NeedsFunding,
+        );
+    }
+    assert_eq!(files(&config.journal_root), 0);
     let quote = request(
         &endpoint,
         &provider,
@@ -601,6 +973,43 @@ pub(super) async fn exercise(runtime: commonware_runtime::tokio::Context) {
     };
     assert_eq!(quote.funding_value, FUNDING);
     assert_eq!(files(&config.journal_root), 0);
+    std::fs::write(&config.journal_root, b"blocked journal root").unwrap();
+    assert!(
+        request(
+            &endpoint,
+            &provider,
+            devnet.network(),
+            FRIEND,
+            &keys[1],
+            &[payment_coins[1]],
+            None
+        )
+        .await
+        .is_err()
+    );
+    std::fs::remove_file(&config.journal_root).unwrap();
+    assert!(
+        request(
+            &endpoint,
+            &provider,
+            devnet.network(),
+            FRIEND,
+            &keys[1],
+            &[payment_coins[1]],
+            None
+        )
+        .await
+        .is_err(),
+        "an ambiguous durable failure cannot be followed by another allocation"
+    );
+    provider.shutdown().await;
+    provider = Provider::start(
+        root.path(),
+        config.clone(),
+        devnet.full_node(0).clone(),
+        calls.clone(),
+    )
+    .await;
     let first = granted(
         request(
             &endpoint,
@@ -623,6 +1032,34 @@ pub(super) async fn exercise(runtime: commonware_runtime::tokio::Context) {
         .unwrap()
     );
     let before = files(&config.journal_root);
+    assert!(
+        request(
+            &endpoint,
+            &provider,
+            devnet.network(),
+            FRIEND,
+            &keys[2],
+            &[alternate_coins[&1]],
+            None
+        )
+        .await
+        .is_err(),
+        "one live offer per principal"
+    );
+    assert!(
+        request(
+            &endpoint,
+            &provider,
+            devnet.network(),
+            OPERATOR,
+            &keys[1],
+            &[alternate_coins[&2]],
+            None
+        )
+        .await
+        .is_err(),
+        "one live offer per key"
+    );
     assert_eq!(
         granted(
             request(
@@ -755,6 +1192,30 @@ pub(super) async fn exercise(runtime: commonware_runtime::tokio::Context) {
         .await
         .unwrap(),
     );
+    // Simulate a client interrupted after accepting revision one. Its funding
+    // stays live; recovery after the horizon must ask for a fresh offer.
+    let interrupted_root = root.path().join("interrupted-client");
+    let mut interrupted = SetupStore::open(
+        &interrupted_root,
+        devnet.network(),
+        third.offer().proposal.bond_edge(),
+        Role::Client,
+        &hellas_kernel::Secp256k1Verifier::new(),
+    )
+    .await
+    .unwrap();
+    interrupted
+        .commit(
+            hellas_work::work_store::SetupRecord::Offer {
+                peer: *provider.endpoint.id().as_bytes(),
+                floor: None,
+                offer: third.clone(),
+            },
+            &hellas_kernel::Secp256k1Verifier::new(),
+        )
+        .await
+        .unwrap();
+    drop(interrupted);
     policy.offers.max_open_offers = 4;
     provider.policy(&secret, 2, policy.clone()).await;
     refused(
@@ -832,6 +1293,45 @@ pub(super) async fn exercise(runtime: commonware_runtime::tokio::Context) {
         .unwrap(),
         first.encode().unwrap()
     );
+    Box::new(Case {
+        root,
+        devnet,
+        chain,
+        owners,
+        keys,
+        payment_coins,
+        config,
+        calls,
+        provider,
+        endpoint,
+        policy,
+        secret,
+        first,
+        second,
+        third,
+        interrupted_root,
+    })
+}
+
+async fn finish(case: Box<Case>) {
+    let Case {
+        root,
+        mut devnet,
+        chain,
+        owners,
+        keys,
+        payment_coins,
+        config,
+        calls,
+        mut provider,
+        endpoint,
+        mut policy,
+        secret,
+        first,
+        second,
+        third,
+        interrupted_root,
+    } = *case;
     let options = PaidWorkOptions {
         config: config.clone(),
         journal_root: root.path().join("client"),
@@ -846,64 +1346,16 @@ pub(super) async fn exercise(runtime: commonware_runtime::tokio::Context) {
         payment_blocks: 32,
         timeout: Duration::from_secs(120),
     };
-    let client_authority =
-        client_authority(&root.path().join("client-authority"), UnixMillis(1)).await;
-    let client_node = devnet.full_node(1).clone();
-    let mut session = sealing_while(
+    Box::pin(evaluate_and_settle(
         &mut devnet,
-        Duration::from_millis(100),
-        PaidWorkSession::open(
-            options.clone(),
-            endpoint.clone(),
-            keys[1].clone(),
-            client_node,
-            client_authority.clone(),
-        ),
-    )
-    .await
-    .unwrap();
-    assert_eq!(
-        session.descriptor().bond_edge(),
-        first.offer().proposal.bond_edge()
-    );
-    // Idempotence survives consumption of the originally proven payment coins.
-    assert_eq!(
-        granted(
-            request(
-                &endpoint,
-                &provider,
-                devnet.network(),
-                FRIEND,
-                &keys[1],
-                &[payment_coins[1]],
-                None
-            )
-            .await
-            .unwrap()
-        )
-        .encode()
-        .unwrap(),
-        first.encode().unwrap()
-    );
-    let result = session
-        .run(
-            Some(hellas_work::test_support::paid::bundle(7).into()),
-            false,
-            None,
-        )
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(result.job_price, JOB_PRICE);
-    assert_eq!(result.credited_cumulative, JOB_PRICE);
-    assert_eq!(
-        sealing_while(&mut devnet, Duration::from_millis(100), session.settle())
-            .await
-            .unwrap(),
-        JOB_PRICE
-    );
-    session.shutdown().await;
-    drop(session);
+        options.clone(),
+        &endpoint,
+        &keys[1],
+        root.path(),
+        &provider,
+        &first,
+    ))
+    .await;
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert_eq!(
         holdings(&devnet, owners[1].key())
@@ -911,7 +1363,7 @@ pub(super) async fn exercise(runtime: commonware_runtime::tokio::Context) {
             .iter()
             .map(|(_, v)| *v)
             .sum::<u64>(),
-        FUNDING - JOB_PRICE
+        owners[1].balance - JOB_PRICE
     );
     // A malicious no-show can post its countersigned bond alone. The same
     // production clock reclaims it without waiting for a payment proposal.
@@ -932,7 +1384,8 @@ pub(super) async fn exercise(runtime: commonware_runtime::tokio::Context) {
         .into_iter()
         .flat_map(|o| o.offer().proposal.bond_funding().maker().iter().copied())
         .collect();
-    for _ in 0..20 {
+    let reclaim_deadline = tokio::time::Instant::now() + hellas_chain::node::RECOVERY_TIMEOUT;
+    loop {
         if holdings(&devnet, owners[0].key())
             .await
             .iter()
@@ -940,7 +1393,15 @@ pub(super) async fn exercise(runtime: commonware_runtime::tokio::Context) {
         {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            tokio::time::Instant::now() < reclaim_deadline,
+            "partial bond reclaimed within the chain recovery bound"
+        );
+        assert!(
+            devnet.height() < second.offer().proposal.bond_terms().timeout.get(),
+            "unleased bond reclaimed before its horizon"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
         devnet.seal().await;
     }
     assert!(
@@ -966,7 +1427,7 @@ pub(super) async fn exercise(runtime: commonware_runtime::tokio::Context) {
             .iter()
             .map(|(_, v)| *v)
             .sum::<u64>()
-            == 36 + JOB_PRICE
+            == 39 + JOB_PRICE
         {
             break;
         }
@@ -974,9 +1435,20 @@ pub(super) async fn exercise(runtime: commonware_runtime::tokio::Context) {
         devnet.seal().await;
     }
     let held = holdings(&devnet, owners[0].key()).await;
-    assert_eq!(held.iter().map(|(_, v)| *v).sum::<u64>(), 36 + JOB_PRICE);
+    assert_eq!(held.iter().map(|(_, v)| *v).sum::<u64>(), 39 + JOB_PRICE);
     assert_eq!(held.iter().filter(|(_, v)| *v == 12).count(), 3);
     assert_eq!(held.iter().filter(|(_, v)| *v == JOB_PRICE).count(), 1);
+    let transport = connect_offer(&endpoint, &provider).await;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let response = hellas_rpc::call::unary::<_,hellas_rpc::services::work_setup::ExchangeSetup>(
+                &transport, ExchangeSetupRequest { bond_edge: third.offer().proposal.bond_edge().to_bytes().to_vec(), bundle: vec![] }, Metadata::new(),
+            ).await.unwrap();
+            if matches!(response.outcome, Some(exchange_setup_response::Outcome::Refused(ref r)) if r.code == hellas_work::work::WorkRefusal::Expired.code() as i32) { break; }
+            tokio::time::sleep(config.poll).await;
+        }
+    }).await.expect("the unanswered offer durably expires at its horizon");
+    drop(transport);
     provider.shutdown().await;
     let store = SetupStore::open(
         &config.journal_root,
@@ -992,6 +1464,65 @@ pub(super) async fn exercise(runtime: commonware_runtime::tokio::Context) {
         Some(SetupEnd::Aborted(SetupAbort::BondOpenExpired))
     );
     drop(store);
+    provider = Provider::start(
+        root.path(),
+        config.clone(),
+        devnet.full_node(0).clone(),
+        calls.clone(),
+    )
+    .await;
+    policy.offers.max_stake_per_client = 11;
+    provider.policy(&secret, 3, policy.clone()).await;
+    refused(
+        request(
+            &endpoint,
+            &provider,
+            devnet.network(),
+            STRANGER,
+            &keys[4],
+            &[payment_coins[4]],
+            None,
+        )
+        .await
+        .unwrap(),
+        OfferRefusalCode::NoStakeAvailable,
+    );
+    policy.offers.max_stake_per_client = 12;
+    provider.policy(&secret, 4, policy).await;
+    let mut fresh_args = options;
+    fresh_args.journal_root = interrupted_root;
+    fresh_args.provider_addrs = provider.endpoint.bound_sockets();
+    fresh_args.payment_funding = third.offer().payment_funding.clone();
+    let agent_authority =
+        client_authority_for(&root.path().join("agent-authority"), UnixMillis(1), AGENT).await;
+    let client_node = devnet.full_node(1).clone();
+    let mut fresh = sealing_while(
+        &mut devnet,
+        Duration::from_millis(100),
+        PaidWorkSession::open(
+            fresh_args,
+            endpoint.clone(),
+            keys[3].clone(),
+            client_node,
+            agent_authority,
+        ),
+    )
+    .await
+    .unwrap();
+    assert_ne!(
+        fresh.descriptor().bond_edge(),
+        third.offer().proposal.bond_edge(),
+        "expired client revision one cannot pin recovery to a dead offer"
+    );
+    assert_eq!(
+        sealing_while(&mut devnet, Duration::from_millis(100), fresh.settle())
+            .await
+            .unwrap(),
+        0
+    );
+    fresh.shutdown().await;
+    drop(fresh);
+    provider.shutdown().await;
     endpoint.close().await;
     devnet.shutdown().await;
 }

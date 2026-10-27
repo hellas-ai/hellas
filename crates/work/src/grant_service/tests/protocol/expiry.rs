@@ -78,7 +78,14 @@ async fn authority_expiry_wakes_delivery_and_rejects_buffered_output() {
                     work_service
                 }
             };
-            let id = accepted_id(work_service.accept(&request).await);
+            let id = accepted_id(
+                crate::test_support::accept_grant(
+                    &work_service,
+                    &request,
+                    &crate::test_support::principal(1).1,
+                )
+                .await,
+            );
             within(backend.started.notified()).await;
             let cache = cache::cached(&service, id);
             if completed {

@@ -27,6 +27,8 @@ pub use setup::{
 /// Why a durable step could not be taken.
 #[derive(Debug, thiserror::Error)]
 pub enum WorkStoreError {
+    #[error(transparent)]
+    Content(#[from] crate::content::ContentError),
     /// The file could not be opened, replayed, or appended to.
     #[error(transparent)]
     Journal(#[from] JournalError),

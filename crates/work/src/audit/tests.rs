@@ -137,14 +137,17 @@ async fn checked_services_audit_reads_and_final_refusals_without_request_content
         assert_eq!(event["reason"], "permission_denied");
     }
     // Permission succeeds, but unavailable execution capacity refuses the final operation.
-    let response = work
-        .accept(&AcceptWorkRequest {
+    let response = common::accept_grant(
+        &work,
+        &AcceptWorkRequest {
             route: Some(WorkRoute::grant(authorization.channel_id.0)),
             authorization: authorization.encode(),
             client_signature: signature.bytes().to_vec(),
             prepared_input: input.encode().unwrap(),
-        })
-        .await;
+        },
+        &common::principal(1).1,
+    )
+    .await;
     assert!(matches!(
         response.outcome,
         Some(accept_work_response::Outcome::Refused(_))

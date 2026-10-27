@@ -43,6 +43,7 @@ use hellas_work::test_support::paid::{
     payment_terms, prompt_tokens, provider, settlement, signer, text_execution, text_policy,
     work_policy,
 };
+use hellas_work::test_support::paid::{accept_uploaded, accept_uploaded_service};
 use hellas_work::work::{
     ClientEndpoint, CloseEndpoint, EndpointError, JobProposal, ProposeError, ProviderEndpoint,
     WorkRefusal, WorkService, propose_work,
@@ -168,7 +169,12 @@ fn request(authorization: &PaidJobAuthorizationV2, signature: Sig, nonce: u8) ->
         )),
         authorization: authorization.encode(),
         client_signature: signature.as_bytes().to_vec(),
-        prepared_input: bundle_bytes(nonce),
+        prepared_input: hellas_rpc::protocol::content_upload::encode_reference(
+            hellas_rpc::ContentRef::new(
+                ContentId::hash(&bundle_bytes(nonce)),
+                bundle_bytes(nonce).len() as u64,
+            ),
+        ),
     }
 }
 
@@ -547,7 +553,7 @@ async fn a_driver_naming_a_job_this_channel_does_not_hold_is_refused() {
 
     let root = temp();
     let service = WorkService::new(provider_endpoint(root.path()).await);
-    accepted_signature(&service.accept(&signed_request(1, 1)).await);
+    accepted_signature(&accept_uploaded_service(&service, &signed_request(1, 1)).await);
     let chain = HeldChain::over((CURSOR + 1)..=(CURSOR + 3), &open);
     let fetches = Arc::clone(&chain.fetches);
     let stranger = service
@@ -701,7 +707,7 @@ async fn a_proposal_is_answered_while_a_drive_waits_on_the_chain() {
 
     let answering = tokio::spawn({
         let service = service.clone();
-        async move { service.accept(&signed_request(1, 1)).await }
+        async move { accept_uploaded_service(&service, &signed_request(1, 1)).await }
     });
     let answered = tokio::time::timeout(std::time::Duration::from_secs(10), answering).await;
     let Ok(Ok(response)) = answered else {
@@ -744,7 +750,7 @@ async fn a_proposal_is_answered_while_a_close_drive_waits_on_the_chain() {
 
     let answering = tokio::spawn({
         let service = service.clone();
-        async move { service.accept(&signed_request(1, 1)).await }
+        async move { accept_uploaded_service(&service, &signed_request(1, 1)).await }
     });
     let answered = tokio::time::timeout(std::time::Duration::from_secs(10), answering).await;
     let Ok(Ok(response)) = answered else {
@@ -836,7 +842,13 @@ async fn a_client_journals_its_signature_before_the_request_leaves() {
         "the signature on the disk is the signature on the wire",
     );
     assert_eq!(job.authorization().encode(), request.authorization);
-    assert_eq!(job.prepared_input(), request.prepared_input);
+    assert_eq!(
+        hellas_rpc::protocol::content_upload::encode_reference(hellas_rpc::ContentRef::new(
+            ContentId::hash(job.prepared_input()),
+            job.prepared_input().len() as u64
+        )),
+        request.prepared_input
+    );
 }
 
 #[tokio::test]
@@ -891,7 +903,7 @@ async fn a_retained_proposal_survives_restart_expiry_and_policy_change() {
     let first = endpoint.propose(&proposal(1)).await.unwrap();
     let work_id = endpoint.state().jobs().next().unwrap().work_id();
     let mut provider_endpoint = provider_endpoint(provider_root.path()).await;
-    let response = provider_endpoint.accept(&first).await;
+    let response = accept_uploaded(&mut provider_endpoint, &first).await;
     drop(endpoint); // The provider response was lost before journaling.
 
     let mut policy = work_policy();
@@ -906,7 +918,10 @@ async fn a_retained_proposal_survives_restart_expiry_and_policy_change() {
     let resumed = endpoint.resume_proposal(work_id).await.unwrap();
     assert_eq!(resumed, first);
     assert_eq!(endpoint.state().proposal_nonce_high_water(), 1);
-    assert_eq!(provider_endpoint.accept(&resumed).await, response);
+    assert_eq!(
+        accept_uploaded(&mut provider_endpoint, &resumed).await,
+        response
+    );
     assert_eq!(endpoint.accepted(&response).await.unwrap(), work_id);
 }
 
@@ -924,7 +939,7 @@ async fn a_different_proposal_waits_for_the_outstanding_reply() {
     assert_eq!(endpoint.propose(&proposal(1)).await.unwrap(), first);
     let provider_root = temp();
     let mut provider_endpoint = provider_endpoint(provider_root.path()).await;
-    let response = provider_endpoint.accept(&first).await;
+    let response = accept_uploaded(&mut provider_endpoint, &first).await;
     endpoint.accepted(&response).await.unwrap();
     assert!(endpoint.propose(&proposal(2)).await.is_ok());
     assert_eq!(
@@ -1167,7 +1182,7 @@ fn phase_of(state: &Channel) -> Option<JobPhase> {
 async fn the_co_signature_is_on_the_disk_before_it_is_answered() {
     let root = temp();
     let mut endpoint = provider_endpoint(root.path()).await;
-    let response = endpoint.accept(&signed_request(1, 1)).await;
+    let response = accept_uploaded(&mut endpoint, &signed_request(1, 1)).await;
     let signature = accepted_signature(&response);
     drop(endpoint);
 
@@ -1189,7 +1204,7 @@ async fn nothing_is_journaled_for_a_proposal_that_is_refused() {
     let mut foreign = authorization(1, 1);
     foreign.channel_id = Digest::from_bytes([0x00; 32]);
     let signature = client().sign(signing_hash(work_id(ready().channel(), &foreign)));
-    let response = endpoint.accept(&request(&foreign, signature, 1)).await;
+    let response = accept_uploaded(&mut endpoint, &request(&foreign, signature, 1)).await;
 
     assert_eq!(refusal_code(&response), WorkRefusalCode::Invalid);
     assert!(before && endpoint.state().jobs().next().is_none());
@@ -1220,7 +1235,7 @@ async fn a_price_the_policy_does_not_fix_is_refused_before_anything_is_journaled
     let mut overpriced = authorization(1, 1);
     overpriced.price = PRICE + 1;
     let signature = client().sign(signing_hash(work_id(ready().channel(), &overpriced)));
-    let response = endpoint.accept(&request(&overpriced, signature, 1)).await;
+    let response = accept_uploaded(&mut endpoint, &request(&overpriced, signature, 1)).await;
 
     assert_eq!(
         refusal_code(&response),
@@ -1244,8 +1259,8 @@ async fn a_price_the_policy_does_not_fix_is_refused_before_anything_is_journaled
 async fn a_retry_returns_the_retained_co_signature() {
     let root = temp();
     let mut endpoint = provider_endpoint(root.path()).await;
-    let first = accepted_signature(&endpoint.accept(&signed_request(1, 1)).await);
-    let second = accepted_signature(&endpoint.accept(&signed_request(1, 1)).await);
+    let first = accepted_signature(&accept_uploaded(&mut endpoint, &signed_request(1, 1)).await);
+    let second = accepted_signature(&accept_uploaded(&mut endpoint, &signed_request(1, 1)).await);
     assert_eq!(first, second);
 }
 
@@ -1259,7 +1274,7 @@ async fn a_retry_after_the_deadline_still_returns_the_retained_signature() {
         .await
         .expect("the client journals its proposal");
     let mut endpoint = provider_endpoint(root.path()).await;
-    let first = accepted_signature(&endpoint.accept(&request).await);
+    let first = accepted_signature(&accept_uploaded(&mut endpoint, &request).await);
     drop(endpoint);
     drop(caller); // The acceptance acknowledgement never reached the client.
 
@@ -1289,7 +1304,7 @@ async fn a_retry_after_the_deadline_still_returns_the_retained_signature() {
         first,
         "an answer already given is not unsaid by a passing height",
     );
-    assert_eq!(service.accept(&resumed).await, again);
+    assert_eq!(accept_uploaded_service(&service, &resumed).await, again);
     assert_eq!(
         service.with_state(Channel::checkpoint).await.unwrap(),
         checkpoint
@@ -1354,9 +1369,7 @@ async fn a_crash_between_the_two_commits_co_signs_on_retry() {
         Some(JobPhase::HalfSigned),
         "the reopened provider is half-signed",
     );
-    let response = endpoint
-        .accept(&request(&authorization, signature, 1))
-        .await;
+    let response = accept_uploaded(&mut endpoint, &request(&authorization, signature, 1)).await;
     assert_eq!(phase_of(endpoint.state()), Some(JobPhase::Accepted),);
     accepted_signature(&response);
 }
@@ -1373,7 +1386,7 @@ async fn a_provider_with_no_finalized_block_is_not_ready() {
     ) else {
         panic!("the endpoint binds");
     };
-    let response = endpoint.accept(&signed_request(1, 1)).await;
+    let response = accept_uploaded(&mut endpoint, &signed_request(1, 1)).await;
     assert_eq!(refusal_code(&response), WorkRefusalCode::NotReady);
     assert!(WorkRefusal::NotReady.is_retryable());
 }
@@ -1389,7 +1402,7 @@ async fn an_authorization_past_its_acceptance_deadline_expires() {
     let Ok(mut endpoint) = ProviderEndpoint::new(ready(), late, provider()) else {
         panic!("the endpoint binds");
     };
-    let response = endpoint.accept(&signed_request(1, 1)).await;
+    let response = accept_uploaded(&mut endpoint, &signed_request(1, 1)).await;
     assert_eq!(refusal_code(&response), WorkRefusalCode::Expired);
     assert!(!WorkRefusal::Expired.is_retryable());
     drop(endpoint);
@@ -1405,7 +1418,7 @@ async fn an_authorization_past_its_acceptance_deadline_expires() {
         "the persisted cursor proves expiry without any new readiness",
     );
     assert_eq!(
-        refusal_code(&service.accept(&expired).await),
+        refusal_code(&accept_uploaded_service(&service, &expired).await),
         WorkRefusalCode::Expired
     );
     let mut forged = expired;
@@ -1433,7 +1446,7 @@ async fn an_authorization_past_its_acceptance_deadline_expires() {
         "the acceptance boundary remains inclusive"
     );
     assert_eq!(
-        refusal_code(&service.accept(&fresh).await),
+        refusal_code(&accept_uploaded_service(&service, &fresh).await),
         WorkRefusalCode::NotReady
     );
     assert_eq!(
@@ -1449,9 +1462,7 @@ async fn a_bundle_that_is_not_the_committed_one_is_invalid() {
     // The authorization commits to bundle 1; the request carries 2.
     let authorization = authorization(1, 1);
     let signature = client().sign(signing_hash(work_id(ready().channel(), &authorization)));
-    let response = endpoint
-        .accept(&request(&authorization, signature, 2))
-        .await;
+    let response = accept_uploaded(&mut endpoint, &request(&authorization, signature, 2)).await;
     assert_eq!(refusal_code(&response), WorkRefusalCode::Invalid);
     assert!(endpoint.state().jobs().next().is_none());
 }
@@ -1521,16 +1532,18 @@ async fn a_bundle_the_policy_does_not_allow_is_refused_though_its_digest_matches
         let Ok(bytes) = bundle.encode() else {
             panic!("{what} encodes");
         };
-        let response = endpoint
-            .accept(&AcceptWorkRequest {
+        let response = accept_uploaded(
+            &mut endpoint,
+            &AcceptWorkRequest {
                 route: Some(hellas_rpc::pb::work::WorkRoute::payment(
                     authorization.channel_id,
                 )),
                 authorization: authorization.encode(),
                 client_signature: signature.as_bytes().to_vec(),
                 prepared_input: bytes,
-            })
-            .await;
+            },
+        )
+        .await;
 
         assert_eq!(
             refusal_code(&response),
@@ -1551,7 +1564,7 @@ async fn a_forged_client_signature_is_invalid() {
     let mut endpoint = provider_endpoint(root.path()).await;
     let authorization = authorization(1, 1);
     let forged = stranger().sign(signing_hash(work_id(ready().channel(), &authorization)));
-    let response = endpoint.accept(&request(&authorization, forged, 1)).await;
+    let response = accept_uploaded(&mut endpoint, &request(&authorization, forged, 1)).await;
     assert_eq!(refusal_code(&response), WorkRefusalCode::Invalid);
     assert!(
         endpoint.state().jobs().next().is_none(),
@@ -1588,7 +1601,7 @@ async fn a_signature_of_any_other_length_is_not_a_signature() {
     for (what, client_signature) in cases {
         let mut request = signed_request(1, 1);
         request.client_signature = client_signature;
-        let response = endpoint.accept(&request).await;
+        let response = accept_uploaded(&mut endpoint, &request).await;
         assert_eq!(
             refusal_code(&response),
             WorkRefusalCode::Invalid,
@@ -1632,7 +1645,7 @@ async fn the_measured_margins_separate_a_late_job_from_a_malformed_one() {
             WorkRefusalCode::Invalid,
         ),
     ] {
-        let response = endpoint.accept(&signed_request_with(1, 1, deadlines)).await;
+        let response = accept_uploaded(&mut endpoint, &signed_request_with(1, 1, deadlines)).await;
         assert_eq!(
             refusal_code(&response),
             expected,
@@ -1653,14 +1666,14 @@ async fn bytes_that_are_not_an_authorization_are_invalid() {
     let mut truncated = signed_request(1, 1);
     truncated.authorization.pop();
     assert_eq!(
-        refusal_code(&endpoint.accept(&truncated).await),
+        refusal_code(&accept_uploaded(&mut endpoint, &truncated).await),
         WorkRefusalCode::Invalid,
     );
 
     let mut retagged = signed_request(1, 1);
     retagged.authorization[1] = 0xfe;
     assert_eq!(
-        refusal_code(&endpoint.accept(&retagged).await),
+        refusal_code(&accept_uploaded(&mut endpoint, &retagged).await),
         WorkRefusalCode::Invalid,
     );
 }
@@ -1669,8 +1682,8 @@ async fn bytes_that_are_not_an_authorization_are_invalid() {
 async fn a_job_already_in_flight_does_not_block_the_next_one() {
     let root = temp();
     let mut endpoint = provider_endpoint(root.path()).await;
-    accepted_signature(&endpoint.accept(&signed_request(1, 1)).await);
-    let response = endpoint.accept(&signed_request(2, 2)).await;
+    accepted_signature(&accept_uploaded(&mut endpoint, &signed_request(1, 1)).await);
+    let response = accept_uploaded(&mut endpoint, &signed_request(2, 2)).await;
     accepted_signature(&response);
     assert_eq!(endpoint.state().jobs().len(), 2);
 }
@@ -1697,7 +1710,7 @@ async fn a_poisoned_endpoint_is_unavailable() {
     // And the refusal that answer becomes on the wire is unavailability,
     // not an accusation about the proposal.
     assert_eq!(
-        refusal_code(&service.accept(&signed_request(1, 1)).await),
+        refusal_code(&accept_uploaded_service(&service, &signed_request(1, 1)).await),
         WorkRefusalCode::Unavailable,
     );
 }
@@ -1841,7 +1854,13 @@ async fn the_wire_carries_the_authorization_the_signature_covers() {
         Some(&[1_u8, 9_u8][..]),
         "format version 1, private record tag 9",
     );
-    assert_eq!(request.prepared_input, bundle_bytes(1));
+    assert_eq!(
+        request.prepared_input,
+        hellas_rpc::protocol::content_upload::encode_reference(hellas_rpc::ContentRef::new(
+            ContentId::hash(&bundle_bytes(1)),
+            bundle_bytes(1).len() as u64
+        ))
+    );
 
     let expected = client().sign(signing_hash(work_id(ready().channel(), &authorization)));
     assert_eq!(request.client_signature, expected.as_bytes().to_vec());
@@ -1971,7 +1990,7 @@ async fn managed_observers_start_closed_and_old_tips_cannot_renew_expired_readin
         Err(EndpointError::ObservationStale)
     ));
     assert_eq!(
-        refusal_code(&provider.accept(&signed_request(1, 1)).await),
+        refusal_code(&accept_uploaded_service(&provider, &signed_request(1, 1)).await),
         WorkRefusalCode::NotReady
     );
     for max_age in [
@@ -1993,7 +2012,7 @@ async fn managed_observers_start_closed_and_old_tips_cannot_renew_expired_readin
             Err(ProposeError::Endpoint(EndpointError::ObservationStale))
         ));
         assert_eq!(
-            refusal_code(&provider.accept(&signed_request(1, 1)).await),
+            refusal_code(&accept_uploaded_service(&provider, &signed_request(1, 1)).await),
             WorkRefusalCode::NotReady
         );
     }

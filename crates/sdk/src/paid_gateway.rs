@@ -193,6 +193,33 @@ pub struct PaidGateway {
     tasks: crate::gateway_work::WorkTasks,
 }
 
+async fn provider_policy(
+    args: &PaidWorkOptions,
+    chain: hellas_chain::WorkBlocks<hellas_chain::rpc::LocalLightClient>,
+    endpoint: &Endpoint,
+    settlement_key: &Secp256k1Signer,
+    owner: hellas_auth::authority::PrincipalId,
+) -> Result<ProviderChannelPolicy> {
+    let chain = chain.with_read_retry(
+        args.config.poll,
+        args.timeout.min(hellas_chain::node::RECOVERY_TIMEOUT),
+    );
+    Ok(
+        match crate::paid_client::offer::retained_offer(args, &chain).await? {
+            Some((_, signed)) => signed.offer().policy.clone(),
+            None => {
+                tokio::time::timeout(
+                    args.timeout,
+                    crate::paid_client::request_paid_quote(args, endpoint, settlement_key, owner),
+                )
+                .await
+                .map_err(|_| PoolError::ConnectionTimeout(args.timeout))??
+                .policy
+            }
+        },
+    )
+}
+
 impl PaidGateway {
     /// Open a reusable pool. Funding, recovery, queueing and payment are shared
     /// by CLI and embedding applications. Call `drain` during host shutdown.
@@ -220,23 +247,8 @@ impl PaidGateway {
         let chain = hellas_chain::WorkBlocks::new(view.client());
         let mut providers = Vec::with_capacity(options.providers.len());
         for args in options.providers {
-            let policy = match crate::paid_client::offer::retained_offer(&args, &chain).await? {
-                Some((_, signed)) => signed.offer().policy.clone(),
-                None => {
-                    tokio::time::timeout(
-                        args.timeout,
-                        crate::paid_client::request_paid_quote(
-                            &args,
-                            &endpoint,
-                            &settlement_key,
-                            owner,
-                        ),
-                    )
-                    .await
-                    .map_err(|_| PoolError::ConnectionTimeout(args.timeout))??
-                    .policy
-                }
-            };
+            let policy =
+                provider_policy(&args, chain.clone(), &endpoint, &settlement_key, owner).await?;
             providers.push(Arc::new(Provider {
                 policy,
                 args,
@@ -889,6 +901,107 @@ mod tests {
                 timeout: Duration::from_secs(30),
             }],
         }
+    }
+
+    #[test]
+    fn retained_gateway_policy_waits_for_chain_recovery_and_has_a_deadline() {
+        use crate::test_support::{PaidFixture, signer};
+        use hellas_chain::test_support::devnet::{
+            Devnet, DevnetConfig, GenesisOwner, OwnerKind, run,
+        };
+        use hellas_work::model::offer::{PaidOffer, SignedPaidOffer};
+        use hellas_work::work_store::{Role, SetupRecord, SetupStore};
+        run(|runtime| {
+            Box::pin(async move {
+                let mut devnet = Devnet::start(
+                    runtime,
+                    DevnetConfig {
+                        name: "gateway_policy_recovery",
+                        owners: vec![GenesisOwner {
+                            kind: OwnerKind::Passkey,
+                            secret_scalar: [0x13; 32],
+                            balance: 1,
+                        }],
+                        full_nodes: 1,
+                    },
+                )
+                .await;
+                devnet.seal().await;
+                let fixture = PaidFixture::on_network(devnet.network());
+                let mut args = pool_options(&fixture).providers.remove(0);
+                args.timeout = hellas_chain::node::RECOVERY_TIMEOUT;
+                let signed = SignedPaidOffer::sign(
+                    PaidOffer {
+                        provider: crate::test_support::enrollment(args.provider).0,
+                        proposal: fixture.proposal.clone(),
+                        policy: fixture.policy.clone(),
+                        omission_bond: 601,
+                        payment_funding: args.payment_funding.clone(),
+                        addresses: vec![],
+                    },
+                    &signer(2),
+                )
+                .unwrap();
+                let mut store = SetupStore::open(
+                    &args.journal_root,
+                    devnet.network(),
+                    signed.offer().proposal.bond_edge(),
+                    Role::Client,
+                    &hellas_kernel::Secp256k1Verifier::new(),
+                )
+                .await
+                .unwrap();
+                store
+                    .commit(
+                        SetupRecord::Offer {
+                            peer: *args.provider.as_bytes(),
+                            floor: None,
+                            offer: Box::new(signed),
+                        },
+                        &hellas_kernel::Secp256k1Verifier::new(),
+                    )
+                    .await
+                    .unwrap();
+                drop(store);
+                let node = devnet.full_node(0).clone();
+                let chain = hellas_chain::WorkBlocks::new(node.view().unwrap().client());
+                let endpoint = bind_paid_endpoint(iroh::SecretKey::from_bytes(&[0x54; 32]))
+                    .await
+                    .unwrap();
+                let owner = hellas_auth::test_support::actors::FRIEND.principal();
+                let key = signer(1);
+                node.require_finalized_height_for_test(devnet.height() + 1);
+                let policy = {
+                    let read = provider_policy(&args, chain.clone(), &endpoint, &key, owner);
+                    tokio::pin!(read);
+                    assert!(
+                        tokio::time::timeout(args.config.poll, &mut read)
+                            .await
+                            .is_err()
+                    );
+                    let (policy, _) = tokio::join!(read, devnet.seal());
+                    policy.unwrap()
+                };
+                assert_eq!(policy, fixture.policy);
+                args.timeout = Duration::from_millis(100);
+                node.require_finalized_height_for_test(devnet.height() + 1);
+                let started = tokio::time::Instant::now();
+                let error = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    provider_policy(&args, chain, &endpoint, &key, owner),
+                )
+                .await
+                .unwrap()
+                .unwrap_err();
+                assert!(
+                    matches!(error, PoolError::Client(PaidClientError::Query(hellas_chain::QueryError::ReadUnavailableTimeout { timeout, .. })) if timeout == args.timeout),
+                    "bounded gateway policy expiry: {error}"
+                );
+                assert!(started.elapsed() >= args.timeout);
+                endpoint.close().await;
+                devnet.shutdown().await;
+            })
+        });
     }
 
     #[test]

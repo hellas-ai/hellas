@@ -101,7 +101,7 @@ impl WorkAdministration {
                             WorkMutation::PaidPolicy {
                                 expected: expected_revision,
                                 policy_salt,
-                                policy: Box::new(policy),
+                                policy,
                             },
                             ChangeReply::Ready(WorkControlReply::PaidPolicyChanged {
                                 revision: expected_revision

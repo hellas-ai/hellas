@@ -37,13 +37,25 @@ impl From<&PaidChannel> for WorkContext {
 /// Application commitments, independent of how the job was funded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct JobInputBinding {
+    pub input_content: hellas_rpc::ContentRef,
     pub prepared_input_digest: Digest,
     pub request_commitment: hellas_rpc::RequestCommitment,
     pub environment_commitment: ContentId,
 }
+impl JobInputBinding {
+    pub(crate) fn check_content(&self, bytes: &[u8]) -> Result<(), PaidWorkError> {
+        if hellas_rpc::ContentRef::for_bytes(bytes) != self.input_content {
+            return Err(PaidWorkError::Mismatch {
+                field: "input_content",
+            });
+        }
+        Ok(())
+    }
+}
 impl From<&PaidJobAuthorizationV2> for JobInputBinding {
     fn from(auth: &PaidJobAuthorizationV2) -> Self {
         Self {
+            input_content: auth.input_content,
             prepared_input_digest: auth.prepared_input_digest,
             request_commitment: auth.request_commitment,
             environment_commitment: auth.environment_commitment,
@@ -53,6 +65,7 @@ impl From<&PaidJobAuthorizationV2> for JobInputBinding {
 impl From<&crate::model::grant::GrantJobAuthorizationV1> for JobInputBinding {
     fn from(auth: &crate::model::grant::GrantJobAuthorizationV1) -> Self {
         Self {
+            input_content: auth.input_content,
             prepared_input_digest: auth.prepared_input_digest,
             request_commitment: auth.request_commitment,
             environment_commitment: auth.environment_commitment,
@@ -124,6 +137,20 @@ impl WorkPolicy {
         match self {
             Self::Evaluate(p) => p.allowed_environment,
             Self::Fetch { policy, .. } => policy.allowed_environment,
+        }
+    }
+
+    pub const fn max_encoded_prepared_input(&self) -> u32 {
+        match self {
+            Self::Evaluate(policy) => policy.max_encoded_prepared_input,
+            Self::Fetch { policy, .. } => policy.max_encoded_prepared_input,
+        }
+    }
+    /// Maximum bytes missing from the provider's content store for one job.
+    pub const fn max_upload_bytes(&self) -> u64 {
+        match self {
+            Self::Evaluate(policy) => policy.max_upload_bytes,
+            Self::Fetch { policy, .. } => policy.max_upload_bytes,
         }
     }
 

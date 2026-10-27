@@ -94,8 +94,9 @@ The omission bond must exceed the payment capacity. At price 20 and ten jobs,
 a capacity of 200 and omission collateral of 201 require 401 units with zero fees
 and reserve. The client checks
 this before signing setup terms or creating a journal.
-The provider's route table must authorize the gateway transport and settlement
-identities. All participants must use the same compatible chain revision.
+The provider verifies the gateway owner's delegated funding and retains the
+first authenticated peer with its offer. All participants must use the same
+compatible chain revision.
 
 Pass the environment, tokenizer, model label, `--default-max-tokens`, and
 `--stop-token` options as for an ordinary gateway. The work policy fixes

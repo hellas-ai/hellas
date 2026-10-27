@@ -111,6 +111,8 @@ impl Case {
                 request.input = PreparedWorkInput::from(
                     PreparedPaidFetchInputV1::new(&events, &contract).unwrap(),
                 );
+                request.authorization.input_content =
+                    hellas_rpc::ContentRef::for_bytes(&request.input.encode().unwrap());
                 request.authorization.prepared_input_digest = request
                     .input
                     .bound_digest(network(), request.authorization.channel_id.0)
@@ -163,7 +165,9 @@ async fn grant_refusals_preserve_the_typed_reason() {
         let directory = tempfile::tempdir().unwrap();
         let fixture = case.arrange(directory.path()).await;
 
-        let response = fixture.work.accept(&fixture.request).await;
+        let response =
+            crate::test_support::accept_grant(&fixture.work, &fixture.request, &FRIEND.node_key())
+                .await;
 
         if case == Case::StaleRevision {
             let Some(accept_work_response::Outcome::Refused(ref detail)) = response.outcome else {

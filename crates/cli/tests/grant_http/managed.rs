@@ -43,7 +43,7 @@ impl ManagedWorker {
                     "allowed_environment":hellas_rpc::FetchContract::http().unwrap().manifest_id().to_string(),
                     "service":"http","method":"request","max_request_body_bytes":65536,
                     "max_output_events":256,"max_output_bytes":65536,"max_spool_bytes":262144,
-                    "max_encoded_result_frame":262144,"max_encoded_prepared_input":262144},
+                    "max_encoded_result_frame":262144,"max_encoded_prepared_input":262144,"max_upload_bytes":262144},
                 "https":{"origin":https.origin,"paths":["/v1/chat/completions"],"methods":["POST"],
                     "credential":null,"tls":{"roots":{"mode":"certificates","der_base64":[https.root_der]},"spki_sha256":[]},
                     "accounting":"openai-chat","max_output_tokens":8,"max_response_bytes":65536}

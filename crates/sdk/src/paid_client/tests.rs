@@ -270,6 +270,7 @@ fn fetch_request(
                 max_spool_bytes: 65536,
                 max_encoded_result_frame: 65536,
                 max_encoded_prepared_input: 65536,
+                max_upload_bytes: 65536,
             },
             route,
         },

@@ -237,11 +237,12 @@ pub struct FetchPolicyV2 {
     pub max_encoded_result_frame: u32,
     /// Maximum size of the complete encoded prepared-input bundle.
     pub max_encoded_prepared_input: u32,
+    pub max_upload_bytes: u64,
 }
 
 impl PrivateRecord for FetchPolicyV2 {
     const TAG: u8 = tag::FETCH_POLICY_V2;
-    const BODY_SIZE: usize = 2 * 32 + 3 * 4 + 8 + 2 * 4;
+    const BODY_SIZE: usize = 2 * 32 + 3 * 4 + 8 + 2 * 4 + 8;
 
     fn encode_body(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(self.allowed_environment.as_bytes());
@@ -252,6 +253,7 @@ impl PrivateRecord for FetchPolicyV2 {
         put_u64(out, self.max_spool_bytes);
         put_u32(out, self.max_encoded_result_frame);
         put_u32(out, self.max_encoded_prepared_input);
+        put_u64(out, self.max_upload_bytes);
     }
 
     fn decode_body(reader: &mut BodyReader<'_>) -> Result<Self, PaidWorkError> {
@@ -264,6 +266,7 @@ impl PrivateRecord for FetchPolicyV2 {
             max_spool_bytes: reader.u64()?,
             max_encoded_result_frame: reader.u32()?,
             max_encoded_prepared_input: reader.u32()?,
+            max_upload_bytes: reader.u64()?,
         })
     }
 }
@@ -278,6 +281,7 @@ pub fn check_fetch_policy(policy: &FetchPolicyV2) -> Result<(), PaidWorkError> {
         ("max_output_events", u64::from(policy.max_output_events)),
         ("max_output_bytes", u64::from(policy.max_output_bytes)),
         ("max_spool_bytes", policy.max_spool_bytes),
+        ("max_upload_bytes", policy.max_upload_bytes),
         (
             "max_encoded_result_frame",
             u64::from(policy.max_encoded_result_frame),
@@ -463,6 +467,7 @@ pub fn propose_fetch_authorization(
         payment_terms_hash: channel.payment_terms_hash(),
         work_policy_digest: fetch_policy_digest(channel, policy),
         payment_policy_digest: job_payment_policy_digest(channel.network(), channel.id(), payment),
+        input_content: hellas_rpc::ContentRef::for_bytes(&bundle.encode()?),
         prepared_input_digest: prepared_fetch_input_digest(channel, bundle)?,
         proposal_nonce,
         acceptance_deadline: deadlines.acceptance,
@@ -523,6 +528,7 @@ pub fn check_bound_fetch_input(
     bundle: &PreparedPaidFetchInputV1,
 ) -> Result<(), PaidWorkError> {
     let encoded = bundle.encode()?;
+    binding.check_content(&encoded)?;
     let limit = u64::from(policy.max_encoded_prepared_input);
     let actual = u64::try_from(encoded.len()).map_err(|_| PaidWorkError::Overflow {
         field: "prepared input length",

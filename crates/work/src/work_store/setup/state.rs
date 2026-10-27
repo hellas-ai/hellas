@@ -123,16 +123,15 @@ impl SetupState {
         &self,
         bundle: &WorkChannelSetupBundleV2,
     ) -> Result<(), SetupStateError> {
-        if let Some((_, signed)) = &self.offer {
-            if bundle
+        if let Some((_, signed)) = &self.offer
+            && (bundle
                 .payment_funding()
                 .is_some_and(|funding| *funding != signed.offer().payment_funding)
                 || bundle
                     .payment_terms()
-                    .is_some_and(|terms| terms.omission_bond != signed.offer().omission_bond)
-            {
-                return Err(SetupStateError::Malformed);
-            }
+                    .is_some_and(|terms| terms.omission_bond != signed.offer().omission_bond))
+        {
+            return Err(SetupStateError::Malformed);
         }
         Ok(())
     }

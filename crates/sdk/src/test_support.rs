@@ -131,8 +131,11 @@ impl PaidFixture {
     }
 
     pub fn new() -> Self {
+        Self::on_network(NetworkId::new("sdk-paid-test").unwrap())
+    }
+
+    pub fn on_network(network: NetworkId) -> Self {
         let root = tempfile::tempdir().unwrap();
-        let network = NetworkId::new("sdk-paid-test").unwrap();
         let payment_id = EdgeId::from_bytes([12; 32]);
         let values = EdgeValues::new(1000, 200, Fees::ZERO);
         let channel_policy = PaidChannelPolicyV1 {
@@ -151,6 +154,7 @@ impl PaidFixture {
                 max_spool_bytes: 65536,
                 max_encoded_result_frame: 65536,
                 max_encoded_prepared_input: 65536,
+                max_upload_bytes: 65536,
             },
             route,
         };

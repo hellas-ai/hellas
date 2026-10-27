@@ -39,7 +39,6 @@ use hellas_work::work_handshake::{
     send_setup_exchange,
 };
 use hellas_work::work_open::{SetupAdvance, SetupProgress};
-use hellas_work::work_store::journal::MAX_RECORD_BYTES;
 use hellas_work::work_store::{Role, SetupScan, SetupStore};
 use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointId, SecretKey};
@@ -663,11 +662,12 @@ impl PaidWorkSession {
                                     RecoveredJob::Unrecoverable(job.work_id())
                                 });
                             }
-                            PreparedWorkInput::decode(job.prepared_input(), MAX_RECORD_BYTES)
-                                .map(|input| {
-                                    RecoveredJob::Replay(job.work_id(), job.phase(), input)
-                                })
-                                .map_err(PaidClientError::from)
+                            PreparedWorkInput::decode(
+                                job.prepared_input(),
+                                hellas_work::content::MAX_CONTENT_BYTES,
+                            )
+                            .map(|input| RecoveredJob::Replay(job.work_id(), job.phase(), input))
+                            .map_err(PaidClientError::from)
                         })
                         .collect::<Result<Vec<_>, _>>()
                 })

@@ -1,4 +1,5 @@
 mod protocol;
+mod uploads;
 use super::*;
 use crate::work_store::journal::JournalError;
 
@@ -30,14 +31,17 @@ async fn start(directory: &std::path::Path, backend: Backend) -> (GrantService, 
         authorization.grant_id,
     )
     .await;
-    let response = work_service
-        .accept(&AcceptWorkRequest {
+    let response = crate::test_support::accept_grant(
+        &work_service,
+        &AcceptWorkRequest {
             route: Some(WorkRoute::grant(authorization.channel_id.0)),
             authorization: authorization.encode(),
             client_signature: signature.bytes().to_vec(),
             prepared_input: input.encode().unwrap(),
-        })
-        .await;
+        },
+        &common::principal(1).1,
+    )
+    .await;
     assert!(matches!(
         response.outcome,
         Some(accept_work_response::Outcome::Accepted(_))

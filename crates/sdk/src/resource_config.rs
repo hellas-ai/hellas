@@ -45,6 +45,7 @@ pub(crate) struct ExecutionPolicyFile {
     max_spool_bytes: u64,
     max_encoded_result_frame: u32,
     max_encoded_prepared_input: u32,
+    max_upload_bytes: u64,
 }
 
 impl ExecutionPolicyFile {
@@ -78,6 +79,7 @@ impl ExecutionPolicyFile {
             max_spool_bytes: self.max_spool_bytes,
             max_encoded_result_frame: self.max_encoded_result_frame,
             max_encoded_prepared_input: self.max_encoded_prepared_input,
+            max_upload_bytes: self.max_upload_bytes,
         };
         Ok(policy)
     }
@@ -97,6 +99,7 @@ pub(crate) struct FetchPolicyFile {
     max_spool_bytes: u64,
     max_encoded_result_frame: u32,
     max_encoded_prepared_input: u32,
+    max_upload_bytes: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -144,6 +147,7 @@ impl FetchPolicyFile {
             max_spool_bytes: self.max_spool_bytes,
             max_encoded_result_frame: self.max_encoded_result_frame,
             max_encoded_prepared_input: self.max_encoded_prepared_input,
+            max_upload_bytes: self.max_upload_bytes,
         };
         let profile = WorkPolicy::Fetch {
             policy,

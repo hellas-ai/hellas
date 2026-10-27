@@ -190,6 +190,7 @@ pub struct MountedWork {
     changes: Arc<tokio::sync::Mutex<()>>,
     driver: Option<AcceptedWorkDriver>,
     node: AdmissionNode,
+    upload_quota: hellas_work::content::UploadQuota,
 }
 
 impl Default for MountedWork {
@@ -199,6 +200,7 @@ impl Default for MountedWork {
             changes: Arc::new(tokio::sync::Mutex::new(())),
             driver: None,
             node: AdmissionNode::default(),
+            upload_quota: Default::default(),
         }
     }
 }
@@ -334,6 +336,23 @@ impl WorkHandler for MountedWorkService {
         Ok(response)
     }
 
+    async fn upload_content(
+        &self,
+        request: hellas_rpc::pb::work::UploadContentRequest,
+        context: TransportContext,
+    ) -> Result<
+        impl Into<WithTrailer<hellas_rpc::pb::work::UploadContentResponse>> + Send,
+        WireStatus,
+    > {
+        if !self.node.ready() {
+            return Err(WireStatus::new(
+                hellas_wire::WireCode::Unavailable,
+                "chain node is catching up",
+            ));
+        }
+        self.service.upload(&request, &context).await
+    }
+
     async fn deliver_result(
         &self,
         request: DeliverResultRequest,
@@ -360,6 +379,9 @@ impl WorkHandler for MountedWorkService {
 }
 
 impl MountedWork {
+    pub fn upload_quota(&self) -> hellas_work::content::UploadQuota {
+        self.upload_quota.clone()
+    }
     pub fn with_backend<B>(backend: B) -> Self
     where
         B: WorkBackend + Send + Sync + 'static,
@@ -369,12 +391,14 @@ impl MountedWork {
             changes: Arc::new(tokio::sync::Mutex::new(())),
             driver: Some(AcceptedWorkDriver::new(backend)),
             node: AdmissionNode::default(),
+            upload_quota: Default::default(),
         }
     }
 
     /// Mounts one channel; duplicate identities are refused without replacement.
     pub async fn mount(&self, peer: PeerId, service: &WorkService) -> Result<(), MountError> {
         let _changes = self.changes.lock().await;
+        service.set_upload_quota(self.upload_quota.clone()).await?;
         let channel = service.with_state(|state| state.channel().id()).await?;
         let mut held = self.mounted.lock().map_err(|_| MountError::Poisoned)?;
         let std::collections::btree_map::Entry::Vacant(entry) = held.entry(channel) else {
@@ -581,6 +605,20 @@ impl WorkHandler for MountedWork {
             None => wt(UnmountedWork.accept_work(request, context)).await,
         }
     }
+    async fn upload_content(
+        &self,
+        request: hellas_rpc::pb::work::UploadContentRequest,
+        context: TransportContext,
+    ) -> Result<
+        impl Into<WithTrailer<hellas_rpc::pb::work::UploadContentResponse>> + Send,
+        WireStatus,
+    > {
+        match self.handler(&context, request.route.as_ref())? {
+            Some(service) => wt(service.upload_content(request, context)).await,
+            None => wt(UnmountedWork.upload_content(request, context)).await,
+        }
+    }
+
     async fn deliver_result(
         &self,
         request: DeliverResultRequest,
@@ -1109,6 +1147,7 @@ impl WorkRunner {
         self.setup_mount
             .2
             .set(AutomaticOffers::spawn(OfferAllocator {
+                needs_restart: Default::default(),
                 config: self.config.clone(),
                 node: node.clone(),
                 authority,

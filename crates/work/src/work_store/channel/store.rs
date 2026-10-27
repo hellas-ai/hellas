@@ -7,6 +7,8 @@ pub struct ChannelStore {
     journal: Journal,
     state: Channel,
     metadata_only: bool,
+    payloads: payload::PayloadStore,
+    pub(crate) uploads: crate::content::UploadStore,
 }
 
 impl ChannelStore {
@@ -83,6 +85,8 @@ impl ChannelStore {
             .into());
         }
         let key = channel_key(&channel).into_bytes();
+        let stem = format!("channel-{}", hex(key));
+        let payloads = payload::PayloadStore::new(root, &stem);
         let replayed = hellas_rpc::observe::Timing::start();
         let (journal, replay) = Journal::open_latest(
             root,
@@ -98,14 +102,34 @@ impl ChannelStore {
             },
         )
         .await?;
+        let uploads = if metadata_only {
+            crate::content::UploadStore::memory(channel.id(), Default::default())
+        } else {
+            crate::content::UploadStore::durable(root, &stem, channel.id())?
+        };
         let mut state = match &replay.checkpoint {
-            Some(bytes) => {
-                Channel::from_checkpoint(bytes, channel, settlement, role, verifier, metadata_only)?
-            }
+            Some(bytes) => Channel::from_checkpoint(
+                bytes,
+                channel,
+                settlement,
+                role,
+                verifier,
+                metadata_only,
+                &payloads,
+            )?,
             None => Channel::new(channel, settlement, role, origin),
         };
+        let mut referenced: std::collections::BTreeSet<String> = state
+            .jobs()
+            .map(|job| hellas_rpc::ContentId::hash(job.prepared_input()).to_string())
+            .collect();
         for bytes in &replay.records {
-            let record = ChannelRecord::decode(bytes)?;
+            let mut record = ChannelRecord::decode(bytes)?;
+            if !metadata_only && let ChannelRecord::JobProposed { prepared_input, .. } = &mut record
+            {
+                *prepared_input = payloads.read(prepared_input)?;
+                referenced.insert(hellas_rpc::ContentId::hash(prepared_input).to_string());
+            }
             state.apply(&record, verifier, metadata_only)?;
         }
         state.book.indeterminate = state
@@ -115,12 +139,28 @@ impl ChannelStore {
             .filter(|job| matches!(job.phase, JobPhase::Running | JobPhase::Streaming))
             .map(|job| job.work_id)
             .collect();
+        let live: std::collections::BTreeSet<String> = state
+            .jobs()
+            .map(|job| hellas_rpc::ContentId::hash(job.prepared_input()).to_string())
+            .collect();
+        let retired_payloads = !metadata_only && referenced != live;
+        if !metadata_only {
+            payloads.prune_ids(&referenced)?;
+        }
         journal.observe_replay(replayed, replay.records.len());
-        let store = Self {
+        let mut store = Self {
             journal,
             state,
             metadata_only,
+            payloads,
+            uploads,
         };
+        // A terminal append can survive a crash before its payload cleanup.
+        // Retire those replay references durably before removing their files.
+        if retired_payloads {
+            store.rotate().await?;
+        }
+        store.gc_uploads()?;
         Ok(store)
     }
 
@@ -128,6 +168,16 @@ impl ChannelStore {
     #[must_use]
     pub const fn state(&self) -> &Channel {
         &self.state
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn pause_next_statement_for_test(
+        &mut self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        self.journal.pause_next_statement().await
     }
 
     /// Whether this journal excludes request and response bodies from disk.
@@ -162,6 +212,7 @@ impl ChannelStore {
             return Ok(&self.state);
         }
         let mut next = self.state.clone();
+        let previous_jobs = self.state.jobs().count();
         // The `false` keeps commit-time validation at full strength even
         // for a metadata-only journal: bodies are verified — digest and
         // transcript-to-result reproduction — before they are stripped
@@ -175,8 +226,7 @@ impl ChannelStore {
             // answered with and the terminal that pays for it — because
             // by then there is no refusal left that costs nothing.
             if let Some(tail) = record.checkpoint_tail() {
-                let len = next
-                    .checkpoint_for_storage(self.metadata_only)
+                let len = payload::checkpoint(&next, self.metadata_only)
                     .len()
                     .saturating_add(tail);
                 if len > MAX_CHECKPOINT_BYTES {
@@ -184,12 +234,32 @@ impl ChannelStore {
                 }
             }
             self.rotate_if_full(record.is_new_work()).await?;
+            let mut stored = record;
+            if !self.metadata_only
+                && let ChannelRecord::JobProposed { prepared_input, .. } = &mut stored
+            {
+                *prepared_input = self.payloads.write(prepared_input)?;
+            }
             self.journal
-                .append(&record.encode_for_storage(self.metadata_only))
+                .append(&stored.encode_for_storage(self.metadata_only))
                 .await?;
             self.state = next;
+            if !self.metadata_only && self.state.jobs().count() < previous_jobs {
+                self.rotate().await?;
+            }
         }
+        self.gc_uploads()?;
         Ok(&self.state)
+    }
+
+    pub(crate) fn gc_uploads(&mut self) -> Result<(), WorkStoreError> {
+        self.uploads.gc(
+            self.state.cursor().0,
+            self.state.close_prepared().is_some()
+                || self.state.close_opened().is_some()
+                || self.state.close_settled().is_some(),
+        )?;
+        Ok(())
     }
 
     /// Moves the journal on to its next generation, carrying this state
@@ -207,8 +277,11 @@ impl ChannelStore {
     /// frame or an install step fails.
     pub async fn rotate(&mut self) -> Result<(), WorkStoreError> {
         self.journal
-            .rotate(&self.state.checkpoint_for_storage(self.metadata_only))
+            .rotate(&payload::checkpoint(&self.state, self.metadata_only))
             .await?;
+        if !self.metadata_only {
+            self.payloads.prune(&self.state)?;
+        }
         Ok(())
     }
 
@@ -225,10 +298,15 @@ impl ChannelStore {
         }
         match self
             .journal
-            .rotate(&self.state.checkpoint_for_storage(self.metadata_only))
+            .rotate(&payload::checkpoint(&self.state, self.metadata_only))
             .await
         {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                if !self.metadata_only {
+                    self.payloads.prune(&self.state)?;
+                }
+                Ok(())
+            }
             Err(error) if new_work => Err(error.into()),
             Err(_) => Ok(()),
         }
