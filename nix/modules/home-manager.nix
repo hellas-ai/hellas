@@ -59,13 +59,12 @@ in
   options.programs.hellas =
     hellas.commonOptions {
       inherit lib;
-      package = (hellas.pickCliPackage pkgs).override { otel = cfg.otel.enable; };
+      package = (hellas.normalCliPackage pkgs).override { otel = cfg.otel.enable; };
       inherit (cfg) otel;
       packageDescription = ''
         The hellas network CLI, including chain, gateway and node support. The shared
-        `otel` options select a telemetry-enabled build when configured. On x86_64-linux, overriding `programs.hellas.package` with
-        this flake's `cli-catena` package enables interactive local Catena
-        commands only. A Linux Catena provider daemon requires the NixOS
+        `otel` options select a telemetry-enabled build when configured. A
+        Linux Catena provider daemon requires the NixOS
         `services.hellas` module; the Home Manager daemon is Darwin-only and
         network-only.
       '';

@@ -449,11 +449,6 @@ let
     responsesBackend = "proxy";
     offer = "provider";
   };
-  oversizedGpuCapacity =
-    builtins.tryEval
-      (evalProvider {
-        gpuMaxGenerationCapacity = 524289;
-      }).config.systemd.services.hellas.serviceConfig.ExecStart;
   cudaProvider = evalProvider {
     workConfigFile = "/run/hellas/work.json";
     gpuBackend = "cuda";
@@ -808,7 +803,6 @@ in
     assert !(providerAssuranceAssertion unsupportedProviderApple).assertion;
     assert !(trustPairAssertion incompleteTrust).assertion;
     assert !(trustRequiredAssertion missingRequiredTrust).assertion;
-    assert !oversizedGpuCapacity.success;
     assert !(memoryHeadroomAssertion insufficientMemoryHeadroom).assertion;
     assert !(memoryHeadroomAssertion insufficientDefaultMemoryHeadroom).assertion;
     assert !(readinessContentAssertion readinessWithoutContent).assertion;

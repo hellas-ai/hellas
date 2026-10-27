@@ -319,10 +319,6 @@ in
             gpuSessionPrograms = 3;
             gpuSessionAssetBytes = 1073741824;
             memoryMaxBytes = 1879048192;
-            gpuMaxGenerationCapacity = 4096;
-            gpuMaxGenerationDeviceBytes = 536870912;
-            gpuCompileTimeoutSeconds = 600;
-            gpuExecutionTimeoutSeconds = 900;
             fetchMaxInFlight = 2;
             fetchQueueSize = 3;
             graffiti = "e2e-discovery";
@@ -392,10 +388,6 @@ in
       assert "MemoryMax=1879048192" in unit
       assert "MemorySwapMax=0" in unit
       assert "OOMPolicy=kill" in unit
-      assert "--gpu-max-generation-capacity 4096" in unit
-      assert "--gpu-max-generation-device-bytes 536870912" in unit
-      assert "--gpu-compile-timeout-secs 600" in unit
-      assert "--gpu-execution-timeout-secs 900" in unit
       assert "TMPDIR=/run/hellas" in unit
       machine.succeed(
           "test \"$(cat /sys/fs/cgroup/system.slice/hellas.service/memory.oom.group)\" = 1"

@@ -201,22 +201,7 @@ let
           buildFeatures = [ "validator" ] ++ lib.optional otel "otel";
         }
       ) { };
-    }
-    # Do not advertise the safe local GPU runtime on platforms where the
-    # packaged provider toolchain is not yet supported.
-    //
-      lib.optionalAttrs (crossSystem == null && pkgSpec.pkgs.stdenv.hostPlatform.system == "x86_64-linux")
-        {
-          cli-catena = lib.makeOverridable (
-            {
-              otel ? false,
-            }:
-            pkgSpec.mkHellasPackage {
-              buildNoDefaultFeatures = true;
-              buildFeatures = [ "evaluate" ] ++ lib.optional otel "otel";
-            }
-          ) { };
-        };
+    };
 
   crossTargets = {
     # The store's replacement-resistant file identity uses Unix device,
@@ -299,13 +284,13 @@ let
       };
       dockerCuda = import ./docker.nix {
         inherit pkgs rustToolchain;
-        cli = nativePackages.cli-catena;
+        cli = nativePackages.cli;
         backend = "cuda";
         revision = self.rev or self.dirtyRev or "unknown";
       };
       dockerHip = import ./docker.nix {
         inherit pkgs rustToolchain;
-        cli = nativePackages.cli-catena;
+        cli = nativePackages.cli;
         backend = "hip";
         revision = self.rev or self.dirtyRev or "unknown";
       };
@@ -313,8 +298,7 @@ let
       nixosTests = lib.optionalAttrs isX86_64Linux (
         import ./tests {
           inherit self pkgs lib;
-          package = nativePackages.cli-catena;
-          networkPackage = nativePackages.cli;
+          package = nativePackages.cli;
           validatorPackage = nativePackages.cli-validator;
         }
       );
@@ -479,7 +463,7 @@ let
   }
   // lib.optionalAttrs isX86_64Linux {
     # Validators are deployed only on x86; ARM workers build the client/node CLI.
-    inherit (nativePackages) cli-catena cli-validator;
+    inherit (nativePackages) cli-validator;
     static-x86_64 = crossPackages.cross-x86_64-linux-musl-cli;
     static-aarch64 = crossPackages.cross-aarch64-linux-musl-cli;
     inherit (linuxOutputs.packages) docker;

@@ -88,7 +88,6 @@ let
         (
           [
             "indexer"
-            "evaluate"
             "otel"
           ]
           ++ lib.optionals isValidatorHost [ "validator" ]
@@ -317,7 +316,6 @@ let
   # streams archives for publishing without requiring a Docker daemon.
   // lib.optionalAttrs isValidatorHost {
     cli-validator = "cli-validator";
-    cli-catena = "cli-catena";
   };
 in
 {

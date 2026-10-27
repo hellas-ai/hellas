@@ -1,7 +1,6 @@
 {
   pkgs,
   package,
-  networkPackage,
 }:
 {
   basic =
@@ -31,27 +30,15 @@
         ${package}/bin/hellas-cli gateway --help | grep -F -- "--responses-fetch-execution-environment"
         ${package}/bin/hellas-cli gateway --help | grep -F -- "--trust-policy"
         ${package}/bin/hellas-cli gateway --help | grep -F -- "--trust-store"
-        ${package}/bin/hellas-cli environment build --help | grep -F -- "--program <CATENA_SOURCE>"
-        ${package}/bin/hellas-cli environment verify --help | grep -F -- "--content-root <DIR>"
-        ${package}/bin/hellas-cli environment verify --help | grep -F -- "--content-index <FILE>"
-        ${package}/bin/hellas-cli environment verify --help | grep -F -- "--recheck"
         ${package}/bin/hellas-cli serve --help | grep -F -- "--content <PATH>"
         ${package}/bin/hellas-cli serve --help | grep -F -- "--identity <IDENTITY>"
         ${package}/bin/hellas-cli serve --help | grep -F -- "--content-root <DIR>"
         ${package}/bin/hellas-cli serve --help | grep -F -- "--content-index <FILE>"
         ${package}/bin/hellas-cli serve --help | grep -F -- "--gpu-session-programs"
         ${package}/bin/hellas-cli serve --help | grep -F -- "--gpu-session-asset-bytes"
-        ${package}/bin/hellas-cli serve --help | grep -F -- "--gpu-max-generation-capacity"
-        ${package}/bin/hellas-cli serve --help | grep -F -- "--gpu-max-generation-device-bytes"
-        ${package}/bin/hellas-cli serve --help | grep -F -- "--gpu-compile-timeout-secs"
-        ${package}/bin/hellas-cli serve --help | grep -F -- "--gpu-execution-timeout-secs"
         ${package}/bin/hellas-cli serve --help | grep -F -- "--work-config"
         ! ${package}/bin/hellas-cli serve --help | grep -F -- "--gfx"
         ${package}/bin/hellas-cli identity --help | grep -F -- "show-enrollment-id"
-
-        # The ordinary package exposes environment tooling without
-        # accidentally pulling in the local Catena evaluator.
-        ${networkPackage}/bin/hellas-cli environment verify --help | grep -F -- "--content-root <DIR>"
 
         ${package}/bin/hellas-cli --identity "$TMPDIR/identity" --software-root \
           monitor --timeout-secs 1 >/dev/null 2>&1 || true

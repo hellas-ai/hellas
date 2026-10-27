@@ -189,23 +189,13 @@ in
   options.services.hellas =
     hellas.commonOptions {
       inherit lib;
-      package = (hellas.nixosCliPackage pkgs).override { otel = cfg.otel.enable; };
+      package = (hellas.normalCliPackage pkgs).override { otel = cfg.otel.enable; };
       inherit (cfg) otel;
-      packageDescription =
-        if hellas.catenaPlatform pkgs then
-          ''
-            The hellas CLI used to run the serve daemon. On x86_64-linux it
-            defaults to this flake's `cli-catena` package, which can compile
-            and execute locally indexed Catena environments. Override
-            `services.hellas.package` with the `cli` package for a network-only
-            node.
-          ''
-        else
-          ''
-            The hellas network CLI used to run the serve daemon. Local Catena
-            execution is currently available only on x86_64-linux because the
-            packaged provider runtime currently targets that platform.
-          '';
+      packageDescription = ''
+        The hellas CLI used to run the serve daemon. Local Catena execution is
+        currently available only on x86_64-linux because the packaged provider
+        runtime currently targets that platform.
+      '';
     }
     // hellas.serveOptions { inherit lib pkgs; }
     // {

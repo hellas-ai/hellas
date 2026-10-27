@@ -1,14 +1,9 @@
 { self }:
 rec {
   # The ordinary CLI omits OTEL. Modules opt in through the package override.
-  # It carries the network, chain and gateway surfaces. Local Catena execution is the explicit `cli-catena` package.
+  # It carries the network, chain, gateway and local Catena execution surfaces.
   normalCliPackage = pkgs: self.packages.${pkgs.stdenv.hostPlatform.system}.cli;
   catenaPlatform = pkgs: pkgs.stdenv.hostPlatform.system == "x86_64-linux";
-  catenaCliPackage = pkgs: self.packages.${pkgs.stdenv.hostPlatform.system}.cli-catena;
-  nixosCliPackage =
-    pkgs: if catenaPlatform pkgs then catenaCliPackage pkgs else normalCliPackage pkgs;
-
-  pickCliPackage = normalCliPackage;
 
   renderEnvironment = builtins.mapAttrs (_: toString);
 
@@ -200,10 +195,6 @@ rec {
     "--gpu-backend"
     "--gpu-session-programs"
     "--gpu-session-asset-bytes"
-    "--gpu-max-generation-capacity"
-    "--gpu-max-generation-device-bytes"
-    "--gpu-compile-timeout-secs"
-    "--gpu-execution-timeout-secs"
     "--work-config"
     "--metrics-port"
     "--graffiti"
@@ -262,11 +253,7 @@ rec {
     || serve.contentIndex != null
     || serve.gpuBackend != null
     || serve.gpuSessionPrograms != null
-    || serve.gpuSessionAssetBytes != null
-    || serve.gpuMaxGenerationCapacity != null
-    || serve.gpuMaxGenerationDeviceBytes != null
-    || serve.gpuCompileTimeoutSeconds != null
-    || serve.gpuExecutionTimeoutSeconds != null;
+    || serve.gpuSessionAssetBytes != null;
 
   commonOptions =
     {
@@ -468,14 +455,6 @@ rec {
           separately to bound host RAM. Null uses the CLI default.
         '';
       };
-      gpuMaxGenerationCapacity = mkOption {
-        type = types.nullOr (types.ints.between 1 524288);
-        default = null;
-        description = "Maximum prompt-plus-output token capacity admitted for one GPU generation (at most 524288, so retained output fits the artifact transport). Null uses the CLI default.";
-      };
-      gpuMaxGenerationDeviceBytes = positiveLimitOption "Maximum non-asset device bytes owned or allocated by one GPU generation, including resident state, token staging, outputs, and intermediates. Null uses the CLI default.";
-      gpuCompileTimeoutSeconds = positiveLimitOption "Maximum seconds spent loading and compiling one Catena program. Null uses the CLI default.";
-      gpuExecutionTimeoutSeconds = positiveLimitOption "Maximum seconds for one GPU control operation or complete generation. Null uses the CLI default.";
       workConfigFile = mkOption {
         type = types.nullOr runtimePath;
         default = null;
@@ -856,10 +835,6 @@ rec {
     ++ optArg "--gpu-backend" serve.gpuBackend
     ++ optArg "--gpu-session-programs" serve.gpuSessionPrograms
     ++ optArg "--gpu-session-asset-bytes" serve.gpuSessionAssetBytes
-    ++ optArg "--gpu-max-generation-capacity" serve.gpuMaxGenerationCapacity
-    ++ optArg "--gpu-max-generation-device-bytes" serve.gpuMaxGenerationDeviceBytes
-    ++ optArg "--gpu-compile-timeout-secs" serve.gpuCompileTimeoutSeconds
-    ++ optArg "--gpu-execution-timeout-secs" serve.gpuExecutionTimeoutSeconds
     ++ optArg "--work-config" serve.workConfigFile
     ++ optArg "--metrics-port" serve.metricsPort
     ++ [
