@@ -12,24 +12,18 @@ use support::temp;
 
 use hellas_auth::Digest;
 use hellas_auth::{ProducerSigningKey, PublicKey};
-use hellas_kernel::{PendingSlot, Secp256k1Verifier, SigVerifier as _};
-use hellas_rpc::evaluate::{
-    EvaluateOutputTranscriptBuilder, EvaluateStopReason, EvaluateTerminal, EvaluateUsage,
-    input_commitment,
-};
+use hellas_kernel::{Secp256k1Verifier, SigVerifier as _};
+use hellas_rpc::evaluate::{EvaluateStopReason, EvaluateTerminal, EvaluateUsage};
 use hellas_rpc::{Assurance, EvaluateRequest, OutputEventEnvelope};
-use hellas_work::model::setup::{
-    ObservedChannel, ReadyChannel, WorkChannelDescriptor, WorkSetupError,
-};
+use hellas_work::model::setup::{ReadyChannel, WorkChannelDescriptor, WorkSetupError};
 use hellas_work::model::work::{
     EvaluatePolicyV2, PaidJobAuthorizationV2, PaidWorkError, canonical_output_digest,
     propose_authorization, result_digest, signing_hash, terminal_result, work_id,
 };
-use hellas_work::test_support::paid::{
-    CURSOR, PRICE, PROMPT_TOKENS, advance, bond_edge, bond_object, bundle, bundle_bytes, client,
-    commit, deadlines, descriptor, descriptor_with, evaluate_request, lease_over, manifest,
-    network, origin, payment_edge, payment_object, payment_policy, provider, provider_producer,
-    settlement, work_policy,
+use hellas_work::test_support::channel::{
+    CURSOR, PRICE, PROMPT_TOKENS, advance, bundle, bundle_bytes, client, commit, deadlines,
+    descriptor, descriptor_with, evaluate_request, manifest, network, origin, payment_policy,
+    provider, provider_producer, settlement, work_policy,
 };
 use hellas_work::work::{
     BackendFault, ProviderEndpoint, RunAdmission, RunError, RunOutcome, WorkBackend, WorkService,
@@ -71,19 +65,7 @@ fn ready_at(height: u64) -> ReadyChannel {
 }
 
 fn ready_of(descriptor: WorkChannelDescriptor, height: u64) -> ReadyChannel {
-    let bond = bond_object();
-    let payment = payment_object();
-    let observed = ObservedChannel {
-        height,
-        bond: Some(&bond),
-        payment: Some(&payment),
-        lease: lease_over(bond_edge(), payment_edge()),
-        pending: PendingSlot::Absent,
-    };
-    match descriptor.check_ready(&observed) {
-        Ok(ready) => ready,
-        Err(error) => panic!("the fixture channel is ready: {error}"),
-    }
+    hellas_work::test_support::channel::ready_of(&descriptor, height)
 }
 
 fn ready() -> ReadyChannel {
@@ -91,21 +73,7 @@ fn ready() -> ReadyChannel {
 }
 
 async fn store_at(root: &std::path::Path, height: u64) -> ChannelStore {
-    let mut store = match ChannelStore::open(
-        root,
-        ready().channel().clone(),
-        settlement(),
-        Role::Provider,
-        origin(),
-        &Secp256k1Verifier::new(),
-    )
-    .await
-    {
-        Ok(store) => store,
-        Err(error) => panic!("the fixture store opens: {error}"),
-    };
-    advance(&mut store, height).await;
-    store
+    hellas_work::test_support::channel::store_at(root, &ready(), Role::Provider, height).await
 }
 
 fn endpoint(store: ChannelStore) -> ProviderEndpoint {
@@ -179,35 +147,13 @@ fn transcript_for(
     chunks: &[&[u32]],
     key: &ProducerSigningKey,
 ) -> Vec<OutputEventEnvelope> {
-    let mut builder =
-        EvaluateOutputTranscriptBuilder::new(input_commitment(request), request.assurance, key);
-    let mut generated: Vec<u32> = Vec::new();
-    for chunk in chunks {
-        if let Err(error) = builder.push_token_delta(chunk.to_vec()) {
-            panic!("a non-empty delta pushes: {error}");
-        }
-        generated.extend_from_slice(chunk);
-    }
-    let usage = EvaluateUsage {
-        input_units: PROMPT_TOKENS,
-        output_units: generated.len() as u64,
-    };
-    let billable_units = match usage.billable_units() {
-        Ok(units) => units,
-        Err(error) => panic!("the fixture usage sums: {error}"),
-    };
-    let terminal = EvaluateTerminal {
-        final_position: generated.len() as u64,
-        stop_reason: EvaluateStopReason::STOP_TOKEN,
-        matched_stop_token_id: Some(1),
-        text_artifact: Digest::from_bytes([0x77; 32]),
-        usage,
-        billable_units,
-    };
-    match builder.finish(terminal) {
-        Ok(events) => events,
-        Err(error) => panic!("the fixture transcript finishes: {error}"),
-    }
+    hellas_work::test_support::channel::transcript_chunks(
+        request,
+        chunks,
+        key,
+        PROMPT_TOKENS,
+        Digest::from_bytes([0x77; 32]),
+    )
 }
 
 fn answer_transcript(request: &EvaluateRequest) -> Vec<OutputEventEnvelope> {

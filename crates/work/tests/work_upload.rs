@@ -20,7 +20,7 @@ use hellas_work::{
             EvaluatePolicyV2, PaidJobAuthorizationV2, PrivateRecord as _, signing_hash, work_id,
         },
     },
-    test_support::paid::*,
+    test_support::channel::*,
     work::{ClientEndpoint, JobProposal, ProviderEndpoint, WorkService},
     work_store::{ChannelStore, Role},
 };

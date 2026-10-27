@@ -236,7 +236,7 @@ hellas-rpc = { workspace = true, features = ["work"] }
 # The consensus tests submit close actions built by the endpoint's own
 # paid-work helpers. Keep that dependency test-only: production chain code
 # only needs it behind the `work-watcher` feature.
-hellas-work.workspace = true
+hellas-work = { workspace = true, features = ["test-support"] }
 serde = { workspace = true, features = ["derive"] }
 sha2.workspace = true
 tempfile = "3"

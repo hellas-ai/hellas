@@ -5,7 +5,7 @@
 //! asserted is what the second process may do — never what the first
 //! one meant to do.
 
-use hellas_work::test_support::paid::{client, network, provider};
+use hellas_work::test_support::channel::{client, network, provider};
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -14,10 +14,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use hellas_auth::Digest;
 use hellas_kernel::{
     Auth, BlockHeight, CoinId, Decode as _, Edge, EdgeId, EdgeValues, Fees, Funding, Key,
-    LeaseSlots, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, Move, NetworkId, Parties, Party,
-    PartyAuth, PartyKeys, PaymentCloseStart, Payout, Proof, RegistryChunk, RegistryNamespace,
-    RegistryRecordTag, Secp256k1Verifier, Sig, Terms, TermsHash, Tx, WorkPaymentTerms,
-    WorkStakeBondTerms,
+    LeaseSlots, List, MAX_PARTY_INPUTS, Move, NetworkId, Parties, Party, PartyAuth, PartyKeys,
+    PaymentCloseStart, Payout, Proof, RegistryChunk, RegistryNamespace, RegistryRecordTag,
+    Secp256k1Verifier, Sig, Terms, TermsHash, Tx, WorkPaymentTerms, WorkStakeBondTerms,
 };
 use hellas_rpc::pb::work::{ExchangeSetupRequest, exchange_setup_response::Outcome};
 use hellas_rpc::protocol::ContentId;
@@ -74,18 +73,15 @@ fn empty_coins() -> List<CoinId, MAX_PARTY_INPUTS> {
 }
 
 fn bond_terms() -> WorkStakeBondTerms {
-    WorkStakeBondTerms {
-        parties: Parties::new(
+    hellas_work::test_support::channel::bond_terms_for(
+        Parties::new(
             PartyKeys::sole(provider().party_key()),
             PartyKeys::sole(client().party_key()),
         ),
-        timeout: BlockHeight::new(HORIZON),
-        timeout_outputs: List::take(
-            [Payout::new(provider().party_key(), STAKE); MAX_EDGE_OUTPUTS],
-            1,
-        ),
-        max_job_price: 40,
-    }
+        BlockHeight::new(HORIZON),
+        Payout::new(provider().party_key(), STAKE),
+        40,
+    )
 }
 
 fn bond_funding() -> Funding {
@@ -105,38 +101,26 @@ fn payment_funding() -> Funding {
 }
 
 fn payment_terms(bond_edge: EdgeId) -> WorkPaymentTerms {
-    WorkPaymentTerms {
+    hellas_work::test_support::channel::payment_terms_for(
         bond_edge,
-        bond_terms: bond_terms(),
-        private_policy_commitment: private_policy_commitment(network(), &SALT, &channel_policy()),
-        omit_response_blocks: hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
-        start_validity_blocks: hellas_kernel::MAX_START_VALIDITY_BLOCKS,
-        // Over half of the dearest edge these fixtures meet (4,096), so the
-        // bond exceeds the capacity it leaves on every one of them.
-        omission_bond: 2_049,
-    }
+        bond_terms(),
+        private_policy_commitment(network(), &SALT, &channel_policy()),
+        hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
+        hellas_kernel::MAX_START_VALIDITY_BLOCKS,
+        2_049,
+    )
 }
 
 fn channel_policy() -> PaidChannelPolicyV1 {
-    PaidChannelPolicyV1 {
-        compute_credit_limit: 40,
-        delivery_credit_limit: 40,
-    }
+    hellas_work::test_support::channel::credit_policy(40, 40)
 }
 
 fn work_policy() -> EvaluatePolicyV2 {
-    EvaluatePolicyV2 {
-        allowed_environment: ContentId::from_bytes([0x31; 32]),
-        generation_policy_digest: Digest::from_bytes([0x32; 32]),
-        identity_source_digest: Digest::from_bytes([0x33; 32]),
-        max_prompt_tokens: 512,
-        max_new_tokens: 128,
-        max_stop_token_ids: 4,
-        max_spool_bytes: 1_048_576,
-        max_encoded_result_frame: 262_144,
-        max_encoded_prepared_input: 1_048_576,
-        max_upload_bytes: 1_048_576,
-    }
+    hellas_work::test_support::channel::evaluate_policy(
+        ContentId::from_bytes([0x31; 32]),
+        Digest::from_bytes([0x32; 32]),
+        Digest::from_bytes([0x33; 32]),
+    )
 }
 
 fn provider_policy() -> ProviderChannelPolicy {
@@ -2464,21 +2448,7 @@ impl SetupView for HeldChannel {
 /// Offers one revision to a setup service through its own handler, and
 /// returns the revision it answers with.
 async fn exchange(service: &SetupService, bundle: Vec<u8>) -> Vec<u8> {
-    let answered = WorkSetupHandler::exchange_setup(
-        service,
-        ExchangeSetupRequest {
-            bond_edge: bond_edge().as_bytes().to_vec(),
-            bundle,
-        },
-        hellas_wire::TransportContext::default(),
-    )
-    .await
-    .expect("the setup handler answers");
-    let response: hellas_rpc::call::WithTrailer<_> = answered.into();
-    match response.response.outcome {
-        Some(Outcome::Advanced(advanced)) => advanced.bundle,
-        other => panic!("expected an advanced revision, got {other:?}"),
-    }
+    hellas_work::test_support::channel::exchange_setup(service, bond_edge(), bundle).await
 }
 
 /// A payment leg learned while a finalized read is suspended changes the

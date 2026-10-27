@@ -13,7 +13,7 @@ use support::temp;
 use hellas_auth::Digest;
 use hellas_auth::PublicKey;
 use hellas_kernel::{
-    EdgeId, EdgeValues, Fees, PayloadHash, PendingSlot, Secp256k1Signer, Secp256k1Verifier, Sig,
+    EdgeId, EdgeValues, Fees, PayloadHash, Secp256k1Signer, Secp256k1Verifier, Sig,
     SigVerifier as _, WorkPaymentSettlement, work_payment_settlement,
 };
 use hellas_rpc::pb::work::{
@@ -28,22 +28,19 @@ use hellas_rpc::{ContentId, Evaluate};
 use hellas_wire::mux::MuxTransport;
 use hellas_wire::{Dispatcher, ServiceMarker, StreamTransport};
 use hellas_work::model::prepared_input::PreparedPaidInputV1;
-use hellas_work::model::setup::{
-    ObservedChannel, ReadyChannel, WorkChannelDescriptor, payment_terms_hash,
-};
+use hellas_work::model::setup::{ReadyChannel, WorkChannelDescriptor, payment_terms_hash};
 use hellas_work::model::work::{
     JobDeadlines, PaidChannel, PaidJobAuthorizationV2, PrivateRecord as _, prepared_input_digest,
     propose_authorization, signing_hash, work_id, work_policy_digest,
 };
-use hellas_work::test_support::paid::{
-    CURSOR, OMISSION_BOND, PAYMENT_RESERVE, PAYMENT_VALUE, PRICE, SALT, advance, bond_edge,
-    bond_object, bundle, bundle_bytes, channel_policy, client, deadlines, descriptor,
-    descriptor_with as descriptor_with_policy, evaluate_request, identity_artifact, lease_over,
-    manifest, network, origin, payload_at, payment_edge, payment_object, payment_policy,
-    payment_terms, prompt_tokens, provider, settlement, signer, text_execution, text_policy,
-    work_policy,
+use hellas_work::test_support::channel::{
+    CURSOR, OMISSION_BOND, PAYMENT_RESERVE, PAYMENT_VALUE, PRICE, SALT, advance, bond_edge, bundle,
+    bundle_bytes, channel_policy, client, deadlines, descriptor,
+    descriptor_with as descriptor_with_policy, evaluate_request, identity_artifact, manifest,
+    network, origin, payload_at, payment_edge, payment_policy, payment_terms, prompt_tokens,
+    provider, settlement, signer, text_execution, text_policy, work_policy,
 };
-use hellas_work::test_support::paid::{accept_uploaded, accept_uploaded_service};
+use hellas_work::test_support::channel::{accept_uploaded, accept_uploaded_service};
 use hellas_work::work::{
     ClientEndpoint, CloseEndpoint, EndpointError, JobProposal, ProposeError, ProviderEndpoint,
     WorkRefusal, WorkService, propose_work,
@@ -67,19 +64,7 @@ fn ready() -> ReadyChannel {
 }
 
 fn ready_with_descriptor(descriptor: WorkChannelDescriptor) -> ReadyChannel {
-    let bond = bond_object();
-    let payment = payment_object();
-    let observed = ObservedChannel {
-        height: CURSOR,
-        bond: Some(&bond),
-        payment: Some(&payment),
-        lease: lease_over(bond_edge(), payment_edge()),
-        pending: PendingSlot::Absent,
-    };
-    match descriptor.check_ready(&observed) {
-        Ok(ready) => ready,
-        Err(error) => panic!("the fixture channel is ready: {error}"),
-    }
+    hellas_work::test_support::channel::ready_of(&descriptor, CURSOR)
 }
 
 async fn store(root: &std::path::Path, role: Role) -> ChannelStore {

@@ -12,222 +12,37 @@
 
 #![cfg(feature = "work")]
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use hellas_work::test_support::channel::serve_work as serve;
+use hellas_work::test_support::channel::{
+    CURSOR, PRICE, PROMPT_TOKENS, bundle, client, commit, deadlines, descriptor_with, payload_at,
+    payment_policy, provider, provider_producer, ready, ready_of, store_at, work_policy,
+};
 
-use bytes::Bytes;
 use hellas_auth::Digest;
-use hellas_auth::{ProducerSigningKey, PublicKey};
 use hellas_client::work::payment::pay_for_result;
 use hellas_client::work::reproduce::{ReproduceFault, Reproduced, Reproducer};
 use hellas_client::work::{
     CheckedResult, CollectError, CollectOutcome, CollectResultError, CollectResultOutcome,
     collect_checked_result, collect_result,
 };
-use hellas_kernel::{
-    BlockHeight, Decode as _, Edge, EdgeId, EdgeValues, Fees, Key, LeaseSlots, List,
-    MAX_EDGE_OUTPUTS, NetworkId, Parties, PartyKeys, Payout, PendingSlot, RegistryChunk,
-    RegistryNamespace, RegistryRecordTag, Secp256k1Signer, Secp256k1Verifier, Terms, TermsHash,
-    WorkPaymentSettlement, WorkPaymentTerms, WorkStakeBondTerms, work_payment_settlement,
-};
-use hellas_rpc::evaluate::{
-    EvaluateOutputTranscriptBuilder, EvaluateStopReason, EvaluateTerminal, EvaluateUsage,
-    input_commitment,
-};
-use hellas_rpc::protocol::artifacts::{
-    BoundTermId, Canonical as _, InputAddressed as _, OutputAddressed as _, SourceRef,
-    TextArtifact, TextExecution, TextExecutionId, TextPolicy, TokenIds, completed_text,
-};
-use hellas_rpc::services::work::WorkServer;
-use hellas_rpc::{
-    Application, Assurance, CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR, ContentId, EvaluateRequest,
-    OutputEventEnvelope, ProgramManifest,
-};
-use hellas_wire::mux::{MessagePipe, MuxConfig, MuxTransport, Role as MuxRole};
-use hellas_wire::{DefaultClock, Dispatcher, StreamTransport};
+use hellas_rpc::evaluate::EvaluateStopReason;
+use hellas_rpc::protocol::artifacts::{OutputAddressed as _, TextExecutionId, completed_text};
+use hellas_rpc::{EvaluateRequest, OutputEventEnvelope};
+use hellas_wire::mux::MuxTransport;
 use hellas_work::model::prepared_input::PreparedPaidInputV1;
-use hellas_work::model::setup::{
-    ObservedChannel, ReadyChannel, WorkChannelConfig, WorkChannelDescriptor, payment_terms_hash,
-};
+use hellas_work::model::setup::ReadyChannel;
 use hellas_work::model::work::{
-    EvaluatePolicyV2, JobDeadlines, PaidChannelPolicyV1, PaidJobAuthorizationV2,
-    generation_policy_digest, identity_source_digest, private_policy_commitment,
-    propose_authorization, signing_hash, work_id,
+    EvaluatePolicyV2, PaidJobAuthorizationV2, propose_authorization, signing_hash, work_id,
 };
 use hellas_work::work::{
-    BackendFault, ClientEndpoint, ProviderEndpoint, RunOutcome, WorkBackend, WorkService,
-    run_accepted_work,
+    ClientEndpoint, ProviderEndpoint, RunOutcome, WorkService, run_accepted_work,
 };
-use hellas_work::work_close::{BlockSourceError, FinalizedBlocks, FinalizedWork, observe};
+use hellas_work::work_close::{BlockSourceError, FinalizedBlocks, FinalizedWork};
 use hellas_work::work_store::{
-    ChannelRecord, ChannelStore, JobPhase, JobState, Role, SetupOrigin, TerminalOutcome,
+    ChannelRecord, ChannelStore, JobPhase, JobState, Role, TerminalOutcome,
 };
-use tokio::sync::mpsc;
 
 // ── Fixture ───────────────────────────────────────────────────────────
-
-const HORIZON: u64 = 500;
-const PRICE: u64 = 10;
-const CREDIT_LIMIT: u64 = 40;
-/// One over half the funding, so the bond exceeds the capacity it
-/// leaves behind at zero fees.
-const OMISSION_BOND: u64 = 601;
-const PAYMENT_VALUE: u64 = 1_000;
-const PAYMENT_RESERVE: u64 = 200;
-const STAKE: u64 = 64;
-const SALT: [u8; 32] = [0x5a; 32];
-/// The finalized block both endpoints have processed through.
-const CURSOR: u64 = 10;
-/// The prompt this fixture's bundle carries, in tokens.
-const PROMPT_TOKENS: u64 = 4;
-
-const fn deadlines() -> JobDeadlines {
-    JobDeadlines {
-        acceptance: 50,
-        terminal: 100,
-        payment: 200,
-    }
-}
-
-fn network() -> NetworkId {
-    let Some(network) = NetworkId::new("hellas-test") else {
-        panic!("a short ascii id is a legal network id");
-    };
-    network
-}
-
-fn client() -> Secp256k1Signer {
-    signer(0x21)
-}
-
-fn provider() -> Secp256k1Signer {
-    signer(0x22)
-}
-
-fn signer(byte: u8) -> Secp256k1Signer {
-    let Ok(signer) = Secp256k1Signer::from_secret_scalar([byte; 32]) else {
-        panic!("a fixed scalar is a key");
-    };
-    signer
-}
-
-fn provider_producer() -> ProducerSigningKey {
-    match ProducerSigningKey::from_secret_bytes([0x22; 32]) {
-        Ok(key) => key,
-        Err(error) => panic!("a fixed scalar is a producer key: {error}"),
-    }
-}
-
-fn bond_edge() -> EdgeId {
-    EdgeId::from_bytes([0x11; EdgeId::LENGTH])
-}
-
-fn payment_edge() -> EdgeId {
-    EdgeId::from_bytes([0x22; EdgeId::LENGTH])
-}
-
-fn channel_policy() -> PaidChannelPolicyV1 {
-    PaidChannelPolicyV1 {
-        compute_credit_limit: CREDIT_LIMIT,
-        delivery_credit_limit: CREDIT_LIMIT,
-    }
-}
-
-fn bond_terms() -> WorkStakeBondTerms {
-    WorkStakeBondTerms {
-        parties: Parties::new(
-            PartyKeys::sole(provider().party_key()),
-            PartyKeys::sole(client().party_key()),
-        ),
-        timeout: BlockHeight::new(HORIZON),
-        timeout_outputs: List::take(
-            [Payout::new(provider().party_key(), STAKE); MAX_EDGE_OUTPUTS],
-            1,
-        ),
-        max_job_price: 40,
-    }
-}
-
-fn payment_terms() -> WorkPaymentTerms {
-    WorkPaymentTerms {
-        bond_edge: bond_edge(),
-        bond_terms: bond_terms(),
-        private_policy_commitment: private_policy_commitment(network(), &SALT, &channel_policy()),
-        omit_response_blocks: hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
-        start_validity_blocks: 8,
-        omission_bond: OMISSION_BOND,
-    }
-}
-
-fn work_policy() -> EvaluatePolicyV2 {
-    EvaluatePolicyV2 {
-        allowed_environment: manifest().content_id(),
-        generation_policy_digest: match generation_policy_digest(&text_policy().canonical_bytes()) {
-            Ok(digest) => digest,
-            Err(error) => panic!("the fixture policy hashes: {error}"),
-        },
-        identity_source_digest: match identity_source_digest(&identity_artifact().canonical_bytes())
-        {
-            Ok(digest) => digest,
-            Err(error) => panic!("the fixture identity hashes: {error}"),
-        },
-        max_prompt_tokens: 512,
-        max_new_tokens: 128,
-        max_stop_token_ids: 4,
-        max_spool_bytes: 1_048_576,
-        max_encoded_result_frame: 262_144,
-        max_encoded_prepared_input: 1_048_576,
-        max_upload_bytes: 1_048_576,
-    }
-}
-
-fn payment_values() -> EdgeValues {
-    EdgeValues::new(PAYMENT_VALUE, PAYMENT_RESERVE, Fees::new(0, 0, 0, 0))
-}
-
-fn descriptor_with(policy: EvaluatePolicyV2) -> WorkChannelDescriptor {
-    let config = WorkChannelConfig {
-        payment_policy: payment_policy(),
-        network: network(),
-        payment_edge: payment_edge(),
-        payment_terms: payment_terms(),
-        policy_salt: SALT,
-        channel_policy: channel_policy(),
-        work_policy: policy.into(),
-        expected_payment_values: payment_values(),
-    };
-    match WorkChannelDescriptor::open(config) {
-        Ok(descriptor) => descriptor,
-        Err(error) => panic!("the fixture channel opens: {error}"),
-    }
-}
-
-fn ready_of(descriptor: &WorkChannelDescriptor, height: u64) -> ReadyChannel {
-    let bond = bond_object();
-    let payment = payment_object();
-    let observed = ObservedChannel {
-        height,
-        bond: Some(&bond),
-        payment: Some(&payment),
-        lease: lease_over(bond_edge(), payment_edge()),
-        pending: PendingSlot::Absent,
-    };
-    match descriptor.check_ready(&observed) {
-        Ok(ready) => ready,
-        Err(error) => panic!("the fixture channel is ready: {error}"),
-    }
-}
-
-fn ready() -> ReadyChannel {
-    ready_of(&descriptor_with(work_policy()), CURSOR)
-}
-
-fn settlement() -> WorkPaymentSettlement {
-    let Some(settlement) = work_payment_settlement(payment_values(), OMISSION_BOND) else {
-        panic!("a funded edge prices both exits");
-    };
-    settlement
-}
 
 fn temp() -> tempfile::TempDir {
     match tempfile::tempdir() {
@@ -236,136 +51,11 @@ fn temp() -> tempfile::TempDir {
     }
 }
 
-async fn store_at(
-    root: &std::path::Path,
-    ready: &ReadyChannel,
-    role: Role,
-    height: u64,
-) -> ChannelStore {
-    let mut store = match ChannelStore::open(
-        root,
-        ready.channel().clone(),
-        settlement(),
-        role,
-        origin(),
-        &Secp256k1Verifier::new(),
-    )
-    .await
-    {
-        Ok(store) => store,
-        Err(error) => panic!("the fixture store opens: {error}"),
-    };
-    advance(&mut store, height).await;
-    store
-}
-
-/// The payload digest of the synthetic block at `height`.
-///
-/// A cursor is contiguous, so a fixture that moves it has to name a
-/// chain rather than repeat one digest: each block's parent is the last
-/// block's payload, and the watcher refuses anything else.
-fn payload_at(height: u64) -> [u8; 32] {
-    let mut payload = [0xc0; 32];
-    for (slot, byte) in payload.iter_mut().zip(height.to_be_bytes()) {
-        *slot = byte;
-    }
-    payload
-}
-
-/// Where the fixture channel was opened: the genesis block of the
-/// synthetic chain above, so a store starts with a clock and `advance`
-/// reads block one next.
-fn origin() -> SetupOrigin {
-    SetupOrigin {
-        payment_edge: payment_edge(),
-        height: 0,
-        payload: payload_at(0),
-        parent: [0_u8; 32],
-    }
-}
-
-/// Runs the production watcher over one empty finalized block per
-/// height, up through `height`.
-///
-/// The same call the settlement loop makes, so a fixture cursor is a
-/// cursor this endpoint could have reached.
-async fn advance(store: &mut ChannelStore, height: u64) {
-    let mut next = store.state().cursor().0.saturating_add(1);
-    while next <= height {
-        let block = FinalizedWork {
-            height: next,
-            parent: payload_at(next.saturating_sub(1)),
-            payload: payload_at(next),
-            txs: Vec::new(),
-        };
-        if let Err(error) = observe(store, &block, &Secp256k1Verifier::new()).await {
-            panic!("the fixture block applies: {error}");
-        }
-        next = next.saturating_add(1);
-    }
-}
-
-async fn commit(store: &mut ChannelStore, record: ChannelRecord) {
-    if let Err(error) = store.commit(record, &Secp256k1Verifier::new()).await {
-        panic!("the fixture record commits: {error}");
-    }
-}
-
 // ── The prepared inputs a job executes from ───────────────────────────
-
-fn manifest() -> ProgramManifest {
-    ProgramManifest::new(
-        Application::new(CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR)
-            .expect("the causal-LM application identity is valid"),
-        ContentId::from_bytes([0x16; 32]),
-    )
-}
 
 /// The prompt every job here runs on. It is the whole input, because
 /// this profile starts from an identity artifact.
 const PROMPT: [u32; 4] = [9, 8, 7, 6];
-
-fn prompt_tokens() -> TokenIds {
-    TokenIds::from(PROMPT.to_vec())
-}
-
-fn text_policy() -> TextPolicy {
-    TextPolicy::from_u32_stop_tokens(64, [2, 1])
-}
-
-fn identity_artifact() -> TextArtifact {
-    TextArtifact::identity(BoundTermId::from_digest(manifest().content_id().digest()))
-}
-
-fn text_execution() -> TextExecution {
-    TextExecution::new(
-        SourceRef::output(identity_artifact().output_id()),
-        prompt_tokens().output_id(),
-        text_policy().output_id(),
-    )
-}
-
-fn evaluate_request(nonce: u8) -> EvaluateRequest {
-    EvaluateRequest {
-        text_execution: text_execution().input_id().digest(),
-        runner_public_key: PublicKey::Secp256k1(client().party_key().to_bytes()),
-        execution_environment: manifest().content_id(),
-        nonce: [nonce; 32],
-        assurance: Assurance::ProducerSigned,
-        retain: true,
-    }
-}
-
-fn bundle(nonce: u8) -> PreparedPaidInputV1 {
-    PreparedPaidInputV1::new(
-        &evaluate_request(nonce),
-        &manifest(),
-        &text_execution(),
-        &prompt_tokens(),
-        &text_policy(),
-        &identity_artifact(),
-    )
-}
 
 fn authorization(policy: &EvaluatePolicyV2, nonce: u8) -> PaidJobAuthorizationV2 {
     match propose_authorization(
@@ -423,24 +113,6 @@ async fn accept(
 const ANSWER: [u32; 5] = [101, 102, 103, 104, 105];
 
 fn transcript_for(request: &EvaluateRequest, answer: &[u32]) -> Vec<OutputEventEnvelope> {
-    let key = provider_producer();
-    let mut builder =
-        EvaluateOutputTranscriptBuilder::new(input_commitment(request), request.assurance, &key);
-    if let Err(error) = builder.push_token_delta(answer.to_vec()) {
-        panic!("a non-empty delta pushes: {error}");
-    }
-    let usage = EvaluateUsage {
-        input_units: PROMPT_TOKENS,
-        output_units: answer.len() as u64,
-    };
-    let billable_units = match usage.billable_units() {
-        Ok(units) => units,
-        Err(error) => panic!("the fixture usage sums: {error}"),
-    };
-    // The artifact a provider's own store records for this execution.
-    // A placeholder would do for the tests that never reexecute; here
-    // it would make an honest provider look wrong, because the answer
-    // digest binds this field and the re-execution derives it.
     let text_artifact = completed_text(
         TextExecutionId::from_digest(request.text_execution),
         &PROMPT,
@@ -449,95 +121,27 @@ fn transcript_for(request: &EvaluateRequest, answer: &[u32]) -> Vec<OutputEventE
     .artifact
     .output_id()
     .digest();
-    match builder.finish(EvaluateTerminal {
-        final_position: answer.len() as u64,
-        stop_reason: EvaluateStopReason::STOP_TOKEN,
-        matched_stop_token_id: Some(1),
+    hellas_work::test_support::channel::transcript_chunks(
+        request,
+        &[answer],
+        &provider_producer(),
+        PROMPT_TOKENS,
         text_artifact,
-        usage,
-        billable_units,
-    }) {
-        Ok(events) => events,
-        Err(error) => panic!("the fixture transcript finishes: {error}"),
-    }
+    )
 }
 
-/// A backend that counts its calls and signs the fixture answer.
-struct AnsweringBackend {
-    calls: Arc<AtomicUsize>,
-}
-
-impl AnsweringBackend {
-    fn new() -> Self {
-        Self {
-            calls: Arc::new(AtomicUsize::new(0)),
-        }
-    }
-}
-
-impl WorkBackend for AnsweringBackend {
-    fn try_admit(
-        &self,
-        domain: hellas_work::work::admission::CapacityDomain,
-    ) -> Result<hellas_work::work::admission::WorkPermit, BackendFault> {
-        Err(hellas_work::work::admission::AdmissionError::Unsupported(domain).into())
-    }
-
-    async fn execute(
-        &self,
-        prepared: hellas_work::work::PreparedWorkInput,
-    ) -> Result<Vec<hellas_rpc::OutputEventEnvelope>, BackendFault> {
-        let hellas_work::work::PreparedWorkInput::Evaluate(input) = prepared else {
-            return Err(hellas_work::work::admission::AdmissionError::Unsupported(
-                hellas_work::work::admission::CapacityDomain::Fetch,
-            )
-            .into());
-        };
-        let input = *input;
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        let produced = transcript_for(input.evaluate_request(), &ANSWER);
-        Ok(produced)
-    }
-}
-
-/// Runs one accepted job to a signed, durable result.
 async fn run_to_result(service: &WorkService, ready: &ReadyChannel, id: Digest) {
-    let backend = AnsweringBackend::new();
+    let backend =
+        hellas_work::test_support::channel::AnsweringBackend::with_transcript(transcript_for);
     let outcome = run_accepted_work(service, ready, &backend, id).await;
     assert!(
         matches!(outcome, Ok(RunOutcome::Completed { .. })),
-        "the fixture job completes: {outcome:?}",
+        "the fixture job completes: {outcome:?}"
     );
 }
 
 // ── Transport plumbing ────────────────────────────────────────────────
 
-struct Pipe {
-    out: mpsc::UnboundedSender<Bytes>,
-    inbox: mpsc::UnboundedReceiver<Bytes>,
-}
-
-impl MessagePipe for Pipe {
-    type SendError = std::io::Error;
-    type RecvError = std::io::Error;
-
-    async fn send_message(&mut self, bytes: Bytes) -> Result<(), Self::SendError> {
-        let _ = self.out.send(bytes);
-        Ok(())
-    }
-
-    async fn recv_message(&mut self) -> Result<Option<Bytes>, Self::RecvError> {
-        Ok(self.inbox.recv().await)
-    }
-}
-
-/// What the two ends of one live session both know.
-///
-/// A mux over a pair of in-memory pipes has no TLS of its own, so the
-/// exporter is supplied here — which is what a QUIC connection does for
-/// itself. Both halves are handed the same value, because that is the
-/// one property the delivery binding rests on: the number is known to
-/// exactly the two ends of one connection.
 fn session() -> hellas_wire::TransportContext {
     hellas_wire::TransportContext {
         open_exporter: Some([0x5e; 32]),
@@ -546,38 +150,10 @@ fn session() -> hellas_wire::TransportContext {
 }
 
 fn transport_pair() -> (MuxTransport, MuxTransport) {
-    let (to_server, server_inbox) = mpsc::unbounded_channel();
-    let (to_client, client_inbox) = mpsc::unbounded_channel();
-    let client = MuxTransport::spawn::<8, _, _>(
-        MuxRole::Client,
-        DefaultClock,
-        MuxConfig::default(),
-        Pipe {
-            out: to_server,
-            inbox: client_inbox,
-        },
+    hellas_work::test_support::transport::transport_pair_without_write_authority(
         session(),
-    );
-    let server = MuxTransport::spawn::<8, _, _>(
-        MuxRole::Server,
-        DefaultClock,
-        MuxConfig::default(),
-        Pipe {
-            out: to_client,
-            inbox: server_inbox,
-        },
         session(),
-    );
-    (client, server)
-}
-
-fn serve(transport: MuxTransport, service: WorkService) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let server = WorkServer(service);
-        while let Ok(Some(inbound)) = transport.accept().await {
-            let _ = Dispatcher::<MuxTransport>::dispatch(&server, inbound).await;
-        }
-    })
+    )
 }
 
 // ── The re-execution engine double ────────────────────────────────────
@@ -1343,110 +919,4 @@ async fn a_stalled_reproduction_refuses_to_pay_at_the_barrier() {
         endpoint.state().last_payment().is_none(),
         "and nothing was signed",
     );
-}
-
-// ── Canonical chain objects, spelled out ──────────────────────────────
-
-const FORMAT_VERSION: u8 = 1;
-const TAG_BLOCK_HEIGHT: u8 = 1;
-const TAG_FEES: u8 = 2;
-const TAG_PARTIES: u8 = 3;
-const TAG_EDGE: u8 = 5;
-const TAG_BOND_LEASE: u8 = 31;
-/// `Freeze | Adjudicated`: close-kind tags 3 and 4.
-const WORK_PAYMENT_CLOSES: u8 = 0b0001_1000;
-/// `Timeout` alone: close-kind tag 1.
-const WORK_STAKE_CLOSES: u8 = 0b0000_0010;
-
-struct EdgeBytes {
-    value: u64,
-    reserve: u64,
-    maker: Key,
-    taker: Key,
-    terms: TermsHash,
-    allowed: u8,
-}
-
-impl EdgeBytes {
-    fn build(&self) -> Edge {
-        let mut out = vec![FORMAT_VERSION, TAG_EDGE];
-        out.extend_from_slice(&self.value.to_be_bytes());
-        out.extend_from_slice(&self.reserve.to_be_bytes());
-        out.extend_from_slice(&[FORMAT_VERSION, TAG_FEES]);
-        for _ in 0..4 {
-            out.extend_from_slice(&0_u64.to_be_bytes());
-        }
-        out.extend_from_slice(&[FORMAT_VERSION, TAG_BLOCK_HEIGHT]);
-        out.extend_from_slice(&HORIZON.to_be_bytes());
-        out.extend_from_slice(&[FORMAT_VERSION, TAG_PARTIES]);
-        // Each party: owner, signer, and an absent payout delegate.
-        for party in [self.maker, self.taker] {
-            out.extend_from_slice(&party.to_bytes());
-            out.extend_from_slice(&party.to_bytes());
-            out.push(0);
-        }
-        out.extend_from_slice(self.terms.as_bytes());
-        out.push(self.allowed);
-        match Edge::decode_exact(&out) {
-            Ok(edge) => edge,
-            Err(error) => panic!("the hand-written edge is canonical: {error:?}"),
-        }
-    }
-}
-
-fn bond_object() -> Edge {
-    EdgeBytes {
-        value: STAKE,
-        reserve: 0,
-        maker: provider().party_key(),
-        taker: client().party_key(),
-        terms: Terms::work_stake_bond(bond_terms()).hash(),
-        allowed: WORK_STAKE_CLOSES,
-    }
-    .build()
-}
-
-fn payment_object() -> Edge {
-    EdgeBytes {
-        value: PAYMENT_VALUE,
-        reserve: PAYMENT_RESERVE,
-        maker: client().party_key(),
-        taker: provider().party_key(),
-        terms: payment_terms_hash(payment_terms()),
-        allowed: WORK_PAYMENT_CLOSES,
-    }
-    .build()
-}
-
-fn lease_over(bond: EdgeId, payment: EdgeId) -> LeaseSlots {
-    let mut value = vec![FORMAT_VERSION, TAG_BOND_LEASE, 2];
-    value.extend_from_slice(&bond.to_bytes());
-    value.extend_from_slice(&payment.to_bytes());
-    value.extend_from_slice(payment_terms_hash(payment_terms()).as_bytes());
-    value.extend_from_slice(&payment_terms().private_policy_commitment);
-    value.extend_from_slice(&HORIZON.to_be_bytes());
-
-    let slots = [0, 1].map(|index| {
-        RegistryChunk::split(
-            RegistryNamespace::BondLease,
-            RegistryRecordTag::BondLease,
-            &value,
-            index,
-        )
-    });
-    let parsed = hellas_kernel::parse_bond_lease(slots, bond);
-    assert!(
-        matches!(parsed, LeaseSlots::Present(_)),
-        "the hand-written lease is readable, got {parsed:?}",
-    );
-    parsed
-}
-
-fn payment_policy() -> hellas_work::model::work::JobPaymentPolicyV2 {
-    hellas_work::model::work::JobPaymentPolicyV2 {
-        fixed_price: PRICE,
-        dispatch_margin_blocks: 4,
-        delivery_margin_blocks: 2,
-        oracle_grace_blocks: 6,
-    }
 }

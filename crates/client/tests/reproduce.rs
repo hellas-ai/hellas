@@ -14,20 +14,16 @@ use hellas_client::work::reproduce::{
     ReproduceFault, Reproduced, Reproducer, Reproduction, ReproductionRequest, plan, reproduce,
 };
 use hellas_kernel::{
-    BlockHeight, EdgeId, List, MAX_EDGE_OUTPUTS, NetworkId, Parties, PartyKeys, Payout,
-    Secp256k1Signer, WorkPaymentTerms, WorkStakeBondTerms,
+    BlockHeight, EdgeId, NetworkId, Parties, PartyKeys, Payout, Secp256k1Signer, WorkPaymentTerms,
 };
-use hellas_rpc::evaluate::{
-    EvaluateOutputTranscriptBuilder, EvaluateStopReason, EvaluateTerminal, EvaluateUsage,
-    input_commitment,
-};
+use hellas_rpc::evaluate::EvaluateStopReason;
 use hellas_rpc::protocol::artifacts::{
     BoundTermId, InputAddressed as _, OutputAddressed as _, SourceRef, TextArtifact, TextExecution,
     TextExecutionId, TextPolicy, TokenIds, completed_text,
 };
 use hellas_rpc::{
-    Application, Assurance, CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR, ContentId, EvaluateRequest,
-    OutputEventEnvelope, ProgramManifest,
+    Application, CATENA_GPU_EVALUATOR, CAUSAL_LM_ADAPTOR, ContentId, EvaluateRequest,
+    ProgramManifest,
 };
 use hellas_work::model::prepared_input::PreparedPaidInputV1;
 use hellas_work::model::work::{
@@ -78,32 +74,26 @@ fn provider_producer() -> ProducerSigningKey {
 }
 
 fn channel_policy() -> PaidChannelPolicyV1 {
-    PaidChannelPolicyV1 {
-        compute_credit_limit: 100,
-        delivery_credit_limit: 100,
-    }
+    hellas_work::test_support::channel::credit_policy(100, 100)
 }
 
 fn payment_terms() -> WorkPaymentTerms {
-    WorkPaymentTerms {
-        bond_edge: EdgeId::from_bytes([0x11; 32]),
-        bond_terms: WorkStakeBondTerms {
-            parties: Parties::new(
+    hellas_work::test_support::channel::payment_terms_for(
+        EdgeId::from_bytes([0x11; 32]),
+        hellas_work::test_support::channel::bond_terms_for(
+            Parties::new(
                 PartyKeys::sole(provider().party_key()),
                 PartyKeys::sole(client().party_key()),
             ),
-            timeout: BlockHeight::new(HORIZON),
-            timeout_outputs: List::take(
-                [Payout::new(provider().party_key(), 64); MAX_EDGE_OUTPUTS],
-                1,
-            ),
-            max_job_price: 40,
-        },
-        private_policy_commitment: private_policy_commitment(network(), &SALT, &channel_policy()),
-        omit_response_blocks: hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
-        start_validity_blocks: 8,
-        omission_bond: 4,
-    }
+            BlockHeight::new(HORIZON),
+            Payout::new(provider().party_key(), 64),
+            40,
+        ),
+        private_policy_commitment(network(), &SALT, &channel_policy()),
+        hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
+        8,
+        4,
+    )
 }
 
 fn channel() -> PaidChannel {
@@ -144,14 +134,12 @@ fn text_execution() -> TextExecution {
 }
 
 fn evaluate_request() -> EvaluateRequest {
-    EvaluateRequest {
-        text_execution: text_execution().input_id().digest(),
-        runner_public_key: PublicKey::Secp256k1(client().party_key().to_bytes()),
-        execution_environment: manifest().content_id(),
-        nonce: [0x33; 32],
-        assurance: Assurance::ProducerSigned,
-        retain: true,
-    }
+    hellas_work::test_support::channel::evaluate_request_for(
+        text_execution().input_id().digest(),
+        PublicKey::Secp256k1(client().party_key().to_bytes()),
+        manifest().content_id(),
+        [0x33; 32],
+    )
 }
 
 fn bundle() -> PreparedPaidInputV1 {
@@ -166,28 +154,21 @@ fn bundle() -> PreparedPaidInputV1 {
 }
 
 fn work_policy() -> EvaluatePolicyV2 {
-    EvaluatePolicyV2 {
-        allowed_environment: manifest().content_id(),
-        generation_policy_digest: match generation_policy_digest(
+    hellas_work::test_support::channel::evaluate_policy(
+        manifest().content_id(),
+        match generation_policy_digest(
             &hellas_rpc::protocol::artifacts::Canonical::canonical_bytes(&text_policy()),
         ) {
             Ok(digest) => digest,
             Err(error) => panic!("the fixture policy hashes: {error}"),
         },
-        identity_source_digest: match identity_source_digest(
+        match identity_source_digest(
             &hellas_rpc::protocol::artifacts::Canonical::canonical_bytes(&identity_artifact()),
         ) {
             Ok(digest) => digest,
             Err(error) => panic!("the fixture identity hashes: {error}"),
         },
-        max_prompt_tokens: 512,
-        max_new_tokens: 128,
-        max_stop_token_ids: 4,
-        max_spool_bytes: 1_048_576,
-        max_encoded_result_frame: 262_144,
-        max_encoded_prepared_input: 1_048_576,
-        max_upload_bytes: 1_048_576,
-    }
+    )
 }
 
 fn authorization() -> PaidJobAuthorizationV2 {
@@ -216,19 +197,6 @@ fn honest_result(answer: &[u32]) -> PaidJobResultV1 {
     let authorization = authorization();
     let request = evaluate_request();
     let key = provider_producer();
-    let mut builder =
-        EvaluateOutputTranscriptBuilder::new(input_commitment(&request), request.assurance, &key);
-    if let Err(error) = builder.push_token_delta(answer.to_vec()) {
-        panic!("a non-empty delta pushes: {error}");
-    }
-    let usage = EvaluateUsage {
-        input_units: PROMPT.len() as u64,
-        output_units: answer.len() as u64,
-    };
-    let billable_units = match usage.billable_units() {
-        Ok(units) => units,
-        Err(error) => panic!("the fixture usage sums: {error}"),
-    };
     // The artifact a provider's store records for this execution. It is
     // pinned to bytes independently in `hellas-rpc`'s vector suite, so
     // this is the provider's side of the correspondence rather than a
@@ -241,17 +209,13 @@ fn honest_result(answer: &[u32]) -> PaidJobResultV1 {
     .artifact
     .output_id()
     .digest();
-    let transcript: Vec<OutputEventEnvelope> = match builder.finish(EvaluateTerminal {
-        final_position: answer.len() as u64,
-        stop_reason: EvaluateStopReason::STOP_TOKEN,
-        matched_stop_token_id: Some(1),
+    let transcript = hellas_work::test_support::channel::transcript_chunks(
+        &request,
+        &[answer],
+        &key,
+        PROMPT.len() as u64,
         text_artifact,
-        usage,
-        billable_units,
-    }) {
-        Ok(events) => events,
-        Err(error) => panic!("the fixture transcript finishes: {error}"),
-    };
+    );
     match terminal_result(&channel, &authorization, &transcript) {
         Ok(result) => result,
         Err(error) => panic!("the fixture transcript is a terminal: {error}"),

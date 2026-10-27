@@ -117,7 +117,7 @@ async fn accept_uploaded_fetch(
         .prepared_input()
         .to_vec();
     let (wire, uploads) =
-        hellas_work::test_support::paid::input_uploads(fixture.ready.channel(), request, &bytes);
+        hellas_work::test_support::channel::input_uploads(fixture.ready.channel(), request, &bytes);
     let context = hellas_wire::TransportContext {
         open_exporter: Some([7; 32]),
         ..Default::default()

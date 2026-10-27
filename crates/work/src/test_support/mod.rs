@@ -642,7 +642,7 @@ pub use node::{
 
 pub mod evaluate;
 
-pub mod paid;
+pub mod channel;
 
 pub fn upload_failure(
     response: Result<hellas_rpc::pb::work::UploadContentResponse, hellas_wire::WireStatus>,

@@ -9,9 +9,9 @@
 
 use hellas_auth::Digest;
 use hellas_kernel::{
-    BlockHeight, Decode as _, Edge, EdgeId, EdgeValues, Fees, LeaseSlots, List, MAX_EDGE_OUTPUTS,
-    NetworkId, Parties, PartyKeys, Payout, PendingSlot, RegistryChunk, RegistryNamespace,
-    RegistryRecordTag, Terms, TermsHash, WorkPaymentTerms, WorkStakeBondTerms,
+    BlockHeight, Decode as _, Edge, EdgeId, EdgeValues, Fees, LeaseSlots, NetworkId, Parties,
+    PartyKeys, Payout, PendingSlot, RegistryChunk, RegistryNamespace, RegistryRecordTag, Terms,
+    TermsHash, WorkPaymentTerms, WorkStakeBondTerms,
 };
 use hellas_rpc::protocol::ContentId;
 use hellas_work::model::setup::{
@@ -59,49 +59,38 @@ fn payment_edge() -> EdgeId {
 }
 
 fn bond_terms() -> WorkStakeBondTerms {
-    WorkStakeBondTerms {
-        // Maker = provider, taker = client. The payment edge mirrors it.
-        parties: Parties::new(
+    hellas_work::test_support::channel::bond_terms_for(
+        Parties::new(
             PartyKeys::sole(provider_key()),
             PartyKeys::sole(client_key()),
         ),
-        timeout: BlockHeight::new(HORIZON),
-        timeout_outputs: List::take([Payout::new(provider_key(), STAKE); MAX_EDGE_OUTPUTS], 1),
-        max_job_price: 40,
-    }
+        BlockHeight::new(HORIZON),
+        Payout::new(provider_key(), STAKE),
+        40,
+    )
 }
 
 fn channel_policy() -> PaidChannelPolicyV1 {
-    PaidChannelPolicyV1 {
-        compute_credit_limit: 40,
-        delivery_credit_limit: 40,
-    }
+    hellas_work::test_support::channel::credit_policy(40, 40)
 }
 
 fn payment_terms() -> WorkPaymentTerms {
-    WorkPaymentTerms {
-        bond_edge: bond_edge(),
-        bond_terms: bond_terms(),
-        private_policy_commitment: private_policy_commitment(network(), &SALT, &channel_policy()),
-        omit_response_blocks: WINDOW,
-        start_validity_blocks: 8,
-        omission_bond: OMISSION_BOND,
-    }
+    hellas_work::test_support::channel::payment_terms_for(
+        bond_edge(),
+        bond_terms(),
+        private_policy_commitment(network(), &SALT, &channel_policy()),
+        WINDOW,
+        8,
+        OMISSION_BOND,
+    )
 }
 
 fn work_policy() -> EvaluatePolicyV2 {
-    EvaluatePolicyV2 {
-        allowed_environment: ContentId::from_bytes([0x31; 32]),
-        generation_policy_digest: Digest::from_bytes([0x32; 32]),
-        identity_source_digest: Digest::from_bytes([0x33; 32]),
-        max_prompt_tokens: 512,
-        max_new_tokens: 128,
-        max_stop_token_ids: 4,
-        max_spool_bytes: 1_048_576,
-        max_encoded_result_frame: 262_144,
-        max_encoded_prepared_input: 1_048_576,
-        max_upload_bytes: 1_048_576,
-    }
+    hellas_work::test_support::channel::evaluate_policy(
+        ContentId::from_bytes([0x31; 32]),
+        Digest::from_bytes([0x32; 32]),
+        Digest::from_bytes([0x33; 32]),
+    )
 }
 
 fn payment_values() -> EdgeValues {

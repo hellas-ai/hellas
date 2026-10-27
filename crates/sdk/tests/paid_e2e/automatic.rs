@@ -607,7 +607,7 @@ async fn evaluate_and_settle(
     );
     let result = session
         .run(
-            Some(hellas_work::test_support::paid::bundle(7).into()),
+            Some(hellas_work::test_support::channel::bundle(7).into()),
             false,
             None,
         )
@@ -907,7 +907,7 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
     );
     assert_eq!(files(&config.journal_root), 0);
     let mut policy = paid_policy();
-    policy.work_policy = hellas_work::test_support::paid::work_policy().into();
+    policy.work_policy = hellas_work::test_support::channel::work_policy().into();
     policy.payment_policy.fixed_price = JOB_PRICE;
     policy.expected_payment_values = EdgeValues::new(FUNDING, 0, Fees::ZERO);
     policy.offers.omission_bond = 201;

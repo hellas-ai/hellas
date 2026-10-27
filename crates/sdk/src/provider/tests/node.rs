@@ -10,7 +10,7 @@ use hellas_rpc::pb::work::{
 };
 use hellas_rpc::services::{work::WorkHandler, work_setup::WorkSetupHandler};
 use hellas_wire::{TransportContext, WireStatus};
-use hellas_work::test_support::paid::{
+use hellas_work::test_support::channel::{
     client, identity_artifact, manifest, prompt_tokens, provider, provider_producer, signer,
     text_execution, text_policy,
 };
@@ -35,7 +35,7 @@ use hellas_auth::{ProducerSigningKey, PublicKey};
 use hellas_chain::{LatestBlock, QueryError, WorkChannelQuery, WorkChannelSnapshot};
 use hellas_kernel::{
     Auth, BlockHeight, BufferWriter, CoinId, Decode as _, Edge, EdgeValues, Encode as _, Fees,
-    Funding, LeaseSlots, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, MAX_START_VALIDITY_BLOCKS,
+    Funding, LeaseSlots, List, MAX_PARTY_INPUTS, MAX_START_VALIDITY_BLOCKS,
     MIN_OMIT_RESPONSE_BLOCKS, Move, Parties, Party, Payout, PendingPaymentClose, Proof,
     RegistryChunk, RegistryNamespace, RegistryRecordTag, StartId, Terms, Tx, WorkPaymentSettlement,
     WorkPaymentTerms, WorkStakeBondTerms, Writer as _,
@@ -1169,18 +1169,15 @@ fn coins(ids: &[u8]) -> List<CoinId, MAX_PARTY_INPUTS> {
 }
 
 fn bond_terms() -> WorkStakeBondTerms {
-    WorkStakeBondTerms {
-        parties: Parties::new(
+    hellas_work::test_support::channel::bond_terms_for(
+        Parties::new(
             PartyKeys::sole(provider().party_key()),
             PartyKeys::sole(client().party_key()),
         ),
-        timeout: BlockHeight::new(500),
-        timeout_outputs: List::take(
-            [Payout::new(provider().party_key(), 64); MAX_EDGE_OUTPUTS],
-            1,
-        ),
-        max_job_price: 40,
-    }
+        BlockHeight::new(500),
+        Payout::new(provider().party_key(), 64),
+        40,
+    )
 }
 
 fn bond_funding() -> Funding {
@@ -1192,43 +1189,32 @@ fn payment_funding() -> Funding {
 }
 
 fn channel_policy() -> PaidChannelPolicyV1 {
-    PaidChannelPolicyV1 {
-        compute_credit_limit: 40,
-        delivery_credit_limit: 40,
-    }
+    hellas_work::test_support::channel::credit_policy(40, 40)
 }
 
 fn work_policy() -> EvaluatePolicyV2 {
-    EvaluatePolicyV2 {
-        allowed_environment: manifest().content_id(),
-        generation_policy_digest: match generation_policy_digest(&text_policy().canonical_bytes()) {
+    hellas_work::test_support::channel::evaluate_policy(
+        manifest().content_id(),
+        match generation_policy_digest(&text_policy().canonical_bytes()) {
             Ok(digest) => digest,
             Err(error) => panic!("the fixture generation policy hashes: {error}"),
         },
-        identity_source_digest: match identity_source_digest(&identity_artifact().canonical_bytes())
-        {
+        match identity_source_digest(&identity_artifact().canonical_bytes()) {
             Ok(digest) => digest,
             Err(error) => panic!("the fixture identity source hashes: {error}"),
         },
-        max_prompt_tokens: 512,
-        max_new_tokens: 128,
-        max_stop_token_ids: 4,
-        max_spool_bytes: 1_048_576,
-        max_encoded_result_frame: 262_144,
-        max_encoded_prepared_input: 1_048_576,
-        max_upload_bytes: 1_048_576,
-    }
+    )
 }
 
 fn payment_terms() -> WorkPaymentTerms {
-    WorkPaymentTerms {
-        bond_edge: bond_edge(),
-        bond_terms: bond_terms(),
-        private_policy_commitment: private_policy_commitment(network(), &SALT, &channel_policy()),
-        omit_response_blocks: MIN_OMIT_RESPONSE_BLOCKS,
-        start_validity_blocks: MAX_START_VALIDITY_BLOCKS,
-        omission_bond: OMISSION_BOND,
-    }
+    hellas_work::test_support::channel::payment_terms_for(
+        bond_edge(),
+        bond_terms(),
+        private_policy_commitment(network(), &SALT, &channel_policy()),
+        MIN_OMIT_RESPONSE_BLOCKS,
+        MAX_START_VALIDITY_BLOCKS,
+        OMISSION_BOND,
+    )
 }
 
 fn provider_policy() -> ProviderChannelPolicy {
@@ -1442,14 +1428,12 @@ async fn open_channel(root: &Path) -> ChannelStore {
 // ── One job, paid for, and then contested ─────────────────────────
 
 fn evaluate_request() -> EvaluateRequest {
-    EvaluateRequest {
-        text_execution: text_execution().input_id().digest(),
-        runner_public_key: PublicKey::Secp256k1(client().party_key().to_bytes()),
-        execution_environment: manifest().content_id(),
-        nonce: [0x9e; 32],
-        assurance: Assurance::ProducerSigned,
-        retain: true,
-    }
+    hellas_work::test_support::channel::evaluate_request_for(
+        text_execution().input_id().digest(),
+        PublicKey::Secp256k1(client().party_key().to_bytes()),
+        manifest().content_id(),
+        [0x9e; 32],
+    )
 }
 
 fn bundle() -> PreparedPaidInputV1 {
@@ -1487,7 +1471,10 @@ fn authorization() -> PaidJobAuthorizationV2 {
 
 /// One complete signed transcript for the fixture request.
 fn answer_transcript() -> Vec<OutputEventEnvelope> {
-    hellas_work::test_support::paid::transcript_for(&evaluate_request(), &[101, 102, 103, 104, 105])
+    hellas_work::test_support::channel::transcript_for(
+        &evaluate_request(),
+        &[101, 102, 103, 104, 105],
+    )
 }
 
 /// The executor-side seam in the node proof. The paid gate still
@@ -2518,18 +2505,15 @@ impl OfferFixture {
     }
 
     fn bond_terms(self) -> WorkStakeBondTerms {
-        WorkStakeBondTerms {
-            parties: Parties::new(
+        hellas_work::test_support::channel::bond_terms_for(
+            Parties::new(
                 PartyKeys::sole(provider().party_key()),
                 PartyKeys::sole(self.client().party_key()),
             ),
-            timeout: BlockHeight::new(500),
-            timeout_outputs: List::take(
-                [Payout::new(provider().party_key(), 64); MAX_EDGE_OUTPUTS],
-                1,
-            ),
-            max_job_price: 40,
-        }
+            BlockHeight::new(500),
+            Payout::new(provider().party_key(), 64),
+            40,
+        )
     }
 
     fn bond_edge(self) -> EdgeId {
@@ -2544,18 +2528,14 @@ impl OfferFixture {
     }
 
     fn payment_terms(self) -> WorkPaymentTerms {
-        WorkPaymentTerms {
-            bond_edge: self.bond_edge(),
-            bond_terms: self.bond_terms(),
-            private_policy_commitment: private_policy_commitment(
-                network(),
-                &SALT,
-                &channel_policy(),
-            ),
-            omit_response_blocks: MIN_OMIT_RESPONSE_BLOCKS,
-            start_validity_blocks: MAX_START_VALIDITY_BLOCKS,
-            omission_bond: OMISSION_BOND,
-        }
+        hellas_work::test_support::channel::payment_terms_for(
+            self.bond_edge(),
+            self.bond_terms(),
+            private_policy_commitment(network(), &SALT, &channel_policy()),
+            MIN_OMIT_RESPONSE_BLOCKS,
+            MAX_START_VALIDITY_BLOCKS,
+            OMISSION_BOND,
+        )
     }
 
     fn payment_edge(self) -> EdgeId {
@@ -2668,14 +2648,12 @@ impl OfferFixture {
     }
 
     fn evaluate_request(self) -> EvaluateRequest {
-        EvaluateRequest {
-            text_execution: text_execution().input_id().digest(),
-            runner_public_key: PublicKey::Secp256k1(self.client().party_key().to_bytes()),
-            execution_environment: manifest().content_id(),
-            nonce: [self.client_seed; 32],
-            assurance: Assurance::ProducerSigned,
-            retain: true,
-        }
+        hellas_work::test_support::channel::evaluate_request_for(
+            text_execution().input_id().digest(),
+            PublicKey::Secp256k1(self.client().party_key().to_bytes()),
+            manifest().content_id(),
+            [self.client_seed; 32],
+        )
     }
 
     fn prepared_bundle(self) -> PreparedPaidInputV1 {

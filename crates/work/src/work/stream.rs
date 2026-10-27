@@ -529,7 +529,7 @@ mod tests {
     #[tokio::test]
     async fn disconnect_during_plaintext_append_cannot_poison_the_provider_journal() {
         use crate::model::setup::ObservedChannel;
-        use crate::test_support::paid as fixture;
+        use crate::test_support::channel as fixture;
         use hellas_kernel::PendingSlot;
         let provider_root = tempfile::tempdir().unwrap();
         let client_root = tempfile::tempdir().unwrap();

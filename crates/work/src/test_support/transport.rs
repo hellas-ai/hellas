@@ -14,6 +14,7 @@ struct Pipe {
     inbox: mpsc::UnboundedReceiver<Bytes>,
     gate: Option<Arc<CarrierGate>>,
     strict_send: bool,
+    authorize_writes: bool,
 }
 
 /// Backpressure at the carrier handoff, after RPC encoding and mux queue/credit work.
@@ -42,6 +43,12 @@ impl MessagePipe for Pipe {
         bytes: Bytes,
         authority: &hellas_wire::WriteAuthority,
     ) -> std::io::Result<()> {
+        if !self.authorize_writes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "pipe cannot authorize writes",
+            ));
+        }
         futures::future::poll_fn(|cx| {
             authority.poll_write(cx, &mut |cx| {
                 if let Some(gate) = &self.gate {
@@ -81,14 +88,14 @@ pub fn transport_pair_with_context(
     client_context: hellas_wire::TransportContext,
     server_context: hellas_wire::TransportContext,
 ) -> (MuxTransport, MuxTransport) {
-    pair(client_context, server_context, None, false)
+    pair(client_context, server_context, None, false, true)
 }
 
 pub fn transport_pair_with_server_gate(
     context: hellas_wire::TransportContext,
     gate: Arc<CarrierGate>,
 ) -> (MuxTransport, MuxTransport) {
-    pair(context.clone(), context, Some(gate), true)
+    pair(context.clone(), context, Some(gate), true, true)
 }
 
 fn pair(
@@ -96,6 +103,7 @@ fn pair(
     server_context: hellas_wire::TransportContext,
     gate: Option<Arc<CarrierGate>>,
     strict_send: bool,
+    authorize_writes: bool,
 ) -> (MuxTransport, MuxTransport) {
     let (to_server, server_inbox) = mpsc::unbounded_channel();
     let (to_client, client_inbox) = mpsc::unbounded_channel();
@@ -108,6 +116,7 @@ fn pair(
             inbox: client_inbox,
             gate: None,
             strict_send,
+            authorize_writes,
         },
         client_context,
     );
@@ -120,8 +129,17 @@ fn pair(
             inbox: server_inbox,
             gate,
             strict_send,
+            authorize_writes,
         },
         server_context,
     );
     (client, server)
+}
+
+/// A plain carrier cannot commit protected writes through an authority callback.
+pub fn transport_pair_without_write_authority(
+    client_context: hellas_wire::TransportContext,
+    server_context: hellas_wire::TransportContext,
+) -> (MuxTransport, MuxTransport) {
+    pair(client_context, server_context, None, false, false)
 }
