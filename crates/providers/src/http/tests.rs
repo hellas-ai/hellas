@@ -590,7 +590,7 @@ async fn provider_injects_secret_without_disclosing_it_to_the_buyer() {
     };
     let output_events = fetch::output(&events, &terminal)
         .unwrap()
-        .sign(&invocation, &seller, 1 << 20)
+        .sign(&invocation, &seller, 1024)
         .unwrap();
     let verified = fetch::decode_output(
         &output::verify(&invocation, &seller.public_key(), &output_events, 1 << 20).unwrap(),
