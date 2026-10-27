@@ -35,7 +35,7 @@ use hellas_auth::{ProducerSigningKey, PublicKey};
 use hellas_chain::{LatestBlock, QueryError, WorkChannelQuery, WorkChannelSnapshot};
 use hellas_kernel::{
     Auth, BlockHeight, BufferWriter, CoinId, Decode as _, Edge, EdgeValues, Encode as _, Fees,
-    Funding, LeaseSlots, List, MAX_EDGE_OUTPUTS, MAX_PARTY_INPUTS, MAX_START_VALIDITY_BLOCKS,
+    Funding, LeaseSlots, List, MAX_PARTY_INPUTS, MAX_START_VALIDITY_BLOCKS,
     MIN_OMIT_RESPONSE_BLOCKS, Move, Parties, Party, Payout, PendingPaymentClose, Proof,
     RegistryChunk, RegistryNamespace, RegistryRecordTag, StartId, Terms, Tx, WorkPaymentSettlement,
     WorkPaymentTerms, WorkStakeBondTerms, Writer as _,
@@ -2505,18 +2505,15 @@ impl OfferFixture {
     }
 
     fn bond_terms(self) -> WorkStakeBondTerms {
-        WorkStakeBondTerms {
-            parties: Parties::new(
+        hellas_work::test_support::channel::bond_terms_for(
+            Parties::new(
                 PartyKeys::sole(provider().party_key()),
                 PartyKeys::sole(self.client().party_key()),
             ),
-            timeout: BlockHeight::new(500),
-            timeout_outputs: List::take(
-                [Payout::new(provider().party_key(), 64); MAX_EDGE_OUTPUTS],
-                1,
-            ),
-            max_job_price: 40,
-        }
+            BlockHeight::new(500),
+            Payout::new(provider().party_key(), 64),
+            40,
+        )
     }
 
     fn bond_edge(self) -> EdgeId {
@@ -2531,18 +2528,14 @@ impl OfferFixture {
     }
 
     fn payment_terms(self) -> WorkPaymentTerms {
-        WorkPaymentTerms {
-            bond_edge: self.bond_edge(),
-            bond_terms: self.bond_terms(),
-            private_policy_commitment: private_policy_commitment(
-                network(),
-                &SALT,
-                &channel_policy(),
-            ),
-            omit_response_blocks: MIN_OMIT_RESPONSE_BLOCKS,
-            start_validity_blocks: MAX_START_VALIDITY_BLOCKS,
-            omission_bond: OMISSION_BOND,
-        }
+        hellas_work::test_support::channel::payment_terms_for(
+            self.bond_edge(),
+            self.bond_terms(),
+            private_policy_commitment(network(), &SALT, &channel_policy()),
+            MIN_OMIT_RESPONSE_BLOCKS,
+            MAX_START_VALIDITY_BLOCKS,
+            OMISSION_BOND,
+        )
     }
 
     fn payment_edge(self) -> EdgeId {
@@ -2655,14 +2648,12 @@ impl OfferFixture {
     }
 
     fn evaluate_request(self) -> EvaluateRequest {
-        EvaluateRequest {
-            text_execution: text_execution().input_id().digest(),
-            runner_public_key: PublicKey::Secp256k1(self.client().party_key().to_bytes()),
-            execution_environment: manifest().content_id(),
-            nonce: [self.client_seed; 32],
-            assurance: Assurance::ProducerSigned,
-            retain: true,
-        }
+        hellas_work::test_support::channel::evaluate_request_for(
+            text_execution().input_id().digest(),
+            PublicKey::Secp256k1(self.client().party_key().to_bytes()),
+            manifest().content_id(),
+            [self.client_seed; 32],
+        )
     }
 
     fn prepared_bundle(self) -> PreparedPaidInputV1 {

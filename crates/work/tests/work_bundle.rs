@@ -58,14 +58,14 @@ fn payment_funding() -> Funding {
 }
 
 fn payment_terms(bond_edge: EdgeId) -> WorkPaymentTerms {
-    WorkPaymentTerms {
+    hellas_work::test_support::channel::payment_terms_for(
         bond_edge,
-        bond_terms: bond_terms(),
-        private_policy_commitment: [0x25; 32],
-        omit_response_blocks: hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
-        start_validity_blocks: 8,
-        omission_bond: 4,
-    }
+        bond_terms(),
+        [0x25; 32],
+        hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
+        8,
+        4,
+    )
 }
 
 /// Revision 1, as the provider exports it.

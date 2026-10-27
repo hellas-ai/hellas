@@ -111,17 +111,14 @@ fn payment_funding() -> Funding {
 }
 
 fn payment_terms(bond_edge: EdgeId) -> WorkPaymentTerms {
-    WorkPaymentTerms {
+    hellas_work::test_support::channel::payment_terms_for(
         bond_edge,
-        bond_terms: bond_terms(),
-        // The provider's own commitment, because the provider's
-        // admission policy opens it against its own salt and credit
-        // policy before it will countersign.
-        private_policy_commitment: private_policy_commitment(network(), &SALT, &channel_policy()),
-        omit_response_blocks: WINDOW,
-        start_validity_blocks: hellas_kernel::MAX_START_VALIDITY_BLOCKS,
-        omission_bond: OMISSION_BOND,
-    }
+        bond_terms(),
+        private_policy_commitment(network(), &SALT, &channel_policy()),
+        WINDOW,
+        hellas_kernel::MAX_START_VALIDITY_BLOCKS,
+        OMISSION_BOND,
+    )
 }
 
 fn channel_policy() -> PaidChannelPolicyV1 {
@@ -129,10 +126,7 @@ fn channel_policy() -> PaidChannelPolicyV1 {
 }
 
 fn other_channel_policy() -> PaidChannelPolicyV1 {
-    PaidChannelPolicyV1 {
-        compute_credit_limit: 39,
-        delivery_credit_limit: 40,
-    }
+    hellas_work::test_support::channel::credit_policy(39, 40)
 }
 
 fn work_policy() -> EvaluatePolicyV2 {

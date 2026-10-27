@@ -101,16 +101,14 @@ fn payment_funding() -> Funding {
 }
 
 fn payment_terms(bond_edge: EdgeId) -> WorkPaymentTerms {
-    WorkPaymentTerms {
+    hellas_work::test_support::channel::payment_terms_for(
         bond_edge,
-        bond_terms: bond_terms(),
-        private_policy_commitment: private_policy_commitment(network(), &SALT, &channel_policy()),
-        omit_response_blocks: hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
-        start_validity_blocks: hellas_kernel::MAX_START_VALIDITY_BLOCKS,
-        // Over half of the dearest edge these fixtures meet (4,096), so the
-        // bond exceeds the capacity it leaves on every one of them.
-        omission_bond: 2_049,
-    }
+        bond_terms(),
+        private_policy_commitment(network(), &SALT, &channel_policy()),
+        hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
+        hellas_kernel::MAX_START_VALIDITY_BLOCKS,
+        2_049,
+    )
 }
 
 fn channel_policy() -> PaidChannelPolicyV1 {
