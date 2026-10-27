@@ -812,6 +812,7 @@ impl UploadStore {
             return self.discard(work);
         }
         if let Some(Upload::Retained(upload)) = self.uploads.get(&work) {
+            let mut published = Vec::new();
             for object in upload.meta.objects.values() {
                 let directory = upload.files.content_root.join("objects");
                 let destination = directory.join(object.id().to_string());
@@ -824,18 +825,24 @@ impl UploadStore {
                 if destination.try_exists()? {
                     // Presence alone does not prove a previous publication finished its flush.
                     finalize_publication(&destination)?;
-                    let indexed = self
-                        .content
-                        .index(&destination)
-                        .map_err(|e| ContentError::Storage(e.to_string()))?;
-                    if indexed.id != object.id().digest() || indexed.len != object.bytes() {
-                        return Err(ContentError::Hash);
-                    }
+                    published.push((destination, *object));
                 }
             }
-        } else {
-            self.retain(bytes)?;
+            // Unlinking the staged hard links changes each object's ctime,
+            // which the index treats as a different file. Index afterwards.
+            self.discard(work)?;
+            for (destination, object) in published {
+                let indexed = self
+                    .content
+                    .index(&destination)
+                    .map_err(|e| ContentError::Storage(e.to_string()))?;
+                if indexed.id != object.id().digest() || indexed.len != object.bytes() {
+                    return Err(ContentError::Hash);
+                }
+            }
+            return Ok(());
         }
+        self.retain(bytes)?;
         self.discard(work)
     }
     pub fn retained(&self, object: ContentRef) -> Result<Vec<u8>, ContentError> {
