@@ -929,7 +929,7 @@ mod tests {
                 devnet.seal().await;
                 let fixture = PaidFixture::on_network(devnet.network());
                 let mut args = pool_options(&fixture).providers.remove(0);
-                args.timeout = Duration::from_millis(100);
+                args.timeout = hellas_chain::node::RECOVERY_TIMEOUT;
                 let signed = SignedPaidOffer::sign(
                     PaidOffer {
                         provider: crate::test_support::enrollment(args.provider).0,
@@ -971,15 +971,19 @@ mod tests {
                 let owner = hellas_auth::test_support::actors::FRIEND.principal();
                 let key = signer(1);
                 node.require_finalized_height_for_test(devnet.height() + 1);
-                let read = provider_policy(&args, chain.clone(), &endpoint, &key, owner);
-                tokio::pin!(read);
-                assert!(
-                    tokio::time::timeout(args.config.poll, &mut read)
-                        .await
-                        .is_err()
-                );
-                let (policy, _) = tokio::join!(read, devnet.seal());
-                assert_eq!(policy.unwrap(), fixture.policy);
+                let policy = {
+                    let read = provider_policy(&args, chain.clone(), &endpoint, &key, owner);
+                    tokio::pin!(read);
+                    assert!(
+                        tokio::time::timeout(args.config.poll, &mut read)
+                            .await
+                            .is_err()
+                    );
+                    let (policy, _) = tokio::join!(read, devnet.seal());
+                    policy.unwrap()
+                };
+                assert_eq!(policy, fixture.policy);
+                args.timeout = Duration::from_millis(100);
                 node.require_finalized_height_for_test(devnet.height() + 1);
                 let started = tokio::time::Instant::now();
                 let error = tokio::time::timeout(

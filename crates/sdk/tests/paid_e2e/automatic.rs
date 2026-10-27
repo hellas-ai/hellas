@@ -623,12 +623,12 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
         GenesisOwner {
             kind: OwnerKind::Passkey,
             seed: 0x13,
-            balance: FUNDING,
+            balance: 3 * FUNDING,
         },
         GenesisOwner {
             kind: OwnerKind::Passkey,
             seed: 0x12,
-            balance: FUNDING,
+            balance: 2 * FUNDING,
         },
         GenesisOwner {
             kind: OwnerKind::Passkey,
@@ -660,6 +660,8 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
         .await
         .unwrap();
     let mut payment_coins = Vec::new();
+    let mut alternate_funding = Vec::new();
+    let mut short_funding = None;
     for index in 0..owners.len() {
         assert_eq!(
             owners[index].key().into_kernel().to_bytes(),
@@ -712,12 +714,114 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
                 .submit_tx(hellas_chain::domain::Transaction::Kernel(tx))
                 .await
                 .unwrap();
+        } else if index <= 2 {
+            let hellas_chain::domain::Transaction::Kernel(hellas_kernel::Tx::Owner(reshape)) = tx
+            else {
+                panic!("owner delegation")
+            };
+            let selected: Vec<_> = reshape.inputs().iter().copied().collect();
+            let plan = hellas_sdk::coin_owner::OwnerReshape::prepare(
+                &chain,
+                devnet.network(),
+                owners[index].key().into_kernel(),
+                &selected,
+                Some(keys[index].party_key()),
+                Some(FUNDING),
+            )
+            .await
+            .unwrap();
+            let ids: Vec<_> = plan.output_ids().iter().copied().collect();
+            assert_eq!(ids.len(), if index == 1 { 3 } else { 2 });
+            if index == 1 {
+                short_funding = Some(ids[2]);
+            }
+            payment_coins.push(ids[0]);
+            alternate_funding.push((index, ids[1]));
+            let tx = plan
+                .clone()
+                .authorize(owners[index].authorize(plan.payload_hash()))
+                .unwrap();
+            chain
+                .submit_tx(hellas_chain::domain::Transaction::Kernel(tx))
+                .await
+                .unwrap();
+            continue;
         } else {
             chain.submit_tx(tx).await.unwrap();
         }
         payment_coins.push(coin);
     }
     devnet.seal().await;
+    let mut alternate_coins = std::collections::BTreeMap::new();
+    for (index, coin) in alternate_funding {
+        let other_key = if index == 1 { &keys[2] } else { &keys[1] };
+        let plan = hellas_sdk::coin_owner::OwnerReshape::prepare(
+            &chain,
+            devnet.network(),
+            owners[index].key().into_kernel(),
+            &[coin],
+            Some(other_key.party_key()),
+            None,
+        )
+        .await
+        .unwrap();
+        alternate_coins.insert(index, *plan.output_ids().iter().next().unwrap());
+        let tx = plan
+            .clone()
+            .authorize(owners[index].authorize(plan.payload_hash()))
+            .unwrap();
+        chain
+            .submit_tx(hellas_chain::domain::Transaction::Kernel(tx))
+            .await
+            .unwrap();
+    }
+    let short_plan = hellas_sdk::coin_owner::OwnerReshape::prepare(
+        &chain,
+        devnet.network(),
+        owners[1].key().into_kernel(),
+        &[short_funding.unwrap()],
+        Some(keys[1].party_key()),
+        Some(FUNDING - 1),
+    )
+    .await
+    .unwrap();
+    let short_coin = *short_plan.output_ids().iter().next().unwrap();
+    let short_tx = short_plan
+        .clone()
+        .authorize(owners[1].authorize(short_plan.payload_hash()))
+        .unwrap();
+    chain
+        .submit_tx(hellas_chain::domain::Transaction::Kernel(short_tx))
+        .await
+        .unwrap();
+    devnet.seal().await;
+    let tip = chain.get_latest_block().await.unwrap().unwrap();
+    for (index, id) in &alternate_coins {
+        let coin = chain
+            .get_coin(tip.payload, id.to_bytes().into())
+            .await
+            .unwrap()
+            .unwrap();
+        let delegate = if *index == 1 {
+            keys[2].party_key()
+        } else {
+            keys[1].party_key()
+        };
+        assert_eq!(coin.owner.into_kernel(), owners[*index].key().into_kernel());
+        assert_eq!(coin.delegate.map(|key| key.into_kernel()), Some(delegate));
+        assert_eq!(coin.value, FUNDING);
+    }
+    let short = chain
+        .get_coin(tip.payload, short_coin.to_bytes().into())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(short.owner.into_kernel(), owners[1].key().into_kernel());
+    assert_eq!(
+        short.delegate.map(|key| key.into_kernel()),
+        Some(keys[1].party_key())
+    );
+    assert_eq!(short.value, FUNDING - 1);
     let (store, secret) = hellas_work::test_support::common_node::bootstrap_node_with_credential(
         &root.path().join("authority"),
         hellas_work::model::grant::grant_network(),
@@ -836,6 +940,23 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
         .unwrap(),
         OfferRefusalCode::NeedsFunding,
     );
+    for coins in [vec![short_coin], vec![payment_coins[1], short_coin]] {
+        refused(
+            request(
+                &endpoint,
+                &provider,
+                devnet.network(),
+                FRIEND,
+                &keys[1],
+                &coins,
+                None,
+            )
+            .await
+            .unwrap(),
+            OfferRefusalCode::NeedsFunding,
+        );
+    }
+    assert_eq!(files(&config.journal_root), 0);
     let quote = request(
         &endpoint,
         &provider,
@@ -918,7 +1039,7 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
             devnet.network(),
             FRIEND,
             &keys[2],
-            &[payment_coins[1]],
+            &[alternate_coins[&1]],
             None
         )
         .await
@@ -932,7 +1053,7 @@ async fn allocate(runtime: commonware_runtime::tokio::Context) -> Box<Case> {
             devnet.network(),
             OPERATOR,
             &keys[1],
-            &[payment_coins[2]],
+            &[alternate_coins[&2]],
             None
         )
         .await
@@ -1242,7 +1363,7 @@ async fn finish(case: Box<Case>) {
             .iter()
             .map(|(_, v)| *v)
             .sum::<u64>(),
-        FUNDING - JOB_PRICE
+        owners[1].balance - JOB_PRICE
     );
     // A malicious no-show can post its countersigned bond alone. The same
     // production clock reclaims it without waiting for a payment proposal.
