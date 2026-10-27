@@ -211,7 +211,7 @@ fn fetch_unsigned_preflight_checks_the_worst_nonce_encoded_byte_ceiling() {
             &ProducerSigningKey::generate(),
             [255; 32],
             runner(),
-            &http_policy(60_000, 65536),
+            &http_policy(60_000, 60_000),
         )
         .unwrap()
         .canonical_bytes()
@@ -223,7 +223,7 @@ fn fetch_unsigned_preflight_checks_the_worst_nonce_encoded_byte_ceiling() {
                 &ProducerSigningKey::generate(),
                 [nonce; 32],
                 runner(),
-                &http_policy(60_000, 65536),
+                &http_policy(60_000, 60_000),
             )
             .unwrap()
             .canonical_bytes()
@@ -235,8 +235,13 @@ fn fetch_unsigned_preflight_checks_the_worst_nonce_encoded_byte_ceiling() {
     // encodes at the same width as the ceiling under test.
     assert!((256..60_000).contains(&actual));
     let actual_u32: u32 = actual.try_into().unwrap();
-    expected.invocation_policy = http_policy(actual_u32, 65536);
+    expected.invocation_policy = http_policy(actual_u32, 60_000);
     job.check_policy(&expected).unwrap();
-    expected.invocation_policy = http_policy(actual_u32 - 1, 65536);
+    expected.invocation_policy = http_policy(actual_u32 - 1, 60_000);
     assert!(job.check_policy(&expected).is_err());
+    expected.invocation_policy = http_policy(actual_u32, (actual - 1) as u64);
+    assert!(
+        job.check_policy(&expected).is_err(),
+        "uncached upload must fit before funding"
+    );
 }

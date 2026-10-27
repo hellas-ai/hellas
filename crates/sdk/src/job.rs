@@ -243,8 +243,18 @@ impl Job {
                 policy.payment_policy.fixed_price, self.price
             )));
         }
+        // The all-255 nonce measures the largest encoding; the throwaway key
+        // authorizes nothing with the requester's identity.
         let key = ProducerSigningKey::generate();
-        self.prepare(&key, [255; 32], key.public_key(), &policy.invocation_policy)?;
+        let prepared =
+            self.prepare(&key, [255; 32], key.public_key(), &policy.invocation_policy)?;
+        if prepared.canonical_bytes()?.len() as u64
+            > policy.invocation_policy.limits.max_upload_bytes
+        {
+            return Err(invalid(
+                "prepared input exceeds the provider's upload limit. Nothing was paid.",
+            ));
+        }
         Ok(())
     }
     pub fn canonical_bytes(&self) -> Vec<u8> {
