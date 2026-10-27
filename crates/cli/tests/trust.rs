@@ -10,7 +10,6 @@ fn local_approval_cli_is_separate_from_identity_and_execution_and_preserves_revi
     let policy = TrustPolicy {
         provider_genesis: ContentId::from_bytes([1; 32]),
         assurance: Assurance::ProducerSigned,
-        environments: vec![ContentId::from_bytes([2; 32])],
         apple: None,
     };
     std::fs::write(&source, serde_json::to_vec(&policy).unwrap()).unwrap();

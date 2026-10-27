@@ -53,7 +53,6 @@ fn signed_open_response(
     let signature = producer.sign_digest(binding).unwrap();
     (
         ProviderTrustAnchor {
-            allowed_environments: vec![],
             expected_genesis,
             required_assurance: Assurance::ProducerSigned,
             apple_app_attest: None,
@@ -210,7 +209,6 @@ fn apple_open_response_for_alpn(
     });
     (
         ProviderTrustAnchor {
-            allowed_environments: vec![],
             expected_genesis,
             required_assurance: Assurance::AppleAppAttest,
             apple_app_attest: Some(apple),
@@ -515,7 +513,7 @@ fn paid_services_app_attest_binds_the_exact_connection_and_service() {
 #[cfg(feature = "work")]
 #[test]
 fn apple_offer_pin_verifies_static_root_policy_then_open_and_result() {
-    use crate::{FetchChunkVerifier, ProducerTrust, UnpinnedOffer};
+    use crate::UnpinnedOffer;
     use hellas_authority::model::grant::{records::*, *};
     use std::num::NonZeroU64;
     let counters = Arc::new(TestCounterStore::default());
@@ -529,8 +527,6 @@ fn apple_offer_pin_verifies_static_root_policy_then_open_and_result() {
     );
     let client = hellas_channel::test_support::principal(1).0;
     let producer = ProducerSigningKey::from_secret_bytes([2; 32]).unwrap();
-    let route = hellas_channel::model::fetch::FetchRoutePolicy::sealed_route("openai", "responses")
-        .unwrap();
     let policy = GrantPolicy {
         resource: hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test resource")),
         account: hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test account")),
@@ -548,24 +544,7 @@ fn apple_offer_pin_verifies_static_root_policy_then_open_and_result() {
                 settings: Default::default(),
             },
         ),
-        work: hellas_channel::model::profile::WorkPolicy::Fetch {
-            contract: test_responses_contract(),
-            policy: hellas_channel::model::fetch::FetchPolicyV2 {
-                allowed_environment: test_responses_contract().manifest_id(),
-                route_commitment: hellas_channel::model::fetch::fetch_route_commitment(
-                    &route.canonical_body_bytes(),
-                )
-                .unwrap(),
-                max_request_body_bytes: 4096,
-                max_output_events: 64,
-                max_output_bytes: 65536,
-                max_spool_bytes: 131072,
-                max_encoded_result_frame: 131072,
-                max_encoded_prepared_input: 65536,
-                max_upload_bytes: 65536,
-            },
-            route,
-        },
+        invocation_policy: hellas_authority::test_support::policy().invocation_policy,
     };
     let offer = SignedOffer::sign(
         Offer {
@@ -618,30 +597,21 @@ fn apple_offer_pin_verifies_static_root_policy_then_open_and_result() {
     )
     .unwrap();
     assert_eq!(counters.counters.lock().unwrap().get(&public_key), Some(&2));
-    let input = hellas_rpc::InputCommitment::from_digest(Digest::hash(b"grant input"));
-    let terminal = hellas_rpc::fetch::encode_fetch_terminal_payload(
-        &hellas_rpc::output::OutputEvent::Finished {
-            stop_reason: hellas_rpc::output::StopReason::EndOfText,
-            usage: None,
-        },
-    )
-    .unwrap();
-    let events = hellas_rpc::fetch::FetchOutputTranscriptBuilder::new(
-        input,
-        Assurance::AppleAppAttest,
-        &producer,
-    )
-    .finish(terminal)
-    .unwrap();
-    let mut verifier = FetchChunkVerifier::new(
-        input,
-        pinned.trust().required_assurance,
-        ProducerTrust::keys([verified]),
-    );
-    verifier.verify_terminal(events[0].clone()).unwrap();
+    use hellas_rpc::protocol::invocation::{InvocationRequest, output};
+    let request = InvocationRequest {
+        execution_environment: ContentId::hash(b"grant environment"),
+        input: ContentId::hash(b"grant input"),
+        runner_public_key: producer.public_key(),
+        nonce: [3; 32],
+        assurance: Assurance::AppleAppAttest,
+        retain: false,
+    };
+    let (_, events) = output::OutputStream::new(&request, &producer, 65536)
+        .unwrap()
+        .fail(output::FailureReason::Unavailable)
+        .unwrap();
+    output::verify(&request, &verified, &events, 65536).unwrap();
     assert!(
         verify_open_response(&trust, &[5; 32], &[6; 32], ALPN, ENROLLED_PEER, response).is_err()
     );
 }
-
-use hellas_channel::test_support::test_responses_contract;

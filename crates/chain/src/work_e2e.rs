@@ -4,45 +4,32 @@
 //! certified history over the network, and submit to validator mempools.
 
 use hellas_channel::test_support::channel::serve_work as serve;
-use hellas_channel::test_support::channel::{identity_artifact, manifest, text_policy};
+use hellas_channel::test_support::channel::{AnsweringBackend, work_policy};
 use std::collections::BTreeSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 
 use commonware_cryptography::Digestible as _;
-use hellas_auth::ProducerSigningKey;
-use hellas_channel::model::prepared_input::PreparedPaidInputV1;
 use hellas_channel::model::setup::{
     ProviderChannelPolicy, ReadyChannel, WorkChannelConfig, WorkChannelDescriptor,
 };
-use hellas_channel::model::work::{
-    EvaluatePolicyV2, JobDeadlines, PaidChannelPolicyV1, generation_policy_digest,
-    identity_source_digest, private_policy_commitment,
-};
+use hellas_channel::model::work::{JobDeadlines, PaidChannelPolicyV1, private_policy_commitment};
 use hellas_channel::work::{
-    BackendFault, ClientEndpoint, CloseEndpoint, JobProposal, PaymentError, RunOutcome,
-    WorkBackend, WorkService, propose_work, run_accepted_work,
+    ClientEndpoint, CloseEndpoint, JobProposal, PaymentError, RunOutcome, WorkService,
+    propose_work, run_accepted_work,
 };
 use hellas_channel::work_close::{CloseProgress, TxSink, close_start};
 use hellas_channel::work_handshake::{PaymentAdmission, SetupEndpoint, SetupService};
 use hellas_channel::work_open::{SetupAdvance, SetupProgress, SetupStep, advance_setup};
 use hellas_channel::work_store::{Role, SetupOrigin, SetupScan, SetupStore};
 use hellas_client::work::payment::pay_for_result;
-use hellas_client::work::reproduce::{
-    ReproduceFault, Reproduced, Reproducer, plan as reproduction_plan,
-};
-use hellas_client::work::{CheckedResult, CollectOutcome, collect_checked_result};
+use hellas_client::work::{CollectResultOutcome, CollectedResult, collect_result};
 use hellas_kernel::{
     BlockHeight, CoinId, EdgeId, EdgeValues, Fees, Funding, List, MAX_PARTY_INPUTS,
     MIN_OMIT_RESPONSE_BLOCKS, Move, Parties, Party, PartyKeys, Payout, PendingSlot,
     Secp256k1Signer, Secp256k1Verifier, Terms as KernelTerms, Tx as KernelTx, WorkPaymentTerms,
     WorkStakeBondTerms,
 };
-use hellas_rpc::evaluate::EvaluateStopReason;
-use hellas_rpc::protocol::artifacts::{
-    Canonical as _, OutputAddressed as _, TextExecutionId, completed_text,
-};
-use hellas_rpc::{EvaluateRequest, OutputEventEnvelope};
 use hellas_wire::TransportContext;
 use hellas_wire::mux::MuxTransport;
 
@@ -98,13 +85,6 @@ fn client() -> Secp256k1Signer {
 
 fn provider() -> Secp256k1Signer {
     signer(0x22)
-}
-
-fn provider_producer() -> ProducerSigningKey {
-    match ProducerSigningKey::from_secret_bytes([0x22; 32]) {
-        Ok(key) => key,
-        Err(error) => panic!("a fixed scalar is a producer key: {error}"),
-    }
 }
 
 /// The two genesis allocations, as the chain minted them, and how the
@@ -227,20 +207,6 @@ fn channel_policy() -> PaidChannelPolicyV1 {
     hellas_channel::test_support::channel::credit_policy(CREDIT_LIMIT, CREDIT_LIMIT)
 }
 
-fn work_policy() -> EvaluatePolicyV2 {
-    hellas_channel::test_support::channel::evaluate_policy(
-        manifest().content_id(),
-        match generation_policy_digest(&text_policy().canonical_bytes()) {
-            Ok(digest) => digest,
-            Err(error) => panic!("the generation policy hashes: {error}"),
-        },
-        match identity_source_digest(&identity_artifact().canonical_bytes()) {
-            Ok(digest) => digest,
-            Err(error) => panic!("the identity artifact hashes: {error}"),
-        },
-    )
-}
-
 fn payment_terms(allocations: &Allocations) -> WorkPaymentTerms {
     hellas_channel::test_support::channel::payment_terms_for(
         bond_edge(allocations),
@@ -264,7 +230,7 @@ fn provider_policy() -> ProviderChannelPolicy {
         network: TEST_NETWORK,
         policy_salt: SALT,
         channel_policy: channel_policy(),
-        work_policy: work_policy().into(),
+        invocation_policy: work_policy(),
         expected_payment_values: expected_values(),
         min_omit_response_blocks: hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
     }
@@ -278,7 +244,7 @@ fn descriptor(allocations: &Allocations) -> WorkChannelDescriptor {
         payment_terms: payment_terms(allocations),
         policy_salt: SALT,
         channel_policy: channel_policy(),
-        work_policy: work_policy().into(),
+        invocation_policy: work_policy(),
         expected_payment_values: expected_values(),
     }) {
         Ok(descriptor) => descriptor,
@@ -529,118 +495,9 @@ async fn client_step(
     }
 }
 
-// ── The one executor, invoked twice ───────────────────────────────────
-
-/// The prompt this fixture's job runs on.
-const PROMPT: [u32; 4] = [9, 8, 7, 6];
-
-/// The deterministic implementation both parties run.
-///
-/// Not `hellas-executor`: there are no model weights in this
-/// repository. What it stands in for is the *model*; the two invocations
-/// of it below are real and separate, and the one that matters — the
-/// client's — reaches it through the real [`Reproducer`] seam with the
-/// real bundle derivation in front.
-struct FixtureExecutor;
-
-impl FixtureExecutor {
-    /// One deterministic continuation of a prompt.
-    fn run(prompt: &[u32], max_new_tokens: u32) -> Vec<u32> {
-        let limit = core::cmp::min(prompt.len(), max_new_tokens as usize + 1);
-        let mut out = Vec::with_capacity(limit + 1);
-        out.push(101);
-        for token in &prompt[..limit.saturating_sub(1)] {
-            out.push(token.wrapping_mul(7).wrapping_add(59));
-        }
-        out
-    }
-}
-
-/// The provider's backend: the shared executor, plus the signed
-/// transcript a provider produces around it, and a call counter.
-struct ProviderBackend {
-    calls: Arc<AtomicUsize>,
-    /// The prompt a shipped provider would resolve from its artifact
-    /// store. Handed over here; see the module note.
-    prompt: Vec<u32>,
-}
-
-impl WorkBackend for ProviderBackend {
-    fn try_admit(
-        &self,
-        domain: hellas_channel::work::admission::CapacityDomain,
-    ) -> Result<hellas_channel::work::admission::WorkPermit, BackendFault> {
-        Err(hellas_channel::work::admission::AdmissionError::Unsupported(domain).into())
-    }
-
-    async fn execute(
-        &self,
-        prepared: hellas_channel::work::PreparedWorkInput,
-    ) -> Result<Vec<hellas_rpc::OutputEventEnvelope>, BackendFault> {
-        let hellas_channel::work::PreparedWorkInput::Evaluate(input) = prepared else {
-            return Err(
-                hellas_channel::work::admission::AdmissionError::Unsupported(
-                    hellas_channel::work::admission::CapacityDomain::Fetch,
-                )
-                .into(),
-            );
-        };
-        let input = *input;
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        let answer = FixtureExecutor::run(&self.prompt, work_policy().max_new_tokens);
-        let prompt = self.prompt.clone();
-        Ok(transcript_for(input.evaluate_request(), &prompt, &answer))
-    }
-}
-
-/// The client's re-execution: the same executor, reached through the
-/// real seam, on the question the *journal-held bundle* derives.
-struct ClientReexecution {
-    calls: Arc<AtomicUsize>,
-}
-
-impl Reproducer for ClientReexecution {
-    async fn reproduce(&self, bundle: &PreparedPaidInputV1) -> Result<Reproduced, ReproduceFault> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        let plan = reproduction_plan(bundle)?;
-        assert_eq!(
-            plan.prompt_token_ids,
-            PROMPT.to_vec(),
-            "the client's question comes out of the bundle both parties signed",
-        );
-        Ok(Reproduced {
-            output_token_ids: FixtureExecutor::run(&plan.prompt_token_ids, plan.max_new_tokens),
-            stop_reason: EvaluateStopReason::STOP_TOKEN,
-            matched_stop_token_id: Some(1),
-        })
-    }
-}
-
-fn transcript_for(
-    request: &EvaluateRequest,
-    prompt: &[u32],
-    answer: &[u32],
-) -> Vec<OutputEventEnvelope> {
-    let text_artifact = completed_text(
-        TextExecutionId::from_digest(request.text_execution),
-        prompt,
-        answer,
-    )
-    .artifact
-    .output_id()
-    .digest();
-    hellas_channel::test_support::channel::transcript_chunks(
-        request,
-        &[answer],
-        &provider_producer(),
-        prompt.len() as u64,
-        text_artifact,
-    )
-}
-
 // ── The job's prepared inputs ─────────────────────────────────────────
 
-fn prepared_input() -> PreparedPaidInputV1 {
+fn prepared_input() -> hellas_rpc::protocol::invocation::PreparedInvocation {
     hellas_channel::test_support::channel::bundle(0x9e)
 }
 
@@ -841,25 +698,23 @@ async fn open_channel(
 ///
 /// Returns the price the provider acknowledged crediting.
 async fn run_one_paid_job(devnet: &WorkDevnet, opened: &mut Opened) -> u64 {
-    let provider_calls = Arc::new(AtomicUsize::new(0));
-    let client_calls = Arc::new(AtomicUsize::new(0));
-    let backend = ProviderBackend {
-        calls: Arc::clone(&provider_calls),
-        prompt: PROMPT.to_vec(),
-    };
-    let engine = ClientReexecution {
-        calls: Arc::clone(&client_calls),
-    };
+    let backend = AnsweringBackend::new();
+    let provider_calls = Arc::clone(&backend.calls);
     let proposal = JobProposal {
-        prepared_input: prepared_input().into(),
+        prepared_input: prepared_input(),
         deadlines: deadlines(),
     };
 
     let (transport, server) = transport_pair();
     let serving = serve(server, opened.service.clone());
-    let work_id = propose_work(transport, &mut opened.client, &proposal)
-        .await
-        .expect("the provider accepts the proposed job");
+    let work_id = propose_work(
+        transport,
+        &mut opened.client,
+        &proposal,
+        &hellas_channel::test_support::channel::program_content(),
+    )
+    .await
+    .expect("the provider accepts the proposed job");
     serving.abort();
 
     assert_eq!(
@@ -879,52 +734,44 @@ async fn run_one_paid_job(devnet: &WorkDevnet, opened: &mut Opened) -> u64 {
         "the provider invoked its backend exactly once",
     );
 
-    // Nothing is payable yet. `collect_checked_result` is the only step
-    // that both takes the answer and checks it, and this is the journal
-    // refusing to price a job it has not been through.
-    //
-    // What this does *not* separate is delivery from the check: proving
-    // that a delivered-but-refuted answer cannot be paid for needs a
-    // second verdict on the same job, and that is
-    // `crates/client/tests/work.rs`'s. Here the two are one call, and
-    // the assertion is that the payment comes after it.
+    // Nothing is payable yet: the client has not collected the
+    // authenticated answer.
     let too_early = opened.client.pay(work_id).await;
     assert!(
         matches!(too_early, Err(PaymentError::NotPayable { .. })),
-        "a job the client has not collected and checked is not payable: {too_early:?}",
+        "a job the client has not collected is not payable: {too_early:?}",
     );
 
     let (transport, server) = transport_pair();
     let serving = serve(server, opened.service.clone());
-    let collected = collect_checked_result(
+    let collected = collect_result(
         transport,
         &mut opened.client,
         &opened.ready,
         &devnet.blocks(CLIENT_NODE),
-        &engine,
         work_id,
     )
     .await;
     serving.abort();
-    let Ok(CollectOutcome::Checked(CheckedResult { result, transcript })) = collected else {
-        panic!("the delivered answer reproduces: {collected:?}");
+    let Ok(CollectResultOutcome::Collected(CollectedResult { result, transcript })) = collected
+    else {
+        panic!("the delivered answer is authenticated: {collected:?}");
     };
     assert_eq!(result.work_id, work_id);
     assert!(!transcript.is_empty());
-    assert_eq!(
-        client_calls.load(Ordering::SeqCst),
-        1,
-        "the client re-executed exactly once",
-    );
 
-    // The payment is signed only now: `collect_checked_result` is what
-    // reaches the matched phase, and `pay` refuses any other one.
+    // The payment is signed only after the client records its own result check.
+    opened
+        .client
+        .verified(work_id)
+        .await
+        .expect("the client records its result check");
     let (transport, server) = transport_pair();
     let serving = serve(server, opened.service.clone());
     let credited = pay_for_result(transport, &mut opened.client, work_id).await;
     serving.abort();
     let Ok(credited) = credited else {
-        panic!("the checked answer is paid for: {credited:?}");
+        panic!("the collected answer is paid for: {credited:?}");
     };
     assert_eq!(credited, PRICE, "one job, at its authorized price");
     assert_eq!(
@@ -939,7 +786,6 @@ async fn run_one_paid_job(devnet: &WorkDevnet, opened: &mut Opened) -> u64 {
     // Still one, after a delivery and a payment: the answer came out of
     // the provider's spool, not out of a second run.
     assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
-    assert_eq!(client_calls.load(Ordering::SeqCst), 1);
     credited
 }
 

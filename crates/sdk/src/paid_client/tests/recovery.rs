@@ -2,12 +2,8 @@ use super::*;
 use crate::test_support::{BODY, PRICE, PaidFixture, signer};
 use hellas_channel::model::work::PrivateRecord as _;
 use hellas_channel::work::{BackendFault, ObservationTime, WorkBackend, run_accepted_work};
-use hellas_rpc::fetch::{
-    FetchOutputTranscriptBuilder, encode_fetch_event_payload, encode_fetch_terminal_payload,
-    verify_input_events,
-};
+use hellas_rpc::fetch::{encode_fetch_event_payload, encode_fetch_terminal_payload};
 use hellas_rpc::output::{OutputEvent, StopReason, TextChannel};
-use hellas_rpc::pb::work::WorkDelivered;
 use hellas_rpc::services::work::{Work, WorkServer};
 use hellas_wire::Dispatcher;
 use std::sync::Arc;
@@ -39,50 +35,32 @@ impl WorkBackend for Backend {
     }
     async fn execute(
         &self,
-        prepared: hellas_channel::work::PreparedWorkInput,
+        input: hellas_channel::work::Admitted,
     ) -> Result<Vec<hellas_rpc::OutputEventEnvelope>, hellas_channel::work::BackendFault> {
-        let hellas_channel::work::PreparedWorkInput::Fetch(input) = prepared else {
-            return Err(
-                hellas_channel::work::admission::AdmissionError::Unsupported(
-                    hellas_channel::work::admission::CapacityDomain::Gpu,
-                )
-                .into(),
-            );
-        };
-        let input = *input;
         self.0.fetch_add(1, Ordering::SeqCst);
-        let (parts, admission) = input.into_parts_and_admission();
-        let _running = admission
-            .reserve(
-                hellas_channel::work::admission::CapacityDomain::Fetch,
-                async { self.try_admit(hellas_channel::work::admission::CapacityDomain::Fetch) },
-            )
+        let domain = input.capacity_domain();
+        let (prepared, _, _, admission) = input
+            .reserve(async { self.try_admit(domain) })
             .await?
-            .dispatch()
-            .await?;
-        let request = verify_input_events(&parts.fetch_input_transcript).unwrap();
+            .into_parts_and_admission();
+        let _running = admission.dispatch().await?;
         let key = ProducerSigningKey::from_secret_bytes([2; 32]).unwrap();
-        let mut output =
-            FetchOutputTranscriptBuilder::new(request.input_commitment, request.assurance, &key);
-        output
-            .push_event(
-                encode_fetch_event_payload(&OutputEvent::TextDelta {
-                    index: 0,
-                    delta: RESPONSE.into(),
-                    channel: TextChannel::Output,
-                })
-                .unwrap(),
-            )
-            .unwrap();
-        Ok(output
-            .finish(
-                encode_fetch_terminal_payload(&OutputEvent::Finished {
-                    stop_reason: StopReason::EndOfText,
-                    usage: None,
-                })
-                .unwrap(),
-            )
-            .unwrap())
+        Ok(hellas_rpc::protocol::invocation::fetch::output(
+            &[encode_fetch_event_payload(&OutputEvent::TextDelta {
+                index: 0,
+                delta: RESPONSE.into(),
+                channel: TextChannel::Output,
+            })
+            .unwrap()],
+            &encode_fetch_terminal_payload(&OutputEvent::Finished {
+                stop_reason: StopReason::EndOfText,
+                usage: None,
+            })
+            .unwrap(),
+        )
+        .unwrap()
+        .sign(&prepared.request, &key, 65536)
+        .unwrap())
     }
 }
 
@@ -169,20 +147,29 @@ async fn restart_pays_delivered_fetch_once_and_skips_lost_payload_jobs() {
         run_accepted_work(&provider, &fixture.ready, &backend, delivered)
             .await
             .unwrap();
-        let request = client.request_delivery(delivered, &[8; 32]).unwrap();
-        let result = provider.deliver(&request, &[8; 32]).await.unwrap();
-        client
-            .receive(
-                delivered,
-                &fixture.ready,
-                &WorkDelivered {
-                    result: result.result.encode(),
-                    provider_signature: result.signature.as_bytes().to_vec(),
-                    transcript: result.transcript,
+        let (transport, server) =
+            hellas_channel::test_support::transport::transport_pair_without_write_authority(
+                hellas_wire::TransportContext {
+                    open_exporter: Some([8; 32]),
+                    ..Default::default()
                 },
-            )
-            .await
-            .unwrap();
+                hellas_wire::TransportContext {
+                    open_exporter: Some([8; 32]),
+                    ..Default::default()
+                },
+            );
+        let serving = hellas_channel::test_support::channel::serve_work(server, provider.clone());
+        hellas_channel::work::fetch_result_stream(
+            transport,
+            &mut client,
+            &fixture.ready,
+            delivered,
+            |_| Ok(()),
+        )
+        .await
+        .unwrap();
+        serving.abort();
+        client.verified(delivered).await.unwrap();
         // Crash after verified delivery, before creating any payment certificate.
         assert!(client.state().last_payment().is_none());
         drop(client);
@@ -197,7 +184,6 @@ async fn restart_pays_delivered_fetch_once_and_skips_lost_payload_jobs() {
             .unwrap();
         let (bundle, key) = enrollment(server.id());
         let trust = hellas_client::ProviderTrustAnchor {
-            allowed_environments: vec![fixture.policy.work_policy.allowed_environment()],
             expected_genesis: bundle.content_id(),
             required_assurance: Assurance::ProducerSigned,
             apple_app_attest: None,
@@ -286,7 +272,18 @@ async fn restart_pays_delivered_fetch_once_and_skips_lost_payload_jobs() {
                 observer: None,
                 needs_recovery: true,
             };
-            assert!(session.run(None, true, None).await.unwrap().is_none());
+            assert!(
+                session
+                    .run(
+                        None,
+                        &hellas_channel::content::InvocationContent::Ephemeral(Default::default()),
+                        true,
+                        None
+                    )
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
             assert!(!session.needs_recovery);
             assert_eq!(
                 provider

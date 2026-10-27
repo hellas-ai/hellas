@@ -980,7 +980,12 @@ async fn paid_finish(case: PaidScenario) {
     .await
     .unwrap();
     session
-        .run(None, &InvocationContent::Ephemeral(Default::default()), true, None)
+        .run(
+            None,
+            &InvocationContent::Ephemeral(Default::default()),
+            true,
+            None,
+        )
         .await
         .unwrap();
     assert!(
@@ -1037,7 +1042,12 @@ async fn paid_finish(case: PaidScenario) {
     .await
     .unwrap();
     session
-        .run(None, &InvocationContent::Ephemeral(Default::default()), true, None)
+        .run(
+            None,
+            &InvocationContent::Ephemeral(Default::default()),
+            true,
+            None,
+        )
         .await
         .unwrap();
     upstream
@@ -1267,7 +1277,12 @@ async fn provider_close_offline(
 ) {
     use hellas_chain::{WorkBlocks, work_view::WorkChannelQuery};
     let result = session
-        .run(Some(input), &InvocationContent::Ephemeral(Default::default()), false, None)
+        .run(
+            Some(input),
+            &InvocationContent::Ephemeral(Default::default()),
+            false,
+            None,
+        )
         .await
         .unwrap()
         .unwrap();

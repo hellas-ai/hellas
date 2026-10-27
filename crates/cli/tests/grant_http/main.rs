@@ -1,9 +1,6 @@
 #![cfg(unix)]
 mod contact;
-#[cfg(feature = "evaluate")]
-mod local_evaluate;
 mod managed;
-mod native_owner;
 mod offer_gateway;
 
 use hellas_authority::test_support::common_node;
@@ -197,9 +194,6 @@ impl Cli {
             .env("OTEL_SDK_DISABLED", "true")
             .stdin(Stdio::null())
             .kill_on_drop(true);
-        if cfg!(feature = "evaluate") && matches!(args.first(), Some(&"serve" | &"gateway")) {
-            command.arg("--store-dir").arg(self.root.join("store"));
-        }
         command
     }
     async fn output(&self, args: &[&str]) -> std::process::Output {
@@ -455,51 +449,6 @@ async fn issue_work_profile_at(
         &hellas_sdk::node_control::profile::read_credential(&output).unwrap(),
     )
 }
-/// A Work credential for `subject` on `allowance`, held by `holder`, issued
-/// through the checked node API by the passkey session of `administrator`'s
-/// subject.
-async fn execution_credential(
-    node: &hellas_authority::node::NodeCoordinator,
-    administrator: &hellas_auth::authority::CredentialSecret,
-    subject: hellas_auth::authority::PrincipalId,
-    allowance: GrantId,
-    holder: hellas_auth::authority::CredentialHolder,
-) -> hellas_auth::authority::CredentialSecret {
-    use hellas_auth::authority as auth;
-    let caller = hellas_authority::test_support::session(node, administrator).await;
-    let root = GrantId([0; 16]);
-    let scope = auth::GrantSpec {
-        authority: caller.authority(),
-        subject,
-        permissions: [auth::Permission {
-            operation: auth::OperationId::new(hellas_authority::grant_service::WORK_EXECUTE)
-                .unwrap(),
-            resource: hellas_authority::grant_service::allowance_resource(
-                caller.authority(),
-                allowance,
-            ),
-        }]
-        .into(),
-        not_before: auth::UnixMillis(1000),
-        expires: auth::UnixMillis(u64::MAX),
-        delegation_depth: 0,
-        issuance: None,
-    };
-    node.grant(
-        &caller,
-        auth::GrantCommand::Issue {
-            authorization: root,
-            id: common_node::EXECUTION_AUTHORIZATION,
-            spec: scope.clone(),
-        },
-    )
-    .await
-    .unwrap();
-    hellas_authority::test_support::credentials::issue_one(node, &caller, root, scope, holder)
-        .await
-        .unwrap()
-        .1
-}
 /// An HTTP authority whose administrator issues the gateway a separate
 /// bearer credential; the bootstrap credential is never the bearer.
 async fn gateway_profile(root: &Path) -> (PathBuf, String) {
@@ -584,13 +533,36 @@ fn gateway_client(token: &str) -> reqwest::Client {
         .build()
         .unwrap()
 }
-/// Record an independent caller approval of one provider and its environments.
-fn approve(
-    root: &Path,
-    name: &str,
-    provider_genesis: hellas_rpc::ContentId,
-    environments: Vec<hellas_rpc::ContentId>,
-) -> PathBuf {
+/// The HTTP Fetch invocation policy the grant resource fixtures admit.
+fn http_invocation_policy() -> hellas_rpc::protocol::invocation::InvocationPolicy {
+    use hellas_rpc::protocol::invocation::{
+        Admission, InvocationPolicy, Limits,
+        fetch::{FetchAdmission, FetchLimits, FetchRoutePolicy},
+    };
+    InvocationPolicy {
+        admissions: vec![Admission::Fetch {
+            admission: FetchAdmission {
+                contract: hellas_rpc::FetchContract::http().unwrap(),
+                route: FetchRoutePolicy::sealed_route("http", "request").unwrap(),
+                limits: FetchLimits {
+                    max_request_body_bytes: 65536,
+                    max_output_events: 256,
+                    max_spool_bytes: 262144,
+                    max_encoded_result_frame: 262144,
+                    max_encoded_prepared_input: 262144,
+                },
+            },
+        }],
+        limits: Limits {
+            max_upload_bytes: 262144,
+            max_output_bytes: 65536,
+            max_steps: 1,
+            execution_timeout_ms: 10_000,
+        },
+    }
+}
+/// Record an independent caller approval of one provider.
+fn approve(root: &Path, name: &str, provider_genesis: hellas_rpc::ContentId) -> PathBuf {
     let trust_root = root.join(format!("{name}-trust"));
     hellas_sdk::trust_policy::TrustPolicyStore::new(&trust_root)
         .approve(
@@ -599,7 +571,6 @@ fn approve(
             hellas_sdk::trust_policy::TrustPolicy {
                 provider_genesis,
                 assurance: hellas_rpc::Assurance::ProducerSigned,
-                environments,
                 apple: None,
             },
             "independent test approval".into(),

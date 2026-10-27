@@ -120,9 +120,43 @@ assurance = "producer-signed"
     let raw = Job::load(root.path()).unwrap();
     let key = ProducerSigningKey::from_secret_bytes([0x21; 32]).unwrap();
     assert_eq!(raw.digest(), helper.digest());
+    let runner = ProducerSigningKey::from_secret_bytes([0x22; 32])
+        .unwrap()
+        .public_key();
+    let policy = hellas_rpc::protocol::invocation::InvocationPolicy {
+        admissions: vec![hellas_rpc::protocol::invocation::Admission::Fetch {
+            admission: hellas_rpc::protocol::invocation::fetch::FetchAdmission {
+                contract: contract.clone(),
+                route: hellas_rpc::protocol::invocation::fetch::FetchRoutePolicy::open_fetch(
+                    false,
+                    vec![],
+                ),
+                limits: hellas_rpc::protocol::invocation::fetch::FetchLimits {
+                    max_request_body_bytes: 65536,
+                    max_output_events: 64,
+                    max_spool_bytes: 65536,
+                    max_encoded_result_frame: 65536,
+                    max_encoded_prepared_input: 65536,
+                },
+            },
+        }],
+        limits: hellas_rpc::protocol::invocation::Limits {
+            max_upload_bytes: 65536,
+            max_output_bytes: 65536,
+            max_steps: 1,
+            execution_timeout_ms: 60_000,
+        },
+    };
     assert_eq!(
-        raw.prepare(&key, [9; 32]).unwrap().encode().unwrap(),
-        helper.prepare(&key, [9; 32]).unwrap().encode().unwrap()
+        raw.prepare(&key, [9; 32], runner.clone(), &policy)
+            .unwrap()
+            .canonical_bytes()
+            .unwrap(),
+        helper
+            .prepare(&key, [9; 32], runner, &policy)
+            .unwrap()
+            .canonical_bytes()
+            .unwrap()
     );
 }
 
@@ -167,6 +201,11 @@ fn output_claims_only_provider_signature_and_job_binding() {
         payment_edge: hellas_kernel::EdgeId::from_bytes([2; 32]),
         channel_id: hellas_auth::Digest::from_bytes([3; 32]),
         transcript: vec![],
+        output: hellas_rpc::protocol::invocation::output::InvocationOutput {
+            outcome: hellas_rpc::protocol::invocation::output::Outcome::Succeeded,
+            artifacts: vec![],
+            metadata: hellas_rpc::JsonBytes(vec![]),
+        },
         work_id: hellas_auth::Digest::from_bytes([4; 32]),
         credited_cumulative: 20,
         job_price: 20,

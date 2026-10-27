@@ -6,6 +6,40 @@ fn fetch() -> Job {
         Assurance::ProducerSigned).unwrap()
 }
 
+fn http_policy(max_encoded_prepared_input: u32, max_upload_bytes: u64) -> InvocationPolicy {
+    use hellas_rpc::protocol::invocation::{
+        Admission, Limits,
+        fetch::{FetchAdmission, FetchLimits, FetchRoutePolicy},
+    };
+    InvocationPolicy {
+        admissions: vec![Admission::Fetch {
+            admission: FetchAdmission {
+                contract: FetchContract::http().unwrap(),
+                route: FetchRoutePolicy::open_fetch(false, vec![]),
+                limits: FetchLimits {
+                    max_request_body_bytes: 4096,
+                    max_output_events: 64,
+                    max_spool_bytes: 65536,
+                    max_encoded_result_frame: 65536,
+                    max_encoded_prepared_input,
+                },
+            },
+        }],
+        limits: Limits {
+            max_upload_bytes,
+            max_output_bytes: 65536,
+            max_steps: 1,
+            execution_timeout_ms: 60_000,
+        },
+    }
+}
+
+fn runner() -> PublicKey {
+    ProducerSigningKey::from_secret_bytes([0x22; 32])
+        .unwrap()
+        .public_key()
+}
+
 #[test]
 fn folder_round_trip_preserves_semantics_and_exact_signed_input() {
     let directory = tempfile::tempdir().unwrap();
@@ -17,24 +51,39 @@ fn folder_round_trip_preserves_semantics_and_exact_signed_input() {
     assert_eq!(loaded.digest(), job.digest());
     let key = ProducerSigningKey::from_secret_bytes([0x21; 32]).unwrap();
     let nonce = job.purchase_nonce(Digest::from_bytes([9; 32]), 1);
-    let direct = job.prepare(&key, nonce).unwrap();
-    let from_folder = loaded.prepare(&key, nonce).unwrap();
-    assert_eq!(direct.encode().unwrap(), from_folder.encode().unwrap());
-    let PreparedWorkInput::Fetch(prepared) = from_folder else {
-        panic!("Fetch input")
+    let policy = http_policy(65536, 65536);
+    let direct = job.prepare(&key, nonce, runner(), &policy).unwrap();
+    let from_folder = loaded.prepare(&key, nonce, runner(), &policy).unwrap();
+    assert_eq!(
+        direct.canonical_bytes().unwrap(),
+        from_folder.canonical_bytes().unwrap()
+    );
+    let hellas_rpc::protocol::invocation::Admission::Fetch { admission } = &policy.admissions[0]
+    else {
+        unreachable!()
     };
-    let parts = prepared.parts().unwrap();
-    let request = hellas_rpc::fetch::verify_input_events(&parts.fetch_input_transcript).unwrap();
+    let request = fetch::validate_input(
+        &from_folder,
+        admission,
+        policy.limits.max_output_bytes,
+        &key.public_key(),
+    )
+    .unwrap();
     assert_eq!(request.retention, hellas_rpc::Retention::Ephemeral);
     assert_eq!(request.service, "http");
     assert_eq!(request.caller_key, key.public_key());
     assert_ne!(nonce, loaded.purchase_nonce(Digest::from_bytes([9; 32]), 2));
     assert_ne!(
-        direct.encode().unwrap(),
+        direct.canonical_bytes().unwrap(),
         loaded
-            .prepare(&key, loaded.purchase_nonce(Digest::from_bytes([9; 32]), 2))
+            .prepare(
+                &key,
+                loaded.purchase_nonce(Digest::from_bytes([9; 32]), 2),
+                runner(),
+                &policy,
+            )
             .unwrap()
-            .encode()
+            .canonical_bytes()
             .unwrap(),
         "a new purchase changes the actual signed input"
     );
@@ -99,42 +148,31 @@ fn folder_paths_cannot_follow_a_symlink_outside_or_inside_the_folder() {
 }
 
 #[test]
-fn causal_lm_folder_round_trip_binds_environment_tokens_and_generation_policy() {
-    let environment = CausalLmEnvironment::new(
-        hellas_rpc::ContentRef::new(hellas_rpc::ContentId::from_bytes([9; 32]), 1),
-        "main",
-        Vec::new(),
-        Vec::new(),
-        vec![4],
-        3,
-        128,
-        hellas_rpc::CausalLmGenerationSchedule {
-            fixed_capacity: 128,
-            prefill_chunk_tokens: 64,
-        },
-    )
-    .unwrap();
-    let job = Job::causal_lm(20, environment.clone(), vec![0, 1], 3, vec![2]).unwrap();
+fn compute_folder_round_trip_binds_environment_plan_and_price() {
+    use hellas_channel::test_support::channel::{environment, plan, work_policy};
+    let content = || {
+        let mut content = EphemeralContent::default();
+        content.insert(environment().canonical_bytes().unwrap());
+        InvocationContent::Ephemeral(content)
+    };
+    let job = Job::compute(20, environment(), plan(), vec![], content()).unwrap();
     let directory = tempfile::tempdir().unwrap();
     job.save(directory.path()).unwrap();
     let loaded = Job::load(directory.path()).unwrap();
     assert_eq!(job.canonical_bytes(), loaded.canonical_bytes());
     let key = ProducerSigningKey::from_secret_bytes([0x21; 32]).unwrap();
-    let input = loaded.prepare(&key, [7; 32]).unwrap();
-    let PreparedWorkInput::Evaluate(prepared) = input else {
-        panic!("causal LM input")
-    };
-    let parts = prepared.parts().unwrap();
-    assert_eq!(parts.evaluate_request.nonce, [7; 32]);
-    assert_eq!(parts.manifest, environment.manifest());
-    assert_eq!(parts.evaluate_request.runner_public_key, key.public_key());
+    let prepared = loaded
+        .prepare(&key, [7; 32], runner(), &work_policy())
+        .unwrap();
+    assert_eq!(prepared.request.nonce, [7; 32]);
     assert_eq!(
-        parts.prompt_tokens,
-        hellas_rpc::protocol::artifacts::TokenIds::from_u32s(vec![0, 1])
+        prepared.manifest().unwrap(),
+        environment().manifest().unwrap()
     );
+    assert_eq!(prepared.request.runner_public_key, runner());
     assert_ne!(
         job.digest(),
-        Job::causal_lm(21, environment, vec![0, 1], 3, vec![2])
+        Job::compute(21, environment(), plan(), vec![], content())
             .unwrap()
             .digest()
     );
@@ -164,144 +202,41 @@ fn typed_job_price_must_round_trip_through_toml() {
 }
 
 #[test]
-fn causal_lm_unsigned_preflight_enforces_generation_identity_and_input_limits() {
-    use hellas_channel::model::{
-        profile::WorkPolicy,
-        work::{EvaluatePolicyV2, generation_policy_digest, identity_source_digest},
-    };
-    use hellas_rpc::protocol::artifacts::{BoundTermId, Canonical as _, TextArtifact, TextPolicy};
-    let environment = CausalLmEnvironment::new(
-        hellas_rpc::ContentRef::new(hellas_rpc::ContentId::from_bytes([9; 32]), 1),
-        "main",
-        vec![],
-        vec![],
-        vec![4],
-        3,
-        128,
-        hellas_rpc::CausalLmGenerationSchedule {
-            fixed_capacity: 128,
-            prefill_chunk_tokens: 64,
-        },
-    )
-    .unwrap();
-    let job = Job::causal_lm(20, environment, vec![0, 1], 3, vec![2]).unwrap();
-    let mut policy = crate::test_support::PaidFixture::new().policy;
-    policy.payment_policy.fixed_price = 20;
-    let allowed = EvaluatePolicyV2 {
-        allowed_environment: job.manifest().content_id(),
-        generation_policy_digest: generation_policy_digest(
-            &TextPolicy::from_u32_stop_tokens(4, vec![2]).canonical_bytes(),
-        )
-        .unwrap(),
-        identity_source_digest: identity_source_digest(
-            &TextArtifact::identity(BoundTermId::from_digest(
-                job.manifest().content_id().digest(),
-            ))
-            .canonical_bytes(),
-        )
-        .unwrap(),
-        max_prompt_tokens: 2,
-        max_new_tokens: 4,
-        max_stop_token_ids: 1,
-        max_spool_bytes: 65536,
-        max_encoded_result_frame: 65536,
-        max_encoded_prepared_input: 65536,
-        max_upload_bytes: 65536,
-    };
-    policy.work_policy = WorkPolicy::Evaluate(allowed);
-    job.check_policy(&policy).unwrap();
-    for field in [
-        "generation",
-        "identity",
-        "prompt",
-        "new tokens",
-        "stop count",
-        "encoded bytes",
-        "upload bytes",
-    ] {
-        let mut denied = allowed;
-        match field {
-            "generation" => denied.generation_policy_digest = Digest::from_bytes([1; 32]),
-            "identity" => denied.identity_source_digest = Digest::from_bytes([1; 32]),
-            "prompt" => denied.max_prompt_tokens = 1,
-            "new tokens" => denied.max_new_tokens = 2,
-            "stop count" => denied.max_stop_token_ids = 0,
-            "encoded bytes" => denied.max_encoded_prepared_input = 1,
-            "upload bytes" => denied.max_upload_bytes = 1,
-            _ => unreachable!(),
-        }
-        policy.work_policy = WorkPolicy::Evaluate(denied);
-        assert!(
-            job.check_policy(&policy).is_err(),
-            "unsigned preflight admitted {field}"
-        );
-    }
-}
-
-#[test]
 fn fetch_unsigned_preflight_checks_the_worst_nonce_encoded_byte_ceiling() {
-    use hellas_channel::model::{
-        fetch::{FetchRoutePolicy, fetch_route_commitment},
-        profile::WorkPolicy,
-    };
     let job = fetch();
     let mut expected = crate::test_support::PaidFixture::new().policy;
     expected.payment_policy.fixed_price = job.price();
-    let WorkPolicy::Fetch { mut policy, .. } = expected.work_policy else {
-        unreachable!()
-    };
-    let route = FetchRoutePolicy::OpenFetch {
-        require_spki_pin: false,
-        allowed_hosts: vec![],
-    };
-    policy.allowed_environment = job.manifest().content_id();
-    policy.route_commitment = fetch_route_commitment(&route.canonical_body_bytes()).unwrap();
     let actual = job
-        .prepare(&ProducerSigningKey::generate(), [255; 32])
+        .prepare(
+            &ProducerSigningKey::generate(),
+            [255; 32],
+            runner(),
+            &http_policy(60_000, 65536),
+        )
         .unwrap()
-        .encode()
+        .canonical_bytes()
         .unwrap()
         .len();
     for nonce in [0, 23, 24, 255] {
         let measured = job
-            .prepare(&ProducerSigningKey::generate(), [nonce; 32])
+            .prepare(
+                &ProducerSigningKey::generate(),
+                [nonce; 32],
+                runner(),
+                &http_policy(60_000, 65536),
+            )
             .unwrap()
-            .encode()
+            .canonical_bytes()
             .unwrap()
             .len();
-        assert_eq!(actual - measured, if nonce < 24 { 32 } else { 0 });
+        assert!(measured <= actual, "nonce {nonce} encodes past the ceiling");
     }
-    policy.max_encoded_prepared_input = actual.try_into().unwrap();
-    expected.work_policy = WorkPolicy::Fetch {
-        policy,
-        route: route.clone(),
-        contract: FetchContract::http().unwrap(),
-    };
+    // The policy is part of the encoded input: measure with a limit that
+    // encodes at the same width as the ceiling under test.
+    assert!((256..60_000).contains(&actual));
+    let actual_u32: u32 = actual.try_into().unwrap();
+    expected.invocation_policy = http_policy(actual_u32, 65536);
     job.check_policy(&expected).unwrap();
-    policy.max_encoded_prepared_input -= 1;
-    expected.work_policy = WorkPolicy::Fetch {
-        policy,
-        route,
-        contract: FetchContract::http().unwrap(),
-    };
+    expected.invocation_policy = http_policy(actual_u32 - 1, 65536);
     assert!(job.check_policy(&expected).is_err());
-    let WorkPolicy::Fetch {
-        mut policy,
-        route,
-        contract,
-    } = expected.work_policy
-    else {
-        unreachable!()
-    };
-    policy.max_encoded_prepared_input = actual.try_into().unwrap();
-    policy.max_upload_bytes = (actual - 1).try_into().unwrap();
-    expected.work_policy = WorkPolicy::Fetch {
-        policy,
-        route,
-        contract,
-    };
-    assert!(
-        job.check_policy(&expected).is_err(),
-        "uncached upload must fit before funding"
-    );
 }

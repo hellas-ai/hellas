@@ -860,17 +860,15 @@ mod tests {
         .unwrap();
         let prepared = Job::from_input(10, prepared)
             .unwrap()
-            .prepare(identity.node_key(), [1; 32])
+            .prepare(
+                identity.node_key(),
+                [1; 32],
+                identity.node_key().public_key(),
+                &fixture.policy.invocation_policy,
+            )
             .unwrap();
-        let PreparedWorkInput::Fetch(prepared) = prepared else {
-            panic!("Fetch input")
-        };
-        let input = hellas_rpc::fetch::verify_input_events(
-            &prepared.parts().unwrap().fetch_input_transcript,
-        )
-        .unwrap();
         assert_eq!(
-            input.execution_environment,
+            prepared.request.execution_environment,
             test_responses_contract().manifest_id()
         );
         assert!(
@@ -897,16 +895,10 @@ mod tests {
         )
         .unwrap();
         let mut quoted = fixture.policy.clone();
-        let WorkPolicy::Fetch {
-            contract: selected,
-            policy,
-            ..
-        } = &mut quoted.work_policy
-        else {
+        let Admission::Fetch { admission } = &mut quoted.invocation_policy.admissions[0] else {
             panic!("Fetch fixture")
         };
-        *selected = contract.clone();
-        policy.allowed_environment = contract.manifest_id();
+        admission.contract = contract.clone();
         let identity = crate::NodeIdentity::from_secret_bytes([0x31; 32], [0x32; 32]).unwrap();
         let request = WorkFetchRequest {
             provider: options.providers[0].provider,
@@ -917,16 +909,18 @@ mod tests {
         let prepared = prepare_fetch(&options.providers[0], &quoted, &request).unwrap();
         let prepared = Job::from_input(10, prepared)
             .unwrap()
-            .prepare(identity.node_key(), [1; 32])
+            .prepare(
+                identity.node_key(),
+                [1; 32],
+                identity.node_key().public_key(),
+                &quoted.invocation_policy,
+            )
             .unwrap();
-        let PreparedWorkInput::Fetch(prepared) = prepared else {
-            panic!("Fetch input")
-        };
-        assert_eq!(prepared.parts().unwrap().contract, contract);
-        let WorkPolicy::Fetch { policy, .. } = &mut quoted.work_policy else {
+        assert_eq!(prepared.manifest().unwrap(), contract.manifest());
+        let Admission::Fetch { admission } = &mut quoted.invocation_policy.admissions[0] else {
             panic!("Fetch fixture")
         };
-        policy.allowed_environment = hellas_rpc::ContentId::from_bytes([99; 32]);
+        admission.route = FetchRoutePolicy::sealed_route("openai", "other").unwrap();
         assert!(prepare_fetch(&options.providers[0], &quoted, &request).is_err());
         assert!(!fixture.root.path().join("client").exists());
     }
@@ -1162,7 +1156,7 @@ mod tests {
         // before preparation/routing has reached task registration.
         let permit = gateway.admission.clone().try_acquire_owned().unwrap();
         gateway.drain().await.unwrap();
-        let result = gateway.submit::<FetchEvent>(Vec::new(), None, None, None, Some(permit));
+        let result = gateway.submit::<FetchEvent>(Vec::new(), None, None, Some(permit));
         assert!(matches!(
             result.err().expect("submission after drain"),
             PoolError::Busy(_)
@@ -1192,6 +1186,14 @@ mod tests {
         );
     }
 
+    fn text(delta: &str) -> FetchEvent {
+        FetchEvent::TextDelta {
+            index: 0,
+            delta: delta.into(),
+            channel: hellas_rpc::output::TextChannel::Output,
+        }
+    }
+
     #[tokio::test]
     async fn buffered_reconnect_burst_is_delivered_and_releases_byte_budget() {
         use futures::StreamExt;
@@ -1200,15 +1202,7 @@ mod tests {
         let budget = Arc::new(Semaphore::new(OUTPUT_BUFFER_BYTES));
         // Retained output can arrive in one burst before HTTP gets a poll.
         for position in 0..128 {
-            emit(
-                &sender,
-                &overflow,
-                &budget,
-                Ok(ExecutionEvent::Chunk {
-                    position,
-                    tokens: vec![0; 4],
-                }),
-            );
+            emit(&sender, &overflow, &budget, Ok(text(&position.to_string())));
         }
         drop(sender);
         drop(overflow);
@@ -1230,16 +1224,9 @@ mod tests {
         let budget = Arc::new(Semaphore::new(OUTPUT_BUFFER_BYTES));
         // A stalled reader cannot retain more than the byte budget, and the
         // synchronous producer callback still returns without waiting on it.
-        for position in 0..3 {
-            emit(
-                &sender,
-                &overflow,
-                &budget,
-                Ok(ExecutionEvent::Chunk {
-                    position,
-                    tokens: vec![0; OUTPUT_BUFFER_BYTES / 2 - OUTPUT_EVENT_OVERHEAD],
-                }),
-            );
+        let half = OUTPUT_BUFFER_BYTES / 2 - OUTPUT_EVENT_OVERHEAD - text("").bytes();
+        for _ in 0..3 {
+            emit(&sender, &overflow, &budget, Ok(text(&"x".repeat(half))));
         }
         assert_eq!(budget.available_permits(), 0);
         let mut response = response_stream(receiver, overflow_receiver);

@@ -3,10 +3,6 @@
 pub(crate) use crate::provider::tests::host::{Host, RemoteHost, provider_enrollment};
 use crate::work_config::{ChainCrossCheck, WorkConfig};
 use hellas_auth::ProducerSigningKey;
-use hellas_channel::model::fetch::{
-    FetchPolicyV2, FetchRoutePolicy, PreparedPaidFetchInputV1, fetch_route_commitment,
-};
-use hellas_channel::model::profile::WorkPolicy;
 use hellas_channel::model::setup::{
     ObservedChannel, ReadyChannel, WorkChannelConfig, WorkChannelDescriptor, payment_terms_hash,
 };
@@ -19,6 +15,8 @@ use hellas_kernel::{
     RegistryNamespace, RegistryRecordTag, Secp256k1Signer, Secp256k1Verifier, Terms, TermsHash,
     WorkPaymentTerms, WorkStakeBondTerms, work_payment_settlement,
 };
+use hellas_rpc::protocol::invocation::fetch::{FetchAdmission, FetchLimits, FetchRoutePolicy};
+use hellas_rpc::protocol::invocation::{Admission, InvocationPolicy, Limits};
 use hellas_rpc::{Assurance, Retention};
 
 pub(crate) use crate::test_identity::enrollment;
@@ -142,22 +140,7 @@ impl PaidFixture {
             compute_credit_limit: 40,
             delivery_credit_limit: 40,
         };
-        let route = FetchRoutePolicy::sealed_route("openai", "responses").unwrap();
-        let work_policy = WorkPolicy::Fetch {
-            contract: test_responses_contract(),
-            policy: FetchPolicyV2 {
-                allowed_environment: test_responses_contract().manifest_id(),
-                route_commitment: fetch_route_commitment(&route.canonical_body_bytes()).unwrap(),
-                max_request_body_bytes: 4096,
-                max_output_events: 64,
-                max_output_bytes: 16384,
-                max_spool_bytes: 65536,
-                max_encoded_result_frame: 65536,
-                max_encoded_prepared_input: 65536,
-                max_upload_bytes: 65536,
-            },
-            route,
-        };
+        let work_policy = work_policy();
         let bond_terms = WorkStakeBondTerms {
             parties: Parties::new(
                 PartyKeys::sole(signer(2).party_key()),
@@ -209,7 +192,7 @@ impl PaidFixture {
             payment_terms: terms.clone(),
             policy_salt: [9; 32],
             channel_policy,
-            work_policy: work_policy.clone(),
+            invocation_policy: work_policy.clone(),
             expected_payment_values: values,
         })
         .unwrap();
@@ -261,7 +244,7 @@ impl PaidFixture {
             network,
             policy_salt: [9; 32],
             channel_policy,
-            work_policy,
+            invocation_policy: work_policy,
             expected_payment_values: values,
             min_omit_response_blocks: hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
         };
@@ -286,7 +269,7 @@ impl PaidFixture {
         } else {
             "provider"
         };
-        ChannelStore::open_metadata_only(
+        ChannelStore::open(
             &self.root.path().join(name),
             self.ready.channel().clone(),
             work_payment_settlement(self.policy.expected_payment_values, OMISSION_BOND).unwrap(),
@@ -297,6 +280,7 @@ impl PaidFixture {
                 payload: [1; 32],
                 parent: [0; 32],
             },
+            hellas_store::ContentStore::new(),
             &Secp256k1Verifier::new(),
         )
         .await
@@ -335,9 +319,16 @@ impl PaidFixture {
         )
         .unwrap();
         JobProposal {
-            prepared_input: PreparedPaidFetchInputV1::new(&events, &test_responses_contract())
-                .unwrap()
-                .into(),
+            prepared_input: hellas_rpc::protocol::invocation::fetch::prepare(
+                &events,
+                &test_responses_contract(),
+                ProducerSigningKey::from_secret_bytes([2; 32])
+                    .unwrap()
+                    .public_key(),
+                work_policy().canonical_bytes().unwrap(),
+                [1; 32],
+            )
+            .unwrap(),
             deadlines: JobDeadlines {
                 acceptance: 50,
                 terminal: 100,
@@ -366,6 +357,31 @@ fn edge(value: u64, reserve: u64, maker: Key, taker: Key, terms: TermsHash, allo
     bytes.extend_from_slice(terms.as_bytes());
     bytes.push(allowed);
     Edge::decode_exact(&bytes).unwrap()
+}
+
+/// The metadata-only Fetch policy this fixture's channel admits.
+pub(crate) fn work_policy() -> InvocationPolicy {
+    InvocationPolicy {
+        admissions: vec![Admission::Fetch {
+            admission: FetchAdmission {
+                contract: test_responses_contract(),
+                route: FetchRoutePolicy::sealed_route("openai", "responses").unwrap(),
+                limits: FetchLimits {
+                    max_request_body_bytes: 4096,
+                    max_output_events: 64,
+                    max_spool_bytes: 65536,
+                    max_encoded_result_frame: 65536,
+                    max_encoded_prepared_input: 65536,
+                },
+            },
+        }],
+        limits: Limits {
+            max_upload_bytes: 65536,
+            max_output_bytes: 16384,
+            max_steps: 1,
+            execution_timeout_ms: 60_000,
+        },
+    }
 }
 
 fn payment_policy() -> hellas_channel::model::work::JobPaymentPolicyV2 {

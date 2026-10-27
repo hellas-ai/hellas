@@ -175,7 +175,7 @@ impl Daemon {
         .unwrap();
         let socket = grant_config.control_socket.clone();
         let journal = grant_config.journal_root.clone();
-        let mut executor = ExecutorSpawnConfig::fetch_only(
+        let mut executor = ExecutorSpawnConfig::new(
             Arc::new(provider_identity.node_key.clone()),
             Assurance::ProducerSigned,
             FetchRouteRegistry::default(),

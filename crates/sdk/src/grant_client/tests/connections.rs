@@ -79,7 +79,6 @@ impl Pair {
         hellas_client::confidential_open::<Open>(
             &self.outgoing,
             &ProviderTrustAnchor {
-                allowed_environments: vec![],
                 expected_genesis: crate::grant_client::tests::provider_enrollment(2).content_id(),
                 required_assurance: Assurance::ProducerSigned,
                 apple_app_attest: None,
@@ -515,7 +514,6 @@ async fn cancelling_application_authentication_closes_the_uncached_connection() 
             pair.provider.bound_sockets(),
             pair.client.clone(),
             ProviderTrustAnchor {
-                allowed_environments: vec![],
                 expected_genesis: crate::grant_client::tests::provider_enrollment(2).content_id(),
                 required_assurance: Assurance::ProducerSigned,
                 apple_app_attest: None,

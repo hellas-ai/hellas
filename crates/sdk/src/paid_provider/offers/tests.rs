@@ -37,7 +37,7 @@ fn options(root: &Path) -> ProvisionOptions {
                 compute_credit_limit: 40,
                 delivery_credit_limit: 40,
             },
-            work_policy: hellas_channel::test_support::channel::work_policy(),
+            invocation_policy: hellas_channel::test_support::channel::work_policy(),
             payment_policy: JobPaymentPolicyV2 {
                 fixed_price: 10,
                 dispatch_margin_blocks: 4,

@@ -63,12 +63,6 @@ impl Host {
         let target = UnpinnedOffer::decode(&signed.encode().unwrap(), self.world.clock.now())
             .unwrap()
             .pin(&hellas_client::ProviderTrustAnchor {
-                allowed_environments: self
-                    .allowance
-                    .policies
-                    .iter()
-                    .map(|p| p.work.allowed_environment())
-                    .collect(),
                 expected_genesis: provider.content_id(),
                 required_assurance: Assurance::ProducerSigned,
                 apple_app_attest: None,

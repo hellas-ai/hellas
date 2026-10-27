@@ -441,7 +441,6 @@ mod tests {
     use commonware_runtime::{Handle, Supervisor as _};
     use commonware_storage::mmr::Location;
     use commonware_utils::non_empty_range;
-    use hellas_auth::Digest as ProtocolDigest;
     use hellas_kernel::{
         BlockHash, BlockHeight, CoinId, Context as KernelContext, EdgeId, EdgeValues, Fees,
         Funding, List, MAX_PARTY_INPUTS, Move, Parties, Party, Payout, PendingSlot,
@@ -449,14 +448,11 @@ mod tests {
         WorkStakeBondTerms,
     };
 
-    use hellas_rpc::protocol::ContentId;
-
     use hellas_channel::model::setup::{
         ProviderChannelPolicy, WorkChannelConfig, WorkChannelDescriptor,
     };
-    use hellas_channel::model::work::{
-        EvaluatePolicyV2, PaidChannelPolicyV1, private_policy_commitment,
-    };
+    use hellas_channel::model::work::{PaidChannelPolicyV1, private_policy_commitment};
+    use hellas_channel::test_support::channel::work_policy;
     use hellas_channel::work_close::{BlockSourceError, adjudicated_close, close_start};
     use hellas_channel::work_handshake::{PaymentAdmission, SetupEndpoint, SetupService};
     use hellas_channel::work_open::{SetupAdvance, SetupProgress, SetupStep, advance_setup};
@@ -553,14 +549,6 @@ mod tests {
         hellas_channel::test_support::channel::credit_policy(40, 40)
     }
 
-    fn work_policy() -> EvaluatePolicyV2 {
-        hellas_channel::test_support::channel::evaluate_policy(
-            ContentId::from_bytes([0x31; 32]),
-            ProtocolDigest::from_bytes([0x32; 32]),
-            ProtocolDigest::from_bytes([0x33; 32]),
-        )
-    }
-
     /// The edge the provider requires the client to fund: the whole
     /// allocation, no reserve, and the chain's zero fees.
     fn expected_values() -> EdgeValues {
@@ -573,7 +561,7 @@ mod tests {
             network: TEST_NETWORK,
             policy_salt: SALT,
             channel_policy: channel_policy(),
-            work_policy: work_policy().into(),
+            invocation_policy: work_policy(),
             expected_payment_values: expected_values(),
             min_omit_response_blocks: hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
         }
@@ -988,7 +976,7 @@ mod tests {
                 payment_terms: payment_terms(),
                 policy_salt: SALT,
                 channel_policy: channel_policy(),
-                work_policy: work_policy().into(),
+                invocation_policy: work_policy(),
                 expected_payment_values: expected_values(),
             }) {
                 Ok(descriptor) => descriptor,

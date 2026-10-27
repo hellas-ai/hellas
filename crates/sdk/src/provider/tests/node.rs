@@ -1,8 +1,7 @@
 use hellas_auth::authority::GrantId;
 use hellas_chain::FinalizedWorkView;
 use hellas_channel::test_support::channel::{
-    client, identity_artifact, manifest, prompt_tokens, provider, provider_producer, signer,
-    text_execution, text_policy,
+    client, provider, provider_producer, signer, work_policy,
 };
 use hellas_channel::work::WorkBackend;
 use hellas_channel::work_close::FinalizedBlocks;
@@ -14,9 +13,8 @@ use hellas_executor::FetchRouteRegistry;
 use hellas_kernel::{EdgeId, NetworkId, PartyKeys, Secp256k1Signer, Secp256k1Verifier};
 use hellas_rpc::pb::work::{
     AcceptWorkRequest, AcceptWorkResponse, AdmitCertificateRequest, AdmitCertificateResponse,
-    DeliverResultResponse, ExchangeSetupRequest, ExchangeSetupResponse, StreamResultRequest,
-    WorkRefusalCode, WorkRefused, accept_work_response, admit_certificate_response,
-    deliver_result_response, exchange_setup_response,
+    ExchangeSetupRequest, ExchangeSetupResponse, StreamResultRequest, WorkRefusalCode, WorkRefused,
+    accept_work_response, admit_certificate_response, exchange_setup_response,
 };
 use hellas_rpc::services::{work::WorkHandler, work_setup::WorkSetupHandler};
 use hellas_wire::{TransportContext, WireStatus};
@@ -31,17 +29,14 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use hellas_auth::Digest;
-use hellas_auth::{ProducerSigningKey, PublicKey};
+use hellas_auth::ProducerSigningKey;
 use hellas_chain::{LatestBlock, QueryError, WorkChannelQuery, WorkChannelSnapshot};
 use hellas_channel::model::bundle::WorkChannelSetupBundleV2;
-use hellas_channel::model::prepared_input::PreparedPaidInputV1;
 use hellas_channel::model::setup::ProviderChannelPolicy;
 use hellas_channel::model::work::{
-    EvaluatePolicyV2, JobDeadlines, PaidChannelPolicyV1, PaidJobAuthorizationV2,
-    PrivateRecord as _, decode_transcript, delivery_request_digest, encode_transcript,
-    generation_policy_digest, identity_source_digest, next_payment, payment_binding_digest,
-    private_policy_commitment, propose_authorization, result_digest, signing_hash, terminal_result,
-    work_id,
+    JobDeadlines, PaidChannelPolicyV1, PaidJobAuthorizationV2, PrivateRecord as _,
+    decode_transcript, delivery_request_digest, encode_transcript, next_payment,
+    payment_binding_digest, private_policy_commitment, result_digest, signing_hash, work_id,
 };
 use hellas_channel::work::{BackendFault, WorkRefusal};
 use hellas_channel::work_close::{BlockSourceError, FinalizedWork};
@@ -58,10 +53,10 @@ use hellas_kernel::{
     WorkPaymentTerms, WorkStakeBondTerms, Writer as _,
 };
 use hellas_rpc::call::WithTrailer;
-use hellas_rpc::protocol::artifacts::{Canonical as _, InputAddressed as _};
+use hellas_rpc::protocol::invocation::PreparedInvocation;
 use hellas_rpc::services::work::WorkClientImpl;
 use hellas_rpc::services::work_setup::WorkSetupClientImpl;
-use hellas_rpc::{Assurance, EvaluateRequest, OutputEventEnvelope, SubmitTxOutcome};
+use hellas_rpc::{Assurance, OutputEventEnvelope, SubmitTxOutcome};
 use hellas_wire::{AuthLevel, PeerIdentity};
 use iroh::{EndpointAddr, TransportAddr};
 use tokio::sync::{Notify, Semaphore};
@@ -647,6 +642,13 @@ fn upload_messages(
         .unwrap_or_else(client);
     let id = hellas_channel::model::work::paid_work_v2_id(network(), a.channel_id, &a);
     let object = ContentRef::for_bytes(&request.prepared_input);
+    let input = PreparedInvocation::from_canonical_bytes(
+        &request.prepared_input,
+        hellas_channel::content::MAX_CONTENT_BYTES,
+    )
+    .unwrap();
+    let program_manifest = input.manifest().unwrap().canonical_bytes();
+    let program_root = hellas_channel::test_support::channel::program_root(&input);
     let chunks = request
         .prepared_input
         .chunks(CONTENT_CHUNK_BYTES)
@@ -654,6 +656,8 @@ fn upload_messages(
         .map(|(index, bytes)| {
             let offset = (index * CONTENT_CHUNK_BYTES) as u64;
             hellas_rpc::pb::work::UploadContentRequest {
+                program_root: program_root.clone(),
+                program_manifest: program_manifest.clone(),
                 route: request.route.clone(),
                 authorization: request.authorization.clone(),
                 client_signature: request.client_signature.clone(),
@@ -1066,16 +1070,6 @@ async fn unmounted_work_refuses_every_method_as_bounded_retryable_not_ready() {
     };
     assert_retryable_not_ready(refusal);
 
-    let delivery: WithTrailer<DeliverResultResponse> = UnmountedWork
-        .deliver_result(StreamResultRequest::default(), TransportContext::default())
-        .await
-        .unwrap()
-        .into();
-    let Some(deliver_result_response::Outcome::Refused(refusal)) = delivery.response.outcome else {
-        panic!("unmounted Work must refuse delivery")
-    };
-    assert_retryable_not_ready(refusal);
-
     let payment: WithTrailer<AdmitCertificateResponse> = UnmountedWork
         .admit_certificate(
             AdmitCertificateRequest::default(),
@@ -1192,20 +1186,6 @@ fn channel_policy() -> PaidChannelPolicyV1 {
     hellas_channel::test_support::channel::credit_policy(40, 40)
 }
 
-fn work_policy() -> EvaluatePolicyV2 {
-    hellas_channel::test_support::channel::evaluate_policy(
-        manifest().content_id(),
-        match generation_policy_digest(&text_policy().canonical_bytes()) {
-            Ok(digest) => digest,
-            Err(error) => panic!("the fixture generation policy hashes: {error}"),
-        },
-        match identity_source_digest(&identity_artifact().canonical_bytes()) {
-            Ok(digest) => digest,
-            Err(error) => panic!("the fixture identity source hashes: {error}"),
-        },
-    )
-}
-
 fn payment_terms() -> WorkPaymentTerms {
     hellas_channel::test_support::channel::payment_terms_for(
         bond_edge(),
@@ -1223,7 +1203,7 @@ fn provider_policy() -> ProviderChannelPolicy {
         network: network(),
         policy_salt: SALT,
         channel_policy: channel_policy(),
-        work_policy: work_policy().into(),
+        invocation_policy: work_policy(),
         expected_payment_values: EdgeValues::new(PAYMENT_VALUE, PAYMENT_RESERVE, Fees::ZERO),
         min_omit_response_blocks: MIN_OMIT_RESPONSE_BLOCKS,
     }
@@ -1428,24 +1408,8 @@ async fn open_channel(root: &Path) -> ChannelStore {
 
 // ── One job, paid for, and then contested ─────────────────────────
 
-fn evaluate_request() -> EvaluateRequest {
-    hellas_channel::test_support::channel::evaluate_request_for(
-        text_execution().input_id().digest(),
-        PublicKey::Secp256k1(client().party_key().to_bytes()),
-        manifest().content_id(),
-        [0x9e; 32],
-    )
-}
-
-fn bundle() -> PreparedPaidInputV1 {
-    PreparedPaidInputV1::new(
-        &evaluate_request(),
-        &manifest(),
-        &text_execution(),
-        &prompt_tokens(),
-        &text_policy(),
-        &identity_artifact(),
-    )
+fn bundle() -> PreparedInvocation {
+    hellas_channel::test_support::channel::bundle(0x9e)
 }
 
 fn deadlines() -> JobDeadlines {
@@ -1457,7 +1421,7 @@ fn deadlines() -> JobDeadlines {
 }
 
 fn authorization() -> PaidJobAuthorizationV2 {
-    match propose_authorization(
+    match hellas_channel::job::propose(
         descriptor().channel(),
         &work_policy(),
         &payment_policy(),
@@ -1473,7 +1437,7 @@ fn authorization() -> PaidJobAuthorizationV2 {
 /// One complete signed transcript for the fixture request.
 fn answer_transcript() -> Vec<OutputEventEnvelope> {
     hellas_channel::test_support::channel::transcript_for(
-        &evaluate_request(),
+        &bundle().request,
         &[101, 102, 103, 104, 105],
     )
 }
@@ -1497,20 +1461,11 @@ impl WorkBackend for AnsweringPaidBackend {
 
     async fn execute(
         &self,
-        prepared: hellas_channel::work::PreparedWorkInput,
+        input: hellas_channel::work::Admitted,
     ) -> Result<Vec<hellas_rpc::OutputEventEnvelope>, hellas_channel::work::BackendFault> {
-        let hellas_channel::work::PreparedWorkInput::Evaluate(input) = prepared else {
-            return Err(
-                hellas_channel::work::admission::AdmissionError::Unsupported(
-                    hellas_channel::work::admission::CapacityDomain::Fetch,
-                )
-                .into(),
-            );
-        };
-        let input = *input;
         assert_eq!(
-            input.evaluate_request().text_execution,
-            evaluate_request().text_execution,
+            input.invocation().request,
+            bundle().request,
             "the paid gate dispatches the request retained in the accepted bundle",
         );
         self.calls.fetch_add(1, Ordering::SeqCst);
@@ -1556,39 +1511,20 @@ impl WorkBackend for BlockingPaidBackend {
 
     async fn execute_stream(
         &self,
-        prepared: hellas_channel::work::PreparedWorkInput,
+        input: hellas_channel::work::Admitted,
         progress: hellas_channel::work::PaidProgress,
     ) -> Result<Vec<hellas_rpc::OutputEventEnvelope>, hellas_channel::work::BackendFault> {
-        let hellas_channel::work::PreparedWorkInput::Evaluate(input) = prepared else {
-            return Err(
-                hellas_channel::work::admission::AdmissionError::Unsupported(
-                    hellas_channel::work::admission::CapacityDomain::Fetch,
-                )
-                .into(),
-            );
-        };
-        let input = *input;
-        for event in answer_transcript() {
-            if event.event().body().kind() == hellas_rpc::evaluate::TOKEN_DELTA_EVENT_KIND {
-                progress(event)?;
-            }
+        let transcript = answer_transcript();
+        for event in &transcript[..transcript.len() - 1] {
+            progress(event.clone())?;
         }
-        self.execute(input.into()).await
+        self.execute(input).await
     }
 
     async fn execute(
         &self,
-        prepared: hellas_channel::work::PreparedWorkInput,
+        _input: hellas_channel::work::Admitted,
     ) -> Result<Vec<hellas_rpc::OutputEventEnvelope>, hellas_channel::work::BackendFault> {
-        let hellas_channel::work::PreparedWorkInput::Evaluate(input) = prepared else {
-            return Err(
-                hellas_channel::work::admission::AdmissionError::Unsupported(
-                    hellas_channel::work::admission::CapacityDomain::Fetch,
-                )
-                .into(),
-            );
-        };
-        let _input = *input;
         self.entered.add_permits(1);
         match self.release.acquire().await {
             Ok(permit) => permit.forget(),
@@ -1599,9 +1535,8 @@ impl WorkBackend for BlockingPaidBackend {
 }
 
 async fn commit(store: &mut ChannelStore, record: ChannelRecord) {
-    if let Err(error) = store.commit(record, &Secp256k1Verifier::new()).await {
-        panic!("the fixture channel record commits: {error}");
-    }
+    // Also stages the declared program content a provider holds after upload.
+    hellas_channel::test_support::channel::commit(store, record).await;
 }
 
 /// The provider journal a process can find after crashing between its
@@ -1616,7 +1551,7 @@ async fn write_accepted_channel(root: &Path) -> Digest {
         ChannelRecord::JobProposed {
             authorization: job,
             client_signature: client().sign(signing_hash(id)),
-            prepared_input: match bundle().encode() {
+            prepared_input: match bundle().canonical_bytes() {
                 Ok(bytes) => bytes,
                 Err(error) => panic!("the fixture bundle encodes: {error}"),
             },
@@ -1650,7 +1585,7 @@ async fn write_contested_channel(root: &Path) -> StartId {
         ChannelRecord::JobProposed {
             authorization: job,
             client_signature: client().sign(signing_hash(id)),
-            prepared_input: match bundle().encode() {
+            prepared_input: match bundle().canonical_bytes() {
                 Ok(bytes) => bytes,
                 Err(error) => panic!("the fixture bundle encodes: {error}"),
             },
@@ -1667,7 +1602,13 @@ async fn write_contested_channel(root: &Path) -> StartId {
     .await;
     commit(&mut store, ChannelRecord::JobRunning { work_id: id }).await;
     let transcript = answer_transcript();
-    let result = match terminal_result(&channel, &job, &transcript) {
+    let result = match hellas_channel::job::paid_terminal_result(
+        &channel,
+        &job,
+        &work_policy(),
+        &bundle(),
+        &transcript,
+    ) {
         Ok(result) => result,
         Err(error) => panic!("the fixture result derives: {error}"),
     };
@@ -1694,6 +1635,10 @@ async fn write_contested_channel(root: &Path) -> StartId {
         ChannelRecord::JobTerminated {
             work_id: id,
             outcome: TerminalOutcome::Certified {
+                signed_result: Box::new((
+                    result,
+                    provider().sign(signing_hash(result_digest(&channel, &result))),
+                )),
                 certificate,
                 binding: Box::new(binding),
                 binding_signature: client()
@@ -2656,28 +2601,12 @@ impl OfferFixture {
         }
     }
 
-    fn evaluate_request(self) -> EvaluateRequest {
-        hellas_channel::test_support::channel::evaluate_request_for(
-            text_execution().input_id().digest(),
-            PublicKey::Secp256k1(self.client().party_key().to_bytes()),
-            manifest().content_id(),
-            [self.client_seed; 32],
-        )
-    }
-
-    fn prepared_bundle(self) -> PreparedPaidInputV1 {
-        PreparedPaidInputV1::new(
-            &self.evaluate_request(),
-            &manifest(),
-            &text_execution(),
-            &prompt_tokens(),
-            &text_policy(),
-            &identity_artifact(),
-        )
+    fn prepared_bundle(self) -> PreparedInvocation {
+        hellas_channel::test_support::channel::bundle(self.client_seed)
     }
 
     fn authorization(self) -> PaidJobAuthorizationV2 {
-        match propose_authorization(
+        match hellas_channel::job::propose(
             self.descriptor().channel(),
             &work_policy(),
             &payment_policy(),
@@ -2699,7 +2628,7 @@ impl OfferFixture {
             )),
             authorization: authorization.encode(),
             client_signature: self.client().sign(signing_hash(id)).as_bytes().to_vec(),
-            prepared_input: match self.prepared_bundle().encode() {
+            prepared_input: match self.prepared_bundle().canonical_bytes() {
                 Ok(bytes) => bytes,
                 Err(error) => panic!("the routed prepared input encodes: {error}"),
             },
@@ -2873,7 +2802,7 @@ fn signed_accept_request() -> AcceptWorkRequest {
         )),
         authorization: authorization.encode(),
         client_signature: client().sign(signing_hash(id)).as_bytes().to_vec(),
-        prepared_input: match bundle().encode() {
+        prepared_input: match bundle().canonical_bytes() {
             Ok(bytes) => bytes,
             Err(error) => panic!("the prepared fixture input encodes: {error}"),
         },
@@ -2898,8 +2827,7 @@ struct RunningPaidNode {
 }
 
 impl RunningPaidNode {
-    async fn start(root: &Path, policy: ProviderChannelPolicy, source: NodeChain) -> Self {
-        let approved_environment = policy.work_policy.allowed_environment();
+    async fn start(root: &Path, source: NodeChain) -> Self {
         let setup_mount = MountedSetup::default();
         let execution_calls = Arc::new(AtomicUsize::new(0));
         let peer = PeerId::from_bytes(*SecretKey::from_bytes(&[0x62; 32]).public().as_bytes());
@@ -2934,7 +2862,6 @@ impl RunningPaidNode {
         let transport_key = SecretKey::from_bytes(&[0x63; 32]);
         let open = test_remote_execution();
         let trust = hellas_client::ProviderTrustAnchor {
-            allowed_environments: vec![approved_environment],
             expected_genesis: open.enrollment.content_id(),
             required_assurance: Assurance::ProducerSigned,
             apple_app_attest: None,
@@ -3114,7 +3041,16 @@ impl RunningPaidNode {
         response
     }
 
-    async fn deliver_result(&self, work_id: Digest) -> DeliverResultResponse {
+    /// One streamed delivery attempt: `None` while the provider reports
+    /// its retryable `NotReady`, else the signed terminal and the events.
+    async fn stream_result(
+        &self,
+        work_id: Digest,
+    ) -> Option<(
+        hellas_rpc::pb::work::WorkStreamTerminal,
+        Vec<OutputEventEnvelope>,
+    )> {
+        use hellas_rpc::pb::work::work_stream_event;
         let (transport, connection) = self.connect(<Work as ServiceMarker>::ALPN.as_bytes()).await;
         let exporter = match transport.open_exporter() {
             Ok(exporter) => exporter,
@@ -3135,13 +3071,39 @@ impl RunningPaidNode {
                 .to_vec(),
         };
         let client = WorkClientImpl::new(transport);
-        let response = match client.deliver_result(request).await {
-            Ok(response) => response,
+        let mut stream = match client.stream_result(request).await {
+            Ok(stream) => stream,
             Err(error) => panic!("Work delivery reaches the node: {error}"),
         };
+        let mut events = Vec::new();
+        let mut delivered = None;
+        while let Some(frame) = stream.next().await {
+            let frame = frame.unwrap_or_else(|error| panic!("the result stream frames: {error}"));
+            let bytes = match frame.outcome {
+                Some(work_stream_event::Outcome::Prefix(bytes)) => bytes,
+                Some(work_stream_event::Outcome::Terminal(terminal)) => {
+                    let bytes = terminal.terminal_transcript.clone();
+                    delivered = Some(terminal);
+                    bytes
+                }
+                Some(work_stream_event::Outcome::Refused(refusal))
+                    if refusal.code == WorkRefusalCode::NotReady as i32 =>
+                {
+                    break;
+                }
+                outcome => panic!(
+                    "the accepted job remains retryable until its result is ready, got {outcome:?}",
+                ),
+            };
+            match decode_transcript(&bytes, usize::MAX) {
+                Ok(batch) => events.extend(batch),
+                Err(error) => panic!("the delivered transcript decodes: {error}"),
+            }
+        }
+        drop(stream);
         drop(client);
         connection.close(0_u32.into(), b"work delivery complete");
-        response
+        delivered.map(|terminal| (terminal, events))
     }
 
     /// Polls through the wire's retryable `NotReady` until the detached
@@ -3149,30 +3111,21 @@ impl RunningPaidNode {
     async fn wait_for_result(&self, work_id: Digest) -> Vec<OutputEventEnvelope> {
         let delivered = tokio::time::timeout(TEST_TIMEOUT, async {
             loop {
-                let response = self.deliver_result(work_id).await;
-                match response.outcome {
-                    Some(deliver_result_response::Outcome::Delivered(delivered)) => {
-                        break delivered;
-                    }
-                    Some(deliver_result_response::Outcome::Refused(refusal))
-                        if refusal.code == WorkRefusalCode::NotReady as i32 =>
-                    {
-                        tokio::task::yield_now().await;
-                    }
-                    outcome => panic!(
-                        "the accepted job remains retryable until its result is ready, got {outcome:?}",
-                    ),
+                if let Some(delivered) = self.stream_result(work_id).await {
+                    break delivered;
                 }
+                tokio::task::yield_now().await;
             }
         })
         .await;
-        let delivered = match delivered {
-            Ok(delivered) => delivered,
-            Err(_) => panic!("the accepted job's result reaches the client"),
+        let Ok((delivered, transcript)) = delivered else {
+            panic!("the accepted job's result reaches the client")
         };
-        let expected = match terminal_result(
+        let expected = match hellas_channel::job::paid_terminal_result(
             descriptor().channel(),
             &authorization(),
+            &work_policy(),
+            &bundle(),
             &answer_transcript(),
         ) {
             Ok(result) => result,
@@ -3193,11 +3146,7 @@ impl RunningPaidNode {
                 .as_bytes(),
             "the result reaches the client with this provider's signature",
         );
-        let budget = usize::try_from(work_policy().max_spool_bytes).unwrap_or(usize::MAX);
-        match decode_transcript(&delivered.transcript, budget) {
-            Ok(transcript) => transcript,
-            Err(error) => panic!("the delivered transcript decodes: {error}"),
-        }
+        transcript
     }
 
     async fn wait_for_mount(&self) {
@@ -3269,7 +3218,7 @@ async fn run_advertised_paid_exchange(
 ) {
     seed_provider_offer(root, PaymentAdmission::Admits(Box::new(policy.clone()))).await;
     let source = NodeChain::new();
-    let node = RunningPaidNode::start(root, policy.clone(), source.clone()).await;
+    let node = RunningPaidNode::start(root, source.clone()).await;
     assert!(
         node.setup_mount
             .service(&node.context(), bond_edge())
@@ -3754,17 +3703,24 @@ fn the_clock_resumes_an_accepted_job_after_restart() {
             .handler(&context, request.route.as_ref())
             .unwrap()
             .expect("restarted channel is mounted");
-        let response: WithTrailer<DeliverResultResponse> = tokio::time::timeout(
-            TEST_TIMEOUT,
-            handler.deliver_result(request.clone(), context.clone()),
-        )
+        let delivered = tokio::time::timeout(TEST_TIMEOUT, async {
+            let mut stream = handler
+                .stream_result(request.clone(), context.clone())
+                .await
+                .expect("delivery succeeds");
+            let mut last = None;
+            while let Some(event) = stream.next().await {
+                last = Some(event.expect("delivery succeeds").outcome);
+            }
+            last
+        })
         .await
-        .expect("retained result is immediately collectable")
-        .expect("delivery succeeds")
-        .into();
+        .expect("retained result is immediately collectable");
         assert!(matches!(
-            response.response.outcome,
-            Some(deliver_result_response::Outcome::Delivered(_))
+            delivered,
+            Some(Some(
+                hellas_rpc::pb::work::work_stream_event::Outcome::Terminal(_)
+            ))
         ));
         assert_eq!(
             calls.load(Ordering::SeqCst),
@@ -3774,12 +3730,13 @@ fn the_clock_resumes_an_accepted_job_after_restart() {
 
         chain.set_snapshot(ready_channel_snapshot(ORIGIN, Some(pending_contest(false))));
         assert!(restarted.tick(&chain).await);
-        let response: WithTrailer<DeliverResultResponse> = handler
-            .deliver_result(request, context)
+        let mut stream = handler
+            .stream_result(request, context)
             .await
-            .expect("refusal is answered")
-            .into();
-        let Some(deliver_result_response::Outcome::Refused(refusal)) = response.response.outcome
+            .expect("refusal is answered");
+        let Some(Ok(hellas_rpc::pb::work::WorkStreamEvent {
+            outcome: Some(hellas_rpc::pb::work::work_stream_event::Outcome::Refused(refusal)),
+        })) = stream.next().await
         else {
             panic!("cached readiness must not release data after a finalized contest");
         };
@@ -4182,14 +4139,15 @@ async fn one_peer_routes_distinct_channels_without_crossing_journals() {
             .as_bytes()
             .to_vec(),
     };
-    let response: WithTrailer<DeliverResultResponse> = mounted
-        .deliver_result(delivery, context.clone())
+    let mut delivery = mounted
+        .stream_result(delivery, context.clone())
         .await
-        .unwrap()
-        .into();
+        .unwrap();
     assert!(matches!(
-        response.response.outcome,
-        Some(deliver_result_response::Outcome::Refused(_))
+        delivery.next().await,
+        Some(Ok(hellas_rpc::pb::work::WorkStreamEvent {
+            outcome: Some(hellas_rpc::pb::work::work_stream_event::Outcome::Refused(_)),
+        }))
     ));
     let certificate = AdmitCertificateRequest {
         route: Some(WorkRoute::payment(second.descriptor().channel().id())),
@@ -4281,7 +4239,7 @@ async fn provider_startup_preserves_explicit_allowances_and_machine_limits() {
             account: hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test account")),
             revision: hellas_auth::authority::Revision(1),
             name: "initial".into(),
-            work: work_policy().into(),
+            invocation_policy: work_policy(),
             https: None,
             pricing: hellas_authority::model::grant::pricing::Pricing {
                 revision: hellas_auth::authority::Revision(1),
@@ -4307,7 +4265,7 @@ async fn provider_startup_preserves_explicit_allowances_and_machine_limits() {
         account: hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test account")),
         revision: hellas_auth::authority::Revision(1),
         name: "evaluate".into(),
-        work: work_policy().into(),
+        invocation_policy: work_policy(),
         https: None,
         pricing: hellas_authority::model::grant::pricing::Pricing {
             revision: hellas_auth::authority::Revision(1),
@@ -4317,7 +4275,7 @@ async fn provider_startup_preserves_explicit_allowances_and_machine_limits() {
     }];
     for options in [config(), changed, config()] {
         let node = options
-            .open(ProviderResources::EvaluateAndFetch(&routes), &provider)
+            .open(ProviderResources::ComputeAndFetch(&routes), &provider)
             .await
             .unwrap();
         let caller = hellas_authority::test_support::session(&node, &secret).await;
@@ -4368,7 +4326,6 @@ async fn grant_and_paid_work_share_a_peer_but_never_a_journal() {
     use {
         hellas_authority::model::grant, hellas_authority::model::grant::budget::*,
         hellas_authority::model::grant::records::*,
-        hellas_channel::model::profile::PreparedWorkInput,
     };
     #[derive(Clone)]
     struct Backend {
@@ -4386,27 +4343,15 @@ async fn grant_and_paid_work_share_a_peer_but_never_a_journal() {
         }
         async fn execute(
             &self,
-            prepared: hellas_channel::work::PreparedWorkInput,
+            input: hellas_channel::work::Admitted,
         ) -> Result<Vec<hellas_rpc::OutputEventEnvelope>, hellas_channel::work::BackendFault>
         {
-            let hellas_channel::work::PreparedWorkInput::Evaluate(input) = prepared else {
-                return Err(
-                    hellas_channel::work::admission::AdmissionError::Unsupported(
-                        hellas_channel::work::admission::CapacityDomain::Fetch,
-                    )
-                    .into(),
-                );
-            };
-            let input = *input;
-            let (_, admission) = input.into_parts_and_admission();
-            let _running = admission
-                .reserve(
-                    hellas_channel::work::admission::CapacityDomain::Gpu,
-                    async { self.try_admit(hellas_channel::work::admission::CapacityDomain::Gpu) },
-                )
+            let domain = input.capacity_domain();
+            let (_, _, _, admission) = input
+                .reserve(async { self.try_admit(domain) })
                 .await?
-                .dispatch()
-                .await?;
+                .into_parts_and_admission();
+            let _running = admission.dispatch().await?;
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(answer_transcript())
         }
@@ -4458,7 +4403,7 @@ async fn grant_and_paid_work_share_a_peer_but_never_a_journal() {
             account: hellas_auth::authority::ResourceId(hellas_auth::Digest::hash(b"test account")),
             revision: hellas_auth::authority::Revision(1),
             name: "native".into(),
-            work: work_policy().into(),
+            invocation_policy: work_policy(),
             https: None,
             pricing: hellas_authority::model::grant::pricing::Pricing {
                 revision: hellas_auth::authority::Revision(1),
@@ -4495,7 +4440,9 @@ async fn grant_and_paid_work_share_a_peer_but_never_a_journal() {
         .state()
         .channel_id(id, hellas_channel::test_support::channel_client(grantee))
         .unwrap();
-    let input = PreparedWorkInput::Evaluate(bundle());
+    // Grant work is memory-only.
+    let mut input = bundle();
+    input.request.retain = false;
     let auth = grant::GrantJobAuthorizationV1 {
         channel_id: channel,
         generation: store.state().generation(id).unwrap(),
@@ -4506,19 +4453,23 @@ async fn grant_and_paid_work_share_a_peer_but_never_a_journal() {
         pricing_revision: store.state().grant(id).unwrap().policies[0]
             .pricing
             .revision,
-        work_policy_digest: store.state().grant(id).unwrap().policies[0]
-            .work
-            .digest(network, channel.0),
-        input_content: hellas_rpc::ContentRef::for_bytes(&input.encode().unwrap()),
-        prepared_input_digest: input.bound_digest(network, channel.0).unwrap(),
+        work_policy_digest: hellas_channel::job::policy_digest(
+            network,
+            channel.0,
+            &store.state().grant(id).unwrap().policies[0].invocation_policy,
+        )
+        .unwrap(),
+        input_content: hellas_rpc::ContentRef::for_bytes(&input.canonical_bytes().unwrap()),
+        prepared_input_digest: hellas_channel::job::bound_prepared_input_digest(
+            network, channel.0, &input,
+        )
+        .unwrap(),
         proposal_nonce: 1,
         acceptance_deadline_ms: hellas_auth::authority::UnixMillis(now.0 + 1000),
         terminal_deadline_ms: hellas_auth::authority::UnixMillis(now.0 + 5000),
         delivery_deadline_ms: hellas_auth::authority::UnixMillis(now.0 + 10000),
-        request_commitment: hellas_rpc::RequestCommitment::from_digest(
-            input.input_commitment().unwrap().digest(),
-        ),
-        environment_commitment: work_policy().allowed_environment,
+        request_commitment: input.request.commitment().unwrap(),
+        environment_commitment: input.request.execution_environment,
     };
     let request = AcceptWorkRequest {
         route: Some(hellas_rpc::pb::work::WorkRoute::grant(channel.0)),
@@ -4528,7 +4479,7 @@ async fn grant_and_paid_work_share_a_peer_but_never_a_journal() {
             .unwrap()
             .bytes()
             .to_vec(),
-        prepared_input: input.encode().unwrap(),
+        prepared_input: input.canonical_bytes().unwrap(),
     };
     let policies = store.state().grant(id).unwrap().policies.clone();
     let service = GrantService::new(

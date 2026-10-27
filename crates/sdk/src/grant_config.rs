@@ -1,4 +1,4 @@
-//! Local resource configuration shares exactly the paid WorkPolicy parser.
+//! Local resource configuration shares exactly the paid InvocationPolicy parser.
 //! Grants and their counters remain runtime state in the provider journal.
 use crate::resource_config::ResourceConfigError;
 use hellas_auth::authority::{ResourceId, Revision};
@@ -160,7 +160,7 @@ mod tests {
     #[test]
     fn resource_configuration_cannot_override_budgets() {
         let policy = hellas_authority::test_support::policy();
-        let baseline = json!({"resource":policy.resource, "account":policy.account, "revision":policy.revision, "name":policy.name, "pricing":policy.pricing});
+        let baseline = json!({"resource":policy.resource, "account":policy.account, "revision":policy.revision, "name":policy.name, "pricing":policy.pricing, "invocation_policy":policy.invocation_policy});
         serde_json::from_value::<ResourceFile>(baseline.clone()).unwrap();
         for field in ["budget", "limits", "allowances", "permissions"] {
             let mut resource = baseline.clone();
@@ -270,26 +270,10 @@ mod tests {
             usd_micros: 3,
             units: NonZeroU64::new(4).unwrap(),
         }]);
-        let hellas_channel::model::profile::WorkPolicy::Fetch {
-            policy, contract, ..
-        } = &expected.work
-        else {
-            panic!("Fetch fixture");
-        };
         let config = json!({"max_job_millis":10000,"resources":[{
             "resource":expected.resource,"account":expected.account,"revision":expected.revision,
             "name":expected.name,"responses":expected.responses,"pricing":expected.pricing,
-            "fetch":{
-                "contract":contract,
-                "allowed_environment":policy.allowed_environment.to_string(),
-                "service":"openai","method":"responses",
-                "max_request_body_bytes":policy.max_request_body_bytes,
-                "max_output_events":policy.max_output_events,"max_output_bytes":policy.max_output_bytes,
-                "max_spool_bytes":policy.max_spool_bytes,
-                "max_encoded_result_frame":policy.max_encoded_result_frame,
-                "max_encoded_prepared_input":policy.max_encoded_prepared_input,
-                "max_upload_bytes":policy.max_upload_bytes
-            }
+            "invocation_policy":expected.invocation_policy
         }]});
         std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
         let parsed = GrantConfig::load(&path, Some(directory.path())).unwrap();

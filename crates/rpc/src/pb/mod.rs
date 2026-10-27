@@ -33,7 +33,6 @@ pub mod hellas {
         }
     }
 
-
     #[cfg(feature = "chain")]
     #[allow(dead_code)]
     pub mod chain {
@@ -64,7 +63,6 @@ pub mod hellas {
 pub mod execute {
     pub use crate::pb::hellas::v1::*;
 }
-
 
 /// Re-exports of `hellas.fetch.v1`.
 #[cfg(feature = "fetch")]

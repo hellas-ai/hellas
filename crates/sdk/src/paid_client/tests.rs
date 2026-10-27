@@ -9,8 +9,7 @@ use hellas_wire::{MethodMarker, StreamTransport, WireStatus};
 
 #[test]
 fn insufficient_quoted_collateral_is_rejected_before_a_bond_request_or_journal() {
-    let (mut policy, _, _) =
-        fetch_request(Assurance::ProducerSigned, hellas_rpc::Retention::Ephemeral);
+    let (mut policy, _, _) = fetch_request(Assurance::ProducerSigned);
     policy.expected_payment_values =
         hellas_kernel::EdgeValues::new(1000, 0, hellas_kernel::Fees::ZERO);
     let fixture = crate::test_support::PaidFixture::new();
@@ -106,7 +105,6 @@ async fn both_paid_connections_open_before_disclosure_and_refuse_wrong_assurance
             .unwrap();
         let (bundle, key) = enrollment(server.id());
         let trust = hellas_client::ProviderTrustAnchor {
-            allowed_environments: vec![],
             expected_genesis: bundle.content_id(),
             required_assurance: Assurance::ProducerSigned,
             apple_app_attest: None,
@@ -223,30 +221,35 @@ fn recovery_skips_only_permanent_delivery_refusals() {
     }));
 }
 
-fn fetch_request(
+fn fetch_events(
     assurance: Assurance,
     retention: hellas_rpc::Retention,
-) -> (ProviderChannelPolicy, PreparedWorkInput, PublicKey) {
-    use hellas_channel::model::fetch::{
-        FetchPolicyV2, FetchRoutePolicy, PreparedPaidFetchInputV1, fetch_route_commitment,
-    };
-    use hellas_channel::model::work::PaidChannelPolicyV1;
-    let environment = test_responses_contract();
-    let caller = ProducerSigningKey::from_secret_bytes([7; 32]).unwrap();
-    let events = hellas_rpc::fetch::build_input_events_with_retention(
+) -> Vec<hellas_rpc::InputEventEnvelope> {
+    hellas_rpc::fetch::build_input_events_with_retention(
         "openai",
         "responses",
         br#"{"input":"private request"}"#,
-        environment.manifest_id(),
+        test_responses_contract().manifest_id(),
         assurance,
-        &caller,
+        &ProducerSigningKey::from_secret_bytes([7; 32]).unwrap(),
         retention,
     )
+    .unwrap()
+}
+
+fn fetch_request(assurance: Assurance) -> (ProviderChannelPolicy, PreparedInvocation, PublicKey) {
+    use hellas_channel::model::work::PaidChannelPolicyV1;
+    let invocation_policy = crate::test_support::work_policy();
+    let prepared = hellas_rpc::protocol::invocation::fetch::prepare(
+        &fetch_events(assurance, hellas_rpc::Retention::Ephemeral),
+        &test_responses_contract(),
+        ProducerSigningKey::from_secret_bytes([2; 32])
+            .unwrap()
+            .public_key(),
+        invocation_policy.canonical_bytes().unwrap(),
+        [1; 32],
+    )
     .unwrap();
-    let prepared = PreparedPaidFetchInputV1::new(&events, &environment)
-        .unwrap()
-        .into();
-    let route = FetchRoutePolicy::sealed_route("openai", "responses").unwrap();
     let policy = ProviderChannelPolicy {
         payment_policy: payment_policy(),
         network: hellas_kernel::NetworkId::new("paid-client-test").unwrap(),
@@ -255,21 +258,7 @@ fn fetch_request(
             compute_credit_limit: 40,
             delivery_credit_limit: 40,
         },
-        work_policy: WorkPolicy::Fetch {
-            contract: environment.clone(),
-            policy: FetchPolicyV2 {
-                allowed_environment: environment.manifest_id(),
-                route_commitment: fetch_route_commitment(&route.canonical_body_bytes()).unwrap(),
-                max_request_body_bytes: 4096,
-                max_output_events: 64,
-                max_output_bytes: 16384,
-                max_spool_bytes: 65536,
-                max_encoded_result_frame: 65536,
-                max_encoded_prepared_input: 65536,
-                max_upload_bytes: 65536,
-            },
-            route,
-        },
+        invocation_policy,
         expected_payment_values: hellas_kernel::EdgeValues::new(
             1000,
             200,
@@ -277,15 +266,17 @@ fn fetch_request(
         ),
         min_omit_response_blocks: hellas_kernel::MIN_OMIT_RESPONSE_BLOCKS,
     };
-    (policy, prepared, caller.public_key())
+    let caller = ProducerSigningKey::from_secret_bytes([7; 32])
+        .unwrap()
+        .public_key();
+    (policy, prepared, caller)
 }
 
 #[test]
 fn fetch_preflight_requires_matching_trust_caller_and_ephemeral_retention() {
     use hellas_rpc::Retention;
-    let (policy, prepared, caller) = fetch_request(Assurance::AppleAppAttest, Retention::Ephemeral);
+    let (policy, prepared, caller) = fetch_request(Assurance::AppleAppAttest);
     let mut trust = hellas_client::ProviderTrustAnchor {
-        allowed_environments: vec![policy.work_policy.allowed_environment()],
         expected_genesis: hellas_rpc::ContentId::from_bytes([8; 32]),
         required_assurance: Assurance::ProducerSigned,
         apple_app_attest: None,
@@ -306,18 +297,23 @@ fn fetch_preflight_requires_matching_trust_caller_and_ephemeral_retention() {
         check_request(&policy, &prepared, &trust, other)
             .unwrap_err()
             .to_string()
-            .contains("Fetch caller")
+            .contains("differs from its invocation")
     );
-    let (policy, prepared, caller) = fetch_request(Assurance::ProducerSigned, Retention::Ephemeral);
+    let (policy, prepared, caller) = fetch_request(Assurance::ProducerSigned);
     trust.required_assurance = Assurance::ProducerSigned;
     check_request(&policy, &prepared, &trust, caller).unwrap();
-    assert_eq!(prepared.assurance().unwrap(), Assurance::ProducerSigned);
-    let (policy, retained, caller) = fetch_request(Assurance::ProducerSigned, Retention::Retain);
+    assert_eq!(prepared.request.assurance, Assurance::ProducerSigned);
     assert!(
-        check_request(&policy, &retained, &trust, caller)
-            .unwrap_err()
-            .to_string()
-            .contains("ephemeral")
+        hellas_rpc::protocol::invocation::fetch::prepare(
+            &fetch_events(Assurance::ProducerSigned, Retention::Retain),
+            &test_responses_contract(),
+            caller,
+            policy.invocation_policy.canonical_bytes().unwrap(),
+            [1; 32],
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("ephemeral")
     );
 }
 

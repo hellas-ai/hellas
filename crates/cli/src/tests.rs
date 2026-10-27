@@ -3,10 +3,6 @@ use super::*;
 #[cfg(unix)]
 mod machines;
 
-const TEST_ENVIRONMENT: &str = "/path/to/model.environment";
-const TEST_MANIFEST_ID: &str = "4444444444444444444444444444444444444444444444444444444444444444";
-const TEST_TOKENIZER: &str = "/path/to/tokenizer.json";
-const TEST_CONTENT: &str = "/path/to/model.hex";
 const TEST_REMOTE_TRUST_ARGS: &[&str] = &[
     "--trust-store",
     "/state/trust",
@@ -36,36 +32,11 @@ fn fetch_environment_cases() -> [(&'static str, hellas_rpc::ContentId); 1] {
 }
 
 fn parse_gateway(args: &[&str]) -> Result<Cli, clap::Error> {
-    let local_content: &[&str] = if args.contains(&"--local") {
-        &[
-            "--content",
-            TEST_CONTENT,
-            "--local-grant",
-            "07070707070707070707070707070707",
-        ]
-    } else {
-        &[]
-    };
     Cli::try_parse_from(
-        [
-            "hellas",
-            "gateway",
-            "--environment",
-            TEST_ENVIRONMENT,
-            "--tokenizer",
-            TEST_TOKENIZER,
-        ]
-        .into_iter()
-        .chain(local_content.iter().copied())
-        .chain(args.iter().copied()),
+        ["hellas", "gateway"]
+            .into_iter()
+            .chain(args.iter().copied()),
     )
-}
-
-fn causal_lm_args(command: Commands) -> CausalLmArgs {
-    match command {
-        Commands::Gateway { causal_lm, .. } => causal_lm.expect("causal-LM arguments"),
-        _ => panic!("expected causal-LM command"),
-    }
 }
 
 #[test]
@@ -86,17 +57,19 @@ fn identity_free_commands_reject_global_identity_options() {
             "hellas",
             "--identity",
             "unused.identity",
-            "environment",
-            "inspect",
-            "--environment",
-            "model.environment",
+            "offer",
+            "import",
+            "provider.offer",
+            "--name",
+            "provider",
         ],
         vec![
             "hellas",
-            "environment",
-            "inspect",
-            "--environment",
-            "model.environment",
+            "offer",
+            "import",
+            "provider.offer",
+            "--name",
+            "provider",
             "--software-root",
         ],
     ] {
@@ -188,28 +161,6 @@ fn gateway_accepts_remote_trust_policy() {
 }
 
 #[test]
-fn gateway_accepts_the_optional_environment_pin() {
-    let pinned = causal_lm_args(
-        parse_gateway(&["--manifest-id", TEST_MANIFEST_ID])
-            .unwrap()
-            .command,
-    );
-    assert_eq!(
-        pinned.manifest_id,
-        Some(hellas_rpc::ContentId::from_bytes([0x44; 32]))
-    );
-}
-
-#[test]
-fn gateway_requires_explicit_environment_and_tokenizer() {
-    assert!(Cli::try_parse_from(["hellas", "gateway"]).is_err());
-    assert!(
-        Cli::try_parse_from(["hellas", "gateway", "--environment", TEST_ENVIRONMENT,]).is_err()
-    );
-    assert!(Cli::try_parse_from(["hellas", "gateway", "--tokenizer", TEST_TOKENIZER]).is_err());
-}
-
-#[test]
 fn http_gateway_requires_a_paid_pool() {
     assert!(
         Cli::try_parse_from(["hellas", "gateway", "--http-fetch-config", "/http.json"]).is_err()
@@ -225,25 +176,6 @@ fn http_gateway_requires_a_paid_pool() {
         ])
         .is_ok()
     );
-}
-
-#[test]
-fn gateway_model_is_only_an_optional_api_label() {
-    let args = causal_lm_args(parse_gateway(&["--model", "api-label"]).unwrap().command);
-    assert_eq!(args.model.as_deref(), Some("api-label"));
-    let args = causal_lm_args(parse_gateway(&[]).unwrap().command);
-    assert!(args.model.is_none());
-}
-
-fn gateway_trust(args: &[&str]) -> anyhow::Result<Option<hellas_client::ProviderTrustAnchor>> {
-    let cli = parse_gateway(args).expect("valid gateway arguments");
-    let Commands::Gateway {
-        responses_backend, ..
-    } = cli.command
-    else {
-        panic!("gateway");
-    };
-    gateway_provider_trust(responses_backend)
 }
 
 #[test]
@@ -310,12 +242,6 @@ fn serve_rejects_software_root_with_apple_assurance() {
         )
         .is_ok()
     );
-}
-
-#[test]
-fn gateway_accepts_explicit_stop_tokens() {
-    let cli = parse_gateway(&["--stop-token", "1,2", "--stop-token", "3"]).unwrap();
-    assert_eq!(causal_lm_args(cli.command).stop_token_ids, vec![1, 2, 3]);
 }
 
 #[test]
@@ -587,8 +513,9 @@ fn content_id_parser_round_trips_xet_text_encoding() {
         displayed
     );
 }
+
 #[test]
-fn proxy_cache_needs_no_causal_lm_files() {
+fn proxy_cache_needs_no_model_files() {
     let cli = Cli::try_parse_from([
         "hellas",
         "gateway",
@@ -598,37 +525,7 @@ fn proxy_cache_needs_no_causal_lm_files() {
         "replay-only",
     ])
     .unwrap();
-    assert!(matches!(
-        cli.command,
-        Commands::Gateway {
-            causal_lm: None,
-            ..
-        }
-    ));
-}
-
-#[test]
-fn unfunded_gateway_routes_require_a_work_backend() {
-    assert!(
-        gateway_trust(&["--responses-backend", "proxy"])
-            .unwrap()
-            .is_none()
-    );
-    for args in [
-        vec![],
-        vec![
-            "--responses-backend",
-            "fetch",
-            "--responses-fetch-execution-environment",
-            "a05c3a1d598166d4a85f6a6a0ff0302e71647b53109902ae5752f6bc04a1acac",
-        ],
-    ] {
-        let error = gateway_trust(&args).unwrap_err();
-        assert!(matches!(
-            error.downcast_ref::<hellas_client::ClientError>(),
-            Some(hellas_client::ClientError::FundingRequired)
-        ));
-    }
+    assert!(matches!(cli.command, Commands::Gateway { .. }));
 }
 
 #[test]
@@ -729,6 +626,3 @@ fn offer_gateway_accepts_independent_apple_trust_policy() {
         );
     }
 }
-
-#[cfg(feature = "evaluate")]
-mod evaluate;

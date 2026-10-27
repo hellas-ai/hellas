@@ -544,12 +544,6 @@ mod paid_shutdown_tests {
         fail: bool,
     }
     impl WorkExecutionBackend for Backend {
-        fn execute(
-            &self,
-            _: WorkExecutionRequest,
-        ) -> Result<WorkOutputStream<ExecutionEvent>, WorkGatewayError> {
-            unreachable!("shutdown does not submit new work")
-        }
         fn drain(&self) -> futures::future::BoxFuture<'_, Result<(), WorkShutdownError>> {
             Box::pin(async {
                 self.drained.store(true, Ordering::Relaxed);

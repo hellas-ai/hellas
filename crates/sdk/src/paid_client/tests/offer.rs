@@ -49,7 +49,6 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
             fixture.descriptor.bond_edge()
         );
         let trust = hellas_client::ProviderTrustAnchor {
-            allowed_environments: vec![fixture.policy.work_policy.allowed_environment()],
             expected_genesis: imported.offer().provider.content_id(),
             required_assurance: Assurance::ProducerSigned,
             apple_app_attest: None,
@@ -75,6 +74,12 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
         use {hellas_authority::test_support::definition, hellas_channel::test_support::network};
         let now = hellas_auth::authority::UnixMillis::now().unwrap_or_default();
         let grant = definition(GrantId([1; 16]), principal(1).0);
+        let grant_policy = grant.policies[0].invocation_policy.clone();
+        let grant_runner = hellas_auth::PublicKey::Secp256k1(
+            hellas_authority::model::grant::records::grant_producer(&bundle)
+                .unwrap()
+                .to_bytes(),
+        );
         let (store, secret) = crate::test_node::bootstrap_node_with_credential(
             &fixture.root.path().join("grants"),
             network(),
@@ -252,7 +257,7 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
             observer: None,
             needs_recovery: false,
         };
-        let error = session.run(Some(fixture.proposal().prepared_input), false, None).await.err().expect("interrupted before acknowledgement");
+        let error = session.run(Some(fixture.proposal().prepared_input), &hellas_channel::content::InvocationContent::Ephemeral(Default::default()), false, None).await.err().expect("interrupted before acknowledgement");
         assert!(matches!(error, PaidClientError::Payment(hellas_channel::work::PaymentError::Transport(status)) if status.code() == hellas_wire::WireCode::Cancelled));
         assert!(!first_upload.load(std::sync::atomic::Ordering::SeqCst));
         assert!(!first_certificate.load(std::sync::atomic::Ordering::SeqCst));
@@ -271,7 +276,7 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
         let client = ClientService::new(ClientEndpoint::recover(fixture.store(Role::Client).await, signer(1)).unwrap());
         client.observer().observe_ready(fixture.ready.clone(), ObservationTime::now(), Duration::from_secs(60)).await.unwrap();
         let mut session = PaidWorkSession { args, descriptor, policy, dialer, client, observer: None, needs_recovery: true };
-        let job = crate::job::Job::fetch(crate::test_support::PRICE, match &fixture.policy.work_policy { WorkPolicy::Fetch { contract, .. } => contract.clone(), _ => unreachable!() }, "openai".into(), "responses".into(), crate::test_support::BODY.to_vec(), Assurance::ProducerSigned).unwrap();
+        let job = crate::job::Job::fetch(crate::test_support::PRICE, hellas_channel::test_support::test_responses_contract(), "openai".into(), "responses".into(), crate::test_support::BODY.to_vec(), Assurance::ProducerSigned).unwrap();
         let result = crate::transact::transact(&mut session, &job, &ProducerSigningKey::from_secret_bytes([1; 32]).unwrap(), crate::transact::TransactionOptions {new_purchase: true, ..Default::default()}).await.unwrap();
         assert_ne!(result.work_id, first);
         assert_eq!(result.credited_cumulative, 2 * crate::test_support::PRICE);
@@ -296,8 +301,35 @@ async fn paid_offer_pins_open_and_runs_a_job_while_wrong_pin_and_missing_open_re
         )
         .await
         .unwrap();
+        let hellas_rpc::protocol::invocation::Admission::Fetch { admission } =
+            &grant_policy.admissions[0]
+        else {
+            panic!("Fetch grant fixture")
+        };
+        let grant_input = hellas_rpc::protocol::invocation::fetch::prepare(
+            &hellas_rpc::fetch::build_input_events_with_retention(
+                "openai",
+                "responses",
+                crate::test_support::BODY,
+                admission.contract.manifest_id(),
+                Assurance::ProducerSigned,
+                &principal(1).1,
+                hellas_rpc::Retention::Ephemeral,
+            )
+            .unwrap(),
+            &admission.contract,
+            grant_runner,
+            grant_policy.canonical_bytes().unwrap(),
+            [3; 32],
+        )
+        .unwrap();
         let result = authorized
-            .run("responses", fixture.proposal().prepared_input, None)
+            .run(
+                "responses",
+                grant_input,
+                &hellas_channel::content::InvocationContent::Ephemeral(Default::default()),
+                None,
+            )
             .await
             .unwrap();
         assert!(!result.events.is_empty());

@@ -303,13 +303,6 @@ impl ResellerBuilder {
         )
         .unwrap()
         .pin(&hellas_sdk::client::ProviderTrustAnchor {
-            allowed_environments: offer
-                .offer()
-                .grant
-                .policies
-                .iter()
-                .map(|p| p.work.allowed_environment())
-                .collect(),
             expected_genesis: provider_bundle.content_id(),
             required_assurance: Assurance::ProducerSigned,
             apple_app_attest: None,
