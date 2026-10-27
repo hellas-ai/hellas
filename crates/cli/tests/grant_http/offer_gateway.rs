@@ -659,7 +659,18 @@ async fn gateway_control_issues_and_revokes_live_credentials() {
         if let Some(token) = token {
             request = request.bearer_auth(token);
         }
-        request.send().await.unwrap().status()
+        let response = request.send().await.unwrap();
+        let status = response.status();
+        if status.is_server_error() {
+            assert_http_response(
+                response,
+                reqwest::StatusCode::OK,
+                &[&process.log, &host.node.log],
+                &host.https,
+            )
+            .await;
+        }
+        status
     };
     assert_eq!(status(None).await, reqwest::StatusCode::UNAUTHORIZED);
     assert_eq!(status(Some(&first)).await, reqwest::StatusCode::OK);

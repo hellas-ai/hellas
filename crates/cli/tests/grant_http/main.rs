@@ -188,7 +188,7 @@ impl Cli {
             .args(args)
             .env("HELLAS_GRANT_DATA_DIR", self.root.join("grants"))
             .env("HELLAS_STORE_DIR", self.root.join("store"))
-            .env("RUST_LOG", "hellas_gateway=info")
+            .env("RUST_LOG", "warn,hellas_gateway=info")
             .env("OTEL_SDK_DISABLED", "true")
             .stdin(Stdio::null())
             .kill_on_drop(true);
@@ -595,4 +595,34 @@ fn approve(
 }
 async fn post(client: &reqwest::Client, url: &str, body: Value) -> reqwest::Response {
     client.post(url).json(&body).send().await.unwrap()
+}
+
+async fn assert_http_response(
+    response: reqwest::Response,
+    expected: reqwest::StatusCode,
+    logs: &[&Path],
+    upstream: &Https,
+) -> String {
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = response.text().await.unwrap();
+    if status != expected {
+        let logs: Vec<_> = logs
+            .iter()
+            .map(|path| {
+                format!(
+                    "{}:\n{}",
+                    path.display(),
+                    std::fs::read_to_string(path).unwrap()
+                )
+            })
+            .collect();
+        panic!(
+            "HTTP {status}, expected {expected}\nheaders: {headers:?}\nbody: {body}\nupstream {}: {} requests\n{}",
+            upstream.origin,
+            upstream.calls.load(Ordering::SeqCst),
+            logs.join("\n")
+        );
+    }
+    body
 }
