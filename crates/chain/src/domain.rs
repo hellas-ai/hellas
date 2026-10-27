@@ -281,14 +281,12 @@ pub fn genesis_object_id(validator_index: u16) -> ObjectId {
 
 /// Returns the chain object id for a kernel coin id.
 #[must_use]
-#[cfg(any(feature = "indexer", feature = "validator"))]
-pub(crate) fn coin_object_id(id: hellas_kernel::CoinId) -> ObjectId {
+pub fn coin_object_id(id: hellas_kernel::CoinId) -> ObjectId {
     ObjectId::from(id.to_bytes())
 }
 
 /// Returns the chain object id for a kernel edge id.
 #[must_use]
-#[cfg(any(feature = "indexer", feature = "validator"))]
 pub(crate) fn edge_object_id(id: hellas_kernel::EdgeId) -> ObjectId {
     ObjectId::from(id.to_bytes())
 }
@@ -298,13 +296,7 @@ pub(crate) fn edge_object_id(id: hellas_kernel::EdgeId) -> ObjectId {
 /// Like the coin and edge helpers, this is the identity map: the kernel
 /// already domain-separates the three derivations, so the chain does not
 /// separate them a second time.
-///
-/// Validator-only, unlike its coin and edge siblings. Those two are also
-/// read by the owner index, which an indexer builds; registry chunks are
-/// consensus state that no owner owns, so nothing outside execution
-/// addresses one.
 #[must_use]
-#[cfg(any(feature = "validator", feature = "full-node"))]
 pub(crate) fn registry_chunk_object_id(id: hellas_kernel::RegistryChunkId) -> ObjectId {
     ObjectId::from(id.to_bytes())
 }

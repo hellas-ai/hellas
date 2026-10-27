@@ -61,6 +61,7 @@ use crate::work_view::{FinalizedWorkView, WorkChannelQuery, WorkChannelSnapshot}
 pub struct WorkBlocks<C> {
     client: C,
     read_retry: Option<(std::time::Duration, std::time::Duration)>,
+    min_height: u64,
 }
 
 /// What one production clock step did for a mounted paid channel.
@@ -113,6 +114,7 @@ impl<C: LightClient> WorkBlocks<C> {
         Self {
             client,
             read_retry: None,
+            min_height: 0,
         }
     }
 
@@ -124,6 +126,13 @@ impl<C: LightClient> WorkBlocks<C> {
         timeout: std::time::Duration,
     ) -> Self {
         self.read_retry = Some((poll, timeout));
+        self
+    }
+
+    /// A persisted journal must never interpret absence at an earlier root.
+    #[must_use]
+    pub fn with_min_height(mut self, height: u64) -> Self {
+        self.min_height = self.min_height.max(height);
         self
     }
 
@@ -289,12 +298,10 @@ impl<C: LightClient + FinalizedWorkView> SetupView for WorkBlocks<C> {
     ) -> Result<Option<FinalizedSetup>, BlockSourceError> {
         let funding = query.funding;
         let Some(snapshot) = self
-            .read(|| {
-                self.client.work_channel_snapshot(WorkChannelQuery {
-                    bond_edge: query.bond_edge,
-                    payment_edge: query.payment_edge,
-                    funding: funding.clone(),
-                })
+            .work_channel_snapshot(WorkChannelQuery {
+                bond_edge: query.bond_edge,
+                payment_edge: query.payment_edge,
+                funding: funding.clone(),
             })
             .await
             .map_err(BlockSourceError::from)?
@@ -319,8 +326,17 @@ impl<C: LightClient + FinalizedWorkView> FinalizedWorkView for WorkBlocks<C> {
         &self,
         query: WorkChannelQuery,
     ) -> Result<Option<WorkChannelSnapshot>, QueryError> {
-        self.read(|| self.client.work_channel_snapshot(query.clone()))
-            .await
+        self.read(|| async {
+            let snapshot = self.client.work_channel_snapshot(query.clone()).await?;
+            if snapshot.as_ref().map_or(0, |value| value.block().height) < self.min_height {
+                return Err(QueryError::StateUnavailable(format!(
+                    "chain is behind persisted journal height {}",
+                    self.min_height
+                )));
+            }
+            Ok(snapshot)
+        })
+        .await
     }
 }
 
@@ -336,7 +352,16 @@ impl<C: LightClient> TxSink for WorkBlocks<C> {
 impl<C: LightClient> FinalizedBlocks for WorkBlocks<C> {
     async fn latest_height(&self) -> Result<Option<u64>, BlockSourceError> {
         Ok(self
-            .read(|| self.client.get_latest_block())
+            .read(|| async {
+                let latest = self.client.get_latest_block().await?;
+                if latest.as_ref().map_or(0, |value| value.height) < self.min_height {
+                    return Err(QueryError::StateUnavailable(format!(
+                        "chain is behind persisted journal height {}",
+                        self.min_height
+                    )));
+                }
+                Ok(latest)
+            })
             .await
             .map_err(BlockSourceError::from)?
             .map(|block| block.height))

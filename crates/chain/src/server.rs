@@ -275,6 +275,58 @@ impl<T> LightClientHandler for LightClientRpc<T>
 where
     T: LightClientApi,
 {
+    async fn get_operations(
+        &self,
+        request: pb::GetOperationsRequest,
+    ) -> Result<pb::GetOperationsResponse, WireStatus> {
+        self.client
+            .get_operations(request)
+            .await
+            .map_err(WireStatus::from)
+    }
+
+    async fn subscribe_finalized(
+        &self,
+        _request: pb::GetLatestBlockRequest,
+    ) -> Result<hellas_rpc::call::ResponseStream<GetFinalizedBlockResponse>, WireStatus> {
+        let permit = self
+            .subscriptions
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| {
+                WireStatus::new(
+                    WireCode::ResourceExhausted,
+                    "connection subscription capacity exhausted",
+                )
+            })?;
+        let client = self.client.clone();
+        let stream = BroadcastStream::new(self.activity_tx.subscribe()).filter_map(move |event| {
+            let client = client.clone();
+            async move {
+                match event {
+                    Ok(ConsensusActivity::Finalization { .. }) => Some(
+                        read_finalized_block(
+                            pb::GetFinalizedBlockRequest { query: None },
+                            |query| client.get_finalized_block(query),
+                        )
+                        .await,
+                    ),
+                    Ok(_) => None,
+                    Err(error) => Some(Err(WireStatus::new(
+                        WireCode::Unavailable,
+                        error.to_string(),
+                    ))),
+                }
+            }
+        });
+        Ok(hellas_rpc::call::ResponseStream::new(stream.map(
+            move |event| {
+                let _permit = &permit;
+                event
+            },
+        )))
+    }
+
     fn get_state_root(
         &self,
         _request: pb::GetStateRootRequest,

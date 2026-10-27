@@ -25,6 +25,8 @@ message GetOperationsResponse {
 }
 
 service LightClient {
+  rpc GetOperations(GetOperationsRequest) returns (GetOperationsResponse);
+  rpc SubscribeFinalized(GetLatestBlockRequest) returns (stream GetFinalizedBlockResponse);
   rpc GetStateRoot(GetStateRootRequest) returns (GetStateRootResponse);
   rpc GetProof(GetProofRequest) returns (GetProofResponse);
   rpc GetCoin(GetCoinRequest) returns (GetCoinResponse);

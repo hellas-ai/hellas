@@ -1,4 +1,4 @@
-use crate::domain::{Coin, Digest, ObjectId, ObjectKind, SettlementKey, Transaction};
+use crate::domain::{Coin, Digest, Object, ObjectId, ObjectKind, SettlementKey, Transaction};
 use hellas_kernel::Encode as _;
 use hellas_rpc::SubmitTxOutcome;
 use hellas_wire::{WireCode, WireStatus};
@@ -112,6 +112,16 @@ pub struct CoinListing {
     pub coins: Vec<(ObjectId, u64)>,
 }
 
+/// Requested current objects at one finalized root. Missing keys are absent.
+/// Remote clients verify the complete retained operation witness; local clients
+/// hold one coherent database reader for the entire result.
+#[derive(Debug, Clone)]
+pub struct ObjectSnapshot {
+    pub network: hellas_kernel::NetworkId,
+    pub block: LatestBlock,
+    pub objects: std::collections::BTreeMap<ObjectId, Object>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EdgeState {
     pub value: u64,
@@ -221,9 +231,10 @@ impl From<QueryError> for WireStatus {
 impl From<WireStatus> for QueryError {
     fn from(status: WireStatus) -> Self {
         match status.code() {
-            WireCode::FailedPrecondition | WireCode::OutOfRange => {
-                QueryError::StateUnavailable(status.message().to_string())
-            }
+            WireCode::Unavailable
+            | WireCode::ResourceExhausted
+            | WireCode::FailedPrecondition
+            | WireCode::OutOfRange => QueryError::StateUnavailable(status.message().to_string()),
             // Chain RPC reserves Aborted for the versioned wrong-object-kind
             // semantic until a later proto can carry these fields directly.
             WireCode::Aborted => parse_wrong_object_kind(status.message())
@@ -238,6 +249,29 @@ impl From<WireStatus> for QueryError {
 
 /// Transport-agnostic query interface for light clients.
 pub trait LightClient: Clone + Send + Sync + 'static {
+    fn get_operations(
+        &self,
+        _request: hellas_rpc::pb::chain::GetOperationsRequest,
+    ) -> impl Future<Output = Result<hellas_rpc::pb::chain::GetOperationsResponse, QueryError>> + Send
+    {
+        async {
+            Err(QueryError::StateUnavailable(
+                "operation proofs are unavailable".into(),
+            ))
+        }
+    }
+
+    fn get_objects(
+        &self,
+        _keys: Vec<ObjectId>,
+    ) -> impl Future<Output = Result<Option<ObjectSnapshot>, QueryError>> + Send {
+        async {
+            Err(QueryError::StateUnavailable(
+                "finalized objects are unavailable".into(),
+            ))
+        }
+    }
+
     fn get_state_root(&self) -> impl Future<Output = Result<Option<Digest>, QueryError>> + Send;
 
     fn get_proof(

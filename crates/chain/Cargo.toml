@@ -26,6 +26,7 @@ domain = [
 domain-consensus = ["domain", "dep:commonware-consensus"]
 client = ["client-core", "hellas-wire/ws-rustls"]
 client-core = [
+    "dep:futures-util",
     "dep:hellas-rpc",
     "hellas-rpc/chain",
     "dep:commonware-codec",
