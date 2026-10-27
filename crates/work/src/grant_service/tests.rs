@@ -1,4 +1,5 @@
 mod protocol;
+mod uploads;
 use super::*;
 use crate::work_store::journal::JournalError;
 

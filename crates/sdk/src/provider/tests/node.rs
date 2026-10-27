@@ -4412,6 +4412,7 @@ async fn grant_and_paid_work_share_a_peer_but_never_a_journal() {
         work_policy_digest: store.state().grant(id).unwrap().policies[0]
             .work
             .digest(network, channel.0),
+        input_content: hellas_rpc::ContentRef::for_bytes(&input.encode().unwrap()),
         prepared_input_digest: input.bound_digest(network, channel.0).unwrap(),
         proposal_nonce: 1,
         acceptance_deadline_ms: hellas_auth::authority::UnixMillis(now.0 + 1000),

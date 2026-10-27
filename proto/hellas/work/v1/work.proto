@@ -219,6 +219,7 @@ message UploadContentRequest {
 message UploadContentResponse {
   // A zero-byte probe returns the durable offset; total_bytes means have.
   uint64 next_offset = 1;
+  WorkRefused refused = 2;
 }
 
 message AcceptWorkResponse {

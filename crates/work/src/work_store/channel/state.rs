@@ -972,6 +972,11 @@ impl Channel<PaymentFunding> {
                 Err(ChannelStateError::Malformed)
             };
         }
+        if hellas_rpc::ContentRef::for_bytes(prepared_input) != authorization.input_content {
+            return Err(ChannelStateError::Record(PaidWorkError::Mismatch {
+                field: "input_content",
+            }));
+        }
         let bundle = PreparedWorkInput::decode(prepared_input, crate::content::MAX_CONTENT_BYTES)
             .map_err(PaidWorkError::from)?;
         if bundle.digest(&self.funding.channel)?.as_bytes()

@@ -55,6 +55,12 @@ impl PayloadStore {
             .jobs()
             .map(|job| ContentId::hash(job.prepared_input()).to_string())
             .collect();
+        self.prune_ids(&live)
+    }
+    pub(super) fn prune_ids(&self, live: &BTreeSet<String>) -> Result<(), ContentError> {
+        if !self.root.try_exists()? {
+            return Ok(());
+        }
         for entry in std::fs::read_dir(&self.root)? {
             let entry = entry?;
             if !live.contains(&entry.file_name().to_string_lossy().into_owned()) {

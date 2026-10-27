@@ -98,6 +98,7 @@ impl Evaluate {
             resource_revision: policy.revision,
             pricing_revision: policy.pricing.revision,
             work_policy_digest: policy.work.digest(network(), channel.0),
+            input_content: hellas_rpc::ContentRef::for_bytes(&input.encode().unwrap()),
             prepared_input_digest: input.bound_digest(network(), channel.0).unwrap(),
             proposal_nonce: nonce,
             acceptance_deadline_ms: UnixMillis(now + 1000),

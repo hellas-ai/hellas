@@ -218,6 +218,7 @@ fn authorization() -> PaidJobAuthorizationV2 {
             channel.id(),
             &payment_policy(),
         ),
+        input_content: hellas_rpc::ContentRef::for_bytes(&bundle().encode().unwrap()),
         prepared_input_digest: input_digest(&channel, &bundle()),
         proposal_nonce: 0x0102_0304_0506_0708,
         acceptance_deadline: 1_000,
@@ -249,10 +250,10 @@ fn job_result(work_id: Digest) -> PaidJobResultV1 {
 fn golden_record_encodings_are_pinned() {
     assert_eq!(PaidChannelPolicyV1::BODY_SIZE, 16);
     assert_eq!(PaidChannelPolicyV1::ENCODED_SIZE, 18);
-    assert_eq!(EvaluatePolicyV2::BODY_SIZE, 122);
-    assert_eq!(EvaluatePolicyV2::ENCODED_SIZE, 124);
-    assert_eq!(PaidJobAuthorizationV2::BODY_SIZE, 360);
-    assert_eq!(PaidJobAuthorizationV2::ENCODED_SIZE, 362);
+    assert_eq!(EvaluatePolicyV2::BODY_SIZE, 130);
+    assert_eq!(EvaluatePolicyV2::ENCODED_SIZE, 132);
+    assert_eq!(PaidJobAuthorizationV2::BODY_SIZE, 400);
+    assert_eq!(PaidJobAuthorizationV2::ENCODED_SIZE, 402);
     assert_eq!(PaidJobResultV1::BODY_SIZE, 96);
     assert_eq!(PaidJobResultV1::ENCODED_SIZE, 98);
     assert_eq!(PaymentBindingV1::BODY_SIZE, 96);
@@ -326,6 +327,7 @@ fn golden_record_encodings_are_pinned() {
             "0000000000000005", // max_spool_bytes
             "00000006", // max_encoded_result_frame
             "00000007", // max_encoded_prepared_input
+            "0000000000000007", // max_upload_bytes
         )
     );
 
@@ -337,6 +339,7 @@ fn golden_record_encodings_are_pinned() {
         payment_terms_hash: TermsHash::from_bytes([0x54; 32]),
         work_policy_digest: Digest::from_bytes([0x55; 32]),
         payment_policy_digest: Digest::from_bytes([0x59; 32]),
+        input_content: hellas_rpc::ContentRef::new(ContentId::from_bytes([0x5a; 32]), 123),
         prepared_input_digest: Digest::from_bytes([0x56; 32]),
         proposal_nonce: 1,
         acceptance_deadline: 2,
@@ -358,6 +361,8 @@ fn golden_record_encodings_are_pinned() {
             "5454545454545454545454545454545454545454545454545454545454545454", // payment_terms
             "5555555555555555555555555555555555555555555555555555555555555555", // policy digest
             "5959595959595959595959595959595959595959595959595959595959595959", // payment policy
+            "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a", // input content id
+            "000000000000007b", // input content bytes
             "5656565656565656565656565656565656565656565656565656565656565656", // prepared input
             "0000000000000001", // proposal_nonce
             "0000000000000002", // acceptance_deadline
@@ -383,9 +388,9 @@ fn maximum_value_bodies_stay_fixed_width() {
     assert_eq!(bytes.len(), PaidJobAuthorizationV2::ENCODED_SIZE);
     assert_eq!(PaidJobAuthorizationV2::decode(&bytes), Ok(authorization));
     // The five `u64`s, all `ff`, at the offsets the layout puts them.
-    assert_eq!(hex(&bytes[258..274]), "ffffffffffffffffffffffffffffffff");
+    assert_eq!(hex(&bytes[298..314]), "ffffffffffffffffffffffffffffffff");
     assert_eq!(
-        hex(&bytes[338..362]),
+        hex(&bytes[378..402]),
         "ffffffffffffffffffffffffffffffffffffffffffffffff"
     );
 }
@@ -510,8 +515,8 @@ fn a_body_cannot_be_reinterpreted_under_another_record() {
     assert_eq!(
         PaidJobAuthorizationV2::decode(&policy),
         Err(PaidWorkError::RecordLength {
-            expected: 362,
-            actual: 124
+            expected: 402,
+            actual: 132
         })
     );
 
@@ -522,8 +527,8 @@ fn a_body_cannot_be_reinterpreted_under_another_record() {
     assert_eq!(
         PaidJobAuthorizationV2::decode(&disguised),
         Err(PaidWorkError::RecordLength {
-            expected: 362,
-            actual: 124
+            expected: 402,
+            actual: 132
         })
     );
 }
@@ -544,7 +549,7 @@ fn golden_digests_bind_the_encoded_network() {
     );
     assert_eq!(
         hex(&work_id(&channel, &authorization()).into_bytes()),
-        "d7495faa86b30ee323b5fbba1bd889a781badd2566b9beb67c48f7bb4b808c2a"
+        "365c54d051a66b4fb5e130020b1af1a7e82d113399af98fd7cfca439c82e4fbf"
     );
 
     let other = channel_on(
@@ -914,8 +919,8 @@ fn widest_fixed_preimage_is_measured() {
         + encoded_network
         + 32
         + PaidJobAuthorizationV2::ENCODED_SIZE;
-    assert_eq!(widest, 34 + 64 + 32 + 362);
-    assert_eq!(widest, 492);
+    assert_eq!(widest, 34 + 64 + 32 + 402);
+    assert_eq!(widest, 532);
     assert!(widest < hellas_xet::MIN_CHUNK_SIZE);
 
     // The one shape that is not record-shaped is bounded too: the
@@ -1013,6 +1018,27 @@ fn every_authorization_field_moves_the_work_id() {
             m.work_policy_digest = Digest::from_bytes([0; 32]);
             m
         }),
+        ("payment_policy_digest", {
+            let mut m = base;
+            m.payment_policy_digest = Digest::from_bytes([0; 32]);
+            m
+        }),
+        ("input_content.id", {
+            let mut m = base;
+            m.input_content = hellas_rpc::ContentRef::new(
+                ContentId::from_bytes([0; 32]),
+                base.input_content.bytes(),
+            );
+            m
+        }),
+        ("input_content.bytes", {
+            let mut m = base;
+            m.input_content = hellas_rpc::ContentRef::new(
+                base.input_content.id(),
+                base.input_content.bytes() + 1,
+            );
+            m
+        }),
         ("prepared_input_digest", {
             let mut m = base;
             m.prepared_input_digest = Digest::from_bytes([0; 32]);
@@ -1054,7 +1080,7 @@ fn every_authorization_field_moves_the_work_id() {
             m
         }),
     ];
-    assert_eq!(mutations.len(), 14, "every field must be mutated");
+    assert_eq!(mutations.len(), 17, "every field must be mutated");
     for (field, mutated) in mutations {
         assert_ne!(
             work_id(&channel, &mutated),
@@ -1204,8 +1230,13 @@ fn every_work_policy_field_moves_its_digest() {
             m.max_encoded_prepared_input += 1;
             m
         }),
+        ("max_upload_bytes", {
+            let mut m = base;
+            m.max_upload_bytes += 1;
+            m
+        }),
     ];
-    assert_eq!(mutations.len(), 9, "every field must be mutated");
+    assert_eq!(mutations.len(), 10, "every field must be mutated");
     for (field, mutated) in mutations {
         assert_ne!(
             work_policy_digest(&channel, &mutated),
@@ -1303,6 +1334,7 @@ fn a_price_above_the_channel_credit_limits_is_refused() {
     authorization.payment_policy_digest =
         hellas_work::model::work::job_payment_policy_digest(channel.network(), channel.id(), &dear);
     authorization.work_policy_digest = work_policy_digest(&channel, &work_policy());
+    authorization.input_content = hellas_rpc::ContentRef::for_bytes(&bundle().encode().unwrap());
     authorization.prepared_input_digest = input_digest(&channel, &bundle());
 
     assert_eq!(
@@ -1387,12 +1419,18 @@ fn an_absent_work_policy_bound_is_refused() {
             "max_encoded_prepared_input",
             EvaluatePolicyV2 {
                 max_encoded_prepared_input: 0,
+                ..base
+            },
+        ),
+        (
+            "max_upload_bytes",
+            EvaluatePolicyV2 {
                 max_upload_bytes: 0,
                 ..base
             },
         ),
     ];
-    assert_eq!(zeroed.len(), 5, "every required bound must be zeroed");
+    assert_eq!(zeroed.len(), 6, "every required bound must be zeroed");
     for (field, policy) in zeroed {
         assert_eq!(
             check_work_policy(&policy),
@@ -1440,6 +1478,7 @@ fn prepared_input_graph_is_checked_not_assumed() {
         &identity_artifact(),
     );
     let mut repointed = authorization;
+    repointed.input_content = hellas_rpc::ContentRef::for_bytes(&other_bundle.encode().unwrap());
     repointed.prepared_input_digest = input_digest(&channel, &other_bundle);
     assert_eq!(
         check_prepared_input(&channel, &repointed, &policy, &other_bundle),
@@ -1468,6 +1507,7 @@ fn prepared_input_graph_is_checked_not_assumed() {
         &identity_artifact(),
     );
     let mut long_auth = authorization;
+    long_auth.input_content = hellas_rpc::ContentRef::for_bytes(&long_bundle.encode().unwrap());
     long_auth.prepared_input_digest = input_digest(&channel, &long_bundle);
     long_auth.request_commitment = Evaluate::commit_request(&long_request);
     assert_eq!(
@@ -1499,6 +1539,8 @@ fn prepared_input_graph_is_checked_not_assumed() {
         &identity_artifact(),
     );
     let mut resumed_auth = authorization;
+    resumed_auth.input_content =
+        hellas_rpc::ContentRef::for_bytes(&resumed_bundle.encode().unwrap());
     resumed_auth.prepared_input_digest = input_digest(&channel, &resumed_bundle);
     resumed_auth.request_commitment = Evaluate::commit_request(&resumed_request);
     assert_eq!(
@@ -1522,6 +1564,8 @@ fn prepared_input_graph_is_checked_not_assumed() {
         &identity_artifact(),
     );
     let mut attested_auth = authorization;
+    attested_auth.input_content =
+        hellas_rpc::ContentRef::for_bytes(&attested_bundle.encode().unwrap());
     attested_auth.prepared_input_digest = input_digest(&channel, &attested_bundle);
     attested_auth.request_commitment = Evaluate::commit_request(&attested);
     assert_eq!(
@@ -1545,6 +1589,8 @@ fn prepared_input_graph_is_checked_not_assumed() {
         &identity_artifact(),
     );
     let mut delegated_auth = authorization;
+    delegated_auth.input_content =
+        hellas_rpc::ContentRef::for_bytes(&delegated_bundle.encode().unwrap());
     delegated_auth.prepared_input_digest = input_digest(&channel, &delegated_bundle);
     delegated_auth.request_commitment = Evaluate::commit_request(&delegated);
     assert_eq!(
@@ -1580,6 +1626,8 @@ fn each_graph_binding_is_checked_on_its_own() {
         &identity_artifact(),
     );
     let mut authorization = base;
+    authorization.input_content =
+        hellas_rpc::ContentRef::for_bytes(&mismatched_prompt.encode().unwrap());
     authorization.prepared_input_digest = input_digest(&channel, &mismatched_prompt);
     assert_eq!(
         check_prepared_input(&channel, &authorization, &policy, &mismatched_prompt),
@@ -1600,6 +1648,8 @@ fn each_graph_binding_is_checked_on_its_own() {
         &identity_artifact(),
     );
     let mut authorization = base;
+    authorization.input_content =
+        hellas_rpc::ContentRef::for_bytes(&mismatched_policy.encode().unwrap());
     authorization.prepared_input_digest = input_digest(&channel, &mismatched_policy);
     assert_eq!(
         check_prepared_input(&channel, &authorization, &policy, &mismatched_policy),
@@ -1623,6 +1673,8 @@ fn each_graph_binding_is_checked_on_its_own() {
         &identity_artifact(),
     );
     let mut authorization = base;
+    authorization.input_content =
+        hellas_rpc::ContentRef::for_bytes(&mismatched_manifest.encode().unwrap());
     authorization.prepared_input_digest = input_digest(&channel, &mismatched_manifest);
     assert_eq!(
         check_prepared_input(&channel, &authorization, &policy, &mismatched_manifest),
@@ -1699,6 +1751,7 @@ fn each_graph_binding_is_checked_on_its_own() {
         &elsewhere,
     );
     let mut authorization = base;
+    authorization.input_content = hellas_rpc::ContentRef::for_bytes(&rebound.encode().unwrap());
     authorization.prepared_input_digest = input_digest(&channel, &rebound);
     authorization.request_commitment = Evaluate::commit_request(&rebound_request);
     assert_eq!(
@@ -1831,6 +1884,7 @@ fn bundle_with_policy(
         &identity_artifact(),
     );
     let authorization = PaidJobAuthorizationV2 {
+        input_content: hellas_rpc::ContentRef::for_bytes(&bundle.encode().unwrap()),
         prepared_input_digest: input_digest(channel, &bundle),
         request_commitment: Evaluate::commit_request(&request),
         ..authorization()
@@ -1872,6 +1926,7 @@ fn only_the_identity_artifact_may_start_a_paid_job() {
         &resumed,
     );
     let authorization = PaidJobAuthorizationV2 {
+        input_content: hellas_rpc::ContentRef::for_bytes(&bundle.encode().unwrap()),
         prepared_input_digest: input_digest(&channel, &bundle),
         request_commitment: Evaluate::commit_request(&request),
         ..authorization()
@@ -2439,7 +2494,7 @@ fn digest_preimages_are_reproducible_by_hand() {
     assert_eq!(preimage.len(), 30 + 16 + 32 + 98);
     assert_eq!(
         hex(&Digest::hash(&preimage).into_bytes()),
-        "75c96eb08b677491f8b3124f120017e23cd316654b0ea40fa2a65e8c992be9a3"
+        "bd4cd5aa978aa14f4341029672f56ad109ae2577d2f97bbfc8a0b3273e286c8c"
     );
 
     // The payment binding, whose three fields are all 32 bytes: a round
@@ -2520,7 +2575,7 @@ fn the_canonical_output_preimage_is_reproducible_by_hand() {
     );
     assert_eq!(
         hex(&Digest::hash(&preimage).into_bytes()),
-        "5a6e996c508376c257f74686658da3c0597fc3519bdacf9a59a00741f4eec8ee"
+        "cf11c6f8572daab86bac1d4d3f914324cfe947af6dbe4dd5ea64a896ece69adf"
     );
 }
 

@@ -597,7 +597,7 @@ async fn restarting_an_accepted_fetch_never_reinvokes_from_a_missing_payload() {
     let service_before = service(provider_dir.path()).await;
     let request = client.propose(&proposal()).await.unwrap();
     let id = client
-        .accepted(&service_before.accept(&request).await)
+        .accepted(&accept_uploaded_client(&service_before, &client, &request).await)
         .await
         .unwrap();
     drop(service_before);

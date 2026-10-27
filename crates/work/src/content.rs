@@ -121,6 +121,17 @@ impl UploadStore {
         let mut store = Self::memory(channel, UploadQuota::default());
         store.directory = Some(directory.clone());
         store.content_root = Some(root.join("content"));
+        if directory.try_exists()? {
+            for entry in std::fs::read_dir(&directory)? {
+                let entry = entry?;
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with(".proposal.") && name.ends_with(".pending") {
+                    std::fs::remove_file(entry.path())?;
+                }
+            }
+            hellas_private::sync_directory(&directory)?;
+        }
         let path = directory.join("proposal");
         if path.try_exists()? {
             let bytes = hellas_private::read_bounded_regular_file(&path, MAX_CONTENT_BYTES + 80)?;
@@ -139,7 +150,7 @@ impl UploadStore {
             {
                 return Err(ContentError::Invalid);
             }
-            store.quota.reserve(channel, object.bytes())?;
+            store.quota.reserve(channel, store.missing_bytes(object)?)?;
             store.stage = Some(Stage {
                 work,
                 object,
@@ -154,7 +165,7 @@ impl UploadStore {
             return Ok(());
         }
         if let Some(stage) = &self.stage {
-            quota.reserve(self.channel, stage.object.bytes())?;
+            quota.reserve(self.channel, self.missing_bytes(stage.object)?)?;
         }
         self.quota.release(self.channel);
         self.quota = quota;
@@ -258,7 +269,20 @@ impl UploadStore {
         }) {
             return Err(ContentError::ProposalLimit);
         }
+        if self.stage.is_none() && offset != 0 {
+            return Err(ContentError::Invalid);
+        }
         if self.held(object)?.is_some() {
+            if self.stage.is_none() {
+                self.quota.reserve(self.channel, 0)?;
+                self.stage = Some(Stage {
+                    work,
+                    object,
+                    deadline,
+                    bytes: Vec::new(),
+                });
+            }
+            self.persist()?;
             return Ok(object.bytes());
         }
         if object.bytes() > max_upload_bytes {
@@ -291,6 +315,13 @@ impl UploadStore {
             self.clear()?;
             return Err(ContentError::Hash);
         }
+        self.persist()?;
+        Ok(next)
+    }
+    pub fn staged_bytes(&self) -> usize {
+        self.stage.as_ref().map_or(0, |stage| stage.bytes.len())
+    }
+    fn persist(&self) -> Result<(), ContentError> {
         if let Some(directory) = &self.directory {
             hellas_private::create_dir_all_durable(directory)?;
             let stage = self.stage.as_ref().ok_or(ContentError::Missing)?;
@@ -300,7 +331,7 @@ impl UploadStore {
             bytes.extend_from_slice(&stage.bytes);
             hellas_private::write_atomically(&directory.join("proposal"), ".pending", &bytes)?;
         }
-        Ok(next)
+        Ok(())
     }
     pub fn missing_bytes(&self, object: ContentRef) -> Result<u64, ContentError> {
         Ok(if self.held(object)?.is_some() {

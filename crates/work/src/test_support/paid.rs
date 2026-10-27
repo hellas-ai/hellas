@@ -379,13 +379,15 @@ pub async fn accept_uploaded(
 ) -> hellas_rpc::pb::work::AcceptWorkResponse {
     let (wire, uploads) = fixture_uploads(endpoint.state().channel(), request);
     for upload in uploads {
-        let _ = endpoint.upload_content(
+        if let Some(refusal) = super::upload_failure(endpoint.upload_content(
             &upload,
             &hellas_wire::TransportContext {
                 open_exporter: Some([7; 32]),
                 ..Default::default()
             },
-        );
+        )) {
+            return refusal;
+        }
     }
     endpoint.accept(&wire).await
 }
@@ -399,15 +401,19 @@ pub async fn accept_uploaded_service(
     };
     let (wire, uploads) = fixture_uploads(&channel, request);
     for upload in uploads {
-        let _ = service
-            .upload(
-                &upload,
-                &hellas_wire::TransportContext {
-                    open_exporter: Some([7; 32]),
-                    ..Default::default()
-                },
-            )
-            .await;
+        if let Some(refusal) = super::upload_failure(
+            service
+                .upload(
+                    &upload,
+                    &hellas_wire::TransportContext {
+                        open_exporter: Some([7; 32]),
+                        ..Default::default()
+                    },
+                )
+                .await,
+        ) {
+            return refusal;
+        }
     }
     service.accept(&wire).await
 }
@@ -574,15 +580,19 @@ pub async fn accept_uploaded_client(
     };
     let (wire, uploads) = input_uploads(client.state().channel(), request, job.prepared_input());
     for upload in uploads {
-        let _ = service
-            .upload(
-                &upload,
-                &hellas_wire::TransportContext {
-                    open_exporter: Some([7; 32]),
-                    ..Default::default()
-                },
-            )
-            .await;
+        if let Some(refusal) = super::upload_failure(
+            service
+                .upload(
+                    &upload,
+                    &hellas_wire::TransportContext {
+                        open_exporter: Some([7; 32]),
+                        ..Default::default()
+                    },
+                )
+                .await,
+        ) {
+            return refusal;
+        }
     }
     service.accept(&wire).await
 }

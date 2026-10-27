@@ -807,6 +807,11 @@ impl ProviderEndpoint {
         )?;
         let reference = decode_reference(&request.prepared_input)
             .ok_or_else(|| Refusal::invalid("prepared input must be a content reference"))?;
+        if reference != authorization.input_content {
+            return Err(Refusal::invalid(
+                "input reference differs from the signed proposal",
+            ));
+        }
         if self
             .close
             .store

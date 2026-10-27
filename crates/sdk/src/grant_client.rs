@@ -389,6 +389,11 @@ impl Link {
                             .await?
                     }
                 };
+                if let Some(refusal) = response.refused {
+                    return Ok(AcceptWorkResponse {
+                        outcome: Some(accept_work_response::Outcome::Refused(refusal)),
+                    });
+                }
                 if response.next_offset > reference.bytes()
                     || (!probing && response.next_offset < end)
                 {
@@ -886,6 +891,7 @@ impl GrantSession {
         let finish_by =
             tokio::time::Instant::now() + Duration::from_millis(span) + self.options.timeout;
         let channel = self.store.channel().id;
+        let prepared = input.encode().map_err(GrantClientError::from)?;
         let a = GrantJobAuthorizationV1 {
             channel_id: channel,
             generation: self.store.channel().generation,
@@ -895,6 +901,7 @@ impl GrantSession {
             resource_revision: policy.revision,
             pricing_revision: policy.pricing.revision,
             work_policy_digest: policy.work.digest(self.target.network, channel.0),
+            input_content: hellas_rpc::ContentRef::for_bytes(&prepared),
             prepared_input_digest: input
                 .bound_digest(self.target.network, channel.0)
                 .map_err(GrantClientError::from)?,
@@ -918,7 +925,7 @@ impl GrantSession {
             .await?;
         let id = grant_work_id(self.target.network, &a);
         self.pending_body = Some((id, input.clone()));
-        let prepared = input.encode().map_err(GrantClientError::from)?;
+
         let request = AcceptWorkRequest {
             route: Some(WorkRoute::grant(channel.0)),
             authorization: a.encode(),

@@ -944,6 +944,7 @@ impl GrantService {
                 held.reap();
                 if matches!(held.status, ServiceStatus::Serving) {
                     held.status = ServiceStatus::Draining;
+                    held.uploads.clear();
                 }
                 match &store {
                     Ok(store) if held.status.check().is_ok() => held

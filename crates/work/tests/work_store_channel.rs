@@ -237,6 +237,7 @@ fn authorization_for(channel: &PaidChannel, nonce: u64) -> PaidJobAuthorizationV
         payment_terms_hash: channel.payment_terms_hash(),
         work_policy_digest: Digest::from_bytes([0x31; 32]),
         payment_policy_digest: Digest::from_bytes([0xec; 32]),
+        input_content: hellas_rpc::ContentRef::for_bytes(&bundle(nonce).encode().unwrap()),
         prepared_input_digest: match prepared_input_digest(channel, &bundle(nonce)) {
             Ok(digest) => digest,
             Err(error) => panic!("the fixture bundle hashes: {error}"),

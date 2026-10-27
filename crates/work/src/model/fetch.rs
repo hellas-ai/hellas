@@ -467,6 +467,7 @@ pub fn propose_fetch_authorization(
         payment_terms_hash: channel.payment_terms_hash(),
         work_policy_digest: fetch_policy_digest(channel, policy),
         payment_policy_digest: job_payment_policy_digest(channel.network(), channel.id(), payment),
+        input_content: hellas_rpc::ContentRef::for_bytes(&bundle.encode()?),
         prepared_input_digest: prepared_fetch_input_digest(channel, bundle)?,
         proposal_nonce,
         acceptance_deadline: deadlines.acceptance,
@@ -527,6 +528,7 @@ pub fn check_bound_fetch_input(
     bundle: &PreparedPaidFetchInputV1,
 ) -> Result<(), PaidWorkError> {
     let encoded = bundle.encode()?;
+    binding.check_content(&encoded)?;
     let limit = u64::from(policy.max_encoded_prepared_input);
     let actual = u64::try_from(encoded.len()).map_err(|_| PaidWorkError::Overflow {
         field: "prepared input length",

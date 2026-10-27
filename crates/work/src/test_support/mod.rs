@@ -424,6 +424,7 @@ pub fn proposal_for(
         resource_revision: def.policies[0].revision,
         pricing_revision: def.policies[0].pricing.revision,
         work_policy_digest: def.policies[0].work.digest(network(), channel.0),
+        input_content: hellas_rpc::ContentRef::for_bytes(&input.encode().unwrap()),
         prepared_input_digest: input.bound_digest(network(), channel.0).unwrap(),
         proposal_nonce: nonce,
         acceptance_deadline_ms: UnixMillis(2_000),
@@ -538,17 +539,18 @@ pub async fn accept_grant(
     let exporter = [7; 32];
     let (wire, chunks) = grant_upload_requests(request, signer, network(), exporter);
     for chunk in chunks {
-        // Refusal tests still exercise AcceptWork's independently checked
-        // permission/signature/deadline response after an upload was denied.
-        let _ = work
-            .upload(
+        if let Some(refusal) = upload_failure(
+            work.upload(
                 &chunk,
                 &hellas_wire::TransportContext {
                     open_exporter: Some(exporter),
                     ..Default::default()
                 },
             )
-            .await;
+            .await,
+        ) {
+            return refusal;
+        }
     }
     work.accept(&wire).await
 }
@@ -641,3 +643,22 @@ pub use node::{
 pub mod evaluate;
 
 pub mod paid;
+
+pub fn upload_failure(
+    response: Result<hellas_rpc::pb::work::UploadContentResponse, hellas_wire::WireStatus>,
+) -> Option<hellas_rpc::pb::work::AcceptWorkResponse> {
+    use hellas_rpc::pb::work::{
+        AcceptWorkResponse, WorkRefusalCode, WorkRefused, accept_work_response,
+    };
+    let refusal = match response {
+        Ok(response) => response.refused?,
+        Err(error) => WorkRefused {
+            code: WorkRefusalCode::Unavailable as i32,
+            reason: error.to_string(),
+            grant: None,
+        },
+    };
+    Some(AcceptWorkResponse {
+        outcome: Some(accept_work_response::Outcome::Refused(refusal)),
+    })
+}

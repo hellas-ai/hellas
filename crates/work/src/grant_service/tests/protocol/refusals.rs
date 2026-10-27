@@ -111,6 +111,8 @@ impl Case {
                 request.input = PreparedWorkInput::from(
                     PreparedPaidFetchInputV1::new(&events, &contract).unwrap(),
                 );
+                request.authorization.input_content =
+                    hellas_rpc::ContentRef::for_bytes(&request.input.encode().unwrap());
                 request.authorization.prepared_input_digest = request
                     .input
                     .bound_digest(network(), request.authorization.channel_id.0)

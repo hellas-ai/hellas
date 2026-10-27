@@ -87,11 +87,6 @@ impl ChannelStore {
         let key = channel_key(&channel).into_bytes();
         let stem = format!("channel-{}", hex(key));
         let payloads = payload::PayloadStore::new(root, &stem);
-        let uploads = if metadata_only {
-            crate::content::UploadStore::memory(channel.id(), Default::default())
-        } else {
-            crate::content::UploadStore::durable(root, &stem, channel.id())?
-        };
         let replayed = hellas_rpc::observe::Timing::start();
         let (journal, replay) = Journal::open_latest(
             root,
@@ -107,6 +102,11 @@ impl ChannelStore {
             },
         )
         .await?;
+        let uploads = if metadata_only {
+            crate::content::UploadStore::memory(channel.id(), Default::default())
+        } else {
+            crate::content::UploadStore::durable(root, &stem, channel.id())?
+        };
         let mut state = match &replay.checkpoint {
             Some(bytes) => Channel::from_checkpoint(
                 bytes,
@@ -119,11 +119,17 @@ impl ChannelStore {
             )?,
             None => Channel::new(channel, settlement, role, origin),
         };
+        let mut referenced: std::collections::BTreeSet<String> = state
+            .jobs()
+            .map(|job| hellas_rpc::ContentId::hash(job.prepared_input()).to_string())
+            .collect();
         for bytes in &replay.records {
             let mut record = ChannelRecord::decode(bytes)?;
-            if !metadata_only && let ChannelRecord::JobProposed { prepared_input, .. } = &mut record
-            {
-                *prepared_input = payloads.read(prepared_input)?;
+            if !metadata_only {
+                if let ChannelRecord::JobProposed { prepared_input, .. } = &mut record {
+                    *prepared_input = payloads.read(prepared_input)?;
+                    referenced.insert(hellas_rpc::ContentId::hash(prepared_input).to_string());
+                }
             }
             state.apply(&record, verifier, metadata_only)?;
         }
@@ -134,6 +140,9 @@ impl ChannelStore {
             .filter(|job| matches!(job.phase, JobPhase::Running | JobPhase::Streaming))
             .map(|job| job.work_id)
             .collect();
+        if !metadata_only {
+            payloads.prune_ids(&referenced)?;
+        }
         journal.observe_replay(replayed, replay.records.len());
         let mut store = Self {
             journal,
@@ -184,6 +193,7 @@ impl ChannelStore {
             return Ok(&self.state);
         }
         let mut next = self.state.clone();
+        let previous_jobs = self.state.jobs().count();
         // The `false` keeps commit-time validation at full strength even
         // for a metadata-only journal: bodies are verified — digest and
         // transcript-to-result reproduction — before they are stripped
@@ -206,15 +216,18 @@ impl ChannelStore {
             }
             self.rotate_if_full(record.is_new_work()).await?;
             let mut stored = record;
-            if !self.metadata_only
-                && let ChannelRecord::JobProposed { prepared_input, .. } = &mut stored
-            {
-                *prepared_input = self.payloads.write(prepared_input)?;
+            if !self.metadata_only {
+                if let ChannelRecord::JobProposed { prepared_input, .. } = &mut stored {
+                    *prepared_input = self.payloads.write(prepared_input)?;
+                }
             }
             self.journal
                 .append(&stored.encode_for_storage(self.metadata_only))
                 .await?;
             self.state = next;
+            if !self.metadata_only && self.state.jobs().count() < previous_jobs {
+                self.rotate().await?;
+            }
         }
         self.gc_uploads()?;
         Ok(&self.state)
@@ -269,7 +282,12 @@ impl ChannelStore {
             .rotate(&payload::checkpoint(&self.state, self.metadata_only))
             .await
         {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                if !self.metadata_only {
+                    self.payloads.prune(&self.state)?;
+                }
+                Ok(())
+            }
             Err(error) if new_work => Err(error.into()),
             Err(_) => Ok(()),
         }

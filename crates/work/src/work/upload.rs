@@ -12,14 +12,29 @@ pub(super) fn content_refusal(error: crate::content::ContentError) -> Refusal {
     };
     Refusal::new(code, error.to_string())
 }
+fn upload_response(result: Result<u64, Refusal>) -> UploadContentResponse {
+    match result {
+        Ok(next_offset) => UploadContentResponse {
+            next_offset,
+            refused: None,
+        },
+        Err(error) => UploadContentResponse {
+            next_offset: 0,
+            refused: Some(WorkRefused {
+                code: error.code.code() as i32,
+                reason: error.reason,
+                grant: None,
+            }),
+        },
+    }
+}
 impl ProviderEndpoint {
     pub fn upload_content(
         &mut self,
         request: &UploadContentRequest,
         context: &TransportContext,
-    ) -> Result<u64, WireStatus> {
-        self.upload(request, context)
-            .map_err(|error| WireStatus::new(hellas_wire::WireCode::InvalidArgument, error.reason))
+    ) -> Result<UploadContentResponse, WireStatus> {
+        Ok(upload_response(self.upload(request, context)))
     }
     fn upload(
         &mut self,
@@ -40,6 +55,11 @@ impl ProviderEndpoint {
                 .map_err(|_| Refusal::invalid("invalid content id"))?,
             request.total_bytes,
         );
+        if object != authorization.input_content {
+            return Err(Refusal::invalid(
+                "object is outside the signed proposal's closure",
+            ));
+        }
         let signature = signature(&request.chunk_signature)
             .ok_or_else(|| Refusal::invalid("invalid chunk signature"))?;
         if !Secp256k1Verifier::new().verify_sig(
@@ -72,6 +92,12 @@ impl ProviderEndpoint {
                 ));
             }
             return Ok(object.bytes());
+        }
+        if self.state().close_prepared().is_some()
+            || self.state().close_opened().is_some()
+            || self.state().close_settled().is_some()
+        {
+            return Err(Refusal::new(WorkRefusal::Declined, "channel is closing"));
         }
         let ready = self
             .admitting()
@@ -153,19 +179,7 @@ impl WorkService {
         let mut endpoint = self.endpoint().await.map_err(|error| {
             WireStatus::new(hellas_wire::WireCode::Unavailable, error.to_string())
         })?;
-        endpoint
-            .upload(request, context)
-            .map(|next_offset| UploadContentResponse { next_offset })
-            .map_err(|error| {
-                WireStatus::new(
-                    if error.code == WorkRefusal::Unavailable {
-                        hellas_wire::WireCode::Unavailable
-                    } else {
-                        hellas_wire::WireCode::InvalidArgument
-                    },
-                    error.reason,
-                )
-            })
+        Ok(upload_response(endpoint.upload(request, context)))
     }
 }
 
@@ -232,6 +246,15 @@ where
                 chunk_signature: chunk_signature.as_bytes().to_vec(),
             })
             .await?;
+        if let Some(refusal) = uploaded.refused {
+            return endpoint
+                .client()
+                .await?
+                .accepted(&AcceptWorkResponse {
+                    outcome: Some(Outcome::Refused(refusal)),
+                })
+                .await;
+        }
         if uploaded.next_offset > reference.bytes() || (!probing && uploaded.next_offset < end) {
             return Err(ProposeError::Malformed("upload offset"));
         }

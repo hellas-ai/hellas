@@ -33,6 +33,9 @@ impl GrantWork {
                     .map_err(|_| refused(GrantRefusalCode::Malformed))?,
                 request.total_bytes,
             );
+            if object != a.input_content {
+                return Err(refused(GrantRefusalCode::Malformed));
+            }
             hellas_auth::signature::verify_digest_signature(
                 &client.node.public_key(),
                 &super::signature(&request.chunk_signature)?,
@@ -49,6 +52,7 @@ impl GrantWork {
             if prior.is_some() {
                 return Ok(UploadContentResponse {
                     next_offset: object.bytes(),
+                    refused: None,
                 });
             }
             let policy = store.state().policy_for(&a)?.work.clone();
@@ -61,6 +65,9 @@ impl GrantWork {
                 .lock()
                 .map_err(|_| refused(GrantRefusalCode::StorageUnavailable))?;
             runtime.status.check()?;
+            if !matches!(runtime.status, ServiceStatus::Serving) {
+                return Err(refused(GrantRefusalCode::QueueCapacity));
+            }
             for uploads in runtime.uploads.values_mut() {
                 uploads
                     .gc(now.0, false)
@@ -74,61 +81,92 @@ impl GrantWork {
                     self.service.upload_quota.clone(),
                 )
             });
-            let next = uploads
-                .stage(
-                    id,
-                    object,
-                    a.acceptance_deadline_ms.0,
-                    policy.max_upload_bytes(),
-                    request.offset,
-                    &request.chunk,
-                )
-                .map_err(|_| refused(GrantRefusalCode::StateCapacity))?;
+            let staged = uploads.stage(
+                id,
+                object,
+                a.acceptance_deadline_ms.0,
+                policy.max_upload_bytes(),
+                request.offset,
+                &request.chunk,
+            );
+            let next = match staged {
+                Ok(next) => next,
+                Err(_) => {
+                    if fresh {
+                        uploads
+                            .clear()
+                            .map_err(|_| refused(GrantRefusalCode::StorageUnavailable))?;
+                    }
+                    return Err(refused(GrantRefusalCode::StateCapacity));
+                }
+            };
             if next == object.bytes() {
-                let bytes = uploads
-                    .read(id, object)
-                    .map_err(|_| refused(GrantRefusalCode::Malformed))?;
-                let input = PreparedWorkInput::decode(&bytes, crate::content::MAX_CONTENT_BYTES)
-                    .map_err(|_| refused(GrantRefusalCode::Malformed))?;
-                let context = WorkContext {
-                    network: store.state().network(),
-                    channel: a.channel_id.0,
-                    client: client.signer(),
-                    provider: grant_producer(store.state().provider()?)
-                        .map_err(NodeStoreError::from)?,
-                };
-                if policy
-                    .check_bound_input(&context, &(&a).into(), &input)
-                    .is_err()
-                {
+                let checked = (|| -> Result<(), WorkRefused> {
+                    let bytes = uploads
+                        .read(id, object)
+                        .map_err(|_| refused(GrantRefusalCode::Malformed))?;
+                    let input =
+                        PreparedWorkInput::decode(&bytes, crate::content::MAX_CONTENT_BYTES)
+                            .map_err(|_| refused(GrantRefusalCode::Malformed))?;
+                    let context = WorkContext {
+                        network: store.state().network(),
+                        channel: a.channel_id.0,
+                        client: client.signer(),
+                        provider: grant_producer(store.state().provider()?)
+                            .map_err(NodeStoreError::from)?,
+                    };
+                    policy
+                        .check_bound_input(&context, &(&a).into(), &input)
+                        .map_err(|_| refused(GrantRefusalCode::Malformed))
+                })();
+                if let Err(error) = checked {
                     uploads
                         .clear()
                         .map_err(|_| refused(GrantRefusalCode::StorageUnavailable))?;
-                    return Err(refused(GrantRefusalCode::Malformed));
+                    return Err(error);
                 }
             }
             drop(runtime);
             if fresh {
-                let service = self.service.clone();
+                let runtime = Arc::downgrade(&self.service.inner);
+                let clock = self.service.node.clock.clone();
                 tokio::spawn(async move {
-                    let delay = a
-                        .acceptance_deadline_ms
-                        .0
-                        .saturating_sub((service.node.clock)().0)
-                        .saturating_add(1);
-                    tokio::time::sleep(Duration::from_millis(delay)).await;
-                    if let Ok(mut runtime) = service.inner.lock()
-                        && let Some(uploads) = runtime.uploads.get_mut(&a.channel_id.0)
-                    {
-                        let _ = uploads.gc((service.node.clock)().0, false);
+                    loop {
+                        let delay = a
+                            .acceptance_deadline_ms
+                            .0
+                            .saturating_sub(clock().0)
+                            .saturating_add(1);
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                        let now = clock().0;
+                        {
+                            let Some(runtime) = runtime.upgrade() else {
+                                return;
+                            };
+                            if let Ok(mut runtime) = runtime.lock() {
+                                if let Some(uploads) = runtime.uploads.get_mut(&a.channel_id.0) {
+                                    let _ = uploads.gc(now, false);
+                                }
+                            }
+                        }
+                        if now > a.acceptance_deadline_ms.0 {
+                            return;
+                        }
                     }
                 });
             }
-            Ok(UploadContentResponse { next_offset: next })
+            Ok(UploadContentResponse {
+                next_offset: next,
+                refused: None,
+            })
         }
         .await;
-        result.map_err(|refusal: WorkRefused| {
-            WireStatus::new(hellas_wire::WireCode::InvalidArgument, refusal.reason)
+        Ok(match result {
+            Ok(response) => response,
+            Err(refusal) => UploadContentResponse {
+                next_offset: 0,
+                refused: Some(refusal),
+            },
         })
     }
 }
